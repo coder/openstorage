@@ -2,7 +2,7 @@
 // (issue #52): soft-delete burns the name and keeps every registry row and
 // blob (docs/explanation/domain-model.md), so without a follow-up story a
 // deleted repository's storage lives forever. The RepoPurger permanently
-// reclaims it — on the sweep cadence once CODESTORAGE_REPO_RETENTION
+// reclaims it — on the sweep cadence once OPENSTORAGE_REPO_RETENTION
 // expires, or synchronously via `openstorage purge-repo`.
 //
 // The purge is TOMBSTONE-THEN-DELETE, the inverse of publish-before-CAS:

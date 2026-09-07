@@ -43,7 +43,7 @@ type Deliverer struct {
 	// must keep the guard and steer it through AllowPrivate.
 	Client *http.Client
 	// AllowPrivate selects the guard's private-range escape hatch
-	// (CODESTORAGE_WEBHOOK_ALLOW_PRIVATE) when Client is nil. Redirects
+	// (OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE) when Client is nil. Redirects
 	// are refused either way.
 	AllowPrivate bool
 	// Now supplies the signing timestamp; defaults to time.Now.

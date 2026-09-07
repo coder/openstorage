@@ -114,7 +114,7 @@ type LFSReclaimReport struct {
 	RowsDeferredReapStale int64 `json:"rows_deferred_reap_stale"`
 	// RowsDeferredLegacyUnarmed counts grace-expired eligible
 	// LEGACY-SPELLED rows deferred because legacy reaping is not armed
-	// end-to-end — this replica's CODESTORAGE_SWEEP_DELETE_LFS_LEGACY is
+	// end-to-end — this replica's OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY is
 	// off, or the fresh watermark does not certify a legacy-armed sweep
 	// (Codex round 17 on PR #132). Their blobs would never be physically
 	// reaped, so refunding their slots would grow storage past the cap.
@@ -138,11 +138,11 @@ const (
 	// mark/clear statement's key list).
 	lfsReclaimRowPage = 1_000
 	// DefaultLFSReclaimObjectBudget bounds the git objects one run may
-	// list across all reachability walks (CODESTORAGE_LFS_GC_OBJECT_BUDGET
+	// list across all reachability walks (OPENSTORAGE_LFS_GC_OBJECT_BUDGET
 	// overrides).
 	DefaultLFSReclaimObjectBudget = int64(1_000_000)
 	// DefaultLFSReclaimGrace is how long a row must stay continuously
-	// unreferenced before retirement (CODESTORAGE_LFS_GC_GRACE overrides).
+	// unreferenced before retirement (OPENSTORAGE_LFS_GC_GRACE overrides).
 	DefaultLFSReclaimGrace = 24 * time.Hour
 	// lfsReclaimHydrateTimeout bounds one namespace member's cache
 	// hydration (Codex round 7): on a cold replica, Materialize downloads
@@ -202,7 +202,7 @@ type LFSReclaimer struct {
 	grace         time.Duration
 	objectBudget  int64
 	deleteEnabled bool
-	// legacyDelete mirrors the fleet's CODESTORAGE_SWEEP_DELETE_LFS_LEGACY
+	// legacyDelete mirrors the fleet's OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY
 	// arming (Codex round 17 on PR #132): legacy-spelled rows may only be
 	// retired while THIS replica's config arms legacy reaping AND the
 	// fresh watermark certifies a legacy-armed sweep — a fresh legacy
@@ -239,7 +239,7 @@ type LFSReclaimer struct {
 }
 
 // NewLFSReclaimer wires the reclamation job. legacyDelete mirrors the
-// sweeper's CODESTORAGE_SWEEP_DELETE_LFS_LEGACY arming — see the field.
+// sweeper's OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY arming — see the field.
 func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSWalkFunc, defaultBranch DefaultBranchFunc, grace time.Duration, objectBudget int64, deleteEnabled, legacyDelete bool, logger *slog.Logger) *LFSReclaimer {
 	assertf(registry != nil, "NewLFSReclaimer: nil registry")
 	assertf(hydrate != nil, "NewLFSReclaimer: nil hydrate seam")
@@ -464,7 +464,7 @@ loop:
 					// skip it (rotation moved past it) and say so — only
 					// a raised budget can ever scan it.
 					report.ReposOverBudget++
-					r.logger.Warn("lfs reclaim: repository exceeds the full run budget; raise CODESTORAGE_LFS_GC_OBJECT_BUDGET to scan and settle it in one pass",
+					r.logger.Warn("lfs reclaim: repository exceeds the full run budget; raise OPENSTORAGE_LFS_GC_OBJECT_BUDGET to scan and settle it in one pass",
 						"repo", base, "budget", r.objectBudget)
 					continue
 				}

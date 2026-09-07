@@ -21,7 +21,7 @@ package sync
 // writes into private networks are a stronger SSRF primitive than the
 // pull lane's reads, so every http(s) push dials through a vetting proxy
 // that denies private/special destinations unless the operator opts in
-// (CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE); see docs/adr/044.
+// (OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE); see docs/adr/044.
 
 import (
 	"context"

@@ -38,7 +38,7 @@ var ErrTargetDenied = errors.New("target denied by egress policy")
 //     URL-time validation leaves open.
 type TargetGuard struct {
 	// AllowPrivate admits loopback/private/link-local/ULA delivery targets
-	// (CODESTORAGE_WEBHOOK_ALLOW_PRIVATE) for genuinely internal
+	// (OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE) for genuinely internal
 	// deployments. Cloud metadata and addresses that can never be a
 	// legitimate receiver (unspecified, multicast, broadcast) stay denied,
 	// and redirects stay refused: the escape hatch relaxes only the private

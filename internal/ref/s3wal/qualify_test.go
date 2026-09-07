@@ -9,7 +9,7 @@
 // Lanes: SeaweedFS (the decided self-hosted store, §5-R7 — REQUIRED to
 // pass), the legacy MinIO CI pin (RECORD mode: non-compliance is a finding
 // logged as a structured verdict, never a test failure), and an external
-// endpoint gated on CODESTORAGE_TEST_S3WAL_URL (required to pass when
+// endpoint gated on OPENSTORAGE_TEST_S3WAL_URL (required to pass when
 // opted in). Deterministic stub-server tests prove the probe refuses
 // non-compliant stores and pin the §2.3 CAS error taxonomy without Docker.
 //
@@ -31,7 +31,6 @@ import (
 	mrand "math/rand/v2"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -47,6 +46,7 @@ import (
 	"gocloud.dev/gcerrors"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/coder/open-storage/internal/envconfig"
 	"github.com/coder/open-storage/internal/ref/s3wal"
 
 	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
@@ -843,7 +843,7 @@ func TestQualifyMinIOLegacy(t *testing.T) {
 // cleanup; the probe runs at a prefixed key so it can never collide with a
 // real deployment's _wal/probe.
 func TestQualifyExternalEndpoint(t *testing.T) {
-	blobURL := os.Getenv(EnvTestS3WALURL)
+	blobURL := envconfig.Getenv(EnvTestS3WALURL)
 	if blobURL == "" {
 		t.Skipf("set %s (s3://bucket?endpoint=http://127.0.0.1:8333&region=us-east-1&s3ForcePathStyle=true) plus AWS credentials to run", EnvTestS3WALURL)
 	}

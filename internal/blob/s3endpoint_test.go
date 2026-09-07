@@ -1,6 +1,6 @@
 // Env-gated S3 endpoint tests (issue #112): unlike the SeaweedFS container
 // tests in seaweedfs_test.go, these run against an externally provided S3
-// endpoint named by CODESTORAGE_TEST_S3_URL (a full s3:// blob URL;
+// endpoint named by OPENSTORAGE_TEST_S3_URL (a full s3:// blob URL;
 // credentials come from the standard AWS environment). The nightly Floci
 // lane (.github/workflows/floci-nightly.yml) points them at floci/floci
 // with FLOCI_SERVICES_S3_ENFORCE_AUTH=true and an IAM-provisioned (not
@@ -35,16 +35,18 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+
+	"github.com/coder/open-storage/internal/envconfig"
 )
 
 // EnvTestS3URL names the external S3 endpoint the tests in this file run
 // against; unset skips them.
-const EnvTestS3URL = "CODESTORAGE_TEST_S3_URL"
+const EnvTestS3URL = "OPENSTORAGE_TEST_S3_URL"
 
 // openS3Endpoint opens the externally provided bucket or skips the test.
 func openS3Endpoint(t *testing.T) *S3 {
 	t.Helper()
-	blobURL := os.Getenv(EnvTestS3URL)
+	blobURL := envconfig.Getenv(EnvTestS3URL)
 	if blobURL == "" {
 		t.Skipf("set %s (s3://bucket?endpoint=http://127.0.0.1:4566&s3ForcePathStyle=true&region=us-east-1) plus AWS credentials to run", EnvTestS3URL)
 	}

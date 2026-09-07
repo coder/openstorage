@@ -3,10 +3,11 @@ package sync
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	stdsync "sync"
 	"time"
+
+	"github.com/coder/open-storage/internal/envconfig"
 )
 
 // LegacyClaimHolder mirrors meta.LegacyClaimHolder (the sync package must
@@ -178,7 +179,7 @@ func (m *MemStore) BeginSync(_ context.Context, repoID, holder string, lease tim
 		if up.SyncClaimHolder == LegacyClaimHolder {
 			// Stealing an adopted legacy claim needs the operator's
 			// drained-fleet assertion (meta.EnvSyncStealLegacy).
-			if v, err := strconv.ParseBool(os.Getenv("CODESTORAGE_SYNC_STEAL_LEGACY")); err != nil || !v {
+			if v, err := strconv.ParseBool(envconfig.Getenv("OPENSTORAGE_SYNC_STEAL_LEGACY")); err != nil || !v {
 				return Upstream{}, "", ErrSyncInProgress
 			}
 		}

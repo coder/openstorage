@@ -168,7 +168,7 @@ func requireAuthWith(verifier auth.Verifier, org string, orgLevel bool, fail fun
 			assertf(claims != nil, "Verifier returned nil claims without error")
 			// Served-org gate (issue #47), mirroring githttp.Server.verifyClaims:
 			// a signature valid for some *other* registered org (e.g. a row
-			// retained after CODESTORAGE_ORG changed) must not grant access to
+			// retained after OPENSTORAGE_ORG changed) must not grant access to
 			// this deployment's REST surface. Checked before scopes so the
 			// failure mode matches the git path's ordering.
 			if org != "" && claims.Iss != org {

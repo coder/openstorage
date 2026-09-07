@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/coder/open-storage/internal/envconfig"
 )
 
 const defaultSDKDir = "/home/coder/openstorage/sdk/packages/code-storage-go"
@@ -81,12 +83,12 @@ func looksLikeNetworkFailure(out string) bool {
 }
 
 func TestVendorSDKCompat(t *testing.T) {
-	sdkDir := os.Getenv("CODESTORAGE_SDK_DIR")
+	sdkDir := envconfig.Getenv("OPENSTORAGE_SDK_DIR")
 	if sdkDir == "" {
 		sdkDir = defaultSDKDir
 	}
 	if _, err := os.Stat(filepath.Join(sdkDir, "go.mod")); err != nil {
-		t.Skipf("vendor Go SDK not found at %s (set CODESTORAGE_SDK_DIR to run the compatibility test): %v", sdkDir, err)
+		t.Skipf("vendor Go SDK not found at %s (set OPENSTORAGE_SDK_DIR to run the compatibility test): %v", sdkDir, err)
 	}
 
 	runBackends(t, func(t *testing.T, e *testEnv) { testVendorSDKCompat(t, e, sdkDir) })

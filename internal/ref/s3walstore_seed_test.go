@@ -12,7 +12,7 @@ import (
 )
 
 // opCountingStore counts Get/Create/Advance round trips through a MemCAS —
-// the unit-level twin of the CODESTORAGE_S3_OP_LOG census (issue #182).
+// the unit-level twin of the OPENSTORAGE_S3_OP_LOG census (issue #182).
 type opCountingStore struct {
 	*s3wal.MemCAS
 	gets, puts atomic.Int64

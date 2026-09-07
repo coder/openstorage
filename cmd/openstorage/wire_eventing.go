@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/envconfig"
 	"github.com/coder/open-storage/internal/events"
 	"github.com/coder/open-storage/internal/githttp"
 	"github.com/coder/open-storage/internal/jobs"
@@ -227,7 +228,7 @@ func forwardDeniedFromContext(ctx context.Context) bool {
 // missing/unparseable scope list: only a proven git:read forwards.
 func hookCallerDeniedForward() bool {
 	var scopes []string
-	if raw := os.Getenv(githttp.EnvScopes); raw != "" {
+	if raw := envconfig.Getenv(githttp.EnvScopes); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &scopes); err != nil {
 			return true // fail closed
 		}
@@ -235,8 +236,8 @@ func hookCallerDeniedForward() bool {
 	if !slices.Contains(scopes, auth.ScopeGitRead) {
 		return true
 	}
-	policyJSON := os.Getenv(githttp.EnvRefsPolicy)
-	opsJSON := os.Getenv(githttp.EnvOps)
+	policyJSON := envconfig.Getenv(githttp.EnvRefsPolicy)
+	opsJSON := envconfig.Getenv(githttp.EnvOps)
 	if policyJSON == "" && opsJSON == "" {
 		return false
 	}
@@ -279,7 +280,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 	whStore := events.MetaWebhookStore{Store: ms}
 	creds, ups := upsync.MetaStores(ms)
 	// AllowPrivate steers the delivery client's SSRF dial guard (issue
-	// #53, CODESTORAGE_WEBHOOK_ALLOW_PRIVATE); the guard itself is always
+	// #53, OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE); the guard itself is always
 	// on and redirects are always refused.
 	deliverer := &events.Deliverer{Webhooks: whStore, AllowPrivate: webhookAllowPrivate, Logger: logger}
 
@@ -356,7 +357,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// markers are durable — re-enqueue marked repos so accepted
 		// pull-upstream and push-upstream (#90) requests survive restarts
 		// (in particular the restart that applies
-		// CODESTORAGE_SYNC_STEAL_LEGACY). Delayed so the loopback
+		// OPENSTORAGE_SYNC_STEAL_LEGACY). Delayed so the loopback
 		// listener is serving before the first recovered run pushes; a
 		// run that still meets a held claim re-arms the deferred retry.
 		recovery := time.AfterFunc(pendingSyncRecoveryDelay, func() {
@@ -455,7 +456,7 @@ const hookDeliveryAttempts = 3
 // strict (the safe direction).
 func hookWebhookAllowPrivate(logger *slog.Logger) bool {
 	assertf(logger != nil, "hookWebhookAllowPrivate: nil logger")
-	raw := os.Getenv(envWebhookAllowPrivate)
+	raw := envconfig.Getenv(envWebhookAllowPrivate)
 	if raw == "" {
 		return false
 	}
@@ -471,7 +472,7 @@ func hookWebhookAllowPrivate(logger *slog.Logger) bool {
 // wireHookEventing points githttp.WrapHookRefStore at the events.RefStore
 // decorator for the `openstorage hook` subprocess, so git pushes emit push
 // events exactly like API writes (docs/reference/webhooks.md). It reads the same env the hook
-// itself uses (serve exports PG_URL; CODESTORAGE_ORG is inherited). The
+// itself uses (serve exports PG_URL; OPENSTORAGE_ORG is inherited). The
 // returned cleanup must run after the hook finishes: in local mode it waits
 // for in-flight deliveries (the subprocess IS the queue), in pg mode it
 // closes the insert-only River client.
@@ -482,8 +483,8 @@ func hookWebhookAllowPrivate(logger *slog.Logger) bool {
 // subprocess, and git-surface pushes do NOT schedule upstream syncs (API
 // writes still do); queued local work dies with the process.
 func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
-	org := os.Getenv(envOrg)
-	dbURL := firstNonEmpty(os.Getenv("CODESTORAGE_PG_URL"), os.Getenv("PG_URL"))
+	org := envconfig.Getenv(envOrg)
+	dbURL := firstNonEmpty(envconfig.Getenv("OPENSTORAGE_PG_URL"), envconfig.Getenv("PG_URL"))
 	if org == "" || dbURL == "" {
 		// No eventing wiring (e.g. direct hook invocation outside serve):
 		// keep the identity default so pushes still work, just eventless.
@@ -499,11 +500,11 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 
 	// Secrets codec (issue #54): hook subprocesses inherit serve's
 	// environment, so a serve process that booted with a valid
-	// CODESTORAGE_SECRETS_KEY hands the same value down here. A malformed
+	// OPENSTORAGE_SECRETS_KEY hands the same value down here. A malformed
 	// value (possible only for direct hook invocation outside serve, which
 	// validates at boot) degrades to eventless — fail closed for secrets:
 	// no delivery ever signs with a wrong or plaintext-passthrough key.
-	secretsCodec, err := resolveSecretsCodec(os.Getenv)
+	secretsCodec, err := resolveSecretsCodec(envconfig.Getenv)
 	if err != nil {
 		logger.Error("hook eventing disabled: secrets key", "err", err)
 		return func() {}
@@ -538,7 +539,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		denied := hookCallerDeniedForward()
 		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org,
 			func(context.Context) bool { return denied })
-		if os.Getenv(githttp.EnvSyncClaim) != "" {
+		if envconfig.Getenv(githttp.EnvSyncClaim) != "" {
 			// This receive-pack IS a sync run's own loopback push (the
 			// claim-fenced token, issue #86): poking the sync seam from it
 			// would chain runs. The pull poke was already suppressed by the

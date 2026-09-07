@@ -138,7 +138,7 @@ func TestBootstrapOrgAuth_WarnsAboutRetainedOrgRows(t *testing.T) {
 	}
 	fileBlocks := []string{string(filePEM)}
 
-	// A row retained from a previous CODESTORAGE_ORG value.
+	// A row retained from a previous OPENSTORAGE_ORG value.
 	if _, err := ms.UpsertOrgWithKeys(ctx, "old-org", fileBlocks); err != nil {
 		t.Fatal(err)
 	}

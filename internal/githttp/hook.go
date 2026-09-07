@@ -23,32 +23,33 @@ import (
 
 	"github.com/coder/open-storage/internal/auth"
 	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/envconfig"
 	"github.com/coder/open-storage/internal/meta"
 	"github.com/coder/open-storage/internal/ref"
 )
 
 // Env names used to route request context from the HTTP handler into the
-// git hooks (which re-exec this binary). CODESTORAGE_TEST_* fault-injection
-// knobs are honored only when CODESTORAGE_TEST_MODE=1.
+// git hooks (which re-exec this binary). OPENSTORAGE_TEST_* fault-injection
+// knobs are honored only when OPENSTORAGE_TEST_MODE=1.
 const (
-	EnvRepo = "CODESTORAGE_GIT_REPO"
+	EnvRepo = "OPENSTORAGE_GIT_REPO"
 	// EnvSyncClaim carries the loopback sync push's claim-holder token
 	// (auth.Claims.SyncClaim, issue #86): the update hook refuses the ref
 	// CAS when the repo's sync claim is no longer held by this holder,
 	// fencing a stale run's in-flight force push out of the ref store.
-	EnvSyncClaim  = "CODESTORAGE_SYNC_CLAIM"
-	EnvRefsPolicy = "CODESTORAGE_GIT_REFS_POLICY"
-	EnvOps        = "CODESTORAGE_GIT_OPS"
+	EnvSyncClaim  = "OPENSTORAGE_SYNC_CLAIM"
+	EnvRefsPolicy = "OPENSTORAGE_GIT_REFS_POLICY"
+	EnvOps        = "OPENSTORAGE_GIT_OPS"
 	// EnvScopes carries the pushing token's scope list (JSON array) into
 	// the hook subprocess. The update hook itself never consults it; the
 	// hook-side forward_on_push poke does (issue #90): auto-forwarding
 	// exports every local head/tag upstream, so a write-only token's push
 	// must not trigger it (the same git:read gate the explicit
 	// push-upstream route enforces).
-	EnvScopes = "CODESTORAGE_GIT_SCOPES"
+	EnvScopes = "OPENSTORAGE_GIT_SCOPES"
 	// EnvOrg names the org whose signing keys verify-sig loads. Shared with
 	// the serve config on purpose: the server sets it explicitly for hooks.
-	EnvOrg = "CODESTORAGE_ORG"
+	EnvOrg = "OPENSTORAGE_ORG"
 	// EnvPushHold carries the absolute path of this push's hold file
 	// (issue #170, hydrate.go push-hold machinery). pre-receive reserves
 	// every ref of the push in it before any update-hook CAS can run;
@@ -57,28 +58,28 @@ const (
 	// D/F-conflicting concurrent pushes serialize on the reservation.
 	// Minted per request by the server and stripped from inherited env
 	// like the other per-push inputs.
-	EnvPushHold = "CODESTORAGE_GIT_PUSH_HOLD"
+	EnvPushHold = "OPENSTORAGE_GIT_PUSH_HOLD"
 	// EnvAtomic marks the push `--atomic` (issue #28). githooks(5) exposes
 	// no atomic indicator, so the HTTP layer sniffs the wire capability
 	// (atomic.go) and sets this; pre-receive then evaluates the policy
 	// across ALL commands and denies before publication when any command
 	// is denied — git would abort every ref on the first update-hook
 	// denial anyway.
-	EnvAtomic    = "CODESTORAGE_GIT_ATOMIC"
-	EnvTestMode  = "CODESTORAGE_TEST_MODE"
-	EnvCrash     = "CODESTORAGE_TEST_CRASH"
-	EnvHookDelay = "CODESTORAGE_TEST_HOOK_DELAY_MS"
+	EnvAtomic    = "OPENSTORAGE_GIT_ATOMIC"
+	EnvTestMode  = "OPENSTORAGE_TEST_MODE"
+	EnvCrash     = "OPENSTORAGE_TEST_CRASH"
+	EnvHookDelay = "OPENSTORAGE_TEST_HOOK_DELAY_MS"
 	// EnvPushDrainMS shrinks the post-copy drain read deadline
 	// (pushDrainTimeout) so the e2e lane can prove hook phases outlive it
 	// (issue #141's receive-pack sibling); ignored outside test mode.
-	EnvPushDrainMS = "CODESTORAGE_TEST_PUSH_DRAIN_MS"
+	EnvPushDrainMS = "OPENSTORAGE_TEST_PUSH_DRAIN_MS"
 	// EnvCASDrop/EnvCASDropHard hold a marker-file path; the first update
 	// hook to create the marker lets its CAS statement commit, then reports
 	// a synthetic connection-drop error (issue #2's ambiguous outcome).
 	// The hard variant also fails the recovery recheck read, as a truly
 	// dead connection would. Later invocations pass through untouched.
-	EnvCASDrop     = "CODESTORAGE_TEST_CAS_DROP"
-	EnvCASDropHard = "CODESTORAGE_TEST_CAS_DROP_HARD"
+	EnvCASDrop     = "OPENSTORAGE_TEST_CAS_DROP"
+	EnvCASDropHard = "OPENSTORAGE_TEST_CAS_DROP_HARD"
 	// EnvUpdateBarrier holds a handshake-file path prefix; the first update
 	// hook to create <path>.ready pauses AFTER its authority CAS commits
 	// and before the hook exits — i.e. before receive-pack performs its own
@@ -86,35 +87,35 @@ const (
 	// this is exactly the window a concurrent hydrate can full-sync the
 	// just-committed ref into the shared cache repo). Later invocations
 	// pass through untouched.
-	EnvUpdateBarrier = "CODESTORAGE_TEST_UPDATE_BARRIER"
+	EnvUpdateBarrier = "OPENSTORAGE_TEST_UPDATE_BARRIER"
 	// EnvUpdateBarrierEach is EnvUpdateBarrier's per-command variant: a
 	// handshake-path PREFIX at which EVERY update hook pauses after its
 	// committed authority CAS, each under a ref-derived suffix (issue
 	// #186 finding 5: the coalescing e2e lane interleaves advertisements
 	// BETWEEN a fanout's hook CASes, which the one-shot barrier cannot
 	// stage).
-	EnvUpdateBarrierEach = "CODESTORAGE_TEST_UPDATE_BARRIER_EACH"
+	EnvUpdateBarrierEach = "OPENSTORAGE_TEST_UPDATE_BARRIER_EACH"
 	// EnvPreReceiveBarrier holds a handshake-file path prefix; the first
 	// pre-receive to create <path>.ready pauses AFTER pack publication
 	// and BEFORE the deferred hold reservation (Codex round-23 security
 	// P2: exactly the window in which a concurrent same-name or
 	// D/F-relative push must be able to proceed) until the test creates
 	// <path>.release. Later invocations pass through untouched.
-	EnvPreReceiveBarrier = "CODESTORAGE_TEST_PRERECEIVE_BARRIER"
+	EnvPreReceiveBarrier = "OPENSTORAGE_TEST_PRERECEIVE_BARRIER"
 	// CrashHeader lets tests request an EnvCrash injection per push; the
 	// server refuses it outside test mode.
 	CrashHeader = "X-Openstorage-Test-Crash"
 )
 
 // PG/S3 connection env for hooks, inherited from the serve process.
-// Canonical CODESTORAGE_* names first; the bare legacy names are still read
+// Canonical OPENSTORAGE_* names first; the bare legacy names are still read
 // so a serve process exporting only those keeps working hooks.
 var (
-	envHookPGURL   = []string{"CODESTORAGE_PG_URL", "PG_URL"}
-	envHookBlobURL = []string{"CODESTORAGE_S3_URL", "BLOB_URL"}
+	envHookPGURL   = []string{"OPENSTORAGE_PG_URL", "PG_URL"}
+	envHookBlobURL = []string{"OPENSTORAGE_S3_URL", "BLOB_URL"}
 )
 
-func testMode() bool { return os.Getenv(EnvTestMode) == "1" }
+func testMode() bool { return envconfig.Getenv(EnvTestMode) == "1" }
 
 // WrapHookRefStore decorates the ref store the update hook opens for its
 // CAS. Hooks run in a fresh `openstorage hook` subprocess (git execs the
@@ -132,7 +133,7 @@ var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) ref.RefStore {
 
 func mustEnv(names ...string) string {
 	for _, n := range names {
-		if v := os.Getenv(n); v != "" {
+		if v := envconfig.Getenv(n); v != "" {
 			return v
 		}
 	}
@@ -179,9 +180,9 @@ func RunHook(ctx context.Context, args []string) error {
 // for committed transactions, and a lost append only defers release to
 // post-receive, the pre-existing bound.
 func referenceTransactionHook(args []string) error {
-	holdPath := os.Getenv(EnvPushHold)
+	holdPath := envconfig.Getenv(EnvPushHold)
 	act := len(args) >= 1 && args[0] == "committed" &&
-		holdPath != "" && os.Getenv(EnvAtomic) != "1"
+		holdPath != "" && envconfig.Getenv(EnvAtomic) != "1"
 	// Drain stdin fully even when gated off (EPIPE noise on the writer
 	// otherwise — same reasoning as post-receive). Names flush in BOUNDED
 	// batches (PR #195 round-15 P2): a batched committed callback lists
@@ -255,7 +256,7 @@ func postReceiveHook() error {
 	// reservation — while stdin carries one record per updated ref, an
 	// attacker-scaled stream whose drain would keep same-name and
 	// D/F-relative pushes blocked into their reservation timeout.
-	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+	if holdPath := envconfig.Getenv(EnvPushHold); holdPath != "" {
 		removePushHoldFiles(holdPath)
 	}
 	// Then drain the updated-ref list git feeds on stdin (unused):
@@ -327,14 +328,14 @@ func preReceive(ctx context.Context) (retErr error) {
 		if retErr == nil {
 			return
 		}
-		if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+		if holdPath := envconfig.Getenv(EnvPushHold); holdPath != "" {
 			removePushHoldFiles(holdPath)
 		}
 	}()
 	repo := mustEnv(EnvRepo)
 	// git sets GIT_QUARANTINE_PATH only when the client transfers objects;
 	// delete-only pushes invoke pre-receive without it.
-	quarantine := os.Getenv("GIT_QUARANTINE_PATH")
+	quarantine := envconfig.Getenv("GIT_QUARANTINE_PATH")
 
 	// Stdin is external input (git relays it from the client connection):
 	// malformed lines deny the push with an error, never a panic.
@@ -361,7 +362,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	if len(commands) == 0 {
 		return errors.New("pre-receive: git invoked hook with no commands")
 	}
-	atomicPush := os.Getenv(EnvAtomic) == "1"
+	atomicPush := envconfig.Getenv(EnvAtomic) == "1"
 
 	// Full-policy verdicts are evaluated AT MOST once per command per push
 	// — memoized per index so every pre-receive consumer (the atomic
@@ -447,7 +448,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	// cannot write for the push window. For atomic pushes every verdict
 	// is nil by this point, so the filter naturally reserves the full
 	// set. The server removes the hold file when receive-pack exits.
-	holdPath := os.Getenv(EnvPushHold)
+	holdPath := envconfig.Getenv(EnvPushHold)
 	// Every return path after publication must run this (both the
 	// quarantined-pack path and the no-pack path): a push that skipped
 	// it would run update hooks with no reservation at all.
@@ -624,7 +625,7 @@ func preReceive(ctx context.Context) (retErr error) {
 			// whose REAL evaluation just passed is recorded, so its update
 			// hook consumes the verdict with an O(log n) lookup instead of
 			// charging the per-evaluation verify fee again — with a small
-			// CODESTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
+			// OPENSTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
 			// refs costs ~N+1 fee units here, and hooks re-charging another N
 			// pushed a fully compliant push past the walk allowance. Inputs
 			// are identical (same push, same policy env, same shas), so the
@@ -954,7 +955,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	var reservedGens map[string]string
 	var quota int64 // 0 = quota disabled (restore covers are skipped too)
 	var ttl time.Duration
-	if quotaRaw := os.Getenv(EnvPackQuota); quotaRaw != "" {
+	if quotaRaw := envconfig.Getenv(EnvPackQuota); quotaRaw != "" {
 		q, err := strconv.ParseInt(quotaRaw, 10, 64)
 		if err != nil || q <= 0 {
 			// The env is set by our own server (never by the client), but
@@ -1025,7 +1026,7 @@ func preReceive(ctx context.Context) (retErr error) {
 			// Test knob: crash after the reservation committed, before any
 			// upload — the reservation deliberately leaks (issue #29's
 			// reserve → crash → sweep recovery window).
-			if testMode() && os.Getenv(EnvCrash) == "after-reserve" {
+			if testMode() && envconfig.Getenv(EnvCrash) == "after-reserve" {
 				fmt.Fprintln(os.Stderr, "openstorage: crashing after reservation, before upload (test knob)")
 				os.Exit(42)
 			}
@@ -1067,7 +1068,7 @@ func preReceive(ctx context.Context) (retErr error) {
 
 	// Test knob: crash between S3 upload and PG commit. The reservation
 	// deliberately leaks here — TTL expiry plus the sweeper reclaim it.
-	if testMode() && os.Getenv(EnvCrash) == "after-s3" {
+	if testMode() && envconfig.Getenv(EnvCrash) == "after-s3" {
 		fmt.Fprintln(os.Stderr, "openstorage: crashing after S3 upload, before PG commit (test knob)")
 		os.Exit(42)
 	}
@@ -1124,7 +1125,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	// concurrent push proceeds while this one is published but not yet
 	// reserved.
 	if testMode() {
-		if p := os.Getenv(EnvPreReceiveBarrier); p != "" {
+		if p := envconfig.Getenv(EnvPreReceiveBarrier); p != "" {
 			pauseAtUpdateBarrier(p)
 		}
 	}
@@ -1545,7 +1546,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// push an EARLIER hook's committed CAS relies on later hooks keeping
 	// the file fresh until git's final local transaction (Codex round-2
 	// P2 on #173).
-	holdPath := os.Getenv(EnvPushHold)
+	holdPath := envconfig.Getenv(EnvPushHold)
 	// Whether THIS ref is actually covered by the push's hold — set when
 	// the bulk reservation is confirmed or the JIT/sidecar
 	// self-reservation succeeds below (PR #195 round-8 P2): a mixed
@@ -1590,7 +1591,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 			if retErr == nil {
 				return
 			}
-			if os.Getenv(EnvAtomic) == "1" {
+			if envconfig.Getenv(EnvAtomic) == "1" {
 				// A whole-push release regardless of THIS ref's coverage:
 				// one atomic denial dooms every sibling's reservation.
 				removePushHoldFiles(holdPath)
@@ -1708,7 +1709,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// race by re-evaluating the holder ATOMICALLY inside the CAS
 	// statement itself — a steal committing after the precheck makes the
 	// CAS report won=false instead of publishing the stale ref.
-	if holder := os.Getenv(EnvSyncClaim); holder != "" {
+	if holder := envconfig.Getenv(EnvSyncClaim); holder != "" {
 		if err := enforceSyncClaimFence(ctx, repo, holder); err != nil {
 			return err
 		}
@@ -1717,7 +1718,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 
 	// Test knob: widen the CAS race window deterministically.
 	if testMode() {
-		if ms := os.Getenv(EnvHookDelay); ms != "" {
+		if ms := envconfig.Getenv(EnvHookDelay); ms != "" {
 			n, err := strconv.Atoi(ms)
 			assertf(err == nil && n >= 0, "bad %s=%q", EnvHookDelay, ms)
 			time.Sleep(time.Duration(n) * time.Millisecond)
@@ -1792,10 +1793,10 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// receive-pack's local ref update so the e2e lane can deterministically
 	// interleave a concurrent hydrate into that window.
 	if testMode() {
-		if p := os.Getenv(EnvUpdateBarrier); p != "" {
+		if p := envconfig.Getenv(EnvUpdateBarrier); p != "" {
 			pauseAtUpdateBarrier(p)
 		}
-		if p := os.Getenv(EnvUpdateBarrierEach); p != "" {
+		if p := envconfig.Getenv(EnvUpdateBarrierEach); p != "" {
 			pauseAtUpdateBarrier(updateBarrierEachPath(p, refName))
 		}
 	}
@@ -2022,9 +2023,9 @@ func (s casDropStore) GetRef(ctx context.Context, repo, name string) (string, er
 // mode only): the invocation that creates the marker file gets the faulty
 // store; every other invocation passes st through untouched.
 func injectCASDrop(st ref.RefStore) ref.RefStore {
-	marker, hard := os.Getenv(EnvCASDrop), false
+	marker, hard := envconfig.Getenv(EnvCASDrop), false
 	if marker == "" {
-		marker, hard = os.Getenv(EnvCASDropHard), true
+		marker, hard = envconfig.Getenv(EnvCASDropHard), true
 	}
 	if marker == "" {
 		return st
@@ -2199,8 +2200,8 @@ func loadRefPolicies(policyJSON, opsJSON string) ([]auth.RefPolicy, error) {
 // attacker-chosen via the push's command list (Codex round-14 security
 // P2).
 func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval bool) error {
-	policyJSON := os.Getenv(EnvRefsPolicy)
-	opsJSON := os.Getenv(EnvOps)
+	policyJSON := envconfig.Getenv(EnvRefsPolicy)
+	opsJSON := envconfig.Getenv(EnvOps)
 	if policyJSON == "" && opsJSON == "" {
 		return nil
 	}
@@ -2512,7 +2513,7 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		examined++
 		if maxWalk > 0 && state.walked+examined > maxWalk {
 			abort()
-			return nil, examined, state.exhaust(fmt.Sprintf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
+			return nil, examined, state.exhaust(fmt.Sprintf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× OPENSTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
 				refName, maxWalk, verifyWalkBudgetMultiplier))
 		}
 		if state.ok[line] {
@@ -2527,7 +2528,7 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		pending = append(pending, line)
 		if budget > 0 && state.spent+len(pending) > budget {
 			abort()
-			return nil, examined, fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces more than %d unverified commits with %d of %d verifications already used (raise CODESTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
+			return nil, examined, fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces more than %d unverified commits with %d of %d verifications already used (raise OPENSTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
 				refName, budget-state.spent, state.spent, budget)
 		}
 	}

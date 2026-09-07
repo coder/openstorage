@@ -110,7 +110,7 @@ func TestSweepLFS_LegacySpellingSweepsAsLFS(t *testing.T) {
 }
 
 // TestSweepHeal_ReconcilesTwinRows (Codex round 85): with periodic
-// sweeping disabled (CODESTORAGE_SWEEP_INTERVAL=0), startup runs Heal —
+// sweeping disabled (OPENSTORAGE_SWEEP_INTERVAL=0), startup runs Heal —
 // which never invoked the twin-row janitor, so a mixed-roll duplicate
 // (legacy row stranded beside the canonical one) double-charged usage and
 // the object cap indefinitely. Heal must reconcile too.
@@ -139,7 +139,7 @@ func TestSweepHeal_ReconcilesTwinRows(t *testing.T) {
 // makes its retained source an aged rowless orphan, so DeleteLFS alone
 // would reap it mid-roll and 404 those replicas' downloads. Legacy-spelled
 // keys therefore need the SEPARATE post-roll opt-in
-// (CODESTORAGE_SWEEP_DELETE_LFS_LEGACY): the transition gate dominates
+// (OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY): the transition gate dominates
 // every other flag combination. Canonical orphans keep sweeping under
 // DeleteLFS alone.
 func TestSweepLFS_LegacyReapNeedsExplicitOptIn(t *testing.T) {
@@ -449,7 +449,7 @@ func TestSweepLFS_HealTruncatedPurgesMismatchedBackup(t *testing.T) {
 }
 
 // TestSweepLFS_ReconcileTickerReconcilesLateTwins (Codex round 88 +
-// security twin): with CODESTORAGE_SWEEP_INTERVAL=0 the startup Heal was
+// security twin): with OPENSTORAGE_SWEEP_INTERVAL=0 the startup Heal was
 // the ONLY reconciliation pass, but a mixed-roll old replica can insert a
 // legacy row beside an existing canonical one at any time after startup —
 // registered fast paths never re-register, so the duplicate count and
@@ -726,7 +726,7 @@ func TestSweepLFS_PurgeVsLegacyGate(t *testing.T) {
 			t.Fatalf("Sweep: %v", err)
 		}
 		if !f.exists(legacy) {
-			t.Fatal("live repo's legacy key reaped without CODESTORAGE_SWEEP_DELETE_LFS_LEGACY — the transition gate must dominate even with the purge probe wired")
+			t.Fatal("live repo's legacy key reaped without OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY — the transition gate must dominate even with the purge probe wired")
 		}
 	})
 }
@@ -744,7 +744,7 @@ func TestSweepLFS_HealTakesNoCoverWhenQuotaDisabled(t *testing.T) {
 	f.upload(quarantineKey(key), content)
 
 	// QuotaEnforced deliberately unset: the production default when
-	// CODESTORAGE_PACK_QUOTA_BYTES is absent.
+	// OPENSTORAGE_PACK_QUOTA_BYTES is absent.
 	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}

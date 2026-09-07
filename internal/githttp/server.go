@@ -24,6 +24,7 @@ import (
 
 	"github.com/coder/open-storage/internal/auth"
 	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/envconfig"
 	"github.com/coder/open-storage/internal/meta"
 	"github.com/coder/open-storage/internal/ref"
 )
@@ -59,7 +60,7 @@ type Server struct {
 	// already fail key resolution inside Verifier (401).
 	Org string
 	// TestMode gates fault-injection knobs (crash header). Only ever set
-	// from CODESTORAGE_TEST_MODE=1; the crash header is refused otherwise.
+	// from OPENSTORAGE_TEST_MODE=1; the crash header is refused otherwise.
 	TestMode bool
 	// ResolveRepo maps a base path element (docs/explanation/git-protocol-and-namespaces.md: repo_id, but ADR-21
 	// accepts name-style urls too) to its live repo record. ok=false when
@@ -101,7 +102,7 @@ type Server struct {
 	// trailing slash) LFS proxy transfer hrefs are built on (issue #51:
 	// uploads always proxy, so behind a reverse proxy the href must be
 	// the canonical external URL — the backend request's Host header may
-	// be internal). Set by the serve wiring from $CODESTORAGE_BASE_URL
+	// be internal). Set by the serve wiring from $OPENSTORAGE_BASE_URL
 	// (or the bound listener); when empty, hrefs fall back to the
 	// request's Host and X-Forwarded-Proto.
 	BaseURL string
@@ -126,14 +127,14 @@ type Server struct {
 	// and the per-repository quota is neither node-wide nor guaranteed
 	// enabled, so without this budget concurrent distinct-key uploads
 	// could exhaust a replica's disk. Set by the serve wiring
-	// ($CODESTORAGE_LFS_STAGING_BYTES, default 10 GiB); <= 0 disables the
+	// ($OPENSTORAGE_LFS_STAGING_BYTES, default 10 GiB); <= 0 disables the
 	// bound (the operator's explicit opt-out).
 	LFSStagingBytes int64
 	// LFSV020WriteCompat keeps the v0.2.0 LFS read surface alive during a
 	// rolling upgrade (ADR-41, Codex round 80): old replicas derive only
 	// the legacy single-key spelling, so a mixed-version fleet would 404
 	// objects that exist only canonically. When set (serve wiring,
-	// $CODESTORAGE_LFS_V020_WRITE_COMPAT), every verified publication
+	// $OPENSTORAGE_LFS_V020_WRITE_COMPAT), every verified publication
 	// also copies the bytes to the legacy key — rowless copies the orphan
 	// sweep reclaims after the flag is dropped post-roll. Off by default:
 	// the canonical spelling is the secure one, and the compat copies are
@@ -472,7 +473,7 @@ func NewServer(st ref.RefStore, bl blob.BlobStore, cacheDir string, verifier aut
 		CacheDir: cacheDir,
 		Verifier: verifier,
 		Org:      org,
-		TestMode: os.Getenv(EnvTestMode) == "1",
+		TestMode: envconfig.Getenv(EnvTestMode) == "1",
 	}
 }
 
@@ -663,7 +664,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, status, err.Error())
 		return
 	}
-	// Fault-injection is only ever honored under CODESTORAGE_TEST_MODE=1;
+	// Fault-injection is only ever honored under OPENSTORAGE_TEST_MODE=1;
 	// otherwise the request is refused loudly rather than silently ignored.
 	crash := r.Header.Get(CrashHeader)
 	if crash != "" && !s.TestMode {
@@ -857,54 +858,16 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	}
 
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
-	cmd.Env = os.Environ()
+	cmd.Env = envconfig.Environ()
 	// No-op for upload-pack; receive-pack assigns the real hold release.
 	releasePushHold := func() {}
 	if service == "receive-pack" {
-		// Never inherit per-push hook env from the serve process
-		// environment (Codex round 2): the hooks trust these as THIS
-		// request's state, so a stale operator-exported value would poison
-		// every push (EnvAtomic: denial-happy mixed-policy handling;
-		// EnvVerifyState: verdicts and budget shared ACROSS pushes;
-		// EnvVerifySigBudget: an unvalidated value failing every
-		// verify-sig push closed) — and appending without stripping would
-		// not even override it, since duplicate env entries resolve
-		// first-match in Go children. os.Environ() returns a fresh copy,
-		// so the in-place filter aliases nothing.
-		env := cmd.Env[:0]
-		for _, kv := range cmd.Env {
-			// EnvUsageFloor, EnvVerifyState, and EnvVerifySigBudget are
-			// stripped for the same reason: the hook trusts them as THIS
-			// push's admission floor and verification state/budget.
-			// EnvScopes/EnvRefsPolicy/EnvOps carry THIS caller's verified
-			// authority (Codex round 6 on #90): duplicates resolve
-			// first-match in Go children, so an inherited stale value
-			// would SHADOW the appended verified one — e.g. an inherited
-			// scope list containing git:read would let a write-only
-			// caller trigger full-repository forwarding, and an inherited
-			// permissive policy would shadow the caller's restrictive
-			// one.
-			if !strings.HasPrefix(kv, EnvAtomic+"=") &&
-				!strings.HasPrefix(kv, EnvUsageFloor+"=") &&
-				!strings.HasPrefix(kv, EnvVerifyState+"=") &&
-				!strings.HasPrefix(kv, EnvVerifySigBudget+"=") &&
-				!strings.HasPrefix(kv, EnvSyncClaim+"=") &&
-				!strings.HasPrefix(kv, EnvScopes+"=") &&
-				!strings.HasPrefix(kv, EnvRefsPolicy+"=") &&
-				!strings.HasPrefix(kv, EnvOps+"=") &&
-				!strings.HasPrefix(kv, EnvPushHold+"=") {
-				env = append(env, kv)
-			}
-		}
-		cmd.Env = append(env,
-			EnvRepo+"="+target.key,
-			EnvOrg+"="+s.Org,
-		)
+		cmd.Env = pushHookEnv(cmd.Env, target.key, s.Org)
 		// Loopback sync pushes carry the run's claim-holder token
 		// (verified JWT claim, issue #86); the update hook fences the ref
 		// CAS on it. Stripped above so operator env can never poison it.
 		if claims.SyncClaim != "" {
-			cmd.Env = append(cmd.Env, EnvSyncClaim+"="+claims.SyncClaim)
+			cmd.Env = envconfig.Set(cmd.Env, EnvSyncClaim, claims.SyncClaim)
 		}
 		// Resolved quota for the pre-receive hook's authoritative
 		// usage+incoming check (quota.go); absent means disabled.
@@ -923,7 +886,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 				httpError(w, http.StatusInternalServerError, "storage quota check failed")
 				return
 			}
-			cmd.Env = append(cmd.Env, EnvPackQuota+"="+strconv.FormatInt(s.PackQuotaBytes, 10))
+			cmd.Env = envconfig.Set(cmd.Env, EnvPackQuota, strconv.FormatInt(s.PackQuotaBytes, 10))
 			// The floor carries its mint time (Codex round 30): the hook
 			// runs only after the client's transfer, whose duration the
 			// client controls, so the hook must be able to judge the
@@ -932,19 +895,19 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// snapshotted (Codex round 49), so the hook can reject a
 			// floor whose listed bytes another replica adopted while the
 			// client transferred.
-			cmd.Env = append(cmd.Env, EnvUsageFloor+"="+strconv.FormatInt(floor, 10)+
+			cmd.Env = envconfig.Set(cmd.Env, EnvUsageFloor, strconv.FormatInt(floor, 10)+
 				":"+strconv.FormatInt(time.Now().Unix(), 10)+":"+strconv.FormatInt(gen, 10))
 			if s.PackReservationTTL > 0 {
-				cmd.Env = append(cmd.Env, EnvPackReservationTTL+"="+s.PackReservationTTL.String())
+				cmd.Env = envconfig.Set(cmd.Env, EnvPackReservationTTL, s.PackReservationTTL.String())
 			}
 		}
 		if atomicPush {
-			cmd.Env = append(cmd.Env, EnvAtomic+"=1")
+			cmd.Env = envconfig.Set(cmd.Env, EnvAtomic, "1")
 		}
 		// The refs claim is passed through raw (docs/reference/authentication.md tuple encoding);
 		// the update hook owns parsing and fails closed on malformed JSON.
 		if len(claims.Refs) > 0 {
-			cmd.Env = append(cmd.Env, EnvRefsPolicy+"="+string(claims.Refs))
+			cmd.Env = envconfig.Set(cmd.Env, EnvRefsPolicy, string(claims.Refs))
 		}
 		// Scopes feed the hook-side forward_on_push poke's git:read gate
 		// (see EnvScopes doc); receive-pack callers always carry at least
@@ -952,17 +915,17 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if len(claims.Scopes) > 0 {
 			scopes, err := json.Marshal(claims.Scopes)
 			assertf(err == nil, "marshal scopes claim: %v", err)
-			cmd.Env = append(cmd.Env, EnvScopes+"="+string(scopes))
+			cmd.Env = envconfig.Set(cmd.Env, EnvScopes, string(scopes))
 		}
 		// Deprecated repo-wide ops claim: folded into the ref policies by
 		// the hook (docs/reference/authentication.md fallback semantics).
 		if len(claims.Ops) > 0 {
 			ops, err := json.Marshal(claims.Ops)
 			assertf(err == nil, "marshal ops claim: %v", err)
-			cmd.Env = append(cmd.Env, EnvOps+"="+string(ops))
+			cmd.Env = envconfig.Set(cmd.Env, EnvOps, string(ops))
 		}
 		if s.TestMode && crash != "" {
-			cmd.Env = append(cmd.Env, EnvCrash+"="+crash)
+			cmd.Env = envconfig.Set(cmd.Env, EnvCrash, crash)
 		}
 		// Per-push verify-sig verdict state (issue #59, verifystate.go):
 		// fresh files per receive-pack request, appended to by the
@@ -987,9 +950,9 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
-		cmd.Env = append(cmd.Env, EnvVerifyState+"="+statePath)
+		cmd.Env = envconfig.Set(cmd.Env, EnvVerifyState, statePath)
 		if s.VerifySigBudget > 0 {
-			cmd.Env = append(cmd.Env, EnvVerifySigBudget+"="+strconv.Itoa(s.VerifySigBudget))
+			cmd.Env = envconfig.Set(cmd.Env, EnvVerifySigBudget, strconv.Itoa(s.VerifySigBudget))
 		}
 		// Push hold (issue #170): the file this push's update hooks record
 		// their in-flight refs in, so concurrent full syncs skip those refs
@@ -1032,7 +995,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			})
 		}
 		defer releasePushHold()
-		cmd.Env = append(cmd.Env, EnvPushHold+"="+holdPath)
+		cmd.Env = envconfig.Set(cmd.Env, EnvPushHold, holdPath)
 	}
 	cmd.Stderr = os.Stderr
 
@@ -1079,7 +1042,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// Test knob: shrink the drain window below an injected hook
 			// delay (EnvHookDelay) so the e2e lane can prove hook phases
 			// outlive it (issue #141's receive-pack sibling).
-			if ms := os.Getenv(EnvPushDrainMS); ms != "" {
+			if ms := envconfig.Getenv(EnvPushDrainMS); ms != "" {
 				n, err := strconv.Atoi(ms)
 				assertf(err == nil && n > 0, "bad %s=%q", EnvPushDrainMS, ms)
 				drainTimeout = time.Duration(n) * time.Millisecond

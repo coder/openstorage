@@ -1,5 +1,5 @@
 // Serve/CLI configuration resolution: flags take precedence, then the
-// canonical CODESTORAGE_* environment variables, then the SPIKE_*/legacy
+// canonical OPENSTORAGE_* environment variables, then the SPIKE_*/legacy
 // spike aliases (PG_URL, BLOB_URL) so phase-0 invocations keep working.
 package main
 
@@ -24,42 +24,42 @@ import (
 
 // Environment variable names, canonical first; envFirst scans left to right.
 var (
-	envPGURL   = []string{"CODESTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL"}
-	envBlobURL = []string{"CODESTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL"}
+	envPGURL   = []string{"OPENSTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL"}
+	envBlobURL = []string{"OPENSTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL"}
 )
 
 const (
-	envListen     = "CODESTORAGE_LISTEN"
-	envOrg        = "CODESTORAGE_ORG"
-	envOrgPubKeys = "CODESTORAGE_ORG_PUBKEYS"
-	envBaseURL    = "CODESTORAGE_BASE_URL"
-	envDataDir    = "CODESTORAGE_DATA_DIR"
-	envRateRPS    = "CODESTORAGE_RATE_RPS"
-	envRateBurst  = "CODESTORAGE_RATE_BURST"
+	envListen     = "OPENSTORAGE_LISTEN"
+	envOrg        = "OPENSTORAGE_ORG"
+	envOrgPubKeys = "OPENSTORAGE_ORG_PUBKEYS"
+	envBaseURL    = "OPENSTORAGE_BASE_URL"
+	envDataDir    = "OPENSTORAGE_DATA_DIR"
+	envRateRPS    = "OPENSTORAGE_RATE_RPS"
+	envRateBurst  = "OPENSTORAGE_RATE_BURST"
 
 	// Trusted-proxy allowlist for rate-limit client identity (issue #30):
 	// comma-separated CIDR prefixes (bare IPs accepted as single-address
 	// entries). Unset keeps RemoteAddr-only keying.
-	envTrustedProxies = "CODESTORAGE_TRUSTED_PROXIES"
+	envTrustedProxies = "OPENSTORAGE_TRUSTED_PROXIES"
 
 	// Per-repo pack-bytes quota on the git surface (issue #21): receive-pack
 	// refuses pushes that would take a repo's packs/ prefix past this many
 	// bytes. Unset applies the generous default; "0" disables enforcement.
-	envPackQuota = "CODESTORAGE_PACK_QUOTA_BYTES"
+	envPackQuota = "OPENSTORAGE_PACK_QUOTA_BYTES"
 
 	// Reservation TTL for the quota's durable admission ledger (issue #29):
 	// how long a crashed writer's reservation keeps gating admission. Must
 	// comfortably exceed the longest plausible server-side pack upload —
 	// an expiring in-flight reservation reopens the overshoot the ledger
 	// closes. Unset applies the one-hour default; must be positive.
-	envPackReservationTTL = "CODESTORAGE_PACK_RESERVATION_TTL"
+	envPackReservationTTL = "OPENSTORAGE_PACK_RESERVATION_TTL"
 
 	// Instance-lease TTL for the s3wal dual-serve guard (issue #133,
 	// plan §2.11). s3wal mode only; unset applies the 2-minute default.
 	// The heartbeat cadence is derived (TTL/4). Lowering it mainly serves
 	// tests/drills — a too-small TTL makes transient S3 hiccups fail-stop
 	// the node, so the floor refuses sub-second values.
-	envS3WALLeaseTTL = "CODESTORAGE_S3WAL_LEASE_TTL"
+	envS3WALLeaseTTL = "OPENSTORAGE_S3WAL_LEASE_TTL"
 
 	// Decoded-byte cap on one git push (issue #55): receive-pack requests
 	// whose body (after any gzip decode) exceeds this many bytes are
@@ -67,13 +67,13 @@ const (
 	// cap from the pack quota (a push cannot legitimately exceed what
 	// quota admission would accept, plus protocol overhead); "0" disables
 	// the cap.
-	envMaxPushBytes = "CODESTORAGE_MAX_PUSH_BYTES"
+	envMaxPushBytes = "OPENSTORAGE_MAX_PUSH_BYTES"
 
 	// Per-push verified-commit budget (issue #59): the maximum number of
 	// commits one push may signature-verify across all its refs before it
 	// is rejected (fail closed). Unset applies the generous default; "0"
 	// disables the budget.
-	envVerifySigBudget = "CODESTORAGE_VERIFY_SIG_BUDGET"
+	envVerifySigBudget = "OPENSTORAGE_VERIFY_SIG_BUDGET"
 
 	// Orphan-pack sweep (issue #5): interval between sweeps ("0" disables
 	// sweeping), minimum blob age before an unregistered pack counts as an
@@ -87,9 +87,9 @@ const (
 	// mis-reaped registered pack — but an old writer racing a delete-mode
 	// sweep can see its freshly registered pack unavailable until the next
 	// sweep heals it. List-only mode is safe on any fleet.
-	envSweepInterval      = "CODESTORAGE_SWEEP_INTERVAL"
-	envSweepAgeThreshold  = "CODESTORAGE_SWEEP_AGE_THRESHOLD"
-	envSweepDeleteEnabled = "CODESTORAGE_SWEEP_DELETE_ENABLED"
+	envSweepInterval      = "OPENSTORAGE_SWEEP_INTERVAL"
+	envSweepAgeThreshold  = "OPENSTORAGE_SWEEP_AGE_THRESHOLD"
+	envSweepDeleteEnabled = "OPENSTORAGE_SWEEP_DELETE_ENABLED"
 
 	// Narrow superseded-class deletion (issue #31): reap aged blobs whose
 	// registry rows a repack fold provably removed (durable pack_retained
@@ -97,7 +97,7 @@ const (
 	// default — set "false" to disable. On S3 it degrades to list-only per
 	// run when the bucket is versioned (the DeleteGuard), rather than
 	// failing startup like the explicit general delete opt-in.
-	envSweepDeleteSuperseded = "CODESTORAGE_SWEEP_DELETE_SUPERSEDED"
+	envSweepDeleteSuperseded = "OPENSTORAGE_SWEEP_DELETE_SUPERSEDED"
 
 	// LFS-class deletion (issue #51): reap aged lfs/ blobs with no
 	// lfs_objects registry row. OFF by default and separate from the
@@ -106,12 +106,12 @@ const (
 	// must not start reaping its pre-existing LFS population on upgrade.
 	// Enable only after list-only reports stop naming live objects
 	// (write-scoped touches adopt stored objects into the registry).
-	envSweepDeleteLFS = "CODESTORAGE_SWEEP_DELETE_LFS"
+	envSweepDeleteLFS = "OPENSTORAGE_SWEEP_DELETE_LFS"
 	// envSweepDeleteLFSLegacy additionally admits LEGACY-SPELLED LFS keys
 	// to the LFS reap — the explicit post-roll cleanup opt-in of the
 	// ADR-41 two-phase key migration (Codex round 81). Keep it off while
 	// any pre-upgrade replica may still serve reads.
-	envSweepDeleteLFSLegacy = "CODESTORAGE_SWEEP_DELETE_LFS_LEGACY"
+	envSweepDeleteLFSLegacy = "OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY"
 
 	// Soft-deleted repository retention (issue #52): how long after its
 	// soft-delete a repository's registry rows and blobs are permanently
@@ -123,17 +123,17 @@ const (
 	// cannot be restored, and the purge releases the deleted repository's
 	// burned (org, url) name — pick a retention comfortably above any
 	// issued token lifetime.
-	envRepoRetention = "CODESTORAGE_REPO_RETENTION"
+	envRepoRetention = "OPENSTORAGE_REPO_RETENTION"
 
 	// Node-wide LFS upload staging budget (issue #51): proxy uploads
 	// stage their full Content-Length on local disk before verification,
 	// so a replica needs a disk bound independent of the per-repo quota
 	// (which is per-repository and may be disabled). "0" disables.
-	envLFSStagingBytes = "CODESTORAGE_LFS_STAGING_BYTES"
+	envLFSStagingBytes = "OPENSTORAGE_LFS_STAGING_BYTES"
 	// envLFSV020WriteCompat keeps the v0.2.0 LFS read surface alive
 	// during a rolling upgrade (ADR-41): set to "1"/"true" on upgraded
 	// replicas until the fleet rolls, then drop it.
-	envLFSV020WriteCompat = "CODESTORAGE_LFS_V020_WRITE_COMPAT"
+	envLFSV020WriteCompat = "OPENSTORAGE_LFS_V020_WRITE_COMPAT"
 
 	// Unreferenced-LFS-object reclamation (issue #73): a bounded
 	// background scan walks each repo's reachable pointer files and
@@ -141,28 +141,28 @@ const (
 	// once they stay unreferenced for a full grace window — unwedging the
 	// per-repo object-count cap after junk uploads. Interval 0 (the
 	// default) disables the job entirely and is the emergency stop.
-	envLFSGCInterval = "CODESTORAGE_LFS_GC_INTERVAL"
+	envLFSGCInterval = "OPENSTORAGE_LFS_GC_INTERVAL"
 	// envLFSGCGrace is how long a row must stay CONTINUOUSLY observed
 	// unreferenced before retirement (default 24h). Retirement re-checks
 	// the grace inside the guarded delete, so any liveness signal —
 	// batch/PUT touch, re-registration, a pointer push — restarts the
 	// window.
-	envLFSGCGrace = "CODESTORAGE_LFS_GC_GRACE"
+	envLFSGCGrace = "OPENSTORAGE_LFS_GC_GRACE"
 	// envLFSGCObjectBudget caps the git objects one reclamation run may
 	// list across its reachability walks (default 1,000,000). A repo
 	// whose walk alone exceeds the full budget is skipped (loudly) until
 	// the budget is raised; nothing is ever retired on a partial walk.
-	envLFSGCObjectBudget = "CODESTORAGE_LFS_GC_OBJECT_BUDGET"
+	envLFSGCObjectBudget = "OPENSTORAGE_LFS_GC_OBJECT_BUDGET"
 	// envLFSGCDeleteEnabled arms retirement. OFF by default: the scan
 	// then only marks/clears rows and reports what it WOULD retire, so
 	// operators can watch report-only passes before opting in — the same
 	// staged rollout as the sweep delete flags.
-	envLFSGCDeleteEnabled = "CODESTORAGE_LFS_GC_DELETE_ENABLED"
+	envLFSGCDeleteEnabled = "OPENSTORAGE_LFS_GC_DELETE_ENABLED"
 
 	// Per-repo LFS object-count cap override (issue #73 option 3): the
 	// operator escape hatch that unwedges a cap-exhausted repository
 	// without waiting for reclamation. Default 100000.
-	envLFSMaxObjectsPerRepo = "CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO"
+	envLFSMaxObjectsPerRepo = "OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO"
 
 	// Registry-vs-storage absence reconciliation (issue #101): a bounded
 	// background scan pages registered lfs_objects/packs rows and
@@ -170,21 +170,21 @@ const (
 	// bytes are charged as TTL'd restore covers so quota admission sees
 	// them while they are missing. Interval 0 (the default) disables the
 	// job entirely.
-	envAbsenceReconcileInterval = "CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"
+	envAbsenceReconcileInterval = "OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL"
 	// envAbsenceReconcileBudget caps the work units one pass may charge
 	// (default 100,000): one per row examined plus one per extra
 	// twin-spelling probe — each unit is at most one blob-store HEAD.
-	envAbsenceReconcileBudget = "CODESTORAGE_ABSENCE_RECONCILE_BUDGET"
+	envAbsenceReconcileBudget = "OPENSTORAGE_ABSENCE_RECONCILE_BUDGET"
 
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
-	envRepackThreshold = "CODESTORAGE_REPACK_THRESHOLD"
+	envRepackThreshold = "OPENSTORAGE_REPACK_THRESHOLD"
 
 	// Webhook SSRF-guard escape hatch (issue #53): "true" admits
 	// loopback/private/link-local/ULA delivery targets for genuinely
 	// internal deployments. Default off; the redirect refusal is NOT
 	// relaxed. Enabling it logs a boot-time warning.
-	envWebhookAllowPrivate = "CODESTORAGE_WEBHOOK_ALLOW_PRIVATE"
+	envWebhookAllowPrivate = "OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE"
 	// envSyncAllowPrivate is the unified sync egress policy knob (issue
 	// #139): it governs BOTH git transfer directions — inbound pull
 	// fetches and outbound push forwards. "true" admits loopback/private/
@@ -195,25 +195,25 @@ const (
 	// ALLOW private upstreams with a boot warning — internal-forge
 	// mirrors are a mainstream released 0.6.x deployment shape, and a
 	// future release flips the unset pull default to deny.
-	envSyncAllowPrivate = "CODESTORAGE_SYNC_ALLOW_PRIVATE"
+	envSyncAllowPrivate = "OPENSTORAGE_SYNC_ALLOW_PRIVATE"
 	// envSyncPushAllowPrivate relaxes the outbound push egress guard's
 	// private receiver classes (issue #90). Deprecated spelling: it stays
 	// push-only (its historical meaning), and envSyncAllowPrivate wins
 	// for both directions when set.
-	envSyncPushAllowPrivate = "CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE"
+	envSyncPushAllowPrivate = "OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE"
 
 	// At-rest envelope encryption for the metadata store's secret columns
 	// (issue #54): comma-separated base64 32-byte AES-256 keys, first =
 	// active encrypt key, rest decrypt-only (rotation). Unset keeps the
 	// legacy plaintext behavior. Hook subprocesses inherit serve's
 	// environment, so the same value reaches their meta stores.
-	envSecretsKey = "CODESTORAGE_SECRETS_KEY"
+	envSecretsKey = "OPENSTORAGE_SECRETS_KEY"
 	// Staging mode for enabling the key on multi-replica fleets:
 	// "decrypt-only" loads the keys for reading but writes plaintext and
 	// performs no rewrites, so a rolling restart never produces an envelope
 	// some replica cannot read yet; "encrypt" (or unset) is normal
 	// operation. Requires the key to be set.
-	envSecretsMode = "CODESTORAGE_SECRETS_MODE"
+	envSecretsMode = "OPENSTORAGE_SECRETS_MODE"
 
 	defaultListen = "127.0.0.1:0"
 )
@@ -260,7 +260,7 @@ const (
 	// shallow prefix the atomic sniffer reads) and are exactly the recovery
 	// path the quota admits for over-quota repositories. 2 MiB covers that
 	// comfortably while still bounding ingress work. An EXPLICIT
-	// CODESTORAGE_MAX_PUSH_BYTES is taken verbatim.
+	// OPENSTORAGE_MAX_PUSH_BYTES is taken verbatim.
 	defaultMaxPushFloorBytes = int64(2) << 20
 
 	// defaultVerifySigBudget bounds verifier spawns per push (issue #59).
@@ -412,7 +412,7 @@ type absenceSettings struct {
 
 // storageURLs is the resolved storage location set shared by every
 // subcommand that opens the stores (serve, signing-key, list-packs):
-// explicit env URLs win, then --data-dir/$CODESTORAGE_DATA_DIR derivation
+// explicit env URLs win, then --data-dir/$OPENSTORAGE_DATA_DIR derivation
 // (local mode) fills the empty slots. Callers validate the slots they need.
 type storageURLs struct {
 	dataDir string // absolute when set; "" outside local mode
@@ -681,7 +681,7 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	return cfg, nil
 }
 
-// resolveRateLimit parses CODESTORAGE_RATE_RPS / CODESTORAGE_RATE_BURST into
+// resolveRateLimit parses OPENSTORAGE_RATE_RPS / OPENSTORAGE_RATE_BURST into
 // the (rps, burst) pair for api.RateLimitConfig. Fail-fast semantics:
 //
 //   - both unset, or RPS explicitly 0 with burst unset/0 → (0, 0) disabled
@@ -726,7 +726,7 @@ func resolveRateLimit(getenv func(string) string) (float64, int, error) {
 	return rps, burst, nil
 }
 
-// resolveTrustedProxies parses CODESTORAGE_TRUSTED_PROXIES: a
+// resolveTrustedProxies parses OPENSTORAGE_TRUSTED_PROXIES: a
 // comma-separated CIDR allowlist (bare IPs accepted as single-address
 // entries) of reverse proxies whose forwarded client identity both rate
 // limiters may trust (issue #30). Fail-fast semantics matching
@@ -776,7 +776,7 @@ func resolveTrustedProxies(getenv func(string) string) ([]netip.Prefix, error) {
 	return prefixes, nil
 }
 
-// resolvePackQuota parses CODESTORAGE_PACK_QUOTA_BYTES (issue #21).
+// resolvePackQuota parses OPENSTORAGE_PACK_QUOTA_BYTES (issue #21).
 // Fail-fast semantics matching resolveRateLimit: malformed or negative
 // values error naming the env var. Unset applies the generous default;
 // an explicit "0" disables quota enforcement.
@@ -796,7 +796,7 @@ func resolvePackQuota(getenv func(string) string) (int64, error) {
 	return v, nil
 }
 
-// resolveMaxPushBytes parses CODESTORAGE_MAX_PUSH_BYTES (issue #55).
+// resolveMaxPushBytes parses OPENSTORAGE_MAX_PUSH_BYTES (issue #55).
 // Fail-fast semantics matching resolvePackQuota: malformed or negative
 // values error naming the env var. Unset derives the cap from the pack
 // quota (defaultMaxPushQuotaMultiple × quota, saturating; a disabled quota
@@ -825,7 +825,7 @@ func resolveMaxPushBytes(getenv func(string) string, packQuotaBytes int64) (int6
 	return v, nil
 }
 
-// resolveVerifySigBudget parses CODESTORAGE_VERIFY_SIG_BUDGET (issue #59).
+// resolveVerifySigBudget parses OPENSTORAGE_VERIFY_SIG_BUDGET (issue #59).
 // Fail-fast semantics matching resolvePackQuota: malformed or negative
 // values error naming the env var. Unset applies the generous default; an
 // explicit "0" disables the budget.
@@ -845,7 +845,7 @@ func resolveVerifySigBudget(getenv func(string) string) (int, error) {
 	return v, nil
 }
 
-// resolvePackReservationTTL parses CODESTORAGE_PACK_RESERVATION_TTL
+// resolvePackReservationTTL parses OPENSTORAGE_PACK_RESERVATION_TTL
 // (issue #29). Fail-fast: malformed or non-positive values error naming the
 // env var (a zero TTL would expire live reservations instantly, silently
 // reopening the overshoot), and the TTL must strictly exceed the
@@ -870,7 +870,7 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 	return d, nil
 }
 
-// resolveS3WALLeaseTTL parses CODESTORAGE_S3WAL_LEASE_TTL (issue #133,
+// resolveS3WALLeaseTTL parses OPENSTORAGE_S3WAL_LEASE_TTL (issue #133,
 // §2.11): the s3wal instance-lease TTL. Unset returns 0 (the lease
 // default, 2 minutes, applies); an explicit "0" returns -1 — the lease is
 // DISABLED, a deliberate escape hatch for test suites that intentionally
@@ -910,7 +910,7 @@ func resolveS3WALLeaseTTL(getenv func(string) string) (time.Duration, error) {
 	return d, nil
 }
 
-// resolveLFSStagingBytes parses CODESTORAGE_LFS_STAGING_BYTES (issue #51):
+// resolveLFSStagingBytes parses OPENSTORAGE_LFS_STAGING_BYTES (issue #51):
 // the node-wide cap on bytes of proxy LFS uploads staging on this replica
 // at once. Fail-fast like resolvePackQuota; unset applies the default, an
 // explicit "0" disables the bound.
@@ -934,7 +934,7 @@ func resolveLFSStagingBytes(getenv func(string) string) (int64, error) {
 // semantics matching resolveRateLimit: malformed or negative values error
 // naming the env var. Defaults: sweep hourly, 24h age threshold, list-only
 // for general orphans, delete-enabled for the provably-folded superseded
-// class (issue #31). CODESTORAGE_SWEEP_INTERVAL=0 disables sweeping
+// class (issue #31). OPENSTORAGE_SWEEP_INTERVAL=0 disables sweeping
 // entirely.
 func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 	assertf(getenv != nil, "resolveSweepSettings: nil getenv")
@@ -1111,7 +1111,7 @@ func resolveLFSMaxObjectsPerRepo(getenv func(string) string) (int64, error) {
 	return v, nil
 }
 
-// resolveRepackThreshold parses CODESTORAGE_REPACK_THRESHOLD. Fail-fast
+// resolveRepackThreshold parses OPENSTORAGE_REPACK_THRESHOLD. Fail-fast
 // semantics matching the sweep settings: malformed values error naming the
 // env var. 0 disables triggering; 1 is rejected (folding fewer than two
 // packs is a no-op, so a 1-threshold would busy-loop the trigger); unset
@@ -1132,7 +1132,7 @@ func resolveRepackThreshold(getenv func(string) string) (int, error) {
 	return v, nil
 }
 
-// resolveWebhookAllowPrivate parses CODESTORAGE_WEBHOOK_ALLOW_PRIVATE
+// resolveWebhookAllowPrivate parses OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE
 // (issue #53): unset/false keeps the webhook delivery SSRF guard strict.
 // Fail-fast semantics: a malformed value is a boot error, never a silent
 // fallback in either direction.
@@ -1206,8 +1206,8 @@ func resolveBoolEnv(getenv func(string) string, name string) (bool, error) {
 	return v, nil
 }
 
-// resolveSecretsCodec parses CODESTORAGE_SECRETS_KEY plus the
-// CODESTORAGE_SECRETS_MODE staging switch (issue #54): unset key keeps the
+// resolveSecretsCodec parses OPENSTORAGE_SECRETS_KEY plus the
+// OPENSTORAGE_SECRETS_MODE staging switch (issue #54): unset key keeps the
 // metadata store's secret columns plaintext; a malformed key list or mode
 // is a boot error (secrets.ParseKeys never echoes key material). Shared by
 // serve and the signing-key CLI so every store handle in the process tree

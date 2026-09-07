@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -20,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/coder/open-storage/internal/envconfig"
 )
 
 // ConditionalStore is the conditional-object surface the manifest driver
@@ -101,7 +102,7 @@ func (c *Client) Close() {
 // package, not in cmd config, so every dialer — serve's ref and meta
 // stores alike — inherits enforcement uniformly. Empty (the default)
 // attaches no middleware and changes no behavior.
-const envExpectedBucketOwner = "CODESTORAGE_S3_EXPECTED_BUCKET_OWNER"
+const envExpectedBucketOwner = "OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER"
 
 // expectedOwnerHeader is the AWS bucket-owner condition header. Unlike
 // internal/blob there is no x-amz-source-expected-bucket-owner spelling:
@@ -116,7 +117,7 @@ var awsAccountIDPattern = regexp.MustCompile(`^[0-9]{12}$`)
 
 // expectedBucketOwnerFromEnv reads and validates envExpectedBucketOwner.
 func expectedBucketOwnerFromEnv() (string, error) {
-	owner := strings.TrimSpace(os.Getenv(envExpectedBucketOwner))
+	owner := strings.TrimSpace(envconfig.Getenv(envExpectedBucketOwner))
 	if owner != "" && !awsAccountIDPattern.MatchString(owner) {
 		return "", fmt.Errorf("%s must be a 12-digit AWS account ID, got %q", envExpectedBucketOwner, owner)
 	}

@@ -46,19 +46,20 @@ import (
 	"time"
 
 	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/envconfig"
 	"github.com/coder/open-storage/internal/ref"
 )
 
 // EnvPackQuota carries the resolved per-repo pack-bytes quota from the serve
 // process into the pre-receive hook (set only when the quota is enabled).
-const EnvPackQuota = "CODESTORAGE_GIT_PACK_QUOTA"
+const EnvPackQuota = "OPENSTORAGE_GIT_PACK_QUOTA"
 
 // EnvPackReservationTTL carries the resolved reservation TTL (issue #29, a
 // Go duration string) from the serve process into the pre-receive hook.
 // Set alongside EnvPackQuota; the hook falls back to
 // defaultReservationTTL when it is absent (a serve binary predating the
 // ledger), so quota enforcement never silently weakens on skew.
-const EnvPackReservationTTL = "CODESTORAGE_GIT_PACK_RESERVATION_TTL"
+const EnvPackReservationTTL = "OPENSTORAGE_GIT_PACK_RESERVATION_TTL"
 
 // EnvUsageFloor carries the repo's UNCOUNTED-bytes admission floor (the
 // packs + LFS listing minus the usage counter at scan start — Codex round
@@ -73,7 +74,7 @@ const EnvPackReservationTTL = "CODESTORAGE_GIT_PACK_RESERVATION_TTL"
 // hookFloorMaxAge instead of trusting it — beyond the reservation TTL,
 // orphaned uploads whose reservations expired are visible only to a
 // listing.
-const EnvUsageFloor = "CODESTORAGE_GIT_USAGE_FLOOR"
+const EnvUsageFloor = "OPENSTORAGE_GIT_USAGE_FLOOR"
 
 // hookFloorMaxAge bounds how old a server-minted usage floor may be
 // before the hook self-lists instead (a var for tests). Five minutes
@@ -103,7 +104,7 @@ const defaultReservationTTL = time.Hour
 // env comes from our own server, so nonsense means misconfiguration, not
 // client input.
 func reservationTTL() (time.Duration, error) {
-	raw := os.Getenv(EnvPackReservationTTL)
+	raw := envconfig.Getenv(EnvPackReservationTTL)
 	if raw == "" {
 		return defaultReservationTTL, nil
 	}
@@ -138,7 +139,7 @@ const usageCacheTTL = 30 * time.Second
 const UsageFloorHandoffMargin = 30 * time.Second
 
 // MinPackReservationTTL is the exclusive lower bound serve's config
-// enforces on CODESTORAGE_PACK_RESERVATION_TTL (Codex rounds 36+42 on
+// enforces on OPENSTORAGE_PACK_RESERVATION_TTL (Codex rounds 36+42 on
 // #51): the reservation TTL must STRICTLY exceed the usage-floor cache
 // lifetime plus the floor-to-reservation handoff margin. CachedUsageFloor
 // feeds LFS and REST admission directly with a listing up to
@@ -516,7 +517,7 @@ func hookFloorScanOnce(ctx context.Context, bl blob.BlobStore, st ref.Store, rep
 // comes from our own server, so nonsense means misconfiguration, not
 // client input.
 func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, int64, error) {
-	raw, ok := os.LookupEnv(EnvUsageFloor)
+	raw, ok := envconfig.LookupEnv(EnvUsageFloor)
 	if !ok {
 		return hookSelfListFloor(ctx, bl, st, repo)
 	}

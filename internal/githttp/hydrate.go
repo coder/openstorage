@@ -457,12 +457,18 @@ const refTxHookScript = refTxHookGate + `%q hook reference-transaction "$@" || e
 // non-committed callback costs one /bin/sh exit; per-ref gits then pay
 // one binary exec per committed ref, the same order as their own
 // per-command update hooks, and batched gits pay one per push.
-const refTxHookGate = refTxHookGateV1 + `[ "$1" = committed ] || exit 0
+const refTxHookGate = `#!/bin/sh
+[ -n "${OPENSTORAGE_GIT_PUSH_HOLD-${CODESTORAGE_GIT_PUSH_HOLD}}" ] || exit 0
+[ "$1" = committed ] || exit 0
 `
 
-// refTxHookGateV1 is the first managed generation's gate (no committed
-// line) — still recognized by the refresh detector so pre-gate installs
-// are upgraded rather than orphaned as foreign.
+// Keep the exact historical CODESTORAGE gates: cache repos survive upgrades,
+// including old binary paths. The current shell gate falls back only when the
+// canonical name is UNSET, not when it is explicitly empty.
+const refTxHookGateLegacy = refTxHookGateV1 + `[ "$1" = committed ] || exit 0
+`
+
+// refTxHookGateV1 is the first managed generation's gate (no committed line).
 const refTxHookGateV1 = `#!/bin/sh
 [ -n "$CODESTORAGE_GIT_PUSH_HOLD" ] || exit 0
 `
@@ -482,6 +488,9 @@ func isManagedRefTxHook(content []byte) bool {
 	// prepared callbacks abort valid pushes. Longest gate first: the
 	// older gate is a prefix of the newer.
 	rest, ok := strings.CutPrefix(string(content), refTxHookGate)
+	if !ok {
+		rest, ok = strings.CutPrefix(string(content), refTxHookGateLegacy)
+	}
 	if !ok {
 		rest, ok = strings.CutPrefix(string(content), refTxHookGateV1)
 	}
@@ -522,7 +531,7 @@ func isManagedRefTxHook(content []byte) bool {
 	}
 	// Literal executables only (PR #195 round-9 P2): $, backquote, and
 	// backslash keep their meaning inside shell double quotes, so a
-	// quoted `"$CODESTORAGE_BIN"` passes Unquote while being an
+	// quoted `"$OPENSTORAGE_BIN"` passes Unquote while being an
 	// operator's dynamic selection — the generator only ever emits
 	// literal absolute paths, and anything else must classify as foreign
 	// and be preserved.

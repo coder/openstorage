@@ -167,7 +167,7 @@ func New(s3c *s3.Client, bucket string) *Client {
 		o.APIOptions = append(o.APIOptions, c.captureStoreDate)
 		// Round-trip census seam (issue #182): installed here rather than
 		// in Dial so wrapped caller-owned clients are counted too. Inert
-		// unless CODESTORAGE_S3_OP_LOG is set.
+		// unless OPENSTORAGE_S3_OP_LOG is set.
 		if opt, ok := s3oplog.APIOption(); ok {
 			o.APIOptions = append(o.APIOptions, opt)
 		}

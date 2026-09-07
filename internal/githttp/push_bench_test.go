@@ -1,6 +1,6 @@
 // Phase 4 push-path e2e benchmark (issue #133, plan §4): REAL `git push`
 // round-trips over loopback against the TestMain-booted serve node, on
-// whichever backend lane CODESTORAGE_TEST_BACKEND selected (s3wal / local /
+// whichever backend lane OPENSTORAGE_TEST_BACKEND selected (s3wal / local /
 // pg). Unlike the hydrate benches, this one deliberately DOES use the
 // booted e2e environment — that is the point: each sample is the full
 // client → smart-HTTP → receive-pack → hook re-exec → ref-CAS → blob path
@@ -25,9 +25,9 @@
 // windows; the reported ns/op is overridden to timed-window wall time per
 // successful push (the reciprocal of push/s) so benchstat tracks
 // throughput, not orchestration. Per-op CSVs land in
-// CODESTORAGE_BENCH_CSV_DIR when set (same contract as the s3wal
+// OPENSTORAGE_BENCH_CSV_DIR when set (same contract as the s3wal
 // microbenches). The sustained window defaults to 5 s per cell to keep
-// nightly runs bounded; CODESTORAGE_BENCH_PUSH_SECS=60 gives the plan §3
+// nightly runs bounded; OPENSTORAGE_BENCH_PUSH_SECS=60 gives the plan §3
 // campaign windows.
 //
 // The bench has two mutually exclusive campaign modes (Codex round-3: a
@@ -39,7 +39,7 @@
 //     end-of-window accepted-tips check still verifies durability. These
 //     are the published performance numbers and the nightly benchstat
 //     series.
-//   - correctness mode (CODESTORAGE_BENCH_OBSERVE=1): the pushObserver
+//   - correctness mode (OPENSTORAGE_BENCH_OBSERVE=1): the pushObserver
 //     polls ls-remote mid-window (~4/s) and validates every observation
 //     against the pre-generated chains. Latency/throughput from these
 //     runs are NOT performance results and are reported separately.
@@ -66,15 +66,16 @@ import (
 	"time"
 
 	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/envconfig"
 )
 
 const (
 	// envBenchPushSecs overrides the per-cell sustained push window.
-	envBenchPushSecs = "CODESTORAGE_BENCH_PUSH_SECS"
+	envBenchPushSecs = "OPENSTORAGE_BENCH_PUSH_SECS"
 	// envBenchCSVDir mirrors the s3wal microbench contract: one raw
 	// per-op CSV per bench cell when set (plan §3: raw CSVs published
 	// alongside the summary tables).
-	envBenchCSVDir = "CODESTORAGE_BENCH_CSV_DIR"
+	envBenchCSVDir = "OPENSTORAGE_BENCH_CSV_DIR"
 	// benchPushWarmup is the untimed collective warmup before each
 	// measured window (plan §3 method: ≥ 20 ops discarded per cell).
 	benchPushWarmup = 20
@@ -100,15 +101,15 @@ const (
 	// envBenchObserve selects correctness mode: "1" runs the mid-window
 	// pushObserver, anything else keeps the window observer-free (the
 	// performance mode; see the package comment).
-	envBenchObserve = "CODESTORAGE_BENCH_OBSERVE"
+	envBenchObserve = "OPENSTORAGE_BENCH_OBSERVE"
 )
 
 // benchObserveMode reports whether this run is a correctness campaign.
-func benchObserveMode() bool { return os.Getenv(envBenchObserve) == "1" }
+func benchObserveMode() bool { return envconfig.Getenv(envBenchObserve) == "1" }
 
 func benchPushWindow(b *testing.B) time.Duration {
 	b.Helper()
-	v := os.Getenv(envBenchPushSecs)
+	v := envconfig.Getenv(envBenchPushSecs)
 	if v == "" {
 		return 5 * time.Second
 	}
@@ -764,7 +765,7 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 // envBenchCSVDir is set (columns: op index, writer, latency).
 func pushCSVDump(b *testing.B, samples []pushSample) {
 	b.Helper()
-	dir := os.Getenv(envBenchCSVDir)
+	dir := envconfig.Getenv(envBenchCSVDir)
 	if dir == "" {
 		return
 	}

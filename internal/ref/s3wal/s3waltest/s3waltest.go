@@ -496,7 +496,7 @@ func DecodeSeq(body []byte) (int64, bool) {
 }
 
 // EnvTestS3WALURL names an external S3 endpoint the qualification lane
-// runs against (same URL grammar as CODESTORAGE_TEST_S3_URL in
+// runs against (same URL grammar as OPENSTORAGE_TEST_S3_URL in
 // internal/blob; distinct variable so blob-package and s3wal runs never
 // collide on cleanup). Unset skips the lane.
-const EnvTestS3WALURL = "CODESTORAGE_TEST_S3WAL_URL"
+const EnvTestS3WALURL = "OPENSTORAGE_TEST_S3WAL_URL"

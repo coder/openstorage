@@ -4,7 +4,7 @@
 // `signing-key` manages the org's commit-signing key registry (docs/reference/authentication.md
 // verify-sig); keygen/mint/list-packs are local dogfooding helpers.
 //
-// Configuration comes from CODESTORAGE_* environment variables, with the
+// Configuration comes from OPENSTORAGE_* environment variables, with the
 // phase-0 spike names (SPIKE_*, PG_URL, BLOB_URL) kept as fallback aliases —
 // see config.go.
 package main
@@ -27,6 +27,7 @@ import (
 	"github.com/coder/open-storage/internal/api"
 	"github.com/coder/open-storage/internal/auth"
 	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/envconfig"
 	"github.com/coder/open-storage/internal/githttp"
 	"github.com/coder/open-storage/internal/meta"
 	"github.com/coder/open-storage/internal/ref"
@@ -107,7 +108,10 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := resolveServeConfig(os.Getenv, *listen, *addr, *cacheDir, *dataDir)
+	envconfig.WarnDeprecated(func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	})
+	cfg, err := resolveServeConfig(envconfig.Getenv, *listen, *addr, *cacheDir, *dataDir)
 	if err != nil {
 		return err
 	}
@@ -181,7 +185,7 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// Listen before building handlers: the default listen address uses an
 	// ephemeral port (127.0.0.1:0), and the API needs the bound address to
-	// build the `http_url` values it returns. $CODESTORAGE_BASE_URL
+	// build the `http_url` values it returns. $OPENSTORAGE_BASE_URL
 	// overrides the derived base, which is unroutable when binding 0.0.0.0.
 	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
@@ -328,7 +332,7 @@ func cmdServe(ctx context.Context, args []string) error {
 
 // selfLoopbackURL derives the sync worker's push target from this process's
 // bound listener (issue #45): loopback pushes must terminate in the minting
-// process, so the external CODESTORAGE_BASE_URL — typically a load balancer
+// process, so the external OPENSTORAGE_BASE_URL — typically a load balancer
 // that may route to any replica — is unusable. An unspecified bind address
 // is rewritten to the matching loopback address; a concrete one is dialable
 // as-is.
@@ -480,8 +484,8 @@ func cmdListPacks(ctx context.Context, args []string) error {
 		return fmt.Errorf("--repo is required")
 	}
 	// Shared derivation with serve/signing-key: env URLs win, local mode
-	// (--data-dir / $CODESTORAGE_DATA_DIR) derives the fileblob location.
-	urls, err := resolveStorageURLs(os.Getenv, *dataDir)
+	// (--data-dir / $OPENSTORAGE_DATA_DIR) derives the fileblob location.
+	urls, err := resolveStorageURLs(envconfig.Getenv, *dataDir)
 	if err != nil {
 		return err
 	}

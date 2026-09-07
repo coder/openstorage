@@ -1,9 +1,9 @@
 package githttp
 
 // End-to-end acceptance for the push-work bounds: the decoded-byte ingress
-// cap (issue #55, CODESTORAGE_MAX_PUSH_BYTES) and the verify-sig work
+// cap (issue #55, OPENSTORAGE_MAX_PUSH_BYTES) and the verify-sig work
 // bounds (issue #59: bounded creation walks, per-push verdict cache,
-// CODESTORAGE_VERIFY_SIG_BUDGET). Real serve nodes, real git clients, and
+// OPENSTORAGE_VERIFY_SIG_BUDGET). Real serve nodes, real git clients, and
 // raw smart-HTTP requests where the wire shape matters.
 
 import (
@@ -60,7 +60,7 @@ func assertCapEnvelope(t *testing.T, status int, body string) {
 	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
 		t.Fatalf("413 body is not the structured envelope: %v\n%s", err, body)
 	}
-	if !strings.Contains(envelope.Error, "push-size cap") || !strings.Contains(envelope.Error, "CODESTORAGE_MAX_PUSH_BYTES") {
+	if !strings.Contains(envelope.Error, "push-size cap") || !strings.Contains(envelope.Error, "OPENSTORAGE_MAX_PUSH_BYTES") {
 		t.Fatalf("413 envelope does not name the cap and knob: %q", envelope.Error)
 	}
 }
@@ -83,7 +83,7 @@ func shallowFlood(n int) []byte {
 // bytes reach storage, and the server state stays pristine.
 func TestPushCap_OversizedGitPush413(t *testing.T) {
 	cacheDir := t.TempDir()
-	node, err := startNode(cacheDir, fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
+	node, err := startNode(cacheDir, fmt.Sprintf("OPENSTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
 	if err != nil {
 		t.Fatalf("start node: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestPushCap_OversizedGitPush413(t *testing.T) {
 // registering anything or leaving quarantine debris.
 func TestPushCap_MidStreamOverflowCleanState(t *testing.T) {
 	cacheDir := t.TempDir()
-	node, err := startNode(cacheDir, fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
+	node, err := startNode(cacheDir, fmt.Sprintf("OPENSTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
 	if err != nil {
 		t.Fatalf("start node: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestPushCap_MidStreamOverflowCleanState(t *testing.T) {
 // capability sniff, and a gzip bomb whose small compressed body decodes
 // past the cap.
 func TestPushCap_RawRequests(t *testing.T) {
-	node, err := startNode(t.TempDir(), fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
+	node, err := startNode(t.TempDir(), fmt.Sprintf("OPENSTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
 	if err != nil {
 		t.Fatalf("start node: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestPushCap_RawRequests(t *testing.T) {
 		// mid-stream — the pushGate path. receive-pack's own failure report
 		// must not commit the response: the client still gets the 413.
 		bigCap := int64(2 << 20)
-		capNode, err := startNode(t.TempDir(), fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", bigCap))
+		capNode, err := startNode(t.TempDir(), fmt.Sprintf("OPENSTORAGE_MAX_PUSH_BYTES=%d", bigCap))
 		if err != nil {
 			t.Fatalf("start node: %v", err)
 		}
@@ -314,7 +314,7 @@ func TestPushCap_RawRequests(t *testing.T) {
 // under the cap is denied whole by the atomic gate — not mangled into a
 // 413, not partially applied.
 func TestPushCap_AtomicSniffStillWorks(t *testing.T) {
-	node, err := startNode(t.TempDir(), fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", 1<<20))
+	node, err := startNode(t.TempDir(), fmt.Sprintf("OPENSTORAGE_MAX_PUSH_BYTES=%d", 1<<20))
 	if err != nil {
 		t.Fatalf("start node: %v", err)
 	}
@@ -515,12 +515,12 @@ func TestVerifySig_VerdictCacheAcrossRefs(t *testing.T) {
 }
 
 // TestVerifySig_BudgetFailsClosed is the issue #59c acceptance: a push
-// introducing more commits than CODESTORAGE_VERIFY_SIG_BUDGET allows is
+// introducing more commits than OPENSTORAGE_VERIFY_SIG_BUDGET allows is
 // rejected whole BEFORE any verifier runs, with a message naming the knob.
 func TestVerifySig_BudgetFailsClosed(t *testing.T) {
 	spawnLog := filepath.Join(t.TempDir(), "spawns.log")
 	node, err := startNode(t.TempDir(),
-		"CODESTORAGE_VERIFY_SIG_BUDGET=2",
+		"OPENSTORAGE_VERIFY_SIG_BUDGET=2",
 		EnvVerifySpawnLog+"="+spawnLog,
 	)
 	if err != nil {
@@ -545,7 +545,7 @@ func TestVerifySig_BudgetFailsClosed(t *testing.T) {
 	if err == nil {
 		t.Fatalf("push over the verification budget should be rejected:\n%s", out)
 	}
-	if !strings.Contains(out, "per-push verification budget") || !strings.Contains(out, "CODESTORAGE_VERIFY_SIG_BUDGET") {
+	if !strings.Contains(out, "per-push verification budget") || !strings.Contains(out, "OPENSTORAGE_VERIFY_SIG_BUDGET") {
 		t.Fatalf("budget rejection missing the documented message:\n%s", out)
 	}
 	if _, exists := pgRefs(t, repo)["refs/heads/feature"]; exists {
@@ -569,7 +569,7 @@ func TestVerifySig_BudgetFailsClosed(t *testing.T) {
 // without the fix.
 func TestPushCap_SlowHookPhaseOutlivesDrainDeadline(t *testing.T) {
 	node, err := startNode(t.TempDir(),
-		fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", int64(1<<20)),
+		fmt.Sprintf("OPENSTORAGE_MAX_PUSH_BYTES=%d", int64(1<<20)),
 		EnvHookDelay+"=1500",
 		EnvPushDrainMS+"=250",
 	)

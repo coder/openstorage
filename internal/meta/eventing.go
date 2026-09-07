@@ -14,15 +14,16 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"os"
 	"strconv"
 	"time"
+
+	"github.com/coder/open-storage/internal/envconfig"
 )
 
 // Webhook is one registered delivery endpoint (docs/reference/webhooks.md). Secret is the HMAC
 // signing key — plaintext at this interface; at rest it is stored plaintext
 // by default and envelope-encrypted when the store carries a secrets codec
-// (issue #54, CODESTORAGE_SECRETS_KEY; see secrets.go). Never log Secret.
+// (issue #54, OPENSTORAGE_SECRETS_KEY; see secrets.go). Never log Secret.
 type Webhook struct {
 	ID        string // server-generated "wh_<16 hex>"
 	OrgID     int64
@@ -126,12 +127,12 @@ const LegacyClaimHolder = "!legacy-grace"
 // EnvSyncStealLegacy enables stealing adopted legacy claims whose grace
 // has lapsed. Any value strconv.ParseBool accepts as true enables it;
 // malformed values stay disabled (the safe direction).
-const EnvSyncStealLegacy = "CODESTORAGE_SYNC_STEAL_LEGACY"
+const EnvSyncStealLegacy = "OPENSTORAGE_SYNC_STEAL_LEGACY"
 
 // legacyStealEnabled reads EnvSyncStealLegacy per decision (cheap; tests
 // flip it with t.Setenv).
 func legacyStealEnabled() bool {
-	v, err := strconv.ParseBool(os.Getenv(EnvSyncStealLegacy))
+	v, err := strconv.ParseBool(envconfig.Getenv(EnvSyncStealLegacy))
 	return err == nil && v
 }
 

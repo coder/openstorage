@@ -124,7 +124,7 @@ func TestAtomicPush_DeleteOnlyMixedDeniedAsUnit(t *testing.T) {
 }
 
 // TestAtomicPush_ServeEnvNotInherited pins the round-2 fix: an operator
-// exporting CODESTORAGE_GIT_ATOMIC=1 in the serve process environment must
+// exporting OPENSTORAGE_GIT_ATOMIC=1 in the serve process environment must
 // not make the hooks treat every push as atomic — the variable is a
 // per-request bit owned by the wire sniff, and duplicate env entries
 // resolve first-match in Go children, so it must be stripped, not merely

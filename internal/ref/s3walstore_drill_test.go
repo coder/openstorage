@@ -7,7 +7,7 @@
 // `git push` + restart-from-bucket-only drill belongs to Phase 3, when
 // serve-mode s3wal wiring exists.
 //
-// Gated behind CODESTORAGE_S3WAL_DRILL=1: this is recorded evidence for
+// Gated behind OPENSTORAGE_S3WAL_DRILL=1: this is recorded evidence for
 // the PR, not a CI lane — the deterministic equivalents run in
 // s3walstore_crashwindow_test.go on every build.
 package ref
@@ -27,6 +27,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/coder/open-storage/internal/envconfig"
 	"github.com/coder/open-storage/internal/ref/s3wal"
 	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
 )
@@ -65,11 +66,11 @@ func drillStore(t *testing.T, endpoint string) *S3WAL {
 // stage, and PARKS at the window named by the environment until the
 // parent's SIGKILL lands.
 func TestS3WALKillMidPushDrillChild(t *testing.T) {
-	window := os.Getenv("CODESTORAGE_S3WAL_DRILL_CHILD")
+	window := envconfig.Getenv("OPENSTORAGE_S3WAL_DRILL_CHILD")
 	if window == "" {
 		t.Skip("drill child: spawned by TestS3WALKillMidPushDrill only")
 	}
-	endpoint := os.Getenv("CODESTORAGE_S3WAL_DRILL_ENDPOINT")
+	endpoint := envconfig.Getenv("OPENSTORAGE_S3WAL_DRILL_ENDPOINT")
 	if endpoint == "" {
 		t.Fatal("drill child: no endpoint")
 	}
@@ -110,8 +111,8 @@ func TestS3WALKillMidPushDrillChild(t *testing.T) {
 // the W1 window (after the blob PUT) and one in the W3 window (after
 // RegisterPacks), each followed by fresh-process recovery.
 func TestS3WALKillMidPushDrill(t *testing.T) {
-	if os.Getenv("CODESTORAGE_S3WAL_DRILL") != "1" {
-		t.Skip("set CODESTORAGE_S3WAL_DRILL=1 to run the recorded kill -9 drill (deterministic twins run in TestS3WALCrashWindows)")
+	if envconfig.Getenv("OPENSTORAGE_S3WAL_DRILL") != "1" {
+		t.Skip("set OPENSTORAGE_S3WAL_DRILL=1 to run the recorded kill -9 drill (deterministic twins run in TestS3WALCrashWindows)")
 	}
 	ctx := context.Background()
 	endpoint, terminate, err := s3waltest.StartSeaweedFSContainer(ctx)
@@ -129,8 +130,8 @@ func TestS3WALKillMidPushDrill(t *testing.T) {
 		t.Helper()
 		cmd := exec.Command(os.Args[0], "-test.run=TestS3WALKillMidPushDrillChild$", "-test.v")
 		cmd.Env = append(os.Environ(),
-			"CODESTORAGE_S3WAL_DRILL_CHILD="+window,
-			"CODESTORAGE_S3WAL_DRILL_ENDPOINT="+endpoint,
+			"OPENSTORAGE_S3WAL_DRILL_CHILD="+window,
+			"OPENSTORAGE_S3WAL_DRILL_ENDPOINT="+endpoint,
 		)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {

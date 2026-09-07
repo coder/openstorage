@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/open-storage/internal/envconfig"
 	"github.com/coder/open-storage/internal/meta"
 )
 
@@ -65,8 +66,8 @@ func cmdSigningKey(ctx context.Context, args []string) error {
 	}
 
 	// Shared derivation with serve/list-packs: env URLs win, local mode
-	// (--data-dir / $CODESTORAGE_DATA_DIR) derives the sqlite location.
-	urls, err := resolveStorageURLs(os.Getenv, *dataDir)
+	// (--data-dir / $OPENSTORAGE_DATA_DIR) derives the sqlite location.
+	urls, err := resolveStorageURLs(envconfig.Getenv, *dataDir)
 	if err != nil {
 		return err
 	}
@@ -76,7 +77,7 @@ func cmdSigningKey(ctx context.Context, args []string) error {
 	// Signing keys are not encrypted, but the codec is threaded for uniform
 	// store semantics (and boot-fatal key-list validation) across every
 	// subcommand that opens the metadata store.
-	secretsCodec, err := resolveSecretsCodec(os.Getenv)
+	secretsCodec, err := resolveSecretsCodec(envconfig.Getenv)
 	if err != nil {
 		return err
 	}
@@ -114,7 +115,7 @@ func runSigningKeyAdd(ctx context.Context, ms meta.Store, out io.Writer, org, ke
 	}
 	k, err := ms.AddSigningKey(ctx, org, text)
 	if errors.Is(err, meta.ErrNotFound) {
-		return fmt.Errorf("org %q is not registered (serve bootstraps it from CODESTORAGE_ORG): %w", org, err)
+		return fmt.Errorf("org %q is not registered (serve bootstraps it from OPENSTORAGE_ORG): %w", org, err)
 	}
 	if err != nil {
 		return err
@@ -128,7 +129,7 @@ func runSigningKeyList(ctx context.Context, ms meta.Store, out io.Writer, org st
 	assertf(ms != nil && out != nil && org != "", "runSigningKeyList: missing store/out/org")
 	keys, err := ms.SigningKeysForOrg(ctx, org)
 	if errors.Is(err, meta.ErrNotFound) {
-		return fmt.Errorf("org %q is not registered (serve bootstraps it from CODESTORAGE_ORG): %w", org, err)
+		return fmt.Errorf("org %q is not registered (serve bootstraps it from OPENSTORAGE_ORG): %w", org, err)
 	}
 	if err != nil {
 		return err

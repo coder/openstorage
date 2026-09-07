@@ -14,6 +14,8 @@ import (
 	"strings"
 	stdsync "sync"
 	"time"
+
+	"github.com/coder/open-storage/internal/envconfig"
 )
 
 // RepoInfo is the minimal repo identity a sync run needs: the storage key
@@ -182,8 +184,8 @@ type Worker struct {
 	DetachPoll time.Duration
 
 	// PushEgressAllowPrivate relaxes the outbound push egress guard's
-	// private receiver classes (resolved from CODESTORAGE_SYNC_ALLOW_PRIVATE
-	// with CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE as the deprecated push-only
+	// private receiver classes (resolved from OPENSTORAGE_SYNC_ALLOW_PRIVATE
+	// with OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE as the deprecated push-only
 	// spelling, see egress.go): loopback/RFC1918/link-local/ULA upstreams
 	// for genuinely internal forges. Metadata and the special-purpose
 	// registry stay denied either way — every http(s) push dials through
@@ -194,7 +196,7 @@ type Worker struct {
 	// PullEgressAllowPrivate is the inbound twin (issue #139): every
 	// http(s) upstream fetch dials through the same vetting proxy, and
 	// this relaxes only its private receiver classes. The serve wiring
-	// resolves it from the unified CODESTORAGE_SYNC_ALLOW_PRIVATE knob,
+	// resolves it from the unified OPENSTORAGE_SYNC_ALLOW_PRIVATE knob,
 	// whose TRANSITIONAL default keeps it true — internal-forge mirrors
 	// are a mainstream released deployment shape, and a future release
 	// flips the unset default to deny (boot warning announces the flip).
@@ -775,7 +777,7 @@ func hermeticGitEnv(allowProtocol string) []string {
 	// auth server through the push egress proxy, which misclassified the
 	// auth failure as a transient dial outage). Nulling the config FILES
 	// alone does not close the env channel.
-	env := os.Environ()
+	env := envconfig.Strip(os.Environ(), "OPENSTORAGE_ASKPASS_USERNAME", "OPENSTORAGE_ASKPASS_PASSWORD")
 	out := make([]string, 0, len(env)+4)
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "GIT_") {
@@ -803,18 +805,16 @@ func authGitEnv(scriptPath, username, password, allowProtocol string) ([]string,
 	assertf(username != "", "authGitEnv: password without username")
 	const script = `#!/bin/sh
 case "$1" in
-[Uu]sername*) printf '%s\n' "$CODESTORAGE_ASKPASS_USERNAME" ;;
-*) printf '%s\n' "$CODESTORAGE_ASKPASS_PASSWORD" ;;
+[Uu]sername*) printf '%s\n' "$OPENSTORAGE_ASKPASS_USERNAME" ;;
+*) printf '%s\n' "$OPENSTORAGE_ASKPASS_PASSWORD" ;;
 esac
 `
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		return nil, fmt.Errorf("write askpass helper: %w", err)
 	}
-	return append(env,
-		"GIT_ASKPASS="+scriptPath,
-		"CODESTORAGE_ASKPASS_USERNAME="+username,
-		"CODESTORAGE_ASKPASS_PASSWORD="+password,
-	), nil
+	env = envconfig.Set(env, "OPENSTORAGE_ASKPASS_USERNAME", username)
+	env = envconfig.Set(env, "OPENSTORAGE_ASKPASS_PASSWORD", password)
+	return append(env, "GIT_ASKPASS="+scriptPath), nil
 }
 
 // runGit executes one git command, returning its stderr for failure
