@@ -41,8 +41,9 @@ to the packs, single node, zero other infrastructure
 
 ## Renamed from code-storage
 
-Starting with v0.15.0, this project is **open.storage**: use the `openstorage` binary,
-`ghcr.io/coder/open-storage` image, and `OPENSTORAGE_*` environment variables.
+Starting with v0.15.0, this project is **open.storage**: use the `openstorage` binary
+and `OPENSTORAGE_*` environment variables. The container image target is
+`ghcr.io/coder/open-storage`; until registry publishing is configured, build locally.
 `CODESTORAGE_*` remains a fallback for the **0.15.x minor release only**, with a boot-time
 warning for each legacy fallback; an explicitly set new variable wins, even when empty.
 Keep existing database, bucket, and data-directory values unchanged when migrating.

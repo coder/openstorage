@@ -133,10 +133,14 @@ host against the published ports:
 docker compose up -d --wait
 OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=./compose-keys/cs-key.pub.pem \
 OPENSTORAGE_PG_URL="postgres://postgres:postgres@127.0.0.1:${PGPORT:-15432}/postgres" \
-OPENSTORAGE_S3_URL="s3://openstorage?endpoint=http://127.0.0.1:${S3PORT:-18333}&s3ForcePathStyle=true&region=us-east-1" \
-AWS_ACCESS_KEY_ID=openstorage AWS_SECRET_ACCESS_KEY=openstorage \
+OPENSTORAGE_S3_URL="s3://codestorage?endpoint=http://127.0.0.1:${S3PORT:-18333}&s3ForcePathStyle=true&region=us-east-1" \
+AWS_ACCESS_KEY_ID=codestorage AWS_SECRET_ACCESS_KEY=codestorage \
   ./openstorage serve --listen 127.0.0.1:8080
 ```
+
+The Compose bucket and development credentials retain their original `codestorage`
+values so rebuilding an app node against existing backing containers keeps working;
+they are compatibility settings, not the product name.
 
 Every variable is documented in the [configuration reference](../reference/configuration.md).
 

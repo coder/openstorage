@@ -16,10 +16,11 @@ your repositories or a change to the upstream wire-compatibility contract.
 | Environment prefix | `CODESTORAGE_*` | `OPENSTORAGE_*` |
 
 Update service-manager commands, scripts, health checks that invoke the binary, and
-installer asset names. The new container image reference is
-`ghcr.io/coder/open-storage`; update deployments to that path and pin the intended
-version or digest. There is **no dual publishing to the old image path**. The environment
-compatibility window below does not provide an old binary name or an old image alias.
+installer asset names. The new container image target is `ghcr.io/coder/open-storage`.
+Registry publishing is not configured in this repository yet: build the Dockerfile
+locally until release publishing is available, then pin a verified version or digest.
+There is **no dual publishing to the old image path**. The environment compatibility
+window below does not provide an old binary name or an old image alias.
 
 The repository is renamed before the v0.15.0 changes merge, so the new Go module path
 resolves from GitHub when the renamed version is available. GitHub redirects the old
