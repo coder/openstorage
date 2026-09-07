@@ -14,6 +14,6 @@ failures map to 401; a valid token whose `iss` is a *different* registered org, 
 claim that does not resolve (repo_id → url via the meta store), or a missing scope
 (`git:read` for upload-pack, `git:write` for receive-pack) map to 403. The phase-0
 "git-only, single key" serve mode and `--jwt-pubkey` are dropped: `serve` requires
-`CODESTORAGE_ORG` + `CODESTORAGE_ORG_PUBKEYS`. This is a breaking CLI change confined to
+`OPENSTORAGE_ORG` + `OPENSTORAGE_ORG_PUBKEYS`. This is a breaking CLI change confined to
 this repo. The CLI `keygen`/`mint` helpers moved off the spike's single-ECDSA code onto
 `internal/auth` (`keygen --alg`, `mint --iss` required, algorithm inferred from the key).

@@ -128,7 +128,7 @@ Repack is deliberately not admission-gated: it replaces rows rather than growing
 registered set, and gating it would deadlock exactly the at-quota repositories that need
 compaction most.
 
-Since [#51](https://github.com/coder/code-storage/issues/51) the same ledger admits Git
+Since [#51](https://github.com/coder/open-storage/issues/51) the same ledger admits Git
 LFS uploads in two stages: the batch endpoint runs an **advisory** admission check
 against each missing object's declared size — failing hopeless requests early with 507
 before issuing any transfer URL, but holding nothing durable — and the verified proxy

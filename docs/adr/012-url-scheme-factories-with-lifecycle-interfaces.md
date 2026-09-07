@@ -22,7 +22,7 @@ Two same-shape decisions ride along:
 - **`Pack.S3Key` → `Pack.Key`.** The field names the blob-store object key, which is no
   longer necessarily S3. The backing SQL column stays `s3_key` on **both** backends so the
   pack SQL is byte-comparable across them and existing PG deployments need no migration.
-- **`modernc.org/sqlite`** (pure Go) over `mattn/go-sqlite3` (cgo): codestorage ships as a
+- **`modernc.org/sqlite`** (pure Go) over `mattn/go-sqlite3` (cgo): open.storage ships as a
   cross-compiled single binary, and the hook path re-execs that binary — a cgo toolchain
   requirement per target platform would poison exactly the deployment story local mode
   exists for. The dependency is large, accepted deliberately.

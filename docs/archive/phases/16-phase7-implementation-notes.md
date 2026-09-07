@@ -1,7 +1,7 @@
 # Phase-7 Implementation Notes & ADRs (deployment packaging + p6 burn-down)
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
@@ -23,7 +23,7 @@ migration path must be advisory-lock-serialized, and river's was not (ADR-40).
 
 Decision: **multi-stage build — `golang:1.26-alpine` with `CGO_ENABLED=0 -trimpath` and
 module/build cache mounts, then an `alpine:3.21` runtime stage with `git` and
-`ca-certificates`, a non-root user, `ENTRYPOINT ["codestorage"]` / `CMD ["serve"]`.**
+`ca-certificates`, a non-root user, `ENTRYPOINT ["openstorage"]` / `CMD ["serve"]`.**
 
 - **Alpine, not distroless/scratch.** The server has a hard runtime dependency on
   external `git` (smart-HTTP upload/receive-pack, merges, hook re-execs); a
@@ -41,7 +41,7 @@ module/build cache mounts, then an `alpine:3.21` runtime stage with `git` and
 
 Decision: **the two-node deployment lives in the existing `docker-compose.yml` as a
 `replicas` profile — `node-a`/`node-b` defined via YAML anchors, differing only in host
-port mapping and the `CODESTORAGE_BASE_URL` that embeds it.**
+port mapping and the `OPENSTORAGE_BASE_URL` that embeds it.**
 
 - **One compose file, not a second deployment file.** The nodes reuse the same
   `postgres`/`minio` service definitions the dev quickstart boots; a parallel file
@@ -56,7 +56,7 @@ port mapping and the `CODESTORAGE_BASE_URL` that embeds it.**
   has no unauthenticated HTTP endpoint, and inventing one just for compose would widen
   the surface. A listener probe is sufficient for `up --wait`.
 - **Keys stay on the host.** The org keypair is generated on the host
-  (`codestorage keygen --out ./compose-keys/cs-key`) and the public key is mounted
+  (`openstorage keygen --out ./compose-keys/cs-key`) and the public key is mounted
   read-only into the nodes; `/compose-keys/` is gitignored. Runtime keys are never
   baked into the image or committed — the standing key policy from the quickstarts.
 

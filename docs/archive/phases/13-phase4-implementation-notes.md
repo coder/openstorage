@@ -1,7 +1,7 @@
 # Phase-4 Implementation Notes & ADRs (write API + p3 read burn-down)
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 

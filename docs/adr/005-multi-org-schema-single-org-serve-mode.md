@@ -9,8 +9,8 @@ the org — but a self-hosted deployment has exactly one tenant. The auth path m
 wire-identical either way.
 
 **Decision.** Schema and verifier are fully multi-org (orgs, per-org public keys, `iss`
-resolves the key set). `serve` provisions exactly one org at startup: `CODESTORAGE_ORG`
-names it and `CODESTORAGE_ORG_PUBKEYS` supplies 1..n PEM public-key blocks (idempotent
+resolves the key set). `serve` provisions exactly one org at startup: `OPENSTORAGE_ORG`
+names it and `OPENSTORAGE_ORG_PUBKEYS` supplies 1..n PEM public-key blocks (idempotent
 upsert). `/api/v1` is mounted only when both are set; without them the binary serves the
 phase-0 git path only.
 

@@ -1,6 +1,6 @@
 # simtest — deterministic simulation testing (DST)
 
-Deterministic, seeded simulation of a multi-node code-storage cluster with
+Deterministic, seeded simulation of a multi-node open.storage cluster with
 fault injection, ported from waltier's SimStore + DST design (issue #3).
 Everything runs in one process — zero containers — on two authority-store
 lanes (`Config.RefBackend`): the shared SQLite file (default) and the

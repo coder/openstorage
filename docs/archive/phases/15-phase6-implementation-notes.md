@@ -1,7 +1,7 @@
 # Phase-6 Implementation Notes & ADRs (LFS, named-repo aliases, repo-urls, rate limiting)
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
@@ -22,7 +22,7 @@ namespace question ADR-3 answered for *refs* gets the opposite answer for LFS *o
 
 ## ADR-34: LFS lives on the storage host — presigned transfers, proxy fallback
 
-> **Amended by [#51](https://github.com/coder/code-storage/issues/51):** presigned
+> **Amended by [#51](https://github.com/coder/open-storage/issues/51):** presigned
 > transfers are now download-only. Uploads always use the verified proxy endpoint — a
 > presigned PUT binds neither content length nor digest, which left LFS outside the
 > storage-quota perimeter — and every verified upload is admitted through the quota
@@ -115,7 +115,7 @@ in-memory token bucket per client IP, applied at every REST route registration s
 - **Key = `RemoteAddr` host.** `X-Forwarded-For` is deliberately not trusted — a
   spoofable header as the limit key would let any client mint fresh buckets at will.
   Deployments behind a trusted proxy terminate client identity there. *(Issue #30
-  later added an opt-in `CODESTORAGE_TRUSTED_PROXIES` CIDR allowlist: when the peer
+  later added an opt-in `OPENSTORAGE_TRUSTED_PROXIES` CIDR allowlist: when the peer
   is a listed proxy, the key becomes the rightmost untrusted `X-Forwarded-For` hop;
   the default stays `RemoteAddr`-only.)*
 - **Per node, in memory.** Nodes are stateless (no shared limiter state to operate), and
@@ -125,7 +125,7 @@ in-memory token bucket per client IP, applied at every REST route registration s
   read routes answer the `{"error"}` envelope, write routes the docs/04 result envelope
   with status `"unavailable"` — `statusForHTTP` in errors.go gained the 429 row, so the
   mapping stays centralized.
-- **Config is fail-fast.** `CODESTORAGE_RATE_RPS` / `CODESTORAGE_RATE_BURST` must be set
+- **Config is fail-fast.** `OPENSTORAGE_RATE_RPS` / `OPENSTORAGE_RATE_BURST` must be set
   as a pair (`RPS > 0` requires `BURST >= 1`); malformed, negative, NaN, or infinite
   values abort startup naming the variable. Unset (or explicit zero) disables limiting —
   the middleware becomes the identity.
@@ -208,7 +208,7 @@ location inline. This section is the phase-7 burn-down record.*
    *Closed in phase 7: `newRateLimiter` returns `(*rateLimiter, error)` with the config
    checks as returned errors (`RPS <= 0` still disables the limiter); propagated as
    `api.New(cfg) (http.Handler, error)` through `buildAPIHandler`
-   (`cmd/codestorage/wire.go`); invalid-config test asserts an error, not a panic.*
+   (`cmd/openstorage/wire.go`); invalid-config test asserts an error, not a panic.*
 5. **P2 — assertf entry guards on p5 handlers/callbacks** (`handlers_fork.go`,
    `handlers_sync.go`, `wire_eventing.go`): carried over from docs/14 item 6.
    *Closed in phase 7: entry guards (nil receiver/deps/args only — never user input)

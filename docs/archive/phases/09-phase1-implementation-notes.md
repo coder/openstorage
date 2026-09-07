@@ -1,12 +1,12 @@
 # Phase-1 Implementation Notes & ADRs
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
 Records the load-bearing decisions from phase 1 (skeleton + auth: `internal/meta`,
-`internal/auth`, `internal/api`, and the `cmd/codestorage` wiring). The phase-0 core
+`internal/auth`, `internal/api`, and the `cmd/openstorage` wiring). The phase-0 core
 decisions — PG as ref authority (ADR-1), S3 upload before the ref flip (ADR-2), namespace
 mapping via separate ref stores (ADR-3) — carry into phase 1 unchanged and stay recorded in
 [08-spike-implementation-notes.md](08-spike-implementation-notes.md): `serve` mounts
@@ -21,11 +21,11 @@ wiring) that could not see each other's code while in flight.
 
 **Decision.** The `meta.Store` and `auth.Verifier` interfaces — including sentinel errors
 mapping onto the docs/03 status contract and the docs/02 scope/claim constants — were
-declared and frozen *before* implementation started. `cmd/codestorage/wire.go` is the
+declared and frozen *before* implementation started. `cmd/openstorage/wire.go` is the
 single integration seam: the only file referencing sibling-slice constructors. An opt-in
-`codestorage_stub` build tag swapped in `wire_stub.go` so the CLI could build and test
-before the slices landed; the stub was deleted once they did — it was scaffolding for the
-parallel build, not a supported mode.
+`openstorage_stub` (then `codestorage_stub`) build tag swapped in `wire_stub.go` so the CLI
+could build and test before the slices landed; the stub was deleted once they did — it was
+scaffolding for the parallel build, not a supported mode.
 
 **Consequences.** The frozen interfaces held and the slices merged without cross-slice
 edits. The one drift was on the *unfrozen* constructor surface — the API slice shipped
@@ -40,8 +40,8 @@ the org — but a self-hosted deployment has exactly one tenant. The auth path m
 wire-identical either way.
 
 **Decision.** Schema and verifier are fully multi-org (orgs, per-org public keys, `iss`
-resolves the key set). `serve` provisions exactly one org at startup: `CODESTORAGE_ORG`
-names it and `CODESTORAGE_ORG_PUBKEYS` supplies 1..n PEM public-key blocks (idempotent
+resolves the key set). `serve` provisions exactly one org at startup: `OPENSTORAGE_ORG`
+names it and `OPENSTORAGE_ORG_PUBKEYS` supplies 1..n PEM public-key blocks (idempotent
 upsert). `/api/v1` is mounted only when both are set; without them the binary serves the
 phase-0 git path only.
 
@@ -76,7 +76,7 @@ docs/01 prescribes after a soft delete is what will free names for reuse.
   DESC`) with an opaque cursor: unpadded base64url of `<created_at_unixnano>|<repo_id>`.
   Malformed cursors map onto 400. This resolves the roadmap's open item.
 - **Legacy env propagation for hooks.** `serve` re-exports the resolved PG/S3 URLs under
-  the spike-era env names so the re-exec'd `codestorage hook` processes keep working no
+  the spike-era env names so the re-exec'd `openstorage hook` processes keep working no
   matter which alias configured the server.
 - **SDK conformance starts now, not at phase 6.** The api tests drive the vendor's
   unmodified TypeScript SDK end-to-end against the in-process server (skipping loudly when

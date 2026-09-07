@@ -1,7 +1,7 @@
 # Implementation Roadmap & Conformance Strategy
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
@@ -42,7 +42,7 @@ git-protocol layers. Everything else (diff, blame, grep, archive, merge) can she
 
 Each phase ends with a dogfooding gate (below) before moving on.
 
-**Phase 0 — de-risk spike: done.** `cmd/codestorage` + `internal/spike` (promoted to
+**Phase 0 — de-risk spike: done.** `cmd/openstorage` + `internal/spike` (promoted to
 `internal/githttp` in phase 2) prove the storage core end-to-end: git push → packs in S3 →
 ref CAS in Postgres → clone from a second stateless node, with JWT ref-policy enforcement
 and `+ephemeral`/`+import` namespace routing. This replaces the "bare git repositories on
@@ -54,7 +54,7 @@ and crash-ordering analysis are recorded in
 **Phase 1 — skeleton + auth: done.** `internal/meta` (Postgres metadata store),
 `internal/auth` (multi-algorithm JWT verification), and `internal/api` (repo CRUD,
 middleware, `{"error"}` envelope) implement the phase-1 surface behind frozen contracts;
-`codestorage serve` mounts `/api/v1` alongside the phase-0 git path in single-org
+`openstorage serve` mounts `/api/v1` alongside the phase-0 git path in single-org
 self-host mode (quickstart in the top-level README). Conformance is already SDK-driven:
 the api tests run the vendor's unmodified TypeScript SDK against the in-process server,
 plus a 401/403/404/409 matrix on real Postgres, wired through the production constructors
@@ -64,10 +64,10 @@ rather than test doubles. Decisions are recorded in
 **Phase 2 — git smart HTTP: done.** The spike git path was promoted to `internal/githttp`
 and completed as the production surface: git-path auth moved onto the production org-key
 verifier (multi-algorithm, iss-validated; git-only serve mode dropped — `serve` requires
-`CODESTORAGE_ORG` + `CODESTORAGE_ORG_PUBKEYS`), the ref-policy engine gained upstream glob
+`OPENSTORAGE_ORG` + `OPENSTORAGE_ORG_PUBKEYS`), the ref-policy engine gained upstream glob
 semantics, the deprecated `ops` fallback, the ephemeral policy quirk, and `verify-sig`
-backed by an org signing-key registry (`codestorage signing-key`, keyring read fresh from
-Postgres each push). `CODESTORAGE_BASE_URL` makes `http_url` routable behind 0.0.0.0
+backed by an org signing-key registry (`openstorage signing-key`, keyring read fresh from
+Postgres each push). `OPENSTORAGE_BASE_URL` makes `http_url` routable behind 0.0.0.0
 binds. Decisions are recorded in
 [10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phase 6 later
 added the LFS batch API and rate limiting on this surface (see 15).
@@ -78,7 +78,7 @@ stacks: the production `postgres://` + `s3://` pair, and a zero-dependency local
 `sqlite://` (pure-Go driver, one `codestorage.db` for refs + metadata) and `file://` pack
 storage — derived from a single `serve --data-dir` flag. Nodes stay stateless either way;
 the container-based acceptance suites gained zero-container lanes (api `/sqlite` subtests,
-`CODESTORAGE_TEST_BACKEND=local` e2e). Decisions are recorded in
+`OPENSTORAGE_TEST_BACKEND=local` e2e). Decisions are recorded in
 [11-local-backends-implementation-notes.md](11-local-backends-implementation-notes.md).
 
 1. **Skeleton + auth — done.** Org registry with public keys; JWT middleware (ES256/RS256/EdDSA,

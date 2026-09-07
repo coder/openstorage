@@ -1,11 +1,11 @@
 # Spike Implementation Notes & ADRs
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
-Records the load-bearing decisions from the phase-0 de-risk spike (`cmd/codestorage`,
+Records the load-bearing decisions from the phase-0 de-risk spike (`cmd/openstorage`,
 `internal/spike/`). The spike code itself is throwaway-quality; the decisions below are the
 part meant to survive into the real backend. Acceptance is covered by container-based tests
 (`internal/spike/spike_test.go`: real Postgres + MinIO via testcontainers, nodes as separate
@@ -77,7 +77,7 @@ promotion) remains open for the real backend.
 ## Smaller notes
 
 - **Hooks re-exec the binary.** `pre-receive`/`update` are two-line shell scripts running
-  `codestorage hook <name>`; request context (repo, refs policy) flows via env vars set by
+  `openstorage hook <name>`; request context (repo, refs policy) flows via env vars set by
   the HTTP handler around `git receive-pack`. No shell/psql dependencies inside hooks.
 - **Schema init takes a PG advisory lock.** Two nodes starting concurrently can race
   `CREATE TABLE IF NOT EXISTS` into a duplicate `pg_type` key error (SQLSTATE 23505);

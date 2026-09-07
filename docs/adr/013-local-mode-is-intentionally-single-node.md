@@ -20,10 +20,10 @@ a node from mixing (PG + `file://`) but nothing optimizes for it either.
   WAL to checkpoint, and one obvious artifact for "hand me your data dir" debugging. The
   tables are disjoint, so the shared file changes no SQL. Split remains possible later by
   passing different URLs; the derivation just doesn't.
-- **Derivation precedence.** `--data-dir <dir>` (or `CODESTORAGE_DATA_DIR`; flag wins)
+- **Derivation precedence.** `--data-dir <dir>` (or `OPENSTORAGE_DATA_DIR`; flag wins)
   fills only the slots not set explicitly: `sqlite://<dir>/codestorage.db`,
-  `file://<dir>/blobs`, cache `<dir>/cache`. Explicit `CODESTORAGE_PG_URL` /
-  `CODESTORAGE_S3_URL` (and legacy aliases) and an explicit `--cache-dir` always win; the
+  `file://<dir>/blobs`, cache `<dir>/cache`. Explicit `OPENSTORAGE_PG_URL` /
+  `OPENSTORAGE_S3_URL` (and legacy aliases) and an explicit `--cache-dir` always win; the
   dir is made absolute up front because hooks re-exec from the cache repo's working
   directory, where a relative path would silently resolve elsewhere.
 

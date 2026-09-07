@@ -1,7 +1,7 @@
 # Phase-2 Implementation Notes & ADRs
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
@@ -21,9 +21,9 @@ clone, concurrent CAS, crash-after-S3 ordering).
 
 **Decision.** Phase 2 is a promotion: `git mv internal/spike internal/githttp` in its own
 mechanical commit (reviewable diffs), then harden in place. Runtime env vars the server
-passes to hooks are renamed (`SPIKE_REPO` → `CODESTORAGE_GIT_REPO`, `SPIKE_REFS_POLICY` →
-`CODESTORAGE_GIT_REFS_POLICY`). Test/fault-injection knobs become `CODESTORAGE_TEST_*` /
-`X-Codestorage-Test-Crash` and are honored **only** when `CODESTORAGE_TEST_MODE=1` — the
+passes to hooks are renamed (`SPIKE_REPO` → `OPENSTORAGE_GIT_REPO`, `SPIKE_REFS_POLICY` →
+`OPENSTORAGE_GIT_REFS_POLICY`). Test/fault-injection knobs become `OPENSTORAGE_TEST_*` /
+`X-Openstorage-Test-Crash` and are honored **only** when `OPENSTORAGE_TEST_MODE=1` — the
 server refuses the crash header otherwise; they exist for the crash-ordering and CAS e2e
 tests, never for production use.
 
@@ -43,7 +43,7 @@ failures map to 401; a valid token whose `iss` is a *different* registered org, 
 claim that does not resolve (repo_id → url via the meta store), or a missing scope
 (`git:read` for upload-pack, `git:write` for receive-pack) map to 403. The phase-0
 "git-only, single key" serve mode and `--jwt-pubkey` are dropped: `serve` requires
-`CODESTORAGE_ORG` + `CODESTORAGE_ORG_PUBKEYS`. This is a breaking CLI change confined to
+`OPENSTORAGE_ORG` + `OPENSTORAGE_ORG_PUBKEYS`. This is a breaking CLI change confined to
 this repo. The CLI `keygen`/`mint` helpers moved off the spike's single-ECDSA code onto
 `internal/auth` (`keygen --alg`, `mint --iss` required, algorithm inferred from the key).
 
@@ -57,7 +57,7 @@ is high-risk, low-value.
 **Decision.** The update hook computes the introduced set (`git rev-list <new> ^<old>`;
 branch creation checks everything reachable — the branch-protection contract compares
 against the ref's own prior tip only, never other refs — and deletions introduce
-nothing; [#59](https://github.com/coder/code-storage/issues/59) bounded the cost with a
+nothing; [#59](https://github.com/coder/open-storage/issues/59) bounded the cost with a
 per-push verdict cache and a fail-closed verification budget) and verifies
 each commit by delegating to git inside the cache repo: a temp `allowed_signers` file
 (`* namespaces="git" <ssh-key>` lines) plus a temp `GNUPGHOME` with the org's armored PGP
@@ -76,8 +76,8 @@ endpoint exists in the spec, so wire compatibility imposes nothing here.
 
 **Decision.** The OSS equivalent is a metadata table plus an operator CLI:
 `org_signing_keys` in `internal/meta` (`AddSigningKey` / `SigningKeysForOrg` /
-`RemoveSigningKey`) and `codestorage signing-key add|list|remove --org <org>`, which talks
-to Postgres directly via `CODESTORAGE_PG_URL` — deliberately not an HTTP endpoint. Key
+`RemoveSigningKey`) and `openstorage signing-key add|list|remove --org <org>`, which talks
+to Postgres directly via `OPENSTORAGE_PG_URL` — deliberately not an HTTP endpoint. Key
 material is validated at add time (a single SSH public key line with an allow-listed type
 whose base64 blob echoes the declared algorithm, or an ASCII-armored PGP public key
 block); the hook trusts registry contents verbatim and reads the keyring **fresh from
@@ -101,7 +101,7 @@ are not additive), applied once at parse time.
 
 ## Backlog fixes landed in phase 2
 
-- **`CODESTORAGE_BASE_URL`** — overrides the `http://<bound-addr>` base used for
+- **`OPENSTORAGE_BASE_URL`** — overrides the `http://<bound-addr>` base used for
   `http_url` in `POST /repos` responses (the derived base is unroutable when binding
   `0.0.0.0`). Validated at startup: http(s), host required, no query/fragment.
 - **500 bodies sanitized** — `/api/v1` handlers log the underlying store error via

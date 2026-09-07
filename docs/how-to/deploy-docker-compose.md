@@ -1,6 +1,6 @@
 # Deploy a two-replica stack with Docker Compose
 
-**Goal:** a running two-replica codestorage deployment — two stateless server nodes
+**Goal:** a running two-replica open.storage deployment — two stateless server nodes
 (`node-a`, `node-b`) sharing one Postgres (ref CAS + metadata) and one SeaweedFS (immutable
 packs, via its S3 gateway) — and proof that a write through one node is immediately visible through the other.
 
@@ -9,13 +9,13 @@ packs, via its S3 gateway) — and proof that a write through one node is immedi
 > from the host: **Git LFS downloads** — the batch API presigns download URLs for the
 > container-only endpoint `http://seaweedfs:8333`, which host-side clients cannot resolve
 > (uploads work: they proxy through the server,
-> [#51](https://github.com/coder/code-storage/issues/51)). Everything else works,
+> [#51](https://github.com/coder/open-storage/issues/51)). Everything else works,
 > including **upstream mirror sync** (`pull-upstream`): since
-> [#49](https://github.com/coder/code-storage/pull/49) the sync worker pushes through the
-> node's **own bound listener**, never `CODESTORAGE_BASE_URL`, so sync works against any
+> [#49](https://github.com/coder/open-storage/pull/49) the sync worker pushes through the
+> node's **own bound listener**, never `OPENSTORAGE_BASE_URL`, so sync works against any
 > upstream the *containers* can reach — public forges just work; an upstream bound to the
 > host's loopback does not (re-verified live in
-> [#60](https://github.com/coder/code-storage/issues/60)). For a hardened
+> [#60](https://github.com/coder/open-storage/issues/60)). For a hardened
 > deployment (TLS, trusted proxies, rolling upgrades, key rotation), follow the
 > [production deployment guide](deploy-production.md) — the topology is the same, only the
 > hardening differs.
@@ -28,7 +28,7 @@ host); the opt-in `replicas` profile adds the two server nodes, built from the r
 ## Prerequisites
 
 - Docker with the Compose plugin.
-- Go and git on the host — the same `codestorage` binary generates keys and mints test
+- Go and git on the host — the same `openstorage` binary generates keys and mints test
   tokens.
 - If sibling checkouts share your Docker daemon, pick unique host ports and a unique
   compose project name (`-p`); every published port is env-overridable (`PGPORT`,
@@ -41,8 +41,8 @@ Runtime keys are generated, never committed. The nodes mount only the **public**
 on the host for minting:
 
 ```sh
-go build ./cmd/codestorage   # or install a released binary: README → Install
-mkdir -p compose-keys && ./codestorage keygen --out ./compose-keys/cs-key
+go build ./cmd/openstorage   # or install a released binary: README → Install
+mkdir -p compose-keys && ./openstorage keygen --out ./compose-keys/cs-key
 # writes compose-keys/cs-key.pem (private, 0600) + compose-keys/cs-key.pub.pem
 ```
 
@@ -77,8 +77,8 @@ it back through node B — no replication step in between, because nodes keep no
 state:
 
 ```sh
-TOK_W=$(./codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
-TOK_GIT=$(./codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
+TOK_W=$(./openstorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
+TOK_GIT=$(./openstorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
 
 # Create + push via node A.
 curl -s -X POST http://127.0.0.1:8081/api/v1/repos -H "Authorization: Bearer $TOK_W" \
@@ -97,7 +97,7 @@ curl -s http://127.0.0.1:8082/api/repos/demo -H "Authorization: Bearer $TOK_GIT"
 ```
 
 `mint` needs `--iss selfhost` because the compose nodes run with
-`CODESTORAGE_ORG=selfhost` — the JWT `iss` claim must match the configured org
+`OPENSTORAGE_ORG=selfhost` — the JWT `iss` claim must match the configured org
 ([auth spec](../reference/authentication.md)).
 
 ## 4. Watch the nodes work
@@ -131,11 +131,11 @@ host against the published ports:
 
 ```sh
 docker compose up -d --wait
-CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=./compose-keys/cs-key.pub.pem \
-CODESTORAGE_PG_URL="postgres://postgres:postgres@127.0.0.1:${PGPORT:-15432}/postgres" \
-CODESTORAGE_S3_URL="s3://codestorage?endpoint=http://127.0.0.1:${S3PORT:-18333}&s3ForcePathStyle=true&region=us-east-1" \
-AWS_ACCESS_KEY_ID=codestorage AWS_SECRET_ACCESS_KEY=codestorage \
-  ./codestorage serve --listen 127.0.0.1:8080
+OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=./compose-keys/cs-key.pub.pem \
+OPENSTORAGE_PG_URL="postgres://postgres:postgres@127.0.0.1:${PGPORT:-15432}/postgres" \
+OPENSTORAGE_S3_URL="s3://openstorage?endpoint=http://127.0.0.1:${S3PORT:-18333}&s3ForcePathStyle=true&region=us-east-1" \
+AWS_ACCESS_KEY_ID=openstorage AWS_SECRET_ACCESS_KEY=openstorage \
+  ./openstorage serve --listen 127.0.0.1:8080
 ```
 
 Every variable is documented in the [configuration reference](../reference/configuration.md).
@@ -144,7 +144,7 @@ Every variable is documented in the [configuration reference](../reference/confi
 
 | Symptom | Cause / fix |
 |---|---|
-| `up --wait` times out on a node healthcheck | The node crashed at startup — `docker compose --profile replicas logs node-a`. Startup validation is fail-fast and names the offending variable ([configuration reference](../reference/configuration.md)). A common cause: no `compose-keys/cs-key.pub.pem` (step 1 not run), so `CODESTORAGE_ORG_PUBKEYS` points at nothing. |
+| `up --wait` times out on a node healthcheck | The node crashed at startup — `docker compose --profile replicas logs node-a`. Startup validation is fail-fast and names the offending variable ([configuration reference](../reference/configuration.md)). A common cause: no `compose-keys/cs-key.pub.pem` (step 1 not run), so `OPENSTORAGE_ORG_PUBKEYS` points at nothing. |
 | Host port already in use | Override `PGPORT` / `S3PORT` / `NODEA_PORT` / `NODEB_PORT` and pass a unique `-p <project>` so parallel checkouts don't collide. |
-| `401`/`403` from curl or git | Token minted with the wrong `--iss` (must equal `CODESTORAGE_ORG`, here `selfhost`), the wrong key, or missing scopes. Repo routes need a token whose `repo` claim matches the target repo. |
+| `401`/`403` from curl or git | Token minted with the wrong `--iss` (must equal `OPENSTORAGE_ORG`, here `selfhost`), the wrong key, or missing scopes. Repo routes need a token whose `repo` claim matches the target repo. |
 | Rotated the keypair but old tokens still verify | Each node registers the key set from its mounted file **at boot** — restart the nodes (`docker compose --profile replicas restart node-a node-b`) after changing `compose-keys/`. |

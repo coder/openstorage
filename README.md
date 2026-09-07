@@ -1,4 +1,4 @@
-# codestorage
+# open.storage
 
 An open-source, wire-compatible backend for [code.storage](https://code.storage) — Pierre
 Computer Company's git-native storage service — built from the specification in
@@ -15,7 +15,7 @@ authority is one S3 bucket ([`s3wal`](docs/explanation/storage-engine.md#the-zer
 flowchart TB
     clients["SDKs · plain git · curl<br/>(customer-signed JWTs, per-org keys)"]
 
-    subgraph node["codestorage serve — stateless, replicate freely"]
+    subgraph node["openstorage serve — stateless, replicate freely"]
         api["REST API<br/>/api/v1 + named-repo aliases"]
         git["git smart-HTTP + LFS"]
         jobs["background jobs<br/>orphan sweep · repack · webhooks · upstream sync"]
@@ -39,25 +39,35 @@ to the packs, single node, zero other infrastructure
 ([ADR-46](docs/adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md),
 [quickstart below](#quickstart-zero-infrastructure-mode-one-bucket-experimental)).
 
+## Renamed from code-storage
+
+Starting with v0.15.0, this project is **open.storage**: use the `openstorage` binary,
+`ghcr.io/coder/open-storage` image, and `OPENSTORAGE_*` environment variables.
+`CODESTORAGE_*` remains a fallback for the **0.15.x minor release only**, with a boot-time
+warning for each legacy fallback; an explicitly set new variable wins, even when empty.
+Keep existing database, bucket, and data-directory values unchanged when migrating.
+See the [migration guide](docs/how-to/migrate-to-openstorage.md) for rollout and Go-module
+instructions. Compatibility with Pierre's upstream service is unchanged.
+
 ## Install
 
 Prebuilt binaries (`linux`/`darwin` × `amd64`/`arm64`, with `checksums.txt`) ship on the
-[releases page](https://github.com/coder/code-storage/releases). The first two options put
-`codestorage` on your `PATH`, which the quickstarts below assume; a source build lands at
-`./codestorage` — substitute accordingly:
+[releases page](https://github.com/coder/open-storage/releases). The first two options put
+`openstorage` on your `PATH`, which the quickstarts below assume; a source build lands at
+`./openstorage` — substitute accordingly:
 
 ```sh
 # Go toolchain (needs Go >= 1.27):
-go install github.com/coder/code-storage/cmd/codestorage@latest
+go install github.com/coder/open-storage/cmd/openstorage@latest
 
 # mise (downloads the release binary; verifies checksums + GitHub artifact attestations):
-mise use -g github:coder/code-storage@latest
+mise use -g github:coder/open-storage@latest
 
-codestorage version               # verify the install
+openstorage version               # verify the install
 
-# From source (contributors; builds ./codestorage without touching PATH):
-git clone https://github.com/coder/code-storage.git && cd code-storage
-go build ./cmd/codestorage && ./codestorage version
+# From source (contributors; builds ./openstorage without touching PATH):
+git clone https://github.com/coder/open-storage.git && cd open-storage
+go build ./cmd/openstorage && ./openstorage version
 ```
 
 > [!NOTE]
@@ -70,54 +80,54 @@ go build ./cmd/codestorage && ./codestorage version
 >
 >   ```sh
 >   gh auth setup-git   # or any git credential helper for github.com
->   GOPRIVATE='github.com/coder/*' go install github.com/coder/code-storage/cmd/codestorage@latest
+>   GOPRIVATE='github.com/coder/*' go install github.com/coder/open-storage/cmd/openstorage@latest
 >   ```
 >
 > - mise needs a GitHub token for the release download: a logged-in `gh` CLI is picked up
 >   automatically (the `github.gh_cli_tokens` setting is on by default); otherwise set
 >   `GITHUB_TOKEN`. On mise versions that predate the `github:` backend, the equivalent is
->   `mise use -g 'ubi:coder/code-storage[exe=codestorage]@latest'` — the `exe=` hint is
->   required because the repo name (`code-storage`) differs from the binary name
->   (`codestorage`).
+>   `mise use -g 'ubi:coder/open-storage[exe=openstorage]@latest'` — the `exe=` hint is
+>   required because the repo name (`open-storage`) differs from the binary name
+>   (`openstorage`).
 
 **Runtime dependencies:** the server shells out to `git` (always) and to `gpg` /
 `ssh-keygen` (only for `verify-sig` ref policies, which fail closed without them —
 [ADR-9](docs/adr/009-verify-sig-delegates-to-gits-own-verification-machinery.md),
-[#50](https://github.com/coder/code-storage/issues/50)). The Docker image carries all
+[#50](https://github.com/coder/open-storage/issues/50)). The Docker image carries all
 three; a bare binary brings none — install them on the host.
 
 ## Quickstart: local mode (60 seconds)
 
-Requires only the `codestorage` binary ([install](#install)) and git — no Docker, no
+Requires only the `openstorage` binary ([install](#install)) and git — no Docker, no
 Postgres, no object store. One flag derives the whole storage stack:
 `sqlite://<dir>/codestorage.db` (refs + metadata), `file://<dir>/blobs` (packs as plain
 files), and `<dir>/cache` (rebuildable cache).
 
 ```sh
 # 1. Generate an org keypair (keys are never committed).
-codestorage keygen --out /tmp/cs-key      # writes /tmp/cs-key.pem + /tmp/cs-key.pub.pem
+openstorage keygen --out /tmp/cs-key      # writes /tmp/cs-key.pem + /tmp/cs-key.pub.pem
 
 # 2. Start a node: REST API + git smart-HTTP on one listener, storage under ~/cs-data.
-CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
-  codestorage serve --listen 127.0.0.1:8080 --data-dir ~/cs-data &
+OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
+  openstorage serve --listen 127.0.0.1:8080 --data-dir ~/cs-data &
 sleep 1 && curl -sf http://127.0.0.1:8080/healthz && kill -0 $!
 # ^ fails fast if the port was already taken by an older server (serve's
 #   "address already in use" exit is easy to miss behind `&`).
 
 # 3. Mint a token and create a repo.
-TOK_CREATE=$(codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
+TOK_CREATE=$(openstorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
 curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TOK_CREATE" \
   -d '{"default_branch":"main"}'                                    # {"repo_id":...}
 
 # 4. Plain git against the same node.
-TOKEN=$(codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
+TOKEN=$(openstorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
 git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
 cd demo && git -c user.name=demo -c user.email=demo@example.com \
   commit --allow-empty -m init && git push origin HEAD:main
 ```
 
-The derivation fills only slots not set explicitly — `CODESTORAGE_PG_URL`,
-`CODESTORAGE_S3_URL`, and `--cache-dir` always win. Local mode is intentionally
+The derivation fills only slots not set explicitly — `OPENSTORAGE_PG_URL`,
+`OPENSTORAGE_S3_URL`, and `--cache-dir` always win. Local mode is intentionally
 single-node
 ([ADR-13](docs/adr/013-local-mode-is-intentionally-single-node.md)); the same binary and data
 survive restarts, so it doubles as a tiny durable git server.
@@ -131,15 +141,15 @@ credentials, published backing-service ports, plain HTTP) — not a hardened dep
 (for that, see the [production guide](docs/how-to/deploy-production.md)):
 
 ```sh
-# 1. Keys on the host, from this checkout (needs the codestorage binary — see Install).
-mkdir -p compose-keys && codestorage keygen --out ./compose-keys/cs-key
+# 1. Keys on the host, from this checkout (needs the openstorage binary — see Install).
+mkdir -p compose-keys && openstorage keygen --out ./compose-keys/cs-key
 
 # 2. Boot backing services + both replicas (node A on :8081, node B on :8082).
 docker compose --profile replicas up -d --wait --build
 
 # 3. Mint tokens against the compose keypair.
-TOK_W=$(codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
-TOK_GIT=$(codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
+TOK_W=$(openstorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
+TOK_GIT=$(openstorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
 
 # 4. Create + push via node A; clone via node B — same HEAD SHA.
 curl -s -X POST http://127.0.0.1:8081/api/v1/repos -H "Authorization: Bearer $TOK_W" \
@@ -160,7 +170,7 @@ docker compose --profile replicas down -v
 Host ports and key locations are env-overridable (`PGPORT`, `S3PORT`, `NODEA_PORT`,
 `NODEB_PORT`, `CS_KEYS_DIR`) — see the [`docker-compose.yml`](docker-compose.yml) header.
 To run the server on the host against just the backing services, boot them with plain
-`docker compose up -d --wait` and point `CODESTORAGE_PG_URL` / `CODESTORAGE_S3_URL` at the
+`docker compose up -d --wait` and point `OPENSTORAGE_PG_URL` / `OPENSTORAGE_S3_URL` at the
 published ports ([configuration reference](docs/reference/configuration.md)).
 
 ## Quickstart: zero-infrastructure mode, one bucket (experimental)
@@ -176,21 +186,21 @@ until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
 # The bucket must exist before serve boots. On a cold store both bucket creation and
 # object writes can precede a writable volume, so retry create + a real write as one unit
 # (the create tolerates already-exists; readiness is the object roundtrip).
-until curl -s -X PUT http://127.0.0.1:8333/codestorage >/dev/null &&
-      curl -sf -X PUT -d ready http://127.0.0.1:8333/codestorage/ready &&
-      curl -sf -X DELETE http://127.0.0.1:8333/codestorage/ready; do sleep 1; done
+until curl -s -X PUT http://127.0.0.1:8333/openstorage >/dev/null &&
+      curl -sf -X PUT -d ready http://127.0.0.1:8333/openstorage/ready &&
+      curl -sf -X DELETE http://127.0.0.1:8333/openstorage/ready; do sleep 1; done
 
 # 2. One node, refs + metadata + packs all in the bucket (this dev SeaweedFS is unauthenticated; any creds sign).
-codestorage keygen --out /tmp/cs-key
-CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
-CODESTORAGE_PG_URL='s3wal://codestorage?endpoint=http://127.0.0.1:8333&region=us-east-1' \
-CODESTORAGE_S3_URL='s3://codestorage?endpoint=http://127.0.0.1:8333&s3ForcePathStyle=true&region=us-east-1' \
+openstorage keygen --out /tmp/cs-key
+OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
+OPENSTORAGE_PG_URL='s3wal://openstorage?endpoint=http://127.0.0.1:8333&region=us-east-1' \
+OPENSTORAGE_S3_URL='s3://openstorage?endpoint=http://127.0.0.1:8333&s3ForcePathStyle=true&region=us-east-1' \
 AWS_ACCESS_KEY_ID=any AWS_SECRET_ACCESS_KEY=any \
-  codestorage serve --listen 127.0.0.1:8080 --cache-dir /tmp/cs-cache &
+  openstorage serve --listen 127.0.0.1:8080 --cache-dir /tmp/cs-cache &
 sleep 3 && curl -sf http://127.0.0.1:8080/healthz && kill -0 $!
 
 # 3. Same client flow as local mode — mint, create, clone, push.
-TOK=$(codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write,git:read,git:write)
+TOK=$(openstorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write,git:read,git:write)
 curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TOK" \
   -d '{"default_branch":"main"}'
 git clone "http://t:${TOK}@127.0.0.1:8080/demo.git" && cd demo
@@ -205,7 +215,7 @@ to expire (up to 2 minutes by default); once the old process is confirmed dead, 
 the lease to skip the wait:
 
 ```sh
-curl -sf -X DELETE http://127.0.0.1:8333/codestorage/_wal/instance-lease
+curl -sf -X DELETE http://127.0.0.1:8333/openstorage/_wal/instance-lease
 ```
 
 The mode is deliberately single-node with honest scaling boundaries (one CAS point per
@@ -240,19 +250,19 @@ explains what changes underneath.
   [River](https://riverqueue.com) jobs on Postgres, in-process in local mode
   ([configuration reference](docs/reference/configuration.md)).
 - **Commit-signing key registry** managed from the CLI
-  ([`codestorage signing-key`](docs/reference/cli.md#codestorage-signing-key)).
+  ([`openstorage signing-key`](docs/reference/cli.md#openstorage-signing-key)).
 
 ## Configuration
 
-`serve` is configured through `CODESTORAGE_*` environment variables. The essentials:
+`serve` is configured through `OPENSTORAGE_*` environment variables. The essentials:
 
 | Variable | Meaning |
 |---|---|
-| `CODESTORAGE_ORG` | **Required.** Org name (JWT `iss` claim) |
-| `CODESTORAGE_ORG_PUBKEYS` | **Required.** PEM file with the org's public keys |
-| `CODESTORAGE_PG_URL` | Database URL for refs + metadata: `postgres://`/`postgresql://`, `sqlite://`, or the experimental `s3wal://` |
-| `CODESTORAGE_S3_URL` | Pack storage URL: `s3://` bucket or `file://` directory |
-| `CODESTORAGE_DATA_DIR` | Local mode: one directory that derives the two storage URLs above (org settings are still required) |
+| `OPENSTORAGE_ORG` | **Required.** Org name (JWT `iss` claim) |
+| `OPENSTORAGE_ORG_PUBKEYS` | **Required.** PEM file with the org's public keys |
+| `OPENSTORAGE_PG_URL` | Database URL for refs + metadata: `postgres://`/`postgresql://`, `sqlite://`, or the experimental `s3wal://` |
+| `OPENSTORAGE_S3_URL` | Pack storage URL: `s3://` bucket or `file://` directory |
+| `OPENSTORAGE_DATA_DIR` | Local mode: one directory that derives the two storage URLs above (org settings are still required) |
 
 Every variable — rate limiting, trusted proxies, pack quotas, sweep and repack tuning,
 legacy aliases — with defaults and validation constraints:
@@ -266,7 +276,7 @@ legacy aliases — with defaults and validation constraints:
 | **Tutorials** | The three quickstarts above |
 | **Reference** | [Configuration](docs/reference/configuration.md) · [CLI](docs/reference/cli.md) · [Testing](docs/reference/testing.md) · [HTTP API](docs/reference/http-api.md) · [Auth & JWT claims](docs/reference/authentication.md) · [Webhooks](docs/reference/webhooks.md) |
 | **Explanation** | [Wire compatibility with code.storage](docs/explanation/wire-compatibility.md) · [The storage engine](docs/explanation/storage-engine.md) · [Domain model](docs/explanation/domain-model.md) · [Git protocol & namespaces](docs/explanation/git-protocol-and-namespaces.md) · [Streaming commit protocols](docs/explanation/streaming-commit-protocols.md) · [Docs index](docs/README.md) · [Architecture decision records](docs/adr/README.md) |
-| **How-to** | [Deploy to production (multi-replica)](docs/how-to/deploy-production.md) · [Deploy a two-replica stack with Docker Compose](docs/how-to/deploy-docker-compose.md) · [Operate the storage lifecycle: repack, quotas, sweeping](docs/how-to/storage-lifecycle-and-sweeping.md) |
+| **How-to** | [Migrate to open.storage](docs/how-to/migrate-to-openstorage.md) · [Deploy to production (multi-replica)](docs/how-to/deploy-production.md) · [Deploy a two-replica stack with Docker Compose](docs/how-to/deploy-docker-compose.md) · [Operate the storage lifecycle: repack, quotas, sweeping](docs/how-to/storage-lifecycle-and-sweeping.md) |
 
 ## Contributing & testing
 
@@ -276,8 +286,8 @@ go test ./...   # needs Docker: boots real Postgres + SeaweedFS via testcontaine
 
 Zero-container lanes cover the same surfaces on the local backends: the api integration
 tests fan out into `/pg` + `/sqlite` subtests, and
-`CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp` runs the full git e2e suite on
-`sqlite://` + `file://`. `CODESTORAGE_TEST_BACKEND=s3wal` runs the same e2e suite on the
+`OPENSTORAGE_TEST_BACKEND=local go test ./internal/githttp` runs the full git e2e suite on
+`sqlite://` + `file://`. `OPENSTORAGE_TEST_BACKEND=s3wal` runs the same e2e suite on the
 zero-infra topology (one SeaweedFS bucket for refs, metadata, *and* blobs — needs
 Docker), plus its lane-only drills. Setup, lanes, lint, commit conventions, and the review bar:
 **[CONTRIBUTING.md](CONTRIBUTING.md)**; test lanes and the DST simulation harness in
@@ -293,7 +303,7 @@ depth: **[testing reference](docs/reference/testing.md)**.
 | `docs/explanation/` | Explanation: storage engine, wire compatibility, domain model, protocols |
 | `docs/adr/` | Standalone architecture decision records (ADR-1..46) |
 | `docs/archive/` | Historical roadmap + per-phase implementation notes |
-| `cmd/codestorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
+| `cmd/openstorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
 | `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
 | `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
 | `internal/meta` | Metadata store: orgs, org public keys, repos, webhooks, git credentials, upstream links |

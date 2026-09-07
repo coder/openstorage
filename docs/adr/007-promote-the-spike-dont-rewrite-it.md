@@ -11,9 +11,9 @@ clone, concurrent CAS, crash-after-S3 ordering).
 
 **Decision.** Phase 2 is a promotion: `git mv internal/spike internal/githttp` in its own
 mechanical commit (reviewable diffs), then harden in place. Runtime env vars the server
-passes to hooks are renamed (`SPIKE_REPO` → `CODESTORAGE_GIT_REPO`, `SPIKE_REFS_POLICY` →
-`CODESTORAGE_GIT_REFS_POLICY`). Test/fault-injection knobs become `CODESTORAGE_TEST_*` /
-`X-Codestorage-Test-Crash` and are honored **only** when `CODESTORAGE_TEST_MODE=1` — the
+passes to hooks are renamed (`SPIKE_REPO` → `OPENSTORAGE_GIT_REPO`, `SPIKE_REFS_POLICY` →
+`OPENSTORAGE_GIT_REFS_POLICY`). Test/fault-injection knobs become `OPENSTORAGE_TEST_*` /
+`X-Openstorage-Test-Crash` and are honored **only** when `OPENSTORAGE_TEST_MODE=1` — the
 server refuses the crash header otherwise; they exist for the crash-ordering and CAS e2e
 tests, never for production use.
 

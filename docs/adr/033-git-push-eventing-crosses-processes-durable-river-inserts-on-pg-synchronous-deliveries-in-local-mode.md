@@ -4,7 +4,7 @@
 > (“Phase-5 Implementation Notes & ADRs (eventing, upstream sync, credentials, fork)”). Historical decision record — later issues and PRs may have
 > superseded details; the git history of the source file is authoritative.
 
-Git pushes mutate refs in the `codestorage hook` subprocess (the pre-receive/update
+Git pushes mutate refs in the `openstorage hook` subprocess (the pre-receive/update
 re-exec), not in the serve process, so ADR-28's CASRef decorator needs a queue reachable
 *across processes* there. Decision: **queue construction dispatches on the metadata DB
 URL scheme** (the same dispatch as `meta.Open`/`ref.Open`), with asymmetric semantics:

@@ -112,12 +112,12 @@ exposure — so every http(s) forward dials through a short-lived loopback
 vetting proxy applying the webhook TargetGuard policy (issue #53): deny
 loopback/private/link-local/ULA/metadata/special-purpose destinations,
 re-resolving and vetting at connect time (no DNS-rebinding TOCTOU).
-`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE` relaxes only the private receiver
+`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE` relaxes only the private receiver
 classes for internal-forge deployments; a denied destination fails the run
 permanently as configuration. The pull lane's egress predates this ADR;
 [ADR-45](045-sync-egress-policy-is-unified-behind-one-dial-time-guard.md)
 extends the same dial-time guard to it behind the unified
-`CODESTORAGE_SYNC_ALLOW_PRIVATE` policy (this flag became the deprecated
+`OPENSTORAGE_SYNC_ALLOW_PRIVATE` policy (this flag became the deprecated
 push-only spelling).
 
 **Failure semantics.** The forward itself is atomic (`git push --atomic`):

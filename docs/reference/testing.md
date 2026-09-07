@@ -12,8 +12,8 @@ One test suite, two storage stacks. Which stack a test run uses is decided in
 | Lane | Command | Backends | Needs |
 |---|---|---|---|
 | **Default (`pg`)** | `go test ./... -count=1 -race -timeout=30m` | Postgres 17 + SeaweedFS, booted per run via [testcontainers](https://golang.testcontainers.org/) | Docker, git, git-lfs |
-| **Local** | `CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m` | SQLite (`sqlite://`) + plain-file blobs (`file://`) | git, git-lfs — **no Docker** |
-| **s3wal** | `CODESTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m` | ONE SeaweedFS bucket carrying refs + metadata (`s3wal://`, the `_wal/` prefix) AND the blobs (`s3://`) — the zero-infra topology (ADR-46), plus its lane-only drills (restart-from-bucket-only, dual-serve refusal) | Docker, git, git-lfs |
+| **Local** | `OPENSTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m` | SQLite (`sqlite://`) + plain-file blobs (`file://`) | git, git-lfs — **no Docker** |
+| **s3wal** | `OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m` | ONE SeaweedFS bucket carrying refs + metadata (`s3wal://`, the `_wal/` prefix) AND the blobs (`s3://`) — the zero-infra topology (ADR-46), plus its lane-only drills (restart-from-bucket-only, dual-serve refusal) | Docker, git, git-lfs |
 | **Backend fan-out** | part of the default lane | `internal/api`, `internal/meta`, and `internal/ref` run every integration/conformance test twice, as `/pg` and `/sqlite` subtests | Docker (for the `/pg` half) |
 
 These are exactly the CI jobs in
@@ -23,19 +23,19 @@ lane (issue #193), and `lint` / `image` complete the required set. CI asserts
 `git lfs version` up front so a missing LFS client fails the job instead of
 silently skipping LFS coverage.
 
-`CODESTORAGE_TEST_BACKEND` accepts `pg` (or unset), `local`, and `s3wal`; anything
+`OPENSTORAGE_TEST_BACKEND` accepts `pg` (or unset), `local`, and `s3wal`; anything
 else panics in `TestMain` (`internal/githttp/e2e_test.go`). On the s3wal lane the
-suite's nodes run with the instance lease disabled (`CODESTORAGE_S3WAL_LEASE_TTL=0`)
+suite's nodes run with the instance lease disabled (`OPENSTORAGE_S3WAL_LEASE_TTL=0`)
 because the shared-bucket multi-node tests are exactly the topology the lease refuses;
 the dual-serve drill re-enables it explicitly. The `internal/githttp`
-e2e harness builds the real `codestorage` binary, boots the chosen backends,
+e2e harness builds the real `openstorage` binary, boots the chosen backends,
 starts server nodes as subprocesses, and drives them with plain `git`, `curl`-level
 HTTP, and a real `git lfs` client.
 
 ### Flags that are not optional
 
 - **`-count=1` when switching lanes.** The Go test cache does track environment
-  variables — but only reads made while the tests run. `CODESTORAGE_TEST_BACKEND`
+  variables — but only reads made while the tests run. `OPENSTORAGE_TEST_BACKEND`
   is read in `TestMain` *before* `m.Run()`, which the cache cannot see, so
   switching lanes without `-count=1` silently replays the other lane's cached
   results and reports them as fresh (reproducible: a `TestMain`-read variable
@@ -69,7 +69,7 @@ message in the PR.
   with the first run's state. Repeat a run by invoking `go test -count=1`
   again, not by raising `-count`.
 - **Repack convergence asserts must use threshold 2.** With
-  `CODESTORAGE_REPACK_THRESHOLD=t`, pack rows converge *below* `t`, not to one
+  `OPENSTORAGE_REPACK_THRESHOLD=t`, pack rows converge *below* `t`, not to one
   row — a fold that snapshots all but the latest push can settle at `t-1` rows
   permanently. Only `t=2` guarantees eventual convergence to exactly one pack,
   which is what makes it assertable.
@@ -78,7 +78,7 @@ message in the PR.
   use minutes-scale deadlines because `-race` on a loaded CI runner is slow.
   Tight sleeps are how CI-only flakes are born.
 - **Local-only tests skip, not fail, on the pg lane** — follow the existing
-  pattern: check the lane and `t.Skipf` with the `CODESTORAGE_TEST_BACKEND=local`
+  pattern: check the lane and `t.Skipf` with the `OPENSTORAGE_TEST_BACKEND=local`
   hint.
 
 ### Hermetic git
@@ -92,8 +92,8 @@ otherwise leak into fixture commits and change SHAs.
 
 ### Fault injection
 
-The e2e suites use server-side knobs (`CODESTORAGE_TEST_MODE`,
-`CODESTORAGE_TEST_CRASH`, `CODESTORAGE_TEST_CAS_DROP`, ...) to force crashes at
+The e2e suites use server-side knobs (`OPENSTORAGE_TEST_MODE`,
+`OPENSTORAGE_TEST_CRASH`, `OPENSTORAGE_TEST_CAS_DROP`, ...) to force crashes at
 precise pipeline stages; the server refuses them outside test mode. The full
 list is in the [configuration reference](configuration.md#internal-and-test-variables).
 
@@ -232,7 +232,7 @@ contend with each other; the local backend keeps the `internal/githttp`
 boot container-free):
 
 ```sh
-CODESTORAGE_TEST_BACKEND=local go test -p 1 ./... -run '^$' -bench . -benchmem
+OPENSTORAGE_TEST_BACKEND=local go test -p 1 ./... -run '^$' -bench . -benchmem
 ```
 
 Benchmarks are **not** a per-PR gate — shared-runner deltas are too noisy to
@@ -249,7 +249,7 @@ caveat when reading results: `BenchmarkAdmitReserve/parallelism=N` scales
 (03:53 UTC): it boots [Floci](https://hub.docker.com/r/floci/floci) — a
 lightweight AWS wire-protocol emulator — with S3 auth enforcement on,
 provisions an IAM access key through the IAM API, and runs
-`go test ./internal/blob` with `CODESTORAGE_TEST_S3_URL` pointed at it. That
+`go test ./internal/blob` with `OPENSTORAGE_TEST_S3_URL` pointed at it. That
 variable gates the endpoint tests in `internal/blob/s3endpoint_test.go`
 (skipped everywhere else): a CRUD round-trip through the real `blob.S3`
 surface, plus the presigned-URL SigV4 test — valid signature ⇒ 200 with the
@@ -323,11 +323,11 @@ aws --endpoint-url http://127.0.0.1:4566 iam create-user --user-name blobtest
 aws --endpoint-url http://127.0.0.1:4566 iam create-access-key --user-name blobtest
 # export the returned AccessKeyId / SecretAccessKey, then:
 
-CODESTORAGE_TEST_S3_URL='s3://floci-test?endpoint=http://127.0.0.1:4566&s3ForcePathStyle=true&region=us-east-1' \
+OPENSTORAGE_TEST_S3_URL='s3://floci-test?endpoint=http://127.0.0.1:4566&s3ForcePathStyle=true&region=us-east-1' \
   go test ./internal/blob -run 'TestS3Endpoint' -count=1 -race -v
 ```
 
-The same tests run against real S3: point `CODESTORAGE_TEST_S3_URL` at an
+The same tests run against real S3: point `OPENSTORAGE_TEST_S3_URL` at an
 existing bucket (`s3://my-bucket?region=us-east-1`) with real credentials in
 the environment. Without an `endpoint` query parameter the bucket is only
 probed, never created — re-creating an owned us-east-1 bucket would reset
@@ -345,8 +345,8 @@ together) with S3 auth
 enforcement on, provisions an IAM user and access key, assumes a role via
 STS, and reruns the full PG-mode `internal/githttp` E2E suite with the blob
 store pointed at Floci and the STS **session credentials** in the
-environment. `CODESTORAGE_TEST_S3_ENDPOINT` is the seam: a test-only
-override read by the suite's `TestMain` (like `CODESTORAGE_TEST_BACKEND`,
+environment. `OPENSTORAGE_TEST_S3_ENDPOINT` is the seam: a test-only
+override read by the suite's `TestMain` (like `OPENSTORAGE_TEST_BACKEND`,
 it never touches production config parsing) that swaps the managed
 SeaweedFS container for the external endpoint on the pg lane — and panics
 on any other lane, where it would otherwise be silently ignored. The
@@ -396,6 +396,6 @@ aws --endpoint-url http://127.0.0.1:4566 sts assume-role \
 # Export the returned session AccessKeyId / SecretAccessKey / SessionToken
 # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN), then:
 
-AWS_REGION=us-east-1 CODESTORAGE_TEST_S3_ENDPOINT=http://127.0.0.1:4566 \
+AWS_REGION=us-east-1 OPENSTORAGE_TEST_S3_ENDPOINT=http://127.0.0.1:4566 \
   go test ./internal/githttp -count=1 -race -timeout=25m
 ```
