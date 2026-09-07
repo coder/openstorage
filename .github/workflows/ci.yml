@@ -67,8 +67,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: docker build -t openstorage-smoke .
-      - run: docker run --rm --entrypoint /bin/sh openstorage-smoke -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      - run: docker build -t ghcr.io/coder/open-storage:smoke .
+      - run: docker run --rm --entrypoint /bin/sh ghcr.io/coder/open-storage:smoke -c 'command -v git && command -v gpg && command -v ssh-keygen'
 
   test-local:
     runs-on: ubuntu-latest
