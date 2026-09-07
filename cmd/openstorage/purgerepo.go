@@ -64,7 +64,7 @@ Flags:
 
 	// Shared derivation with serve/signing-key/list-packs: env URLs win,
 	// local mode (--data-dir / $OPENSTORAGE_DATA_DIR) fills the rest.
-	urls, err := resolveStorageURLs(envconfig.Getenv, *dataDir)
+	urls, err := resolveStorageURLs(envconfig.LookupEnv, *dataDir)
 	if err != nil {
 		return err
 	}

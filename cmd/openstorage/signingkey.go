@@ -67,7 +67,7 @@ func cmdSigningKey(ctx context.Context, args []string) error {
 
 	// Shared derivation with serve/list-packs: env URLs win, local mode
 	// (--data-dir / $OPENSTORAGE_DATA_DIR) derives the sqlite location.
-	urls, err := resolveStorageURLs(envconfig.Getenv, *dataDir)
+	urls, err := resolveStorageURLs(envconfig.LookupEnv, *dataDir)
 	if err != nil {
 		return err
 	}

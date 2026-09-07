@@ -484,7 +484,7 @@ func hookWebhookAllowPrivate(logger *slog.Logger) bool {
 // writes still do); queued local work dies with the process.
 func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	org := envconfig.Getenv(envOrg)
-	dbURL := firstNonEmpty(envconfig.Getenv("OPENSTORAGE_PG_URL"), envconfig.Getenv("PG_URL"))
+	dbURL := envconfig.First("OPENSTORAGE_PG_URL", "PG_URL")
 	if org == "" || dbURL == "" {
 		// No eventing wiring (e.g. direct hook invocation outside serve):
 		// keep the identity default so pushes still work, just eventless.

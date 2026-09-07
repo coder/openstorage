@@ -22,7 +22,8 @@ import (
 	"github.com/coder/open-storage/internal/secrets"
 )
 
-// Environment variable names, canonical first; envFirst scans left to right.
+// Environment variable names, canonical first; envFirst scans left to right
+// and stops at the first name that is set, even to the empty string.
 var (
 	envPGURL   = []string{"OPENSTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL"}
 	envBlobURL = []string{"OPENSTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL"}
@@ -270,12 +271,23 @@ const (
 	defaultVerifySigBudget = 10000
 )
 
-// envFirst returns the first non-empty value among names. getenv is injected
-// so tests never mutate process env.
-func envFirst(getenv func(string) string, names ...string) string {
-	assertf(getenv != nil && len(names) > 0, "envFirst: missing getenv or names")
+// envLookup reads one environment variable and reports whether it is set.
+// Presence matters: an explicitly empty canonical variable must not fall
+// through to an older alias. It is injected so tests never mutate process env.
+type envLookup func(string) (string, bool)
+
+// get is the value-only view for settings without alias chains.
+func (lookup envLookup) get(name string) string {
+	v, _ := lookup(name)
+	return v
+}
+
+// envFirst returns the value of the first PRESENT name (even when empty);
+// unset names fall through to the next alias.
+func envFirst(lookup envLookup, names ...string) string {
+	assertf(lookup != nil && len(names) > 0, "envFirst: missing lookup or names")
 	for _, n := range names {
-		if v := getenv(n); v != "" {
+		if v, ok := lookup(n); ok {
 			return v
 		}
 	}
@@ -428,12 +440,12 @@ type storageURLs struct {
 // this binary from a different working directory (the bare cache repo), so
 // relative sqlite/file URLs would silently point somewhere else across the
 // re-exec.
-func resolveStorageURLs(getenv func(string) string, flagDataDir string) (storageURLs, error) {
-	assertf(getenv != nil, "resolveStorageURLs: nil getenv")
+func resolveStorageURLs(lookup envLookup, flagDataDir string) (storageURLs, error) {
+	assertf(lookup != nil, "resolveStorageURLs: nil lookup")
 	u := storageURLs{
-		dbURL:   envFirst(getenv, envPGURL...),
-		blobURL: envFirst(getenv, envBlobURL...),
-		dataDir: firstNonEmpty(flagDataDir, getenv(envDataDir)),
+		dbURL:   envFirst(lookup, envPGURL...),
+		blobURL: envFirst(lookup, envBlobURL...),
+		dataDir: firstNonEmpty(flagDataDir, lookup.get(envDataDir)),
 	}
 	if u.dataDir != "" {
 		abs, err := filepath.Abs(u.dataDir)
@@ -496,9 +508,10 @@ func errBlobURLRequired() error {
 // resolveServeConfig merges flags and environment into a validated config.
 // Precedence per slot: explicit flag > explicit env > --data-dir derivation
 // (local mode) > built-in default (cacheDir only).
-func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCacheDir, flagDataDir string) (serveConfig, error) {
-	assertf(getenv != nil, "resolveServeConfig: nil getenv")
-	urls, err := resolveStorageURLs(getenv, flagDataDir)
+func resolveServeConfig(lookup envLookup, flagListen, flagAddr, flagCacheDir, flagDataDir string) (serveConfig, error) {
+	assertf(lookup != nil, "resolveServeConfig: nil lookup")
+	getenv := lookup.get
+	urls, err := resolveStorageURLs(lookup, flagDataDir)
 	if err != nil {
 		return serveConfig{}, err
 	}

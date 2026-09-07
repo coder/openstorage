@@ -33,6 +33,17 @@ func Getenv(name string) string {
 	return value
 }
 
+// First returns the value of the first PRESENT name in an alias chain. An
+// explicitly empty earlier name ends the scan instead of exposing a later alias.
+func First(names ...string) string {
+	for _, name := range names {
+		if value, ok := LookupEnv(name); ok {
+			return value
+		}
+	}
+	return ""
+}
+
 func legacyName(name string) string {
 	suffix, ok := strings.CutPrefix(name, prefix)
 	if !ok {

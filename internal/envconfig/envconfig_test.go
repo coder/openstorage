@@ -56,6 +56,29 @@ func TestLookupEnv(t *testing.T) {
 	}
 }
 
+func TestFirstStopsAtPresentName(t *testing.T) {
+	const canonical, legacy, alias = "OPENSTORAGE_ENVCONFIG_FIRST", "CODESTORAGE_ENVCONFIG_FIRST", "ENVCONFIG_FIRST_ALIAS"
+	for _, name := range []string{canonical, legacy, alias} {
+		unset(t, name)
+	}
+	t.Setenv(alias, "alias")
+	if got := First(canonical, alias); got != "alias" {
+		t.Fatalf("unset canonical must fall through, got %q", got)
+	}
+	t.Setenv(legacy, "old")
+	if got := First(canonical, alias); got != "old" {
+		t.Fatalf("legacy prefix precedes the older alias, got %q", got)
+	}
+	t.Setenv(canonical, "")
+	if got := First(canonical, alias); got != "" {
+		t.Fatalf("explicitly empty canonical must stop the scan, got %q", got)
+	}
+	t.Setenv(canonical, "new")
+	if got := First(canonical, alias); got != "new" {
+		t.Fatalf("canonical wins, got %q", got)
+	}
+}
+
 func TestWarnDeprecated(t *testing.T) {
 	// Each test invocation represents a fresh boot, including -count runs.
 	warnOnce = sync.Once{}

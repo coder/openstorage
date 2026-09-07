@@ -131,11 +131,11 @@ var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) ref.RefStore {
 	return ref.IdempotentCAS{RefStore: st}
 }
 
+// mustEnv reads an alias chain by presence: an explicitly empty canonical
+// name fails loudly rather than exposing an older alias.
 func mustEnv(names ...string) string {
-	for _, n := range names {
-		if v := envconfig.Getenv(n); v != "" {
-			return v
-		}
+	if v := envconfig.First(names...); v != "" {
+		return v
 	}
 	panic(fmt.Sprintf("githttp assertion failed: hook: required env %s is empty", names[0]))
 }

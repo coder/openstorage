@@ -111,14 +111,19 @@ func cmdServe(ctx context.Context, args []string) error {
 	envconfig.WarnDeprecated(func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	})
-	cfg, err := resolveServeConfig(envconfig.Getenv, *listen, *addr, *cacheDir, *dataDir)
+	cfg, err := resolveServeConfig(envconfig.LookupEnv, *listen, *addr, *cacheDir, *dataDir)
 	if err != nil {
 		return err
 	}
 	// The pre-receive/update hooks re-exec this binary with the server's
-	// inherited environment and read the legacy names (internal/githttp/hook.go),
-	// so propagate the resolved values regardless of which alias set them.
-	for _, kv := range [][2]string{{"PG_URL", cfg.dbURL}, {"BLOB_URL", cfg.blobURL}} {
+	// inherited environment (internal/githttp/hook.go), so propagate the
+	// resolved values under the canonical names regardless of which alias or
+	// --data-dir derivation set them; the bare names keep older hook binaries
+	// sharing this cache working.
+	for _, kv := range [][2]string{
+		{"OPENSTORAGE_PG_URL", cfg.dbURL}, {"OPENSTORAGE_S3_URL", cfg.blobURL},
+		{"PG_URL", cfg.dbURL}, {"BLOB_URL", cfg.blobURL},
+	} {
 		if err := os.Setenv(kv[0], kv[1]); err != nil {
 			return err
 		}
@@ -485,7 +490,7 @@ func cmdListPacks(ctx context.Context, args []string) error {
 	}
 	// Shared derivation with serve/signing-key: env URLs win, local mode
 	// (--data-dir / $OPENSTORAGE_DATA_DIR) derives the fileblob location.
-	urls, err := resolveStorageURLs(envconfig.Getenv, *dataDir)
+	urls, err := resolveStorageURLs(envconfig.LookupEnv, *dataDir)
 	if err != nil {
 		return err
 	}

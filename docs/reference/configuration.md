@@ -8,9 +8,10 @@ validation constraints, and interaction notes. Source of truth:
 Resolution precedence per setting: **explicit flag > canonical `OPENSTORAGE_*` env var >
 `CODESTORAGE_*` fallback > older legacy alias > `--data-dir` derivation (local mode) >
 built-in default**. The old prefix is supported for one minor release, **0.15.x**.
-An explicitly set `OPENSTORAGE_*` variable wins even when its value is empty: the old
-prefix cannot fill it back in. The selected value then follows that setting's normal
-validation and default rules. `serve` emits a boot-time deprecation warning for each
+An explicitly set `OPENSTORAGE_*` variable wins even when its value is empty: neither
+the old prefix nor any older alias can fill it back in. The selected value then follows
+that setting's normal validation and default rules (an empty storage URL derives from
+`--data-dir` or fails startup; it never falls back to a legacy alias). `serve` emits a boot-time deprecation warning for each
 legacy-prefix fallback, without logging the value. Migrate before upgrading to 0.16.0;
 see the [migration guide](../how-to/migrate-to-openstorage.md).
 
@@ -75,7 +76,7 @@ Database URL for the ref authority (CAS) and metadata store.
   `s3wal://bucket?endpoint=…&region=…` (**experimental** zero-infra mode, single node:
   refs and metadata live in conditional-CAS objects under the bucket's `_wal/` prefix —
   [ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)).
-- **Legacy aliases** (scanned left to right, first non-empty wins): `SPIKE_PG_URL`, `PG_URL`.
+- **Legacy aliases** (scanned left to right, the first *set* name wins, even when empty): `SPIKE_PG_URL`, `PG_URL`.
 - **Default:** none. Startup fails unless set explicitly or derived from the data dir
   (`sqlite://<dir>/codestorage.db`).
 - On Postgres, schema setup (including the durable [River](https://riverqueue.com) job
@@ -104,7 +105,7 @@ Immutable pack storage URL, opened through [gocloud.dev](https://gocloud.dev/how
   reference — by adding `endpoint=http://...&s3ForcePathStyle=true`; other
   S3-compatible stores, including MinIO, are best-effort) or `file://<absolute-dir>`
   (local mode).
-- **Legacy aliases:** `SPIKE_S3_URL`, `BLOB_URL`.
+- **Legacy aliases** (same presence rule as `OPENSTORAGE_PG_URL`): `SPIKE_S3_URL`, `BLOB_URL`.
 - **Default:** none. Startup fails unless set explicitly or derived from the data dir
   (`file://<dir>/blobs`).
 - S3 credentials come from the standard AWS chain (`AWS_ACCESS_KEY_ID`,
