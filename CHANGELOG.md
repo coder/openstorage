@@ -1,16 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-* Use `github.com/coder/openstorage` as the canonical Go module and repository
-  identity in imports, documentation, and build/release configuration. The
-  `v0.15.0` tag still declares `github.com/coder/open-storage`; existing tags are
-  unchanged. See the [migration guide](docs/how-to/migrate-to-openstorage.md).
-  The project name remains open.storage, with the `openstorage` binary and
-  `OPENSTORAGE_*` configuration prefix.
-
 ## [0.15.0](https://github.com/coder/openstorage/compare/v0.14.6...v0.15.0) (2026-09-07)
 
 
