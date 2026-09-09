@@ -69,6 +69,132 @@ class DocLinkCheckerTests(unittest.TestCase):
                 self.assertIn(' -> #hidden\n', result.stdout)
                 self.assertTrue(result.stdout.endswith('broken links: 1\n'))
 
+    def test_indented_code_does_not_create_anchors(self):
+        for indent in ['    ', '\t', '  \t']:
+            with self.subTest(indent=repr(indent)):
+                result = self.run_checker(
+                    indent + '<a name="hidden"></a>\n\n[Missing](#hidden)\n'
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(' -> #hidden\n', result.stdout)
+
+    def test_multiline_code_spans_do_not_create_anchors(self):
+        for delimiter in ['`', '``', '```']:
+            with self.subTest(delimiter=delimiter):
+                result = self.run_checker(
+                    'Example: ' + delimiter + 'before\n'
+                    '<a name="hidden"></a>\n'
+                    'after' + delimiter + '\n\n[Missing](#hidden)\n'
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(' -> #hidden\n', result.stdout)
+
+    def test_code_spans_require_exact_runs_and_cannot_cross_blocks(self):
+        hidden = [
+            'Example: ``before\n` mismatched\n<a name="hidden"></a>\nlonger ```\nafter``\n',
+            'Example: `before\n    <a name="hidden"></a>\nafter`\n',
+            'Example: `before\n*\n<a name="hidden"></a>\nafter`\n',
+            'Example: `before\n2. continuation\n<a name="hidden"></a>\nafter`\n',
+        ]
+        for example in hidden:
+            with self.subTest(example=example):
+                result = self.run_checker(example + '\n[Missing](#hidden)\n')
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(' -> #hidden\n', result.stdout)
+        visible = [
+            'Example: `unmatched\n\n<a name="visible"></a>\nLater `\n',
+            'Example: ``unmatched\n<a name="visible"></a>\nOnly a single `\n',
+            'Example: `unmatched\n```text\ncode\n```\n<a name="visible"></a>\nLater `\n',
+            'Example: `unmatched\n# Heading\n<a name="visible"></a>\nLater `\n',
+            'Example: \\`escaped\n<a name="visible"></a>\nLater `\n',
+        ]
+        for example in visible:
+            with self.subTest(example=example):
+                result = self.run_checker(example + '\n[Valid](#visible)\n')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_containers_preserve_fenced_and_indented_code_contexts(self):
+        examples = [
+            '> ```html\n> <a name="hidden"></a>\n> ```\n',
+            '> ```html\n> <a name="hidden"></a>\n',  # unclosed quote fence
+            '> ~~~~html\n> ~~~\n> <a name="hidden"></a>\n> ~~~~\n',
+            '>     <a name="hidden"></a>\n',
+            '- Example:\n\n  ```html\n  <a name="hidden"></a>\n  ```\n',
+            '- Outer:\n  - Example:\n\n    ~~~~html\n    ~~~\n    <a name="hidden"></a>\n    ~~~~\n',
+            '- Example:\n\n      <a name="hidden"></a>\n',
+        ]
+        for example in examples:
+            with self.subTest(example=example):
+                result = self.run_checker(example + '\n[Missing](#hidden)\n')
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(' -> #hidden\n', result.stdout)
+
+    def test_indentation_keeps_real_html_and_list_continuations(self):
+        examples = [
+            '<a\n    name="visible"\n></a>\n',
+            'Paragraph continues\n    <a name="visible"></a>\n',
+            '- Item\n\n    <a name="visible"></a>\n',
+            '- Outer\n  - Inner\n\n    <a name="visible"></a>\n',
+            '> <a\n>     name="visible"\n> ></a>\n',
+        ]
+        for example in examples:
+            with self.subTest(example=example):
+                result = self.run_checker(example + '\n[Valid](#visible)\n')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dedented_text_ends_a_container_code_block(self):
+        for code in ['> ```html\n> code\n', '- ```html\n  code\n']:
+            with self.subTest(code=code):
+                result = self.run_checker(
+                    code + '<a name="visible"></a>\n\n[Valid](#visible)\n'
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_setext_heading_ends_a_paragraph_before_indented_code(self):
+        result = self.run_checker(
+            'Heading\n=======\n    <a name="hidden"></a>\n\n[Missing](#hidden)\n'
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(' -> #hidden\n', result.stdout)
+        result = self.run_checker('=======\n    <a name="visible"></a>\n\n[Valid](#visible)\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_thematic_break_is_not_a_list_continuation(self):
+        for separator in ['* * *', '- - -', '_ _ _']:
+            with self.subTest(separator=separator):
+                result = self.run_checker(
+                    separator + '\n    <a name="hidden"></a>\n\n[Missing](#hidden)\n'
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_nested_containers_and_tabs_match_rendered_code_context(self):
+        cases = [
+            ('> - ~~~html\n>   <a name="anchor"></a>\n>   ~~~\n', False),
+            ('- > ```html\n  > <a name="anchor"></a>\n  > ```\n', False),
+            ('- item\n\n\t\t<a name="anchor"></a>\n', False),
+            ('- item\n\n\t<a name="anchor"></a>\n', True),
+            ('- First `unmatched\n- <a name="anchor"></a> later `\n', True),
+            ('> Example `before\n<a name="anchor"></a>\nafter`\n', False),
+            ('- Example `before\n<a name="anchor"></a>\nafter`\n', False),
+        ]
+        for example, visible in cases:
+            with self.subTest(example=example):
+                result = self.run_checker(example + '\n[Probe](#anchor)\n')
+                self.assertEqual(result.returncode, 0 if visible else 1,
+                                 result.stdout + result.stderr)
+
+    def test_html_comments_attributes_and_escaped_markup_keep_their_meaning(self):
+        result = self.run_checker(
+            '<!-- comment with `\n\n<a name="hidden"></a>\n-->\n'
+            '<a\n    title="literal ` backtick" name="visible"\n></a>\n'
+            'Escaped \\<a name="escaped"></a>\n'
+            '&lt;a name="entity"&gt;&lt;/a&gt;\n\n'
+            '[Valid](#visible) [Missing](#hidden) [Missing](#escaped) [Missing](#entity)\n'
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(result.stdout.endswith('broken links: 3\n'), result.stdout)
+        self.assertNotIn(' -> #visible', result.stdout)
+
     def test_explicit_anchors_do_not_change_heading_duplicate_suffixes(self):
         result = self.run_checker(
             '<a name="heading"></a>\n# Heading\n# Heading\n'
