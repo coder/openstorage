@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline docs link checker: validates every relative INLINE markdown link
-(file + heading anchor) under README.md, CONTRIBUTING.md, CHANGELOG.md, and docs/.
+(file + heading or explicit HTML anchor) under README.md, CONTRIBUTING.md,
+CHANGELOG.md, and docs/.
 
 Unsupported-but-valid Markdown fails closed rather than silently passing:
 reference-style links ([text][ref] with a [ref]: destination line) and
@@ -15,12 +16,15 @@ Zero dependencies. Not wired into CI on purpose — run it when touching docs:
 Exits non-zero and prints one line per broken link. Anchor checking follows
 GitHub's algorithm (lowercase, strip backticks/asterisks, spaces to hyphens,
 dedupe with -1/-2 suffixes) and skips docs/upstream/ anchors (vendor copies).
+Explicit <a name="..."> and <a id="..."> anchors retain their exact values;
+anchors demonstrated in fenced or inline code do not create destinations.
 
 Deliberately minimal: it parses the Markdown this tree actually writes.
 Destinations may contain balanced (single-level) parentheses and an optional
 quoted title; fences track their opening character and length per CommonMark.
 """
 import os, re, sys, posixpath
+from html.parser import HTMLParser
 
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -32,6 +36,26 @@ REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:")
 ANGLE = re.compile(r"\]\(\s*<")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#{1,6}) +(.*)$")
+
+
+def without_inline_code(ln):
+    # A code span closes only with an exactly equal backtick run. Demonstrated
+    # links and HTML anchors inside code spans are not rendered destinations.
+    return re.sub(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", "", ln)
+
+
+class ExplicitAnchors(HTMLParser):
+    """Collect anchor attributes while letting HTMLParser skip HTML comments."""
+
+    def __init__(self):
+        super().__init__()
+        self.anchors = set()
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for name, value in attrs:
+                if name in ("name", "id") and value:
+                    self.anchors.add(value)
 
 
 def gh_anchor(h):
@@ -69,7 +93,9 @@ def check():
     anchors = {}
     for path in md:
         aset = set()
+        explicit = ExplicitAnchors()
         for _, ln in scan_lines(path):
+            explicit.feed(without_inline_code(ln))
             m = HEADING.match(ln)
             if m:
                 # strip an optional ATX closing sequence ("## Title ##")
@@ -78,16 +104,15 @@ def check():
                 while a in aset:
                     a = f"{base}-{i}"; i += 1
                 aset.add(a)
+        explicit.close()
+        # Explicit anchors must not change GitHub's heading duplicate suffixes.
+        aset.update(explicit.anchors)
         anchors[path] = aset
     bad = 0
     for path in md:
         d = posixpath.dirname(path) or "."
         for lineno, ln in scan_lines(path):
-            # mask inline code spans (`...`, ``...``) so demonstrated link
-            # syntax inside them is not validated; per CommonMark a span
-            # closes only with an EXACTLY equal backtick run, so both ends
-            # are anchored against longer runs
-            ln = re.sub(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", "", ln)
+            ln = without_inline_code(ln)
             if REFDEF.match(ln):
                 print(f"UNSUPPORTED REF-STYLE LINK DEF {path}:{lineno} -> {ln.strip()[:60]}")
                 bad += 1
