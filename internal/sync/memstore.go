@@ -7,7 +7,7 @@ import (
 	stdsync "sync"
 	"time"
 
-	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/openstorage/internal/envconfig"
 )
 
 // LegacyClaimHolder mirrors meta.LegacyClaimHolder (the sync package must

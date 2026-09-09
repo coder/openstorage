@@ -35,8 +35,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/coder/open-storage/internal/envconfig"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // EnvVerifyState carries the per-push verify-sig state file path from the

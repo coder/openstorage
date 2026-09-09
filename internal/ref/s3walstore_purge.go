@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // FenceRepoPurge durably marks the BASE group purge-fenced (idempotent,

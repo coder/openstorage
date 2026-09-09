@@ -22,7 +22,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/openstorage/internal/blob"
 )
 
 // fuzzHeaderStore serves one in-memory blob to packHeaderObjectCount's

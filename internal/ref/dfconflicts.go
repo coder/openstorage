@@ -34,7 +34,7 @@ func dfStrictPrefixes(name string, fn func(prefix string) bool) {
 
 // dfProbeChunk bounds how many candidate names one DFConflicts round
 // materializes prefixes and query parameters for (Codex round-16 security
-// P2 on coder/open-storage#173): each name expands into up to depth-many
+// P2 on coder/openstorage#173): each name expands into up to depth-many
 // strict prefixes, so an unchunked 100k-command no-pack push inflated a
 // ~15 MB request into millions of retained prefix strings and a
 // comparably sized query array before the database saw a byte. Chunking

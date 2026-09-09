@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // RefBackend names the authority-store lane a simulation runs on.

@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // errInjectedRead marks a read the store must never have depended on.

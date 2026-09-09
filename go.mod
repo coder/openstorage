@@ -1,4 +1,4 @@
-module github.com/coder/open-storage
+module github.com/coder/openstorage
 
 go 1.27.1
 

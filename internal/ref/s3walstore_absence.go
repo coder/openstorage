@@ -30,7 +30,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // s3walAbsenceIncarnationTail matches a deterministic incarnation cover's

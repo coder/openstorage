@@ -13,7 +13,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/openstorage/internal/blob"
 )
 
 // measureBranchPack pushes work's HEAD to a throwaway branch of measureRepo

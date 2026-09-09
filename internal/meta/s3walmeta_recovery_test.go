@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // newS3WALMetaPair returns one shared MemCAS and two independent meta

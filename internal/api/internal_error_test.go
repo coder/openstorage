@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // failingStore returns err from every method; the leaked-secret marker in

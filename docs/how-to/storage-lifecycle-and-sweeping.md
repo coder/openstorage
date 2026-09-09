@@ -163,7 +163,7 @@ Tuning: raise the threshold to fold less often (bigger, rarer folds), lower it (
 Every repository has a storage-bytes quota
 ([`OPENSTORAGE_PACK_QUOTA_BYTES`](../reference/configuration.md#openstorage_pack_quota_bytes),
 default 10 GiB, `0` disables) covering its packs **and its LFS objects**
-([#51](https://github.com/coder/open-storage/issues/51)). A repository and its
+([#51](https://github.com/coder/openstorage/issues/51)). A repository and its
 `+ephemeral` / `+import` namespaces share one quota, accounted against the base
 repository — including LFS, whose object space the namespaces share outright.
 
@@ -251,7 +251,7 @@ Four independent knobs control what a sweep may *do*:
 ### LFS orphans and pre-registry objects
 
 The LFS registry (which upload settlement writes) was introduced with
-[#51](https://github.com/coder/open-storage/issues/51): **every LFS object uploaded by
+[#51](https://github.com/coder/openstorage/issues/51): **every LFS object uploaded by
 an older build has no registry row** and therefore shows up as an orphan candidate,
 however live its pointers are. That is why LFS deletion is a separate opt-in and is not
 covered by `OPENSTORAGE_SWEEP_DELETE_ENABLED`. Stored objects are adopted into the
@@ -382,7 +382,7 @@ A conservative enablement sequence:
 Registered LFS objects are permanent by default: the sweeper treats every
 registered row as live, and nothing in the normal lifecycle deletes one. That
 permanence has a failure mode
-([#73](https://github.com/coder/open-storage/issues/73)): a `git:write` holder
+([#73](https://github.com/coder/openstorage/issues/73)): a `git:write` holder
 can direct-PUT up to the per-repo object cap
 ([`OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO`](../reference/configuration.md#openstorage_lfs_max_objects_per_repo),
 default 100,000) in *tiny* objects nobody references — a few hundred kilobytes
@@ -535,7 +535,7 @@ bytes are physically absent**. That state is doubly bad:
 - **Integrity:** a missing registered pack may be referenced by committed
   refs (clones fail); a missing LFS object 404s until a restore source
   appears.
-- **Quota visibility** ([#101](https://github.com/coder/open-storage/issues/101)):
+- **Quota visibility** ([#101](https://github.com/coder/openstorage/issues/101)):
   the admission floor is `max(0, listing − counter)`, and the counter still
   includes the absent bytes the listing lacks — the floor deflates by the
   missing size, hiding up to that many rowless legacy bytes from admission.

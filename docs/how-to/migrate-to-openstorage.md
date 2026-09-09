@@ -1,44 +1,50 @@
 # Migrate to open.storage
 
-**Goal:** upgrade an existing code-storage installation to open.storage v0.15.x
-without changing the durable stores it uses. This is a naming change, not a move of
-your repositories or a change to the upstream wire-compatibility contract.
+**Goal:** update an existing code-storage or open.storage installation to the
+current repository and module identity without changing its durable stores or
+upstream wire-compatibility contract. The product, binary, and environment-prefix
+rename shipped in v0.15.0; the correction to the one-word repository and Go module
+name is unreleased.
 
 ## 1. Update executables, images, and source references
 
-| Surface | Before | From v0.15.0 |
+| Surface | Before v0.15.0 | Current |
 |---|---|---|
 | Product name | code-storage | open.storage |
-| Repository | `coder/code-storage` | `coder/open-storage` |
-| Go module | `github.com/coder/code-storage` | `github.com/coder/open-storage` |
+| Repository | `coder/code-storage` | `coder/openstorage` |
+| Go module | `github.com/coder/code-storage` | `github.com/coder/openstorage` |
 | Binary and command directory | `codestorage`, `cmd/codestorage` | `openstorage`, `cmd/openstorage` |
 | Release archives | `codestorage_<version>_<os>_<arch>.tar.gz` | `openstorage_<version>_<os>_<arch>.tar.gz` |
 | Environment prefix | `CODESTORAGE_*` | `OPENSTORAGE_*` |
 
 Update service-manager commands, scripts, health checks that invoke the binary, and
-installer asset names. The new container image target is `ghcr.io/coder/open-storage`.
+installer asset names. The new container image target is `ghcr.io/coder/openstorage`.
 Registry publishing is not configured in this repository yet: build the Dockerfile
 locally until release publishing is available, then pin a verified version or digest.
 There is **no dual publishing to the old image path**. The environment compatibility
 window below does not provide an old binary name or an old image alias.
 
-The repository is renamed before the v0.15.0 changes merge, so the new Go module path
-resolves from GitHub when the renamed version is available. GitHub redirects the old
-repository URL, but that redirect does not rewrite Go imports or the module declaration.
-After the rename, update checkout remotes and use the new module path:
+The canonical repository is now `coder/openstorage` (one word). The `v0.15.0` tag
+still declares `github.com/coder/open-storage`; this source tree corrects it to
+`github.com/coder/openstorage`. GitHub redirects do not rewrite Go imports or
+the module declaration in existing tags. Update checkout remotes and build from
+a checkout containing the corrected `go.mod`:
 
 ```sh
-git remote set-url origin https://github.com/coder/open-storage.git
-go install github.com/coder/open-storage/cmd/openstorage@latest
+git remote set-url origin https://github.com/coder/openstorage.git
+go install ./cmd/openstorage
 openstorage version
 ```
 
 For a private/internal checkout, use the authenticated-Git and `GOPRIVATE` setup in
-[Install](../../README.md#install). Downstream Go consumers must update their imports
-and module requirement to `github.com/coder/open-storage` at v0.15.0 or later, then run
-`go mod tidy` (and `go mod vendor` if they vendor dependencies). Older tags keep their
-original module path and original release asset names; do not request an old tag through
-the new module path and assume GitHub's redirect changes its `go.mod`.
+[CONTRIBUTING](../../CONTRIBUTING.md#authenticated-installation).
+Downstream Go consumers must update imports and their module requirement to
+`github.com/coder/openstorage`, selecting a revision that declares that path,
+then run `go mod tidy` (and `go mod vendor` if they vendor dependencies). After a
+release includes this correction, `go install
+github.com/coder/openstorage/cmd/openstorage@latest` can use that release. Until
+then, build from the corrected checkout above. Older tags retain their original
+module paths and release asset names.
 
 ## 2. Roll out the environment-prefix change
 

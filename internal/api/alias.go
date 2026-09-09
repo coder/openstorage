@@ -26,8 +26,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // aliasRoute maps METHOD /api/repos/{repo_name}<suffix> onto METHOD <v1Path>

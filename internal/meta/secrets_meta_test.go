@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/open-storage/internal/secrets"
+	"github.com/coder/openstorage/internal/secrets"
 )
 
 // newTestKey returns a fresh random base64 OPENSTORAGE_SECRETS_KEY entry.

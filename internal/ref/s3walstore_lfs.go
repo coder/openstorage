@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // errS3WALDeleteLockBlocked signals a registration path that a live delete

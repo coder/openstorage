@@ -475,7 +475,7 @@ new secrets plaintext.
 Per-repository storage-bytes quota enforced at every external storage writer: git pushes
 that would grow a repo's `packs/` usage past the quota are refused at pre-receive before
 anything is stored, REST pack writes (commit-pack, merge, notes, fork) are refused with
-a `403` envelope, and Git LFS uploads ([#51](https://github.com/coder/open-storage/issues/51))
+a `403` envelope, and Git LFS uploads ([#51](https://github.com/coder/openstorage/issues/51))
 are refused with per-object `507` batch errors before any transfer URL is issued (the
 verified upload transfer re-checks the actual `Content-Length`, so under-declared batch
 sizes cannot bypass the gate).
@@ -505,7 +505,7 @@ sizes cannot bypass the gate).
 
 Node-wide cap on the aggregate bytes of Git LFS uploads staging on one replica at a
 time. LFS uploads go through the verified proxy transfer
-([#51](https://github.com/coder/open-storage/issues/51)) and stage their full body
+([#51](https://github.com/coder/openstorage/issues/51)) and stage their full body
 under the replica's `$TMPDIR` before verification and publication — the
 per-repository quota above bounds neither the node (it is per repo) nor anything when
 disabled, so this is the replica's disk-protection bound. The budget is charged
@@ -598,7 +598,7 @@ exceeds this many bytes is rejected with `413` and a JSON error envelope. Only b
 without reading at all), so per-push disk and decode work is bounded by the cap: git
 discards the truncated partial quarantine when the stream is cut, and nothing is
 published or registered on the overflow path. This is the native pre-storage push bound
-([#55](https://github.com/coder/open-storage/issues/55)); the pack quota above bounds
+([#55](https://github.com/coder/openstorage/issues/55)); the pack quota above bounds
 *retained* storage and runs only after a push has fully streamed to the replica's disk.
 (Degenerate exception: a *complete, valid* push padded with trailing junk past the cap
 still answers `413`, but its hooks already ran under the normal quota admission.)
@@ -620,7 +620,7 @@ still answers `413`, but its hooks already ran under the normal quota admission.
 ### `OPENSTORAGE_VERIFY_SIG_BUDGET`
 
 Per-push budget for `verify-sig` signature verifications
-([#59](https://github.com/coder/open-storage/issues/59)): the maximum number of commits
+([#59](https://github.com/coder/openstorage/issues/59)): the maximum number of commits
 one push may verify — each verification spawns a `git verify-commit` subprocess — across
 all its refs, pre-receive evaluation and update hooks combined. A ref update that would
 exceed the remaining budget is rejected fail-closed **before** the excess verifications
@@ -706,7 +706,7 @@ threshold and their retained bytes returned to the repo's quota headroom.
 
 Delete mode for **LFS orphans**: `lfs/` blobs with no LFS registry row, older than the
 age threshold. Deliberately separate from `OPENSTORAGE_SWEEP_DELETE_ENABLED`: the LFS
-registry ships with [#51](https://github.com/coder/open-storage/issues/51), so **every
+registry ships with [#51](https://github.com/coder/openstorage/issues/51), so **every
 LFS object uploaded by an older build has no row** and would classify as an orphan —
 a fleet already running general deletes must not reap its pre-existing LFS population
 on upgrade. Stored objects are adopted into the registry by write-scoped touches
@@ -777,7 +777,7 @@ command runs the same primitive synchronously for one repository.
 ### `OPENSTORAGE_LFS_GC_INTERVAL`
 
 Cadence of the unreferenced-LFS-object reclamation job
-([#73](https://github.com/coder/open-storage/issues/73),
+([#73](https://github.com/coder/openstorage/issues/73),
 [ADR-42](../adr/042-lfs-reclamation-is-mark-and-sweep-over-reachable-pointer-files.md)).
 Registered LFS objects are otherwise permanent, so a `git:write` holder
 direct-PUTting tiny objects nobody references can exhaust the per-repo
@@ -862,7 +862,7 @@ until the eligible rows are the junk you expect, then opt in.
   [grace](#openstorage_lfs_gc_grace) of at least the reap cadence, including
   the 1-hour quarantine retention floor every reap's backup copy is kept for
   (startup errors otherwise). The coupling is also OBSERVED at runtime
-  ([#120](https://github.com/coder/open-storage/issues/120)): each
+  ([#120](https://github.com/coder/openstorage/issues/120)): each
   destructive LFS sweep pass that completes its keyspace with zero errors
   records a durable fleet-wide watermark, and retirement refunds slots only
   while that watermark is fresher than the grace window — armed-but-failing
@@ -894,9 +894,9 @@ until the eligible rows are the junk you expect, then opt in.
 ### `OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO`
 
 Per-repository LFS object-count cap (issue
-[#51](https://github.com/coder/open-storage/issues/51)): bytes bound row count
+[#51](https://github.com/coder/openstorage/issues/51)): bytes bound row count
 at nothing, so the registry's population needs its own bound. This override is
-the operator escape hatch of [#73](https://github.com/coder/open-storage/issues/73):
+the operator escape hatch of [#73](https://github.com/coder/openstorage/issues/73):
 a repository wedged at the cap by unreferenced junk can be unwedged immediately
 by raising the cap, without waiting for a reclamation grace window.
 
@@ -907,7 +907,7 @@ by raising the cap, without waiting for a reclamation grace window.
 ### `OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL`
 
 Cadence of the registry-vs-storage absence reconciliation job
-([#101](https://github.com/coder/open-storage/issues/101),
+([#101](https://github.com/coder/openstorage/issues/101),
 [ADR-43](../adr/043-absence-reconciliation-covers-registered-but-missing-bytes.md)).
 Each pass pages registered rows — `lfs_objects` and `packs` — and
 point-checks their bytes still physically exist in blob storage. While a
@@ -995,7 +995,7 @@ stretches individual probes.
 - Discovered losses are covered by ONE aggregate reservation row per
   affected repository and registry class, and the cover rows themselves
   are the durable tracking state
-  ([#125](https://github.com/coder/open-storage/issues/125)): the renewal
+  ([#125](https://github.com/coder/openstorage/issues/125)): the renewal
   phase lists the live rows and re-charges each at one work unit per row,
   entirely database-derived, so the per-repo reservation-row cap cannot
   bind and any replica keeps every cover alive. Each full rotation over a

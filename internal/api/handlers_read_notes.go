@@ -12,8 +12,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/coder/open-storage/internal/gitread"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // ---------------------------------------------------------------------------

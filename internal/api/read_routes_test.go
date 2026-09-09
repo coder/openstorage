@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/openstorage/internal/auth"
 )
 
 // readRoutes is the full docs/archive/phases/07-implementation-roadmap.md p3 route set plus the notes read routes

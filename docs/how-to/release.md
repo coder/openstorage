@@ -4,8 +4,8 @@
 notes, and verified cross-platform binaries — with no manual version arithmetic.
 
 Releases are driven by [release-please](https://github.com/googleapis/release-please)
-([#65](https://github.com/coder/open-storage/issues/65)) and the binaries workflow
-([#66](https://github.com/coder/open-storage/issues/66)):
+([#65](https://github.com/coder/openstorage/issues/65)) and the binaries workflow
+([#66](https://github.com/coder/openstorage/issues/66)):
 
 ```
 conventional commit lands on main
@@ -25,7 +25,7 @@ binaries built (CGO off), archives verified on linux + macOS, assets uploaded
 release-please only reacts to [conventional-commit](https://www.conventionalcommits.org/)
 **squash titles** on main. This repo's historical `<scope>: <subject>` style (`api: ...`,
 `githttp: ...`) is *invisible* to it — such commits neither bump the version nor appear
-in the CHANGELOG. The `pr-title` CI check ([#68](https://github.com/coder/open-storage/issues/68))
+in the CHANGELOG. The `pr-title` CI check ([#68](https://github.com/coder/openstorage/issues/68))
 rejects non-conventional titles on every PR and re-checks on title edits. For releasable
 work, title the PR:
 
@@ -49,9 +49,9 @@ protection requires `lint` / `test` / `test-local` / `test-s3wal`. Approve via t
 button on the PR's Actions run, or:
 
 ```sh
-gh run list -R coder/open-storage --branch release-please--branches--main \
+gh run list -R coder/openstorage --branch release-please--branches--main \
   --workflow ci --status action_required --limit 1
-gh api --method POST repos/coder/open-storage/actions/runs/<run-id>/approve
+gh api --method POST repos/coder/openstorage/actions/runs/<run-id>/approve
 ```
 
 (`--workflow ci` matters: the branch also gets a held run from the optional
@@ -83,17 +83,17 @@ trigger a bump). The next `release-please.yml` run on that push:
    assets. Every archive contains `openstorage` and `LICENSE` at its root, so binary
    recipients receive the license and `mise`/`ubi`-style installers can still find the binary.
 
-Watch the run: `gh run list --workflow release-please -R coder/open-storage`.
+Watch the run: `gh run list --workflow release-please -R coder/openstorage`.
 
 If the binaries job fails after the release exists (flaky runner, infra), fix the cause
-and re-run: `gh workflow run release -R coder/open-storage -f tag=vX.Y.Z` — it rebuilds
+and re-run: `gh workflow run release -R coder/openstorage -f tag=vX.Y.Z` — it rebuilds
 from the tag and replaces the assets (`--clobber`).
 
 ## Notes
 
 - **Runtime dependencies:** the released binary does not bundle `git` (always required),
   or `gpg` / `ssh-keygen` (required for `verify-sig` ref policies, which shell out and
-  fail closed — [#50](https://github.com/coder/open-storage/issues/50)). Unlike the
+  fail closed — [#50](https://github.com/coder/openstorage/issues/50)). Unlike the
   Docker image, a bare binary brings none of these; install them on the host.
 - **First release bootstrap:** `initial-version` in
   [`release-please-config.json`](../../release-please-config.json) pins the first

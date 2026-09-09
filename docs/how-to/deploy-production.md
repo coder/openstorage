@@ -30,7 +30,7 @@ clients ──► reverse proxy (TLS) ──► N × openstorage serve ──►
 - The container image (repo [`Dockerfile`](../../Dockerfile)) runs as a non-root user and
   needs the `git` binary at runtime, plus `gpg` and `ssh-keygen` if you protect refs with
   `verify-sig` policies — signature verification shells out to them and fails closed
-  ([#50](https://github.com/coder/open-storage/issues/50)). The supplied image includes
+  ([#50](https://github.com/coder/openstorage/issues/50)). The supplied image includes
   all three (CI asserts this); remember them if you build your own image.
 
 ## Backing services
@@ -42,7 +42,7 @@ serialized by advisory locks (see [concurrent boot](#concurrent-boot-schema-setu
 The database is the authority for refs, metadata, quota accounting, and the durable
 [River](https://riverqueue.com) job queue — and it stores **webhook HMAC secrets and
 upstream-sync credentials**, plaintext by default
-([#54](https://github.com/coder/open-storage/issues/54)). Set
+([#54](https://github.com/coder/openstorage/issues/54)). Set
 [`OPENSTORAGE_SECRETS_KEY`](../reference/configuration.md#openstorage_secrets_key) (the
 same value on every replica) to envelope-encrypt those columns with AES-256-GCM; the
 reference documents the key format, rotation procedure, failure modes, and the required
@@ -226,21 +226,21 @@ and bypasses every proxy-enforced limit. Then:
   routable. It is only embedded in responses — internal traffic (the upstream-sync
   worker's loopback pushes) targets each replica's own listener directly, so the
   replicas do not need to reach the external URL themselves
-  ([#45](https://github.com/coder/open-storage/issues/45)).
+  ([#45](https://github.com/coder/openstorage/issues/45)).
 - Both the REST API and git smart-HTTP (clone/push, LFS *batch*) ride the same
   listener — proxy everything. Response bodies (clones, archives) can be very large;
   stream rather than buffer them. Push ingress is bounded natively: the server rejects
   any push whose decoded body exceeds
   [`OPENSTORAGE_MAX_PUSH_BYTES`](../reference/configuration.md#openstorage_max_push_bytes)
   (default 2 × the pack quota, 2 MiB minimum) with a `413`, feeding git at most the cap's worth of
-  bytes ([#55](https://github.com/coder/open-storage/issues/55)) — so size temporary
+  bytes ([#55](https://github.com/coder/openstorage/issues/55)) — so size temporary
   disk for up to one cap per concurrent push (git discards the truncated quarantine on
   rejection; a declared oversize is rejected without reading at all). Fetch-side
   negotiation bodies are bounded too: a gzip-encoded `git-upload-pack` request is capped
   at a fixed 4 MiB decoded — plus a small compressed-stream allowance, so
   decode-to-nothing gzip streams cannot hold a connection open — and must finish within
   30 seconds. Oversize requests are rejected with a `413` before git runs
-  ([#70](https://github.com/coder/open-storage/issues/70)). A proxy
+  ([#70](https://github.com/coder/openstorage/issues/70)). A proxy
   request-body cap is therefore optional defense-in-depth — if you set one, size it at
   or above the server cap and remember the proxy sees wire bytes while the server counts
   decoded (post-gzip) bytes. Request duration and concurrency limits remain the proxy's
@@ -251,7 +251,7 @@ and bypasses every proxy-enforced limit. Then:
   mode), so Git LFS clients need direct network reach to the configured S3
   endpoint — a VPC-internal bucket endpoint breaks LFS pulls for external clients even
   though the batch request itself succeeds. Uploads always go through the server's
-  verified proxy transfer ([#51](https://github.com/coder/open-storage/issues/51)):
+  verified proxy transfer ([#51](https://github.com/coder/openstorage/issues/51)):
   a presigned PUT cannot bind content length or checksum, so the server receives, size-
   and sha256-verifies, and meters every upload against the repository
   [storage quota](../reference/configuration.md#openstorage_pack_quota_bytes) before
@@ -271,7 +271,7 @@ and bypasses every proxy-enforced limit. Then:
   15 minutes after the last old replica exits. Complete the roll promptly; LFS objects
   a client uploaded around the roll window are re-verified on their next write-scoped
   touch only while unregistered, so treat uploads from that window with the same trust
-  you gave v0.1.0's presigned path ([#78](https://github.com/coder/open-storage/issues/78)
+  you gave v0.1.0's presigned path ([#78](https://github.com/coder/openstorage/issues/78)
   tracks closing this window with object-version fencing).
 
 ### Client identity behind the proxy (`OPENSTORAGE_TRUSTED_PROXIES`)
@@ -417,7 +417,7 @@ Two sharp edges:
   `pull-upstream` runs and the database's org key set stays exactly the configured file
   keys. (Historically the loopback key was persisted last-writer-wins, breaking sync on
   every replica but the most recently booted one —
-  [#45](https://github.com/coder/open-storage/issues/45).)
+  [#45](https://github.com/coder/openstorage/issues/45).)
 
 ## Background maintenance in a fleet
 
@@ -442,7 +442,7 @@ the [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 Everything above assumes the production topology: Postgres plus a bucket. The
 **experimental** `s3wal://` mode
 ([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md),
-issue [#133](https://github.com/coder/open-storage/issues/133)) removes Postgres *and*
+issue [#133](https://github.com/coder/openstorage/issues/133)) removes Postgres *and*
 local disk from the durability story: refs and metadata live in conditional-CAS objects
 under the bucket's reserved `_wal/` prefix, next to the ordinary `packs/` and `lfs/`
 payloads. One S3-compatible bucket is the sole durable authority — kill the process,

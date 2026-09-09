@@ -18,8 +18,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // benchFanoutEnv builds a repo whose ref store holds n same-tip refs and

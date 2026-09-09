@@ -65,8 +65,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/envconfig"
 )
 
 const (

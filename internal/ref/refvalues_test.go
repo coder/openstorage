@@ -7,7 +7,7 @@ import (
 
 // TestRefValues_AcrossBackends pins the batched exact-value probe on every
 // production store (issue #170 atomic-push base check; Codex round-14 P1
-// on coder/open-storage#173: atomic pushes must verify every command's
+// on coder/openstorage#173: atomic pushes must verify every command's
 // authority base before any update hook's CAS, in ONE push-proportional
 // batch): present names map to their exact sha, absent names are omitted,
 // and the empty candidate set does no store work.

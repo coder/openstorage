@@ -14,7 +14,7 @@ are never logged (worker and delivery code paths keep them out of errors and slo
 fields), webhook secrets are shown exactly once at registration (ADR-29), and credential
 reads are scoped to the sync worker. Revisit when a KMS/keystore seam exists.
 
-**Amended by [#54](https://github.com/coder/open-storage/issues/54):** the environment is
+**Amended by [#54](https://github.com/coder/openstorage/issues/54):** the environment is
 now that seam. Optional
 [`OPENSTORAGE_SECRETS_KEY`](../reference/configuration.md#openstorage_secrets_key)
 envelope-encrypts both columns (AES-256-GCM, `enc:v1:` marker, comma-separated key list

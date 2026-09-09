@@ -24,15 +24,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coder/open-storage/internal/api"
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/envconfig"
-	"github.com/coder/open-storage/internal/githttp"
-	"github.com/coder/open-storage/internal/meta"
-	"github.com/coder/open-storage/internal/ref"
-	"github.com/coder/open-storage/internal/ref/s3wal"
-	"github.com/coder/open-storage/internal/version"
+	"github.com/coder/openstorage/internal/api"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/ref"
+	"github.com/coder/openstorage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/version"
 )
 
 func main() {

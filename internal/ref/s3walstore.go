@@ -34,7 +34,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // ErrRefNameNotUTF8 rejects ref names carrying invalid UTF-8 (git accepts

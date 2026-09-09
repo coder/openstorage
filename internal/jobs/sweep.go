@@ -32,8 +32,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // PackRegistry is the slice of ref.RefStore the sweeper needs: point

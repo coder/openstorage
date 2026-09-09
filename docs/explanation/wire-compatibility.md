@@ -94,14 +94,14 @@ Beyond serving the smart-HTTP wire format, the semantics clients depend on match
   registered via [`openstorage signing-key`](../reference/cli.md#openstorage-signing-key).
   Verification shells out through git — `ssh-keygen` for SSH, `gpg` for PGP — and fails
   closed per ref when the binary is absent. The repository's supplied container image
-  ships both ([#50](https://github.com/coder/open-storage/issues/50)); install them
+  ships both ([#50](https://github.com/coder/openstorage/issues/50)); install them
   yourself if you build a custom image and protect refs with `verify-sig`.
 
 ### Git LFS transfer semantics
 
 The batch API speaks the standard LFS `basic` adapter, so any git-lfs client works
 unchanged — but the transfer hrefs it hands out are asymmetric by design
-([#51](https://github.com/coder/open-storage/issues/51)):
+([#51](https://github.com/coder/openstorage/issues/51)):
 
 - **Downloads** get presigned S3 URLs when the backend can sign (server-proxied
   fallback otherwise, e.g. local file mode). Reads are never quota-gated.
@@ -126,7 +126,7 @@ deployment serves **one organization**, configured at boot
 For clients this is invisible — tokens carry the same `iss`/`repo`/`scopes` claims either
 way. Both surfaces reject any verified token whose `iss` is not the served org with
 `403` (the REST surface historically accepted tokens for retained org rows —
-[#47](https://github.com/coder/open-storage/issues/47)). Org rows retained from an
+[#47](https://github.com/coder/openstorage/issues/47)). Org rows retained from an
 earlier `OPENSTORAGE_ORG` value stay in the database and each boot logs a warning naming
 them, but their tokens are rejected on both surfaces. What changes is operations: org
 onboarding and signing-key registration are your deployment configuration (env + CLI)
@@ -177,7 +177,7 @@ tracked as ordinary, visible project work:
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled
-  [**`upstream-compat`**](https://github.com/coder/open-storage/issues?q=label%3Aupstream-compat) —
+  [**`upstream-compat`**](https://github.com/coder/openstorage/issues?q=label%3Aupstream-compat) —
   that label query is the live drift status.
 - **Compatibility gates:** the merge-gate CI runs the full e2e suites (API, git
   protocol, LFS) that pin the documented wire behavior, and an opt-in SDK-compatibility
@@ -187,5 +187,5 @@ tracked as ordinary, visible project work:
 
 To evaluate SDK compatibility for a specific integration: check the
 [surface matrix](#implemented-surface) for the feature groups you use, then the open
-[`upstream-compat` issues](https://github.com/coder/open-storage/issues?q=label%3Aupstream-compat)
+[`upstream-compat` issues](https://github.com/coder/openstorage/issues?q=label%3Aupstream-compat)
 for anything upstream shipped that has not landed here yet.

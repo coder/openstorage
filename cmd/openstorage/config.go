@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/githttp"
-	"github.com/coder/open-storage/internal/jobs"
-	"github.com/coder/open-storage/internal/ref"
-	"github.com/coder/open-storage/internal/secrets"
+	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/jobs"
+	"github.com/coder/openstorage/internal/ref"
+	"github.com/coder/openstorage/internal/secrets"
 )
 
 // Environment variable names, canonical first; envFirst scans left to right

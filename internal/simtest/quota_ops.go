@@ -11,8 +11,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // simQuotaBytes is the generous per-repo quota the reserve op admits

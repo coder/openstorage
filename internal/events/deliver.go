@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // ErrWebhookGone marks a delivery whose webhook was deleted between

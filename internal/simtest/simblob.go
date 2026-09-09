@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/openstorage/internal/blob"
 )
 
 // SimBlobStore decorates a blob.BlobStore with seeded fault injection.

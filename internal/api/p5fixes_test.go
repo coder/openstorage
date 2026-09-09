@@ -16,10 +16,10 @@ import (
 	stdsync "sync"
 	"testing"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/events"
-	"github.com/coder/open-storage/internal/meta"
-	upsync "github.com/coder/open-storage/internal/sync"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/events"
+	"github.com/coder/openstorage/internal/meta"
+	upsync "github.com/coder/openstorage/internal/sync"
 )
 
 func TestGetRepoIncludesBaseRepo(t *testing.T) { runBackends(t, testGetRepoIncludesBaseRepo) }

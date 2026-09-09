@@ -21,11 +21,11 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/envconfig"
-	"github.com/coder/open-storage/internal/meta"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // Env names used to route request context from the HTTP handler into the

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/openstorage/internal/blob"
 )
 
 // skipUnlessS3WAL gates the drills to the zero-infra lane.

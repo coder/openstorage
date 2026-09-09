@@ -19,8 +19,8 @@ import (
 
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/coder/open-storage/internal/events"
-	"github.com/coder/open-storage/internal/sync"
+	"github.com/coder/openstorage/internal/events"
+	"github.com/coder/openstorage/internal/sync"
 )
 
 // TestSyncSnoozeDelayLegacyBackoff: a lapsed LEGACY claim may be

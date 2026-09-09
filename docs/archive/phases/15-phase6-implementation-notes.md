@@ -22,7 +22,7 @@ namespace question ADR-3 answered for *refs* gets the opposite answer for LFS *o
 
 ## ADR-34: LFS lives on the storage host — presigned transfers, proxy fallback
 
-> **Amended by [#51](https://github.com/coder/open-storage/issues/51):** presigned
+> **Amended by [#51](https://github.com/coder/openstorage/issues/51):** presigned
 > transfers are now download-only. Uploads always use the verified proxy endpoint — a
 > presigned PUT binds neither content length nor digest, which left LFS outside the
 > storage-quota perimeter — and every verified upload is admitted through the quota

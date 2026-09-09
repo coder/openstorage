@@ -7,8 +7,8 @@
   "bootstrap-sha": "4594422de4787645bac7356973ec7932ee0256d4",
   "packages": {
     ".": {
-      "package-name": "open-storage",
-      "component": "open-storage"
+      "package-name": "openstorage",
+      "component": "openstorage"
     }
   }
 }

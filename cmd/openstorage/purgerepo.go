@@ -15,10 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/envconfig"
-	"github.com/coder/open-storage/internal/jobs"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/jobs"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // sanitizeTerm replaces control characters (C0, DEL, C1 — the bytes

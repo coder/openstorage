@@ -32,7 +32,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
 
 // Qualified SeaweedFS recipe (Gate 1a-A, PR #142): pinned image,

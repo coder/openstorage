@@ -15,7 +15,7 @@ import (
 	stdsync "sync"
 	"time"
 
-	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/openstorage/internal/envconfig"
 )
 
 // RepoInfo is the minimal repo identity a sync run needs: the storage key

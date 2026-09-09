@@ -21,9 +21,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/gitread"
-	"github.com/coder/open-storage/internal/meta"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // maxInlineDiffBytes is the large-file filtering threshold for the diff

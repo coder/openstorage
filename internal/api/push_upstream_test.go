@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/coder/open-storage/internal/auth"
-	upsync "github.com/coder/open-storage/internal/sync"
+	"github.com/coder/openstorage/internal/auth"
+	upsync "github.com/coder/openstorage/internal/sync"
 )
 
 // usyncAllowPush enables http.receivepack on a seeded upstream bare repo so

@@ -27,9 +27,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/coder/open-storage/internal/envconfig"
-	"github.com/coder/open-storage/internal/ref/s3wal"
-	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
 
 const (
