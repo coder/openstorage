@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // SimRefStore decorates a ref.RefStore with seeded clean/ambiguous fault

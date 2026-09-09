@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/lfsscan"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/lfsscan"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // lfsReclaimGitEnv pins identity and neuters host config so fixture commits

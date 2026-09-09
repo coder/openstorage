@@ -9,13 +9,13 @@ packs, via its S3 gateway) — and proof that a write through one node is immedi
 > from the host: **Git LFS downloads** — the batch API presigns download URLs for the
 > container-only endpoint `http://seaweedfs:8333`, which host-side clients cannot resolve
 > (uploads work: they proxy through the server,
-> [#51](https://github.com/coder/open-storage/issues/51)). Everything else works,
+> [#51](https://github.com/coder/openstorage/issues/51)). Everything else works,
 > including **upstream mirror sync** (`pull-upstream`): since
-> [#49](https://github.com/coder/open-storage/pull/49) the sync worker pushes through the
+> [#49](https://github.com/coder/openstorage/pull/49) the sync worker pushes through the
 > node's **own bound listener**, never `OPENSTORAGE_BASE_URL`, so sync works against any
 > upstream the *containers* can reach — public forges just work; an upstream bound to the
 > host's loopback does not (re-verified live in
-> [#60](https://github.com/coder/open-storage/issues/60)). For a hardened
+> [#60](https://github.com/coder/openstorage/issues/60)). For a hardened
 > deployment (TLS, trusted proxies, rolling upgrades, key rotation), follow the
 > [production deployment guide](deploy-production.md) — the topology is the same, only the
 > hardening differs.

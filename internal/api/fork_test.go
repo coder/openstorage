@@ -25,9 +25,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/gitread"
-	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // newForkServer mounts POST /api/v1/repos through the production auth

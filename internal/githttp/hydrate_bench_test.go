@@ -16,8 +16,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // benchHydrateEnv returns a SQLite ref store, a fileblob store, and a cache

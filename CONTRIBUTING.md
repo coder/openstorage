@@ -24,17 +24,22 @@ versions CI uses. Installing the same versions by hand works too.
 While the repository and release downloads are internal to the Coder organization,
 installing requires GitHub credentials with repository access:
 
-- `go install` must fetch directly from GitHub using authenticated Git, bypassing the
-  public module proxy and checksum database:
+- To build the current source, clone it using authenticated Git:
 
   ```sh
   gh auth setup-git   # or configure another Git credential helper for github.com
-  GOPRIVATE='github.com/coder/*' go install github.com/coder/open-storage/cmd/openstorage@latest
+  git clone https://github.com/coder/openstorage.git && cd openstorage
+  go install ./cmd/openstorage
   ```
 
-  The Go module path is `github.com/coder/open-storage`; the GitHub repository is
-  `coder/openstorage`, and GitHub redirects the old repository URL. Keep the declared
-  module path in `go install` commands.
+  This checkout uses the committed `vendor/` tree. Its Go module path is
+  `github.com/coder/openstorage`. The `v0.15.0` tag still declares
+  `github.com/coder/open-storage`; GitHub redirects do not change existing tags.
+  Until a release includes the corrected module path, use the checkout above.
+  After that release, installation by module path can use
+  `GOPRIVATE='github.com/coder/*' go install github.com/coder/openstorage/cmd/openstorage@latest`.
+  `GOPRIVATE` makes Go fetch private modules directly through authenticated Git,
+  bypassing the public module proxy and checksum database.
 
 - mise needs a GitHub token for release downloads. A logged-in `gh` CLI is picked up
   when `github.gh_cli_tokens` is enabled (the default); otherwise set `GITHUB_TOKEN`:
@@ -159,7 +164,7 @@ golangci-lint run
 
 Config is [`.golangci.yml`](.golangci.yml) (v2 schema): the default linter set
 plus `misspell`, `unconvert`, `nolintlint`, and the `gofmt`/`goimports`
-formatters (local prefix `github.com/coder/open-storage`).
+formatters (local prefix `github.com/coder/openstorage`).
 
 ## Go style: modern idioms
 

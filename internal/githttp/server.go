@@ -22,11 +22,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/envconfig"
-	"github.com/coder/open-storage/internal/meta"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // assertf is a fail-fast invariant check for conditions that indicate a

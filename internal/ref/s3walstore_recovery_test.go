@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // newRecoveryStores returns two independent S3WAL drivers sharing one

@@ -27,7 +27,7 @@ import (
 	stdsync "sync"
 	"time"
 
-	"github.com/coder/open-storage/internal/events"
+	"github.com/coder/openstorage/internal/events"
 )
 
 // egressProxy fronts exactly one git transfer (an outbound `git push` or

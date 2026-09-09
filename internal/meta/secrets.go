@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/secrets"
+	"github.com/coder/openstorage/internal/secrets"
 )
 
 // ErrReservedSecret: CreateWebhook/CreateGitCredential/UpdateGitCredential

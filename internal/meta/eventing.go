@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/openstorage/internal/envconfig"
 )
 
 // Webhook is one registered delivery endpoint (docs/reference/webhooks.md). Secret is the HMAC

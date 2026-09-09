@@ -20,7 +20,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // s3walLapseEvidence reports whether a doomed reservation map key is an

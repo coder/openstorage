@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // s3walBackend is the s3wal lane fixture: a fresh MemCAS-backed store per

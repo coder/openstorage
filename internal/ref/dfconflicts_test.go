@@ -7,7 +7,7 @@ import (
 
 // TestDFConflicts_AcrossBackends pins the batched authority D/F probe's
 // verdict semantics on every production store (issue #170 push holds;
-// Codex round-13 on coder/open-storage#173: the probe must be batched and
+// Codex round-13 on coder/openstorage#173: the probe must be batched and
 // candidate-proportional, so each backend implements it natively): strict
 // prefix ancestors and strict descendants conflict; exact matches,
 // siblings, and clean names do not. The '.' fixture pins byte-order

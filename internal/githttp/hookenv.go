@@ -1,6 +1,6 @@
 package githttp
 
-import "github.com/coder/open-storage/internal/envconfig"
+import "github.com/coder/openstorage/internal/envconfig"
 
 // pushHookEnv discards inherited request authority under BOTH env prefixes.
 // Optional settings must stay absent when this request does not supply them;

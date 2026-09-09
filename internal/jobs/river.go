@@ -15,8 +15,8 @@ import (
 	"github.com/riverqueue/river/rivermigrate"
 	"github.com/riverqueue/river/rivertype"
 
-	"github.com/coder/open-storage/internal/events"
-	"github.com/coder/open-storage/internal/sync"
+	"github.com/coder/openstorage/internal/events"
+	"github.com/coder/openstorage/internal/sync"
 )
 
 // deliveryArgs is one durable webhook-delivery job. The payload is the

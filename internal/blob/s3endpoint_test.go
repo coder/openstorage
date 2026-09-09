@@ -36,7 +36,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/openstorage/internal/envconfig"
 )
 
 // EnvTestS3URL names the external S3 endpoint the tests in this file run

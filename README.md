@@ -40,9 +40,12 @@ macOS binaries for amd64 and arm64, plus `checksums.txt`. Install a release with
 or build with Go 1.27.1 or newer:
 
 ```sh
-# Choose one:
+# Install a release binary:
 mise use -g github:coder/openstorage@latest
-go install github.com/coder/open-storage/cmd/openstorage@latest
+
+# Or build the current source:
+git clone https://github.com/coder/openstorage.git && cd openstorage
+go install ./cmd/openstorage
 
 openstorage version
 ```

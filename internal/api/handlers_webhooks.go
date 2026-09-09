@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/events"
-	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/events"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // Webhook CRUD surface. Endpoint management is NOT part of the public SDK

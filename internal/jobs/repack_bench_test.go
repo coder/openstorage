@@ -20,8 +20,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // benchFoldBudgets are fixed selection budgets for the in-memory benchmarks.

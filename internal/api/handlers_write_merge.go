@@ -58,9 +58,9 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/gitread"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // wmMaxConflictSideBytes caps one rendered conflict side (result, base,

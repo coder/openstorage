@@ -24,7 +24,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/openstorage/internal/envconfig"
 )
 
 const defaultSDKDir = "/home/coder/openstorage/sdk/packages/code-storage-go"

@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/openstorage/internal/blob"
 )
 
 func TestLFS_GitLFSRoundTrip(t *testing.T) {

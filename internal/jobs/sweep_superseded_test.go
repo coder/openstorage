@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/blob"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // foldWorld seeds one repo with two registered packs folded into a

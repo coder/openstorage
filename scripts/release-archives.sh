@@ -27,7 +27,7 @@ date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # cross-compiles below instead of silently linking against host libc.
 export CGO_ENABLED=0
 
-module=github.com/coder/open-storage
+module=github.com/coder/openstorage
 ldflags="-s -w
 	-X ${module}/internal/version.version=${tag}
 	-X ${module}/internal/version.commit=${commit}

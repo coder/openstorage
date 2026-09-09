@@ -49,7 +49,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 var _ ScanStateStore = (*S3WAL)(nil)

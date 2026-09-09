@@ -57,7 +57,7 @@ is high-risk, low-value.
 **Decision.** The update hook computes the introduced set (`git rev-list <new> ^<old>`;
 branch creation checks everything reachable — the branch-protection contract compares
 against the ref's own prior tip only, never other refs — and deletions introduce
-nothing; [#59](https://github.com/coder/open-storage/issues/59) bounded the cost with a
+nothing; [#59](https://github.com/coder/openstorage/issues/59) bounded the cost with a
 per-push verdict cache and a fail-closed verification budget) and verifies
 each commit by delegating to git inside the cache repo: a temp `allowed_signers` file
 (`* namespaces="git" <ssh-key>` lines) plus a temp `GNUPGHOME` with the org's armored PGP

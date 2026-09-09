@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/jobs"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/jobs"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // mapEnv builds a presence-aware lookup from a fixed map (no process env

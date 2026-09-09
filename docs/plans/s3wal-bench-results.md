@@ -29,11 +29,11 @@ arms pass. (3)'s 30 s starvation arm **is recorded tripped as written**
 (56.4 s at N=8) — the evaluation below assesses that reading as a
 measurement-regime artifact (the campaign's runner omitted the §2.3
 backoff the cell definition names —
-[#181](https://github.com/coder/code-storage/issues/181), since fixed by
-[PR #184](https://github.com/coder/code-storage/pull/184))
+[#181](https://github.com/coder/openstorage/issues/181), since fixed by
+[PR #184](https://github.com/coder/openstorage/pull/184))
 and records the verdict consequence explicitly: s3wal stays experimental,
 the arm must be re-measured on real S3 under the §2.3-conformant runner
-([PR #184](https://github.com/coder/code-storage/pull/184) landed it
+([PR #184](https://github.com/coder/openstorage/pull/184) landed it
 after this campaign; the re-run awaits fresh credentials) before any
 promote-grade claim, and if it trips again with backoff in place the
 criterion stands and the recommendation flips to closing #133.
@@ -172,9 +172,9 @@ transient client-side TLS handshake timeout surfaced as a hook decline. The
 probe script, per-worker raw results, and rejection taxonomy are
 committed as
 [`probe-fairness-real-s3-2026-08-27.txt`](./s3wal-bench-data/probe-fairness-real-s3-2026-08-27.txt).
-The harness fix ([#181](https://github.com/coder/code-storage/issues/181))
+The harness fix ([#181](https://github.com/coder/openstorage/issues/181))
 **landed after this campaign was recorded**:
-[PR #184](https://github.com/coder/code-storage/pull/184) (merged
+[PR #184](https://github.com/coder/openstorage/pull/184) (merged
 2026-08-27, after the campaign commit) adds the §2.3 full-jitter backoff
 and removes winner-chaining. The real-S3 columns above are from the
 pre-#184 runner; the conformant real-S3 re-run of this cell is pending
@@ -391,7 +391,7 @@ the bench tolerates and counts these like any rejection.
     supplements rather than replaces the recorded number; the
     authoritative re-measurement is a real-S3 re-run of this cell under
     the §2.3-conformant runner
-    ([PR #184](https://github.com/coder/code-storage/pull/184), which
+    ([PR #184](https://github.com/coder/openstorage/pull/184), which
     closed #181 after this campaign was recorded) — pending fresh
     credentials.
 - **(4)** 304-path p99 > 100 ms: measured **20.12 ms** — passes with 5×
@@ -411,17 +411,17 @@ added path inflates the latency cells conservatively), thresholds (1),
 60.0 s at N=32). The maintainer assessment is that this reading measures
 the harness's own deviation from the cell definition (no §2.3 backoff +
 winner-chaining in the campaign's runner —
-[#181](https://github.com/coder/code-storage/issues/181), since fixed by
-[PR #184](https://github.com/coder/code-storage/pull/184))
+[#181](https://github.com/coder/openstorage/issues/181), since fixed by
+[PR #184](https://github.com/coder/openstorage/pull/184))
 rather than a store or design property, with the production-shape probe
 (21.9 s worst gap) as supporting — not overriding — evidence.
 
 **Gate 1a-B verdict:** the plan's kill consequence (recommend closing
-[#133](https://github.com/coder/code-storage/issues/133)) is **not**
+[#133](https://github.com/coder/openstorage/issues/133)) is **not**
 taken on the strength of the tripped reading alone; s3wal **stays
 experimental** (no status upgrade), and the starvation arm is treated as
 *unresolved pending re-measurement*: the runner is now §2.3-conformant
-([PR #184](https://github.com/coder/code-storage/pull/184), merged after
+([PR #184](https://github.com/coder/openstorage/pull/184), merged after
 this campaign was recorded), so the cell must be re-run on real S3 with
 fresh credentials (the campaign's expired). If the arm trips again under
 the conformant regime, the criterion stands and the recommendation flips
@@ -442,8 +442,8 @@ below is from live runs; the bucket was emptied and deleted afterward.
   endpoints reject with 400 `IllegalLocationConstraintException` before
   any existence check (boot-fatal in BOTH s3wal and PG+S3 modes; invisible
   on SeaweedFS/MinIO/us-east-1). Filed as
-  [#179](https://github.com/coder/code-storage/issues/179), fixed in
-  [PR #180](https://github.com/coder/code-storage/pull/180); the session
+  [#179](https://github.com/coder/openstorage/issues/179), fixed in
+  [PR #180](https://github.com/coder/openstorage/pull/180); the session
   ran on that fix.
 - **s3wal mode smoke** (`s3wal://bucket?region=eu-central-1` +
   `s3://bucket?region=eu-central-1`, expected-bucket-owner set): repo
@@ -466,8 +466,8 @@ below is from live runs; the bucket was emptied and deleted afterward.
   recomputed summaries are committed as
   [`e2e-push-times-real-s3-2026-08-27.txt`](./s3wal-bench-data/e2e-push-times-real-s3-2026-08-27.txt).
   Round-trip census filed as
-  [#182](https://github.com/coder/code-storage/issues/182);
-  [PR #185](https://github.com/coder/code-storage/pull/185) landed a
+  [#182](https://github.com/coder/openstorage/issues/182);
+  [PR #185](https://github.com/coder/openstorage/pull/185) landed a
   first round of per-push round-trip trims **after this campaign was
   recorded**, so the figures above predate it (treat them as the
   pre-#185 upper bound; the post-#185 cost needs a re-measurement with

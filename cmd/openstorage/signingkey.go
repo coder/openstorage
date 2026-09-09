@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/envconfig"
-	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 const (

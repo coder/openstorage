@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/openstorage/internal/envconfig"
 )
 
 // Use the presence-aware production reader here, not mapEnv: a value-only mock

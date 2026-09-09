@@ -19,7 +19,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // assertf is a fail-fast invariant check for programming errors only.

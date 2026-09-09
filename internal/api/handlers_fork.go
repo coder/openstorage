@@ -31,10 +31,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/gitread"
-	"github.com/coder/open-storage/internal/meta"
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // forkAwareCreateRepo dispatches POST /api/v1/repos: bodies carrying a

@@ -9,8 +9,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/coder/open-storage/internal/auth"
-	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // registerRepoURLRoutes wires the repo-urls surface: org-level org:read

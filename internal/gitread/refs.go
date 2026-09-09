@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // Tag is one refs/tags entry. SHA is the PEELED commit sha for annotated
