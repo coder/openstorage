@@ -77,9 +77,11 @@ trigger a bump). The next `release-please.yml` run on that push:
    linux/arm64, darwin/amd64, darwin/arm64 with `CGO_ENABLED=0`
    ([`scripts/release-archives.sh`](../../scripts/release-archives.sh)), stamps
    tag/commit/date into [`openstorage version`](../reference/cli.md#openstorage-version),
-   verifies checksums plus the native binary on both ubuntu and macOS runners, and
+   verifies archive contents and the bundled license against the root [`LICENSE`](../../LICENSE),
+   verifies checksums and runs the native binary on both ubuntu and macOS runners, then
    uploads `openstorage_<version>_<os>_<arch>.tar.gz` + `checksums.txt` as release
-   assets (binary at the archive root, so `mise`/`ubi`-style installers can infer it).
+   assets. Every archive contains `openstorage` and `LICENSE` at its root, so binary
+   recipients receive the license and `mise`/`ubi`-style installers can still find the binary.
 
 Watch the run: `gh run list --workflow release-please -R coder/open-storage`.
 

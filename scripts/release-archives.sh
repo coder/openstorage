@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the openstorage release archives: cross-compiles ./cmd/openstorage
-# for every supported platform, packages each binary at the root of
+# for every supported platform, packages each binary and LICENSE at the root of
 # openstorage_<version>_<os>_<arch>.tar.gz, and writes a sha256 checksums.txt
 # next to them. Used by .github/workflows/release.yml and runnable locally so
 # the tested path is the shipped path.
@@ -42,15 +42,17 @@ for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
 	GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "$ldflags" \
 		-o "$workdir/openstorage" ./cmd/openstorage
 	archive="openstorage_${version}_${goos}_${goarch}.tar.gz"
-	tar -czf "$outdir/$archive" -C "$workdir" openstorage
+	# Do not add AppleDouble metadata entries when building archives on macOS.
+	COPYFILE_DISABLE=1 tar -czf "$outdir/$archive" -C "$workdir" openstorage -C "$PWD" LICENSE
 	rm -rf "$workdir"
-	# Layout assertion: exactly one entry, the binary at the archive root
-	# (mise/ubi-style installers rely on this).
+	# Layout assertion: the binary and canonical license at the archive root.
+	# Keep the binary at the root for mise/ubi-style installers.
 	entries="$(tar -tzf "$outdir/$archive")"
-	[ "$entries" = "openstorage" ] || {
+	[ "$entries" = $'openstorage\nLICENSE' ] || {
 		echo "release-archives.sh: unexpected layout in $archive: $entries" >&2
 		exit 1
 	}
+	tar -xOzf "$outdir/$archive" LICENSE | cmp - LICENSE
 	echo "built $archive"
 done
 

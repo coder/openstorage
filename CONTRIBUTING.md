@@ -9,7 +9,7 @@ depth, see the [testing reference](docs/reference/testing.md).
 
 | Tool | Why |
 |---|---|
-| Go ≥ 1.27 | `go.mod` toolchain; CI resolves the version from `go.mod` |
+| Go ≥ 1.27.1 | `go.mod` toolchain; CI resolves the version from `go.mod` |
 | git | the server shells out to it; every test uses it |
 | git-lfs | the LFS end-to-end tests drive a real `git lfs` client (CI fails fast if it is missing) |
 | Docker | the default test lane boots real Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/); also the compose stack |
@@ -19,17 +19,45 @@ The Go and golangci-lint pins live in [`mise.toml`](mise.toml); with
 [mise](https://mise.jdx.dev/) installed, `mise install` fetches exactly the
 versions CI uses. Installing the same versions by hand works too.
 
+## Authenticated installation
+
+While the repository and release downloads are internal to the Coder organization,
+installing requires GitHub credentials with repository access:
+
+- `go install` must fetch directly from GitHub using authenticated Git, bypassing the
+  public module proxy and checksum database:
+
+  ```sh
+  gh auth setup-git   # or configure another Git credential helper for github.com
+  GOPRIVATE='github.com/coder/*' go install github.com/coder/open-storage/cmd/openstorage@latest
+  ```
+
+  The Go module path is `github.com/coder/open-storage`; the GitHub repository is
+  `coder/openstorage`, and GitHub redirects the old repository URL. Keep the declared
+  module path in `go install` commands.
+
+- mise needs a GitHub token for release downloads. A logged-in `gh` CLI is picked up
+  when `github.gh_cli_tokens` is enabled (the default); otherwise set `GITHUB_TOKEN`:
+
+  ```sh
+  mise use -g github:coder/openstorage@latest
+  ```
+
+  For mise versions that predate the `github:` backend, use
+  `mise use -g 'ubi:coder/openstorage[exe=openstorage]@latest'`.
+
 ## Build and run
 
 ```sh
+git clone https://github.com/coder/openstorage.git && cd openstorage
 go build ./cmd/openstorage && ./openstorage version
 ./openstorage keygen --out /tmp/cs-key   # org keypair, used by both serve modes below
 ```
 
 (A source build lands at `./openstorage` without touching `PATH` — spell the
-`./` out, or `go install` it.) Two ways to run what you built:
+`./` out, or `go install` it.) Three ways to run what you built:
 
-- **Zero-dependency local mode** — SQLite + plain-file blobs, one flag:
+- **Local mode** — SQLite + files; no database or object-storage service required:
 
   ```sh
   OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
@@ -55,7 +83,7 @@ go build ./cmd/openstorage && ./openstorage version
   [compose guide](docs/how-to/deploy-docker-compose.md). Every `OPENSTORAGE_*`
   variable is documented in the [configuration reference](docs/reference/configuration.md).
 
-- **Zero-infrastructure mode (experimental)** — one SeaweedFS bucket as the sole durable
+- **S3-only storage (experimental)** — one SeaweedFS bucket as the sole durable
   authority (`s3wal://` refs + metadata and `s3://` blobs on the same bucket, which must
   exist before boot):
 
@@ -188,7 +216,7 @@ counts.
 A PR merges when all of the following hold:
 
 1. **CI is green** — all five jobs: `lint`, `test` (default lane), `test-local`,
-   `test-s3wal` (zero-infra serve lane, issue #193), and `image` (Docker build +
+   `test-s3wal` (S3-only storage lane, issue #193), and `image` (Docker build +
    runtime-dependency smoke test).
 2. **A clean automated review round** — comment `@codex review` on the PR and
    address what comes back: fix genuine errors; when a finding is out of scope,
