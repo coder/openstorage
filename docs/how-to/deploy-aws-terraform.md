@@ -80,7 +80,7 @@ Install the matching `openstorage` CLI on your client using the
 For a Linux amd64 client, the verified archive above is directly runnable:
 
 ```bash
-tar -xzf "$ARCHIVE_PATH" -C "$CLIENT_DIR" openstorage LICENSE
+tar -xzf "$ARCHIVE_PATH" -C "$CLIENT_DIR" openstorage
 export PATH="$CLIENT_DIR:$PATH"
 openstorage version
 ```

@@ -38,10 +38,11 @@ def install_release(archive_path, expected_sha256, tag, destination):
     if digest.hexdigest() != expected_sha256.lower():
         raise ValueError("release checksum mismatch")
     # Do not use extract/extractall: ignore archive ownership, permissions, and
-    # paths, and reject links or anything outside the two-file release layout.
+    # paths. Published v0.15.0 archives contain only the binary; newer ones add LICENSE.
     with tarfile.open(archive_path, "r:gz") as archive:
         members = archive.getmembers()
-        if len(members) != 2 or {member.name for member in members} != {"openstorage", "LICENSE"}:
+        names = {member.name for member in members}
+        if len(members) != len(names) or names not in ({"openstorage"}, {"openstorage", "LICENSE"}):
             raise ValueError("unexpected release archive layout")
         if any(not member.isreg() or member.issparse() or not 0 < member.size <= 512 * 1024 * 1024 for member in members):
             raise ValueError("release archive must contain only bounded regular files")
@@ -54,7 +55,7 @@ def install_release(archive_path, expected_sha256, tag, destination):
             output = run([str(binary), "--version"]).decode("utf-8").strip()
             if not output.startswith("openstorage " + tag + " (") or "\n" in output:
                 raise ValueError("release binary version mismatch")
-            license_content = (Path(temp) / "LICENSE").read_bytes()
+            license_content = (Path(temp) / "LICENSE").read_bytes() if "LICENSE" in names else None
             os.replace(binary, destination)
             return license_content
 
@@ -113,7 +114,8 @@ def bootstrap():
         run(["aws", "s3api", "get-object", "--bucket", cfg["artifact_bucket"], "--key", cfg["artifact_key"],
              "--region", cfg["region"], "--expected-bucket-owner", cfg["account_id"], str(archive)], timeout=300)
         license_content = install_release(archive, cfg["release_sha256"], cfg["release_tag"], Path("/usr/local/bin/openstorage"))
-    atomic_write(CONFIG_DIR / "LICENSE", license_content, 0o644)
+    if license_content is not None:
+        atomic_write(CONFIG_DIR / "LICENSE", license_content, 0o644)
     install_ca()
     for name in UNITS:
         atomic_write(Path("/etc/systemd/system") / name, (CONFIG_DIR / name).read_bytes(), 0o644)

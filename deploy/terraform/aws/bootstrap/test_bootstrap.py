@@ -133,8 +133,17 @@ class ArchiveTests(unittest.TestCase):
                     run.assert_not_called()
                 self.assertEqual(self.destination.read_bytes(), b"previous release")
 
+    def test_binary_only_published_release(self):
+        # v0.15.0's published archive predates the LICENSE packaging change.
+        digest = self.archive_with(self.valid_entries()[:1])
+        with mock.patch.object(bootstrap, "run", return_value=b"openstorage v0.15.0 (release)\n"):
+            license_content = bootstrap.install_release(self.archive, digest, "v0.15.0", self.destination)
+        self.assertIsNone(license_content)
+        self.assertEqual(self.destination.read_bytes(), b"binary")
+        self.assertEqual(stat.S_IMODE(self.destination.stat().st_mode), 0o755)
+
     def test_missing_or_duplicate_entries(self):
-        for entries in [self.valid_entries()[:1], self.valid_entries() + self.valid_entries()[:1]]:
+        for entries in [[], self.valid_entries()[1:], self.valid_entries() + self.valid_entries()[:1]]:
             digest = self.archive_with(entries)
             with self.assertRaises(ValueError):
                 bootstrap.install_release(self.archive, digest, "v0.10.0", self.destination)
