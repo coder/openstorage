@@ -39,7 +39,7 @@ import (
 // qualification matrix only to document its conditional-write behavior.
 const (
 	SeaweedFSImage   = "chrislusf/seaweedfs:4.45"
-	MinIOLegacyImage = "minio/minio:RELEASE.2024-01-16T16-07-38Z"
+	MinIOLegacyImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z@sha256:4c4a4876193f030c81f57aabb22bcb9a73462010eb61fcab66908e03e5484af8"
 	// FlociImage pins the Floci row of the qualification matrix (issues
 	// #205, #212): the nightly lane runs the 22 qualification surfaces plus
 	// get-under-overwrite in REQUIRE mode against this build, so bumping
