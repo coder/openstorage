@@ -30,6 +30,29 @@ func TestS3WAL_OfflineBackupRestore(t *testing.T) {
 	if _, err := exec.LookPath("git-lfs"); err != nil {
 		t.Fatal("s3wal backup drill requires git-lfs: ", err)
 	}
+	// Isolate every Git subprocess, including shared helpers and serve children.
+	for _, entry := range os.Environ() {
+		key, value, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "GIT_") {
+			t.Setenv(key, value) // Register restoration before unsetting, not emptying.
+			if err := os.Unsetenv(key); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for key, value := range map[string]string{
+		"GIT_CONFIG_GLOBAL":   "/dev/null",
+		"GIT_CONFIG_SYSTEM":   "/dev/null",
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_AUTHOR_NAME":     "githttp",
+		"GIT_AUTHOR_EMAIL":    "githttp@test.invalid",
+		"GIT_AUTHOR_DATE":     "2000-01-01T00:00:00Z",
+		"GIT_COMMITTER_NAME":  "githttp",
+		"GIT_COMMITTER_EMAIL": "githttp@test.invalid",
+		"GIT_COMMITTER_DATE":  "2000-01-01T00:00:00Z",
+	} {
+		t.Setenv(key, value)
+	}
 	ctx := t.Context()
 	base, err := url.Parse(blobURL)
 	if err != nil {

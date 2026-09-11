@@ -188,10 +188,12 @@ pass may the original node resume against its original bucket.
    ```
 
 4. A copied `_wal/instance-lease` can look fresh because copying resets its
-   Last-Modified time. Prefer waiting out the configured lease TTL after copying.
-   If necessary, remove **only that key from the restore bucket**, only after
-   confirming every old serving process is dead/fenced; record this intentional
-   post-verification mutation. Never disable the instance lease for recovery.
+   Last-Modified time. Prefer waiting at least the saved lease TTL **plus two
+   seconds** after copying, allowing for whole-second S3 timestamp resolution.
+   If startup still reports a held lease, keep the node fenced and retry after
+   its expiry. If necessary, remove **only that key from the restore bucket**,
+   only after confirming every old serving process is dead/fenced; record this
+   intentional post-verification mutation. Never disable the instance lease for recovery.
    Do not rewrite embedded clocks, claims or scan cursors. New object modification
    times can delay age-based cleanup; copied leases/claims can delay work. Monitor
    lease refusals and clock-skew warnings using the [deployment guide](deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
