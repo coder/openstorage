@@ -206,11 +206,14 @@ export TOKEN=$(openstorage mint --key "$CLIENT_DIR/org.pem" --iss "$OPENSTORAGE_
   --repo demo --scopes repo:write,git:read,git:write --ttl 15m)
 printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | \
   curl --config - --fail --silent --show-error --max-time 30 \
-  -X POST "$SERVICE_URL/api/v1/repos" -d '{"default_branch":"main"}'
+  -X POST "$SERVICE_URL/api/v1/repos" -d '{"default_branch":"main"}' \
+  > "$CLIENT_DIR/demo.json"
+# Use the canonical clone URL returned by repository creation.
+CLONE_URL=$(python3 -c 'import json,os; print(json.load(open(os.environ["CLIENT_DIR"]+"/demo.json"))["http_url"])')
 # Supply Git auth in process environment, not a token-bearing remote URL.
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.${SERVICE_URL}/.extraHeader"
-export GIT_CONFIG_VALUE_0="Authorization: Bearer $TOKEN"
-git clone "$SERVICE_URL/demo.git" "$CLIENT_DIR/demo"
+export GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 't:%s' "$TOKEN" | openssl base64 -A)"
+git clone "$CLONE_URL" "$CLIENT_DIR/demo"
 (cd "$CLIENT_DIR/demo" && git -c user.name=example -c user.email=example@example.com \
   commit --allow-empty -m 'reference deployment' && git push origin HEAD:main)
 printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | \
@@ -234,22 +237,50 @@ channel in this slice; changing bootstrap inputs replaces the disposable node.
 `release: {tag, sha256}`. It contains no private key, token, or database password.
 The client/runner supplies its local signing-key path separately.
 
-The opt-in [smoke adapter](../../deploy/terraform/aws/scripts/smoke.sh) reads this
-same Terraform output and invokes the separately owned #222 acceptance runner:
+The opt-in [smoke adapter](../../deploy/terraform/aws/scripts/smoke.sh) translates
+this output to the separately owned #222 runner's `--config`/`--output` interface.
+It requires a runner supporting **`pg-s3-single-node` with empty `replica_urls` and
+optional `ca_file`**. Runner versions supporting only `local`, two-replica `pg-s3`,
+and `s3wal` reject this handoff. Compatible runner integration is a remaining
+#222 gate, not established by the adapter's stub tests. Do not label this node
+`local`, repeat the ALB URL as two replicas, or disable TLS verification to bypass it.
+
+Prepare four local inputs, separately from Terraform. Use the approved source
+commit and executable SHA for your matching client platform, **not the Linux
+archive SHA**. Paths resolve relative to the invoking directory. The runner checks
+executable hash/version consistency; that does not attest deployed binaries.
 
 ```bash
-# Only after the sandbox and testing have been approved and the stack exists.
+# Replace these values with the independently verified local helper identity.
+export CANDIDATE_COMMIT='REPLACE_WITH_FULL_40_CHARACTER_RELEASE_COMMIT'
+export CLIENT_BINARY_SHA256='REPLACE_WITH_VERIFIED_64_CHARACTER_EXECUTABLE_SHA256'
+python3 - <<'PY'
+import json, os, shutil
+from pathlib import Path
+client = Path(os.environ["CLIENT_DIR"])
+(client / "runner-inputs.json").write_text(json.dumps({
+    "candidate_commit": os.environ["CANDIDATE_COMMIT"],
+    "binary": shutil.which("openstorage"),
+    "binary_sha256": os.environ["CLIENT_BINARY_SHA256"],
+    "private_key_file": str(client / "org.pem"),
+}))
+PY
+# Requires the compatible #222 runner, approved testing, and an existing stack.
+# results must not exist. Omit --smoke for config/local-artifact checks only.
 OPENSTORAGE_AWS_SMOKE=1 timeout --signal=TERM --kill-after=30s 20m \
-  mise exec -- deploy/terraform/aws/scripts/smoke.sh "$CLIENT_DIR/org.pem" \
-  /path/to/acceptance-runner --results "$CLIENT_DIR/results"
+  mise exec -- deploy/terraform/aws/scripts/smoke.sh "$CLIENT_DIR/runner-inputs.json" \
+  "$CLIENT_DIR/results" python3 /path/to/aws_launch_qualification.py \
+  --smoke --budget-seconds 600
 ```
 
-Runner interface: extra arguments pass through, followed by
-`--deployment <temporary-json-path> --signing-key <local-path>`. The runner must
-copy non-secret deployment metadata into its result manifest before returning;
-the adapter removes its temporary JSON and propagates the runner's exit status.
-It never provisions resources. The scenario runner and result-manifest
-implementation belong to #222, not a second Terraform tree here.
+The adapter reads state but never provisions resources. It combines system CA
+trust with the public ALB CA, keeps the signing key local, removes temporary
+config/CA files, and propagates the runner's exit status. Keep the earlier exported
+`deployment.json` beside the runner results for resource and archive metadata;
+the runner config intentionally excludes those extra fields. `--aws-readonly`
+optionally enables the runner's STS/HeadBucket probes using the caller's approved
+AWS credentials. Scenarios and result manifests belong to #222, not another
+framework here. Single-node smoke explicitly cannot prove cross-replica behavior.
 
 RC qualification must record the reference Git commit, exact release commit and
 artifact SHA, Terraform/provider lock, region/account, sanitized inputs, timestamps,
