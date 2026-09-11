@@ -10,6 +10,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -370,26 +371,42 @@ func selfLoopbackURL(addr net.Addr) string {
 func cmdKeygen(args []string) error {
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
 	out := fs.String("out", "", "output path prefix (writes <out>.pem and <out>.pub.pem)")
-	alg := fs.String("alg", "ES256", "key algorithm: one of "+strings.Join(auth.AllowedAlgorithms, ", "))
+	alg := fs.String("alg", "ES256", "fresh key algorithm: one of "+strings.Join(auth.AllowedAlgorithms, ", "))
+	ifMissing := fs.Bool("if-missing", false, "reuse a valid existing pair unchanged; generate only when both files are absent")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *out == "" {
 		return fmt.Errorf("--out is required")
 	}
-	privPath, pubPath, err := generateKeyPEMFiles(*alg, *out)
+	privPath, pubPath, err := generateKeyPEMFiles(*alg, *out, *ifMissing)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("wrote %s and %s\n", privPath, pubPath)
+	status := "wrote"
+	if *ifMissing {
+		status = "ready"
+	}
+	fmt.Printf("%s %s and %s\n", status, privPath, pubPath)
 	return nil
 }
 
 // generateKeyPEMFiles creates a fresh keypair for alg and writes
 // <outPrefix>.pem (PKCS#8 private, 0600) and <outPrefix>.pub.pem (PKIX
 // public — the format the org key registry accepts). Never commit either.
-func generateKeyPEMFiles(alg, outPrefix string) (privPath, pubPath string, err error) {
+// ifMissing reuses a valid pair without writes, ignoring alg on reuse.
+func generateKeyPEMFiles(alg, outPrefix string, ifMissing bool) (privPath, pubPath string, err error) {
 	assertf(outPrefix != "", "generateKeyPEMFiles: empty output prefix")
+	privPath, pubPath = outPrefix+".pem", outPrefix+".pub.pem"
+	if ifMissing {
+		reused, err := reuseKeyPEMFiles(privPath, pubPath)
+		if err != nil {
+			return "", "", err
+		}
+		if reused {
+			return privPath, pubPath, nil
+		}
+	}
 	priv, err := auth.GenerateKey(alg)
 	if err != nil {
 		return "", "", err
@@ -402,14 +419,89 @@ func generateKeyPEMFiles(alg, outPrefix string) (privPath, pubPath string, err e
 	if err != nil {
 		return "", "", err
 	}
-	privPath, pubPath = outPrefix+".pem", outPrefix+".pub.pem"
-	if err := os.WriteFile(privPath, privPEM, 0o600); err != nil {
-		return "", "", err
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if ifMissing {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_EXCL
 	}
-	if err := os.WriteFile(pubPath, pubPEM, 0o644); err != nil {
-		return "", "", err
+	for _, file := range []struct {
+		path string
+		data []byte
+		mode os.FileMode
+	}{{privPath, privPEM, 0o600}, {pubPath, pubPEM, 0o644}} {
+		f, err := os.OpenFile(file.path, flags, file.mode)
+		if err != nil {
+			return "", "", err
+		}
+		_, writeErr := f.Write(file.data)
+		if err := errors.Join(writeErr, f.Close()); err != nil {
+			return "", "", err
+		}
 	}
 	return privPath, pubPath, nil
+}
+
+// reuseKeyPEMFiles returns false, nil only when both paths are absent. Never
+// repair partial creation: O_EXCL protects each fresh file, not an atomic pair.
+func reuseKeyPEMFiles(privPath, pubPath string) (bool, error) {
+	var data [2][]byte
+	found := 0
+	for i, path := range []string{privPath, pubPath} {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if !info.Mode().IsRegular() {
+			return false, fmt.Errorf("%s: key must be a regular file (not a symlink)", path)
+		}
+		if i == 0 && info.Mode().Perm()&0o077 != 0 {
+			return false, fmt.Errorf("%s: private key must have no group or other permissions", path)
+		}
+		data[i], err = os.ReadFile(path)
+		if err != nil {
+			return false, err
+		}
+		found++
+	}
+	if found == 0 {
+		return false, nil
+	}
+	if found != 2 {
+		return false, fmt.Errorf("incomplete keypair: both %s and %s must exist", privPath, pubPath)
+	}
+	priv, err := auth.ParsePrivateKeyPEM(data[0])
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", privPath, err)
+	}
+	alg, err := auth.DefaultAlgorithm(priv)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", privPath, err)
+	}
+	// Parsing alone can accept keys that cannot sign with an allowed algorithm.
+	if _, err := auth.MintToken(priv, alg, auth.Claims{}); err != nil {
+		return false, fmt.Errorf("%s: unusable signing key: %w", privPath, err)
+	}
+	pubs, err := auth.ParsePublicKeysPEM(data[1])
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", pubPath, err)
+	}
+	if len(pubs) != 1 {
+		return false, fmt.Errorf("%s: expected exactly one public key", pubPath)
+	}
+	want, err := auth.MarshalPublicKeyPEM(priv.Public())
+	if err != nil {
+		return false, err
+	}
+	got, err := auth.MarshalPublicKeyPEM(pubs[0])
+	if err != nil {
+		return false, err
+	}
+	if !bytes.Equal(want, got) {
+		return false, fmt.Errorf("%s and %s: keys do not match", privPath, pubPath)
+	}
+	return true, nil
 }
 
 func cmdMint(args []string) error {

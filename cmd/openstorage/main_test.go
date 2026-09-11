@@ -38,7 +38,7 @@ func TestGenerateKeyPEMFilesAndMint(t *testing.T) {
 	for _, alg := range []string{"ES256", "RS256", "EdDSA"} {
 		t.Run(alg, func(t *testing.T) {
 			prefix := filepath.Join(t.TempDir(), "org1")
-			privPath, pubPath, err := generateKeyPEMFiles(alg, prefix)
+			privPath, pubPath, err := generateKeyPEMFiles(alg, prefix, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -77,14 +77,14 @@ func TestGenerateKeyPEMFilesAndMint(t *testing.T) {
 }
 
 func TestGenerateKeyPEMFilesRejectsUnknownAlg(t *testing.T) {
-	if _, _, err := generateKeyPEMFiles("HS256", filepath.Join(t.TempDir(), "k")); err == nil {
+	if _, _, err := generateKeyPEMFiles("HS256", filepath.Join(t.TempDir(), "k"), false); err == nil {
 		t.Fatal("want error for disallowed algorithm")
 	}
 }
 
 func TestMintTokenValidation(t *testing.T) {
 	prefix := filepath.Join(t.TempDir(), "k")
-	privPath, _, err := generateKeyPEMFiles("ES256", prefix)
+	privPath, _, err := generateKeyPEMFiles("ES256", prefix, false)
 	if err != nil {
 		t.Fatal(err)
 	}
