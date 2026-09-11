@@ -17,7 +17,7 @@ import urllib.request
 
 from runtime import CA_FILE, CONFIG_DIR, atomic_write, load_config, run
 
-UNITS = ("openstorage.service", "openstorage-config-refresh.service", "openstorage-config-refresh.timer")
+UNITS = ("openstorage.service", "openstorage-refresh.service", "openstorage-refresh.timer")
 CA_URL = "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"
 
 
@@ -118,7 +118,7 @@ def bootstrap():
     for name in UNITS:
         atomic_write(Path("/etc/systemd/system") / name, (CONFIG_DIR / name).read_bytes(), 0o644)
     run(["systemctl", "daemon-reload"])
-    run(["systemctl", "enable", "--now", "openstorage.service", "openstorage-config-refresh.timer"], timeout=120)
+    run(["systemctl", "enable", "--now", "openstorage.service", "openstorage-refresh.timer"], timeout=120)
 
 
 def main():

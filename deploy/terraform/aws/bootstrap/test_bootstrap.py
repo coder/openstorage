@@ -316,8 +316,10 @@ class UnitTests(unittest.TestCase):
     def test_units_use_root_preparation_and_unprivileged_server_without_cycle(self):
         directory = Path(__file__).parent
         service = (directory / "openstorage.service").read_text()
-        refresh = (directory / "openstorage-config-refresh.service").read_text()
-        timer = (directory / "openstorage-config-refresh.timer").read_text()
+        self.assertEqual(bootstrap.UNITS, ("openstorage.service", "openstorage-refresh.service", "openstorage-refresh.timer"))
+        refresh = (directory / "openstorage-refresh.service").read_text()
+        timer = (directory / "openstorage-refresh.timer").read_text()
+        self.assertIn("Unit=openstorage-refresh.service", timer)
         for setting in ["User=openstorage", "Group=openstorage", "UMask=0077", "LimitCORE=0",
                         "ExecStartPre=+/usr/bin/python3 /etc/openstorage/runtime.py prepare",
                         "EnvironmentFile=-/run/openstorage/service.env",
