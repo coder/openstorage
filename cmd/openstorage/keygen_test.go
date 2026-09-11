@@ -90,6 +90,8 @@ func TestGenerateKeyPEMFilesIfMissingRejectsExisting(t *testing.T) {
 		{"other_read", func(p string) error { return os.Chmod(p+".pem", 0o604) }},
 		{"other_write", func(p string) error { return os.Chmod(p+".pem", 0o602) }},
 		{"other_execute", func(p string) error { return os.Chmod(p+".pem", 0o601) }},
+		{"public_group_write", func(p string) error { return os.Chmod(p+".pub.pem", 0o620) }},
+		{"public_other_write", func(p string) error { return os.Chmod(p+".pub.pem", 0o602) }},
 		{"private_symlink", func(p string) error { return replaceKeyWithSymlink(p + ".pem") }},
 		{"public_symlink", func(p string) error { return replaceKeyWithSymlink(p + ".pub.pem") }},
 		{"dangling_private_symlink", func(p string) error {
@@ -142,6 +144,127 @@ func TestGenerateKeyPEMFilesIfMissingRejectsExisting(t *testing.T) {
 			before := snapshotKeyFiles(t, prefix)
 			if _, _, err := generateKeyPEMFiles("ES256", prefix, true); err == nil {
 				t.Error("want error, not key replacement")
+			}
+			assertKeyFilesUnchanged(t, prefix, before)
+		})
+	}
+}
+
+func TestGenerateKeyPEMFilesIfMissingRejectsExtraPEMData(t *testing.T) {
+	for _, suffix := range []string{".pem", ".pub.pem"} {
+		t.Run(suffix, func(t *testing.T) {
+			for _, tc := range []struct {
+				name   string
+				before string
+				after  string
+			}{
+				{"garbage_prefix", "not PEM\n", ""},
+				{"garbage_suffix", "", "not PEM\n"},
+				{"truncated_before", "-----BEGIN BROKEN-----\nAAAA\n", ""},
+				{"truncated_after", "", "-----BEGIN BROKEN-----\nAAAA\n"},
+				{"corrupt_before", "-----BEGIN BROKEN-----\n@@@\n-----END BROKEN-----\n", ""},
+				{"corrupt_after", "", "-----BEGIN BROKEN-----\n@@@\n-----END BROKEN-----\n"},
+				{"multiple_blocks", "", ""},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					prefix := filepath.Join(t.TempDir(), "org")
+					if _, _, err := generateKeyPEMFiles("ES256", prefix, false); err != nil {
+						t.Fatal(err)
+					}
+					path := prefix + suffix
+					data, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					block, _ := pem.Decode(data)
+					if block == nil {
+						t.Fatal("generated key has no PEM block")
+					}
+					if tc.name == "multiple_blocks" {
+						data = bytes.Repeat(data, 2)
+					} else {
+						data = append(append([]byte(tc.before), data...), tc.after...)
+						data = bytes.ReplaceAll(data, []byte("BROKEN"), []byte(block.Type))
+					}
+					if err := os.WriteFile(path, data, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					before := snapshotKeyFiles(t, prefix)
+					if _, _, err := generateKeyPEMFiles("ES256", prefix, true); err == nil {
+						t.Error("want error for extra PEM data")
+					}
+					assertKeyFilesUnchanged(t, prefix, before)
+				})
+			}
+		})
+	}
+}
+
+func TestGenerateKeyPEMFilesIfMissingPEMFormatting(t *testing.T) {
+	for _, alg := range []string{"ES256", "RS256", "EdDSA"} {
+		t.Run(alg, func(t *testing.T) {
+			for name, mode := range map[string]os.FileMode{"public_read_only": 0o444, "public_owner_writable": 0o644} {
+				t.Run(name, func(t *testing.T) {
+					prefix := filepath.Join(t.TempDir(), "org")
+					privPath, pubPath, err := generateKeyPEMFiles(alg, prefix, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, path := range []string{privPath, pubPath} {
+						data, err := os.ReadFile(path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						data = bytes.ReplaceAll(data, []byte("\n"), []byte(" \t\r\n"))
+						data = append(append([]byte(" \t\r\n"), data...), " \t\r\n"...)
+						if err := os.WriteFile(path, data, 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := os.Chmod(pubPath, mode); err != nil {
+						t.Fatal(err)
+					}
+					before := snapshotKeyFiles(t, prefix)
+					if _, _, err := generateKeyPEMFiles("HS256", prefix, true); err != nil {
+						t.Fatalf("reuse formatted %s pair: %v", alg, err)
+					}
+					assertKeyFilesUnchanged(t, prefix, before)
+				})
+			}
+		})
+	}
+}
+
+func TestGenerateKeyPEMFilesIfMissingRSAStrength(t *testing.T) {
+	for name, bits := range map[string]int{"512bit": 512, "1024bit": 1024, "2048bit": 2048, "3072bit": 3072} {
+		t.Run(name, func(t *testing.T) {
+			if bits == 512 {
+				// Exercise the bootstrap policy even with Go's weak-key compatibility switch enabled.
+				t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",rsa1024min=0")
+			}
+			key, err := rsa.GenerateKey(rand.Reader, bits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := auth.MintToken(key, "RS256", auth.Claims{}); err != nil {
+				t.Fatalf("fixture must be a signable RSA key: %v", err)
+			}
+			priv, err := auth.MarshalPrivateKeyPEM(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pub, err := auth.MarshalPublicKeyPEM(key.Public())
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefix := filepath.Join(t.TempDir(), "org")
+			if err := errors.Join(os.WriteFile(prefix+".pem", priv, 0o600), os.WriteFile(prefix+".pub.pem", pub, 0o644)); err != nil {
+				t.Fatal(err)
+			}
+			before := snapshotKeyFiles(t, prefix)
+			_, _, err = generateKeyPEMFiles("RS256", prefix, true)
+			if (err == nil) != (bits >= 2048) {
+				t.Errorf("reuse %d-bit RSA key: error = %v, want success only for >=2048 bits", bits, err)
 			}
 			assertKeyFilesUnchanged(t, prefix, before)
 		})

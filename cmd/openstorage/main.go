@@ -12,7 +12,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -459,9 +461,20 @@ func reuseKeyPEMFiles(privPath, pubPath string) (bool, error) {
 		if i == 0 && info.Mode().Perm()&0o077 != 0 {
 			return false, fmt.Errorf("%s: private key must have no group or other permissions", path)
 		}
+		if i == 1 && info.Mode().Perm()&0o022 != 0 {
+			return false, fmt.Errorf("%s: public key must have no group or other write permissions", path)
+		}
 		data[i], err = os.ReadFile(path)
 		if err != nil {
 			return false, err
+		}
+		data[i] = bytes.TrimSpace(data[i])
+		block, rest := pem.Decode(data[i])
+		// Decode can skip garbage or a malformed block before a valid one.
+		if block == nil || len(bytes.TrimSpace(rest)) != 0 ||
+			!bytes.HasPrefix(data[i], []byte("-----BEGIN ")) ||
+			bytes.Contains(data[i], []byte("\n-----BEGIN ")) {
+			return false, fmt.Errorf("%s: expected exactly one PEM block with only surrounding whitespace", path)
 		}
 		found++
 	}
@@ -474,6 +487,9 @@ func reuseKeyPEMFiles(privPath, pubPath string) (bool, error) {
 	priv, err := auth.ParsePrivateKeyPEM(data[0])
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", privPath, err)
+	}
+	if key, ok := priv.(*rsa.PrivateKey); ok && key.N.BitLen() < 2048 {
+		return false, fmt.Errorf("%s: RSA signing key must be at least 2048 bits", privPath)
 	}
 	alg, err := auth.DefaultAlgorithm(priv)
 	if err != nil {

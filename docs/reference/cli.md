@@ -84,9 +84,12 @@ openstorage keygen --if-missing --out ./keys/org   # validates; no rotation or r
 ```
 
 With `--if-missing`, both existing files must be regular files, not symlinks. The private
-file must have no group or other permission bits; unsafe permissions cause an error,
-not an automatic chmod. It must contain a usable PKCS#8 or SEC1 signing key, and the
-public file must contain exactly one matching PKIX public key, not a multi-key bundle.
+file must have no group or other permission bits; the public file must have no group or
+other write permission bits. Unsafe permissions cause an error, not an automatic chmod.
+Each file must contain exactly one PEM block with only whitespace outside it; extra
+blocks or other payloads are rejected. Whitespace and CRLF formatting are preserved.
+The private block must contain a usable PKCS#8 or SEC1 signing key (RSA keys must be at
+least 2048 bits), and the public block must contain the matching PKIX public key.
 Reuse preserves file bytes, permissions, and modification times. `--alg` only controls
 fresh generation: even a different or unsupported value is ignored on successful reuse.
 The command prints only the key paths, never the key material.
