@@ -28,6 +28,7 @@ Before anyone provisions resources, record and approve these concrete inputs:
 | Region and compute | EC2 runner, bucket, and servers in one approved region; record instance identity document and bucket region. No off-region laptop campaign. |
 | Standard topology | Two independently addressable PG+S3 replicas sharing the same Postgres database and bucket, plus the advertised public endpoint. |
 | Experimental topology | Separate single-node S3WAL deployment and scratch bucket; retain the instance lease. Never describe this as promoted support. |
+| Buckets | Exact approved names and expected owner for dedicated empty PG blob and S3WAL buckets; versioning must never have been enabled and Object Lock must be disabled. No customer data. |
 | Candidate | Full 40-character source SHA, immutable archive checksum or image digest, extracted binary checksum, build provenance, and installed checksum/digest on **every** node. |
 | Access | Short-lived client/test credentials and renewable instance-role credentials. No administrator role for the runtime. Client JWT private key stays off servers and out of Terraform state. |
 | Budget | Approved monetary ceiling, instance sizes/count, maximum cloud session length, accountable teardown operator, and an independent deadline/kill procedure. The runner's 300-second default bounds only the smoke process, not AWS billing. |
@@ -45,7 +46,15 @@ start with the [documented bucket permissions](deploy-production.md#backing-serv
 `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and
 `s3:AbortMultipartUpload` on its objects. Constrain access with
 `aws:ResourceAccount`; configure `OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER` too.
-The reference creates the bucket; the runner never calls `CreateBucket`.
+The reference provisioning role creates the buckets; the runner never calls
+`CreateBucket`. **The serve role for these pre-existing scratch buckets must
+explicitly deny `s3:CreateBucket`.** Production `serve` calls `blob.EnsureBucket`,
+which attempts `CreateBucket` before falling back from `AccessDenied` to
+`HeadBucket`. A successful runner `HeadBucket` preflight does not prevent that
+startup attempt. Verify the effective serve-role policy before starting either
+mode; reject broad provisioning credentials rather than relying on preflight
+or changing startup behavior for the measurement.
+
 Use separate, narrowly scoped test sessions for denied-read/write/delete cases;
 do not mutate a shared production role. Versioned or version-suspended buckets
 are unsuitable for the existing external test suites' deletion-based cleanup.
@@ -200,7 +209,16 @@ lease/restart runs as deployed-RC AWS tests.
 Coordinate shared session evidence with
 [#192](https://github.com/coder/openstorage/issues/192) (S3WAL promotion) and
 [#182](https://github.com/coder/openstorage/issues/182) (performance), without
-changing their criteria. EKS is a follow-up unless the launch claims Kubernetes
-support; such a claim requires workload identity, ingress/TLS, replacement, and
-rollout evidence. Keep #222 open until the cloud criteria, publication of
+changing their criteria. The #182 packet prepares three paired, sequential
+single-writer runs: 20 warmups and 60 measured pushes per lane per pair (480
+pushes plus six seed pushes and setup/final reads). Approve that traffic and
+its separate diagnostic traffic within the shared request/time/spend limits.
+Keep this comparison separate from two-replica acceptance. Local performance
+windows are not AWS proof; re-pin the eventual candidate and rerun applicable
+gates before cloud execution. Starvation, separate-day repetition, and support
+promotion remain #192-owned.
+
+EKS is a follow-up unless the launch claims Kubernetes support; such a claim
+requires workload identity, ingress/TLS, replacement, and rollout evidence.
+Keep #222 open until the cloud criteria, publication of
 sanitized evidence and deployment limits, and verified teardown are complete.
