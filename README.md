@@ -62,7 +62,10 @@ The repository's Docker image includes all three; a standalone binary does not.
 
 ## Quickstarts
 
-Start with **Try locally** (recommended). Expand a section for setup commands.
+Start with **Try locally** (recommended). For a container-only server setup, follow
+[Try with Docker only](docs/how-to/quickstart-docker.md): one local-mode server,
+persistent named volumes, and no host Go or `openstorage` binary. It uses an explicit
+local image build, not a published download. Expand a section below for other setups.
 
 <a name="quickstart-local-mode-60-seconds"></a>
 

@@ -1,0 +1,80 @@
+# Single-node development quickstart. Build locally and export the exact image ID;
+# no published registry image is assumed. See docs/how-to/quickstart-docker.md.
+x-image: &image "${OPENSTORAGE_IMAGE:?Set OPENSTORAGE_IMAGE to your locally built image ID}"
+
+services:
+  init:
+    image: *image
+    pull_policy: never
+    user: root
+    restart: "no"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        fail() { echo "quickstart init: $$*; restore a complete backup or destroy this disposable project" >&2; exit 1; }
+        # Only the mount roots are prepared. Never repair existing key files or
+        # recursively chown data; a different runtime UID needs an operator migration.
+        chown root:root /private /public
+        chmod 700 /private
+        chmod 755 /public
+        chown openstorage:openstorage /data
+        chmod 700 /data
+        umask 077
+        if [ -e /public/org.pub.pem ] || [ -L /public/org.pub.pem ]; then
+          [ -f /public/org.pub.pem ] && [ ! -L /public/org.pub.pem ] || fail "public key is not a regular file"
+          [ -f /private/org.pem ] && [ -f /private/org.pub.pem ] || fail "published key has no complete private pair"
+        fi
+        openstorage keygen --if-missing --out /private/org
+        if [ -e /public/org.pub.pem ] || [ -L /public/org.pub.pem ]; then
+          cmp -s /private/org.pub.pem /public/org.pub.pem || fail "published key differs from validated pair"
+          [ "$$(stat -c '%u:%g:%a' /public/org.pub.pem)" = 0:0:644 ] || fail "public key permissions changed"
+        else
+          # Noclobber exclusively creates the destination. An interrupted copy
+          # remains visible and fails validation next time; never silently replace it.
+          (umask 022; set -C; cat /private/org.pub.pem > /public/org.pub.pem)
+        fi
+    volumes:
+      - private:/private
+      - public:/public
+      - data:/data
+
+  server:
+    image: *image
+    pull_policy: never
+    user: openstorage
+    restart: "no"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      OPENSTORAGE_DATA_DIR: /data
+      OPENSTORAGE_ORG: selfhost
+      OPENSTORAGE_ORG_PUBKEYS: /public/org.pub.pem
+      OPENSTORAGE_LISTEN: 0.0.0.0:8080
+      OPENSTORAGE_BASE_URL: http://127.0.0.1:${OPENSTORAGE_PORT:-8080}
+    ports:
+      - "127.0.0.1:${OPENSTORAGE_PORT:-8080}:8080"
+    volumes:
+      - public:/public:ro
+      - data:/data
+    healthcheck:
+      # Startup initialization has completed before /healthz can answer. This
+      # remains a liveness probe, not continuous backing-store readiness.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  cli:
+    image: *image
+    pull_policy: never
+    profiles: ["tools"]
+    user: root
+    restart: "no"
+    volumes:
+      - private:/private:ro
+
+volumes:
+  private:
+  public:
+  data:

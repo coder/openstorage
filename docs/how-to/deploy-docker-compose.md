@@ -1,5 +1,9 @@
 # Deploy a two-replica stack with Docker Compose
 
+For a **single-node, Docker-only quickstart** with persistent SQLite/file storage
+and host-reachable Git LFS, use [Try with Docker only](quickstart-docker.md) instead.
+That separate recipe does not change the development stack below.
+
 **Goal:** a running two-replica open.storage deployment — two stateless server nodes
 (`node-a`, `node-b`) sharing one Postgres (ref CAS + metadata) and one SeaweedFS (immutable
 packs, via its S3 gateway) — and proof that a write through one node is immediately visible through the other.
