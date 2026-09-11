@@ -1,0 +1,33 @@
+[Unit]
+Description=open.storage
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=openstorage
+Group=openstorage
+# PID 1 reads this root-only file again after ExecStartPre has prepared it.
+EnvironmentFile=-/run/openstorage/service.env
+ExecStartPre=+/usr/bin/python3 /etc/openstorage/runtime.py prepare
+ExecStart=/usr/local/bin/openstorage serve --cache-dir=/var/cache/openstorage
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+TimeoutStopSec=30s
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+CapabilityBoundingSet=
+CacheDirectory=openstorage
+CacheDirectoryMode=0700
+StateDirectory=openstorage
+StateDirectoryMode=0700
+UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_ENDPOINT_URL
+
+[Install]
+WantedBy=multi-user.target

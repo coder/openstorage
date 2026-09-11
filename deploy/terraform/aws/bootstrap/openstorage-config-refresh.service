@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh open.storage RDS credentials
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /etc/openstorage/runtime.py refresh
+TimeoutStartSec=120s
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true

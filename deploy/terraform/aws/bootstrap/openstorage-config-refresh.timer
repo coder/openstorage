@@ -1,0 +1,11 @@
+[Unit]
+Description=Check open.storage RDS password rotation every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=1s
+Unit=openstorage-config-refresh.service
+
+[Install]
+WantedBy=timers.target

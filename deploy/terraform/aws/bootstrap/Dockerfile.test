@@ -1,0 +1,8 @@
+# Build from this directory; run the resulting image with --network=none.
+FROM amazonlinux:2023
+RUN dnf install -y --allowerasing git gnupg2 openssh-clients python3 awscli-2 openssl shadow-utils ca-certificates systemd \
+    && dnf clean all
+WORKDIR /probe
+COPY . .
+ENV PYTHONDONTWRITEBYTECODE=1
+CMD ["/bin/sh", "-ec", "python3 -m unittest discover -v && python3 container_probe.py"]
