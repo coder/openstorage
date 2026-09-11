@@ -6,8 +6,14 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json/v2"
 	"encoding/pem"
+	"strings"
 	"testing"
+
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jws"
 )
 
 // TestGenerateKey_DefaultAlgorithm checks each allowed algorithm yields a
@@ -121,6 +127,39 @@ func TestMintToken_Rejections(t *testing.T) {
 	}
 	if _, err := MintToken(ecKey, "HS256", validClaims("acme")); err == nil {
 		t.Error("MintToken accepted a disallowed algorithm")
+	}
+}
+
+// Guard the JWX member-name escaping fix against dependency downgrades.
+// MintToken currently uses only fixed header names, not caller-supplied names.
+func TestJWS_CustomHeaderNameEscaped(t *testing.T) {
+	key := mustGenerateKey(t, "EdDSA")
+	const name = `x":0,"admin`
+	headers := jws.NewHeaders()
+	if err := headers.Set(name, true); err != nil {
+		t.Fatal(err)
+	}
+	signed, err := jws.Sign([]byte(`{}`), jws.WithKey(jwa.EdDSA(), key, jws.WithProtectedHeaders(headers)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _, ok := strings.Cut(string(signed), ".")
+	if !ok {
+		t.Fatal("signed JWS has no protected header segment")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(decoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["admin"]; ok {
+		t.Fatalf("custom name injected an admin header: %s", decoded)
+	}
+	if got[name] != true || len(got) != 2 || got["alg"] != "EdDSA" {
+		t.Fatalf("protected headers = %s, want only alg and the exact custom name", decoded)
 	}
 }
 
