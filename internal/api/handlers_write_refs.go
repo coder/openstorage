@@ -221,6 +221,21 @@ type wrefCreateBranchRequest struct {
 	PreferredBase string `json:"preferred_base"`
 }
 
+func (req *wrefCreateBranchRequest) UnmarshalJSON(data []byte) error {
+	type request wrefCreateBranchRequest
+	if err := json.Unmarshal(data, (*request)(req)); err != nil {
+		return err
+	}
+	if req.TargetBranch != nil {
+		return nil
+	}
+	// A misspelled field must not turn a named request into an allocation.
+	// Keep the existing permissive decoding for explicitly named targets.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	return dec.Decode((*request)(req))
+}
+
 type wrefCreateBranchResponse struct {
 	Message           string `json:"message"`
 	TargetBranch      string `json:"target_branch"`

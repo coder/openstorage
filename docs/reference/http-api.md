@@ -84,7 +84,10 @@ Each successful call creates a new branch: **retrying after an unknown result ca
 another branch**. Retain the returned name and delete branches you no longer need.
 `force: true` requires an explicit, valid target name (otherwise `400`); named-target
 force and ref-policy checks are unchanged. Locally, explicit empty or `null` targets
-remain `400`, not allocation requests. Collisions are retried with create-only CAS,
+remain `400`, not allocation requests. Allocation requests reject unknown fields with
+`400` so a misspelled target field cannot silently allocate a branch; named-target
+requests retain their existing unknown-field tolerance.
+Collisions are retried with create-only CAS,
 never overwriting an existing ref; exhausting the bounded attempts returns `409`.
 Policy denials and storage errors are not retried internally.
 

@@ -81,6 +81,36 @@ func TestWriteRefsAllocateBranch(t *testing.T) {
 	})
 }
 
+func TestWriteRefsAllocateUnknownFields(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+		paths := []string{"/api/v1/repos/branches/create", "/api/repos/" + url.PathEscape(fx.url) + "/branches/create"}
+		for i, path := range paths {
+			for _, body := range []string{
+				`{"base_ref":"main","targetBranch":"feature"}`,
+				`{"base_ref":"main","targetIsEphemeral":true}`,
+				`{"base_ref":"main","unknown":true}`,
+			} {
+				before := wrefRefs(t, e, fx.repoID)
+				resp, raw := e.doReq(t, http.MethodPost, path, fx.token, []byte(body), "")
+				if resp.StatusCode != http.StatusBadRequest || !maps.Equal(before, wrefRefs(t, e, fx.repoID)) {
+					t.Fatalf("%s %s: status %d: %s or refs changed", path, body, resp.StatusCode, raw)
+				}
+			}
+			// Named requests retain the existing unknown-field tolerance and
+			// case-insensitive JSON field matching.
+			for _, field := range []string{"target_branch", "TARGET_BRANCH"} {
+				name := fmt.Sprintf("named-%d-%s", i, field)
+				body := fmt.Appendf(nil, `{"base_ref":"main",%q:%q,"targetBranch":"ignored"}`, field, name)
+				resp, raw := e.doReq(t, http.MethodPost, path, fx.token, body, "")
+				if resp.StatusCode != http.StatusOK || wrefRefs(t, e, fx.repoID)[wrefRefName(name, false)] != fx.c2 {
+					t.Fatalf("named compatibility: status %d: %s", resp.StatusCode, raw)
+				}
+			}
+		}
+	})
+}
+
 func TestWriteRefsAllocateAuth(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := wrefSeedFixture(t, e)
