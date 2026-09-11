@@ -31,6 +31,24 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
       - run: golangci-lint run
 
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      # Offline/mock gates only. This job has no AWS credentials and never applies.
+      - run: terraform -chdir=deploy/terraform/aws fmt -check -recursive
+      - run: terraform -chdir=deploy/terraform/aws init -backend=false -lockfile=readonly -input=false
+      - run: terraform -chdir=deploy/terraform/aws validate
+      - run: terraform -chdir=deploy/terraform/aws test
+      - run: python3 -m unittest discover -s deploy/terraform/aws/bootstrap -p 'test_*.py' -v
+      - run: docker build -t openstorage-bootstrap:test -f deploy/terraform/aws/bootstrap/Dockerfile.test deploy/terraform/aws/bootstrap
+      - run: docker run --rm --network=none openstorage-bootstrap:test
+      - run: python3 -m unittest discover -s deploy/terraform/aws/tests -p 'test_*.py' -v
+      - run: bash -n deploy/terraform/aws/scripts/smoke.sh
+      - run: python3 scripts/check-doc-links.py
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
