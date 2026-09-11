@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -4852,30 +4853,51 @@ func (b stallingUploadBlob) UploadFile(ctx context.Context, key, path string) er
 // with the byte quota DISABLED (a stalled publication pins the staging
 // budget and per-key slot regardless of quota configuration).
 func TestLFSQuota_PublicationBoundedByLease(t *testing.T) {
-	const ttl = 400 * time.Millisecond
+	// A production-valid TTL with a one-second publication lease. The fake
+	// clock excludes scheduler and filesystem latency from the deadline
+	// assertion, without relaxing the lease bound (issue #166).
+	const ttl = MinPackReservationTTL + time.Second
 	for name, quota := range map[string]int64{"quota-enabled": 1000, "quota-disabled": 0} {
 		t.Run(name, func(t *testing.T) {
-			srv, st, mint := newLFSQuotaServer(t, quota, ttl)
-			srv.Blob = stallingUploadBlob{BlobStore: srv.Blob}
-			tok := mint(auth.ScopeGitWrite)
-			content := []byte("stalled publication")
-			oid := sha256Hex(content)
+			synctest.Test(t, func(t *testing.T) {
+				srv, st, mint := newLFSQuotaServer(t, quota, ttl)
+				srv.LFSStagingBytes = 1 << 20
+				srv.Blob = stallingUploadBlob{BlobStore: srv.Blob}
+				tok := mint(auth.ScopeGitWrite)
+				content := []byte("stalled publication")
+				oid := sha256Hex(content)
+				key := blob.LFSKey(lfsTestRepoID, oid)
 
-			start := time.Now()
-			w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
-				"basic:"+tok, string(content))
-			if w.Code != http.StatusInternalServerError {
-				t.Fatalf("stalled-publication PUT status = %d, body %s (want 500)", w.Code, w.Body)
-			}
-			if elapsed := time.Since(start); elapsed > 3*ttl {
-				t.Fatalf("stalled publication held the request %v, want ~90%% of the %v TTL", elapsed, ttl)
-			}
-			if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || has {
-				t.Fatalf("aborted publication left a registry row: %v, %v", has, err)
-			}
-			if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 0 {
-				t.Fatalf("aborted publication credited usage: %+v", ls)
-			}
+				start := time.Now()
+				w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+					"basic:"+tok, string(content))
+				if w.Code != http.StatusInternalServerError {
+					t.Fatalf("stalled-publication PUT status = %d, body %s (want 500)", w.Code, w.Body)
+				}
+				if elapsed := time.Since(start); elapsed != time.Second {
+					t.Fatalf("stalled publication held the request %v, want the 1s publication lease", elapsed)
+				}
+				if has, err := st.HasLFSObject(t.Context(), lfsTestRepoID, key); err != nil || has {
+					t.Fatalf("aborted publication left a registry row: %v, %v", has, err)
+				}
+				if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 0 || ls.ReservedBytes != 0 {
+					t.Fatalf("aborted publication left usage or reservations: %+v", ls)
+				}
+				srv.lfsStagingMu.Lock()
+				ops, inflight := srv.lfsStagingOps, srv.lfsStagingInFlight
+				srv.lfsStagingMu.Unlock()
+				if ops != 0 || inflight != 0 {
+					t.Fatalf("staging after aborted publication = ops %d, bytes %d — slots leaked", ops, inflight)
+				}
+				if _, held := srv.lfsUploadsInFlight.Load(key); held {
+					t.Fatal("aborted publication held the per-key slot")
+				}
+				claimed, owner, err := st.TryAdoptionClaim(t.Context(), lfsTestRepoID, key)
+				if err != nil || !claimed {
+					t.Fatalf("adoption claim after aborted publication = %v, %v, want available", claimed, err)
+				}
+				srv.releaseAdoptionClaim(key, owner)
+			})
 		})
 	}
 }
