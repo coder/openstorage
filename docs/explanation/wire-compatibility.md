@@ -44,6 +44,25 @@ namespaces), and [webhooks](../reference/webhooks.md) (webhooks). By feature gro
 | Throttled responses | ✅ | Every HTTP-level `429` (gateway [rate limiter](../reference/configuration.md#rate-limiting) and busy/backpressure paths) carries the two upstream-documented headers: `Retry-After` (delay-seconds) and the IETF `RateLimit` service-limit field (`"default";r=0;t=<retry-after-secs>`); `Retry-After` takes precedence |
 | Auth model | ✅ | Customer-signed JWTs (`ES256`/`RS256`/`EdDSA`/`PS256`/`ES384`/`ES512`), scopes `git:read` / `git:write` / `repo:write` / `org:read` (exact matching — no scope implies another), `refs` policy tuples ([auth spec](../reference/authentication.md)) |
 
+### Server-allocated branch contract
+
+Both branch-create routes support omitting `target_branch`, allocating a new opaque
+name in the selected persistent or ephemeral namespace. `force: true` requires a named
+target. Each successful allocation is independent: retrying after an unknown result can
+create another branch. Persist the returned name rather than treating the request as an
+idempotent operation. Existing namespace behavior, including the REST/Git ephemeral
+split below, is unchanged. See [HTTP API](../reference/http-api.md#branches).
+
+This is an additive adoption of the [public OpenAPI](https://code.storage/docs/openapi.yaml)
+and [SDK create-branch documentation](https://code.storage/docs/reference/sdk/create-branch.md).
+At the 2026-09-11 refresh, the public spec SHA-256 was
+`1ef19148db362d1cd201cb25eeba4462cad1e420aff8c7c2323ebd3036ad1cec`;
+[the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still matched the
+previous snapshot (`e7638a43bbdc9ae0639c1d5ec65a81fea18e30c3f2ae22815d141042ab07574f`).
+The specs had not converged, and these read-only audits do not demonstrate deployment
+of allocation on that cluster. No upstream identifier layout or equivalence for explicit
+empty/null values is claimed; open.storage continues to reject those values.
+
 ### Deprecated aliases
 
 Upstream renamed several parameters and body fields over time; SDKs in the wild still
