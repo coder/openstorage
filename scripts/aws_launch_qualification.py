@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import signal
 import stat
@@ -172,24 +173,35 @@ class Runner:
         timeout = self.remaining()
         # AWS shared config and SSO caches live in the caller's home, not Git's sandbox.
         env = self.env | {"HOME": str(Path.home())} if argv[0] == "aws" else self.env
-        with tempfile.TemporaryFile(dir=self.work) as output:
-            process = subprocess.Popen(argv, cwd=cwd or self.work, env=env, stdin=subprocess.DEVNULL,
-                                       stdout=output, stderr=subprocess.DEVNULL, start_new_session=True)
+        if argv[0] == "git":
+            env = {key: value for key, value in env.items() if not key.lower().endswith("_proxy")}
+        process = subprocess.Popen(argv, cwd=cwd or self.work, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            data = bytearray()
+            deadline = time.monotonic() + timeout
+            with process.stdout, selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    chunk = os.read(process.stdout.fileno(), min(65536, LIMIT + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    require(len(data) <= LIMIT, "command_output_too_large")
+            code = process.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException:
             try:
-                code = process.wait(timeout=timeout)
-            except BaseException:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=5)
-                raise
-            self.log.append(f"{self.active}: process expected=0 actual={code}")
-            require(code == 0, "command_failed")
-            output.seek(0)
-            data = output.read(LIMIT + 1)
-            require(len(data) <= LIMIT, "command_output_too_large")
-            return data
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+            raise
+        self.log.append(f"{self.active}: process expected=0 actual={code}")
+        require(code == 0, "command_failed")
+        return bytes(data)
 
     def http(self, base, path, token=None, method="GET", data=None, expected=200, git=False):
         headers = {"Content-Type": "application/x-ndjson" if path.endswith("commit-pack") else "application/json"}
@@ -245,8 +257,9 @@ class Runner:
         self.passed()
 
     def mint(self, scopes):
+        # Cover the maximum 900-second run and the separate 45-second cleanup.
         token = self.command([self.config["binary"], "mint", "--key", self.config["private_key_file"],
-                              "--iss", self.config["org"], "--repo", self.repo, "--scopes", scopes, "--ttl", "15m"]).decode().strip()
+                              "--iss", self.config["org"], "--repo", self.repo, "--scopes", scopes, "--ttl", "20m"]).decode().strip()
         require(re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token), "invalid_minted_token")
         return token
 
@@ -362,6 +375,10 @@ def deadline_expired(_signum, _frame):
     raise Failure("budget_exhausted")
 
 
+def interrupted(_signum, _frame):
+    raise KeyboardInterrupt
+
+
 def execute(config, output, smoke=False, aws_readonly=False, budget=300):
     result = {"schema_version": 1, "status": "failed", "launch_qualified": False, "remote_artifact_verified": False, "clean_source_verified": False,
               "config": {}, "scratch_repo": None, "cleanup": {"status": "not_needed", "reason": "no creation attempted"},
@@ -377,11 +394,12 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
         return 1
     with tempfile.TemporaryDirectory(prefix="q222-") as work:
         runner = Runner(result, work, budget if type(budget) is int else 0)
-        old_alarm = None
+        old_alarm = old_term = None
         try:
             require(type(budget) is int and 1 <= budget <= 900, "invalid_budget")
             require(os.name == "posix", "posix_required")
             old_alarm = signal.signal(signal.SIGALRM, deadline_expired)
+            old_term = signal.signal(signal.SIGTERM, interrupted)
             signal.setitimer(signal.ITIMER_REAL, budget)
             runner.preflight(config, smoke, aws_readonly)
             if aws_readonly:
@@ -406,6 +424,8 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
                 if old_alarm is not None:
                     signal.setitimer(signal.ITIMER_REAL, 0)
                     signal.signal(signal.SIGALRM, old_alarm)
+                if old_term is not None:
+                    signal.signal(signal.SIGTERM, old_term)
             result["scenarios"] = list(result["scenarios"].values())
             private_write(output / "result.json", json.dumps(result, indent=2) + "\n")
             private_write(output / "runner.log", "\n".join(runner.log) + "\n")
