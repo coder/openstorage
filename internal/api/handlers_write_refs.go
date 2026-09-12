@@ -208,17 +208,32 @@ func (s *server) wrefListRefs(w http.ResponseWriter, r *http.Request, repoID str
 // POST /api/v1/repos/branches/create (git:write)
 
 type wrefCreateBranchRequest struct {
-	TargetBranch      string `json:"target_branch"`
-	BaseRef           string `json:"base_ref"`
-	BaseBranch        string `json:"base_branch"` // deprecated; base_ref wins
-	BaseIsEphemeral   bool   `json:"base_is_ephemeral"`
-	TargetIsEphemeral bool   `json:"target_is_ephemeral"`
+	TargetBranch      json.RawMessage `json:"target_branch"`
+	BaseRef           string          `json:"base_ref"`
+	BaseBranch        string          `json:"base_branch"` // deprecated; base_ref wins
+	BaseIsEphemeral   bool            `json:"base_is_ephemeral"`
+	TargetIsEphemeral bool            `json:"target_is_ephemeral"`
 	// Force CAS-recreates an existing target branch. Non-fast-forward moves
 	// stay subject to the no-force-push ref-policy op (real ancestry check).
 	Force bool `json:"force"`
 	// PreferredBase is the fallback base: used when no base_ref/base_branch
 	// is given, or when the primary base does not resolve.
 	PreferredBase string `json:"preferred_base"`
+}
+
+func (req *wrefCreateBranchRequest) UnmarshalJSON(data []byte) error {
+	type request wrefCreateBranchRequest
+	if err := json.Unmarshal(data, (*request)(req)); err != nil {
+		return err
+	}
+	if req.TargetBranch != nil {
+		return nil
+	}
+	// A misspelled field must not turn a named request into an allocation.
+	// Keep the existing permissive decoding for explicitly named targets.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	return dec.Decode((*request)(req))
 }
 
 type wrefCreateBranchResponse struct {
@@ -244,8 +259,15 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	if !wrefDecodeBody(w, r, &req) {
 		return
 	}
-	if !wrefValidBranchInput(req.TargetBranch) {
+	// Only omission requests allocation; explicit empty/null targets stay invalid.
+	allocate := req.TargetBranch == nil
+	var targetBranch string
+	if !allocate && (json.Unmarshal(req.TargetBranch, &targetBranch) != nil || !wrefValidBranchInput(targetBranch)) {
 		writeErr(w, http.StatusBadRequest, "invalid target_branch")
+		return
+	}
+	if allocate && req.Force {
+		writeErr(w, http.StatusBadRequest, "force requires target_branch")
 		return
 	}
 	base := req.BaseRef
@@ -290,53 +312,68 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "base ref not found")
 		return
 	}
-	targetRef := wrefRefName(req.TargetBranch, req.TargetIsEphemeral)
-	// The CAS precondition: zero for plain create, the current tip when
-	// force re-creates an existing branch.
-	oldSHA := ref.ZeroSHA
-	if req.Force {
-		refs, ok := s.wrefListRefs(w, r, repo.RepoID)
-		if !ok {
-			return
+	attempts := 1
+	if allocate {
+		attempts = 8
+	}
+	for range attempts {
+		if allocate {
+			targetBranch = rand.Text()
+			assertf(wrefValidBranchInput(targetBranch), "invalid allocated branch name %q", targetBranch)
 		}
-		if cur, exists := refs[targetRef]; exists {
-			oldSHA = cur
-		}
-	}
-	deny, err := wrefPolicyCheck(mustClaims(r), targetRef, oldSHA, baseSHA, func(a, b string) (bool, error) {
-		return wrefIsAncestor(ctx, repoPath, nil, a, b)
-	})
-	if err != nil {
-		s.internalErr(w, r, "evaluate ref policy", err)
-		return
-	}
-	if deny != "" {
-		writeErr(w, http.StatusForbidden, deny)
-		return
-	}
-	won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)
-	if err != nil {
-		s.internalErr(w, r, "create branch ref", err)
-		return
-	}
-	if !won {
+		targetRef := wrefRefName(targetBranch, req.TargetIsEphemeral)
+		// The CAS precondition: zero for plain create, the current tip when
+		// force re-creates an existing branch.
+		oldSHA := ref.ZeroSHA
 		if req.Force {
-			writeErr(w, http.StatusConflict, "branch moved concurrently")
+			refs, ok := s.wrefListRefs(w, r, repo.RepoID)
+			if !ok {
+				return
+			}
+			if cur, exists := refs[targetRef]; exists {
+				oldSHA = cur
+			}
+		}
+		deny, err := wrefPolicyCheck(mustClaims(r), targetRef, oldSHA, baseSHA, func(a, b string) (bool, error) {
+			return wrefIsAncestor(ctx, repoPath, nil, a, b)
+		})
+		if err != nil {
+			s.internalErr(w, r, "evaluate ref policy", err)
 			return
 		}
-		writeErr(w, http.StatusConflict, "branch already exists")
+		if deny != "" {
+			writeErr(w, http.StatusForbidden, deny)
+			return
+		}
+		won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)
+		if err != nil {
+			s.internalErr(w, r, "create branch ref", err)
+			return
+		}
+		if !won {
+			if allocate {
+				continue
+			}
+			if req.Force {
+				writeErr(w, http.StatusConflict, "branch moved concurrently")
+				return
+			}
+			writeErr(w, http.StatusConflict, "branch already exists")
+			return
+		}
+		message := "branch created"
+		if oldSHA != ref.ZeroSHA {
+			message = "branch updated"
+		}
+		writeJSON(w, http.StatusOK, wrefCreateBranchResponse{
+			Message:           message,
+			TargetBranch:      targetBranch,
+			TargetIsEphemeral: req.TargetIsEphemeral,
+			CommitSHA:         baseSHA,
+		})
 		return
 	}
-	message := "branch created"
-	if oldSHA != ref.ZeroSHA {
-		message = "branch updated"
-	}
-	writeJSON(w, http.StatusOK, wrefCreateBranchResponse{
-		Message:           message,
-		TargetBranch:      req.TargetBranch,
-		TargetIsEphemeral: req.TargetIsEphemeral,
-		CommitSHA:         baseSHA,
-	})
+	writeErr(w, http.StatusConflict, "could not allocate an unused branch name")
 }
 
 // ---------------------------------------------------------------------------
