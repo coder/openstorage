@@ -221,6 +221,16 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(self.result()["cleanup"]["status"], "unknown")
             self.assertFalse(any(call.args[2] == "/api/v1/repos/delete" for call in calls))
 
+    def test_minted_tokens_outlive_maximum_run_and_cleanup(self):
+        code, _, commands = self.smoke_with()
+        self.assertEqual(code, 0)
+        minted = [call.args[0] for call in commands if "mint" in call.args[0]]
+        self.assertEqual(len(minted), 2)
+        for argv in minted:
+            ttl = argv[argv.index("--ttl") + 1]
+            self.assertRegex(ttl, r"^[0-9]+m$")
+            self.assertGreater(int(ttl[:-1]) * 60, 900 + 45)
+
     def test_cleanup_failure_fails_otherwise_successful_smoke(self):
         def http(runner, base, path, *args, **kwargs):
             if path == "/api/v1/repos/delete":
@@ -249,12 +259,54 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(self.result()["cleanup"]["status"], "soft_deleted")
             self.assertTrue(any(call.args[2] == "/api/v1/repos/delete" for call in calls))
 
+    def test_sigterm_after_creation_records_failure_and_cleans_up(self):
+        script = '''import os, signal, sys, tempfile
+from pathlib import Path
+from test_aws_launch_qualification import RunnerTests
+
+tempfile.tempdir = sys.argv[2]
+case = RunnerTests()
+case.setUp()
+case.output = Path(sys.argv[1])
+previous = signal.getsignal(signal.SIGTERM)
+def http(runner, base, path, *args, **kwargs):
+    if path.endswith("commit-pack"):
+        os.kill(os.getpid(), signal.SIGTERM)
+    return case.fake_http(runner, base, path, *args, **kwargs)
+try:
+    code, _, _ = case.smoke_with(http)
+    assert signal.getsignal(signal.SIGTERM) == previous
+finally:
+    case.doCleanups()
+sys.exit(code)
+'''
+        env = os.environ | {"PYTHONPATH": str(Path(__file__).resolve().parent)}
+        child = subprocess.run([q.sys.executable, "-B", "-c", script, str(self.output), str(self.root)],
+                               env=env, capture_output=True, timeout=10)
+        self.assertEqual(child.returncode, 1, child.stderr.decode())
+        result = self.result()
+        self.assertEqual(result["status"], "failed")
+        self.assertRegex(result["scratch_repo"], r"^q222-")
+        self.assertEqual(result["cleanup"]["status"], "soft_deleted")
+        cases = {case["id"]: case for case in result["scenarios"]}
+        self.assertEqual(cases["api_commit"]["reason"], "interrupted")
+        self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
+
     def test_subprocess_timeout_kills_owned_process_and_sanitizes(self):
         with tempfile.TemporaryDirectory() as work:
             runner = q.Runner({}, work, 1)
             with patch.object(runner, "remaining", return_value=0.05):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     runner.command([q.sys.executable, "-c", "import time; time.sleep(20)"])
+
+    def test_subprocess_output_limit_is_enforced_before_exit(self):
+        runner = q.Runner({}, str(self.root), 1)
+        script = f"import sys, time; sys.stdout.buffer.write(b'x' * {q.LIMIT + 1}); sys.stdout.flush(); time.sleep(20)"
+        with self.assertRaisesRegex(q.Failure, "^command_output_too_large$"):
+            runner.command([q.sys.executable, "-c", script])
+        runner = q.Runner({}, str(self.root), 5)
+        data = runner.command([q.sys.executable, "-c", f"import sys; sys.stdout.buffer.write(b'x' * {q.LIMIT})"])
+        self.assertEqual(data, b"x" * q.LIMIT)
 
     def test_inherited_git_environment_is_removed(self):
         with patch.dict(os.environ, {"GIT_SSH_COMMAND": SECRET, "GIT_CONFIG_COUNT": "9", "GIT_ASKPASS": SECRET, "GIT_TRACE": SECRET}):
@@ -263,6 +315,15 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn(key, runner.env)
         self.assertEqual(runner.env["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(runner.env["HOME"], str(self.root))
+
+    def test_git_children_do_not_inherit_proxy_settings(self):
+        proxies = {name: SECRET for name in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "no_proxy")}
+        git = self.root / "git"
+        git.write_text(f"#!{q.sys.executable}\nimport json, os\nprint(json.dumps({{k: v for k, v in os.environ.items() if k.lower().endswith('_proxy')}}))\n")
+        git.chmod(0o700)
+        with patch.dict(os.environ, proxies | {"PATH": str(self.root)}):
+            runner = q.Runner({}, str(self.root), 5)
+        self.assertEqual(json.loads(runner.command(["git", "version"])), {})
 
     def test_urllib_redirect_does_not_forward_credentials(self):
         handler = q.NoRedirect()
@@ -301,15 +362,15 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("consistency checks", cases["clean_source_provenance"]["reason"])
 
     def test_aws_preserves_shared_config_and_sso_home_without_changing_git_home(self):
-        with patch.dict(os.environ, {"HOME": str(self.root / "caller")}):
+        for name in ("aws", "git"):
+            executable = self.root / name
+            executable.write_text(f"#!{q.sys.executable}\nimport os\nprint(os.environ['HOME'])\n")
+            executable.chmod(0o700)
+        with patch.dict(os.environ, {"HOME": str(self.root / "caller"), "PATH": str(self.root)}):
             runner = q.Runner({}, str(self.root / "scratch"), 5)
             runner.work.mkdir()
-            with patch.object(q.subprocess, "Popen") as popen:
-                popen.return_value.wait.return_value = 0
-                runner.command(["aws", "sts", "get-caller-identity"])
-                self.assertEqual(popen.call_args.kwargs["env"]["HOME"], str(self.root / "caller"))
-                runner.command(["git", "version"])
-                self.assertEqual(popen.call_args.kwargs["env"]["HOME"], str(self.root / "scratch"))
+            self.assertEqual(runner.command(["aws", "sts", "get-caller-identity"]).decode().strip(), str(self.root / "caller"))
+            self.assertEqual(runner.command(["git", "version"]).decode().strip(), str(self.root / "scratch"))
 
     def test_requested_aws_uses_only_readonly_expected_owner_operations(self):
         self.config["aws"] = dict(region="us-east-1", bucket="existing-bucket", expected_bucket_owner="123456789012")
@@ -385,7 +446,10 @@ class RunnerTests(unittest.TestCase):
 
     def test_timeout_reaps_child_even_if_process_group_already_exited(self):
         runner = q.Runner({}, str(self.root), 1)
-        with patch.object(q.subprocess, "Popen") as popen, patch.object(q.os, "killpg", side_effect=ProcessLookupError):
+        read, write = os.pipe()
+        os.close(write)
+        with os.fdopen(read, "rb") as stdout, patch.object(q.subprocess, "Popen") as popen, patch.object(q.os, "killpg", side_effect=ProcessLookupError):
+            popen.return_value.stdout = stdout
             popen.return_value.wait.side_effect = [subprocess.TimeoutExpired("child", 1), 0]
             with self.assertRaises(subprocess.TimeoutExpired):
                 runner.command(["child"])
