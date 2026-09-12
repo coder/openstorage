@@ -64,8 +64,9 @@ Generates an org keypair for JWT signing.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--out` | required | Output path prefix: writes `<out>.pem` (PKCS#8 private key, created with mode `0600` — a pre-existing file is overwritten but keeps its old mode) and `<out>.pub.pem` (PKIX public key) |
-| `--alg` | `ES256` | Key algorithm: one of `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512` |
+| `--out` | required | Output path prefix: writes `<out>.pem` (PKCS#8 private key, created with mode `0600`) and `<out>.pub.pem` (PKIX public key, created with mode `0644`), subject to umask. Without `--if-missing`, existing files are overwritten but keep their old modes |
+| `--alg` | `ES256` | Fresh key algorithm: one of `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512`. Ignored when `--if-missing` reuses an existing pair |
+| `--if-missing` | `false` | Generate only when both files are absent; otherwise validate and reuse a matching pair without writes |
 
 Point `OPENSTORAGE_ORG_PUBKEYS` at the `.pub.pem` file (it may hold several concatenated
 public key blocks). Never commit either file.
@@ -73,6 +74,32 @@ public key blocks). Never commit either file.
 ```sh
 openstorage keygen --out /tmp/cs-key   # /tmp/cs-key.pem + /tmp/cs-key.pub.pem
 ```
+
+For repeatable bootstrap, use a directory you control:
+
+```sh
+mkdir -m 700 ./keys
+openstorage keygen --if-missing --out ./keys/org
+openstorage keygen --if-missing --out ./keys/org   # validates; no rotation or rewrite
+```
+
+With `--if-missing`, both existing files must be regular files, not symlinks. The private
+file must have no group or other permission bits; the public file must have no group or
+other write permission bits. Unsafe permissions cause an error, not an automatic chmod.
+Each file must contain exactly one PEM block with only whitespace outside it; extra
+blocks or other payloads are rejected. Whitespace and CRLF formatting are preserved.
+The private block must contain a usable PKCS#8 or SEC1 signing key (RSA keys must be at
+least 2048 bits), and the public block must contain the matching PKIX public key.
+Reuse preserves file bytes, permissions, and modification times. `--alg` only controls
+fresh generation: even a different or unsupported value is ignored on successful reuse.
+The command prints only the key paths, never the key material.
+
+Missing halves, corrupt keys, mismatches, and unsafe existing files fail without writes.
+Fresh files are created exclusively, so a concurrently created file is not overwritten.
+The two-file creation is **not atomic**: interruption or an I/O error can leave a partial
+pair, which later runs reject rather than silently replace. Inspect and repair that state
+explicitly. Do not edit or replace the files or their containing directory while the
+command runs; it does not lock the directory against other processes.
 
 ## `openstorage mint`
 
