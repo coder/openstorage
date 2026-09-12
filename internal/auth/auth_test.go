@@ -9,6 +9,9 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
+	"math/big"
+	"strings"
 	"testing"
 )
 
@@ -103,5 +106,46 @@ func TestClaimsHasScope(t *testing.T) {
 	// Exact match only: no implication between scopes.
 	if c.HasScope(ScopeGitWrite) || c.HasScope(ScopeOrgRead) || c.HasScope("git") {
 		t.Fatal("HasScope matched a scope that was not granted")
+	}
+}
+
+func TestParsePublicKeysPEM_RSAMinimum(t *testing.T) {
+	for _, bits := range []int{512, 1024, 2047, 2048, 3072} {
+		t.Run(fmt.Sprint(bits), func(t *testing.T) {
+			// Inert public-only fixture: exercise exact bit lengths without
+			// generating private keys below the crypto/rsa generation floor.
+			pub := &rsa.PublicKey{N: new(big.Int).SetBit(new(big.Int), bits-1, 1), E: 65537}
+			data := pemPublicKey(t, pub)
+			keys, err := ParsePublicKeysPEM(data)
+			if bits < 2048 {
+				if err == nil || keys != nil || !strings.Contains(err.Error(), "minimum 2048") {
+					t.Fatalf("got %d keys, %v; want minimum 2048 error and no keys", len(keys), err)
+				}
+				return
+			}
+			if err != nil || len(keys) != 1 {
+				t.Fatalf("got %d keys, %v; want one accepted key", len(keys), err)
+			}
+			if got := keys[0].(*rsa.PublicKey).N.BitLen(); got != bits {
+				t.Fatalf("modulus = %d bits, want %d", got, bits)
+			}
+		})
+	}
+}
+
+func TestParsePublicKeysPEM_RejectsMixedWeakRSA(t *testing.T) {
+	strong := mustPublicPEM(t, mustGenerateKey(t, "ES256"))
+	weak := string(pemPublicKey(t, &rsa.PublicKey{N: new(big.Int).SetBit(new(big.Int), 1023, 1), E: 65537}))
+	malformed := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: []byte("invalid DER")}))
+	for name, data := range map[string]string{
+		"weak first": weak + strong,
+		"weak last":  strong + weak,
+		"malformed":  strong + malformed,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if keys, err := ParsePublicKeysPEM([]byte(data)); err == nil || keys != nil {
+				t.Fatalf("got %d keys, %v; want error and no partial key set", len(keys), err)
+			}
+		})
 	}
 }
