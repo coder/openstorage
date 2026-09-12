@@ -98,8 +98,12 @@ client inputs. Output names in Terraform need not match these JSON keys.
    servers, not two names for the same load balancer. They must have trusted TLS
    certificates. URLs have no credentials, path, trailing slash, query, or
    fragment. Local rehearsal alone permits loopback HTTP.
-2. `pg-s3` requires exactly two distinct replica origins. `s3wal` and `local`
-   require an empty `replica_urls` array. Declaring a topology does not prove the
+2. `pg-s3` requires exactly two distinct HTTPS replica origins. `s3wal`, `local`,
+   and `pg-s3-single-node` require an empty `replica_urls` array. The explicit
+   `pg-s3-single-node` topology is **non-qualifying reference smoke only** and
+   requires HTTPS, including on loopback. It does not satisfy the two-replica
+   AWS acceptance requirement. Never duplicate a replica URL or relabel a
+   reference deployment as `local`. Declaring any topology does not prove the
    backing stores or physical replica identity.
 3. Generate the organization key with `openstorage keygen`; deploy only its
    public half through #224. The private key must be a regular mode-0600 file.
@@ -114,6 +118,30 @@ client inputs. Output names in Terraform need not match these JSON keys.
    topology, endpoint-to-instance mapping, artifact provenance, region checks,
    and teardown evidence alongside the runner result. Do not publish raw state,
    cloud-init output, credentials, or presigned URLs.
+
+### Single-node reference and private deployment CA
+
+For the #224 single-node reference, the adapter emits
+`topology: "pg-s3-single-node"`, `replica_urls: []`, and `ca_file`. The runner
+uses the existing API/Git/LFS smoke at the advertised HTTPS endpoint. Its
+`cross_replica` scenario remains skipped with an explicit reference-smoke
+reason; `launch_qualified` remains false. This is adapter compatibility, not
+verification of PostgreSQL, S3, AWS placement, IAM, or launch readiness.
+
+Optional `ca_file` is a path to a **complete public CA certificate bundle** in
+PEM format. It must be a regular, nonempty file of at most 1 MiB, containing
+only CA certificates and whitespace, not a private key or a leaf certificate.
+The runner validates it before executing the helper, then snapshots it into
+its private temporary directory. urllib, Git, and Git LFS use that snapshot
+with certificate and hostname verification enabled. Cleanup removes the
+snapshot. The CA path and contents are not copied into result evidence.
+
+A supplied bundle must include the public roots needed by all deployment and
+transfer endpoints, alongside any private deployment CA's **public**
+certificate. The #224 adapter concatenates the OS public roots with its
+deployment CA, preserving trust for public S3 transfers. When `ca_file` is
+omitted, each client continues to use its default public trust. No TLS bypass
+is supported. Unknown issuers and hostname mismatches fail the smoke.
 
 ## 3. Run preflight, then opt into the smoke
 
@@ -190,6 +218,16 @@ Capture a screenshot **and** video of the actual invocation and result, plus
 `runner.log` and `result.json`. Review evidence for secrets before publication.
 Use `gh` 2.99+ `--attach` for images/video on the implementation PR. Never
 record a terminal printing environment values, mint output, or Terraform state.
+
+To rehearse the single-node adapter contract without AWS, put the local service
+behind an owned loopback HTTPS proxy with a matching server certificate. Supply
+an ephemeral public CA bundle and use `pg-s3-single-node`, not `local`, in the
+runner input. Run the same smoke; require `cross_replica` to stay skipped.
+Repeat with an unrelated CA, a malformed bundle, and a mismatched hostname;
+each must fail. Stop the owned proxy/server and remove their private keys and
+data afterward. This remains SQLite/fileblob transport evidence, not a PG/S3
+deployment test. Offline transport regression tests require OpenSSL, Git and
+Git LFS: `python3 -B -m unittest discover -s scripts -p 'test_*.py'`.
 
 ## 5. Complete the separate cloud gate
 

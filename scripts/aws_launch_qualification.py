@@ -17,6 +17,7 @@ import re
 import selectors
 import shutil
 import signal
+import ssl
 import stat
 import subprocess
 import sys
@@ -111,18 +112,18 @@ def load_config(path):
     config = json.loads(data, object_pairs_hook=unique_fields)
     required = {"schema_version", "candidate_commit", "binary", "binary_sha256", "topology",
                 "endpoint", "replica_urls", "org", "private_key_file"}
-    require(isinstance(config, dict) and required <= config.keys() and config.keys() <= required | {"aws"}, "invalid_fields")
+    require(isinstance(config, dict) and required <= config.keys() and config.keys() <= required | {"aws", "ca_file"}, "invalid_fields")
     require(type(config["schema_version"]) is int and config["schema_version"] == 1, "invalid_schema")
     for field, pattern in (("candidate_commit", r"[a-f0-9]{40}"), ("binary_sha256", r"[a-f0-9]{64}"),
                            ("org", r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")):
         require(isinstance(config[field], str) and re.fullmatch(pattern, config[field]), "invalid_identity")
-    require(config["topology"] in ("local", "pg-s3", "s3wal"), "invalid_topology")
+    require(config["topology"] in ("local", "pg-s3", "pg-s3-single-node", "s3wal"), "invalid_topology")
     config["endpoint"] = origin(config["endpoint"], config["topology"] == "local")
     replicas = config["replica_urls"]
     require(isinstance(replicas, list) and len(replicas) == (2 if config["topology"] == "pg-s3" else 0), "invalid_replicas")
     config["replica_urls"] = [origin(url, False) for url in replicas]
     require(len(set(config["replica_urls"])) == len(replicas), "duplicate_replicas")
-    for field in ("binary", "private_key_file"):
+    for field in ["binary", "private_key_file"] + (["ca_file"] if "ca_file" in config else []):
         require(isinstance(config[field], str) and config[field], "invalid_path")
         path = Path(config[field]).resolve(strict=True)
         require(stat.S_ISREG(path.stat().st_mode), "not_regular_file")
@@ -223,6 +224,21 @@ class Runner:
         self.step("config")
         self.config = load_config(path)
         config = self.config
+        if "ca_file" in config:
+            with open(config["ca_file"], "rb") as file:
+                data = file.read(LIMIT + 1)
+            require(len(data) <= LIMIT, "ca_bundle_too_large")
+            require(re.fullmatch(rb"\s*(?:-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+", data), "invalid_ca_bundle")
+            ca = self.work / "ca.pem"
+            private_write(ca, data.decode("ascii"))
+            context = ssl.create_default_context(cafile=str(ca))
+            counts = context.cert_store_stats()
+            require(counts["x509_ca"] > 0 and counts["x509_ca"] == counts["x509"], "invalid_ca_bundle")
+            self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
+                                                       urllib.request.HTTPSHandler(context=context))
+            config["ca_file"] = str(ca)
+        if config["topology"] == "pg-s3-single-node":
+            self.result["scenarios"]["cross_replica"]["reason"] = "single-node reference smoke; not AWS launch qualification"
         self.result["config"] = {key: config[key] for key in ("candidate_commit", "binary_sha256", "topology")}
         for tool in (["git", "git-lfs"] if smoke else []) + (["aws"] if aws_readonly else []):
             require(shutil.which(tool), "missing_dependency")
@@ -264,7 +280,8 @@ class Runner:
         return token
 
     def git(self, *args, cwd=None):
-        return self.command(["git", "-c", "http.followRedirects=false", "-c", "credential.helper=",
+        ca = ["-c", "http.sslCAInfo=" + self.config["ca_file"]] if "ca_file" in self.config else []
+        return self.command(["git", *ca, "-c", "http.followRedirects=false", "-c", "credential.helper=",
                              "-c", "credential.helper=" + str(self.work / "credential"),
                              "-c", "credential.useHttpPath=true", "-c", "protocol.file.allow=never", *args], cwd=cwd)
 

@@ -626,6 +626,38 @@ sys.exit(code)
         self.assertEqual(cases["aws_identity"]["status"], "passed")
         self.assertEqual(cases["aws_bucket"]["status"], "failed")
 
+    def test_single_node_reference_smoke_is_not_qualification(self):
+        self.config.update(topology="pg-s3-single-node", endpoint="https://reference.test")
+        code, requests, _ = self.smoke_with()
+        self.assertEqual(code, 0)
+        self.assertEqual({call.args[1] for call in requests}, {"https://reference.test"})
+        result = self.result()
+        self.assertFalse(result["launch_qualified"])
+        self.assertEqual(result["config"]["topology"], "pg-s3-single-node")
+        self.assertEqual(result["cleanup"]["status"], "soft_deleted")
+        cases = {case["id"]: case for case in result["scenarios"]}
+        for name in ("cross_replica", "standard_topology", "ec2_same_region"):
+            self.assertEqual(cases[name]["status"], "skipped")
+        self.assertIn("reference smoke", cases["cross_replica"]["reason"])
+
+    def test_reference_and_aws_topology_boundaries(self):
+        baseline = self.config | {"endpoint": "https://reference.test"}
+        invalid = [
+            {"topology": "pg-s3-single-node", "endpoint": "http://127.0.0.1:8080"},
+            {"topology": "pg-s3-single-node", "replica_urls": ["https://one.test"]},
+            {"topology": "pg-s3-single-node", "replica_urls": ["https://one.test", "https://two.test"]},
+            {"topology": "pg-s3", "replica_urls": ["https://one.test"]},
+            {"topology": "pg-s3", "replica_urls": ["https://one.test", "https://two.test", "https://three.test"]},
+            {"topology": "pg-s3", "replica_urls": ["https://one.test", "http://127.0.0.1"]},
+        ]
+        for index, change in enumerate(invalid):
+            with self.subTest(change=change):
+                self.config = baseline | change
+                self.output = self.root / str(index)
+                with self.preflight() as command:
+                    self.assertEqual(self.invoke(smoke=True), 1)
+                command.assert_not_called()
+
     def test_pg_s3_writes_first_replica_and_reads_second_and_public(self):
         self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
         code, requests, commands = self.smoke_with()
