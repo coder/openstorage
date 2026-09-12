@@ -191,7 +191,7 @@ func TestWriteRefsBranches(t *testing.T) {
 			for name, req := range map[string]map[string]any{
 				"refs prefix":  {"target_branch": "refs/heads/x", "base_branch": "main"},
 				"dotdot":       {"target_branch": "a..b", "base_branch": "main"},
-				"empty target": {"base_branch": "main"},
+				"empty target": {"target_branch": "", "base_branch": "main"},
 				"missing base": {"target_branch": "ok"},
 			} {
 				resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token, req)

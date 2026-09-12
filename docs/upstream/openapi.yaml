@@ -7362,13 +7362,13 @@ paths:
                   description: Optional source ref or revision. Provide base_ref or the deprecated base_branch.
                   type: string
                 force:
-                  description: Allow non-fast-forward updates when recreating an existing branch.
+                  description: Allow non-fast-forward updates when recreating an existing named branch. Requires target_branch.
                   type: boolean
                 preferred_base:
                   description: Optional pack hint. A branch name the backend prefers as the delta base when it builds the thin pack. It does not change the source or the result.
                   type: string
                 target_branch:
-                  description: Destination branch name.
+                  description: Optional destination branch name. Omit it to let the server allocate a name.
                   examples:
                     - feature/new-onboarding
                   type: string
@@ -7377,8 +7377,6 @@ paths:
                   examples:
                     - false
                   type: boolean
-              required:
-                - target_branch
               type: object
         description: Create a branch from another branch or ref. The source and destination can live in the default namespace or the ephemeral namespace.
         required: true
@@ -31382,13 +31380,13 @@ paths:
                   description: Optional source ref or revision. Provide base_ref or the deprecated base_branch.
                   type: string
                 force:
-                  description: Allow non-fast-forward updates when recreating an existing branch.
+                  description: Allow non-fast-forward updates when recreating an existing named branch. Requires target_branch.
                   type: boolean
                 preferred_base:
                   description: Optional pack hint. A branch name the backend prefers as the delta base when it builds the thin pack. It does not change the source or the result.
                   type: string
                 target_branch:
-                  description: Destination branch name.
+                  description: Optional destination branch name. Omit it to let the server allocate a name.
                   examples:
                     - feature/new-onboarding
                   type: string
@@ -31397,8 +31395,6 @@ paths:
                   examples:
                     - false
                   type: boolean
-              required:
-                - target_branch
               type: object
         description: Create a branch from another branch or ref. The source and destination can live in the default namespace or the ephemeral namespace.
         required: true
