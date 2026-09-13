@@ -397,6 +397,12 @@ Tokens are verified against the org's public keys in the database, and each repl
 **rewrites** that key set at boot from its `OPENSTORAGE_ORG_PUBKEYS` file (last boot
 wins). Hence: identical file contents everywhere, distributed via your secret store.
 
+RSA org keys must be at least **2048 bits**. When upgrading from a version that
+accepted smaller RSA keys, complete the rotation below **on the old fleet first**:
+reissue client tokens/Git credentials and remove every weak key before upgrading.
+A mixed strong+weak key set fails closed at startup and verification. See the
+[public-key policy](../reference/authentication.md#organization-public-key-strength).
+
 Rotation without downtime:
 
 1. Append the new public key block to the PEM file (all replicas).

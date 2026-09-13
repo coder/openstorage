@@ -94,7 +94,7 @@ func ClaimsFromContext(ctx context.Context) (*Claims, bool) {
 
 // ParsePublicKeysPEM parses one or more PEM "PUBLIC KEY" (PKIX) blocks and
 // returns the contained keys. Accepted key types: ECDSA (P-256/384/521),
-// RSA, and Ed25519 — the families backing AllowedAlgorithms. Errors on zero
+// RSA (at least 2048 bits), and Ed25519 — the families backing AllowedAlgorithms. Errors on zero
 // blocks or any unsupported/undecodable block.
 func ParsePublicKeysPEM(data []byte) ([]crypto.PublicKey, error) {
 	var keys []crypto.PublicKey
@@ -111,8 +111,13 @@ func ParsePublicKeysPEM(data []byte) ([]crypto.PublicKey, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse public key block %d: %w", len(keys)+1, err)
 		}
-		switch key.(type) {
-		case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
+		switch k := key.(type) {
+		case *rsa.PublicKey:
+			if bits := k.N.BitLen(); bits < 2048 {
+				return nil, fmt.Errorf("public key block %d: RSA modulus is %d bits (minimum 2048); rotate the key before upgrading", len(keys)+1, bits)
+			}
+			keys = append(keys, key)
+		case *ecdsa.PublicKey, ed25519.PublicKey:
 			keys = append(keys, key)
 		default:
 			return nil, fmt.Errorf("unsupported public key type %T (want ECDSA, RSA, or Ed25519)", key)
