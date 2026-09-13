@@ -53,6 +53,7 @@ package githttp
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -278,7 +279,7 @@ func benchGenerateChain(dir string, writer, n int) ([]string, error) {
 			return nil, err
 		}
 		if out, err := tryGit(dir, "commit", "-a", "-q", "-m", fmt.Sprintf("w%d op %d", writer, op)); err != nil {
-			return nil, fmt.Errorf("commit %d: %w\n%s", op, err, out)
+			return nil, fmt.Errorf("commit %d: %w\n%s\n%s", op, err, out, benchChainFailureDiagnostics(dir, writer, op))
 		}
 	}
 	// Limiting applies before --reverse: the newest n commits, oldest
@@ -292,6 +293,110 @@ func benchGenerateChain(dir string, writer, n int) ([]string, error) {
 		return nil, fmt.Errorf("chain length %d, want %d", len(shas), n)
 	}
 	return shas, nil
+}
+
+// benchChainFailureDiagnostics runs before the caller can clean up its client
+// repo. It never retries the commit or replaces its original error (issue #219).
+func benchChainFailureDiagnostics(dir string, writer, op int) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "benchGenerateChain diagnostics:\ncaptured_at=%s command=git commit -a -q -m %q\nrepo=%q TMPDIR=%q GOTMPDIR=%q\n",
+		time.Now().UTC().Format(time.RFC3339Nano), fmt.Sprintf("w%d op %d", writer, op), dir, os.Getenv("TMPDIR"), os.Getenv("GOTMPDIR"))
+	objects, err := benchChainObjectDir(dir)
+	if err != nil {
+		fmt.Fprintf(&out, "objects_resolution=fallback resolve_error=%v\n", err)
+		objects = os.Getenv("GIT_OBJECT_DIRECTORY")
+		if objects == "" {
+			objects = filepath.Join(dir, ".git", "objects")
+		} else if !filepath.IsAbs(objects) {
+			objects = filepath.Join(dir, objects)
+		}
+	} else {
+		fmt.Fprintln(&out, "objects_resolution=git")
+	}
+	fmt.Fprintf(&out, "objects=%q\n", objects)
+	if real, err := filepath.EvalSymlinks(objects); err != nil {
+		fmt.Fprintf(&out, "objects_realpath_error=%v\n", err)
+	} else {
+		fmt.Fprintf(&out, "objects_realpath=%q\n", real)
+	}
+
+	paths := []string{dir, filepath.Dir(dir), filepath.Join(dir, ".git"), objects, filepath.Dir(objects)}
+	for i, path := range paths {
+		if slices.Contains(paths[:i], path) {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Fprintf(&out, "stat path=%q error=%v\n", path, err)
+			continue
+		}
+		fmt.Fprintf(&out, "stat path=%q mode=%s mtime=%s", path, info.Mode(), info.ModTime().UTC().Format(time.RFC3339Nano))
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			fmt.Fprintf(&out, " device=%d inode=%d", stat.Dev, stat.Ino)
+		}
+		fmt.Fprintln(&out)
+	}
+
+	// Missing objects/.git directories must not make us silently measure /tmp.
+	// Label the actual sampled ancestor; it may not be the failed path's mount.
+	path := objects
+	for range 8 {
+		var fs syscall.Statfs_t
+		if err := syscall.Statfs(path, &fs); err == nil {
+			fmt.Fprintf(&out, "statfs_path=%q fsid=%v type=%#x block_size=%d blocks_free=%d blocks_available=%d inodes_free=%d\n",
+				path, fs.Fsid, fs.Type, fs.Bsize, fs.Bfree, fs.Bavail, fs.Ffree)
+			return out.String()
+		} else {
+			fmt.Fprintf(&out, "statfs path=%q error=%v\n", path, err)
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+	}
+	fmt.Fprintln(&out, "statfs_unavailable=true")
+	return out.String()
+}
+
+// Resolve Git's primary write location, including GIT_OBJECT_DIRECTORY. Only
+// stdout is captured: Git's diagnostic stderr can include configuration values.
+func benchChainObjectDir(dir string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--path-format=absolute", "--git-path", "objects")
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(stdout, 4097))
+	if len(data) > 4096 {
+		cancel()
+	}
+	waitErr := cmd.Wait()
+	if len(data) > 4096 {
+		return "", fmt.Errorf("object path exceeds 4096 bytes")
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if readErr != nil {
+		return "", readErr
+	}
+	if waitErr != nil {
+		return "", waitErr
+	}
+	objects := strings.TrimSuffix(string(data), "\n")
+	if !filepath.IsAbs(objects) {
+		return "", fmt.Errorf("git did not return an absolute object path")
+	}
+	return objects, nil
 }
 
 // pushObserver validates mid-window ls-remote observations against the

@@ -256,6 +256,32 @@ budget (compare runs with `benchstat`, which wants `count` around 10). One
 caveat when reading results: `BenchmarkAdmitReserve/parallelism=N` scales
 `b.SetParallelism`, so the worker count is N × GOMAXPROCS, not N.
 
+### Push benchmark client-chain failures
+
+`BenchmarkPushE2E` generates each writer's commits after the seed push and
+before writer warmup or measurement. If a client `git commit` fails, the
+original Git error and exit status are retained, followed by synchronous
+`benchGenerateChain diagnostics` collected before benchmark fixture cleanup.
+The context includes a UTC timestamp, safe commit arguments, repository/object
+paths, parent stat results, `TMPDIR`/`GOTMPDIR`, and filesystem identity/capacity
+(device ID, `statfs` FSID, free blocks and inodes). It does not dump Git config,
+credentials, other environment variables, or fixture contents.
+
+Git object-path resolution has a two-second process-group deadline and a
+4 KiB stdout limit; its stderr is discarded. If resolution fails, the report
+labels the fallback (`GIT_OBJECT_DIRECTORY`, or the client's `.git/objects`).
+`statfs` tries the object path and up to seven ancestors, labeling
+`statfs_path`, the path actually measured. An ancestor's filesystem is not proof of the
+filesystem at the failed write; these observations are not an atomic snapshot
+or a diagnosis of issue #219. Human-readable mount source/target names are not
+collected.
+
+No commit is retried, and successful workload/timing/assertions are unchanged.
+These failure-only observations are not throughput measurements. Tests named
+`TestBenchGenerateChainDiagnostics_Synthetic*` validate diagnostic behavior
+with deliberately invalid fixtures; they are not reproductions of the
+unexplained ENOENT flake. No new untrusted-input parser or fuzz target is added.
+
 ## The Floci S3 lane
 
 [`floci-nightly.yml`](../../.github/workflows/floci-nightly.yml) runs daily
