@@ -6,6 +6,11 @@ It covers loss of the serving bucket using a separately protected copy, not just
 replacement of the node. It does not make S3WAL supported or qualify AWS disaster
 recovery. Promotion gates remain in [#192](https://github.com/coder/openstorage/issues/192).
 
+Before changing binaries, read the
+[S3WAL format stability policy](../explanation/storage-engine.md#s3wal-format-stability-policy).
+A stopped-node backup is an upgrade precaution, not qualification of
+cross-version rollback.
+
 ## Recovery contract
 
 1. Stop and fence **every writer** for the entire backup window. Blocking HTTP

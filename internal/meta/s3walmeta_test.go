@@ -18,11 +18,43 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/coder/openstorage/internal/ref/s3wal"
 )
+
+// TestS3WALMetaDecode isolates format rejection from the other document guards.
+func TestS3WALMetaDecode(t *testing.T) {
+	const fields = `"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`
+	for _, tc := range []struct{ name, body, wantErr string }{
+		{"malformed JSON", `{`, "s3walmeta: document decode:"},
+		{"missing version", `{` + fields, "s3walmeta: document version 0 unsupported (want 1)"},
+		{"zero version", `{"v":0,` + fields, "s3walmeta: document version 0 unsupported (want 1)"},
+		{"foreign version", `{"v":2,` + fields, "s3walmeta: document version 2 unsupported (want 1)"},
+		{"valid v1", `{"v":1,` + fields, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := decodeS3WALMetaDoc([]byte(tc.body))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("decode error = %v, want %q", err, tc.wantErr)
+				}
+				if doc != nil {
+					t.Fatalf("rejected document = %+v, want nil", doc)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if doc == nil || doc.V != 1 || doc.Seq != 1 || doc.Writer != "0123456789abcdef0123456789abcdef" || doc.NextOrgID != 0 || doc.NextKeyID != 0 {
+				t.Fatalf("decoded document = %+v, want the valid v1 control", doc)
+			}
+		})
+	}
+}
 
 // s3walBackend is the s3wal lane fixture: a fresh MemCAS-backed store per
 // subtest (like the sqlite lane's fresh DB file).
