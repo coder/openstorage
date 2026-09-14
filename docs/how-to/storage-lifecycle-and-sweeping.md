@@ -136,14 +136,21 @@ repack: folded packs             repo=<id> folded=<n> pack=<new-pack-id>
 
 Operationally relevant properties:
 
-- **Counts converge below the threshold, not to one pack.** A fold that snapshots all but
-  the very latest pushes can legitimately settle at `threshold - 1` packs. That is
-  converged, not stuck. The one exception: when no combination of ≥ 2 packs fits the
-  fold budgets (next bullet), nothing is foldable and the count legitimately stays at or
-  above the threshold.
+- **Convergence expectations assume a uniform consumer threshold.** The threshold is per
+  process/replica, for its triggers and the follow-up checks of jobs it consumes.
+  Configure every eligible consumer of the repository's shared River queue alike;
+  setting only the push node to `2` is insufficient. Mixed-threshold fleets do not
+  promise preservation of a producer's lower threshold.
+- **Counts target below that uniform threshold, not necessarily one pack.** After
+  writes quiesce, a fold that snapshots all but the latest pushes can settle at
+  `threshold - 1` packs. Exactly-one convergence requires threshold `2` on every
+  eligible consumer and continued successful fold progress within the budgets below.
+  When no combination of ≥ 2 packs fits, nothing is foldable and the count can stay
+  at or above the threshold.
 - **Bounded folds.** Each fold is capped at compiled-in budgets (2 GiB of pack bytes,
   ~1M objects, 5 minutes — not tunable via environment). Repositories above the budgets
-  fold incrementally: each fold schedules a successor until counts converge.
+  fold incrementally: successful folds schedule successors while the executing
+  consumer's threshold is still met.
   `repack: budgets select nothing to fold` means no combination of ≥ 2 packs fits the
   budgets — a no-op, not an error.
 - **Usage grows before it shrinks.** A fold adds the consolidated pack while the
@@ -156,7 +163,8 @@ Operationally relevant properties:
   upload is left for the sweeper.
 
 Tuning: raise the threshold to fold less often (bigger, rarer folds), lower it (minimum
-2) for latency-sensitive read paths on push-heavy repos. `0` disables triggering.
+2) for latency-sensitive read paths on push-heavy repos. `0` disables that process's
+triggers and follow-ups; already-queued durable jobs still run.
 
 ## Pack quotas
 

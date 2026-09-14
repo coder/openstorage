@@ -68,11 +68,14 @@ message in the PR.
   that lives for the whole `TestMain` process, so an in-process rerun collides
   with the first run's state. Repeat a run by invoking `go test -count=1`
   again, not by raising `-count`.
-- **Repack convergence asserts must use threshold 2.** With
-  `OPENSTORAGE_REPACK_THRESHOLD=t`, pack rows converge *below* `t`, not to one
-  row — a fold that snapshots all but the latest push can settle at `t-1` rows
-  permanently. Only `t=2` guarantees eventual convergence to exactly one pack,
-  which is what makes it assertable.
+- **Exactly-one repack asserts require threshold 2 on every eligible consumer.**
+  `OPENSTORAGE_REPACK_THRESHOLD` is per process: setting it on the push node
+  does not configure other replicas consuming the repository's shared River queue.
+  Isolate the test's queue or set all its eligible consumers to `2`. Even then,
+  exactly-one convergence assumes writes quiesce and folds keep making successful
+  progress within the [fold budgets](../how-to/storage-lifecycle-and-sweeping.md#background-repack).
+  With a uniform enabled threshold `t`, the target is *below* `t`, not necessarily
+  one pack; a mixed-threshold fleet does not promise the producer's lower threshold.
 - **Budget for job chains generously.** Background work (repack successors,
   sync) runs through the real queue with delays; convergence waits in the suite
   use minutes-scale deadlines because `-race` on a loaded CI runner is slow.
