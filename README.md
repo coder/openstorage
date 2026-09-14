@@ -194,19 +194,19 @@ git -c user.name=demo -c user.email=demo@example.com commit --allow-empty -m ini
 git push origin HEAD:main
 ```
 
-Stop the process with plain `kill` to release its instance lease. You can delete the
-cache directory and start a fresh node against the same bucket; it reconstructs
-service from the stored data. After a hard stop (`kill -9` or machine loss), a
-replacement waits for the old lease to expire (up to 2 minutes by default).
-Once the old process is confirmed dead, delete the lease to skip that wait:
-
-```sh
-curl -sf -X DELETE http://127.0.0.1:8333/openstorage/_wal/instance-lease
-```
+Stop the process with plain `kill` (`SIGTERM`) and verify it and all hook/maintenance
+writers exited. Lease release is best effort: even graceful shutdown can leave a
+lease behind. After a hard stop or failed release, keep old writers fenced and
+allow at least the **holder's recorded TTL plus 2s** after confirmed stop (default
+TTL 2m), then follow the runbook below before starting one replacement. A corrupt
+or unjudgeable lease requires fenced investigation, not repeated starts. Never
+manually delete the lease or edit `_wal/` to skip the wait or make startup pass.
+Once stopped, the cache can be discarded; a fresh node reconstructs service from
+the stored data.
 
 This mode is single-node: ref updates within each repository group share one
 compare-and-swap point, so concurrent pushes serialize there. The
-[deployment guide](docs/how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)
+[shutdown/restart guide](docs/how-to/deploy-production.md#s3wal-shutdown-and-restart)
 has the full lease and crash-recovery runbook, and
 [the storage engine](docs/explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal)
 explains what changes underneath.
