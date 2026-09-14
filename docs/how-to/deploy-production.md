@@ -33,6 +33,23 @@ clients ──► reverse proxy (TLS) ──► N × openstorage serve ──►
   ([#50](https://github.com/coder/openstorage/issues/50)). The supplied image includes
   all three (CI asserts this); remember them if you build your own image.
 
+### Runtime base and support
+
+The Dockerfile pins the runtime base to **Alpine 3.24.1 by multi-platform image
+index digest**. The Go builder version follows `mise.toml`, but its image tag is
+not digest-pinned. `apk add --no-cache` resolves packages from the Alpine v3.24
+repositories at build time, but does not upgrade every package inherited from the
+base. The runtime base pin therefore does **not** make the full build reproducible
+or guarantee current package fixes. An uncached rebuild re-resolves added packages;
+base-image and package upgrades still need qualification.
+
+[Alpine's release inventory](https://alpinelinux.org/releases.json), checked on
+2026-09-11, lists v3.24 `main` support through **2028-06-01** and `community`
+support through **2026-11-01**. These are upstream repository support dates, not
+a whole-image support guarantee or a vulnerability-scan result. The previous
+v3.21 `main` branch remains supported through **2026-11-01**; this refresh is
+planned maintenance, not evidence that it was already unsupported.
+
 ## Backing services
 
 **Postgres** — one database, reachable from every replica
