@@ -25,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,6 +35,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -353,7 +355,7 @@ func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
 	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
 		s3AccessKey, s3SecretKey)
 	seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		Image:        "chrislusf/seaweedfs:4.45",
+		Image:        "chrislusf/seaweedfs:4.46",
 		ExposedPorts: []string{"8333/tcp"},
 		Cmd:          []string{"server", "-s3", "-dir=/data", "-volume.max=32", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
 		Files: []testcontainers.ContainerFile{{
@@ -1324,14 +1326,44 @@ func TestLocalMode_PacksOnDiskAndStatelessCache(t *testing.T) {
 
 // --- issue #1: insert-triggered background repack ----------------------------
 
+// repackDatabase isolates this test's River consumers from the shared nodeA
+// without changing the shared fixture's repack policy or starting more containers.
+func repackDatabase(t *testing.T) string {
+	t.Helper()
+	conn, err := pgx.Connect(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	if _, err := conn.Exec(t.Context(), "CREATE DATABASE repack_convergence"); err != nil {
+		t.Fatal(err)
+	}
+	// Registered before the test's nodes and store handles, so they close first.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(ctx, "DROP DATABASE repack_convergence"); err != nil {
+			t.Errorf("drop repack database: %v", err)
+		}
+	})
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/repack_convergence"
+	return u.String()
+}
+
 // TestRepack_PushesFoldToOnePack drives the full trigger→job→fold pipeline
 // through the real binary on both backend lanes: pushes past the threshold
 // make the background repack consolidate the registered rows down to ONE
 // pack, superseded blobs linger for the sweeper, and a cold node clones the
 // byte-identical repo from the consolidated pack alone.
 //
-// Threshold 2 — the ONLY threshold where "exactly one row" is a guaranteed
-// eventual state (issue #34). The system invariant is convergence BELOW the
+// Threshold 2 on EVERY eligible consumer — the ONLY threshold where "exactly
+// one row" is a guaranteed eventual state (issue #34). The PG lane uses a
+// private database so nodeA cannot consume these jobs at its default threshold.
+// The system invariant is convergence BELOW the
 // threshold, not to one row: at threshold 3, a fold that snapshots pushes
 // 1–4 with push 5 registering after the swap legitimately settles at 2 rows
 // forever (2 < 3: the trigger correctly declines, the follow-up gate is not
@@ -1341,8 +1373,53 @@ func TestLocalMode_PacksOnDiskAndStatelessCache(t *testing.T) {
 // TestLocalQueue_TriggerMidFoldConvergesToOne pins the mid-fold interleave
 // of that argument deterministically.
 func TestRepack_PushesFoldToOnePack(t *testing.T) {
-	node := startNodeT(t, "OPENSTORAGE_REPACK_THRESHOLD=2")
-	repo := registerRepo(t, "t-repack")
+	repackDBURL := dbURL
+	if testBackend == backendPG {
+		repackDBURL = repackDatabase(t)
+		// The connected database, not just the push node's setting, must
+		// exclude the shared fixture's threshold-10 River consumer.
+		conn, err := pgx.Connect(t.Context(), repackDBURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close(context.Background()) })
+		var database string
+		if err := conn.QueryRow(t.Context(), "SELECT current_database()").Scan(&database); err != nil {
+			t.Fatal(err)
+		}
+		if database != "repack_convergence" {
+			t.Fatalf("repack fixture shares database %q with foreign River consumers", database)
+		}
+	}
+	nodeEnv := []string{"OPENSTORAGE_REPACK_THRESHOLD=2", "OPENSTORAGE_PG_URL=" + repackDBURL}
+	node := startNodeT(t, nodeEnv...)
+	store, metadata := testStore, testMeta
+	if testBackend == backendPG {
+		var err error
+		store, err = ref.Open(t.Context(), repackDBURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(store.Close)
+		metadata, err = meta.Open(t.Context(), repackDBURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(metadata.Close)
+	}
+	record, err := metadata.CreateRepo(t.Context(), testOrg, "t-repack", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := record.RepoID
+	listPacks := func() []ref.Pack {
+		t.Helper()
+		packs, err := store.ListPacks(t.Context(), repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return packs
+	}
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 
@@ -1361,13 +1438,13 @@ func TestRepack_PushesFoldToOnePack(t *testing.T) {
 	// interleave needs several links — under -race on a loaded shared
 	// runner the old 60s budget expired mid-chain (issue #34).
 	deadline := time.Now().Add(3 * time.Minute)
-	for len(pgPacks(t, repo)) != 1 {
+	for len(listPacks()) != 1 {
 		if time.Now().After(deadline) {
-			t.Fatalf("pack rows never folded to 1: %+v", pgPacks(t, repo))
+			t.Fatalf("pack rows never folded to 1: %+v", listPacks())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	packs := pgPacks(t, repo)
+	packs := listPacks()
 	objs := s3Packs(t, repo)
 	if len(objs) <= 1 {
 		t.Fatalf("superseded pack blobs were deleted synchronously: %v", objs)
@@ -1383,7 +1460,7 @@ func TestRepack_PushesFoldToOnePack(t *testing.T) {
 	}
 
 	// Cold node: clone must reproduce the exact history from the fold.
-	nodeB := startNodeT(t)
+	nodeB := startNodeT(t, nodeEnv...)
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 	mustGit(t, "", "clone", remoteURL(nodeB, repo, token), cloneDir)
 	if got := revParse(t, cloneDir, "HEAD"); got != head {

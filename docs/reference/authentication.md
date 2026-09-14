@@ -25,6 +25,29 @@ Verification must accept, keyed per-org public key:
 
 JWT header: `{"alg": "<alg>", "typ": "JWT"}`.
 
+### Organization public-key strength
+
+RSA organization public keys require a modulus of **at least 2048 bits**, for both
+RS256 and PS256. ECDSA (P-256/384/521) and Ed25519 behavior is unchanged.
+
+Single-org boot configuration (`OPENSTORAGE_ORG_PUBKEYS`) is the registration path;
+there is no HTTP organization-key registration endpoint. Startup rejects a weak RSA
+key with the file path and required minimum. Verification also checks every registered
+PEM block on every request, including keys already stored before upgrade. A weak RSA
+key anywhere in the set rejects the entire set: even a token signed by a strong key
+receives **401**, not 500. Weak keys are not silently skipped, and there is no override.
+
+**Rotate before upgrading.** On the old fleet, add a strong key, switch clients to it,
+and reissue tokens (including Git credentials). Remove every weak key from the PEM
+files on all replicas and from registered org key sets before rolling out this change.
+Updating only the database is insufficient: startup replaces the configured org's
+registered keys from its file. Old weak-key tokens stop working; adding a strong key
+without removing the weak key is not enough. See [fleet key rotation](../how-to/deploy-production.md#jwt-keys-across-the-fleet).
+
+This policy applies to public authentication keys. The client-side private-key parser
+and token-minting helpers are unchanged; successfully minting a token does not imply
+that the server will accept its key.
+
 ## Claim set
 
 ```json

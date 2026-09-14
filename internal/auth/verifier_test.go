@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -330,4 +332,47 @@ func TestUnionKeySource_RejectsBadInputs(t *testing.T) {
 		}
 	}()
 	UnionKeySource(fakeKeySource{}, "acme", "not a pem block")
+}
+
+func TestVerify_RejectsWeakRSAKeySource(t *testing.T) {
+	weak, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strong, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		t.Fatal(err)
+	}
+	weakPEM, strongPEM := mustPublicPEM(t, weak), mustPublicPEM(t, strong)
+	for _, alg := range []string{"RS256", "PS256"} {
+		t.Run(alg, func(t *testing.T) {
+			weakToken := mustMint(t, weak, alg, validClaims("acme"))
+			strongToken := mustMint(t, strong, alg, validClaims("acme"))
+			source := fakeKeySource{"acme": {strongPEM}}
+			// Exercise the production overlay as well as mutable registered
+			// rows; all keys must be revalidated on every request.
+			v := NewVerifier(UnionKeySource(source, "acme", mustPublicPEM(t, mustGenerateKey(t, "ES256"))))
+			if _, err := v.Verify(t.Context(), strongToken); err != nil {
+				t.Fatal(err)
+			}
+			for _, pems := range [][]string{
+				{weakPEM}, {strongPEM, weakPEM}, {weakPEM, strongPEM}, {strongPEM + weakPEM},
+			} {
+				source["acme"] = pems
+				for _, token := range []string{weakToken, strongToken} {
+					claims, err := v.Verify(t.Context(), token)
+					if err == nil || claims != nil || !strings.Contains(err.Error(), "minimum 2048") {
+						t.Fatalf("Verify returned claims=%v, err=%v; want RSA minimum error", claims, err)
+					}
+				}
+			}
+			source["acme"] = []string{strongPEM}
+			if _, err := v.Verify(t.Context(), strongToken); err != nil {
+				t.Fatalf("strong key after rotation: %v", err)
+			}
+			if claims, err := v.Verify(t.Context(), weakToken); err == nil || claims != nil {
+				t.Fatal("removed weak key still authenticates")
+			}
+		})
+	}
 }

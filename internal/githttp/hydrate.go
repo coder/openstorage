@@ -149,9 +149,8 @@ type cacheRepoMemo struct {
 }
 
 // cacheRepoMemos maps cache repo paths to their verified fingerprints, one
-// small entry per repo this process serves. Concurrent full passes may
-// both store; either snapshot is a state a full pass verified, and the
-// same-value config writes make the passes idempotent.
+// small entry per repo this process serves. Full passes serialize on the
+// repository's hydrate lock; memo hits remain lock-free.
 var cacheRepoMemos sync.Map // map[string]cacheRepoMemo
 
 // memoFiles pairs each fingerprint with the path it must still match.
@@ -303,11 +302,11 @@ func cacheRepoUnchanged(repoPath string, m cacheRepoMemo) bool {
 	return true
 }
 
-// EnsureCacheRepoCtx is EnsureCacheRepo honoring ctx in its git
-// subprocesses (init, config): the repack fold's materialization runs the
+// EnsureCacheRepoCtx is EnsureCacheRepo honoring ctx in its lock wait and
+// git subprocesses (init, config): the repack fold's materialization runs the
 // setup under the fold's wall-clock budget, and a stalled subprocess or
 // filesystem must not outlive it.
-func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, error) {
+func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath string, retErr error) {
 	// Before memoization every call reached runGitCtx and propagated an
 	// expired context via its first subprocess; the memo hit must honor
 	// the same contract — the repack materializer runs this under its
@@ -316,6 +315,26 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 		return "", err
 	}
 	path := RepoPath(cacheDir, repo)
+	if m, ok := cacheRepoMemos.Load(path); ok && cacheRepoUnchanged(path, m.(cacheRepoMemo)) {
+		return path, nil
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return "", err
+	}
+	// Cold initialization and repairs write config.lock. Serialize the full
+	// pass across processes sharing this cache, using the existing hydrate
+	// lock inode (never unlink it). Release before Hydrate reads authority or
+	// takes this lock for pack/ref synchronization; no locks are nested here.
+	unlock, err := flockExclusiveCtx(ctx, filepath.Join(path, "codestorage.hydrate.lock"))
+	if err != nil {
+		return "", fmt.Errorf("lock cache initialization %s: %w", repo, err)
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	// A previous initializer may have finished while we waited. Keep both
+	// the warm fast path above and same-process waiters fork-free.
 	if m, ok := cacheRepoMemos.Load(path); ok {
 		if cacheRepoUnchanged(path, m.(cacheRepoMemo)) {
 			return path, nil
@@ -325,14 +344,65 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 		// full verify/repair pass below, which re-memoizes on success.
 		cacheRepoMemos.Delete(path)
 	}
-	if _, err := os.Stat(filepath.Join(path, "HEAD")); err != nil {
-		if err := os.MkdirAll(path, 0o755); err != nil {
+	// A prior interrupted init may have left HEAD but not the directories
+	// Git requires. Re-init that partial tree without discarding its contents.
+	needsInit := false
+	for _, name := range []string{"HEAD", "objects", "refs"} {
+		fi, err := os.Stat(filepath.Join(path, name))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", err
 		}
+		if err != nil || (name != "HEAD" && !fi.IsDir()) {
+			needsInit = true
+		}
+	}
+	// A canceled Git child can leave HEAD before init finishes, or leave
+	// HEAD.lock/config.lock. After runGitCtx reaps it, remove only our new
+	// regular files under the hydrate lock. Never remove preexisting state.
+	initialized := false
+	var cleanup [3]string
+	for i, name := range []string{"HEAD", "HEAD.lock", "config.lock"} {
+		if name != "config.lock" && !needsInit {
+			continue
+		}
+		file := filepath.Join(path, name)
+		if _, err := os.Lstat(file); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		cleanup[i] = file
+	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for _, file := range cleanup {
+			if file == "" || (initialized && filepath.Base(file) == "HEAD") {
+				continue
+			}
+			fi, err := os.Lstat(file)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err == nil {
+				if fi.Mode().IsRegular() {
+					err = os.Remove(file)
+				} else {
+					err = errors.New("not a regular file")
+				}
+			}
+			if err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("clean interrupted cache initialization %s: %w", file, err))
+			}
+		}
+	}()
+	if needsInit {
 		if _, err := runGitCtx(ctx, "", "init", "--bare", "--initial-branch=main", path); err != nil {
 			return "", err
 		}
 	}
+	initialized = true
 	// Read-check first: config writes take config.lock, and concurrent
 	// hydrates of the same repo must not fail on lock contention in the
 	// steady-state already-configured case. On any verification failure —
@@ -3640,7 +3710,7 @@ func writeGenerationMarker(repoPath string, gen int64, head string) {
 // path must not serialize on an exclusive lock.
 func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string) (repoPath string, refsErr error, err error) {
 	headTarget := HeadTarget(defaultBranch)
-	repoPath, err = EnsureCacheRepo(cacheDir, repo)
+	repoPath, err = EnsureCacheRepoCtx(ctx, cacheDir, repo)
 	if err != nil {
 		return "", nil, err
 	}

@@ -25,7 +25,7 @@ services:
     # root user it replaced); unauthenticated requests get 403. Never
     # enable versioning or object-lock on data buckets (seaweedfs#8073
     # avoidance).
-    image: chrislusf/seaweedfs:4.45
+    image: chrislusf/seaweedfs:4.46
     command: server -s3 -dir=/data -ip.bind=0.0.0.0 -s3.config=/etc/seaweedfs/s3.json
     configs:
       - source: seaweedfs-s3

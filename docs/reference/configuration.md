@@ -79,6 +79,9 @@ Database URL for the ref authority (CAS) and metadata store.
 - **Legacy aliases** (scanned left to right, the first *set* name wins, even when empty): `SPIKE_PG_URL`, `PG_URL`.
 - **Default:** none. Startup fails unless set explicitly or derived from the data dir
   (`sqlite://<dir>/codestorage.db`).
+- In PostgreSQL URI query values, `+` is literal (encode spaces as `%20`), and
+  repeated parameters use the last value. Invalid percent escapes are rejected.
+  These parsing rules follow libpq as of pgx v5.11.
 - On Postgres, schema setup (including the durable [River](https://riverqueue.com) job
   tables) runs automatically at startup and is advisory-lock-serialized, so concurrently
   booting replicas are safe.
