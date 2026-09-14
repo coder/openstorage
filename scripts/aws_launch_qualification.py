@@ -281,16 +281,28 @@ class Runner:
         self.step("auth_denial")
         self.token = self.mint("repo:write,git:read,git:write")
         limited = self.mint("repo:write")
+        signed, signature = self.token.rsplit(".", 1)
+        signature = bytearray(base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4)))
+        require(signature, "invalid_minted_token")
+        # Alter signature bytes, not unused base64 padding bits; keep claims and scopes intact.
+        signature[0] ^= 1
+        forged = signed + "." + base64.urlsafe_b64encode(signature).decode().rstrip("=")
         self.gitpath = "/" + self.repo + ".git"
         for base in dict.fromkeys([public, self.writer, reader]):
-            for token, expected in ((None, 401), ("invalid", 401), (limited, 403)):
+            for token, expected in ((None, 401), ("invalid", 401), (forged, 401), (limited, 403)):
                 self.http(base, "/api/v1/repo", token, expected=expected)
                 self.http(base, self.gitpath + "/info/refs?service=git-upload-pack", token, expected=expected, git=True)
         self.passed()
         self.step("create_repo")
         self.result["cleanup"].update(status="unknown", reason="creation attempted; acknowledgment not yet verified")
         response = json.loads(self.http(self.writer, "/api/v1/repos", self.token, "POST", b'{"default_branch":"main"}'))
-        require(response.get("repo_name") == self.repo and isinstance(response.get("repo_id"), str) and response["repo_id"], "invalid_create_acknowledgment")
+        require(isinstance(response, dict) and response.get("repo_name") == self.repo
+                and isinstance(response.get("repo_id"), str) and re.fullmatch(r"repo_[0-9a-f]{12}", response["repo_id"]), "invalid_create_acknowledgment")
+        canonical_path = "/" + response["repo_id"] + ".git"
+        canonical_url = public + canonical_path
+        # An acknowledgment cannot add a new origin or credential path to the trust boundary.
+        require(response.get("http_url") == canonical_url, "invalid_create_url")
+        self.gitpath = canonical_path
         self.created = True
         self.passed()
         self.step("api_commit")
@@ -316,6 +328,8 @@ if sys.argv[1:] == ['get']:
 ''')
         (self.work / "credential").chmod(0o700)
         self.step("git_clone")
+        require(self.git("ls-remote", "--exit-code", canonical_url, "refs/heads/main").decode().strip()
+                == sha + "\trefs/heads/main", "canonical_git_mismatch")
         clone = self.work / "clone"
         self.git("clone", reader + self.gitpath, str(clone))
         require(self.git("rev-parse", "HEAD", cwd=clone).decode().strip() == sha and (clone / "hello.txt").read_bytes() == initial, "clone_mismatch")
@@ -395,6 +409,12 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
     with tempfile.TemporaryDirectory(prefix="q222-") as work:
         runner = Runner(result, work, budget if type(budget) is int else 0)
         old_alarm = old_term = None
+        cleanup_interrupted = False
+        def defer_cleanup_interrupt(_signum, _frame):
+            nonlocal cleanup_interrupted
+            cleanup_interrupted = True
+            result["status"] = "failed"
+            runner.log.append("cleanup: interrupted")
         try:
             require(type(budget) is int and 1 <= budget <= 900, "invalid_budget")
             require(os.name == "posix", "posix_required")
@@ -413,6 +433,9 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
             runner.log.append(runner.active + ": " + reason)
         finally:
             try:
+                # Defer cancellation, not the alarm: cleanup retains its 45-second bound.
+                if old_term is not None:
+                    signal.signal(signal.SIGTERM, defer_cleanup_interrupt)
                 if old_alarm is not None:
                     signal.setitimer(signal.ITIMER_REAL, 45)
                 runner.cleanup()
@@ -421,6 +444,8 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
                 result["scenarios"]["cleanup"].update(status="failed", reason="cleanup_failed_or_interrupted")
                 runner.log.append("cleanup: failed")
             finally:
+                if cleanup_interrupted and result["scenarios"]["cleanup"]["status"] == "passed":
+                    result["scenarios"]["cleanup"].update(status="failed", reason="interrupted")
                 if old_alarm is not None:
                     signal.setitimer(signal.ITIMER_REAL, 0)
                     signal.signal(signal.SIGALRM, old_alarm)

@@ -1,5 +1,7 @@
 """Offline regression coverage for the opt-in qualification runner."""
+import base64
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import aws_launch_qualification as q
 
 
 COMMIT = "a" * 40
+REPO_ID = "repo_0123456789ab"
 SECRET = "DO_NOT_LEAK_QUALIFICATION_SECRET"
 
 
@@ -156,7 +159,8 @@ class RunnerTests(unittest.TestCase):
     def fake_http(self, runner, base, path, token=None, method="GET", data=None, expected=200, git=False):
         if path == "/api/v1/repos" and method == "POST":
             self.assertEqual(json.loads(data), {"default_branch": "main"})
-            return json.dumps({"repo_name": runner.repo, "repo_id": "generated-id"}).encode()
+            return json.dumps({"repo_name": runner.repo, "repo_id": REPO_ID,
+                               "http_url": runner.config["endpoint"] + "/" + REPO_ID + ".git"}).encode()
         if path.endswith("commit-pack"):
             self.assertEqual(json.loads(data.splitlines()[0])["metadata"]["target_branch"], "main")
             return json.dumps({"commit": {"commit_sha": COMMIT}, "result": {"success": True, "new_sha": COMMIT}}).encode()
@@ -175,6 +179,8 @@ class RunnerTests(unittest.TestCase):
             else:
                 for name in ("hello.txt", "payload.bin"):
                     (clone / name).write_bytes((clone.parent / "clone" / name).read_bytes())
+        if "ls-remote" in argv:
+            return (COMMIT + "\trefs/heads/main\n").encode()
         if "show" in argv:
             payload = (Path(cwd) / "payload.bin").read_bytes()
             return f"version https://git-lfs.github.com/spec/v1\noid sha256:{hashlib.sha256(payload).hexdigest()}\nsize {len(payload)}\n".encode()
@@ -221,6 +227,67 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(self.result()["cleanup"]["status"], "unknown")
             self.assertFalse(any(call.args[2] == "/api/v1/repos/delete" for call in calls))
 
+    def test_create_identity_and_url_must_match_canonical_contract(self):
+        canonical = self.config["endpoint"] + "/" + REPO_ID + ".git"
+        invalid = [
+            None, {"repo_name": "another-repo"}, {"repo_id": None}, {"repo_id": "generated-id"},
+            {"repo_id": "repo_0123456789AB"}, {"repo_id": "repo_0123456789abc"},
+            {"repo_id": "../" + REPO_ID}, {"http_url": None}, {"http_url": ""},
+            {"http_url": "https://untrusted.test/" + REPO_ID + ".git"},
+            {"http_url": canonical.replace(REPO_ID, "repo_abcdef012345")},
+            {"http_url": canonical + "?token=" + SECRET}, {"http_url": canonical + "#fragment"},
+            {"http_url": canonical.replace("127.0.0.1", "user@127.0.0.1")},
+            {"http_url": canonical.replace("repo_", "%72epo_")},
+        ]
+        for index, change in enumerate(invalid):
+            with self.subTest(change=change):
+                self.output = self.root / str(index)
+                def http(runner, base, path, *args, **kwargs):
+                    body = self.fake_http(runner, base, path, *args, **kwargs)
+                    if path == "/api/v1/repos":
+                        acknowledgment = json.loads(body)
+                        if change is None:
+                            acknowledgment.pop("http_url")
+                        else:
+                            acknowledgment.update(change)
+                        body = json.dumps(acknowledgment).encode()
+                    return body
+                code, calls, commands = self.smoke_with(http)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.result()["cleanup"]["status"], "unknown")
+                self.assertEqual(next(case for case in self.result()["scenarios"] if case["id"] == "create_repo")["status"], "failed")
+                self.assertFalse(any(call.args[0][0] == "git" for call in commands))
+                self.assertFalse(any(call.args[2] == "/api/v1/repos/delete" for call in calls))
+                self.assertTrue(all(call.args[1] == self.config["endpoint"] for call in calls))
+                self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
+
+    def test_smoke_uses_canonical_git_url_and_direct_replica_paths(self):
+        baseline = self.config.copy()
+        for topology in ("local", "pg-s3"):
+            with self.subTest(topology=topology):
+                self.config = baseline.copy()
+                self.output = self.root / topology
+                if topology == "pg-s3":
+                    self.config.update(topology=topology, endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
+                code, calls, commands = self.smoke_with()
+                self.assertEqual(code, 0)
+                public = self.config["endpoint"]
+                writer, reader = self.config["replica_urls"] or (public, public)
+                path = "/" + REPO_ID + ".git"
+                argv = [call.args[0] for call in commands]
+                advertised = [args[-2] for args in argv if "ls-remote" in args]
+                self.assertEqual(advertised, [public + path])
+                self.assertEqual([args[-2] for args in argv if "clone" in args], [reader + path, reader + path])
+                self.assertEqual([args[-1] for args in argv if "set-url" in args], [writer + path])
+                for args in argv:
+                    for arg in args:
+                        if arg.startswith(("https://", "http://")):
+                            self.assertIn(arg, {base + path for base in (public, writer, reader)})
+                    if args[0] == "git":
+                        self.assertIn("http.followRedirects=false", args)
+                cleanup_paths = [call.args[2] for call in calls if call.kwargs.get("expected") == 404 and call.kwargs.get("git")]
+                self.assertEqual(cleanup_paths, [path + "/info/refs?service=git-upload-pack"] * (3 if topology == "pg-s3" else 1))
+
     def test_minted_tokens_outlive_maximum_run_and_cleanup(self):
         code, _, commands = self.smoke_with()
         self.assertEqual(code, 0)
@@ -230,6 +297,60 @@ class RunnerTests(unittest.TestCase):
             ttl = argv[argv.index("--ttl") + 1]
             self.assertRegex(ttl, r"^[0-9]+m$")
             self.assertGreater(int(ttl[:-1]) * 60, 900 + 45)
+
+    def test_auth_denials_detect_forged_signature_acceptance_on_api_and_git(self):
+        self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
+        # A local HMAC fixture provides an independent signature oracle, not a deployment auth test.
+        key = b"offline qualification signature fixture"
+        def encode(data):
+            return base64.urlsafe_b64encode(data).decode().rstrip("=")
+        def decode(data):
+            return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+        def command(argv, **kwargs):
+            if "mint" in argv:
+                claims = {"iss": "test-org", "repo": argv[argv.index("--repo") + 1],
+                          "scopes": argv[argv.index("--scopes") + 1].split(",")}
+                message = encode(b'{"alg":"HS256","typ":"JWT"}') + "." + encode(json.dumps(claims).encode())
+                return (message + "." + encode(hmac.digest(key, message.encode(), "sha256"))).encode()
+            return self.fake_command(argv, **kwargs)
+        for accepts_forged in (None, "api", "git"):
+            with self.subTest(accepts_forged=accepts_forged):
+                self.output = self.root / str(accepts_forged)
+                forged_calls = []
+                def http(runner, base, path, token=None, method="GET", data=None, expected=200, git=False):
+                    if runner.active == "auth_denial" and token not in (None, "invalid"):
+                        header, payload, signature = token.split(".")
+                        authentic = hmac.digest(key, (header + "." + payload).encode(), "sha256")
+                        if not hmac.compare_digest(decode(signature), authentic):
+                            self.assertEqual((header, payload), tuple(runner.token.split(".")[:2]))
+                            self.assertEqual(json.loads(decode(header))["alg"], "HS256")
+                            self.assertEqual(json.loads(decode(payload))["scopes"], ["repo:write", "git:read", "git:write"])
+                            self.assertEqual(len(decode(signature)), len(authentic))
+                            interface = "git" if git else "api"
+                            forged_calls.append((base, interface, expected))
+                            q.require((200 if accepts_forged == interface else 401) == expected, "unexpected_http_status")
+                    return self.fake_http(runner, base, path, token, method, data, expected, git)
+                with patch.object(q.Runner, "http", autospec=True, side_effect=http) as requests, \
+                        patch.object(q.Runner, "command", side_effect=command), patch.object(q.shutil, "which", return_value="/bin/fake"):
+                    code = self.invoke(smoke=True)
+                if accepts_forged is None:
+                    self.assertEqual(code, 0)
+                    self.assertEqual(forged_calls, [(base, interface, 401) for base in
+                                     ("https://public.test", "https://one.test", "https://two.test") for interface in ("api", "git")])
+                    for token in (None, "invalid"):
+                        self.assertEqual(sum(call.args[3] == token and call.kwargs.get("expected") == 401 for call in requests.call_args_list if len(call.args) > 3), 6)
+                    self.assertEqual(sum(call.kwargs.get("expected") == 403 for call in requests.call_args_list), 6)
+                else:
+                    self.assertEqual(code, 1)
+                    self.assertEqual(forged_calls[-1][1:], (accepts_forged, 401))
+                    case = next(case for case in self.result()["scenarios"] if case["id"] == "auth_denial")
+                    self.assertEqual((case["status"], case["reason"]), ("failed", "unexpected_http_status"))
+                    self.assertEqual(self.result()["cleanup"]["status"], "not_needed")
+                    self.assertFalse(any(call.args[2] == "/api/v1/repos" for call in requests.call_args_list))
+                for call in requests.call_args_list:
+                    if len(call.args) > 3 and isinstance(call.args[3], str) and call.args[3].count(".") == 2:
+                        for file in self.output.iterdir():
+                            self.assertNotIn(call.args[3], file.read_text())
 
     def test_cleanup_failure_fails_otherwise_successful_smoke(self):
         def http(runner, base, path, *args, **kwargs):
@@ -291,6 +412,61 @@ sys.exit(code)
         cases = {case["id"]: case for case in result["scenarios"]}
         self.assertEqual(cases["api_commit"]["reason"], "interrupted")
         self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
+
+    def test_sigterm_during_cleanup_finishes_delete_and_replica_verification(self):
+        self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
+        expected = [("https://one.test", "DELETE", False)] + [
+            (base, "GET", git) for base in ("https://public.test", "https://one.test", "https://two.test") for git in (False, True)
+        ]
+        for interrupt_at in range(len(expected)):
+            with self.subTest(interrupt_at=interrupt_at):
+                self.output = self.root / str(interrupt_at)
+                completed = []
+                previous = [q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGALRM)]
+                def http(runner, base, path, token=None, method="GET", data=None, **kwargs):
+                    if runner.active == "cleanup":
+                        if len(completed) == interrupt_at:
+                            os.kill(os.getpid(), q.signal.SIGTERM)
+                        completed.append((base, method, kwargs.get("git", False)))
+                    return self.fake_http(runner, base, path, token, method, data, **kwargs)
+                with patch.object(q.signal, "setitimer", wraps=q.signal.setitimer) as timer:
+                    code, _, _ = self.smoke_with(http)
+                self.assertEqual(code, 1)
+                self.assertEqual(next(case for case in self.result()["scenarios"] if case["id"] == "lfs_roundtrip")["status"], "passed")
+                self.assertEqual(completed, expected)
+                self.assertEqual(self.result()["cleanup"]["status"], "soft_deleted")
+                case = next(case for case in self.result()["scenarios"] if case["id"] == "cleanup")
+                self.assertEqual((case["status"], case["reason"]), ("failed", "interrupted"))
+                self.assertEqual([call.args for call in timer.call_args_list], [
+                    (q.signal.ITIMER_REAL, 300), (q.signal.ITIMER_REAL, 45), (q.signal.ITIMER_REAL, 0),
+                ])
+                self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGALRM)], previous)
+                self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
+
+    def test_sigterm_during_cleanup_preserves_failures_and_alarm_deadline(self):
+        for failure in ("http", "alarm"):
+            with self.subTest(failure=failure):
+                self.output = self.root / failure
+                after_signal = []
+                previous = [q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGALRM)]
+                def http(runner, base, path, *args, **kwargs):
+                    if path == "/api/v1/repos/delete":
+                        os.kill(os.getpid(), q.signal.SIGTERM)
+                        after_signal.append(True)
+                        if failure == "alarm":
+                            os.kill(os.getpid(), q.signal.SIGALRM)
+                            after_signal.append(False)  # The active cleanup alarm must interrupt here.
+                        raise OSError(SECRET)
+                    return self.fake_http(runner, base, path, *args, **kwargs)
+                code, calls, _ = self.smoke_with(http)
+                self.assertEqual(code, 1)
+                self.assertEqual(after_signal, [True])
+                self.assertEqual(self.result()["cleanup"]["status"], "unknown")
+                case = next(case for case in self.result()["scenarios"] if case["id"] == "cleanup")
+                self.assertEqual((case["status"], case["reason"]), ("failed", "cleanup_failed_or_interrupted"))
+                self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGALRM)], previous)
+                self.assertFalse(any(call.kwargs.get("expected") == 404 for call in calls))
+                self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
 
     def test_subprocess_timeout_kills_owned_process_and_sanitizes(self):
         with tempfile.TemporaryDirectory() as work:
@@ -433,11 +609,16 @@ sys.exit(code)
                 self.assertEqual(stat.S_IMODE(helper.stat().st_mode), 0o700)
                 self.assertEqual(stat.S_IMODE((work / "credentials.json").stat().st_mode), 0o600)
                 url = q.urllib.parse.urlsplit(argv[-2])
+                self.assertEqual(url.path, "/" + REPO_ID + ".git")
                 fields = f"protocol={url.scheme}\nhost={url.netloc}\npath={url.path[1:]}\n\n"
-                accepted = subprocess.run([str(helper), "get"], input=fields, text=True, capture_output=True, timeout=3, check=True)
-                self.assertEqual(accepted.stdout, "username=t\npassword=aaa.bbb.ccc\n")
-                denied = subprocess.run([str(helper), "get"], input=fields.replace(url.netloc, "untrusted.test"), text=True, capture_output=True, timeout=3, check=True)
-                self.assertEqual(denied.stdout, "")
+                for accepted_fields in (fields, fields.replace(url.path[1:], url.path[1:] + "/info/lfs")):
+                    accepted = subprocess.run([str(helper), "get"], input=accepted_fields, text=True, capture_output=True, timeout=3, check=True)
+                    self.assertEqual(accepted.stdout, "username=t\npassword=aaa.bbb.ccc\n")
+                for denied_fields in (fields.replace(url.netloc, "untrusted.test"),
+                                      fields.replace(url.path[1:], "another-repo.git"),
+                                      fields.replace(url.path[1:], url.path[1:] + "-other")):
+                    denied = subprocess.run([str(helper), "get"], input=denied_fields, text=True, capture_output=True, timeout=3, check=True)
+                    self.assertEqual(denied.stdout, "")
             return self.fake_command(argv, **kwargs)
         with patch.object(q.Runner, "http", autospec=True, side_effect=self.fake_http), patch.object(q.Runner, "command", side_effect=command), patch.object(q.shutil, "which", return_value="/bin/fake"):
             self.assertEqual(self.invoke(smoke=True), 0)
