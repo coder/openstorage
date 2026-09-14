@@ -306,7 +306,7 @@ func cacheRepoUnchanged(repoPath string, m cacheRepoMemo) bool {
 // git subprocesses (init, config): the repack fold's materialization runs the
 // setup under the fold's wall-clock budget, and a stalled subprocess or
 // filesystem must not outlive it.
-func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, error) {
+func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath string, retErr error) {
 	// Before memoization every call reached runGitCtx and propagated an
 	// expired context via its first subprocess; the memo hit must honor
 	// the same contract — the repack materializer runs this under its
@@ -344,11 +344,58 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 		// full verify/repair pass below, which re-memoizes on success.
 		cacheRepoMemos.Delete(path)
 	}
-	if _, err := os.Stat(filepath.Join(path, "HEAD")); err != nil {
+	// A prior interrupted init may have left HEAD but not the directories
+	// Git requires. Re-init that partial tree without discarding its contents.
+	needsInit := false
+	for _, name := range []string{"HEAD", "objects", "refs"} {
+		fi, err := os.Stat(filepath.Join(path, name))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		if err != nil || (name != "HEAD" && !fi.IsDir()) {
+			needsInit = true
+		}
+	}
+	// A canceled Git child can leave HEAD before init finishes, or leave
+	// HEAD.lock/config.lock. After runGitCtx reaps it, remove only our new
+	// regular files under the hydrate lock. Never remove preexisting state.
+	initialized := false
+	for _, name := range []string{"HEAD", "HEAD.lock", "config.lock"} {
+		if name != "config.lock" && !needsInit {
+			continue
+		}
+		file := filepath.Join(path, name)
+		if _, err := os.Lstat(file); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		defer func() {
+			if retErr == nil || (name == "HEAD" && initialized) {
+				return
+			}
+			fi, err := os.Lstat(file)
+			if errors.Is(err, os.ErrNotExist) {
+				return
+			}
+			if err == nil {
+				if fi.Mode().IsRegular() {
+					err = os.Remove(file)
+				} else {
+					err = errors.New("not a regular file")
+				}
+			}
+			if err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("clean interrupted cache initialization %s: %w", file, err))
+			}
+		}()
+	}
+	if needsInit {
 		if _, err := runGitCtx(ctx, "", "init", "--bare", "--initial-branch=main", path); err != nil {
 			return "", err
 		}
 	}
+	initialized = true
 	// Read-check first: config writes take config.lock, and concurrent
 	// hydrates of the same repo must not fail on lock contention in the
 	// steady-state already-configured case. On any verification failure —
