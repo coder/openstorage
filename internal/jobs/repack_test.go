@@ -1585,7 +1585,8 @@ func TestRepackTrigger_Threshold(t *testing.T) {
 // block later triggers. The repacker itself still folds the sqlite+fileblob
 // fixture — the queue backend and the pack stores are independent seams.
 func TestRiver_RepackUniqueByRepo(t *testing.T) {
-	ctx := context.Background()
+	// Keep the consumer alive for the whole test; observer waits have their own budget.
+	ctx := t.Context()
 	pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
 		tcpostgres.WithDatabase("postgres"),
 		tcpostgres.WithUsername("postgres"),
@@ -1602,20 +1603,15 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	}
 
 	f := newRepackFixture(t)
-	for range 3 {
-		f.push(t)
-	}
 	gate := make(chan struct{})
-	released := false
-	release := func() {
-		if !released {
-			released = true
-			close(gate)
-		}
-	}
-	defer release()
+	raceWindow := make(chan struct{})
+	release := stdsync.OnceFunc(func() { close(gate) })
 	r := f.repacker(t.TempDir())
-	r.BeforeSwap = func(context.Context, ref.Pack) error { <-gate; return nil }
+	firstFold := stdsync.OnceFunc(func() {
+		close(raceWindow)
+		<-gate
+	})
+	r.BeforeSwap = func(context.Context, ref.Pack) error { firstFold(); return nil }
 	r.FollowUpThreshold = 2 // successor gate: mid-run rows demand a follow-up
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
@@ -1624,7 +1620,11 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
-	defer q.Close()
+	defer func() {
+		release()
+		q.Close()
+	}()
+	trigger := NewRepackTrigger(f.store, 2, q.EnqueueRepack, slog.New(slog.DiscardHandler))
 
 	pool, err := pgxpool.New(ctx, pgURL)
 	if err != nil {
@@ -1639,10 +1639,18 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 		return n
 	}
 
-	// First trigger inserts the job; wait until a worker is RUNNING it
-	// (parked at the BeforeSwap gate).
-	if err := q.EnqueueRepack(ctx, f.repo); err != nil {
-		t.Fatalf("enqueue repack: %v", err)
+	// The production trigger declines below threshold, then starts the fold.
+	f.push(t)
+	trigger.MaybeEnqueue(ctx, f.repo)
+	if n := countJobs(); n != 0 {
+		t.Fatalf("river holds %d repack jobs below threshold, want 0", n)
+	}
+	f.push(t)
+	trigger.MaybeEnqueue(ctx, f.repo)
+	select {
+	case <-raceWindow:
+	case <-time.After(60 * time.Second):
+		t.Fatal("repack never reached the post-snapshot, pre-swap window")
 	}
 	waitJobs := func(query string, want int, what string) {
 		t.Helper()
@@ -1668,12 +1676,9 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	// packs registered mid-fold survive the fold's snapshot; the WORKER
 	// owns folding them via the successor inserted atomically with its
 	// completion.
-	f.push(t)
-	f.push(t)
-	for range 3 {
-		if err := q.EnqueueRepack(ctx, f.repo); err != nil {
-			t.Fatalf("enqueue repack mid-run: %v", err)
-		}
+	for range 2 {
+		f.push(t)
+		trigger.MaybeEnqueue(ctx, f.repo)
 	}
 	if n := countJobs(); n != 1 {
 		t.Fatalf("river holds %d repack jobs while one is running, want 1 (unique)", n)
@@ -1689,6 +1694,8 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	if n := countJobs(); n != 2 {
 		t.Fatalf("river holds %d repack jobs after the chain, want 2 (below-threshold successor must not chain)", n)
 	}
+	waitJobs(`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state IN ('available', 'pending', 'retryable', 'running', 'scheduled')`, 0, "active repack jobs")
+	waitJobs(`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state != 'completed'`, 0, "non-completed repack jobs")
 	if rows := f.packRows(t); len(rows) != 1 {
 		t.Fatalf("pack rows after follow-up fold = %+v, want 1 (mid-run rows not refolded)", rows)
 	}
