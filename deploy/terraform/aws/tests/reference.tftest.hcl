@@ -60,6 +60,10 @@ run "secure_default" {
     error_message = "Database must be encrypted/private and use an AWS-managed password, not state-stored credentials."
   }
   assert {
+    condition     = aws_db_instance.this.allocated_storage == 20 && aws_db_instance.this.max_allocated_storage == null
+    error_message = "The evaluation database must remain fixed at 20 GiB with storage autoscaling disabled."
+  }
+  assert {
     condition     = aws_db_instance.this.deletion_protection && !aws_s3_bucket.data.force_destroy && aws_instance.server.root_block_device[0].encrypted
     error_message = "Default persistent data destruction must be blocked and local disk encrypted."
   }

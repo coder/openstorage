@@ -75,7 +75,6 @@ resource "aws_db_instance" "this" {
   engine_version               = "17"
   instance_class               = "db.t4g.micro"
   allocated_storage            = 20
-  max_allocated_storage        = 20
   storage_type                 = "gp3"
   storage_encrypted            = true
   db_name                      = "openstorage"
