@@ -1,6 +1,7 @@
 package githttp
 
 import (
+	"context"
 	"net/http/cgi"
 	"net/http/httptest"
 	"net/url"
@@ -31,7 +32,9 @@ func localSchedulingStorage(t *testing.T) (string, string) {
 	}
 	// Own the container as well as the bucket: TestMain reserves volume slots
 	// for its shared bucket and the backup drill, not an additional collection.
-	addr, terminate := startSeaweedFS(t.Context())
+	// The helper's terminator retains this context; it must outlive t.Context's
+	// cancellation before cleanup, or termination silently relies on Ryuk.
+	addr, terminate := startSeaweedFS(context.WithoutCancel(t.Context()))
 	t.Cleanup(terminate)
 	for _, u := range []*url.URL{db, blobs} {
 		u.Host = "local-hook-forwarding"
