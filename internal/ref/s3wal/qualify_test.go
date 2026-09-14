@@ -817,7 +817,7 @@ func TestQualifySeaweedFS(t *testing.T) {
 	endpoint := startSeaweedFS(t)
 	raw := rawS3Client(t, endpoint, "us-east-1", "seaweedfs", "seaweedfs")
 	ensureBucket(t, raw, "s3wal-qualify")
-	e := newQualEnv(t, "seaweedfs-4.45", raw, "s3wal-qualify", "", s3wal.ProbeKey)
+	e := newQualEnv(t, "seaweedfs-4.46", raw, "s3wal-qualify", "", s3wal.ProbeKey)
 	runQualification(t, e, true)
 }
 
