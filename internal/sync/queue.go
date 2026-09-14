@@ -18,13 +18,14 @@ import (
 // (foundation-slice ADR); the Postgres deployment substitutes the durable
 // jobs seam.
 type InProcessQueue struct {
-	run     func(ctx context.Context, job Job) error
-	runPush func(ctx context.Context, job Job) error
-	logger  *slog.Logger
-	mu      stdsync.Mutex
-	pending map[string]bool // lane-prefixed repoID -> queued (not yet running)
-	closed  bool
-	wg      stdsync.WaitGroup
+	run       func(ctx context.Context, job Job) error
+	runPush   func(ctx context.Context, job Job) error
+	logger    *slog.Logger
+	mu        stdsync.Mutex
+	pending   map[string]bool // lane-prefixed repoID -> queued (not yet running)
+	observers chan struct{}   // bounds live-consumer work, including queued observations
+	closed    bool
+	wg        stdsync.WaitGroup
 }
 
 var _ Queue = (*InProcessQueue)(nil)
@@ -36,7 +37,7 @@ func NewInProcessQueue(run, runPush func(ctx context.Context, job Job) error, lo
 	assertf(run != nil, "NewInProcessQueue: nil run func")
 	assertf(runPush != nil, "NewInProcessQueue: nil runPush func")
 	assertf(logger != nil, "NewInProcessQueue: nil logger")
-	return &InProcessQueue{run: run, runPush: runPush, logger: logger, pending: make(map[string]bool)}
+	return &InProcessQueue{run: run, runPush: runPush, logger: logger, pending: make(map[string]bool), observers: make(chan struct{}, 4)}
 }
 
 // EnqueueSync schedules one sync run. The run executes on its own goroutine
@@ -54,6 +55,16 @@ func (q *InProcessQueue) EnqueueSync(_ context.Context, job Job) error {
 // that must not lose the request mark it first (UpstreamStore.RequestPush).
 func (q *InProcessQueue) EnqueuePush(_ context.Context, job Job) error {
 	return q.enqueue("push:", q.runPush, "push run finished with error", job)
+}
+
+// ErrPendingQueueFull leaves durable intent for a later traversal, without
+// allocating a waiting goroutine. Explicit caller/retry enqueues are unchanged.
+var ErrPendingQueueFull = errors.New("local pending observation slots full")
+
+// EnqueuePendingSync observes durable pull intent; see EnqueuePendingPush.
+func (q *InProcessQueue) EnqueuePendingSync(ctx context.Context, job Job) error {
+	job.pendingOnly = true
+	return q.enqueue("observe-pull:", q.run, "pending pull observation failed", job)
 }
 
 // EnqueuePendingPush schedules an observation of durable pending work, not a
@@ -81,8 +92,18 @@ func (q *InProcessQueue) enqueue(lane string, run func(ctx context.Context, job 
 		}
 		return nil // coalesced with the queued run
 	}
+	if job.pendingOnly {
+		select {
+		case q.observers <- struct{}{}:
+		default:
+			return ErrPendingQueueFull
+		}
+	}
 	q.pending[key] = true
 	q.wg.Go(func() {
+		if job.pendingOnly {
+			defer func() { <-q.observers }()
+		}
 		q.mu.Lock()
 		delete(q.pending, key)
 		q.mu.Unlock()

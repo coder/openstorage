@@ -46,9 +46,43 @@ Full endpoint catalogs: [HTTP API](../reference/http-api.md) (REST),
 | Namespaces & forks | ✅ | `+ephemeral` / `+import` namespaces. Synchronous forks copy the full fork-point closure into the new repository (independent storage and [quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas), nothing shared with the source). Git-pushed and REST-written ephemeral state live in separate ref spaces ([deviation](#known-deviations-from-the-vendored-spec)) |
 | Git LFS | ✅ | Batch API on the same remote; presigned S3 downloads with a server-proxied fallback, verified server-proxied uploads ([below](#git-lfs-transfer-semantics)) |
 | Webhooks | ✅ | HMAC-signed `push` and `repo.sync.*` events, plus webhook CRUD |
-| Upstream sync & credentials | ✅ | `pull-upstream`, `push-upstream` (outbound forwarding: explicit trigger plus opt-in `base_repo.forward_pushes`; trigger semantics differ from upstream's implicit forwarding, see the [deviation](#known-deviations-from-the-vendored-spec)), detach base, git-credential CRUD. Non-Postgres gap (SQLite local mode and experimental s3wal mode): a *git-surface* push does not auto-schedule sync or forwarding, because the hook subprocess cannot reach the serve process's in-process queue. API writes and explicit `pull-upstream`/`push-upstream` triggers are unaffected |
+| Upstream sync & credentials | ✅ | `pull-upstream`, `push-upstream` (outbound forwarding: explicit trigger plus opt-in `base_repo.forward_pushes`; trigger semantics differ from upstream's implicit forwarding, see the [deviation](#known-deviations-from-the-vendored-spec)), detach base, git-credential CRUD. SQLite local mode and experimental s3wal also schedule from accepted *git-surface* updates via best-effort durable pending intent and a live local consumer ([guarantees and limits](#local-git-push-scheduling)) |
 | Throttled responses | ✅ | Every HTTP-level `429` (gateway [rate limiter](../reference/configuration.md#rate-limiting) and busy/backpressure paths) carries both upstream-documented headers: `Retry-After` (delay-seconds) and the IETF `RateLimit` service-limit field (`"default";r=0;t=<retry-after-secs>`); `Retry-After` takes precedence |
 | Auth model | ✅ | Customer-signed JWTs (`ES256`/`RS256`/`EdDSA`/`PS256`/`ES384`/`ES512`), scopes `git:read` / `git:write` / `repo:write` / `org:read` (exact matching — no scope implies another), `refs` policy tuples ([auth spec](../reference/authentication.md)) |
+
+### Local Git-push scheduling
+
+SQLite and experimental S3WAL hooks mark existing sync/forward intent **after a
+winning persistent ref update**. The serve process consumes pending markers while
+running, not only after restart. It waits 15 seconds at startup, then reads at most
+16 marked repository rows per one-second tick, with a ten-second scan context and
+at most four concurrent live-consumer observations. These bounds do not change
+existing explicit API/retry worker concurrency. S3WAL still reads its whole metadata
+document for each page; bounded results do not mean bounded document I/O. Hook
+scheduling also adds an upstream-link metadata lookup on the ordinary Git-push path,
+including when no link exists: a conditional read still costs an S3 round trip.
+
+Forwarding remains opt-in. It requires caller `git:read` and no ref-policy operation;
+missing/malformed scopes or policies fail closed. A denied forward creates neither
+forward intent nor an inbound-pull fallback over the accepted write. Sync workers'
+claim-tagged loopback pushes do not trigger another run. With forwarding disabled,
+a push pokes inbound sync only when no inbound run was observed in flight, as before.
+No-op or wholly rejected pushes create no intent. A partially accepted push, or a
+committed update followed by an HTTP error such as 413, can create intent: the
+accepted authority change, not the final response status, is the trigger.
+
+This is **best-effort post-commit scheduling**, not an atomic ref-and-intent write.
+A crash or metadata failure between ref CAS and the intent mark can lose the trigger;
+mark/queue failures are logged and do not roll back the accepted ref. Later scans can
+recover a successfully persisted pending marker, but cannot reconstruct a missing
+one. At startup, orphaned outbound claims are re-marked once before workers exist;
+live scans never turn an active claim without new pending intent into work. The
+existing retry/coalescing rules and force levels remain in effect. Local timer
+ownership prevents live observations from bypassing backoff or resetting its retry
+budget, but those timers and their elapsed delays do not survive process restart.
+Restart recovery covers the existing durable-pending contract, not retry timing.
+There is no exactly-once, at-least-once, or fixed completion-time guarantee. S3WAL
+remains experimental; this does not establish full upstream compatibility.
 
 ### Server-allocated branch contract
 
@@ -190,7 +224,7 @@ the [archived phase notes](../archive/phases/)):
 | `201` on write endpoints (spec) | `commit-pack` / `diff-commit` / `restore-commit` and `POST`/`DELETE .../notes` return `200` | Recorded deviation ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md)): the SDKs accept both; schema-validating clients should expect `200` |
 | Credential-create response includes a summary (`created_at`, …) | `POST .../git-credentials` returns only `{"id": …}` | Recorded deviation ([phase-7 notes](../archive/phases/16-phase7-implementation-notes.md)); fetch the summary via the credential list if needed |
 | One ephemeral namespace across git and REST | Two separate ref spaces: git push to `/{repo}+ephemeral.git` writes a distinct `+ephemeral` storage key; REST `ephemeral=true` reads/writes `refs/namespaces/ephemeral/…` under the base repository. Ephemeral state does not cross surfaces | Recorded cross-surface split ([phase-4 notes](../archive/phases/13-phase4-implementation-notes.md)): REST writes follow the REST read surface, so API-created ephemeral refs stay visible to `GET .../branches?ephemeral=true` and merge promotion |
-| Implicit push forwarding: in upstream's GitHub App mode every `git push` to the default remote is proxied straight to GitHub, always on, with no REST trigger ([integrations guide](../upstream/guides/integrations.md)) | Explicit `POST /repos/push-upstream` (non-force by default, `force: true` opt-in) plus an opt-in per-repo `base_repo.forward_pushes` flag (default **off**) that schedules a forward after every won local push and mirrors back on success. A rejected non-fast-forward fails the run with per-ref reasons instead of rewriting upstream history. Ref deletions are not propagated in either direction (the inbound mirror deliberately avoids `--mirror` for the same reason). With `forward_pushes` off, a local push still triggers the inbound mirror, which force-resets local refs to upstream state ("upstream wins") | Recorded deviation ([ADR-44](../adr/044-outbound-push-forwarding-rides-a-separate-push-claim-lane.md), issue #90): implicit always-on forwarding invites silent divergence and needs GitHub App infrastructure this backend does not have. The explicit trigger + opt-in flag keep the direction observable (`repo.sync.*` events with `direction: "push"`) and non-destructive by default |
+| Implicit push forwarding: in upstream's GitHub App mode every `git push` to the default remote is proxied straight to GitHub, always on, with no REST trigger ([integrations guide](../upstream/guides/integrations.md)) | Explicit `POST /repos/push-upstream` (non-force by default, `force: true` opt-in) plus an opt-in per-repo `base_repo.forward_pushes` flag (default **off**) that schedules a forward after an authorized won local push and mirrors back on success (best-effort [local-mode scheduling](#local-git-push-scheduling)). A rejected non-fast-forward fails the run with per-ref reasons instead of rewriting upstream history. Ref deletions are not propagated in either direction (the inbound mirror deliberately avoids `--mirror` for the same reason). With `forward_pushes` off, a local push still triggers the inbound mirror, which force-resets local refs to upstream state ("upstream wins") | Recorded deviation ([ADR-44](../adr/044-outbound-push-forwarding-rides-a-separate-push-claim-lane.md), issue #90): implicit always-on forwarding invites silent divergence and needs GitHub App infrastructure this backend does not have. The explicit trigger + opt-in flag keep the direction observable (`repo.sync.*` events with `direction: "push"`) and non-destructive by default |
 
 Extensions that upstream's spec does not list:
 

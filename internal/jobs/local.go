@@ -107,6 +107,17 @@ func (q *Local) EnqueuePush(ctx context.Context, job sync.Job) error {
 	return q.syncq.EnqueuePush(ctx, job)
 }
 
+// EnqueuePendingSync and EnqueuePendingPush observe existing durable intent.
+// These local-only entrypoints neither manufacture requests nor bypass retry
+// admission. The underlying queue bounds concurrent observations.
+func (q *Local) EnqueuePendingSync(ctx context.Context, job sync.Job) error {
+	return q.syncq.EnqueuePendingSync(ctx, job)
+}
+
+func (q *Local) EnqueuePendingPush(ctx context.Context, job sync.Job) error {
+	return q.syncq.EnqueuePendingPush(ctx, job)
+}
+
 // EnqueueRepack runs one fold attempt on a background goroutine with a
 // fresh context (it must outlive the HTTP request that triggered it). At
 // most one repack per repo is in flight; a trigger landing while one runs

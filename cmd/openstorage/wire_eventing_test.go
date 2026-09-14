@@ -34,8 +34,9 @@ func TestIsPGURLRoutesS3WALToLocalQueue(t *testing.T) {
 // panics so unexpected store traffic fails loudly.
 type forwardPokeStore struct {
 	failingStore
-	up    meta.RepoUpstream
-	marks []bool
+	up      meta.RepoUpstream
+	marks   []bool
+	markErr error
 }
 
 func (s *forwardPokeStore) GetRepoUpstream(context.Context, string) (meta.RepoUpstream, error) {
@@ -44,7 +45,7 @@ func (s *forwardPokeStore) GetRepoUpstream(context.Context, string) (meta.RepoUp
 
 func (s *forwardPokeStore) RequestPush(_ context.Context, _ string, force bool) error {
 	s.marks = append(s.marks, force)
-	return nil
+	return s.markErr
 }
 
 // TestEnqueueSyncOrForwardPolicedCallerGate: the forward reroute fails

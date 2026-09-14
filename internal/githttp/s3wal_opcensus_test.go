@@ -143,14 +143,17 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// Regression guard (issue #182): the per-shape budgets. Raising a
 	// bound requires justifying the new round trip against the census in
 	// that issue — on real S3 each one is user-visible push latency.
-	// 19 = ReservePackBytes reads fresh by design (s3walMutation.noSeed:
-	// its lapse-evidence write must never derive from a seed).
-	const steadyBudget = 19
+	// The previous steady-state ceiling of 19 includes ReservePackBytes
+	// reading fresh (s3walMutation.noSeed: lapse evidence cannot use a seed).
+	// Local post-CAS scheduling (#266) adds one hook:update metadata GET to
+	// check the upstream link, even when absent. It is a conditional GET
+	// after ListWebhooks, but still costs one S3 round trip. No slack added.
+	const steadyBudget = 20
 	if len(steady) > steadyBudget {
 		t.Errorf("steady-state push cost %d S3 round trips, budget is %d:\n%s",
 			len(steady), steadyBudget, censusTable(steady))
 	}
-	const deleteBudget = 9
+	const deleteBudget = 10
 	if len(deleteOnly) > deleteBudget {
 		t.Errorf("delete-only push cost %d S3 round trips, budget is %d:\n%s",
 			len(deleteOnly), deleteBudget, censusTable(deleteOnly))
