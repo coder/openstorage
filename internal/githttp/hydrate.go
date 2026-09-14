@@ -360,7 +360,8 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 	// HEAD.lock/config.lock. After runGitCtx reaps it, remove only our new
 	// regular files under the hydrate lock. Never remove preexisting state.
 	initialized := false
-	for _, name := range []string{"HEAD", "HEAD.lock", "config.lock"} {
+	var cleanup [3]string
+	for i, name := range []string{"HEAD", "HEAD.lock", "config.lock"} {
 		if name != "config.lock" && !needsInit {
 			continue
 		}
@@ -370,13 +371,19 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return "", err
 		}
-		defer func() {
-			if retErr == nil || (name == "HEAD" && initialized) {
-				return
+		cleanup[i] = file
+	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for _, file := range cleanup {
+			if file == "" || (initialized && filepath.Base(file) == "HEAD") {
+				continue
 			}
 			fi, err := os.Lstat(file)
 			if errors.Is(err, os.ErrNotExist) {
-				return
+				continue
 			}
 			if err == nil {
 				if fi.Mode().IsRegular() {
@@ -388,8 +395,8 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 			if err != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("clean interrupted cache initialization %s: %w", file, err))
 			}
-		}()
-	}
+		}
+	}()
 	if needsInit {
 		if _, err := runGitCtx(ctx, "", "init", "--bare", "--initial-branch=main", path); err != nil {
 			return "", err
