@@ -11,7 +11,8 @@ This guide covers what is *specific* to running a fleet: statelessness and local
 concurrent boot, health checks, rolling upgrades, proxying, and key rotation. Every
 variable it mentions is specified in the [configuration reference](../reference/configuration.md);
 values are only repeated here where the deployment context matters. For a disposable
-stack to try first, see the [Docker Compose how-to](deploy-docker-compose.md).
+stack to try first, see the [Docker Compose how-to](deploy-docker-compose.md). For an AWS
+evaluation deployment with infrastructure included, use the [Terraform EC2 reference](deploy-aws-terraform.md).
 
 ## Topology
 

@@ -1,0 +1,9 @@
+/.terraform/
+__pycache__/
+/*.tfstate*
+/*.tfplan
+/*.tfvars
+/*.tfvars.json
+/override.tf
+/override.tf.json
+/.terraform.tfstate.lock.info

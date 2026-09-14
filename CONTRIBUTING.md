@@ -15,7 +15,7 @@ depth, see the [testing reference](docs/reference/testing.md).
 | Docker | the default test lane boots real Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/); also the compose stack |
 | gpg / ssh-keygen | only for `verify-sig` ref-policy tests and manual dogfooding of signature verification |
 
-The Go and golangci-lint pins live in [`mise.toml`](mise.toml); with
+The Go, golangci-lint, and AWS-reference Terraform pins live in [`mise.toml`](mise.toml); with
 [mise](https://mise.jdx.dev/) installed, `mise install` fetches exactly the
 versions CI uses. Installing the same versions by hand works too.
 
