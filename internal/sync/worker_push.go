@@ -75,6 +75,11 @@ const defaultDetachPoll = 2 * time.Second
 func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	w.assertReady()
 	assertf(job.Org != "" && job.RepoID != "", "RunPush: incomplete job %+v", job)
+	finishLocal, admitted := w.startLocal(job, true)
+	if !admitted {
+		return nil
+	}
+	defer finishLocal()
 	timeout := w.Timeout
 	if timeout <= 0 {
 		timeout = defaultRunTimeout
@@ -92,8 +97,17 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	assertf(repo.RepoID == job.RepoID, "RepoLookup returned %q for %q", repo.RepoID, job.RepoID)
 
 	holder := newClaimHolder()
-	up, force, stolenFrom, err := w.Upstreams.BeginPush(ctx, job.RepoID, holder, claimLease(timeout))
+	var up Upstream
+	var force bool
+	var stolenFrom string
+	err = w.admitLocal(ctx, job, true, func() error {
+		var claimErr error
+		up, force, stolenFrom, claimErr = w.Upstreams.BeginPush(ctx, job.RepoID, holder, claimLease(timeout))
+		return claimErr
+	})
 	switch {
+	case errors.Is(err, errNoPending):
+		return nil // queued observation was covered before admission
 	case errors.Is(err, ErrNotFound):
 		return nil // detached before start: cancel silently
 	case errors.Is(err, ErrPushInProgress):
@@ -271,37 +285,11 @@ func (w *Worker) schedulePushRetry(ctx context.Context, job Job, force bool) {
 	if w.RequeuePush == nil {
 		return // river lane: the completion gate schedules the delayed successor
 	}
-	retry := job.Retry + 1
-	key := "push-retry:" + job.RepoID
-	w.deferMu.Lock()
-	if w.deferredRetry == nil {
-		w.deferredRetry = make(map[string]bool)
-	}
-	if w.deferredRetry[key] {
-		w.deferMu.Unlock()
-		return // one pending retry timer per repo; markers coalesce into it
-	}
-	w.deferredRetry[key] = true
-	w.deferMu.Unlock()
-
-	delay := PushRetryDelay(retry)
+	job.Retry++
+	delay := PushRetryDelay(job.Retry)
 	w.Logger.Warn("push-upstream unreachable; retrying with backoff",
-		"org", job.Org, "repo", job.RepoID, "retry", retry, "delay", delay)
-	time.AfterFunc(delay, func() {
-		w.deferMu.Lock()
-		delete(w.deferredRetry, key)
-		w.deferMu.Unlock()
-		bg, cancel := context.WithTimeout(context.Background(), detachedOpTimeout)
-		defer cancel()
-		cur, err := w.Upstreams.GetUpstream(bg, job.RepoID)
-		if err != nil || cur.PushPending == PushPendingNone {
-			return // covered meanwhile (or detached)
-		}
-		if rqErr := w.RequeuePush(bg, Job{Org: job.Org, RepoID: job.RepoID, Retry: retry}); rqErr != nil {
-			w.Logger.Warn("push retry requeue failed",
-				"org", job.Org, "repo", job.RepoID, "err", rqErr)
-		}
-	})
+		"org", job.Org, "repo", job.RepoID, "retry", job.Retry, "delay", delay)
+	w.scheduleLocalRetry("push-retry:"+job.RepoID, delay, job, true)
 }
 
 // deferPendingPushRetry mirrors deferPendingRetry for the outbound lane: a
@@ -318,34 +306,8 @@ func (w *Worker) deferPendingPushRetry(ctx context.Context, job Job) {
 	if err != nil || up.PushPending == PushPendingNone {
 		return // nothing promised (or detached): the skip is final
 	}
-	key := "push-defer:" + job.RepoID
-	w.deferMu.Lock()
-	if w.deferredRetry == nil {
-		w.deferredRetry = make(map[string]bool)
-	}
-	if w.deferredRetry[key] {
-		w.deferMu.Unlock()
-		return
-	}
-	w.deferredRetry[key] = true
-	w.deferMu.Unlock()
-
 	delay := max(time.Until(up.PushClaimExpiresAt)+deferRetrySlack, deferRetrySlack)
-	time.AfterFunc(delay, func() {
-		w.deferMu.Lock()
-		delete(w.deferredRetry, key)
-		w.deferMu.Unlock()
-		bg, cancel := context.WithTimeout(context.Background(), detachedOpTimeout)
-		defer cancel()
-		cur, err := w.Upstreams.GetUpstream(bg, job.RepoID)
-		if err != nil || cur.PushPending == PushPendingNone {
-			return // covered meanwhile (or detached)
-		}
-		if rqErr := w.RequeuePush(bg, Job{Org: job.Org, RepoID: job.RepoID}); rqErr != nil {
-			w.Logger.Warn("deferred pending push requeue failed",
-				"org", job.Org, "repo", job.RepoID, "err", rqErr)
-		}
-	})
+	w.scheduleLocalRetry("push-defer:"+job.RepoID, delay, job, true)
 }
 
 // finishPush completes the claimed outbound run on a detached context with

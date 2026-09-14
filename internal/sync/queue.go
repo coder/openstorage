@@ -56,6 +56,15 @@ func (q *InProcessQueue) EnqueuePush(_ context.Context, job Job) error {
 	return q.enqueue("push:", q.runPush, "push run finished with error", job)
 }
 
+// EnqueuePendingPush schedules an observation of durable pending work, not a
+// fresh caller request. The worker revalidates it at admission. A separate
+// coalescing key prevents an observation from swallowing an explicit request
+// or a retry carrying its existing backoff count.
+func (q *InProcessQueue) EnqueuePendingPush(ctx context.Context, job Job) error {
+	job.pendingOnly = true
+	return q.enqueue("observe-push:", q.runPush, "pending push observation failed", job)
+}
+
 func (q *InProcessQueue) enqueue(lane string, run func(ctx context.Context, job Job) error, failMsg string, job Job) error {
 	assertf(job.Org != "" && job.RepoID != "", "enqueue: incomplete job %+v", job)
 	key := lane + job.RepoID
@@ -65,6 +74,11 @@ func (q *InProcessQueue) enqueue(lane string, run func(ctx context.Context, job 
 		return errors.New("sync queue is closed")
 	}
 	if q.pending[key] {
+		// The queued caller covers this retry. There will be no successor
+		// carrying its reservation into the worker, so release it here.
+		if job.retryOwner != nil {
+			job.retryOwner.forgetLocalRetry(job.retryKey, job.retryTimer)
+		}
 		return nil // coalesced with the queued run
 	}
 	q.pending[key] = true

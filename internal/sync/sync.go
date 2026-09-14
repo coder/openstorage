@@ -271,7 +271,12 @@ type Job struct {
 	Org    string // org name (JWT iss)
 	RepoID string
 	Ref    string
-	Retry  int
+	// pendingOnly is an in-process observation, never a persisted job field.
+	pendingOnly bool
+	retryKey    string
+	retryTimer  *time.Timer
+	retryOwner  *Worker
+	Retry       int
 }
 
 // Queue schedules sync runs. The Postgres deployment backs this with the

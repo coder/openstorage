@@ -139,7 +139,10 @@ type Worker struct {
 	// timer per repository (issue #86 — request volume against a dead
 	// holder's unexpired lease must not accumulate timers).
 	deferMu       stdsync.Mutex
-	deferredRetry map[string]bool
+	deferredRetry map[string]*time.Timer
+	localActive   map[string]int
+	localClosed   bool
+	localTimers   stdsync.WaitGroup
 
 	// Requeue, when non-nil, schedules a follow-up run when FinishSync
 	// reports sync requests that arrived after this run's claim
@@ -222,6 +225,155 @@ func (w *Worker) assertReady() {
 	assertf(w.Logger != nil, "Worker.Logger is required")
 }
 
+// Local observations are not new caller requests. Track the entire local run,
+// including FinishPush -> durable retry mark -> timer registration, so a poll
+// cannot consume retry intent in that handoff. Explicit callers still enter
+// the existing claim path, including during backoff.
+func (w *Worker) startLocal(job Job, push bool) (func(), bool) {
+	if (!push && w.Requeue == nil) || (push && w.RequeuePush == nil) {
+		assertf(!job.pendingOnly, "pending observation requires a local queue")
+		return func() {}, true
+	}
+	lane := "pull:" + job.RepoID
+	if push {
+		lane = "push:" + job.RepoID
+	}
+	w.deferMu.Lock()
+	defer w.deferMu.Unlock()
+	if w.localClosed || (job.pendingOnly && (w.localActive[lane] > 0 || w.localRetryPending(job.RepoID, push))) {
+		return nil, false
+	}
+	if job.retryTimer != nil && w.deferredRetry[job.retryKey] == job.retryTimer {
+		delete(w.deferredRetry, job.retryKey)
+	}
+	if w.localActive == nil {
+		w.localActive = make(map[string]int)
+	}
+	w.localActive[lane]++
+	return func() {
+		w.deferMu.Lock()
+		defer w.deferMu.Unlock()
+		assertf(w.localActive[lane] > 0, "unbalanced local run for %q", lane)
+		w.localActive[lane]--
+		if w.localActive[lane] == 0 {
+			delete(w.localActive, lane)
+		}
+	}, true
+}
+
+// localRetryPending is called with deferMu held. Timer reservations remain
+// present through enqueue until the successor actually enters startLocal.
+func (w *Worker) localRetryPending(repoID string, push bool) bool {
+	if push {
+		return w.deferredRetry["push-retry:"+repoID] != nil || w.deferredRetry["push-defer:"+repoID] != nil
+	}
+	return w.deferredRetry[repoID] != nil
+}
+
+var errNoPending = errors.New("pending observation already covered")
+
+// admitLocal serializes the observation's current marker check with ordinary
+// local claims. The durable Begin methods and their claim protocol are unchanged.
+// No lock is held across a Git transfer or worker completion callback.
+func (w *Worker) admitLocal(ctx context.Context, job Job, push bool, claim func() error) error {
+	if (!push && w.Requeue == nil) || (push && w.RequeuePush == nil) {
+		return claim()
+	}
+	w.deferMu.Lock()
+	defer w.deferMu.Unlock()
+	if job.pendingOnly {
+		lane := "pull:" + job.RepoID
+		if push {
+			lane = "push:" + job.RepoID
+		}
+		if w.localActive[lane] != 1 || w.localRetryPending(job.RepoID, push) {
+			return errNoPending
+		}
+		up, err := w.Upstreams.GetUpstream(ctx, job.RepoID)
+		if err != nil {
+			return err
+		}
+		if (push && up.PushPending == PushPendingNone) || (!push && !up.SyncPending) {
+			return errNoPending
+		}
+	}
+	return claim()
+}
+
+// scheduleLocalRetry retains the existing single-flight time.AfterFunc retry.
+// Its identity is transferred to the queued job, not released before enqueue:
+// a live poll must not reset Retry while that successor is waiting to start.
+func (w *Worker) scheduleLocalRetry(key string, delay time.Duration, job Job, push bool) {
+	w.deferMu.Lock()
+	defer w.deferMu.Unlock()
+	if w.localClosed || w.deferredRetry[key] != nil {
+		return
+	}
+	if w.deferredRetry == nil {
+		w.deferredRetry = make(map[string]*time.Timer)
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(delay, func() {
+		w.deferMu.Lock()
+		if w.localClosed || w.deferredRetry[key] != timer {
+			w.deferMu.Unlock()
+			return
+		}
+		w.localTimers.Add(1)
+		w.deferMu.Unlock()
+		defer w.localTimers.Done()
+
+		ctx, cancel := context.WithTimeout(context.Background(), detachedOpTimeout)
+		defer cancel()
+		up, err := w.Upstreams.GetUpstream(ctx, job.RepoID)
+		if err != nil || (push && up.PushPending == PushPendingNone) || (!push && !up.SyncPending) {
+			w.forgetLocalRetry(key, timer)
+			return
+		}
+		w.deferMu.Lock()
+		closed := w.localClosed
+		w.deferMu.Unlock()
+		if closed {
+			w.forgetLocalRetry(key, timer)
+			return
+		}
+		job.pendingOnly = false
+		job.retryKey, job.retryTimer, job.retryOwner = key, timer, w
+		enqueue := w.Requeue
+		if push {
+			enqueue = w.RequeuePush
+		}
+		if err := enqueue(ctx, job); err != nil {
+			w.forgetLocalRetry(key, timer)
+			w.Logger.Warn("local pending retry enqueue failed", "repo", job.RepoID, "err", err)
+		}
+	})
+	w.deferredRetry[key] = timer
+}
+
+// forgetLocalRetry releases only this timer's reservation, never a successor's.
+func (w *Worker) forgetLocalRetry(key string, timer *time.Timer) {
+	w.deferMu.Lock()
+	defer w.deferMu.Unlock()
+	if w.deferredRetry[key] == timer {
+		delete(w.deferredRetry, key)
+	}
+}
+
+// CloseLocal stops local retry timers and joins callbacks already firing.
+// Call before closing the local queue, which then waits for admitted runs.
+// Durable markers remain for the existing boot recovery contract.
+func (w *Worker) CloseLocal() {
+	w.deferMu.Lock()
+	w.localClosed = true
+	for _, timer := range w.deferredRetry {
+		timer.Stop()
+	}
+	clear(w.deferredRetry)
+	w.deferMu.Unlock()
+	w.localTimers.Wait()
+}
+
 // syncFailure carries the exact documented failure string plus the real
 // cause for server-side logs.
 type syncFailure struct {
@@ -261,6 +413,11 @@ func failureCode(err error) string {
 func (w *Worker) Run(ctx context.Context, job Job) error {
 	w.assertReady()
 	assertf(job.Org != "" && job.RepoID != "", "Run: incomplete job %+v", job)
+	finishLocal, admitted := w.startLocal(job, false)
+	if !admitted {
+		return nil
+	}
+	defer finishLocal()
 	timeout := w.Timeout
 	if timeout <= 0 {
 		timeout = defaultRunTimeout
@@ -278,8 +435,16 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	assertf(repo.RepoID == job.RepoID, "RepoLookup returned %q for %q", repo.RepoID, job.RepoID)
 
 	holder := newClaimHolder()
-	up, stolenFrom, err := w.Upstreams.BeginSync(ctx, job.RepoID, holder, claimLease(timeout))
+	var up Upstream
+	var stolenFrom string
+	err = w.admitLocal(ctx, job, false, func() error {
+		var claimErr error
+		up, stolenFrom, claimErr = w.Upstreams.BeginSync(ctx, job.RepoID, holder, claimLease(timeout))
+		return claimErr
+	})
 	switch {
+	case errors.Is(err, errNoPending):
+		return nil // queued observation was covered before admission
 	case errors.Is(err, ErrNotFound):
 		return nil // detached before start: cancel silently (docs/reference/webhooks.md)
 	case errors.Is(err, ErrSyncInProgress):
@@ -427,35 +592,7 @@ func (w *Worker) deferPendingRetry(ctx context.Context, job Job) {
 	if err != nil || !up.SyncPending {
 		return // nothing promised (or detached): the skip is final
 	}
-	// At most one pending timer per repo: repeated requests against the
-	// same dead lease coalesce into it (their markers are one flag), and
-	// the slot frees when it fires so a later skip can schedule anew.
-	w.deferMu.Lock()
-	if w.deferredRetry == nil {
-		w.deferredRetry = make(map[string]bool)
-	}
-	if w.deferredRetry[job.RepoID] {
-		w.deferMu.Unlock()
-		return
-	}
-	w.deferredRetry[job.RepoID] = true
-	w.deferMu.Unlock()
-
-	time.AfterFunc(deferredRetryDelay(up), func() {
-		w.deferMu.Lock()
-		delete(w.deferredRetry, job.RepoID)
-		w.deferMu.Unlock()
-		bg, cancel := context.WithTimeout(context.Background(), detachedOpTimeout)
-		defer cancel()
-		cur, err := w.Upstreams.GetUpstream(bg, job.RepoID)
-		if err != nil || !cur.SyncPending {
-			return // covered meanwhile (or detached)
-		}
-		if rqErr := w.Requeue(bg, job); rqErr != nil {
-			w.Logger.Warn("deferred pending sync requeue failed",
-				"org", job.Org, "repo", job.RepoID, "err", rqErr)
-		}
-	})
+	w.scheduleLocalRetry(job.RepoID, deferredRetryDelay(up), job, false)
 }
 
 // emitDetached emits one lifecycle event on a bounded context DETACHED

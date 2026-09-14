@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	stdsync "sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -131,7 +133,7 @@ func TestLocalIntentPollDoesNotStealRetry(t *testing.T) {
 							t.Fatal("fixture missed the retry registration window")
 						}
 						q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
-						if err := q.EnqueuePush(ctx, Job{Org: "acme", RepoID: r.RepoID}); err != nil {
+						if err := q.EnqueuePendingPush(ctx, Job{Org: "acme", RepoID: r.RepoID}); err != nil {
 							t.Fatal(err)
 						}
 						q.Close() // force the admitted poll job to finish in this window
@@ -170,6 +172,273 @@ func TestLocalIntentPollDoesNotStealRetry(t *testing.T) {
 				})
 			})
 		}
+	}
+}
+
+func localIntentWorker(t *testing.T, backend, host string) (*workerFixture, meta.Backend, Job) {
+	t.Helper()
+	st := localIntentStore(t, backend)
+	r, err := st.CreateRepo(t.Context(), "acme", "https://example.com/admission.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newWorkerFixture(t)
+	f.worker.Credentials, f.worker.Upstreams = MetaStores(st)
+	seedLocalRepo(t, f, r.RepoID)
+	if host == "" {
+		addEmptyUpstream(t, f.upstreamDir, "own", "proj")
+		host = "file://" + f.upstreamDir
+	}
+	if _, err := st.SetRepoUpstream(t.Context(), meta.RepoUpstream{
+		RepoID: r.RepoID, Provider: "gitea", Owner: "own", Name: "proj",
+		UpstreamHost: host, ForwardOnPush: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RequestPush(t.Context(), r.RepoID, true); err != nil {
+		t.Fatal(err)
+	}
+	return f, st, Job{Org: "acme", RepoID: r.RepoID}
+}
+
+func TestLocalPendingPushStaleQueuedObservation(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		t.Run(backend, func(t *testing.T) {
+			f, st, job := localIntentWorker(t, backend, "")
+			arrived, release := make(chan struct{}), make(chan struct{})
+			q := NewInProcessQueue(f.worker.Run, func(ctx context.Context, job Job) error {
+				if job.pendingOnly {
+					close(arrived)
+					<-release
+				}
+				return f.worker.RunPush(ctx, job)
+			}, discardTestLogger())
+			defer q.Close()
+			releaseWorker := stdsync.OnceFunc(func() { close(release) })
+			defer releaseWorker()
+			f.worker.RequeuePush = q.EnqueuePush
+			if err := q.EnqueuePendingPush(t.Context(), job); err != nil {
+				t.Fatal(err)
+			}
+			<-arrived
+			// An explicit caller consumes the observed marker before the
+			// queued observation reaches the worker. Its stale job is no work.
+			if err := f.worker.RunPush(t.Context(), job); err != nil {
+				t.Fatal(err)
+			}
+			releaseWorker()
+			q.Close()
+			up, err := st.GetRepoUpstream(t.Context(), job.RepoID)
+			if err != nil || up.PushRunCount != 1 || up.PushPending != 0 {
+				t.Fatalf("stale observation created a run: %+v err=%v", up, err)
+			}
+		})
+	}
+}
+
+func TestLocalPendingPushRetryHandoff(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		t.Run(backend, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f, st, job := localIntentWorker(t, backend, "http://127.0.0.1:1")
+				q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
+				defer q.Close()
+				atEnqueue, release := make(chan struct{}), make(chan struct{})
+				defer close(release)
+				f.worker.RequeuePush = func(ctx context.Context, retry Job) error {
+					if retry.Retry == 1 {
+						atEnqueue <- struct{}{}
+						<-release
+					}
+					return q.EnqueuePush(ctx, retry)
+				}
+				if err := f.worker.RunPush(t.Context(), job); !TransientPushFailure(err) {
+					t.Fatalf("want transient failure: %v", err)
+				}
+				time.Sleep(PushRetryDelay(1))
+				<-atEnqueue
+				if err := q.EnqueuePendingPush(t.Context(), job); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				up, err := st.GetRepoUpstream(t.Context(), job.RepoID)
+				if err != nil || up.PushRunCount != 1 || up.PushPending != 2 {
+					t.Errorf("poll stole timer-to-queue handoff: runs=%d pending=%d err=%v", up.PushRunCount, up.PushPending, err)
+				}
+				// End the fixture's durable request before releasing the delayed
+				// enqueue, so any later timer has no repository left to retry.
+				if err := st.DeleteRepoUpstream(t.Context(), job.RepoID); err != nil {
+					t.Fatal(err)
+				}
+			})
+		})
+	}
+}
+
+func TestLocalPendingPushQueuedRetry(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		t.Run(backend, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f, st, job := localIntentWorker(t, backend, "http://127.0.0.1:1")
+				arrived, release := make(chan struct{}), make(chan struct{})
+				q := NewInProcessQueue(f.worker.Run, func(ctx context.Context, retry Job) error {
+					if retry.Retry == 1 {
+						close(arrived)
+						<-release
+					}
+					return f.worker.RunPush(ctx, retry)
+				}, discardTestLogger())
+				defer q.Close()
+				defer f.worker.CloseLocal()
+				releaseWorker := stdsync.OnceFunc(func() { close(release) })
+				defer releaseWorker()
+				f.worker.RequeuePush = q.EnqueuePush
+				if err := f.worker.RunPush(t.Context(), job); !TransientPushFailure(err) {
+					t.Fatalf("want transient failure: %v", err)
+				}
+				time.Sleep(PushRetryDelay(1))
+				<-arrived
+				if err := q.EnqueuePendingPush(t.Context(), job); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				up, err := st.GetRepoUpstream(t.Context(), job.RepoID)
+				if err != nil || up.PushRunCount != 1 {
+					t.Fatalf("poll overtook queued retry: runs=%d err=%v", up.PushRunCount, err)
+				}
+				releaseWorker()
+				synctest.Wait()
+				up, err = st.GetRepoUpstream(t.Context(), job.RepoID)
+				if err != nil || up.PushRunCount != 2 || up.PushPending != 2 {
+					t.Fatalf("queued retry failed to retain force: %+v err=%v", up, err)
+				}
+			})
+		})
+	}
+}
+
+func TestLocalPendingPushBackoffAndBudget(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		for _, fresh := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/fresh=%t", backend, fresh), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					f, st, job := localIntentWorker(t, backend, "http://127.0.0.1:1")
+					q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
+					defer q.Close()
+					defer f.worker.CloseLocal()
+					f.worker.RequeuePush = q.EnqueuePush
+					if err := f.worker.RunPush(t.Context(), job); !TransientPushFailure(err) {
+						t.Fatalf("want transient failure: %v", err)
+					}
+					wantRuns := 1
+					if fresh {
+						// Preserve explicit caller behavior: a fresh enqueue may run
+						// immediately during backoff. Its plain mark cannot downgrade
+						// the already durable forced retry.
+						if err := st.RequestPush(t.Context(), job.RepoID, false); err != nil {
+							t.Fatal(err)
+						}
+						if err := q.EnqueuePush(t.Context(), job); err != nil {
+							t.Fatal(err)
+						}
+						synctest.Wait()
+						wantRuns++
+					}
+					for retry := 1; retry <= MaxPushTransientRetries; retry++ {
+						if err := q.EnqueuePendingPush(t.Context(), job); err != nil {
+							t.Fatal(err)
+						}
+						synctest.Wait()
+						up, err := st.GetRepoUpstream(t.Context(), job.RepoID)
+						if err != nil || up.PushRunCount != wantRuns || up.PushPending != 2 {
+							t.Fatalf("poll changed backoff/force before retry%d: runs=%d want=%d pending=%d err=%v", retry, up.PushRunCount, wantRuns, up.PushPending, err)
+						}
+						time.Sleep(PushRetryDelay(retry) - time.Second)
+						synctest.Wait()
+						up, err = st.GetRepoUpstream(t.Context(), job.RepoID)
+						if err != nil || up.PushRunCount != wantRuns {
+							t.Fatalf("retry%d fired early: runs=%d want=%d err=%v", retry, up.PushRunCount, wantRuns, err)
+						}
+						time.Sleep(time.Second)
+						synctest.Wait()
+						wantRuns++
+					}
+					if err := q.EnqueuePendingPush(t.Context(), job); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					up, err := st.GetRepoUpstream(t.Context(), job.RepoID)
+					if err != nil || up.PushPending != 0 || up.PushRunCount != wantRuns {
+						t.Fatalf("poll reset exhausted retry budget: %+v want runs=%d err=%v", up, wantRuns, err)
+					}
+					for _, event := range f.rec.list() {
+						if !event.Forced {
+							t.Fatalf("retry downgraded force: %+v", event)
+						}
+					}
+				})
+			})
+		}
+	}
+}
+
+type pauseRetryRead struct {
+	UpstreamStore
+	enabled atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *pauseRetryRead) GetUpstream(ctx context.Context, id string) (Upstream, error) {
+	up, err := s.UpstreamStore.GetUpstream(ctx, id)
+	if s.enabled.CompareAndSwap(true, false) {
+		close(s.entered)
+		<-s.release
+	}
+	return up, err
+}
+
+func TestLocalPendingPushShutdown(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		t.Run(backend, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f, st, job := localIntentWorker(t, backend, "http://127.0.0.1:1")
+				q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
+				defer q.Close()
+				f.worker.RequeuePush = q.EnqueuePush
+				paused := &pauseRetryRead{UpstreamStore: f.worker.Upstreams, entered: make(chan struct{}), release: make(chan struct{})}
+				f.worker.Upstreams = paused
+				if err := f.worker.RunPush(t.Context(), job); !TransientPushFailure(err) {
+					t.Fatalf("want transient failure: %v", err)
+				}
+				paused.enabled.Store(true)
+				time.Sleep(PushRetryDelay(1))
+				<-paused.entered
+				closed := make(chan struct{})
+				go func() { f.worker.CloseLocal(); close(closed) }()
+				synctest.Wait()
+				select {
+				case <-closed:
+					t.Fatal("CloseLocal failed to join an already firing timer")
+				default:
+				}
+				close(paused.release)
+				<-closed
+				if err := q.EnqueuePendingPush(t.Context(), job); err != nil {
+					t.Fatal(err)
+				}
+				if err := q.EnqueuePush(t.Context(), job); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				time.Sleep(PushRetryDelay(MaxPushTransientRetries))
+				synctest.Wait()
+				up, err := st.GetRepoUpstream(t.Context(), job.RepoID)
+				if err != nil || up.PushRunCount != 1 || up.PushPending != 2 || up.PushSyncing {
+					t.Fatalf("shutdown resurrected work or lost durable intent: %+v err=%v", up, err)
+				}
+			})
+		})
 	}
 }
 
