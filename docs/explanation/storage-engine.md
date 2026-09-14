@@ -49,6 +49,57 @@ leave blobs behind by design, and reclamation is deferred to an asynchronous, ca
 [sweeper](#why-deletion-is-so-careful) instead of any synchronous delete on the write
 path.
 
+## Storage compatibility and qualification
+
+`OPENSTORAGE_S3_URL` selects the **blob** store, not the ref authority. With a
+Postgres or SQLite ref store, S3 holds packs and LFS bytes. A `s3wal://` ref-store
+URL instead selects **experimental S3WAL authority** and requires an S3 blob URL
+alongside it ([configuration](../reference/configuration.md#openstorage_pg_url)).
+Blob compatibility never implies authority qualification.
+
+**Blob capabilities:** the current [S3 implementation](../../internal/blob/blob.go)
+and [shared transfer path](../../internal/blob/file.go) use path-style AWS SigV4,
+PUT/GET/HEAD/DELETE, paginated prefix LIST, multipart uploads, byte-range GET,
+ETag/size metadata, and server-side COPY (multipart copy for objects over 5 GiB).
+LFS downloads use presigned GET URLs; uploads go through the application proxy.
+Successful publication must be readable, and quota accounting relies on listings
+including published objects. Basic PUT/GET/DELETE/LIST success alone does not
+establish compatibility; validate the used capabilities and the
+[permissions and bucket configuration](../how-to/deploy-production.md#backing-services).
+
+**Authority capabilities:** all blob requirements plus atomic conditional PUT
+(`If-None-Match: *` create; `If-Match` advance, exactly one concurrent winner),
+ETag-based conditional GET/304, strong read-after-write and list-after-write
+consistency, byte-ordered paginated LIST with prefix/`StartAfter`, and reliable
+store HTTP `Date` witnesses for expiry decisions. The
+[startup probe](../../internal/ref/s3wal/probe.go) checks conditional writes;
+[startup also refuses a missing usable Date witness](../../internal/ref/s3walstore.go).
+Neither proves deployment-wide consistency or reliable time under all failures.
+Never front the authority with a cache. Keep versioning and object lock disabled.
+Conditional DELETE is **not** a correctness requirement or guard.
+
+| Surface / store | Capability requirements | Observed evidence (version/configuration scoped) | Support / status |
+|---|---|---|---|
+| Ordinary S3 blobs with PG/SQLite authority | Blob capabilities above | SeaweedFS is the [CI reference](../reference/testing.md#test-lanes). Historical [4.42 / legacy MinIO results](../plans/s3wal-phase1a-results.md#5-r7-store-qualification-matrix) cover specific transfer surfaces, not every blob operation/configuration. | AWS S3 is the primary target; SeaweedFS the tested self-hosted reference. Other endpoints, including MinIO, are untested/best-effort for this use, not blanket product endorsements. |
+| AWS S3 as S3WAL authority | Blob + authority capabilities above | [22/22 require-mode verdicts](../plans/s3wal-bench-data/qualify-transcript-real-s3-2026-08-27.txt), eu-central-1, 2026-08-27; dedicated bucket, versioning/object lock off. [Campaign scope](../plans/s3wal-bench-results.md#environment): `52ea5c02` + PR #180's boot fix; one day, compute near but not in-region. | **Experimental.** Conditional future promotion target only. Historical evidence, not current-release AWS qualification. |
+| SeaweedFS as S3WAL authority | Blob + authority capabilities above | [Phase 1a](../plans/s3wal-phase1a-results.md#environment): 4.42, 2026-08-25. Current [fixture pin/config](../../internal/ref/s3wal/s3waltest/s3waltest.go): 4.46, `weed server -s3`, anonymous gateway with signed fixture requests, versioning/object lock off; [require-mode lane](../../internal/ref/s3wal/qualify_test.go). | **Experimental.** CI reference and conditional future promotion target; no claim for arbitrary releases or deployment topologies. |
+| MinIO as S3WAL authority | Blob + authority capabilities above | [Legacy `RELEASE.2024-01-16T16-07-38Z`](../plans/s3wal-phase1a-results.md#5-r7-store-qualification-matrix) ignored duplicate `If-None-Match: *` creation; stale `If-Match` advance did pass. The boot probe refused it. | **Not qualified for S3WAL authority.** That observation is not a verdict on every past/future MinIO release; blob acceptance is separate. |
+| Other S3 endpoints / emulators as S3WAL authority | Blob + authority capabilities above | No deployment qualification established here. Even [Floci `nightly-09012026`](../reference/testing.md#the-floci-s3-lane)'s require-mode/overwrite tests are regression coverage, not promotion evidence. | **Not qualified for S3WAL authority.** Passing a probe or selected tests does not confer support. |
+
+The [qualification harness](../../internal/ref/s3wal/qualify_test.go) fails
+non-pass verdicts in require mode; the legacy MinIO record-mode lane records
+incompatibilities rather than certifying the endpoint. A green test job is not a
+claim that every recorded store passed.
+
+**Conditional policy, not promotion:** AWS S3 and SeaweedFS are the intended
+future promotion targets for [#192 G1](https://github.com/coder/openstorage/issues/192),
+subject to the remaining qualification, correctness, operations and release-specific
+coverage gates. This does not establish that A1–A3's conformant real-S3 starvation
+rerun, separate-day repeats or in-region campaign passed. **All S3WAL targets
+remain experimental**, with the [single-node boundaries](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)
+unchanged; #192 remains open. No beta, GA or production-support announcement is
+made by this matrix.
+
 ## Why repack packs the union, not reachable objects
 
 Push-heavy repositories accumulate one small pack per push, and read-side hydration cost
