@@ -270,3 +270,55 @@ repo, webhook, credential, org-key, and upstream-link mutation advances the sing
 `_wal/meta.json` (metadata write rates are low, but they serialize globally). If
 hot-repo write throughput binds, local mode is the faster single-node alternative;
 multi-node serving means the Postgres topology.
+
+### S3WAL format stability policy
+
+**Prospective commitment.** The baseline is commit
+[`d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d`](https://github.com/coder/openstorage/commit/d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d).
+From this baseline forward, the persisted v1 schema, object-key layout, and
+interpretation of these two formats are frozen:
+
+- Repository-group manifests at `_wal/repo/<baseRepoID>`, with no file extension,
+  defined by [`manifest.go` at the baseline](https://github.com/coder/openstorage/blob/d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d/internal/ref/s3wal/manifest.go).
+- The metadata document at `_wal/meta.json`, defined by
+  [`s3walmeta.go` at the baseline](https://github.com/coder/openstorage/blob/d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d/internal/meta/s3walmeta.go).
+
+This freezes the format, not mutable values such as refs, counters, or lease
+expiry times, and not JSON byte formatting or member ordering. It does not freeze
+all bucket objects: auxiliary lease, scan, and temporary objects outside these
+two formats are not covered. Current valid v1 data remains usable without a
+format migration. The historical v1 schema evolved before this commitment; a
+shared `v: 1` is not a retroactive guarantee that every past release pair can
+safely read and rewrite each other's data.
+
+**Unknown-field tolerance is not read/write compatibility.** Both codecs decode
+into typed Go structures and encode those structures again. They accept unknown
+JSON fields but do not preserve them on rewrite. Adding, removing, or
+reinterpreting a durable field is not safe merely because it is optional,
+additive, or tagged `omitempty`: an older writer can drop information or apply a
+different meaning. Such schema changes must not silently extend this frozen v1
+format.
+
+**Current enforcement.** Both decoders return errors for unsupported version
+values; both encoders assert that they write v1. These are codec-level guards,
+not a bucket-wide compatibility check. They do not guarantee that an old process
+always exits or cannot mutate other bucket objects, nor that an upgrade is atomic
+or a downgrade safe. There is no v2 migration capability or automatic read-time
+migration in the current implementation.
+
+**Future release obligations.** Before enabling writes incompatible with the
+covered baseline, a release must:
+
+1. Bump the affected format version rather than write new semantics under v1.
+2. Include implemented and tested in-place migration capability in the new
+   reader/writer binary for its documented source formats.
+3. Document an operator upgrade procedure, including supported source versions,
+   writer shutdown/fencing, migration and verification steps, and when writes may
+   resume. These are release requirements, not an upgrade engine supplied today.
+
+Downgrade after incompatible-format writes is unsupported. Take a verified
+[stopped-node backup](../how-to/backup-restore-s3wal.md) as a precaution before an
+upgrade; that same-binary recovery procedure does not qualify cross-version
+rollback. Release-pair upgrade testing remains separate work under
+[#192](https://github.com/coder/openstorage/issues/192), which remains open.
+This policy does not promote S3WAL: the backend remains **experimental**.

@@ -587,6 +587,11 @@ fresh-cache recovery into an empty bucket. A live `aws s3 sync` is not a
 consistent snapshot. The procedure has a local fixture drill; it is not a
 real-S3 disaster-recovery qualification or a promotion/support claim.
 
+**Format changes need a separate upgrade procedure.** Read the
+[S3WAL format stability policy](../explanation/storage-engine.md#s3wal-format-stability-policy)
+before changing binaries. The stopped-node backup is a precaution, not a
+cross-version rollback guarantee.
+
 **The lease lifecycle in practice.** A [graceful shutdown](#rolling-upgrades-and-restarts)
 (`SIGTERM`/`SIGINT`) releases `_wal/instance-lease` on the way out (a bounded best-effort
 delete — 5 seconds — after the bounded HTTP drain), so a successor starts immediately.
