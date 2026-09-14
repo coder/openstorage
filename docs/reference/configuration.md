@@ -1022,10 +1022,18 @@ Registered-pack count at which a post-write trigger schedules a background repac
 that repository. Repack packs the union of the snapshotted packs' objects into one
 consolidated pack — the registered object set never shrinks.
 
-- **Default:** `10`. **`0` disables triggering** (already-queued durable jobs still run);
-  `1` is rejected (folding fewer than two packs is a no-op, so it would busy-loop the
-  trigger); negative or malformed values are startup errors.
-- Pack counts converge below the threshold, not necessarily to a single pack.
+- **Default:** `10`. **`0` disables this process's triggers and follow-ups**
+  (already-queued durable jobs still run); `1` is rejected (folding fewer than two
+  packs is a no-op, so it would busy-loop the trigger); negative or malformed values
+  are startup errors.
+- The threshold is **per process/replica**, for both its post-write triggers and the
+  follow-up checks of jobs it consumes. Setting one push node to `2` does not set
+  other consumers of the same River queue to `2`. Mixed-threshold fleets do not
+  promise preservation of a producer's lower threshold.
+- With the same enabled threshold on every eligible consumer, pack counts target
+  below that threshold, not necessarily one pack. Exactly-one convergence requires
+  all those consumers to use `2`, plus quiescent writes and successful fold progress
+  within the [fold budgets](../how-to/storage-lifecycle-and-sweeping.md#background-repack).
 
 ### `OPENSTORAGE_SYNC_STEAL_LEGACY`
 
