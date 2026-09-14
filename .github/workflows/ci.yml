@@ -56,19 +56,23 @@ jobs:
           done
       - run: go test ./... -count=1 -race -timeout=30m
 
-  # Build-only image smoke test (no push, no registry): verify-sig ref
-  # policies shell out through git to `gpg` (PGP) and `ssh-keygen` (SSH) at
-  # push time and fail closed when the binary is absent (ADR-9, #50), and the
-  # server hard-requires external `git`. Assert the runtime image keeps
-  # shipping all three so a base-image or package-list change cannot silently
-  # regress signed pushes.
+  # Build locally, never push. Check runtime tools and exercise the unchanged
+  # single-node Compose reference with this exact candidate image ID.
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: docker build -t ghcr.io/coder/openstorage:smoke .
-      - run: docker run --rm --entrypoint /bin/sh ghcr.io/coder/openstorage:smoke -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      - name: Build candidate image without publication
+        run: |
+          docker build --iidfile "$RUNNER_TEMP/openstorage-image.id" .
+          echo "OPENSTORAGE_IMAGE=$(cat "$RUNNER_TEMP/openstorage-image.id")" >> "$GITHUB_ENV"
+      - name: Check runtime Git and signature tools
+        run: docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      - name: Smoke the exact Compose quickstart
+        run: |
+          bash -n scripts/smoke-compose-quickstart.sh
+          bash scripts/smoke-compose-quickstart.sh
 
   test-local:
     runs-on: ubuntu-latest
