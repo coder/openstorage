@@ -3,15 +3,15 @@ package githttp
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +30,6 @@ type upgradeFixture struct {
 
 func newUpgradeFixture(t *testing.T) *upgradeFixture {
 	t.Helper()
-	isolateUpgradeGit(t)
 	src := t.TempDir()
 	upgWrite(t, filepath.Join(src, "go.mod"), "module github.com/coder/openstorage\n\ngo 1.21\n")
 	upgWrite(t, filepath.Join(src, "cmd/openstorage/main.go"), "package main\n\nfunc main() {}\n")
@@ -73,11 +72,7 @@ func (f *upgradeFixture) setArchive(t *testing.T, entries ...tarEntry) {
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
 	for _, e := range entries {
-		typ := e.Type
-		if typ == 0 {
-			typ = tar.TypeReg
-		}
-		hdr := &tar.Header{Name: e.Name, Typeflag: typ, Mode: 0o755, Size: int64(len(e.Body)), Linkname: e.Link}
+		hdr := &tar.Header{Name: e.Name, Typeflag: cmp.Or(e.Type, byte(tar.TypeReg)), Mode: 0o755, Size: int64(len(e.Body)), Linkname: e.Link}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatal(err)
 		}
@@ -124,11 +119,11 @@ func (f *upgradeFixture) mustReject(t *testing.T, cfg upgradeInputConfig, want s
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	var names []string
+	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		names = append(names, e.Name())
 	}
-	if strings.Join(names, ",") != strings.Join(frozen, ",") {
+	if !slices.Equal(names, frozen) {
 		t.Fatalf("dest contents after failure %v, want %v", names, frozen)
 	}
 }
@@ -186,7 +181,7 @@ func TestPrepareUpgradeInputs_RejectsSourceDrift(t *testing.T) {
 	t.Run("untracked file", func(t *testing.T) {
 		scratch := filepath.Join(f.cfg.SourceDir, "scratch.txt")
 		upgWrite(t, scratch, "dirty\n")
-		f.mustReject(t, f.cfg, "not clean")
+		f.mustReject(t, f.cfg, "status")
 		if err := os.Remove(scratch); err != nil {
 			t.Fatal(err)
 		}
@@ -233,41 +228,34 @@ func TestPrepareUpgradeInputs_RejectsCandidate(t *testing.T) {
 
 func TestVerifyUpgradeBuildInfo(t *testing.T) {
 	commit := strings.Repeat("ab", 20)
-	valid := func() *debug.BuildInfo {
-		return &debug.BuildInfo{Path: upgradeCandidateMainPath, Settings: []debug.BuildSetting{
-			{Key: "GOOS", Value: "linux"}, {Key: "GOARCH", Value: "amd64"}, {Key: "vcs", Value: "git"},
-			{Key: "vcs.revision", Value: commit}, {Key: "vcs.modified", Value: "false"},
-		}}
+	// Settings are key/value pairs; a later duplicate key overrides (the
+	// verifier reads the last value, as debug.BuildInfo lookups do).
+	build := func(path string, kv ...string) *debug.BuildInfo {
+		bi := &debug.BuildInfo{Path: path}
+		for i := 0; i < len(kv); i += 2 {
+			bi.Settings = append(bi.Settings, debug.BuildSetting{Key: kv[i], Value: kv[i+1]})
+		}
+		return bi
 	}
-	if err := verifyUpgradeBuildInfo(valid(), upgradeCandidateMainPath, commit); err != nil {
+	base := []string{"GOOS", "linux", "GOARCH", "amd64", "vcs", "git", "vcs.revision", commit, "vcs.modified", "false"}
+	if err := verifyUpgradeBuildInfo(build(upgradeCandidateMainPath, base...), upgradeCandidateMainPath, commit); err != nil {
 		t.Fatalf("valid build info rejected: %v", err)
 	}
-	set := func(key, value string) func(*debug.BuildInfo) {
-		return func(bi *debug.BuildInfo) {
-			for i := range bi.Settings {
-				if bi.Settings[i].Key == key {
-					bi.Settings[i].Value = value
-				}
-			}
-		}
-	}
 	for name, tc := range map[string]struct {
-		mutate func(*debug.BuildInfo)
-		want   string
+		bi   *debug.BuildInfo
+		want string
 	}{
-		"wrong main path":    {func(bi *debug.BuildInfo) { bi.Path = "github.com/coder/openstorage/cmd/other" }, "main path"},
-		"darwin":             {set("GOOS", "darwin"), "GOOS"},
-		"arm64":              {set("GOARCH", "arm64"), "GOARCH"},
-		"not git":            {set("vcs", "hg"), "vcs="},
-		"malformed revision": {set("vcs.revision", commit[:39]), "vcs.revision"},
-		"wrong revision":     {set("vcs.revision", strings.Repeat("cd", 20)), "vcs.revision"},
-		"modified":           {set("vcs.modified", "true"), "vcs.modified"},
-		"no revision":        {func(bi *debug.BuildInfo) { bi.Settings = bi.Settings[:3] }, "vcs.revision"},
+		"wrong main path":    {build("github.com/coder/openstorage/cmd/other", base...), "main path"},
+		"darwin":             {build(upgradeCandidateMainPath, append(base, "GOOS", "darwin")...), "GOOS"},
+		"arm64":              {build(upgradeCandidateMainPath, append(base, "GOARCH", "arm64")...), "GOARCH"},
+		"not git":            {build(upgradeCandidateMainPath, append(base, "vcs", "hg")...), "vcs="},
+		"malformed revision": {build(upgradeCandidateMainPath, append(base, "vcs.revision", commit[:39])...), "vcs.revision"},
+		"wrong revision":     {build(upgradeCandidateMainPath, append(base, "vcs.revision", strings.Repeat("cd", 20))...), "vcs.revision"},
+		"modified":           {build(upgradeCandidateMainPath, append(base, "vcs.modified", "true")...), "vcs.modified"},
+		"no revision":        {build(upgradeCandidateMainPath, base[:6]...), "vcs.revision"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			bi := valid()
-			tc.mutate(bi)
-			if err := verifyUpgradeBuildInfo(bi, upgradeCandidateMainPath, commit); err == nil || !strings.Contains(err.Error(), tc.want) {
+			if err := verifyUpgradeBuildInfo(tc.bi, upgradeCandidateMainPath, commit); err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error %v, want substring %q", err, tc.want)
 			}
 		})
@@ -277,27 +265,30 @@ func TestVerifyUpgradeBuildInfo(t *testing.T) {
 func TestPrepareUpgradeInputs_RejectsOfficialArtifacts(t *testing.T) {
 	f := newUpgradeFixture(t)
 	frozen := []string{"candidate", "checksums.txt", upgradeArchiveName}
-	good := f.pin
+	goodLine := f.pin.ArchiveSHA256 + "  " + upgradeArchiveName + "\n"
+	zeros := strings.Repeat("0", 64)
+	for name, tc := range map[string]struct{ body, want string }{
+		"checksums lacks archive line":      {f.pin.ArchiveSHA256 + "  openstorage_0.15.0_linux_arm64.tar.gz\n", "no entry"},
+		"checksums line disagrees with pin": {zeros + "  " + upgradeArchiveName + "\n", "lists"},
+		"checksums line malformed":          {"not a digest  " + upgradeArchiveName + "\n", "malformed"},
+		"checksums lists archive twice":     {goodLine + goodLine, "twice"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f.setChecksums(t, tc.body)
+			defer f.setChecksums(t, goodLine)
+			f.mustReject(t, f.cfg, tc.want, frozen...)
+		})
+	}
 	t.Run("checksums bytes drift", func(t *testing.T) {
-		upgWrite(t, f.cfg.Checksums, good.ArchiveSHA256+"  "+upgradeArchiveName+"\n# tampered\n")
-		defer f.setChecksums(t, good.ArchiveSHA256+"  "+upgradeArchiveName+"\n")
+		upgWrite(t, f.cfg.Checksums, goodLine+"# tampered\n") // pin unchanged
+		defer f.setChecksums(t, goodLine)
 		f.mustReject(t, f.cfg, "checksums.txt sha256", frozen...)
-	})
-	t.Run("checksums lacks archive line", func(t *testing.T) {
-		f.setChecksums(t, good.ArchiveSHA256+"  openstorage_0.15.0_linux_arm64.tar.gz\n")
-		defer f.setChecksums(t, good.ArchiveSHA256+"  "+upgradeArchiveName+"\n")
-		f.mustReject(t, f.cfg, "no entry", frozen...)
-	})
-	t.Run("checksums line disagrees with pin", func(t *testing.T) {
-		f.setChecksums(t, strings.Repeat("0", 64)+"  "+upgradeArchiveName+"\n")
-		defer f.setChecksums(t, good.ArchiveSHA256+"  "+upgradeArchiveName+"\n")
-		f.mustReject(t, f.cfg, "lists", frozen...)
 	})
 	t.Run("archive digest", func(t *testing.T) {
 		pin := f.pin
 		defer func() { f.pin = pin }()
-		f.pin.ArchiveSHA256 = strings.Repeat("0", 64)
-		f.setChecksums(t, f.pin.ArchiveSHA256+"  "+upgradeArchiveName+"\n")
+		f.pin.ArchiveSHA256 = zeros
+		f.setChecksums(t, zeros+"  "+upgradeArchiveName+"\n")
 		f.mustReject(t, f.cfg, "archive sha256", frozen...)
 	})
 	for name, tc := range map[string]struct {
@@ -343,22 +334,24 @@ func TestPrepareUpgradeInputs_FreezesAndRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The fixture archive entry is the candidate's bytes, so both digests agree.
+	want := upgradeInputs{
+		OldBinary: filepath.Join(dest, "openstorage-v0.0.0-fixture"), CandidateBinary: filepath.Join(dest, "candidate"),
+		OldTag: f.pin.OldTag, OldCommit: f.pin.OldCommit, OldBinarySHA256: f.cfg.CandidateSHA256,
+		ArchiveSHA256: f.pin.ArchiveSHA256, ChecksumsSHA256: f.pin.ChecksumsSHA256,
+		CandidateSHA256: f.cfg.CandidateSHA256, Commit: f.cfg.Commit, Tree: f.cfg.Tree,
+	}
+	if got != want {
+		t.Fatalf("identities\n got %+v\nwant %+v", got, want)
+	}
 	for _, p := range []string{got.OldBinary, got.CandidateBinary} {
 		st, err := os.Stat(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if filepath.Dir(p) != dest || st.Mode().Perm() != 0o500 {
-			t.Fatalf("%s: dir %s mode %o, want frozen 0500 binary in %s", p, filepath.Dir(p), st.Mode().Perm(), dest)
+		if st.Mode().Perm() != 0o500 || upgSHA256(t, p) != f.cfg.CandidateSHA256 {
+			t.Fatalf("%s: mode %o, want a frozen 0500 copy of the fixture binary", p, st.Mode().Perm())
 		}
-	}
-	if body, err := os.ReadFile(got.OldBinary); err != nil || !bytes.Equal(body, f.oldBinaryBody) {
-		t.Fatalf("old binary bytes %q (%v), want archive entry", body, err)
-	}
-	if got.CandidateSHA256 != f.cfg.CandidateSHA256 || got.Commit != f.cfg.Commit || got.Tree != f.cfg.Tree ||
-		got.ArchiveSHA256 != f.pin.ArchiveSHA256 || got.OldBinarySHA256 != upgSHA256(t, got.OldBinary) ||
-		got.OldTag != f.pin.OldTag || got.OldCommit != f.pin.OldCommit {
-		t.Fatalf("identities %+v do not match fixture %+v", got, f)
 	}
 	raw, err := os.ReadFile(filepath.Join(dest, "inputs.json"))
 	if err != nil {
@@ -375,6 +368,19 @@ func TestPrepareUpgradeInputs_FreezesAndRecords(t *testing.T) {
 	if _, err := prepareUpgradeInputsPinned(f.pin, f.cfg, dest); err == nil || !strings.Contains(err.Error(), "exist") {
 		t.Fatalf("second attempt in the same dest: %v, want exclusive-create failure", err)
 	}
+	// Pre-invocation recheck: passes on frozen bytes, fails once they change.
+	if err := got.recheck(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(got.CandidateBinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(got.CandidateBinary, []byte("tampered"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := got.recheck(); err == nil || !strings.Contains(err.Error(), "candidate sha256") {
+		t.Fatalf("recheck after tampering: %v, want candidate digest mismatch", err)
+	}
 }
 
 // buildUpgradeCandidate builds the fixture module's ./cmd/openstorage with
@@ -386,36 +392,26 @@ func buildUpgradeCandidate(t *testing.T, src string) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "build", "-buildvcs=true", "-trimpath", "-o", out, "./cmd/openstorage")
 	cmd.Dir = src
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0", "GOFLAGS=", "GOWORK=off", "GOTOOLCHAIN=local")
+	cmd.Env = append(upgGitEnv(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0", "GOFLAGS=", "GOWORK=off", "GOTOOLCHAIN=local")
 	if raw, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build fixture: %v\n%s", err, raw)
 	}
 	return out
 }
 
-func isolateUpgradeGit(t *testing.T) {
-	t.Helper()
-	for _, entry := range os.Environ() {
-		if key, value, _ := strings.Cut(entry, "="); strings.HasPrefix(key, "GIT_") {
-			t.Setenv(key, value)
-			if err := os.Unsetenv(key); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	for key, value := range map[string]string{
-		"GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_SYSTEM": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1",
-		"GIT_AUTHOR_NAME": "githttp", "GIT_AUTHOR_EMAIL": "githttp@test.invalid", "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
-		"GIT_COMMITTER_NAME": "githttp", "GIT_COMMITTER_EMAIL": "githttp@test.invalid", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
-	} {
-		t.Setenv(key, value)
-	}
+// upgGitEnv is a hermetic environment for fixture git (and go build -buildvcs):
+// no inherited GIT_*, no user/system config, fixed identity and dates.
+func upgGitEnv() []string {
+	return append(slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "GIT_") }),
+		"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_SYSTEM="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=githttp", "GIT_AUTHOR_EMAIL=githttp@test.invalid", "GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
+		"GIT_COMMITTER_NAME=githttp", "GIT_COMMITTER_EMAIL=githttp@test.invalid", "GIT_COMMITTER_DATE=2000-01-01T00:00:00Z")
 }
 
 func upgGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), "git", args...)
-	cmd.Dir = dir
+	cmd.Dir, cmd.Env = dir, upgGitEnv()
 	raw, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, raw)
@@ -435,10 +431,9 @@ func upgWrite(t *testing.T, path, body string) {
 
 func upgSHA256(t *testing.T, path string) string {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	sum, err := upgradeSHA256(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
+	return sum
 }

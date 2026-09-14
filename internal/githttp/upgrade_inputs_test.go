@@ -1,14 +1,12 @@
 package githttp
 
 // Test-only input identity helpers for the release-candidate upgrade lane
-// (issue #267). prepareUpgradeInputs freezes the official v0.15.0
-// linux/amd64 release archive, its checksum file, and the locally built
-// candidate binary into an exclusively owned attempt directory, verifies
-// every identity against the pinned digests, the embedded VCS build info,
-// and the clean source checkout, then records a receipt (inputs.json).
-// It never downloads anything and never executes either binary; the
-// dedicated upgrade TestMain owns downloads and process lifecycle, and on
-// failure the attempt directory is left exactly as it was for inspection.
+// (issue #267): prepareUpgradeInputs freezes the official v0.15.0
+// linux/amd64 archive, its checksum file, and the locally built candidate
+// into an exclusively owned attempt directory, verifies every identity
+// (pinned digests, embedded VCS build info, clean source checkout), and
+// records inputs.json. It never downloads or executes anything; the upgrade
+// TestMain owns downloads and lifecycle, and failures leave dest untouched.
 
 import (
 	"archive/tar"
@@ -43,8 +41,8 @@ const (
 	upgradeCandidateMainPath = "github.com/coder/openstorage/cmd/openstorage"
 )
 
-// upgradeReleasePin is the expected identity of the old release; the
-// official pin is the only one used outside the helper's own tests.
+// upgradeReleasePin is the old release's expected identity; only the
+// official pin is used outside the helper's own tests.
 type upgradeReleasePin struct {
 	OldTag, OldCommit, OldMainPath, ArchiveName, ArchiveSHA256, ChecksumsSHA256 string
 }
@@ -54,9 +52,8 @@ var officialUpgradeRelease = upgradeReleasePin{
 	ArchiveName: upgradeArchiveName, ArchiveSHA256: upgradeArchiveSHA256, ChecksumsSHA256: upgradeChecksumsSHA256,
 }
 
-// upgradeInputConfig names the caller-provided inputs: the downloaded
-// archive and checksum file, the candidate built from SourceDir, its
-// expected sha256, and the commit/tree SourceDir must currently be at.
+// upgradeInputConfig: downloaded archive + checksum file, candidate built
+// from SourceDir with its expected sha256, and SourceDir's required commit/tree.
 type upgradeInputConfig struct {
 	Archive, Checksums, Candidate, CandidateSHA256, Commit, Tree, SourceDir string
 }
@@ -80,10 +77,9 @@ func prepareUpgradeInputs(cfg upgradeInputConfig, dest string) (upgradeInputs, e
 	return prepareUpgradeInputsPinned(officialUpgradeRelease, cfg, dest)
 }
 
-// prepareUpgradeInputsPinned freezes and verifies cfg against pin. dest
-// must be an existing private directory owned by this attempt; every
-// output is created exclusively, so a reused dest fails instead of
-// overwriting or retrying, and nothing is removed on failure.
+// prepareUpgradeInputsPinned freezes and verifies cfg against pin. dest must
+// be this attempt's existing private directory; outputs are created
+// exclusively (a reused dest fails, never overwrites) and never removed.
 func prepareUpgradeInputsPinned(pin upgradeReleasePin, cfg upgradeInputConfig, dest string) (upgradeInputs, error) {
 	var out upgradeInputs
 	if err := cfg.validate(); err != nil {
@@ -104,26 +100,25 @@ func prepareUpgradeInputsPinned(pin upgradeReleasePin, cfg upgradeInputConfig, d
 		src, dst string
 		mode     os.FileMode
 	}{{cfg.Candidate, candidate, 0o500}, {cfg.Checksums, checksums, 0o400}, {cfg.Archive, archive, 0o400}} {
-		if err := freezeUpgradeFile(c.src, c.dst, c.mode); err != nil {
+		in, err := os.Open(c.src)
+		if err != nil {
+			return out, fmt.Errorf("upgrade inputs: %w", err)
+		}
+		err = writeUpgradeFile(c.dst, c.mode, in)
+		if err := errors.Join(err, in.Close()); err != nil {
 			return out, err
 		}
 	}
-	candidateSum, err := upgradeSHA256(candidate)
+	candidateSum, err := upgradeExpectSHA256(candidate, cfg.CandidateSHA256, "candidate")
 	if err != nil {
 		return out, err
-	}
-	if candidateSum != cfg.CandidateSHA256 {
-		return out, fmt.Errorf("upgrade inputs: candidate sha256 %s, want %s", candidateSum, cfg.CandidateSHA256)
 	}
 	if err := verifyUpgradeBinary(candidate, upgradeCandidateMainPath, cfg.Commit); err != nil {
 		return out, fmt.Errorf("upgrade inputs: candidate: %w", err)
 	}
-	checksumsSum, err := upgradeSHA256(checksums)
+	checksumsSum, err := upgradeExpectSHA256(checksums, pin.ChecksumsSHA256, "checksums.txt")
 	if err != nil {
 		return out, err
-	}
-	if checksumsSum != pin.ChecksumsSHA256 {
-		return out, fmt.Errorf("upgrade inputs: checksums.txt sha256 %s, want %s", checksumsSum, pin.ChecksumsSHA256)
 	}
 	listed, err := upgradeListedDigest(checksums, pin.ArchiveName)
 	if err != nil {
@@ -132,12 +127,9 @@ func prepareUpgradeInputsPinned(pin upgradeReleasePin, cfg upgradeInputConfig, d
 	if listed != pin.ArchiveSHA256 {
 		return out, fmt.Errorf("upgrade inputs: checksums.txt lists %s for %s, want pinned %s", listed, pin.ArchiveName, pin.ArchiveSHA256)
 	}
-	archiveSum, err := upgradeSHA256(archive)
+	archiveSum, err := upgradeExpectSHA256(archive, pin.ArchiveSHA256, "archive")
 	if err != nil {
 		return out, err
-	}
-	if archiveSum != pin.ArchiveSHA256 {
-		return out, fmt.Errorf("upgrade inputs: archive sha256 %s, want %s", archiveSum, pin.ArchiveSHA256)
 	}
 	oldBinary := filepath.Join(dest, "openstorage-"+pin.OldTag)
 	if err := extractUpgradeBinary(archive, oldBinary); err != nil {
@@ -170,13 +162,10 @@ func (cfg upgradeInputConfig) validate() error {
 		name, path string
 		dir        bool
 	}{{"Archive", cfg.Archive, false}, {"Checksums", cfg.Checksums, false}, {"Candidate", cfg.Candidate, false}, {"SourceDir", cfg.SourceDir, true}} {
-		kind := "regular file"
-		if f.dir {
-			kind = "directory"
-		}
 		st, err := os.Stat(f.path)
 		if f.path == "" || err != nil || (f.dir && !st.IsDir()) || (!f.dir && !st.Mode().IsRegular()) {
-			return fmt.Errorf("upgrade inputs: %s %q must be an existing %s: %v", f.name, f.path, kind, err)
+			return fmt.Errorf("upgrade inputs: %s %q must be an existing %s: %v", f.name, f.path,
+				map[bool]string{false: "regular file", true: "directory"}[f.dir], err)
 		}
 	}
 	for _, h := range []struct {
@@ -208,37 +197,37 @@ func verifyUpgradeSource(dir, commit, tree string) error {
 		}
 		return strings.TrimSpace(string(raw)), nil
 	}
-	head, err := git("rev-parse", "--verify", "HEAD^{commit}")
-	if err != nil {
-		return err
-	}
-	if head != commit {
-		return fmt.Errorf("upgrade inputs: %s HEAD is %s, want %s", dir, head, commit)
-	}
-	headTree, err := git("rev-parse", "--verify", "HEAD^{tree}")
-	if err != nil {
-		return err
-	}
-	if headTree != tree {
-		return fmt.Errorf("upgrade inputs: %s HEAD tree is %s, want %s", dir, headTree, tree)
-	}
-	status, err := git("status", "--porcelain", "--untracked-files=all")
-	if err != nil {
-		return err
-	}
-	if status != "" {
-		return fmt.Errorf("upgrade inputs: %s is not clean:\n%s", dir, status)
+	for _, c := range [...]struct {
+		args       []string
+		want, what string
+	}{
+		{[]string{"rev-parse", "--verify", "HEAD^{commit}"}, commit, "HEAD"},
+		{[]string{"rev-parse", "--verify", "HEAD^{tree}"}, tree, "HEAD tree"},
+		{[]string{"status", "--porcelain", "--untracked-files=all"}, "", "status"},
+	} {
+		got, err := git(c.args...)
+		if err != nil {
+			return err
+		}
+		if got != c.want {
+			return fmt.Errorf("upgrade inputs: %s %s is %q, want %q", dir, c.what, got, c.want)
+		}
 	}
 	return nil
 }
 
-func freezeUpgradeFile(src, dst string, mode os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("upgrade inputs: %w", err)
+// recheck re-hashes both frozen binaries against the receipt. Call it
+// immediately before every invocation so a binary altered after
+// preparation is never executed.
+func (in upgradeInputs) recheck() error {
+	for _, b := range [...]struct{ path, want, what string }{
+		{in.OldBinary, in.OldBinarySHA256, "old binary"}, {in.CandidateBinary, in.CandidateSHA256, "candidate"},
+	} {
+		if _, err := upgradeExpectSHA256(b.path, b.want, b.what); err != nil {
+			return err
+		}
 	}
-	defer in.Close()
-	return writeUpgradeFile(dst, mode, in)
+	return nil
 }
 
 // writeUpgradeFile creates dst exclusively (an earlier attempt's output is
@@ -266,6 +255,18 @@ func upgradeSHA256(path string) (string, error) {
 		return "", fmt.Errorf("upgrade inputs: hash %s: %w", path, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// upgradeExpectSHA256 hashes path and requires the expected digest want.
+func upgradeExpectSHA256(path, want, what string) (string, error) {
+	got, err := upgradeSHA256(path)
+	if err != nil {
+		return "", err
+	}
+	if got != want {
+		return "", fmt.Errorf("upgrade inputs: %s sha256 %s, want %s", what, got, want)
+	}
+	return got, nil
 }
 
 // upgradeListedDigest returns the digest a GNU sha256sum file lists for
