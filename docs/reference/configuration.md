@@ -125,11 +125,12 @@ s3wal mode only: the TTL of the `_wal/instance-lease` dual-serve guard
 ([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)
 §2.11). At startup, serve refuses to run while another process holds a fresh lease on the
 bucket; while running, it heartbeats the lease every TTL/4 and **fail-stops** if the lease
-is stolen or unrenewable. A graceful shutdown (`SIGTERM`/`SIGINT`) releases the lease so a
-successor can start immediately; only a hard kill (`SIGKILL`, crash, power loss) leaves the
-lease behind, and that node's successor can start once the stale lease ages past the TTL —
-the [production guide](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)
-covers the recovery runbook.
+is stolen or unrenewable. Graceful shutdown (`SIGTERM`/`SIGINT`) attempts a bounded,
+best-effort release; failed release, hard kills and fail-stop exits can leave a lease.
+A successor must respect the **holder's recorded TTL** and store-clock resolution
+margin, not merely its own configured TTL. Follow the [shutdown/restart
+procedure](../how-to/deploy-production.md#s3wal-shutdown-and-restart) and
+[source-backed operational signals](../how-to/deploy-production.md#s3wal-operational-signals).
 
 - **Default:** unset — 2 minutes (30-second heartbeats).
 - **Validation:** a [duration](https://pkg.go.dev/time#ParseDuration) of at least `1s` —
@@ -137,9 +138,9 @@ covers the recovery runbook.
   which **disables** the lease entirely (a test-suite escape hatch for deliberately
   running several processes against one bucket; serve warns loudly, and accidental
   dual-serve topologies then go undetected).
-- The lease is best-effort *detection*: correctness never depends on it (every state
-  change is CAS-serialized regardless), so tuning it can only change how quickly an
-  accidental second writer is noticed. Ignored outside s3wal mode.
+- The lease is best-effort *detection* with fail-stop on heartbeat loss, not an
+  independent integrity guarantee or support for two servers against one bucket.
+  Do not disable it or manually delete the lease to recover. Ignored outside s3wal mode.
 
 ### `OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER`
 
