@@ -579,6 +579,13 @@ its own disk, and the same `OPENSTORAGE_SECRETS_KEY` if one encrypts the metadat
 store's secret columns — provisioned from your config/secret store like any other
 deployment.
 
+**Bucket loss is a separate recovery problem.** Node replacement from the same
+bucket is not a backup. Use the [stopped-node backup/restore runbook](backup-restore-s3wal.md)
+for an opaque whole-bucket snapshot, independent inventory verification and
+fresh-cache recovery into an empty bucket. A live `aws s3 sync` is not a
+consistent snapshot. The procedure has a local fixture drill; it is not a
+real-S3 disaster-recovery qualification or a promotion/support claim.
+
 **The lease lifecycle in practice.** A [graceful shutdown](#rolling-upgrades-and-restarts)
 (`SIGTERM`/`SIGINT`) releases `_wal/instance-lease` on the way out (a bounded best-effort
 delete — 5 seconds — after the bounded HTTP drain), so a successor starts immediately.

@@ -348,14 +348,16 @@ func testMainInner(m *testing.M) int {
 // asynchronously — so the callers' EnsureBucket retry is the actual
 // readiness signal (the s3wal lane additionally gates on a scratch write
 // roundtrip before its no-retry boot probe runs — issue #165). Shared by
-// the pg and s3wal lanes.
+// the pg and s3wal lanes. Reserve 32 volume slots for the shared bucket and
+// the recovery drill's three buckets (seven volumes each); automatic sizing
+// can exhaust slots on small CI disks even with tiny fixture payloads.
 func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
 	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
 		s3AccessKey, s3SecretKey)
 	seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		Image:        "chrislusf/seaweedfs:4.46",
 		ExposedPorts: []string{"8333/tcp"},
-		Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
+		Cmd:          []string{"server", "-s3", "-dir=/data", "-volume.max=32", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
 		Files: []testcontainers.ContainerFile{{
 			Reader:            strings.NewReader(s3Config),
 			ContainerFilePath: "/etc/seaweedfs/s3.json",
