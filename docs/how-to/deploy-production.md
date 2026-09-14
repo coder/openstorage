@@ -75,9 +75,11 @@ serve process still holds the key.
 ([`OPENSTORAGE_S3_URL`](../reference/configuration.md#openstorage_s3_url)); credentials come
 from the standard AWS chain (env vars, shared config, instance roles). AWS S3 is the
 primary target; for self-hosting, [SeaweedFS](https://github.com/seaweedfs/seaweedfs) is
-the reference store the test suite runs against. Other S3-compatible stores (including
-MinIO) are supported on a best-effort basis — existing deployments keep working, but the
-test suites no longer run against them.
+the reference store the test suite runs against. Other endpoints (including MinIO) are
+untested/best-effort for ordinary blobs, not guaranteed compatible by product name or
+basic CRUD success. Check the [capabilities and qualification matrix](../explanation/storage-engine.md#storage-compatibility-and-qualification)
+for the used transfer, presign, range/copy and consistency requirements. Blob
+acceptance with PG/SQLite authority does not qualify an endpoint for S3WAL authority.
 
 - **Bucket permissions for the replica role.** With default settings the role needs all
   of:
@@ -503,13 +505,15 @@ misses a competitor's write. AWS S3 has provided this guarantee for all
 regions [since December 2020](https://aws.amazon.com/blogs/aws/amazon-s3-update-strong-read-after-write-consistency/)
 ([consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel));
 verify it for any other store, and never front the bucket with a cache.
-Qualified today: **SeaweedFS** (the tested self-hosted reference — the qualification
-lanes run against it in CI) and **AWS S3** (the full qualification lane passed in
-require mode against eu-central-1, 2026-08-27 — one campaign; see the
-[benchmark results](../plans/s3wal-bench-results.md)). MinIO and
-other S3-compatible stores are not qualified for `s3wal://` even where they work fine as
-plain [`OPENSTORAGE_S3_URL`](../reference/configuration.md#openstorage_s3_url) blob
-storage. Do not enable bucket versioning or object lock on the bucket.
+Reliable store HTTP `Date` witnesses are also required for expiry decisions; startup
+refuses a store that supplies no usable witness during the probe. Passing that probe
+is not a support certificate. The [storage qualification matrix](../explanation/storage-engine.md#storage-compatibility-and-qualification)
+separates tested releases/configurations from capability requirements and support
+status. **All S3WAL targets remain experimental.** AWS S3 and SeaweedFS are conditional
+future promotion targets under [#192 G1](https://github.com/coder/openstorage/issues/192),
+not a declaration that the remaining real-S3 or operations gates passed. MinIO and
+other endpoints are **not qualified for S3WAL authority**; ordinary blob compatibility
+is a separate question. Do not enable bucket versioning or object lock on the bucket.
 
 **Credentials and IAM.** Credentials come from the standard AWS chain (env vars, shared
 config, instance roles). The node's permission set on the one bucket matches the
