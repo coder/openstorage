@@ -5,8 +5,8 @@ package githttp
 // linux/amd64 archive, its checksum file, and the locally built candidate
 // into an exclusively owned attempt directory, verifies every identity
 // (pinned digests, embedded VCS build info, clean source checkout), and
-// records inputs.json. It never downloads or executes anything; the upgrade
-// TestMain owns downloads and lifecycle, and failures leave dest untouched.
+// records inputs.json. It never downloads or executes anything; the operator
+// supplies inputs and TestMain owns lifecycle. Failures preserve partial outputs.
 
 import (
 	"archive/tar"
@@ -216,9 +216,8 @@ func verifyUpgradeSource(dir, commit, tree string) error {
 	return nil
 }
 
-// recheck re-hashes both frozen binaries against the receipt. Call it
-// immediately before every invocation so a binary altered after
-// preparation is never executed.
+// recheck re-hashes both frozen binaries against the receipt immediately
+// before each invocation, detecting changes since preparation.
 func (in upgradeInputs) recheck() error {
 	for _, b := range [...]struct{ path, want, what string }{
 		{in.OldBinary, in.OldBinarySHA256, "old binary"}, {in.CandidateBinary, in.CandidateSHA256, "candidate"},

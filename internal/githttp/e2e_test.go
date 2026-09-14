@@ -103,6 +103,9 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if os.Getenv("OPENSTORAGE_TEST_UPGRADE") != "" {
+		os.Exit(upgradeTestMain(m))
+	}
 	if fuzzSkipEnvBoot(os.Args[1:]) {
 		os.Exit(m.Run())
 	}
@@ -410,7 +413,11 @@ func (n *testNode) stop() {
 // env entries win (os/exec dedups), so tests can override the defaults —
 // e.g. `OPENSTORAGE_TEST_MODE=` to prove knobs are refused in production.
 func startNode(cacheDir string, extraEnv ...string) (*testNode, error) {
-	cmd := exec.Command(binPath, "serve",
+	return startBinaryNode(binPath, cacheDir, os.Stderr, extraEnv...)
+}
+
+func startBinaryNode(binary, cacheDir string, stderr io.Writer, extraEnv ...string) (*testNode, error) {
+	cmd := exec.Command(binary, "serve",
 		"--listen", "127.0.0.1:0",
 		"--cache-dir", cacheDir,
 	)
@@ -430,7 +437,7 @@ func startNode(cacheDir string, extraEnv ...string) (*testNode, error) {
 		cmd.Env = append(cmd.Env, "OPENSTORAGE_S3WAL_LEASE_TTL=0")
 	}
 	cmd.Env = append(cmd.Env, extraEnv...)
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -451,11 +458,13 @@ func startNode(cacheDir string, extraEnv ...string) (*testNode, error) {
 	case line, ok := <-lineCh:
 		if !ok || !strings.HasPrefix(line, "listening on ") {
 			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 			return nil, fmt.Errorf("node did not announce address (got %q)", line)
 		}
 		return &testNode{cmd: cmd, addr: strings.TrimPrefix(line, "listening on ")}, nil
 	case <-time.After(30 * time.Second):
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return nil, fmt.Errorf("node startup timed out")
 	}
 }
