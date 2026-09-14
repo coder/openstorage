@@ -539,7 +539,7 @@ it is a deliberate single-node design:
 | One node, ever | No replicas, no failover process — recovery is "start a new node against the bucket". The instance lease detects accidental dual-serve; it does not make it safe. |
 | One CAS point per repository group | Concurrent pushes to the *same* repository serialize on one object; hot-repo write throughput is a handful of ref flips per second, and contention shows up as CAS retries. Different repositories don't contend. |
 | Every ref/metadata operation is an S3 round trip | Latency floors are S3 latency, not local-disk or Postgres latency. Same-region compute is assumed. |
-| Manifest size | A repository group's whole registry lives in one JSON object: soft warning at 4 MiB, new registrations refused at 16 MiB (roughly: thousands of refs + packs + LFS objects per repo, not tens of thousands). |
+| Manifest size | A repository group's whole registry lives in one JSON object: growth-guarded mutations warn above 4 MiB and are refused above 16 MiB; see the [size-guard scope](#s3wal-operational-signals) below. |
 | Background jobs are in-process | Like local mode: tickers, no durable River queue; queued local work dies with the process (durable request markers are re-enqueued at boot). |
 
 If any of these bind, use local mode (SQLite on a persistent volume) or the Postgres
@@ -566,9 +566,10 @@ qualification suite passed all surfaces against real S3):
   N=8, 16.9 s at N=32 — microbench manifest advances, not full pushes); the
   loopback e2e push bench measured real-push p99 of 5.8 s at N=32 vs local mode's
   2.8 s. Distinct repositories do not contend.
-- Contention exhaustion surfaces to the client as a clean, git-native hook rejection
-  naming the exhausted retry budget (`s3wal cas ref repo_…: 16 attempts: s3wal:
-  conditional-write contention retries exhausted`), never a hang.
+- The campaigns observed client-visible hook rejections on contention exhaustion
+  (`s3wal cas ref repo_…: 16 attempts: s3wal: conditional-write contention retries
+  exhausted`). Interpret this bounded-attempt failure using the
+  [operational signals](#s3wal-operational-signals), not as a capacity diagnosis.
 - Zero lost updates observed: every acknowledged push was durable across ~15,300 real
   pushes in the sustained multi-writer campaigns, plus ~790,000 lost-then-retried CAS
   races in the microbench cells.
@@ -596,25 +597,62 @@ real-S3 disaster-recovery qualification or a promotion/support claim.
 before changing binaries. The stopped-node backup is a precaution, not a
 cross-version rollback guarantee.
 
-**The lease lifecycle in practice.** A [graceful shutdown](#rolling-upgrades-and-restarts)
-(`SIGTERM`/`SIGINT`) releases `_wal/instance-lease` on the way out (a bounded best-effort
-delete — 5 seconds — after the bounded HTTP drain), so a successor starts immediately.
-After a **hard stop** (`SIGKILL`, crash, power loss) the lease stays behind: a replacement
-started early refuses with `s3wal instance lease _wal/instance-lease is held by another
-serve process …` until the stale lease ages past
-[`OPENSTORAGE_S3WAL_LEASE_TTL`](../reference/configuration.md#openstorage_s3wal_lease_ttl)
-(default 2 minutes), then boots normally by stealing it. To skip that wait, delete
-`_wal/instance-lease` — only after confirming the old process is actually dead: deleting
-it under a live node re-creates the undetected dual-serve topology the lease exists to
-catch. While running, the node heartbeats every TTL/4 and **fail-stops** (exits) if the
-lease is stolen or unrenewable — run serve under a supervisor that restarts it like any
-crash.
+### S3WAL operational signals
 
-**What to monitor in this mode** (besides the [general table](#what-to-monitor)):
+This is an **experimental, single-node** log/error runbook, not a metrics endpoint
+or an incident/real-S3 qualification. Use it alongside the [general monitoring
+guidance](#what-to-monitor). Returned store errors are not themselves server log
+entries: the caller determines their presentation. Terminal `serve` and `hook`
+errors print to stderr with `openstorage serve:` / `openstorage hook:` prefixes
+and exit 1; hook errors can reach Git clients. `WARN` below means `slog.Warn`.
+Ellipses abbreviate variable text, not literal messages.
 
-| Signal | Why |
-|---|---|
-| `s3wal instance lease` startup refusals / fail-stop exits | Dual-serve detection, or a stale lease after a crash (wait out the TTL); heartbeat-loss exits need the supervisor restart |
-| `openstorage hook: s3wal cas ref … contention retries exhausted` (client-visible) | Hot-repo CAS contention exceeded the retry budget — a retry usually lands; frequent occurrences mean the workload outgrew the one-CAS-point boundary |
-| `s3wal manifest approaching size cap` log line | A repository group's manifest passed the 4 MiB warning threshold; growing writes are refused at 16 MiB |
-| `s3wal clock skew guard tripped: demoting expiry verdict to report-only` log line | A skew guard failed closed — expiries defer (over-retention, never early deletion); persistent tripping means a wrong clock, so fix it and restart |
+| Signal/error | Emission conditions and fields | What it establishes | What it does not establish | Safe response |
+|---|---|---|---|---|
+| Returned `s3wal …: 16 attempts: s3wal: conditional-write contention retries exhausted` | The [manifest mutation loop](../../internal/ref/s3walstore.go#L473-L611) exhausted 16 fresh attempts (an optional cached-seed try is extra); text names operation and base. The [conditional client](../../internal/ref/s3wal/casobj.go#L342-L398) can separately exhaust 16 `409 ConditionalRequestConflict` attempts, naming `create`/`advance` and key. | A bounded attempt budget failed for the observed operation/base or key. | Not a global capacity limit or proven root cause. Manifest retries also include never-sent/recovery paths. These loops do not log ordinary retries; that says nothing about other SDK/transport logging. | Preserve the full error and operation; inspect same-base writer concurrency and store connectivity/errors. Reduce competing work before a controlled retry; inspect actual refs/results first. Do not retry until green. |
+| `WARN s3wal manifest approaching size cap` | [Size guard](../../internal/ref/s3walstore.go#L614-L633): growth predicate true; candidate encoded bytes **> 4 MiB and ≤ 16 MiB**. Fields: `base`, `bytes`, `warn`, `cap`. Suppressed after the first warning for that base in that store's map. | A candidate mutation crossed the soft threshold. | Not proof the write committed, a current-size gauge, or one warning per process/fleet lifetime. No warning does not prove spare capacity. | Record base/bytes and growth-producing operations; plan supported application-level cleanup or a deployment change before the hard cap. Never edit the manifest. |
+| Returned `s3wal …: manifest would grow to … bytes (cap 16777216): refusing new registrations` | Same guard, growth predicate true and candidate bytes **> 16 MiB**; text includes operation, base, size and cap. Hard refusal precedes the soft-warning branch. | This candidate was refused before its conditional PUT. | Not a blanket read-only mode or a promise that deletes, updates, reads or purge succeed; other guards and failures remain. | Stop adding registry entries to the affected group. Assess supported cleanup through ordinary APIs; preserve failures and escalate if cleanup is blocked. Do not raise/bypass the guard. |
+| Stderr `s3wal instance lease _wal/instance-lease is held by another serve process …` | [Acquisition](../../internal/ref/s3wal/lease.go#L138-L227) found a fresh recorded lease, or a foreign holder won an acquisition race. Fields in text: holder prefix, rounded store-clock age, holder's TTL. | This startup refused that lease. | Not proof the holder is still alive; a stopped process can leave a lease. Not permission to force takeover. | Identify/fence writers and follow the [shutdown/restart procedure](#s3wal-shutdown-and-restart) below. |
+| Stderr `s3wal instance lease … fail-stop` | [Renewal](../../internal/ref/s3wal/lease.go#L258-L327) re-read found a foreign holder, corruption or disappearance; or failures persisted until the last accepted renewal was at least TTL − cadence old. Cadence is TTL/4. `unrenewable since …` includes elapsed time, TTL and write/read errors. | The heartbeat returned a loss verdict; [`serve` exits 1](../../cmd/openstorage/main.go#L165-L180). | Not proof of whole-system integrity, safe dual servers, or that every transient renewal failure exits. Fail-stop does not run graceful cleanup. | Preserve stderr and supervisor history; fence traffic/restarts, identify every writer, inspect connectivity and store evidence before restarting one node. |
+| Stderr `s3wal init: store supplied no usable HTTP Date witness during the probe …` or lease `… freshness cannot be judged on the store clock …` / `… is corrupt …` | [Startup probe](../../internal/ref/s3walstore.go#L199-L214) lacks a usable Date witness (missing or older than 30s); [lease acquisition](../../internal/ref/s3wal/lease.go#L154-L227) cannot decode the lease or judge its store-clock age. | Startup failed closed on missing/invalid evidence. | Not necessarily host-clock skew or a stale/dead holder. | Preserve errors; inspect store/proxy Date and Last-Modified behavior and connectivity. Keep writers fenced and escalate corruption. Do not follow diagnostic text suggesting object deletion. |
+| `WARN s3wal clock skew guard tripped: demoting expiry verdict to report-only` | [Expiry guard](../../internal/ref/s3walstore_quota.go#L68-L124): positive TTL appears elapsed, but clock or store-Date check fails. Fields: `base`, `what`, `manifest_clk`, `local_now`, `wall_drift`, `store_date`, `store_date_age`, `ttl`. | **That expiry verdict** was refused. | Not a diagnosis of a wrong host clock, a global report-only switch, or proof that all other operations are safe/successful. | Compare host time/drift, manifest clock and store/proxy Date evidence. A missing/stale witness also trips the guard. Fix the cause before a controlled restart; do not disable time safeguards. |
+
+**Size-guard scope.** The guard runs only when `mu.grows` is non-nil and returns
+true; it does not measure the byte delta against the old manifest. Equality with
+either threshold does not trigger that threshold's action. Mutations outside that
+predicate bypass **only this guard**. The warning map is allocated by each
+[`newS3WALStore`](../../internal/ref/s3walstore.go#L152-L193); `serve` opens a store,
+and [hook invocations open their own](../../internal/githttp/hook.go#L1728-L1732).
+Reopening a store permits another warning for the same base.
+
+**Clock-guard scope.** The [clock checks](../../internal/ref/s3wal/manifest.go#L334-L427)
+compare a manifest clock ahead of local time and wall-vs-monotonic drift against
+`min(TTL/4, 15m)`. The store-Date arm additionally requires a fresh witness and
+local/store agreement; bounds below the 2s Date-resolution tolerance disable that
+arm. A quiet repository's old manifest clock alone is not skew. The conditional
+client [records parsed HTTP Date headers](../../internal/ref/s3wal/casobj.go#L178-L213).
+A prior wall-clock step can leave the [store's drift baseline](../../internal/ref/s3walstore.go#L636-L650)
+tripped until restart; restart does not repair an incorrect clock or missing witness.
+
+### S3WAL shutdown and restart
+
+1. Preserve the full error/log context, binary version, affected base/operation,
+   timestamps, holder/TTL evidence and supervisor history. Redact credentials and
+   signed URLs. Identify every serving process, hook and maintenance writer;
+   prevent replacement launches and fence access before intervening.
+2. Stop the old node with `SIGTERM`/`SIGINT` and verify it and its writers exited.
+   The [graceful shutdown](#rolling-upgrades-and-restarts) drains HTTP, then attempts
+   lease release with a **5s best-effort bound**. Immediate restart is possible
+   only if release succeeds; graceful shutdown can also leave the lease behind.
+3. After a hard stop, heartbeat fail-stop or failed release, keep the old writers
+   fenced. Allow at least the **holder's recorded TTL plus 2s** after confirmed
+   stop (default TTL 2m). Acquisition uses store Date and Last-Modified with a
+   whole-second resolution margin, not a comparison of host clocks. Start only
+   one replacement; if it still refuses a held lease, preserve that evidence,
+   remain fenced and wait for its reported expiry before a controlled retry.
+   Unjudgeable/corrupt leases require investigation, not repeated starts.
+4. Verify authenticated repository reads and expected refs before restoring
+   traffic; `/healthz` alone is not recovery proof. The instance lease is a
+   diagnostic/fail-stop mechanism, **not** independent proof of integrity or
+   support for dual servers. Never manually delete the lease, edit `_wal/`, force
+   takeover or disable safeguards to make startup pass.
