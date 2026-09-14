@@ -32,6 +32,16 @@ e2e harness builds the real `openstorage` binary, boots the chosen backends,
 starts server nodes as subprocesses, and drives them with plain `git`, `curl`-level
 HTTP, and a real `git lfs` client.
 
+### Offline S3WAL recovery drill
+
+`TestS3WAL_OfflineBackupRestore` runs in the S3WAL lane. It uses isolated source,
+backup and restore buckets, not the shared serving bucket. The drill checks a
+stopped-node whole-bucket copy, rejects a damaged inventory before restore boot,
+removes source data/cache, and verifies fresh-cache Git/LFS recovery and a new
+push. See the [recovery runbook](../how-to/backup-restore-s3wal.md#reproduce-the-local-recovery-drill)
+for the targeted command and operational limitations. This is local fixture
+proof, not a real-S3 promotion gate.
+
 ### Flags that are not optional
 
 - **`-count=1` when switching lanes.** The Go test cache does track environment
@@ -297,7 +307,7 @@ guards it in require mode.
 Two positives from the same spike, for future lane design: Floci passes the
 full 22-surface s3wal qualification suite (`TestQualifyExternalEndpoint` in
 `internal/ref/s3wal`; re-confirmed 22/22 on the pin by `TestQualifyFloci`)
-— the only emulator besides SeaweedFS to do so — and SeaweedFS 4.45 honors
+— the only emulator besides SeaweedFS to do so — and SeaweedFS 4.46 honors
 conditional DELETE (412 and the object survives on a mismatched `If-Match`),
 unlike both Floci and the legacy MinIO pin.
 
