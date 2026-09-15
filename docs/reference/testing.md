@@ -42,6 +42,15 @@ push. See the [recovery runbook](../how-to/backup-restore-s3wal.md#reproduce-the
 for the targeted command and operational limitations. This is local fixture
 proof, not a real-S3 promotion gate.
 
+### Official-release upgrade smoke
+
+The opt-in [official-to-candidate upgrade harness](../how-to/test-release-upgrade.md)
+uses an explicitly supplied official v0.15.0 archive and an exact clean candidate.
+It bypasses the shared suite bootstrap, uses a private bucket with active leases,
+and checks cold-cache Git/LFS, selected metadata, and encrypted-secret continuity.
+Ordinary CI does not download release artifacts or claim this upgrade coverage.
+A candidate smoke does not complete the final released-pair promotion criterion.
+
 ### Flags that are not optional
 
 - **`-count=1` when switching lanes.** The Go test cache does track environment
