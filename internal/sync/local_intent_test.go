@@ -317,6 +317,187 @@ func TestLocalPendingPushQueuedRetry(t *testing.T) {
 	}
 }
 
+// Inject an upstream endpoint outage without replacing durable claim behavior.
+type unavailablePushEndpoint struct {
+	UpstreamStore
+	offline bool
+}
+
+func (s *unavailablePushEndpoint) BeginPush(ctx context.Context, id, holder string, lease time.Duration) (Upstream, bool, string, error) {
+	up, force, stolen, err := s.UpstreamStore.BeginPush(ctx, id, holder, lease)
+	if s.offline {
+		up.UpstreamHost = "http://127.0.0.1:1"
+	}
+	return up, force, stolen, err
+}
+
+// An explicit run may cover delayed work. Its old timer (or queued retry)
+// must neither delay the next hook marker nor consume that marker later.
+func TestLocalPendingPushCoveredRetry(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		for _, phase := range []string{"backoff", "deferred", "queued"} {
+			t.Run(backend+"/"+phase, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx := t.Context()
+					f, st, job := localIntentWorker(t, backend, "")
+					arrived, release := make(chan struct{}), make(chan struct{})
+					q := NewInProcessQueue(f.worker.Run, func(ctx context.Context, retry Job) error {
+						if phase == "queued" && retry.Retry == 1 {
+							close(arrived)
+							<-release
+						}
+						return f.worker.RunPush(ctx, retry)
+					}, discardTestLogger())
+					defer q.Close()
+					defer f.worker.CloseLocal()
+					releaseWorker := stdsync.OnceFunc(func() { close(release) })
+					defer releaseWorker()
+					f.worker.RequeuePush = q.EnqueuePush
+					if phase == "deferred" {
+						if _, _, _, err := f.worker.Upstreams.BeginPush(ctx, job.RepoID, "other", 2*time.Minute); err != nil {
+							t.Fatal(err)
+						}
+						if err := st.RequestPush(ctx, job.RepoID, false); err != nil {
+							t.Fatal(err)
+						}
+						if err := f.worker.RunPush(ctx, job); err != nil {
+							t.Fatal(err)
+						}
+						if _, err := f.worker.Upstreams.FinishPush(ctx, job.RepoID, "other", true); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						endpoint := &unavailablePushEndpoint{UpstreamStore: f.worker.Upstreams, offline: true}
+						f.worker.Upstreams = endpoint
+						if err := f.worker.RunPush(ctx, job); !TransientPushFailure(err) {
+							t.Fatalf("want real transient failure: %v", err)
+						}
+						endpoint.offline = false
+						if phase == "queued" {
+							time.Sleep(PushRetryDelay(1))
+							<-arrived
+						}
+					}
+					if err := f.worker.RunPush(ctx, job); err != nil {
+						t.Fatalf("explicit run must cover the pending work: %v", err)
+					}
+					if err := st.RequestPush(ctx, job.RepoID, false); err != nil {
+						t.Fatal(err)
+					}
+					if err := q.EnqueuePendingPush(ctx, job); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					up, err := st.GetRepoUpstream(ctx, job.RepoID)
+					if err != nil || up.PushRunCount != 3 || up.PushPending != 0 {
+						t.Errorf("obsolete retry blocked a fresh hook: runs=%d pending=%d err=%v", up.PushRunCount, up.PushPending, err)
+					}
+					releaseWorker()
+					time.Sleep(3 * time.Minute)
+					synctest.Wait()
+					up, err = st.GetRepoUpstream(ctx, job.RepoID)
+					if err != nil || up.PushRunCount != 3 || up.PushPending != 0 {
+						t.Fatalf("obsolete retry ran after its intent was covered: %+v err=%v", up, err)
+					}
+				})
+			})
+		}
+	}
+}
+
+type localAdmissionFailure struct {
+	UpstreamStore
+	read, claim atomic.Bool
+}
+
+func (s *localAdmissionFailure) GetUpstream(ctx context.Context, id string) (Upstream, error) {
+	if s.read.CompareAndSwap(true, false) {
+		return Upstream{}, fmt.Errorf("temporary metadata read failure")
+	}
+	return s.UpstreamStore.GetUpstream(ctx, id)
+}
+
+func (s *localAdmissionFailure) BeginPush(ctx context.Context, id, holder string, lease time.Duration) (Upstream, bool, string, error) {
+	if s.claim.CompareAndSwap(true, false) {
+		return Upstream{}, false, "", fmt.Errorf("temporary metadata claim failure")
+	}
+	return s.UpstreamStore.BeginPush(ctx, id, holder, lease)
+}
+
+func TestLocalPendingPushPreclaimFailureKeepsBackoff(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		for _, phase := range []string{"lookup", "claim", "timer_read", "enqueue"} {
+			t.Run(backend+"/"+phase, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx := t.Context()
+					f, st, job := localIntentWorker(t, backend, "http://127.0.0.1:1")
+					fault := &localAdmissionFailure{UpstreamStore: f.worker.Upstreams}
+					f.worker.Upstreams = fault
+					var lookupFail, enqueueFail atomic.Bool
+					lookup := f.worker.Repos
+					f.worker.Repos = func(ctx context.Context, org, id string) (RepoInfo, error) {
+						if lookupFail.CompareAndSwap(true, false) {
+							return RepoInfo{}, fmt.Errorf("temporary repo lookup failure")
+						}
+						return lookup(ctx, org, id)
+					}
+					q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
+					defer q.Close()
+					defer f.worker.CloseLocal()
+					f.worker.RequeuePush = func(ctx context.Context, retry Job) error {
+						if enqueueFail.CompareAndSwap(true, false) {
+							return fmt.Errorf("temporary enqueue failure")
+						}
+						return q.EnqueuePush(ctx, retry)
+					}
+					job.Retry = 3 // Exercise a late backoff position and the remaining budget.
+					if err := f.worker.RunPush(ctx, job); !TransientPushFailure(err) {
+						t.Fatalf("want real transient transfer failure: %v", err)
+					}
+					switch phase {
+					case "lookup":
+						lookupFail.Store(true)
+					case "claim":
+						fault.claim.Store(true)
+					case "timer_read":
+						fault.read.Store(true)
+					case "enqueue":
+						enqueueFail.Store(true)
+					}
+					time.Sleep(PushRetryDelay(4))
+					synctest.Wait()
+					if lookupFail.Load() || fault.claim.Load() || fault.read.Load() || enqueueFail.Load() {
+						t.Fatal("fixture did not reach the selected failure")
+					}
+					assertRuns := func(want, pending int) {
+						t.Helper()
+						up, err := st.GetRepoUpstream(ctx, job.RepoID)
+						if err != nil || up.PushRunCount != want || up.PushPending != pending {
+							t.Fatalf("runs=%d pending=%d, want %d/%d: %v", up.PushRunCount, up.PushPending, want, pending, err)
+						}
+					}
+					// No new caller intent: polling cannot take over the failed
+					// pre-claim handoff as Retry=0 or run at a shorter cadence.
+					if err := q.EnqueuePendingPush(ctx, Job{Org: job.Org, RepoID: job.RepoID}); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					assertRuns(1, 2)
+					time.Sleep(PushRetryDelay(4) - time.Second)
+					synctest.Wait()
+					assertRuns(1, 2)
+					time.Sleep(time.Second)
+					synctest.Wait()
+					assertRuns(2, 2)
+					time.Sleep(PushRetryDelay(5))
+					synctest.Wait()
+					assertRuns(3, 0) // budget exhausted, not reset by the failed handoff
+				})
+			})
+		}
+	}
+}
+
 func TestLocalPendingPushBackoffAndBudget(t *testing.T) {
 	for _, backend := range []string{"sqlite", "s3wal"} {
 		for _, fresh := range []bool{false, true} {

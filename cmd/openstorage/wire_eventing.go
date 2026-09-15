@@ -149,8 +149,9 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 // git:read scope); the poke matches it. The write itself was accepted and
 // stays local; convergence resumes on the next authorized trigger.
 // Deliberately NOT falling through to the pull poke: pulling now would
-// force-revert the write that was just accepted. The pull poke stays
-// ungated — documented invariant-11 behavior this slice does not change.
+// force-revert the write that was just accepted. The helper does not gate
+// the pull poke; the local hook callback separately rejects ref policies
+// before creating its durable pull marker.
 func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string, callerDenied func(ctx context.Context) bool) func(ctx context.Context, repoID string) error {
 	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "" && callerDenied != nil,
 		"enqueueSyncOrForward: missing deps")
@@ -235,9 +236,13 @@ func hookCallerDeniedForward() bool {
 			return true // fail closed
 		}
 	}
-	if !slices.Contains(scopes, auth.ScopeGitRead) {
-		return true
-	}
+	return !slices.Contains(scopes, auth.ScopeGitRead) || hookCallerDeniedPull()
+}
+
+// hookCallerDeniedPull matches the explicit pull API's ref-policy gate: a
+// full mirror must not change refs on behalf of a restricted writer. Git HTTP
+// already checked git:write; unlike forwarding, pulling does not require read.
+func hookCallerDeniedPull() bool {
 	policyJSON := envconfig.Getenv(githttp.EnvRefsPolicy)
 	opsJSON := envconfig.Getenv(githttp.EnvOps)
 	if policyJSON == "" && opsJSON == "" {
@@ -521,9 +526,14 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		local := jobs.NewLocal(deliverer, neverRun, neverRun, nil /* hook subprocesses never fold */, logger)
 		cleanups = append(cleanups, local.Close) // waits for in-flight deliveries
 		enqueueDelivery = local.EnqueueWebhookDelivery
-		denied := hookCallerDeniedForward()
+		denied, pullDenied := hookCallerDeniedForward(), hookCallerDeniedPull()
 		enqueueSync = enqueueSyncOrForward(ms,
-			func(ctx context.Context, job upsync.Job) error { return ms.RequestSync(ctx, job.RepoID) },
+			func(ctx context.Context, job upsync.Job) error {
+				if pullDenied {
+					return nil // an allowed ref write cannot authorize an unpoliced mirror
+				}
+				return ms.RequestSync(ctx, job.RepoID)
+			},
 			// enqueueSyncOrForward already persisted RequestPush. The hook
 			// never starts a worker; the serve-side live consumer owns it.
 			func(context.Context, upsync.Job) error { return nil }, org,

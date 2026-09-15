@@ -66,7 +66,10 @@ Forwarding remains opt-in. It requires caller `git:read` and no ref-policy opera
 missing/malformed scopes or policies fail closed. A denied forward creates neither
 forward intent nor an inbound-pull fallback over the accepted write. Sync workers'
 claim-tagged loopback pushes do not trigger another run. With forwarding disabled,
-a push pokes inbound sync only when no inbound run was observed in flight, as before.
+a push pokes inbound sync only when no inbound run was observed in flight and the
+caller has no ref-policy operation. Malformed ref policies or operations also deny
+this pull trigger. Like the explicit pull API, an unpoliced `git:write` caller does
+not additionally need `git:read` to trigger a pull.
 No-op or wholly rejected pushes create no intent. A partially accepted push, or a
 committed update followed by an HTTP error such as 413, can create intent: the
 accepted authority change, not the final response status, is the trigger.

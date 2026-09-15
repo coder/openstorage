@@ -89,6 +89,7 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 
 	repo, err := w.Repos(ctx, job.Org, job.RepoID)
 	if errors.Is(err, ErrNotFound) {
+		w.forgetLocalRetry(job.retryKey, job.retryTimer)
 		return nil // repo deleted while queued: nothing to push or emit
 	}
 	if err != nil {
@@ -109,6 +110,7 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	case errors.Is(err, errNoPending):
 		return nil // queued observation was covered before admission
 	case errors.Is(err, ErrNotFound):
+		w.forgetLocalRetry(job.retryKey, job.retryTimer)
 		return nil // detached before start: cancel silently
 	case errors.Is(err, ErrPushInProgress):
 		// Overlapping outbound run: skip. A LIVE holder covers pending
@@ -297,6 +299,9 @@ func (w *Worker) schedulePushRetry(ctx context.Context, job Job, force bool) {
 // request's last local vehicle until the lease can be stolen. No legacy
 // grace exists here — push claims only ever come from #90-aware binaries.
 func (w *Worker) deferPendingPushRetry(ctx context.Context, job Job) {
+	if job.retryTimer != nil {
+		return // finishLocal re-arms this already-owned retry at its existing cadence
+	}
 	if w.RequeuePush == nil {
 		return // river lane: durable rescue owns crashed-holder recovery
 	}

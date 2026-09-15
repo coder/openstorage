@@ -240,17 +240,18 @@ func (w *Worker) startLocal(job Job, push bool) (func(), bool) {
 	}
 	w.deferMu.Lock()
 	defer w.deferMu.Unlock()
-	if w.localClosed || (job.pendingOnly && (w.localActive[lane] > 0 || w.localRetryPending(job.RepoID, push))) {
+	if w.localClosed || (job.retryTimer != nil && w.deferredRetry[job.retryKey] != job.retryTimer) ||
+		(job.pendingOnly && (w.localActive[lane] > 0 || w.localRetryPending(job.RepoID, push))) {
 		return nil, false
-	}
-	if job.retryTimer != nil && w.deferredRetry[job.retryKey] == job.retryTimer {
-		delete(w.deferredRetry, job.retryKey)
 	}
 	if w.localActive == nil {
 		w.localActive = make(map[string]int)
 	}
 	w.localActive[lane]++
 	return func() {
+		// A successful claim removes this identity. Otherwise a pre-claim
+		// error must retain its retry position rather than hand it to a poll.
+		defer w.rearmLocalRetry(job)
 		w.deferMu.Lock()
 		defer w.deferMu.Unlock()
 		assertf(w.localActive[lane] > 0, "unbalanced local run for %q", lane)
@@ -262,7 +263,7 @@ func (w *Worker) startLocal(job Job, push bool) (func(), bool) {
 }
 
 // localRetryPending is called with deferMu held. Timer reservations remain
-// present through enqueue until the successor actually enters startLocal.
+// present through enqueue and pre-claim failures until a claim covers them.
 func (w *Worker) localRetryPending(repoID string, push bool) bool {
 	if push {
 		return w.deferredRetry["push-retry:"+repoID] != nil || w.deferredRetry["push-defer:"+repoID] != nil
@@ -281,6 +282,9 @@ func (w *Worker) admitLocal(ctx context.Context, job Job, push bool, claim func(
 	}
 	w.deferMu.Lock()
 	defer w.deferMu.Unlock()
+	if w.localClosed || (job.retryTimer != nil && w.deferredRetry[job.retryKey] != job.retryTimer) {
+		return errNoPending // an intervening claim covered this queued retry
+	}
 	if job.pendingOnly {
 		lane := "pull:" + job.RepoID
 		if push {
@@ -297,7 +301,22 @@ func (w *Worker) admitLocal(ctx context.Context, job Job, push bool, claim func(
 			return errNoPending
 		}
 	}
-	return claim()
+	if err := claim(); err != nil {
+		return err
+	}
+	// This claim consumed the pending marker, including any delayed intent.
+	// Cancel both timer and queued identities before admitting another run.
+	keys := []string{job.RepoID}
+	if push {
+		keys = []string{"push-retry:" + job.RepoID, "push-defer:" + job.RepoID}
+	}
+	for _, key := range keys {
+		if timer := w.deferredRetry[key]; timer != nil {
+			timer.Stop()
+			delete(w.deferredRetry, key)
+		}
+	}
+	return nil
 }
 
 // scheduleLocalRetry retains the existing single-flight time.AfterFunc retry.
@@ -323,32 +342,53 @@ func (w *Worker) scheduleLocalRetry(key string, delay time.Duration, job Job, pu
 		w.deferMu.Unlock()
 		defer w.localTimers.Done()
 
+		// Reset may start another callback before this one returns. Never
+		// mutate the captured job shared by those callbacks.
+		retry := job
+		retry.pendingOnly = false
+		retry.retryKey, retry.retryTimer, retry.retryOwner, retry.retryDelay = key, timer, w, delay
 		ctx, cancel := context.WithTimeout(context.Background(), detachedOpTimeout)
 		defer cancel()
 		up, err := w.Upstreams.GetUpstream(ctx, job.RepoID)
-		if err != nil || (push && up.PushPending == PushPendingNone) || (!push && !up.SyncPending) {
+		if errors.Is(err, ErrNotFound) || (err == nil && ((push && up.PushPending == PushPendingNone) || (!push && !up.SyncPending))) {
 			w.forgetLocalRetry(key, timer)
+			return
+		}
+		if err != nil {
+			w.rearmLocalRetry(retry)
+			w.Logger.Warn("local pending retry read failed", "repo", job.RepoID, "err", err)
 			return
 		}
 		w.deferMu.Lock()
-		closed := w.localClosed
+		stale := w.localClosed || w.deferredRetry[key] != timer
 		w.deferMu.Unlock()
-		if closed {
-			w.forgetLocalRetry(key, timer)
+		if stale {
 			return
 		}
-		job.pendingOnly = false
-		job.retryKey, job.retryTimer, job.retryOwner = key, timer, w
 		enqueue := w.Requeue
 		if push {
 			enqueue = w.RequeuePush
 		}
-		if err := enqueue(ctx, job); err != nil {
-			w.forgetLocalRetry(key, timer)
+		if err := enqueue(ctx, retry); err != nil {
+			w.rearmLocalRetry(retry)
 			w.Logger.Warn("local pending retry enqueue failed", "repo", job.RepoID, "err", err)
 		}
 	})
 	w.deferredRetry[key] = timer
+}
+
+// rearmLocalRetry retains the same delay and Retry count when no claim took
+// ownership. A successful intervening claim or shutdown invalidates the timer.
+func (w *Worker) rearmLocalRetry(job Job) {
+	if job.retryTimer == nil {
+		return
+	}
+	assertf(job.retryDelay > 0, "local retry has no delay")
+	w.deferMu.Lock()
+	defer w.deferMu.Unlock()
+	if !w.localClosed && w.deferredRetry[job.retryKey] == job.retryTimer {
+		job.retryTimer.Reset(job.retryDelay)
+	}
 }
 
 // forgetLocalRetry releases only this timer's reservation, never a successor's.
@@ -427,6 +467,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 
 	repo, err := w.Repos(ctx, job.Org, job.RepoID)
 	if errors.Is(err, ErrNotFound) {
+		w.forgetLocalRetry(job.retryKey, job.retryTimer)
 		return nil // repo deleted while queued: nothing to sync or emit
 	}
 	if err != nil {
@@ -446,6 +487,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	case errors.Is(err, errNoPending):
 		return nil // queued observation was covered before admission
 	case errors.Is(err, ErrNotFound):
+		w.forgetLocalRetry(job.retryKey, job.retryTimer)
 		return nil // detached before start: cancel silently (docs/reference/webhooks.md)
 	case errors.Is(err, ErrSyncInProgress):
 		// Overlapping run: skip (invariant 11). A LIVE holder covers any
@@ -583,6 +625,9 @@ func deferredRetryDelay(up Upstream) time.Duration {
 // documented local-mode trade-off; the river lane instead relies on its
 // durable job being rescued and re-run (jobs/river.go syncRescueAttempts).
 func (w *Worker) deferPendingRetry(ctx context.Context, job Job) {
+	if job.retryTimer != nil {
+		return // finishLocal re-arms this already-owned retry at its existing cadence
+	}
 	if w.Requeue == nil {
 		return // river lane: durable rescue owns crashed-holder recovery
 	}

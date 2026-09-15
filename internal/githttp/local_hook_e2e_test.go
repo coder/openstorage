@@ -56,7 +56,8 @@ func TestLocalHookIntentTracksAcceptedCommands(t *testing.T) {
 	}{
 		{name: "no_op", noop: true},
 		{name: "rejected", denied: true, wantErr: true},
-		{name: "partial", partial: true, denied: true, wantErr: true, wantIntent: true},
+		{name: "partial_cannot_pull", partial: true, denied: true, wantErr: true},
+		{name: "partial_unpoliced", partial: true, wantIntent: true},
 		{name: "atomic_rejected", partial: true, atomic: true, denied: true, wantErr: true},
 		{name: "atomic_accepted", partial: true, atomic: true, wantIntent: true},
 		{name: "partial_cannot_forward_or_pull", partial: true, denied: true, forward: true, wantErr: true},

@@ -276,6 +276,7 @@ type Job struct {
 	retryKey    string
 	retryTimer  *time.Timer
 	retryOwner  *Worker
+	retryDelay  time.Duration
 	Retry       int
 }
 
