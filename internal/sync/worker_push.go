@@ -139,7 +139,18 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	started.Type = EventSyncStarted
 	w.emitDetached(ctx, job.Org, EventSyncStarted, started.marshal())
 
-	rejected, runErr := w.transferPush(ctx, job, repo, up, holder, force)
+	var runErr error
+	if w.WaitPushPublication != nil {
+		assertf(w.RequeuePush != nil, "publication wait requires the local queue")
+		runErr = w.WaitPushPublication(ctx, job.RepoID)
+	}
+	publicationWaitFailed := runErr != nil
+	var rejected []RejectedRef
+	if !publicationWaitFailed {
+		rejected, runErr = w.transferPush(ctx, job, repo, up, holder, force)
+	} else {
+		runErr = &syncFailure{code: FailInternal, cause: fmt.Errorf("wait for cache ref publication: %w", runErr)}
+	}
 	if errors.Is(runErr, errDetached) {
 		return nil // detach raced the run: the row is gone, cancel silently
 	}
@@ -236,6 +247,22 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 					"org", job.Org, "repo", job.RepoID, "err", afErr)
 			}
 		}
+	}
+
+	if publicationWaitFailed {
+		// No snapshot was taken. Retain the consumed intent (including force)
+		// and the SAME transfer-retry position, even when the wait timed out.
+		// localActive covers this mark-to-timer handoff against live polling.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+		defer cancel()
+		if err := w.Upstreams.RequestPush(rctx, job.RepoID, force); err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				w.Logger.Warn("re-mark publication wait failed", "repo", job.RepoID, "err", err)
+			}
+			return runErr
+		}
+		w.scheduleLocalRetry("push-retry:"+job.RepoID, PushRetryDelay(max(1, job.Retry)), job, true)
+		return runErr
 	}
 
 	if runErr != nil && TransientPushFailure(runErr) && job.Retry < MaxPushTransientRetries {

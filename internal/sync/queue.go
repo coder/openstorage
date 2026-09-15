@@ -26,6 +26,8 @@ type InProcessQueue struct {
 	observers chan struct{}   // bounds live-consumer work, including queued observations
 	closed    bool
 	wg        stdsync.WaitGroup
+
+	beforeDequeue func(Job) // test seam: pause a real queued job before coalescing ends
 }
 
 var _ Queue = (*InProcessQueue)(nil)
@@ -85,10 +87,10 @@ func (q *InProcessQueue) enqueue(lane string, run func(ctx context.Context, job 
 		return errors.New("sync queue is closed")
 	}
 	if q.pending[key] {
-		// The queued caller covers this retry. There will be no successor
-		// carrying its reservation into the worker, so release it here.
+		// Queuing is not a claim: the caller can still fail before admission.
+		// Keep the same retry position until a successful claim covers it.
 		if job.retryOwner != nil {
-			job.retryOwner.forgetLocalRetry(job.retryKey, job.retryTimer)
+			job.retryOwner.rearmLocalRetry(job)
 		}
 		return nil // coalesced with the queued run
 	}
@@ -103,6 +105,9 @@ func (q *InProcessQueue) enqueue(lane string, run func(ctx context.Context, job 
 	q.wg.Go(func() {
 		if job.pendingOnly {
 			defer func() { <-q.observers }()
+		}
+		if q.beforeDequeue != nil {
+			q.beforeDequeue(job)
 		}
 		q.mu.Lock()
 		delete(q.pending, key)

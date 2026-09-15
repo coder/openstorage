@@ -280,7 +280,7 @@ func isPGURL(dbURL string) bool {
 // non-nil repack registers the background-repack worker on both backends.
 // The returned cleanup stops the sweep and the queue (waiting for in-flight
 // local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, absence *jobs.AbsenceReconcileSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, syncEgress syncEgressSettings, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL, cacheDir string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, absence *jobs.AbsenceReconcileSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, syncEgress syncEgressSettings, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
 	assertf(ms != nil && dbURL != "" && org != "" && loopbackBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
@@ -363,6 +363,10 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// additionally drives the transient-retry backoff timers (#90).
 		worker.Requeue = queue.EnqueueSync
 		worker.RequeuePush = queue.EnqueuePush
+		assertf(cacheDir != "", "local publication wait requires the cache directory")
+		worker.WaitPushPublication = func(ctx context.Context, repoID string) error {
+			return githttp.WaitForPushPublication(ctx, cacheDir, repoID)
+		}
 		stopPending := startLocalPendingSync(ctx, pending, org, q, logger)
 		cleanup = func() {
 			stopPending()       // cancel and join the producer before closing admission

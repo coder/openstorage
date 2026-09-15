@@ -161,6 +161,11 @@ type Worker struct {
 	// split: local mode points it at EnqueuePush, river leaves it nil and
 	// schedules successors transactionally (jobs/river.go pushWorker).
 	RequeuePush func(ctx context.Context, job Job) error
+	// WaitPushPublication is local-mode wiring for the existing cache push
+	// holds. It runs after claim admission, before any outbound snapshot.
+	// A failed wait is not a transfer attempt and retains the retry budget.
+	WaitPushPublication func(ctx context.Context, repoID string) error
+
 	// AfterForward, when non-nil, enqueues one inbound sync after every
 	// SUCCESSFUL outbound run. On ForwardOnPush repos it is the
 	// mirror-back half of the upstream model ("pushes are proxied to the

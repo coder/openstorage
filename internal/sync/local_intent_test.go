@@ -424,6 +424,102 @@ func (s *localAdmissionFailure) BeginPush(ctx context.Context, id, holder string
 	return s.UpstreamStore.BeginPush(ctx, id, holder, lease)
 }
 
+// The ordinary job is really queued, not merely paused after dequeue: the
+// timer must coalesce before that job encounters the injected pre-claim error.
+func TestLocalPendingPushCoalescedRetryPreclaimFailure(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		for _, phase := range []string{"lookup", "claim"} {
+			t.Run(backend+"/"+phase, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx := t.Context()
+					f, st, job := localIntentWorker(t, backend, "http://127.0.0.1:1")
+					fault := &localAdmissionFailure{UpstreamStore: f.worker.Upstreams}
+					f.worker.Upstreams = fault
+					var lookupFail atomic.Bool
+					lookup := f.worker.Repos
+					f.worker.Repos = func(ctx context.Context, org, id string) (RepoInfo, error) {
+						if lookupFail.CompareAndSwap(true, false) {
+							return RepoInfo{}, fmt.Errorf("temporary repo lookup failure")
+						}
+						return lookup(ctx, org, id)
+					}
+					arrived, release := make(chan struct{}), make(chan struct{})
+					q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
+					q.beforeDequeue = func(queued Job) {
+						if !queued.pendingOnly && queued.Retry == 0 {
+							close(arrived)
+							<-release
+						}
+					}
+					defer q.Close()
+					defer f.worker.CloseLocal()
+					releaseWorker := stdsync.OnceFunc(func() { close(release) })
+					defer releaseWorker()
+					var retries []int
+					f.worker.RequeuePush = func(ctx context.Context, retry Job) error {
+						retries = append(retries, retry.Retry)
+						return q.EnqueuePush(ctx, retry)
+					}
+					job.Retry = 3
+					if err := f.worker.RunPush(ctx, job); !TransientPushFailure(err) {
+						t.Fatalf("want real transient failure: %v", err)
+					}
+					ordinary := Job{Org: job.Org, RepoID: job.RepoID}
+					if err := q.EnqueuePush(ctx, ordinary); err != nil {
+						t.Fatal(err)
+					}
+					<-arrived
+					time.Sleep(PushRetryDelay(4))
+					synctest.Wait()
+					if len(retries) != 1 || retries[0] != 4 {
+						t.Fatalf("retry did not reach real queued coalescing: %v", retries)
+					}
+					if phase == "lookup" {
+						lookupFail.Store(true)
+					} else {
+						fault.claim.Store(true)
+					}
+					releaseWorker()
+					synctest.Wait()
+					if lookupFail.Load() || fault.claim.Load() {
+						t.Fatal("ordinary job did not hit the selected pre-claim error")
+					}
+					assertRuns := func(want, pending int) {
+						t.Helper()
+						up, err := st.GetRepoUpstream(ctx, job.RepoID)
+						if err != nil || up.PushRunCount != want || up.PushPending != pending || up.PushSyncing {
+							t.Fatalf("runs=%d pending=%d syncing=%t, want %d/%d/false: %v", up.PushRunCount, up.PushPending, up.PushSyncing, want, pending, err)
+						}
+					}
+					assertRuns(1, 2)
+					if err := q.EnqueuePendingPush(ctx, ordinary); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					assertRuns(1, 2) // no fresh request: polling cannot inherit Retry=0
+					time.Sleep(PushRetryDelay(4) - time.Second)
+					synctest.Wait()
+					assertRuns(1, 2)
+					time.Sleep(time.Second)
+					synctest.Wait()
+					assertRuns(2, 2)
+					time.Sleep(PushRetryDelay(5))
+					synctest.Wait()
+					assertRuns(3, 0)
+					if len(retries) != 3 || retries[1] != 4 || retries[2] != 5 {
+						t.Fatalf("coalescing changed retry position/budget: %v", retries)
+					}
+					for _, event := range f.rec.list() {
+						if !event.Forced {
+							t.Fatalf("coalescing downgraded force: %+v", event)
+						}
+					}
+				})
+			})
+		}
+	}
+}
+
 func TestLocalPendingPushPreclaimFailureKeepsBackoff(t *testing.T) {
 	for _, backend := range []string{"sqlite", "s3wal"} {
 		for _, phase := range []string{"lookup", "claim", "timer_read", "enqueue"} {
@@ -492,6 +588,76 @@ func TestLocalPendingPushPreclaimFailureKeepsBackoff(t *testing.T) {
 					time.Sleep(PushRetryDelay(5))
 					synctest.Wait()
 					assertRuns(3, 0) // budget exhausted, not reset by the failed handoff
+				})
+			})
+		}
+	}
+}
+
+func TestLocalPushPublicationWaitFailureKeepsRetry(t *testing.T) {
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		for _, failure := range []string{"read", "timeout"} {
+			t.Run(backend+"/"+failure, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					f, st, job := localIntentWorker(t, backend, "http://127.0.0.1:1")
+					q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
+					defer q.Close()
+					defer f.worker.CloseLocal()
+					var retries []int
+					f.worker.RequeuePush = func(ctx context.Context, retry Job) error {
+						retries = append(retries, retry.Retry)
+						return q.EnqueuePush(ctx, retry)
+					}
+					first := true
+					f.worker.WaitPushPublication = func(ctx context.Context, id string) error {
+						up, err := st.GetRepoUpstream(ctx, id)
+						if err != nil || !up.PushSyncing || up.PushPending != 0 {
+							t.Fatalf("publication must follow the actual claim: %+v %v", up, err)
+						}
+						if !first {
+							return nil
+						}
+						first = false
+						if failure == "timeout" {
+							<-ctx.Done()
+							return ctx.Err()
+						}
+						return fmt.Errorf("temporary hold read failure")
+					}
+					job.Retry = 4
+					if err := f.worker.RunPush(t.Context(), job); err == nil || TransientPushFailure(err) {
+						t.Fatalf("wait failure is not a network attempt: %v", err)
+					}
+					assertRuns := func(want, pending int) {
+						t.Helper()
+						up, err := st.GetRepoUpstream(t.Context(), job.RepoID)
+						if err != nil || up.PushRunCount != want || up.PushPending != pending || up.PushSyncing || up.PushSuccessCount != 0 {
+							t.Fatalf("run/intent after publication wait: %+v want %d/%d err=%v", up, want, pending, err)
+						}
+					}
+					assertRuns(1, 2)
+					if err := q.EnqueuePendingPush(t.Context(), Job{Org: job.Org, RepoID: job.RepoID}); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					assertRuns(1, 2)
+					time.Sleep(PushRetryDelay(4) - time.Second)
+					synctest.Wait()
+					assertRuns(1, 2)
+					time.Sleep(time.Second)
+					synctest.Wait()
+					assertRuns(2, 2)
+					time.Sleep(PushRetryDelay(5))
+					synctest.Wait()
+					assertRuns(3, 0)
+					if len(retries) != 2 || retries[0] != 4 || retries[1] != 5 {
+						t.Fatalf("wait spent/reset the transfer retry budget: %v", retries)
+					}
+					for _, event := range f.rec.list() {
+						if !event.Forced {
+							t.Fatalf("wait lost consumed force: %+v", event)
+						}
+					}
 				})
 			})
 		}

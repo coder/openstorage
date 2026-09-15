@@ -81,9 +81,13 @@ recover a successfully persisted pending marker, but cannot reconstruct a missin
 one. At startup, orphaned outbound claims are re-marked once before workers exist;
 live scans never turn an active claim without new pending intent into work. The
 existing retry/coalescing rules and force levels remain in effect. Local timer
-ownership prevents live observations from bypassing backoff or resetting its retry
-budget, but those timers and their elapsed delays do not survive process restart.
-Restart recovery covers the existing durable-pending contract, not retry timing.
+ownership lasts through queue coalescing until an actual claim, preventing live
+observations from bypassing backoff or resetting its retry budget. After claiming
+forward intent, the local worker waits for existing cache-ref push holds before
+fetching its snapshot. A failed publication wait restores the consumed force level
+and retries without spending the transfer-retry budget. Those timers and their
+elapsed delays do not survive process restart. Restart recovery covers the existing
+durable-pending contract, not retry timing.
 There is no exactly-once, at-least-once, or fixed completion-time guarantee. S3WAL
 remains experimental; this does not establish full upstream compatibility.
 
