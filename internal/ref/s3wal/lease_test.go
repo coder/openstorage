@@ -137,6 +137,101 @@ func (s noLastModifiedStore) Get(ctx context.Context, key string) (Object, error
 	return obj, err
 }
 
+// leaseReadOnlyStore fails on any mutation attempt during a refused acquisition.
+type leaseReadOnlyStore struct {
+	ConditionalStore
+	t *testing.T
+}
+
+func (s leaseReadOnlyStore) Create(context.Context, string, []byte) (string, error) {
+	s.t.Fatal("refused acquisition attempted Create")
+	return "", nil
+}
+
+func (s leaseReadOnlyStore) Advance(context.Context, string, []byte, string) (string, error) {
+	s.t.Fatal("refused acquisition attempted Advance")
+	return "", nil
+}
+
+func (s leaseReadOnlyStore) Delete(context.Context, string) error {
+	s.t.Fatal("refused acquisition attempted Delete")
+	return nil
+}
+
+func TestInstanceLeaseUnsafeEvidenceRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  string
+		wrap  func(ConditionalStore) ConditionalStore
+		cause string
+	}{
+		{name: "malformed JSON", body: `{`},
+		{name: "missing holder", body: `{}`},
+		{name: "empty holder", body: `{"holder":""}`},
+		{
+			name: "no Date witness", body: `{"holder":"previous","ttl":"2m"}`,
+			wrap:  func(cs ConditionalStore) ConditionalStore { return noWitnessStore{cs} },
+			cause: "no store Date witness observed",
+		},
+		{
+			name: "no Last-Modified", body: `{"holder":"previous","ttl":"2m"}`,
+			wrap:  func(cs ConditionalStore) ConditionalStore { return noLastModifiedStore{cs} },
+			cause: "store returned no Last-Modified stamp",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			cas := NewMemCAS()
+			clk := newLeaseClock()
+			cas.Now = clk.Now
+			if _, err := cas.Create(ctx, LeaseKey, []byte(tc.body)); err != nil {
+				t.Fatal(err)
+			}
+			before, err := cas.Get(ctx, LeaseKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clk.Advance(10 * time.Minute) // TTL expiry cannot make invalid evidence usable.
+			var cs ConditionalStore = leaseReadOnlyStore{ConditionalStore: cas, t: t}
+			if tc.wrap != nil {
+				cs = tc.wrap(cs)
+			}
+			lease, err := AcquireInstanceLease(ctx, cs, LeaseConfig{Now: clk.Now})
+			if err == nil || lease != nil {
+				t.Fatalf("want refusal with no lease, got lease %v, error %v", lease, err)
+			}
+			reason := "is corrupt"
+			if tc.cause != "" {
+				reason = "freshness cannot be judged on the store clock"
+				if cause := errors.Unwrap(err); cause == nil || cause.Error() != tc.cause {
+					t.Errorf("want wrapped store-clock error %q, got %v", tc.cause, cause)
+				}
+			}
+			for _, want := range []string{
+				LeaseKey, reason, "refusing to start", "preserve the lease object and error evidence",
+				"keep writers fenced", "investigate", "fencing, restart, or TTL expiry does not",
+				"https://github.com/coder/openstorage/blob/main/docs/how-to/deploy-production.md#s3wal-operational-signals",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("diagnostic missing %q: %v", want, err)
+				}
+			}
+			for _, unsafe := range []string{"delete", "remove"} {
+				if strings.Contains(strings.ToLower(err.Error()), unsafe) {
+					t.Errorf("diagnostic suggests destructive recovery: %v", err)
+				}
+			}
+			after, getErr := cas.Get(ctx, LeaseKey)
+			if getErr != nil {
+				t.Fatalf("lease object no longer readable: %v", getErr)
+			}
+			if string(after.Body) != string(before.Body) || after.ETag != before.ETag || !after.LastModified.Equal(before.LastModified) {
+				t.Fatalf("refused acquisition changed lease object: before %+v, after %+v", before, after)
+			}
+		})
+	}
+}
+
 // TestInstanceLeaseStoreClockUnjudgeableFailsClosed: without a Date
 // witness or a Last-Modified stamp the store-clock age cannot be judged —
 // acquisition must refuse (never fall back to wall clocks, never steal),

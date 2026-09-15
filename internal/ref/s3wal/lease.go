@@ -155,8 +155,8 @@ func AcquireInstanceLease(ctx context.Context, cs ConditionalStore, cfg LeaseCon
 		if derr := json.Unmarshal(obj.Body, &doc); derr != nil || doc.Holder == "" {
 			// Fail closed on a corrupt lease object: freshness cannot be
 			// judged, and blind-stealing garbage could mask a live
-			// holder. The operator resolves it by deleting the key.
-			return nil, fmt.Errorf("s3wal instance lease: %s is corrupt (%v): refusing to start; delete the object after confirming no other serve process runs against this bucket", LeaseKey, derr)
+			// holder. Preserve the object as evidence for fenced investigation.
+			return nil, fmt.Errorf("s3wal instance lease: %s is corrupt (%v): refusing to start; preserve the lease object and error evidence, keep writers fenced, and investigate; fencing, restart, or TTL expiry does not repair corrupt data; see https://github.com/coder/openstorage/blob/main/docs/how-to/deploy-production.md#s3wal-operational-signals", LeaseKey, derr)
 		}
 		age, aerr := storeAge(cs, obj)
 		if aerr != nil {
@@ -164,7 +164,7 @@ func AcquireInstanceLease(ctx context.Context, cs ConditionalStore, cfg LeaseCon
 			// cannot be ruled out, and falling back to comparing our wall
 			// clock against the holder's stamp is the skew hazard this
 			// judgment exists to remove.
-			return nil, fmt.Errorf("s3wal instance lease: %s freshness cannot be judged on the store clock (%w): refusing to start; delete the object after confirming no other serve process runs against this bucket", LeaseKey, aerr)
+			return nil, fmt.Errorf("s3wal instance lease: %s freshness cannot be judged on the store clock (%w): refusing to start; preserve the lease object and error evidence, keep writers fenced, and investigate; fencing, restart, or TTL expiry does not supply a trustworthy store-clock verdict; see https://github.com/coder/openstorage/blob/main/docs/how-to/deploy-production.md#s3wal-operational-signals", LeaseKey, aerr)
 		}
 		if heldTTL := doc.ttlOrDefault(); age < heldTTL+leaseDateResolution {
 			return nil, &LeaseHeldError{Holder: doc.Holder, Age: age, TTL: heldTTL}
