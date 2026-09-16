@@ -4,17 +4,15 @@
 # floci/floci — booted with FLOCI_SERVICES_S3_ENFORCE_AUTH=true — through the
 # test-only OPENSTORAGE_TEST_S3_ENDPOINT override in the suite's TestMain.
 # Credentials come from a real chain no other lane exercises: IAM
-# CreateAccessKey → STS AssumeRole → session credentials. Scope note: Floci
-# only honors IAM/STS-minted access-key IDs but does not validate
-# header-auth signatures or session tokens (gap list in
-# docs/reference/testing.md), so this proves the suite runs end-to-end on
-# freshly minted temporary keys while exercising — not asserting —
-# AWS_SESSION_TOKEN plumbing (env → SDK → serve children). Value:
-# second-implementation wire-drift armor under the whole git/LFS surface.
-# The per-PR blob store stays SeaweedFS deliberately — Floci does not
-# validate header-auth SigV4 signatures and ignores conditional DELETE
-# (issue #201 spike findings, re-verified on the pin below — issue #212;
-# its torn-read bug is fixed as of floci-io/floci#2874).
+# CreateAccessKey → STS AssumeRole → session credentials. Release 2.1.0
+# rejects wrong header-auth secrets and missing, forged, or mismatched
+# temporary-session tokens in the #274 GetObject probes. This lane runs
+# the whole Git/LFS surface on those temporary credentials, including
+# AWS_SESSION_TOKEN plumbing (env → SDK → serve children).
+# The per-PR blob store stays SeaweedFS. Floci still ignores conditional
+# DELETE and expected-owner headers, and an explicit IAM Deny s3:GetObject
+# does not deny reads. See docs/reference/testing.md for the scoped probes.
+# Neither lane qualifies Floci for S3WAL authority.
 # Local repro: docs/reference/testing.md (The Floci githttp E2E lane).
 name: floci-nightly-githttp
 
@@ -39,19 +37,13 @@ jobs:
       # installed so the lane cannot quietly lose coverage (mirrors ci.yml).
       - run: git lfs version
       - name: boot floci
-        # Pinned tag, not :latest — this lane exports credentials parsed from
-        # the image's API responses, so keep the image bytes as stable as a
-        # mutable registry allows. nightly-09012026 is the first published
-        # build with the GetObject torn-read fix (floci-io/floci#2874); no
-        # release tag contains it yet. Keep in sync with s3waltest.FlociImage
-        # (the s3wal qualification-matrix pin, issues #205/#212) so every
-        # pinned Floci lane probes the same build.
-        # TODO(#212): move to the first release tag after 2.0.1 together
-        # with s3waltest.FlociImage.
+        # Keep this OCI index digest in sync with s3waltest.FlociImage and
+        # floci-nightly.yml. Release 2.1.0 passed the baseline/candidate
+        # qualification and credential lanes before adoption (#274).
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-            floci/floci:nightly-09012026
+            floci/floci:2.1.0@sha256:f5aa8c18302cedb4f2385f5c4e455b3efc77fee6bf7b6e5d1712b2817ba102db
           for i in $(seq 1 60); do
             if curl -s -o /dev/null http://127.0.0.1:4566/; then
               echo "floci ready after ${i}s"
@@ -77,10 +69,10 @@ jobs:
             --user-name githttp-nightly --output json)
           access_key_id=$(jq -r '.AccessKey.AccessKeyId // empty' <<<"$key_json")
           secret_key=$(jq -r '.AccessKey.SecretAccessKey // empty' <<<"$key_json")
-          # The image tag is pinned but the registry copy is still mutable,
-          # so returned JSON stays untrusted: full-string-validate every
-          # value before use — for the GITHUB_ENV writes below, an embedded
-          # newline would otherwise inject extra variables (e.g. GOCACHEPROG)
+          # API responses remain untrusted even with a digest-pinned image.
+          # Full-string-validate every value before use: for the GITHUB_ENV
+          # writes below, an embedded newline would otherwise inject extra
+          # variables (e.g. GOCACHEPROG)
           # into every later step. Bash [[ =~ ]] anchors span the whole
           # string, so newlines cannot hide inside.
           if [[ ! "$access_key_id" =~ ^[A-Z0-9]{16,32}$ ]] || [[ ! "$secret_key" =~ ^[A-Za-z0-9/+=]{20,64}$ ]]; then
