@@ -32,6 +32,35 @@ e2e harness builds the real `openstorage` binary, boots the chosen backends,
 starts server nodes as subprocesses, and drives them with plain `git`, `curl`-level
 HTTP, and a real `git lfs` client.
 
+### SeaweedFS fixture image
+
+The fixtures and reference Compose file pin SeaweedFS
+[4.47](https://github.com/seaweedfs/seaweedfs/releases/tag/4.47), published on
+2026-09-14. The [changes since 4.46](https://github.com/seaweedfs/seaweedfs/compare/4.46...4.47)
+include S3 request routing, IAM reload handling, bucket-policy enforcement,
+volume error handling, and master shutdown.
+
+These SHA-256 digests identify the Docker Hub image metadata retrieved on
+2026-09-16. Each platform manifest identifies the image for that operating system
+and architecture. Published manifests do not establish runtime qualification.
+
+| Image metadata | 4.46 | 4.47 |
+|---|---|---|
+| Multi-platform index | `08d516132314207d10c8e37cbffc1f32b147d870169688734cc61c6231625b62` | `ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882` |
+| Linux/amd64 manifest | `6a602956ac4915057199a5271343e9c86c403a561db7c21033362f6791aa29c9` | `f83509b0721dfd8e2e07faf76c0a899f67a8a889c89abe2fa0a5227ba1320362` |
+| Linux/arm64 manifest | `cc476c229cb2b7c86401070ed791ec6c5c1f3193b37db5a13f510e770a15dc6c` | `d4cf67729aa8777e1a43a5b61d72e5b96179e4b7bac9a221cb14cbc2036cb32e` |
+
+For each pin change, compare the existing REQUIRE-mode qualification and legacy
+MinIO rejection checks without changing their assertions. The shared readiness
+helper requires `HeadBucket` and a scratch object PUT/DELETE before testing.
+An HTTP health response alone does not prove that volumes accept writes.
+Keep enough volume capacity for every bucket, including backup and restore buckets.
+
+Run the full lanes above and existing fuzz seeds for regression coverage.
+Native-amd64 runtime results do not qualify native ARM, real AWS, or S3WAL promotion.
+Historical benchmark receipts remain historical. A fixture upgrade does not update
+those measurements or establish a performance improvement.
+
 ### Offline S3WAL recovery drill
 
 `TestS3WAL_OfflineBackupRestore` runs in the S3WAL lane. It uses isolated source,
@@ -342,9 +371,9 @@ guards it in require mode.
 Two positives from the same spike, for future lane design: Floci passes the
 full 22-surface s3wal qualification suite (`TestQualifyExternalEndpoint` in
 `internal/ref/s3wal`; re-confirmed 22/22 on the pin by `TestQualifyFloci`)
-— the only emulator besides SeaweedFS to do so — and SeaweedFS 4.46 honors
-conditional DELETE (412 and the object survives on a mismatched `If-Match`),
-unlike both Floci and the legacy MinIO pin.
+— the only emulator besides SeaweedFS to do so. The earlier SeaweedFS 4.46
+qualification observed conditional DELETE enforcement (412 and the object
+survives on a mismatched `If-Match`), unlike both Floci and the legacy MinIO pin.
 
 The same workflow also runs the Floci row of the s3wal qualification matrix:
 `TestQualifyFloci` (`internal/ref/s3wal/qualify_floci_test.go`) runs the 22

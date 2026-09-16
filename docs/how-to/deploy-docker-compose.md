@@ -61,6 +61,12 @@ S3 gateway's unauthenticated `/healthz`), and both nodes (unauthenticated
 [`GET /healthz`](deploy-production.md#health-checks)). Node A publishes on `:8081`, node B
 on `:8082`; both containers listen on `0.0.0.0:8080` internally.
 
+The SeaweedFS healthcheck does not prove that volumes accept object writes.
+Before storage validation, require `HeadBucket` plus a scratch object PUT/DELETE
+on the target bucket, including after a SeaweedFS restart. The
+[test fixtures](../reference/testing.md#seaweedfs-fixture-image) use this stronger
+readiness gate.
+
 Both nodes boot **concurrently** against an empty database on the first run — schema setup
 (metadata, ref store, and the durable [River](https://riverqueue.com) job tables) is
 advisory-lock-serialized, so concurrent replica boot is safe by design. The
