@@ -38,7 +38,7 @@ import (
 // §5-R7); the MinIO pin is the repo's legacy CI image, kept in the
 // qualification matrix only to document its conditional-write behavior.
 const (
-	SeaweedFSImage   = "chrislusf/seaweedfs:4.46"
+	SeaweedFSImage   = "chrislusf/seaweedfs:4.47"
 	MinIOLegacyImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z@sha256:4c4a4876193f030c81f57aabb22bcb9a73462010eb61fcab66908e03e5484af8"
 	// FlociImage pins the Floci row of the qualification matrix (issues
 	// #205, #212): the nightly lane runs the 22 qualification surfaces plus
