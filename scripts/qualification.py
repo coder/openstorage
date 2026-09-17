@@ -234,8 +234,6 @@ class Qualification:
             except OSError as exc:
                 self.error("control", exc)
             now = time.monotonic()
-            if now >= end and process.returncode is None:
-                self.receipt["timed_out"] = True
             if stopping is None and (process.returncode is not None or self.receipt["error"]
                                      or self.receipt["interrupted"] or self.receipt["timed_out"]):
                 stopping = now
@@ -272,6 +270,9 @@ class Qualification:
                             except ProcessLookupError:
                                 pass  # It exited after the wait check; reap next time.
                             sent[child] = sig
+                # Reap available leader status before this poll's timeout decision.
+                if time.monotonic() >= end and process.returncode is None:
+                    self.receipt["timed_out"] = True
                 try:
                     os.waitid(os.P_ALL, 0, WAIT)
                 except ChildProcessError as exc:
@@ -290,6 +291,8 @@ class Qualification:
         require(sys.platform == "linux" and len(list(Path("/proc/self/task").iterdir())) == 1,
                 "dedicated single-thread Linux process required")
         require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, "SIGCHLD must not auto-reap")
+        # Refuse unsupported proc mounts before owning a lock or any producer.
+        Path(f"/proc/self/task/{os.getpid()}/children").read_text()
         libc = ctypes.CDLL(None, use_errno=True)
         require(libc.prctl(36, 1, 0, 0, 0) == 0, "child subreaper unavailable")
         # Probe pidfd wait support and reject unrelated inherited children before

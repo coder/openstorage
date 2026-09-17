@@ -122,7 +122,7 @@ def fixture(root, case):
                               artifacts=os.environ.get("OPENSTORAGE_TEST_ARTIFACT_DIR")))
     while not (root / "go").exists():
         time.sleep(0.005)
-    if case in ("zero", "seven", "reparented"):
+    if case in ("zero", "seven", "reparented", "deadline-exit"):
         os._exit(7 if case == "seven" else 0)
     while True:
         signal.pause()
@@ -180,7 +180,43 @@ def adapter(root, case):
         raise AssertionError("numeric signaling is forbidden")
     os.waitid, signal.pidfd_send_signal, os.close = wait, send, close
     os.kill = os.killpg = forbidden
-    timeout = "0.3" if case == "timeout" else "3"
+    if case == "missing-children":
+        actual_read = Path.read_text
+        def read(path, *args, **kwargs):
+            if str(path) == f"/proc/self/task/{os.getpid()}/children":
+                raise FileNotFoundError("child list unavailable")
+            return actual_read(path, *args, **kwargs)
+        def unexpected_launch(*args, **kwargs):
+            (root / "launch-attempt").touch()
+            raise OSError("producer reached without child discovery")
+        Path.read_text = read
+        subprocess.Popen = unexpected_launch  # Fail safely if admission is broken.
+    elif case == "deadline-exit":
+        actual_sleep = time.sleep
+        paused = False
+        def sleep(seconds):
+            nonlocal paused
+            if not paused:
+                paused = True
+                # At the first poll boundary, let the real leader exit without
+                # reaping it, then force the next poll beyond the deadline.
+                children = Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
+                assert len(children) == 1
+                fd = os.pidfd_open(int(children[0]))
+                try:
+                    deadline = time.monotonic() + 2
+                    while (status := actual_wait(os.P_PIDFD, fd, module.WAIT)) is None:
+                        assert time.monotonic() < deadline, "leader exit barrier"
+                        actual_sleep(0.001)
+                    assert status.si_code == os.CLD_EXITED and status.si_status == 0
+                    trace("waitable-before-deadline-check", native=status.si_status)
+                finally:
+                    actual_close(fd)
+                actual_sleep(0.35)
+            else:
+                actual_sleep(seconds)
+        time.sleep = sleep
+    timeout = "0.3" if case in ("timeout", "deadline-exit") else "3"
     sys.exit(module.main(["--lock", str(root / "lock"), "--docker-socket", str(root / "docker.sock"),
                           "--daemon-id", "private-daemon", "--backing-directory", str(root),
                           "--headroom-bytes", "1000", "--timeout", timeout, "--",
@@ -274,7 +310,7 @@ class QualificationTests(unittest.TestCase):
                 os.write(fd, b"I" if case == "int" else b"T")
             finally:
                 os.close(fd)
-        self.assertEqual(proc.wait(timeout=5), expected, self.logs())
+        self.assertEqual(proc.wait(timeout=5), expected, str(self.receipt()) + self.logs())
         receipt = self.receipt()
         self.assertTrue(receipt["quiescent"])
         self.assertEqual(receipt["state"], "complete")
@@ -310,6 +346,12 @@ class QualificationTests(unittest.TestCase):
 
     def test_timeout(self):
         self.run_case("timeout", 124)
+
+    def test_waitable_leader_is_reaped_before_timeout(self):
+        self.run_case("deadline-exit", 0)
+        self.assertFalse(self.receipt()["timed_out"])
+        events = [json.loads(line) for line in (self.root / "native.jsonl").read_text().splitlines()]
+        self.assertIn(dict(event="waitable-before-deadline-check", native=0), events)
 
     def test_direct_term(self):
         self.run_case("direct-term", 143)
@@ -369,6 +411,18 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=5), 70, self.logs())
         self.assertFalse(self.locked())
         self.assertTrue(self.receipt()["error"])
+        self.assertIsNone(self.sentinel.poll())
+
+    def test_missing_child_discovery_refuses_before_lock_or_launch(self):
+        proc = self.start("adapter", str(self.root), "missing-children")
+        self.assertEqual(proc.wait(timeout=5), 70, self.logs())
+        self.assertFalse((self.root / "launch-attempt").exists(), self.logs())
+        self.assertFalse((self.root / "http.jsonl").exists())
+        receipt = self.receipt()
+        self.assertIsNone(receipt["native_status"])
+        self.assertTrue(receipt["quiescent"])
+        self.assertFalse(receipt["lock_held"])
+        self.assertFalse(self.locked())
         self.assertIsNone(self.sentinel.poll())
 
     def test_reserved_blocks_cannot_authorize_admission(self):
