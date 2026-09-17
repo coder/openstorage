@@ -40,6 +40,16 @@ silently skipping LFS coverage.
   server nodes as subprocesses, and drives them with plain `git`, `curl`-level
   HTTP, and a real `git lfs` client.
 
+### Qualification command adapter
+
+The opt-in [qualification adapter](../how-to/qualification-adapter.md) supervises
+one native command and its descendants before exact-session Docker cleanup.
+Its harmless Python tests use private fake resources and run in the `lint` job.
+The adapter and fixtures share `TESTCONTAINERS_SESSION_ID` and the caller-created
+`OPENSTORAGE_TEST_ARTIFACT_DIR`. Fixtures retain ownership of capture attachment
+and draining. This adapter does not replace existing test lanes or qualify their
+real-fixture composition.
+
 ### SeaweedFS fixture image
 
 The fixtures and reference Compose file pin SeaweedFS

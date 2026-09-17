@@ -30,6 +30,8 @@ jobs:
       # pins; install both here so CI lints with exactly the local toolchain.
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
       - run: golangci-lint run
+      - name: Harmless qualification adapter and documentation tests
+        run: python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
 
   terraform:
     runs-on: ubuntu-latest
