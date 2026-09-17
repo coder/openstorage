@@ -40,6 +40,8 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/coder/openstorage/internal/testutil/seaweedcapture"
+
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
@@ -357,7 +359,7 @@ func testMainInner(m *testing.M) int {
 func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
 	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
 		s3AccessKey, s3SecretKey)
-	seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+	seaweedC, err := seaweedcapture.Start(ctx, testcontainers.GenericContainerRequest{
 		Image:        "chrislusf/seaweedfs:4.47",
 		ExposedPorts: []string{"8333/tcp"},
 		Cmd:          []string{"server", "-s3", "-dir=/data", "-volume.max=32", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},

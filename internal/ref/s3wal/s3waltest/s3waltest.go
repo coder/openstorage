@@ -32,6 +32,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/coder/openstorage/internal/testutil/seaweedcapture"
 )
 
 // Store image pins. SeaweedFS is the self-hosted store of record (plan
@@ -70,7 +72,7 @@ const (
 // no writable volume for a while (issue #165) — so callers must gate on
 // EnsureBucket, whose write-readiness roundtrip is the readiness signal.
 func StartSeaweedFSContainer(ctx context.Context) (endpoint string, terminate func(), err error) {
-	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+	c, err := seaweedcapture.Start(ctx, testcontainers.GenericContainerRequest{
 		Image:        SeaweedFSImage,
 		ExposedPorts: []string{"8333/tcp"},
 		Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0"},
