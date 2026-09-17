@@ -32,6 +32,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/coder/openstorage/internal/testutil/seaweedcapture"
+
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
 
@@ -83,7 +85,7 @@ func startSeaweedFS(t *testing.T, enforceAuth bool) string {
 			FileMode:          0o444,
 		}}
 	}
-	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+	c, err := seaweedcapture.Start(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
 		Started:          true,
 	})

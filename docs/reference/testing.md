@@ -61,6 +61,12 @@ Native-amd64 runtime results do not qualify native ARM, real AWS, or S3WAL promo
 Historical benchmark receipts remain historical. A fixture upgrade does not update
 those measurements or establish a performance improvement.
 
+### Private SeaweedFS log capture
+
+The managed SeaweedFS fixtures support opt-in, bounded private stdout/stderr capture through automatic teardown.
+See [the capture procedure](../how-to/capture-seaweedfs-test-logs.md) for `OPENSTORAGE_TEST_ARTIFACT_DIR`, explicit session attribution, capture receipts, and the deliberately failing TestMain diagnostic.
+Keep raw logs private and interpret capture status separately from the native test exit.
+
 ### Offline S3WAL recovery drill
 
 `TestS3WAL_OfflineBackupRestore` runs in the S3WAL lane. It uses isolated source,
