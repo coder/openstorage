@@ -113,21 +113,27 @@ func (c *capture) attach(ctx context.Context, root *os.Root, container testconta
 		return errors.New("seaweed capture: session label not verified")
 	}
 	c.status.Container = id
+	// Attribution must be valid, but runtime file failures must not replace
+	// the native fixture result. Finalization reports even a missing receipt.
 	name := "seaweed-" + c.status.Session + "-" + id
 	if err := root.Mkdir(name, 0o700); err != nil {
-		return errors.New("seaweed capture: cannot exclusively create capture directory")
+		c.problem("setup-error")
+		return nil
 	}
 	c.root, err = root.OpenRoot(name)
 	if err != nil {
-		return errors.New("seaweed capture: cannot open capture directory")
+		c.problem("setup-error")
+		return nil
 	}
 	c.stdout, err = c.root.OpenFile("stdout.log", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return errors.New("seaweed capture: cannot create stdout file")
+		c.problem("setup-error")
+		return nil
 	}
 	c.stderr, err = c.root.OpenFile("stderr.log", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return errors.New("seaweed capture: cannot create stderr file")
+		c.problem("setup-error")
+		return nil
 	}
 	c.save()
 	return nil

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -224,7 +225,7 @@ func TestWriteFailureIsExplicit(t *testing.T) {
 	}
 }
 
-func TestCaptureDirectoryCollisionDoesNotClobber(t *testing.T) {
+func TestCaptureSetupFailureDoesNotFailFixtureOrClobber(t *testing.T) {
 	dir := captureEnv(t)
 	c := &fakeContainer{id: strings.Repeat("d", 64)}
 	path := filepath.Join(dir, "seaweed-"+testSession+"-"+c.id)
@@ -234,7 +235,17 @@ func TestCaptureDirectoryCollisionDoesNotClobber(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "stdout.log"), []byte("sentinel"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := start(t.Context(), testcontainers.GenericContainerRequest{Started: true}, func(ctx context.Context, req testcontainers.GenericContainerRequest) (testcontainers.Container, error) {
+	output, err := os.CreateTemp(t.TempDir(), "receipt-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = output
+	t.Cleanup(func() {
+		os.Stderr = original
+		_ = output.Close()
+	})
+	got, err := start(t.Context(), testcontainers.GenericContainerRequest{Started: true}, func(ctx context.Context, req testcontainers.GenericContainerRequest) (testcontainers.Container, error) {
 		for _, hooks := range req.LifecycleHooks {
 			for _, hook := range hooks.PostCreates {
 				if err := hook(ctx, c); err != nil {
@@ -242,15 +253,27 @@ func TestCaptureDirectoryCollisionDoesNotClobber(t *testing.T) {
 				}
 			}
 		}
-		t.Fatal("collision accepted")
-		return nil, nil
+		req.LogConsumerCfg.Consumers[0].Accept(testcontainers.Log{LogType: testcontainers.StderrLog, Content: []byte("server event")})
+		finalize(t, req, c)
+		return c, nil
 	})
-	if err == nil {
-		t.Fatal("collision accepted")
+	if err != nil || got != c {
+		t.Fatalf("capture setup replaced native success: container=%v err=%v", got, err)
 	}
 	data, err := os.ReadFile(filepath.Join(path, "stdout.log"))
 	if err != nil || string(data) != "sentinel" {
 		t.Fatal("existing evidence changed")
+	}
+	data, err = os.ReadFile(output.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status receipt
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(string(data), "SEAWEED_CAPTURE ")), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Session != testSession || status.Container != c.id || status.Phase != "finalized" || !slices.Contains(status.Errors, "setup-error") || slices.Contains(status.Errors, "startup-error") {
+		t.Fatalf("setup failure not reported separately: %+v", status)
 	}
 }
 

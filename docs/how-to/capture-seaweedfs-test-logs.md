@@ -49,7 +49,7 @@ A missing receipt, a pending receipt after exit, or nonempty `errors` means that
 An empty stdout file is normal when SeaweedFS writes only to stderr.
 
 Error codes include `startup-error`, `stream-error`, `drain-timeout`, `producer-stop-error`, `producer-ack-timeout`, and `capture-context-canceled`.
-File failures use `write-error`, `sync-error`, `close-error`, or `receipt-write-error`.
+File failures use `setup-error`, `write-error`, `sync-error`, `close-error`, or `receipt-write-error`.
 Missing evidence uses `missing-producer`, `missing-output`, `missing-file`, or `missing-receipt`.
 The helper also emits a sanitized `SEAWEED_CAPTURE <json>` line to test stderr after finalization.
 Use this fallback if the receipt cannot be written.
