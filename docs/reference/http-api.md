@@ -33,6 +33,27 @@ contract with implementation notes the spec lacks.
 
 ## Endpoint catalog
 
+### Organization metadata (`org:read`)
+
+`GET /api/meta` uses the absolute path shown, without `/v1`. It requires an
+org-scoped token (`repo: "org"`) with `org:read` for the served organization.
+The ordinary pre-auth rate limiter applies. There is no `/api/v1/meta` alias.
+
+open.storage returns `200` with this exact shape:
+
+```json
+{"ips":{"api":[],"git":[]},"provider":{"name":"","region":""}}
+```
+
+The arrays are empty because open.storage publishes no ingress CIDRs. The provider
+and region strings are empty because it does not determine deployment location.
+These are the upstream contract's unpublished/unavailable values, **not proof that
+ingress does not exist or a populated firewall allowlist**. Obtain ingress ranges
+from your deployment operator before configuring a firewall.
+
+This implements the documented upstream contract captured on September 21, 2026;
+it does not establish the endpoint's rollout status on upstream clusters.
+
 ### Repository lifecycle (`repo:write` / `org:read`)
 
 | Method & path | Scope | Notes |

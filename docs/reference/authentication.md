@@ -79,7 +79,7 @@ Notes:
 | `git:read` | all read endpoints (files, branches, tags, commits, diffs, blame, grep, notes read, merge preview, `GET /repo` metadata) + git clone/fetch |
 | `git:write` | ref mutations (commit-pack, diff-commit, restore-commit, branch create/delete, merge, tag create, notes write/delete, pull-upstream) + git push |
 | `repo:write` | repo lifecycle (create/delete repo, git-credentials CRUD, unset base repo) |
-| `org:read` | org-wide listing (`GET /repos`, `GET /api/repo-urls/{repo_id}`) |
+| `org:read` | organization metadata (`GET /api/meta`, `repo: "org"`) and org-wide listing (`GET /repos`, `GET /api/repo-urls/{repo_id}`) |
 
 Endpoint quirks (verified across all three SDKs):
 - `DELETE /repos/tags` is requested with **both** `git:read` and `git:write`.
