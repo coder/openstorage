@@ -171,6 +171,8 @@ func New(cfg Config) (http.Handler, error) {
 	route := func(pattern string, orgLevel bool, h http.HandlerFunc, scopes ...string) {
 		mux.Handle(pattern, rl.limit(routeRead)(requireAuth(cfg.Verifier, cfg.Org, orgLevel, scopes...)(h)))
 	}
+	route("GET /api/meta", true, handleOrganizationMetadata, auth.ScopeOrgRead)
+
 	// POST /repos is the base_repo-aware create: code/code.storage fork
 	// specs dispatch to the synchronous fork (handlers_fork.go); everything
 	// else falls back to the sync-aware creator (which embeds the frozen
