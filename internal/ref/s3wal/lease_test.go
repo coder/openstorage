@@ -165,9 +165,9 @@ func TestInstanceLeaseUnsafeEvidenceRefusal(t *testing.T) {
 		wrap  func(ConditionalStore) ConditionalStore
 		cause string
 	}{
-		{name: "malformed JSON", body: `{`},
-		{name: "missing holder", body: `{}`},
-		{name: "empty holder", body: `{"holder":""}`},
+		{name: "malformed JSON", body: `{`, cause: "unexpected end of JSON input"},
+		{name: "missing holder", body: `{}`, cause: leaseHolderMissing},
+		{name: "empty holder", body: `{"holder":""}`, cause: leaseHolderMissing},
 		{
 			name: "no Date witness", body: `{"holder":"previous","ttl":"2m"}`,
 			wrap:  func(cs ConditionalStore) ConditionalStore { return noWitnessStore{cs} },
@@ -200,12 +200,18 @@ func TestInstanceLeaseUnsafeEvidenceRefusal(t *testing.T) {
 			if err == nil || lease != nil {
 				t.Fatalf("want refusal with no lease, got lease %v, error %v", lease, err)
 			}
-			reason := "is corrupt"
-			if tc.cause != "" {
+			reason := "is corrupt (" + tc.cause + ")"
+			if tc.wrap != nil {
 				reason = "freshness cannot be judged on the store clock"
 				if cause := errors.Unwrap(err); cause == nil || cause.Error() != tc.cause {
 					t.Errorf("want wrapped store-clock error %q, got %v", tc.cause, cause)
 				}
+			}
+			// #192 C3 follow-up: a decodable body with no holder has no
+			// decode error to print; the diagnostic must name the real
+			// cause instead of formatting a nil error.
+			if strings.Contains(err.Error(), "<nil>") {
+				t.Errorf("diagnostic formats a nil cause: %v", err)
 			}
 			for _, want := range []string{
 				LeaseKey, reason, "refusing to start", "preserve the lease object and error evidence",
@@ -283,6 +289,40 @@ func TestInstanceLeaseHeartbeatLossDetection(t *testing.T) {
 			t.Fatalf("renew after a foreign delete: want a vanished fail-stop verdict, got %v", err)
 		}
 	})
+	for _, tc := range []struct{ name, body, cause string }{
+		{name: "malformed JSON while held", body: `{`, cause: "unexpected end of JSON input"},
+		{name: "missing holder while held", body: `{}`, cause: leaseHolderMissing},
+		{name: "empty holder while held", body: `{"holder":""}`, cause: leaseHolderMissing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cas := NewMemCAS()
+			clk := newLeaseClock()
+			l, err := AcquireInstanceLease(ctx, cas, LeaseConfig{TTL: 2 * time.Minute, Now: clk.Now})
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			cur, err := cas.Get(ctx, LeaseKey)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if _, err := cas.Advance(ctx, LeaseKey, []byte(tc.body), cur.ETag); err != nil {
+				t.Fatalf("foreign overwrite: %v", err)
+			}
+			clk.Advance(30 * time.Second)
+			err = l.renew(ctx)
+			if err == nil {
+				t.Fatal("renew over a corrupt lease object: want a fail-stop verdict, got nil")
+			}
+			for _, want := range []string{"became corrupt while held (" + tc.cause + ")", "fail-stop"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("verdict missing %q: %v", want, err)
+				}
+			}
+			if strings.Contains(err.Error(), "<nil>") {
+				t.Errorf("verdict formats a nil cause: %v", err)
+			}
+		})
+	}
 	t.Run("dropped renewals age out headroom", func(t *testing.T) {
 		cas := NewMemCAS()
 		clk := newLeaseClock()

@@ -151,8 +151,8 @@ func AcquireInstanceLease(ctx context.Context, cs ConditionalStore, cfg LeaseCon
 	case err != nil:
 		return nil, fmt.Errorf("s3wal instance lease: read %s: %w", LeaseKey, err)
 	default:
-		var doc leaseDoc
-		if derr := json.Unmarshal(obj.Body, &doc); derr != nil || doc.Holder == "" {
+		doc, derr := decodeLeaseDoc(obj.Body)
+		if derr != nil {
 			// Fail closed on a corrupt lease object: freshness cannot be
 			// judged, and blind-stealing garbage could mask a live
 			// holder. Preserve the object as evidence for fenced investigation.
@@ -287,8 +287,8 @@ func (l *InstanceLease) renew(ctx context.Context) error {
 	obj, gerr := l.cs.Get(ctx, LeaseKey)
 	switch {
 	case gerr == nil:
-		var doc leaseDoc
-		if derr := json.Unmarshal(obj.Body, &doc); derr != nil || doc.Holder == "" {
+		doc, derr := decodeLeaseDoc(obj.Body)
+		if derr != nil {
 			return fmt.Errorf("s3wal instance lease: %s became corrupt while held (%v): fail-stop", LeaseKey, derr)
 		}
 		if doc.Holder != l.holder {
@@ -348,3 +348,23 @@ func (l *InstanceLease) Release(ctx context.Context) {
 
 // Holder exposes the lease's holder nonce for logs and tests.
 func (l *InstanceLease) Holder() string { return l.holder }
+
+// leaseHolderMissing is the corruption cause for a lease body that decodes
+// but names no holder. It exists so diagnostics state the real cause
+// instead of formatting a nil decode error (#192 C3 follow-up).
+const leaseHolderMissing = "holder is missing or empty"
+
+// decodeLeaseDoc decodes a lease body and rejects one without a holder:
+// such a body gives no basis for judging ownership, so callers treat it
+// as corrupt exactly like undecodable bytes. The returned error is the
+// cause to report; it is never nil for a rejected body.
+func decodeLeaseDoc(body []byte) (leaseDoc, error) {
+	var doc leaseDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return leaseDoc{}, err
+	}
+	if doc.Holder == "" {
+		return leaseDoc{}, errors.New(leaseHolderMissing)
+	}
+	return doc, nil
+}
