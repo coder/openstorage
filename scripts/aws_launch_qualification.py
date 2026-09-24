@@ -300,8 +300,11 @@ class Runner:
                 and isinstance(response.get("repo_id"), str) and re.fullmatch(r"repo_[0-9a-f]{12}", response["repo_id"]), "invalid_create_acknowledgment")
         canonical_path = "/" + response["repo_id"] + ".git"
         canonical_url = public + canonical_path
-        # An acknowledgment cannot add a new origin or credential path to the trust boundary.
-        require(response.get("http_url") == canonical_url, "invalid_create_url")
+        # Normalize only the origin; the repo-ID path must match exactly. The
+        # acknowledgment cannot add a new origin or credential path to the trust boundary.
+        advertised = response.get("http_url")
+        require(isinstance(advertised, str) and advertised.endswith(canonical_path)
+                and origin(advertised[:-len(canonical_path)], self.config["topology"] == "local") == public, "invalid_create_url")
         self.gitpath = canonical_path
         self.created = True
         self.passed()
@@ -411,7 +414,7 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
         return 1
     with tempfile.TemporaryDirectory(prefix="q222-") as work:
         runner = Runner(result, work, budget if type(budget) is int else 0)
-        old_alarm = old_term = None
+        old_alarm = old_term = old_int = None
         cleanup_interrupted = False
         def defer_cleanup_interrupt(_signum, _frame):
             nonlocal cleanup_interrupted
@@ -439,6 +442,7 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
                 # Defer cancellation, not the alarm: cleanup retains its 45-second bound.
                 if old_term is not None:
                     signal.signal(signal.SIGTERM, defer_cleanup_interrupt)
+                    old_int = signal.signal(signal.SIGINT, defer_cleanup_interrupt)
                 if old_alarm is not None:
                     signal.setitimer(signal.ITIMER_REAL, 45)
                 runner.cleanup()
@@ -454,6 +458,8 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
                     signal.signal(signal.SIGALRM, old_alarm)
                 if old_term is not None:
                     signal.signal(signal.SIGTERM, old_term)
+                if old_int is not None:
+                    signal.signal(signal.SIGINT, old_int)
             result["scenarios"] = list(result["scenarios"].values())
             private_write(output / "result.json", json.dumps(result, indent=2) + "\n")
             private_write(output / "runner.log", "\n".join(runner.log) + "\n")
