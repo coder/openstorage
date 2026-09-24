@@ -114,10 +114,18 @@ about the endpoint's rollout status on upstream clusters.
 | `GET /repos/file` | `path` (req), `ref`, `ephemeral`, `ephemeral_base`; headers `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` | Raw blob stream. Status 200/206/304/412/416. Headers: `X-Blob-Sha`, `X-Last-Commit-Sha`, `ETag`, `Last-Modified`, `Accept-Ranges`, `Content-Range`, `Content-Type`, `Content-Length` |
 | `HEAD /repos/file` | same | headers only |
 | `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], ref, entries: [{path, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type` |
-| `GET /repos/files/metadata` | same | `{files: [{path, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message}}, ref, next_cursor, has_more}`. **404 on unborn branch** |
+| `GET /repos/files/metadata` | same | `{files: [{path, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. **404 on unborn branch** |
 | `POST /repos/archive` | body `{ref?, include_globs?, exclude_globs?, max_blob_size?, archive?: {prefix}}` | tar.gz stream |
 | `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, file_filters?: {include_globs, exclude_globs, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
 | `GET /repos/blame` | `path` (req), `ref`, `ephemeral`, `range` (repeatable, `git blame -L` specs like `1,10`), `detect_moves` | `{ref, path, commit_sha, lines: [{line_number, commit_sha, original_line_number, original_path, previous_commit_sha?, author_name, author_email, author_time, committer_name, committer_email, committer_time, summary}]}` |
+
+`order` in `files/metadata` is the commit's history-order rank relative to the resolved ref: its 0-based position in `git rev-list --topo-order <resolved commit>`. The ref's own commit is `0`, and larger values are older. A commit always ranks higher than every one of its descendants, whatever its author or committer date. Among a folder's files, the one with the smallest `order` was changed most recently in the ref's history.
+
+`order` is an absolute position in the ref's history, not a rank within the response. Values can have gaps, and a response contains `0` only when the ref's own commit is the last commit of a listed file. Ranks agree across pages when the requests resolve to the same commit. A branch can move between requests, so pin `ref` to a commit SHA to page through one snapshot.
+
+Ties between commits that ancestry does not order follow git's topo-order walk, which ignores dates. A commit becomes eligible once all of its children reachable from the ref are ranked, and the most recently eligible commit is ranked next. When ranking a merge makes several of its parents eligible at once, they become eligible in parent order, so the line of history behind the last of them is ranked first. The same history always yields the same ranks.
+
+Cost: each page runs one extra `git rev-list --topo-order` walk. open.storage does not write commit-graphs for its cache repositories, so git usually reads the whole history of the ref for that walk (about 70–90 ms for 20,000 commits in `BenchmarkTopoRanks`). That is about the cost of one `git log -1` for a file last changed near the root, which the endpoint already runs for each file on the page.
 
 ### Branches
 
