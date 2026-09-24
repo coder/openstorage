@@ -46,6 +46,15 @@ func requireReaped(t *testing.T, pidFile string) {
 	}
 }
 
+// skipWithoutOrderWalk skips a test that needs a 200 from files/metadata
+// on platforms where the order walk fails closed (no enforceable heap cap).
+func skipWithoutOrderWalk(t *testing.T) {
+	t.Helper()
+	if !topoHeapLimitSupported() {
+		t.Skip("files/metadata fails closed (503) where the walk's heap cap cannot be enforced")
+	}
+}
+
 func requireFree(t *testing.T, b *topoWalkBudget) {
 	t.Helper()
 	if n := len(b.slots); n != 0 {
@@ -152,6 +161,7 @@ func TestFilesMetadataTopoWalkBusy503(t *testing.T) {
 		}
 
 		drain()
+		skipWithoutOrderWalk(t)
 		resp, body = coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
 		coreRequireStatus(t, resp, body, http.StatusOK)
 	})
@@ -178,6 +188,32 @@ func TestFilesMetadataTopoWalkTooLarge503(t *testing.T) {
 		requireFree(t, topoWalks)
 
 		topoWalks.heapLimitBytes = saved
+		resp, body = coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
+		coreRequireStatus(t, resp, body, http.StatusOK)
+	})
+}
+
+// TestFilesMetadataTopoWalkUnsupportedPlatform503: where the heap cap
+// cannot be enforced (non-Linux), files/metadata fails closed with 503 and
+// no Retry-After, starting no git and holding no slot.
+func TestFilesMetadataTopoWalkUnsupportedPlatform503(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := coreSeedFixture(t, e, e.newOrg(t))
+		saved := topoHeapLimitSupported
+		topoHeapLimitSupported = func() bool { return false }
+		t.Cleanup(func() { topoHeapLimitSupported = saved })
+
+		resp, body := coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
+		coreRequireStatus(t, resp, body, http.StatusServiceUnavailable)
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			t.Errorf("Retry-After = %q, want none", ra)
+		}
+		requireFree(t, topoWalks)
+
+		topoHeapLimitSupported = saved
+		if !saved() {
+			return // real non-Linux platform: the endpoint stays 503
+		}
 		resp, body = coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
 		coreRequireStatus(t, resp, body, http.StatusOK)
 	})

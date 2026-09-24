@@ -929,6 +929,7 @@ func TestReadCoreFiles(t *testing.T) {
 		})
 
 		t.Run("metadata", func(t *testing.T) {
+			skipWithoutOrderWalk(t)
 			resp, body := coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
 			coreRequireStatus(t, resp, body, 200)
 			var got listFilesMetadataResponse
@@ -991,6 +992,7 @@ func TestReadCoreFiles(t *testing.T) {
 		})
 
 		t.Run("metadata always recursive and paginated", func(t *testing.T) {
+			skipWithoutOrderWalk(t)
 			resp, body := coreGet(t, e, "GET", "/api/v1/repos/files/metadata?recursive=false&limit=4", fx.token, nil)
 			coreRequireStatus(t, resp, body, 200)
 			var got listFilesMetadataResponse
@@ -1018,6 +1020,7 @@ func TestReadCoreFiles(t *testing.T) {
 //
 // Author dates disagree with topology: s1 2030 > s2 2029 > base 2024 > m1 2001.
 func TestReadCoreFilesMetadataOrder(t *testing.T) {
+	skipWithoutOrderWalk(t)
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		ctx := context.Background()
 		org := e.newOrg(t)

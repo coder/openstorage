@@ -14,6 +14,14 @@ import (
 	"github.com/coder/openstorage/internal/ref"
 )
 
+// ErrHeapLimitUnsupported: a heap cap was requested on a platform that
+// cannot enforce it (non-Linux). git was not started.
+var ErrHeapLimitUnsupported = errors.New("git heap limit cannot be enforced on this platform")
+
+// heapLimitAvailable reports whether heap caps are enforced here; a
+// variable so tests can exercise the unsupported path on Linux.
+var heapLimitAvailable = HeapLimitSupported
+
 // ErrMemoryLimit marks a TopoRanks walk that needed more heap than its
 // maxHeapBytes cap allowed; git was stopped by its own allocation failure.
 var ErrMemoryLimit = errors.New("git exceeded its memory limit")
@@ -40,8 +48,9 @@ var ErrMemoryLimit = errors.New("git exceeded its memory limit")
 // maxHeapBytes > 0 caps git's heap: on Linux, RLIMIT_DATA (heap and other
 // private writable mappings; read-only pack mmaps are not counted) is set
 // by a /bin/sh wrapper before git is exec'd, and a walk that needs more
-// fails with ErrMemoryLimit. Other platforms do not enforce the cap. 0
-// means no cap.
+// fails with ErrMemoryLimit. Other platforms cannot enforce the cap, so a
+// capped call there fails with ErrHeapLimitUnsupported before starting
+// git; the cap is never silently dropped. 0 means no cap.
 func TopoRanks(ctx context.Context, repoPath, rev string, want []string, maxHeapBytes int64) (map[string]int, error) {
 	assertf(ref.ValidSHA(rev), "TopoRanks: unresolved rev %q", rev)
 	assertf(maxHeapBytes >= 0, "TopoRanks: negative maxHeapBytes %d", maxHeapBytes)
@@ -53,6 +62,9 @@ func TopoRanks(ctx context.Context, repoPath, rev string, want []string, maxHeap
 	ranks := make(map[string]int, len(pending))
 	if len(pending) == 0 {
 		return ranks, nil
+	}
+	if maxHeapBytes > 0 && !heapLimitAvailable() {
+		return nil, ErrHeapLimitUnsupported
 	}
 	assertf(repoPath != "", "TopoRanks: empty repoPath")
 

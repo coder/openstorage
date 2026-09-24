@@ -7,9 +7,18 @@ import (
 	"os/exec"
 )
 
-// heapLimitedGit returns `git args...`. The heap cap is enforced on Linux
-// only (topo_cmd_linux.go); elsewhere maxHeapBytes is ignored.
-func heapLimitedGit(ctx context.Context, _ int64, args ...string) *exec.Cmd {
+// HeapLimitSupported reports whether TopoRanks can enforce maxHeapBytes on
+// this platform. Outside Linux there is no qualified mechanism (macOS does
+// not enforce RLIMIT_DATA), so capped TopoRanks calls fail with
+// ErrHeapLimitUnsupported instead of running uncapped.
+func HeapLimitSupported() bool { return false }
+
+// heapLimitedGit is only reached with maxHeapBytes == 0 here (TopoRanks
+// refuses capped calls first).
+func heapLimitedGit(ctx context.Context, maxHeapBytes int64, args ...string) *exec.Cmd {
+	if maxHeapBytes != 0 {
+		panic("gitread assertion failed: heapLimitedGit: heap cap requested on an unsupported platform")
+	}
 	return exec.CommandContext(ctx, "git", args...)
 }
 

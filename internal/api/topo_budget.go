@@ -35,10 +35,17 @@ var (
 	errTopoWalkBusy = errors.New("commit order walk capacity exhausted")
 	// errTopoWalkTimeout: the walk hit topoWalkTimeout and git was killed.
 	errTopoWalkTimeout = errors.New("commit order walk exceeded the server time budget")
+	// errTopoWalkUnsupported: this platform cannot enforce the heap cap,
+	// so no walk is run (fail closed). Retrying cannot succeed.
+	errTopoWalkUnsupported = errors.New("commit order requires a Linux server: the walk's memory limit cannot be enforced on this platform")
 	// errTopoWalkTooLarge: the walk needed more heap than
 	// topoWalkMaxHeapBytes. Retrying the same commit cannot succeed.
 	errTopoWalkTooLarge = errors.New("history too large to compute commit order within the server memory budget")
 )
+
+// topoHeapLimitSupported reports whether the heap cap can be enforced; a
+// variable so tests can exercise the fail-closed path on Linux.
+var topoHeapLimitSupported = gitread.HeapLimitSupported
 
 // topoWalks is the process-wide budget shared by every server instance.
 var topoWalks = newTopoWalkBudget(topoWalkMaxConcurrent, topoWalkTimeout, topoWalkMaxHeapBytes)
@@ -71,6 +78,9 @@ func (b *topoWalkBudget) ranks(ctx context.Context, repoPath, rev string, want [
 	if len(want) == 0 {
 		return map[string]int{}, nil // no walk, so no slot
 	}
+	if b.heapLimitBytes > 0 && !topoHeapLimitSupported() {
+		return nil, errTopoWalkUnsupported // before taking a slot or starting git
+	}
 	select {
 	case b.slots <- struct{}{}:
 	default:
@@ -83,6 +93,9 @@ func (b *topoWalkBudget) ranks(ctx context.Context, repoPath, rev string, want [
 	ranks, err := gitread.TopoRanks(walkCtx, repoPath, rev, want, b.heapLimitBytes)
 	if err != nil && ctx.Err() == nil && errors.Is(walkCtx.Err(), context.DeadlineExceeded) {
 		return nil, fmt.Errorf("%w (%v): %w", errTopoWalkTimeout, b.timeout, err)
+	}
+	if errors.Is(err, gitread.ErrHeapLimitUnsupported) {
+		return nil, fmt.Errorf("%w: %w", errTopoWalkUnsupported, err)
 	}
 	if errors.Is(err, gitread.ErrMemoryLimit) {
 		return nil, fmt.Errorf("%w: %w", errTopoWalkTooLarge, err)

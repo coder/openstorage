@@ -2,9 +2,11 @@ package gitread
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -181,4 +183,34 @@ func BenchmarkTopoRanks(b *testing.B) {
 	mustGit(b, dir, "commit-graph", "write", "--reachable")
 	run("graph/tip", tip, 0)
 	run("graph/root", root, n-1)
+}
+
+// TestTopoRanksRefusesUnenforceableHeapLimit: a requested cap is never
+// silently dropped. Where the platform cannot enforce it, TopoRanks fails
+// with ErrHeapLimitUnsupported before starting git (the repo path does not
+// exist, so any git run would fail differently). With no cap, or no wanted
+// commits, nothing changes.
+func TestTopoRanksRefusesUnenforceableHeapLimit(t *testing.T) {
+	saved := heapLimitAvailable
+	heapLimitAvailable = func() bool { return false }
+	t.Cleanup(func() { heapLimitAvailable = saved })
+
+	sha := strings.Repeat("a", 40)
+	if _, err := TopoRanks(context.Background(), "/nonexistent/repo", sha, []string{sha}, 1<<20); !errors.Is(err, ErrHeapLimitUnsupported) {
+		t.Fatalf("err = %v, want ErrHeapLimitUnsupported", err)
+	}
+	if ranks, err := TopoRanks(context.Background(), "/nonexistent/repo", sha, nil, 1<<20); err != nil || len(ranks) != 0 {
+		t.Fatalf("empty want: ranks = %v, err = %v", ranks, err)
+	}
+	f := newFixture(t)
+	ranks, err := TopoRanks(context.Background(), f.dir, f.c2, []string{f.c2}, 0)
+	if err != nil || ranks[f.c2] != 0 {
+		t.Fatalf("no cap: ranks = %v, err = %v", ranks, err)
+	}
+}
+
+func TestHeapLimitSupportedMatchesPlatform(t *testing.T) {
+	if got, want := HeapLimitSupported(), runtime.GOOS == "linux"; got != want {
+		t.Fatalf("HeapLimitSupported() = %v on %s, want %v", got, runtime.GOOS, want)
+	}
 }

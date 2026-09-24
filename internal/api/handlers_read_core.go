@@ -882,6 +882,10 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "1")
 		writeErr(w, http.StatusServiceUnavailable, "server is busy computing commit order; retry shortly")
 		return
+	case errors.Is(err, errTopoWalkUnsupported):
+		// Platform property, not load: no Retry-After.
+		writeErr(w, http.StatusServiceUnavailable, errTopoWalkUnsupported.Error())
+		return
 	case errors.Is(err, errTopoWalkTooLarge):
 		// Deterministic for this commit: no Retry-After.
 		s.logger.Warn("files/metadata commit order walk exceeded its memory limit", "path", r.URL.Path, "err", err)

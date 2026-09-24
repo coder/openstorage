@@ -11,6 +11,10 @@ import (
 	"syscall"
 )
 
+// HeapLimitSupported reports whether TopoRanks can enforce maxHeapBytes on
+// this platform (RLIMIT_DATA via `ulimit -d`).
+func HeapLimitSupported() bool { return true }
+
 // heapLimitedGit returns `git args...`. When maxHeapBytes > 0 it runs git
 // behind /bin/sh, which sets RLIMIT_DATA (`ulimit -d`, KiB) and then execs
 // git, so the limit is in force before git allocates anything and the
