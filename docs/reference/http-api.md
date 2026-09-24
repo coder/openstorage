@@ -65,7 +65,7 @@ about the endpoint's rollout status on upstream clusters.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Optional body `{default_branch?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
+| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
@@ -75,6 +75,10 @@ about the endpoint's rollout status on upstream clusters.
 
 **`POST /repos` body:**
 
+- The JWT `repo` claim always names the new repository. The optional `repo_name` (it can
+  contain `/`) must equal that claim exactly, with no case folding, trimming, or path
+  normalization. A mismatch, including an empty string, returns 400 and creates nothing,
+  for forks too. `null` or an omitted `repo_name` changes nothing.
 - Query `default_branch` is a fallback, used only when the body omits it.
 - `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
