@@ -285,8 +285,40 @@ class RunnerTests(unittest.TestCase):
                             self.assertIn(arg, {base + path for base in (public, writer, reader)})
                     if args[0] == "git":
                         self.assertIn("http.followRedirects=false", args)
-                cleanup_paths = [call.args[2] for call in calls if call.kwargs.get("expected") == 404 and call.kwargs.get("git")]
-                self.assertEqual(cleanup_paths, [path + "/info/refs?service=git-upload-pack"] * (3 if topology == "pg-s3" else 1))
+                origins = 3 if topology == "pg-s3" else 1
+                name = [call.args[2] for call in calls if call.kwargs.get("expected") == 404 and call.kwargs.get("git")]
+                self.assertEqual(len(name), origins)
+                self.assertTrue(all(p.startswith("/q222-") and p.endswith(".git/info/refs?service=git-upload-pack") for p in name))
+                canonical = [call.args[2] for call in calls if call.kwargs.get("expected") == 403 and call.args[2].startswith(path)]
+                self.assertEqual(canonical, [path + "/info/refs?service=git-upload-pack"] * origins)
+
+    def test_cleanup_matches_git_status_rules_after_soft_delete(self):
+        # Mirrors internal/githttp authenticate(): the token names the repository, so a
+        # deleted name path is a 404, while a repo-ID path that no longer resolves is a
+        # 403 (claim mismatch, never an existence oracle).
+        self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
+        deleted = []
+        observed = []
+        def http(runner, base, path, token=None, method="GET", data=None, expected=200, git=False):
+            if path == "/api/v1/repos/delete":
+                deleted.append(base)
+            elif deleted and path == "/api/v1/repo":
+                observed.append((base, "api", expected))
+                q.require(expected == 404, "unexpected_http_status")
+            elif deleted and git:
+                name_path = path.startswith("/" + runner.repo + ".git/")
+                self.assertTrue(name_path or path.startswith("/" + REPO_ID + ".git/"))
+                observed.append((base, "name" if name_path else "id", expected))
+                q.require(expected == (404 if name_path else 403), "unexpected_http_status")
+            return self.fake_http(runner, base, path, token, method, data, expected, git)
+        code, _, _ = self.smoke_with(http)
+        self.assertEqual(code, 0)
+        self.assertEqual(deleted, ["https://one.test"])
+        self.assertEqual(observed, [(base, kind, status) for base in ("https://public.test", "https://one.test", "https://two.test")
+                                    for kind, status in (("api", 404), ("name", 404), ("id", 403))])
+        result = self.result()
+        self.assertEqual(result["cleanup"]["status"], "soft_deleted")
+        self.assertEqual(next(case for case in result["scenarios"] if case["id"] == "cleanup")["status"], "passed")
 
     def test_minted_tokens_outlive_maximum_run_and_cleanup(self):
         code, _, commands = self.smoke_with()
@@ -339,7 +371,8 @@ class RunnerTests(unittest.TestCase):
                                      ("https://public.test", "https://one.test", "https://two.test") for interface in ("api", "git")])
                     for token in (None, "invalid"):
                         self.assertEqual(sum(call.args[3] == token and call.kwargs.get("expected") == 401 for call in requests.call_args_list if len(call.args) > 3), 6)
-                    self.assertEqual(sum(call.kwargs.get("expected") == 403 for call in requests.call_args_list), 6)
+                    self.assertEqual(sum(call.kwargs.get("expected") == 403 and not call.args[2].startswith("/" + REPO_ID)
+                                         for call in requests.call_args_list), 6)
                 else:
                     self.assertEqual(code, 1)
                     self.assertEqual(forged_calls[-1][1:], (accepts_forged, 401))
@@ -416,7 +449,7 @@ sys.exit(code)
     def test_sigterm_during_cleanup_finishes_delete_and_replica_verification(self):
         self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
         expected = [("https://one.test", "DELETE", False)] + [
-            (base, "GET", git) for base in ("https://public.test", "https://one.test", "https://two.test") for git in (False, True)
+            (base, "GET", git) for base in ("https://public.test", "https://one.test", "https://two.test") for git in (False, True, True)
         ]
         for interrupt_at in range(len(expected)):
             with self.subTest(interrupt_at=interrupt_at):

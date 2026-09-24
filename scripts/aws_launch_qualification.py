@@ -380,7 +380,10 @@ if sys.argv[1:] == ['get']:
         self.http(self.writer, "/api/v1/repos/delete", self.token, "DELETE")
         for base in dict.fromkeys([self.config["endpoint"], *self.config["replica_urls"]]):
             self.http(base, "/api/v1/repo", self.token, expected=404)
-            self.http(base, self.gitpath + "/info/refs?service=git-upload-pack", self.token, expected=404, git=True)
+            self.http(base, "/" + self.repo + ".git/info/refs?service=git-upload-pack", self.token, expected=404, git=True)
+            # The token names the repository. Once deleted, its repo-ID path no longer
+            # resolves, so Git answers 403 rather than confirming existence.
+            self.http(base, self.gitpath + "/info/refs?service=git-upload-pack", self.token, expected=403, git=True)
         self.result["cleanup"].update(status="soft_deleted", reason="API and Git inaccessible; physical blobs and tombstone may remain")
         self.passed()
 
