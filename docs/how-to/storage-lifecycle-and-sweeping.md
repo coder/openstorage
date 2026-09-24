@@ -25,7 +25,7 @@ nothing is deleted synchronously. Every blob falls into one of these classes:
 | **Registered packs** | Every push and REST write publishes a pack and registers it | [Repack](#background-repack) folds many into one; the originals become *retained* |
 | **Retained (superseded) packs** | A repack fold replaced their registry rows; the blobs linger | Sweeper's superseded reap ([`OPENSTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#openstorage_sweep_delete_superseded), on by default) after the age threshold |
 | **Orphan packs** | Crashed writers (pack published, registration never committed), lost repack races | Sweeper — **list-only by default**; deletion needs the [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#openstorage_sweep_delete_enabled) opt-in |
-| **LFS objects** (canonical `lfs/<repo_id>/o2/<oid>`; legacy pre-adoption `lfs/<repo_id>/<oid>`, ADR-41) | Verified LFS uploads publish the object and register it | Permanent while the repository lives; [repository purge](#reclaiming-deleted-repositories) or [LFS reclamation](#reclaiming-unreferenced-lfs-objects) |
+| **LFS objects** (canonical `lfs/<repo_id>/o2/<oid>`; legacy pre-adoption `lfs/<repo_id>/<oid>`, ADR-41) | Verified LFS uploads publish the object and register it | Permanent while the repository lives, unless opt-in [LFS reclamation](#reclaiming-unreferenced-lfs-objects) retires unreferenced ones for the sweeper to delete; [repository purge](#reclaiming-deleted-repositories) reclaims the rest |
 | **Orphan LFS objects** | Crashed uploads, and objects uploaded before the LFS registry existed | Sweeper — **list-only by default**; deletion needs the separate [`OPENSTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#openstorage_sweep_delete_lfs) opt-in (see [the caveat](#lfs-orphans-and-pre-registry-objects)) |
 | **Quarantine copies** (`sweep/quarantine/<nonce>/…`) | Delete-mode sweeps copy every blob aside before deleting it | The sweep purges backups older than `max(age threshold, 1h)` while a destructive mode is on |
 
@@ -530,13 +530,14 @@ What else to know:
 - **Cadence is checked at startup:** interval ≤ TTL/2 and pass wall clock ≤ TTL/4, so
   covers cannot lapse between passes.
 - **Budget:** keep it above twice the live cover population. Renewal still covers
-  everything when over budget (`renewal_over_budget`), but loss discovery slows.
+  everything when over budget (`renewal_over_budget`), and discovery keeps its
+  guaranteed half-budget allowance.
 - On PostgreSQL the job has its own single-worker River queue, so slow webhook deliveries
   cannot delay renewals.
 
 > [!WARNING]
 > **Fail-closed fence.** If cover renewal fails and the last healthy renewal is too old
-> (covers could lapse), pushes, LFS uploads, and adoptions answer a transient "quota
+> (covers could lapse), finite quota-gated writes (pushes, LFS uploads, adoptions) answer a transient "quota
 > accounting temporarily degraded, retry later". Writes resume after a healthy pass
 > completes one full error-free recovery rotation of both registries (a rotation dirtied
 > by any stat or cover error never counts). Internal restore and cover reservations stay
@@ -544,8 +545,8 @@ What else to know:
 
 > [!IMPORTANT]
 > **Upgrade the whole fleet first** (ADR-43). Only fence-aware binaries enforce the fence
-> and record lapse evidence. Enable the job only after every node is upgraded, and
-> complete later rolling upgrades within one reservation TTL. The boot log warns while
+> and record lapse evidence. Complete rolling upgrades within one reservation TTL,
+> and enable the job only after every node is upgraded. The boot log warns while
 > the job runs with quota enforcement.
 
 Cover and fence details:
