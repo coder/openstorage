@@ -137,7 +137,7 @@ def fixture(root, case):
                               artifacts=os.environ.get("OPENSTORAGE_TEST_ARTIFACT_DIR")))
     while not (root / "go").exists():
         time.sleep(0.005)
-    if case in ("zero", "seven", "reparented", "deadline-exit", "late-signal"):
+    if case in ("zero", "seven", "reparented", "deadline-exit", "late-signal", "final-save", "unchanged-receipt"):
         os._exit(7 if case == "seven" else 0)
     while True:
         signal.pause()
@@ -212,6 +212,16 @@ def adapter(root, case):
                 raise FileNotFoundError("child list unavailable")
             return actual_read(path, *args, **kwargs)
         Path.read_text = read
+    elif case == "lock-signal":
+        actual_tick = module.Qualification.tick
+        def tick(runner):
+            actual_tick(runner)
+            if not runner.receipt["interrupted"]:
+                # Deliver TERM after the lock-wait snapshot, before admission
+                # checks the handler's updated in-memory interruption field.
+                assert not runner.receipt["lock_held"]
+                signal.raise_signal(signal.SIGTERM)
+        module.Qualification.tick = tick
     elif case == "deadline-exit":
         actual_sleep = time.sleep
         paused = False
@@ -249,6 +259,21 @@ def adapter(root, case):
                 signal.raise_signal(signal.SIGTERM)
             return actual_flock(lock, operation)
         fcntl.flock = flock
+    if case in ("final-save", "unchanged-receipt"):
+        if case == "unchanged-receipt":
+            module.CAPACITY_INTERVAL = 30  # No timer-driven receipt changes during this short run.
+        actual_fsync = os.fsync
+        failed = False
+        def fsync(fd):
+            nonlocal failed
+            snapshot = json.loads(Path(f"/proc/self/fd/{fd}").read_text())
+            trace("receipt-fsync", snapshot=snapshot)
+            if case == "final-save" and snapshot["state"] == "complete" and not failed:
+                failed = True
+                trace("final-save-failed")
+                raise OSError(errno.EIO, "one-shot receipt failure")
+            return actual_fsync(fd)
+        os.fsync = fsync
     timeout = "0.3" if case in ("timeout", "deadline-exit") else "3"
     sys.exit(module.main(["--lock", str(root / "lock"), "--docker-socket", str(root / "docker.sock"),
                           "--daemon-id", "private-daemon", "--backing-directory", str(root),
@@ -395,6 +420,39 @@ class QualificationTests(unittest.TestCase):
         self.assertTrue((self.root / "late-signal").exists())
         self.assertEqual(self.receipt()["interrupted"], 0)
 
+    def test_final_receipt_recovers_complete_state_after_write_failure(self):
+        proc = self.start("adapter", str(self.root), "final-save")
+        self.until(lambda: (self.root / "ready").exists(), proc=proc)
+        (self.root / "go").touch()
+        self.assertEqual(proc.wait(timeout=5), 70, self.logs())
+        receipt = self.receipt()
+        self.assertEqual(receipt["state"], "complete")
+        self.assertEqual(receipt["native_status"], 0)
+        self.assertEqual(receipt["error"], "receipt:OSError:5")
+        self.assertTrue(receipt["quiescent"])
+        self.assertEqual(receipt["reaped"], 3)
+        self.assertFalse(receipt["lock_held"])
+        self.assertFalse(self.locked())
+        self.assertIsNone(self.sentinel.poll())
+        events = [json.loads(line) for line in (self.root / "native.jsonl").read_text().splitlines()]
+        self.assertEqual(sum(e["event"] == "final-save-failed" for e in events), 1)
+
+    def test_unchanged_receipts_do_not_repeat_synchronous_writes(self):
+        proc = self.start("adapter", str(self.root), "unchanged-receipt")
+        self.until(lambda: (self.root / "ready").exists(), proc=proc)
+        (self.root / "go").touch()
+        self.assertEqual(proc.wait(timeout=5), 0, self.logs())
+        events = [json.loads(line) for line in (self.root / "native.jsonl").read_text().splitlines()]
+        snapshots = [e["snapshot"] for e in events if e["event"] == "receipt-fsync"]
+        self.assertGreater(len(snapshots), 1)
+        for previous, current in zip(snapshots, snapshots[1:]):
+            self.assertNotEqual(previous, current)
+        self.assertEqual(snapshots[-1], self.receipt())
+        self.assertEqual(snapshots[-1]["state"], "complete")
+        self.assertTrue(snapshots[-1]["quiescent"])
+        self.assertFalse(self.locked())
+        self.assertIsNone(self.sentinel.poll())
+
     def test_direct_term(self):
         self.run_case("direct-term", 143)
 
@@ -412,6 +470,21 @@ class QualificationTests(unittest.TestCase):
         (self.root / "go").touch()
         self.assertEqual(proc.wait(timeout=5), 0, self.logs())
         self.assertFalse(self.locked())
+
+    def test_lock_wait_interruption_is_durable_before_exit(self):
+        with (self.root / "lock").open() as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            proc = self.start("adapter", str(self.root), "lock-signal")
+            self.assertEqual(proc.wait(timeout=5), 143, self.logs())
+            receipt = self.receipt()
+            self.assertEqual(receipt["interrupted"], signal.SIGTERM)
+            self.assertEqual(receipt["state"], "complete")
+            self.assertFalse(receipt["lock_held"])
+            self.assertTrue(receipt["quiescent"])
+            self.assertFalse((self.root / "ready").exists())
+            self.assertFalse((self.root / "http.jsonl").exists())
+            self.assertTrue(self.locked())  # The contender did not unlock our lock.
+            self.assertIsNone(self.sentinel.poll())
 
     def test_query_outage_retains_lock_until_scoped_empty(self):
         self.hold_case("outage")

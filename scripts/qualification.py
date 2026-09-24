@@ -169,6 +169,7 @@ class Qualification:
         self.control = os.open(self.control_path, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW)
         self.lock = None
         self.final = False
+        self.last_saved = None
         self.next_capacity = 0
         self.docker = Docker(args, session)
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -191,13 +192,16 @@ class Qualification:
 
     def save(self):
         try:
+            snapshot = json.dumps(self.receipt, sort_keys=True) + "\n"
+            if snapshot == self.last_saved:
+                return True
             temporary = self.path.with_suffix(".tmp")
             with temporary.open("w") as out:
-                json.dump(self.receipt, out, sort_keys=True)
-                out.write("\n")
+                out.write(snapshot)
                 out.flush()
                 os.fsync(out.fileno())
             temporary.replace(self.path)
+            self.last_saved = snapshot
             return True
         except OSError as exc:
             self.error("receipt", exc)
@@ -366,7 +370,12 @@ class Qualification:
         while True:
             self.tick()
             if self.receipt["interrupted"] or self.receipt["error"]:
-                return self.exit_code()
+                self.final = True
+                while True:
+                    self.receipt["state"] = "complete"
+                    if self.save():
+                        return self.exit_code()
+                    time.sleep(HOLD_POLL)
             try:
                 fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
@@ -408,11 +417,12 @@ class Qualification:
                 time.sleep(HOLD_POLL)
         # Never leave the lock scope by exception on a query error or deadline.
         self.final = True  # Freeze the verdict before its last durable snapshot.
-        self.receipt.update(state="complete", lock_held=False)
-        while not self.save():
+        while True:
+            self.receipt.update(state="complete", lock_held=False)
+            if self.save():
+                break
             self.receipt["lock_held"] = True
             time.sleep(HOLD_POLL)
-            self.receipt["lock_held"] = False
         fcntl.flock(self.lock, fcntl.LOCK_UN)
         return self.exit_code()
 
