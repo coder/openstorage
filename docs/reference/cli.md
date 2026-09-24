@@ -1,30 +1,32 @@
 # CLI Reference
 
-The `openstorage` binary bundles the server and its operational helpers:
+The `openstorage` binary contains the server and its operational helpers:
 
 ```
 openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> [flags]
 ```
 
-Sources of truth: [`cmd/openstorage/main.go`](../../cmd/openstorage/main.go) and
+Sources: [`cmd/openstorage/main.go`](../../cmd/openstorage/main.go) and
 [`cmd/openstorage/signingkey.go`](../../cmd/openstorage/signingkey.go). Environment
-variables are documented in the [configuration reference](configuration.md).
+variables: [configuration reference](configuration.md).
 
-Subcommands that open the stores (`serve`, `signing-key`, `list-packs`, `purge-repo`)
-share one storage resolution: explicit env URLs win, then `--data-dir` /
-`$OPENSTORAGE_DATA_DIR` (local mode) derives the missing slots. Every backend scheme
-works through those env URLs, including the experimental
-[`s3wal://`](configuration.md#openstorage_pg_url) zero-infra pair: `signing-key` and
-`purge-repo` open the bucket-backed metadata/ref stores from the database URL, and
-`list-packs` reads the blob side through the `s3://` URL (it never opens the database
-URL).
+**Storage resolution** (`serve`, `signing-key`, `list-packs`, `purge-repo`): explicit env
+URLs win, then `--data-dir` / `$OPENSTORAGE_DATA_DIR` (local mode) fills missing slots.
+Every backend scheme works, including the experimental
+[`s3wal://`](configuration.md#openstorage_pg_url) zero-infra pair. `signing-key` and
+`purge-repo` open its metadata/ref stores from the database URL; `list-packs` reads blobs
+through the `s3://` URL and never opens the database URL.
 
 ## `openstorage serve`
 
-Runs one stateless node: the `/api/v1` REST API (plus the `/api/repos/{repo_name}/...`
-aliases and `/api/repo-urls/{repo_id}`), the git smart-HTTP path with its LFS batch API,
-and an unauthenticated `GET /healthz` liveness probe — all on a single listener. Prints
-`listening on <addr>` once bound.
+Runs one stateless node. A single listener serves:
+
+- the `/api/v1` REST API, plus the `/api/repos/{repo_name}/...` aliases and
+  `/api/repo-urls/{repo_id}`;
+- git smart HTTP with the LFS batch API;
+- `GET /healthz`, an unauthenticated liveness probe.
+
+Prints `listening on <addr>` once bound.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -34,9 +36,9 @@ and an unauthenticated `GET /healthz` liveness probe — all on a single listene
 | `--data-dir` | `$OPENSTORAGE_DATA_DIR` | Local-mode data directory; derives database/blob/cache locations for slots not set explicitly |
 
 Requires `OPENSTORAGE_ORG` + `OPENSTORAGE_ORG_PUBKEYS` (single-org mode) and a resolvable
-database + blob URL — either explicit env URLs or local mode via `--data-dir`. All
-validation happens at startup; see the [configuration reference](configuration.md) for
-every knob (rate limiting, quotas, sweeping, repack).
+database + blob URL (explicit env URLs, or local mode via `--data-dir`). All validation
+happens at startup. Rate limiting, quotas, sweeping, and repack are in the
+[configuration reference](configuration.md).
 
 ```sh
 # Local mode: SQLite + plain files under one directory, no other services.
@@ -51,12 +53,14 @@ OPENSTORAGE_PG_URL='s3wal://bucket?endpoint=...' OPENSTORAGE_S3_URL='s3://bucket
 
 ## `openstorage hook`
 
-Internal. `openstorage hook <pre-receive|update> [args...]` is installed by the server
-into cached bare repositories and re-exec'd by git during pushes: `pre-receive` publishes
-and registers the quarantined pack (enforcing the pack quota), `update` runs the ref-CAS
-and ref policies ([git protocol](../explanation/git-protocol-and-namespaces.md)). It reads connection
-and per-request environment inherited from the serve process — there is no reason to run
-it manually.
+Internal; do not run it manually. `openstorage hook <pre-receive|update> [args...]` is
+installed by the server into cached bare repositories and re-exec'd by git during pushes.
+It reads connection and per-request environment inherited from the serve process.
+
+| Hook | Action |
+|---|---|
+| `pre-receive` | Publishes and registers the quarantined pack; enforces the pack quota |
+| `update` | Runs the ref CAS and ref policies ([git protocol](../explanation/git-protocol-and-namespaces.md)) |
 
 ## `openstorage keygen`
 
@@ -65,11 +69,12 @@ Generates an org keypair for JWT signing.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--out` | required | Output path prefix: writes `<out>.pem` (PKCS#8 private key, created with mode `0600`) and `<out>.pub.pem` (PKIX public key, created with mode `0644`), subject to umask. Without `--if-missing`, existing files are overwritten but keep their old modes |
-| `--alg` | `ES256` | Fresh key algorithm: one of `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512`. Ignored when `--if-missing` reuses an existing pair |
+| `--alg` | `ES256` | Fresh key algorithm: one of `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512`. Ignored when `--if-missing` reuses an existing pair, even if different or unsupported |
 | `--if-missing` | `false` | Generate only when both files are absent; otherwise validate and reuse a matching pair without writes |
 
 Point `OPENSTORAGE_ORG_PUBKEYS` at the `.pub.pem` file (it may hold several concatenated
-public key blocks). Never commit either file.
+public key blocks). Never commit either file. The command prints only the key paths,
+never key material.
 
 ```sh
 openstorage keygen --out /tmp/cs-key   # /tmp/cs-key.pem + /tmp/cs-key.pub.pem
@@ -83,28 +88,27 @@ openstorage keygen --if-missing --out ./keys/org
 openstorage keygen --if-missing --out ./keys/org   # validates; no rotation or rewrite
 ```
 
-With `--if-missing`, both existing files must be regular files, not symlinks. The private
-file must have no group or other permission bits; the public file must have no group or
-other write permission bits. Unsafe permissions cause an error, not an automatic chmod.
-Each file must contain exactly one PEM block with only whitespace outside it; extra
-blocks or other payloads are rejected. Whitespace and CRLF formatting are preserved.
-The private block must contain a usable PKCS#8 or SEC1 signing key (RSA keys must be at
-least 2048 bits), and the public block must contain the matching PKIX public key.
-Reuse preserves file bytes, permissions, and modification times. `--alg` only controls
-fresh generation: even a different or unsupported value is ignored on successful reuse.
-The command prints only the key paths, never the key material.
+**`--if-missing` reuse checks.** Missing halves, corrupt keys, mismatches, and unsafe
+files fail without writes; nothing is chmod'ed automatically.
 
-Missing halves, corrupt keys, mismatches, and unsafe existing files fail without writes.
-Fresh files are created exclusively, so a concurrently created file is not overwritten.
-The two-file creation is **not atomic**: interruption or an I/O error can leave a partial
-pair, which later runs reject rather than silently replace. Inspect and repair that state
-explicitly. Do not edit or replace the files or their containing directory while the
-command runs; it does not lock the directory against other processes.
+- Both files must be regular files, not symlinks.
+- Private file: no group or other permission bits. Public file: no group or other write bits.
+- Each file holds exactly one PEM block, with only whitespace outside it. Extra blocks or
+  other payloads are rejected.
+- The private block holds a usable PKCS#8 or SEC1 signing key (RSA: at least 2048 bits);
+  the public block holds the matching PKIX public key.
+- Reuse preserves file bytes (including whitespace and CRLF), permissions, and
+  modification times.
+
+**Fresh generation** creates files exclusively, so a concurrently created file is not
+overwritten. The two-file creation is **not atomic**: an interruption or I/O error can
+leave a partial pair, which later runs reject; inspect and repair it yourself. The command
+does not lock the directory, so do not touch the files or directory while it runs.
 
 ## `openstorage mint`
 
-Mints a JWT signed with the org's private key — the local-mode stand-in for your token
-service. Claims follow [auth spec](authentication.md).
+Mints a JWT signed with the org's private key: the local-mode stand-in for your token
+service. Claims: [auth spec](authentication.md).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -116,11 +120,18 @@ service. Claims follow [auth spec](authentication.md).
 | `--alg` | inferred from key type | JWS signature algorithm |
 | `--ttl` | `1h` | Token lifetime (must be positive) |
 
-Ref-policy patterns support an exact ref name, a standalone `*` (matches everything), or a
-single trailing `*` after a `/` (prefix match, e.g. `refs/heads/feature/*`). Any other `*`
-placement is **not** a glob — it falls through to exact comparison and never matches, so a
-mistyped pattern like `refs/heads/main*` silently leaves the ref unpoliced. Evaluation
-semantics: [auth spec](authentication.md).
+Ref-policy patterns (evaluation: [auth spec](authentication.md)):
+
+| Pattern | Matches |
+|---|---|
+| Exact ref name | That ref |
+| `*` alone | Everything |
+| Single trailing `*` after `/`, e.g. `refs/heads/feature/*` | Prefix match |
+| `*` anywhere else | Nothing — treated as an exact name |
+
+> [!WARNING]
+> A mistyped pattern such as `refs/heads/main*` never matches, so the ref is silently
+> left unpoliced.
 
 ```sh
 TOKEN=$(openstorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
@@ -130,24 +141,31 @@ git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
 ## `openstorage signing-key`
 
 Manages the org's commit-signing key registry for the `verify-sig` ref-policy op
-([auth spec](authentication.md)). Upstream exposes this through its dashboard; the OSS
-equivalent is this CLI writing to the metadata store, which the update hook reads fresh on
-every push. The org must already be registered (`serve` bootstraps it from
+([auth spec](authentication.md)); upstream uses a dashboard instead. It writes to the
+metadata store, which the update hook reads fresh on every push. The org must already be registered (`serve` bootstraps it from
 `OPENSTORAGE_ORG`).
 
-Common flags: `--org` (required — the JWT `iss` claim) and `--data-dir` (local mode;
+Common flags: `--org` (required; the JWT `iss` claim) and `--data-dir` (local mode;
 otherwise the database env URL is used).
 
 ### `signing-key add`
 
-`--key` (required) points at either a single SSH public key line
-(`<type> <base64> [comment]`; types `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256/384/521`
-and their `sk-` FIDO variants) or an ASCII-armored PGP public key block. Validation on add
-checks framing only, not full key material: for SSH lines the type allow-list, base64
-decodability, and the wire-format type echo (a truncated key payload still passes); for
-PGP blocks just the armor header/footer. Bad key material surfaces later, at `verify-sig`
-push time, where one bad registry entry can block protected pushes until it is removed —
-so verify a signed push after adding a key. The hook trusts registry contents verbatim.
+`--key` (required) points at one of:
+
+- a single SSH public key line, `<type> <base64> [comment]`. Types: `ssh-ed25519`,
+  `ssh-rsa`, `ecdsa-sha2-nistp256/384/521`, and their `sk-` FIDO variants;
+- an ASCII-armored PGP public key block.
+
+`add` checks framing only, not key material:
+
+- SSH: type allow-list, base64 decodability, and the wire-format type echo. A truncated
+  key payload still passes.
+- PGP: armor header and footer only.
+
+> [!WARNING]
+> The hook trusts registry contents verbatim. Bad key material surfaces only at
+> `verify-sig` push time, and one bad entry can block protected pushes until removed.
+> Verify a signed push after adding a key.
 
 ### `signing-key list`
 
@@ -165,8 +183,8 @@ openstorage signing-key remove --org selfhost --id 1 --data-dir ~/cs-data
 
 ## `openstorage list-packs`
 
-Lists the pack objects under a repository's `packs/` prefix in the blob store (key and
-size per line, plus a total) — a storage-inspection helper for dogfooding and debugging.
+Lists pack objects under a repository's `packs/` blob-store prefix (key and size per line,
+plus a total), for dogfooding and debugging.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -179,25 +197,33 @@ openstorage list-packs --repo repo_761aac427fd3 --data-dir ~/cs-data
 
 ## `openstorage purge-repo`
 
-Permanently reclaims one **soft-deleted** repository: unregisters its refs, packs, and
-LFS objects (base repository plus `+ephemeral`/`+import` namespaces), deletes its blobs
-through the sweeper's quarantine-first discipline, and removes its credentials and
-upstream link. The synchronous twin of the
+Permanently reclaims one **soft-deleted** repository, including its `+ephemeral`/`+import`
+namespaces:
+
+- unregisters its refs, packs, and LFS objects;
+- deletes its blobs through the sweeper's quarantine-first discipline;
+- removes its credentials and upstream link.
+
+It is the synchronous twin of the
 [`OPENSTORAGE_REPO_RETENTION`](configuration.md#openstorage_repo_retention) background
-purge — same primitive, same crash-safe ordering (rows tombstone before blobs; an
-interrupted purge resumes on re-run).
+purge: same primitive, same crash-safe ordering. Rows tombstone before blobs, and an
+interrupted purge resumes on re-run.
 
-**Irreversible.** A purged repository cannot be restored, and its `(org, url)` name
-stays burned forever (the repository row is kept as a tombstone — URL-scoped tokens may
-outlive the purge, so the name is never released). The repository must already be
-soft-deleted (`DELETE /api/v1/repos/delete`) at least one hour earlier — younger
-deletions are refused so no in-flight pre-delete push can race the purge.
+> [!CAUTION]
+> **Irreversible.** A purged repository cannot be restored. Its `(org, url)` name stays
+> burned forever: the repository row is kept as a tombstone because URL-scoped tokens may
+> outlive the purge.
 
-**Fleet-upgrade prerequisite:** run this only once every node — serve replicas *and*
-hook-running git nodes — runs a build with the purge write fence, exactly like enabling
-[`OPENSTORAGE_REPO_RETENTION`](configuration.md#openstorage_repo_retention): an older
-binary does not check the fence, so its in-flight write can be stranded behind the
-completed purge.
+**Preconditions:**
+
+1. The repository was soft-deleted (`DELETE /api/v1/repos/delete`) at least one hour
+   earlier. Younger deletions are refused so no in-flight pre-delete push can race the
+   purge.
+2. **Fleet upgrade:** every node — serve replicas *and* hook-running git nodes — runs a
+   build with the purge write fence, exactly as for enabling
+   [`OPENSTORAGE_REPO_RETENTION`](configuration.md#openstorage_repo_retention). An older
+   binary does not check the fence, so its in-flight write can be stranded behind the
+   completed purge.
 
 ```
 openstorage purge-repo [flags] <repo-id>
@@ -213,12 +239,13 @@ openstorage purge-repo [flags] <repo-id>
 openstorage purge-repo --data-dir ~/cs-data --yes repo_761aac427fd3
 ```
 
-Deleted blob bytes land in `sweep/quarantine/` first and are freed once the backups age
-past the quarantine window on a later sweep (the running server's sweep collects them;
-with sweeping disabled they remain until one runs). Re-running the command on an
-already-purged repository rescans its blob prefixes for stragglers — bytes an in-flight
-pre-delete push published after the first pass — and reaps them through the same
-quarantine handshake.
+Deleted blob bytes go to `sweep/quarantine/` first. The running server's sweep frees them
+once they age past the quarantine window; with sweeping disabled they stay until a sweep
+runs.
+
+Re-running on an already-purged repository rescans its blob prefixes for stragglers (bytes
+an in-flight pre-delete push published after the first pass) and reaps them through the
+same quarantine handshake.
 
 ## `openstorage version`
 
@@ -228,6 +255,6 @@ Prints the build version on one line and exits (`--version` is an alias):
 openstorage v<version> (commit <sha>, built <timestamp>, <go-version>)
 ```
 
-Release binaries have the tag/commit/date stamped at build time
-([`scripts/release-archives.sh`](../../scripts/release-archives.sh)); source builds fall
-back to Go module build info, reporting `devel` when nothing better is known.
+Release binaries get the tag, commit, and date stamped at build time
+([`scripts/release-archives.sh`](../../scripts/release-archives.sh)). Source builds fall
+back to Go module build info and report `devel` when nothing better is known.

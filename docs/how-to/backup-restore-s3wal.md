@@ -1,75 +1,79 @@
 # Back up and restore a stopped S3WAL node (experimental)
 
-This is a **manual, offline, same-binary** recovery procedure for the
-[one-bucket S3WAL topology](deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
-It covers loss of the serving bucket using a separately protected copy, not just
-replacement of the node. It does not make S3WAL supported or qualify AWS disaster
-recovery. Promotion gates remain in [#192](https://github.com/coder/openstorage/issues/192).
+Snapshot a stopped
+[one-bucket S3WAL node](deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)
+and restore it into a new bucket, for example after losing the serving bucket. The
+procedure is **manual, offline, and same-binary**.
 
-Before changing binaries, read the
-[S3WAL format stability policy](../explanation/storage-engine.md#s3wal-format-stability-policy).
-A stopped-node backup is an upgrade precaution, not qualification of
-cross-version rollback.
+> [!IMPORTANT]
+> S3WAL stays experimental; this does not qualify AWS disaster recovery (gates:
+> [#192](https://github.com/coder/openstorage/issues/192)). A stopped-node backup is
+> an upgrade precaution, not proof of cross-version rollback. Read the [S3WAL format stability policy](../explanation/storage-engine.md#s3wal-format-stability-policy)
+> before changing binaries.
+
+## Prerequisites
+
+- Bash, AWS CLI v2, and Python 3.11+.
+- Pre-provisioned, empty backup and restore buckets on the source's endpoint and
+  region.
+- Independently scoped backup credentials (see below).
+- Authority to stop the node and every other writer.
 
 ## Recovery contract
 
-1. Stop and fence **every writer** for the entire backup window. Blocking HTTP
-   ingress alone is insufficient: hooks, background jobs, direct S3 clients,
-   outstanding presigned uploads, replication and lifecycle automation can still
-   change objects. Stop the supervisor from restarting the node. Drain requests,
-   send `SIGTERM`, wait for process exit and its hook children, and revoke or wait
-   out external upload access. Confirm any in-flight storage operations have
-   finished. If you cannot establish quiescence, do not call the copy consistent.
-2. Copy **every object**, preserving its exact key, bytes and user metadata. Do not
-   select only currently referenced packs. The bucket includes `_wal/meta.json`,
-   repository manifests, permanent purge tombstones, scan state, packs, LFS bytes
-   and sweep quarantine objects. Do not edit JSON or discard unfamiliar keys.
-3. Use a new, empty destination for each snapshot and each restore. Never merge a
-   backup into an existing serving bucket or overwrite the only good backup.
-   Verify the complete key/body/metadata inventory before starting a node.
-4. Keep a matching external configuration backup: binary/image digest, both
-   storage URLs, region/endpoint, expected bucket owner, organization, public-key
-   PEM files, and `OPENSTORAGE_SECRETS_KEY` if used. Store credentials and private
-   signing keys separately in your secret manager. The node cache is disposable;
-   it is not a backup of the authority.
+1. **Stop and fence every writer** for the whole backup window. Blocking HTTP is
+   not enough: hooks, jobs, direct S3 clients, presigned uploads, replication, and
+   lifecycle automation can still write.
+   - Stop the supervisor from restarting the node.
+   - Drain requests, send `SIGTERM`, and wait for the process and hook children.
+   - Revoke or wait out external upload access and in-flight storage operations.
+   - Without proven quiescence, the copy is not consistent.
+2. **Copy every object** with exact key, bytes, and user metadata, not just
+   referenced packs: `_wal/meta.json`, manifests, permanent purge tombstones, scan
+   state, packs, LFS bytes, sweep quarantine. Never edit JSON or drop unknown keys.
+3. **Use a new, empty destination** for every snapshot and restore. Never merge into
+   a serving bucket or overwrite the only good backup. Verify the full
+   key/body/metadata inventory before starting a node.
+4. **Back up the configuration too:** binary/image digest, both storage URLs,
+   region/endpoint, expected bucket owner, organization, public-key PEMs, and
+   `OPENSTORAGE_SECRETS_KEY` if used. Keep credentials and signing keys in your
+   secret manager. The node cache is disposable, not a backup.
 
-A stopped source prevents interleaving copies of different committed states.
-Normal publication uploads pack/LFS bytes before registering them in the
-manifest; this does **not** establish that a previously damaged source is healthy.
-Inventory equality proves copy fidelity, not application consistency or repair.
-Clone/fsck/LFS checks below are a separate acceptance gate.
+A stopped source prevents copying mixed committed states. Inventory equality proves
+copy fidelity, not application consistency: a damaged source stays damaged. The
+clone/fsck/LFS checks are a separate gate.
 
-**Recovery point and time:** the recovery point is the verified stopped snapshot.
-Changes accepted after the source resumes are absent from that snapshot. Downtime
-includes draining, copying and verification; recovery time includes provisioning,
-copying back, verification and cold-cache hydration. Measure these for your data
-size. This small local drill establishes no fleet-wide RPO/RTO guarantee.
+**Recovery point and time:** the recovery point is the verified snapshot. Downtime
+covers draining, copying, and verifying; recovery time covers provisioning, copying
+back, verifying, and cold-cache hydration. Measure both for your data; the local drill sets no
+RPO/RTO.
 
 ## Prepare a protected snapshot
 
-Use a backup identity that can read the source, but whose backup destination
-cannot be modified or deleted by the serving node's credentials. Protect the
-inventory/configuration record independently too. A second bucket writable by a
-compromised serving identity is not ransomware protection. Choose retention and
-off-site protection outside the serving authority; this procedure does not test
-cross-region disaster recovery.
+- **Backup identity:** can read the source; the serving node's credentials cannot
+  modify or delete its destination. (A bucket a compromised serving identity can
+  write is not ransomware protection.) Protect the inventory/config record too, and
+  choose retention and off-site protection outside the serving authority.
+- **Serving buckets** (source and restored) must have versioning and object lock
+  disabled ([store contract](deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)).
+  Do not enable either to implement this procedure.
+  An archival system must instead export a complete ordinary-object snapshot into
+  an empty compliant bucket, with its own policy/key recovery validated.
+- **Not reproduced by the object inventory:** bucket policies, ACLs, lifecycle rules,
+  KMS keys, tags, and provider settings. Provision them deliberately; never blindly
+  copy source access policy. (`--copy-props default` can copy object tags, but the
+  inventory only checks keys, bodies, and metadata.)
+- **Scope:** the Bash/AWS CLI v2 examples copy between pre-provisioned buckets on
+  **one endpoint in one region**. No cross-endpoint migration or cross-region
+  disaster recovery.
+- **Credentials:** independently scoped (with KMS rights where needed), via
+  `AWS_PROFILE` or the normal chain, never in arguments.
+- **Endpoint:** loopback URL for a local SeaweedFS drill; empty for AWS.
 
-The source and restored **serving** buckets must have versioning and object lock
-disabled, as required by the [store contract](deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
-Do not enable them to implement this procedure. A separately managed archival
-system must export a complete ordinary-object snapshot into an empty compliant
-serving bucket; archival policies and encryption keys need their own recovery
-validation. Bucket policies, ACLs, lifecycle rules, KMS keys, tags and provider
-settings are not reproduced by the object inventory below. Provision destination
-permissions/encryption deliberately; never blindly restore source access policy.
+Do not run against production until the quiescence and permission requirements are
+met.
 
-The following Bash/AWS CLI v2 examples copy between pre-provisioned buckets on
-**one endpoint in one region**. They are not a cross-endpoint migration tool.
-Use independently scoped backup credentials (including KMS decrypt/encrypt rights
-where applicable); configure `AWS_PROFILE` or the normal credential chain without
-putting secrets in command arguments. For a local SeaweedFS drill set `ENDPOINT`
-to its loopback URL. For AWS leave it empty. Do not run against production until
-the quiescence and permission requirements above are satisfied.
+### 1. Set variables
 
 ```bash
 set -euo pipefail
@@ -86,12 +90,15 @@ if [[ -n "$ENDPOINT" ]]; then opts+=(--endpoint-url "$ENDPOINT"); fi
 # AWS: set real owner IDs; do not disable the checks.
 ```
 
-Save this inventory helper as `inventory.py` in a restricted working directory
-**outside** the bucket. It uses Python 3.11+ and the AWS CLI, paginates the whole
-bucket, downloads one object at a time and computes SHA-256 locally. It needs
-scratch disk for the largest object and memory for the inventory. Its output is
-sensitive: keys and user metadata may disclose repository information. Do not
-upload real inventories to issues or include credentials in transcripts.
+### 2. Save the inventory helper
+
+Save as `inventory.py` in a restricted directory **outside** the bucket. It needs
+Python 3.11+, the AWS CLI, scratch disk for the largest object, and memory for the
+inventory. It paginates the whole bucket and SHA-256-hashes one object at a time.
+
+> [!WARNING]
+> Inventories are sensitive: keys and metadata reveal repository details. Never
+> upload real ones to issues or put credentials in transcripts.
 
 ```python
 import hashlib
@@ -133,12 +140,13 @@ with tempfile.TemporaryDirectory() as scratch:
 print(json.dumps(entries, sort_keys=True, indent=2))
 ```
 
-The CLI must be allowed to paginate (no `--no-paginate` or `--max-items`). A
-failure aborts the helper; a failed or incomplete inventory is never accepted.
-Do not replace body hashes with ETags: multipart/encrypted object ETags are not
-portable content hashes.
+Let the CLI paginate (no `--no-paginate` or `--max-items`). Any failure aborts;
+never accept an incomplete inventory. Do not substitute ETags for body hashes:
+multipart/encrypted ETags are not portable.
 
-With the source stopped/fenced and the destination inaccessible to other writers:
+### 3. Copy and verify
+
+With the source stopped/fenced and no other writer able to reach the destination:
 
 ```bash
 BUCKET="$SOURCE" EXPECTED_OWNER="$SOURCE_OWNER" python3 inventory.py > source-before.json
@@ -152,35 +160,41 @@ cmp source-before.json source-after.json
 cmp source-before.json backup.json
 ```
 
-`--copy-props default` preserves user metadata, including multipart copies; it
-may require additional object-tagging permissions. The high-level `s3 cp` command
-does not pin expected owners per request; use bucket-scoped permissions for both
-sides. The inventory helper pins the owner on its AWS reads. Validate the copy
-implementation on your endpoint, including large objects, before operational use.
-The local fixture below does not exercise AWS CLI multipart copying or AWS IAM/KMS.
+**Verify:** both `cmp` commands succeed silently.
 
-Record stop/copy/verify times, the binary digest, object count, total bytes and a
-hash of `source-before.json` in the protected backup catalog. Retain the verified
-inventory with the snapshot. A source mismatch invalidates the snapshot: find and
-stop the writer, then take a new snapshot. Matching before/after inventories are
-an additional check, **not a substitute for writer fencing**. Only after all gates
-pass may the original node resume against its original bucket.
+- `--copy-props default` keeps user metadata, also on multipart copies; it may need
+  object-tagging permissions.
+- `s3 cp` does not pin expected owners per request, so scope permissions per bucket.
+  The inventory helper does pin owners.
+- Validate copying on your endpoint, including large objects. The local drill does
+  not exercise AWS CLI multipart copying or IAM/KMS.
+
+### 4. Record and resume
+
+> [!IMPORTANT]
+> Matching before/after inventories are an extra check, **not a substitute for
+> writer fencing**.
+
+1. In the protected catalog, record stop/copy/verify times, binary digest, object
+   count, total bytes, and a hash of `source-before.json`. Keep the inventory with
+   the snapshot.
+2. Source inventories differ? The snapshot is invalid: find and stop the writer,
+   then start over.
+3. Only after all checks pass may the original node resume on its bucket.
 
 ## Restore and validate before cutover
 
-1. Keep the original node stopped/fenced during a real recovery cutover. Do not
-   start two copies of the deployment. The instance lease only detects nodes
-   sharing one bucket; it cannot detect two restored buckets. During a drill,
-   isolate the restored node from users **and deny nonessential outbound
-   traffic before boot**. Restored pending upstream-sync/forwarding markers can
+1. **Keep the original node stopped/fenced** during a real cutover. Never run two
+   copies: the instance lease detects nodes sharing one bucket, not two buckets.
+   In a drill, isolate the restored node from users **and deny nonessential
+   outbound traffic before boot**: restored pending sync/forwarding markers can
    enqueue work at boot, and later writes can deliver restored webhooks.
-2. Use the exact saved binary and configuration, changing both storage URLs and
-   owner settings to the restored bucket and using an empty cache directory.
-   This is not an upgrade/downgrade procedure. Do not use an older binary merely
-   because the JSON says `v: 1`; cross-release compatibility is a separate #192
-   gate. Keep the original backup immutable while investigating failed recovery.
-3. Verify the backup still matches its saved inventory. Copy into the empty
-   restore bucket, then verify again, **before any serve process starts**:
+2. **Use the exact saved binary and configuration**, with both storage URLs and owner
+   settings pointed at the restore bucket and an empty cache directory. This is not
+   an upgrade/downgrade: `v: 1` in the JSON does not make an older binary safe
+   (cross-release compatibility is a #192 gate). Keep the backup immutable while
+   investigating a failed recovery.
+3. **Verify, copy, and verify again, before any serve process starts:**
 
    ```bash
    BUCKET="$BACKUP" EXPECTED_OWNER="$BACKUP_OWNER" python3 inventory.py > backup-now.json
@@ -192,50 +206,62 @@ pass may the original node resume against its original bucket.
    cmp source-before.json restored.json
    ```
 
-4. A copied `_wal/instance-lease` can look fresh because copying resets its
-   Last-Modified time. Prefer waiting at least the saved lease TTL **plus two
-   seconds** after copying, allowing for whole-second S3 timestamp resolution.
-   If startup still reports a held lease, keep the node fenced and retry after
-   its expiry. If necessary, remove **only that key from the restore bucket**,
-   only after confirming every old serving process is dead/fenced; record this
-   intentional post-verification mutation. Never disable the instance lease for recovery.
-   Do not rewrite embedded clocks, claims or scan cursors. New object modification
-   times can delay age-based cleanup; copied leases/claims can delay work. Monitor
-   lease refusals and clock-skew warnings using the [deployment guide](deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
-5. Start one isolated restored node. Check authenticated repository metadata and
-   expected refs; make fresh clones, run `git fsck --strict`, fetch/check LFS and
-   compare payload bytes or SHA-256 with known-good expectations. Exercise a
-   disposable repository's push and re-clone to check new CAS writes. `/healthz`
-   alone is not recovery proof. A real incident requires checks across the affected
-   repository inventory, not just the small fixture below.
-6. Before admitting users or allowing external side effects, reconcile security
-   changes since the snapshot: deleted/purged repository names, revoked keys,
-   credentials and webhook/upstream settings may have been rolled back. Unexpired
-   JWTs accepted by restored keys can work again. Preserve purge tombstones in the
-   snapshot, but do not assume it contains revocations made later. After compromise,
+4. **Handle the copied instance lease.** Copying resets `_wal/instance-lease`'s
+   Last-Modified time, so it can look fresh.
+   - Wait at least the saved lease TTL **plus two seconds** (S3 timestamps have
+     whole-second resolution).
+   - Still held at startup? Keep the node fenced and retry after expiry.
+   - Last resort: remove **only that key from the restore bucket**, after confirming
+     every old serving process is dead/fenced. Record this mutation.
+
+   **Never disable the instance lease for recovery.** Do not rewrite embedded
+   clocks, claims, or scan cursors.
+
+   New modification times can delay age-based cleanup; copied leases/claims can delay
+   work. Monitor lease refusals and clock-skew warnings
+   ([deployment guide](deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)).
+5. **Start one isolated restored node and validate data:**
+   - authenticated repository metadata and expected refs;
+   - fresh clones plus `git fsck --strict`;
+   - LFS fetch, with payload bytes or SHA-256 compared to known-good values;
+   - a push and re-clone on a disposable repository, to test new CAS writes.
+
+   `/healthz` alone is not proof. A real incident needs checks across all affected
+   repositories, not just the fixture below.
+6. **Reconcile security changes since the snapshot** before admitting users or
+   external side effects. Deleted or purged repository names, revoked keys, credentials, and
+   webhook/upstream settings may be rolled back; unexpired JWTs from restored keys
+   can work again. The snapshot keeps purge tombstones but may lack later
+   revocations. After a compromise,
    rotate credentials/keys and assess the backup's trustworthiness separately.
    Authorize a single cutover only after data and security checks pass.
 
 ## Reproduce the local recovery drill
 
-Install the [contributor prerequisites](../../CONTRIBUTING.md#prerequisites):
-pinned Go, Docker and git-lfs. From the repository root:
+Install the [contributor prerequisites](../../CONTRIBUTING.md#prerequisites)
+(pinned Go, Docker, git-lfs). From the repository root:
 
 ```bash
 OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp \
   -run '^TestS3WAL_OfflineBackupRestore$' -count=1 -race -timeout=5m -v
 ```
 
-The drill uses separate source, backup and restore buckets on disposable
-SeaweedFS. It stops the source, verifies whole-bucket copies (including an opaque
-metadata-bearing object), rejects a damaged restore inventory before boot, removes
-source data/cache, and checks fresh-cache Git/LFS recovery and a subsequent push.
-The copier/verifier is test-only. Capture the stage log plus a terminal screenshot
-and recording for review; use only generated test credentials/data.
+The drill uses separate source, backup, and restore buckets on disposable
+SeaweedFS:
 
-This is **local fixture proof**, not evidence for AWS permissions, account/region
-loss, retention enforcement, large-object transfer, hostile-writer fencing or
-fleet-wide corruption recovery. It does not satisfy A1's conformant real-S3
-starvation rerun, A2's separate-day repeats, A3's in-region campaign or A4/#182's
-measurement refresh. If the conformant rerun again trips the recorded 30-second
-starvation criterion, the kill/deprecation recommendation remains unchanged.
+1. stops the source and verifies whole-bucket copies, including an opaque
+   metadata-bearing object;
+2. rejects a damaged restore inventory before boot;
+3. removes source data and cache;
+4. checks fresh-cache Git/LFS recovery and a later push.
+
+The copier/verifier is test-only. For review, capture the stage log, a screenshot,
+and a recording, with generated test credentials and data only.
+
+> [!NOTE]
+> This is **local fixture proof**, not evidence for AWS permissions, account/region
+> loss, retention enforcement, large-object transfer, hostile-writer fencing, or fleet-wide
+> corruption recovery. It does not satisfy A1's conformant
+> real-S3 starvation rerun, A2's separate-day repeats, A3's in-region campaign, or
+> A4/#182's measurement refresh. If the conformant rerun again trips the recorded
+> 30-second starvation criterion, the kill/deprecation recommendation stands.

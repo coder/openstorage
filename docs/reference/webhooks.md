@@ -1,8 +1,23 @@
 # Outbound Webhooks
 
-The backend delivers HTTP POST notifications to customer-configured endpoints. (Endpoint
-registration/management is not exposed via the public SDKs — likely dashboard/control-plane;
-an OSS backend needs its own config surface for this.)
+The backend sends HTTP POST notifications to customer-configured endpoints. This page
+covers endpoint management, delivery headers, signatures, and event payloads. Delivery
+egress rules: [`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`](configuration.md#openstorage_webhook_allow_private).
+
+## Endpoint management
+
+The public SDKs do not manage endpoints; upstream uses its dashboard/control plane.
+open.storage adds its own org-level routes. All require `repo:write` with `repo: "org"`
+and return the plain `{"error"}` envelope on failure.
+
+| Method & path | Body → Response |
+|---|---|
+| `POST /api/v1/webhooks` | `{url, secret?}` → 200 `{id, url, secret, created_at}` |
+| `GET /api/v1/webhooks` | → 200 `{webhooks: [{id, url, created_at}]}` |
+| `DELETE /api/v1/webhooks/{id}` | → 204; 404 |
+
+The signing secret is returned exactly once, from `POST`; the server generates one when
+the body omits it. `GET` never echoes secrets.
 
 ## Delivery headers
 
@@ -21,11 +36,12 @@ signature   = hex(HMAC_SHA256(secret, signed_data))
 header      = "t=" + timestamp + ",sha256=" + signature
 ```
 
-Receiver validation the backend must be compatible with:
-- timestamp age ≤ 300s by default (clients reject older), and not more than 60s in the
-  future → the backend must sign with the *send-time* timestamp and deliver promptly,
-  re-signing on retries.
-- Constant-time comparison of hex digests.
+Receivers (the SDKs) validate:
+
+- **Timestamp window:** age ≤ 300s by default (older is rejected) and no more than 60s in
+  the future. The backend therefore signs with the *send-time* timestamp, delivers
+  promptly, and re-signs on retries.
+- **Digest:** constant-time comparison of hex digests.
 
 ## Event payloads
 
@@ -42,41 +58,47 @@ Receiver validation the backend must be compatible with:
 }
 ```
 
-All seven fields are required — the Go SDK rejects payloads with any empty field
+All seven fields are required: the Go SDK rejects a payload with any empty field
 ("invalid push payload").
 
 ### `repo.sync.started` / `repo.sync.succeeded` / `repo.sync.failed`
 
-From official docs (guides/webhooks.md): payloads carry `type`, repo identity and sync
-metadata; `repo.sync.failed` additionally has `error`, one of:
-`"authentication failed"`, `"failed to clone repository"`, `"failed to push to storage"`,
-`"repository configuration error"`, `"upstream repository unreachable"`,
-`"internal error"`, `"session unavailable"`, `"sync failed"`.
-See [`../upstream/guides/webhooks.md`](../upstream/guides/webhooks.md) for the exact field tables.
+Payloads carry `type`, repo identity, and sync metadata. Exact field tables:
+[`../upstream/guides/webhooks.md`](../upstream/guides/webhooks.md).
 
-Outbound push-upstream runs (our extension — see the
-[HTTP API](http-api.md) "Upstream sync") reuse these three event types with a
-`direction: "push"` discriminator; inbound pull payloads are unchanged on the
-wire (no `direction` field), so absence means pull. Push-direction payloads may
-additionally carry `forced: true` (the run used force refspecs) and, on
-`repo.sync.failed` with `error: "push rejected by upstream"`, a
-`rejected_refs: [{ref, reason}]` array naming each ref the upstream refused
-(e.g. `non-fast-forward`). The forward is atomic: one refused ref fails the
-whole batch and the upstream is left untouched, so the array also lists the
-innocent refs with reason `atomic push failed`. Push-direction `error`
-values reuse the strings
-above plus `"failed to push to upstream"` (generic outbound push failure) and
-`"push rejected by upstream"`. `run_count`/`is_first_sync` count outbound runs
-independently of inbound ones.
+`repo.sync.failed` adds `error`, one of:
+
+- `"authentication failed"`
+- `"failed to clone repository"`
+- `"failed to push to storage"`
+- `"repository configuration error"`
+- `"upstream repository unreachable"`
+- `"internal error"`
+- `"session unavailable"`
+- `"sync failed"`
+
+**Push direction** (open.storage extension; see
+[Upstream sync](http-api.md#upstream-sync)). Outbound push-upstream runs reuse the same
+three event types:
+
+| Field | Meaning |
+|---|---|
+| `direction: "push"` | Present on push runs only. Inbound pull payloads are unchanged on the wire (no `direction` field), so absence means pull |
+| `forced: true` | Optional; the run used force refspecs |
+| `rejected_refs: [{ref, reason}]` | On `repo.sync.failed` with `error: "push rejected by upstream"`: each ref the upstream refused (e.g. `non-fast-forward`). The forward is atomic — one refused ref fails the whole batch and leaves the upstream untouched — so the array also lists innocent refs with reason `atomic push failed` |
+| `error` | The strings above, plus `"failed to push to upstream"` (generic outbound push failure) and `"push rejected by upstream"` |
+| `run_count` / `is_first_sync` | Count outbound runs independently of inbound ones |
 
 ### Unknown events
 
-SDKs pass through unrecognized `X-Pierre-Event` values as `{type, raw}` — safe to add new
-event types.
+SDKs pass unrecognized `X-Pierre-Event` values through as `{type, raw}`, so new event
+types are safe to add.
 
 ## Implementation guidance
 
-- Emit events after the ref update commits atomically (queue + at-least-once delivery;
-  receivers use timestamp checks, not idempotency keys — keep retry windows short or
-  re-sign).
-- Ephemeral-namespace updates do not emit `push` events (see the [domain model](../explanation/domain-model.md), invariant 7).
+- Emit events after the ref update commits atomically, via a queue with at-least-once
+  delivery.
+- Receivers use timestamp checks, not idempotency keys: keep retry windows short or
+  re-sign.
+- Ephemeral-namespace updates do not emit `push` events
+  ([domain model](../explanation/domain-model.md), invariant 7).
