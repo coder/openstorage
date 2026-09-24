@@ -872,9 +872,20 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	// openapi (#292): `order` is the topological rank relative to the
 	// resolved ref, from ONE walk per page (gitread.TopoRanks documents the
 	// tie-break). Ranks are relative to commit, not to the page, so they
-	// agree across pages of the same listing.
-	ranks, err := gitread.TopoRanks(r.Context(), repoPath, commit, slices.Collect(maps.Keys(commitsMap)))
-	if err != nil {
+	// agree across pages of the same listing. The walk runs under the
+	// process-wide topoWalks budget; when it is exhausted or times out the
+	// request fails with 503 rather than returning entries without order.
+	ranks, err := topoWalks.ranks(r.Context(), repoPath, commit, slices.Collect(maps.Keys(commitsMap)))
+	switch {
+	case errors.Is(err, errTopoWalkBusy):
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "server is busy computing commit order; retry shortly")
+		return
+	case errors.Is(err, errTopoWalkTimeout):
+		s.logger.Warn("files/metadata commit order walk timed out", "path", r.URL.Path, "err", err)
+		writeErr(w, http.StatusServiceUnavailable, "commit order walk exceeded the server time budget")
+		return
+	case err != nil:
 		s.internalErr(w, r, "topological commit order", err)
 		return
 	}

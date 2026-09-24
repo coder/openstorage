@@ -125,7 +125,7 @@ about the endpoint's rollout status on upstream clusters.
 
 Ties between commits that ancestry does not order follow git's topo-order walk, which ignores dates. A commit becomes eligible once all of its children reachable from the ref are ranked, and the most recently eligible commit is ranked next. When ranking a merge makes several of its parents eligible at once, they become eligible in parent order, so the line of history behind the last of them is ranked first. The same history always yields the same ranks.
 
-Cost: each page runs one extra `git rev-list --topo-order` walk. open.storage does not write commit-graphs for its cache repositories, so git usually reads the whole history of the ref for that walk (about 70–90 ms for 20,000 commits in `BenchmarkTopoRanks`). That is about the cost of one `git log -1` for a file last changed near the root, which the endpoint already runs for each file on the page.
+Cost: each page runs one extra `git rev-list --topo-order` walk. open.storage does not write commit-graphs for its cache repositories, so git usually reads the whole history of the ref for that walk (about 70–90 ms for 20,000 commits in `BenchmarkTopoRanks`). That is about the cost of one `git log -1` for a file last changed near the root, which the endpoint already runs for each file on the page. The walks are bounded per server process: at most 4 run at once, and each is stopped after 20 seconds. When all 4 are busy, the request fails at once with 503 and `Retry-After: 1`, without queueing. When a walk exceeds its time limit, the request fails with 503. A successful response always carries `order` for every commit. A history too long to walk within the limit gets 503 on every page. Commit-graph support, tracked in [#307](https://github.com/coder/openstorage/issues/307), would make the walk much faster.
 
 ### Branches
 
@@ -284,4 +284,4 @@ freshness pokes) and push-upstream forwards.
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, CAS conflict |
 | 412 | CAS precondition failed |
 | 429 | rate limit ("unavailable" to ref-update clients) |
-| 5xx | internal/unavailable; 503 documented for cold-storage warmup on grep/archive |
+| 5xx | internal/unavailable; 503 documented for cold-storage warmup on grep/archive, and for `files/metadata` when the commit-order walk budget is busy (with `Retry-After`) or exceeded |
