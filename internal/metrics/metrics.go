@@ -1,4 +1,4 @@
-// Package metrics owns the opt-in Prometheus exposition (ADR-47, issue
+// Package metrics owns the opt-in Prometheus exposition (ADR-48, issue
 // #325). Collectors live on a private registry, never the global default
 // one, and every label value is a constant chosen here: callers pass
 // typed enums, so no request data can reach a label. Incrementing is
@@ -257,7 +257,7 @@ func InstrumentMux(mux *http.ServeMux, classify func(pattern string) Surface) ht
 	})
 }
 
-// Fixed bounds for the unauthenticated metrics listener (ADR-47): no
+// Fixed bounds for the unauthenticated metrics listener (ADR-48): no
 // configuration knobs.
 const (
 	scrapeTimeout        = 10 * time.Second
@@ -292,7 +292,7 @@ func NewServer() *http.Server {
 
 // IsUnspecifiedBind reports whether addr binds every interface (empty
 // host or an unspecified IP). Such binds get a startup warning; they are
-// not refused (ADR-47). The warning is not exposure detection.
+// not refused (ADR-48). The warning is not exposure detection.
 func IsUnspecifiedBind(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {

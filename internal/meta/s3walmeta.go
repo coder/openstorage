@@ -565,7 +565,7 @@ type s3walMetaMutation struct {
 // attempts retry.
 func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 	defer func() {
-		// ADR-47: count terminal contention exhaustion at the return
+		// ADR-48: count terminal contention exhaustion at the return
 		// boundary only (never per attempt).
 		if errors.Is(err, s3wal.ErrCASContention) {
 			metrics.S3WALContentionExhausted(metrics.ScopeMeta)

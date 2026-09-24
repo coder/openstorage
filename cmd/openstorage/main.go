@@ -167,7 +167,7 @@ func cmdServe(ctx context.Context, args []string) error {
 			if err != nil {
 				return err
 			}
-			metrics.SetS3WALLeaseHeld(true) // ADR-47: local state, not proof of ownership
+			metrics.SetS3WALLeaseHeld(true) // ADR-48: local state, not proof of ownership
 			defer func() {
 				// Release is best-effort by design (an abandoned lease
 				// expires on its TTL), so bound it: a stalled endpoint
@@ -204,7 +204,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		return err
 	}
 	defer ln.Close()
-	// Opt-in metrics listener (ADR-47): its own socket, server, and mux.
+	// Opt-in metrics listener (ADR-48): its own socket, server, and mux.
 	// Bind it before anything is announced or served; a bad or busy
 	// address fails startup instead of silently disabling metrics.
 	var metricsLn net.Listener
@@ -344,7 +344,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// their own request contexts (and the stores hold no long-lived
 	// context), so work admitted before the signal completes normally
 	// within the bounded drain.
-	// Instrument the whole mux (ADR-47) so its own redirects count too.
+	// Instrument the whole mux (ADR-48) so its own redirects count too.
 	httpSrv := &http.Server{Handler: metrics.InstrumentMux(mux, metricsSurface)}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpSrv.Serve(ln) }()
@@ -353,7 +353,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		return err
 	case err := <-metricsErr:
 		// The metrics server stopped on its own: exit rather than keep
-		// serving unmonitored (ADR-47).
+		// serving unmonitored (ADR-48).
 		return fmt.Errorf("metrics listener stopped: %w", err)
 	case <-ctx.Done():
 		// Restore default signal disposition first: a second signal
@@ -660,7 +660,7 @@ func cmdListPacks(ctx context.Context, args []string) error {
 }
 
 // metricsSurface maps the mux pattern for a request to its fixed metrics
-// surface (ADR-47). It mirrors the registrations above: /api/ subtree,
+// surface (ADR-48). It mirrors the registrations above: /api/ subtree,
 // /healthz, and the Git fallback for everything else. For a mux redirect
 // the pattern is the redirect's target path, classified by the same rule.
 func metricsSurface(pattern string) metrics.Surface {

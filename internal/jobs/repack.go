@@ -219,7 +219,7 @@ const repackVerifyReserve = 30 * time.Second
 // deployment shape that winner runs the same follow-up recheck.
 func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err error) {
 	folded, err = r.repack(ctx, repo)
-	// ADR-47: success = folded cleanly; noop = nothing to fold or a lost
+	// ADR-48: success = folded cleanly; noop = nothing to fold or a lost
 	// race; error = any error, including a committed fold that failed
 	// verification.
 	switch {

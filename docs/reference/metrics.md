@@ -2,7 +2,7 @@
 
 `openstorage serve` can expose Prometheus metrics on a separate, opt-in
 listener. It is off by default. The design and its security rules are in
-[ADR-47](../adr/047-metrics-ride-an-opt-in-separate-listener-with-fixed-labels.md).
+[ADR-48](../adr/048-metrics-ride-an-opt-in-separate-listener-with-fixed-labels.md).
 
 ## Turn it on
 

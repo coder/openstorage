@@ -19,7 +19,7 @@ import (
 )
 
 // metricsNode is a serve process started with custom listen settings and
-// full stdout/stderr capture, for the ADR-47 listener drills.
+// full stdout/stderr capture, for the ADR-48 listener drills.
 type metricsNode struct {
 	cmd         *exec.Cmd
 	addr        string // API/Git listener

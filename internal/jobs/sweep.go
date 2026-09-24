@@ -325,7 +325,7 @@ func NewSweeper(blobs blob.BlobStore, packs PackRegistry, cfg SweepConfig, logge
 // absorbs it — and the next sweep's heal pass remains the crash backstop.
 func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	report, err := s.sweep(ctx)
-	// ADR-47: one outcome per execution, on the choke point both queue
+	// ADR-48: one outcome per execution, on the choke point both queue
 	// backends share.
 	if err != nil {
 		metrics.JobRun(metrics.JobOrphanSweep, metrics.ResultError)

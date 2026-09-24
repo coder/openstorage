@@ -19,7 +19,7 @@ func jobDelta(job, result string, fn func()) float64 {
 }
 
 // TestMetricsSweepOutcomes: each Sweep execution counts exactly one
-// outcome (ADR-47) on the choke point both queue backends share.
+// outcome (ADR-48) on the choke point both queue backends share.
 func TestMetricsSweepOutcomes(t *testing.T) {
 	f := newSweepFixture(t)
 	seedSweepWorld(f)

@@ -62,7 +62,7 @@ New here? Start with the [README quickstart](../README.md#quickstart-local-mode-
 
 | Directory | Contents |
 |---|---|
-| [`adr/`](adr/README.md) | Architecture decision records (ADR-1 to ADR-47). Historical and individually addressable. |
+| [`adr/`](adr/README.md) | Architecture decision records (ADR-1 to ADR-48). Historical and individually addressable. |
 | [`archive/`](archive/phases/07-implementation-roadmap.md) | The original implementation roadmap and per-phase notes (`archive/phases/08` to `16`). Historical: for current behavior, prefer reference and explanation pages. Recorded evidence paths and upstream names are unchanged. |
 | `upstream/` | Verbatim copies of the vendor's OpenAPI spec and docs, kept for compatibility audits. |
 

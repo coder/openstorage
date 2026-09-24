@@ -1173,7 +1173,7 @@ func (s *S3WAL) GetGeneration(ctx context.Context, repo string) (int64, error) {
 }
 
 // countContention counts a terminal S3WAL mutation that returned
-// ErrCASContention (ADR-47). Deferred at a mutation loop's return
+// ErrCASContention (ADR-48). Deferred at a mutation loop's return
 // boundary, so it counts once per mutation, never per attempt.
 func countContention(scope metrics.ContentionScope, err *error) {
 	if errors.Is(*err, s3wal.ErrCASContention) {

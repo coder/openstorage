@@ -242,7 +242,7 @@ It never serves metrics; see [`OPENSTORAGE_METRICS_LISTEN`](#openstorage_metrics
 ### `OPENSTORAGE_METRICS_LISTEN`
 
 Address of the opt-in Prometheus metrics listener ([metrics reference](metrics.md),
-[ADR-47](../adr/047-metrics-ride-an-opt-in-separate-listener-with-fixed-labels.md)).
+[ADR-48](../adr/048-metrics-ride-an-opt-in-separate-listener-with-fixed-labels.md)).
 
 - **Default:** unset or empty, which means no metrics listener.
 - **Format:** `host:port`, like `127.0.0.1:9464`. `:0` picks a free port, printed as

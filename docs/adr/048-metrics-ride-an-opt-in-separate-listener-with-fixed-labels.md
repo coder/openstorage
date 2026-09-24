@@ -1,4 +1,4 @@
-# ADR-47: Metrics ride an opt-in, separate listener with fixed labels
+# ADR-48: Metrics ride an opt-in, separate listener with fixed labels
 
 > Decision record for issue #325 (opt-in Prometheus metrics listener),
 > which implements the C3 GA observability item of #192. The desk chose

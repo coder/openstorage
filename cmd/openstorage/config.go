@@ -38,7 +38,7 @@ const (
 	envRateRPS    = "OPENSTORAGE_RATE_RPS"
 	envRateBurst  = "OPENSTORAGE_RATE_BURST"
 
-	// envMetricsListen enables the opt-in metrics listener (ADR-47).
+	// envMetricsListen enables the opt-in metrics listener (ADR-48).
 	envMetricsListen = "OPENSTORAGE_METRICS_LISTEN"
 
 	// Trusted-proxy allowlist for rate-limit client identity (issue #30):
@@ -304,7 +304,7 @@ type serveConfig struct {
 	dbURL    string
 	blobURL  string
 
-	// metricsListen is the opt-in metrics listener address (ADR-47);
+	// metricsListen is the opt-in metrics listener address (ADR-48);
 	// empty means no listener.
 	metricsListen string
 

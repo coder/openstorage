@@ -10,7 +10,7 @@ import (
 )
 
 // TestS3WALMetaMetricsContention drives the MemCAS contention fault seam
-// through a metadata-document mutation and asserts the ADR-47 counter
+// through a metadata-document mutation and asserts the ADR-48 counter
 // moves once for the terminal failure.
 func TestS3WALMetaMetricsContention(t *testing.T) {
 	ctx := context.Background()

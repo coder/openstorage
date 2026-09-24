@@ -23,7 +23,7 @@ const (
 
 // TestS3WALMetricsContention drives the existing MemCAS contention fault
 // seam through a refs-manifest CAS and a scan-state write and asserts the
-// ADR-47 counter moves exactly once per terminal mutation, and not at all
+// ADR-48 counter moves exactly once per terminal mutation, and not at all
 // on success.
 func TestS3WALMetricsContention(t *testing.T) {
 	ctx := context.Background()

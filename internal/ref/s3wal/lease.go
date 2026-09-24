@@ -286,7 +286,7 @@ func (l *InstanceLease) renew(ctx context.Context) error {
 		l.etag, l.renewedAt = etag, start
 		return nil
 	}
-	metrics.S3WALLeaseRenewalFailed() // ADR-47: failed write attempt, not a lost lease
+	metrics.S3WALLeaseRenewalFailed() // ADR-48: failed write attempt, not a lost lease
 	obj, gerr := l.cs.Get(ctx, LeaseKey)
 	switch {
 	case gerr == nil:

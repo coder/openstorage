@@ -6,7 +6,7 @@ import (
 	"github.com/coder/openstorage/internal/metrics"
 )
 
-// TestMetricsSurface pins the mux-pattern → surface mapping (ADR-47): the
+// TestMetricsSurface pins the mux-pattern → surface mapping (ADR-48): the
 // three registrations in serve, plus the redirect-target paths the mux
 // reports for its own redirects.
 func TestMetricsSurface(t *testing.T) {

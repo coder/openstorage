@@ -1632,7 +1632,7 @@ func TestLogSyncEgressWarnings(t *testing.T) {
 }
 
 // TestResolveServeConfigMetricsListen: the metrics listener is off unless
-// OPENSTORAGE_METRICS_LISTEN is set to a non-empty value (ADR-47). Values
+// OPENSTORAGE_METRICS_LISTEN is set to a non-empty value (ADR-48). Values
 // are not trimmed: a whitespace-only value reaches the bind and fails
 // startup instead of silently disabling metrics.
 func TestResolveServeConfigMetricsListen(t *testing.T) {

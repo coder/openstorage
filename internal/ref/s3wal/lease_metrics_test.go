@@ -9,7 +9,7 @@ import (
 )
 
 // TestInstanceLeaseMetricsRenewalFailures drives the existing dropped-write
-// fault seam: every failed renewal write counts once (ADR-47), including
+// fault seam: every failed renewal write counts once (ADR-48), including
 // the attempt whose verdict is the fail-stop, and a clean renewal does not.
 func TestInstanceLeaseMetricsRenewalFailures(t *testing.T) {
 	ctx := context.Background()
