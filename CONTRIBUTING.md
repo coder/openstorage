@@ -1,9 +1,15 @@
 # Contributing
 
-This document covers the local development loop: building, running, testing,
-linting, and what it takes to get a change merged. For what the project *is*,
-start at the [README](README.md); for test lanes and the simulation harness in
-depth, see the [testing reference](docs/reference/testing.md).
+Build, test, and merge a change. Project overview: [README](README.md).
+Test lanes in depth: [testing reference](docs/reference/testing.md).
+
+## TL;DR
+
+1. Install the [prerequisites](#prerequisites), then `mise install`.
+2. Build: `go build ./cmd/openstorage`.
+3. Test: `go test ./... -count=1 -race -timeout=30m` plus the [other two lanes](#tests).
+4. Lint: `golangci-lint run`.
+5. Open a PR with a [conventional title](#commit-and-pr-conventions); meet the [review bar](#the-review-bar).
 
 ## Prerequisites
 
@@ -11,20 +17,20 @@ depth, see the [testing reference](docs/reference/testing.md).
 |---|---|
 | Go ≥ 1.27.1 | `go.mod` toolchain; CI resolves the version from `go.mod` |
 | git | the server shells out to it; every test uses it |
-| git-lfs | the LFS end-to-end tests drive a real `git lfs` client (CI fails fast if it is missing) |
-| Docker | the default test lane boots real Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/); also the compose stack |
-| gpg / ssh-keygen | only for `verify-sig` ref-policy tests and manual dogfooding of signature verification |
+| git-lfs | LFS e2e tests drive a real `git lfs` client; CI fails fast without it |
+| Docker | default test lane (Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/)) and the compose stack |
+| gpg / ssh-keygen | only `verify-sig` ref-policy tests and manual signature dogfooding |
 
-The Go, golangci-lint, and AWS-reference Terraform pins live in [`mise.toml`](mise.toml); with
-[mise](https://mise.jdx.dev/) installed, `mise install` fetches exactly the
-versions CI uses. Installing the same versions by hand works too.
+[`mise.toml`](mise.toml) pins Go, golangci-lint, and the AWS-reference Terraform.
+[mise](https://mise.jdx.dev/)'s `mise install` fetches CI's exact versions;
+installing them by hand also works.
 
 ## Authenticated installation
 
-While the repository and release downloads are internal to the Coder organization,
-installing requires GitHub credentials with repository access:
+The repository and release downloads are internal to the Coder organization,
+so you need GitHub credentials with repository access.
 
-- To build the current source, clone it using authenticated Git:
+- **From source**, clone with authenticated Git:
 
   ```sh
   gh auth setup-git   # or configure another Git credential helper for github.com
@@ -32,23 +38,22 @@ installing requires GitHub credentials with repository access:
   go install ./cmd/openstorage
   ```
 
-  This checkout uses the committed `vendor/` tree. Its Go module path is
-  `github.com/coder/openstorage`. The `v0.15.0` tag still declares
-  `github.com/coder/open-storage`; GitHub redirects do not change existing tags.
-  Until a release includes the corrected module path, use the checkout above.
-  After that release, installation by module path can use
+  This uses the committed `vendor/` tree. The `v0.15.0` tag still declares
+  module path `github.com/coder/open-storage`, not `github.com/coder/openstorage`
+  (GitHub redirects do not change tags). Once a release carries the current
+  path, you can install with
   `GOPRIVATE='github.com/coder/*' go install github.com/coder/openstorage/cmd/openstorage@latest`.
-  `GOPRIVATE` makes Go fetch private modules directly through authenticated Git,
-  bypassing the public module proxy and checksum database.
+  `GOPRIVATE` fetches through authenticated Git, bypassing the public module
+  proxy and checksum database.
 
-- mise needs a GitHub token for release downloads. A logged-in `gh` CLI is picked up
-  when `github.gh_cli_tokens` is enabled (the default); otherwise set `GITHUB_TOKEN`:
+- **With mise**, release downloads need a GitHub token: a logged-in `gh` CLI
+  (used when `github.gh_cli_tokens` is on, the default) or `GITHUB_TOKEN`:
 
   ```sh
   mise use -g github:coder/openstorage@latest
   ```
 
-  For mise versions that predate the `github:` backend, use
+  Older mise without the `github:` backend:
   `mise use -g 'ubi:coder/openstorage[exe=openstorage]@latest'`.
 
 ## Build and run
@@ -59,21 +64,21 @@ go build ./cmd/openstorage && ./openstorage version
 ./openstorage keygen --out /tmp/cs-key   # org keypair, used by both serve modes below
 ```
 
-(A source build lands at `./openstorage` without touching `PATH` — spell the
-`./` out, or `go install` it.) Three ways to run what you built:
+The binary lands at `./openstorage`, not on `PATH` (or `go install` it).
+Run it one of three ways:
 
-- **Local mode** — SQLite + files; no database or object-storage service required:
+- **Local mode** — SQLite + files; no database or object-storage service:
 
   ```sh
   OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
     ./openstorage serve --listen 127.0.0.1:8080 --data-dir /tmp/cs-data
   ```
 
-  The [README quickstart](README.md#quickstart-local-mode-60-seconds) continues from
-  here (minting tokens, creating a repo, pushing).
+  Next: [README quickstart](README.md#quickstart-local-mode-60-seconds)
+  (mint tokens, create a repo, push).
 
-- **Production topology (Postgres + SeaweedFS)** — boot the backing services from the
-  repo compose file and run `serve` on the host against them:
+- **Production topology (Postgres + SeaweedFS)** — compose runs the services;
+  `serve` runs on the host:
 
   ```sh
   docker compose up -d --wait
@@ -84,13 +89,12 @@ go build ./cmd/openstorage && ./openstorage version
     ./openstorage serve --listen 127.0.0.1:8080
   ```
 
-  The opt-in `replicas` profile adds two containerized server nodes — see the
-  [compose guide](docs/how-to/deploy-docker-compose.md). Every `OPENSTORAGE_*`
-  variable is documented in the [configuration reference](docs/reference/configuration.md).
+  The opt-in `replicas` profile adds two server containers
+  ([compose guide](docs/how-to/deploy-docker-compose.md)). All `OPENSTORAGE_*`
+  variables: [configuration reference](docs/reference/configuration.md).
 
-- **S3-only storage (experimental)** — one SeaweedFS bucket as the sole durable
-  authority (`s3wal://` refs + metadata and `s3://` blobs on the same bucket, which must
-  exist before boot):
+- **S3-only storage (experimental)** — one SeaweedFS bucket holds everything
+  durable (`s3wal://` refs + metadata, `s3://` blobs). It must exist before boot.
 
   ```sh
   docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.47 server -s3 -dir=/data -ip.bind=0.0.0.0
@@ -107,17 +111,14 @@ go build ./cmd/openstorage && ./openstorage version
     ./openstorage serve --listen 127.0.0.1:8080
   ```
 
-  (This standalone SeaweedFS runs unauthenticated, so any credentials sign.) The
-  [README quickstart](README.md#quickstart-zero-infrastructure-mode-one-bucket-experimental)
-  continues with the client flow; topology and boundaries are in the
-  [production guide](docs/how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
+  This SeaweedFS is unauthenticated, so any credentials work. Next:
+  [README quickstart](README.md#quickstart-zero-infrastructure-mode-one-bucket-experimental);
+  limits: [production guide](docs/how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
 
 ## Tests
 
-CI gates every PR on all three lane commands below (issue #193 promoted the
-s3wal lane from nightly-only). The
-[testing reference](docs/reference/testing.md) explains what each lane covers
-and the conventions for writing new tests.
+CI gates every PR on these three lanes. The
+[testing reference](docs/reference/testing.md) explains coverage and test conventions.
 
 ```sh
 # 1. Default lane — the full suite on the production backends.
@@ -134,53 +135,47 @@ OPENSTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeou
 OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m
 ```
 
-A further lane hides inside the first: the `internal/api`, `internal/meta`, and
-`internal/ref` suites fan out into `/pg` + `/sqlite` subtests on their own, so
-the default lane already covers both backends for those packages — and it also
-runs the s3wal store suites there (conformance over the in-memory CAS fake,
-qualification against a SeaweedFS container).
+The default lane also fans `internal/api`, `internal/meta`, and `internal/ref`
+out into `/pg` + `/sqlite` subtests, and runs the s3wal store suites
+(conformance on the in-memory CAS fake, qualification on SeaweedFS).
 
-Two flags are load-bearing:
+Two flags are required:
 
-- **`-count=1`** — lane selection is an environment variable read in `TestMain`
-  before the tests start, which the Go test cache cannot see. Without
-  `-count=1`, switching lanes can silently replay cached results from the
-  other lane ([details](docs/reference/testing.md#flags-that-are-not-optional)).
-- **`-race`** — CI runs every lane under the race detector; a test that is only
-  green without `-race` is not green.
+- **`-count=1`** — `TestMain` reads the lane variable, which the test cache
+  cannot see. Without it, switching lanes can replay the other lane's cached
+  results ([details](docs/reference/testing.md#flags-that-are-not-optional)).
+- **`-race`** — CI runs every lane with it. Green without `-race` is not green.
 
-While iterating, scope down (`go test ./internal/api -run TestName -count=1`)
-and save the full matrix for the end.
+Iterate on a narrow scope (`go test ./internal/api -run TestName -count=1`);
+run the full matrix at the end.
 
 ## Lint
 
-The linter pin lives in [`mise.toml`](mise.toml) — CI installs from the same
-file, so `mise install` guarantees you and CI agree:
+CI and `mise install` use the same linter pin from [`mise.toml`](mise.toml):
 
 ```sh
 mise install
 golangci-lint run
 ```
 
-Config is [`.golangci.yml`](.golangci.yml) (v2 schema): the default linter set
-plus `misspell`, `unconvert`, `nolintlint`, and the `gofmt`/`goimports`
-formatters (local prefix `github.com/coder/openstorage`).
+Config: [`.golangci.yml`](.golangci.yml) (v2 schema) — default linters plus
+`misspell`, `unconvert`, `nolintlint`, and `gofmt`/`goimports` formatters
+(local prefix `github.com/coder/openstorage`).
 
 ## Go style: modern idioms
 
-Write modern Go (the go.mod version pins what is available). The repo vendors
-JetBrains' [Modern Go Guidelines](https://github.com/JetBrains/go-modern-guidelines)
-as an agent skill at
-[`.agents/skills/use-modern-go/`](.agents/skills/use-modern-go/SKILL.md) —
-coding agents pick it up automatically; humans can run the same CLI:
+Write modern Go, up to the `go.mod` version. JetBrains'
+[Modern Go Guidelines](https://github.com/JetBrains/go-modern-guidelines) ship as
+the agent skill [`.agents/skills/use-modern-go/`](.agents/skills/use-modern-go/SKILL.md);
+agents load it automatically, humans run the CLI:
 
 ```sh
 sh .agents/skills/use-modern-go/scripts/run-tool.sh list --file-path path/to/file.go
 ```
 
-Existing code is kept modern with the official
+New code must not reintroduce patterns the
 [`modernize`](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/modernize)
-analyzer; new code should not reintroduce patterns it would rewrite:
+analyzer rewrites:
 
 ```sh
 go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...
@@ -188,52 +183,45 @@ go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest
 
 ## Commit and PR conventions
 
-PRs are **squash-merged**, and [release-please derives versions and the
-CHANGELOG from the squash titles](docs/how-to/release.md) — so the PR title
-must be a [conventional commit](https://www.conventionalcommits.org/) subject.
-The `pr-title` CI check enforces the shape on every PR and re-checks it when
-the title is edited:
+PRs are **squash-merged**, and
+[release-please builds versions and the CHANGELOG from squash titles](docs/how-to/release.md).
+The PR title must be a [conventional commit](https://www.conventionalcommits.org/)
+subject; the `pr-title` check enforces it, including after title edits:
 
 ```
 type(scope)?: summary
 ```
 
-- The type prefix is **required**. Allowed types: `feat`, `fix`, `docs`, `ci`,
-  `chore`, `build`, `refactor`, `test`, `perf`.
-- The repo's package-prefix habit goes in the **scope**, not the type:
-  `fix(githttp): ...`, never `githttp: ...`. A bare package prefix is not a
-  conventional commit, so release-please ignores the commit entirely — a
-  genuine fix never reaches the CHANGELOG or the version bump (this happened
-  to #81).
-- `fix: ...` → patch release, `feat: ...` → minor release,
-  `feat!:` / `BREAKING CHANGE:` → breaking.
-- `perf: ...` → also releasable: with our uncustomized release-please config it
-  triggers a patch release and appears in the CHANGELOG under "Performance
-  Improvements". Don't use it for refactors that don't change performance.
-- `docs:`, `test:`, `ci:`, `chore:`, `build:`, `refactor:` → no release, hidden
-  from the CHANGELOG.
+- The type prefix is **required** and must be a type from the table below.
+- Package names go in the **scope**: `fix(githttp): ...`, never `githttp: ...`.
+  release-please ignores a bare package prefix, so the change never ships.
+- Only the squash title counts; branch commits can be anything.
 
-Individual commits inside the PR branch can be anything; only the squash title
-counts.
+| Type | Release effect |
+|---|---|
+| `fix` | patch release |
+| `feat` | minor release |
+| `feat!:` / `BREAKING CHANGE:` | breaking release |
+| `perf` | patch release under "Performance Improvements"; not for refactors that leave performance unchanged |
+| `docs`, `test`, `ci`, `chore`, `build`, `refactor` | no release; hidden from the CHANGELOG |
 
 ## The review bar
 
-A PR merges when all of the following hold:
+A PR merges when all of these hold:
 
-1. **CI is green** — all five jobs: `lint`, `test` (default lane), `test-local`,
-   `test-s3wal` (S3-only storage lane, issue #193), and `image` (Docker build +
-   runtime-dependency smoke test).
-2. **A clean automated review round** — comment `@codex review` on the PR and
-   address what comes back: fix genuine errors; when a finding is out of scope,
-   say why and resolve the thread. Every push invalidates the round — re-request
-   on the new head.
+1. **CI is green** — every job in `ci.yml`: `lint`, `terraform` (offline
+   Terraform checks + docs link check), `test` (default lane), `test-local`,
+   `test-s3wal` (S3-only storage lane), and `image` (Docker build +
+   runtime-dependency smoke test), plus the `pr-title` check.
+2. **A clean automated review round** — comment `@codex review`. Fix genuine
+   errors; for out-of-scope findings, say why and resolve the thread. Every
+   push invalidates the round: re-request on the new head.
 3. **A clean automated security round** — same protocol with
    `@codex security review`.
 4. **No unresolved review threads.**
-5. **The branch is up to date with `main`** — branch protection blocks merges
-   from behind; prefer GitHub's *Update branch* over force-pushing.
+5. **The branch is up to date with `main`** — branch protection enforces it.
+   Prefer GitHub's *Update branch* over force-pushing.
 
-House style for the changes themselves: fixes land **red-first** — the PR
-contains a test that fails on the pre-fix code (see
-[testing reference](docs/reference/testing.md#red-first-tests)). Docs claims
-must be verified against the code or a live run, not copied from memory.
+Fixes land [**red-first**](docs/reference/testing.md#red-first-tests): the PR
+includes a test that fails on the pre-fix code. Verify docs claims against the
+code or a live run, not memory.

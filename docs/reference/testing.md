@@ -1,13 +1,13 @@
 # Testing reference
 
-How this repository is tested: the lanes CI runs, the conventions for writing
-new tests, and the deterministic simulation (DST) harness. For the two-command
-quick version, see [CONTRIBUTING](../../CONTRIBUTING.md#tests).
+The test lanes CI runs, the conventions for new tests, and the deterministic
+simulation (DST) harness. Quick version: [CONTRIBUTING](../../CONTRIBUTING.md#tests).
 
 ## Test lanes
 
-One test suite, two storage stacks. Which stack a test run uses is decided in
-`TestMain`, not per test:
+One suite, several storage stacks. `TestMain` picks the stack for the whole run.
+
+**Per-PR lanes** — required by the [review bar](../../CONTRIBUTING.md#the-review-bar):
 
 | Lane | Command | Backends | Needs |
 |---|---|---|---|
@@ -16,33 +16,40 @@ One test suite, two storage stacks. Which stack a test run uses is decided in
 | **s3wal** | `OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m` | ONE SeaweedFS bucket carrying refs + metadata (`s3wal://`, the `_wal/` prefix) AND the blobs (`s3://`) — the zero-infra topology (ADR-46), plus its lane-only drills (restart-from-bucket-only, dual-serve refusal) | Docker, git, git-lfs |
 | **Backend fan-out** | part of the default lane | `internal/api`, `internal/meta`, and `internal/ref` run every integration/conformance test twice, as `/pg` and `/sqlite` subtests | Docker (for the `/pg` half) |
 
-These are exactly the CI jobs in
-[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml): `test` runs the
-default lane, `test-local` runs the local lane, `test-s3wal` runs the s3wal
-lane (issue #193), and `lint` / `image` complete the required set. CI asserts
-`git lfs version` up front so a missing LFS client fails the job instead of
+**Nightly lanes** — not PR gates; each can also be dispatched manually:
+
+| Lane | Workflow | Daily (UTC) | Covers |
+|---|---|---|---|
+| [DST sweep](#the-nightly-sweep) | [`dst-nightly.yml`](../../.github/workflows/dst-nightly.yml) | 03:17 | 48 seeds × 300 steps |
+| [Fuzzing](#fuzzing) | [`fuzz-nightly.yml`](../../.github/workflows/fuzz-nightly.yml) | 02:41 | every target, 4m each |
+| [Benchmarks](#benchmarks) | [`bench-nightly.yml`](../../.github/workflows/bench-nightly.yml) | 04:23 | full sweep |
+| [Floci S3](#the-floci-s3-lane) | [`floci-nightly.yml`](../../.github/workflows/floci-nightly.yml) | 03:53 | blob endpoint + s3wal qualification |
+| [Floci githttp E2E](#the-floci-githttp-e2e-lane) | [`floci-nightly-githttp.yml`](../../.github/workflows/floci-nightly-githttp.yml) | 04:53 | git/LFS E2E on STS credentials |
+
+In [`ci.yml`](../../.github/workflows/ci.yml), `test`, `test-local`, and
+`test-s3wal` run the three lanes; `lint` and `image` complete the set. Each
+test job runs `git lfs version` first, so a missing LFS client fails instead of
 silently skipping LFS coverage.
 
-`OPENSTORAGE_TEST_BACKEND` accepts `pg` (or unset), `local`, and `s3wal`; anything
-else panics in `TestMain` (`internal/githttp/e2e_test.go`). On the s3wal lane the
-suite's nodes run with the instance lease disabled (`OPENSTORAGE_S3WAL_LEASE_TTL=0`)
-because the shared-bucket multi-node tests are exactly the topology the lease refuses;
-the dual-serve drill re-enables it explicitly. The `internal/githttp`
-e2e harness builds the real `openstorage` binary, boots the chosen backends,
-starts server nodes as subprocesses, and drives them with plain `git`, `curl`-level
-HTTP, and a real `git lfs` client.
+- `OPENSTORAGE_TEST_BACKEND` accepts `pg` (or unset), `local`, and `s3wal`;
+  anything else panics in `TestMain` (`internal/githttp/e2e_test.go`).
+- The s3wal lane sets `OPENSTORAGE_S3WAL_LEASE_TTL=0`, because its shared-bucket
+  multi-node tests are the topology the instance lease refuses. The dual-serve
+  drill re-enables the lease.
+- The `internal/githttp` harness builds the real `openstorage` binary, starts
+  server nodes as subprocesses, and drives them with plain `git`, `curl`-level
+  HTTP, and a real `git lfs` client.
 
 ### SeaweedFS fixture image
 
 The fixtures and reference Compose file pin SeaweedFS
-[4.47](https://github.com/seaweedfs/seaweedfs/releases/tag/4.47), published on
-2026-09-14. The [changes since 4.46](https://github.com/seaweedfs/seaweedfs/compare/4.46...4.47)
-include S3 request routing, IAM reload handling, bucket-policy enforcement,
+[4.47](https://github.com/seaweedfs/seaweedfs/releases/tag/4.47), published
+2026-09-14. [Changes since 4.46](https://github.com/seaweedfs/seaweedfs/compare/4.46...4.47)
+touch S3 request routing, IAM reload handling, bucket-policy enforcement,
 volume error handling, and master shutdown.
 
-These SHA-256 digests identify the Docker Hub image metadata retrieved on
-2026-09-16. Each platform manifest identifies the image for that operating system
-and architecture. Published manifests do not establish runtime qualification.
+SHA-256 digests of the Docker Hub image metadata (retrieved 2026-09-16; a
+published manifest does not prove runtime qualification):
 
 | Image metadata | 4.46 | 4.47 |
 |---|---|---|
@@ -50,54 +57,54 @@ and architecture. Published manifests do not establish runtime qualification.
 | Linux/amd64 manifest | `6a602956ac4915057199a5271343e9c86c403a561db7c21033362f6791aa29c9` | `f83509b0721dfd8e2e07faf76c0a899f67a8a889c89abe2fa0a5227ba1320362` |
 | Linux/arm64 manifest | `cc476c229cb2b7c86401070ed791ec6c5c1f3193b37db5a13f510e770a15dc6c` | `d4cf67729aa8777e1a43a5b61d72e5b96179e4b7bac9a221cb14cbc2036cb32e` |
 
-For each pin change, compare the existing REQUIRE-mode qualification and legacy
-MinIO rejection checks without changing their assertions. The shared readiness
-helper requires `HeadBucket` and a scratch object PUT/DELETE before testing.
-An HTTP health response alone does not prove that volumes accept writes.
-Keep enough volume capacity for every bucket, including backup and restore buckets.
+On every pin change:
 
-Run the full lanes above and existing fuzz seeds for regression coverage.
-Native-amd64 runtime results do not qualify native ARM, real AWS, or S3WAL promotion.
-Historical benchmark receipts remain historical. A fixture upgrade does not update
-those measurements or establish a performance improvement.
+1. Compare the REQUIRE-mode qualification and legacy MinIO rejection checks
+   without changing their assertions.
+2. Keep volume capacity for every bucket, including backup and restore. The
+   readiness helper requires `HeadBucket` plus a scratch PUT/DELETE; a health
+   response does not prove volumes accept writes.
+3. Run the full lanes and existing fuzz seeds.
+
+Native-amd64 results do not qualify native ARM, real AWS, or S3WAL promotion.
+A fixture upgrade neither updates historical benchmark receipts nor shows a
+performance change.
 
 ### Private SeaweedFS log capture
 
-The managed SeaweedFS fixtures support opt-in, bounded private stdout/stderr capture through automatic teardown.
-See [the capture procedure](../how-to/capture-seaweedfs-test-logs.md) for `OPENSTORAGE_TEST_ARTIFACT_DIR`, explicit session attribution, capture receipts, and the deliberately failing TestMain diagnostic.
-Keep raw logs private and interpret capture status separately from the native test exit.
+Managed SeaweedFS fixtures offer opt-in, bounded, private stdout/stderr
+capture through teardown. See [the capture procedure](../how-to/capture-seaweedfs-test-logs.md)
+for `OPENSTORAGE_TEST_ARTIFACT_DIR`, session attribution, receipts, and the
+deliberately failing TestMain diagnostic. Keep raw logs private; capture status
+is separate from the test exit code.
 
 ### Offline S3WAL recovery drill
 
-`TestS3WAL_OfflineBackupRestore` runs in the S3WAL lane. It uses isolated source,
-backup and restore buckets, not the shared serving bucket. The drill checks a
-stopped-node whole-bucket copy, rejects a damaged inventory before restore boot,
-removes source data/cache, and verifies fresh-cache Git/LFS recovery and a new
-push. See the [recovery runbook](../how-to/backup-restore-s3wal.md#reproduce-the-local-recovery-drill)
-for the targeted command and operational limitations. This is local fixture
-proof, not a real-S3 promotion gate.
+`TestS3WAL_OfflineBackupRestore` (S3WAL lane) uses isolated source, backup,
+and restore buckets. It copies a stopped node's whole bucket, rejects a damaged
+inventory before restore boot, removes source data/cache, and verifies
+fresh-cache Git/LFS recovery plus a new push. Command and limits:
+[recovery runbook](../how-to/backup-restore-s3wal.md#reproduce-the-local-recovery-drill).
+Local fixture proof, not a real-S3 promotion gate.
 
 ### Official-release upgrade smoke
 
-The opt-in [official-to-candidate upgrade harness](../how-to/test-release-upgrade.md)
-uses an explicitly supplied official v0.15.0 archive and an exact clean candidate.
-It bypasses the shared suite bootstrap, uses a private bucket with active leases,
-and checks cold-cache Git/LFS, selected metadata, and encrypted-secret continuity.
-Ordinary CI does not download release artifacts or claim this upgrade coverage.
-A candidate smoke does not complete the final released-pair promotion criterion.
+The opt-in [upgrade harness](../how-to/test-release-upgrade.md) takes an
+explicitly supplied official v0.15.0 archive and an exact clean candidate. It
+skips the shared suite bootstrap, uses a private bucket with active leases, and
+checks cold-cache Git/LFS, selected metadata, and encrypted-secret continuity.
+Ordinary CI neither downloads releases nor claims this coverage. A candidate
+smoke does not meet the final released-pair promotion criterion.
 
 ### Flags that are not optional
 
-- **`-count=1` when switching lanes.** The Go test cache does track environment
-  variables — but only reads made while the tests run. `OPENSTORAGE_TEST_BACKEND`
-  is read in `TestMain` *before* `m.Run()`, which the cache cannot see, so
-  switching lanes without `-count=1` silently replays the other lane's cached
-  results and reports them as fresh (reproducible: a `TestMain`-read variable
-  change still yields `(cached)`). Variables read inside test functions, such
-  as `DST_SEED`, invalidate the cache on their own; `-count=1` everywhere is
-  simply the uniform CI-parity habit.
-- **`-race` always.** Every CI lane runs under the race detector, including the
-  nightly DST sweep. Local runs without `-race` are for fast iteration only.
+- **`-count=1` when switching lanes.** The test cache only tracks environment
+  reads made while tests run. `TestMain` reads `OPENSTORAGE_TEST_BACKEND`
+  *before* `m.Run()`, so switching lanes without `-count=1` replays the other
+  lane's `(cached)` results as fresh. Variables read inside tests (`DST_SEED`)
+  invalidate the cache themselves; `-count=1` everywhere is simply CI parity.
+- **`-race` always.** Every CI lane uses it, including the nightly DST sweep.
+  Skip it only for fast iteration.
 
 ## Writing tests: house conventions
 
@@ -105,65 +112,61 @@ A candidate smoke does not complete the final released-pair promotion criterion.
 
 Bug fixes and behavior changes land red-first:
 
-1. Write the test that captures the desired behavior **before** the fix, run
-   it, and confirm it fails — *for the expected reason*, not from a typo in the
-   test.
-2. Land the fix; the same test goes green with no edits to its assertions.
+1. Write the test for the desired behavior **before** the fix. Run it and
+   confirm it fails *for the expected reason*, not from a test typo.
+2. Land the fix. The same test goes green with no edits to its assertions.
 3. Keep the reproduction narrow: one test that pins the bug beats a broad one
-   that happens to trip over it.
+   that trips over it.
 
-Reviewers may ask for the red run; for subtle fixes, note the pre-fix failure
-message in the PR.
+Reviewers may ask for the red run. For subtle fixes, quote the pre-fix
+failure in the PR.
 
 ### E2E conventions (`internal/githttp`)
 
-- **Keep `-count=1`; never `-count=2` or higher on the e2e suites.** E2E tests
-  register repositories under fixed names (`t-repack`, ...) against a backend
-  that lives for the whole `TestMain` process, so an in-process rerun collides
-  with the first run's state. Repeat a run by invoking `go test -count=1`
-  again, not by raising `-count`.
-- **Exactly-one repack asserts require threshold 2 on every eligible consumer.**
-  `OPENSTORAGE_REPACK_THRESHOLD` is per process: setting it on the push node
-  does not configure other replicas consuming the repository's shared River queue.
-  Isolate the test's queue or set all its eligible consumers to `2`. Even then,
-  exactly-one convergence assumes writes quiesce and folds keep making successful
-  progress within the [fold budgets](../how-to/storage-lifecycle-and-sweeping.md#background-repack).
-  With a uniform enabled threshold `t`, the target is *below* `t`, not necessarily
-  one pack; a mixed-threshold fleet does not promise the producer's lower threshold.
-- **Budget for job chains generously.** Background work (repack successors,
-  sync) runs through the real queue with delays; convergence waits in the suite
-  use minutes-scale deadlines because `-race` on a loaded CI runner is slow.
-  Tight sleeps are how CI-only flakes are born.
-- **Local-only tests skip, not fail, on the pg lane** — follow the existing
+- **Keep `-count=1`; never `-count=2` or higher on the e2e suites.**
+  Repositories use fixed names (`t-repack`, ...) on a backend that lives for
+  the whole `TestMain` process, so an in-process rerun collides. To repeat,
+  invoke `go test -count=1` again.
+- **Exactly-one repack asserts need threshold 2 on every eligible consumer.**
+  `OPENSTORAGE_REPACK_THRESHOLD` is per process: the push node's value does not
+  configure other replicas on the shared River queue. Isolate the queue or set
+  all eligible consumers to `2`. Convergence also assumes writes quiesce and
+  folds keep succeeding within the
+  [fold budgets](../how-to/storage-lifecycle-and-sweeping.md#background-repack).
+  With a uniform threshold `t`, the target is *below* `t`, not necessarily one
+  pack; a mixed-threshold fleet does not promise the producer's lower threshold.
+- **Budget job chains generously.** Background work (repack successors, sync)
+  runs through the real, delayed queue. Use minutes-scale convergence deadlines:
+  `-race` on a loaded CI runner is slow, and tight sleeps cause CI-only flakes.
+- **Local-only tests skip, not fail, on the pg lane.** Follow the existing
   pattern: check the lane and `t.Skipf` with the `OPENSTORAGE_TEST_BACKEND=local`
   hint.
 
 ### Hermetic git
 
-Tests that shell out to git must not inherit the developer's identity or
-hooks. The house pattern (see `internal/simtest/gitenv.go`) pins
-`GIT_AUTHOR_*` / `GIT_COMMITTER_*` and neutralizes config:
-`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`,
-`GIT_CONFIG_NOSYSTEM=1`. Host-level `GIT_*` variables and global hooks
-otherwise leak into fixture commits and change SHAs.
+Tests that shell out to git must not inherit the developer's identity or hooks;
+host `GIT_*` variables and global hooks leak into fixture commits and change
+SHAs. The house pattern (`internal/simtest/gitenv.go`) pins `GIT_AUTHOR_*` /
+`GIT_COMMITTER_*` and neutralizes config: `GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`.
 
 ### Fault injection
 
-The e2e suites use server-side knobs (`OPENSTORAGE_TEST_MODE`,
-`OPENSTORAGE_TEST_CRASH`, `OPENSTORAGE_TEST_CAS_DROP`, ...) to force crashes at
-precise pipeline stages; the server refuses them outside test mode. The full
-list is in the [configuration reference](configuration.md#internal-and-test-variables).
+E2E suites force crashes at precise pipeline stages with server-side knobs
+(`OPENSTORAGE_TEST_MODE`, `OPENSTORAGE_TEST_CRASH`, `OPENSTORAGE_TEST_CAS_DROP`,
+...). The server refuses them outside test mode. Full list:
+[configuration reference](configuration.md#internal-and-test-variables).
 
 ## The DST harness
 
-`internal/simtest` is a deterministic, seeded simulation of a multi-node
-cluster — pushes, API writes, hydrations, crashes, restarts, repack races,
-upstream-sync claim/steal/finish cycles, and injected storage faults, all in
-one process on the local backends, checked against invariant oracles
-(ref/pack consistency, CAS atomicity, webhook soundness, sync claim-lease
-liveness). **[`internal/simtest/README.md`](../../internal/simtest/README.md)**
-is the authoritative description of what it exercises, the oracles, and the
-determinism rules; this section covers how to run and triage it.
+`internal/simtest` is a deterministic, seeded, single-process simulation of a
+multi-node cluster on the local backends: pushes, API writes, hydrations,
+crashes, restarts, repack races, upstream-sync claim/steal/finish cycles, and
+injected storage faults. Invariant oracles check ref/pack consistency, CAS
+atomicity, webhook soundness, and sync claim-lease liveness.
+**[`internal/simtest/README.md`](../../internal/simtest/README.md)** is the
+authority on scope, oracles, and determinism rules; this section covers running
+and triage.
 
 | What | How |
 |---|---|
@@ -172,12 +175,10 @@ determinism rules; this section covers how to run and triage it.
 | Reproduce a seed (CLI) | `go run ./cmd/dst -seed <seed> [-steps N] [-nodes N] [-v] [-keep]` |
 | Nightly sweep | [`dst-nightly.yml`](../../.github/workflows/dst-nightly.yml) → `TestDSTSweep` |
 
-A run prints one summary line and a verdict. Determinism means: the same
-binary run with the same configuration prints the same trace hash. The two
-entry points expose different slices of that configuration — `cmd/dst` takes
-`-seed`/`-steps`/`-nodes`, `TestDSTSeed` takes `DST_SEED`/`DST_STEPS` with the
-default node count — so a replay reproduces a run when its parameters match
-the original's (everything not exposed stays at the shared defaults):
+A run prints a summary line and a verdict. The same binary and configuration
+always print the same trace hash. `cmd/dst` takes `-seed`/`-steps`/`-nodes`;
+`TestDSTSeed` takes `DST_SEED`/`DST_STEPS` with the default node count. A
+replay matches when those parameters match (the rest are shared defaults).
 
 ```console
 $ go run ./cmd/dst -seed 42
@@ -190,209 +191,193 @@ Defaults: 150 steps, 3 nodes. Exit codes: `0` clean, `1` invariant violation,
 
 ### Triaging a violation
 
-1. **Replay exactly.** A failure (nightly log or local sweep) names the seed
-   and step count: `go run ./cmd/dst -seed <seed> -steps <steps> -v`. `-v`
-   streams the op-by-op trace — each line shows the op, the faults it consumed,
-   its outcome, and the ground-truth tip after it; the violation names the step
-   and the oracle.
+1. **Replay exactly** with the reported seed and step count:
+   `go run ./cmd/dst -seed <seed> -steps <steps> -v`. `-v` streams each op, the
+   faults it consumed, its outcome, and the ground-truth tip after it. The
+   violation names the step and the oracle.
 2. **Inspect surviving state.** Add `-keep` to retain the run directory
    (printed as `run dir: /tmp/dst-seed<seed>-...`): the SQLite DB, the blob
    directory, and each node's cache, ready for `sqlite3` / `git fsck`.
-3. **Attribute the fault.** The trace's fault annotations tie every injected
-   fault to the op that consumed it — e.g.
-   `ref.CASRef/ambiguous(won=true err=<nil>)` is a CAS that committed under an
-   ambiguous fault, the exact class the recovery oracles guard.
-4. **Verify the fix against the seed** — carrying the reported step count, or
-   a longer sweep's failure point silently falls back to the 150-step default:
+3. **Attribute the fault.** Annotations tie each injected fault to the op that
+   consumed it: `ref.CASRef/ambiguous(won=true err=<nil>)` is a CAS that
+   committed under an ambiguous fault, the class the recovery oracles guard.
+4. **Verify the fix** with the reported step count (without it, the run falls
+   back to 150 steps):
    `DST_SEED=<seed> DST_STEPS=<steps> go test ./internal/simtest -run 'TestDSTSeed' -v -count=1`
-   must pass. Trace hashes are per-run-content: the failing hash belongs to the
-   *pre-fix* reproduction (the `VIOLATION` line is hashed and stops the run);
-   the fixed run produces a different hash — what determinism guarantees is
-   that repeated runs of the same binary print the *same* one.
-5. **Pin it in the regression corpus.** The reproduction command guards
-   nothing after it scrolls by — `TestDSTSeed` skips when `DST_SEED` is unset,
-   and the nightly sweep derives fresh seeds from each run id. Add the exact
-   failing configuration (seed, step count, backend lane, the issue it
-   reproduced) to the `dstRegressions` table in
-   `internal/simtest/dst_test.go`; `TestDSTRegressions` replays every entry in
-   the PR gate. Prove it red before the fix and green after. An entry is
-   armor for the harness+driver pair that produced it — a later harness
-   change that legitimately re-schedules the PRNG stream must re-validate
-   the entry against its issue rather than drop it silently.
+   must pass. The hash will differ: the failing hash includes the `VIOLATION`
+   line that stopped the pre-fix run.
+5. **Pin it in the regression corpus.** `TestDSTSeed` skips without `DST_SEED`
+   and the nightly sweep picks fresh seeds, so nothing else guards the bug.
+   Add the exact configuration (seed, step count, backend lane, issue) to the
+   `dstRegressions` table in `internal/simtest/dst_test.go`;
+   `TestDSTRegressions` replays every entry in the PR gate. Prove it red before
+   the fix and green after. Entries are tied to the harness+driver pair that
+   produced them: if a harness change legitimately re-schedules the PRNG
+   stream, re-validate each entry against its issue instead of dropping it.
 
 ### The nightly sweep
 
-[`dst-nightly.yml`](../../.github/workflows/dst-nightly.yml) runs daily (03:17
-UTC): 48 seeds × 300 steps under `-race`, seed base derived from the run id so
-every night covers fresh seeds while staying reproducible from the log. It can
-be dispatched manually with `seeds` / `base` / `steps` inputs, which map to the
-`DST_SWEEP_SEEDS` / `DST_SWEEP_BASE` / `DST_STEPS` variables of `TestDSTSweep`.
-There are no artifacts — everything needed to replay a failure is in the job
-log.
+[`dst-nightly.yml`](../../.github/workflows/dst-nightly.yml) runs 48 seeds ×
+300 steps under `-race`, with the seed base derived from the run id: fresh
+seeds nightly, reproducible from the log. Dispatch inputs `seeds` / `base` /
+`steps` map to `TestDSTSweep`'s `DST_SWEEP_SEEDS` / `DST_SWEEP_BASE` /
+`DST_STEPS`. No artifacts; the job log has everything to replay a failure.
 
 ## Fuzzing
 
 Native Go fuzz targets (`func Fuzz*` in `fuzz_test.go` files) cover the
-untrusted-input decoders: receive-pack sniffing and the LFS batch decode
-(`internal/githttp`), JWT verification and ref-policy parsing
-(`internal/auth`), secret envelopes and key parsing (`internal/secrets`),
-pack header/idx counts (`internal/jobs`), and rate-limit client keying and
-pagination cursors (`internal/api`). Targets assert *graceful* behavior, not
-just no-panic: garbage must map to errors — never a fabricated identity,
-plaintext, or capability — usually via an independent reference oracle or a
-known-answer set built from keys that exist only in the test process.
+untrusted-input decoders:
 
-Seed corpora live in the `f.Add` calls next to each target, so plain
-`go test ./...` replays every seed as an ordinary test — normal CI covers
-fuzz regressions for free. When a campaign finds a failing input, `go test`
-writes it to `<pkg>/testdata/fuzz/<FuzzTarget>/`; check that file in with the
-fix so the crasher replays forever.
+- `internal/githttp`: receive-pack sniffing, LFS batch decode
+- `internal/auth`: JWT verification, ref-policy parsing
+- `internal/secrets`: secret envelopes, key parsing
+- `internal/jobs`: pack header/idx counts
+- `internal/api`: rate-limit client keying, pagination cursors
 
-Run a target locally with (one `-fuzz` target per invocation):
+Targets assert *graceful* behavior, not just no-panic: garbage maps to
+errors, never a fabricated identity, plaintext, or capability. Most check an
+independent reference oracle or a known-answer set built from test-only keys.
+
+Seed corpora are the `f.Add` calls beside each target, so plain `go test ./...`
+replays every seed in normal CI. A campaign writes a failing input to
+`<pkg>/testdata/fuzz/<FuzzTarget>/`; commit it with the fix so it replays
+forever.
+
+Run one target per invocation:
 
 ```sh
 go test ./internal/auth -run '^$' -fuzz '^FuzzVerify$' -fuzztime 60s -parallel 8
 ```
 
-Keep `-parallel` around 8 on high-core machines — the default spawns one
-worker per core, and each `internal/githttp` fuzz process skips the e2e
-environment boot via the fuzz early-out in its `TestMain`.
+Keep `-parallel` near 8 on high-core machines (the default is one worker per
+core). `internal/githttp` fuzz processes skip the e2e boot via a fuzz early-out
+in `TestMain`.
 
-[`fuzz-nightly.yml`](../../.github/workflows/fuzz-nightly.yml) runs the
-sustained sweep daily (02:41 UTC): every target sequentially at 4m each
-(dispatch inputs `fuzztime` / `parallel` override the budget). A failing
-input turns the workflow red and uploads everything under
-`internal/*/testdata/fuzz/` as the `fuzz-crashers` artifact for triage.
+[`fuzz-nightly.yml`](../../.github/workflows/fuzz-nightly.yml) runs each target
+sequentially for 4m (dispatch inputs `fuzztime` / `parallel` override). A
+failing input turns it red and uploads `internal/*/testdata/fuzz/` as the
+`fuzz-crashers` artifact.
 
 ## Benchmarks
 
-Hot-path benchmarks (`func Benchmark*` in `*_bench_test.go` files) baseline
-the per-request and per-trigger costs optimization work measures against:
-the hydration fast path and steady-state `EnsureCacheRepo`
-(`internal/githttp`), quota-admission usage listing and ledger reservation
-(`internal/blob`, `internal/ref`), repack fold selection (`internal/jobs`),
-bearer-token verification per algorithm family (`internal/auth`), and
-pre-auth rate limiting under mutex contention (`internal/api`).
+Hot-path benchmarks (`func Benchmark*` in `*_bench_test.go` files) set the
+per-request and per-trigger baselines for optimization work:
 
-House conventions: report allocations (`b.ReportAllocs`), iterate with
-`b.Loop()` (setup stays untimed and results stay live), express size and
-algorithm matrices as `b.Run` sub-benchmarks (`packs=100`, `candidates=1000`,
-`ES256`), and keep fixtures deterministic and container-free — SQLite,
-fileblob, or in-memory buckets; never the network, Docker, or real S3. Each
-timed iteration also checks its result against the expected value, so a
-benchmark that silently stops measuring the intended path fails instead of
-reporting numbers for the wrong one.
+- `internal/githttp`: hydration fast path, steady-state `EnsureCacheRepo`
+- `internal/blob`, `internal/ref`: quota-admission usage listing, ledger reservation
+- `internal/jobs`: repack fold selection
+- `internal/auth`: bearer-token verification per algorithm family
+- `internal/api`: pre-auth rate limiting under mutex contention
 
-Run the full sweep locally (`-run '^$'` skips ordinary tests; `-p 1`
-serializes the per-package test binaries so benchmark packages never
-contend with each other; the local backend keeps the `internal/githttp`
-boot container-free):
+House conventions:
+
+- Report allocations (`b.ReportAllocs`).
+- Iterate with `b.Loop()` (setup stays untimed, results stay live).
+- Express size and algorithm matrices as `b.Run` sub-benchmarks (`packs=100`,
+  `candidates=1000`, `ES256`).
+- Keep fixtures deterministic and container-free: SQLite, fileblob, or
+  in-memory buckets; never the network, Docker, or real S3.
+- Check each timed iteration's result, so a benchmark that drifts off the
+  intended path fails instead of reporting wrong numbers.
+
+Full local sweep (`-run '^$'` skips tests, `-p 1` stops packages contending,
+the local backend keeps `internal/githttp` container-free):
 
 ```sh
 OPENSTORAGE_TEST_BACKEND=local go test -p 1 ./... -run '^$' -bench . -benchmem
 ```
 
-Benchmarks are **not** a per-PR gate — shared-runner deltas are too noisy to
-block merges on. [`bench-nightly.yml`](../../.github/workflows/bench-nightly.yml)
-runs the sweep daily (04:23 UTC) and uploads the output as the
+Benchmarks are **not** a per-PR gate (shared runners are too noisy).
+[`bench-nightly.yml`](../../.github/workflows/bench-nightly.yml) uploads the
 `bench-results` artifact; dispatch inputs `benchtime` / `count` override the
-budget (compare runs with `benchstat`, which wants `count` around 10). One
-caveat when reading results: `BenchmarkAdmitReserve/parallelism=N` scales
-`b.SetParallelism`, so the worker count is N × GOMAXPROCS, not N.
+budget (`benchstat` wants `count` near 10). `BenchmarkAdmitReserve/parallelism=N`
+scales `b.SetParallelism`, so it runs N × GOMAXPROCS workers, not N.
 
 ### Push benchmark client-chain failures
 
-`BenchmarkPushE2E` generates each writer's commits after the seed push and
-before writer warmup or measurement. If a client `git commit` fails, the
-original Git error and exit status are retained, followed by synchronous
-`benchGenerateChain diagnostics` collected before benchmark fixture cleanup.
-The context includes a UTC timestamp, safe commit arguments, repository/object
-paths, parent stat results, `TMPDIR`/`GOTMPDIR`, and filesystem identity/capacity
-(device ID, `statfs` FSID, free blocks and inodes). It does not dump Git config,
-credentials, other environment variables, or fixture contents.
+`BenchmarkPushE2E` generates each writer's commits after the seed push, before
+warmup or measurement. If a client `git commit` fails, the error keeps Git's
+message and exit status, followed by `benchGenerateChain diagnostics`
+collected synchronously before fixture cleanup:
 
-Git object-path resolution has a two-second process-group deadline and a
-4 KiB stdout limit; its stderr is discarded. If resolution fails, the report
-labels the fallback (`GIT_OBJECT_DIRECTORY`, or the client's `.git/objects`).
-`statfs` tries the object path and up to seven ancestors, labeling
-`statfs_path`, the path actually measured. An ancestor's filesystem is not proof of the
-filesystem at the failed write; these observations are not an atomic snapshot
-or a diagnosis of issue #219. Human-readable mount source/target names are not
-collected.
+- UTC timestamp, safe commit arguments, repository/object paths, parent stat
+  results, `TMPDIR`/`GOTMPDIR`;
+- filesystem identity/capacity: device ID, `statfs` FSID, free blocks and inodes.
 
-No commit is retried, and successful workload/timing/assertions are unchanged.
-These failure-only observations are not throughput measurements. Tests named
-`TestBenchGenerateChainDiagnostics_Synthetic*` validate diagnostic behavior
-with deliberately invalid fixtures; they are not reproductions of the
-unexplained ENOENT flake. No new untrusted-input parser or fuzz target is added.
+It never collects Git config, credentials, other environment variables,
+fixture contents, or mount source/target names.
+
+- Object-path resolution has a two-second process-group deadline and a 4 KiB
+  stdout cap; stderr is discarded. On failure the report labels the fallback
+  (`GIT_OBJECT_DIRECTORY`, or the client's `.git/objects`).
+- `statfs` tries the object path and up to seven ancestors, labeling the one
+  measured as `statfs_path`. An ancestor's filesystem may differ from the
+  failed write's.
+- Observations are not an atomic snapshot or a diagnosis of the unexplained
+  ENOENT flake.
+
+Commits are never retried; successful runs, timing, and assertions are
+unchanged, and these observations are not throughput data.
+`TestBenchGenerateChainDiagnostics_Synthetic*` validates the diagnostics with
+deliberately invalid fixtures; it does not reproduce the flake.
 
 ## The Floci S3 lane
 
-[`floci-nightly.yml`](../../.github/workflows/floci-nightly.yml) runs daily
-(03:53 UTC): it boots [Floci](https://hub.docker.com/r/floci/floci) — a
-lightweight AWS wire-protocol emulator — with S3 auth enforcement on,
-provisions an IAM access key through the IAM API, and runs
-`go test ./internal/blob` with `OPENSTORAGE_TEST_S3_URL` pointed at it. That
+[`floci-nightly.yml`](../../.github/workflows/floci-nightly.yml) boots
+[Floci](https://hub.docker.com/r/floci/floci), a lightweight AWS wire-protocol
+emulator, with S3 auth enforced. It mints an IAM access key through the IAM API
+and runs `go test ./internal/blob` with `OPENSTORAGE_TEST_S3_URL` set. That
 variable gates the endpoint tests in `internal/blob/s3endpoint_test.go`
-(skipped everywhere else): a CRUD round-trip through the real `blob.S3`
-surface, plus the presigned-URL SigV4 test — valid signature ⇒ 200 with the
-exact bytes, corrupted signature ⇒ `403 SignatureDoesNotMatch`. The
-per-PR SeaweedFS container test also pins presign accept/reject live (with
-a static enforcing identity); this nightly lane adds the external-endpoint
-path with a key provisioned through a real IAM API rather than a static
-config, against a second, independent wire-protocol implementation.
+(skipped elsewhere): a CRUD round-trip through the real `blob.S3` surface, and
+presigned-URL SigV4 (valid ⇒ 200 with the exact bytes; corrupted ⇒
+`403 SignatureDoesNotMatch`).
 
-Known Floci gaps, so nobody extends this lane into them (found open on
-`1.7.0` and `nightly-08282026` by the #201 spike; every one re-verified
-still open on `nightly-09012026` — the pinned `s3waltest.FlociImage` — by
-#212, with `FLOCI_SERVICES_S3_ENFORCE_AUTH=true` and an IAM-minted key):
+The per-PR SeaweedFS container test already pins presign accept/reject with a
+static enforcing identity. This lane adds the external-endpoint path, an
+IAM-minted key, and a second, independent wire-protocol implementation.
 
-- No IAM policy evaluation on S3 actions (an attached explicit
-  `Deny s3:GetObject` still lets `GetObject` succeed), and
-  `x-amz-expected-bucket-owner` is ignored (a wrong 12-digit owner is
-  accepted on `GetObject` and `HeadBucket`; AWS returns 403) — both stay
-  covered by unit-test seams.
-- `DeleteObject` with `If-Match` is silently ignored: a mismatched `If-Match`
-  deletes the object anyway, with no 412 (MinIO-class behavior).
-- Header-auth SigV4 signatures are not validated — only that the access-key
-  ID exists (an unknown key ID gets `InvalidAccessKeyId`), so a wrong secret
-  or a forged session token is accepted. Presigned-URL signature validation
-  IS enforced (a tampered presigned GET or PUT gets
-  `403 SignatureDoesNotMatch`), and that is the SigV4 property this lane pins.
+**Known Floci gaps** — do not extend this lane into them. All are verified open
+on the pin `nightly-09012026` (`s3waltest.FlociImage`) with
+`FLOCI_SERVICES_S3_ENFORCE_AUTH=true` and an IAM-minted key:
 
-Fixed upstream — torn reads under same-key overwrite: through `2.0.1`, a GET
-racing a PUT on the same key could return a body that was neither version,
-with broken HTTP framing (Go logs "Unsolicited response received on idle
-HTTP channel") that poisoned keep-alive connections — the sole disqualifier
-for any s3wal-shaped lane, whose production shape is manifest reads racing
+- No IAM policy evaluation on S3 actions (an explicit `Deny s3:GetObject` still
+  allows `GetObject`), and `x-amz-expected-bucket-owner` is ignored (a wrong
+  12-digit owner passes `GetObject` and `HeadBucket`; AWS returns 403).
+  Unit-test seams cover both.
+- `DeleteObject` ignores `If-Match`: a mismatch still deletes, with no 412
+  (MinIO-class behavior).
+- Header-auth SigV4 checks only that the access-key ID exists (unknown ⇒
+  `InvalidAccessKeyId`); a wrong secret or forged session token passes.
+  Presigned-URL signatures ARE validated (tampered GET or PUT ⇒
+  `403 SignatureDoesNotMatch`); that is the SigV4 property this lane pins.
+
+**Fixed upstream: torn reads.** Through `2.0.1`, a GET racing a same-key PUT
+could return a body that was neither version, with broken HTTP framing (Go logs
+"Unsolicited response received on idle HTTP channel") that poisoned keep-alive
+connections. That disqualifies any s3wal-shaped lane, where manifest reads race
 CAS overwrites. [floci-io/floci#2874](https://github.com/floci-io/floci/pull/2874)
-(merged 2026-09-01, refined by
-[#2901](https://github.com/floci-io/floci/pull/2901)) fixes it;
-`nightly-09012026` is the first published build carrying the fix, and no
-release tag contains it yet (`2.0.1` was cut 25 minutes before it merged),
-so that dated tag is the pin until upstream cuts the next release (TODO in
-`s3waltest.go`). The `get-under-overwrite` qualification surface below now
-guards it in require mode.
+(merged 2026-09-01, refined by [#2901](https://github.com/floci-io/floci/pull/2901))
+fixed it. `nightly-09012026` is the first build with the fix and no release tag
+has it yet, so that tag stays the pin until the next release (TODO in
+`s3waltest.go`). The `get-under-overwrite` surface guards it in require mode.
 
-Two positives from the same spike, for future lane design: Floci passes the
-full 22-surface s3wal qualification suite (`TestQualifyExternalEndpoint` in
-`internal/ref/s3wal`; re-confirmed 22/22 on the pin by `TestQualifyFloci`)
-— the only emulator besides SeaweedFS to do so. The earlier SeaweedFS 4.46
-qualification observed conditional DELETE enforcement (412 and the object
-survives on a mismatched `If-Match`), unlike both Floci and the legacy MinIO pin.
+**Positives:** Floci passes the full 22-surface s3wal qualification suite
+(`TestQualifyExternalEndpoint` in `internal/ref/s3wal`; 22/22 on the pin via
+`TestQualifyFloci`), the only emulator besides SeaweedFS to do so. SeaweedFS
+4.46 enforced conditional DELETE (412; the object survives a mismatched
+`If-Match`), unlike Floci and the legacy MinIO pin.
 
-The same workflow also runs the Floci row of the s3wal qualification matrix:
-`TestQualifyFloci` (`internal/ref/s3wal/qualify_floci_test.go`) runs the 22
-qualification surfaces plus the `get-under-overwrite` (torn-read) surface in
-**require mode** against the pinned `s3waltest.FlociImage`, and the
-`delete-if-match` surface in record mode (the pin still ignores the
-condition; s3wal never relies on it — ADR-46). This is second-implementation
-regression armor for s3wal's S3 usage — it is **not** promotion evidence for
-the s3wal backend (#192): the store requirements in
-[the production guide](../how-to/deploy-production.md) are unchanged, and
-Floci is not a qualified `s3wal://` store. Like the SeaweedFS lane, the test
-is gated only by `-short`, so it also runs in the per-PR `test` job; the
-nightly job additionally asserts the VERDICT transcript is complete.
+**Floci row of the s3wal qualification matrix.** The same workflow runs
+`TestQualifyFloci` (`internal/ref/s3wal/qualify_floci_test.go`) against the
+pinned `s3waltest.FlociImage`: the 22 surfaces plus `get-under-overwrite` in
+**require mode**, and `delete-if-match` in record mode (the pin ignores the
+condition; s3wal never relies on it — ADR-46).
+
+This is regression armor from a second implementation, **not** s3wal promotion
+evidence: the store requirements in [the production guide](../how-to/deploy-production.md)
+are unchanged, and Floci is not a qualified `s3wal://` store. Like the
+SeaweedFS lane, the test is gated only by `-short`, so it also runs in the
+per-PR `test` job. The nightly job also asserts a complete VERDICT transcript.
 
 Run it locally (Docker + the `aws` CLI):
 
@@ -410,55 +395,55 @@ OPENSTORAGE_TEST_S3_URL='s3://floci-test?endpoint=http://127.0.0.1:4566&s3ForceP
   go test ./internal/blob -run 'TestS3Endpoint' -count=1 -race -v
 ```
 
-The same tests run against real S3: point `OPENSTORAGE_TEST_S3_URL` at an
-existing bucket (`s3://my-bucket?region=us-east-1`) with real credentials in
-the environment. Without an `endpoint` query parameter the bucket is only
-probed, never created — re-creating an owned us-east-1 bucket would reset
-its ACLs. Versioned (or version-suspended) buckets are refused, because
-cleanup relies on `DeleteObject` actually reclaiming the test keys rather
-than writing delete markers. Keys are uniquely suffixed and cleaned up, but
-use an unversioned scratch bucket, not a production one.
+For real S3, point `OPENSTORAGE_TEST_S3_URL` at an existing bucket
+(`s3://my-bucket?region=us-east-1`) with real credentials in the environment.
+
+> [!WARNING]
+> Use an unversioned scratch bucket, never a production one.
+>
+> - Without an `endpoint` parameter the bucket is only probed, never created:
+>   re-creating an owned us-east-1 bucket would reset its ACLs.
+> - Versioned or version-suspended buckets are refused; cleanup needs
+>   `DeleteObject` to reclaim test keys, not write delete markers.
+> - Keys are uniquely suffixed and cleaned up.
 
 ## The Floci githttp E2E lane
 
 [`floci-nightly-githttp.yml`](../../.github/workflows/floci-nightly-githttp.yml)
-runs daily (04:53 UTC): it boots a pinned Floci image (the same build
-`s3waltest.FlociImage` pins for the qualification matrix — bump both
-together) with S3 auth
-enforcement on, provisions an IAM user and access key, assumes a role via
-STS, and reruns the full PG-mode `internal/githttp` E2E suite with the blob
-store pointed at Floci and the STS **session credentials** in the
-environment. `OPENSTORAGE_TEST_S3_ENDPOINT` is the seam: a test-only
-override read by the suite's `TestMain` (like `OPENSTORAGE_TEST_BACKEND`,
-it never touches production config parsing) that swaps the managed
-SeaweedFS container for the external endpoint on the pg lane — and panics
-on any other lane, where it would otherwise be silently ignored. The
-workflow's last step asserts the suite's bucket exists on Floci, so broken
-override plumbing fails the lane instead of passing green against a
-quietly booted SeaweedFS.
+boots the pinned Floci image with S3 auth enforced, mints an IAM user and key,
+and assumes a role via STS. It reruns the full PG-mode `internal/githttp` E2E
+suite with blobs on Floci and the STS **session credentials** in the
+environment. It uses the same build as `s3waltest.FlociImage`: bump both
+together.
 
-What the nightly adds over the per-PR `test` job: a second, independent S3
-wire-protocol implementation under the whole git/LFS surface (wire-drift
-armor), and the only lane anywhere that *runs* on IAM/STS-minted session
-credentials — every other lane signs with long-lived static keys. Be
-precise about what that buys: Floci only honors access-key IDs minted
-through IAM/STS, so the lane proves the suite operates end-to-end on
-freshly minted temporary keys — but its header-auth gap (see the gap list
-above: only the key ID's existence is checked) means a dropped or forged
-`AWS_SESSION_TOKEN` on header-auth requests would **not** fail the lane.
-Verifying token integrity end-to-end needs an endpoint that authenticates
-temporary credentials; until then this lane exercises, without asserting,
-the session-token plumbing (env → SDK → serve subprocesses). Floci's
-default in-memory storage mode is exactly right for a fresh-per-run lane;
-persistent mode (`FLOCI_STORAGE_MODE=persistent` plus a volume) was verified
-working during the issue #201 spike if the lane ever needs restart survival.
+The seam is `OPENSTORAGE_TEST_S3_ENDPOINT`, a test-only `TestMain` override
+like `OPENSTORAGE_TEST_BACKEND` that never touches production config parsing.
+On the pg lane it replaces the managed SeaweedFS container with the external
+endpoint; on other lanes it panics instead of being ignored. The last workflow
+step asserts the suite's bucket exists on Floci, so broken plumbing fails
+instead of passing on a quietly booted SeaweedFS.
 
-The per-PR blob store deliberately stays SeaweedFS: Floci is not strictly
-better — header-auth SigV4 signatures are not validated and conditional
-DELETE is ignored (its torn-read bug is fixed as of the pinned build). The
-authoritative gap list, with details, is in
-[the Floci S3 lane](#the-floci-s3-lane) section above. The lane is
-nightly-only and **not** part of the required PR check set.
+It adds over the per-PR `test` job:
+
+- a second, independent S3 wire-protocol implementation under the whole
+  git/LFS surface (wire-drift armor);
+- the only lane that *runs* on IAM/STS-minted session credentials; all others
+  sign with long-lived static keys.
+
+Limit: Floci only honors IAM/STS-minted key IDs, so the suite provably works on
+fresh temporary keys. But Floci checks only the key ID on header auth, so a
+dropped or forged `AWS_SESSION_TOKEN` would **not** fail the lane. The lane
+exercises, without asserting, the session-token plumbing (env → SDK → serve
+subprocesses) until an endpoint that authenticates temporary credentials is
+available.
+
+Floci's default in-memory storage suits a fresh-per-run lane. Persistent mode
+(`FLOCI_STORAGE_MODE=persistent` plus a volume) is verified working if restart
+survival is ever needed.
+
+Per-PR blobs stay on SeaweedFS because of the [Floci gaps](#the-floci-s3-lane)
+(unvalidated header-auth SigV4, ignored conditional DELETE). This lane is
+nightly-only and **not** a required PR check.
 
 Run it locally (Docker + the `aws` CLI; the tag is `s3waltest.FlociImage`):
 
