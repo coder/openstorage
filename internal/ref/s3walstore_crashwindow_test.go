@@ -24,6 +24,7 @@ package ref
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,12 +32,14 @@ import (
 )
 
 // crashEnv is one crash-window fixture: the shared "bucket" (MemCAS), the
-// live driver, and the modeled blob store (key -> bytes).
+// live driver, the modeled blob store (key -> bytes), and an optional
+// injected clock that survives restarts.
 type crashEnv struct {
 	t     *testing.T
 	mc    *s3wal.MemCAS
 	s     *S3WAL
 	blobs map[string]int64
+	clock *fakeClock
 }
 
 func newCrashEnv(t *testing.T) *crashEnv {
@@ -52,6 +55,67 @@ func (e *crashEnv) restart() {
 	e.s = newS3WALStore(e.mc, nil, nil)
 	e.s.backoffBase = time.Microsecond
 	e.s.backoffCap = time.Millisecond
+	if e.clock != nil {
+		e.s.now = e.clock.now
+	}
+}
+
+// useClock drives the driver (across restarts) and the store's Date
+// witness from clock, so TTL verdicts are a pure function of the clock.
+func (e *crashEnv) useClock(clock *fakeClock) {
+	e.t.Helper()
+	assertf(clock != nil, "crashEnv.useClock: nil clock")
+	e.clock = clock
+	e.s.now = clock.now
+	e.mc.Now = clock.now // store clock agrees (§2.4-3 Date witness)
+}
+
+// assertFencedWhileLive proves the delete lease on key, stamped stamp,
+// fences registration at its LAST live instant: the injected clock is
+// frozen one nanosecond inside the full window, so no scheduling delay
+// can age the lease past the check (issue #318). The registration must
+// keep polling (the clock is read across several attempts) and never
+// commit; after cancellation the lease and the missing row are verified.
+func (e *crashEnv) assertFencedWhileLive(base, key string, bytes int64, stamp time.Time) {
+	e.t.Helper()
+	assertf(e.clock != nil, "crashEnv.assertFencedWhileLive: no injected clock")
+	assertf(!stamp.IsZero() && bytes > 0, "crashEnv.assertFencedWhileLive(%v, %d)", stamp, bytes)
+	clock := e.clock
+	clock.set(stamp.Add(s3walDeleteLockWindow() - time.Nanosecond))
+	var reads atomic.Int64
+	e.s.now = func() time.Time { reads.Add(1); return clock.now() }
+	defer func() { e.s.now = clock.now }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.s.RegisterLFSObject(ctx, base, key, bytes) }()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	safety := time.After(time.Minute) // real-time safety net, not a verdict input
+	for reads.Load() < 10 {
+		select {
+		case err := <-done:
+			if err == nil {
+				e.t.Fatal("registration ignored a live delete lease")
+			}
+			e.t.Fatalf("registration under a live delete lease failed instead of polling: %v", err)
+		case <-safety:
+			e.t.Fatalf("registration made no progress under a live delete lease (%d clock reads)", reads.Load())
+		case <-tick.C:
+		}
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		e.t.Fatalf("registration under a live delete lease = %v, want blocked until cancelled", err)
+	}
+	m := mustManifest(e.t, e.s, base)
+	if lock := m.DeleteLocks[key]; lock == nil || !lock.CreatedAt.Equal(stamp) {
+		e.t.Fatalf("live delete lease on %s disturbed: %+v", key, lock)
+	}
+	if m.LFS.Objects[key] != nil {
+		e.t.Fatal("registration ignored a live delete lease")
+	}
 }
 
 // upload models the pack/LFS blob PUT that precedes every registration.
@@ -351,33 +415,38 @@ func TestS3WALCrashWindows(t *testing.T) {
 		const base = "w6repo"
 		const key = "lfs/w6repo/oid1"
 
-		// Shrink the lease protocol to test scale (same knob the
-		// recovery suite uses).
-		oldTTL, oldIO, oldSafety, oldPoll := s3walDeleteLockTTL, s3walDeleteIOTimeout, s3walDeleteLockSafety, s3walDeleteLockPoll
-		s3walDeleteLockTTL, s3walDeleteIOTimeout, s3walDeleteLockSafety, s3walDeleteLockPoll =
-			40*time.Millisecond, 10*time.Millisecond, 5*time.Millisecond, time.Millisecond
-		t.Cleanup(func() {
-			s3walDeleteLockTTL, s3walDeleteIOTimeout, s3walDeleteLockSafety, s3walDeleteLockPoll = oldTTL, oldIO, oldSafety, oldPoll
-		})
+		// Lease verdicts run on an injected clock at the production
+		// protocol scale (issue #318): wall-clock sleeps against a 55 ms
+		// window let a descheduled test reach the check after the lease
+		// had genuinely expired, which read as "registration ignored a
+		// live delete lease". Only the poll interval shrinks, so blocked
+		// registrations re-check quickly in real time.
+		oldPoll := s3walDeleteLockPoll
+		s3walDeleteLockPoll = time.Millisecond
+		t.Cleanup(func() { s3walDeleteLockPoll = oldPoll })
+		e.useClock(newFakeClock(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)))
+		window := s3walDeleteLockWindow()
 
-		// (a) Killed BEFORE the DELETE was sent: the stale lock briefly
-		// blocks registration, then expires — the safe direction.
+		// (a) Killed BEFORE the DELETE was sent: the stale lock blocks
+		// registration for its full window, then expires — the safe
+		// direction.
 		recoveryEdit(t, e.s, base, func(m *s3wal.Manifest, clk time.Time) {
 			m.DeleteLocks = map[string]*s3wal.DeleteLock{
 				key: {Owner: "crashed-proc", OpID: s3wal.NewOpID(), CreatedAt: clk},
 			}
 		})
+		stamp := mustManifest(t, e.s, base).DeleteLocks[key].CreatedAt
 		e.restart()
-		blockedCtx, cancel := context.WithTimeout(ctx, 15*time.Millisecond)
-		err := e.s.RegisterLFSObject(blockedCtx, base, key, 5)
-		cancel()
-		if err == nil {
-			t.Fatal("registration ignored a live delete lease")
-		}
-		// After the FULL blocking window the lease no longer fences.
-		time.Sleep(s3walDeleteLockTTL + s3walDeleteIOTimeout + s3walDeleteLockSafety + 10*time.Millisecond)
+		e.assertFencedWhileLive(base, key, 5, stamp)
+		// At the FULL blocking window the lease no longer fences.
+		e.clock.set(stamp.Add(window))
 		e.upload(key, 5)
-		if err := e.s.RegisterLFSObject(ctx, base, key, 5); err != nil {
+		// Real-time safety net only: an over-fencing lease fails here
+		// instead of hanging until the package timeout.
+		expiredCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		err := e.s.RegisterLFSObject(expiredCtx, base, key, 5)
+		cancel()
+		if err != nil {
 			t.Fatalf("post-expiry registration: %v", err)
 		}
 		e.assertPQ(base)
@@ -400,21 +469,17 @@ func TestS3WALCrashWindows(t *testing.T) {
 		if err == nil || deleted {
 			t.Fatalf("GuardedLFSDelete = (%v, %v), want the crash surfaced", deleted, err)
 		}
-		if m := mustManifest(t, e.s, base); m.DeleteLocks[key2] == nil {
-			t.Fatalf("crashed delete's lease missing: %+v", m.DeleteLocks)
+		lock2 := mustManifest(t, e.s, base).DeleteLocks[key2]
+		if lock2 == nil {
+			t.Fatal("crashed delete's lease missing")
 		}
 		e.restart()
 		// Within the blocking window the crashed delete's lease still
 		// fences registration.
-		blockedCtx2, cancel2 := context.WithTimeout(ctx, 15*time.Millisecond)
-		err = e.s.RegisterLFSObject(blockedCtx2, base, key2, 6)
-		cancel2()
-		if err == nil {
-			t.Fatal("registration ignored the crashed delete's live lease")
-		}
-		// Past the FULL window the sweeper reaps the leaked lease and
+		e.assertFencedWhileLive(base, key2, 6, lock2.CreatedAt)
+		// At the FULL window the sweeper reaps the leaked lease and
 		// registration proceeds.
-		time.Sleep(s3walDeleteLockTTL + s3walDeleteIOTimeout + s3walDeleteLockSafety + 10*time.Millisecond)
+		e.clock.set(lock2.CreatedAt.Add(window))
 		if _, err := e.s.SweepExpiredPackReservations(ctx, ttl); err != nil {
 			t.Fatalf("sweep: %v", err)
 		}
