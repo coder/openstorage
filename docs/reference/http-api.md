@@ -269,11 +269,12 @@ The `git:read` endpoints answer from git subprocesses over a cache repository. A
 
 | Limit | Value | When it is exceeded |
 |---|---|---|
-| Concurrency | At most 8 requests per server process run git work that grows with history, tree, blob or output size. A request waits up to 1 second for a slot. Single-object reads (ref resolution, one commit) need no slot. A request gives its slot back when its response starts. `archive` copies each file to a temporary file before sending it and gives the slot back each time, so a client that stops reading holds no slot. | 503 with `Retry-After: 1`. git is not started. |
+| Concurrency | At most 8 requests per server process run git at once, and `file` and `archive` downloads have a separate pool of 4. A request takes its slot at its first git subprocess, including single-object reads, and keeps it until its response has been delivered. A request waits up to 1 second for a slot. | 503 with `Retry-After: 1`. git is not started. |
 | Time | 30 seconds of git time per request, counted from its first git subprocess and shared by all of them. `archive` gets 10 minutes, because it streams at the client's pace. | 503 without `Retry-After`. The running git subprocess is stopped. |
 | Memory (Linux) | 256 MiB of git heap per subprocess (`RLIMIT_DATA`, set before git starts); 32 MiB for single-object reads. Read-only pack mappings are shared page cache and are not counted. | 422. |
 | Output | 64 MiB of buffered git output per request, shared by all its subprocesses. File contents that `file`, `archive` and `diff` stream instead of buffering are not counted. | 422. git is stopped as soon as the limit is passed. |
 | File size | 100 MiB per file, checked from the tree before the file is read. | 422 for `file` (GET and HEAD) and `archive`, before any response byte. |
+| Delivery | Each 64 KiB of a response must reach the client within 30 seconds, and the whole response within 2 minutes of its first byte (`file` and `archive`: 10 minutes). | The connection is closed. The request's slot, memory and temporary files are released. |
 
 The largest git heap measured on a 300,000-commit linear history is 184 MB, for `git log -1 -- <file added in the root commit>`, so such histories are served. Histories past roughly 400,000 commits can get 422 for per-file history walks, `blame` of old files, and deep `commits` pages. A `files/metadata` page whose per-file walks need more than 30 seconds in total gets 503; request smaller pages with `limit`. Commit-graphs ([#307](https://github.com/coder/openstorage/issues/307)) would make these walks cheaper, but the limits do not depend on them.
 

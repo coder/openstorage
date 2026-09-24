@@ -101,11 +101,11 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 	assertf(p != nil && p.repoPath != "", "Stream: unprepared archive")
 	assertf(w != nil, "Stream: nil writer")
 
-	// Each blob is spooled to a temp file before it is written to w, and
-	// the request's git slot is released after every git child, so a
-	// client that stops reading never holds a slot or a git process
-	// (#313). The spool holds one blob at a time, at most MaxBlobBytes
-	// (PrepareArchive checked every size).
+	// Each blob is spooled to a temp file before it is written to w, so a
+	// client that stops reading never keeps a git process (and its heap)
+	// alive (#313). The spool holds one blob at a time, at most
+	// MaxBlobBytes (PrepareArchive checked every size); the HTTP layer's
+	// write deadlines bound how long a stalled client keeps it.
 	spool, err := os.CreateTemp("", "openstorage-archive-*")
 	if err != nil {
 		return err
@@ -114,12 +114,6 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 		_ = spool.Close()
 		_ = os.Remove(spool.Name())
 	}()
-	budget := BudgetFrom(ctx)
-	releaseSlot := func() {
-		if budget != nil {
-			budget.Release()
-		}
-	}
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	for _, e := range p.entries {
@@ -133,7 +127,6 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 			if err != nil {
 				return err
 			}
-			releaseSlot()
 			hdr.Typeflag = tar.TypeSymlink
 			hdr.Linkname = string(target)
 			hdr.Mode = 0o777
@@ -156,7 +149,6 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 			if err := CatBlobTo(ctx, p.repoPath, e.SHA, spool); err != nil {
 				return err
 			}
-			releaseSlot()
 			if _, err := spool.Seek(0, io.SeekStart); err != nil {
 				return err
 			}

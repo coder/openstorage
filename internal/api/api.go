@@ -188,7 +188,7 @@ func New(cfg Config) (http.Handler, error) {
 	// Routes that start git run under a per-request git budget (#313,
 	// git_budget.go); the /api/repos/{repo_name}/... aliases re-dispatch
 	// through these registrations and inherit it.
-	route("GET /api/v1/repos/file", false, withGitReadBudget(s.handleGetFile), auth.ScopeGitRead)
+	route("GET /api/v1/repos/file", false, withGitFileBudget(s.handleGetFile), auth.ScopeGitRead)
 	route("GET /api/v1/repos/files", false, withGitReadBudget(s.handleListFiles), auth.ScopeGitRead)
 	route("GET /api/v1/repos/files/metadata", false, withGitReadBudget(s.handleFilesMetadata), auth.ScopeGitRead)
 	route("GET /api/v1/repos/branches", false, s.handleListBranches, auth.ScopeGitRead)

@@ -31,9 +31,8 @@ const (
 	// this cannot be read through the API.
 	LightHeapBytes int64 = 32 << 20
 	// DefaultOutputBytes is the buffered-stdout allowance of one request (a
-	// Budget), shared by all of its children, or of one call without a
-	// Budget. Streaming children (CatBlobTo into a caller's writer) are not
-	// counted; they never buffer in memory.
+	// Budget), shared by all of its children. Streaming children (CatBlobTo
+	// into a caller's writer) are not counted; they never buffer in memory.
 	DefaultOutputBytes int64 = 64 << 20
 	// MaxBlobBytes is the largest blob the API streams (file, archive).
 	// git reads a blob below core.bigFileThreshold (512 MiB) fully into its
@@ -54,10 +53,10 @@ type Class int
 
 const (
 	// Light: bounded by one object (ref resolution, single-commit reads).
-	// Runs under LightHeapBytes and needs no admission slot.
+	// Runs under LightHeapBytes.
 	Light Class = iota + 1
 	// Heavy: grows with history, tree, blob, or output size. Runs under
-	// HeavyHeapBytes and needs its request's admission slot.
+	// HeavyHeapBytes.
 	Heavy
 )
 
@@ -121,8 +120,9 @@ func DefaultLimits() Limits {
 	return Limits{HeavyHeap: HeavyHeapBytes, LightHeap: LightHeapBytes, MaxBlob: MaxBlobBytes}
 }
 
-// Slots is a process-wide pool of admission slots for Heavy children. A
-// request holds at most one slot (see Budget).
+// Slots is a process-wide pool of request admission slots. A request
+// holds at most one slot, from its first git child until it ends (see
+// Budget).
 type Slots struct {
 	ch   chan struct{}
 	wait time.Duration
@@ -170,9 +170,12 @@ func (s *Slots) InUse() int { return len(s.ch) }
 
 // Budget is one request's share of the read-side git limits. A handler
 // middleware creates it, attaches it with WithBudget, and calls Close when
-// the request ends. Without a Budget in the context, children still run
-// under their heap caps and a per-call output allowance, but without
-// admission or a deadline.
+// the request has finished, including delivering its response. The
+// request's first git child takes one admission slot, and the request
+// keeps it until Close: the slot bounds everything the request retains
+// (git children, buffered output, parsed results, spools), not just its
+// git processes. Without a Budget in the context (write endpoints), Run
+// applies none of these limits.
 type Budget struct {
 	slots   *Slots
 	timeout time.Duration
@@ -180,8 +183,6 @@ type Budget struct {
 
 	mu         sync.Mutex
 	held       bool      // this request holds one slot
-	running    int       // Heavy children started and not yet reaped
-	releaseReq bool      // Release was called while a child ran
 	deadline   time.Time // zero until the first child starts
 	outputLeft int64
 	closed     bool
@@ -221,44 +222,22 @@ func BudgetFrom(ctx context.Context) *Budget {
 	return b
 }
 
-// Release gives the request's slot back early: HTTP handlers call it when
-// the response starts, and Stream after each blob it has spooled, so a slow
-// client cannot hold a slot while git is idle. A Heavy child started later
-// re-acquires one. If a child is running, the slot is released when it is
-// reaped.
-func (b *Budget) Release() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.running > 0 {
-		b.releaseReq = true
-		return
-	}
-	b.releaseLocked()
-}
-
-// Close ends the budget: it releases the slot. Every child has been reaped
-// by then (run waits for git before returning).
+// Close ends the budget and releases its slot. Every child has been reaped
+// by then (Run waits for git before returning).
 func (b *Budget) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	assertf(b.running == 0, "Budget.Close: %d children still running", b.running)
-	b.releaseLocked()
-	b.closed = true
-}
-
-func (b *Budget) releaseLocked() {
 	if b.held {
 		b.slots.release()
 		b.held = false
 	}
-	b.releaseReq = false
+	b.closed = true
 }
 
-// start admits one child: it takes the request's slot for a Heavy child
-// (waiting at most the pool's wait), starts the git clock on the first
-// child, and returns the child's deadline. done must be called once the
-// child is reaped.
-func (b *Budget) start(ctx context.Context, class Class) (deadline time.Time, err error) {
+// start admits one child: the request's first child takes its slot
+// (waiting at most the pool's wait), and starts the git clock. It returns
+// the child's deadline.
+func (b *Budget) start(ctx context.Context) (deadline time.Time, err error) {
 	b.mu.Lock()
 	assertf(!b.closed, "Budget: child started after Close")
 	if b.deadline.IsZero() {
@@ -269,12 +248,7 @@ func (b *Budget) start(ctx context.Context, class Class) (deadline time.Time, er
 		b.mu.Unlock()
 		return time.Time{}, fmt.Errorf("%w (%v)", ErrTimeBudget, b.timeout)
 	}
-	if class != Heavy {
-		b.mu.Unlock()
-		return deadline, nil
-	}
 	if b.held {
-		b.running++
 		b.mu.Unlock()
 		return deadline, nil
 	}
@@ -295,21 +269,7 @@ func (b *Budget) start(ctx context.Context, class Class) (deadline time.Time, er
 	} else {
 		b.held = true
 	}
-	b.running++
 	return deadline, nil
-}
-
-func (b *Budget) done(class Class) {
-	if class != Heavy {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	assertf(b.running > 0, "Budget.done: no running child")
-	b.running--
-	if b.running == 0 && b.releaseReq {
-		b.releaseLocked()
-	}
 }
 
 // take reserves n bytes of buffered output; false means the allowance is
@@ -325,27 +285,12 @@ func (b *Budget) take(n int64) bool {
 	return true
 }
 
-// outputAllowance is a buffered-output reservation source: a Budget, or a
-// per-call counter when there is none.
-type outputAllowance interface{ take(n int64) bool }
-
-type callAllowance struct{ left int64 }
-
-func (a *callAllowance) take(n int64) bool {
-	if n > a.left {
-		a.left = 0
-		return false
-	}
-	a.left -= n
-	return true
-}
-
-// limitedBuffer buffers stdout against an allowance. On overflow it kills
-// git at once (instead of letting it block on a full pipe) and refuses the
-// write.
+// limitedBuffer buffers stdout against a Budget's allowance (nil: no
+// limit). On overflow it kills git at once (instead of letting it block on
+// a full pipe) and refuses the write.
 type limitedBuffer struct {
 	buf      bytes.Buffer
-	allow    outputAllowance
+	allow    *Budget
 	kill     context.CancelFunc
 	overflow bool
 }
@@ -353,7 +298,7 @@ type limitedBuffer struct {
 var errOutputOverflow = errors.New("output allowance exhausted")
 
 func (l *limitedBuffer) Write(p []byte) (int, error) {
-	if l.overflow || !l.allow.take(int64(len(p))) {
+	if l.overflow || (l.allow != nil && !l.allow.take(int64(len(p)))) {
 		l.overflow = true
 		l.kill()
 		return 0, errOutputOverflow
@@ -418,30 +363,24 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	name := "git " + strings.Join(c.Args, " ")
 
 	b := BudgetFrom(ctx)
-	heap := HeavyHeapBytes
-	if c.Class == Light {
-		heap = LightHeapBytes
-	}
-	var allow outputAllowance = &callAllowance{left: DefaultOutputBytes}
+	var heap int64 // no Budget (write endpoints): no limits at all
 	limitCtx := ctx
 	if b != nil {
 		heap = b.limits.HeavyHeap
 		if c.Class == Light {
 			heap = b.limits.LightHeap
 		}
-		deadline, err := b.start(ctx, c.Class)
+		deadline, err := b.start(ctx)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", name, err)
 		}
-		defer b.done(c.Class)
-		allow = b
 		var cancel context.CancelFunc
 		limitCtx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
 	if !heapLimitAvailable() {
-		// No qualified heap-cap mechanism outside Linux (docs): the other
-		// limits still apply.
+		// No qualified heap-cap mechanism outside Linux (ADR-048): the
+		// other limits still apply.
 		heap = 0
 	}
 	runCtx, kill := context.WithCancel(limitCtx)
@@ -460,7 +399,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 		stream = &stopWriter{w: c.Stdout, kill: kill}
 		cmd.Stdout = stream
 	} else {
-		out = &limitedBuffer{allow: allow, kill: kill}
+		out = &limitedBuffer{allow: b, kill: kill}
 		cmd.Stdout = out
 	}
 	err := cmd.Run()

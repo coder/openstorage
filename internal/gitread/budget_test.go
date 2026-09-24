@@ -116,9 +116,10 @@ func TestRunHeapCapStopsDeepPathWalk(t *testing.T) {
 	}
 	b.Close()
 	assertNoChildren(t)
-	// The same walk fits under the default cap, and the budget's slot was
-	// returned.
-	commits, err := Log(context.Background(), dir, tip, LogOptions{Path: "cold.txt", MaxCount: 1})
+	// The same walk fits under the default cap.
+	b2 := testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes)
+	defer b2.Close()
+	commits, err := Log(WithBudget(context.Background(), b2), dir, tip, LogOptions{Path: "cold.txt", MaxCount: 1})
 	if err != nil || len(commits) != 1 {
 		t.Fatalf("default cap: commits = %d, err = %v", len(commits), err)
 	}
@@ -131,17 +132,24 @@ func TestRunAppliesClassHeapCapsBeforeExec(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "limit")
 	fakeGit(t, "ulimit -d >> "+out)
 	dir := t.TempDir()
-	if _, err := Run(context.Background(), Cmd{Class: Heavy, Dir: dir, Args: []string{"x"}}); err != nil {
+	b := testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes)
+	ctx := WithBudget(context.Background(), b)
+	if _, err := Run(ctx, Cmd{Class: Heavy, Dir: dir, Args: []string{"x"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Run(context.Background(), Cmd{Class: Light, Dir: dir, Args: []string{"x"}}); err != nil {
+	if _, err := Run(ctx, Cmd{Class: Light, Dir: dir, Args: []string{"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+	// Without a Budget (write endpoints) Run applies no limit.
+	if _, err := Run(context.Background(), Cmd{Class: Heavy, Dir: dir, Args: []string{"x"}}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := strconv.FormatInt(HeavyHeapBytes>>10, 10) + "\n" + strconv.FormatInt(LightHeapBytes>>10, 10) + "\n"
+	want := strconv.FormatInt(HeavyHeapBytes>>10, 10) + "\n" + strconv.FormatInt(LightHeapBytes>>10, 10) + "\nunlimited\n"
 	if string(got) != want {
 		t.Fatalf("git inherited RLIMIT_DATA %q KiB, want %q", got, want)
 	}
@@ -212,13 +220,13 @@ func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	if _, err := Run(octx, Cmd{Class: Heavy, Dir: t.TempDir(), Args: []string{"x"}}); !errors.Is(err, ErrBusy) {
 		t.Fatalf("err = %v, want ErrBusy", err)
 	}
-	// Light children need no slot.
-	if _, err := Run(octx, Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"x"}}); err != nil {
-		t.Fatalf("light child: %v", err)
+	// Light-only requests need the slot too: they retain output as well.
+	if _, err := Run(octx, Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"x"}}); !errors.Is(err, ErrBusy) {
+		t.Fatalf("light child: err = %v, want ErrBusy", err)
 	}
 	raw, _ := os.ReadFile(marker)
-	if n := strings.Count(string(raw), "x"); n != 3 {
-		t.Fatalf("git ran %d times, want 3 (the busy child must not start)", n)
+	if n := strings.Count(string(raw), "x"); n != 2 {
+		t.Fatalf("git ran %d times, want 2 (busy children must not start)", n)
 	}
 	holder.Close()
 	if _, err := Run(octx, Cmd{Class: Heavy, Dir: t.TempDir(), Args: []string{"x"}}); err != nil {
@@ -227,32 +235,6 @@ func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	other.Close()
 	if slots.InUse() != 0 {
 		t.Fatalf("slots in use after Close = %d", slots.InUse())
-	}
-}
-
-func TestBudgetReleaseWhileChildRunsDefersToReap(t *testing.T) {
-	slots := NewSlots(1, 0)
-	b := testBudget(slots, time.Minute, DefaultOutputBytes)
-	ctx := context.Background()
-	if _, err := b.start(ctx, Heavy); err != nil {
-		t.Fatal(err)
-	}
-	b.Release()
-	if slots.InUse() != 1 {
-		t.Fatal("slot released while a Heavy child was still running")
-	}
-	b.done(Heavy)
-	if slots.InUse() != 0 {
-		t.Fatal("slot not released when the running child was reaped")
-	}
-	// Re-acquired by a later child, released by Close.
-	if _, err := b.start(ctx, Heavy); err != nil {
-		t.Fatal(err)
-	}
-	b.done(Heavy)
-	b.Close()
-	if slots.InUse() != 0 {
-		t.Fatal("Close kept the slot")
 	}
 }
 
@@ -378,10 +360,10 @@ func (w *blockingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// A client that stops reading an archive holds neither the request's slot
-// nor a git process: Stream spools each blob and releases the slot before
-// writing it.
-func TestArchiveStreamStalledReaderHoldsNoSlot(t *testing.T) {
+// A client that stops reading an archive keeps no git process alive:
+// Stream spools each blob before writing it. (The request keeps its slot
+// until the HTTP layer's write deadlines end it.)
+func TestArchiveStreamStalledReaderKeepsNoGitProcess(t *testing.T) {
 	f := newFixture(t)
 	slots := NewSlots(1, 0)
 	b := testBudget(slots, time.Minute, DefaultOutputBytes)
@@ -398,12 +380,10 @@ func TestArchiveStreamStalledReaderHoldsNoSlot(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("Stream never wrote")
 	}
-	// The gzip writer buffers, so the first Write carries spooled blob
-	// bytes: git has finished and the slot is free while the client stalls.
-	if n := slots.InUse(); n != 0 {
-		t.Fatalf("stalled reader holds %d slot(s)", n)
-	}
 	assertNoChildren(t)
+	if n := slots.InUse(); n != 1 {
+		t.Fatalf("slots in use = %d, want 1 (held until the request ends)", n)
+	}
 	close(w.release)
 	if err := <-done; err != nil {
 		t.Fatal(err)

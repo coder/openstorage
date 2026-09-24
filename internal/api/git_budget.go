@@ -4,22 +4,29 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/coder/openstorage/internal/gitread"
 )
 
 // Process-wide limits on read-side git work (#313). Every git:read route
-// runs its handler under a gitread.Budget (withGitReadBudget); gitread.Run
-// applies the per-child caps. docs/reference/http-api.md ("Resource limits
-// on git reads") is the client-facing description and ADR-048 the design;
-// keep them in step.
+// runs its handler under a gitread.Budget (withGitReadBudget,
+// withGitStreamBudget); gitread.Run applies the per-child caps.
+// docs/reference/http-api.md ("Resource limits on git reads") is the
+// client-facing description and ADR-048 the design; keep them in step.
+//
+// A request takes its admission slot at its first git child and keeps it
+// until its response is delivered: the slot bounds everything the request
+// retains (git children, buffered output, parsed results, spools). Write
+// deadlines bound how long a slow reader can keep it.
 const (
-	// gitReadSlots caps requests running Heavy git children at once in
-	// this process. With gitread.HeavyHeapBytes per child, their git heap
-	// is at most 2 GiB.
+	// gitReadSlots caps requests with JSON responses that run git at once
+	// in this process. Their git heap is at most 8 x 256 MiB while a child
+	// runs; buffered output adds at most 64 MiB (plus parsed copies) each.
 	gitReadSlots = 8
+	// gitStreamSlots is a separate pool for file and archive downloads,
+	// whose delivery can take minutes, so they cannot starve JSON reads.
+	gitStreamSlots = 4
 	// gitReadSlotWait is how long a request waits for a slot before it
 	// is answered 503 + Retry-After.
 	gitReadSlotWait = time.Second
@@ -29,76 +36,146 @@ const (
 	// walks gets 30 s in total, not 30 s per walk.
 	gitReadTimeout = 30 * time.Second
 	// gitArchiveTimeout replaces gitReadTimeout for archives, which
-	// alternate git children with writes at the client's pace. Stream
-	// spools each blob and gives the slot back before writing it, so a
-	// stalled client holds no slot.
+	// alternate git children with writes at the client's pace.
 	gitArchiveTimeout = 10 * time.Minute
+	// gitWriteIdle is how long one chunk (gitWriteChunk) of a git:read
+	// response may take to reach the client before the connection is
+	// closed.
+	gitWriteIdle  = 30 * time.Second
+	gitWriteChunk = 64 << 10
+	// gitDeliveryTimeout and gitStreamDeliveryTimeout are absolute limits
+	// on delivering a response, counted from its first byte, so a client
+	// that reads a trickle cannot keep a slot and its payload forever.
+	gitDeliveryTimeout       = 2 * time.Minute
+	gitStreamDeliveryTimeout = 10 * time.Minute
 )
 
-// gitReadPolicy is the configuration withGitReadBudget builds each
+// gitReadPolicy is the configuration the budget middleware builds each
 // request's budget from; a struct so tests can swap in small limits.
 type gitReadPolicy struct {
 	slots          *gitread.Slots
+	streamSlots    *gitread.Slots
 	timeout        time.Duration
 	archiveTimeout time.Duration
 	outputBytes    int64
 	limits         gitread.Limits
+	writeIdle      time.Duration
+	delivery       time.Duration
+	streamDelivery time.Duration
 }
 
 // gitReads is the process-wide policy shared by every server instance.
 var gitReads = gitReadPolicy{
 	slots:          gitread.NewSlots(gitReadSlots, gitReadSlotWait),
+	streamSlots:    gitread.NewSlots(gitStreamSlots, gitReadSlotWait),
 	timeout:        gitReadTimeout,
 	archiveTimeout: gitArchiveTimeout,
 	outputBytes:    gitread.DefaultOutputBytes,
 	limits:         gitread.DefaultLimits(),
+	writeIdle:      gitWriteIdle,
+	delivery:       gitDeliveryTimeout,
+	streamDelivery: gitStreamDeliveryTimeout,
 }
 
-// withGitReadBudget runs h with a fresh request budget in its context. The
-// budget's admission slot is given back as soon as the response starts
-// (gitReadWriter), and in any case when h returns; gitread reaps every git
-// child before its call returns, so no child outlives the request.
-func withGitReadBudget(h http.HandlerFunc) http.HandlerFunc {
-	return gitReadBudget(h, false)
-}
+// gitRouteKind selects a route's pool and time limits.
+type gitRouteKind int
 
-// withGitArchiveBudget is withGitReadBudget with the archive time budget.
+const (
+	gitRouteJSON    gitRouteKind = iota // JSON responses
+	gitRouteFile                        // GET/HEAD file: blob staged to disk, then streamed
+	gitRouteArchive                     // archive: git children interleaved with streaming
+)
+
+// withGitReadBudget runs a JSON-response handler under a request budget.
+func withGitReadBudget(h http.HandlerFunc) http.HandlerFunc { return gitReadBudget(h, gitRouteJSON) }
+
+// withGitFileBudget runs the file download handler under a request budget
+// from the stream pool.
+func withGitFileBudget(h http.HandlerFunc) http.HandlerFunc { return gitReadBudget(h, gitRouteFile) }
+
+// withGitArchiveBudget runs the archive handler under a request budget
+// from the stream pool, with the archive time budget.
 func withGitArchiveBudget(h http.HandlerFunc) http.HandlerFunc {
-	return gitReadBudget(h, true)
+	return gitReadBudget(h, gitRouteArchive)
 }
 
-func gitReadBudget(h http.HandlerFunc, archive bool) http.HandlerFunc {
+func gitReadBudget(h http.HandlerFunc, kind gitRouteKind) http.HandlerFunc {
 	assertf(h != nil, "gitReadBudget: nil handler")
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := gitReads
-		timeout := p.timeout
-		if archive {
-			timeout = p.archiveTimeout
+		slots, timeout, delivery := p.slots, p.timeout, p.delivery
+		switch kind {
+		case gitRouteFile:
+			slots, delivery = p.streamSlots, p.streamDelivery
+		case gitRouteArchive:
+			slots, timeout, delivery = p.streamSlots, p.archiveTimeout, p.streamDelivery
 		}
-		b := gitread.NewBudget(p.slots, timeout, p.outputBytes).WithLimits(p.limits)
+		b := gitread.NewBudget(slots, timeout, p.outputBytes).WithLimits(p.limits)
+		gw := &gitReadWriter{ResponseWriter: w, rc: http.NewResponseController(w), idle: p.writeIdle, delivery: delivery}
+		// LIFO: the response is flushed under its deadlines, then the slot
+		// is released, also when the handler aborts with a panic.
 		defer b.Close()
-		h(&gitReadWriter{ResponseWriter: w, b: b}, r.WithContext(gitread.WithBudget(r.Context(), b)))
+		defer gw.finish()
+		h(gw, r.WithContext(gitread.WithBudget(r.Context(), b)))
 	}
 }
 
-// gitReadWriter releases the request's admission slot when the response
-// starts, so a slow reader cannot hold a slot while no git child runs.
+// gitReadWriter puts write deadlines on a git:read response: each chunk of
+// gitWriteChunk bytes must reach the client within the idle limit, and the
+// whole response within the delivery limit counted from its first byte. A
+// stalled or trickling client therefore gets its connection closed, the
+// handler returns, and the request's slot and payload are released.
 type gitReadWriter struct {
 	http.ResponseWriter
-	b    *gitread.Budget
-	once sync.Once
+	rc             *http.ResponseController
+	idle, delivery time.Duration
+	expiry         time.Time // zero until the response starts
 }
 
-func (w *gitReadWriter) started() { w.once.Do(w.b.Release) }
+// arm sets the write deadline for the next chunk. Writers without deadline
+// support (tests' recorders) get none; there is no connection to hold.
+func (w *gitReadWriter) arm() {
+	now := time.Now()
+	if w.expiry.IsZero() {
+		w.expiry = now.Add(w.delivery)
+	}
+	deadline := now.Add(w.idle)
+	if deadline.After(w.expiry) {
+		deadline = w.expiry
+	}
+	_ = w.rc.SetWriteDeadline(deadline)
+}
 
 func (w *gitReadWriter) WriteHeader(status int) {
-	w.started()
+	w.arm()
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *gitReadWriter) Write(p []byte) (int, error) {
-	w.started()
-	return w.ResponseWriter.Write(p)
+	n := 0
+	for len(p) > 0 {
+		chunk := p[:min(len(p), gitWriteChunk)]
+		w.arm()
+		m, err := w.ResponseWriter.Write(chunk)
+		n += m
+		if err != nil {
+			return n, err
+		}
+		p = p[len(chunk):]
+	}
+	return n, nil
+}
+
+// finish flushes a started response under its deadlines, then clears the
+// deadline so a later request on the same keep-alive connection starts
+// without it.
+func (w *gitReadWriter) finish() {
+	if w.expiry.IsZero() {
+		return
+	}
+	w.arm()
+	_ = w.rc.Flush()
+	_ = w.rc.SetWriteDeadline(time.Time{})
 }
 
 // Unwrap exposes the wrapped writer to http.ResponseController.

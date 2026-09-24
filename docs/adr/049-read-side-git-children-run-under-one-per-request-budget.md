@@ -25,15 +25,17 @@ For every child, the runner:
 
 A request's limits live in a `gitread.Budget` carried in the context. A
 middleware installs it on every `git:read` route that starts git, including
-merge/preview. The limits are:
+merge/preview. Without a Budget (write endpoints), `Run` applies no limit,
+so their behavior is unchanged. The limits are:
 
 | Limit | Value | Failure (before or instead of the work) |
 |---|---|---|
-| Admission | 8 slots per process for requests with Heavy work; 1 s wait; released when the response starts, and by `archive` after each spooled blob | 503 + `Retry-After: 1`; git not started |
+| Admission | 8 slots per process (`file` and `archive`: a separate 4), taken at the request's first git child of either class and held until the response is delivered; 1 s wait | 503 + `Retry-After: 1`; git not started |
 | Time | 30 s of git time per request from its first child, shared by all children (archive: 10 min) | 503, no `Retry-After`; git killed and reaped |
 | Heap | `RLIMIT_DATA` 256 MiB Heavy / 32 MiB Light, set by `/bin/sh -c 'ulimit -d …; exec git'`; an inherited stricter limit is kept | 422 |
 | Output | 64 MiB buffered stdout per request | 422; git killed at once |
 | Blob size | 100 MiB, checked from `ls-tree` sizes | 422 before any response byte |
+| Delivery | 30 s per 64 KiB written, and 2 min for the whole response from its first byte (`file`, `archive`: 10 min), as HTTP write deadlines | connection closed; handler returns and releases slot, payload and temp files |
 
 Limit errors never wrap `*exec.ExitError`. Callers that map git exit
 statuses to "not found" or "no match" check `IsBudgetError` first.
@@ -61,10 +63,13 @@ users can push. The production image is Linux.
   prepare the walk. A count preflight is itself a full walk.
 - **`RLIMIT_AS`.** It counts address space, including pack mmaps and
   thread stack reservations, so honest reads would fail unpredictably.
-- **Per-child slots.** A files/metadata page runs hundreds of sequential
-  children. A slot per child would let unlimited requests hold completed
-  output between children. A request-scoped slot bounds that; the slot is
-  released when the response starts.
+- **Per-child slots, or releasing the slot when the response starts.** A
+  slot bounds everything a request retains, not just its git processes: a
+  files/metadata page keeps output between hundreds of children, and a
+  finished blame keeps its payload while a slow client reads it. Admission
+  therefore lasts until the response is delivered, and write deadlines
+  (idle and absolute) bound how long a slow reader can hold it. Light-only
+  requests (a multi-megabyte commit object) take a slot too.
 - **Per-child deadlines.** A 30 s deadline per child would give a
   1000-entry page 8 hours.
 - **Failing closed on macOS.** That would disable the whole read API on a
@@ -81,8 +86,10 @@ users can push. The production image is Linux.
   stack and malloc arena, and one thread per CPU (792 MB of VmData on 32
   CPUs) cannot start under the cap.
 - `archive` spools each blob (at most 100 MiB) to a temporary file before
-  writing it, so a client that stops reading holds neither a slot nor a git
-  process. An archive error after its response started still aborts the
-  connection.
+  writing it, so a client that stops reading keeps no git process alive.
+  An archive error after its response started still aborts the connection.
+- Under a flood of slow readers, git reads return 503 until the write
+  deadlines release slots. No finite pool guarantees availability under
+  arbitrary load; the per-IP rate limiter is the lever for that.
 - Hydration, `upload-pack`, and write endpoints are outside this budget.
   #322 tracks whether commit-graph writes join it.
