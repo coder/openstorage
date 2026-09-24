@@ -1,22 +1,29 @@
 # Configuration Reference
 
-Every `OPENSTORAGE_*` environment variable the `openstorage` binary reads, with defaults,
-validation constraints, and interaction notes. Source of truth:
-[`cmd/openstorage/config.go`](../../cmd/openstorage/config.go). Flags are documented in the
+Every `OPENSTORAGE_*` environment variable that the `openstorage` binary reads, with its
+default, validation rules, and key interactions. Source of truth:
+[`cmd/openstorage/config.go`](../../cmd/openstorage/config.go). Flags are in the
 [CLI reference](cli.md).
 
-Resolution precedence per setting: **explicit flag > canonical `OPENSTORAGE_*` env var >
-`CODESTORAGE_*` fallback > older legacy alias > `--data-dir` derivation (local mode) >
-built-in default**. The old prefix is supported for one minor release, **0.15.x**.
-An explicitly set `OPENSTORAGE_*` variable wins even when its value is empty: neither
-the old prefix nor any older alias can fill it back in. The selected value then follows
-that setting's normal validation and default rules (an empty storage URL derives from
-`--data-dir` or fails startup; it never falls back to a legacy alias). `serve` emits a boot-time deprecation warning for each
-legacy-prefix fallback, without logging the value. Migrate before upgrading to 0.16.0;
-see the [migration guide](../how-to/migrate-to-openstorage.md).
+## Precedence and validation
 
-Malformed values are fail-fast startup errors naming the variable, never silently
-replaced by a value from the old prefix.
+Each setting takes its value from the first source that is set:
+
+1. Explicit flag.
+2. Canonical `OPENSTORAGE_*` variable. It wins even when set to an empty value.
+3. `CODESTORAGE_*` fallback. Supported for one minor release, **0.15.x**. `serve` logs a
+   boot-time deprecation warning for each fallback it uses, without the value.
+4. Older legacy alias (listed per variable).
+5. `--data-dir` derivation (local mode).
+6. Built-in default.
+
+- An empty canonical value is never refilled from the old prefix or an older alias. It
+  follows the setting's normal validation and default rules: an empty storage URL derives
+  from `--data-dir` or fails startup; it never falls back to a legacy alias.
+- Malformed values are fail-fast startup errors naming the variable. They are never
+  replaced by a value from the old prefix.
+- Migrate before upgrading to 0.16.0: see the
+  [migration guide](../how-to/migrate-to-openstorage.md).
 
 ## Summary
 
@@ -71,1005 +78,904 @@ replaced by a value from the old prefix.
 
 Database URL for the ref authority (CAS) and metadata store.
 
-- **Schemes:** `postgres://` or `postgresql://` (production, any number of stateless
-  replicas), `sqlite://<absolute-path>` (local mode, single node), or
-  `s3wal://bucket?endpoint=…&region=…` (**experimental** zero-infra mode, single node:
-  refs and metadata live in conditional-CAS objects under the bucket's `_wal/` prefix —
-  [ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)).
-- **Legacy aliases** (scanned left to right, the first *set* name wins, even when empty): `SPIKE_PG_URL`, `PG_URL`.
-- **Default:** none. Startup fails unless set explicitly or derived from the data dir
+- **Default:** none. Startup fails unless set or derived from the data dir
   (`sqlite://<dir>/codestorage.db`).
-- In PostgreSQL URI query values, `+` is literal (encode spaces as `%20`), and
-  repeated parameters use the last value. Invalid percent escapes are rejected.
-  These parsing rules follow libpq as of pgx v5.11.
-- On Postgres, schema setup (including the durable [River](https://riverqueue.com) job
-  tables) runs automatically at startup and is advisory-lock-serialized, so concurrently
-  booting replicas are safe.
-- **`s3wal://` pairing rule:** the scheme requires an `s3://`
-  [`OPENSTORAGE_S3_URL`](#openstorage_s3_url) — `file://` (including the data-dir
-  derivation) is refused at startup, because the mode's whole premise is that the bucket
-  is the *sole* durable authority. Pointing both URLs at the **same bucket** is the
-  expected topology (the `packs/`, `lfs/`, and `_wal/` key prefixes coexist without
-  overlap; the `_wal/` prefix is reserved). Credentials come from the standard AWS env
-  chain; at startup a conditional-write probe refuses any store that does not implement
-  `If-Match`/`If-None-Match` PUTs faithfully. All S3WAL targets remain **experimental**;
-  see the [storage qualification matrix](../explanation/storage-engine.md#storage-compatibility-and-qualification)
-  for release-scoped evidence and conditional future promotion targets. The store
-  must also provide strong read-after-write and list-after-write consistency — an
-  unprobed deployment prerequisite, see the
+- **Schemes:**
+  - `postgres://` or `postgresql://`: production, any number of stateless replicas.
+  - `sqlite://<absolute-path>`: local mode, single node.
+  - `s3wal://bucket?endpoint=…&region=…`: **experimental** zero-infra mode, single node.
+    Refs and metadata live in conditional-CAS objects under the bucket's `_wal/` prefix
+    ([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)).
+- **Legacy aliases:** `SPIKE_PG_URL`, `PG_URL`, scanned left to right. The first *set*
+  name wins, even when empty.
+- **PostgreSQL URIs** parse like libpq (as of pgx v5.11): `+` in query values is literal
+  (encode spaces as `%20`), repeated parameters use the last value, and invalid percent
+  escapes are rejected.
+- **Postgres schema setup**, including the durable [River](https://riverqueue.com) job
+  tables, runs at startup under an advisory lock. Concurrently booting replicas are safe.
+
+**`s3wal://` pairing rule and requirements:**
+
+- [`OPENSTORAGE_S3_URL`](#openstorage_s3_url) must be `s3://`. `file://`, including the
+  data-dir derivation, is refused at startup: the bucket must be the *sole* durable
+  authority.
+- Point both URLs at the **same bucket** (the expected topology). The `packs/`, `lfs/`,
+  and `_wal/` prefixes do not overlap; `_wal/` is reserved.
+- Credentials come from the standard AWS env chain.
+- A startup probe refuses stores that do not implement `If-Match`/`If-None-Match` PUTs
+  faithfully.
+- The store must also provide strong read-after-write and list-after-write consistency.
+  This is not probed; see the
   [store requirements](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
-  Jobs run on the in-process queue and tickers, exactly like local mode.
+- Jobs run on the in-process queue and tickers, like local mode.
+- All S3WAL targets remain **experimental**. See the
+  [storage qualification matrix](../explanation/storage-engine.md#storage-compatibility-and-qualification)
+  for release-scoped evidence and conditional future promotion targets.
 
 ### `OPENSTORAGE_S3_URL`
 
 Immutable pack storage URL, opened through [gocloud.dev](https://gocloud.dev/howto/blob/).
 
-- **Schemes:** `s3://bucket?region=...` (AWS S3, or an S3-compatible store such as
-  [SeaweedFS](https://github.com/seaweedfs/seaweedfs) — the tested self-hosted
-  reference — by adding `endpoint=http://...&s3ForcePathStyle=true`; other
-  S3-compatible stores, including MinIO, are best-effort) or `file://<absolute-dir>`
-  (local mode).
-- **Legacy aliases** (same presence rule as `OPENSTORAGE_PG_URL`): `SPIKE_S3_URL`, `BLOB_URL`.
-- **Default:** none. Startup fails unless set explicitly or derived from the data dir
+- **Default:** none. Startup fails unless set or derived from the data dir
   (`file://<dir>/blobs`).
-- S3 credentials come from the standard AWS chain (`AWS_ACCESS_KEY_ID`,
-  `AWS_SECRET_ACCESS_KEY`, shared config, instance roles).
-- Delete-mode sweeping interacts with bucket versioning — see
+- **Schemes:**
+  - `s3://bucket?region=...`: AWS S3. For an S3-compatible store, add
+    `endpoint=http://...&s3ForcePathStyle=true`.
+    [SeaweedFS](https://github.com/seaweedfs/seaweedfs) is the tested self-hosted
+    reference; others, including MinIO, are best-effort.
+  - `file://<absolute-dir>`: local mode.
+- **Legacy aliases:** `SPIKE_S3_URL`, `BLOB_URL` (same presence rule as
+  `OPENSTORAGE_PG_URL`).
+- **Credentials:** the standard AWS chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  shared config, instance roles).
+- With an `s3wal://` database URL this **must** be `s3://`, and the same bucket is the
+  expected target ([pairing rule](#openstorage_pg_url)).
+- Delete-mode sweeping interacts with bucket versioning; see
   [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](#openstorage_sweep_delete_enabled).
-- With an `s3wal://` database URL this **must** be `s3://` — see the
-  [pairing rule](#openstorage_pg_url); the same bucket is the expected target.
 
 ### `OPENSTORAGE_S3WAL_LEASE_TTL`
 
-s3wal mode only: the TTL of the `_wal/instance-lease` dual-serve guard
+TTL of the s3wal `_wal/instance-lease` dual-serve guard
 ([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)
-§2.11). At startup, serve refuses to run while another process holds a fresh lease on the
-bucket; while running, it heartbeats the lease every TTL/4 and **fail-stops** if the lease
-is stolen or unrenewable. Graceful shutdown (`SIGTERM`/`SIGINT`) attempts a bounded,
-best-effort release; failed release, hard kills and fail-stop exits can leave a lease.
-A successor must respect the **holder's recorded TTL** and store-clock resolution
-margin, not merely its own configured TTL. Follow the [shutdown/restart
-procedure](../how-to/deploy-production.md#s3wal-shutdown-and-restart) and
-[source-backed operational signals](../how-to/deploy-production.md#s3wal-operational-signals).
+§2.11). Ignored outside s3wal mode.
 
-- **Default:** unset — 2 minutes (30-second heartbeats).
-- **Validation:** a [duration](https://pkg.go.dev/time#ParseDuration) of at least `1s` —
-  the derived heartbeat cadence must tolerate ordinary S3 latency jitter — or exactly `0`,
-  which **disables** the lease entirely (a test-suite escape hatch for deliberately
-  running several processes against one bucket; serve warns loudly, and accidental
-  dual-serve topologies then go undetected).
-- The lease is best-effort *detection* with fail-stop on heartbeat loss, not an
-  independent integrity guarantee or support for two servers against one bucket.
-  Do not disable it or manually delete the lease to recover. Ignored outside s3wal mode.
+- **Default:** unset = 2 minutes (30-second heartbeats).
+- **Values:** a [duration](https://pkg.go.dev/time#ParseDuration) of at least `1s` (the
+  TTL/4 heartbeat must tolerate ordinary S3 latency jitter), or exactly `0`.
+- **`0` disables the lease.** It exists so test suites can run several processes against
+  one bucket. `serve` warns loudly, and accidental dual-serve topologies go undetected.
+- **Behavior:**
+  - At startup, `serve` refuses to run while another process holds a fresh lease on the
+    bucket.
+  - While running, it heartbeats every TTL/4 and **fail-stops** if the lease is stolen or
+    unrenewable.
+  - Graceful shutdown (`SIGTERM`/`SIGINT`) attempts a bounded, best-effort release.
+    Failed release, hard kills, and fail-stop exits can leave a lease.
+  - A successor must respect the **holder's recorded TTL** plus store-clock resolution
+    margin, not just its own configured TTL.
+
+> [!WARNING]
+> The lease is best-effort *detection* with fail-stop on heartbeat loss. It is not an
+> independent integrity guarantee or support for two servers on one bucket. Do not
+> disable it or delete the lease by hand to recover. Follow the
+> [shutdown/restart procedure](../how-to/deploy-production.md#s3wal-shutdown-and-restart)
+> and [operational signals](../how-to/deploy-production.md#s3wal-operational-signals).
 
 ### `OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER`
 
 Optional [bucket owner
 condition](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-owner-condition.html):
 the 12-digit AWS account ID that must own the `OPENSTORAGE_S3_URL` bucket. AWS bucket
-names are global — a deleted bucket name can be re-registered by a third party — and the
-blob layer otherwise trusts whatever the name resolves to. When set, every S3 request the
-server issues carries `x-amz-expected-bucket-owner` via client middleware (the gocloud
-data plane, multipart copies, the startup probe, sweeps, git-hook subprocesses, and the
-purge CLI all share that client seam), so operations against a re-owned bucket fail with
-`403 Access Denied` instead of silently reading from or writing to an attacker's bucket.
-The same env var is also enforced by the `s3wal://` mode's conditional client: every
-`_wal/` manifest/metadata CAS request — including the boot probe and the instance
-lease — carries the header via its own all-or-nothing middleware, so the ref and
-metadata authority objects (which include the org's public keys) get the same protection
-as the blob plane.
+names are global and a deleted name can be re-registered by anyone; without this, the
+blob layer trusts whatever the name resolves to.
 
-- **Default:** unset — no condition parameters are sent; behavior is unchanged.
-- **Format:** exactly 12 digits. Anything else is boot-fatal (a typo'd ID would 403 every
-  operation on AWS, so misconfiguration fails fast instead).
-- **Startup:** when set, every accepted `CreateBucket` outcome — success,
-  `BucketAlreadyOwnedByYou`, `BucketAlreadyExists`, or the tolerated `AccessDenied` of a
-  least-privilege role — is followed by a `HeadBucket` probe under the owner condition,
-  so a squatted name *and* credential/account drift (credentials from a different account
-  than the configured owner) both fail boot. (AWS ignores the condition on `CreateBucket`
-  itself; that operation cannot carry it.)
-- **Presigned URLs** (LFS downloads) embed the condition as a signed lowercase
-  `x-amz-expected-bucket-owner` query parameter — the spelling S3 enforces on presigned
-  requests. The URL stays self-contained (clients send no extra header), and stripping or
-  altering the parameter breaks the SigV4 signature.
-- **Self-hosted stores (SeaweedFS, MinIO) and S3 emulators ignore the condition** (no
-  global bucket namespace); the
-  parameter is harmless pass-through there, so the setting is only useful — and only
-  meaningfully enforced — against AWS S3. Pair it with the `aws:ResourceAccount` IAM
-  condition described in [Deploy to production](../how-to/deploy-production.md), which
-  remains the primary control; this application-level check is defense-in-depth.
+- **Default:** unset. No condition is sent.
+- **Format:** exactly 12 digits. Anything else fails boot.
+- **Effect:** every S3 request carries `x-amz-expected-bucket-owner`, so requests to a
+  re-owned bucket fail with `403 Access Denied`. This covers:
+  - the shared blob client: gocloud data plane, multipart copies, startup probe, sweeps,
+    git-hook subprocesses, and the purge CLI;
+  - the `s3wal://` conditional client (its own all-or-nothing middleware): every `_wal/`
+    CAS request, including the boot probe and the instance lease. These ref and metadata
+    objects include the org's public keys.
+- **Startup:** every accepted `CreateBucket` outcome (success, `BucketAlreadyOwnedByYou`,
+  `BucketAlreadyExists`, or a least-privilege role's tolerated `AccessDenied`) is followed
+  by a `HeadBucket` under the condition. A squatted name and credentials from a different
+  account both fail boot. (`CreateBucket` itself cannot carry the condition.)
+- **Presigned URLs** (LFS downloads) embed it as a signed lowercase
+  `x-amz-expected-bucket-owner` query parameter (the spelling S3 enforces there). Clients
+  send no extra header; altering the parameter breaks the SigV4 signature.
+- **AWS only.** SeaweedFS, MinIO, and S3 emulators ignore the condition (the parameter
+  passes through harmlessly).
+- This is defense-in-depth. The primary control is the `aws:ResourceAccount` IAM
+  condition in [Deploy to production](../how-to/deploy-production.md).
 
 ### `OPENSTORAGE_S3_OP_LOG`
 
-Diagnostics seam (issue #182): when set to a file path, every S3 HTTP round trip issued
-through the server's SDK clients — the blob client and the `s3wal://` conditional
-client, in the serve process and in the git-hook subprocesses alike — appends one
-whitespace-separated line:
+Diagnostics: set to a file path to append one line per S3 HTTP round trip. Covers the blob
+client and the `s3wal://` conditional client, in `serve` and in git-hook subprocesses.
 
 ```
 <unixnano> <pid> <role> <operation> <status> <duration_us> <request-path>
 ```
 
-`role` is derived from the process argv (`openstorage:serve`,
-`openstorage:hook:pre-receive`, …), so a shared log attributes each round trip to the
-process that issued it. Use it to census the per-operation S3 round-trip cost of a
-request (each round trip is a WAN round trip on real S3). Writes are `O_APPEND`
-one-line syscalls, safe for concurrent processes sharing one file.
-
-- **Default:** unset — no middleware is installed; zero overhead.
-- **The path must be absolute.** Hook subprocesses inherit the variable but run from the
-  cache repository, not the server's working directory, so a relative path would silently
-  split the log across per-process files; it is rejected (with a stderr warning).
-- An unopenable path logs a warning to stderr and disables the seam; it never fails the
-  process (diagnostics must not take down serving).
-- The log grows without bound and includes object keys; treat it like a debug log
-  (temporary use, not permanent telemetry).
+- **Default:** unset. No middleware; zero overhead.
+- **The path must be absolute.** Hooks run from the cache repository, so a relative path
+  would split the log across files; it is rejected with a stderr warning.
+- An unopenable path logs a stderr warning and disables the log. It never fails the
+  process.
+- `role` comes from argv (`openstorage:serve`, `openstorage:hook:pre-receive`, …), so a
+  shared log attributes each round trip to its process.
+- Use it to count the S3 round trips (WAN round trips on real S3) behind a request.
+- Writes are `O_APPEND` one-line syscalls, safe for concurrent processes.
+- The log grows without bound and includes object keys. Use it temporarily, like a debug
+  log.
 
 ### `OPENSTORAGE_DATA_DIR`
 
-Local-mode data directory (the `--data-dir` flag wins over the env var). Setting it derives
-every storage slot **not set explicitly**:
+Local-mode data directory. The `--data-dir` flag wins over the variable.
 
-- database: `sqlite://<dir>/codestorage.db`
-- packs: `file://<dir>/blobs`
-- cache: `<dir>/cache`
-
-The database filename is retained for on-disk compatibility: the renamed binary reopens
-the same database, without a file rename or data migration. See the
-[migration guide](../how-to/migrate-to-openstorage.md#3-keep-persistent-data-locations-unchanged).
-
-Explicit `OPENSTORAGE_PG_URL` / `OPENSTORAGE_S3_URL` / `--cache-dir` always win over the
-derivation. The path is made absolute at startup (git hooks re-exec the binary from a
-different working directory). Local mode is intentionally single-node — see ADR-13 in
-[local-backends notes](../archive/phases/11-local-backends-implementation-notes.md).
+- **Derives** every storage slot not set explicitly:
+  - database: `sqlite://<dir>/codestorage.db`
+  - packs: `file://<dir>/blobs`
+  - cache: `<dir>/cache`
+- Explicit `OPENSTORAGE_PG_URL` / `OPENSTORAGE_S3_URL` / `--cache-dir` always win.
+- The path is made absolute at startup (git hooks re-exec the binary from another
+  directory).
+- The `codestorage.db` filename is kept for on-disk compatibility: the binary reopens the
+  same database with no rename or migration. See the
+  [migration guide](../how-to/migrate-to-openstorage.md#3-keep-persistent-data-locations-unchanged).
+- Local mode is single-node by design; see ADR-13 in the
+  [local-backends notes](../archive/phases/11-local-backends-implementation-notes.md).
 
 ## Server identity and network
 
 ### `OPENSTORAGE_LISTEN`
 
-Listen address for the single HTTP listener (REST API + git smart-HTTP + `/healthz`).
-The `--listen` flag (or its legacy alias `--addr`) wins. **Default:** `127.0.0.1:0`
-(an ephemeral port, printed as `listening on ...` at startup).
+Address of the single HTTP listener (REST API, git smart-HTTP, `/healthz`).
+
+- **Default:** `127.0.0.1:0`, an ephemeral port printed as `listening on ...`.
+- The `--listen` flag (legacy alias `--addr`) wins.
 
 ### `OPENSTORAGE_ORG`
 
-**Required.** The organization name — the JWT `iss` claim every token must carry
-([auth spec](authentication.md)). `serve` always runs single-org mode: the REST API and
-the git smart-HTTP path authenticate against the same org-key verifier, and the org row is
-bootstrapped from this value at startup.
+**Required.** Organization name: the JWT `iss` claim every token must carry
+([auth spec](authentication.md)).
+
+- `serve` always runs single-org mode: REST and git smart-HTTP share one org-key verifier.
+- The org row is bootstrapped from this value at startup.
 
 ### `OPENSTORAGE_ORG_PUBKEYS`
 
-**Required.** Path to a PEM file with one or more public key blocks (PKIX) that verify the
-org's JWTs. Every block that PEM-decodes is validated at startup (must be a `PUBLIC KEY`
-block of a supported family) — but parsing stops silently at the first undecodable data, so
-a truncated block appended after a valid key is dropped rather than rejected. After a key
-rotation, verify a token signed with the newly added key is accepted instead of trusting
-startup success.
-Generate a keypair with [`openstorage keygen`](cli.md#openstorage-keygen); allowed JWS
-algorithms are `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512` (`none` and `HS*` are
-always rejected).
+**Required.** Path to a PEM file with one or more PKIX public key blocks that verify the
+org's JWTs.
+
+- Generate a keypair with [`openstorage keygen`](cli.md#openstorage-keygen).
+- **Allowed JWS algorithms:** `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512`. `none`
+  and `HS*` are always rejected.
+- **Validation:** each block that PEM-decodes must be a `PUBLIC KEY` block of a supported
+  family.
+- **Caveat:** parsing stops silently at the first undecodable data, so a truncated block
+  after a valid key is dropped, not rejected. After a rotation, check that a token signed
+  with the new key is accepted; startup success does not prove it.
 
 ### `OPENSTORAGE_BASE_URL`
 
-Externally reachable base URL (`http(s)://host[:port]`, no query/fragment; a trailing slash
-is stripped) used for the `http_url` values in API responses. **Default:** derived from the
-bound listener address — which is unroutable when binding `0.0.0.0`, so set this behind any
-real deployment or reverse proxy.
+Externally reachable base URL for `http_url` values in API responses.
+
+- **Default:** derived from the bound listener. That is unroutable when binding `0.0.0.0`,
+  so set this in any real deployment or behind a reverse proxy.
+- **Format:** `http(s)://host[:port]`, no query or fragment. A trailing slash is stripped.
 
 ## Rate limiting
 
 ### `OPENSTORAGE_RATE_RPS` / `OPENSTORAGE_RATE_BURST`
 
-Per-client-IP token-bucket rate limit applied to the REST surface **and** — with separate
-bucket state — the git smart-HTTP surface. Exceeding it yields `429` with `Retry-After`
-plus the IETF `RateLimit` header (`"default";r=0;t=<retry-after-secs>`), the pair
-documented upstream on every 429.
+Per-client-IP token-bucket rate limit for the REST surface **and** (with separate bucket
+state) the git smart-HTTP surface. Excess requests get `429` with `Retry-After` plus the
+IETF `RateLimit` header (`"default";r=0;t=<retry-after-secs>`), the pair documented
+upstream on every 429.
 
-- **Default:** both unset — limiting disabled.
-- **Constraints (fail-fast at startup):** `RPS` must be a non-negative finite number;
-  `BURST` a non-negative integer. Setting `RPS > 0` requires `BURST >= 1` and vice versa —
-  half-set pairs are startup errors. `RPS=0` with `BURST` unset/`0` explicitly disables.
-- The git surface raises bucket depths below 8 to 8: one git operation is several
-  smart-HTTP requests, and a burst too small for a complete exchange would make every
-  clone/fetch/push permanently fail.
-- Client identity defaults to the TCP `RemoteAddr`; forwarded headers are **not** trusted
-  unless `OPENSTORAGE_TRUSTED_PROXIES` is set. Behind a proxy that pools backend
-  connections, all clients otherwise share one bucket.
+- **Default:** both unset; limiting is disabled.
+- **Values** (fail-fast at startup):
+  - `RPS`: a non-negative finite number. `BURST`: a non-negative integer.
+  - `RPS > 0` requires `BURST >= 1`, and vice versa. Half-set pairs are startup errors.
+  - `RPS=0` with `BURST` unset or `0` explicitly disables.
+- **Git minimum burst:** the git surface raises depths below 8 to 8. One git operation is
+  several requests; a smaller burst would make every clone/fetch/push permanently fail.
+- **Client identity** is the TCP `RemoteAddr`. Forwarded headers are **not** trusted
+  unless `OPENSTORAGE_TRUSTED_PROXIES` is set; otherwise, behind a proxy that pools
+  backend connections, all clients share one bucket.
 
 ### `OPENSTORAGE_TRUSTED_PROXIES`
 
-Comma-separated CIDR allowlist (bare IPs accepted as single-address entries) of reverse
-proxies whose forwarded client identity the rate limiters may trust.
+Comma-separated CIDR allowlist of reverse proxies whose forwarded client identity the rate
+limiters may trust. Bare IPs count as single-address entries.
 
-- When the TCP peer is inside the allowlist, both limiters key buckets on the **rightmost
-  `X-Forwarded-For` hop that is not itself allowlisted**; otherwise (including malformed
-  `X-Forwarded-For`) they fall back to `RemoteAddr`.
-- **Default:** unset — `RemoteAddr`-only keying.
-- **Constraints:** validated at startup even while rate limiting is disabled. Empty
-  entries, zone-scoped addresses, and IPv4-mapped prefixes below `/96` are rejected;
-  IPv4-mapped entries are normalized to their IPv4 form.
-- **List only proxies that set or append `X-Forwarded-For` themselves** — trusting a proxy
-  that forwards client-supplied values verbatim lets any client mint fresh rate-limit
-  buckets.
+- **Default:** unset; buckets key on `RemoteAddr` only.
+- **Keying:** when the TCP peer is allowlisted, both limiters key on the **rightmost
+  `X-Forwarded-For` hop that is not itself allowlisted**. Otherwise (including malformed
+  `X-Forwarded-For`) they use `RemoteAddr`.
+- **Validation:** at startup, even while rate limiting is off. Rejects empty entries,
+  zone-scoped addresses, and IPv4-mapped prefixes below `/96`. IPv4-mapped entries are
+  normalized to IPv4.
+- **List only proxies that set or append `X-Forwarded-For` themselves.** A proxy that
+  forwards client-supplied values verbatim lets any client mint fresh buckets.
+
+## Egress policy
 
 ### `OPENSTORAGE_SYNC_ALLOW_PRIVATE`
 
-Unified sync egress policy for BOTH git transfer directions (ADR-45). `upstream_host` is
-caller-linked data, so every http(s) sync transfer — inbound pull-upstream fetches
-(`POST /repos/pull-upstream`, the first sync at `POST /repos`, freshness pokes) and
-outbound push forwards (`POST /repos/push-upstream`, `forward_pushes`) — routes through a
-dial-time vetting proxy that applies the same destination policy as webhook delivery:
-private, loopback, link-local, metadata, and special-purpose targets are denied, with
-every DNS answer re-resolved and vetted at connect time. A denied destination fails the
-run as `repository configuration error` (pull) / `invalid sync configuration` (push, no
-retry) and the upstream is never contacted. Registration (`POST /repos` with `base_repo`)
-additionally runs a fast-feedback courtesy check against the same pull-lane policy;
-dial-time enforcement stays authoritative.
+Unified egress policy for upstream sync in **both** directions (ADR-45).
 
-- `true` — both directions may target internal self-hosted forges
-  (RFC 1918/loopback/ULA/link-local). Cloud-metadata and special-purpose ranges stay
-  denied either way.
-- `false` — strict in both directions: only public upstreams are dialable.
-- **Unset (the transitional default):** pushes stay strict (the deprecated
-  [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) may relax
-  them), while pulls ALLOW private upstreams and `serve` logs a boot warning. Syncing
-  from internal forges is a mainstream released 0.6.x deployment shape, so this release
-  does not break it; **a future release flips the unset pull default to deny.** Set the
-  variable explicitly now: `true` to keep internal-forge pulls working across the flip,
-  `false` to adopt the strict policy early.
+- **Default:** unset (transitional; see below).
+- **Values:**
+  - `true`: both directions may target internal forges (RFC 1918, loopback, ULA,
+    link-local). Cloud-metadata and special-purpose ranges stay denied.
+  - `false`: strict both ways; only public upstreams are dialable.
+  - **Unset:** pushes stay strict (the deprecated
+    [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) may relax
+    them); pulls ALLOW private upstreams, and `serve` logs a boot warning.
+  - Malformed booleans are startup errors.
+- **Enforcement:** every http(s) sync transfer (`upstream_host` is caller-linked data)
+  dials through a vetting proxy with the webhook destination policy: private, loopback,
+  link-local, metadata, and special-purpose targets are denied, with every DNS answer
+  re-vetted at connect time.
+- **Covered:** pulls (`POST /repos/pull-upstream`, the first sync at `POST /repos`,
+  freshness pokes) and push forwards (`POST /repos/push-upstream`, `forward_pushes`).
+- **Denied destination:** the upstream is never contacted. Pulls fail as
+  `repository configuration error`; pushes fail as `invalid sync configuration`, with no
+  retry.
+- **Registration** (`POST /repos` with `base_repo`) also runs a courtesy check against the
+  pull policy. Dial-time enforcement stays authoritative.
 
-Migration notes (0.7.x): pull-upstream fetches previously had no destination policy.
-They now always dial through the vetting proxy, which also means ambient
-`HTTP_PROXY`/`HTTPS_PROXY` settings no longer apply to upstream fetches — the guard
-dials destinations directly, exactly like webhook delivery and push forwarding.
-Operators that require proxied egress must enforce an equivalent destination policy at
-that proxy; there is no supported way to chain the guard through an external proxy.
-Malformed boolean values are startup errors.
+> [!IMPORTANT]
+> A future release flips the unset pull default to **deny**. Set this explicitly now:
+> `true` keeps internal-forge pulls working across the flip; `false` adopts the strict
+> policy early.
+
+**Migration note (0.7.x):** pulls previously had no destination policy. They now always
+use the vetting proxy, which dials directly, so `HTTP_PROXY`/`HTTPS_PROXY` no longer apply
+to upstream fetches (same as webhooks and push forwarding). If you require proxied egress,
+enforce an equivalent destination policy at that proxy; the guard cannot be chained
+through an external proxy.
 
 ### `OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
 
-**Deprecated** push-only spelling of the sync egress policy, kept for released 0.6.x
-deployments. **Default: `false`.** When
-[`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) is unset, `true`
-relaxes the private receiver classes for outbound push forwards only (its historical
-meaning); when the unified variable is set, this one is ignored. Either state logs a
-boot-time deprecation notice naming the replacement.
+**Deprecated** push-only spelling of the sync egress policy, kept for 0.6.x deployments.
+
+- **Default:** `false`.
+- If [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) is unset, `true`
+  relaxes the private receiver classes for push forwards only.
+- If the unified variable is set, this one is ignored.
+- Either way, setting it logs a boot deprecation notice naming the replacement.
 
 ### `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`
 
-Controls the native webhook SSRF guard. **Default: `false`.** By default, webhook delivery
-rejects IANA special-purpose ranges, including loopback, RFC 1918, RFC 6598 shared,
-IPv4/IPv6 link-local, IPv6 ULA, translation/protocol anycast, documentation, benchmarking,
-reserved, unspecified, multicast, broadcast, and cloud-metadata targets. IPv4-mapped IPv6
-addresses are normalized before classification, so (for example) `::ffff:10.0.0.1` is private.
+Controls the native webhook SSRF guard.
 
-Registration performs the same target check against IP literals and the DNS answers visible
-at that moment as a fast-feedback courtesy. **Registration acceptance is not a reachability
-guarantee:** DNS may be unavailable or change after registration. Every delivery attempt is
-authoritatively re-resolved at dial time; all returned addresses must be allowed, and a
-resolution failure, empty answer, or mixed public/private answer fails the attempt through
-the normal retry/dead-letter path. The client connects to the vetted IP literal so DNS cannot
-be rebound between validation and connect.
+- **Default:** `false`. Delivery rejects IANA special-purpose ranges, including loopback,
+  RFC 1918, RFC 6598 shared, IPv4/IPv6 link-local, IPv6 ULA, translation/protocol
+  anycast, documentation, benchmarking, reserved, unspecified, multicast, broadcast, and
+  cloud-metadata targets. IPv4-mapped IPv6 is normalized first, so `::ffff:10.0.0.1` is
+  private.
+- **`true`** (Go boolean; logs a startup warning): admits loopback, RFC 1918, RFC 6598
+  shared, link-local, and ULA receivers. Use it only for intentionally internal webhooks.
+  It **still blocks** cloud metadata, unspecified/multicast/broadcast, other IANA
+  special-purpose ranges (documentation, benchmarking, reserved, translation,
+  protocol-anycast), and redirects.
+- Malformed booleans are startup errors.
 
-Webhook deliveries never follow redirects. `301`, `302`, `307`, and `308` responses are
-delivery failures, and the redirect target receives no request. The delivery transport also
-ignores `HTTP_PROXY` / `HTTPS_PROXY`: validating a proxy socket would not validate the URL
-target the proxy later connects to.
+How the guard is enforced:
 
-Set this variable to a Go boolean `true` only when webhooks intentionally target internal
-services. It admits loopback, RFC 1918, RFC 6598 shared, link-local, and ULA receivers,
-and logs a warning at startup. It **does not** permit cloud metadata, unspecified/multicast/
-broadcast addresses, other IANA special-purpose ranges (such as documentation, benchmarking,
-reserved, translation, or protocol-anycast space), or redirects. Malformed boolean values
-are startup errors.
+- **Registration** checks IP literals and the DNS answers visible at that moment, as fast
+  feedback only. **Acceptance is not a reachability guarantee:** DNS may fail or change
+  later.
+- **Every delivery attempt** re-resolves at dial time. All addresses must be allowed. A
+  resolution failure, empty answer, or mixed public/private answer fails the attempt
+  through the normal retry/dead-letter path.
+- The client connects to the vetted IP literal, so DNS cannot be rebound in between.
+- **No redirects:** `301`, `302`, `307`, and `308` are delivery failures; the target gets
+  no request.
+- Delivery ignores `HTTP_PROXY` / `HTTPS_PROXY`, since vetting a proxy socket would not
+  vet the proxy's final target.
 
 ## Secrets at rest
 
 ### `OPENSTORAGE_SECRETS_KEY`
 
-Enables application-level envelope encryption of the metadata database's secret columns:
-webhook HMAC signing secrets (`webhooks.secret`) and upstream-sync credential passwords
-(`git_credentials.password`). **Default: unset — those columns are stored plaintext** and
-the [production guide's](../how-to/deploy-production.md#backing-services) guidance to
-scope database access tightly and encrypt the database and its backups applies unchanged
-(it remains recommended defense-in-depth even with this variable set).
+Enables envelope encryption of the metadata database's secret columns: webhook HMAC
+signing secrets (`webhooks.secret`) and upstream-sync credential passwords
+(`git_credentials.password`).
 
-Format: a comma-separated list of base64-encoded 32-byte (AES-256) keys. The **first key
-encrypts every write**; the remaining keys are decrypt-only. Generate a key with:
+- **Default:** unset. **Those columns are stored plaintext.** Either way, follow the
+  [production guide](../how-to/deploy-production.md#backing-services): scope database
+  access tightly and encrypt the database and its backups.
+- **Format:** comma-separated base64-encoded 32-byte (AES-256) keys. The **first key
+  encrypts every write**; the rest are decrypt-only. Generate a key with:
 
 ```sh
 head -c 32 /dev/urandom | base64
 ```
 
-Values are stored as `enc:v1:<keyid>:<base64 nonce+ciphertext>` (AES-256-GCM), where
-`<keyid>` is the first 8 hex characters of the key's SHA-256 fingerprint — public, safe to
-log, and usable in SQL to audit rotation progress. Rows written before encryption was
-enabled stay readable and are transparently re-encrypted the next time they are read
-(webhook deliveries, credential use, and list/get API calls all count) — including any
-legacy plaintext value that happens to start with `enc:`, which reads verbatim and is
-migrated into a real envelope. To keep new values unambiguous, the API rejects new webhook
-secrets and credential passwords starting with the reserved prefix `enc:` (HTTP 400) — in
-plaintext mode too.
+- **Validation:** a malformed list (bad base64, wrong length, duplicate or empty entries)
+  is a startup error.
+- **Set the same value on every replica.** Hook subprocesses inherit it from `serve`.
+- **Startup log:** `secrets at-rest encryption enabled`, with mode, key count, and active
+  fingerprint. Key material never appears in logs or errors.
+- **Stored format:** `enc:v1:<keyid>:<base64 nonce+ciphertext>` (AES-256-GCM). `<keyid>`
+  is the first 8 hex characters of the key's SHA-256 fingerprint: public, safe to log,
+  and usable in SQL to audit rotation.
+- **Existing plaintext rows** stay readable and are re-encrypted on their next read
+  (webhook deliveries, credential use, list/get API calls). A legacy plaintext value that
+  happens to start with `enc:` reads verbatim and migrates too.
+- **Reserved prefix:** the API rejects new webhook secrets and credential passwords
+  starting with `enc:` (HTTP 400), in plaintext mode too.
+- **Missing key:** reading a row without the key that wrote it is a request-time error
+  naming the row and key fingerprint, never a silent passthrough.
+- **Recovery never needs the lost key.** An undecryptable webhook is listed without its
+  secret and only its deliveries fail. Replacing (`PUT`) or deleting a credential, and
+  deleting and re-registering a webhook, work on undecryptable rows.
 
-**Enabling on a multi-replica fleet.** A rolling restart applies any environment change
-one replica at a time, so enablement is staged so that no envelope is ever written before
-every process can decrypt it (a single-replica deployment, e.g. local mode, can skip
-straight to step 3):
+> [!WARNING]
+> - Removing the variable while encrypted rows exist makes them unreadable. Keep the key
+>   list stable once enabled, and back the keys up outside the database.
+> - Binaries that predate this variable read `enc:v1:` envelopes verbatim: they sign
+>   webhooks with the ciphertext or send it as an upstream password, failing silently.
+>   Upgrade every node before setting the key anywhere, and do not roll back to such a
+>   binary while encrypted rows exist.
 
-1. **Binary first:** deploy an envelope-aware binary to *every* node — serve replicas and
-   hook-running git nodes — with `OPENSTORAGE_SECRETS_KEY` unset. Plaintext behavior is
-   unchanged (see the upgrade-ordering note below for why this must come first).
-2. **Stage the key, decrypt-only:** set `OPENSTORAGE_SECRETS_KEY` together with
-   [`OPENSTORAGE_SECRETS_MODE=decrypt-only`](#openstorage_secrets_mode) fleet-wide. Every
-   process loads the key for reading but keeps writing plaintext and performs no rewrites,
-   so replicas restarted earlier never produce a value the rest cannot read.
-3. **Switch to encrypt:** once every replica runs with the staged key, drop
-   `OPENSTORAGE_SECRETS_MODE` (or set it to `encrypt`) fleet-wide. Encrypted writes and
-   lazy re-encryption begin; replicas restarted earlier in this rollout write envelopes
-   the not-yet-restarted ones already decrypt, courtesy of step 2.
+**Enable on a multi-replica fleet.** Stage the rollout so no envelope exists before every
+process can decrypt it. A single replica (e.g. local mode) can skip to step 3.
 
-Alternatively, a drained/atomic cutover (stop all replicas, set the key, start) collapses
-steps 2–3.
+1. **Binary first.** Deploy an envelope-aware binary to *every* node (serve replicas and
+   hook-running git nodes) with `OPENSTORAGE_SECRETS_KEY` unset.
+2. **Stage the key.** Set `OPENSTORAGE_SECRETS_KEY` and
+   [`OPENSTORAGE_SECRETS_MODE=decrypt-only`](#openstorage_secrets_mode) fleet-wide.
+   Processes can decrypt but still write plaintext and rewrite nothing.
+3. **Encrypt.** Once every replica has the key, drop `OPENSTORAGE_SECRETS_MODE` (or set
+   `encrypt`) fleet-wide. Encrypted writes and lazy re-encryption begin.
 
-**Key rotation.** The same staging applies when introducing a new key — no process may
-ever encounter a key it cannot decrypt:
+A drained cutover (stop all replicas, set the key, start) collapses steps 2–3.
 
-1. **Stage the new key fleet-wide, as a decrypt-only list entry:**
-   `OPENSTORAGE_SECRETS_KEY="<old-key>,<new-key>"`. Writes still use the old key, but
-   every restarted process can already decrypt both, so ordering within the rollout does
-   not matter.
-2. **Promote, fleet-wide:** `OPENSTORAGE_SECRETS_KEY="<new-key>,<old-key>"`. Replicas
-   restarted earlier keep decrypting new-key rows because step 1 listed it everywhere.
-3. **Rewrite and verify, then drop the old key** (below).
+**Rotate a key.** A single replica can skip step 1 (one restart swaps the list).
 
-A single-replica deployment can skip step 1 — one restart swaps the whole list atomically.
-
-Reads decrypt with whichever listed key wrote the row and re-encrypt it under the new
-active key. To force full re-encryption instead of waiting for organic reads, touch every
-row once — list the org's webhooks (`GET /api/v1/webhooks`) and, per repo with a stored
-credential, trigger a sync (`POST /api/v1/repos/pull-upstream`) or re-`PUT` the
-credential. Verify progress directly:
+1. **Stage** fleet-wide: `OPENSTORAGE_SECRETS_KEY="<old-key>,<new-key>"`. Writes still
+   use the old key; rollout order does not matter.
+2. **Promote** fleet-wide: `OPENSTORAGE_SECRETS_KEY="<new-key>,<old-key>"`.
+3. **Re-encrypt, verify, then drop the old key.** Each read re-encrypts a row under the
+   new key. To avoid waiting, touch every row: list the org's webhooks
+   (`GET /api/v1/webhooks`) and, per repo with a stored credential, trigger a sync
+   (`POST /api/v1/repos/pull-upstream`) or re-`PUT` the credential. Check progress:
 
 ```sql
 SELECT count(*) FROM webhooks        WHERE secret   NOT LIKE 'enc:v1:<new-keyid>:%';
 SELECT count(*) FROM git_credentials WHERE password NOT LIKE 'enc:v1:<new-keyid>:%';
 ```
 
-When both counts reach zero, drop the old key from the list.
-
-Failure modes are fail-closed and named: a malformed key list (bad base64, wrong length,
-duplicate or empty entries) is a startup error; reading an encrypted row without the key
-that wrote it is a request-time error naming the row and key fingerprint — never a silent
-plaintext or ciphertext passthrough. Removing the variable entirely while encrypted rows
-exist makes those rows unreadable (same error), so keep the key list stable once enabled
-and back the keys up outside the database. Recovery never requires the lost key: webhook
-listings and event fan-out stay up (an undecryptable webhook is listed with its secret
-omitted and only its own deliveries fail), and replacing a credential's password (`PUT`)
-or deleting it, and deleting + re-registering a webhook, work on undecryptable rows —
-those paths never read the stored value. Startup logs one line
-(`secrets at-rest encryption enabled`) with the mode, key count, and active fingerprint;
-key material never appears in logs or errors.
-
-Hook subprocesses and every replica must see the same value — it is read from the
-environment by the serve process and inherited by the re-executed hook binary, so no extra
-plumbing is needed beyond setting it consistently across replicas.
-
-**Upgrade ordering (mixed fleets).** Binaries that predate this variable do not understand
-the `enc:v1:` envelope: they would read it verbatim and sign webhook deliveries with the
-ciphertext string (or present it as an upstream password), producing invalid deliveries
-and failed syncs with no error. That is why enablement step 1 above requires every node to
-run an envelope-aware binary before the key is set anywhere. The same constraint applies
-in reverse: rolling back to a pre-envelope binary while encrypted rows exist silently
-misuses them — decrypt requirements do not roll back with the binary.
+When both counts are zero, remove the old key from the list.
 
 ### `OPENSTORAGE_SECRETS_MODE`
 
-Staging switch for [`OPENSTORAGE_SECRETS_KEY`](#openstorage_secrets_key). **Default:
-`encrypt`** (normal operation). `decrypt-only` loads the key list for reading but keeps
-writing plaintext and performs no lazy rewrites — the first-enable staging mode described
-above, used while a rolling restart distributes the key so that no envelope exists before
-every replica can decrypt it. Setting `decrypt-only` without `OPENSTORAGE_SECRETS_KEY`,
-or any other value, is a startup error. Do not run `decrypt-only` indefinitely: it stores
-new secrets plaintext.
+Staging switch for [`OPENSTORAGE_SECRETS_KEY`](#openstorage_secrets_key).
+
+- **Default:** `encrypt` (normal operation).
+- **`decrypt-only`:** loads the keys for reading but writes plaintext and does no lazy
+  rewrites. Use it only while a rolling restart distributes the key; it stores new
+  secrets plaintext.
+- **Validation:** `decrypt-only` without `OPENSTORAGE_SECRETS_KEY`, or any other value, is
+  a startup error.
 
 ## Pack quota
 
 ### `OPENSTORAGE_PACK_QUOTA_BYTES`
 
-Per-repository storage-bytes quota enforced at every external storage writer: git pushes
-that would grow a repo's `packs/` usage past the quota are refused at pre-receive before
-anything is stored, REST pack writes (commit-pack, merge, notes, fork) are refused with
-a `403` envelope, and Git LFS uploads ([#51](https://github.com/coder/openstorage/issues/51))
-are refused with per-object `507` batch errors before any transfer URL is issued (the
-verified upload transfer re-checks the actual `Content-Length`, so under-declared batch
-sizes cannot bypass the gate).
+Per-repository storage quota (packs + LFS), enforced at every external storage writer.
 
 - **Default:** 10 GiB (`10737418240`). **`0` disables enforcement**; negative or malformed
   values are startup errors.
-- **Namespace roll-up:** a repository and its `+ephemeral` / `+import` namespaces
-  ([git protocol](../explanation/git-protocol-and-namespaces.md)) share one quota, accounted against the
-  base repository. LFS objects always store under the base repository's prefix.
-- Admission is a durable reservation ledger in the ref store, atomic across concurrent
-  pushes and replicas: two pushes that individually fit but together exceed the quota —
-  exactly one wins. LFS uploads charge the same ledger (an advisory batch fast-fail,
-  then a durable reserve at the verified upload, settled at
-  verified upload completion). Independent of bytes, two compiled population bounds
-  (like the repack fold budgets) keep tiny declared sizes from growing the shared
-  database: each repository is capped at 10,000 **active reservation rows** (excess
-  batches answer transient `429`s until rows settle or expire; admission also prunes the
-  repo's expired rows itself, so the physical table stays bounded even with sweeping
-  disabled) and at 100,000 **registered LFS objects** (excess answers `507` naming the
-  limit; re-publication of already-registered objects is exempt). These apply even with
-  the byte quota disabled.
-- Background repack maintenance is **not** quota-gated (an at-quota repository could never
-  compact itself otherwise), and repack preserves the registered object set — it does not
-  reclaim unreachable objects. LFS downloads are never quota-gated.
+- **Where it is enforced:**
+  - Git pushes that would grow `packs/` past the quota: refused at pre-receive, before
+    anything is stored.
+  - REST pack writes (commit-pack, merge, notes, fork): `403` envelope.
+  - Git LFS uploads: per-object `507` batch errors before any transfer URL is issued. The
+    verified upload re-checks the actual `Content-Length`, so under-declared sizes cannot
+    bypass it.
+- **Namespaces:** a repo and its `+ephemeral` / `+import` namespaces
+  ([git protocol](../explanation/git-protocol-and-namespaces.md)) share the base repo's
+  quota. LFS objects always store under the base repo's prefix.
+- **Admission** uses a durable reservation ledger in the ref store, atomic across pushes
+  and replicas: of two pushes that fit alone but not together, exactly one wins. LFS
+  charges it too (advisory batch check, then a durable reserve at the verified upload).
+- **Population bounds** (compiled in, like the repack fold budgets; apply even with the
+  byte quota off):
+  - 10,000 **active reservation rows** per repo. Excess batches get transient `429`s until
+    rows settle or expire. Admission prunes the repo's expired rows itself, so the table
+    stays bounded even with sweeping off.
+  - 100,000 **registered LFS objects** per repo. Excess gets `507` naming the limit;
+    re-publishing registered objects is exempt.
+- **Never quota-gated:** background repack (so an at-quota repo can still compact) and LFS
+  downloads. Repack keeps the registered object set; it does not reclaim unreachable
+  objects.
 
 ### `OPENSTORAGE_LFS_STAGING_BYTES`
 
-Node-wide cap on the aggregate bytes of Git LFS uploads staging on one replica at a
-time. LFS uploads go through the verified proxy transfer
-([#51](https://github.com/coder/openstorage/issues/51)) and stage their full body
-under the replica's `$TMPDIR` before verification and publication — the
-per-repository quota above bounds neither the node (it is per repo) nor anything when
-disabled, so this is the replica's disk-protection bound. The budget is charged
-incrementally as body bytes actually arrive (a stalled upload holds only slightly more
-than it has transferred, not its declared `Content-Length`), and each repository's
-staged bytes are held to a fair share that scales with the budget's free capacity, so
-one repository's uploads cannot occupy the whole replica budget. Uploads that do not
-fit right now answer `429` with `Retry-After` + `RateLimit`; an object whose declared size exceeds
-the largest hold a single repository can ever reach — one third of the budget —
-answers `413`.
+Per-replica cap on the total bytes of in-flight LFS uploads. Uploads (the verified proxy
+transfer) stage their full body under `$TMPDIR` before verification and publication. This
+bound protects the replica's disk, which the per-repo quota does not.
 
-- **Default:** 32 GiB (`34359738368`). The budget is a **working set, not an
-  object-size cap**: because a single repository's hold tops out at a third of the
-  budget, supporting objects of size `S` needs a budget of about `3 × S` — the default
-  keeps one default-quota-sized (10 GiB) object stageable with cross-repository
-  capacity intact. **`0` disables the bound**; negative or malformed values are
-  startup errors.
-- Size it below the free space you guarantee `$TMPDIR`, minus headroom for git push
-  quarantines and fork closures, which stage there too.
-- Each object additionally allows only one in-flight upload per replica (concurrent
-  identical PUTs answer `429`), and an upload body is aborted — releasing its capacity —
-  when it delivers no bytes for a full minute **or** outlives the
-  [reservation TTL](#openstorage_pack_reservation_ttl) in total (an upload slower than
-  the TTL's implied floor — ~3 MB/s for 10 GiB at the defaults — cannot finish before
-  its admission reservation expires anyway).
+- **Default:** 32 GiB (`34359738368`). **`0` disables the bound**; negative or malformed
+  values are startup errors.
+- **A working set, not an object-size cap.** One repo can hold at most a third of the
+  budget, so objects of size `S` need a budget of about `3 × S`. The default fits one
+  10 GiB (default-quota-sized) object with cross-repo capacity left.
+- **Sizing:** keep it below the free space guaranteed in `$TMPDIR`, minus headroom for git
+  push quarantines and fork closures, which stage there too.
+- **Charging:** bytes are charged as they arrive, so a stalled upload holds little more
+  than it has transferred, not its declared `Content-Length`. Each repo is held to a fair
+  share that scales with free capacity.
+- **Responses:**
+  - Does not fit right now: `429` with `Retry-After` + `RateLimit`.
+  - Declared size above a third of the budget: `413`.
+  - A second concurrent upload of the same object on one replica: `429`.
+- **Aborts:** an upload is aborted, freeing capacity, after a full minute with no bytes
+  **or** when it outlives the [reservation TTL](#openstorage_pack_reservation_ttl). An
+  upload that slow (~3 MB/s for 10 GiB at defaults) could not beat its reservation's
+  expiry anyway.
 
 ### `OPENSTORAGE_LFS_V020_WRITE_COMPAT`
 
-Registered LFS objects live at a canonical key old presigned upload URLs cannot
-address ([ADR-41](../adr/041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md));
-replicas running v0.2.0 or older derive only the legacy single-key spelling and
-cannot see canonically stored objects. During a rolling upgrade from v0.2.0, set
-this on the **upgraded** replicas so every verified LFS publication is also copied
-to the legacy key — not-yet-upgraded replicas keep serving those objects for the
-duration of the roll. The bridge is enforced, not best-effort: an upload whose
-compat copy fails answers `502` (the canonical object is already durable and
-registered — the client's retry is zero-growth and repairs the copy), and
-write-scoped touches of registered objects repair a missing legacy spelling.
-Drop the variable once the whole fleet is upgraded: the
-compat copies are rowless, so the [orphan sweep](../how-to/storage-lifecycle-and-sweeping.md)
-reclaims them under its LFS opt-in.
+Rolling-upgrade bridge from v0.2.0. Registered LFS objects live at a canonical key
+([ADR-41](../adr/041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md))
+that old presigned upload URLs cannot address and v0.2.0-and-older replicas cannot see.
+Set this on **upgraded** replicas to also copy every verified LFS publication to the
+legacy key, so old replicas keep serving objects during the roll.
 
-- **Default:** `false`. The canonical spelling is the secure one — the compat
-  copies are exactly as exposed to still-valid legacy upload URLs as everything
-  v0.2.0 served — so compat is opt-in and meant to be temporary.
-- **Cannot be combined with [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs)
-  while a sweep schedule is active** (`OPENSTORAGE_SWEEP_INTERVAL` > 0 — a
-  fail-fast startup error; with the interval at `0` no schedule is built, the
-  delete flag is inert, and the fleet-wide sweep emergency stop stays
-  available): the flag declares a mixed v0.2.0 fleet, and during
-  that roll destructive LFS sweeping must be off **fleet-wide** — the in-place row
-  migration makes a touched object's legacy blob rowless to an old binary's
-  sweeper, which has no legacy gate and reaps it immediately, breaking
-  old-replica reads. The tripwire covers upgraded nodes; set
-  `CODESTORAGE_SWEEP_DELETE_LFS=false` on pre-0.15 nodes yourself before rolling
-  (those binaries do not recognize the new prefix).
-- With a [storage quota](#openstorage_pack_quota_bytes) enforced, the bridge copy
-  passes real quota admission: each fresh upload effectively costs twice its size
-  for the roll's duration, and an upload whose bridge would exceed the quota
-  answers `507` instead of overshooting (the canonical object stays registered;
-  freeing space lets a retry repair the bridge).
+- **Default:** `false`. The canonical spelling is the secure one; compat copies are exposed
+  to still-valid legacy upload URLs, like everything v0.2.0 served. Keep it temporary.
+- **Enforced:** if the compat copy fails, the upload answers `502`. The canonical object is
+  already registered, so the retry is zero-growth and repairs the copy. Write-scoped
+  touches of registered objects also repair a missing legacy copy.
+- **Quota:** with a [quota](#openstorage_pack_quota_bytes) enforced, the copy is charged
+  normally, so each fresh upload costs about twice its size during the roll. If the copy
+  would exceed the quota, the upload answers `507`; the canonical object stays registered,
+  and a retry after freeing space repairs the copy.
+- **After the roll:** drop the variable once the whole fleet is upgraded. The rowless
+  copies are reclaimed by the [orphan sweep](../how-to/storage-lifecycle-and-sweeping.md)
+  under its LFS opt-in.
+
+> [!WARNING]
+> Destructive LFS sweeping must be off **fleet-wide** during a v0.2.0 roll: an old
+> binary's sweeper has no legacy gate and would reap migrated objects' legacy blobs,
+> breaking old-replica reads.
+> - Combining this flag with [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs)
+>   while a sweep schedule is active (`OPENSTORAGE_SWEEP_INTERVAL` > 0) is a startup
+>   error. With the interval at `0`, no schedule runs, the delete flag is inert, and the
+>   fleet-wide emergency stop stays available.
+> - That check runs only on upgraded nodes. On pre-0.15 nodes, set
+>   `CODESTORAGE_SWEEP_DELETE_LFS=false` yourself before rolling; they do not read the new
+>   prefix.
 
 ### `OPENSTORAGE_PACK_RESERVATION_TTL`
 
-How long a crashed writer's quota reservation keeps gating admission (Go duration, e.g.
-`30m`, `2h`). Admission ignores rows older than the TTL immediately; the sweeper's
-periodic pruning of expired rows is garbage collection, not what re-opens headroom.
+How long a crashed writer's quota reservation keeps gating admission.
 
-- **Default:** `1h`. **Constraints:** must be greater than 60 seconds — the 30-second
-  usage-floor cache lifetime plus the 30-second admission handoff margin — and the
-  server refuses smaller values at startup. A zero TTL would expire live reservations
-  instantly, and a TTL at or below the floor's freshness budget would let a cached
-  usage listing (plus the admission call it feeds) outlive the reservations covering
-  uploads published after it, silently reopening the overshoot the ledger closes.
-- Must comfortably exceed the longest plausible server-side pack upload — the default
-  clears a default-quota-sized (10 GiB) upload at ~3 MB/s.
-- LFS upload reservations (charged durably at the verified upload, right before its
-  bytes publish; the batch check is advisory and holds nothing) use the same TTL, so it
-  must cover an object's publication and registration tail, not the client's transfer
-  time.
+- **Default:** `1h`.
+- **Values:** a Go duration (e.g. `30m`, `2h`) greater than 60 seconds (the 30-second
+  usage-floor cache lifetime plus the 30-second admission handoff margin). Smaller values
+  fail startup; they could silently reopen quota overshoot.
+- **Sizing:** comfortably exceed the longest server-side pack upload. The default covers a
+  10 GiB upload at ~3 MB/s.
+- **LFS** reservations use the same TTL. They are charged at the verified upload, just
+  before publish (the batch check holds nothing), so the TTL must cover publication and
+  registration, not the client's transfer.
+- Admission ignores expired rows immediately; the sweeper's pruning is only garbage
+  collection.
 
 ## Push work bounds
 
 ### `OPENSTORAGE_MAX_PUSH_BYTES`
 
-Decoded-byte cap on one git push: a `git-receive-pack` request whose body — after any
-`Content-Encoding: gzip` decode, so compressed streams cannot smuggle a larger payload —
-exceeds this many bytes is rejected with `413` and a JSON error envelope. Only bytes
-**up to the cap** can ever reach `git receive-pack` (a declared oversize is rejected
-without reading at all), so per-push disk and decode work is bounded by the cap: git
-discards the truncated partial quarantine when the stream is cut, and nothing is
-published or registered on the overflow path. This is the native pre-storage push bound
-([#55](https://github.com/coder/openstorage/issues/55)); the pack quota above bounds
-*retained* storage and runs only after a push has fully streamed to the replica's disk.
-(Degenerate exception: a *complete, valid* push padded with trailing junk past the cap
-still answers `413`, but its hooks already ran under the normal quota admission.)
+Cap on one git push's decoded body size. A `git-receive-pack` body over the cap, counted
+after any `Content-Encoding: gzip` decode, is rejected with `413` and a JSON error
+envelope.
 
-- **Default:** 2 × [`OPENSTORAGE_PACK_QUOTA_BYTES`](#openstorage_pack_quota_bytes), with
-  a 2 MiB minimum — a push cannot legitimately need more than quota admission would
-  accept plus protocol overhead, and the floor keeps delete-only/zero-growth pushes (the
-  over-quota recovery path) working under byte-scale quotas. Disabling the quota (`0`)
-  also disables the derived cap; an explicit value is taken verbatim (no floor); set
-  this variable explicitly to keep a cap without a quota. **`0` disables the cap**;
-  negative or malformed values are startup errors.
-- Applies to git pushes only, including the upstream-sync worker's loopback pushes.
-  Fetches/clones (`upload-pack`) and LFS object transfers are unaffected.
-- Gzip request bodies are additionally bounded on the **compressed** side at the cap
-  plus ~6% + 4 KiB of framing allowance (streams that decompress to almost nothing
-  cannot otherwise be bounded by a decoded count). Single-member streams — what git
-  clients send — never approach it; the 413 envelope names both bounds.
+- **Default:** 2 × [`OPENSTORAGE_PACK_QUOTA_BYTES`](#openstorage_pack_quota_bytes), at
+  least 2 MiB. The floor keeps delete-only/zero-growth pushes (the over-quota recovery
+  path) working under byte-scale quotas.
+- **Values:** **`0` disables the cap**; negative or malformed values are startup errors.
+  An explicit value is used verbatim (no floor).
+- Disabling the quota (`0`) also disables the derived cap. To keep a cap without a quota,
+  set this explicitly.
+- **Scope:** git pushes only, including the sync worker's loopback pushes. Fetches,
+  clones (`upload-pack`), and LFS transfers are unaffected.
+- **Bounded work:** only bytes up to the cap reach `git receive-pack`; a declared oversize
+  is rejected unread. Git discards the truncated quarantine, and nothing is published or
+  registered. (The pack quota
+  bounds *retained* storage, after the push has streamed to disk.)
+- **Gzip bodies** are also capped on the **compressed** side at the cap + ~6% + 4 KiB.
+  Git clients' single-member streams never approach it. The 413 envelope names both
+  bounds.
+- **Edge case:** a *complete, valid* push padded with junk past the cap still gets `413`,
+  but its hooks already ran under normal quota admission.
 
 ### `OPENSTORAGE_VERIFY_SIG_BUDGET`
 
-Per-push budget for `verify-sig` signature verifications
-([#59](https://github.com/coder/openstorage/issues/59)): the maximum number of commits
-one push may verify — each verification spawns a `git verify-commit` subprocess — across
-all its refs, pre-receive evaluation and update hooks combined. A ref update that would
-exceed the remaining budget is rejected fail-closed **before** the excess verifications
-run, with an error naming this variable. Rejection follows git's normal per-ref
-semantics, like every other policy denial: on a plain multi-ref push only the
-over-budget ref updates are denied (refs whose commits fit the budget can still land),
-while `git push --atomic` rejects the whole push on the first denial.
+Per-push cap on `verify-sig` signature verifications: how many commits one push may verify
+across all refs, pre-receive evaluation and update hooks combined. Each verification spawns
+a `git verify-commit` subprocess.
 
-- **Default:** `10000`. **`0` disables the budget**; negative or malformed values are
-  startup errors.
-- The budget is charged per unique commit actually verified: within one push, verdicts
-  are cached per commit and whole ranges are deduplicated across refs, so pushing many
-  refs over the same history costs each commit one verification.
-- Branch creation verifies **everything reachable** from the new tip — per the
-  branch-protection contract the comparison is against the ref's own prior tip, never
-  against other refs — so creating a ref over a deep signature-verified history is the
-  worst case this budget bounds. Raise it deliberately before importing histories deeper
-  than the budget under a `verify-sig` policy: such pushes are rejected fail-closed with
-  an error naming this variable.
-- The budget also derives a per-push **history-walk allowance** of 100 × its value:
-  every commit a walk examines (cached verdicts included) counts, and each ref
-  evaluation is additionally charged a small fee for the per-push verification state it
-  loads — so many refs re-walking or merely re-loading cached results are bounded too.
-  `0` disables all of these bounds.
+- **Default:** `10000`. **`0` disables the budget** and the walk allowance below; negative
+  or malformed values are startup errors.
+- **Over budget:** the ref update is rejected fail-closed **before** the excess
+  verifications run, with an error naming this variable. Normal per-ref semantics apply:
+  a plain multi-ref push denies only over-budget refs, while `git push --atomic` rejects
+  the whole push.
+- **Charging:** once per unique commit verified. Verdicts are cached and ranges are
+  deduplicated across refs within a push.
+- **Worst case:** branch creation verifies **everything reachable** from the new tip (per
+  the branch-protection contract, it compares against the ref's own prior tip, never other
+  refs). Raise the budget before importing histories deeper than it under a `verify-sig`
+  policy.
+- **Walk allowance:** 100 × the budget per push. Every commit a walk examines counts
+  (cached verdicts included), plus a small fee per ref evaluation for the verification
+  state it loads.
 
 ## Maintenance jobs
 
 Background jobs run through a queue seam: durable [River](https://riverqueue.com) jobs on
-Postgres, in-process in local mode.
+Postgres, in-process in local mode. For procedures and run reports, see
+[Operate the storage lifecycle](../how-to/storage-lifecycle-and-sweeping.md).
 
 ### `OPENSTORAGE_SWEEP_INTERVAL`
 
-Interval between orphan-pack sweeps (Go duration). The sweeper diffs the blob store's
-`packs/` and `lfs/` listings against their authoritative registries and reports — and
-only when explicitly enabled, deletes — unregistered blobs older than the age threshold.
-It also prunes expired quota reservations on the same cadence.
+Interval between orphan sweeps. The sweeper diffs the blob store's `packs/` and `lfs/`
+listings against their registries and reports unregistered blobs older than the age
+threshold. It deletes them only when explicitly enabled. It also prunes expired quota
+reservations on the same cadence.
 
-- **Default:** `1h`. **`0` disables sweeping** (a strictly restorative quarantine-heal pass
-  still runs once at startup, and an hourly background janitor keeps reconciling
-  legacy/canonical LFS registry-row twins that mixed-version rollouts can strand after
-  startup — without it a duplicate row would double-charge usage and the object cap
-  indefinitely); negative values are startup errors.
+- **Default:** `1h`. **Values:** a Go duration; negative values are startup errors.
+- **`0` disables sweeping.** Two things still run:
+  - a strictly restorative quarantine-heal pass, once at startup;
+  - an hourly janitor that reconciles legacy/canonical LFS registry-row twins that
+    mixed-version rollouts can strand. Without it, a duplicate row would double-charge
+    usage and the object cap indefinitely.
 
 ### `OPENSTORAGE_SWEEP_AGE_THRESHOLD`
 
-Minimum blob age before an unregistered pack counts as an orphan (Go duration). The
-threshold is the only concurrency guard needed: in-flight pushes register their packs
-within a request timeout, far below any sane threshold.
+Minimum blob age before an unregistered pack counts as an orphan.
 
-- **Default:** `24h`. **Constraints:** must be positive.
+- **Default:** `24h`. **Values:** a positive Go duration.
+- This is the only concurrency guard needed: in-flight pushes register their packs within
+  a request timeout, far below any sane threshold.
 
 ### `OPENSTORAGE_SWEEP_DELETE_ENABLED`
 
-Opt-in delete mode for **general** orphans. `false` (the default) is list-only: candidates
-are logged, nothing is deleted. Deletes copy each blob to a quarantine key first, and every
-sweep starts with a heal pass that restores any registered-but-missing pack from
-quarantine — so a rollback to list-only still repairs a delete-enabled crash.
+Opt-in delete mode for **general** orphans.
 
-- **Default:** `false`. **Constraints:** must parse as a boolean.
-- **Fleet-upgrade prerequisite:** enable only once **every** node — serve replicas *and*
-  hook-running git nodes — runs a build with the post-registration publish verify
-  (`blob.EnsurePublished`). A mixed fleet cannot lose data (quarantine plus the heal pass
-  restore any mis-reaped registered pack), but an old writer racing a delete-mode sweep can
-  see its freshly registered pack unavailable until the next sweep heals it. List-only mode
-  is safe on any fleet.
+- **Default:** `false`: list-only. Candidates are logged; nothing is deleted.
+  **Values:** a boolean.
+- **Quarantine first:** each deleted blob is copied to a quarantine key first. Every sweep
+  starts with a heal pass that restores registered-but-missing packs from quarantine, so
+  rolling back to list-only still repairs a delete-enabled crash.
+- **Fleet prerequisite:** enable only when **every** node (serve replicas *and*
+  hook-running git nodes) runs a build with the post-registration publish verify
+  (`blob.EnsurePublished`). On a mixed fleet no data is lost, but an old writer's new pack
+  can be unavailable until the next sweep heals it. List-only is safe on any fleet.
 - **S3 versioning:** on a bucket with versioning enabled or suspended, deletes only write
-  delete markers while every version stays stored and billed. Startup **fails** when delete
-  mode is enabled against such a bucket (or when versioning cannot be verified — grant
-  `s3:GetBucketVersioning` or stay list-only), and every delete-mode sweep re-checks at
-  runtime, downgrading itself to list-only on drift.
+  delete markers; every version stays stored and billed. Startup **fails** when delete
+  mode meets such a bucket, or when versioning cannot be verified (grant
+  `s3:GetBucketVersioning` or stay list-only). Each delete-mode sweep re-checks and
+  downgrades itself to list-only on drift.
 
 ### `OPENSTORAGE_SWEEP_DELETE_SUPERSEDED`
 
-Delete mode for the **narrow superseded-by-repack** class: blobs whose registry rows a
-repack fold provably removed (durable `pack_retained` records) are reaped after the age
-threshold and their retained bytes returned to the repo's quota headroom.
+Delete mode for the narrow **superseded-by-repack** class: blobs whose registry rows a
+repack fold provably removed (durable `pack_retained` records). They are reaped after the
+age threshold, and their bytes return to the repo's quota headroom.
 
-- **Default:** `true` (`false` disables). **Constraints:** must parse as a boolean.
-- Unlike the general delete opt-in above, a versioned S3 bucket does not fail startup —
-  each sweep run downgrades to list-only instead (the heal pass still runs).
+- **Default:** `true` (`false` disables). **Values:** a boolean.
+- **Versioned S3 bucket:** does not fail startup, unlike the general opt-in. Each sweep
+  run downgrades to list-only instead; the heal pass still runs.
 
 ### `OPENSTORAGE_SWEEP_DELETE_LFS`
 
-Delete mode for **LFS orphans**: `lfs/` blobs with no LFS registry row, older than the
-age threshold. Deliberately separate from `OPENSTORAGE_SWEEP_DELETE_ENABLED`: the LFS
-registry ships with [#51](https://github.com/coder/openstorage/issues/51), so **every
-LFS object uploaded by an older build has no row** and would classify as an orphan —
-a fleet already running general deletes must not reap its pre-existing LFS population
-on upgrade. Stored objects are adopted into the registry by write-scoped touches
-(upload batches naming them, re-uploads of the same content).
+Delete mode for **LFS orphans**: `lfs/` blobs with no LFS registry row, older than the age
+threshold.
 
-- **Default:** `false` (list-only). **Constraints:** must parse as a boolean.
-- Enable only after list-only [sweep reports](../how-to/storage-lifecycle-and-sweeping.md#lfs-orphans-and-pre-registry-objects)
+- **Default:** `false` (list-only). **Values:** a boolean.
+- **Separate from `OPENSTORAGE_SWEEP_DELETE_ENABLED` on purpose:** every LFS object
+  uploaded by a build older than the LFS registry
+  ([#51](https://github.com/coder/openstorage/issues/51)) has no row and would look
+  orphaned. Write-scoped touches (upload batches naming an object, re-uploads of the same
+  content) adopt stored objects into the registry.
+- Enable only after list-only
+  [sweep reports](../how-to/storage-lifecycle-and-sweeping.md#lfs-orphans-and-pre-registry-objects)
   stop naming objects that should live.
-- Same quarantine-first disposal and heal pass as the pack classes; on versioned S3
-  buckets it fails startup exactly like the general delete opt-in.
-- Legacy-spelled keys (`lfs/<repo_id>/<oid>`, ADR-41) are **excluded** from this reap
-  until [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](#openstorage_sweep_delete_lfs_legacy)
-  is also set.
+- Same quarantine-first disposal and heal pass as the pack classes. On versioned S3
+  buckets it fails startup like the general opt-in.
+- Legacy-spelled keys (`lfs/<repo_id>/<oid>`, ADR-41) are **excluded** until
+  [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](#openstorage_sweep_delete_lfs_legacy) is also set.
 
 ### `OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`
 
-Post-roll cleanup opt-in for **legacy-spelled** LFS keys (`lfs/<repo_id>/<oid>` — the
+Post-roll opt-in to delete **legacy-spelled** LFS keys (`lfs/<repo_id>/<oid>`, the
 v0.2.0-and-older spelling,
 [ADR-41](../adr/041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md)).
-Adoption migrates objects to canonical keys but **retains** the legacy source: old
-replicas derive only that spelling, and a just-issued presigned GET must survive its
-lifetime — so during a rolling upgrade the retained sources are aged rowless orphans
-that [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs) alone must not
-touch. This flag is the operator's assertion that the transition is over: every
-replica runs the new binary and the last old replica exited more than 15 minutes ago
-(the presign expiry). The transition gate dominates every other flag combination —
-without this flag no sweep mode deletes a legacy-spelled key.
 
-- **Default:** `false` (legacy keys are never deleted). **Constraints:** must parse
-  as a boolean; only meaningful together with `OPENSTORAGE_SWEEP_DELETE_LFS`.
+- **Default:** `false`: legacy keys are never deleted. **Values:** a boolean; only
+  meaningful with `OPENSTORAGE_SWEEP_DELETE_LFS`.
+- **Why:** adoption migrates objects to canonical keys but **keeps** the legacy source for
+  old replicas and still-valid presigned GETs. During a roll, those sources are rowless
+  orphans that `OPENSTORAGE_SWEEP_DELETE_LFS` alone must not touch.
+- **Set it only when the transition is over:** every replica runs the new binary, and the
+  last old replica exited more than 15 minutes ago (the presign expiry).
+- This gate overrides every other flag: without it, no sweep mode deletes a
+  legacy-spelled key.
 - Same quarantine-first disposal as every destructive class.
 
 ### `OPENSTORAGE_REPO_RETENTION`
 
-Retention window for soft-deleted repositories: once a repository has been deleted
-longer than this, a purge pass on the sweep cadence **permanently** removes its
-registry and eventing rows (refs, packs, LFS objects, credentials, upstream link) and
-deletes its blobs through the same quarantine-first discipline as every other sweep
-class. Only the repository row itself is retained, stamped as a purge tombstone — see
-the name-burn note below. The [`openstorage purge-repo`](cli.md#openstorage-purge-repo)
-command runs the same primitive synchronously for one repository.
+Retention window for soft-deleted repositories. Once a repo has been deleted longer than
+this, a purge pass on the sweep cadence **permanently** removes its registry and eventing
+rows (refs, packs, LFS objects, credentials, upstream link) and deletes its blobs
+quarantine-first. Only the repository row remains, as a purge tombstone.
+[`openstorage purge-repo`](cli.md#openstorage-purge-repo) runs the same purge
+synchronously for one repo.
 
-- **Default:** unset (`0`) — soft-deleted repositories are kept forever.
-- **Constraints:** a Go duration of at least `1h` (shorter values are startup errors:
-  the purge always waits at least an hour after deletion so no in-flight pre-delete
-  push can race it), and sweeping must be enabled
-  ([`OPENSTORAGE_SWEEP_INTERVAL`](#openstorage_sweep_interval) > 0) — the purge rides
-  the sweep schedule.
-- **Fleet-upgrade prerequisite:** enable only once **every** node — serve replicas *and*
-  hook-running git nodes — runs a build with the purge write fence (ref updates and
-  pack/LFS registrations reject purged repositories). Older binaries do not check the
-  fence, so on a mixed fleet a write accepted by an old node can commit after the
-  purge's verification and be stranded behind the completed purge while reporting
-  success. The same prerequisite applies to running
-  [`openstorage purge-repo`](cli.md#openstorage-purge-repo). Leaving retention unset is
-  safe on any fleet.
-- **Purged repositories cannot be restored.** The repository row is kept as a permanent
-  tombstone, so the burned `(org, url)` name is never released: JWT repo claims are
-  URL-scoped and can outlive any retention window, and a name reuse would let a stale
-  token authorize against the successor repository.
-- Purged blob bytes move to quarantine first and are freed when the backups age out
-  (sweeps are purge-aware even with every `*_DELETE_*` flag off — and independent of
-  this variable, so `purge-repo`-minted fences get the same cleanup). On versioned S3
-  buckets it fails startup exactly like the delete opt-ins. Each purge also write-fences
-  the repository before touching anything, so a still-in-flight pre-delete push fails
-  instead of racing the reclamation.
+- **Default:** unset (`0`): soft-deleted repos are kept forever.
+- **Values:** a Go duration of at least `1h`; shorter values are startup errors. The purge
+  always waits at least an hour after deletion, so no in-flight pre-delete push can race
+  it.
+- **Requires sweeping:** [`OPENSTORAGE_SWEEP_INTERVAL`](#openstorage_sweep_interval) > 0.
+  The purge rides the sweep schedule.
+- **Fleet prerequisite** (also for `openstorage purge-repo`): enable only when **every**
+  node (serve replicas *and* hook-running git nodes) runs a build with the purge write
+  fence (ref updates and pack/LFS registrations reject purged repos). Otherwise an old
+  node can accept a write that is stranded behind the purge while reporting success.
+  Leaving retention unset is safe on any fleet.
+- **Write fence:** each purge fences the repo before touching anything, so a still
+  in-flight pre-delete push fails instead of racing the reclamation.
+- **Blob bytes** move to quarantine first and are freed when the backups age out. Sweeps
+  are purge-aware even with every `*_DELETE_*` flag off, and independent of this variable,
+  so `purge-repo`-minted fences get the same cleanup. On versioned S3 buckets it fails
+  startup like the delete opt-ins.
+
+> [!WARNING]
+> **Purged repositories cannot be restored.** The tombstone never releases the `(org, url)`
+> name: JWT repo claims are URL-scoped and can outlive any retention window, so reusing
+> the name would let a stale token authorize against the new repository.
 
 ### `OPENSTORAGE_LFS_GC_INTERVAL`
 
 Cadence of the unreferenced-LFS-object reclamation job
-([#73](https://github.com/coder/openstorage/issues/73),
-[ADR-42](../adr/042-lfs-reclamation-is-mark-and-sweep-over-reachable-pointer-files.md)).
-Registered LFS objects are otherwise permanent, so a `git:write` holder
-direct-PUTting tiny objects nobody references can exhaust the per-repo
-object-count cap for everyone (`507` on every new object). Each run walks the
-reachable pointer files of repositories holding LFS objects (bounded, resumable
-— see the [operations guide](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects)),
-stamps rows no reachable pointer references, and — only with
-[`OPENSTORAGE_LFS_GC_DELETE_ENABLED`](#openstorage_lfs_gc_delete_enabled) —
-retires rows whose stamp survived a full
-[grace window](#openstorage_lfs_gc_grace), refunding their object count and
-quota bytes.
+([ADR-42](../adr/042-lfs-reclamation-is-mark-and-sweep-over-reachable-pointer-files.md)).
+Registered LFS objects are otherwise permanent, so a `git:write` holder direct-PUTting
+tiny unreferenced objects can exhaust the per-repo object cap for everyone (`507` on
+every new object).
 
-- **Default:** unset (`0`) — the job never runs. `0` is also the fleet-wide
-  emergency stop.
-- **Constraints:** a non-negative Go duration.
-- Retirement removes registry rows only; the blobs become ordinary rowless
-  orphans reaped by the
-  [sweeper's LFS delete opt-in](#openstorage_sweep_delete_lfs). Arming
-  retirement therefore
-  [requires that opt-in](#openstorage_lfs_gc_delete_enabled) — refunded cap
-  slots must never outrun physical deletion.
+- **Default:** unset (`0`): the job never runs. `0` is also the fleet-wide emergency stop.
+- **Values:** a non-negative Go duration.
+- **Each run** walks reachable pointer files (bounded, resumable) and stamps unreferenced
+  rows. With [`OPENSTORAGE_LFS_GC_DELETE_ENABLED`](#openstorage_lfs_gc_delete_enabled), it
+  retires rows whose stamp outlived the [grace window](#openstorage_lfs_gc_grace),
+  refunding object count and quota bytes. See the
+  [operations guide](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects).
+- Retirement removes registry rows only; the
+  [sweeper's LFS delete opt-in](#openstorage_sweep_delete_lfs) reaps the blobs. Arming
+  retirement therefore [requires that opt-in](#openstorage_lfs_gc_delete_enabled).
 
 ### `OPENSTORAGE_LFS_GC_GRACE`
 
-How long an LFS object must stay **continuously** observed as unreferenced
-before reclamation may retire its registry row. The clock starts when a scan
-first finds no reachable pointer referencing the object and resets on every
-liveness signal: a pointer becoming reachable, a re-upload, or a batch/PUT
-answering "already stored" (the client may be about to push a pointer). The
-retirement transaction re-checks the grace under the same lock registrations
-take, so no signal can lose the race silently.
+How long an LFS object must stay **continuously** unreferenced before reclamation may
+retire its registry row.
 
-- **Default:** `24h`. **Constraints:** a positive Go duration. Keep it
-  comfortably above your longest expected upload→push gap — a pointer pushed
-  through the normal git-lfs flow always touches the object first, but raw-git
-  pointer pushes only get the reachability scan's protection.
-- With [`OPENSTORAGE_LFS_GC_DELETE_ENABLED`](#openstorage_lfs_gc_delete_enabled)
-  set, the grace must also be at least the physical reap cadence —
+- **Default:** `24h`. **Values:** a positive Go duration.
+- **Clock:** starts when a scan first finds no reachable pointer to the object. Resets on
+  any liveness signal: a pointer becoming reachable, a re-upload, or a batch/PUT answering
+  "already stored". Retirement re-checks the grace under the registration lock, so no
+  signal loses the race.
+- **Sizing:** keep it well above your longest expected upload→push gap. Pointers pushed
+  through the normal git-lfs flow always touch the object first; raw-git pointer pushes
+  get only the reachability scan's protection.
+- **With `OPENSTORAGE_LFS_GC_DELETE_ENABLED`:** must be at least the physical reap cadence,
   max([`OPENSTORAGE_SWEEP_AGE_THRESHOLD`](#openstorage_sweep_age_threshold),
-  [`OPENSTORAGE_SWEEP_INTERVAL`](#openstorage_sweep_interval), the 1-hour
-  quarantine retention floor) — a startup error otherwise: cap slots
-  refunded faster than the reap (and its quarantine purge) frees their
-  blobs would let one repository's upload→retire cycles grow the shared
-  storage prefixes without bound.
-- **Granularity:** local mode (SQLite) stamps marks at whole-second
-  resolution, so the effective window rounds up — never down — and may run up
-  to two seconds longer than configured. The window is never shorter than the
-  configured grace on either backend.
+  [`OPENSTORAGE_SWEEP_INTERVAL`](#openstorage_sweep_interval), the 1-hour quarantine
+  retention floor), or startup fails.
+- **Granularity:** local mode (SQLite) stamps whole seconds, so the effective window
+  rounds up (never down) and may run up to two seconds longer. It is never shorter than
+  configured on either backend.
 
 ### `OPENSTORAGE_LFS_GC_OBJECT_BUDGET`
 
-Caps the work units one reclamation run may spend — each git object a
-reachability walk lists charges one unit plus one more per 4 KiB of its raw
-(inflated) size, so entry-stuffed trees and large blobs pay for the bytes git
-must expand; each ref a scanned namespace holds and each registry row
-settlement examines charges one unit; and every attempted repository,
-including skips, charges at least one — the bound that keeps the job's cost
-predictable on any repository shape. A repository whose own walk exceeds the
-remaining budget is retried first next run with a full budget; one whose walk
-exceeds the FULL budget is skipped loudly until the budget is raised. Nothing
-is ever marked or retired from a partial walk.
+Caps the work units one reclamation run may spend, so its cost stays predictable on any
+repository shape.
 
-- **Default:** `1000000`. **Constraints:** a positive integer.
+- **Default:** `1000000`. **Values:** a positive integer.
+- **Charges:**
+  - each git object a reachability walk lists: one unit, plus one per 4 KiB of its raw
+    (inflated) size, so entry-stuffed trees and large blobs pay for what git expands;
+  - each ref a scanned namespace holds, and each registry row settlement examines: one
+    unit;
+  - each attempted repository, including skips: at least one unit.
+- A repo whose walk exceeds the remaining budget is retried first next run with a full
+  budget. One that exceeds the **full** budget is skipped loudly until you raise it.
+- Nothing is marked or retired from a partial walk.
 
 ### `OPENSTORAGE_LFS_GC_DELETE_ENABLED`
 
-Arms retirement. Off, the job still scans, stamps, and reports what it *would*
-retire (`rows_eligible` in the run report) — the same staged rollout as the
-[sweep delete flags](#openstorage_sweep_delete_enabled): watch report-only runs
-until the eligible rows are the junk you expect, then opt in.
+Arms retirement. When off, the job still scans, stamps, and reports what it *would* retire
+(`rows_eligible` in the run report). Roll out like the
+[sweep delete flags](#openstorage_sweep_delete_enabled): watch report-only runs until the
+eligible rows are the junk you expect, then opt in.
 
-- **Default:** `false`. **Constraints:** must parse as a boolean; requires
-  [`OPENSTORAGE_LFS_GC_INTERVAL`](#openstorage_lfs_gc_interval) > 0 (arming a
-  disabled job is a startup error).
-- **Physical-deletion coupling** (security): retirement refunds the
-  object-cap slot, but only the
-  [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs) reap deletes
-  the stranded blob — decoupled, upload → grace → retire → re-upload cycles
-  would grow `lfs/<repo>/` far past the cap that quota floors and sweep
-  listings rely on to stay bounded. Arming retirement while the sweep
-  schedule is live therefore requires that opt-in, plus a
-  [grace](#openstorage_lfs_gc_grace) of at least the reap cadence, including
-  the 1-hour quarantine retention floor every reap's backup copy is kept for
-  (startup errors otherwise). The coupling is also OBSERVED at runtime
-  ([#120](https://github.com/coder/openstorage/issues/120)): each
-  destructive LFS sweep pass that completes its keyspace with zero errors
-  records a durable fleet-wide watermark, and retirement refunds slots only
-  while that watermark is fresher than the grace window — armed-but-failing
-  sweeps, passes outrunning the reclamation cycle, and mid-flight guard
-  demotions all freeze refunds automatically (`reap_watermark_stale` /
-  `rows_deferred_reap_stale` in the run report). A fresh deployment stays
-  report-only until its first clean destructive LFS sweep completes.
-  Legacy-spelled rows (pre-ADR-41 `lfs/<repo>/<oid>` keys) are gated one
-  step further: their blobs are only reaped when
-  [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](#openstorage_sweep_delete_lfs_legacy)
-  is also armed, so they retire only while that flag is set AND the fresh
-  watermark records a legacy-armed sweep — otherwise they defer with
-  `rows_deferred_legacy_unarmed` in the run report. With
-  the sweep schedule stopped
-  ([`OPENSTORAGE_SWEEP_INTERVAL=0`](#openstorage_sweep_interval), the
-  emergency stop), the process starts but demotes retirement to report-only
-  with a warning — nothing would reap the blobs meanwhile.
-- **Mixed-fleet prerequisite:** every replica serving LFS requests must run a
-  build with this feature before retirement is armed — older replicas answer
-  "already stored" without clearing the reclamation stamp, so a grace-expired
-  row could retire before that client pushes its pointer. If report-only
-  scans ran during the roll, also wait one full
-  [grace](#openstorage_lfs_gc_grace) after the last pre-touch replica stops
-  before arming deletes: marks stamped mid-roll may already be grace-expired,
-  and shutdown revokes none of the old replica's outstanding "stored"
-  promises. See
-  [the rollout guidance](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects).
+- **Default:** `false`. **Values:** a boolean.
+- **Requires** [`OPENSTORAGE_LFS_GC_INTERVAL`](#openstorage_lfs_gc_interval) > 0. Arming a
+  disabled job is a startup error.
+- **Requires, while the sweep schedule is live** (security; startup fails otherwise):
+  [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs), and a
+  [grace](#openstorage_lfs_gc_grace) of at least the reap cadence. Retirement refunds the
+  cap slot, but only that reap deletes the blob; decoupled, re-upload cycles would grow
+  `lfs/<repo>/` without bound.
+- **Runtime check:** each destructive LFS sweep pass that completes its keyspace with zero
+  errors records a durable fleet-wide watermark. Refunds happen only while that watermark
+  is fresher than the grace window. Failing or lagging sweeps and mid-flight guard
+  demotions freeze refunds (`reap_watermark_stale` /
+  `rows_deferred_reap_stale`). A fresh deployment stays report-only until its first clean
+  destructive LFS sweep.
+- **Legacy-spelled rows** (pre-ADR-41 `lfs/<repo>/<oid>` keys) retire only while
+  [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](#openstorage_sweep_delete_lfs_legacy) is set
+  **and** the fresh watermark records a legacy-armed sweep. Otherwise they defer
+  (`rows_deferred_legacy_unarmed`).
+- **Sweep stopped** ([`OPENSTORAGE_SWEEP_INTERVAL=0`](#openstorage_sweep_interval), the
+  emergency stop): the process starts but demotes retirement to report-only with a
+  warning, since nothing would reap the blobs.
+- **Mixed-fleet prerequisite:** arm only when every replica serving LFS runs a build with
+  this feature (older replicas answer "already stored" without clearing the stamp). If
+  report-only scans ran during the roll, also wait one full grace after the last
+  pre-touch replica stops. See the
+  [rollout guidance](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects).
 
 ### `OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO`
 
-Per-repository LFS object-count cap (issue
-[#51](https://github.com/coder/openstorage/issues/51)): bytes bound row count
-at nothing, so the registry's population needs its own bound. This override is
-the operator escape hatch of [#73](https://github.com/coder/openstorage/issues/73):
-a repository wedged at the cap by unreferenced junk can be unwedged immediately
-by raising the cap, without waiting for a reclamation grace window.
+Per-repository LFS object-count cap. Bytes do not bound row count, so the registry needs
+its own bound.
 
-- **Default:** `100000`. **Constraints:** a positive integer. The cap is
-  enforced at registration inside the serve process, so set it identically on
-  every replica.
+- **Default:** `100000`. **Values:** a positive integer.
+- **Set it identically on every replica:** the serve process enforces it at registration.
+- **Escape hatch:** raise it to unwedge a repo stuck at the cap with unreferenced junk
+  immediately, without waiting for a reclamation grace window.
 
 ### `OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL`
 
 Cadence of the registry-vs-storage absence reconciliation job
-([#101](https://github.com/coder/openstorage/issues/101),
-[ADR-43](../adr/043-absence-reconciliation-covers-registered-but-missing-bytes.md)).
-Each pass pages registered rows — `lfs_objects` and `packs` — and
-point-checks their bytes still physically exist in blob storage. While a
-registered blob's bytes are absent (storage-layer loss; every software
-deletion path quarantines first), the quota admission floor is deflated by
-the absent size, hiding equally sized rowless legacy bytes; the pass makes
-the loss visible again by charging it as a TTL'd restore cover and
-invalidating cached floors — and it is the mechanism that *detects*
-registered-but-missing bytes at all (a missing registered pack is an
-integrity loss logged loudly: committed refs may reference it). See the
+([ADR-43](../adr/043-absence-reconciliation-covers-registered-but-missing-bytes.md)). Each
+pass pages registered `lfs_objects` and `packs` rows and point-checks that their bytes
+still exist in blob storage. It is the only mechanism that *detects*
+registered-but-missing bytes. See the
 [operations guide](../how-to/storage-lifecycle-and-sweeping.md#reconciling-registered-but-missing-bytes).
 
-- **Default:** unset (`0`) — the job never runs.
-- **Constraints:** a non-negative Go duration, at most half of
-  [`OPENSTORAGE_PACK_RESERVATION_TTL`](#openstorage_pack_reservation_ttl)
-  (a startup error otherwise): covers are ordinary TTL'd reservations
-  renewed once per pass, a pass's wall clock is capped at a quarter of the
-  TTL, and periodic ticks that fire mid-pass coalesce — together those
-  bound every tracked cover's renewal gap within the TTL, so a long scan
-  can never let a live cover lapse.
-- The job is non-destructive on every path: it only inserts/refreshes
-  reservation rows and bumps the shared floor generation. With quota
-  enforcement disabled
-  ([`OPENSTORAGE_PACK_QUOTA_BYTES=0`](#openstorage_pack_quota_bytes)) it
-  detects and reports without charging anything.
-- **Degraded-renewal admission fence** (quota enforcement on): every
-  successful pass stamps a renewal-health watermark. If a pass's cover
-  renewal FAILS while that watermark is absent or older than the
-  cover-lapse safety bound (the TTL minus this interval minus twice the
-  pass wall clock — a failure is harmless only while covers survive
-  until the NEXT attempt, and the watermark can trail the touch it
-  records by up to one more pass), covers may lapse un-renewed and quota
-  arithmetic would silently under-count them — the job then fails finite
-  quota-gated writes closed (pushes, LFS uploads, adoptions answer
-  "quota accounting temporarily degraded, retry later") until a healthy
-  pass completes one full recovery rotation of both registries.
-  Transient renewal blips within the safety bound never fence; internal
-  restore/cover reservations are always exempt so recovery can proceed.
-  A SUCCESSFUL renewal whose prior watermark exists but is a full TTL
-  old fences too — the strict-TTL touch cannot resurrect covers that
-  already lapsed — so a fleet paused past the TTL, or quota re-enabled
-  after an off period whose earlier passes had stamped, runs one fenced
-  recovery rotation before finite quota-gated writes resume. An ABSENT
-  watermark (the first pass after enabling the job, or after upgrading
-  to a version that stamps it) is not lapse evidence by itself: that
-  pass fences only on positive evidence — a durable lapse-evidence
-  marker (recorded whenever admission-time GC or the reservation sweep
-  deletes an expired cover), a physically present expired cover, or an
-  evidence check that itself fails — and otherwise stamps health with
-  admissions left open, so an ordinary first pass after enablement or
-  upgrade does NOT block writes.
+Absence means storage-layer loss (software deletes quarantine first). A missing
+registered pack is logged loudly as an integrity loss: committed refs may reference it.
+Absent bytes also deflate the quota admission floor, hiding equally sized rowless legacy
+bytes, so the pass charges each loss as a TTL'd restore cover and invalidates cached
+floors.
 
-  **Upgrade ordering (mixed fleets).** The fence check and the
-  lapse-evidence markers run only in new binaries: during a rolling
-  upgrade, a write routed to a pre-upgrade replica reserves WITHOUT the
-  fence check (spending the deflated headroom an armed fence closes on
-  new replicas), and a pre-upgrade replica's expired-reservation GC
-  deletes a lapsed cover without recording evidence — silently
-  defeating the first health stamp's probe afterwards. Both guarantees
-  are fleet-wide only once every replica runs a fence-aware binary.
-  Enable this job only after the whole fleet is upgraded; when
-  upgrading a fleet that already runs it, complete the roll within one
-  [`OPENSTORAGE_PACK_RESERVATION_TTL`](#openstorage_pack_reservation_ttl)
-  (healthy renewal re-TTLs covers every pass, so a prompt roll leaves
-  no expired cover for pre-upgrade GC to consume). The serve boot log
-  warns while reconciliation runs with quota enforcement as a reminder
-  of this prerequisite (see ADR-43).
+- **Default:** unset (`0`): the job never runs.
+- **Values:** a non-negative Go duration, at most half of
+  [`OPENSTORAGE_PACK_RESERVATION_TTL`](#openstorage_pack_reservation_ttl); otherwise
+  startup fails. With passes capped at a quarter of the TTL and mid-pass ticks coalesced,
+  covers renewed once per pass never lapse.
+- **Non-destructive:** it only inserts/refreshes reservation rows and bumps the shared
+  floor generation. With quota off
+  ([`OPENSTORAGE_PACK_QUOTA_BYTES=0`](#openstorage_pack_quota_bytes)), it detects and
+  reports without charging.
+- **Admission fence** (quota on): each successful pass stamps a renewal-health watermark.
+  When the fence arms, finite quota-gated writes (pushes, LFS uploads, adoptions) fail
+  closed with "quota accounting temporarily degraded, retry later" until a healthy pass
+  completes one full recovery rotation of both registries. Internal restore/cover
+  reservations are always exempt, so recovery can proceed. The fence arms when:
+  - a cover renewal **fails** while the watermark is absent or older than the cover-lapse
+    safety bound (TTL − this interval − 2 × pass wall clock). Blips within the bound never
+    fence.
+  - a renewal **succeeds** but the prior watermark is a full TTL old (covers may have
+    lapsed). A fleet paused past the TTL, or quota re-enabled after an off period whose
+    earlier passes had stamped, therefore runs one fenced recovery rotation first.
+- **First pass** after enabling the job, or after upgrading to a version that stamps the
+  watermark: an absent watermark alone is not lapse evidence. The pass fences only on
+  positive evidence (a durable lapse-evidence marker, recorded whenever admission-time GC
+  or the reservation sweep deletes an expired cover; a physically present expired cover;
+  or a failed evidence check). Otherwise it stamps health and leaves admissions open, so
+  an ordinary first pass does **not** block writes.
+
+> [!IMPORTANT]
+> **Upgrade the whole fleet before enabling this job.** Only new binaries check the fence
+> and record lapse evidence: pre-upgrade replicas reserve without the fence check, and
+> their GC deletes lapsed covers without recording evidence. When upgrading a fleet that
+> already runs the job, finish the roll within one
+> [`OPENSTORAGE_PACK_RESERVATION_TTL`](#openstorage_pack_reservation_ttl), so no cover
+> expires for old GC to consume. The serve boot log warns while reconciliation runs with
+> quota enforcement (ADR-43).
 
 ### `OPENSTORAGE_ABSENCE_RECONCILE_BUDGET`
 
-Caps the work units one reconciliation pass may charge: one per registry row
-examined plus one per extra registration or twin-spelling probe — each unit
-is at most one blob-store HEAD or registry point read. A budget-limited pass
-parks its keyset cursor and the next pass resumes strictly after it, so
-arbitrarily large registries reconcile across passes. Within a pass, up to
-half the budget first **re-settles already-discovered losses** (keeping
-their covers refreshed every pass, independent of the rotation), then the
-two registry rotations split the remainder with an alternating leader; a
-one-hour wall-clock cap bounds the pass even when a degraded blob store
-stretches individual probes.
+Caps the work units one reconciliation pass may charge: one per registry row examined,
+plus one per extra registration or twin-spelling probe. Each unit is at most one
+blob-store HEAD or registry point read.
 
-- **Default:** `100000`. **Constraints:** an integer of at least `100`
-  (one row can cost up to three units, so degenerate budgets cannot
-  guarantee progress on both registries).
-- Discovered losses are covered by ONE aggregate reservation row per
-  affected repository and registry class, and the cover rows themselves
-  are the durable tracking state
-  ([#125](https://github.com/coder/openstorage/issues/125)): the renewal
-  phase lists the live rows and re-charges each at one work unit per row,
-  entirely database-derived, so the per-repo reservation-row cap cannot
-  bind and any replica keeps every cover alive. Each full rotation over a
-  repository's rows re-derives its exact deficit total — growing the live
-  cover in place, re-minting the key with the exact smaller total when
-  heals shrink it (`covers_rotated`; the stale row is deleted), and
-  releasing it outright when everything healed (`covers_released`). Shrink
-  therefore lags by at most one rotation (conservative), never renewal.
-- **Sizing:** keep the budget above twice the live cover-row population.
-  Renewal never lapses on budget — it always offers the full cover
-  listing, squeezing discovery when it overruns its allocation
-  (`renewal_over_budget`) — but a squeezed rotation slows loss discovery
-  and heal shedding. Rotation cursors, traversal bookkeeping, and the
-  alternating-leader parity are all fleet-persistent (`job_scan_state`),
-  so multi-replica PostgreSQL fleets share one rotation regardless of
-  which replica River schedules.
+- **Default:** `100000`. **Values:** an integer of at least `100` (one row can cost up to
+  three units, so smaller budgets cannot guarantee progress on both registries).
+- **Resumable:** a budget-limited pass parks its keyset cursor, and the next pass resumes
+  strictly after it, so any registry size reconciles across passes.
+- **Budget split:** up to half the budget first **re-settles known losses** (refreshing
+  their covers every pass, independent of the rotation). The two registry rotations split
+  the rest with an alternating leader. A one-hour wall-clock cap bounds the pass even
+  when a degraded blob store slows probes.
+- **Cover rows:** discovered losses share ONE aggregate reservation row per affected repo
+  and registry class. Renewal re-charges each live row at one unit, entirely from the
+  database, so the per-repo reservation-row cap cannot bind and any replica keeps every
+  cover alive. Each full rotation re-derives the exact deficit, so shrinking lags by at
+  most one rotation, never renewal. Details:
+  [operations guide](../how-to/storage-lifecycle-and-sweeping.md#reconciling-registered-but-missing-bytes).
+- **Sizing:** keep the budget above twice the live cover-row population. Renewal always
+  covers every row, squeezing discovery when it overruns (`renewal_over_budget`), which
+  slows loss discovery and heal shedding.
+- **Fleet-shared state:** rotation cursors, traversal bookkeeping, and the
+  alternating-leader parity persist in `job_scan_state`, so multi-replica PostgreSQL
+  fleets share one rotation whichever replica River schedules.
 
 ### `OPENSTORAGE_REPACK_THRESHOLD`
 
-Registered-pack count at which a post-write trigger schedules a background repack fold for
-that repository. Repack packs the union of the snapshotted packs' objects into one
-consolidated pack — the registered object set never shrinks.
+Registered-pack count at which a post-write trigger schedules a background repack fold
+for that repository. Repack packs the union of the snapshotted packs' objects into one
+consolidated pack; the registered object set never shrinks.
 
-- **Default:** `10`. **`0` disables this process's triggers and follow-ups**
-  (already-queued durable jobs still run); `1` is rejected (folding fewer than two
-  packs is a no-op, so it would busy-loop the trigger); negative or malformed values
-  are startup errors.
-- The threshold is **per process/replica**, for both its post-write triggers and the
-  follow-up checks of jobs it consumes. Setting one push node to `2` does not set
-  other consumers of the same River queue to `2`. Mixed-threshold fleets do not
-  promise preservation of a producer's lower threshold.
-- With the same enabled threshold on every eligible consumer, pack counts target
-  below that threshold, not necessarily one pack. Exactly-one convergence requires
-  all those consumers to use `2`, plus quiescent writes and successful fold progress
-  within the [fold budgets](../how-to/storage-lifecycle-and-sweeping.md#background-repack).
+- **Default:** `10`.
+- **Values:** **`0` disables this process's triggers and follow-ups** (already-queued
+  durable jobs still run). `1` is rejected: folding fewer than two packs is a no-op, so it
+  would busy-loop the trigger. Negative or malformed values are startup errors.
+- **Per process/replica:** it governs that process's post-write triggers and the
+  follow-up checks of jobs it consumes. Setting one push node to `2` does not change other
+  consumers of the same River queue. Mixed-threshold fleets do not promise to preserve a
+  producer's lower threshold.
+- **Convergence:** with the same enabled threshold on every eligible consumer, pack counts
+  target below that threshold, not necessarily one pack. Exactly one pack requires all
+  those consumers at `2`, quiescent writes, and successful fold progress within the
+  [fold budgets](../how-to/storage-lifecycle-and-sweeping.md#background-repack).
 
 ### `OPENSTORAGE_SYNC_STEAL_LEGACY`
 
-Upstream-sync claims are leased: a run that dies mid-sync leaves a claim the next run
-steals automatically once the lease expires. Claims written by **pre-lease builds** carry
-no lease and none of the holder guards that make stealing safe; new replicas adopt them
-under one grace period but will not steal them without this opt-in.
+Opt-in to steal upstream-sync claims left by **pre-lease builds**. Normal claims are
+leased and stolen automatically once the lease expires. Pre-lease claims lack the lease
+and holder guards that make stealing safe; new replicas adopt them under one grace period
+but never steal them without this flag.
 
-- **Default:** `false` (adopted legacy claims are never stolen). Malformed values stay
+- **Default:** `false`: adopted legacy claims are never stolen. Malformed values stay
   disabled.
 - **Enable only after the whole fleet runs a lease-aware build** (same fleet prerequisite
-  as [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](#openstorage_sweep_delete_enabled)): from then
-  on, legacy claims can only be pre-upgrade crash leftovers, and stealing them heals those
-  wedges without operator row-surgery. Safe to leave enabled permanently afterwards.
+  as [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](#openstorage_sweep_delete_enabled)). From then
+  on, legacy claims can only be pre-upgrade crash leftovers, and stealing them heals
+  those wedges without manual row surgery. Safe to leave enabled permanently afterwards.
 
 ## Internal and test variables
 
-Variables outside the operator surface, listed for completeness — never set these manually:
+Not part of the operator surface; listed for completeness. Never set these manually.
 
 - `OPENSTORAGE_GIT_REPO`, `OPENSTORAGE_GIT_REFS_POLICY`, `OPENSTORAGE_GIT_OPS`,
   `OPENSTORAGE_GIT_ATOMIC`, `OPENSTORAGE_GIT_PACK_QUOTA`,
   `OPENSTORAGE_GIT_PACK_RESERVATION_TTL`, `OPENSTORAGE_GIT_VERIFY_STATE`,
-  `OPENSTORAGE_GIT_VERIFY_SIG_BUDGET` — per-request plumbing the server sets for the
-  `openstorage hook` subprocess git re-execs.
-- `OPENSTORAGE_ASKPASS_USERNAME`, `OPENSTORAGE_ASKPASS_PASSWORD` — set by the upstream-sync
+  `OPENSTORAGE_GIT_VERIFY_SIG_BUDGET`: per-request plumbing the server sets for the
+  `openstorage hook` subprocess that git re-execs.
+- `OPENSTORAGE_ASKPASS_USERNAME`, `OPENSTORAGE_ASKPASS_PASSWORD`: set by the upstream-sync
   worker for its own git credential-askpass subprocess.
 - `OPENSTORAGE_TEST_MODE`, `OPENSTORAGE_TEST_CRASH`, `OPENSTORAGE_TEST_CAS_DROP`,
   `OPENSTORAGE_TEST_CAS_DROP_HARD`, `OPENSTORAGE_TEST_HOOK_DELAY_MS`,
-  `OPENSTORAGE_TEST_VERIFY_SPAWN_LOG` — crash/fault injection and observability knobs
-  for the e2e suites; the server refuses test-mode requests outside test mode.
-- `OPENSTORAGE_TEST_BACKEND`, `OPENSTORAGE_SDK_DIR` — test-lane selection (see the
-  [testing reference](testing.md)) and the SDK-compatibility
-  suite's vendor checkout location.
+  `OPENSTORAGE_TEST_VERIFY_SPAWN_LOG`: crash/fault injection and observability knobs for
+  the e2e suites. The server refuses test-mode requests outside test mode.
+- `OPENSTORAGE_TEST_BACKEND`, `OPENSTORAGE_SDK_DIR`: test-lane selection (see the
+  [testing reference](testing.md)) and the SDK-compatibility suite's vendor checkout
+  location.
 
 The Docker Compose file has its own host-port overrides (`PGPORT`, `S3PORT`,
-`NODEA_PORT`, `NODEB_PORT`, `CS_KEYS_DIR`) — see the
+`NODEA_PORT`, `NODEB_PORT`, `CS_KEYS_DIR`); see the
 [`docker-compose.yml`](../../docker-compose.yml) header.
