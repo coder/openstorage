@@ -59,8 +59,10 @@ RPO/RTO.
   Do not enable either to implement this procedure.
   An archival system must instead export a complete ordinary-object snapshot into
   an empty compliant bucket, with its own policy/key recovery validated.
-- **Not copied:** bucket policies, ACLs, lifecycle rules, KMS keys, tags, provider
-  settings. Provision them deliberately; never blindly copy source access policy.
+- **Not reproduced by the object inventory:** bucket policies, ACLs, lifecycle rules,
+  KMS keys, tags, and provider settings. Provision them deliberately; never blindly
+  copy source access policy. (`--copy-props default` can copy object tags, but the
+  inventory only checks keys, bodies, and metadata.)
 - **Scope:** the Bash/AWS CLI v2 examples copy between pre-provisioned buckets on
   **one endpoint in one region**. No cross-endpoint migration or cross-region
   disaster recovery.

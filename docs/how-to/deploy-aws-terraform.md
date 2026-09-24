@@ -286,8 +286,9 @@ OPENSTORAGE_AWS_SMOKE=1 timeout --signal=TERM --kill-after=30s 20m \
   --smoke --budget-seconds 600
 ```
 
-The adapter reads state but never provisions. It adds the ALB CA to system trust,
-keeps the signing key local, removes temporary files, and returns the runner's exit
+The adapter reads state but never provisions. It builds a temporary CA bundle
+(system CAs plus the ALB CA) for the runner, keeps the signing key local, removes
+temporary config/CA files, and returns the runner's exit
 status. `--aws-readonly` enables the runner's STS/HeadBucket probes with your
 approved credentials. Keep `deployment.json` beside the results; the runner config
 omits its resource and archive metadata. Single-node smoke cannot prove
