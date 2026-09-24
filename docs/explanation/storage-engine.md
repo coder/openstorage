@@ -39,8 +39,10 @@ flowchart LR
   B -. crash .-> U[Registered but unreachable:<br/>repack carries it forward]
 ```
 
-**Crash asymmetry:** at worst a crash strands an unreferenced blob (an **orphan**), as
-the diagram shows. The write path never produces a committed ref to unpublished bytes.
+**Crash asymmetry:** a crash between publish and commit leaves only extra bytes: an
+unregistered blob (an **orphan**, which the sweeper can reclaim) or, after
+registration, a registered but unreachable pack that repack carries forward. The write
+path never produces a committed ref to unpublished bytes.
 With destructive sweeping enabled, rare delete/registration races can make a registered pack *transiently*
 unavailable; the quarantine handshake and every sweep's opening heal pass restore it. The
 exposure is a bounded retry window, never durable loss. Orphans are cheap and
