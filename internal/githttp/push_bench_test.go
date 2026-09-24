@@ -221,12 +221,34 @@ func benchSeedRepo(b *testing.B) string {
 	b.Helper()
 	dir := b.TempDir()
 	benchGit(b, dir, "init", "-b", "main", ".")
+	// No background repack while writers clone from this repo (see
+	// benchCloneWriter).
+	benchGit(b, dir, "config", "maintenance.auto", "false")
 	if err := os.WriteFile(filepath.Join(dir, "data.txt"), []byte("seed\n"), 0o644); err != nil {
 		b.Fatal(err)
 	}
 	benchGit(b, dir, "add", ".")
 	benchGit(b, dir, "commit", "-m", "seed")
 	return dir
+}
+
+// benchCloneWriter clones seed into dir and checks out the writer's branch.
+// The clone disables Git's auto maintenance (issue #219). Since Git 2.54 every
+// `git commit` starts a detached `git maintenance run --auto`, which repacks
+// once Git's sampled loose-object estimate passes 256; a chain of about 100
+// commits often gets there. That repack's prune-packed removes emptied
+// objects/xx directories while the chain's next commit writes a new object
+// there, which fails as "unable to create temporary file: No such file or
+// directory". A client `git push` does not run auto maintenance, so the
+// measured path is unchanged.
+func benchCloneWriter(seed, dir string, writer int) error {
+	if out, err := tryGit("", "clone", "--config", "maintenance.auto=false", seed, dir); err != nil {
+		return fmt.Errorf("git clone: %w\n%s", err, out)
+	}
+	if out, err := tryGit(dir, "checkout", "-b", fmt.Sprintf("w%d", writer)); err != nil {
+		return fmt.Errorf("git checkout: %w\n%s", err, out)
+	}
+	return nil
 }
 
 // benchCommitOp rewrites the tracked data file and commits, returning the
@@ -585,8 +607,9 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	var genWG sync.WaitGroup
 	for i := range dirs {
 		dirs[i] = filepath.Join(b.TempDir(), fmt.Sprintf("w%d", i))
-		benchGit(b, "", "clone", seed, dirs[i])
-		benchGit(b, dirs[i], "checkout", "-b", fmt.Sprintf("w%d", i))
+		if err := benchCloneWriter(seed, dirs[i], i); err != nil {
+			b.Fatal(err)
+		}
 		genWG.Add(1)
 		go func(i int) {
 			defer genWG.Done()
