@@ -38,6 +38,9 @@ const (
 	envRateRPS    = "OPENSTORAGE_RATE_RPS"
 	envRateBurst  = "OPENSTORAGE_RATE_BURST"
 
+	// envMetricsListen enables the opt-in metrics listener (ADR-48).
+	envMetricsListen = "OPENSTORAGE_METRICS_LISTEN"
+
 	// Trusted-proxy allowlist for rate-limit client identity (issue #30):
 	// comma-separated CIDR prefixes (bare IPs accepted as single-address
 	// entries). Unset keeps RemoteAddr-only keying.
@@ -301,6 +304,10 @@ type serveConfig struct {
 	dbURL    string
 	blobURL  string
 
+	// metricsListen is the opt-in metrics listener address (ADR-48);
+	// empty means no listener.
+	metricsListen string
+
 	// dataDir, when set, is the local-mode data directory (always absolute):
 	// database/blob/cache locations are derived from it for slots not set
 	// explicitly (sqlite://<dir>/codestorage.db, file://<dir>/blobs,
@@ -524,6 +531,7 @@ func resolveServeConfig(lookup envLookup, flagListen, flagAddr, flagCacheDir, fl
 		org:         getenv(envOrg),
 		orgKeysPath: getenv(envOrgPubKeys),
 	}
+	cfg.metricsListen = getenv(envMetricsListen)
 	if cfg.cacheDir == "" {
 		// Preserve the default cache location across product renames so
 		// rolling deployments continue sharing cache coordination files.

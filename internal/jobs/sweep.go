@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -323,6 +324,18 @@ func NewSweeper(blobs blob.BlobStore, packs PackRegistry, cfg SweepConfig, logge
 // transient, not data loss — hydration's bounded missing-pack retry
 // absorbs it — and the next sweep's heal pass remains the crash backstop.
 func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
+	report, err := s.sweep(ctx)
+	// ADR-48: one outcome per execution, on the choke point both queue
+	// backends share.
+	if err != nil {
+		metrics.JobRun(metrics.JobOrphanSweep, metrics.ResultError)
+	} else {
+		metrics.JobRun(metrics.JobOrphanSweep, metrics.ResultSuccess)
+	}
+	return report, err
+}
+
+func (s *Sweeper) sweep(ctx context.Context) (SweepReport, error) {
 	start := s.now()
 	// Heal before classifying so a pack restored from quarantine is listed
 	// (and counted live) by the very sweep that healed it. Healing runs in

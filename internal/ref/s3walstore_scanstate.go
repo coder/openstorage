@@ -49,6 +49,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
@@ -193,7 +194,8 @@ func (s *S3WAL) scanMutateShared(ctx context.Context, op, job, scope string, fn 
 	return s.scanMutateWith(ctx, op, job, scope, true, fn)
 }
 
-func (s *S3WAL) scanMutateWith(ctx context.Context, op, job, scope string, shared bool, fn func(prev *s3walScanRow, stamp time.Time) (*s3walScanRow, error)) error {
+func (s *S3WAL) scanMutateWith(ctx context.Context, op, job, scope string, shared bool, fn func(prev *s3walScanRow, stamp time.Time) (*s3walScanRow, error)) (err error) {
+	defer countContention(metrics.ScopeScanState, &err)
 	assertf(op != "" && fn != nil, "scanMutate: incomplete mutation %q", op)
 	key := s3walScanKey(job, scope)
 	unlock := s.lockScan(key)

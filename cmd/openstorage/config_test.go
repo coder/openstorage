@@ -1630,3 +1630,31 @@ func TestLogSyncEgressWarnings(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveServeConfigMetricsListen: the metrics listener is off unless
+// OPENSTORAGE_METRICS_LISTEN is set to a non-empty value (ADR-48). Values
+// are not trimmed: a whitespace-only value reaches the bind and fails
+// startup instead of silently disabling metrics.
+func TestResolveServeConfigMetricsListen(t *testing.T) {
+	base := map[string]string{
+		"PG_URL": "p", "BLOB_URL": "b", "OPENSTORAGE_ORG": "o", "OPENSTORAGE_ORG_PUBKEYS": "/k",
+	}
+	cfg, err := resolveServeConfig(mapEnv(base), "", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.metricsListen != "" {
+		t.Fatalf("metrics listener must be off by default, got %q", cfg.metricsListen)
+	}
+	for value, want := range map[string]string{"": "", "  ": "  ", "127.0.0.1:9464": "127.0.0.1:9464"} {
+		env := maps.Clone(base)
+		env["OPENSTORAGE_METRICS_LISTEN"] = value
+		cfg, err := resolveServeConfig(mapEnv(env), "", "", "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.metricsListen != want {
+			t.Errorf("OPENSTORAGE_METRICS_LISTEN=%q resolved to %q, want %q", value, cfg.metricsListen, want)
+		}
+	}
+}

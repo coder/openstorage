@@ -56,3 +56,4 @@ has moved on, the linked issues/PRs in each record's text are the trail.
 | ADR-45 | [Sync egress policy is unified behind one dial-time guard](045-sync-egress-policy-is-unified-behind-one-dial-time-guard.md) | issue #139 |
 | ADR-46 | [s3wal — refs and metadata ride one conditional-CAS object per repo group](046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md) | issue #133 |
 | ADR-47 | [Cache repos get split commit-graphs, written by full hydrates](047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md) | issue #307 |
+| ADR-48 | [Metrics ride an opt-in, separate listener with fixed labels](048-metrics-ride-an-opt-in-separate-listener-with-fixed-labels.md) | issue #325 |

@@ -34,6 +34,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
@@ -470,7 +471,8 @@ type s3walMutation struct {
 // an apply=false verdict — is re-derived from a fresh read instead of
 // being returned: concluding "lost"/"no-op"/"refused" from unvalidated
 // state would break CAS linearizability.
-func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error {
+func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) (err error) {
+	defer countContention(metrics.ScopeRefs, &err)
 	assertf(mu.fn != nil && mu.op != "", "mutate: incomplete mutation %+v", mu)
 	unlock := s.lockBase(base)
 	defer unlock()
@@ -540,6 +542,7 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 				s.dropSnap(base) // unvalidated refusal: re-derive fresh
 				continue
 			}
+			metrics.S3WALManifestSizeGuard(metrics.SizeGuardRefuse)
 			return notExecuted(err) // size refusal: never sent
 		}
 		ourNonce, ourSeq := m.Writer, m.Seq
@@ -627,6 +630,7 @@ func (s *S3WAL) checkManifestSize(base string, mu s3walMutation, size int) error
 		s.warned[base] = true
 		s.warnMu.Unlock()
 		if !warnedBefore {
+			metrics.S3WALManifestSizeGuard(metrics.SizeGuardWarn)
 			slog.Warn("s3wal manifest approaching size cap", "base", base, "bytes", size, "warn", s.softWarnBytes, "cap", s.hardCapBytes)
 		}
 	}
@@ -1166,4 +1170,13 @@ func (s *S3WAL) GetGeneration(ctx context.Context, repo string) (int64, error) {
 	}
 	assertf(mem.Gen >= 0, "manifest holds negative generation %d for %s", mem.Gen, repo)
 	return mem.Gen, nil
+}
+
+// countContention counts a terminal S3WAL mutation that returned
+// ErrCASContention (ADR-48). Deferred at a mutation loop's return
+// boundary, so it counts once per mutation, never per attempt.
+func countContention(scope metrics.ContentionScope, err *error) {
+	if errors.Is(*err, s3wal.ErrCASContention) {
+		metrics.S3WALContentionExhausted(scope)
+	}
 }

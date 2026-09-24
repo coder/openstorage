@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/coder/openstorage/internal/metrics"
 )
 
 // LeaseKey is the dual-serve guard object (§2.1 key table).
@@ -284,6 +286,7 @@ func (l *InstanceLease) renew(ctx context.Context) error {
 		l.etag, l.renewedAt = etag, start
 		return nil
 	}
+	metrics.S3WALLeaseRenewalFailed() // ADR-48: failed write attempt, not a lost lease
 	obj, gerr := l.cs.Get(ctx, LeaseKey)
 	switch {
 	case gerr == nil:

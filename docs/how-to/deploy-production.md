@@ -481,6 +481,36 @@ read their reports, and delete-mode prerequisites: see the
 | `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
 
+The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
+the mapping below says which ones remain log-only.
+
+### Metrics and log signal mapping
+
+Set [`OPENSTORAGE_METRICS_LISTEN`](../reference/configuration.md#openstorage_metrics_listen)
+to expose Prometheus metrics on a separate, **unauthenticated** listener. Bind it to
+loopback or a private network only the scraper can reach. Metrics are per `serve`
+process: work in Git hook subprocesses (the ref updates of a push) is not counted.
+
+Rows marked **log only** have no metric; their log line or stderr message stays the
+signal. For those rows the stable parts are the event text or prefix shown, its listed
+fields, when it is emitted, and its channel (structured log or stderr). Free-form error
+text appended after it is not part of the contract.
+
+| Signal (table) | Metric | Notes |
+|---|---|---|
+| API/git `5xx` rates per replica (What to monitor) | `openstorage_http_requests_total{code_class="5xx"}` by `surface` | Also `openstorage_http_request_duration_seconds` |
+| `orphan pack sweep finished` (What to monitor) | `openstorage_job_runs_total{job="orphan_sweep"}` | Outcome only; orphan counts and bytes stay **log only** in the report line |
+| `repack: folded packs` / `repack trigger: scheduled fold` (What to monitor) | `openstorage_job_runs_total{job="repack"}` | Fold outcomes only; trigger lines stay **log only** |
+| Pack quota exceeded (What to monitor) | **log only** | Client-visible hook error plus the `quota: receive-pack … at/over quota` server line |
+| Postgres availability and advisory-lock waits (What to monitor) | **log only** | Observe PostgreSQL itself (`pg_locks`) |
+| S3WAL `… conditional-write contention retries exhausted` (S3WAL signals) | `openstorage_s3wal_cas_contention_exhausted_total` by `scope` | Serve-process mutations only; push-side failures reach the client and hook stderr |
+| `WARN s3wal manifest approaching size cap` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="warn"}` | Counts when the once-per-repository warning is logged |
+| S3WAL `manifest would grow to … refusing new registrations` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="refuse"}` | Serve-process refusals only |
+| Lease `… is held by another serve process …` (S3WAL signals) | **log only** | Startup refusal; the process never serves |
+| Lease `… fail-stop` (S3WAL signals) | **log only** for the verdict | `openstorage_s3wal_lease_renewal_failures_total` counts failed renewal writes before it; `openstorage_s3wal_lease_held` is local state, and the process exits on fail-stop |
+| Startup `no usable HTTP Date witness` / lease `freshness cannot be judged` / `is corrupt` (S3WAL signals) | **log only** | Startup refusals |
+| `WARN s3wal clock skew guard tripped` (S3WAL signals) | **log only** | |
+
 ## Zero-infrastructure mode (experimental): one bucket, one node
 
 The **experimental** `s3wal://` mode drops Postgres and removes local disk from the
@@ -633,8 +663,9 @@ rollback guarantee.
 
 ### S3WAL operational signals
 
-An **experimental, single-node** log/error runbook, not a metrics endpoint or an
-incident/real-S3 qualification. Use it with the [general monitoring guidance](#what-to-monitor).
+An **experimental, single-node** log/error runbook, not an incident/real-S3
+qualification. Use it with the [general monitoring guidance](#what-to-monitor). Rows that
+also have a metric are listed in the [metrics and log mapping](#metrics-and-log-signal-mapping).
 
 - Returned store errors are not server log entries themselves; the caller decides how
   they appear.
@@ -644,12 +675,12 @@ incident/real-S3 qualification. Use it with the [general monitoring guidance](#w
 
 | Signal/error | Emission conditions and fields | What it establishes | What it does not establish | Safe response |
 |---|---|---|---|---|
-| Returned `s3wal …: 16 attempts: s3wal: conditional-write contention retries exhausted` | The [manifest loop](../../internal/ref/s3walstore.go#L473-L611) has 16 fresh attempts (an optional cached-seed try is extra), naming operation and base. The [scan-state loop](../../internal/ref/s3walstore_scanstate.go#L184-L281) also has a 16-attempt budget, naming operation and `_wal/scan/` key; shared lapse-marker updates can contend across receive hooks. The [conditional client](../../internal/ref/s3wal/casobj.go#L342-L398) separately retries up to 16 `409 ConditionalRequestConflict` attempts, naming `create`/`advance` and key. | A bounded attempt budget failed for the observed operation/base or key. | Not a global capacity limit or proven root cause. Manifest/scan retries also include never-sent/recovery paths. These loops do not log ordinary retries; that says nothing about other SDK/transport logging. | Preserve the full error, operation and identifier; check store connectivity/errors. For a manifest base, inspect same-base writers and actual refs/results. For a scan-state key, inspect marker work across concurrent receive hooks, not just that repository's refs. Reduce competing work before a controlled retry; do not retry until green. |
-| `WARN s3wal manifest approaching size cap` | [Size guard](../../internal/ref/s3walstore.go#L614-L633): growth predicate true; candidate encoded bytes **> 4 MiB and ≤ 16 MiB**. Fields: `base`, `bytes`, `warn`, `cap`. Suppressed after the first warning for that base in that store's map. | A candidate mutation exceeded the soft threshold. | Not proof the write committed, a current-size gauge, or one warning per process/fleet lifetime. No warning does not prove spare capacity. | Record base/bytes and growth-producing operations; plan supported application-level cleanup or a deployment change before the hard cap. Never edit the manifest. |
+| Returned `s3wal …: 16 attempts: s3wal: conditional-write contention retries exhausted` | The [manifest loop](../../internal/ref/s3walstore.go#L474-L614) has 16 fresh attempts (an optional cached-seed try is extra), naming operation and base. The [scan-state loop](../../internal/ref/s3walstore_scanstate.go#L185-L283) also has a 16-attempt budget, naming operation and `_wal/scan/` key; shared lapse-marker updates can contend across receive hooks. The [conditional client](../../internal/ref/s3wal/casobj.go#L342-L398) separately retries up to 16 `409 ConditionalRequestConflict` attempts, naming `create`/`advance` and key. | A bounded attempt budget failed for the observed operation/base or key. | Not a global capacity limit or proven root cause. Manifest/scan retries also include never-sent/recovery paths. These loops do not log ordinary retries; that says nothing about other SDK/transport logging. | Preserve the full error, operation and identifier; check store connectivity/errors. For a manifest base, inspect same-base writers and actual refs/results. For a scan-state key, inspect marker work across concurrent receive hooks, not just that repository's refs. Reduce competing work before a controlled retry; do not retry until green. |
+| `WARN s3wal manifest approaching size cap` | [Size guard](../../internal/ref/s3walstore.go#L617-L637): growth predicate true; candidate encoded bytes **> 4 MiB and ≤ 16 MiB**. Fields: `base`, `bytes`, `warn`, `cap`. Suppressed after the first warning for that base in that store's map. | A candidate mutation exceeded the soft threshold. | Not proof the write committed, a current-size gauge, or one warning per process/fleet lifetime. No warning does not prove spare capacity. | Record base/bytes and growth-producing operations; plan supported application-level cleanup or a deployment change before the hard cap. Never edit the manifest. |
 | Returned `s3wal …: manifest would grow to … bytes (cap 16777216): refusing new registrations` | Same guard, growth predicate true and candidate bytes **> 16 MiB**; text includes operation, base, size and cap. Hard refusal precedes the soft-warning branch. | This candidate was refused before its conditional PUT. | Not a blanket read-only mode or a promise that deletes, updates, reads or purge succeed; other guards and failures remain. | Stop adding registry entries to the affected group. Assess supported cleanup through ordinary APIs; preserve failures and escalate if cleanup is blocked. Do not raise/bypass the guard. |
-| Stderr `s3wal instance lease _wal/instance-lease is held by another serve process …` | [Acquisition](../../internal/ref/s3wal/lease.go#L138-L227) found a fresh recorded lease, or a foreign holder won an acquisition race. Fields in text: holder prefix, rounded store-clock age, holder's TTL. | This startup refused that lease. | Not proof the holder is still alive; a stopped process can leave a lease. Not permission to force takeover. | Identify/fence writers and follow the [shutdown/restart procedure](#s3wal-shutdown-and-restart) below. |
-| Stderr `s3wal instance lease … fail-stop` | [Renewal](../../internal/ref/s3wal/lease.go#L258-L327) re-read found a foreign holder, corruption or disappearance; or failures persisted until the last accepted renewal was at least TTL − cadence old. Cadence is TTL/4. `unrenewable since …` includes elapsed time, TTL and write/read errors. | The heartbeat returned a loss verdict; [`serve` exits 1](../../cmd/openstorage/main.go#L165-L180). | Not proof of whole-system integrity, safe dual servers, or that every transient renewal failure exits. Fail-stop does not run graceful cleanup. | Preserve stderr and supervisor history; fence traffic/restarts, identify every writer, inspect connectivity and store evidence before restarting one node. |
-| Stderr `s3wal init: store supplied no usable HTTP Date witness during the probe …` or lease `… freshness cannot be judged on the store clock …` / `… is corrupt …` | [Startup probe](../../internal/ref/s3walstore.go#L199-L214) lacks a usable Date witness (missing or older than 30s); [lease acquisition](../../internal/ref/s3wal/lease.go#L154-L227) cannot decode the lease, finds no holder in it, or cannot judge its store-clock age. | Startup failed closed on missing/invalid evidence. | Not necessarily host-clock skew or a stale/dead holder. | Preserve errors; inspect store/proxy Date and Last-Modified behavior and connectivity. Keep writers fenced and escalate corruption. Do not follow diagnostic text suggesting object deletion. |
+| Stderr `s3wal instance lease _wal/instance-lease is held by another serve process …` | [Acquisition](../../internal/ref/s3wal/lease.go#L140-L229) found a fresh recorded lease, or a foreign holder won an acquisition race. Fields in text: holder prefix, rounded store-clock age, holder's TTL. | This startup refused that lease. | Not proof the holder is still alive; a stopped process can leave a lease. Not permission to force takeover. | Identify/fence writers and follow the [shutdown/restart procedure](#s3wal-shutdown-and-restart) below. |
+| Stderr `s3wal instance lease … fail-stop` | [Renewal](../../internal/ref/s3wal/lease.go#L260-L330) re-read found a foreign holder, corruption or disappearance; or failures persisted until the last accepted renewal was at least TTL − cadence old. Cadence is TTL/4. `unrenewable since …` includes elapsed time, TTL and write/read errors. | The heartbeat returned a loss verdict; [`serve` exits 1](../../cmd/openstorage/main.go#L166-L184). | Not proof of whole-system integrity, safe dual servers, or that every transient renewal failure exits. Fail-stop does not run graceful cleanup. | Preserve stderr and supervisor history; fence traffic/restarts, identify every writer, inspect connectivity and store evidence before restarting one node. |
+| Stderr `s3wal init: store supplied no usable HTTP Date witness during the probe …` or lease `… freshness cannot be judged on the store clock …` / `… is corrupt …` | [Startup probe](../../internal/ref/s3walstore.go#L200-L215) lacks a usable Date witness (missing or older than 30s); [lease acquisition](../../internal/ref/s3wal/lease.go#L156-L229) cannot decode the lease, finds no holder in it, or cannot judge its store-clock age. | Startup failed closed on missing/invalid evidence. | Not necessarily host-clock skew or a stale/dead holder. | Preserve errors; inspect store/proxy Date and Last-Modified behavior and connectivity. Keep writers fenced and escalate corruption. Do not follow diagnostic text suggesting object deletion. |
 | `WARN s3wal clock skew guard tripped: demoting expiry verdict to report-only` | [Expiry guard](../../internal/ref/s3walstore_quota.go#L68-L124): positive TTL appears elapsed, but clock or store-Date check fails. Fields: `base`, `what`, `manifest_clk`, `local_now`, `wall_drift`, `store_date`, `store_date_age`, `ttl`. | **That expiry verdict** was refused. | Not a diagnosis of a wrong host clock, a global report-only switch, or proof that all other operations are safe/successful. | Compare host time/drift, manifest clock and store/proxy Date evidence. A missing/stale witness also trips the guard. Fix the cause before a controlled restart; do not disable time safeguards. |
 
 <details>
@@ -661,7 +692,7 @@ incident/real-S3 qualification. Use it with the [general monitoring guidance](#w
   the byte delta against the old manifest.
 - Equality with either threshold does not trigger that threshold's action.
 - Mutations outside that predicate bypass **only this guard**.
-- Each [`newS3WALStore`](../../internal/ref/s3walstore.go#L152-L193) allocates its own
+- Each [`newS3WALStore`](../../internal/ref/s3walstore.go#L153-L194) allocates its own
   warning map. `serve` opens a store, and
   [hook invocations open their own](../../internal/githttp/hook.go#L1728-L1732).
   Reopening a store permits another warning for the same base.
@@ -674,7 +705,7 @@ incident/real-S3 qualification. Use it with the [general monitoring guidance](#w
   below the 2s Date-resolution tolerance disable that arm.
 - A quiet repository's old manifest clock alone is not skew.
 - The conditional client [records parsed HTTP Date headers](../../internal/ref/s3wal/casobj.go#L178-L213).
-- A prior wall-clock step can leave the [store's drift baseline](../../internal/ref/s3walstore.go#L636-L650)
+- A prior wall-clock step can leave the [store's drift baseline](../../internal/ref/s3walstore.go#L640-L654)
   tripped until restart. Restart does not repair an incorrect clock or missing witness.
 
 </details>

@@ -36,6 +36,7 @@ Each setting takes its value from the first source that is set:
 | [`OPENSTORAGE_S3_OP_LOG`](#openstorage_s3_op_log) | unset (disabled) | Diagnostics: append one line per S3 HTTP round trip to this file |
 | [`OPENSTORAGE_DATA_DIR`](#openstorage_data_dir) | — | Local-mode data directory; derives the two URLs above |
 | [`OPENSTORAGE_LISTEN`](#openstorage_listen) | `127.0.0.1:0` | Listen address |
+| [`OPENSTORAGE_METRICS_LISTEN`](#openstorage_metrics_listen) | unset (disabled) | Opt-in, unauthenticated Prometheus `/metrics` listener address |
 | [`OPENSTORAGE_ORG`](#openstorage_org) | — (required) | Org name (JWT `iss` claim) |
 | [`OPENSTORAGE_ORG_PUBKEYS`](#openstorage_org_pubkeys) | — (required) | PEM file with the org's public keys |
 | [`OPENSTORAGE_BASE_URL`](#openstorage_base_url) | derived from listener | External base URL for `http_url` values |
@@ -232,10 +233,30 @@ Local-mode data directory. The `--data-dir` flag wins over the variable.
 
 ### `OPENSTORAGE_LISTEN`
 
-Address of the single HTTP listener (REST API, git smart-HTTP, `/healthz`).
+Address of the HTTP listener for the REST API, git smart-HTTP, and `/healthz`.
+It never serves metrics; see [`OPENSTORAGE_METRICS_LISTEN`](#openstorage_metrics_listen).
 
 - **Default:** `127.0.0.1:0`, an ephemeral port printed as `listening on ...`.
 - The `--listen` flag (legacy alias `--addr`) wins.
+
+### `OPENSTORAGE_METRICS_LISTEN`
+
+Address of the opt-in Prometheus metrics listener ([metrics reference](metrics.md),
+[ADR-48](../adr/048-metrics-ride-an-opt-in-separate-listener-with-fixed-labels.md)).
+
+- **Default:** unset or empty, which means no metrics listener.
+- **Format:** `host:port`, like `127.0.0.1:9464`. `:0` picks a free port, printed as
+  `metrics listening on ...`.
+- **Validation:** the address is bound at startup before anything is served. An invalid,
+  unresolvable, or busy address, including the API listener's own address, stops `serve`
+  with exit 1. The value is not trimmed, so a whitespace-only value fails too.
+- **Serves:** only `GET /metrics` on its own socket. It shares nothing with the API
+  listener.
+
+> [!WARNING]
+> The metrics listener has **no authentication**. Bind it to loopback or a private
+> network that only your scraper can reach. `serve` warns when the address binds every
+> interface, but the warning is not access control.
 
 ### `OPENSTORAGE_ORG`
 

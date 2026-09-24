@@ -41,6 +41,7 @@ New here? Start with the [README quickstart](../README.md#quickstart-local-mode-
 | Page | Covers |
 |---|---|
 | [Configuration](reference/configuration.md) | Every `OPENSTORAGE_*` variable, defaults, and validation |
+| [Metrics](reference/metrics.md) | The opt-in Prometheus listener and every metric it exposes |
 | [CLI](reference/cli.md) | `openstorage` commands and flags |
 | [HTTP API](reference/http-api.md) | Endpoint catalog, scopes, and the status-code contract |
 | [Authentication](reference/authentication.md) | Customer-signed JWTs, claims, scopes, and ref policies |
@@ -61,7 +62,7 @@ New here? Start with the [README quickstart](../README.md#quickstart-local-mode-
 
 | Directory | Contents |
 |---|---|
-| [`adr/`](adr/README.md) | Architecture decision records (ADR-1 to ADR-47). Historical and individually addressable. |
+| [`adr/`](adr/README.md) | Architecture decision records (ADR-1 to ADR-48). Historical and individually addressable. |
 | [`archive/`](archive/phases/07-implementation-roadmap.md) | The original implementation roadmap and per-phase notes (`archive/phases/08` to `16`). Historical: for current behavior, prefer reference and explanation pages. Recorded evidence paths and upstream names are unchanged. |
 | `upstream/` | Verbatim copies of the vendor's OpenAPI spec and docs, kept for compatibility audits. |
 
