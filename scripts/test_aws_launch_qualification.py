@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import hmac
+import itertools
 import json
 import os
 from pathlib import Path
@@ -261,6 +262,31 @@ class RunnerTests(unittest.TestCase):
                 self.assertTrue(all(call.args[1] == self.config["endpoint"] for call in calls))
                 self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
 
+    def test_create_url_accepts_equivalent_origin_spellings(self):
+        for index, (endpoint, advertised) in enumerate([
+            ("https://PUBLIC.test:443", "https://PUBLIC.test:443"),
+            ("https://public.test", "https://PUBLIC.test:443"),
+            ("http://LOCALHOST:80", "http://LOCALHOST:80"),
+            ("http://[::1]:80", "http://[::1]:80"),
+        ]):
+            with self.subTest(endpoint=endpoint, advertised=advertised):
+                self.config["endpoint"] = endpoint
+                self.output = self.root / str(index)
+                def http(runner, base, path, *args, **kwargs):
+                    body = self.fake_http(runner, base, path, *args, **kwargs)
+                    if path == "/api/v1/repos":
+                        ack = json.loads(body)
+                        ack["http_url"] = advertised + "/" + REPO_ID + ".git"
+                        body = json.dumps(ack).encode()
+                    return body
+                code, calls, commands = self.smoke_with(http)
+                self.assertEqual(code, 0)
+                normalized = q.origin(endpoint, True)
+                canonical = normalized + "/" + REPO_ID + ".git"
+                self.assertEqual([call.args[0][-2] for call in commands if "ls-remote" in call.args[0]], [canonical])
+                self.assertTrue(all(call.args[1] == normalized for call in calls))
+                self.assertEqual(self.result()["cleanup"]["status"], "soft_deleted")
+
     def test_smoke_uses_canonical_git_url_and_direct_replica_paths(self):
         baseline = self.config.copy()
         for topology in ("local", "pg-s3"):
@@ -446,20 +472,20 @@ sys.exit(code)
         self.assertEqual(cases["api_commit"]["reason"], "interrupted")
         self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
 
-    def test_sigterm_during_cleanup_finishes_delete_and_replica_verification(self):
+    def test_signals_during_cleanup_finishes_delete_and_replica_verification(self):
         self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
         expected = [("https://one.test", "DELETE", False)] + [
             (base, "GET", git) for base in ("https://public.test", "https://one.test", "https://two.test") for git in (False, True, True)
         ]
-        for interrupt_at in range(len(expected)):
-            with self.subTest(interrupt_at=interrupt_at):
-                self.output = self.root / str(interrupt_at)
+        for sig, interrupt_at in itertools.product((q.signal.SIGTERM, q.signal.SIGINT), range(len(expected))):
+            with self.subTest(signal=sig, interrupt_at=interrupt_at):
+                self.output = self.root / f"{sig}-{interrupt_at}"
                 completed = []
-                previous = [q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGALRM)]
+                previous = [q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGINT, q.signal.SIGALRM)]
                 def http(runner, base, path, token=None, method="GET", data=None, **kwargs):
                     if runner.active == "cleanup":
                         if len(completed) == interrupt_at:
-                            os.kill(os.getpid(), q.signal.SIGTERM)
+                            os.kill(os.getpid(), sig)
                         completed.append((base, method, kwargs.get("git", False)))
                     return self.fake_http(runner, base, path, token, method, data, **kwargs)
                 with patch.object(q.signal, "setitimer", wraps=q.signal.setitimer) as timer:
@@ -473,18 +499,18 @@ sys.exit(code)
                 self.assertEqual([call.args for call in timer.call_args_list], [
                     (q.signal.ITIMER_REAL, 300), (q.signal.ITIMER_REAL, 45), (q.signal.ITIMER_REAL, 0),
                 ])
-                self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGALRM)], previous)
+                self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGINT, q.signal.SIGALRM)], previous)
                 self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
 
-    def test_sigterm_during_cleanup_preserves_failures_and_alarm_deadline(self):
-        for failure in ("http", "alarm"):
-            with self.subTest(failure=failure):
-                self.output = self.root / failure
+    def test_signals_during_cleanup_preserves_failures_and_alarm_deadline(self):
+        for sig, failure in itertools.product((q.signal.SIGTERM, q.signal.SIGINT), ("http", "alarm")):
+            with self.subTest(signal=sig, failure=failure):
+                self.output = self.root / f"{sig}-{failure}"
                 after_signal = []
-                previous = [q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGALRM)]
+                previous = [q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGINT, q.signal.SIGALRM)]
                 def http(runner, base, path, *args, **kwargs):
                     if path == "/api/v1/repos/delete":
-                        os.kill(os.getpid(), q.signal.SIGTERM)
+                        os.kill(os.getpid(), sig)
                         after_signal.append(True)
                         if failure == "alarm":
                             os.kill(os.getpid(), q.signal.SIGALRM)
@@ -497,7 +523,7 @@ sys.exit(code)
                 self.assertEqual(self.result()["cleanup"]["status"], "unknown")
                 case = next(case for case in self.result()["scenarios"] if case["id"] == "cleanup")
                 self.assertEqual((case["status"], case["reason"]), ("failed", "cleanup_failed_or_interrupted"))
-                self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGALRM)], previous)
+                self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGINT, q.signal.SIGALRM)], previous)
                 self.assertFalse(any(call.kwargs.get("expected") == 404 for call in calls))
                 self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
 
