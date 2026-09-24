@@ -1,11 +1,11 @@
 # Cut a release
 
-**Goal:** ship a new open.storage version — semver tag, GitHub release with CHANGELOG
-notes, and verified cross-platform binaries — with no manual version arithmetic.
+Ship a new open.storage version: a semver tag, a GitHub release with CHANGELOG
+notes, and verified cross-platform binaries. You never compute versions by hand.
 
-Releases are driven by [release-please](https://github.com/googleapis/release-please)
+[release-please](https://github.com/googleapis/release-please)
 ([#65](https://github.com/coder/openstorage/issues/65)) and the binaries workflow
-([#66](https://github.com/coder/openstorage/issues/66)):
+([#66](https://github.com/coder/openstorage/issues/66)) drive the flow:
 
 ```
 conventional commit lands on main
@@ -22,12 +22,13 @@ binaries built (CGO off), archives verified on linux + macOS, assets uploaded
 
 ## 1. Land conventional commits
 
-release-please only reacts to [conventional-commit](https://www.conventionalcommits.org/)
-**squash titles** on main. This repo's historical `<scope>: <subject>` style (`api: ...`,
-`githttp: ...`) is *invisible* to it — such commits neither bump the version nor appear
-in the CHANGELOG. The `pr-title` CI check ([#68](https://github.com/coder/openstorage/issues/68))
-rejects non-conventional titles on every PR and re-checks on title edits. For releasable
-work, title the PR:
+release-please reads only [conventional-commit](https://www.conventionalcommits.org/)
+**squash titles** on main. The older `<scope>: <subject>` style (`api: ...`,
+`githttp: ...`) is *invisible*: it neither bumps the version nor appears in the
+CHANGELOG. The `pr-title` CI check ([#68](https://github.com/coder/openstorage/issues/68))
+rejects non-conventional PR titles, including after title edits.
+
+Title releasable PRs like this:
 
 | Squash title | Effect (pre-1.0, `bump-minor-pre-major`) |
 |---|---|
@@ -40,13 +41,13 @@ work, title the PR:
 
 ## 2. Get the release PR green
 
-After the next push to main, release-please opens (or updates) the rolling release PR.
+After the next push to main, release-please opens or updates the rolling release PR.
 
-**Known caveat** (verified empirically on the first release PR, #74): the PR is created
-by `github-actions[bot]`, so GitHub creates the `pull_request` CI run but holds it at
-**"action required"** — nothing executes until a maintainer approves it, while branch
-protection requires `lint` / `test` / `test-local` / `test-s3wal`. Approve via the **Approve and run**
-button on the PR's Actions run, or:
+`github-actions[bot]` creates that PR, so GitHub holds its `pull_request` CI run at
+**"action required"**. Nothing runs until a maintainer approves it, and branch
+protection requires `lint` / `test` / `test-local` / `test-s3wal`.
+
+Approve with the **Approve and run** button on the PR's Actions run, or:
 
 ```sh
 gh run list -R coder/openstorage --branch release-please--branches--main \
@@ -54,57 +55,58 @@ gh run list -R coder/openstorage --branch release-please--branches--main \
 gh api --method POST repos/coder/openstorage/actions/runs/<run-id>/approve
 ```
 
-(`--workflow ci` matters: the branch also gets a held run from the optional
-`pr-title` workflow, and without the filter `--limit 1` can return that one —
-approving it would leave the required `lint`/`test`/`test-local`/`test-s3wal` checks blocked.)
+> [!IMPORTANT]
+> Keep `--workflow ci`. The branch also gets a held run from the optional `pr-title`
+> workflow. Without the filter, `--limit 1` may return that run, and approving it
+> leaves the required checks blocked.
 
-Each release-please refresh of the branch (any push to main while the release PR is
-open) creates a fresh held run needing the same approval. The separate `pr-title`
-workflow run is held the same way, but it is deliberately **not** in the required-check
-set precisely so an unapproved run cannot wedge the release PR — approving it is
-optional (the `chore(main): release X.Y.Z` title passes). A fine-grained PAT or GitHub
-App token in the action's `token` input would remove the ritual; until one is
-provisioned, approve-and-run is the documented path. Do **not** loosen branch
-protection instead.
+- Every push to main while the release PR is open refreshes the branch and creates
+  a new held run. Approve each one.
+- Approving the `pr-title` run is optional. It is deliberately **not** a required
+  check, so an unapproved run cannot wedge the release PR.
+- A fine-grained PAT or GitHub App token in the action's `token` input would remove
+  this step. Until one exists, approve-and-run is the documented path. Do **not**
+  loosen branch protection instead.
 
 ## 3. Merge the release PR
 
-Squash-merge as-is (keep the `chore(main): release X.Y.Z` title — it must not itself
-trigger a bump). The next `release-please.yml` run on that push:
+Squash-merge it as-is. Keep the `chore(main): release X.Y.Z` title so it does not
+trigger another bump. The next `release-please.yml` run then:
 
-1. creates tag `vX.Y.Z` and the GitHub release with the CHANGELOG section as notes, and
-2. chains the `release` workflow, which builds `./cmd/openstorage` for linux/amd64,
-   linux/arm64, darwin/amd64, darwin/arm64 with `CGO_ENABLED=0`
-   ([`scripts/release-archives.sh`](../../scripts/release-archives.sh)), stamps
-   tag/commit/date into [`openstorage version`](../reference/cli.md#openstorage-version),
-   verifies archive contents and the bundled license against the root [`LICENSE`](../../LICENSE),
-   verifies checksums and runs the native binary on both ubuntu and macOS runners, then
-   uploads `openstorage_<version>_<os>_<arch>.tar.gz` + `checksums.txt` as release
-   assets. Every archive contains `openstorage` and `LICENSE` at its root, so binary
-   recipients receive the license and `mise`/`ubi`-style installers can still find the binary.
+1. Creates tag `vX.Y.Z` and the GitHub release, using the CHANGELOG section as notes.
+2. Chains the `release` workflow
+   ([`scripts/release-archives.sh`](../../scripts/release-archives.sh)), which:
+   - builds `./cmd/openstorage` for linux/amd64, linux/arm64, darwin/amd64, and
+     darwin/arm64 with `CGO_ENABLED=0`;
+   - stamps tag/commit/date into [`openstorage version`](../reference/cli.md#openstorage-version);
+   - verifies archive contents and the bundled license against the root
+     [`LICENSE`](../../LICENSE);
+   - verifies checksums and runs the native binary on ubuntu and macOS runners;
+   - uploads `openstorage_<version>_<os>_<arch>.tar.gz` and `checksums.txt`.
 
-Watch the run: `gh run list --workflow release-please -R coder/openstorage`.
+Each archive has `openstorage` and `LICENSE` at its root, so recipients get the
+license and `mise`/`ubi`-style installers still find the binary.
 
-If the binaries job fails after the release exists (flaky runner, infra), fix the cause
-and re-run: `gh workflow run release -R coder/openstorage -f tag=vX.Y.Z` — it rebuilds
-from the tag and replaces the assets (`--clobber`).
+**Watch the run:** `gh run list --workflow release-please -R coder/openstorage`.
+
+**If the binaries job fails** after the release exists (flaky runner, infra), fix
+the cause and run `gh workflow run release -R coder/openstorage -f tag=vX.Y.Z`. It
+rebuilds from the tag and replaces the assets (`--clobber`).
 
 ## Notes
 
-- **Runtime dependencies:** the released binary does not bundle `git` (always required),
-  or `gpg` / `ssh-keygen` (required for `verify-sig` ref policies, which shell out and
-  fail closed — [#50](https://github.com/coder/openstorage/issues/50)). Unlike the
-  Docker image, a bare binary brings none of these; install them on the host.
-- **First release bootstrap:** `initial-version` in
-  [`release-please-config.json`](../../release-please-config.json) pins the first
-  release to `0.1.0` (without it, release-please's first-release path proposes `1.0.0`
-  and ignores the manifest's `0.0.0`), and `bootstrap-sha` pins where changelog
-  collection starts. Both only affect the first release; the manifest is
-  self-maintaining afterwards.
-- **Retroactively fixing a bad squash title:** if a releasable commit already landed
-  on main with a non-conventional title, edit the *merged PR's body* to add
-  release-please's commit-override block — the next run parses it instead of the
-  commit message (works because we squash-merge):
+- **Runtime dependencies:** the binary does not bundle `git` (always required) or
+  `gpg` / `ssh-keygen` (required for `verify-sig` ref policies, which shell out and
+  fail closed; [#50](https://github.com/coder/openstorage/issues/50)). Unlike the
+  Docker image, install them on the host.
+- **First release bootstrap:** in [`release-please-config.json`](../../release-please-config.json),
+  `initial-version` pins the first release to `0.1.0`. Without it, release-please
+  proposes `1.0.0` and ignores the manifest's `0.0.0`. `bootstrap-sha` pins where
+  changelog collection starts. Both affect only the first release; the manifest
+  maintains itself afterwards.
+- **Fixing a bad squash title after merge:** edit the *merged PR's body* and add
+  release-please's commit-override block. Because we squash-merge, the next run
+  parses it instead of the commit message:
 
   ```
   BEGIN_COMMIT_OVERRIDE
@@ -112,7 +114,7 @@ from the tag and replaces the assets (`--clobber`).
   END_COMMIT_OVERRIDE
   ```
 
-  Never put these markers in an unmerged PR body unless you mean it — they replace
+  Never put these markers in an unmerged PR body unless you mean it: they replace
   the squash title for release purposes.
-- **Tag namespace:** leave `v*` tags to release-please. A manually pushed tag would
-  desync its notion of the last release.
+- **Tag namespace:** leave `v*` tags to release-please. A manually pushed tag
+  desyncs its notion of the last release.
