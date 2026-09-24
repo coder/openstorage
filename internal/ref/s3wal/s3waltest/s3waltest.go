@@ -45,19 +45,15 @@ import (
 const (
 	SeaweedFSImage   = "chrislusf/seaweedfs:4.47"
 	MinIOLegacyImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z@sha256:4c4a4876193f030c81f57aabb22bcb9a73462010eb61fcab66908e03e5484af8"
-	// FlociImage pins the Floci row of the qualification matrix (issues
-	// #205, #212): the nightly lane runs the 22 qualification surfaces plus
-	// get-under-overwrite in REQUIRE mode against this build, so bumping
-	// the pin is how a new Floci build gets re-qualified and re-probed for
-	// the remaining documented gap (DeleteObject+If-Match ignored — issue
-	// #201). nightly-09012026 (image sha256:3d415bb82d47…, upstream
-	// revision f2b4c084) is the first published build carrying the
-	// GetObject torn-read fix floci-io/floci#2874 (plus its follow-up
-	// #2901); no release tag contains that fix yet — 2.0.1 was cut 25 min
-	// before it merged.
-	// TODO(#212): move to the first release tag after 2.0.1 once upstream
-	// cuts one (verify `git tag --contains b4aab999` in a floci clone).
-	FlociImage = "floci/floci:nightly-09012026"
+	// FlociImage pins the qualified stable release by OCI index digest (#274).
+	// Release 2.1.0 includes the GetObject torn-read fix floci-io/floci#2874
+	// and follow-up #2901. The linux/amd64 image (config 7527713e14d1,
+	// upstream revision 560b3e4a) passed all 22 standard surfaces plus
+	// get-under-overwrite in REQUIRE mode. DeleteObject+If-Match remains
+	// ignored and record-only, never a correctness guard.
+	// Keep both Floci workflows in sync with this pin. See
+	// docs/reference/testing.md for credential coverage and remaining gaps.
+	FlociImage = "floci/floci:2.1.0@sha256:f5aa8c18302cedb4f2385f5c4e455b3efc77fee6bf7b6e5d1712b2817ba102db"
 )
 
 // SeaweedFS's `weed server -s3` anonymous mode accepts any static
@@ -115,11 +111,9 @@ func StartSeaweedFS(tb testing.TB) string {
 // default non-enforcing auth mode: the data plane then accepts any static
 // SigV4 credential pair, so the lane needs no IAM provisioning (the only
 // vendored AWS service clients are s3 and sts). That is the right shape
-// for the qualification matrix, which probes data-plane semantics —
-// Floci's header-auth enforcement validates only key-ID existence anyway
-// (issue #201), and the SigV4/IAM enforcement path already has its own
-// nightly lane (floci-nightly.yml's blob job). Callers must still gate on
-// EnsureBucket for write readiness.
+// for the qualification matrix, which probes data-plane semantics.
+// Auth-enabled IAM and STS coverage lives in the two Floci workflows.
+// Callers must still gate on EnsureBucket for write readiness.
 func StartFloci(tb testing.TB) string {
 	tb.Helper()
 	ctx := context.Background()

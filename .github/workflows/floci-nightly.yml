@@ -6,18 +6,15 @@
 # with OPENSTORAGE_TEST_S3_URL pointed at it. That gates the env-gated
 # endpoint tests (internal/blob/s3endpoint_test.go), which pin real SigV4
 # verification on presigned URLs: valid signature ⇒ 200 + exact bytes,
-# corrupted signature ⇒ 403 SignatureDoesNotMatch. Known Floci gaps, so this
-# lane must not be extended into them (re-verified on nightly-09012026, the
-# pinned s3waltest.FlociImage — issue #212): no IAM policy evaluation on S3
-# actions and x-amz-expected-bucket-owner ignored (both documented in that
-# test file), DeleteObject+If-Match silently ignored, and header-auth SigV4
-# signatures not validated (key-ID existence only — presigned-URL
-# validation IS enforced, the property this lane pins). The torn-read gap
-# (GET racing a same-key overwrite) is fixed upstream in floci-io/floci#2874,
-# first shipped in nightly-09012026. A second job runs the Floci row of the
-# s3wal qualification matrix (issues #205, #212) — see the s3wal-qualify
-# job below. Full gap list + local repro: docs/reference/testing.md (The
-# Floci S3 lane).
+# corrupted signature ⇒ 403 SignatureDoesNotMatch. Release 2.1.0 also
+# rejects wrong header-auth secrets and invalid temporary-session tokens
+# in the #274 GetObject probes. Remaining gaps on this pin: an explicit
+# IAM Deny s3:GetObject does not deny reads, x-amz-expected-bucket-owner
+# is ignored, and DeleteObject+If-Match is ignored. Do not use this lane
+# to assert those properties. The release includes the torn-read fix
+# (floci-io/floci#2874 and #2901). A second job runs the Floci row of the
+# s3wal qualification matrix. Full gap list + local repro:
+# docs/reference/testing.md (The Floci S3 lane).
 name: floci-nightly
 
 on:
@@ -38,10 +35,12 @@ jobs:
         with:
           go-version-file: go.mod
       - name: boot floci
+        # Keep this OCI index digest in sync with s3waltest.FlociImage and
+        # floci-nightly-githttp.yml so every lane tests the qualified release.
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-            floci/floci:latest
+            floci/floci:2.1.0@sha256:f5aa8c18302cedb4f2385f5c4e455b3efc77fee6bf7b6e5d1712b2817ba102db
           for i in $(seq 1 60); do
             if curl -s -o /dev/null http://127.0.0.1:4566/; then
               echo "floci ready after ${i}s"
@@ -65,7 +64,7 @@ jobs:
             --user-name blob-nightly --output json)
           access_key_id=$(jq -r '.AccessKey.AccessKeyId // empty' <<<"$key_json")
           secret_key=$(jq -r '.AccessKey.SecretAccessKey // empty' <<<"$key_json")
-          # The image tag is mutable, so the returned JSON is untrusted:
+          # API responses remain untrusted even with a digest-pinned image:
           # full-string-validate both values before writing them to
           # GITHUB_ENV — an embedded newline would otherwise inject extra
           # variables (e.g. GOCACHEPROG) into every later step. Bash [[ =~ ]]
