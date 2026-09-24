@@ -1,68 +1,110 @@
 # open.storage documentation
 
-Documentation for open.storage, the open-source backend wire-compatible with
-[code.storage](https://code.storage) (Pierre Computer Company), organized by
-[Diátaxis](https://diataxis.fr/) quadrant.
+open.storage is an open-source Git storage backend, wire-compatible with
+[code.storage](https://code.storage) (Pierre Computer Company). These docs follow the
+[Diátaxis](https://diataxis.fr/) layout: tutorials, how-to guides, reference, and
+explanation.
 
-## Navigation
+New here? Start with the [README quickstart](../README.md#quickstart-local-mode-60-seconds).
 
-| Quadrant | Start here |
+<a name="navigation"></a>
+
+## Tutorials
+
+- [README quickstarts](../README.md#quickstart-local-mode-60-seconds): local mode in
+  60 seconds, two replicas with Docker Compose, and one S3 bucket (experimental).
+
+## How-to guides
+
+**Try and deploy**
+
+- [Try with Docker only](how-to/quickstart-docker.md)
+- [Deploy a two-replica stack with Docker Compose](how-to/deploy-docker-compose.md)
+- [Deploy to production](how-to/deploy-production.md)
+- [Deploy the AWS EC2 reference (Terraform)](how-to/deploy-aws-terraform.md)
+- [Migrate to open.storage](how-to/migrate-to-openstorage.md)
+
+**Operate**
+
+- [Operate the storage lifecycle: repack, quotas, sweeping](how-to/storage-lifecycle-and-sweeping.md)
+- [Run the zero-infrastructure mode (s3wal, experimental)](how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)
+- [Back up and restore a stopped S3WAL node](how-to/backup-restore-s3wal.md)
+
+**Maintain the project**
+
+- [Cut a release](how-to/release.md)
+- [Test an official-release upgrade locally](how-to/test-release-upgrade.md)
+- [Retain private SeaweedFS test logs](how-to/capture-seaweedfs-test-logs.md)
+
+## Reference
+
+| Page | Covers |
 |---|---|
-| **Tutorials** | The [README quickstarts](../README.md#quickstart-local-mode-60-seconds): local mode in 60 seconds, multi-node with Docker Compose, zero-infrastructure mode on one bucket (experimental) |
-| **How-to guides** | [Try with Docker only](how-to/quickstart-docker.md) · [Migrate to open.storage](how-to/migrate-to-openstorage.md) · [Deploy to production](how-to/deploy-production.md) · [Deploy the AWS EC2 reference](how-to/deploy-aws-terraform.md) · [Run the zero-infrastructure mode (s3wal)](how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node) · [Back up and restore a stopped S3WAL node](how-to/backup-restore-s3wal.md) · [Deploy a two-replica stack with Docker Compose](how-to/deploy-docker-compose.md) · [Operate the storage lifecycle](how-to/storage-lifecycle-and-sweeping.md) · [Cut a release](how-to/release.md) |
-| **Reference** | [Configuration](reference/configuration.md) · [CLI](reference/cli.md) · [Testing](reference/testing.md) · [HTTP API](reference/http-api.md) · [Authentication & JWT claims](reference/authentication.md) · [Webhooks](reference/webhooks.md) |
-| **Explanation** | [Wire compatibility](explanation/wire-compatibility.md) · [The storage engine](explanation/storage-engine.md) · [Domain model](explanation/domain-model.md) · [Git protocol & namespaces](explanation/git-protocol-and-namespaces.md) · [Streaming commit protocols](explanation/streaming-commit-protocols.md) |
+| [Configuration](reference/configuration.md) | Every `OPENSTORAGE_*` variable, defaults, and validation |
+| [CLI](reference/cli.md) | `openstorage` commands and flags |
+| [HTTP API](reference/http-api.md) | Endpoint catalog, scopes, and the status-code contract |
+| [Authentication](reference/authentication.md) | Customer-signed JWTs, claims, scopes, and ref policies |
+| [Webhooks](reference/webhooks.md) | Endpoint management, delivery headers, signatures, and event payloads |
+| [Testing](reference/testing.md) | Test lanes, conventions, fuzzing, and benchmarks |
 
-Two further directories sit outside the quadrants:
+## Explanation
 
-- **[`adr/`](adr/README.md)** — standalone architecture decision records (ADR-1..46),
-  extracted from the phase notes; historical, individually addressable.
-- **[`archive/`](archive/phases/07-implementation-roadmap.md)** — the original
-  [implementation roadmap](archive/phases/07-implementation-roadmap.md) and the per-phase
-  implementation notes (`archive/phases/08` … `16`), preserving historical workflows
-  with current project naming. Recorded evidence paths and upstream names are unchanged.
-  **Historical material**: for current behavior, prefer the reference and explanation
-  pages above.
-- **`upstream/`** — verbatim copies of the vendor's official OpenAPI spec and doc pages,
-  kept for wire-compatibility auditing.
+| Page | Explains |
+|---|---|
+| [Wire compatibility](explanation/wire-compatibility.md) | What matches code.storage, and the known deviations |
+| [The storage engine](explanation/storage-engine.md) | Immutable packs, ref compare-and-swap, garbage collection, and s3wal |
+| [Domain model](explanation/domain-model.md) | Entities, ref namespaces, and the invariants a backend must uphold |
+| [Git protocol and namespaces](explanation/git-protocol-and-namespaces.md) | Git smart HTTP, remote URLs, LFS, and refs over Git |
+| [Streaming commit protocols](explanation/streaming-commit-protocols.md) | NDJSON commits from file operations or patches, and restore commits |
 
-Contributor entry points: [CONTRIBUTING](../CONTRIBUTING.md) (setup, gates, review bar)
-and the [testing reference](reference/testing.md).
+## Other directories
 
-## The specification set: sources & methodology
+| Directory | Contents |
+|---|---|
+| [`adr/`](adr/README.md) | Architecture decision records (ADR-1 to ADR-46). Historical and individually addressable. |
+| [`archive/`](archive/phases/07-implementation-roadmap.md) | The original implementation roadmap and per-phase notes (`archive/phases/08` to `16`). Historical: for current behavior, prefer reference and explanation pages. Recorded evidence paths and upstream names are unchanged. |
+| `upstream/` | Verbatim copies of the vendor's OpenAPI spec and docs, kept for compatibility audits. |
 
-Five of the pages above — [domain model](explanation/domain-model.md),
+Contributors: start with [CONTRIBUTING](../CONTRIBUTING.md) and the
+[testing reference](reference/testing.md).
+
+<a name="the-specification-set-sources--methodology"></a>
+
+## How the API specification was built
+
+Six pages specify the code.storage API surface precisely enough to build a compatible
+backend: [domain model](explanation/domain-model.md),
 [authentication](reference/authentication.md), [HTTP API](reference/http-api.md),
 [streaming commit protocols](explanation/streaming-commit-protocols.md),
-[git protocol & namespaces](explanation/git-protocol-and-namespaces.md), and
-[webhooks](reference/webhooks.md) — specify the API surface of code.storage (Pierre
-Computer Company) precisely enough to build a wire-compatible backend from scratch. A
-compatible backend can be dropped in via the SDKs' `apiBaseUrl` / `storageBaseUrl`
-overrides without changing client code.
+[Git protocol and namespaces](explanation/git-protocol-and-namespaces.md), and
+[webhooks](reference/webhooks.md). A compatible backend drops in through the SDKs'
+`apiBaseUrl` / `storageBaseUrl` overrides, with no client code changes.
 
-Claims were extracted independently from three parallel SDK implementations and cross-checked
-against the vendor's own documentation:
+Each claim was extracted independently from three SDKs and cross-checked against the
+vendor's docs:
 
-| Source | What it authoritatively defines |
+| Source | Defines |
 |---|---|
 | `sdk/packages/code-storage-typescript` | Wire formats, JWT claims, NDJSON streaming, webhooks |
-| `sdk/packages/code-storage-python` | Same surface, confirms wire formats (convergent) |
-| `sdk/packages/code-storage-go` | Same surface, confirms wire formats (convergent) |
-| `just-code-storage` (real consumer) | Semantics clients depend on (sync, conflicts, status codes) |
-| `upstream/openapi.yaml` (official) | Full HTTP endpoint catalog incl. paths not used by SDKs |
-| `upstream/getting-started/`, `upstream/guides/` (official) | Auth model, webhooks, LFS, git operations prose |
+| `sdk/packages/code-storage-python` | Same surface; confirms wire formats |
+| `sdk/packages/code-storage-go` | Same surface; confirms wire formats |
+| `just-code-storage` (real consumer) | Semantics clients rely on: sync, conflicts, status codes |
+| `upstream/openapi.yaml` (official) | Full endpoint catalog, including paths the SDKs do not use |
+| `upstream/getting-started/`, `upstream/guides/` (official) | Auth model, webhooks, LFS, and Git operations |
 
-The three SDKs implement an **identical** wire surface (endpoints, claims, chunk sizes,
-signature scheme), which gives high confidence that the extracted spec is correct.
+All three SDKs implement the same wire surface (endpoints, claims, chunk sizes,
+signature scheme), which gives high confidence in the extracted spec.
 
-## The two API path styles
+<a name="the-two-api-path-styles"></a>
 
-The official OpenAPI spec defines **two parallel path styles** for the same operations:
+## Two API path styles
 
-- **v1 API (`/api/v1/...`)** — what all three SDKs use today. The target repository is *not*
-  in the path; it is identified by the JWT `repo` claim (e.g. `GET /api/v1/repos/commits`).
-- **Named-repo API (`/api/repos/{repo_name}/...`)** — newer style where the repo is in the
-  path (e.g. `GET /api/repos/{repo_name}/commits`); JWT still needs a matching `repo` claim.
+The official spec defines two path styles for the same operations:
 
-An open-source backend targeting SDK compatibility must implement the **v1 API first**;
-the named-repo style is a thin routing layer over the same handlers.
+| Style | Example | Repository comes from |
+|---|---|---|
+| **v1** (`/api/v1/...`) — used by all three SDKs | `GET /api/v1/repos/commits` | The JWT `repo` claim |
+| **Named-repo** (`/api/repos/{repo_name}/...`) — newer | `GET /api/repos/{repo_name}/commits` | The path; the JWT still needs a matching `repo` claim |
+
+Implement v1 first for SDK compatibility. The named-repo style is a thin routing layer
+over the same handlers.
