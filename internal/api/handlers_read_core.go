@@ -784,6 +784,7 @@ type fileMetaCommit struct {
 	Author  string `json:"author"`
 	Date    string `json:"date"`
 	Message string `json:"message"`
+	Order   int    `json:"order"`
 }
 
 type listFilesMetadataResponse struct {

@@ -27,7 +27,7 @@ var gitEnv = []string{
 	"GIT_CONFIG_SYSTEM=/dev/null",
 }
 
-func mustGit(t *testing.T, dir string, args ...string) string {
+func mustGit(t testing.TB, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
