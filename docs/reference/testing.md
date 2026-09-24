@@ -59,8 +59,10 @@ published manifest does not prove runtime qualification):
 
 On every pin change:
 
-1. Compare the REQUIRE-mode qualification and legacy MinIO rejection checks
-   without changing their assertions.
+1. Compare the REQUIRE-mode qualification and the probe-refusal checks
+   (`TestProbeRefusesNonCompliantStore`, plus the opt-in
+   [legacy MinIO lane](#legacy-minio-lane-opt-in) on a host that holds its
+   image) without changing their assertions.
 2. Keep volume capacity for every bucket, including backup and restore. The
    readiness helper requires `HeadBucket` plus a scratch PUT/DELETE; a health
    response does not prove volumes accept writes.
@@ -69,6 +71,38 @@ On every pin change:
 Native-amd64 results do not qualify native ARM, real AWS, or S3WAL promotion.
 A fixture upgrade neither updates historical benchmark receipts nor shows a
 performance change.
+
+### Legacy MinIO lane (opt-in)
+
+`TestQualifyMinIOLegacy` (`internal/ref/s3wal`) runs the qualification surfaces
+in record mode against the legacy MinIO pin `s3waltest.MinIOLegacyImage`
+(`RELEASE.2024-01-16T16-07-38Z`, pinned by digest). Record mode logs each store
+behavior as a verdict; only a surface that produces no verdict fails. The
+historical results are in the
+[Phase 1a matrix](../plans/s3wal-phase1a-results.md#5-r7-store-qualification-matrix).
+
+Since 2026-09-24 the image can no longer be pulled: quay.io and Docker Hub
+refuse anonymous pulls, and dl.min.io answers 410 Gone for community releases
+([#304](https://github.com/coder/openstorage/issues/304)). The lane is therefore
+opt-in, and CI does not run real MinIO:
+
+- Unset (default): the test skips and names this reason.
+- `OPENSTORAGE_TEST_MINIO_LEGACY=1`: the test runs with the unchanged digest
+  pin. A missing image, missing Docker, `-short`, or an incomplete verdict set
+  fails the test.
+- Any other value fails the test.
+
+```sh
+OPENSTORAGE_TEST_MINIO_LEGACY=1 go test ./internal/ref/s3wal \
+  -run '^TestQualifyMinIOLegacy$' -count=1 -v
+```
+
+The host needs a local copy of that exact image digest, so a fresh machine
+cannot run the lane. Maintainers run it on SeaweedFS pin changes (step 1 above)
+and on changes to the s3wal probe or CAS error classification. The per-PR lane
+still covers the defect this store showed, ignored `If-None-Match: *` creation,
+without Docker: `TestProbeRefusesNonCompliantStore` requires the probe to refuse
+such a store at step 2.
 
 ### Private SeaweedFS log capture
 
