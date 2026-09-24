@@ -1,11 +1,13 @@
 package githttp
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -82,6 +84,69 @@ func TestBenchGenerateChainSuccess(t *testing.T) {
 		t.Errorf("history count=%q, want seed plus three commits", got)
 	}
 	mustGit(t, dir, "fsck", "--full", "--no-dangling")
+}
+
+// benchTraceChain runs a two-commit chain in dir under GIT_TRACE2_EVENT and
+// returns how many commits started and how many auto-maintenance children
+// those commits spawned.
+func benchTraceChain(t *testing.T, dir string) (commits, maintenance int) {
+	t.Helper()
+	trace := filepath.Join(t.TempDir(), "trace2.json")
+	t.Setenv("GIT_TRACE2_EVENT", trace)
+	if _, err := benchGenerateChain(dir, 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_TRACE2_EVENT", "")
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.Lines(string(data)) {
+		var ev struct {
+			Event string   `json:"event"`
+			Argv  []string `json:"argv"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("trace2 line %q: %v", line, err)
+		}
+		switch {
+		case ev.Event == "start" && slices.Contains(ev.Argv, "commit"):
+			commits++
+		case ev.Event == "child_start" && slices.Contains(ev.Argv, "maintenance"):
+			maintenance++
+		}
+	}
+	return commits, maintenance
+}
+
+// Issue #219: since Git 2.54, `git commit` auto-maintenance can repack in a
+// detached process, and that repack's prune-packed rmdirs emptied fan-out
+// directories while the next chain commit writes into them (ENOENT from Git's
+// temp-object creation). Writer clones must not spawn that background
+// repacker at all.
+func TestBenchCloneWriterDisablesAutoMaintenance(t *testing.T) {
+	seed := newBenchChainTestRepo(t)
+
+	// Control: a plain clone's commits do spawn auto maintenance, so the
+	// trace selector below matches real events on this Git. autoDetach=false
+	// keeps that child in the foreground so it cannot outlive the test.
+	control := filepath.Join(t.TempDir(), "control")
+	mustGit(t, "", "clone", seed, control)
+	mustGit(t, control, "config", "maintenance.autoDetach", "false")
+	if commits, maintenance := benchTraceChain(t, control); commits != 2 || maintenance != 2 {
+		t.Fatalf("control: %d commits spawned %d maintenance children, want 2 and 2", commits, maintenance)
+	}
+
+	dir := filepath.Join(t.TempDir(), "w0")
+	if err := benchCloneWriter(seed, dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(mustGit(t, dir, "branch", "--show-current")); got != "w0" {
+		t.Fatalf("writer branch=%q, want w0", got)
+	}
+	if commits, maintenance := benchTraceChain(t, dir); commits != 2 || maintenance != 0 {
+		t.Fatalf("writer clone: %d commits spawned %d maintenance children, want 2 and 0", commits, maintenance)
+	}
 }
 
 func TestBenchGenerateChainDiagnostics_SyntheticResolverFailures(t *testing.T) {
