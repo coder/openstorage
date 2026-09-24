@@ -1,8 +1,10 @@
 # The storage engine: immutable packs, ref CAS, and garbage
 
 **TL;DR:** pack bytes are published before any ref can point at them. A crash can leave
-garbage, never a dangling ref; a careful sweeper reclaims it later. That explains what
-operators see: orphan blobs, retained bytes, repacks that keep unreachable objects.
+extra bytes, never a dangling ref. A careful sweeper later reclaims unregistered and
+superseded blobs; registered but unreachable objects stay until repository purge. That
+explains what operators see: orphan blobs, retained bytes, repacks that keep unreachable
+objects.
 Procedures: [storage lifecycle how-to](../how-to/storage-lifecycle-and-sweeping.md).
 Topology: [production guide](../how-to/deploy-production.md).
 
