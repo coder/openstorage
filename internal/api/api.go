@@ -185,24 +185,27 @@ func New(cfg Config) (http.Handler, error) {
 
 	// git:read surface (docs/archive/phases/07-implementation-roadmap.md p3, docs/reference/http-api.md; scope table docs/reference/authentication.md:56). Go's
 	// ServeMux "GET" patterns also match HEAD, covering HEAD /repos/file.
-	route("GET /api/v1/repos/file", false, s.handleGetFile, auth.ScopeGitRead)
-	route("GET /api/v1/repos/files", false, s.handleListFiles, auth.ScopeGitRead)
-	route("GET /api/v1/repos/files/metadata", false, s.handleFilesMetadata, auth.ScopeGitRead)
+	// Routes that start git run under a per-request git budget (#313,
+	// git_budget.go); the /api/repos/{repo_name}/... aliases re-dispatch
+	// through these registrations and inherit it.
+	route("GET /api/v1/repos/file", false, withGitReadBudget(s.handleGetFile), auth.ScopeGitRead)
+	route("GET /api/v1/repos/files", false, withGitReadBudget(s.handleListFiles), auth.ScopeGitRead)
+	route("GET /api/v1/repos/files/metadata", false, withGitReadBudget(s.handleFilesMetadata), auth.ScopeGitRead)
 	route("GET /api/v1/repos/branches", false, s.handleListBranches, auth.ScopeGitRead)
 	route("GET /api/v1/repos/branch", false, s.handleGetBranch, auth.ScopeGitRead)
-	route("GET /api/v1/repos/branches/diff", false, s.handleBranchesDiff, auth.ScopeGitRead)
-	route("GET /api/v1/repos/commits", false, s.handleListCommits, auth.ScopeGitRead)
-	route("GET /api/v1/repos/commit", false, s.handleGetCommit, auth.ScopeGitRead)
-	route("GET /api/v1/repos/diff", false, s.handleDiff, auth.ScopeGitRead)
-	route("GET /api/v1/repos/tags", false, s.handleListTags, auth.ScopeGitRead)
-	route("GET /api/v1/repos/tag", false, s.handleGetTag, auth.ScopeGitRead)
-	route("GET /api/v1/repos/blame", false, s.handleBlame, auth.ScopeGitRead)
-	route("POST /api/v1/repos/grep", false, s.handleGrep, auth.ScopeGitRead)
-	route("POST /api/v1/repos/archive", false, s.handleArchive, auth.ScopeGitRead)
+	route("GET /api/v1/repos/branches/diff", false, withGitReadBudget(s.handleBranchesDiff), auth.ScopeGitRead)
+	route("GET /api/v1/repos/commits", false, withGitReadBudget(s.handleListCommits), auth.ScopeGitRead)
+	route("GET /api/v1/repos/commit", false, withGitReadBudget(s.handleGetCommit), auth.ScopeGitRead)
+	route("GET /api/v1/repos/diff", false, withGitReadBudget(s.handleDiff), auth.ScopeGitRead)
+	route("GET /api/v1/repos/tags", false, withGitReadBudget(s.handleListTags), auth.ScopeGitRead)
+	route("GET /api/v1/repos/tag", false, withGitReadBudget(s.handleGetTag), auth.ScopeGitRead)
+	route("GET /api/v1/repos/blame", false, withGitReadBudget(s.handleBlame), auth.ScopeGitRead)
+	route("POST /api/v1/repos/grep", false, withGitReadBudget(s.handleGrep), auth.ScopeGitRead)
+	route("POST /api/v1/repos/archive", false, withGitArchiveBudget(s.handleArchive), auth.ScopeGitRead)
 
 	// Notes read surface (docs/reference/http-api.md "Notes"; handlers_read_notes.go). The
 	// notes write routes live in registerWriteRefRoutes below.
-	route("GET /api/v1/repos/notes", false, s.handleGetNote, auth.ScopeGitRead)
+	route("GET /api/v1/repos/notes", false, withGitReadBudget(s.handleGetNote), auth.ScopeGitRead)
 	route("GET /api/v1/repos/notes/refs", false, s.handleListNotesRefs, auth.ScopeGitRead)
 
 	// git:write surface (docs/archive/phases/07-implementation-roadmap.md p4). The route/scope tables live next to

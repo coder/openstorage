@@ -45,7 +45,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -80,8 +79,10 @@ func (s *server) registerWriteMergeRoutes(mux *http.ServeMux, verifier auth.Veri
 	mux.Handle("POST /api/v1/repos/merge",
 		rl.limit(routeWrite)(requireAuthWrite(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handleMerge))))
 	// Preview is a read (docs/reference/http-api.md: git:read) and keeps the {"error"} body.
+	// Its git children run under the read budget (#313); the scratch git
+	// runner (wcScratch.git) switches to gitread.Run when one is present.
 	mux.Handle("GET /api/v1/repos/merge/preview",
-		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitRead)(http.HandlerFunc(s.handleMergePreview))))
+		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitRead)(withGitReadBudget(s.handleMergePreview))))
 }
 
 // ---------------------------------------------------------------------------
@@ -231,17 +232,15 @@ func wmRunMergeTree(ctx context.Context, sc *wcScratch, targetSHA, sourceSHA str
 		args = append(args, "--allow-unrelated-histories")
 	}
 	args = append(args, targetSHA, sourceSHA)
-	cmd := sc.gitCmd(ctx, nil, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
+	// Exit 1 means conflicts; its stdout is still the result.
+	out, err := sc.git(ctx, nil, nil, args...)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
-			return nil, fmt.Errorf("git merge-tree: %w: %s", err, strings.TrimSpace(stderr.String()))
+			return nil, err
 		}
 	}
-	return wmParseMergeTreeZ(stdout.String(), err == nil)
+	return wmParseMergeTreeZ(out, err == nil)
 }
 
 // wmParseMergeTreeZ parses the NUL-separated merge-tree output described

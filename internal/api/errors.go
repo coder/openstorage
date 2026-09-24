@@ -11,10 +11,18 @@ import (
 const internalErrorMsg = "internal error"
 
 // internalErr logs the real error with request context and writes the
-// generic {"error":"internal error"} envelope with status 500.
+// generic {"error":"internal error"} envelope with status 500 — except for
+// read-side git limit errors, which get their documented answer
+// (writeGitLimitErr).
 func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil, "internalErr called with nil error")
 	assertf(op != "", "internalErr called with empty op")
+	// Read-side git limits (#313) are not internal errors: every handler
+	// reports its git failures through here, so this is the one place that
+	// maps them to their documented 422/503 answers.
+	if s.writeGitLimitErr(w, r, op, err) {
+		return
+	}
 	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
