@@ -52,10 +52,10 @@ func RepoPath(cacheDir, repo string) string {
 }
 
 // gitSpawnObserver, when set, observes every git subprocess spawned through
-// runGitCtx and updateRefStdin — the only two exec sites reachable from
-// Hydrate. Test seam for issue #93's guarantee that the generation-match
-// fast path forks no subprocess; an atomic pointer so installing the
-// observer never races a concurrent hydrator.
+// runGitCtx, updateRefStdin, and runCommitGraphAttempt — the only exec
+// sites reachable from Hydrate. Test seam for issue #93's guarantee that
+// the generation-match fast path forks no subprocess; an atomic pointer so
+// installing the observer never races a concurrent hydrator.
 var gitSpawnObserver atomic.Pointer[func(dir string, args []string)]
 
 func observeGitSpawn(dir string, args []string) {
@@ -3817,8 +3817,18 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	// early flush's skip under a hold released mid-scan would otherwise
 	// be vouched for by a fingerprint that still matches).
 	preHoldsKey, preHoldsOK := livePushHoldsKey(repoPath)
+	// Collect the distinct SHAs the sync streams (issue #307): every pass
+	// drains the whole store sequence, so after a successful sync tips holds
+	// exactly the tips it applied (or is over the cap). The commit-graph
+	// refresh below walks only these, never the live ref namespace.
+	var tips *refTips
+	uncollected := newStore
+	collectingStore := func() refSeq {
+		tips = newRefTips()
+		return &tipCollectingRefSeq{inner: uncollected(), tips: tips}
+	}
 	for range 3 {
-		if skippedHeld, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, syncRefsBatch); refsErr == nil {
+		if skippedHeld, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, collectingStore, syncRefsBatch); refsErr == nil {
 			break
 		}
 		// A store-side scan failure is an infrastructure error, not local
@@ -3843,6 +3853,11 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		// fresh marker for a whole TTL. No marker — the next hydrate
 		// full-syncs again and heals the ref once the hold clears.
 		writeGenerationMarker(repoPath, gen, headTarget)
+		// Refresh the commit-graph (issue #307, ADR-47) after the marker,
+		// so lock-free fast-path readers are not held up by it, and still
+		// under the hydrate lock, which serializes every graph writer for
+		// this repo. Best-effort: failures are logged, never returned.
+		refreshCommitGraph(ctx, repoPath, tips)
 	} else if refsErr == nil && skippedHeld && preHoldsOK {
 		// Held-skip verdict (Codex round-22 security P2, see
 		// heldGenerationMarker): reusable by later hydrates while the
