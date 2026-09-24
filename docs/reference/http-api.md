@@ -77,8 +77,8 @@ about the endpoint's rollout status on upstream clusters.
 
 - The JWT `repo` claim always names the new repository. The optional `repo_name` (it can
   contain `/`) must equal that claim exactly, with no case folding, trimming, or path
-  normalization. A mismatch, including an empty string, returns 400 before `default_branch`
-  or `base_repo` is checked, for forks too. `null` or an omitted `repo_name` changes nothing.
+  normalization. A mismatch, including an empty string, returns 400 and creates nothing,
+  for forks too. `null` or an omitted `repo_name` changes nothing.
 - Query `default_branch` is a fallback, used only when the body omits it.
 - `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus

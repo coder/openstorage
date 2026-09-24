@@ -339,6 +339,15 @@ func testCreateRepoRepoName(t *testing.T, e *testEnv) {
 		}
 		requireEnvelope(t, resp, respBody)
 		requireNoRow(t, claim)
+		// A mismatch next to a type-invalid sibling fails decoding first
+		// (generic invalid-JSON 400); either way nothing is created.
+		resp, respBody = e.doReq(t, http.MethodPost, "/api/v1/repos", tok, []byte(`{"repo_name":"`+other+`","default_branch":42}`), "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("mismatch + numeric default_branch status = %d, want 400 (body %s)", resp.StatusCode, respBody)
+		}
+		requireEnvelope(t, resp, respBody)
+		requireNoRow(t, claim)
+		requireNoRow(t, other)
 	})
 
 	t.Run("mismatch naming an existing repo cannot touch it", func(t *testing.T) {

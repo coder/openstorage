@@ -178,8 +178,11 @@ const repoNameMismatchMsg = "repo_name must equal the JWT repo claim"
 
 // repoNameMatches reports whether the optional body repo_name is absent or
 // exactly (byte-for-byte, no normalization) equal to the JWT repo claim.
-// Every POST /repos creator checks it before any other body validation or
-// side effect, so a body name can confirm the claim but never override it.
+// Every POST /repos creator checks it right after decoding the body, before
+// validating default_branch or base_repo values and before any side effect,
+// so a body name can confirm the claim but never override it. A body that
+// fails to decode (e.g. a non-string sibling field) is rejected earlier with
+// the generic invalid-JSON 400; either way nothing is created.
 func (req *createRepoRequest) repoNameMatches(claim string) bool {
 	assertf(req != nil, "repoNameMatches: nil request")
 	assertf(claim != "" && claim != auth.RepoClaimOrg, "repoNameMatches: non-repo claim %q", claim)
