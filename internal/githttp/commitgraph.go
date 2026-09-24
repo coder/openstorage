@@ -108,7 +108,7 @@ type commitGraphOutcome string
 
 const (
 	outcomeWritten       commitGraphOutcome = "written"         // graph extended (or nothing new); not logged
-	outcomeWrittenPlain  commitGraphOutcome = "written_plain"   // first attempt timed out; plain retry succeeded
+	outcomeWrittenPlain  commitGraphOutcome = "written_plain"   // first attempt timed out; plain retry succeeded (possibly with nothing new to write)
 	outcomeSkippedTipCap commitGraphOutcome = "skipped_tip_cap" // more than commitGraphMaxTips distinct tips
 	outcomeSkippedBusy   commitGraphOutcome = "skipped_busy"    // every process-wide slot busy
 	outcomeLockHeld      commitGraphOutcome = "lock_held"       // commit-graph-chain.lock already exists
@@ -180,7 +180,7 @@ func refreshCommitGraph(ctx context.Context, repoPath string, tips *refTips) com
 		return recordCommitGraphOutcome(repoPath, outcomeCanceled, err.Error())
 	case errors.Is(err, errCommitGraphLockHeld):
 		return recordCommitGraphOutcome(repoPath, outcomeLockHeld, err.Error()+" (see the stale-lock runbook; reads stay correct, only slower)")
-	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errCommitGraphBudget):
+	case errors.Is(err, context.DeadlineExceeded):
 		return recordCommitGraphOutcome(repoPath, outcomeTimedOut, err.Error()+" (reads stay correct, only slower)")
 	default:
 		return recordCommitGraphOutcome(repoPath, outcomeFailed, err.Error()+" (reads stay correct, only slower)")
@@ -217,11 +217,13 @@ func writeCommitGraph(ctx context.Context, repoPath string, tips []string) (plai
 	if !errors.Is(err, errCommitGraphBudget) {
 		return false, err
 	}
+	// Only the terminal failure is wrapped (%w), so outcome classification
+	// follows what ended the refresh, not the first attempt's timeout.
 	if cerr := ctx.Err(); cerr != nil {
-		return false, fmt.Errorf("%w; no retry: %w", err, cerr)
+		return false, fmt.Errorf("%v; no retry: %w", err, cerr)
 	}
 	if rerr := runCommitGraphAttempt(ctx, repoPath, 0, append(slices.Clip(args), "--no-changed-paths"), stdin); rerr != nil {
-		return false, fmt.Errorf("%w; plain retry: %w", err, rerr)
+		return false, fmt.Errorf("%v; plain retry: %w", err, rerr)
 	}
 	return true, nil
 }

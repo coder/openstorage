@@ -262,7 +262,8 @@ func TestCommitGraphEnv(t *testing.T) {
 // attempt (no --no-changed-paths) records its pid and then hangs until
 // SIGTERM ("term <pid>"), or exits 1 in mode "fail". The plain retry logs
 // whether the first attempt's process is already gone ("prev-dead") and
-// then execs the real Git, or hangs too in mode "hang-all".
+// then execs the real Git, hangs too in mode "hang-all", or exits 1 in
+// mode "hang-then-fail".
 func fakeCommitGraphGit(t *testing.T, mode string) (logPath string) {
 	t.Helper()
 	realGit, err := exec.LookPath("git")
@@ -278,6 +279,7 @@ echo "start $$ $*" >> "$log"
 case " $* " in
 *" --no-changed-paths "*)
 	if [ -f "$log.pid1" ] && kill -0 "$(cat "$log.pid1")" 2>/dev/null; then echo prev-alive >> "$log"; else echo prev-dead >> "$log"; fi
+	if [ "$CG_FAKE_MODE" = hang-then-fail ]; then echo boom2 >&2; exit 1; fi
 	[ "$CG_FAKE_MODE" = hang-all ] || exec "$CG_REAL_GIT" "$@" ;;
 *)
 	echo $$ > "$log.pid1"

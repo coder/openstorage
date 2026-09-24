@@ -225,7 +225,7 @@ change. These are the outcomes:
 | Outcome | Meaning | Action |
 |---|---|---|
 | `outcome=written` | Graph extended, or already current. Not logged. | None |
-| `outcome=written_plain` | The first attempt ran out of its 3 s budget, and a graph without Bloom filters was written instead. Later refreshes of that repo on this replica also skip Bloom filters. | None needed. Expected for very large histories. |
+| `outcome=written_plain` | The first attempt ran out of its 3 s budget, and the retry without Bloom filters succeeded (it may have found nothing new to write). Later refreshes of that repo on this replica may also skip Bloom filters. | None needed. Expected for very large histories. |
 | `outcome=skipped_tip_cap` | The repo's refs point at more than 10,000 distinct commits, so no refresh ran. | None. The existing graph (if any) stays valid. |
 | `outcome=skipped_busy` | Two refreshes were already running in this process, so this one was skipped. The next full hydrate retries. | Look only if it is constant. That means sustained full-hydrate load. |
 | `outcome=lock_held` | Git found `objects/info/commit-graphs/commit-graph-chain.lock` already present. | If it repeats for one repo, follow the stale-lock runbook below. |
@@ -244,21 +244,21 @@ stops growing on that replica. To recover:
 
 1. Take the repository path from the `repo=` field. A relative path is relative to the
    server's working directory.
-2. Confirm that no process is still writing that graph. On the replica (or inside its
-   container), list the writers with `pgrep -af 'commit-graph write'`, and check each
-   one's working directory with `readlink /proc/<pid>/cwd`. If any writer's working
-   directory is the repository path, wait for it to exit and check again.
-3. Remove only the lock file:
+2. Drain the replica (stop routing new requests to it) and stop the openstorage process.
+3. Make sure nothing else is still writing to the cache. A Git child of the stopped
+   server can outlive it, and so can a Git process someone started by hand. With the
+   server stopped, `pgrep -af git` on the replica (or inside its container) must list no
+   Git process working in the cache directory. If one does, wait for it to exit. Only a
+   stopped replica makes this check safe: a live server can start a new writer right
+   after the check.
+4. Remove the lock file:
    `rm <repo>/objects/info/commit-graphs/commit-graph-chain.lock`. You may also delete
    leftover `objects/info/commit-graphs/tmp_graph_*` files from the killed writer; Git
-   ignores them.
-4. After the next full hydrate of that repository (for example, after the next push),
-   check that no new `lock_held` line appears. `git -C <repo> commit-graph verify` should
-   succeed.
-
-If you cannot rule out a live writer, drain and stop the replica first. You may then
-delete the whole `objects/info/commit-graphs` directory, because the graph is rebuilt on
-the next full hydrate.
+   ignores them. If in doubt, delete the whole `objects/info/commit-graphs` directory
+   instead. The graph is rebuildable.
+5. Start the replica. After the next full hydrate of that repository (for example, after
+   the next push), check that no new `lock_held` line appears. `git -C <repo>
+   commit-graph verify` should succeed.
 
 openstorage never removes this lock itself. It cannot prove that no live process owns
 the lock: a crashed server can leave its Git child running, and other Git processes do

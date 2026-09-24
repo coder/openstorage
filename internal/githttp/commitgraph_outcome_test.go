@@ -193,3 +193,19 @@ func TestRefreshCommitGraph_FailedLogged(t *testing.T) {
 		t.Fatalf("failed line %q lacks git's stderr", l)
 	}
 }
+
+// The outcome follows what ended the refresh: a first-attempt timeout
+// followed by an unrelated retry failure is failed, not timed_out.
+func TestRefreshCommitGraph_ClassifiesTerminalFailure(t *testing.T) {
+	repoPath, tips := newGraphRepo(t, 5)
+	fakeCommitGraphGit(t, "hang-then-fail")
+	setCommitGraphBudgets(t, 10*time.Second, 300*time.Millisecond, time.Second)
+	buf := captureLog(t)
+	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeFailed {
+		t.Fatalf("outcome = %s, want failed", got)
+	}
+	assertOneOutcome(t, buf, outcomeFailed, repoPath)
+	if l := refreshLines(buf)[0]; !strings.Contains(l, "boom2") {
+		t.Fatalf("failed line %q lacks the retry's stderr", l)
+	}
+}
