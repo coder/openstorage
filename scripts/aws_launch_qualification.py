@@ -32,6 +32,7 @@ SCENARIOS = {
     "config": "not reached", "local_artifact": "not reached",
     "aws_identity": "--aws-readonly not requested", "aws_bucket": "--aws-readonly not requested",
     "health": "--smoke not requested", "auth_denial": "--smoke not requested",
+    "auth_repo_binding": "--smoke not requested", "auth_expiry": "--smoke not requested",
     "create_repo": "--smoke not requested", "api_commit": "--smoke not requested",
     "git_clone": "--smoke not requested", "git_push": "--smoke not requested",
     "lfs_roundtrip": "--smoke not requested", "cross_replica": "requires pg-s3 smoke",
@@ -272,12 +273,27 @@ class Runner:
                       "--expected-bucket-owner", aws["expected_bucket_owner"], *common])
         self.passed()
 
-    def mint(self, scopes):
-        # Cover the maximum 900-second run and the separate 45-second cleanup.
+    def mint(self, scopes, repo=None, ttl="20m"):
+        # Normal tokens cover the maximum run and cleanup; only the expiry probe uses 1s.
         token = self.command([self.config["binary"], "mint", "--key", self.config["private_key_file"],
-                              "--iss", self.config["org"], "--repo", self.repo, "--scopes", scopes, "--ttl", "20m"]).decode().strip()
+                              "--iss", self.config["org"], "--repo", repo or self.repo, "--scopes", scopes, "--ttl", ttl]).decode().strip()
         require(re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token), "invalid_minted_token")
         return token
+
+    def read_denial(self, token, api_status, git_status):
+        # The API alias binds the URL name to the claim. The v1 route alone only
+        # reads the repo named in the claim, so it cannot test cross-repo denial.
+        for base in dict.fromkeys([self.config["endpoint"], *self.config["replica_urls"]]):
+            for path, method, data, git, status in (
+                ("/api/repos/" + self.repo, "GET", None, False, api_status),
+                (self.gitpath + "/info/refs?service=git-upload-pack", "GET", None, True, git_status),
+                (self.gitpath + "/info/lfs/objects/batch", "POST",
+                 b'{"operation":"download","transfers":["basic"],"objects":[]}', True, git_status),
+            ):
+                # Same-route positive control: a missing repo or invalid body must
+                # not masquerade as an authorization denial. Empty LFS reads do not write.
+                self.http(base, path, self.token, method, data, git=git)
+                self.http(base, path, token, method, data, expected=status, git=git)
 
     def git(self, *args, cwd=None):
         return self.command(["git", "-c", "http.followRedirects=false", "-c", "credential.helper=",
@@ -340,6 +356,20 @@ class Runner:
                 and origin(advertised[:-len(canonical_path)], self.config["topology"] == "local") == public, "invalid_create_url")
         self.gitpath = canonical_path
         self.created = True
+        self.passed()
+        self.step("auth_repo_binding")
+        self.read_denial(self.mint("git:read", repo="q222-other-" + str(uuid.uuid4())), 404, 403)
+        self.passed()
+        self.step("auth_expiry")
+        expired = self.mint("git:read", ttl="1s")
+        payload = expired.split(".")[1]
+        expires = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["exp"]
+        require(type(expires) is int and expires <= time.time() + 5, "invalid_short_token_expiry")
+        delay = max(0, expires + 2 - time.time())
+        require(delay < self.remaining(), "budget_exhausted")
+        time.sleep(delay)
+        require(time.time() >= expires, "expiry_wait_incomplete")
+        self.read_denial(expired, 401, 401)
         self.passed()
         self.step("api_commit")
         initial = b"qualification API\n"

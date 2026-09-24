@@ -152,6 +152,12 @@ The smoke creates its own unique repository. It checks health, authorization
 denials, API commit → Git clone, Git push → API read, branch/tag handling,
 and a real Git LFS round-trip. The standard-mode path also exercises direct
 replica reads. It uses the supplied signing key to mint short-lived JWTs.
+Read-only API, Git, and empty LFS-download requests must reject correctly signed
+cross-repository and expired tokens, with a valid-token control on each route.
+The expiry check mints a one-second token and waits until two seconds past its
+expiry within the run budget; server clock skew can make this check fail.
+Write-scope denial probes remain separate work in
+[issue #319](https://github.com/coder/openstorage/issues/319).
 Raw child output, tokens, and response bodies are not copied into evidence.
 API/Git redirects are disabled; Git LFS retains its own redirect policy.
 Use only trusted scratch endpoints, not arbitrary third-party repositories.

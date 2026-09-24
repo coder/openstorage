@@ -49,6 +49,8 @@ class RunnerTests(unittest.TestCase):
         if argv[-1] == "version" and argv[0] != "git":
             return f"openstorage devel (commit {COMMIT}, built now, go1.26.0)\n".encode()
         if "mint" in argv:
+            if argv[argv.index("--ttl") + 1] == "1s":
+                return b"aaa.eyJleHAiOjB9.ccc\n"  # exp=0; no wall-clock delay in ordinary fixtures.
             return b"aaa.bbb.ccc\n"
         return b""
 
@@ -383,7 +385,8 @@ class RunnerTests(unittest.TestCase):
                 name = [call.args[2] for call in calls if call.kwargs.get("expected") == 404 and call.kwargs.get("git")]
                 self.assertEqual(len(name), origins)
                 self.assertTrue(all(p.startswith("/q222-") and p.endswith(".git/info/refs?service=git-upload-pack") for p in name))
-                canonical = [call.args[2] for call in calls if call.kwargs.get("expected") == 403 and call.args[2].startswith(path)]
+                deletion = next(index for index, call in enumerate(calls) if call.args[2] == "/api/v1/repos/delete")
+                canonical = [call.args[2] for call in calls[deletion + 1:] if call.kwargs.get("expected") == 403 and call.args[2].startswith(path)]
                 self.assertEqual(canonical, [path + "/info/refs?service=git-upload-pack"] * origins)
 
     def test_cleanup_matches_git_status_rules_after_soft_delete(self):
@@ -418,8 +421,11 @@ class RunnerTests(unittest.TestCase):
         code, _, commands = self.smoke_with()
         self.assertEqual(code, 0)
         minted = [call.args[0] for call in commands if "mint" in call.args[0]]
-        self.assertEqual(len(minted), 2)
+        self.assertEqual(len(minted), 4)
+        self.assertEqual(sum(argv[argv.index("--ttl") + 1] == "1s" for argv in minted), 1)
         for argv in minted:
+            if argv[argv.index("--ttl") + 1] == "1s":
+                continue  # The authentic expired-token denial probe, never a cleanup credential.
             ttl = argv[argv.index("--ttl") + 1]
             self.assertRegex(ttl, r"^[0-9]+m$")
             self.assertGreater(int(ttl[:-1]) * 60, 900 + 45)
@@ -435,7 +441,7 @@ class RunnerTests(unittest.TestCase):
         def command(argv, **kwargs):
             if "mint" in argv:
                 claims = {"iss": "test-org", "repo": argv[argv.index("--repo") + 1],
-                          "scopes": argv[argv.index("--scopes") + 1].split(",")}
+                          "scopes": argv[argv.index("--scopes") + 1].split(","), "exp": 0}
                 message = encode(b'{"alg":"HS256","typ":"JWT"}') + "." + encode(json.dumps(claims).encode())
                 return (message + "." + encode(hmac.digest(key, message.encode(), "sha256"))).encode()
             return self.fake_command(argv, **kwargs)
@@ -478,6 +484,116 @@ class RunnerTests(unittest.TestCase):
                     if len(call.args) > 3 and isinstance(call.args[3], str) and call.args[3].count(".") == 2:
                         for file in self.output.iterdir():
                             self.assertNotIn(call.args[3], file.read_text())
+
+    def test_signed_read_denials_on_api_git_and_lfs(self):
+        origins = ("https://public.test", "https://one.test", "https://two.test")
+        self.config.update(topology="pg-s3", endpoint=origins[0], replica_urls=list(origins[1:]))
+        key = b"independent signed repo-binding fixture"
+        def encode(value):
+            return base64.urlsafe_b64encode(value).decode().rstrip("=")
+        def decode(value):
+            return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        def command(argv, **kwargs):
+            if "mint" in argv:
+                claims = {"iss": "test-org", "repo": argv[argv.index("--repo") + 1],
+                          "scopes": argv[argv.index("--scopes") + 1].split(","),
+                          "exp": 0 if argv[argv.index("--ttl") + 1] == "1s" else int(q.time.time()) + 1200}
+                message = encode(b'{"alg":"HS256","typ":"JWT"}') + "." + encode(json.dumps(claims).encode())
+                return (message + "." + encode(hmac.digest(key, message.encode(), "sha256"))).encode()
+            return self.fake_command(argv, **kwargs)
+        for index, (scenario, accepts) in enumerate(itertools.product(
+                ("auth_repo_binding", "auth_expiry"), [None, *itertools.product(origins, ("api", "git", "lfs"))])):
+            with self.subTest(scenario=scenario, accepts=accepts):
+                self.output = self.root / str(index)
+                observed = []
+                def http(runner, base, path, token=None, method="GET", data=None, expected=200, git=False):
+                    if runner.active == scenario:
+                        self.assertTrue(runner.created)
+                        header, payload, signature = token.split(".")
+                        self.assertTrue(hmac.compare_digest(decode(signature), hmac.digest(key, (header + "." + payload).encode(), "sha256")))
+                        claims = json.loads(decode(payload))
+                        self.assertIn("git:read", claims["scopes"])
+                        interface = "lfs" if path.endswith("/objects/batch") else "git" if git else "api"
+                        wanted_path = {"api": "/api/repos/" + runner.repo,
+                                       "git": "/" + REPO_ID + ".git/info/refs?service=git-upload-pack",
+                                       "lfs": "/" + REPO_ID + ".git/info/lfs/objects/batch"}[interface]
+                        self.assertEqual(path, wanted_path)
+                        self.assertEqual(method, "POST" if interface == "lfs" else "GET")
+                        if interface == "lfs":
+                            self.assertEqual(json.loads(data), {"operation": "download", "transfers": ["basic"], "objects": []})
+                        denied = token != runner.token
+                        if scenario == "auth_repo_binding":
+                            self.assertGreater(claims["exp"], q.time.time())
+                            if denied:
+                                self.assertRegex(claims["repo"], r"^q222-other-[a-f0-9-]{36}$")
+                            else:
+                                self.assertEqual(claims["repo"], runner.repo)
+                            denial_status = 404 if interface == "api" else 403
+                        else:
+                            self.assertEqual(claims["repo"], runner.repo)
+                            self.assertEqual(claims["exp"] <= q.time.time(), denied)
+                            denial_status = 401
+                        observed.append((base, interface, denied, expected))
+                        status = denial_status if denied else 200
+                        if denied and accepts == (base, interface):
+                            status = 200
+                        q.require(status == expected, "unexpected_http_status")
+                    return self.fake_http(runner, base, path, token, method, data, expected, git)
+                with patch.object(q.Runner, "http", autospec=True, side_effect=http), \
+                        patch.object(q.Runner, "command", side_effect=command), patch.object(q.shutil, "which", return_value="/bin/fake"):
+                    code = self.invoke(smoke=True)
+                if accepts is None:
+                    self.assertEqual(code, 0)
+                    self.assertEqual(observed, [(base, interface, wrong, (401 if scenario == "auth_expiry" else 404 if interface == "api" else 403) if wrong else 200)
+                                               for base in origins for interface in ("api", "git", "lfs") for wrong in (False, True)])
+                else:
+                    self.assertEqual(code, 1)
+                    case = next(case for case in self.result()["scenarios"] if case["id"] == scenario)
+                    self.assertEqual((case["status"], case["reason"]), ("failed", "unexpected_http_status"))
+                    self.assertEqual(observed[-1][:3], (*accepts, True))
+                self.assertEqual(self.result()["cleanup"]["status"], "soft_deleted")
+
+    def test_expiry_wait_is_bounded_and_preserves_the_signed_token(self):
+        for index, (expires, remaining, reason) in enumerate([
+            (1001, 30, None), (1001, 1, "budget_exhausted"),
+            (10000, 30, "invalid_short_token_expiry"), (True, 30, "invalid_short_token_expiry"),
+            ("1001", 30, "invalid_short_token_expiry"), (None, 30, "invalid_short_token_expiry"),
+        ]):
+            with self.subTest(expires=expires, remaining=remaining):
+                self.output = self.root / str(index)
+                clock = [1000.0]
+                payload = base64.urlsafe_b64encode(json.dumps({"exp": expires}).encode()).decode().rstrip("=")
+                token = "aaa." + payload + ".ccc"
+                def command(argv, **kwargs):
+                    if "mint" in argv and argv[argv.index("--ttl") + 1] == "1s":
+                        return token.encode()
+                    return self.fake_command(argv, **kwargs)
+                def sleep(delay):
+                    clock[0] += delay
+                probes = []
+                def http(runner, base, path, *args, **kwargs):
+                    if runner.active == "auth_expiry":
+                        self.assertEqual(clock[0], 1003.0)
+                        if kwargs.get("expected") == 401:
+                            probes.append(args[0])
+                    return self.fake_http(runner, base, path, *args, **kwargs)
+                with patch.object(q.Runner, "command", side_effect=command), \
+                        patch.object(q.Runner, "http", autospec=True, side_effect=http), \
+                        patch.object(q.Runner, "remaining", return_value=remaining), \
+                        patch.object(q.shutil, "which", return_value="/bin/fake"), \
+                        patch.object(q.time, "time", side_effect=lambda: clock[0]), patch.object(q.time, "sleep", side_effect=sleep) as wait:
+                    self.assertEqual(self.invoke(smoke=True), int(reason is not None))
+                if reason is None:
+                    wait.assert_called_once_with(3.0)
+                    self.assertEqual(probes, [token] * 3)
+                else:
+                    wait.assert_not_called()
+                    self.assertEqual(probes, [])
+                    case = next(case for case in self.result()["scenarios"] if case["id"] == "auth_expiry")
+                    self.assertEqual(case["reason"], reason)
+                self.assertEqual(self.result()["cleanup"]["status"], "soft_deleted")
+                for file in self.output.iterdir():
+                    self.assertNotIn(token, file.read_text())
 
     def test_cleanup_failure_fails_otherwise_successful_smoke(self):
         def http(runner, base, path, *args, **kwargs):
@@ -651,7 +767,7 @@ sys.exit(code)
                 case = next(case for case in self.result()["scenarios"] if case["id"] == "cleanup")
                 self.assertEqual((case["status"], case["reason"]), ("failed", "cleanup_failed_or_interrupted"))
                 self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGINT, q.signal.SIGALRM)], previous)
-                self.assertFalse(any(call.kwargs.get("expected") == 404 for call in calls))
+                self.assertEqual(calls[-1].args[2], "/api/v1/repos/delete")
                 self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
 
     def test_subprocess_timeout_kills_owned_process_and_sanitizes(self):
