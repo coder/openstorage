@@ -1,70 +1,99 @@
 # HTTP API Reference (v1, SDK-compatible surface)
 
-Base: `https://api.{org}.code.storage/api/v1` (SDKs build `{apiBaseUrl}/api/v{version}`,
-version fixed at 1). All endpoints require `Authorization: Bearer <jwt>` (see the
-[auth spec](authentication.md)). SDKs send a `Code-Storage-Agent` header — `code-storage-sdk/<ver>`
-(TypeScript), `code-storage-py-sdk/<ver>` (Python), `code-storage-go-sdk/<ver>` (Go);
-treat it as informational.
+The SDK-verified v1 contract, with implementation notes the official spec lacks. Full
+request/response schemas, including the parallel `/api/repos/{repo_name}/...` path style,
+are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
 
-For exhaustive request/response schemas see [`../upstream/openapi.yaml`](../upstream/openapi.yaml) (official; also defines
-the parallel `/api/repos/{repo_name}/...` path style). This document is the SDK-verified
-contract with implementation notes the spec lacks.
+- **Base URL:** `https://api.{org}.code.storage/api/v1`. SDKs build
+  `{apiBaseUrl}/api/v{version}` with version fixed at 1.
+- **Auth:** every endpoint requires `Authorization: Bearer <jwt>`
+  ([auth spec](authentication.md)).
+- **`Code-Storage-Agent` header** (informational): `code-storage-sdk/<ver>` (TypeScript),
+  `code-storage-py-sdk/<ver>` (Python), `code-storage-go-sdk/<ver>` (Go).
 
 ## Conventions
 
-- **Pagination** (all list endpoints): request `cursor` + `limit` query params (or
-  `pagination: {cursor, limit}` in grep's body); response `next_cursor` (opaque string, null/
-  empty when exhausted) + `has_more` (bool). Docs default limit 20, max 100; SDK-observed
-  server defaults differ per endpoint (files 1000/max 5000, files/metadata 200/max 1000,
-  notes refs 20).
-- **Errors**: `{"error": "<unstable human string>"}` + status code. Write endpoints that move
-  refs return the richer `result` envelope ([streaming protocols](../explanation/streaming-commit-protocols.md)) even on
-  4xx/5xx statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`.
-- **Throttling**: every `429` — the gateway [rate limiter](configuration.md#rate-limiting)
-  and transient busy/backpressure answers — carries `Retry-After` (delay-seconds) plus the
-  IETF `RateLimit` service-limit field (`"default";r=0;t=<retry-after-secs>`, current
-  draft-ietf-httpapi-ratelimit-headers shape). `Retry-After` takes precedence over the
-  `RateLimit` effective window; no `RateLimit-Policy` is advertised.
+- **Pagination** (all list endpoints): request `cursor` + `limit` query params (grep:
+  `pagination: {cursor, limit}` in the body). Response: `next_cursor` (opaque string,
+  null/empty when exhausted) + `has_more` (bool). Documented default limit 20, max 100.
+  SDK-observed server defaults differ: files 1000/max 5000, files/metadata 200/max 1000,
+  notes refs 20.
+- **Errors**: `{"error": "<unstable human string>"}` + status code. Ref-moving write
+  endpoints return the richer `result` envelope
+  ([streaming protocols](../explanation/streaming-commit-protocols.md)), even on 4xx/5xx
+  statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`.
+- **Throttling**: every `429` (the gateway [rate limiter](configuration.md#rate-limiting)
+  and transient busy/backpressure answers) carries:
+  - `Retry-After` (delay-seconds), which takes precedence over the `RateLimit` window;
+  - the IETF `RateLimit` service-limit field, `"default";r=0;t=<retry-after-secs>`
+    (current draft-ietf-httpapi-ratelimit-headers shape).
+
+  No `RateLimit-Policy` is advertised.
 - **Booleans in query strings** are literal `"true"` / `"false"`.
 - **Repeated params**: `path` may repeat on diff endpoints; `range` may repeat on blame.
-- **No client retries**: none of the SDKs retry; every error surfaces immediately. Timeouts
-  observed client-side (Python): 30s default, 60s diff/grep, 180s branch-create/merge/
-  merge-preview/commit/tag/restore-commit.
+- **No client retries**: no SDK retries; every error surfaces immediately. Python
+  client-side timeouts: 30s default, 60s diff/grep, 180s
+  branch-create/merge/merge-preview/commit/tag/restore-commit.
 
 ## Endpoint catalog
 
 ### Organization metadata (`org:read`)
 
-`GET /api/meta` uses the absolute path shown, without `/v1`. It requires an
-org-scoped token (`repo: "org"`) with `org:read` for the served organization.
-The ordinary pre-auth rate limiter applies. There is no `/api/v1/meta` alias.
+`GET /api/meta` — absolute path, no `/v1`, and no `/api/v1/meta` alias.
 
-open.storage returns `200` with this exact shape:
+- **Auth:** org-scoped token (`repo: "org"`) with `org:read` for the served organization.
+- **Rate limit:** the ordinary pre-auth limiter.
+- **Response:** `200` with this exact shape:
 
 ```json
 {"ips":{"api":[],"git":[]},"provider":{"name":"","region":""}}
 ```
 
-The arrays are empty because open.storage publishes no ingress CIDRs. The provider
-and region strings are empty because it does not determine deployment location.
-These are the upstream contract's unpublished/unavailable values, **not proof that
-ingress does not exist or a populated firewall allowlist**. Obtain ingress ranges
-from your deployment operator before configuring a firewall.
+The arrays are empty because open.storage publishes no ingress CIDRs; provider and
+region are empty because it does not determine deployment location. These are the
+upstream contract's "unpublished/unavailable" values.
 
-This implements the documented upstream contract captured on September 21, 2026;
-it does not establish the endpoint's rollout status on upstream clusters.
+> [!WARNING]
+> Empty arrays are **not proof that ingress does not exist, nor a populated firewall
+> allowlist**. Get ingress ranges from your deployment operator before configuring a
+> firewall.
+
+Implements the upstream contract as documented on September 21, 2026; this says nothing
+about the endpoint's rollout status on upstream clusters.
 
 ### Repository lifecycle (`repo:write` / `org:read`)
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Body optional: `{default_branch?, base_repo?}`. Query `default_branch` is a fallback used only when the body omits it. `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}\|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`. Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht` (+generic w/ `upstream_host`). `forward_pushes: true` (default false, our extension) schedules a push-upstream run after every won local push, and inverts the sync conflict rule: local wins (inbound syncs never force-rewind local refs) — see "Upstream sync". → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
+| `POST /repos` | repo:write (repo=new id) | Optional body `{default_branch?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at}`; 404 → SDK returns null |
-| `PATCH /repo` | repo:write | Update the default branch. Body `{default_branch}` required, non-empty; a plain branch name (qualified to `refs/heads/<name>` at hydrate time) or its `refs/heads/`-qualified spelling (stored verbatim). Other ref namespaces (tags/notes) → 400 — the default names a branch. The branch is never created by this call and may be unborn (clones then see a dangling `HEAD`, like a fresh repo). CAS against the previously read value → 409 on a concurrent change; `no-push` ref policies covering `HEAD` or the target deny with 403. → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec). Clone `HEAD` follows on the next hydrate of each node's cache. |
+| `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
 | `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix; from OpenAPI.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value |
 | `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs) |
+
+**`POST /repos` body:**
+
+- Query `default_branch` is a fallback, used only when the body omits it.
+- `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
+- Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
+  generic with `upstream_host`.
+- `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
+  run after every won local push. It also inverts the sync conflict rule: local wins, and
+  inbound syncs never force-rewind local refs. See [Upstream sync](#upstream-sync).
+
+**`PATCH /repo` rules:**
+
+- `default_branch` is required and non-empty: a plain branch name (qualified to
+  `refs/heads/<name>` at hydrate time) or its `refs/heads/`-qualified spelling (stored
+  verbatim).
+- Other ref namespaces (tags/notes) → 400; the default names a branch.
+- The call never creates the branch. It may be unborn; clones then see a dangling `HEAD`,
+  like a fresh repo.
+- CAS against the previously read value → 409 on a concurrent change.
+- `no-push` ref policies covering `HEAD` or the target → 403.
+- Clone `HEAD` follows on each node's next cache hydrate.
 
 ### Git credentials (generic HTTPS upstreams)
 
@@ -98,26 +127,29 @@ it does not establish the endpoint's rollout status on upstream clusters.
 | `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`) |
 | `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
 
-Branch creation on both path styles accepts an omitted `target_branch` to allocate a
-new opaque name in the requested target namespace. Always use the returned
-`target_branch`, `commit_sha`, and `target_is_ephemeral`; do not depend on a name format.
-Each successful call creates a new branch: **retrying after an unknown result can create
-another branch**. Retain the returned name and delete branches you no longer need.
-`force: true` requires an explicit, valid target name (otherwise `400`); named-target
-force and ref-policy checks are unchanged. Locally, explicit empty or `null` targets
-remain `400`, not allocation requests. Allocation requests reject unknown fields with
-`400` so a misspelled target field cannot silently allocate a branch; named-target
-requests retain their existing unknown-field tolerance.
-Collisions are retried with create-only CAS,
-never overwriting an existing ref; exhausting the bounded attempts returns `409`.
-Policy denials and storage errors are not retried internally.
+**Server-allocated branch names** (`POST /repos/branches/create`, both path styles):
 
-This adopts the public OpenAPI/SDK contract, not demonstrated upstream cluster behavior;
-see the [contract audit](../explanation/wire-compatibility.md#server-allocated-branch-contract).
+- Omit `target_branch` to allocate a new opaque name in the requested target namespace.
+  Use the returned `target_branch`, `commit_sha`, and `target_is_ephemeral`; do not
+  depend on a name format.
+- Each successful call creates a new branch, so **retrying after an unknown result can
+  create another branch**. Keep the returned name and delete branches you no longer need.
+- `force: true` requires an explicit, valid target name (otherwise `400`). Named-target
+  force and ref-policy checks are unchanged.
+- In open.storage, explicit empty or `null` targets are `400`, not allocation requests.
+- Allocation requests reject unknown fields with `400`, so a misspelled target field
+  cannot silently allocate a branch. Named-target requests keep their unknown-field
+  tolerance.
+- Name collisions retry with create-only CAS and never overwrite an existing ref.
+  Exhausting the bounded attempts returns `409`. Policy denials and storage errors are
+  not retried.
+
+This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster behavior
+([contract audit](../explanation/wire-compatibility.md#server-allocated-branch-contract)).
 
 `FileDiff` = `{path, state (raw letter; SDKs normalize A/M/D/R/C/T/U), old_path?, raw
-(unified diff text), bytes, is_eof, additions, deletions}`; `filtered_files` entries omit
-`raw`/counts (large files filtered unless explicitly requested via `path`).
+(unified diff text), bytes, is_eof, additions, deletions}`. `filtered_files` entries omit
+`raw`/counts; large files are filtered unless requested via `path`.
 
 ### Commits
 
@@ -152,50 +184,80 @@ committer_email, date (RFC3339)}`.
 | `DELETE /repos/notes` | git:write | `{object_ref (deprecated alias sha), notes_ref?, expected_notes_ref_sha?, author?}` → same envelope |
 | `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. 400 if custom notes refs disabled server-side |
 
-Default notes ref `refs/notes/commits`; bare names resolve to `refs/notes/<name>`.
-`object_ref` is a full object SHA (commit, tree, blob, or annotated tag), or a
-branch, tag, short SHA, or other revision that resolves to a commit (an
-unresolvable revision is a 404); responses echo the resolved object id in
-`sha`.
+- Default notes ref: `refs/notes/commits`. Bare names resolve to `refs/notes/<name>`.
+- `object_ref`: a full object SHA (commit, tree, blob, or annotated tag), or a branch,
+  tag, short SHA, or other revision that resolves to a commit. Unresolvable → 404.
+- Responses echo the resolved object id in `sha`.
 
 ### Upstream sync
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async); only for repos with `base_repo`. A 202 is never dropped: a request that arrives while a sync run is already in flight coalesces into one follow-up run, so some run observes upstream as of the request or later. Fetch egress is policy-guarded (see below) |
-| `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async); only for repos with `base_repo`. Requires BOTH scopes: the run exports every local head/tag, so a write-only token must not be able to publish content it cannot clone. Our extension (upstream forwards implicitly — see [wire compatibility](../explanation/wire-compatibility.md)): publishes local `refs/heads/*` and `refs/tags/*` to the upstream with the stored credential. Non-force by default — a ref the upstream refuses (non-fast-forward) fails the run with per-ref reasons in the `repo.sync.failed` event's `rejected_refs`; the push is atomic (one refused ref fails the whole batch and the upstream is left untouched); `force: true` opts into `+refs`. Ref deletions are not propagated. The 202 coalescing guarantee matches pull-upstream, and `force` survives coalescing (a forced request is never downgraded). An unreachable upstream retries with exponential backoff (1–16 min, 5 attempts); auth/config/rejection failures do not retry. A successful run schedules one follow-up inbound sync, so a pull that raced the forward cannot strand a stale local snapshot. Egress is guarded at dial time: private/special destinations are denied (permanent `invalid sync configuration` failure) unless [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](configuration.md#openstorage_sync_push_allow_private) opts internal forges in |
+| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async). Repos with `base_repo` only |
+| `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Repos with `base_repo` only. open.storage extension |
 
-Outbound runs emit the same `repo.sync.*` events with `direction: "push"` (see
-[webhooks](webhooks.md)). `DELETE /repos/base` cancels in-flight runs in both
-directions silently. Ref policies fail closed on both triggers: any policy op
-denies pull-upstream and push-upstream alike. The same gate covers
-`forward_pushes` auto-forwarding: a git push accepted from a token carrying
-any ref-policy op, or lacking git:read, does not trigger the forward (it
-would publish every head and tag, not just the refs that token may touch or
-read) — the write stays local and the repository converges on the next
-authorized trigger.
+**Both triggers:**
 
-**Egress policy** (ADR-45): `upstream_host` is caller-linked data, so every
-http(s) sync transfer in either direction — pull-upstream fetches (including
-the first sync at `POST /repos` and freshness pokes) and push-upstream
-forwards — dials through a vetting proxy applying the webhook delivery
-destination policy, governed by
-[`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#openstorage_sync_allow_private)
-(transitional default: pulls allow private upstreams, pushes deny). A denied
-pull destination fails the run as `repository configuration error`; a denied
-push destination as `invalid sync configuration`. `POST /repos` with
-`base_repo` additionally rejects an upstream_host the pull policy denies at
-registration time with 400 (courtesy check; dial time is authoritative).
+- **A 202 is never dropped.** A request that arrives during an in-flight sync run
+  coalesces into one follow-up run, so some run observes upstream as of the request or
+  later.
+- Egress is policy-guarded at dial time; see [Egress policy](#egress-policy) below.
 
-**Mixed-fleet prerequisite** (documentation-enforced, like the other
-[upgrade orderings](configuration.md)): complete the rolling upgrade of
-every replica to a build with this feature **before creating repositories
-with `forward_pushes: true`**. The forward reroute and the local-wins pull
-rule are replica-local code — a pre-feature replica that accepts a push on
-such a repository still schedules the legacy inbound force-mirror
-("upstream wins"), which can rewind the just-accepted write, and no forward
-is scheduled either way. Repositories without the flag are unaffected: old
-and new replicas agree on their pull-only behavior.
+**`push-upstream`** (upstream forwards implicitly; see
+[wire compatibility](../explanation/wire-compatibility.md)):
+
+- Publishes local `refs/heads/*` and `refs/tags/*` to the upstream with the stored
+  credential. Ref deletions are not propagated.
+- Requires **both** scopes: the run exports every local head and tag, so a write-only
+  token must not publish content it cannot clone.
+- Non-force by default. A ref the upstream refuses (non-fast-forward) fails the run, with
+  per-ref reasons in the `repo.sync.failed` event's `rejected_refs`. `force: true` opts
+  into `+refs`, and survives coalescing (a forced request is never downgraded).
+- The push is atomic: one refused ref fails the whole batch and leaves the upstream
+  untouched.
+- An unreachable upstream retries with exponential backoff (1–16 min, 5 attempts).
+  Auth, config, and rejection failures do not retry.
+- A successful run schedules one follow-up inbound sync, so a pull that raced the forward
+  cannot strand a stale local snapshot.
+- Private/special destinations are denied (permanent `invalid sync configuration`
+  failure) unless
+  [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](configuration.md#openstorage_sync_push_allow_private)
+  opts internal forges in.
+
+**Events and cancellation:** outbound runs emit the same `repo.sync.*` events with
+`direction: "push"` ([webhooks](webhooks.md)). `DELETE /repos/base` silently cancels
+in-flight runs in both directions.
+
+**Ref policies fail closed:** any policy op denies both pull-upstream and push-upstream.
+The same gate covers `forward_pushes`: a git push from a token that carries any
+ref-policy op, or lacks git:read, does not trigger the forward, since the forward
+publishes every head and tag, not just the refs that token may touch or read. The write
+stays local; the repository converges on the next authorized trigger.
+
+#### Egress policy
+
+Per ADR-45, `upstream_host` is caller-linked data. Every http(s) sync transfer in either
+direction dials through a vetting proxy that applies the webhook delivery destination
+policy. That covers pull-upstream fetches (including the first sync at `POST /repos` and
+freshness pokes) and push-upstream forwards.
+
+- Governed by
+  [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#openstorage_sync_allow_private).
+  Transitional default: pulls allow private upstreams, pushes deny.
+- A denied pull destination fails the run as `repository configuration error`; a denied
+  push destination as `invalid sync configuration`.
+- `POST /repos` with `base_repo` also rejects, with 400, an `upstream_host` the pull
+  policy denies. This registration check is a courtesy; dial time is authoritative.
+
+> [!CAUTION]
+> **Mixed-fleet prerequisite:** finish the rolling upgrade of every replica to a build
+> with this feature **before creating repositories with `forward_pushes: true`**. The
+> forward reroute and local-wins pull rule are replica-local code. A pre-feature replica
+> that accepts a push on such a repository still schedules the legacy inbound
+> force-mirror ("upstream wins"), which can rewind the just-accepted write, and schedules
+> no forward. Repositories without the flag are unaffected: old and new replicas agree on
+> pull-only behavior. This ordering is documentation-enforced, like the other
+> [upgrade orderings](configuration.md).
 
 ## Status-code contract (what clients key on)
 
