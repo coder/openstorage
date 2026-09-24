@@ -60,8 +60,9 @@ full hydrate:
 | nothing new | 3.8–4.5 ms |
 
 The write cost is charged to the full hydrate after a push, not to the
-push itself. The `--topo-order` walk from #292 gains too: issue #307 measured
-71 ms to 3.7 ms for the tip rank with #292's `BenchmarkTopoRanks`.
+push itself. The `--topo-order` walk from #292 gains too: issue #307 reports
+71 ms to 3.7 ms for the tip rank, measured with `BenchmarkTopoRanks` from
+PR #306 (not yet on main when this was written).
 
 Split graphs keep the amortized write cost proportional to the new
 commits. Git merges layers geometrically (`--size-multiple=2`), so an

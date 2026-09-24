@@ -166,12 +166,34 @@ func assertGraphEquivalent(t *testing.T, dir, state string) {
 	t.Setenv("GIT_CONFIG_KEY_0", "core.commitGraph")
 	t.Setenv("GIT_CONFIG_VALUE_0", "false")
 	noGraph := graphReads(t, dir)
+	// Not vacuous: under the override a path walk must not touch the graph.
+	if bloomStatistics(t, dir) {
+		t.Fatalf("%s: core.commitGraph=false override did not disable the graph", state)
+	}
 	os.Unsetenv("GIT_CONFIG_COUNT")
 	os.Unsetenv("GIT_CONFIG_KEY_0")
 	os.Unsetenv("GIT_CONFIG_VALUE_0")
 	if withGraph != noGraph {
 		t.Fatalf("%s: reads differ with the commit-graph\n--- with graph\n%s\n--- without\n%s", state, withGraph, noGraph)
 	}
+}
+
+// bloomStatistics reports whether a traced path walk (under the current
+// environment) ruled commits out with changed-path Bloom filters.
+func bloomStatistics(t *testing.T, dir string) bool {
+	t.Helper()
+	trace := filepath.Join(t.TempDir(), "trace.json")
+	cmd := exec.Command("git", "log", "-1", "--format=%H", "main", "--", "root-only.txt")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("traced log: %v\n%s", err, out)
+	}
+	ev, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Contains(string(ev), `"definitely_not":`) && !strings.Contains(string(ev), `"definitely_not":0,`)
 }
 
 func TestReadsIdenticalWithCommitGraph(t *testing.T) {
@@ -185,15 +207,8 @@ func TestReadsIdenticalWithCommitGraph(t *testing.T) {
 	write("--split", "--changed-paths")
 	assertGraphEquivalent(t, dir, "fresh Bloom graph")
 	// Not vacuous: the path walk actually consulted Bloom filters.
-	trace := filepath.Join(t.TempDir(), "trace.json")
-	cmd := exec.Command("git", "log", "-1", "--format=%H", "main", "--", "root-only.txt")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+trace)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("traced log: %v\n%s", err, out)
-	}
-	if ev, _ := os.ReadFile(trace); !strings.Contains(string(ev), `"definitely_not":`) || strings.Contains(string(ev), `"definitely_not":0,`) {
-		t.Fatalf("path walk did not use Bloom filters; trace:\n%s", ev)
+	if !bloomStatistics(t, dir) {
+		t.Fatal("path walk did not use Bloom filters")
 	}
 
 	appendGraphHistory(t, dir, 300, 340)
