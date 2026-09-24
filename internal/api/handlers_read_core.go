@@ -873,13 +873,19 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	// resolved ref, from ONE walk per page (gitread.TopoRanks documents the
 	// tie-break). Ranks are relative to commit, not to the page, so they
 	// agree across pages of the same listing. The walk runs under the
-	// process-wide topoWalks budget; when it is exhausted or times out the
-	// request fails with 503 rather than returning entries without order.
+	// process-wide topoWalks budget; when it is exhausted, times out, or
+	// hits its heap cap, the request fails with 503 rather than returning
+	// entries without order.
 	ranks, err := topoWalks.ranks(r.Context(), repoPath, commit, slices.Collect(maps.Keys(commitsMap)))
 	switch {
 	case errors.Is(err, errTopoWalkBusy):
 		w.Header().Set("Retry-After", "1")
 		writeErr(w, http.StatusServiceUnavailable, "server is busy computing commit order; retry shortly")
+		return
+	case errors.Is(err, errTopoWalkTooLarge):
+		// Deterministic for this commit: no Retry-After.
+		s.logger.Warn("files/metadata commit order walk exceeded its memory limit", "path", r.URL.Path, "err", err)
+		writeErr(w, http.StatusServiceUnavailable, "history too large to compute commit order within the server memory budget")
 		return
 	case errors.Is(err, errTopoWalkTimeout):
 		s.logger.Warn("files/metadata commit order walk timed out", "path", r.URL.Path, "err", err)

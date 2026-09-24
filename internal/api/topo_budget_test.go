@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -55,7 +56,7 @@ func requireFree(t *testing.T, b *topoWalkBudget) {
 const topoTestSHA = "1111111111111111111111111111111111111111"
 
 func TestTopoWalkBudgetSaturatedRejectsWithoutGit(t *testing.T) {
-	b := newTopoWalkBudget(2, time.Minute)
+	b := newTopoWalkBudget(2, time.Minute, 0)
 	b.slots <- struct{}{}
 	b.slots <- struct{}{}
 	// A nonexistent repo path proves no git process is started.
@@ -70,7 +71,7 @@ func TestTopoWalkBudgetSaturatedRejectsWithoutGit(t *testing.T) {
 
 func TestTopoWalkBudgetDeadlineKillsAndReapsGit(t *testing.T) {
 	pidFile := fakeSlowGit(t)
-	b := newTopoWalkBudget(1, 300*time.Millisecond)
+	b := newTopoWalkBudget(1, 300*time.Millisecond, 0)
 	start := time.Now()
 	_, err := b.ranks(context.Background(), t.TempDir(), topoTestSHA, []string{topoTestSHA})
 	if !errors.Is(err, errTopoWalkTimeout) {
@@ -85,7 +86,7 @@ func TestTopoWalkBudgetDeadlineKillsAndReapsGit(t *testing.T) {
 
 func TestTopoWalkBudgetCallerCancelKillsAndReapsGit(t *testing.T) {
 	pidFile := fakeSlowGit(t)
-	b := newTopoWalkBudget(1, time.Minute)
+	b := newTopoWalkBudget(1, time.Minute, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		for {
@@ -110,7 +111,7 @@ func TestTopoWalkBudgetSuccessReleasesSlot(t *testing.T) {
 	coreGit(t, dir, "commit", "-q", "--allow-empty", "-m", "one")
 	coreGit(t, dir, "commit", "-q", "--allow-empty", "-m", "two")
 	tip, parent := coreRevParse(t, dir, "HEAD"), coreRevParse(t, dir, "HEAD~1")
-	b := newTopoWalkBudget(1, time.Minute)
+	b := newTopoWalkBudget(1, time.Minute, 0)
 	ranks, err := b.ranks(context.Background(), dir, tip, []string{parent, tip})
 	if err != nil || len(ranks) != 2 || ranks[tip] != 0 || ranks[parent] != 1 {
 		t.Fatalf("ranks = %v, err = %v", ranks, err)
@@ -151,6 +152,32 @@ func TestFilesMetadataTopoWalkBusy503(t *testing.T) {
 		}
 
 		drain()
+		resp, body = coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
+		coreRequireStatus(t, resp, body, http.StatusOK)
+	})
+}
+
+// TestFilesMetadataTopoWalkTooLarge503: when the walk exceeds the heap
+// limit, files/metadata answers 503 WITHOUT Retry-After (retrying the same
+// commit cannot succeed) and never a 200 without `order`.
+func TestFilesMetadataTopoWalkTooLarge503(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the heap limit is enforced on Linux only")
+	}
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := coreSeedFixture(t, e, e.newOrg(t))
+		saved := topoWalks.heapLimitBytes
+		topoWalks.heapLimitBytes = 64 << 10 // far below what git needs to start
+		t.Cleanup(func() { topoWalks.heapLimitBytes = saved })
+
+		resp, body := coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
+		coreRequireStatus(t, resp, body, http.StatusServiceUnavailable)
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			t.Errorf("Retry-After = %q, want none", ra)
+		}
+		requireFree(t, topoWalks)
+
+		topoWalks.heapLimitBytes = saved
 		resp, body = coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
 		coreRequireStatus(t, resp, body, http.StatusOK)
 	})

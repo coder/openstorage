@@ -4,15 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
-	"os/exec"
 	"slices"
 	"strings"
 
 	"github.com/coder/openstorage/internal/ref"
 )
+
+// ErrMemoryLimit marks a TopoRanks walk that needed more heap than its
+// maxHeapBytes cap allowed; git was stopped by its own allocation failure.
+var ErrMemoryLimit = errors.New("git exceeded its memory limit")
 
 // TopoRanks returns the history-order rank of every commit in want relative
 // to rev (a resolved full SHA): the commit's 0-based position in
@@ -30,9 +34,17 @@ import (
 // Every entry of want must be reachable from rev; an unreachable commit is
 // an error, not a missing entry. Duplicates in want are allowed. The walk
 // stops once every wanted commit is ranked; without a commit-graph, git
-// still reads the whole history before it prints the first commit.
-func TopoRanks(ctx context.Context, repoPath, rev string, want []string) (map[string]int, error) {
+// still reads the whole history before it prints the first commit, and its
+// heap grows with that history.
+//
+// maxHeapBytes > 0 caps git's heap: on Linux, RLIMIT_DATA (heap and other
+// private writable mappings; read-only pack mmaps are not counted) is set
+// by a /bin/sh wrapper before git is exec'd, and a walk that needs more
+// fails with ErrMemoryLimit. Other platforms do not enforce the cap. 0
+// means no cap.
+func TopoRanks(ctx context.Context, repoPath, rev string, want []string, maxHeapBytes int64) (map[string]int, error) {
 	assertf(ref.ValidSHA(rev), "TopoRanks: unresolved rev %q", rev)
+	assertf(maxHeapBytes >= 0, "TopoRanks: negative maxHeapBytes %d", maxHeapBytes)
 	pending := make(map[string]struct{}, len(want))
 	for _, sha := range want {
 		assertf(ref.ValidSHA(sha), "TopoRanks: malformed wanted sha %q", sha)
@@ -49,7 +61,7 @@ func TopoRanks(ctx context.Context, repoPath, rev string, want []string) (map[st
 	walkCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	args := []string{"rev-list", "--topo-order", rev}
-	cmd := exec.CommandContext(walkCtx, "git", args...)
+	cmd := heapLimitedGit(walkCtx, maxHeapBytes, args...)
 	cmd.Dir = repoPath
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -88,7 +100,11 @@ func TopoRanks(ctx context.Context, repoPath, rev string, want []string) (map[st
 		return nil, fmt.Errorf("git %s: read: %w", strings.Join(args, " "), scanErr)
 	}
 	if waitErr != nil {
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), waitErr, strings.TrimSpace(stderr.String()))
+		msg := strings.TrimSpace(stderr.String())
+		if maxHeapBytes > 0 && heapLimitFailure(waitErr, msg) {
+			return nil, fmt.Errorf("git %s: %w (%d bytes): %s", strings.Join(args, " "), ErrMemoryLimit, maxHeapBytes, msg)
+		}
+		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), waitErr, msg)
 	}
 	missing := slices.Sorted(maps.Keys(pending))
 	return nil, fmt.Errorf("commit %s is not reachable from %s", missing[0], rev)

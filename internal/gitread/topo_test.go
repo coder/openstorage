@@ -28,7 +28,7 @@ func TestTopoRanksLinear(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 
-	ranks, err := TopoRanks(ctx, f.dir, f.c2, []string{f.c1, f.c2, f.c1})
+	ranks, err := TopoRanks(ctx, f.dir, f.c2, []string{f.c1, f.c2, f.c1}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestTopoRanksLinear(t *testing.T) {
 	}
 
 	// Ranks are relative to rev: from the feature tip, c1 is one step back.
-	ranks, err = TopoRanks(ctx, f.dir, f.c3, []string{f.c1})
+	ranks, err = TopoRanks(ctx, f.dir, f.c3, []string{f.c1}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestTopoRanksLinear(t *testing.T) {
 func TestTopoRanksUnreachableCommitErrors(t *testing.T) {
 	f := newFixture(t)
 	// c3 (feature) is not an ancestor of c2 (main).
-	if _, err := TopoRanks(context.Background(), f.dir, f.c2, []string{f.c1, f.c3}); err == nil ||
+	if _, err := TopoRanks(context.Background(), f.dir, f.c2, []string{f.c1, f.c3}, 0); err == nil ||
 		!strings.Contains(err.Error(), f.c3) {
 		t.Fatalf("err = %v, want unreachable %s", err, f.c3)
 	}
@@ -58,7 +58,7 @@ func TestTopoRanksUnreachableCommitErrors(t *testing.T) {
 
 func TestTopoRanksEmptyWantRunsNoGit(t *testing.T) {
 	// A nonexistent repo path proves no git process runs.
-	ranks, err := TopoRanks(context.Background(), "/nonexistent/repo", strings.Repeat("a", 40), nil)
+	ranks, err := TopoRanks(context.Background(), "/nonexistent/repo", strings.Repeat("a", 40), nil, 0)
 	if err != nil || ranks == nil || len(ranks) != 0 {
 		t.Fatalf("ranks = %#v, err = %v, want empty non-nil map", ranks, err)
 	}
@@ -96,7 +96,7 @@ func TestTopoRanksMergeIgnoresDates(t *testing.T) {
 	all := []string{base, m1, s1, s2, merge}
 	check := func(label string) {
 		t.Helper()
-		ranks, err := TopoRanks(context.Background(), dir, merge, all)
+		ranks, err := TopoRanks(context.Background(), dir, merge, all, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -110,7 +110,7 @@ func TestTopoRanksMergeIgnoresDates(t *testing.T) {
 
 	// Ranks count every commit ahead in the walk, including ones not
 	// asked for: base alone still ranks 4.
-	ranks, err := TopoRanks(context.Background(), dir, merge, []string{base})
+	ranks, err := TopoRanks(context.Background(), dir, merge, []string{base}, 0)
 	if err != nil || ranks[base] != 4 {
 		t.Fatalf("base alone: ranks = %v, err = %v, want base:4", ranks, err)
 	}
@@ -157,7 +157,7 @@ func BenchmarkTopoRanks(b *testing.B) {
 	run := func(name, want string, wantRank int) {
 		b.Run(name, func(b *testing.B) {
 			for b.Loop() {
-				ranks, err := TopoRanks(ctx, dir, tip, []string{want})
+				ranks, err := TopoRanks(ctx, dir, tip, []string{want}, 0)
 				if err != nil || ranks[want] != wantRank {
 					b.Fatalf("ranks = %v, err = %v", ranks, err)
 				}
