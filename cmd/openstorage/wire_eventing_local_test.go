@@ -140,10 +140,10 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 	}
 }
 
-type localPendingQuery func(context.Context, string, int) ([]meta.PendingSyncWork, error)
+type localPendingQuery func(context.Context, string, string, int) ([]meta.PendingSyncWork, error)
 
-func (q localPendingQuery) ListPendingSyncWork(ctx context.Context, after string, limit int) ([]meta.PendingSyncWork, error) {
-	return q(ctx, after, limit)
+func (q localPendingQuery) ListPendingSyncWork(ctx context.Context, org, after string, limit int) ([]meta.PendingSyncWork, error) {
+	return q(ctx, org, after, limit)
 }
 
 func TestLocalPendingConsumerPaginationAndShutdown(t *testing.T) {
@@ -153,9 +153,9 @@ func TestLocalPendingConsumerPaginationAndShutdown(t *testing.T) {
 		run := func(_ context.Context, j upsync.Job) error { started <- j.RepoID; return nil }
 		q := jobs.NewLocal(&events.Deliverer{}, run, run, nil, slog.Default())
 		defer q.Close()
-		query := localPendingQuery(func(ctx context.Context, after string, limit int) ([]meta.PendingSyncWork, error) {
-			if limit != localPendingPageSize {
-				t.Errorf("limit=%d", limit)
+		query := localPendingQuery(func(ctx context.Context, org, after string, limit int) ([]meta.PendingSyncWork, error) {
+			if org != "org" || limit != localPendingPageSize {
+				t.Errorf("org=%q limit=%d", org, limit)
 			}
 			deadline, ok := ctx.Deadline()
 			if !ok || time.Until(deadline) > localPendingTimeout {
@@ -218,7 +218,7 @@ func TestLocalPendingConsumerJoinsCanceledScan(t *testing.T) {
 		defer q.Close()
 		entered := make(chan struct{})
 		exited := make(chan struct{})
-		query := localPendingQuery(func(ctx context.Context, _ string, _ int) ([]meta.PendingSyncWork, error) {
+		query := localPendingQuery(func(ctx context.Context, _, _ string, _ int) ([]meta.PendingSyncWork, error) {
 			close(entered)
 			<-ctx.Done()
 			close(exited)
@@ -300,7 +300,7 @@ func TestLocalBootRepairPreservesOrphanForce(t *testing.T) {
 				t.Fatalf("live claim: %v %v", ok, err)
 			}
 			for range 3 {
-				page, err := ms.(meta.LocalPendingStore).ListPendingSyncWork(ctx, "", 16)
+				page, err := ms.(meta.LocalPendingStore).ListPendingSyncWork(ctx, "boot", "", 16)
 				if err != nil || len(page) != 1 || page[0].RepoID != ids[0] || !page[0].Push {
 					t.Fatalf("live scan manufactured work: %+v %v", page, err)
 				}

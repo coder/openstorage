@@ -140,7 +140,7 @@ type Worker struct {
 	// holder's unexpired lease must not accumulate timers).
 	deferMu       stdsync.Mutex
 	deferredRetry map[string]*time.Timer
-	localActive   map[string]int
+	localActive   map[string]*localLane
 	localClosed   bool
 	localTimers   stdsync.WaitGroup
 
@@ -162,8 +162,9 @@ type Worker struct {
 	// schedules successors transactionally (jobs/river.go pushWorker).
 	RequeuePush func(ctx context.Context, job Job) error
 	// WaitPushPublication is local-mode wiring for the existing cache push
-	// holds. It runs after claim admission, before any outbound snapshot.
-	// A failed wait is not a transfer attempt and retains the retry budget.
+	// holds. RunPush and Run call it after claim admission, before any
+	// snapshot. A failed wait is not a transfer attempt: it restores the
+	// consumed intent, and RunPush retains its retry budget.
 	WaitPushPublication func(ctx context.Context, repoID string) error
 
 	// AfterForward, when non-nil, enqueues one inbound sync after every
@@ -230,6 +231,20 @@ func (w *Worker) assertReady() {
 	assertf(w.Logger != nil, "Worker.Logger is required")
 }
 
+// localLane lives until its last run exits, including runs waiting to claim.
+// active is guarded by deferMu; admission never holds deferMu during store I/O.
+type localLane struct {
+	active    int
+	admission stdsync.Mutex
+}
+
+func localLaneKey(repoID string, push bool) string {
+	if push {
+		return "push:" + repoID
+	}
+	return "pull:" + repoID
+}
+
 // Local observations are not new caller requests. Track the entire local run,
 // including FinishPush -> durable retry mark -> timer registration, so a poll
 // cannot consume retry intent in that handoff. Explicit callers still enter
@@ -239,30 +254,32 @@ func (w *Worker) startLocal(job Job, push bool) (func(), bool) {
 		assertf(!job.pendingOnly, "pending observation requires a local queue")
 		return func() {}, true
 	}
-	lane := "pull:" + job.RepoID
-	if push {
-		lane = "push:" + job.RepoID
-	}
+	key := localLaneKey(job.RepoID, push)
 	w.deferMu.Lock()
 	defer w.deferMu.Unlock()
 	if w.localClosed || (job.retryTimer != nil && w.deferredRetry[job.retryKey] != job.retryTimer) ||
-		(job.pendingOnly && (w.localActive[lane] > 0 || w.localRetryPending(job.RepoID, push))) {
+		(job.pendingOnly && (w.localActive[key] != nil || w.localRetryPending(job.RepoID, push))) {
 		return nil, false
 	}
 	if w.localActive == nil {
-		w.localActive = make(map[string]int)
+		w.localActive = make(map[string]*localLane)
 	}
-	w.localActive[lane]++
+	lane := w.localActive[key]
+	if lane == nil {
+		lane = &localLane{}
+		w.localActive[key] = lane
+	}
+	lane.active++
 	return func() {
 		// A successful claim removes this identity. Otherwise a pre-claim
 		// error must retain its retry position rather than hand it to a poll.
 		defer w.rearmLocalRetry(job)
 		w.deferMu.Lock()
 		defer w.deferMu.Unlock()
-		assertf(w.localActive[lane] > 0, "unbalanced local run for %q", lane)
-		w.localActive[lane]--
-		if w.localActive[lane] == 0 {
-			delete(w.localActive, lane)
+		assertf(w.localActive[key] == lane && lane.active > 0, "unbalanced local run for %q", key)
+		lane.active--
+		if lane.active == 0 {
+			delete(w.localActive, key)
 		}
 	}, true
 }
@@ -279,25 +296,39 @@ func (w *Worker) localRetryPending(repoID string, push bool) bool {
 var errNoPending = errors.New("pending observation already covered")
 
 // admitLocal serializes the observation's current marker check with ordinary
-// local claims. The durable Begin methods and their claim protocol are unchanged.
+// claims in the same repository/lane, without blocking unrelated metadata I/O.
 // No lock is held across a Git transfer or worker completion callback.
 func (w *Worker) admitLocal(ctx context.Context, job Job, push bool, claim func() error) error {
 	if (!push && w.Requeue == nil) || (push && w.RequeuePush == nil) {
 		return claim()
 	}
 	w.deferMu.Lock()
-	defer w.deferMu.Unlock()
-	if w.localClosed || (job.retryTimer != nil && w.deferredRetry[job.retryKey] != job.retryTimer) {
-		return errNoPending // an intervening claim covered this queued retry
+	lane := w.localActive[localLaneKey(job.RepoID, push)]
+	assertf(lane != nil && lane.active > 0, "local claim requires an active run")
+	w.deferMu.Unlock()
+	lane.admission.Lock()
+	defer lane.admission.Unlock()
+
+	w.deferMu.Lock()
+	if w.localClosed || (job.retryTimer != nil && w.deferredRetry[job.retryKey] != job.retryTimer) ||
+		(job.pendingOnly && (lane.active != 1 || w.localRetryPending(job.RepoID, push))) {
+		w.deferMu.Unlock()
+		return errNoPending // an intervening run covers this observation or retry
+	}
+	keys := []string{job.RepoID}
+	if push {
+		keys = []string{"push-retry:" + job.RepoID, "push-defer:" + job.RepoID}
+	}
+	var timers [2]*time.Timer
+	for i, key := range keys {
+		timers[i] = w.deferredRetry[key]
+	}
+	w.deferMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if job.pendingOnly {
-		lane := "pull:" + job.RepoID
-		if push {
-			lane = "push:" + job.RepoID
-		}
-		if w.localActive[lane] != 1 || w.localRetryPending(job.RepoID, push) {
-			return errNoPending
-		}
 		up, err := w.Upstreams.GetUpstream(ctx, job.RepoID)
 		if err != nil {
 			return err
@@ -309,14 +340,12 @@ func (w *Worker) admitLocal(ctx context.Context, job Job, push bool, claim func(
 	if err := claim(); err != nil {
 		return err
 	}
-	// This claim consumed the pending marker, including any delayed intent.
-	// Cancel both timer and queued identities before admitting another run.
-	keys := []string{job.RepoID}
-	if push {
-		keys = []string{"push-retry:" + job.RepoID, "push-defer:" + job.RepoID}
-	}
-	for _, key := range keys {
-		if timer := w.deferredRetry[key]; timer != nil {
+	// This claim covers the retry reservations present at admission, not any
+	// successor registered while metadata I/O was in flight.
+	w.deferMu.Lock()
+	defer w.deferMu.Unlock()
+	for i, key := range keys {
+		if timer := timers[i]; timer != nil && w.deferredRetry[key] == timer {
 			timer.Stop()
 			delete(w.deferredRetry, key)
 		}
@@ -526,7 +555,20 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	started.Type = EventSyncStarted
 	w.emitDetached(ctx, job.Org, EventSyncStarted, started.marshal())
 
-	runErr := w.transfer(ctx, job, repo, up, holder)
+	// A hook CAS covered by this claim may not have published its cache ref
+	// yet: fetching now would compare against the stale cache and lose
+	// upstream-wins (the RunPush wait, same wiring).
+	var runErr error
+	if w.WaitPushPublication != nil {
+		assertf(w.Requeue != nil, "publication wait requires the local queue")
+		runErr = w.WaitPushPublication(ctx, job.RepoID)
+	}
+	publicationWaitFailed := runErr != nil
+	if !publicationWaitFailed {
+		runErr = w.transfer(ctx, job, repo, up, holder)
+	} else {
+		runErr = &syncFailure{code: FailInternal, cause: fmt.Errorf("wait for cache ref publication: %w", runErr)}
+	}
 	if errors.Is(runErr, errDetached) {
 		return nil // detach raced the run: the row is gone, cancel silently
 	}
@@ -567,6 +609,23 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		w.emitDetached(ctx, job.Org, EventSyncFailed, terminal.marshal())
 		w.Logger.Warn("upstream sync failed",
 			"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
+	}
+
+	if publicationWaitFailed {
+		// No snapshot was taken. Restore the consumed intent durably and own
+		// one delayed local retry; pull jobs carry no Retry budget, so this is
+		// the push lane's first backoff. localActive covers this mark-to-timer
+		// handoff against live polling.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+		defer cancel()
+		if err := w.Upstreams.RequestSync(rctx, job.RepoID); err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				w.Logger.Warn("re-mark publication wait failed", "repo", job.RepoID, "err", err)
+			}
+			return runErr
+		}
+		w.scheduleLocalRetry(job.RepoID, PushRetryDelay(1), job, false)
+		return runErr
 	}
 
 	if fin.SyncPending && w.Requeue != nil {

@@ -79,7 +79,7 @@ func startLocalPendingSync(ctx context.Context, ms meta.LocalPendingStore, org s
 func scanLocalPendingSync(ctx context.Context, ms meta.LocalPendingStore, org string, q *jobs.Local, logger *slog.Logger, after string) string {
 	ctx, cancel := context.WithTimeout(ctx, localPendingTimeout)
 	defer cancel()
-	work, err := ms.ListPendingSyncWork(ctx, after, localPendingPageSize)
+	work, err := ms.ListPendingSyncWork(ctx, org, after, localPendingPageSize)
 	if err != nil {
 		logger.Warn("local pending sync scan failed", "err", err)
 		return after
