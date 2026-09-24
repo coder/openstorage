@@ -27,7 +27,6 @@ func withGitReadPolicy(t *testing.T, p gitReadPolicy) *gitReadPolicy {
 func testGitReadPolicy(slots int, timeout time.Duration, output int64, limits gitread.Limits) gitReadPolicy {
 	return gitReadPolicy{
 		slots:          gitread.NewSlots(slots, 0),
-		archiveSlots:   gitread.NewSlots(slots, 0),
 		timeout:        timeout,
 		archiveTimeout: timeout,
 		outputBytes:    output,
@@ -37,7 +36,7 @@ func testGitReadPolicy(slots int, timeout time.Duration, output int64, limits gi
 
 func requireSlotsFree(t *testing.T, p *gitReadPolicy) {
 	t.Helper()
-	if n := p.slots.InUse() + p.archiveSlots.InUse(); n != 0 {
+	if n := p.slots.InUse(); n != 0 {
 		t.Fatalf("%d git read slots still held after the responses", n)
 	}
 }
@@ -181,32 +180,6 @@ func TestGitReadBudgetAdmissionAndDeadline(t *testing.T) {
 			requireSlotsFree(t, p)
 		})
 
-		t.Run("archives use their own slots", func(t *testing.T) {
-			p := withGitReadPolicy(t, testGitReadPolicy(1, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
-			hold := func(slots *gitread.Slots) *gitread.Budget {
-				b := gitread.NewBudget(slots, time.Minute, gitread.DefaultOutputBytes)
-				if _, err := gitread.Run(gitread.WithBudget(context.Background(), b),
-					gitread.Cmd{Class: gitread.Heavy, Dir: t.TempDir(), Args: []string{"version"}}); err != nil {
-					t.Fatal(err)
-				}
-				return b
-			}
-			// Every archive slot is held (slow downloads): archives are
-			// refused, other reads are not.
-			archives := hold(p.archiveSlots)
-			resp, body := e.doReq(t, "POST", "/api/v1/repos/archive", fx.token, []byte(`{}`), "")
-			requireLimitStatus(t, resp, body, http.StatusServiceUnavailable, true, "busy")
-			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits", fx.token, nil)
-			coreRequireStatus(t, resp, body, http.StatusOK)
-			archives.Close()
-			// And the other way round.
-			reads := hold(p.slots)
-			resp, body = e.doReq(t, "POST", "/api/v1/repos/archive", fx.token, []byte(`{}`), "")
-			coreRequireStatus(t, resp, body, http.StatusOK)
-			reads.Close()
-			requireSlotsFree(t, p)
-		})
-
 		t.Run("spent time budget answers 503 without Retry-After", func(t *testing.T) {
 			p := withGitReadPolicy(t, testGitReadPolicy(2, time.Nanosecond, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
 			for _, path := range []string{
@@ -234,6 +207,13 @@ func TestGitReadBudgetAdmissionAndDeadline(t *testing.T) {
 				gitread.Limits{HeavyHeap: gitread.HeavyHeapBytes, LightHeap: 64 << 10, MaxBlob: gitread.MaxBlobBytes}))
 			resp, body := coreGet(t, e, "GET", "/api/v1/repos/commits?ref=main", fx.token, nil)
 			requireLimitStatus(t, resp, body, http.StatusUnprocessableEntity, false, "memory")
+		})
+
+		t.Run("git errors quoting request input are not memory limits", func(t *testing.T) {
+			skipWithoutHeapCap(t)
+			// git reports "fatal: no such path out of memory in <sha>".
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/blame?path=out%20of%20memory", fx.token, nil)
+			coreRequireStatus(t, resp, body, http.StatusNotFound)
 		})
 	})
 }

@@ -3,6 +3,7 @@
 package gitread
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,5 +43,28 @@ func TestHeapLimitWrapperKeepsStricterInheritedLimit(t *testing.T) {
 				t.Fatalf("git saw RLIMIT_DATA soft/hard %q KiB, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// Only git's own allocation diagnostics count as a heap failure: git
+// errors that quote request input ("no such path out of memory") must keep
+// their ordinary meaning.
+func TestHeapLimitFailureMatchesOnlyGitDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		stderr string
+		want   bool
+	}{
+		{"fatal: Out of memory, malloc failed (tried to allocate 4096 bytes)", true},
+		{"warning: x\nfatal: inflateInit: out of memory (no message)", true},
+		{"fatal: mmap failed: Cannot allocate memory", true},
+		{"fatal: no such path out of memory in 1111111111111111111111111111111111111111", false},
+		{"fatal: no such path Out of memory, malloc failed in HEAD", false},
+		{"fatal: path 'fatal: Out of memory' does not exist", false},
+		{"fatal: bad revision 'Cannot allocate memory'", false},
+		{"", false},
+	} {
+		if got := heapLimitFailure(errors.New("exit status 128"), tc.stderr); got != tc.want {
+			t.Errorf("heapLimitFailure(%q) = %v, want %v", tc.stderr, got, tc.want)
+		}
 	}
 }

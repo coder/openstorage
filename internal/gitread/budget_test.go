@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -362,4 +363,50 @@ func TestRunWithoutHeapCapSupportStillRuns(t *testing.T) {
 	if strings.TrimSpace(string(got)) != "unlimited" {
 		t.Fatalf("git ran under RLIMIT_DATA %q, want no cap", got)
 	}
+}
+
+// blockingWriter blocks every Write until release is closed.
+type blockingWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return len(p), nil
+}
+
+// A client that stops reading an archive holds neither the request's slot
+// nor a git process: Stream spools each blob and releases the slot before
+// writing it.
+func TestArchiveStreamStalledReaderHoldsNoSlot(t *testing.T) {
+	f := newFixture(t)
+	slots := NewSlots(1, 0)
+	b := testBudget(slots, time.Minute, DefaultOutputBytes)
+	ctx := WithBudget(context.Background(), b)
+	prepared, err := PrepareArchive(ctx, f.dir, f.c2, ArchiveOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { done <- prepared.Stream(ctx, w) }()
+	select {
+	case <-w.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Stream never wrote")
+	}
+	// The gzip writer buffers, so the first Write carries spooled blob
+	// bytes: git has finished and the slot is free while the client stalls.
+	if n := slots.InUse(); n != 0 {
+		t.Fatalf("stalled reader holds %d slot(s)", n)
+	}
+	assertNoChildren(t)
+	close(w.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
 }

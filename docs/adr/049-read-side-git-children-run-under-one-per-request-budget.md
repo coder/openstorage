@@ -29,7 +29,7 @@ merge/preview. The limits are:
 
 | Limit | Value | Failure (before or instead of the work) |
 |---|---|---|
-| Admission | 8 slots per process for requests with Heavy work (archives: their own 4); 1 s wait | 503 + `Retry-After: 1`; git not started |
+| Admission | 8 slots per process for requests with Heavy work; 1 s wait; released when the response starts, and by `archive` after each spooled blob | 503 + `Retry-After: 1`; git not started |
 | Time | 30 s of git time per request from its first child, shared by all children (archive: 10 min) | 503, no `Retry-After`; git killed and reaped |
 | Heap | `RLIMIT_DATA` 256 MiB Heavy / 32 MiB Light, set by `/bin/sh -c 'ulimit -d …; exec git'`; an inherited stricter limit is kept | 422 |
 | Output | 64 MiB buffered stdout per request | 422; git killed at once |
@@ -80,6 +80,9 @@ users can push. The production image is Linux.
 - `git grep` is pinned to one thread. `RLIMIT_DATA` counts every thread's
   stack and malloc arena, and one thread per CPU (792 MB of VmData on 32
   CPUs) cannot start under the cap.
-- An archive error after its response started still aborts the connection.
+- `archive` spools each blob (at most 100 MiB) to a temporary file before
+  writing it, so a client that stops reading holds neither a slot nor a git
+  process. An archive error after its response started still aborts the
+  connection.
 - Hydration, `upload-pack`, and write endpoints are outside this budget.
   #322 tracks whether commit-graph writes join it.

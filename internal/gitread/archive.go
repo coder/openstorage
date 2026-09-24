@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -100,6 +101,25 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 	assertf(p != nil && p.repoPath != "", "Stream: unprepared archive")
 	assertf(w != nil, "Stream: nil writer")
 
+	// Each blob is spooled to a temp file before it is written to w, and
+	// the request's git slot is released after every git child, so a
+	// client that stops reading never holds a slot or a git process
+	// (#313). The spool holds one blob at a time, at most MaxBlobBytes
+	// (PrepareArchive checked every size).
+	spool, err := os.CreateTemp("", "openstorage-archive-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+	}()
+	budget := BudgetFrom(ctx)
+	releaseSlot := func() {
+		if budget != nil {
+			budget.Release()
+		}
+	}
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	for _, e := range p.entries {
@@ -113,6 +133,7 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 			if err != nil {
 				return err
 			}
+			releaseSlot()
 			hdr.Typeflag = tar.TypeSymlink
 			hdr.Linkname = string(target)
 			hdr.Mode = 0o777
@@ -126,12 +147,24 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 			if e.Mode == "100755" {
 				hdr.Mode = 0o755
 			}
+			if err := spool.Truncate(0); err != nil {
+				return err
+			}
+			if _, err := spool.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			if err := CatBlobTo(ctx, p.repoPath, e.SHA, spool); err != nil {
+				return err
+			}
+			releaseSlot()
+			if _, err := spool.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
 			}
-			// Stream blob bytes straight into the tar entry; a size
-			// mismatch surfaces as a tar write error.
-			if err := CatBlobTo(ctx, p.repoPath, e.SHA, tw); err != nil {
+			// A size mismatch surfaces as a tar write error.
+			if _, err := io.Copy(tw, spool); err != nil {
 				return err
 			}
 		default:

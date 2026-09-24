@@ -18,7 +18,7 @@ import (
 const (
 	// gitReadSlots caps requests running Heavy git children at once in
 	// this process. With gitread.HeavyHeapBytes per child, their git heap
-	// is at most 2 GiB. Archives have their own pool (gitArchiveSlots).
+	// is at most 2 GiB.
 	gitReadSlots = 8
 	// gitReadSlotWait is how long a request waits for a slot before it
 	// is answered 503 + Retry-After.
@@ -28,20 +28,17 @@ const (
 	// by all of them: a files/metadata page with hundreds of per-file
 	// walks gets 30 s in total, not 30 s per walk.
 	gitReadTimeout = 30 * time.Second
-	// gitArchiveTimeout replaces gitReadTimeout for archives, whose git
-	// children stream at the client's pace.
+	// gitArchiveTimeout replaces gitReadTimeout for archives, which
+	// alternate git children with writes at the client's pace. Stream
+	// spools each blob and gives the slot back before writing it, so a
+	// stalled client holds no slot.
 	gitArchiveTimeout = 10 * time.Minute
-	// gitArchiveSlots is the archives' own slot pool: an archive holds its
-	// slot while it streams, so slow downloads could otherwise take every
-	// slot from the other reads for up to gitArchiveTimeout.
-	gitArchiveSlots = 4
 )
 
 // gitReadPolicy is the configuration withGitReadBudget builds each
 // request's budget from; a struct so tests can swap in small limits.
 type gitReadPolicy struct {
 	slots          *gitread.Slots
-	archiveSlots   *gitread.Slots
 	timeout        time.Duration
 	archiveTimeout time.Duration
 	outputBytes    int64
@@ -51,7 +48,6 @@ type gitReadPolicy struct {
 // gitReads is the process-wide policy shared by every server instance.
 var gitReads = gitReadPolicy{
 	slots:          gitread.NewSlots(gitReadSlots, gitReadSlotWait),
-	archiveSlots:   gitread.NewSlots(gitArchiveSlots, gitReadSlotWait),
 	timeout:        gitReadTimeout,
 	archiveTimeout: gitArchiveTimeout,
 	outputBytes:    gitread.DefaultOutputBytes,
@@ -75,11 +71,11 @@ func gitReadBudget(h http.HandlerFunc, archive bool) http.HandlerFunc {
 	assertf(h != nil, "gitReadBudget: nil handler")
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := gitReads
-		slots, timeout := p.slots, p.timeout
+		timeout := p.timeout
 		if archive {
-			slots, timeout = p.archiveSlots, p.archiveTimeout
+			timeout = p.archiveTimeout
 		}
-		b := gitread.NewBudget(slots, timeout, p.outputBytes).WithLimits(p.limits)
+		b := gitread.NewBudget(p.slots, timeout, p.outputBytes).WithLimits(p.limits)
 		defer b.Close()
 		h(&gitReadWriter{ResponseWriter: w, b: b}, r.WithContext(gitread.WithBudget(r.Context(), b)))
 	}

@@ -222,9 +222,10 @@ func BudgetFrom(ctx context.Context) *Budget {
 }
 
 // Release gives the request's slot back early: HTTP handlers call it when
-// the response starts, so a slow client cannot hold a slot while git is
-// idle. A Heavy child started later re-acquires one. If a child is running,
-// the slot is released when it is reaped.
+// the response starts, and Stream after each blob it has spooled, so a slow
+// client cannot hold a slot while git is idle. A Heavy child started later
+// re-acquires one. If a child is running, the slot is released when it is
+// reaped.
 func (b *Budget) Release() {
 	b.mu.Lock()
 	defer b.mu.Unlock()

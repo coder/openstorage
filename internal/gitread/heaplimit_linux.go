@@ -45,14 +45,26 @@ func heapLimitedGit(ctx context.Context, maxHeapBytes int64, args ...string) *ex
 }
 
 // heapLimitFailure reports whether a git run under a heap cap died of it:
-// git's own "Out of memory" fatal (or zlib's "inflateInit: out of
-// memory"), or, when the cap is hit before or outside git's checked
-// allocators (dynamic loader, libc), a crash by SIGSEGV, SIGBUS, or
-// SIGABRT. SIGKILL (context cancellation or deadline) is not a heap
-// failure.
+// git's fatal allocation diagnostics, or, when the cap is hit before or
+// outside git's checked allocators (dynamic loader, libc), a crash by
+// SIGSEGV, SIGBUS, or SIGABRT. SIGKILL (context cancellation or deadline)
+// is not a heap failure.
+//
+// Only a fatal line that STARTS with a known diagnostic counts: git
+// messages can quote request input (a path named "out of memory"), and
+// such text never forms the start of the line.
 func heapLimitFailure(waitErr error, stderr string) bool {
-	if strings.Contains(strings.ToLower(stderr), "out of memory") || strings.Contains(stderr, "Cannot allocate memory") {
-		return true
+	for line := range strings.SplitSeq(stderr, "\n") {
+		for _, prefix := range heapFailurePrefixes {
+			if strings.HasPrefix(line, prefix) {
+				return true
+			}
+		}
+		// die_errno("mmap failed%s") ends with strerror(ENOMEM); the %s
+		// is git's own hint text.
+		if strings.HasPrefix(line, "fatal: mmap failed") && strings.HasSuffix(line, ": Cannot allocate memory") {
+			return true
+		}
 	}
 	var exitErr *exec.ExitError
 	if !errors.As(waitErr, &exitErr) {
@@ -67,4 +79,15 @@ func heapLimitFailure(waitErr error, stderr string) bool {
 		return true
 	}
 	return false
+}
+
+// heapFailurePrefixes are git's fatal allocation diagnostics (git 2.54
+// and 2.55): every x*alloc/xstrdup/xmmap "Out of memory..." die, and the
+// zlib wrappers' "inflateInit: out of memory (no message)" family.
+var heapFailurePrefixes = []string{
+	"fatal: Out of memory",
+	"fatal: inflateInit: out of memory",
+	"fatal: inflate: out of memory",
+	"fatal: deflateInit: out of memory",
+	"fatal: deflate: out of memory",
 }
