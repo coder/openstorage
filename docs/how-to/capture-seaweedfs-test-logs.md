@@ -1,16 +1,22 @@
 # Retain private SeaweedFS test logs
 
-The three managed SeaweedFS fixtures can retain server logs through automatic test teardown, including startup failure.
-This covers the shared S3WAL helper, both blob authentication variants, and the `githttp` TestMain fixture.
-It does not capture external S3 services, Floci, MinIO, or production servers.
+Keep SeaweedFS server logs from test fixtures after automatic teardown, including
+startup failures. Use this to debug fixture failures.
+
+Covered: the three managed fixtures (the shared S3WAL helper, both blob
+authentication variants, and the `githttp` TestMain fixture). Not covered: external
+S3 services, Floci, MinIO, or production servers.
 
 ## Enable capture
 
-Create a private directory before the test process starts.
-Set `OPENSTORAGE_TEST_ARTIFACT_DIR` to that directory and set an explicit `TESTCONTAINERS_SESSION_ID`.
-Use a new session and directory for each process.
-Session IDs must contain 1–64 ASCII letters, digits, underscores, or hyphens.
-The artifact directory must have mode `0700` and must not be a symbolic link.
+Before the test process starts:
+
+1. Create a private directory: mode `0700`, not a symbolic link.
+2. Set `OPENSTORAGE_TEST_ARTIFACT_DIR` to it.
+3. Set an explicit `TESTCONTAINERS_SESSION_ID` of 1–64 ASCII letters, digits,
+   underscores, or hyphens.
+
+Use a new session and directory for each process:
 
 ```sh
 umask 077
@@ -20,58 +26,75 @@ OPENSTORAGE_TEST_ARTIFACT_DIR="$artifacts" \
   go test ./internal/blob -run '^TestS3_ExpectedBucketOwnerHarmlessOnSeaweedFS$' -count=1 -race
 ```
 
-If the artifact variable is unset or empty, fixture behavior stays unchanged.
-This variable is test-only, not server configuration.
-Capture adds file writes and synchronization, so do not enable it for performance comparisons.
-No new fuzz target or benchmark is required: this change does not alter application parsing or storage algorithms.
-Existing fuzz workers that skip fixture startup do not create captures.
+- Unset or empty artifact variable: fixtures behave as before.
+- The variable is test-only, not server configuration.
+- Capture adds file writes and syncs; keep it off for performance comparisons.
+- Fuzz workers that skip fixture startup create no captures.
 
-On shared Docker hosts, hold the host's existing container lifecycle lock during real fixture tests.
-Check usable disk space before and after lock acquisition and before each heavy phase.
-Allow for SeaweedFS's disk floor and the test workload.
-Keep the lock until test producers finish and their exact-session resources are gone.
-Do not remove resources from other sessions or hold the lock during GitHub review waits.
+**On shared Docker hosts:**
+
+- Hold the host's container lifecycle lock during real fixture tests.
+- Check usable disk space before and after taking the lock and before each heavy
+  phase. Allow for SeaweedFS's disk floor plus the test workload.
+- Keep the lock until test producers finish and their exact-session resources are
+  gone. Never remove other sessions' resources or hold the lock during GitHub review
+  waits.
 
 ## Interpret the artifacts
 
-Each fixture creates `seaweed-<session>-<full-container-id>/` with mode `0700`.
-The helper verifies the container's Testcontainers session label before capture.
-The directory contains three mode-`0600` files:
+Each fixture creates `seaweed-<session>-<full-container-id>/` (mode `0700`) after
+checking the container's Testcontainers session label. It holds three mode-`0600`
+files:
 
 - `stdout.log`: The first 1 MiB of observed standard output.
 - `stderr.log`: The first 1 MiB of observed standard error.
 - `status.json`: A version-1 capture receipt, which records capture state and errors.
 
 The receipt contains `version`, `session`, `container`, `phase`, `coverage`, `stdout_bytes`, `stderr_bytes`, `truncated`, and `errors`.
-`phase` starts as `pending` and becomes `finalized` after the pinned Testcontainers stop/drain path, before removal.
-A missing receipt, a pending receipt after exit, or nonempty `errors` means that evidence is incomplete.
-`truncated: true` means that at least one stream exceeded its limit.
-An empty stdout file is normal when SeaweedFS writes only to stderr.
 
-Error codes include `startup-error`, `stream-error`, `drain-timeout`, `producer-stop-error`, `producer-ack-timeout`, and `capture-context-canceled`.
-File failures use `setup-error`, `write-error`, `sync-error`, `close-error`, or `receipt-write-error`.
-Missing evidence uses `missing-producer`, `missing-output`, `missing-file`, or `missing-receipt`.
-The helper also emits a sanitized `SEAWEED_CAPTURE <json>` line to test stderr after finalization.
-Use this fallback if the receipt cannot be written.
-Capture errors do not replace the native test result or prevent teardown.
+| Receipt state | Meaning |
+|---|---|
+| `phase: pending` | Capture running. It becomes `finalized` after the pinned Testcontainers stop/drain path, before removal. |
+| Missing receipt, `pending` after exit, or nonempty `errors` | Evidence is incomplete. |
+| `truncated: true` | At least one stream hit its limit. |
+| Empty `stdout.log` | Normal: SeaweedFS may write only to stderr. |
 
-`coverage: "best-effort"` does not promise gapless logs, even with no errors.
-The pinned Testcontainers producer can reconnect and skip records.
-Capture bounds retained files, not the library's memory use while it reads startup-error logs.
-Abrupt process termination or failed container stops can leave pending evidence.
-The fixture does not supervise test processes or perform a global Docker cleanup.
+<details><summary>Error codes</summary>
 
-Do not publish raw logs without a separate secret review.
-Server logs can contain credentials, request details, or private repository names.
-The helper suppresses Testcontainers' raw startup-log dumps when capture is enabled.
-It does not redact retained files, test output from other sources, or upload anything.
+- Capture: `startup-error`, `stream-error`, `drain-timeout`, `producer-stop-error`,
+  `producer-ack-timeout`, `capture-context-canceled`.
+- Files: `setup-error`, `write-error`, `sync-error`, `close-error`,
+  `receipt-write-error`.
+- Missing evidence: `missing-producer`, `missing-output`, `missing-file`,
+  `missing-receipt`.
+
+</details>
+
+After finalization the helper also prints a sanitized `SEAWEED_CAPTURE <json>` line
+to test stderr. Use it if the receipt cannot be written. Capture errors never
+change the native test result or block teardown.
+
+**Limits:**
+
+- `coverage: "best-effort"` does not promise gapless logs, even without errors: the
+  pinned Testcontainers producer can reconnect and skip records.
+- Capture bounds retained files, not the library's memory while it reads
+  startup-error logs.
+- Abrupt termination or failed container stops can leave pending evidence.
+- The fixture does not supervise test processes or clean up Docker globally.
+
+> [!WARNING]
+> Never publish raw logs without a separate secret review. They can contain
+> credentials, request details, or private repository names. With capture enabled
+> the helper suppresses Testcontainers' raw startup-log dumps, but it does not
+> redact retained files or other test output, and uploads nothing.
 
 ## Prove retention after a failed TestMain test
 
-This procedure uses the real default `githttp` TestMain stack, including Postgres and automatic teardown.
-It waits for a captured SeaweedFS startup event, then deliberately fails one selected test.
-Ordinary CI skips this diagnostic unless `-seaweed-capture-fail` is supplied.
-Run these commands from the repository root under the resource precautions above.
+This runs the real default `githttp` TestMain stack, including Postgres and
+automatic teardown. It waits for a captured SeaweedFS startup event, then fails one
+selected test on purpose. Ordinary CI skips it unless `-seaweed-capture-fail` is
+set. Run from the repository root under the shared-host precautions above:
 
 ```sh
 umask 077
@@ -106,9 +129,17 @@ print('Native test exit: 1 (deliberate failure); retained-evidence proof: PASS')
 PY
 ```
 
-The native test must exit 1 only after the acknowledgment and deliberate failure message.
-The Python verifier must exit 0 independently.
-Make sure that the process and exact-session Docker resources are gone before releasing the lifecycle lock.
-Keep the native exit, raw receipts, and logs together for investigation.
-For a review, record only a sanitized verifier session, with screenshots and a video that show both verdicts.
-This local emulator proof does not establish real-AWS behavior or promote the experimental S3WAL backend.
+**Verify:**
+
+1. The native test exits 1, and only after the acknowledgment and the deliberate
+   failure message.
+2. The Python verifier exits 0 on its own.
+3. The process and exact-session Docker resources are gone before you release the
+   lifecycle lock.
+
+Keep the native exit, raw receipts, and logs together. For a review, record only a
+sanitized verifier session, with screenshots and a video showing both verdicts.
+
+> [!NOTE]
+> This local emulator proof does not establish real-AWS behavior or promote the
+> experimental S3WAL backend.

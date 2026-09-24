@@ -1,15 +1,18 @@
 # Try open.storage with Docker only
 
-Run **one local-mode server** using SQLite and files. Docker and a recent Docker
-Compose plugin (`up --wait` support) are the only server-side prerequisites. No Go,
-standalone `openstorage` binary, Postgres, or S3 service is needed on the host.
-Start from a [repository checkout](../../CONTRIBUTING.md#authenticated-installation).
+Run **one local-mode server** (SQLite plus files) using only Docker. For a
+two-replica Postgres/S3 stack, use the [development stack](deploy-docker-compose.md).
 
-This is **development verification**, not a pinned downloadable image reference.
-The recipe requires an explicitly selected local build. Registry publication is
-not part of this flow; [issue #227](https://github.com/coder/openstorage/issues/227)
-remains open for the downloadable reference. The existing
-[two-replica development stack](deploy-docker-compose.md) is a separate option.
+This is **development verification** with a locally built image. No pinned
+downloadable image exists yet ([issue #227](https://github.com/coder/openstorage/issues/227)).
+
+## Prerequisites
+
+- A [repository checkout](../../CONTRIBUTING.md#authenticated-installation).
+- Docker with a recent Compose plugin (supports `up --wait`).
+- Step 3 only: client-side curl, Git, and Git LFS.
+
+No Go, `openstorage` binary, Postgres, or S3 is needed on the host.
 
 ## 1. Build and start
 
@@ -26,27 +29,33 @@ dc() { docker compose -f compose.quickstart.yml -p "$OPENSTORAGE_PROJECT" "$@"; 
 dc up -d --wait
 ```
 
-[`compose.quickstart.yml`](../../compose.quickstart.yml) never pulls an image. Keep
-the image ID, project name, and port for later commands. The server is bound only to
-`127.0.0.1:$OPENSTORAGE_PORT`. Git and LFS advertise that same host-reachable URL.
-`/healthz` answers after startup initialization; the healthcheck is **liveness**,
-not a continuous check of database or blob-storage readiness.
+Keep the image ID, project name, and port for later commands.
 
-The one-shot root `init` service prepares only the volume roots, generates a keypair
-only when absent, and validates an existing pair without rewriting it. It copies
-**only the public PEM** to the public volume. Invalid, incomplete, mismatched, or
-symlinked key files block startup; a failed initializer is not automatically restarted.
-The long-running server is nonroot. It has a read-only public volume and a writable
-data volume, but **no private-key mount**. The `cli` helper is opt-in and mounts only
-the private volume, read-only. Private directory/file modes are 0700/0600.
-Docker administrators can access all these volumes; this does not isolate secrets
-from people who control the Docker daemon.
+- [`compose.quickstart.yml`](../../compose.quickstart.yml) never pulls an image.
+- The server listens only on `127.0.0.1:$OPENSTORAGE_PORT`; Git and LFS advertise
+  that URL.
+- `/healthz` is a **liveness** check after startup, not continuous database or
+  blob-storage readiness.
+
+<details><summary>How keys and volumes are set up</summary>
+
+- A one-shot root `init` service prepares volume roots, generates a keypair only
+  when absent, and validates an existing pair without rewriting it.
+- It copies **only the public PEM** to the public volume.
+- Invalid, incomplete, mismatched, or symlinked key files block startup. A failed
+  `init` is not restarted.
+- The nonroot server gets a read-only public volume, a writable data volume, and
+  **no private-key mount**.
+- The opt-in `cli` helper mounts only the private volume, read-only.
+- Private modes are 0700 (directory) and 0600 (file).
+- Docker daemon administrators can read all volumes.
+
+</details>
 
 ## 2. Mint a token without installing the CLI
 
-Keep credentials out of command history, terminal output, and Git remote URLs.
-Do not enable shell or Git tracing. The token below lasts one hour and is scoped
-to the `demo` repository:
+Keep credentials out of history, terminal output, and remote URLs. Do not enable
+shell or Git tracing. This token lasts one hour and is scoped to repository `demo`:
 
 ```sh
 set +x
@@ -58,8 +67,8 @@ dc run --rm --no-deps -T cli mint --key /private/org.pem --iss selfhost \
 printf 'Authorization: Bearer %s\n' "$(cat "$OPENSTORAGE_TOKEN_FILE")" > "$CLIENT_DIR/auth"
 ```
 
-For an optional private-key export, redirect directly into a new restrictive host
-file. Do not print the key or place it in the checkout:
+Optional: export the private key into a new restrictive host file, never to the
+terminal or the checkout:
 
 ```sh
 KEY_DIR=$(mktemp -d "$HOME/openstorage-keys.XXXXXX")
@@ -68,15 +77,14 @@ KEY_DIR=$(mktemp -d "$HOME/openstorage-keys.XXXXXX")
 )
 ```
 
-Store that file securely. It grants the ability to mint organization tokens. A
-private-key export alone is **not** a complete backup of the keypair or repository data.
+> [!WARNING]
+> This file can mint organization tokens; store it securely. It is **not** a
+> complete backup of the keypair or repository data.
 
 ## 3. Use the API, Git, and LFS
 
-This section additionally needs **client-side** curl, Git, and Git LFS. They are
-not needed to start the server or mint tokens. Run from the checkout root; all demo
-files stay outside it. The askpass script reads the token file instead of saving a
-tokenized remote or invoking your normal credential store.
+Run from the checkout root; demo files stay outside it. The askpass script reads
+the token file, bypassing tokenized remotes and your credential store.
 
 ```sh
 BASE="http://127.0.0.1:$OPENSTORAGE_PORT"
@@ -111,15 +119,19 @@ cmp "$CLIENT_DIR/source/hello.txt" "$CLIENT_DIR/clone/hello.txt"
 cmp "$CLIENT_DIR/source/example.bin" "$CLIENT_DIR/clone/example.bin"
 ```
 
-Both comparisons should be silent. Unlike the two-replica S3 development example,
-local file storage proxies LFS uploads **and downloads** through the server's
-loopback URL. No container-only object-store address reaches the client.
+**Verify:** both `cmp` commands print nothing. Local storage proxies LFS uploads
+**and downloads** through the loopback URL, so the client never sees a
+container-only object-store address.
 
 ## 4. Stop, resume, or destroy
 
-Three named volumes persist: `${OPENSTORAGE_PROJECT}_private` (keypair),
-`${OPENSTORAGE_PROJECT}_public` (public copy), and `${OPENSTORAGE_PROJECT}_data`
-(SQLite, blobs, and rebuildable cache).
+Three named volumes persist:
+
+| Volume | Contents |
+| --- | --- |
+| `${OPENSTORAGE_PROJECT}_private` | keypair |
+| `${OPENSTORAGE_PROJECT}_public` | public key copy |
+| `${OPENSTORAGE_PROJECT}_data` | SQLite, blobs, rebuildable cache |
 
 ```sh
 dc stop                        # pause, retain containers and all three volumes
@@ -129,12 +141,14 @@ dc up -d --wait                 # same keys, repos, Git, and LFS data
 dc up -d --wait --force-recreate # also retains the named volumes
 ```
 
-A previously minted, unexpired token still works after those operations. Verify
-with the API read above and another clone to a new directory. Changing the project
-name selects different volumes; do not mistake an empty new project for lost data.
-Do not scale this SQLite/file-storage topology beyond one server.
+- Unexpired tokens keep working. Verify with the API read above and a fresh clone.
+- A different project name selects different volumes; an empty project is not lost
+  data.
+- Never run more than one server on this SQLite/file topology.
 
-**Destructive reset, only for a disposable project:**
+> [!WARNING]
+> Destructive reset, only for a disposable project. `down --volumes` irreversibly
+> deletes the keys **and** all repository data.
 
 ```sh
 dc --profile tools down --volumes # irreversibly deletes keys AND repository data
@@ -142,31 +156,36 @@ rm -rf -- "$CLIENT_DIR"          # remove this walkthrough's host credentials/cl
 unset OPENSTORAGE_TOKEN_FILE GIT_ASKPASS GIT_TERMINAL_PROMPT
 ```
 
-If init fails, inspect `dc logs init` and run `dc down` **without** `--volumes`.
-Preserve the volumes before recovery. Restore a known-good, consistent backup of
-all three volumes; never delete just one key file or generate replacement keys over
-existing state. The initializer deliberately does not repair malformed files,
-replace a differing public copy, or regenerate a missing pair while a public copy
-remains. It changes ownership only at mount roots, so changing the image's runtime
-UID requires an explicit offline data migration, not a recursive startup repair.
-Without a usable backup, only reset a project whose data you intend to discard.
-Do not run competing initializers or edit key volumes while the server is running.
+### If `init` fails
+
+1. Inspect `dc logs init`.
+2. Run `dc down` **without** `--volumes` and preserve the volumes.
+3. Restore a known-good, consistent backup of **all three** volumes. Without one,
+   reset only a project whose data you intend to discard.
+
+> [!IMPORTANT]
+> Never delete one key file or generate replacement keys over existing state. Do
+> not run competing initializers or edit key volumes while the server runs.
+
+`init` never repairs malformed files, replaces a differing public copy, or
+regenerates a missing pair while a public copy remains. It changes ownership only at
+mount roots, so changing the runtime UID needs an offline data migration.
 
 ## Verification and production boundary
 
-CI builds the repository Dockerfile without pushing it, then runs
+CI builds the Dockerfile without pushing and runs
 [`scripts/smoke-compose-quickstart.sh`](../../scripts/smoke-compose-quickstart.sh)
-with the exact local image ID. To repeat it, install the client tools above plus
-Bash and Python 3, then run `bash scripts/smoke-compose-quickstart.sh` with
-`OPENSTORAGE_IMAGE` exported. It uses unique disposable projects, tests API/Git/LFS,
-old-token persistence, key isolation, and fail-closed bootstrap faults, then checks
-that its containers, volumes, and networks are deleted. It never changes the
-reference Compose config. No new parser or hot path is introduced, so this change
-adds integration smoke coverage rather than fuzz targets or benchmarks.
+on the exact local image ID. To repeat it, install the client tools plus Bash and
+Python 3, export `OPENSTORAGE_IMAGE`, and run
+`bash scripts/smoke-compose-quickstart.sh`.
 
-This plain-HTTP, single-node default is for a trusted local machine, not a production
-security or availability configuration. Before deployment, plan TLS, external URLs,
-access control, key management/rotation, consistent backups, resource limits, and
-monitoring using the [production guide](deploy-production.md). The two Compose
-recipes remain distinct; this one does not harden or change the existing development
-Postgres/S3 stack.
+The smoke uses disposable projects to test API/Git/LFS, old-token persistence, key
+isolation, and fail-closed bootstrap faults. It then checks that its containers,
+volumes, and networks are gone, and never changes the reference Compose config.
+
+> [!IMPORTANT]
+> This plain-HTTP, single-node setup is for a trusted local machine, not production.
+
+Before deploying, plan TLS, external URLs, access control, key management and rotation, consistent
+backups, resource limits, and monitoring with the
+[production guide](deploy-production.md).
