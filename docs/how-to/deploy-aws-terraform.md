@@ -1,54 +1,54 @@
 # Deploy the AWS EC2 reference with Terraform
 
-**One user deployment, also used by release smoke tests.** The
-[Terraform root](../../deploy/terraform/aws) provisions an HTTPS Application Load
-Balancer (ALB), one Amazon Linux 2023 x86-64 EC2 server, private single-AZ RDS
-PostgreSQL, S3 repository storage, networking, and IAM. No existing VPC, DNS zone,
-certificate, or organization-managed infrastructure is required.
+Deploy one open.storage server on AWS: an HTTPS Application Load Balancer (ALB), one
+Amazon Linux 2023 x86-64 EC2 instance, private single-AZ RDS PostgreSQL, S3, networking,
+and IAM. Release smoke tests use the same [Terraform root](../../deploy/terraform/aws).
+No existing VPC, DNS zone, certificate, or organization-managed infrastructure is
+needed.
 
-This is an **evaluation reference, not a highly available fleet**. PostgreSQL and
-S3 are the standard durable topology. It does not deploy Kubernetes or promote
-experimental S3-only storage. Local/mock verification is not evidence of a
-successful AWS deployment; clean-account and release qualification remain tracked
-in [#224](https://github.com/coder/openstorage/issues/224) and
-[#222](https://github.com/coder/openstorage/issues/222).
+> [!IMPORTANT]
+> This is an **evaluation reference, not a highly available fleet**: standard
+> PostgreSQL + S3, no Kubernetes, no experimental S3-only storage. Local/mock checks
+> do not prove an AWS deployment works; qualification is tracked in [#224](https://github.com/coder/openstorage/issues/224)
+> and [#222](https://github.com/coder/openstorage/issues/222).
 
 ## 1. Prerequisites and cost boundary
 
-1. Obtain approval for an isolated AWS account/sandbox, a commercial AWS region
-   with two available AZs, a spending limit, and teardown authority. Use
-   short-lived credentials (`aws sso login` or an assumed role). **The commands
-   below create billable resources.** This guide does not authorize that spend.
-2. The provisioning role needs to create/read/update/delete VPCs, subnets, routes,
-   security groups, an Internet gateway, EC2/EBS, an ALB/target group/listener,
-   RDS/subnet groups, S3 buckets/objects/policies, IAM instance roles/policies and
-   profiles, and imported ACM certificates. It needs `iam:PassRole` for the
-   reference EC2 role, reads of the public AL2023 SSM parameter, and the usual
-   describe/tag permissions for those services. A clean account may also need
-   `iam:CreateServiceLinkedRole` for ELB, RDS, and RDS-managed Secrets Manager
-   integration. Permission boundaries, SCPs, region opt-in, quotas, or denied
-   service-linked role creation can block provisioning. There is no embedded
-   administrator policy or claim that the runtime role can provision the stack.
-3. Install [mise](https://mise.jdx.dev/), then run `mise install` at the repository
-   root. Terraform is pinned in `mise.toml`; provider versions and checksums are
-   committed beside the reference. Also install AWS CLI v2, Git, Git LFS, `gh`,
-   Python 3, OpenSSL, `curl`, and GNU `timeout` for bounded automation.
-4. Have access to the exact release or RC archive and its trusted checksum. While
-   downloads require repository access, use authenticated `gh` **on your client**.
-   The instance receives neither a GitHub token nor the signing private key.
-5. Know your client's public egress IPv4 CIDR (normally `/32`). Do not use an
-   address-discovery service without considering its privacy implications. The
-   ALB accepts only these CIDRs on port 443. There is no SSH ingress.
+> [!WARNING]
+> **The commands below create billable resources.** This guide does not authorize
+> that spend.
 
-The default bill includes a `t3.small`, a 50-GiB encrypted gp3 root/cache disk,
-`db.t4g.micro` PostgreSQL with 20 GiB and seven-day automated backups, an ALB,
-public IPv4 addresses, Secrets Manager, and S3/storage/request/transfer charges.
-Check regional prices before applying. There is no NAT gateway, autoscaling,
-scheduled job, or automatic shutdown. Budget alarms are not hard spending caps.
+1. **Approval:** an isolated AWS account/sandbox, a commercial region with two
+   available AZs, a spending limit, and teardown authority. Use short-lived
+   credentials (`aws sso login` or an assumed role).
+2. **Provisioning permissions:** create/read/update/delete VPCs, subnets, routes,
+   security groups, an Internet gateway, EC2/EBS, ALB/target group/listener,
+   RDS/subnet groups, S3 buckets/objects/policies, IAM instance roles/policies/
+   profiles, and imported ACM certificates. Plus `iam:PassRole` for the EC2 role,
+   reads of the public AL2023 SSM parameter, and describe/tag permissions. A clean
+   account may need `iam:CreateServiceLinkedRole` for ELB, RDS, and RDS-managed
+   Secrets Manager. Boundaries, SCPs, region opt-in, quotas, or denied
+   service-linked roles can block provisioning. No administrator policy is
+   embedded, and the runtime role is not meant to provision the stack.
+3. **Tools:** [mise](https://mise.jdx.dev/) plus `mise install` at the repo root
+   (pins Terraform; provider locks are committed), AWS CLI v2, Git, Git LFS, `gh`,
+   Python 3, OpenSSL, `curl`, and GNU `timeout`.
+4. **Release:** the exact release/RC archive and its trusted checksum. Use
+   authenticated `gh` **on your client** while downloads need repository access. The
+   instance never gets a GitHub token or the signing key.
+5. **Client CIDR:** your public egress IPv4 CIDR (normally `/32`); mind the privacy
+   of address-discovery services. The ALB accepts only these CIDRs on port 443. No
+   SSH ingress.
+
+**Default bill:** a `t3.small`, a 50-GiB encrypted gp3 root/cache disk,
+`db.t4g.micro` PostgreSQL (20 GiB, seven-day automated backups), an ALB, public IPv4
+addresses, Secrets Manager, and S3 storage/request/transfer. Check regional prices.
+No NAT gateway, autoscaling, scheduled job, or automatic shutdown. Budget alarms are
+not hard caps.
 
 ## 2. Prepare release and organization authentication locally
 
-Use a private directory **outside the checkout** for signing keys and downloads:
+Download and verify the release into a private directory **outside the checkout**:
 
 ```bash
 set -euo pipefail
@@ -75,9 +75,8 @@ PY
 export RELEASE_SHA256
 ```
 
-Install the matching `openstorage` CLI on your client using the
-[installation instructions](../../CONTRIBUTING.md#authenticated-installation).
-For a Linux amd64 client, the verified archive above is directly runnable:
+Install the matching client CLI ([instructions](../../CONTRIBUTING.md#authenticated-installation)).
+On Linux amd64, the verified archive runs directly:
 
 ```bash
 tar -xzf "$ARCHIVE_PATH" -C "$CLIENT_DIR" openstorage
@@ -85,11 +84,12 @@ export PATH="$CLIENT_DIR:$PATH"
 openstorage version
 ```
 
-Other clients need their own matching platform archive and checksum as well as the
-Linux amd64 archive for EC2. Record `openstorage version` (including commit) with
-the evidence. An RC may be built
-with [`scripts/release-archives.sh`](../../scripts/release-archives.sh); its exact
-source commit and archive digest must be recorded. This does not publish an artifact.
+Other clients need their own platform archive and checksum (EC2 still uses Linux
+amd64). Record `openstorage version`, including commit, with the evidence. An RC may
+be built with [`scripts/release-archives.sh`](../../scripts/release-archives.sh);
+record its source commit and archive digest. This publishes nothing.
+
+Generate the org keypair and write the Terraform inputs:
 
 ```bash
 openstorage keygen --out "$CLIENT_DIR/org" --alg ES256
@@ -115,29 +115,30 @@ inputs = {
 PY
 ```
 
-Do not paste a private key into a tfvar, environment template, PR, or log.
-Terraform rejects private-key PEM in the public-key input; bootstrap additionally
-parses the actual public key. Losing the signing key loses the ability to mint
-new tokens. Back it up securely outside Terraform.
+> [!WARNING]
+> Never paste a private key into a tfvar, env template, PR, or log. (Terraform
+> rejects private PEM in the public-key input; bootstrap parses the public key.)
+> Without the signing key you cannot mint tokens: back it up outside Terraform.
 
 ## 3. Protect state, plan, and apply
 
-**Terraform state contains the transport CA and server TLS private keys.** They
-are unrelated to the organization's JWT signing key, which never enters state.
-Marking a value sensitive only redacts normal CLI rendering; state, saved plans,
-`terraform show -json`, and provider debug logs can still contain it. Restrict
-local file permissions/backups, never commit or upload state/plans, and use an
-encrypted, access-controlled, locking remote backend for shared/persistent use.
-The root intentionally leaves backend selection to the operator; configuring that
-backend is separate from the reference resources to avoid a state bootstrap cycle.
+> [!WARNING]
+> **Terraform state contains the transport CA and server TLS private keys.**
+> "Sensitive" only redacts normal CLI output; state, saved plans,
+> `terraform show -json`, and provider debug logs can still contain them.
 
-RDS generates and rotates its master password in Secrets Manager. Terraform stores
-its ARN/metadata, not its value. The EC2 runtime fetches it with its role and holds
-the connection string in a root-only `/run` file and the service process environment.
-Instance administrators can access it. Repository data and RDS snapshots can
-contain application secrets: this slice does not enable application-level
-`OPENSTORAGE_SECRETS_KEY` encryption for webhook/upstream credentials. See the
-[production security guidance](deploy-production.md#backing-services).
+- Restrict local permissions and backups. Never commit or upload state or plans.
+- For shared or persistent use, configure an encrypted, access-controlled, locking remote backend
+  yourself (left out to avoid a state bootstrap cycle).
+- The org JWT signing key never enters state.
+- RDS generates and rotates its master password in Secrets Manager; Terraform stores
+  only the ARN. The instance keeps the connection string in a root-only `/run` file
+  and the service environment, readable by instance administrators.
+- Repository data and RDS snapshots can contain application secrets:
+  `OPENSTORAGE_SECRETS_KEY` encryption for webhook/upstream credentials is not
+  enabled. See [production security guidance](deploy-production.md#backing-services).
+
+Check the account and region, then plan, review, and apply:
 
 ```bash
 # From the repository root. Verify account/region before any mutation.
@@ -152,36 +153,50 @@ mise exec -- terraform -chdir=deploy/terraform/aws output -json deployment \
   > "$CLIENT_DIR/deployment.json"
 ```
 
-A timeout does **not** guarantee rollback or cleanup. Preserve state, inspect AWS
-and the next plan, and finish or tear down the partial deployment. Never run a
-second apply/destroy concurrently or blindly remove a state lock.
+> [!IMPORTANT]
+> A timeout does **not** guarantee rollback or cleanup. Preserve state, inspect AWS and the next plan,
+> then finish or tear down. Never run concurrent apply/destroy or blindly remove a
+> state lock.
 
-The instance has a public address for outbound HTTPS packages/AWS APIs but accepts
-port 8080 only from the ALB security group. PostgreSQL is in private subnets and
-accepts port 5432 only from the instance. ALB-to-instance HTTP stays inside that
-security-group boundary; this is not end-to-end TLS. IMDSv2 is required. Runtime
-IAM is limited to the deployment's S3 data, the exact release object, and the RDS
-secret; S3 access is pinned to the owning account. Repository S3 is unversioned to
-preserve the documented destructive-sweep semantics.
+<details><summary>What the stack looks like</summary>
 
-Cloud-init downloads the staged release from the private artifact bucket, verifies
-SHA-256 and embedded version before installation, and starts a non-root systemd
-service. Automatic restart and a managed-password refresh timer handle process
-failure/credential rotation. Bootstrap needs working HTTPS egress to AWS package
-repositories, S3, Secrets Manager, and the RDS CA endpoint. The root AMI resolves
-from AWS's AL2023 parameter; replay its output `ami_id` as an input to pin it.
-OS package/security updates and RDS minor versions are intentionally not byte-pinned.
+**Network and IAM**
+
+- The instance has a public address for outbound HTTPS but accepts port 8080 only
+  from the ALB security group.
+- PostgreSQL is in private subnets, port 5432 open only to the instance.
+- ALB-to-instance is plain HTTP inside that boundary, not end-to-end TLS.
+- IMDSv2 is required.
+- Runtime IAM covers only the deployment's S3 data, the release object, and the RDS
+  secret; S3 access is pinned to the owning account.
+- Repository S3 is unversioned, matching the destructive-sweep semantics.
+
+**Bootstrap**
+
+- Cloud-init fetches the release from the private artifact bucket, verifies SHA-256
+  and embedded version, and starts a non-root systemd service with automatic
+  restart and a managed-password refresh timer.
+- Bootstrap needs HTTPS egress to AWS package repos, S3, Secrets Manager, and the
+  RDS CA endpoint.
+- The AMI comes from AWS's AL2023 parameter; pass output `ami_id` back as an input
+  to pin it. OS packages and RDS minor versions are not byte-pinned.
+
+</details>
 
 ## 4. Trust TLS and use the service
 
-No custom domain is needed. The output URL uses the **ALB DNS name**, not a stable
-IP. Terraform creates a private CA and imports an ALB certificate with that DNS
-SAN into ACM. Browsers do not trust it automatically. Trust the public CA obtained
-from your protected Terraform output; **never use `curl -k` or disable Git TLS
-verification**. The leaf expires after one year and is renewed by a subsequent
-Terraform apply when within 30 days of expiry. There is no unattended renewal job.
-A publicly trusted custom-domain deployment is a later extension, not a hidden
-manual prerequisite for this path.
+The service URL is the **ALB DNS name** (not a stable IP); no domain is needed.
+Terraform creates a private CA and imports a matching ALB certificate into ACM.
+Browsers do not trust it.
+
+> [!WARNING]
+> Trust the public CA from your protected Terraform output. **Never use `curl -k` or
+> disable Git TLS verification.**
+
+The leaf expires after one year. An apply within 30 days of expiry renews it; no
+job renews it unattended. Publicly trusted custom domains are a future extension.
+
+Build a CA bundle, check liveness, then create, push to, and read a demo repository:
 
 ```bash
 export SERVICE_URL=$(python3 -c 'import json,os; print(json.load(open(os.environ["CLIENT_DIR"]+"/deployment.json"))["service_url"])')
@@ -221,34 +236,33 @@ printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | \
 unset TOKEN GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 ```
 
-Do not run this shell with `set -x`, `GIT_TRACE`, curl verbosity, or HTTP-header
-logging. Tokens remain accessible to same-user process inspection while in use.
-The create/write/read flow is an authenticated connectivity check. `/healthz`
-returns process liveness after initial startup, not continuous PG/S3 health; an
-ALB-healthy node can still fail data operations. Inspect EC2 console/cloud-init
-output and ALB target health for startup failures. There is no SSH/SSM management
-channel in this slice; changing bootstrap inputs replaces the disposable node.
+- No `set -x`, `GIT_TRACE`, curl verbosity, or header logging. Same-user processes
+  can inspect tokens while in use.
+- The create/write/read flow is the real connectivity check. `/healthz` is liveness
+  only; an ALB-healthy node can still fail PG/S3 operations.
+- Debug startup with EC2 console/cloud-init output and ALB target health. There is
+  no SSH/SSM; changing bootstrap inputs replaces the disposable node.
 
 ## 5. Release-smoke integration and evidence
 
-`terraform output -json deployment` is the **schema version 1** handoff. It includes
+`terraform output -json deployment` is the **schema version 1** handoff:
 `service_url`, `health_url`, `tls_ca_certificate_pem`, `org`, `region`, `account_id`,
 `instance_ids`, `ami_id`, `bucket`, `database_id`, ALB/target-group ARNs, and
-`release: {tag, sha256}`. It contains no private key, token, or database password.
-The client/runner supplies its local signing-key path separately.
+`release: {tag, sha256}`. No private key, token, or database password; the runner
+supplies its own signing-key path. The opt-in
+[smoke adapter](../../deploy/terraform/aws/scripts/smoke.sh) maps it to the #222
+runner's `--config`/`--output` interface.
 
-The opt-in [smoke adapter](../../deploy/terraform/aws/scripts/smoke.sh) translates
-this output to the separately owned #222 runner's `--config`/`--output` interface.
-It requires a runner supporting **`pg-s3-single-node` with empty `replica_urls` and
-optional `ca_file`**. Runner versions supporting only `local`, two-replica `pg-s3`,
-and `s3wal` reject this handoff. Compatible runner integration is a remaining
-#222 gate, not established by the adapter's stub tests. Do not label this node
-`local`, repeat the ALB URL as two replicas, or disable TLS verification to bypass it.
+> [!IMPORTANT]
+> The runner must support **`pg-s3-single-node` with empty `replica_urls` and
+> optional `ca_file`**; runners with only `local`, two-replica `pg-s3`, and `s3wal`
+> reject it. Compatible integration is still a #222 gate (stub tests do not prove
+> it). Never label this node `local`, list the ALB twice, or disable TLS to bypass.
 
-Prepare four local inputs, separately from Terraform. Use the approved source
-commit and executable SHA for your matching client platform, **not the Linux
-archive SHA**. Paths resolve relative to the invoking directory. The runner checks
-executable hash/version consistency; that does not attest deployed binaries.
+Prepare runner inputs separately from Terraform. Use the approved source commit and
+the executable SHA for **your client platform, not the Linux archive SHA**. Paths
+resolve from the invoking directory. The runner's hash/version check does not attest
+deployed binaries.
 
 ```bash
 # Replace these values with the independently verified local helper identity.
@@ -273,38 +287,37 @@ OPENSTORAGE_AWS_SMOKE=1 timeout --signal=TERM --kill-after=30s 20m \
   --smoke --budget-seconds 600
 ```
 
-The adapter reads state but never provisions resources. It combines system CA
-trust with the public ALB CA, keeps the signing key local, removes temporary
-config/CA files, and propagates the runner's exit status. Keep the earlier exported
-`deployment.json` beside the runner results for resource and archive metadata;
-the runner config intentionally excludes those extra fields. `--aws-readonly`
-optionally enables the runner's STS/HeadBucket probes using the caller's approved
-AWS credentials. Scenarios and result manifests belong to #222, not another
-framework here. Single-node smoke explicitly cannot prove cross-replica behavior.
+The adapter reads state but never provisions. It builds a temporary CA bundle
+(system CAs plus the ALB CA) for the runner, keeps the signing key local, removes
+temporary config/CA files, and returns the runner's exit
+status. `--aws-readonly` enables the runner's STS/HeadBucket probes with your
+approved credentials. Keep `deployment.json` beside the results; the runner config
+omits its resource and archive metadata. Single-node smoke cannot prove
+cross-replica behavior.
 
-RC qualification must record the reference Git commit, exact release commit and
+**RC qualification** must record: the reference Git commit, exact release commit and
 artifact SHA, Terraform/provider lock, region/account, sanitized inputs, timestamps,
 logs, screenshot/video, pass/fail/skipped cases, and teardown/resource checks.
-Real same-region Git/API/LFS/auth/IAM/recovery and two-replica evidence are still
-required by #222. A successful plan, bootstrap unit test, or apply is insufficient.
-No recurring cloud schedule is enabled. Daily/weekly/RC cadence, budget, ownership,
-notifications, recovery breadth, and leaked-resource detection remain follow-ups
-in #224 pending approved execution resources.
+
+A plan, bootstrap unit test, or apply is not enough: #222 still needs real
+same-region Git/API/LFS/auth/IAM/recovery and two-replica evidence. No recurring
+cloud schedule runs; cadence, budget, ownership, notifications, recovery breadth,
+and leak detection remain #224 follow-ups.
 
 ## 6. Persistence and deliberate teardown
 
-RDS and S3 hold the durable repository. EC2 root/cache replacement is disposable;
-losing it does not deliberately delete PG/S3. This is not a tested recovery or
-backup-restore guarantee. Cache grows without eviction; 50 GiB is only evaluation
-capacity. There is no HA, automatic instance replacement, disk alarm, or restore
-automation. RDS's seven-day backups are not an independently verified backup of
-both stores together.
+RDS and S3 hold the durable repository; losing the EC2 disk does not deliberately delete them.
+This is not a tested recovery guarantee. The cache grows without eviction (50 GiB is
+evaluation capacity). There is no HA, instance replacement, disk alarm, or restore
+automation, and RDS backups are not a verified backup of both stores together.
 
-By default, RDS deletion protection is on and nonempty S3 data cannot be force
-deleted. `terraform destroy` can therefore partially destroy other resources and
-then fail. **Do not use destroy to pause a retained deployment.** Retained resources
-continue to cost money. Export/verify the desired database and object backups
-before intentionally enabling destructive teardown:
+By default RDS deletion protection is on and nonempty S3 cannot be force deleted,
+so `terraform destroy` can partially succeed and then fail.
+
+> [!WARNING]
+> **Do not use destroy to pause a deployment**; retained resources keep costing
+> money. Export and verify backups first: these commands delete all data with no
+> final snapshot.
 
 ```bash
 # This first apply permanently opts the stack into data deletion on destroy.
@@ -318,13 +331,16 @@ timeout --signal=INT --kill-after=60s 60m \
 mise exec -- terraform -chdir=deploy/terraform/aws state list
 ```
 
-Confirm state is empty and inspect EC2/EBS, ELB, RDS/backups/Secrets Manager, S3,
-IAM, ACM, and VPC resources in the recorded region for the deployment name/tags.
-An empty state alone cannot prove the account has no leaks. If deletion times out,
-retain the state and rerun the inspected destroy; never delete state to hide a
-failed cleanup. Terraform-managed artifact storage is disposable too. Any manual
-snapshots/backups and your state backend are outside this destroy and require
-separate retention/cleanup decisions.
+**Verify cleanup:**
+
+1. Confirm the state list is empty.
+2. Inspect EC2/EBS, ELB, RDS/backups/Secrets Manager, S3, IAM, ACM, and VPC in the
+   recorded region for the deployment name/tags. Empty state does not prove no leaks.
+3. On timeout, keep state and rerun the inspected destroy. Never delete state to
+   hide a failed cleanup.
+
+Terraform-managed artifact storage is destroyed too. Manual snapshots/backups and
+your state backend are outside this destroy.
 
 ## Local contributor checks (no AWS account)
 
@@ -339,6 +355,6 @@ python3 -m unittest discover -s deploy/terraform/aws/tests -p 'test_*.py' -v
 python3 scripts/check-doc-links.py
 ```
 
-Terraform tests use mocked providers and **plan only**; bootstrap unit tests use
-local fixtures/stubs. They do not establish AWS IAM, RDS, networking, certificate
-import, ALB readiness, clean-account provisioning, or dependable AWS cleanup.
+These use mocked providers (**plan only**) and local stubs. They do not prove AWS
+IAM, RDS, networking, certificate import, ALB readiness, clean-account provisioning,
+or reliable cleanup.
