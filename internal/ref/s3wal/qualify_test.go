@@ -13,7 +13,8 @@
 // #304), and an external
 // endpoint gated on OPENSTORAGE_TEST_S3WAL_URL (required to pass when
 // opted in). Deterministic stub-server tests prove the probe refuses
-// non-compliant stores and pin the §2.3 CAS error taxonomy without Docker.
+// non-compliant stores, pin the §2.3 CAS error taxonomy, and pin the
+// record-mode verdicts of the legacy MinIO lane without Docker.
 //
 // Every verdict is logged as `VERDICT store=… surface=… verdict=… detail=…`
 // so a lane transcript is the raw material for the §5-R7 qualification
@@ -23,6 +24,7 @@ package s3wal_test
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -290,12 +292,16 @@ type qualSurface struct {
 }
 
 // runSurfaces executes the given surfaces under runQualification's
-// verdict-handling contract (see above); the Floci lane reuses it for its
-// extra gap surfaces (qualify_floci_test.go).
-func runSurfaces(t *testing.T, e *qualEnv, require bool, surfaces []qualSurface) {
+// verdict-handling contract (see above) and returns every logged verdict
+// in order; the Floci lane reuses it for its extra gap surfaces
+// (qualify_floci_test.go), and TestQualifyLegacyMinIOStub asserts the
+// returned rows.
+func runSurfaces(t *testing.T, e *qualEnv, require bool, surfaces []qualSurface) []verdict {
 	t.Helper()
+	var all []verdict
 	for _, s := range surfaces {
 		for _, v := range s.run(t, e) {
+			all = append(all, v)
 			t.Logf("VERDICT store=%s surface=%s verdict=%s detail=%q", e.label, v.surface, v.class, v.detail)
 			switch {
 			case v.class == verdictError:
@@ -305,6 +311,7 @@ func runSurfaces(t *testing.T, e *qualEnv, require bool, surfaces []qualSurface)
 			}
 		}
 	}
+	return all
 }
 
 // surfaceRawRoundTrip: PutObject → GetObject → HeadObject → DeleteObject →
@@ -872,8 +879,11 @@ func TestMinIOLegacyLaneRequested(t *testing.T) {
 // The lane is opt-in (EnvTestMinIOLegacy, issue #304). Once requested it
 // fails loudly: a missing image, missing Docker, -short, or an incomplete
 // verdict set is a test failure, never a skip. Default CI does not run real
-// MinIO; the deterministic probe-refusal coverage for the same defect class
-// (ignored If-None-Match: *) is TestProbeRefusesNonCompliantStore.
+// MinIO. Its default-CI guards are TestQualifyLegacyMinIOStub, which pins
+// this lane's record-mode verdict rows on the conditional surfaces against
+// a stub modeled on its recorded behavior (issue #310), and
+// TestProbeRefusesNonCompliantStore, which covers probe refusal for the
+// same defect class (ignored If-None-Match: *).
 func TestQualifyMinIOLegacy(t *testing.T) {
 	requested, err := minIOLegacyLaneRequested(envconfig.Getenv(EnvTestMinIOLegacy))
 	if err != nil {
@@ -1694,6 +1704,190 @@ func TestProbeRefusesNonCompliantStore(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "refusing to serve") {
 				t.Fatalf("probe error %q does not refuse to serve", err)
+			}
+		})
+	}
+}
+
+// legacyMinIOStore is a deterministic in-memory stand-in for the legacy
+// MinIO pin (s3waltest.MinIOLegacyImage, RELEASE.2024-01-16T16-07-38Z) on
+// the conditional surfaces, for path-style bucket "stub". It models only
+// behavior the real lane recorded (Phase 1a matrix column "MinIO legacy
+// 2024-01", re-observed by TestQualifyMinIOLegacy on a cached host for
+// #304 on 2026-09-24):
+//
+//   - PUT If-None-Match: * on an EXISTING key is accepted and overwrites
+//     the object (gocloud-ifnotexist, conditional-create-duplicate and
+//     probe step 2 all recorded `ignores`), unless honorIfNoneMatch is set.
+//   - PUT If-Match is honored: a stale ETag gets 412 PreconditionFailed
+//     (conditional-advance-stale `pass`).
+//   - GET If-None-Match is honored: a matching ETag gets 304, any other
+//     ETag gets the body (get-304-matched and get-304-changed `pass`).
+//   - Every accepted PUT gets the S3 single-part ETag, the quoted hex MD5
+//     of the body, so different bytes get a new ETag
+//     (conditional-advance-matched `pass`).
+//
+// honorIfNoneMatch turns it into the compliant control: the same store
+// with only the creation guard fixed. ignoredCreates counts accepted
+// If-None-Match: * PUTs over an existing key, proving each `ignores`
+// verdict came from a header that really reached the store.
+type legacyMinIOStore struct {
+	mu               sync.Mutex
+	objs             map[string]recordedObject
+	honorIfNoneMatch bool
+	ignoredCreates   int
+}
+
+func (s *legacyMinIOStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeS3Error(w, http.StatusBadRequest, "IncompleteBody")
+		return
+	}
+	key, ok := strings.CutPrefix(r.URL.Path, "/stub/")
+	if !ok || key == "" {
+		// Bucket-level or foreign-bucket requests are outside the modeled
+		// surfaces; answering them would invent MinIO behavior.
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented")
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.objs == nil {
+		s.objs = map[string]recordedObject{}
+	}
+	cur, exists := s.objs[key]
+	switch r.Method {
+	case http.MethodPut:
+		if r.Header.Get("If-None-Match") == "*" && exists {
+			if s.honorIfNoneMatch {
+				writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+				return
+			}
+			s.ignoredCreates++
+		}
+		if im := r.Header.Get("If-Match"); im != "" && (!exists || im != cur.etag) {
+			writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			return
+		}
+		sum := md5.Sum(body)
+		obj := recordedObject{body: body, etag: fmt.Sprintf("%q", hex.EncodeToString(sum[:]))}
+		s.objs[key] = obj
+		w.Header().Set("ETag", obj.etag)
+		w.WriteHeader(http.StatusOK)
+	case http.MethodGet, http.MethodHead:
+		if !exists {
+			writeS3Error(w, http.StatusNotFound, "NoSuchKey")
+			return
+		}
+		w.Header().Set("ETag", cur.etag)
+		if inm := r.Header.Get("If-None-Match"); inm != "" && inm == cur.etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(cur.body)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = w.Write(cur.body)
+	case http.MethodDelete:
+		delete(s.objs, key)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented")
+	}
+}
+
+func (s *legacyMinIOStore) ignoredCreateCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ignoredCreates
+}
+
+// TestQualifyLegacyMinIOStub is the default-CI guard for the record-mode
+// classification that only TestQualifyMinIOLegacy exercised before that
+// lane became opt-in (issues #304, #310). It runs the qualification
+// surfaces that touch conditional headers against legacyMinIOStore in
+// record mode, with no Docker and no network beyond loopback, and pins the
+// exact verdict rows the real lane recorded:
+//
+//   - gocloud-ifnotexist and conditional-create-duplicate classified as
+//     `ignores` (the err == nil branches, unreachable on SeaweedFS);
+//   - the probe decomposed into step 1 `pass`, step 2 `ignores` with the
+//     probe's diagnosis, and steps 3–5 `not-reached`;
+//   - record mode (require=false) logging those findings without failing.
+//
+// The honest If-Match and GET If-None-Match rows are pinned too, so the
+// stub stays a store that ignores only creation guards. The compliant
+// control flips honorIfNoneMatch and must turn every row into `pass`.
+// The remaining surfaces (round trip, multipart, listing, contiguity,
+// presigned GET, bucket bootstrap) recorded `pass` on MinIO and take the
+// same branches in the require-mode SeaweedFS lane, so the stub does not
+// model them.
+func TestQualifyLegacyMinIOStub(t *testing.T) {
+	surfaces := []qualSurface{
+		{"gocloud-ifnotexist", surfaceGocloudIfNotExist},
+		{"conditional-create", surfaceConditionalCreate},
+		{"conditional-advance", surfaceConditionalAdvance},
+		{"get-if-none-match", surfaceGetIfNoneMatch},
+		{"probe", surfaceProbe},
+	}
+	type row struct{ surface, class string }
+	legacyRows := []row{
+		{"gocloud-ifnotexist", verdictIgnores},
+		{"conditional-create-fresh", verdictPass},
+		{"conditional-create-duplicate", verdictIgnores},
+		{"conditional-advance-matched", verdictPass},
+		{"conditional-advance-stale", verdictPass},
+		{"get-304-matched", verdictPass},
+		{"get-304-changed", verdictPass},
+		{"probe-step-1-create", verdictPass},
+		{"probe-step-2-duplicate-create-412", verdictIgnores},
+		{"probe-step-3-matched-advance", verdictNotReached},
+		{"probe-step-4-stale-advance-412", verdictNotReached},
+		{"probe-step-5-racing-advances", verdictNotReached},
+	}
+	compliantRows := make([]row, len(legacyRows))
+	for i, r := range legacyRows {
+		compliantRows[i] = row{r.surface, verdictPass}
+	}
+	for _, tc := range []struct {
+		name  string
+		store *legacyMinIOStore
+		want  []row
+		// wantIgnored is how many If-None-Match: * PUTs over an existing
+		// key the store must accept: one each from gocloud-ifnotexist,
+		// conditional-create-duplicate and probe step 2.
+		wantIgnored int
+	}{
+		{"legacy-minio-2024-01", &legacyMinIOStore{}, legacyRows, 3},
+		{"compliant-control", &legacyMinIOStore{honorIfNoneMatch: true}, compliantRows, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.store)
+			t.Cleanup(srv.Close)
+			raw := rawS3Client(t, srv.URL, "us-east-1", "stub", "stub")
+			e := newQualEnv(t, "stub-"+tc.name, raw, "stub", "", s3wal.ProbeKey)
+			got := runSurfaces(t, e, false, surfaces)
+			gotRows := make([]row, len(got))
+			for i, v := range got {
+				gotRows[i] = row{v.surface, v.class}
+			}
+			if !slices.Equal(gotRows, tc.want) {
+				t.Fatalf("verdict rows:\n got %v\nwant %v", gotRows, tc.want)
+			}
+			for _, v := range got {
+				switch {
+				case v.class == verdictIgnores && v.detail == "":
+					t.Errorf("surface %s: ignores verdict without a diagnosis", v.surface)
+				case v.surface == "probe-step-2-duplicate-create-412" && v.class == verdictIgnores &&
+					!strings.Contains(v.detail, "IGNORES If-None-Match: *"):
+					t.Errorf("probe step 2 detail = %q, want the probe's ignored-If-None-Match diagnosis", v.detail)
+				}
+			}
+			if n := tc.store.ignoredCreateCount(); n != tc.wantIgnored {
+				t.Errorf("store accepted %d If-None-Match: * PUTs over existing keys, want %d", n, tc.wantIgnored)
 			}
 		})
 	}
