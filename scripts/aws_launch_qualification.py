@@ -422,16 +422,23 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
             result["status"] = "failed"
             runner.log.append("cleanup: interrupted")
         try:
-            require(type(budget) is int and 1 <= budget <= 900, "invalid_budget")
-            require(os.name == "posix", "posix_required")
-            old_alarm = signal.signal(signal.SIGALRM, deadline_expired)
-            old_term = signal.signal(signal.SIGTERM, interrupted)
-            signal.setitimer(signal.ITIMER_REAL, budget)
-            runner.preflight(config, smoke, aws_readonly)
-            if aws_readonly:
-                runner.aws()
-            if smoke:
-                runner.smoke()
+            try:
+                require(type(budget) is int and 1 <= budget <= 900, "invalid_budget")
+                require(os.name == "posix", "posix_required")
+                old_alarm = signal.signal(signal.SIGALRM, deadline_expired)
+                old_term = signal.signal(signal.SIGTERM, interrupted)
+                signal.setitimer(signal.ITIMER_REAL, budget)
+                runner.preflight(config, smoke, aws_readonly)
+                if aws_readonly:
+                    runner.aws()
+                if smoke:
+                    runner.smoke()
+            finally:
+                # If the main alarm fires while disarming, the outer finally
+                # still owns cleanup. No main timer remains during its handoff.
+                if old_alarm is not None:
+                    signal.signal(signal.SIGALRM, signal.SIG_IGN)
+                    signal.setitimer(signal.ITIMER_REAL, 0)
             result["status"] = "passed"
         except (Exception, KeyboardInterrupt) as error:
             reason = str(error) if isinstance(error, Failure) else "interrupted" if isinstance(error, KeyboardInterrupt) else "operation_failed"
@@ -439,11 +446,13 @@ def execute(config, output, smoke=False, aws_readonly=False, budget=300):
             runner.log.append(runner.active + ": " + reason)
         finally:
             try:
-                # Defer cancellation, not the alarm: cleanup retains its 45-second bound.
+                # Cleanup gets its own alarm: urllib socket timeouts alone do
+                # not bound responses that trickle bytes before each timeout.
                 if old_term is not None:
                     signal.signal(signal.SIGTERM, defer_cleanup_interrupt)
                     old_int = signal.signal(signal.SIGINT, defer_cleanup_interrupt)
                 if old_alarm is not None:
+                    signal.signal(signal.SIGALRM, deadline_expired)
                     signal.setitimer(signal.ITIMER_REAL, 45)
                 runner.cleanup()
             except (Exception, KeyboardInterrupt):

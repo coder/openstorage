@@ -472,6 +472,64 @@ sys.exit(code)
         self.assertEqual(cases["api_commit"]["reason"], "interrupted")
         self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
 
+    def test_main_alarm_cannot_skip_cleanup_during_handler_handoff(self):
+        install = q.signal.signal
+        for interrupt_at in (q.signal.SIGTERM, q.signal.SIGINT):
+            with self.subTest(interrupt_at=interrupt_at):
+                self.output = self.root / str(interrupt_at)
+                fired = []
+                def signal_handler(sig, handler):
+                    if sig == interrupt_at and getattr(handler, "__name__", "") == "defer_cleanup_interrupt":
+                        if q.signal.getitimer(q.signal.ITIMER_REAL)[0] > 0:
+                            # Model the main timer expiring: a one-shot timer is no
+                            # longer armed when its signal is delivered.
+                            q.signal.setitimer(q.signal.ITIMER_REAL, 0)
+                            fired.append(True)
+                            os.kill(os.getpid(), q.signal.SIGALRM)
+                    return install(sig, handler)
+                with patch.object(q.signal, "signal", side_effect=signal_handler):
+                    code, calls, _ = self.smoke_with()
+                self.assertEqual(code, 1 if fired else 0)
+                self.assertTrue(any(call.args[2] == "/api/v1/repos/delete" for call in calls))
+                self.assertEqual(self.result()["cleanup"]["status"], "soft_deleted")
+
+    def test_main_alarm_during_disarm_still_reaches_cleanup(self):
+        install = q.signal.signal
+        fired = []
+        previous = [q.signal.getsignal(sig) for sig in (q.signal.SIGALRM, q.signal.SIGTERM, q.signal.SIGINT)]
+        def signal_handler(sig, handler):
+            if sig == q.signal.SIGALRM and handler == q.signal.SIG_IGN and not fired:
+                q.signal.setitimer(q.signal.ITIMER_REAL, 0)
+                fired.append(True)
+                os.kill(os.getpid(), q.signal.SIGALRM)
+            return install(sig, handler)
+        with patch.object(q.signal, "signal", side_effect=signal_handler):
+            code, calls, _ = self.smoke_with()
+        self.assertEqual(fired, [True])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.result()["status"], "failed")
+        self.assertTrue(any(call.args[2] == "/api/v1/repos/delete" for call in calls))
+        self.assertEqual(self.result()["cleanup"]["status"], "soft_deleted")
+        self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGALRM, q.signal.SIGTERM, q.signal.SIGINT)], previous)
+
+    def test_cleanup_keeps_an_independent_alarm_deadline(self):
+        arm = q.signal.setitimer
+        reached = []
+        def timer(which, seconds, interval=0):
+            return arm(which, 0.02 if seconds == 45 else seconds, interval)
+        def http(runner, base, path, *args, **kwargs):
+            if path == "/api/v1/repos/delete":
+                reached.append("delete")
+                q.time.sleep(2)
+                reached.append("unbounded")
+            return self.fake_http(runner, base, path, *args, **kwargs)
+        with patch.object(q.signal, "setitimer", side_effect=timer):
+            code, _, _ = self.smoke_with(http)
+        self.assertEqual(code, 1)
+        self.assertEqual(reached, ["delete"])
+        self.assertEqual(self.result()["cleanup"]["status"], "unknown")
+        self.assertEqual(next(case for case in self.result()["scenarios"] if case["id"] == "cleanup")["status"], "failed")
+
     def test_signals_during_cleanup_finishes_delete_and_replica_verification(self):
         self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
         expected = [("https://one.test", "DELETE", False)] + [
@@ -497,7 +555,8 @@ sys.exit(code)
                 case = next(case for case in self.result()["scenarios"] if case["id"] == "cleanup")
                 self.assertEqual((case["status"], case["reason"]), ("failed", "interrupted"))
                 self.assertEqual([call.args for call in timer.call_args_list], [
-                    (q.signal.ITIMER_REAL, 300), (q.signal.ITIMER_REAL, 45), (q.signal.ITIMER_REAL, 0),
+                    (q.signal.ITIMER_REAL, 300), (q.signal.ITIMER_REAL, 0),
+                    (q.signal.ITIMER_REAL, 45), (q.signal.ITIMER_REAL, 0),
                 ])
                 self.assertEqual([q.signal.getsignal(sig) for sig in (q.signal.SIGTERM, q.signal.SIGINT, q.signal.SIGALRM)], previous)
                 self.assertNotIn(SECRET, (self.output / "runner.log").read_text())
