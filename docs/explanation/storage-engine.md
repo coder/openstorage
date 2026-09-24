@@ -1,147 +1,159 @@
 # The storage engine: immutable packs, ref CAS, and garbage
 
-This page explains *why* the storage lifecycle works the way it does — the invariants the
-engine is built around, and the consequences an operator observes (orphan blobs, retained
-bytes, repacks that keep unreachable objects). The corresponding runbook is the
-[storage lifecycle how-to](../how-to/storage-lifecycle-and-sweeping.md); deployment
-topology is in the [production guide](../how-to/deploy-production.md).
+**TL;DR:** pack bytes are published before any ref can point at them. A crash can leave
+extra bytes, never a dangling ref. A careful sweeper later reclaims unregistered and
+superseded blobs; registered but unreachable objects stay until repository purge. That
+explains what operators see: orphan blobs, retained bytes, repacks that keep unreachable
+objects.
+Procedures: [storage lifecycle how-to](../how-to/storage-lifecycle-and-sweeping.md).
+Topology: [production guide](../how-to/deploy-production.md).
 
 ## Two stores, one invariant
 
-All durable state splits across two systems with very different guarantees:
+| Store | Local mode | Holds | Guarantee |
+|---|---|---|---|
+| **Database** (Postgres) | SQLite | The *authority*: refs, pack registry, metadata, quota accounting | Refs advance only through compare-and-swap: each writer states the value it expects, and exactly one concurrent writer wins. |
+| **Blob store** (S3-compatible) | Plain files | *Immutable, content-addressed packs* | Bytes under a key never change. Replicas racing the deliberately non-atomic exists-check may re-PUT *identical* content: harmless, but on a versioned bucket each re-PUT leaves a billed noncurrent version ([lifecycle rules](../how-to/deploy-production.md#backing-services)). |
 
-- **The database (Postgres; SQLite in local mode)** is the *authority*: refs, the pack
-  registry, metadata, quota accounting. Refs advance only through compare-and-swap — every
-  writer states the value it expects, and exactly one concurrent writer wins.
-- **The blob store (S3-compatible; plain files in local mode)** holds *immutable,
-  content-addressed packs*. The bytes under a key never change; concurrent replicas
-  racing the deliberate non-atomic exists-check may re-PUT the *identical* content to
-  the same key — semantically harmless, though on a versioned bucket each re-PUT leaves
-  a billed noncurrent version
-  ([lifecycle-rule guidance](../how-to/deploy-production.md#backing-services)).
+An experimental third backend collapses both into one bucket
+([below](#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal)).
 
-(An experimental third backend collapses both stores into one S3-compatible bucket —
-[below](#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal).)
-
-The single invariant tying them together — **publish before CAS**:
+The one invariant across both is **publish before CAS**:
 
 > Pack bytes are durably published to the blob store *before* any database row (pack
 > registration, ref CAS) references them.
 
-Every writer honors it: git pushes upload and register quarantined packs in the
-pre-receive hook, and git's update hook only CASes refs after pre-receive succeeded; REST
-writes (commit-pack, merge, notes, fork) run the same upload → register → CAS pipeline;
-repack publishes its consolidated pack before swapping registry rows. After registering,
-writers *verify* the blob is really readable (`blob.EnsurePublished`) — the belt to the
-sweeper's suspenders ([below](#why-deletion-is-so-careful)).
+Every writer honors it:
 
-The payoff is crash asymmetry. A crash between publish and commit strands a paid-for but
-unreferenced blob — an **orphan**, invisible to every reader, costing only storage. The
-write path can never produce the opposite — a committed ref pointing at bytes that were
-never published. (With destructive sweeping enabled, rare delete/registration races can
-make an already-registered pack *transiently* unavailable; the quarantine handshake and
-every sweep's opening heal pass restore it, so the exposure is a bounded retry window,
-never durable loss.) Orphans are cheap and reclaimable; durably dangling refs would be
-data loss. The engine chooses its failure mode.
+- **Git pushes** upload and register quarantined packs in the pre-receive hook; the
+  update hook CASes refs only after pre-receive succeeded.
+- **REST writes** (commit-pack, merge, notes, fork) run the same upload → register → CAS
+  pipeline.
+- **Repack** publishes its consolidated pack before swapping registry rows.
 
-The corollary: **garbage is normal**. Crashed pushes, lost races, superseded packs all
-leave blobs behind by design, and reclamation is deferred to an asynchronous, careful
-[sweeper](#why-deletion-is-so-careful) instead of any synchronous delete on the write
-path.
+After registering, writers verify the blob is readable (`blob.EnsurePublished`), backing
+up the [sweeper](#why-deletion-is-so-careful).
+
+```mermaid
+flowchart LR
+  A[Upload pack<br/>to blob store] --> B[Register pack row] --> C[Verify readable] --> D[CAS refs]
+  A -. crash .-> O[Orphan: blob with no registry row<br/>invisible, costs storage only]
+  B -. crash .-> U[Registered but unreachable:<br/>repack carries it forward]
+```
+
+**Crash asymmetry:** a crash between publish and commit leaves only extra bytes: an
+unregistered blob (an **orphan**, which the sweeper can reclaim) or, after
+registration, a registered but unreachable pack that repack carries forward. The write
+path never produces a committed ref to unpublished bytes.
+With destructive sweeping enabled, rare delete/registration races can make a registered pack *transiently*
+unavailable; the quarantine handshake and every sweep's opening heal pass restore it. The
+exposure is a bounded retry window, never durable loss. Orphans are cheap and
+reclaimable; durably dangling refs would be data loss.
+
+So **garbage is normal**. Crashed pushes, lost races, and superseded packs leave blobs by
+design. An asynchronous [sweeper](#why-deletion-is-so-careful) reclaims them; the write
+path never deletes synchronously.
 
 ## Storage compatibility and qualification
 
-`OPENSTORAGE_S3_URL` selects the **blob** store, not the ref authority. With a
-Postgres or SQLite ref store, S3 holds packs and LFS bytes. A `s3wal://` ref-store
-URL instead selects **experimental S3WAL authority** and requires an S3 blob URL
-alongside it ([configuration](../reference/configuration.md#openstorage_pg_url)).
-Blob compatibility never implies authority qualification.
+`OPENSTORAGE_S3_URL` selects the **blob** store, not the ref authority. With a Postgres
+or SQLite ref store, S3 holds packs and LFS bytes. A `s3wal://` ref-store URL selects
+**experimental S3WAL authority** and requires an S3 blob URL alongside it
+([configuration](../reference/configuration.md#openstorage_pg_url)). Blob compatibility
+never implies authority qualification.
 
-**Blob capabilities:** the current [S3 implementation](../../internal/blob/blob.go)
-and [shared transfer path](../../internal/blob/file.go) use path-style AWS SigV4,
-PUT/GET/HEAD/DELETE, paginated prefix LIST, multipart uploads, byte-range GET,
-ETag/size metadata, and server-side COPY (multipart copy for objects over 5 GiB).
-LFS downloads use presigned GET URLs; uploads go through the application proxy.
-Successful publication must be readable, and quota accounting relies on listings
-including published objects. Basic PUT/GET/DELETE/LIST success alone does not
-establish compatibility; validate the used capabilities and the
-[permissions and bucket configuration](../how-to/deploy-production.md#backing-services).
+**Blob capabilities** used by the [S3 implementation](../../internal/blob/blob.go) and
+[shared transfer path](../../internal/blob/file.go): path-style AWS SigV4;
+PUT/GET/HEAD/DELETE; paginated prefix LIST; multipart uploads; byte-range GET; ETag/size
+metadata; server-side COPY (multipart copy for objects over 5 GiB). LFS downloads use
+presigned GET URLs; uploads go through the application proxy. Successful publication must
+be readable, and quota accounting relies on listings including published objects. Basic
+PUT/GET/DELETE/LIST success does not establish compatibility: validate the capabilities
+used and the [permissions and bucket configuration](../how-to/deploy-production.md#backing-services).
 
-**Authority capabilities:** all blob requirements plus atomic conditional PUT
-(`If-None-Match: *` create; `If-Match` advance, exactly one concurrent winner),
-ETag-based conditional GET/304, strong read-after-write and list-after-write
-consistency, byte-ordered paginated LIST with prefix/`StartAfter`, and reliable
-store HTTP `Date` witnesses for expiry decisions. The
-[startup probe](../../internal/ref/s3wal/probe.go) checks conditional writes;
-[startup also refuses a missing usable Date witness](../../internal/ref/s3walstore.go).
+**Authority capabilities:** all blob requirements, plus
+
+- atomic conditional PUT (`If-None-Match: *` create; `If-Match` advance, exactly one
+  concurrent winner);
+- ETag-based conditional GET/304;
+- strong read-after-write and list-after-write consistency;
+- byte-ordered paginated LIST with prefix/`StartAfter`;
+- reliable store HTTP `Date` witnesses for expiry decisions.
+
+The [startup probe](../../internal/ref/s3wal/probe.go) checks conditional writes, and
+[startup refuses a missing usable Date witness](../../internal/ref/s3walstore.go).
 Neither proves deployment-wide consistency or reliable time under all failures.
-Never front the authority with a cache. Keep versioning and object lock disabled.
 Conditional DELETE is **not** a correctness requirement or guard.
 
-| Surface / store | Capability requirements | Observed evidence (version/configuration scoped) | Support / status |
-|---|---|---|---|
-| Ordinary S3 blobs with PG/SQLite authority | Blob capabilities above | SeaweedFS is the [CI reference](../reference/testing.md#test-lanes). Historical [4.42 / legacy MinIO results](../plans/s3wal-phase1a-results.md#5-r7-store-qualification-matrix) cover specific transfer surfaces, not every blob operation/configuration. | AWS S3 is the primary target; SeaweedFS the tested self-hosted reference. Other endpoints, including MinIO, are untested/best-effort for this use, not blanket product endorsements. |
-| AWS S3 as S3WAL authority | Blob + authority capabilities above | [22/22 require-mode verdicts](../plans/s3wal-bench-data/qualify-transcript-real-s3-2026-08-27.txt), eu-central-1, 2026-08-27; dedicated bucket, versioning/object lock off. [Campaign scope](../plans/s3wal-bench-results.md#environment): `52ea5c02` + PR #180's boot fix; one day, compute near but not in-region. | **Experimental.** Conditional future promotion target only. Historical evidence, not current-release AWS qualification. |
-| SeaweedFS as S3WAL authority | Blob + authority capabilities above | [Phase 1a](../plans/s3wal-phase1a-results.md#environment): 4.42, 2026-08-25. Current [fixture pin/config](../../internal/ref/s3wal/s3waltest/s3waltest.go): 4.47, `weed server -s3`, anonymous gateway with signed fixture requests, versioning/object lock off; [require-mode lane](../../internal/ref/s3wal/qualify_test.go). | **Experimental.** CI reference and conditional future promotion target; no claim for arbitrary releases or deployment topologies. |
-| MinIO as S3WAL authority | Blob + authority capabilities above | [Legacy `RELEASE.2024-01-16T16-07-38Z`](../plans/s3wal-phase1a-results.md#5-r7-store-qualification-matrix) ignored duplicate `If-None-Match: *` creation; stale `If-Match` advance did pass. The boot probe refused it. | **Not qualified for S3WAL authority.** That observation is not a verdict on every past/future MinIO release; blob acceptance is separate. |
-| Other S3 endpoints / emulators as S3WAL authority | Blob + authority capabilities above | No deployment qualification established here. Even [Floci `nightly-09012026`](../reference/testing.md#the-floci-s3-lane)'s require-mode/overwrite tests are regression coverage, not promotion evidence. | **Not qualified for S3WAL authority.** Passing a probe or selected tests does not confer support. |
+> [!WARNING]
+> Never front the authority with a cache. Keep versioning and object lock disabled.
 
-The [qualification harness](../../internal/ref/s3wal/qualify_test.go) fails
-non-pass verdicts in require mode; the legacy MinIO record-mode lane records
-incompatibilities rather than certifying the endpoint. A green test job is not a
-claim that every recorded store passed.
+The first row needs the blob capabilities; every S3WAL authority row needs blob plus
+authority capabilities.
 
-**Conditional policy, not promotion:** AWS S3 and SeaweedFS are the intended
-future promotion targets for [#192 G1](https://github.com/coder/openstorage/issues/192),
-subject to the remaining qualification, correctness, operations and release-specific
-coverage gates. This does not establish that A1–A3's conformant real-S3 starvation
-rerun, separate-day repeats or in-region campaign passed. **All S3WAL targets
-remain experimental**, with the [single-node boundaries](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)
-unchanged; #192 remains open. No beta, GA or production-support announcement is
-made by this matrix.
+| Surface / store | Observed evidence (version/configuration scoped) | Support / status |
+|---|---|---|
+| Ordinary S3 blobs with PG/SQLite authority | SeaweedFS is the [CI reference](../reference/testing.md#test-lanes). Historical [4.42 / legacy MinIO results](../plans/s3wal-phase1a-results.md#5-r7-store-qualification-matrix) cover specific transfer surfaces, not every blob operation/configuration. | AWS S3 is the primary target; SeaweedFS the tested self-hosted reference. Other endpoints, including MinIO, are untested/best-effort for this use, not blanket product endorsements. |
+| AWS S3 as S3WAL authority | [22/22 require-mode verdicts](../plans/s3wal-bench-data/qualify-transcript-real-s3-2026-08-27.txt), eu-central-1, 2026-08-27; dedicated bucket, versioning/object lock off. [Campaign scope](../plans/s3wal-bench-results.md#environment): `52ea5c02` + PR #180's boot fix; one day, compute near but not in-region. | **Experimental.** Conditional future promotion target only. Historical evidence, not current-release AWS qualification. |
+| SeaweedFS as S3WAL authority | [Phase 1a](../plans/s3wal-phase1a-results.md#environment): 4.42, 2026-08-25. Current [fixture pin/config](../../internal/ref/s3wal/s3waltest/s3waltest.go): 4.47, `weed server -s3`, anonymous gateway with signed fixture requests, versioning/object lock off; [require-mode lane](../../internal/ref/s3wal/qualify_test.go). | **Experimental.** CI reference and conditional future promotion target; no claim for arbitrary releases or deployment topologies. |
+| MinIO as S3WAL authority | [Legacy `RELEASE.2024-01-16T16-07-38Z`](../plans/s3wal-phase1a-results.md#5-r7-store-qualification-matrix) ignored duplicate `If-None-Match: *` creation; stale `If-Match` advance did pass. The boot probe refused it. | **Not qualified for S3WAL authority.** Not a verdict on every past/future MinIO release; blob acceptance is separate. |
+| Other S3 endpoints / emulators as S3WAL authority | No deployment qualification established here. Even [Floci `nightly-09012026`](../reference/testing.md#the-floci-s3-lane)'s require-mode/overwrite tests are regression coverage, not promotion evidence. | **Not qualified for S3WAL authority.** Passing a probe or selected tests does not confer support. |
+
+The [qualification harness](../../internal/ref/s3wal/qualify_test.go) fails non-pass
+verdicts in require mode; the legacy MinIO record-mode lane records incompatibilities
+without certifying the endpoint. A green test job does not mean every recorded store
+passed.
+
+**Conditional policy, not promotion.** AWS S3 and SeaweedFS are the intended future
+promotion targets for [#192 G1](https://github.com/coder/openstorage/issues/192), subject
+to the remaining qualification, correctness, operations, and release-specific coverage
+gates. A1–A3's conformant real-S3 starvation rerun, separate-day repeats, and in-region
+campaign are not established as passed. **All S3WAL targets remain experimental** within
+the unchanged
+[single-node boundaries](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node),
+and #192 remains open. This matrix announces no beta, GA, or production support.
 
 ## Why repack packs the union, not reachable objects
 
+Repack keeps every object of the packs it folds, so *the registered object set never
+shrinks*.
+
 Push-heavy repositories accumulate one small pack per push, and read-side hydration cost
-grows with pack count. Background repack folds many registered packs into one
-consolidated pack.
+grows with pack count. Background repack folds many registered packs into one.
 
-The natural design — run `git pack-objects --all` and keep reachable objects — is wrong
-here, because reachability at fold time is not a safe upper bound for what registered
-packs must keep serving. A push registers its pack in pre-receive and CASes its refs in
-the update hook *moments later*. A fold that snapshots between the two would drop the
-momentarily-unreachable pushed objects; then the ref CAS lands and points refs at objects
-no registered pack contains — cold-cache corruption that no swap-time check can prevent.
+Keeping only reachable objects (`git pack-objects --all`) would be wrong: reachability at
+fold time does not bound what registered packs must keep serving. A push registers its
+pack in pre-receive and CASes its refs in the update hook *moments later*. A fold that
+snapshots between the two drops the momentarily unreachable pushed objects. The ref CAS
+then points refs at objects no registered pack contains: cold-cache corruption that no
+swap-time check can prevent.
 
-So repack packs the **union of the snapshotted packs' objects**, preserving a simple
-invariant: *the registered object set never shrinks*. Any interleaving of registrations
-and ref CASes stays consistent. The costs are accepted deliberately:
+Packing the **union of the snapshotted packs' objects** keeps any interleaving of
+registrations and ref CASes consistent. The accepted costs:
 
 - **Unreachable objects are carried forward** (crashed pushes, deleted branches).
-  Reclaiming them safely would need a reachability grace protocol — out of scope, and why
-  [deleting branches doesn't reclaim space](../how-to/storage-lifecycle-and-sweeping.md#why-is-the-bucket-growing).
-- **Superseded originals linger.** The fold's swap (`ReplacePacks`) is a row-set CAS in
-  one transaction: it deletes exactly the input rows (losing cleanly if a concurrent fold
-  got there first), records them as *retained*, and inserts the consolidated pack. The
-  old blobs are not deleted synchronously — a concurrent loser may still be mid-read on
-  them, and blob-store deletes aren't transactional with the database. They stay
-  quota-counted as retained bytes until the sweeper reaps them.
+  Reclaiming them safely needs a reachability grace protocol, which is out of scope. This
+  is why [deleting branches doesn't reclaim space](../how-to/storage-lifecycle-and-sweeping.md#why-is-the-bucket-growing).
+- **Superseded originals linger.** The swap (`ReplacePacks`) is a one-transaction row-set
+  CAS: it deletes exactly the input rows (losing cleanly if a concurrent fold got there
+  first), records them as *retained*, and inserts the consolidated pack. Old blobs are
+  not deleted synchronously: a concurrent loser may still be reading them, and blob
+  deletes aren't transactional with the database. They stay quota-counted as retained
+  bytes until the sweeper reaps them.
 
-Folds are budgeted (bytes, objects, wall time — compiled constants) and selected from
-cheap point reads (blob size + the pack header's object count) before anything is
-downloaded, so a fold either provably fits its budgets or provably cannot happen. Big
-repositories converge over successive folds; pack counts converge *below* the trigger
-threshold, not to one — except when no pack pair fits the budgets at all, where the
-no-op is proven and the count legitimately stays put.
+**Folds are budgeted** by bytes, objects, and wall time (compiled constants). Selection
+uses cheap point reads (blob size plus the pack header's object count) before any
+download, so a fold provably fits its budgets or provably cannot happen. Big repositories
+converge over successive folds, to *below* the trigger threshold, not to one pack. When no
+pack pair fits the budgets, the no-op is proven and the count legitimately stays put.
 
 ## Why quota admission is a ledger, not a counter
 
 A per-repository pack-bytes quota must hold across replicas and concurrent pushes: two
-pushes that individually fit but together overshoot must not both pass. A plain usage
-counter can't see in-flight uploads; listing the bucket on every push is slow and racy.
-
-Admission is a durable reservation ledger in the database, serialized per base repository
-(one advisory lock in Postgres, an immediate transaction in SQLite):
+pushes that fit alone but overshoot together must not both pass. A plain counter can't
+see in-flight uploads; listing the bucket per push is slow and racy. So admission is a
+durable reservation ledger in the database, serialized per base repository (an advisory
+lock in Postgres, an immediate transaction in SQLite):
 
 ```
 usage counter + uncounted floor + active reservations + incoming ≤ quota
@@ -151,225 +163,233 @@ The *uncounted floor* is the physical blob listing minus the usage counter read 
 listing's scan start, clamped at zero: the bytes the counter has never seen.
 
 - **Reservations** claim headroom *before* upload and are consumed atomically when the
-  pack registers. A crashed writer's reservation keeps gating until its TTL elapses —
-  admission filters expired rows out immediately; the sweeper's later pruning is pure
-  garbage collection. A *retry* of the same push refreshes the same reservation instead
-  of double-charging, because packs are content-addressed.
-- **The counter and the floor split the bytes between them.** The live counter covers
-  everything registered — including settlements newer than the floor's scan — while the
-  uncounted floor covers what the counter never saw (pre-ledger packs, pre-registry LFS
-  objects, orphaned uploads). Summing the two counts every byte at least once and
-  double-counts only a blob whose listing and registration straddle one scan window —
-  transient, and toward *denying* at the margin, never silent overshoot. The floor is
-  served from a short-lived per-repository cache shared by every admission surface
-  (git pushes, REST pack writes, LFS transfers) rather than re-scanned per write — safe
-  precisely because everything registered or in flight is covered by the counter and
-  reservations regardless of the floor's staleness.
-- **Retained bytes stay counted.** A repack fold doesn't remove the superseded blobs, so
-  it doesn't free quota either — the ledger is debited only when the sweeper reaps them.
-  Quota tracks the bytes under the repository's *pack prefixes*, not logical
-  reachability. (Bucket-wide consumption falls a step later still: a reaped blob leaves
-  an equal-sized quarantine backup outside the pack prefixes until the purge window
-  passes.)
+  pack registers. A crashed writer's reservation gates until its TTL elapses; admission
+  ignores expired rows immediately, and the sweeper's later pruning is pure garbage
+  collection. A *retry* of the same push refreshes its reservation instead of
+  double-charging, because packs are content-addressed.
+- **The counter and floor split the bytes.** The live counter covers everything
+  registered, including settlements newer than the floor's scan. The floor covers what
+  the counter never saw: pre-ledger packs, pre-registry LFS objects, orphaned uploads.
+  The sum counts every byte at least once. It double-counts only a blob whose listing and
+  registration straddle one scan window: transient, and toward *denying* at the margin,
+  never silent overshoot. The floor comes from a short-lived per-repository cache shared
+  by every admission surface (git pushes, REST pack writes, LFS transfers), not a
+  per-write scan. That is safe because the counter and reservations cover everything
+  registered or in flight, however stale the floor.
+- **Retained bytes stay counted.** A fold doesn't remove superseded blobs, so it frees no
+  quota; the ledger is debited only when the sweeper reaps them. Quota tracks bytes under
+  the repository's *pack prefixes*, not logical reachability. Bucket-wide usage falls a
+  step later still: a reaped blob leaves an equal-sized quarantine backup outside the
+  pack prefixes until the purge window passes.
 - **Namespaces roll up.** `+ephemeral` / `+import` pushes store packs under sibling
-  prefixes (`packs/<repo>+ephemeral/…`), not the base prefix — but quota admission lists
-  base and namespace prefixes together and charges them all against the base repository.
+  prefixes (`packs/<repo>+ephemeral/…`), but admission lists base and namespace prefixes
+  together and charges them all to the base repository.
 
 Repack is deliberately not admission-gated: it replaces rows rather than growing the
-registered set, and gating it would deadlock exactly the at-quota repositories that need
-compaction most.
+registered set, and gating it would deadlock the at-quota repositories that most need
+compaction.
 
-Since [#51](https://github.com/coder/openstorage/issues/51) the same ledger admits Git
-LFS uploads in two stages: the batch endpoint runs an **advisory** admission check
-against each missing object's declared size — failing hopeless requests early with 507
-before issuing any transfer URL, but holding nothing durable — and the verified proxy
-upload performs the **durable** admission after the body has been staged and its sha256
-verified, reserving the actual byte count immediately before publication. Settlement —
-consuming the reservation and crediting the counter — happens in one transaction with
-the object's registration. An upload URL therefore does not hold capacity during
-transfer: two near-quota clients can both receive URLs and one may still be denied at
-upload time; quota is never overshot. The listing floor covers the `lfs/` prefix
-alongside the pack prefixes, so pre-ledger LFS bytes gate admission too.
+**Git LFS uploads** use the same ledger in two stages:
+
+1. **Advisory** (batch endpoint): checks each missing object's declared size and fails
+   hopeless requests early with 507, before issuing any transfer URL. It holds nothing
+   durable.
+2. **Durable** (verified proxy upload): after the body is staged and its sha256
+   verified, reserves the actual byte count immediately before publication.
+
+Settlement (consuming the reservation, crediting the counter) shares one transaction with
+the object's registration. An upload URL therefore holds no capacity during transfer: two
+near-quota clients can both get URLs and one may still be denied at upload. Quota is
+never overshot. The listing floor covers the `lfs/` prefix too, so pre-ledger LFS bytes
+gate admission.
 
 ## Why deletion is so careful
 
-The sweeper is the only component that ever destroys data, so it assumes everything else
-might be racing it. Its ground truth is a diff: blobs under `packs/` without a registry
-row, older than an age threshold (in-flight writers register well within it). Then four
-layers make acting on that diff safe — candidates are re-validated just before acting;
-deletes are quarantine-copies first; the registry is re-checked *after* each delete, with
-instant restore if a registration landed mid-delete; and every sweep begins by healing any
-registered-but-missing pack from quarantine. The writer-side `EnsurePublished` verify
-closes the remaining interleaving: a registration that lands after the sweep's recheck
-sees the missing blob and re-uploads it. This joint argument is also why destructive
-sweeping has a
-[fleet-wide build prerequisite](../how-to/storage-lifecycle-and-sweeping.md#before-enabling-delete-mode-fleet-prerequisite):
-a writer *without* the verify reopens the one window the layers close, which is exactly
-the mixed-fleet caveat.
+The sweeper is the only component that destroys data, so it assumes everything else might
+be racing it.
 
-Deletion is also two classes with different risk profiles, which is why there are
+Its ground truth is a diff: blobs under `packs/` with no registry row, older than an age
+threshold (in-flight writers register well within it). Four layers make acting on it
+safe:
+
+1. Candidates are re-validated just before acting.
+2. Deletes are quarantine-copies first.
+3. The registry is re-checked *after* each delete, with instant restore if a
+   registration landed mid-delete.
+4. Every sweep begins by healing any registered-but-missing pack from quarantine.
+
+The writer-side `EnsurePublished` verify closes the last interleaving: a registration
+landing after the sweep's recheck sees the missing blob and re-uploads it. Hence the
+[fleet-wide build prerequisite](../how-to/storage-lifecycle-and-sweeping.md#before-enabling-delete-mode-fleet-prerequisite)
+for destructive sweeping: a writer *without* the verify reopens the one window the layers
+close. That is the mixed-fleet caveat.
+
+Two deletion classes carry different risk, hence
 [two knobs](../how-to/storage-lifecycle-and-sweeping.md#the-orphan-sweeper):
-repack-superseded blobs are *provably* garbage (durable retained records say so) and are
-reaped by default, while general orphans are inferred garbage — the inference is sound,
-but the class exists because something already went wrong once — so they stay list-only
-until an operator opts in.
+
+| Class | Why it is garbage | Default |
+|---|---|---|
+| Repack-superseded blobs | *Provably*: durable retained records say so | Reaped |
+| General orphans | *Inferred*: the inference is sound, but the class exists because something already went wrong once | List-only until an operator opts in |
 
 ## The cache layer: hydration and generations
 
-Replicas serve git reads from local bare-repository caches that are pure derivations of
-database + blob store. Correctness across replicas comes from a per-repository
-**generation counter**, bumped by database triggers on every committed ref or pack
-change — not by application code, so a rolling upgrade can't miss a bump. A cache marked
-with the current generation (and current default branch) is provably fresh and can answer
-after one database point read; anything else triggers hydration — download missing packs,
-rebuild refs — under a local file lock, with the marker written only after complete
-success. Losing a cache directory is an efficiency event, never a correctness event.
+Replica caches are disposable: losing one is an efficiency event, never a correctness
+event.
 
-Ref rebuilds are **bounded**: a full sync never materializes a repository's whole ref set
-in memory, because ref fanout is attacker-scaled (millions of same-tip refs cost one row
-each). The database side streams byte-ordered keyset pages, the cache side streams git's
-own sorted ref listing, and a merge-join between them applies deletions and updates in
-bounded batches — all deletions strictly before any update, so directory/file renames
-among ref names can't wedge the sync. Every page is an individually consistent snapshot;
-if refs change while pages stream, the mutation's generation bump outruns the marker this
-sync writes, so the next read repeats the full sync and converges. That is the same
-staleness window a single-snapshot rebuild always had — bounded memory costs no
-additional semantics.
+- Replicas serve git reads from local bare-repository caches, pure derivations of
+  database + blob store.
+- A per-repository **generation counter** keeps replicas correct. Database triggers bump
+  it on every committed ref or pack change; since application code doesn't, a rolling
+  upgrade can't miss a bump.
+- A cache marked with the current generation (and default branch) is provably fresh and
+  answers after one database point read.
+- Anything else hydrates (download missing packs, rebuild refs) under a local file lock,
+  writing the marker only after complete success.
+
+**Ref rebuilds are bounded.** A full sync never holds a repository's whole ref set in
+memory, because ref fanout is attacker-scaled (millions of same-tip refs cost one row
+each). The database streams byte-ordered keyset pages, the cache streams git's own sorted
+ref listing, and a merge-join applies deletions and updates in bounded batches. All
+deletions go strictly before any update, so directory/file renames among ref names can't
+wedge the sync. Each page is a consistent snapshot. If refs change mid-stream, the
+mutation's generation bump outruns the marker this sync writes, so the next read repeats
+the full sync and converges. A single-snapshot rebuild had the same staleness window, so
+bounded memory adds no new semantics.
 
 ## The zero-infrastructure backend: S3 as sole authority (s3wal)
 
 The **experimental** `s3wal://` backend
 ([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md))
-removes the database entirely: one S3-compatible bucket is the *only* durable system.
-The two-store split above collapses — the bucket holds the immutable packs (`packs/`,
-`lfs/`, unchanged) *and* the authority, as conditional-CAS JSON objects under the
-reserved `_wal/` prefix. Deployment mechanics are in the
-[production guide](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node);
-this section explains what changes in the engine and what deliberately does not.
+removes the database: one S3-compatible bucket is the *only* durable system. It holds the
+immutable packs (`packs/`, `lfs/`, unchanged) *and* the authority, as conditional-CAS
+JSON objects under the reserved `_wal/` prefix. Deployment is covered in the
+[production guide](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
 
-**One manifest object per repository group is the ref authority.** The entire state of
-a base repository group `{base, +ephemeral, +import}` — refs, pack registry, quota
-ledger and reservations, delete locks, LFS registry, sync-claim fence — lives in one
-JSON object, `_wal/repo/<baseRepoID>`, advanced atomically with `PutObject + If-Match`
-(create: `If-None-Match: *`). Every multi-row transaction the SQL backends run becomes
-a single-object compare-and-swap: exactly one concurrent writer wins, losers re-read
-and retry with jittered backoff. All metadata tables (repos, webhooks, credentials,
-signing keys, org keys) share one further object, `_wal/meta.json`, with the same CAS
-discipline and a process-local cache revalidated through `If-None-Match` 304s.
+**One manifest object per repository group is the ref authority.** A base repository
+group `{base, +ephemeral, +import}` keeps its entire state in one JSON object,
+`_wal/repo/<baseRepoID>`: refs, pack registry, quota ledger and reservations, delete
+locks, LFS registry, sync-claim fence. It advances atomically with
+`PutObject + If-Match` (create: `If-None-Match: *`), so each multi-row SQL transaction
+becomes a single-object CAS: exactly one concurrent writer wins; losers re-read and retry
+with jittered backoff. All metadata tables (repos, webhooks, credentials, signing keys,
+org keys) share one more object, `_wal/meta.json`, with the same CAS discipline and a
+process-local cache revalidated through `If-None-Match` 304s.
 
-**Writes are validated by the CAS; reads are trusted.** Only the conditional PUT
-proves a snapshot current: a manifest read that turned out stale surfaces as a 412
-and is re-read, but a read that ends in a *negative* verdict — a sweep finding
-nothing expired, a CAS whose precondition no longer holds, a generation check that
-sees no change — is never followed by a write and is taken at face value. A
-per-process sequence watermark crashes the node if the store ever serves a version
-older than one this process already observed, but a fresh process, or a version
-merely one behind, is undetectable. The design therefore makes **strong
-read-after-write and list-after-write consistency a hard requirement of the
-store** (see the [deployment prerequisites](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node))
-rather than paying a validating write on every read-only verdict.
+**Writes are validated by the CAS; reads are trusted.** Only the conditional PUT proves a
+snapshot current; a stale manifest read surfaces as a 412 and is re-read. A read ending in
+a *negative* verdict is never followed by a write and is taken at face value: a sweep
+finding nothing expired, a CAS whose precondition no longer holds, a generation check
+seeing no change. A per-process sequence watermark crashes the node if the store serves a
+version older than one this process already saw, but a fresh process, or a version merely
+one behind, is undetectable. Rather than pay a validating write on every read-only
+verdict, the design makes **strong read-after-write and list-after-write consistency a
+hard requirement of the store** (see the
+[deployment prerequisites](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)).
 
-**Publish before CAS is preserved unchanged.** Pack and LFS bytes still upload through
-the ordinary blob path *before* the manifest CAS registers or references them — the
-crash asymmetry (orphans, never dangling refs) carries over verbatim. What changes is
-only who arbitrates the ref flip: an ETag condition on one object instead of a database
-row lock.
+**Publish before CAS is unchanged.** Pack and LFS bytes still upload through the ordinary
+blob path *before* the manifest CAS registers or references them, so the crash asymmetry
+carries over verbatim. Only the ref-flip arbiter changes: an ETag condition on one object
+instead of a database row lock.
 
-**A manifest logical clock replaces the database clock.** PG/SQLite stamp every lease
-and grace window with the DB clock so node skew cannot corrupt expiry. s3wal has no
-server clock, so every CAS writes `clk = max(localNow, clk_prev + 1ms)` — monotone
-across restarts and backward local jumps — and all stamps use it. Verdicts that permit
-destruction or steal **fail closed** (demote to report-only, log, never expire early)
-behind three skew guards: when the manifest clock runs ahead of local time, when the
-wall clock drifts from the process's monotonic clock, each by more than
-`min(15 min, ttl/4)` — and destructive verdicts additionally cross-check the S3 HTTP
-`Date` response header, the only arm that catches a clock that was wrong at boot (a
-store supplying no usable `Date` witness is refused at startup). Over-retention and
-false-deny are the only reachable failure directions. That guarantee covers the expiry
-paths judged against the manifest and store clocks — pack reservations, delete locks,
-grace windows, the instance lease. Metadata claim leases in `_wal/meta.json` (the
-sync/push claims) instead use plain wall-clock TTLs, mirroring the SQL backends' lease
-semantics.
+**A manifest logical clock replaces the database clock.** PG/SQLite stamp leases and
+grace windows with the DB clock so node skew cannot corrupt expiry. s3wal has no server
+clock, so every CAS writes `clk = max(localNow, clk_prev + 1ms)` (monotone across restarts
+and backward local jumps), and all stamps use it. Verdicts that permit destruction or
+steal **fail closed** (demote to report-only, log, never expire early) behind three skew
+guards:
+
+1. The manifest clock is ahead of local time by more than `min(15 min, ttl/4)`.
+2. The wall clock drifts from the process's monotonic clock by more than
+   `min(15 min, ttl/4)`.
+3. Destructive verdicts also cross-check the S3 HTTP `Date` response header, the only
+   guard that catches a clock that was wrong at boot. A store supplying no usable `Date`
+   witness is refused at startup.
+
+Over-retention and false-deny are the only reachable failure directions. This covers
+expiry judged against manifest and store clocks: pack reservations, delete locks, grace
+windows, the instance lease. Metadata claim leases in `_wal/meta.json` (the sync/push
+claims) use plain wall-clock TTLs instead, mirroring the SQL backends' lease semantics.
 
 **No conditional DELETE, anywhere.** S3-compatible stores do not honor `If-Match` on
-DELETE uniformly — a guard that sometimes does not guard is worse than none. Deletion
-safety comes from ordering instead: manifest purge tombstones are terminal and never
-deleted, and physical deletes are fenced by short-TTL delete locks recorded in the
-manifest via CAS plus the sweeper's quarantine-first handshake.
+DELETE uniformly, and a guard that sometimes does not guard is worse than none. Deletion
+safety comes from ordering: manifest purge tombstones are terminal and never deleted, and
+physical deletes are fenced by short-TTL delete locks recorded in the manifest via CAS
+plus the sweeper's quarantine-first handshake.
 
-**Single-writer serialization, detected — not enforced.** The mode is intentionally
-single-node. Correctness never depends on that (every state change is CAS-serialized
-regardless), but a second writer degrades the clock guards and cache behavior, so the
-`_wal/instance-lease` CAS-heartbeat turns accidental dual-serve into a *detected*
-condition: serve refuses to start over a fresh foreign lease, steals expired ones, and
-fail-stops on heartbeat loss. It is best-effort detection, never the correctness
-mechanism.
+**Single-writer serialization is detected, not enforced.** The mode is intentionally
+single-node, but correctness never depends on that: every state change is CAS-serialized
+regardless. A second writer does degrade the clock guards and cache behavior, so the
+`_wal/instance-lease` CAS heartbeat makes accidental dual-serve *detected*: serve refuses
+to start over a fresh foreign lease, steals expired ones, and fail-stops on heartbeat
+loss. This is best-effort detection, never the correctness mechanism.
 
-**Manifest size is a documented boundary.** A repository group's whole registry is one
-JSON object: growing writes warn past 4 MiB and are refused past 16 MiB — shrinking
-writes and the purge pipeline always pass, so an oversized manifest stays cleanable.
+**Manifest size is a documented boundary.** A group's whole registry is one JSON object.
+Growing writes warn past 4 MiB and are refused past 16 MiB; shrinking writes and the purge
+pipeline always pass, so an oversized manifest stays cleanable.
 
-**When to choose it — and the honest cost.** The target is small, single-tenant,
-single-node deployments that want durability without operating a database: the process
-dies, the disk burns, and a fresh node pointed at the bucket reconstructs full service.
-The price is one CAS point per repository group: concurrent pushes to the *same*
-repository serialize on one object (hot-repo contention surfaces as CAS retries and,
-exhausted, as a clean push rejection), and every ref or metadata operation pays an S3
-round trip. On the git data plane, distinct repositories do not contend — each group
-has its own manifest. Metadata is one further CAS point shared by *everything*: every
-repo, webhook, credential, org-key, and upstream-link mutation advances the single
-`_wal/meta.json` (metadata write rates are low, but they serialize globally). If
-hot-repo write throughput binds, local mode is the faster single-node alternative;
-multi-node serving means the Postgres topology.
+**When to choose it, and the cost.**
+
+- **Target:** small, single-tenant, single-node deployments wanting durability without
+  operating a database. The process dies, the disk burns, and a fresh node pointed at the
+  bucket reconstructs full service.
+- **Per-repository cost:** one CAS point per repository group. Concurrent pushes to the
+  *same* repository serialize on one object; contention surfaces as CAS retries and, when
+  exhausted, a clean push rejection. Every ref or metadata operation pays an S3 round
+  trip. Distinct repositories don't contend on the git data plane: each group has its own
+  manifest.
+- **Global metadata cost:** every repo, webhook, credential, org-key, and upstream-link
+  mutation advances the single `_wal/meta.json`. Metadata write rates are low, but they
+  serialize globally.
+- **Alternatives:** if hot-repo write throughput binds, local mode is the faster
+  single-node option; multi-node serving means the Postgres topology.
 
 ### S3WAL format stability policy
 
-**Prospective commitment.** The baseline is commit
-[`d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d`](https://github.com/coder/openstorage/commit/d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d).
-From this baseline forward, the persisted v1 schema, object-key layout, and
-interpretation of these two formats are frozen:
+**Prospective commitment.** From baseline commit
+[`d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d`](https://github.com/coder/openstorage/commit/d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d)
+forward, the persisted v1 schema, object-key layout, and interpretation of two formats
+are frozen:
 
 - Repository-group manifests at `_wal/repo/<baseRepoID>`, with no file extension,
   defined by [`manifest.go` at the baseline](https://github.com/coder/openstorage/blob/d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d/internal/ref/s3wal/manifest.go).
 - The metadata document at `_wal/meta.json`, defined by
   [`s3walmeta.go` at the baseline](https://github.com/coder/openstorage/blob/d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d/internal/meta/s3walmeta.go).
 
-This freezes the format, not mutable values such as refs, counters, or lease
-expiry times, and not JSON byte formatting or member ordering. It does not freeze
-all bucket objects: auxiliary lease, scan, and temporary objects outside these
-two formats are not covered. Current valid v1 data remains usable without a
-format migration. The historical v1 schema evolved before this commitment; a
-shared `v: 1` is not a retroactive guarantee that every past release pair can
-safely read and rewrite each other's data.
+Not frozen: mutable values (refs, counters, lease expiry times), JSON byte formatting or
+member ordering, and other bucket objects (auxiliary lease, scan, and temporary objects).
+Current valid v1 data stays usable without a format migration. The v1 schema evolved
+before this commitment, so a shared `v: 1` does not retroactively guarantee that every
+past release pair can safely read and rewrite each other's data.
 
-**Unknown-field tolerance is not read/write compatibility.** Both codecs decode
-into typed Go structures and encode those structures again. They accept unknown
-JSON fields but do not preserve them on rewrite. Adding, removing, or
-reinterpreting a durable field is not safe merely because it is optional,
-additive, or tagged `omitempty`: an older writer can drop information or apply a
-different meaning. Such schema changes must not silently extend this frozen v1
-format.
+**Unknown-field tolerance is not read/write compatibility.** Both codecs decode into typed
+Go structures and re-encode them: they accept unknown JSON fields but drop them on
+rewrite. So adding, removing, or reinterpreting a durable field is not safe just because
+it is optional, additive, or tagged `omitempty`: an older writer can drop information or
+apply a different meaning. Such changes must not silently extend the frozen v1 format.
 
-**Current enforcement.** Both decoders return errors for unsupported version
-values; both encoders assert that they write v1. These are codec-level guards,
-not a bucket-wide compatibility check. They do not guarantee that an old process
-always exits or cannot mutate other bucket objects, nor that an upgrade is atomic
-or a downgrade safe. There is no v2 migration capability or automatic read-time
-migration in the current implementation.
+**Current enforcement.** Both decoders reject unsupported version values; both encoders
+assert they write v1. These codec-level guards are not a bucket-wide compatibility check.
+They do not guarantee that an old process always exits or cannot mutate other bucket
+objects, that an upgrade is atomic, or that a downgrade is safe. There is no v2 migration
+capability or automatic read-time migration today.
 
-**Future release obligations.** Before enabling writes incompatible with the
-covered baseline, a release must:
+**Future release obligations.** Before enabling writes incompatible with the baseline, a
+release must:
 
 1. Bump the affected format version rather than write new semantics under v1.
-2. Include implemented and tested in-place migration capability in the new
-   reader/writer binary for its documented source formats.
-3. Document an operator upgrade procedure, including supported source versions,
-   writer shutdown/fencing, migration and verification steps, and when writes may
-   resume. These are release requirements, not an upgrade engine supplied today.
+2. Include implemented and tested in-place migration in the new reader/writer binary for
+   its documented source formats.
+3. Document an operator upgrade procedure: supported source versions, writer
+   shutdown/fencing, migration and verification steps, and when writes may resume.
 
-Downgrade after incompatible-format writes is unsupported. Take a verified
-[stopped-node backup](../how-to/backup-restore-s3wal.md) as a precaution before an
-upgrade; that same-binary recovery procedure does not qualify cross-version
-rollback. Release-pair upgrade testing remains separate work under
-[#192](https://github.com/coder/openstorage/issues/192), which remains open.
-This policy does not promote S3WAL: the backend remains **experimental**.
+These are release requirements, not an upgrade engine supplied today.
+
+> [!WARNING]
+> Downgrade after incompatible-format writes is unsupported.
+
+Take a verified [stopped-node backup](../how-to/backup-restore-s3wal.md) before an
+upgrade as a precaution; that same-binary recovery procedure does not qualify
+cross-version rollback. Release-pair upgrade testing is separate work under
+[#192](https://github.com/coder/openstorage/issues/192), which remains open. This policy
+does not promote S3WAL: the backend remains **experimental**.
