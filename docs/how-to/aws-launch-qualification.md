@@ -11,14 +11,24 @@ public API, Git, and Git LFS interfaces. It does not provision infrastructure,
 restart servers, change IAM, schedule jobs, publish releases, or approve launch.
 Its result always has `launch_qualified: false`.
 
+> [!IMPORTANT]
+> **Having this runner in the repository is not real-AWS qualification.** It has
+> run only against offline unit-test fixtures and a local loopback server. It has
+> not run against AWS. #222 stays open until an approved in-region campaign
+> produces the evidence in [section 5](#5-complete-the-separate-cloud-gate).
+
 ## 1. Establish the deployment and authorization boundary
 
-Use the Terraform reference owned by
+Use the [AWS EC2 Terraform reference](deploy-aws-terraform.md) owned by
 [issue #224](https://github.com/coder/openstorage/issues/224), including its
 normal bootstrap, authentication, and teardown path. Do not create a separate
-acceptance-only Terraform stack. Until that reference and its outputs are
-available, use the local rehearsal below; do not substitute local success for
-AWS qualification.
+acceptance-only Terraform stack. That reference deploys one PostgreSQL + S3
+node, and its smoke adapter emits a `pg-s3-single-node` configuration with a
+`ca_file`. **This runner rejects that configuration.** It accepts only `local`,
+two-replica `pg-s3`, and `s3wal`. Supporting the reference is separate #222 work;
+never label that node `local`, list one server twice, or disable TLS to get past
+the check. Until a compatible deployment and runner exist, use the local
+rehearsal below; do not substitute local success for AWS qualification.
 
 Before anyone provisions resources, record and approve these concrete inputs:
 
@@ -61,7 +71,7 @@ are unsuitable for the existing external test suites' deletion-based cleanup.
 
 ## 2. Supply the reference deployment contract
 
-The runner consumes a small JSON file, not raw Terraform state. The #224
+The runner consumes a small JSON file, not raw Terraform state. A #224
 adapter should select only the following non-secret outputs and locally held
 client inputs. Output names in Terraform need not match these JSON keys.
 
