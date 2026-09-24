@@ -10,9 +10,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +51,29 @@ func seedHistory(tb testing.TB, repoPath string, n int) string {
 		tb.Fatalf("rev-parse: %v\n%s", err, out)
 	}
 	return strings.TrimSpace(out)
+}
+
+// repoTips returns the distinct SHAs the repo's refs point at, sorted.
+func repoTips(tb testing.TB, repoPath string) []string {
+	tb.Helper()
+	out, err := tryGit(repoPath, "for-each-ref", "--format=%(objectname)")
+	if err != nil {
+		tb.Fatalf("for-each-ref: %v\n%s", err, out)
+	}
+	set := map[string]struct{}{}
+	for f := range strings.FieldsSeq(out) {
+		set[f] = struct{}{}
+	}
+	return slices.Sorted(maps.Keys(set))
+}
+
+// tipsOf builds the refTips a sync of these SHAs would collect.
+func tipsOf(shas ...string) *refTips {
+	t := newRefTips()
+	for _, s := range shas {
+		t.add(s)
+	}
+	return t
 }
 
 // commitGraphChain returns the split chain's layer hashes (nil when absent).
@@ -199,6 +224,7 @@ func TestWriteCommitGraph_IsolatesInheritedGitEnv(t *testing.T) {
 	repoPath := t.TempDir()
 	mustGit(t, repoPath, "init", "-q", "--bare")
 	seedHistory(t, repoPath, 10)
+	tips := repoTips(t, repoPath)
 	decoy := t.TempDir()
 	mustGit(t, decoy, "init", "-q", "--bare")
 	globalCfg := filepath.Join(t.TempDir(), "gitconfig")
@@ -212,7 +238,7 @@ func TestWriteCommitGraph_IsolatesInheritedGitEnv(t *testing.T) {
 	t.Setenv("GIT_CONFIG_VALUE_0", "false")
 	t.Setenv("GIT_CONFIG_GLOBAL", globalCfg)
 
-	if err := writeCommitGraph(t.Context(), repoPath); err != nil {
+	if err := writeCommitGraph(t.Context(), repoPath, tips); err != nil {
 		t.Fatalf("writeCommitGraph: %v", err)
 	}
 	if chain := commitGraphChain(t, repoPath); len(chain) == 0 {
@@ -304,7 +330,7 @@ func TestWriteCommitGraph_TimeoutFallsBackToPlainGraph(t *testing.T) {
 	logPath := fakeCommitGraphGit(t, "hang")
 	setCommitGraphBudgets(t, 10*time.Second, 500*time.Millisecond, time.Second)
 
-	if err := writeCommitGraph(t.Context(), repoPath); err != nil {
+	if err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath)); err != nil {
 		t.Fatalf("writeCommitGraph = %v, want the plain retry to succeed", err)
 	}
 	lines := readFakeLog(t, logPath)
@@ -329,6 +355,7 @@ func TestWriteCommitGraph_CancellationSuppressesFallback(t *testing.T) {
 	repoPath := t.TempDir()
 	mustGit(t, repoPath, "init", "-q", "--bare")
 	seedHistory(t, repoPath, 5)
+	tips := repoTips(t, repoPath)
 	logPath := fakeCommitGraphGit(t, "hang")
 	setCommitGraphBudgets(t, 10*time.Second, 5*time.Second, time.Second)
 
@@ -344,7 +371,7 @@ func TestWriteCommitGraph_CancellationSuppressesFallback(t *testing.T) {
 		}
 		cancel()
 	})
-	err := writeCommitGraph(ctx, repoPath)
+	err := writeCommitGraph(ctx, repoPath, tips)
 	wg.Wait()
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("writeCommitGraph = %v, want context.Canceled", err)
@@ -363,7 +390,7 @@ func TestWriteCommitGraph_NoRetryAfterDeadlineOrFailure(t *testing.T) {
 
 	logPath := fakeCommitGraphGit(t, "hang")
 	setCommitGraphBudgets(t, 300*time.Millisecond, 5*time.Second, time.Second)
-	if err := writeCommitGraph(t.Context(), repoPath); !errors.Is(err, context.DeadlineExceeded) {
+	if err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("deadline case = %v, want context.DeadlineExceeded", err)
 	}
 	if lines := readFakeLog(t, logPath); countPrefix(lines, "start ") != 1 {
@@ -372,7 +399,7 @@ func TestWriteCommitGraph_NoRetryAfterDeadlineOrFailure(t *testing.T) {
 
 	logPath = fakeCommitGraphGit(t, "fail")
 	setCommitGraphBudgets(t, 10*time.Second, 2*time.Second, time.Second)
-	err := writeCommitGraph(t.Context(), repoPath)
+	err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath))
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("failure case = %v, want the git stderr", err)
 	}
@@ -509,16 +536,18 @@ func BenchmarkCommitGraphRefresh(b *testing.B) {
 				b.StopTimer()
 				seedWideHistory(b, repoPath, next, push)
 				next += push
+				tips := repoTips(b, repoPath)
 				b.StartTimer()
-				if err := writeCommitGraph(ctx, repoPath); err != nil {
+				if err := writeCommitGraph(ctx, repoPath, tips); err != nil {
 					b.Fatal(err)
 				}
 			}
 		})
 	}
 	b.Run("noop", func(b *testing.B) {
+		tips := repoTips(b, repoPath)
 		for b.Loop() {
-			if err := writeCommitGraph(ctx, repoPath); err != nil {
+			if err := writeCommitGraph(ctx, repoPath, tips); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -530,43 +559,82 @@ func BenchmarkCommitGraphRefresh(b *testing.B) {
 	}
 }
 
-// Ref fanout is attacker-scaled: above commitGraphMaxRefs the refresh is
-// skipped (no `--reachable` walk over every ref), while the hydrate and
-// its marker still succeed. The count is exact: at the cap it writes.
-func TestHydrate_CommitGraphSkippedAboveRefCap(t *testing.T) {
+// The refresh walks only the distinct tips the sync applied: same-tip ref
+// fanout collapses to one tip and still writes, more distinct tips than
+// commitGraphMaxTips skip the write (the hydrate and its marker still
+// succeed), and refs a concurrent writer adds after the sync are not
+// walked.
+func TestHydrate_CommitGraphWalksOnlySyncedTips(t *testing.T) {
 	st, bl, cacheDir, repo, repoPath := hydrateWithHistory(t, 5)
 	st.mu.Lock()
 	tip := st.refs["refs/heads/main"]
-	for i := range 3 {
-		st.refs[fmt.Sprintf("refs/heads/b%d", i)] = tip
+	for i := range 50 {
+		st.refs[fmt.Sprintf("refs/heads/fan%d", i)] = tip
 	}
 	st.mu.Unlock()
-	old := commitGraphMaxRefs
-	t.Cleanup(func() { commitGraphMaxRefs = old })
+	old := commitGraphMaxTips
+	t.Cleanup(func() { commitGraphMaxTips = old })
 
-	commitGraphMaxRefs = 3 // 4 refs
-	var spawned []string
-	obs := func(_ string, args []string) {
-		if len(args) > 0 && args[0] == "commit-graph" {
-			spawned = append(spawned, strings.Join(args, " "))
+	var args [][]string
+	obs := func(_ string, a []string) {
+		if len(a) > 0 && a[0] == "commit-graph" {
+			args = append(args, a)
 		}
 	}
 	gitSpawnObserver.Store(&obs)
 	defer gitSpawnObserver.Store(nil)
+
+	commitGraphMaxTips = 1 // 51 refs, one distinct tip
 	mustHydrate(t, st, bl, cacheDir, repo)
-	if len(spawned) != 0 || commitGraphChain(t, repoPath) != nil {
-		t.Fatalf("refresh ran above the ref cap: spawned %q", spawned)
-	}
-	if got := markerContent(t, repoPath); got != "8 refs/heads/main" {
-		t.Fatalf("marker = %q, want \"8 refs/heads/main\"", got)
+	if len(args) != 1 || !slices.Contains(args[0], "--stdin-commits") || slices.Contains(args[0], "--reachable") {
+		t.Fatalf("same-tip fanout: commit-graph runs %q, want one --stdin-commits write", args)
 	}
 
-	commitGraphMaxRefs = 4
+	// Two distinct tips over a cap of 1: skipped, hydrate still clean.
+	parent := strings.TrimSpace(mustGit(t, repoPath, "rev-parse", tip+"~1"))
+	st.mu.Lock()
+	st.refs["refs/heads/old"] = parent
+	st.mu.Unlock()
 	st.setGen(9)
 	mustHydrate(t, st, bl, cacheDir, repo)
-	if len(spawned) != 1 || len(commitGraphChain(t, repoPath)) == 0 {
-		t.Fatalf("refresh at the ref cap: spawned %q, want one write", spawned)
+	if len(args) != 1 {
+		t.Fatalf("over the tip cap: commit-graph runs %q, want no new write", args)
 	}
+	if got := markerContent(t, repoPath); got != "9 refs/heads/main" {
+		t.Fatalf("marker = %q, want \"9 refs/heads/main\"", got)
+	}
+}
+
+// A ref a concurrent writer (receive-pack) adds after the sync is not
+// walked: the command gets exactly the synced tips on stdin.
+func TestWriteCommitGraph_FeedsOnlyGivenTips(t *testing.T) {
+	repoPath := t.TempDir()
+	mustGit(t, repoPath, "init", "-q", "--bare")
+	tip := seedHistory(t, repoPath, 5)
+	synced := []string{tip}
+	late := seedHistory(t, repoPath, 3) // moves main past the synced tip
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	stdinLog := filepath.Join(dir, "stdin")
+	script := filepath.Join(dir, "record-git")
+	body := "#!/bin/sh\ncat > \"" + stdinLog + "\"\nexec \"" + realGit + "\" \"$@\" < \"" + stdinLog + "\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := commitGraphGit
+	commitGraphGit = script
+	t.Cleanup(func() { commitGraphGit = old })
+
+	if err := writeCommitGraph(t.Context(), repoPath, synced); err != nil {
+		t.Fatalf("writeCommitGraph: %v", err)
+	}
+	if b, _ := os.ReadFile(stdinLog); strings.TrimSpace(string(b)) != tip {
+		t.Fatalf("stdin = %q, want only the synced tip %s (not the late tip %s)", b, tip, late)
+	}
+	mustGit(t, repoPath, "commit-graph", "verify")
 }
 
 // With every process-wide slot busy the refresh is skipped without
@@ -583,18 +651,37 @@ func TestRefreshCommitGraph_SkipsWhenSlotsBusy(t *testing.T) {
 	for range cap(commitGraphSlots) {
 		commitGraphSlots <- struct{}{}
 	}
-	refreshCommitGraph(t.Context(), repoPath, 1)
+	tips := tipsOf(repoTips(t, repoPath)...)
+	refreshCommitGraph(t.Context(), repoPath, tips)
 	for range cap(commitGraphSlots) {
 		<-commitGraphSlots
 	}
 	if spawns != 0 || commitGraphChain(t, repoPath) != nil {
 		t.Fatalf("refresh ran with every slot busy (%d spawns)", spawns)
 	}
-	refreshCommitGraph(t.Context(), repoPath, 1)
+	refreshCommitGraph(t.Context(), repoPath, tips)
 	if spawns != 1 || len(commitGraphChain(t, repoPath)) == 0 {
 		t.Fatalf("refresh with a free slot: %d spawns, want one write", spawns)
 	}
 	if len(commitGraphSlots) != 0 {
 		t.Fatalf("refresh leaked a slot: %d held", len(commitGraphSlots))
+	}
+}
+
+// A relative cache directory (an accepted --cache-dir value) yields
+// relative repo paths; the refresh must work with them, not panic.
+func TestHydrate_CommitGraphWithRelativeCacheDir(t *testing.T) {
+	st, bl, cacheDir, repo, repoPath := hydrateWithHistory(t, 5)
+	t.Chdir(filepath.Dir(cacheDir))
+	rel := filepath.Base(cacheDir)
+	got, refsErr, err := Hydrate(t.Context(), st, bl, rel, repo, "main")
+	if err != nil || refsErr != nil {
+		t.Fatalf("Hydrate(relative cache dir) = (refsErr %v, err %v)", refsErr, err)
+	}
+	if filepath.IsAbs(got) {
+		t.Fatalf("repo path %q is absolute; the test no longer covers relative paths", got)
+	}
+	if len(commitGraphChain(t, repoPath)) == 0 {
+		t.Fatal("no commit-graph written through a relative repo path")
 	}
 }

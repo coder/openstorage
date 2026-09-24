@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // Refresh budgets (ADR-47 "Budgets and the no-Bloom fallback"). The whole
@@ -35,12 +38,52 @@ var (
 	commitGraphKillDelay   = time.Second
 )
 
-// commitGraphMaxRefs caps the refs a refresh may walk. Ref fanout is
-// attacker-scaled (a push can mint many same-tip refs cheaply), and
-// `--reachable` resolves every ref on every write: 10,000 refs cost about
-// 155 ms, 500,000 refs about 24 s. Above the cap the refresh is skipped;
-// an existing graph stays in place and stays correct, only staler.
-var commitGraphMaxRefs = 10000
+// commitGraphMaxTips caps the distinct commit tips one refresh may walk.
+// The refresh never enumerates the live ref namespace (`--reachable`
+// resolves every ref, and ref fanout is attacker-scaled: 500,000 refs
+// took about 24 s); it feeds `--stdin-commits` the distinct tips the sync
+// that just ran applied, collected while the sync streamed them. Above the
+// cap the refresh is skipped; an existing graph stays in place and stays
+// correct, only staler.
+var commitGraphMaxTips = 10000
+
+// refTips collects the distinct SHAs a ref sync streams, up to
+// commitGraphMaxTips; past the cap it drops the set and marks itself over,
+// so its memory stays bounded however many refs the repo has.
+type refTips struct {
+	set  map[string]struct{}
+	over bool
+}
+
+func newRefTips() *refTips { return &refTips{set: map[string]struct{}{}} }
+
+func (t *refTips) add(sha string) {
+	if t.over {
+		return
+	}
+	if _, ok := t.set[sha]; ok {
+		return
+	}
+	if len(t.set) >= commitGraphMaxTips {
+		t.set, t.over = nil, true
+		return
+	}
+	t.set[sha] = struct{}{}
+}
+
+// tipCollectingRefSeq records every SHA inner yields into tips.
+type tipCollectingRefSeq struct {
+	inner refSeq
+	tips  *refTips
+}
+
+func (c *tipCollectingRefSeq) next() (string, string, bool, error) {
+	name, sha, ok, err := c.inner.next()
+	if ok && err == nil {
+		c.tips.add(sha)
+	}
+	return name, sha, ok, err
+}
 
 // commitGraphSlots bounds concurrent refreshes per process, so writes across
 // many repos can occupy at most cap(commitGraphSlots) CPUs. A refresh that
@@ -56,15 +99,19 @@ var commitGraphGit = "git"
 // of its own budget (as opposed to the request or the shared deadline).
 var errCommitGraphBudget = errors.New("commit-graph attempt budget expired")
 
-// refreshCommitGraph writes or extends repoPath's split commit-graph and
-// logs any failure. refs is the repo's ref count from the sync that just
-// completed. The caller must hold the repo's hydrate lock: it serializes
-// every commit-graph writer for the repo on this node.
-func refreshCommitGraph(ctx context.Context, repoPath string, refs int) {
-	assertf(refs >= 0, "refreshCommitGraph: negative ref count %d", refs)
-	if refs > commitGraphMaxRefs {
-		log.Printf("commit-graph %s: skipped, %d refs exceed the %d-ref cap (reads stay correct, only slower)", repoPath, refs, commitGraphMaxRefs)
+// refreshCommitGraph adds the commits reachable from tips (the distinct
+// SHAs the sync that just completed applied) to repoPath's split
+// commit-graph and logs any failure. The caller must hold the repo's
+// hydrate lock: it serializes every commit-graph writer for the repo on
+// this node.
+func refreshCommitGraph(ctx context.Context, repoPath string, tips *refTips) {
+	assertf(tips != nil, "refreshCommitGraph: nil tips")
+	if tips.over {
+		log.Printf("commit-graph %s: skipped, more than %d distinct ref tips (reads stay correct, only slower)", repoPath, commitGraphMaxTips)
 		return
+	}
+	if len(tips.set) == 0 {
+		return // no refs, nothing to graph
 	}
 	select {
 	case commitGraphSlots <- struct{}{}:
@@ -73,37 +120,45 @@ func refreshCommitGraph(ctx context.Context, repoPath string, refs int) {
 		log.Printf("commit-graph %s: skipped, all %d refresh slots busy (the next full hydrate retries)", repoPath, cap(commitGraphSlots))
 		return
 	}
-	if err := writeCommitGraph(ctx, repoPath); err != nil {
+	if err := writeCommitGraph(ctx, repoPath, slices.Sorted(maps.Keys(tips.set))); err != nil {
 		log.Printf("commit-graph %s: %v (reads stay correct, only slower)", repoPath, err)
 	}
 }
 
-// writeCommitGraph runs `git commit-graph write --reachable --split` in the
-// repo. Bloom filters (--changed-paths) are requested only when no graph
-// exists yet; later writes inherit the choice from the existing chain. If
-// the first attempt runs out of its own budget while the request and the
-// shared deadline are still live, one retry writes a layer without Bloom
-// filters (--no-changed-paths), which later writes then inherit.
-func writeCommitGraph(ctx context.Context, repoPath string) error {
-	assertf(filepath.IsAbs(repoPath), "writeCommitGraph: relative repo path %q", repoPath)
+// writeCommitGraph runs `git commit-graph write --stdin-commits --split` in
+// the repo, walking only from tips (so its work is bounded by the tip
+// count and the new history, never by the live ref namespace, which a
+// concurrent receive-pack may be growing). Bloom filters (--changed-paths)
+// are requested only when no graph exists yet; later writes inherit the
+// choice from the existing chain. If the first attempt runs out of its own
+// budget while the request and the shared deadline are still live, one
+// retry writes a layer without Bloom filters (--no-changed-paths), which
+// later writes then inherit.
+func writeCommitGraph(ctx context.Context, repoPath string, tips []string) error {
+	assertf(repoPath != "", "writeCommitGraph: empty repo path")
+	assertf(len(tips) > 0 && len(tips) <= commitGraphMaxTips, "writeCommitGraph: %d tips (cap %d)", len(tips), commitGraphMaxTips)
+	for _, tip := range tips {
+		assertf(ref.ValidSHA(tip), "writeCommitGraph: invalid tip %q", tip)
+	}
 	assertf(commitGraphDeadline > 0 && commitGraphFirstBudget > 0 && commitGraphKillDelay > 0,
 		"writeCommitGraph: non-positive budget (deadline %v, first %v, kill %v)",
 		commitGraphDeadline, commitGraphFirstBudget, commitGraphKillDelay)
 	ctx, cancel := context.WithTimeout(ctx, commitGraphDeadline)
 	defer cancel()
-	args := []string{"commit-graph", "write", "--reachable", "--split", "--no-progress"}
+	stdin := strings.Join(tips, "\n") + "\n"
+	args := []string{"commit-graph", "write", "--stdin-commits", "--split", "--no-progress"}
 	first := args
 	if !hasCommitGraph(repoPath) {
 		first = append(slices.Clip(args), "--changed-paths")
 	}
-	err := runCommitGraphAttempt(ctx, repoPath, commitGraphFirstBudget, first)
+	err := runCommitGraphAttempt(ctx, repoPath, commitGraphFirstBudget, first, stdin)
 	if !errors.Is(err, errCommitGraphBudget) {
 		return err
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		return fmt.Errorf("%w; no retry: %w", err, cerr)
 	}
-	if rerr := runCommitGraphAttempt(ctx, repoPath, 0, append(slices.Clip(args), "--no-changed-paths")); rerr != nil {
+	if rerr := runCommitGraphAttempt(ctx, repoPath, 0, append(slices.Clip(args), "--no-changed-paths"), stdin); rerr != nil {
 		return fmt.Errorf("%w; plain retry: %w", err, rerr)
 	}
 	log.Printf("commit-graph %s: first attempt exceeded %v; wrote a layer without Bloom filters, later writes on this node inherit that", repoPath, commitGraphFirstBudget)
@@ -127,7 +182,7 @@ func hasCommitGraph(repoPath string) bool {
 // attempt with errCommitGraphBudget as the cause; 0 runs it under ctx
 // alone. cmd.Run returns only after the child is reaped, so the caller
 // never releases the hydrate lock (or starts a retry) while it still runs.
-func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Duration, args []string) error {
+func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Duration, args []string, stdin string) error {
 	assertf(budget >= 0, "runCommitGraphAttempt: negative budget %v", budget)
 	actx := ctx
 	if budget > 0 {
@@ -138,6 +193,7 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 	observeGitSpawn(repoPath, args)
 	cmd := exec.CommandContext(actx, commitGraphGit, args...)
 	cmd.Dir = repoPath
+	cmd.Stdin = strings.NewReader(stdin)
 	cmd.Env = commitGraphEnv(os.Environ())
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = commitGraphKillDelay

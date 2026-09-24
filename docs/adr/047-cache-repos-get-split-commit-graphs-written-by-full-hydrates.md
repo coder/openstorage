@@ -11,10 +11,13 @@ applied every ref (`refsErr == nil` and no push-held ref skipped) and
 published its generation marker, `Hydrate` runs
 
 ```
-git commit-graph write --reachable --split --no-progress [--changed-paths]
+git commit-graph write --stdin-commits --split --no-progress [--changed-paths]
 ```
 
-in the cache repo, still holding `codestorage.hydrate.lock`.
+in the cache repo, still holding `codestorage.hydrate.lock`. Its stdin is
+the set of distinct commit tips that sync just applied, collected while it
+streamed the store refs, so the write never enumerates the live ref
+namespace.
 `--changed-paths` is passed only when the repo has no graph yet. Later
 writes inherit the choice: Git keeps writing Bloom filters if and only if
 the existing graph has them.
@@ -30,17 +33,20 @@ the existing graph has them.
   until the next full hydrate, the new commits are simply outside the
   graph.
 - A marker-TTL refresh or a default-branch change also runs a write. With
-  nothing new to add, the write costs about 4 ms (20k commits, one ref).
-  In an exploratory run it took about 155 ms with 10,000 refs, because
-  `--reachable` resolves every ref.
+  nothing new to add, the write costs about 4 ms (20k commits, one ref);
+  in an exploratory run, 10,000 distinct tips cost about 50 ms.
 - Two guards can skip the write; a skipped write leaves any existing graph
   in place, which stays correct and only gets staler:
-  - **Ref cap.** Ref fanout is attacker-scaled: a push can mint many
-    same-tip refs cheaply, and every later ref move forces a full hydrate.
-    Codex's security review measured 23.6 s for one write over 500,000
-    refs. So the refresh is skipped when the sync just streamed more than
-    `commitGraphMaxRefs` (10,000) refs. The count comes from the sync's own
-    pass over the store refs, so it costs nothing extra.
+  - **Tip cap.** Ref fanout is attacker-scaled: a push can mint many refs
+    cheaply, and every later ref move forces a full hydrate. A
+    `--reachable` write resolves every ref (Codex's security review
+    measured 23.6 s for 500,000 refs), and a concurrent receive-pack can
+    add refs after the sync, so counting refs before a `--reachable` walk
+    would not bound it. Instead the sync collects its distinct tips (the
+    set is dropped once it exceeds the cap, so memory stays bounded) and
+    the write walks only those. Same-tip fanout collapses to one tip. The
+    refresh is skipped when the sync saw more than `commitGraphMaxTips`
+    (10,000) distinct tips.
   - **Process-wide slots.** At most `cap(commitGraphSlots)` (2) refreshes
     run at once per process, across all repos. A refresh that finds both
     slots busy is skipped, not queued; the repo's next full hydrate tries
@@ -168,11 +174,12 @@ already synced. A missing, stale, or partial graph is only slower:
   scratch repos (which reach the cache through alternates) read the graph
   lock-free. Git replaces the chain file and layers by atomic rename.
 - **Concurrent receive-pack.** Receive-pack takes no hydrate lock, and
-  this change does not add one. Its quarantined objects are invisible to
-  `--reachable` until Git migrates them, and it moves refs only after the
-  migration. So a concurrent write sees old or new refs, and every object
-  either set reaches is present. The write touches no refs, so push holds
-  are unaffected.
+  this change does not add one. The write walks only the tips the sync
+  applied; those commits and their history are already in the object
+  store, and nothing deletes objects. Refs a concurrent push adds are not
+  walked; the next full hydrate (which that push's generation bump
+  forces) adds them. The write touches no refs, so push holds are
+  unaffected.
 - **Repack.** The fold materializes packs and writes a new pack holding
   the union of their objects. Object IDs are unchanged, so the graph stays
   valid and needs no integration.
@@ -185,7 +192,8 @@ already synced. A missing, stale, or partial graph is only slower:
 The child gets the same isolation as the API and sync Git subprocesses:
 every inherited `GIT_*` variable is dropped, and `GIT_CONFIG_GLOBAL` and
 `GIT_CONFIG_SYSTEM` point at `/dev/null` (plus `GIT_CONFIG_NOSYSTEM=1`).
-An inherited `GIT_DIR`, `GIT_OBJECT_DIRECTORY`, or
-`GIT_CONFIG_COUNT/KEY/VALUE` could otherwise redirect the write or disable
-it, and host config could change the graph format. Hydrate's other
+The repo path may be relative (a relative `--cache-dir` is accepted); the
+child runs with that path as its working directory. An inherited
+`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, or `GIT_CONFIG_COUNT/KEY/VALUE` could
+otherwise redirect the write or disable it, and host config could change the graph format. Hydrate's other
 subprocesses are unchanged.
