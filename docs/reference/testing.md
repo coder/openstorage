@@ -98,8 +98,8 @@ OPENSTORAGE_TEST_MINIO_LEGACY=1 go test ./internal/ref/s3wal \
 ```
 
 The host needs a local copy of that exact image digest, so a fresh machine
-cannot run the lane. As of 2026-09-24 the image survives only in one
-maintainer's private Docker cache. Nothing is published, and if that cache is
+cannot run the lane. As of 2026-09-24 the image survives only as private
+copies on one maintainer's host. Nothing is published, and if those copies are
 lost the lane can no longer run. A maintainer who holds the image runs the lane
 on SeaweedFS pin changes (step 1 above) and on changes to the s3wal probe or CAS
 error classification. It remains the byte-exact historical qualification
