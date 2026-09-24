@@ -35,6 +35,19 @@ var (
 	commitGraphKillDelay   = time.Second
 )
 
+// commitGraphMaxRefs caps the refs a refresh may walk. Ref fanout is
+// attacker-scaled (a push can mint many same-tip refs cheaply), and
+// `--reachable` resolves every ref on every write: 10,000 refs cost about
+// 155 ms, 500,000 refs about 24 s. Above the cap the refresh is skipped;
+// an existing graph stays in place and stays correct, only staler.
+var commitGraphMaxRefs = 10000
+
+// commitGraphSlots bounds concurrent refreshes per process, so writes across
+// many repos can occupy at most cap(commitGraphSlots) CPUs. A refresh that
+// finds every slot busy is skipped, not queued: the next full hydrate of
+// that repo retries, and a stale graph only costs speed.
+var commitGraphSlots = make(chan struct{}, 2)
+
 // commitGraphGit is the binary the refresh runs. Test seam for driving the
 // timeout, retry, and reaping paths with a scripted fake.
 var commitGraphGit = "git"
@@ -44,9 +57,22 @@ var commitGraphGit = "git"
 var errCommitGraphBudget = errors.New("commit-graph attempt budget expired")
 
 // refreshCommitGraph writes or extends repoPath's split commit-graph and
-// logs any failure. The caller must hold the repo's hydrate lock: it
-// serializes every commit-graph writer for the repo on this node.
-func refreshCommitGraph(ctx context.Context, repoPath string) {
+// logs any failure. refs is the repo's ref count from the sync that just
+// completed. The caller must hold the repo's hydrate lock: it serializes
+// every commit-graph writer for the repo on this node.
+func refreshCommitGraph(ctx context.Context, repoPath string, refs int) {
+	assertf(refs >= 0, "refreshCommitGraph: negative ref count %d", refs)
+	if refs > commitGraphMaxRefs {
+		log.Printf("commit-graph %s: skipped, %d refs exceed the %d-ref cap (reads stay correct, only slower)", repoPath, refs, commitGraphMaxRefs)
+		return
+	}
+	select {
+	case commitGraphSlots <- struct{}{}:
+		defer func() { <-commitGraphSlots }()
+	default:
+		log.Printf("commit-graph %s: skipped, all %d refresh slots busy (the next full hydrate retries)", repoPath, cap(commitGraphSlots))
+		return
+	}
 	if err := writeCommitGraph(ctx, repoPath); err != nil {
 		log.Printf("commit-graph %s: %v (reads stay correct, only slower)", repoPath, err)
 	}

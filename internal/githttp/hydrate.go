@@ -1093,6 +1093,20 @@ type refSeq interface {
 	next() (name, sha string, ok bool, err error)
 }
 
+// countingRefSeq counts the refs inner yields into *n.
+type countingRefSeq struct {
+	inner refSeq
+	n     *int
+}
+
+func (c *countingRefSeq) next() (string, string, bool, error) {
+	name, sha, ok, err := c.inner.next()
+	if ok && err == nil {
+		*c.n++
+	}
+	return name, sha, ok, err
+}
+
 // storeRefSeq streams a repo's refs from the store in syncRefsBatch-sized
 // keyset pages. Each page is one consistent snapshot; cross-page tearing
 // under concurrent mutation is healed by the generation marker (any
@@ -3817,8 +3831,17 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	// early flush's skip under a hold released mid-scan would otherwise
 	// be vouched for by a fingerprint that still matches).
 	preHoldsKey, preHoldsOK := livePushHoldsKey(repoPath)
+	// Count the store refs the sync streams (issue #307): every pass drains
+	// the whole store sequence, so after a successful sync storeRefs is the
+	// repo's ref count, which bounds the commit-graph refresh below.
+	storeRefs := 0
+	uncounted := newStore
+	countedStore := func() refSeq {
+		storeRefs = 0
+		return &countingRefSeq{inner: uncounted(), n: &storeRefs}
+	}
 	for range 3 {
-		if skippedHeld, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, syncRefsBatch); refsErr == nil {
+		if skippedHeld, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, countedStore, syncRefsBatch); refsErr == nil {
 			break
 		}
 		// A store-side scan failure is an infrastructure error, not local
@@ -3846,8 +3869,9 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		// Refresh the commit-graph (issue #307, ADR-47) after the marker,
 		// so lock-free fast-path readers are not held up by it, and still
 		// under the hydrate lock, which serializes every graph writer for
-		// this repo. Best-effort: failures are logged, never returned.
-		refreshCommitGraph(ctx, repoPath)
+		// this repo. Best-effort: failures are logged, never returned; the
+		// ref count caps the attacker-scaled `--reachable` ref walk.
+		refreshCommitGraph(ctx, repoPath, storeRefs)
 	} else if refsErr == nil && skippedHeld && preHoldsOK {
 		// Held-skip verdict (Codex round-22 security P2, see
 		// heldGenerationMarker): reusable by later hydrates while the

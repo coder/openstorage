@@ -529,3 +529,72 @@ func BenchmarkCommitGraphRefresh(b *testing.B) {
 		}
 	}
 }
+
+// Ref fanout is attacker-scaled: above commitGraphMaxRefs the refresh is
+// skipped (no `--reachable` walk over every ref), while the hydrate and
+// its marker still succeed. The count is exact: at the cap it writes.
+func TestHydrate_CommitGraphSkippedAboveRefCap(t *testing.T) {
+	st, bl, cacheDir, repo, repoPath := hydrateWithHistory(t, 5)
+	st.mu.Lock()
+	tip := st.refs["refs/heads/main"]
+	for i := range 3 {
+		st.refs[fmt.Sprintf("refs/heads/b%d", i)] = tip
+	}
+	st.mu.Unlock()
+	old := commitGraphMaxRefs
+	t.Cleanup(func() { commitGraphMaxRefs = old })
+
+	commitGraphMaxRefs = 3 // 4 refs
+	var spawned []string
+	obs := func(_ string, args []string) {
+		if len(args) > 0 && args[0] == "commit-graph" {
+			spawned = append(spawned, strings.Join(args, " "))
+		}
+	}
+	gitSpawnObserver.Store(&obs)
+	defer gitSpawnObserver.Store(nil)
+	mustHydrate(t, st, bl, cacheDir, repo)
+	if len(spawned) != 0 || commitGraphChain(t, repoPath) != nil {
+		t.Fatalf("refresh ran above the ref cap: spawned %q", spawned)
+	}
+	if got := markerContent(t, repoPath); got != "8 refs/heads/main" {
+		t.Fatalf("marker = %q, want \"8 refs/heads/main\"", got)
+	}
+
+	commitGraphMaxRefs = 4
+	st.setGen(9)
+	mustHydrate(t, st, bl, cacheDir, repo)
+	if len(spawned) != 1 || len(commitGraphChain(t, repoPath)) == 0 {
+		t.Fatalf("refresh at the ref cap: spawned %q, want one write", spawned)
+	}
+}
+
+// With every process-wide slot busy the refresh is skipped without
+// spawning Git; once a slot frees up it writes again.
+func TestRefreshCommitGraph_SkipsWhenSlotsBusy(t *testing.T) {
+	repoPath := t.TempDir()
+	mustGit(t, repoPath, "init", "-q", "--bare")
+	seedHistory(t, repoPath, 5)
+	var spawns int
+	obs := func(_ string, _ []string) { spawns++ }
+	gitSpawnObserver.Store(&obs)
+	defer gitSpawnObserver.Store(nil)
+
+	for range cap(commitGraphSlots) {
+		commitGraphSlots <- struct{}{}
+	}
+	refreshCommitGraph(t.Context(), repoPath, 1)
+	for range cap(commitGraphSlots) {
+		<-commitGraphSlots
+	}
+	if spawns != 0 || commitGraphChain(t, repoPath) != nil {
+		t.Fatalf("refresh ran with every slot busy (%d spawns)", spawns)
+	}
+	refreshCommitGraph(t.Context(), repoPath, 1)
+	if spawns != 1 || len(commitGraphChain(t, repoPath)) == 0 {
+		t.Fatalf("refresh with a free slot: %d spawns, want one write", spawns)
+	}
+	if len(commitGraphSlots) != 0 {
+		t.Fatalf("refresh leaked a slot: %d held", len(commitGraphSlots))
+	}
+}

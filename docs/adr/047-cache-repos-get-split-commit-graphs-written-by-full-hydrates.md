@@ -33,6 +33,19 @@ the existing graph has them.
   nothing new to add, the write costs about 4 ms (20k commits, one ref).
   In an exploratory run it took about 155 ms with 10,000 refs, because
   `--reachable` resolves every ref.
+- Two guards can skip the write; a skipped write leaves any existing graph
+  in place, which stays correct and only gets staler:
+  - **Ref cap.** Ref fanout is attacker-scaled: a push can mint many
+    same-tip refs cheaply, and every later ref move forces a full hydrate.
+    Codex's security review measured 23.6 s for one write over 500,000
+    refs. So the refresh is skipped when the sync just streamed more than
+    `commitGraphMaxRefs` (10,000) refs. The count comes from the sync's own
+    pass over the store refs, so it costs nothing extra.
+  - **Process-wide slots.** At most `cap(commitGraphSlots)` (2) refreshes
+    run at once per process, across all repos. A refresh that finds both
+    slots busy is skipped, not queued; the repo's next full hydrate tries
+    again. This bounds commit-graph CPU per node to two cores however
+    many repos an attacker drives.
 
 ## Why split graphs and Bloom filters
 
