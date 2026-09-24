@@ -876,7 +876,7 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	// process-wide topoWalks budget; when it is exhausted, times out, or
 	// hits its heap cap, the request fails with 503 rather than returning
 	// entries without order.
-	ranks, err := topoWalks.ranks(r.Context(), repoPath, commit, slices.Collect(maps.Keys(commitsMap)))
+	ranks, err := topoWalks.ranks(r.Context(), repo.RepoID, repoPath, commit, slices.Collect(maps.Keys(commitsMap)))
 	switch {
 	case errors.Is(err, errTopoWalkBusy):
 		w.Header().Set("Retry-After", "1")

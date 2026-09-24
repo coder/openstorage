@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/coder/openstorage/internal/gitread"
@@ -15,8 +16,10 @@ import (
 // cheap (#307 tracks commit-graphs), so the walks are capped per process
 // and per request.
 const (
-	// topoWalkMaxConcurrent caps simultaneous walks in this process.
-	// Excess requests fail fast (no queue) with 503 + Retry-After.
+	// topoWalkMaxConcurrent caps simultaneous walks in this process, and
+	// each repository may hold at most one of them, so one repository's
+	// deep history cannot starve the others. Excess requests fail fast
+	// (no queue) with 503 + Retry-After.
 	topoWalkMaxConcurrent = 4
 	// topoWalkTimeout caps one walk. A 300,000-commit history took about
 	// 3.4 s in the security review's reproduction, so this admits
@@ -55,7 +58,11 @@ var topoWalks = newTopoWalkBudget(topoWalkMaxConcurrent, topoWalkTimeout, topoWa
 // TopoRanks always waits for (reaps) git before it returns, so a held slot
 // always means at most one live git process.
 type topoWalkBudget struct {
-	slots   chan struct{}
+	slots chan struct{}
+	// mu guards active: the repositories with a walk in flight (at most
+	// one walk per repository).
+	mu      sync.Mutex
+	active  map[string]struct{}
 	timeout time.Duration
 	// heapLimitBytes is passed to gitread.TopoRanks; 0 = no cap.
 	heapLimitBytes int64
@@ -65,22 +72,42 @@ func newTopoWalkBudget(maxConcurrent int, timeout time.Duration, heapLimitBytes 
 	assertf(maxConcurrent > 0, "newTopoWalkBudget: maxConcurrent %d", maxConcurrent)
 	assertf(timeout > 0, "newTopoWalkBudget: timeout %v", timeout)
 	assertf(heapLimitBytes >= 0, "newTopoWalkBudget: heapLimitBytes %d", heapLimitBytes)
-	return &topoWalkBudget{slots: make(chan struct{}, maxConcurrent), timeout: timeout, heapLimitBytes: heapLimitBytes}
+	return &topoWalkBudget{
+		slots:          make(chan struct{}, maxConcurrent),
+		active:         map[string]struct{}{},
+		timeout:        timeout,
+		heapLimitBytes: heapLimitBytes,
+	}
 }
 
 // ranks returns gitread.TopoRanks(ctx, repoPath, rev, want) under the
-// budget. It returns errTopoWalkBusy without starting git when no slot is
-// free, and an error wrapping errTopoWalkTimeout when the walk outlives the
+// budget. It returns errTopoWalkBusy without starting git when repoKey
+// already has a walk in flight or no global slot is free, and an error wrapping errTopoWalkTimeout when the walk outlives the
 // budget's deadline, and an error wrapping errTopoWalkTooLarge when git
 // exceeds the heap cap. Caller cancellation surfaces as TopoRanks' own
 // error.
-func (b *topoWalkBudget) ranks(ctx context.Context, repoPath, rev string, want []string) (map[string]int, error) {
+func (b *topoWalkBudget) ranks(ctx context.Context, repoKey, repoPath, rev string, want []string) (map[string]int, error) {
+	assertf(repoKey != "", "topoWalkBudget.ranks: empty repoKey")
 	if len(want) == 0 {
 		return map[string]int{}, nil // no walk, so no slot
 	}
 	if b.heapLimitBytes > 0 && !topoHeapLimitSupported() {
 		return nil, errTopoWalkUnsupported // before taking a slot or starting git
 	}
+	// Per-repository admission first, so a busy repository never takes a
+	// global slot.
+	b.mu.Lock()
+	if _, busy := b.active[repoKey]; busy {
+		b.mu.Unlock()
+		return nil, errTopoWalkBusy
+	}
+	b.active[repoKey] = struct{}{}
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		delete(b.active, repoKey)
+		b.mu.Unlock()
+	}()
 	select {
 	case b.slots <- struct{}{}:
 	default:

@@ -60,6 +60,11 @@ func requireFree(t *testing.T, b *topoWalkBudget) {
 	if n := len(b.slots); n != 0 {
 		t.Fatalf("%d walk slots still held", n)
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n := len(b.active); n != 0 {
+		t.Fatalf("%d repositories still marked walking: %v", n, b.active)
+	}
 }
 
 const topoTestSHA = "1111111111111111111111111111111111111111"
@@ -69,7 +74,7 @@ func TestTopoWalkBudgetSaturatedRejectsWithoutGit(t *testing.T) {
 	b.slots <- struct{}{}
 	b.slots <- struct{}{}
 	// A nonexistent repo path proves no git process is started.
-	_, err := b.ranks(context.Background(), "/nonexistent/repo", topoTestSHA, []string{topoTestSHA})
+	_, err := b.ranks(context.Background(), "repo_a", "/nonexistent/repo", topoTestSHA, []string{topoTestSHA})
 	if !errors.Is(err, errTopoWalkBusy) {
 		t.Fatalf("err = %v, want errTopoWalkBusy", err)
 	}
@@ -82,7 +87,7 @@ func TestTopoWalkBudgetDeadlineKillsAndReapsGit(t *testing.T) {
 	pidFile := fakeSlowGit(t)
 	b := newTopoWalkBudget(1, 300*time.Millisecond, 0)
 	start := time.Now()
-	_, err := b.ranks(context.Background(), t.TempDir(), topoTestSHA, []string{topoTestSHA})
+	_, err := b.ranks(context.Background(), "repo_a", t.TempDir(), topoTestSHA, []string{topoTestSHA})
 	if !errors.Is(err, errTopoWalkTimeout) {
 		t.Fatalf("err = %v, want errTopoWalkTimeout", err)
 	}
@@ -106,7 +111,7 @@ func TestTopoWalkBudgetCallerCancelKillsAndReapsGit(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
-	_, err := b.ranks(ctx, t.TempDir(), topoTestSHA, []string{topoTestSHA})
+	_, err := b.ranks(ctx, "repo_a", t.TempDir(), topoTestSHA, []string{topoTestSHA})
 	if err == nil || errors.Is(err, errTopoWalkTimeout) || !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("err = %v, want a cancellation error that is not errTopoWalkTimeout", err)
 	}
@@ -121,7 +126,7 @@ func TestTopoWalkBudgetSuccessReleasesSlot(t *testing.T) {
 	coreGit(t, dir, "commit", "-q", "--allow-empty", "-m", "two")
 	tip, parent := coreRevParse(t, dir, "HEAD"), coreRevParse(t, dir, "HEAD~1")
 	b := newTopoWalkBudget(1, time.Minute, 0)
-	ranks, err := b.ranks(context.Background(), dir, tip, []string{parent, tip})
+	ranks, err := b.ranks(context.Background(), "repo_a", dir, tip, []string{parent, tip})
 	if err != nil || len(ranks) != 2 || ranks[tip] != 0 || ranks[parent] != 1 {
 		t.Fatalf("ranks = %v, err = %v", ranks, err)
 	}
@@ -217,4 +222,51 @@ func TestFilesMetadataTopoWalkUnsupportedPlatform503(t *testing.T) {
 		resp, body = coreGet(t, e, "GET", "/api/v1/repos/files/metadata", fx.token, nil)
 		coreRequireStatus(t, resp, body, http.StatusOK)
 	})
+}
+
+// TestTopoWalkBudgetOneWalkPerRepo: one repository can hold at most one
+// walk slot, so it cannot starve other repositories (security review
+// round 4). A second walk for the same repository is busy without taking a
+// global slot or starting git; another repository still walks; the
+// repository is free again once its walk returns.
+func TestTopoWalkBudgetOneWalkPerRepo(t *testing.T) {
+	pidFile := fakeSlowGit(t)
+	b := newTopoWalkBudget(4, time.Minute, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.ranks(ctx, "repo_a", t.TempDir(), topoTestSHA, []string{topoTestSHA})
+		done <- err
+	}()
+	for {
+		if _, err := os.Stat(pidFile); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err := b.ranks(context.Background(), "repo_a", "/nonexistent/repo", topoTestSHA, []string{topoTestSHA}); !errors.Is(err, errTopoWalkBusy) {
+		t.Fatalf("second walk for repo_a: err = %v, want errTopoWalkBusy", err)
+	}
+	if n := len(b.slots); n != 1 {
+		t.Fatalf("busy same-repo call left %d slots held, want 1", n)
+	}
+
+	// Another repository is admitted while repo_a walks: it starts its own
+	// (fake, slow) git, which its short caller deadline then stops.
+	ctxB, cancelB := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancelB()
+	if _, err := b.ranks(ctxB, "repo_b", t.TempDir(), topoTestSHA, []string{topoTestSHA}); err == nil || errors.Is(err, errTopoWalkBusy) {
+		t.Fatalf("repo_b: err = %v, want a non-busy walk error", err)
+	}
+	if n := len(b.slots); n != 1 {
+		t.Fatalf("after repo_b returned, %d slots held, want 1 (repo_a)", n)
+	}
+
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("cancelled repo_a walk returned no error")
+	}
+	requireReaped(t, pidFile)
+	requireFree(t, b)
 }
