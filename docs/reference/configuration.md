@@ -486,7 +486,8 @@ Per-repository storage quota (packs + LFS), enforced at every external storage w
   quota. LFS objects always store under the base repo's prefix.
 - **Admission** uses a durable reservation ledger in the ref store, atomic across pushes
   and replicas: of two pushes that fit alone but not together, exactly one wins. LFS
-  charges it too (advisory batch check, then a durable reserve at the verified upload).
+  charges it too (advisory batch check, then a durable reserve at the verified upload, settled when
+  the upload completes).
 - **Population bounds** (compiled in, like the repack fold budgets; apply even with the
   byte quota off):
   - 10,000 **active reservation rows** per repo. Excess batches get transient `429`s until
@@ -865,7 +866,7 @@ floors.
 - **Values:** a non-negative Go duration, at most half of
   [`OPENSTORAGE_PACK_RESERVATION_TTL`](#openstorage_pack_reservation_ttl); otherwise
   startup fails. With passes capped at a quarter of the TTL and mid-pass ticks coalesced,
-  covers renewed once per pass never lapse.
+  a long scan can never let a live cover lapse.
 - **Non-destructive:** it only inserts/refreshes reservation rows and bumps the shared
   floor generation. With quota off
   ([`OPENSTORAGE_PACK_QUOTA_BYTES=0`](#openstorage_pack_quota_bytes)), it detects and
