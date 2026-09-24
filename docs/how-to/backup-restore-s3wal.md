@@ -44,8 +44,8 @@ copy fidelity, not application consistency: a damaged source stays damaged. The
 clone/fsck/LFS checks are a separate gate.
 
 **Recovery point and time:** the recovery point is the verified snapshot. Downtime
-covers draining, copying, and verifying; recovery time adds provisioning, copying
-back, and cold-cache hydration. Measure both for your data; the local drill sets no
+covers draining, copying, and verifying; recovery time covers provisioning, copying
+back, verifying, and cold-cache hydration. Measure both for your data; the local drill sets no
 RPO/RTO.
 
 ## Prepare a protected snapshot
@@ -229,7 +229,7 @@ cmp source-before.json backup.json
    `/healthz` alone is not proof. A real incident needs checks across all affected
    repositories, not just the fixture below.
 6. **Reconcile security changes since the snapshot** before admitting users or
-   external side effects. Purged repository names, revoked keys, credentials, and
+   external side effects. Deleted or purged repository names, revoked keys, credentials, and
    webhook/upstream settings may be rolled back; unexpired JWTs from restored keys
    can work again. The snapshot keeps purge tombstones but may lack later
    revocations. After a compromise,

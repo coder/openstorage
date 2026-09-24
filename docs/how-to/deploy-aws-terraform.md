@@ -3,7 +3,8 @@
 Deploy one open.storage server on AWS: an HTTPS Application Load Balancer (ALB), one
 Amazon Linux 2023 x86-64 EC2 instance, private single-AZ RDS PostgreSQL, S3, networking,
 and IAM. Release smoke tests use the same [Terraform root](../../deploy/terraform/aws).
-No existing VPC, DNS zone, or certificate is needed.
+No existing VPC, DNS zone, certificate, or organization-managed infrastructure is
+needed.
 
 > [!IMPORTANT]
 > This is an **evaluation reference, not a highly available fleet**: standard
@@ -28,7 +29,7 @@ No existing VPC, DNS zone, or certificate is needed.
    account may need `iam:CreateServiceLinkedRole` for ELB, RDS, and RDS-managed
    Secrets Manager. Boundaries, SCPs, region opt-in, quotas, or denied
    service-linked roles can block provisioning. No administrator policy is
-   embedded; the runtime role cannot provision the stack.
+   embedded, and the runtime role is not meant to provision the stack.
 3. **Tools:** [mise](https://mise.jdx.dev/) plus `mise install` at the repo root
    (pins Terraform; provider locks are committed), AWS CLI v2, Git, Git LFS, `gh`,
    Python 3, OpenSSL, `curl`, and GNU `timeout`.
@@ -305,7 +306,7 @@ and leak detection remain #224 follow-ups.
 
 ## 6. Persistence and deliberate teardown
 
-RDS and S3 hold the durable repository; losing the EC2 disk does not delete them.
+RDS and S3 hold the durable repository; losing the EC2 disk does not deliberately delete them.
 This is not a tested recovery guarantee. The cache grows without eviction (50 GiB is
 evaluation capacity). There is no HA, instance replacement, disk alarm, or restore
 automation, and RDS backups are not a verified backup of both stores together.

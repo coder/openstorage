@@ -98,7 +98,7 @@ rebuilds from the tag and replaces the assets (`--clobber`).
 - **Runtime dependencies:** the binary does not bundle `git` (always required) or
   `gpg` / `ssh-keygen` (required for `verify-sig` ref policies, which shell out and
   fail closed; [#50](https://github.com/coder/openstorage/issues/50)). Unlike the
-  Docker image, install them on the host.
+  Docker image, the bare binary bundles none of these; install them on the host.
 - **First release bootstrap:** in [`release-please-config.json`](../../release-please-config.json),
   `initial-version` pins the first release to `0.1.0`. Without it, release-please
   proposes `1.0.0` and ignores the manifest's `0.0.0`. `bootstrap-sha` pins where

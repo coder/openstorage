@@ -1,7 +1,7 @@
 # Migrate to open.storage
 
-Upgrade an installation that uses the legacy `codestorage` binary or `CODESTORAGE_*`
-variables to the current names. Durable stores and the upstream wire-compatibility
+Upgrade an existing code-storage or open.storage installation to the current binary,
+environment, repository, and module names. Durable stores and the upstream wire-compatibility
 contract stay unchanged.
 
 - The binary and environment-prefix change shipped in v0.15.0.
