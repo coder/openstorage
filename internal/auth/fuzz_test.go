@@ -186,6 +186,13 @@ func FuzzVerify(f *testing.F) {
 	} {
 		f.Add(seed)
 	}
+	// Issue #312: encoding-only re-spellings of accepted tokens (padding
+	// bits, '=', standard alphabet, CR/LF) must all be rejected.
+	for _, tok := range []string{valid, fuzzES256Token, fuzzRS256Token} {
+		for _, m := range encodingOnlyMutants(tok) {
+			f.Add(m.token)
+		}
+	}
 
 	f.Fuzz(func(t *testing.T, token string) {
 		claims, err := v.Verify(context.Background(), token)
@@ -197,6 +204,11 @@ func FuzzVerify(f *testing.F) {
 		}
 		if claims == nil {
 			t.Fatal("Verify returned nil error and nil claims")
+		}
+		// Canonical-encoding oracle (issue #312), checked with a second
+		// algorithm independent of checkCanonicalSegments.
+		if !isCanonicalJWT(token) {
+			t.Fatalf("Verify accepted a non-canonical token: %q", token)
 		}
 		// Graceful-behavior oracle: only material signed by this process's
 		// keys can verify, and every valid seed carries the `good` claim

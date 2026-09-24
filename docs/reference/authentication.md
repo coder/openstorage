@@ -27,6 +27,22 @@ Official docs list only **ES256 and RS256** (EC P-256/384/521 and RSA keys).
 
 JWT header: `{"alg": "<alg>", "typ": "JWT"}`.
 
+### Token encoding
+
+A token is a compact JWS: three segments (header, payload, signature) separated by `.`.
+
+- Each segment must be canonical unpadded base64url (RFC 7515): no `=` padding, no `+`
+  or `/`, no spaces or line breaks, and unused trailing bits set to zero. Any other
+  spelling gets **401**, even when it decodes to the same bytes.
+- The rule applies to the token itself. The HTTP API trims spaces around the
+  `Authorization` value; the Git Basic-auth password is checked as sent.
+- Standard JWT libraries emit this form, including the ones the SDKs use (`jose`, PyJWT,
+  golang-jwt). Earlier versions accepted other spellings; a hand-built token that relies
+  on one must be reissued.
+- Canonical encoding does not provide replay protection or make token text a unique
+  credential identity. For example, an ECDSA signature has a second valid form with
+  different bytes.
+
 ### Organization public-key strength
 
 RSA organization public keys need a modulus of **at least 2048 bits**, for both RS256 and
