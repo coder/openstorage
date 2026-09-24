@@ -18,6 +18,8 @@ The artifact directory must use that same filesystem.
 Remote Docker, Docker Desktop, alternate mount mappings, and hostile commands are outside this contract.
 
 Use a fresh `TESTCONTAINERS_SESSION_ID` for each command.
+It must be 1 to 64 ASCII letters, digits, underscores, or hyphens, the same rule the SeaweedFS log-capture fixture enforces.
+The adapter refuses other values before it takes the lock.
 The command and every fixture must honor this label and the supplied Docker endpoint.
 Do not share the session label or replace the daemon endpoint during a run.
 The adapter rejects preexisting resources with that label and conflicting Docker configuration.
@@ -113,6 +115,7 @@ PY
 ```
 
 The adapter also records direct TERM, INT, and HUP signals without unwinding ownership.
+Signals that arrive after it starts writing the final receipt do not change the result, so the receipt and the exit status agree.
 It gives stopped producers a grace period, then uses pidfd SIGKILL when required.
 The command timeout starts after launch. Lock admission waits remain cancellable through the same channel.
 
@@ -131,6 +134,9 @@ The adapter releases the lock only after successful empty container, network, an
 There is no automatic handoff or force-release command.
 
 Cleanup uses exact session-label filters and checks full container/network IDs or volume names and labels before each deletion.
+Another cleaner, such as Ryuk or container auto-removal, can remove a listed resource first.
+A 404 response during that resource's inspection or deletion is not an error, and the adapter never deletes a resource it could not inspect.
+Cleanup still succeeds only when the final scoped inventories are empty.
 It does not prune, remove images, or implicitly delete container volumes.
 Volume-name safety also requires the cooperative lifecycle lock and exclusive session label.
 

@@ -30,7 +30,10 @@ QUERY_TIMEOUT = 5
 MIN_AVAILABLE = 60_696_476_550
 MAX_RESPONSE = 1024 * 1024
 LABEL = "org.testcontainers.sessionId"
+# Must equal sessionPattern in internal/testutil/seaweedcapture/capture.go.
+SESSION_PATTERN = r"[a-zA-Z0-9_-]{1,64}"
 KINDS = ("containers", "networks", "volumes")
+MISSING = object()  # A missing_ok request received 404: the resource is gone.
 WALL = 0x40000000  # __WALL includes Linux clone children with other exit signals.
 WAIT = os.WEXITED | os.WNOWAIT | os.WNOHANG | WALL
 
@@ -49,7 +52,7 @@ class Docker:
     def __init__(self, args, session):
         self.args, self.session = args, session
 
-    def request(self, method, path):
+    def request(self, method, path, missing_ok=False):
         connection = http.client.HTTPConnection("localhost", timeout=QUERY_TIMEOUT)
         transport = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         transport.settimeout(QUERY_TIMEOUT)
@@ -60,6 +63,8 @@ class Docker:
             connection.request(method, path)
             response = connection.getresponse()
             data = response.read(MAX_RESPONSE + 1)
+            if missing_ok and response.status == 404:
+                return MISSING
             require(200 <= response.status < 300, "Docker HTTP failure")
             require(len(data) <= MAX_RESPONSE, "Docker response too large")
             require(response.length in (None, 0), "truncated Docker response")
@@ -111,7 +116,12 @@ class Docker:
         for kind, identifiers in inventory.items():
             for ident in identifiers:
                 path = "/" + kind + "/" + ident
-                resource = self.request("GET", path + ("/json" if kind == "containers" else ""))
+                # A competing cleaner, such as Ryuk or container auto-removal, can
+                # remove a listed resource first. A 404 never authorizes deletion;
+                # the final scoped inventory below decides success.
+                resource = self.request("GET", path + ("/json" if kind == "containers" else ""), missing_ok=True)
+                if resource is MISSING:
+                    continue
                 require(isinstance(resource, dict), "invalid resource inspection")
                 require(resource.get("Name" if kind == "volumes" else "Id") == ident,
                         "inspection identity mismatch")
@@ -119,7 +129,7 @@ class Docker:
                 require(isinstance(config, dict) and isinstance(config.get("Labels"), dict)
                         and config["Labels"].get(LABEL) == self.session, "inspection label mismatch")
                 # Volumes are separate, individually inspected resources. Never v=1.
-                self.request("DELETE", path + ("?force=1" if kind == "containers" else ""))
+                self.request("DELETE", path + ("?force=1" if kind == "containers" else ""), missing_ok=True)
         require(not any(self.inventory().values()), "owned resources remain")
 
 
@@ -127,7 +137,7 @@ class Qualification:
     def __init__(self, args):
         self.args = args
         session = os.environ.get("TESTCONTAINERS_SESSION_ID", "")
-        require(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", session), "explicit session ID required")
+        require(re.fullmatch(SESSION_PATTERN, session), "explicit fixture-compatible session ID required")
         artifact = os.environ.get("OPENSTORAGE_TEST_ARTIFACT_DIR", "")
         require(artifact and Path(artifact).is_absolute(), "absolute artifact directory required")
         self.artifact = Path(artifact)
@@ -158,6 +168,7 @@ class Qualification:
         os.mkfifo(self.control_path, 0o600)
         self.control = os.open(self.control_path, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW)
         self.lock = None
+        self.final = False
         self.next_capacity = 0
         self.docker = Docker(args, session)
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -165,7 +176,9 @@ class Qualification:
         signal.signal(signal.SIGALRM, request_timeout)
 
     def interrupt(self, signum, frame=None):
-        if not self.receipt["interrupted"]:
+        # A signal after the final snapshot begins must not make the returned
+        # status disagree with the durable receipt.
+        if not self.final and not self.receipt["interrupted"]:
             self.receipt["interrupted"] = signum
 
     def error(self, stage, exc):
@@ -361,6 +374,7 @@ class Qualification:
                     break
                 time.sleep(HOLD_POLL)
         # Never leave the lock scope by exception on a query error or deadline.
+        self.final = True  # Freeze the verdict before its last durable snapshot.
         self.receipt.update(state="complete", lock_held=False)
         while not self.save():
             self.receipt["lock_held"] = True

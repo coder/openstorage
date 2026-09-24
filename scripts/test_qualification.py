@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socketserver
 import subprocess
@@ -63,19 +64,32 @@ def server(root):
                 assert kind in KINDS, self.path
                 labels = {LABEL: "wrong" if mode == "identity" else "private-session"}
                 resource = dict(Name=IDS[kind], Labels=labels) if kind == "volumes" else dict(Id=IDS[kind], Labels=labels)
+                # "vanish" models a competing cleaner, such as Ryuk or container
+                # auto-removal: it wins the container inspection and network
+                # DELETE races, then finishes its sweep before any later inventory.
                 if self.command == "DELETE":
                     assert receipt["quiescent"] and receipt["lock_held"], row
                     assert query.get("v") is None, "implicit volume deletion"
                     (root / ("removed-" + kind)).touch()
+                    if mode == "vanish":
+                        self.send_error(404)
+                        return
                     if mode == "partial":
                         (root / "mode").write_text("outage")
                     response = {}
                 elif query:
                     assert json.loads(query["filters"][0]) == {"label": [LABEL + "=private-session"]}
+                    if mode == "vanish" and (root / "removed-containers").exists():
+                        for other in KINDS:
+                            (root / ("removed-" + other)).touch()
                     present = (root / "ready").exists() and not (root / ("removed-" + kind)).exists()
                     response = [resource] if present else []
                     if kind == "volumes":
                         response = dict(Volumes=response, Warnings=[])
+                elif mode == "vanish" and kind != "networks":
+                    (root / ("removed-" + kind)).touch()
+                    self.send_error(404)
+                    return
                 else:
                     response = resource
                     if kind == "containers":
@@ -122,7 +136,7 @@ def fixture(root, case):
                               artifacts=os.environ.get("OPENSTORAGE_TEST_ARTIFACT_DIR")))
     while not (root / "go").exists():
         time.sleep(0.005)
-    if case in ("zero", "seven", "reparented", "deadline-exit"):
+    if case in ("zero", "seven", "reparented", "deadline-exit", "late-signal"):
         os._exit(7 if case == "seven" else 0)
     while True:
         signal.pause()
@@ -216,6 +230,18 @@ def adapter(root, case):
             else:
                 actual_sleep(seconds)
         time.sleep = sleep
+    elif case == "late-signal":
+        actual_flock = fcntl.flock
+        def flock(lock, operation):
+            if operation == fcntl.LOCK_UN:
+                # The final receipt is durable. Deliver a handled signal before
+                # the unlock and exit-status selection.
+                final = json.loads((root / "artifacts/qualification.json").read_text())
+                assert final["state"] == "complete" and not final["interrupted"], final
+                (root / "late-signal").touch()
+                signal.raise_signal(signal.SIGTERM)
+            return actual_flock(lock, operation)
+        fcntl.flock = flock
     timeout = "0.3" if case in ("timeout", "deadline-exit") else "3"
     sys.exit(module.main(["--lock", str(root / "lock"), "--docker-socket", str(root / "docker.sock"),
                           "--daemon-id", "private-daemon", "--backing-directory", str(root),
@@ -238,9 +264,9 @@ class QualificationTests(unittest.TestCase):
         self.until(lambda: (self.root / "server-ready").exists())
         self.sentinel = self.start("sentinel")
 
-    def start(self, *args):
+    def start(self, *args, session="private-session"):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("DOCKER_", "TESTCONTAINERS_"))}
-        env.update(HOME=str(self.root / "home"), TESTCONTAINERS_SESSION_ID="private-session",
+        env.update(HOME=str(self.root / "home"), TESTCONTAINERS_SESSION_ID=session,
                    OPENSTORAGE_TEST_ARTIFACT_DIR=str(self.root / "artifacts"))
         log = (self.root / (str(len(self.children)) + ".log")).open("w+")
         proc = subprocess.Popen([sys.executable, "-B", str(HERE), *args], env=env, stdout=log, stderr=log)
@@ -353,6 +379,11 @@ class QualificationTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.root / "native.jsonl").read_text().splitlines()]
         self.assertIn(dict(event="waitable-before-deadline-check", native=0), events)
 
+    def test_late_signal_cannot_contradict_final_receipt(self):
+        self.run_case("late-signal", 0)
+        self.assertTrue((self.root / "late-signal").exists())
+        self.assertEqual(self.receipt()["interrupted"], 0)
+
     def test_direct_term(self):
         self.run_case("direct-term", 143)
 
@@ -388,6 +419,40 @@ class QualificationTests(unittest.TestCase):
 
     def test_periodic_capacity_failure_stops_producer_before_hold(self):
         self.hold_case("capacity-drop")
+
+    def test_concurrent_removal_is_not_cleanup_failure(self):
+        proc = self.start("adapter", str(self.root), "zero")
+        self.until(lambda: (self.root / "ready").exists(), proc=proc)
+        (self.root / "mode").write_text("vanish")
+        (self.root / "go").touch()
+        self.assertEqual(proc.wait(timeout=5), 0, str(self.receipt()) + self.logs())
+        receipt = self.receipt()
+        self.assertEqual((receipt["error"], receipt["state"], receipt["native_status"]), ("", "complete", 0))
+        self.assertTrue(receipt["quiescent"])
+        self.assertFalse(receipt["lock_held"])
+        self.assertFalse(self.locked())
+        self.assertIsNone(self.sentinel.poll())
+        requests = [json.loads(line) for line in (self.root / "http.jsonl").read_text().splitlines()]
+        # A 404 inspection never authorizes deletion; the one DELETE lost its race.
+        deletes = [r for r in requests if r["method"] == "DELETE"]
+        self.assertEqual([r["path"] for r in deletes], ["/networks/" + IDS["networks"]])
+        self.assertTrue(all(r["quiescent"] and r["lock_held"] for r in deletes))
+        # Success rests on the final scoped inventory, not on the 404 responses.
+        final = requests[-3:]
+        self.assertEqual([r["path"] for r in final], ["/containers/json", "/networks", "/volumes"])
+        self.assertTrue(all(r["method"] == "GET" and "filters" in r["query"] for r in final))
+
+    def test_fixture_incompatible_session_refused_before_lock(self):
+        # The existing fixture capture rejects these; admission must refuse them.
+        for session in ("dot.session", "a" * 65, "a" * 128):
+            with self.subTest(session=session):
+                proc = self.start("adapter", str(self.root), "zero", session=session)
+                self.assertEqual(proc.wait(timeout=5), 70, self.logs())
+                self.assertFalse((self.root / "artifacts/qualification.json").exists())
+                self.assertFalse((self.root / "http.jsonl").exists())
+                self.assertFalse((self.root / "ready").exists())
+                self.assertFalse(self.locked())
+        self.assertIsNone(self.sentinel.poll())
 
     def hold_case(self, mode):
         proc = self.start("adapter", str(self.root), "capacity-drop" if mode == "capacity-drop" else "zero")
@@ -430,6 +495,17 @@ class QualificationTests(unittest.TestCase):
         self.assertNotEqual(proc.wait(timeout=5), 0, self.logs())
         self.assertFalse((self.root / "ready").exists())
         self.assertFalse(self.locked())
+
+
+class SessionContractTests(unittest.TestCase):
+    def test_session_contract_matches_fixture_capture(self):
+        spec = importlib.util.spec_from_file_location("qualification", HERE.with_name("qualification.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        go = (HERE.parents[1] / "internal/testutil/seaweedcapture/capture.go").read_text()
+        match = re.search(r"sessionPattern\s*=\s*regexp\.MustCompile\(`\^(.*)\$`\)", go)
+        self.assertIsNotNone(match, "fixture session contract not found")
+        self.assertEqual(module.SESSION_PATTERN, match.group(1))
 
 
 if __name__ == "__main__":
