@@ -247,6 +247,10 @@ event.
   answers after one database point read.
 - Anything else hydrates (download missing packs, rebuild refs) under a local file lock,
   writing the marker only after complete success.
+- After that marker, still under the lock, the full hydrate refreshes the cache's split
+  commit-graph, which speeds up history walks. The refresh is best effort and
+  time-bounded: a missing, stale, or failed graph only makes reads slower
+  ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)).
 
 **Ref rebuilds are bounded.** A full sync never holds a repository's whole ref set in
 memory, because ref fanout is attacker-scaled (millions of same-tip refs cost one row

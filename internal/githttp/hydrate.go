@@ -52,10 +52,10 @@ func RepoPath(cacheDir, repo string) string {
 }
 
 // gitSpawnObserver, when set, observes every git subprocess spawned through
-// runGitCtx and updateRefStdin — the only two exec sites reachable from
-// Hydrate. Test seam for issue #93's guarantee that the generation-match
-// fast path forks no subprocess; an atomic pointer so installing the
-// observer never races a concurrent hydrator.
+// runGitCtx, updateRefStdin, and runCommitGraphAttempt — the only exec
+// sites reachable from Hydrate. Test seam for issue #93's guarantee that
+// the generation-match fast path forks no subprocess; an atomic pointer so
+// installing the observer never races a concurrent hydrator.
 var gitSpawnObserver atomic.Pointer[func(dir string, args []string)]
 
 func observeGitSpawn(dir string, args []string) {
@@ -3843,6 +3843,11 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		// fresh marker for a whole TTL. No marker — the next hydrate
 		// full-syncs again and heals the ref once the hold clears.
 		writeGenerationMarker(repoPath, gen, headTarget)
+		// Refresh the commit-graph (issue #307, ADR-47) after the marker,
+		// so lock-free fast-path readers are not held up by it, and still
+		// under the hydrate lock, which serializes every graph writer for
+		// this repo. Best-effort: failures are logged, never returned.
+		refreshCommitGraph(ctx, repoPath)
 	} else if refsErr == nil && skippedHeld && preHoldsOK {
 		// Held-skip verdict (Codex round-22 security P2, see
 		// heldGenerationMarker): reusable by later hydrates while the
