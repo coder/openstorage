@@ -10,6 +10,7 @@ Use Python 3.9 or newer and Linux with working child-subreaper, pidfd, and `/pro
 A pidfd is a kernel handle for one process.
 A child subreaper adopts orphaned descendants so it can wait for their exit.
 The adapter refuses admission when its required kernel operations fail.
+Before it takes the lock, it signals and reaps a disposable child through a pidfd to confirm that pidfd signaling works.
 
 Run the adapter as a dedicated, single-thread process on the Docker host.
 Supply an existing coordinator-owned lifecycle lock, the local Unix socket, and the expected Docker daemon ID and data directory.
@@ -137,6 +138,7 @@ Cleanup uses exact session-label filters and checks full container/network IDs o
 Another cleaner, such as Ryuk or container auto-removal, can remove a listed resource first.
 A 404 response during that resource's inspection or deletion is not an error, and the adapter never deletes a resource it could not inspect.
 Cleanup still succeeds only when the final scoped inventories are empty.
+Other error responses, including a 409 while another cleaner's removal is still in progress, remain cleanup errors: the adapter holds the lock until read-only reconciliation sees empty inventories, then returns `70`.
 It does not prune, remove images, or implicitly delete container volumes.
 Volume-name safety also requires the cooperative lifecycle lock and exclusive session label.
 

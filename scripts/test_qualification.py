@@ -3,6 +3,7 @@
 All servers, locks, resources, and commands are private fakes. No Docker access.
 """
 import ctypes
+import errno
 import fcntl
 import http.server
 import importlib.util
@@ -185,6 +186,8 @@ def adapter(root, case):
     def send(fd, sig, *args):
         assert fd in authorized and fd not in reaped, "signal without live kernel parenthood"
         trace("signal", fd=fd, signal=sig)
+        if case == "signal-denied":  # A seccomp-style denial of pidfd_send_signal.
+            raise PermissionError(errno.EPERM, "pidfd signaling denied")
         return actual_signal(fd, sig, *args)
     def close(fd):
         authorized.discard(fd)
@@ -194,17 +197,21 @@ def adapter(root, case):
         raise AssertionError("numeric signaling is forbidden")
     os.waitid, signal.pidfd_send_signal, os.close = wait, send, close
     os.kill = os.killpg = forbidden
+    actual_popen = subprocess.Popen
+    def launch(*args, **kwargs):
+        if case in ("missing-children", "signal-denied"):
+            (root / "launch-attempt").touch()
+            raise OSError("producer reached without a required capability")
+        trace("launch")
+        return actual_popen(*args, **kwargs)
+    subprocess.Popen = launch  # Refusal cases fail safely if admission is broken.
     if case == "missing-children":
         actual_read = Path.read_text
         def read(path, *args, **kwargs):
             if str(path) == f"/proc/self/task/{os.getpid()}/children":
                 raise FileNotFoundError("child list unavailable")
             return actual_read(path, *args, **kwargs)
-        def unexpected_launch(*args, **kwargs):
-            (root / "launch-attempt").touch()
-            raise OSError("producer reached without child discovery")
         Path.read_text = read
-        subprocess.Popen = unexpected_launch  # Fail safely if admission is broken.
     elif case == "deadline-exit":
         actual_sleep = time.sleep
         paused = False
@@ -348,7 +355,11 @@ class QualificationTests(unittest.TestCase):
         native = -2 if case.endswith("int") else -15 if case in ("term", "direct-term", "timeout") else expected
         self.assertEqual(receipt["native_status"], native)
         events = [json.loads(line) for line in (self.root / "native.jsonl").read_text().splitlines()]
-        self.assertTrue(any(e["event"] == "signal" and e["signal"] == signal.SIGKILL for e in events))
+        launched = [e["event"] for e in events].index("launch")
+        # The admission probe kills and reaps a disposable child before launch.
+        self.assertIn(("signal", signal.SIGKILL), [(e["event"], e.get("signal")) for e in events[:launched]])
+        self.assertIn(("reap", signal.SIGKILL), [(e["event"], e.get("native")) for e in events[:launched]])
+        self.assertTrue(any(e["event"] == "signal" and e["signal"] == signal.SIGKILL for e in events[launched:]))
         self.assertEqual(events[-1]["event"], "echild")
         requests = [json.loads(line) for line in (self.root / "http.jsonl").read_text().splitlines()]
         deletes = [r for r in requests if r["method"] == "DELETE"]
@@ -489,6 +500,20 @@ class QualificationTests(unittest.TestCase):
         self.assertFalse(receipt["lock_held"])
         self.assertFalse(self.locked())
         self.assertIsNone(self.sentinel.poll())
+
+    def test_denied_pidfd_signal_refuses_before_lock_or_launch(self):
+        proc = self.start("adapter", str(self.root), "signal-denied")
+        self.assertEqual(proc.wait(timeout=5), 70, self.logs())
+        self.assertFalse((self.root / "launch-attempt").exists(), self.logs())
+        self.assertFalse((self.root / "http.jsonl").exists())
+        receipt = self.receipt()
+        self.assertIsNone(receipt["native_status"])
+        self.assertTrue(receipt["quiescent"])
+        self.assertFalse(receipt["lock_held"])
+        self.assertFalse(self.locked())
+        self.assertIsNone(self.sentinel.poll())
+        # The disposable probe child still exits and is reaped by the adapter;
+        # cleanup() fails if it had to rescue any child.
 
     def test_reserved_blocks_cannot_authorize_admission(self):
         proc = self.start("adapter", str(self.root), "capacity")

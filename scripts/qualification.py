@@ -300,6 +300,38 @@ class Qualification:
                 self.error("drain-deadline", TimeoutError())
             time.sleep(POLL)
 
+    def probe_signal(self):
+        """Refuse admission unless pidfd signaling works, before any lock or producer.
+
+        Validate, SIGKILL, and reap a disposable child with the same pidfd
+        operations that supervise() uses. If signaling fails, closing the pipe
+        lets the child exit on its own, so it is still reaped without numeric
+        signals.
+        """
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(w)
+                os.read(r, 1)  # Blocks until SIGKILL or the parent's close.
+            finally:
+                os._exit(0)
+        os.close(r)
+        fd = None
+        try:
+            fd = os.pidfd_open(pid)
+            require(os.waitid(os.P_PIDFD, fd, WAIT) is None, "probe child exited early")
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        finally:
+            os.close(w)
+            # No other children exist here, so P_ALL can reap it if pidfd_open failed.
+            status = os.waitid(os.P_PIDFD, fd, os.WEXITED | WALL) if fd is not None else \
+                os.waitid(os.P_ALL, 0, os.WEXITED | WALL)
+            if fd is not None:
+                os.close(fd)
+        require(status.si_pid == pid and status.si_code == os.CLD_KILLED
+                and status.si_status == signal.SIGKILL, "pidfd signaling unavailable")
+
     def run(self, command):
         require(sys.platform == "linux" and len(list(Path("/proc/self/task").iterdir())) == 1,
                 "dedicated single-thread Linux process required")
@@ -326,6 +358,7 @@ class Qualification:
             pass
         else:
             raise ValueError("inherited children are not allowed")
+        self.probe_signal()
         self.capacity()  # Pre-lock admission; no producer or resource ownership yet.
         require(self.save(), "receipt unavailable")
         self.lock = open(self.args.lock, "r")  # Existing coordinator-owned inode only.
