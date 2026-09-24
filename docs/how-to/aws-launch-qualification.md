@@ -1,245 +1,125 @@
-# Prepare and run AWS launch acceptance
+# Run artifact and read-only AWS preflight
 
-**Status: readiness tooling, not release qualification.**
-[Issue #222](https://github.com/coder/openstorage/issues/222) requires fresh,
-in-region AWS evidence for an exact release candidate. The August 27 campaign
-and emulator lanes are regression evidence, not current release proof.
+**This is preflight tooling, not release qualification.** The
+[runner](../../scripts/aws_launch_qualification.py) checks a local executable's
+checksum and reported commit. With explicit opt-in, it also requests AWS STS
+identity and an expected-owner `HeadBucket` check. It does not exercise a server.
 
-The [runner](../../scripts/aws_launch_qualification.py) checks a pinned local
-binary and exercises an **existing, trusted scratch deployment** through its
-public API, Git, and Git LFS interfaces. It does not provision infrastructure,
-restart servers, change IAM, schedule jobs, publish releases, or approve launch.
-Its result always has `launch_qualified: false`.
+Live smoke and real-AWS qualification are deferred under
+[issue #222](https://github.com/coder/openstorage/issues/222), which remains open.
+The live mutating `--smoke` path is not available. It returns only with work on
+an account and campaign explicitly authorized by the user. Neither local tests
+nor a successful read-only AWS preflight satisfy #222.
 
-> [!IMPORTANT]
-> **Having this runner in the repository is not real-AWS qualification.** It has
-> run only against offline unit-test fixtures and a local loopback server. It has
-> not run against AWS. #222 stays open until an approved in-region campaign
-> produces the evidence in [section 5](#5-complete-the-separate-cloud-gate).
+## 1. Prepare the local artifact and configuration
 
-## 1. Establish the deployment and authorization boundary
+Requirements: Python 3.11+ on POSIX and a locally runnable, trusted `openstorage`
+executable. The AWS CLI is needed only for `--aws-readonly`. Running preflight
+needs no Go installation, Git, Git LFS, Python packages, or signing key.
 
-Use the [AWS EC2 Terraform reference](deploy-aws-terraform.md) owned by
-[issue #224](https://github.com/coder/openstorage/issues/224), including its
-normal bootstrap, authentication, and teardown path. Do not create a separate
-acceptance-only Terraform stack. That reference deploys one PostgreSQL + S3
-node, and its smoke adapter emits a `pg-s3-single-node` configuration with a
-`ca_file`. **This runner rejects that configuration.** It accepts only `local`,
-two-replica `pg-s3`, and `s3wal`. Supporting the reference is separate #222 work;
-never label that node `local`, list one server twice, or disable TLS to get past
-the check. Until a compatible deployment and runner exist, use the local
-rehearsal below; do not substitute local success for AWS qualification.
-
-Before anyone provisions resources, record and approve these concrete inputs:
-
-| Prerequisite | Required decision or evidence |
-|---|---|
-| Sandbox | Dedicated non-production account or explicitly isolated sandbox; no customer data. Unique run ID and resource tags. |
-| Region and compute | EC2 runner, bucket, and servers in one approved region; record instance identity document and bucket region. No off-region laptop campaign. |
-| Standard topology | Two independently addressable PG+S3 replicas sharing the same Postgres database and bucket, plus the advertised public endpoint. |
-| Experimental topology | Separate single-node S3WAL deployment and scratch bucket; retain the instance lease. Never describe this as promoted support. |
-| Buckets | Exact approved names and expected owner for dedicated empty PG blob and S3WAL buckets; versioning must never have been enabled and Object Lock must be disabled. No customer data. |
-| Candidate | Full 40-character source SHA, immutable archive checksum or image digest, extracted binary checksum, build provenance, and installed checksum/digest on **every** node. |
-| Access | Short-lived client/test credentials and renewable instance-role credentials. No administrator role for the runtime. Client JWT private key stays off servers and out of Terraform state. |
-| Budget | Approved monetary ceiling, instance sizes/count, maximum cloud session length, accountable teardown operator, and an independent deadline/kill procedure. The runner's 300-second default bounds only the smoke process, not AWS billing. |
-| Teardown | Explicit treatment of bucket objects, multipart uploads, database storage/backups, volumes, load balancers, network resources, IAM resources, and Terraform state. Verify deletion/retention individually. |
-
-A practical approval request is one sandbox, one region, two standard-mode
-replicas and one separate experimental node, a co-located EC2 runner, and a
-single bounded session. The parent supplies the actual region, role, approved
-runtime, and spending ceiling before apply. Do not infer authorization from
-credentials merely being available.
-
-Separate provisioning permissions from runtime permissions. For the runtime,
-start with the [documented bucket permissions](deploy-production.md#backing-services):
-`s3:ListBucket` and `s3:GetBucketVersioning` on the dedicated bucket;
-`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and
-`s3:AbortMultipartUpload` on its objects. Constrain access with
-`aws:ResourceAccount`; configure `OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER` too.
-The reference provisioning role creates the buckets; the runner never calls
-`CreateBucket`. **The serve role for these pre-existing scratch buckets must
-explicitly deny `s3:CreateBucket`.** Production `serve` calls `blob.EnsureBucket`,
-which attempts `CreateBucket` before falling back from `AccessDenied` to
-`HeadBucket`. A successful runner `HeadBucket` preflight does not prevent that
-startup attempt. Verify the effective serve-role policy before starting either
-mode; reject broad provisioning credentials rather than relying on preflight
-or changing startup behavior for the measurement.
-
-Use separate, narrowly scoped test sessions for denied-read/write/delete cases;
-do not mutate a shared production role. Versioned or version-suspended buckets
-are unsuitable for the existing external test suites' deletion-based cleanup.
-
-## 2. Supply the reference deployment contract
-
-The runner consumes a small JSON file, not raw Terraform state. A #224
-adapter should select only the following non-secret outputs and locally held
-client inputs. Output names in Terraform need not match these JSON keys.
+Supply a JSON file with these fields:
 
 ```json
 {
   "schema_version": 1,
-  "candidate_commit": "<full lowercase source SHA>",
+  "candidate_commit": "<full 40-character lowercase source SHA>",
   "binary": "/private/rc/openstorage",
-  "binary_sha256": "<SHA256 of that executable, not the archive>",
-  "topology": "pg-s3",
-  "endpoint": "https://public.example.test",
-  "replica_urls": ["https://replica-a.example.test", "https://replica-b.example.test"],
-  "org": "acceptance",
-  "private_key_file": "/private/client/org.pem",
-  "aws": {
-    "region": "<approved region>",
-    "bucket": "<dedicated scratch bucket>",
-    "expected_bucket_owner": "<12-digit account ID>"
-  }
+  "binary_sha256": "<64-character lowercase SHA256 of that executable>"
 }
 ```
 
-1. `endpoint` is the advertised origin; replica URLs directly select different
-   servers, not two names for the same load balancer. They must have trusted TLS
-   certificates. URLs have no credentials, path, trailing slash, query, or
-   fragment. Local rehearsal alone permits loopback HTTP.
-2. `pg-s3` requires exactly two distinct replica origins. Offline checks normalize
-   IP literals, IPv4-mapped IPv6, host case, and the DNS trailing dot for comparison.
-   Smoke resolves both names within the command budget and rejects empty, invalid,
-   scoped, or overlapping address-and-port sets before contacting the servers.
-   Requests retain the configured hostnames and TLS checks. Disjoint addresses do
-   not prove physical replica identity or future DNS answers; the operator must
-   verify the mapping. `s3wal` and `local` require an empty `replica_urls` array.
-   Declaring a topology does not prove the backing stores.
-3. Generate the organization key with `openstorage keygen`; deploy only its
-   public half through #224. The private key must be a regular mode-0600 file.
-   Paths are relative to the invocation directory unless absolute. Do not put
-   tokens, AWS keys, private PEM contents, or database URLs in this JSON.
-4. Pin the binary checksum independently of the downloaded file, and verify its
-   release provenance. A checksum and the binary's reported commit are consistency
-   checks, not an attestation that the source was clean or the remote servers run
-   that binary. `clean_source_verified` and `remote_artifact_verified` remain
-   false in this slice. The deployment owner must collect node-specific evidence.
-5. Keep `terraform version`, provider lockfile/revision, sanitized input choices,
-   topology, endpoint-to-instance mapping, artifact provenance, region checks,
-   and teardown evidence alongside the runner result. Do not publish raw state,
-   cloud-init output, credentials, or presigned URLs.
+Use an independently verified checksum, not the archive checksum. The runner
+copies the executable to a private temporary directory, hashes that copy, and
+runs its `version` command only if the checksum matches. Paths are relative to
+the invocation directory unless absolute. Unknown or duplicate fields fail;
+old fields such as `endpoint`, `topology`, and `private_key_file` are not accepted.
 
-## 3. Run preflight, then opt into the smoke
+The checksum and reported commit are consistency checks, not build provenance.
+Use a trusted binary: preflight executes it and does not sandbox it. Verify
+clean-source provenance and installed artifacts separately. The result always
+has `clean_source_verified`, `remote_artifact_verified`, and `launch_qualified`
+set to `false`.
 
-Requirements: Python 3.11+ on POSIX; a locally runnable candidate binary;
-Git and Git LFS for smoke. The AWS CLI is needed only for `--aws-readonly`.
-No Python packages or Go installation are needed to use the runner.
+## 2. Run offline preflight
 
 ```sh
-# Offline by default: no endpoint request, repository mutation, or AWS call.
 python3 scripts/aws_launch_qualification.py \
   --config /private/run.json --output /private/evidence/preflight
-
-# Explicit read-only AWS opt-in: STS identity and expected-owner HeadBucket.
-# Use the approved short-lived credential chain; never put keys in arguments.
-python3 scripts/aws_launch_qualification.py \
-  --config /private/run.json --output /private/evidence/aws-preflight --aws-readonly
-
-# After preflight and approval of scratch-repository writes on this deployment:
-python3 scripts/aws_launch_qualification.py \
-  --config /private/run.json --output /private/evidence/smoke --smoke
 ```
 
-Each output directory must be new. It is private (0700), with private (0600)
-`result.json` and `runner.log` files. The default budget is 300 seconds;
-`--budget-seconds` accepts 1–900. Remote cleanup has a separate bounded budget.
-Requested checks failing, timing out, or failing cleanup return nonzero. A
-zero exit means only the requested readiness checks passed, **not** launch
-acceptance. Unrequested and unimplemented checks remain explicit skips.
+The output directory must be new and its parent must exist. The runner creates
+it with mode 0700 and writes `result.json` and `runner.log` with mode 0600. It
+records fixed diagnostic codes, not raw child output or configuration paths.
+A zero exit means only the requested checks passed. Unrequested AWS checks and
+deferred qualification work are recorded as skips.
 
-The smoke creates its own unique repository. It checks health, authorization
-denials, API commit → Git clone, Git push → API read, branch/tag handling,
-and a real Git LFS round-trip. The standard-mode path also exercises direct
-replica reads. It uses the supplied signing key to mint short-lived JWTs.
-Read-only API, Git, and empty LFS-download requests must reject correctly signed
-cross-repository and expired tokens, with a valid-token control on each route.
-The expiry check mints a one-second token and waits until two seconds past its
-expiry within the run budget; server clock skew can make this check fail.
-Write-scope denial probes remain separate work in
-[issue #319](https://github.com/coder/openstorage/issues/319).
-Raw child output, tokens, and response bodies are not copied into evidence.
-API/Git redirects are disabled; Git LFS retains its own redirect policy.
-Use only trusted scratch endpoints, not arbitrary third-party repositories.
+`--budget-seconds` accepts 1–900 and defaults to 300. Each child command gets at
+most 30 seconds or the remaining shared budget, whichever is smaller. Child
+stdout is limited to 1 MiB. Timeout or excess output fails the check. The budget
+does not interrupt local file copying or hashing, and is not a whole-process or
+cloud-spending limit. Forced termination can prevent evidence from being written.
 
-Cleanup soft-deletes only a repository whose creation was acknowledged. A
-conflict never authorizes deletion of an existing repository. An ambiguous
-creation or failed deletion leaves an explicit operator cleanup obligation.
-Even successful soft deletion **retains physical objects and metadata**;
-it is not bucket cleanup or Terraform teardown. SIGKILL, host loss, and power
-loss cannot run a process's cleanup handler: inspect the recorded scratch name
-and deployment inventory after an interrupted campaign.
+## 3. Opt into read-only AWS checks only when authorized
 
-## 4. Rehearse locally
+Do not infer permission from credentials being available. First obtain approval
+for the account, region, existing bucket, expected owner, and credential chain.
+Add an `aws` object to the JSON:
 
-This verifies the runner and product interfaces on SQLite + file blobs. It
-cannot verify AWS IAM, session credentials, presigning, or two-replica storage.
-Use a clean committed checkout; keep all scratch state outside it.
+```json
+"aws": {
+  "region": "<approved region>",
+  "bucket": "<approved existing bucket>",
+  "expected_bucket_owner": "<12-digit account ID>"
+}
+```
+
+Use the approved AWS CLI credential chain, including shared configuration or SSO.
+Do not put credentials in the JSON or command arguments. Then run:
+
+```sh
+python3 scripts/aws_launch_qualification.py \
+  --config /private/run.json --output /private/evidence/aws-preflight --aws-readonly
+```
+
+This requests only `aws sts get-caller-identity` and `aws s3api head-bucket` with
+`--expected-bucket-owner`. Both use the configured region; a failed command
+returns a nonzero runner exit. The AWS CLI inherits the caller's configuration,
+including endpoint overrides and credential helpers. Trust and verify that
+configuration; the runner does not attest which endpoint answered.
+
+These calls do not prove runtime read/write permissions, wrong-owner denial,
+credential expiry or refresh, presigned transfers, deployment topology, or
+real-S3 recovery. No bucket or repository is created by these checks.
+
+## 4. Rehearse locally and preserve evidence
+
+Use a clean committed checkout and keep rehearsal files outside it. For a local
+build, use the repository's pinned Go version:
 
 ```sh
 mise install
-export REHEARSAL=$(mktemp -d "$HOME/openstorage-acceptance.XXXXXX")
-chmod 700 "$REHEARSAL"
-mise exec -- go build -o "$REHEARSAL/openstorage" ./cmd/openstorage
-"$REHEARSAL/openstorage" keygen --out "$REHEARSAL/org"
-# In a dedicated terminal; stop this process with Ctrl-C after the smoke.
-OPENSTORAGE_ORG=acceptance OPENSTORAGE_ORG_PUBKEYS="$REHEARSAL/org.pub.pem" \
-  OPENSTORAGE_BASE_URL=http://127.0.0.1:18080 \
-  "$REHEARSAL/openstorage" serve --listen 127.0.0.1:18080 \
-  --data-dir "$REHEARSAL/data"
+export REHEARSAL=$(mktemp -d "$HOME/openstorage-preflight.XXXXXX")
+GOROOT=$(mise where go)
+export GOROOT
+"$GOROOT/bin/go" build -o "$REHEARSAL/openstorage" ./cmd/openstorage
+"$REHEARSAL/openstorage" version
+git rev-parse HEAD
+sha256sum "$REHEARSAL/openstorage"
+python3 -m unittest discover -s scripts -p test_aws_launch_qualification.py -v
 ```
 
-In another terminal, create the JSON from section 2 with `topology: "local"`,
-`endpoint: "http://127.0.0.1:18080"`, `replica_urls: []`, and no `aws` field.
-Use `git rev-parse HEAD` for the candidate commit, `sha256sum` of the built
-executable, and the paths printed/selected above. Run offline preflight first,
-then `--smoke`. Assert `status` is passed, no scenario failed, cleanup is
-`soft_deleted`, and `launch_qualified` is false. Stop the owned server before
-removing the private rehearsal directory; retain only sanitized evidence.
+Use those local values in the JSON, omit `aws`, and run section 2. Check for two
+passed scenarios, six skips, no failures, and `launch_qualified: false`. A wrong
+checksum must fail before execution; `--smoke` must be rejected. Unit tests use
+local fixtures for AWS calls; they do not establish AWS permissions or behavior.
+Capture a screenshot **and** video of the actual invocation and results, plus
+the two evidence files. Review them for secrets before publication. Use `gh`
+2.99+ `--attach` for images and video; never record environment or credential dumps.
 
-Capture a screenshot **and** video of the actual invocation and result, plus
-`runner.log` and `result.json`. Review evidence for secrets before publication.
-Use `gh` 2.99+ `--attach` for images/video on the implementation PR. Never
-record a terminal printing environment values, mint output, or Terraform state.
-
-## 5. Complete the separate cloud gate
-
-The fixed result inventory makes missing evidence visible; this slice does not
-provide commands that fault or control cloud infrastructure. The campaign owner
-must add and verify these evidence sets on the **same pinned candidate**:
-
-| Required evidence | Acceptance oracle |
-|---|---|
-| Deployment | In-region EC2 identity, both standard replicas, separate experimental node, artifact/provenance match on every node. |
-| Temporary credentials | Valid temporary session succeeds; invalid key/secret, absent/forged/expired session tokens fail. Record safe error classes, never credential values. |
-| Refresh | The running service survives real role-session refresh and still reads acknowledged Git/LFS data; initial temporary-key success alone is insufficient. |
-| IAM and owner | Each deliberately denied operation fails; mismatched expected owner fails. A successful HeadBucket is not proof of all runtime owner checks. |
-| Presigned transfers | Valid GET/PUT works; tampered signature fails and rejected PUT leaves no accepted bytes. |
-| Contention/recovery | Concurrent writes have consistent acknowledged refs; cold-cache restart, interrupted push, and recovery retain every acknowledged commit and LFS object. |
-| S3WAL | Existing external CAS qualification plus lease/restart drills on real S3; record failed, skipped, and record-only surfaces, not just a green exit. |
-| Cleanup | Reference teardown succeeds; resource and data inventory confirms deletion or explicitly approved retention. |
-
-The [external blob tests](../reference/testing.md#the-floci-s3-lane) and
-`TestQualifyExternalEndpoint` in `internal/ref/s3wal` already accept real S3.
-They mutate scratch keys and require separate execution authorization. Run them
-from the pinned source and preserve the full case census; package-test success
-is not evidence that the deployed binary was tested. The existing githttp
-`TestMain` builds its own binaries and backends, so do not relabel its emulator
-lease/restart runs as deployed-RC AWS tests.
-
-Coordinate shared session evidence with
-[#192](https://github.com/coder/openstorage/issues/192) (S3WAL promotion) and
-[#182](https://github.com/coder/openstorage/issues/182) (performance), without
-changing their criteria. The #182 packet prepares three paired, sequential
-single-writer runs: 20 warmups and 60 measured pushes per lane per pair (480
-pushes plus six seed pushes and setup/final reads). Approve that traffic and
-its separate diagnostic traffic within the shared request/time/spend limits.
-Keep this comparison separate from two-replica acceptance. Local performance
-windows are not AWS proof; re-pin the eventual candidate and rerun applicable
-gates before cloud execution. Starvation, separate-day repetition, and support
-promotion remain #192-owned.
-
-EKS is a follow-up unless the launch claims Kubernetes support; such a claim
-requires workload identity, ingress/TLS, replacement, and rollout evidence.
-Keep #222 open until the cloud criteria, publication of
-sanitized evidence and deployment limits, and verified teardown are complete.
+The separate #222 campaign still needs approved in-region deployment, exact
+candidate provenance, live API/Git/LFS coverage, AWS credential and IAM negative
+cases, recovery evidence, and published deployment limits. The
+[AWS EC2 reference](deploy-aws-terraform.md) is a separate deployment path, not
+this runner's input contract. S3WAL promotion remains
+[#192](https://github.com/coder/openstorage/issues/192)-owned. Keep #222 open until
+its full acceptance criteria are met; this guide does not authorize cloud work.

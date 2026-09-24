@@ -22,7 +22,7 @@ New here? Start with the [README quickstart](../README.md#quickstart-local-mode-
 - [Deploy a two-replica stack with Docker Compose](how-to/deploy-docker-compose.md)
 - [Deploy to production](how-to/deploy-production.md)
 - [Deploy the AWS EC2 reference (Terraform)](how-to/deploy-aws-terraform.md)
-- [Prepare AWS launch acceptance](how-to/aws-launch-qualification.md)
+- [Run artifact and read-only AWS preflight](how-to/aws-launch-qualification.md)
 - [Migrate to open.storage](how-to/migrate-to-openstorage.md)
 
 **Operate**
