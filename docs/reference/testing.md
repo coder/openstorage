@@ -60,9 +60,9 @@ published manifest does not prove runtime qualification):
 On every pin change:
 
 1. Compare the REQUIRE-mode qualification and the probe-refusal checks
-   (`TestProbeRefusesNonCompliantStore`, plus the opt-in
-   [legacy MinIO lane](#legacy-minio-lane-opt-in) on a host that holds its
-   image) without changing their assertions.
+   (`TestProbeRefusesNonCompliantStore` and `TestQualifyLegacyMinIOStub`,
+   plus the opt-in [legacy MinIO lane](#legacy-minio-lane-opt-in) on a host
+   that holds its image) without changing their assertions.
 2. Keep volume capacity for every bucket, including backup and restore. The
    readiness helper requires `HeadBucket` plus a scratch PUT/DELETE; a health
    response does not prove volumes accept writes.
@@ -98,11 +98,29 @@ OPENSTORAGE_TEST_MINIO_LEGACY=1 go test ./internal/ref/s3wal \
 ```
 
 The host needs a local copy of that exact image digest, so a fresh machine
-cannot run the lane. Maintainers run it on SeaweedFS pin changes (step 1 above)
-and on changes to the s3wal probe or CAS error classification. The per-PR lane
-still covers the defect this store showed, ignored `If-None-Match: *` creation,
-without Docker: `TestProbeRefusesNonCompliantStore` requires the probe to refuse
-such a store at step 2.
+cannot run the lane. As of 2026-09-24 the image survives only in one
+maintainer's private Docker cache. Nothing is published, and if that cache is
+lost the lane can no longer run. A maintainer who holds the image runs the lane
+on SeaweedFS pin changes (step 1 above) and on changes to the s3wal probe or CAS
+error classification. It remains the byte-exact historical qualification
+against the real store.
+
+Default CI guards this lane's record-mode classification without Docker or
+external network access ([#310](https://github.com/coder/openstorage/issues/310)):
+
+- `TestQualifyLegacyMinIOStub` runs the surfaces that send conditional headers
+  in record mode against an in-memory stub. The stub models the behavior this
+  lane recorded: it ignores `If-None-Match: *` on PUT and honors `If-Match` and
+  GET `If-None-Match`. The test requires the lane's recorded verdict rows:
+  `ignores` for `gocloud-ifnotexist`, `conditional-create-duplicate`, and probe
+  step 2, `not-reached` for probe steps 3–5, and `pass` for the rest. A
+  compliant control run of the same stub must pass every row.
+- `TestProbeRefusesNonCompliantStore` requires the probe to refuse a store that
+  ignores `If-None-Match: *` creation at step 2.
+
+The stub is not the real store. It models only the recorded behavior on those
+surfaces. The other surfaces recorded `pass` on MinIO and take the same
+classification branches in the SeaweedFS lane.
 
 ### Private SeaweedFS log capture
 
