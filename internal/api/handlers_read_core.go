@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -799,7 +800,8 @@ type listFilesMetadataResponse struct {
 // recursive (the `recursive` flag is accepted for symmetry, openapi), each
 // page entry annotated with the last commit touching it, commit details
 // deduplicated into the `commits` map. Unborn branch -> 404 (invariant 3).
-// The per-path `git log -1` is O(page) subprocesses — accepted for p3.
+// The per-path `git log -1` is O(page) subprocesses — accepted for p3 —
+// plus one `git rev-list --topo-order` walk per page for the `order` ranks.
 func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -866,6 +868,22 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 			Date:    last[0].AuthorDate.UTC().Format(time.RFC3339),
 			Message: strings.TrimRight(last[0].Message, "\n"),
 		}
+	}
+	// openapi (#292): `order` is the topological rank relative to the
+	// resolved ref, from ONE walk per page (gitread.TopoRanks documents the
+	// tie-break). Ranks are relative to commit, not to the page, so they
+	// agree across pages of the same listing.
+	ranks, err := gitread.TopoRanks(r.Context(), repoPath, commit, slices.Collect(maps.Keys(commitsMap)))
+	if err != nil {
+		s.internalErr(w, r, "topological commit order", err)
+		return
+	}
+	for sha, c := range commitsMap {
+		rank, ok := ranks[sha]
+		// TopoRanks errors instead of omitting a wanted commit.
+		assertf(ok, "files/metadata: no topo rank for %s", sha)
+		c.Order = rank
+		commitsMap[sha] = c
 	}
 	next := ""
 	if hasMore {
