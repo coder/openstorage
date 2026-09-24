@@ -1,43 +1,31 @@
 # open.storage
 
-**API-first Git storage you can self-host.**
+**Self-hosted, API-first Git storage.**
 
-Git storage for your applications, on infrastructure you control. Build applications
-and tools that create repositories, read and write files, and manage branches and
-merges through an HTTP API. Ordinary Git clients can use the same repositories.
+Create repositories, commit files, and merge branches over HTTP. Clone the same
+repositories with plain `git`. Run one binary on SQLite and local files, or a fleet
+of replicas on Postgres and S3. The code.storage SDKs work against it, with
+[documented differences](docs/explanation/wire-compatibility.md).
 
-Run locally with SQLite and files, or deploy multiple server nodes backed by Postgres
-and S3-compatible storage. The code.storage SDKs can connect to it, with
-[documented compatibility differences](docs/explanation/wire-compatibility.md).
+[Install](#install) · [Quickstart](#quickstart) · [API reference](docs/reference/http-api.md) · [Docs](docs/README.md)
 
-[Install](#install) · [Try locally](#quickstart-local-mode-60-seconds) · [API reference](docs/reference/http-api.md)
+## Features
 
-## Write with the API, clone with Git
-
-Complete **Try locally** below, then keep the server running and use `$TOKEN` in the
-same shell. Commit `hello.txt` through the API and read it from a new clone:
-
-```sh
-curl --fail-with-body -sS http://127.0.0.1:8080/api/v1/repos/commit-pack \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/x-ndjson' -H 'Accept: application/json' \
-  --data-binary @- <<'NDJSON'
-{"metadata":{"target_branch":"main","commit_message":"Add greeting","author":{"name":"Demo","email":"demo@example.com"},"files":[{"path":"hello.txt","content_id":"greeting","operation":"upsert"}]}}
-{"blob_chunk":{"content_id":"greeting","data":"SGVsbG8gZnJvbSB0aGUgQVBJIQo=","eof":true}}
-NDJSON
-git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git" demo-from-api
-cat demo-from-api/hello.txt  # Hello from the API!
-```
-
-The API accepts file operations as [NDJSON metadata and content chunks](docs/explanation/streaming-commit-protocols.md).
-SDKs handle the framing. With an HTTP client such as curl, send the frames directly
-as shown above.
+- **Repository API:** files, commits, branches, tags, diffs, blame, search, archives,
+  merges, and restores over [HTTP](docs/reference/http-api.md).
+- **Git remote:** clone, fetch, push, and [Git LFS](docs/explanation/git-protocol-and-namespaces.md)
+  on the same repositories, with ref policies and optional signed-commit checks.
+- **Integrations:** signed [webhooks](docs/reference/webhooks.md), forks, and upstream
+  sync. On SQLite and S3-only storage, Git pushes do not trigger upstream sync; API
+  writes and explicit sync requests do.
+- **Access control:** organization-signed JWTs with repository scopes. One organization
+  per deployment ([authentication](docs/reference/authentication.md)).
+- **Operations:** rate limits, per-repository pack quotas, orphan sweeping, and
+  repacking ([storage lifecycle](docs/how-to/storage-lifecycle-and-sweeping.md)).
 
 ## Install
 
-[Release downloads](https://github.com/coder/openstorage/releases) include Linux and
-macOS binaries for amd64 and arm64, plus `checksums.txt`. Install a release with mise,
-or build with Go 1.27.1 or newer:
+Install a release binary with mise, or build from source with Go 1.27.1 or newer:
 
 ```sh
 # Install a release binary:
@@ -50,33 +38,24 @@ go install ./cmd/openstorage
 openstorage version
 ```
 
-The repository and release downloads currently require Coder organization access.
-See [authenticated installation](CONTRIBUTING.md#authenticated-installation) for the
-required GitHub credentials and Go settings. To build from a checkout, see
-[contributing](CONTRIBUTING.md#build-and-run). The quickstarts assume `openstorage` is
-on your `PATH`.
+- **Access:** the repository and releases currently require Coder organization access.
+  See [authenticated installation](CONTRIBUTING.md#authenticated-installation), or
+  [build and run](CONTRIBUTING.md#build-and-run) from a checkout.
+- **Releases:** [Linux and macOS binaries](https://github.com/coder/openstorage/releases)
+  for amd64 and arm64, plus `checksums.txt`.
+- **Runtime dependencies:** the server needs `git`. Signed-commit ref policies also
+  need `gpg` or `ssh-keygen` for the relevant signature type. The Docker image includes all three; the binary does not.
 
-**Runtime dependencies:** install `git` on the server. Ref policies that verify
-commit signatures also require `gpg` or `ssh-keygen` for the relevant signature type.
-The repository's Docker image includes all three; a standalone binary does not.
+<a name="quickstarts"></a>
 
-## Quickstarts
-
-Start with **Try locally** (recommended). For a container-only server setup, follow
-[Try with Docker only](docs/how-to/quickstart-docker.md): one local-mode server,
-persistent named volumes, and no host Go or `openstorage` binary. It uses an explicit
-local image build, not a published download. Expand a section below for other setups.
+## Quickstart
 
 <a name="quickstart-local-mode-60-seconds"></a>
 
-<details>
-<summary>Try locally (recommended): SQLite + files</summary>
+### Try locally: SQLite + files
 
-Run the `openstorage` binary ([install](#install)) with git installed; the commands
-below also use curl. No database or object-storage service required. One flag derives
-the whole storage stack:
-`sqlite://<dir>/codestorage.db` (refs + metadata), `file://<dir>/blobs` (packs as plain
-files), and `<dir>/cache` (rebuildable cache).
+You need `openstorage` on your `PATH`, `git`, and `curl`. No database or object
+store required.
 
 ```sh
 # 1. Generate an org keypair (keys are never committed).
@@ -101,23 +80,57 @@ cd demo && git -c user.name=demo -c user.email=demo@example.com \
   commit --allow-empty -m init && git push origin HEAD:main
 ```
 
-Explicit `OPENSTORAGE_PG_URL`, `OPENSTORAGE_S3_URL`, and `--cache-dir` settings take
-precedence over paths derived from `--data-dir`. Local mode runs as a
-[single node](docs/adr/013-local-mode-is-intentionally-single-node.md).
-Data persists across restarts.
+`--data-dir` derives the whole storage stack:
 
-</details>
+| Path | Holds |
+|---|---|
+| `sqlite://<dir>/codestorage.db` | Refs and metadata |
+| `file://<dir>/blobs` | Git packs, as plain files |
+| `<dir>/cache` | Rebuildable cache |
+
+Data persists across restarts. Explicit `OPENSTORAGE_PG_URL`, `OPENSTORAGE_S3_URL`, and
+`--cache-dir` settings override the derived paths. Local mode runs as a
+[single node](docs/adr/013-local-mode-is-intentionally-single-node.md).
+
+### Write with the API, clone with Git
+
+Keep the server running. In the same shell, commit `hello.txt` through the API and
+read it from a fresh clone:
+
+```sh
+curl --fail-with-body -sS http://127.0.0.1:8080/api/v1/repos/commit-pack \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/x-ndjson' -H 'Accept: application/json' \
+  --data-binary @- <<'NDJSON'
+{"metadata":{"target_branch":"main","commit_message":"Add greeting","author":{"name":"Demo","email":"demo@example.com"},"files":[{"path":"hello.txt","content_id":"greeting","operation":"upsert"}]}}
+{"blob_chunk":{"content_id":"greeting","data":"SGVsbG8gZnJvbSB0aGUgQVBJIQo=","eof":true}}
+NDJSON
+git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git" demo-from-api
+cat demo-from-api/hello.txt  # Hello from the API!
+```
+
+The API takes file operations as [NDJSON metadata and content chunks](docs/explanation/streaming-commit-protocols.md).
+SDKs handle this framing for you; with curl, you send the frames yourself.
+
+### Other setups
+
+| Setup | Use it to | Guide |
+|---|---|---|
+| Docker only | Run one local-mode server with persistent volumes and no host Go or binary. Builds the image locally. | [Try with Docker only](docs/how-to/quickstart-docker.md) |
+| Two replicas | See two nodes share Postgres and SeaweedFS. | [Below](#quickstart-multi-node-with-docker-compose) |
+| One S3 bucket | Keep all durable state in one bucket. Experimental, single node. | [Below](#quickstart-zero-infrastructure-mode-one-bucket-experimental) |
 
 <a name="quickstart-multi-node-with-docker-compose"></a>
 
 <details>
-<summary>Explore multiple nodes: Docker Compose with Postgres + SeaweedFS</summary>
+<summary><b>Two replicas: Docker Compose with Postgres + SeaweedFS</b></summary>
 
-This Docker Compose stack runs two stateless server replicas (`node-a`, `node-b`)
-built from the repo `Dockerfile`. They share Postgres and SeaweedFS, so a push through
-one node is visible through the other. It is a **development stack** with default
-credentials, published backing-service ports, and plain HTTP. For deployment beyond
-local development, follow the [production guide](docs/how-to/deploy-production.md).
+Two stateless replicas (`node-a`, `node-b`), built from the repo `Dockerfile`, share
+Postgres and SeaweedFS. A push through one node is visible through the other.
+
+> [!WARNING]
+> This is a development stack: default credentials, published backing-service ports,
+> and plain HTTP. For real deployments, follow the [production guide](docs/how-to/deploy-production.md).
 
 ```sh
 # 1. Generate keys on the host from this checkout (requires openstorage; see Install).
@@ -146,24 +159,23 @@ curl -s http://127.0.0.1:8082/api/repos/demo -H "Authorization: Bearer $TOK_GIT"
 docker compose --profile replicas down -v
 ```
 
-Override host ports and key locations with `PGPORT`, `S3PORT`, `NODEA_PORT`,
-`NODEB_PORT`, and `CS_KEYS_DIR`, as listed in the
-[`docker-compose.yml`](docker-compose.yml) header.
-To run the server on the host against just the backing services, boot them with plain
-`docker compose up -d --wait` and point `OPENSTORAGE_PG_URL` / `OPENSTORAGE_S3_URL` at the
-published ports ([configuration reference](docs/reference/configuration.md)).
+- Override host ports and key locations with `PGPORT`, `S3PORT`, `NODEA_PORT`,
+  `NODEB_PORT`, and `CS_KEYS_DIR` (see the [`docker-compose.yml`](docker-compose.yml) header).
+- To run the server on the host instead, start only the backing services with
+  `docker compose up -d --wait`, then point `OPENSTORAGE_PG_URL` and `OPENSTORAGE_S3_URL`
+  at the published ports ([configuration reference](docs/reference/configuration.md)).
 
 </details>
 
 <a name="quickstart-zero-infrastructure-mode-one-bucket-experimental"></a>
 
 <details>
-<summary>Use one S3 bucket (experimental, single node)</summary>
+<summary><b>One S3 bucket (experimental, single node)</b></summary>
 
-The **experimental, single-node** `s3wal://` backend uses S3-only storage: one
-S3-compatible bucket holds all durable state. No Postgres, SQLite file, or durable
-local disk is required. Refs and metadata live in
-conditional-CAS objects under the bucket's `_wal/` prefix, next to the packs:
+The **experimental, single-node** `s3wal://` backend keeps all durable state in one
+S3-compatible bucket: no Postgres, no SQLite file, no durable local disk. Refs and
+metadata live in conditional-CAS objects under the bucket's `_wal/` prefix, next to
+the packs.
 
 ```sh
 # 1. Start an S3-compatible service for this example (SeaweedFS).
@@ -194,29 +206,30 @@ git -c user.name=demo -c user.email=demo@example.com commit --allow-empty -m ini
 git push origin HEAD:main
 ```
 
-Stop the process with plain `kill` (`SIGTERM`) and verify it and all hook/maintenance
-writers exited. Lease release is best effort: even graceful shutdown can leave a
-lease behind. After a hard stop or failed release, keep old writers fenced and
-allow at least the **holder's recorded TTL plus 2s** after confirmed stop (default
-TTL 2m), then follow the runbook below before starting one replacement. A corrupt
-or unjudgeable lease requires fenced investigation, not repeated starts. Never
-manually delete the lease or edit `_wal/` to skip the wait or make startup pass.
-Once stopped, the cache can be discarded; a fresh node reconstructs service from
-the stored data.
+**Stopping and restarting.** Stop with plain `kill` (`SIGTERM`), then confirm the
+process and all hook and maintenance writers have exited. Once stopped, you can
+discard the cache; a fresh node rebuilds from the bucket.
 
-This mode is single-node: ref updates within each repository group share one
-compare-and-swap point, so concurrent pushes serialize there. The
-[shutdown/restart guide](docs/how-to/deploy-production.md#s3wal-shutdown-and-restart)
-has the full lease and crash-recovery runbook, and
-[the storage engine](docs/explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal)
-explains what changes underneath.
+> [!WARNING]
+> Shutdown releases the instance lease on a best-effort basis, so a lease can remain
+> even after a clean stop. After a hard stop or failed release:
+>
+> 1. Keep old writers fenced.
+> 2. Wait at least the **holder's recorded TTL plus 2s** after the confirmed stop (default TTL 2m).
+> 3. Follow the [shutdown and restart runbook](docs/how-to/deploy-production.md#s3wal-shutdown-and-restart), then start exactly one replacement.
+>
+> A corrupt or unjudgeable lease needs fenced investigation, not repeated starts.
+> Never delete the lease or edit `_wal/` by hand to skip the wait or to make startup pass.
+
+This mode is single-node. Ref updates within a repository group share one
+compare-and-swap point, so concurrent pushes serialize. See [the storage engine](docs/explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal)
+for what changes underneath.
 
 </details>
 
-## Architecture at a glance
+<a name="architecture-at-a-glance"></a>
 
-For deployments with multiple server nodes, Postgres holds refs and metadata, and
-S3-compatible storage holds immutable Git packs:
+## How it works
 
 ```mermaid
 flowchart TB
@@ -237,91 +250,82 @@ flowchart TB
     node --> packs
 ```
 
-Pack data is published before refs advance through compare-and-swap. Server nodes
-share the durable stores and keep rebuildable local caches, so clients can use any
-replica. Local mode substitutes SQLite and files and supports one server process.
-Experimental [S3-only storage](#quickstart-zero-infrastructure-mode-one-bucket-experimental)
-puts refs, metadata, and packs in one bucket and also supports only one server process.
-See the [storage engine](docs/explanation/storage-engine.md) for concurrency, durability,
-and recovery details.
+- **Postgres** holds refs and metadata. **S3-compatible storage** holds immutable Git packs.
+- Packs are published before refs advance through compare-and-swap.
+- Replicas share the durable stores and keep only rebuildable local caches, so clients
+  can use any replica.
+- Local mode (SQLite + files) and experimental [S3-only storage](#quickstart-zero-infrastructure-mode-one-bucket-experimental)
+  each support one server process.
 
-## Features
-
-- **Read and write repositories:** files, commits, branches, tags, diffs, blame, search,
-  archives, merges, and restores through the [HTTP API](docs/reference/http-api.md).
-- **Use Git clients:** clone, fetch, push, and [Git LFS](docs/explanation/git-protocol-and-namespaces.md)
-  on the same remote, with ref policies and optional signed-commit verification.
-- **Connect workflows:** signed [webhooks](docs/reference/webhooks.md), repository forks,
-  and upstream synchronization. On SQLite and S3-only storage, Git pushes do not
-  automatically schedule upstream sync; API writes and explicit sync requests do.
-- **Control access:** organization-signed JWTs with repository scopes and ref policies.
-  Each deployment serves **one organization**; see [authentication](docs/reference/authentication.md).
-- **Operate the storage:** rate limits, per-repository pack quotas, orphan sweeping,
-  and repacking. Use the [deployment guide](docs/how-to/deploy-production.md) and
-  [storage operations guide](docs/how-to/storage-lifecycle-and-sweeping.md) before
-  exposing a service beyond the quickstart.
+The [storage engine](docs/explanation/storage-engine.md) page covers concurrency,
+durability, and recovery.
 
 ## Compatibility with code.storage
 
-open.storage implements the storage API used by [code.storage](https://code.storage),
-Pierre Computer Company's Git storage service. Its TypeScript, Python, and Go SDKs
-can target this backend through their API and storage base-URL settings.
+open.storage implements the storage API of [code.storage](https://code.storage),
+Pierre Computer Company's Git storage service. Point its TypeScript, Python, or Go SDK
+at this backend with the SDK's API and storage base-URL settings.
 
-Compatibility covers the storage surface, with [documented differences](docs/explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)
-in endpoint behavior, ephemeral namespaces, and upstream forwarding. Account management,
-billing, a web UI, and a multi-tenant control plane are outside this project's scope.
-Review the [compatibility guide](docs/explanation/wire-compatibility.md) for your integration.
+- **Covered:** the storage surface, with [documented differences](docs/explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)
+  in endpoint behavior, ephemeral namespaces, and upstream forwarding.
+- **Out of scope:** account management, billing, a web UI, and a multi-tenant control plane.
+
+Check the [compatibility guide](docs/explanation/wire-compatibility.md) against your integration.
 
 ## Configuration
 
-Configure the organization and signing keys with `OPENSTORAGE_ORG` and
-`OPENSTORAGE_ORG_PUBKEYS`. Use `--data-dir` / `OPENSTORAGE_DATA_DIR` for local mode,
-or `OPENSTORAGE_PG_URL` and `OPENSTORAGE_S3_URL` to select backing stores.
+| Setting | Purpose |
+|---|---|
+| `OPENSTORAGE_ORG`, `OPENSTORAGE_ORG_PUBKEYS` | Organization name and its public signing keys |
+| `--data-dir` / `OPENSTORAGE_DATA_DIR` | Local mode: derive all storage from one directory |
+| `OPENSTORAGE_PG_URL`, `OPENSTORAGE_S3_URL` | Select the ref/metadata store and the pack store |
 
-The [configuration reference](docs/reference/configuration.md) covers defaults, limits,
-and background jobs; the [CLI reference](docs/reference/cli.md) covers commands and flags.
+Everything else: [configuration reference](docs/reference/configuration.md) (defaults,
+limits, background jobs) and [CLI reference](docs/reference/cli.md) (commands and flags).
 
 ## Documentation
 
-| Task | Start here |
+| I want to… | Start here |
 |---|---|
-| Try it | [Quickstarts](#quickstarts) |
+| Try it | [Quickstart](#quickstart) |
 | Build an integration | [HTTP API](docs/reference/http-api.md) · [Authentication](docs/reference/authentication.md) · [Streaming writes](docs/explanation/streaming-commit-protocols.md) |
-| Deploy and operate | [Deployment](docs/how-to/deploy-production.md) · [Configuration](docs/reference/configuration.md) · [Storage lifecycle](docs/how-to/storage-lifecycle-and-sweeping.md) |
+| Deploy and operate | [Production deployment](docs/how-to/deploy-production.md) · [Configuration](docs/reference/configuration.md) · [Storage lifecycle](docs/how-to/storage-lifecycle-and-sweeping.md) |
 | Understand the design | [Storage engine](docs/explanation/storage-engine.md) · [Compatibility](docs/explanation/wire-compatibility.md) · [Architecture decisions](docs/adr/README.md) |
 | Find everything else | [Documentation index](docs/README.md) |
 
-## Contributing & testing
+Before exposing a service beyond the quickstart, read the
+[deployment guide](docs/how-to/deploy-production.md) and the
+[storage lifecycle guide](docs/how-to/storage-lifecycle-and-sweeping.md).
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for building from source, test commands, and
-review requirements. The [testing reference](docs/reference/testing.md) describes
-local, Postgres, and S3-only test lanes and the simulation harness.
+<a name="contributing--testing"></a>
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers building from source, tests, and the review
+bar. The [testing reference](docs/reference/testing.md) describes the local, Postgres,
+and S3-only test lanes and the simulation harness.
 
 <details>
 <summary>Repository layout</summary>
 
 | Path | Contents |
 |---|---|
-| `docs/` | Documentation organized by [Diátaxis](https://diataxis.fr/) quadrant. Start at the [index](docs/README.md). |
-| `docs/reference/` | Reference: configuration, CLI, testing, HTTP API, auth, webhooks |
-| `docs/explanation/` | Explanation: storage engine, wire compatibility, domain model, protocols |
-| `docs/adr/` | Standalone architecture decision records (ADR-1..46) |
-| `docs/archive/` | Historical roadmap + per-phase implementation notes |
 | `cmd/openstorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
 | `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
-| `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
+| `internal/auth` | JWT verification (per-org public keys, allowed algorithms) |
 | `internal/meta` | Metadata store: orgs, org public keys, repos, webhooks, git credentials, upstream links |
 | `internal/blob` | `BlobStore` contract + S3 and local-file implementations (immutable packs) |
 | `internal/ref` | `RefStore` contract + Postgres, SQLite, and s3wal implementations (CAS ref authority) |
 | `internal/gitread` | Read-side git plumbing (ls-tree, log, diff, blame, grep, archive) over the hydrated cache repo |
-| `internal/githttp` | Git smart-HTTP server + LFS batch API, policy/verify-sig hooks, cache hydration, e2e suite |
+| `internal/githttp` | Git smart-HTTP + LFS batch API, policy/verify-sig hooks, cache hydration, e2e suite |
 | `internal/events` | Outbound webhooks: HMAC-signed delivery + the push-event `RefStore` decorator |
 | `internal/sync` | Upstream mirror sync worker (fetch + loopback push), credential/upstream contracts |
-| `internal/jobs` | Background queue seam: durable River jobs (Postgres) or in-process (local mode) |
-| `docker-compose.yml` | Postgres + SeaweedFS for local dogfooding, plus an opt-in two-replica `replicas` profile |
+| `internal/jobs` | Background queue: durable River jobs (Postgres) or in-process (local mode) |
+| `docs/` | Documentation by [Diátaxis](https://diataxis.fr/) quadrant; start at the [index](docs/README.md) |
+| `docker-compose.yml` | Postgres + SeaweedFS for local development, plus an opt-in two-replica `replicas` profile |
 
 </details>
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+[Apache License 2.0](LICENSE).
