@@ -39,6 +39,9 @@ import (
 // Store image pins. SeaweedFS is the self-hosted store of record (plan
 // §5-R7); the MinIO pin is the repo's legacy CI image, kept in the
 // qualification matrix only to document its conditional-write behavior.
+// Upstream withdrew its community MinIO images and binaries (issue #304), so
+// the MinIO pin only resolves on hosts that still hold this exact digest;
+// its lane is opt-in (OPENSTORAGE_TEST_MINIO_LEGACY in internal/ref/s3wal).
 const (
 	SeaweedFSImage   = "chrislusf/seaweedfs:4.47"
 	MinIOLegacyImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z@sha256:4c4a4876193f030c81f57aabb22bcb9a73462010eb61fcab66908e03e5484af8"
@@ -141,14 +144,15 @@ func StartFloci(tb testing.TB) string {
 	return fmt.Sprintf("http://%s:%s", host, port.Port())
 }
 
-// StartMinIOLegacy runs the repo's legacy MinIO CI pin exactly like
-// internal/blob/minio_test.go does.
+// StartMinIOLegacy runs the repo's legacy MinIO CI pin with the
+// testcontainers MinIO module defaults. The image can no longer be pulled
+// from quay.io or Docker Hub (issue #304): a missing local copy fails here.
 func StartMinIOLegacy(tb testing.TB) (endpoint, user, pass string) {
 	tb.Helper()
 	ctx := context.Background()
 	minioC, err := tcminio.Run(ctx, MinIOLegacyImage)
 	if err != nil {
-		tb.Fatalf("start minio container: %v", err)
+		tb.Fatalf("start minio container %s (upstream withdrew it, issue #304; this host needs a local copy of that exact digest): %v", MinIOLegacyImage, err)
 	}
 	tb.Cleanup(func() { _ = minioC.Terminate(context.Background()) })
 	addr, err := minioC.ConnectionString(ctx)

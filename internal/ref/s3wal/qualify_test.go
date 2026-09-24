@@ -8,7 +8,9 @@
 //
 // Lanes: SeaweedFS (the decided self-hosted store, §5-R7 — REQUIRED to
 // pass), the legacy MinIO CI pin (RECORD mode: non-compliance is a finding
-// logged as a structured verdict, never a test failure), and an external
+// logged as a structured verdict, never a test failure; opt-in via
+// OPENSTORAGE_TEST_MINIO_LEGACY=1 since upstream withdrew the image, issue
+// #304), and an external
 // endpoint gated on OPENSTORAGE_TEST_S3WAL_URL (required to pass when
 // opted in). Deterministic stub-server tests prove the probe refuses
 // non-compliant stores and pin the §2.3 CAS error taxonomy without Docker.
@@ -821,14 +823,67 @@ func TestQualifySeaweedFS(t *testing.T) {
 	runQualification(t, e, true)
 }
 
+// EnvTestMinIOLegacy opts in to TestQualifyMinIOLegacy. Upstream withdrew
+// its community MinIO images and binaries (issue #304), so default CI cannot
+// pull s3waltest.MinIOLegacyImage and the lane only runs when requested on
+// a host that still holds that exact digest (docs/reference/testing.md).
+const EnvTestMinIOLegacy = "OPENSTORAGE_TEST_MINIO_LEGACY"
+
+// minIOLegacyLaneRequested parses EnvTestMinIOLegacy strictly: unset or
+// empty means not requested, "1" means requested, and any other value is
+// an error so a typo can never silently skip a requested lane.
+func minIOLegacyLaneRequested(value string) (bool, error) {
+	switch value {
+	case "":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s=%q: set it to 1 to run the legacy MinIO lane, or leave it unset", EnvTestMinIOLegacy, value)
+	}
+}
+
+func TestMinIOLegacyLaneRequested(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    bool
+		wantErr bool
+	}{
+		{"", false, false},
+		{"1", true, false},
+		{"0", false, true},
+		{"true", false, true},
+		{" 1", false, true},
+		{"yes", false, true},
+	} {
+		got, err := minIOLegacyLaneRequested(tc.value)
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("minIOLegacyLaneRequested(%q) = %v, %v; want %v, error %v", tc.value, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
 // TestQualifyMinIOLegacy is the record-mode lane for the old MinIO CI pin:
 // its behavior — compliant or not — is a documented finding for the §5-R7
 // matrix, never a test failure. Infrastructure/harness errors (verdictError)
 // still fail: they mean a surface produced no verdict, so the matrix row
 // would be incomplete, not a finding.
+//
+// The lane is opt-in (EnvTestMinIOLegacy, issue #304). Once requested it
+// fails loudly: a missing image, missing Docker, -short, or an incomplete
+// verdict set is a test failure, never a skip. Default CI does not run real
+// MinIO; the deterministic probe-refusal coverage for the same defect class
+// (ignored If-None-Match: *) is TestProbeRefusesNonCompliantStore.
 func TestQualifyMinIOLegacy(t *testing.T) {
+	requested, err := minIOLegacyLaneRequested(envconfig.Getenv(EnvTestMinIOLegacy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !requested {
+		t.Skipf("legacy MinIO lane is opt-in: upstream withdrew the image (issue #304); set %s=1 on a host holding %s", EnvTestMinIOLegacy, s3waltest.MinIOLegacyImage)
+	}
 	if testing.Short() {
-		t.Skip("minio qualification needs docker")
+		t.Fatalf("%s=1 requests the legacy MinIO lane, which needs Docker; drop -short", EnvTestMinIOLegacy)
 	}
 	endpoint, user, pass := startMinIOLegacy(t)
 	raw := rawS3Client(t, endpoint, "us-east-1", user, pass)

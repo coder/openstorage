@@ -102,7 +102,8 @@ authority capabilities.
 The [qualification harness](../../internal/ref/s3wal/qualify_test.go) fails non-pass
 verdicts in require mode; the legacy MinIO record-mode lane records incompatibilities
 without certifying the endpoint. A green test job does not mean every recorded store
-passed.
+passed. That MinIO lane is [opt-in](../reference/testing.md#legacy-minio-lane-opt-in)
+because upstream withdrew its image, so default CI does not run real MinIO.
 
 **Conditional policy, not promotion.** AWS S3 and SeaweedFS are the intended future
 promotion targets for [#192 G1](https://github.com/coder/openstorage/issues/192), subject
