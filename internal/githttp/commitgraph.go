@@ -99,29 +99,91 @@ var commitGraphGit = "git"
 // of its own budget (as opposed to the request or the shared deadline).
 var errCommitGraphBudget = errors.New("commit-graph attempt budget expired")
 
+// commitGraphOutcome is how one refresh ended. The set is fixed (it is
+// the log contract in docs/how-to/deploy-production.md, "Commit-graph
+// refresh", and the label set of a future
+// commit_graph_refresh_total{outcome} counter once the metrics listener
+// lands), and it never carries the repo.
+type commitGraphOutcome string
+
+const (
+	outcomeWritten       commitGraphOutcome = "written"         // graph extended (or nothing new); not logged
+	outcomeWrittenPlain  commitGraphOutcome = "written_plain"   // first attempt timed out; plain retry succeeded
+	outcomeSkippedTipCap commitGraphOutcome = "skipped_tip_cap" // more than commitGraphMaxTips distinct tips
+	outcomeSkippedBusy   commitGraphOutcome = "skipped_busy"    // every process-wide slot busy
+	outcomeLockHeld      commitGraphOutcome = "lock_held"       // commit-graph-chain.lock already exists
+	outcomeTimedOut      commitGraphOutcome = "timed_out"       // the refresh deadline expired
+	outcomeCanceled      commitGraphOutcome = "canceled"        // the request went away
+	outcomeFailed        commitGraphOutcome = "failed"          // any other git failure
+)
+
+// commitGraphOutcomes lists every outcome, in documentation order.
+var commitGraphOutcomes = []commitGraphOutcome{
+	outcomeWritten, outcomeWrittenPlain, outcomeSkippedTipCap, outcomeSkippedBusy,
+	outcomeLockHeld, outcomeTimedOut, outcomeCanceled, outcomeFailed,
+}
+
+// errCommitGraphLockHeld marks a write that failed because Git found its
+// lock file already present (a concurrent or dead writer's).
+var errCommitGraphLockHeld = errors.New("commit-graph lock file already exists")
+
+// recordCommitGraphOutcome is the single reporting point for a refresh's
+// outcome. Every outcome except written is logged as one line:
+//
+//	commit-graph refresh outcome=<outcome> repo=<repoPath>[: <detail>]
+//
+// TODO(#322): count commit_graph_refresh_total{outcome} here once the
+// metrics listener (PR #327) lands.
+func recordCommitGraphOutcome(repoPath string, o commitGraphOutcome, detail string) commitGraphOutcome {
+	assertf(slices.Contains(commitGraphOutcomes, o), "recordCommitGraphOutcome: unknown outcome %q", o)
+	if o == outcomeWritten {
+		return o
+	}
+	line := fmt.Sprintf("commit-graph refresh outcome=%s repo=%s", o, repoPath)
+	if detail != "" {
+		line += ": " + detail
+	}
+	log.Print(line)
+	return o
+}
+
 // refreshCommitGraph adds the commits reachable from tips (the distinct
 // SHAs the sync that just completed applied) to repoPath's split
-// commit-graph and logs any failure. The caller must hold the repo's
+// commit-graph and reports how it ended (recordCommitGraphOutcome). A
+// repo with no refs records nothing. The caller must hold the repo's
 // hydrate lock: it serializes every commit-graph writer for the repo on
-// this node.
-func refreshCommitGraph(ctx context.Context, repoPath string, tips *refTips) {
+// this node. Never fails the caller: the outcome is informational.
+func refreshCommitGraph(ctx context.Context, repoPath string, tips *refTips) commitGraphOutcome {
 	assertf(tips != nil, "refreshCommitGraph: nil tips")
 	if tips.over {
-		log.Printf("commit-graph %s: skipped, more than %d distinct ref tips (reads stay correct, only slower)", repoPath, commitGraphMaxTips)
-		return
+		return recordCommitGraphOutcome(repoPath, outcomeSkippedTipCap,
+			fmt.Sprintf("more than %d distinct ref tips (reads stay correct, only slower)", commitGraphMaxTips))
 	}
 	if len(tips.set) == 0 {
-		return // no refs, nothing to graph
+		return outcomeWritten // no refs, nothing to graph
 	}
 	select {
 	case commitGraphSlots <- struct{}{}:
 		defer func() { <-commitGraphSlots }()
 	default:
-		log.Printf("commit-graph %s: skipped, all %d refresh slots busy (the next full hydrate retries)", repoPath, cap(commitGraphSlots))
-		return
+		return recordCommitGraphOutcome(repoPath, outcomeSkippedBusy,
+			fmt.Sprintf("all %d refresh slots busy (the next full hydrate retries)", cap(commitGraphSlots)))
 	}
-	if err := writeCommitGraph(ctx, repoPath, slices.Sorted(maps.Keys(tips.set))); err != nil {
-		log.Printf("commit-graph %s: %v (reads stay correct, only slower)", repoPath, err)
+	plain, err := writeCommitGraph(ctx, repoPath, slices.Sorted(maps.Keys(tips.set)))
+	switch {
+	case err == nil && plain:
+		return recordCommitGraphOutcome(repoPath, outcomeWrittenPlain,
+			fmt.Sprintf("first attempt exceeded %v; wrote a layer without Bloom filters, later writes on this node inherit that", commitGraphFirstBudget))
+	case err == nil:
+		return recordCommitGraphOutcome(repoPath, outcomeWritten, "")
+	case errors.Is(err, context.Canceled):
+		return recordCommitGraphOutcome(repoPath, outcomeCanceled, err.Error())
+	case errors.Is(err, errCommitGraphLockHeld):
+		return recordCommitGraphOutcome(repoPath, outcomeLockHeld, err.Error()+" (see the stale-lock runbook; reads stay correct, only slower)")
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errCommitGraphBudget):
+		return recordCommitGraphOutcome(repoPath, outcomeTimedOut, err.Error()+" (reads stay correct, only slower)")
+	default:
+		return recordCommitGraphOutcome(repoPath, outcomeFailed, err.Error()+" (reads stay correct, only slower)")
 	}
 }
 
@@ -133,8 +195,8 @@ func refreshCommitGraph(ctx context.Context, repoPath string, tips *refTips) {
 // choice from the existing chain. If the first attempt runs out of its own
 // budget while the request and the shared deadline are still live, one
 // retry writes a layer without Bloom filters (--no-changed-paths), which
-// later writes then inherit.
-func writeCommitGraph(ctx context.Context, repoPath string, tips []string) error {
+// later writes then inherit; plain reports that the retry wrote it.
+func writeCommitGraph(ctx context.Context, repoPath string, tips []string) (plain bool, err error) {
 	assertf(repoPath != "", "writeCommitGraph: empty repo path")
 	assertf(len(tips) > 0 && len(tips) <= commitGraphMaxTips, "writeCommitGraph: %d tips (cap %d)", len(tips), commitGraphMaxTips)
 	for _, tip := range tips {
@@ -151,18 +213,17 @@ func writeCommitGraph(ctx context.Context, repoPath string, tips []string) error
 	if !hasCommitGraph(repoPath) {
 		first = append(slices.Clip(args), "--changed-paths")
 	}
-	err := runCommitGraphAttempt(ctx, repoPath, commitGraphFirstBudget, first, stdin)
+	err = runCommitGraphAttempt(ctx, repoPath, commitGraphFirstBudget, first, stdin)
 	if !errors.Is(err, errCommitGraphBudget) {
-		return err
+		return false, err
 	}
 	if cerr := ctx.Err(); cerr != nil {
-		return fmt.Errorf("%w; no retry: %w", err, cerr)
+		return false, fmt.Errorf("%w; no retry: %w", err, cerr)
 	}
 	if rerr := runCommitGraphAttempt(ctx, repoPath, 0, append(slices.Clip(args), "--no-changed-paths"), stdin); rerr != nil {
-		return fmt.Errorf("%w; plain retry: %w", err, rerr)
+		return false, fmt.Errorf("%w; plain retry: %w", err, rerr)
 	}
-	log.Printf("commit-graph %s: first attempt exceeded %v; wrote a layer without Bloom filters, later writes on this node inherit that", repoPath, commitGraphFirstBudget)
-	return nil
+	return true, nil
 }
 
 // hasCommitGraph reports whether repoPath already has a commit-graph (split
@@ -209,6 +270,10 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		err = fmt.Errorf("%w: %w", cerr, err)
+	} else if strings.Contains(stderr.String(), ".lock': File exists") {
+		// Git's lockfile message; the lock is never removed here (its
+		// owner cannot be proven, ADR-47).
+		err = fmt.Errorf("%w: %w", errCommitGraphLockHeld, err)
 	}
 	return fmt.Errorf("git %s: %w: %s", line, err, strings.TrimSpace(stderr.String()))
 }

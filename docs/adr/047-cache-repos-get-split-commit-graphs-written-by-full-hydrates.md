@@ -160,8 +160,17 @@ already synced. A missing, stale, or partial graph is only slower:
 - A pre-existing lock is never removed. Its owner cannot be proven: a dead
   server can leave a live child, and a foreign Git need not honor our
   flock. Git fails with "Unable to create ... lock: File exists". The
-  failure is logged and the next hydrate retries. An operator removes a
-  stale lock by hand.
+  failure is logged as `outcome=lock_held` and the next hydrate retries.
+  An operator removes a stale lock by hand, following the
+  [stale-lock runbook](../how-to/deploy-production.md#commit-graph-refresh).
+  Issue #322 considered automatic cleanup and declined it for the same
+  reason.
+- Every refresh ends in one outcome from a fixed set (`written`,
+  `written_plain`, `skipped_tip_cap`, `skipped_busy`, `lock_held`,
+  `timed_out`, `canceled`, `failed`). Every outcome except `written` logs
+  one line, `commit-graph refresh outcome=<outcome> repo=<path>: <detail>`.
+  This is a documented log contract
+  ([outcomes](../how-to/deploy-production.md#commit-graph-refresh)).
 
 ## Concurrency
 

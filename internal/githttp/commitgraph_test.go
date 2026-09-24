@@ -238,7 +238,7 @@ func TestWriteCommitGraph_IsolatesInheritedGitEnv(t *testing.T) {
 	t.Setenv("GIT_CONFIG_VALUE_0", "false")
 	t.Setenv("GIT_CONFIG_GLOBAL", globalCfg)
 
-	if err := writeCommitGraph(t.Context(), repoPath, tips); err != nil {
+	if _, err := writeCommitGraph(t.Context(), repoPath, tips); err != nil {
 		t.Fatalf("writeCommitGraph: %v", err)
 	}
 	if chain := commitGraphChain(t, repoPath); len(chain) == 0 {
@@ -330,7 +330,7 @@ func TestWriteCommitGraph_TimeoutFallsBackToPlainGraph(t *testing.T) {
 	logPath := fakeCommitGraphGit(t, "hang")
 	setCommitGraphBudgets(t, 10*time.Second, 500*time.Millisecond, time.Second)
 
-	if err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath)); err != nil {
+	if _, err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath)); err != nil {
 		t.Fatalf("writeCommitGraph = %v, want the plain retry to succeed", err)
 	}
 	lines := readFakeLog(t, logPath)
@@ -371,7 +371,7 @@ func TestWriteCommitGraph_CancellationSuppressesFallback(t *testing.T) {
 		}
 		cancel()
 	})
-	err := writeCommitGraph(ctx, repoPath, tips)
+	_, err := writeCommitGraph(ctx, repoPath, tips)
 	wg.Wait()
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("writeCommitGraph = %v, want context.Canceled", err)
@@ -390,7 +390,7 @@ func TestWriteCommitGraph_NoRetryAfterDeadlineOrFailure(t *testing.T) {
 
 	logPath := fakeCommitGraphGit(t, "hang")
 	setCommitGraphBudgets(t, 300*time.Millisecond, 5*time.Second, time.Second)
-	if err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath)); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("deadline case = %v, want context.DeadlineExceeded", err)
 	}
 	if lines := readFakeLog(t, logPath); countPrefix(lines, "start ") != 1 {
@@ -399,7 +399,7 @@ func TestWriteCommitGraph_NoRetryAfterDeadlineOrFailure(t *testing.T) {
 
 	logPath = fakeCommitGraphGit(t, "fail")
 	setCommitGraphBudgets(t, 10*time.Second, 2*time.Second, time.Second)
-	err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath))
+	_, err := writeCommitGraph(t.Context(), repoPath, repoTips(t, repoPath))
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("failure case = %v, want the git stderr", err)
 	}
@@ -538,7 +538,7 @@ func BenchmarkCommitGraphRefresh(b *testing.B) {
 				next += push
 				tips := repoTips(b, repoPath)
 				b.StartTimer()
-				if err := writeCommitGraph(ctx, repoPath, tips); err != nil {
+				if _, err := writeCommitGraph(ctx, repoPath, tips); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -547,7 +547,7 @@ func BenchmarkCommitGraphRefresh(b *testing.B) {
 	b.Run("noop", func(b *testing.B) {
 		tips := repoTips(b, repoPath)
 		for b.Loop() {
-			if err := writeCommitGraph(ctx, repoPath, tips); err != nil {
+			if _, err := writeCommitGraph(ctx, repoPath, tips); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -628,7 +628,7 @@ func TestWriteCommitGraph_FeedsOnlyGivenTips(t *testing.T) {
 	commitGraphGit = script
 	t.Cleanup(func() { commitGraphGit = old })
 
-	if err := writeCommitGraph(t.Context(), repoPath, synced); err != nil {
+	if _, err := writeCommitGraph(t.Context(), repoPath, synced); err != nil {
 		t.Fatalf("writeCommitGraph: %v", err)
 	}
 	if b, _ := os.ReadFile(stdinLog); strings.TrimSpace(string(b)) != tip {
