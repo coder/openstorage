@@ -99,7 +99,10 @@ func Grep(ctx context.Context, repoPath, commit string, opts GrepOptions) ([]Gre
 // runGrep executes one git grep pass and parses it; every line is typed as
 // a match (the caller downgrades context lines).
 func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, extraArgs []string) ([]GrepFile, error) {
-	args := []string{"grep", "-I", "-n", "--null"}
+	// grep.threads=1: RLIMIT_DATA counts every thread's stack and malloc
+	// arena, so git grep's default of one thread per CPU (792 MB of VmData
+	// on 32 CPUs) cannot even start under HeavyHeapBytes.
+	args := []string{"-c", "grep.threads=1", "grep", "-I", "-n", "--null"}
 	if opts.CaseInsensitive {
 		args = append(args, "-i")
 	}
@@ -108,7 +111,7 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 	if len(opts.Pathspecs) > 0 {
 		args = append(append(args, "--"), opts.Pathspecs...)
 	}
-	out, err := runGit(ctx, repoPath, args...)
+	out, err := runGit(ctx, Heavy, repoPath, args...)
 	if err != nil {
 		// Exit status 1 with empty output is git grep's "no matches".
 		var exitErr *exec.ExitError

@@ -20,7 +20,7 @@ func Note(ctx context.Context, repoPath, notesRef, sha string) (string, error) {
 	assertf(repoPath != "", "Note: empty repoPath")
 	assertf(strings.HasPrefix(notesRef, "refs/notes/"), "Note: %q is not a notes ref", notesRef)
 	assertf(ref.ValidSHA(sha), "Note: unvalidated sha %q", sha)
-	out, err := runGit(ctx, repoPath, "notes", "--ref", notesRef, "show", sha)
+	out, err := runGit(ctx, Heavy, repoPath, "notes", "--ref", notesRef, "show", sha)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {

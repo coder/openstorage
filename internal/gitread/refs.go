@@ -28,7 +28,7 @@ const tagRefPrefix = "refs/tags/"
 // peel to) a non-commit object — trees or blobs, pushable with plain git —
 // are skipped rather than surfaced with a non-commit sha.
 func PeeledTags(ctx context.Context, repoPath string) ([]Tag, error) {
-	out, err := runGit(ctx, repoPath, "for-each-ref",
+	out, err := runGit(ctx, Heavy, repoPath, "for-each-ref",
 		"--format=%(refname)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)", "refs/tags")
 	if err != nil {
 		return nil, err

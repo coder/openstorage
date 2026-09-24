@@ -42,7 +42,9 @@ type PreparedArchive struct {
 }
 
 // PrepareArchive resolves the tree at commit (a resolved full SHA) and
-// applies the include/exclude globs and MaxBlobSize filters up front.
+// applies the include/exclude globs and MaxBlobSize filters up front. A
+// kept blob over the blob limit (CheckBlobSize) fails it with ErrBlobTooLarge, before any
+// archive byte is written.
 func PrepareArchive(ctx context.Context, repoPath, commit string, opts ArchiveOptions) (*PreparedArchive, error) {
 	assertf(ref.ValidSHA(commit), "PrepareArchive: unresolved commit %q", commit)
 	assertf(ValidArchivePrefix(opts.Prefix), "PrepareArchive: unsafe prefix %q", opts.Prefix)
@@ -74,6 +76,11 @@ func PrepareArchive(ctx context.Context, repoPath, commit string, opts ArchiveOp
 		}
 		if opts.MaxBlobSize > 0 && e.Type == EntryBlob && e.Size > opts.MaxBlobSize {
 			continue
+		}
+		// Before any header is sent: a blob too large to stream within
+		// the heap cap fails the whole request cleanly (#313).
+		if err := CheckBlobSize(ctx, e.Path, e.Size); err != nil {
+			return nil, err
 		}
 		kept = append(kept, e)
 	}

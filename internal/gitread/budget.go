@@ -1,0 +1,484 @@
+package gitread
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Resource bounds for read-side git children (#313). Every git child that
+// gitread starts runs through run, which applies them before git does any
+// work. docs/reference/http-api.md ("Resource limits on git reads") is the
+// client-facing description and ADR-048 the design; keep them in step.
+const (
+	// HeavyHeapBytes caps the heap (RLIMIT_DATA, Linux) of a child whose
+	// work grows with history length, tree size, blob size, or output size.
+	// Measured peak VmData on a 300,000-commit linear history (git 2.55):
+	// `log -1 -- <file from the root commit>` 184 MB, `blame` of that file
+	// 126 MB, `merge-base <tip> <root>` 130 MB, `log --skip=299990` 75 MB.
+	// So a 300k history fits; histories past roughly 400k commits can fail
+	// the per-file walks. Read-only pack mappings are shared page cache and
+	// are not counted.
+	HeavyHeapBytes int64 = 256 << 20
+	// LightHeapBytes caps a child whose work is bounded by one object:
+	// ref resolution and single-commit reads. A commit object larger than
+	// this cannot be read through the API.
+	LightHeapBytes int64 = 32 << 20
+	// DefaultOutputBytes is the buffered-stdout allowance of one request (a
+	// Budget), shared by all of its children, or of one call without a
+	// Budget. Streaming children (CatBlobTo into a caller's writer) are not
+	// counted; they never buffer in memory.
+	DefaultOutputBytes int64 = 64 << 20
+	// MaxBlobBytes is the largest blob the API streams (file, archive).
+	// git reads a blob below core.bigFileThreshold (512 MiB) fully into its
+	// heap, and a deltified blob also needs its base, so larger blobs would
+	// hit HeavyHeapBytes part-way; callers check sizes up front instead.
+	MaxBlobBytes int64 = 100 << 20
+
+	// stderrKeepBytes bounds the stderr kept per child (its tail: git
+	// prints its fatal message last).
+	stderrKeepBytes = 64 << 10
+	// childWaitDelay bounds how long Wait may block on git's output pipes
+	// after git is killed (exec.Cmd.WaitDelay).
+	childWaitDelay = 2 * time.Second
+)
+
+// Class sorts read-side git children by what their cost scales with.
+type Class int
+
+const (
+	// Light: bounded by one object (ref resolution, single-commit reads).
+	// Runs under LightHeapBytes and needs no admission slot.
+	Light Class = iota + 1
+	// Heavy: grows with history, tree, blob, or output size. Runs under
+	// HeavyHeapBytes and needs its request's admission slot.
+	Heavy
+)
+
+var (
+	// ErrBusy: no admission slot freed up in time; git was not started.
+	ErrBusy = errors.New("git read capacity exhausted")
+	// ErrTimeBudget: the request's git time budget ran out; the running
+	// child (if any) was killed and reaped.
+	ErrTimeBudget = errors.New("git reads exceeded the request time budget")
+	// ErrOutputLimit: git's buffered output exceeded the request's
+	// allowance; git was killed and reaped as soon as that happened.
+	ErrOutputLimit = errors.New("git output exceeded the request output budget")
+	// ErrBlobTooLarge: a blob is larger than MaxBlobBytes; git was not
+	// started for it.
+	ErrBlobTooLarge = errors.New("blob exceeds the API read size limit")
+	// ErrMemoryLimit: git needed more heap than its class's cap and was
+	// stopped by its own allocation failure (Linux only).
+	ErrMemoryLimit = errors.New("git exceeded its memory limit")
+	// ErrStop may be returned by a streaming Cmd.Stdout's Write to end git
+	// early (a history walk that has seen enough): Run then kills and reaps
+	// git and returns no error.
+	ErrStop = errors.New("stop streaming git output")
+)
+
+// heapLimitAvailable reports whether heap caps are enforced here; a
+// variable so tests can exercise the no-cap path on Linux.
+var heapLimitAvailable = HeapLimitSupported
+
+// IsBudgetError reports whether err is a resource-limit outcome (ErrBusy,
+// ErrTimeBudget, ErrOutputLimit, ErrBlobTooLarge, ErrMemoryLimit). Callers
+// that turn git failures into "not found" or "no match" must check it
+// first so a limit is never reported as missing data.
+func IsBudgetError(err error) bool {
+	return errors.Is(err, ErrBusy) || errors.Is(err, ErrTimeBudget) || errors.Is(err, ErrOutputLimit) ||
+		errors.Is(err, ErrBlobTooLarge) || errors.Is(err, ErrMemoryLimit)
+}
+
+// CheckBlobSize fails with ErrBlobTooLarge when a blob of size bytes is
+// over the blob limit (MaxBlobBytes, or the Budget's in ctx). Streaming
+// callers check before they start git or send response headers.
+func CheckBlobSize(ctx context.Context, path string, size int64) error {
+	limit := MaxBlobBytes
+	if b := BudgetFrom(ctx); b != nil {
+		limit = b.limits.MaxBlob
+	}
+	if size > limit {
+		return fmt.Errorf("%q is %d bytes: %w (%d bytes)", path, size, ErrBlobTooLarge, limit)
+	}
+	return nil
+}
+
+// Limits are the per-child caps a Budget applies.
+type Limits struct {
+	HeavyHeap int64 // RLIMIT_DATA of Heavy children
+	LightHeap int64 // RLIMIT_DATA of Light children
+	MaxBlob   int64 // CheckBlobSize limit
+}
+
+// DefaultLimits returns HeavyHeapBytes, LightHeapBytes and MaxBlobBytes.
+func DefaultLimits() Limits {
+	return Limits{HeavyHeap: HeavyHeapBytes, LightHeap: LightHeapBytes, MaxBlob: MaxBlobBytes}
+}
+
+// Slots is a process-wide pool of admission slots for Heavy children. A
+// request holds at most one slot (see Budget).
+type Slots struct {
+	ch   chan struct{}
+	wait time.Duration
+}
+
+// NewSlots returns a pool of n slots. A request waits at most wait for a
+// free slot before failing with ErrBusy.
+func NewSlots(n int, wait time.Duration) *Slots {
+	assertf(n > 0, "NewSlots: n %d", n)
+	assertf(wait >= 0, "NewSlots: wait %v", wait)
+	return &Slots{ch: make(chan struct{}, n), wait: wait}
+}
+
+func (s *Slots) acquire(ctx context.Context) error {
+	select {
+	case s.ch <- struct{}{}:
+		return nil
+	default:
+	}
+	if s.wait == 0 {
+		return ErrBusy
+	}
+	t := time.NewTimer(s.wait)
+	defer t.Stop()
+	select {
+	case s.ch <- struct{}{}:
+		return nil
+	case <-t.C:
+		return ErrBusy
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Slots) release() {
+	select {
+	case <-s.ch:
+	default:
+		assertf(false, "Slots.release: no slot held")
+	}
+}
+
+// InUse reports how many slots are held (tests and diagnostics).
+func (s *Slots) InUse() int { return len(s.ch) }
+
+// Budget is one request's share of the read-side git limits. A handler
+// middleware creates it, attaches it with WithBudget, and calls Close when
+// the request ends. Without a Budget in the context, children still run
+// under their heap caps and a per-call output allowance, but without
+// admission or a deadline.
+type Budget struct {
+	slots   *Slots
+	timeout time.Duration
+	limits  Limits
+
+	mu         sync.Mutex
+	held       bool      // this request holds one slot
+	running    int       // Heavy children started and not yet reaped
+	releaseReq bool      // Release was called while a child ran
+	deadline   time.Time // zero until the first child starts
+	outputLeft int64
+	closed     bool
+}
+
+// NewBudget returns a request budget drawing admission from slots, with a
+// git time budget of timeout (counted from the first child, so repository
+// hydration before it is not included) and outputBytes of buffered output.
+func NewBudget(slots *Slots, timeout time.Duration, outputBytes int64) *Budget {
+	assertf(slots != nil, "NewBudget: nil slots")
+	assertf(timeout > 0, "NewBudget: timeout %v", timeout)
+	assertf(outputBytes > 0, "NewBudget: outputBytes %d", outputBytes)
+	return &Budget{slots: slots, timeout: timeout, limits: DefaultLimits(), outputLeft: outputBytes}
+}
+
+// WithLimits replaces the per-child caps (tests lower them). It returns b.
+func (b *Budget) WithLimits(l Limits) *Budget {
+	assertf(l.HeavyHeap > 0 && l.LightHeap > 0 && l.MaxBlob > 0, "WithLimits: %+v", l)
+	b.limits = l
+	return b
+}
+
+// Limits returns the per-child caps b applies.
+func (b *Budget) Limits() Limits { return b.limits }
+
+type budgetKey struct{}
+
+// WithBudget attaches b to ctx for every gitread call made with it.
+func WithBudget(ctx context.Context, b *Budget) context.Context {
+	assertf(b != nil, "WithBudget: nil budget")
+	return context.WithValue(ctx, budgetKey{}, b)
+}
+
+// BudgetFrom returns the Budget attached to ctx, or nil.
+func BudgetFrom(ctx context.Context) *Budget {
+	b, _ := ctx.Value(budgetKey{}).(*Budget)
+	return b
+}
+
+// Release gives the request's slot back early: HTTP handlers call it when
+// the response starts, so a slow client cannot hold a slot while git is
+// idle. A Heavy child started later re-acquires one. If a child is running,
+// the slot is released when it is reaped.
+func (b *Budget) Release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.running > 0 {
+		b.releaseReq = true
+		return
+	}
+	b.releaseLocked()
+}
+
+// Close ends the budget: it releases the slot. Every child has been reaped
+// by then (run waits for git before returning).
+func (b *Budget) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	assertf(b.running == 0, "Budget.Close: %d children still running", b.running)
+	b.releaseLocked()
+	b.closed = true
+}
+
+func (b *Budget) releaseLocked() {
+	if b.held {
+		b.slots.release()
+		b.held = false
+	}
+	b.releaseReq = false
+}
+
+// start admits one child: it takes the request's slot for a Heavy child
+// (waiting at most the pool's wait), starts the git clock on the first
+// child, and returns the child's deadline. done must be called once the
+// child is reaped.
+func (b *Budget) start(ctx context.Context, class Class) (deadline time.Time, err error) {
+	b.mu.Lock()
+	assertf(!b.closed, "Budget: child started after Close")
+	if b.deadline.IsZero() {
+		b.deadline = time.Now().Add(b.timeout)
+	}
+	deadline = b.deadline
+	if time.Now().After(deadline) {
+		b.mu.Unlock()
+		return time.Time{}, fmt.Errorf("%w (%v)", ErrTimeBudget, b.timeout)
+	}
+	if class != Heavy {
+		b.mu.Unlock()
+		return deadline, nil
+	}
+	if b.held {
+		b.running++
+		b.mu.Unlock()
+		return deadline, nil
+	}
+	b.mu.Unlock()
+	// Wait for a slot without holding mu.
+	actx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	if err := b.slots.acquire(actx); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return time.Time{}, fmt.Errorf("%w (%v)", ErrTimeBudget, b.timeout)
+		}
+		return time.Time{}, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.held { // a concurrent child of the same request got one first
+		b.slots.release()
+	} else {
+		b.held = true
+	}
+	b.running++
+	return deadline, nil
+}
+
+func (b *Budget) done(class Class) {
+	if class != Heavy {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	assertf(b.running > 0, "Budget.done: no running child")
+	b.running--
+	if b.running == 0 && b.releaseReq {
+		b.releaseLocked()
+	}
+}
+
+// take reserves n bytes of buffered output; false means the allowance is
+// exhausted (the reservation is not made).
+func (b *Budget) take(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > b.outputLeft {
+		b.outputLeft = 0
+		return false
+	}
+	b.outputLeft -= n
+	return true
+}
+
+// outputAllowance is a buffered-output reservation source: a Budget, or a
+// per-call counter when there is none.
+type outputAllowance interface{ take(n int64) bool }
+
+type callAllowance struct{ left int64 }
+
+func (a *callAllowance) take(n int64) bool {
+	if n > a.left {
+		a.left = 0
+		return false
+	}
+	a.left -= n
+	return true
+}
+
+// limitedBuffer buffers stdout against an allowance. On overflow it kills
+// git at once (instead of letting it block on a full pipe) and refuses the
+// write.
+type limitedBuffer struct {
+	buf      bytes.Buffer
+	allow    outputAllowance
+	kill     context.CancelFunc
+	overflow bool
+}
+
+var errOutputOverflow = errors.New("output allowance exhausted")
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	if l.overflow || !l.allow.take(int64(len(p))) {
+		l.overflow = true
+		l.kill()
+		return 0, errOutputOverflow
+	}
+	return l.buf.Write(p)
+}
+
+// stopWriter forwards git's streamed output; when the consumer returns
+// ErrStop it records that and kills git at once.
+type stopWriter struct {
+	w       io.Writer
+	kill    context.CancelFunc
+	stopped atomic.Bool
+}
+
+func (s *stopWriter) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	if errors.Is(err, ErrStop) {
+		s.stopped.Store(true)
+		s.kill()
+	}
+	return n, err
+}
+
+// tailBuffer keeps the last stderrKeepBytes written to it.
+type tailBuffer struct{ b []byte }
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.b = append(t.b, p...)
+	if over := len(t.b) - stderrKeepBytes; over > 0 {
+		t.b = append(t.b[:0], t.b[over:]...)
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string { return strings.TrimSpace(string(t.b)) }
+
+// Cmd is one read-side git child for Run.
+type Cmd struct {
+	Class Class
+	Dir   string    // repository (or scratch) directory; required
+	Env   []string  // nil inherits the server's environment
+	Stdin io.Reader // nil: no stdin
+	// Stdout, when set, receives git's output as it is produced and is not
+	// counted against the output allowance (streaming callers, such as a
+	// `rev-list` walk read incrementally). Its Write may return ErrStop to
+	// end git early. When nil, output is buffered, counted, and returned.
+	Stdout io.Writer
+	Args   []string
+}
+
+// Run starts one read-side git child under the limits above and waits for
+// it (git is always reaped before Run returns). Limit outcomes are
+// returned as ErrBusy, ErrTimeBudget, ErrOutputLimit, or ErrMemoryLimit,
+// and never wrap *exec.ExitError, so exit-status checks cannot mistake them
+// for git's own "no match" or "not found" statuses. Other failures wrap
+// git's *exec.ExitError.
+func Run(ctx context.Context, c Cmd) (string, error) {
+	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
+	assertf(c.Dir != "", "Run: empty Dir")
+	assertf(len(c.Args) > 0, "Run: no git args")
+	name := "git " + strings.Join(c.Args, " ")
+
+	b := BudgetFrom(ctx)
+	heap := HeavyHeapBytes
+	if c.Class == Light {
+		heap = LightHeapBytes
+	}
+	var allow outputAllowance = &callAllowance{left: DefaultOutputBytes}
+	limitCtx := ctx
+	if b != nil {
+		heap = b.limits.HeavyHeap
+		if c.Class == Light {
+			heap = b.limits.LightHeap
+		}
+		deadline, err := b.start(ctx, c.Class)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", name, err)
+		}
+		defer b.done(c.Class)
+		allow = b
+		var cancel context.CancelFunc
+		limitCtx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	if !heapLimitAvailable() {
+		// No qualified heap-cap mechanism outside Linux (docs): the other
+		// limits still apply.
+		heap = 0
+	}
+	runCtx, kill := context.WithCancel(limitCtx)
+	defer kill()
+
+	cmd := heapLimitedGit(runCtx, heap, c.Args...)
+	cmd.Dir = c.Dir
+	cmd.Env = c.Env
+	cmd.Stdin = c.Stdin
+	cmd.WaitDelay = childWaitDelay
+	var stderr tailBuffer
+	cmd.Stderr = &stderr
+	var out *limitedBuffer
+	var stream *stopWriter
+	if c.Stdout != nil {
+		stream = &stopWriter{w: c.Stdout, kill: kill}
+		cmd.Stdout = stream
+	} else {
+		out = &limitedBuffer{allow: allow, kill: kill}
+		cmd.Stdout = out
+	}
+	err := cmd.Run()
+	stdout := ""
+	if out != nil {
+		stdout = out.buf.String()
+	}
+	if err == nil || (stream != nil && stream.stopped.Load()) {
+		// A stopped stream: git was killed on the consumer's request.
+		return stdout, nil
+	}
+	msg := stderr.String()
+	switch {
+	case out != nil && out.overflow:
+		return stdout, fmt.Errorf("%s: %w", name, ErrOutputLimit)
+	case ctx.Err() == nil && errors.Is(limitCtx.Err(), context.DeadlineExceeded):
+		return stdout, fmt.Errorf("%s: %w", name, ErrTimeBudget)
+	case heap > 0 && heapLimitFailure(err, msg):
+		return stdout, fmt.Errorf("%s: %w (%d bytes): %s", name, ErrMemoryLimit, heap, msg)
+	}
+	return stdout, fmt.Errorf("%s: %w: %s", name, err, msg)
+}

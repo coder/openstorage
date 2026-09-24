@@ -52,7 +52,7 @@ func Diff(ctx context.Context, repoPath, base, target string, opts DiffOptions) 
 		common = append(append(common, "--"), opts.Paths...)
 	}
 
-	nameStatus, err := runGit(ctx, repoPath, append([]string{"diff", "--no-color", "--name-status", "-z"}, common...)...)
+	nameStatus, err := runGit(ctx, Heavy, repoPath, append([]string{"diff", "--no-color", "--name-status", "-z"}, common...)...)
 	if err != nil {
 		return nil, DiffStats{}, err
 	}
@@ -61,7 +61,7 @@ func Diff(ctx context.Context, repoPath, base, target string, opts DiffOptions) 
 		return nil, DiffStats{}, err
 	}
 
-	numstat, err := runGit(ctx, repoPath, append([]string{"diff", "--no-color", "--numstat", "-z"}, common...)...)
+	numstat, err := runGit(ctx, Heavy, repoPath, append([]string{"diff", "--no-color", "--numstat", "-z"}, common...)...)
 	if err != nil {
 		return nil, DiffStats{}, err
 	}
@@ -69,7 +69,7 @@ func Diff(ctx context.Context, repoPath, base, target string, opts DiffOptions) 
 		return nil, DiffStats{}, err
 	}
 
-	patch, err := runGit(ctx, repoPath, append([]string{"diff", "--no-color", "--patch"}, common...)...)
+	patch, err := runGit(ctx, Heavy, repoPath, append([]string{"diff", "--no-color", "--patch"}, common...)...)
 	if err != nil {
 		return nil, DiffStats{}, err
 	}
