@@ -194,7 +194,8 @@ type(scope)?: summary
 
 - The type prefix is **required** and must be a type from the table below.
 - Package names go in the **scope**: `fix(githttp): ...`, never `githttp: ...`.
-  release-please ignores a bare package prefix, so the change never ships.
+  release-please ignores a bare package prefix: the change still lands on `main`,
+  but gets no version bump and no CHANGELOG entry.
 - Only the squash title counts; branch commits can be anything.
 
 | Type | Release effect |
