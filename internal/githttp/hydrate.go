@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -3857,7 +3858,7 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		// so lock-free fast-path readers are not held up by it, and still
 		// under the hydrate lock, which serializes every graph writer for
 		// this repo. Best-effort: failures are logged, never returned.
-		refreshCommitGraph(ctx, repoPath, tips)
+		refreshCommitGraph(ctx, repoPath, gitlimit.RepoKey(BaseRepo(repo)), tips)
 	} else if refsErr == nil && skippedHeld && preHoldsOK {
 		// Held-skip verdict (Codex round-22 security P2, see
 		// heldGenerationMarker): reusable by later hydrates while the

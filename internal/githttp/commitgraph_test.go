@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/gitlimit"
 )
 
 // seedHistory appends n commits to refs/heads/main in the bare repo at
@@ -51,6 +52,19 @@ func seedHistory(tb testing.TB, repoPath string, n int) string {
 		tb.Fatalf("rev-parse: %v\n%s", err, out)
 	}
 	return strings.TrimSpace(out)
+}
+
+// realGit is the real git binary, resolved at package init, before any
+// test puts a fake `git` first on PATH (a fake resolving "git" itself
+// would exec itself forever).
+var testRealGit, testRealGitErr = exec.LookPath("git")
+
+func realGitPath(tb testing.TB) string {
+	tb.Helper()
+	if testRealGitErr != nil {
+		tb.Fatalf("git not found: %v", testRealGitErr)
+	}
+	return testRealGit
 }
 
 // repoTips returns the distinct SHAs the repo's refs point at, sorted.
@@ -257,8 +271,10 @@ func TestCommitGraphEnv(t *testing.T) {
 	}
 }
 
-// fakeCommitGraphGit installs a shell script as the commit-graph binary.
-// Every run appends "start <pid> <args>" to the returned log. The first
+// fakeCommitGraphGit puts a fake `git` first on PATH (the refresh runs
+// `git` through gitlimit.Command, which resolves it there, also behind the
+// heap-cap shell). Other git commands pass through to the real git. Every
+// commit-graph run appends "start <pid> <args>" to the returned log. The first
 // attempt (no --no-changed-paths) records its pid and then hangs until
 // SIGTERM ("term <pid>"), or exits 1 in mode "fail". The plain retry logs
 // whether the first attempt's process is already gone ("prev-dead") and
@@ -266,14 +282,12 @@ func TestCommitGraphEnv(t *testing.T) {
 // mode "hang-then-fail".
 func fakeCommitGraphGit(t *testing.T, mode string) (logPath string) {
 	t.Helper()
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
+	realGit := realGitPath(t)
 	dir := t.TempDir()
 	logPath = filepath.Join(dir, "log")
-	script := filepath.Join(dir, "fake-git")
+	script := filepath.Join(dir, "git")
 	const body = `#!/bin/sh
+[ "$1" = commit-graph ] || exec "$CG_REAL_GIT" "$@"
 log="$CG_FAKE_LOG"
 echo "start $$ $*" >> "$log"
 case " $* " in
@@ -297,9 +311,7 @@ echo "woke $$" >> "$log"
 	t.Setenv("CG_FAKE_LOG", logPath)
 	t.Setenv("CG_FAKE_MODE", mode)
 	t.Setenv("CG_REAL_GIT", realGit)
-	old := commitGraphGit
-	commitGraphGit = script
-	t.Cleanup(func() { commitGraphGit = old })
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return logPath
 }
 
@@ -615,20 +627,15 @@ func TestWriteCommitGraph_FeedsOnlyGivenTips(t *testing.T) {
 	tip := seedHistory(t, repoPath, 5)
 	synced := []string{tip}
 	late := seedHistory(t, repoPath, 3) // moves main past the synced tip
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
+	realGit := realGitPath(t)
 	dir := t.TempDir()
 	stdinLog := filepath.Join(dir, "stdin")
-	script := filepath.Join(dir, "record-git")
-	body := "#!/bin/sh\ncat > \"" + stdinLog + "\"\nexec \"" + realGit + "\" \"$@\" < \"" + stdinLog + "\"\n"
+	script := filepath.Join(dir, "git")
+	body := "#!/bin/sh\n[ \"$1\" = commit-graph ] || exec \"" + realGit + "\" \"$@\"\ncat > \"" + stdinLog + "\"\nexec \"" + realGit + "\" \"$@\" < \"" + stdinLog + "\"\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	old := commitGraphGit
-	commitGraphGit = script
-	t.Cleanup(func() { commitGraphGit = old })
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	if _, err := writeCommitGraph(t.Context(), repoPath, synced); err != nil {
 		t.Fatalf("writeCommitGraph: %v", err)
@@ -639,35 +646,119 @@ func TestWriteCommitGraph_FeedsOnlyGivenTips(t *testing.T) {
 	mustGit(t, repoPath, "commit-graph", "verify")
 }
 
-// With every process-wide slot busy the refresh is skipped without
-// spawning Git; once a slot frees up it writes again.
-func TestRefreshCommitGraph_SkipsWhenSlotsBusy(t *testing.T) {
+// testSlotKey is the slot key refreshes in these tests count against.
+var testSlotKey = gitlimit.RepoKey("repo_commitgraphtest")
+
+// holdMaintenance takes n maintenance admissions (for other repositories)
+// for the rest of the test.
+func holdMaintenance(t *testing.T, n int) {
+	t.Helper()
+	for i := range n {
+		release, ok := gitlimit.TryAdmitMaintenance(gitlimit.RepoKey(fmt.Sprintf("repo_held%d", i)))
+		if !ok {
+			t.Fatal("maintenance admission unavailable at test start")
+		}
+		t.Cleanup(release)
+	}
+}
+
+// holdReadSlots takes n slots of the shared read pool for the rest of the
+// test, as n in-flight API reads of distinct repositories would.
+func holdReadSlots(t *testing.T, n int) {
+	t.Helper()
+	for i := range n {
+		key := gitlimit.RepoKey(fmt.Sprintf("repo_reader%d", i))
+		if !gitlimit.ReadSlots.TryAcquire(key) {
+			t.Fatal("read slot unavailable at test start")
+		}
+		t.Cleanup(func() { gitlimit.ReadSlots.Release(key) })
+	}
+}
+
+// assertNoAdmissionHeld checks the refresh returned every permit it took.
+func assertNoAdmissionHeld(t *testing.T) {
+	t.Helper()
+	if n := gitlimit.ReadSlots.InUse(); n != 0 {
+		t.Fatalf("shared read pool: %d slots still held", n)
+	}
+	release, ok := gitlimit.TryAdmitMaintenance(testSlotKey)
+	if !ok {
+		t.Fatal("maintenance share still held")
+	}
+	release()
+}
+
+// Refreshes join the read API's shared admission pool (#313, #322): with
+// the pool full of reads, a refresh is skipped without spawning Git; once
+// a slot frees up it writes again and returns its permit.
+func TestRefreshCommitGraph_SkipsWhenReadPoolFull(t *testing.T) {
 	repoPath := t.TempDir()
 	mustGit(t, repoPath, "init", "-q", "--bare")
 	seedHistory(t, repoPath, 5)
+	tips := tipsOf(repoTips(t, repoPath)...)
 	var spawns int
 	obs := func(_ string, _ []string) { spawns++ }
 	gitSpawnObserver.Store(&obs)
 	defer gitSpawnObserver.Store(nil)
 
-	for range cap(commitGraphSlots) {
-		commitGraphSlots <- struct{}{}
-	}
-	tips := tipsOf(repoTips(t, repoPath)...)
-	refreshCommitGraph(t.Context(), repoPath, tips)
-	for range cap(commitGraphSlots) {
-		<-commitGraphSlots
-	}
+	t.Run("pool full", func(t *testing.T) {
+		holdReadSlots(t, gitlimit.ReadSlotCount)
+		if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeSkippedBusy {
+			t.Fatalf("outcome = %s, want skipped_busy", got)
+		}
+	})
 	if spawns != 0 || commitGraphChain(t, repoPath) != nil {
-		t.Fatalf("refresh ran with every slot busy (%d spawns)", spawns)
+		t.Fatalf("refresh ran with the read pool full (%d spawns)", spawns)
 	}
-	refreshCommitGraph(t.Context(), repoPath, tips)
-	if spawns != 1 || len(commitGraphChain(t, repoPath)) == 0 {
-		t.Fatalf("refresh with a free slot: %d spawns, want one write", spawns)
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeWritten || spawns != 1 {
+		t.Fatalf("refresh with a free slot: outcome %s, %d spawns, want one write", got, spawns)
 	}
-	if len(commitGraphSlots) != 0 {
-		t.Fatalf("refresh leaked a slot: %d held", len(commitGraphSlots))
-	}
+	assertNoAdmissionHeld(t)
+}
+
+// A repository whose reads hold its whole per-repository share gets no
+// refresh, while another repository's refresh still runs.
+func TestRefreshCommitGraph_RespectsRepositoryShare(t *testing.T) {
+	repoPath := t.TempDir()
+	mustGit(t, repoPath, "init", "-q", "--bare")
+	seedHistory(t, repoPath, 5)
+	tips := tipsOf(repoTips(t, repoPath)...)
+	t.Run("repository share full", func(t *testing.T) {
+		for range gitlimit.RepoSlotCount {
+			if !gitlimit.ReadSlots.TryAcquire(testSlotKey) {
+				t.Fatal("read slot unavailable")
+			}
+			t.Cleanup(func() { gitlimit.ReadSlots.Release(testSlotKey) })
+		}
+		if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeSkippedBusy {
+			t.Fatalf("outcome = %s, want skipped_busy", got)
+		}
+		if got := refreshCommitGraph(t.Context(), repoPath, gitlimit.RepoKey("repo_other"), tips); got != outcomeWritten {
+			t.Fatalf("other repository's refresh = %s, want written", got)
+		}
+	})
+	assertNoAdmissionHeld(t)
+}
+
+// Maintenance holds at most gitlimit.MaintenanceShare slots: two running
+// refreshes block a third, while reads still get the rest of the pool.
+func TestRefreshCommitGraph_MaintenanceShareLeavesReadsTheRest(t *testing.T) {
+	repoPath := t.TempDir()
+	mustGit(t, repoPath, "init", "-q", "--bare")
+	seedHistory(t, repoPath, 5)
+	tips := tipsOf(repoTips(t, repoPath)...)
+	t.Run("share full", func(t *testing.T) {
+		holdMaintenance(t, gitlimit.MaintenanceShare)
+		if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeSkippedBusy {
+			t.Fatalf("outcome = %s, want skipped_busy", got)
+		}
+		holdReadSlots(t, gitlimit.ReadSlotCount-gitlimit.MaintenanceShare)
+		if gitlimit.ReadSlots.TryAcquire(gitlimit.RepoKey("repo_extra")) {
+			gitlimit.ReadSlots.Release(gitlimit.RepoKey("repo_extra"))
+			t.Fatal("pool larger than ReadSlotCount")
+		}
+	})
+	assertNoAdmissionHeld(t)
 }
 
 // A relative cache directory (an accepted --cache-dir value) yields

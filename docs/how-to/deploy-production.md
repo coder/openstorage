@@ -227,8 +227,9 @@ change. These are the outcomes:
 | `outcome=written` | Graph extended, or already current. Not logged. | None |
 | `outcome=written_plain` | The first attempt ran out of its 3 s budget, and the retry without Bloom filters succeeded (it may have found nothing new to write). Later refreshes of that repo on this replica may also skip Bloom filters. | None needed. Expected for very large histories. |
 | `outcome=skipped_tip_cap` | The repo's refs point at more than 10,000 distinct commits, so no refresh ran. | None. The existing graph (if any) stays valid. |
-| `outcome=skipped_busy` | Two refreshes were already running in this process, so this one was skipped. The next full hydrate retries. | Look only if it is constant. That means sustained full-hydrate load. |
+| `outcome=skipped_busy` | No slot was free right away, so the refresh was skipped and the next full hydrate retries. Refreshes share the git read API's 8-slot pool, count against the repository's 2-slot share like its reads, and may hold at most 2 of the pool's slots in total. | Look only if it is constant. That means sustained read or full-hydrate load. |
 | `outcome=lock_held` | Git found `objects/info/commit-graphs/commit-graph-chain.lock` already present. | If it repeats for one repo, follow the stale-lock runbook below. |
+| `outcome=memory_limit` | Git needed more heap than its 256 MiB cap (the read API's Heavy cap; Linux only) and stopped. | If it repeats for one repo, the history is too large for a graph within the cap. Reads stay correct. |
 | `outcome=timed_out` | The refresh used its whole 5 s deadline. It held that repo's hydrate lock for up to about 7 s. | If it repeats for one repo, that repo pays this on every full hydrate. Consider the history size. |
 | `outcome=canceled` | The request that triggered the full hydrate went away. | None |
 | `outcome=failed` | Any other Git failure. The detail carries Git's stderr. | Read the detail. |

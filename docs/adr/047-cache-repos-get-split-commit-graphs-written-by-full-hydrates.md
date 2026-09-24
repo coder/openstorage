@@ -47,10 +47,18 @@ the existing graph has them.
     the write walks only those. Same-tip fanout collapses to one tip. The
     refresh is skipped when the sync saw more than `commitGraphMaxTips`
     (10,000) distinct tips.
-  - **Process-wide slots.** At most `cap(commitGraphSlots)` (2) refreshes
-    run at once per process, across all repos. A refresh that finds both
-    slots busy is skipped, not queued; the repo's next full hydrate tries
-    again. This bounds commit-graph CPU per node to two cores however
+  - **Shared admission and heap cap (#322).** A refresh joins the git
+    read API's chokepoint (ADR-48) through the leaf package
+    `internal/gitlimit`. It takes one slot of the same process-wide 8-slot
+    pool as JSON reads with a non-blocking try, because it runs under the
+    hydrate lock. The slot counts against the repository's per-repository
+    share, like its reads. Refreshes may hold at most 2 of those slots at once, so
+    reads always keep the rest. A refresh that gets no slot is skipped,
+    not queued; the repo's next full hydrate tries again. Git runs under
+    the read API's Heavy heap cap (256 MiB `RLIMIT_DATA`, Linux only),
+    also on hydrates that no read budget covers (`upload-pack`). A write
+    that hits the cap ends as `memory_limit`. Together this bounds
+    commit-graph work per node to two processes of bounded heap, however
     many repos an attacker drives.
 
 ## Why split graphs and Bloom filters
@@ -167,7 +175,7 @@ already synced. A missing, stale, or partial graph is only slower:
   reason.
 - Every refresh ends in one outcome from a fixed set (`written`,
   `written_plain`, `skipped_tip_cap`, `skipped_busy`, `lock_held`,
-  `timed_out`, `canceled`, `failed`). Every outcome except `written` logs
+  `memory_limit`, `timed_out`, `canceled`, `failed`). Every outcome except `written` logs
   one line, `commit-graph refresh outcome=<outcome> repo=<path>: <detail>`.
   This is a documented log contract
   ([outcomes](../how-to/deploy-production.md#commit-graph-refresh)).

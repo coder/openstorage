@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/openstorage/internal/gitlimit"
 )
 
 // captureLog redirects the standard logger for one test and returns the
@@ -44,6 +46,9 @@ func refreshLines(buf *bytes.Buffer) []string {
 // and repoPath.
 func assertOneOutcome(t *testing.T, buf *bytes.Buffer, outcome commitGraphOutcome, repoPath string) {
 	t.Helper()
+	if outcome != outcomeSkippedBusy {
+		assertNoAdmissionHeld(t)
+	}
 	lines := refreshLines(buf)
 	want := fmt.Sprintf("commit-graph refresh outcome=%s repo=%s", outcome, repoPath)
 	if len(lines) != 1 || (lines[0] != want && !strings.HasPrefix(lines[0], want+": ")) {
@@ -62,7 +67,7 @@ func newGraphRepo(t *testing.T, commits int) (repoPath string, tips *refTips) {
 func TestCommitGraphOutcomes_FixedSet(t *testing.T) {
 	want := []commitGraphOutcome{
 		outcomeWritten, outcomeWrittenPlain, outcomeSkippedTipCap, outcomeSkippedBusy,
-		outcomeLockHeld, outcomeTimedOut, outcomeCanceled, outcomeFailed,
+		outcomeLockHeld, outcomeMemoryLimit, outcomeTimedOut, outcomeCanceled, outcomeFailed,
 	}
 	if fmt.Sprint(commitGraphOutcomes) != fmt.Sprint(want) {
 		t.Fatalf("commitGraphOutcomes = %v, want %v (a new outcome must be documented in deploy-production.md)", commitGraphOutcomes, want)
@@ -90,7 +95,7 @@ func TestCommitGraphOutcomes_Documented(t *testing.T) {
 func TestRefreshCommitGraph_WrittenIsSilent(t *testing.T) {
 	repoPath, tips := newGraphRepo(t, 5)
 	buf := captureLog(t)
-	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeWritten {
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeWritten {
 		t.Fatalf("outcome = %s, want written", got)
 	}
 	if lines := refreshLines(buf); len(lines) != 0 {
@@ -105,7 +110,7 @@ func TestRefreshCommitGraph_SkippedTipCapLogged(t *testing.T) {
 	t.Cleanup(func() { commitGraphMaxTips = old })
 	tips := tipsOf(repoTips(t, repoPath)[0], strings.Repeat("a", 40))
 	buf := captureLog(t)
-	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeSkippedTipCap {
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeSkippedTipCap {
 		t.Fatalf("outcome = %s, want skipped_tip_cap", got)
 	}
 	assertOneOutcome(t, buf, outcomeSkippedTipCap, repoPath)
@@ -113,16 +118,9 @@ func TestRefreshCommitGraph_SkippedTipCapLogged(t *testing.T) {
 
 func TestRefreshCommitGraph_SkippedBusyLogged(t *testing.T) {
 	repoPath, tips := newGraphRepo(t, 5)
-	for range cap(commitGraphSlots) {
-		commitGraphSlots <- struct{}{}
-	}
-	t.Cleanup(func() {
-		for range cap(commitGraphSlots) {
-			<-commitGraphSlots
-		}
-	})
+	holdMaintenance(t, gitlimit.MaintenanceShare)
 	buf := captureLog(t)
-	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeSkippedBusy {
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeSkippedBusy {
 		t.Fatalf("outcome = %s, want skipped_busy", got)
 	}
 	assertOneOutcome(t, buf, outcomeSkippedBusy, repoPath)
@@ -139,7 +137,7 @@ func TestRefreshCommitGraph_LockHeldLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := captureLog(t)
-	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeLockHeld {
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeLockHeld {
 		t.Fatalf("outcome = %s, want lock_held", got)
 	}
 	assertOneOutcome(t, buf, outcomeLockHeld, repoPath)
@@ -153,7 +151,7 @@ func TestRefreshCommitGraph_WrittenPlainLogged(t *testing.T) {
 	fakeCommitGraphGit(t, "hang")
 	setCommitGraphBudgets(t, 10*time.Second, 300*time.Millisecond, time.Second)
 	buf := captureLog(t)
-	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeWrittenPlain {
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeWrittenPlain {
 		t.Fatalf("outcome = %s, want written_plain", got)
 	}
 	assertOneOutcome(t, buf, outcomeWrittenPlain, repoPath)
@@ -164,7 +162,7 @@ func TestRefreshCommitGraph_TimedOutLogged(t *testing.T) {
 	fakeCommitGraphGit(t, "hang-all")
 	setCommitGraphBudgets(t, 500*time.Millisecond, 200*time.Millisecond, 200*time.Millisecond)
 	buf := captureLog(t)
-	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeTimedOut {
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeTimedOut {
 		t.Fatalf("outcome = %s, want timed_out", got)
 	}
 	assertOneOutcome(t, buf, outcomeTimedOut, repoPath)
@@ -175,7 +173,7 @@ func TestRefreshCommitGraph_CanceledLogged(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	buf := captureLog(t)
-	if got := refreshCommitGraph(ctx, repoPath, tips); got != outcomeCanceled {
+	if got := refreshCommitGraph(ctx, repoPath, testSlotKey, tips); got != outcomeCanceled {
 		t.Fatalf("outcome = %s, want canceled", got)
 	}
 	assertOneOutcome(t, buf, outcomeCanceled, repoPath)
@@ -185,7 +183,7 @@ func TestRefreshCommitGraph_FailedLogged(t *testing.T) {
 	repoPath, tips := newGraphRepo(t, 5)
 	fakeCommitGraphGit(t, "fail")
 	buf := captureLog(t)
-	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeFailed {
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeFailed {
 		t.Fatalf("outcome = %s, want failed", got)
 	}
 	assertOneOutcome(t, buf, outcomeFailed, repoPath)
@@ -201,11 +199,60 @@ func TestRefreshCommitGraph_ClassifiesTerminalFailure(t *testing.T) {
 	fakeCommitGraphGit(t, "hang-then-fail")
 	setCommitGraphBudgets(t, 10*time.Second, 300*time.Millisecond, time.Second)
 	buf := captureLog(t)
-	if got := refreshCommitGraph(t.Context(), repoPath, tips); got != outcomeFailed {
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeFailed {
 		t.Fatalf("outcome = %s, want failed", got)
 	}
 	assertOneOutcome(t, buf, outcomeFailed, repoPath)
 	if l := refreshLines(buf)[0]; !strings.Contains(l, "boom2") {
 		t.Fatalf("failed line %q lacks the retry's stderr", l)
 	}
+}
+
+// Every refresh runs under the read API's Heavy heap cap, also on hydrates
+// no read budget covers (upload-pack): the fake git reports the
+// RLIMIT_DATA it was started with.
+func TestRefreshCommitGraph_RunsUnderHeapCap(t *testing.T) {
+	if !gitlimit.HeapLimitSupported() {
+		t.Skip("no heap cap on this platform")
+	}
+	repoPath, tips := newGraphRepo(t, 5)
+	realGit := realGitPath(t)
+	dir := t.TempDir()
+	report := filepath.Join(dir, "limit")
+	body := "#!/bin/sh\n[ \"$1\" = commit-graph ] || exec \"" + realGit + "\" \"$@\"\nulimit -S -d > \"" + report + "\"\nexec \"" + realGit + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeWritten {
+		t.Fatalf("outcome = %s, want written", got)
+	}
+	b, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(string(b)), fmt.Sprint(gitlimit.HeavyHeapBytes/1024); got != want {
+		t.Fatalf("commit-graph ran with RLIMIT_DATA %s KiB, want %s", got, want)
+	}
+	assertNoAdmissionHeld(t)
+}
+
+// A git that dies of its heap cap is reported as memory_limit.
+func TestRefreshCommitGraph_MemoryLimitLogged(t *testing.T) {
+	if !gitlimit.HeapLimitSupported() {
+		t.Skip("no heap cap on this platform")
+	}
+	repoPath, tips := newGraphRepo(t, 5)
+	realGit := realGitPath(t)
+	dir := t.TempDir()
+	body := "#!/bin/sh\n[ \"$1\" = commit-graph ] || exec \"" + realGit + "\" \"$@\"\necho 'fatal: Out of memory, malloc failed (tried to allocate 1048576 bytes)' >&2\nexit 128\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	buf := captureLog(t)
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeMemoryLimit {
+		t.Fatalf("outcome = %s, want memory_limit", got)
+	}
+	assertOneOutcome(t, buf, outcomeMemoryLimit, repoPath)
 }
