@@ -96,6 +96,22 @@ def origin(value, local):
     return url.scheme + "://" + host + suffix
 
 
+def normalized_ip(value):
+    address = ipaddress.ip_address(value)
+    require(not getattr(address, "scope_id", None), "ambiguous_replica_address")
+    return str(getattr(address, "ipv4_mapped", None) or address)
+
+
+def replica_identity(value):
+    url = urllib.parse.urlsplit(value)
+    host = url.hostname.lower().removesuffix(".")
+    try:
+        host = normalized_ip(host)
+    except ValueError:
+        pass  # DNS names are resolved only when smoke is explicitly requested.
+    return host, url.port or 443
+
+
 def unique_fields(pairs):
     result = {}
     for key, value in pairs:
@@ -121,7 +137,7 @@ def load_config(path):
     replicas = config["replica_urls"]
     require(isinstance(replicas, list) and len(replicas) == (2 if config["topology"] == "pg-s3" else 0), "invalid_replicas")
     config["replica_urls"] = [origin(url, False) for url in replicas]
-    require(len(set(config["replica_urls"])) == len(replicas), "duplicate_replicas")
+    require(len({replica_identity(url) for url in config["replica_urls"]}) == len(replicas), "duplicate_replicas")
     for field in ("binary", "private_key_file"):
         require(isinstance(config[field], str) and config[field], "invalid_path")
         path = Path(config[field]).resolve(strict=True)
@@ -275,6 +291,23 @@ class Runner:
         replicas = self.config["replica_urls"]
         self.writer, reader = replicas if replicas else (public, public)
         self.step("health")
+        addresses = set()
+        for base in replicas:
+            url = urllib.parse.urlsplit(base)
+            # Resolve in a bounded/reaped child; DNS cannot block the main process.
+            # Keep the original hostname (including an absolute DNS trailing dot).
+            answers = json.loads(self.command([sys.executable, "-I", "-c",
+                "import json,socket,sys; print(json.dumps([[a[4][0],a[4][3] if len(a[4])==4 else 0] "
+                "for a in socket.getaddrinfo(sys.argv[1],int(sys.argv[2]),type=socket.SOCK_STREAM)]))",
+                url.hostname, str(url.port or 443)]))
+            require(isinstance(answers, list) and answers, "invalid_replica_resolution")
+            current = set()
+            for answer in answers:
+                require(isinstance(answer, list) and len(answer) == 2 and isinstance(answer[0], str)
+                        and type(answer[1]) is int and answer[1] == 0, "ambiguous_replica_address")
+                current.add((normalized_ip(answer[0]), url.port or 443))
+            require(not addresses.intersection(current), "duplicate_replicas")
+            addresses.update(current)
         for base in dict.fromkeys([public, self.writer, reader]):
             self.http(base, "/healthz")
         self.passed()

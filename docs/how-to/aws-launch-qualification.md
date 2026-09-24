@@ -98,9 +98,14 @@ client inputs. Output names in Terraform need not match these JSON keys.
    servers, not two names for the same load balancer. They must have trusted TLS
    certificates. URLs have no credentials, path, trailing slash, query, or
    fragment. Local rehearsal alone permits loopback HTTP.
-2. `pg-s3` requires exactly two distinct replica origins. `s3wal` and `local`
-   require an empty `replica_urls` array. Declaring a topology does not prove the
-   backing stores or physical replica identity.
+2. `pg-s3` requires exactly two distinct replica origins. Offline checks normalize
+   IP literals, IPv4-mapped IPv6, host case, and the DNS trailing dot for comparison.
+   Smoke resolves both names within the command budget and rejects empty, invalid,
+   scoped, or overlapping address-and-port sets before contacting the servers.
+   Requests retain the configured hostnames and TLS checks. Disjoint addresses do
+   not prove physical replica identity or future DNS answers; the operator must
+   verify the mapping. `s3wal` and `local` require an empty `replica_urls` array.
+   Declaring a topology does not prove the backing stores.
 3. Generate the organization key with `openstorage keygen`; deploy only its
    public half through #224. The private key must be a regular mode-0600 file.
    Paths are relative to the invocation directory unless absolute. Do not put

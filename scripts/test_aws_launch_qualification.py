@@ -97,6 +97,72 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(self.result()["status"], "failed")
                 self.assertNotIn(SECRET, (self.output / "result.json").read_text())
 
+    def test_equivalent_replica_spellings_fail_offline_without_execution(self):
+        pairs = [
+            ["https://[2001:db8::1]", "https://[2001:0db8:0:0:0:0:0:1]:443"],
+            ["https://REPLICA.test.", "https://replica.test"],
+            ["https://192.0.2.1", "https://[::ffff:c000:201]"],
+            ["https://[fe80::1%25eth0]", "https://[fe80::2%25eth0]"],
+        ]
+        for index, replicas in enumerate(pairs):
+            with self.subTest(replicas=replicas):
+                self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=replicas)
+                self.output = self.root / str(index)
+                with self.preflight() as command, patch.object(q.Runner, "http") as http:
+                    self.assertEqual(self.invoke(), 1)
+                command.assert_not_called()
+                http.assert_not_called()
+
+    def test_replica_resolution_fails_closed_before_http_or_creation(self):
+        self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test", "https://two.test"])
+        cases = [
+            [["192.0.2.1", 0]],
+            [["192.0.2.2", 0], ["::ffff:192.0.2.1", 0]],
+            [], [["not-an-ip", 0]], [["fe80::1%eth0", 0]], [["fe80::1", 2]],
+            [["192.0.2.2"]], {"address": "192.0.2.2"},
+            subprocess.TimeoutExpired(["resolver"], 1),
+        ]
+        for index, answers in enumerate(cases):
+            with self.subTest(answers=answers):
+                self.output = self.root / str(index)
+                resolved = []
+                def command(argv, **kwargs):
+                    if argv[0] == q.sys.executable:
+                        resolved.append(argv[-2])
+                        if argv[-2] == "two.test":
+                            if isinstance(answers, Exception):
+                                raise answers
+                            return json.dumps(answers).encode()
+                        return b'[["192.0.2.1",0]]'
+                    return self.fake_command(argv, **kwargs)
+                with patch.object(q.Runner, "command", side_effect=command), \
+                        patch.object(q.Runner, "http") as http, patch.object(q.shutil, "which", return_value="/bin/fake"):
+                    self.assertEqual(self.invoke(smoke=True), 1)
+                self.assertEqual(resolved, ["one.test", "two.test"])
+                http.assert_not_called()
+                self.assertEqual(self.result()["cleanup"]["status"], "not_needed")
+
+    def test_disjoint_replica_answers_preserve_urls_and_offline_does_not_resolve(self):
+        self.config.update(topology="pg-s3", endpoint="https://public.test", replica_urls=["https://one.test.", "https://two.test"])
+        resolved = []
+        def command(argv, **kwargs):
+            if argv[0] == q.sys.executable:
+                resolved.append(argv[-2:])
+                answers = [["192.0.2.1", 0], ["2001:db8::1", 0]] if argv[-2] == "one.test." else [["192.0.2.2", 0], ["2001:db8::2", 0]]
+                return json.dumps(answers).encode()
+            return self.fake_command(argv, **kwargs)
+        with patch.object(q.Runner, "command", side_effect=command), patch.object(q.Runner, "http") as http:
+            self.assertEqual(self.invoke(), 0)
+        self.assertEqual(resolved, [])
+        http.assert_not_called()
+        self.output = self.root / "smoke"
+        with patch.object(q.Runner, "command", side_effect=command), \
+                patch.object(q.Runner, "http", autospec=True, side_effect=self.fake_http) as http, \
+                patch.object(q.shutil, "which", return_value="/bin/fake"):
+            self.assertEqual(self.invoke(smoke=True), 0)
+        self.assertEqual(resolved, [["one.test.", "443"], ["two.test", "443"]])
+        self.assertEqual({call.args[1] for call in http.call_args_list}, {"https://public.test", "https://one.test.", "https://two.test"})
+
     def test_hash_mismatch_never_executes_binary(self):
         self.config["binary_sha256"] = "0" * 64
         with self.preflight() as command:
@@ -170,6 +236,8 @@ class RunnerTests(unittest.TestCase):
         return b""
 
     def fake_command(self, argv, cwd=None):
+        if argv[0] == q.sys.executable:
+            return json.dumps([[{"one.test": "192.0.2.1", "two.test": "192.0.2.2"}[argv[-2]], 0]]).encode()
         if argv[0] != "git":
             return self.command(argv, cwd=cwd)
         if "clone" in argv:
