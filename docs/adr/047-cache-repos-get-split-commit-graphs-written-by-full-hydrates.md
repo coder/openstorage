@@ -30,49 +30,53 @@ the existing graph has them.
   until the next full hydrate, the new commits are simply outside the
   graph.
 - A marker-TTL refresh or a default-branch change also runs a write. With
-  nothing new to add, the write costs about 8–11 ms (20k commits, 1 ref)
-  and about 155 ms with 10,000 refs, because `--reachable` resolves every
-  ref.
+  nothing new to add, the write costs about 4 ms (20k commits, one ref).
+  In an exploratory run it took about 155 ms with 10,000 refs, because
+  `--reachable` resolves every ref.
 
 ## Why split graphs and Bloom filters
 
-Measured with Git 2.55 on an AMD EPYC 9454P:
+Committed benchmarks, 20k-commit history, each commit changing 3 of
+about 1,000 files in 50 directories. Git 2.55 on a shared AMD EPYC 9454P
+host; ranges over 3–5 runs.
 
-| history | case | no graph | graph |
+`BenchmarkLogPathCommitGraph` (`internal/gitread`), `git log -1 -- <path>`
+as `files/metadata` runs it per entry:
+
+| path | no graph | plain graph | graph with Bloom filters |
 |---|---|---|---|
-| 20k commits | `log -1 -- <path>`, path only in the root commit | 124 ms | 23 ms (83 ms without Bloom) |
-| 20k commits | `rev-list --topo-order` | 75 ms | 25 ms |
-| 100k commits | `log -1 -- <path>`, old path | 227 ms | 79 ms |
+| file changed by the tip commit | 3.1–5.6 ms | 3.3–3.7 ms | 3.4–3.6 ms |
+| file only in the root commit (worst case) | 126–148 ms | 69–73 ms | 22–24 ms |
 
-The write cost per full hydrate on a 20k-commit history with merges and
-three changed files per commit:
+`BenchmarkCommitGraphRefresh` (`internal/githttp`), cost charged to one
+full hydrate:
 
 | write | cost |
 |---|---|
-| first write, with Bloom filters | 0.7–0.9 s |
-| `--split` after a 10-commit push | 15–43 ms |
-| `--split` after a 100-commit push | 29–52 ms |
-| non-split rewrite of the whole graph | 110–170 ms |
+| first write, plain | 89–99 ms |
+| first write, with Bloom filters | 2.1–2.4 s |
+| after a 10-commit push (production writer, Bloom inherited) | 14–18 ms |
+| after a 100-commit push | 44–46 ms |
+| nothing new | 3.8–4.5 ms |
 
-These timings are exploratory. The committed benchmarks
-(`BenchmarkLogPathCommitGraph` in `internal/gitread`,
-`BenchmarkCommitGraphRefresh` in `internal/githttp`) are the reproducible
-numbers. The write cost is charged to the full hydrate after a push, not to
-the push itself.
+The write cost is charged to the full hydrate after a push, not to the
+push itself. The `--topo-order` walk from #292 gains too: issue #307 measured
+71 ms to 3.7 ms for the tip rank with #292's `BenchmarkTopoRanks`.
 
 Split graphs keep the amortized write cost proportional to the new
 commits. Git merges layers geometrically (`--size-multiple=2`), so an
-occasional write that merges layers costs more (the 43 ms and 52 ms
-outliers above), and every write resolves every ref. The default Bloom filter
-version (1) is kept: Git documents version 2 as possibly incompatible with
-older Git, and cache directories outlive image upgrades.
+occasional write that merges layers costs more, and every write resolves
+every ref. A non-split rewrite of the whole graph cost 110–170 ms per
+write in an exploratory run. The default Bloom filter version (1) is
+kept: Git documents version 2 as possibly incompatible with older Git,
+and cache directories outlive image upgrades.
 
 ## Budgets and the no-Bloom fallback
 
 Computing Bloom filters for a whole history can be expensive. In an
-exploratory run, a repacked 100k-commit fixture took 74 s, against
-0.7–0.9 s for 20k commits. That fixture does not prove a general scaling
-law, but it rules out an unbounded write under the hydrate lock.
+exploratory run, a repacked 100k-commit fixture took 74 s, against about
+2 s for the 20k-commit benchmark. That fixture does not prove a general
+scaling law, but it rules out an unbounded write under the hydrate lock.
 `--max-new-filters` does not bound it usefully: Git chose which commits got
 filters, the tip commits got none in our test, and with `--split` the
 skipped commits are revisited only when their layer is merged. So the
@@ -81,12 +85,14 @@ refresh is bounded by time instead:
 1. The whole refresh shares one deadline, `commitGraphDeadline` (5 s),
    derived from the request context.
 2. The first attempt, in the inherited mode, gets at most
-   `commitGraphFirstBudget` (2 s) of it.
+   `commitGraphFirstBudget` (3 s) of it. That covers the 20k-commit
+   benchmark's first write with Bloom filters on an idle host. On a busy
+   host the same write can overrun and fall back.
 3. If that attempt runs out of its own budget while the request is still
    live and the shared deadline has not passed, one retry runs with
    `--no-changed-paths` for the rest of the shared deadline. A graph
-   without Bloom filters costs about 5–7 µs per commit (0.46 s for 100k
-   commits).
+   without Bloom filters costs about 5 µs per commit (0.46 s for 100k
+   commits in an exploratory run).
 4. A timed-out attempt gets SIGTERM, then SIGKILL after
    `commitGraphKillDelay` (1 s), and is reaped before the retry starts.
    So the refresh holds the lock for at most about 7 s.
@@ -125,8 +131,8 @@ already synced. A missing, stale, or partial graph is only slower:
   tree diff.
 - A reader that loses a split layer to a concurrent merge prints `warning:
   unable to find all commit-graph files` and uses the layers it loaded.
-  This was tested with Git 2.55: the output was unchanged and the exit
-  code was 0. `gitread` shows stderr only on failure.
+  This was tested with Git 2.55 by deleting a layer by hand: the output
+  was unchanged and the exit code was 0. `gitread` shows stderr only on failure.
 - If a budget expires, Git gets SIGTERM, which runs its lockfile cleanup.
   SIGKILL follows after `commitGraphKillDelay`. Git computes the graph in
   memory and takes `commit-graph-chain.lock` only to write the result. A
@@ -157,8 +163,8 @@ already synced. A missing, stale, or partial graph is only slower:
   the union of their objects. Object IDs are unchanged, so the graph stays
   valid and needs no integration.
 - **Lock hold time.** Other full hydrates of the same repo wait up to the
-  shared deadline plus the kill delays. Fast-path readers do not wait, because the marker is published
-  before the write starts.
+  shared deadline plus the kill delays. Fast-path readers do not wait,
+  because the marker is published before the write starts.
 
 ## Subprocess isolation
 

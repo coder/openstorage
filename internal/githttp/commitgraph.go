@@ -31,7 +31,7 @@ import (
 // so tests can shrink them; nothing else writes them.
 var (
 	commitGraphDeadline    = 5 * time.Second
-	commitGraphFirstBudget = 2 * time.Second
+	commitGraphFirstBudget = 3 * time.Second
 	commitGraphKillDelay   = time.Second
 )
 
