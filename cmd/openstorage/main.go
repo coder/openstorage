@@ -276,7 +276,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// aliases /api/repos/{repo_name}/*, and /api/repo-urls/{repo_id}.
 	// Mounting only /api/v1/ would strand the phase-6 routes on the git
 	// fallback handler below.
-	mux.Handle("/api/", metrics.InstrumentHTTP(metrics.SurfaceAPI, apiHandler))
+	mux.Handle("/api/", apiHandler)
 
 	// Git smart-HTTP path, authenticated with the same verifier as the API
 	// (ADR-8: iss-resolved org keys; the spike's single-key mode is gone).
@@ -319,15 +319,15 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	mux.Handle("/", metrics.InstrumentHTTP(metrics.SurfaceGit, gitLimit(srv.Handler())))
+	mux.Handle("/", gitLimit(srv.Handler()))
 
 	// Unauthenticated liveness probe: lets quickstarts and compose
 	// healthchecks confirm this server (not a stale process squatting the
 	// port) is answering before any authenticated call.
-	mux.Handle("/healthz", metrics.InstrumentHTTP(metrics.SurfaceHealth, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintln(w, `{"status":"ok"}`)
-	})))
+	})
 
 	fmt.Printf("listening on %s\n", ln.Addr())
 	// Printed after the API line so parsers of the first stdout line keep
@@ -344,7 +344,8 @@ func cmdServe(ctx context.Context, args []string) error {
 	// their own request contexts (and the stores hold no long-lived
 	// context), so work admitted before the signal completes normally
 	// within the bounded drain.
-	httpSrv := &http.Server{Handler: mux}
+	// Instrument the whole mux (ADR-47) so its own redirects count too.
+	httpSrv := &http.Server{Handler: metrics.InstrumentMux(mux, metricsSurface)}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpSrv.Serve(ln) }()
 	select {
@@ -656,4 +657,19 @@ func cmdListPacks(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("total: %d pack(s)\n", len(objs))
 	return nil
+}
+
+// metricsSurface maps the mux pattern for a request to its fixed metrics
+// surface (ADR-47). It mirrors the registrations above: /api/ subtree,
+// /healthz, and the Git fallback for everything else. For a mux redirect
+// the pattern is the redirect's target path, classified by the same rule.
+func metricsSurface(pattern string) metrics.Surface {
+	switch {
+	case strings.HasPrefix(pattern, "/api/"):
+		return metrics.SurfaceAPI
+	case pattern == "/healthz":
+		return metrics.SurfaceHealth
+	default:
+		return metrics.SurfaceGit
+	}
 }

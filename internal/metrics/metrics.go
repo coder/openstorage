@@ -237,6 +237,26 @@ func InstrumentHTTP(s Surface, next http.Handler) http.Handler {
 	})
 }
 
+// InstrumentMux instruments a whole ServeMux, so responses the mux
+// generates itself (the /api → /api/ redirect, path-cleaning redirects)
+// are counted too. The surface comes from classify applied to the pattern
+// mux.Handler reports: the matched registration, or for a mux redirect the
+// path the redirect leads to. classify must map every input to one of the
+// fixed surfaces; the pattern itself never becomes a label.
+func InstrumentMux(mux *http.ServeMux, classify func(pattern string) Surface) http.Handler {
+	assertf(mux != nil && classify != nil, "metrics.InstrumentMux: nil mux or classifier")
+	bySurface := make([]http.Handler, len(surfaceNames))
+	for s := range surfaceNames {
+		bySurface[s] = InstrumentHTTP(Surface(s), mux)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, pattern := mux.Handler(r)
+		s := classify(pattern)
+		name(surfaceNames[:], s) // crash on an out-of-range classifier result
+		bySurface[s].ServeHTTP(w, r)
+	})
+}
+
 // Fixed bounds for the unauthenticated metrics listener (ADR-47): no
 // configuration knobs.
 const (

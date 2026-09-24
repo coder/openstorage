@@ -232,6 +232,36 @@ func TestMetricsListenerSeparateFromAPI(t *testing.T) {
 		}
 		return total
 	}
+	// Mux-generated responses count too (Codex P2 on PR #327): /api is
+	// redirected by http.ServeMux itself, never reaching a handler.
+	apiRedirects := func() float64 {
+		_, body := httpGet(t, "http://"+n.metricsAddr+"/metrics", "")
+		for line := range strings.SplitSeq(body, "\n") {
+			if v, ok := strings.CutPrefix(line, `openstorage_http_requests_total{code_class="3xx",surface="api"} `); ok {
+				f, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					t.Fatalf("parse %q: %v", line, err)
+				}
+				return f
+			}
+		}
+		t.Fatal("api 3xx series missing")
+		return 0
+	}
+	redirBefore := apiRedirects()
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := noRedirect.Get("http://" + n.addr + "/api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode/100 != 3 {
+		t.Fatalf("GET /api = %d, want a mux redirect", resp.StatusCode)
+	}
+	if d := apiRedirects() - redirBefore; d != 1 {
+		t.Fatalf("mux-generated /api redirect moved api 3xx by %v, want 1", d)
+	}
+
 	before := gitCount()
 	work := initWorkRepo(t)
 	url := fmt.Sprintf("http://t:%s@%s/%s.git", token, n.addr, repo)

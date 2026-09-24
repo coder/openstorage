@@ -267,3 +267,53 @@ func TestIsUnspecifiedBind(t *testing.T) {
 		}
 	}
 }
+
+// TestInstrumentMuxCountsMuxGeneratedResponses pins the Codex P2 on
+// PR #327: http.ServeMux answers some requests itself (the /api → /api/
+// redirect, path-cleaning redirects), so per-registration wrappers never
+// saw them. Wrapping the whole mux counts every response exactly once,
+// under the surface the request resolves to.
+func TestInstrumentMuxCountsMuxGeneratedResponses(t *testing.T) {
+	mux := http.NewServeMux()
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
+	mux.Handle("/api/", ok)
+	mux.Handle("/healthz", ok)
+	mux.Handle("/", ok)
+	classify := func(pattern string) Surface {
+		switch {
+		case strings.HasPrefix(pattern, "/api/"):
+			return SurfaceAPI
+		case pattern == "/healthz":
+			return SurfaceHealth
+		default:
+			return SurfaceGit
+		}
+	}
+	h := InstrumentMux(mux, classify)
+	for _, tc := range []struct {
+		target, surface, class string
+	}{
+		{"/api", "api", "3xx"},               // mux-generated redirect to /api/
+		{"/x/../api/v1/repos", "api", "3xx"}, // path-cleaning redirect
+		{"//healthz", "health", "3xx"},
+		{"/api/v1/repos", "api", "2xx"},
+		{"/healthz", "health", "2xx"},
+		{"/repo.git/info/refs", "git", "2xx"},
+	} {
+		t.Run(tc.target, func(t *testing.T) {
+			totals := func() float64 { return Value("openstorage_http_requests_total", nil) }
+			one := map[string]string{"surface": tc.surface, "code_class": tc.class}
+			beforeAll, beforeOne := totals(), Value("openstorage_http_requests_total", one)
+			req := httptest.NewRequest(http.MethodGet, "http://example.test"+tc.target, nil)
+			req.URL.Path = tc.target // keep the uncleaned path, as a raw client sends it
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if got := Value("openstorage_http_requests_total", one) - beforeOne; got != 1 {
+				t.Errorf("%s: %s/%s delta = %v (status %d), want 1", tc.target, tc.surface, tc.class, got, rec.Code)
+			}
+			if got := totals() - beforeAll; got != 1 {
+				t.Errorf("%s: total delta = %v, want exactly 1 (no double counting)", tc.target, got)
+			}
+		})
+	}
+}

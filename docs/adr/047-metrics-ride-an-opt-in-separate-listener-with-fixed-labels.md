@@ -74,9 +74,15 @@ missing series:
 | `openstorage_s3wal_manifest_size_guard_total` | counter | `result` = `warn` \| `refuse` |
 | `openstorage_job_runs_total` | counter | `job` = `orphan_sweep` \| `repack`; `result` = `success` \| `noop` \| `error` |
 
-`surface` is fixed per mux registration (`/api/` → `api`, `/healthz` →
-`health`, everything else including LFS and unmatched paths → `git`), not
-parsed from the path. `code_class` comes from the final status the
+`surface` follows the API/Git mux's own routing, not a parse of the
+request path: the whole mux is instrumented, and the pattern
+`mux.Handler` reports (the matched registration, or for a redirect the
+mux generates itself, such as `/api` → `/api/` or a path-cleaning
+redirect, the path it leads to) is classified into `api` (the `/api/`
+subtree), `health` (`/healthz`), or `git` (everything else, including LFS
+and unmatched paths). The classifier's output is always one of those three
+constants; the pattern never becomes a label. Wrapping the whole mux means
+mux-generated responses are counted too. `code_class` comes from the final status the
 handler wrote (an implicit 200 counts as `2xx`; informational `1xx`
 headers do not replace the final status), clamped to the five classes.
 The status wrapper keeps `Unwrap`, so `http.ResponseController` deadlines
