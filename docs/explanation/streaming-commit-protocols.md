@@ -1,7 +1,8 @@
 # Streaming Commit Protocols (NDJSON)
 
-**TL;DR:** HTTP API commits use a custom **NDJSON** stream, not git packfiles: a
-metadata frame, then base64 chunk frames, answered by a shared response envelope.
+**TL;DR:** the two streaming commit endpoints (`commit-pack`, `diff-commit`) take a
+custom **NDJSON** stream, not git packfiles: a metadata frame, then base64 chunk
+frames, answered by a shared response envelope. `restore-commit` is plain JSON.
 
 Both streaming endpoints follow these transport rules:
 
