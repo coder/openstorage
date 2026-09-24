@@ -234,8 +234,10 @@ change. These are the outcomes:
 | `outcome=canceled` | The request that triggered the full hydrate went away. | None |
 | `outcome=failed` | Any other Git failure. The detail carries Git's stderr. | Read the detail. |
 
-A `commit_graph_refresh_total{outcome}` counter with exactly these labels (and no repo
-label) is planned for the metrics listener.
+The [metrics listener](../reference/metrics.md) counts every outcome, including
+`written`, in `openstorage_commit_graph_refresh_total{outcome}`. The labels are exactly
+these outcomes, with no repository label: use the log line's `repo=` field to find the
+repository.
 
 **Stale-lock runbook.** The symptom is `outcome=lock_held` for the same `repo=` on every
 full hydrate. The usual cause is that a Git process was killed (SIGKILL, the OOM killer,
@@ -572,6 +574,7 @@ text appended after it is not part of the contract.
 | Lease `… fail-stop` (S3WAL signals) | **log only** for the verdict | `openstorage_s3wal_lease_renewal_failures_total` counts failed renewal writes before it; `openstorage_s3wal_lease_held` is local state, and the process exits on fail-stop |
 | Startup `no usable HTTP Date witness` / lease `freshness cannot be judged` / `is corrupt` (S3WAL signals) | **log only** | Startup refusals |
 | `WARN s3wal clock skew guard tripped` (S3WAL signals) | **log only** | |
+| `commit-graph refresh outcome=…` (What to monitor) | `openstorage_commit_graph_refresh_total` by `outcome` | Counts every refresh, including the silent `written`; the repository stays **log only** in the line's `repo=` field |
 
 ## Zero-infrastructure mode (experimental): one bucket, one node
 

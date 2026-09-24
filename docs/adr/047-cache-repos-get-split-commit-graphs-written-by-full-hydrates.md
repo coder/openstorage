@@ -179,6 +179,9 @@ already synced. A missing, stale, or partial graph is only slower:
   one line, `commit-graph refresh outcome=<outcome> repo=<path>: <detail>`.
   This is a documented log contract
   ([outcomes](../how-to/deploy-production.md#commit-graph-refresh)).
+  Every outcome, including `written`, is also counted in
+  `openstorage_commit_graph_refresh_total{outcome}` (no repository label)
+  on the opt-in metrics listener.
 
 ## Concurrency
 

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/gitlimit"
+	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -89,11 +90,10 @@ func (c *tipCollectingRefSeq) next() (string, string, bool, error) {
 // of its own budget (as opposed to the request or the shared deadline).
 var errCommitGraphBudget = errors.New("commit-graph attempt budget expired")
 
-// commitGraphOutcome is how one refresh ended. The set is fixed (it is
-// the log contract in docs/how-to/deploy-production.md, "Commit-graph
-// refresh", and the label set of a future
-// commit_graph_refresh_total{outcome} counter once the metrics listener
-// lands), and it never carries the repo.
+// commitGraphOutcome is how one refresh ended. The set is fixed: it is
+// the log contract in docs/how-to/deploy-production.md ("Commit-graph
+// refresh") and the label set of openstorage_commit_graph_refresh_total,
+// and it never carries the repo.
 type commitGraphOutcome string
 
 const (
@@ -118,15 +118,29 @@ var commitGraphOutcomes = []commitGraphOutcome{
 // lock file already present (a concurrent or dead writer's).
 var errCommitGraphLockHeld = errors.New("commit-graph lock file already exists")
 
+// commitGraphMetric maps each outcome to its metrics label enum.
+var commitGraphMetric = map[commitGraphOutcome]metrics.CommitGraphOutcome{
+	outcomeWritten:       metrics.CommitGraphWritten,
+	outcomeWrittenPlain:  metrics.CommitGraphWrittenPlain,
+	outcomeSkippedTipCap: metrics.CommitGraphSkippedTipCap,
+	outcomeSkippedBusy:   metrics.CommitGraphSkippedBusy,
+	outcomeLockHeld:      metrics.CommitGraphLockHeld,
+	outcomeMemoryLimit:   metrics.CommitGraphMemoryLimit,
+	outcomeTimedOut:      metrics.CommitGraphTimedOut,
+	outcomeCanceled:      metrics.CommitGraphCanceled,
+	outcomeFailed:        metrics.CommitGraphFailed,
+}
+
 // recordCommitGraphOutcome is the single reporting point for a refresh's
-// outcome. Every outcome except written is logged as one line:
+// outcome. Every outcome counts once in
+// openstorage_commit_graph_refresh_total{outcome}; every outcome except
+// written is also logged as one line:
 //
 //	commit-graph refresh outcome=<outcome> repo=<repoPath>[: <detail>]
-//
-// TODO(#322): count commit_graph_refresh_total{outcome} here once the
-// metrics listener (PR #327) lands.
 func recordCommitGraphOutcome(repoPath string, o commitGraphOutcome, detail string) commitGraphOutcome {
-	assertf(slices.Contains(commitGraphOutcomes, o), "recordCommitGraphOutcome: unknown outcome %q", o)
+	m, ok := commitGraphMetric[o]
+	assertf(ok && slices.Contains(commitGraphOutcomes, o), "recordCommitGraphOutcome: unknown outcome %q", o)
+	metrics.CommitGraphRefresh(m)
 	if o == outcomeWritten {
 		return o
 	}

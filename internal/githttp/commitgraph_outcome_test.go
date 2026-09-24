@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/gitlimit"
+	"github.com/coder/openstorage/internal/metrics"
 )
 
 // captureLog redirects the standard logger for one test and returns the
@@ -255,4 +256,18 @@ func TestRefreshCommitGraph_MemoryLimitLogged(t *testing.T) {
 		t.Fatalf("outcome = %s, want memory_limit", got)
 	}
 	assertOneOutcome(t, buf, outcomeMemoryLimit, repoPath)
+}
+
+// Every outcome, including the silent written, counts once in
+// openstorage_commit_graph_refresh_total under a label equal to its name.
+func TestRecordCommitGraphOutcome_CountsMetric(t *testing.T) {
+	captureLog(t)
+	for _, o := range commitGraphOutcomes {
+		labels := map[string]string{"outcome": string(o)}
+		before := metrics.Value("openstorage_commit_graph_refresh_total", labels)
+		recordCommitGraphOutcome("repo.git", o, "")
+		if got := metrics.Value("openstorage_commit_graph_refresh_total", labels) - before; got != 1 {
+			t.Errorf("outcome %s: counter delta = %v, want 1", o, got)
+		}
+	}
 }
