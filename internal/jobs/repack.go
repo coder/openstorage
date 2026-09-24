@@ -60,6 +60,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -217,6 +218,22 @@ const repackVerifyReserve = 30 * time.Second
 // return (false, nil) — a loss proves a concurrent fold won, and in every
 // deployment shape that winner runs the same follow-up recheck.
 func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err error) {
+	folded, err = r.repack(ctx, repo)
+	// ADR-47: success = folded cleanly; noop = nothing to fold or a lost
+	// race; error = any error, including a committed fold that failed
+	// verification.
+	switch {
+	case err != nil:
+		metrics.JobRun(metrics.JobRepack, metrics.ResultError)
+	case folded:
+		metrics.JobRun(metrics.JobRepack, metrics.ResultSuccess)
+	default:
+		metrics.JobRun(metrics.JobRepack, metrics.ResultNoop)
+	}
+	return folded, err
+}
+
+func (r *Repacker) repack(ctx context.Context, repo string) (folded bool, err error) {
 	assertf(repo != "", "Repack: empty repo")
 	// Runtime budget: the fold's deadline covers everything below —
 	// hydration, enumeration, pack-objects (killed via CommandContext on

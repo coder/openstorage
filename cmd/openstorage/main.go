@@ -33,6 +33,7 @@ import (
 	"github.com/coder/openstorage/internal/envconfig"
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
 	"github.com/coder/openstorage/internal/ref/s3wal"
 	"github.com/coder/openstorage/internal/version"
@@ -166,16 +167,19 @@ func cmdServe(ctx context.Context, args []string) error {
 			if err != nil {
 				return err
 			}
+			metrics.SetS3WALLeaseHeld(true) // ADR-47: local state, not proof of ownership
 			defer func() {
 				// Release is best-effort by design (an abandoned lease
 				// expires on its TTL), so bound it: a stalled endpoint
 				// must not hang an otherwise graceful shutdown.
+				metrics.SetS3WALLeaseHeld(false)
 				rctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 				defer cancel()
 				lease.Release(rctx)
 			}()
 			go func() {
 				if err := lease.Heartbeat(ctx); err != nil {
+					metrics.SetS3WALLeaseHeld(false)
 					fatalf("openstorage serve: %v", err)
 				}
 			}()
@@ -198,6 +202,21 @@ func cmdServe(ctx context.Context, args []string) error {
 	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
 		return err
+	}
+	defer ln.Close()
+	// Opt-in metrics listener (ADR-47): its own socket, server, and mux.
+	// Bind it before anything is announced or served; a bad or busy
+	// address fails startup instead of silently disabling metrics.
+	var metricsLn net.Listener
+	if cfg.metricsListen != "" {
+		metricsLn, err = net.Listen("tcp", cfg.metricsListen)
+		if err != nil {
+			return fmt.Errorf("%s=%q: metrics listener: %w", envMetricsListen, cfg.metricsListen, err)
+		}
+		defer metricsLn.Close()
+		if metrics.IsUnspecifiedBind(cfg.metricsListen) {
+			fmt.Fprintf(os.Stderr, "warning: %s=%s binds every interface and the metrics listener has no authentication; restrict it to loopback or a private network only the scraper can reach\n", envMetricsListen, cfg.metricsListen)
+		}
 	}
 	httpBaseURL := cfg.baseURL
 	if httpBaseURL == "" {
@@ -257,7 +276,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// aliases /api/repos/{repo_name}/*, and /api/repo-urls/{repo_id}.
 	// Mounting only /api/v1/ would strand the phase-6 routes on the git
 	// fallback handler below.
-	mux.Handle("/api/", apiHandler)
+	mux.Handle("/api/", metrics.InstrumentHTTP(metrics.SurfaceAPI, apiHandler))
 
 	// Git smart-HTTP path, authenticated with the same verifier as the API
 	// (ADR-8: iss-resolved org keys; the spike's single-key mode is gone).
@@ -300,17 +319,26 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	mux.Handle("/", gitLimit(srv.Handler()))
+	mux.Handle("/", metrics.InstrumentHTTP(metrics.SurfaceGit, gitLimit(srv.Handler())))
 
 	// Unauthenticated liveness probe: lets quickstarts and compose
 	// healthchecks confirm this server (not a stale process squatting the
 	// port) is answering before any authenticated call.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.Handle("/healthz", metrics.InstrumentHTTP(metrics.SurfaceHealth, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintln(w, `{"status":"ok"}`)
-	})
+	})))
 
 	fmt.Printf("listening on %s\n", ln.Addr())
+	// Printed after the API line so parsers of the first stdout line keep
+	// working; the bind itself already happened above.
+	var metricsSrv *http.Server
+	metricsErr := make(chan error, 1)
+	if metricsLn != nil {
+		fmt.Printf("metrics listening on %s\n", metricsLn.Addr())
+		metricsSrv = metrics.NewServer()
+		go func() { metricsErr <- metricsSrv.Serve(metricsLn) }()
+	}
 	// Serve on an http.Server rather than bare http.Serve: only Shutdown
 	// gives the termination signal a drain seam. In-flight requests keep
 	// their own request contexts (and the stores hold no long-lived
@@ -322,6 +350,10 @@ func cmdServe(ctx context.Context, args []string) error {
 	select {
 	case err := <-serveErr:
 		return err
+	case err := <-metricsErr:
+		// The metrics server stopped on its own: exit rather than keep
+		// serving unmonitored (ADR-47).
+		return fmt.Errorf("metrics listener stopped: %w", err)
 	case <-ctx.Done():
 		// Restore default signal disposition first: a second signal
 		// during the drain kills immediately (operator escape hatch).
@@ -331,6 +363,11 @@ func cmdServe(ctx context.Context, args []string) error {
 		defer cancel()
 		if err := httpSrv.Shutdown(dctx); err != nil {
 			fmt.Fprintf(os.Stderr, "openstorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)
+		}
+		if metricsSrv != nil {
+			if err := metricsSrv.Shutdown(dctx); err != nil {
+				fmt.Fprintf(os.Stderr, "openstorage serve: metrics drain incomplete: %v\n", err)
+			}
 		}
 		// Orderly signal shutdown exits 0; the deferred teardown above
 		// (workers, stores, instance lease) runs on this return.

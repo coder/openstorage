@@ -41,6 +41,7 @@ New here? Start with the [README quickstart](../README.md#quickstart-local-mode-
 | Page | Covers |
 |---|---|
 | [Configuration](reference/configuration.md) | Every `OPENSTORAGE_*` variable, defaults, and validation |
+| [Metrics](reference/metrics.md) | The opt-in Prometheus listener and every metric it exposes |
 | [CLI](reference/cli.md) | `openstorage` commands and flags |
 | [HTTP API](reference/http-api.md) | Endpoint catalog, scopes, and the status-code contract |
 | [Authentication](reference/authentication.md) | Customer-signed JWTs, claims, scopes, and ref policies |
