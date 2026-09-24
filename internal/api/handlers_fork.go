@@ -108,6 +108,12 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		writeErr(w, http.StatusForbidden, err.Error())
 		return
 	}
+	// Before the source token is even verified: a body repo_name can only
+	// confirm the destination claim, never redirect the fork.
+	if !req.repoNameMatches(url) {
+		writeErr(w, http.StatusBadRequest, repoNameMismatchMsg)
+		return
+	}
 
 	// The fork-source JWT (docs/explanation/domain-model.md invariant 12) authorizes reading the
 	// source repo. Absent token: malformed request (400). A token that does

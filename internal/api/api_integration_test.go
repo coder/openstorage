@@ -228,6 +228,153 @@ func testCreateRepoValidation(t *testing.T, e *testEnv) {
 	}
 }
 
+// TestCreateRepoRepoName covers the optional body `repo_name` (issue #293).
+// Upstream: "It can contain a slash. When present, it must equal the JWT repo
+// claim. When omitted, the repo claim supplies the name." A mismatch is the
+// documented 400 ("did not match the JWT repo claim"), in this backend's
+// recorded {"error"} envelope (docs/explanation/wire-compatibility.md). The
+// security invariant: the body name can only confirm the claim, never
+// override it, so a mismatch creates nothing under either name.
+func TestCreateRepoRepoName(t *testing.T) { runBackends(t, testCreateRepoRepoName) }
+
+func testCreateRepoRepoName(t *testing.T, e *testEnv) {
+	org := e.newOrg(t)
+	requireRow := func(t *testing.T, url, wantID string) {
+		t.Helper()
+		readTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeGitRead}})
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repo", readTok, nil, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /repo %q status = %d (body %s)", url, resp.StatusCode, body)
+		}
+		var got repoEntry
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.RepoName != url || (wantID != "" && got.RepoID != wantID) {
+			t.Fatalf("GET /repo %q = %+v, want repo_name %q repo_id %q", url, got, url, wantID)
+		}
+	}
+	requireNoRow := func(t *testing.T, url string) {
+		t.Helper()
+		readTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeGitRead}})
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repo", readTok, nil, "")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET /repo %q status = %d, want 404 (body %s)", url, resp.StatusCode, body)
+		}
+	}
+	mismatch := func(t *testing.T, claim string, body []byte) {
+		t.Helper()
+		tok := e.mint(t, tokenSpec{iss: org, repo: claim, scopes: []string{auth.ScopeRepoWrite}})
+		resp, respBody := e.doReq(t, http.MethodPost, "/api/v1/repos", tok, body, "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST /repos claim %q body %s status = %d, want 400 (body %s)", claim, body, resp.StatusCode, respBody)
+		}
+		if msg := requireEnvelope(t, resp, respBody); msg != "repo_name must equal the JWT repo claim" {
+			t.Fatalf("mismatch error = %q", msg)
+		}
+		requireNoRow(t, claim)
+	}
+
+	t.Run("absent", func(t *testing.T) {
+		url := "rn-" + randomHex(t, 4)
+		created := createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusOK)
+		if created.RepoName != url {
+			t.Fatalf("repo_name = %q, want %q", created.RepoName, url)
+		}
+		requireRow(t, url, created.RepoID)
+	})
+
+	t.Run("null is absent", func(t *testing.T) {
+		url := "rn-" + randomHex(t, 4)
+		created := createRepo(t, e, org, url, []byte(`{"repo_name":null}`), http.StatusOK)
+		requireRow(t, url, created.RepoID)
+	})
+
+	t.Run("equal", func(t *testing.T) {
+		url := "rn-" + randomHex(t, 4)
+		created := createRepo(t, e, org, url, []byte(`{"repo_name":"`+url+`"}`), http.StatusOK)
+		if created.RepoName != url {
+			t.Fatalf("repo_name = %q, want %q", created.RepoName, url)
+		}
+		requireRow(t, url, created.RepoID)
+	})
+
+	t.Run("equal with slash", func(t *testing.T) {
+		url := "pierre/rn-" + randomHex(t, 4)
+		body, err := json.Marshal(map[string]any{"repo_name": url, "default_branch": "trunk"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		created := createRepo(t, e, org, url, body, http.StatusOK)
+		if created.RepoName != url {
+			t.Fatalf("repo_name = %q, want %q", created.RepoName, url)
+		}
+		requireRow(t, url, created.RepoID)
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		claim := "pierre/rn-" + randomHex(t, 4)
+		other := "pierre/rn-" + randomHex(t, 4)
+		for _, name := range []string{
+			other,                                // a different name entirely
+			"",                                   // present but empty is not absent
+			strings.ToUpper(claim),               // exact, case-sensitive equality
+			claim + "/",                          // no path normalization
+			" " + claim,                          // no trimming
+			strings.TrimPrefix(claim, "pierre/"), // no owner-prefix inference
+		} {
+			body, err := json.Marshal(map[string]any{"repo_name": name})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mismatch(t, claim, body)
+		}
+		// The body name never becomes a repo either.
+		requireNoRow(t, other)
+		// Non-string repo_name is malformed input.
+		tok := e.mint(t, tokenSpec{iss: org, repo: claim, scopes: []string{auth.ScopeRepoWrite}})
+		resp, respBody := e.doReq(t, http.MethodPost, "/api/v1/repos", tok, []byte(`{"repo_name":42}`), "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("numeric repo_name status = %d, want 400 (body %s)", resp.StatusCode, respBody)
+		}
+		requireEnvelope(t, resp, respBody)
+		requireNoRow(t, claim)
+	})
+
+	t.Run("mismatch naming an existing repo cannot touch it", func(t *testing.T) {
+		// A token for a new repo that names someone else's existing repo in
+		// the body must not create, re-create, or collide (409) with it.
+		victim := "pierre/rn-victim-" + randomHex(t, 4)
+		victimRepo := createRepo(t, e, org, victim, nil, http.StatusOK)
+		claim := "pierre/rn-" + randomHex(t, 4)
+		body, err := json.Marshal(map[string]any{"repo_name": victim, "default_branch": "evil"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mismatch(t, claim, body)
+		requireRow(t, victim, victimRepo.RepoID)
+		readTok := e.mint(t, tokenSpec{iss: org, repo: victim, scopes: []string{auth.ScopeGitRead}})
+		_, getBody := e.doReq(t, http.MethodGet, "/api/v1/repo", readTok, nil, "")
+		var got repoEntry
+		if err := json.Unmarshal(getBody, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.DefaultBranch != "main" {
+			t.Fatalf("victim default_branch = %q, want main (untouched)", got.DefaultBranch)
+		}
+	})
+
+	t.Run("mismatch is rejected before base_repo validation", func(t *testing.T) {
+		// Sync (non-fork) base_repo: the name check comes first, so no row
+		// or upstream link is created, whatever the base_repo says.
+		claim := "rn-" + randomHex(t, 4)
+		mismatch(t, claim, []byte(`{"repo_name":"other","base_repo":{"provider":"github","owner":"o","name":"n","auth":{"auth_type":"public"}}}`))
+		// Fork base_repo through the production dispatcher: rejected before
+		// the fork handler even looks at the (missing) source token.
+		mismatch(t, claim, []byte(`{"repo_name":"other","base_repo":{"provider":"code","operation":"fork"}}`))
+	})
+}
+
 // TestPerRepoRoutesRejectNonRepoClaims locks in the docs/reference/authentication.md failure map for
 // per-repo routes: tokens whose repo claim is empty or "org" get 403 — never
 // a 500 (regression: empty claims previously reached the store and panicked).

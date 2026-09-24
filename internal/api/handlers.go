@@ -164,8 +164,26 @@ func validBranchName(name string) bool {
 }
 
 type createRepoRequest struct {
+	// RepoName is the optional upstream `repo_name` (issue #293). It never
+	// names the repo: the JWT repo claim always does, and a present
+	// repo_name must equal it (repoNameMatches). nil = absent or null.
+	RepoName      *string         `json:"repo_name"`
 	DefaultBranch string          `json:"default_branch"`
 	BaseRepo      json.RawMessage `json:"base_repo"`
+}
+
+// repoNameMismatchMsg is the 400 body for a repo_name that differs from the
+// JWT repo claim (upstream documents 400 for this case).
+const repoNameMismatchMsg = "repo_name must equal the JWT repo claim"
+
+// repoNameMatches reports whether the optional body repo_name is absent or
+// exactly (byte-for-byte, no normalization) equal to the JWT repo claim.
+// Every POST /repos creator checks it before any other body validation or
+// side effect, so a body name can confirm the claim but never override it.
+func (req *createRepoRequest) repoNameMatches(claim string) bool {
+	assertf(req != nil, "repoNameMatches: nil request")
+	assertf(claim != "" && claim != auth.RepoClaimOrg, "repoNameMatches: non-repo claim %q", claim)
+	return req.RepoName == nil || *req.RepoName == claim
 }
 
 type createRepoResponse struct {
@@ -177,7 +195,7 @@ type createRepoResponse struct {
 
 // handleCreateRepo implements POST /api/v1/repos (scope repo:write). The new
 // repo's url is the JWT `repo` claim; the optional body carries
-// {default_branch?, base_repo?} (docs/reference/http-api.md).
+// {repo_name?, default_branch?, base_repo?} (docs/reference/http-api.md).
 func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	url := claims.Repo
@@ -203,6 +221,10 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 			return
 		}
+	}
+	if !req.repoNameMatches(url) {
+		writeErr(w, http.StatusBadRequest, repoNameMismatchMsg)
+		return
 	}
 	// Fork/upstream sync is a later phase; silently dropping base_repo would
 	// lie to clients, so reject it outright.

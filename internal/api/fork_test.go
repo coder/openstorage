@@ -234,6 +234,57 @@ func TestForkRepo(t *testing.T) {
 			}
 		})
 
+		// Issue #293: the optional body repo_name may only confirm the
+		// destination's JWT repo claim (caller.url contains slashes).
+		t.Run("repo_name equal to claim", func(t *testing.T) {
+			caller := newForkCaller(t, e, "")
+			req := forkBody(srcReadTok, nil)
+			req["repo_name"] = caller.url
+			resp, body := forkDo(t, srv, caller.token, req)
+			forkID := forkRequireCreated(t, resp, body)
+			if body["repo_name"] != caller.url {
+				t.Fatalf("repo_name = %v, want %s", body["repo_name"], caller.url)
+			}
+			row, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url)
+			if err != nil || row.RepoID != forkID {
+				t.Fatalf("repo row = %+v err %v, want repo_id %s", row, err, forkID)
+			}
+		})
+
+		t.Run("repo_name mismatch creates nothing", func(t *testing.T) {
+			caller := newForkCaller(t, e, "")
+			other := caller.url + "-other"
+			for _, name := range []string{other, src.url, ""} {
+				req := forkBody(srcReadTok, nil)
+				req["repo_name"] = name
+				resp, body := forkDo(t, srv, caller.token, req)
+				if resp.StatusCode != http.StatusBadRequest || body["error"] != "repo_name must equal the JWT repo claim" {
+					t.Fatalf("repo_name %q: status = %d body %v, want 400 name mismatch", name, resp.StatusCode, body)
+				}
+			}
+			forkRequireNoRepoRow(t, e, caller.org, caller.url)
+			forkRequireNoRepoRow(t, e, caller.org, other)
+			// The fork source named in the body is untouched.
+			if refs := wrefRefs(t, e, src.repoID); refs["refs/heads/main"] != src.c2 {
+				t.Fatalf("source refs = %v, want refs/heads/main=%s", refs, src.c2)
+			}
+		})
+
+		t.Run("repo_name mismatch on the frozen fallback", func(t *testing.T) {
+			// No base_repo: the dispatcher replays to the frozen creator,
+			// which enforces the same rule.
+			caller := newForkCaller(t, e, "")
+			resp, body := forkDo(t, srv, caller.token, map[string]any{"repo_name": caller.url + "x"})
+			if resp.StatusCode != http.StatusBadRequest || body["error"] != "repo_name must equal the JWT repo claim" {
+				t.Fatalf("status = %d body %v, want 400 name mismatch", resp.StatusCode, body)
+			}
+			forkRequireNoRepoRow(t, e, caller.org, caller.url)
+			resp, body = forkDo(t, srv, caller.token, map[string]any{"repo_name": caller.url})
+			if resp.StatusCode != http.StatusOK || body["repo_name"] != caller.url {
+				t.Fatalf("equal repo_name status = %d body %v, want 200", resp.StatusCode, body)
+			}
+		})
+
 		t.Run("cross-org fork", func(t *testing.T) {
 			// The caller org differs from the source org; authorization to
 			// read the source comes solely from the embedded source JWT.

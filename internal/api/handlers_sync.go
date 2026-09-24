@@ -183,6 +183,10 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if !req.repoNameMatches(url) {
+		writeErr(w, http.StatusBadRequest, repoNameMismatchMsg)
+		return
+	}
 
 	var spec *usyncBaseRepo
 	upstreamHost := ""
