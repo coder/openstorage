@@ -438,8 +438,8 @@ subprocesses) until an endpoint that authenticates temporary credentials is
 available.
 
 Floci's default in-memory storage suits a fresh-per-run lane. Persistent mode
-(`FLOCI_STORAGE_MODE=persistent` plus a volume) is verified working if restart
-survival is ever needed.
+(`FLOCI_STORAGE_MODE=persistent` plus a volume) was verified working on an earlier
+Floci build, if restart survival is ever needed.
 
 Per-PR blobs stay on SeaweedFS because of the [Floci gaps](#the-floci-s3-lane)
 (unvalidated header-auth SigV4, ignored conditional DELETE). This lane is

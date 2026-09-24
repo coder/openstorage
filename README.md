@@ -44,7 +44,7 @@ openstorage version
 - **Releases:** [Linux and macOS binaries](https://github.com/coder/openstorage/releases)
   for amd64 and arm64, plus `checksums.txt`.
 - **Runtime dependencies:** the server needs `git`. Signed-commit ref policies also
-  need `gpg` or `ssh-keygen`. The Docker image includes all three; the binary does not.
+  need `gpg` or `ssh-keygen` for the relevant signature type. The Docker image includes all three; the binary does not.
 
 <a name="quickstarts"></a>
 
@@ -219,7 +219,7 @@ discard the cache; a fresh node rebuilds from the bucket.
 > 3. Follow the [shutdown and restart runbook](docs/how-to/deploy-production.md#s3wal-shutdown-and-restart), then start exactly one replacement.
 >
 > A corrupt or unjudgeable lease needs fenced investigation, not repeated starts.
-> Never delete the lease or edit `_wal/` by hand to skip the wait.
+> Never delete the lease or edit `_wal/` by hand to skip the wait or to make startup pass.
 
 This mode is single-node. Ref updates within a repository group share one
 compare-and-swap point, so concurrent pushes serialize. See [the storage engine](docs/explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal)

@@ -173,7 +173,7 @@ agents load it automatically, humans run the CLI:
 sh .agents/skills/use-modern-go/scripts/run-tool.sh list --file-path path/to/file.go
 ```
 
-New code must not reintroduce patterns the
+New code should not reintroduce patterns the
 [`modernize`](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/modernize)
 analyzer rewrites:
 
