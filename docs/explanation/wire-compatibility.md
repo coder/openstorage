@@ -1,7 +1,7 @@
 # Wire compatibility with code.storage
 
 **TL;DR:** open.storage can stand in for [code.storage](https://code.storage) (Pierre
-Computer Company) behind existing clients. The differences are one organization per
+Computer Company) behind existing clients. The main differences are one organization per
 deployment, no multi-tenant control plane, and a short list of
 [tracked deviations](#known-deviations-from-the-vendored-spec). This page is for platform
 teams and integrators deciding without reading the source.
