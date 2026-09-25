@@ -2187,6 +2187,9 @@ components:
       additionalProperties: false
       description: RFC 9457-compatible problem details payload describing the error response.
       properties:
+        code:
+          description: A stable, machine-readable error code in snake_case. Branch on `code`, not on `detail`. The API description lists the codes.
+          type: string
         detail:
           description: A human-readable explanation specific to this occurrence of the problem.
           type: string
@@ -2210,6 +2213,7 @@ components:
         - type
         - title
         - status
+        - code
       type: object
     PullUpstreamRequest:
       additionalProperties: false
@@ -2557,11 +2561,42 @@ info:
 
     ## Errors
 
-    Most endpoints return RFC 9457-compatible problem details under `application/problem+json`, with a legacy `error` field mirrored from `detail`.
+    Most endpoints return RFC 9457-compatible problem details under `application/problem+json`, with a legacy `error` field mirrored from `detail`. Each problem body has a stable, snake_case `code`. Branch on `code`, not on `detail`. The Error codes section lists the values.
 
     A `429 Too Many Requests` response carries the current IETF `RateLimit` service-limit field and `Retry-After`. `RateLimit` reports immediately available quota (`r`) and its effective window in seconds (`t`); `Retry-After` is the minimum delay and takes precedence. The gateway's capacity is dynamic, so it does not advertise a fixed `RateLimit-Policy` on successful responses.
 
     Streaming commit and note workflows may return operation-specific failure bodies so callers can inspect partial results, branch state, or workflow status without parsing generic error strings.
+
+    ## Error codes
+
+    Each problem body has a stable `code`. Each status has a generic code. A specific code replaces it when the caller must take a different action. New codes can be added. Treat an unknown code as the generic code for its status.
+
+    Generic codes: `bad_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `method_not_allowed` (405), `request_timeout` (408), `conflict` (409), `precondition_failed` (412), `payload_too_large` (413), `unprocessable_entity` (422), `rate_limited` (429), `request_canceled` (499), `internal_error` (500), `not_implemented` (501), `bad_gateway` (502), `service_unavailable` (503), `gateway_timeout` (504). Any other status uses its status text in snake_case.
+
+    Specific codes:
+
+    - `authentication_unavailable` (403): the server cannot verify credentials now; retry.
+    - `insufficient_scope` (403): the token does not have a scope that the operation requires.
+    - `repo_claim_missing` (400): the token has no `repo` claim.
+    - `repo_name_mismatch` (400): the request `repo_name` does not match the token `repo` claim.
+    - `route_not_found` (404): no API route matches the path.
+    - `repository_not_found` (404): the repository does not exist or the token cannot access it.
+    - `repository_deleted` (409): the repository is already deleted.
+    - `repository_thawing` (409): the repository is being restored from cold storage; retry after `Retry-After`.
+    - `sync_in_progress` (409): an upstream sync is in progress; retry.
+    - `upstream_already_configured` (409): the repository already has an upstream.
+    - `branch_not_found` (404): the branch does not exist.
+    - `ref_not_found` (404): the ref or revision does not exist.
+    - `merge_conflict` (409): the merge has file conflicts.
+    - `credential_not_found` (404): the Git credential does not exist.
+    - `credential_exists` (409): the repository already has a Git credential.
+    - `github_app_not_configured` (412): the organization does not have exactly one GitHub App.
+    - `github_repository_inaccessible` (412, or the 4xx status from the upstream): GitHub does not give access to the upstream repository.
+    - `hosting_not_enabled` (403): hosting is not enabled for the organization.
+    - `hosting_project_not_found` (404): the repository has no hosting project.
+    - `deployment_not_found` (404): the deployment does not exist.
+    - `deployment_project_name_in_use` (409): another repository uses the hosting project name.
+    - `idempotency_key_reused` (422): the idempotency key belongs to a different request.
   title: code.storage
   version: 1.0.0
 openapi: 3.1.0
@@ -2739,6 +2774,7 @@ paths:
           content:
             application/json:
               example:
+                code: repository_not_found
                 detail: repository not found
                 error: repository not found
                 instance: /api/repo-urls/repo_7f2b3d9
@@ -2749,6 +2785,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: repository_not_found
                 detail: repository not found
                 error: repository not found
                 instance: /api/repo-urls/repo_7f2b3d9
@@ -2867,6 +2904,7 @@ paths:
           content:
             application/json:
               example:
+                code: bad_request
                 detail: invalid cursor
                 error: invalid cursor
                 instance: /api/repos
@@ -2877,6 +2915,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: bad_request
                 detail: invalid cursor
                 error: invalid cursor
                 instance: /api/repos
@@ -3053,6 +3092,7 @@ paths:
           content:
             application/json:
               example:
+                code: bad_request
                 detail: "unknown provider: example-host"
                 error: "unknown provider: example-host"
                 instance: /api/repos
@@ -3063,6 +3103,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: bad_request
                 detail: "unknown provider: example-host"
                 error: "unknown provider: example-host"
                 instance: /api/repos
@@ -3222,6 +3263,7 @@ paths:
           content:
             application/json:
               example:
+                code: repository_deleted
                 detail: repository already deleted
                 error: repository already deleted
                 instance: /api/repos/dotfiles
@@ -3232,6 +3274,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: repository_deleted
                 detail: repository already deleted
                 error: repository already deleted
                 instance: /api/repos/dotfiles
@@ -3453,6 +3496,7 @@ paths:
           content:
             application/json:
               example:
+                code: bad_request
                 detail: default_branch is required
                 error: default_branch is required
                 instance: /api/repos/my-demo-repository
@@ -3463,6 +3507,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: bad_request
                 detail: default_branch is required
                 error: default_branch is required
                 instance: /api/repos/my-demo-repository
@@ -3503,6 +3548,7 @@ paths:
           content:
             application/json:
               example:
+                code: conflict
                 detail: default branch was modified concurrently, please retry
                 error: default branch was modified concurrently, please retry
                 instance: /api/repos/my-demo-repository
@@ -3513,6 +3559,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: conflict
                 detail: default branch was modified concurrently, please retry
                 error: default branch was modified concurrently, please retry
                 instance: /api/repos/my-demo-repository
@@ -4202,6 +4249,7 @@ paths:
           content:
             application/json:
               example:
+                code: conflict
                 detail: cannot delete the default branch
                 error: cannot delete the default branch
                 instance: /api/repos/dotfiles/branches
@@ -4212,6 +4260,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: conflict
                 detail: cannot delete the default branch
                 error: cannot delete the default branch
                 instance: /api/repos/dotfiles/branches
@@ -8872,6 +8921,7 @@ paths:
           content:
             application/json:
               example:
+                code: bad_request
                 detail: default_branch is required
                 error: default_branch is required
                 instance: /api/repos/my-demo-repository
@@ -8882,6 +8932,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: bad_request
                 detail: default_branch is required
                 error: default_branch is required
                 instance: /api/repos/my-demo-repository
@@ -8922,6 +8973,7 @@ paths:
           content:
             application/json:
               example:
+                code: conflict
                 detail: default branch was modified concurrently, please retry
                 error: default branch was modified concurrently, please retry
                 instance: /api/repos/my-demo-repository
@@ -8932,6 +8984,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: conflict
                 detail: default branch was modified concurrently, please retry
                 error: default branch was modified concurrently, please retry
                 instance: /api/repos/my-demo-repository
@@ -9046,6 +9099,7 @@ paths:
           content:
             application/json:
               example:
+                code: bad_request
                 detail: invalid cursor
                 error: invalid cursor
                 instance: /api/repos
@@ -9056,6 +9110,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: bad_request
                 detail: invalid cursor
                 error: invalid cursor
                 instance: /api/repos
@@ -9236,6 +9291,7 @@ paths:
           content:
             application/json:
               example:
+                code: bad_request
                 detail: "unknown provider: example-host"
                 error: "unknown provider: example-host"
                 instance: /api/repos
@@ -9246,6 +9302,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: bad_request
                 detail: "unknown provider: example-host"
                 error: "unknown provider: example-host"
                 instance: /api/repos
@@ -9825,6 +9882,7 @@ paths:
           content:
             application/json:
               example:
+                code: conflict
                 detail: cannot delete the default branch
                 error: cannot delete the default branch
                 instance: /api/repos/dotfiles/branches
@@ -9835,6 +9893,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: conflict
                 detail: cannot delete the default branch
                 error: cannot delete the default branch
                 instance: /api/repos/dotfiles/branches
@@ -10831,6 +10890,7 @@ paths:
           content:
             application/json:
               example:
+                code: repository_deleted
                 detail: repository already deleted
                 error: repository already deleted
                 instance: /api/repos/dotfiles
@@ -10841,6 +10901,7 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
               example:
+                code: repository_deleted
                 detail: repository already deleted
                 error: repository already deleted
                 instance: /api/repos/dotfiles
