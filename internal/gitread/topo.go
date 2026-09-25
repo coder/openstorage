@@ -1,15 +1,12 @@
 package gitread
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"maps"
 	"math"
-	"os/exec"
 	"slices"
-	"strings"
 
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -30,7 +27,9 @@ import (
 // Every entry of want must be reachable from rev; an unreachable commit is
 // an error, not a missing entry. Duplicates in want are allowed. The walk
 // stops once every wanted commit is ranked; without a commit-graph, git
-// still reads the whole history before it prints the first commit.
+// still reads the whole history before it prints the first commit. The walk
+// is a Heavy child of the request's read budget (see Run): it fails with
+// ErrBusy, ErrTimeBudget or ErrMemoryLimit rather than exceed it.
 func TopoRanks(ctx context.Context, repoPath, rev string, want []string) (map[string]int, error) {
 	assertf(ref.ValidSHA(rev), "TopoRanks: unresolved rev %q", rev)
 	pending := make(map[string]struct{}, len(want))
@@ -44,52 +43,90 @@ func TopoRanks(ctx context.Context, repoPath, rev string, want []string) (map[st
 	}
 	assertf(repoPath != "", "TopoRanks: empty repoPath")
 
-	// A child context lets us stop git as soon as the last wanted commit
-	// is ranked instead of draining the rest of the history.
-	walkCtx, stop := context.WithCancel(ctx)
-	defer stop()
-	args := []string{"rev-list", "--topo-order", rev}
-	cmd := exec.CommandContext(walkCtx, "git", args...)
-	cmd.Dir = repoPath
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	stdout, err := cmd.StdoutPipe()
+	// One Heavy streaming child through Run (#313): the request's budget
+	// applies (admission before git starts, the Heavy heap cap on Linux,
+	// the time budget), and limit outcomes come back as ErrBusy,
+	// ErrTimeBudget or ErrMemoryLimit. The writer ends git with ErrStop as
+	// soon as the last wanted commit is ranked; Run then reaps git.
+	rw := &rankWriter{pending: pending, ranks: ranks}
+	_, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdout: rw, Args: []string{"rev-list", "--topo-order", rev}})
+	if rw.err != nil {
+		return nil, rw.err
+	}
 	if err != nil {
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
-	}
-	sc := bufio.NewScanner(stdout)
-	rank := 0
-	for len(pending) > 0 && sc.Scan() {
-		sha := sc.Text()
-		if _, ok := pending[sha]; ok {
-			ranks[sha] = rank
-			delete(pending, sha)
+	// git exited on its own (or was stopped): account for a final line
+	// without a newline, then every wanted commit must have been seen.
+	if len(rw.partial) > 0 {
+		rw.line(string(rw.partial))
+		if rw.err != nil {
+			return nil, rw.err
 		}
-		rank++
 	}
-	scanErr := sc.Err()
-	if len(pending) == 0 {
-		// Done: stop git early. Its exit status is irrelevant now,
-		// since it may have been killed mid-write.
-		stop()
-		_ = cmd.Wait()
-		// The API documents order as int32.
-		if rank-1 > math.MaxInt32 {
-			return nil, fmt.Errorf("topo rank %d overflows int32", rank-1)
+	if len(pending) > 0 {
+		missing := slices.Sorted(maps.Keys(pending))
+		return nil, fmt.Errorf("commit %s is not reachable from %s", missing[0], rev)
+	}
+	assertf(len(ranks) > 0, "TopoRanks: finished with no ranks")
+	return ranks, nil
+}
+
+// maxRevListLine bounds one line of `rev-list` output (an object ID plus
+// newline); anything longer is not rev-list output.
+const maxRevListLine = 128
+
+// rankWriter consumes `git rev-list --topo-order` output as Run streams
+// it: the n-th line is the commit of rank n. It returns ErrStop once every
+// pending commit is ranked, and records (in err) any output that is not a
+// list of object IDs or a rank that would overflow the API's int32.
+type rankWriter struct {
+	pending map[string]struct{}
+	ranks   map[string]int
+	partial []byte
+	rank    int
+	err     error
+}
+
+func (w *rankWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 && w.err == nil && len(w.pending) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			w.partial = append(w.partial, p...)
+			if len(w.partial) > maxRevListLine {
+				w.err = fmt.Errorf("git rev-list: output line longer than %d bytes", maxRevListLine)
+			}
+			break
 		}
-		assertf(len(ranks) > 0, "TopoRanks: finished with no ranks")
-		return ranks, nil
+		w.partial = append(w.partial, p[:i]...)
+		p = p[i+1:]
+		w.line(string(w.partial))
+		w.partial = w.partial[:0]
 	}
-	waitErr := cmd.Wait()
-	if scanErr != nil {
-		return nil, fmt.Errorf("git %s: read: %w", strings.Join(args, " "), scanErr)
+	if w.err != nil {
+		return 0, w.err
 	}
-	if waitErr != nil {
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), waitErr, strings.TrimSpace(stderr.String()))
+	if len(w.pending) == 0 {
+		return n, ErrStop
 	}
-	missing := slices.Sorted(maps.Keys(pending))
-	return nil, fmt.Errorf("commit %s is not reachable from %s", missing[0], rev)
+	return n, nil
+}
+
+// line ranks one output line.
+func (w *rankWriter) line(sha string) {
+	if !ref.ValidSHA(sha) {
+		w.err = fmt.Errorf("git rev-list: unexpected output line %q", sha)
+		return
+	}
+	// The API documents order as int32.
+	if w.rank > math.MaxInt32 {
+		w.err = fmt.Errorf("topo rank %d overflows int32", w.rank)
+		return
+	}
+	if _, ok := w.pending[sha]; ok {
+		w.ranks[sha] = w.rank
+		delete(w.pending, sha)
+	}
+	w.rank++
 }

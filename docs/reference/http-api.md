@@ -125,7 +125,7 @@ about the endpoint's rollout status on upstream clusters.
 
 Ties between commits that ancestry does not order follow git's topo-order walk, which ignores dates. A commit becomes eligible once all of its children reachable from the ref are ranked, and the most recently eligible commit is ranked next. When ranking a merge makes several of its parents eligible at once, they become eligible in parent order, so the line of history behind the last of them is ranked first. The same history always yields the same ranks.
 
-Cost: each page runs one extra `git rev-list --topo-order` walk. open.storage does not write commit-graphs for its cache repositories, so git usually reads the whole history of the ref for that walk (about 70–90 ms for 20,000 commits in `BenchmarkTopoRanks`). That is about the cost of one `git log -1` for a file last changed near the root, which the endpoint already runs for each file on the page.
+Each page runs one `git rev-list --topo-order` walk for `order`, as one more git subprocess of the request, under the [resource limits on git reads](#resource-limits-on-git-reads). If a limit is hit, the request fails with that section's status: 503 with `Retry-After` when busy, 503 when out of time, 422 for memory. A 200 response always carries the exact `order` of every commit; the field is never omitted or estimated. With a commit-graph ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)), git can print ranks as it goes, and the walk is stopped as soon as every listed commit is ranked. Without one, git reads the whole history of the ref before it prints anything: about 70–90 ms for 20,000 commits in `BenchmarkTopoRanks`, and about 80 MB of git heap at 300,000 commits and 124 MB at 700,000 (measured on Linux), below the 256 MiB limit.
 
 ### Branches
 
@@ -284,7 +284,7 @@ The `git:read` endpoints answer from git subprocesses over a cache repository. A
 | File size | 100 MiB per file, checked from the tree before the file is read. | 422 for `file` (GET and HEAD) and `archive`, before any response byte. |
 | Delivery | Each 64 KiB of a response must reach the client within 30 seconds, and the whole response within 2 minutes of its first byte (`file` and `archive`: 10 minutes). | The connection is closed. The request's slot, memory and temporary files are released. |
 
-The largest git heap measured on a 300,000-commit linear history is 184 MB, for `git log -1 -- <file added in the root commit>`, so such histories are served. Histories past roughly 400,000 commits can get 422 for per-file history walks and `blame` of old files. Deep `commits` pages need less memory: they still fit at 1,000,000 commits (at most 232 MiB) and are estimated to reach the cap at roughly 1.1 million. A `files/metadata` page whose per-file walks need more than 30 seconds in total gets 503; request smaller pages with `limit`. Commit-graphs, which full hydrates now write ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)), make these walks cheaper when present, but the limits do not depend on them: the measurements above are without a commit-graph.
+The largest git heap measured on a 300,000-commit linear history is 184 MB, for `git log -1 -- <file added in the root commit>`, so such histories are served. Histories past roughly 400,000 commits can get 422 for per-file history walks and `blame` of old files. Deep `commits` pages need less memory: they still fit at 1,000,000 commits (at most 232 MiB) and are estimated to reach the cap at roughly 1.1 million. A `files/metadata` page whose per-file walks and `order` walk need more than 30 seconds in total gets 503; request smaller pages with `limit`. Commit-graphs, which full hydrates now write ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)), make these walks cheaper when present, but the limits do not depend on them: the measurements above are without a commit-graph.
 
 | Endpoint | git work | Cost grows with |
 |---|---|---|
@@ -292,7 +292,7 @@ The largest git heap measured on a 300,000-commit linear history is 184 MB, for 
 | `commits` | `git log --skip=<cursor offset> -n <limit+1> [-- path]` | cursor offset; history searched for `path` |
 | `commit` | `git log -n 1`, `git cat-file commit` | the commit object (single object) |
 | `files` | `git ls-tree [-r]` | tree size |
-| `files/metadata` | `git ls-tree -r`, then one `git log -1 -- <path>` per listed file | tree size; page size × history depth |
+| `files/metadata` | `git ls-tree -r`, then one `git log -1 -- <path>` per listed file, then one `git rev-list --topo-order` for `order` | tree size; page size × history depth; history depth |
 | `file` | `git ls-tree`, `git log -1 -- <path>`, `git cat-file blob` | history depth; file size |
 | `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git ls-tree` and `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
 | `blame` | `git blame` | file length × history depth |
