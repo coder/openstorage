@@ -43,6 +43,7 @@ jobs:
           targets="
             ./internal/githttp:FuzzSniffAtomicPush
             ./internal/githttp:FuzzLFSBatch
+            ./internal/githttp:FuzzPushPublicationScan
             ./internal/auth:FuzzVerify
             ./internal/auth:FuzzParseRefPolicies
             ./internal/secrets:FuzzDecrypt
