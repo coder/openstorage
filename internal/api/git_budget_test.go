@@ -34,8 +34,8 @@ func withGitReadPolicy(t *testing.T, p gitReadPolicy) *gitReadPolicy {
 // testGitReadPolicy is the production policy shape with test-sized knobs.
 func testGitReadPolicy(slots int, timeout time.Duration, output int64, limits gitread.Limits) gitReadPolicy {
 	return gitReadPolicy{
-		slots:          gitread.NewSlots(slots, 0),
-		streamSlots:    gitread.NewSlots(slots, 0),
+		slots:          gitread.NewSlots(slots, slots, 0),
+		streamSlots:    gitread.NewSlots(slots, slots, 0),
 		timeout:        timeout,
 		archiveTimeout: timeout,
 		outputBytes:    output,
@@ -172,7 +172,7 @@ func TestGitReadBudgetAdmissionAndDeadline(t *testing.T) {
 			p := withGitReadPolicy(t, testGitReadPolicy(1, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
 			// Another request holds the only slot: it ran one Heavy child
 			// and has not finished.
-			holder := gitread.NewBudget(p.slots, time.Minute, gitread.DefaultOutputBytes)
+			holder := gitread.NewBudget(p.slots, "another-repo", time.Minute, gitread.DefaultOutputBytes)
 			hctx := gitread.WithBudget(context.Background(), holder)
 			if _, err := gitread.Run(hctx, gitread.Cmd{Class: gitread.Heavy, Dir: t.TempDir(), Args: []string{"version"}}); err != nil {
 				t.Fatal(err)
@@ -196,7 +196,7 @@ func TestGitReadBudgetAdmissionAndDeadline(t *testing.T) {
 
 			// And the other way round: a held download slot refuses
 			// downloads, not JSON reads.
-			streams := gitread.NewBudget(p.streamSlots, time.Minute, gitread.DefaultOutputBytes)
+			streams := gitread.NewBudget(p.streamSlots, "another-repo", time.Minute, gitread.DefaultOutputBytes)
 			if _, err := gitread.Run(gitread.WithBudget(context.Background(), streams),
 				gitread.Cmd{Class: gitread.Light, Dir: t.TempDir(), Args: []string{"version"}}); err != nil {
 				t.Fatal(err)
@@ -206,6 +206,34 @@ func TestGitReadBudgetAdmissionAndDeadline(t *testing.T) {
 			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commit?ref=main", fx.token, nil)
 			coreRequireStatus(t, resp, body, http.StatusOK)
 			streams.Close()
+			requireSlotsFree(t, p)
+		})
+
+		t.Run("one repository cannot take the whole pool", func(t *testing.T) {
+			pol := testGitReadPolicy(3, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits())
+			pol.slots = gitread.NewSlots(3, 2, 0)
+			p := withGitReadPolicy(t, pol)
+			other := seedDeepHistory(t, e, org, 10)
+			// Two slow requests of fx's repository hold its whole share.
+			key := org + "\x00" + fx.repo.URL
+			var held []*gitread.Budget
+			for range 2 {
+				b := gitread.NewBudget(p.slots, key, time.Minute, gitread.DefaultOutputBytes)
+				if _, err := gitread.Run(gitread.WithBudget(context.Background(), b),
+					gitread.Cmd{Class: gitread.Light, Dir: t.TempDir(), Args: []string{"version"}}); err != nil {
+					t.Fatal(err)
+				}
+				held = append(held, b)
+			}
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/commits", fx.token, nil)
+			requireLimitStatus(t, resp, body, http.StatusServiceUnavailable, true, "busy")
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits", other.token, nil)
+			coreRequireStatus(t, resp, body, http.StatusOK)
+			for _, b := range held {
+				b.Close()
+			}
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits", fx.token, nil)
+			coreRequireStatus(t, resp, body, http.StatusOK)
 			requireSlotsFree(t, p)
 		})
 

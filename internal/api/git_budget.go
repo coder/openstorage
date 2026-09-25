@@ -23,10 +23,15 @@ const (
 	// gitReadSlots caps requests with JSON responses that run git at once
 	// in this process. Their git heap is at most 8 x 256 MiB while a child
 	// runs; buffered output adds at most 64 MiB (plus parsed copies) each.
+	// Downloads (gitStreamSlots) add the same heap bound again.
 	gitReadSlots = 8
 	// gitStreamSlots is a separate pool for file and archive downloads,
 	// whose delivery can take minutes, so they cannot starve JSON reads.
-	gitStreamSlots = 4
+	gitStreamSlots = 8
+	// gitRepoSlots is how many slots of each pool one repository (the
+	// token's issuer and repo claim) may hold, so slow readers of one
+	// repository cannot take a whole pool from the others.
+	gitRepoSlots = 2
 	// gitReadSlotWait is how long a request waits for a slot before it
 	// is answered 503 + Retry-After.
 	gitReadSlotWait = time.Second
@@ -66,8 +71,8 @@ type gitReadPolicy struct {
 
 // gitReads is the process-wide policy shared by every server instance.
 var gitReads = gitReadPolicy{
-	slots:          gitread.NewSlots(gitReadSlots, gitReadSlotWait),
-	streamSlots:    gitread.NewSlots(gitStreamSlots, gitReadSlotWait),
+	slots:          gitread.NewSlots(gitReadSlots, gitRepoSlots, gitReadSlotWait),
+	streamSlots:    gitread.NewSlots(gitStreamSlots, gitRepoSlots, gitReadSlotWait),
 	timeout:        gitReadTimeout,
 	archiveTimeout: gitArchiveTimeout,
 	outputBytes:    gitread.DefaultOutputBytes,
@@ -110,7 +115,12 @@ func gitReadBudget(h http.HandlerFunc, kind gitRouteKind) http.HandlerFunc {
 		case gitRouteArchive:
 			slots, timeout, delivery = p.streamSlots, p.archiveTimeout, p.streamDelivery
 		}
-		b := gitread.NewBudget(slots, timeout, p.outputBytes).WithLimits(p.limits)
+		// Every git:read route is repo-scoped (requireAuth has verified
+		// the claims), so the key names the repository the token reads.
+		claims := mustClaims(r)
+		assertf(claims.Repo != "", "gitReadBudget: route without a repo claim")
+		key := claims.Iss + "\x00" + claims.Repo
+		b := gitread.NewBudget(slots, key, timeout, p.outputBytes).WithLimits(p.limits)
 		gw := &gitReadWriter{ResponseWriter: w, rc: http.NewResponseController(w), idle: p.writeIdle, delivery: delivery}
 		// LIFO: the response is flushed under its deadlines, then the slot
 		// is released, also when the handler aborts with a panic.

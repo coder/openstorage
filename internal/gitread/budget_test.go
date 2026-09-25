@@ -93,7 +93,7 @@ func deepHistory(t *testing.T, n int) (dir, tip, root string) {
 }
 
 func testBudget(slots *Slots, timeout time.Duration, output int64) *Budget {
-	return NewBudget(slots, timeout, output)
+	return NewBudget(slots, "repo", timeout, output)
 }
 
 // A deep history makes the per-file walk for a file from the root commit
@@ -103,7 +103,7 @@ func TestRunHeapCapStopsDeepPathWalk(t *testing.T) {
 		t.Skip("heap cap is Linux-only")
 	}
 	dir, tip, _ := deepHistory(t, 20000)
-	b := testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes).
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes).
 		WithLimits(Limits{HeavyHeap: 4 << 20, LightHeap: LightHeapBytes, MaxBlob: MaxBlobBytes})
 	ctx := WithBudget(context.Background(), b)
 	_, err := Log(ctx, dir, tip, LogOptions{Path: "cold.txt", MaxCount: 1})
@@ -117,7 +117,7 @@ func TestRunHeapCapStopsDeepPathWalk(t *testing.T) {
 	b.Close()
 	assertNoChildren(t)
 	// The same walk fits under the default cap.
-	b2 := testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes)
+	b2 := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes)
 	defer b2.Close()
 	commits, err := Log(WithBudget(context.Background(), b2), dir, tip, LogOptions{Path: "cold.txt", MaxCount: 1})
 	if err != nil || len(commits) != 1 {
@@ -132,7 +132,7 @@ func TestRunAppliesClassHeapCapsBeforeExec(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "limit")
 	fakeGit(t, "ulimit -d >> "+out)
 	dir := t.TempDir()
-	b := testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes)
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes)
 	ctx := WithBudget(context.Background(), b)
 	if _, err := Run(ctx, Cmd{Class: Heavy, Dir: dir, Args: []string{"x"}}); err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestRunAppliesClassHeapCapsBeforeExec(t *testing.T) {
 
 func TestRunOutputLimitKillsGit(t *testing.T) {
 	dir, tip, _ := deepHistory(t, 5000)
-	b := testBudget(NewSlots(1, 0), time.Minute, 64<<10)
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, 64<<10)
 	ctx := WithBudget(context.Background(), b)
 	start := time.Now()
 	_, err := Log(ctx, dir, tip, LogOptions{})
@@ -175,7 +175,7 @@ func TestRunOutputLimitKillsGit(t *testing.T) {
 
 func TestRunTimeBudgetKillsAndReapsGit(t *testing.T) {
 	fakeGit(t, "exec sleep 30")
-	b := testBudget(NewSlots(1, 0), 200*time.Millisecond, DefaultOutputBytes)
+	b := testBudget(NewSlots(1, 1, 0), 200*time.Millisecond, DefaultOutputBytes)
 	ctx := WithBudget(context.Background(), b)
 	start := time.Now()
 	_, err := Run(ctx, Cmd{Class: Heavy, Dir: t.TempDir(), Args: []string{"log"}})
@@ -201,7 +201,7 @@ func TestRunTimeBudgetKillsAndReapsGit(t *testing.T) {
 func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "ran")
 	fakeGit(t, "echo x >> "+marker)
-	slots := NewSlots(1, 50*time.Millisecond)
+	slots := NewSlots(1, 1, 50*time.Millisecond)
 	holder := testBudget(slots, time.Minute, DefaultOutputBytes)
 	hctx := WithBudget(context.Background(), holder)
 	if _, err := Run(hctx, Cmd{Class: Heavy, Dir: t.TempDir(), Args: []string{"x"}}); err != nil {
@@ -245,7 +245,7 @@ func TestLimitErrorsAreNotMaskedAsMissing(t *testing.T) {
 	}
 	f := newFixture(t)
 	tiny := Limits{HeavyHeap: 64 << 10, LightHeap: 64 << 10, MaxBlob: MaxBlobBytes}
-	ctx := WithBudget(context.Background(), testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes).WithLimits(tiny))
+	ctx := WithBudget(context.Background(), testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes).WithLimits(tiny))
 	if _, err := ResolveRef(ctx, f.dir, "main", false); !errors.Is(err, ErrMemoryLimit) || errors.Is(err, ErrNotFound) {
 		t.Fatalf("ResolveRef: err = %v, want ErrMemoryLimit and not ErrNotFound", err)
 	}
@@ -263,7 +263,7 @@ func TestLimitErrorsAreNotMaskedAsMissing(t *testing.T) {
 // machine. grep.threads=1 keeps it far below.
 func TestGrepRunsUnderHeavyCap(t *testing.T) {
 	f := newFixture(t)
-	b := testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes).
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes).
 		WithLimits(Limits{HeavyHeap: 16 << 20, LightHeap: LightHeapBytes, MaxBlob: MaxBlobBytes})
 	files, err := Grep(WithBudget(context.Background(), b), f.dir, f.c2, GrepOptions{Pattern: "line"})
 	if err != nil || len(files) == 0 {
@@ -274,7 +274,7 @@ func TestGrepRunsUnderHeavyCap(t *testing.T) {
 
 func TestPrepareArchiveRejectsOversizedBlobUpFront(t *testing.T) {
 	f := newFixture(t)
-	b := testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes).
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes).
 		WithLimits(Limits{HeavyHeap: HeavyHeapBytes, LightHeap: LightHeapBytes, MaxBlob: 10})
 	ctx := WithBudget(context.Background(), b)
 	_, err := PrepareArchive(ctx, f.dir, f.c2, ArchiveOptions{})
@@ -294,7 +294,7 @@ func TestPrepareArchiveRejectsOversizedBlobUpFront(t *testing.T) {
 // error, and the request's slot and deadline applied throughout.
 func TestRunStreamingWalkStopsEarly(t *testing.T) {
 	dir, tip, _ := deepHistory(t, 5000)
-	slots := NewSlots(1, 0)
+	slots := NewSlots(1, 1, 0)
 	b := testBudget(slots, time.Minute, 1) // 1 byte: streaming output is not buffered or counted
 	ctx := WithBudget(context.Background(), b)
 	pr, pw := io.Pipe()
@@ -333,7 +333,7 @@ func TestRunWithoutHeapCapSupportStillRuns(t *testing.T) {
 	t.Cleanup(func() { heapLimitAvailable = saved })
 	out := filepath.Join(t.TempDir(), "limit")
 	fakeGit(t, "ulimit -d > "+out)
-	b := testBudget(NewSlots(1, 0), time.Minute, DefaultOutputBytes)
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes)
 	if _, err := Run(WithBudget(context.Background(), b), Cmd{Class: Heavy, Dir: t.TempDir(), Args: []string{"x"}}); err != nil {
 		t.Fatalf("err = %v, want the read to run", err)
 	}
@@ -365,7 +365,7 @@ func (w *blockingWriter) Write(p []byte) (int, error) {
 // until the HTTP layer's write deadlines end it.)
 func TestArchiveStreamStalledReaderKeepsNoGitProcess(t *testing.T) {
 	f := newFixture(t)
-	slots := NewSlots(1, 0)
+	slots := NewSlots(1, 1, 0)
 	b := testBudget(slots, time.Minute, DefaultOutputBytes)
 	ctx := WithBudget(context.Background(), b)
 	prepared, err := PrepareArchive(ctx, f.dir, f.c2, ArchiveOptions{})
@@ -389,4 +389,52 @@ func TestArchiveStreamStalledReaderKeepsNoGitProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.Close()
+}
+
+// One key (repository) holds at most perKey slots; other keys still get
+// the rest, and a waiter wakes as soon as a slot is released.
+func TestSlotsPerKeyShare(t *testing.T) {
+	ctx := context.Background()
+	s := NewSlots(3, 2, 0)
+	for range 2 {
+		if err := s.acquire(ctx, "a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.acquire(ctx, "a"); !errors.Is(err, ErrBusy) {
+		t.Fatalf("third slot for one key: err = %v, want ErrBusy", err)
+	}
+	if err := s.acquire(ctx, "b"); err != nil {
+		t.Fatalf("other key: %v", err)
+	}
+	if err := s.acquire(ctx, "c"); !errors.Is(err, ErrBusy) {
+		t.Fatalf("full pool: err = %v, want ErrBusy", err)
+	}
+	s.release("a")
+	if err := s.acquire(ctx, "c"); err != nil {
+		t.Fatalf("after a release: %v", err)
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		s.release(k)
+	}
+	if s.InUse() != 0 {
+		t.Fatalf("in use = %d after releasing everything", s.InUse())
+	}
+
+	w := NewSlots(1, 1, 10*time.Second)
+	if err := w.acquire(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan error, 1)
+	start := time.Now()
+	go func() { got <- w.acquire(ctx, "b") }()
+	time.Sleep(50 * time.Millisecond)
+	w.release("a")
+	if err := <-got; err != nil {
+		t.Fatalf("waiter: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("waiter woke after %v, want right after the release", d)
+	}
+	w.release("b")
 }

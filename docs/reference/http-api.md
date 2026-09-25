@@ -269,7 +269,7 @@ The `git:read` endpoints answer from git subprocesses over a cache repository. A
 
 | Limit | Value | When it is exceeded |
 |---|---|---|
-| Concurrency | At most 8 requests per server process run git at once, and `file` and `archive` downloads have a separate pool of 4. A request takes its slot at its first git subprocess, including single-object reads, and keeps it until its response has been delivered. A request waits up to 1 second for a slot. | 503 with `Retry-After: 1`. git is not started. |
+| Concurrency | At most 8 requests per server process run git at once, and `file` and `archive` downloads have a separate pool of 8. One repository (the token's repository) can hold at most 2 slots of each pool. A request takes its slot at its first git subprocess, including single-object reads, and keeps it until its response has been delivered. A request waits up to 1 second for a slot. | 503 with `Retry-After: 1`. git is not started. |
 | Time | 30 seconds of git time per request, counted from its first git subprocess and shared by all of them. `archive` gets 10 minutes, because it streams at the client's pace. | 503 without `Retry-After`. The running git subprocess is stopped. |
 | Memory (Linux) | 256 MiB of git heap per subprocess (`RLIMIT_DATA`, set before git starts); 32 MiB for single-object reads. Read-only pack mappings are shared page cache and are not counted. | 422. |
 | Output | 64 MiB of buffered git output per request, shared by all its subprocesses. File contents that `file`, `archive` and `diff` stream instead of buffering are not counted. | 422. git is stopped as soon as the limit is passed. |

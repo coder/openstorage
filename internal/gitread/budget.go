@@ -122,51 +122,84 @@ func DefaultLimits() Limits {
 
 // Slots is a process-wide pool of request admission slots. A request
 // holds at most one slot, from its first git child until it ends (see
-// Budget).
+// Budget). One key (a repository) may hold at most perKey of them, so slow
+// requests against one repository cannot take the whole pool from the
+// others.
 type Slots struct {
-	ch   chan struct{}
-	wait time.Duration
+	n, perKey int
+	wait      time.Duration
+
+	mu    sync.Mutex
+	used  int
+	byKey map[string]int
+	freed chan struct{} // closed and replaced on every release
 }
 
-// NewSlots returns a pool of n slots. A request waits at most wait for a
-// free slot before failing with ErrBusy.
-func NewSlots(n int, wait time.Duration) *Slots {
+// NewSlots returns a pool of n slots, at most perKey of them per key. A
+// request waits at most wait for a free slot before failing with ErrBusy.
+func NewSlots(n, perKey int, wait time.Duration) *Slots {
 	assertf(n > 0, "NewSlots: n %d", n)
+	assertf(perKey > 0 && perKey <= n, "NewSlots: perKey %d of %d", perKey, n)
 	assertf(wait >= 0, "NewSlots: wait %v", wait)
-	return &Slots{ch: make(chan struct{}, n), wait: wait}
+	return &Slots{n: n, perKey: perKey, wait: wait, byKey: map[string]int{}, freed: make(chan struct{})}
 }
 
-func (s *Slots) acquire(ctx context.Context) error {
-	select {
-	case s.ch <- struct{}{}:
-		return nil
-	default:
+// tryAcquire takes a slot for key if the pool and the key's share allow
+// it; otherwise it returns a channel that is closed on the next release.
+func (s *Slots) tryAcquire(key string) (bool, <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.used < s.n && s.byKey[key] < s.perKey {
+		s.used++
+		s.byKey[key]++
+		return true, nil
 	}
-	if s.wait == 0 {
-		return ErrBusy
+	return false, s.freed
+}
+
+func (s *Slots) acquire(ctx context.Context, key string) error {
+	var expired <-chan time.Time
+	if s.wait > 0 {
+		t := time.NewTimer(s.wait)
+		defer t.Stop()
+		expired = t.C
 	}
-	t := time.NewTimer(s.wait)
-	defer t.Stop()
-	select {
-	case s.ch <- struct{}{}:
-		return nil
-	case <-t.C:
-		return ErrBusy
-	case <-ctx.Done():
-		return ctx.Err()
+	for {
+		ok, freed := s.tryAcquire(key)
+		if ok {
+			return nil
+		}
+		if s.wait == 0 {
+			return ErrBusy
+		}
+		select {
+		case <-freed: // try again
+		case <-expired:
+			return ErrBusy
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
-func (s *Slots) release() {
-	select {
-	case <-s.ch:
-	default:
-		assertf(false, "Slots.release: no slot held")
+func (s *Slots) release(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	assertf(s.used > 0 && s.byKey[key] > 0, "Slots.release: no slot held for %q", key)
+	s.used--
+	if s.byKey[key]--; s.byKey[key] == 0 {
+		delete(s.byKey, key)
 	}
+	close(s.freed)
+	s.freed = make(chan struct{})
 }
 
 // InUse reports how many slots are held (tests and diagnostics).
-func (s *Slots) InUse() int { return len(s.ch) }
+func (s *Slots) InUse() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.used
+}
 
 // Budget is one request's share of the read-side git limits. A handler
 // middleware creates it, attaches it with WithBudget, and calls Close when
@@ -178,6 +211,7 @@ func (s *Slots) InUse() int { return len(s.ch) }
 // applies none of these limits.
 type Budget struct {
 	slots   *Slots
+	key     string // the Slots key (repository) this request counts against
 	timeout time.Duration
 	limits  Limits
 
@@ -188,14 +222,15 @@ type Budget struct {
 	closed     bool
 }
 
-// NewBudget returns a request budget drawing admission from slots, with a
-// git time budget of timeout (counted from the first child, so repository
-// hydration before it is not included) and outputBytes of buffered output.
-func NewBudget(slots *Slots, timeout time.Duration, outputBytes int64) *Budget {
+// NewBudget returns a request budget drawing admission from slots under
+// key (the request's repository), with a git time budget of timeout
+// (counted from the first child, so repository hydration before it is not
+// included) and outputBytes of buffered output.
+func NewBudget(slots *Slots, key string, timeout time.Duration, outputBytes int64) *Budget {
 	assertf(slots != nil, "NewBudget: nil slots")
 	assertf(timeout > 0, "NewBudget: timeout %v", timeout)
 	assertf(outputBytes > 0, "NewBudget: outputBytes %d", outputBytes)
-	return &Budget{slots: slots, timeout: timeout, limits: DefaultLimits(), outputLeft: outputBytes}
+	return &Budget{slots: slots, key: key, timeout: timeout, limits: DefaultLimits(), outputLeft: outputBytes}
 }
 
 // WithLimits replaces the per-child caps (tests lower them). It returns b.
@@ -228,7 +263,7 @@ func (b *Budget) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.held {
-		b.slots.release()
+		b.slots.release(b.key)
 		b.held = false
 	}
 	b.closed = true
@@ -256,7 +291,7 @@ func (b *Budget) start(ctx context.Context) (deadline time.Time, err error) {
 	// Wait for a slot without holding mu.
 	actx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	if err := b.slots.acquire(actx); err != nil {
+	if err := b.slots.acquire(actx, b.key); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			return time.Time{}, fmt.Errorf("%w (%v)", ErrTimeBudget, b.timeout)
 		}
@@ -265,7 +300,7 @@ func (b *Budget) start(ctx context.Context) (deadline time.Time, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.held { // a concurrent child of the same request got one first
-		b.slots.release()
+		b.slots.release(b.key)
 	} else {
 		b.held = true
 	}

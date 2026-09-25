@@ -67,7 +67,7 @@ func TestDeepHistoryQualification(t *testing.T) {
 	}
 	for _, c := range classes {
 		t.Run(c.name, func(t *testing.T) {
-			b := NewBudget(NewSlots(1, 0), 10*time.Minute, DefaultOutputBytes)
+			b := NewBudget(NewSlots(1, 1, 0), "repo", 10*time.Minute, DefaultOutputBytes)
 			ctx := WithBudget(context.Background(), b)
 			sampler := sampleChildVmData()
 			began := time.Now()
