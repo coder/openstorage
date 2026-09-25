@@ -2,6 +2,7 @@ package s3waltest_test
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -11,6 +12,42 @@ import (
 
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
+
+func TestBootingFakeS3Paths(t *testing.T) {
+	for _, tt := range []struct {
+		method     string
+		path       string
+		status     int
+		objectPuts int
+	}{
+		{http.MethodHead, "/bucket", http.StatusOK, 0},
+		{http.MethodHead, "/bucket/", http.StatusOK, 0},
+		{http.MethodPut, "/bucket", http.StatusOK, 0},
+		{http.MethodPut, "/bucket/", http.StatusOK, 0},
+		{http.MethodHead, "/bucket/key", http.StatusBadRequest, 0},
+		{http.MethodPut, "/bucket/key", http.StatusInternalServerError, 1},
+		// S3 keys include every slash after the bucket separator.
+		{http.MethodHead, "/bucket//key", http.StatusBadRequest, 0},
+		{http.MethodPut, "/bucket//key", http.StatusInternalServerError, 1},
+		{http.MethodHead, "/bucket//", http.StatusBadRequest, 0},
+		{http.MethodPut, "/bucket//", http.StatusInternalServerError, 1},
+	} {
+		t.Run(tt.method+tt.path, func(t *testing.T) {
+			fake := &s3waltest.BootingFakeS3{PutFailures: 1}
+			r := httptest.NewRequestWithContext(t.Context(), tt.method, tt.path, nil)
+			w := httptest.NewRecorder()
+			fake.Handler().ServeHTTP(w, r)
+			if w.Code != tt.status {
+				t.Errorf("status = %d, want %d", w.Code, tt.status)
+			}
+			remaining, puts, deletes := fake.Snapshot()
+			if remaining != 1-tt.objectPuts || puts != tt.objectPuts || deletes != 0 {
+				t.Errorf("Snapshot = (%d, %d, %d), want (%d, %d, 0)",
+					remaining, puts, deletes, 1-tt.objectPuts, tt.objectPuts)
+			}
+		})
+	}
+}
 
 // TestEnsureBucketGatesWriteReadiness pins the issue #165 contract:
 // EnsureBucket must not hand the bucket to a test before an object-write
