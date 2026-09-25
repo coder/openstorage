@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -972,6 +973,21 @@ func TestReadCoreFiles(t *testing.T) {
 			if len(got.Commits) != 3 {
 				t.Errorf("commits map has %d entries, want 3 (deduplicated)", len(got.Commits))
 			}
+			// Linear main history: order counts back from the ref tip (c3).
+			wantOrder := map[string]int{fx.c3: 0, fx.c2: 1, fx.c1: 2}
+			for sha, meta := range got.Commits {
+				if meta.Order != wantOrder[sha] {
+					t.Errorf("commit %s order = %d, want %d", sha, meta.Order, wantOrder[sha])
+				}
+			}
+			// The order field is on the wire even when it is 0.
+			var raw struct {
+				Commits map[string]map[string]json.RawMessage `json:"commits"`
+			}
+			coreDecode(t, body, &raw)
+			if o, ok := raw.Commits[fx.c3]["order"]; !ok || string(o) != "0" {
+				t.Errorf("tip commit raw order = %q (present %v), want 0", o, ok)
+			}
 		})
 
 		t.Run("metadata always recursive and paginated", func(t *testing.T) {
@@ -988,6 +1004,135 @@ func TestReadCoreFiles(t *testing.T) {
 			_, freshToken := coreFreshRepo(t, e, org)
 			resp, body = coreGet(t, e, "GET", "/api/v1/repos/files/metadata", freshToken, nil)
 			coreRequireStatus(t, resp, body, 404) // invariant 3: unborn -> 404
+		})
+	})
+}
+
+// TestReadCoreFilesMetadataOrder covers the commit `order` rank (issue
+// #292): the commit's absolute position in the resolved ref's topological
+// history (not a rank within the page), independent of author dates,
+// stable across pages, and identical on the named-repo alias.
+//
+//	base (a.txt, shared/one.txt, shared/two.txt) -- m1 (main.txt) ------ M (merge.txt, main)
+//	    \-- s1 (side1.txt) -- s2 (side2.txt) (side) ---------------------/
+//
+// Author dates disagree with topology: s1 2030 > s2 2029 > base 2024 > m1 2001.
+func TestReadCoreFilesMetadataOrder(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		ctx := context.Background()
+		org := e.newOrg(t)
+		repoURL := "https://example.com/" + org + "/order-" + randomHex(t, 4)
+		repo, err := e.store.CreateRepo(ctx, org, repoURL, "main")
+		if err != nil {
+			t.Fatalf("create repo: %v", err)
+		}
+		dir := t.TempDir()
+		commit := func(msg, authorDate string, files ...string) string {
+			for _, f := range files {
+				coreWriteFile(t, dir, f, f+"\n")
+			}
+			coreGit(t, dir, "add", ".")
+			coreGit(t, dir, "commit", "-q", "--date="+authorDate, "-m", msg)
+			return coreRevParse(t, dir, "HEAD")
+		}
+		coreGit(t, dir, "init", "-q", "-b", "main", ".")
+		base := commit("base", coreAuthorDate, "a.txt", "shared/one.txt", "shared/two.txt")
+		coreGit(t, dir, "checkout", "-q", "-b", "side")
+		s1 := commit("s1", "2030-01-01T00:00:00+00:00", "side1.txt")
+		s2 := commit("s2", "2029-01-01T00:00:00+00:00", "side2.txt")
+		coreGit(t, dir, "checkout", "-q", "main")
+		m1 := commit("m1", "2001-01-01T00:00:00+00:00", "main.txt")
+		coreGit(t, dir, "merge", "-q", "--no-ff", "--no-commit", "side")
+		merge := commit("M", coreAuthorDate, "merge.txt")
+
+		// An empty commit on top of M: it is the ref's commit but no
+		// listed file's last commit, so no entry may carry order 0.
+		coreGit(t, dir, "commit", "-q", "--allow-empty", "-m", "empty tip")
+		emptyTip := coreRevParse(t, dir, "HEAD")
+		coreGit(t, dir, "reset", "-q", "--hard", merge)
+
+		coreSeedStores(t, e, repo.RepoID, dir, map[string]string{
+			"refs/heads/main":      merge,
+			"refs/heads/side":      s2,
+			"refs/heads/empty-tip": emptyTip,
+		})
+		token := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+
+		wantLast := map[string]string{
+			"a.txt": base, "shared/one.txt": base, "shared/two.txt": base,
+			"main.txt": m1, "side1.txt": s1, "side2.txt": s2, "merge.txt": merge,
+		}
+		// git topo-order from M: M, then the merge's last parent's line
+		// (s2, s1), then the first parent's line (m1), then base.
+		wantOrder := map[string]int{merge: 0, s2: 1, s1: 2, m1: 3, base: 4}
+
+		// fetchAll walks every page and checks that each commit keeps one
+		// order value across pages.
+		fetchAll := func(t *testing.T, path string) (map[string]string, map[string]int) {
+			t.Helper()
+			last, order := map[string]string{}, map[string]int{}
+			cursor := ""
+			for range 20 {
+				u := path
+				if cursor != "" {
+					u += "&cursor=" + cursor
+				}
+				resp, body := coreGet(t, e, "GET", u, token, nil)
+				coreRequireStatus(t, resp, body, 200)
+				var got listFilesMetadataResponse
+				coreDecode(t, body, &got)
+				for _, f := range got.Files {
+					last[f.Path] = f.LastCommitSHA
+					if _, ok := got.Commits[f.LastCommitSHA]; !ok {
+						t.Fatalf("commits map missing %s", f.LastCommitSHA)
+					}
+				}
+				for sha, meta := range got.Commits {
+					if prev, seen := order[sha]; seen && prev != meta.Order {
+						t.Errorf("commit %s order %d on one page, %d on another", sha, prev, meta.Order)
+					}
+					order[sha] = meta.Order
+				}
+				if !got.HasMore {
+					return last, order
+				}
+				cursor = got.NextCursor
+			}
+			t.Fatal("pagination did not terminate")
+			return nil, nil
+		}
+
+		for name, prefix := range map[string]string{
+			"v1":    "/api/v1/repos/files/metadata?",
+			"alias": "/api/repos/" + url.PathEscape(repoURL) + "/files/metadata?",
+		} {
+			t.Run(name, func(t *testing.T) {
+				for _, limit := range []string{"limit=1000", "limit=2"} {
+					last, order := fetchAll(t, prefix+limit)
+					if fmt.Sprint(last) != fmt.Sprint(wantLast) {
+						t.Errorf("%s: last commits = %v, want %v", limit, last, wantLast)
+					}
+					if fmt.Sprint(order) != fmt.Sprint(wantOrder) {
+						t.Errorf("%s: order = %v, want %v", limit, order, wantOrder)
+					}
+				}
+			})
+		}
+
+		t.Run("relative to the resolved ref", func(t *testing.T) {
+			_, order := fetchAll(t, "/api/v1/repos/files/metadata?ref=side&limit=1000")
+			want := map[string]int{s2: 0, s1: 1, base: 2}
+			if fmt.Sprint(order) != fmt.Sprint(want) {
+				t.Errorf("order at side = %v, want %v", order, want)
+			}
+		})
+
+		t.Run("absolute rank: 0 absent when the tip is not listed", func(t *testing.T) {
+			_, order := fetchAll(t, "/api/v1/repos/files/metadata?ref=empty-tip&limit=1000")
+			want := map[string]int{merge: 1, s2: 2, s1: 3, m1: 4, base: 5}
+			if fmt.Sprint(order) != fmt.Sprint(want) {
+				t.Errorf("order at empty-tip = %v, want %v", order, want)
+			}
 		})
 	})
 }
