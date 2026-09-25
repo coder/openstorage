@@ -17,7 +17,7 @@ import (
 // process restart — the documented local-mode ADR trade-off.
 type Local struct {
 	deliverer *events.Deliverer
-	syncq     *sync.InProcessQueue
+	syncq     localSyncQueue
 	repacker  *Repacker // nil: repack disabled on this queue
 	logger    *slog.Logger
 
@@ -53,13 +53,33 @@ var _ Queue = (*Local)(nil)
 // or not wired, e.g. hook-subprocess queues that must never fold);
 // EnqueueRepack is then refused.
 func NewLocal(deliverer *events.Deliverer, runSync, runPush SyncRunner, repacker *Repacker, logger *slog.Logger) *Local {
-	assertf(deliverer != nil, "NewLocal: nil deliverer")
 	assertf(runSync != nil, "NewLocal: nil sync runner")
 	assertf(runPush != nil, "NewLocal: nil push runner")
 	assertf(logger != nil, "NewLocal: nil logger")
+	return newLocal(deliverer, sync.NewInProcessQueue(runSync, runPush, logger), repacker, logger)
+}
+
+// localSyncQueue is the sync/push half of the in-process queue:
+// sync.InProcessQueue, or sync.LocalScheduler on SQLite (ADR-50).
+type localSyncQueue interface {
+	EnqueueSync(ctx context.Context, job sync.Job) error
+	EnqueuePush(ctx context.Context, job sync.Job) error
+	Close()
+}
+
+// NewLocalScheduled is NewLocal with sync and push runs driven by the
+// durable SQLite schedule (issue #266). Close closes sched.
+func NewLocalScheduled(deliverer *events.Deliverer, sched *sync.LocalScheduler, repacker *Repacker, logger *slog.Logger) *Local {
+	assertf(sched != nil, "NewLocalScheduled: nil scheduler")
+	return newLocal(deliverer, sched, repacker, logger)
+}
+
+func newLocal(deliverer *events.Deliverer, syncq localSyncQueue, repacker *Repacker, logger *slog.Logger) *Local {
+	assertf(deliverer != nil, "NewLocal: nil deliverer")
+	assertf(logger != nil, "NewLocal: nil logger")
 	return &Local{
 		deliverer:     deliverer,
-		syncq:         sync.NewInProcessQueue(runSync, runPush, logger),
+		syncq:         syncq,
 		repacker:      repacker,
 		logger:        logger,
 		repacking:     make(map[string]bool),

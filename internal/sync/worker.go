@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // RepoInfo is the minimal repo identity a sync run needs: the storage key
@@ -177,6 +178,14 @@ type Worker struct {
 	// point it at the queue's EnqueueSync.
 	AfterForward func(ctx context.Context, job Job) error
 
+	// Local, when non-nil, is the durable local schedule (SQLite, issue
+	// #266, ADR-50): runs claim through ClaimDue* (refused claims end the
+	// run with nothing written), and one end-of-run write schedules any
+	// retry, follow-up, or mirror-back in the row. Requeue, RequeuePush,
+	// AfterForward and the deferred-retry timers are then unused: a
+	// LocalScheduler sweep turns due rows into runs.
+	Local LocalLanes
+
 	// DetachPoll is the cadence of the outbound push watchdog that
 	// re-reads the upstream row WHILE `git push` runs and kills the
 	// subprocess when the repo is detached or the claim stolen mid-push
@@ -278,20 +287,35 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	assertf(repo.RepoID == job.RepoID, "RepoLookup returned %q for %q", repo.RepoID, job.RepoID)
 
 	holder := newClaimHolder()
-	up, stolenFrom, err := w.Upstreams.BeginSync(ctx, job.RepoID, holder, claimLease(timeout))
-	switch {
-	case errors.Is(err, ErrNotFound):
-		return nil // detached before start: cancel silently (docs/reference/webhooks.md)
-	case errors.Is(err, ErrSyncInProgress):
-		// Overlapping run: skip (invariant 11). A LIVE holder covers any
-		// pending request at its FinishSync (#85) — but a dead holder's
-		// unexpired lease refuses the steal AND never finishes, and this
-		// run was the request's only local vehicle: schedule one retry
-		// for just after the lease expires (issue #86).
-		w.deferPendingRetry(ctx, job)
-		return nil
-	case err != nil:
-		return fmt.Errorf("begin sync %s: %w", job.RepoID, err)
+	var up Upstream
+	var stolenFrom string
+	if w.Local != nil {
+		c, err := w.Local.ClaimDueSync(ctx, job.RepoID, holder, claimLease(timeout))
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return nil // detached before start: cancel silently
+		case err != nil:
+			return fmt.Errorf("begin sync %s: %w", job.RepoID, err)
+		case !c.Claimed:
+			return nil // busy or nothing due: the row keeps the work for a later sweep
+		}
+		up, stolenFrom = c.Up, c.StolenFrom
+	} else {
+		up, stolenFrom, err = w.Upstreams.BeginSync(ctx, job.RepoID, holder, claimLease(timeout))
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return nil // detached before start: cancel silently (docs/reference/webhooks.md)
+		case errors.Is(err, ErrSyncInProgress):
+			// Overlapping run: skip (invariant 11). A LIVE holder covers any
+			// pending request at its FinishSync (#85) — but a dead holder's
+			// unexpired lease refuses the steal AND never finishes, and this
+			// run was the request's only local vehicle: schedule one retry
+			// for just after the lease expires (issue #86).
+			w.deferPendingRetry(ctx, job)
+			return nil
+		case err != nil:
+			return fmt.Errorf("begin sync %s: %w", job.RepoID, err)
+		}
 	}
 	if stolenFrom != "" {
 		// The previous holder's lease expired without a FinishSync — its
@@ -327,7 +351,14 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	fin, err := w.finishSync(ctx, job.RepoID, holder, runErr == nil)
+	var fin Upstream
+	if w.Local != nil {
+		fin, err = w.retryFinish(ctx, "sync", job.RepoID, func(fctx context.Context) (Upstream, error) {
+			return w.Local.FinishSyncOutcome(fctx, job.RepoID, holder, meta.SyncOutcome{Kind: meta.OutcomeDone, Success: runErr == nil})
+		})
+	} else {
+		fin, err = w.finishSync(ctx, job.RepoID, holder, runErr == nil)
+	}
 	if errors.Is(err, ErrNotFound) {
 		return nil // detached mid-run: cancel silently (docs/reference/webhooks.md)
 	}
@@ -357,6 +388,9 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 			"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
 	}
 
+	if w.Local != nil {
+		return runErr // intent that arrived mid-run stays due in the row; the sweep runs it
+	}
 	if fin.SyncPending && w.Requeue != nil {
 		// Requests marked (RequestSync) after this run claimed are not
 		// covered by its fetch snapshot: schedule the coalesced follow-up
@@ -484,16 +518,27 @@ const finishSyncAttempts = 3
 // immediately; exhausting the attempts leaves the claim to expire and be
 // stolen by the next run.
 func (w *Worker) finishSync(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
+	return w.retryFinish(ctx, "sync", repoID, func(fctx context.Context) (Upstream, error) {
+		return w.Upstreams.FinishSync(fctx, repoID, holder, success)
+	})
+}
+
+// retryFinish runs one end-of-run write with bounded retries on a context
+// detached from the run budget. ErrNotFound and ErrClaimLost are final. If
+// every attempt fails the claim stays held and expires with its lease; the
+// next claim steals it (with its force mandate, and on the local schedule
+// its retry position).
+func (w *Worker) retryFinish(ctx context.Context, lane, repoID string, finish func(context.Context) (Upstream, error)) (Upstream, error) {
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
 	defer cancel()
 	var lastErr error
 	for attempt := 1; attempt <= finishSyncAttempts; attempt++ {
-		fin, err := w.Upstreams.FinishSync(fctx, repoID, holder, success)
+		fin, err := finish(fctx)
 		if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrClaimLost) {
 			return fin, err
 		}
 		lastErr = err
-		w.Logger.Warn("finish sync failed; retrying while the claim is held",
+		w.Logger.Warn("finish "+lane+" failed; retrying while the claim is held",
 			"repo", repoID, "attempt", attempt, "err", err)
 		select {
 		case <-fctx.Done():
