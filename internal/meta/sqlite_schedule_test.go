@@ -310,6 +310,30 @@ func TestSQLiteFinishPushOutcome(t *testing.T) {
 			t.Fatalf("restore row = %+v sched = %+v", got.Up, got.Sched)
 		}
 	})
+	t.Run("explicit request during the run stays due after retry and restore", func(t *testing.T) {
+		for _, kind := range []LaneOutcome{OutcomeRetry, OutcomeRestore} {
+			f := start(t, false)
+			if err := f.s.RequestPushNow(t.Context(), f.repo, false); err != nil {
+				t.Fatal(err)
+			}
+			f.finishPush(t, "run", PushOutcome{Kind: kind, Delay: 4 * time.Minute})
+			if got := f.row(t); got.Sched.pushDue != 0 || got.Up.PushPending != 1 {
+				t.Fatalf("%v after mid-run RequestPushNow: row=%+v sched=%+v, want due now", kind, got.Up, got.Sched)
+			}
+			if c := f.claimPush(t, "api"); !c.Claimed {
+				t.Fatalf("%v: explicit request postponed: %+v", kind, c)
+			}
+		}
+		// A hook request during the run joins the backoff instead.
+		f := start(t, false)
+		if err := f.s.RequestPush(t.Context(), f.repo, false); err != nil {
+			t.Fatal(err)
+		}
+		f.finishPush(t, "run", PushOutcome{Kind: OutcomeRetry, Delay: 4 * time.Minute})
+		if got := f.row(t).Sched.pushDue; got != f.now.Add(4*time.Minute).UnixNano() {
+			t.Fatalf("hook request during the run: due %d, want the backoff", got)
+		}
+	})
 	t.Run("stolen claim is lost and untouched", func(t *testing.T) {
 		f := start(t, false)
 		f.advance(schedLease)
@@ -611,6 +635,7 @@ func TestSQLiteScheduleModel(t *testing.T) {
 							t.Fatalf("step %d %s = %+v, model claim force=%v attempt=%d stolen=%q", step, op, c, force, m.attempt, stolen)
 						}
 						m.pushPending, m.pushSyncing, m.pushHolder, m.pushExpires, m.pushForce = 0, true, holder, now+schedLease.Nanoseconds(), force
+						m.pushDue = now // claim time marks "no explicit request during this run"
 					default:
 						if c.Claimed || c.Busy {
 							t.Fatalf("step %d %s = %+v, model no work", step, op, c)
@@ -655,10 +680,10 @@ func TestSQLiteScheduleModel(t *testing.T) {
 							m.pushRun++
 							m.pushPending = max(m.pushPending, level(o.Force))
 							m.attempt++
-							m.pushDue = now + o.Delay.Nanoseconds()
+							m.pushDue = retryDue(m.pushDue, now, o.Delay)
 						case OutcomeRestore:
 							m.pushPending = max(m.pushPending, level(o.Force))
-							m.pushDue = now + o.Delay.Nanoseconds()
+							m.pushDue = retryDue(m.pushDue, now, o.Delay)
 						}
 					}
 				case 7:
@@ -733,4 +758,13 @@ func level(force bool) int {
 		return 2
 	}
 	return 1
+}
+
+// retryDue is the model's due time after a retry or restore: an explicit
+// request recorded during the run (due reset to 0) stays due now.
+func retryDue(due, now int64, delay time.Duration) int64 {
+	if due == 0 {
+		return 0
+	}
+	return now + delay.Nanoseconds()
 }

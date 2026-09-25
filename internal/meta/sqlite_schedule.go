@@ -71,11 +71,14 @@ const (
 	// budget spent. Resets attempt and due time.
 	OutcomeDone LaneOutcome = iota + 1
 	// OutcomeRetry (push only) ends a transiently failed run: re-marks the
-	// run's level, advances the attempt, and sets due = now + Delay.
+	// run's level, advances the attempt, and sets due = now + Delay, unless
+	// RequestPushNow recorded an explicit request during the run: that
+	// request stays due now.
 	OutcomeRetry
 	// OutcomeRestore ends a run that never started its transfer (failed
-	// publication wait): re-marks, keeps the attempt, due = now + Delay,
-	// and counts no run.
+	// publication wait): re-marks, keeps the attempt, due = now + Delay
+	// (an explicit request made during the run stays due now), and counts
+	// no run.
 	OutcomeRestore
 )
 
@@ -214,11 +217,11 @@ func (s *SQLite) FinishPushOutcome(ctx context.Context, repoID, holder string, o
 	case OutcomeRetry:
 		stmt = `UPDATE repo_upstreams SET ` + release + `,
 			push_run_count = push_run_count + 1, push_pending = MAX(push_pending, ?),
-			push_attempt = push_attempt + 1, push_due = ?`
+			push_attempt = push_attempt + 1, push_due = CASE WHEN push_due = 0 THEN 0 ELSE ? END`
 		args = []any{level, nowNanos + o.Delay.Nanoseconds()}
 	case OutcomeRestore:
 		stmt = `UPDATE repo_upstreams SET ` + release + `,
-			push_pending = MAX(push_pending, ?), push_due = ?`
+			push_pending = MAX(push_pending, ?), push_due = CASE WHEN push_due = 0 THEN 0 ELSE ? END`
 		args = []any{level, nowNanos + o.Delay.Nanoseconds()}
 	}
 	stmt += ` WHERE repo_id = ? AND push_syncing = 1 AND push_claim_holder = ?`

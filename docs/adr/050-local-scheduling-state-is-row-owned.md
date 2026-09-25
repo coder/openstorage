@@ -34,7 +34,7 @@ fields without a format change (issue #335).
 | Transition | Effect |
 |---|---|
 | `RequestPush` (unchanged) | Raises the pending level. Due time and attempt are untouched, so a hook request during a backoff joins it, as on PostgreSQL. |
-| `RequestPushNow` | `RequestPush`, plus due now. The attempt is kept. Explicit API requests use it. |
+| `RequestPushNow` | `RequestPush`, plus due now. The attempt is kept. Explicit API requests use it; one made while a run holds the lane stays due now even if that run ends in `retry` or `restore`. |
 | `ClaimDuePush` / `ClaimDueSync` | Claims only a lane with durable work: a due pending level and no live claim, or an expired claim. A refused claim writes nothing. The attempt stays in the row while the run executes. |
 | `FinishPushOutcome` / `FinishSyncOutcome` | Ends the run and schedules what follows in the same write: `done` resets attempt and due time (a successful forward can also mark its mirror-back pull); `retry` re-marks the run's level, advances the attempt, and sets the due time; `restore` re-marks with the same attempt and counts no run. |
 | `ListLocalWork` | Lists lanes whose claim guard holds now, for live repositories of the served organization. |

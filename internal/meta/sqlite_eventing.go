@@ -744,6 +744,17 @@ func (s *SQLite) beginPush(ctx context.Context, repoID, holder string, lease tim
 			holder, nowNanos+lease.Nanoseconds(), forceInt, repoID); err != nil {
 			return err
 		}
+		if requireDue {
+			// While a scheduled run holds the lane, push_due carries its
+			// claim time (never 0). RequestPushNow resets it to 0, which
+			// marks an explicit request made during the run; the run's
+			// retry/restore then keeps that request due now.
+			assertf(nowNanos > 0, "claim time %d is not positive", nowNanos)
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE repo_upstreams SET push_due = ? WHERE repo_id = ?`, nowNanos, repoID); err != nil {
+				return err
+			}
+		}
 		row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
 			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
 		if err != nil {
