@@ -93,4 +93,11 @@ users can push. The production image is Linux.
   within the delivery limit. No finite pool guarantees availability under
   arbitrary load; the per-IP rate limiter is the lever for that.
 - Hydration, `upload-pack`, and write endpoints are outside this budget.
-  #322 tracks whether commit-graph writes join it.
+  Commit-graph refreshes (ADR-47) join its admission pool and heap cap
+  instead (#322): the shared pieces live in the leaf package
+  `internal/gitlimit`, because `gitread` imports `githttp`. A refresh
+  takes one slot of the same 8-slot pool with a non-blocking try, counted
+  against the refreshed repository's share like its reads, so it is
+  skipped rather than queued. Refreshes may hold at most 2 slots at
+  once, and each one runs under the Heavy heap cap. They do not use a
+  request's Budget, so they never start its 30 s clock.

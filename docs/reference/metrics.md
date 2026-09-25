@@ -45,6 +45,7 @@ counted; their failures reach the client and the hook's stderr.
 | `openstorage_s3wal_lease_held` | gauge | none | 1 while this process holds the instance lease by its own account. Local state, not proof of bucket ownership. A fail-stop exits the process, so the scraper usually sees the target disappear instead of a 0. |
 | `openstorage_s3wal_manifest_size_guard_total` | counter | `result` (`warn`, `refuse`) | `warn`: the once-per-repository size warning was logged. `refuse`: a growing mutation was finally refused. |
 | `openstorage_job_runs_total` | counter | `job` (`orphan_sweep`, `repack`), `result` (`success`, `noop`, `error`) | Executions in this process. Repack `noop` = nothing to fold or a lost race; `error` includes a committed fold that failed verification. These are operation outcomes, not final River job states. |
+| `openstorage_commit_graph_refresh_total` | counter | `outcome` (`written`, `written_plain`, `skipped_tip_cap`, `skipped_busy`, `lock_held`, `memory_limit`, `timed_out`, `canceled`, `failed`) | Cache commit-graph refreshes after full hydrates in this process, one per refresh. A repository with no refs counts as `written`. The outcomes are the [commit-graph log contract](../how-to/deploy-production.md#commit-graph-refresh). No repository label: the `repo=` field of the log line names the repository. |
 
 - Every label value is fixed in code. No repository, org, token, user,
   path, or host value ever becomes a label.

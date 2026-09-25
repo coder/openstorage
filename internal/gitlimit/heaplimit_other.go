@@ -1,6 +1,6 @@
 //go:build !linux
 
-package gitread
+package gitlimit
 
 import (
 	"context"
@@ -14,12 +14,12 @@ import (
 // read because the cap is unavailable.
 func HeapLimitSupported() bool { return false }
 
-// heapLimitedGit is only reached with maxHeapBytes == 0 here: Run drops the
+// Command is only reached with maxHeapBytes == 0 here: Run drops the
 // cap first where HeapLimitSupported is false.
-func heapLimitedGit(ctx context.Context, maxHeapBytes int64, args ...string) *exec.Cmd {
-	assertf(maxHeapBytes == 0, "heapLimitedGit: heap cap %d requested on an unsupported platform", maxHeapBytes)
+func Command(ctx context.Context, maxHeapBytes int64, args ...string) *exec.Cmd {
+	assertf(maxHeapBytes == 0, "Command: heap cap %d requested on an unsupported platform", maxHeapBytes)
 	return exec.CommandContext(ctx, "git", args...)
 }
 
-// heapLimitFailure: no cap is enforced here, so no failure is a cap hit.
-func heapLimitFailure(error, string) bool { return false }
+// HeapFailure: no cap is enforced here, so no failure is a cap hit.
+func HeapFailure(error, string) bool { return false }

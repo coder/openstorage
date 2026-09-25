@@ -70,6 +70,35 @@ const (
 
 var resultNames = [...]string{ResultSuccess: "success", ResultNoop: "noop", ResultError: "error"}
 
+// CommitGraphOutcome is how one cache commit-graph refresh ended (ADR-47,
+// issue #322). Label values equal githttp's outcome names, which are also
+// its documented log contract.
+type CommitGraphOutcome int
+
+const (
+	CommitGraphWritten CommitGraphOutcome = iota
+	CommitGraphWrittenPlain
+	CommitGraphSkippedTipCap
+	CommitGraphSkippedBusy
+	CommitGraphLockHeld
+	CommitGraphMemoryLimit
+	CommitGraphTimedOut
+	CommitGraphCanceled
+	CommitGraphFailed
+)
+
+var commitGraphOutcomeNames = [...]string{
+	CommitGraphWritten:       "written",
+	CommitGraphWrittenPlain:  "written_plain",
+	CommitGraphSkippedTipCap: "skipped_tip_cap",
+	CommitGraphSkippedBusy:   "skipped_busy",
+	CommitGraphLockHeld:      "lock_held",
+	CommitGraphMemoryLimit:   "memory_limit",
+	CommitGraphTimedOut:      "timed_out",
+	CommitGraphCanceled:      "canceled",
+	CommitGraphFailed:        "failed",
+}
+
 var codeClasses = [...]string{"1xx", "2xx", "3xx", "4xx", "5xx"}
 
 var (
@@ -100,6 +129,10 @@ var (
 		Name: "openstorage_s3wal_manifest_size_guard_total",
 		Help: "S3WAL manifest size-guard events in this process: warn = once-per-repository warning logged, refuse = final refusal of a growing mutation.",
 	}, []string{"result"})
+	commitGraphRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "openstorage_commit_graph_refresh_total",
+		Help: "Commit-graph refreshes of cache repositories after full hydrates in this process, by fixed outcome (no repository label).",
+	}, []string{"outcome"})
 	jobRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "openstorage_job_runs_total",
 		Help: "Executions of background job operations in this process, by fixed job and outcome.",
@@ -108,7 +141,10 @@ var (
 
 func init() {
 	registry.MustRegister(httpRequests, httpDuration, s3walContention, s3walLeaseRenewalFailures,
-		s3walLeaseHeld, s3walSizeGuard, jobRuns)
+		s3walLeaseHeld, s3walSizeGuard, jobRuns, commitGraphRefresh)
+	for _, o := range commitGraphOutcomeNames {
+		commitGraphRefresh.WithLabelValues(o)
+	}
 	// Initialize every finite series so a clean process exposes zeros
 	// instead of missing series.
 	for _, s := range surfaceNames {
@@ -159,6 +195,11 @@ func SetS3WALLeaseHeld(held bool) {
 // S3WALManifestSizeGuard counts one manifest size-guard event.
 func S3WALManifestSizeGuard(r SizeGuardResult) {
 	s3walSizeGuard.WithLabelValues(name(sizeGuardNames[:], r)).Inc()
+}
+
+// CommitGraphRefresh counts one cache commit-graph refresh outcome.
+func CommitGraphRefresh(o CommitGraphOutcome) {
+	commitGraphRefresh.WithLabelValues(name(commitGraphOutcomeNames[:], o)).Inc()
 }
 
 // JobRun counts one background job execution outcome.

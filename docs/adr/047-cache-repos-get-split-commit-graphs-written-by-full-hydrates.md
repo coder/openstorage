@@ -47,10 +47,18 @@ the existing graph has them.
     the write walks only those. Same-tip fanout collapses to one tip. The
     refresh is skipped when the sync saw more than `commitGraphMaxTips`
     (10,000) distinct tips.
-  - **Process-wide slots.** At most `cap(commitGraphSlots)` (2) refreshes
-    run at once per process, across all repos. A refresh that finds both
-    slots busy is skipped, not queued; the repo's next full hydrate tries
-    again. This bounds commit-graph CPU per node to two cores however
+  - **Shared admission and heap cap (#322).** A refresh joins the git
+    read API's chokepoint ([ADR-49](049-read-side-git-children-run-under-one-per-request-budget.md)) through the leaf package
+    `internal/gitlimit`. It takes one slot of the same process-wide 8-slot
+    pool as JSON reads with a non-blocking try, because it runs under the
+    hydrate lock. The slot counts against the repository's per-repository
+    share, like its reads. Refreshes may hold at most 2 of those slots at once, so
+    reads always keep the rest. A refresh that gets no slot is skipped,
+    not queued; the repo's next full hydrate tries again. Git runs under
+    the read API's Heavy heap cap (256 MiB `RLIMIT_DATA`, Linux only),
+    also on hydrates that no read budget covers (`upload-pack`). A write
+    that hits the cap ends as `memory_limit`. Together this bounds
+    commit-graph work per node to two processes of bounded heap, however
     many repos an attacker drives.
 
 ## Why split graphs and Bloom filters
@@ -160,8 +168,20 @@ already synced. A missing, stale, or partial graph is only slower:
 - A pre-existing lock is never removed. Its owner cannot be proven: a dead
   server can leave a live child, and a foreign Git need not honor our
   flock. Git fails with "Unable to create ... lock: File exists". The
-  failure is logged and the next hydrate retries. An operator removes a
-  stale lock by hand.
+  failure is logged as `outcome=lock_held` and the next hydrate retries.
+  An operator removes a stale lock by hand, following the
+  [stale-lock runbook](../how-to/deploy-production.md#commit-graph-refresh).
+  Issue #322 considered automatic cleanup and declined it for the same
+  reason.
+- Every refresh ends in one outcome from a fixed set (`written`,
+  `written_plain`, `skipped_tip_cap`, `skipped_busy`, `lock_held`,
+  `memory_limit`, `timed_out`, `canceled`, `failed`). Every outcome except `written` logs
+  one line, `commit-graph refresh outcome=<outcome> repo=<path>: <detail>`.
+  This is a documented log contract
+  ([outcomes](../how-to/deploy-production.md#commit-graph-refresh)).
+  Every outcome, including `written`, is also counted in
+  `openstorage_commit_graph_refresh_total{outcome}` (no repository label)
+  on the opt-in metrics listener.
 
 ## Concurrency
 
@@ -192,6 +212,9 @@ already synced. A missing, stale, or partial graph is only slower:
 The child gets the same isolation as the API and sync Git subprocesses:
 every inherited `GIT_*` variable is dropped, and `GIT_CONFIG_GLOBAL` and
 `GIT_CONFIG_SYSTEM` point at `/dev/null` (plus `GIT_CONFIG_NOSYSTEM=1`).
+It also runs with `LC_ALL=C`: the lock and heap-cap outcomes are
+classified from Git's English messages, which a translated locale would
+change (#322).
 The repo path may be relative (a relative `--cache-dir` is accepted); the
 child runs with that path as its working directory. An inherited
 `GIT_DIR`, `GIT_OBJECT_DIRECTORY`, or `GIT_CONFIG_COUNT/KEY/VALUE` could

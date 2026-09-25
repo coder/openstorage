@@ -249,7 +249,8 @@ event.
   writing the marker only after complete success.
 - After that marker, still under the lock, the full hydrate refreshes the cache's split
   commit-graph, which speeds up history walks. The refresh is best effort,
-  time-bounded, limited to two at a time per process, and walks only the commit tips the
+  time-bounded, admitted through the git read pool (at most two at a time) under the same heap
+  cap as reads, and walks only the commit tips the
   sync just applied (skipped above 10,000 distinct tips): a missing, stale, or failed graph
   only makes reads slower
   ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)).

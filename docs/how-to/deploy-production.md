@@ -204,6 +204,70 @@ Rules for the cache:
   or clear the directory **only while the replica is drained and stopped**. Deleting it
   under a live process races in-flight requests and the hydration lock file.
 
+### Commit-graph refresh
+
+After each full hydrate, a replica refreshes the cache repository's split commit-graph,
+which speeds up history walks
+([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)).
+The refresh is best effort. A missing, stale, or failed graph makes reads slower, never
+wrong, and never fails a request.
+
+**Log contract.** Each refresh ends in one outcome from a fixed set. A successful refresh
+logs nothing. Every other outcome logs exactly one line:
+
+```
+commit-graph refresh outcome=<outcome> repo=<cache repo path>: <detail>
+```
+
+The `outcome=` and `repo=` fields are stable. The detail text is for people and may
+change; line breaks inside it (from Git's stderr) are escaped as `\n`, so a record
+never spans lines. These are the outcomes:
+
+| Outcome | Meaning | Action |
+|---|---|---|
+| `outcome=written` | Graph extended, or already current. Not logged. | None |
+| `outcome=written_plain` | The first attempt ran out of its 3 s budget, and the retry without Bloom filters succeeded (it may have found nothing new to write). Later refreshes of that repo on this replica may also skip Bloom filters. | None needed. Expected for very large histories. |
+| `outcome=skipped_tip_cap` | The repo's refs point at more than 10,000 distinct commits, so no refresh ran. | None. The existing graph (if any) stays valid. |
+| `outcome=skipped_busy` | No slot was free right away, so the refresh was skipped and the next full hydrate retries. Refreshes share the git read API's 8-slot pool, count against the repository's 2-slot share like its reads, and may hold at most 2 of the pool's slots in total. | Look only if it is constant. That means sustained read or full-hydrate load. |
+| `outcome=lock_held` | Git found `objects/info/commit-graphs/commit-graph-chain.lock` already present. | If it repeats for one repo, follow the stale-lock runbook below. |
+| `outcome=memory_limit` | Git needed more heap than its 256 MiB cap (the read API's Heavy cap; Linux only) and stopped. | If it repeats for one repo, the history is too large for a graph within the cap. Reads stay correct. |
+| `outcome=timed_out` | The refresh used its whole 5 s deadline. It held that repo's hydrate lock for up to about 7 s. | If it repeats for one repo, that repo pays this on every full hydrate. Consider the history size. |
+| `outcome=canceled` | The request that triggered the full hydrate went away. | None |
+| `outcome=failed` | Any other Git failure. The detail carries Git's stderr. | Read the detail. |
+
+The [metrics listener](../reference/metrics.md) counts every outcome, including
+`written`, in `openstorage_commit_graph_refresh_total{outcome}`. The labels are exactly
+these outcomes, with no repository label: use the log line's `repo=` field to find the
+repository.
+
+**Stale-lock runbook.** The symptom is `outcome=lock_held` for the same `repo=` on every
+full hydrate. The usual cause is that a Git process was killed (SIGKILL, the OOM killer,
+or a host crash) during the short window in which it holds the lock. A person running
+Git by hand in the cache can cause it too. Reads stay correct. Only that repo's graph
+stops growing on that replica. To recover:
+
+1. Take the repository path from the `repo=` field. A relative path is relative to the
+   server's working directory.
+2. Drain the replica (stop routing new requests to it) and stop the openstorage process.
+3. Make sure nothing else is still writing to the cache. A Git child of the stopped
+   server can outlive it, and so can a Git process someone started by hand. With the
+   server stopped, `pgrep -af git` on the replica (or inside its container) must list no
+   Git process working in the cache directory. If one does, wait for it to exit. Only a
+   stopped replica makes this check safe: a live server can start a new writer right
+   after the check.
+4. Remove the lock file:
+   `rm <repo>/objects/info/commit-graphs/commit-graph-chain.lock`. You may also delete
+   leftover `objects/info/commit-graphs/tmp_graph_*` files from the killed writer; Git
+   ignores them. If in doubt, delete the whole `objects/info/commit-graphs` directory
+   instead. The graph is rebuildable.
+5. Start the replica. After the next full hydrate of that repository (for example, after
+   the next push), check that no new `lock_held` line appears. `git -C <repo>
+   commit-graph verify` should succeed.
+
+openstorage never removes this lock itself. It cannot prove that no live process owns
+the lock: a crashed server can leave its Git child running, and other Git processes do
+not take openstorage's lock.
+
 ## Concurrent boot: schema setup and migrations
 
 Replicas race at boot by design: deploy tooling starts them all at once against the same
@@ -479,6 +543,7 @@ read their reports, and delete-mode prerequisites: see the
 | `orphan pack sweep finished` log line | Per-sweep report: orphan counts/bytes, deletions, reclaimed bytes ([field reference](storage-lifecycle-and-sweeping.md#reading-a-sweep-report)) |
 | `repack: folded packs` / `repack trigger: scheduled fold` log lines | Repack progress; a repo that triggers but never folds warrants a look |
 | `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
+| `commit-graph refresh outcome=…` log lines | A `repo=` that repeats `lock_held`, `timed_out`, or `failed` needs a look ([outcomes and stale-lock runbook](#commit-graph-refresh)) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
@@ -510,6 +575,7 @@ text appended after it is not part of the contract.
 | Lease `… fail-stop` (S3WAL signals) | **log only** for the verdict | `openstorage_s3wal_lease_renewal_failures_total` counts failed renewal writes before it; `openstorage_s3wal_lease_held` is local state, and the process exits on fail-stop |
 | Startup `no usable HTTP Date witness` / lease `freshness cannot be judged` / `is corrupt` (S3WAL signals) | **log only** | Startup refusals |
 | `WARN s3wal clock skew guard tripped` (S3WAL signals) | **log only** | |
+| `commit-graph refresh outcome=…` (What to monitor) | `openstorage_commit_graph_refresh_total` by `outcome` | Counts every refresh, including the silent `written`; the repository stays **log only** in the line's `repo=` field |
 
 ## Zero-infrastructure mode (experimental): one bucket, one node
 

@@ -470,44 +470,44 @@ func TestSlotsPerKeyShare(t *testing.T) {
 	ctx := context.Background()
 	s := NewSlots(3, 2, 0)
 	for range 2 {
-		if err := s.acquire(ctx, "a"); err != nil {
+		if err := s.Acquire(ctx, "a"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := s.acquire(ctx, "a"); !errors.Is(err, ErrBusy) {
+	if err := s.Acquire(ctx, "a"); !errors.Is(err, ErrBusy) {
 		t.Fatalf("third slot for one key: err = %v, want ErrBusy", err)
 	}
-	if err := s.acquire(ctx, "b"); err != nil {
+	if err := s.Acquire(ctx, "b"); err != nil {
 		t.Fatalf("other key: %v", err)
 	}
-	if err := s.acquire(ctx, "c"); !errors.Is(err, ErrBusy) {
+	if err := s.Acquire(ctx, "c"); !errors.Is(err, ErrBusy) {
 		t.Fatalf("full pool: err = %v, want ErrBusy", err)
 	}
-	s.release("a")
-	if err := s.acquire(ctx, "c"); err != nil {
+	s.Release("a")
+	if err := s.Acquire(ctx, "c"); err != nil {
 		t.Fatalf("after a release: %v", err)
 	}
 	for _, k := range []string{"a", "b", "c"} {
-		s.release(k)
+		s.Release(k)
 	}
 	if s.InUse() != 0 {
 		t.Fatalf("in use = %d after releasing everything", s.InUse())
 	}
 
 	w := NewSlots(1, 1, 10*time.Second)
-	if err := w.acquire(ctx, "a"); err != nil {
+	if err := w.Acquire(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
 	got := make(chan error, 1)
 	start := time.Now()
-	go func() { got <- w.acquire(ctx, "b") }()
+	go func() { got <- w.Acquire(ctx, "b") }()
 	time.Sleep(50 * time.Millisecond)
-	w.release("a")
+	w.Release("a")
 	if err := <-got; err != nil {
 		t.Fatalf("waiter: %v", err)
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("waiter woke after %v, want right after the release", d)
 	}
-	w.release("b")
+	w.Release("b")
 }

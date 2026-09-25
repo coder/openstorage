@@ -14,13 +14,14 @@ import (
 	"log"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/coder/openstorage/internal/gitlimit"
+	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -85,43 +86,121 @@ func (c *tipCollectingRefSeq) next() (string, string, bool, error) {
 	return name, sha, ok, err
 }
 
-// commitGraphSlots bounds concurrent refreshes per process, so writes across
-// many repos can occupy at most cap(commitGraphSlots) CPUs. A refresh that
-// finds every slot busy is skipped, not queued: the next full hydrate of
-// that repo retries, and a stale graph only costs speed.
-var commitGraphSlots = make(chan struct{}, 2)
-
-// commitGraphGit is the binary the refresh runs. Test seam for driving the
-// timeout, retry, and reaping paths with a scripted fake.
-var commitGraphGit = "git"
-
 // errCommitGraphBudget is the cancellation cause of an attempt that ran out
 // of its own budget (as opposed to the request or the shared deadline).
 var errCommitGraphBudget = errors.New("commit-graph attempt budget expired")
 
+// commitGraphOutcome is how one refresh ended. The set is fixed: it is
+// the log contract in docs/how-to/deploy-production.md ("Commit-graph
+// refresh") and the label set of openstorage_commit_graph_refresh_total,
+// and it never carries the repo.
+type commitGraphOutcome string
+
+const (
+	outcomeWritten       commitGraphOutcome = "written"         // graph extended (or nothing new); not logged
+	outcomeWrittenPlain  commitGraphOutcome = "written_plain"   // first attempt timed out; plain retry succeeded (possibly with nothing new to write)
+	outcomeSkippedTipCap commitGraphOutcome = "skipped_tip_cap" // more than commitGraphMaxTips distinct tips
+	outcomeSkippedBusy   commitGraphOutcome = "skipped_busy"    // no maintenance admission (gitlimit.TryAdmitMaintenance)
+	outcomeLockHeld      commitGraphOutcome = "lock_held"       // commit-graph-chain.lock already exists
+	outcomeMemoryLimit   commitGraphOutcome = "memory_limit"    // git hit its heap cap (gitlimit.HeavyHeapBytes)
+	outcomeTimedOut      commitGraphOutcome = "timed_out"       // the refresh deadline expired
+	outcomeCanceled      commitGraphOutcome = "canceled"        // the request went away
+	outcomeFailed        commitGraphOutcome = "failed"          // any other git failure
+)
+
+// commitGraphOutcomes lists every outcome, in documentation order.
+var commitGraphOutcomes = []commitGraphOutcome{
+	outcomeWritten, outcomeWrittenPlain, outcomeSkippedTipCap, outcomeSkippedBusy,
+	outcomeLockHeld, outcomeMemoryLimit, outcomeTimedOut, outcomeCanceled, outcomeFailed,
+}
+
+// errCommitGraphLockHeld marks a write that failed because Git found its
+// lock file already present (a concurrent or dead writer's).
+var errCommitGraphLockHeld = errors.New("commit-graph lock file already exists")
+
+// commitGraphMetric maps each outcome to its metrics label enum.
+var commitGraphMetric = map[commitGraphOutcome]metrics.CommitGraphOutcome{
+	outcomeWritten:       metrics.CommitGraphWritten,
+	outcomeWrittenPlain:  metrics.CommitGraphWrittenPlain,
+	outcomeSkippedTipCap: metrics.CommitGraphSkippedTipCap,
+	outcomeSkippedBusy:   metrics.CommitGraphSkippedBusy,
+	outcomeLockHeld:      metrics.CommitGraphLockHeld,
+	outcomeMemoryLimit:   metrics.CommitGraphMemoryLimit,
+	outcomeTimedOut:      metrics.CommitGraphTimedOut,
+	outcomeCanceled:      metrics.CommitGraphCanceled,
+	outcomeFailed:        metrics.CommitGraphFailed,
+}
+
+// logLineEscaper keeps a log record on one line.
+var logLineEscaper = strings.NewReplacer("\r", `\r`, "\n", `\n`)
+
+// recordCommitGraphOutcome is the single reporting point for a refresh's
+// outcome. Every outcome counts once in
+// openstorage_commit_graph_refresh_total{outcome}; every outcome except
+// written is also logged as one line:
+//
+//	commit-graph refresh outcome=<outcome> repo=<repoPath>[: <detail>]
+func recordCommitGraphOutcome(repoPath string, o commitGraphOutcome, detail string) commitGraphOutcome {
+	m, ok := commitGraphMetric[o]
+	assertf(ok && slices.Contains(commitGraphOutcomes, o), "recordCommitGraphOutcome: unknown outcome %q", o)
+	metrics.CommitGraphRefresh(m)
+	if o == outcomeWritten {
+		return o
+	}
+	line := fmt.Sprintf("commit-graph refresh outcome=%s repo=%s", o, repoPath)
+	if detail != "" {
+		line += ": " + detail
+	}
+	// Exactly one line per record: git's stderr can span lines, so escape
+	// embedded line breaks rather than letting them split the record.
+	log.Print(logLineEscaper.Replace(line))
+	return o
+}
+
 // refreshCommitGraph adds the commits reachable from tips (the distinct
 // SHAs the sync that just completed applied) to repoPath's split
-// commit-graph and logs any failure. The caller must hold the repo's
+// commit-graph and reports how it ended (recordCommitGraphOutcome). A
+// repo with no refs reports written: there is nothing to graph. The caller must hold the repo's
 // hydrate lock: it serializes every commit-graph writer for the repo on
-// this node.
-func refreshCommitGraph(ctx context.Context, repoPath string, tips *refTips) {
+// this node. Never fails the caller: the outcome is informational.
+func refreshCommitGraph(ctx context.Context, repoPath, slotKey string, tips *refTips) commitGraphOutcome {
 	assertf(tips != nil, "refreshCommitGraph: nil tips")
+	assertf(slotKey != "", "refreshCommitGraph: empty slot key")
 	if tips.over {
-		log.Printf("commit-graph %s: skipped, more than %d distinct ref tips (reads stay correct, only slower)", repoPath, commitGraphMaxTips)
-		return
+		return recordCommitGraphOutcome(repoPath, outcomeSkippedTipCap,
+			fmt.Sprintf("more than %d distinct ref tips (reads stay correct, only slower)", commitGraphMaxTips))
 	}
 	if len(tips.set) == 0 {
-		return // no refs, nothing to graph
+		return recordCommitGraphOutcome(repoPath, outcomeWritten, "") // no refs: nothing to graph, already current
 	}
-	select {
-	case commitGraphSlots <- struct{}{}:
-		defer func() { <-commitGraphSlots }()
+	// Join the shared git admission pool (#313's, gitlimit.ReadSlots) as
+	// maintenance: try-only, because the caller holds the hydrate lock, and
+	// at most gitlimit.MaintenanceShare refreshes at once, so reads keep
+	// the rest of the pool. The permit is released after every attempt
+	// has been reaped (writeCommitGraph returns only then).
+	release, ok := gitlimit.TryAdmitMaintenance(slotKey)
+	if !ok {
+		return recordCommitGraphOutcome(repoPath, outcomeSkippedBusy,
+			fmt.Sprintf("no admission: the shared git read pool or the %d-refresh maintenance share is full (the next full hydrate retries)", gitlimit.MaintenanceShare))
+	}
+	defer release()
+	plain, err := writeCommitGraph(ctx, repoPath, slices.Sorted(maps.Keys(tips.set)))
+	switch {
+	case err == nil && plain:
+		return recordCommitGraphOutcome(repoPath, outcomeWrittenPlain,
+			fmt.Sprintf("first attempt exceeded %v; wrote a layer without Bloom filters, later writes on this node inherit that", commitGraphFirstBudget))
+	case err == nil:
+		return recordCommitGraphOutcome(repoPath, outcomeWritten, "")
+	case errors.Is(err, context.Canceled):
+		return recordCommitGraphOutcome(repoPath, outcomeCanceled, err.Error())
+	case errors.Is(err, gitlimit.ErrMemoryLimit):
+		return recordCommitGraphOutcome(repoPath, outcomeMemoryLimit, err.Error()+" (reads stay correct, only slower)")
+	case errors.Is(err, errCommitGraphLockHeld):
+		return recordCommitGraphOutcome(repoPath, outcomeLockHeld, err.Error()+" (see the stale-lock runbook; reads stay correct, only slower)")
+	case errors.Is(err, context.DeadlineExceeded):
+		return recordCommitGraphOutcome(repoPath, outcomeTimedOut, err.Error()+" (reads stay correct, only slower)")
 	default:
-		log.Printf("commit-graph %s: skipped, all %d refresh slots busy (the next full hydrate retries)", repoPath, cap(commitGraphSlots))
-		return
-	}
-	if err := writeCommitGraph(ctx, repoPath, slices.Sorted(maps.Keys(tips.set))); err != nil {
-		log.Printf("commit-graph %s: %v (reads stay correct, only slower)", repoPath, err)
+		return recordCommitGraphOutcome(repoPath, outcomeFailed, err.Error()+" (reads stay correct, only slower)")
 	}
 }
 
@@ -133,8 +212,8 @@ func refreshCommitGraph(ctx context.Context, repoPath string, tips *refTips) {
 // choice from the existing chain. If the first attempt runs out of its own
 // budget while the request and the shared deadline are still live, one
 // retry writes a layer without Bloom filters (--no-changed-paths), which
-// later writes then inherit.
-func writeCommitGraph(ctx context.Context, repoPath string, tips []string) error {
+// later writes then inherit; plain reports that the retry wrote it.
+func writeCommitGraph(ctx context.Context, repoPath string, tips []string) (plain bool, err error) {
 	assertf(repoPath != "", "writeCommitGraph: empty repo path")
 	assertf(len(tips) > 0 && len(tips) <= commitGraphMaxTips, "writeCommitGraph: %d tips (cap %d)", len(tips), commitGraphMaxTips)
 	for _, tip := range tips {
@@ -151,18 +230,19 @@ func writeCommitGraph(ctx context.Context, repoPath string, tips []string) error
 	if !hasCommitGraph(repoPath) {
 		first = append(slices.Clip(args), "--changed-paths")
 	}
-	err := runCommitGraphAttempt(ctx, repoPath, commitGraphFirstBudget, first, stdin)
+	err = runCommitGraphAttempt(ctx, repoPath, commitGraphFirstBudget, first, stdin)
 	if !errors.Is(err, errCommitGraphBudget) {
-		return err
+		return false, err
 	}
+	// Only the terminal failure is wrapped (%w), so outcome classification
+	// follows what ended the refresh, not the first attempt's timeout.
 	if cerr := ctx.Err(); cerr != nil {
-		return fmt.Errorf("%w; no retry: %w", err, cerr)
+		return false, fmt.Errorf("%v; no retry: %w", err, cerr)
 	}
 	if rerr := runCommitGraphAttempt(ctx, repoPath, 0, append(slices.Clip(args), "--no-changed-paths"), stdin); rerr != nil {
-		return fmt.Errorf("%w; plain retry: %w", err, rerr)
+		return false, fmt.Errorf("%v; plain retry: %w", err, rerr)
 	}
-	log.Printf("commit-graph %s: first attempt exceeded %v; wrote a layer without Bloom filters, later writes on this node inherit that", repoPath, commitGraphFirstBudget)
-	return nil
+	return true, nil
 }
 
 // hasCommitGraph reports whether repoPath already has a commit-graph (split
@@ -190,8 +270,15 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 		actx, cancel = context.WithTimeoutCause(ctx, budget, errCommitGraphBudget)
 		defer cancel()
 	}
+	// The same heap cap as the read API's Heavy children (#313), applied
+	// on every path, including hydrates that no read budget covers
+	// (upload-pack). No cap where the platform cannot enforce one.
+	var heap int64
+	if gitlimit.HeapLimitSupported() {
+		heap = gitlimit.HeavyHeapBytes
+	}
 	observeGitSpawn(repoPath, args)
-	cmd := exec.CommandContext(actx, commitGraphGit, args...)
+	cmd := gitlimit.Command(actx, heap, args...)
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(stdin)
 	cmd.Env = commitGraphEnv(os.Environ())
@@ -209,6 +296,12 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		err = fmt.Errorf("%w: %w", cerr, err)
+	} else if heap > 0 && gitlimit.HeapFailure(err, stderr.String()) {
+		err = fmt.Errorf("%w (%d bytes): %w", gitlimit.ErrMemoryLimit, heap, err)
+	} else if strings.Contains(stderr.String(), ".lock': File exists") {
+		// Git's lockfile message; the lock is never removed here (its
+		// owner cannot be proven, ADR-47).
+		err = fmt.Errorf("%w: %w", errCommitGraphLockHeld, err)
 	}
 	return fmt.Errorf("git %s: %w: %s", line, err, strings.TrimSpace(stderr.String()))
 }
@@ -216,7 +309,8 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 // commitGraphEnv is the child's environment: environ without any inherited
 // GIT_* variable (GIT_DIR, GIT_OBJECT_DIRECTORY, GIT_CONFIG_COUNT/KEY/VALUE
 // and friends could redirect or disable the write), with global and system
-// config pinned to /dev/null like the API and sync Git subprocesses.
+// config pinned to /dev/null like the API and sync Git subprocesses, and
+// the C locale.
 func commitGraphEnv(environ []string) []string {
 	env := make([]string, 0, len(environ)+3)
 	for _, kv := range environ {
@@ -224,5 +318,8 @@ func commitGraphEnv(environ []string) []string {
 			env = append(env, kv)
 		}
 	}
-	return append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	// LC_ALL=C last (exec keeps the last value of a duplicate key): lock
+	// and heap failures are classified from Git's English messages, which
+	// an inherited translated locale would change.
+	return append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "LC_ALL=C")
 }

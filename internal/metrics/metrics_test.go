@@ -65,6 +65,15 @@ func TestExpositionHasEveryFamilyWithInitializedSeries(t *testing.T) {
 		`openstorage_s3wal_manifest_size_guard_total{result="refuse"} `,
 		`openstorage_job_runs_total{job="orphan_sweep",result="success"} `,
 		`openstorage_job_runs_total{job="repack",result="noop"} `,
+		`openstorage_commit_graph_refresh_total{outcome="written"} `,
+		`openstorage_commit_graph_refresh_total{outcome="written_plain"} `,
+		`openstorage_commit_graph_refresh_total{outcome="skipped_tip_cap"} `,
+		`openstorage_commit_graph_refresh_total{outcome="skipped_busy"} `,
+		`openstorage_commit_graph_refresh_total{outcome="lock_held"} `,
+		`openstorage_commit_graph_refresh_total{outcome="memory_limit"} `,
+		`openstorage_commit_graph_refresh_total{outcome="timed_out"} `,
+		`openstorage_commit_graph_refresh_total{outcome="canceled"} `,
+		`openstorage_commit_graph_refresh_total{outcome="failed"} `,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("exposition missing series %q", want)
@@ -120,6 +129,9 @@ func TestLabelValuesAreFixed(t *testing.T) {
 		"result=warn": true, "result=refuse": true,
 		"job=orphan_sweep": true, "job=repack": true,
 		"result=success": true, "result=noop": true, "result=error": true,
+		"outcome=written": true, "outcome=written_plain": true, "outcome=skipped_tip_cap": true,
+		"outcome=skipped_busy": true, "outcome=lock_held": true, "outcome=memory_limit": true,
+		"outcome=timed_out": true, "outcome=canceled": true, "outcome=failed": true,
 	}
 	for name, labels := range seriesLabels(t, scrape(t, Handler())) {
 		for l := range labels {
@@ -198,6 +210,7 @@ func TestSignalHelpersIncrement(t *testing.T) {
 		{"openstorage_s3wal_lease_renewal_failures_total", nil, S3WALLeaseRenewalFailed},
 		{"openstorage_s3wal_manifest_size_guard_total", map[string]string{"result": "refuse"}, func() { S3WALManifestSizeGuard(SizeGuardRefuse) }},
 		{"openstorage_job_runs_total", map[string]string{"job": "repack", "result": "error"}, func() { JobRun(JobRepack, ResultError) }},
+		{"openstorage_commit_graph_refresh_total", map[string]string{"outcome": "lock_held"}, func() { CommitGraphRefresh(CommitGraphLockHeld) }},
 	} {
 		before := Value(p.name, p.labels)
 		p.fire()

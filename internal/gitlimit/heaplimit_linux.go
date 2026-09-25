@@ -1,6 +1,6 @@
 //go:build linux
 
-package gitread
+package gitlimit
 
 import (
 	"context"
@@ -15,7 +15,7 @@ import (
 // platform (RLIMIT_DATA via `ulimit -d`).
 func HeapLimitSupported() bool { return true }
 
-// heapLimitWrapper is the /bin/sh script heapLimitedGit runs: $1 is the
+// heapLimitWrapper is the /bin/sh script Command runs: $1 is the
 // cap in KiB, the remaining arguments are git's. It only ever LOWERS the
 // limit: when the inherited soft limit is already at or below the cap, it
 // is kept (raising toward the cap past an inherited hard limit fails with
@@ -25,7 +25,7 @@ const heapLimitWrapper = `cur=$(ulimit -S -d) || exit 125
 if [ "$cur" = unlimited ] || [ "$cur" -gt "$1" ]; then ulimit -d "$1" || exit 125; fi
 shift; exec git "$@"`
 
-// heapLimitedGit returns `git args...`. When maxHeapBytes > 0 it runs git
+// Command returns `git args...`. When maxHeapBytes > 0 it runs git
 // behind /bin/sh, which sets RLIMIT_DATA (`ulimit -d`, KiB) and then execs
 // git, so the limit is in force before git allocates anything and the
 // process id stays git's (context kill and Wait still reach git). An
@@ -35,7 +35,7 @@ shift; exec git "$@"`
 // RLIMIT_DATA counts the heap and other private writable mappings, which
 // includes every thread's stack and malloc arena; read-only pack mappings
 // (shared page cache) are not counted.
-func heapLimitedGit(ctx context.Context, maxHeapBytes int64, args ...string) *exec.Cmd {
+func Command(ctx context.Context, maxHeapBytes int64, args ...string) *exec.Cmd {
 	if maxHeapBytes == 0 {
 		return exec.CommandContext(ctx, "git", args...)
 	}
@@ -44,7 +44,7 @@ func heapLimitedGit(ctx context.Context, maxHeapBytes int64, args ...string) *ex
 	return exec.CommandContext(ctx, "/bin/sh", wrapper...)
 }
 
-// heapLimitFailure reports whether a git run under a heap cap died of it:
+// HeapFailure reports whether a git run under a heap cap died of it:
 // git's fatal allocation diagnostics, or, when the cap is hit before or
 // outside git's checked allocators (dynamic loader, libc), a crash by
 // SIGSEGV, SIGBUS, or SIGABRT. SIGKILL (context cancellation or deadline)
@@ -53,7 +53,7 @@ func heapLimitedGit(ctx context.Context, maxHeapBytes int64, args ...string) *ex
 // Only a fatal line that STARTS with a known diagnostic counts: git
 // messages can quote request input (a path named "out of memory"), and
 // such text never forms the start of the line.
-func heapLimitFailure(waitErr error, stderr string) bool {
+func HeapFailure(waitErr error, stderr string) bool {
 	for line := range strings.SplitSeq(stderr, "\n") {
 		for _, prefix := range heapFailurePrefixes {
 			if strings.HasPrefix(line, prefix) {
