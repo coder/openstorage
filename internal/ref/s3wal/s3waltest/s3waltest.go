@@ -385,7 +385,9 @@ type BootingFakeS3 struct {
 // anything else → 400.
 func (f *BootingFakeS3) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bucketOnly := !strings.Contains(strings.TrimPrefix(r.URL.Path, "/"), "/")
+		// Keep slashes in nonempty object keys; /bucket/ has no key.
+		_, key, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
+		bucketOnly := key == ""
 		switch {
 		case bucketOnly && (r.Method == http.MethodPut || r.Method == http.MethodHead):
 			w.WriteHeader(http.StatusOK)
