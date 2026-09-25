@@ -853,8 +853,12 @@ func TestLocalScheduleMirrorBackAndInitialSyncDurable(t *testing.T) {
 	}
 	reached, release := f.gate.hold("ClaimDueSync", repo.RepoID)
 	f.sweep(t) // the forward succeeds
+	select {
+	case <-reached:
+		t.Fatal("mirror-back pull ran inside the forward's run instead of a later pass")
+	default:
+	}
 	release()
-	_ = reached
 	if r := f.row(t, repo.RepoID); !r.SyncPending || r.PushSuccessCount != 1 {
 		t.Fatalf("forward success did not mark the mirror-back: %+v", r)
 	}
