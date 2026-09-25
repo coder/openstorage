@@ -407,9 +407,8 @@ func TestUpstreamSyncLifecycle(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("policed pull-upstream status %d: %s", resp.StatusCode, respBody)
 		}
-		var denied map[string]string
-		if err := json.Unmarshal(respBody, &denied); err != nil || denied["error"] != `ref policy op "no-push" denies pull-upstream` {
-			t.Fatalf("policed pull-upstream body = %s (err %v)", respBody, err)
+		if msg := requireEnvelope(t, resp, respBody); msg != `ref policy op "no-push" denies pull-upstream` {
+			t.Fatalf("policed pull-upstream error = %q", msg)
 		}
 		s.assertNoEvent(t)
 
@@ -457,10 +456,7 @@ func TestUpstreamSyncLifecycle(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("pull-upstream after detach status %d: %s", resp.StatusCode, respBody)
 		}
-		var envelope map[string]string
-		if err := json.Unmarshal(respBody, &envelope); err != nil || envelope["error"] == "" {
-			t.Fatalf("pull-upstream after detach body = %s (err %v)", respBody, err)
-		}
+		requireEnvelope(t, resp, respBody)
 		s.assertNoEvent(t)
 	})
 }
@@ -519,12 +515,8 @@ func TestCreateRepoBaseRepoValidation(t *testing.T) {
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Fatalf("status %d: %s", resp.StatusCode, respBody)
 				}
-				var envelope map[string]string
-				if err := json.Unmarshal(respBody, &envelope); err != nil {
-					t.Fatal(err)
-				}
-				if envelope["error"] != c.wantMsg {
-					t.Fatalf("error = %q, want %q", envelope["error"], c.wantMsg)
+				if msg := requireEnvelope(t, resp, respBody); msg != c.wantMsg {
+					t.Fatalf("error = %q, want %q", msg, c.wantMsg)
 				}
 				// Rejection must not leave a repo row behind.
 				if _, err := e.store.GetRepoByURL(context.Background(), s.org, repoURL); !errors.Is(err, meta.ErrNotFound) {
@@ -549,10 +541,7 @@ func TestPullUpstreamAndDetachWithoutBase(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("pull-upstream status %d: %s", resp.StatusCode, respBody)
 		}
-		var envelope map[string]string
-		if err := json.Unmarshal(respBody, &envelope); err != nil || envelope["error"] == "" {
-			t.Fatalf("pull-upstream body = %s (err %v)", respBody, err)
-		}
+		requireEnvelope(t, resp, respBody)
 
 		// Detach without an upstream is still an idempotent 200.
 		repoToken := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})

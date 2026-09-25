@@ -122,9 +122,8 @@ func TestPushUpstreamLifecycle(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("policed push-upstream status %d: %s", resp.StatusCode, respBody)
 		}
-		var denied map[string]string
-		if err := json.Unmarshal(respBody, &denied); err != nil || denied["error"] != `ref policy op "no-push" denies push-upstream` {
-			t.Fatalf("policed push-upstream body = %s (err %v)", respBody, err)
+		if msg := requireEnvelope(t, resp, respBody); msg != `ref policy op "no-push" denies push-upstream` {
+			t.Fatalf("policed push-upstream error = %q", msg)
 		}
 		s.assertNoEvent(t)
 
@@ -175,9 +174,8 @@ func TestPushUpstreamRequiresBaseRepo(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status %d: %s", resp.StatusCode, respBody)
 		}
-		var out map[string]string
-		if err := json.Unmarshal(respBody, &out); err != nil || out["error"] != "repository has no upstream base_repo" {
-			t.Fatalf("400 body = %s (err %v)", respBody, err)
+		if msg := requireEnvelope(t, resp, respBody); msg != "repository has no upstream base_repo" {
+			t.Fatalf("400 error = %q", msg)
 		}
 	})
 }

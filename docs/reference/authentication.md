@@ -137,4 +137,9 @@ branch-protection mechanism; there is no server-side protection config.
 | valid token, insufficient scope or ref policy denies | 403 |
 | `repo` claim mismatch with target | 403 (do not leak existence: 404 acceptable per vendor error-string instability) |
 
-Error body: `{"error": "<message>"}` — clients branch on status codes, not messages.
+Error body: `{"error": "<message>"}` plus the problem-details fields described under
+[HTTP API conventions](http-api.md#conventions) (`type`, `title`, `status`, a generic
+`code` such as `unauthorized` or `forbidden`, and `detail`). Ref-moving write endpoints
+answer with the `result` envelope instead
+([streaming protocols](../explanation/streaming-commit-protocols.md)). Clients branch on
+status codes (or `code` where present), not messages.

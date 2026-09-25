@@ -480,5 +480,6 @@ func requireEnvelope(t *testing.T, resp *http.Response, body []byte) string {
 			t.Fatalf("401 WWW-Authenticate = %q, want Bearer", got)
 		}
 	}
+	assertProblemFields(t, resp.StatusCode, body)
 	return envlp.Error
 }

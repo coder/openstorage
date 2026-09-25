@@ -144,6 +144,7 @@ func TestRateLimit429ReadEnvelope(t *testing.T) {
 	if body.Error != "rate limit exceeded" {
 		t.Errorf("error = %q, want %q", body.Error, "rate limit exceeded")
 	}
+	assertProblemFields(t, w.Code, w.Body.Bytes())
 }
 
 func TestRateLimit429WriteEnvelope(t *testing.T) {
@@ -438,6 +439,10 @@ func TestGitRateLimit429Envelope(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Error == "" {
 		t.Fatalf("expected {\"error\"} envelope, got %q (err %v)", w.Body.String(), err)
 	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	assertProblemFields(t, w.Code, w.Body.Bytes())
 	// A different client IP still has its own full bucket.
 	if w := rlRequest(t, h, "10.0.0.10:1"); w.Code != http.StatusOK {
 		t.Fatalf("other client = %d, want 200 (per-client isolation)", w.Code)
