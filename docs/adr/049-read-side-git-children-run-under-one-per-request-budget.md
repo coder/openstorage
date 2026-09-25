@@ -29,9 +29,9 @@ so their behavior is unchanged. The limits are:
 
 | Limit | Value | Failure (before or instead of the work) |
 |---|---|---|
-| Admission | 8 slots per process (`file` and `archive`: a separate 8), at most 2 of each per repository (its canonical ID, whatever the token's claim spelling), taken at the request's first git child of either class and held until the response is delivered; 1 s wait | 503 + `Retry-After: 1`; git not started |
-| Time | 30 s of git time per request from its first child, shared by all children (archive: 10 min) | 503, no `Retry-After`; git killed and reaped |
-| Heap | `RLIMIT_DATA` 256 MiB Heavy / 32 MiB Light, set by `/bin/sh -c 'ulimit -d …; exec git'`; an inherited stricter limit is kept | 422 |
+| Admission | 8 slots per process (`file` and `archive`: a separate 8), at most 2 of each per repository (its canonical ID, whatever the token's claim spelling), taken at the request's first git child of either class and held until the response has been written to the connection; 1 s wait | 503 + `Retry-After: 1`; git not started |
+| Time | every child must finish within 30 s (archive: 10 min) of the request's first child, in wall-clock time | 503, no `Retry-After`; git killed and reaped |
+| Heap | `RLIMIT_DATA` 256 MiB Heavy / 32 MiB Light, set by `/bin/sh -c 'ulimit -d …; exec git'`; an inherited stricter limit is kept | 422, also for a `SIGSEGV`/`SIGBUS`/`SIGABRT` crash under the cap |
 | Output | 64 MiB buffered stdout per request | 422; git killed at once |
 | Blob size | 100 MiB, checked from `ls-tree` sizes | 422 before any response byte |
 | Delivery | 30 s per 64 KiB written, and 2 min for the whole response from its first byte (`file`, `archive`: 10 min), as HTTP write deadlines | connection closed; handler returns and releases slot, payload and temp files |
@@ -66,7 +66,7 @@ users can push. The production image is Linux.
   slot bounds everything a request retains, not just its git processes: a
   files/metadata page keeps output between hundreds of children, and a
   finished blame keeps its payload while a slow client reads it. Admission
-  therefore lasts until the response is delivered, and write deadlines
+  therefore lasts until the response has been written to the connection, and write deadlines
   (idle and absolute) bound how long a slow reader can hold it. Light-only
   requests (a multi-megabyte commit object) take a slot too.
 - **Per-child deadlines.** A 30 s deadline per child would give a
