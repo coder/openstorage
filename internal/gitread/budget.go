@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -375,7 +376,7 @@ func (t *tailBuffer) String() string { return strings.TrimSpace(string(t.b)) }
 type Cmd struct {
 	Class Class
 	Dir   string    // repository (or scratch) directory; required
-	Env   []string  // nil inherits the server's environment
+	Env   []string  // nil inherits the server's environment (see childEnv)
 	Stdin io.Reader // nil: no stdin
 	// Stdout, when set, receives git's output as it is produced and is not
 	// counted against the output allowance (streaming callers, such as a
@@ -383,6 +384,41 @@ type Cmd struct {
 	// end git early. When nil, output is buffered, counted, and returned.
 	Stdout io.Writer
 	Args   []string
+}
+
+// localeCategories are glibc's locale categories other than LC_MESSAGES.
+var localeCategories = []string{
+	"LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY", "LC_PAPER",
+	"LC_NAME", "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION",
+}
+
+// childEnv returns a git child's environment: env (nil: the server's) with
+// git's messages in the untranslated C locale, because heapLimitFailure
+// matches git's English diagnostics (#339). Only LC_MESSAGES changes:
+// LC_CTYPE and LC_COLLATE drive git grep's regex matching (-i on non-ASCII
+// text, "." over multibyte characters), so LC_ALL=C would change results.
+// An inherited LC_ALL overrides every category, so it is replaced by the
+// same value on each other category. gettext ignores LANGUAGE when
+// LC_MESSAGES is C. exec.Cmd uses the last value of a repeated variable.
+func childEnv(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	out := make([]string, 0, len(env)+len(localeCategories)+1)
+	all := ""
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "LC_ALL="); ok {
+			all = v // the last value is the effective one
+			continue
+		}
+		out = append(out, kv)
+	}
+	if all != "" { // an empty LC_ALL is ignored, like an unset one
+		for _, c := range localeCategories {
+			out = append(out, c+"="+all)
+		}
+	}
+	return append(out, "LC_MESSAGES=C")
 }
 
 // Run starts one read-side git child under the limits above and waits for
@@ -423,7 +459,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 
 	cmd := heapLimitedGit(runCtx, heap, c.Args...)
 	cmd.Dir = c.Dir
-	cmd.Env = c.Env
+	cmd.Env = childEnv(c.Env)
 	cmd.Stdin = c.Stdin
 	cmd.WaitDelay = childWaitDelay
 	var stderr tailBuffer

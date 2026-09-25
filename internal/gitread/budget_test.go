@@ -155,6 +155,79 @@ func TestRunAppliesClassHeapCapsBeforeExec(t *testing.T) {
 	}
 }
 
+// childEnvOf runs a fake `git` that prints its environment and returns the
+// effective variables it saw.
+func childEnvOf(t *testing.T, ctx context.Context, env []string) map[string]string {
+	t.Helper()
+	out, err := Run(ctx, Cmd{Class: Heavy, Dir: t.TempDir(), Env: env, Args: []string{"x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vars := map[string]string{}
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if _, dup := vars[k]; dup {
+			t.Fatalf("git saw %s twice", k)
+		}
+		vars[k] = v
+	}
+	return vars
+}
+
+// heapLimitFailure matches git's English diagnostics, so a translated
+// locale must not reach git's messages (#339). Only LC_MESSAGES is
+// pinned: LC_CTYPE/LC_COLLATE drive git grep's regex matching.
+func TestRunPinsGitMessagesToCLocale(t *testing.T) {
+	fakeGit(t, "env")
+	t.Setenv("LANG", "de_DE.UTF-8")
+	t.Setenv("LANGUAGE", "de")
+	t.Setenv("LC_MESSAGES", "de_DE.UTF-8")
+	t.Setenv("LC_CTYPE", "fr_FR.UTF-8")
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	check := func(name string, got map[string]string, want map[string]string) {
+		t.Helper()
+		if v, ok := got["LC_ALL"]; ok {
+			t.Errorf("%s: git saw LC_ALL=%q; it overrides LC_MESSAGES", name, v)
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("%s: git saw %s=%q, want %q", name, k, got[k], v)
+			}
+		}
+	}
+	// The inherited LC_ALL keeps its value on every other category.
+	inherited := map[string]string{"LC_MESSAGES": "C", "LC_CTYPE": "de_DE.UTF-8", "LC_COLLATE": "de_DE.UTF-8", "LC_TIME": "de_DE.UTF-8", "LANG": "de_DE.UTF-8"}
+	check("no budget", childEnvOf(t, context.Background(), nil), inherited)
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes)
+	defer b.Close()
+	ctx := WithBudget(context.Background(), b) // Linux: behind the heap-cap shell
+	check("budget", childEnvOf(t, ctx, nil), inherited)
+
+	// A caller's own Env is kept, not replaced by the server's.
+	env := []string{"PATH=" + os.Getenv("PATH"), "MARKER=kept", "LC_ALL=pt_BR.UTF-8", "LC_MESSAGES=pt_BR.UTF-8"}
+	orig := append([]string(nil), env...)
+	for name, c := range map[string]context.Context{"caller env": context.Background(), "caller env, budget": ctx} {
+		got := childEnvOf(t, c, env)
+		check(name, got, map[string]string{"MARKER": "kept", "LC_MESSAGES": "C", "LC_CTYPE": "pt_BR.UTF-8"})
+		if _, ok := got["LANG"]; ok {
+			t.Errorf("%s: git saw the server's LANG with a caller Env", name)
+		}
+	}
+	if strings.Join(env, "\n") != strings.Join(orig, "\n") {
+		t.Fatalf("Run modified the caller's Env: %q", env)
+	}
+
+	// Without LC_ALL the other categories are untouched.
+	got := childEnvOf(t, context.Background(), []string{"PATH=" + os.Getenv("PATH"), "LANG=de_DE.UTF-8"})
+	check("no LC_ALL", got, map[string]string{"LANG": "de_DE.UTF-8", "LC_MESSAGES": "C"})
+	if v, ok := got["LC_CTYPE"]; ok {
+		t.Errorf("no LC_ALL: git saw LC_CTYPE=%q, want it unset", v)
+	}
+}
+
 func TestRunOutputLimitKillsGit(t *testing.T) {
 	dir, tip, _ := deepHistory(t, 5000)
 	b := testBudget(NewSlots(1, 1, 0), time.Minute, 64<<10)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -153,5 +154,32 @@ func TestGrepNoMatchesAndBinarySkipped(t *testing.T) {
 	}
 	if len(files) != 0 {
 		t.Fatalf("binary grep = %+v, want skipped", files)
+	}
+}
+
+// #339 pins only git's messages to the C locale: a UTF-8 server locale
+// must still reach git grep's regex matching (LC_ALL=C would break -i on
+// non-ASCII text and "." over multibyte characters).
+func TestGrepKeepsServerCharacterLocale(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "f.txt", "CAFÉ au lait\nnaïve\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "utf-8")
+	commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	t.Setenv("LC_ALL", "C.UTF-8")
+	probe := exec.Command("git", "grep", "-q", "-i", "café", commit)
+	probe.Dir = dir
+	if probe.Run() != nil {
+		t.Skip("this git has no C.UTF-8 regex locale")
+	}
+	for _, opts := range []GrepOptions{{Pattern: "café", CaseInsensitive: true}, {Pattern: "na.ve"}} {
+		files, err := Grep(context.Background(), dir, commit, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(files) != 1 || len(files[0].Lines) != 1 {
+			t.Errorf("grep %+v under LC_ALL=C.UTF-8 = %+v, want one match", opts, files)
+		}
 	}
 }
