@@ -265,7 +265,7 @@ func TestWriteCommitGraph_IsolatesInheritedGitEnv(t *testing.T) {
 
 func TestCommitGraphEnv(t *testing.T) {
 	got := commitGraphEnv([]string{"PATH=/bin", "GIT_DIR=/x", "HOME=/h", "GIT_CONFIG_COUNT=1", "GITX=keep"})
-	want := []string{"PATH=/bin", "HOME=/h", "GITX=keep", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1"}
+	want := []string{"PATH=/bin", "HOME=/h", "GITX=keep", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "LC_ALL=C"}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("commitGraphEnv = %q, want %q", got, want)
 	}

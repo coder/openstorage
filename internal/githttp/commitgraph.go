@@ -131,6 +131,9 @@ var commitGraphMetric = map[commitGraphOutcome]metrics.CommitGraphOutcome{
 	outcomeFailed:        metrics.CommitGraphFailed,
 }
 
+// logLineEscaper keeps a log record on one line.
+var logLineEscaper = strings.NewReplacer("\r", `\r`, "\n", `\n`)
+
 // recordCommitGraphOutcome is the single reporting point for a refresh's
 // outcome. Every outcome counts once in
 // openstorage_commit_graph_refresh_total{outcome}; every outcome except
@@ -148,7 +151,9 @@ func recordCommitGraphOutcome(repoPath string, o commitGraphOutcome, detail stri
 	if detail != "" {
 		line += ": " + detail
 	}
-	log.Print(line)
+	// Exactly one line per record: git's stderr can span lines, so escape
+	// embedded line breaks rather than letting them split the record.
+	log.Print(logLineEscaper.Replace(line))
 	return o
 }
 
@@ -304,7 +309,8 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 // commitGraphEnv is the child's environment: environ without any inherited
 // GIT_* variable (GIT_DIR, GIT_OBJECT_DIRECTORY, GIT_CONFIG_COUNT/KEY/VALUE
 // and friends could redirect or disable the write), with global and system
-// config pinned to /dev/null like the API and sync Git subprocesses.
+// config pinned to /dev/null like the API and sync Git subprocesses, and
+// the C locale.
 func commitGraphEnv(environ []string) []string {
 	env := make([]string, 0, len(environ)+3)
 	for _, kv := range environ {
@@ -312,5 +318,8 @@ func commitGraphEnv(environ []string) []string {
 			env = append(env, kv)
 		}
 	}
-	return append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	// LC_ALL=C last (exec keeps the last value of a duplicate key): lock
+	// and heap failures are classified from Git's English messages, which
+	// an inherited translated locale would change.
+	return append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "LC_ALL=C")
 }

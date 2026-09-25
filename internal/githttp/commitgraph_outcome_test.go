@@ -271,3 +271,39 @@ func TestRecordCommitGraphOutcome_CountsMetric(t *testing.T) {
 		}
 	}
 }
+
+// A multi-line git stderr still yields exactly one log line: embedded
+// newlines are escaped, so every record keeps its outcome= and repo=.
+func TestRecordCommitGraphOutcome_OneLineWithMultiLineDetail(t *testing.T) {
+	buf := captureLog(t)
+	recordCommitGraphOutcome("repo.git", outcomeFailed, "warning: a\nfatal: b\r\nfatal: c")
+	out := strings.TrimRight(buf.String(), "\n")
+	if strings.Count(out, "\n") != 0 || !strings.HasPrefix(out, "commit-graph refresh outcome=failed repo=repo.git: ") {
+		t.Fatalf("log output = %q, want one line with the stable prefix", out)
+	}
+	if !strings.Contains(out, `warning: a\nfatal: b\r\nfatal: c`) {
+		t.Fatalf("log output = %q, want the newlines escaped, not dropped", out)
+	}
+}
+
+// The child runs in the C locale: lock and heap failures are classified
+// from Git's English messages, which a translated locale would change.
+func TestRefreshCommitGraph_ChildRunsInCLocale(t *testing.T) {
+	repoPath, tips := newGraphRepo(t, 5)
+	realGit := realGitPath(t)
+	dir := t.TempDir()
+	report := filepath.Join(dir, "locale")
+	body := "#!/bin/sh\n[ \"$1\" = commit-graph ] || exec \"" + realGit + "\" \"$@\"\necho \"LC_ALL=$LC_ALL\" > \"" + report + "\"\nexec \"" + realGit + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	t.Setenv("LANG", "de_DE.UTF-8")
+	if got := refreshCommitGraph(t.Context(), repoPath, testSlotKey, tips); got != outcomeWritten {
+		t.Fatalf("outcome = %s, want written", got)
+	}
+	if b, err := os.ReadFile(report); err != nil || strings.TrimSpace(string(b)) != "LC_ALL=C" {
+		t.Fatalf("child locale = %q (err %v), want LC_ALL=C", b, err)
+	}
+}

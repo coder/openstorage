@@ -212,6 +212,9 @@ already synced. A missing, stale, or partial graph is only slower:
 The child gets the same isolation as the API and sync Git subprocesses:
 every inherited `GIT_*` variable is dropped, and `GIT_CONFIG_GLOBAL` and
 `GIT_CONFIG_SYSTEM` point at `/dev/null` (plus `GIT_CONFIG_NOSYSTEM=1`).
+It also runs with `LC_ALL=C`: the lock and heap-cap outcomes are
+classified from Git's English messages, which a translated locale would
+change (#322).
 The repo path may be relative (a relative `--cache-dir` is accepted); the
 child runs with that path as its working directory. An inherited
 `GIT_DIR`, `GIT_OBJECT_DIRECTORY`, or `GIT_CONFIG_COUNT/KEY/VALUE` could

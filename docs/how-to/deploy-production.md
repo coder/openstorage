@@ -220,7 +220,8 @@ commit-graph refresh outcome=<outcome> repo=<cache repo path>: <detail>
 ```
 
 The `outcome=` and `repo=` fields are stable. The detail text is for people and may
-change. These are the outcomes:
+change; line breaks inside it (from Git's stderr) are escaped as `\n`, so a record
+never spans lines. These are the outcomes:
 
 | Outcome | Meaning | Action |
 |---|---|---|
