@@ -128,3 +128,36 @@ func TestRunShutdownRestoresRequest(t *testing.T) {
 		}
 	})
 }
+
+// stallRestoreStore is a MemStore whose RestoreSync hangs until its context
+// ends, like a stalled database.
+type stallRestoreStore struct{ *MemStore }
+
+func (s stallRestoreStore) RestoreSync(ctx context.Context, _, _ string) (Upstream, error) {
+	<-ctx.Done()
+	return Upstream{}, ctx.Err()
+}
+
+// A stalled store cannot hold a shutdown restore past its bound (issue
+// #343 review, P2): the run returns after shutdownRestoreTimeout.
+func TestRunShutdownRestoreIsBounded(t *testing.T) {
+	f := newWorkerFixture(t)
+	f.worker.Upstreams = stallRestoreStore{f.store}
+	up := newStallUpstream(t)
+	seedUpstream(t, up.root, "own", "s4")
+	f.putUpstream(t, "repo_s4", "own", "s4", up.url)
+	f.addLoopbackRepo(t, "repo_s4")
+	start := time.Now()
+	var elapsed time.Duration
+	err := runCancelledByShutdown(t, up, func(ctx context.Context) error {
+		err := f.worker.Run(ctx, Job{Org: "org", RepoID: "repo_s4"})
+		elapsed = time.Since(start)
+		return err
+	})
+	if err == nil || errors.Is(err, ErrShutdown) {
+		t.Fatalf("Run = %v, want the restore's failure", err)
+	}
+	if elapsed > shutdownRestoreTimeout+5*time.Second {
+		t.Fatalf("Run returned after %v, want about shutdownRestoreTimeout (%v)", elapsed, shutdownRestoreTimeout)
+	}
+}

@@ -512,6 +512,12 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 // later than this anyway.
 const shutdownRestoreDelay = time.Second
 
+// shutdownRestoreTimeout bounds a shutdown restore write, retries
+// included, to serve's restore window (cmd shutdownRestoreWait), so a
+// stalled store cannot hold shutdown past its budget. A restore that runs
+// out leaves the claim to expire with its lease (issue #343 review).
+const shutdownRestoreTimeout = 2 * time.Second
+
 // claimLocal runs a local-schedule claim unless shutdown already cancelled
 // the run. The claim itself is not cancellable: a claim cancelled mid-write
 // could commit without this run knowing, and then block the request until
@@ -533,7 +539,7 @@ func (w *Worker) claimLocal(ctx context.Context, claim func(context.Context) (La
 func (w *Worker) restoreForShutdown(ctx context.Context, lane string, job Job, holder string, runErr error,
 	finish func(context.Context) (Upstream, error)) error {
 	assertf(shutdownAborted(ctx), "restoreForShutdown outside a drained run")
-	_, err := w.retryFinish(ctx, lane, job.RepoID, finish)
+	_, err := w.retryFinishWithin(ctx, shutdownRestoreTimeout, lane, job.RepoID, finish)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return nil // detached meanwhile: nothing to keep
@@ -657,7 +663,14 @@ func (w *Worker) finishSync(ctx context.Context, repoID, holder string, success 
 // next claim steals it (with its force mandate, and on the local schedule
 // its retry position).
 func (w *Worker) retryFinish(ctx context.Context, lane, repoID string, finish func(context.Context) (Upstream, error)) (Upstream, error) {
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+	return w.retryFinishWithin(ctx, detachedOpTimeout, lane, repoID, finish)
+}
+
+// retryFinishWithin is retryFinish bounded by timeout instead of
+// detachedOpTimeout.
+func (w *Worker) retryFinishWithin(ctx context.Context, timeout time.Duration, lane, repoID string, finish func(context.Context) (Upstream, error)) (Upstream, error) {
+	assertf(timeout > 0, "retryFinishWithin: non-positive timeout %v", timeout)
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 	var lastErr error
 	for attempt := 1; attempt <= finishSyncAttempts; attempt++ {

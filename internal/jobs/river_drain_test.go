@@ -286,3 +286,76 @@ func TestRiverDrainSyncRunsWaitsForRunsThatFinish(t *testing.T) {
 		t.Fatalf("job state %q, want completed", state)
 	}
 }
+
+// A run whose shutdown restore FAILED leaves its claim held and its request
+// consumed. The job must still be kept: its next run steals the expired
+// claim and does the work exactly once (issue #343 review, P1).
+func TestRiverDrainKeepsJobWhenRestoreFails(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_stuck", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	const lease = 2 * time.Second
+	var inFlight atomic.Bool
+	hang := func(ctx context.Context, job sync.Job) error {
+		if _, _, err := store.BeginSync(ctx, job.RepoID, "p1", lease); err != nil {
+			return err
+		}
+		inFlight.Store(true)
+		<-ctx.Done()
+		return errors.New("restore sync: store unavailable") // restore failed: claim kept
+	}
+	q1, err := NewRiver(ctx, pgURL, deliverer, hang, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	if err := store.RequestSync(ctx, "repo_stuck"); err != nil {
+		t.Fatal(err)
+	}
+	if err := q1.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_stuck"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "run in flight", inFlight.Load)
+	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	q1.DrainSyncRuns(dctx, 100*time.Millisecond)
+	cancel()
+	q1.Close()
+	if up, _ := store.GetUpstream(ctx, "repo_stuck"); !up.Syncing || up.SyncPending {
+		t.Fatalf("row %+v, want the failed restore's shape: claim held, request consumed", up)
+	}
+	if state, _ := riverJob(t, pgURL, "upstream_sync", "repo_stuck"); state != "available" && state != "scheduled" {
+		t.Fatalf("job state %q, want it kept", state)
+	}
+
+	var runs atomic.Int32
+	steal := func(ctx context.Context, job sync.Job) error {
+		_, stolen, err := store.BeginSync(ctx, job.RepoID, "p2", time.Minute)
+		if err != nil {
+			return err
+		}
+		if stolen != "p1" {
+			return fmt.Errorf("claim not stolen from p1 (%q)", stolen)
+		}
+		runs.Add(1)
+		_, err = store.FinishSync(ctx, job.RepoID, "p2", true)
+		return err
+	}
+	q2, err := NewRiver(ctx, pgURL, deliverer, steal, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q2.Close()
+	waitFor(t, "the kept job to steal and run", func() bool { return runs.Load() == 1 })
+	time.Sleep(syncFollowUpSnooze + time.Second)
+	if n := runs.Load(); n != 1 {
+		t.Fatalf("%d runs after restart, want exactly 1", n)
+	}
+	if up, _ := store.GetUpstream(ctx, "repo_stuck"); up.Syncing || up.SuccessCount != 1 {
+		t.Fatalf("row %+v, want one successful run and no claim", up)
+	}
+}

@@ -513,10 +513,14 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 
 	rctx, done := withShutdown(ctx, w.runs)
 	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref})
+	stopped := errors.Is(context.Cause(rctx), sync.ErrShutdown)
 	done()
 	if runErr != nil {
 		w.logger.Warn("sync run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
+	}
+	if stopped && runErr != nil {
+		return shutdownSnooze(ctx, w.upstreams, job.Args.RepoID, syncSnoozeDelay, w.logger)
 	}
 
 	assertf(w.pool != nil, "syncWorker: pool not wired")
@@ -629,10 +633,14 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 
 	rctx, done := withShutdown(ctx, w.runs)
 	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Retry: job.Args.Retry})
+	stopped := errors.Is(context.Cause(rctx), sync.ErrShutdown)
 	done()
 	if runErr != nil {
 		w.logger.Warn("push run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
+	}
+	if stopped && runErr != nil {
+		return shutdownSnooze(ctx, w.upstreams, job.Args.RepoID, pushSnoozeDelay, w.logger)
 	}
 
 	assertf(w.pool != nil, "pushWorker: pool not wired")
@@ -930,6 +938,38 @@ func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
 	if err := q.client.Stop(ctx); err != nil {
 		_ = q.client.StopAndCancel(ctx) // cancels the rest; ctx is done
 	}
+}
+
+// shutdownSnoozeFallback is shutdownSnooze's delay when it cannot read the
+// row: long enough for any claim the run left behind to expire (claim
+// leases stay below the snooze cap).
+const shutdownSnoozeFallback = 30 * time.Minute
+
+// shutdownSnooze keeps the job of a run that DrainSyncRuns cancelled and
+// that returned an error, whatever its restore did (issue #343 review). A
+// restored run left its request pending and no claim; the snooze then
+// matches the gate's own uncovered-pending snooze. A failed restore left
+// the claim held and the request consumed; the gate would complete the
+// job (no pending mark), and the request would be lost once the claim
+// expired. The delay therefore waits past any claim on the fresh row, and
+// the next run steals it and does the work. No successor is inserted: this
+// job stays the only one for the lane and repo, and its next run's claim
+// covers every request marked before it.
+func shutdownSnooze(ctx context.Context, upstreams sync.UpstreamStore, repoID string,
+	delayFor func(sync.Upstream) time.Duration, logger *slog.Logger) error {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	delay := shutdownSnoozeFallback
+	switch up, err := upstreams.GetUpstream(rctx, repoID); {
+	case err == nil:
+		delay = delayFor(up)
+	case errors.Is(err, sync.ErrNotFound):
+		return nil // detached: nothing to keep
+	default:
+		logger.Warn("shutdown: upstream read failed; snoozing past any claim", "repo", repoID, "err", err)
+	}
+	logger.Info("shutdown: keeping the cancelled run's job for the next process", "repo", repoID, "delay", delay)
+	return river.JobSnooze(delay)
 }
 
 // withShutdown returns a sync or push run's context: cancelled with
