@@ -31,6 +31,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // MaxPushTransientRetries bounds the transient-failure retry chain of one
@@ -92,18 +94,35 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	assertf(repo.RepoID == job.RepoID, "RepoLookup returned %q for %q", repo.RepoID, job.RepoID)
 
 	holder := newClaimHolder()
-	up, force, stolenFrom, err := w.Upstreams.BeginPush(ctx, job.RepoID, holder, claimLease(timeout))
-	switch {
-	case errors.Is(err, ErrNotFound):
-		return nil // detached before start: cancel silently
-	case errors.Is(err, ErrPushInProgress):
-		// Overlapping outbound run: skip. A LIVE holder covers pending
-		// requests at its FinishPush; a dead holder's unexpired lease
-		// needs the deferred retry, exactly like the pull lane (#86).
-		w.deferPendingPushRetry(ctx, job)
-		return nil
-	case err != nil:
-		return fmt.Errorf("begin push %s: %w", job.RepoID, err)
+	var up Upstream
+	var force bool
+	var stolenFrom string
+	attempt := job.Retry
+	if w.Local != nil {
+		c, err := w.Local.ClaimDuePush(ctx, job.RepoID, holder, claimLease(timeout))
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return nil // detached before start: cancel silently
+		case err != nil:
+			return fmt.Errorf("begin push %s: %w", job.RepoID, err)
+		case !c.Claimed:
+			return nil // busy or nothing due: the row keeps the work for a later sweep
+		}
+		up, force, stolenFrom, attempt = c.Up, c.Force, c.StolenFrom, c.Attempt
+	} else {
+		up, force, stolenFrom, err = w.Upstreams.BeginPush(ctx, job.RepoID, holder, claimLease(timeout))
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return nil // detached before start: cancel silently
+		case errors.Is(err, ErrPushInProgress):
+			// Overlapping outbound run: skip. A LIVE holder covers pending
+			// requests at its FinishPush; a dead holder's unexpired lease
+			// needs the deferred retry, exactly like the pull lane (#86).
+			w.deferPendingPushRetry(ctx, job)
+			return nil
+		case err != nil:
+			return fmt.Errorf("begin push %s: %w", job.RepoID, err)
+		}
 	}
 	if stolenFrom != "" {
 		w.Logger.Warn("stole expired push claim",
@@ -133,7 +152,19 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	fin, err := w.finishPush(ctx, job.RepoID, holder, runErr == nil)
+	var fin Upstream
+	if w.Local != nil {
+		o := localPushOutcome(runErr, attempt, force)
+		if o.Kind == meta.OutcomeRetry {
+			w.Logger.Warn("push-upstream unreachable; retrying with backoff",
+				"org", job.Org, "repo", job.RepoID, "retry", attempt+1, "delay", o.Delay)
+		}
+		fin, err = w.retryFinish(ctx, "push", job.RepoID, func(fctx context.Context) (Upstream, error) {
+			return w.Local.FinishPushOutcome(fctx, job.RepoID, holder, o)
+		})
+	} else {
+		fin, err = w.finishPush(ctx, job.RepoID, holder, runErr == nil)
+	}
 	if errors.Is(err, ErrNotFound) {
 		return nil // detached mid-run: cancel silently
 	}
@@ -162,6 +193,11 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
 	}
 
+	if w.Local != nil {
+		// The end-of-run write already scheduled the retry, the mirror-back
+		// pull, or any intent that arrived mid-run; the sweep runs them.
+		return runErr
+	}
 	if runErr == nil && w.AfterForward != nil {
 		// Mirror-back pull after EVERY successful outbound run (see the
 		// AfterForward field doc): scheduled strictly after the forward
@@ -352,24 +388,25 @@ func (w *Worker) deferPendingPushRetry(ctx context.Context, job Job) {
 // bounded retries — finishSync's rationale applies verbatim to the push
 // lease.
 func (w *Worker) finishPush(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
-	defer cancel()
-	var lastErr error
-	for attempt := 1; attempt <= finishSyncAttempts; attempt++ {
-		fin, err := w.Upstreams.FinishPush(fctx, repoID, holder, success)
-		if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrClaimLost) {
-			return fin, err
-		}
-		lastErr = err
-		w.Logger.Warn("finish push failed; retrying while the claim is held",
-			"repo", repoID, "attempt", attempt, "err", err)
-		select {
-		case <-fctx.Done():
-			return Upstream{}, lastErr
-		case <-time.After(time.Duration(attempt) * time.Second):
-		}
+	return w.retryFinish(ctx, "push", repoID, func(fctx context.Context) (Upstream, error) {
+		return w.Upstreams.FinishPush(fctx, repoID, holder, success)
+	})
+}
+
+// localPushOutcome decides how a local-schedule push run ends. The retry
+// policy is main's: only unreachable upstreams retry, one initial attempt
+// plus MaxPushTransientRetries retries, after PushRetryDelay. Success also
+// marks the mirror-back pull in the same write (see Worker.AfterForward).
+func localPushOutcome(runErr error, attempt int, force bool) meta.PushOutcome {
+	assertf(attempt >= 0 && attempt <= MaxPushTransientRetries, "local push attempt %d out of range", attempt)
+	switch {
+	case runErr == nil:
+		return meta.PushOutcome{Kind: meta.OutcomeDone, Success: true, MirrorBack: true}
+	case TransientPushFailure(runErr) && attempt < MaxPushTransientRetries:
+		return meta.PushOutcome{Kind: meta.OutcomeRetry, Force: force, Delay: PushRetryDelay(attempt + 1)}
+	default:
+		return meta.PushOutcome{Kind: meta.OutcomeDone}
 	}
-	return Upstream{}, lastErr
 }
 
 // transferPush performs the loopback fetch + upstream push. A nil error is
