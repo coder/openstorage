@@ -116,8 +116,7 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			// Not claimed: the request stays marked (issue #343).
 			return fmt.Errorf("begin push %s: %w", job.RepoID, ErrShutdown)
 		}
-		// Not cancellable, as in claimLocal (see Run).
-		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+		cctx, ccancel := claimContext(ctx)
 		up, force, stolenFrom, err = w.Upstreams.BeginPush(cctx, job.RepoID, holder, claimLease(timeout))
 		ccancel()
 		switch {
@@ -130,7 +129,7 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			w.deferPendingPushRetry(ctx, job)
 			return nil
 		case err != nil:
-			return fmt.Errorf("begin push %s: %w", job.RepoID, err)
+			return shutdownErr(ctx, fmt.Errorf("begin push %s: %w", job.RepoID, err))
 		}
 	}
 	if stolenFrom != "" {

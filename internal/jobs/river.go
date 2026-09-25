@@ -513,13 +513,12 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 
 	rctx, done := withShutdown(ctx, w.runs)
 	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref})
-	stopped := errors.Is(context.Cause(rctx), sync.ErrShutdown)
 	done()
 	if runErr != nil {
 		w.logger.Warn("sync run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
 	}
-	if stopped && runErr != nil {
+	if errors.Is(runErr, sync.ErrShutdown) {
 		return shutdownSnooze(ctx, w.upstreams, job.Args.RepoID, syncSnoozeDelay, w.logger)
 	}
 
@@ -633,13 +632,12 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 
 	rctx, done := withShutdown(ctx, w.runs)
 	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Retry: job.Args.Retry})
-	stopped := errors.Is(context.Cause(rctx), sync.ErrShutdown)
 	done()
 	if runErr != nil {
 		w.logger.Warn("push run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
 	}
-	if stopped && runErr != nil {
+	if errors.Is(runErr, sync.ErrShutdown) {
 		return shutdownSnooze(ctx, w.upstreams, job.Args.RepoID, pushSnoozeDelay, w.logger)
 	}
 
@@ -918,8 +916,7 @@ func (q *River) EnqueueRepack(ctx context.Context, repo string) error {
 // cancelled with sync.ErrShutdown, so they release their claims and
 // re-mark their requests without counting a run, and River keeps waiting
 // until ctx ends; whatever still runs then (other job kinds) is cancelled
-// as a plain stop. A restored run's job completes through the unchanged
-// gate, which snoozes it (an uncounted failed run with a pending request),
+// as a plain stop. The worker keeps a cancelled run's job (shutdownSnooze),
 // so the job, its Retry, and any request deduplicated against it pass to
 // the next process or another replica. Close still runs afterwards.
 func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
@@ -934,7 +931,7 @@ func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
 		return // every job finished while the listener served
 	}
 	q.cancelRuns(sync.ErrShutdown)
-	// Soft again: restored runs' completion gates run on live contexts.
+	// Soft again: cancelled runs restore and snooze their jobs first.
 	if err := q.client.Stop(ctx); err != nil {
 		_ = q.client.StopAndCancel(ctx) // cancels the rest; ctx is done
 	}
@@ -945,8 +942,11 @@ func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
 // leases stay below the snooze cap).
 const shutdownSnoozeFallback = 30 * time.Minute
 
-// shutdownSnooze keeps the job of a run that DrainSyncRuns cancelled and
-// that returned an error, whatever its restore did (issue #343 review). A
+// shutdownSnooze keeps the job of a run that DrainSyncRuns cancelled before
+// it committed an outcome: sync.Worker then returns an error wrapping
+// sync.ErrShutdown, whatever its restore did (issue #343 review). A run
+// that already counted its outcome returns a plain error and goes through
+// the gate, so it is not rerun. A
 // restored run left its request pending and no claim; the snooze then
 // matches the gate's own uncovered-pending snooze. A failed restore left
 // the claim held and the request consumed; the gate would complete the

@@ -9,6 +9,7 @@ package githttp
 // keeps its request, so the next boot completes it.
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -46,6 +47,18 @@ func privateDatabase(t *testing.T, dataDir string) string {
 		if _, err := conn.Exec(t.Context(), "CREATE DATABASE "+name); err != nil {
 			t.Fatal(err)
 		}
+		// Registered first, so it runs after the nodes and stores close.
+		t.Cleanup(func() {
+			c, err := pgx.Connect(context.Background(), dbURL)
+			if err != nil {
+				t.Errorf("drop %s: %v", name, err)
+				return
+			}
+			defer func() { _ = c.Close(context.Background()) }()
+			if _, err := c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
+				t.Errorf("drop %s: %v", name, err)
+			}
+		})
 		u, err := url.Parse(dbURL)
 		if err != nil {
 			t.Fatal(err)

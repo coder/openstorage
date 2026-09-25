@@ -353,9 +353,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 			// Not claimed: the request stays marked (issue #343).
 			return fmt.Errorf("begin sync %s: %w", job.RepoID, ErrShutdown)
 		}
-		// Not cancellable, as in claimLocal: a claim cancelled mid-write
-		// could commit without this run knowing.
-		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+		cctx, ccancel := claimContext(ctx)
 		up, stolenFrom, err = w.Upstreams.BeginSync(cctx, job.RepoID, holder, claimLease(timeout))
 		ccancel()
 		switch {
@@ -370,7 +368,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 			w.deferPendingRetry(ctx, job)
 			return nil
 		case err != nil:
-			return fmt.Errorf("begin sync %s: %w", job.RepoID, err)
+			return shutdownErr(ctx, fmt.Errorf("begin sync %s: %w", job.RepoID, err))
 		}
 	}
 	if stolenFrom != "" {
@@ -519,16 +517,40 @@ const shutdownRestoreDelay = time.Second
 const shutdownRestoreTimeout = 2 * time.Second
 
 // claimLocal runs a local-schedule claim unless shutdown already cancelled
-// the run. The claim itself is not cancellable: a claim cancelled mid-write
-// could commit without this run knowing, and then block the request until
-// its lease expired, instead of being restored (issue #342).
+// the run, on a claimContext.
 func (w *Worker) claimLocal(ctx context.Context, claim func(context.Context) (LaneClaim, error)) (LaneClaim, error) {
 	if shutdownAborted(ctx) {
 		return LaneClaim{}, nil // not claimed: the request stays in the row
 	}
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+	cctx, cancel := claimContext(ctx)
 	defer cancel()
 	return claim(cctx)
+}
+
+// claimContext is the context a claim write runs on. A cancellation of the
+// run (shutdown, timeout) reaches it only after shutdownRestoreTimeout: a
+// claim cut off mid-write could commit without the run knowing and hold
+// the request until its lease expires (issue #342), but a stalled store
+// must not hold shutdown past its budget either (issue #343 review). A
+// claim that still commits unseen is recovered once its lease expires: by
+// SQLite's sweep, or by the River job that shutdownSnooze keeps.
+func claimContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+	stop := context.AfterFunc(ctx, func() { time.AfterFunc(shutdownRestoreTimeout, cancel) })
+	return cctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+// shutdownErr marks err as shutdown-caused when the drain cancelled the
+// run: River keeps the job of a run that returns such an error, since the
+// run committed no outcome (jobs.shutdownSnooze).
+func shutdownErr(ctx context.Context, err error) error {
+	if err != nil && shutdownAborted(ctx) && !errors.Is(err, ErrShutdown) {
+		return fmt.Errorf("%w: %w", ErrShutdown, err)
+	}
+	return err
 }
 
 // restoreForShutdown ends a run that a shutdown drain cancelled with
@@ -548,7 +570,8 @@ func (w *Worker) restoreForShutdown(ctx context.Context, lane string, job Job, h
 			"org", job.Org, "repo", job.RepoID, "holder", holder)
 		return nil
 	case err != nil:
-		return fmt.Errorf("restore %s %s after shutdown: %w", lane, job.RepoID, err)
+		// Nothing committed: the claim is left to expire (claimContext).
+		return fmt.Errorf("restore %s %s: %w: %w", lane, job.RepoID, ErrShutdown, err)
 	}
 	w.Logger.Info(lane+" run cancelled by shutdown; request kept for the next process",
 		"org", job.Org, "repo", job.RepoID, "cause", runErr)

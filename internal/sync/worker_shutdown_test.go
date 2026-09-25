@@ -154,10 +154,54 @@ func TestRunShutdownRestoreIsBounded(t *testing.T) {
 		elapsed = time.Since(start)
 		return err
 	})
-	if err == nil || errors.Is(err, ErrShutdown) {
-		t.Fatalf("Run = %v, want the restore's failure", err)
+	// Still marked as shutdown-caused: nothing was committed, so River
+	// must keep the job (jobs.shutdownSnooze).
+	if !errors.Is(err, ErrShutdown) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run = %v, want the restore's timeout, marked ErrShutdown", err)
 	}
 	if elapsed > shutdownRestoreTimeout+5*time.Second {
 		t.Fatalf("Run returned after %v, want about shutdownRestoreTimeout (%v)", elapsed, shutdownRestoreTimeout)
+	}
+}
+
+// stallClaimStore is a MemStore whose BeginSync hangs until its context
+// ends, like a stalled database.
+type stallClaimStore struct {
+	*MemStore
+	entered chan struct{}
+}
+
+func (s stallClaimStore) BeginSync(ctx context.Context, _, _ string, _ time.Duration) (Upstream, string, error) {
+	close(s.entered)
+	<-ctx.Done()
+	return Upstream{}, "", ctx.Err()
+}
+
+// A stalled claim write cannot hold shutdown past its bound either (issue
+// #343 review): it sees the drain's cancellation after
+// shutdownRestoreTimeout, and the run reports ErrShutdown so River keeps
+// its job.
+func TestRunShutdownClaimIsBounded(t *testing.T) {
+	f := newWorkerFixture(t)
+	st := stallClaimStore{MemStore: f.store, entered: make(chan struct{})}
+	f.worker.Upstreams = st
+	f.putUpstream(t, "repo_s5", "own", "s5", "http://127.0.0.1:1")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	errc := make(chan error, 1)
+	go func() { errc <- f.worker.Run(ctx, Job{Org: "org", RepoID: "repo_s5"}) }()
+	<-st.entered
+	start := time.Now()
+	cancel(ErrShutdown)
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrShutdown) {
+			t.Fatalf("Run = %v, want ErrShutdown", err)
+		}
+		if d := time.Since(start); d > shutdownRestoreTimeout+5*time.Second {
+			t.Fatalf("claim held shutdown for %v", d)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("stalled claim ignored the shutdown bound")
 	}
 }

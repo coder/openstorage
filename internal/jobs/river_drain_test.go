@@ -308,7 +308,8 @@ func TestRiverDrainKeepsJobWhenRestoreFails(t *testing.T) {
 		}
 		inFlight.Store(true)
 		<-ctx.Done()
-		return errors.New("restore sync: store unavailable") // restore failed: claim kept
+		// Restore failed, as sync.Worker reports it: claim kept.
+		return fmt.Errorf("restore sync: %w: store unavailable", sync.ErrShutdown)
 	}
 	q1, err := NewRiver(ctx, pgURL, deliverer, hang, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
@@ -357,5 +358,47 @@ func TestRiverDrainKeepsJobWhenRestoreFails(t *testing.T) {
 	}
 	if up, _ := store.GetUpstream(ctx, "repo_stuck"); up.Syncing || up.SuccessCount != 1 {
 		t.Fatalf("row %+v, want one successful run and no claim", up)
+	}
+}
+
+// A run that already counted its failure when the drain cancelled it
+// returns a plain error: its job completes through the gate and is not
+// rerun (issue #343 review).
+func TestRiverDrainCompletesCommittedFailure(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_done", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var counted atomic.Bool
+	runner := func(ctx context.Context, job sync.Job) error {
+		if _, _, err := store.BeginSync(ctx, job.RepoID, "h", time.Minute); err != nil {
+			return err
+		}
+		if _, err := store.FinishSync(ctx, job.RepoID, "h", false); err != nil {
+			return err
+		}
+		counted.Store(true)
+		<-ctx.Done() // the drain arrives while the run emits its terminal event
+		return errors.New("failed to clone repository")
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_done"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "counted failure", counted.Load)
+	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	q.DrainSyncRuns(dctx, 100*time.Millisecond)
+	cancel()
+	q.Close()
+	if state, _ := riverJob(t, pgURL, "upstream_sync", "repo_done"); state != "completed" {
+		t.Fatalf("job state %q, want completed (the failure was already counted)", state)
 	}
 }
