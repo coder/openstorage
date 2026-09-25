@@ -115,6 +115,13 @@ func skipWithoutHeapCap(t *testing.T) {
 
 func TestGitReadBudgetDeepHistory(t *testing.T) {
 	skipWithoutHeapCap(t)
+	// Pin the worst case: full hydrates write a commit-graph (ADR-47), which
+	// shrinks a deep --skip walk below the small test cap. The graph is
+	// best-effort, so the limits must hold without one; git children of
+	// this test ignore it.
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.commitGraph")
+	t.Setenv("GIT_CONFIG_VALUE_0", "false")
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
 		fx := seedDeepHistory(t, e, org, 20000)
