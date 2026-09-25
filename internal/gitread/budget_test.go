@@ -325,7 +325,7 @@ func TestRunStreamingWalkStopsEarly(t *testing.T) {
 	b.Close()
 }
 
-// Non-Linux policy (ADR-048), exercised on Linux: where the heap cap
+// Non-Linux policy (ADR-049), exercised on Linux: where the heap cap
 // cannot be enforced, Run runs git without it instead of refusing.
 func TestRunWithoutHeapCapSupportStillRuns(t *testing.T) {
 	saved := heapLimitAvailable

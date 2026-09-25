@@ -10,7 +10,7 @@ import (
 // HeapLimitSupported reports whether Run can cap a git child's heap on this
 // platform. Outside Linux there is no qualified mechanism (macOS does not
 // enforce RLIMIT_DATA). Run then runs git without a heap cap, under the
-// admission, time, and output limits only (ADR-048); it never refuses a
+// admission, time, and output limits only (ADR-049); it never refuses a
 // read because the cap is unavailable.
 func HeapLimitSupported() bool { return false }
 

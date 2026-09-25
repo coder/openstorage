@@ -1,4 +1,4 @@
-# ADR-48: Read-side git children run under one per-request budget
+# ADR-49: Read-side git children run under one per-request budget
 
 > Decision record for issue #313 (bound the memory and work of read-side
 > git subprocesses on deep histories). Context: the `git:read` endpoints
@@ -7,8 +7,7 @@
 > from the root commit>` peaks at 184 MB of heap. Before this decision, no
 > read had a time, concurrency, or output bound: `http.Server` has no
 > timeouts, children were killed only when the client disconnected, and
-> `runGit` buffered all stdout. (ADR-47 is reserved by the open commit-graph
-> PR #321.)
+> `runGit` buffered all stdout.
 
 **Every read-side git child goes through one runner, `gitread.Run`.** The
 caller names the child's class:

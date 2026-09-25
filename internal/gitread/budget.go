@@ -15,7 +15,7 @@ import (
 // Resource bounds for read-side git children (#313). Every git child that
 // gitread starts runs through run, which applies them before git does any
 // work. docs/reference/http-api.md ("Resource limits on git reads") is the
-// client-facing description and ADR-048 the design; keep them in step.
+// client-facing description and ADR-049 the design; keep them in step.
 const (
 	// HeavyHeapBytes caps the heap (RLIMIT_DATA, Linux) of a child whose
 	// work grows with history length, tree size, blob size, or output size.
@@ -379,7 +379,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 		defer cancel()
 	}
 	if !heapLimitAvailable() {
-		// No qualified heap-cap mechanism outside Linux (ADR-048): the
+		// No qualified heap-cap mechanism outside Linux (ADR-049): the
 		// other limits still apply.
 		heap = 0
 	}

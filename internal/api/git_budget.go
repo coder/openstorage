@@ -13,7 +13,7 @@ import (
 // runs its handler under a gitread.Budget (withGitReadBudget,
 // withGitStreamBudget); gitread.Run applies the per-child caps.
 // docs/reference/http-api.md ("Resource limits on git reads") is the
-// client-facing description and ADR-048 the design; keep them in step.
+// client-facing description and ADR-049 the design; keep them in step.
 //
 // A request takes its admission slot at its first git child and keeps it
 // until its response is delivered: the slot bounds everything the request

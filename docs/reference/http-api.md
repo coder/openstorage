@@ -276,7 +276,7 @@ The `git:read` endpoints answer from git subprocesses over a cache repository. A
 | File size | 100 MiB per file, checked from the tree before the file is read. | 422 for `file` (GET and HEAD) and `archive`, before any response byte. |
 | Delivery | Each 64 KiB of a response must reach the client within 30 seconds, and the whole response within 2 minutes of its first byte (`file` and `archive`: 10 minutes). | The connection is closed. The request's slot, memory and temporary files are released. |
 
-The largest git heap measured on a 300,000-commit linear history is 184 MB, for `git log -1 -- <file added in the root commit>`, so such histories are served. Histories past roughly 400,000 commits can get 422 for per-file history walks, `blame` of old files, and deep `commits` pages. A `files/metadata` page whose per-file walks need more than 30 seconds in total gets 503; request smaller pages with `limit`. Commit-graphs ([#307](https://github.com/coder/openstorage/issues/307)) would make these walks cheaper, but the limits do not depend on them.
+The largest git heap measured on a 300,000-commit linear history is 184 MB, for `git log -1 -- <file added in the root commit>`, so such histories are served. Histories past roughly 400,000 commits can get 422 for per-file history walks, `blame` of old files, and deep `commits` pages. A `files/metadata` page whose per-file walks need more than 30 seconds in total gets 503; request smaller pages with `limit`. Commit-graphs, which full hydrates now write ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)), make these walks cheaper when present, but the limits do not depend on them: the measurements above are without a commit-graph.
 
 | Endpoint | git work | Cost grows with |
 |---|---|---|
@@ -296,7 +296,7 @@ The largest git heap measured on a 300,000-commit linear history is 184 MB, for 
 
 Other limits and gaps:
 
-- **Platforms.** The memory limit needs `RLIMIT_DATA`, which only Linux enforces. On other server platforms, such as macOS, git runs without a memory cap, and the concurrency, time, output and file-size limits still apply. No endpoint refuses a request because the memory cap is unavailable. For deployments where untrusted users can push, run the server on Linux. See [ADR-048](../adr/048-read-side-git-children-run-under-one-per-request-budget.md).
+- **Platforms.** The memory limit needs `RLIMIT_DATA`, which only Linux enforces. On other server platforms, such as macOS, git runs without a memory cap, and the concurrency, time, output and file-size limits still apply. No endpoint refuses a request because the memory cap is unavailable. For deployments where untrusted users can push, run the server on Linux. See [ADR-49](../adr/049-read-side-git-children-run-under-one-per-request-budget.md).
 - `archive` streams its response. An error after the response has started (for example, the time limit, or a delta-compressed file whose base object does not fit in memory) closes the connection, so the client sees a truncated, invalid gzip stream instead of a status code.
 - Not covered by these limits: hydrating the cache repository before the git reads (serialized per repository), git clone and fetch over the git protocol (`upload-pack`, which has its own request-size limits), and the write endpoints.
 
