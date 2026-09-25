@@ -215,7 +215,7 @@ func TestGitReadBudgetAdmissionAndDeadline(t *testing.T) {
 			p := withGitReadPolicy(t, pol)
 			other := seedDeepHistory(t, e, org, 10)
 			// Two slow requests of fx's repository hold its whole share.
-			key := org + "\x00" + fx.repo.URL
+			key := "repo\x00" + fx.repo.RepoID
 			var held []*gitread.Budget
 			for range 2 {
 				b := gitread.NewBudget(p.slots, key, time.Minute, gitread.DefaultOutputBytes)
@@ -227,12 +227,18 @@ func TestGitReadBudgetAdmissionAndDeadline(t *testing.T) {
 			}
 			resp, body := coreGet(t, e, "GET", "/api/v1/repos/commits", fx.token, nil)
 			requireLimitStatus(t, resp, body, http.StatusServiceUnavailable, true, "busy")
+			// A token naming the repository by ID shares the same quota.
+			byID := e.mint(t, tokenSpec{iss: org, repo: fx.repo.RepoID, scopes: []string{auth.ScopeGitRead}})
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits", byID, nil)
+			requireLimitStatus(t, resp, body, http.StatusServiceUnavailable, true, "busy")
 			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits", other.token, nil)
 			coreRequireStatus(t, resp, body, http.StatusOK)
 			for _, b := range held {
 				b.Close()
 			}
 			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits", fx.token, nil)
+			coreRequireStatus(t, resp, body, http.StatusOK)
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits", byID, nil)
 			coreRequireStatus(t, resp, body, http.StatusOK)
 			requireSlotsFree(t, p)
 		})

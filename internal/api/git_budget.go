@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // Process-wide limits on read-side git work (#313). Every git:read route
@@ -28,9 +29,9 @@ const (
 	// gitStreamSlots is a separate pool for file and archive downloads,
 	// whose delivery can take minutes, so they cannot starve JSON reads.
 	gitStreamSlots = 8
-	// gitRepoSlots is how many slots of each pool one repository (the
-	// token's issuer and repo claim) may hold, so slow readers of one
-	// repository cannot take a whole pool from the others.
+	// gitRepoSlots is how many slots of each pool one repository may hold,
+	// so slow readers of one repository cannot take a whole pool from the
+	// others.
 	gitRepoSlots = 2
 	// gitReadSlotWait is how long a request waits for a slot before it
 	// is answered 503 + Retry-After.
@@ -92,19 +93,40 @@ const (
 )
 
 // withGitReadBudget runs a JSON-response handler under a request budget.
-func withGitReadBudget(h http.HandlerFunc) http.HandlerFunc { return gitReadBudget(h, gitRouteJSON) }
+func (s *server) withGitReadBudget(h http.HandlerFunc) http.HandlerFunc {
+	return s.gitReadBudget(h, gitRouteJSON)
+}
 
 // withGitFileBudget runs the file download handler under a request budget
 // from the stream pool.
-func withGitFileBudget(h http.HandlerFunc) http.HandlerFunc { return gitReadBudget(h, gitRouteFile) }
+func (s *server) withGitFileBudget(h http.HandlerFunc) http.HandlerFunc {
+	return s.gitReadBudget(h, gitRouteFile)
+}
 
 // withGitArchiveBudget runs the archive handler under a request budget
 // from the stream pool, with the archive time budget.
-func withGitArchiveBudget(h http.HandlerFunc) http.HandlerFunc {
-	return gitReadBudget(h, gitRouteArchive)
+func (s *server) withGitArchiveBudget(h http.HandlerFunc) http.HandlerFunc {
+	return s.gitReadBudget(h, gitRouteArchive)
 }
 
-func gitReadBudget(h http.HandlerFunc, kind gitRouteKind) http.HandlerFunc {
+// gitRepoSlotKey is the Slots key of the repository a request reads: its
+// canonical RepoID, so every claim spelling (URL or ID) of one repository
+// shares one quota. If the claim does not resolve, the handler answers
+// without running git; the raw claim is then a safe key.
+func (s *server) gitRepoSlotKey(r *http.Request) string {
+	// Every git:read route is repo-scoped (requireAuth has verified the
+	// claims).
+	claims := mustClaims(r)
+	assertf(claims.Repo != "", "gitRepoSlotKey: route without a repo claim")
+	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
+	if err != nil {
+		return "claim\x00" + claims.Iss + "\x00" + claims.Repo
+	}
+	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
+	return "repo\x00" + repo.RepoID
+}
+
+func (s *server) gitReadBudget(h http.HandlerFunc, kind gitRouteKind) http.HandlerFunc {
 	assertf(h != nil, "gitReadBudget: nil handler")
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := gitReads
@@ -115,12 +137,7 @@ func gitReadBudget(h http.HandlerFunc, kind gitRouteKind) http.HandlerFunc {
 		case gitRouteArchive:
 			slots, timeout, delivery = p.streamSlots, p.archiveTimeout, p.streamDelivery
 		}
-		// Every git:read route is repo-scoped (requireAuth has verified
-		// the claims), so the key names the repository the token reads.
-		claims := mustClaims(r)
-		assertf(claims.Repo != "", "gitReadBudget: route without a repo claim")
-		key := claims.Iss + "\x00" + claims.Repo
-		b := gitread.NewBudget(slots, key, timeout, p.outputBytes).WithLimits(p.limits)
+		b := gitread.NewBudget(slots, s.gitRepoSlotKey(r), timeout, p.outputBytes).WithLimits(p.limits)
 		gw := &gitReadWriter{ResponseWriter: w, rc: http.NewResponseController(w), idle: p.writeIdle, delivery: delivery}
 		// LIFO: the response is flushed under its deadlines, then the slot
 		// is released, also when the handler aborts with a panic.

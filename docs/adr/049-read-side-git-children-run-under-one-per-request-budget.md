@@ -29,7 +29,7 @@ so their behavior is unchanged. The limits are:
 
 | Limit | Value | Failure (before or instead of the work) |
 |---|---|---|
-| Admission | 8 slots per process (`file` and `archive`: a separate 8), at most 2 of each per repository (token issuer and repo claim), taken at the request's first git child of either class and held until the response is delivered; 1 s wait | 503 + `Retry-After: 1`; git not started |
+| Admission | 8 slots per process (`file` and `archive`: a separate 8), at most 2 of each per repository (its canonical ID, whatever the token's claim spelling), taken at the request's first git child of either class and held until the response is delivered; 1 s wait | 503 + `Retry-After: 1`; git not started |
 | Time | 30 s of git time per request from its first child, shared by all children (archive: 10 min) | 503, no `Retry-After`; git killed and reaped |
 | Heap | `RLIMIT_DATA` 256 MiB Heavy / 32 MiB Light, set by `/bin/sh -c 'ulimit -d …; exec git'`; an inherited stricter limit is kept | 422 |
 | Output | 64 MiB buffered stdout per request | 422; git killed at once |
