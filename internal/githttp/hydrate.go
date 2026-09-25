@@ -2289,33 +2289,6 @@ func newPushHoldSet(names []string) pushHoldSet {
 	return pushHoldSet{names: names}
 }
 
-// WaitForPushPublication waits for the cache-ref transactions protected by
-// existing push holds. A local forward calls this AFTER claiming its durable
-// pending intent: a hook CAS covered by that claim already has a hold;
-// a hook CAS arriving after the wait marks work for the next forward.
-// Unlike ordinary hydration, unreadable holds cannot justify a snapshot.
-func WaitForPushPublication(ctx context.Context, cacheDir, repo string) error {
-	assertf(cacheDir != "" && repo != "", "WaitForPushPublication: missing cache/repo")
-	holds := pushHoldDirCache{dir: filepath.Join(RepoPath(cacheDir, repo), pushHoldDir)}
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		set, err := holds.load()
-		if err != nil {
-			return err
-		}
-		if len(set.names) == 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(25 * time.Millisecond): // existing push-hold polling cadence
-		}
-	}
-}
-
 // loadPushHolds snapshots repoPath's live holds for hydration, FAIL-OPEN
 // on read trouble (partial set): a missed hold only reopens the narrow
 // spurious-rejection window this machinery closes, and a serving-path sync
