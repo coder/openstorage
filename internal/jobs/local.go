@@ -248,6 +248,16 @@ func (q *Local) runRepack(repo string) {
 	}
 }
 
+// DrainSyncRuns runs the scheduled sync queue's shutdown drain (issue #342,
+// sync.LocalScheduler.Drain) while serve's listener still takes loopback
+// pushes. Deliveries and repacks keep running until Close. It does nothing
+// for the in-process queue.
+func (q *Local) DrainSyncRuns(ctx context.Context) {
+	if d, ok := q.syncq.(interface{ Drain(context.Context) }); ok {
+		d.Drain(ctx)
+	}
+}
+
 // Close stops accepting work and waits for in-flight deliveries and syncs.
 func (q *Local) Close() {
 	q.mu.Lock()

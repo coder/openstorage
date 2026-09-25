@@ -76,9 +76,9 @@ const (
 	// request stays due now.
 	OutcomeRetry
 	// OutcomeRestore ends a run that never started its transfer (failed
-	// publication wait): re-marks, keeps the attempt, due = now + Delay
-	// (an explicit request made during the run stays due now), and counts
-	// no run.
+	// publication wait) or that the process's shutdown cancelled (issue
+	// #342): re-marks, keeps the attempt, due = now + Delay (an explicit
+	// request made during the run stays due now), and counts no run.
 	OutcomeRestore
 )
 

@@ -99,7 +99,9 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	var stolenFrom string
 	attempt := job.Retry
 	if w.Local != nil {
-		c, err := w.Local.ClaimDuePush(ctx, job.RepoID, holder, claimLease(timeout))
+		c, err := w.claimLocal(ctx, func(cctx context.Context) (LaneClaim, error) {
+			return w.Local.ClaimDuePush(cctx, job.RepoID, holder, claimLease(timeout))
+		})
 		switch {
 		case errors.Is(err, ErrNotFound):
 			return nil // detached before start: cancel silently
@@ -150,6 +152,14 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 		w.Logger.Warn("push claim stolen mid-run; abandoning before the upstream push",
 			"org", job.Org, "repo", job.RepoID, "holder", holder)
 		return nil
+	}
+
+	if w.Local != nil && runErr != nil && shutdownAborted(ctx) {
+		// Shutdown cancelled the run (issue #342): keep its request, force
+		// level, and retry position for the next process.
+		return w.restoreForShutdown(ctx, "push", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
+			return w.Local.FinishPushOutcome(fctx, job.RepoID, holder, meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: shutdownRestoreDelay})
+		})
 	}
 
 	var fin Upstream

@@ -290,7 +290,9 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	var up Upstream
 	var stolenFrom string
 	if w.Local != nil {
-		c, err := w.Local.ClaimDueSync(ctx, job.RepoID, holder, claimLease(timeout))
+		c, err := w.claimLocal(ctx, func(cctx context.Context) (LaneClaim, error) {
+			return w.Local.ClaimDueSync(cctx, job.RepoID, holder, claimLease(timeout))
+		})
 		switch {
 		case errors.Is(err, ErrNotFound):
 			return nil // detached before start: cancel silently
@@ -349,6 +351,14 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		w.Logger.Warn("sync claim stolen mid-run; abandoning before the loopback push",
 			"org", job.Org, "repo", job.RepoID, "holder", holder)
 		return nil
+	}
+
+	if w.Local != nil && runErr != nil && shutdownAborted(ctx) {
+		// Shutdown cancelled the run (issue #342): keep its request for
+		// the next process instead of counting a failure.
+		return w.restoreForShutdown(ctx, "sync", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
+			return w.Local.FinishSyncOutcome(fctx, job.RepoID, holder, meta.SyncOutcome{Kind: meta.OutcomeRestore, Delay: shutdownRestoreDelay})
+		})
 	}
 
 	var fin Upstream
@@ -419,6 +429,47 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		}
 	}
 	return runErr
+}
+
+// shutdownRestoreDelay is how long a request kept by a shutdown-cancelled
+// run waits before it is due again; the next process's first sweep starts
+// later than this anyway.
+const shutdownRestoreDelay = time.Second
+
+// claimLocal runs a local-schedule claim unless shutdown already cancelled
+// the run. The claim itself is not cancellable: a claim cancelled mid-write
+// could commit without this run knowing, and then block the request until
+// its lease expired, instead of being restored (issue #342).
+func (w *Worker) claimLocal(ctx context.Context, claim func(context.Context) (LaneClaim, error)) (LaneClaim, error) {
+	if shutdownAborted(ctx) {
+		return LaneClaim{}, nil // not claimed: the request stays in the row
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+	defer cancel()
+	return claim(cctx)
+}
+
+// restoreForShutdown ends a local-schedule run that LocalScheduler.Drain
+// cancelled (issue #342) with finish, an OutcomeRestore write: the request
+// stays pending for the next process, no run is counted, and no terminal
+// event is emitted (like detach and claim-steal abandonment).
+func (w *Worker) restoreForShutdown(ctx context.Context, lane string, job Job, holder string, runErr error,
+	finish func(context.Context) (Upstream, error)) error {
+	assertf(w.Local != nil && shutdownAborted(ctx), "restoreForShutdown outside a drained local run")
+	_, err := w.retryFinish(ctx, lane, job.RepoID, finish)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return nil // detached meanwhile: nothing to keep
+	case errors.Is(err, ErrClaimLost):
+		w.Logger.Warn(lane+" claim lost before the shutdown restore; abandoning",
+			"org", job.Org, "repo", job.RepoID, "holder", holder)
+		return nil
+	case err != nil:
+		return fmt.Errorf("restore %s %s after shutdown: %w", lane, job.RepoID, err)
+	}
+	w.Logger.Info(lane+" run cancelled by shutdown; request kept for the next process",
+		"org", job.Org, "repo", job.RepoID, "cause", runErr)
+	return nil
 }
 
 // deferRetrySlack delays the deferred retry past the observed lease expiry

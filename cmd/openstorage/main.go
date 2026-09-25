@@ -93,6 +93,13 @@ const leaseReleaseTimeout = 5 * time.Second
 // attempt, never data (docs/how-to/deploy-production.md).
 const shutdownDrainTimeout = 10 * time.Second
 
+// shutdownRunWait is the part of shutdownDrainTimeout that scheduled sync
+// and push runs get to finish, before the listener stops, while it still
+// serves their loopback pushes (issue #342). Runs still going then are
+// cancelled and keep their requests (ADR-50), so a longer wait would only
+// save reruns.
+const shutdownRunWait = 5 * time.Second
+
 func cmdServe(ctx context.Context, args []string) error {
 	// A termination signal cancels the serve context (issue #174): the
 	// select at the bottom then drains HTTP and RETURNS, letting every
@@ -266,7 +273,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		assertf(gitSrv != nil, "usageFloor called before the git server was wired")
 		return gitSrv.CachedUsageFloorGen(ctx, repo)
 	}
-	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, loopbackBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
+	apiHandler, metaStore, verifier, maybeRepack, drainRuns, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, loopbackBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
 		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.lfsGC, cfg.absence, cfg.lfsV020WriteCompat, cfg.repackThreshold, cfg.webhookAllowPrivate, cfg.syncEgress, cfg.secretsCodec, usageFloor)
 	if err != nil {
 		return err
@@ -362,6 +369,13 @@ func cmdServe(ctx context.Context, args []string) error {
 		fmt.Fprintln(os.Stderr, "openstorage serve: termination signal received; draining")
 		dctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 		defer cancel()
+		// Scheduled sync runs push to THIS listener (issue #342): stop
+		// starting runs and let in-flight ones finish while it still
+		// serves. Runs still going when the wait ends are cancelled and
+		// keep their requests for the next process.
+		rctx, rcancel := context.WithTimeout(dctx, shutdownRunWait)
+		drainRuns(rctx)
+		rcancel()
 		if err := httpSrv.Shutdown(dctx); err != nil {
 			fmt.Fprintf(os.Stderr, "openstorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)
 		}

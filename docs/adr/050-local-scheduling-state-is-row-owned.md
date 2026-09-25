@@ -52,6 +52,13 @@ fields without a format change (issue #335).
 - Callers must record a durable request before they enqueue local work;
   conditional claims ignore queue entries that have no durable work behind
   them.
+- Shutdown keeps requests (issue #342). Before `serve` stops its listener,
+  the scheduler stops starting runs and waits a bounded time for runs in
+  flight, which push to that listener. It then cancels the rest. A run
+  cancelled this way ends with `restore`, emits no `repo.sync.failed`, and
+  its request runs in the next process. Correctness does not depend on the
+  wait: the run is classified by its cancellation cause, which is set before
+  the listener stops.
 
 **Rollout.** The store transitions land first, with no callers. The SQLite
 worker and its sweep follow, and hook marking comes last, after its consumer
