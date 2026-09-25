@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
 // internalErrorMsg is the only 500 body clients ever see: raw error strings
@@ -27,21 +28,90 @@ func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, 
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
-// errorEnvelope is the wire error shape: {"error": "<unstable human string>"}
-// (docs/reference/http-api.md). Clients branch on status codes only, never on the message.
+// errorEnvelope is the plain wire error shape (docs/reference/http-api.md):
+// the legacy {"error": "<unstable human string>"} plus the RFC 9457
+// problem-details fields upstream documents (issue #349). `code` is the
+// generic per-status code only; `detail` mirrors `error`. Clients branch on
+// the status code or `code`, never on the message. The content type stays
+// application/json: SDK 1.17.1 parses error JSON only for that type.
 type errorEnvelope struct {
-	Error string `json:"error"`
+	Error  string `json:"error"`
+	Type   string `json:"type"`
+	Title  string `json:"title"`
+	Status int    `json:"status"`
+	Code   string `json:"code"`
+	Detail string `json:"detail"`
 }
 
-// writeErr writes the {"error": msg} envelope with the given status.
+// writeErr writes the plain error envelope with the given status.
 // 401 responses additionally carry `WWW-Authenticate: Bearer` (docs/reference/authentication.md).
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	assertf(status >= 400 && status < 600, "writeErr called with non-error status %d", status)
 	assertf(msg != "", "writeErr called with empty message")
+	// RFC 9457 `title` is the status text, so only registered statuses are
+	// valid here (499 is never emitted: ADR-26).
+	title := http.StatusText(status)
+	assertf(title != "", "writeErr called with unregistered status %d", status)
 	if status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 	}
-	writeJSON(w, status, errorEnvelope{Error: msg})
+	writeJSON(w, status, errorEnvelope{
+		Error:  msg,
+		Type:   "about:blank",
+		Title:  title,
+		Status: status,
+		Code:   genericProblemCode(status),
+		Detail: msg,
+	})
+}
+
+// genericProblemCodes is upstream's generic per-status `code` table,
+// verbatim from the "Error codes" section of docs/upstream/openapi.yaml
+// (TestGenericProblemCodeMatchesUpstream pins it to the snapshot).
+var genericProblemCodes = map[int]string{
+	http.StatusBadRequest:            "bad_request",
+	http.StatusUnauthorized:          "unauthorized",
+	http.StatusForbidden:             "forbidden",
+	http.StatusNotFound:              "not_found",
+	http.StatusMethodNotAllowed:      "method_not_allowed",
+	http.StatusRequestTimeout:        "request_timeout",
+	http.StatusConflict:              "conflict",
+	http.StatusPreconditionFailed:    "precondition_failed",
+	http.StatusRequestEntityTooLarge: "payload_too_large",
+	http.StatusUnprocessableEntity:   "unprocessable_entity",
+	http.StatusTooManyRequests:       "rate_limited",
+	499:                              "request_canceled",
+	http.StatusInternalServerError:   "internal_error",
+	http.StatusNotImplemented:        "not_implemented",
+	http.StatusBadGateway:            "bad_gateway",
+	http.StatusServiceUnavailable:    "service_unavailable",
+	http.StatusGatewayTimeout:        "gateway_timeout",
+}
+
+// genericProblemCode returns upstream's generic `code` for status. Upstream:
+// "Any other status uses its status text in snake_case"; that fallback uses
+// Go's status text, which may name a few statuses differently from upstream.
+// Every status writeErr emits today is in the table.
+func genericProblemCode(status int) string {
+	if code, ok := genericProblemCodes[status]; ok {
+		return code
+	}
+	text := http.StatusText(status)
+	assertf(text != "", "genericProblemCode: unregistered status %d", status)
+	var b strings.Builder
+	sep := false
+	for _, r := range strings.ToLower(text) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			if sep && b.Len() > 0 {
+				b.WriteByte('_')
+			}
+			b.WriteRune(r)
+			sep = false
+			continue
+		}
+		sep = true
+	}
+	return b.String()
 }
 
 // writeJSON writes v as the JSON response body with the given status.

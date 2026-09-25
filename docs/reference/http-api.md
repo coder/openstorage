@@ -18,7 +18,16 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   null/empty when exhausted) + `has_more` (bool). Documented default limit 20, max 100.
   SDK-observed server defaults differ: files 1000/max 5000, files/metadata 200/max 1000,
   notes refs 20.
-- **Errors**: `{"error": "<unstable human string>"}` + status code. Ref-moving write
+- **Errors**: `{"error": "<unstable human string>"}` + status code, with RFC 9457
+  problem-details fields alongside `error`: `type` (`about:blank`), `title` (the status
+  text), `status`, `code`, and `detail` (same string as `error`). `code` is upstream's
+  generic code for the status (`bad_request`, `unauthorized`, `forbidden`, `not_found`,
+  `conflict`, `unprocessable_entity`, `rate_limited`, `internal_error`,
+  `service_unavailable`, …); open.storage emits none of upstream's specific codes such
+  as `repository_not_found`. Branch on the status code or `code`, not on the message.
+  The content type stays `application/json`. `status` is a JSON number, as in upstream's
+  bodies: decode the body into a struct or a map of arbitrary values, not a string-only
+  map (such as Go's `map[string]string`). Ref-moving write
   endpoints return the richer `result` envelope
   ([streaming protocols](../explanation/streaming-commit-protocols.md)), even on 4xx/5xx
   statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`.

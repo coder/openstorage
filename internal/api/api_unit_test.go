@@ -111,6 +111,7 @@ func decodeEnvelope(t *testing.T, rr *httptest.ResponseRecorder) string {
 	if env.Error == "" {
 		t.Fatalf("envelope has empty error message: %s", rr.Body.String())
 	}
+	assertProblemFields(t, rr.Code, rr.Body.Bytes())
 	return env.Error
 }
 
