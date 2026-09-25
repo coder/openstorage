@@ -186,6 +186,14 @@ type Worker struct {
 	// LocalScheduler sweep turns due rows into runs.
 	Local LocalLanes
 
+	// WaitPublication, when non-nil (SQLite local mode, with Local set),
+	// blocks until no in-flight push still holds the repo's cache refs
+	// unpublished (githttp.WaitForPushPublication). A local run calls it
+	// after its claim and before its snapshot and started event: a hook
+	// records intent after the authority CAS but before receive-pack
+	// publishes the cache ref. A failed wait restores the consumed request.
+	WaitPublication func(ctx context.Context, repoID string) error
+
 	// DetachPoll is the cadence of the outbound push watchdog that
 	// re-reads the upstream row WHILE `git push` runs and kills the
 	// subprocess when the repo is detached or the claim stolen mid-push
@@ -264,6 +272,44 @@ func failureCode(err error) string {
 	return FailInternal
 }
 
+// localPublicationRetryDelay is how long a run restored after a failed
+// publication wait waits before it is due again.
+const localPublicationRetryDelay = 5 * time.Second
+
+// localPublicationWaitTimeout bounds one publication wait, so a hold that
+// never releases cannot keep the claim for the whole run budget.
+const localPublicationWaitTimeout = time.Minute
+
+func (w *Worker) waitPublication(ctx context.Context, repoID string) error {
+	if w.WaitPublication == nil {
+		return nil
+	}
+	assertf(w.Local != nil, "WaitPublication requires the local schedule")
+	wctx, cancel := context.WithTimeout(ctx, localPublicationWaitTimeout)
+	defer cancel()
+	return w.WaitPublication(wctx, repoID)
+}
+
+// restoreLocal ends a claimed local run whose publication wait failed: no
+// snapshot was taken and no event emitted, so the run hands its request
+// back to the row (restore) instead of counting a run.
+func (w *Worker) restoreLocal(ctx context.Context, job Job, holder, lane string, waitErr error, finish func(ctx context.Context) (Upstream, error)) error {
+	w.Logger.Warn("publication wait failed; request restored for a later run",
+		"org", job.Org, "repo", job.RepoID, "lane", lane, "err", waitErr)
+	_, err := w.retryFinish(ctx, lane, job.RepoID, finish)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return nil // detached while waiting: nothing to restore
+	case errors.Is(err, ErrClaimLost):
+		w.Logger.Warn("claim lost while waiting for publication; abandoning",
+			"org", job.Org, "repo", job.RepoID, "lane", lane, "holder", holder)
+		return nil
+	case err != nil:
+		return fmt.Errorf("restore %s %s: %w", lane, job.RepoID, err)
+	}
+	return nil
+}
+
 // Run executes one sync run for job. It returns an error for logging by the
 // queue; documented outcomes (detached, overlapping run, failed sync with an
 // emitted event) are not errors to the caller beyond that.
@@ -326,6 +372,15 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		// racing live runs (clock trouble or budget drift).
 		w.Logger.Warn("stole expired sync claim",
 			"org", job.Org, "repo", job.RepoID, "holder", holder, "stolen_from", stolenFrom)
+	}
+
+	if w.Local != nil {
+		if err := w.waitPublication(ctx, job.RepoID); err != nil {
+			return w.restoreLocal(ctx, job, holder, "sync", err, func(fctx context.Context) (Upstream, error) {
+				return w.Local.FinishSyncOutcome(fctx, job.RepoID, holder,
+					meta.SyncOutcome{Kind: meta.OutcomeRestore, Delay: localPublicationRetryDelay})
+			})
+		}
 	}
 
 	startedAt := eventTime(time.Now())

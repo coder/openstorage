@@ -233,9 +233,15 @@ func hookCallerDeniedForward() bool {
 			return true // fail closed
 		}
 	}
-	if !slices.Contains(scopes, auth.ScopeGitRead) {
-		return true
-	}
+	return !slices.Contains(scopes, auth.ScopeGitRead) || hookCallerDeniedPull()
+}
+
+// hookCallerDeniedPull is the SQLite hook's pull gate, matching the
+// explicit pull API's ref-policy gate: a full mirror must not change refs
+// on behalf of a restricted writer. Git HTTP already checked git:write;
+// unlike forwarding, pulling does not require read. Malformed values count
+// as denied.
+func hookCallerDeniedPull() bool {
 	policyJSON := envconfig.Getenv(githttp.EnvRefsPolicy)
 	opsJSON := envconfig.Getenv(githttp.EnvOps)
 	if policyJSON == "" && opsJSON == "" {
@@ -273,7 +279,7 @@ func isPGURL(dbURL string) bool {
 // non-nil repack registers the background-repack worker on both backends.
 // The returned cleanup stops the sweep and the queue (waiting for in-flight
 // local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, absence *jobs.AbsenceReconcileSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, syncEgress syncEgressSettings, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL, cacheDir string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, absence *jobs.AbsenceReconcileSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, syncEgress syncEgressSettings, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
 	assertf(ms != nil && dbURL != "" && org != "" && loopbackBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
@@ -344,7 +350,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		}
 		queue = q
 	} else {
-		queue, cleanup = buildLocalSyncQueue(ms, org, worker, deliverer, repack, logger)
+		queue, cleanup = buildLocalSyncQueue(ms, org, cacheDir, worker, deliverer, repack, logger)
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep)
 			prev := cleanup
@@ -423,8 +429,10 @@ func hookWebhookAllowPrivate(logger *slog.Logger) bool {
 // Cross-process queue story (ADR): pg-mode hooks insert durable River jobs
 // worked by the serve process. Local mode has no shared durable queue, so
 // hook deliveries run synchronously (bounded attempts) inside the hook
-// subprocess, and git-surface pushes do NOT schedule upstream syncs (API
-// writes still do); queued local work dies with the process.
+// subprocess. On SQLite (ADR-50) an authorized git-surface push records
+// durable intent in the schedule row, and the serve sweep turns it into a
+// run. S3WAL git-surface pushes do NOT schedule upstream syncs (API writes
+// still do; issue #335).
 func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	org := envconfig.Getenv(envOrg)
 	dbURL := envconfig.First("OPENSTORAGE_PG_URL", "PG_URL")
@@ -482,15 +490,6 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		denied := hookCallerDeniedForward()
 		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org,
 			func(context.Context) bool { return denied })
-		if envconfig.Getenv(githttp.EnvSyncClaim) != "" {
-			// This receive-pack IS a sync run's own loopback push (the
-			// claim-fenced token, issue #86): poking the sync seam from it
-			// would chain runs. The pull poke was already suppressed by the
-			// in-flight claim check; the forward poke (issue #90) must be
-			// suppressed here or every inbound mirror update would enqueue
-			// an outbound no-op forward. Push webhooks still emit.
-			enqueueSync = nil
-		}
 	} else {
 		// Local mode: deliver synchronously (bounded) before hook exit.
 		deliverer := &events.Deliverer{
@@ -508,8 +507,34 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		}
 		local := jobs.NewLocal(deliverer, neverRun, neverRun, nil /* hook subprocesses never fold */, logger)
 		cleanups = append(cleanups, local.Close) // waits for in-flight deliveries
-		enqueueSync = nil                        // documented local-mode gap (see doc comment)
 		enqueueDelivery = local.EnqueueWebhookDelivery
+		if _, ok := ms.(meta.LocalScheduleStore); ok {
+			// SQLite: record intent only. The hook never starts a run;
+			// the serve sweep claims the row once the push's cache refs
+			// are published (the worker's publication wait).
+			denied, pullDenied := hookCallerDeniedForward(), hookCallerDeniedPull()
+			enqueueSync = enqueueSyncOrForward(ms,
+				func(ctx context.Context, job upsync.Job) error {
+					if pullDenied {
+						return nil // an allowed ref write cannot authorize an unpoliced mirror
+					}
+					return ms.RequestSync(ctx, job.RepoID)
+				},
+				// enqueueSyncOrForward already recorded RequestPush.
+				func(context.Context, upsync.Job) error { return nil }, org,
+				func(context.Context) bool { return denied })
+		}
+		// S3WAL leaves enqueueSync nil: the documented gap (issue #335).
+	}
+
+	if envconfig.Getenv(githttp.EnvSyncClaim) != "" {
+		// This receive-pack IS a sync run's own loopback push (the
+		// claim-fenced token, issue #86): poking the sync seam from it
+		// would chain runs. The pull poke was already suppressed by the
+		// in-flight claim check; the forward poke (issue #90) must be
+		// suppressed here or every inbound mirror update would enqueue
+		// an outbound no-op forward. Push webhooks still emit.
+		enqueueSync = nil
 	}
 
 	githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) ref.RefStore {

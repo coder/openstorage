@@ -60,6 +60,22 @@ fields without a format change (issue #335).
   wait: the run is classified by its cancellation cause, which is set before
   the listener stops.
 
-**Rollout.** The store transitions land first, with no callers. The SQLite
-worker and its sweep follow, and hook marking comes last, after its consumer
-is qualified.
+**Consumers.** On SQLite the serve process runs a sweep every second that
+turns due lanes into runs; it replaces boot recovery and the process-local
+retry timers. Queue enqueues only offer runs: every caller records its
+request first. API `push-upstream` records with `RequestPushNow`; implicit
+forward pokes and git-surface hooks use `RequestPush` and `RequestSync`.
+
+**Git-surface hooks** (the `openstorage hook` subprocess) record intent with
+one row write after the authority CAS, behind the API's gates: forwarding
+needs `git:read` and no ref-policy operations, pulling needs no ref-policy
+operations, a sync run's own loopback push records nothing, and a live pull
+claim suppresses pull marking (as on PostgreSQL). The hook marks before
+receive-pack publishes the cache ref, so a local run waits for the claimed
+repository's publication (`githttp.WaitForPushPublication`) after its claim
+and before its snapshot and `repo.sync.started` event. A failed wait ends
+the run with `restore`, due again after a few seconds.
+
+**Rollout.** The store transitions landed first, with no callers (#336). The
+SQLite worker and its sweep followed (#341), and hook marking came last,
+after its consumer was qualified.

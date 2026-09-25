@@ -131,6 +131,15 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			"org", job.Org, "repo", job.RepoID, "holder", holder, "stolen_from", stolenFrom)
 	}
 
+	if w.Local != nil {
+		if err := w.waitPublication(ctx, job.RepoID); err != nil {
+			return w.restoreLocal(ctx, job, holder, "push", err, func(fctx context.Context) (Upstream, error) {
+				return w.Local.FinishPushOutcome(fctx, job.RepoID, holder,
+					meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: localPublicationRetryDelay})
+			})
+		}
+	}
+
 	startedAt := eventTime(time.Now())
 	base := Event{
 		Repository:  EventRepository{ID: repo.RepoID, URL: repo.URL},
