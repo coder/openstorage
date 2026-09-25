@@ -463,6 +463,7 @@ type syncWorker struct {
 	upstreams sync.UpstreamStore
 	pool      *pgxpool.Pool
 	logger    *slog.Logger
+	runs      context.Context // see withShutdown
 }
 
 // Work runs one sync, then completes the job and inserts a GATED successor
@@ -510,10 +511,15 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 			"repo", job.Args.RepoID, "err", err)
 	}
 
-	runErr := w.run(ctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref})
+	rctx, done := withShutdown(ctx, w.runs)
+	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref})
+	done()
 	if runErr != nil {
 		w.logger.Warn("sync run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
+	}
+	if errors.Is(runErr, sync.ErrShutdown) {
+		return shutdownSnooze(ctx, w.upstreams, job.Args.RepoID, syncSnoozeDelay, w.logger)
 	}
 
 	assertf(w.pool != nil, "syncWorker: pool not wired")
@@ -609,6 +615,7 @@ type pushWorker struct {
 	upstreams sync.UpstreamStore
 	pool      *pgxpool.Pool
 	logger    *slog.Logger
+	runs      context.Context // see withShutdown
 }
 
 func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
@@ -623,10 +630,15 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 			"repo", job.Args.RepoID, "err", err)
 	}
 
-	runErr := w.run(ctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Retry: job.Args.Retry})
+	rctx, done := withShutdown(ctx, w.runs)
+	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Retry: job.Args.Retry})
+	done()
 	if runErr != nil {
 		w.logger.Warn("push run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
+	}
+	if errors.Is(runErr, sync.ErrShutdown) {
+		return shutdownSnooze(ctx, w.upstreams, job.Args.RepoID, pushSnoozeDelay, w.logger)
 	}
 
 	assertf(w.pool != nil, "pushWorker: pool not wired")
@@ -703,6 +715,10 @@ type River struct {
 	pool          *pgxpool.Pool
 	started       bool
 	repackEnabled bool
+	// cancelRuns cancels every sync and push run with sync.ErrShutdown
+	// (DrainSyncRuns, issue #343); the workers derive each run's context
+	// from runs.
+	cancelRuns context.CancelCauseFunc
 }
 
 var _ Queue = (*River)(nil)
@@ -771,10 +787,11 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		return nil, fmt.Errorf("jobs: river migrations: %w", migrateErr)
 	}
 
+	runs, cancelRuns := context.WithCancelCause(context.Background())
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &deliveryWorker{deliverer: deliverer})
-	river.AddWorker(workers, &syncWorker{run: runSync, upstreams: upstreams, pool: pool, logger: logger})
-	river.AddWorker(workers, &pushWorker{run: runPush, upstreams: upstreams, pool: pool, logger: logger})
+	river.AddWorker(workers, &syncWorker{run: runSync, upstreams: upstreams, pool: pool, logger: logger, runs: runs})
+	river.AddWorker(workers, &pushWorker{run: runPush, upstreams: upstreams, pool: pool, logger: logger, runs: runs})
 	if repack != nil {
 		river.AddWorker(workers, &repackWorker{repacker: repack, pool: pool})
 	}
@@ -827,14 +844,19 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		Logger:       logger,
 	})
 	if err != nil {
+		cancelRuns(nil)
 		pool.Close()
 		return nil, fmt.Errorf("jobs: river client: %w", err)
 	}
-	if err := client.Start(ctx); err != nil {
+	// Not ctx: serve's context ends at the termination signal, and River
+	// cancels every running job when its start context ends. Shutdown goes
+	// through DrainSyncRuns and Close instead (issue #343).
+	if err := client.Start(context.WithoutCancel(ctx)); err != nil {
+		cancelRuns(nil)
 		pool.Close()
 		return nil, fmt.Errorf("jobs: start river client: %w", err)
 	}
-	return &River{client: client, pool: pool, started: true, repackEnabled: repack != nil}, nil
+	return &River{client: client, pool: pool, started: true, repackEnabled: repack != nil, cancelRuns: cancelRuns}, nil
 }
 
 // NewRiverInsertOnly connects an insert-only client (no migrations — hooks
@@ -886,6 +908,92 @@ func (q *River) EnqueueRepack(ctx context.Context, repo string) error {
 	}
 	_, err := q.client.Insert(ctx, repackArgs{Repo: repo}, nil)
 	return err
+}
+
+// DrainSyncRuns is serve's shutdown drain (issue #343), run while the
+// listener still takes the runs' loopback pushes. River stops fetching
+// jobs and waits up to wait for running ones. Then sync and push runs are
+// cancelled with sync.ErrShutdown, so they release their claims and
+// re-mark their requests without counting a run, and River keeps waiting
+// until ctx ends; whatever still runs then (other job kinds) is cancelled
+// as a plain stop. The worker keeps a cancelled run's job (shutdownSnooze),
+// so the job, its Retry, and any request deduplicated against it pass to
+// the next process or another replica. Close still runs afterwards.
+func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
+	assertf(wait >= 0, "DrainSyncRuns: negative wait %v", wait)
+	if !q.started {
+		return
+	}
+	wctx, cancel := context.WithTimeout(ctx, wait)
+	err := q.client.Stop(wctx) // soft: no new fetches, waits for running jobs
+	cancel()
+	if err == nil {
+		return // every job finished while the listener served
+	}
+	q.cancelRuns(sync.ErrShutdown)
+	// Soft again: cancelled runs restore and snooze their jobs first.
+	if err := q.client.Stop(ctx); err != nil {
+		_ = q.client.StopAndCancel(ctx) // cancels the rest; ctx is done
+	}
+}
+
+// shutdownSnoozeFallback is shutdownSnooze's delay when it cannot read the
+// row: long enough for any claim the run left behind to expire (claim
+// leases stay below the snooze cap).
+const shutdownSnoozeFallback = 30 * time.Minute
+
+// shutdownSnooze keeps the job of a run that DrainSyncRuns cancelled before
+// it committed an outcome: sync.Worker then returns an error wrapping
+// sync.ErrShutdown, whatever its restore did (issue #343 review). A run
+// that already counted its outcome returns a plain error and goes through
+// the gate, so it is not rerun. A
+// restored run left its request pending and no claim; the snooze then
+// matches the gate's own uncovered-pending snooze. A failed restore left
+// the claim held and the request consumed; the gate would complete the
+// job (no pending mark), and the request would be lost once the claim
+// expired. The delay therefore waits past any claim on the fresh row, and
+// the next run steals it and does the work. No successor is inserted: this
+// job stays the only one for the lane and repo, and its next run's claim
+// covers every request marked before it.
+func shutdownSnooze(ctx context.Context, upstreams sync.UpstreamStore, repoID string,
+	delayFor func(sync.Upstream) time.Duration, logger *slog.Logger) error {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	delay := shutdownSnoozeFallback
+	switch up, err := upstreams.GetUpstream(rctx, repoID); {
+	case err == nil:
+		delay = delayFor(up)
+	case errors.Is(err, sync.ErrNotFound):
+		return nil // detached: nothing to keep
+	default:
+		logger.Warn("shutdown: upstream read failed; snoozing past any claim", "repo", repoID, "err", err)
+	}
+	logger.Info("shutdown: keeping the cancelled run's job for the next process", "repo", repoID, "delay", delay)
+	return river.JobSnooze(delay)
+}
+
+// withShutdown returns a sync or push run's context: cancelled with
+// sync.ErrShutdown by DrainSyncRuns, and with the job context's cause and
+// deadline otherwise. It derives from runs, not from the job context, so
+// DrainSyncRuns's cancellation lands synchronously (context.AfterFunc runs
+// its callback on another goroutine): a job-context cancellation right
+// after it cannot win with a plain cause and make the run count as failed.
+func withShutdown(ctx, runs context.Context) (context.Context, func()) {
+	assertf(runs != nil, "withShutdown: nil runs context")
+	rctx, cancel := context.WithCancelCause(runs)
+	stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	release := func() {
+		stop()
+		cancel(nil)
+	}
+	if d, ok := ctx.Deadline(); ok {
+		dctx, dcancel := context.WithDeadline(rctx, d)
+		return dctx, func() {
+			dcancel()
+			release()
+		}
+	}
+	return rctx, release
 }
 
 // Close stops the workers (waiting for in-flight jobs) and closes the pool.

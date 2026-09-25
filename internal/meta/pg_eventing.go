@@ -555,6 +555,83 @@ func (s *PG) FinishSync(ctx context.Context, repoID, holder string, success bool
 	}
 }
 
+// RunRestoreStore ends runs that serve's shutdown cancelled without counting
+// them (issue #343). Only *PG implements it: SQLite restores through
+// LocalScheduleStore (ADR-50), and S3WAL runs are never shutdown-cancelled.
+type RunRestoreStore interface {
+	RestoreSync(ctx context.Context, repoID, holder string) (RepoUpstream, error)
+	RestorePush(ctx context.Context, repoID, holder string, force bool) (RepoUpstream, error)
+}
+
+var _ RunRestoreStore = (*PG)(nil)
+
+// RestoreSync ends the run claimed by holder without counting it (issue
+// #343): serve's shutdown cancelled it. The claim is released and the
+// request re-marked, so the next run redoes it. Errors as FinishSync.
+func (s *PG) RestoreSync(ctx context.Context, repoID, holder string) (RepoUpstream, error) {
+	assertf(repoID != "", "RestoreSync: empty repo id")
+	assertf(holder != "", "RestoreSync: empty holder")
+	up, err := scanRepoUpstream(s.pool.QueryRow(ctx,
+		`UPDATE repo_upstreams
+		 SET syncing = false, sync_pending = true,
+		     sync_claim_holder = '', sync_claim_expires_at = 'epoch'
+		 WHERE repo_id = $1 AND syncing = true AND sync_claim_holder = $2
+		 RETURNING `+repoUpstreamCols, repoID, holder))
+	if err == nil {
+		return up, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return RepoUpstream{}, fmt.Errorf("restore sync for repo %q: %w", repoID, err)
+	}
+	return RepoUpstream{}, s.classifyGuardMiss(ctx, repoID, holder, "sync", func(cur RepoUpstream) (bool, string) {
+		return cur.Syncing, cur.SyncClaimHolder
+	})
+}
+
+// RestorePush is RestoreSync on the push_* lane: the claim is released
+// and the run's consumed level (force when force) re-marked; levels only
+// coalesce upward. The attempt lives in the River job, which snoozes.
+func (s *PG) RestorePush(ctx context.Context, repoID, holder string, force bool) (RepoUpstream, error) {
+	assertf(repoID != "", "RestorePush: empty repo id")
+	assertf(holder != "", "RestorePush: empty holder")
+	level := 1
+	if force {
+		level = 2
+	}
+	up, err := scanRepoUpstream(s.pool.QueryRow(ctx,
+		`UPDATE repo_upstreams
+		 SET push_syncing = false, push_pending = GREATEST(push_pending, $3),
+		     push_claim_holder = '', push_claim_expires_at = 'epoch', push_claim_force = false
+		 WHERE repo_id = $1 AND push_syncing = true AND push_claim_holder = $2
+		 RETURNING `+repoUpstreamCols, repoID, holder, level))
+	if err == nil {
+		return up, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return RepoUpstream{}, fmt.Errorf("restore push for repo %q: %w", repoID, err)
+	}
+	return RepoUpstream{}, s.classifyGuardMiss(ctx, repoID, holder, "push", func(cur RepoUpstream) (bool, string) {
+		return cur.PushSyncing, cur.PushClaimHolder
+	})
+}
+
+// classifyGuardMiss explains a holder-guarded UPDATE that matched no row,
+// as FinishSync does: ErrClaimLost when another holder owns the lane,
+// ErrNotFound otherwise.
+func (s *PG) classifyGuardMiss(ctx context.Context, repoID, holder, lane string, claimOf func(RepoUpstream) (bool, string)) error {
+	cur, err := s.GetRepoUpstream(ctx, repoID)
+	if errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if err != nil {
+		return fmt.Errorf("restore %s for repo %q: %w", lane, repoID, err)
+	}
+	if held, by := claimOf(cur); held && by != holder {
+		return fmt.Errorf("upstream for repo %q now held by %q: %w", repoID, by, ErrClaimLost)
+	}
+	return fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+}
+
 // RequestPush raises the outbound pending level (issue #90); levels only
 // coalesce upward so force is never downgraded. ErrNotFound when detached.
 func (s *PG) RequestPush(ctx context.Context, repoID string, force bool) error {

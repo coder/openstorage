@@ -112,7 +112,13 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 		}
 		up, force, stolenFrom, attempt = c.Up, c.Force, c.StolenFrom, c.Attempt
 	} else {
-		up, force, stolenFrom, err = w.Upstreams.BeginPush(ctx, job.RepoID, holder, claimLease(timeout))
+		if shutdownAborted(ctx) {
+			// Not claimed: the request stays marked (issue #343).
+			return fmt.Errorf("begin push %s: %w", job.RepoID, ErrShutdown)
+		}
+		cctx, ccancel := claimContext(ctx)
+		up, force, stolenFrom, err = w.Upstreams.BeginPush(cctx, job.RepoID, holder, claimLease(timeout))
+		ccancel()
 		switch {
 		case errors.Is(err, ErrNotFound):
 			return nil // detached before start: cancel silently
@@ -123,7 +129,7 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			w.deferPendingPushRetry(ctx, job)
 			return nil
 		case err != nil:
-			return fmt.Errorf("begin push %s: %w", job.RepoID, err)
+			return shutdownErr(ctx, fmt.Errorf("begin push %s: %w", job.RepoID, err))
 		}
 	}
 	if stolenFrom != "" {
@@ -163,12 +169,24 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	if w.Local != nil && runErr != nil && shutdownAborted(ctx) {
-		// Shutdown cancelled the run (issue #342): keep its request, force
-		// level, and retry position for the next process.
-		return w.restoreForShutdown(ctx, "push", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
-			return w.Local.FinishPushOutcome(fctx, job.RepoID, holder, meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: shutdownRestoreDelay})
-		})
+	if runErr != nil && shutdownAborted(ctx) {
+		// Shutdown cancelled the run: keep its request, force level, and
+		// retry position for the next process.
+		if w.Local != nil { // SQLite (issue #342)
+			return w.restoreForShutdown(ctx, "push", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
+				return w.Local.FinishPushOutcome(fctx, job.RepoID, holder, meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: shutdownRestoreDelay})
+			})
+		}
+		if rs, ok := w.Upstreams.(ShutdownRestorer); ok { // PostgreSQL/River (issue #343)
+			if err := w.restoreForShutdown(ctx, "push", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
+				return rs.RestorePush(fctx, job.RepoID, holder, force)
+			}); err != nil {
+				return err
+			}
+			// An error, so River's completion gate snoozes this job: its
+			// Retry (the retry position) rides along unchanged.
+			return fmt.Errorf("push %s: %w", job.RepoID, ErrShutdown)
+		}
 	}
 
 	var fin Upstream

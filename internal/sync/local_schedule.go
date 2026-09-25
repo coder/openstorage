@@ -130,7 +130,7 @@ type LocalScheduler struct {
 	wg       stdsync.WaitGroup // enqueues and sweep passes
 	runs     stdsync.WaitGroup // run goroutines; no Add once draining or closed
 	// runCtx is every run's parent context. Drain cancels it with
-	// errShutdown when its wait ends, and the worker then ends the run
+	// ErrShutdown when its wait ends, and the worker then ends the run
 	// with OutcomeRestore (issue #342).
 	runCtx     context.Context
 	cancelRuns context.CancelCauseFunc
@@ -333,18 +333,20 @@ func (s *LocalScheduler) Stop() {
 	}
 }
 
-// errShutdown is the cause Drain cancels runs with. A run whose context
-// carries it ends with OutcomeRestore instead of a counted failure.
-var errShutdown = errors.New("server shutting down")
+// ErrShutdown is the cause serve's shutdown drain cancels sync and push
+// runs with (LocalScheduler.Drain, jobs.River.DrainSyncRuns). A run whose
+// context carries it keeps its request instead of counting a failure.
+var ErrShutdown = errors.New("server shutting down")
 
-// shutdownAborted reports whether Drain cancelled the run behind ctx.
+// shutdownAborted reports whether a shutdown drain cancelled the run
+// behind ctx.
 func shutdownAborted(ctx context.Context) bool {
-	return errors.Is(context.Cause(ctx), errShutdown)
+	return errors.Is(context.Cause(ctx), ErrShutdown)
 }
 
 // Drain prepares shutdown while the loopback listener still serves (issue
 // #342). It stops the sweep and new runs, waits up to wait for runs in
-// flight, then cancels the remaining runs with errShutdown and waits for
+// flight, then cancels the remaining runs with ErrShutdown and waits for
 // them to record that. Enqueues still record their durable request; its
 // run is left to the next process's sweep. A cancelled run ends with
 // OutcomeRestore and keeps its request, so correctness does not depend on
@@ -374,7 +376,7 @@ func (s *LocalScheduler) Drain(ctx context.Context, wait time.Duration) {
 	case <-timer.C:
 	case <-ctx.Done():
 	}
-	s.cancelRuns(errShutdown)
+	s.cancelRuns(ErrShutdown)
 	select {
 	case <-done: // every cancelled run has written its restore
 	case <-ctx.Done():
