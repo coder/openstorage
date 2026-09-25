@@ -908,11 +908,12 @@ func (q *River) EnqueueRepack(ctx context.Context, repo string) error {
 // listener still takes the runs' loopback pushes. River stops fetching
 // jobs and waits up to wait for running ones. Then sync and push runs are
 // cancelled with sync.ErrShutdown, so they release their claims and
-// re-mark their requests without counting a run, and every other job is
-// cancelled as a plain stop, until ctx ends. The completion gate snoozes a
-// restored run's job (an uncounted failed run with a pending request), so
-// the job, its Retry, and any request deduplicated against it pass to the
-// next process. Close still runs afterwards.
+// re-mark their requests without counting a run, and River keeps waiting
+// until ctx ends; whatever still runs then (other job kinds) is cancelled
+// as a plain stop. A restored run's job completes through the unchanged
+// gate, which snoozes it (an uncounted failed run with a pending request),
+// so the job, its Retry, and any request deduplicated against it pass to
+// the next process or another replica. Close still runs afterwards.
 func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
 	assertf(wait >= 0, "DrainSyncRuns: negative wait %v", wait)
 	if !q.started {
@@ -924,16 +925,19 @@ func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
 	if err == nil {
 		return // every job finished while the listener served
 	}
-	q.cancelRuns(sync.ErrShutdown) // first, so runs see this cause
-	_ = q.client.StopAndCancel(ctx)
+	q.cancelRuns(sync.ErrShutdown)
+	// Soft again: restored runs' completion gates run on live contexts.
+	if err := q.client.Stop(ctx); err != nil {
+		_ = q.client.StopAndCancel(ctx) // cancels the rest; ctx is done
+	}
 }
 
 // withShutdown returns a sync or push run's context: cancelled with
 // sync.ErrShutdown by DrainSyncRuns, and with the job context's cause and
 // deadline otherwise. It derives from runs, not from the job context, so
-// DrainSyncRuns's cancellation lands synchronously: the StopAndCancel that
-// follows it would otherwise win the race with a plain cause, and the run
-// would count as failed.
+// DrainSyncRuns's cancellation lands synchronously (context.AfterFunc runs
+// its callback on another goroutine): a job-context cancellation right
+// after it cannot win with a plain cause and make the run count as failed.
 func withShutdown(ctx, runs context.Context) (context.Context, func()) {
 	assertf(runs != nil, "withShutdown: nil runs context")
 	rctx, cancel := context.WithCancelCause(runs)
