@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/coder/openstorage/internal/gitlimit"
 )
 
 // Resource bounds for read-side git children (#313). Every git child that
@@ -26,7 +28,7 @@ const (
 	// So a 300k history fits; histories past roughly 400k commits can fail
 	// the per-file walks. Read-only pack mappings are shared page cache and
 	// are not counted.
-	HeavyHeapBytes int64 = 256 << 20
+	HeavyHeapBytes = gitlimit.HeavyHeapBytes
 	// LightHeapBytes caps a child whose work is bounded by one object:
 	// ref resolution and single-commit reads. A commit object larger than
 	// this cannot be read through the API.
@@ -63,7 +65,7 @@ const (
 
 var (
 	// ErrBusy: no admission slot freed up in time; git was not started.
-	ErrBusy = errors.New("git read capacity exhausted")
+	ErrBusy = gitlimit.ErrBusy
 	// ErrTimeBudget: the request's git time budget ran out; the running
 	// child (if any) was killed and reaped.
 	ErrTimeBudget = errors.New("git reads exceeded the request time budget")
@@ -75,7 +77,7 @@ var (
 	ErrBlobTooLarge = errors.New("blob exceeds the API read size limit")
 	// ErrMemoryLimit: git needed more heap than its class's cap and was
 	// stopped by its own allocation failure (Linux only).
-	ErrMemoryLimit = errors.New("git exceeded its memory limit")
+	ErrMemoryLimit = gitlimit.ErrMemoryLimit
 	// ErrStop may be returned by a streaming Cmd.Stdout's Write to end git
 	// early (a history walk that has seen enough): Run then kills and reaps
 	// git and returns no error.
@@ -125,82 +127,12 @@ func DefaultLimits() Limits {
 // holds at most one slot, from its first git child until it ends (see
 // Budget). One key (a repository) may hold at most perKey of them, so slow
 // requests against one repository cannot take the whole pool from the
-// others.
-type Slots struct {
-	n, perKey int
-	wait      time.Duration
-
-	mu    sync.Mutex
-	used  int
-	byKey map[string]int
-	freed chan struct{} // closed and replaced on every release
-}
+// others. It is gitlimit's pool type, shared with cache maintenance.
+type Slots = gitlimit.Slots
 
 // NewSlots returns a pool of n slots, at most perKey of them per key. A
 // request waits at most wait for a free slot before failing with ErrBusy.
-func NewSlots(n, perKey int, wait time.Duration) *Slots {
-	assertf(n > 0, "NewSlots: n %d", n)
-	assertf(perKey > 0 && perKey <= n, "NewSlots: perKey %d of %d", perKey, n)
-	assertf(wait >= 0, "NewSlots: wait %v", wait)
-	return &Slots{n: n, perKey: perKey, wait: wait, byKey: map[string]int{}, freed: make(chan struct{})}
-}
-
-// tryAcquire takes a slot for key if the pool and the key's share allow
-// it; otherwise it returns a channel that is closed on the next release.
-func (s *Slots) tryAcquire(key string) (bool, <-chan struct{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.used < s.n && s.byKey[key] < s.perKey {
-		s.used++
-		s.byKey[key]++
-		return true, nil
-	}
-	return false, s.freed
-}
-
-func (s *Slots) acquire(ctx context.Context, key string) error {
-	var expired <-chan time.Time
-	if s.wait > 0 {
-		t := time.NewTimer(s.wait)
-		defer t.Stop()
-		expired = t.C
-	}
-	for {
-		ok, freed := s.tryAcquire(key)
-		if ok {
-			return nil
-		}
-		if s.wait == 0 {
-			return ErrBusy
-		}
-		select {
-		case <-freed: // try again
-		case <-expired:
-			return ErrBusy
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (s *Slots) release(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	assertf(s.used > 0 && s.byKey[key] > 0, "Slots.release: no slot held for %q", key)
-	s.used--
-	if s.byKey[key]--; s.byKey[key] == 0 {
-		delete(s.byKey, key)
-	}
-	close(s.freed)
-	s.freed = make(chan struct{})
-}
-
-// InUse reports how many slots are held (tests and diagnostics).
-func (s *Slots) InUse() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.used
-}
+func NewSlots(n, perKey int, wait time.Duration) *Slots { return gitlimit.NewSlots(n, perKey, wait) }
 
 // Budget is one request's share of the read-side git limits. A handler
 // middleware creates it, attaches it with WithBudget, and calls Close when
@@ -264,7 +196,7 @@ func (b *Budget) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.held {
-		b.slots.release(b.key)
+		b.slots.Release(b.key)
 		b.held = false
 	}
 	b.closed = true
@@ -292,7 +224,7 @@ func (b *Budget) start(ctx context.Context) (deadline time.Time, err error) {
 	// Wait for a slot without holding mu.
 	actx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	if err := b.slots.acquire(actx, b.key); err != nil {
+	if err := b.slots.Acquire(actx, b.key); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			return time.Time{}, fmt.Errorf("%w (%v)", ErrTimeBudget, b.timeout)
 		}
@@ -301,7 +233,7 @@ func (b *Budget) start(ctx context.Context) (deadline time.Time, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.held { // a concurrent child of the same request got one first
-		b.slots.release(b.key)
+		b.slots.Release(b.key)
 	} else {
 		b.held = true
 	}

@@ -1,6 +1,6 @@
 //go:build linux
 
-package gitread
+package gitlimit
 
 import (
 	"errors"
@@ -63,8 +63,8 @@ func TestHeapLimitFailureMatchesOnlyGitDiagnostics(t *testing.T) {
 		{"fatal: bad revision 'Cannot allocate memory'", false},
 		{"", false},
 	} {
-		if got := heapLimitFailure(errors.New("exit status 128"), tc.stderr); got != tc.want {
-			t.Errorf("heapLimitFailure(%q) = %v, want %v", tc.stderr, got, tc.want)
+		if got := HeapFailure(errors.New("exit status 128"), tc.stderr); got != tc.want {
+			t.Errorf("HeapFailure(%q) = %v, want %v", tc.stderr, got, tc.want)
 		}
 	}
 }

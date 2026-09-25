@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/meta"
 )
@@ -21,21 +22,16 @@ import (
 // retains (git children, buffered output, parsed results, spools). Write
 // deadlines bound how long a slow reader can keep it.
 const (
-	// gitReadSlots caps requests with JSON responses that run git at once
-	// in this process. Their git heap is at most 8 x 256 MiB while a child
-	// runs; buffered output adds at most 64 MiB (plus parsed copies) each.
-	// Downloads (gitStreamSlots) add the same heap bound again.
-	gitReadSlots = 8
 	// gitStreamSlots is a separate pool for file and archive downloads,
 	// whose delivery can take minutes, so they cannot starve JSON reads.
 	gitStreamSlots = 8
 	// gitRepoSlots is how many slots of each pool one repository may hold,
 	// so slow readers of one repository cannot take a whole pool from the
 	// others.
-	gitRepoSlots = 2
+	gitRepoSlots = gitlimit.RepoSlotCount
 	// gitReadSlotWait is how long a request waits for a slot before it
 	// is answered 503 + Retry-After.
-	gitReadSlotWait = time.Second
+	gitReadSlotWait = gitlimit.ReadSlotWait
 	// gitReadTimeout is one request's git time budget, counted from its
 	// first git child (repository hydration is not included) and shared
 	// by all of them: a files/metadata page with hundreds of per-file
@@ -72,7 +68,14 @@ type gitReadPolicy struct {
 
 // gitReads is the process-wide policy shared by every server instance.
 var gitReads = gitReadPolicy{
-	slots:          gitread.NewSlots(gitReadSlots, gitRepoSlots, gitReadSlotWait),
+	// gitlimit.ReadSlots (gitlimit.ReadSlotCount = 8, gitRepoSlots per
+	// repository) caps requests with JSON responses that run git at once
+	// in this process. It is shared with cache maintenance, which may hold
+	// at most gitlimit.MaintenanceShare of its slots (#322). Their git
+	// heap is at most 8 x 256 MiB while a child runs; buffered output adds
+	// at most 64 MiB (plus parsed copies) each. Downloads (streamSlots)
+	// add the same heap bound again.
+	slots:          gitlimit.ReadSlots,
 	streamSlots:    gitread.NewSlots(gitStreamSlots, gitRepoSlots, gitReadSlotWait),
 	timeout:        gitReadTimeout,
 	archiveTimeout: gitArchiveTimeout,
@@ -123,7 +126,7 @@ func (s *server) gitRepoSlotKey(r *http.Request) string {
 		return "claim\x00" + claims.Iss + "\x00" + claims.Repo
 	}
 	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
-	return "repo\x00" + repo.RepoID
+	return gitlimit.RepoKey(repo.RepoID)
 }
 
 func (s *server) gitReadBudget(h http.HandlerFunc, kind gitRouteKind) http.HandlerFunc {
