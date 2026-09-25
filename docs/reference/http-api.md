@@ -238,7 +238,9 @@ committer_email, date (RFC3339)}`.
 
 **Events and cancellation:** outbound runs emit the same `repo.sync.*` events with
 `direction: "push"` ([webhooks](webhooks.md)). `DELETE /repos/base` silently cancels
-in-flight runs in both directions.
+in-flight runs in both directions. With a SQLite database, a run that server shutdown
+cancels also ends without a terminal event: its request stays pending, and the next
+server process runs it with a new `repo.sync.started`.
 
 **Ref policies fail closed:** any policy op denies both pull-upstream and push-upstream.
 The same gate covers `forward_pushes`: a git push from a token that carries any

@@ -69,7 +69,7 @@ func logSyncEgressWarnings(logger *slog.Logger, s syncEgressSettings) {
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, absence absenceSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, syncEgress syncEgressSettings, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, absence absenceSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, syncEgress syncEgressSettings, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(context.Context, time.Duration), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
@@ -89,11 +89,11 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	}
 	ms, msCleanup, err := openMetaStore(ctx, dbURL, secretsCodec, metaOpts...)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
-	fail := func(err error) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+	fail := func(err error) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(context.Context, time.Duration), func(), error) {
 		msCleanup()
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Eventing/sync stack (docs/reference/webhooks.md): jobs queue with delivery + sync
@@ -429,7 +429,16 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		queueCleanup() // stop workers before closing their meta store
 		msCleanup()
 	}
-	return h, ms, verifier, maybeRepack, cleanup, nil
+	// drainRuns is serve's pre-listener-stop drain of scheduled sync runs
+	// (issue #342); only the SQLite local schedule has one.
+	drainRuns := func(ctx context.Context, wait time.Duration) {
+		if d, ok := queue.(interface {
+			DrainSyncRuns(context.Context, time.Duration)
+		}); ok {
+			d.DrainSyncRuns(ctx, wait)
+		}
+	}
+	return h, ms, verifier, maybeRepack, drainRuns, cleanup, nil
 }
 
 // bootstrapOrgAuth registers the configured file keys for the served org

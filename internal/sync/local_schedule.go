@@ -126,7 +126,14 @@ type LocalScheduler struct {
 	mu       stdsync.Mutex
 	inflight map[string]bool // lane-prefixed repo ID -> queued or running
 	closed   bool
-	wg       stdsync.WaitGroup
+	draining bool              // Drain started: no new runs, requests still recorded
+	wg       stdsync.WaitGroup // enqueues and sweep passes
+	runs     stdsync.WaitGroup // run goroutines; no Add once draining or closed
+	// runCtx is every run's parent context. Drain cancels it with
+	// errShutdown when its wait ends, and the worker then ends the run
+	// with OutcomeRestore (issue #342).
+	runCtx     context.Context
+	cancelRuns context.CancelCauseFunc
 
 	sweepMu  stdsync.Mutex // serializes passes; guards cursor
 	cursor   string
@@ -141,8 +148,10 @@ var _ Queue = (*LocalScheduler)(nil)
 func NewLocalScheduler(lanes LocalLanes, org string, runSync, runPush func(ctx context.Context, job Job) error, logger *slog.Logger) *LocalScheduler {
 	assertf(lanes != nil && org != "" && runSync != nil && runPush != nil && logger != nil,
 		"NewLocalScheduler: missing dependency")
+	runCtx, cancelRuns := context.WithCancelCause(context.Background())
 	return &LocalScheduler{lanes: lanes, org: org, runSync: runSync, runPush: runPush, logger: logger,
-		slots: make(chan struct{}, localSweepSlots), inflight: make(map[string]bool)}
+		slots: make(chan struct{}, localSweepSlots), inflight: make(map[string]bool),
+		runCtx: runCtx, cancelRuns: cancelRuns}
 }
 
 // EnqueueSync records a durable pull request, then offers a run. It serves
@@ -202,9 +211,10 @@ var errSchedulerClosed = errors.New("sync queue is closed")
 
 // offer starts a run for job's lane unless one is already queued or
 // running (that run, or the next sweep, covers the durable request). Sweep
-// offers also need a free slot; they are dropped otherwise. It fails only
-// when the scheduler closed: the durable request then waits for the next
-// process's sweep.
+// offers also need a free slot; they are dropped otherwise, and every offer
+// is dropped once Drain started. It fails only when the scheduler closed.
+// A dropped or failed offer leaves the durable request for a later sweep,
+// in this process or the next.
 func (s *LocalScheduler) offer(job Job, push, fromSweep bool) error {
 	assertf(job.Org != "" && job.RepoID != "", "offer: incomplete job %+v", job)
 	key, run := "pull:"+job.RepoID, s.runSync
@@ -216,7 +226,7 @@ func (s *LocalScheduler) offer(job Job, push, fromSweep bool) error {
 	if s.closed {
 		return errSchedulerClosed
 	}
-	if s.inflight[key] {
+	if s.draining || s.inflight[key] {
 		return nil
 	}
 	if fromSweep && !push && s.inflight["push:"+job.RepoID] {
@@ -233,7 +243,7 @@ func (s *LocalScheduler) offer(job Job, push, fromSweep bool) error {
 		}
 	}
 	s.inflight[key] = true
-	s.wg.Go(func() {
+	s.runs.Go(func() {
 		defer func() {
 			s.mu.Lock()
 			delete(s.inflight, key)
@@ -242,7 +252,7 @@ func (s *LocalScheduler) offer(job Job, push, fromSweep bool) error {
 				<-s.slots
 			}
 		}()
-		if err := run(context.Background(), job); err != nil {
+		if err := run(s.runCtx, job); err != nil {
 			s.logger.Warn("local sync run finished with error", "lane", key, "err", err)
 		}
 	})
@@ -255,7 +265,7 @@ func (s *LocalScheduler) offer(job Job, push, fromSweep bool) error {
 // run.
 func (s *LocalScheduler) SweepOnce(ctx context.Context) error {
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.draining {
 		s.mu.Unlock()
 		return nil
 	}
@@ -323,10 +333,59 @@ func (s *LocalScheduler) Stop() {
 	}
 }
 
+// errShutdown is the cause Drain cancels runs with. A run whose context
+// carries it ends with OutcomeRestore instead of a counted failure.
+var errShutdown = errors.New("server shutting down")
+
+// shutdownAborted reports whether Drain cancelled the run behind ctx.
+func shutdownAborted(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), errShutdown)
+}
+
+// Drain prepares shutdown while the loopback listener still serves (issue
+// #342). It stops the sweep and new runs, waits up to wait for runs in
+// flight, then cancels the remaining runs with errShutdown and waits for
+// them to record that. Enqueues still record their durable request; its
+// run is left to the next process's sweep. A cancelled run ends with
+// OutcomeRestore and keeps its request, so correctness does not depend on
+// wait. ctx bounds the whole drain: a run still unfinished when it ends is
+// left to Close, and if the process dies first, its claim expires with its
+// lease.
+func (s *LocalScheduler) Drain(ctx context.Context, wait time.Duration) {
+	assertf(wait >= 0, "Drain: negative wait %v", wait)
+	s.mu.Lock()
+	s.draining = true
+	stop := s.stop
+	s.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	s.sweeping.Wait()
+	done := make(chan struct{})
+	go func() {
+		s.runs.Wait() // no run starts once draining is set
+		close(done)
+	}()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	s.cancelRuns(errShutdown)
+	select {
+	case <-done: // every cancelled run has written its restore
+	case <-ctx.Done():
+	}
+}
+
 // Close stops the scheduler and waits for in-flight runs. After it returns
 // the scheduler makes no store calls.
 func (s *LocalScheduler) Close() {
 	s.Stop()
 	s.sweeping.Wait()
-	s.wg.Wait() // in-flight runs and sweep passes
+	s.wg.Wait()   // enqueues and sweep passes
+	s.runs.Wait() // runs, including any Drain cancelled
 }

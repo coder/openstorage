@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	stdsync "sync"
+	"time"
 
 	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/sync"
@@ -245,6 +246,18 @@ func (q *Local) runRepack(repo string) {
 			return
 		}
 		q.mu.Unlock()
+	}
+}
+
+// DrainSyncRuns runs the scheduled sync queue's shutdown drain (issue #342,
+// sync.LocalScheduler.Drain) while serve's listener still takes loopback
+// pushes. Deliveries and repacks keep running until Close. It does nothing
+// for the in-process queue.
+func (q *Local) DrainSyncRuns(ctx context.Context, wait time.Duration) {
+	if d, ok := q.syncq.(interface {
+		Drain(context.Context, time.Duration)
+	}); ok {
+		d.Drain(ctx, wait)
 	}
 }
 
