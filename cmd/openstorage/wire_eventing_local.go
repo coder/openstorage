@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/events"
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/jobs"
 	"github.com/coder/openstorage/internal/meta"
 	upsync "github.com/coder/openstorage/internal/sync"
@@ -21,9 +22,15 @@ const localSweepInterval = time.Second
 // a sweep replaces boot recovery and the process-local retry timers, and
 // explicit enqueues record their request before offering a run. S3WAL
 // keeps the in-process queue with boot recovery (issue #335).
-func buildLocalSyncQueue(ms meta.Store, org string, worker *upsync.Worker, deliverer *events.Deliverer, repack *jobs.Repacker, logger *slog.Logger) (jobs.Queue, func()) {
+func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Worker, deliverer *events.Deliverer, repack *jobs.Repacker, logger *slog.Logger) (jobs.Queue, func()) {
 	if lanes, ok := upsync.MetaLocalLanes(ms); ok {
+		assertf(cacheDir != "", "buildLocalSyncQueue: the publication wait needs the cache directory")
 		worker.Local = lanes
+		// Git-surface hooks record intent after the authority CAS, before
+		// receive-pack publishes the cache ref: runs wait for publication.
+		worker.WaitPublication = func(ctx context.Context, repoID string) error {
+			return githttp.WaitForPushPublication(ctx, cacheDir, repoID)
+		}
 		sched := upsync.NewLocalScheduler(lanes, org, worker.Run, worker.RunPush, logger)
 		queue := jobs.NewLocalScheduled(deliverer, sched, repack, logger)
 		// The first pass waits for the loopback listener, like the boot

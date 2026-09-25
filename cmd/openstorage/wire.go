@@ -366,7 +366,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// schedule one more fold when the count is still at/above it.
 	repacker.FollowUpThreshold = repackThreshold
 
-	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, lfsReclaimSchedule, absenceSchedule, repacker, webhookAllowPrivate, syncEgress, logger)
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, cacheDir, key, schedule, lfsReclaimSchedule, absenceSchedule, repacker, webhookAllowPrivate, syncEgress, logger)
 	if err != nil {
 		// The reconcile ticker predates eventing setup (Codex round 104):
 		// failing without stopping it leaks an hourly ref-store query loop

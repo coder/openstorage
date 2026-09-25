@@ -1011,3 +1011,93 @@ func TestLocalScheduleMirrorBackAfterPushLifecycle(t *testing.T) {
 			pushDone, pullStarted, f.wf.rec.list())
 	}
 }
+
+// TestLocalSchedulePublicationFence (C6 unit half, C5 failed wait): a local
+// run waits for the claimed repo's cache publication after its claim and
+// before its snapshot and started event. A failed wait restores the
+// consumed request (force and attempt kept, due after a short delay),
+// emits nothing, and counts no run.
+func TestLocalSchedulePublicationFence(t *testing.T) {
+	t.Run("push waits after the claim, before the started event", func(t *testing.T) {
+		f := newLocalSchedFixture(t)
+		up := newHTTPUpstream(t)
+		bare := up.addRepo(t, "own", "p1")
+		repo, head := f.addRepo(t, "p1", up.host())
+		entered, release := make(chan struct{}), make(chan struct{})
+		f.wf.worker.WaitPublication = func(ctx context.Context, repoID string) error {
+			if repoID == repo {
+				close(entered)
+				<-release
+			}
+			return nil
+		}
+		if err := f.ms.RequestPush(t.Context(), repo, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.sched.SweepOnce(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+		if r := f.row(t, repo); !r.PushSyncing || len(f.pushEvents(repo)) != 0 {
+			t.Fatalf("while waiting: row %+v, %d events; want a live claim and no events", r, len(f.pushEvents(repo)))
+		}
+		close(release)
+		f.idle(t)
+		assertPushTypes(t, f.pushEvents(repo), EventSyncStarted, EventSyncSucceeded)
+		if got := upstreamHead(t, bare); got != head {
+			t.Fatalf("upstream main = %q, want %q", got, head)
+		}
+	})
+	t.Run("failed push wait restores force and attempt", func(t *testing.T) {
+		f := newLocalSchedFixture(t)
+		up := newHTTPUpstream(t)
+		bare := up.addRepo(t, "own", "p2")
+		repo, _ := f.addRepo(t, "p2", up.host())
+		before := upstreamHead(t, bare)
+		up.down(t)
+		if err := f.ms.RequestPush(t.Context(), repo, true); err != nil {
+			t.Fatal(err)
+		}
+		f.sweep(t) // transient failure: attempt 1, force kept
+		f.advance(time.Minute)
+		f.wf.worker.WaitPublication = func(context.Context, string) error {
+			return errors.New("publication unverified")
+		}
+		f.sweep(t) // the retry claims, then its wait fails
+		r := f.row(t, repo)
+		attempt, due := f.readSchedule(t, repo)
+		if r.PushSyncing || r.PushPending != 2 || r.PushRunCount != 1 || attempt != 1 ||
+			due != f.now().Add(localPublicationRetryDelay).UnixNano() || len(f.pushEvents(repo)) != 2 {
+			t.Fatalf("after a failed wait: row %+v attempt %d due %d events %d; want force kept, attempt 1, due +%v, no new run",
+				r, attempt, due, len(f.pushEvents(repo)), localPublicationRetryDelay)
+		}
+		if got := upstreamHead(t, bare); got != before {
+			t.Fatalf("upstream changed after a failed wait: %q", got)
+		}
+	})
+	t.Run("failed pull wait restores the request", func(t *testing.T) {
+		f := newLocalSchedFixture(t)
+		seedUpstream(t, f.wf.upstreamDir, "own", "p3")
+		repo, _ := f.addRepo(t, "p3", "file://"+f.wf.upstreamDir)
+		f.wf.worker.WaitPublication = func(context.Context, string) error {
+			return errors.New("publication unverified")
+		}
+		if err := f.ms.RequestSync(t.Context(), repo); err != nil {
+			t.Fatal(err)
+		}
+		f.sweep(t)
+		if r := f.row(t, repo); r.Syncing || !r.SyncPending || r.RunCount != 0 || len(f.wf.rec.list()) != 0 {
+			t.Fatalf("after a failed wait: row %+v events %d; want the request kept and no run", r, len(f.wf.rec.list()))
+		}
+		f.wf.worker.WaitPublication = func(context.Context, string) error { return nil }
+		f.sweep(t) // not due yet
+		if r := f.row(t, repo); r.RunCount != 0 {
+			t.Fatalf("restored pull ran before its delay: %+v", r)
+		}
+		f.advance(localPublicationRetryDelay)
+		f.sweep(t)
+		if r := f.row(t, repo); r.SuccessCount != 1 || r.SyncPending {
+			t.Fatalf("restored pull did not run after its delay: %+v", r)
+		}
+	})
+}

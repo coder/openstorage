@@ -19,7 +19,9 @@ URL scheme** (the same dispatch as `meta.Open`/`ref.Open`), with asymmetric sema
   *synchronously* with bounded attempts (3) before the hook exits — the subprocess IS
   the queue — and git-surface pushes do **not** schedule upstream syncs (API writes
   still do). Accepted gap, consistent with ADR-27's durability trade-off: a missed sync
-  re-enqueues on the next API write or `pull-upstream`.
+  re-enqueues on the next API write or `pull-upstream`. Superseded for SQLite by
+  [ADR-50](050-local-scheduling-state-is-row-owned.md): the hook records durable
+  intent in the schedule row. The gap remains for S3WAL (#335).
 
 Failure stance is fail-open: if the hook cannot open the meta store or build the queue,
 eventing is disabled for that push rather than the push denied — same reasoning as
