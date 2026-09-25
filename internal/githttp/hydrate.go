@@ -73,7 +73,7 @@ var hookVerifyBarrier atomic.Pointer[func(path string)]
 
 // runGit executes git with args, returning stdout only. Stderr is captured
 // separately and surfaced in the error text: git warnings on stderr must
-// never contaminate parsed stdout (e.g. for-each-ref in SyncRefs).
+// never contaminate parsed stdout (e.g. for-each-ref in syncRefsStreamed).
 func runGit(dir string, args ...string) (string, error) {
 	return runGitCtx(context.Background(), dir, args...)
 }
@@ -1163,8 +1163,7 @@ func (s *storeRefSeq) next() (string, string, bool, error) {
 	return e.Name, e.SHA, true, nil
 }
 
-// sliceRefSeq yields a pre-sorted in-memory ref set (the SyncRefs map
-// adapter and tests).
+// sliceRefSeq yields a pre-sorted in-memory ref set (tests).
 type sliceRefSeq struct {
 	names []string
 	shas  map[string]string
@@ -1286,7 +1285,7 @@ func (b *refCmdBatch) flush() error {
 	// per flush multiplies held-ref bytes by the flush count — a
 	// repo-scale hold overlapping a repo-scale sync re-parses gigabytes.
 	// The cache re-reads a hold file only when its (size, mtime) changes;
-	// hydration stays FAIL-OPEN on read errors, like loadPushHolds.
+	// hydration stays FAIL-OPEN on read errors (reservation fails closed).
 	if b.holds == nil {
 		b.holds = &pushHoldDirCache{dir: filepath.Join(b.repoPath, pushHoldDir)}
 	}
@@ -1489,26 +1488,6 @@ func syncRefsPassUpdates(ctx context.Context, repoPath string, store refSeq, bat
 	}
 	err = upds.flush()
 	return upds.skipped, err
-}
-
-// SyncRefs makes the local ref store match want exactly (the store wins):
-// updates changed refs, deletes locals that want does not know, and points
-// HEAD at headTarget (the repo's default branch per the meta row, qualified
-// by HeadTarget). Must run after HydratePacks so targets exist locally.
-// Callers holding an already-bounded ref set use this map form; Hydrate
-// streams pages straight from the ref store instead (issue #119) so a
-// repo's ref fanout never materializes in memory.
-func SyncRefs(repoPath string, want map[string]string, headTarget string) error {
-	names := make([]string, 0, len(want))
-	for name := range want {
-		names = append(names, name)
-	}
-	sort.Strings(names) // byte order, matching for-each-ref
-	newStore := func() refSeq { return &sliceRefSeq{names: names, shas: want} }
-	// Skipped push-held refs are invisible here by design: this map form
-	// publishes no generation marker, so a skip costs nothing to track.
-	_, err := syncRefsStreamed(context.Background(), repoPath, headTarget, newStore, syncRefsBatch)
-	return err
 }
 
 // updateRefStdin feeds commands to one `git update-ref --stdin` transaction.
@@ -2288,16 +2267,6 @@ type pushHoldSet struct{ names []string } // sorted ascending
 func newPushHoldSet(names []string) pushHoldSet {
 	sort.Strings(names)
 	return pushHoldSet{names: names}
-}
-
-// loadPushHolds snapshots repoPath's live holds for hydration, FAIL-OPEN
-// on read trouble (partial set): a missed hold only reopens the narrow
-// spurious-rejection window this machinery closes, and a serving-path sync
-// must not fail on hold-read hiccups. Reservation uses readPushHolds
-// directly and fails closed instead.
-func loadPushHolds(repoPath string) pushHoldSet {
-	s, _ := readPushHolds(filepath.Join(repoPath, pushHoldDir), "")
-	return s
 }
 
 // linkFile is os.Link behind a test seam (PR #195 round-14 P2: restore-

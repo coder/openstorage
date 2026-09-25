@@ -50,26 +50,34 @@ func localRefs(t *testing.T, repoPath string) map[string]string {
 	return refs
 }
 
-// A D/F rename (delete refs/heads/foo/bar, create refs/heads/foo) must
-// apply cleanly even when every batch is a separate update-ref transaction:
-// all deletions land strictly before any update, or git's files backend
-// rejects the create while the doomed loose ref still exists.
+// A D/F rename in either direction (refs/heads/foo/bar -> refs/heads/foo,
+// or refs/heads/foo -> refs/heads/foo/bar) must apply cleanly even when
+// every batch is a separate update-ref transaction: all deletions land
+// strictly before any update, or git's files backend rejects the create
+// while the doomed loose ref still exists.
 func TestSyncRefsStreamed_DFRenameDeletesFirst(t *testing.T) {
-	dir := initWorkRepo(t)
-	head := revParse(t, dir, "HEAD")
-	mustGit(t, dir, "update-ref", "refs/heads/foo/bar", head)
+	for name, tc := range map[string]struct{ local, remote string }{
+		"file replaces directory": {local: "refs/heads/foo/bar", remote: "refs/heads/foo"},
+		"directory replaces file": {local: "refs/heads/foo", remote: "refs/heads/foo/bar"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := initWorkRepo(t)
+			head := revParse(t, dir, "HEAD")
+			mustGit(t, dir, "update-ref", tc.local, head)
 
-	syncFromMap(t, dir, map[string]string{
-		"refs/heads/main": head,
-		"refs/heads/foo":  head,
-	}, "refs/heads/main", 1)
+			syncFromMap(t, dir, map[string]string{
+				"refs/heads/main": head,
+				tc.remote:         head,
+			}, "refs/heads/main", 1)
 
-	got := localRefs(t, dir)
-	if _, ok := got["refs/heads/foo/bar"]; ok {
-		t.Fatalf("refs/heads/foo/bar survived the rename sync: %v", got)
-	}
-	if got["refs/heads/foo"] != head {
-		t.Fatalf("refs/heads/foo = %q, want %q", got["refs/heads/foo"], head)
+			got := localRefs(t, dir)
+			if _, ok := got[tc.local]; ok {
+				t.Fatalf("%s survived the rename sync: %v", tc.local, got)
+			}
+			if got[tc.remote] != head {
+				t.Fatalf("%s = %q, want %q", tc.remote, got[tc.remote], head)
+			}
+		})
 	}
 }
 

@@ -8,6 +8,9 @@ import (
 	"time"
 )
 
+// One key (repository) holds at most perKey slots; other keys still get
+// the rest, a waiter wakes as soon as a slot is released, and a cancelled
+// waiter gives up.
 func TestSlotsTryAcquireAndPerKeyShare(t *testing.T) {
 	s := NewSlots(3, 2, 0)
 	if !s.TryAcquire("a") || s.Acquire(context.Background(), "a") != nil {
@@ -28,10 +31,27 @@ func TestSlotsTryAcquireAndPerKeyShare(t *testing.T) {
 	}
 	w := NewSlots(1, 1, time.Minute)
 	w.TryAcquire("a")
+	got := make(chan error, 1)
+	start := time.Now()
+	go func() { got <- w.Acquire(context.Background(), "b") }()
+	time.Sleep(50 * time.Millisecond)
+	w.Release("a")
+	if err := <-got; err != nil {
+		t.Fatalf("waiter: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("waiter woke after %v, want right after the release", d)
+	}
+	// The pool is full again (b holds its only slot): a cancelled waiter
+	// must give up instead of waiting out the minute.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := w.Acquire(ctx, "b"); !errors.Is(err, context.Canceled) {
+	if err := w.Acquire(ctx, "a"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Acquire with a cancelled context = %v, want context.Canceled", err)
+	}
+	w.Release("b")
+	if w.InUse() != 0 {
+		t.Fatalf("in use = %d after releasing everything", w.InUse())
 	}
 }
 

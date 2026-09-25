@@ -14,44 +14,6 @@ import (
 	"github.com/coder/openstorage/internal/ref"
 )
 
-// SyncRefs must delete local refs that PG does not know about (PG wins).
-func TestSyncRefs_DeletesStaleLocalRef(t *testing.T) {
-	dir := initWorkRepo(t)
-	head := revParse(t, dir, "HEAD")
-	mustGit(t, dir, "branch", "stale")
-
-	if err := SyncRefs(dir, map[string]string{"refs/heads/main": head}, "refs/heads/main"); err != nil {
-		t.Fatalf("SyncRefs: %v", err)
-	}
-
-	out := mustGit(t, dir, "for-each-ref", "--format=%(refname) %(objectname)")
-	if strings.Contains(out, "refs/heads/stale") {
-		t.Fatalf("stale local ref survived sync:\n%s", out)
-	}
-	if !strings.Contains(out, "refs/heads/main "+head) {
-		t.Fatalf("refs/heads/main missing or moved:\n%s", out)
-	}
-}
-
-// SyncRefs must point HEAD at the given target (issue #18: the default
-// branch is per-repo state from the meta row, no longer hardcoded main).
-func TestSyncRefs_PointsHeadAtTarget(t *testing.T) {
-	dir := initWorkRepo(t)
-	head := revParse(t, dir, "HEAD")
-
-	if err := SyncRefs(dir, map[string]string{
-		"refs/heads/main": head,
-		"refs/heads/dev":  head,
-	}, "refs/heads/dev"); err != nil {
-		t.Fatalf("SyncRefs: %v", err)
-	}
-
-	out := mustGit(t, dir, "symbolic-ref", "HEAD")
-	if got := strings.TrimSpace(out); got != "refs/heads/dev" {
-		t.Fatalf("HEAD = %q, want refs/heads/dev", got)
-	}
-}
-
 // HeadTarget qualifies short branch names and passes refs/-prefixed values
 // through verbatim (openapi.yaml PATCH repo).
 func TestHeadTarget(t *testing.T) {
@@ -60,31 +22,6 @@ func TestHeadTarget(t *testing.T) {
 	}
 	if got := HeadTarget("refs/heads/dev"); got != "refs/heads/dev" {
 		t.Fatalf("HeadTarget(refs/heads/dev) = %q, want refs/heads/dev", got)
-	}
-}
-
-// A ref replaced across a directory/file boundary (refs/heads/foo deleted,
-// refs/heads/foo/bar created in PG) must sync: deletions have to run before
-// updates and in their own update-ref transaction, because git's files
-// backend rejects the delete+create pair in one transaction.
-func TestSyncRefs_DirectoryFileConflict(t *testing.T) {
-	dir := initWorkRepo(t)
-	head := revParse(t, dir, "HEAD")
-	mustGit(t, dir, "branch", "foo")
-
-	if err := SyncRefs(dir, map[string]string{
-		"refs/heads/main":    head,
-		"refs/heads/foo/bar": head,
-	}, "refs/heads/main"); err != nil {
-		t.Fatalf("SyncRefs: %v", err)
-	}
-
-	out := mustGit(t, dir, "for-each-ref", "--format=%(refname) %(objectname)")
-	if strings.Contains(out, "refs/heads/foo "+head) {
-		t.Fatalf("refs/heads/foo survived sync:\n%s", out)
-	}
-	if !strings.Contains(out, "refs/heads/foo/bar "+head) {
-		t.Fatalf("refs/heads/foo/bar missing:\n%s", out)
 	}
 }
 

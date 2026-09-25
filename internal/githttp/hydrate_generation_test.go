@@ -558,7 +558,7 @@ func TestHydrate_MarkerWrittenOnlyAfterSuccess(t *testing.T) {
 		t.Fatalf("Hydrate err = %v, want refsErr-only failure", err)
 	}
 	if refsErr == nil {
-		t.Fatal("SyncRefs must fail for a missing object")
+		t.Fatal("ref sync must fail for a missing object")
 	}
 	if _, err := os.Stat(filepath.Join(repoPath, generationMarker)); !os.IsNotExist(err) {
 		t.Fatalf("refsErr hydrate left a marker (stat err %v)", err)
