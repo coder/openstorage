@@ -194,13 +194,12 @@ github.com/docker/go-units
 # github.com/dustin/go-humanize v1.1.0
 ## explicit; go 1.21
 github.com/dustin/go-humanize
-# github.com/ebitengine/purego v0.10.1
-## explicit; go 1.18
+# github.com/ebitengine/purego v0.11.1
+## explicit; go 1.25.0
 github.com/ebitengine/purego
 github.com/ebitengine/purego/internal/cgo
 github.com/ebitengine/purego/internal/fakecgo
 github.com/ebitengine/purego/internal/strings
-github.com/ebitengine/purego/internal/xreflect
 # github.com/felixge/httpsnoop v1.1.0
 ## explicit; go 1.25
 github.com/felixge/httpsnoop
@@ -316,7 +315,7 @@ github.com/lestrrat-go/jwx/v3/transform
 # github.com/lestrrat-go/option/v2 v2.0.0
 ## explicit; go 1.23
 github.com/lestrrat-go/option/v2
-# github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e
+# github.com/lufia/plan9stats v0.0.0-20260802145828-341c2f0c90b5
 ## explicit; go 1.21
 github.com/lufia/plan9stats
 # github.com/magiconair/properties v1.18.11
@@ -393,7 +392,7 @@ github.com/opencontainers/go-digest
 ## explicit; go 1.18
 github.com/opencontainers/image-spec/specs-go
 github.com/opencontainers/image-spec/specs-go/v1
-# github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55
+# github.com/power-devops/perfstat v0.0.0-20260916203055-22a1a467d9f0
 ## explicit; go 1.14
 github.com/power-devops/perfstat
 # github.com/prometheus/client_golang v1.24.1
@@ -481,7 +480,7 @@ github.com/segmentio/asm/cpu/arm64
 github.com/segmentio/asm/cpu/cpuid
 github.com/segmentio/asm/cpu/x86
 github.com/segmentio/asm/internal/unsafebytes
-# github.com/shirou/gopsutil/v4 v4.26.6
+# github.com/shirou/gopsutil/v4 v4.26.8
 ## explicit; go 1.24.0
 github.com/shirou/gopsutil/v4/common
 github.com/shirou/gopsutil/v4/cpu
