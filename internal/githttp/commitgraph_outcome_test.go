@@ -104,6 +104,24 @@ func TestRefreshCommitGraph_WrittenIsSilent(t *testing.T) {
 	}
 }
 
+// A full hydrate of a repository with no refs is still one refresh: it
+// counts once as written (nothing to graph is "already current") and,
+// like every written, logs nothing.
+func TestRefreshCommitGraph_EmptyRepoCountsWritten(t *testing.T) {
+	buf := captureLog(t)
+	labels := map[string]string{"outcome": string(outcomeWritten)}
+	before := metrics.Value("openstorage_commit_graph_refresh_total", labels)
+	if got := refreshCommitGraph(t.Context(), t.TempDir(), testSlotKey, newRefTips()); got != outcomeWritten {
+		t.Fatalf("outcome = %s, want written", got)
+	}
+	if got := metrics.Value("openstorage_commit_graph_refresh_total", labels) - before; got != 1 {
+		t.Fatalf("written counter delta = %v, want 1", got)
+	}
+	if lines := refreshLines(buf); len(lines) != 0 {
+		t.Fatalf("empty-repo refresh logged %q", lines)
+	}
+}
+
 func TestRefreshCommitGraph_SkippedTipCapLogged(t *testing.T) {
 	repoPath, _ := newGraphRepo(t, 5)
 	old := commitGraphMaxTips

@@ -160,7 +160,7 @@ func recordCommitGraphOutcome(repoPath string, o commitGraphOutcome, detail stri
 // refreshCommitGraph adds the commits reachable from tips (the distinct
 // SHAs the sync that just completed applied) to repoPath's split
 // commit-graph and reports how it ended (recordCommitGraphOutcome). A
-// repo with no refs records nothing. The caller must hold the repo's
+// repo with no refs reports written: there is nothing to graph. The caller must hold the repo's
 // hydrate lock: it serializes every commit-graph writer for the repo on
 // this node. Never fails the caller: the outcome is informational.
 func refreshCommitGraph(ctx context.Context, repoPath, slotKey string, tips *refTips) commitGraphOutcome {
@@ -171,7 +171,7 @@ func refreshCommitGraph(ctx context.Context, repoPath, slotKey string, tips *ref
 			fmt.Sprintf("more than %d distinct ref tips (reads stay correct, only slower)", commitGraphMaxTips))
 	}
 	if len(tips.set) == 0 {
-		return outcomeWritten // no refs, nothing to graph
+		return recordCommitGraphOutcome(repoPath, outcomeWritten, "") // no refs: nothing to graph, already current
 	}
 	// Join the shared git admission pool (#313's, gitlimit.ReadSlots) as
 	// maintenance: try-only, because the caller holds the hydrate lock, and
