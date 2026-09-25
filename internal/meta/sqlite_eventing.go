@@ -470,12 +470,24 @@ func (s *SQLite) PendingSyncRepoIDs(ctx context.Context) ([]string, error) {
 // claimed=false with the current row when an unexpired run is in flight;
 // ErrNotFound when detached.
 func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, string, error) {
+	c, err := s.beginSync(ctx, repoID, holder, lease, false)
+	if err != nil {
+		return RepoUpstream{}, false, "", err
+	}
+	return c.Up, c.Claimed, c.StolenFrom, nil
+}
+
+// beginSync is TryBeginSync's transaction. With requireDue (the local
+// schedule's ClaimDueSync, issue #266) an unclaimed lane is claimable only
+// when sync_pending is set and sync_due has passed; claimed lanes follow
+// the unchanged lease/steal/legacy rules.
+func (s *SQLite) beginSync(ctx context.Context, repoID, holder string, lease time.Duration, requireDue bool) (LocalClaim, error) {
 	assertf(repoID != "", "TryBeginSync: empty repo id")
 	assertf(holder != "", "TryBeginSync: empty holder")
 	assertf(lease > 0, "TryBeginSync: non-positive lease %v", lease)
 	nowNanos, _ := s.nowNano()
 	var up RepoUpstream
-	var claimed bool
+	var claimed, busy bool
 	var stolenFrom string
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		prev, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
@@ -491,7 +503,7 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease 
 		// unconditional.
 		now := time.Unix(0, nowNanos)
 		if prev.Syncing && prev.SyncClaimExpiresAt.After(now) {
-			up = prev // unexpired claim in flight: refused, current row
+			up, busy = prev, true // unexpired claim in flight: refused, current row
 			return nil
 		}
 		if prev.Syncing && prev.SyncClaimHolder == LegacyClaimHolder && !legacyStealEnabled() {
@@ -499,8 +511,18 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease 
 			// paused pre-lease binary, which carries none of the holder
 			// guards — stealing needs the operator's drained-fleet
 			// assertion (EnvSyncStealLegacy).
-			up = prev
+			up, busy = prev, true
 			return nil
+		}
+		if requireDue && !prev.Syncing {
+			sched, err := readLocalScheduleTx(ctx, tx, repoID)
+			if err != nil {
+				return err
+			}
+			if !prev.SyncPending || sched.syncDue > nowNanos {
+				up = prev // no durable work due: refused, nothing written
+				return nil
+			}
 		}
 		reread := func() error {
 			row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
@@ -521,6 +543,7 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease 
 				LegacyClaimHolder, nowNanos+lease.Nanoseconds(), repoID); err != nil {
 				return err
 			}
+			busy = true
 			return reread()
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -542,9 +565,10 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease 
 		return nil
 	})
 	if err != nil {
-		return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: %w", repoID, err)
+		return LocalClaim{}, fmt.Errorf("begin sync for repo %q: %w", repoID, err)
 	}
-	return up, claimed, stolenFrom, nil
+	assertf(!(claimed && busy), "begin sync for %q: claimed and busy", repoID)
+	return LocalClaim{Up: up, Claimed: claimed, Busy: busy, StolenFrom: stolenFrom}, nil
 }
 
 // FinishSync completes the run claimed by holder: increments RunCount (and
@@ -663,13 +687,26 @@ func (s *SQLite) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
 // the dead claim's persisted force mandate (push_claim_force), so a crash
 // between claim and finish cannot downgrade an accepted forced request.
 func (s *SQLite) TryBeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, bool, string, error) {
+	c, err := s.beginPush(ctx, repoID, holder, lease, false)
+	if err != nil {
+		return RepoUpstream{}, false, false, "", err
+	}
+	return c.Up, c.Claimed, c.Force, c.StolenFrom, nil
+}
+
+// beginPush is TryBeginPush's transaction. With requireDue (the local
+// schedule's ClaimDuePush, issue #266) an unclaimed lane is claimable only
+// when push_pending is set and push_due has passed; an expired claim is
+// stolen as before. The claimed run's attempt stays in the row.
+func (s *SQLite) beginPush(ctx context.Context, repoID, holder string, lease time.Duration, requireDue bool) (LocalClaim, error) {
 	assertf(repoID != "", "TryBeginPush: empty repo id")
 	assertf(holder != "", "TryBeginPush: empty holder")
 	assertf(lease > 0, "TryBeginPush: non-positive lease %v", lease)
 	nowNanos, _ := s.nowNano()
 	var up RepoUpstream
-	var claimed, force bool
+	var claimed, force, busy bool
 	var stolenFrom string
+	var attempt int
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		prev, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
 			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
@@ -681,8 +718,19 @@ func (s *SQLite) TryBeginPush(ctx context.Context, repoID, holder string, lease 
 		}
 		now := time.Unix(0, nowNanos)
 		if prev.PushSyncing && prev.PushClaimExpiresAt.After(now) {
-			up = prev // unexpired claim in flight: refused, current row
+			up, busy = prev, true // unexpired claim in flight: refused, current row
 			return nil
+		}
+		if requireDue {
+			sched, err := readLocalScheduleTx(ctx, tx, repoID)
+			if err != nil {
+				return err
+			}
+			if !prev.PushSyncing && (prev.PushPending == 0 || sched.pushDue > nowNanos) {
+				up = prev // no durable work due: refused, nothing written
+				return nil
+			}
+			attempt = sched.pushAttempt
 		}
 		force = prev.PushPending == 2 || (prev.PushSyncing && prev.PushClaimForce)
 		forceInt := 0
@@ -695,6 +743,17 @@ func (s *SQLite) TryBeginPush(ctx context.Context, repoID, holder string, lease 
 			 WHERE repo_id = ?`,
 			holder, nowNanos+lease.Nanoseconds(), forceInt, repoID); err != nil {
 			return err
+		}
+		if requireDue {
+			// While a scheduled run holds the lane, push_due carries its
+			// claim time (never 0). RequestPushNow resets it to 0, which
+			// marks an explicit request made during the run; the run's
+			// retry/restore then keeps that request due now.
+			assertf(nowNanos > 0, "claim time %d is not positive", nowNanos)
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE repo_upstreams SET push_due = ? WHERE repo_id = ?`, nowNanos, repoID); err != nil {
+				return err
+			}
 		}
 		row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
 			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
@@ -711,9 +770,10 @@ func (s *SQLite) TryBeginPush(ctx context.Context, repoID, holder string, lease 
 		return nil
 	})
 	if err != nil {
-		return RepoUpstream{}, false, false, "", fmt.Errorf("begin push for repo %q: %w", repoID, err)
+		return LocalClaim{}, fmt.Errorf("begin push for repo %q: %w", repoID, err)
 	}
-	return up, claimed, force, stolenFrom, nil
+	assertf(!(claimed && busy), "begin push for %q: claimed and busy", repoID)
+	return LocalClaim{Up: up, Claimed: claimed, Busy: busy, Force: claimed && force, Attempt: attempt, StolenFrom: stolenFrom}, nil
 }
 
 // FinishPush is FinishSync on the push_* lane: holder-guarded completion,
