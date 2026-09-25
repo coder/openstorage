@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +47,40 @@ func init() {
 		_, ok := signatureAlgorithms[name]
 		assertf(ok, "allowed algorithm %q has no jwa mapping", name)
 	}
+}
+
+// errNonCanonicalSegment marks a token rejected because a segment is not
+// canonical unpadded base64url (issue #312).
+var errNonCanonicalSegment = errors.New("jwt segment is not canonical unpadded base64url")
+
+// strictRawURL rejects '=' padding, the standard alphabet, and non-zero
+// padding bits. Like every encoding/base64 decoder it still skips CR/LF,
+// which is why checkCanonicalSegments also compares the re-encoding.
+var strictRawURL = base64.RawURLEncoding.Strict()
+
+// checkCanonicalSegments requires every segment of a compact JWS to be
+// non-empty, canonical unpadded base64url (RFC 7515 §2; RFC 4648 §3.5 lets
+// decoders reject non-zero padding bits). jwx's default decoder is lenient
+// (it guesses std/url, padded/raw, is not Strict), and jws.Verify rebuilds
+// the signing input by re-encoding the decoded header and payload, so
+// without this check one signed token had many accepted spellings (issue
+// #312). This does not make token text unique: an ECDSA signature (r, s)
+// has a valid twin (r, n-s) with different bytes. Never key caches, replay
+// or deny lists on the raw token string.
+func checkCanonicalSegments(token string) error {
+	segs := strings.Split(token, ".")
+	assertf(len(segs) == 3, "checkCanonicalSegments: %d segments; caller must check the compact shape", len(segs))
+	for i, seg := range segs {
+		name := [...]string{"header", "payload", "signature"}[i]
+		if seg == "" {
+			return fmt.Errorf("jwt %s: %w", name, errNonCanonicalSegment)
+		}
+		raw, err := strictRawURL.DecodeString(seg)
+		if err != nil || base64.RawURLEncoding.EncodeToString(raw) != seg {
+			return fmt.Errorf("jwt %s: %w", name, errNonCanonicalSegment)
+		}
+	}
+	return nil
 }
 
 // KeySource resolves an org's registered PEM public key blocks by org name
@@ -115,6 +150,10 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	// front keeps the single-signature/protected-header assumptions below.
 	if strings.Count(token, ".") != 2 {
 		return nil, errors.New("jwt must be a compact JWS (header.payload.signature)")
+	}
+	// Check the original text before any parsing; never normalize and retry.
+	if err := checkCanonicalSegments(token); err != nil {
+		return nil, err
 	}
 	msg, err := jws.Parse([]byte(token))
 	if err != nil {
