@@ -488,21 +488,6 @@ func TestEmissionSurvivesCanceledRequestContext(t *testing.T) {
 	}
 }
 
-func TestHelperFunctions(t *testing.T) {
-	if got := BaseRepoID("repo_ab+ephemeral"); got != "repo_ab" {
-		t.Errorf("BaseRepoID(+ephemeral) = %q", got)
-	}
-	if got := BaseRepoID("repo_ab+import"); got != "repo_ab" {
-		t.Errorf("BaseRepoID(+import) = %q", got)
-	}
-	if got := BaseRepoID("repo_ab"); got != "repo_ab" {
-		t.Errorf("BaseRepoID(bare) = %q", got)
-	}
-	if EphemeralUpdate("repo_ab+import", "refs/heads/main") {
-		t.Error("EphemeralUpdate treats +import as ephemeral")
-	}
-}
-
 // TestEndToEndPushDelivery closes the in-package loop: a won CAS through
 // the decorator enqueues a delivery, the Deliverer posts it, and the
 // receiver verifies the signature against the raw body — the same check

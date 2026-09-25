@@ -172,17 +172,28 @@ func TestPushHoldSet_CoversAndConflicts(t *testing.T) {
 	}
 }
 
+// readHolds snapshots repoPath's live push holds with one uncached
+// pushHoldDirCache load, the parser hydration and reservation share.
+func readHolds(t *testing.T, repoPath string) pushHoldSet {
+	t.Helper()
+	s, err := readPushHolds(filepath.Join(repoPath, pushHoldDir), "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	return s
+}
+
 // TestTouchPushHold_RestoresFreshness: the hook-side refresh keeps a hold
 // live past the TTL for as long as its owner runs.
 func TestTouchPushHold_RestoresFreshness(t *testing.T) {
 	dir := t.TempDir()
 	holdPath := mintHold(t, dir, "refs/heads/x")
 	expireHold(t, holdPath)
-	if loadPushHolds(dir).covers("refs/heads/x") {
+	if readHolds(t, dir).covers("refs/heads/x") {
 		t.Fatal("expired hold still live")
 	}
 	touchPushHold(holdPath)
-	if !loadPushHolds(dir).covers("refs/heads/x") {
+	if !readHolds(t, dir).covers("refs/heads/x") {
 		t.Fatal("touched hold not live again")
 	}
 }
@@ -455,7 +466,7 @@ func TestPushHoldReaders_SkipUnreservedSidecar(t *testing.T) {
 	if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, "refs/heads/denied"), nil, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	holds := loadPushHolds(dir)
+	holds := readHolds(t, dir)
 	if !holds.covers("refs/heads/held") {
 		t.Fatal("real hold not loaded")
 	}
@@ -846,7 +857,7 @@ func TestRemovePushHolds(t *testing.T) {
 	if err := removePushHolds(holdPath, []string{"refs/heads/b"}); err != nil {
 		t.Fatalf("removePushHolds: %v", err)
 	}
-	holds := loadPushHolds(dir)
+	holds := readHolds(t, dir)
 	for name, want := range map[string]bool{
 		"refs/heads/a": true,
 		"refs/heads/b": false,
