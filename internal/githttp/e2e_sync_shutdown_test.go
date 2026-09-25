@@ -1,17 +1,19 @@
 package githttp
 
-// Local-lane acceptance for issue #342: SIGTERM while a local-schedule
-// pull is in flight must not use up the pull's request. Before the fix,
-// serve stopped its listener first; the run then finished its upstream
-// fetch, failed its loopback push to this process's own listener, and the
-// failed run consumed the request. Now serve drains the scheduler before
-// the listener stops, and a run cancelled by that drain keeps its request
-// (OutcomeRestore, ADR-50), so the next boot completes it.
+// Acceptance for issues #342 (SQLite) and #343 (PostgreSQL/River):
+// SIGTERM while a pull is in flight must not use up the pull's request.
+// Before the fixes, serve stopped its listener first; the run then finished
+// its upstream fetch, failed its loopback push to this process's own
+// listener, and the failed run consumed the request. Now serve drains its
+// sync runs before the listener stops, and a run cancelled by that drain
+// keeps its request, so the next boot completes it.
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -19,8 +21,42 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
+
+// privateDatabase returns a database URL no other serve process in the lane
+// uses: the lane's shared nodes run their own sync workers (SQLite sweeps,
+// River workers) and would otherwise pick up or steal the run. On
+// PostgreSQL it is a fresh database on the lane's server.
+func privateDatabase(t *testing.T, dataDir string) string {
+	t.Helper()
+	switch testBackend {
+	case backendLocal:
+		return "sqlite://" + filepath.Join(dataDir, "codestorage.db")
+	case backendPG:
+		conn, err := pgx.Connect(t.Context(), dbURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close(t.Context()) }()
+		name := fmt.Sprintf("shutdown_%d", time.Now().UnixNano())
+		if _, err := conn.Exec(t.Context(), "CREATE DATABASE "+name); err != nil {
+			t.Fatal(err)
+		}
+		u, err := url.Parse(dbURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.Path = "/" + name
+		return u.String()
+	default:
+		t.Skip("S3-WAL shutdown is issue #335")
+		return ""
+	}
+}
 
 // stallHandler holds every request while hold is set, until release closes
 // (then serves it) or the client goes away.
@@ -82,13 +118,9 @@ func waitForRepoMain(t *testing.T, st ref.RefStore, repoID, want string) {
 }
 
 func TestSync_ShutdownKeepsInFlightPullRequest(t *testing.T) {
-	if testBackend != backendLocal {
-		t.Skip("the durable local schedule is SQLite-only; PostgreSQL and S3-WAL shutdown is issue #343")
-	}
-	// A private database and blob store: the lane's shared nodes run their
-	// own schedule sweeps and would otherwise pick up (or steal) the run.
+	// A private database and blob store (see privateDatabase).
 	dataDir := t.TempDir()
-	dbURL := "sqlite://" + filepath.Join(dataDir, "codestorage.db")
+	dbURL := privateDatabase(t, dataDir)
 	env := []string{"OPENSTORAGE_PG_URL=" + dbURL, "OPENSTORAGE_S3_URL=file://" + filepath.Join(dataDir, "blobs")}
 	cacheDir := t.TempDir()
 
@@ -104,6 +136,11 @@ func TestSync_ShutdownKeepsInFlightPullRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
+	ms, err := meta.Open(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ms.Close)
 	repo := createSyncedRepo(t, node1, up, "shutdown-keeps-pull")
 	waitForRepoMain(t, st, repo, head)
 
@@ -120,6 +157,10 @@ func TestSync_ShutdownKeepsInFlightPullRequest(t *testing.T) {
 		t.Fatal("the pull run never reached the upstream")
 	}
 
+	held, err := ms.GetRepoUpstream(t.Context(), repo)
+	if err != nil || !held.Syncing {
+		t.Fatalf("held run's row: %+v, %v", held, err)
+	}
 	if err := node1.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("signal: %v", err)
 	}
@@ -142,6 +183,15 @@ func TestSync_ShutdownKeepsInFlightPullRequest(t *testing.T) {
 	close(stall.release)
 	if err := waitNodeExit(t, node1, 60*time.Second); err != nil {
 		t.Fatalf("serve did not exit cleanly on SIGTERM: %v", err)
+	}
+	// The cancelled run is not counted (so it emitted no repo.sync.failed)
+	// and left its request pending with the claim released.
+	kept, err := ms.GetRepoUpstream(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.RunCount != held.RunCount || !kept.SyncPending || kept.Syncing {
+		t.Fatalf("after shutdown: row %+v, want run_count %d, the request pending, no claim", kept, held.RunCount)
 	}
 
 	// The next boot's sweep completes the kept request.

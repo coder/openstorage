@@ -430,7 +430,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		msCleanup()
 	}
 	// drainRuns is serve's pre-listener-stop drain of scheduled sync runs
-	// (issue #342); only the SQLite local schedule has one.
+	// (issues #342, #343): the SQLite local schedule and River have one.
 	drainRuns := func(ctx context.Context, wait time.Duration) {
 		if d, ok := queue.(interface {
 			DrainSyncRuns(context.Context, time.Duration)

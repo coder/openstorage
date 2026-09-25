@@ -291,3 +291,54 @@ func (m *MemStore) FinishPush(_ context.Context, repoID, holder string, success 
 	m.upstreams[repoID] = up
 	return up, nil
 }
+
+var _ ShutdownRestorer = (*MemStore)(nil)
+
+// RestoreSync implements ShutdownRestorer with PG's semantics.
+func (m *MemStore) RestoreSync(_ context.Context, repoID, holder string) (Upstream, error) {
+	assertf(holder != "", "RestoreSync: empty holder")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	up, ok := m.upstreams[repoID]
+	if !ok {
+		return Upstream{}, ErrNotFound
+	}
+	if !up.Syncing {
+		return Upstream{}, fmt.Errorf("no run in flight for %q: %w", repoID, ErrNotFound)
+	}
+	if up.SyncClaimHolder != holder {
+		return Upstream{}, fmt.Errorf("now held by %q: %w", up.SyncClaimHolder, ErrClaimLost)
+	}
+	up.Syncing, up.SyncPending = false, true
+	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Time{}
+	m.upstreams[repoID] = up
+	return up, nil
+}
+
+// RestorePush implements ShutdownRestorer with PG's semantics.
+func (m *MemStore) RestorePush(_ context.Context, repoID, holder string, force bool) (Upstream, error) {
+	assertf(holder != "", "RestorePush: empty holder")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	up, ok := m.upstreams[repoID]
+	if !ok {
+		return Upstream{}, ErrNotFound
+	}
+	if !up.PushSyncing {
+		return Upstream{}, fmt.Errorf("no push run in flight for %q: %w", repoID, ErrNotFound)
+	}
+	if up.PushClaimHolder != holder {
+		return Upstream{}, fmt.Errorf("now held by %q: %w", up.PushClaimHolder, ErrClaimLost)
+	}
+	level := PushPendingPush
+	if force {
+		level = PushPendingForce
+	}
+	up.PushSyncing, up.PushClaimForce = false, false
+	up.PushClaimHolder, up.PushClaimExpiresAt = "", time.Time{}
+	if level > up.PushPending {
+		up.PushPending = level
+	}
+	m.upstreams[repoID] = up
+	return up, nil
+}

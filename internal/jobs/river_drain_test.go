@@ -1,0 +1,288 @@
+package jobs
+
+// Serve shutdown on the River lane (issue #343): DrainSyncRuns soft-stops
+// River, waits for running jobs, then cancels sync and push runs with
+// sync.ErrShutdown. A run cancelled that way restores its request, and the
+// unchanged completion gate snoozes its job, so the next process runs the
+// request exactly once.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	stdsync "sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/coder/openstorage/internal/events"
+	"github.com/coder/openstorage/internal/sync"
+)
+
+// drainRecorder records which repos each process's runners started.
+type drainRecorder struct {
+	mu      stdsync.Mutex
+	started []string
+	causes  []error
+}
+
+func (r *drainRecorder) start(repo string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.started = append(r.started, repo)
+}
+
+func (r *drainRecorder) cause(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.causes = append(r.causes, err)
+}
+
+func (r *drainRecorder) count(repo string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, s := range r.started {
+		if s == repo {
+			n++
+		}
+	}
+	return n
+}
+
+// riverJob reads one repo's only job of kind: its state and args retry.
+func riverJob(t *testing.T, pgURL, kind, repo string) (state string, retry int) {
+	t.Helper()
+	conn, err := pgx.Connect(t.Context(), pgURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(t.Context()) }()
+	var n int
+	if err := conn.QueryRow(t.Context(),
+		`SELECT count(*), min(state::text), coalesce(min((args->>'retry')::int), 0) FROM river_job WHERE kind = $1 AND args->>'repo_id' = $2`,
+		kind, repo).Scan(&n, &state, &retry); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("%s jobs for %s: %d, want exactly 1", kind, repo, n)
+	}
+	return state, retry
+}
+
+func TestRiverDrainSyncRunsKeepsRequests(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	store := sync.NewMemStore()
+	for _, id := range []string{"repo_pull", "repo_push", "repo_late"} {
+		if _, err := store.PutUpstream(ctx, sync.Upstream{
+			RepoID: id, Provider: "gitea", Owner: "o", Name: id, UpstreamHost: "example.test",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+
+	// Process 1: runs claim, then hang until cancelled; a shutdown cause
+	// restores, as sync.Worker does on PostgreSQL.
+	var seq atomic.Int32
+	rec1 := &drainRecorder{}
+	hang := func(push bool) SyncRunner {
+		return func(ctx context.Context, job sync.Job) error {
+			holder := fmt.Sprintf("p1-%d", seq.Add(1))
+			var force bool
+			if push {
+				_, f, _, err := store.BeginPush(ctx, job.RepoID, holder, time.Minute)
+				if err != nil {
+					return err
+				}
+				force = f
+			} else if _, _, err := store.BeginSync(ctx, job.RepoID, holder, time.Minute); err != nil {
+				return err
+			}
+			rec1.start(job.RepoID)
+			<-ctx.Done()
+			rec1.cause(context.Cause(ctx))
+			if !errors.Is(context.Cause(ctx), sync.ErrShutdown) {
+				return ctx.Err()
+			}
+			var err error
+			if push {
+				_, err = store.RestorePush(context.WithoutCancel(ctx), job.RepoID, holder, force)
+			} else {
+				_, err = store.RestoreSync(context.WithoutCancel(ctx), job.RepoID, holder)
+			}
+			return errors.Join(err, sync.ErrShutdown)
+		}
+	}
+	q1, err := NewRiver(ctx, pgURL, deliverer, hang(false), hang(true), store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	if err := store.RequestSync(ctx, "repo_pull"); err != nil {
+		t.Fatal(err)
+	}
+	if err := q1.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_pull"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestPush(ctx, "repo_push", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := q1.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: "repo_push", Retry: 2}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "both runs in flight", func() bool { return rec1.count("repo_pull") == 1 && rec1.count("repo_push") == 1 })
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		q1.DrainSyncRuns(dctx, 500*time.Millisecond)
+	}()
+	// A request recorded during the drain is inserted, but the stopping
+	// client starts no new job.
+	time.Sleep(100 * time.Millisecond)
+	if err := store.RequestSync(ctx, "repo_late"); err != nil {
+		t.Fatal(err)
+	}
+	if err := q1.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_late"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-drained:
+	case <-time.After(30 * time.Second):
+		t.Fatal("DrainSyncRuns did not return")
+	}
+	q1.Close()
+
+	if n := rec1.count("repo_late"); n != 0 {
+		t.Fatalf("a job started during the drain (%d runs)", n)
+	}
+	for _, c := range rec1.causes {
+		if !errors.Is(c, sync.ErrShutdown) {
+			t.Fatalf("run cancelled with cause %v, want sync.ErrShutdown", c)
+		}
+	}
+	if up, _ := store.GetUpstream(ctx, "repo_pull"); up.RunCount != 0 || !up.SyncPending || up.Syncing {
+		t.Fatalf("pull after the drain: %+v, want no run counted, the request pending, no claim", up)
+	}
+	if up, _ := store.GetUpstream(ctx, "repo_push"); up.PushRunCount != 0 || up.PushPending != sync.PushPendingForce || up.PushSyncing {
+		t.Fatalf("push after the drain: %+v, want no run counted, force pending, no claim", up)
+	}
+	// The gate kept both jobs (snoozed: River stores a short snooze as
+	// available at a later scheduled_at), with the push job's retry.
+	kept := func(state string) bool { return state == "available" || state == "scheduled" }
+	if state, _ := riverJob(t, pgURL, "upstream_sync", "repo_pull"); !kept(state) {
+		t.Fatalf("pull job state %q, want it kept for the next process", state)
+	}
+	if state, retry := riverJob(t, pgURL, "upstream_push", "repo_push"); !kept(state) || retry != 2 {
+		t.Fatalf("push job state %q retry %d, want it kept with retry 2", state, retry)
+	}
+
+	// Process 2 runs each kept request exactly once.
+	rec2 := &drainRecorder{}
+	finish := func(push bool) SyncRunner {
+		return func(ctx context.Context, job sync.Job) error {
+			holder := fmt.Sprintf("p2-%d", seq.Add(1))
+			if push {
+				_, force, _, err := store.BeginPush(ctx, job.RepoID, holder, time.Minute)
+				if err != nil {
+					return err
+				}
+				if !force || job.Retry != 2 {
+					return fmt.Errorf("rerun lost its force (%v) or retry (%d)", force, job.Retry)
+				}
+				rec2.start(job.RepoID)
+				_, err = store.FinishPush(ctx, job.RepoID, holder, true)
+				return err
+			}
+			if _, _, err := store.BeginSync(ctx, job.RepoID, holder, time.Minute); err != nil {
+				return err
+			}
+			rec2.start(job.RepoID)
+			_, err := store.FinishSync(ctx, job.RepoID, holder, true)
+			return err
+		}
+	}
+	q2, err := NewRiver(ctx, pgURL, deliverer, finish(false), finish(true), store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q2.Close()
+	waitFor(t, "kept requests completed", func() bool {
+		a, _ := store.GetUpstream(ctx, "repo_pull")
+		b, _ := store.GetUpstream(ctx, "repo_push")
+		c, _ := store.GetUpstream(ctx, "repo_late")
+		return a.SuccessCount == 1 && b.PushSuccessCount == 1 && c.SuccessCount == 1
+	})
+	time.Sleep(syncFollowUpSnooze + time.Second) // room for any stray rerun
+	for _, repo := range []string{"repo_pull", "repo_push", "repo_late"} {
+		if n := rec2.count(repo); n != 1 {
+			t.Fatalf("%s ran %d times after restart, want exactly 1", repo, n)
+		}
+	}
+}
+
+// A run that ends within the wait finishes normally: DrainSyncRuns cancels
+// nothing while every job completes in time.
+func TestRiverDrainSyncRunsWaitsForRunsThatFinish(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_ok", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	var running atomic.Bool
+	var cancelled atomic.Bool
+	runner := func(ctx context.Context, job sync.Job) error {
+		if _, _, err := store.BeginSync(ctx, job.RepoID, "h", time.Minute); err != nil {
+			return err
+		}
+		running.Store(true)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			cancelled.Store(true)
+		}
+		_, err := store.FinishSync(context.WithoutCancel(ctx), job.RepoID, "h", true)
+		return err
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_ok"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "run in flight", running.Load)
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		q.DrainSyncRuns(ctx, time.Minute)
+	}()
+	select {
+	case <-drained:
+		t.Fatal("DrainSyncRuns returned while a run was in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	<-drained
+	if cancelled.Load() {
+		t.Fatal("a run that finished within the wait was cancelled")
+	}
+	if up, _ := store.GetUpstream(ctx, "repo_ok"); up.SuccessCount != 1 {
+		t.Fatalf("row %+v, want one successful run", up)
+	}
+	if state, _ := riverJob(t, pgURL, "upstream_sync", "repo_ok"); state != "completed" {
+		t.Fatalf("job state %q, want completed", state)
+	}
+}

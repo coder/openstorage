@@ -349,7 +349,15 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		}
 		up, stolenFrom = c.Up, c.StolenFrom
 	} else {
-		up, stolenFrom, err = w.Upstreams.BeginSync(ctx, job.RepoID, holder, claimLease(timeout))
+		if shutdownAborted(ctx) {
+			// Not claimed: the request stays marked (issue #343).
+			return fmt.Errorf("begin sync %s: %w", job.RepoID, ErrShutdown)
+		}
+		// Not cancellable, as in claimLocal: a claim cancelled mid-write
+		// could commit without this run knowing.
+		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+		up, stolenFrom, err = w.Upstreams.BeginSync(cctx, job.RepoID, holder, claimLease(timeout))
+		ccancel()
 		switch {
 		case errors.Is(err, ErrNotFound):
 			return nil // detached before start: cancel silently (docs/reference/webhooks.md)
@@ -408,12 +416,25 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	if w.Local != nil && runErr != nil && shutdownAborted(ctx) {
-		// Shutdown cancelled the run (issue #342): keep its request for
-		// the next process instead of counting a failure.
-		return w.restoreForShutdown(ctx, "sync", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
-			return w.Local.FinishSyncOutcome(fctx, job.RepoID, holder, meta.SyncOutcome{Kind: meta.OutcomeRestore, Delay: shutdownRestoreDelay})
-		})
+	if runErr != nil && shutdownAborted(ctx) {
+		// Shutdown cancelled the run: keep its request for the next
+		// process instead of counting a failure.
+		if w.Local != nil { // SQLite (issue #342)
+			return w.restoreForShutdown(ctx, "sync", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
+				return w.Local.FinishSyncOutcome(fctx, job.RepoID, holder, meta.SyncOutcome{Kind: meta.OutcomeRestore, Delay: shutdownRestoreDelay})
+			})
+		}
+		if rs, ok := w.Upstreams.(ShutdownRestorer); ok { // PostgreSQL/River (issue #343)
+			if err := w.restoreForShutdown(ctx, "sync", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
+				return rs.RestoreSync(fctx, job.RepoID, holder)
+			}); err != nil {
+				return err
+			}
+			// Still an error: River's completion gate snoozes the job
+			// (keeping it for the next process) only for a run that
+			// failed without being counted while a request is pending.
+			return fmt.Errorf("sync %s: %w", job.RepoID, ErrShutdown)
+		}
 	}
 
 	var fin Upstream
@@ -504,13 +525,14 @@ func (w *Worker) claimLocal(ctx context.Context, claim func(context.Context) (La
 	return claim(cctx)
 }
 
-// restoreForShutdown ends a local-schedule run that LocalScheduler.Drain
-// cancelled (issue #342) with finish, an OutcomeRestore write: the request
-// stays pending for the next process, no run is counted, and no terminal
-// event is emitted (like detach and claim-steal abandonment).
+// restoreForShutdown ends a run that a shutdown drain cancelled with
+// finish, a restore write (OutcomeRestore on SQLite, issue #342;
+// ShutdownRestorer on PostgreSQL, issue #343): the request stays pending
+// for the next process, no run is counted, and no terminal event is
+// emitted (like detach and claim-steal abandonment).
 func (w *Worker) restoreForShutdown(ctx context.Context, lane string, job Job, holder string, runErr error,
 	finish func(context.Context) (Upstream, error)) error {
-	assertf(w.Local != nil && shutdownAborted(ctx), "restoreForShutdown outside a drained local run")
+	assertf(shutdownAborted(ctx), "restoreForShutdown outside a drained run")
 	_, err := w.retryFinish(ctx, lane, job.RepoID, finish)
 	switch {
 	case errors.Is(err, ErrNotFound):

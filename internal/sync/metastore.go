@@ -90,7 +90,10 @@ func (s metaCredentials) CredentialForRepo(ctx context.Context, repoID string) (
 
 type metaUpstreams struct{ ms meta.EventingStore }
 
-var _ UpstreamStore = metaUpstreams{}
+var (
+	_ UpstreamStore    = metaUpstreams{}
+	_ ShutdownRestorer = metaUpstreams{}
+)
 
 func fromMetaUpstream(u meta.RepoUpstream) Upstream {
 	return Upstream{
@@ -179,6 +182,43 @@ func (s metaUpstreams) BeginPush(ctx context.Context, repoID, holder string, lea
 		return Upstream{}, false, "", fmt.Errorf("%w: repo %s", ErrPushInProgress, repoID)
 	}
 	return fromMetaUpstream(row), force, stolenFrom, nil
+}
+
+// ShutdownRestorer ends a run that serve's shutdown cancelled without
+// counting it (issue #343, PostgreSQL): the claim is released and the
+// request (for push, the consumed level) re-marked. MemStore and PG-backed
+// stores implement it; SQLite restores through LocalLanes instead.
+type ShutdownRestorer interface {
+	RestoreSync(ctx context.Context, repoID, holder string) (Upstream, error)
+	RestorePush(ctx context.Context, repoID, holder string, force bool) (Upstream, error)
+}
+
+var errRestoreUnsupported = errors.New("metadata store cannot restore shutdown-cancelled runs")
+
+func (s metaUpstreams) RestoreSync(ctx context.Context, repoID, holder string) (Upstream, error) {
+	rs, ok := s.ms.(meta.RunRestoreStore)
+	if !ok {
+		return Upstream{}, fmt.Errorf("restore sync %s: %T: %w", repoID, s.ms, errRestoreUnsupported)
+	}
+	return mapFinishErr(rs.RestoreSync(ctx, repoID, holder))
+}
+
+func (s metaUpstreams) RestorePush(ctx context.Context, repoID, holder string, force bool) (Upstream, error) {
+	rs, ok := s.ms.(meta.RunRestoreStore)
+	if !ok {
+		return Upstream{}, fmt.Errorf("restore push %s: %T: %w", repoID, s.ms, errRestoreUnsupported)
+	}
+	return mapFinishErr(rs.RestorePush(ctx, repoID, holder, force))
+}
+
+func mapFinishErr(row meta.RepoUpstream, err error) (Upstream, error) {
+	if errors.Is(err, meta.ErrClaimLost) {
+		return Upstream{}, fmt.Errorf("%w: %v", ErrClaimLost, err)
+	}
+	if err != nil {
+		return Upstream{}, mapMetaErr(err, ErrNotFound, nil)
+	}
+	return fromMetaUpstream(row), nil
 }
 
 func (s metaUpstreams) FinishPush(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
