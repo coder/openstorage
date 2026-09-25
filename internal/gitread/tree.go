@@ -1,11 +1,9 @@
 package gitread
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"os/exec"
 	"strconv"
 	"strings"
 
@@ -46,7 +44,7 @@ func LsTree(ctx context.Context, repoPath, commit, path string, recursive bool) 
 	if path != "" {
 		args = append(args, "--", path)
 	}
-	out, err := runGit(ctx, repoPath, args...)
+	out, err := runGit(ctx, Heavy, repoPath, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -152,27 +150,24 @@ func StatBlob(ctx context.Context, repoPath, commit, path string) (BlobInfo, err
 }
 
 // CatBlobTo streams the raw bytes of blob sha into w without buffering the
-// whole blob in memory (file/archive streaming path).
+// whole blob in memory (file/archive streaming path). git itself runs as a
+// Heavy child: a blob it must inflate or rebuild from deltas in its heap
+// can hit HeavyHeapBytes, so callers check CheckBlobSize first.
 func CatBlobTo(ctx context.Context, repoPath, sha string, w io.Writer) error {
 	assertf(ref.ValidSHA(sha), "CatBlobTo: malformed sha %q", sha)
 	assertf(w != nil, "CatBlobTo: nil writer")
-	cmd := exec.CommandContext(ctx, "git", "cat-file", "blob", sha)
-	cmd.Dir = repoPath
-	var stderr bytes.Buffer
-	cmd.Stdout = w
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git cat-file blob %s: %w: %s", sha, err, strings.TrimSpace(stderr.String()))
-	}
-	return nil
+	_, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdout: w, Args: []string{"cat-file", "blob", sha}})
+	return err
 }
 
 // ReadBlob returns the full contents of blob sha. Use only for small blobs
-// (symlink targets); file streaming goes through CatBlobTo.
+// (symlink targets); file streaming goes through CatBlobTo. The bytes count
+// against the output allowance.
 func ReadBlob(ctx context.Context, repoPath, sha string) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := CatBlobTo(ctx, repoPath, sha, &buf); err != nil {
+	assertf(ref.ValidSHA(sha), "ReadBlob: malformed sha %q", sha)
+	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Args: []string{"cat-file", "blob", sha}})
+	if err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	return []byte(out), nil
 }

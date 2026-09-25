@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -42,7 +43,9 @@ type PreparedArchive struct {
 }
 
 // PrepareArchive resolves the tree at commit (a resolved full SHA) and
-// applies the include/exclude globs and MaxBlobSize filters up front.
+// applies the include/exclude globs and MaxBlobSize filters up front. A
+// kept blob over the blob limit (CheckBlobSize) fails it with ErrBlobTooLarge, before any
+// archive byte is written.
 func PrepareArchive(ctx context.Context, repoPath, commit string, opts ArchiveOptions) (*PreparedArchive, error) {
 	assertf(ref.ValidSHA(commit), "PrepareArchive: unresolved commit %q", commit)
 	assertf(ValidArchivePrefix(opts.Prefix), "PrepareArchive: unsafe prefix %q", opts.Prefix)
@@ -75,6 +78,11 @@ func PrepareArchive(ctx context.Context, repoPath, commit string, opts ArchiveOp
 		if opts.MaxBlobSize > 0 && e.Type == EntryBlob && e.Size > opts.MaxBlobSize {
 			continue
 		}
+		// Before any header is sent: a blob too large to stream within
+		// the heap cap fails the whole request cleanly (#313).
+		if err := CheckBlobSize(ctx, e.Path, e.Size); err != nil {
+			return nil, err
+		}
 		kept = append(kept, e)
 	}
 	return &PreparedArchive{
@@ -93,6 +101,19 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 	assertf(p != nil && p.repoPath != "", "Stream: unprepared archive")
 	assertf(w != nil, "Stream: nil writer")
 
+	// Each blob is spooled to a temp file before it is written to w, so a
+	// client that stops reading never keeps a git process (and its heap)
+	// alive (#313). The spool holds one blob at a time, at most
+	// MaxBlobBytes (PrepareArchive checked every size); the HTTP layer's
+	// write deadlines bound how long a stalled client keeps it.
+	spool, err := os.CreateTemp("", "openstorage-archive-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+	}()
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	for _, e := range p.entries {
@@ -119,12 +140,23 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 			if e.Mode == "100755" {
 				hdr.Mode = 0o755
 			}
+			if err := spool.Truncate(0); err != nil {
+				return err
+			}
+			if _, err := spool.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			if err := CatBlobTo(ctx, p.repoPath, e.SHA, spool); err != nil {
+				return err
+			}
+			if _, err := spool.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
 			}
-			// Stream blob bytes straight into the tar entry; a size
-			// mismatch surfaces as a tar write error.
-			if err := CatBlobTo(ctx, p.repoPath, e.SHA, tw); err != nil {
+			// A size mismatch surfaces as a tar write error.
+			if _, err := io.Copy(tw, spool); err != nil {
 				return err
 			}
 		default:

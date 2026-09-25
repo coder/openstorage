@@ -92,17 +92,16 @@ func mergeBaseSHA(ctx context.Context, repoPath, a, b string) (string, bool, err
 	if !ref.ValidSHA(a) || !ref.ValidSHA(b) {
 		return "", false, fmt.Errorf("mergeBaseSHA: unresolved inputs %q/%q", a, b)
 	}
-	cmd := exec.CommandContext(ctx, "git", "merge-base", a, b)
-	cmd.Dir = repoPath
-	out, err := cmd.Output()
+	out, err := gitread.Run(ctx, gitread.Cmd{Class: gitread.Heavy, Dir: repoPath, Args: []string{"merge-base", a, b}})
 	if err != nil {
+		// Limit errors never wrap *exec.ExitError (gitread.Run).
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return "", false, nil // no common ancestor
 		}
-		return "", false, fmt.Errorf("git merge-base %s %s: %w", a, b, err)
+		return "", false, err
 	}
-	sha := strings.TrimSpace(string(out))
+	sha := strings.TrimSpace(out)
 	if !ref.ValidSHA(sha) {
 		return "", false, fmt.Errorf("git merge-base emitted %q", sha)
 	}
@@ -789,6 +788,10 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		}
 		// The cursor's anchor commit must still exist in this repo.
 		if _, resolveErr := gitread.ResolveRef(r.Context(), repoPath, commit, false); resolveErr != nil {
+			if gitread.IsBudgetError(resolveErr) {
+				s.internalErr(w, r, "resolve grep cursor", resolveErr)
+				return
+			}
 			writeErr(w, http.StatusBadRequest, "invalid cursor")
 			return
 		}

@@ -556,6 +556,14 @@ func (sc *wcScratch) gitCmd(ctx context.Context, extraEnv []string, args ...stri
 // git runs one git command to completion, returning stdout; stderr is
 // captured separately so warnings never contaminate parsed output.
 func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string, args ...string) (string, error) {
+	if gitread.BudgetFrom(ctx) != nil {
+		// A git:read request (merge preview): run under its read budget
+		// (#313). Write requests carry no budget and keep the plain path.
+		return gitread.Run(ctx, gitread.Cmd{
+			Class: gitread.Heavy, Dir: sc.repoPath, Env: append(append([]string{}, sc.baseEnv...), extraEnv...),
+			Stdin: stdin, Args: args,
+		})
+	}
 	cmd := sc.gitCmd(ctx, extraEnv, args...)
 	cmd.Stdin = stdin
 	var stderr bytes.Buffer

@@ -147,7 +147,7 @@ func graphReads(t *testing.T, dir string) string {
 		{"merge-base", "--all", mainTip, sideTip},
 		{"rev-list", "--topo-order", mainTip, "--", "hot.txt"},
 	} {
-		out, err := runGit(ctx, dir, args...)
+		out, err := runGit(ctx, Heavy, dir, args...)
 		if err != nil {
 			t.Fatalf("%v: %v", args, err)
 		}

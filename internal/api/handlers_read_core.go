@@ -919,6 +919,12 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before staging: a blob too large to read within the git heap cap is
+	// refused with 422 (#313), for HEAD as for GET.
+	if err := gitread.CheckBlobSize(r.Context(), filePath, info.Size); err != nil {
+		s.internalErr(w, r, "check blob size", err)
+		return
+	}
 	tmp, err := os.CreateTemp("", "openstorage-file-*")
 	if err != nil {
 		s.internalErr(w, r, "stage blob", err)

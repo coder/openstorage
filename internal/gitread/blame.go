@@ -43,9 +43,9 @@ func Blame(ctx context.Context, repoPath, commit, path string, ranges []string, 
 		args = append(args, "-M")
 	}
 	args = append(args, commit, "--", path)
-	out, err := runGit(ctx, repoPath, args...)
+	out, err := runGit(ctx, Heavy, repoPath, args...)
 	if err != nil {
-		if strings.Contains(err.Error(), "no such path") {
+		if !IsBudgetError(err) && strings.Contains(err.Error(), "no such path") {
 			return nil, fmt.Errorf("blame %q at %s: %w", path, commit, ErrNotFound)
 		}
 		return nil, err

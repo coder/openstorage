@@ -263,6 +263,43 @@ freshness pokes) and push-upstream forwards.
 > pull-only behavior. This ordering is documentation-enforced, like the other
 > [upgrade orderings](configuration.md).
 
+## Resource limits on git reads
+
+The `git:read` endpoints answer from git subprocesses over a cache repository. Anyone who can push shapes that repository, so every git subprocess that reads repository data for these endpoints runs under the limits below ([#313](https://github.com/coder/openstorage/issues/313)). Each limit takes effect before the work it bounds.
+
+| Limit | Value | When it is exceeded |
+|---|---|---|
+| Concurrency | At most 8 requests per server process run git at once, and `file` and `archive` downloads have a separate pool of 8. One repository can hold at most 2 slots of each pool, whether its tokens name it by URL or by ID. A request takes its slot at its first git subprocess, including single-object reads, and keeps it until its response has been delivered. A request waits up to 1 second for a slot. | 503 with `Retry-After: 1`. git is not started. |
+| Time | 30 seconds of git time per request, counted from its first git subprocess and shared by all of them. `archive` gets 10 minutes, because it streams at the client's pace. | 503 without `Retry-After`. The running git subprocess is stopped. |
+| Memory (Linux) | 256 MiB of git heap per subprocess (`RLIMIT_DATA`, set before git starts); 32 MiB for single-object reads. Read-only pack mappings are shared page cache and are not counted. | 422. |
+| Output | 64 MiB of buffered git output per request, shared by all its subprocesses. File contents that `file`, `archive` and `diff` stream instead of buffering are not counted. | 422. git is stopped as soon as the limit is passed. |
+| File size | 100 MiB per file, checked from the tree before the file is read. | 422 for `file` (GET and HEAD) and `archive`, before any response byte. |
+| Delivery | Each 64 KiB of a response must reach the client within 30 seconds, and the whole response within 2 minutes of its first byte (`file` and `archive`: 10 minutes). | The connection is closed. The request's slot, memory and temporary files are released. |
+
+The largest git heap measured on a 300,000-commit linear history is 184 MB, for `git log -1 -- <file added in the root commit>`, so such histories are served. Histories past roughly 400,000 commits can get 422 for per-file history walks, `blame` of old files, and deep `commits` pages. A `files/metadata` page whose per-file walks need more than 30 seconds in total gets 503; request smaller pages with `limit`. Commit-graphs, which full hydrates now write ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)), make these walks cheaper when present, but the limits do not depend on them: the measurements above are without a commit-graph.
+
+| Endpoint | git work | Cost grows with |
+|---|---|---|
+| all below | ref resolution (`check-ref-format`, `rev-parse`) | nothing (single object) |
+| `commits` | `git log --skip=<cursor offset> -n <limit+1> [-- path]` | cursor offset; history searched for `path` |
+| `commit` | `git log -n 1`, `git cat-file commit` | the commit object (single object) |
+| `files` | `git ls-tree [-r]` | tree size |
+| `files/metadata` | `git ls-tree -r`, then one `git log -1 -- <path>` per listed file | tree size; page size × history depth |
+| `file` | `git ls-tree`, `git log -1 -- <path>`, `git cat-file blob` | history depth; file size |
+| `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git ls-tree` and `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
+| `blame` | `git blame` | file length × history depth |
+| `grep` | `git grep` (one thread) | tree size; number of matches |
+| `archive` | `git ls-tree -r`, `git cat-file blob` per file | tree size |
+| `tags`, `tag` | `git for-each-ref refs/tags` | number of tags |
+| `notes` | `git notes show` | notes tree and note size |
+| `merge/preview` | `git merge-base`, `git merge-tree`, `git ls-tree` and `git cat-file` per conflict | history to the merge base; tree size |
+
+Other limits and gaps:
+
+- **Platforms.** The memory limit needs `RLIMIT_DATA`, which only Linux enforces. On other server platforms, such as macOS, git runs without a memory cap, and the concurrency, time, output and file-size limits still apply. No endpoint refuses a request because the memory cap is unavailable. For deployments where untrusted users can push, run the server on Linux. See [ADR-49](../adr/049-read-side-git-children-run-under-one-per-request-budget.md).
+- `archive` streams its response. An error after the response has started (for example, the time limit, or a delta-compressed file whose base object does not fit in memory) closes the connection, so the client sees a truncated, invalid gzip stream instead of a status code.
+- Not covered by these limits: hydrating the cache repository before the git reads (serialized per repository), git clone and fetch over the git protocol (`upload-pack`, which has its own request-size limits), and the write endpoints.
+
 ## Status-code contract (what clients key on)
 
 | Status | Meaning to clients |
@@ -275,5 +312,6 @@ freshness pokes) and push-upstream forwards.
 | 404 | repo/object/branch not found; unborn-branch file metadata |
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, CAS conflict |
 | 412 | CAS precondition failed |
+| 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit ("unavailable" to ref-update clients) |
-| 5xx | internal/unavailable; 503 documented for cold-storage warmup on grep/archive |
+| 5xx | internal/unavailable; 503 documented for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |

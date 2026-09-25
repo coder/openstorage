@@ -52,7 +52,13 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 	if opts.Path != "" {
 		args = append(args, "--", opts.Path)
 	}
-	out, err := runGit(ctx, repoPath, args...)
+	// One commit with no path filter or skip is a single-object read;
+	// anything else walks history.
+	class := Heavy
+	if opts.Path == "" && opts.Skip == 0 && opts.MaxCount == 1 {
+		class = Light
+	}
+	out, err := runGit(ctx, class, repoPath, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +130,7 @@ func GetCommit(ctx context.Context, repoPath, sha string) (CommitDetail, error) 
 		return CommitDetail{}, fmt.Errorf("log -n 1 %s returned %d commits", sha, len(commits))
 	}
 	detail := CommitDetail{Commit: commits[0]}
-	raw, err := runGit(ctx, repoPath, "cat-file", "commit", sha)
+	raw, err := runGit(ctx, Light, repoPath, "cat-file", "commit", sha)
 	if err != nil {
 		return CommitDetail{}, err
 	}

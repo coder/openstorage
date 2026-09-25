@@ -15,11 +15,9 @@
 package gitread
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"strings"
 
@@ -45,20 +43,12 @@ func assertf(cond bool, format string, args ...any) {
 	}
 }
 
-// runGit executes git -C repoPath with args, returning stdout only. Stderr
-// is captured separately and surfaced in the error text so git warnings
-// never contaminate parsed stdout.
-func runGit(ctx context.Context, repoPath string, args ...string) (string, error) {
+// runGit runs `git args...` in repoPath as one child of class (see Run),
+// returning stdout only. Stderr is kept separately and surfaced in the
+// error text so git warnings never contaminate parsed stdout.
+func runGit(ctx context.Context, class Class, repoPath string, args ...string) (string, error) {
 	assertf(repoPath != "", "runGit: empty repoPath")
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = repoPath
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
-	}
-	return string(out), nil
+	return Run(ctx, Cmd{Class: class, Dir: repoPath, Args: args})
 }
 
 // Materialize rebuilds the cache repo for repo from the ref/blob stores
@@ -101,12 +91,18 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 	if spec == "" {
 		return "", fmt.Errorf("resolve empty ref: %w", ErrNotFound)
 	}
+	// limitErr records a resource-limit or cancellation outcome: those must
+	// surface as errors, never as "not found".
+	var limitErr error
 	// Ref candidates are built only from well-formed ref names
 	// (check-ref-format): git forbids the rev-expression metacharacters
 	// (~ ^ : @{ ...) in refnames, so a validated candidate cannot smuggle
 	// an expression like "main~1" through the rev-parse below.
 	validRefName := func(name string) bool {
-		_, err := runGit(ctx, repoPath, "check-ref-format", name)
+		_, err := runGit(ctx, Light, repoPath, "check-ref-format", name)
+		if err != nil && limitErr == nil && (IsBudgetError(err) || ctx.Err() != nil) {
+			limitErr = err
+		}
 		return err == nil
 	}
 	var candidates []string
@@ -126,11 +122,17 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 	if hexRevRe.MatchString(spec) {
 		candidates = append(candidates, spec)
 	}
+	if limitErr != nil {
+		return "", limitErr
+	}
 	for _, cand := range candidates {
 		// --end-of-options stops a hostile spec from being parsed as an
 		// option; ^{commit} peels annotated tags and rejects non-commits.
-		out, err := runGit(ctx, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand+"^{commit}")
+		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand+"^{commit}")
 		if err != nil {
+			if IsBudgetError(err) || ctx.Err() != nil {
+				return "", err
+			}
 			continue
 		}
 		sha := strings.TrimSpace(out)
