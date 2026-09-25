@@ -84,13 +84,6 @@ func (g *gateLanes) enter(method, repo string) error {
 	return err
 }
 
-func (g *gateLanes) RequestPushNow(ctx context.Context, repoID string, force bool) error {
-	if err := g.enter("RequestPushNow", repoID); err != nil {
-		return err
-	}
-	return g.LocalLanes.RequestPushNow(ctx, repoID, force)
-}
-
 func (g *gateLanes) RequestSync(ctx context.Context, repoID string) error {
 	if err := g.enter("RequestSync", repoID); err != nil {
 		return err
@@ -399,8 +392,12 @@ func TestLocalScheduleFinalP2Replay(t *testing.T) {
 		t.Fatalf("sweep during backoff started a run (%d events)", n)
 	}
 
-	// The upstream recovers; an explicit request expedites and covers the retry.
+	// The upstream recovers; an explicit request (API push-upstream:
+	// RequestPushNow, then the hint) expedites and covers the retry.
 	up.up(t)
+	if err := f.ms.RequestPushNow(t.Context(), repo, false); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.sched.EnqueuePush(t.Context(), Job{Org: f.org, RepoID: repo}); err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +472,7 @@ func TestLocalScheduleNewerIntentSurvives(t *testing.T) {
 			<-reached
 			var err error
 			if explicit {
-				err = f.gate.LocalLanes.RequestPushNow(t.Context(), repo, false)
+				err = f.ms.RequestPushNow(t.Context(), repo, false)
 			} else {
 				err = f.ms.RequestPush(t.Context(), repo, false)
 			}
@@ -866,4 +863,103 @@ func TestLocalScheduleMirrorBackAndInitialSyncDurable(t *testing.T) {
 	if r := f.row(t, repo.RepoID); r.SuccessCount != 2 || r.SyncPending {
 		t.Fatalf("mirror-back pull did not run: %+v", r)
 	}
+}
+
+// TestLocalScheduleEnqueueHints: on SQLite the callers record requests and
+// the scheduler's enqueues only offer runs (review of #341). An implicit
+// forward poke joins a waiting backoff, a pull-upstream offer does not
+// re-mark a request a run already claimed, and Close waits for an enqueue
+// that passed its gate.
+func TestLocalScheduleEnqueueHints(t *testing.T) {
+	t.Run("forward poke joins the backoff; explicit push-upstream expedites", func(t *testing.T) {
+		f := newLocalSchedFixture(t)
+		up := newHTTPUpstream(t)
+		bare := up.addRepo(t, "own", "h1")
+		repo, head := f.addRepo(t, "h1", up.host())
+		up.down(t)
+		if err := f.ms.RequestPush(t.Context(), repo, false); err != nil {
+			t.Fatal(err)
+		}
+		f.sweep(t) // transient failure: attempt 1, due in 1 min
+		_, due := f.readSchedule(t, repo)
+		// enqueueSyncOrForward on API ref writes: RequestPush, then the hint.
+		for range 3 {
+			if err := f.ms.RequestPush(t.Context(), repo, false); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.sched.EnqueuePush(t.Context(), Job{Org: f.org, RepoID: repo}); err != nil {
+				t.Fatal(err)
+			}
+			f.idle(t)
+		}
+		if attempt, got := f.readSchedule(t, repo); attempt != 1 || got != due || len(f.pushEvents(repo)) != 2 {
+			t.Fatalf("forward pokes during the backoff: attempt %d due %d events %d; want attempt 1, due %d, no new run",
+				attempt, got, len(f.pushEvents(repo)), due)
+		}
+		// API push-upstream records through the upstream store adapter.
+		_, ups := MetaStores(f.ms)
+		pn, ok := ups.(interface {
+			RequestPushNow(ctx context.Context, repoID string, force bool) error
+		})
+		if !ok {
+			t.Fatal("meta upstream store has no RequestPushNow")
+		}
+		up.up(t)
+		if err := pn.RequestPushNow(t.Context(), repo, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.sched.EnqueuePush(t.Context(), Job{Org: f.org, RepoID: repo}); err != nil {
+			t.Fatal(err)
+		}
+		f.idle(t)
+		assertPushTypes(t, f.pushEvents(repo), EventSyncStarted, EventSyncFailed, EventSyncStarted, EventSyncSucceeded)
+		if got := upstreamHead(t, bare); got != head {
+			t.Fatalf("upstream main = %q, want %q", got, head)
+		}
+	})
+	t.Run("pull-upstream offer does not re-mark a claimed request", func(t *testing.T) {
+		f := newLocalSchedFixture(t)
+		seedUpstream(t, f.wf.upstreamDir, "own", "h2")
+		repo, _ := f.addRepo(t, "h2", "file://"+f.wf.upstreamDir)
+		if err := f.ms.RequestSync(t.Context(), repo); err != nil { // the handler's write
+			t.Fatal(err)
+		}
+		reached, release := f.gate.hold("FinishSyncOutcome", repo)
+		if err := f.sched.SweepOnce(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		<-reached // a sweep-started run claimed the request before the handler offered
+		if err := f.sched.OfferSync(t.Context(), Job{Org: f.org, RepoID: repo}); err != nil {
+			t.Fatal(err)
+		}
+		release()
+		f.idle(t)
+		f.sweep(t)
+		if r := f.row(t, repo); r.SuccessCount != 1 || r.SyncPending {
+			t.Fatalf("one pull-upstream request: row %+v, want exactly one run", r)
+		}
+	})
+	t.Run("Close waits for an enqueue past its gate", func(t *testing.T) {
+		f := newLocalSchedFixture(t)
+		repo, _ := f.addRepo(t, "h3", "file://"+f.wf.upstreamDir)
+		reached, releaseOnce := f.gate.hold("RequestSync", repo)
+		var once stdsync.Once
+		release := func() { once.Do(releaseOnce) }
+		defer release()
+		errc := make(chan error, 1)
+		go func() { errc <- f.sched.EnqueueSync(context.Background(), Job{Org: f.org, RepoID: repo}) }()
+		<-reached
+		closed := make(chan struct{})
+		go func() { f.sched.Close(); close(closed) }()
+		select {
+		case <-closed:
+			t.Fatal("Close returned while an enqueue was still writing to the store")
+		case <-time.After(100 * time.Millisecond):
+		}
+		release()
+		<-closed
+		if err := <-errc; err == nil {
+			t.Fatal("an enqueue that lost the race with Close reported success")
+		}
+	})
 }

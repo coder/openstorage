@@ -116,6 +116,25 @@ func (q *Local) EnqueueSync(ctx context.Context, job sync.Job) error {
 	return q.syncq.EnqueueSync(ctx, job)
 }
 
+// OfferSync offers a pull run for a request the caller already recorded
+// (API pull-upstream). On the SQLite schedule it does not record the
+// request again; the in-process queue has no such distinction and
+// enqueues.
+func (q *Local) OfferSync(ctx context.Context, job sync.Job) error {
+	q.mu.Lock()
+	closed := q.closed
+	q.mu.Unlock()
+	if closed {
+		return errors.New("jobs queue is closed")
+	}
+	if o, ok := q.syncq.(interface {
+		OfferSync(ctx context.Context, job sync.Job) error
+	}); ok {
+		return o.OfferSync(ctx, job)
+	}
+	return q.syncq.EnqueueSync(ctx, job)
+}
+
 // EnqueuePush delegates to the in-process queue's outbound lane (issue #90).
 func (q *Local) EnqueuePush(ctx context.Context, job sync.Job) error {
 	q.mu.Lock()

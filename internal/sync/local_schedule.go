@@ -18,7 +18,6 @@ import (
 // process-local retry or defer timers.
 type LocalLanes interface {
 	RequestSync(ctx context.Context, repoID string) error
-	RequestPushNow(ctx context.Context, repoID string, force bool) error
 	ClaimDuePush(ctx context.Context, repoID, holder string, lease time.Duration) (LaneClaim, error)
 	ClaimDueSync(ctx context.Context, repoID, holder string, lease time.Duration) (LaneClaim, error)
 	FinishPushOutcome(ctx context.Context, repoID, holder string, o meta.PushOutcome) (Upstream, error)
@@ -62,10 +61,6 @@ func mapLaneErr(err error) error {
 
 func (m metaLocalLanes) RequestSync(ctx context.Context, repoID string) error {
 	return mapLaneErr(m.es.RequestSync(ctx, repoID))
-}
-
-func (m metaLocalLanes) RequestPushNow(ctx context.Context, repoID string, force bool) error {
-	return mapLaneErr(m.ls.RequestPushNow(ctx, repoID, force))
 }
 
 func laneClaim(c meta.LocalClaim, err error) (LaneClaim, error) {
@@ -150,46 +145,67 @@ func NewLocalScheduler(lanes LocalLanes, org string, runSync, runPush func(ctx c
 		slots: make(chan struct{}, localSweepSlots), inflight: make(map[string]bool)}
 }
 
-// EnqueueSync records a durable pull request, then offers a run. Callers
-// that already recorded one (pull-upstream) only repeat an idempotent write.
+// EnqueueSync records a durable pull request, then offers a run. It serves
+// callers without a request of their own (the initial sync at repo
+// creation, the invariant-11 poke); pull-upstream records its request
+// first and uses OfferSync.
 func (s *LocalScheduler) EnqueueSync(ctx context.Context, job Job) error {
-	if err := s.checkOpen(); err != nil {
+	done, err := s.enter()
+	if err != nil {
 		return err
 	}
+	defer done()
 	if err := s.lanes.RequestSync(ctx, job.RepoID); err != nil {
 		return fmt.Errorf("record sync request: %w", err)
 	}
-	s.offer(job, false, false)
-	return nil
+	return s.offer(job, false, false)
 }
 
-// EnqueuePush records an explicit push request (RequestPushNow: due now,
-// retry position kept), then offers a run. On SQLite only the API's
-// push-upstream enqueues pushes: hooks record intent in the store directly.
-func (s *LocalScheduler) EnqueuePush(ctx context.Context, job Job) error {
-	if err := s.checkOpen(); err != nil {
+// OfferSync offers a pull run for a request the caller already recorded.
+// Recording it again here could re-mark a request that a run claimed in
+// between, and that would start a second run for one request.
+func (s *LocalScheduler) OfferSync(_ context.Context, job Job) error {
+	done, err := s.enter()
+	if err != nil {
 		return err
 	}
-	if err := s.lanes.RequestPushNow(ctx, job.RepoID, false); err != nil {
-		return fmt.Errorf("record push request: %w", err)
-	}
-	s.offer(job, true, false)
-	return nil
+	defer done()
+	return s.offer(job, false, false)
 }
 
-func (s *LocalScheduler) checkOpen() error {
+// EnqueuePush offers a push run. Every caller records its request first:
+// the API's push-upstream with RequestPushNow (due now), the forward poke
+// with RequestPush (joins a waiting backoff). The row decides whether the
+// run may claim.
+func (s *LocalScheduler) EnqueuePush(_ context.Context, job Job) error {
+	done, err := s.enter()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return s.offer(job, true, false)
+}
+
+// enter admits one enqueue: Close waits for it (so no store call follows
+// Close) until the returned done runs.
+func (s *LocalScheduler) enter() (done func(), err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return errors.New("sync queue is closed")
+		return nil, errSchedulerClosed
 	}
-	return nil
+	s.wg.Add(1)
+	return s.wg.Done, nil
 }
+
+var errSchedulerClosed = errors.New("sync queue is closed")
 
 // offer starts a run for job's lane unless one is already queued or
 // running (that run, or the next sweep, covers the durable request). Sweep
-// offers also need a free slot; they are dropped otherwise.
-func (s *LocalScheduler) offer(job Job, push, fromSweep bool) {
+// offers also need a free slot; they are dropped otherwise. It fails only
+// when the scheduler closed: the durable request then waits for the next
+// process's sweep.
+func (s *LocalScheduler) offer(job Job, push, fromSweep bool) error {
 	assertf(job.Org != "" && job.RepoID != "", "offer: incomplete job %+v", job)
 	key, run := "pull:"+job.RepoID, s.runSync
 	if push {
@@ -197,14 +213,17 @@ func (s *LocalScheduler) offer(job Job, push, fromSweep bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.inflight[key] {
-		return
+	if s.closed {
+		return errSchedulerClosed
+	}
+	if s.inflight[key] {
+		return nil
 	}
 	if fromSweep {
 		select {
 		case s.slots <- struct{}{}:
 		default:
-			return
+			return nil
 		}
 	}
 	s.inflight[key] = true
@@ -221,6 +240,7 @@ func (s *LocalScheduler) offer(job Job, push, fromSweep bool) {
 			s.logger.Warn("local sync run finished with error", "lane", key, "err", err)
 		}
 	})
+	return nil
 }
 
 // SweepOnce reads one page of due lanes (rotating through the served org's
@@ -245,11 +265,12 @@ func (s *LocalScheduler) SweepOnce(ctx context.Context) error {
 		return fmt.Errorf("list local work: %w", err)
 	}
 	for _, w := range work {
+		// An offer fails only after Close; the next process sweeps again.
 		if w.Push {
-			s.offer(Job{Org: s.org, RepoID: w.RepoID}, true, true)
+			_ = s.offer(Job{Org: s.org, RepoID: w.RepoID}, true, true)
 		}
 		if w.Pull {
-			s.offer(Job{Org: s.org, RepoID: w.RepoID}, false, true)
+			_ = s.offer(Job{Org: s.org, RepoID: w.RepoID}, false, true)
 		}
 	}
 	s.cursor = ""

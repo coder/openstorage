@@ -417,7 +417,14 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 		syncRef = repo.DefaultBranch
 		assertf(syncRef != "", "repo %s has empty default branch", repo.RepoID)
 	}
-	if err := s.queue.EnqueueSync(r.Context(), upsync.Job{
+	// The request is recorded above; a queue with a durable schedule
+	// (SQLite, ADR-50) must only offer the run, or it could re-mark a
+	// request that a run already claimed.
+	enqueue := s.queue.EnqueueSync
+	if o, ok := s.queue.(syncOfferer); ok {
+		enqueue = o.OfferSync
+	}
+	if err := enqueue(r.Context(), upsync.Job{
 		Org:    claims.Iss,
 		RepoID: repo.RepoID,
 		Ref:    syncRef,
@@ -486,7 +493,15 @@ func (s *syncServer) handlePushUpstream(w http.ResponseWriter, r *http.Request) 
 	// protocol (issue #79): a request that coalesces with a run that
 	// already claimed survives to that run's FinishPush. Force rides the
 	// durable marker, not the job — queue deduplication is keyed by repo.
-	err = s.ups.RequestPush(r.Context(), repo.RepoID, req.Force)
+	// A store with due times (the SQLite local schedule, ADR-50) records
+	// it with RequestPushNow: an explicit request makes a waiting retry
+	// due now and keeps its retry position. Implicit forward requests use
+	// RequestPush and join the backoff.
+	if pn, ok := s.ups.(pushNowRequester); ok {
+		err = pn.RequestPushNow(r.Context(), repo.RepoID, req.Force)
+	} else {
+		err = s.ups.RequestPush(r.Context(), repo.RepoID, req.Force)
+	}
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
 		writeErr(w, http.StatusBadRequest, "repository has no upstream base_repo")
@@ -503,6 +518,19 @@ func (s *syncServer) handlePushUpstream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"message": pushUpstreamAcceptedMsg})
+}
+
+// syncOfferer is the optional queue extension for pull runs whose request
+// the caller already recorded (jobs.Local; SQLite schedules without a
+// second write).
+type syncOfferer interface {
+	OfferSync(ctx context.Context, job upsync.Job) error
+}
+
+// pushNowRequester is the optional UpstreamStore extension for explicit
+// push requests (the meta adapter; RequestPush on stores without due times).
+type pushNowRequester interface {
+	RequestPushNow(ctx context.Context, repoID string, force bool) error
 }
 
 // handleDetachBase implements DELETE /api/v1/repos/base (scope repo:write):

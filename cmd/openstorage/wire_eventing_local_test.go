@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"path/filepath"
 	"testing"
@@ -36,5 +37,19 @@ func TestBuildLocalSyncQueueUsesDurableScheduleOnSQLite(t *testing.T) {
 	}
 	if worker.Requeue != nil || worker.RequeuePush != nil {
 		t.Fatal("SQLite worker still wires process-local requeue")
+	}
+	// The API's explicit triggers reach the schedule through these
+	// optional extensions: pull-upstream offers without re-marking, and
+	// push-upstream records with RequestPushNow.
+	if _, ok := queue.(interface {
+		OfferSync(ctx context.Context, job upsync.Job) error
+	}); !ok {
+		t.Fatalf("queue %T cannot offer an already recorded pull", queue)
+	}
+	_, ups := upsync.MetaStores(ms)
+	if _, ok := ups.(interface {
+		RequestPushNow(ctx context.Context, repoID string, force bool) error
+	}); !ok {
+		t.Fatalf("upstream store %T has no RequestPushNow", ups)
 	}
 }

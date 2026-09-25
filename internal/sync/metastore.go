@@ -159,6 +159,17 @@ func (s metaUpstreams) RequestPush(ctx context.Context, repoID string, force boo
 	return mapMetaErr(s.ms.RequestPush(ctx, repoID, force), ErrNotFound, nil)
 }
 
+// RequestPushNow records an explicit push request (API push-upstream). On
+// the SQLite local schedule (ADR-50) the same write makes a waiting retry
+// due now and keeps its retry position. Other backends have no due time,
+// so it is RequestPush there.
+func (s metaUpstreams) RequestPushNow(ctx context.Context, repoID string, force bool) error {
+	if ls, ok := s.ms.(meta.LocalScheduleStore); ok {
+		return mapMetaErr(ls.RequestPushNow(ctx, repoID, force), ErrNotFound, nil)
+	}
+	return s.RequestPush(ctx, repoID, force)
+}
+
 func (s metaUpstreams) BeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (Upstream, bool, string, error) {
 	row, claimed, force, stolenFrom, err := s.ms.TryBeginPush(ctx, repoID, holder, lease)
 	if err != nil {
