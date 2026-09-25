@@ -171,6 +171,9 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		    push_claim_force      INTEGER NOT NULL DEFAULT 0,
 		    push_run_count        INTEGER NOT NULL DEFAULT 0,
 		    push_success_count    INTEGER NOT NULL DEFAULT 0,
+		    push_attempt          INTEGER NOT NULL DEFAULT 0,
+		    push_due              INTEGER NOT NULL DEFAULT 0,
+		    sync_due              INTEGER NOT NULL DEFAULT 0,
 		    created_at    INTEGER NOT NULL
 		)`,
 	} {
@@ -198,6 +201,12 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		{"repo_upstreams", "push_claim_force", `push_claim_force INTEGER NOT NULL DEFAULT 0`},
 		{"repo_upstreams", "push_run_count", `push_run_count INTEGER NOT NULL DEFAULT 0`},
 		{"repo_upstreams", "push_success_count", `push_success_count INTEGER NOT NULL DEFAULT 0`},
+		// Local schedule state (issue #266, ADR-50): retry position and
+		// due times owned by the row. 0 means "first attempt, due now",
+		// so pending work recorded before the upgrade is due at once.
+		{"repo_upstreams", "push_attempt", `push_attempt INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "push_due", `push_due INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "sync_due", `sync_due INTEGER NOT NULL DEFAULT 0`},
 		// Purge tombstone column (issue #52) for data dirs predating it.
 		{"repos", "purged_at", `purged_at INTEGER`},
 	} {

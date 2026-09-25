@@ -58,3 +58,4 @@ has moved on, the linked issues/PRs in each record's text are the trail.
 | ADR-47 | [Cache repos get split commit-graphs, written by full hydrates](047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md) | issue #307 |
 | ADR-48 | [Metrics ride an opt-in, separate listener with fixed labels](048-metrics-ride-an-opt-in-separate-listener-with-fixed-labels.md) | issue #325 |
 | ADR-49 | [Read-side git children run under one per-request budget](049-read-side-git-children-run-under-one-per-request-budget.md) | issue #313 |
+| ADR-50 | [Local scheduling state is row-owned](050-local-scheduling-state-is-row-owned.md) | issue #266 |
