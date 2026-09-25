@@ -100,6 +100,11 @@ const shutdownDrainTimeout = 10 * time.Second
 // save reruns.
 const shutdownRunWait = 5 * time.Second
 
+// shutdownRestoreWait bounds how long cancelled runs get to record their
+// kept requests (one SQLite row write each) before the HTTP drain starts,
+// so the restore commits inside a supervisor's kill grace window.
+const shutdownRestoreWait = 2 * time.Second
+
 func cmdServe(ctx context.Context, args []string) error {
 	// A termination signal cancels the serve context (issue #174): the
 	// select at the bottom then drains HTTP and RETURNS, letting every
@@ -372,9 +377,9 @@ func cmdServe(ctx context.Context, args []string) error {
 		// Scheduled sync runs push to THIS listener (issue #342): stop
 		// starting runs and let in-flight ones finish while it still
 		// serves. Runs still going when the wait ends are cancelled and
-		// keep their requests for the next process.
-		rctx, rcancel := context.WithTimeout(dctx, shutdownRunWait)
-		drainRuns(rctx)
+		// record their kept requests before the HTTP drain.
+		rctx, rcancel := context.WithTimeout(dctx, shutdownRunWait+shutdownRestoreWait)
+		drainRuns(rctx, shutdownRunWait)
 		rcancel()
 		if err := httpSrv.Shutdown(dctx); err != nil {
 			fmt.Fprintf(os.Stderr, "openstorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)

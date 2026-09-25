@@ -69,7 +69,7 @@ func logSyncEgressWarnings(logger *slog.Logger, s syncEgressSettings) {
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, absence absenceSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, syncEgress syncEgressSettings, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(context.Context), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, absence absenceSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, syncEgress syncEgressSettings, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(context.Context, time.Duration), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
@@ -91,7 +91,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	fail := func(err error) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(context.Context), func(), error) {
+	fail := func(err error) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(context.Context, time.Duration), func(), error) {
 		msCleanup()
 		return nil, nil, nil, nil, nil, nil, err
 	}
@@ -431,9 +431,11 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	}
 	// drainRuns is serve's pre-listener-stop drain of scheduled sync runs
 	// (issue #342); only the SQLite local schedule has one.
-	drainRuns := func(ctx context.Context) {
-		if d, ok := queue.(interface{ DrainSyncRuns(context.Context) }); ok {
-			d.DrainSyncRuns(ctx)
+	drainRuns := func(ctx context.Context, wait time.Duration) {
+		if d, ok := queue.(interface {
+			DrainSyncRuns(context.Context, time.Duration)
+		}); ok {
+			d.DrainSyncRuns(ctx, wait)
 		}
 	}
 	return h, ms, verifier, maybeRepack, drainRuns, cleanup, nil

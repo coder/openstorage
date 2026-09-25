@@ -1,12 +1,11 @@
 // Shutdown controls for the SQLite local schedule (issue #342): Drain
-// waits for runs while serve's listener still serves, then cancels the rest,
-// and a cancelled run keeps its request (OutcomeRestore) with no
-// repo.sync.failed.
+// waits for runs while serve's listener still serves, then cancels the rest
+// and waits for them to record OutcomeRestore, which keeps each request
+// with no repo.sync.failed.
 
 package sync
 
 import (
-	"context"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
@@ -113,10 +112,8 @@ func TestLocalScheduleDrainKeepsInFlightRequests(t *testing.T) {
 		}
 		up.held(t)
 
-		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-		f.sched.Drain(ctx)
-		cancel()
-		f.sched.Close() // waits for the cancelled run's end-of-run write
+		// Drain returns only after the cancelled run recorded its restore.
+		f.sched.Drain(t.Context(), 50*time.Millisecond)
 		r := f.row(t, repo)
 		if !r.SyncPending || r.Syncing || r.RunCount != 0 {
 			t.Fatalf("after the drain: row %+v, want the request pending, unclaimed, no run counted", r)
@@ -150,10 +147,7 @@ func TestLocalScheduleDrainKeepsInFlightRequests(t *testing.T) {
 		f.sched.Start(0, time.Hour) // one sweep pass starts the run
 		up.held(t)
 
-		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-		f.sched.Drain(ctx)
-		cancel()
-		f.sched.Close()
+		f.sched.Drain(t.Context(), 50*time.Millisecond)
 		r := f.row(t, repo)
 		attempt, _ := f.readSchedule(t, repo)
 		if r.PushPending != 2 || r.PushSyncing || r.PushRunCount != 0 || attempt != 0 {
@@ -187,7 +181,7 @@ func TestLocalScheduleDrainKeepsInFlightRequests(t *testing.T) {
 		up.held(t)
 		drained := make(chan struct{})
 		go func() {
-			f.sched.Drain(t.Context()) // no deadline: waits for the run
+			f.sched.Drain(t.Context(), time.Hour) // waits for the run
 			close(drained)
 		}()
 		// A request recorded during the drain is kept, but starts no run.

@@ -343,13 +343,16 @@ func shutdownAborted(ctx context.Context) bool {
 }
 
 // Drain prepares shutdown while the loopback listener still serves (issue
-// #342). It stops the sweep and new runs, then waits for runs in flight
-// until ctx ends, and then cancels the remaining runs with errShutdown.
-// Enqueues still record their durable request; its run is left to the
-// next process's sweep. A cancelled run ends with OutcomeRestore and keeps
-// its request, so correctness does not depend on how long ctx allows.
-// Drain returns without waiting for cancelled runs; Close waits for them.
-func (s *LocalScheduler) Drain(ctx context.Context) {
+// #342). It stops the sweep and new runs, waits up to wait for runs in
+// flight, then cancels the remaining runs with errShutdown and waits for
+// them to record that. Enqueues still record their durable request; its
+// run is left to the next process's sweep. A cancelled run ends with
+// OutcomeRestore and keeps its request, so correctness does not depend on
+// wait. ctx bounds the whole drain: a run still unfinished when it ends is
+// left to Close, and if the process dies first, its claim expires with its
+// lease.
+func (s *LocalScheduler) Drain(ctx context.Context, wait time.Duration) {
+	assertf(wait >= 0, "Drain: negative wait %v", wait)
 	s.mu.Lock()
 	s.draining = true
 	stop := s.stop
@@ -363,10 +366,18 @@ func (s *LocalScheduler) Drain(ctx context.Context) {
 		s.runs.Wait() // no run starts once draining is set
 		close(done)
 	}()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
 	select {
 	case <-done:
+		return
+	case <-timer.C:
 	case <-ctx.Done():
-		s.cancelRuns(errShutdown)
+	}
+	s.cancelRuns(errShutdown)
+	select {
+	case <-done: // every cancelled run has written its restore
+	case <-ctx.Done():
 	}
 }
 
