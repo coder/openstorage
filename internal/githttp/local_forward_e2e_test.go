@@ -187,6 +187,9 @@ func TestLocalHookForwardBeforeCachePublication(t *testing.T) {
 		done <- pushResult{out, err}
 	}()
 	waitForFile(t, barrier+".ready", 30*time.Second)
+	// Observe for 20 s (past the sweep's 15 s start delay): the loop exits
+	// early only if the forward completed, which the checks below reject.
+	// A correct consumer claims and stays parked in its publication wait.
 	var before meta.RepoUpstream
 	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
 		before, err = ms.GetRepoUpstream(t.Context(), id)

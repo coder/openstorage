@@ -1054,19 +1054,22 @@ func TestLocalSchedulePublicationFence(t *testing.T) {
 		bare := up.addRepo(t, "own", "p2")
 		repo, _ := f.addRepo(t, "p2", up.host())
 		before := upstreamHead(t, bare)
-		f.wf.worker.WaitPublication = func(context.Context, string) error {
-			return errors.New("publication unverified")
-		}
+		up.down(t)
 		if err := f.ms.RequestPush(t.Context(), repo, true); err != nil {
 			t.Fatal(err)
 		}
-		f.sweep(t)
+		f.sweep(t) // transient failure: attempt 1, force kept
+		f.advance(time.Minute)
+		f.wf.worker.WaitPublication = func(context.Context, string) error {
+			return errors.New("publication unverified")
+		}
+		f.sweep(t) // the retry claims, then its wait fails
 		r := f.row(t, repo)
 		attempt, due := f.readSchedule(t, repo)
-		if r.PushSyncing || r.PushPending != 2 || r.PushRunCount != 0 || attempt != 0 ||
-			due != f.now().Add(localPublicationRetryDelay).UnixNano() || len(f.wf.rec.list()) != 0 {
-			t.Fatalf("after a failed wait: row %+v attempt %d due %d events %d; want force kept, attempt 0, due +%v, no run",
-				r, attempt, due, len(f.wf.rec.list()), localPublicationRetryDelay)
+		if r.PushSyncing || r.PushPending != 2 || r.PushRunCount != 1 || attempt != 1 ||
+			due != f.now().Add(localPublicationRetryDelay).UnixNano() || len(f.pushEvents(repo)) != 2 {
+			t.Fatalf("after a failed wait: row %+v attempt %d due %d events %d; want force kept, attempt 1, due +%v, no new run",
+				r, attempt, due, len(f.pushEvents(repo)), localPublicationRetryDelay)
 		}
 		if got := upstreamHead(t, bare); got != before {
 			t.Fatalf("upstream changed after a failed wait: %q", got)
