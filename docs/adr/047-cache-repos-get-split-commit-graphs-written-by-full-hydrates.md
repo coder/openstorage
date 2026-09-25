@@ -48,7 +48,7 @@ the existing graph has them.
     refresh is skipped when the sync saw more than `commitGraphMaxTips`
     (10,000) distinct tips.
   - **Shared admission and heap cap (#322).** A refresh joins the git
-    read API's chokepoint (ADR-48) through the leaf package
+    read API's chokepoint ([ADR-49](049-read-side-git-children-run-under-one-per-request-budget.md)) through the leaf package
     `internal/gitlimit`. It takes one slot of the same process-wide 8-slot
     pool as JSON reads with a non-blocking try, because it runs under the
     hydrate lock. The slot counts against the repository's per-repository
