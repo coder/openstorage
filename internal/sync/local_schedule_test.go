@@ -109,7 +109,11 @@ func (g *gateLanes) FinishPushOutcome(ctx context.Context, repoID, holder string
 	if err := g.enter("FinishPushOutcome", repoID); err != nil {
 		return Upstream{}, err
 	}
-	return g.LocalLanes.FinishPushOutcome(ctx, repoID, holder, o)
+	up, err := g.LocalLanes.FinishPushOutcome(ctx, repoID, holder, o)
+	if gerr := g.enter("FinishPushOutcome:after", repoID); gerr != nil {
+		return Upstream{}, gerr
+	}
+	return up, err
 }
 
 func (g *gateLanes) FinishSyncOutcome(ctx context.Context, repoID, holder string, o meta.SyncOutcome) (Upstream, error) {
@@ -962,4 +966,48 @@ func TestLocalScheduleEnqueueHints(t *testing.T) {
 			t.Fatal("an enqueue that lost the race with Close reported success")
 		}
 	})
+}
+
+// TestLocalScheduleMirrorBackAfterPushLifecycle: the success write marks
+// the mirror-back pull, but the sweep does not start it until the push run
+// has emitted its terminal event, as on the non-local path (AfterForward
+// runs after the emit). Review of #341.
+func TestLocalScheduleMirrorBackAfterPushLifecycle(t *testing.T) {
+	f := newLocalSchedFixture(t)
+	up := newHTTPUpstream(t)
+	up.addRepo(t, "own", "h4")
+	repo, _ := f.addRepo(t, "h4", up.host())
+	if err := f.ms.RequestPush(t.Context(), repo, false); err != nil {
+		t.Fatal(err)
+	}
+	reached, release := f.gate.hold("FinishPushOutcome:after", repo)
+	var once stdsync.Once
+	defer once.Do(release)
+	if err := f.sched.SweepOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	<-reached // the success write is done; the push has not emitted yet
+	if r := f.row(t, repo); !r.SyncPending {
+		t.Fatalf("success write did not mark the mirror-back: %+v", r)
+	}
+	if err := f.sched.SweepOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // a wrongly offered pull would start here
+	once.Do(release)
+	f.idle(t)
+	f.sweep(t)
+	pushDone, pullStarted := -1, -1
+	for i, e := range f.wf.rec.list() {
+		switch {
+		case e.Direction == DirectionPush && e.Type == EventSyncSucceeded:
+			pushDone = i
+		case e.Direction == "" && e.Type == EventSyncStarted && pullStarted < 0:
+			pullStarted = i
+		}
+	}
+	if pushDone < 0 || pullStarted < 0 || pullStarted < pushDone {
+		t.Fatalf("push succeeded at %d, mirror-back pull started at %d: want the push lifecycle first (%+v)",
+			pushDone, pullStarted, f.wf.rec.list())
+	}
 }

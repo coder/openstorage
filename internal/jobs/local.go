@@ -257,6 +257,11 @@ func (q *Local) Close() {
 	if !alreadyClosed {
 		close(q.repackDone) // unblock repack goroutines parked on the semaphore
 	}
+	// A scheduled sync queue (the SQLite sweep, ADR-50) would keep starting
+	// runs while deliveries and repacks drain: stop it first.
+	if st, ok := q.syncq.(interface{ Stop() }); ok {
+		st.Stop()
+	}
 	q.wg.Wait()
 	q.syncq.Close()
 }

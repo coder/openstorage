@@ -219,6 +219,12 @@ func (s *LocalScheduler) offer(job Job, push, fromSweep bool) error {
 	if s.inflight[key] {
 		return nil
 	}
+	if fromSweep && !push && s.inflight["push:"+job.RepoID] {
+		// A push run's success write marks its mirror-back pull before
+		// the run emits its terminal event. Start the pull on a later
+		// pass, after the push lifecycle, as AfterForward does off SQLite.
+		return nil
+	}
 	if fromSweep {
 		select {
 		case s.slots <- struct{}{}:
@@ -305,9 +311,9 @@ func (s *LocalScheduler) Start(delay, interval time.Duration) {
 	})
 }
 
-// Close stops the sweep, stops accepting runs, and waits for in-flight
-// runs. After it returns the scheduler makes no store calls.
-func (s *LocalScheduler) Close() {
+// Stop stops the sweep and stops accepting runs without waiting for runs
+// in flight.
+func (s *LocalScheduler) Stop() {
 	s.mu.Lock()
 	stop := s.stop
 	s.closed = true
@@ -315,6 +321,12 @@ func (s *LocalScheduler) Close() {
 	if stop != nil {
 		stop()
 	}
+}
+
+// Close stops the scheduler and waits for in-flight runs. After it returns
+// the scheduler makes no store calls.
+func (s *LocalScheduler) Close() {
+	s.Stop()
 	s.sweeping.Wait()
 	s.wg.Wait() // in-flight runs and sweep passes
 }
