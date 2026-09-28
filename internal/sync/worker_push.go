@@ -73,7 +73,7 @@ const defaultDetachPoll = 2 * time.Second
 // RunPush executes one outbound push-upstream run for job. Lifecycle,
 // abandonment, and event semantics mirror Run: detach cancels silently at
 // every stage, a stolen claim abandons loudly without terminal events, and
-// documented failures emit repo.sync.failed with direction "push".
+// documented failures emit repo.push_upstream.failed (issue #354).
 func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	w.assertReady()
 	assertf(job.Org != "" && job.RepoID != "", "RunPush: incomplete job %+v", job)

@@ -87,7 +87,7 @@ func (k loopbackKey) mint(org string, repo upsync.RepoInfo, ttl time.Duration, h
 	})
 }
 
-// webhookSink fans one repo.sync.* event out to the org's registered
+// webhookSink fans one repo.sync.* or repo.push_upstream.* event out to the org's registered
 // webhooks (sync.EventSink). Emission is fire-and-forget: failures are
 // logged, never propagated (the sync run outcome is already decided).
 type webhookSink struct {
