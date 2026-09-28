@@ -1203,6 +1203,185 @@ components:
       required:
         - tag
       type: object
+    GitPushEvent:
+      additionalProperties: false
+      description: A Git ref update. The X-Pierre-Event header identifies this payload as push; the body has no type field.
+      properties:
+        after:
+          description: The new commit SHA. All zeros for a deleted ref.
+          type: string
+        before:
+          description: The previous commit SHA. All zeros for a newly created ref.
+          type: string
+        customer_id:
+          description: The customer ID that owns the repository.
+          type: string
+        pushed_at:
+          description: When the push occurred, as an RFC 3339 timestamp.
+          format: date-time
+          type: string
+        ref:
+          description: The full Git ref name, for example refs/heads/main.
+          type: string
+        repository:
+          $ref: "#/components/schemas/GitPushEventRepository"
+          description: The repository that produced the event.
+      required:
+        - repository
+        - ref
+        - before
+        - after
+        - customer_id
+        - pushed_at
+      type: object
+    GitPushEventRepository:
+      additionalProperties: false
+      description: The repository that produced the event.
+      properties:
+        id:
+          description: The internal repository ID.
+          type: string
+        url:
+          description: The repository URL path, for example team/project.
+          type: string
+      required:
+        - id
+        - url
+      type: object
+    GitSyncEventRepository:
+      additionalProperties: false
+      description: The repository that produced the event.
+      properties:
+        id:
+          description: The internal repository ID.
+          type: string
+        url:
+          description: The repository URL path, for example team/project.
+          type: string
+      required:
+        - id
+        - url
+      type: object
+    GitSyncFailedEvent:
+      additionalProperties: false
+      description: Sent when a repository sync run fails, including failures after retries are exhausted and infrastructure failures. Internal cancellations do not produce this event. run_count includes the run that just finished.
+      properties:
+        completed_at:
+          description: When the sync run finished, as an RFC 3339 timestamp. Absent on started events.
+          format: date-time
+          type: string
+        error:
+          description: The failure message. Absent unless the sync failed.
+          type: string
+        is_first_sync:
+          description: Whether the repository had never synced successfully before this run began.
+          type: boolean
+        lifecycle_id:
+          description: The sync lifecycle ID. It can be absent on older deliveries.
+          type: string
+        repository:
+          $ref: "#/components/schemas/GitSyncEventRepository"
+          description: The repository that produced the event.
+        run_count:
+          description: Completed sync runs. For started events, this excludes the current run. For succeeded and failed events, it includes the current run.
+          format: int64
+          type: integer
+        started_at:
+          description: When the sync run began, as an RFC 3339 timestamp.
+          format: date-time
+          type: string
+        type:
+          description: The sync event type. It matches the X-Pierre-Event header.
+          enum:
+            - repo.sync.failed
+          type: string
+      required:
+        - type
+        - repository
+        - run_count
+        - is_first_sync
+        - started_at
+      type: object
+    GitSyncStartedEvent:
+      additionalProperties: false
+      description: Sent when a repository sync run begins, before the upstream fetch starts. run_count counts previously completed runs.
+      properties:
+        completed_at:
+          description: When the sync run finished, as an RFC 3339 timestamp. Absent on started events.
+          format: date-time
+          type: string
+        error:
+          description: The failure message. Absent unless the sync failed.
+          type: string
+        is_first_sync:
+          description: Whether the repository had never synced successfully before this run began.
+          type: boolean
+        lifecycle_id:
+          description: The sync lifecycle ID. It can be absent on older deliveries.
+          type: string
+        repository:
+          $ref: "#/components/schemas/GitSyncEventRepository"
+          description: The repository that produced the event.
+        run_count:
+          description: Completed sync runs. For started events, this excludes the current run. For succeeded and failed events, it includes the current run.
+          format: int64
+          type: integer
+        started_at:
+          description: When the sync run began, as an RFC 3339 timestamp.
+          format: date-time
+          type: string
+        type:
+          description: The sync event type. It matches the X-Pierre-Event header.
+          enum:
+            - repo.sync.started
+          type: string
+      required:
+        - type
+        - repository
+        - run_count
+        - is_first_sync
+        - started_at
+      type: object
+    GitSyncSucceededEvent:
+      additionalProperties: false
+      description: Sent when a repository sync run completes successfully. run_count includes the run that just finished.
+      properties:
+        completed_at:
+          description: When the sync run finished, as an RFC 3339 timestamp. Absent on started events.
+          format: date-time
+          type: string
+        error:
+          description: The failure message. Absent unless the sync failed.
+          type: string
+        is_first_sync:
+          description: Whether the repository had never synced successfully before this run began.
+          type: boolean
+        lifecycle_id:
+          description: The sync lifecycle ID. It can be absent on older deliveries.
+          type: string
+        repository:
+          $ref: "#/components/schemas/GitSyncEventRepository"
+          description: The repository that produced the event.
+        run_count:
+          description: Completed sync runs. For started events, this excludes the current run. For succeeded and failed events, it includes the current run.
+          format: int64
+          type: integer
+        started_at:
+          description: When the sync run began, as an RFC 3339 timestamp.
+          format: date-time
+          type: string
+        type:
+          description: The sync event type. It matches the X-Pierre-Event header.
+          enum:
+            - repo.sync.succeeded
+          type: string
+      required:
+        - type
+        - repository
+        - run_count
+        - is_first_sync
+        - started_at
+      type: object
     GrepFileMatchResponse:
       additionalProperties: false
       description: Matches grouped under a single file path.
@@ -2608,7 +2787,7 @@ paths:
         #### JWT claims
         Required scopes: `org:read`  
         Requires per repo scope: No
-      operationId: get_meta
+      operationId: meta-get
       responses:
         "200":
           content:
@@ -2857,7 +3036,7 @@ paths:
         #### JWT claims
         Required scopes: `org:read`  
         Requires per repo scope: No
-      operationId: list_repos
+      operationId: repos-list
       parameters:
         - description: Case-insensitive substring to match against the repository `url`. Trimmed before matching. When omitted or empty after trimming, the full repository list is returned.
           example: sdk
@@ -3013,7 +3192,7 @@ paths:
         #### JWT claims
         Required scopes: `repo:write`  
         Requires per repo scope: Yes
-      operationId: create_repo
+      operationId: repos-create
       parameters:
         - description: Optional default branch override. When present, it is used if the request body does not already specify one.
           example: main
@@ -3203,7 +3382,7 @@ paths:
         #### JWT claims
         Required scopes: `repo:write`  
         Requires per repo scope: Yes
-      operationId: delete_repo
+      operationId: repos-delete
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -3336,7 +3515,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: get_repo
+      operationId: repos-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -3461,7 +3640,7 @@ paths:
         #### JWT claims
         Required scopes: `repo:write`  
         Requires per repo scope: Yes
-      operationId: update_repo
+      operationId: repos-update
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -3623,7 +3802,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: archive
+      operationId: repos-archive-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -3768,7 +3947,7 @@ paths:
         #### JWT claims
         Required scopes: `repo:write`  
         Requires per repo scope: Yes
-      operationId: unset_base_repo
+      operationId: repos-upstream-delete
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -3883,7 +4062,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: blame
+      operationId: repos-blame-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -4046,7 +4225,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: get_branch
+      operationId: repos-branches-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -4177,7 +4356,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: delete_branch
+      operationId: repos-branches-delete
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -4322,7 +4501,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: list_branches
+      operationId: repos-branches-list
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -4462,7 +4641,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: create_branch
+      operationId: repos-branches-create
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -4765,7 +4944,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: get_commit
+      operationId: repos-commits-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -4907,7 +5086,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: commit_pack
+      operationId: repos-commits-create
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -5057,7 +5236,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: list_commits
+      operationId: repos-commits-list
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -5221,7 +5400,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: get_commit_diff
+      operationId: repos-diff-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -5416,7 +5595,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: diff_commit
+      operationId: repos-commits-createFromDiff
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -5552,7 +5731,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: get_file
+      operationId: repos-files-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -5829,7 +6008,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: head_file
+      operationId: repos-files-metadata-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -6093,7 +6272,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: list_files
+      operationId: repos-files-list
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -6256,7 +6435,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: list_files_metadata
+      operationId: repos-files-metadata-list
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -6419,7 +6598,7 @@ paths:
         #### JWT claims
         Required scopes: `repo:write`  
         Requires per repo scope: Yes
-      operationId: create_generic_git_credential
+      operationId: repos-gitCredentials-create
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -6547,7 +6726,7 @@ paths:
         #### JWT claims
         Required scopes: `repo:write`  
         Requires per repo scope: Yes
-      operationId: delete_generic_git_credential
+      operationId: repos-gitCredentials-delete
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -6663,7 +6842,7 @@ paths:
         #### JWT claims
         Required scopes: `repo:write`  
         Requires per repo scope: Yes
-      operationId: update_generic_git_credential
+      operationId: repos-gitCredentials-update
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -6798,7 +6977,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: grep
+      operationId: repos-grep
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -6945,7 +7124,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: merge_branch
+      operationId: repos-merge
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -7091,7 +7270,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: preview_merge
+      operationId: repos-previewMerge
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -7264,7 +7443,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: notes_delete
+      operationId: repos-notes-delete
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -7401,7 +7580,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: notes_read
+      operationId: repos-notes-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -7544,7 +7723,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: notes_write
+      operationId: repos-notes-write
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -7694,6 +7873,11 @@ paths:
         - Notes
       x-permission-scopes:
         - git:write
+      x-pierre-operation:
+        mapping:
+          add: repos.notes.create
+          append: repos.notes.append
+        propertyName: action
       x-requires-repo-scope: true
       x-stability: stable
   /api/repos/{repo_name}/notes/refs:
@@ -7703,7 +7887,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: list_notes_refs
+      operationId: repos-notes-refs-list
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -7844,7 +8028,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: pull_upstream
+      operationId: repos-pullUpstream
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -8116,7 +8300,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: restore_commit
+      operationId: repos-commits-restore
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -8255,7 +8439,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: get_tag
+      operationId: repos-tags-get
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -8380,7 +8564,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
-      operationId: list_tags
+      operationId: repos-tags-list
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -8513,7 +8697,7 @@ paths:
         #### JWT claims
         Required scopes: `git:write`  
         Requires per repo scope: Yes
-      operationId: create_tag
+      operationId: repos-tags-create
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -8643,7 +8827,7 @@ paths:
         #### JWT claims
         Required scopes: `git:read`, `git:write`  
         Requires per repo scope: Yes
-      operationId: delete_tag
+      operationId: repos-tags-delete
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
           example: my-demo-repository
@@ -14323,3 +14507,136 @@ tags:
     name: Notes
   - description: Read metadata about the Code Storage deployment that serves your organisation, such as its cloud location and inbound IP addresses.
     name: Organization
+webhooks:
+  push:
+    post:
+      description: Sent when a Git ref is updated in a repository. Each updated ref produces a separate event. The event type is in X-Pierre-Event, not in the JSON body.
+      operationId: webhooks-push
+      parameters:
+        - description: The event type for this delivery.
+          in: header
+          name: X-Pierre-Event
+          required: true
+          schema:
+            enum:
+              - push
+            type: string
+        - description: Signature in the form t=<unix_timestamp>,sha256=<hex_signature>. Verify HMAC-SHA256 with the subscription secret over the timestamp, a period, and the raw request body. Check the timestamp to reject old deliveries.
+          in: header
+          name: X-Pierre-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitPushEvent"
+        description: The push event payload.
+        required: true
+      responses:
+        2XX:
+          description: The receiver accepted the delivery. Return any 2xx status to acknowledge it.
+      security: []
+      summary: Git ref updated
+      tags:
+        - Webhooks
+  repo.sync.failed:
+    post:
+      description: Sent when a repository sync run fails, including failures after retries are exhausted and infrastructure failures. Internal cancellations do not produce this event. run_count includes the run that just finished.
+      operationId: webhooks-repo-sync-failed
+      parameters:
+        - description: The event type for this delivery.
+          in: header
+          name: X-Pierre-Event
+          required: true
+          schema:
+            enum:
+              - repo.sync.failed
+            type: string
+        - description: Signature in the form t=<unix_timestamp>,sha256=<hex_signature>. Verify HMAC-SHA256 with the subscription secret over the timestamp, a period, and the raw request body. Check the timestamp to reject old deliveries.
+          in: header
+          name: X-Pierre-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitSyncFailedEvent"
+        description: The repo.sync.failed event payload.
+        required: true
+      responses:
+        2XX:
+          description: The receiver accepted the delivery. Return any 2xx status to acknowledge it.
+      security: []
+      summary: Repository sync failed
+      tags:
+        - Webhooks
+  repo.sync.started:
+    post:
+      description: Sent when a repository sync run begins, before the upstream fetch starts. run_count counts previously completed runs.
+      operationId: webhooks-repo-sync-started
+      parameters:
+        - description: The event type for this delivery.
+          in: header
+          name: X-Pierre-Event
+          required: true
+          schema:
+            enum:
+              - repo.sync.started
+            type: string
+        - description: Signature in the form t=<unix_timestamp>,sha256=<hex_signature>. Verify HMAC-SHA256 with the subscription secret over the timestamp, a period, and the raw request body. Check the timestamp to reject old deliveries.
+          in: header
+          name: X-Pierre-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitSyncStartedEvent"
+        description: The repo.sync.started event payload.
+        required: true
+      responses:
+        2XX:
+          description: The receiver accepted the delivery. Return any 2xx status to acknowledge it.
+      security: []
+      summary: Repository sync started
+      tags:
+        - Webhooks
+  repo.sync.succeeded:
+    post:
+      description: Sent when a repository sync run completes successfully. run_count includes the run that just finished.
+      operationId: webhooks-repo-sync-succeeded
+      parameters:
+        - description: The event type for this delivery.
+          in: header
+          name: X-Pierre-Event
+          required: true
+          schema:
+            enum:
+              - repo.sync.succeeded
+            type: string
+        - description: Signature in the form t=<unix_timestamp>,sha256=<hex_signature>. Verify HMAC-SHA256 with the subscription secret over the timestamp, a period, and the raw request body. Check the timestamp to reject old deliveries.
+          in: header
+          name: X-Pierre-Signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitSyncSucceededEvent"
+        description: The repo.sync.succeeded event payload.
+        required: true
+      responses:
+        2XX:
+          description: The receiver accepted the delivery. Return any 2xx status to acknowledge it.
+      security: []
+      summary: Repository sync succeeded
+      tags:
+        - Webhooks
