@@ -232,7 +232,7 @@ committer_email, date (RFC3339)}`.
 - Requires **both** scopes: the run exports every local head and tag, so a write-only
   token must not publish content it cannot clone.
 - Non-force by default. A ref the upstream refuses (non-fast-forward) fails the run, with
-  per-ref reasons in the `repo.sync.failed` event's `rejected_refs`. `force: true` opts
+  per-ref reasons in the `repo.push_upstream.failed` event's `rejected_refs`. `force: true` opts
   into `+refs`, and survives coalescing (a forced request is never downgraded).
 - The push is atomic: one refused ref fails the whole batch and leaves the upstream
   untouched.
@@ -245,12 +245,12 @@ committer_email, date (RFC3339)}`.
   [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](configuration.md#openstorage_sync_push_allow_private)
   opts internal forges in.
 
-**Events and cancellation:** outbound runs emit the same `repo.sync.*` events with
-`direction: "push"` ([webhooks](webhooks.md)). `DELETE /repos/base` silently cancels
+**Events and cancellation:** outbound runs emit `repo.push_upstream.*` events
+([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. `DELETE /repos/base` silently cancels
 in-flight runs in both directions. With a SQLite or PostgreSQL database, a run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
-a new `repo.sync.started`.
+a new `repo.sync.started` (outbound: `repo.push_upstream.started`).
 
 **Ref policies fail closed:** any policy op denies both pull-upstream and push-upstream.
 The same gate covers `forward_pushes`: a git push from a token that carries any

@@ -388,7 +388,7 @@ func TestLocalScheduleFinalP2Replay(t *testing.T) {
 	if r.PushSyncing || r.PushPending != 1 || attempt != 1 || due != f.now().Add(time.Minute).UnixNano() {
 		t.Fatalf("after A: row %+v attempt %d due %d; want pending 1, attempt 1, due +1m in one write", r, attempt, due)
 	}
-	assertPushTypes(t, f.pushEvents(repo), EventSyncStarted, EventSyncFailed)
+	assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamFailed)
 
 	// Not due: a sweep starts nothing.
 	f.sweep(t)
@@ -406,7 +406,7 @@ func TestLocalScheduleFinalP2Replay(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.idle(t)
-	assertPushTypes(t, f.pushEvents(repo), EventSyncStarted, EventSyncFailed, EventSyncStarted, EventSyncSucceeded)
+	assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamFailed, EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 	if got := upstreamHead(t, bare); got != head {
 		t.Fatalf("upstream main = %q, want %q", got, head)
 	}
@@ -420,7 +420,7 @@ func TestLocalScheduleFinalP2Replay(t *testing.T) {
 	}
 	f.sweep(t)
 	ev := f.pushEvents(repo)
-	if len(ev) != 6 || ev[5].Type != EventSyncSucceeded {
+	if len(ev) != 6 || ev[5].Type != EventPushUpstreamSucceeded {
 		t.Fatalf("hook intent after the covering run: events %+v", ev)
 	}
 	if f.wf.worker.deferredRetry != nil {
@@ -455,7 +455,7 @@ func TestLocalScheduleNewerIntentSurvives(t *testing.T) {
 		}
 		f.sweep(t)
 		ev := f.pushEvents(repo)
-		if len(ev) != 4 || !ev[2].Forced || ev[3].Type != EventSyncSucceeded {
+		if len(ev) != 4 || !ev[2].Forced || ev[3].Type != EventPushUpstreamSucceeded {
 			t.Fatalf("follow-up run: %+v, want a forced successful second run", ev)
 		}
 		if upstreamHead(t, bare) != head {
@@ -647,7 +647,7 @@ func TestLocalScheduleShutdownAndRestart(t *testing.T) {
 	f.sweep(t)
 	f.sweep(t)
 	ev := f.pushEvents(repo)
-	if len(ev) != 4 || ev[3].Type != EventSyncSucceeded || upstreamHead(t, bare) != head {
+	if len(ev) != 4 || ev[3].Type != EventPushUpstreamSucceeded || upstreamHead(t, bare) != head {
 		t.Fatalf("after the due time: %+v, want exactly one successful retry", ev)
 	}
 }
@@ -916,7 +916,7 @@ func TestLocalScheduleEnqueueHints(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.idle(t)
-		assertPushTypes(t, f.pushEvents(repo), EventSyncStarted, EventSyncFailed, EventSyncStarted, EventSyncSucceeded)
+		assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamFailed, EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 		if got := upstreamHead(t, bare); got != head {
 			t.Fatalf("upstream main = %q, want %q", got, head)
 		}
@@ -1000,7 +1000,7 @@ func TestLocalScheduleMirrorBackAfterPushLifecycle(t *testing.T) {
 	pushDone, pullStarted := -1, -1
 	for i, e := range f.wf.rec.list() {
 		switch {
-		case e.Direction == DirectionPush && e.Type == EventSyncSucceeded:
+		case e.Direction == DirectionPush && e.Type == EventPushUpstreamSucceeded:
 			pushDone = i
 		case e.Direction == "" && e.Type == EventSyncStarted && pullStarted < 0:
 			pullStarted = i
@@ -1043,7 +1043,7 @@ func TestLocalSchedulePublicationFence(t *testing.T) {
 		}
 		close(release)
 		f.idle(t)
-		assertPushTypes(t, f.pushEvents(repo), EventSyncStarted, EventSyncSucceeded)
+		assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 		if got := upstreamHead(t, bare); got != head {
 			t.Fatalf("upstream main = %q, want %q", got, head)
 		}

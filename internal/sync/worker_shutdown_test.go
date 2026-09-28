@@ -94,13 +94,13 @@ func TestRunShutdownRestoresRequest(t *testing.T) {
 		if r.PushRunCount != 0 || r.PushPending != PushPendingForce || r.PushSyncing || r.SyncPending {
 			t.Fatalf("after the shutdown: %+v, want no run counted, force pending, no claim, no mirror-back", r)
 		}
-		assertEventTypes(t, eventsFor(f, "repo_s2"), EventSyncStarted)
+		assertEventTypes(t, eventsFor(f, "repo_s2"), EventPushUpstreamStarted)
 
 		if err := f.worker.RunPush(t.Context(), job); err != nil {
 			t.Fatalf("rerun: %v", err)
 		}
 		ev := eventsFor(f, "repo_s2")
-		assertEventTypes(t, ev, EventSyncStarted, EventSyncStarted, EventSyncSucceeded)
+		assertEventTypes(t, ev, EventPushUpstreamStarted, EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 		if !ev[1].Forced {
 			t.Fatal("the rerun lost the kept force level")
 		}

@@ -23,6 +23,7 @@ the body omits it. `GET` never echoes secrets.
 
 ```
 X-Pierre-Event: <event_type>                     # push | repo.sync.started | repo.sync.succeeded | repo.sync.failed
+                                                 # open.storage extension: repo.push_upstream.started | .succeeded | .failed
 X-Pierre-Signature: t=<unix_seconds>,sha256=<hex_hmac>
 Content-Type: application/json
 User-Agent: Pierre-Webhook/1.0
@@ -81,26 +82,37 @@ Payloads carry `type`, repo identity, and sync metadata. Exact field tables:
 - `"session unavailable"`
 - `"sync failed"`
 
-**Push direction** (open.storage extension; see
-[Upstream sync](http-api.md#upstream-sync)). Outbound push-upstream runs reuse the same
-three event types:
+These three events cover inbound (pull) runs only, and their bodies carry only the fields
+of upstream's schemas.
+
+### `repo.push_upstream.started` / `repo.push_upstream.succeeded` / `repo.push_upstream.failed`
+
+open.storage extension for outbound push-upstream runs (see
+[Upstream sync](http-api.md#upstream-sync)). Upstream has no outbound-run event. The body
+has the `repo.sync.*` fields, with `type` set to the event name, plus:
 
 | Field | Meaning |
 |---|---|
-| `direction: "push"` | Present on push runs only. Inbound pull payloads are unchanged on the wire (no `direction` field), so absence means pull |
+| `direction: "push"` | Always present. It predates the separate event names and is kept so receivers that check it keep working |
 | `forced: true` | Optional; the run used force refspecs |
-| `rejected_refs: [{ref, reason}]` | On `repo.sync.failed` with `error: "push rejected by upstream"`: each ref the upstream refused (e.g. `non-fast-forward`). The forward is atomic — one refused ref fails the whole batch and leaves the upstream untouched — so the array also lists innocent refs with reason `atomic push failed` |
+| `rejected_refs: [{ref, reason}]` | On `repo.push_upstream.failed` with `error: "push rejected by upstream"`: each ref the upstream refused (e.g. `non-fast-forward`). The forward is atomic — one refused ref fails the whole batch and leaves the upstream untouched — so the array also lists innocent refs with reason `atomic push failed` |
 | `error` | The strings above, plus `"failed to push to upstream"` (generic outbound push failure) and `"push rejected by upstream"` |
 | `run_count` / `is_first_sync` | Count outbound runs independently of inbound ones |
 
-Upstream's sync schemas set `additionalProperties: false`, so the `direction`, `forced` and
-`rejected_refs` fields are a
-[recorded deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec).
+> [!IMPORTANT]
+> **Migration ([#354](https://github.com/coder/openstorage/issues/354)):** earlier releases
+> sent outbound runs as `repo.sync.*` with `direction: "push"`, which upstream's schemas
+> reject (`additionalProperties: false`). Receivers that watched `repo.sync.*` for
+> `direction: "push"` must handle `repo.push_upstream.*` instead. The body is unchanged apart
+> from `type`. During a rolling upgrade, replicas that have not upgraded yet still send the
+> old names. Deliveries queued before the upgrade keep the event name and body they were
+> queued with.
 
 ### Unknown events
 
 SDKs pass unrecognized `X-Pierre-Event` values through as `{type, raw}`, so new event
-types are safe to add.
+types are safe to add. Receivers should answer 2xx for event types they ignore. A non-2xx
+answer makes the backend retry the delivery and then discard it.
 
 ## Implementation guidance
 

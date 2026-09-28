@@ -102,11 +102,11 @@ func TestPushUpstreamLifecycle(t *testing.T) {
 		if accepted["message"] != "Repository push initiated successfully" || len(accepted) != 1 {
 			t.Fatalf("202 body = %s", respBody)
 		}
-		started := s.waitEvent(t, upsync.EventSyncStarted)
+		started := s.waitEvent(t, upsync.EventPushUpstreamStarted)
 		if started.Direction != upsync.DirectionPush || started.RunCount != 0 || !started.IsFirstSync || started.Forced {
 			t.Fatalf("bad push started event: %+v", started)
 		}
-		done := s.waitEvent(t, upsync.EventSyncSucceeded)
+		done := s.waitEvent(t, upsync.EventPushUpstreamSucceeded)
 		if done.Direction != upsync.DirectionPush || done.RunCount != 1 || done.Error != "" {
 			t.Fatalf("bad push succeeded event: %+v", done)
 		}
@@ -134,8 +134,8 @@ func TestPushUpstreamLifecycle(t *testing.T) {
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("push-upstream status %d: %s", resp.StatusCode, respBody)
 		}
-		s.waitEvent(t, upsync.EventSyncStarted)
-		failed := s.waitEvent(t, upsync.EventSyncFailed)
+		s.waitEvent(t, upsync.EventPushUpstreamStarted)
+		failed := s.waitEvent(t, upsync.EventPushUpstreamFailed)
 		if failed.Error != upsync.FailRejected || failed.Direction != upsync.DirectionPush {
 			t.Fatalf("bad rejected event: %+v", failed)
 		}
@@ -151,11 +151,11 @@ func TestPushUpstreamLifecycle(t *testing.T) {
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("forced push-upstream status %d: %s", resp.StatusCode, respBody)
 		}
-		forcedStarted := s.waitEvent(t, upsync.EventSyncStarted)
+		forcedStarted := s.waitEvent(t, upsync.EventPushUpstreamStarted)
 		if !forcedStarted.Forced {
 			t.Fatalf("forced run not marked forced: %+v", forcedStarted)
 		}
-		s.waitEvent(t, upsync.EventSyncSucceeded)
+		s.waitEvent(t, upsync.EventPushUpstreamSucceeded)
 		if got := upstreamSHA(t, upRoot, "own", "proj", "refs/heads/main"); got != localHead {
 			t.Fatalf("upstream main = %q, want force-updated %q", got, localHead)
 		}

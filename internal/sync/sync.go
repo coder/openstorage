@@ -253,7 +253,7 @@ type UpstreamStore interface {
 	FinishPush(ctx context.Context, repoID, holder string, success bool) (Upstream, error)
 }
 
-// EventSink receives one repo.sync.* event for fan-out to the org's
+// EventSink receives one repo.sync.* or repo.push_upstream.* event for fan-out to the org's
 // registered webhooks (docs/reference/webhooks.md). payload is the exact JSON body to sign and
 // deliver; implementations must not mutate it. The webhook-delivery slice
 // provides the production sink; tests use recorders.

@@ -153,14 +153,14 @@ func TestLocalScheduleDrainKeepsInFlightRequests(t *testing.T) {
 		if r.PushPending != 2 || r.PushSyncing || r.PushRunCount != 0 || attempt != 0 {
 			t.Fatalf("after the drain: row %+v attempt %d, want force pending, unclaimed, no run counted, attempt 0", r, attempt)
 		}
-		assertPushTypes(t, f.pushEvents(repo), EventSyncStarted)
+		assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted)
 
 		up.hold.Store(false)
 		f.restart(t)
 		f.advance(shutdownRestoreDelay)
 		f.sweep(t)
 		ev := f.pushEvents(repo)
-		assertPushTypes(t, ev, EventSyncStarted, EventSyncStarted, EventSyncSucceeded)
+		assertPushTypes(t, ev, EventPushUpstreamStarted, EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 		if !ev[1].Forced {
 			t.Fatal("the rerun lost the kept force level")
 		}

@@ -41,6 +41,11 @@ const (
 	EventSyncStarted   = "repo.sync.started"
 	EventSyncSucceeded = "repo.sync.succeeded"
 	EventSyncFailed    = "repo.sync.failed"
+	// Outbound push-upstream run events (open.storage extension, issue
+	// #354; emitted by the upstream-sync worker's push lane).
+	EventPushUpstreamStarted   = "repo.push_upstream.started"
+	EventPushUpstreamSucceeded = "repo.push_upstream.succeeded"
+	EventPushUpstreamFailed    = "repo.push_upstream.failed"
 )
 
 // Webhook is one registered delivery endpoint. Secret is the HMAC signing
