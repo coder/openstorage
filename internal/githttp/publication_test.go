@@ -160,17 +160,29 @@ func TestPushPublicationWait_HeldUntilPublished(t *testing.T) {
 			hold := pubHold(t, repo, "refs/heads/done", "refs/heads/main")
 			pubRelease(t, hold, "refs/heads/done")
 
-			// Lockstep: the wait blocks in afterPass until the test reads
-			// the verdict, so the publish happens strictly between polls.
+			// Lockstep: afterPass hands the verdict over, then blocks
+			// until the next nextPoll resumes it, so every change the test
+			// makes between two nextPoll calls lands strictly between
+			// passes. Without the resume, the wait ran on into its next
+			// pass while the test was still publishing (issue #356).
 			polls := make(chan bool)
+			resume := make(chan struct{})
 			w := newPublicationWait(filepath.Join(repo, pushHoldDir), pubRoomy)
-			w.afterPass = func(held bool) { polls <- held }
+			w.afterPass = func(held bool) {
+				polls <- held
+				<-resume
+			}
 			done := make(chan error, 1)
 			go func() { done <- w.wait(t.Context()) }()
+			paused := false // the wait is blocked in afterPass
 			nextPoll := func() bool {
 				t.Helper()
+				if paused {
+					resume <- struct{}{}
+				}
 				select {
 				case held := <-polls:
+					paused = true
 					return held
 				case err := <-done:
 					t.Fatalf("wait returned %v before the expected poll", err)
@@ -201,10 +213,15 @@ func TestPushPublicationWait_HeldUntilPublished(t *testing.T) {
 			if held := nextPoll(); !held {
 				t.Fatal("restored hold stopped holding")
 			}
+			// Outlast the poll interval before publishing: a lockstep
+			// that let the wait run ahead would now report a stale held
+			// verdict every time instead of rarely under load.
+			time.Sleep(2 * publicationPollInterval)
 			tc.publish(t, hold)
 			if held := nextPoll(); held {
 				t.Fatal("still held after publication")
 			}
+			resume <- struct{}{} // let the final pass return
 			if err := <-done; err != nil {
 				t.Fatalf("wait after publication: %v", err)
 			}
