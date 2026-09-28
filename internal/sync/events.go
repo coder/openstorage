@@ -6,10 +6,21 @@ import (
 )
 
 // Sync lifecycle event types (docs/reference/webhooks.md, X-Pierre-Event values).
+// Inbound runs only: upstream's schemas for these set additionalProperties:
+// false, so their bodies never carry the outbound fields below.
 const (
 	EventSyncStarted   = "repo.sync.started"
 	EventSyncSucceeded = "repo.sync.succeeded"
 	EventSyncFailed    = "repo.sync.failed"
+)
+
+// Outbound push-upstream run event types (open.storage extension, issue
+// #354). Upstream has no outbound-run event, so these carry the same body as
+// the sync events plus direction/forced/rejected_refs under their own names.
+const (
+	EventPushUpstreamStarted   = "repo.push_upstream.started"
+	EventPushUpstreamSucceeded = "repo.push_upstream.succeeded"
+	EventPushUpstreamFailed    = "repo.push_upstream.failed"
 )
 
 // Exact documented repo.sync.failed error strings (docs/reference/webhooks.md — receivers may
@@ -31,11 +42,14 @@ const (
 
 // DirectionPush marks outbound (local -> upstream) runs in event payloads
 // (issue #90). Inbound runs omit the field entirely so pre-#90 pull event
-// bodies stay byte-identical on the wire.
+// bodies stay byte-identical on the wire. Since issue #354 the event type
+// already tells the directions apart; the field stays so receivers that
+// checked it keep working.
 const DirectionPush = "push"
 
-// Event is the repo.sync.* webhook payload (docs/upstream/guides/webhooks.md
-// field tables). CompletedAt/Error are only present on terminal events.
+// Event is the repo.sync.* and repo.push_upstream.* webhook payload
+// (docs/upstream/guides/webhooks.md field tables). CompletedAt/Error are only
+// present on terminal events.
 type Event struct {
 	Type        string          `json:"type"`
 	Repository  EventRepository `json:"repository"`
@@ -77,13 +91,18 @@ func eventTime(t time.Time) string {
 // marshal serializes the event payload. Guarded by asserts because every
 // field is produced internally — a malformed event is a programming error.
 func (e Event) marshal() []byte {
-	assertf(e.Type == EventSyncStarted || e.Type == EventSyncSucceeded || e.Type == EventSyncFailed,
-		"marshal: bad event type %q", e.Type)
+	inbound := e.Type == EventSyncStarted || e.Type == EventSyncSucceeded || e.Type == EventSyncFailed
+	outbound := e.Type == EventPushUpstreamStarted || e.Type == EventPushUpstreamSucceeded || e.Type == EventPushUpstreamFailed
+	assertf(inbound || outbound, "marshal: bad event type %q", e.Type)
+	started := e.Type == EventSyncStarted || e.Type == EventPushUpstreamStarted
+	failed := e.Type == EventSyncFailed || e.Type == EventPushUpstreamFailed
 	assertf(e.Repository.ID != "" && e.Repository.URL != "", "marshal: incomplete repository (%+v)", e.Repository)
 	assertf(e.StartedAt != "", "marshal: missing started_at")
-	assertf((e.Type == EventSyncFailed) == (e.Error != ""), "marshal: error field mismatch for %s", e.Type)
-	assertf((e.Type != EventSyncStarted) == (e.CompletedAt != ""), "marshal: completed_at mismatch for %s", e.Type)
+	assertf(failed == (e.Error != ""), "marshal: error field mismatch for %s", e.Type)
+	assertf(!started == (e.CompletedAt != ""), "marshal: completed_at mismatch for %s", e.Type)
 	assertf(e.Direction == "" || e.Direction == DirectionPush, "marshal: bad direction %q", e.Direction)
+	// The type names the direction; the body field must agree (issue #354).
+	assertf(outbound == (e.Direction == DirectionPush), "marshal: direction %q on %s", e.Direction, e.Type)
 	assertf(e.Direction == DirectionPush || (!e.Forced && len(e.RejectedRefs) == 0),
 		"marshal: push-only fields on a pull event")
 	assertf(len(e.RejectedRefs) == 0 || e.Error == FailRejected,

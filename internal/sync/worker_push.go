@@ -156,8 +156,8 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 		Forced:      force,
 	}
 	started := base
-	started.Type = EventSyncStarted
-	w.emitDetached(ctx, job.Org, EventSyncStarted, started.marshal())
+	started.Type = EventPushUpstreamStarted
+	w.emitDetached(ctx, job.Org, EventPushUpstreamStarted, started.marshal())
 
 	rejected, runErr := w.transferPush(ctx, job, repo, up, holder, force)
 	if errors.Is(runErr, errDetached) {
@@ -217,15 +217,15 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	terminal.RunCount = fin.PushRunCount // includes the run that just finished
 	terminal.CompletedAt = eventTime(time.Now())
 	if runErr == nil {
-		terminal.Type = EventSyncSucceeded
-		w.emitDetached(ctx, job.Org, EventSyncSucceeded, terminal.marshal())
+		terminal.Type = EventPushUpstreamSucceeded
+		w.emitDetached(ctx, job.Org, EventPushUpstreamSucceeded, terminal.marshal())
 	} else {
-		terminal.Type = EventSyncFailed
+		terminal.Type = EventPushUpstreamFailed
 		terminal.Error = failureCode(runErr)
 		if terminal.Error == FailRejected {
 			terminal.RejectedRefs = rejected
 		}
-		w.emitDetached(ctx, job.Org, EventSyncFailed, terminal.marshal())
+		w.emitDetached(ctx, job.Org, EventPushUpstreamFailed, terminal.marshal())
 		w.Logger.Warn("push-upstream failed",
 			"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
 	}

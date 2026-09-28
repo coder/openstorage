@@ -63,7 +63,7 @@ func TestPushRunCleanPushSucceeds(t *testing.T) {
 	}
 
 	events := f.rec.list()
-	assertEventTypes(t, events, EventSyncStarted, EventSyncSucceeded)
+	assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 	started, done := events[0], events[1]
 	if started.Direction != DirectionPush || started.Forced || started.RunCount != 0 || !started.IsFirstSync {
 		t.Fatalf("bad started event: %+v", started)
@@ -124,7 +124,7 @@ func TestPushRunNonFastForwardRejectsAtomically(t *testing.T) {
 	}
 
 	events := f.rec.list()
-	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamFailed)
 	failed := events[1]
 	if failed.Error != FailRejected || failed.Direction != DirectionPush {
 		t.Fatalf("bad failed event: %+v", failed)
@@ -164,7 +164,7 @@ func TestPushRunForceOverridesNonFastForward(t *testing.T) {
 	}
 
 	events := f.rec.list()
-	assertEventTypes(t, events, EventSyncStarted, EventSyncSucceeded)
+	assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 	if !events[0].Forced || !events[1].Forced {
 		t.Fatalf("force flag missing from events: %+v", events)
 	}
@@ -182,7 +182,7 @@ func TestPushRunEmptyLocalRepoSucceeds(t *testing.T) {
 	if err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pd"}); err != nil {
 		t.Fatalf("RunPush: %v", err)
 	}
-	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncSucceeded)
+	assertEventTypes(t, f.rec.list(), EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 }
 
 // TestPushRunAuthFailure: an upstream demanding credentials nobody stored
@@ -206,7 +206,7 @@ func TestPushRunAuthFailure(t *testing.T) {
 		t.Fatalf("auth failure classified transient: %v", err)
 	}
 	events := f.rec.list()
-	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamFailed)
 	if events[1].Error != FailAuth {
 		t.Fatalf("error = %q, want %q", events[1].Error, FailAuth)
 	}
@@ -239,7 +239,7 @@ func TestPushRunUnreachableRemarksPending(t *testing.T) {
 		t.Fatalf("unreachable failure not classified transient: %v", err)
 	}
 	events := f.rec.list()
-	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamFailed)
 	if events[1].Error != FailUnreachable {
 		t.Fatalf("error = %q, want %q", events[1].Error, FailUnreachable)
 	}
@@ -306,7 +306,7 @@ func TestPushRunDetachMidRunEmitsNoTerminalEvent(t *testing.T) {
 	}
 	// started was emitted before the detach; no succeeded/failed after it,
 	// and nothing reached the upstream.
-	assertEventTypes(t, f.rec.list(), EventSyncStarted)
+	assertEventTypes(t, f.rec.list(), EventPushUpstreamStarted)
 	if refs := testGit(t, f.upstreamDir, "-C", bare, "for-each-ref"); refs != "" {
 		t.Fatalf("detached run still pushed refs upstream: %q", refs)
 	}
@@ -357,7 +357,7 @@ func TestPushRunDetachDuringUpstreamPushKillsSubprocess(t *testing.T) {
 	}
 	// started was emitted before the detach; the canceled run emits no
 	// terminal event.
-	assertEventTypes(t, f.rec.list(), EventSyncStarted)
+	assertEventTypes(t, f.rec.list(), EventPushUpstreamStarted)
 }
 
 // TestPushRunPrivateUpstreamDeniedByDefault: with the production egress
@@ -390,7 +390,7 @@ func TestPushRunPrivateUpstreamDeniedByDefault(t *testing.T) {
 		t.Fatal("denied egress still reached the private upstream")
 	}
 	events := f.rec.list()
-	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamFailed)
 	if events[1].Error != FailConfig {
 		t.Fatalf("error = %q, want %q", events[1].Error, FailConfig)
 	}
@@ -424,7 +424,7 @@ func TestPushRunProxyDialFailureStaysTransient(t *testing.T) {
 		t.Fatalf("proxy dial failure not classified transient: %v", err)
 	}
 	events := f.rec.list()
-	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamFailed)
 	if events[1].Error != FailUnreachable {
 		t.Fatalf("error = %q, want %q", events[1].Error, FailUnreachable)
 	}
@@ -525,7 +525,7 @@ func TestPushRunIndependentOfPullClaim(t *testing.T) {
 	if err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pk"}); err != nil {
 		t.Fatalf("RunPush under a pull claim: %v", err)
 	}
-	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncSucceeded)
+	assertEventTypes(t, f.rec.list(), EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 }
 
 // TestPushRunAfterForwardSchedulesMirrorBack: EVERY successful outbound

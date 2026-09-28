@@ -6,6 +6,11 @@
 > `POST /repos/push-upstream` trigger plus an opt-in per-repo
 > `base_repo.forward_pushes` flag — the trigger-semantics difference is a
 > recorded [wire-compatibility deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec).
+>
+> **Amended by #354:** outbound runs now emit `repo.push_upstream.{started,succeeded,failed}`
+> instead of `repo.sync.*` with `direction: "push"`, so the `repo.sync.*` bodies match
+> upstream's schemas. Mentions of `repo.sync.failed` for outbound runs below predate that
+> change.
 
 An outbound run is [ADR-30](030-upstream-sync-mirror-fetch-loopback-push-through-our-own-front-door.md)'s
 mirror image: mirror-fetch the LOCAL refs through this server's own
