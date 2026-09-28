@@ -59,12 +59,16 @@ Receivers (the SDKs) validate:
 ```
 
 All seven fields are required: the Go SDK rejects a payload with any empty field
-("invalid push payload").
+("invalid push payload"). Upstream's schema is `GitPushEvent` in the vendored
+[OpenAPI spec](../upstream/openapi.yaml) (top-level `webhooks`).
 
 ### `repo.sync.started` / `repo.sync.succeeded` / `repo.sync.failed`
 
 Payloads carry `type`, repo identity, and sync metadata. Exact field tables:
-[`../upstream/guides/webhooks.md`](../upstream/guides/webhooks.md).
+[`../upstream/guides/webhooks.md`](../upstream/guides/webhooks.md). Upstream's schemas are
+`GitSyncStartedEvent`, `GitSyncSucceededEvent` and `GitSyncFailedEvent` in the vendored
+[OpenAPI spec](../upstream/openapi.yaml). open.storage does not send their optional
+`lifecycle_id` ([#354](https://github.com/coder/openstorage/issues/354)).
 
 `repo.sync.failed` adds `error`, one of:
 
@@ -88,6 +92,10 @@ three event types:
 | `rejected_refs: [{ref, reason}]` | On `repo.sync.failed` with `error: "push rejected by upstream"`: each ref the upstream refused (e.g. `non-fast-forward`). The forward is atomic — one refused ref fails the whole batch and leaves the upstream untouched — so the array also lists innocent refs with reason `atomic push failed` |
 | `error` | The strings above, plus `"failed to push to upstream"` (generic outbound push failure) and `"push rejected by upstream"` |
 | `run_count` / `is_first_sync` | Count outbound runs independently of inbound ones |
+
+Upstream's sync schemas set `additionalProperties: false`, so the `direction`, `forced` and
+`rejected_refs` fields are a
+[recorded deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec).
 
 ### Unknown events
 
