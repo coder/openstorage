@@ -285,7 +285,26 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 	defer os.RemoveAll(packDir)
-	out, err := wrefGit(ctx, srcPath, nil, strings.NewReader(forkSHA+"\n"),
+	// Everything below (git's env and argv, the server's own stat) must
+	// agree on this dir: git resolves relative paths against srcPath.
+	if packDir, err = filepath.Abs(packDir); err != nil {
+		s.internalErr(w, r, "resolve fork pack dir", err)
+		return
+	}
+	// packDir doubles as git's object directory, with the source cache odb
+	// as a read-only alternate (the write pipelines' scratch layout):
+	// pack-objects stages its temporary pack under the object directory
+	// and renames it to the destination, so both must share a filesystem.
+	// With the cache odb as object directory, a TMPDIR on another
+	// filesystem than the data dir failed that rename with EXDEV (#360).
+	// The alternate must be absolute too: srcPath is relative under a
+	// relative --cache-dir, and git runs with it as working directory.
+	absSrc, err := filepath.Abs(srcPath)
+	if err != nil {
+		s.internalErr(w, r, "resolve fork source path", err)
+		return
+	}
+	out, err := wrefGit(ctx, srcPath, wrefScratchEnv(absSrc, packDir), strings.NewReader(forkSHA+"\n"),
 		"pack-objects", "--revs", "-q", filepath.Join(packDir, "pack"))
 	if err != nil {
 		s.internalErr(w, r, "pack fork closure", err)
