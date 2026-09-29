@@ -35,7 +35,7 @@ Full endpoint catalogs: [HTTP API](../reference/http-api.md) (REST),
 
 | Surface | Status | Notes |
 |---|---|---|
-| Repository lifecycle | ✅ | Create (incl. fork via `base_repo`), get, `PATCH` (default branch), list, delete, `GET /api/repo-urls/{repo_id}` |
+| Repository lifecycle | ✅ | Create (incl. Git Sync via `upstream`, and copy or fork via `base_repo`), get (with `upstream` for sync-linked repos), `PATCH` (default branch), list, delete, `GET /api/repo-urls/{repo_id}` |
 | Read surface | ✅ | Files (conditional/range streaming), file listings + metadata, branches, tags, commits, diff, branches-diff, blame, grep, archive, notes — cursor pagination throughout |
 | Single-item lookups | ✅ | `GET .../branch`, `GET .../tag` — served although the vendored spec omits them (SDK-relied surface) |
 | Write surface | ✅ | NDJSON `commit-pack` and `diff-commit` streaming, `restore-commit`, branch/tag/notes writes — compare-and-swap (`expected_head_sha` etc.) and ref policies everywhere |
@@ -185,6 +185,10 @@ the [archived phase notes](../archive/phases/)):
 |---|---|---|
 | `POST .../reset-commits` (NDJSON) | Not implemented; `POST .../restore-commit` (plain JSON) covers the SDK-visible restore semantics | Recorded deviation ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md)); no SDK calls `reset-commits` |
 | `DELETE /api/repos/{repo_name}/tags/{tag_name}` (tag in path) | `DELETE .../tags` with the tag in the request body | Matches the SDKs' actual call shape |
+| `POST /repos` `upstream.access`: `app` (the default for `github`) reads through the organization's GitHub App installation | Only `access: "public"` is accepted; `app` or an omitted `access` with `provider: "github"` → 400. A public mirror syncs on the same triggers as a `base_repo` sync link, not only on request | No GitHub App integration. Private GitHub repositories sync through the deprecated `base_repo` form with `auth.token` |
+| `POST /repos` `upstream.host`: a bare hostname | Also accepts an `http(s)://` base URL, as `base_repo.upstream_host` does | Self-hosted forges on plain HTTP or a sub-path; the same validation and egress policy apply |
+| `POST /repos` with both `upstream` and `base_repo`: "do not set" both, no documented error | 400 | Ambiguous request; failing loudly beats guessing which form wins |
+| `POST /repos` `base_repo` copy: default branch defaults to `main` when omitted | Without a top-level `default_branch`, a copy takes the source's default branch name (fork behavior) | A copy runs the fork implementation |
 | `GET`/`POST /api/repos` (bare collection routes) | `/api/v1/repos` only; named-repo aliases exist for repo-scoped routes, not org-scoped collections | The alias layer covers the styles SDKs use |
 | RFC 9457 problem-details error bodies (spec). Since upstream's 2026-09-24 spec update, `ProblemDetails` requires a snake_case `code` and tells clients to branch on `code`, not on `detail` | The plain `{"error":"<msg>"}` envelope carries problem-details fields next to `error`: `type` (`about:blank`), `title`, `status`, `detail` (same string as `error`), and upstream's generic per-status `code` ([#349](https://github.com/coder/openstorage/issues/349)). Not emitted: upstream's specific codes (such as `repository_not_found`), `instance`, and the `application/problem+json` content type. The [streaming protocols](streaming-commit-protocols.md) `{"result":{"success":false,…}}` envelope carries no problem-details fields. Failures use one of these two shapes, by route and failure class. Do not assume one shape per route family: branch on the status code, or check both shapes. Per-route contracts are in [HTTP API](../reference/http-api.md) and [streaming protocols](streaming-commit-protocols.md) | Recorded deviations ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md), [ADR-26](../adr/026-result-envelope-statuses-499-is-not-emittable.md)): all three SDKs branch on status codes. At the 2026-09-25 audit this held for SDK `1.17.1` (stable) and `1.18.0-beta.0` (beta): no SDK reads `code`, `detail`, or any problem-details field other than the legacy `error` string. The beta Go and TypeScript clients additionally accept `application/problem+json` error bodies; the content type stays `application/json` because the `1.17.1` Go and TypeScript clients parse error JSON only for that type. Upstream says to treat an unknown code as the generic code for its status, so a client that follows that guidance handles the generic-only `code`; a client that expects a specific code sees the generic one instead (for example `not_found` for `repository_not_found`). `status` is a JSON number, as in upstream's bodies: a client that decoded the old `{"error"}` body into a string-only map (such as Go's `map[string]string`) must switch to a struct or `map[string]any`. Revisit specific codes when an SDK release reads `code`, or when a user reports depending on one |
 | `201` on write endpoints (spec) | `commit-pack` / `diff-commit` / `restore-commit` and `POST`/`DELETE .../notes` return `200` | Recorded deviation ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md)): the SDKs accept both; schema-validating clients should expect `200` |
@@ -210,9 +214,9 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-09-28 (upstream
-  `Last-Modified` 2026-09-28 03:06:23 GMT), SHA-256
-  `3b237b44f0cdf1a0f1f02234b07be50f5a4b327a2a6f570f9d4c43a75fe7b1ee`.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-09-29 (upstream
+  `Last-Modified` 2026-09-28 19:47:47 GMT), SHA-256
+  `ca9adca0e98dc2369643b05b2f1c2734769d2f2c590c3084152778e7ba33f65c`.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled

@@ -170,6 +170,15 @@ type createRepoRequest struct {
 	RepoName      *string         `json:"repo_name"`
 	DefaultBranch string          `json:"default_branch"`
 	BaseRepo      json.RawMessage `json:"base_repo"`
+	// Upstream is upstream's UpstreamConfig Git Sync form (issue #359);
+	// only (*syncServer).handleCreateRepo accepts it.
+	Upstream json.RawMessage `json:"upstream"`
+}
+
+// jsonPresent reports whether an optional raw JSON field was sent with a
+// non-null value.
+func jsonPresent(raw json.RawMessage) bool {
+	return len(raw) > 0 && string(raw) != "null"
 }
 
 // repoNameMismatchMsg is the 400 body for a repo_name that differs from the
@@ -235,6 +244,10 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "base_repo not supported")
 		return
 	}
+	if jsonPresent(req.Upstream) {
+		writeErr(w, http.StatusBadRequest, "upstream not supported")
+		return
+	}
 	branch := req.DefaultBranch
 	if branch == "" {
 		// openapi.yaml: optional query override, used only when the body
@@ -276,8 +289,8 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 // repo is the JWT `repo` claim; 404 when absent or soft-deleted. The
 // response schema (openapi.yaml) requires repo_id, repo_name, url
 // (deprecated mirror of repo_name), default_branch, created_at —
-// repoEntry carries exactly those, plus base_repo when the repo has an
-// upstream link (docs/reference/http-api.md, docs/archive/phases/14-phase5-implementation-notes.md deferred #2).
+// repoEntry carries exactly those, plus upstream and its deprecated
+// base_repo mirror when the repo has an upstream link (docs/reference/http-api.md, docs/archive/phases/14-phase5-implementation-notes.md deferred #2).
 func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
@@ -300,6 +313,7 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 		URL:           repo.URL,
 		DefaultBranch: repo.DefaultBranch,
 		CreatedAt:     repo.CreatedAt.UTC().Format(time.RFC3339),
+		Upstream:      base,
 		BaseRepo:      base,
 	})
 }
@@ -450,8 +464,10 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// baseRepoEntry is the GET-response `base_repo` object (docs/reference/http-api.md): the
-// upstream coordinates a synced repo mirrors.
+// baseRepoEntry is the GET-response `upstream` object and its deprecated
+// `base_repo` mirror, upstream's UpstreamRepo schema
+// (docs/reference/http-api.md): the upstream coordinates a synced repo
+// mirrors.
 type baseRepoEntry struct {
 	Provider string `json:"provider"`
 	Owner    string `json:"owner"`
@@ -475,12 +491,15 @@ func (s *server) baseRepoOf(ctx context.Context, repoID string) (*baseRepoEntry,
 }
 
 type repoEntry struct {
-	RepoID        string         `json:"repo_id"`
-	RepoName      string         `json:"repo_name"`
-	URL           string         `json:"url"` // deprecated: mirrors repo_name
-	DefaultBranch string         `json:"default_branch"`
-	CreatedAt     string         `json:"created_at"`
-	BaseRepo      *baseRepoEntry `json:"base_repo,omitempty"`
+	RepoID        string `json:"repo_id"`
+	RepoName      string `json:"repo_name"`
+	URL           string `json:"url"` // deprecated: mirrors repo_name
+	DefaultBranch string `json:"default_branch"`
+	CreatedAt     string `json:"created_at"`
+	// Upstream and BaseRepo (deprecated upstream) carry the same value;
+	// both are omitted when the repo has no upstream.
+	Upstream *baseRepoEntry `json:"upstream,omitempty"`
+	BaseRepo *baseRepoEntry `json:"base_repo,omitempty"`
 }
 
 type listReposResponse struct {
@@ -543,6 +562,7 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 			URL:           repo.URL,
 			DefaultBranch: repo.DefaultBranch,
 			CreatedAt:     repo.CreatedAt.UTC().Format(time.RFC3339),
+			Upstream:      base,
 			BaseRepo:      base,
 		})
 	}

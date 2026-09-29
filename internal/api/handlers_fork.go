@@ -3,6 +3,8 @@
 //
 //	POST /api/v1/repos  repo:write  base_repo {provider: "code"|"code.storage",
 //	                                operation: "fork", auth: {token}} -> one-shot fork
+//	POST /api/v1/repos  repo:write  base_repo {name, ref?, auth: {token}}
+//	                                (no provider/operation: upstream's copy form) -> the same fork
 //
 // A fork is a deterministic, independent clone performed inside the request
 // (ADR-31): the fork-point closure is packed from the source's materialized
@@ -66,7 +68,9 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 			replay()
 			return
 		}
-		if len(req.BaseRepo) == 0 || string(req.BaseRepo) == "null" {
+		// A body with `upstream` always goes to the fallback, which owns
+		// the Git Sync form and rejects it next to base_repo (issue #359).
+		if !jsonPresent(req.BaseRepo) || jsonPresent(req.Upstream) {
 			replay()
 			return
 		}
@@ -75,15 +79,41 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 			replay()
 			return
 		}
-		if spec.Operation != "fork" || (spec.Provider != "code" && spec.Provider != "code.storage") {
+		if !spec.isCopy() && (spec.Operation != "fork" || (spec.Provider != "code" && spec.Provider != "code.storage")) {
 			replay()
 			return
+		}
+		if spec.isCopy() {
+			// The copy form is new (issue #359) and upstream's BaseRepo
+			// sets additionalProperties: false: a misspelled field (say,
+			// "reff") must not silently copy another ref.
+			dec := json.NewDecoder(bytes.NewReader(req.BaseRepo))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&usyncBaseRepo{}); err != nil {
+				writeErr(w, http.StatusBadRequest, "invalid base_repo: "+err.Error())
+				return
+			}
 		}
 		s.handleForkRepo(w, r, verifier, &req, &spec)
 	}
 }
 
-// handleForkRepo performs one synchronous fork. Flow: verify the embedded
+// isCopy reports upstream's one-time-copy form of base_repo ({name, ref?,
+// auth.token}, no provider and no operation; issue #359). A copy is a fork
+// of a Code Storage repository under the current field names.
+func (spec *usyncBaseRepo) isCopy() bool {
+	return spec.Provider == "" && spec.Operation == ""
+}
+
+// copySyncFieldsMsg is the 400 body for a copy that carries fields of the
+// deprecated sync form, which a copy would otherwise ignore.
+const copySyncFieldsMsg = "base_repo without provider is a copy: owner, upstream_host, forward_pushes, and auth.auth_type need the deprecated sync form"
+
+// copyNameMismatchMsg is the 403 body when base_repo.name does not name
+// the repository base_repo.auth.token grants.
+const copyNameMismatchMsg = "base_repo.name is not the repository base_repo.auth.token grants"
+
+// handleForkRepo performs one synchronous fork (or copy). Flow: verify the embedded
 // fork-source JWT (repo-scoped git:read on the source), resolve the source
 // row and the fork point in its materialized cache, policy-check the fork's
 // initial ref, pack the fork-point closure, create the repo row, publish the
@@ -94,7 +124,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	assertf(s != nil && s.store != nil && s.refStore != nil && s.blobStore != nil && s.cacheDir != "",
 		"handleForkRepo: nil server deps")
 	assertf(verifier != nil && req != nil && spec != nil, "handleForkRepo: nil inputs")
-	assertf(spec.Operation == "fork" && (spec.Provider == "code" || spec.Provider == "code.storage"),
+	assertf(spec.isCopy() || (spec.Operation == "fork" && (spec.Provider == "code" || spec.Provider == "code.storage")),
 		"handleForkRepo: mis-dispatched base_repo provider %q operation %q", spec.Provider, spec.Operation)
 
 	claims := mustClaims(r)
@@ -115,11 +145,26 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 
+	// The copy form names its source repository (checked below) and
+	// carries none of the deprecated sync form's fields.
+	if spec.isCopy() && spec.Name == "" {
+		writeErr(w, http.StatusBadRequest, "base_repo.name is required for a copy")
+		return
+	}
+	if spec.isCopy() && (spec.Owner != "" || spec.UpstreamHost != "" || spec.ForwardPushes || (spec.Auth != nil && spec.Auth.AuthType != "")) {
+		writeErr(w, http.StatusBadRequest, copySyncFieldsMsg)
+		return
+	}
+
 	// The fork-source JWT (docs/explanation/domain-model.md invariant 12) authorizes reading the
 	// source repo. Absent token: malformed request (400). A token that does
 	// not verify, is not repo-scoped, or lacks git:read: authorization
 	// failure on the source (403).
 	if spec.Auth == nil || spec.Auth.Token == "" {
+		if spec.isCopy() {
+			writeErr(w, http.StatusBadRequest, "base_repo.auth.token is required for a copy")
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "base_repo.auth.token is required for provider "+strconv.Quote(spec.Provider))
 		return
 	}
@@ -151,6 +196,21 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 	assertf(srcRepo.RepoID != "", "store returned repo with empty RepoID")
+	if spec.isCopy() {
+		// The copy form names its source; the token must grant exactly
+		// that repository, or the request would copy a repo other than the
+		// one named. Resolved in the token's org, after the token verified,
+		// so an unknown name and a different repo answer alike.
+		named, err := meta.ResolveRepoKey(ctx, s.store, srcClaims.Iss, spec.Name)
+		switch {
+		case errors.Is(err, meta.ErrNotFound) || (err == nil && named.RepoID != srcRepo.RepoID):
+			writeErr(w, http.StatusForbidden, copyNameMismatchMsg)
+			return
+		case err != nil:
+			s.internalErr(w, r, "resolve copy source name", err)
+			return
+		}
+	}
 
 	srcPath, err := gitread.Materialize(ctx, s.refStore, s.blobStore, s.cacheDir, srcRepo.RepoID, srcRepo.DefaultBranch)
 	if err != nil {

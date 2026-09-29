@@ -347,8 +347,8 @@ Unified egress policy for upstream sync in **both** directions (ADR-45).
 - **Denied destination:** the upstream is never contacted. Pulls fail as
   `repository configuration error`; pushes fail as `invalid sync configuration`, with no
   retry.
-- **Registration** (`POST /repos` with `base_repo`) also runs a courtesy check against the
-  pull policy. Dial-time enforcement stays authoritative.
+- **Registration** (`POST /repos` with `upstream` or `base_repo`) also runs a courtesy
+  check against the pull policy. Dial-time enforcement stays authoritative.
 
 > [!IMPORTANT]
 > A future release flips the unset pull default to **deny**. Set this explicitly now:

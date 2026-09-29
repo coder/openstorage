@@ -2,7 +2,8 @@ package api
 
 // Upstream-sync HTTP surface (docs/reference/http-api.md "Upstream sync", phase-5 workstream D):
 //
-//	POST   /api/v1/repos                repo:write  base_repo {operation: "sync"} -> mirror link + first sync
+//	POST   /api/v1/repos                repo:write  upstream {provider, owner, name, access?, host?}
+//	                                                or base_repo {operation: "sync"} -> mirror link + first sync
 //	POST   /api/v1/repos/pull-upstream  git:write   {ref?, after?} -> 202 {"message": "Repository sync initiated successfully"}
 //	DELETE /api/v1/repos/base           repo:write  idempotent detach -> 200 {"message": "repository detached"}
 //
@@ -16,6 +17,7 @@ package api
 // requests for providers the dispatcher does not own.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -112,6 +114,68 @@ func validateSyncBaseRepo(spec *usyncBaseRepo) (host, errMsg string) {
 	return host, ""
 }
 
+// upstreamConfig is upstream's UpstreamConfig (POST /repos `upstream`,
+// issue #359): the Git Sync form that replaces base_repo's deprecated sync
+// fields.
+type upstreamConfig struct {
+	Provider string `json:"provider"`
+	Owner    string `json:"owner"`
+	Name     string `json:"name"`
+	Access   string `json:"access"`
+	Host     string `json:"host"`
+}
+
+// upstreamAppAccessMsg rejects GitHub App access (upstream's default for
+// provider github): open.storage has no GitHub App integration, and
+// silently syncing without it would change what the link reads.
+const upstreamAppAccessMsg = `upstream access "app" (the default for github) is not supported: open.storage has no GitHub App integration; set access "public"`
+
+// parseUpstreamConfig decodes and validates an UpstreamConfig and maps it
+// onto the sync machinery's spec (no credential, no push forwarding).
+// errMsg != "" means 400 with that envelope message; nothing is stored.
+func parseUpstreamConfig(raw json.RawMessage) (spec *usyncBaseRepo, host, errMsg string) {
+	assertf(jsonPresent(raw), "parseUpstreamConfig: absent upstream")
+	var cfg upstreamConfig
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// additionalProperties: false upstream; an ignored field (for example
+	// a branch) would silently change what the link syncs.
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, "", "invalid upstream: " + err.Error()
+	}
+	if cfg.Provider == "" || cfg.Owner == "" || cfg.Name == "" {
+		return nil, "", "upstream provider, owner, and name are required"
+	}
+	// ProviderHost knows exactly upstream's UpstreamConfig provider enum;
+	// code/code.storage are not in it (a copy uses base_repo).
+	defaultHost, known := upsync.ProviderHost(cfg.Provider)
+	if !known {
+		return nil, "", "unsupported upstream provider " + strconv.Quote(cfg.Provider)
+	}
+	switch cfg.Access {
+	case "", "app", "public":
+	default:
+		return nil, "", "invalid upstream access " + strconv.Quote(cfg.Access)
+	}
+	if cfg.Provider != "github" && cfg.Access != "" {
+		return nil, "", "upstream access applies to provider github only"
+	}
+	if cfg.Provider == "github" && cfg.Access != "public" {
+		return nil, "", upstreamAppAccessMsg
+	}
+	host = cfg.Host
+	if host != "" && !validUpstreamHost(host) {
+		return nil, "", "invalid upstream host " + strconv.Quote(cfg.Host)
+	}
+	if host == "" {
+		host = defaultHost
+	}
+	if host == "" {
+		return nil, "", "upstream host is required for provider " + strconv.Quote(cfg.Provider)
+	}
+	return &usyncBaseRepo{Provider: cfg.Provider, Owner: cfg.Owner, Name: cfg.Name}, host, ""
+}
+
 // validUpstreamHost accepts the two documented upstream_host shapes — a
 // bare hostname[:port] or an http(s):// base URL — and nothing else.
 // upsync.CloneURL uses the value verbatim as the base of a git fetch URL,
@@ -188,9 +252,23 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upstream documents no error for both forms; setting both is
+	// ambiguous, so it is a 400 (issue #359).
+	if jsonPresent(req.BaseRepo) && jsonPresent(req.Upstream) {
+		writeErr(w, http.StatusBadRequest, "base_repo and upstream cannot both be set")
+		return
+	}
 	var spec *usyncBaseRepo
-	upstreamHost := ""
-	if len(req.BaseRepo) > 0 && string(req.BaseRepo) != "null" {
+	upstreamHost, hostField := "", ""
+	switch {
+	case jsonPresent(req.Upstream):
+		var errMsg string
+		if spec, upstreamHost, errMsg = parseUpstreamConfig(req.Upstream); errMsg != "" {
+			writeErr(w, http.StatusBadRequest, errMsg)
+			return
+		}
+		hostField = "upstream host"
+	case jsonPresent(req.BaseRepo):
 		spec = &usyncBaseRepo{}
 		if err := json.Unmarshal(req.BaseRepo, spec); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid base_repo: "+err.Error())
@@ -201,13 +279,17 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, errMsg)
 			return
 		}
+		hostField = "base_repo upstream_host"
+	}
+	if spec != nil {
+		assertf(upstreamHost != "" && hostField != "", "create: validated sync spec without host")
 		// Registration-time egress courtesy check (issue #139), mirroring
 		// webhook CheckRegistration: fast feedback for upstream hosts the
 		// pull lane's dial-time vetting proxy would deny anyway, before any
 		// rows exist. Fail-open on resolution errors — acceptance is not a
 		// reachability promise; the worker's guard is authoritative.
 		if err := s.guard.CheckHost(r.Context(), upstreamHostname(upstreamHost)); err != nil {
-			writeErr(w, http.StatusBadRequest, "base_repo upstream_host denied by sync egress policy: "+err.Error())
+			writeErr(w, http.StatusBadRequest, hostField+" denied by sync egress policy: "+err.Error())
 			return
 		}
 	}

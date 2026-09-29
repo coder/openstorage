@@ -74,9 +74,9 @@ about the endpoint's rollout status on upstream clusters.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
-| `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, base_repo?}], next_cursor, has_more}` |
-| `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at}`; 404 → SDK returns null |
+| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
+| `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
+| `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
 | `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix; from OpenAPI.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value |
@@ -89,7 +89,31 @@ about the endpoint's rollout status on upstream clusters.
   normalization. A mismatch, including an empty string, returns 400 and creates nothing,
   for forks too. `null` or an omitted `repo_name` changes nothing.
 - Query `default_branch` is a fallback, used only when the body omits it.
-- `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
+- `upstream` (Git Sync): `{provider, owner, name, access?, host?}`. It creates a sync link
+  and schedules the first sync, like the deprecated `base_repo` sync form. Unknown fields
+  → 400.
+  - Providers: `github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht, sourcehut`.
+    Any other value → 400. `gitea` and `forgejo` need `host`.
+  - `access` applies to `github` only (any other provider → 400). Only
+    `access: "public"` is supported: a public mirror with no stored credential. `app`,
+    upstream's default when `access` is omitted, needs a GitHub App installation, which
+    open.storage does not have → 400. To sync a private GitHub repository, use the
+    deprecated `base_repo` sync form with `auth.token`.
+  - `host`: a bare `hostname[:port]`, or (open.storage extension) an `http(s)://` base
+    URL like `base_repo.upstream_host`. It defaults to the provider's public host.
+  - No credential is stored at create. For a private non-GitHub upstream, add one with
+    `POST /repos/git-credentials`, then call `pull-upstream`.
+  - `upstream` has no `forward_pushes`; use the deprecated `base_repo` sync form to opt in.
+- Setting both `upstream` and `base_repo` → 400 (upstream says not to set both and
+  documents no error).
+- `base_repo` copy (no `provider`, no `operation`): `{name, ref?, auth: {token}}` copies a
+  repository on this server once, with no link kept. It runs the fork below: `auth.token`
+  needs `git:read` on the source, and `name` must name the repository that token grants
+  (otherwise 403). `ref` is a branch, tag, or commit SHA; it defaults to the source's
+  default branch. Without a top-level `default_branch`, the copy's default branch takes
+  the source's default branch name, as a fork does. Unknown fields, and the sync-only fields
+  `owner`, `upstream_host`, `forward_pushes`, and `auth.auth_type`, → 400.
+- `base_repo` (deprecated sync and fork form): `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
   generic with `upstream_host`.
 - `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
@@ -214,8 +238,8 @@ committer_email, date (RFC3339)}`.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async). Repos with `base_repo` only |
-| `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Repos with `base_repo` only. open.storage extension |
+| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only |
+| `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 
 **Both triggers:**
 
@@ -270,8 +294,8 @@ freshness pokes) and push-upstream forwards.
   Transitional default: pulls allow private upstreams, pushes deny.
 - A denied pull destination fails the run as `repository configuration error`; a denied
   push destination as `invalid sync configuration`.
-- `POST /repos` with `base_repo` also rejects, with 400, an `upstream_host` the pull
-  policy denies. This registration check is a courtesy; dial time is authoritative.
+- `POST /repos` with `upstream` or a `base_repo` sync also rejects, with 400, an
+  `upstream.host` or `upstream_host` the pull policy denies. This registration check is a courtesy; dial time is authoritative.
 
 > [!CAUTION]
 > **Mixed-fleet prerequisite:** finish the rolling upgrade of every replica to a build

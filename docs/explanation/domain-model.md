@@ -13,7 +13,7 @@ Organization (org)                     ← tenant; from subdomain + JWT `iss`
       ├── url: string                 ← client-facing URL path; may contain slashes ("team/project"); the value used in the JWT `repo` claim
       ├── default_branch: string      ← defaults to "main"
       ├── created_at: ISO-8601 string
-      ├── base_repo?                  ← optional upstream link {provider, owner, name, ...}
+      ├── upstream? / base_repo?      ← optional upstream link {provider, owner, name, ...}
       ├── git_credentials?            ← stored HTTPS credential for generic upstreams
       ├── Refs
       │    ├── refs/heads/*           ← persistent branches
@@ -90,9 +90,10 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
 10. **Tag semantics.** `POST /repos/tags` creates lightweight tags only; `target` must
     resolve to a commit. List/delete must dereference annotated tags correctly (the
     listed `sha` is the *dereferenced commit* SHA).
-11. **Upstream sync.** Repos created with `base_repo` mirror an external provider
-    (`github`, `gitlab`, `bitbucket`, `gitea`, `forgejo`, `codeberg`, `sr.ht`;
-    self-hosted instances via `upstream_host`, credentials via git-credentials).
+11. **Upstream sync.** Repos created with `upstream` (or the deprecated `base_repo` sync
+    form) mirror an external provider (`github`, `gitlab`, `bitbucket`, `gitea`,
+    `forgejo`, `codeberg`, `sr.ht`; self-hosted instances via `upstream.host` or
+    `upstream_host`, credentials via git-credentials).
     - Non-ephemeral ref mutations on synced repos schedule background sync.
       `pull-upstream` returns 202 (async); `DELETE /repos/base` detaches idempotently.
     - The sync lifecycle emits `repo.sync.started/succeeded/failed` webhooks.
@@ -106,7 +107,9 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
       run's late writes. A crash can delay syncing but never permanently stop it.
 12. **Forking.** `base_repo: {provider: "code", operation: "fork", auth: {token: <jwt>}}`
     forks an existing code.storage repo (optionally at `ref`/`sha`) into an independent
-    repo. The fork-source JWT carries `git:read` on the source repo.
+    repo. The fork-source JWT carries `git:read` on the source repo. Upstream's copy form,
+    `base_repo: {name, ref?, auth: {token}}` without `provider`, runs the same fork;
+    `name` must name the repo the token grants.
 
 ## Consumer-assumed response semantics (load-bearing details)
 
