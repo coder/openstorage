@@ -111,7 +111,8 @@ about the endpoint's rollout status on upstream clusters.
   needs `git:read` on the source, and `name` must name the repository that token grants
   (otherwise 403). `ref` is a branch, tag, or commit SHA; it defaults to the source's
   default branch. Without a top-level `default_branch`, the copy's default branch takes
-  the source's default branch name, as a fork does.
+  the source's default branch name, as a fork does. Unknown fields, and the sync-only fields
+  `owner`, `upstream_host`, `forward_pushes`, and `auth.auth_type`, → 400.
 - `base_repo` (deprecated sync and fork form): `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
   generic with `upstream_host`.

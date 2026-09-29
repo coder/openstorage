@@ -279,6 +279,31 @@ func TestCreateRepoBaseRepoCopy(t *testing.T) {
 			}
 		})
 
+		// base_repo has additionalProperties: false; a typo must not
+		// copy the wrong history, and sync-only fields mean nothing to a
+		// copy.
+		t.Run("unknown or sync-only fields", func(t *testing.T) {
+			tok := map[string]any{"token": srcReadTok}
+			for _, c := range []struct {
+				base    map[string]any
+				wantMsg string
+			}{
+				{map[string]any{"name": src.url, "reff": "feature", "auth": tok}, `invalid base_repo: json: unknown field "reff"`},
+				{map[string]any{"name": src.url, "auth": map[string]any{"token": srcReadTok, "user": "x"}}, `invalid base_repo: json: unknown field "user"`},
+				{map[string]any{"name": src.url, "owner": "o", "auth": tok}, copySyncFieldsMsg},
+				{map[string]any{"name": src.url, "upstream_host": "github.com", "auth": tok}, copySyncFieldsMsg},
+				{map[string]any{"name": src.url, "forward_pushes": true, "auth": tok}, copySyncFieldsMsg},
+				{map[string]any{"name": src.url, "auth": map[string]any{"token": srcReadTok, "auth_type": "jwt"}}, copySyncFieldsMsg},
+			} {
+				caller := newForkCaller(t, e, "")
+				resp, body := forkDo(t, srv, caller.token, map[string]any{"base_repo": c.base})
+				if resp.StatusCode != http.StatusBadRequest || body["error"] != c.wantMsg {
+					t.Fatalf("%v: status %d body %v, want 400 %q", c.base, resp.StatusCode, body, c.wantMsg)
+				}
+				forkRequireNoRepoRow(t, e, caller.org, caller.url)
+			}
+		})
+
 		t.Run("missing name or token", func(t *testing.T) {
 			for _, c := range []struct {
 				base    map[string]any

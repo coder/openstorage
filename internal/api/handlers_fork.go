@@ -83,6 +83,17 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 			replay()
 			return
 		}
+		if spec.isCopy() {
+			// The copy form is new (issue #359) and upstream's BaseRepo
+			// sets additionalProperties: false: a misspelled field (say,
+			// "reff") must not silently copy another ref.
+			dec := json.NewDecoder(bytes.NewReader(req.BaseRepo))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&usyncBaseRepo{}); err != nil {
+				writeErr(w, http.StatusBadRequest, "invalid base_repo: "+err.Error())
+				return
+			}
+		}
 		s.handleForkRepo(w, r, verifier, &req, &spec)
 	}
 }
@@ -93,6 +104,10 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 func (spec *usyncBaseRepo) isCopy() bool {
 	return spec.Provider == "" && spec.Operation == ""
 }
+
+// copySyncFieldsMsg is the 400 body for a copy that carries fields of the
+// deprecated sync form, which a copy would otherwise ignore.
+const copySyncFieldsMsg = "base_repo without provider is a copy: owner, upstream_host, forward_pushes, and auth.auth_type need the deprecated sync form"
 
 // copyNameMismatchMsg is the 403 body when base_repo.name does not name
 // the repository base_repo.auth.token grants.
@@ -130,9 +145,14 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 
-	// The copy form names its source repository (checked below).
+	// The copy form names its source repository (checked below) and
+	// carries none of the deprecated sync form's fields.
 	if spec.isCopy() && spec.Name == "" {
 		writeErr(w, http.StatusBadRequest, "base_repo.name is required for a copy")
+		return
+	}
+	if spec.isCopy() && (spec.Owner != "" || spec.UpstreamHost != "" || spec.ForwardPushes || (spec.Auth != nil && spec.Auth.AuthType != "")) {
+		writeErr(w, http.StatusBadRequest, copySyncFieldsMsg)
 		return
 	}
 
