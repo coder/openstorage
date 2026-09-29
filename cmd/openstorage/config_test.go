@@ -255,6 +255,31 @@ func TestResolveServeConfigLegacyEnvCompat(t *testing.T) {
 	}
 }
 
+// A relative --cache-dir resolves against serve's working directory once,
+// at startup: git later runs inside cache repos, where a relative path
+// would resolve against the repo instead (issue #363).
+func TestResolveServeConfigRelativeCacheDir(t *testing.T) {
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	env := map[string]string{
+		"OPENSTORAGE_ORG":         "org1",
+		"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+	}
+	maps.Copy(env, spikeEnv)
+	cfg, err := resolveServeConfig(mapEnv(env), "", "", "relcache", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// t.TempDir may sit behind a symlink; compare against Getwd's spelling.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(wd, "relcache"); cfg.cacheDir != want {
+		t.Fatalf("cacheDir = %q, want %q", cfg.cacheDir, want)
+	}
+}
+
 func TestResolveServeConfigCanonicalEnv(t *testing.T) {
 	env := mapEnv(map[string]string{
 		"OPENSTORAGE_PG_URL":      "postgres://new",
