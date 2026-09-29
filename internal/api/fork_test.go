@@ -21,6 +21,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -477,6 +478,45 @@ func TestForkRepo(t *testing.T) {
 				t.Fatalf("WWW-Authenticate = %q, want Bearer", got)
 			}
 		})
+	})
+}
+
+// TestForkRelativeCacheDir: --cache-dir may be relative, and then
+// gitread.Materialize returns a relative repo path that git also uses as
+// its working directory. Paths handed to git through the environment must
+// not be resolved against that working directory (PR #362 review).
+func TestForkRelativeCacheDir(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		src := wrefSeedFixture(t, e)
+		srcReadTok := e.mint(t, tokenSpec{iss: src.org, repo: src.url, scopes: []string{auth.ScopeGitRead}})
+		caller := newForkCaller(t, e, "")
+		// Hydrate the source cache first, as a git push does in production:
+		// the fork itself must then only pack from it.
+		if _, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, src.repoID, "main"); err != nil {
+			t.Fatalf("materialize source: %v", err)
+		}
+
+		t.Chdir(filepath.Dir(e.cacheDir))
+		s := &server{
+			store:       e.store,
+			httpBaseURL: testHTTPBaseURL,
+			logger:      discardLogger(),
+			refStore:    e.refStore,
+			blobStore:   e.blobStore,
+			cacheDir:    filepath.Base(e.cacheDir),
+		}
+		verifier := auth.NewVerifier(e.store)
+		mux := http.NewServeMux()
+		mux.Handle("POST /api/v1/repos",
+			requireAuth(verifier, "", false, auth.ScopeRepoWrite)(s.forkAwareCreateRepo(verifier, s.handleCreateRepo)))
+		srv := httptest.NewServer(recoverPanics(s.logger)(mux))
+		t.Cleanup(srv.Close)
+
+		resp, body := forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
+		forkID := forkRequireCreated(t, resp, body)
+		if refs := wrefRefs(t, e, forkID); refs["refs/heads/main"] != src.c2 {
+			t.Fatalf("fork refs = %v, want refs/heads/main=%s", refs, src.c2)
+		}
 	})
 }
 
