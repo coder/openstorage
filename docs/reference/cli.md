@@ -32,7 +32,7 @@ Prints `listening on <addr>` once bound.
 |---|---|---|
 | `--listen` | `$OPENSTORAGE_LISTEN`, then `127.0.0.1:0` | Listen address |
 | `--addr` | — | Legacy alias for `--listen` (`--listen` wins) |
-| `--cache-dir` | data-dir derivation, then `$TMPDIR/codestorage-cache` | Rebuildable bare-repo cache directory |
+| `--cache-dir` | data-dir derivation, then `$TMPDIR/codestorage-cache` | Rebuildable bare-repo cache directory; a relative path resolves against the working directory at startup |
 | `--data-dir` | `$OPENSTORAGE_DATA_DIR` | Local-mode data directory; derives database/blob/cache locations for slots not set explicitly |
 
 Requires `OPENSTORAGE_ORG` + `OPENSTORAGE_ORG_PUBKEYS` (single-org mode) and a resolvable

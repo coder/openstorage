@@ -537,6 +537,14 @@ func resolveServeConfig(lookup envLookup, flagListen, flagAddr, flagCacheDir, fl
 		// rolling deployments continue sharing cache coordination files.
 		cfg.cacheDir = filepath.Join(os.TempDir(), "codestorage-cache")
 	}
+	// Resolve a relative cache dir (flag, or a relative $TMPDIR) against
+	// serve's working directory once: git runs inside cache repos, where
+	// a relative path would resolve against the repo instead (issue #363).
+	abs, err := filepath.Abs(cfg.cacheDir)
+	if err != nil {
+		return serveConfig{}, fmt.Errorf("--cache-dir %q: %w", cfg.cacheDir, err)
+	}
+	cfg.cacheDir = abs
 	if cfg.dbURL == "" {
 		return serveConfig{}, errDBURLRequired()
 	}

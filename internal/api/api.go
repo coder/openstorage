@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -138,6 +139,14 @@ func New(cfg Config) (http.Handler, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// git runs with cache repos as its working directory, and paths
+	// derived from the cache dir also reach git through argv and env
+	// (index-pack, scratch alternates): a relative cache dir would resolve
+	// against the repo instead of our cwd (issue #363).
+	cacheDir, err := filepath.Abs(cfg.CacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("cache dir %q: %w", cfg.CacheDir, err)
+	}
 
 	s := &server{
 		store:              cfg.Store,
@@ -145,7 +154,7 @@ func New(cfg Config) (http.Handler, error) {
 		logger:             logger,
 		refStore:           cfg.RefStore,
 		blobStore:          cfg.BlobStore,
-		cacheDir:           cfg.CacheDir,
+		cacheDir:           cacheDir,
 		maybeRepack:        cfg.MaybeRepack,
 		packQuotaBytes:     cfg.PackQuotaBytes,
 		packReservationTTL: cfg.PackReservationTTL,
