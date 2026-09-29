@@ -41,6 +41,28 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 	t.Fatalf("timed out waiting for %s", path)
 }
 
+// waitForPushHold polls the node's push-hold directory until a live hold
+// names ref: the push that owns it has reserved the name and has not yet
+// finished (issue #364 — a fixed sleep let a slow first push lose the race
+// to the push meant to wait on it). done is that push's result channel; if
+// the push finishes first, the hold can no longer be observed, so fail
+// with its result instead of waiting out the deadline.
+func waitForPushHold[R any](t *testing.T, cacheDir, repo, ref string, done <-chan R) {
+	t.Helper()
+	dir := filepath.Join(RepoPath(cacheDir, repo), pushHoldDir)
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		if holds, err := readPushHolds(dir, ""); err == nil && holds.contains(ref) {
+			return
+		}
+		select {
+		case res := <-done:
+			t.Fatalf("push finished before %s was observed held: %+v", ref, res)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatalf("timed out waiting for a push hold on %s in %s", ref, dir)
+}
+
 // TestPush_SurvivesConcurrentHydrateOfCommittedRef: a branch-creation push
 // pauses after its update hook committed the authority CAS; a concurrent
 // request on the same node then hydrates (full sync — the CAS bumped the
@@ -430,7 +452,12 @@ func TestPush_WaitedCreationReprobesAuthority(t *testing.T) {
 	// Every update hook on this node sleeps 3s BEFORE its CAS: X's hold
 	// stays live and uncommitted long enough for Y's pre-receive probe
 	// and reservation wait to begin.
-	node := startNodeT(t, EnvHookDelay+"=3000")
+	nodeCache := t.TempDir()
+	node, err := startNode(nodeCache, EnvHookDelay+"=3000")
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
 
 	type pushResult struct {
 		out string
@@ -441,7 +468,11 @@ func TestPush_WaitedCreationReprobesAuthority(t *testing.T) {
 		out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/q")
 		doneX <- pushResult{out, err}
 	}()
-	time.Sleep(500 * time.Millisecond)
+	// Start Y only once X holds q (issue #364). X reserves q before its
+	// hook's 3s pre-CAS delay, so Y meets the live, uncommitted hold; were
+	// Y slower than that, X's committed q would doom Y's first probe with
+	// the same outcome.
+	waitForPushHold(t, nodeCache, repo, "refs/heads/q", doneX)
 	doneY := make(chan pushResult, 1)
 	go func() {
 		out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/q/c")
@@ -482,7 +513,12 @@ func TestAtomicPush_WaitedCreationDeniedWhole(t *testing.T) {
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
 	head := revParse(t, work, "HEAD")
 
-	node := startNodeT(t, EnvHookDelay+"=3000")
+	nodeCache := t.TempDir()
+	node, err := startNode(nodeCache, EnvHookDelay+"=3000")
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
 
 	type pushResult struct {
 		out string
@@ -493,7 +529,11 @@ func TestAtomicPush_WaitedCreationDeniedWhole(t *testing.T) {
 		out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/q")
 		doneX <- pushResult{out, err}
 	}()
-	time.Sleep(500 * time.Millisecond)
+	// Start Y only once X holds q (issue #364). X reserves q before its
+	// hook's 3s pre-CAS delay, so Y meets the live, uncommitted hold; were
+	// Y slower than that, X's committed q would doom Y's first probe with
+	// the same outcome.
+	waitForPushHold(t, nodeCache, repo, "refs/heads/q", doneX)
 	doneY := make(chan pushResult, 1)
 	go func() {
 		out, err := tryGit(work, "push", "--atomic", remoteURL(node, repo, token),
