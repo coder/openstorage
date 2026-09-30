@@ -392,7 +392,8 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	startedAt := eventTime(time.Now())
 	isFirst := up.SuccessCount == 0
 	base := Event{
-		Repository:  EventRepository{ID: repo.RepoID, URL: repo.URL},
+		Org:         job.Org,
+		Repository:  newEventRepository(repo),
 		RunCount:    up.RunCount,
 		IsFirstSync: isFirst,
 		StartedAt:   startedAt,

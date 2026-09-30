@@ -148,7 +148,8 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 
 	startedAt := eventTime(time.Now())
 	base := Event{
-		Repository:  EventRepository{ID: repo.RepoID, URL: repo.URL},
+		Org:         job.Org,
+		Repository:  newEventRepository(repo),
 		RunCount:    up.PushRunCount,
 		IsFirstSync: up.PushSuccessCount == 0,
 		StartedAt:   startedAt,

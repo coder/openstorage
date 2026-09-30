@@ -592,7 +592,7 @@ components:
       type: object
     GitPushEvent:
       additionalProperties: false
-      description: A Git ref update. The X-Pierre-Event header identifies this payload as push; the body has no type field.
+      description: A Git ref update. The type field and the X-Pierre-Event header identify this payload as push.
       properties:
         after:
           description: The new commit SHA. All zeros for a deleted ref.
@@ -601,7 +601,11 @@ components:
           description: The previous commit SHA. All zeros for a newly created ref.
           type: string
         customer_id:
-          description: The customer ID that owns the repository.
+          deprecated: true
+          description: "Deprecated: use org. The internal ID of the customer that owns the repository."
+          type: string
+        org:
+          description: The organization name. It is the iss claim of the JWTs that the organization signs. It can be absent on older deliveries.
           type: string
         pushed_at:
           description: When the push occurred, as an RFC 3339 timestamp.
@@ -613,6 +617,11 @@ components:
         repository:
           $ref: "#/components/schemas/WebhookRepository"
           description: The repository that produced the event.
+        type:
+          description: The event type. It matches the X-Pierre-Event header. It can be absent on older deliveries.
+          enum:
+            - push
+          type: string
       required:
         - repository
         - ref
@@ -638,6 +647,9 @@ components:
         lifecycle_id:
           description: The sync lifecycle ID. It can be absent on older deliveries.
           type: string
+        org:
+          description: The organization name. It is the iss claim of the JWTs that the organization signs. It can be absent on older deliveries.
+          type: string
         repository:
           $ref: "#/components/schemas/WebhookRepository"
           description: The repository that produced the event.
@@ -650,7 +662,7 @@ components:
           format: date-time
           type: string
         type:
-          description: The sync event type. It matches the X-Pierre-Event header.
+          description: The event type. It matches the X-Pierre-Event header.
           enum:
             - repo.sync.failed
           type: string
@@ -678,6 +690,9 @@ components:
         lifecycle_id:
           description: The sync lifecycle ID. It can be absent on older deliveries.
           type: string
+        org:
+          description: The organization name. It is the iss claim of the JWTs that the organization signs. It can be absent on older deliveries.
+          type: string
         repository:
           $ref: "#/components/schemas/WebhookRepository"
           description: The repository that produced the event.
@@ -690,7 +705,7 @@ components:
           format: date-time
           type: string
         type:
-          description: The sync event type. It matches the X-Pierre-Event header.
+          description: The event type. It matches the X-Pierre-Event header.
           enum:
             - repo.sync.started
           type: string
@@ -718,6 +733,9 @@ components:
         lifecycle_id:
           description: The sync lifecycle ID. It can be absent on older deliveries.
           type: string
+        org:
+          description: The organization name. It is the iss claim of the JWTs that the organization signs. It can be absent on older deliveries.
+          type: string
         repository:
           $ref: "#/components/schemas/WebhookRepository"
           description: The repository that produced the event.
@@ -730,7 +748,7 @@ components:
           format: date-time
           type: string
         type:
-          description: The sync event type. It matches the X-Pierre-Event header.
+          description: The event type. It matches the X-Pierre-Event header.
           enum:
             - repo.sync.succeeded
           type: string
@@ -2545,8 +2563,12 @@ components:
         id:
           description: The internal repository ID.
           type: string
+        repo_name:
+          description: The repository name, for example team/project. It can be absent on older deliveries.
+          type: string
         url:
-          description: The repository URL path, for example team/project.
+          deprecated: true
+          description: "Deprecated: use repo_name, which has the same value. The repository name, for example team/project."
           type: string
       required:
         - id
@@ -14433,7 +14455,7 @@ tags:
 webhooks:
   push:
     post:
-      description: Sent when a Git ref is updated in a repository. Each updated ref produces a separate event. The event type is in X-Pierre-Event, not in the JSON body.
+      description: Sent when a Git ref is updated in a repository. Each updated ref produces a separate event.
       operationId: webhooks-push
       parameters:
         - description: The event type for this delivery.

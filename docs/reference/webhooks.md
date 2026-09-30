@@ -50,17 +50,19 @@ Receivers (the SDKs) validate:
 
 ```json
 {
-  "repository": {"id": "<repo_id>", "url": "<repo url>"},
+  "type": "push",
+  "repository": {"id": "<repo_id>", "url": "<repo url>", "repo_name": "<repo url>"},
   "ref": "refs/heads/main",
   "before": "<40-hex, all zeros for ref creation>",
   "after": "<40-hex, all zeros for ref deletion>",
-  "customer_id": "<org/customer id>",
+  "customer_id": "<org name>",
+  "org": "<org name>",
   "pushed_at": "2026-01-20T10:30:00Z"
 }
 ```
 
-All seven fields are required: the Go SDK rejects a payload with any empty field
-("invalid push payload"). Upstream's schema is `GitPushEvent` in the vendored
+Every field is always sent and never empty: the Go SDK rejects a payload with an empty
+field ("invalid push payload"). Upstream's schema is `GitPushEvent` in the vendored
 [OpenAPI spec](../upstream/openapi.yaml) (top-level `webhooks`).
 
 ### `repo.sync.started` / `repo.sync.succeeded` / `repo.sync.failed`
@@ -107,6 +109,21 @@ has the `repo.sync.*` fields, with `type` set to the event name, plus:
 > from `type`. During a rolling upgrade, replicas that have not upgraded yet still send the
 > old names. Deliveries queued before the upgrade keep the event name and body they were
 > queued with.
+
+### Fields on every event: `org` and `repository.repo_name`
+
+Every event body (`push`, `repo.sync.*` and `repo.push_upstream.*`) carries:
+
+| Field | Value |
+|---|---|
+| `org` | The served org name (`OPENSTORAGE_ORG`). Upstream defines `org` as the `iss` claim of the org's JWTs, and open.storage accepts no other `iss` |
+| `repository.repo_name` | The same value as `repository.url`, for example `team/project` |
+
+Upstream deprecates `repository.url` ("use repo_name") and the push event's `customer_id`
+("use org"). open.storage still sends both, unchanged: `customer_id` carries the org name, like
+`org`. Deliveries queued before an upgrade keep the body they were queued with, and replicas
+that have not upgraded yet send the old bodies, so a delivery can lack `org`, `repo_name` and
+the push `type`. Upstream warns about the same gap on older deliveries.
 
 ### Unknown events
 

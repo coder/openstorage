@@ -66,9 +66,17 @@ func discardTestLogger() *slog.Logger {
 type eventRec struct {
 	mu     stdsync.Mutex
 	events []Event
+	raws   []rawEvent
 }
 
-func (r *eventRec) Emit(_ context.Context, _, eventType string, payload []byte) {
+// rawEvent is one Emit call as delivered: the org it was emitted for, the
+// X-Pierre-Event type, and the exact body bytes.
+type rawEvent struct {
+	org, eventType string
+	body           []byte
+}
+
+func (r *eventRec) Emit(_ context.Context, org, eventType string, payload []byte) {
 	var e Event
 	if err := json.Unmarshal(payload, &e); err != nil {
 		panic("eventRec: bad payload: " + err.Error())
@@ -79,12 +87,19 @@ func (r *eventRec) Emit(_ context.Context, _, eventType string, payload []byte) 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, e)
+	r.raws = append(r.raws, rawEvent{org: org, eventType: eventType, body: append([]byte(nil), payload...)})
 }
 
 func (r *eventRec) list() []Event {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]Event(nil), r.events...)
+}
+
+func (r *eventRec) rawList() []rawEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]rawEvent(nil), r.raws...)
 }
 
 // testGit runs one git command with a hermetic env (host config masked,
@@ -692,7 +707,8 @@ func TestProviderHostDefaults(t *testing.T) {
 func TestEventMarshalShape(t *testing.T) {
 	e := Event{
 		Type:        EventSyncFailed,
-		Repository:  EventRepository{ID: "repo_x", URL: "acme/x"},
+		Org:         "acme",
+		Repository:  EventRepository{ID: "repo_x", URL: "acme/x", RepoName: "acme/x"},
 		RunCount:    3,
 		IsFirstSync: false,
 		StartedAt:   "2026-03-17T10:00:00Z",
@@ -705,7 +721,8 @@ func TestEventMarshalShape(t *testing.T) {
 	}
 	want := map[string]any{
 		"type":          "repo.sync.failed",
-		"repository":    map[string]any{"id": "repo_x", "url": "acme/x"},
+		"org":           "acme",
+		"repository":    map[string]any{"id": "repo_x", "url": "acme/x", "repo_name": "acme/x"},
 		"run_count":     float64(3),
 		"is_first_sync": false,
 		"started_at":    "2026-03-17T10:00:00Z",
@@ -720,7 +737,7 @@ func TestEventMarshalShape(t *testing.T) {
 		switch wv := w.(type) {
 		case map[string]any:
 			gm, ok := g.(map[string]any)
-			if !ok || gm["id"] != wv["id"] || gm["url"] != wv["url"] {
+			if !ok || len(gm) != len(wv) || gm["id"] != wv["id"] || gm["url"] != wv["url"] || gm["repo_name"] != wv["repo_name"] {
 				t.Fatalf("payload[%q] = %v, want %v", k, g, w)
 			}
 		default:
@@ -736,7 +753,8 @@ func TestEventMarshalShape(t *testing.T) {
 	// started events omit completed_at/error entirely.
 	s := Event{
 		Type:       EventSyncStarted,
-		Repository: EventRepository{ID: "repo_x", URL: "acme/x"},
+		Org:        "acme",
+		Repository: EventRepository{ID: "repo_x", URL: "acme/x", RepoName: "acme/x"},
 		StartedAt:  "2026-03-17T10:00:00Z",
 	}
 	var sm map[string]any
