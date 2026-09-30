@@ -51,7 +51,11 @@ const DirectionPush = "push"
 // (docs/upstream/guides/webhooks.md field tables). CompletedAt/Error are only
 // present on terminal events.
 type Event struct {
-	Type        string          `json:"type"`
+	Type string `json:"type"`
+	// Org is the served org name: upstream defines it as the `iss` claim
+	// of the org's JWTs, and the served-org gate accepts no other iss
+	// (issue #367).
+	Org         string          `json:"org"`
 	Repository  EventRepository `json:"repository"`
 	RunCount    int             `json:"run_count"`
 	IsFirstSync bool            `json:"is_first_sync"`
@@ -76,10 +80,17 @@ type RejectedRef struct {
 }
 
 // EventRepository identifies the synced repo: id = repo_id, url = the JWT
-// `repo` claim value.
+// `repo` claim value. RepoName carries the same value as URL: upstream
+// deprecated url in favour of repo_name (issue #367).
 type EventRepository struct {
-	ID  string `json:"id"`
-	URL string `json:"url"`
+	ID       string `json:"id"`
+	URL      string `json:"url"`
+	RepoName string `json:"repo_name"`
+}
+
+// newEventRepository builds the repository object for repo's events.
+func newEventRepository(repo RepoInfo) EventRepository {
+	return EventRepository{ID: repo.RepoID, URL: repo.URL, RepoName: repo.URL}
 }
 
 // eventTime renders timestamps the way the payload examples do (RFC 3339,
@@ -96,7 +107,9 @@ func (e Event) marshal() []byte {
 	assertf(inbound || outbound, "marshal: bad event type %q", e.Type)
 	started := e.Type == EventSyncStarted || e.Type == EventPushUpstreamStarted
 	failed := e.Type == EventSyncFailed || e.Type == EventPushUpstreamFailed
+	assertf(e.Org != "", "marshal: missing org on %s", e.Type)
 	assertf(e.Repository.ID != "" && e.Repository.URL != "", "marshal: incomplete repository (%+v)", e.Repository)
+	assertf(e.Repository.RepoName == e.Repository.URL, "marshal: repo_name %q != url %q", e.Repository.RepoName, e.Repository.URL)
 	assertf(e.StartedAt != "", "marshal: missing started_at")
 	assertf(failed == (e.Error != ""), "marshal: error field mismatch for %s", e.Type)
 	assertf(!started == (e.CompletedAt != ""), "marshal: completed_at mismatch for %s", e.Type)

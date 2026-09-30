@@ -206,39 +206,88 @@ func TestCASRefEmitsOnePushPerWebhook(t *testing.T) {
 		t.Errorf("fan-out payloads differ")
 	}
 
-	// docs/reference/webhooks.md: exactly these seven fields, all non-empty.
+	// docs/reference/webhooks.md: exactly these fields, all non-empty.
 	var got map[string]any
 	if err := json.Unmarshal(env.deliveries[0].Payload, &got); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
-	if len(got) != 6 {
-		t.Errorf("top-level payload keys = %d (%v), want 6", len(got), got)
+	if len(got) != 8 {
+		t.Errorf("top-level payload keys = %d (%v), want 8", len(got), got)
 	}
 	repoObj, ok := got["repository"].(map[string]any)
-	if !ok || len(repoObj) != 2 {
-		t.Fatalf("repository object = %v, want {id, url}", got["repository"])
+	if !ok || len(repoObj) != 3 {
+		t.Fatalf("repository object = %v, want {id, url, repo_name}", got["repository"])
 	}
 	for field, want := range map[string]string{
+		"type":   "push",
 		"ref":    "refs/heads/main",
 		"before": shaA,
 		"after":  shaB,
 		// docs/archive/phases/14-phase5-implementation-notes.md deferred #3: customer_id is the org-name string matching
 		// the JWT `iss` claim, not the internal integer org ID.
 		"customer_id": "acme",
-		"pushed_at":   "2026-01-20T10:30:00Z",
+		// Issue #367: org is the served org name, the only `iss` the
+		// served-org gate accepts.
+		"org":       "acme",
+		"pushed_at": "2026-01-20T10:30:00Z",
 	} {
 		if got[field] != want {
 			t.Errorf("payload.%s = %v, want %q", field, got[field], want)
 		}
 	}
-	if repoObj["id"] != "repo_abc123" || repoObj["url"] != "acme/widgets" {
+	// Issue #367: repo_name has the same value as the deprecated url.
+	if repoObj["id"] != "repo_abc123" || repoObj["url"] != "acme/widgets" || repoObj["repo_name"] != "acme/widgets" {
 		t.Errorf("payload.repository = %v", repoObj)
 	}
+	assertUpstreamPushShape(t, env.deliveries[0].Payload)
 	if env.deliveries[0].Event != EventPush {
 		t.Errorf("delivery event = %q, want %q", env.deliveries[0].Event, EventPush)
 	}
 	if len(env.syncPokes) != 1 || env.syncPokes[0] != "repo_abc123" {
 		t.Errorf("sync pokes = %v, want [repo_abc123]", env.syncPokes)
+	}
+}
+
+// upstreamPushEventProps / upstreamWebhookRepositoryProps are the property
+// names of upstream's GitPushEvent and WebhookRepository schemas
+// (docs/upstream/openapi.yaml, 2026-09-29 20:33:38 GMT snapshot). Both set
+// additionalProperties: false, so a push body may carry no other key.
+var (
+	upstreamPushEventProps = map[string]bool{
+		"type": true, "repository": true, "ref": true, "before": true, "after": true,
+		"customer_id": true, "org": true, "pushed_at": true,
+	}
+	upstreamWebhookRepositoryProps = map[string]bool{"id": true, "url": true, "repo_name": true}
+)
+
+// assertUpstreamPushShape fails unless body uses only keys upstream's push
+// schemas define, and carries every one of them: the optional type, org
+// and repository.repo_name included (issue #367).
+func assertUpstreamPushShape(t *testing.T, body []byte) {
+	t.Helper()
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	assertExactKeys(t, "push body", got, upstreamPushEventProps)
+	var repo map[string]json.RawMessage
+	if err := json.Unmarshal(got["repository"], &repo); err != nil {
+		t.Fatalf("push body repository: %v: %s", err, body)
+	}
+	assertExactKeys(t, "push body repository", repo, upstreamWebhookRepositoryProps)
+}
+
+func assertExactKeys(t *testing.T, what string, got map[string]json.RawMessage, want map[string]bool) {
+	t.Helper()
+	for k := range got {
+		if !want[k] {
+			t.Errorf("%s carries %q, which upstream's schema forbids", what, k)
+		}
+	}
+	for k := range want {
+		if _, ok := got[k]; !ok {
+			t.Errorf("%s lacks %q", what, k)
+		}
 	}
 }
 

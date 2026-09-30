@@ -102,7 +102,8 @@ ones. On conflict:
 Where upstream does, responses mirror legacy names alongside current ones, so older SDK
 response parsing keeps working. Examples: `url` mirrors `repo_name`; delete-repo
 responses carry `repo_name` plus the deprecated `repo_id`; deleted-branch responses carry
-both `target_branch` and `name`.
+both `target_branch` and `name`; [webhook](../reference/webhooks.md) bodies carry
+`repository.repo_name` and `org` next to the deprecated `repository.url` and `customer_id`.
 
 ### Git protocol semantics
 
@@ -214,9 +215,9 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-09-29 (upstream
-  `Last-Modified` 2026-09-28 19:47:47 GMT), SHA-256
-  `ca9adca0e98dc2369643b05b2f1c2734769d2f2c590c3084152778e7ba33f65c`.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-09-30 (upstream
+  `Last-Modified` 2026-09-29 20:33:38 GMT), SHA-256
+  `6523f6d57df76f43ab21fab55441d974d1b0897c159b719c55cb31c41e2e6224`.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled

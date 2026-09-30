@@ -186,27 +186,33 @@ func BaseRepoID(repoKey string) string {
 }
 
 // RepositoryRef is the `repository` object embedded in event payloads.
+// RepoName carries the same value as URL: upstream deprecated url in favour
+// of repo_name (issue #367), and both stay on the wire.
 type RepositoryRef struct {
-	ID  string `json:"id"`
-	URL string `json:"url"`
+	ID       string `json:"id"`
+	URL      string `json:"url"`
+	RepoName string `json:"repo_name"`
 }
 
-// PushPayload is the docs/reference/webhooks.md `push` event body. All seven fields are
-// required non-empty — vendor SDKs reject payloads with any empty field.
+// PushPayload is the docs/reference/webhooks.md `push` event body. Every field is
+// sent non-empty — vendor SDKs reject payloads with any empty field.
 type PushPayload struct {
+	Type       string        `json:"type"` // always EventPush (issue #367)
 	Repository RepositoryRef `json:"repository"`
 	Ref        string        `json:"ref"`
 	Before     string        `json:"before"` // 40 zeros for ref creation
 	After      string        `json:"after"`  // 40 zeros for ref deletion
 	CustomerID string        `json:"customer_id"`
+	Org        string        `json:"org"`       // same value as CustomerID (issue #367)
 	PushedAt   string        `json:"pushed_at"` // RFC 3339 UTC
 }
 
 // NewPushPayload builds the push body for one won CAS. before/after come
 // straight from CASRef's old/new, which already use ref.ZeroSHA for
-// create/delete — exactly the docs/reference/webhooks.md wire convention. customer_id is the
-// owning org's name — the same string the JWT `iss` claim carries (docs/reference/webhooks.md
-// "org/customer id"; vendor SDKs compare it against iss).
+// create/delete — exactly the docs/reference/webhooks.md wire convention. customer_id and
+// org are both the owning org's name — the same string the JWT `iss` claim carries
+// (docs/reference/webhooks.md; vendor SDKs compare it against iss). Upstream defines org
+// as that iss and deprecates customer_id; the served-org gate accepts only this iss.
 func NewPushPayload(org string, repo meta.Repo, refName, before, after string, pushedAt time.Time) PushPayload {
 	assertf(org != "", "NewPushPayload: empty org")
 	assertf(repo.RepoID != "", "NewPushPayload: empty RepoID")
@@ -216,11 +222,13 @@ func NewPushPayload(org string, repo meta.Repo, refName, before, after string, p
 	assertf(ref.ValidSHA(after), "NewPushPayload: malformed after sha %q", after)
 	assertf(!pushedAt.IsZero(), "NewPushPayload: zero pushed_at")
 	return PushPayload{
-		Repository: RepositoryRef{ID: repo.RepoID, URL: repo.URL},
+		Type:       EventPush,
+		Repository: RepositoryRef{ID: repo.RepoID, URL: repo.URL, RepoName: repo.URL},
 		Ref:        refName,
 		Before:     before,
 		After:      after,
 		CustomerID: org,
+		Org:        org,
 		PushedAt:   pushedAt.UTC().Format(time.RFC3339),
 	}
 }
