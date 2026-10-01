@@ -43,19 +43,20 @@ silently skipping LFS coverage.
 ### SeaweedFS fixture image
 
 The fixtures and reference Compose file pin SeaweedFS
-[4.47](https://github.com/seaweedfs/seaweedfs/releases/tag/4.47), published
-2026-09-14. [Changes since 4.46](https://github.com/seaweedfs/seaweedfs/compare/4.46...4.47)
-touch S3 request routing, IAM reload handling, bucket-policy enforcement,
-volume error handling, and master shutdown.
+[4.48](https://github.com/seaweedfs/seaweedfs/releases/tag/4.48), published
+2026-09-28. [Changes since 4.47](https://github.com/seaweedfs/seaweedfs/compare/4.47...4.48)
+touch S3 request-body draining on error responses, list-marker handling,
+ListMultipartUploads timestamps, POST-policy versioning, Object Lock
+permissions, volume and erasure-coding input validation, and filer shutdown.
 
-SHA-256 digests of the Docker Hub image metadata (retrieved 2026-09-16; a
+SHA-256 digests of the Docker Hub image metadata (retrieved 2026-10-01; a
 published manifest does not prove runtime qualification):
 
-| Image metadata | 4.46 | 4.47 |
+| Image metadata | 4.47 | 4.48 |
 |---|---|---|
-| Multi-platform index | `08d516132314207d10c8e37cbffc1f32b147d870169688734cc61c6231625b62` | `ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882` |
-| Linux/amd64 manifest | `6a602956ac4915057199a5271343e9c86c403a561db7c21033362f6791aa29c9` | `f83509b0721dfd8e2e07faf76c0a899f67a8a889c89abe2fa0a5227ba1320362` |
-| Linux/arm64 manifest | `cc476c229cb2b7c86401070ed791ec6c5c1f3193b37db5a13f510e770a15dc6c` | `d4cf67729aa8777e1a43a5b61d72e5b96179e4b7bac9a221cb14cbc2036cb32e` |
+| Multi-platform index | `ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882` | `4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d` |
+| Linux/amd64 manifest | `f83509b0721dfd8e2e07faf76c0a899f67a8a889c89abe2fa0a5227ba1320362` | `aba492e2a4e4c90bff795745e8e660affa1f09e7650f5981bd7bccd1a06cd931` |
+| Linux/arm64 manifest | `d4cf67729aa8777e1a43a5b61d72e5b96179e4b7bac9a221cb14cbc2036cb32e` | `f1f303474940e9e088edbd2c1658f7ac38cb0dd90f91a2b0a51916d74b8575a1` |
 
 On every pin change:
 
