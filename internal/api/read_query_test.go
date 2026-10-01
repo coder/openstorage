@@ -710,6 +710,62 @@ func testQueryBranchesDiffMigration(t *testing.T, e *testEnv) {
 		rqFileByPath(t, cur.Files, "noeol.txt")
 	})
 
+	// Unrelated histories (issue #373): with no merge base, both endpoints
+	// fall back to the same direct two-dot base..ref diff and report an
+	// empty merge_base_sha. A separate repo keeps the orphan branch out of
+	// the shared query fixture other tests list and count.
+	t.Run("unrelated histories", func(t *testing.T) {
+		org := e.newOrg(t)
+		repoURL := "https://example.com/org/query-orphan-" + randomHex(t, 4)
+		repoID := createRepo(t, e, org, repoURL, nil, http.StatusOK).RepoID
+		dir := t.TempDir()
+		coreGit(t, dir, "init", "-q", "-b", "main", ".")
+		coreWriteFile(t, dir, "shared.txt", "main\n")
+		coreWriteFile(t, dir, "main-only.txt", "main only\n")
+		coreGit(t, dir, "add", "-A")
+		coreGit(t, dir, "commit", "-q", "-m", "main root")
+		mainTip := coreRevParse(t, dir, "HEAD")
+		coreGit(t, dir, "checkout", "-q", "--orphan", "orphan")
+		coreGit(t, dir, "rm", "-q", "-rf", ".")
+		coreWriteFile(t, dir, "shared.txt", "orphan\n")
+		coreWriteFile(t, dir, "orphan-only.txt", "orphan only\n")
+		rqWriteFileBytes(t, dir, "orphan.bin", []byte{0x00, 0x01, 0x02, 0xff})
+		coreGit(t, dir, "add", "-A")
+		coreGit(t, dir, "commit", "-q", "-m", "orphan root")
+		orphanTip := coreRevParse(t, dir, "HEAD")
+		coreSeedStores(t, e, repoID, dir, map[string]string{
+			"refs/heads/main":   mainTip,
+			"refs/heads/orphan": orphanTip,
+		})
+		otok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/branches/diff?branch=orphan&base=main", otok, nil, "")
+		var old branchDiffResponse
+		rqDecode(t, resp, body, &old)
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref=orphan&base_ref=main", otok, nil, "")
+		var cur commitDiffResponse
+		rqDecode(t, resp, body, &cur)
+		if cur.SHA != orphanTip || cur.BaseSHA != mainTip {
+			t.Errorf("sha/base_sha = %q/%q, want %q/%q", cur.SHA, cur.BaseSHA, orphanTip, mainTip)
+		}
+		if old.MergeBaseSHA != "" || cur.MergeBaseSHA != "" {
+			t.Errorf("merge_base_sha = %q (branches/diff) / %q (diff), want empty for unrelated histories", old.MergeBaseSHA, cur.MergeBaseSHA)
+		}
+		// main..orphan two-dot: main-only.txt deleted, shared.txt modified,
+		// orphan-only.txt added; the binary is filtered, not inlined.
+		if len(cur.Files) != 3 || len(cur.FilteredFiles) != 1 {
+			t.Fatalf("diff files/filtered = %d/%d, want 3/1 (%s)", len(cur.Files), len(cur.FilteredFiles), body)
+		}
+		rqFileByPath(t, cur.Files, "main-only.txt")
+		rqFileByPath(t, cur.Files, "shared.txt")
+		rqFileByPath(t, cur.Files, "orphan-only.txt")
+		oldDiff := sameDiff{old.MergeBaseSHA, old.Stats, old.Files, old.FilteredFiles}
+		curDiff := sameDiff{cur.MergeBaseSHA, cur.Stats, cur.Files, cur.FilteredFiles}
+		if !reflect.DeepEqual(oldDiff, curDiff) {
+			t.Errorf("mapped diff differs:\nbranches/diff %+v\ndiff          %+v", oldDiff, curDiff)
+		}
+	})
+
 	t.Run("namespace misses map to 404 on both", func(t *testing.T) {
 		for _, path := range []string{
 			"/api/v1/repos/branches/diff?branch=eph",
