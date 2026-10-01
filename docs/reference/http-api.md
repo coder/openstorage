@@ -168,9 +168,31 @@ Each page runs one `git rev-list --topo-order` walk for `order`, as one more git
 | `GET /repos/branch` | git:read | `name` (req), `ephemeral?` → `{branch: {name, head_sha, created_at}}` — one branch by exact short name (no pagination fields); 404 when absent |
 | `POST /repos/branches/create` | git:write | `{target_branch?, base_ref?\|base_branch?(deprecated), preferred_base?, base_is_ephemeral?, target_is_ephemeral?, force?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
 | `DELETE /repos/branches` | git:write | `{target_branch (deprecated alias name), ephemeral?}` → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent) |
-| `GET /repos/branches/diff` | git:read | `branch` (req), `base?`, `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}` |
+| `GET /repos/branches/diff` | git:read | **Deprecated upstream** (both path styles); still implemented. Use `GET /repos/diff` ([migration](#migrating-from-branchesdiff)). `branch` (req), `base?` (defaults to the repo default branch), `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}` |
 | `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`) |
 | `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
+
+#### Migrating from `branches/diff`
+
+Upstream deprecated `GET /api/v1/repos/branches/diff` and
+`GET /api/repos/{repo_name}/branches/diff` in favor of `GET /repos/diff` (same path
+styles). open.storage keeps serving `branches/diff`. To migrate, rename the parameters:
+
+| `branches/diff` | `diff` |
+|---|---|
+| `branch` | `ref` |
+| `base` | `base_ref` |
+| `ephemeral` | `ref_is_ephemeral` |
+| `ephemeral_base` | `base_is_ephemeral` |
+| `path` | `path` |
+
+With `base_ref` set, `diff` returns the same three-dot diff (`merge_base_sha`, `stats`,
+`files`, `filtered_files`) as `branches/diff`. The envelope differs: `sha` and `base_sha`
+(resolved commits) replace `branch` and `base` (the names you sent).
+
+**Default base:** `branches/diff` without `base` diffs against the repo default branch.
+`diff` without `base_ref` returns the diff of the one commit `ref` points to. To keep the
+old behavior, read `default_branch` from `GET /repo` and send it as `base_ref`.
 
 **Server-allocated branch names** (`POST /repos/branches/create`, both path styles):
 
