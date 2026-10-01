@@ -18,9 +18,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -606,6 +608,118 @@ func testQueryBranchesDiff(t *testing.T, e *testEnv) {
 		rqExpectErr(t, resp, body, http.StatusNotFound)
 		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/branches/diff?branch=feature&base=no-such-base", tok, nil, "")
 		rqExpectErr(t, resp, body, http.StatusNotFound)
+	})
+}
+
+// --- branches/diff → diff migration (issue #370) ------------------------------
+
+// TestQueryBranchesDiffMigration pins upstream's migration mapping from the
+// deprecated GET /repos/branches/diff to GET /repos/diff: branch → ref,
+// base → base_ref, ephemeral → ref_is_ephemeral, ephemeral_base →
+// base_is_ephemeral, and an omitted base becomes base_ref = the repo's
+// default_branch. Mapped requests must return the same diff.
+func TestQueryBranchesDiffMigration(t *testing.T) { runBackends(t, testQueryBranchesDiffMigration) }
+
+func testQueryBranchesDiffMigration(t *testing.T, e *testEnv) {
+	fx := queryFixtureFor(t, e)
+	tok := fx.readToken(t, e)
+
+	// Clients reproduce the old default base by reading default_branch.
+	resp, body := e.doReq(t, http.MethodGet, "/api/v1/repo", tok, nil, "")
+	var repo repoEntry
+	rqDecode(t, resp, body, &repo)
+	if repo.DefaultBranch != "main" {
+		t.Fatalf("default_branch = %q, want main", repo.DefaultBranch)
+	}
+	defaultBase := "base_ref=" + repo.DefaultBranch
+
+	// sameDiff is the part of the two payloads that must agree; the
+	// envelopes differ by design (branch/base vs sha/base_sha).
+	type sameDiff struct {
+		MergeBaseSHA  string
+		Stats         diffStatsPayload
+		Files         []fileDiffEntry
+		FilteredFiles []filteredFileEntry
+	}
+	for _, c := range []struct {
+		name, oldQuery, newQuery string
+		wantSHA, wantBaseSHA     string
+		wantFiles                int
+	}{
+		{"omitted base is the default branch", "branch=feature", "ref=feature&" + defaultBase, fx.c3, fx.c4, 2},
+		{"explicit base sha", "branch=feature&base=" + fx.c1, "ref=feature&base_ref=" + fx.c1, fx.c3, fx.c1, 4},
+		{"base branch name", "branch=main&base=feature", "ref=main&base_ref=feature", fx.c4, fx.c3, 2},
+		{"default branch against itself", "branch=main", "ref=main&" + defaultBase, fx.c4, fx.c4, 0},
+		{"ephemeral branch", "branch=eph&ephemeral=true", "ref=eph&ref_is_ephemeral=true&" + defaultBase, fx.c3, fx.c4, 2},
+		{"ephemeral base", "branch=main&base=eph&ephemeral_base=true", "ref=main&base_ref=eph&base_is_ephemeral=true", fx.c4, fx.c3, 2},
+		{"both ephemeral", "branch=eph&ephemeral=true&base=eph&ephemeral_base=true",
+			"ref=eph&ref_is_ephemeral=true&base_ref=eph&base_is_ephemeral=true", fx.c3, fx.c3, 0},
+		{"repeated path filter", "branch=feature&path=notes.txt&path=large.txt",
+			"ref=feature&" + defaultBase + "&path=notes.txt&path=large.txt", fx.c3, fx.c4, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/branches/diff?"+c.oldQuery, tok, nil, "")
+			var old branchDiffResponse
+			rqDecode(t, resp, body, &old)
+			resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?"+c.newQuery, tok, nil, "")
+			var cur commitDiffResponse
+			rqDecode(t, resp, body, &cur)
+			if cur.SHA != c.wantSHA || cur.BaseSHA != c.wantBaseSHA {
+				t.Errorf("sha/base_sha = %q/%q, want %q/%q", cur.SHA, cur.BaseSHA, c.wantSHA, c.wantBaseSHA)
+			}
+			if len(cur.Files) != c.wantFiles {
+				t.Errorf("files = %d, want %d (%s)", len(cur.Files), c.wantFiles, body)
+			}
+			oldDiff := sameDiff{old.MergeBaseSHA, old.Stats, old.Files, old.FilteredFiles}
+			curDiff := sameDiff{cur.MergeBaseSHA, cur.Stats, cur.Files, cur.FilteredFiles}
+			if !reflect.DeepEqual(oldDiff, curDiff) {
+				t.Errorf("mapped diff differs:\nbranches/diff %+v\ndiff          %+v", oldDiff, curDiff)
+			}
+		})
+	}
+
+	t.Run("named-repo paths", func(t *testing.T) {
+		esc := url.PathEscape(fx.repoURL)
+		resp, body := e.doReq(t, http.MethodGet, "/api/repos/"+esc+"/branches/diff?branch=feature", tok, nil, "")
+		var old branchDiffResponse
+		rqDecode(t, resp, body, &old)
+		resp, body = e.doReq(t, http.MethodGet, "/api/repos/"+esc+"/diff?ref=feature&"+defaultBase, tok, nil, "")
+		var cur commitDiffResponse
+		rqDecode(t, resp, body, &cur)
+		if !reflect.DeepEqual(old.Files, cur.Files) || old.MergeBaseSHA != cur.MergeBaseSHA || len(cur.Files) != 2 {
+			t.Errorf("named-repo diff differs: old %+v, new %+v", old.Files, cur.Files)
+		}
+	})
+
+	// The caveat upstream documents: without base_ref, /diff is the
+	// single-commit diff of ref, not a diff against the default branch.
+	t.Run("omitted base_ref is a single-commit diff", func(t *testing.T) {
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/branches/diff?branch=main", tok, nil, "")
+		var old branchDiffResponse
+		rqDecode(t, resp, body, &old)
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref=main", tok, nil, "")
+		var cur commitDiffResponse
+		rqDecode(t, resp, body, &cur)
+		if len(old.Files) != 0 {
+			t.Errorf("branches/diff main vs default = %d files, want 0", len(old.Files))
+		}
+		if cur.BaseSHA != "" || cur.MergeBaseSHA != "" || len(cur.Files) != 2 {
+			t.Fatalf("diff ref=main: base_sha=%q merge_base=%q files=%d, want empty/empty/2 (c4 vs c2)", cur.BaseSHA, cur.MergeBaseSHA, len(cur.Files))
+		}
+		rqFileByPath(t, cur.Files, "main-only.txt")
+		rqFileByPath(t, cur.Files, "noeol.txt")
+	})
+
+	t.Run("namespace misses map to 404 on both", func(t *testing.T) {
+		for _, path := range []string{
+			"/api/v1/repos/branches/diff?branch=eph",
+			"/api/v1/repos/diff?ref=eph&" + defaultBase,
+			"/api/v1/repos/branches/diff?branch=feature&base=eph",
+			"/api/v1/repos/diff?ref=feature&base_ref=eph",
+		} {
+			resp, body := e.doReq(t, http.MethodGet, path, tok, nil, "")
+			rqExpectErr(t, resp, body, http.StatusNotFound)
+		}
 	})
 }
 

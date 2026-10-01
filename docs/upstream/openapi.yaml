@@ -4682,11 +4682,16 @@ paths:
       x-stability: stable
   /api/repos/{repo_name}/branches/diff:
     get:
+      deprecated: true
       description: |-
         Compare a feature branch to its base branch and return every change that would be reviewed before a merge. Repeated `path` filters limit the diff to selected files and bypass the usual large-file filtering for those requested paths.
+
+        `GET /api/repos/{repo_name}/diff` replaces this endpoint. Send `branch` as `ref`, `base` as `base_ref`, `ephemeral` as `ref_is_ephemeral`, and `ephemeral_base` as `base_is_ephemeral`. When you omit `base`, this endpoint diffs against the repository default branch. When you omit `base_ref`, `/diff` returns the diff of one commit. To get the same diff, read `default_branch` from the repository and send it as `base_ref`.
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
+
+        Deprecated: Use `/api/repos/{repo_name}/diff` with `ref` and `base_ref` instead.
       operationId: get_branch_diff
       parameters:
         - description: Repository name. Names that contain `/` or any other character that is not safe in a URL path segment must be URL encoded so the value occupies a single path segment. For example `pierre/example` is sent as `pierre%2Fexample`. Plain names such as `example` can be sent as-is. The server URL-decodes the value before resolving the repository.
@@ -4703,7 +4708,7 @@ paths:
           required: true
           schema:
             type: string
-        - description: Optional base branch or ref to diff against.
+        - description: Optional base branch or ref to diff against. When omitted, the repository default branch is used.
           example: main
           in: query
           name: base
@@ -4847,6 +4852,7 @@ paths:
       summary: Get Branch Diff
       tags:
         - Commits
+      x-deprecation-message: Use `/api/repos/{repo_name}/diff` with `ref` and `base_ref` instead.
       x-permission-scopes:
         - git:read
       x-requires-repo-scope: true
@@ -10338,11 +10344,13 @@ paths:
       deprecated: true
       description: |-
         Compare a feature branch to its base branch and return every change that would be reviewed before a merge. Repeated `path` filters limit the diff to selected files and bypass the usual large-file filtering for those requested paths.
+
+        `GET /api/repos/{repo_name}/diff` replaces this endpoint. Send `branch` as `ref`, `base` as `base_ref`, `ephemeral` as `ref_is_ephemeral`, and `ephemeral_base` as `base_is_ephemeral`. When you omit `base`, this endpoint diffs against the repository default branch. When you omit `base_ref`, `/diff` returns the diff of one commit. To get the same diff, read `default_branch` from the repository and send it as `base_ref`.
         #### JWT claims
         Required scopes: `git:read`  
         Requires per repo scope: Yes
 
-        Deprecated: Use `/api/repos/{repo_name}/branches/diff` instead.
+        Deprecated: Use `/api/repos/{repo_name}/diff` with `ref` and `base_ref` instead.
       operationId: get_branch_diff_legacy
       parameters:
         - description: Branch name to diff.
@@ -10352,7 +10360,7 @@ paths:
           required: true
           schema:
             type: string
-        - description: Optional base branch or ref to diff against.
+        - description: Optional base branch or ref to diff against. When omitted, the repository default branch is used.
           example: main
           in: query
           name: base
@@ -10496,7 +10504,7 @@ paths:
       summary: Get Branch Diff
       tags:
         - Commits
-      x-deprecation-message: Use `/api/repos/{repo_name}/branches/diff` instead.
+      x-deprecation-message: Use `/api/repos/{repo_name}/diff` with `ref` and `base_ref` instead.
       x-permission-scopes:
         - git:read
       x-requires-repo-scope: true
