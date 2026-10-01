@@ -97,7 +97,7 @@ Run it one of three ways:
   durable (`s3wal://` refs + metadata, `s3://` blobs). It must exist before boot.
 
   ```sh
-  docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.47 server -s3 -dir=/data -ip.bind=0.0.0.0
+  docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.48 server -s3 -dir=/data -ip.bind=0.0.0.0
   until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
   # Cold start: bucket creation and object writes can both precede a writable volume,
   # so retry create + a real write roundtrip as one unit (create tolerates already-exists).
