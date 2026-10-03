@@ -15,7 +15,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
 
 - **Pagination** (all list endpoints): request `cursor` + `limit` query params (grep:
   `pagination: {cursor, limit}` in the body). Response: `next_cursor` (opaque string,
-  null/empty when exhausted) + `has_more` (bool). Documented default limit 20, max 100.
+  sent only when `has_more` is true; grep alone sends `""` when exhausted) + `has_more`
+  (bool). Documented default limit 20, max 100.
   SDK-observed server defaults differ: files 1000/max 5000, files/metadata 200/max 1000,
   notes refs 20.
 - **Errors**: `{"error": "<unstable human string>"}` + status code, with RFC 9457

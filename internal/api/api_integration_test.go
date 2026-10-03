@@ -229,9 +229,9 @@ func testCreateRepoValidation(t *testing.T, e *testEnv) {
 }
 
 // TestCreateRepoRepoName covers the optional body `repo_name` (issue #293).
-// Upstream: "It can contain a slash. When present, it must equal the JWT repo
-// claim. When omitted, the repo claim supplies the name." A mismatch is the
-// documented 400 ("did not match the JWT repo claim"), in this backend's
+// Upstream's 2026-10-02 snapshot shortened the field text to "It can contain
+// a slash." but still documents the mismatch as a 400 ("did not match the JWT
+// repo claim") and keeps create repo-scoped. A mismatch is that 400, in this backend's
 // recorded {"error"} envelope (docs/explanation/wire-compatibility.md). The
 // security invariant: the body name can only confirm the claim, never
 // override it, so a mismatch creates nothing under either name.

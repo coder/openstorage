@@ -179,9 +179,18 @@ type branchEntry struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// assertPageCursor pins the pagination contract every list response with an
+// omitempty next_cursor relies on: a non-empty cursor exactly when another
+// page exists. Upstream (spec 2026-10-02) documents next_cursor as absent
+// when there are no more results, so an exhausted page must carry "" (and
+// omitempty drops the key), and a has_more page must carry a real cursor.
+func assertPageCursor(hasMore bool, next string) {
+	assertf(hasMore == (next != ""), "page cursor: has_more=%v with next_cursor %q", hasMore, next)
+}
+
 type listBranchesResponse struct {
 	Branches   []branchEntry `json:"branches"`
-	NextCursor string        `json:"next_cursor"`
+	NextCursor string        `json:"next_cursor,omitempty"`
 	HasMore    bool          `json:"has_more"`
 }
 
@@ -251,6 +260,7 @@ func (s *server) handleListBranches(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		next = entries[len(entries)-1].Cursor
 	}
+	assertPageCursor(hasMore, next)
 	writeJSON(w, http.StatusOK, listBranchesResponse{Branches: entries, NextCursor: next, HasMore: hasMore})
 }
 
@@ -326,7 +336,7 @@ type tagEntry struct {
 
 type listTagsResponse struct {
 	Tags       []tagEntry `json:"tags"`
-	NextCursor string     `json:"next_cursor"`
+	NextCursor string     `json:"next_cursor,omitempty"`
 	HasMore    bool       `json:"has_more"`
 }
 
@@ -382,6 +392,7 @@ func (s *server) handleListTags(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		next = entries[len(entries)-1].Cursor
 	}
+	assertPageCursor(hasMore, next)
 	writeJSON(w, http.StatusOK, listTagsResponse{Tags: entries, NextCursor: next, HasMore: hasMore})
 }
 
@@ -462,7 +473,7 @@ func toCommitInfo(c gitread.Commit) commitInfo {
 
 type listCommitsResponse struct {
 	Commits    []commitInfo `json:"commits"`
-	NextCursor string       `json:"next_cursor"`
+	NextCursor string       `json:"next_cursor,omitempty"`
 	HasMore    bool         `json:"has_more"`
 }
 
@@ -556,6 +567,7 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		next = coreCursorEncode(cursorKindCommits, anchor, strconv.Itoa(offset+limit))
 	}
+	assertPageCursor(hasMore, next)
 	writeJSON(w, http.StatusOK, listCommitsResponse{Commits: entries, NextCursor: next, HasMore: hasMore})
 }
 
@@ -710,7 +722,7 @@ type listFilesResponse struct {
 	Paths      []string    `json:"paths"`
 	Ref        string      `json:"ref"`
 	Entries    []fileEntry `json:"entries"`
-	NextCursor string      `json:"next_cursor"`
+	NextCursor string      `json:"next_cursor,omitempty"`
 	HasMore    bool        `json:"has_more"`
 }
 
@@ -764,6 +776,7 @@ func (s *server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		next = coreCursorEncode(cursorKindFiles, page[len(page)-1].Path)
 	}
+	assertPageCursor(hasMore, next)
 	writeJSON(w, http.StatusOK, listFilesResponse{
 		Paths:      paths,
 		Ref:        refLabel,
@@ -792,7 +805,7 @@ type listFilesMetadataResponse struct {
 	Files      []fileMetaEntry           `json:"files"`
 	Commits    map[string]fileMetaCommit `json:"commits"`
 	Ref        string                    `json:"ref"`
-	NextCursor string                    `json:"next_cursor"`
+	NextCursor string                    `json:"next_cursor,omitempty"`
 	HasMore    bool                      `json:"has_more"`
 }
 
@@ -889,6 +902,7 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		next = coreCursorEncode(cursorKindFileMeta, page[len(page)-1].Path)
 	}
+	assertPageCursor(hasMore, next)
 	writeJSON(w, http.StatusOK, listFilesMetadataResponse{
 		Files:      files,
 		Commits:    commitsMap,

@@ -504,7 +504,7 @@ type repoEntry struct {
 
 type listReposResponse struct {
 	Repos      []repoEntry `json:"repos"`
-	NextCursor string      `json:"next_cursor"`
+	NextCursor string      `json:"next_cursor,omitempty"`
 	HasMore    bool        `json:"has_more"`
 }
 
@@ -566,6 +566,7 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 			BaseRepo:      base,
 		})
 	}
+	assertPageCursor(res.HasMore, res.NextCursor)
 	writeJSON(w, http.StatusOK, listReposResponse{
 		Repos:      entries,
 		NextCursor: res.NextCursor,

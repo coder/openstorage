@@ -184,6 +184,7 @@ the [archived phase notes](../archive/phases/)):
 
 | Upstream spec | Here | Rationale |
 |---|---|---|
+| `GET /api/repo-changes`: an `org:read` feed of the latest state of each changed branch, with ref and repository deletions (spec 2026-10-02) | Not implemented: the route answers `404` | No metadata backend records per-ref change times or ref-deletion tombstones, and S3-WAL needs a metadata format decision first. No SDK calls the route yet. Tracked in [#376](https://github.com/coder/openstorage/issues/376) |
 | `POST .../reset-commits` (NDJSON) | Not implemented; `POST .../restore-commit` (plain JSON) covers the SDK-visible restore semantics | Recorded deviation ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md)); no SDK calls `reset-commits` |
 | `DELETE /api/repos/{repo_name}/tags/{tag_name}` (tag in path) | `DELETE .../tags` with the tag in the request body | Matches the SDKs' actual call shape |
 | `POST /repos` `upstream.access`: `app` (the default for `github`) reads through the organization's GitHub App installation | Only `access: "public"` is accepted; `app` or an omitted `access` with `provider: "github"` → 400. A public mirror syncs on the same triggers as a `base_repo` sync link, not only on request | No GitHub App integration. Private GitHub repositories sync through the deprecated `base_repo` form with `auth.token` |
@@ -215,9 +216,9 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-01 (upstream
-  `Last-Modified` 2026-09-30 16:45:01 GMT), SHA-256
-  `0e85cfa42bb1e5130b91d19bce6449febac888044c8298b9c8414ec6d9e66804`.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-03 (upstream
+  `Last-Modified` 2026-10-02 20:39:20 GMT), SHA-256
+  `f83d6d183e00ab78a859015b1890c21735f2ac7aecac60341b75032faa5deae5`.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled
