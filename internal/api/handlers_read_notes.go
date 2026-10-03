@@ -107,7 +107,7 @@ type rnotesRefEntry struct {
 type rnotesListRefsResponse struct {
 	Refs       []rnotesRefEntry `json:"refs"`
 	Prefix     string           `json:"prefix"`
-	NextCursor string           `json:"next_cursor"`
+	NextCursor string           `json:"next_cursor,omitempty"`
 	HasMore    bool             `json:"has_more"`
 }
 
@@ -186,5 +186,6 @@ func (s *server) handleListNotesRefs(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		next = entries[len(entries)-1].Cursor
 	}
+	assertPageCursor(hasMore, next)
 	writeJSON(w, http.StatusOK, rnotesListRefsResponse{Refs: entries, Prefix: prefix, NextCursor: next, HasMore: hasMore})
 }
