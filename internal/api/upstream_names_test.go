@@ -37,7 +37,7 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 		resp, body := pack(t, "main", "c1", "a.txt", nil)
 		c1 := wctRequireOK(t, resp, body).Commit.CommitSHA
 		resp, body = pack(t, "main", "c2", "b.txt", map[string]any{"expected_target_sha": c1})
-		c2 := wctRequireOK(t, resp, body).Commit.CommitSHA
+		wctRequireOK(t, resp, body)
 
 		t.Run("stale expected_target_sha is 412", func(t *testing.T) {
 			resp, body := pack(t, "main", "stale", "x.txt", map[string]any{"expected_target_sha": c1})
@@ -102,54 +102,28 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 			return wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(raw))
 		}
 
-		var c1Tree string
-		t.Run("restore base_ref sha with expected_target_sha", func(t *testing.T) {
+		t.Run("restore honors expected_target_sha", func(t *testing.T) {
+			resp, body := restore(t, map[string]any{"target_branch": "main", "target_commit_sha": c1, "expected_target_sha": c1})
+			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
 			tip := wctBranchTip(t, e, readTok, "main", false)
-			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": c1, "expected_target_sha": tip})
-			env := wctRequireOK(t, resp, body)
-			c1Tree = env.Commit.TreeSHA
-			if env.Result.OldSHA != tip {
+			resp, body = restore(t, map[string]any{"target_branch": "main", "target_commit_sha": c1, "expected_target_sha": tip})
+			if env := wctRequireOK(t, resp, body); env.Result.OldSHA != tip {
 				t.Fatalf("old_sha = %q, want %q", env.Result.OldSHA, tip)
 			}
 		})
 
-		t.Run("restore base_ref branch name resolves to its tip", func(t *testing.T) {
-			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "persist"})
-			env := wctRequireOK(t, resp, body)
-			if env.Commit.TreeSHA == c1Tree {
-				t.Fatalf("restore to persist kept c1 tree %s", c1Tree)
+		t.Run("restore refuses base_ref, alone or mixed", func(t *testing.T) {
+			tip := wctBranchTip(t, e, readTok, "main", false)
+			for _, md := range []map[string]any{
+				{"target_branch": "main", "base_ref": c1},
+				{"target_branch": "main", "base_ref": c1, "target_commit_sha": c1},
+			} {
+				resp, body := restore(t, md)
+				wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
 			}
-		})
-
-		t.Run("restore base_ref wins over target_commit_sha", func(t *testing.T) {
-			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": c1, "target_commit_sha": c2})
-			if env := wctRequireOK(t, resp, body); env.Commit.TreeSHA != c1Tree {
-				t.Fatalf("tree = %s, want c1 tree %s", env.Commit.TreeSHA, c1Tree)
+			if got := wctBranchTip(t, e, readTok, "main", false); got != tip {
+				t.Fatalf("main moved to %s", got)
 			}
-		})
-
-		t.Run("restore base_ref resolves a 40-hex branch name as a branch", func(t *testing.T) {
-			// A branch whose name is the hex of c2 but whose tip is c1:
-			// base_ref must pick the branch (c1 tree), not object c2.
-			resp, body := pack(t, c2, "hexname", "h.txt", map[string]any{"base_branch": "main"})
-			hexTip := wctRequireOK(t, resp, body).Commit.CommitSHA
-			resp, body = restore(t, map[string]any{"target_branch": "main", "base_ref": c2})
-			got := wctRequireOK(t, resp, body).Commit.TreeSHA
-			resp, body = restore(t, map[string]any{"target_branch": "main", "base_ref": hexTip})
-			want := wctRequireOK(t, resp, body).Commit.TreeSHA
-			if got != want {
-				t.Fatalf("base_ref %s restored tree %s, want the branch tip tree %s", c2, got, want)
-			}
-		})
-
-		t.Run("restore unknown base_ref is 404", func(t *testing.T) {
-			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "no-such-branch"})
-			wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
-		})
-
-		t.Run("restore with present empty base_ref is 400", func(t *testing.T) {
-			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "", "target_commit_sha": c1})
-			wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
 		})
 
 		t.Run("restore without a target is 400", func(t *testing.T) {

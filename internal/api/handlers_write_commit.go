@@ -280,7 +280,9 @@ type wcMetadata struct {
 	ExpectedTargetSHA *string `json:"expected_target_sha"`
 	TargetIsEphemeral *bool   `json:"target_is_ephemeral"`
 	BaseIsEphemeral   *bool   `json:"base_is_ephemeral"`
-	BaseRef           *string `json:"base_ref"` // restore-commit only
+	// BaseRef is decoded only so restore-commit can refuse it: until it is
+	// supported, a request naming it must not silently run another target.
+	BaseRef *string `json:"base_ref"`
 }
 
 // applyCurrentNames folds the current upstream field names into the
@@ -297,9 +299,6 @@ func (md *wcMetadata) applyCurrentNames() {
 	}
 	if md.BaseIsEphemeral != nil {
 		md.EphemeralBase = *md.BaseIsEphemeral
-	}
-	if md.BaseRef != nil {
-		md.TargetCommitSHA = *md.BaseRef
 	}
 }
 
@@ -1245,9 +1244,10 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	md := req.Metadata
-	// base_ref (the current name, issue #378) names a branch, tag, or
-	// commit; the deprecated target_commit_sha stays a 40-hex sha.
-	revision := md.BaseRef != nil
+	if md.BaseRef != nil {
+		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is not supported yet; send target_commit_sha", "", "")
+		return
+	}
 	md.applyCurrentNames()
 	if md.CommitMessage == "" {
 		md.CommitMessage = "Restore to " + md.TargetCommitSHA
@@ -1256,12 +1256,8 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
 		return
 	}
-	if revision && md.TargetCommitSHA == "" {
-		wcFail(w, http.StatusBadRequest, "invalid", "base_ref must not be empty", "", "")
-		return
-	}
-	if !revision && !ref.ValidSHA(md.TargetCommitSHA) {
-		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is required (or the deprecated 40-hex target_commit_sha)", "", "")
+	if !ref.ValidSHA(md.TargetCommitSHA) {
+		wcFail(w, http.StatusBadRequest, "invalid", "target_commit_sha must be a 40-hex sha", "", "")
 		return
 	}
 	plan, ok := s.wcPlanCommit(w, r, repo.RepoID, md)
@@ -1285,27 +1281,11 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sc.close()
 
-	target := md.TargetCommitSHA
-	if revision {
-		// A base_ref revision resolves like other revision inputs
-		// (gitread.ResolveRef: branch, tag — peeled — then hex), even when
-		// it is 40 hex characters: a branch may have such a name.
-		resolved, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
-		if errors.Is(err, gitread.ErrNotFound) {
-			wcFail(w, http.StatusNotFound, "not_found", "base_ref "+target+" does not resolve to a commit",
-				md.TargetBranch, plan.oldSHA)
-			return
-		} else if err != nil {
-			s.wcInternal(w, r, "resolve restore base_ref", err)
-			return
-		}
-		target = resolved
-	}
 	// The restore target must exist and be a commit; its tree becomes the
 	// new commit's tree verbatim.
-	tree, err := sc.resolveTree(r.Context(), target)
+	tree, err := sc.resolveTree(r.Context(), md.TargetCommitSHA)
 	if err != nil {
-		wcFail(w, http.StatusNotFound, "not_found", "restore target "+target+" not found",
+		wcFail(w, http.StatusNotFound, "not_found", "target_commit_sha "+md.TargetCommitSHA+" not found",
 			md.TargetBranch, plan.oldSHA)
 		return
 	}
