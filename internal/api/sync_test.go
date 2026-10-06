@@ -228,6 +228,9 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 		requireAuth(s.verifier, s.org, false, auth.ScopeRepoWrite)(http.HandlerFunc(ss.handleCreateRepo)))
 	registerCredentialRoutes(mux, s.verifier, s.org, ss, nil)
 	registerSyncRoutes(mux, s.verifier, s.org, ss, nil)
+	// The named-repo aliases re-dispatch into this mux, so the path-style
+	// sync routes (.../upstream/pull, DELETE .../upstream) work here too.
+	registerAliasRoutes(mux, &server{store: e.store, logger: discardLogger()}, ss, s.verifier, s.org, nil)
 	s.api = httptest.NewServer(mux)
 	t.Cleanup(s.api.Close)
 	return s

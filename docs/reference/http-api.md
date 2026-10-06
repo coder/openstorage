@@ -81,7 +81,8 @@ about the endpoint's rollout status on upstream clusters.
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
 | `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value. An open.storage extension: upstream removed the route from its spec on 2026-10-05, and open.storage keeps serving it for existing clients |
-| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). Deprecated upstream (2026-10-05); still served |
+| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). Deprecated upstream (2026-10-05) for `DELETE /api/repos/{repo_name}/upstream`, which runs the same handler; still served |
+| `DELETE /api/repos/{repo_name}/upstream` | repo:write | Path style only (spec 2026-10-05). Same handler, scope and responses as `DELETE /repos/base` |
 
 **`POST /repos` body:**
 
@@ -249,6 +250,7 @@ committer_email, date (RFC3339)}`.
 |---|---|---|
 | `GET /repos/notes` | git:read | `object_ref` (req; deprecated alias `sha`), `notes_ref?` (deprecated alias `ref`) → `{sha, note, ref_sha}` |
 | `POST /repos/notes` | git:write | `{object_ref (deprecated alias sha), action: "add"\|"append" (deprecated upstream), note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}` → `{sha, notes_ref, target_ref (deprecated mirror), base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
+| `POST /api/repos/{repo_name}/notes/append` | git:write | Path style only (spec 2026-10-05). `{object_ref (deprecated alias sha), note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}`, decoded strictly: `action`, any unknown field, or a `null` → 400. Appends, or creates the note when the object has none → **201** with the same envelope. A stale guard → 409 `conflict` and nothing is appended |
 | `DELETE /repos/notes` | git:write | Query `object_ref`, `notes_ref?`, `expected_notes_ref_sha?`. The deprecated body `{object_ref (deprecated alias sha), notes_ref?, expected_notes_ref_sha?, author?}` still works; a query parameter that is present wins over its body field, even when empty → same envelope |
 | `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. 400 if custom notes refs disabled server-side |
 
@@ -256,15 +258,16 @@ committer_email, date (RFC3339)}`.
 - `object_ref`: a full object SHA (commit, tree, blob, or annotated tag), or a branch,
   tag, short SHA, or other revision that resolves to a commit. Unresolvable → 404.
 - Responses echo the resolved object id in `sha`.
-- A stale `expected_notes_ref_sha` → 412 `precondition_failed`, except the `DELETE` query
-  parameter form, which answers 409 `conflict` as upstream documents (the SDKs send the
-  body forms and read `result.status`).
+- A stale `expected_notes_ref_sha` → 412 `precondition_failed`, except `POST .../notes/append`
+  and the `DELETE` query parameter form, which answer 409 `conflict` as upstream documents
+  (the SDKs send the body forms and read `result.status`).
 
 ### Upstream sync
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05); still served |
+| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. The reserved `after` field is ignored |
+| `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400 |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 
 **Both triggers:**
