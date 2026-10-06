@@ -63,6 +63,7 @@ func (s *server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	sha = wrefLowerFullSHA(sha)
 	if !ref.ValidSHA(sha) {
 		// openapi (issue #161): a non-SHA object_ref is a revision — a
 		// branch, tag, short SHA, or full ref — that must resolve to a

@@ -79,6 +79,13 @@ ones. On conflict:
 
 - The **current spelling wins**, and the losing duplicate is ignored rather than
   independently validated.
+- For every pair in the table below, the current spelling counts as sent only when it is
+  non-empty. An empty current value falls back to the deprecated one.
+- The commit metadata names (`expected_target_sha`, `target_is_ephemeral`,
+  `base_is_ephemeral`, and restore's `base_ref`, described in
+  [streaming protocols](streaming-commit-protocols.md)) win whenever they are present,
+  even when empty or `false`. So do the `DELETE .../branches` and `DELETE .../notes` query
+  parameters over the deprecated request body.
 - Exception: boolean *query* aliases shape-validate both spellings, so a request that
   `400`d on a malformed bool before the alias existed keeps `400`ing.
 - Exception: the JWT `refs`/`ops` pair **merges** rather than conflicts (last row).
@@ -209,6 +216,11 @@ Extensions that upstream's spec does not list:
   has no outbound-run event, and its `repo.sync.*` schemas forbid the outbound fields, so
   every `push` and `repo.sync.*` event matches upstream's `webhooks` schemas
   ([#354](https://github.com/coder/openstorage/issues/354));
+- on `POST .../restore-commit`, the `target_is_ephemeral` flag (deprecated alias
+  `ephemeral`, accepted there before upstream's 2026-10-05 spec) and a fully qualified
+  `refs/...` `base_ref`. Upstream's `ReposCommitsRestoreRequest` lists neither. Restore
+  also accepts `base_is_ephemeral` (deprecated alias `ephemeral_base`) but ignores it
+  ([HTTP API](../reference/http-api.md));
 - `GET /api/repo-urls/{repo_id}`, which upstream removed from its spec on 2026-10-05.
   It resolves a repository ID only inside the token's organization (`org:read`);
 - the unauthenticated `/healthz` liveness probe.

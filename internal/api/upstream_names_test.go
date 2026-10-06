@@ -353,3 +353,87 @@ func TestDeleteBranchAndNoteQueryParams(t *testing.T) {
 		})
 	})
 }
+
+// TestRestoreCommitTagBaseRef covers issue #381: a restore-commit base_ref
+// naming a lightweight tag, an annotated tag (peeled to its commit), a
+// fully qualified refs/tags/ name, or an uppercase full SHA.
+func TestRestoreCommitTagBaseRef(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		repo, writeTok, readTok := wctRepo(t, e)
+
+		// c1 (root): a.txt v1   <- lightweight tag "light"
+		// c2: a.txt v2          <- main, annotated tag "annot"
+		dir := t.TempDir()
+		coreGit(t, dir, "init", "-q", "-b", "main", ".")
+		coreWriteFile(t, dir, "a.txt", "v1\n")
+		coreGit(t, dir, "add", ".")
+		coreGit(t, dir, "commit", "-q", "-m", "c1")
+		c1 := coreRevParse(t, dir, "HEAD")
+		coreWriteFile(t, dir, "a.txt", "v2\n")
+		coreGit(t, dir, "commit", "-q", "-am", "c2")
+		c2 := coreRevParse(t, dir, "HEAD")
+		coreGit(t, dir, "tag", "-a", "-m", "annotated", "annot", c2)
+		tagObj := coreRevParse(t, dir, "refs/tags/annot")
+		if tagObj == c2 {
+			t.Fatal("annotated tag object sha unexpectedly equals commit sha")
+		}
+		tree1, tree2 := coreRevParse(t, dir, c1+"^{tree}"), coreRevParse(t, dir, c2+"^{tree}")
+		coreSeedStores(t, e, repo.RepoID, dir, map[string]string{
+			"refs/heads/main":                c2,
+			"refs/tags/light":                c1,
+			"refs/tags/annot":                tagObj,
+			auth.EphemeralRefName("scratch"): c2,
+		})
+
+		// Each restore parents on the current tip and moves main, so every
+		// step restores a tree that differs from the previous step's.
+		steps := []struct{ baseRef, wantTree string }{
+			{"light", tree1},
+			{"annot", tree2},
+			{strings.ToUpper(c1), tree1},
+			{"refs/tags/annot", tree2},
+		}
+		for _, step := range steps {
+			tip := wctBranchTip(t, e, readTok, "main", false)
+			raw, err := json.Marshal(map[string]any{"metadata": map[string]any{
+				"target_branch": "main", "base_ref": step.baseRef, "author": wctAuthor,
+				"expected_target_sha": tip}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, body := wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(raw))
+			env := wctRequireOK(t, resp, body)
+			if env.Commit.TreeSHA != step.wantTree || env.Result.OldSHA != tip {
+				t.Fatalf("base_ref %q: tree %s old_sha %s, want tree %s old_sha %s",
+					step.baseRef, env.Commit.TreeSHA, env.Result.OldSHA, step.wantTree, tip)
+			}
+			if got := wctBranchTip(t, e, readTok, "main", false); got != env.Commit.CommitSHA {
+				t.Fatalf("base_ref %q: main = %s, want %s", step.baseRef, got, env.Commit.CommitSHA)
+			}
+		}
+
+		// target_is_ephemeral restores the ephemeral branch. base_is_ephemeral
+		// is accepted and ignored: "light" exists only outside the ephemeral
+		// namespace, so honoring the flag would answer 404.
+		mainBefore := wctBranchTip(t, e, readTok, "main", false)
+		raw, err := json.Marshal(map[string]any{"metadata": map[string]any{
+			"target_branch": "scratch", "target_is_ephemeral": true, "base_is_ephemeral": true,
+			"base_ref": "light", "author": wctAuthor}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, body := wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(raw))
+		env := wctRequireOK(t, resp, body)
+		if env.Commit.TreeSHA != tree1 || env.Result.OldSHA != c2 {
+			t.Fatalf("ephemeral restore: tree %s old_sha %s, want tree %s old_sha %s",
+				env.Commit.TreeSHA, env.Result.OldSHA, tree1, c2)
+		}
+		if got := wctBranchTip(t, e, readTok, "scratch", true); got != env.Commit.CommitSHA {
+			t.Fatalf("ephemeral scratch = %s, want %s", got, env.Commit.CommitSHA)
+		}
+		if got := wctBranchTip(t, e, readTok, "main", false); got != mainBefore {
+			t.Fatalf("main moved %s -> %s", mainBefore, got)
+		}
+	})
+}
