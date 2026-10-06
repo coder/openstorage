@@ -21,7 +21,7 @@ import (
 func TestCommitMetadataCurrentNames(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)
-		_, writeTok, readTok := wctRepo(t, e)
+		repo, writeTok, readTok := wctRepo(t, e)
 
 		pack := func(t *testing.T, branch, msg, path string, extra map[string]any) (*http.Response, []byte) {
 			t.Helper()
@@ -37,7 +37,8 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 		resp, body := pack(t, "main", "c1", "a.txt", nil)
 		c1 := wctRequireOK(t, resp, body).Commit.CommitSHA
 		resp, body = pack(t, "main", "c2", "b.txt", map[string]any{"expected_target_sha": c1})
-		wctRequireOK(t, resp, body)
+		c2Env := wctRequireOK(t, resp, body)
+		c2, c2Tree := c2Env.Commit.CommitSHA, c2Env.Commit.TreeSHA
 
 		t.Run("stale expected_target_sha is 412", func(t *testing.T) {
 			resp, body := pack(t, "main", "stale", "x.txt", map[string]any{"expected_target_sha": c1})
@@ -102,28 +103,92 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 			return wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(raw))
 		}
 
-		t.Run("restore honors expected_target_sha", func(t *testing.T) {
-			resp, body := restore(t, map[string]any{"target_branch": "main", "target_commit_sha": c1, "expected_target_sha": c1})
-			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
-			tip := wctBranchTip(t, e, readTok, "main", false)
-			resp, body = restore(t, map[string]any{"target_branch": "main", "target_commit_sha": c1, "expected_target_sha": tip})
-			if env := wctRequireOK(t, resp, body); env.Result.OldSHA != tip {
+		// setRef points a branch at a commit directly in the ref authority.
+		setRef := func(t *testing.T, branch, sha string) {
+			t.Helper()
+			if won, err := e.refStore.CASRef(t.Context(), repo.RepoID, "refs/heads/"+branch, ref.ZeroSHA, sha); err != nil || !won {
+				t.Fatalf("seed %s: won=%v err=%v", branch, won, err)
+			}
+		}
+		mainTip := func(t *testing.T) string { t.Helper(); return wctBranchTip(t, e, readTok, "main", false) }
+		requireTip := func(t *testing.T, want string) {
+			t.Helper()
+			if got := mainTip(t); got != want {
+				t.Fatalf("main moved to %s, want %s", got, want)
+			}
+		}
+		var c1Tree string
+		t.Run("restore base_ref sha with expected_target_sha", func(t *testing.T) {
+			tip := mainTip(t)
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": c1, "expected_target_sha": tip})
+			env := wctRequireOK(t, resp, body)
+			c1Tree = env.Commit.TreeSHA
+			if env.Result.OldSHA != tip {
 				t.Fatalf("old_sha = %q, want %q", env.Result.OldSHA, tip)
 			}
 		})
 
-		t.Run("restore refuses base_ref, alone or mixed", func(t *testing.T) {
-			tip := wctBranchTip(t, e, readTok, "main", false)
-			for _, md := range []map[string]any{
-				{"target_branch": "main", "base_ref": c1},
-				{"target_branch": "main", "base_ref": c1, "target_commit_sha": c1},
-			} {
-				resp, body := restore(t, md)
-				wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
+		t.Run("restore base_ref equal to the tip is 412", func(t *testing.T) {
+			tip := mainTip(t)
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": tip})
+			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
+			requireTip(t, tip)
+		})
+
+		t.Run("restore base_ref with no tree change is 412", func(t *testing.T) {
+			tip := mainTip(t)
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": c1})
+			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
+			requireTip(t, tip)
+		})
+
+		t.Run("restore base_ref that is not an ancestor is 412", func(t *testing.T) {
+			tip := mainTip(t)
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "persist"})
+			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
+			requireTip(t, tip)
+		})
+
+		t.Run("restore base_ref resolves a 40-hex branch name as a branch", func(t *testing.T) {
+			// Branch named like c1's hex but pointing at c2. Read as a SHA,
+			// c1 would be a no-op (412); read as a branch it restores c2.
+			setRef(t, c1, c2)
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": c1})
+			if got := wctRequireOK(t, resp, body).Commit.TreeSHA; got != c2Tree {
+				t.Fatalf("restored tree %s, want c2 tree", got)
 			}
-			if got := wctBranchTip(t, e, readTok, "main", false); got != tip {
-				t.Fatalf("main moved to %s", got)
+		})
+
+		t.Run("restore base_ref branch name resolves to its tip", func(t *testing.T) {
+			setRef(t, "at-c1", c1)
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "at-c1"})
+			if got := wctRequireOK(t, resp, body).Commit.TreeSHA; got != c1Tree {
+				t.Fatalf("restored tree %s, want c1 tree %s", got, c1Tree)
 			}
+		})
+
+		t.Run("restore base_ref wins over target_commit_sha", func(t *testing.T) {
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": c2, "target_commit_sha": c1})
+			if got := wctRequireOK(t, resp, body).Commit.TreeSHA; got != c2Tree {
+				t.Fatalf("tree = %s, want c2 tree", got)
+			}
+		})
+
+		t.Run("legacy target_commit_sha keeps its unchecked behavior", func(t *testing.T) {
+			// Recorded deviation: the SDK form restores even a no-op.
+			tip := mainTip(t)
+			resp, body := restore(t, map[string]any{"target_branch": "main", "target_commit_sha": tip})
+			wctRequireOK(t, resp, body)
+		})
+
+		t.Run("restore unknown base_ref is 404", func(t *testing.T) {
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "no-such-branch"})
+			wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
+		})
+
+		t.Run("restore with present empty base_ref is 400", func(t *testing.T) {
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "", "target_commit_sha": c1})
+			wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
 		})
 
 		t.Run("restore without a target is 400", func(t *testing.T) {
