@@ -114,6 +114,18 @@ func wrefAliasField(current, deprecated string) string {
 	return deprecated
 }
 
+// wrefLowerFullSHA lowercases a full 40-hex object id in either case (git
+// object names are case-insensitive) and returns anything else unchanged.
+// The notes surface addresses ANY object by its full id, so an uppercase id
+// must take that path too instead of commit-only revision resolution
+// (issue #381).
+func wrefLowerFullSHA(s string) string {
+	if lower := strings.ToLower(s); len(s) == 40 && ref.ValidSHA(lower) {
+		return lower
+	}
+	return s
+}
+
 // wrefRefName maps a bare branch name to its stored ref name: the plain
 // refs/heads/ name, or the ephemeral-namespace name under the same storage
 // key (see package comment).
@@ -964,6 +976,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 
 	ctx := r.Context()
+	objectSHA = wrefLowerFullSHA(objectSHA)
 	if !ref.ValidSHA(objectSHA) {
 		// openapi (issue #161): a non-40-hex object_ref is a revision — a
 		// branch, tag, short SHA, or full ref — that must resolve to a

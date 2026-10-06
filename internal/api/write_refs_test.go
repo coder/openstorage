@@ -888,6 +888,23 @@ func TestWriteRefsNotes(t *testing.T) {
 				t.Fatalf("tag object note show = %q err %v", out, err)
 			}
 
+			// Issue #381 review (P2): an uppercase full id takes the same
+			// any-object path, so it addresses the tag OBJECT, never its
+			// peeled commit, on both the write and the read side.
+			upper := strings.ToUpper(fx.tagObj)
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": upper, "action": "append", "note": "upper", "notes_ref": "rev-notes"})
+			if resp.StatusCode != http.StatusOK || body["sha"] != fx.tagObj {
+				t.Fatalf("uppercase tag object append: status = %d body %v", resp.StatusCode, body)
+			}
+			if out, err := showNote(t, "refs/notes/rev-notes", fx.tagObj); err != nil || !strings.Contains(out, "upper") {
+				t.Fatalf("tag object note show = %q err %v", out, err)
+			}
+			getResp, getBody := e.doReq(t, http.MethodGet, "/api/v1/repos/notes?notes_ref=rev-notes&object_ref="+upper, fx.token, nil, "")
+			if getResp.StatusCode != http.StatusOK || !strings.Contains(string(getBody), "upper") {
+				t.Fatalf("uppercase tag object read: status = %d body %s", getResp.StatusCode, getBody)
+			}
+
 			// PR #163 review (P2): resolution precedes the CAS guard — a
 			// mismatched guard 412s with the RESOLVED id in the envelope,
 			// and an unresolvable revision 404s despite a stale guard.
