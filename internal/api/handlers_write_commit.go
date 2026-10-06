@@ -280,9 +280,7 @@ type wcMetadata struct {
 	ExpectedTargetSHA *string `json:"expected_target_sha"`
 	TargetIsEphemeral *bool   `json:"target_is_ephemeral"`
 	BaseIsEphemeral   *bool   `json:"base_is_ephemeral"`
-	// BaseRef is decoded only so restore-commit can refuse it: until it is
-	// supported, a request naming it must not silently run another target.
-	BaseRef *string `json:"base_ref"`
+	BaseRef           *string `json:"base_ref"` // restore-commit only
 }
 
 // applyCurrentNames folds the current upstream field names into the
@@ -299,6 +297,9 @@ func (md *wcMetadata) applyCurrentNames() {
 	}
 	if md.BaseIsEphemeral != nil {
 		md.EphemeralBase = *md.BaseIsEphemeral
+	}
+	if md.BaseRef != nil {
+		md.TargetCommitSHA = *md.BaseRef
 	}
 }
 
@@ -1244,10 +1245,9 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	md := req.Metadata
-	if md.BaseRef != nil {
-		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is not supported yet; send target_commit_sha", "", "")
-		return
-	}
+	// base_ref (the current name, issue #378) names a branch, tag, or
+	// commit; the deprecated target_commit_sha stays a 40-hex sha.
+	revision := md.BaseRef != nil
 	md.applyCurrentNames()
 	if md.CommitMessage == "" {
 		md.CommitMessage = "Restore to " + md.TargetCommitSHA
@@ -1256,8 +1256,12 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
 		return
 	}
-	if !ref.ValidSHA(md.TargetCommitSHA) {
-		wcFail(w, http.StatusBadRequest, "invalid", "target_commit_sha must be a 40-hex sha", "", "")
+	if revision && md.TargetCommitSHA == "" {
+		wcFail(w, http.StatusBadRequest, "invalid", "base_ref must not be empty", "", "")
+		return
+	}
+	if !revision && !ref.ValidSHA(md.TargetCommitSHA) {
+		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is required (or the deprecated 40-hex target_commit_sha)", "", "")
 		return
 	}
 	plan, ok := s.wcPlanCommit(w, r, repo.RepoID, md)
@@ -1281,12 +1285,31 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sc.close()
 
+	target := md.TargetCommitSHA
+	if revision {
+		// A base_ref revision resolves like other revision inputs
+		// (gitread.ResolveRef: branch, tag — peeled — then hex), even when
+		// it is 40 hex characters: a branch may have such a name.
+		resolved, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
+		if errors.Is(err, gitread.ErrNotFound) {
+			wcFail(w, http.StatusNotFound, "not_found", "base_ref "+target+" does not resolve to a commit",
+				md.TargetBranch, plan.oldSHA)
+			return
+		} else if err != nil {
+			s.wcInternal(w, r, "resolve restore base_ref", err)
+			return
+		}
+		target = resolved
+	}
 	// The restore target must exist and be a commit; its tree becomes the
 	// new commit's tree verbatim.
-	tree, err := sc.resolveTree(r.Context(), md.TargetCommitSHA)
+	tree, err := sc.resolveTree(r.Context(), target)
 	if err != nil {
-		wcFail(w, http.StatusNotFound, "not_found", "target_commit_sha "+md.TargetCommitSHA+" not found",
+		wcFail(w, http.StatusNotFound, "not_found", "restore target "+target+" not found",
 			md.TargetBranch, plan.oldSHA)
+		return
+	}
+	if revision && !s.wcRestoreMoves(w, r, sc, md, plan, target, tree) {
 		return
 	}
 	commit, err := sc.commitTree(r.Context(), tree, plan.parent, md)
@@ -1295,4 +1318,38 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, tree, commit, nil)
+}
+
+// wcRestoreMoves enforces the spec's restore preconditions for the base_ref
+// form (412 precondition_failed): the branch must not already point at
+// base_ref, the restore must change the tree, and base_ref must be an
+// ancestor of the current tip. The deprecated target_commit_sha form keeps
+// its unchecked behavior, which the SDKs rely on (recorded deviation,
+// issue #378). Writes the failure envelope and returns false on rejection.
+func (s *server) wcRestoreMoves(w http.ResponseWriter, r *http.Request, sc *wcScratch, md *wcMetadata, plan *wcPlan, target, tree string) bool {
+	assertf(ref.ValidSHA(target) && plan.oldSHA != ref.ZeroSHA, "wcRestoreMoves: target %q tip %q", target, plan.oldSHA)
+	fail := func(msg string) bool {
+		wcFail(w, http.StatusPreconditionFailed, "precondition_failed", msg, md.TargetBranch, plan.oldSHA)
+		return false
+	}
+	if target == plan.oldSHA {
+		return fail("branch " + md.TargetBranch + " already points at base_ref")
+	}
+	tipTree, err := sc.resolveTree(r.Context(), plan.oldSHA)
+	if err != nil {
+		s.wcInternal(w, r, "resolve restore tip tree", err)
+		return false
+	}
+	if tipTree == tree {
+		return fail("restore to base_ref would produce no change")
+	}
+	ok, err := wmIsAncestor(r.Context(), sc, target, plan.oldSHA)
+	if err != nil {
+		s.wcInternal(w, r, "check restore ancestry", err)
+		return false
+	}
+	if !ok {
+		return fail("base_ref is not an ancestor of " + md.TargetBranch)
+	}
+	return true
 }

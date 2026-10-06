@@ -130,9 +130,13 @@ these codes rather than treating them as opaque failures.
 
 ## 4. `POST /api/v1/repos/restore-commit` — plain JSON, same ack
 
-Not streamed. The body is `{"metadata": {"target_branch", "target_commit_sha", "author",
-"commit_message"?, "expected_target_sha"?, "committer"?}}`; `expected_head_sha` aliases
-`expected_target_sha` as in §1. The server creates a **new** commit whose tree equals
-`target_commit_sha`'s tree, parented on the current tip. History
+Not streamed. The body is `{"metadata": {"target_branch", "base_ref", "author",
+"commit_message"?, "expected_target_sha"?, "committer"?}}`. `base_ref` is a branch, tag,
+or commit. The deprecated `target_commit_sha` (a 40-hex SHA only) still works, and
+`expected_head_sha` aliases `expected_target_sha` as in §1. The server creates a **new**
+commit whose tree equals the `base_ref` commit's tree, parented on the current tip. A
+`base_ref` restore answers 412 `precondition_failed` when the branch already points at
+`base_ref`, when the tree would not change, or when `base_ref` is not an ancestor of the
+tip. The deprecated `target_commit_sha` form skips these checks. History
 is preserved; it is not a force reset. The response/error envelope is as above (without
 `blob_count`).
