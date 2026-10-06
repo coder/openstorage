@@ -99,7 +99,7 @@ func TestNotesAppendRoute(t *testing.T) {
 			}
 			// A duplicate member name (issue #381): encoding/json alone
 			// would let the last one win.
-			dup := json.RawMessage(`{"object_ref":"` + fx.c2 + `","note":null,"note":"x"}`)
+			dup := json.RawMessage(`{"object_ref":"` + fx.c2 + `","note":"x","note":"y"}`)
 			if resp, out := post(t, fx.token, dup); resp.StatusCode != http.StatusBadRequest {
 				t.Errorf("duplicate note: status %d body %v, want 400", resp.StatusCode, out)
 			}
