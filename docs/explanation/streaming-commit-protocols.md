@@ -35,6 +35,17 @@ Line 1 — metadata frame:
 }}
 ```
 
+The upstream spec names three of these fields differently and marks the names above
+deprecated. open.storage accepts both. If a request sends both, the current name wins.
+A current boolean wins whenever it is present, so `"target_is_ephemeral": false`
+overrides `"ephemeral": true`.
+
+| Current name | Deprecated name |
+|---|---|
+| `expected_target_sha` | `expected_head_sha` |
+| `target_is_ephemeral` | `ephemeral` |
+| `base_is_ephemeral` | `ephemeral_base` |
+
 Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
 
 ```json
@@ -119,8 +130,10 @@ these codes rather than treating them as opaque failures.
 
 ## 4. `POST /api/v1/repos/restore-commit` — plain JSON, same ack
 
-Not streamed. The body is `{"metadata": {"target_branch", "target_commit_sha", "author",
-"commit_message"?, "expected_head_sha"?, "committer"?}}`. The server creates a **new**
-commit whose tree equals `target_commit_sha`'s tree, parented on the current tip. History
+Not streamed. The body is `{"metadata": {"target_branch", "base_ref", "author",
+"commit_message"?, "expected_target_sha"?, "committer"?}}`. `base_ref` is a branch, tag,
+or commit. The deprecated `target_commit_sha` (a 40-hex SHA only) still works, and
+`expected_head_sha` aliases `expected_target_sha` as in §1. The server creates a **new**
+commit whose tree equals the `base_ref` commit's tree, parented on the current tip. History
 is preserved; it is not a force reset. The response/error envelope is as above (without
 `blob_count`).

@@ -80,8 +80,8 @@ about the endpoint's rollout status on upstream clusters.
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
-| `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix; from OpenAPI.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value |
-| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs) |
+| `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value. An open.storage extension: upstream removed the route from its spec on 2026-10-05, and open.storage keeps serving it for existing clients |
+| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). Deprecated upstream (2026-10-05); still served |
 
 **`POST /repos` body:**
 
@@ -89,7 +89,7 @@ about the endpoint's rollout status on upstream clusters.
   contain `/`) must equal that claim exactly, with no case folding, trimming, or path
   normalization. A mismatch, including an empty string, returns 400 and creates nothing,
   for forks too. `null` or an omitted `repo_name` changes nothing.
-- Query `default_branch` is a fallback, used only when the body omits it.
+- Query `default_branch` (deprecated upstream) is a fallback, used only when the body omits it.
 - `upstream` (Git Sync): `{provider, owner, name, access?, host?}`. It creates a sync link
   and schedules the first sync, like the deprecated `base_repo` sync form. Unknown fields
   → 400.
@@ -168,7 +168,7 @@ Each page runs one `git rev-list --topo-order` walk for `order`, as one more git
 | `GET /repos/branches` | git:read | `cursor, limit, ephemeral` → `{branches: [{cursor, name, head_sha, created_at}], next_cursor, has_more}` |
 | `GET /repos/branch` | git:read | `name` (req), `ephemeral?` → `{branch: {name, head_sha, created_at}}` — one branch by exact short name (no pagination fields); 404 when absent |
 | `POST /repos/branches/create` | git:write | `{target_branch?, base_ref?\|base_branch?(deprecated), preferred_base?, base_is_ephemeral?, target_is_ephemeral?, force?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
-| `DELETE /repos/branches` | git:write | `{target_branch (deprecated alias name), ephemeral?}` → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent) |
+| `DELETE /repos/branches` | git:write | Query `target_branch`, `ephemeral?`. The deprecated body `{target_branch (deprecated alias name), ephemeral?}` still works; a query parameter that is present wins over its body field, even when empty → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent) |
 | `GET /repos/branches/diff` | git:read | **Deprecated upstream** (both path styles); still implemented. Use `GET /repos/diff` ([migration](#migrating-from-branchesdiff)). `branch` (req), `base?` (defaults to the repo default branch), `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, merge_base_sha, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}`; `merge_base_sha` is empty when the histories are unrelated (direct `base..branch` diff) |
 | `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`) |
 | `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
@@ -228,7 +228,7 @@ This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster 
 | `GET /repos/diff` | git:read | `ref` (req; deprecated alias `sha`), `base_ref?` (deprecated alias `baseSha`), `ref_is_ephemeral?`, `base_is_ephemeral?`, `git_apply_compatible?` (deprecated alias `gitApplyCompatible`), `path` (repeatable) → `{sha, base_sha, merge_base_sha, stats, files: [FileDiff], filtered_files}`. `base_sha` is the commit `base_ref` resolved to, empty for a single-commit diff. On alias conflict the current name wins |
 | `POST /repos/commit-pack` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
 | `POST /repos/diff-commit` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
-| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, target_commit_sha, author, commit_message?, expected_head_sha?, committer?}}` → commit ack ([streaming protocols](../explanation/streaming-commit-protocols.md)). Creates a *new* commit restoring old tree (history preserved) |
+| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, base_ref (branch, tag, or commit; deprecated alias target_commit_sha, 40-hex only), author, commit_message?, expected_target_sha? (deprecated alias expected_head_sha), committer?}}` → commit ack ([streaming protocols](../explanation/streaming-commit-protocols.md)). Creates a *new* commit restoring old tree (history preserved) |
 | `POST /repos/reset-commits` | git:write | In OpenAPI only (not in SDKs): NDJSON metadata stream; same restore-commit family |
 
 `CommitInfo` = `{sha, parent_shas[], message, author_name, author_email, committer_name,
@@ -248,20 +248,23 @@ committer_email, date (RFC3339)}`.
 | Method & path | Scope | Body/query |
 |---|---|---|
 | `GET /repos/notes` | git:read | `object_ref` (req; deprecated alias `sha`), `notes_ref?` (deprecated alias `ref`) → `{sha, note, ref_sha}` |
-| `POST /repos/notes` | git:write | `{object_ref (deprecated alias sha), action: "add"\|"append", note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}` → `{sha, notes_ref, target_ref (deprecated mirror), base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
-| `DELETE /repos/notes` | git:write | `{object_ref (deprecated alias sha), notes_ref?, expected_notes_ref_sha?, author?}` → same envelope |
+| `POST /repos/notes` | git:write | `{object_ref (deprecated alias sha), action: "add"\|"append" (deprecated upstream), note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}` → `{sha, notes_ref, target_ref (deprecated mirror), base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
+| `DELETE /repos/notes` | git:write | Query `object_ref`, `notes_ref?`, `expected_notes_ref_sha?`. The deprecated body `{object_ref (deprecated alias sha), notes_ref?, expected_notes_ref_sha?, author?}` still works; a query parameter that is present wins over its body field, even when empty → same envelope |
 | `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. 400 if custom notes refs disabled server-side |
 
 - Default notes ref: `refs/notes/commits`. Bare names resolve to `refs/notes/<name>`.
 - `object_ref`: a full object SHA (commit, tree, blob, or annotated tag), or a branch,
   tag, short SHA, or other revision that resolves to a commit. Unresolvable → 404.
 - Responses echo the resolved object id in `sha`.
+- A stale `expected_notes_ref_sha` → 412 `precondition_failed`, except the `DELETE` query
+  parameter form, which answers 409 `conflict` as upstream documents (the SDKs send the
+  body forms and read `result.status`).
 
 ### Upstream sync
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only |
+| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05); still served |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 
 **Both triggers:**

@@ -273,6 +273,30 @@ type wcMetadata struct {
 	Files           []wcFileOp `json:"files"`
 	// restore-commit only (docs/explanation/streaming-commit-protocols.md §4).
 	TargetCommitSHA string `json:"target_commit_sha"`
+
+	// Current upstream names (ReposCommitsCreateRequest and siblings,
+	// issue #378). The SDKs still send the deprecated names above;
+	// applyCurrentNames folds these into them, the current name winning.
+	ExpectedTargetSHA string `json:"expected_target_sha"`
+	TargetIsEphemeral *bool  `json:"target_is_ephemeral"`
+	BaseIsEphemeral   *bool  `json:"base_is_ephemeral"`
+	BaseRef           string `json:"base_ref"` // restore-commit only
+}
+
+// applyCurrentNames folds the current upstream field names into the
+// deprecated fields the handlers read. Strings follow wrefAliasField (a
+// non-empty current name wins); booleans win whenever present, so an
+// explicit target_is_ephemeral: false overrides a legacy ephemeral: true.
+func (md *wcMetadata) applyCurrentNames() {
+	assertf(md != nil, "applyCurrentNames: nil metadata")
+	md.ExpectedHeadSHA = wrefAliasField(md.ExpectedTargetSHA, md.ExpectedHeadSHA)
+	if md.TargetIsEphemeral != nil {
+		md.Ephemeral = *md.TargetIsEphemeral
+	}
+	if md.BaseIsEphemeral != nil {
+		md.EphemeralBase = *md.BaseIsEphemeral
+	}
+	md.TargetCommitSHA = wrefAliasField(md.BaseRef, md.TargetCommitSHA)
 }
 
 type wcBlobChunk struct {
@@ -309,6 +333,7 @@ func wcReadMetadata(w http.ResponseWriter, lr *wcLineReader) (*wcMetadata, bool)
 		wcFail(w, http.StatusBadRequest, "invalid", "first frame must be a metadata frame", "", "")
 		return nil, false
 	}
+	frame.Metadata.applyCurrentNames()
 	return frame.Metadata, true
 }
 
@@ -388,7 +413,7 @@ func wcValidateMetadata(md *wcMetadata) error {
 		}
 	}
 	if md.ExpectedHeadSHA != "" && !ref.ValidSHA(md.ExpectedHeadSHA) {
-		return errors.New("expected_head_sha must be a 40-hex sha")
+		return errors.New("expected_target_sha (or expected_head_sha) must be a 40-hex sha")
 	}
 	if md.BaseBranch != "" {
 		if err := wcValidateBranchParam("base_branch", md.BaseBranch); err != nil {
@@ -486,10 +511,11 @@ func (s *server) wcPlanCommit(w http.ResponseWriter, r *http.Request, repoID str
 		plan.parent = baseTip
 		casTip = baseTip
 	}
-	// CAS guard (decision #2): a stale expected_head_sha is a 412.
+	// CAS guard (decision #2): a stale expected_target_sha (deprecated
+	// expected_head_sha) is a 412.
 	if md.ExpectedHeadSHA != "" && strings.ToLower(md.ExpectedHeadSHA) != casTip {
 		wcFail(w, http.StatusPreconditionFailed, "precondition_failed",
-			fmt.Sprintf("expected_head_sha %s does not match current tip %s", md.ExpectedHeadSHA, casTip),
+			fmt.Sprintf("expected target sha %s does not match current tip %s", md.ExpectedHeadSHA, casTip),
 			md.TargetBranch, plan.oldSHA)
 		return nil, false
 	}
@@ -1215,6 +1241,10 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	md := req.Metadata
+	// base_ref (the current name, issue #378) names a branch, tag, or
+	// commit; the deprecated target_commit_sha stays a 40-hex sha.
+	revision := md.BaseRef != ""
+	md.applyCurrentNames()
 	if md.CommitMessage == "" {
 		md.CommitMessage = "Restore to " + md.TargetCommitSHA
 	}
@@ -1222,8 +1252,8 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
 		return
 	}
-	if !ref.ValidSHA(md.TargetCommitSHA) {
-		wcFail(w, http.StatusBadRequest, "invalid", "target_commit_sha must be a 40-hex sha", "", "")
+	if !revision && !ref.ValidSHA(md.TargetCommitSHA) {
+		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is required (or the deprecated 40-hex target_commit_sha)", "", "")
 		return
 	}
 	plan, ok := s.wcPlanCommit(w, r, repo.RepoID, md)
@@ -1247,11 +1277,26 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sc.close()
 
+	target := md.TargetCommitSHA
+	if !ref.ValidSHA(target) {
+		// A base_ref revision resolves like other revision inputs
+		// (gitread.ResolveRef: branch, tag — peeled — or hex prefix).
+		resolved, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
+		if errors.Is(err, gitread.ErrNotFound) {
+			wcFail(w, http.StatusNotFound, "not_found", "base_ref "+target+" does not resolve to a commit",
+				md.TargetBranch, plan.oldSHA)
+			return
+		} else if err != nil {
+			s.wcInternal(w, r, "resolve restore base_ref", err)
+			return
+		}
+		target = resolved
+	}
 	// The restore target must exist and be a commit; its tree becomes the
 	// new commit's tree verbatim.
-	tree, err := sc.resolveTree(r.Context(), md.TargetCommitSHA)
+	tree, err := sc.resolveTree(r.Context(), target)
 	if err != nil {
-		wcFail(w, http.StatusNotFound, "not_found", "target_commit_sha "+md.TargetCommitSHA+" not found",
+		wcFail(w, http.StatusNotFound, "not_found", "restore target "+target+" not found",
 			md.TargetBranch, plan.oldSHA)
 		return
 	}

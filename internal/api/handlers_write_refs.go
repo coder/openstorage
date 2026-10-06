@@ -83,6 +83,26 @@ func wrefDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
+// wrefDecodeOptionalBody is wrefDecodeBody for the deprecated DELETE
+// bodies (branches, notes) whose fields moved to query parameters
+// (issue #378): an empty body decodes to the zero value, while an
+// unreadable or malformed one is still a 400.
+func wrefDecodeOptionalBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return false
+	}
+	if len(body) == 0 {
+		return true
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return false
+	}
+	return true
+}
+
 // wrefAliasField resolves a request-body alias pair: the current upstream
 // field wins when both are set (the live spec defines no precedence, so
 // this mirrors the coreAliasParam query convention from issue #15).
@@ -401,22 +421,37 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req wrefDeleteBranchRequest
-	if !wrefDecodeBody(w, r, &req) {
+	if !wrefDecodeOptionalBody(w, r, &req) {
 		return
 	}
 	// openapi (issue #17): target_branch is the current field, name the
-	// deprecated alias.
+	// deprecated alias. Since the 2026-10-05 spec (issue #378) both live in
+	// query parameters and the body is deprecated: a query parameter that
+	// is present wins over its body field, even when empty.
 	name := wrefAliasField(req.TargetBranch, req.Name)
+	ephemeral := req.Ephemeral
+	q := r.URL.Query()
+	if q.Has("target_branch") {
+		name = q.Get("target_branch")
+	}
+	if q.Has("ephemeral") {
+		v, err := coreBoolParam(q, "ephemeral")
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		ephemeral = v
+	}
 	if !wrefValidBranchInput(name) {
 		writeErr(w, http.StatusBadRequest, "invalid branch name")
 		return
 	}
 	assertf(repo.DefaultBranch != "", "repo %s has empty default branch", repo.RepoID)
-	refName := wrefRefName(name, req.Ephemeral)
+	refName := wrefRefName(name, ephemeral)
 	// Compare STORED ref names: the default branch may be recorded in
 	// refs/-qualified form (PATCH /repo stores such values verbatim), and
 	// the short request name must still hit the protection.
-	if !req.Ephemeral && refName == githttp.HeadTarget(repo.DefaultBranch) {
+	if !ephemeral && refName == githttp.HeadTarget(repo.DefaultBranch) {
 		writeErr(w, http.StatusForbidden, "refusing to delete the default branch")
 		return
 	}
@@ -450,7 +485,7 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, wrefDeleteBranchResponse{
 		TargetBranch: name,
 		Name:         name,
-		Ephemeral:    req.Ephemeral,
+		Ephemeral:    ephemeral,
 		Message:      "branch deleted",
 	})
 }
@@ -672,7 +707,7 @@ func (s *server) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 // wrefHandleNote implements the shared POST/DELETE notes flow: validate
 // (object_ref is a full object SHA or a revision resolving to a commit,
 // issue #161; success responses echo the resolved id in `sha`), CAS-guard
-// on expected_notes_ref_sha (412), run the notes operation on a request-
+// on expected_notes_ref_sha (412; 409 for the DELETE query form), run the notes operation on a request-
 // scoped temp ref with a scratch object directory, policy-check, publish the
 // new objects (pack → upload → register), and CAS the notes ref (409 on a
 // lost race). Domain failures answer with the note-write envelope.
@@ -682,7 +717,11 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		return
 	}
 	var req wrefNoteRequest
-	if !wrefDecodeBody(w, r, &req) {
+	decode := wrefDecodeBody
+	if deleteNote {
+		decode = wrefDecodeOptionalBody
+	}
+	if !decode(w, r, &req) {
 		return
 	}
 	// openapi (issue #17): object_ref/notes_ref/expected_notes_ref_sha are
@@ -691,6 +730,25 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	objectSHA := wrefAliasField(req.ObjectRef, req.SHA)
 	notesRefRaw := wrefAliasField(req.NotesRef, req.Ref)
 	expectedRefSHA := wrefAliasField(req.ExpectedNotesRefSHA, req.ExpectedRefSHA)
+	// A stale guard is a 412 on the legacy body forms. The 2026-10-05 spec
+	// (issue #378) moves the DELETE fields to query parameters (present
+	// query wins over the body, even when empty) and documents 409 for a
+	// stale query guard; the SDKs still send the body form and surface
+	// result.status, so only the query form answers 409.
+	staleGuardStatus := http.StatusPreconditionFailed
+	if deleteNote {
+		q := r.URL.Query()
+		if q.Has("object_ref") {
+			objectSHA = q.Get("object_ref")
+		}
+		if q.Has("notes_ref") {
+			notesRefRaw = q.Get("notes_ref")
+		}
+		if q.Has("expected_notes_ref_sha") {
+			expectedRefSHA = q.Get("expected_notes_ref_sha")
+			staleGuardStatus = http.StatusConflict
+		}
+	}
 	targetRef, err := wrefNotesRefName(notesRefRaw)
 	if err != nil {
 		wrefNoteFail(w, http.StatusBadRequest, err.Error(), objectSHA, notesRefRaw, "", ref.ZeroSHA)
@@ -764,7 +822,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	// Invariant 1: expected_notes_ref_sha is the notes-ref CAS guard; the
 	// zero sha asserts the ref is unborn.
 	if expectedRefSHA != "" && expectedRefSHA != oldOrZero {
-		wrefNoteFail(w, http.StatusPreconditionFailed,
+		wrefNoteFail(w, staleGuardStatus,
 			fmt.Sprintf("expected_notes_ref_sha %.8s does not match %s tip %.8s", expectedRefSHA, targetRef, oldOrZero),
 			objectSHA, targetRef, old, oldOrZero)
 		return
