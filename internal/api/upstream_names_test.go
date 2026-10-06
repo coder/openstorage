@@ -52,6 +52,12 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
 		})
 
+		t.Run("present empty expected_target_sha drops the legacy guard", func(t *testing.T) {
+			resp, body := pack(t, "main", "empty-current", "z.txt",
+				map[string]any{"expected_target_sha": "", "expected_head_sha": c1})
+			wctRequireOK(t, resp, body)
+		})
+
 		t.Run("target_is_ephemeral writes the ephemeral branch", func(t *testing.T) {
 			resp, body := pack(t, "preview", "eph", "e.txt",
 				map[string]any{"target_is_ephemeral": true, "base_branch": "main"})
@@ -139,6 +145,11 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 		t.Run("restore unknown base_ref is 404", func(t *testing.T) {
 			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "no-such-branch"})
 			wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
+		})
+
+		t.Run("restore with present empty base_ref is 400", func(t *testing.T) {
+			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "", "target_commit_sha": c1})
+			wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
 		})
 
 		t.Run("restore without a target is 400", func(t *testing.T) {

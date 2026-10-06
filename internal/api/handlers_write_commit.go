@@ -277,26 +277,30 @@ type wcMetadata struct {
 	// Current upstream names (ReposCommitsCreateRequest and siblings,
 	// issue #378). The SDKs still send the deprecated names above;
 	// applyCurrentNames folds these into them, the current name winning.
-	ExpectedTargetSHA string `json:"expected_target_sha"`
-	TargetIsEphemeral *bool  `json:"target_is_ephemeral"`
-	BaseIsEphemeral   *bool  `json:"base_is_ephemeral"`
-	BaseRef           string `json:"base_ref"` // restore-commit only
+	ExpectedTargetSHA *string `json:"expected_target_sha"`
+	TargetIsEphemeral *bool   `json:"target_is_ephemeral"`
+	BaseIsEphemeral   *bool   `json:"base_is_ephemeral"`
+	BaseRef           *string `json:"base_ref"` // restore-commit only
 }
 
 // applyCurrentNames folds the current upstream field names into the
-// deprecated fields the handlers read. Strings follow wrefAliasField (a
-// non-empty current name wins); booleans win whenever present, so an
-// explicit target_is_ephemeral: false overrides a legacy ephemeral: true.
+// deprecated fields the handlers read. A current name wins whenever it is
+// present, even when empty or false: "expected_target_sha": "" drops a
+// legacy guard, and target_is_ephemeral: false overrides ephemeral: true.
 func (md *wcMetadata) applyCurrentNames() {
 	assertf(md != nil, "applyCurrentNames: nil metadata")
-	md.ExpectedHeadSHA = wrefAliasField(md.ExpectedTargetSHA, md.ExpectedHeadSHA)
+	if md.ExpectedTargetSHA != nil {
+		md.ExpectedHeadSHA = *md.ExpectedTargetSHA
+	}
 	if md.TargetIsEphemeral != nil {
 		md.Ephemeral = *md.TargetIsEphemeral
 	}
 	if md.BaseIsEphemeral != nil {
 		md.EphemeralBase = *md.BaseIsEphemeral
 	}
-	md.TargetCommitSHA = wrefAliasField(md.BaseRef, md.TargetCommitSHA)
+	if md.BaseRef != nil {
+		md.TargetCommitSHA = *md.BaseRef
+	}
 }
 
 type wcBlobChunk struct {
@@ -1243,13 +1247,17 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	md := req.Metadata
 	// base_ref (the current name, issue #378) names a branch, tag, or
 	// commit; the deprecated target_commit_sha stays a 40-hex sha.
-	revision := md.BaseRef != ""
+	revision := md.BaseRef != nil
 	md.applyCurrentNames()
 	if md.CommitMessage == "" {
 		md.CommitMessage = "Restore to " + md.TargetCommitSHA
 	}
 	if err := wcValidateMetadata(md); err != nil {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
+		return
+	}
+	if revision && md.TargetCommitSHA == "" {
+		wcFail(w, http.StatusBadRequest, "invalid", "base_ref must not be empty", "", "")
 		return
 	}
 	if !revision && !ref.ValidSHA(md.TargetCommitSHA) {

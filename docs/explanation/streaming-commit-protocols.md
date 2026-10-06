@@ -36,9 +36,9 @@ Line 1 — metadata frame:
 ```
 
 The upstream spec names three of these fields differently and marks the names above
-deprecated. open.storage accepts both. If a request sends both, the current name wins.
-A current boolean wins whenever it is present, so `"target_is_ephemeral": false`
-overrides `"ephemeral": true`.
+deprecated. open.storage accepts both. If a request sends both, the current name wins
+whenever it is present, even when it is empty or `false`: `"expected_target_sha": ""`
+drops a legacy guard, and `"target_is_ephemeral": false` overrides `"ephemeral": true`.
 
 | Current name | Deprecated name |
 |---|---|
