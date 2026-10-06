@@ -1278,9 +1278,10 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	defer sc.close()
 
 	target := md.TargetCommitSHA
-	if !ref.ValidSHA(target) {
+	if revision {
 		// A base_ref revision resolves like other revision inputs
-		// (gitread.ResolveRef: branch, tag — peeled — or hex prefix).
+		// (gitread.ResolveRef: branch, tag — peeled — then hex), even when
+		// it is 40 hex characters: a branch may have such a name.
 		resolved, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
 		if errors.Is(err, gitread.ErrNotFound) {
 			wcFail(w, http.StatusNotFound, "not_found", "base_ref "+target+" does not resolve to a commit",

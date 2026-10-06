@@ -122,6 +122,20 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 			}
 		})
 
+		t.Run("restore base_ref resolves a 40-hex branch name as a branch", func(t *testing.T) {
+			// A branch whose name is the hex of c2 but whose tip is c1:
+			// base_ref must pick the branch (c1 tree), not object c2.
+			resp, body := pack(t, c2, "hexname", "h.txt", map[string]any{"base_branch": "main"})
+			hexTip := wctRequireOK(t, resp, body).Commit.CommitSHA
+			resp, body = restore(t, map[string]any{"target_branch": "main", "base_ref": c2})
+			got := wctRequireOK(t, resp, body).Commit.TreeSHA
+			resp, body = restore(t, map[string]any{"target_branch": "main", "base_ref": hexTip})
+			want := wctRequireOK(t, resp, body).Commit.TreeSHA
+			if got != want {
+				t.Fatalf("base_ref %s restored tree %s, want the branch tip tree %s", c2, got, want)
+			}
+		})
+
 		t.Run("restore unknown base_ref is 404", func(t *testing.T) {
 			resp, body := restore(t, map[string]any{"target_branch": "main", "base_ref": "no-such-branch"})
 			wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
@@ -211,10 +225,17 @@ func TestDeleteBranchAndNoteQueryParams(t *testing.T) {
 			}
 		})
 
-		t.Run("default branch stays protected by query", func(t *testing.T) {
+		t.Run("default branch by query is 409, body form keeps 403", func(t *testing.T) {
 			resp, _ := del(t, "/api/v1/repos/branches", url.Values{"target_branch": {"main"}}, nil)
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("query: status %d, want 409", resp.StatusCode)
+			}
+			resp, _ = wrefDo(t, srv, "DELETE", "/api/v1/repos/branches", fx.token, map[string]any{"target_branch": "main"})
 			if resp.StatusCode != http.StatusForbidden {
-				t.Fatalf("status %d, want 403", resp.StatusCode)
+				t.Fatalf("body: status %d, want 403", resp.StatusCode)
+			}
+			if wrefRefs(t, e, fx.repoID)["refs/heads/main"] != fx.c2 {
+				t.Fatal("default branch moved")
 			}
 		})
 

@@ -431,8 +431,12 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 	name := wrefAliasField(req.TargetBranch, req.Name)
 	ephemeral := req.Ephemeral
 	q := r.URL.Query()
+	// Refusing the default branch is a 403 on the legacy body form, which
+	// the SDKs send; the query form answers the spec's 409.
+	protectedStatus := http.StatusForbidden
 	if q.Has("target_branch") {
 		name = q.Get("target_branch")
+		protectedStatus = http.StatusConflict
 	}
 	if q.Has("ephemeral") {
 		v, err := coreBoolParam(q, "ephemeral")
@@ -452,7 +456,7 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 	// refs/-qualified form (PATCH /repo stores such values verbatim), and
 	// the short request name must still hit the protection.
 	if !ephemeral && refName == githttp.HeadTarget(repo.DefaultBranch) {
-		writeErr(w, http.StatusForbidden, "refusing to delete the default branch")
+		writeErr(w, protectedStatus, "refusing to delete the default branch")
 		return
 	}
 	refs, ok := s.wrefListRefs(w, r, repo.RepoID)
