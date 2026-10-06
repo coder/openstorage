@@ -22,6 +22,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -46,6 +47,10 @@ type aliasRoute struct {
 	// "org", so these skip the path-vs-claim repo check.
 	orgLevel bool
 	scopes   []string
+	// mark, when set, tags the re-dispatched request's context so the
+	// shared v1 handler can apply a path-style operation's own contract
+	// (POST .../notes/append, issue #378). Clients cannot set it.
+	mark func(context.Context) context.Context
 }
 
 // aliasRoutes mirrors every repo-scoped v1 route registered in api.go /
@@ -94,6 +99,10 @@ func aliasRoutes() []aliasRoute {
 		write(http.MethodDelete, "/tags", "/api/v1/repos/tags", auth.ScopeGitRead, auth.ScopeGitWrite),
 		write(http.MethodPost, "/notes", "/api/v1/repos/notes", auth.ScopeGitWrite),
 		write(http.MethodDelete, "/notes", "/api/v1/repos/notes", auth.ScopeGitWrite),
+		// Path-style append (spec 2026-10-05, issue #378): no v1 twin, so it
+		// re-dispatches to the notes write route marked as an append.
+		{method: http.MethodPost, suffix: "/notes/append", v1Path: "/api/v1/repos/notes",
+			flavor: routeWrite, scopes: []string{auth.ScopeGitWrite}, mark: withNoteAppend},
 		write(http.MethodPost, "/merge", "/api/v1/repos/merge", auth.ScopeGitWrite),
 
 		// Sync + credentials (requireAuth with the {"error"} envelope, per
@@ -101,6 +110,11 @@ func aliasRoutes() []aliasRoute {
 		read(http.MethodPost, "/pull-upstream", "/api/v1/repos/pull-upstream", auth.ScopeGitWrite),
 		read(http.MethodPost, "/push-upstream", "/api/v1/repos/push-upstream", auth.ScopeGitWrite, auth.ScopeGitRead),
 		read(http.MethodDelete, "/base", "/api/v1/repos/base", auth.ScopeRepoWrite),
+		// Path-style replacements of pull-upstream and base (spec
+		// 2026-10-05, issue #378): same handlers, bodies and scopes.
+		{method: http.MethodPost, suffix: "/upstream/pull", v1Path: "/api/v1/repos/pull-upstream",
+			flavor: routeRead, scopes: []string{auth.ScopeGitWrite}, mark: withStrictPullBody},
+		read(http.MethodDelete, "/upstream", "/api/v1/repos/base", auth.ScopeRepoWrite),
 		read(http.MethodPost, "/git-credentials", "/api/v1/repos/git-credentials", auth.ScopeRepoWrite),
 		{method: http.MethodPut, suffix: "/git-credentials", v1Path: "/api/v1/repos/git-credentials",
 			flavor: routeRead, orgLevel: true, scopes: []string{auth.ScopeRepoWrite}},
@@ -191,7 +205,11 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 		// above, so the v1 handler reads it from the start. The exempt
 		// marker stops the v1 limiter from charging a second token — this
 		// request already paid at the alias registration.
-		r2 := r.Clone(rateLimitExempt(r.Context()))
+		ctx := rateLimitExempt(r.Context())
+		if ar.mark != nil {
+			ctx = ar.mark(ctx)
+		}
+		r2 := r.Clone(ctx)
 		r2.URL.Path = ar.v1Path
 		r2.URL.RawPath = "" // v1 paths need no escaping; Path is canonical
 		r2.RequestURI = r2.URL.RequestURI()

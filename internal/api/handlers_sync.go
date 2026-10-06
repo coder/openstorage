@@ -437,6 +437,20 @@ func policyDeniesPullUpstream(policies []auth.RefPolicy) (string, bool) {
 	return "", false
 }
 
+// strictPullBodyKey marks a request re-dispatched from POST
+// /api/repos/{repo_name}/upstream/pull (alias.go); only the alias layer
+// sets it.
+type strictPullBodyKey struct{}
+
+func withStrictPullBody(ctx context.Context) context.Context {
+	return context.WithValue(ctx, strictPullBodyKey{}, true)
+}
+
+func isStrictPullBody(ctx context.Context) bool {
+	v, _ := ctx.Value(strictPullBodyKey{}).(bool)
+	return v
+}
+
 // handlePullUpstream implements POST /api/v1/repos/pull-upstream (scope
 // git:write): enqueue a sync for the JWT repo claim target. 400 when the
 // repo has no upstream base_repo (docs/reference/http-api.md: "only for repos with base_repo").
@@ -464,7 +478,15 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if len(body) > 0 {
-		if err := json.Unmarshal(body, &req); err != nil {
+		decode := json.Unmarshal
+		if isStrictPullBody(r.Context()) {
+			// POST .../upstream/pull (issue #378): ReposUpstreamPullRequest
+			// is additionalProperties false, so a typo such as "refs" must
+			// not silently sync the default branch. The deprecated route
+			// keeps its lenient decode for existing callers.
+			decode = strictJSON
+		}
+		if err := decode(body, &req); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 			return
 		}

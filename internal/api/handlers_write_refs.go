@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -700,6 +701,110 @@ func wrefNotesRefName(raw string) (string, error) {
 	return "refs/notes/" + raw, nil
 }
 
+// noteAppendKey marks a request re-dispatched from POST
+// /api/repos/{repo_name}/notes/append (alias.go). Only the alias layer
+// sets it; a direct /api/v1 request never carries it.
+type noteAppendKey struct{}
+
+func withNoteAppend(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noteAppendKey{}, true)
+}
+
+func isNoteAppend(ctx context.Context) bool {
+	v, _ := ctx.Value(noteAppendKey{}).(bool)
+	return v
+}
+
+// wrefNoteAppendRequest is ReposNotesAppendRequest (additionalProperties
+// false, no `action`): decoded strictly, the operation is always append.
+type wrefNoteAppendRequest struct {
+	ObjectRef           string          `json:"object_ref"`
+	SHA                 string          `json:"sha"`
+	Note                string          `json:"note"`
+	NotesRef            string          `json:"notes_ref"`
+	Ref                 string          `json:"ref"`
+	ExpectedNotesRefSHA string          `json:"expected_notes_ref_sha"`
+	ExpectedRefSHA      string          `json:"expected_ref_sha"`
+	Author              *wrefNoteAuthor `json:"author"`
+}
+
+// strictJSON decodes body into dst for schemas with additionalProperties
+// false and no nullable fields. The body must be a JSON object; unknown or
+// case-variant member names (encoding/json matches names case-insensitively,
+// even with DisallowUnknownFields), JSON null members, and trailing data
+// are errors. dst must point to a struct.
+func strictJSON(body []byte, dst any) error {
+	t := reflect.TypeOf(dst)
+	assertf(t != nil && t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct, "strictJSON: dst %T is not a struct pointer", dst)
+	if err := checkStrictObject(body, t.Elem(), ""); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("trailing data")
+	}
+	return nil
+}
+
+// checkStrictObject verifies raw is a JSON object whose member names are
+// exactly the json tags of struct type t, with no null members; struct and
+// struct-pointer fields are checked recursively.
+func checkStrictObject(raw []byte, t reflect.Type, path string) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+		if path == "" {
+			return errors.New("body must be a JSON object")
+		}
+		return fmt.Errorf("%s must be a JSON object", strings.TrimSuffix(path, "."))
+	}
+	fields := make(map[string]reflect.Type, t.NumField())
+	for i := range t.NumField() {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			fields[name] = t.Field(i).Type
+		}
+	}
+	for name, v := range members {
+		ft, ok := fields[name]
+		if !ok {
+			return fmt.Errorf("unknown field %q", path+name)
+		}
+		if string(bytes.TrimSpace(v)) == "null" {
+			return fmt.Errorf("%s must not be null", path+name)
+		}
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft.Kind() == reflect.Struct {
+			if err := checkStrictObject(v, ft, path+name+"."); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// wrefDecodeStrictBody is wrefDecodeBody with strictJSON.
+func wrefDecodeStrictBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return false
+	}
+	if len(body) == 0 {
+		writeErr(w, http.StatusBadRequest, "missing request body")
+		return false
+	}
+	if err := strictJSON(body, dst); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return false
+	}
+	return true
+}
+
 func (s *server) handleWriteNote(w http.ResponseWriter, r *http.Request) {
 	s.wrefHandleNote(w, r, false)
 }
@@ -721,12 +826,24 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		return
 	}
 	var req wrefNoteRequest
-	decode := wrefDecodeBody
-	if deleteNote {
-		decode = wrefDecodeOptionalBody
-	}
-	if !decode(w, r, &req) {
-		return
+	appendRoute := !deleteNote && isNoteAppend(r.Context())
+	switch {
+	case appendRoute:
+		var ar wrefNoteAppendRequest
+		if !wrefDecodeStrictBody(w, r, &ar) {
+			return
+		}
+		req = wrefNoteRequest{ObjectRef: ar.ObjectRef, SHA: ar.SHA, Action: "append", Note: ar.Note,
+			NotesRef: ar.NotesRef, Ref: ar.Ref, ExpectedNotesRefSHA: ar.ExpectedNotesRefSHA,
+			ExpectedRefSHA: ar.ExpectedRefSHA, Author: ar.Author}
+	case deleteNote:
+		if !wrefDecodeOptionalBody(w, r, &req) {
+			return
+		}
+	default:
+		if !wrefDecodeBody(w, r, &req) {
+			return
+		}
 	}
 	// openapi (issue #17): object_ref/notes_ref/expected_notes_ref_sha are
 	// the current fields; sha/ref/expected_ref_sha stay as deprecated
@@ -740,6 +857,10 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	// stale query guard; the SDKs still send the body form and surface
 	// result.status, so only the query form answers 409.
 	staleGuardStatus := http.StatusPreconditionFailed
+	if appendRoute {
+		// POST .../notes/append documents 409 for a stale guard.
+		staleGuardStatus = http.StatusConflict
+	}
 	if deleteNote {
 		q := r.URL.Query()
 		if q.Has("object_ref") {
@@ -907,7 +1028,11 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		wrefNoteFail(w, http.StatusConflict, targetRef+" moved concurrently", objectSHA, targetRef, old, oldOrZero)
 		return
 	}
-	writeJSON(w, http.StatusOK, wrefNoteResponse{
+	okStatus := http.StatusOK // recorded deviation: the legacy routes answer 200
+	if appendRoute {
+		okStatus = http.StatusCreated // the path-style append follows the spec
+	}
+	writeJSON(w, okStatus, wrefNoteResponse{
 		SHA:        objectSHA,
 		NotesRef:   targetRef,
 		TargetRef:  targetRef,
