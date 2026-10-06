@@ -121,6 +121,7 @@ func TestResolveRef(t *testing.T) {
 		{"annotated tag peels to commit", "v1", false, f.c1},
 		{"lightweight tag", "v2-light", false, f.c2},
 		{"full sha", f.c1, false, f.c1},
+		{"uppercase full sha", strings.ToUpper(f.c1), false, f.c1},
 		{"short sha", f.c1[:8], false, f.c1},
 		{"ephemeral branch", "main", true, f.c1},
 		{"ephemeral full ref", "refs/heads/main", true, f.c1},
@@ -138,7 +139,7 @@ func TestResolveRef(t *testing.T) {
 		})
 	}
 
-	for _, spec := range []string{"", "nope", "refs/heads/nope", "deadbeef", "HEAD~1", "main~1", "--verify"} {
+	for _, spec := range []string{"", "nope", "refs/heads/nope", "deadbeef", "HEAD~1", "main~1", "--verify", strings.ToUpper(f.c1[:8])} {
 		if sha, err := ResolveRef(ctx, f.dir, spec, false); !errors.Is(err, ErrNotFound) {
 			t.Errorf("ResolveRef(%q) = (%q, %v), want ErrNotFound", spec, sha, err)
 		}

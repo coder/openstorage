@@ -74,6 +74,11 @@ func Materialize(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheD
 // :/text, ...) into the API surface.
 var hexRevRe = regexp.MustCompile(`\A[0-9a-f]{4,40}\z`)
 
+// fullHexRe matches a full object name in either case. Git object names
+// are case-insensitive hex, so ResolveRef lowercases a full one before the
+// hex fallback (issue #381). Abbreviations stay lowercase-only.
+var fullHexRe = regexp.MustCompile(`\A[0-9a-fA-F]{40}\z`)
+
 // ResolveRef resolves a request ref to a full commit SHA in the repo at
 // repoPath. Resolution order (docs/reference/http-api.md "branch name, short or full SHA"):
 //
@@ -81,7 +86,8 @@ var hexRevRe = regexp.MustCompile(`\A[0-9a-f]{4,40}\z`)
 //     (auth.EphemeralRefName) when ephemeral is true
 //  2. tag:      refs/tags/<spec> (annotated tags peel to their commit)
 //  3. full ref: <spec> verbatim when it already starts with "refs/"
-//  4. hex:      short or full SHA (lowercase hex only, no rev expressions)
+//  4. hex:      short or full SHA (no rev expressions; a full SHA may be
+//     uppercase, an abbreviation must be lowercase)
 //
 // Everything unresolvable wraps ErrNotFound — including the empty spec and
 // the unborn-branch case, where the DB knows no such ref yet (invariant 3:
@@ -119,8 +125,12 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 	} else if validRefName(spec) {
 		candidates = append(candidates, spec)
 	}
-	if hexRevRe.MatchString(spec) {
-		candidates = append(candidates, spec)
+	hex := spec
+	if fullHexRe.MatchString(spec) {
+		hex = strings.ToLower(spec)
+	}
+	if hexRevRe.MatchString(hex) {
+		candidates = append(candidates, hex)
 	}
 	if limitErr != nil {
 		return "", limitErr

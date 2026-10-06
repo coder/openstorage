@@ -729,10 +729,11 @@ type wrefNoteAppendRequest struct {
 }
 
 // strictJSON decodes body into dst for schemas with additionalProperties
-// false and no nullable fields. The body must be a JSON object; unknown or
-// case-variant member names (encoding/json matches names case-insensitively,
-// even with DisallowUnknownFields), JSON null members, and trailing data
-// are errors. dst must point to a struct.
+// false and no nullable fields. The body must be a JSON object; unknown,
+// duplicate, or case-variant member names (encoding/json matches names
+// case-insensitively, even with DisallowUnknownFields, and lets the last
+// duplicate win), JSON null members, and trailing data are errors. dst
+// must point to a struct.
 func strictJSON(body []byte, dst any) error {
 	t := reflect.TypeOf(dst)
 	assertf(t != nil && t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct, "strictJSON: dst %T is not a struct pointer", dst)
@@ -750,28 +751,57 @@ func strictJSON(body []byte, dst any) error {
 }
 
 // checkStrictObject verifies raw is a JSON object whose member names are
-// exactly the json tags of struct type t, with no null members; struct and
-// struct-pointer fields are checked recursively.
+// exactly the json tags of struct type t, each at most once, with no null
+// members; struct and struct-pointer fields are checked recursively.
+// Slice, array, and map fields are not: a field holding structs there
+// fails the assertion below, so a schema that needs them must add the
+// recursion first (issue #381).
 func checkStrictObject(raw []byte, t reflect.Type, path string) error {
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
-		if path == "" {
-			return errors.New("body must be a JSON object")
-		}
-		return fmt.Errorf("%s must be a JSON object", strings.TrimSuffix(path, "."))
+	notObject := errors.New("body must be a JSON object")
+	if path != "" {
+		notObject = fmt.Errorf("%s must be a JSON object", strings.TrimSuffix(path, "."))
 	}
 	fields := make(map[string]reflect.Type, t.NumField())
 	for i := range t.NumField() {
+		ft := t.Field(i).Type
+		if k := ft.Kind(); k == reflect.Slice || k == reflect.Array || k == reflect.Map {
+			et := ft.Elem()
+			if et.Kind() == reflect.Pointer {
+				et = et.Elem()
+			}
+			assertf(et.Kind() != reflect.Struct, "checkStrictObject: %s field %s holds structs, which are not checked", t, t.Field(i).Name)
+		}
 		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
 		if name != "" && name != "-" {
-			fields[name] = t.Field(i).Type
+			fields[name] = ft
 		}
 	}
-	for name, v := range members {
+	// Walk the members in order with a token decoder: unmarshaling into a
+	// map would hide a duplicate name.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return notObject
+	}
+	seen := make(map[string]bool, len(fields))
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return notObject
+		}
+		name, ok := tok.(string)
+		assertf(ok, "checkStrictObject: member name token %T", tok)
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return notObject
+		}
 		ft, ok := fields[name]
 		if !ok {
 			return fmt.Errorf("unknown field %q", path+name)
 		}
+		if seen[name] {
+			return fmt.Errorf("duplicate field %q", path+name)
+		}
+		seen[name] = true
 		if string(bytes.TrimSpace(v)) == "null" {
 			return fmt.Errorf("%s must not be null", path+name)
 		}
@@ -783,6 +813,13 @@ func checkStrictObject(raw []byte, t reflect.Type, path string) error {
 				return err
 			}
 		}
+	}
+	// The closing brace, then nothing: trailing data is not an object.
+	if _, err := dec.Token(); err != nil {
+		return notObject
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return notObject
 	}
 	return nil
 }
