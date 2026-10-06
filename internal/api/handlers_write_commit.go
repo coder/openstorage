@@ -273,6 +273,33 @@ type wcMetadata struct {
 	Files           []wcFileOp `json:"files"`
 	// restore-commit only (docs/explanation/streaming-commit-protocols.md §4).
 	TargetCommitSHA string `json:"target_commit_sha"`
+
+	// Current upstream names (ReposCommitsCreateRequest and siblings,
+	// issue #378). The SDKs still send the deprecated names above;
+	// applyCurrentNames folds these into them, the current name winning.
+	ExpectedTargetSHA *string `json:"expected_target_sha"`
+	TargetIsEphemeral *bool   `json:"target_is_ephemeral"`
+	BaseIsEphemeral   *bool   `json:"base_is_ephemeral"`
+	// BaseRef is decoded only so restore-commit can refuse it: until it is
+	// supported, a request naming it must not silently run another target.
+	BaseRef *string `json:"base_ref"`
+}
+
+// applyCurrentNames folds the current upstream field names into the
+// deprecated fields the handlers read. A current name wins whenever it is
+// present, even when empty or false: "expected_target_sha": "" drops a
+// legacy guard, and target_is_ephemeral: false overrides ephemeral: true.
+func (md *wcMetadata) applyCurrentNames() {
+	assertf(md != nil, "applyCurrentNames: nil metadata")
+	if md.ExpectedTargetSHA != nil {
+		md.ExpectedHeadSHA = *md.ExpectedTargetSHA
+	}
+	if md.TargetIsEphemeral != nil {
+		md.Ephemeral = *md.TargetIsEphemeral
+	}
+	if md.BaseIsEphemeral != nil {
+		md.EphemeralBase = *md.BaseIsEphemeral
+	}
 }
 
 type wcBlobChunk struct {
@@ -309,6 +336,7 @@ func wcReadMetadata(w http.ResponseWriter, lr *wcLineReader) (*wcMetadata, bool)
 		wcFail(w, http.StatusBadRequest, "invalid", "first frame must be a metadata frame", "", "")
 		return nil, false
 	}
+	frame.Metadata.applyCurrentNames()
 	return frame.Metadata, true
 }
 
@@ -388,7 +416,7 @@ func wcValidateMetadata(md *wcMetadata) error {
 		}
 	}
 	if md.ExpectedHeadSHA != "" && !ref.ValidSHA(md.ExpectedHeadSHA) {
-		return errors.New("expected_head_sha must be a 40-hex sha")
+		return errors.New("expected_target_sha (or expected_head_sha) must be a 40-hex sha")
 	}
 	if md.BaseBranch != "" {
 		if err := wcValidateBranchParam("base_branch", md.BaseBranch); err != nil {
@@ -486,10 +514,11 @@ func (s *server) wcPlanCommit(w http.ResponseWriter, r *http.Request, repoID str
 		plan.parent = baseTip
 		casTip = baseTip
 	}
-	// CAS guard (decision #2): a stale expected_head_sha is a 412.
+	// CAS guard (decision #2): a stale expected_target_sha (deprecated
+	// expected_head_sha) is a 412.
 	if md.ExpectedHeadSHA != "" && strings.ToLower(md.ExpectedHeadSHA) != casTip {
 		wcFail(w, http.StatusPreconditionFailed, "precondition_failed",
-			fmt.Sprintf("expected_head_sha %s does not match current tip %s", md.ExpectedHeadSHA, casTip),
+			fmt.Sprintf("expected target sha %s does not match current tip %s", md.ExpectedHeadSHA, casTip),
 			md.TargetBranch, plan.oldSHA)
 		return nil, false
 	}
@@ -1215,6 +1244,11 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	md := req.Metadata
+	if md.BaseRef != nil {
+		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is not supported yet; send target_commit_sha", "", "")
+		return
+	}
+	md.applyCurrentNames()
 	if md.CommitMessage == "" {
 		md.CommitMessage = "Restore to " + md.TargetCommitSHA
 	}

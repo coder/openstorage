@@ -160,6 +160,24 @@ components:
         - committer_time
         - summary
       type: object
+    BlobChunk:
+      additionalProperties: false
+      description: Part of the content of one file in a create-commit NDJSON body. Send the chunks of a file in order, and set `eof` on the last one.
+      properties:
+        content_id:
+          description: Ties the chunk to a file operation.
+          type: string
+        data:
+          description: Base64-encoded payload (decoded payload must be at most 4 MiB per chunk).
+          type: string
+        eof:
+          description: Set true on the final chunk for that content_id.
+          type: boolean
+      required:
+        - content_id
+        - data
+        - eof
+      type: object
     Branch:
       description: A branch.
       properties:
@@ -277,6 +295,20 @@ components:
       required:
         - commit
         - result
+      type: object
+    DiffChunk:
+      additionalProperties: false
+      description: Part of the Git patch in a create-commit-from-diff NDJSON body. Send the chunks in order, and set `eof` on the last one.
+      properties:
+        data:
+          description: Base64-encoded diff bytes. Decoded payloads must be at most 4 MiB. Combined diff must be compatible with git apply --cached --binary.
+          type: string
+        eof:
+          description: Set true on the final chunk to signal end-of-stream.
+          type: boolean
+      required:
+        - data
+        - eof
       type: object
     DiffStats:
       additionalProperties: false
@@ -419,6 +451,25 @@ components:
         - message
         - order
       type: object
+    FileOperation:
+      additionalProperties: false
+      description: A file that a commit adds, replaces, or deletes.
+      properties:
+        content_id:
+          description: Identifier that blob chunks reference for this file. Required for upsert.
+          type: string
+        mode:
+          description: File mode such as 100644 or 100755. Defaults to 100644.
+          type: string
+        operation:
+          description: upsert (default) to add or replace content, or delete to remove a file.
+          type: string
+        path:
+          description: Repository-relative path, with no leading slash.
+          type: string
+      required:
+        - path
+      type: object
     FileWithMetadata:
       additionalProperties: false
       description: File entry in a list-files-with-metadata response, including mode, type, and the SHA of the most recent commit that touched it.
@@ -529,31 +580,6 @@ components:
         - stats
         - files
         - filtered_files
-      type: object
-    GetRepoURLByIDResponse:
-      additionalProperties: false
-      description: Repository URL path resolved from an internal repository ID.
-      properties:
-        repo_id:
-          description: Stable repository identifier.
-          examples:
-            - repo_7f2b3d9
-          type: string
-        repo_name:
-          description: Repository name or path. It can contain a slash. It matches the JWT repo claim.
-          examples:
-            - team/project-alpha
-          type: string
-        url:
-          deprecated: true
-          description: "Deprecated: use repo_name. Repository name or path, not a full URL."
-          examples:
-            - team/project-alpha
-          type: string
-      required:
-        - repo_id
-        - repo_name
-        - url
       type: object
     GitCredential:
       additionalProperties: false
@@ -1079,50 +1105,6 @@ components:
         - ref
         - sha
       type: object
-    NotesWriteRequest:
-      additionalProperties: false
-      description: Notes write request describing the commit, the action (`add`, `append`, or `remove`), the note content, and optional concurrency guard.
-      properties:
-        action:
-          default: add
-          description: add creates a note and fails if one already exists. append adds new text to the existing note body.
-          type: string
-        author:
-          $ref: "#/components/schemas/GitIdentity"
-          description: Author object with name and email for the notes commit.
-        expected_notes_ref_sha:
-          description: Optional compare-and-swap guard for the notes ref. Provide expected_notes_ref_sha or the deprecated expected_ref_sha.
-          type: string
-        expected_ref_sha:
-          deprecated: true
-          description: "Deprecated: use expected_notes_ref_sha. Optional compare-and-swap guard for the notes ref."
-          type: string
-        note:
-          description: Plain-text note content. Required for add and append.
-          type: string
-        notes_ref:
-          description: Optional notes ref to target. A bare name like reviews is placed under refs/notes/; a fully-qualified refs/notes/* ref is also accepted. Defaults to refs/notes/commits. Provide notes_ref or the deprecated ref.
-          examples:
-            - refs/notes/commits
-          type: string
-        object_ref:
-          description: "Git object the note attaches to: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Provide object_ref or the deprecated sha."
-          examples:
-            - b003fc78805954584e1ee364a4ad39d7c79e819a
-          type: string
-        ref:
-          deprecated: true
-          description: "Deprecated: use notes_ref. Optional notes ref to target."
-          examples:
-            - refs/notes/commits
-          type: string
-        sha:
-          deprecated: true
-          description: "Deprecated: use object_ref. Git object SHA to attach the note to."
-          examples:
-            - b003fc78805954584e1ee364a4ad39d7c79e819a
-          type: string
-      type: object
     NotesWriteResponse:
       additionalProperties: false
       description: Result of a notes write operation, including the resulting notes ref state.
@@ -1322,101 +1304,6 @@ components:
         - success
         - status
       type: object
-    RepoChange:
-      additionalProperties: false
-      description: Latest tracked head state, ref deletion, or repository deletion.
-      properties:
-        changed_at:
-          description: Metadata change time in RFC 3339 format, used by changed_after.
-          examples:
-            - "2026-08-04T00:01:00Z"
-          type: string
-        ephemeral:
-          description: Whether this item refers to an ephemeral branch. False for regular branches; null for repository deletions.
-          examples:
-            - false
-          type:
-            - boolean
-            - "null"
-        last_push_at:
-          description: Original push time in RFC 3339 format. Null when unavailable or for repository deletions.
-          examples:
-            - "2026-08-04T00:00:00Z"
-          type:
-            - string
-            - "null"
-        oid:
-          description: Current target object ID. Null unless state is ref_updated.
-          examples:
-            - b003fc78805954584e1ee364a4ad39d7c79e819a
-          type:
-            - string
-            - "null"
-        ref:
-          description: Head ref in refs/heads/<name> form. Ephemeral branches use the same form with ephemeral set to true. Null for repo_deleted.
-          examples:
-            - refs/heads/main
-          type:
-            - string
-            - "null"
-        repo_id:
-          description: Stable repository identifier.
-          examples:
-            - repo_7f2b3d9
-          type: string
-        repo_name:
-          description: Repository name or path. Empty for historical deletions whose original name was not preserved.
-          examples:
-            - team/project-alpha
-          type: string
-        state:
-          description: Latest ref state or repository deletion.
-          enum:
-            - ref_updated
-            - ref_deleted
-            - repo_deleted
-          examples:
-            - ref_updated
-          type: string
-      required:
-        - repo_id
-        - repo_name
-        - ref
-        - ephemeral
-        - state
-        - oid
-        - last_push_at
-        - changed_at
-      type: object
-    RepoChangesListResponse:
-      additionalProperties: false
-      description: Paginated repository changes for the current organisation.
-      properties:
-        changes:
-          description: Latest changes to tracked heads and repository deletions.
-          items:
-            $ref: "#/components/schemas/RepoChange"
-          type: array
-        has_more:
-          description: Whether another page is available.
-          examples:
-            - true
-          type: boolean
-        next_changed_after:
-          description: Delayed poll boundary in RFC 3339 format. Save after all pages are processed and use as changed_after for the next poll.
-          examples:
-            - "2026-08-04T00:02:00Z"
-          type: string
-        next_cursor:
-          description: Opaque cursor for the next page. Pass it as `cursor` to read the next page. Absent when there are no more results.
-          examples:
-            - MTcwNzU3MzQ1MTAwMDAwMDAwMHxyZXBvXzlhNGMyMWY
-          type: string
-      required:
-        - changes
-        - next_changed_after
-        - has_more
-      type: object
     ReposArchiveGetRequest:
       additionalProperties: false
       description: Archive options describing the ref to snapshot and the include or exclude filters applied to the resulting tarball.
@@ -1483,8 +1370,6 @@ components:
         base_branch:
           deprecated: true
           description: "Deprecated: use base_ref. Preferred source branch name."
-          examples:
-            - main
           type: string
         base_is_ephemeral:
           description: Whether the base branch should be resolved from the ephemeral namespace.
@@ -1493,6 +1378,8 @@ components:
           type: boolean
         base_ref:
           description: Optional source ref or revision. Provide base_ref or the deprecated base_branch.
+          examples:
+            - main
           type: string
         force:
           description: Allow non-fast-forward updates when recreating an existing named branch. Requires target_branch.
@@ -1542,21 +1429,23 @@ components:
       type: object
     ReposBranchesDeleteRequest:
       additionalProperties: false
-      description: Branch deletion request identifying the branch to remove.
+      description: Deprecated branch deletion body. Use the target_branch and ephemeral query parameters.
       properties:
         ephemeral:
-          description: Delete the branch from the ephemeral namespace instead of the default namespace.
+          deprecated: true
+          description: "Deprecated: use the ephemeral query parameter. Delete the branch from the ephemeral namespace instead of the default namespace."
           examples:
             - false
           type: boolean
         name:
           deprecated: true
-          description: "Deprecated: use target_branch. Branch name to delete."
+          description: "Deprecated: use the target_branch query parameter. Branch name to delete."
           examples:
             - feature/old-onboarding
           type: string
         target_branch:
-          description: Branch name to delete. Must not start with refs/. Provide target_branch or the deprecated name.
+          deprecated: true
+          description: "Deprecated: use the target_branch query parameter. Branch name to delete. Must not start with refs/."
           examples:
             - feature/old-onboarding
           type: string
@@ -1625,6 +1514,102 @@ components:
         - branches
         - has_more
       type: object
+    ReposCommitsCreateFromDiffRequest:
+      additionalProperties: false
+      description: "Metadata line of a create-commit-from-diff NDJSON body: the target branch and the commit message and identities. The `diff_chunk` lines that follow carry the patch."
+      properties:
+        author:
+          $ref: "#/components/schemas/GitIdentity"
+          description: Author identity for the commit.
+        base_branch:
+          description: Source branch to seed from when target_branch does not exist yet.
+          type: string
+        base_is_ephemeral:
+          description: When true, interpret base_branch as ephemeral.
+          type: boolean
+        commit_message:
+          description: Commit message for the new commit.
+          type: string
+        committer:
+          $ref: "#/components/schemas/GitIdentity"
+          description: Committer identity. Defaults to author when omitted.
+        ephemeral:
+          deprecated: true
+          description: "Deprecated: use target_is_ephemeral. When true, write the target branch under the ephemeral namespace."
+          type: boolean
+        ephemeral_base:
+          deprecated: true
+          description: "Deprecated: use base_is_ephemeral. When true, interpret base_branch as ephemeral."
+          type: boolean
+        expected_head_sha:
+          deprecated: true
+          description: "Deprecated: use expected_target_sha. Guard ensuring the branch tip matches before applying the patch."
+          type: string
+        expected_target_sha:
+          description: Guard ensuring the target branch tip matches before applying the patch.
+          type: string
+        target_branch:
+          description: Destination branch name.
+          type: string
+        target_is_ephemeral:
+          description: When true, write the target branch under the ephemeral namespace.
+          type: boolean
+      required:
+        - target_branch
+        - commit_message
+        - author
+      type: object
+    ReposCommitsCreateRequest:
+      additionalProperties: false
+      description: "Metadata line of a create-commit NDJSON body: the target branch, the commit message and identities, and the file operations. The `blob_chunk` lines that follow carry the file content."
+      properties:
+        author:
+          $ref: "#/components/schemas/GitIdentity"
+          description: Author identity for the commit.
+        base_branch:
+          description: Source branch to copy when target_branch does not yet exist.
+          type: string
+        base_is_ephemeral:
+          description: When true, interpret base_branch as ephemeral.
+          type: boolean
+        commit_message:
+          description: Commit message for the new commit.
+          type: string
+        committer:
+          $ref: "#/components/schemas/GitIdentity"
+          description: Committer identity. Defaults to author when omitted.
+        ephemeral:
+          deprecated: true
+          description: "Deprecated: use target_is_ephemeral. When true, write the target branch under the ephemeral namespace."
+          type: boolean
+        ephemeral_base:
+          deprecated: true
+          description: "Deprecated: use base_is_ephemeral. When true, interpret base_branch as ephemeral."
+          type: boolean
+        expected_head_sha:
+          deprecated: true
+          description: "Deprecated: use expected_target_sha. Commit SHA that must match the branch tip before writing."
+          type: string
+        expected_target_sha:
+          description: Commit SHA that must match the target branch tip before writing. Omit to fast-forward unconditionally.
+          type: string
+        files:
+          description: File operations applied in this commit.
+          items:
+            $ref: "#/components/schemas/FileOperation"
+          type: array
+        target_branch:
+          description: Destination branch name (no refs/ prefix).
+          type: string
+        target_is_ephemeral:
+          description: When true, write the target branch under the ephemeral namespace.
+          type: boolean
+      required:
+        - target_branch
+        - commit_message
+        - author
+        - files
+      type: object
     ReposCommitsGetResponse:
       additionalProperties: false
       description: Commit metadata for a single resolved revision, without diff content.
@@ -1657,6 +1642,40 @@ components:
       required:
         - commits
         - has_more
+      type: object
+    ReposCommitsRestoreRequest:
+      additionalProperties: false
+      description: "Metadata line of a restore-commit NDJSON body: the branch to reset, the revision to reset it to, and the commit identities. The body has no other line."
+      properties:
+        author:
+          $ref: "#/components/schemas/GitIdentity"
+          description: Author identity for the restore commit.
+        base_ref:
+          description: Branch, tag, or commit to reset the branch to. Provide base_ref or the deprecated target_commit_sha.
+          type: string
+        commit_message:
+          description: Commit message for the restore commit. Defaults to a message that names the branch and the commit.
+          type: string
+        committer:
+          $ref: "#/components/schemas/GitIdentity"
+          description: Committer identity. Defaults to author when omitted.
+        expected_head_sha:
+          deprecated: true
+          description: "Deprecated: use expected_target_sha. Guard ensuring the current tip matches before applying the restore."
+          type: string
+        expected_target_sha:
+          description: Guard ensuring the target branch tip matches before applying the restore.
+          type: string
+        target_branch:
+          description: Branch name to reset (no refs/ prefix).
+          type: string
+        target_commit_sha:
+          deprecated: true
+          description: "Deprecated: use base_ref. Commit to reset the branch to."
+          type: string
+      required:
+        - target_branch
+        - author
       type: object
     ReposCommitsRestoreResponse:
       additionalProperties: false
@@ -1695,7 +1714,7 @@ components:
       type: object
     ReposCreateResponse:
       additionalProperties: false
-      description: Result of creating a repository, including the assigned internal repository ID and the repository URL path.
+      description: Result of creating a repository, including its repository name.
       properties:
         http_url:
           deprecated: true
@@ -1988,12 +2007,12 @@ components:
           description: Pattern configuration.
         ref:
           description: Preferred branch, tag, or commit to search.
+          examples:
+            - main
           type: string
         rev:
           deprecated: true
           description: "Deprecated: use ref. Legacy ref field retained for backwards compatibility."
-          examples:
-            - main
           type: string
       required:
         - query
@@ -2169,6 +2188,146 @@ components:
         - target
         - promoted_commits
       type: object
+    ReposNotesAppendRequest:
+      additionalProperties: false
+      description: Append-note request describing the Git object, the text to add, and the optional notes ref guard.
+      properties:
+        author:
+          $ref: "#/components/schemas/GitIdentity"
+          description: Author object with name and email for the notes commit.
+        expected_notes_ref_sha:
+          description: Optional compare-and-swap guard for the notes ref. Provide expected_notes_ref_sha or the deprecated expected_ref_sha.
+          type: string
+        expected_ref_sha:
+          deprecated: true
+          description: "Deprecated: use expected_notes_ref_sha. Optional compare-and-swap guard for the notes ref."
+          type: string
+        note:
+          description: Plain text to add to the note.
+          examples:
+            - Deployment complete.
+          type: string
+        notes_ref:
+          description: Optional notes ref to target. A bare name like reviews is placed under refs/notes/; a fully-qualified refs/notes/* ref is also accepted. Defaults to refs/notes/commits. Provide notes_ref or the deprecated ref.
+          examples:
+            - refs/notes/commits
+          type: string
+        object_ref:
+          description: "Git object the note attaches to: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Provide object_ref or the deprecated sha."
+          examples:
+            - b003fc78805954584e1ee364a4ad39d7c79e819a
+          type: string
+        ref:
+          deprecated: true
+          description: "Deprecated: use notes_ref. Optional notes ref to target."
+          examples:
+            - refs/notes/commits
+          type: string
+        sha:
+          deprecated: true
+          description: "Deprecated: use object_ref. Git object SHA to attach the note to."
+          examples:
+            - b003fc78805954584e1ee364a4ad39d7c79e819a
+          type: string
+      required:
+        - note
+      type: object
+    ReposNotesCreateRequest:
+      additionalProperties: false
+      description: Create-note request describing the Git object, the note content, and the optional notes ref guard.
+      properties:
+        action:
+          default: add
+          deprecated: true
+          description: "Deprecated: use POST /notes/append to append. add creates a note and fails if one already exists. append adds text to the note, and creates the note if none exists."
+          type: string
+        author:
+          $ref: "#/components/schemas/GitIdentity"
+          description: Author object with name and email for the notes commit.
+        expected_notes_ref_sha:
+          description: Optional compare-and-swap guard for the notes ref. Provide expected_notes_ref_sha or the deprecated expected_ref_sha.
+          type: string
+        expected_ref_sha:
+          deprecated: true
+          description: "Deprecated: use expected_notes_ref_sha. Optional compare-and-swap guard for the notes ref."
+          type: string
+        note:
+          description: Plain-text note content. Required.
+          examples:
+            - Reviewed. Ready for production.
+          type: string
+        notes_ref:
+          description: Optional notes ref to target. A bare name like reviews is placed under refs/notes/; a fully-qualified refs/notes/* ref is also accepted. Defaults to refs/notes/commits. Provide notes_ref or the deprecated ref.
+          examples:
+            - refs/notes/commits
+          type: string
+        object_ref:
+          description: "Git object the note attaches to: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Provide object_ref or the deprecated sha."
+          examples:
+            - b003fc78805954584e1ee364a4ad39d7c79e819a
+          type: string
+        ref:
+          deprecated: true
+          description: "Deprecated: use notes_ref. Optional notes ref to target."
+          examples:
+            - refs/notes/commits
+          type: string
+        sha:
+          deprecated: true
+          description: "Deprecated: use object_ref. Git object SHA to attach the note to."
+          examples:
+            - b003fc78805954584e1ee364a4ad39d7c79e819a
+          type: string
+      type: object
+    ReposNotesDeleteRequest:
+      additionalProperties: false
+      description: Deprecated delete-note body. Use the object_ref, notes_ref, and expected_notes_ref_sha query parameters.
+      properties:
+        action:
+          deprecated: true
+          description: "Deprecated: a delete ignores action."
+          type: string
+        author:
+          $ref: "#/components/schemas/GitIdentity"
+          deprecated: true
+          description: "Deprecated: no replacement. Without author, the notes commit of a delete has the default author. Author object with name and email for the notes commit."
+        expected_notes_ref_sha:
+          deprecated: true
+          description: "Deprecated: use the expected_notes_ref_sha query parameter. Optional compare-and-swap guard for the notes ref."
+          type: string
+        expected_ref_sha:
+          deprecated: true
+          description: "Deprecated: use the expected_notes_ref_sha query parameter. Optional compare-and-swap guard for the notes ref."
+          type: string
+        note:
+          deprecated: true
+          description: "Deprecated: a delete ignores note."
+          type: string
+        notes_ref:
+          deprecated: true
+          description: "Deprecated: use the notes_ref query parameter. Optional notes ref to target."
+          examples:
+            - refs/notes/commits
+          type: string
+        object_ref:
+          deprecated: true
+          description: "Deprecated: use the object_ref query parameter. Git object the note attaches to."
+          examples:
+            - b003fc78805954584e1ee364a4ad39d7c79e819a
+          type: string
+        ref:
+          deprecated: true
+          description: "Deprecated: use the notes_ref query parameter. Optional notes ref to target."
+          examples:
+            - refs/notes/commits
+          type: string
+        sha:
+          deprecated: true
+          description: "Deprecated: use the object_ref query parameter. Git object SHA the note attaches to."
+          examples:
+            - b003fc78805954584e1ee364a4ad39d7c79e819a
+          type: string
+      type: object
     ReposNotesGetResponse:
       additionalProperties: false
       description: A single Git note attached to a commit, including the current notes ref tip.
@@ -2292,31 +2451,6 @@ components:
         - target_tip_sha
         - conflict_paths
         - conflicts
-      type: object
-    ReposPullUpstreamRequest:
-      additionalProperties: false
-      description: Optional parameters for triggering a sync from the configured upstream.
-      properties:
-        after:
-          description: Optional opaque token from a previous pull-upstream response. Reserved for compatibility with future incremental syncs.
-          type: string
-        ref:
-          description: Optional branch or tag to pull from the configured upstream. Defaults to the repository's tracked default branch.
-          examples:
-            - main
-          type: string
-      type: object
-    ReposPullUpstreamResponse:
-      additionalProperties: false
-      description: Acknowledgement that an upstream sync has been initiated; the sync itself runs asynchronously.
-      properties:
-        message:
-          description: Human-readable status message.
-          examples:
-            - Repository sync initiated successfully
-          type: string
-      required:
-        - message
       type: object
     ReposTagsCreateRequest:
       additionalProperties: false
@@ -2485,6 +2619,31 @@ components:
           description: Human-readable detach status message.
           examples:
             - repository detached
+          type: string
+      required:
+        - message
+      type: object
+    ReposUpstreamPullRequest:
+      additionalProperties: false
+      description: Optional parameters for triggering a sync from the configured upstream.
+      properties:
+        after:
+          description: Optional opaque token from a previous pull-upstream response. Reserved for compatibility with future incremental syncs.
+          type: string
+        ref:
+          description: Optional branch or tag to pull from the configured upstream. Defaults to the repository's tracked default branch.
+          examples:
+            - main
+          type: string
+      type: object
+    ReposUpstreamPullResponse:
+      additionalProperties: false
+      description: Acknowledgement that an upstream sync has been initiated; the sync itself runs asynchronously.
+      properties:
+        message:
+          description: Human-readable status message.
+          examples:
+            - Repository sync initiated successfully
           type: string
       required:
         - message
@@ -2892,290 +3051,15 @@ paths:
         - org:read
       x-requires-repo-scope: false
       x-stability: stable
-  /api/repo-changes:
-    get:
-      description: |-
-        List the latest state of tracked branches changed after the given timestamp, not every change. By default, return regular branches; set `include_ephemeral=true` to include ephemeral branches too. Tags and other namespaces are excluded. Branch refs use `refs/heads/<name>`, with `ephemeral` identifying ephemeral branches. Every item field is present; fields that do not apply are null.
-
-        Scope: `org:read`.
-      operationId: repoChanges-list
-      parameters:
-        - description: RFC3339 timestamp, exclusive. Required without a cursor. Compared with metadata update time; must match the cursor bound if supplied with a cursor.
-          in: query
-          name: changed_after
-          schema:
-            type: string
-        - description: Opaque cursor from the preceding page. Preserves the time bounds and include_ephemeral setting.
-          in: query
-          name: cursor
-          schema:
-            type: string
-        - description: Include ephemeral branch changes alongside regular branch changes. Defaults to false on the first page; inherited from the cursor on subsequent pages. Must match the cursor setting if supplied with a cursor.
-          in: query
-          name: include_ephemeral
-          schema:
-            type: boolean
-        - description: Maximum changes per page, from 1 to 1000. Defaults to 100.
-          in: query
-          name: limit
-          schema:
-            default: 100
-            maximum: 1000
-            minimum: 1
-            type: integer
-      responses:
-        "200":
-          content:
-            application/json:
-              example:
-                changes:
-                  - changed_at: "2026-08-04T00:01:00Z"
-                    ephemeral: false
-                    last_push_at: "2026-08-04T00:00:00Z"
-                    oid: b003fc78805954584e1ee364a4ad39d7c79e819a
-                    ref: refs/heads/main
-                    repo_id: repo_7f2b3d9
-                    repo_name: team/project-alpha
-                    state: ref_updated
-                has_more: true
-                next_changed_after: "2026-08-04T00:02:00Z"
-                next_cursor: MTcwNzU3MzQ1MTAwMDAwMDAwMHxyZXBvXzlhNGMyMWY
-              schema:
-                $ref: "#/components/schemas/RepoChangesListResponse"
-          description: Success
-        "400":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Bad Request
-        "401":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Unauthorized
-        "403":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Forbidden
-        "404":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Not Found
-        "409":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
-        "429":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Too Many Requests
-          headers:
-            RateLimit:
-              description: Current IETF service-limit field. `r=0` means no request is immediately available; `t` is the effective window in seconds before capacity is expected to return.
-              schema:
-                type: string
-            Retry-After:
-              description: Minimum delay before retrying, expressed as seconds or an HTTP date. This value takes precedence over the `RateLimit` effective window.
-              schema:
-                type: string
-        "500":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Internal Server Error
-        "503":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Service Unavailable
-      security:
-        - bearerAuth:
-            - org:read
-      summary: List Repository Changes
-      tags:
-        - Repositories
-      x-permission-scopes:
-        - org:read
-      x-requires-repo-scope: false
-      x-stability: stable
-  /api/repo-urls/{repo_id}:
-    get:
-      description: |-
-        Resolve the repository URL path for an internal repository ID in the current organisation. The returned `url` is the value clients use in the JWT `repo` claim.
-
-        Scope: `org:read`.
-      operationId: get_repo_url_by_id
-      parameters:
-        - description: Internal repository ID to resolve.
-          example: repo_7f2b3d9
-          in: path
-          name: repo_id
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          content:
-            application/json:
-              example:
-                repo_id: repo_7f2b3d9
-                repo_name: team/project-alpha
-                url: team/project-alpha
-              schema:
-                $ref: "#/components/schemas/GetRepoURLByIDResponse"
-          description: Repository URL path resolved from the supplied internal repository ID.
-        "400":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Bad Request
-        "401":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Unauthorized
-        "403":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Forbidden
-        "404":
-          content:
-            application/json:
-              example:
-                code: repository_not_found
-                detail: repository not found
-                error: repository not found
-                instance: /api/repo-urls/repo_7f2b3d9
-                status: 404
-                title: Not Found
-                type: about:blank
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              example:
-                code: repository_not_found
-                detail: repository not found
-                error: repository not found
-                instance: /api/repo-urls/repo_7f2b3d9
-                status: 404
-                title: Not Found
-                type: about:blank
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: No active repository with that ID exists for the current organisation.
-        "409":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
-        "429":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Too Many Requests
-          headers:
-            RateLimit:
-              description: Current IETF service-limit field. `r=0` means no request is immediately available; `t` is the effective window in seconds before capacity is expected to return.
-              schema:
-                type: string
-            Retry-After:
-              description: Minimum delay before retrying, expressed as seconds or an HTTP date. This value takes precedence over the `RateLimit` effective window.
-              schema:
-                type: string
-        "500":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Internal Server Error
-        "503":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Service Unavailable
-      security:
-        - bearerAuth:
-            - org:read
-      summary: Get Repo Url By Id
-      tags:
-        - Repositories
-      x-permission-scopes:
-        - org:read
-      x-requires-repo-scope: false
-      x-stability: stable
   /api/repos:
     get:
       description: |-
-        List repositories for the current organisation with cursor-based pagination. Supply `q` to filter results by a case-insensitive substring match against the repository `url` (for example `pierre/sdk-documentation`).
+        List repositories for the current organisation with cursor-based pagination. Supply `q` to filter results by a case-insensitive substring match against `repo_name` (for example `pierre/sdk-documentation`).
 
         Scope: `org:read`.
       operationId: repos-list
       parameters:
-        - description: Case-insensitive substring to match against the repository `url`. Trimmed before matching. When omitted or empty after trimming, the full repository list is returned.
+        - description: Case-insensitive substring to match against `repo_name`. Trimmed before matching. When omitted or empty after trimming, the full repository list is returned.
           example: sdk
           in: query
           name: q
@@ -3204,19 +3088,13 @@ paths:
                 has_more: true
                 next_cursor: MTcwNzU3MzQ1MTAwMDAwMDAwMHxyZXBvXzlhNGMyMWY
                 repos:
-                  - base_repo:
-                      name: Hello-World
-                      owner: octocat
-                      provider: github
-                    created_at: "2024-01-15T10:30:00Z"
+                  - created_at: "2024-01-15T10:30:00Z"
                     default_branch: main
-                    repo_id: repo_7f2b3d9
                     repo_name: team/project-alpha
                     upstream:
                       name: Hello-World
                       owner: octocat
                       provider: github
-                    url: team/project-alpha
               schema:
                 $ref: "#/components/schemas/ReposListResponse"
           description: A paginated view of repositories in the organisation.
@@ -3338,8 +3216,8 @@ paths:
         Scope: `repo:write` on the repository.
       operationId: repos-create
       parameters:
-        - description: Optional default branch override. When present, it is used if the request body does not already specify one.
-          example: main
+        - deprecated: true
+          description: "Deprecated: use the default_branch body field instead. Default branch for the new repository. When the body also has default_branch, the body value wins."
           in: query
           name: default_branch
           schema:
@@ -3403,9 +3281,7 @@ paths:
           content:
             application/json:
               example:
-                http_url: pierre/sdk-documentation
                 message: repository created
-                repo_id: repo_7f2b3d9
                 repo_name: pierre/sdk-documentation
               schema:
                 $ref: "#/components/schemas/ReposCreateResponse"
@@ -3539,7 +3415,6 @@ paths:
             application/json:
               example:
                 message: Repository pierre/sdk-documentation deletion initiated. Physical storage cleanup will complete asynchronously.
-                repo_id: repo_7f2b3d9
                 repo_name: pierre/sdk-documentation
               schema:
                 $ref: "#/components/schemas/ReposDeleteResponse"
@@ -3670,19 +3545,13 @@ paths:
           content:
             application/json:
               example:
-                base_repo:
-                  name: Hello-World
-                  owner: octocat
-                  provider: github
                 created_at: "2024-01-15T10:30:00Z"
                 default_branch: main
-                repo_id: repo_7f2b3d9
                 repo_name: team/project-alpha
                 upstream:
                   name: Hello-World
                   owner: octocat
                   provider: github
-                url: team/project-alpha
               schema:
                 $ref: "#/components/schemas/Repository"
           description: Repository metadata resolved from the JWT `repo` claim.
@@ -3808,10 +3677,7 @@ paths:
             application/json:
               example:
                 default_branch: main
-                id: repo_7f2b3d9
-                repo_id: repo_7f2b3d9
                 repo_name: pierre/sdk-documentation
-                url: pierre/sdk-documentation
               schema:
                 $ref: "#/components/schemas/ReposUpdateResponse"
           description: Default branch updated. Returns the repository ID, its URL path, and the branch name now recorded as the default.
@@ -4085,11 +3951,16 @@ paths:
       x-stability: stable
   /api/repos/{repo_name}/base:
     delete:
+      deprecated: true
       description: |-
         Detach the repository from its configured upstream provider. The operation is idempotent: already-detached repositories return success.
 
+        `DELETE /api/repos/{repo_name}/upstream` replaces this endpoint. It returns the same responses.
+
         Scope: `repo:write` on the repository.
-      operationId: repos-upstream-delete
+
+        Deprecated: Use `/api/repos/{repo_name}/upstream` instead.
+      operationId: unset_base_repo
       parameters:
         - description: The repository name, for example `acme/web`.
           example: my-demo-repository
@@ -4193,6 +4064,7 @@ paths:
       summary: Unset Base Repo
       tags:
         - Repositories
+      x-deprecation-message: Use `/api/repos/{repo_name}/upstream` instead.
       x-permission-scopes:
         - repo:write
       x-requires-repo-scope: true
@@ -4492,7 +4364,7 @@ paths:
   /api/repos/{repo_name}/branches:
     delete:
       description: |-
-        Delete a branch from the repository. The default branch is protected and cannot be deleted through this endpoint.
+        Delete a branch from the repository. Name the branch with the `target_branch` and `ephemeral` query parameters. The server resolves the current branch tip before deleting, so the caller does not need the branch SHA. The default branch is protected and cannot be deleted through this endpoint.
 
         Scope: `git:write` on the repository.
       operationId: repos-branches-delete
@@ -4504,17 +4376,23 @@ paths:
           required: true
           schema:
             type: string
+        - description: Exact short name of the branch to delete. Must not start with refs/. Required unless the deprecated body names the branch.
+          example: feature/old-onboarding
+          in: query
+          name: target_branch
+          schema:
+            type: string
+        - description: When true, delete the branch from the ephemeral namespace instead of the default namespace.
+          in: query
+          name: ephemeral
+          schema:
+            type: boolean
       requestBody:
         content:
           application/json:
-            example:
-              ephemeral: false
-              name: feature/old-onboarding
-              target_branch: feature/old-onboarding
             schema:
               $ref: "#/components/schemas/ReposBranchesDeleteRequest"
-        description: Delete a branch by name. The server resolves the current branch tip before deleting, so the caller does not need the branch SHA.
-        required: true
+        description: "Deprecated: send the `target_branch` and `ephemeral` query parameters, and no body. A query parameter wins over its body field."
       responses:
         "200":
           content:
@@ -4522,7 +4400,6 @@ paths:
               example:
                 ephemeral: false
                 message: branch deleted
-                name: feature/old-onboarding
                 target_branch: feature/old-onboarding
               schema:
                 $ref: "#/components/schemas/ReposBranchesDeleteResponse"
@@ -4791,8 +4668,8 @@ paths:
         content:
           application/json:
             example:
-              base_branch: main
               base_is_ephemeral: false
+              base_ref: main
               target_branch: feature/new-onboarding
               target_is_ephemeral: false
             schema:
@@ -5102,7 +4979,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use ref instead. Commit SHA, short SHA, branch name, or other revision Git can resolve."
-          example: main
           in: query
           name: sha
           schema:
@@ -5243,6 +5119,25 @@ paths:
               {"blob_chunk":{"content_id":"blob-1","data":"IyBWZXJzaW9uIDIuMS4wCi0gcmVmcmVzaCBkb2NzCg==","eof":true}}
               {"blob_chunk":{"content_id":"blob-2","data":"","eof":true}}
             schema:
+              contentSchema:
+                items:
+                  additionalProperties: false
+                  properties:
+                    blob_chunk:
+                      $ref: "#/components/schemas/BlobChunk"
+                  required:
+                    - blob_chunk
+                  type: object
+                minItems: 1
+                prefixItems:
+                  - additionalProperties: false
+                    properties:
+                      metadata:
+                        $ref: "#/components/schemas/ReposCommitsCreateRequest"
+                    required:
+                      - metadata
+                    type: object
+                type: array
               description: NDJSON stream. The first line must be `metadata`; subsequent lines must be `blob_chunk` payloads. Decoded blob chunks are limited to 4 MiB each.
               type: string
         description: Send newline-delimited JSON where the first line is a `metadata` object and each following line is a `blob_chunk`. This lets you stream file contents without a local Git client.
@@ -5259,12 +5154,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: expected branch head did not match current tip
                   new_sha: ""
                   old_sha: ""
                   status: precondition_failed
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The NDJSON stream was malformed or metadata validation failed.
@@ -5300,12 +5195,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: expected branch head did not match current tip
                   new_sha: ""
                   old_sha: ""
                   status: precondition_failed
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The branch moved or the requested update could not be applied cleanly.
@@ -5314,12 +5209,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: blob chunk size 5242881 exceeds maximum 4194304
                   new_sha: ""
                   old_sha: ""
                   status: payload_too_large
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: A decoded blob chunk exceeded the 4 MiB limit.
@@ -5392,7 +5287,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use ref instead. Optional branch name to list commits from. When omitted, the repository default branch is used."
-          example: main
           in: query
           name: branch
           schema:
@@ -5559,7 +5453,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use ref instead. Commit SHA to diff."
-          example: b003fc78805954584e1ee364a4ad39d7c79e819a
           in: query
           name: sha
           schema:
@@ -5572,7 +5465,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use base_ref instead. Optional base commit SHA to diff against. When omitted, the diff is generated against the commit's parent."
-          example: a4d39d7c79e819ab003fc78805954584e1ee36
           in: query
           name: baseSha
           schema:
@@ -5605,7 +5497,6 @@ paths:
             type: boolean
         - deprecated: true
           description: "Deprecated: use git_apply_compatible instead. When enabled, concatenate `files[].raw` in response order and apply the result against the selected base with `git apply`. Changes listed in `filtered_files` are not included in the patch. Defaults to false, preserving review-oriented whitespace suppression."
-          example: false
           in: query
           name: gitApplyCompatible
           schema:
@@ -5753,6 +5644,25 @@ paths:
               {"diff_chunk":{"data":"ZGlmZiAtLWdpdCBhL1JFQURNRS5tZCBiL1JFQURNRS5tZAo=","eof":false}}
               {"diff_chunk":{"data":"QEAgLTEsMSArMSwyIEBACi1IZWxsbworSGVsbG8gV29ybGQK","eof":true}}
             schema:
+              contentSchema:
+                items:
+                  additionalProperties: false
+                  properties:
+                    diff_chunk:
+                      $ref: "#/components/schemas/DiffChunk"
+                  required:
+                    - diff_chunk
+                  type: object
+                minItems: 1
+                prefixItems:
+                  - additionalProperties: false
+                    properties:
+                      metadata:
+                        $ref: "#/components/schemas/ReposCommitsCreateFromDiffRequest"
+                    required:
+                      - metadata
+                    type: object
+                type: array
               description: NDJSON stream. The first line must be `metadata`; subsequent lines must be `diff_chunk` payloads. Decoded diff chunks are limited to 4 MiB each.
               type: string
         description: Send newline-delimited JSON where the first line is a `metadata` object and each following line is a `diff_chunk`. The combined diff must be compatible with `git apply --cached --binary`.
@@ -5769,12 +5679,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: diff payload could not be decoded
                   new_sha: ""
                   old_sha: ""
                   status: invalid_diff
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The NDJSON stream or diff payload was invalid.
@@ -5810,12 +5720,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: patch does not apply cleanly
                   new_sha: ""
                   old_sha: ""
                   status: conflict
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The diff could not be applied cleanly or the target branch tip changed.
@@ -7131,7 +7041,7 @@ paths:
               query:
                 case_sensitive: true
                 pattern: ephemeral branches
-              rev: main
+              ref: main
             schema:
               $ref: "#/components/schemas/ReposGrepRequest"
         description: Search repository contents by pattern. Optional file filters, context lines, and pagination let you retrieve only the relevant slices for agents and tools.
@@ -7277,7 +7187,6 @@ paths:
                 email: review@example.com
                 name: Review Bot
               expected_target_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
-              source_branch: feature/preview
               source_is_ephemeral: true
               source_ref: feature/preview
               squash: false
@@ -7297,7 +7206,6 @@ paths:
                 promoted_commits: 3
                 result: merged
                 source:
-                  branch: feature/preview
                   ephemeral: true
                   ref: feature/preview
                   sha: 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1
@@ -7576,7 +7484,7 @@ paths:
   /api/repos/{repo_name}/notes:
     delete:
       description: |-
-        Remove the Git note attached to a commit or other Git object SHA.
+        Remove the Git note attached to a commit or other Git object. Name the note with the query parameters of `GET /notes`. The notes commit of the delete has the default author.
 
         Scope: `git:write` on the repository.
       operationId: repos-notes-delete
@@ -7588,21 +7496,30 @@ paths:
           required: true
           schema:
             type: string
+        - description: "Git object whose note should be deleted: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Required unless the deprecated body names the object."
+          example: b003fc78805954584e1ee364a4ad39d7c79e819a
+          in: query
+          name: object_ref
+          schema:
+            type: string
+        - description: Optional notes ref to delete from. A bare name like reviews is placed under refs/notes/; a fully-qualified refs/notes/* ref is also accepted. Defaults to refs/notes/commits.
+          example: refs/notes/commits
+          in: query
+          name: notes_ref
+          schema:
+            type: string
+        - description: "Optional compare-and-swap guard: the notes ref SHA that you read before the delete. The delete fails with 409 when the notes ref has a different SHA."
+          example: 0c8b5bb9d550d58fcfd651a4fdce8024ef7f1492
+          in: query
+          name: expected_notes_ref_sha
+          schema:
+            type: string
       requestBody:
         content:
           application/json:
-            example:
-              author:
-                email: review@example.com
-                name: Review Bot
-              notes_ref: refs/notes/commits
-              object_ref: b003fc78805954584e1ee364a4ad39d7c79e819a
-              ref: refs/notes/commits
-              sha: b003fc78805954584e1ee364a4ad39d7c79e819a
             schema:
-              $ref: "#/components/schemas/NotesWriteRequest"
-        description: Delete the Git note for the supplied SHA. Set `ref` to target a notes ref other than refs/notes/commits; a bare name like `reviews` is accepted and placed under refs/notes/. `note` and `action` are ignored for `DELETE` requests.
-        required: true
+              $ref: "#/components/schemas/ReposNotesDeleteRequest"
+        description: "Deprecated: send the `object_ref`, `notes_ref`, and `expected_notes_ref_sha` query parameters, and no body. A query parameter wins over its body field."
       responses:
         "201":
           content:
@@ -7615,7 +7532,6 @@ paths:
                   status: ok
                   success: true
                 sha: b003fc78805954584e1ee364a4ad39d7c79e819a
-                target_ref: refs/notes/commits
               schema:
                 $ref: "#/components/schemas/NotesWriteResponse"
           description: Note removed from the notes ref.
@@ -7732,7 +7648,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use object_ref instead. Git object SHA whose note should be fetched."
-          example: b003fc78805954584e1ee364a4ad39d7c79e819a
           in: query
           name: sha
           schema:
@@ -7745,7 +7660,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use notes_ref instead. Optional notes ref to read from. Defaults to refs/notes/commits."
-          example: refs/notes/commits
           in: query
           name: ref
           schema:
@@ -7854,10 +7768,10 @@ paths:
       x-stability: stable
     post:
       description: |-
-        Attach text to a Git object without changing the repository contents. Use notes for review markers, internal decisions, or other lightweight context.
+        Attach text to a Git object without changing the repository contents. Use notes for review markers, internal decisions, or other lightweight context. To add text to a note, use `POST /notes/append`.
 
         Scope: `git:write` on the repository.
-      operationId: repos-notes-write
+      operationId: repos-notes-create
       parameters:
         - description: The repository name, for example `acme/web`.
           example: my-demo-repository
@@ -7873,34 +7787,22 @@ paths:
               author:
                 email: review@example.com
                 name: Review Bot
+              note: Reviewed. Ready for production.
               notes_ref: refs/notes/commits
               object_ref: b003fc78805954584e1ee364a4ad39d7c79e819a
-              ref: refs/notes/commits
-              sha: b003fc78805954584e1ee364a4ad39d7c79e819a
             examples:
-              append_note:
-                description: Append new content to an existing note.
-                summary: Append note
-                value:
-                  action: append
-                  author:
-                    email: review@example.com
-                    name: Review Bot
-                  note: Deployment complete.
-                  sha: b003fc78805954584e1ee364a4ad39d7c79e819a
               create_note:
                 description: Create a new note on a commit.
                 summary: Create note
                 value:
-                  action: add
                   author:
                     email: review@example.com
                     name: Review Bot
                   note: Reviewed. Ready for production.
-                  sha: b003fc78805954584e1ee364a4ad39d7c79e819a
+                  object_ref: b003fc78805954584e1ee364a4ad39d7c79e819a
             schema:
-              $ref: "#/components/schemas/NotesWriteRequest"
-        description: Create or append a Git note for the supplied SHA. `add` fails if a note already exists; use `append` to extend one. When `action` is omitted the server behaves as though `add` was supplied. Set `ref` to target a notes ref other than refs/notes/commits; a bare name like `reviews` is accepted and placed under refs/notes/.
+              $ref: "#/components/schemas/ReposNotesCreateRequest"
+        description: "Create a Git note for the supplied `object_ref`. The request fails with 409 if the object already has a note. Set `notes_ref` to target a notes ref other than refs/notes/commits; a bare name like `reviews` is accepted and placed under refs/notes/. The deprecated `action: append` appends, as `POST /notes/append` does."
         required: true
       responses:
         "201":
@@ -7914,7 +7816,6 @@ paths:
                   status: ok
                   success: true
                 sha: b003fc78805954584e1ee364a4ad39d7c79e819a
-                target_ref: refs/notes/commits
               schema:
                 $ref: "#/components/schemas/NotesWriteResponse"
           description: Note update applied to the notes ref.
@@ -8002,7 +7903,7 @@ paths:
       security:
         - bearerAuth:
             - git:write
-      summary: Create or Append Note
+      summary: Create Note
       tags:
         - Notes
       x-permission-scopes:
@@ -8012,6 +7913,151 @@ paths:
           add: repos.notes.create
           append: repos.notes.append
         propertyName: action
+      x-requires-repo-scope: true
+      x-stability: stable
+  /api/repos/{repo_name}/notes/append:
+    post:
+      description: |-
+        Add text to the note on a Git object, or create the note if the object has none. A retry after a success adds the text again. To make a retry safe, set `expected_notes_ref_sha` to the notes ref SHA that you read before the first request: a retry then fails with 409 and adds nothing.
+
+        Scope: `git:write` on the repository.
+      operationId: repos-notes-append
+      parameters:
+        - description: The repository name, for example `acme/web`.
+          example: my-demo-repository
+          in: path
+          name: repo_name
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            example:
+              author:
+                email: review@example.com
+                name: Review Bot
+              note: Deployment complete.
+              notes_ref: refs/notes/commits
+              object_ref: b003fc78805954584e1ee364a4ad39d7c79e819a
+            examples:
+              append_note:
+                description: Add text to the note on a commit.
+                summary: Append note
+                value:
+                  author:
+                    email: review@example.com
+                    name: Review Bot
+                  note: Deployment complete.
+                  object_ref: b003fc78805954584e1ee364a4ad39d7c79e819a
+            schema:
+              $ref: "#/components/schemas/ReposNotesAppendRequest"
+        description: Add text to the Git note of the supplied `object_ref`. If the object has no note, the request creates it. Set `notes_ref` to target a notes ref other than refs/notes/commits; a bare name like `reviews` is accepted and placed under refs/notes/.
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              example:
+                base_commit: 0c8b5bb9d550d58fcfd651a4fdce8024ef7f1492
+                new_ref_sha: 3a1d9f7d6b6d482c970554e2a6ef980ecf4f1d55
+                notes_ref: refs/notes/commits
+                result:
+                  status: ok
+                  success: true
+                sha: b003fc78805954584e1ee364a4ad39d7c79e819a
+              schema:
+                $ref: "#/components/schemas/NotesWriteResponse"
+          description: Note update applied to the notes ref.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Conflict
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Too Many Requests
+          headers:
+            RateLimit:
+              description: Current IETF service-limit field. `r=0` means no request is immediately available; `t` is the effective window in seconds before capacity is expected to return.
+              schema:
+                type: string
+            Retry-After:
+              description: Minimum delay before retrying, expressed as seconds or an HTTP date. This value takes precedence over the `RateLimit` effective window.
+              schema:
+                type: string
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Internal Server Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Service Unavailable
+      security:
+        - bearerAuth:
+            - git:write
+      summary: Append Note
+      tags:
+        - Notes
+      x-permission-scopes:
+        - git:write
       x-requires-repo-scope: true
       x-stability: stable
   /api/repos/{repo_name}/notes/refs:
@@ -8156,11 +8202,16 @@ paths:
       x-stability: stable
   /api/repos/{repo_name}/pull-upstream:
     post:
+      deprecated: true
       description: |-
-        Trigger a sync from the configured upstream of the repository. This only works for repositories that were created with an upstream `base_repo`.
+        Trigger a sync from the configured upstream of the repository. This only works for repositories that have an `upstream`.
+
+        `POST /api/repos/{repo_name}/upstream/pull` replaces this endpoint. It takes the same request body and returns the same response.
 
         Scope: `git:write` on the repository.
-      operationId: repos-pullUpstream
+
+        Deprecated: Use `/api/repos/{repo_name}/upstream/pull` instead.
+      operationId: pull_upstream
       parameters:
         - description: The repository name, for example `acme/web`.
           example: my-demo-repository
@@ -8175,7 +8226,7 @@ paths:
             example:
               ref: main
             schema:
-              $ref: "#/components/schemas/ReposPullUpstreamRequest"
+              $ref: "#/components/schemas/ReposUpstreamPullRequest"
         description: Optional sync hints. Most callers can omit the body entirely and simply trigger the next upstream pull.
       responses:
         "202":
@@ -8184,7 +8235,7 @@ paths:
               example:
                 message: Repository sync initiated successfully
               schema:
-                $ref: "#/components/schemas/ReposPullUpstreamResponse"
+                $ref: "#/components/schemas/ReposUpstreamPullResponse"
           description: Sync trigger accepted. The repository sync runs asynchronously.
         "400":
           content:
@@ -8273,6 +8324,7 @@ paths:
       summary: Pull Upstream
       tags:
         - Repositories
+      x-deprecation-message: Use `/api/repos/{repo_name}/upstream/pull` instead.
       x-permission-scopes:
         - git:write
       x-requires-repo-scope: true
@@ -8300,6 +8352,18 @@ paths:
             example: |
               {"metadata":{"target_branch":"main","base_ref":"abc123def4567890abc123def4567890abc123de","expected_target_sha":"0123456789abcdef0123456789abcdef01234567","commit_message":"Reset branch","author":{"name":"Docs Bot","email":"docs@example.com"}}}
             schema:
+              contentSchema:
+                maxItems: 1
+                minItems: 1
+                prefixItems:
+                  - additionalProperties: false
+                    properties:
+                      metadata:
+                        $ref: "#/components/schemas/ReposCommitsRestoreRequest"
+                    required:
+                      - metadata
+                    type: object
+                type: array
               description: NDJSON stream containing one `metadata` object.
               type: string
         description: Send a single NDJSON metadata line describing the branch to restore and the commit SHA to restore it to. The handler requires this line and rejects an empty body with `400`, even though the published contract leaves it optional.
@@ -8367,12 +8431,12 @@ paths:
               example:
                 commit: null
                 result:
-                  branch: ""
                   message: branch already matches target commit
                   new_sha: ""
                   old_sha: ""
                   status: precondition_failed
                   success: false
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/ReposCommitsRestoreResponse"
           description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`."
@@ -8445,6 +8509,18 @@ paths:
             example: |
               {"metadata":{"target_branch":"main","base_ref":"abc123def4567890abc123def4567890abc123de","expected_target_sha":"0123456789abcdef0123456789abcdef01234567","commit_message":"Reset branch","author":{"name":"Docs Bot","email":"docs@example.com"}}}
             schema:
+              contentSchema:
+                maxItems: 1
+                minItems: 1
+                prefixItems:
+                  - additionalProperties: false
+                    properties:
+                      metadata:
+                        $ref: "#/components/schemas/ReposCommitsRestoreRequest"
+                    required:
+                      - metadata
+                    type: object
+                type: array
               description: NDJSON stream containing one `metadata` object.
               type: string
         description: Send a single NDJSON metadata line describing the branch to restore and the commit SHA to restore it to.
@@ -8507,12 +8583,12 @@ paths:
               example:
                 commit: null
                 result:
-                  branch: ""
                   message: branch already matches target commit
                   new_sha: ""
                   old_sha: ""
                   status: precondition_failed
                   success: false
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/ReposCommitsRestoreResponse"
           description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`."
@@ -8839,7 +8915,6 @@ paths:
             example:
               name: v1.0.0
               ref: main
-              target: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
             schema:
               $ref: "#/components/schemas/ReposTagsCreateRequest"
         description: Create a lightweight tag that points to an exact commit SHA.
@@ -9071,6 +9146,243 @@ paths:
         - git:read
         - git:write
       x-request-validation-profile: delete_tag_by_path
+      x-requires-repo-scope: true
+      x-stability: stable
+  /api/repos/{repo_name}/upstream:
+    delete:
+      description: |-
+        Detach the repository from its configured upstream provider. The operation is idempotent: already-detached repositories return success.
+
+        Scope: `repo:write` on the repository.
+      operationId: repos-upstream-delete
+      parameters:
+        - description: The repository name, for example `acme/web`.
+          example: my-demo-repository
+          in: path
+          name: repo_name
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              example:
+                message: repository detached
+              schema:
+                $ref: "#/components/schemas/ReposUpstreamDeleteResponse"
+          description: Upstream detach result.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              example:
+                message: repository detached
+              schema:
+                $ref: "#/components/schemas/ReposUpstreamDeleteResponse"
+          description: The detach workflow is already in progress or the sync workflow is missing.
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Too Many Requests
+          headers:
+            RateLimit:
+              description: Current IETF service-limit field. `r=0` means no request is immediately available; `t` is the effective window in seconds before capacity is expected to return.
+              schema:
+                type: string
+            Retry-After:
+              description: Minimum delay before retrying, expressed as seconds or an HTTP date. This value takes precedence over the `RateLimit` effective window.
+              schema:
+                type: string
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Internal Server Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Service Unavailable
+      security:
+        - bearerAuth:
+            - repo:write
+      summary: Delete Upstream
+      tags:
+        - Repositories
+      x-permission-scopes:
+        - repo:write
+      x-requires-repo-scope: true
+      x-stability: stable
+  /api/repos/{repo_name}/upstream/pull:
+    post:
+      description: |-
+        Trigger a sync from the configured upstream of the repository. This only works for repositories that have an `upstream`.
+
+        Scope: `git:write` on the repository.
+      operationId: repos-upstream-pull
+      parameters:
+        - description: The repository name, for example `acme/web`.
+          example: my-demo-repository
+          in: path
+          name: repo_name
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            example:
+              ref: main
+            schema:
+              $ref: "#/components/schemas/ReposUpstreamPullRequest"
+        description: Optional sync hints. Most callers can omit the body entirely and simply trigger the next upstream pull.
+      responses:
+        "202":
+          content:
+            application/json:
+              example:
+                message: Repository sync initiated successfully
+              schema:
+                $ref: "#/components/schemas/ReposUpstreamPullResponse"
+          description: Sync trigger accepted. The repository sync runs asynchronously.
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Conflict
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Too Many Requests
+          headers:
+            RateLimit:
+              description: Current IETF service-limit field. `r=0` means no request is immediately available; `t` is the effective window in seconds before capacity is expected to return.
+              schema:
+                type: string
+            Retry-After:
+              description: Minimum delay before retrying, expressed as seconds or an HTTP date. This value takes precedence over the `RateLimit` effective window.
+              schema:
+                type: string
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Internal Server Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: Service Unavailable
+      security:
+        - bearerAuth:
+            - git:write
+      summary: Pull Upstream
+      tags:
+        - Repositories
+      x-permission-scopes:
+        - git:write
       x-requires-repo-scope: true
       x-stability: stable
   /api/v1/repo:
@@ -9358,14 +9670,14 @@ paths:
     get:
       deprecated: true
       description: |-
-        List repositories for the current organisation with cursor-based pagination. Supply `q` to filter results by a case-insensitive substring match against the repository `url` (for example `pierre/sdk-documentation`).
+        List repositories for the current organisation with cursor-based pagination. Supply `q` to filter results by a case-insensitive substring match against `repo_name` (for example `pierre/sdk-documentation`).
 
         Scope: `org:read`.
 
         Deprecated: Use `/api/repos` instead.
       operationId: list_repos_legacy
       parameters:
-        - description: Case-insensitive substring to match against the repository `url`. Trimmed before matching. When omitted or empty after trimming, the full repository list is returned.
+        - description: Case-insensitive substring to match against `repo_name`. Trimmed before matching. When omitted or empty after trimming, the full repository list is returned.
           example: sdk
           in: query
           name: q
@@ -9532,8 +9844,8 @@ paths:
         Deprecated: Use `/api/repos` instead.
       operationId: create_repo_legacy
       parameters:
-        - description: Optional default branch override. When present, it is used if the request body does not already specify one.
-          example: main
+        - deprecated: true
+          description: "Deprecated: use the default_branch body field instead. Default branch for the new repository. When the body also has default_branch, the body value wins."
           in: query
           name: default_branch
           schema:
@@ -9859,9 +10171,11 @@ paths:
       description: |-
         Detach the repository from its configured upstream provider. The operation is idempotent: already-detached repositories return success.
 
+        `DELETE /api/repos/{repo_name}/upstream` replaces this endpoint. It returns the same responses.
+
         Scope: `repo:write` on the repository.
 
-        Deprecated: Use `/api/repos/{repo_name}/base` instead.
+        Deprecated: Use `/api/repos/{repo_name}/upstream` instead.
       operationId: unset_base_repo_legacy
       responses:
         "200":
@@ -9958,7 +10272,7 @@ paths:
       summary: Unset Base Repo
       tags:
         - Repositories
-      x-deprecation-message: Use `/api/repos/{repo_name}/base` instead.
+      x-deprecation-message: Use `/api/repos/{repo_name}/upstream` instead.
       x-permission-scopes:
         - repo:write
       x-requires-repo-scope: true
@@ -10126,12 +10440,24 @@ paths:
     delete:
       deprecated: true
       description: |-
-        Delete a branch from the repository. The default branch is protected and cannot be deleted through this endpoint.
+        Delete a branch from the repository. Name the branch with the `target_branch` and `ephemeral` query parameters. The server resolves the current branch tip before deleting, so the caller does not need the branch SHA. The default branch is protected and cannot be deleted through this endpoint.
 
         Scope: `git:write` on the repository.
 
         Deprecated: Use `/api/repos/{repo_name}/branches` instead.
       operationId: delete_branch_legacy
+      parameters:
+        - description: Exact short name of the branch to delete. Must not start with refs/. Required unless the deprecated body names the branch.
+          example: feature/old-onboarding
+          in: query
+          name: target_branch
+          schema:
+            type: string
+        - description: When true, delete the branch from the ephemeral namespace instead of the default namespace.
+          in: query
+          name: ephemeral
+          schema:
+            type: boolean
       requestBody:
         content:
           application/json:
@@ -10141,8 +10467,7 @@ paths:
               target_branch: feature/old-onboarding
             schema:
               $ref: "#/components/schemas/ReposBranchesDeleteRequest"
-        description: Delete a branch by name. The server resolves the current branch tip before deleting, so the caller does not need the branch SHA.
-        required: true
+        description: "Deprecated: send the `target_branch` and `ephemeral` query parameters, and no body. A query parameter wins over its body field."
       responses:
         "200":
           content:
@@ -10412,8 +10737,8 @@ paths:
         content:
           application/json:
             example:
-              base_branch: main
               base_is_ephemeral: false
+              base_ref: main
               target_branch: feature/new-onboarding
               target_is_ephemeral: false
             schema:
@@ -10713,7 +11038,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use ref instead. Commit SHA, short SHA, branch name, or other revision Git can resolve."
-          example: main
           in: query
           name: sha
           schema:
@@ -10850,6 +11174,25 @@ paths:
               {"blob_chunk":{"content_id":"blob-1","data":"IyBWZXJzaW9uIDIuMS4wCi0gcmVmcmVzaCBkb2NzCg==","eof":true}}
               {"blob_chunk":{"content_id":"blob-2","data":"","eof":true}}
             schema:
+              contentSchema:
+                items:
+                  additionalProperties: false
+                  properties:
+                    blob_chunk:
+                      $ref: "#/components/schemas/BlobChunk"
+                  required:
+                    - blob_chunk
+                  type: object
+                minItems: 1
+                prefixItems:
+                  - additionalProperties: false
+                    properties:
+                      metadata:
+                        $ref: "#/components/schemas/ReposCommitsCreateRequest"
+                    required:
+                      - metadata
+                    type: object
+                type: array
               description: NDJSON stream. The first line must be `metadata`; subsequent lines must be `blob_chunk` payloads. Decoded blob chunks are limited to 4 MiB each.
               type: string
         description: Send newline-delimited JSON where the first line is a `metadata` object and each following line is a `blob_chunk`. This lets you stream file contents without a local Git client.
@@ -10866,12 +11209,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: expected branch head did not match current tip
                   new_sha: ""
                   old_sha: ""
                   status: precondition_failed
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The NDJSON stream was malformed or metadata validation failed.
@@ -10907,12 +11250,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: expected branch head did not match current tip
                   new_sha: ""
                   old_sha: ""
                   status: precondition_failed
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The branch moved or the requested update could not be applied cleanly.
@@ -10921,12 +11264,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: blob chunk size 5242881 exceeds maximum 4194304
                   new_sha: ""
                   old_sha: ""
                   status: payload_too_large
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: A decoded blob chunk exceeded the 4 MiB limit.
@@ -10996,7 +11339,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use ref instead. Optional branch name to list commits from. When omitted, the repository default branch is used."
-          example: main
           in: query
           name: branch
           schema:
@@ -11289,7 +11631,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use ref instead. Commit SHA to diff."
-          example: b003fc78805954584e1ee364a4ad39d7c79e819a
           in: query
           name: sha
           schema:
@@ -11302,7 +11643,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use base_ref instead. Optional base commit SHA to diff against. When omitted, the diff is generated against the commit's parent."
-          example: a4d39d7c79e819ab003fc78805954584e1ee36
           in: query
           name: baseSha
           schema:
@@ -11335,7 +11675,6 @@ paths:
             type: boolean
         - deprecated: true
           description: "Deprecated: use git_apply_compatible instead. When enabled, concatenate `files[].raw` in response order and apply the result against the selected base with `git apply`. Changes listed in `filtered_files` are not included in the patch. Defaults to false, preserving review-oriented whitespace suppression."
-          example: false
           in: query
           name: gitApplyCompatible
           schema:
@@ -11479,6 +11818,25 @@ paths:
               {"diff_chunk":{"data":"ZGlmZiAtLWdpdCBhL1JFQURNRS5tZCBiL1JFQURNRS5tZAo=","eof":false}}
               {"diff_chunk":{"data":"QEAgLTEsMSArMSwyIEBACi1IZWxsbworSGVsbG8gV29ybGQK","eof":true}}
             schema:
+              contentSchema:
+                items:
+                  additionalProperties: false
+                  properties:
+                    diff_chunk:
+                      $ref: "#/components/schemas/DiffChunk"
+                  required:
+                    - diff_chunk
+                  type: object
+                minItems: 1
+                prefixItems:
+                  - additionalProperties: false
+                    properties:
+                      metadata:
+                        $ref: "#/components/schemas/ReposCommitsCreateFromDiffRequest"
+                    required:
+                      - metadata
+                    type: object
+                type: array
               description: NDJSON stream. The first line must be `metadata`; subsequent lines must be `diff_chunk` payloads. Decoded diff chunks are limited to 4 MiB each.
               type: string
         description: Send newline-delimited JSON where the first line is a `metadata` object and each following line is a `diff_chunk`. The combined diff must be compatible with `git apply --cached --binary`.
@@ -11495,12 +11853,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: diff payload could not be decoded
                   new_sha: ""
                   old_sha: ""
                   status: invalid_diff
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The NDJSON stream or diff payload was invalid.
@@ -11536,12 +11894,12 @@ paths:
             application/json:
               example:
                 result:
-                  branch: main
                   message: patch does not apply cleanly
                   new_sha: ""
                   old_sha: ""
                   status: conflict
                   success: false
+                  target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The diff could not be applied cleanly or the target branch tip changed.
@@ -12826,7 +13184,7 @@ paths:
               query:
                 case_sensitive: true
                 pattern: ephemeral branches
-              rev: main
+              ref: main
             schema:
               $ref: "#/components/schemas/ReposGrepRequest"
         description: Search repository contents by pattern. Optional file filters, context lines, and pagination let you retrieve only the relevant slices for agents and tools.
@@ -13266,12 +13624,31 @@ paths:
     delete:
       deprecated: true
       description: |-
-        Remove the Git note attached to a commit or other Git object SHA.
+        Remove the Git note attached to a commit or other Git object. Name the note with the query parameters of `GET /notes`. The notes commit of the delete has the default author.
 
         Scope: `git:write` on the repository.
 
         Deprecated: Use `/api/repos/{repo_name}/notes` instead.
       operationId: notes_delete_legacy
+      parameters:
+        - description: "Git object whose note should be deleted: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Required unless the deprecated body names the object."
+          example: b003fc78805954584e1ee364a4ad39d7c79e819a
+          in: query
+          name: object_ref
+          schema:
+            type: string
+        - description: Optional notes ref to delete from. A bare name like reviews is placed under refs/notes/; a fully-qualified refs/notes/* ref is also accepted. Defaults to refs/notes/commits.
+          example: refs/notes/commits
+          in: query
+          name: notes_ref
+          schema:
+            type: string
+        - description: "Optional compare-and-swap guard: the notes ref SHA that you read before the delete. The delete fails with 409 when the notes ref has a different SHA."
+          example: 0c8b5bb9d550d58fcfd651a4fdce8024ef7f1492
+          in: query
+          name: expected_notes_ref_sha
+          schema:
+            type: string
       requestBody:
         content:
           application/json:
@@ -13284,9 +13661,8 @@ paths:
               ref: refs/notes/commits
               sha: b003fc78805954584e1ee364a4ad39d7c79e819a
             schema:
-              $ref: "#/components/schemas/NotesWriteRequest"
-        description: Delete the Git note for the supplied SHA. Set `ref` to target a notes ref other than refs/notes/commits; a bare name like `reviews` is accepted and placed under refs/notes/. `note` and `action` are ignored for `DELETE` requests.
-        required: true
+              $ref: "#/components/schemas/ReposNotesDeleteRequest"
+        description: "Deprecated: send the `object_ref`, `notes_ref`, and `expected_notes_ref_sha` query parameters, and no body. A query parameter wins over its body field."
       responses:
         "201":
           content:
@@ -13413,7 +13789,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use object_ref instead. Git object SHA whose note should be fetched."
-          example: b003fc78805954584e1ee364a4ad39d7c79e819a
           in: query
           name: sha
           schema:
@@ -13426,7 +13801,6 @@ paths:
             type: string
         - deprecated: true
           description: "Deprecated: use notes_ref instead. Optional notes ref to read from. Defaults to refs/notes/commits."
-          example: refs/notes/commits
           in: query
           name: ref
           schema:
@@ -13537,7 +13911,7 @@ paths:
     post:
       deprecated: true
       description: |-
-        Attach text to a Git object without changing the repository contents. Use notes for review markers, internal decisions, or other lightweight context.
+        Attach text to a Git object without changing the repository contents. Use notes for review markers, internal decisions, or other lightweight context. To add text to a note, use `POST /notes/append`.
 
         Scope: `git:write` on the repository.
 
@@ -13550,34 +13924,24 @@ paths:
               author:
                 email: review@example.com
                 name: Review Bot
+              note: Reviewed. Ready for production.
               notes_ref: refs/notes/commits
               object_ref: b003fc78805954584e1ee364a4ad39d7c79e819a
               ref: refs/notes/commits
               sha: b003fc78805954584e1ee364a4ad39d7c79e819a
             examples:
-              append_note:
-                description: Append new content to an existing note.
-                summary: Append note
-                value:
-                  action: append
-                  author:
-                    email: review@example.com
-                    name: Review Bot
-                  note: Deployment complete.
-                  sha: b003fc78805954584e1ee364a4ad39d7c79e819a
               create_note:
                 description: Create a new note on a commit.
                 summary: Create note
                 value:
-                  action: add
                   author:
                     email: review@example.com
                     name: Review Bot
                   note: Reviewed. Ready for production.
-                  sha: b003fc78805954584e1ee364a4ad39d7c79e819a
+                  object_ref: b003fc78805954584e1ee364a4ad39d7c79e819a
             schema:
-              $ref: "#/components/schemas/NotesWriteRequest"
-        description: Create or append a Git note for the supplied SHA. `add` fails if a note already exists; use `append` to extend one. When `action` is omitted the server behaves as though `add` was supplied. Set `ref` to target a notes ref other than refs/notes/commits; a bare name like `reviews` is accepted and placed under refs/notes/.
+              $ref: "#/components/schemas/ReposNotesCreateRequest"
+        description: "Create a Git note for the supplied `object_ref`. The request fails with 409 if the object already has a note. Set `notes_ref` to target a notes ref other than refs/notes/commits; a bare name like `reviews` is accepted and placed under refs/notes/. The deprecated `action: append` appends, as `POST /notes/append` does."
         required: true
       responses:
         "201":
@@ -13679,7 +14043,7 @@ paths:
       security:
         - bearerAuth:
             - git:write
-      summary: Create or Append Note
+      summary: Create Note
       tags:
         - Notes
       x-deprecation-message: Use `/api/repos/{repo_name}/notes` instead.
@@ -13828,11 +14192,13 @@ paths:
     post:
       deprecated: true
       description: |-
-        Trigger a sync from the configured upstream of the repository. This only works for repositories that were created with an upstream `base_repo`.
+        Trigger a sync from the configured upstream of the repository. This only works for repositories that have an `upstream`.
+
+        `POST /api/repos/{repo_name}/upstream/pull` replaces this endpoint. It takes the same request body and returns the same response.
 
         Scope: `git:write` on the repository.
 
-        Deprecated: Use `/api/repos/{repo_name}/pull-upstream` instead.
+        Deprecated: Use `/api/repos/{repo_name}/upstream/pull` instead.
       operationId: pull_upstream_legacy
       requestBody:
         content:
@@ -13840,7 +14206,7 @@ paths:
             example:
               ref: main
             schema:
-              $ref: "#/components/schemas/ReposPullUpstreamRequest"
+              $ref: "#/components/schemas/ReposUpstreamPullRequest"
         description: Optional sync hints. Most callers can omit the body entirely and simply trigger the next upstream pull.
       responses:
         "202":
@@ -13849,7 +14215,7 @@ paths:
               example:
                 message: Repository sync initiated successfully
               schema:
-                $ref: "#/components/schemas/ReposPullUpstreamResponse"
+                $ref: "#/components/schemas/ReposUpstreamPullResponse"
           description: Sync trigger accepted. The repository sync runs asynchronously.
         "400":
           content:
@@ -13938,7 +14304,7 @@ paths:
       summary: Pull Upstream
       tags:
         - Repositories
-      x-deprecation-message: Use `/api/repos/{repo_name}/pull-upstream` instead.
+      x-deprecation-message: Use `/api/repos/{repo_name}/upstream/pull` instead.
       x-permission-scopes:
         - git:write
       x-requires-repo-scope: true
@@ -13961,6 +14327,18 @@ paths:
             example: |
               {"metadata":{"target_branch":"main","base_ref":"abc123def4567890abc123def4567890abc123de","expected_target_sha":"0123456789abcdef0123456789abcdef01234567","commit_message":"Reset branch","author":{"name":"Docs Bot","email":"docs@example.com"}}}
             schema:
+              contentSchema:
+                maxItems: 1
+                minItems: 1
+                prefixItems:
+                  - additionalProperties: false
+                    properties:
+                      metadata:
+                        $ref: "#/components/schemas/ReposCommitsRestoreRequest"
+                    required:
+                      - metadata
+                    type: object
+                type: array
               description: NDJSON stream containing one `metadata` object.
               type: string
         description: Send a single NDJSON metadata line describing the branch to restore and the commit SHA to restore it to. The handler requires this line and rejects an empty body with `400`, even though the published contract leaves it optional.
@@ -14028,12 +14406,12 @@ paths:
               example:
                 commit: null
                 result:
-                  branch: ""
                   message: branch already matches target commit
                   new_sha: ""
                   old_sha: ""
                   status: precondition_failed
                   success: false
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/ReposCommitsRestoreResponse"
           description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`."
@@ -14102,6 +14480,18 @@ paths:
             example: |
               {"metadata":{"target_branch":"main","base_ref":"abc123def4567890abc123def4567890abc123de","expected_target_sha":"0123456789abcdef0123456789abcdef01234567","commit_message":"Reset branch","author":{"name":"Docs Bot","email":"docs@example.com"}}}
             schema:
+              contentSchema:
+                maxItems: 1
+                minItems: 1
+                prefixItems:
+                  - additionalProperties: false
+                    properties:
+                      metadata:
+                        $ref: "#/components/schemas/ReposCommitsRestoreRequest"
+                    required:
+                      - metadata
+                    type: object
+                type: array
               description: NDJSON stream containing one `metadata` object.
               type: string
         description: Send a single NDJSON metadata line describing the branch to restore and the commit SHA to restore it to.
@@ -14164,12 +14554,12 @@ paths:
               example:
                 commit: null
                 result:
-                  branch: ""
                   message: branch already matches target commit
                   new_sha: ""
                   old_sha: ""
                   status: precondition_failed
                   success: false
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/ReposCommitsRestoreResponse"
           description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`."
