@@ -122,11 +122,11 @@ func forkBody(srcToken string, extra map[string]any) map[string]any {
 // repo_id.
 func forkRequireCreated(t *testing.T, resp *http.Response, body map[string]any) string {
 	t.Helper()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, body %v, want 200", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, body %v, want 201", resp.StatusCode, body)
 	}
 	repoID, _ := body["repo_id"].(string)
-	if repoID == "" || body["message"] != "repository created" {
+	if repoID == "" || body["message"] != repoCreatedMsg(body["repo_name"].(string)) {
 		t.Fatalf("create body = %v", body)
 	}
 	if body["http_url"] != testHTTPBaseURL+"/"+repoID+".git" {
@@ -281,8 +281,8 @@ func TestForkRepo(t *testing.T) {
 			}
 			forkRequireNoRepoRow(t, e, caller.org, caller.url)
 			resp, body = forkDo(t, srv, caller.token, map[string]any{"repo_name": caller.url})
-			if resp.StatusCode != http.StatusOK || body["repo_name"] != caller.url {
-				t.Fatalf("equal repo_name status = %d body %v, want 200", resp.StatusCode, body)
+			if resp.StatusCode != http.StatusCreated || body["repo_name"] != caller.url {
+				t.Fatalf("equal repo_name status = %d body %v, want 201", resp.StatusCode, body)
 			}
 		})
 

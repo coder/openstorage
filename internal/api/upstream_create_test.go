@@ -164,7 +164,7 @@ func TestCreateRepoUpstreamShownOnGet(t *testing.T) {
 		org := e.newOrg(t)
 		repoURL := "team/linked-" + randomHex(t, 4)
 		body := []byte(`{"default_branch":"trunk","upstream":{"provider":"gitea","owner":"own","name":"proj","host":"forge.example.invalid"}}`)
-		created := createRepo(t, e, org, repoURL, body, http.StatusOK)
+		created := createRepo(t, e, org, repoURL, body, http.StatusCreated)
 		want := baseRepoEntry{Provider: "gitea", Owner: "own", Name: "proj"}
 
 		readTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})

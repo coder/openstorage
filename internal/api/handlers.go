@@ -205,6 +205,32 @@ type createRepoResponse struct {
 	Message  string `json:"message"`
 }
 
+// repoCreatedMsg is upstream's ReposCreateResponse message for a 201.
+func repoCreatedMsg(name string) string { return "Repository '" + name + "' created" }
+
+// answerTakenName answers a create whose name is taken (CreateRepo returned
+// meta.ErrAlreadyExists). A live repo is 409, whatever the create form:
+// a fork's repo row is visible before its pack is published, so a 200
+// could name a repo that the failing fork then deletes (issue #388). A
+// soft-deleted or purged repo keeps its name reserved: 404, and nothing is
+// restored. The caller already passed the create route's auth (repo:write,
+// repo claim = this name, the token's org), so the lookup reads nothing
+// outside what that token can see.
+func answerTakenName(w http.ResponseWriter, r *http.Request, store meta.Store,
+	internalErr func(http.ResponseWriter, *http.Request, string, error), org, url string,
+) {
+	assertf(store != nil && internalErr != nil && org != "" && url != "", "answerTakenName: missing inputs")
+	_, err := store.GetRepoByURL(r.Context(), org, url)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "repository "+strconv.Quote(url)+" was deleted, and its name cannot be reused")
+	case err != nil:
+		internalErr(w, r, "get existing repository", err)
+	default:
+		writeErr(w, http.StatusConflict, "repository already exists")
+	}
+}
+
 // handleCreateRepo implements POST /api/v1/repos (scope repo:write). The new
 // repo's url is the JWT `repo` claim; the optional body carries
 // {repo_name?, default_branch?, base_repo?} (docs/reference/http-api.md).
@@ -265,7 +291,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
 	switch {
 	case errors.Is(err, meta.ErrAlreadyExists):
-		writeErr(w, http.StatusConflict, "repository already exists")
+		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url)
 		return
 	case errors.Is(err, meta.ErrNotFound):
 		// Unreachable after successful auth (the org must exist to have
@@ -277,11 +303,11 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
-	writeJSON(w, http.StatusOK, createRepoResponse{
+	writeJSON(w, http.StatusCreated, createRepoResponse{
 		RepoID:   repo.RepoID,
 		RepoName: repo.URL,
 		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
-		Message:  "repository created",
+		Message:  repoCreatedMsg(repo.URL),
 	})
 }
 

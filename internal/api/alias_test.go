@@ -141,7 +141,7 @@ func TestAliasDeleteRepo(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
 		repoURL := "alias/delete-" + randomHex(t, 4)
-		created := createRepo(t, e, org, repoURL, nil, http.StatusOK)
+		created := createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
 
 		resp, body := e.doReq(t, http.MethodDelete, "/api/repos/"+url.PathEscape(repoURL), writeTok, nil, "")

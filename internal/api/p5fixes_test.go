@@ -29,8 +29,8 @@ func testGetRepoIncludesBaseRepo(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	linkedURL := "team/linked-" + randomHex(t, 4)
 	plainURL := "team/plain-" + randomHex(t, 4)
-	linked := createRepo(t, e, org, linkedURL, nil, http.StatusOK)
-	createRepo(t, e, org, plainURL, nil, http.StatusOK)
+	linked := createRepo(t, e, org, linkedURL, nil, http.StatusCreated)
+	createRepo(t, e, org, plainURL, nil, http.StatusCreated)
 	if _, err := e.store.SetRepoUpstream(ctx, meta.RepoUpstream{
 		RepoID: linked.RepoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
 	}); err != nil {
@@ -216,7 +216,7 @@ func testPullUpstreamDefaultsRefToDefaultBranch(t *testing.T, e *testEnv) {
 
 	body := []byte(`{"default_branch":"trunk","base_repo":{"provider":"github","owner":"acme","name":"demo","operation":"sync"}}`)
 	resp, respBody := p5fixReq(t, srv, http.MethodPost, "/api/v1/repos", writeTok, body)
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d (body %s)", resp.StatusCode, respBody)
 	}
 

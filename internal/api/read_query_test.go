@@ -77,7 +77,7 @@ func buildQueryFixture(t *testing.T, e *testEnv) *queryFixture {
 		org:     e.newOrg(t),
 		repoURL: "https://example.com/org/query-" + randomHex(t, 4),
 	}
-	fx.repoID = createRepo(t, e, fx.org, fx.repoURL, nil, http.StatusOK).RepoID
+	fx.repoID = createRepo(t, e, fx.org, fx.repoURL, nil, http.StatusCreated).RepoID
 
 	dir, err := os.MkdirTemp("", "openstorage-query-fixture-*")
 	if err != nil {
@@ -717,7 +717,7 @@ func testQueryBranchesDiffMigration(t *testing.T, e *testEnv) {
 	t.Run("unrelated histories", func(t *testing.T) {
 		org := e.newOrg(t)
 		repoURL := "https://example.com/org/query-orphan-" + randomHex(t, 4)
-		repoID := createRepo(t, e, org, repoURL, nil, http.StatusOK).RepoID
+		repoID := createRepo(t, e, org, repoURL, nil, http.StatusCreated).RepoID
 		dir := t.TempDir()
 		coreGit(t, dir, "init", "-q", "-b", "main", ".")
 		coreWriteFile(t, dir, "shared.txt", "main\n")
@@ -1317,7 +1317,7 @@ func TestQueryUnborn404s(t *testing.T) { runBackends(t, testQueryUnborn404s) }
 func testQueryUnborn404s(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	repoURL := "https://example.com/org/unborn-" + randomHex(t, 4)
-	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+	createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 	tok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
 
 	requests := []struct {

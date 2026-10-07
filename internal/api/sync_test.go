@@ -296,7 +296,7 @@ func (s *usyncStack) createRepo(t *testing.T, repoURL string, body []byte) strin
 	t.Helper()
 	token := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
 	resp, respBody := s.req(t, http.MethodPost, "/api/v1/repos", token, body)
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create repo: status %d: %s", resp.StatusCode, respBody)
 	}
 	var out struct {

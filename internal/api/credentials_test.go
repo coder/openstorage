@@ -253,7 +253,7 @@ func TestCredentialPathIDRoundTrip(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
 		repoURL := "team/credpath-" + randomHex(t, 4)
-		repo := createRepo(t, e, org, repoURL, nil, http.StatusOK)
+		repo := createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 		credID := gcredCreateEnv(t, e, org, repoURL, repo.RepoID)
 		esc := url.PathEscape(repoURL) // the name spans a slash: %2F handling included
 		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
@@ -301,7 +301,7 @@ func TestCredentialPathIDNegatives(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
 		repoURL := "team/credpath-" + randomHex(t, 4)
-		repo := createRepo(t, e, org, repoURL, nil, http.StatusOK)
+		repo := createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 		credID := gcredCreateEnv(t, e, org, repoURL, repo.RepoID)
 		esc := url.PathEscape(repoURL)
 		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
@@ -324,7 +324,7 @@ func TestCredentialPathIDNegatives(t *testing.T) {
 		// A credential attached to ANOTHER repo answers 404 like a missing
 		// one (no cross-repo existence oracle).
 		otherURL := "team/credpath-other-" + randomHex(t, 4)
-		other := createRepo(t, e, org, otherURL, nil, http.StatusOK)
+		other := createRepo(t, e, org, otherURL, nil, http.StatusCreated)
 		otherCred := gcredCreateEnv(t, e, org, otherURL, other.RepoID)
 		resp, body = e.doReq(t, http.MethodPut, "/api/repos/"+esc+"/git-credentials/"+otherCred, writeTok, putBody, "")
 		if resp.StatusCode != http.StatusNotFound {
@@ -392,7 +392,7 @@ func TestCredentialCreateByPathName(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
 		repoURL := "team/credalias-" + randomHex(t, 4)
-		createRepo(t, e, org, repoURL, nil, http.StatusOK)
+		createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
 
 		resp, body := e.doReq(t, http.MethodPost, "/api/repos/"+url.PathEscape(repoURL)+"/git-credentials",
