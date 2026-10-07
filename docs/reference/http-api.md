@@ -129,15 +129,16 @@ about the endpoint's rollout status on upstream clusters.
 
 - A new repository → **201** `Repository '<name>' created`.
 - A sync create (`upstream`, or the `base_repo` sync form) of a name whose repo has the same
-  upstream (provider, host, owner, and name) → **200** `Repository '<name>' already exists`,
-  with the existing `repo_id`. The request's `default_branch`, `forward_pushes`, `auth`, and
-  `ref` are ignored.
+  upstream (provider, host, owner, and name) and the same `forward_pushes` → **200**
+  `Repository '<name>' already exists`, with the existing `repo_id`. The request's
+  `default_branch`, `auth`, and `ref` are ignored.
 - A sync create commits the repo, its upstream, and its credential first, then schedules the
   first sync. If scheduling fails → **503** with `Retry-After`, and the repo stays. A repeat
   of the sync create schedules the missing first sync with the stored settings, then answers
   200. Once the first sync is scheduled, a repeat schedules nothing.
 - Any other live taken name → **409**: a plain, copy, or fork create, a sync create of a repo
-  without an upstream or with a different one, and every name on the S3-WAL backend
+  without an upstream, with a different one, or with a different `forward_pushes`, and every
+  name on the S3-WAL backend
   ([#335](https://github.com/coder/openstorage/issues/335)) or created before this release.
   Upstream answers 200 for most of these. open.storage cannot yet tell a finished fork from
   one still in progress. [#388](https://github.com/coder/openstorage/issues/388) tracks the

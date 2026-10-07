@@ -430,9 +430,10 @@ func (s *syncServer) completeSyncCreate(w http.ResponseWriter, r *http.Request, 
 }
 
 // answerTakenSyncName answers a sync create of a taken name (issue #388).
-// Only a repo with the same upstream (provider, host, owner, name) is
-// compatible; the request's default_branch, forward_pushes, auth and ref
-// are ignored. A pending repo is repaired with its STORED configuration
+// Only a repo with the same upstream (provider, host, owner, name) and the
+// same forward_pushes is compatible: a 200 must not hide that the repo
+// forwards pushes when the caller asked it not to. The request's
+// default_branch, auth and ref are ignored. A pending repo is repaired with its STORED configuration
 // (the first-sync job carries no ref), a complete one schedules nothing.
 func (s *syncServer) answerTakenSyncName(w http.ResponseWriter, r *http.Request, org, url string, want meta.RepoUpstream) {
 	repo, err := s.store.GetRepoByURL(r.Context(), org, url)
@@ -450,6 +451,9 @@ func (s *syncServer) answerTakenSyncName(w http.ResponseWriter, r *http.Request,
 		return
 	case up.Provider != want.Provider || up.UpstreamHost != want.UpstreamHost || up.Owner != want.Owner || up.Name != want.Name:
 		writeErr(w, http.StatusConflict, "repository already exists with a different upstream")
+		return
+	case up.ForwardOnPush != want.ForwardOnPush:
+		writeErr(w, http.StatusConflict, "repository already exists with a different forward_pushes setting")
 		return
 	}
 	if repo.CreateState == meta.CreateStatePending && !s.completeSyncCreate(w, r, org, url, repo.RepoID) {

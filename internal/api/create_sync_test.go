@@ -200,10 +200,18 @@ func TestSyncCreateRepeat(t *testing.T) {
 			if code, _, _ := s.post(t, "sync", syncBody); code != http.StatusCreated {
 				t.Fatalf("sync create = %d", code)
 			}
+			fwd := `{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":"127.0.0.1","forward_pushes":true}}`
+			if code, _, _ := s.post(t, "fwd", fwd); code != http.StatusCreated {
+				t.Fatalf("forwarding sync create = %d", code)
+			}
+			if code, _, _ := s.post(t, "fwd", fwd); code != http.StatusOK {
+				t.Fatalf("same forwarding repeat = %d, want 200", code)
+			}
 			for _, c := range []struct{ name, body string }{
 				{"plain", syncBody}, // no upstream on the existing repo
 				{"sync", `{"upstream":{"provider":"gitea","owner":"o","name":"other","host":"127.0.0.1"}}`},
 				{"sync", `{}`}, // a plain create of a synced repo: 200 only after #388's last PR
+				{"fwd", `{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":"127.0.0.1"}}`},
 			} {
 				if code, _, _ := s.post(t, c.name, c.body); code != http.StatusConflict {
 					t.Fatalf("%s with %s = %d, want 409", c.name, c.body, code)
