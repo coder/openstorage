@@ -111,6 +111,9 @@ about the endpoint's rollout status on upstream clusters.
   - `upstream` has no `forward_pushes`; use the deprecated `base_repo` sync form to opt in.
 - Setting both `upstream` and `base_repo` → 400 (upstream says not to set both and
   documents no error).
+- A sync create (`upstream`, or a `base_repo` sync) with a token whose ref policies carry
+  any op → 403, and nothing is stored or scheduled: the first sync updates refs that those
+  policies cannot police. A plain create with the same token still works.
 - `base_repo` copy (no `provider`, no `operation`): `{name, ref?, auth: {token}}` copies a
   repository on this server once, with no link kept. It runs the fork below: `auth.token`
   needs `git:read` on the source, and `name` must name the repository that token grants
@@ -318,7 +321,8 @@ server shutdown cancels also ends without a terminal event: its request stays pe
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
 a new `repo.sync.started` (outbound: `repo.push_upstream.started`).
 
-**Ref policies fail closed:** any policy op denies both pull-upstream and push-upstream.
+**Ref policies fail closed:** any policy op denies pull-upstream, push-upstream, and a
+sync create at `POST /repos` (403).
 The same gate covers `forward_pushes`: a git push from a token that carries any
 ref-policy op, or lacks git:read, does not trigger the forward, since the forward
 publishes every head and tag, not just the refs that token may touch or read. The write

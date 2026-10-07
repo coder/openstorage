@@ -154,6 +154,77 @@ func TestCreateRepoUpstreamValidation(t *testing.T) {
 	})
 }
 
+// TestCreateRepoSyncRefPolicyDenied (issue #394): a sync create starts a
+// first mirror through the unpoliced loopback token, so a token with any
+// ref policy op gets the same 403 as pull-upstream, before the repo row,
+// the credential and the first sync exist. The same create with an
+// unrestricted token still succeeds.
+func TestCreateRepoSyncRefPolicyDenied(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		s := newUsyncStack(t, e)
+		upRoot := t.TempDir()
+		forge := usyncCGIServer(t, upRoot, func(*http.Request) bool { return true }, false)
+		usyncSeedUpstream(t, upRoot, "octo", "hello")
+
+		// A plain create (no sync link) with a policed token is unchanged.
+		plainURL := "team/plain-" + randomHex(t, 4)
+		plainTok := s.e.mint(t, tokenSpec{iss: s.org, repo: plainURL,
+			scopes: []string{auth.ScopeRepoWrite}, refs: `[["main", ["no-push"]]]`})
+		if resp, respBody := s.req(t, http.MethodPost, "/api/v1/repos", plainTok, nil); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("policed plain create status %d: %s", resp.StatusCode, respBody)
+		}
+
+		cases := []struct {
+			name, op string
+			body     map[string]any
+		}{
+			{"upstream", "no-force-push", map[string]any{"upstream": map[string]any{
+				"provider": "gitea", "owner": "octo", "name": "hello", "host": forge.URL,
+			}}},
+			{"base_repo", "verify-sig", map[string]any{"base_repo": map[string]any{
+				"provider": "gitea", "owner": "octo", "name": "hello", "upstream_host": forge.URL,
+				"auth": map[string]any{"token": "upstream-secret"},
+			}}},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				repoURL := "team/policed-" + randomHex(t, 4)
+				body, err := json.Marshal(c.body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				policed := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL,
+					scopes: []string{auth.ScopeRepoWrite}, refs: `[["main", ["` + c.op + `"]]]`})
+				resp, respBody := s.req(t, http.MethodPost, "/api/v1/repos", policed, body)
+				if resp.StatusCode != http.StatusForbidden {
+					t.Fatalf("policed create status %d: %s", resp.StatusCode, respBody)
+				}
+				if msg := requireEnvelope(t, resp, respBody); msg != `ref policy op "`+c.op+`" denies sync repository create` {
+					t.Fatalf("policed create error = %q", msg)
+				}
+				if _, err := e.store.GetRepoByURL(context.Background(), s.org, repoURL); !errors.Is(err, meta.ErrNotFound) {
+					t.Fatalf("repo %q exists after denied create (err %v)", repoURL, err)
+				}
+				s.assertNoEvent(t)
+
+				// The same create without ref policies is unchanged.
+				repoID := s.createRepo(t, repoURL, body)
+				if started := s.waitEvent(t, upsync.EventSyncStarted); started.Repository.ID != repoID || !started.IsFirstSync {
+					t.Fatalf("bad started event: %+v", started)
+				}
+				s.waitEvent(t, upsync.EventSyncSucceeded)
+				if _, err := s.mem.GetUpstream(context.Background(), repoID); err != nil {
+					t.Fatalf("upstream row: %v", err)
+				}
+				_, err = s.mem.CredentialForRepo(context.Background(), repoID)
+				if wantCred := c.name == "base_repo"; wantCred != (err == nil) {
+					t.Fatalf("credential for repo: err %v, want stored=%v", err, wantCred)
+				}
+			})
+		}
+	})
+}
+
 // TestCreateRepoUpstreamShownOnGet runs through the full api.New stack
 // (fork dispatcher included): a repo created with `upstream` reports it on
 // GET /repo, the named-repo alias, and GET /repos, with base_repo kept as
