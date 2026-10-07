@@ -29,8 +29,8 @@ func testGetRepoIncludesBaseRepo(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	linkedURL := "team/linked-" + randomHex(t, 4)
 	plainURL := "team/plain-" + randomHex(t, 4)
-	linked := createRepo(t, e, org, linkedURL, nil, http.StatusOK)
-	createRepo(t, e, org, plainURL, nil, http.StatusOK)
+	linked := createRepo(t, e, org, linkedURL, nil, http.StatusCreated)
+	createRepo(t, e, org, plainURL, nil, http.StatusCreated)
 	if _, err := e.store.SetRepoUpstream(ctx, meta.RepoUpstream{
 		RepoID: linked.RepoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
 	}); err != nil {

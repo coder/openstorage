@@ -17,7 +17,7 @@ components:
           description: Authentication for the source repository. A copy requires auth.token.
         default_branch:
           deprecated: true
-          description: "Deprecated: use the top-level default_branch for a copy, and upstream.branch for a sync."
+          description: "Deprecated: use the top-level default_branch for a copy or a sync."
           type: string
         name:
           description: Name of the Code Storage repository to copy. In the deprecated form, the repository name on the provider.
@@ -1723,9 +1723,9 @@ components:
             - pierre/sdk-documentation
           type: string
         message:
-          description: High-level creation result.
+          description: "Human-readable result: the repository was created, or it already exists. The status gives the same result: 201 or 200."
           examples:
-            - repository created
+            - Repository 'pierre/sdk-documentation' created
           type: string
         repo_id:
           deprecated: true
@@ -3211,6 +3211,8 @@ paths:
 
         A repository starts empty or from a source. `base_repo` is a one-time copy of a Code Storage repository; `upstream` is a lasting link to an external Git host. A copy takes the history of one commit (`base_repo.ref`, or the source HEAD) into one branch, and keeps no link to its source. A sync keeps its upstream, and the repository can sync from it again. Set at most one of the two.
 
+        Create is idempotent on the repository name. A new repository returns `201`. When the name already exists, the request returns `200`, and a copy copies nothing. When the name exists with a different upstream, the request returns `409`.
+
         The deprecated form of `base_repo`, with `provider` and `operation`, still works.
 
         Scope: `repo:write` on the repository.
@@ -3281,11 +3283,20 @@ paths:
           content:
             application/json:
               example:
-                message: repository created
+                message: Repository 'pierre/sdk-documentation' already exists
                 repo_name: pierre/sdk-documentation
               schema:
                 $ref: "#/components/schemas/ReposCreateResponse"
-          description: Repository created successfully.
+          description: The repository already existed, and the request created nothing.
+        "201":
+          content:
+            application/json:
+              example:
+                message: Repository 'pierre/sdk-documentation' created
+                repo_name: pierre/sdk-documentation
+              schema:
+                $ref: "#/components/schemas/ReposCreateResponse"
+          description: The request created the repository.
         "400":
           content:
             application/json:
@@ -9837,6 +9848,8 @@ paths:
 
         A repository starts empty or from a source. `base_repo` is a one-time copy of a Code Storage repository; `upstream` is a lasting link to an external Git host. A copy takes the history of one commit (`base_repo.ref`, or the source HEAD) into one branch, and keeps no link to its source. A sync keeps its upstream, and the repository can sync from it again. Set at most one of the two.
 
+        Create is idempotent on the repository name. A new repository returns `201`. When the name already exists, the request returns `200`, and a copy copies nothing. When the name exists with a different upstream, the request returns `409`.
+
         The deprecated form of `base_repo`, with `provider` and `operation`, still works.
 
         Scope: `repo:write` on the repository.
@@ -9909,13 +9922,22 @@ paths:
           content:
             application/json:
               example:
+                message: Repository 'pierre/sdk-documentation' already exists
+                repo_name: pierre/sdk-documentation
+              schema:
+                $ref: "#/components/schemas/ReposCreateResponse"
+          description: The repository already existed, and the request created nothing.
+        "201":
+          content:
+            application/json:
+              example:
                 http_url: pierre/sdk-documentation
-                message: repository created
+                message: Repository 'pierre/sdk-documentation' created
                 repo_id: repo_7f2b3d9
                 repo_name: pierre/sdk-documentation
               schema:
                 $ref: "#/components/schemas/ReposCreateResponse"
-          description: Repository created successfully.
+          description: The request created the repository.
         "400":
           content:
             application/json:

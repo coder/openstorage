@@ -208,42 +208,26 @@ type createRepoResponse struct {
 // repoCreatedMsg is upstream's ReposCreateResponse message for a 201.
 func repoCreatedMsg(name string) string { return "Repository '" + name + "' created" }
 
-// repoExistsConflictMsg is the 409 for a create whose name a live repo
-// without a matching upstream holds.
-const repoExistsConflictMsg = "repository already exists"
-
-// liveExistingRepo starts every POST /repos answer for a taken name
-// (CreateRepo returned meta.ErrAlreadyExists). It returns the live repo, or
-// writes the answer itself: 404 when a soft-deleted or purged repo holds
-// the name (it stays reserved, and nothing is restored), 500 on a store
-// error. The caller already passed the create route's auth (repo:write,
-// repo claim = this name, the token's org), so nothing it reads is
+// answerTakenName answers a create whose name is taken (CreateRepo returned
+// meta.ErrAlreadyExists). A live repo is 409, whatever the create form:
+// a fork's repo row is visible before its pack is published, so a 200
+// could name a repo that the failing fork then deletes (issue #388). A
+// soft-deleted or purged repo keeps its name reserved: 404, and nothing is
+// restored. The caller already passed the create route's auth (repo:write,
+// repo claim = this name, the token's org), so the lookup reads nothing
 // outside what that token can see.
-func liveExistingRepo(w http.ResponseWriter, r *http.Request, store meta.Store,
-	internalErr func(http.ResponseWriter, *http.Request, string, error), org, url string,
-) (meta.Repo, bool) {
-	assertf(store != nil && internalErr != nil && org != "" && url != "", "liveExistingRepo: missing inputs")
-	repo, err := store.GetRepoByURL(r.Context(), org, url)
-	switch {
-	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository "+strconv.Quote(url)+" was deleted, and its name cannot be reused")
-		return meta.Repo{}, false
-	case err != nil:
-		internalErr(w, r, "get existing repository", err)
-		return meta.Repo{}, false
-	}
-	return repo, true
-}
-
-// answerTakenName answers a plain, copy, or fork create of a taken name.
-// A live repo is 409 even without an upstream: a fork's repo row is
-// visible before its pack is published, so a 200 here could name a repo
-// that the failing fork then deletes (issue #388).
 func answerTakenName(w http.ResponseWriter, r *http.Request, store meta.Store,
 	internalErr func(http.ResponseWriter, *http.Request, string, error), org, url string,
 ) {
-	if _, ok := liveExistingRepo(w, r, store, internalErr, org, url); ok {
-		writeErr(w, http.StatusConflict, repoExistsConflictMsg)
+	assertf(store != nil && internalErr != nil && org != "" && url != "", "answerTakenName: missing inputs")
+	_, err := store.GetRepoByURL(r.Context(), org, url)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "repository "+strconv.Quote(url)+" was deleted, and its name cannot be reused")
+	case err != nil:
+		internalErr(w, r, "get existing repository", err)
+	default:
+		writeErr(w, http.StatusConflict, "repository already exists")
 	}
 }
 

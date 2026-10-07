@@ -78,7 +78,7 @@ about the endpoint's rollout status on upstream clusters.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
+| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 409 = a live repo holds the name; 404 = a deleted repo holds the name (below). |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
@@ -124,6 +124,16 @@ about the endpoint's rollout status on upstream clusters.
 - `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
   run after every won local push. It also inverts the sync conflict rule: local wins, and
   inbound syncs never force-rewind local refs. See [Upstream sync](#upstream-sync).
+
+**Repeat creates** (upstream spec 2026-10-07; open.storage covers part of it, see [#388](https://github.com/coder/openstorage/issues/388)):
+
+- A new repository → **201** `Repository '<name>' created`.
+- A live repo already holds the name → **409** `repository already exists`, for every create
+  form (plain, `upstream` sync, `base_repo` copy or fork), even for an identical request.
+  Upstream answers 200 unless the upstream differs. open.storage cannot yet tell a finished
+  repo from a create that is still in progress, so a 200 could name a repo that the failing
+  create then deletes. [#388](https://github.com/coder/openstorage/issues/388) tracks the fix.
+- A deleted repo keeps its name → **404**. Nothing is restored.
 
 **`PATCH /repo` rules:**
 
