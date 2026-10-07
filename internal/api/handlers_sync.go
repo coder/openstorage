@@ -230,7 +230,8 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 
 	// docs/reference/authentication.md: ref policies apply to every HTTP write endpoint; malformed
 	// policy claims fail closed exactly like the frozen create handler.
-	if _, err := refPolicies(claims); err != nil {
+	policies, err := refPolicies(claims)
+	if err != nil {
 		writeErr(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -283,6 +284,14 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	if spec != nil {
 		assertf(upstreamHost != "" && hostField != "", "create: validated sync spec without host")
+		// Issue #394: the first sync mirror-pushes through the unpoliced
+		// loopback token exactly like pull-upstream, so the same refusal
+		// applies here, before the repo row, the credential and the first
+		// sync exist.
+		if op, denied := policyDeniesPullUpstream(policies); denied {
+			writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies sync repository create")
+			return
+		}
 		// Registration-time egress courtesy check (issue #139), mirroring
 		// webhook CheckRegistration: fast feedback for upstream hosts the
 		// pull lane's dial-time vetting proxy would deny anyway, before any
