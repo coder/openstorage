@@ -37,10 +37,14 @@ import (
 // dependencies — a sibling of `server` because that struct is a frozen
 // contract for this slice.
 type syncServer struct {
-	store       meta.Store
-	creds       upsync.CredentialStore
-	ups         upsync.UpstreamStore
-	queue       upsync.Queue
+	store meta.Store
+	creds upsync.CredentialStore
+	ups   upsync.UpstreamStore
+	queue upsync.Queue
+	// firstSync is the queue's first-sync scheduler when the store tracks
+	// create state (issue #388); nil on S3-WAL (#335), which keeps the
+	// legacy sync create and answers 409 for every taken name.
+	firstSync   upsync.FirstSyncScheduler
 	httpBaseURL string // no trailing slash; POST /repos response http_url
 	// guard runs the registration-time egress courtesy check on base_repo
 	// upstream_host (issue #139), configured with the effective pull-lane
@@ -56,11 +60,16 @@ func newSyncServer(store meta.Store, creds upsync.CredentialStore, ups upsync.Up
 	assertf(queue != nil, "newSyncServer: nil queue")
 	assertf(httpBaseURL != "", "newSyncServer: empty httpBaseURL")
 	assertf(logger != nil, "newSyncServer: nil logger")
+	firstSync, _ := queue.(upsync.FirstSyncScheduler)
+	if firstSync != nil && !firstSync.TracksCreateState() {
+		firstSync = nil
+	}
 	return &syncServer{
 		store:       store,
 		creds:       creds,
 		ups:         ups,
 		queue:       queue,
+		firstSync:   firstSync,
 		httpBaseURL: httpBaseURL,
 		guard:       guard,
 		logger:      logger,

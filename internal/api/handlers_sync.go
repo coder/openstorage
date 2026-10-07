@@ -313,15 +313,30 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var repo meta.Repo
-	if spec == nil {
-		// A plain create finishes at insert (issue #388). A sync create
-		// stays legacy (never treated as complete) until its first-sync
-		// schedule is tracked.
+	tracked := spec != nil && s.firstSync != nil
+	var link meta.RepoUpstream
+	switch {
+	case spec == nil:
+		// A plain create finishes at insert (issue #388).
 		repo, err = s.store.CreateRepoWithState(r.Context(), claims.Iss, url, branch, meta.CreateStateComplete)
-	} else {
+	case tracked:
+		// Repo, upstream, and credential in one write, pending until the
+		// first sync is scheduled (issue #388).
+		link = meta.RepoUpstream{Provider: spec.Provider, Owner: spec.Owner, Name: spec.Name,
+			UpstreamHost: upstreamHost, ForwardOnPush: spec.ForwardPushes}
+		var cred *meta.GitCredential
+		if spec.Auth != nil && spec.Auth.Token != "" {
+			cred = &meta.GitCredential{Password: spec.Auth.Token}
+		}
+		repo, err = s.linked().CreateLinkedRepo(r.Context(), claims.Iss, url, branch, link, cred)
+	default:
+		// The store tracks no create state (S3-WAL): legacy rows, 409.
 		repo, err = s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
 	}
 	switch {
+	case errors.Is(err, meta.ErrAlreadyExists) && tracked:
+		s.answerTakenSyncName(w, r, claims.Iss, url, link)
+		return
 	case errors.Is(err, meta.ErrAlreadyExists):
 		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url)
 		return
@@ -334,7 +349,11 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
 
-	if spec != nil {
+	if tracked {
+		if !s.completeSyncCreate(w, r, claims.Iss, url, repo.RepoID) {
+			return
+		}
+	} else if spec != nil {
 		// Order matters: the credential must exist before the first sync
 		// run can start (the queue spawns the worker immediately). Each
 		// post-create failure abandons the fresh repo row (docs/archive/phases/14-phase5-implementation-notes.md
@@ -378,6 +397,69 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		RepoName: repo.URL,
 		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
 		Message:  repoCreatedMsg(repo.URL),
+	})
+}
+
+// linked is the store's atomic linked create. Every store that tracks
+// create state (PostgreSQL, SQLite) is an EventingStore.
+func (s *syncServer) linked() meta.EventingStore {
+	es, ok := s.store.(meta.EventingStore)
+	assertf(ok, "sync create: store %T tracks create state but is not an EventingStore", s.store)
+	return es
+}
+
+// completeSyncCreate schedules a pending sync create's first sync and
+// marks it complete (issue #388). It reports whether the caller may answer
+// success; otherwise it wrote the error. A scheduling failure keeps every
+// row and answers 503: a compatible retry repairs the pending create. A
+// delete that landed first answers 404, never success.
+func (s *syncServer) completeSyncCreate(w http.ResponseWriter, r *http.Request, org, url, repoID string) bool {
+	out, err := s.firstSync.CompleteSyncCreate(r.Context(), org, repoID)
+	switch {
+	case err == nil && out == meta.CreateDeleted:
+		writeErr(w, http.StatusNotFound, repoDeletedMsg(url))
+		return false
+	case err != nil: // includes a concurrently detached upstream (ErrNotFound)
+		s.logger.Error("schedule first sync; the repository stays pending", "org", org, "repo_id", repoID, "err", err)
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusServiceUnavailable, "the repository exists, but its first sync could not be scheduled; retry the create")
+		return false
+	}
+	assertf(out == meta.CreateCompleted || out == meta.CreateAlreadyComplete, "CompleteSyncCreate outcome %d", out)
+	return true
+}
+
+// answerTakenSyncName answers a sync create of a taken name (issue #388).
+// Only a repo with the same upstream (provider, host, owner, name) is
+// compatible; the request's default_branch, forward_pushes, auth and ref
+// are ignored. A pending repo is repaired with its STORED configuration
+// (the first-sync job carries no ref), a complete one schedules nothing.
+func (s *syncServer) answerTakenSyncName(w http.ResponseWriter, r *http.Request, org, url string, want meta.RepoUpstream) {
+	repo, err := s.store.GetRepoByURL(r.Context(), org, url)
+	if err != nil {
+		answerTakenName(w, r, s.store, s.internalErr, org, url) // 404 deleted, or 500
+		return
+	}
+	up, err := s.ups.GetUpstream(r.Context(), repo.RepoID)
+	switch {
+	case errors.Is(err, upsync.ErrNotFound) || repo.CreateState == meta.CreateStateLegacy:
+		writeErr(w, http.StatusConflict, "repository already exists")
+		return
+	case err != nil:
+		s.internalErr(w, r, "get existing upstream", err)
+		return
+	case up.Provider != want.Provider || up.UpstreamHost != want.UpstreamHost || up.Owner != want.Owner || up.Name != want.Name:
+		writeErr(w, http.StatusConflict, "repository already exists with a different upstream")
+		return
+	}
+	if repo.CreateState == meta.CreateStatePending && !s.completeSyncCreate(w, r, org, url, repo.RepoID) {
+		return
+	}
+	writeJSON(w, http.StatusOK, createRepoResponse{
+		RepoID:   repo.RepoID,
+		RepoName: repo.URL,
+		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
+		Message:  "Repository '" + repo.URL + "' already exists",
 	})
 }
 

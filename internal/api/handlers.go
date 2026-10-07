@@ -208,6 +208,10 @@ type createRepoResponse struct {
 // repoCreatedMsg is upstream's ReposCreateResponse message for a 201.
 func repoCreatedMsg(name string) string { return "Repository '" + name + "' created" }
 
+func repoDeletedMsg(url string) string {
+	return "repository " + strconv.Quote(url) + " was deleted, and its name cannot be reused"
+}
+
 // answerTakenName answers a create whose name is taken (CreateRepo returned
 // meta.ErrAlreadyExists). A live repo is 409, whatever the create form:
 // a fork's repo row is visible before its pack is published, so a 200
@@ -223,7 +227,7 @@ func answerTakenName(w http.ResponseWriter, r *http.Request, store meta.Store,
 	_, err := store.GetRepoByURL(r.Context(), org, url)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository "+strconv.Quote(url)+" was deleted, and its name cannot be reused")
+		writeErr(w, http.StatusNotFound, repoDeletedMsg(url))
 	case err != nil:
 		internalErr(w, r, "get existing repository", err)
 	default:

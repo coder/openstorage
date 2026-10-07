@@ -78,7 +78,7 @@ about the endpoint's rollout status on upstream clusters.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 409 = a live repo holds the name; 404 = a deleted repo holds the name (below). |
+| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 200 = a sync create of a repo with the same upstream; 409 = any other live taken name; 404 = a deleted repo holds the name; 503 = first sync not scheduled, retry (below). |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
@@ -128,12 +128,22 @@ about the endpoint's rollout status on upstream clusters.
 **Repeat creates** (upstream spec 2026-10-07; open.storage covers part of it, see [#388](https://github.com/coder/openstorage/issues/388)):
 
 - A new repository → **201** `Repository '<name>' created`.
-- A live repo already holds the name → **409** `repository already exists`, for every create
-  form (plain, `upstream` sync, `base_repo` copy or fork), even for an identical request.
-  Upstream answers 200 unless the upstream differs. open.storage cannot yet tell a finished
-  repo from a create that is still in progress, so a 200 could name a repo that the failing
-  create then deletes. [#388](https://github.com/coder/openstorage/issues/388) tracks the fix.
-- A deleted repo keeps its name → **404**. Nothing is restored.
+- A sync create (`upstream`, or the `base_repo` sync form) of a name whose repo has the same
+  upstream (provider, host, owner, and name) → **200** `Repository '<name>' already exists`,
+  with the existing `repo_id`. The request's `default_branch`, `forward_pushes`, `auth`, and
+  `ref` are ignored.
+- A sync create commits the repo, its upstream, and its credential first, then schedules the
+  first sync. If scheduling fails → **503** with `Retry-After`, and the repo stays. A repeat
+  of the sync create schedules the missing first sync with the stored settings, then answers
+  200. Once the first sync is scheduled, a repeat schedules nothing.
+- Any other live taken name → **409**: a plain, copy, or fork create, a sync create of a repo
+  without an upstream or with a different one, and every name on the S3-WAL backend
+  ([#335](https://github.com/coder/openstorage/issues/335)) or created before this release.
+  Upstream answers 200 for most of these. open.storage cannot yet tell a finished fork from
+  one still in progress. [#388](https://github.com/coder/openstorage/issues/388) tracks the
+  rest.
+- A deleted repo keeps its name → **404**. Nothing is restored. A sync create whose repo is
+  deleted before its first sync is scheduled also answers 404.
 
 **`PATCH /repo` rules:**
 
