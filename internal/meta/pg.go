@@ -316,8 +316,18 @@ func (s *PG) CreateRepo(ctx context.Context, org, url, defaultBranch string) (Re
 	if err != nil {
 		return Repo{}, err
 	}
+	return pgInsertRepo(ctx, s.pool, org, orgID, url, defaultBranch)
+}
+
+// pgQueryRower is the QueryRow method *pgxpool.Pool and pgx.Tx share, so
+// an insert runs alone or inside CreateLinkedRepo's transaction.
+type pgQueryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func pgInsertRepo(ctx context.Context, q pgQueryRower, org string, orgID int64, url, defaultBranch string) (Repo, error) {
 	r := Repo{RepoID: newRepoID(), OrgID: orgID, URL: url, DefaultBranch: defaultBranch}
-	err = s.pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`INSERT INTO repos (repo_id, org_id, url, default_branch) VALUES ($1, $2, $3, $4)
 		 RETURNING created_at`,
 		r.RepoID, orgID, url, defaultBranch).Scan(&r.CreatedAt)

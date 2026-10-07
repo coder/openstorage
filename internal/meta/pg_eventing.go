@@ -201,6 +201,10 @@ func (s *PG) DeleteWebhook(ctx context.Context, org, id string) error {
 // ErrAlreadyExists when the repo already has a credential; ErrReservedSecret
 // when the password starts with the reserved envelope prefix.
 func (s *PG) CreateGitCredential(ctx context.Context, cred GitCredential) (GitCredential, error) {
+	return s.createGitCredential(ctx, s.pool, cred)
+}
+
+func (s *PG) createGitCredential(ctx context.Context, q pgQueryRower, cred GitCredential) (GitCredential, error) {
 	assertf(cred.RepoID != "", "CreateGitCredential: empty repo id")
 	stored, err := encodeSecret(s.codec, cred.Password)
 	if err != nil {
@@ -214,7 +218,7 @@ func (s *PG) CreateGitCredential(ctx context.Context, cred GitCredential) (GitCr
 	// a purged repository. The row lock totally orders the insert against
 	// SoftDeleteRepo/PurgeRepoMeta — it either commits while the repo is
 	// live (the purge then deletes it) or re-evaluates to zero rows.
-	err = s.pool.QueryRow(ctx,
+	err = q.QueryRow(ctx,
 		`INSERT INTO git_credentials (id, repo_id, username, password)
 		 SELECT $1, $2, $3, $4
 		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = $2 AND deleted_at IS NULL FOR UPDATE)
@@ -330,6 +334,43 @@ func (s *PG) GitCredentialForRepo(ctx context.Context, repoID string) (GitCreden
 // counters/syncing/sync_pending/claim lease zeroed). ErrAlreadyExists when
 // the repo already has one.
 func (s *PG) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream, error) {
+	return pgSetRepoUpstream(ctx, s.pool, up)
+}
+
+// CreateLinkedRepo runs CreateRepo, CreateGitCredential and
+// SetRepoUpstream in one transaction (meta.EventingStore contract). A
+// concurrent insert of the same (org, url) blocks on the unique index
+// until this commits, so its conflict path reads the upstream too.
+func (s *PG) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch string, up RepoUpstream, cred *GitCredential) (Repo, error) {
+	assertf(url != "" && defaultBranch != "", "CreateLinkedRepo: empty url %q or default branch %q", url, defaultBranch)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	var repo Repo
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		if repo, err = pgInsertRepo(ctx, tx, org, orgID, url, defaultBranch); err != nil {
+			return err
+		}
+		if cred != nil {
+			c := *cred
+			c.RepoID = repo.RepoID
+			if _, err := s.createGitCredential(ctx, tx, c); err != nil {
+				return err
+			}
+		}
+		up.RepoID = repo.RepoID
+		_, err = pgSetRepoUpstream(ctx, tx, up)
+		return err
+	})
+	if err != nil {
+		return Repo{}, err
+	}
+	return repo, nil
+}
+
+func pgSetRepoUpstream(ctx context.Context, q pgQueryRower, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
@@ -338,7 +379,7 @@ func (s *PG) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream
 	// Live-repo guard with FOR UPDATE — see CreateGitCredential (issue
 	// #52, PR #105 round 6): no upstream link may attach to a deleted or
 	// purged repository.
-	err := s.pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host, forward_on_push)
 		 SELECT $1, $2, $3, $4, $5, $6
 		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = $1 AND deleted_at IS NULL FOR UPDATE)

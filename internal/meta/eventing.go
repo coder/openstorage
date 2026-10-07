@@ -184,6 +184,13 @@ type EventingStore interface {
 	// store; RunCount/SuccessCount/Syncing start zeroed). ErrAlreadyExists
 	// when the repo already has one (base_repo is set exactly once).
 	SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream, error)
+	// CreateLinkedRepo is CreateRepo plus SetRepoUpstream (and
+	// CreateGitCredential when cred is non-nil) in one atomic write, so no
+	// reader sees the repo before its upstream link (issue #387: a
+	// concurrent create of the same name compares upstreams). The store
+	// assigns every ID; caller-set RepoIDs are ignored. ErrAlreadyExists
+	// when (org, url) is taken, and then nothing is written.
+	CreateLinkedRepo(ctx context.Context, org, url, defaultBranch string, up RepoUpstream, cred *GitCredential) (Repo, error)
 	// GetRepoUpstream returns the row; ErrNotFound when detached/never linked.
 	GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstream, error)
 	// DeleteRepoUpstream detaches the repo; ErrNotFound when already detached.

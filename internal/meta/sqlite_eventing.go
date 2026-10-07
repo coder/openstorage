@@ -202,6 +202,10 @@ func (s *SQLite) DeleteWebhook(ctx context.Context, org, id string) error {
 // ErrAlreadyExists when the repo already has a credential; ErrReservedSecret
 // when the password starts with the reserved envelope prefix.
 func (s *SQLite) CreateGitCredential(ctx context.Context, cred GitCredential) (GitCredential, error) {
+	return s.createGitCredential(ctx, s.db, cred)
+}
+
+func (s *SQLite) createGitCredential(ctx context.Context, q sqliteExecer, cred GitCredential) (GitCredential, error) {
 	assertf(cred.RepoID != "", "CreateGitCredential: empty repo id")
 	stored, err := encodeSecret(s.codec, cred.Password)
 	if err != nil {
@@ -213,7 +217,7 @@ func (s *SQLite) CreateGitCredential(ctx context.Context, cred GitCredential) (G
 	// Live-repo guard (issue #52, PR #105 round 6): SQLite's single-writer
 	// lock totally orders this statement against SoftDeleteRepo /
 	// PurgeRepoMeta — see the PG twin's rationale.
-	res, err := s.db.ExecContext(ctx,
+	res, err := q.ExecContext(ctx,
 		`INSERT INTO git_credentials (id, repo_id, username, password, created_at)
 		 SELECT ?, ?, ?, ?, ?
 		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = ? AND deleted_at IS NULL)`,
@@ -353,6 +357,42 @@ func (s *SQLite) GitCredentialForRepo(ctx context.Context, repoID string) (GitCr
 // counters/syncing/sync_pending/claim lease zeroed). ErrAlreadyExists when
 // the repo already has one.
 func (s *SQLite) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream, error) {
+	return s.setRepoUpstream(ctx, s.db, up)
+}
+
+// CreateLinkedRepo runs CreateRepo, CreateGitCredential and
+// SetRepoUpstream in one BEGIN IMMEDIATE transaction (meta.EventingStore
+// contract).
+func (s *SQLite) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch string, up RepoUpstream, cred *GitCredential) (Repo, error) {
+	assertf(url != "" && defaultBranch != "", "CreateLinkedRepo: empty url %q or default branch %q", url, defaultBranch)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	var repo Repo
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		if repo, err = s.insertRepo(ctx, tx, org, orgID, url, defaultBranch); err != nil {
+			return err
+		}
+		if cred != nil {
+			c := *cred
+			c.RepoID = repo.RepoID
+			if _, err := s.createGitCredential(ctx, tx, c); err != nil {
+				return err
+			}
+		}
+		up.RepoID = repo.RepoID
+		_, err = s.setRepoUpstream(ctx, tx, up)
+		return err
+	})
+	if err != nil {
+		return Repo{}, err
+	}
+	return repo, nil
+}
+
+func (s *SQLite) setRepoUpstream(ctx context.Context, q sqliteExecer, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	nanos, createdAt := s.nowNano()
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
@@ -362,7 +402,7 @@ func (s *SQLite) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpst
 	up.CreatedAt = createdAt
 	// Live-repo guard — see CreateGitCredential (issue #52, PR #105
 	// round 6).
-	res, err := s.db.ExecContext(ctx,
+	res, err := q.ExecContext(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host,
 		        run_count, success_count, syncing, sync_pending,
 		        sync_claim_holder, sync_claim_expires_at, forward_on_push, created_at)
