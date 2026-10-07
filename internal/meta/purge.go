@@ -101,7 +101,7 @@ func (s *PG) RepoPurgeState(ctx context.Context, repoID string) (state PurgeStat
 		`SELECT `+repoCols+`, purged_at FROM repos WHERE repo_id = $1`, repoID)
 	var r Repo
 	var purgedAt *time.Time
-	err = row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &r.CreatedAt, &r.DeletedAt, &purgedAt)
+	err = row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &r.CreatedAt, &r.DeletedAt, &r.CreateState, &purgedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return PurgeState{}, false, nil
 	}

@@ -189,7 +189,8 @@ type EventingStore interface {
 	// reader sees the repo before its upstream link (issue #387: a
 	// concurrent create of the same name compares upstreams). The store
 	// assigns every ID; caller-set RepoIDs are ignored. ErrAlreadyExists
-	// when (org, url) is taken, and then nothing is written.
+	// when (org, url) is taken, and then nothing is written. The repo is
+	// CreateStatePending until CompleteRepoCreate.
 	CreateLinkedRepo(ctx context.Context, org, url, defaultBranch string, up RepoUpstream, cred *GitCredential) (Repo, error)
 	// GetRepoUpstream returns the row; ErrNotFound when detached/never linked.
 	GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstream, error)

@@ -49,7 +49,51 @@ type Repo struct {
 	DefaultBranch string     // validated ref component, default "main"
 	CreatedAt     time.Time  // UTC; rendered as RFC 3339 in responses
 	DeletedAt     *time.Time // nil while live (soft delete per docs/explanation/domain-model.md)
+	CreateState   CreateState
 }
+
+// CreateState records whether a repo's create finished (issue #388). A
+// repeat POST /repos may answer 200 only for CreateStateComplete.
+type CreateState int
+
+const (
+	// CreateStateLegacy: the row predates create tracking, or the backend
+	// cannot store it (S3-WAL's frozen v1 format, issue #335). A crashed
+	// fork can look like this, so the row is never treated as complete.
+	CreateStateLegacy CreateState = 0
+	// CreateStatePending: inserted, and the create has not finished.
+	CreateStatePending CreateState = 1
+	// CreateStateComplete: the create finished.
+	CreateStateComplete CreateState = 2
+)
+
+func validCreateState(s CreateState) bool {
+	return s == CreateStateLegacy || s == CreateStatePending || s == CreateStateComplete
+}
+
+// completeOutcome answers CompleteRepoCreate for a row its conditional
+// update did not change (any row, deleted included).
+func completeOutcome(r Repo) (CreateOutcome, error) {
+	switch {
+	case r.DeletedAt != nil:
+		return CreateDeleted, nil
+	case r.CreateState == CreateStateComplete:
+		return CreateAlreadyComplete, nil
+	default:
+		// A live pending row would have been updated; a legacy row was
+		// never inserted pending, so no create can be finishing it.
+		return 0, fmt.Errorf("complete create of repo id %q: create_state %d is not pending", r.RepoID, r.CreateState)
+	}
+}
+
+// CreateOutcome is the result of CompleteRepoCreate.
+type CreateOutcome int
+
+const (
+	CreateCompleted       CreateOutcome = iota + 1 // this call finished the create
+	CreateAlreadyComplete                          // an earlier call finished it
+	CreateDeleted                                  // the repo was deleted first; the create must not report success
+)
 
 // ListParams are the GET /repos query parameters after handler-side
 // validation: handlers reject bad `limit` with 400 and pass the resolved
@@ -100,7 +144,18 @@ type Store interface {
 
 	// CreateRepo inserts a live repo with a server-generated RepoID.
 	// ErrAlreadyExists when (org, url) is taken — even by a soft-deleted row.
+	// The row's CreateState is CreateStateLegacy.
 	CreateRepo(ctx context.Context, org, url, defaultBranch string) (Repo, error)
+
+	// CreateRepoWithState is CreateRepo with an explicit CreateState
+	// (pending or complete). S3-WAL stores no state: its rows read legacy.
+	CreateRepoWithState(ctx context.Context, org, url, defaultBranch string, state CreateState) (Repo, error)
+
+	// CompleteRepoCreate moves a pending repo to complete. A soft-deleted
+	// repo returns CreateDeleted, even if it was complete. ErrNotFound when
+	// no row exists. On a legacy row it returns an error on PostgreSQL and
+	// SQLite, and CreateCompleted on S3-WAL (whose rows are all legacy).
+	CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error)
 
 	// GetRepoByURL returns the live repo with the given url;
 	// ErrNotFound when absent or soft-deleted.

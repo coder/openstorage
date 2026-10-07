@@ -372,7 +372,7 @@ func (s *SQLite) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch s
 	var repo Repo
 	err = s.inTx(ctx, func(tx *sql.Tx) error {
 		var err error
-		if repo, err = s.insertRepo(ctx, tx, org, orgID, url, defaultBranch); err != nil {
+		if repo, err = s.insertRepo(ctx, tx, org, orgID, url, defaultBranch, CreateStatePending); err != nil {
 			return err
 		}
 		if cred != nil {

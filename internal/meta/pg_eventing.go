@@ -350,7 +350,7 @@ func (s *PG) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch strin
 	var repo Repo
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		var err error
-		if repo, err = pgInsertRepo(ctx, tx, org, orgID, url, defaultBranch); err != nil {
+		if repo, err = pgInsertRepo(ctx, tx, org, orgID, url, defaultBranch, CreateStatePending); err != nil {
 			return err
 		}
 		if cred != nil {

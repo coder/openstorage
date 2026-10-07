@@ -312,7 +312,15 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	repo, err := s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
+	var repo meta.Repo
+	if spec == nil {
+		// A plain create finishes at insert (issue #388). A sync create
+		// stays legacy (never treated as complete) until its first-sync
+		// schedule is tracked.
+		repo, err = s.store.CreateRepoWithState(r.Context(), claims.Iss, url, branch, meta.CreateStateComplete)
+	} else {
+		repo, err = s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
+	}
 	switch {
 	case errors.Is(err, meta.ErrAlreadyExists):
 		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url)

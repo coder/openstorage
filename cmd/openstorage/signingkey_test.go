@@ -97,6 +97,14 @@ func (failingStore) CreateRepo(context.Context, string, string, string) (meta.Re
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) CreateRepoWithState(context.Context, string, string, string, meta.CreateState) (meta.Repo, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) CompleteRepoCreate(context.Context, string, string) (meta.CreateOutcome, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (failingStore) GetRepoByURL(context.Context, string, string) (meta.Repo, error) {
 	panic("not used by signing-key CLI")
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/meta"
 	upsync "github.com/coder/openstorage/internal/sync"
 )
 
@@ -50,6 +51,12 @@ func TestCreateRepoStatusCodes(t *testing.T) {
 				created := post(t, repoURL, c.body, http.StatusCreated)
 				if created["message"] != "Repository '"+repoURL+"' created" || created["repo_id"] == "" {
 					t.Fatalf("create response = %v", created)
+				}
+				// A plain create is complete at insert. A sync create stays
+				// legacy until its first-sync schedule is tracked (#388).
+				wantState := map[bool]meta.CreateState{true: meta.CreateStateComplete, false: meta.CreateStateLegacy}[c.body == nil]
+				if row, err := e.store.GetRepoByURL(context.Background(), s.org, repoURL); err != nil || row.CreateState != wantState {
+					t.Fatalf("stored row = %+v, %v; want create state %d", row, err, wantState)
 				}
 				if c.body != nil {
 					s.waitEvent(t, upsync.EventSyncStarted)

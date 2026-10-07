@@ -86,6 +86,7 @@ func TestS3WALMetaConformance(t *testing.T) {
 		{"GitCredentials", testGitCredentials},
 		{"RepoUpstream", testRepoUpstream},
 		{"CreateLinkedRepo", testCreateLinkedRepo},
+		{"CreateState", testCreateState},
 		{"SyncLifecycle", testSyncLifecycle},
 		{"TryBeginSyncConcurrent", testTryBeginSyncConcurrent},
 		{"SyncClaimLease", testSyncClaimLease},
