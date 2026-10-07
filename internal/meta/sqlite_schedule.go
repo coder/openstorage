@@ -26,6 +26,9 @@ import (
 // LocalScheduleStore is the local serve process's durable schedule. It is
 // an optional interface (type-assert a Store): only *SQLite implements it.
 type LocalScheduleStore interface {
+	// CompleteSyncRepoCreate marks a pending sync create complete and
+	// records its first-sync request in one write (issue #388).
+	CompleteSyncRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error)
 	// RequestPushNow is RequestPush for an explicit caller request (API
 	// push-upstream): it also makes the pending work due now, keeping the
 	// retry position. One write, so no request/expedite gap exists.

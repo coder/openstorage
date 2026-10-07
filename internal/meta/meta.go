@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"time"
 )
@@ -67,8 +68,15 @@ const (
 	CreateStateComplete CreateState = 2
 )
 
-func validCreateState(s CreateState) bool {
-	return s == CreateStateLegacy || s == CreateStatePending || s == CreateStateComplete
+// knownCreateState reads a value this binary does not know (written by a
+// newer binary before a downgrade) as legacy, which is never treated as
+// complete, and logs a warning instead of failing the read.
+func knownCreateState(repoID string, s CreateState) CreateState {
+	if s == CreateStateLegacy || s == CreateStatePending || s == CreateStateComplete {
+		return s
+	}
+	slog.Warn("meta: unknown repos.create_state, reading it as legacy", "repo_id", repoID, "create_state", int(s))
+	return CreateStateLegacy
 }
 
 // completeOutcome answers CompleteRepoCreate for a row its conditional

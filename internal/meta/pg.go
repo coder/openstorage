@@ -217,7 +217,7 @@ func scanRepo(row pgx.Row) (Repo, error) {
 	if err := row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &r.CreatedAt, &r.DeletedAt, &r.CreateState); err != nil {
 		return Repo{}, err
 	}
-	assertf(validCreateState(r.CreateState), "repo %q has invalid create_state %d", r.RepoID, r.CreateState)
+	r.CreateState = knownCreateState(r.RepoID, r.CreateState)
 	r.CreatedAt = r.CreatedAt.UTC()
 	if r.DeletedAt != nil {
 		utc := r.DeletedAt.UTC()
@@ -334,34 +334,47 @@ func (s *PG) CreateRepoWithState(ctx context.Context, org, url, defaultBranch st
 	return pgInsertRepo(ctx, s.pool, org, orgID, url, defaultBranch, state)
 }
 
-// CompleteRepoCreate moves a pending repo to complete (meta.Store
-// contract). State only moves pending -> complete and live -> deleted, so
-// the follow-up read after a no-op update sees a state at least as new.
+// CompleteRepoCreate moves a pending repo to complete (meta.Store contract).
 func (s *PG) CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
-	assertf(repoID != "", "CompleteRepoCreate: empty repo id for org %q", org)
-	orgID, err := s.lookupOrgID(ctx, org)
-	if err != nil {
-		return 0, err
-	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE repos SET create_state = $3
-		 WHERE org_id = $1 AND repo_id = $2 AND create_state = $4 AND deleted_at IS NULL`,
-		orgID, repoID, CreateStateComplete, CreateStatePending)
-	if err != nil {
-		return 0, fmt.Errorf("complete create of repo id %q: %w", repoID, err)
-	}
-	if tag.RowsAffected() == 1 {
-		return CreateCompleted, nil
-	}
-	r, err := scanRepo(s.pool.QueryRow(ctx,
-		`SELECT `+repoCols+` FROM repos WHERE org_id = $1 AND repo_id = $2`, orgID, repoID))
+	var out CreateOutcome
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		out, err = PGCompleteRepoCreate(ctx, tx, org, repoID, nil)
+		return err
+	})
+	return out, err
+}
+
+// PGCompleteRepoCreate is CompleteRepoCreate inside the caller's
+// transaction on the metadata database. It locks the repo row; only when
+// the row is live and pending does it run schedule(ctx) (nil = nothing)
+// and mark the row complete, so both commit together or not at all
+// (issue #388: River inserts a sync create's first-sync job in tx). A
+// complete or deleted row runs nothing.
+func PGCompleteRepoCreate(ctx context.Context, tx pgx.Tx, org, repoID string, schedule func(context.Context) error) (CreateOutcome, error) {
+	assertf(tx != nil && repoID != "", "PGCompleteRepoCreate: nil tx or empty repo id for org %q", org)
+	r, err := scanRepo(tx.QueryRow(ctx,
+		`SELECT `+repoCols+` FROM repos
+		 WHERE org_id = (SELECT id FROM orgs WHERE name = $1) AND repo_id = $2 FOR UPDATE`, org, repoID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
 	}
 	if err != nil {
-		return 0, fmt.Errorf("read repo id %q after complete: %w", repoID, err)
+		return 0, fmt.Errorf("lock repo id %q: %w", repoID, err)
 	}
-	return completeOutcome(r)
+	if r.DeletedAt != nil || r.CreateState != CreateStatePending {
+		return completeOutcome(r)
+	}
+	if schedule != nil {
+		if err := schedule(ctx); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE repos SET create_state = $2 WHERE repo_id = $1`,
+		repoID, CreateStateComplete); err != nil {
+		return 0, fmt.Errorf("complete create of repo id %q: %w", repoID, err)
+	}
+	return CreateCompleted, nil
 }
 
 // pgQueryRower is the QueryRow method *pgxpool.Pool and pgx.Tx share, so
