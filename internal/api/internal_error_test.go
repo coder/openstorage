@@ -39,6 +39,14 @@ func (f failingStore) CreateRepo(context.Context, string, string, string) (meta.
 	return meta.Repo{}, f.err
 }
 
+func (f failingStore) CreateRepoWithState(context.Context, string, string, string, meta.CreateState) (meta.Repo, error) {
+	return meta.Repo{}, f.err
+}
+
+func (f failingStore) CompleteRepoCreate(context.Context, string, string) (meta.CreateOutcome, error) {
+	return 0, f.err
+}
+
 func (f failingStore) GetRepoByURL(context.Context, string, string) (meta.Repo, error) {
 	return meta.Repo{}, f.err
 }

@@ -31,7 +31,7 @@ const (
 	// must 409).
 	repoURLConstraint = "repos_org_id_url_key"
 	// repoCols is the scan column list matching scanRepo.
-	repoCols = "repo_id, org_id, url, default_branch, created_at, deleted_at"
+	repoCols = "repo_id, org_id, url, default_branch, created_at, deleted_at, create_state"
 )
 
 // PG implements Backend on Postgres.
@@ -169,6 +169,9 @@ ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_run_count integer NOT N
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_success_count integer NOT NULL DEFAULT 0;
 -- Upgrade path for repos predating the purge tombstone column (issue #52).
 ALTER TABLE repos ADD COLUMN IF NOT EXISTS purged_at timestamptz;
+-- Create state (issue #388): 0 legacy, 1 pending, 2 complete. Rows that
+-- predate the column read legacy, which is never treated as complete.
+ALTER TABLE repos ADD COLUMN IF NOT EXISTS create_state integer NOT NULL DEFAULT 0;
 -- Retention-purge scan index (issue #52): PurgeableRepos pages PENDING
 -- purges (soft-deleted, not yet stamped) oldest-deletion-first. Excluding
 -- stamped tombstones keeps the scan O(pending) — completed purges keep
@@ -211,9 +214,10 @@ func (s *PG) lookupOrgID(ctx context.Context, name string) (int64, error) {
 // Repo contract.
 func scanRepo(row pgx.Row) (Repo, error) {
 	var r Repo
-	if err := row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &r.CreatedAt, &r.DeletedAt); err != nil {
+	if err := row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &r.CreatedAt, &r.DeletedAt, &r.CreateState); err != nil {
 		return Repo{}, err
 	}
+	assertf(validCreateState(r.CreateState), "repo %q has invalid create_state %d", r.RepoID, r.CreateState)
 	r.CreatedAt = r.CreatedAt.UTC()
 	if r.DeletedAt != nil {
 		utc := r.DeletedAt.UTC()
@@ -316,7 +320,48 @@ func (s *PG) CreateRepo(ctx context.Context, org, url, defaultBranch string) (Re
 	if err != nil {
 		return Repo{}, err
 	}
-	return pgInsertRepo(ctx, s.pool, org, orgID, url, defaultBranch)
+	return pgInsertRepo(ctx, s.pool, org, orgID, url, defaultBranch, CreateStateLegacy)
+}
+
+// CreateRepoWithState is CreateRepo with an explicit create state.
+func (s *PG) CreateRepoWithState(ctx context.Context, org, url, defaultBranch string, state CreateState) (Repo, error) {
+	assertf(url != "" && defaultBranch != "", "CreateRepoWithState: empty url %q or default branch %q", url, defaultBranch)
+	assertf(state == CreateStatePending || state == CreateStateComplete, "CreateRepoWithState: state %d", state)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	return pgInsertRepo(ctx, s.pool, org, orgID, url, defaultBranch, state)
+}
+
+// CompleteRepoCreate moves a pending repo to complete (meta.Store
+// contract). State only moves pending -> complete and live -> deleted, so
+// the follow-up read after a no-op update sees a state at least as new.
+func (s *PG) CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
+	assertf(repoID != "", "CompleteRepoCreate: empty repo id for org %q", org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return 0, err
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE repos SET create_state = $3
+		 WHERE org_id = $1 AND repo_id = $2 AND create_state = $4 AND deleted_at IS NULL`,
+		orgID, repoID, CreateStateComplete, CreateStatePending)
+	if err != nil {
+		return 0, fmt.Errorf("complete create of repo id %q: %w", repoID, err)
+	}
+	if tag.RowsAffected() == 1 {
+		return CreateCompleted, nil
+	}
+	r, err := scanRepo(s.pool.QueryRow(ctx,
+		`SELECT `+repoCols+` FROM repos WHERE org_id = $1 AND repo_id = $2`, orgID, repoID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read repo id %q after complete: %w", repoID, err)
+	}
+	return completeOutcome(r)
 }
 
 // pgQueryRower is the QueryRow method *pgxpool.Pool and pgx.Tx share, so
@@ -325,12 +370,12 @@ type pgQueryRower interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func pgInsertRepo(ctx context.Context, q pgQueryRower, org string, orgID int64, url, defaultBranch string) (Repo, error) {
-	r := Repo{RepoID: newRepoID(), OrgID: orgID, URL: url, DefaultBranch: defaultBranch}
+func pgInsertRepo(ctx context.Context, q pgQueryRower, org string, orgID int64, url, defaultBranch string, state CreateState) (Repo, error) {
+	r := Repo{RepoID: newRepoID(), OrgID: orgID, URL: url, DefaultBranch: defaultBranch, CreateState: state}
 	err := q.QueryRow(ctx,
-		`INSERT INTO repos (repo_id, org_id, url, default_branch) VALUES ($1, $2, $3, $4)
+		`INSERT INTO repos (repo_id, org_id, url, default_branch, create_state) VALUES ($1, $2, $3, $4, $5)
 		 RETURNING created_at`,
-		r.RepoID, orgID, url, defaultBranch).Scan(&r.CreatedAt)
+		r.RepoID, orgID, url, defaultBranch, state).Scan(&r.CreatedAt)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == repoURLConstraint {
 		return Repo{}, fmt.Errorf("repo %q in org %q: %w", url, org, ErrAlreadyExists)

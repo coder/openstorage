@@ -376,6 +376,12 @@ rewrite. So adding, removing, or reinterpreting a durable field is not safe just
 it is optional, additive, or tagged `omitempty`: an older writer can drop information or
 apply a different meaning. Such changes must not silently extend the frozen v1 format.
 
+**Fields v1 does not carry.** PostgreSQL and SQLite store a per-repository create state
+(`repos.create_state`: legacy, pending, or complete; [#388](https://github.com/coder/openstorage/issues/388)).
+The v1 metadata document has no such field, and adding one needs the v2 decision in
+[#335](https://github.com/coder/openstorage/issues/335). Until then every S3WAL repository
+reads as legacy, which the API never treats as a finished create.
+
 **Current enforcement.** Both decoders reject unsupported version values; both encoders
 assert they write v1. These codec-level guards are not a bucket-wide compatibility check.
 They do not guarantee that an old process always exits or cannot mutate other bucket

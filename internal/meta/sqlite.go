@@ -209,6 +209,8 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		{"repo_upstreams", "sync_due", `sync_due INTEGER NOT NULL DEFAULT 0`},
 		// Purge tombstone column (issue #52) for data dirs predating it.
 		{"repos", "purged_at", `purged_at INTEGER`},
+		// Create state (issue #388): 0 legacy, 1 pending, 2 complete.
+		{"repos", "create_state", `create_state INTEGER NOT NULL DEFAULT 0`},
 	} {
 		var present int
 		if err := tx.QueryRowContext(ctx,
@@ -281,9 +283,10 @@ func scanRepoSQLite(row sqlRow) (Repo, error) {
 	var r Repo
 	var createdAt int64
 	var deletedAt sql.NullInt64
-	if err := row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &createdAt, &deletedAt); err != nil {
+	if err := row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &createdAt, &deletedAt, &r.CreateState); err != nil {
 		return Repo{}, err
 	}
+	assertf(validCreateState(r.CreateState), "repo %q has invalid create_state %d", r.RepoID, r.CreateState)
 	r.CreatedAt = time.Unix(0, createdAt).UTC()
 	if deletedAt.Valid {
 		utc := time.Unix(0, deletedAt.Int64).UTC()
@@ -403,7 +406,49 @@ func (s *SQLite) CreateRepo(ctx context.Context, org, url, defaultBranch string)
 	if err != nil {
 		return Repo{}, err
 	}
-	return s.insertRepo(ctx, s.db, org, orgID, url, defaultBranch)
+	return s.insertRepo(ctx, s.db, org, orgID, url, defaultBranch, CreateStateLegacy)
+}
+
+// CreateRepoWithState is CreateRepo with an explicit create state.
+func (s *SQLite) CreateRepoWithState(ctx context.Context, org, url, defaultBranch string, state CreateState) (Repo, error) {
+	assertf(url != "" && defaultBranch != "", "CreateRepoWithState: empty url %q or default branch %q", url, defaultBranch)
+	assertf(state == CreateStatePending || state == CreateStateComplete, "CreateRepoWithState: state %d", state)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	return s.insertRepo(ctx, s.db, org, orgID, url, defaultBranch, state)
+}
+
+// CompleteRepoCreate moves a pending repo to complete (meta.Store
+// contract; see the PG twin for why the follow-up read is safe).
+func (s *SQLite) CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
+	assertf(repoID != "", "CompleteRepoCreate: empty repo id for org %q", org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return 0, err
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE repos SET create_state = ?
+		 WHERE org_id = ? AND repo_id = ? AND create_state = ? AND deleted_at IS NULL`,
+		CreateStateComplete, orgID, repoID, CreateStatePending)
+	if err != nil {
+		return 0, fmt.Errorf("complete create of repo id %q: %w", repoID, err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return 0, fmt.Errorf("complete create of repo id %q: %w", repoID, err)
+	} else if n == 1 {
+		return CreateCompleted, nil
+	}
+	r, err := scanRepoSQLite(s.db.QueryRowContext(ctx,
+		`SELECT `+repoCols+` FROM repos WHERE org_id = ? AND repo_id = ?`, orgID, repoID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read repo id %q after complete: %w", repoID, err)
+	}
+	return completeOutcome(r)
 }
 
 // sqliteExecer is the ExecContext method *sql.DB and *sql.Tx share, so an
@@ -412,12 +457,12 @@ type sqliteExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func (s *SQLite) insertRepo(ctx context.Context, q sqliteExecer, org string, orgID int64, url, defaultBranch string) (Repo, error) {
+func (s *SQLite) insertRepo(ctx context.Context, q sqliteExecer, org string, orgID int64, url, defaultBranch string, state CreateState) (Repo, error) {
 	nanos, createdAt := s.nowNano()
-	r := Repo{RepoID: newRepoID(), OrgID: orgID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt}
+	r := Repo{RepoID: newRepoID(), OrgID: orgID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt, CreateState: state}
 	_, err := q.ExecContext(ctx,
-		`INSERT INTO repos (repo_id, org_id, url, default_branch, created_at) VALUES (?, ?, ?, ?, ?)`,
-		r.RepoID, orgID, url, defaultBranch, nanos)
+		`INSERT INTO repos (repo_id, org_id, url, default_branch, created_at, create_state) VALUES (?, ?, ?, ?, ?, ?)`,
+		r.RepoID, orgID, url, defaultBranch, nanos, state)
 	// A unique violation here can only be (org_id, url): a repo_id collision
 	// would be SQLITE_CONSTRAINT_PRIMARYKEY, a different extended code.
 	if isUniqueViolation(err) {

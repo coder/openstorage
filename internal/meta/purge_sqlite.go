@@ -45,7 +45,7 @@ func (s *SQLite) RepoPurgeState(ctx context.Context, repoID string) (state Purge
 	var r Repo
 	var createdAt int64
 	var deletedAt, purgedAt sql.NullInt64
-	err = row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &createdAt, &deletedAt, &purgedAt)
+	err = row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &createdAt, &deletedAt, &r.CreateState, &purgedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PurgeState{}, false, nil
 	}

@@ -877,6 +877,36 @@ func (s *S3WAL) GetRepoByID(ctx context.Context, org, repoID string) (Repo, erro
 	return r.toRepo(repoID), nil
 }
 
+// CreateRepoWithState is CreateRepo: the frozen v1 document has no
+// create_state field (issue #335), so every S3-WAL row reads
+// CreateStateLegacy and a repeat create stays 409.
+func (s *S3WAL) CreateRepoWithState(ctx context.Context, org, url, defaultBranch string, state CreateState) (Repo, error) {
+	assertf(state == CreateStatePending || state == CreateStateComplete, "CreateRepoWithState: state %d", state)
+	return s.CreateRepo(ctx, org, url, defaultBranch)
+}
+
+// CompleteRepoCreate stores nothing (see CreateRepoWithState). It still
+// reports CreateDeleted for a repo deleted before its create finished.
+func (s *S3WAL) CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
+	assertf(repoID != "", "CompleteRepoCreate: empty repo id for org %q", org)
+	doc, err := s.viewDoc(ctx)
+	if err != nil {
+		return 0, err
+	}
+	orgRow, err := lookupOrg(doc, org)
+	if err != nil {
+		return 0, err
+	}
+	r := doc.Repos[repoID]
+	switch {
+	case r == nil || r.OrgID != orgRow.ID:
+		return 0, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+	case r.DeletedAt != 0:
+		return CreateDeleted, nil
+	}
+	return CreateCompleted, nil
+}
+
 // UpdateRepoDefaultBranch CASes the live repo's default branch (Store
 // contract). Recovery class PRED on the semantic effect: branch == new
 // proves the swap holds (an ambiguous PUT superseded by a competitor that
