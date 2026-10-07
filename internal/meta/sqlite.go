@@ -403,9 +403,19 @@ func (s *SQLite) CreateRepo(ctx context.Context, org, url, defaultBranch string)
 	if err != nil {
 		return Repo{}, err
 	}
+	return s.insertRepo(ctx, s.db, org, orgID, url, defaultBranch)
+}
+
+// sqliteExecer is the ExecContext method *sql.DB and *sql.Tx share, so an
+// insert runs alone or inside CreateLinkedRepo's transaction.
+type sqliteExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (s *SQLite) insertRepo(ctx context.Context, q sqliteExecer, org string, orgID int64, url, defaultBranch string) (Repo, error) {
 	nanos, createdAt := s.nowNano()
 	r := Repo{RepoID: newRepoID(), OrgID: orgID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt}
-	_, err = s.db.ExecContext(ctx,
+	_, err := q.ExecContext(ctx,
 		`INSERT INTO repos (repo_id, org_id, url, default_branch, created_at) VALUES (?, ?, ?, ?, ?)`,
 		r.RepoID, orgID, url, defaultBranch, nanos)
 	// A unique violation here can only be (org_id, url): a repo_id collision

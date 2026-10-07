@@ -85,6 +85,7 @@ func TestS3WALMetaConformance(t *testing.T) {
 		{"Webhooks", testWebhooks},
 		{"GitCredentials", testGitCredentials},
 		{"RepoUpstream", testRepoUpstream},
+		{"CreateLinkedRepo", testCreateLinkedRepo},
 		{"SyncLifecycle", testSyncLifecycle},
 		{"TryBeginSyncConcurrent", testTryBeginSyncConcurrent},
 		{"SyncClaimLease", testSyncClaimLease},

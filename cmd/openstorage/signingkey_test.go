@@ -161,6 +161,10 @@ func (failingStore) SetRepoUpstream(context.Context, meta.RepoUpstream) (meta.Re
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) CreateLinkedRepo(context.Context, string, string, string, meta.RepoUpstream, *meta.GitCredential) (meta.Repo, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (failingStore) GetRepoUpstream(context.Context, string) (meta.RepoUpstream, error) {
 	panic("not used by signing-key CLI")
 }

@@ -431,6 +431,89 @@ func (s *S3WAL) GitCredentialForRepo(ctx context.Context, repoID string) (GitCre
 	return GitCredential{}, fmt.Errorf("credential for repo %q: %w", repoID, ErrNotFound)
 }
 
+// CreateLinkedRepo is CreateRepo, CreateGitCredential and SetRepoUpstream
+// in one document mutation (meta.EventingStore contract): the single-object
+// CAS publishes the three rows together. Recovery class PRED, like
+// CreateRepo: the per-run random RepoID on the fresh snapshot proves OUR
+// mutation landed, and with it every row it carried.
+func (s *S3WAL) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch string, up RepoUpstream, cred *GitCredential) (Repo, error) {
+	assertf(url != "" && defaultBranch != "", "CreateLinkedRepo: empty url %q or default branch %q", url, defaultBranch)
+	for what, v := range map[string]string{"url": url, "default branch": defaultBranch} {
+		if err := utf8OK(what, v); err != nil {
+			return Repo{}, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
+		}
+	}
+	// The upstream and credential rows are checked only after the
+	// duplicate-name check, as the SQL twins insert the repo row first: a
+	// taken name is ErrAlreadyExists on every backend.
+	rowFields := map[string]string{
+		"upstream provider": up.Provider, "upstream owner": up.Owner,
+		"upstream name": up.Name, "upstream host": up.UpstreamHost,
+	}
+	if cred != nil {
+		rowFields["credential username"], rowFields["credential password"] = cred.Username, cred.Password
+	}
+	nanos, createdAt := s.nowNano()
+	var repo Repo
+	var repoID string
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "create linked repo",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			orgRow, err := lookupOrg(doc, org)
+			if err != nil {
+				return false, err
+			}
+			for _, r := range doc.Repos {
+				if r.OrgID == orgRow.ID && r.URL == url {
+					return false, fmt.Errorf("repo %q in org %q: %w", url, org, ErrAlreadyExists)
+				}
+			}
+			for what, v := range rowFields {
+				if err := utf8OK(what, v); err != nil {
+					return false, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
+				}
+			}
+			var stored string
+			if cred != nil {
+				var err error
+				if stored, err = encodeSecret(s.codec, cred.Password); err != nil {
+					return false, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
+				}
+			}
+			repoID = newRepoID()
+			if doc.Repos == nil {
+				doc.Repos = make(map[string]*s3walMetaRepo)
+			}
+			doc.Repos[repoID] = &s3walMetaRepo{OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: nanos}
+			if cred != nil {
+				if doc.Credentials == nil {
+					doc.Credentials = make(map[string]*s3walMetaCredential)
+				}
+				doc.Credentials[NewEventingID("ggc")] = &s3walMetaCredential{RepoID: repoID, Username: cred.Username, Password: stored, CreatedAt: nanos}
+			}
+			if doc.Upstreams == nil {
+				doc.Upstreams = make(map[string]*s3walMetaUpstream)
+			}
+			doc.Upstreams[repoID] = &s3walMetaUpstream{
+				Provider: up.Provider, Owner: up.Owner, Name: up.Name, UpstreamHost: up.UpstreamHost,
+				ForwardOnPush: up.ForwardOnPush, CreatedAt: nanos,
+			}
+			repo = Repo{RepoID: repoID, OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt}
+			return true, nil
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			if repoID != "" && doc.Repos[repoID] != nil {
+				return s3walMetaApplied
+			}
+			return s3walMetaRerun
+		},
+	})
+	if err != nil {
+		return Repo{}, err
+	}
+	return repo, nil
+}
+
 // SetRepoUpstream inserts the upstream row (CreatedAt assigned by the
 // store; counters/flags/leases zeroed). ErrAlreadyExists when the repo
 // already has one; ErrNotFound for deleted or unknown repos (live-repo

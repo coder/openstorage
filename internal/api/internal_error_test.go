@@ -109,6 +109,10 @@ func (f failingStore) SetRepoUpstream(context.Context, meta.RepoUpstream) (meta.
 	return meta.RepoUpstream{}, f.err
 }
 
+func (f failingStore) CreateLinkedRepo(context.Context, string, string, string, meta.RepoUpstream, *meta.GitCredential) (meta.Repo, error) {
+	return meta.Repo{}, f.err
+}
+
 func (f failingStore) GetRepoUpstream(context.Context, string) (meta.RepoUpstream, error) {
 	return meta.RepoUpstream{}, f.err
 }
