@@ -39,6 +39,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
     (current draft-ietf-httpapi-ratelimit-headers shape).
 
   No `RateLimit-Policy` is advertised.
+- **Guard SHAs** (`expected_target_sha`, `expected_head_sha`, `expected_notes_ref_sha`,
+  `expected_ref_sha`, and the deprecated restore `target_commit_sha`) take a full 40-hex
+  SHA in either case.
 - **Booleans in query strings** are literal `"true"` / `"false"`.
 - **Repeated params**: `path` may repeat on diff endpoints; `range` may repeat on blame.
 - **No client retries**: no SDK retries; every error surfaces immediately. Python
@@ -229,7 +232,7 @@ This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster 
 | `GET /repos/diff` | git:read | `ref` (req; deprecated alias `sha`), `base_ref?` (deprecated alias `baseSha`), `ref_is_ephemeral?`, `base_is_ephemeral?`, `git_apply_compatible?` (deprecated alias `gitApplyCompatible`), `path` (repeatable) → `{sha, base_sha, merge_base_sha, stats, files: [FileDiff], filtered_files}`. `base_sha` is the commit `base_ref` resolved to, empty for a single-commit diff. On alias conflict the current name wins |
 | `POST /repos/commit-pack` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
 | `POST /repos/diff-commit` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
-| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, base_ref (branch, tag, or commit; deprecated alias target_commit_sha, 40-hex only), author, commit_message?, expected_target_sha? (deprecated alias expected_head_sha), committer?}}` → commit ack ([streaming protocols](../explanation/streaming-commit-protocols.md)). Creates a *new* commit restoring old tree (history preserved). `base_ref` resolves as a branch, then a tag (annotated tags peel), then a fully qualified `refs/...` name verbatim, then a full or abbreviated SHA (a full SHA may be uppercase). It always resolves outside the ephemeral namespace. Extensions: `target_is_ephemeral?` (deprecated alias `ephemeral`) restores a branch in the ephemeral namespace. `base_is_ephemeral` (deprecated alias `ephemeral_base`) is accepted and ignored |
+| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, base_ref (branch, tag, or commit; deprecated alias target_commit_sha, 40-hex only), author, commit_message?, expected_target_sha? (deprecated alias expected_head_sha), committer?}}` → commit ack ([streaming protocols](../explanation/streaming-commit-protocols.md)). Creates a *new* commit restoring old tree (history preserved). A `refs/...` `base_ref` resolves verbatim. Any other name tries a branch, then a tag (annotated tags peel). Then `base_ref` resolves as a full or abbreviated SHA (a full SHA may be uppercase). It always resolves outside the ephemeral namespace. Extensions: `target_is_ephemeral?` (deprecated alias `ephemeral`) restores a branch in the ephemeral namespace. `base_is_ephemeral` (deprecated alias `ephemeral_base`) is accepted and ignored |
 | `POST /repos/reset-commits` | git:write | In OpenAPI only (not in SDKs): NDJSON metadata stream; same restore-commit family |
 
 `CommitInfo` = `{sha, parent_shas[], message, author_name, author_email, committer_name,

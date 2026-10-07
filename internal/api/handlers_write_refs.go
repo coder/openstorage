@@ -114,12 +114,13 @@ func wrefAliasField(current, deprecated string) string {
 	return deprecated
 }
 
-// wrefLowerFullSHA lowercases a full 40-hex object id in either case (git
+// lowerFullSHA lowercases a full 40-hex object id in either case (git
 // object names are case-insensitive) and returns anything else unchanged.
 // The notes surface addresses ANY object by its full id, so an uppercase id
 // must take that path too instead of commit-only revision resolution
-// (issue #381).
-func wrefLowerFullSHA(s string) string {
+// (issue #381). Every full-SHA guard field (expected_*_sha, the deprecated
+// restore target_commit_sha) goes through it too (issue #385).
+func lowerFullSHA(s string) string {
 	if lower := strings.ToLower(s); len(s) == 40 && ref.ValidSHA(lower) {
 		return lower
 	}
@@ -948,6 +949,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			return
 		}
 	}
+	expectedRefSHA = lowerFullSHA(expectedRefSHA)
 	if expectedRefSHA != "" && !ref.ValidSHA(expectedRefSHA) {
 		wrefNoteFail(w, http.StatusBadRequest, "expected_notes_ref_sha must be a full 40-hex object id", objectSHA, targetRef, "", ref.ZeroSHA)
 		return
@@ -976,7 +978,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 
 	ctx := r.Context()
-	objectSHA = wrefLowerFullSHA(objectSHA)
+	objectSHA = lowerFullSHA(objectSHA)
 	if !ref.ValidSHA(objectSHA) {
 		// openapi (issue #161): a non-40-hex object_ref is a revision — a
 		// branch, tag, short SHA, or full ref — that must resolve to a

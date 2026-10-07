@@ -437,3 +437,113 @@ func TestRestoreCommitTagBaseRef(t *testing.T) {
 		}
 	})
 }
+
+// TestGuardSHAUppercase covers issue #385: every full-SHA guard field
+// accepts an uppercase 40-hex value. A stale uppercase guard still fails
+// the guard (412), not validation (400), and a current one passes.
+func TestGuardSHAUppercase(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+		post := func(t *testing.T, path string, frames ...any) (int, []byte) {
+			t.Helper()
+			resp, body := wctPost(t, srv, path, writeTok, bytes.NewReader(wctLines(t, frames...)))
+			return resp.StatusCode, body
+		}
+		pack := func(t *testing.T, msg string, extra map[string]any) (int, []byte) {
+			t.Helper()
+			files := []map[string]any{{"path": msg + ".txt", "content_id": "id", "operation": "upsert"}}
+			return post(t, "/api/v1/repos/commit-pack", wctMeta("main", msg, files, extra), wctChunk("id", []byte(msg), true))
+		}
+		mainTip := func(t *testing.T) string { t.Helper(); return wctBranchTip(t, e, readTok, "main", false) }
+		code, body := pack(t, "root", nil)
+		if code != http.StatusOK {
+			t.Fatalf("seed: %d %s", code, body)
+		}
+		root, rootTree := wctDecode(t, body).Commit.CommitSHA, wctDecode(t, body).Commit.TreeSHA
+		// advance commits a new file unguarded and returns the current
+		// and the now stale tip, so each restore changes the tree.
+		advance := func(t *testing.T) (current, stale string) {
+			t.Helper()
+			stale = mainTip(t)
+			if code, body := pack(t, "adv-"+stale[:8], nil); code != http.StatusOK {
+				t.Fatalf("advance: %d %s", code, body)
+			}
+			return mainTip(t), stale
+		}
+		diff := func(t *testing.T, extra map[string]any) (int, []byte) {
+			return post(t, "/api/v1/repos/diff-commit", wctMeta("main", "diff", nil, extra), wctDiffChunk(nil, true))
+		}
+		restore := func(t *testing.T, extra map[string]any) (int, []byte) {
+			md := map[string]any{"target_branch": "main", "author": wctAuthor, "target_commit_sha": root}
+			for k, v := range extra {
+				md[k] = v
+			}
+			return post(t, "/api/v1/repos/restore-commit", map[string]any{"metadata": md})
+		}
+
+		msrv := wmServer(t, e)
+		mfx := wmSeedFixture(t, e)
+		merge := func(t *testing.T, extra map[string]any) (int, []byte) {
+			extra["author"] = wmTestAuthor
+			resp, body := wmDo(t, msrv, "POST", "/api/v1/repos/merge", mfx.token, wmMergeBody("feature", "t-clean", "merge", extra))
+			return resp.StatusCode, body
+		}
+
+		nsrv := newWrefServer(t, e)
+		nfx := wrefSeedFixture(t, e)
+		note := func(t *testing.T, extra map[string]any) (int, []byte) {
+			t.Helper()
+			req := map[string]any{"object_ref": nfx.c2, "action": "append", "note": "n", "notes_ref": "case"}
+			for k, v := range extra {
+				req[k] = v
+			}
+			resp, body := wrefDo(t, nsrv, "POST", "/api/v1/repos/notes", nfx.token, req)
+			raw, _ := json.Marshal(body)
+			return resp.StatusCode, raw
+		}
+		noteTips := func(t *testing.T) (current, stale string) {
+			t.Helper()
+			if code, body := note(t, nil); code != http.StatusOK {
+				t.Fatalf("seed note: %d %s", code, body)
+			}
+			return wrefRefs(t, e, nfx.repoID)["refs/notes/case"], nfx.c1
+		}
+
+		for _, tc := range []struct {
+			name, field string
+			tips        func(t *testing.T) (current, stale string)
+			send        func(t *testing.T, extra map[string]any) (int, []byte)
+		}{
+			{"commit-pack", "expected_target_sha", advance, func(t *testing.T, x map[string]any) (int, []byte) { return pack(t, "cp-target", x) }},
+			{"commit-pack", "expected_head_sha", advance, func(t *testing.T, x map[string]any) (int, []byte) { return pack(t, "cp-head", x) }},
+			{"diff-commit", "expected_target_sha", advance, diff},
+			{"diff-commit", "expected_head_sha", advance, diff},
+			{"restore-commit", "expected_target_sha", advance, restore},
+			{"restore-commit", "expected_head_sha", advance, restore},
+			{"merge", "expected_target_sha", func(*testing.T) (string, string) { return mfx.c2, mfx.c1 }, merge},
+			{"notes", "expected_notes_ref_sha", noteTips, note},
+		} {
+			t.Run(tc.name+" "+tc.field, func(t *testing.T) {
+				current, stale := tc.tips(t)
+				if code, body := tc.send(t, map[string]any{tc.field: strings.ToUpper(stale)}); code != http.StatusPreconditionFailed {
+					t.Fatalf("stale uppercase guard: %d %s, want 412", code, body)
+				}
+				if code, body := tc.send(t, map[string]any{tc.field: strings.ToUpper(current)}); code != http.StatusOK {
+					t.Fatalf("current uppercase guard: %d %s, want 200", code, body)
+				}
+			})
+		}
+
+		t.Run("restore-commit target_commit_sha", func(t *testing.T) {
+			advance(t)
+			code, body := restore(t, map[string]any{"target_commit_sha": strings.ToUpper(root)})
+			if code != http.StatusOK {
+				t.Fatalf("uppercase target_commit_sha: %d %s, want 200", code, body)
+			}
+			if got := wctDecode(t, body).Commit.TreeSHA; got != rootTree {
+				t.Fatalf("restored tree %s, want %s", got, rootTree)
+			}
+		})
+	})
+}
