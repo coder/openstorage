@@ -40,7 +40,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
 
   No `RateLimit-Policy` is advertised.
 - **Guard SHAs** (`expected_target_sha`, `expected_head_sha`, `expected_notes_ref_sha`,
-  and the deprecated restore `target_commit_sha`) take a full 40-hex SHA in either case.
+  `expected_ref_sha`, and the deprecated restore `target_commit_sha`) take a full 40-hex
+  SHA in either case.
 - **Booleans in query strings** are literal `"true"` / `"false"`.
 - **Repeated params**: `path` may repeat on diff endpoints; `range` may repeat on blame.
 - **No client retries**: no SDK retries; every error surfaces immediately. Python
