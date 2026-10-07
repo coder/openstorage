@@ -64,7 +64,7 @@ func TestLocalHookLiveForwardAndPendingRestart(t *testing.T) {
 	var created struct {
 		RepoID string `json:"repo_id"`
 	}
-	if status := apiJSON(t, node, "POST", token, "/api/v1/repos", "{}", &created); status != 200 || created.RepoID == "" {
+	if status := apiJSON(t, node, "POST", token, "/api/v1/repos", "{}", &created); status != http.StatusCreated || created.RepoID == "" {
 		t.Fatalf("create: status=%d id=%q", status, created.RepoID)
 	}
 	id := created.RepoID
@@ -166,7 +166,7 @@ func TestLocalHookForwardBeforeCachePublication(t *testing.T) {
 	var created struct {
 		RepoID string `json:"repo_id"`
 	}
-	if status := apiJSON(t, node, "POST", token, "/api/v1/repos", "{}", &created); status != 200 || created.RepoID == "" {
+	if status := apiJSON(t, node, "POST", token, "/api/v1/repos", "{}", &created); status != http.StatusCreated || created.RepoID == "" {
 		t.Fatalf("create: status=%d id=%q", status, created.RepoID)
 	}
 	id := created.RepoID
@@ -331,7 +331,7 @@ func TestLocalHookForwardBackoffSurvivesRestart(t *testing.T) {
 	var created struct {
 		RepoID string `json:"repo_id"`
 	}
-	if status := apiJSON(t, node, "POST", token, "/api/v1/repos", "{}", &created); status != 200 || created.RepoID == "" {
+	if status := apiJSON(t, node, "POST", token, "/api/v1/repos", "{}", &created); status != http.StatusCreated || created.RepoID == "" {
 		t.Fatalf("create: status=%d id=%q", status, created.RepoID)
 	}
 	id := created.RepoID

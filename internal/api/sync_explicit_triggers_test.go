@@ -61,7 +61,7 @@ func TestExplicitSyncTriggersUseScheduleExtensions(t *testing.T) {
 		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
 		gitTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitWrite, auth.ScopeGitRead}})
 		body := []byte(`{"base_repo":{"provider":"github","owner":"acme","name":"demo","operation":"sync"}}`)
-		if resp, b := p5fixReq(t, srv, http.MethodPost, "/api/v1/repos", writeTok, body); resp.StatusCode != http.StatusOK {
+		if resp, b := p5fixReq(t, srv, http.MethodPost, "/api/v1/repos", writeTok, body); resp.StatusCode != http.StatusCreated {
 			t.Fatalf("create status = %d (body %s)", resp.StatusCode, b)
 		}
 		if resp, b := p5fixReq(t, srv, http.MethodPost, "/api/v1/repos/pull-upstream", gitTok, []byte(`{}`)); resp.StatusCode != http.StatusAccepted {

@@ -69,7 +69,7 @@ func createSyncedRepo(t *testing.T, n *testNode, u *syncUpstream, url string) st
 		RepoID string `json:"repo_id"`
 	}
 	token := mintTestToken(t, url, "repo:write", "")
-	if status := apiJSON(t, n, http.MethodPost, token, "/api/v1/repos", body, &out); status != http.StatusOK {
+	if status := apiJSON(t, n, http.MethodPost, token, "/api/v1/repos", body, &out); status != http.StatusCreated {
 		t.Fatalf("create synced repo %q on %s: status %d", url, n.addr, status)
 	}
 	if out.RepoID == "" {

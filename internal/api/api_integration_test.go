@@ -31,7 +31,7 @@ func createRepo(t *testing.T, e *testEnv, org, urlClaim string, body []byte, wan
 		t.Fatalf("POST /repos (%s) status = %d, want %d (body %s)", urlClaim, resp.StatusCode, wantStatus, respBody)
 	}
 	var out createRepoResponse
-	if wantStatus == http.StatusOK {
+	if wantStatus < 300 {
 		if err := json.Unmarshal(respBody, &out); err != nil {
 			t.Fatalf("decode create response %q: %v", respBody, err)
 		}
@@ -63,7 +63,7 @@ func testCRUDHappyPath(t *testing.T, e *testEnv) {
 	repoURL := "repo-" + randomHex(t, 8)
 
 	// Create.
-	created := createRepo(t, e, org, repoURL, []byte(`{"default_branch":"main"}`), http.StatusOK)
+	created := createRepo(t, e, org, repoURL, []byte(`{"default_branch":"main"}`), http.StatusCreated)
 	if !repoIDRe.MatchString(created.RepoID) {
 		t.Fatalf("repo_id %q does not match %v", created.RepoID, repoIDRe)
 	}
@@ -175,7 +175,7 @@ func testCRUDHappyPath(t *testing.T, e *testEnv) {
 		t.Fatalf("re-delete error = %q", msg)
 	}
 
-	createRepo(t, e, org, repoURL, nil, http.StatusConflict)
+	createRepo(t, e, org, repoURL, nil, http.StatusNotFound) // the deleted repo keeps its name (#387)
 }
 
 func TestCreateRepoValidation(t *testing.T) { runBackends(t, testCreateRepoValidation) }
@@ -213,7 +213,7 @@ func testCreateRepoValidation(t *testing.T, e *testEnv) {
 
 	// Empty body defaults the branch to main.
 	repoURL := "v-" + randomHex(t, 4)
-	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+	createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 	readTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
 	resp, body := e.doReq(t, http.MethodGet, "/api/v1/repo", readTok, nil, "")
 	if resp.StatusCode != http.StatusOK {
@@ -277,7 +277,7 @@ func testCreateRepoRepoName(t *testing.T, e *testEnv) {
 
 	t.Run("absent", func(t *testing.T) {
 		url := "rn-" + randomHex(t, 4)
-		created := createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusOK)
+		created := createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusCreated)
 		if created.RepoName != url {
 			t.Fatalf("repo_name = %q, want %q", created.RepoName, url)
 		}
@@ -286,13 +286,13 @@ func testCreateRepoRepoName(t *testing.T, e *testEnv) {
 
 	t.Run("null is absent", func(t *testing.T) {
 		url := "rn-" + randomHex(t, 4)
-		created := createRepo(t, e, org, url, []byte(`{"repo_name":null}`), http.StatusOK)
+		created := createRepo(t, e, org, url, []byte(`{"repo_name":null}`), http.StatusCreated)
 		requireRow(t, url, created.RepoID)
 	})
 
 	t.Run("equal", func(t *testing.T) {
 		url := "rn-" + randomHex(t, 4)
-		created := createRepo(t, e, org, url, []byte(`{"repo_name":"`+url+`"}`), http.StatusOK)
+		created := createRepo(t, e, org, url, []byte(`{"repo_name":"`+url+`"}`), http.StatusCreated)
 		if created.RepoName != url {
 			t.Fatalf("repo_name = %q, want %q", created.RepoName, url)
 		}
@@ -305,7 +305,7 @@ func testCreateRepoRepoName(t *testing.T, e *testEnv) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		created := createRepo(t, e, org, url, body, http.StatusOK)
+		created := createRepo(t, e, org, url, body, http.StatusCreated)
 		if created.RepoName != url {
 			t.Fatalf("repo_name = %q, want %q", created.RepoName, url)
 		}
@@ -354,7 +354,7 @@ func testCreateRepoRepoName(t *testing.T, e *testEnv) {
 		// A token for a new repo that names someone else's existing repo in
 		// the body must not create, re-create, or collide (409) with it.
 		victim := "pierre/rn-victim-" + randomHex(t, 4)
-		victimRepo := createRepo(t, e, org, victim, nil, http.StatusOK)
+		victimRepo := createRepo(t, e, org, victim, nil, http.StatusCreated)
 		claim := "pierre/rn-" + randomHex(t, 4)
 		body, err := json.Marshal(map[string]any{"repo_name": victim, "default_branch": "evil"})
 		if err != nil {
@@ -441,7 +441,7 @@ func testRefPolicyOnWriteEndpoints(t *testing.T, e *testEnv) {
 	}
 
 	repoURL := "repo-" + randomHex(t, 8)
-	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+	createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 
 	// Malformed policy claims fail closed (403) on both write endpoints.
 	badTok := e.mint(t, tokenSpec{iss: org, repo: "repo-" + randomHex(t, 8),
@@ -466,8 +466,8 @@ func testRefPolicyOnWriteEndpoints(t *testing.T, e *testEnv) {
 	createTok := e.mint(t, tokenSpec{iss: org, repo: "repo-" + randomHex(t, 8),
 		scopes: []string{auth.ScopeRepoWrite}, refs: `[["*", ["no-push"]]]`})
 	resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos", createTok, nil, "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("create with no-push policy: status = %d, want 200 (body %s)", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create with no-push policy: status = %d, want 201 (body %s)", resp.StatusCode, body)
 	}
 
 	// verify-sig and empty ops never deny deletions.
@@ -502,7 +502,7 @@ func testCreateRepoDefaultBranchQueryParam(t *testing.T, e *testEnv) {
 		t.Helper()
 		tok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
 		resp, respBody := e.doReq(t, http.MethodPost, "/api/v1/repos"+query, tok, body, "")
-		if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("create %s status = %d (body %s)", repoURL, resp.StatusCode, respBody)
 		}
 	}
@@ -531,7 +531,7 @@ func testListPaginationAndQ(t *testing.T, e *testEnv) {
 	for i := range total {
 		// Mixed case to exercise the case-insensitive q filter.
 		u := fmt.Sprintf("PgN-%02d-%s", i, randomHex(t, 3))
-		createRepo(t, e, org, u, nil, http.StatusOK)
+		createRepo(t, e, org, u, nil, http.StatusCreated)
 		urls[strings.ToLower(u)] = true
 	}
 	orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}})
@@ -631,7 +631,7 @@ func TestAuthMatrix(t *testing.T) { runBackends(t, testAuthMatrix) }
 func testAuthMatrix(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	repoURL := "matrix-" + randomHex(t, 6)
-	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+	createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 
 	endpoints := []struct {
 		name     string
@@ -767,7 +767,7 @@ func TestJWTPerAlgorithmPositive(t *testing.T) { runBackends(t, testJWTPerAlgori
 func testJWTPerAlgorithmPositive(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	repoURL := "alg-" + randomHex(t, 6)
-	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+	createRepo(t, e, org, repoURL, nil, http.StatusCreated)
 
 	for _, alg := range auth.AllowedAlgorithms {
 		t.Run(alg, func(t *testing.T) {

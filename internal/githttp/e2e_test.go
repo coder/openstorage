@@ -1588,7 +1588,7 @@ func apiJSON(t *testing.T, n *testNode, method, token, path, body string, out an
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out != nil && resp.StatusCode == http.StatusOK {
+	if out != nil && resp.StatusCode/100 == 2 {
 		if err := json.Unmarshal(respBody, out); err != nil {
 			t.Fatalf("decode %s %s: %v\n%s", method, path, err, respBody)
 		}

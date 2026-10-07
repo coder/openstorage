@@ -315,7 +315,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
 	switch {
 	case errors.Is(err, meta.ErrAlreadyExists):
-		writeErr(w, http.StatusConflict, "repository already exists")
+		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url)
 		return
 	case errors.Is(err, meta.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "organization not found")
@@ -365,11 +365,11 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, createRepoResponse{
+	writeJSON(w, http.StatusCreated, createRepoResponse{
 		RepoID:   repo.RepoID,
 		RepoName: repo.URL,
 		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
-		Message:  "repository created",
+		Message:  repoCreatedMsg(repo.URL),
 	})
 }
 

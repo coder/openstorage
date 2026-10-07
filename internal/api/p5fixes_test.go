@@ -216,7 +216,7 @@ func testPullUpstreamDefaultsRefToDefaultBranch(t *testing.T, e *testEnv) {
 
 	body := []byte(`{"default_branch":"trunk","base_repo":{"provider":"github","owner":"acme","name":"demo","operation":"sync"}}`)
 	resp, respBody := p5fixReq(t, srv, http.MethodPost, "/api/v1/repos", writeTok, body)
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d (body %s)", resp.StatusCode, respBody)
 	}
 

@@ -180,7 +180,7 @@ func TestErrorBodiesCarryProblemFields(t *testing.T) {
 func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	url := "pd-" + randomHex(t, 4)
-	createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusOK)
+	createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusCreated)
 	writeTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeRepoWrite}})
 	readTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeGitRead}})
 	missingTok := e.mint(t, tokenSpec{iss: org, repo: "pd-missing-" + randomHex(t, 4), scopes: []string{auth.ScopeGitRead}})
