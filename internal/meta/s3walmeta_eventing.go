@@ -438,22 +438,20 @@ func (s *S3WAL) GitCredentialForRepo(ctx context.Context, repoID string) (GitCre
 // mutation landed, and with it every row it carried.
 func (s *S3WAL) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch string, up RepoUpstream, cred *GitCredential) (Repo, error) {
 	assertf(url != "" && defaultBranch != "", "CreateLinkedRepo: empty url %q or default branch %q", url, defaultBranch)
-	fields := map[string]string{
-		"url": url, "default branch": defaultBranch, "upstream provider": up.Provider,
-		"upstream owner": up.Owner, "upstream name": up.Name, "upstream host": up.UpstreamHost,
-	}
-	var stored string
-	if cred != nil {
-		fields["credential username"], fields["credential password"] = cred.Username, cred.Password
-		var err error
-		if stored, err = encodeSecret(s.codec, cred.Password); err != nil {
-			return Repo{}, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
-		}
-	}
-	for what, v := range fields {
+	for what, v := range map[string]string{"url": url, "default branch": defaultBranch} {
 		if err := utf8OK(what, v); err != nil {
 			return Repo{}, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
 		}
+	}
+	// The upstream and credential rows are checked only after the
+	// duplicate-name check, as the SQL twins insert the repo row first: a
+	// taken name is ErrAlreadyExists on every backend.
+	rowFields := map[string]string{
+		"upstream provider": up.Provider, "upstream owner": up.Owner,
+		"upstream name": up.Name, "upstream host": up.UpstreamHost,
+	}
+	if cred != nil {
+		rowFields["credential username"], rowFields["credential password"] = cred.Username, cred.Password
 	}
 	nanos, createdAt := s.nowNano()
 	var repo Repo
@@ -468,6 +466,18 @@ func (s *S3WAL) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch st
 			for _, r := range doc.Repos {
 				if r.OrgID == orgRow.ID && r.URL == url {
 					return false, fmt.Errorf("repo %q in org %q: %w", url, org, ErrAlreadyExists)
+				}
+			}
+			for what, v := range rowFields {
+				if err := utf8OK(what, v); err != nil {
+					return false, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
+				}
+			}
+			var stored string
+			if cred != nil {
+				var err error
+				if stored, err = encodeSecret(s.codec, cred.Password); err != nil {
+					return false, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
 				}
 			}
 			repoID = newRepoID()

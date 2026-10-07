@@ -37,6 +37,11 @@ func testCreateLinkedRepo(t *testing.T, s Backend) {
 	if _, err := s.CreateLinkedRepo(ctx, org, "linked", "main", other, nil); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("taken name err = %v, want ErrAlreadyExists", err)
 	}
+	// The name check comes first on every backend: a taken name is
+	// ErrAlreadyExists even when the credential would be rejected.
+	if _, err := s.CreateLinkedRepo(ctx, org, "linked", "main", other, &GitCredential{Password: secrets.ReservedPrefix + "x"}); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("taken name with a reserved secret err = %v, want ErrAlreadyExists", err)
+	}
 	if got, err := s.GetRepoUpstream(ctx, repo.RepoID); err != nil || got != link {
 		t.Fatalf("upstream after taken-name create = %+v, %v; want unchanged %+v", got, err, link)
 	}
