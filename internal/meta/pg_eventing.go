@@ -428,6 +428,22 @@ func (s *PG) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 	return nil
 }
 
+// PGRequestSync is RequestSync inside the caller's transaction. It locks
+// the upstream row, so a concurrent detach either waits for the commit or
+// makes this fail with ErrNotFound (issue #388: a sync create must not
+// complete for a detached repo).
+func PGRequestSync(ctx context.Context, tx pgx.Tx, repoID string) error {
+	assertf(tx != nil && repoID != "", "PGRequestSync: nil tx or empty repo id")
+	tag, err := tx.Exec(ctx, `UPDATE repo_upstreams SET sync_pending = true WHERE repo_id = $1`, repoID)
+	if err != nil {
+		return fmt.Errorf("request sync for repo %q: %w", repoID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+	}
+	return nil
+}
+
 // RequestSync marks a pending sync request; ErrNotFound when detached.
 // See the EventingStore contract (eventing.go) for the pending-flag
 // protocol (issue #79).

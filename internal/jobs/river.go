@@ -889,6 +889,11 @@ func (q *River) CompleteSyncCreate(ctx context.Context, org, repoID string) (met
 	err := pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
 		var err error
 		out, err = meta.PGCompleteRepoCreate(ctx, tx, org, repoID, func(ctx context.Context) error {
+			// The durable request (as SQLite records it) also fails a
+			// detached repo, so the create never completes without a link.
+			if err := meta.PGRequestSync(ctx, tx, repoID); err != nil {
+				return err
+			}
 			_, err := q.client.InsertTx(ctx, tx, syncArgs{Org: org, RepoID: repoID}, nil)
 			return err
 		})
