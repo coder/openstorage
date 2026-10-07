@@ -23,6 +23,7 @@ type LocalLanes interface {
 	FinishPushOutcome(ctx context.Context, repoID, holder string, o meta.PushOutcome) (Upstream, error)
 	FinishSyncOutcome(ctx context.Context, repoID, holder string, o meta.SyncOutcome) (Upstream, error)
 	ListLocalWork(ctx context.Context, org, after string, limit int) ([]meta.LocalWork, error)
+	CompleteSyncRepoCreate(ctx context.Context, org, repoID string) (meta.CreateOutcome, error)
 }
 
 // LaneClaim is a conditional claim's result: exactly one of Claimed, Busy

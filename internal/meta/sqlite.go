@@ -286,7 +286,7 @@ func scanRepoSQLite(row sqlRow) (Repo, error) {
 	if err := row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &createdAt, &deletedAt, &r.CreateState); err != nil {
 		return Repo{}, err
 	}
-	assertf(validCreateState(r.CreateState), "repo %q has invalid create_state %d", r.RepoID, r.CreateState)
+	r.CreateState = knownCreateState(r.RepoID, r.CreateState)
 	r.CreatedAt = time.Unix(0, createdAt).UTC()
 	if deletedAt.Valid {
 		utc := time.Unix(0, deletedAt.Int64).UTC()
@@ -420,35 +420,56 @@ func (s *SQLite) CreateRepoWithState(ctx context.Context, org, url, defaultBranc
 	return s.insertRepo(ctx, s.db, org, orgID, url, defaultBranch, state)
 }
 
-// CompleteRepoCreate moves a pending repo to complete (meta.Store
-// contract; see the PG twin for why the follow-up read is safe).
+// CompleteRepoCreate moves a pending repo to complete (meta.Store contract).
 func (s *SQLite) CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
+	return s.completeRepoCreate(ctx, org, repoID, false)
+}
+
+// CompleteSyncRepoCreate is CompleteRepoCreate for a sync create (issue
+// #388): when the row is pending it also records the first-sync request
+// (sync_pending, which the local schedule's sweep runs) in the same
+// write. A complete or deleted row records nothing.
+func (s *SQLite) CompleteSyncRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
+	return s.completeRepoCreate(ctx, org, repoID, true)
+}
+
+func (s *SQLite) completeRepoCreate(ctx context.Context, org, repoID string, requestSync bool) (CreateOutcome, error) {
 	assertf(repoID != "", "CompleteRepoCreate: empty repo id for org %q", org)
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return 0, err
 	}
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE repos SET create_state = ?
-		 WHERE org_id = ? AND repo_id = ? AND create_state = ? AND deleted_at IS NULL`,
-		CreateStateComplete, orgID, repoID, CreateStatePending)
-	if err != nil {
-		return 0, fmt.Errorf("complete create of repo id %q: %w", repoID, err)
-	}
-	if n, err := res.RowsAffected(); err != nil {
-		return 0, fmt.Errorf("complete create of repo id %q: %w", repoID, err)
-	} else if n == 1 {
-		return CreateCompleted, nil
-	}
-	r, err := scanRepoSQLite(s.db.QueryRowContext(ctx,
-		`SELECT `+repoCols+` FROM repos WHERE org_id = ? AND repo_id = ?`, orgID, repoID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("read repo id %q after complete: %w", repoID, err)
-	}
-	return completeOutcome(r)
+	var out CreateOutcome
+	err = s.inTx(ctx, func(tx *sql.Tx) error { // BEGIN IMMEDIATE: one writer
+		r, err := scanRepoSQLite(tx.QueryRowContext(ctx,
+			`SELECT `+repoCols+` FROM repos WHERE org_id = ? AND repo_id = ?`, orgID, repoID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+		}
+		if err != nil {
+			return fmt.Errorf("read repo id %q: %w", repoID, err)
+		}
+		if r.DeletedAt != nil || r.CreateState != CreateStatePending {
+			out, err = completeOutcome(r)
+			return err
+		}
+		if requestSync {
+			res, err := tx.ExecContext(ctx, `UPDATE repo_upstreams SET sync_pending = 1 WHERE repo_id = ?`, repoID)
+			if err != nil {
+				return fmt.Errorf("request first sync for repo %q: %w", repoID, err)
+			}
+			if n, err := res.RowsAffected(); err != nil || n != 1 {
+				return fmt.Errorf("request first sync for repo %q: %d upstream rows, %v: %w", repoID, n, err, ErrNotFound)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE repos SET create_state = ? WHERE repo_id = ?`,
+			CreateStateComplete, repoID); err != nil {
+			return fmt.Errorf("complete create of repo id %q: %w", repoID, err)
+		}
+		out = CreateCompleted
+		return nil
+	})
+	return out, err
 }
 
 // sqliteExecer is the ExecContext method *sql.DB and *sql.Tx share, so an

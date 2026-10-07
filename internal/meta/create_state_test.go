@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestCreateState(t *testing.T) { runBackends(t, testCreateState) }
@@ -194,3 +197,100 @@ func upgradeCreateState(t *testing.T, s Backend, initSchema func(context.Context
 }
 
 func isPG(s Backend) bool { _, ok := s.(*PG); return ok }
+
+func TestCompleteRepoCreateSchedules(t *testing.T) {
+	runBackends(t, testCompleteRepoCreateSchedules)
+}
+
+// testCompleteRepoCreateSchedules: the first-sync request commits with the
+// complete mark, or neither does (issue #388). PG runs the caller's
+// schedule inside the locked transaction; SQLite records sync_pending.
+// Unknown create_state values (a newer binary's) read legacy.
+func testCompleteRepoCreateSchedules(t *testing.T, s Backend) {
+	ctx := t.Context()
+	org := seedOrg(t, s)
+	up := RepoUpstream{Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}
+	// complete runs the backend's sync completion; calls counts schedule
+	// steps (PG) or newly recorded first-sync requests (SQLite).
+	var complete func(repoID string, fail bool) (CreateOutcome, int, error)
+	var exec func(q string, args ...any)
+	switch b := s.(type) {
+	case *PG:
+		exec = func(q string, args ...any) {
+			if _, err := b.pool.Exec(ctx, strings.ReplaceAll(q, "?", "$1"), args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		complete = func(repoID string, fail bool) (out CreateOutcome, calls int, err error) {
+			err = pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
+				out, err = PGCompleteRepoCreate(ctx, tx, org, repoID, func(context.Context) error {
+					calls++
+					if fail {
+						return errors.New("injected schedule failure")
+					}
+					return nil
+				})
+				return err
+			})
+			return out, calls, err
+		}
+	case *SQLite:
+		exec = func(q string, args ...any) {
+			if _, err := b.db.ExecContext(ctx, q, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		complete = func(repoID string, fail bool) (CreateOutcome, int, error) {
+			if fail { // a failing write: the upstream row is gone
+				exec(`DELETE FROM repo_upstreams WHERE repo_id = ?`, repoID)
+			}
+			out, err := b.CompleteSyncRepoCreate(ctx, org, repoID)
+			var n int
+			_ = b.db.QueryRowContext(ctx, `SELECT count(*) FROM repo_upstreams WHERE repo_id = ? AND sync_pending = 1`, repoID).Scan(&n)
+			return out, n, err
+		}
+	default:
+		t.Fatalf("unexpected backend %T", s)
+	}
+
+	r, err := s.CreateLinkedRepo(ctx, org, "first", "main", up, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, calls, err := complete(r.RepoID, false); err != nil || out != CreateCompleted || calls != 1 {
+		t.Fatalf("pending: %v, %d calls, %v; want completed with one schedule", out, calls, err)
+	}
+	// The first sync ran; a repeat sees complete and schedules nothing.
+	exec(`UPDATE repo_upstreams SET sync_pending = false WHERE repo_id = ?`, r.RepoID)
+	if out, calls, err := complete(r.RepoID, false); err != nil || out != CreateAlreadyComplete || calls != 0 {
+		t.Fatalf("complete: %v, %d calls, %v; want already complete, nothing scheduled", out, calls, err)
+	}
+
+	failing, err := s.CreateLinkedRepo(ctx, org, "failing", "main", up, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := complete(failing.RepoID, true); err == nil {
+		t.Fatal("a failing schedule must fail the completion")
+	}
+	if got, err := s.GetRepoByID(ctx, org, failing.RepoID); err != nil || got.CreateState != CreateStatePending {
+		t.Fatalf("after a failed schedule: %+v, %v; want still pending", got, err)
+	}
+
+	gone, err := s.CreateLinkedRepo(ctx, org, "gone", "main", up, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SoftDeleteRepo(ctx, org, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	if out, calls, err := complete(gone.RepoID, false); err != nil || out != CreateDeleted || calls != 0 {
+		t.Fatalf("deleted: %v, %d calls, %v; want deleted, nothing scheduled", out, calls, err)
+	}
+
+	// A downgrade can leave a newer binary's state value: read it as legacy.
+	exec(`UPDATE repos SET create_state = 7 WHERE repo_id = ?`, r.RepoID)
+	if got, err := s.GetRepoByID(ctx, org, r.RepoID); err != nil || got.CreateState != CreateStateLegacy {
+		t.Fatalf("unknown create_state read = %+v, %v; want legacy", got, err)
+	}
+}

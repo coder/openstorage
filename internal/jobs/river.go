@@ -16,6 +16,7 @@ import (
 	"github.com/riverqueue/river/rivertype"
 
 	"github.com/coder/openstorage/internal/events"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/sync"
 )
 
@@ -721,7 +722,10 @@ type River struct {
 	cancelRuns context.CancelCauseFunc
 }
 
-var _ Queue = (*River)(nil)
+var (
+	_ Queue                   = (*River)(nil)
+	_ sync.FirstSyncScheduler = (*River)(nil)
+)
 
 // NewRiver opens a dedicated pool on pgURL, applies the river migrations
 // (serve owns DDL, mirroring meta/ref InitSchema), and starts workers that
@@ -873,6 +877,24 @@ func NewRiverInsertOnly(ctx context.Context, pgURL string) (*River, error) {
 		return nil, fmt.Errorf("jobs: river insert-only client: %w", err)
 	}
 	return &River{client: client, pool: pool}, nil
+}
+
+// TracksCreateState: River runs only on PostgreSQL.
+func (q *River) TracksCreateState() bool { return true }
+
+// CompleteSyncCreate inserts the first-sync job and marks the create
+// complete in one transaction on the shared database (issue #388).
+func (q *River) CompleteSyncCreate(ctx context.Context, org, repoID string) (meta.CreateOutcome, error) {
+	var out meta.CreateOutcome
+	err := pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
+		var err error
+		out, err = meta.PGCompleteRepoCreate(ctx, tx, org, repoID, func(ctx context.Context) error {
+			_, err := q.client.InsertTx(ctx, tx, syncArgs{Org: org, RepoID: repoID}, nil)
+			return err
+		})
+		return err
+	})
+	return out, err
 }
 
 func (q *River) EnqueueWebhookDelivery(ctx context.Context, d events.Delivery) error {

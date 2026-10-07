@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/events"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/sync"
 )
 
@@ -46,7 +47,10 @@ type Local struct {
 // cap × per-fold budgets instead of scaling with attacker-creatable repos.
 const localRepackWorkers = 4
 
-var _ Queue = (*Local)(nil)
+var (
+	_ Queue                   = (*Local)(nil)
+	_ sync.FirstSyncScheduler = (*Local)(nil)
+)
 
 // NewLocal builds the in-process queue. deliverer must be configured with
 // the webhook lookup; runSync is normally sync.(*Worker).Run and runPush
@@ -134,6 +138,20 @@ func (q *Local) OfferSync(ctx context.Context, job sync.Job) error {
 		return o.OfferSync(ctx, job)
 	}
 	return q.syncq.EnqueueSync(ctx, job)
+}
+
+// TracksCreateState is true only on the SQLite schedule; the in-process
+// queue serves S3-WAL, which stores no create state (issue #335).
+func (q *Local) TracksCreateState() bool {
+	_, ok := q.syncq.(sync.FirstSyncScheduler)
+	return ok
+}
+
+// CompleteSyncCreate delegates to the SQLite schedule (issue #388).
+func (q *Local) CompleteSyncCreate(ctx context.Context, org, repoID string) (meta.CreateOutcome, error) {
+	fs, ok := q.syncq.(sync.FirstSyncScheduler) // the scheduler refuses after Close
+	assertf(ok, "CompleteSyncCreate on a queue that tracks no create state")
+	return fs.CompleteSyncCreate(ctx, org, repoID)
 }
 
 // EnqueuePush delegates to the in-process queue's outbound lane (issue #90).
