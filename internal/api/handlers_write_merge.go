@@ -463,6 +463,7 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	if req.Squash && req.Strategy == "ff_only" {
 		return errors.New("squash is incompatible with the ff_only strategy")
 	}
+	req.ExpectedTargetSHA = lowerFullSHA(req.ExpectedTargetSHA)
 	if req.ExpectedTargetSHA != "" && !ref.ValidSHA(req.ExpectedTargetSHA) {
 		return errors.New("expected_target_sha must be a 40-hex sha")
 	}

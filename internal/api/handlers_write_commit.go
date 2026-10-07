@@ -298,8 +298,13 @@ func (md *wcMetadata) applyCurrentNames() {
 	if md.BaseIsEphemeral != nil {
 		md.EphemeralBase = *md.BaseIsEphemeral
 	}
+	// Full-SHA guards are case-insensitive (issue #385). base_ref is a
+	// revision and stays verbatim: a branch may have a 40-hex name.
+	md.ExpectedHeadSHA = lowerFullSHA(md.ExpectedHeadSHA)
 	if md.BaseRef != nil {
 		md.TargetCommitSHA = *md.BaseRef
+	} else {
+		md.TargetCommitSHA = lowerFullSHA(md.TargetCommitSHA)
 	}
 }
 
