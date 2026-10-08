@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +37,7 @@ import (
 )
 
 const (
+	jobCancelPollBatchSize        = 1000
 	producerReportIntervalDefault = 30 * time.Second
 	queuePollIntervalDefault      = 2 * time.Second
 	queueReportIntervalDefault    = 10 * time.Minute
@@ -42,7 +45,9 @@ const (
 
 // Test-only properties.
 type producerTestSignals struct {
+	CancelHandledDuringFetch   testsignal.TestSignal[int64]                // notifies when a cancellation is handled during a fetch
 	DeletedExpiredQueueRecords testsignal.TestSignal[struct{}]             // notifies when the producer deletes expired queue records
+	ExecutorShutdownStarted    testsignal.TestSignal[struct{}]             // notifies when the producer starts draining active jobs
 	JobFetchTriggered          testsignal.TestSignal[struct{}]             // notifies when the producer's fetch limiter is triggered via triggerJobFetch
 	MetadataChanged            testsignal.TestSignal[struct{}]             // notifies when the producer detects a metadata change
 	Paused                     testsignal.TestSignal[struct{}]             // notifies when the producer is paused
@@ -56,6 +61,7 @@ type producerTestSignals struct {
 
 func (ts *producerTestSignals) Init(tb testutil.TestingTB) {
 	ts.DeletedExpiredQueueRecords.Init(tb)
+	ts.ExecutorShutdownStarted.Init(tb)
 	ts.JobFetchTriggered.Init(tb)
 	ts.MetadataChanged.Init(tb)
 	ts.Paused.Init(tb)
@@ -77,6 +83,8 @@ type producerConfig struct {
 	// are coming in via LISTEN/NOTIFY then fetches may be delayed as long as
 	// FetchPollInterval.
 	FetchCooldown time.Duration
+
+	FetchOnlyKnownKinds bool
 
 	// FetchPollInterval is the amount of time between periodic fetches for new
 	// jobs. Typically new jobs will be picked up ~immediately after insert via
@@ -104,8 +112,8 @@ type producerConfig struct {
 	QueueEventCallback func(event *Event)
 
 	// QueuePollInterval is the amount of time between periodic checks for
-	// queue setting changes. This is only used in poll-only mode (when no
-	// notifier is provided).
+	// queue setting changes and job cancellation requests. This is only used in
+	// poll-only mode (when no notifier is provided).
 	QueuePollInterval time.Duration
 	// QueueReportInterval is the amount of time between periodic reports
 	// of the queue status.
@@ -190,22 +198,25 @@ type producer struct {
 	baseservice.BaseService
 	startstop.BaseStartStop
 
-	// Jobs which are currently being worked. Only used by main goroutine.
-	activeJobs map[int64]*jobexecutor.JobExecutor
+	// Jobs which are currently being worked. The polling goroutine snapshots
+	// their IDs; only the main goroutine accesses the executors themselves.
+	activeJobsMu sync.Mutex
+	activeJobs   map[int64]*jobexecutor.JobExecutor
 
 	completer       jobcompleter.JobCompleter
 	config          *producerConfig
 	id              atomic.Int64 // atomic because it's written at startup and read during shutdown
 	exec            riverdriver.Executor
 	errorHandler    jobexecutor.ErrorHandler
+	fetchKind       []string // cached registered kinds, including aliases; nil disables filtering
 	fetchLimiter    *chanutil.DebouncedChan
 	metricEmitHooks []rivertype.HookMetricEmit // memoized hooks of type HookMetricEmit for reuse in dispatchWork
 	state           riverpilot.ProducerState
 	pilot           riverpilot.Pilot
 	workers         *Workers
 
-	// Receives job IDs to cancel. Written by notifier goroutine, only read from
-	// main goroutine.
+	// Receives job IDs to cancel. Written by notifier and polling goroutines,
+	// only read from the main goroutine.
 	cancelCh chan int64
 
 	// Set to true when the producer thinks it should trigger another fetch as
@@ -294,6 +305,17 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 	fetchCtx, shouldStart, started, stopped := p.StartInit(fetchCtx)
 	if !shouldStart {
 		return nil
+	}
+
+	// Workers can be registered after the client is constructed, so capture
+	// kinds at startup. Keep an empty registry non-nil to avoid fetching all kinds.
+	p.fetchKind = nil
+	if p.config.FetchOnlyKnownKinds {
+		p.fetchKind = make([]string, 0, len(p.workers.workersMap))
+		for kind := range p.workers.workersMap {
+			p.fetchKind = append(p.fetchKind, kind)
+		}
+		slices.Sort(p.fetchKind)
 	}
 
 	isExpectedShutdownError := func(err error) bool {
@@ -425,11 +447,14 @@ func (p *producer) StartWorkContext(fetchCtx, workCtx context.Context) error {
 
 			subroutineWG.Add(1)
 			go p.pollForSettingChanges(subroutineCtx, &subroutineWG, initiallyPaused, initialMetadata)
+
+			subroutineWG.Add(1)
+			go p.pollForJobCancellations(subroutineCtx, &subroutineWG)
 		}
 
 		p.fetchAndRunLoop(fetchCtx, workCtx)
 		p.Logger.DebugContext(workCtx, p.Name+": Entering shutdown loop", slog.String("queue", p.config.Queue), slog.Int64("id", p.id.Load()))
-		p.executorShutdownLoop()
+		p.executorShutdownLoop(workCtx)
 
 		p.Logger.DebugContext(workCtx, p.Name+": Shutdown loop exited, awaiting subroutines", slog.String("queue", p.config.Queue), slog.Int64("id", p.id.Load()))
 		cancelSubroutines(fmt.Errorf("producer stopped: %w", startstop.ErrStop))
@@ -651,6 +676,9 @@ func (p *producer) innerFetchLoop(workCtx context.Context, fetchResultCh chan pr
 		}
 	}
 
+	// A fetched job may not have an executor yet. Keep unmatched cancellations
+	// only for this fetch so unrelated IDs cannot affect later fetches.
+	pendingCancelJobs := make(map[int64]struct{})
 	go p.dispatchWork(workCtx, limit, fetchResultCh)
 
 	for {
@@ -658,10 +686,10 @@ func (p *producer) innerFetchLoop(workCtx context.Context, fetchResultCh chan pr
 		case result := <-fetchResultCh:
 			if result.err != nil {
 				p.Logger.ErrorContext(workCtx, p.Name+": Error fetching jobs", slog.String("err", result.err.Error()), slog.String("queue", p.config.Queue))
-			} else if len(result.jobs) > 0 {
-				p.startNewExecutors(workCtx, result.jobs)
+			} else if numLocked := len(result.jobs); numLocked > 0 {
+				p.startNewExecutors(workCtx, result.jobs, result.decodeErrors, pendingCancelJobs)
 
-				if len(result.jobs) == limit {
+				if numLocked == limit {
 					// Fetch returned the maximum number of jobs that were requested,
 					// implying there may be more in the queue. Trigger another fetch when
 					// slots are available.
@@ -672,17 +700,33 @@ func (p *producer) innerFetchLoop(workCtx context.Context, fetchResultCh chan pr
 		case result := <-p.jobResultCh:
 			p.removeActiveJob(result)
 		case jobID := <-p.cancelCh:
-			p.maybeCancelJob(workCtx, jobID)
+			if !p.maybeCancelJob(workCtx, jobID) {
+				pendingCancelJobs[jobID] = struct{}{}
+			}
+			p.testSignals.CancelHandledDuringFetch.Signal(jobID)
 		}
 	}
 }
 
-func (p *producer) executorShutdownLoop() {
+func (p *producer) executorShutdownLoop(ctx context.Context) {
+	p.testSignals.ExecutorShutdownStarted.Signal(struct{}{})
+
 	// No more jobs will be fetched or executed. However, we must wait for all
 	// in-progress jobs to complete.
-	for len(p.activeJobs) != 0 {
-		result := <-p.jobResultCh
-		p.removeActiveJob(result)
+	for {
+		p.activeJobsMu.Lock()
+		numActiveJobs := len(p.activeJobs)
+		p.activeJobsMu.Unlock()
+		if numActiveJobs == 0 {
+			return
+		}
+
+		select {
+		case jobID := <-p.cancelCh:
+			p.maybeCancelJob(ctx, jobID)
+		case result := <-p.jobResultCh:
+			p.removeActiveJob(result)
+		}
 	}
 }
 
@@ -738,12 +782,16 @@ func (p *producer) finalizeShutdown(ctx context.Context) {
 
 func (p *producer) addActiveJob(id int64, executor *jobexecutor.JobExecutor) {
 	p.numJobsActive.Add(1)
+	p.activeJobsMu.Lock()
 	p.activeJobs[id] = executor
+	p.activeJobsMu.Unlock()
 }
 
 func (p *producer) removeActiveJob(job *rivertype.JobRow) {
+	p.activeJobsMu.Lock()
 	executor := p.activeJobs[job.ID]
 	delete(p.activeJobs, job.ID)
+	p.activeJobsMu.Unlock()
 	if executor == nil || executor.TryCloseSlot() {
 		p.numJobsActive.Add(-1)
 	}
@@ -780,12 +828,15 @@ func (p *producer) handleWorkerUnstuck() {
 	p.config.JobStuckCount.Add(-1)
 }
 
-func (p *producer) maybeCancelJob(ctx context.Context, id int64) {
+func (p *producer) maybeCancelJob(ctx context.Context, id int64) bool {
+	p.activeJobsMu.Lock()
 	executor, ok := p.activeJobs[id]
+	p.activeJobsMu.Unlock()
 	if !ok {
-		return
+		return false
 	}
 	executor.Cancel(ctx)
+	return true
 }
 
 func (p *producer) metricEmitHooksFromLookup() []rivertype.HookMetricEmit {
@@ -833,8 +884,9 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 		startedAt = time.Now()
 	}
 
-	jobs, err := p.pilot.JobGetAvailable(ctx, p.exec, p.state, &riverdriver.JobGetAvailableParams{
+	res, err := p.pilot.JobGetAvailable(ctx, p.exec, p.state, &riverdriver.JobGetAvailableParams{
 		ClientID:       p.config.ClientID,
+		Kind:           p.fetchKind,
 		MaxAttemptedBy: maxAttemptedBy,
 		MaxToLock:      count,
 		Now:            p.Time.NowOrNil(),
@@ -846,6 +898,9 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 		fetchResultCh <- producerFetchResult{err: err}
 		return
 	}
+	if res == nil { // tolerate a pilot returning a nil result when it locks no jobs
+		res = &riverdriver.JobGetAvailableResult{}
+	}
 
 	if len(p.metricEmitHooks) > 0 {
 		p.emitMetric(ctx, &rivertype.HookMetricEmitParams{
@@ -856,13 +911,13 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 		})
 		p.emitMetric(ctx, &rivertype.HookMetricEmitParams{
 			Metric: &rivertype.JobGetAvailableCountMetric{
-				Count: len(jobs),
+				Count: len(res.Jobs),
 				Queue: p.config.Queue,
 			},
 		})
 	}
 
-	fetchResultCh <- producerFetchResult{jobs: jobs}
+	fetchResultCh <- producerFetchResult{decodeErrors: res.DecodeErrors, jobs: res.Jobs}
 }
 
 func (p *producer) emitMetric(ctx context.Context, params *rivertype.HookMetricEmitParams) {
@@ -907,15 +962,20 @@ func (p *producer) heartbeatLogLoop(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.JobRow) {
+// startNewExecutors starts an executor for each locked job. A job whose row
+// couldn't be decoded isn't worked, but it still gets an executor that fails
+// its attempt with the decode error, so that it's retried or discarded
+// through the normal error handling path instead of being left running.
+func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.JobRow, decodeErrors map[int64]error, pendingCancelJobs map[int64]struct{}) {
 	defaultClientRetryPolicy := retrypolicy.NewDefault(p.Time)
 
 	for _, job := range jobs {
-		workInfo, ok := p.workers.workersMap[job.Kind]
-
+		decodeErr := decodeErrors[job.ID]
 		var workUnit workunit.WorkUnit
-		if ok {
-			workUnit = workInfo.workUnitFactory.MakeUnit(job)
+		if decodeErr == nil {
+			if workInfo, ok := p.workers.workersMap[job.Kind]; ok {
+				workUnit = workInfo.workUnitFactory.MakeUnit(job)
+			}
 		}
 
 		// jobCancel will always be called by the executor to prevent leaks.
@@ -932,6 +992,7 @@ func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.
 			PluginLookupByJob:        p.config.PluginLookupByJob,
 			PluginLookupGlobal:       p.config.PluginLookupGlobal,
 			JobRow:                   job,
+			JobRowDecodeErr:          decodeErr,
 			ProducerCallbacks: struct {
 				JobDone func(jobRow *rivertype.JobRow)
 				Stuck   func(ctx context.Context, jobRow *rivertype.JobRow)
@@ -946,6 +1007,10 @@ func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.
 			WorkUnit:               workUnit,
 		})
 		p.addActiveJob(job.ID, executor)
+		if _, ok := pendingCancelJobs[job.ID]; ok {
+			// Cancel before execution so the worker starts with a cancelled context.
+			executor.Cancel(workCtx)
+		}
 
 		go executor.Execute(jobCtx)
 	}
@@ -961,6 +1026,57 @@ func (p *producer) maxJobsToFetch() int {
 
 func (p *producer) handleWorkerDone(job *rivertype.JobRow) {
 	p.jobResultCh <- job
+}
+
+// Cancellation polling is independent of fetching: saturated and paused producers
+// must still cancel jobs, including while draining during graceful shutdown.
+func (p *producer) pollForJobCancellations(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(p.config.QueuePollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := p.pollForJobCancellationsOnce(ctx); err != nil {
+				if !errors.Is(context.Cause(ctx), startstop.ErrStop) {
+					p.Logger.ErrorContext(ctx, p.Name+": Error fetching job cancellation requests", slog.String("err", err.Error()))
+				}
+				continue
+			}
+		}
+	}
+}
+
+func (p *producer) pollForJobCancellationsOnce(ctx context.Context) error {
+	p.activeJobsMu.Lock()
+	jobIDs := slices.Collect(maps.Keys(p.activeJobs))
+	p.activeJobsMu.Unlock()
+
+	// Bound query size (including SQLite's parameter count) and skip database
+	// access entirely when there are no active jobs.
+	for batch := range slices.Chunk(jobIDs, jobCancelPollBatchSize) {
+		cancelIDs, err := timeoututil.WithTimeoutV(ctx, 10*time.Second, p.Name+".pollForJobCancellations", func(ctx context.Context) ([]int64, error) {
+			return p.exec.JobGetCancelRequested(ctx, &riverdriver.JobGetCancelRequestedParams{
+				ID:     batch,
+				Schema: p.config.Schema,
+			})
+		})
+		if err != nil {
+			return err
+		}
+
+		for _, id := range cancelIDs {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case p.cancelCh <- id:
+			}
+		}
+	}
+	return nil
 }
 
 func (p *producer) pollForSettingChanges(ctx context.Context, wg *sync.WaitGroup, lastPaused bool, lastMetadata []byte) {
@@ -1118,8 +1234,9 @@ func (p *producer) reportQueueStatusOnce(ctx context.Context) {
 }
 
 type producerFetchResult struct {
-	jobs []*rivertype.JobRow
-	err  error
+	decodeErrors map[int64]error
+	err          error
+	jobs         []*rivertype.JobRow
 }
 
 type errorHandlerAdapter struct {
