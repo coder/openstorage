@@ -943,6 +943,24 @@ components:
         - ref
         - commit
       type: object
+    InvalidParam:
+      additionalProperties: false
+      description: One invalid field of the request body.
+      properties:
+        name:
+          description: Dotted wire path of the field.
+          examples:
+            - deployment.production_branch
+          type: string
+        reason:
+          description: The rule that the value breaks.
+          examples:
+            - exceeds 255 characters
+          type: string
+      required:
+        - name
+        - reason
+      type: object
     MergeConflict:
       additionalProperties: false
       description: Merge failure caused by a conflict, a moved target branch, or a repository change, with the conflicting paths when known.
@@ -1029,7 +1047,7 @@ components:
       type: object
     Meta:
       additionalProperties: false
-      description: Cloud location and inbound IP addresses of the Code Storage deployment that serves the current organisation.
+      description: Cloud location and inbound IP addresses of the Code Storage cluster that serves the current organisation.
       properties:
         ips:
           $ref: "#/components/schemas/MetaIPs"
@@ -1043,17 +1061,17 @@ components:
       type: object
     MetaIPs:
       additionalProperties: false
-      description: Inbound IPv4 address ranges of the deployment, grouped by the kind of traffic they accept.
+      description: Inbound IPv4 address ranges of the cluster, grouped by the kind of traffic they accept.
       properties:
         api:
-          description: Addresses that accept HTTP API traffic. Empty when no addresses are published for the organisation's deployment.
+          description: Addresses that accept HTTP API traffic. Empty when no addresses are published for the organisation's cluster.
           examples:
             - - 192.0.2.0/24
           items:
             type: string
           type: array
         git:
-          description: Addresses that accept Git over HTTPS traffic. Empty when no addresses are published for the organisation's deployment.
+          description: Addresses that accept Git over HTTPS traffic. Empty when no addresses are published for the organisation's cluster.
           examples:
             - - 192.0.2.0/24
           items:
@@ -1065,7 +1083,7 @@ components:
       type: object
     MetaProvider:
       additionalProperties: false
-      description: Cloud provider and region of the deployment that serves the current organisation.
+      description: Cloud provider and region of the cluster that serves the current organisation.
       properties:
         name:
           description: Cloud provider that hosts the organisation, such as aws or gcp. Empty when the gateway cannot determine its location.
@@ -1239,7 +1257,6 @@ components:
         - reason
       type: object
     ProblemDetails:
-      additionalProperties: false
       description: RFC 9457-compatible problem details payload describing the error response.
       properties:
         code:
@@ -1890,12 +1907,11 @@ components:
             - glpat_xxxxxxxxxxxx
           type: string
         username:
-          description: Optional username for HTTPS authentication. Omit it for token-only providers.
+          description: Username for HTTPS authentication. GitLab needs a non-empty username, such as `oauth2`. Bitbucket access tokens use `x-token-auth`. Gitea, Forgejo, and Codeberg accept the token with no username.
           examples:
-            - git
+            - oauth2
           type: string
       required:
-        - username
         - password
       type: object
     ReposGitCredentialsCreateRequestLegacy:
@@ -1914,13 +1930,12 @@ components:
             - repo_7f2b3d9
           type: string
         username:
-          description: Optional username for HTTPS authentication. Omit it for token-only providers.
+          description: Username for HTTPS authentication. GitLab needs a non-empty username, such as `oauth2`. Bitbucket access tokens use `x-token-auth`. Gitea, Forgejo, and Codeberg accept the token with no username.
           examples:
-            - git
+            - oauth2
           type: string
       required:
         - repo_id
-        - username
         - password
       type: object
     ReposGitCredentialsDeleteRequestLegacy:
@@ -1945,12 +1960,11 @@ components:
             - glpat_rotated_token
           type: string
         username:
-          description: Optional username for HTTPS authentication. Omit for token-only providers.
+          description: Username for HTTPS authentication. GitLab needs a non-empty username, such as `oauth2`. Bitbucket access tokens use `x-token-auth`. Gitea, Forgejo, and Codeberg accept the token with no username. An omitted username clears the stored one.
           examples:
-            - git
+            - oauth2
           type: string
       required:
-        - username
         - password
       type: object
     ReposGitCredentialsUpdateRequestLegacy:
@@ -1968,13 +1982,12 @@ components:
             - glpat_rotated_token
           type: string
         username:
-          description: Optional username for HTTPS authentication. Omit for token-only providers.
+          description: Username for HTTPS authentication. GitLab needs a non-empty username, such as `oauth2`. Bitbucket access tokens use `x-token-auth`. Gitea, Forgejo, and Codeberg accept the token with no username. An omitted username clears the stored one.
           examples:
-            - git
+            - oauth2
           type: string
       required:
         - id
-        - username
         - password
       type: object
     ReposGrepRequest:
@@ -2810,6 +2823,18 @@ components:
       required:
         - provider
       type: object
+    ValidationProblemDetails:
+      allOf:
+        - $ref: "#/components/schemas/ProblemDetails"
+        - properties:
+            invalid_params:
+              description: The invalid fields of the request body, one item for each field. The response leaves it out when the server cannot name the field, for example when the body is not valid JSON.
+              items:
+                $ref: "#/components/schemas/InvalidParam"
+              type: array
+          type: object
+      description: Problem details of a request body that is not valid. `invalid_params` names each invalid field.
+      type: object
     WebhookRepository:
       additionalProperties: false
       description: The repository that produced the event.
@@ -2899,6 +2924,8 @@ info:
 
     Most endpoints return RFC 9457-compatible problem details under `application/problem+json`, with a legacy `error` field mirrored from `detail`. Each problem body has a stable, snake_case `code`. Branch on `code`, not on `detail`. The Error codes section lists the values.
 
+    A `400 Bad Request` response for a request body can name the invalid fields in `invalid_params`. Each item has the dotted path of the field in `name`, for example `deployment.production_branch`, and the rule that the value breaks in `reason`.
+
     A `429 Too Many Requests` response carries the current IETF `RateLimit` service-limit field and `Retry-After`. `RateLimit` reports immediately available quota (`r`) and its effective window in seconds (`t`); `Retry-After` is the minimum delay and takes precedence. The gateway's capacity is dynamic, so it does not advertise a fixed `RateLimit-Policy` on successful responses.
 
     Streaming commit and note workflows may return operation-specific failure bodies so callers can inspect partial results, branch state, or workflow status without parsing generic error strings.
@@ -2940,7 +2967,7 @@ paths:
   /api/meta:
     get:
       description: |-
-        Return the cloud provider, region, and public inbound IP addresses of the Code Storage deployment that serves the current organisation. Addresses are listed separately for Git over HTTPS and for the HTTP API; allow them in firewall rules that restrict outbound traffic to Code Storage. The lists change when the deployment's ingress changes, so poll this endpoint rather than copying them once.
+        Return the cloud provider, region, and public inbound IP addresses of the Code Storage cluster that serves the current organisation. Addresses are listed separately for Git over HTTPS and for the HTTP API; allow them in firewall rules that restrict outbound traffic to Code Storage. The lists change when the cluster's ingress changes, so poll this endpoint rather than copying them once.
 
         Scope: `org:read`.
       operationId: meta-get
@@ -2959,7 +2986,7 @@ paths:
                   region: us-east-2
               schema:
                 $ref: "#/components/schemas/Meta"
-          description: Cloud location and inbound IP addresses of the deployment that serves the organisation.
+          description: Cloud location and inbound IP addresses of the cluster that serves the organisation.
         "400":
           content:
             application/json:
@@ -3309,7 +3336,7 @@ paths:
                 title: Bad Request
                 type: about:blank
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               example:
                 code: bad_request
@@ -3320,8 +3347,8 @@ paths:
                 title: Bad Request
                 type: about:blank
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: The repository name was invalid or did not match the JWT repo claim, the request set both base_repo and upstream, or the source was invalid.
+                $ref: "#/components/schemas/ValidationProblemDetails"
+          description: The repository name was invalid or did not match the JWT repo claim, the request set both base_repo and upstream, or the source was invalid. `invalid_params` names each invalid field of the body.
         "401":
           content:
             application/json:
@@ -3697,26 +3724,30 @@ paths:
             application/json:
               example:
                 code: bad_request
-                detail: default_branch is required
-                error: default_branch is required
-                instance: /api/repos/my-demo-repository
+                detail: default_branch must be a string
+                error: default_branch must be a string
+                invalid_params:
+                  - name: default_branch
+                    reason: must be a string
                 status: 400
                 title: Bad Request
                 type: about:blank
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               example:
                 code: bad_request
-                detail: default_branch is required
-                error: default_branch is required
-                instance: /api/repos/my-demo-repository
+                detail: default_branch must be a string
+                error: default_branch must be a string
+                invalid_params:
+                  - name: default_branch
+                    reason: must be a string
                 status: 400
                 title: Bad Request
                 type: about:blank
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: The body could not be decoded as JSON, or `default_branch` was missing or empty.
+                $ref: "#/components/schemas/ValidationProblemDetails"
+          description: The body could not be decoded as JSON, a field was not valid, or `default_branch` was missing or empty. `invalid_params` names each invalid field.
         "401":
           content:
             application/json:
@@ -3873,10 +3904,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -4419,10 +4450,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -4703,10 +4734,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -6669,7 +6700,7 @@ paths:
           application/json:
             example:
               password: glpat_xxxxxxxxxxxx
-              username: git
+              username: oauth2
             schema:
               $ref: "#/components/schemas/ReposGitCredentialsCreateRequest"
         description: Store HTTPS credentials for a generic Git upstream such as GitLab, Bitbucket, Gitea, Forgejo, Codeberg, or SourceHut.
@@ -6688,10 +6719,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -6918,7 +6949,7 @@ paths:
           application/json:
             example:
               password: glpat_rotated_token
-              username: git
+              username: oauth2
             schema:
               $ref: "#/components/schemas/ReposGitCredentialsUpdateRequest"
         description: Rotate or replace an existing generic Git credential.
@@ -6937,10 +6968,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -7084,10 +7115,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -7232,10 +7263,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -7550,10 +7581,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -7834,10 +7865,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -7984,10 +8015,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -8252,10 +8283,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -8945,10 +8976,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -9309,10 +9340,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -9557,26 +9588,30 @@ paths:
             application/json:
               example:
                 code: bad_request
-                detail: default_branch is required
-                error: default_branch is required
-                instance: /api/repos/my-demo-repository
+                detail: default_branch must be a string
+                error: default_branch must be a string
+                invalid_params:
+                  - name: default_branch
+                    reason: must be a string
                 status: 400
                 title: Bad Request
                 type: about:blank
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               example:
                 code: bad_request
-                detail: default_branch is required
-                error: default_branch is required
-                instance: /api/repos/my-demo-repository
+                detail: default_branch must be a string
+                error: default_branch must be a string
+                invalid_params:
+                  - name: default_branch
+                    reason: must be a string
                 status: 400
                 title: Bad Request
                 type: about:blank
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: The body could not be decoded as JSON, or `default_branch` was missing or empty.
+                $ref: "#/components/schemas/ValidationProblemDetails"
+          description: The body could not be decoded as JSON, a field was not valid, or `default_branch` was missing or empty. `invalid_params` names each invalid field.
         "401":
           content:
             application/json:
@@ -9950,7 +9985,7 @@ paths:
                 title: Bad Request
                 type: about:blank
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               example:
                 code: bad_request
@@ -9961,8 +9996,8 @@ paths:
                 title: Bad Request
                 type: about:blank
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: The repository name was invalid or did not match the JWT repo claim, the request set both base_repo and upstream, or the source was invalid.
+                $ref: "#/components/schemas/ValidationProblemDetails"
+          description: The repository name was invalid or did not match the JWT repo claim, the request set both base_repo and upstream, or the source was invalid. `invalid_params` names each invalid field of the body.
         "401":
           content:
             application/json:
@@ -10099,10 +10134,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -10506,10 +10541,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -10783,10 +10818,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -12849,10 +12884,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -12953,7 +12988,7 @@ paths:
             example:
               password: glpat_xxxxxxxxxxxx
               repo_id: repo_7f2b3d9
-              username: git
+              username: oauth2
             schema:
               $ref: "#/components/schemas/ReposGitCredentialsCreateRequestLegacy"
         description: Store HTTPS credentials for a generic Git upstream such as GitLab, Bitbucket, Gitea, Forgejo, Codeberg, or SourceHut.
@@ -12972,10 +13007,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -13076,7 +13111,7 @@ paths:
             example:
               id: ggc_1234567890abcdef
               password: glpat_rotated_token
-              username: git
+              username: oauth2
             schema:
               $ref: "#/components/schemas/ReposGitCredentialsUpdateRequestLegacy"
         description: Rotate or replace an existing generic Git credential.
@@ -13095,10 +13130,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -13238,10 +13273,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -13384,10 +13419,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -13705,10 +13740,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -13985,10 +14020,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -14243,10 +14278,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -14665,10 +14700,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -14920,10 +14955,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
+                $ref: "#/components/schemas/ValidationProblemDetails"
           description: Bad Request
         "401":
           content:
@@ -15029,7 +15064,7 @@ tags:
     name: Tags
   - description: Attach and retrieve Git notes for commits or other Git objects.
     name: Notes
-  - description: Read metadata about the Code Storage deployment that serves your organisation, such as its cloud location and inbound IP addresses.
+  - description: Read metadata about the Code Storage cluster that serves your organisation, such as its cloud location and inbound IP addresses.
     name: Organization
 webhooks:
   push:

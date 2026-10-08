@@ -740,8 +740,8 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("git init: %w: %s", err, stderr)}
 	}
 
-	// Upstream credential: absent = public upstream. Username defaults to
-	// "git" for token-only providers (docs/reference/http-api.md: username optional).
+	// Upstream credential: absent = public upstream. An omitted username
+	// gets a per-provider placeholder (credentialUsername).
 	username, password := "", ""
 	switch cred, err := w.Credentials.CredentialForRepo(ctx, job.RepoID); {
 	case err == nil:
@@ -749,9 +749,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	case !errors.Is(err, ErrNotFound):
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("load credential: %w", err)}
 	}
-	if username == "" {
-		username = "git"
-	}
+	username = credentialUsername(up.Provider, username)
 	fetchEnv, err := authGitEnv(filepath.Join(tmp, "askpass-fetch.sh"), username, password, w.allowProtocol())
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: err}
@@ -1001,6 +999,25 @@ func hermeticGitEnv(allowProtocol string) []string {
 		"GIT_CONFIG_SYSTEM=/dev/null",
 		"GIT_ALLOW_PROTOCOL="+allowProtocol,
 	)
+}
+
+// credentialUsername returns the Basic-auth username sent with a stored
+// credential. The API makes the username optional, as upstream does, and
+// git sends no credentials at all for an empty username, so an omitted
+// one needs a placeholder: x-token-auth for provider bitbucket (Bitbucket
+// access tokens require it), "git" otherwise (Gitea, Forgejo, Codeberg
+// and GitLab personal/project/group/OAuth tokens ignore the username).
+// Credentials whose username matters (GitLab deploy and CI job tokens,
+// Bitbucket app passwords and API tokens) must send it
+// (docs/reference/http-api.md, "Git credentials").
+func credentialUsername(provider, stored string) string {
+	if stored != "" {
+		return stored
+	}
+	if provider == "bitbucket" {
+		return "x-token-auth"
+	}
+	return "git"
 }
 
 // authGitEnv extends hermeticGitEnv with a GIT_ASKPASS helper feeding the
