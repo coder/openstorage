@@ -155,6 +155,8 @@ type Driver[TTx any] interface {
 
 	// SupportsListener gets whether this driver supports a listener. Drivers
 	// that don't support a listener support poll only mode only.
+	// Before InitDriver, this reports the driver's default capability; callers
+	// must recheck after initialization to account for the database server.
 	//
 	// API is not stable. DO NOT USE.
 	SupportsListener() bool
@@ -167,6 +169,8 @@ type Driver[TTx any] interface {
 	// notification mechanism, it will still broadcast in case there are other
 	// clients/drivers on the database that do support a listener. If
 	// notifications can't be supported at all, no broadcast attempt is made.
+	// Like SupportsListener, this is refined by InitDriver. Executors also
+	// initialize lazily before sending notifications for clients that never start.
 	//
 	// API is not stable. DO NOT USE.
 	SupportsListenNotify() bool
@@ -224,6 +228,11 @@ type Executor interface {
 	IndexReindex(ctx context.Context, params *IndexReindexParams) error
 	IndexReindexArtifacts(ctx context.Context, params *IndexReindexArtifactsParams) ([]string, error)
 
+	// InitDriver initializes driver-specific state using information read from
+	// the database. Implementations must be safe to call concurrently and
+	// repeatedly, and should cache successfully initialized state.
+	InitDriver(ctx context.Context) error
+
 	JobCancel(ctx context.Context, params *JobCancelParams) (*rivertype.JobRow, error)
 	JobCountByAllStates(ctx context.Context, params *JobCountByAllStatesParams) (map[rivertype.JobState]int, error)
 	JobCountByQueueAndState(ctx context.Context, params *JobCountByQueueAndStateParams) ([]*JobCountByQueueAndStateResult, error)
@@ -231,11 +240,27 @@ type Executor interface {
 	JobDelete(ctx context.Context, params *JobDeleteParams) (*rivertype.JobRow, error)
 	JobDeleteBefore(ctx context.Context, params *JobDeleteBeforeParams) (int, error)
 	JobDeleteMany(ctx context.Context, params *JobDeleteManyParams) ([]*rivertype.JobRow, error)
-	JobGetAvailable(ctx context.Context, params *JobGetAvailableParams) ([]*rivertype.JobRow, error)
+
+	// JobGetAvailable locks available jobs for work, moving them to `running`.
+	// A locked job whose row can't be fully decoded doesn't fail the call.
+	// It's included in Jobs with an entry in DecodeErrors so that the caller
+	// can fail its attempt instead of working the partial row.
+	JobGetAvailable(ctx context.Context, params *JobGetAvailableParams) (*JobGetAvailableResult, error)
+
 	JobGetByID(ctx context.Context, params *JobGetByIDParams) (*rivertype.JobRow, error)
 	JobGetByIDMany(ctx context.Context, params *JobGetByIDManyParams) ([]*rivertype.JobRow, error)
 	JobGetByKindMany(ctx context.Context, params *JobGetByKindManyParams) ([]*rivertype.JobRow, error)
+
+	// JobGetCancelRequested returns IDs of running jobs with a cancellation request,
+	// restricted to the provided IDs.
+	JobGetCancelRequested(ctx context.Context, params *JobGetCancelRequestedParams) ([]int64, error)
+
+	// JobGetStuck gets jobs that have been running since before a horizon. A
+	// job row that can't be fully decoded is returned with the fields that
+	// couldn't be decoded left empty so that one bad row can't prevent stuck
+	// jobs from being rescued.
 	JobGetStuck(ctx context.Context, params *JobGetStuckParams) ([]*rivertype.JobRow, error)
+
 	JobInsertFastMany(ctx context.Context, params *JobInsertFastManyParams) ([]*JobInsertFastResult, error)
 	JobInsertFastManyNoReturning(ctx context.Context, params *JobInsertFastManyParams) (int, error)
 	JobInsertFull(ctx context.Context, params *JobInsertFullParams) (*rivertype.JobRow, error)
@@ -245,7 +270,13 @@ type Executor interface {
 	JobRescueMany(ctx context.Context, params *JobRescueManyParams) (*struct{}, error)
 	JobRetry(ctx context.Context, params *JobRetryParams) (*rivertype.JobRow, error)
 	JobSchedule(ctx context.Context, params *JobScheduleParams) ([]*JobScheduleResult, error)
+
+	// JobSetStateIfRunningMany sets the state of running jobs, returning the
+	// resulting rows. A job row that can't be fully decoded is returned with
+	// the fields that couldn't be decoded left empty so that the state of an
+	// undecodable job can be set without failing the other jobs set with it.
 	JobSetStateIfRunningMany(ctx context.Context, params *JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error)
+
 	JobUpdate(ctx context.Context, params *JobUpdateParams) (*rivertype.JobRow, error)
 	JobUpdateFull(ctx context.Context, params *JobUpdateFullParams) (*rivertype.JobRow, error)
 	LeaderAttemptElect(ctx context.Context, params *LeaderElectParams) (*Leader, error)
@@ -280,8 +311,8 @@ type Executor interface {
 	// the `line` column was added to the migrations table.
 	MigrationInsertManyAssumingMain(ctx context.Context, params *MigrationInsertManyAssumingMainParams) ([]*Migration, error)
 
-	// NotificationDeleteBefore deletes notifications before a certain time
-	// horizon.
+	// NotificationDeleteBefore deletes up to Max notifications before a certain
+	// time horizon, oldest first.
 	//
 	// A "notification" in this context refers to a row in `river_notification`
 	// which is a special table implemented in some databases (e.g. SQLite) that
@@ -289,6 +320,10 @@ type Executor interface {
 	NotificationDeleteBefore(ctx context.Context, params *NotificationDeleteBeforeParams) (int, error)
 
 	NotifyMany(ctx context.Context, params *NotifyManyParams) error
+
+	// Ping checks that the database is reachable.
+	Ping(ctx context.Context) error
+
 	PGAdvisoryXactLock(ctx context.Context, key int64) (*struct{}, error)
 
 	QueueCreateOrSetUpdatedAt(ctx context.Context, params *QueueCreateOrSetUpdatedAtParams) (*rivertype.Queue, error)
@@ -423,13 +458,31 @@ type JobDeleteBeforeParams struct {
 type JobDeleteManyParams JobListParams
 
 type JobGetAvailableParams struct {
-	ClientID       string
+	ClientID string
+
+	// Kind restricts claims to these kinds. Nil allows every kind; an empty,
+	// non-nil slice allows none. Filtering occurs before the limit and locking.
+	Kind []string
+
 	MaxAttemptedBy int
 	MaxToLock      int
 	Now            *time.Time
 	ProducerID     int64
 	Queue          string
 	Schema         string
+}
+
+// JobGetAvailableResult is the result of JobGetAvailable.
+type JobGetAvailableResult struct {
+	// DecodeErrors contains decode errors keyed by job ID. It's nil when all
+	// rows decoded successfully. Each entry corresponds to a row in Jobs whose
+	// attempt should be failed instead of worked.
+	DecodeErrors map[int64]error
+
+	// Jobs contains every locked job, including rows that couldn't be fully
+	// decoded. Fields that couldn't be decoded are left empty, with the error
+	// recorded in DecodeErrors. Every job has been moved to `running`.
+	Jobs []*rivertype.JobRow
 }
 
 type JobGetByIDParams struct {
@@ -444,6 +497,12 @@ type JobGetByIDManyParams struct {
 
 type JobGetByKindManyParams struct {
 	Kind   []string
+	Schema string
+}
+
+// JobGetCancelRequestedParams restricts cancellation checks to specific job IDs.
+type JobGetCancelRequestedParams struct {
+	ID     []int64
 	Schema string
 }
 
@@ -845,6 +904,7 @@ type NotifyManyParams struct {
 
 type NotificationDeleteBeforeParams struct {
 	CreatedAtHorizon time.Time
+	Max              int
 	Schema           string
 }
 
@@ -963,7 +1023,7 @@ func MigrationLineMainTruncateTables(version int) []string {
 		return []string{"river_job", "river_leader", "river_queue"}
 	case 5, 6:
 		return []string{"river_job", "river_leader", "river_queue", "river_client", "river_client_queue"}
-	case 0, 7:
+	case 0, 7, 8:
 		return []string{"river_job", "river_leader", "river_queue", "river_notification"}
 	}
 

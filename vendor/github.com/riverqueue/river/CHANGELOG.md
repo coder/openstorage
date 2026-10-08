@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-10-05
+
+### Changed
+
+- Internal transaction helpers now reuse existing transactions instead of creating unnecessary savepoints. Callers of transactional APIs must roll back their transaction on error; applications that need partial rollback can create an explicit savepoint around the River call. Set `RIVER_USE_LEGACY_SUBTRANSACTIONS=1` (or `true`) before starting the application to restore savepoints in these helpers, including those used by River Pro. This is a temporary compatibility fallback planned for removal in a future release. [PR #1420](https://github.com/riverqueue/river/pull/1420).
+
+### Fixed
+
+- Fixed `rivertest.Worker` to honor a configured `Config.JobStuckThreshold` for stuck job detection. Previously, it always used an internal 5 second threshold, so the `Job appears to be stuck` log line was emitted at a different time than it would be under a real client. [PR #1418](https://github.com/riverqueue/river/pull/1418).
+- Fixed SQLite job cleanup stalling when excluded queues fill the oldest batch, and added support for included queue filters so per-queue retention works on SQLite. [PR #1417](https://github.com/riverqueue/river/pull/1417).
+- Fixed a unique insert skipped as a duplicate of a job of a different kind (possible with `UniqueOpts.ExcludeKind`) changing the existing job's kind to its own. [PR #1421](https://github.com/riverqueue/river/pull/1421).
+
+## [0.48.0] - 2026-09-30
+
+⚠️ This release contains a new database migration, version 8, but it only affects SQLite:
+
+- If you're on Postgres, you can ignore it with no adverse effect.
+- If you're on SQLite, it rebuilds `river_job` to add an `AUTOINCREMENT` keyword to the primary key, preventing a possible edge case where generated job IDs could be reused after deletion. It's not necessary to run the migration for River to work, but it's a good idea to get it in when convenient. [PR #1390](https://github.com/riverqueue/river/pull/1390).
+
+⚠️ If using River Pro, make sure to upgrade it to at least River Pro v0.31.0 to get a compatible package.
+
+### Added
+
+- Added support for YugabyteDB. When `LISTEN/NOTIFY` is unavailable or disabled, clients automatically poll for running job cancellations and queue pause, resume, and metadata changes, and skip unsupported notification broadcasts. This works with the default `PollOnly: false`. Native notifications require YugabyteDB 2025.2.3 or later with `ysql_yb_enable_listen_notify=true` on both Masters and TServers. [PR #1347](https://github.com/riverqueue/river/pull/1347).
+- Added `Config.LeaderElectionDisabled` to let a client work jobs without participating in leader election or running maintenance services. Other eligible clients in the same database and schema continue handling scheduling, retries, periodic enqueueing, rescue, and cleanup. [PR #1382](https://github.com/riverqueue/river/pull/1382).
+- Added `Config.FetchOnlyKnownKinds` to restrict job fetching to registered worker kinds, including aliases. Clients with different workers can share a queue while leaving unknown jobs available without consuming attempts. Disabled by default; leader election and stuck-job rescue behavior are unchanged. [PR #1396](https://github.com/riverqueue/river/pull/1396).
+
+### Changed
+
+- `UniqueOpts.ByPeriod` now derives a job's period from its effective scheduled time (`InsertOpts.ScheduledAt` when set, otherwise the insertion time), so scheduled jobs are deduplicated against other jobs scheduled in the same period rather than against jobs inserted in the same period. Periods are also now always measured in UTC, so processes and `ScheduledAt` values in different time zones produce the same unique key for the same period. Unique keys for scheduled `ByPeriod` jobs, and for any `ByPeriod` job inserted from a process whose local time zone isn't UTC, differ from those produced by previous versions. During a rolling upgrade, old and new clients may therefore each insert one job for such a period; jobs that aren't scheduled and are inserted from UTC processes are unaffected. [PR #1377](https://github.com/riverqueue/river/pull/1377).
+- `UniqueOpts{ExcludeKind: true}` alone is now rejected at insert time instead of being silently ignored. `UniqueOpts.isEmpty()` now considers `ExcludeKind`, in line with the equivalent handling in internal/dbunique. **Warning:** This new rejection can be considered a minor breaking change. [PR #1404](https://github.com/riverqueue/river/pull/1404).
+
+### Fixed
+
+- Fixed cancelled transaction starts leaving Turso connections unusable, which could prevent maintenance from recovering after a startup failure. [PR #1347](https://github.com/riverqueue/river/pull/1347).
+- Fixed maintenance startup failures leaving a client renewing leadership with maintenance stopped in poll-only mode. After exhausting startup retries, clients now request local resignation without depending on database notifications. [PR #1347](https://github.com/riverqueue/river/pull/1347).
+- Fixed `JobRescuer` overwriting jobs that complete, leave the running state, or are claimed again by another worker after being fetched for rescue, preserving their state, errors, metadata, and timestamps across PostgreSQL and SQLite drivers. Fixes [#1302](https://github.com/riverqueue/river/issues/1302). [PR #1373](https://github.com/riverqueue/river/pull/1373).
+- Fixed SQLite job list pagination skipping or repeating jobs by formatting cursor timestamps consistently with stored timestamps. [PR #1374](https://github.com/riverqueue/river/pull/1374).
+- Improved PostgreSQL job listing performance when filtering by one finalized state (`completed`, `cancelled`, or `discarded`) and sorting by finalized time, including in River UI. [PR #1374](https://github.com/riverqueue/river/pull/1374).
+- Fixed `rivermigrate` leaving `river_migration` rows behind after migrating a non-main migration line down through its version 1, which caused a later up migration of that line to skip version 1. With `MigrateTx`, rows for every removed version were left behind. [PR #1378](https://github.com/riverqueue/river/pull/1378).
+- Fixed `river bench` inserting every benchmark job with a `num` arg of `0` instead of numbering jobs sequentially. [PR #1379](https://github.com/riverqueue/river/pull/1379).
+- Attempt errors that are valid JSON but don't have the shape River writes (for example an `at` timestamp in another format, an `attempt` stored as a string, or an `error` or `trace` that isn't a string) are now decoded on a best effort basis when reading jobs from the database. Timestamps outside RFC 3339 are left zero; stored values are unchanged. Previously a single such element made its job unreadable, and if that happened while fetching jobs, every job locked in the same fetch was left `running` indefinitely. [PR #1380](https://github.com/riverqueue/river/pull/1380).
+- A fetched job whose row can't be decoded (for example a SQLite job whose `tags` were changed to something other than an array of strings) no longer leaves every job locked in the same fetch stuck `running`. The other jobs are worked normally, while the undecodable job's attempt fails with an error describing the decode failure, and it's retried or discarded like any other failed job. Its original values are preserved, with non-array `errors` values wrapped to append the failure or rescue error. Neither the rescuer nor the SQLite scheduler fails on such a job, so its retry doesn't stop other jobs from being rescued or scheduled. [PR #1380](https://github.com/riverqueue/river/pull/1380).
+- Fixed SQLite notification listeners delivering notifications from before a subscription or from an unsubscribe gap. Notification reads now fetch subscribed topics in bounded batches, and cleanup deletes expired notifications in batches of 10,000 rows (reduced to 1,000 after repeated timeouts), with pauses between batches to reduce write lock contention. [PR #1381](https://github.com/riverqueue/river/pull/1381).
+- Fixed the job completer panicking when a job it was finalizing had its state changed concurrently, like being moved to `pending` out of band, or being rescued while the completer's update waited on the row lock (in which case PostgreSQL returns the job's pre-update `running` row). Such jobs are now skipped without emitting a completion event. [PR #1383](https://github.com/riverqueue/river/pull/1383).
+- Fixed `JobList` pagination skipping or repeating jobs when ordering by `JobListOrderByTime` with multiple states. Cursors now use the same time field as the list's ordering (the one for the first listed state) rather than the one for each job's own state. Jobs where that field is null, like `finalized_at` for unfinalized jobs, are paginated correctly and consistently sort last in ascending order and first in descending order on all drivers. Ordering by `JobListOrderByTime` with an empty `States()` filter now uses `scheduled_at` instead of returning an error. [PR #1384](https://github.com/riverqueue/river/pull/1384).
+- A SQLite job whose `args`, `attempted_by`, `errors`, `metadata`, or `tags` were changed to text that isn't valid JSON no longer makes every fetch from its queue fail with a "malformed JSON" error. The job's attempt fails like that of any other job that can't be decoded, and completing, rescuing, or scheduling it no longer fails either. Invalid values are left in place, except that an invalid `errors` value is kept as a string in a new array so that attempt errors can still be appended. [PR #1386](https://github.com/riverqueue/river/pull/1386).
+- Fixed `UniqueOpts.ByArgs` skipping distinct jobs or failing inserts when JSON keys contain path syntax (like `user.id`), are empty, or come from unnamed tags like `json:",omitempty"`. Unaffected unique keys remain unchanged; affected jobs may be inserted again after upgrading or by old and new clients during a rolling upgrade. [PR #1387](https://github.com/riverqueue/river/pull/1387).
+- Fixed `JobListCursor.UnmarshalText` rejecting valid cursors whose URL-safe base64 encoding contains `-` or `_`, so cursors produced by `MarshalText` always round-trip. [PR #1388](https://github.com/riverqueue/river/pull/1388).
+- Fixed SQLite drivers deleting jobs in a finalized state whose retention period was set to -1 (keep forever), like `Config.DiscardedJobRetentionPeriod: -1`, whenever another state's retention period was finite. [PR #1389](https://github.com/riverqueue/river/pull/1389).
+- Fixed SQLite reusing the ID of a deleted job when that job held the largest ID, which could cause an ID observed earlier to refer to an unrelated job later. [PR #1390](https://github.com/riverqueue/river/pull/1390).
+- Fixed the `Job appears to be stuck` log line reporting the client-level `JobTimeout` instead of the worker-level timeout when a worker overrides `Timeout`. [PR #1394](https://github.com/riverqueue/river/pull/1394).
+- Fixed job cancellations received during a fetch being lost before the fetched jobs started. Matching jobs now receive cancellation before work begins. [PR #1397](https://github.com/riverqueue/river/pull/1397).
+- Fixed SQLite `JobCancel` and `JobCancelTx` notifying running workers through the shared control outbox, so their contexts are cancelled when the transaction commits. [PR #1398](https://github.com/riverqueue/river/pull/1398).
+- Fixed SQLite `InsertMany` and `InsertManyTx` reporting multiple inserted jobs when a batch contains the same active unique key more than once. Such batches now fail atomically, matching PostgreSQL. [PR #1399](https://github.com/riverqueue/river/pull/1399).
+- Fixed error and panic handlers receiving the wrong job row when a single execution reports errors for multiple jobs. [PR #1401](https://github.com/riverqueue/river/pull/1401).
+- Fixed the default retry policy scheduling a job's retry about 292 years in the past on amd64 once the job had errored 310 or more times, which made it run again immediately. The capped retry delay is now exactly the maximum duration on every architecture. [PR #1402](https://github.com/riverqueue/river/pull/1402).
+- Fixed up migrations targeting an already-applied version to do nothing instead of applying later pending migrations. [PR #1403](https://github.com/riverqueue/river/pull/1403).
+- Fixed remote cancellation leaving peer jobs running until rescue when a worker returns per-job results for several jobs. The cancelled job now settles as cancelled, and peers settle according to their own results. [PR #1408](https://github.com/riverqueue/river/pull/1408).
+- Fixed `JobCancel` returning a stale pre-commit row to the loser of a concurrent-cancel race. The query's fallback read now takes a row lock (`FOR UPDATE`), matching the documented "returns the up-to-date `JobRow`" contract. The analogous shape in `JobRetry` is known and will follow separately. [PR #1409](https://github.com/riverqueue/river/pull/1409).
+- Fixed `JobRetry` returning a stale pre-commit row to the loser of a concurrent retry race. The CTE's fallback read now takes a row lock (`FOR UPDATE`), the same shape as the `JobCancel` fix. [PR #1410](https://github.com/riverqueue/river/pull/1410).
+
 ## [0.47.0] - 2026-09-01
 
 ### Added

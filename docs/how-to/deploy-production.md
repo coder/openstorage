@@ -31,7 +31,7 @@ clients ──► reverse proxy (TLS) ──► N × openstorage serve ──►
 
 ### Runtime base and support
 
-The Dockerfile pins the runtime base to **Alpine 3.24.1 by multi-platform image index
+The Dockerfile pins the runtime base to **Alpine 3.24.2 by multi-platform image index
 digest**. This does **not** make the full build reproducible or guarantee current
 package fixes:
 
@@ -42,7 +42,7 @@ package fixes:
 - Base-image and package upgrades still need qualification.
 
 Alpine v3.24 upstream support ([release inventory](https://alpinelinux.org/releases.json),
-checked 2026-09-11): `main` through **2028-06-01**, `community` through **2026-11-01**.
+checked 2026-10-08): `main` through **2028-06-01**, `community` through **2026-11-01**.
 These are repository support dates, not a whole-image support guarantee or a
 vulnerability-scan result.
 

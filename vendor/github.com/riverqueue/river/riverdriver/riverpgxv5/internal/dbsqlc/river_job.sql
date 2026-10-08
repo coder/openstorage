@@ -48,10 +48,10 @@ WITH locked_job AS (
 notification AS (
     SELECT
         id,
-        pg_notify(
+        CASE WHEN @notify::boolean THEN pg_notify(
             concat(coalesce(sqlc.narg('schema')::text, current_schema()), '.', @control_topic::text),
             json_build_object('action', 'cancel', 'job_id', id, 'queue', queue)::text
-        )
+        ) END
     FROM
         locked_job
     WHERE
@@ -72,10 +72,13 @@ updated_job AS (
     WHERE river_job.id = notification.id
     RETURNING river_job.*
 )
-SELECT *
-FROM /* TEMPLATE: schema */river_job
-WHERE id = @id::bigint
-    AND id NOT IN (SELECT id FROM updated_job)
+SELECT * FROM (
+    SELECT *
+    FROM /* TEMPLATE: schema */river_job
+    WHERE id = @id::bigint
+    FOR UPDATE
+) AS fallback_job
+WHERE fallback_job.id NOT IN (SELECT id FROM updated_job)
 UNION
 SELECT *
 FROM updated_job;
@@ -206,6 +209,7 @@ WITH locked_jobs AS (
     WHERE
         state = 'available'
         AND queue = @queue::text
+        AND (sqlc.narg('kind')::text[] IS NULL OR kind = ANY(sqlc.narg('kind')::text[]))
         AND scheduled_at <= coalesce(sqlc.narg('now')::timestamptz, now())
     ORDER BY
         priority ASC,
@@ -252,6 +256,14 @@ ORDER BY id;
 SELECT *
 FROM /* TEMPLATE: schema */river_job
 WHERE kind = any(@kind::text[])
+ORDER BY id;
+
+-- name: JobGetCancelRequested :many
+SELECT id
+FROM /* TEMPLATE: schema */river_job
+WHERE id = any(@id::bigint[])
+    AND metadata ? 'cancel_attempted_at'
+    AND state = 'running'
 ORDER BY id;
 
 -- name: JobGetStuck :many
@@ -317,8 +329,11 @@ ON CONFLICT (unique_key)
         AND unique_states IS NOT NULL
         AND /* TEMPLATE: schema */river_job_state_in_bitmask(unique_states, state)
     -- Something needs to be updated for a row to be returned on a conflict.
-    DO UPDATE SET kind = EXCLUDED.kind
-RETURNING sqlc.embed(river_job), (xmax != 0) AS unique_skipped_as_duplicate;
+    -- Keep the existing kind, which may differ under `ExcludeKind`.
+    DO UPDATE SET kind = river_job.kind
+RETURNING
+    sqlc.embed(river_job),
+    /* TEMPLATE_BEGIN: unique_skipped_as_duplicate */ (xmax != 0) /* TEMPLATE_END */ AS unique_skipped_as_duplicate;
 
 -- name: JobInsertFastManyNoReturning :execrows
 INSERT INTO /* TEMPLATE: schema */river_job(
@@ -501,7 +516,9 @@ FROM (
         unnest(@scheduled_at::timestamptz[]) AS scheduled_at,
         unnest(@state::text[])::/* TEMPLATE: schema */river_job_state AS state
 ) AS updated_job
-WHERE river_job.id = updated_job.id;
+WHERE river_job.id = updated_job.id
+    AND river_job.state = 'running'
+    AND river_job.attempted_at < @stuck_horizon::timestamptz;
 
 -- name: JobRetry :one
 WITH job_to_update AS (
@@ -528,10 +545,13 @@ updated_job AS (
         )
     RETURNING river_job.*
 )
-SELECT *
-FROM /* TEMPLATE: schema */river_job
-WHERE id = @id::bigint
-    AND id NOT IN (SELECT id FROM updated_job)
+SELECT * FROM (
+    SELECT *
+    FROM /* TEMPLATE: schema */river_job
+    WHERE id = @id::bigint
+    FOR UPDATE
+) AS fallback_job
+WHERE fallback_job.id NOT IN (SELECT id FROM updated_job)
 UNION
 SELECT *
 FROM updated_job;

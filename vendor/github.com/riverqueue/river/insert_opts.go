@@ -158,10 +158,15 @@ type UniqueOpts struct {
 	// 	}
 	ByArgs bool
 
-	// ByPeriod defines uniqueness within a given period. On an insert time is
-	// rounded down to the nearest multiple of the given period, and a job is
-	// only inserted if there isn't an existing job that will run between then
-	// and the next multiple of the period.
+	// ByPeriod defines uniqueness within a given period. On an insert, the
+	// job's scheduled time (ScheduledAt, or the current time for jobs that
+	// aren't scheduled) is rounded down to the nearest multiple of the given
+	// period, and a job is only inserted if there isn't an existing job that
+	// will run between then and the next multiple of the period.
+	//
+	// Periods are measured in UTC, so the same period produces the same
+	// unique key regardless of the time zone of the inserting process or of
+	// a provided ScheduledAt.
 	//
 	// Default is no unique period, meaning that as long as any other unique
 	// property is enabled, uniqueness will be enforced across all jobs of the
@@ -214,6 +219,10 @@ type UniqueOpts struct {
 	// ExcludeKind indicates that the job kind should not be included in the
 	// uniqueness check. This is useful when you want to enforce uniqueness
 	// across all jobs regardless of kind.
+	//
+	// Must be combined with at least one of ByArgs, ByQueue, or ByPeriod;
+	// otherwise the key would be constant across the entire table and the
+	// combination is rejected by validate.
 	ExcludeKind bool
 }
 
@@ -227,7 +236,8 @@ func (o *UniqueOpts) isEmpty() bool {
 	return !o.ByArgs &&
 		o.ByPeriod == time.Duration(0) &&
 		!o.ByQueue &&
-		o.ByState == nil
+		o.ByState == nil &&
+		!o.ExcludeKind
 }
 
 var jobStateAll = rivertype.JobStates() //nolint:gochecknoglobals
@@ -255,6 +265,10 @@ func (o *UniqueOpts) validate() error {
 
 	if o.ByPeriod != time.Duration(0) && o.ByPeriod < 1*time.Second {
 		return errors.New("UniqueOpts.ByPeriod should not be less than 1 second")
+	}
+
+	if o.ExcludeKind && !o.ByArgs && !o.ByQueue && o.ByPeriod == 0 {
+		return errors.New("UniqueOpts.ExcludeKind requires ByArgs, ByQueue, or ByPeriod")
 	}
 
 	// Job states are typed, but since the underlying type is a string, users

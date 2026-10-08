@@ -28,16 +28,21 @@ type Pilot interface {
 	// conceivably be changed.)
 	JobCleanerQueuesExcluded() []string
 
+	// JobGetAvailable locks available jobs for work. Locked jobs whose rows
+	// couldn't be fully decoded are included in Jobs with entries in
+	// DecodeErrors and should have their attempt failed by the caller.
 	JobGetAvailable(
 		ctx context.Context,
 		exec riverdriver.Executor,
 		state ProducerState,
 		params *riverdriver.JobGetAvailableParams,
-	) ([]*rivertype.JobRow, error)
+	) (*riverdriver.JobGetAvailableResult, error)
 
+	// JobInsertMany inserts jobs in the supplied transaction. The caller owns
+	// its commit or rollback; implementations must keep related writes in it.
 	JobInsertMany(
 		ctx context.Context,
-		exec riverdriver.Executor,
+		execTx riverdriver.ExecutorTx,
 		params *riverdriver.JobInsertFastManyParams,
 	) ([]*riverdriver.JobInsertFastResult, error)
 

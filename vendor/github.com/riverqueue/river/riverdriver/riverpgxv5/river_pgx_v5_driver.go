@@ -9,13 +9,13 @@ import (
 	"cmp"
 	"context"
 	"embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -30,6 +30,7 @@ import (
 	"github.com/riverqueue/river/rivershared/uniquestates"
 	"github.com/riverqueue/river/rivershared/util/dbutil"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
+	"github.com/riverqueue/river/rivershared/util/randutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -39,8 +40,9 @@ var migrationFS embed.FS
 
 // Driver is an implementation of riverdriver.Driver for Pgx v5.
 type Driver struct {
-	dbPool   *pgxpool.Pool
-	replacer sqlctemplate.Replacer
+	dbPool               *pgxpool.Pool
+	postgresCapabilities atomic.Pointer[riverdriver.PostgresCapabilities]
+	replacer             sqlctemplate.Replacer
 }
 
 // New returns a new Pgx v5 River driver for use with River.
@@ -105,8 +107,11 @@ func (d *Driver) SQLFragmentColumnIn(column string, values any) (string, any, er
 	return fmt.Sprintf("%s = any(@%s)", column, column), values, nil
 }
 
-func (d *Driver) SupportsListener() bool       { return true }
-func (d *Driver) SupportsListenNotify() bool   { return true }
+func (d *Driver) SupportsListener() bool { return d.SupportsListenNotify() }
+func (d *Driver) SupportsListenNotify() bool {
+	capabilities := d.postgresCapabilities.Load()
+	return capabilities == nil || capabilities.SupportsListenNotify
+}
 func (d *Driver) TimePrecision() time.Duration { return time.Microsecond }
 
 func (d *Driver) UnwrapExecutor(tx pgx.Tx) riverdriver.ExecutorTx {
@@ -216,7 +221,17 @@ func (e *Executor) IndexesExist(ctx context.Context, params *riverdriver.Indexes
 	return exists, nil
 }
 
+func (e *Executor) InitDriver(ctx context.Context) error {
+	_, err := e.getPostgresCapabilities(ctx)
+	return err
+}
+
 func (e *Executor) JobCancel(ctx context.Context, params *riverdriver.JobCancelParams) (*rivertype.JobRow, error) {
+	capabilities, err := e.getPostgresCapabilities(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	cancelledAt, err := params.CancelAttemptedAt.MarshalJSON()
 	if err != nil {
 		return nil, err
@@ -226,6 +241,7 @@ func (e *Executor) JobCancel(ctx context.Context, params *riverdriver.JobCancelP
 		ID:                params.ID,
 		CancelAttemptedAt: cancelledAt,
 		ControlTopic:      params.ControlTopic,
+		Notify:            capabilities.SupportsListenNotify,
 		Now:               params.Now,
 		Schema:            pgtype.Text{String: params.Schema, Valid: params.Schema != ""},
 	})
@@ -316,9 +332,10 @@ func (e *Executor) JobDeleteMany(ctx context.Context, params *riverdriver.JobDel
 	return sliceutil.MapError(jobs, jobRowFromInternal)
 }
 
-func (e *Executor) JobGetAvailable(ctx context.Context, params *riverdriver.JobGetAvailableParams) ([]*rivertype.JobRow, error) {
+func (e *Executor) JobGetAvailable(ctx context.Context, params *riverdriver.JobGetAvailableParams) (*riverdriver.JobGetAvailableResult, error) {
 	jobs, err := dbsqlc.New().JobGetAvailable(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetAvailableParams{
 		AttemptedBy:    params.ClientID,
+		Kind:           params.Kind,
 		MaxAttemptedBy: int32(min(params.MaxAttemptedBy, math.MaxInt32)), //nolint:gosec
 		MaxToLock:      int32(min(params.MaxToLock, math.MaxInt32)),      //nolint:gosec
 		Now:            params.Now,
@@ -327,7 +344,7 @@ func (e *Executor) JobGetAvailable(ctx context.Context, params *riverdriver.JobG
 	if err != nil {
 		return nil, interpretError(err)
 	}
-	return sliceutil.MapError(jobs, jobRowFromInternal)
+	return jobGetAvailableResultFromInternal(jobs), nil
 }
 
 func (e *Executor) JobGetByID(ctx context.Context, params *riverdriver.JobGetByIDParams) (*rivertype.JobRow, error) {
@@ -354,6 +371,11 @@ func (e *Executor) JobGetByKindMany(ctx context.Context, params *riverdriver.Job
 	return sliceutil.MapError(jobs, jobRowFromInternal)
 }
 
+func (e *Executor) JobGetCancelRequested(ctx context.Context, params *riverdriver.JobGetCancelRequestedParams) ([]int64, error) {
+	ids, err := dbsqlc.New().JobGetCancelRequested(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.ID)
+	return ids, interpretError(err)
+}
+
 func (e *Executor) JobGetStuck(ctx context.Context, params *riverdriver.JobGetStuckParams) ([]*rivertype.JobRow, error) {
 	jobs, err := dbsqlc.New().JobGetStuck(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetStuckParams{
 		AfterID:      params.AfterID,
@@ -363,10 +385,21 @@ func (e *Executor) JobGetStuck(ctx context.Context, params *riverdriver.JobGetSt
 	if err != nil {
 		return nil, interpretError(err)
 	}
-	return sliceutil.MapError(jobs, jobRowFromInternal)
+	return jobRowsFromInternalPartial(jobs), nil
 }
 
 func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.JobInsertFastManyParams) ([]*riverdriver.JobInsertFastResult, error) {
+	capabilities, err := e.getPostgresCapabilities(ctx)
+	if err != nil {
+		return nil, err
+	}
+	uniqueInsertMode := capabilities.UniqueInsertMode
+
+	var uniqueNonce string
+	if uniqueInsertMode == riverdriver.UniqueInsertModeMetadataNonce {
+		uniqueNonce = randutil.Hex(8)
+	}
+
 	insertJobsParams := &dbsqlc.JobInsertFastManyParams{
 		ID:           make([]int64, len(params.Jobs)),
 		Args:         make([][]byte, len(params.Jobs)),
@@ -408,7 +441,16 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.Jo
 		insertJobsParams.CreatedAt[i] = createdAt
 		insertJobsParams.Kind[i] = params.Kind
 		insertJobsParams.MaxAttempts[i] = int16(min(params.MaxAttempts, math.MaxInt16)) //nolint:gosec
-		insertJobsParams.Metadata[i] = sliceutil.FirstNonEmpty(params.Metadata, defaultObject)
+		metadata := sliceutil.FirstNonEmpty(params.Metadata, defaultObject)
+		if uniqueNonce != "" {
+			var err error
+			metadata, err = riverdriver.UniqueInsertMetadataWithNonce(metadata, uniqueNonce)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		insertJobsParams.Metadata[i] = metadata
 		insertJobsParams.Priority[i] = int16(min(params.Priority, math.MaxInt16)) //nolint:gosec
 		insertJobsParams.Queue[i] = params.Queue
 		insertJobsParams.ScheduledAt[i] = scheduledAt
@@ -418,6 +460,9 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.Jo
 		insertJobsParams.UniqueStates[i] = int32(params.UniqueStates)
 	}
 
+	ctx = sqlctemplate.WithReplacements(ctx, map[string]sqlctemplate.Replacement{
+		"unique_skipped_as_duplicate": {Value: uniqueInsertMode.SQL(), Stable: true},
+	}, nil)
 	items, err := dbsqlc.New().JobInsertFastMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, insertJobsParams)
 	if err != nil {
 		return nil, interpretError(err)
@@ -428,7 +473,13 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.Jo
 		if err != nil {
 			return nil, err
 		}
-		return &riverdriver.JobInsertFastResult{Job: job, UniqueSkippedAsDuplicate: row.UniqueSkippedAsDuplicate}, nil
+
+		uniqueSkippedAsDuplicate := row.UniqueSkippedAsDuplicate
+		if uniqueInsertMode == riverdriver.UniqueInsertModeMetadataNonce {
+			uniqueSkippedAsDuplicate = riverdriver.UniqueInsertMetadataIsDuplicate(job.Metadata, uniqueNonce)
+		}
+
+		return &riverdriver.JobInsertFastResult{Job: job, UniqueSkippedAsDuplicate: uniqueSkippedAsDuplicate}, nil
 	})
 }
 
@@ -585,11 +636,12 @@ func (e *Executor) JobList(ctx context.Context, params *riverdriver.JobListParam
 
 func (e *Executor) JobRescueMany(ctx context.Context, params *riverdriver.JobRescueManyParams) (*struct{}, error) {
 	err := dbsqlc.New().JobRescueMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobRescueManyParams{
-		ID:          params.ID,
-		Error:       params.Error,
-		FinalizedAt: sliceutil.Map(params.FinalizedAt, func(t *time.Time) time.Time { return ptrutil.ValOrDefault(t, time.Time{}) }),
-		ScheduledAt: params.ScheduledAt,
-		State:       params.State,
+		ID:           params.ID,
+		Error:        params.Error,
+		FinalizedAt:  sliceutil.Map(params.FinalizedAt, func(t *time.Time) time.Time { return ptrutil.ValOrDefault(t, time.Time{}) }),
+		ScheduledAt:  params.ScheduledAt,
+		State:        params.State,
+		StuckHorizon: params.StuckHorizon,
 	})
 	if err != nil {
 		return nil, interpretError(err)
@@ -669,7 +721,7 @@ func (e *Executor) JobSetStateIfRunningMany(ctx context.Context, params *riverdr
 	if err != nil {
 		return nil, interpretError(err)
 	}
-	return sliceutil.MapError(jobs, jobRowFromInternal)
+	return jobRowsFromInternalPartial(jobs), nil
 }
 
 func (e *Executor) JobUpdate(ctx context.Context, params *riverdriver.JobUpdateParams) (*rivertype.JobRow, error) {
@@ -778,10 +830,16 @@ func (e *Executor) LeaderInsert(ctx context.Context, params *riverdriver.LeaderI
 }
 
 func (e *Executor) LeaderResign(ctx context.Context, params *riverdriver.LeaderResignParams) (bool, error) {
+	capabilities, err := e.getPostgresCapabilities(ctx)
+	if err != nil {
+		return false, err
+	}
+
 	numResigned, err := dbsqlc.New().LeaderResign(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.LeaderResignParams{
 		ElectedAt:       params.ElectedAt,
 		LeaderID:        params.LeaderID,
 		LeadershipTopic: params.LeadershipTopic,
+		Notify:          capabilities.SupportsListenNotify,
 		Schema:          pgtype.Text{String: params.Schema, Valid: params.Schema != ""},
 	})
 	if err != nil {
@@ -866,16 +924,31 @@ func (e *Executor) MigrationInsertManyAssumingMain(ctx context.Context, params *
 }
 
 func (e *Executor) NotificationDeleteBefore(ctx context.Context, params *riverdriver.NotificationDeleteBeforeParams) (int, error) {
-	numDeleted, err := dbsqlc.New().NotificationDeleteBefore(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.CreatedAtHorizon)
+	numDeleted, err := dbsqlc.New().NotificationDeleteBefore(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.NotificationDeleteBeforeParams{
+		CreatedAtHorizon: params.CreatedAtHorizon,
+		Max:              int64(params.Max),
+	})
 	return int(numDeleted), interpretError(err)
 }
 
 func (e *Executor) NotifyMany(ctx context.Context, params *riverdriver.NotifyManyParams) error {
+	capabilities, err := e.getPostgresCapabilities(ctx)
+	if err != nil {
+		return err
+	}
+	if !capabilities.SupportsListenNotify {
+		return nil
+	}
+
 	return dbsqlc.New().PGNotifyMany(ctx, e.dbtx, &dbsqlc.PGNotifyManyParams{
 		Payload: params.Payload,
 		Schema:  pgtype.Text{String: params.Schema, Valid: params.Schema != ""},
 		Topic:   params.Topic,
 	})
+}
+
+func (e *Executor) Ping(ctx context.Context) error {
+	return e.Exec(ctx, "SELECT 1")
 }
 
 func (e *Executor) PGAdvisoryXactLock(ctx context.Context, key int64) (*struct{}, error) {
@@ -1034,6 +1107,29 @@ func (e *Executor) TableTruncate(ctx context.Context, params *riverdriver.TableT
 		),
 	)
 	return interpretError(err)
+}
+
+func (e *Executor) getPostgresCapabilities(ctx context.Context) (*riverdriver.PostgresCapabilities, error) {
+	if e.driver != nil {
+		if capabilities := e.driver.postgresCapabilities.Load(); capabilities != nil {
+			return capabilities, nil
+		}
+	}
+
+	productAndVersion, err := dbsqlc.New().PGGetProductAndVersion(ctx, e.dbtx)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+
+	capabilities := riverdriver.NewPostgresCapabilities(productAndVersion.Product, productAndVersion.VersionNum, productAndVersion.YbListenNotifyEnabled)
+	if e.driver != nil {
+		// Concurrent callers may both detect, but the first successful result
+		// becomes the driver's cached capabilities. Don't hold a lock while
+		// querying: a caller may already hold the pool's only connection.
+		e.driver.postgresCapabilities.CompareAndSwap(nil, capabilities)
+		capabilities = e.driver.postgresCapabilities.Load()
+	}
+	return capabilities, nil
 }
 
 type ExecutorTx struct {
@@ -1238,17 +1334,51 @@ func interpretError(err error) error {
 	return err
 }
 
+// jobGetAvailableResultFromInternal decodes the job rows locked by
+// JobGetAvailable, retaining every row and recording decode errors by job ID
+// because they've all been moved to `running`.
+func jobGetAvailableResultFromInternal(jobs []*dbsqlc.RiverJob) *riverdriver.JobGetAvailableResult {
+	res := &riverdriver.JobGetAvailableResult{Jobs: make([]*rivertype.JobRow, len(jobs))}
+	for i, internal := range jobs {
+		job, err := jobRowFromInternalPartial(internal)
+		res.Jobs[i] = job
+		if err != nil {
+			if res.DecodeErrors == nil {
+				res.DecodeErrors = make(map[int64]error)
+			}
+			res.DecodeErrors[job.ID] = err
+		}
+	}
+	return res
+}
+
+// jobRowFromInternal decodes a job row, returning an error if any of its
+// fields can't be decoded.
 func jobRowFromInternal(internal *dbsqlc.RiverJob) (*rivertype.JobRow, error) {
+	job, err := jobRowFromInternalPartial(internal)
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// jobRowFromInternalPartial decodes a job row. A row is always returned, even
+// along with an error, in which case the fields that couldn't be decoded are
+// left empty.
+func jobRowFromInternalPartial(internal *dbsqlc.RiverJob) (*rivertype.JobRow, error) {
 	var attemptedAt *time.Time
 	if internal.AttemptedAt != nil {
 		t := internal.AttemptedAt.UTC()
 		attemptedAt = &t
 	}
 
+	var decodeErr error
 	errors := make([]rivertype.AttemptError, len(internal.Errors))
 	for i, rawError := range internal.Errors {
-		if err := json.Unmarshal(rawError, &errors[i]); err != nil {
-			return nil, err
+		if err := riverdriver.UnmarshalAttemptError(rawError, &errors[i]); err != nil {
+			decodeErr = fmt.Errorf("error unmarshaling `errors`: %w", err)
+			errors = nil
+			break
 		}
 	}
 
@@ -1282,7 +1412,17 @@ func jobRowFromInternal(internal *dbsqlc.RiverJob) (*rivertype.JobRow, error) {
 		Tags:         internal.Tags,
 		UniqueKey:    internal.UniqueKey,
 		UniqueStates: uniquestates.UniqueBitmaskToStates(uniqueStatesByte),
-	}, nil
+	}, decodeErr
+}
+
+// jobRowsFromInternalPartial decodes job rows with jobRowFromInternalPartial,
+// ignoring decode errors so that one bad row doesn't prevent returning the
+// others.
+func jobRowsFromInternalPartial(jobs []*dbsqlc.RiverJob) []*rivertype.JobRow {
+	return sliceutil.Map(jobs, func(internal *dbsqlc.RiverJob) *rivertype.JobRow {
+		job, _ := jobRowFromInternalPartial(internal)
+		return job
+	})
 }
 
 func leaderFromInternal(internal *dbsqlc.RiverLeader) *riverdriver.Leader {

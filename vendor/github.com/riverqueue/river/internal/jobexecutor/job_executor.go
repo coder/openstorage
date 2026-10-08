@@ -115,7 +115,15 @@ type JobExecutor struct {
 	PluginLookupByJob        *pluginlookup.JobPluginLookup
 	PluginLookupGlobal       *pluginlookup.PluginLookup
 	JobRow                   *rivertype.JobRow
-	ProducerCallbacks        struct {
+
+	// JobRowDecodeErr is set for a locked job whose row couldn't be fully
+	// decoded, in which case JobRow contains only the fields that could be.
+	// The job isn't worked. Instead, its attempt fails with an error
+	// describing the decode failure, and it's retried or discarded like any
+	// other failed attempt.
+	JobRowDecodeErr error
+
+	ProducerCallbacks struct {
 		JobDone func(jobRow *rivertype.JobRow)
 		Stuck   func(ctx context.Context, jobRow *rivertype.JobRow)
 		Unstuck func()
@@ -154,27 +162,41 @@ func (e *JobExecutor) Execute(ctx context.Context) {
 	}
 
 	res := e.execute(ctx)
+	e.reportResults(ctx, res)
+	e.ProducerCallbacks.JobDone(e.JobRow)
+}
+
+func (e *JobExecutor) reportResults(ctx context.Context, res *jobExecutorResult) {
+	if multiJobErrors, ok := res.Err.(withJobsAndErrorsByID); ok {
+		e.reportMultiJobResults(ctx, res, multiJobErrors)
+		return
+	}
+
 	if res.Err != nil && errors.Is(context.Cause(ctx), rivertype.ErrJobCancelledRemotely) {
 		res.Err = context.Cause(ctx)
 	}
+	e.reportResult(ctx, e.JobRow, res)
+}
 
-	var multiJobErrors withJobsAndErrorsByID
-	if res.Err != nil {
-		multiJobErrors, _ = res.Err.(withJobsAndErrorsByID)
+func (e *JobExecutor) reportMultiJobResults(ctx context.Context, res *jobExecutorResult, multiJobErrors withJobsAndErrorsByID) {
+	cancelCause := context.Cause(ctx)
+	remotelyCancelled := errors.Is(cancelCause, rivertype.ErrJobCancelledRemotely)
+	if remotelyCancelled {
+		leaderRes := *res
+		leaderRes.Err = cancelCause
+		e.reportResult(ctx, e.JobRow, &leaderRes)
 	}
 
-	if multiJobErrors == nil {
-		e.reportResult(ctx, e.JobRow, res)
-	} else {
-		errorsByID := multiJobErrors.ErrorsByID()
-		for _, jobRow := range multiJobErrors.Jobs() {
-			jobSpecificRes := *res
-			jobSpecificRes.Err = errorsByID[jobRow.ID]
-			e.reportResult(ctx, jobRow, &jobSpecificRes)
+	errorsByID := multiJobErrors.ErrorsByID()
+	for _, jobRow := range multiJobErrors.Jobs() {
+		if remotelyCancelled && jobRow.ID == e.JobRow.ID {
+			continue
 		}
-	}
 
-	e.ProducerCallbacks.JobDone(e.JobRow)
+		jobSpecificRes := *res
+		jobSpecificRes.Err = errorsByID[jobRow.ID]
+		e.reportResult(ctx, jobRow, &jobSpecificRes)
+	}
 }
 
 // Executes the job, handling a panic if necessary (and various other error
@@ -210,6 +232,15 @@ func (e *JobExecutor) execute(ctx context.Context) (res *jobExecutorResult) {
 		}
 		e.stats.RunDuration = e.Time.Now().Sub(e.start)
 	}()
+
+	if e.JobRowDecodeErr != nil {
+		e.Logger.ErrorContext(ctx, e.Name+": Job row couldn't be decoded; failing attempt without working it",
+			slog.String("error", e.JobRowDecodeErr.Error()),
+			slog.Int64("job_id", e.JobRow.ID),
+			slog.String("kind", e.JobRow.Kind),
+		)
+		return &jobExecutorResult{Err: fmt.Errorf("job row couldn't be decoded: %w", e.JobRowDecodeErr), MetadataUpdates: metadataUpdates}
+	}
 
 	if e.WorkUnit == nil {
 		e.Logger.ErrorContext(ctx, e.Name+": Unhandled job kind",
@@ -297,8 +328,6 @@ func (e *JobExecutor) watchStuck(ctx context.Context, jobTimeout time.Duration) 
 	// We add a WithoutCancel here so that this inner goroutine becomes
 	// immune to all context cancellations _except_ the one where it's
 	// cancelled because we leave JobExecutor.execute.
-	//
-	// This shadows the context outside the e.ClientJobTimeout > 0 check.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 
 	go func() {
@@ -314,7 +343,7 @@ func (e *JobExecutor) watchStuck(ctx context.Context, jobTimeout time.Duration) 
 			e.Logger.WarnContext(ctx, e.Name+": Job appears to be stuck",
 				slog.Int64("job_id", e.JobRow.ID),
 				slog.String("kind", e.JobRow.Kind),
-				slog.Duration("timeout", e.ClientJobTimeout),
+				slog.Duration("timeout", jobTimeout),
 			)
 
 			// context cancelled as we leave JobExecutor.execute
@@ -339,7 +368,7 @@ func (e *JobExecutor) watchStuck(ctx context.Context, jobTimeout time.Duration) 
 	return cancel
 }
 
-func (e *JobExecutor) invokeErrorHandler(ctx context.Context, res *jobExecutorResult) bool {
+func (e *JobExecutor) invokeErrorHandler(ctx context.Context, jobRow *rivertype.JobRow, res *jobExecutorResult) bool {
 	invokeAndHandlePanic := func(funcName string, errorHandler func() *ErrorHandlerResult) *ErrorHandlerResult {
 		defer func() {
 			if panicVal := recover(); panicVal != nil {
@@ -357,12 +386,12 @@ func (e *JobExecutor) invokeErrorHandler(ctx context.Context, res *jobExecutorRe
 	switch {
 	case res.Err != nil:
 		errorHandlerRes = invokeAndHandlePanic("HandleError", func() *ErrorHandlerResult {
-			return e.ErrorHandler.HandleError(ctx, e.JobRow, res.Err)
+			return e.ErrorHandler.HandleError(ctx, jobRow, res.Err)
 		})
 
 	case res.PanicVal != nil:
 		errorHandlerRes = invokeAndHandlePanic("HandlePanic", func() *ErrorHandlerResult {
-			return e.ErrorHandler.HandlePanic(ctx, e.JobRow, res.PanicVal, res.PanicTrace)
+			return e.ErrorHandler.HandlePanic(ctx, jobRow, res.PanicVal, res.PanicTrace)
 		})
 	}
 
@@ -477,7 +506,7 @@ func (e *JobExecutor) reportError(ctx context.Context, jobRow *rivertype.JobRow,
 
 	if e.ErrorHandler != nil && !cancelJob && !softStopped {
 		// Error handlers also have an opportunity to cancel the job.
-		cancelJob = e.invokeErrorHandler(ctx, res)
+		cancelJob = e.invokeErrorHandler(ctx, jobRow, res)
 	}
 
 	now := e.Time.Now()
