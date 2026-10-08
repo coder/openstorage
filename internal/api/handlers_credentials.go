@@ -364,9 +364,8 @@ type gcredPathUpdateRequest struct {
 // handleUpdateCredentialByPath implements
 // PUT /api/repos/{repo_name}/git-credentials/{git_credential_id}: rotate
 // username/password -> 200 {id, created_at}, the exact v1 PUT body shape.
-// openapi marks `username` required yet describes it as "omit for
-// token-only providers"; the v1 semantics (optional username, required
-// password) are the compatible superset and are used here.
+// Only `password` is required (openapi.yaml); an omitted username clears
+// the stored one, as on the v1 PUT.
 func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http.Request) {
 	cred, ok := s.gcredByPath(w, r)
 	if !ok {

@@ -26,6 +26,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `conflict`, `unprocessable_entity`, `rate_limited`, `internal_error`,
   `service_unavailable`, …); open.storage emits none of upstream's specific codes such
   as `repository_not_found`. Branch on the status code or `code`, not on the message.
+  Upstream's 400 bodies can also carry `invalid_params` (`[{name, reason}]`, one item
+  per invalid request field). The member is optional upstream, and open.storage never
+  sends it: read the message in `detail`.
   The content type stays `application/json`. `status` is a JSON number, as in upstream's
   bodies: decode the body into a struct or a map of arbitrary values, not a string-only
   map (such as Go's `map[string]string`). Ref-moving write
@@ -157,6 +160,24 @@ about the endpoint's rollout status on upstream clusters.
 | `POST /repos/git-credentials` | repo:write (repo=repoId) | `{repo_id, password, username?}` → `{id}`; 409 = exists |
 | `PUT /repos/git-credentials` | repo:write (repo="org") | `{id, password, username?}` → `{id, created_at}`; 404 |
 | `DELETE /repos/git-credentials` | repo:write (repo="org") | `{id}` → 200/204; 404 |
+
+`username` is optional on create and update, on these routes and on the path-style
+`/repos/{repo_name}/git-credentials` routes. Only `password` is required. The server
+stores the username exactly as sent. An update that omits it clears the stored one.
+
+Git sends no credentials when the username is empty. So for a credential with no
+username, the sync worker sends a placeholder username with the stored password:
+`x-token-auth` when the upstream's provider is `bitbucket`, and `git` for every other
+provider.
+
+| Host | What to send |
+|---|---|
+| Gitea, Forgejo, Codeberg | The token as `password`. The username can be omitted. |
+| GitLab personal, project, group or OAuth token | The token as `password`. The username can be omitted (upstream suggests `oauth2`). |
+| GitLab deploy token | The deploy token's username. CI job tokens use `gitlab-ci-token`. |
+| Bitbucket access token | The token as `password`. The username can be omitted when the provider is `bitbucket`. Otherwise send `x-token-auth`. |
+| Bitbucket app password or API token | Your Bitbucket username. |
+| Any other host | The username that host expects. |
 
 ### Files & trees (`git:read`)
 

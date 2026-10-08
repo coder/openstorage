@@ -527,8 +527,9 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 
 	// Upstream credential: absent = let the push fail with git's own auth
 	// classification (public upstreams reject unauthenticated pushes;
-	// credential-less file:// upstreams in tests just work). Username
-	// defaults to "git" for token-only providers, like the pull fetch.
+	// credential-less file:// upstreams in tests just work). An omitted
+	// username gets a per-provider placeholder (credentialUsername), like
+	// the pull fetch.
 	username, password := "", ""
 	switch cred, err := w.Credentials.CredentialForRepo(ctx, job.RepoID); {
 	case err == nil:
@@ -536,9 +537,7 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	case !errors.Is(err, ErrNotFound):
 		return nil, &syncFailure{code: FailInternal, cause: fmt.Errorf("load credential: %w", err)}
 	}
-	if username == "" {
-		username = "git"
-	}
+	username = credentialUsername(up.Provider, username)
 	pushEnv, err := authGitEnv(filepath.Join(tmp, "askpass-upstream.sh"), username, password, w.allowProtocol())
 	if err != nil {
 		return nil, &syncFailure{code: FailInternal, cause: err}
