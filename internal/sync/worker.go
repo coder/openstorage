@@ -43,7 +43,7 @@ type Loopback struct {
 	// bound listener, never the external (load-balanced) base URL.
 	BaseURL string
 	// Token mints a short-lived git:write JWT for the loopback push (basic
-	// auth `t:<jwt>`, docs/explanation/git-protocol-and-namespaces.md). The token is passed to git via GIT_ASKPASS
+	// auth `t:<jwt>`, docs/explanation/git-protocol-and-namespaces.md). The token is passed to git via a credential helper
 	// and never logged. May return "" when BaseURL needs no auth (file://).
 	// ttl and holder FENCE the push against a claim steal (issue #86):
 	// implementations must cap the token lifetime at ttl (no new push
@@ -741,19 +741,12 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	}
 
 	// Upstream credential: absent = public upstream. An omitted username
-	// gets a per-provider placeholder (credentialUsername).
-	username, password := "", ""
-	switch cred, err := w.Credentials.CredentialForRepo(ctx, job.RepoID); {
-	case err == nil:
-		username, password = cred.Username, cred.Password
-	case !errors.Is(err, ErrNotFound):
-		return &syncFailure{code: FailInternal, cause: fmt.Errorf("load credential: %w", err)}
+	// gets the per-provider default (credentialAuth).
+	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up.Provider)
+	if fail != nil {
+		return fail
 	}
-	username = credentialUsername(up.Provider, username)
-	fetchEnv, err := authGitEnv(filepath.Join(tmp, "askpass-fetch.sh"), username, password, w.allowProtocol())
-	if err != nil {
-		return &syncFailure{code: FailInternal, cause: err}
-	}
+	fetchEnv := authGitEnv(username, password, w.allowProtocol())
 	// Egress guard (egress.go, issue #139): the inbound fetch dials
 	// through the same vetting proxy as outbound pushes — upstream_host
 	// is caller-linked data, so unguarded egress is an SSRF read/
@@ -832,11 +825,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("mint loopback token: %w", err)}
 	}
-	// docs/explanation/git-protocol-and-namespaces.md: git basic auth is username "t", password = JWT.
-	pushEnv, err := authGitEnv(filepath.Join(tmp, "askpass-push.sh"), "t", token, w.allowProtocol())
-	if err != nil {
-		return &syncFailure{code: FailInternal, cause: err}
-	}
+	pushEnv := loopbackGitEnv(token, w.allowProtocol())
 	// The loopback push is a self-call (Loopback.BaseURL doc): proxy env
 	// must never reroute it through a load balancer, where the token could
 	// land on a replica that cannot verify it (issue #45). os/exec keeps
@@ -1001,47 +990,93 @@ func hermeticGitEnv(allowProtocol string) []string {
 	)
 }
 
-// credentialUsername returns the Basic-auth username sent with a stored
-// credential. The API makes the username optional, as upstream does, and
-// git sends no credentials at all for an empty username, so an omitted
-// one needs a placeholder: x-token-auth for provider bitbucket (Bitbucket
-// access tokens require it), "git" otherwise (Gitea, Forgejo, Codeberg
-// and GitLab personal/project/group/OAuth tokens ignore the username).
-// Credentials whose username matters (GitLab deploy and CI job tokens,
-// Bitbucket app passwords and API tokens) must send it
-// (docs/reference/http-api.md, "Git credentials").
-func credentialUsername(provider, stored string) string {
-	if stored != "" {
-		return stored
+// upstreamAuth loads the repo's stored upstream credential and returns
+// the Basic-auth pair the worker sends. ("", "") means none: no stored
+// credential, or one with an empty password (sent nothing before #400
+// either). The pair travels through git's line-based credential-helper
+// protocol, so a stored value with CR, LF or NUL fails the run as
+// configuration instead of injecting helper attributes; the error never
+// names the value.
+func (w *Worker) upstreamAuth(ctx context.Context, repoID, provider string) (username, password string, fail *syncFailure) {
+	cred, err := w.Credentials.CredentialForRepo(ctx, repoID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return "", "", nil
+	case err != nil:
+		return "", "", &syncFailure{code: FailInternal, cause: fmt.Errorf("load credential: %w", err)}
+	case cred.Password == "":
+		return "", "", nil
+	case strings.ContainsAny(cred.Username+cred.Password, "\r\n\x00"):
+		return "", "", &syncFailure{code: FailConfig, cause: errors.New("stored git credential contains CR, LF or NUL")}
 	}
-	if provider == "bitbucket" {
-		return "x-token-auth"
-	}
-	return "git"
+	username, password = credentialAuth(provider, cred.Username, cred.Password)
+	return username, password, nil
 }
 
-// authGitEnv extends hermeticGitEnv with a GIT_ASKPASS helper feeding the
-// given basic-auth credentials. Secrets travel via the child process
-// environment only — never argv (visible in ps) and never logs. An empty
-// password installs no helper (public upstream / file:// loopback).
-func authGitEnv(scriptPath, username, password, allowProtocol string) ([]string, error) {
+// credentialAuth returns the Basic-auth pair for a stored credential with
+// a non-empty password. A stored username always wins. The API makes the
+// username optional, and git sends no credentials at all for an empty
+// username, so an omitted one gets upstream's per-provider default (spec
+// 2026-10-08, issue #400): x-token-auth (Bitbucket) or oauth2 (GitLab)
+// with the token as the password, and the token as the USERNAME with an
+// empty password for Gitea, Forgejo and Codeberg (git sends "<token>:").
+// GitHub and every other provider keep "git" plus the token as the
+// password (docs/reference/http-api.md, "Git credentials").
+func credentialAuth(provider, storedUsername, password string) (username, pass string) {
+	assertf(password != "", "credentialAuth: empty password")
+	if storedUsername != "" {
+		return storedUsername, password
+	}
+	switch provider {
+	case "bitbucket":
+		return "x-token-auth", password
+	case "gitlab":
+		return "oauth2", password
+	case "gitea", "forgejo", "codeberg":
+		return password, ""
+	}
+	return "git", password
+}
+
+// gitCredentialHelper answers git's credential "get" with the pair from
+// the OPENSTORAGE_ASKPASS_* environment and ignores "store" and "erase".
+// It is static shell: secrets reach git through the child environment
+// only, never argv (visible in ps) or a file. GIT_ASKPASS is not used
+// because git passes its password prompt as argv, and that prompt names
+// the username, which is the token for Gitea-family hosts.
+const gitCredentialHelper = `!f() { while read -r _; do :; done; test "$1" = get || return 0; ` +
+	`printf 'username=%s\npassword=%s\n' "$OPENSTORAGE_ASKPASS_USERNAME" "$OPENSTORAGE_ASKPASS_PASSWORD"; }; f`
+
+// loopbackGitEnv is authGitEnv for a loopback token: git basic auth is
+// username "t", password = JWT (docs/explanation/git-protocol-and-namespaces.md).
+// An empty token (file:// loopback) sends no credential.
+func loopbackGitEnv(token, allowProtocol string) []string {
+	if token == "" {
+		return authGitEnv("", "", allowProtocol)
+	}
+	return authGitEnv("t", token, allowProtocol)
+}
+
+// authGitEnv extends hermeticGitEnv with a credential helper feeding the
+// given Basic-auth pair. An empty username installs no helper (public
+// upstream / file:// loopback); the password may be empty (Gitea-family
+// token-as-username). Callers reject CR/LF/NUL first (upstreamAuth).
+func authGitEnv(username, password, allowProtocol string) []string {
 	env := hermeticGitEnv(allowProtocol)
-	if password == "" {
-		return env, nil
+	if username == "" {
+		assertf(password == "", "authGitEnv: password without username")
+		return env
 	}
-	assertf(username != "", "authGitEnv: password without username")
-	const script = `#!/bin/sh
-case "$1" in
-[Uu]sername*) printf '%s\n' "$OPENSTORAGE_ASKPASS_USERNAME" ;;
-*) printf '%s\n' "$OPENSTORAGE_ASKPASS_PASSWORD" ;;
-esac
-`
-	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
-		return nil, fmt.Errorf("write askpass helper: %w", err)
-	}
+	assertf(!strings.ContainsAny(username+password, "\r\n\x00"), "authGitEnv: credential with CR, LF or NUL")
 	env = envconfig.Set(env, "OPENSTORAGE_ASKPASS_USERNAME", username)
 	env = envconfig.Set(env, "OPENSTORAGE_ASKPASS_PASSWORD", password)
-	return append(env, "GIT_ASKPASS="+scriptPath), nil
+	// The empty first value resets any helper list git may have collected
+	// (credential.helper is multi-valued), so only ours answers.
+	return append(env,
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=credential.helper", "GIT_CONFIG_VALUE_1="+gitCredentialHelper,
+	)
 }
 
 // runGit executes one git command, returning its stderr for failure

@@ -55,7 +55,9 @@ func TestPushUpstreamLifecycle(t *testing.T) {
 		const upstreamPass = "up-secret"
 		upstream := usyncCGIServer(t, upRoot, func(r *http.Request) bool {
 			user, pass, ok := r.BasicAuth()
-			return ok && basicAuthEquals(user, pass, "git", upstreamPass)
+			// provider gitea, no stored username: the token is the
+			// username, with an empty password (issue #400).
+			return ok && basicAuthEquals(user, pass, upstreamPass, "")
 		}, false)
 		usyncSeedUpstream(t, upRoot, "own", "proj")
 		usyncAllowPush(t, upRoot, "own", "proj")

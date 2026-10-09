@@ -482,10 +482,7 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	if err != nil {
 		return nil, &syncFailure{code: FailInternal, cause: fmt.Errorf("mint loopback token: %w", err)}
 	}
-	fetchEnv, err := authGitEnv(filepath.Join(tmp, "askpass-loopback.sh"), "t", token, w.allowProtocol())
-	if err != nil {
-		return nil, &syncFailure{code: FailInternal, cause: err}
-	}
+	fetchEnv := loopbackGitEnv(token, w.allowProtocol())
 	// Self-call: never route through a proxy/load balancer (issue #45).
 	fetchEnv = append(fetchEnv, "NO_PROXY=*", "no_proxy=*")
 	fetchURL := strings.TrimRight(w.Loopback.BaseURL, "/") + "/" + repo.RepoID + ".git"
@@ -528,20 +525,13 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	// Upstream credential: absent = let the push fail with git's own auth
 	// classification (public upstreams reject unauthenticated pushes;
 	// credential-less file:// upstreams in tests just work). An omitted
-	// username gets a per-provider placeholder (credentialUsername), like
-	// the pull fetch.
-	username, password := "", ""
-	switch cred, err := w.Credentials.CredentialForRepo(ctx, job.RepoID); {
-	case err == nil:
-		username, password = cred.Username, cred.Password
-	case !errors.Is(err, ErrNotFound):
-		return nil, &syncFailure{code: FailInternal, cause: fmt.Errorf("load credential: %w", err)}
+	// username gets the per-provider default (credentialAuth), like the
+	// pull fetch.
+	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up.Provider)
+	if fail != nil {
+		return nil, fail
 	}
-	username = credentialUsername(up.Provider, username)
-	pushEnv, err := authGitEnv(filepath.Join(tmp, "askpass-upstream.sh"), username, password, w.allowProtocol())
-	if err != nil {
-		return nil, &syncFailure{code: FailInternal, cause: err}
-	}
+	pushEnv := authGitEnv(username, password, w.allowProtocol())
 	// Egress guard (egress.go): every network push dials through the
 	// vetting proxy — upstream_host is caller-linked data, so unguarded
 	// egress would be an SSRF/write primitive into private networks.
