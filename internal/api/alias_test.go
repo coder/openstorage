@@ -64,6 +64,7 @@ func TestAliasV1Equivalence(t *testing.T) {
 			{"branch", http.MethodGet, "/branch?name=main", "/api/v1/repos/branch?name=main", fx.token, nil},
 			{"branch missing", http.MethodGet, "/branch?name=nope", "/api/v1/repos/branch?name=nope", fx.token, nil},
 			{"commits", http.MethodGet, "/commits?limit=2", "/api/v1/repos/commits?limit=2", fx.token, nil},
+			{"commit", http.MethodGet, "/commit?ref=main", "/api/v1/repos/commit?ref=main", fx.token, nil},
 			{"files", http.MethodGet, "/files?ref=main&recursive=true", "/api/v1/repos/files?ref=main&recursive=true", fx.token, nil},
 			{"file", http.MethodGet, "/file?path=README.md", "/api/v1/repos/file?path=README.md", fx.token, nil},
 			{"tags", http.MethodGet, "/tags", "/api/v1/repos/tags", fx.token, nil},
