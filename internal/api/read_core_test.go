@@ -63,8 +63,8 @@ func coreGit(t *testing.T, dir string, args ...string) string {
 		"GIT_COMMITTER_NAME=core-test",
 		"GIT_COMMITTER_EMAIL=core@test.invalid",
 		// Distinct pinned dates so author-vs-committer date wiring is
-		// assertable (files/metadata reports the AUTHOR date, commit
-		// listings the COMMITTER date).
+		// assertable (commit `date` and files/metadata report the AUTHOR
+		// date, commit `committer_date` the COMMITTER date).
 		"GIT_AUTHOR_DATE="+coreAuthorDate,
 		"GIT_COMMITTER_DATE="+coreCommitterDate,
 	)
@@ -598,6 +598,32 @@ func TestReadCoreBranchesAndTags(t *testing.T) {
 	})
 }
 
+// coreRequireCommitDates asserts the raw wire keys of every Commit in a
+// commits or commit response (issue #400): `date` carries the author date
+// and `committer_date` the committer date, so a decode into commitInfo
+// cannot hide a missing or swapped key.
+func coreRequireCommitDates(t *testing.T, body []byte) {
+	t.Helper()
+	var raw struct {
+		Commit  map[string]any   `json:"commit"`
+		Commits []map[string]any `json:"commits"`
+	}
+	coreDecode(t, body, &raw)
+	all := raw.Commits
+	if raw.Commit != nil {
+		all = append(all, raw.Commit)
+	}
+	if len(all) == 0 {
+		t.Fatalf("no commits in body: %s", body)
+	}
+	for i, c := range all {
+		if c["date"] != coreAuthorDateUTC || c["committer_date"] != coreCommitterDateUTC {
+			t.Errorf("commit %d: date=%v committer_date=%v, want %q and %q", i, c["date"], c["committer_date"],
+				coreAuthorDateUTC, coreCommitterDateUTC)
+		}
+	}
+}
+
 func TestReadCoreCommits(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
@@ -620,12 +646,15 @@ func TestReadCoreCommits(t *testing.T) {
 					c.CommitterName != "core-test" || c.CommitterEmail != "core@test.invalid" {
 					t.Errorf("commits[%d] identity = %+v", i, c)
 				}
-				// commitInfo.date is the COMMITTER date (invariant 9 orders
-				// history by commit date).
-				if c.Date != coreCommitterDateUTC {
-					t.Errorf("commits[%d].date = %q, want committer date %q", i, c.Date, coreCommitterDateUTC)
+				// Issue #400: `date` is the AUTHOR date and
+				// `committer_date` the COMMITTER date (the fixture pins
+				// them apart).
+				if c.Date != coreAuthorDateUTC || c.CommitterDate != coreCommitterDateUTC {
+					t.Errorf("commits[%d] date, committer_date = %q, %q, want author %q, committer %q",
+						i, c.Date, c.CommitterDate, coreAuthorDateUTC, coreCommitterDateUTC)
 				}
 			}
+			coreRequireCommitDates(t, body)
 			if got.Commits[0].Message != "c3: modes, symlink, submodule" {
 				t.Errorf("message = %q", got.Commits[0].Message)
 			}
@@ -744,6 +773,7 @@ func TestReadCoreCommits(t *testing.T) {
 				if got.Commit.SHA != fx.c3 {
 					t.Errorf("sha=%q resolved %s, want %s", spec, got.Commit.SHA, fx.c3)
 				}
+				coreRequireCommitDates(t, body)
 			}
 			resp, body := coreGet(t, e, "GET", "/api/v1/repos/commit?sha=deadbeef", fx.token, nil)
 			coreRequireStatus(t, resp, body, 404)

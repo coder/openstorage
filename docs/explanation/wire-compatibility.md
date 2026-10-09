@@ -233,9 +233,9 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-08 (upstream
-  `Last-Modified` 2026-10-08 03:01:33 GMT), SHA-256
-  `47f2a69b7f22e2ededdb34d389fbdd6fff30c5c471d0fb9a7aeef64cb8c34c01`.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-09 (upstream
+  `Last-Modified` 2026-10-08 19:00:21 GMT), SHA-256
+  `9f8e372a29576963499f73d1ed1301cae4719107fa3effb6d9fccf30da2cac9a`.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled

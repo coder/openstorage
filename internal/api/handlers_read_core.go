@@ -444,8 +444,9 @@ func (s *server) handleGetTag(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // 2a: GET /repos/commits + GET /repos/commit
 
-// commitInfo is the docs/reference/http-api.md CommitInfo wire shape; `date` is the committer
-// date (invariant 9 orders history by commit date).
+// commitInfo is the docs/reference/http-api.md CommitInfo wire shape. Upstream's spec
+// (2026-10-08, issue #400) makes `date` the AUTHOR date and adds `committer_date`; a rebase
+// or cherry-pick moves only the committer date.
 type commitInfo struct {
 	SHA            string   `json:"sha"`
 	ParentSHAs     []string `json:"parent_shas"`
@@ -455,6 +456,7 @@ type commitInfo struct {
 	CommitterName  string   `json:"committer_name"`
 	CommitterEmail string   `json:"committer_email"`
 	Date           string   `json:"date"`
+	CommitterDate  string   `json:"committer_date"`
 }
 
 func toCommitInfo(c gitread.Commit) commitInfo {
@@ -467,7 +469,8 @@ func toCommitInfo(c gitread.Commit) commitInfo {
 		AuthorEmail:    c.AuthorEmail,
 		CommitterName:  c.CommitterName,
 		CommitterEmail: c.CommitterEmail,
-		Date:           c.CommitterDate.UTC().Format(time.RFC3339),
+		Date:           c.AuthorDate.UTC().Format(time.RFC3339),
+		CommitterDate:  c.CommitterDate.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -876,8 +879,8 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 		})
 		commitsMap[last[0].SHA] = fileMetaCommit{
 			Author: last[0].AuthorName,
-			// openapi: "RFC 3339 author date for the commit" — author, not
-			// committer, date (unlike commitInfo.Date / invariant 9 ordering).
+			// openapi: "RFC 3339 author date for the commit", like
+			// commitInfo.Date.
 			Date:    last[0].AuthorDate.UTC().Format(time.RFC3339),
 			Message: strings.TrimRight(last[0].Message, "\n"),
 		}

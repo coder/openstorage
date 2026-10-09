@@ -270,7 +270,10 @@ This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster 
 | `POST /repos/reset-commits` | git:write | In OpenAPI only (not in SDKs): NDJSON metadata stream; same restore-commit family |
 
 `CommitInfo` = `{sha, parent_shas[], message, author_name, author_email, committer_name,
-committer_email, date (RFC3339)}`.
+committer_email, date (RFC3339), committer_date (RFC3339)}`. `date` is the author
+timestamp and `committer_date` the committer timestamp, as in upstream's spec of
+2026-10-08. A rebase or cherry-pick changes only `committer_date`. Before that spec,
+`date` carried the committer timestamp.
 
 ### Tags
 
@@ -303,8 +306,8 @@ committer_email, date (RFC3339)}`.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. The reserved `after` field is ignored |
-| `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400 |
+| `POST /repos/pull-upstream` | git:write | Optional body `{ref?, after?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. Both body fields are accepted and ignored: every pull syncs all branches and tags of the upstream. Upstream deprecated the body on 2026-10-08 |
+| `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional, deprecated body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400. Its fields are ignored |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 
 **Both triggers:**

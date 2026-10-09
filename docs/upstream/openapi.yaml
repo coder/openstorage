@@ -229,6 +229,11 @@ components:
           examples:
             - Jane Doe
           type: string
+        committer_date:
+          description: Commit committer timestamp in RFC 3339 format. A rebase or cherry-pick sets it to a later time than the author timestamp.
+          examples:
+            - "2024-01-16T09:05:41Z"
+          type: string
         committer_email:
           description: Commit committer email.
           examples:
@@ -240,7 +245,7 @@ components:
             - Jane Doe
           type: string
         date:
-          description: Commit timestamp in RFC 3339 format.
+          description: Commit author timestamp in RFC 3339 format.
           examples:
             - "2024-01-15T14:32:18Z"
           type: string
@@ -1907,7 +1912,7 @@ components:
             - glpat_xxxxxxxxxxxx
           type: string
         username:
-          description: Username for HTTPS authentication. GitLab needs a non-empty username, such as `oauth2`. Bitbucket access tokens use `x-token-auth`. Gitea, Forgejo, and Codeberg accept the token with no username.
+          description: "Username for HTTPS authentication. Optional. With no username, requests to the upstream send the token as the password with the username `x-token-auth` for Bitbucket and `oauth2` for GitLab, and as the username for Gitea, Forgejo, and Codeberg. sr.ht takes no credential over HTTPS: it serves private repositories and pushes only over SSH."
           examples:
             - oauth2
           type: string
@@ -1930,7 +1935,7 @@ components:
             - repo_7f2b3d9
           type: string
         username:
-          description: Username for HTTPS authentication. GitLab needs a non-empty username, such as `oauth2`. Bitbucket access tokens use `x-token-auth`. Gitea, Forgejo, and Codeberg accept the token with no username.
+          description: "Username for HTTPS authentication. Optional. With no username, requests to the upstream send the token as the password with the username `x-token-auth` for Bitbucket and `oauth2` for GitLab, and as the username for Gitea, Forgejo, and Codeberg. sr.ht takes no credential over HTTPS: it serves private repositories and pushes only over SSH."
           examples:
             - oauth2
           type: string
@@ -1960,7 +1965,7 @@ components:
             - glpat_rotated_token
           type: string
         username:
-          description: Username for HTTPS authentication. GitLab needs a non-empty username, such as `oauth2`. Bitbucket access tokens use `x-token-auth`. Gitea, Forgejo, and Codeberg accept the token with no username. An omitted username clears the stored one.
+          description: "Username for HTTPS authentication. Optional. With no username, requests to the upstream send the token as the password with the username `x-token-auth` for Bitbucket and `oauth2` for GitLab, and as the username for Gitea, Forgejo, and Codeberg. sr.ht takes no credential over HTTPS: it serves private repositories and pushes only over SSH. An omitted username clears the stored one."
           examples:
             - oauth2
           type: string
@@ -1982,7 +1987,7 @@ components:
             - glpat_rotated_token
           type: string
         username:
-          description: Username for HTTPS authentication. GitLab needs a non-empty username, such as `oauth2`. Bitbucket access tokens use `x-token-auth`. Gitea, Forgejo, and Codeberg accept the token with no username. An omitted username clears the stored one.
+          description: "Username for HTTPS authentication. Optional. With no username, requests to the upstream send the token as the password with the username `x-token-auth` for Bitbucket and `oauth2` for GitLab, and as the username for Gitea, Forgejo, and Codeberg. sr.ht takes no credential over HTTPS: it serves private repositories and pushes only over SSH. An omitted username clears the stored one."
           examples:
             - oauth2
           type: string
@@ -2638,15 +2643,15 @@ components:
       type: object
     ReposUpstreamPullRequest:
       additionalProperties: false
-      description: Optional parameters for triggering a sync from the configured upstream.
+      description: Deprecated upstream pull body. Its fields have no effect, so send no body.
       properties:
         after:
-          description: Optional opaque token from a previous pull-upstream response. Reserved for compatibility with future incremental syncs.
+          deprecated: true
+          description: "Deprecated: omit it. The field has no effect, and no response returns a token for it. A pull syncs every branch and tag of the upstream."
           type: string
         ref:
-          description: Optional branch or tag to pull from the configured upstream. Defaults to the repository's tracked default branch.
-          examples:
-            - main
+          deprecated: true
+          description: "Deprecated: omit it. The field has no effect: a pull syncs every branch and tag of the upstream."
           type: string
       type: object
     ReposUpstreamPullResponse:
@@ -5033,6 +5038,7 @@ paths:
                 commit:
                   author_email: jane@example.com
                   author_name: Jane Doe
+                  committer_date: "2024-01-16T09:05:41Z"
                   committer_email: jane@example.com
                   committer_name: Jane Doe
                   date: "2024-01-15T14:32:18Z"
@@ -5365,6 +5371,7 @@ paths:
                 commits:
                   - author_email: jane@example.com
                     author_name: Jane Doe
+                    committer_date: "2024-01-16T09:05:41Z"
                     committer_email: jane@example.com
                     committer_name: Jane Doe
                     date: "2024-01-15T14:32:18Z"
@@ -8265,11 +8272,9 @@ paths:
       requestBody:
         content:
           application/json:
-            example:
-              ref: main
             schema:
               $ref: "#/components/schemas/ReposUpstreamPullRequest"
-        description: Optional sync hints. Most callers can omit the body entirely and simply trigger the next upstream pull.
+        description: "Deprecated: send no body. Its fields have no effect: a pull syncs every branch and tag of the upstream."
       responses:
         "202":
           content:
@@ -9322,11 +9327,9 @@ paths:
       requestBody:
         content:
           application/json:
-            example:
-              ref: main
             schema:
               $ref: "#/components/schemas/ReposUpstreamPullRequest"
-        description: Optional sync hints. Most callers can omit the body entirely and simply trigger the next upstream pull.
+        description: "Deprecated: send no body. Its fields have no effect: a pull syncs every branch and tag of the upstream."
       responses:
         "202":
           content:
@@ -11107,6 +11110,7 @@ paths:
                 commit:
                   author_email: jane@example.com
                   author_name: Jane Doe
+                  committer_date: "2024-01-16T09:05:41Z"
                   committer_email: jane@example.com
                   committer_name: Jane Doe
                   date: "2024-01-15T14:32:18Z"
@@ -11432,6 +11436,7 @@ paths:
                 commits:
                   - author_email: jane@example.com
                     author_name: Jane Doe
+                    committer_date: "2024-01-16T09:05:41Z"
                     committer_email: jane@example.com
                     committer_name: Jane Doe
                     date: "2024-01-15T14:32:18Z"
@@ -14260,11 +14265,9 @@ paths:
       requestBody:
         content:
           application/json:
-            example:
-              ref: main
             schema:
               $ref: "#/components/schemas/ReposUpstreamPullRequest"
-        description: Optional sync hints. Most callers can omit the body entirely and simply trigger the next upstream pull.
+        description: "Deprecated: send no body. Its fields have no effect: a pull syncs every branch and tag of the upstream."
       responses:
         "202":
           content:
