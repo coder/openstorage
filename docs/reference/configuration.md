@@ -989,7 +989,7 @@ Not part of the operator surface; listed for completeness. Never set these manua
   `OPENSTORAGE_GIT_VERIFY_SIG_BUDGET`: per-request plumbing the server sets for the
   `openstorage hook` subprocess that git re-execs.
 - `OPENSTORAGE_ASKPASS_USERNAME`, `OPENSTORAGE_ASKPASS_PASSWORD`: set by the upstream-sync
-  worker for its own git credential-askpass subprocess.
+  worker for its own git credential helper.
 - `OPENSTORAGE_TEST_MODE`, `OPENSTORAGE_TEST_CRASH`, `OPENSTORAGE_TEST_CAS_DROP`,
   `OPENSTORAGE_TEST_CAS_DROP_HARD`, `OPENSTORAGE_TEST_HOOK_DELAY_MS`,
   `OPENSTORAGE_TEST_VERIFY_SPAWN_LOG`: crash/fault injection and observability knobs for

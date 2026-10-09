@@ -6,6 +6,7 @@ import (
 	"net/http/cgi"
 	"net/http/httptest"
 	"os/exec"
+	"strings"
 	stdsync "sync"
 	"testing"
 )
@@ -60,17 +61,28 @@ func (u *gatedUpstream) usernames() []string {
 // TestCredentialUsernameOnTheWire drives real pull and push transfers
 // against an upstream that accepts exactly one Basic user:password. A
 // stored username is sent unchanged. An omitted one (git sends no
-// credentials for an empty username) becomes x-token-auth for provider
-// bitbucket and "git" for every other provider (issue #396).
+// credentials for an empty username) gets upstream's per-provider default
+// (issue #400): x-token-auth (bitbucket) or oauth2 (gitlab) with the
+// token as the password, the token as the username with an empty password
+// (gitea, forgejo, codeberg), and "git" for every other provider.
 func TestCredentialUsernameOnTheWire(t *testing.T) {
 	const token = "tok-secret"
-	for _, tc := range []struct{ provider, stored, wire string }{
-		{"gitea", "", "git"},
-		{"bitbucket", "", "x-token-auth"},
-		{"gitea", "oauth2", "oauth2"},
-		{"bitbucket", "jdoe", "jdoe"},
+	for _, tc := range []struct{ provider, stored, wireUser, wirePass string }{
+		{"gitea", "", token, ""},
+		{"forgejo", "", token, ""},
+		{"codeberg", "", token, ""},
+		{"gitlab", "", "oauth2", token},
+		{"bitbucket", "", "x-token-auth", token},
+		{"github", "", "git", token},
+		{"sr.ht", "", "git", token},
+		{"gitea", "oauth2", "oauth2", token},
+		{"gitlab", "deploy-user", "deploy-user", token},
+		{"bitbucket", "jdoe", "jdoe", token},
 	} {
-		name := tc.provider + "/" + tc.wire
+		name := tc.provider + "/" + tc.wireUser
+		if tc.wireUser == token {
+			name = tc.provider + "/token-as-username"
+		}
 		putUpstream := func(t *testing.T, f *workerFixture, repoID, host string) {
 			t.Helper()
 			if _, err := f.store.PutUpstream(context.Background(), Upstream{
@@ -84,7 +96,7 @@ func TestCredentialUsernameOnTheWire(t *testing.T) {
 		}
 		t.Run(name+"/pull", func(t *testing.T) {
 			f := newWorkerFixture(t)
-			up := newGatedUpstream(t, tc.wire, token)
+			up := newGatedUpstream(t, tc.wireUser, tc.wirePass)
 			head := seedUpstream(t, up.root, "own", "proj")
 			loop := f.addLoopbackRepo(t, "repo_cu")
 			putUpstream(t, f, "repo_cu", up.url)
@@ -94,11 +106,11 @@ func TestCredentialUsernameOnTheWire(t *testing.T) {
 			if got := testGit(t, f.loopbackDir, "-C", loop, "rev-parse", "refs/heads/main"); got != head {
 				t.Fatalf("loopback main = %s, want %s", got, head)
 			}
-			requireOnlyUsername(t, up.usernames(), tc.wire)
+			requireOnlyUsername(t, up.usernames(), tc.wireUser)
 		})
 		t.Run(name+"/push", func(t *testing.T) {
 			f := newWorkerFixture(t)
-			up := newGatedUpstream(t, tc.wire, token)
+			up := newGatedUpstream(t, tc.wireUser, tc.wirePass)
 			head := seedLocalRepo(t, f, "repo_cp")
 			bare := addEmptyUpstream(t, up.root, "own", "proj")
 			testGit(t, bare, "config", "http.receivepack", "true")
@@ -112,9 +124,56 @@ func TestCredentialUsernameOnTheWire(t *testing.T) {
 			if got := testGit(t, up.root, "-C", bare, "rev-parse", "refs/heads/main"); got != head {
 				t.Fatalf("upstream main = %s, want %s", got, head)
 			}
-			requireOnlyUsername(t, up.usernames(), tc.wire)
+			requireOnlyUsername(t, up.usernames(), tc.wireUser)
 		})
 	}
+
+	// A refused token-as-username credential: the failure names neither
+	// the token nor the helper's environment (issue #400).
+	t.Run("wrong token/pull error names no token", func(t *testing.T) {
+		const wrong = "wrong-secret-4f1c"
+		f := newWorkerFixture(t)
+		up := newGatedUpstream(t, token, "")
+		seedUpstream(t, up.root, "own", "proj")
+		f.addLoopbackRepo(t, "repo_cw")
+		f.putUpstream(t, "repo_cw", "own", "proj", up.url) // provider gitea
+		if _, err := f.store.CreateCredential(context.Background(), Credential{RepoID: "repo_cw", Password: wrong}); err != nil {
+			t.Fatal(err)
+		}
+		err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_cw"})
+		if err == nil {
+			t.Fatal("Run succeeded with a refused credential")
+		}
+		requireOnlyUsername(t, up.usernames(), wrong)
+		for _, ev := range f.rec.rawList() {
+			if strings.Contains(string(ev.body), wrong) {
+				t.Fatalf("event payload names the token: %s", ev.body)
+			}
+		}
+		if strings.Contains(err.Error(), wrong) {
+			t.Fatalf("Run error names the token: %v", err)
+		}
+	})
+
+	// The credential helper speaks a line protocol: a stored value with a
+	// line break fails as configuration and sends nothing upstream.
+	t.Run("line break/pull fails as config", func(t *testing.T) {
+		f := newWorkerFixture(t)
+		up := newGatedUpstream(t, token, "")
+		seedUpstream(t, up.root, "own", "proj")
+		f.addLoopbackRepo(t, "repo_cl")
+		f.putUpstream(t, "repo_cl", "own", "proj", up.url)
+		if _, err := f.store.CreateCredential(context.Background(), Credential{RepoID: "repo_cl", Password: token + "\nusername=evil"}); err != nil {
+			t.Fatal(err)
+		}
+		err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_cl"})
+		if err == nil || !strings.Contains(err.Error(), FailConfig) || strings.Contains(err.Error(), "evil") {
+			t.Fatalf("Run error = %v, want %q without the value", err, FailConfig)
+		}
+		if got := up.usernames(); len(got) != 0 {
+			t.Fatalf("upstream saw credentials: %q", got)
+		}
+	})
 
 	// No stored credential: git sends no Basic credentials and the gated
 	// upstream refuses the pull.

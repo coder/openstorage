@@ -21,39 +21,60 @@ import (
 	"time"
 )
 
-func TestAuthGitEnvOverridesInheritedCredentials(t *testing.T) {
+// TestAuthGitEnvCredentialHelper runs real `git credential` against the
+// authGitEnv environment: "get" answers with the given pair (an empty
+// password included, issue #400), "store" and "erase" print nothing,
+// inherited credential aliases never survive, and an empty username
+// installs no helper at all. A repo-local helper never answers first.
+func TestAuthGitEnvCredentialHelper(t *testing.T) {
 	for _, name := range []string{
 		"OPENSTORAGE_ASKPASS_USERNAME", "CODESTORAGE_ASKPASS_USERNAME",
 		"OPENSTORAGE_ASKPASS_PASSWORD", "CODESTORAGE_ASKPASS_PASSWORD",
 	} {
 		t.Setenv(name, "inherited")
 	}
-	for _, password := range []string{"", "trusted-password"} {
-		script := filepath.Join(t.TempDir(), "askpass")
-		env, err := authGitEnv(script, "trusted-user", password, "https")
+	// A repo-local helper must not answer first: authGitEnv resets the
+	// multi-valued credential.helper list before adding its own.
+	repoDir := t.TempDir()
+	testGit(t, repoDir, "init", "-q", ".")
+	testGit(t, repoDir, "config", "credential.helper", "!f() { echo username=local; echo password=local; }; f")
+	gitCredential := func(t *testing.T, env []string, action string) string {
+		t.Helper()
+		cmd := exec.CommandContext(t.Context(), "git", "credential", action)
+		cmd.Dir = repoDir
+		cmd.Env = env
+		cmd.Stdin = strings.NewReader("protocol=https\nhost=forge.invalid\n\n")
+		out, err := cmd.Output()
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("git credential %s: %v", action, err)
 		}
+		return string(out)
+	}
+	for _, tc := range []struct{ user, pass string }{{"trusted-user", "trusted-password"}, {"tok-as-user", ""}} {
+		env := authGitEnv(tc.user, tc.pass, "https")
 		for _, entry := range env {
 			if strings.Contains(entry, "STORAGE_ASKPASS_") && strings.HasSuffix(entry, "=inherited") {
 				t.Fatal("inherited credential alias survived")
 			}
-		}
-		if password == "" {
-			for _, entry := range env {
-				if strings.HasPrefix(entry, "GIT_ASKPASS=") || strings.HasPrefix(entry, "OPENSTORAGE_ASKPASS_") || strings.HasPrefix(entry, "CODESTORAGE_ASKPASS_") {
-					t.Fatal("public upstream inherited an askpass helper or credential")
-				}
+			if strings.HasPrefix(entry, "GIT_CONFIG_VALUE_") && tc.pass != "" && strings.Contains(entry, tc.pass) {
+				t.Fatal("credential value reached git config (argv of the helper shell)")
 			}
-			continue
 		}
-		for prompt, want := range map[string]string{"Username": "trusted-user", "Password": password} {
-			cmd := exec.CommandContext(t.Context(), script, prompt)
-			cmd.Env = env
-			out, err := cmd.CombinedOutput()
-			if err != nil || string(out) != want+"\n" {
-				t.Fatalf("askpass %s did not return the trusted value (err=%v)", prompt, err)
+		got := gitCredential(t, env, "fill")
+		want := "protocol=https\nhost=forge.invalid\nusername=" + tc.user + "\npassword=" + tc.pass + "\n"
+		if got != want {
+			t.Fatalf("credential fill = %q, want %q", got, want)
+		}
+		for _, action := range []string{"approve", "reject"} {
+			if out := gitCredential(t, env, action); out != "" {
+				t.Fatalf("credential %s printed %q", action, out)
 			}
+		}
+	}
+	for _, entry := range authGitEnv("", "", "https") {
+		if strings.HasPrefix(entry, "GIT_CONFIG_") && !strings.HasPrefix(entry, "GIT_CONFIG_GLOBAL=") && !strings.HasPrefix(entry, "GIT_CONFIG_SYSTEM=") ||
+			strings.HasPrefix(entry, "OPENSTORAGE_ASKPASS_") || strings.HasPrefix(entry, "CODESTORAGE_ASKPASS_") {
+			t.Fatalf("public upstream got a credential helper or credential: %q", entry)
 		}
 	}
 }

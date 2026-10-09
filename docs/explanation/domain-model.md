@@ -85,7 +85,7 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
      the repository's storage permanently, with no restore.
    - The name burn persists: URL-scoped tokens may outlive any retention, so the
      `(org, url)` pair is never released.
-9. **Commit ordering.** `GET /repos/commits` returns history newest-first by commit date,
+9. **Commit ordering.** `GET /repos/commits` returns history newest-first by committer date,
    cursor-paginated.
 10. **Tag semantics.** `POST /repos/tags` creates lightweight tags only; `target` must
     resolve to a commit. List/delete must dereference annotated tags correctly (the

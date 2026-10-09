@@ -165,19 +165,32 @@ about the endpoint's rollout status on upstream clusters.
 `/repos/{repo_name}/git-credentials` routes. Only `password` is required. The server
 stores the username exactly as sent. An update that omits it clears the stored one.
 
-Git sends no credentials when the username is empty. So for a credential with no
-username, the sync worker sends a placeholder username with the stored password:
-`x-token-auth` when the upstream's provider is `bitbucket`, and `git` for every other
-provider.
+A stored username is always sent as is. Git sends no credentials when the username is
+empty, so for a credential with no username the sync worker sends the upstream's
+per-provider default from upstream's spec of 2026-10-08:
+
+| Upstream provider | Sent when no username is stored |
+|---|---|
+| `bitbucket` | Username `x-token-auth`, the token as the password |
+| `gitlab` | Username `oauth2`, the token as the password |
+| `gitea`, `forgejo`, `codeberg` | The token as the username, with an empty password (git cannot send a username alone) |
+| `github` and every other provider | Username `git`, the token as the password |
+
+The spec also notes that sr.ht takes no credential over HTTPS. A credential stored for
+an sr.ht upstream still gets the `git` default.
 
 | Host | What to send |
 |---|---|
 | Gitea, Forgejo, Codeberg | The token as `password`. The username can be omitted. |
-| GitLab personal, project, group or OAuth token | The token as `password`. The username can be omitted (upstream suggests `oauth2`). |
+| GitLab personal, project, group or OAuth token | The token as `password`. The username can be omitted when the provider is `gitlab`. Otherwise send `oauth2`. |
 | GitLab deploy token | The deploy token's username. CI job tokens use `gitlab-ci-token`. |
 | Bitbucket access token | The token as `password`. The username can be omitted when the provider is `bitbucket`. Otherwise send `x-token-auth`. |
 | Bitbucket app password or API token | Your Bitbucket username. |
 | Any other host | The username that host expects. |
+
+The worker hands the pair to git through a credential helper that reads it from the
+environment. A stored username or password that contains a carriage return, line feed
+or NUL fails the sync as a configuration error.
 
 ### Files & trees (`git:read`)
 
