@@ -1,5 +1,72 @@
 # Changelog
 
+## [0.16.0](https://github.com/coder/openstorage/compare/v0.15.0...v0.16.0) (2026-10-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **api:** Commit.date now means the author date. Read the new committer_date field for the committer date.
+* **api:** POST /api/v1/repos returns 201 instead of 200 for a new repository, the success message text changes, and a create of a deleted repo's name returns 404 instead of 409. The Go and TypeScript SDKs accept any 2xx.
+* **webhooks:** send outbound push-upstream runs as repo.push_upstream.* events ([#358](https://github.com/coder/openstorage/issues/358))
+
+### Features
+
+* **api:** accept optional repo_name in POST /repos ([#299](https://github.com/coder/openstorage/issues/299)) ([3a68bc9](https://github.com/coder/openstorage/commit/3a68bc98851c823a0cfd64648837cfd83a6a07cb))
+* **api:** accept restore-commit base_ref with the spec's 412 preconditions ([#383](https://github.com/coder/openstorage/issues/383)) ([b0ddce7](https://github.com/coder/openstorage/commit/b0ddce709856aa56ff2f0c5cd9e87d68e473e9cf))
+* **api:** accept upstream on repo create and expose it on repo GET ([#361](https://github.com/coder/openstorage/issues/361)) ([f6a6d33](https://github.com/coder/openstorage/commit/f6a6d336266a2730e71ce17789354c34b000088b))
+* **api:** add organization metadata endpoint ([#286](https://github.com/coder/openstorage/issues/286)) ([536e096](https://github.com/coder/openstorage/commit/536e096a32db4a0f76a3d163f2075d7d4984164f))
+* **api:** add RFC 9457 problem-details fields to the error envelope ([#351](https://github.com/coder/openstorage/issues/351)) ([1f392ac](https://github.com/coder/openstorage/commit/1f392ac38e330e1966a8a9a31a023f2ba09cdfe7))
+* **api:** add topological order rank to files/metadata commits ([#337](https://github.com/coder/openstorage/issues/337)) ([516ee3d](https://github.com/coder/openstorage/commit/516ee3dcbed62c4a15da6642980a5bdbbbe921bd))
+* **api:** allocate omitted branch targets ([#239](https://github.com/coder/openstorage/issues/239)) ([3663fae](https://github.com/coder/openstorage/commit/3663faef017a7c51392933d3f5e11a0a52d68520))
+* **api:** answer POST /repos 201 on create and 404 for a deleted name ([#390](https://github.com/coder/openstorage/issues/390)) ([127be7d](https://github.com/coder/openstorage/commit/127be7debbd9f9ee39ce0bf9b3eeb2d368e7b86a))
+* **api:** bound memory, time and concurrency of read-side git subprocesses ([#324](https://github.com/coder/openstorage/issues/324)) ([0fec21e](https://github.com/coder/openstorage/commit/0fec21eb42be719c5843924d69b0015eea774516))
+* **api:** serve the path-style notes/append, upstream/pull and DELETE upstream routes ([#382](https://github.com/coder/openstorage/issues/382)) ([718d3a5](https://github.com/coder/openstorage/commit/718d3a52b6c5403f7f4956320aae1066ebc7583a))
+* **cli:** add fail-closed keygen bootstrap mode ([e32d58f](https://github.com/coder/openstorage/commit/e32d58f349d9b7fa41d052488db0347a4647695a))
+* **compose:** add a local-build Docker-only quickstart ([#256](https://github.com/coder/openstorage/issues/256)) ([e374aad](https://github.com/coder/openstorage/commit/e374aad49eef85d5142612b56795d0995503ea12))
+* **deploy:** add Terraform AWS EC2 reference ([#254](https://github.com/coder/openstorage/issues/254)) ([d94125f](https://github.com/coder/openstorage/commit/d94125f63c0bec1ea4bdf833dd19deaaa22e4a9d))
+* **githttp:** bounded push-publication wait primitive ([#332](https://github.com/coder/openstorage/issues/332)) ([474791e](https://github.com/coder/openstorage/commit/474791ea36db75e53eab305664c974e3ad948c8c))
+* **githttp:** commit-graph refreshes join the shared git chokepoint; outcome log contract and metric ([#338](https://github.com/coder/openstorage/issues/338)) ([cb8b33a](https://github.com/coder/openstorage/commit/cb8b33a8313ffbabf50f0671c8d92b94e5657e20))
+* **meta:** add CreateLinkedRepo, an atomic repo + upstream (+ credential) create ([#389](https://github.com/coder/openstorage/issues/389)) ([c3af22a](https://github.com/coder/openstorage/commit/c3af22a501cb4aa404950b2231f208c5d4660b92))
+* **meta:** record a per-repository create state ([#391](https://github.com/coder/openstorage/issues/391)) ([f677626](https://github.com/coder/openstorage/commit/f6776265b658d46bdc7916cd5a8a4179ed34fef3))
+* **meta:** SQLite local schedule state and transitions ([#336](https://github.com/coder/openstorage/issues/336)) ([549d37c](https://github.com/coder/openstorage/commit/549d37cb0131a93f270d2fbcc03424748e308e94))
+* **metrics:** add opt-in Prometheus metrics listener ([#327](https://github.com/coder/openstorage/issues/327)) ([372a4b3](https://github.com/coder/openstorage/commit/372a4b3031821c0a3d9653a06eccd869c6d59dcb))
+* **sync:** schedule a sync create's first sync with its create mark ([#392](https://github.com/coder/openstorage/issues/392)) ([0c6c2c2](https://github.com/coder/openstorage/commit/0c6c2c2f1222080b48dd87425b8a15945b20b368))
+* **sync:** SQLite git-surface pushes schedule sync and forwarding ([#345](https://github.com/coder/openstorage/issues/345)) ([897ccd1](https://github.com/coder/openstorage/commit/897ccd1054a86f1142fbd156281a4b40a648ffbb))
+* **sync:** SQLite local worker and schedule sweep ([#341](https://github.com/coder/openstorage/issues/341)) ([edb0eeb](https://github.com/coder/openstorage/commit/edb0eeb064dbd1025ad2d607283a099bd44fc10d))
+* **webhooks:** send org, type and repository.repo_name ([#368](https://github.com/coder/openstorage/issues/368)) ([05f083a](https://github.com/coder/openstorage/commit/05f083a8a94d98a983fbaed165b36484d4449e8d))
+* **webhooks:** send outbound push-upstream runs as repo.push_upstream.* events ([#358](https://github.com/coder/openstorage/issues/358)) ([c69bcc7](https://github.com/coder/openstorage/commit/c69bcc737fb998f73fbbaac8d6598b27b5decd3d))
+
+
+### Bug Fixes
+
+* **api:** accept current upstream field names and DELETE query params ([#379](https://github.com/coder/openstorage/issues/379)) ([a26fcc3](https://github.com/coder/openstorage/commit/a26fcc3aef61684930b8c4c36b505c7b8f1d7692))
+* **api:** accept uppercase full SHAs and reject duplicate strict-JSON members ([#384](https://github.com/coder/openstorage/issues/384)) ([87b06ec](https://github.com/coder/openstorage/commit/87b06ec90d029349913e716321b80b0e5efc28b4))
+* **api:** accept uppercase guard SHAs and walk strict request types ([#386](https://github.com/coder/openstorage/issues/386)) ([9efd9d7](https://github.com/coder/openstorage/commit/9efd9d70126bce1f49425bab0a45e8bc221b409a))
+* **api:** deny sync repo creates for ref-policy-restricted tokens ([#395](https://github.com/coder/openstorage/issues/395)) ([db465a2](https://github.com/coder/openstorage/commit/db465a2594aecbf88094c3688e8db30eff38d5d8))
+* **api:** omit exhausted pagination cursors and refresh upstream spec ([#377](https://github.com/coder/openstorage/issues/377)) ([6851ff9](https://github.com/coder/openstorage/commit/6851ff93f6ad34b3576669812896f5a1f5788cc0))
+* **api:** report the author date as Commit.date and add committer_date ([#401](https://github.com/coder/openstorage/issues/401)) ([cf05eff](https://github.com/coder/openstorage/commit/cf05eff6c7852112ffe14b2a3bbc6784077a1217))
+* **api:** resolve a relative cache dir once at startup and in api.New ([#366](https://github.com/coder/openstorage/issues/366)) ([b590932](https://github.com/coder/openstorage/commit/b59093209ae15a35db392d8930a39e6339be9d37))
+* **auth:** require 2048-bit RSA organization public keys ([5b17f02](https://github.com/coder/openstorage/commit/5b17f0261a5b81a61430d02fab25dc03a54b750b))
+* **ci:** make the legacy MinIO qualification lane opt-in ([#308](https://github.com/coder/openstorage/issues/308)) ([c01ad82](https://github.com/coder/openstorage/commit/c01ad8268f4f7f74df842bab4e8c2e0f42bb6e38))
+* **ci:** restore the legacy MinIO fixture source ([#251](https://github.com/coder/openstorage/issues/251)) ([5f172c5](https://github.com/coder/openstorage/commit/5f172c5e4e72568dcdf0f344d65f75163b2f34c6))
+* **deps:** update x/crypto to address SSH advisories ([#233](https://github.com/coder/openstorage/issues/233)) ([de71d60](https://github.com/coder/openstorage/commit/de71d6061da7e4afb306254b731f756c3dd9340a))
+* **githttp:** serialize cold cache initialization ([#252](https://github.com/coder/openstorage/issues/252)) ([915d4be](https://github.com/coder/openstorage/commit/915d4beafaaa313f282a6ea08eb99970ad4d9908))
+* **gitread:** pin git's message locale so heap-cap failures classify as 422 ([#340](https://github.com/coder/openstorage/issues/340)) ([870a647](https://github.com/coder/openstorage/commit/870a64786dfd1e85a981a0adf13ed8cbd901d591))
+* **jobs:** keep River sync runs uncounted across serve shutdown ([#347](https://github.com/coder/openstorage/issues/347)) ([b224898](https://github.com/coder/openstorage/commit/b224898af6c778717bda8a576e43fb5b79ddd421))
+* **s3wal:** name missing lease holder in corruption diagnostics ([#302](https://github.com/coder/openstorage/issues/302)) ([6bf383a](https://github.com/coder/openstorage/commit/6bf383a272fc81b695e5db5d0630dc031ac8ba12))
+* **s3wal:** preserve evidence in lease refusal diagnostics ([#270](https://github.com/coder/openstorage/issues/270)) ([84101df](https://github.com/coder/openstorage/commit/84101df0e27770f4808735fa41485bb7f94deaf6))
+* **s3wal:** preserve evidence in lease refusal diagnostics ([#270](https://github.com/coder/openstorage/issues/270)) ([84101df](https://github.com/coder/openstorage/commit/84101df0e27770f4808735fa41485bb7f94deaf6))
+* **sync:** keep in-flight local runs' requests across serve shutdown ([#344](https://github.com/coder/openstorage/issues/344)) ([bba1986](https://github.com/coder/openstorage/commit/bba1986913e5f0dc5ee2c90fd47e0cc9aa7f9870))
+* **sync:** send upstream's default username when none is stored ([#402](https://github.com/coder/openstorage/issues/402)) ([ed1b409](https://github.com/coder/openstorage/commit/ed1b409ce7c53f03a98a8d3fb4dd6f37859a01b0))
+* **sync:** send x-token-auth for Bitbucket credentials without a username ([#398](https://github.com/coder/openstorage/issues/398)) ([6cb11d3](https://github.com/coder/openstorage/commit/6cb11d301be0e5bb920c7c3b81d98403bb3601ad))
+* **test:** accept trailing slash on fake S3 bucket requests ([#330](https://github.com/coder/openstorage/issues/330)) ([347f59d](https://github.com/coder/openstorage/commit/347f59d6ff3d1841bb7f1e07c87c33ae74fafbb5))
+* use the canonical openstorage repository and Go module ([#225](https://github.com/coder/openstorage/issues/225)) ([c877535](https://github.com/coder/openstorage/commit/c8775353a7ce469fcebad75ee95ff471a458bea8))
+
+
+### Performance Improvements
+
+* **githttp:** write split commit-graphs for cache repositories ([#321](https://github.com/coder/openstorage/issues/321)) ([84e2125](https://github.com/coder/openstorage/commit/84e212568cbb8f66431b7912d3d3acb87dc42638))
+
 ## [0.15.0](https://github.com/coder/openstorage/compare/v0.14.6...v0.15.0) (2026-09-07)
 
 
