@@ -3,8 +3,13 @@
 Run **one local-mode server** (SQLite plus files) using only Docker. For a
 two-replica Postgres/S3 stack, use the [development stack](deploy-docker-compose.md).
 
-This is **development verification** with a locally built image. No pinned
-downloadable image exists yet ([issue #227](https://github.com/coder/openstorage/issues/227)).
+The Compose file runs the image you choose: a published
+`ghcr.io/coder/openstorage` version or a local build.
+
+> [!IMPORTANT]
+> **No image is published yet.** No version has been pushed to a registry
+> ([issue #227](https://github.com/coder/openstorage/issues/227)).
+> Until this page lists a published version, use [a local build](#option-b-build-locally).
 
 ## Prerequisites
 
@@ -14,14 +19,32 @@ downloadable image exists yet ([issue #227](https://github.com/coder/openstorage
 
 No Go, `openstorage` binary, Postgres, or S3 is needed on the host.
 
-## 1. Build and start
+## 1. Choose an image and start
 
-Run these commands from the checkout root, in the same shell:
+Run these commands from the checkout root, in the same shell. First set
+`OPENSTORAGE_IMAGE` with option A or option B.
+
+### Option A: use a published image
+
+Not available yet: see the note above. Once a version `X.Y.Z` is published, pin it
+by version and digest, and log in first while the package is private:
+
+```sh
+docker login ghcr.io  # a GitHub token with read:packages; not needed for a public package
+export OPENSTORAGE_IMAGE=ghcr.io/coder/openstorage:X.Y.Z@sha256:<index digest>
+```
+
+### Option B: build locally
 
 ```sh
 TAG="openstorage-quickstart:local-$(date +%s)-$$"
 docker build -t "$TAG" .
 export OPENSTORAGE_IMAGE=$(docker image inspect --format '{{.Id}}' "$TAG")
+```
+
+### Start
+
+```sh
 export OPENSTORAGE_PROJECT=openstorage-demo  # choose another name on a shared daemon
 export OPENSTORAGE_PORT=8080               # choose a free loopback port
 
@@ -29,9 +52,10 @@ dc() { docker compose -f compose.quickstart.yml -p "$OPENSTORAGE_PROJECT" "$@"; 
 dc up -d --wait
 ```
 
-Keep the image ID, project name, and port for later commands.
+Keep the image, project name, and port for later commands.
 
-- [`compose.quickstart.yml`](../../compose.quickstart.yml) never pulls an image.
+- [`compose.quickstart.yml`](../../compose.quickstart.yml) has no default image. It
+  pulls `OPENSTORAGE_IMAGE` only when the image is not present locally.
 - The server listens only on `127.0.0.1:$OPENSTORAGE_PORT`; Git and LFS advertise
   that URL.
 - `/healthz` is a **liveness** check after startup, not continuous database or
@@ -173,11 +197,12 @@ mount roots, so changing the runtime UID needs an offline data migration.
 
 ## Verification and production boundary
 
-CI builds the Dockerfile without pushing and runs
+On linux/amd64 and linux/arm64 runners, CI builds the Dockerfile without pushing,
+tags it like a published image, and runs
 [`scripts/smoke-compose-quickstart.sh`](../../scripts/smoke-compose-quickstart.sh)
-on the exact local image ID. To repeat it, install the client tools plus Bash and
-Python 3, export `OPENSTORAGE_IMAGE`, and run
-`bash scripts/smoke-compose-quickstart.sh`.
+on it. To repeat it, install the client tools plus Bash and Python 3, export
+`OPENSTORAGE_IMAGE` (an image already present locally, so nothing is pulled), and
+run `bash scripts/smoke-compose-quickstart.sh`.
 
 The smoke uses disposable projects to test API/Git/LFS, old-token persistence, key
 isolation, and fail-closed bootstrap faults. It then checks that its containers,

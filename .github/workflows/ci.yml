@@ -115,10 +115,13 @@ jobs:
           grep -F "openstorage v0.0.0-ci (commit $GITHUB_SHA," <<<"$out"
       - name: Check runtime Git and signature tools
         run: docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      # Use the published-image reference form. The tag exists only in this
+      # runner's daemon, and the smoke refuses to start unless the image is local.
       - name: Smoke the exact Compose quickstart
         run: |
           bash -n scripts/smoke-compose-quickstart.sh
-          bash scripts/smoke-compose-quickstart.sh
+          docker tag "$OPENSTORAGE_IMAGE" ghcr.io/coder/openstorage:0.0.0-ci
+          OPENSTORAGE_IMAGE=ghcr.io/coder/openstorage:0.0.0-ci bash scripts/smoke-compose-quickstart.sh
 
   test-local:
     runs-on: ubuntu-latest
