@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Development verification of the unchanged reference config, never a registry push.
+# Verification of the unchanged reference config, never a registry push or pull.
 set +x
 set -Eeuo pipefail
 umask 077
-: "${OPENSTORAGE_IMAGE:?Build Dockerfile and export its exact local image ID}"
-[[ $OPENSTORAGE_IMAGE =~ ^sha256:[a-f0-9]{64}$ ]]
+: "${OPENSTORAGE_IMAGE:?Export a local image ID or an image reference already present locally}"
 for tool in docker python3 curl git; do command -v "$tool" >/dev/null; done
+# The image must already be local, so Compose's pull_policy: missing never pulls.
+image_id=$(docker image inspect --format '{{.Id}}' "$OPENSTORAGE_IMAGE")
+[[ $image_id =~ ^sha256:[a-f0-9]{64}$ ]]
 git lfs version
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
@@ -66,6 +68,7 @@ s = c["services"]
 assert set(s) == {"init", "server", "cli"}
 assert set(c["volumes"]) == {"private", "public", "data"}
 assert all(v["image"] == sys.argv[2] for v in s.values())
+assert all(v["pull_policy"] == "missing" for v in s.values())
 assert s["server"]["user"] == "openstorage"
 assert s["server"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
 p, = s["server"]["ports"]
@@ -85,7 +88,7 @@ up() { compose up -d --wait --wait-timeout 60 >>"$work/compose.log" 2>&1; }
 up
 server=$(compose ps -q server)
 docker inspect "$server" >"$work/server.json"
-python3 - "$work/server.json" "$project" "$OPENSTORAGE_IMAGE" <<'PY'
+python3 - "$work/server.json" "$project" "$image_id" <<'PY'
 import json, sys
 s, = json.load(open(sys.argv[1]))
 assert s["Image"] == sys.argv[3]

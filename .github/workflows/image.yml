@@ -1,0 +1,100 @@
+# Container image verification (issue #227): builds an existing release tag's
+# image natively on linux/amd64 and linux/arm64 and runs the Compose quickstart
+# smoke on each. It pushes nothing and has no registry credentials.
+#
+# Manual only, on purpose: there is no push, tag, release, or workflow_call
+# trigger. Publishing to a registry is a later, separately approved change.
+# Runbook: docs/how-to/release.md#4-verify-the-container-image.
+name: image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and check (e.g. v0.17.0)"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  # Resolve the tag to a commit once. Every later job builds that commit, so a
+  # tag moved during the run cannot change what gets checked.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      date: ${{ steps.resolve.outputs.date }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a published release tag on main
+        id: resolve
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag must look like v1.2.3, got: $TAG"; exit 1; }
+          commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+          git merge-base --is-ancestor "$commit" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
+          # Every job builds the tag's own Dockerfile. Tags cut before it took the
+          # stamp build args (v0.16.0 and earlier) cannot pass the version check.
+          git show "$commit:Dockerfile" | grep -qE '^ARG VERSION([= ]|$)' ||
+            { echo "::error::$TAG predates version-stamped images; use a release cut after the image workflow landed"; exit 1; }
+          [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = false ] || { echo "::error::$TAG has no published release"; exit 1; }
+          # The commit time, not the build time, so every job stamps the same value.
+          date=$(TZ=UTC0 git show -s --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "$commit")
+          {
+            echo "tag=$TAG"
+            echo "commit=$commit"
+            echo "date=$date"
+          } >> "$GITHUB_OUTPUT"
+          echo "$TAG -> $commit ($date)"
+
+  # Native build and full Compose quickstart smoke on each platform. Pushes nothing.
+  verify:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    name: verify (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      ARCH: ${{ matrix.arch }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      COMMIT: ${{ needs.resolve.outputs.commit }}
+      BUILD_DATE: ${{ needs.resolve.outputs.date }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - name: Build without publication
+        run: |
+          docker build --iidfile "$RUNNER_TEMP/openstorage-image.id" --build-arg VERSION="$TAG" \
+            --build-arg COMMIT="$COMMIT" --build-arg BUILD_DATE="$BUILD_DATE" .
+          echo "OPENSTORAGE_IMAGE=$(cat "$RUNNER_TEMP/openstorage-image.id")" >> "$GITHUB_ENV"
+      - name: Check platform, version stamp, and runtime tools
+        run: |
+          [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$OPENSTORAGE_IMAGE")" = "linux/$ARCH" ]
+          out=$(docker run --rm "$OPENSTORAGE_IMAGE" --version)
+          echo "$out"
+          grep -F "openstorage $TAG (commit $COMMIT, built $BUILD_DATE," <<<"$out"
+          docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      - name: Smoke the Compose quickstart
+        run: bash scripts/smoke-compose-quickstart.sh
