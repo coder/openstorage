@@ -44,34 +44,38 @@ Title releasable PRs like this:
 After the next push to main, release-please opens or updates the rolling release PR.
 
 `github-actions[bot]` creates that PR, so GitHub holds its `pull_request` CI run at
-**"action required"**. Nothing runs until a maintainer approves it, and branch
-protection requires `lint` / `test` / `test-local` / `test-s3wal`.
+**"action required"**. Nothing runs until a maintainer approves it. Branch
+protection requires `lint` / `test` / `test-local` / `test-s3wal` from the `ci`
+workflow and `pr-title` from the `pr-title` workflow.
 
-Approve with the **Approve and run** button on the PR's Actions run, or:
+Each push to the branch holds two runs: one `ci` and one `pr-title`. Approve both,
+with the **Approve and run** button on each Actions run, or:
 
 ```sh
-gh run list -R coder/openstorage --branch release-please--branches--main \
-  --workflow ci --status action_required --limit 1
-gh api --method POST repos/coder/openstorage/actions/runs/<run-id>/approve
+for wf in ci pr-title; do
+  gh run list -R coder/openstorage --branch release-please--branches--main--components--openstorage \
+    --workflow "$wf" --status action_required --limit 1
+done
+gh api --method POST repos/coder/openstorage/actions/runs/<run-id>/approve  # once per run
 ```
 
 > [!IMPORTANT]
-> Keep `--workflow ci`. The branch also gets a held run from the optional `pr-title`
-> workflow. Without the filter, `--limit 1` may return that run, and approving it
-> leaves the required checks blocked.
+> Approve both runs. If either stays held, its required checks never report and the
+> release PR cannot merge.
 
 - Every push to main while the release PR is open refreshes the branch and creates
-  a new held run. Approve each one.
-- Approving the `pr-title` run is optional. It is deliberately **not** a required
-  check, so an unapproved run cannot wedge the release PR.
+  two new held runs. Approve each one.
 - A fine-grained PAT or GitHub App token in the action's `token` input would remove
   this step. Until one exists, approve-and-run is the documented path. Do **not**
   loosen branch protection instead.
 
 ## 3. Merge the release PR
 
-Squash-merge it as-is. Keep the `chore(main): release X.Y.Z` title so it does not
-trigger another bump. The next `release-please.yml` run then:
+Release PRs go through the merge queue like every other PR. Enqueue it as-is with
+**Merge when ready**, or `gh pr merge <number> -R coder/openstorage --squash`. Do
+not edit the title or the body: keep the `chore(main): release X.Y.Z` title so it
+does not trigger another bump. The queue runs `ci` and `pr-title` again on the
+queued commit, then squash-merges it. The next `release-please.yml` run then:
 
 1. Creates tag `vX.Y.Z` and the GitHub release, using the CHANGELOG section as notes.
 2. Chains the `release` workflow

@@ -11,3 +11,6 @@
 # Local quickstart scratch (cloned demo repo, serve --data-dir state)
 /demo/
 /tmp/
+
+# Release archives from `scripts/release-archives.sh <tag> dist` (#414)
+/dist/
