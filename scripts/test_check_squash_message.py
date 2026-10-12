@@ -35,6 +35,7 @@ class SquashMessageTests(unittest.TestCase):
             ("BREAKING CHANGE:", bang, [1]),
             ("Text.\n\ndocs: split here\nBREAKING CHANGE: y", bang, [3]),
             ("Add a BEGIN_COMMIT_OVERRIDE block\n\nfeat: x", None, [1, 3]),
+            ("BEGIN_COMMIT_OVERRIDE\nfix: a\nBEGIN_NESTED_COMMIT\nfeat: b\nEND_COMMIT_OVERRIDE", None, [3]),
         ]
         for body, subject, expected in cases:
             with self.subTest(body=body):
@@ -44,7 +45,7 @@ class SquashMessageTests(unittest.TestCase):
         body = "\r\n".join([
             "Accepted in every", "segment: non-zero padding bits, and CR/LF anywhere",
             "Docs impact: none. See [the guide](docs/a.md) and (#405).",
-            "- fix: a list item is fine", "    indented(code(sample))", "", "Closes #405",
+            "- fix: a list item is fine", "    indented(code(sample))", "fix #405", "", "Closes #405",
             "https://github.com/user-attachments/assets/3cf83530",
             "Signed-off-by: A Person <a@example.com>",
             "_Generated with [`xum`](https://github.com/coder/xum) • Model: `m`_",

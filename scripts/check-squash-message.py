@@ -51,19 +51,16 @@ def footer_finding(line):
         return "this footer sets the next release version. Remove it."
     glued = kind + (scope or "") + (bang or "") + (": " if separator == ":" else "") + value
     # The parser trims each footer commit, so an EM SPACE before "fix:" vanishes.
-    # Check the line as written too: a subject's separator may also be " #".
-    for text in (glued, line):
-        commit = SUBJECT.match(JS_TRIM.sub("", text))
-        if commit and (commit.group(1) in VISIBLE or commit.group(2)):
-            return "release-please reads this line as another commit. Reword or rewrap it."
+    commit = SUBJECT.match(JS_TRIM.sub("", glued))
+    if commit and (commit.group(1) in VISIBLE or commit.group(2)):
+        return "release-please reads this line as another commit. Reword or rewrap it."
     return None
 
 
 def findings(message):
     """Return (body line number, reason) pairs for one squash message."""
     assert isinstance(message, str), type(message)
-    # The parser splits lines on CR as well as LF.
-    lines = re.split(r"\r\n|\r|\n", message.strip())
+    lines = re.split(r"\r\n|\r|\n", message.strip())  # The parser also ends lines at CR.
     subject, body = lines[0], lines[1:]
     if body and body[0] == "":
         body = body[1:]  # The separator line: body line 1 is the PR body's line 1.
@@ -90,6 +87,8 @@ def findings(message):
                 block_start = closing is not None
             elif marker == closing:
                 closing, block_start = None, False
+            elif marker in MARKERS:  # release-please still splits at a nested BEGIN.
+                reason = f"{marker} inside another block. Close the first block before it."
         elif block_start and line.strip():
             block_start = False
             if not BLOCK_SUBJECT.match(line):
