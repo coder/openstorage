@@ -199,7 +199,9 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           [[ $DIGEST =~ ^sha256:[a-f0-9]{64}$ ]]
-          [ "$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')" = "$DIGEST" ]
+          # Parse JSON: some Buildx releases ignore a field template like
+          # {{.Manifest.Digest}} and print the default table (docker/buildx#4006).
+          [ "$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)" = "$DIGEST" ]
           platforms=$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .Manifest}}' |
             jq -r '[.manifests[].platform | select(.os != "unknown") | .os + "/" + .architecture] | sort | join(",")')
           [ "$platforms" = linux/amd64,linux/arm64 ]
