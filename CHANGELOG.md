@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.17.0](https://github.com/coder/openstorage/compare/v0.16.0...v0.17.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** openstorage no longer reads CODESTORAGE_* environment variables. Rename each one to its OPENSTORAGE_* name before you upgrade. A process that still sets an old name without its replacement refuses to start and names the variables to rename.
+
+### Features
+
+* **compose:** accept a registry image in the Docker-only quickstart ([#406](https://github.com/coder/openstorage/issues/406)) ([22346a4](https://github.com/coder/openstorage/commit/22346a40905590c7da16aa71ddd708fea7df597a))
+* **config:** remove the CODESTORAGE_* environment fallback ([#413](https://github.com/coder/openstorage/issues/413)) ([f70ee39](https://github.com/coder/openstorage/commit/f70ee3949e1dfc1782c69e62e15b98b855d41fe8))
+
 ## [0.16.0](https://github.com/coder/openstorage/compare/v0.15.0...v0.16.0) (2026-10-09)
 
 
