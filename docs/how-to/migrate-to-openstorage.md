@@ -55,10 +55,13 @@ original module paths and asset names.
 
 The canonical prefix is `OPENSTORAGE_*`. In 0.15.x and 0.16.x, a `CODESTORAGE_*`
 variable is a fallback when the matching new variable is **unset**. 0.17.0 removes
-the fallback.
+the fallback and reads only `OPENSTORAGE_*` names.
 
 > [!WARNING]
-> Migrate all settings before upgrading to 0.17.0. Do not rely on the fallback.
+> Migrate all settings before upgrading to 0.17.0. From 0.17.0, every subcommand
+> except `version` and the internal `hook` refuses to start while a `CODESTORAGE_*`
+> variable is set and its `OPENSTORAGE_*` replacement is unset. The error names each
+> old variable and its replacement, without values.
 
 Precedence rules:
 
@@ -66,8 +69,9 @@ Precedence rules:
   goes through that setting's normal validation or default; it never falls back.
   For example, an empty required org setting fails startup even if the old org
   variable has a value.
-- `serve` logs a **boot-time deprecation warning for each legacy fallback**, without
-  values. A shadowed legacy variable is not a fallback.
+- A `CODESTORAGE_*` variable whose replacement is set, even to an empty value, is
+  ignored. 0.15.x and 0.16.x `serve` logged a boot-time deprecation warning for each
+  fallback it used, without values.
 - Explicit CLI flags still take precedence over environment settings.
 
 Rolling upgrade (pre-0.15 binaries do **not** read the new prefix):
@@ -123,10 +127,11 @@ Use the **existing** deployment's paths and org settings, not fresh directories.
 Rehearse before touching production, on a backed-up local install or isolated
 staging deployment with its existing stores:
 
-1. Start the new `openstorage` binary with the old environment names. Check
-   `/healthz`. Confirm the boot log warns for each fallback without printing secrets.
-2. Stop it gracefully. Rename the keys to `OPENSTORAGE_*`, keeping all values and
-   storage paths. Start it and check `/healthz`; the deprecation warnings are gone.
+1. Start the new `openstorage` binary with only the old environment names. It must
+   refuse to start, and its error must name each old variable and its replacement
+   without printing secrets.
+2. Rename the keys to `OPENSTORAGE_*`, keeping all values and storage paths. Start it
+   and check `/healthz`.
 3. With an existing repository's token, read metadata, clone, and push a test
    commit. Restart and confirm the commit survives. If you use Git LFS, fetch an
    existing LFS object too.

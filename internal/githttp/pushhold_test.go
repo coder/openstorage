@@ -3443,6 +3443,7 @@ func TestEnsureCacheRepo_RestoresOwnerExecBit(t *testing.T) {
 // failing prepared callback aborts valid pushes after an upgrade.
 func TestEnsureCacheRepo_RefreshesPreGateGenerations(t *testing.T) {
 	for name, legacy := range map[string]string{
+		"v0.15-gen":          refTxHookGateV015 + `"/opt/old/openstorage" hook reference-transaction "$@" || exit 0` + "\n",
 		"committed-gen":      refTxHookGateLegacy + `"/opt/old/codestorage" hook reference-transaction "$@" || exit 0` + "\n",
 		"committed-exec-gen": refTxHookGateLegacy + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
 		"exec-gen":           refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",

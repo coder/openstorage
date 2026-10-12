@@ -56,6 +56,9 @@ func TestAuthGitEnvCredentialHelper(t *testing.T) {
 			if strings.Contains(entry, "STORAGE_ASKPASS_") && strings.HasSuffix(entry, "=inherited") {
 				t.Fatal("inherited credential alias survived")
 			}
+			if strings.HasPrefix(entry, "CODESTORAGE_ASKPASS_") {
+				t.Fatal("the credential helper reads only OPENSTORAGE_ASKPASS_*; no legacy copy may reach git")
+			}
 			if strings.HasPrefix(entry, "GIT_CONFIG_VALUE_") && tc.pass != "" && strings.Contains(entry, tc.pass) {
 				t.Fatal("credential value reached git config (argv of the helper shell)")
 			}

@@ -858,7 +858,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	}
 
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
-	cmd.Env = envconfig.Environ()
+	cmd.Env = os.Environ()
 	// No-op for upload-pack; receive-pack assigns the real hold release.
 	releasePushHold := func() {}
 	if service == "receive-pack" {

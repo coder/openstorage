@@ -529,13 +529,20 @@ const refTxHookScript = refTxHookGate + `%q hook reference-transaction "$@" || e
 // one binary exec per committed ref, the same order as their own
 // per-command update hooks, and batched gits pay one per push.
 const refTxHookGate = `#!/bin/sh
+[ -n "$OPENSTORAGE_GIT_PUSH_HOLD" ] || exit 0
+[ "$1" = committed ] || exit 0
+`
+
+// refTxHookGateV015 is the 0.15.x and 0.16.x gate, which fell back to the
+// CODESTORAGE_* name when the canonical one was unset. Recognizing it lets the
+// refresh pass replace it with the canonical-only gate above.
+const refTxHookGateV015 = `#!/bin/sh
 [ -n "${OPENSTORAGE_GIT_PUSH_HOLD-${CODESTORAGE_GIT_PUSH_HOLD}}" ] || exit 0
 [ "$1" = committed ] || exit 0
 `
 
 // Keep the exact historical CODESTORAGE gates: cache repos survive upgrades,
-// including old binary paths. The current shell gate falls back only when the
-// canonical name is UNSET, not when it is explicitly empty.
+// including old binary paths.
 const refTxHookGateLegacy = refTxHookGateV1 + `[ "$1" = committed ] || exit 0
 `
 
@@ -559,6 +566,9 @@ func isManagedRefTxHook(content []byte) bool {
 	// prepared callbacks abort valid pushes. Longest gate first: the
 	// older gate is a prefix of the newer.
 	rest, ok := strings.CutPrefix(string(content), refTxHookGate)
+	if !ok {
+		rest, ok = strings.CutPrefix(string(content), refTxHookGateV015)
+	}
 	if !ok {
 		rest, ok = strings.CutPrefix(string(content), refTxHookGateLegacy)
 	}

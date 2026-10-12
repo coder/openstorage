@@ -16,7 +16,7 @@ func TestResolvePackQuotaEnvCompatibility(t *testing.T) {
 		want              int64
 	}{
 		{name: "canonical", canonical: new("123"), want: 123},
-		{name: "legacy", legacy: new("456"), want: 456},
+		{name: "legacy ignored", legacy: new("456"), want: defaultPackQuotaBytes},
 		{name: "both", canonical: new("123"), legacy: new("456"), want: 123},
 		{name: "canonical empty", canonical: new(""), legacy: new("456"), want: defaultPackQuotaBytes},
 	} {
