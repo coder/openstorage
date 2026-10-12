@@ -93,6 +93,45 @@ license and `mise`/`ubi`-style installers still find the binary.
 the cause and run `gh workflow run release -R coder/openstorage -f tag=vX.Y.Z`. It
 rebuilds from the tag and replaces the assets (`--clobber`).
 
+## 4. Publish the container image
+
+A release does **not** publish an image. The
+[`image`](../../.github/workflows/image.yml) workflow runs only when a maintainer
+dispatches it for an existing release tag
+([#227](https://github.com/coder/openstorage/issues/227)).
+
+1. Build and check without pushing (the default, `publish=false`):
+
+   ```sh
+   gh workflow run image -R coder/openstorage --ref main -f tag=vX.Y.Z
+   ```
+
+   The `verify` jobs build the tag natively on linux/amd64 and linux/arm64 runners.
+   Each job checks the platform, the `openstorage --version` stamp, and the runtime
+   tools, then runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
+
+2. After that run is green and publication is approved, push:
+
+   ```sh
+   gh workflow run image -R coder/openstorage --ref main -f tag=vX.Y.Z -f publish=true
+   ```
+
+   The `publish` job runs only for a dispatch from `main`. It is the only job with
+   `packages: write`. It pushes one multi-platform tag, `ghcr.io/coder/openstorage:X.Y.Z`,
+   with OCI labels (source, revision, version), SBOM, and provenance. It refuses to
+   run when that tag already exists, so version tags are never replaced. The run
+   summary records the index digest. The `verify-published` jobs then pull that
+   digest on both platforms and repeat the checks and the smoke.
+
+> [!IMPORTANT]
+> GitHub creates a new package as **private**. By default it inherits this
+> repository's access: people who can read the repository can pull it after
+> `docker login ghcr.io`. Public access is a separate package-settings change by an
+> organization owner.
+
+**If a published image is bad,** do not move or reuse its tag. Fix forward with a new
+release. A package admin can delete the bad version in the package settings.
+
 ## Notes
 
 - **Runtime dependencies:** the binary does not bundle `git` (always required) or
