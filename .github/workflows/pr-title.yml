@@ -10,11 +10,9 @@
 # via its cancel-in-progress concurrency group, cancel — the full test suite
 # on every title or body edit.
 #
-# The job also checks squash bodies, which release-please parses too (#405):
-# scripts/check-squash-message.py holds the rules. pr-title is a required
-# check. release-please's own PRs get their pull_request runs held at "action
-# required" (bot author): approve the held pr-title run with the ci run
-# (docs/how-to/release.md).
+# It also checks squash bodies with scripts/check-squash-message.py (#405).
+# pr-title is required: on release-please PRs, approve its held run with the ci
+# run (docs/how-to/release.md).
 name: pr-title
 
 on:
@@ -27,15 +25,13 @@ on:
   # commits. That also catches a title edited after its pull_request run.
   merge_group:
     types: [checks_requested]
-  # Also check the squash messages that land: a merge outside the queue can
-  # edit the message, as v0.16.0's bad lines show. A finding here cannot block
-  # the merge; it tells the owner to fix the release notes before the release.
+  # Also check what lands: a merge outside the queue can edit the message (as
+  # in v0.16.0). A finding here tells the owner to fix the release notes.
   push:
     branches: [main]
 
-# Metadata check. It checks out only scripts/ for the body checker, and the
-# merge_group and push step calls the API to list the commits. Both need
-# nothing beyond contents: read.
+# Metadata check: a scripts/-only checkout plus an API call that lists the
+# queued or pushed commits. Both need nothing beyond contents: read.
 permissions: {}
 
 concurrency:

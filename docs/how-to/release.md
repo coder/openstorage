@@ -39,28 +39,20 @@ Title releasable PRs like this:
 | `docs:`, `chore:`, `ci:`, `build:`, `test:`, `refactor:` | no bump, hidden from CHANGELOG |
 | anything else (`api: ...`) | ignored entirely |
 
-The PR body becomes the squash body, and release-please parses it too. In
-v0.16.0, squash bodies that were rewrapped at merge time dropped #323 and #362 from
-the CHANGELOG and listed #270 twice
-([#405](https://github.com/coder/openstorage/issues/405)). So `pr-title` also runs
-[`scripts/check-squash-message.py`](../../scripts/check-squash-message.py) on the
-PR body, on merge-queue commits, and on each commit that lands on main. It rejects
-a line that:
+The PR body becomes the squash body, and release-please parses it too. In v0.16.0,
+squash bodies rewrapped at merge time dropped #323 and #362 and listed #270 twice
+([#405](https://github.com/coder/openstorage/issues/405)). So `pr-title` runs
+[`scripts/check-squash-message.py`](../../scripts/check-squash-message.py) on the PR
+body, on merge-queue commits, and on each commit that lands on main. The script
+names each rule. It rejects, for example, a line that starts with a word and an
+unclosed `(` (release-please drops the whole commit), a line that reads as another
+`feat` or `fix` commit, and a commit-override marker inside a line. A wrapped
+`segment: ...` line is harmless.
 
-- starts with a word and an unclosed `(`, such as `` `CreateTemp(filepath.Dir(x))` ``.
-  release-please cannot parse the message and drops the whole commit.
-- looks like another commit to release-please: a `feat`, `fix`, `perf` or
-  `revert` subject, a subject with `!`, or any commit type at the start of a
-  paragraph. This adds or duplicates an entry.
-- is a `Release-As` footer, an empty breaking-change footer, or a breaking-change
-  footer in a PR whose title has no `!`.
-
-A wrapped line such as `segment: non-zero padding bits` is harmless. To fix a
-finding, reword or rewrap the line. Merge with the PR body as the squash body. If
-you edit the squash message at merge time, check that text first with
-`python3 scripts/check-squash-message.py message.txt`.
-If the `pr-title` run on main fails after a merge, add a commit-override block to
-the merged PR's body before the next release (see Notes).
+Merge with the PR body as the squash body. If you edit the message at merge time,
+run `python3 scripts/check-squash-message.py message.txt` on it first. If `pr-title`
+fails on main after a merge, add a commit-override block to the merged PR's body
+before the next release (see Notes).
 
 ## 2. Get the release PR green
 

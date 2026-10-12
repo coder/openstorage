@@ -202,7 +202,7 @@ type(scope)?: summary
 |---|---|
 | `fix` | patch release |
 | `feat` | minor release |
-| `feat!:` / `BREAKING CHANGE:` | breaking release |
+| `feat!:` (a `BREAKING CHANGE:` footer also needs the `!`) | breaking release |
 | `perf` | patch release under "Performance Improvements"; not for refactors that leave performance unchanged |
 | `docs`, `test`, `ci`, `chore`, `build`, `refactor` | no release; hidden from the CHANGELOG |
 
@@ -213,8 +213,8 @@ A PR merges when all of these hold:
 1. **CI is green** — every job in `ci.yml`: `lint`, `terraform` (offline
    Terraform checks + docs link check), `test` (default lane), `test-local`,
    `test-s3wal` (S3-only storage lane), and `image` (Docker build +
-   runtime-dependency smoke test), plus the `pr-title` check on ordinary PRs.
-   release-please PRs are exempt from `pr-title`; see the
+   runtime-dependency smoke test), plus the `pr-title` check on the title and
+   body. On release-please PRs, approve its held run too; see the
    [release runbook](docs/how-to/release.md).
 2. **A clean automated review round** — comment `@codex review`. Fix genuine
    errors; for out-of-scope findings, say why and resolve the thread. Every
