@@ -2,10 +2,11 @@
 # docker-compose.yml `replicas` profile). The runtime stage is alpine rather
 # than distroless because the server has a hard runtime dependency on external
 # git (smart-HTTP upload/receive-pack, merges, hook re-execs).
-# Keep the Go version in sync with mise.toml.
+# Keep the Go version in sync with mise.toml. Both base images are pinned by
+# multi-platform index digest: published images must not depend on a mutable tag.
 # The build stage runs on the builder's native platform and cross-compiles
 # (pure Go, CGO off), so a multi-platform build emulates only the runtime stage.
-FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 ARG TARGETOS TARGETARCH
 # Release builds (.github/workflows/image.yml) stamp `openstorage --version`
 # like scripts/release-archives.sh does. .git is not in the build context, so
