@@ -1,11 +1,12 @@
-# Single-node development quickstart. Build locally and export the exact image ID;
-# no published registry image is assumed. See docs/how-to/quickstart-docker.md.
-x-image: &image "${OPENSTORAGE_IMAGE:?Set OPENSTORAGE_IMAGE to your locally built image ID}"
+# Single-node Docker-only quickstart. OPENSTORAGE_IMAGE has no default: set it to
+# a published ghcr.io/coder/openstorage version or to a local build. Compose pulls
+# it only when it is not already present. See docs/how-to/quickstart-docker.md.
+x-image: &image "${OPENSTORAGE_IMAGE:?Set OPENSTORAGE_IMAGE to a published image or a local build}"
 
 services:
   init:
     image: *image
-    pull_policy: never
+    pull_policy: missing
     user: root
     restart: "no"
     entrypoint: ["/bin/sh", "-ec"]
@@ -40,7 +41,7 @@ services:
 
   server:
     image: *image
-    pull_policy: never
+    pull_policy: missing
     user: openstorage
     restart: "no"
     depends_on:
@@ -67,7 +68,7 @@ services:
 
   cli:
     image: *image
-    pull_policy: never
+    pull_policy: missing
     profiles: ["tools"]
     user: root
     restart: "no"
