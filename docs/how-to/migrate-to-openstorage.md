@@ -5,8 +5,8 @@ environment, repository, and module names. Durable stores and the upstream wire-
 contract stay unchanged.
 
 - The binary and environment-prefix change shipped in v0.15.0.
-- The one-word repository and Go module path (`github.com/coder/openstorage`) is
-  unreleased.
+- The one-word repository and Go module path (`github.com/coder/openstorage`)
+  shipped in v0.16.0.
 
 ## Prerequisites
 
@@ -47,17 +47,18 @@ Downstream Go consumers: change imports and the module requirement to
 `github.com/coder/openstorage` at a revision that declares that path. Then run
 `go mod tidy` (plus `go mod vendor` if you vendor).
 
-Once a release includes the corrected path, `go install
-github.com/coder/openstorage/cmd/openstorage@latest` works. Until then, build from
-the corrected checkout. Older tags keep their original module paths and asset names.
+From v0.16.0, `go install github.com/coder/openstorage/cmd/openstorage@v0.16.0`
+works with the authenticated-Git and `GOPRIVATE` setup above. Older tags keep their
+original module paths and asset names.
 
 ## 2. Roll out the environment-prefix change
 
-The canonical prefix is `OPENSTORAGE_*`. In **0.15.x only**, a `CODESTORAGE_*`
-variable is a fallback when the matching new variable is **unset**.
+The canonical prefix is `OPENSTORAGE_*`. In 0.15.x and 0.16.x, a `CODESTORAGE_*`
+variable is a fallback when the matching new variable is **unset**. 0.17.0 removes
+the fallback.
 
 > [!WARNING]
-> Migrate all settings before upgrading to 0.16.0.
+> Migrate all settings before upgrading to 0.17.0. Do not rely on the fallback.
 
 Precedence rules:
 
@@ -71,7 +72,9 @@ Precedence rules:
 
 Rolling upgrade (pre-0.15 binaries do **not** read the new prefix):
 
-1. Keep the old variables until every replica runs v0.15.x.
+1. Keep the old variables until every replica runs v0.15.x or v0.16.x. From 0.17.0
+   only the new names work, so a fleet that still runs pre-0.15 binaries must set
+   both names, with identical values, before any replica runs 0.17.0 or later.
 2. Rename the keys to the new prefix, keeping the values, and restart each replica.
 3. If both names must coexist during the roll, keep their values identical.
 

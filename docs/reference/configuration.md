@@ -11,8 +11,8 @@ Each setting takes its value from the first source that is set:
 
 1. Explicit flag.
 2. Canonical `OPENSTORAGE_*` variable. It wins even when set to an empty value.
-3. `CODESTORAGE_*` fallback. Supported for one minor release, **0.15.x**. `serve` logs a
-   boot-time deprecation warning for each fallback it uses, without the value.
+3. `CODESTORAGE_*` fallback. 0.15.x and 0.16.x read it; **0.17.0 removes it**. `serve`
+   logs a boot-time deprecation warning for each fallback it uses, without the value.
 4. Older legacy alias (listed per variable).
 5. `--data-dir` derivation (local mode).
 6. Built-in default.
@@ -22,7 +22,7 @@ Each setting takes its value from the first source that is set:
   from `--data-dir` or fails startup; it never falls back to a legacy alias.
 - Malformed values are fail-fast startup errors naming the variable. They are never
   replaced by a value from the old prefix.
-- Migrate before upgrading to 0.16.0: see the
+- Migrate before upgrading to 0.17.0: see the
   [migration guide](../how-to/migrate-to-openstorage.md).
 
 ## Summary

@@ -107,6 +107,27 @@ license and `mise`/`ubi`-style installers still find the binary.
 the cause and run `gh workflow run release -R coder/openstorage -f tag=vX.Y.Z`. It
 rebuilds from the tag and replaces the assets (`--clobber`).
 
+## 4. Verify the container image
+
+A release does **not** build or publish an image. The
+[`image`](../../.github/workflows/image.yml) workflow runs only when a maintainer
+dispatches it for an existing release tag
+([#227](https://github.com/coder/openstorage/issues/227)). It pushes nothing and
+has no registry credentials:
+
+```sh
+gh workflow run image -R coder/openstorage --ref main -f tag=vX.Y.Z
+```
+
+The `verify` jobs build the tag's own Dockerfile natively on linux/amd64 and
+linux/arm64 runners. Each job checks the platform, the `openstorage --version`
+stamp, and the runtime tools, then runs the
+[Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh). The workflow
+refuses tags cut before the Dockerfile stamped the version (v0.16.0 and earlier).
+
+No image is published to a registry yet. Publication is a later, separately
+approved change.
+
 ## Notes
 
 - **Runtime dependencies:** the binary does not bundle `git` (always required) or

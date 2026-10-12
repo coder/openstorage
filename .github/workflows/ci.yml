@@ -84,22 +84,44 @@ jobs:
       - run: go test ./... -count=1 -race -timeout=30m
 
   # Build locally, never push. Check runtime tools and exercise the unchanged
-  # single-node Compose reference with this exact candidate image ID.
+  # single-node Compose reference with this exact candidate image ID, natively
+  # on both platforms that .github/workflows/image.yml checks for release tags.
   image:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    name: image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build candidate image without publication
         run: |
-          docker build --iidfile "$RUNNER_TEMP/openstorage-image.id" .
+          docker build --iidfile "$RUNNER_TEMP/openstorage-image.id" \
+            --build-arg VERSION=v0.0.0-ci --build-arg COMMIT="$GITHUB_SHA" .
           echo "OPENSTORAGE_IMAGE=$(cat "$RUNNER_TEMP/openstorage-image.id")" >> "$GITHUB_ENV"
+      - name: Check platform and version stamp
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$OPENSTORAGE_IMAGE")" = "linux/$ARCH" ]
+          out=$(docker run --rm "$OPENSTORAGE_IMAGE" --version)
+          echo "$out"
+          grep -F "openstorage v0.0.0-ci (commit $GITHUB_SHA," <<<"$out"
       - name: Check runtime Git and signature tools
         run: docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      # Use the published-image reference form. The tag exists only in this
+      # runner's daemon, and the smoke refuses to start unless the image is local.
       - name: Smoke the exact Compose quickstart
         run: |
           bash -n scripts/smoke-compose-quickstart.sh
-          bash scripts/smoke-compose-quickstart.sh
+          docker tag "$OPENSTORAGE_IMAGE" ghcr.io/coder/openstorage:0.0.0-ci
+          OPENSTORAGE_IMAGE=ghcr.io/coder/openstorage:0.0.0-ci bash scripts/smoke-compose-quickstart.sh
 
   test-local:
     runs-on: ubuntu-latest
