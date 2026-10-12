@@ -10,12 +10,11 @@
 # via its cancel-in-progress concurrency group, cancel — the full test suite
 # on every title or body edit.
 #
-# Deliberately NOT in branch protection's required checks yet: release-please's
-# own PRs get their pull_request runs held at "action required" (bot author —
-# docs/how-to/release.md), and the documented approval ritual targets the
-# single held ci run. A required-but-never-approved pr-title run would wedge
-# release PRs. Revisit once the next release PR demonstrates the held-run
-# behavior for this workflow.
+# The job also checks squash bodies, which release-please parses too (#405):
+# scripts/check-squash-message.py holds the rules. pr-title is a required
+# check. release-please's own PRs get their pull_request runs held at "action
+# required" (bot author): approve the held pr-title run with the ci run
+# (docs/how-to/release.md).
 name: pr-title
 
 on:
@@ -28,16 +27,22 @@ on:
   # commits. That also catches a title edited after its pull_request run.
   merge_group:
     types: [checks_requested]
+  # Also check the squash messages that land: a merge outside the queue can
+  # edit the message, as v0.16.0's bad lines show. A finding here cannot block
+  # the merge; it tells the owner to fix the release notes before the release.
+  push:
+    branches: [main]
 
-# Metadata check: no checkout. Only the merge_group step calls the API, to
-# list the queued commits, and needs nothing beyond contents: read.
+# Metadata check. It checks out only scripts/ for the body checker, and the
+# merge_group and push step calls the API to list the commits. Both need
+# nothing beyond contents: read.
 permissions: {}
 
 concurrency:
   # merge_group has no pull request number. Its ref
   # (gh-readonly-queue/main/...) is unique per queue entry, so entries never
-  # cancel each other.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # cancel each other. Each push to main is keyed by its own head commit.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.after || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -49,6 +54,11 @@ jobs:
     env:
       TYPES: feat|fix|docs|ci|chore|build|refactor|test|perf
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
       # The title is untrusted input: pass it via env, never interpolate it
       # into the script body.
       - name: Require a conventional-commit PR title
@@ -79,15 +89,24 @@ jobs:
           EOF
           exit 1
 
+      # The body is untrusted too: env only, and the checker never echoes it.
+      - name: Reject PR bodies that release-please misreads
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n\n%s\n' "$TITLE" "$BODY" | python3 scripts/check-squash-message.py
+
       # Same rule on every squash subject the queue is about to land: the
       # commits between the group's base (current main) and its head. Commit
       # subjects are untrusted too: they only reach the script via files.
-      - name: Require conventional-commit subjects on the queued commits
-        if: github.event_name == 'merge_group'
+      # The push run checks the commits a merge just added to main.
+      - name: Require conventional-commit subjects and bodies on the queued or landed commits
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha || github.event.after }}
         run: |
           set -euo pipefail
           resp="$RUNNER_TEMP/merge-group-compare.json"
@@ -111,4 +130,12 @@ jobs:
               bad=1
             fi
           done < "$RUNNER_TEMP/subjects.txt"
+          # And the body check on each whole squash message.
+          for i in $(seq 0 $((listed - 1))); do
+            jq -r ".commits[$i].commit.message" "$resp" > "$RUNNER_TEMP/message-$i.txt"
+          done
+          python3 scripts/check-squash-message.py "$RUNNER_TEMP"/message-*.txt || bad=1
+          if [ "$bad" = 1 ] && [ "$GITHUB_EVENT_NAME" = push ]; then
+            echo "::error title=Fix the release notes::Add a BEGIN_COMMIT_OVERRIDE block to the merged PR's body before the next release. See docs/how-to/release.md."
+          fi
           exit "$bad"

@@ -34,10 +34,33 @@ Title releasable PRs like this:
 |---|---|
 | `fix: ...`, `fix(scope): ...` | patch bump, CHANGELOG "Bug Fixes" |
 | `feat: ...`, `feat(scope): ...` | minor bump, CHANGELOG "Features" |
-| `feat!: ...` / `BREAKING CHANGE:` footer | minor bump (major once we pass 1.0.0) |
+| `feat!: ...` (a `BREAKING CHANGE:` footer also needs the `!`) | minor bump (major once we pass 1.0.0) |
 | `perf: ...` | patch bump, CHANGELOG "Performance Improvements" |
 | `docs:`, `chore:`, `ci:`, `build:`, `test:`, `refactor:` | no bump, hidden from CHANGELOG |
 | anything else (`api: ...`) | ignored entirely |
+
+The PR body becomes the squash body, and release-please parses it too. In
+v0.16.0, squash bodies that were rewrapped at merge time dropped #323 and #362 from
+the CHANGELOG and listed #270 twice
+([#405](https://github.com/coder/openstorage/issues/405)). So `pr-title` also runs
+[`scripts/check-squash-message.py`](../../scripts/check-squash-message.py) on the
+PR body, on merge-queue commits, and on each commit that lands on main. It rejects
+a line that:
+
+- starts with a word and an unclosed `(`, such as `` `CreateTemp(filepath.Dir(x))` ``.
+  release-please cannot parse the message and drops the whole commit.
+- looks like another commit to release-please: a `feat`, `fix`, `perf` or
+  `revert` subject, a subject with `!`, or any commit type at the start of a
+  paragraph. This adds or duplicates an entry.
+- is a `Release-As` footer, an empty breaking-change footer, or a breaking-change
+  footer in a PR whose title has no `!`.
+
+A wrapped line such as `segment: non-zero padding bits` is harmless. To fix a
+finding, reword or rewrap the line. Merge with the PR body as the squash body. If
+you edit the squash message at merge time, check that text first with
+`python3 scripts/check-squash-message.py message.txt`.
+If the `pr-title` run on main fails after a merge, add a commit-override block to
+the merged PR's body before the next release (see Notes).
 
 ## 2. Get the release PR green
 
@@ -45,7 +68,7 @@ After the next push to main, release-please opens or updates the rolling release
 
 `github-actions[bot]` creates that PR, so GitHub holds its `pull_request` CI run at
 **"action required"**. Nothing runs until a maintainer approves it, and branch
-protection requires `lint` / `test` / `test-local` / `test-s3wal`.
+protection requires `lint` / `test` / `test-local` / `test-s3wal` / `pr-title`.
 
 Approve with the **Approve and run** button on the PR's Actions run, or:
 
@@ -55,15 +78,14 @@ gh run list -R coder/openstorage --branch release-please--branches--main \
 gh api --method POST repos/coder/openstorage/actions/runs/<run-id>/approve
 ```
 
+Then repeat both commands with `--workflow pr-title`.
+
 > [!IMPORTANT]
-> Keep `--workflow ci`. The branch also gets a held run from the optional `pr-title`
-> workflow. Without the filter, `--limit 1` may return that run, and approving it
-> leaves the required checks blocked.
+> Approve one held run per workflow. Without `--workflow`, `--limit 1` returns only
+> one of them, and the other required checks stay blocked.
 
 - Every push to main while the release PR is open refreshes the branch and creates
-  a new held run. Approve each one.
-- Approving the `pr-title` run is optional. It is deliberately **not** a required
-  check, so an unapproved run cannot wedge the release PR.
+  new held runs. Approve each one.
 - A fine-grained PAT or GitHub App token in the action's `token` input would remove
   this step. Until one exists, approve-and-run is the documented path. Do **not**
   loosen branch protection instead.
@@ -104,7 +126,7 @@ rebuilds from the tag and replaces the assets (`--clobber`).
   proposes `1.0.0` and ignores the manifest's `0.0.0`. `bootstrap-sha` pins where
   changelog collection starts. Both affect only the first release; the manifest
   maintains itself afterwards.
-- **Fixing a bad squash title after merge:** edit the *merged PR's body* and add
+- **Fixing a bad squash title or body after merge:** edit the *merged PR's body* and add
   release-please's commit-override block. Because we squash-merge, the next run
   parses it instead of the commit message:
 
