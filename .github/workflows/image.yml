@@ -66,6 +66,10 @@ jobs:
           [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag must look like v1.2.3, got: $TAG"; exit 1; }
           commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
           git merge-base --is-ancestor "$commit" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
+          # Every job builds the tag's own Dockerfile. Tags cut before it took the
+          # stamp build args (v0.16.0 and earlier) cannot pass the version check.
+          git show "$commit:Dockerfile" | grep -qE '^ARG VERSION([= ]|$)' ||
+            { echo "::error::$TAG predates version-stamped images; publish a release cut after the image workflow landed"; exit 1; }
           [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = false ] || { echo "::error::$TAG has no published release"; exit 1; }
           # The commit time, not the build time, so every job stamps the same value.
           date=$(TZ=UTC0 git show -s --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "$commit")

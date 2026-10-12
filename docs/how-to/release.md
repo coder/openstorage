@@ -98,7 +98,9 @@ rebuilds from the tag and replaces the assets (`--clobber`).
 A release does **not** publish an image. The
 [`image`](../../.github/workflows/image.yml) workflow runs only when a maintainer
 dispatches it for an existing release tag
-([#227](https://github.com/coder/openstorage/issues/227)).
+([#227](https://github.com/coder/openstorage/issues/227)). The workflow builds the
+tag's own Dockerfile, so it refuses tags cut before that Dockerfile stamped the
+version (v0.16.0 and earlier).
 
 1. Build and check without pushing (the default, `publish=false`):
 
