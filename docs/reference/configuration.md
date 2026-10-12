@@ -11,12 +11,15 @@ Each setting takes its value from the first source that is set:
 
 1. Explicit flag.
 2. Canonical `OPENSTORAGE_*` variable. It wins even when set to an empty value.
-3. `CODESTORAGE_*` fallback. 0.15.x and 0.16.x read it; **0.17.0 removes it**. `serve`
-   logs a boot-time deprecation warning for each fallback it uses, without the value.
-4. Older legacy alias (listed per variable).
-5. `--data-dir` derivation (local mode).
-6. Built-in default.
+3. Older legacy alias (listed per variable).
+4. `--data-dir` derivation (local mode).
+5. Built-in default.
 
+- `CODESTORAGE_*` names are not read. 0.15.x and 0.16.x read them as a fallback;
+  **0.17.0 removes it**. Every subcommand except `version` and the internal `hook`
+  refuses to start while a `CODESTORAGE_*` variable is set and its `OPENSTORAGE_*`
+  replacement is unset. The error names each pair, without values. A `CODESTORAGE_*`
+  variable whose replacement is set is ignored.
 - An empty canonical value is never refilled from the old prefix or an older alias. It
   follows the setting's normal validation and default rules: an empty storage URL derives
   from `--data-dir` or fails startup; it never falls back to a legacy alias.

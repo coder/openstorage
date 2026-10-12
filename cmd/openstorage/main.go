@@ -43,6 +43,13 @@ func main() {
 	if len(os.Args) < 2 {
 		fatalf("usage: openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> ...")
 	}
+	// Refuse old-only CODESTORAGE_* settings before any command reads config.
+	// Hooks inherit the serve environment, which already passed this check.
+	if cmd := os.Args[1]; cmd != "hook" && cmd != "version" && cmd != "--version" {
+		if err := envconfig.CheckLegacy(); err != nil {
+			fatalf("openstorage %s: %v", cmd, err)
+		}
+	}
 	ctx := context.Background()
 	var err error
 	switch os.Args[1] {
@@ -124,9 +131,6 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	envconfig.WarnDeprecated(func(format string, args ...any) {
-		fmt.Fprintf(os.Stderr, format+"\n", args...)
-	})
 	cfg, err := resolveServeConfig(envconfig.LookupEnv, *listen, *addr, *cacheDir, *dataDir)
 	if err != nil {
 		return err

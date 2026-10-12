@@ -1,12 +1,13 @@
-// Package envconfig resolves OPENSTORAGE_* settings with one minor release of
-// CODESTORAGE_* compatibility. Presence, not a nonempty value, selects the new name.
+// Package envconfig resolves OPENSTORAGE_* settings. Presence, not a nonempty
+// value, selects a name. The old CODESTORAGE_* names are not read: CheckLegacy
+// refuses a process that still sets one without its replacement.
 package envconfig
 
 import (
+	"fmt"
 	"os"
 	"slices"
 	"strings"
-	"sync"
 )
 
 const (
@@ -14,17 +15,10 @@ const (
 	legacyPrefix = "CODESTORAGE_"
 )
 
-// LookupEnv is os.LookupEnv with a legacy fallback for OPENSTORAGE_* names.
-// Other names pass through unchanged. Lookups never log: hooks and lazy runtime
-// settings must not emit a warning on every read.
+// LookupEnv is os.LookupEnv, kept as the injectable reader for settings.
+// Lookups never log: hooks and lazy runtime settings read it on every call.
 func LookupEnv(name string) (string, bool) {
-	if value, ok := os.LookupEnv(name); ok {
-		return value, true
-	}
-	if strings.HasPrefix(name, prefix) {
-		return os.LookupEnv(legacyName(name))
-	}
-	return "", false
+	return os.LookupEnv(name)
 }
 
 // Getenv is the value-only form of LookupEnv, suitable for injected config readers.
@@ -52,43 +46,34 @@ func legacyName(name string) string {
 	return legacyPrefix + suffix
 }
 
-var warnOnce sync.Once
-
-// WarnDeprecated reports legacy settings once at server startup, including knobs
-// first read lazily after startup. Only names are logged, never environment values.
-// Do not call this in hook subprocesses.
-func WarnDeprecated(warn func(string, ...any)) {
-	warnOnce.Do(func() {
-		seen := make(map[string]bool)
-		for _, entry := range os.Environ() {
-			name, _, _ := strings.Cut(entry, "=")
-			suffix, legacy := strings.CutPrefix(name, legacyPrefix)
-			if !legacy || seen[name] {
-				continue
-			}
-			seen[name] = true
-			if _, set := os.LookupEnv(prefix + suffix); !set {
-				warn("warning: %s is deprecated; use %s instead (legacy support lasts one minor release)", name, prefix+suffix)
-			}
+// CheckLegacy fails when a CODESTORAGE_* variable is set and its OPENSTORAGE_*
+// replacement is unset. The error names every such pair, sorted, and never
+// includes a value. A legacy name next to its set replacement is ignored, so a
+// fleet that still runs pre-0.15 binaries can keep both names. Do not call this
+// in hook subprocesses: git relays hook stderr to the pushing client.
+func CheckLegacy() error {
+	var pairs []string
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		suffix, legacy := strings.CutPrefix(name, legacyPrefix)
+		if !legacy {
+			continue
 		}
-	})
-}
-
-// Environ returns a child environment with canonical settings also exported
-// under their legacy names. This keeps old hook binaries in shared caches working;
-// an explicitly empty canonical setting must also clear any inherited old value.
-func Environ() []string {
-	env := os.Environ()
-	for _, entry := range slices.Clone(env) {
-		name, value, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(name, prefix) {
-			env = Set(env, name, value)
+		if _, set := os.LookupEnv(prefix + suffix); !set {
+			pairs = append(pairs, name+" -> "+prefix+suffix)
 		}
 	}
-	return env
+	if len(pairs) == 0 {
+		return nil
+	}
+	slices.Sort(pairs)
+	pairs = slices.Compact(pairs)
+	return fmt.Errorf("CODESTORAGE_* variables are no longer read; rename them (see docs/how-to/migrate-to-openstorage.md): %s",
+		strings.Join(pairs, ", "))
 }
 
-// Strip removes both spellings of each canonical name from a child environment.
+// Strip removes both spellings of each canonical name from a child environment,
+// so no inherited value under either prefix reaches the child.
 // It reuses env's backing array; callers must own that slice.
 func Strip(env []string, names ...string) []string {
 	return slices.DeleteFunc(env, func(entry string) bool {
@@ -102,8 +87,10 @@ func Strip(env []string, names ...string) []string {
 	})
 }
 
-// Set replaces both spellings with a trusted value. Exporting both lets older
-// hook binaries use a new server's request context during rolling upgrades.
+// Set replaces both spellings with one trusted canonical value. Children read
+// only OPENSTORAGE_* names: every hook script runs this binary (EnsureCacheRepo
+// rewrites managed hooks before each request), and 0.15.x and 0.16.x hook
+// binaries also read the canonical name first.
 func Set(env []string, name, value string) []string {
-	return append(Strip(env, name), name+"="+value, legacyName(name)+"="+value)
+	return append(Strip(env, name), name+"="+value)
 }
