@@ -7,8 +7,8 @@ The Compose file runs the image you choose: a published
 `ghcr.io/coder/openstorage` version or a local build.
 
 > [!IMPORTANT]
-> **No image is published yet.** The publication workflow exists, but no version
-> has been pushed ([issue #227](https://github.com/coder/openstorage/issues/227)).
+> **No image is published yet.** No version has been pushed to a registry
+> ([issue #227](https://github.com/coder/openstorage/issues/227)).
 > Until this page lists a published version, use [a local build](#option-b-build-locally).
 
 ## Prerequisites
