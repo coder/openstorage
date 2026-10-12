@@ -1,43 +1,25 @@
-# Container image publication (issue #227): builds ghcr.io/coder/openstorage
-# for linux/amd64 and linux/arm64 from an existing release tag.
+# Container image verification (issue #227): builds an existing release tag's
+# image natively on linux/amd64 and linux/arm64 and runs the Compose quickstart
+# smoke on each. It pushes nothing and has no registry credentials.
 #
-# Manual only, on purpose. There is no push, tag, release, or workflow_call
-# trigger, so neither a merge nor a release ever publishes an image. A dispatch
-# with the default publish=false builds and checks both platforms natively and
-# pushes nothing. publish=true (dispatched from main) also pushes exactly one
-# immutable version tag (vX.Y.Z -> :X.Y.Z), refuses a tag that already exists,
-# records the index digest, and re-runs the checks on the pulled digest.
-# Only the publish job can write packages. Runbook:
-# docs/how-to/release.md#4-publish-the-container-image.
+# Manual only, on purpose: there is no push, tag, release, or workflow_call
+# trigger. Publishing to a registry is a later, separately approved change.
+# Runbook: docs/how-to/release.md#4-verify-the-container-image.
 name: image
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to build (e.g. v0.16.0)"
+        description: "Existing release tag to build and check (e.g. v0.17.0)"
         required: true
         type: string
-      publish:
-        description: "Push to ghcr.io/coder/openstorage (false: build and check only)"
-        required: true
-        type: boolean
-        default: false
 
 permissions: {}
 
-# One image run at a time, never cancelled midway: the existence check and the
-# push in the publish job must not race another run for the same tag.
-concurrency:
-  group: image
-  cancel-in-progress: false
-
-env:
-  IMAGE: ghcr.io/coder/openstorage
-
 jobs:
   # Resolve the tag to a commit once. Every later job builds that commit, so a
-  # tag moved during the run cannot change what gets checked or published.
+  # tag moved during the run cannot change what gets checked.
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -46,7 +28,6 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       commit: ${{ steps.resolve.outputs.commit }}
-      version: ${{ steps.resolve.outputs.version }}
       date: ${{ steps.resolve.outputs.date }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,26 +38,22 @@ jobs:
         id: resolve
         env:
           TAG: ${{ inputs.tag }}
-          PUBLISH: ${{ inputs.publish }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          # Fail loudly instead of letting the publish job skip silently.
-          [ "$PUBLISH" != true ] || [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::publish=true requires a dispatch from main"; exit 1; }
           [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag must look like v1.2.3, got: $TAG"; exit 1; }
           commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
           git merge-base --is-ancestor "$commit" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
           # Every job builds the tag's own Dockerfile. Tags cut before it took the
           # stamp build args (v0.16.0 and earlier) cannot pass the version check.
           git show "$commit:Dockerfile" | grep -qE '^ARG VERSION([= ]|$)' ||
-            { echo "::error::$TAG predates version-stamped images; publish a release cut after the image workflow landed"; exit 1; }
+            { echo "::error::$TAG predates version-stamped images; use a release cut after the image workflow landed"; exit 1; }
           [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = false ] || { echo "::error::$TAG has no published release"; exit 1; }
           # The commit time, not the build time, so every job stamps the same value.
           date=$(TZ=UTC0 git show -s --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "$commit")
           {
             echo "tag=$TAG"
             echo "commit=$commit"
-            echo "version=${TAG#v}"
             echo "date=$date"
           } >> "$GITHUB_OUTPUT"
           echo "$TAG -> $commit ($date)"
@@ -112,150 +89,6 @@ jobs:
           docker build --iidfile "$RUNNER_TEMP/openstorage-image.id" --build-arg VERSION="$TAG" \
             --build-arg COMMIT="$COMMIT" --build-arg BUILD_DATE="$BUILD_DATE" .
           echo "OPENSTORAGE_IMAGE=$(cat "$RUNNER_TEMP/openstorage-image.id")" >> "$GITHUB_ENV"
-      - name: Check platform, version stamp, and runtime tools
-        run: |
-          [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$OPENSTORAGE_IMAGE")" = "linux/$ARCH" ]
-          out=$(docker run --rm "$OPENSTORAGE_IMAGE" --version)
-          echo "$out"
-          grep -F "openstorage $TAG (commit $COMMIT, built $BUILD_DATE," <<<"$out"
-          docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
-      - name: Smoke the Compose quickstart
-        run: bash scripts/smoke-compose-quickstart.sh
-
-  publish:
-    needs: [resolve, verify]
-    # Dispatch input `publish` defaults to false. Requiring main stops a branch
-    # copy of this file from publishing.
-    if: inputs.publish && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-    env:
-      TAG: ${{ needs.resolve.outputs.tag }}
-      VERSION: ${{ needs.resolve.outputs.version }}
-      COMMIT: ${{ needs.resolve.outputs.commit }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.resolve.outputs.commit }}
-          persist-credentials: false
-      # The build stage cross-compiles natively. QEMU runs only the arm64
-      # runtime stage (apk add); verify-published runs that result natively.
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          platforms: arm64
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Refuse to replace an existing version tag
-        env:
-          ACTOR: ${{ github.actor }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Credentials go through stdin, never argv.
-          token=$(printf 'user = "%s:%s"\n' "$ACTOR" "$GH_TOKEN" | curl -fsS -K - \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE#ghcr.io/}:pull" | jq -r .token)
-          echo "::add-mask::$token"
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -I -H "Authorization: Bearer $token" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
-            "https://${IMAGE%%/*}/v2/${IMAGE#ghcr.io/}/manifests/$VERSION")
-          # 404 is the only proof of absence. 200 means published already; any
-          # other status is unknown, so stop rather than risk an overwrite.
-          [ "$code" = 404 ] || { echo "::error::$IMAGE:$VERSION exists or cannot be checked (HTTP $code). Version tags are immutable."; exit 1; }
-      - name: Build and push both platforms
-        id: push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          # The checked-out tree, not the action's default Git context of the
-          # dispatching ref (main).
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
-          build-args: |
-            VERSION=${{ needs.resolve.outputs.tag }}
-            COMMIT=${{ needs.resolve.outputs.commit }}
-            BUILD_DATE=${{ needs.resolve.outputs.date }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
-            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
-            org.opencontainers.image.created=${{ needs.resolve.outputs.date }}
-            org.opencontainers.image.title=openstorage
-            org.opencontainers.image.description=Self-hosted, API-first Git storage
-            org.opencontainers.image.licenses=Apache-2.0
-          annotations: |
-            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            index:org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
-            index:org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
-            index:org.opencontainers.image.description=Self-hosted, API-first Git storage
-          provenance: mode=max
-          sbom: true
-      - name: Check the pushed index and record its digest
-        env:
-          DIGEST: ${{ steps.push.outputs.digest }}
-        run: |
-          [[ $DIGEST =~ ^sha256:[a-f0-9]{64}$ ]]
-          # Parse JSON: some Buildx releases ignore a field template like
-          # {{.Manifest.Digest}} and print the default table (docker/buildx#4006).
-          [ "$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)" = "$DIGEST" ]
-          platforms=$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .Manifest}}' |
-            jq -r '[.manifests[].platform | select(.os != "unknown") | .os + "/" + .architecture] | sort | join(",")')
-          [ "$platforms" = linux/amd64,linux/arm64 ]
-          {
-            echo "### Published $IMAGE:$VERSION"
-            echo
-            echo "- Index digest: \`$DIGEST\`"
-            echo "- Platforms: $platforms"
-            echo "- Source: $TAG ($COMMIT)"
-            echo "- Pin: \`$IMAGE:$VERSION@$DIGEST\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # The same checks again, natively, on the bytes now in the registry.
-  verify-published:
-    needs: [resolve, publish]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    name: verify-published (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      packages: read
-    env:
-      ARCH: ${{ matrix.arch }}
-      TAG: ${{ needs.resolve.outputs.tag }}
-      COMMIT: ${{ needs.resolve.outputs.commit }}
-      BUILD_DATE: ${{ needs.resolve.outputs.date }}
-      DIGEST: ${{ needs.publish.outputs.digest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.resolve.outputs.commit }}
-          persist-credentials: false
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Pull the published digest
-        run: |
-          docker pull --platform "linux/$ARCH" "$IMAGE@$DIGEST"
-          [ "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE@$DIGEST")" = "$COMMIT" ]
-          echo "OPENSTORAGE_IMAGE=$(docker image inspect --format '{{.Id}}' "$IMAGE@$DIGEST")" >> "$GITHUB_ENV"
       - name: Check platform, version stamp, and runtime tools
         run: |
           [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$OPENSTORAGE_IMAGE")" = "linux/$ARCH" ]
