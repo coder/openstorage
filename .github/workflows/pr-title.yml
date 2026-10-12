@@ -10,12 +10,9 @@
 # via its cancel-in-progress concurrency group, cancel — the full test suite
 # on every title or body edit.
 #
-# Deliberately NOT in branch protection's required checks yet: release-please's
-# own PRs get their pull_request runs held at "action required" (bot author —
-# docs/how-to/release.md), and the documented approval ritual targets the
-# single held ci run. A required-but-never-approved pr-title run would wedge
-# release PRs. Revisit once the next release PR demonstrates the held-run
-# behavior for this workflow.
+# A required check. release-please's own PRs get their pull_request runs held
+# at "action required" (bot author), so the release runbook has maintainers
+# approve both the ci and the pr-title run (docs/how-to/release.md).
 name: pr-title
 
 on:

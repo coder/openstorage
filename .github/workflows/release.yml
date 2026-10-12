@@ -42,25 +42,42 @@ jobs:
       - name: Build archives + checksums (CGO off)
         env:
           TAG: ${{ inputs.tag }}
-        run: ./scripts/release-archives.sh "$TAG" dist
+        # Write outside the checkout: Go stamps vcs.modified=true on every
+        # build that sees untracked files, and older tags do not gitignore
+        # dist/ (#414).
+        run: ./scripts/release-archives.sh "$TAG" "$RUNNER_TEMP/dist"
+      - name: Require a clean VCS stamp on every binary
+        run: |
+          cd "$RUNNER_TEMP/dist"
+          bad=0
+          for archive in openstorage_*.tar.gz; do
+            tar -xOzf "$archive" openstorage >"$RUNNER_TEMP/vcs-check"
+            if go version -m "$RUNNER_TEMP/vcs-check" | grep -qxF $'\tbuild\tvcs.modified=false'; then
+              echo "clean VCS stamp: $archive"
+            else
+              echo "::error title=Dirty VCS stamp::$archive does not report vcs.modified=false"
+              bad=1
+            fi
+          done
+          exit "$bad"
       - name: Verify native archive (linux/amd64), bundled license, and all checksums
         env:
           TAG: ${{ inputs.tag }}
         run: |
-          cd dist
+          cd "$RUNNER_TEMP/dist"
           sha256sum -c checksums.txt
           tar -xzf "openstorage_${TAG#v}_linux_amd64.tar.gz"
-          cmp LICENSE ../LICENSE
+          cmp LICENSE "$GITHUB_WORKSPACE/LICENSE"
           out="$(./openstorage --version)"
           echo "$out"
           grep -F "$TAG" <<<"$out"
-          grep -F "$(git -C .. rev-parse HEAD)" <<<"$out"
+          grep -F "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" <<<"$out"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-archives
           path: |
-            dist/openstorage_*.tar.gz
-            dist/checksums.txt
+            ${{ runner.temp }}/dist/openstorage_*.tar.gz
+            ${{ runner.temp }}/dist/checksums.txt
           if-no-files-found: error
 
   # The darwin binaries come from a linux cross-compile; prove the one

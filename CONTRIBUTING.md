@@ -213,8 +213,8 @@ A PR merges when all of these hold:
 1. **CI is green** — every job in `ci.yml`: `lint`, `terraform` (offline
    Terraform checks + docs link check), `test` (default lane), `test-local`,
    `test-s3wal` (S3-only storage lane), and `image` (Docker build +
-   runtime-dependency smoke test), plus the `pr-title` check on ordinary PRs.
-   release-please PRs are exempt from `pr-title`; see the
+   runtime-dependency smoke test), plus the `pr-title` check. Release PRs need
+   their held `ci` and `pr-title` runs approved; see the
    [release runbook](docs/how-to/release.md).
 2. **A clean automated review round** — comment `@codex review`. Fix genuine
    errors; for out-of-scope findings, say why and resolve the thread. Every
