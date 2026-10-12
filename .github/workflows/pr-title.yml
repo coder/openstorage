@@ -21,27 +21,42 @@ name: pr-title
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
+  # A merge queue on main waits for pr-title (a required check) on the queue's
+  # combined commit. There is no pull request in that context, so the job
+  # re-checks what actually lands instead: each queued PR becomes one squash
+  # commit whose subject is its title, and main fast-forwards to exactly those
+  # commits. That also catches a title edited after its pull_request run.
+  merge_group:
+    types: [checks_requested]
 
-# Pure metadata check: no checkout, no API calls, no token scopes needed.
+# Metadata check: no checkout. Only the merge_group step calls the API, to
+# list the queued commits, and needs nothing beyond contents: read.
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  # merge_group has no pull request number. Its ref
+  # (gh-readonly-queue/main/...) is unique per queue entry, so entries never
+  # cancel each other.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   pr-title:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      TYPES: feat|fix|docs|ci|chore|build|refactor|test|perf
     steps:
       # The title is untrusted input: pass it via env, never interpolate it
       # into the script body.
       - name: Require a conventional-commit PR title
+        if: github.event_name == 'pull_request'
         env:
           TITLE: ${{ github.event.pull_request.title }}
         run: |
-          types='feat|fix|docs|ci|chore|build|refactor|test|perf'
-          if printf '%s' "$TITLE" | grep -qE "^($types)(\([a-z0-9][a-z0-9._/+-]*\))?!?: [^ ]"; then
+          if printf '%s' "$TITLE" | grep -qE "^($TYPES)(\([a-z0-9][a-z0-9._/+-]*\))?!?: [^ ]"; then
             echo "PR title is a conventional-commit subject: $TITLE"
             exit 0
           fi
@@ -63,3 +78,37 @@ jobs:
           by release-please.
           EOF
           exit 1
+
+      # Same rule on every squash subject the queue is about to land: the
+      # commits between the group's base (current main) and its head. Commit
+      # subjects are untrusted too: they only reach the script via files.
+      - name: Require conventional-commit subjects on the queued commits
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          resp="$RUNNER_TEMP/merge-group-compare.json"
+          gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" > "$resp"
+          total=$(jq '.total_commits' "$resp")
+          listed=$(jq '.commits | length' "$resp")
+          # A group always adds at least one commit, and compare lists up to
+          # 250 (a group holds at most 100 PRs). Anything else means we would
+          # check the wrong set: fail rather than pass unchecked commits.
+          if [ "$total" -lt 1 ] || [ "$total" -ne "$listed" ]; then
+            echo "::error title=Unexpected merge group::compare $BASE_SHA...$HEAD_SHA listed $listed of $total commits"
+            exit 1
+          fi
+          jq -r '.commits[].commit.message | split("\n")[0]' "$resp" > "$RUNNER_TEMP/subjects.txt"
+          bad=0
+          while IFS= read -r subject; do
+            if printf '%s' "$subject" | grep -qE "^($TYPES)(\([a-z0-9][a-z0-9._/+-]*\))?!?: [^ ]"; then
+              echo "Queued squash subject is a conventional-commit subject: $subject"
+            else
+              echo "::error title=Non-conventional squash subject::Expected 'type(scope): summary'; got '$subject'. Fix the PR title and re-queue. See CONTRIBUTING.md (Commit and PR conventions)."
+              bad=1
+            fi
+          done < "$RUNNER_TEMP/subjects.txt"
+          exit "$bad"

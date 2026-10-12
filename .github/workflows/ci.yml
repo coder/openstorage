@@ -6,10 +6,19 @@
 # tests that are skipped in the default pg lane; the s3wal lane covers the
 # zero-infra serve path (bucket-only authority) that was nightly-only before
 # issue #193.
+#
+# merge_group: a merge queue on main waits for every required check (lint,
+# test, test-local, test-s3wal, plus pr-title from pr-title.yml) to report
+# on the queue's combined commit, and a check that never reports leaves the
+# queue entry pending until it times out. So every job runs, unconditionally,
+# on merge_group as well. Each queue entry gets its own temporary
+# gh-readonly-queue/main/... ref, so the concurrency group below never
+# cancels one entry's run for another's.
 name: ci
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
