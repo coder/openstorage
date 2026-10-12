@@ -85,7 +85,7 @@ jobs:
 
   # Build locally, never push. Check runtime tools and exercise the unchanged
   # single-node Compose reference with this exact candidate image ID, natively
-  # on both platforms that .github/workflows/image.yml checks for release tags.
+  # on both platforms that .github/workflows/image.yml builds and publishes.
   image:
     strategy:
       fail-fast: false
