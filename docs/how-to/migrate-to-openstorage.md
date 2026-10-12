@@ -72,7 +72,9 @@ Precedence rules:
 
 Rolling upgrade (pre-0.15 binaries do **not** read the new prefix):
 
-1. Keep the old variables until every replica runs v0.15.0 or later.
+1. Keep the old variables until every replica runs v0.15.x or v0.16.x. From 0.17.0
+   only the new names work, so a fleet that still runs pre-0.15 binaries must set
+   both names, with identical values, before any replica runs 0.17.0 or later.
 2. Rename the keys to the new prefix, keeping the values, and restart each replica.
 3. If both names must coexist during the roll, keep their values identical.
 
