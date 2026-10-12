@@ -7,7 +7,9 @@
 
 * **api:** Commit.date now means the author date. Read the new committer_date field for the committer date.
 * **api:** POST /api/v1/repos returns 201 instead of 200 for a new repository, the success message text changes, and a create of a deleted repo's name returns 404 instead of 409. The Go and TypeScript SDKs accept any 2xx.
+* **auth:** RSA organization public keys must be at least 2048 bits. The server checks this at key ingestion and on every request, including keys already stored, so rotate weaker keys before you upgrade. ([#253](https://github.com/coder/openstorage/issues/253))
 * **webhooks:** send outbound push-upstream runs as repo.push_upstream.* events ([#358](https://github.com/coder/openstorage/issues/358))
+* The Go module path is now github.com/coder/openstorage (was github.com/coder/open-storage). Update go install commands, go.mod requirements and imports. ([#225](https://github.com/coder/openstorage/issues/225))
 
 ### Features
 
@@ -46,6 +48,8 @@
 * **api:** omit exhausted pagination cursors and refresh upstream spec ([#377](https://github.com/coder/openstorage/issues/377)) ([6851ff9](https://github.com/coder/openstorage/commit/6851ff93f6ad34b3576669812896f5a1f5788cc0))
 * **api:** report the author date as Commit.date and add committer_date ([#401](https://github.com/coder/openstorage/issues/401)) ([cf05eff](https://github.com/coder/openstorage/commit/cf05eff6c7852112ffe14b2a3bbc6784077a1217))
 * **api:** resolve a relative cache dir once at startup and in api.New ([#366](https://github.com/coder/openstorage/issues/366)) ([b590932](https://github.com/coder/openstorage/commit/b59093209ae15a35db392d8930a39e6339be9d37))
+* **api:** stage the fork pack on the pack dir's filesystem ([#362](https://github.com/coder/openstorage/issues/362)) ([fcb7816](https://github.com/coder/openstorage/commit/fcb7816243c4c8aa14c937d94404311b46f9ee44))
+* **auth:** reject non-canonical base64url in JWT segments ([#323](https://github.com/coder/openstorage/issues/323)) ([2ee1cfb](https://github.com/coder/openstorage/commit/2ee1cfb169d6be7b87f2db003ba9dd074e937cd6))
 * **auth:** require 2048-bit RSA organization public keys ([5b17f02](https://github.com/coder/openstorage/commit/5b17f0261a5b81a61430d02fab25dc03a54b750b))
 * **ci:** make the legacy MinIO qualification lane opt-in ([#308](https://github.com/coder/openstorage/issues/308)) ([c01ad82](https://github.com/coder/openstorage/commit/c01ad8268f4f7f74df842bab4e8c2e0f42bb6e38))
 * **ci:** restore the legacy MinIO fixture source ([#251](https://github.com/coder/openstorage/issues/251)) ([5f172c5](https://github.com/coder/openstorage/commit/5f172c5e4e72568dcdf0f344d65f75163b2f34c6))
@@ -54,7 +58,6 @@
 * **gitread:** pin git's message locale so heap-cap failures classify as 422 ([#340](https://github.com/coder/openstorage/issues/340)) ([870a647](https://github.com/coder/openstorage/commit/870a64786dfd1e85a981a0adf13ed8cbd901d591))
 * **jobs:** keep River sync runs uncounted across serve shutdown ([#347](https://github.com/coder/openstorage/issues/347)) ([b224898](https://github.com/coder/openstorage/commit/b224898af6c778717bda8a576e43fb5b79ddd421))
 * **s3wal:** name missing lease holder in corruption diagnostics ([#302](https://github.com/coder/openstorage/issues/302)) ([6bf383a](https://github.com/coder/openstorage/commit/6bf383a272fc81b695e5db5d0630dc031ac8ba12))
-* **s3wal:** preserve evidence in lease refusal diagnostics ([#270](https://github.com/coder/openstorage/issues/270)) ([84101df](https://github.com/coder/openstorage/commit/84101df0e27770f4808735fa41485bb7f94deaf6))
 * **s3wal:** preserve evidence in lease refusal diagnostics ([#270](https://github.com/coder/openstorage/issues/270)) ([84101df](https://github.com/coder/openstorage/commit/84101df0e27770f4808735fa41485bb7f94deaf6))
 * **sync:** keep in-flight local runs' requests across serve shutdown ([#344](https://github.com/coder/openstorage/issues/344)) ([bba1986](https://github.com/coder/openstorage/commit/bba1986913e5f0dc5ee2c90fd47e0cc9aa7f9870))
 * **sync:** send upstream's default username when none is stored ([#402](https://github.com/coder/openstorage/issues/402)) ([ed1b409](https://github.com/coder/openstorage/commit/ed1b409ce7c53f03a98a8d3fb4dd6f37859a01b0))
