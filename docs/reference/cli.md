@@ -3,7 +3,7 @@
 The `openstorage` binary contains the server and its operational helpers:
 
 ```
-openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> [flags]
+openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|s3wal-meta|version> [flags]
 ```
 
 Sources: [`cmd/openstorage/main.go`](../../cmd/openstorage/main.go) and
@@ -246,6 +246,37 @@ runs.
 Re-running on an already-purged repository rescans its blob prefixes for stragglers (bytes
 an in-flight pre-delete push published after the first pass) and reaps them through the
 same quarantine handshake.
+
+## `openstorage s3wal-meta`
+
+Converts an S3WAL bucket's metadata document (`_wal/meta.json`) between format versions 1
+and 2 ([ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md)).
+`serve` reads only version 2. Run the command once with the new binary when you upgrade
+from a v1 release, and with `--to 1` before you go back to one. The steps are in the
+[deployment guide](../how-to/deploy-production.md#upgrading-the-s3wal-metadata-format).
+
+```
+openstorage s3wal-meta convert --to <1|2>
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--to` | required | Target version: `2` to upgrade, `1` to downgrade |
+
+The database URL (`OPENSTORAGE_PG_URL`) must be an `s3wal://` URL. The command:
+
+1. Runs the conditional-write probe, then takes the instance lease. It refuses while
+   another process holds a fresh lease, so it never runs under a live `serve`. It
+   ignores `OPENSTORAGE_S3WAL_LEASE_TTL=0`.
+2. Renews the lease while it runs and stops before its write if a renewal fails.
+3. Writes the converted document with a conditional write, re-reads it, and checks that
+   it equals the expected conversion. It prints the version, `seq` and row counts.
+4. Releases the lease.
+
+`--to 2` changes only the version. `--to 1` drops the four v2 fields and sets
+`sync_pending` on every lane whose pull claim is set, so a v1 release restarts that pull
+at boot. A document already at the target version is left unchanged (exit 0). A bucket
+without a metadata document needs nothing: `serve` creates a v2 document.
 
 ## `openstorage version`
 

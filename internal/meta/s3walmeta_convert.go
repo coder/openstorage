@@ -112,10 +112,11 @@ func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int) (S
 				continue
 			}
 		}
-		if err := verifyS3WALMetaConversion(ctx, cs, want); err != nil {
+		got, err := verifyS3WALMetaConversion(ctx, cs, want)
+		if err != nil {
 			return S3WALMetaConversion{}, err
 		}
-		res.SeqAfter, res.After = want.Seq, countS3WALMeta(want)
+		res.SeqAfter, res.After = got.Seq, countS3WALMeta(got)
 		return res, nil
 	}
 	return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: %d attempts: %w", s3walConvertAttempts, s3wal.ErrCASContention)
@@ -149,23 +150,52 @@ func convertS3WALMetaDoc(body []byte, to int) (*s3walMetaDoc, error) {
 }
 
 // verifyS3WALMetaConversion re-reads the stored document and checks it is
-// exactly want: our write, decoded back to the expected tables.
-func verifyS3WALMetaConversion(ctx context.Context, cs s3wal.ConditionalStore, want *s3walMetaDoc) error {
+// exactly want, the source with the conversion applied. It returns the
+// stored document.
+func verifyS3WALMetaConversion(ctx context.Context, cs s3wal.ConditionalStore, want *s3walMetaDoc) (*s3walMetaDoc, error) {
 	obj, err := cs.Get(ctx, s3walMetaKey)
 	if err != nil {
-		return fmt.Errorf("s3walmeta convert: verify read: %w", err)
+		return nil, fmt.Errorf("s3walmeta convert: verify read: %w", err)
 	}
 	got, err := decodeS3WALMetaDocVersion(obj.Body, want.V)
 	if err != nil {
-		return fmt.Errorf("s3walmeta convert: verify: %w", err)
+		return nil, fmt.Errorf("s3walmeta convert: verify: %w", err)
 	}
 	if got.Writer != want.Writer || got.Seq != want.Seq {
-		return fmt.Errorf("s3walmeta convert: verify: document advanced to seq %d by writer %s after the conversion wrote seq %d; another writer is running", got.Seq, got.Writer, want.Seq)
+		return nil, fmt.Errorf("s3walmeta convert: verify: document advanced to seq %d by writer %s after the conversion wrote seq %d; another writer is running", got.Seq, got.Writer, want.Seq)
 	}
+	omitEmptyContainers(got)
+	omitEmptyContainers(want)
 	if !reflect.DeepEqual(got, want) {
-		return fmt.Errorf("s3walmeta convert: verify: stored seq %d does not decode to the expected document", got.Seq)
+		return nil, fmt.Errorf("s3walmeta convert: verify: stored seq %d does not decode to the expected document", got.Seq)
 	}
-	return nil
+	return got, nil
+}
+
+// omitEmptyContainers sets the empty omitempty maps and slices of doc to
+// nil, as an encode and decode does, so an empty table in the source does
+// not read as a mismatch.
+func omitEmptyContainers(doc *s3walMetaDoc) {
+	if len(doc.Orgs) == 0 {
+		doc.Orgs = nil
+	}
+	if len(doc.Repos) == 0 {
+		doc.Repos = nil
+	}
+	if len(doc.Webhooks) == 0 {
+		doc.Webhooks = nil
+	}
+	if len(doc.Credentials) == 0 {
+		doc.Credentials = nil
+	}
+	if len(doc.Upstreams) == 0 {
+		doc.Upstreams = nil
+	}
+	for _, o := range doc.Orgs {
+		if len(o.SigningKeys) == 0 {
+			o.SigningKeys = nil
+		}
+	}
 }
 
 func countS3WALMeta(doc *s3walMetaDoc) S3WALMetaCounts {

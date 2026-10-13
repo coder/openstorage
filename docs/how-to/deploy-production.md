@@ -784,6 +784,43 @@ also have a metric are listed in the [metrics and log mapping](#metrics-and-log-
 
 </details>
 
+### Upgrading the S3WAL metadata format
+
+A release with metadata format v2
+([ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md))
+does not serve a v1 bucket. It stops at startup with `document version 1 needs
+conversion`. A v1 release stops on a v2 bucket with `document version 2 unsupported`.
+Neither writes the metadata document.
+
+**Upgrade from a v1 release (v0.16.0 or later).** Upgrade an older install to a v1
+release first.
+
+1. Stop `serve` with `SIGTERM`. Wait for the process and its hook children to exit. Do
+   not run `signing-key` or `purge-repo` until step 5 ends.
+2. Take a verified [stopped-node backup](backup-restore-s3wal.md).
+3. Replace the binary. Replace it only while `serve` is stopped: hooks run the binary at
+   the path `serve` started from, and a v2 hook on a v1 bucket accepts pushes but drops
+   their webhooks.
+4. Run `openstorage s3wal-meta convert --to 2` with the serve environment. If it reports
+   a held lease, confirm that no `serve` runs, wait the holder's recorded TTL plus 2s
+   (step 3 of [shutdown and restart](#s3wal-shutdown-and-restart)), and run it again. A
+   `serve` started with `OPENSTORAGE_S3WAL_LEASE_TTL=0` holds no lease, so the command
+   cannot detect it.
+5. Start `serve`. Pending push and pull work runs at once, at the first attempt.
+
+**Downgrade to a v1 release (v0.16.0 or later).**
+
+1. Stop `serve` and wait for the process and its hook children to exit, as in upgrade
+   step 1.
+2. Take a verified [stopped-node backup](backup-restore-s3wal.md). The conversion drops
+   the retry positions and create states, and the backup is the only way back to them.
+3. Run `openstorage s3wal-meta convert --to 1` with the v2 binary. A held lease is handled
+   as in upgrade step 4.
+4. Replace the binary with the v1 release and start it.
+
+The downgrade keeps all data. It loses retry backoff positions, and every repository's
+create state reads legacy, so a repeat create answers 409.
+
 ### S3WAL shutdown and restart
 
 > [!WARNING]

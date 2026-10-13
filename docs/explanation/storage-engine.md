@@ -376,17 +376,22 @@ rewrite. So adding, removing, or reinterpreting a durable field is not safe just
 it is optional, additive, or tagged `omitempty`: an older writer can drop information or
 apply a different meaning. Such changes must not silently extend the frozen v1 format.
 
-**Fields v1 does not carry.** PostgreSQL and SQLite store a per-repository create state
-(`repos.create_state`: legacy, pending, or complete; [#388](https://github.com/coder/openstorage/issues/388)).
-The v1 metadata document has no such field, and adding one needs the v2 decision in
-[#335](https://github.com/coder/openstorage/issues/335). Until then every S3WAL repository
-reads as legacy, which the API never treats as a finished create.
+**Metadata format v2.** The metadata document is at version 2
+([ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md)).
+v2 is v1 plus four fields: `repos[].create_state` and the schedule fields
+`upstreams[].push_attempt`, `push_due` and `sync_due`. A missing field means what v1
+means: a legacy create state, the first attempt, due now. Repository-group manifests stay
+at v1. `serve`, `hook`, `signing-key` and `purge-repo` read only v2. On a v1 document
+they stop with an error that names the conversion command, and they do not write it.
+Only [`openstorage s3wal-meta convert`](../reference/cli.md#openstorage-s3wal-meta)
+reads and writes v1. The operator procedure is in the
+[deployment guide](../how-to/deploy-production.md#upgrading-the-s3wal-metadata-format).
 
 **Current enforcement.** Both decoders reject unsupported version values; both encoders
-assert they write v1. These codec-level guards are not a bucket-wide compatibility check.
-They do not guarantee that an old process always exits or cannot mutate other bucket
-objects, that an upgrade is atomic, or that a downgrade is safe. There is no v2 migration
-capability or automatic read-time migration today.
+assert the version they write. These codec-level guards are not a bucket-wide
+compatibility check. They do not guarantee that an old process always exits or cannot
+mutate other bucket objects. The conversion is an explicit, stopped-node command: no
+process converts on read.
 
 **Future release obligations.** Before enabling writes incompatible with the baseline, a
 release must:
@@ -400,7 +405,9 @@ release must:
 These are release requirements, not an upgrade engine supplied today.
 
 > [!WARNING]
-> Downgrade after incompatible-format writes is unsupported.
+> Downgrade after incompatible-format writes is unsupported, with one exception: a
+> metadata v2 bucket goes back to a v1 release (v0.16.0 or later) through
+> `openstorage s3wal-meta convert --to 1`.
 
 Take a verified [stopped-node backup](../how-to/backup-restore-s3wal.md) before an
 upgrade as a precaution; that same-binary recovery procedure does not qualify

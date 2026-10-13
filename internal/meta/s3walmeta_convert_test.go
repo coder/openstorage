@@ -94,7 +94,8 @@ func assertConverted(t *testing.T, cas s3wal.ConditionalStore, src *s3walMetaDoc
 }
 
 // seedS3WALMetaClaim seeds every table and leaves the pull lane claimed,
-// as a process that stopped while it held the claim leaves it.
+// as a process that stopped while it held the claim leaves it. It stores
+// the result as v1, as a v1 release wrote it (no v2 field is set).
 func seedS3WALMetaClaim(t *testing.T, cas *s3wal.MemCAS) (string, *s3walMetaDoc) {
 	t.Helper()
 	ctx := context.Background()
@@ -114,6 +115,8 @@ func seedS3WALMetaClaim(t *testing.T, cas *s3wal.MemCAS) (string, *s3walMetaDoc)
 	if u := doc.Upstreams[repoID]; !u.Syncing || u.SyncPending {
 		t.Fatalf("seeded lane = %+v, want a claim that consumed sync_pending", u)
 	}
+	putS3WALMeta(t, cas, doc, 1)
+	doc, _ = storedS3WALMeta(t, cas)
 	return repoID, doc
 }
 
@@ -149,9 +152,20 @@ func TestS3WALMetaConvert(t *testing.T) {
 	}
 	assertConverted(t, cas, v2, 1)
 
-	// The v1 normal path reads the result and lists the claimed lane.
+	// The normal (v2) path refuses the v1 document and writes nothing.
 	st := NewS3WAL(cas)
 	defer st.Close()
+	v1Seq := res.SeqAfter + 2
+	if _, err := st.UpsertOrgWithKeys(ctx, "new", []string{"pem"}); err == nil || !strings.Contains(err.Error(), "convert --to 2") {
+		t.Fatalf("v2 write on v1 = %v, want the conversion hint", err)
+	}
+	if got, _ := storedS3WALMeta(t, cas); got.V != 1 || got.Seq != v1Seq {
+		t.Fatalf("refused write left v%d seq %d, want v1 seq %d", got.V, got.Seq, v1Seq)
+	}
+	// Back to v2: the claimed lane is pending, and v2 boot lists it.
+	if _, err := ConvertS3WALMeta(ctx, cas, 2); err != nil {
+		t.Fatal(err)
+	}
 	ids, err := st.PendingSyncRepoIDs(ctx)
 	if err != nil || len(ids) != 1 || ids[0] != repoID {
 		t.Fatalf("PendingSyncRepoIDs = %v, %v", ids, err)
@@ -162,6 +176,14 @@ func TestS3WALMetaConvertEdges(t *testing.T) {
 	ctx := context.Background()
 	if res, err := ConvertS3WALMeta(ctx, s3wal.NewMemCAS(), 2); err != nil || !res.Missing {
 		t.Fatalf("missing document = %+v, %v", res, err)
+	}
+	// Empty tables, which the encoder omits, still verify.
+	empty := s3wal.NewMemCAS()
+	if _, err := empty.Create(ctx, s3walMetaKey, []byte(`{"v":1,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[]}},"repos":{}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := ConvertS3WALMeta(ctx, empty, 2); err != nil || res.SeqAfter != 2 || res.After.Orgs != 1 {
+		t.Fatalf("empty-table document = %+v, %v", res, err)
 	}
 	cas := s3wal.NewMemCAS()
 	_, src := seedS3WALMetaClaim(t, cas)
@@ -205,31 +227,32 @@ func (r *raceCAS) Advance(ctx context.Context, key string, body []byte, etag str
 }
 
 // A v1 writer that the fence missed: its write between the conversion's
-// read and write survives, and its next write after the conversion fails
-// without changing the v2 document.
+// read and write survives, and its next CAS, made on the v1 ETag it read,
+// loses without changing the v2 document.
 func TestS3WALMetaConvertRace(t *testing.T) {
 	ctx := context.Background()
 	mem := s3wal.NewMemCAS()
 	seedS3WALMetaClaim(t, mem)
-	old := NewS3WAL(mem)
-	defer old.Close()
+	var v1ETag string
 	cas := &raceCAS{MemCAS: mem, before: func() {
-		if _, err := old.UpsertOrgWithKeys(ctx, "raced", []string{"pem"}); err != nil {
-			t.Errorf("racing v1 write: %v", err)
+		doc, _ := storedS3WALMeta(t, mem)
+		doc.Orgs["raced"] = &s3walMetaOrg{ID: 9, PublicKeys: []string{"pem"}}
+		putS3WALMeta(t, mem, doc, 1)
+		obj, err := mem.Get(ctx, s3walMetaKey)
+		if err != nil {
+			t.Error(err)
 		}
+		v1ETag = obj.ETag
 	}}
 	if _, err := ConvertS3WALMeta(ctx, cas, 2); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := storedS3WALMeta(t, mem)
+	got, body := storedS3WALMeta(t, mem)
 	if got.V != 2 || got.Orgs["raced"] == nil {
 		t.Fatalf("converted document v%d orgs %v, want v2 with the raced org", got.V, got.Orgs)
 	}
-	if _, err := old.UpsertOrgWithKeys(ctx, "late", []string{"pem"}); err == nil || !strings.Contains(err.Error(), "document version 2 unsupported") {
-		t.Fatalf("late v1 write = %v, want a version error", err)
-	}
-	if after, _ := storedS3WALMeta(t, mem); after.Seq != got.Seq {
-		t.Fatalf("late v1 write moved seq %d -> %d", got.Seq, after.Seq)
+	if _, err := mem.Advance(ctx, s3walMetaKey, body, v1ETag); !errors.Is(err, s3wal.ErrLostRace) {
+		t.Fatalf("late v1 CAS = %v, want a lost race", err)
 	}
 }
 

@@ -62,7 +62,7 @@ const s3walMetaKey = "_wal/meta.json"
 // s3walMetaVersion is the only document schema version this binary's
 // normal code paths read or write. Only the format conversion
 // (s3walmeta_convert.go, ADR-51) reads and writes the others.
-const s3walMetaVersion = 1
+const s3walMetaVersion = 2
 
 // The document schema versions (ADR-51). v2 is v1 plus four fields whose
 // absent value means exactly what v1 means (the zero-value rule):
@@ -248,6 +248,10 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 		return nil, fmt.Errorf("s3walmeta: document decode: %w", err)
 	}
 	if !slices.Contains(versions, doc.V) {
+		if doc.V == s3walMetaV1 {
+			// ADR-51 rollout R1: only the offline conversion reads v1.
+			return nil, fmt.Errorf("s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2` (docs/how-to/deploy-production.md#upgrading-the-s3wal-metadata-format)")
+		}
 		return nil, fmt.Errorf("s3walmeta: document version %d unsupported (want %d)", doc.V, s3walMetaVersion)
 	}
 	if doc.Seq < 1 {
