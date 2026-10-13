@@ -350,7 +350,11 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		}
 		queue = q
 	} else {
-		queue, cleanup = buildLocalSyncQueue(ms, org, cacheDir, worker, deliverer, repack, logger)
+		var err error
+		queue, cleanup, err = buildLocalSyncQueue(ms, org, cacheDir, worker, deliverer, repack, logger)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep)
 			prev := cleanup
