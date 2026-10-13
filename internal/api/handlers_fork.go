@@ -410,7 +410,9 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 // cancellation, is retried once on a detached, bounded context; then the
 // create answers 500 and the row stays pending, so plain and copy creates
 // of the name answer 503 until DELETE /repos/delete clears it. A delete
-// that landed first wins: 404, never 201.
+// that landed first wins: 404, never 201. AlreadyComplete is a success: a
+// failed attempt can have committed before its error (the retry then sees
+// complete), and S3-WAL's ambiguous-PUT recovery answers it on purpose.
 func (s *server) completeFork(w http.ResponseWriter, r *http.Request, org, url, repoID string) bool {
 	assertf(org != "" && url != "" && repoID != "", "completeFork: missing inputs")
 	out, err := s.store.CompleteRepoCreate(r.Context(), org, repoID)
@@ -428,8 +430,8 @@ func (s *server) completeFork(w http.ResponseWriter, r *http.Request, org, url, 
 		writeErr(w, http.StatusNotFound, repoDeletedMsg(url))
 		return false
 	}
-	// Nothing else completes a fork's row: AlreadyComplete is impossible.
-	assertf(out == meta.CreateCompleted, "CompleteRepoCreate of fork %s: outcome %d", repoID, out)
+	assertf(out == meta.CreateCompleted || out == meta.CreateAlreadyComplete,
+		"CompleteRepoCreate of fork %s: outcome %d", repoID, out)
 	return true
 }
 

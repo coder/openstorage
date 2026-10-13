@@ -134,6 +134,31 @@ func TestPendingFork(t *testing.T) {
 			}
 		})
 
+		t.Run("a completion that committed before its error succeeds", func(t *testing.T) {
+			// The first attempt commits, then fails (a cancellation after
+			// the commit); the retry sees complete. Also S3-WAL's
+			// ambiguous-PUT recovery path.
+			var mu stdsync.Mutex
+			first := true
+			s := newPendingForkStack(t, e, e.blobStore, completeHookStore{Store: e.store,
+				hook: func(ctx context.Context, org, repoID string) (meta.CreateOutcome, error) {
+					out, err := e.store.CompleteRepoCreate(ctx, org, repoID)
+					mu.Lock()
+					defer mu.Unlock()
+					if first && err == nil {
+						first = false
+						return 0, errors.New("injected error after commit")
+					}
+					return out, err
+				}})
+			if code, _, msg := s.create(t, "committed", s.copy); code != http.StatusCreated {
+				t.Fatalf("copy whose completion committed before its error = %d %q, want 201", code, msg)
+			}
+			if st, err := s.state(t, "committed"); err != nil || st != meta.CreateStateComplete {
+				t.Fatalf("create_state = %d, %v; want complete", st, err)
+			}
+		})
+
 		t.Run("a failed completion is retried once, then the name stays pending", func(t *testing.T) {
 			var mu stdsync.Mutex
 			failures := 0
