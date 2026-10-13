@@ -820,16 +820,24 @@ var errStealVictimUncleared = errors.New("steal victim fence not yet cleared")
 // (per-run tokens make it test-only) is handled uniformly: the holder's
 // old token is cleared and the post-commit write-through reinstalls it.
 func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, string, error) {
+	c, err := s.beginSync(ctx, repoID, holder, lease, false)
+	return c.Up, c.Claimed, c.StolenFrom, err
+}
+
+// beginSync is TryBeginSync; with requireDue (ClaimDueSync, ADR-50) an
+// unclaimed lane is claimed only when sync_pending is set and sync_due has
+// passed, and a refusal writes nothing.
+func (s *S3WAL) beginSync(ctx context.Context, repoID, holder string, lease time.Duration, requireDue bool) (LocalClaim, error) {
 	assertf(repoID != "", "TryBeginSync: empty repo id")
 	assertf(holder != "", "TryBeginSync: empty holder")
 	assertf(lease > 0, "TryBeginSync: non-positive lease %v", lease)
 	if err := utf8OK("holder", holder); err != nil {
-		return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: %w", repoID, err)
+		return LocalClaim{}, fmt.Errorf("begin sync for repo %q: %w", repoID, err)
 	}
 	nowNanos, _ := s.nowNano()
 	expiry := nowNanos + lease.Nanoseconds()
 	var up RepoUpstream
-	var claimed bool
+	var claimed, busy bool
 	var stolenFrom string
 	var prevPending bool
 	var stealVictim string
@@ -839,7 +847,7 @@ func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease t
 		err = s.mutate(ctx, s3walMetaMutation{
 			op: "begin sync",
 			fn: func(doc *s3walMetaDoc) (bool, error) {
-				claimed, stolenFrom, prevPending = false, "", false
+				claimed, busy, stolenFrom, prevPending = false, false, "", false
 				u, err := lookupUpstream(doc, repoID)
 				if err != nil {
 					return false, err
@@ -854,7 +862,11 @@ func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease t
 					return false, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
 				}
 				if u.Syncing && u.SyncClaimExpiresAt > nowNanos {
-					up = u.toRepoUpstream(repoID) // unexpired claim in flight: refused
+					up, busy = u.toRepoUpstream(repoID), true // unexpired claim in flight: refused
+					return false, nil
+				}
+				if requireDue && !u.Syncing && (!u.SyncPending || u.SyncDue > nowNanos) {
+					up = u.toRepoUpstream(repoID) // no durable work due: refused, nothing written
 					return false, nil
 				}
 				if u.Syncing {
@@ -889,21 +901,21 @@ func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease t
 		// claim-and-expire cycle, so this loop converges immediately in
 		// practice; the bound is a defensive backstop.
 		if tries+1 >= s.casAttempts {
-			return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: steal victim changed across %d fence pre-clear attempts", repoID, s.casAttempts)
+			return LocalClaim{}, fmt.Errorf("begin sync for repo %q: steal victim changed across %d fence pre-clear attempts", repoID, s.casAttempts)
 		}
 		if cerr := s.sink.ClearSyncClaim(ctx, repoID, stealVictim); cerr != nil {
 			// Nothing consumed: the steal CAS was never attempted, the
 			// victim's expired claim and token are intact — plainly
 			// retryable.
-			return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: clear expired victim fence: %w", repoID, cerr)
+			return LocalClaim{}, fmt.Errorf("begin sync for repo %q: clear expired victim fence: %w", repoID, cerr)
 		}
 		clearedVictim = stealVictim
 	}
 	if err != nil {
-		return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: %w", repoID, err)
+		return LocalClaim{}, fmt.Errorf("begin sync for repo %q: %w", repoID, err)
 	}
 	if !claimed || s.sink == nil {
-		return up, claimed, stolenFrom, nil
+		return LocalClaim{Up: up, Claimed: claimed, Busy: busy, StolenFrom: stolenFrom}, nil
 	}
 
 	// §2.8 write-through: install the fence token in the ref manifest.
@@ -918,7 +930,7 @@ func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease t
 			slog.Warn("s3walmeta: fence cleanup after failed write-through also failed; a stale token may linger (fail-closed for every other holder)",
 				"repo", repoID, "err", cerr)
 		}
-		return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: sync-claim write-through: %w", repoID, serr)
+		return LocalClaim{}, fmt.Errorf("begin sync for repo %q: sync-claim write-through: %w", repoID, serr)
 	}
 	// Revalidate the meta claim now that the fence is installed: if the
 	// claim was stolen while our manifest write was in flight (our token
@@ -942,16 +954,18 @@ func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease t
 	}
 	if gerr == nil && !detaching && fresh.Syncing && fresh.SyncClaimHolder == holder &&
 		fresh.SyncClaimExpiresAt.Equal(time.Unix(0, expiry).UTC()) {
-		return up, true, stolenFrom, nil
+		return LocalClaim{Up: up, Claimed: true, StolenFrom: stolenFrom}, nil
 	}
 	if cerr := s.sink.ClearSyncClaim(ctx, repoID, holder); cerr != nil {
 		slog.Warn("s3walmeta: fence clear after lost claim revalidation failed; the stale token blocks no thief (their claim re-installs it) but fails our writes closed",
 			"repo", repoID, "err", cerr)
 	}
 	if gerr != nil {
-		return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: claim revalidation: %w", repoID, gerr)
+		return LocalClaim{}, fmt.Errorf("begin sync for repo %q: claim revalidation: %w", repoID, gerr)
 	}
-	return fresh, false, "", nil
+	// The claim was stolen during the fence install, or the row is
+	// detaching: refused, and a thief's live claim is reported busy.
+	return LocalClaim{Up: fresh, Busy: fresh.Syncing}, nil
 }
 
 // rollbackSyncClaim undoes a just-committed claim after a failed fence
@@ -1106,21 +1120,31 @@ func (s *S3WAL) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
 // refs, which no local CASRef fences. Recovery class PRED: the
 // (holder, expiry-stamp) pair proves OUR claim, as in TryBeginSync.
 func (s *S3WAL) TryBeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, bool, string, error) {
+	c, err := s.beginPush(ctx, repoID, holder, lease, false)
+	return c.Up, c.Claimed, c.Force, c.StolenFrom, err
+}
+
+// beginPush is TryBeginPush; with requireDue (ClaimDuePush, ADR-50) an
+// unclaimed lane is claimed only when its pending level is due, the claim
+// returns the retry position, and push_due takes the claim time (see
+// FinishPushOutcome).
+func (s *S3WAL) beginPush(ctx context.Context, repoID, holder string, lease time.Duration, requireDue bool) (LocalClaim, error) {
 	assertf(repoID != "", "TryBeginPush: empty repo id")
 	assertf(holder != "", "TryBeginPush: empty holder")
 	assertf(lease > 0, "TryBeginPush: non-positive lease %v", lease)
 	if err := utf8OK("holder", holder); err != nil {
-		return RepoUpstream{}, false, false, "", fmt.Errorf("begin push for repo %q: %w", repoID, err)
+		return LocalClaim{}, fmt.Errorf("begin push for repo %q: %w", repoID, err)
 	}
 	nowNanos, _ := s.nowNano()
 	expiry := nowNanos + lease.Nanoseconds()
 	var up RepoUpstream
-	var claimed, force bool
+	var claimed, force, busy bool
+	var attempt int
 	var stolenFrom string
 	err := s.mutate(ctx, s3walMetaMutation{
 		op: "begin push",
 		fn: func(doc *s3walMetaDoc) (bool, error) {
-			claimed, force, stolenFrom = false, false, ""
+			claimed, force, busy, stolenFrom, attempt = false, false, false, "", 0
 			u, err := lookupUpstream(doc, repoID)
 			if err != nil {
 				return false, err
@@ -1128,8 +1152,18 @@ func (s *S3WAL) TryBeginPush(ctx context.Context, repoID, holder string, lease t
 			assertf(!(u.PushSyncing && u.PushClaimHolder == ""),
 				"s3walmeta: repo %q push claim has no holder", repoID)
 			if u.PushSyncing && u.PushClaimExpiresAt > nowNanos {
-				up = u.toRepoUpstream(repoID) // unexpired claim in flight: refused
+				up, busy = u.toRepoUpstream(repoID), true // unexpired claim in flight: refused
 				return false, nil
+			}
+			if requireDue {
+				if !u.PushSyncing && (u.PushPending == 0 || u.PushDue > nowNanos) {
+					up = u.toRepoUpstream(repoID) // no durable work due: refused, nothing written
+					return false, nil
+				}
+				// While a scheduled run holds the lane, push_due carries
+				// its claim time (never 0); RequestPushNow resets it to 0.
+				assertf(nowNanos > 0, "claim time %d is not positive", nowNanos)
+				attempt, u.PushDue = u.PushAttempt, nowNanos
 			}
 			force = u.PushPending == 2 || (u.PushSyncing && u.PushClaimForce)
 			if u.PushSyncing {
@@ -1150,9 +1184,10 @@ func (s *S3WAL) TryBeginPush(ctx context.Context, repoID, holder string, lease t
 		},
 	})
 	if err != nil {
-		return RepoUpstream{}, false, false, "", fmt.Errorf("begin push for repo %q: %w", repoID, err)
+		return LocalClaim{}, fmt.Errorf("begin push for repo %q: %w", repoID, err)
 	}
-	return up, claimed, force, stolenFrom, nil
+	assertf(!(claimed && busy), "begin push for %q: claimed and busy", repoID)
+	return LocalClaim{Up: up, Claimed: claimed, Busy: busy, Force: claimed && force, Attempt: attempt, StolenFrom: stolenFrom}, nil
 }
 
 // FinishPush is FinishSync on the push_* lane: holder-guarded completion,

@@ -1,11 +1,13 @@
-// Conformance and model tests for the SQLite local schedule (issue #266):
-// the lane row owns pending level, due time, attempt, and claim, and every
-// transition is one BEGIN IMMEDIATE transaction on that row. All time is
-// store time (WithNowFunc), so no test sleeps.
+// Conformance and model tests for the local schedule (issue #266, ADR-50)
+// on SQLite and S3WAL (ADR-51): the lane row owns pending level, due time,
+// attempt, and claim, and every transition is one transaction (SQLite) or
+// one CAS (S3WAL) on that row. All time is store time (WithNowFunc), so no
+// test sleeps.
 
 package meta
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -13,14 +15,30 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 const schedLease = 16 * time.Minute
 
-// schedFixture is one SQLite store with a mutable injected clock and one
+// schedStore is a backend with the local schedule transitions these tests
+// drive, and a reader of the schedule fields.
+type schedStore interface {
+	Backend
+	EventingStore
+	RequestPushNow(ctx context.Context, repoID string, force bool) error
+	ClaimDuePush(ctx context.Context, repoID, holder string, lease time.Duration) (LocalClaim, error)
+	ClaimDueSync(ctx context.Context, repoID, holder string, lease time.Duration) (LocalClaim, error)
+	FinishPushOutcome(ctx context.Context, repoID, holder string, o PushOutcome) (RepoUpstream, error)
+	FinishSyncOutcome(ctx context.Context, repoID, holder string, o SyncOutcome) (RepoUpstream, error)
+	ListLocalWork(ctx context.Context, org, after string, limit int) ([]LocalWork, error)
+	readLocalSchedule(ctx context.Context, repoID string) (localSchedule, error)
+}
+
+// schedFixture is one store with a mutable injected clock and one
 // upstream-linked repo in a served org.
 type schedFixture struct {
-	s    *SQLite
+	s    schedStore
 	now  time.Time
 	org  string
 	repo string
@@ -42,6 +60,33 @@ func newSchedFixture(t *testing.T) *schedFixture {
 	f.s = s
 	f.repo, f.url = f.addRepo(t, f.org, "main")
 	return f
+}
+
+// newS3WALSchedFixture is newSchedFixture on an in-memory S3WAL bucket.
+func newS3WALSchedFixture(t *testing.T) *schedFixture {
+	t.Helper()
+	f := &schedFixture{now: time.Unix(1700000000, 0).UTC(), org: "sched-org"}
+	st := NewS3WAL(s3wal.NewMemCAS(), WithNowFunc(func() time.Time { return f.now }))
+	t.Cleanup(st.Close)
+	f.s = s3walLocalSchedule{st}
+	f.repo, f.url = f.addRepo(t, f.org, "main")
+	return f
+}
+
+// runSchedBackends runs body against SQLite and S3WAL.
+func runSchedBackends(t *testing.T, body func(*testing.T, func(*testing.T) *schedFixture)) {
+	t.Run("sqlite", func(t *testing.T) { body(t, newSchedFixture) })
+	t.Run("s3wal", func(t *testing.T) { body(t, newS3WALSchedFixture) })
+}
+
+// sqlite returns the SQLite store, skipping on other backends.
+func (f *schedFixture) sqlite(t *testing.T) *SQLite {
+	t.Helper()
+	s, ok := f.s.(*SQLite)
+	if !ok {
+		t.Skip("SQLite only")
+	}
+	return s
 }
 
 // addRepo creates a repo with an upstream link in org and returns its ID and URL.
@@ -132,7 +177,7 @@ func TestSQLiteScheduleUpgradeAddsColumns(t *testing.T) {
 	// Simulate a data dir that predates the schedule columns, with pending
 	// work already recorded under the old schema.
 	for _, col := range []string{"push_attempt", "push_due", "sync_due"} {
-		if _, err := f.s.db.ExecContext(ctx, `ALTER TABLE repo_upstreams DROP COLUMN `+col); err != nil {
+		if _, err := f.sqlite(t).db.ExecContext(ctx, `ALTER TABLE repo_upstreams DROP COLUMN `+col); err != nil {
 			t.Fatalf("drop %s: %v", col, err)
 		}
 	}
@@ -156,7 +201,9 @@ func TestSQLiteScheduleUpgradeAddsColumns(t *testing.T) {
 	}
 }
 
-func TestSQLiteClaimDuePush(t *testing.T) {
+func TestLocalClaimDuePush(t *testing.T) { runSchedBackends(t, testLocalClaimDuePush) }
+
+func testLocalClaimDuePush(t *testing.T, newSchedFixture func(*testing.T) *schedFixture) {
 	t.Run("idle lane is not work", func(t *testing.T) {
 		f := newSchedFixture(t)
 		before := f.row(t)
@@ -223,7 +270,9 @@ func TestSQLiteClaimDuePush(t *testing.T) {
 	})
 }
 
-func TestSQLiteRequestPushNow(t *testing.T) {
+func TestLocalRequestPushNow(t *testing.T) { runSchedBackends(t, testLocalRequestPushNow) }
+
+func testLocalRequestPushNow(t *testing.T, newSchedFixture func(*testing.T) *schedFixture) {
 	f := newSchedFixture(t)
 	f.backoff(t, false, 4*time.Minute)
 	if err := f.s.RequestPushNow(t.Context(), f.repo, true); err != nil {
@@ -251,7 +300,9 @@ func TestSQLiteRequestPushNow(t *testing.T) {
 	}
 }
 
-func TestSQLiteFinishPushOutcome(t *testing.T) {
+func TestLocalFinishPushOutcome(t *testing.T) { runSchedBackends(t, testLocalFinishPushOutcome) }
+
+func testLocalFinishPushOutcome(t *testing.T, newSchedFixture func(*testing.T) *schedFixture) {
 	start := func(t *testing.T, force bool) *schedFixture {
 		f := newSchedFixture(t)
 		if err := f.s.RequestPush(t.Context(), f.repo, force); err != nil {
@@ -364,7 +415,9 @@ func TestSQLiteFinishPushOutcome(t *testing.T) {
 	})
 }
 
-func TestSQLiteSyncLaneSchedule(t *testing.T) {
+func TestLocalSyncLaneSchedule(t *testing.T) { runSchedBackends(t, testLocalSyncLaneSchedule) }
+
+func testLocalSyncLaneSchedule(t *testing.T, newSchedFixture func(*testing.T) *schedFixture) {
 	t.Run("claim needs pending and due", func(t *testing.T) {
 		f := newSchedFixture(t)
 		if c := f.claimSync(t, "h1"); c.Claimed || c.Busy {
@@ -437,7 +490,7 @@ func TestSQLiteSyncLaneSchedule(t *testing.T) {
 	})
 	t.Run("legacy claim keeps its adoption path", func(t *testing.T) {
 		f := newSchedFixture(t)
-		if _, err := f.s.db.ExecContext(t.Context(),
+		if _, err := f.sqlite(t).db.ExecContext(t.Context(),
 			`UPDATE repo_upstreams SET syncing = 1, sync_claim_holder = '', sync_claim_expires_at = 0 WHERE repo_id = ?`, f.repo); err != nil {
 			t.Fatal(err)
 		}
@@ -450,7 +503,9 @@ func TestSQLiteSyncLaneSchedule(t *testing.T) {
 	})
 }
 
-func TestSQLiteListLocalWork(t *testing.T) {
+func TestLocalListLocalWork(t *testing.T) { runSchedBackends(t, testLocalListLocalWork) }
+
+func testLocalListLocalWork(t *testing.T, newSchedFixture func(*testing.T) *schedFixture) {
 	f := newSchedFixture(t)
 	ctx := t.Context()
 	must := func(err error) {
@@ -582,7 +637,9 @@ func (m *schedModel) check(t *testing.T, step int, op string, got schedRow) {
 	}
 }
 
-func TestSQLiteScheduleModel(t *testing.T) {
+func TestLocalScheduleModel(t *testing.T) { runSchedBackends(t, testLocalScheduleModel) }
+
+func testLocalScheduleModel(t *testing.T, newSchedFixture func(*testing.T) *schedFixture) {
 	for seed := range uint64(8) {
 		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
 			f := newSchedFixture(t)
