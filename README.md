@@ -116,7 +116,7 @@ SDKs handle this framing for you; with curl, you send the frames yourself.
 
 | Setup | Use it to | Guide |
 |---|---|---|
-| Docker only | Run one local-mode server with persistent volumes and no host Go or binary. Builds the image locally. | [Try with Docker only](docs/how-to/quickstart-docker.md) |
+| Docker only | Run one local-mode server with persistent volumes and no host Go or binary. Uses the published image or a local build. | [Try with Docker only](docs/how-to/quickstart-docker.md) |
 | Two replicas | See two nodes share Postgres and SeaweedFS. | [Below](#quickstart-multi-node-with-docker-compose) |
 | One S3 bucket | Keep all durable state in one bucket. Experimental, single node. | [Below](#quickstart-zero-infrastructure-mode-one-bucket-experimental) |
 

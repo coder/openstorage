@@ -6,11 +6,6 @@ two-replica Postgres/S3 stack, use the [development stack](deploy-docker-compose
 The Compose file runs the image you choose: a published
 `ghcr.io/coder/openstorage` version or a local build.
 
-> [!IMPORTANT]
-> **No image is published yet.** No version has been pushed to a registry
-> ([issue #227](https://github.com/coder/openstorage/issues/227)).
-> Until this page lists a published version, use [a local build](#option-b-build-locally).
-
 ## Prerequisites
 
 - A [repository checkout](../../CONTRIBUTING.md#authenticated-installation).
@@ -26,12 +21,16 @@ Run these commands from the checkout root, in the same shell. First set
 
 ### Option A: use a published image
 
-Not available yet: see the note above. Once a version `X.Y.Z` is published, pin it
-by version and digest, and log in first while the package is private:
+Version `0.17.0` is published for linux/amd64 and linux/arm64. Pin it by version
+and index digest.
+
+The package is **private** and inherits this internal repository's access: people
+who can read the repository can pull it. Log in first with a GitHub token that has
+the `read:packages` scope. Without such a token, use option B.
 
 ```sh
-docker login ghcr.io  # a GitHub token with read:packages; not needed for a public package
-export OPENSTORAGE_IMAGE=ghcr.io/coder/openstorage:X.Y.Z@sha256:<index digest>
+docker login ghcr.io  # GitHub token with read:packages
+export OPENSTORAGE_IMAGE=ghcr.io/coder/openstorage:0.17.0@sha256:db15dca024218292ad1b9e52aab3c19a2d727e4438a555c30b46b5807c90df59
 ```
 
 ### Option B: build locally

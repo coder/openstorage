@@ -26,9 +26,10 @@ contract stay unchanged.
 
 1. Update service-manager commands, scripts, health checks that invoke the binary,
    and installer asset names.
-2. Switch images to `ghcr.io/coder/openstorage`. Registry publishing is not
-   configured yet: build the Dockerfile locally, then pin a verified version or
-   digest once releases publish. Nothing is published to the old image path, and
+2. Switch images to `ghcr.io/coder/openstorage`, pinned by version and digest
+   ([published pin](quickstart-docker.md#option-a-use-a-published-image); pulling
+   the private package needs `docker login ghcr.io` with `read:packages`), or build
+   the Dockerfile locally. Nothing is published to the old image path, and
    the section 2 fallback provides **no old binary name or image alias**.
 3. Update checkout remotes and build from a checkout with the corrected `go.mod`.
    The `v0.15.0` tag still declares `github.com/coder/open-storage`, and GitHub
