@@ -1,12 +1,15 @@
 # Test an official release → exact candidate upgrade locally
 
-Run the opt-in upgrade smoke: **official v0.15.0 → one exact, unreleased candidate**
-on local SeaweedFS.
+Run the opt-in upgrade smoke: **official v0.18.0 → one exact, unreleased candidate →
+official v0.18.0** on local SeaweedFS. v0.18.0 is the last release that writes S3WAL
+metadata format v1, so the run also covers the
+[ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md)
+conversion to v2 and the supported `s3wal-meta convert --to 1` downgrade.
 
 > [!IMPORTANT]
-> Not final released-pair certification, all-v1-data compatibility, downgrade
-> safety, AWS qualification, or S3WAL promotion; the backend stays experimental. The
-> published successor still needs its own released-pair run to complete D2.
+> Not final released-pair certification, all-v1-data compatibility, AWS
+> qualification, or S3WAL promotion; the backend stays experimental. The published
+> successor still needs its own released-pair run to complete D2.
 
 ## Prerequisites
 
@@ -25,10 +28,10 @@ umask 077
 EVIDENCE=$(mktemp -d "$HOME/openstorage-upgrade.XXXXXX")
 mkdir "$EVIDENCE/inputs"
 # Deliberate operator acquisition, never performed by ordinary tests.
-TAG=$(git ls-remote origin refs/tags/v0.15.0 | cut -f1)
-test "$TAG" = d65da6e53ee62145a0cb78a0f89bf6839c8f9171
-gh release download v0.15.0 --repo coder/openstorage \
-  --pattern openstorage_0.15.0_linux_amd64.tar.gz --pattern checksums.txt \
+TAG=$(git ls-remote origin refs/tags/v0.18.0 | cut -f1)
+test "$TAG" = 1438d3dc1e8913c5f26995ad4b251077e39be55e
+gh release download v0.18.0 --repo coder/openstorage \
+  --pattern openstorage_0.18.0_linux_amd64.tar.gz --pattern checksums.txt \
   --dir "$EVIDENCE/inputs"
 (cd "$EVIDENCE/inputs" && sha256sum --check --ignore-missing checksums.txt)
 sha256sum "$EVIDENCE/inputs/"*
@@ -44,10 +47,11 @@ The harness pins these verified official bytes, not a caller-supplied checksum:
 
 | Input | SHA-256 |
 |---|---|
-| `openstorage_0.15.0_linux_amd64.tar.gz` | `b9465088ebf371f2dcd9bed2c3012ea81fd687d39611aff3c1dfdd6ace842611` |
-| `checksums.txt` | `3aea91fdc66009fbf6e67ea00405cfa88869cd8a69fe320aab52f953937c3175` |
+| `openstorage_0.18.0_linux_amd64.tar.gz` | `943bba3db97668e76a8dcfe09cb9da6edc09793337468d0ec07b10dae307120d` |
+| `checksums.txt` | `491bd396f802e5810cc84e14e5db64e50e68d358189c2edbdabd2decc0495043` |
 
-A rebuilt v0.15.0 tag is **not** the official artifact. Candidate identity is its
+The archive holds `openstorage` and `LICENSE`. The harness extracts only the binary.
+A rebuilt v0.18.0 tag is **not** the official artifact. Candidate identity is its
 SHA-256, clean VCS build info, and the exact commit and tree.
 
 > [!WARNING]
@@ -79,7 +83,7 @@ test ! -e "$ATTEMPT" && test ! -e "$ATTEMPT.log"
 set +e
 OPENSTORAGE_TEST_UPGRADE=require \
 OPENSTORAGE_UPGRADE_ATTEMPT="$ATTEMPT" \
-OPENSTORAGE_UPGRADE_ARCHIVE="$EVIDENCE/inputs/openstorage_0.15.0_linux_amd64.tar.gz" \
+OPENSTORAGE_UPGRADE_ARCHIVE="$EVIDENCE/inputs/openstorage_0.18.0_linux_amd64.tar.gz" \
 OPENSTORAGE_UPGRADE_CHECKSUMS="$EVIDENCE/inputs/checksums.txt" \
 OPENSTORAGE_UPGRADE_CANDIDATE="$EVIDENCE/inputs/candidate" \
 OPENSTORAGE_UPGRADE_CANDIDATE_SHA256="$CANDIDATE_SHA256" \
@@ -108,7 +112,12 @@ resolve the pinned compiler. Never change global Git or tool-manager settings.
    record, and a webhook with an encrypted secret. Org signing and encryption config
    are generated privately and reused unchanged.
 4. After SIGTERM, clean exit/reap, lease absence, and a two-second all-key
-   hash/metadata quiet window, the cold candidate:
+   hash/metadata quiet window:
+   - the candidate refuses the v1 bucket (`document version 1 needs conversion`);
+   - `s3wal-meta convert --to 2` verifies its result and releases its lease;
+   - the official release refuses the v2 bucket (`document version 2 unsupported`).
+
+   Neither refusal changes `meta.json` or leaves a lease. The cold candidate then:
    - authenticates the old token and rejects an invalid one;
    - matches repository and webhook values (identities, names/URL, default branch,
      creation times);
@@ -116,9 +125,12 @@ resolve the pinned compiler. Never change global Git or tool-manager settings.
 5. A candidate Git/LFS write yields a webhook whose HMAC verifies with the original
    secret and names the new HEAD. A second cold restart serves the new HEAD and
    bytes, stops cleanly, and releases its lease.
+6. `s3wal-meta convert --to 1` verifies, the candidate refuses the result, and the
+   cold official release passes the same checks as step 4 on the candidate's HEAD and
+   LFS bytes.
 
 The attempt keeps `inputs.json`, frozen inputs, `phases.log`, active lease documents,
-quiescent inventories, per-process stderr, and `inner-exit.txt`.
+quiescent inventories, per-process stderr, `convert-to-*.out`, and `inner-exit.txt`.
 
 > [!IMPORTANT]
 > The outer exit is separate. A missing inner receipt, killed process, partial log,

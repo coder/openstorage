@@ -54,7 +54,8 @@ func newUpgradeFixture(t *testing.T) *upgradeFixture {
 	}
 	f.oldBinaryBody = body
 	f.pin = upgradeReleasePin{OldTag: "v0.0.0-fixture", OldCommit: f.cfg.Commit, OldMainPath: upgradeCandidateMainPath, ArchiveName: upgradeArchiveName}
-	f.setArchive(t, tarEntry{Name: "openstorage", Body: f.oldBinaryBody})
+	// The released layout: the binary, then LICENSE (skipped).
+	f.setArchive(t, tarEntry{Name: "openstorage", Body: f.oldBinaryBody}, tarEntry{Name: "LICENSE", Body: []byte("license")})
 	return f
 }
 
@@ -268,7 +269,7 @@ func TestPrepareUpgradeInputs_RejectsOfficialArtifacts(t *testing.T) {
 	goodLine := f.pin.ArchiveSHA256 + "  " + upgradeArchiveName + "\n"
 	zeros := strings.Repeat("0", 64)
 	for name, tc := range map[string]struct{ body, want string }{
-		"checksums lacks archive line":      {f.pin.ArchiveSHA256 + "  openstorage_0.15.0_linux_arm64.tar.gz\n", "no entry"},
+		"checksums lacks archive line":      {f.pin.ArchiveSHA256 + "  openstorage_0.18.0_linux_arm64.tar.gz\n", "no entry"},
 		"checksums line disagrees with pin": {zeros + "  " + upgradeArchiveName + "\n", "lists"},
 		"checksums line malformed":          {"not a digest  " + upgradeArchiveName + "\n", "malformed"},
 		"checksums lists archive twice":     {goodLine + goodLine, "twice"},
@@ -310,9 +311,15 @@ func TestPrepareUpgradeInputs_RejectsOfficialArtifacts(t *testing.T) {
 	// second one or a foreign binary, so the frozen old binary is preserved.
 	withOld := append(frozen[:2:2], "openstorage-v0.0.0-fixture", upgradeArchiveName)
 	t.Run("extra entry", func(t *testing.T) {
-		f.setArchive(t, tarEntry{Name: "openstorage", Body: f.oldBinaryBody}, tarEntry{Name: "LICENSE", Body: []byte("x")})
-		defer f.setArchive(t, tarEntry{Name: "openstorage", Body: f.oldBinaryBody})
-		f.mustReject(t, f.cfg, "extra entry", withOld...)
+		for _, extra := range [][]tarEntry{
+			{{Name: "README", Body: []byte("x")}},
+			{{Name: "LICENSE", Link: "/etc/passwd", Type: tar.TypeSymlink}},
+			{{Name: "LICENSE", Body: []byte("x")}, {Name: "LICENSE", Body: []byte("x")}},
+		} {
+			f.setArchive(t, append([]tarEntry{{Name: "openstorage", Body: f.oldBinaryBody}}, extra...)...)
+			f.mustReject(t, f.cfg, "extra entry", withOld...)
+		}
+		f.setArchive(t, tarEntry{Name: "openstorage", Body: f.oldBinaryBody})
 	})
 	t.Run("old binary is not the pinned build", func(t *testing.T) {
 		f.setArchive(t, tarEntry{Name: "openstorage", Body: []byte("#!/bin/false\n")})
