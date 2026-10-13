@@ -231,7 +231,7 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 	// The named-repo aliases re-dispatch into this mux, so the path-style
 	// sync routes (.../upstream/pull, DELETE .../upstream) work here too.
 	registerAliasRoutes(mux, &server{store: e.store, logger: discardLogger()}, ss, s.verifier, s.org, nil)
-	s.api = httptest.NewServer(mux)
+	s.api = httptest.NewServer(withProblemInstance(mux))
 	t.Cleanup(s.api.Close)
 	return s
 }

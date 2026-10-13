@@ -31,16 +31,18 @@ func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, 
 // errorEnvelope is the plain wire error shape (docs/reference/http-api.md):
 // the legacy {"error": "<unstable human string>"} plus the RFC 9457
 // problem-details fields upstream documents (issue #349). `code` is the
-// generic per-status code only; `detail` mirrors `error`. Clients branch on
-// the status code or `code`, never on the message. The content type stays
-// application/json: SDK 1.17.1 parses error JSON only for that type.
+// generic per-status code only; `detail` mirrors `error`; `instance` is the
+// request path (issue #352). Clients branch on the status code or `code`,
+// never on the message. The content type stays application/json: SDK 1.17.1
+// parses error JSON only for that type.
 type errorEnvelope struct {
-	Error  string `json:"error"`
-	Type   string `json:"type"`
-	Title  string `json:"title"`
-	Status int    `json:"status"`
-	Code   string `json:"code"`
-	Detail string `json:"detail"`
+	Error    string `json:"error"`
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Status   int    `json:"status"`
+	Code     string `json:"code"`
+	Detail   string `json:"detail"`
+	Instance string `json:"instance,omitempty"`
 }
 
 // writeErr writes the plain error envelope with the given status.
@@ -56,13 +58,54 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 	}
 	writeJSON(w, status, errorEnvelope{
-		Error:  msg,
-		Type:   "about:blank",
-		Title:  title,
-		Status: status,
-		Code:   genericProblemCode(status),
-		Detail: msg,
+		Error:    msg,
+		Type:     "about:blank",
+		Title:    title,
+		Status:   status,
+		Code:     genericProblemCode(status),
+		Detail:   msg,
+		Instance: problemInstance(w),
 	})
+}
+
+// instanceWriter carries the RFC 9457 `instance` of one request: the
+// escaped request path the client sent, without the query (upstream's
+// example answers a bad ?cursor on GET /api/repos with `instance:
+// /api/repos`).
+type instanceWriter struct {
+	http.ResponseWriter
+	instance string
+}
+
+// Unwrap exposes the wrapped writer to http.ResponseController.
+func (w *instanceWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// withProblemInstance records the request path for writeErr. It must wrap
+// the whole handler: the /api/repos/{repo_name}/... aliases rewrite
+// r.URL.Path to the v1 path before they dispatch (alias.go), and `instance`
+// names the path the client sent.
+func withProblemInstance(next http.Handler) http.Handler {
+	assertf(next != nil, "withProblemInstance: nil handler")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&instanceWriter{ResponseWriter: w, instance: r.URL.EscapedPath()}, r)
+	})
+}
+
+// problemInstance finds the instanceWriter under w through the Unwrap
+// chain, the http.ResponseController convention that every writer wrapper
+// in this package follows. It returns "" (no `instance` member) when w was
+// not served through withProblemInstance, as in unit tests.
+func problemInstance(w http.ResponseWriter) string {
+	for {
+		switch t := w.(type) {
+		case *instanceWriter:
+			return t.instance
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		default:
+			return ""
+		}
+	}
 }
 
 // genericProblemCodes is upstream's generic per-status `code` table,

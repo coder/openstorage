@@ -240,5 +240,5 @@ func New(cfg Config) (http.Handler, error) {
 		mux.Handle("/", cfg.Fallback)
 	}
 
-	return recoverPanics(logger)(logRequests(logger)(mux)), nil
+	return withProblemInstance(recoverPanics(logger)(logRequests(logger)(mux))), nil
 }

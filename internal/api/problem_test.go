@@ -7,6 +7,7 @@ package api
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -119,12 +120,13 @@ func TestGenericProblemCodeFallback(t *testing.T) {
 // problemBody is the wire shape the tests expect. It is declared here, not
 // shared with the implementation, so the tests pin the JSON names.
 type problemBody struct {
-	Type   string `json:"type"`
-	Title  string `json:"title"`
-	Status int    `json:"status"`
-	Code   string `json:"code"`
-	Detail string `json:"detail"`
-	Error  string `json:"error"`
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Status   int    `json:"status"`
+	Code     string `json:"code"`
+	Detail   string `json:"detail"`
+	Error    string `json:"error"`
+	Instance string `json:"instance"`
 }
 
 // assertProblemFields checks the RFC 9457 fields of a plain-envelope error
@@ -169,6 +171,43 @@ func TestWriteErrProblemFields(t *testing.T) {
 	}
 }
 
+// TestProblemInstanceThroughWrappers: writeErr finds `instance` under the
+// package's writer wrappers (statusRecorder here) through Unwrap, including
+// the recovered-panic 500, and omits it without withProblemInstance.
+func TestProblemInstanceThroughWrappers(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	for _, tc := range []struct {
+		name string
+		h    http.HandlerFunc
+		want int
+	}{
+		{"writeErr", func(w http.ResponseWriter, _ *http.Request) { writeErr(w, http.StatusNotFound, "nope") }, http.StatusNotFound},
+		{"panic", func(http.ResponseWriter, *http.Request) { panic("boom") }, http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := withProblemInstance(recoverPanics(logger)(logRequests(logger)(tc.h)))
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/repos/team%2Fapp/branches?cursor=x", nil))
+			if rr.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rr.Code, tc.want)
+			}
+			assertProblemFields(t, rr.Code, rr.Body.Bytes())
+			var p problemBody
+			if err := json.Unmarshal(rr.Body.Bytes(), &p); err != nil {
+				t.Fatal(err)
+			}
+			if p.Instance != "/api/repos/team%2Fapp/branches" {
+				t.Fatalf("instance = %q, want the escaped path without the query", p.Instance)
+			}
+		})
+	}
+	rr := httptest.NewRecorder()
+	writeErr(rr, http.StatusNotFound, "nope")
+	if strings.Contains(rr.Body.String(), `"instance"`) {
+		t.Fatalf("body without withProblemInstance = %s, want no instance member", rr.Body)
+	}
+}
+
 // TestErrorBodiesCarryProblemFields exercises representative routes and
 // failure classes through the full server on both backends: the auth
 // middleware (401, 403), repo resolution (404), body validation (400), and
@@ -183,7 +222,11 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 	createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusCreated)
 	writeTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeRepoWrite}})
 	readTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeGitRead}})
-	missingTok := e.mint(t, tokenSpec{iss: org, repo: "pd-missing-" + randomHex(t, 4), scopes: []string{auth.ScopeGitRead}})
+	missing := "pd-missing-" + randomHex(t, 4)
+	missingTok := e.mint(t, tokenSpec{iss: org, repo: missing, scopes: []string{auth.ScopeGitRead}})
+	nested := "pd/missing-" + randomHex(t, 4)
+	nestedTok := e.mint(t, tokenSpec{iss: org, repo: nested, scopes: []string{auth.ScopeGitRead}})
+	nestedPath := "/api/repos/" + strings.ReplaceAll(nested, "/", "%2F") + "/branches"
 
 	for _, tc := range []struct {
 		name, method, path, token string
@@ -193,6 +236,13 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 		{"no token", http.MethodGet, "/api/v1/repo", "", nil, http.StatusUnauthorized},
 		{"missing scope", http.MethodGet, "/api/v1/repo", writeTok, nil, http.StatusForbidden},
 		{"repo not found", http.MethodGet, "/api/v1/repo", missingTok, nil, http.StatusNotFound},
+		// `instance` leaves out the query.
+		{"bad cursor", http.MethodGet, "/api/v1/repos/branches?cursor=%21%21", readTok, nil, http.StatusBadRequest},
+		// `instance` is the alias path the client sent, both for the
+		// alias's own repo lookup and after it dispatches to the v1 route.
+		{"alias repo not found", http.MethodGet, "/api/repos/" + missing + "/branches", missingTok, nil, http.StatusNotFound},
+		{"encoded alias name", http.MethodGet, nestedPath, nestedTok, nil, http.StatusNotFound},
+		{"alias bad cursor", http.MethodGet, "/api/repos/" + url + "/branches?cursor=%21%21", readTok, nil, http.StatusBadRequest},
 		{"invalid JSON", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{`), http.StatusBadRequest},
 		{"repo exists", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{"default_branch":"main"}`), http.StatusConflict},
 		{"read ok control", http.MethodGet, "/api/v1/repo", readTok, nil, http.StatusOK},
@@ -206,6 +256,13 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 				return
 			}
 			requireEnvelope(t, resp, body)
+			var p problemBody
+			if err := json.Unmarshal(body, &p); err != nil {
+				t.Fatal(err)
+			}
+			if want, _, _ := strings.Cut(tc.path, "?"); p.Instance != want {
+				t.Fatalf("instance = %q, want %q", p.Instance, want)
+			}
 		})
 	}
 }

@@ -438,7 +438,10 @@ func NewGitRateLimit(cfg RateLimitConfig) (func(http.Handler) http.Handler, erro
 			ok, retryAfter := l.admitReserve(l.clientKey(r), gitMinBurst)
 			if !ok {
 				rateLimited(w, retryAfter)
-				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+				// This limiter runs outside api.New, so it records
+				// `instance` itself. Only the 429 is wrapped: git
+				// responses pass through on the unwrapped writer.
+				writeErr(&instanceWriter{ResponseWriter: w, instance: r.URL.EscapedPath()}, http.StatusTooManyRequests, "rate limit exceeded")
 				return
 			}
 			next.ServeHTTP(w, r)

@@ -21,7 +21,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   notes refs 20.
 - **Errors**: `{"error": "<unstable human string>"}` + status code, with RFC 9457
   problem-details fields alongside `error`: `type` (`about:blank`), `title` (the status
-  text), `status`, `code`, and `detail` (same string as `error`). `code` is upstream's
+  text), `status`, `code`, `detail` (same string as `error`), and `instance` (the
+  escaped request path the client sent, without the query string; for a
+  `/api/repos/{repo_name}/...` alias, the alias path). `code` is upstream's
   generic code for the status (`bad_request`, `unauthorized`, `forbidden`, `not_found`,
   `conflict`, `unprocessable_entity`, `rate_limited`, `internal_error`,
   `service_unavailable`, …); open.storage emits none of upstream's specific codes such

@@ -34,7 +34,15 @@ func aliasRequireIdentical(t *testing.T, e *testEnv, method, aliasPath, v1Path, 
 	if act, vct := aliasResp.Header.Get("Content-Type"), v1Resp.Header.Get("Content-Type"); act != vct {
 		t.Errorf("%s %s Content-Type = %q, v1 = %q", method, aliasPath, act, vct)
 	}
-	if !bytes.Equal(aliasBody, v1Body) {
+	// Problem bodies differ only in `instance`, which names each request's
+	// own path (issue #352).
+	want := v1Body
+	if v1Resp.StatusCode >= 400 {
+		v1Inst, _ := json.Marshal(v1Resp.Request.URL.EscapedPath())
+		aliasInst, _ := json.Marshal(aliasResp.Request.URL.EscapedPath())
+		want = bytes.Replace(v1Body, []byte(`"instance":`+string(v1Inst)), []byte(`"instance":`+string(aliasInst)), 1)
+	}
+	if !bytes.Equal(aliasBody, want) {
 		t.Errorf("%s %s body != v1 body\nalias: %q\nv1:    %q", method, aliasPath, aliasBody, v1Body)
 	}
 }
