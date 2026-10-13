@@ -59,3 +59,4 @@ has moved on, the linked issues/PRs in each record's text are the trail.
 | ADR-48 | [Metrics ride an opt-in, separate listener with fixed labels](048-metrics-ride-an-opt-in-separate-listener-with-fixed-labels.md) | issue #325 |
 | ADR-49 | [Read-side git children run under one per-request budget](049-read-side-git-children-run-under-one-per-request-budget.md) | issue #313 |
 | ADR-50 | [Local scheduling state is row-owned](050-local-scheduling-state-is-row-owned.md) | issue #266 |
+| ADR-51 | [S3WAL metadata v2 is one versioned document, converted by a fenced command](051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md) (proposed) | issue #335 |
