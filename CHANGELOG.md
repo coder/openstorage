@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.18.0](https://github.com/coder/openstorage/compare/v0.17.0...v0.18.0) (2026-10-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sync:** a REST write or git push from a token whose ref policies carry any op no longer schedules the inbound upstream sync on PostgreSQL, or for REST writes on SQLite and S3WAL. The write stays local, and the repository converges on the next write, pull-upstream or push-upstream from a token without policy ops. In a mixed fleet, replicas on an older binary still schedule the sync for such writes until they are upgraded.
+
+### Features
+
+* **api:** add RFC 9457 instance to problem-details error bodies ([#420](https://github.com/coder/openstorage/issues/420)) ([6b23ae9](https://github.com/coder/openstorage/commit/6b23ae9f9b06f22e0f8260f8a9f269a6b945b362))
+* **api:** emit upstream's specific not-found and conflict problem codes ([#435](https://github.com/coder/openstorage/issues/435)) ([5cadc73](https://github.com/coder/openstorage/commit/5cadc73d849630a2ef3555792275177268e46b72))
+* **api:** emit upstream's specific problem codes from the central helpers ([#428](https://github.com/coder/openstorage/issues/428)) ([b14fa58](https://github.com/coder/openstorage/commit/b14fa588d162d7881fb34507046af822bcb73b6b))
+* **api:** pull-upstream finishes a pending sync create ([#432](https://github.com/coder/openstorage/issues/432)) ([deef8b1](https://github.com/coder/openstorage/commit/deef8b10c2f3a3ff9d2cc86a51dbe56108ec6bd0))
+
+
+### Bug Fixes
+
+* **deps:** bump Go toolchain to 1.27.2 for stdlib security fixes ([#434](https://github.com/coder/openstorage/issues/434)) ([04a3eea](https://github.com/coder/openstorage/commit/04a3eea2b54e1d4201bb57d15479b5157abe990d))
+* **jobs:** a PostgreSQL sync create completes only while its upstream is linked ([#423](https://github.com/coder/openstorage/issues/423)) ([c034b20](https://github.com/coder/openstorage/commit/c034b20ef9f80af73705b914c8cc7edbac1055d0))
+* **release:** keep release binaries' VCS stamp clean ([#415](https://github.com/coder/openstorage/issues/415)) ([3bd4897](https://github.com/coder/openstorage/commit/3bd4897d7f5c9c0b4d41e20b0fdfebe11345a7ea))
+* **s3wal:** restart a pull that crashed holding its claim ([#427](https://github.com/coder/openstorage/issues/427)) ([464c1c2](https://github.com/coder/openstorage/commit/464c1c2a7ceba485b578d2ed7e8419f7707d26eb))
+* **sync:** deny the implicit sync poke for ref-policy-restricted tokens ([#426](https://github.com/coder/openstorage/issues/426)) ([dacd7cd](https://github.com/coder/openstorage/commit/dacd7cd9076336565730311e1999f1e4c0400438))
+
 ## [0.17.0](https://github.com/coder/openstorage/compare/v0.16.0...v0.17.0) (2026-10-12)
 
 
