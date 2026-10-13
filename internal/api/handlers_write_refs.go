@@ -343,7 +343,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if baseSHA == "" {
-		writeErr(w, http.StatusNotFound, "base ref not found")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "base ref not found")
 		return
 	}
 	attempts := 1
@@ -479,7 +479,7 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 	}
 	cur, exists := refs[refName]
 	if !exists {
-		writeErr(w, http.StatusNotFound, "branch not found")
+		writeProblem(w, http.StatusNotFound, codeBranchNotFound, "branch not found")
 		return
 	}
 	deny, err := wrefPolicyCheck(mustClaims(r), refName, cur, ref.ZeroSHA, nil)
@@ -555,7 +555,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	sha, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
 	switch {
 	case errors.Is(err, gitread.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "ref does not resolve to a commit")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "ref does not resolve to a commit")
 		return
 	case err != nil:
 		s.internalErr(w, r, "resolve tag target", err)
@@ -618,7 +618,7 @@ func (s *server) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
 	}
 	cur, exists := refs[refName]
 	if !exists {
-		writeErr(w, http.StatusNotFound, "tag not found")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "tag not found")
 		return
 	}
 	deny, err := wrefPolicyCheck(mustClaims(r), refName, cur, ref.ZeroSHA, nil)

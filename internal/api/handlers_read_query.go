@@ -298,7 +298,7 @@ func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	}
 	target, err := gitread.ResolveRef(r.Context(), repoPath, refParam, refEphemeral)
 	if errors.Is(err, gitread.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "commit not found")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "commit not found")
 		return
 	} else if err != nil {
 		s.internalErr(w, r, "resolve diff ref", err)
@@ -311,7 +311,7 @@ func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	if baseParam := strings.TrimSpace(coreAliasParam(q, "base_ref", "baseSha")); baseParam != "" {
 		baseCommit, err := gitread.ResolveRef(r.Context(), repoPath, baseParam, baseEphemeral)
 		if errors.Is(err, gitread.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "base commit not found")
+			writeProblem(w, http.StatusNotFound, codeRefNotFound, "base commit not found")
 			return
 		} else if err != nil {
 			s.internalErr(w, r, "resolve diff base_ref", err)
@@ -400,7 +400,7 @@ func (s *server) handleBranchesDiff(w http.ResponseWriter, r *http.Request) {
 	}
 	branchSHA, err := gitread.ResolveRef(r.Context(), repoPath, branchParam, ephemeral)
 	if errors.Is(err, gitread.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "branch not found")
+		writeProblem(w, http.StatusNotFound, codeBranchNotFound, "branch not found")
 		return
 	} else if err != nil {
 		s.internalErr(w, r, "resolve diff branch", err)
@@ -412,7 +412,7 @@ func (s *server) handleBranchesDiff(w http.ResponseWriter, r *http.Request) {
 	}
 	baseSHA, err := gitread.ResolveRef(r.Context(), repoPath, baseName, ephemeralBase)
 	if errors.Is(err, gitread.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "base not found")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "base not found")
 		return
 	} else if err != nil {
 		s.internalErr(w, r, "resolve diff base", err)
@@ -508,7 +508,7 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 	}
 	commit, err := gitread.ResolveRef(r.Context(), repoPath, refName, ephemeral)
 	if errors.Is(err, gitread.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "ref not found")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "ref not found")
 		return
 	} else if err != nil {
 		s.internalErr(w, r, "resolve blame ref", err)
@@ -798,7 +798,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	} else {
 		commit, err = gitread.ResolveRef(r.Context(), repoPath, refName, body.Ephemeral)
 		if errors.Is(err, gitread.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "ref not found")
+			writeProblem(w, http.StatusNotFound, codeRefNotFound, "ref not found")
 			return
 		} else if err != nil {
 			s.internalErr(w, r, "resolve grep ref", err)
@@ -977,7 +977,7 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	commit, err := gitread.ResolveRef(r.Context(), repoPath, refName, false)
 	if errors.Is(err, gitread.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "ref not found")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "ref not found")
 		return
 	} else if err != nil {
 		s.internalErr(w, r, "resolve archive ref", err)
