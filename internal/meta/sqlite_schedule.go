@@ -10,8 +10,8 @@
 // a sweep derives "due now" from the rows (ListLocalWork), and a claim
 // (ClaimDue*) is the only admission gate.
 //
-// SQLite only: PG schedules through River, and S3WAL's frozen v1 metadata
-// format cannot take new fields without a format change (issue #335).
+// PG schedules through River. S3WAL implements the same transitions in
+// s3walmeta_schedule.go (metadata v2, ADR-51).
 
 package meta
 
@@ -24,7 +24,8 @@ import (
 )
 
 // LocalScheduleStore is the local serve process's durable schedule. It is
-// an optional interface (type-assert a Store): only *SQLite implements it.
+// an optional interface (type-assert a Store): only *SQLite implements it
+// on a Store today (the S3WAL transitions are not wired yet).
 type LocalScheduleStore interface {
 	// CompleteSyncRepoCreate marks a pending sync create complete and
 	// records its first-sync request in one write (issue #388).
