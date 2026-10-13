@@ -21,17 +21,12 @@ import (
 
 const schedLease = 16 * time.Minute
 
-// schedStore is a backend with the local schedule transitions these tests
-// drive, and a reader of the schedule fields.
+// schedStore is a backend with the local schedule and a reader of the
+// schedule fields.
 type schedStore interface {
 	Backend
 	EventingStore
-	RequestPushNow(ctx context.Context, repoID string, force bool) error
-	ClaimDuePush(ctx context.Context, repoID, holder string, lease time.Duration) (LocalClaim, error)
-	ClaimDueSync(ctx context.Context, repoID, holder string, lease time.Duration) (LocalClaim, error)
-	FinishPushOutcome(ctx context.Context, repoID, holder string, o PushOutcome) (RepoUpstream, error)
-	FinishSyncOutcome(ctx context.Context, repoID, holder string, o SyncOutcome) (RepoUpstream, error)
-	ListLocalWork(ctx context.Context, org, after string, limit int) ([]LocalWork, error)
+	LocalScheduleStore
 	readLocalSchedule(ctx context.Context, repoID string) (localSchedule, error)
 }
 

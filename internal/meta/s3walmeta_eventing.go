@@ -963,9 +963,14 @@ func (s *S3WAL) beginSync(ctx context.Context, repoID, holder string, lease time
 	if gerr != nil {
 		return LocalClaim{}, fmt.Errorf("begin sync for repo %q: claim revalidation: %w", repoID, gerr)
 	}
-	// The claim was stolen during the fence install, or the row is
-	// detaching: refused, and a thief's live claim is reported busy.
-	return LocalClaim{Up: fresh, Busy: fresh.Syncing}, nil
+	// The row is detaching: a due claim answers like the up-front check
+	// in fn (ErrNotFound); TryBeginSync keeps its plain refusal.
+	if detaching && requireDue {
+		return LocalClaim{}, fmt.Errorf("begin sync for repo %q: upstream detaching: %w", repoID, ErrNotFound)
+	}
+	// The claim was stolen during the fence install: refused, and the
+	// thief's live claim is reported busy.
+	return LocalClaim{Up: fresh, Busy: fresh.Syncing && fresh.SyncClaimHolder != holder}, nil
 }
 
 // rollbackSyncClaim undoes a just-committed claim after a failed fence

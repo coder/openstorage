@@ -947,9 +947,10 @@ func (s *S3WAL) CreateRepoWithState(ctx context.Context, org, url, defaultBranch
 }
 
 // CompleteRepoCreate marks a pending row complete (Store contract, issue
-// #388). Recovery class PRED: a rerun on a fresh snapshot after an
-// ambiguous PUT that landed answers CreateAlreadyComplete, which callers
-// treat as success, like a lost race against a concurrent completion.
+// #388). Recovery class PRED: an ambiguous PUT whose write is still the
+// latest answers CreateCompleted (writer nonce); one that landed and was
+// superseded reruns and answers CreateAlreadyComplete (or CreateDeleted),
+// which callers treat like a lost race against a concurrent completion.
 func (s *S3WAL) CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
 	assertf(repoID != "", "CompleteRepoCreate: empty repo id for org %q", org)
 	var out CreateOutcome
