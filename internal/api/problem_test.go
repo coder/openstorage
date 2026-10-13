@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -229,6 +230,18 @@ func expectedProblemCode(t *testing.T, status int, msg string) string {
 		code = "insufficient_scope"
 	case status == http.StatusBadRequest && msg == "repo_name must equal the JWT repo claim":
 		code = "repo_name_mismatch"
+	case status == http.StatusNotFound && (msg == "branch not found" ||
+		(strings.HasPrefix(msg, "source branch ") || strings.HasPrefix(msg, "target branch ")) && strings.HasSuffix(msg, " not found")):
+		code = "branch_not_found"
+	case status == http.StatusNotFound && slices.Contains([]string{"ref not found", "tag not found", "commit not found",
+		"base commit not found", "base not found", "base ref not found", "ref does not resolve to a commit"}, msg):
+		code = "ref_not_found"
+	case status == http.StatusNotFound && msg == "credential not found":
+		code = "credential_not_found"
+	case status == http.StatusConflict && msg == "credential already exists":
+		code = "credential_exists"
+	case status == http.StatusConflict && msg == "repository already deleted":
+		code = "repository_deleted"
 	}
 	if code != "" {
 		if got := upstreamSpecificCodes(t)[code]; got != status {
@@ -241,6 +254,20 @@ func expectedProblemCode(t *testing.T, status int, msg string) string {
 		t.Fatalf("status %d is not in upstream's generic table; add an explicit expectation", status)
 	}
 	return generic
+}
+
+// requireProblemCode asserts a plain problem body (requireEnvelope) with
+// exactly the given `code`.
+func requireProblemCode(t *testing.T, resp *http.Response, body []byte, want string) {
+	t.Helper()
+	requireEnvelope(t, resp, body)
+	var p problemBody
+	if err := json.Unmarshal(body, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Code != want {
+		t.Fatalf("code = %q, want %q (body %s)", p.Code, want, body)
+	}
 }
 
 // problemBody is the wire shape the tests expect. It is declared here, not
@@ -375,6 +402,11 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 		{"repo name mismatch", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{"repo_name":"pd-other"}`), http.StatusBadRequest, "repo_name_mismatch"},
 		// Other 403s keep the generic code.
 		{"org token on repo route", http.MethodGet, "/api/v1/repo", orgTok, nil, http.StatusForbidden, "forbidden"},
+		{"branch not found", http.MethodGet, "/api/v1/repos/branch?name=nope", readTok, nil, http.StatusNotFound, "branch_not_found"},
+		{"alias branch not found", http.MethodGet, "/api/repos/" + url + "/branch?name=nope", readTok, nil, http.StatusNotFound, "branch_not_found"},
+		{"ref not found", http.MethodGet, "/api/v1/repos/commit?ref=nope", readTok, nil, http.StatusNotFound, "ref_not_found"},
+		{"tag not found", http.MethodGet, "/api/v1/repos/tag?name=nope", readTok, nil, http.StatusNotFound, "ref_not_found"},
+		// "path not found" and similar keep the generic code.
 		{"read ok control", http.MethodGet, "/api/v1/repo", readTok, nil, http.StatusOK, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

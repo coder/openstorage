@@ -631,7 +631,7 @@ func (s *server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 		writeRepoNotFound(w)
 		return
 	case errors.Is(err, meta.ErrAlreadyDeleted):
-		writeErr(w, http.StatusConflict, "repository already deleted")
+		writeProblem(w, http.StatusConflict, codeRepositoryDeleted, "repository already deleted")
 		return
 	case err != nil:
 		s.internalErr(w, r, "delete repository", err)

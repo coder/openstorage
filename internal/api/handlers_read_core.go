@@ -322,7 +322,7 @@ func (s *server) handleGetBranch(w http.ResponseWriter, r *http.Request) {
 		}})
 		return
 	}
-	writeErr(w, http.StatusNotFound, "branch not found")
+	writeProblem(w, http.StatusNotFound, codeBranchNotFound, "branch not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +438,7 @@ func (s *server) handleGetTag(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeErr(w, http.StatusNotFound, "tag not found")
+	writeProblem(w, http.StatusNotFound, codeRefNotFound, "tag not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +541,7 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 		}
 		anchor, err = gitread.ResolveRef(r.Context(), repoPath, branch, ephemeral)
 		if errors.Is(err, gitread.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "branch not found")
+			writeProblem(w, http.StatusNotFound, codeBranchNotFound, "branch not found")
 			return
 		} else if err != nil {
 			s.internalErr(w, r, "resolve branch", err)
@@ -604,7 +604,7 @@ func (s *server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	sha, err := gitread.ResolveRef(r.Context(), repoPath, spec, false)
 	if errors.Is(err, gitread.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "commit not found")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "commit not found")
 		return
 	} else if err != nil {
 		s.internalErr(w, r, "resolve commit", err)
@@ -654,7 +654,7 @@ func (s *server) resolveFilesRequest(w http.ResponseWriter, r *http.Request, rep
 	if errors.Is(err, gitread.ErrNotFound) {
 		// Unknown ref and the unborn-branch case (fresh repo: the ref
 		// authority knows no such branch yet) — invariant 3: 404.
-		writeErr(w, http.StatusNotFound, "ref not found")
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "ref not found")
 		return "", "", "", false
 	} else if err != nil {
 		s.internalErr(w, r, "resolve ref", err)

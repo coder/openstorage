@@ -811,12 +811,12 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	sourceSHA, ok := tips[wcRefName(source, sourceEphemeral)]
 	if !ok {
-		writeErr(w, http.StatusNotFound, "source branch "+source+" not found")
+		writeProblem(w, http.StatusNotFound, codeBranchNotFound, "source branch "+source+" not found")
 		return
 	}
 	targetSHA, ok := tips[wcRefName(target, targetEphemeral)]
 	if !ok {
-		writeErr(w, http.StatusNotFound, "target branch "+target+" not found")
+		writeProblem(w, http.StatusNotFound, codeBranchNotFound, "target branch "+target+" not found")
 		return
 	}
 

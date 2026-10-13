@@ -161,7 +161,7 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 	})
 	switch {
 	case errors.Is(err, upsync.ErrCredentialExists):
-		writeErr(w, http.StatusConflict, "credential already exists")
+		writeProblem(w, http.StatusConflict, codeCredentialExists, "credential already exists")
 		return
 	case errors.Is(err, meta.ErrReservedSecret):
 		writeErr(w, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
@@ -190,7 +190,7 @@ func (s *syncServer) gcredForOrg(w http.ResponseWriter, r *http.Request, org, id
 	cred, err := s.creds.CredentialMeta(r.Context(), id)
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "credential not found")
+		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return upsync.Credential{}, false
 	case err != nil:
 		s.internalErr(w, r, "load credential", err)
@@ -199,7 +199,7 @@ func (s *syncServer) gcredForOrg(w http.ResponseWriter, r *http.Request, org, id
 	_, err = s.store.GetRepoByID(r.Context(), org, cred.RepoID)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "credential not found")
+		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return upsync.Credential{}, false
 	case err != nil:
 		s.internalErr(w, r, "resolve credential owner", err)
@@ -231,7 +231,7 @@ func (s *syncServer) handleUpdateCredential(w http.ResponseWriter, r *http.Reque
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
 		// Deleted between the ownership check and the update.
-		writeErr(w, http.StatusNotFound, "credential not found")
+		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return
 	case errors.Is(err, meta.ErrReservedSecret):
 		writeErr(w, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
@@ -268,7 +268,7 @@ func (s *syncServer) handleDeleteCredential(w http.ResponseWriter, r *http.Reque
 	err := s.creds.DeleteCredential(r.Context(), req.ID)
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "credential not found")
+		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return
 	case err != nil:
 		s.internalErr(w, r, "delete credential", err)

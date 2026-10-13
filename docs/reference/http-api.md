@@ -29,9 +29,12 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `service_unavailable`, …), except for these specific upstream codes:
   `repository_not_found` (404: the repository does not exist or the token cannot
   access it, including a fork's source repository), `insufficient_scope` (403: the
-  token, or a fork's `base_repo.auth.token`, lacks a required scope), and
+  token, or a fork's `base_repo.auth.token`, lacks a required scope),
   `repo_name_mismatch` (400: the create body's `repo_name` differs from the token's
-  `repo` claim). open.storage emits no other specific codes. As upstream advises, treat
+  `repo` claim), `branch_not_found` (404), `ref_not_found` (404: a ref, tag, or
+  revision does not resolve), `credential_not_found` (404), `credential_exists` (409),
+  and `repository_deleted` (409: the repository is already deleted). open.storage
+  emits no other specific codes. As upstream advises, treat
   an unknown code as the generic code for its status. Branch on the status code or
   `code`, not on the message.
   Upstream's 400 bodies can also carry `invalid_params` (`[{name, reason}]`, one item

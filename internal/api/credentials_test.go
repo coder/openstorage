@@ -93,11 +93,12 @@ func TestCredentialCreate(t *testing.T) {
 		gcredCreate(t, s, repoURL, repoID)
 
 		// Duplicate -> 409 (docs/reference/http-api.md: 409 = exists).
-		resp, _ = s.req(t, http.MethodPost, "/api/v1/repos/git-credentials", repoToken,
+		resp, body := s.req(t, http.MethodPost, "/api/v1/repos/git-credentials", repoToken,
 			[]byte(`{"repo_id":"`+repoID+`","password":"p2"}`))
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("duplicate: status %d, want 409", resp.StatusCode)
 		}
+		requireProblemCode(t, resp, body, "credential_exists")
 	})
 }
 
@@ -127,11 +128,12 @@ func TestCredentialUpdate(t *testing.T) {
 		}
 
 		// Missing/unknown id and validation failures.
-		resp, _ = s.req(t, http.MethodPut, "/api/v1/repos/git-credentials", orgToken,
+		resp, body := s.req(t, http.MethodPut, "/api/v1/repos/git-credentials", orgToken,
 			[]byte(`{"id":"ggc_0000000000000000","password":"p"}`))
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("unknown id: status %d, want 404", resp.StatusCode)
 		}
+		requireProblemCode(t, resp, body, "credential_not_found")
 		resp, _ = s.req(t, http.MethodPut, "/api/v1/repos/git-credentials", orgToken,
 			[]byte(`{"password":"p"}`))
 		if resp.StatusCode != http.StatusBadRequest {
@@ -193,11 +195,12 @@ func TestCredentialDelete(t *testing.T) {
 		}
 
 		// Second delete -> 404; missing id -> 400.
-		resp, _ = s.req(t, http.MethodDelete, "/api/v1/repos/git-credentials", orgToken,
+		resp, body := s.req(t, http.MethodDelete, "/api/v1/repos/git-credentials", orgToken,
 			[]byte(`{"id":"`+credID+`"}`))
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("second delete: status %d, want 404", resp.StatusCode)
 		}
+		requireProblemCode(t, resp, body, "credential_not_found")
 		resp, _ = s.req(t, http.MethodDelete, "/api/v1/repos/git-credentials", orgToken, []byte(`{}`))
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("missing id: status %d, want 400", resp.StatusCode)
