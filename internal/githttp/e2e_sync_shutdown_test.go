@@ -214,4 +214,29 @@ func TestSync_ShutdownKeepsInFlightPullRequest(t *testing.T) {
 	}
 	t.Cleanup(node2.stop)
 	waitForRepoMain(t, st, repo, head)
+
+	// The push hooks commit the ref store before receive-pack finishes in
+	// cacheDir: its local ref update, reference-transaction and
+	// post-receive hooks still run (issue #431). node2.stop's SIGKILL does
+	// not reach those git processes, so they kept writing while TempDir
+	// cleanup removed cacheDir. Wait for the run's terminal row, then stop
+	// node2 with SIGTERM: serve's drain waits for its in-flight receive-pack
+	// requests before it exits.
+	deadline = time.Now().Add(60 * time.Second)
+	for {
+		row, err := ms.GetRepoUpstream(t.Context(), repo)
+		if err == nil && !row.Syncing && !row.SyncPending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sync run never settled: row %+v, err %v", row, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if err := node2.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal node2: %v", err)
+	}
+	if err := waitNodeExit(t, node2, 60*time.Second); err != nil {
+		t.Fatalf("node2 did not exit cleanly on SIGTERM: %v", err)
+	}
 }
