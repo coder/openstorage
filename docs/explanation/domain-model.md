@@ -94,7 +94,9 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
     form) mirror an external provider (`github`, `gitlab`, `bitbucket`, `gitea`,
     `forgejo`, `codeberg`, `sr.ht`; self-hosted instances via `upstream.host` or
     `upstream_host`, credentials via git-credentials).
-    - Non-ephemeral ref mutations on synced repos schedule background sync.
+    - Non-ephemeral ref mutations on synced repos schedule background sync, unless the
+      writing token carries a ref-policy op (see
+      [Ref policies fail closed](../reference/http-api.md#upstream-sync)).
       `pull-upstream` returns 202 (async); `DELETE /repos/base` detaches idempotently.
     - The sync lifecycle emits `repo.sync.started/succeeded/failed` webhooks.
     - At most one sync run per repo is in flight. A `pull-upstream` accepted during a run

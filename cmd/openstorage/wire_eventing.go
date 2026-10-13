@@ -136,7 +136,7 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 // run's own loopback pushes carry the sync claim, which suppresses the
 // hook-side poke entirely (wireHookEventing).
 //
-// callerDenied gates the FORWARD reroute only (Codex rounds 3 + security
+// forwardDenied gates the FORWARD reroute (Codex rounds 3 + security
 // on #90): the forward publishes every local head and tag with the stored
 // upstream credential, so it must not be implicitly triggerable by (a) a
 // caller whose token carries ANY ref-policy op — one allowed to update
@@ -147,10 +147,16 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 // git:read scope); the poke matches it. The write itself was accepted and
 // stays local; convergence resumes on the next authorized trigger.
 // Deliberately NOT falling through to the pull poke: pulling now would
-// force-revert the write that was just accepted. The pull poke stays
-// ungated — documented invariant-11 behavior this slice does not change.
-func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string, callerDenied func(ctx context.Context) bool) func(ctx context.Context, repoID string) error {
-	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "" && callerDenied != nil,
+// force-revert the write that was just accepted.
+//
+// pullDenied gates the PULL poke (issue #421): the mirror force-updates
+// every head and tag through the unpoliced loopback token, so a caller
+// whose token carries ANY ref-policy op must not trigger it implicitly,
+// matching POST /repos/pull-upstream and the sync create. Pulling needs no
+// git:read. The write stays local until the next authorized trigger;
+// nothing polls the upstream.
+func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string, forwardDenied, pullDenied func(ctx context.Context) bool) func(ctx context.Context, repoID string) error {
+	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "" && forwardDenied != nil && pullDenied != nil,
 		"enqueueSyncOrForward: missing deps")
 	return func(ctx context.Context, repoID string) error {
 		up, err := ms.GetRepoUpstream(ctx, repoID)
@@ -161,7 +167,7 @@ func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(c
 			return err
 		}
 		if up.ForwardOnPush {
-			if callerDenied(ctx) {
+			if forwardDenied(ctx) {
 				return nil // fail closed: no implicit full-mirror publication (see doc)
 			}
 			if err := ms.RequestPush(ctx, repoID, false); err != nil {
@@ -174,6 +180,9 @@ func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(c
 		}
 		if up.Syncing {
 			return nil // run in flight (or our own loopback push): skip
+		}
+		if pullDenied(ctx) {
+			return nil // fail closed: no implicit unpoliced mirror (see doc)
 		}
 		return enqueuePull(ctx, upsync.Job{Org: org, RepoID: repoID})
 	}
@@ -191,22 +200,30 @@ func anyRefPolicyOps(policies []auth.RefPolicy) bool {
 	return false
 }
 
-// forwardDeniedFromContext resolves enqueueSyncOrForward's callerDenied
+// forwardDeniedFromContext resolves enqueueSyncOrForward's forwardDenied
 // for the serve process, whose ref mutations run under the request
 // context: the auth middleware injects the verified claims, and absent
 // claims mean a server-initiated write (import machinery, maintenance),
 // which is trusted by definition. A caller is denied when its token lacks
 // git:read (write-only tokens must not export the repo — see the
-// enqueueSyncOrForward doc) or carries any ref-policy op. A refs claim
-// that fails to parse counts as DENIED — a malformed policy must not
-// grant a broader implicit trigger than a parseable one.
+// enqueueSyncOrForward doc) or pullDeniedFromContext denies it.
 func forwardDeniedFromContext(ctx context.Context) bool {
 	claims, ok := auth.ClaimsFromContext(ctx)
 	if !ok {
 		return false
 	}
-	if !claims.HasScope(auth.ScopeGitRead) {
-		return true
+	return !claims.HasScope(auth.ScopeGitRead) || pullDeniedFromContext(ctx)
+}
+
+// pullDeniedFromContext resolves enqueueSyncOrForward's pullDenied for the
+// serve process: a caller is denied when its token carries any ref-policy
+// op. Absent claims are trusted, as in forwardDeniedFromContext. A refs
+// claim that fails to parse counts as DENIED — a malformed policy must not
+// grant a broader implicit trigger than a parseable one.
+func pullDeniedFromContext(ctx context.Context) bool {
+	claims, ok := auth.ClaimsFromContext(ctx)
+	if !ok {
+		return false
 	}
 	var policies []auth.RefPolicy
 	if len(claims.Refs) > 0 {
@@ -236,8 +253,8 @@ func hookCallerDeniedForward() bool {
 	return !slices.Contains(scopes, auth.ScopeGitRead) || hookCallerDeniedPull()
 }
 
-// hookCallerDeniedPull is the SQLite hook's pull gate, matching the
-// explicit pull API's ref-policy gate: a full mirror must not change refs
+// hookCallerDeniedPull is pullDeniedFromContext for the hook subprocess,
+// matching the explicit pull API's ref-policy gate: a full mirror must not change refs
 // on behalf of a restricted writer. Git HTTP already checked git:write;
 // unlike forwarding, pulling does not require read. Malformed values count
 // as denied.
@@ -387,7 +404,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			Repos:           ms,
 			Webhooks:        whStore,
 			EnqueueDelivery: queue.EnqueueWebhookDelivery,
-			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org, forwardDeniedFromContext),
+			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org, forwardDeniedFromContext, pullDeniedFromContext),
 			Logger:          logger,
 		})
 	}
@@ -487,9 +504,10 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		enqueueDelivery = q.EnqueueWebhookDelivery
 		// The hook subprocess serves exactly one push by one caller, so
 		// the denial verdict is a process-wide constant from its env.
-		denied := hookCallerDeniedForward()
+		denied, pullDenied := hookCallerDeniedForward(), hookCallerDeniedPull()
 		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org,
-			func(context.Context) bool { return denied })
+			func(context.Context) bool { return denied },
+			func(context.Context) bool { return pullDenied })
 	} else {
 		// Local mode: deliver synchronously (bounded) before hook exit.
 		deliverer := &events.Deliverer{
@@ -515,14 +533,12 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			denied, pullDenied := hookCallerDeniedForward(), hookCallerDeniedPull()
 			enqueueSync = enqueueSyncOrForward(ms,
 				func(ctx context.Context, job upsync.Job) error {
-					if pullDenied {
-						return nil // an allowed ref write cannot authorize an unpoliced mirror
-					}
 					return ms.RequestSync(ctx, job.RepoID)
 				},
 				// enqueueSyncOrForward already recorded RequestPush.
 				func(context.Context, upsync.Job) error { return nil }, org,
-				func(context.Context) bool { return denied })
+				func(context.Context) bool { return denied },
+				func(context.Context) bool { return pullDenied })
 		}
 		// S3WAL leaves enqueueSync nil: the documented gap (issue #335).
 	}
