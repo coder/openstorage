@@ -7,7 +7,14 @@
 // The transitions live on s3walLocalSchedule, not on *S3WAL, so that
 // *S3WAL does not satisfy LocalScheduleStore yet: serve type-asserts that
 // interface to choose the durable schedule, and the S3WAL worker, sweep and
-// shutdown restore are wired separately.
+// shutdown restore are wired separately (ADR-51 PR 3).
+//
+// Ambiguous PUTs: like FinishSync, the finish transitions classify a
+// superseded write by its effect. A thief that stole and finished an
+// expired claim can move the counters exactly as ours did, so either
+// verdict leaves the stored schedule correct; only the caller's report can
+// differ (success, ErrClaimLost or ErrNotFound). No outcome is ever applied
+// twice, because the holder guard fails once the claim is released.
 
 package meta
 
@@ -20,6 +27,8 @@ import (
 
 // s3walLocalSchedule is the S3WAL local schedule over s's document.
 type s3walLocalSchedule struct{ *S3WAL }
+
+var _ LocalScheduleStore = s3walLocalSchedule{}
 
 // readLocalSchedule reads one lane's schedule fields (tests and diagnostics).
 func (s s3walLocalSchedule) readLocalSchedule(ctx context.Context, repoID string) (localSchedule, error) {
@@ -34,6 +43,45 @@ func (s s3walLocalSchedule) readLocalSchedule(ctx context.Context, repoID string
 	sc := localSchedule{pushAttempt: u.PushAttempt, pushDue: u.PushDue, syncDue: u.SyncDue}
 	assertf(sc.pushAttempt >= 0 && sc.pushDue >= 0 && sc.syncDue >= 0, "corrupt schedule for %q: %+v", repoID, sc)
 	return sc, nil
+}
+
+// CompleteSyncRepoCreate is CompleteRepoCreate that also records the
+// first-sync request (sync_pending) in the same CAS. A complete or deleted
+// row records nothing; a pending row without an upstream is ErrNotFound and
+// stays pending. Recovery class PRED, as CompleteRepoCreate.
+func (s s3walLocalSchedule) CompleteSyncRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
+	assertf(repoID != "", "CompleteSyncRepoCreate: empty repo id for org %q", org)
+	var out CreateOutcome
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "complete sync repo create",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			out = 0
+			orgRow, err := lookupOrg(doc, org)
+			if err != nil {
+				return false, err
+			}
+			r := doc.Repos[repoID]
+			if r == nil || r.OrgID != orgRow.ID {
+				return false, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+			}
+			if r.DeletedAt != 0 || CreateState(r.CreateState) != CreateStatePending {
+				out, err = completeOutcome(r.toRepo(repoID))
+				return false, err
+			}
+			u := doc.Upstreams[repoID]
+			if u == nil || u.Detaching {
+				return false, fmt.Errorf("request first sync for repo %q: %w", repoID, ErrNotFound)
+			}
+			u.SyncPending = true
+			r.CreateState = int(CreateStateComplete)
+			out = CreateCompleted
+			return true, nil
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return out, nil
 }
 
 // RequestPushNow raises the pending level and makes it due now, keeping the
@@ -74,9 +122,11 @@ func (s s3walLocalSchedule) ClaimDueSync(ctx context.Context, repoID, holder str
 }
 
 // FinishPushOutcome ends holder's push run and schedules what follows in
-// the same CAS, as on SQLite. After an ambiguous PUT it reruns on the fresh
-// document: if the write landed, the guard no longer holds and the run
-// gets ErrNotFound (never a second application).
+// the same CAS, as on SQLite. Recovery class PRED: our claim still in place
+// means the write never landed; otherwise a run-counting outcome landed iff
+// the run and success counters and the attempt moved exactly as ours, and a
+// restore landed iff the lane is released with its level re-marked. A restore superseded by a new claim
+// reruns and reports ErrClaimLost or ErrNotFound, but its effect stands.
 func (s s3walLocalSchedule) FinishPushOutcome(ctx context.Context, repoID, holder string, o PushOutcome) (RepoUpstream, error) {
 	assertf(repoID != "", "FinishPushOutcome: empty repo id")
 	assertf(holder != "", "FinishPushOutcome: empty holder")
@@ -87,6 +137,7 @@ func (s s3walLocalSchedule) FinishPushOutcome(ctx context.Context, repoID, holde
 		level = 2
 	}
 	var up RepoUpstream
+	var prevRun, prevSuccess, prevAttempt int
 	err := s.mutate(ctx, s3walMetaMutation{
 		op: "finish push outcome",
 		fn: func(doc *s3walMetaDoc) (bool, error) {
@@ -94,6 +145,7 @@ func (s s3walLocalSchedule) FinishPushOutcome(ctx context.Context, repoID, holde
 			if err := laneHeld(repoID, u != nil && u.PushSyncing, func() string { return u.PushClaimHolder }, holder); err != nil {
 				return false, err
 			}
+			prevRun, prevSuccess, prevAttempt = u.PushRunCount, u.PushSuccessCount, u.PushAttempt
 			u.PushSyncing, u.PushClaimHolder, u.PushClaimExpiresAt, u.PushClaimForce = false, "", 0, false
 			switch o.Kind {
 			case OutcomeDone:
@@ -116,6 +168,18 @@ func (s s3walLocalSchedule) FinishPushOutcome(ctx context.Context, repoID, holde
 			up = u.toRepoUpstream(repoID)
 			return true, nil
 		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			u := doc.Upstreams[repoID]
+			switch {
+			case u == nil, u.PushSyncing && u.PushClaimHolder == holder:
+				return s3walMetaRerun
+			case o.Kind == OutcomeDone && u.PushRunCount == prevRun+1 && u.PushSuccessCount == prevSuccess+b2i(o.Success) && u.PushAttempt == 0,
+				o.Kind == OutcomeRetry && u.PushRunCount == prevRun+1 && u.PushSuccessCount == prevSuccess && u.PushAttempt == prevAttempt+1,
+				o.Kind == OutcomeRestore && !u.PushSyncing && u.PushPending >= level:
+				return s3walMetaApplied
+			}
+			return s3walMetaRerun
+		},
 	})
 	if err != nil {
 		return RepoUpstream{}, fmt.Errorf("finish push for repo %q: %w", repoID, err)
@@ -136,6 +200,7 @@ func (s s3walLocalSchedule) FinishSyncOutcome(ctx context.Context, repoID, holde
 	}
 	nowNanos, _ := s.nowNano()
 	var up RepoUpstream
+	var prevRun, prevSuccess int
 	err := s.mutate(ctx, s3walMetaMutation{
 		op: "finish sync outcome",
 		fn: func(doc *s3walMetaDoc) (bool, error) {
@@ -143,6 +208,7 @@ func (s s3walLocalSchedule) FinishSyncOutcome(ctx context.Context, repoID, holde
 			if err := laneHeld(repoID, u != nil && u.Syncing, func() string { return u.SyncClaimHolder }, holder); err != nil {
 				return false, err
 			}
+			prevRun, prevSuccess = u.RunCount, u.SuccessCount
 			u.Syncing, u.SyncClaimHolder, u.SyncClaimExpiresAt = false, "", 0
 			switch o.Kind {
 			case OutcomeDone:
@@ -156,6 +222,17 @@ func (s s3walLocalSchedule) FinishSyncOutcome(ctx context.Context, repoID, holde
 			}
 			up = u.toRepoUpstream(repoID)
 			return true, nil
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			u := doc.Upstreams[repoID]
+			switch {
+			case u == nil, u.Syncing && u.SyncClaimHolder == holder:
+				return s3walMetaRerun
+			case o.Kind == OutcomeDone && u.RunCount == prevRun+1 && u.SuccessCount == prevSuccess+b2i(o.Success),
+				o.Kind == OutcomeRestore && !u.Syncing && u.SyncPending:
+				return s3walMetaApplied
+			}
+			return s3walMetaRerun
 		},
 	})
 	if err != nil {
@@ -212,4 +289,11 @@ func (s s3walLocalSchedule) ListLocalWork(ctx context.Context, org, after string
 		work = work[:limit]
 	}
 	return work, nil
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
