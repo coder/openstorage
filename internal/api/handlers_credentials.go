@@ -47,6 +47,10 @@ type syncServer struct {
 	// policy; the sync worker's dial-time vetting proxy stays authoritative.
 	guard  events.TargetGuard
 	logger *slog.Logger // never nil
+
+	// firstSync is the queue's scheduler when it tracks create state
+	// (issue #388); nil on S3-WAL (#335), whose sync creates stay legacy.
+	firstSync upsync.FirstSyncScheduler
 }
 
 func newSyncServer(store meta.Store, creds upsync.CredentialStore, ups upsync.UpstreamStore, queue upsync.Queue, httpBaseURL string, guard events.TargetGuard, logger *slog.Logger) *syncServer {
@@ -56,7 +60,12 @@ func newSyncServer(store meta.Store, creds upsync.CredentialStore, ups upsync.Up
 	assertf(queue != nil, "newSyncServer: nil queue")
 	assertf(httpBaseURL != "", "newSyncServer: empty httpBaseURL")
 	assertf(logger != nil, "newSyncServer: nil logger")
+	firstSync, _ := queue.(upsync.FirstSyncScheduler)
+	if firstSync != nil && !firstSync.TracksCreateState() {
+		firstSync = nil
+	}
 	return &syncServer{
+		firstSync:   firstSync,
 		store:       store,
 		creds:       creds,
 		ups:         ups,

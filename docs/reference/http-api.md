@@ -89,7 +89,7 @@ about the endpoint's rollout status on upstream clusters.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 409 = a live repo holds the name; 404 = a deleted repo holds the name (below). |
+| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 409 = a live repo holds the name; 404 = a deleted repo holds the name; 503 = a sync create's first sync could not be scheduled (below). |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
@@ -148,6 +148,13 @@ about the endpoint's rollout status on upstream clusters.
   repo from a create that is still in progress, so a 200 could name a repo that the failing
   create then deletes. [#388](https://github.com/coder/openstorage/issues/388) tracks the fix.
 - A deleted repo keeps its name → **404**. Nothing is restored.
+- A sync create whose first sync cannot be scheduled → **503** with `Retry-After`. The repo
+  and its upstream link and credential exist, but the create is pending, and a repeat
+  create answers 409. `POST /repos/pull-upstream` finishes the create: it needs `git:write`
+  and a token without ref-policy ops, uses the stored link, and answers 202.
+- A pending sync create whose upstream link was removed (`DELETE /repos/base`) stays
+  pending: `pull-upstream` → 400. Only `DELETE /repos/delete` clears it (the name then
+  answers 404).
 
 **`PATCH /repo` rules:**
 
@@ -453,4 +460,4 @@ Other limits and gaps:
 | 412 | CAS precondition failed |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit ("unavailable" to ref-update clients) |
-| 5xx | internal/unavailable; 503 documented for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |
+| 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |
