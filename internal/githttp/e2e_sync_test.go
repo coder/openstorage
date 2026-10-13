@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // syncUpstream is a dumb-HTTP git upstream the serve nodes can fetch from.
@@ -108,12 +110,16 @@ func TestSync_LoopbackPushesSurviveLaterBoots(t *testing.T) {
 	up := newSyncUpstream(t)
 	head := up.commitAndPublish(t, "one")
 
+	// Fresh repo names per run: nodeA and the lane database outlive the
+	// test, so fixed names would collide under -count>1 (issue #429).
+	suffix := fmt.Sprint(time.Now().UnixNano())
+
 	// Boot the later node BEFORE nodeA does any sync work.
 	nodeB := startNodeT(t)
 
 	// The earlier-booted node must sync: create (first run) + explicit
 	// pull-upstream of a fresh upstream commit.
-	repoA := createSyncedRepo(t, nodeA, up, "sync-a")
+	repoA := createSyncedRepo(t, nodeA, up, "sync-a-"+suffix)
 	waitForMain(t, repoA, head)
 
 	// Deliberately NO wait for the create-triggered run's claim to clear
@@ -128,13 +134,24 @@ func TestSync_LoopbackPushesSurviveLaterBoots(t *testing.T) {
 	waitForMain(t, repoA, head)
 
 	// The later-booted node syncs too.
-	repoB := createSyncedRepo(t, nodeB, up, "sync-b")
+	repoB := createSyncedRepo(t, nodeB, up, "sync-b-"+suffix)
 	waitForMain(t, repoB, head)
 
 	// Loopback keys never reach the database: the org's registered keys
 	// are exactly the two configured file keys, no matter how many nodes
 	// have booted (issue #45's deleted-slot is gone entirely).
-	pems, err := testMeta.PublicKeysForOrg(context.Background(), testOrg)
+	//
+	// Read through a fresh handle, not testMeta (issue #429). On S3-WAL,
+	// PublicKeysForOrg answers from an in-memory snapshot. testMeta's
+	// snapshot dates from TestMain's secondOrg upsert, before nodeA
+	// registered testOrg, and picks up other processes' writes only on
+	// its 15s refresh. A new handle's first lookup reads the store.
+	ms, err := meta.Open(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ms.Close()
+	pems, err := ms.PublicKeysForOrg(t.Context(), testOrg)
 	if err != nil {
 		t.Fatal(err)
 	}
