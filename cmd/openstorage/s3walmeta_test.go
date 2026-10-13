@@ -108,3 +108,35 @@ func TestS3WALMetaConvertStopsOnLeaseLoss(t *testing.T) {
 		t.Fatalf("stored %s after lease loss", v)
 	}
 }
+
+// cancelGetCAS cancels the command's context during the metadata read, as
+// SIGINT does through signal.NotifyContext.
+type cancelGetCAS struct {
+	*s3wal.MemCAS
+	cancel context.CancelFunc
+}
+
+func (c *cancelGetCAS) Get(ctx context.Context, key string) (s3wal.Object, error) {
+	if key == s3walMetaTestKey {
+		c.cancel()
+	}
+	return c.MemCAS.Get(ctx, key)
+}
+
+// An interrupted conversion writes nothing and releases its lease, so serve
+// can start at once.
+func TestS3WALMetaConvertInterruptReleasesLease(t *testing.T) {
+	cas := newV1Bucket(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := runS3WALMetaConvert(ctx, &cancelGetCAS{MemCAS: cas, cancel: cancel}, 2, s3wal.LeaseConfig{}, &bytes.Buffer{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted convert = %v, want context.Canceled", err)
+	}
+	if v := storedVersion(t, cas); v != `{"v":1` {
+		t.Fatalf("stored %s after interrupt", v)
+	}
+	if _, err := cas.Get(context.Background(), s3wal.LeaseKey); !errors.Is(err, s3wal.ErrNotExist) {
+		t.Fatalf("lease after interrupt = %v, want released", err)
+	}
+}

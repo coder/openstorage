@@ -812,9 +812,11 @@ release first.
 
 1. Stop `serve` and wait for the process and its hook children to exit, as in upgrade
    step 1.
-2. Run `openstorage s3wal-meta convert --to 1` with the v2 binary. A held lease is handled
+2. Take a verified [stopped-node backup](backup-restore-s3wal.md). The conversion drops
+   the retry positions and create states, and the backup is the only way back to them.
+3. Run `openstorage s3wal-meta convert --to 1` with the v2 binary. A held lease is handled
    as in upgrade step 4.
-3. Replace the binary with the v1 release and start it.
+4. Replace the binary with the v1 release and start it.
 
 The downgrade keeps all data. It loses retry backoff positions, and every repository's
 create state reads legacy, so a repeat create answers 409.

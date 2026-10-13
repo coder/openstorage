@@ -177,6 +177,14 @@ func TestS3WALMetaConvertEdges(t *testing.T) {
 	if res, err := ConvertS3WALMeta(ctx, s3wal.NewMemCAS(), 2); err != nil || !res.Missing {
 		t.Fatalf("missing document = %+v, %v", res, err)
 	}
+	// Empty tables, which the encoder omits, still verify.
+	empty := s3wal.NewMemCAS()
+	if _, err := empty.Create(ctx, s3walMetaKey, []byte(`{"v":1,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[]}},"repos":{}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := ConvertS3WALMeta(ctx, empty, 2); err != nil || res.SeqAfter != 2 || res.After.Orgs != 1 {
+		t.Fatalf("empty-table document = %+v, %v", res, err)
+	}
 	cas := s3wal.NewMemCAS()
 	_, src := seedS3WALMetaClaim(t, cas)
 	cctx, cancel := context.WithCancel(ctx)

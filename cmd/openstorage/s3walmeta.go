@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/coder/openstorage/internal/envconfig"
@@ -31,6 +33,9 @@ func cmdS3WALMeta(ctx context.Context, args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("s3wal-meta convert: unexpected arguments %q", fs.Args())
+	}
 	if *to != 1 && *to != 2 {
 		return errors.New("--to must be 1 or 2")
 	}
@@ -41,6 +46,10 @@ func cmdS3WALMeta(ctx context.Context, args []string) error {
 	if !strings.HasPrefix(urls.dbURL, "s3wal://") {
 		return fmt.Errorf("s3wal-meta convert needs an s3wal:// database URL in %s", envPGURL[0])
 	}
+	// SIGINT/SIGTERM cancel the conversion, so the lease is released on
+	// the normal path instead of blocking serve until its TTL expires.
+	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	c, err := s3wal.Dial(ctx, urls.dbURL)
 	if err != nil {
 		return err
@@ -103,7 +112,7 @@ func convertOutcome(res meta.S3WALMetaConversion, err error) string {
 	if err != nil || res.Missing || res.From == res.To {
 		return "unchanged unless the write was in flight; run the command again"
 	}
-	return fmt.Sprintf("at version %d (seq %d)", res.To, res.SeqAfter)
+	return fmt.Sprintf("written at version %d (seq %d); run the command again to confirm", res.To, res.SeqAfter)
 }
 
 func formatS3WALMetaCounts(c meta.S3WALMetaCounts) string {
