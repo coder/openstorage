@@ -133,6 +133,21 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    summary records the index digest. The `verify-published` jobs then pull that
    digest on both platforms and repeat the checks and the smoke.
 
+3. After the `verify-published` jobs pass, update the quickstart pin. In
+   [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
+   set `OPENSTORAGE_IMAGE` to `ghcr.io/coder/openstorage:X.Y.Z@sha256:<index digest>`.
+   Copy the `Pin` line from the publish run summary, or read the index digest
+   (after `docker login ghcr.io`):
+
+   ```sh
+   docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z \
+     --format '{{json .Manifest}}' | jq -r .digest
+   ```
+
+   Keep the Docker-only row in the [README](../../README.md) and step 2 of the
+   [migration guide](migrate-to-openstorage.md) consistent with that pin, as
+   [#417](https://github.com/coder/openstorage/pull/417) did.
+
 > [!IMPORTANT]
 > GitHub creates a new package as **private**. By default it inherits this
 > repository's access: people who can read the repository can pull it after
