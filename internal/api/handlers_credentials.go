@@ -112,7 +112,7 @@ func gcredDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return false
 	}
 	return true

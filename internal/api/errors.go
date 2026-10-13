@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 )
 
@@ -43,6 +45,17 @@ type errorEnvelope struct {
 	Code     string `json:"code"`
 	Detail   string `json:"detail"`
 	Instance string `json:"instance,omitempty"`
+	// InvalidParams is upstream's ValidationProblemDetails member: only on
+	// a 400 for a request body, only when the server can name the field.
+	InvalidParams []invalidParam `json:"invalid_params,omitempty"`
+}
+
+// invalidParam is one item of upstream's `invalid_params` (InvalidParam):
+// the dotted wire path of one invalid request-body field, and the rule
+// that its value breaks.
+type invalidParam struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
 }
 
 // writeErr writes the plain error envelope with the given status and
@@ -56,7 +69,17 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 // errorEnvelope. code is the generic code for status, or a specific code
 // from specificProblemCodes whose upstream status is status.
 func writeProblem(w http.ResponseWriter, status int, code, msg string) {
+	writeProblemParams(w, status, code, msg, nil)
+}
+
+// writeProblemParams is writeProblem with `invalid_params`, which only a
+// 400 may carry.
+func writeProblemParams(w http.ResponseWriter, status int, code, msg string, params []invalidParam) {
 	assertf(status >= 400 && status < 600, "writeProblem called with non-error status %d", status)
+	assertf(len(params) == 0 || status == http.StatusBadRequest, "writeProblem: invalid_params on status %d", status)
+	for _, p := range params {
+		assertf(p.Name != "" && p.Reason != "", "writeProblem: incomplete invalid param %+v", p)
+	}
 	assertf(msg != "", "writeProblem called with empty message")
 	// RFC 9457 `title` is the status text, so only registered statuses are
 	// valid here (499 is never emitted: ADR-26).
@@ -71,14 +94,79 @@ func writeProblem(w http.ResponseWriter, status int, code, msg string) {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 	}
 	writeJSON(w, status, errorEnvelope{
-		Error:    msg,
-		Type:     "about:blank",
-		Title:    title,
-		Status:   status,
-		Code:     code,
-		Detail:   msg,
-		Instance: problemInstance(w),
+		Error:         msg,
+		Type:          "about:blank",
+		Title:         title,
+		Status:        status,
+		Code:          code,
+		Detail:        msg,
+		Instance:      problemInstance(w),
+		InvalidParams: params,
 	})
+}
+
+// writeInvalid writes the 400 for a request body that is not valid. msg
+// is the message; cause adds `invalid_params` when it names a field
+// (invalidParamsFor).
+func writeInvalid(w http.ResponseWriter, msg string, cause error) {
+	writeProblemParams(w, http.StatusBadRequest, genericProblemCode(http.StatusBadRequest), msg, invalidParamsFor(cause))
+}
+
+// fieldError is a request-body error that names one field. Error()
+// returns msg, the message the body already carries.
+type fieldError struct {
+	param invalidParam
+	msg   string
+}
+
+func (e *fieldError) Error() string { return e.msg }
+
+// newFieldError returns a fieldError for the field at the dotted wire path
+// name.
+func newFieldError(name, reason, msg string) *fieldError {
+	assertf(name != "" && reason != "" && msg != "", "newFieldError(%q, %q, %q): empty argument", name, reason, msg)
+	return &fieldError{param: invalidParam{Name: name, Reason: reason}, msg: msg}
+}
+
+// invalidParamsFor names the request-body field that err is about: a
+// *fieldError, or encoding/json's *UnmarshalTypeError with a field path
+// and a JSON kind. It returns nil when it cannot name one (syntax errors,
+// a wrong top-level type, encoding/json's unknown-field error, which has
+// no path): upstream then leaves `invalid_params` out.
+func invalidParamsFor(err error) []invalidParam {
+	if fe, ok := errors.AsType[*fieldError](err); ok {
+		return []invalidParam{fe.param}
+	}
+	if te, ok := errors.AsType[*json.UnmarshalTypeError](err); ok && te.Field != "" && te.Type != nil {
+		if kind := jsonKind(te.Type); kind != "" {
+			return []invalidParam{{Name: te.Field, Reason: "must be " + kind}}
+		}
+	}
+	return nil
+}
+
+// jsonKind names the JSON kind that Go type t decodes from, with its
+// article ("a string"), or "" when t accepts several kinds.
+func jsonKind(t reflect.Type) string {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "a boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "an integer"
+	case reflect.Float32, reflect.Float64:
+		return "a number"
+	case reflect.Struct, reflect.Map:
+		return "an object"
+	case reflect.Slice, reflect.Array:
+		return "an array"
+	}
+	return ""
 }
 
 // Specific problem codes open.storage emits, from the "Specific codes:"

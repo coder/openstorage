@@ -78,7 +78,7 @@ func wrefDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return false
 	}
 	return true
@@ -98,7 +98,7 @@ func wrefDecodeOptionalBody(w http.ResponseWriter, r *http.Request, dst any) boo
 		return true
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return false
 	}
 	return true
@@ -770,9 +770,10 @@ func strictJSON(body []byte, dst any) error {
 // fails the assertion below, so a schema that needs them must add the
 // recursion first (issue #381).
 func checkStrictObject(raw []byte, t reflect.Type, path string) error {
-	notObject := errors.New("body must be a JSON object")
+	var notObject error = errors.New("body must be a JSON object")
 	if path != "" {
-		notObject = fmt.Errorf("%s must be a JSON object", strings.TrimSuffix(path, "."))
+		name := strings.TrimSuffix(path, ".")
+		notObject = newFieldError(name, "must be a JSON object", name+" must be a JSON object")
 	}
 	fields := make(map[string]reflect.Type, t.NumField())
 	for i := range t.NumField() {
@@ -809,14 +810,14 @@ func checkStrictObject(raw []byte, t reflect.Type, path string) error {
 		}
 		ft, ok := fields[name]
 		if !ok {
-			return fmt.Errorf("unknown field %q", path+name)
+			return newFieldError(path+name, "is not a known field", fmt.Sprintf("unknown field %q", path+name))
 		}
 		if seen[name] {
-			return fmt.Errorf("duplicate field %q", path+name)
+			return newFieldError(path+name, "appears more than once", fmt.Sprintf("duplicate field %q", path+name))
 		}
 		seen[name] = true
 		if string(bytes.TrimSpace(v)) == "null" {
-			return fmt.Errorf("%s must not be null", path+name)
+			return newFieldError(path+name, "must not be null", path+name+" must not be null")
 		}
 		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
@@ -849,7 +850,7 @@ func wrefDecodeStrictBody(w http.ResponseWriter, r *http.Request, dst any) bool 
 		return false
 	}
 	if err := strictJSON(body, dst); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return false
 	}
 	return true

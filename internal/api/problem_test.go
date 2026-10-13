@@ -279,13 +279,189 @@ func requireProblemCode(t *testing.T, resp *http.Response, body []byte, want str
 // problemBody is the wire shape the tests expect. It is declared here, not
 // shared with the implementation, so the tests pin the JSON names.
 type problemBody struct {
-	Type     string `json:"type"`
-	Title    string `json:"title"`
-	Status   int    `json:"status"`
-	Code     string `json:"code"`
-	Detail   string `json:"detail"`
-	Error    string `json:"error"`
-	Instance string `json:"instance"`
+	Type          string `json:"type"`
+	Title         string `json:"title"`
+	Status        int    `json:"status"`
+	Code          string `json:"code"`
+	Detail        string `json:"detail"`
+	Error         string `json:"error"`
+	Instance      string `json:"instance"`
+	InvalidParams []struct {
+		Name   string `json:"name"`
+		Reason string `json:"reason"`
+	} `json:"invalid_params"`
+}
+
+// problemMembers is every member a plain problem body may carry:
+// ProblemDetails plus ValidationProblemDetails' invalid_params
+// (TestProblemMembersMatchUpstream pins it to the spec).
+var problemMembers = []string{"code", "detail", "error", "instance", "invalid_params", "status", "title", "type"}
+
+// upstreamSchemaProperties returns the property names of one schema under
+// components/schemas in the vendored spec, by indentation: the schema at
+// 4 spaces, "properties:" at 6, each property at 8.
+func upstreamSchemaProperties(t *testing.T, schema string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(upstreamSpecPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var props []string
+	inSchema, inProps := false, false
+	for l := range strings.SplitSeq(string(raw), "\n") {
+		indent := len(l) - len(strings.TrimLeft(l, " "))
+		switch {
+		case indent == 4 && strings.TrimSpace(l) == schema+":":
+			inSchema = true
+		case inSchema && indent <= 4 && strings.TrimSpace(l) != "":
+			inSchema, inProps = false, false
+		case inSchema && indent == 6:
+			inProps = strings.TrimSpace(l) == "properties:"
+		case inProps && indent == 8 && strings.HasSuffix(l, ":"):
+			props = append(props, strings.TrimSuffix(strings.TrimSpace(l), ":"))
+		}
+	}
+	if len(props) == 0 {
+		t.Fatalf("schema %s has no properties in %s", schema, upstreamSpecPath)
+	}
+	slices.Sort(props)
+	return props
+}
+
+// TestProblemMembersMatchUpstream pins the problem members and the
+// InvalidParam item to the spec, and the invalid_params example that
+// upstream documents for a type error.
+func TestProblemMembersMatchUpstream(t *testing.T) {
+	want := append(upstreamSchemaProperties(t, "ProblemDetails"), "invalid_params")
+	slices.Sort(want)
+	if !slices.Equal(want, problemMembers) {
+		t.Fatalf("problem members = %v, upstream ProblemDetails + invalid_params = %v", problemMembers, want)
+	}
+	if got := upstreamSchemaProperties(t, "InvalidParam"); !slices.Equal(got, []string{"name", "reason"}) {
+		t.Fatalf("InvalidParam properties = %v, want [name reason]", got)
+	}
+	raw, err := os.ReadFile(upstreamSpecPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "invalid_params:\n                  - name: default_branch\n                    reason: must be a string\n") {
+		t.Fatal("the spec no longer has the default_branch / must be a string invalid_params example")
+	}
+	type patch struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	err = json.Unmarshal([]byte(`{"default_branch":5}`), new(patch))
+	if got := invalidParamsFor(err); len(got) != 1 || got[0] != (invalidParam{Name: "default_branch", Reason: "must be a string"}) {
+		t.Fatalf("invalidParamsFor(%v) = %+v, want upstream's example", err, got)
+	}
+}
+
+// TestInvalidParamsFor covers each decode-failure class: the ones that
+// name a field, and the ones that cannot (no invalid_params upstream).
+func TestInvalidParamsFor(t *testing.T) {
+	type auth struct {
+		Token string `json:"token"`
+	}
+	type req struct {
+		Name  string            `json:"name"`
+		Force bool              `json:"force"`
+		Limit int               `json:"limit"`
+		Ratio float64           `json:"ratio"`
+		Auth  *auth             `json:"auth"`
+		Tags  []string          `json:"tags"`
+		Meta  map[string]string `json:"meta"`
+		Any   any               `json:"any"`
+	}
+	for _, tc := range []struct {
+		body, name, reason string
+	}{
+		{`{"name":1}`, "name", "must be a string"},
+		{`{"force":"yes"}`, "force", "must be a boolean"},
+		{`{"limit":"x"}`, "limit", "must be an integer"},
+		{`{"ratio":"x"}`, "ratio", "must be a number"},
+		{`{"auth":{"token":1}}`, "auth.token", "must be a string"},
+		{`{"auth":3}`, "auth", "must be an object"},
+		{`{"tags":"x"}`, "tags", "must be an array"},
+		{`{"meta":[]}`, "meta", "must be an object"},
+		{`[]`, "", ""},             // the body itself has the wrong type
+		{`{`, "", ""},              // syntax error
+		{`{"name":"a"} x`, "", ""}, // trailing data
+	} {
+		err := json.Unmarshal([]byte(tc.body), new(req))
+		if err == nil {
+			t.Fatalf("%s: decode succeeded", tc.body)
+		}
+		got := invalidParamsFor(err)
+		if tc.name == "" {
+			if got != nil {
+				t.Errorf("%s: invalidParamsFor = %+v, want none", tc.body, got)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0] != (invalidParam{Name: tc.name, Reason: tc.reason}) {
+			t.Errorf("%s: invalidParamsFor = %+v, want [{%s %s}]", tc.body, got, tc.name, tc.reason)
+		}
+	}
+	// encoding/json's unknown-field error has no path: no invalid_params.
+	dec := json.NewDecoder(strings.NewReader(`{"auth":{"x":1}}`))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(new(req)); err == nil || invalidParamsFor(err) != nil {
+		t.Errorf("DisallowUnknownFields error %v: invalidParamsFor = %+v, want none", err, invalidParamsFor(err))
+	}
+	if invalidParamsFor(nil) != nil {
+		t.Error("invalidParamsFor(nil) != nil")
+	}
+	// strictJSON names the member path, and keeps its message.
+	type strictReq struct {
+		Ref    string `json:"ref"`
+		Author *struct {
+			Name string `json:"name"`
+		} `json:"author"`
+	}
+	for _, tc := range []struct{ body, name, reason, msg string }{
+		{`{"ref":"a","x":1}`, "x", "is not a known field", `unknown field "x"`},
+		{`{"author":{"name":"a","x":1}}`, "author.x", "is not a known field", `unknown field "author.x"`},
+		{`{"ref":"a","ref":"b"}`, "ref", "appears more than once", `duplicate field "ref"`},
+		{`{"ref":null}`, "ref", "must not be null", "ref must not be null"},
+		{`{"author":3}`, "author", "must be a JSON object", "author must be a JSON object"},
+		{`{"ref":3}`, "ref", "must be a string", ""},
+	} {
+		err := strictJSON([]byte(tc.body), new(strictReq))
+		if err == nil {
+			t.Fatalf("%s: strictJSON succeeded", tc.body)
+		}
+		if tc.msg != "" && err.Error() != tc.msg {
+			t.Errorf("%s: message = %q, want %q (unchanged)", tc.body, err, tc.msg)
+		}
+		if got := invalidParamsFor(err); len(got) != 1 || got[0] != (invalidParam{Name: tc.name, Reason: tc.reason}) {
+			t.Errorf("%s: invalidParamsFor = %+v, want [{%s %s}]", tc.body, got, tc.name, tc.reason)
+		}
+	}
+	if err := strictJSON([]byte(`[]`), new(strictReq)); err == nil || invalidParamsFor(err) != nil {
+		t.Errorf("non-object body: %v, invalidParamsFor = %+v, want none", err, invalidParamsFor(err))
+	}
+}
+
+// TestWriteProblemInvalidParamsAssertions: invalid_params only on a 400,
+// and only with complete items.
+func TestWriteProblemInvalidParamsAssertions(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		params []invalidParam
+	}{
+		{http.StatusConflict, []invalidParam{{"a", "b"}}},
+		{http.StatusBadRequest, []invalidParam{{"", "b"}}},
+		{http.StatusBadRequest, []invalidParam{{"a", ""}}},
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("writeProblemParams(%d, %+v) did not panic", tc.status, tc.params)
+				}
+			}()
+			writeProblemParams(httptest.NewRecorder(), tc.status, genericProblemCode(tc.status), "boom", tc.params)
+		}()
+	}
 }
 
 // assertProblemFields checks the RFC 9457 fields of a plain-envelope error
@@ -305,6 +481,25 @@ func assertProblemFields(t *testing.T, status int, body []byte) string {
 	}
 	if p.Error == "" || p.Detail != p.Error {
 		t.Fatalf("detail = %q, error = %q: want equal and non-empty (body %s)", p.Detail, p.Error, body)
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		t.Fatal(err)
+	}
+	for m := range members {
+		if !slices.Contains(problemMembers, m) {
+			t.Fatalf("problem body has member %q outside upstream's schema (body %s)", m, body)
+		}
+	}
+	if raw, ok := members["invalid_params"]; ok {
+		if status != http.StatusBadRequest || len(p.InvalidParams) == 0 || string(raw) == "null" {
+			t.Fatalf("invalid_params on status %d must be a non-empty list on a 400 (body %s)", status, body)
+		}
+		for _, ip := range p.InvalidParams {
+			if ip.Name == "" || ip.Reason == "" {
+				t.Fatalf("incomplete invalid_params item %+v (body %s)", ip, body)
+			}
+		}
 	}
 	return p.Error
 }
@@ -437,6 +632,62 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 			}
 			if p.Code != tc.code {
 				t.Fatalf("code = %q, want %q (body %s)", p.Code, tc.code, body)
+			}
+		})
+	}
+}
+
+// TestInvalidParamsOnBodyFailures: request-body decode failures name the
+// field in invalid_params through the full server on both backends; the
+// failures that cannot name one leave the member out.
+func TestInvalidParamsOnBodyFailures(t *testing.T) {
+	runBackends(t, testInvalidParamsOnBodyFailures)
+}
+
+func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
+	org := e.newOrg(t)
+	url := "ip-" + randomHex(t, 4)
+	createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusCreated)
+	repoTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeRepoWrite}})
+	gitTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite}})
+	freshTok := e.mint(t, tokenSpec{iss: org, repo: "ip-fresh-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
+
+	type param struct{ name, reason string }
+	for _, tc := range []struct {
+		name, method, path, token string
+		body                      string
+		want                      *param // nil: no invalid_params
+	}{
+		// Upstream's own example (PATCH /repos, ValidationProblemDetails).
+		{"patch type error", http.MethodPatch, "/api/v1/repo", repoTok, `{"default_branch":5}`, &param{"default_branch", "must be a string"}},
+		{"alias patch type error", http.MethodPatch, "/api/repos/" + url, repoTok, `{"default_branch":5}`, &param{"default_branch", "must be a string"}},
+		{"create type error", http.MethodPost, "/api/v1/repos", freshTok, `{"default_branch":true}`, &param{"default_branch", "must be a string"}},
+		{"create branch type error", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":"x","force":"yes"}`, &param{"force", "must be a boolean"}},
+		{"strict unknown field", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"sha":"main","note":"n","bogus":1}`, &param{"bogus", "is not a known field"}},
+		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, nil},
+		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(tc.body), "")
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, body)
+			}
+			requireEnvelope(t, resp, body)
+			var p problemBody
+			if err := json.Unmarshal(body, &p); err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == nil {
+				if strings.Contains(string(body), `"invalid_params"`) {
+					t.Fatalf("body %s has invalid_params, want none", body)
+				}
+				return
+			}
+			if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != tc.want.name || p.InvalidParams[0].Reason != tc.want.reason {
+				t.Fatalf("invalid_params = %+v, want [{%s %s}] (body %s)", p.InvalidParams, tc.want.name, tc.want.reason, body)
+			}
+			if !strings.HasPrefix(p.Error, "invalid JSON body: ") {
+				t.Fatalf("error = %q, want the unchanged decode message", p.Error)
 			}
 		})
 	}

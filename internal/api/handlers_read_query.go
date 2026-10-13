@@ -700,7 +700,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	}
 	var body grepRequestBody
 	if err := json.Unmarshal(raw, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}
 	pattern := body.Query.Pattern
@@ -935,7 +935,7 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	var body archiveRequestBody
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &body); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 			return
 		}
 	}
