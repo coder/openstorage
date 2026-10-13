@@ -12,11 +12,11 @@
 // — ErrSignedURLUnsupported). With real AWS credentials and an existing
 // bucket the same tests run against real S3 unchanged.
 //
-// Known Floci gaps (re-probed on stable 2.1.0, the digest-pinned
-// s3waltest.FlociImage, in issue #274) — do NOT add tests here that
-// require IAM policy evaluation on S3 actions (Deny policies are not
-// enforced, issue #48 stays mock-covered) or x-amz-expected-bucket-owner
-// enforcement (the header is ignored, issue #58 stays seam-covered).
+// Known Floci gaps (re-probed on stable 2.2.0, the digest-pinned
+// s3waltest.FlociImage) — do NOT add tests here that require IAM policy
+// evaluation on S3 actions (Deny policies are not enforced, issue #48
+// stays mock-covered) or x-amz-expected-bucket-owner enforcement (the
+// header is ignored, issue #58 stays seam-covered).
 package blob
 
 import (

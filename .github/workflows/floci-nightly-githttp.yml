@@ -4,14 +4,14 @@
 # floci/floci — booted with FLOCI_SERVICES_S3_ENFORCE_AUTH=true — through the
 # test-only OPENSTORAGE_TEST_S3_ENDPOINT override in the suite's TestMain.
 # Credentials come from a real chain no other lane exercises: IAM
-# CreateAccessKey → STS AssumeRole → session credentials. Release 2.1.0
-# rejects wrong header-auth secrets and missing, forged, or mismatched
-# temporary-session tokens in the #274 GetObject probes. This lane runs
-# the whole Git/LFS surface on those temporary credentials, including
+# CreateAccessKey → STS AssumeRole → session credentials. Releases 2.1.0
+# and 2.2.0 reject wrong header-auth secrets and missing, forged, or
+# mismatched temporary-session tokens in the GetObject probes. This lane
+# runs the whole Git/LFS surface on those temporary credentials, including
 # AWS_SESSION_TOKEN plumbing (env → SDK → serve children).
-# The per-PR blob store stays SeaweedFS. Floci still ignores conditional
-# DELETE and expected-owner headers, and an explicit IAM Deny s3:GetObject
-# does not deny reads. See docs/reference/testing.md for the scoped probes.
+# The per-PR blob store stays SeaweedFS. Floci still ignores expected-owner
+# headers, and an explicit IAM Deny s3:GetObject does not deny reads.
+# See docs/reference/testing.md for the scoped probes.
 # Neither lane qualifies Floci for S3WAL authority.
 # Local repro: docs/reference/testing.md (The Floci githttp E2E lane).
 name: floci-nightly-githttp
@@ -38,12 +38,12 @@ jobs:
       - run: git lfs version
       - name: boot floci
         # Keep this OCI index digest in sync with s3waltest.FlociImage and
-        # floci-nightly.yml. Release 2.1.0 passed the baseline/candidate
-        # qualification and credential lanes before adoption (#274).
+        # floci-nightly.yml. Release 2.2.0 passed the baseline/candidate
+        # qualification and credential lanes before adoption.
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-            floci/floci:2.1.0@sha256:f5aa8c18302cedb4f2385f5c4e455b3efc77fee6bf7b6e5d1712b2817ba102db
+            floci/floci:2.2.0@sha256:e97cd0c1dc2aa14e7697fb5ef5018404c4d6345169dbd276315f0bed2c7b0520
           for i in $(seq 1 60); do
             if curl -s -o /dev/null http://127.0.0.1:4566/; then
               echo "floci ready after ${i}s"
@@ -56,9 +56,10 @@ jobs:
           exit 1
       - name: provision IAM user + role, assume role via STS
         # The IAM/STS control plane accepts any credentials; only the S3 data
-        # plane enforces auth, and it only honors keys minted through
-        # IAM/STS. The suite runs on the SESSION credentials from AssumeRole,
-        # not the long-lived user key.
+        # plane enforces auth. It honors keys minted through IAM/STS (plus
+        # Floci's built-in test key, which this lane never uses). The suite
+        # runs on the SESSION credentials from AssumeRole, not the
+        # long-lived user key.
         env:
           AWS_ACCESS_KEY_ID: root
           AWS_SECRET_ACCESS_KEY: root

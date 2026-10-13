@@ -8,10 +8,11 @@
 // mode — the pinned build passes them all now that upstream fixed the
 // torn-read bug (floci-io/floci#2874), so a regression in either Floci or
 // s3wal's own S3 usage fails the test. delete-if-match stays a RECORD-mode
-// finding: the pin still ignores the condition (issue #201), and s3wal
-// never depends on it (ADR-46). Like the SeaweedFS and MinIO lanes, this
-// test is gated only by -short, so it runs wherever `go test ./...` runs —
-// the per-PR `test` job included, as the record-mode row already did.
+// row: Floci ignored the condition through 2.1.0 (issue #201) and 2.2.0
+// honors it, but s3wal never depends on it (ADR-46). Like the SeaweedFS
+// and MinIO lanes, this test is gated only by -short, so it runs wherever
+// `go test ./...` runs — the per-PR `test` job included, as the
+// record-mode row already did.
 // This is second-implementation regression armor only; it is not
 // promotion evidence for the s3wal backend (#192), whose gates
 // (docs/how-to/deploy-production.md) are unchanged by anything here.
@@ -62,9 +63,9 @@ func TestQualifyFloci(t *testing.T) {
 // AWS honors the condition on general-purpose buckets: mismatched If-Match
 // ⇒ 412 and the object survives; matched If-Match ⇒ deleted. The
 // corruption-class divergence is silently deleting on a mismatch (legacy
-// MinIO; Floci through 2.0.1 and nightly-09012026 — issue #201). s3wal
-// deliberately never uses conditional DELETE as a guard (ADR-46), so this
-// surface is a matrix row, not a design dependency.
+// MinIO; Floci through 2.1.0 — issue #201). s3wal deliberately never
+// uses conditional DELETE as a guard (ADR-46), so this surface is a
+// matrix row, not a design dependency.
 func surfaceDeleteIfMatch(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
 	const name = "delete-if-match"
