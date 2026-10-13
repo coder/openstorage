@@ -30,10 +30,11 @@ func TestS3WALMetaDecode(t *testing.T) {
 	const fields = `"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`
 	for _, tc := range []struct{ name, body, wantErr string }{
 		{"malformed JSON", `{`, "s3walmeta: document decode:"},
-		{"missing version", `{` + fields, "s3walmeta: document version 0 unsupported (want 1)"},
-		{"zero version", `{"v":0,` + fields, "s3walmeta: document version 0 unsupported (want 1)"},
-		{"foreign version", `{"v":2,` + fields, "s3walmeta: document version 2 unsupported (want 1)"},
-		{"valid v1", `{"v":1,` + fields, ""},
+		{"missing version", `{` + fields, "s3walmeta: document version 0 unsupported (want 2)"},
+		{"zero version", `{"v":0,` + fields, "s3walmeta: document version 0 unsupported (want 2)"},
+		{"v1 needs conversion", `{"v":1,` + fields, "s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2`"},
+		{"foreign version", `{"v":3,` + fields, "s3walmeta: document version 3 unsupported (want 2)"},
+		{"valid v2", `{"v":2,` + fields, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			doc, err := decodeS3WALMetaDoc([]byte(tc.body))
@@ -49,8 +50,8 @@ func TestS3WALMetaDecode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if doc == nil || doc.V != 1 || doc.Seq != 1 || doc.Writer != "0123456789abcdef0123456789abcdef" || doc.NextOrgID != 0 || doc.NextKeyID != 0 {
-				t.Fatalf("decoded document = %+v, want the valid v1 control", doc)
+			if doc == nil || doc.V != 2 || doc.Seq != 1 || doc.Writer != "0123456789abcdef0123456789abcdef" || doc.NextOrgID != 0 || doc.NextKeyID != 0 {
+				t.Fatalf("decoded document = %+v, want the valid v2 control", doc)
 			}
 		})
 	}

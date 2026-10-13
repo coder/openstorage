@@ -191,7 +191,7 @@ cmp source-before.json backup.json
    enqueue work at boot, and later writes can deliver restored webhooks.
 2. **Use the exact saved binary and configuration**, with both storage URLs and owner
    settings pointed at the restore bucket and an empty cache directory. This is not
-   an upgrade/downgrade: `v: 1` in the JSON does not make an older binary safe
+   an upgrade/downgrade: the `v` version in the JSON does not make another binary safe
    (cross-release compatibility is a #192 gate). Keep the backup immutable while
    investigating a failed recovery.
 3. **Verify, copy, and verify again, before any serve process starts:**
