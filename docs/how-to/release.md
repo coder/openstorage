@@ -135,7 +135,11 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
-   set `OPENSTORAGE_IMAGE` to `ghcr.io/coder/openstorage:X.Y.Z@sha256:<index digest>`.
+   change both places that name the image:
+
+   - the sentence "Version `X.Y.Z` is published for ..." (version and platforms)
+   - the `export OPENSTORAGE_IMAGE=ghcr.io/coder/openstorage:X.Y.Z@sha256:<index digest>` line
+
    Copy the `Pin` line from the publish run summary, or read the index digest
    (after `docker login ghcr.io`):
 
@@ -146,7 +150,14 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 
    Keep the Docker-only row in the [README](../../README.md) and step 2 of the
    [migration guide](migrate-to-openstorage.md) consistent with that pin, as
-   [#417](https://github.com/coder/openstorage/pull/417) did.
+   [#417](https://github.com/coder/openstorage/pull/417) did. Neither names a
+   version or digest. To confirm no other copy remains, run:
+
+   ```sh
+   git grep -nE 'openstorage:[0-9]|is published for' -- README.md docs ':!docs/how-to/release.md'
+   ```
+
+   It must list only the two Option A lines, both with the new version.
 
 > [!IMPORTANT]
 > GitHub creates a new package as **private**. By default it inherits this
