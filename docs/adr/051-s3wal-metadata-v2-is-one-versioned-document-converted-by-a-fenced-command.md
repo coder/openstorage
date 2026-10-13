@@ -137,7 +137,8 @@ binary reads v2. Conversion between v1 and v2 is an explicit, fenced command
   v1 binaries built after [#427](https://github.com/coder/openstorage/pull/427)
   list such lanes at boot and set `sync_pending` again before they claim
   anything. v0.16.0 and v0.17.0 list pull lanes only by `sync_pending`, so
-  they never run that pull. `--to 1` therefore sets `sync_pending` on every
+  they do not restart that pull at boot. It waits for the next push, poll or
+  explicit `pull-upstream` request. `--to 1` therefore sets `sync_pending` on every
   lane with `syncing = true`, which is the #427 boot step done ahead of
   time. Every supported v1 target then runs the pull once the dead claim
   expires. The push lane needs no change: every v1 release lists
@@ -235,9 +236,10 @@ fields under `v: 1`.
      encoder and a recovery read that decodes both versions: `mutate`
      cannot serve here, because its recovery read rejects every version but
      the binary's own. An ambiguous PUT resolves through the writer nonce.
-   - It compares the decoded tables of the source and the result, apart
-     from the four fields, `v`, `seq` and `writer`. It reports a mismatch
-     and exits non-zero. It prints the version, `seq`, and row counts per
+   - It compares the decoded result with the expected document: the source
+     with the conversion applied (for `--to 1`, the four fields dropped and
+     `sync_pending` set on every lane with `syncing = true`), apart from
+     `seq` and `writer`. It reports a mismatch and exits non-zero. It prints the version, `seq`, and row counts per
      table for both documents.
    - Re-running it on a document already at the target version changes
      nothing and exits 0.
@@ -255,12 +257,15 @@ fields under `v: 1`.
 6. **Create state before #388 resumes.** S3WAL writes a create state only
    where an S3WAL completion path exists. `CreateRepoWithState` stores the
    requested state (today only plain creates call it, with `complete`), and
-   `CompleteRepoCreate` stores `complete`. `CreateLinkedRepo` inserts
-   legacy rows until S3WAL implements `CompleteSyncRepoCreate` (PR 3), so no
-   S3WAL row stays pending without a way to finish. From PR 3 on, S3WAL
-   follows the SQL backends: a sync create is pending until its first sync
-   is recorded, and `pull-upstream` can finish it
-   ([#432](https://github.com/coder/openstorage/pull/432)).
+   `CompleteRepoCreate` stores `complete`. The API calls `CreateLinkedRepo`
+   only when the queue tracks create state (`TracksCreateState`), which
+   `jobs.Local` reports as false on S3WAL until PR 3. PR 2 implements
+   `CompleteSyncRepoCreate` on S3WAL with no callers. PR 3 makes
+   `TracksCreateState` true on S3WAL, and from then on S3WAL follows the SQL
+   backends: a sync create is pending until its first sync is recorded, and
+   `pull-upstream` can finish it
+   ([#432](https://github.com/coder/openstorage/pull/432)). No S3WAL row is
+   pending without a way to finish.
 
 Reasons:
 
@@ -356,10 +361,12 @@ Tests are listed with the PR that adds them.
    - The command ignores `OPENSTORAGE_S3WAL_LEASE_TTL=0`. It stops before its
      write when a lease renewal fails.
    - `--to 1` sets `sync_pending` on a lane whose pull claim is set. The
-     official v0.17.0 binary then runs that pull after the claim expires.
+     official v0.16.0 binary and the latest v1 release then each run that
+     pull after the claim expires.
 3. **Zero-value rule (PR 1).**
    - Property test: for random v2 documents d, `to2(to1(d))` equals d with
-     the four fields cleared.
+     the four fields cleared and `sync_pending` set on every lane with
+     `syncing = true`.
    - The cleared document behaves as v1: rows are legacy (repeat create 409),
      and lanes are due now at attempt 0.
    - Behavior, not only data: a document with a live claim, an expired
@@ -393,13 +400,14 @@ Tests are listed with the PR that adds them.
 
 ## Delivery
 
-Each PR has at most 500 changed lines.
+Each PR has at most 500 changed lines. A planned PR that exceeds the limit
+lands as several PRs in the same order.
 
 1. v2 codec, conversion command, zero-value tests, release-pair extension,
    and the operator procedure in `storage-engine.md`, `deploy-production.md`
    and `backup-restore-s3wal.md`. S3WAL stores create states as in
-   decision item 6. The API keeps answering 409 for S3WAL until #388
-   resumes.
+   decision item 6. Repeat creates on S3WAL keep answering 409 until #388
+   adds the 200 answer for every backend.
 2. `meta.LocalScheduleStore` on `*meta.S3WAL`, with no callers.
 3. The S3WAL worker on the sweep, and shutdown `restore` (#343).
 4. Hook marking on S3WAL, the census update, and the wire-compatibility row.
