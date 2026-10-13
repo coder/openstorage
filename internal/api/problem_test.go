@@ -7,6 +7,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -239,8 +240,9 @@ func expectedProblemCodes(t *testing.T, status int, msg string) []string {
 	case status == http.StatusNotFound &&
 		(strings.HasPrefix(msg, "source branch ") || strings.HasPrefix(msg, "target branch ")) && strings.HasSuffix(msg, " not found"):
 		code = "branch_not_found"
-	case status == http.StatusNotFound && slices.Contains([]string{"ref not found", "tag not found", "commit not found",
-		"base commit not found", "base not found", "base ref not found", "ref does not resolve to a commit"}, msg):
+	case status == http.StatusNotFound && (slices.Contains([]string{"ref not found", "tag not found", "commit not found",
+		"base commit not found", "base not found", "base ref not found", "ref does not resolve to a commit"}, msg) ||
+		strings.HasPrefix(msg, "object_ref does not resolve to a commit: ")):
 		code = "ref_not_found"
 	case status == http.StatusNotFound && msg == "credential not found":
 		code = "credential_not_found"
@@ -731,6 +733,91 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			}
 			if !strings.HasPrefix(p.Error, "invalid ") {
 				t.Fatalf("error = %q, want the unchanged decode message", p.Error)
+			}
+		})
+	}
+}
+
+// TestInvalidParamsOnValidators: the single-field validators of upstream's
+// ValidationProblemDetails routes name their fields through the full
+// server on both backends. Rules across fields, and query parameters,
+// name none.
+func TestInvalidParamsOnValidators(t *testing.T) {
+	runBackends(t, testInvalidParamsOnValidators)
+}
+
+func testInvalidParamsOnValidators(t *testing.T, e *testEnv) {
+	org := e.newOrg(t)
+	url := "iv-" + randomHex(t, 4)
+	created := createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusCreated)
+	repoTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeRepoWrite}})
+	gitTok := e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite}})
+	orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeRepoWrite}})
+	fresh := func() string {
+		return e.mint(t, tokenSpec{iss: org, repo: "iv-fresh-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
+	}
+	type param struct{ name, reason string }
+	req := func(n, r string) param { return param{n, r} }
+	for _, tc := range []struct {
+		name, method, path, token, body string
+		want                            []param // nil: no invalid_params
+	}{
+		{"patch required", http.MethodPatch, "/api/v1/repo", repoTok, `{}`, []param{req("default_branch", "is required")}},
+		{"patch invalid", http.MethodPatch, "/api/v1/repo", repoTok, `{"default_branch":"bad..name"}`, []param{req("default_branch", "is not a valid branch name")}},
+		{"create invalid", http.MethodPost, "/api/v1/repos", fresh(), `{"default_branch":"bad..name"}`, []param{req("default_branch", "is not a valid branch name")}},
+		{"create query param", http.MethodPost, "/api/v1/repos?default_branch=bad..name", fresh(), `{}`, nil},
+		{"upstream required", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"github"}}`,
+			[]param{req("upstream.owner", "is required"), req("upstream.name", "is required")}},
+		{"upstream provider", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"nope","owner":"o","name":"n"}}`,
+			[]param{req("upstream.provider", "is not supported")}},
+		{"upstream access", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"github","owner":"o","name":"n","access":"x"}}`,
+			[]param{req("upstream.access", "must be app or public")}},
+		{"upstream type", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"github","owner":1,"name":"n"}}`,
+			[]param{req("upstream.owner", "must be a string")}},
+		{"base_repo required", http.MethodPost, "/api/v1/repos", fresh(), `{"base_repo":{"provider":"github","owner":"o"}}`,
+			[]param{req("base_repo.name", "is required")}},
+		{"base_repo operation", http.MethodPost, "/api/v1/repos", fresh(), `{"base_repo":{"provider":"github","owner":"o","name":"n","operation":"bogus"}}`,
+			[]param{req("base_repo.operation", "must be sync or fork")}},
+		{"base_repo not an object", http.MethodPost, "/api/v1/repos", fresh(), `{"base_repo":{"provider":"github","owner":"o","name":"n","auth":3}}`,
+			[]param{req("base_repo.auth", "must be an object")}},
+		{"both forms", http.MethodPost, "/api/v1/repos", fresh(), `{"base_repo":{"provider":"github"},"upstream":{"provider":"github"}}`, nil},
+		{"tag name", http.MethodPost, "/api/v1/repos/tags", gitTok, `{"name":"bad..name","ref":"main"}`, []param{req("name", "must be a valid tag name")}},
+		{"tag ref", http.MethodPost, "/api/v1/repos/tags", gitTok, `{"name":"v1"}`, []param{req("ref", "is required")}},
+		{"target_branch", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":"bad..name","base_ref":"main"}`,
+			[]param{req("target_branch", "must be a valid branch name")}},
+		{"force without target", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"force":true,"base_ref":"main"}`, nil},
+		{"grep pattern", http.MethodPost, "/api/v1/repos/grep", gitTok, `{"query":{"pattern":""}}`, []param{req("query.pattern", "is required")}},
+		{"grep context", http.MethodPost, "/api/v1/repos/grep", gitTok, `{"query":{"pattern":"x"},"context":{"before":-1,"after":-2}}`,
+			[]param{req("context.before", "must be at least 0"), req("context.after", "must be at least 0")}},
+		{"grep max_lines", http.MethodPost, "/api/v1/repos/grep", gitTok, `{"query":{"pattern":"x"},"limits":{"max_lines":0}}`,
+			[]param{req("limits.max_lines", fmt.Sprintf("must be between 1 and %d", grepMaxLinesCap))}},
+		{"grep paths", http.MethodPost, "/api/v1/repos/grep", gitTok, `{"query":{"pattern":"x"},"paths":["src",""]}`,
+			[]param{req("paths.1", "must be a non-empty path")}},
+		{"grep cursor", http.MethodPost, "/api/v1/repos/grep", gitTok, `{"query":{"pattern":"x"},"pagination":{"cursor":"!!"}}`,
+			[]param{req("pagination.cursor", "is not a valid cursor")}},
+		{"archive max_blob_size", http.MethodPost, "/api/v1/repos/archive", gitTok, `{"max_blob_size":-1}`, []param{req("max_blob_size", "must be at least 0")}},
+		{"archive glob", http.MethodPost, "/api/v1/repos/archive", gitTok, `{"exclude_globs":["a",""]}`, []param{req("exclude_globs.1", "must be a non-empty glob")}},
+		{"archive prefix", http.MethodPost, "/api/v1/repos/archive", gitTok, `{"archive":{"prefix":"../x"}}`,
+			[]param{req("archive.prefix", "must be a relative path inside the archive")}},
+		{"credential password", http.MethodPost, "/api/v1/repos/git-credentials", repoTok, `{"repo_id":"` + created.RepoID + `"}`, []param{req("password", "is required")}},
+		{"credential id", http.MethodPut, "/api/v1/repos/git-credentials", orgTok, `{"password":"p"}`, []param{req("id", "is required")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(tc.body), "")
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, body)
+			}
+			requireEnvelope(t, resp, body)
+			var p problemBody
+			if err := json.Unmarshal(body, &p); err != nil {
+				t.Fatal(err)
+			}
+			var got []param
+			for _, ip := range p.InvalidParams {
+				got = append(got, param{ip.Name, ip.Reason})
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("invalid_params = %+v, want %+v (body %s)", got, tc.want, body)
 			}
 		})
 	}

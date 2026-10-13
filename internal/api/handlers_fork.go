@@ -90,7 +90,8 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 			dec := json.NewDecoder(bytes.NewReader(req.BaseRepo))
 			dec.DisallowUnknownFields()
 			if err := dec.Decode(&usyncBaseRepo{}); err != nil {
-				writeErr(w, http.StatusBadRequest, "invalid base_repo: "+err.Error())
+				fe := fieldErrorUnder("base_repo", "invalid base_repo: "+err.Error(), err)
+				writeInvalid(w, fe.Error(), fe)
 				return
 			}
 		}
@@ -148,7 +149,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	// The copy form names its source repository (checked below) and
 	// carries none of the deprecated sync form's fields.
 	if spec.isCopy() && spec.Name == "" {
-		writeErr(w, http.StatusBadRequest, "base_repo.name is required for a copy")
+		writeInvalidField(w, "base_repo.name", "is required for a copy", "base_repo.name is required for a copy")
 		return
 	}
 	if spec.isCopy() && (spec.Owner != "" || spec.UpstreamHost != "" || spec.ForwardPushes || (spec.Auth != nil && spec.Auth.AuthType != "")) {
@@ -162,10 +163,10 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	// failure on the source (403).
 	if spec.Auth == nil || spec.Auth.Token == "" {
 		if spec.isCopy() {
-			writeErr(w, http.StatusBadRequest, "base_repo.auth.token is required for a copy")
+			writeInvalidField(w, "base_repo.auth.token", "is required for a copy", "base_repo.auth.token is required for a copy")
 			return
 		}
-		writeErr(w, http.StatusBadRequest, "base_repo.auth.token is required for provider "+strconv.Quote(spec.Provider))
+		writeInvalidField(w, "base_repo.auth.token", "is required", "base_repo.auth.token is required for provider "+strconv.Quote(spec.Provider))
 		return
 	}
 	srcClaims, err := verifier.Verify(r.Context(), spec.Auth.Token)
@@ -242,12 +243,12 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	// The fork's default branch name: request body wins, then the
 	// base_repo.default_branch spelling, then the query fallback, then the
 	// source's own default branch name.
-	branch := req.DefaultBranch
+	branch, branchPath := req.DefaultBranch, "default_branch"
 	if branch == "" {
-		branch = spec.DefaultBranch
+		branch, branchPath = spec.DefaultBranch, "base_repo.default_branch"
 	}
 	if branch == "" {
-		branch = r.URL.Query().Get("default_branch")
+		branch, branchPath = r.URL.Query().Get("default_branch"), ""
 	}
 	if branch == "" {
 		// The source's stored default may be refs/heads/-qualified (PATCH
@@ -257,7 +258,11 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		branch = strings.TrimPrefix(srcRepo.DefaultBranch, "refs/heads/")
 	}
 	if !validBranchName(branch) {
-		writeErr(w, http.StatusBadRequest, "invalid default_branch")
+		if branchPath == "" { // the query parameter or the source: no body field
+			writeErr(w, http.StatusBadRequest, "invalid default_branch")
+		} else {
+			writeInvalidField(w, branchPath, "is not a valid branch name", "invalid default_branch")
+		}
 		return
 	}
 

@@ -705,7 +705,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	}
 	pattern := body.Query.Pattern
 	if strings.TrimSpace(pattern) == "" {
-		writeErr(w, http.StatusBadRequest, "query.pattern is required")
+		writeInvalidField(w, "query.pattern", "is required", "query.pattern is required")
 		return
 	}
 	caseSensitive := true
@@ -720,14 +720,22 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		after = *body.Context.After
 	}
 	if before < 0 || after < 0 {
-		writeErr(w, http.StatusBadRequest, "context lines must be non-negative")
+		var params []invalidParam
+		if before < 0 {
+			params = append(params, invalidParam{Name: "context.before", Reason: "must be at least 0"})
+		}
+		if after < 0 {
+			params = append(params, invalidParam{Name: "context.after", Reason: "must be at least 0"})
+		}
+		writeInvalid(w, "context lines must be non-negative", newFieldErrors("context lines must be non-negative", params...))
 		return
 	}
 	maxLines := grepDefaultMaxLines
 	if body.Limits.MaxLines != nil {
 		maxLines = *body.Limits.MaxLines
 		if maxLines < 1 || maxLines > grepMaxLinesCap {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid limits.max_lines (want 1..%d)", grepMaxLinesCap))
+			writeInvalidField(w, "limits.max_lines", fmt.Sprintf("must be between 1 and %d", grepMaxLinesCap),
+				fmt.Sprintf("invalid limits.max_lines (want 1..%d)", grepMaxLinesCap))
 			return
 		}
 	}
@@ -735,7 +743,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	if body.Limits.MaxMatchesPerFile != nil {
 		maxPerFile = *body.Limits.MaxMatchesPerFile
 		if maxPerFile < 1 {
-			writeErr(w, http.StatusBadRequest, "invalid limits.max_matches_per_file (want >= 1)")
+			writeInvalidField(w, "limits.max_matches_per_file", "must be at least 1", "invalid limits.max_matches_per_file (want >= 1)")
 			return
 		}
 	}
@@ -743,13 +751,13 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	if body.Pagination.Limit != nil {
 		pageLimit = *body.Pagination.Limit
 		if pageLimit < 1 {
-			writeErr(w, http.StatusBadRequest, "invalid pagination.limit (want >= 1)")
+			writeInvalidField(w, "pagination.limit", "must be at least 1", "invalid pagination.limit (want >= 1)")
 			return
 		}
 	}
-	for _, p := range body.Paths {
+	for i, p := range body.Paths {
 		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid paths entry %q", p))
+			writeInvalidField(w, "paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p))
 			return
 		}
 	}
@@ -783,7 +791,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	if body.Pagination.Cursor != "" {
 		commit, cursorPath, cursorLine, err = decodeGrepCursor(body.Pagination.Cursor)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
+			writeInvalidField(w, "pagination.cursor", "is not a valid cursor", err.Error())
 			return
 		}
 		// The cursor's anchor commit must still exist in this repo.
@@ -792,7 +800,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 				s.internalErr(w, r, "resolve grep cursor", resolveErr)
 				return
 			}
-			writeErr(w, http.StatusBadRequest, "invalid cursor")
+			writeInvalidField(w, "pagination.cursor", "is not a valid cursor", "invalid cursor")
 			return
 		}
 	} else {
@@ -819,7 +827,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		// The commit is a resolved SHA and pathspecs carry only :(literal)
 		// magic, so a git usage failure (exit 128) means the request's
 		// pattern is not a valid regex — client input, not a server fault.
-		writeErr(w, http.StatusBadRequest, "invalid query.pattern")
+		writeInvalidField(w, "query.pattern", "must be a valid pattern", "invalid query.pattern")
 		return
 	case err != nil:
 		s.internalErr(w, r, "run grep", err)
@@ -943,21 +951,26 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	if body.MaxBlobSize != nil {
 		maxBlobSize = *body.MaxBlobSize
 		if maxBlobSize < 0 {
-			writeErr(w, http.StatusBadRequest, "invalid max_blob_size (want >= 0)")
+			writeInvalidField(w, "max_blob_size", "must be at least 0", "invalid max_blob_size (want >= 0)")
 			return
 		}
 	}
-	for _, glob := range append(append([]string{}, body.IncludeGlobs...), body.ExcludeGlobs...) {
-		if strings.TrimSpace(glob) == "" || strings.ContainsRune(glob, 0) {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid glob %q", glob))
-			return
+	for _, list := range []struct {
+		name  string
+		globs []string
+	}{{"include_globs", body.IncludeGlobs}, {"exclude_globs", body.ExcludeGlobs}} {
+		for i, glob := range list.globs {
+			if strings.TrimSpace(glob) == "" || strings.ContainsRune(glob, 0) {
+				writeInvalidField(w, list.name+"."+strconv.Itoa(i), "must be a non-empty glob", fmt.Sprintf("invalid glob %q", glob))
+				return
+			}
 		}
 	}
 	// Reject prefixes that could make extracted entries escape the
 	// destination root (tar slip): absolute paths, "."/".." segments,
 	// NUL bytes, backslashes.
 	if !gitread.ValidArchivePrefix(body.Archive.Prefix) {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid archive.prefix %q", body.Archive.Prefix))
+		writeInvalidField(w, "archive.prefix", "must be a relative path inside the archive", fmt.Sprintf("invalid archive.prefix %q", body.Archive.Prefix))
 		return
 	}
 	// The prefix is a folder name (openapi example "sdk-docs/"); normalize

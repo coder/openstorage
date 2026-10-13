@@ -137,6 +137,27 @@ func newFieldErrors(msg string, params ...invalidParam) *fieldError {
 	return &fieldError{params: params, msg: msg}
 }
 
+// requiredFields returns a fieldError naming each empty field of fields
+// (dotted wire path -> value), in the order given, or nil when none is
+// empty.
+func requiredFields(msg string, fields ...[2]string) error {
+	var params []invalidParam
+	for _, f := range fields {
+		if f[1] == "" {
+			params = append(params, invalidParam{Name: f[0], Reason: "is required"})
+		}
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return newFieldErrors(msg, params...)
+}
+
+// writeInvalidField writes the 400 for one invalid request-body field.
+func writeInvalidField(w http.ResponseWriter, name, reason, msg string) {
+	writeInvalid(w, msg, newFieldError(name, reason, msg))
+}
+
 // fieldErrorUnder returns an error with message msg that names the field
 // cause names, below the request-body member prefix: for a member that
 // is decoded on its own from a json.RawMessage. A type error on the
