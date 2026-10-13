@@ -477,11 +477,11 @@ func (s *SQLite) RequestSync(ctx context.Context, repoID string) error {
 	return nil
 }
 
-// PendingSyncRepoIDs lists repos with the sync_pending marker set (boot
-// recovery for accepted pull-upstream requests, issue #86).
+// PendingSyncRepoIDs lists repos with the sync_pending marker set or an
+// in-flight claim (see the EventingStore contract; issues #86 and #424).
 func (s *SQLite) PendingSyncRepoIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT repo_id FROM repo_upstreams WHERE sync_pending = 1 ORDER BY repo_id`)
+		`SELECT repo_id FROM repo_upstreams WHERE sync_pending = 1 OR syncing = 1 ORDER BY repo_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list pending sync repos: %w", err)
 	}

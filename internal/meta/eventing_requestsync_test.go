@@ -98,3 +98,35 @@ func testRequestSyncPendingLifecycle(t *testing.T, s Backend) {
 		t.Errorf("conflicting claim consumed SyncPending: row = %+v, err = %v", got, err)
 	}
 }
+
+func TestPendingSyncIncludesOrphanedClaims(t *testing.T) { runBackends(t, testPendingSyncOrphans) }
+
+// Local-mode boot recovery must see repos whose previous process died
+// AFTER its claim consumed sync_pending (issue #424): PendingSyncRepoIDs
+// lists in-flight claims too, not only marked rows.
+func testPendingSyncOrphans(t *testing.T, s Backend) {
+	ctx := t.Context()
+	repoID := testRepoID(t, s, "")
+	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{
+		RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
+	}); err != nil {
+		t.Fatalf("SetRepoUpstream: %v", err)
+	}
+	if err := s.RequestSync(ctx, repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, _, err := s.TryBeginSync(ctx, repoID, "holder-orphan", time.Minute); err != nil || !claimed {
+		t.Fatalf("claim = (%v, %v), want claimed", claimed, err)
+	}
+	// Marker consumed, claim in flight: the crashed-process row shape.
+	if ids, err := s.PendingSyncRepoIDs(ctx); err != nil || !slices.Contains(ids, repoID) {
+		t.Fatalf("PendingSyncRepoIDs = (%v, %v), want orphan-claimed %s listed", ids, err, repoID)
+	}
+	// A finished run clears the row out of the listing.
+	if _, err := s.FinishSync(ctx, repoID, "holder-orphan", true); err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := s.PendingSyncRepoIDs(ctx); err != nil || slices.Contains(ids, repoID) {
+		t.Fatalf("PendingSyncRepoIDs = (%v, %v), want idle %s not listed", ids, err, repoID)
+	}
+}

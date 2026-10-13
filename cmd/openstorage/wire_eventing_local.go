@@ -47,6 +47,9 @@ func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Wor
 	// additionally drives the transient-retry backoff timers (#90).
 	worker.Requeue = queue.EnqueueSync
 	worker.RequeuePush = queue.EnqueuePush
+	rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	remarkOrphanedSyncClaims(rctx, ms, logger)
+	cancel()
 	// Boot recovery (issue #86): queued local work and deferred retry
 	// timers die with the process, but the SyncPending/PushPending
 	// markers are durable — re-enqueue marked repos so accepted
@@ -96,5 +99,29 @@ func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Wor
 	return queue, func() {
 		recovery.Stop()
 		queue.Close()
+	}
+}
+
+// remarkOrphanedSyncClaims re-marks sync_pending on every repo the boot
+// scan lists (issue #424). A pull that crashed while it held its claim
+// consumed the marker, so without the re-mark its recovered run meets
+// the dead, unexpired lease, skips, and arms no deferred retry. The
+// caller runs it before this process can claim anything: S3-WAL serve
+// holds the instance lease by now, so every claim seen here is dead. A
+// claim taken later is live and is never re-marked. If an operator
+// disabled the instance lease and a second serve holds a live claim, the
+// re-mark costs one follow-up run after it finishes, not a second
+// concurrent run: the claim lease still refuses each claim until it
+// expires.
+func remarkOrphanedSyncClaims(ctx context.Context, ms meta.Store, logger *slog.Logger) {
+	ids, err := ms.PendingSyncRepoIDs(ctx)
+	if err != nil {
+		logger.Warn("orphaned sync claim boot re-mark failed", "err", err)
+		return
+	}
+	for _, id := range ids {
+		if err := ms.RequestSync(ctx, id); err != nil {
+			logger.Warn("orphaned sync claim boot re-mark failed", "repo", id, "err", err)
+		}
 	}
 }
