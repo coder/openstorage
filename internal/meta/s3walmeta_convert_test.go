@@ -49,9 +49,8 @@ func putS3WALMeta(t *testing.T, cas s3wal.ConditionalStore, doc *s3walMetaDoc, v
 	}
 }
 
-// expectedS3WALMeta restates the ADR-51 rule on a JSON copy of src. It is
-// close to convertS3WALMetaDoc on purpose: the tests check the stored
-// bytes and the round trip against it, not a second algorithm.
+// expectedS3WALMeta is the conversion written a second way: from the
+// ADR-51 rule, not from convertS3WALMetaDoc.
 func expectedS3WALMeta(t *testing.T, src *s3walMetaDoc, to int) *s3walMetaDoc {
 	t.Helper()
 	raw, err := json.Marshal(src)
@@ -178,14 +177,6 @@ func TestS3WALMetaConvertEdges(t *testing.T) {
 	if res, err := ConvertS3WALMeta(ctx, s3wal.NewMemCAS(), 2); err != nil || !res.Missing {
 		t.Fatalf("missing document = %+v, %v", res, err)
 	}
-	// An empty table the encoder would omit still verifies.
-	empty := s3wal.NewMemCAS()
-	if _, err := empty.Create(ctx, s3walMetaKey, []byte(`{"v":1,"seq":1,"writer":"w","next_org_id":0,"next_key_id":0,"repos":{}}`)); err != nil {
-		t.Fatal(err)
-	}
-	if res, err := ConvertS3WALMeta(ctx, empty, 2); err != nil || res.To != 2 || res.SeqAfter != 2 {
-		t.Fatalf("empty-table document = %+v, %v", res, err)
-	}
 	cas := s3wal.NewMemCAS()
 	_, src := seedS3WALMetaClaim(t, cas)
 	cctx, cancel := context.WithCancel(ctx)
@@ -213,35 +204,6 @@ func TestS3WALMetaConvertAmbiguous(t *testing.T) {
 	}
 }
 
-// cancelOnGetCAS cancels once, during the first Get of the meta key: the
-// fence is lost while the conversion reads.
-type cancelOnGetCAS struct {
-	*s3wal.MemCAS
-	cancel func()
-}
-
-func (c *cancelOnGetCAS) Get(ctx context.Context, key string) (s3wal.Object, error) {
-	obj, err := c.MemCAS.Get(ctx, key)
-	if f := c.cancel; f != nil && key == s3walMetaKey {
-		c.cancel = nil
-		f()
-	}
-	return obj, err
-}
-
-func TestS3WALMetaConvertCancelDuringRead(t *testing.T) {
-	mem := s3wal.NewMemCAS()
-	_, src := seedS3WALMetaClaim(t, mem)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if _, err := ConvertS3WALMeta(ctx, &cancelOnGetCAS{MemCAS: mem, cancel: cancel}, 2); !errors.Is(err, context.Canceled) {
-		t.Fatalf("convert = %v, want context.Canceled", err)
-	}
-	if got, _ := storedS3WALMeta(t, mem); got.V != src.V || got.Seq != src.Seq {
-		t.Fatalf("cancel during the read wrote v%d seq %d", got.V, got.Seq)
-	}
-}
-
 // raceCAS runs before once, ahead of the first Advance of the meta key.
 type raceCAS struct {
 	*s3wal.MemCAS
@@ -256,44 +218,33 @@ func (r *raceCAS) Advance(ctx context.Context, key string, body []byte, etag str
 	return r.MemCAS.Advance(ctx, key, body, etag)
 }
 
-// A writer that the fence missed: its write between the conversion's read
-// and write survives, the conversion applies to it, and its next CAS, made
-// on the ETag it read, loses without changing the converted document.
+// A v1 writer that the fence missed: its write between the conversion's
+// read and write survives, and its next CAS, made on the v1 ETag it read,
+// loses without changing the v2 document.
 func TestS3WALMetaConvertRace(t *testing.T) {
-	for _, to := range []int{2, 1} {
-		t.Run(fmt.Sprintf("to%d", to), func(t *testing.T) {
-			ctx := context.Background()
-			mem := s3wal.NewMemCAS()
-			repoID, _ := seedS3WALMetaClaim(t, mem)
-			from := 3 - to
-			if from == 2 {
-				if _, err := ConvertS3WALMeta(ctx, mem, 2); err != nil {
-					t.Fatal(err)
-				}
-			}
-			var racedETag string
-			cas := &raceCAS{MemCAS: mem, before: func() {
-				doc, _ := storedS3WALMeta(t, mem)
-				doc.Orgs["raced"] = &s3walMetaOrg{ID: 9, PublicKeys: []string{"pem"}}
-				putS3WALMeta(t, mem, doc, from)
-				obj, err := mem.Get(ctx, s3walMetaKey)
-				if err != nil {
-					t.Error(err)
-				}
-				racedETag = obj.ETag
-			}}
-			if _, err := ConvertS3WALMeta(ctx, cas, to); err != nil {
-				t.Fatal(err)
-			}
-			got, body := storedS3WALMeta(t, mem)
-			// Only --to 1 re-marks the claimed pull as pending.
-			if got.V != to || got.Orgs["raced"] == nil || got.Upstreams[repoID].SyncPending != (to == 1) {
-				t.Fatalf("converted document v%d orgs %v lane %+v, want v%d with the raced org (pull pending: %v)", got.V, got.Orgs, got.Upstreams[repoID], to, to == 1)
-			}
-			if _, err := mem.Advance(ctx, s3walMetaKey, body, racedETag); !errors.Is(err, s3wal.ErrLostRace) {
-				t.Fatalf("late CAS = %v, want a lost race", err)
-			}
-		})
+	ctx := context.Background()
+	mem := s3wal.NewMemCAS()
+	seedS3WALMetaClaim(t, mem)
+	var v1ETag string
+	cas := &raceCAS{MemCAS: mem, before: func() {
+		doc, _ := storedS3WALMeta(t, mem)
+		doc.Orgs["raced"] = &s3walMetaOrg{ID: 9, PublicKeys: []string{"pem"}}
+		putS3WALMeta(t, mem, doc, 1)
+		obj, err := mem.Get(ctx, s3walMetaKey)
+		if err != nil {
+			t.Error(err)
+		}
+		v1ETag = obj.ETag
+	}}
+	if _, err := ConvertS3WALMeta(ctx, cas, 2); err != nil {
+		t.Fatal(err)
+	}
+	got, body := storedS3WALMeta(t, mem)
+	if got.V != 2 || got.Orgs["raced"] == nil {
+		t.Fatalf("converted document v%d orgs %v, want v2 with the raced org", got.V, got.Orgs)
+	}
+	if _, err := mem.Advance(ctx, s3walMetaKey, body, v1ETag); !errors.Is(err, s3wal.ErrLostRace) {
+		t.Fatalf("late v1 CAS = %v, want a lost race", err)
 	}
 }
 

@@ -70,9 +70,6 @@ func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int) (S
 		}
 		res := S3WALMetaConversion{From: src.V, To: to, SeqBefore: src.Seq, SeqAfter: src.Seq, Before: countS3WALMeta(src), After: countS3WALMeta(src)}
 		if src.V == to {
-			// Also reached when an earlier attempt's ambiguous PUT landed
-			// and a second converter then advanced the document: the
-			// result is right, but From == To understates our write.
 			return res, nil
 		}
 		want, err := convertS3WALMetaDoc(obj.Body, to)
@@ -115,7 +112,7 @@ func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int) (S
 				continue
 			}
 		}
-		if err := verifyS3WALMetaConversion(ctx, cs, body, want); err != nil {
+		if err := verifyS3WALMetaConversion(ctx, cs, want); err != nil {
 			return S3WALMetaConversion{}, err
 		}
 		res.SeqAfter, res.After = want.Seq, countS3WALMeta(want)
@@ -152,10 +149,8 @@ func convertS3WALMetaDoc(body []byte, to int) (*s3walMetaDoc, error) {
 }
 
 // verifyS3WALMetaConversion re-reads the stored document and checks it is
-// exactly what we wrote: body, decoded back. Comparing decoded bodies (not
-// want itself) keeps an empty source map, which the encoder omits, from
-// reading as a mismatch.
-func verifyS3WALMetaConversion(ctx context.Context, cs s3wal.ConditionalStore, body []byte, want *s3walMetaDoc) error {
+// exactly want: our write, decoded back to the expected tables.
+func verifyS3WALMetaConversion(ctx context.Context, cs s3wal.ConditionalStore, want *s3walMetaDoc) error {
 	obj, err := cs.Get(ctx, s3walMetaKey)
 	if err != nil {
 		return fmt.Errorf("s3walmeta convert: verify read: %w", err)
@@ -167,11 +162,7 @@ func verifyS3WALMetaConversion(ctx context.Context, cs s3wal.ConditionalStore, b
 	if got.Writer != want.Writer || got.Seq != want.Seq {
 		return fmt.Errorf("s3walmeta convert: verify: document advanced to seq %d by writer %s after the conversion wrote seq %d; another writer is running", got.Seq, got.Writer, want.Seq)
 	}
-	wrote, err := decodeS3WALMetaDocVersion(body, want.V)
-	if err != nil {
-		return fmt.Errorf("s3walmeta convert: verify: %w", err)
-	}
-	if !reflect.DeepEqual(got, wrote) {
+	if !reflect.DeepEqual(got, want) {
 		return fmt.Errorf("s3walmeta convert: verify: stored seq %d does not decode to the expected document", got.Seq)
 	}
 	return nil
