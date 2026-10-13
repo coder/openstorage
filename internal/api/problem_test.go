@@ -222,9 +222,10 @@ func expectedProblemCode(t *testing.T, status int, msg string) string {
 	t.Helper()
 	code := ""
 	switch {
-	case status == http.StatusNotFound && msg == "repository not found":
+	case status == http.StatusNotFound && (msg == "repository not found" || msg == "fork source repository not found"):
 		code = "repository_not_found"
-	case status == http.StatusForbidden && strings.HasPrefix(msg, "missing required scope "):
+	case status == http.StatusForbidden && (strings.HasPrefix(msg, "missing required scope ") ||
+		strings.HasPrefix(msg, "base_repo.auth.token is missing required scope ")):
 		code = "insufficient_scope"
 	case status == http.StatusBadRequest && msg == "repo_name must equal the JWT repo claim":
 		code = "repo_name_mismatch"

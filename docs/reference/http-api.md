@@ -28,7 +28,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `conflict`, `unprocessable_entity`, `rate_limited`, `internal_error`,
   `service_unavailable`, …), except for these specific upstream codes:
   `repository_not_found` (404: the repository does not exist or the token cannot
-  access it), `insufficient_scope` (403: the token lacks a required scope), and
+  access it, including a fork's source repository), `insufficient_scope` (403: the
+  token, or a fork's `base_repo.auth.token`, lacks a required scope), and
   `repo_name_mismatch` (400: the create body's `repo_name` differs from the token's
   `repo` claim). open.storage emits no other specific codes. As upstream advises, treat
   an unknown code as the generic code for its status. Branch on the status code or
