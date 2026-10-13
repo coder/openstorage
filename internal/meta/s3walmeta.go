@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	mrand "math/rand/v2"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -58,9 +59,19 @@ var ErrValueNotUTF8 = errors.New("s3walmeta: string value is not valid UTF-8")
 // `_wal/repo/` only), and the sweeper excludes the whole `_wal/` prefix.
 const s3walMetaKey = "_wal/meta.json"
 
-// s3walMetaVersion is the only document schema version this binary reads
-// or writes.
+// s3walMetaVersion is the only document schema version this binary's
+// normal code paths read or write. Only the format conversion
+// (s3walmeta_convert.go, ADR-51) reads and writes the others.
 const s3walMetaVersion = 1
+
+// The document schema versions (ADR-51). v2 is v1 plus four fields whose
+// absent value means exactly what v1 means (the zero-value rule):
+// s3walMetaRepo.CreateState and s3walMetaUpstream.PushAttempt, PushDue,
+// SyncDue.
+const (
+	s3walMetaV1 = 1
+	s3walMetaV2 = 2
+)
 
 // s3walKeyRefreshInterval is the org public-key snapshot's background
 // refresh cadence — the cross-process staleness bound for
@@ -130,6 +141,10 @@ type s3walMetaRepo struct {
 	CreatedAt     int64  `json:"created_at"`
 	DeletedAt     int64  `json:"deleted_at,omitempty"` // 0 = live
 	PurgedAt      int64  `json:"purged_at,omitempty"`  // 0 = never purged
+	// CreateState is v2 only (ADR-51): CreateState as stored by the SQL
+	// backends; absent (0) is CreateStateLegacy, which is what every v1
+	// row means.
+	CreateState int `json:"create_state,omitempty"`
 }
 
 type s3walMetaWebhook struct {
@@ -176,6 +191,11 @@ type s3walMetaUpstream struct {
 	// unset. No legacy-schema concern: no pre-s3walmeta binary exists
 	// (the package-wide argument), so absent means false, never unknown.
 	Detaching bool `json:"detaching,omitempty"`
+	// The ADR-50 schedule fields, v2 only (ADR-51). Absent (0) means the
+	// first attempt, due now: what every v1 lane means.
+	PushAttempt int   `json:"push_attempt,omitempty"`
+	PushDue     int64 `json:"push_due,omitempty"`
+	SyncDue     int64 `json:"sync_due,omitempty"`
 }
 
 // toRepoUpstream renders the stored row as the interface type, converting
@@ -216,11 +236,18 @@ func newS3WALMetaDoc() *s3walMetaDoc {
 // decodeS3WALMetaDoc parses and validates one fetched document body.
 // Corruption is a crash-and-burn error, never a silent empty state.
 func decodeS3WALMetaDoc(body []byte) (*s3walMetaDoc, error) {
+	return decodeS3WALMetaDocVersion(body, s3walMetaVersion)
+}
+
+// decodeS3WALMetaDocVersion is decodeS3WALMetaDoc accepting any of the
+// listed versions. Only the format conversion lists more than one.
+func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, error) {
+	assertf(len(versions) > 0, "decodeS3WALMetaDocVersion: no versions")
 	var doc s3walMetaDoc
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("s3walmeta: document decode: %w", err)
 	}
-	if doc.V != s3walMetaVersion {
+	if !slices.Contains(versions, doc.V) {
 		return nil, fmt.Errorf("s3walmeta: document version %d unsupported (want %d)", doc.V, s3walMetaVersion)
 	}
 	if doc.Seq < 1 {
@@ -242,6 +269,13 @@ func decodeS3WALMetaDoc(body []byte) (*s3walMetaDoc, error) {
 // path rejects invalid UTF-8 first, so tripping it is a missed guard.
 func (doc *s3walMetaDoc) encodeAdvance() ([]byte, error) {
 	assertf(doc.V == s3walMetaVersion, "encodeAdvance: version %d", doc.V)
+	return doc.encodeNext()
+}
+
+// encodeNext is encodeAdvance for any known version. Only the format
+// conversion calls it directly.
+func (doc *s3walMetaDoc) encodeNext() ([]byte, error) {
+	assertf(doc.V == s3walMetaV1 || doc.V == s3walMetaV2, "encodeAdvance: version %d", doc.V)
 	assertf(doc.Seq >= 0, "encodeAdvance: seq %d", doc.Seq)
 	for name := range doc.Orgs {
 		assertf(utf8.ValidString(name),
@@ -648,8 +682,14 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 
 // sleepJitter blocks for the §2.3 full-jitter lost-race backoff.
 func (s *S3WAL) sleepJitter(ctx context.Context, attempt int) error {
+	return sleepFullJitter(ctx, attempt, s.backoffBase, s.backoffCap)
+}
+
+// sleepFullJitter blocks for a full-jitter backoff of at most
+// min(capDur, base<<attempt).
+func sleepFullJitter(ctx context.Context, attempt int, base, capDur time.Duration) error {
 	assertf(attempt >= 0 && attempt < 63, "sleepJitter: attempt %d out of range", attempt)
-	ceiling := min(s.backoffCap, s.backoffBase<<uint(attempt))
+	ceiling := min(capDur, base<<uint(attempt))
 	assertf(ceiling > 0, "sleepJitter: non-positive backoff ceiling %v", ceiling)
 	timer := time.NewTimer(mrand.N(ceiling))
 	defer timer.Stop()
