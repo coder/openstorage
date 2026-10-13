@@ -113,7 +113,7 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createWebhookRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}
 	if !validWebhookURL(req.URL) {

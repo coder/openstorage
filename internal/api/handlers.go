@@ -256,7 +256,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	var req createRepoRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 			return
 		}
 	}
@@ -425,7 +425,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	var req patchRepoRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 			return
 		}
 	}

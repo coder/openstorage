@@ -39,9 +39,16 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   emits no other specific codes. As upstream advises, treat
   an unknown code as the generic code for its status. Branch on the status code or
   `code`, not on the message.
-  Upstream's 400 bodies can also carry `invalid_params` (`[{name, reason}]`, one item
-  per invalid request field). The member is optional upstream, and open.storage never
-  sends it: read the message in `detail`.
+  A `400` for a request body can also carry `invalid_params` (`[{name, reason}]`, as
+  upstream's `ValidationProblemDetails`): `name` is the dotted wire path of the invalid
+  field, and `reason` is the rule its value breaks. open.storage sends it when a body
+  field has the wrong JSON type (for example `{"name":"default_branch","reason":"must be
+  a string"}`; nested fields such as `base_repo.auth.token` and array elements such as
+  `paths.0` too), and when a strictly decoded body has an unknown, duplicate, or `null`
+  member, or a member that must be an object. It leaves the member out when it cannot
+  name one field: an unreadable or empty body, a JSON syntax error, a body that is not
+  an object, and unknown fields on the other bodies. The message in `detail` does not
+  change.
   The content type stays `application/json`. `status` is a JSON number, as in upstream's
   bodies: decode the body into a struct or a map of arbitrary values, not a string-only
   map (such as Go's `map[string]string`). Ref-moving write
