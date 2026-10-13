@@ -327,7 +327,7 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	var created struct {
 		RepoID string `json:"repo_id"`
 	}
-	if status := apiJSON(t, old, http.MethodPost, token, "/api/v1/repos", `{"default_branch":"main"}`, &created); status != http.StatusOK || created.RepoID == "" {
+	if status := apiJSON(t, old, http.MethodPost, token, "/api/v1/repos", `{"default_branch":"main"}`, &created); status != http.StatusCreated || created.RepoID == "" {
 		t.Fatalf("official create repo status=%d", status)
 	}
 	type repoMetadata struct {
