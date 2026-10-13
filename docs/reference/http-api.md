@@ -362,10 +362,14 @@ a new `repo.sync.started` (outbound: `repo.push_upstream.started`).
 
 **Ref policies fail closed:** any policy op denies pull-upstream, push-upstream, and a
 sync create at `POST /repos` (403).
-The same gate covers `forward_pushes`: a git push from a token that carries any
-ref-policy op, or lacks git:read, does not trigger the forward, since the forward
-publishes every head and tag, not just the refs that token may touch or read. The write
-stays local; the repository converges on the next authorized trigger.
+The same gate covers the sync that a ref write schedules. A REST write or git push from
+a token that carries any ref-policy op does not trigger the inbound sync, since the sync
+force-updates every head and tag from the upstream, not just the refs that token may
+touch. For `forward_pushes` repos, such a write, or one from a token that lacks
+git:read, does not trigger the forward, since the forward publishes every head and tag.
+The write stays local. Nothing polls the upstream, so the repository converges only on
+the next authorized trigger: a write, pull-upstream, or push-upstream that passes these
+gates.
 
 #### Egress policy
 

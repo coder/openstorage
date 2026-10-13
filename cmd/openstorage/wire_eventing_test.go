@@ -52,8 +52,8 @@ func (s *forwardPokeStore) RequestPush(_ context.Context, _ string, force bool) 
 // on #90) or lacks git:read (security round: a write-only token must not
 // export content it cannot clone) — matching POST /repos/push-upstream —
 // while server-initiated writes (no claims) and read+write unpoliced
-// tokens forward, and the PULL poke stays ungated (documented invariant-11
-// behavior this slice does not change).
+// tokens forward. The PULL poke fails closed on any ref-policy op too
+// (issue #421, matching POST /repos/pull-upstream) but needs no git:read.
 func TestEnqueueSyncOrForwardPolicedCallerGate(t *testing.T) {
 	bg := context.Background()
 	rw := []string{auth.ScopeGitRead, auth.ScopeGitWrite}
@@ -76,8 +76,16 @@ func TestEnqueueSyncOrForwardPolicedCallerGate(t *testing.T) {
 			Refs: json.RawMessage(`{not json`)}), true, false, false},
 		{"forward_write_only_token_denied", auth.WithClaims(bg, &auth.Claims{
 			Scopes: []string{auth.ScopeGitWrite}}), true, false, false},
-		{"pull_policed_still_pokes", auth.WithClaims(bg, &auth.Claims{Scopes: []string{auth.ScopeGitWrite},
-			Refs: json.RawMessage(`[["refs/heads/main", ["no-push"]]]`)}), false, false, true},
+		{"pull_server_initiated_no_claims", bg, false, false, true},
+		{"pull_write_only_unpoliced", auth.WithClaims(bg, &auth.Claims{Scopes: []string{auth.ScopeGitWrite}}), false, false, true},
+		{"pull_pattern_without_ops", auth.WithClaims(bg, &auth.Claims{Scopes: rw,
+			Refs: json.RawMessage(`[["refs/heads/*", []]]`)}), false, false, true},
+		{"pull_policed_refs_denied", auth.WithClaims(bg, &auth.Claims{Scopes: []string{auth.ScopeGitWrite},
+			Refs: json.RawMessage(`[["refs/heads/main", ["no-push"]]]`)}), false, false, false},
+		{"pull_deprecated_ops_denied", auth.WithClaims(bg, &auth.Claims{Scopes: rw,
+			Ops: []string{"verify-sig"}}), false, false, false},
+		{"pull_malformed_refs_fails_closed", auth.WithClaims(bg, &auth.Claims{Scopes: rw,
+			Refs: json.RawMessage(`{not json`)}), false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,7 +94,7 @@ func TestEnqueueSyncOrForwardPolicedCallerGate(t *testing.T) {
 			poke := enqueueSyncOrForward(st,
 				func(context.Context, upsync.Job) error { pulled++; return nil },
 				func(context.Context, upsync.Job) error { pushed++; return nil },
-				"acme", forwardDeniedFromContext)
+				"acme", forwardDeniedFromContext, pullDeniedFromContext)
 			if err := poke(tc.ctx, "r1"); err != nil {
 				t.Fatalf("poke: %v", err)
 			}
