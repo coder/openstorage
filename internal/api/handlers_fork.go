@@ -117,10 +117,10 @@ const copyNameMismatchMsg = "base_repo.name is not the repository base_repo.auth
 // handleForkRepo performs one synchronous fork (or copy). Flow: verify the embedded
 // fork-source JWT (repo-scoped git:read on the source), resolve the source
 // row and the fork point in its materialized cache, policy-check the fork's
-// initial ref, pack the fork-point closure, create the repo row, publish the
-// pack under the new RepoID, and CAS-create the default branch. Failures
-// after the repo row exists soft-delete it (forkAbandon) so no orphaned
-// live repo remains.
+// initial ref, pack the fork-point closure, create the pending repo row,
+// publish the pack under the new RepoID, CAS-create the default branch,
+// and mark the create complete (issue #388). Failures before the won CAS
+// soft-delete the row (forkAbandon) so no orphaned live repo remains.
 func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier auth.Verifier, req *createRepoRequest, spec *usyncBaseRepo) {
 	assertf(s != nil && s.store != nil && s.refStore != nil && s.blobStore != nil && s.cacheDir != "",
 		"handleForkRepo: nil server deps")
@@ -338,10 +338,12 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 
-	repo, err := s.store.CreateRepo(ctx, claims.Iss, url, branch)
+	// Pending until completeFork: a concurrent create of the name answers
+	// 503, never success for a repo that this fork may still delete.
+	repo, err := s.store.CreateRepoWithState(ctx, claims.Iss, url, branch, meta.CreateStatePending)
 	switch {
 	case errors.Is(err, meta.ErrAlreadyExists):
-		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url)
+		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url, false)
 		return
 	case errors.Is(err, meta.ErrNotFound):
 		// Unreachable after successful auth (the org must exist to have
@@ -390,6 +392,9 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		writeErr(w, http.StatusConflict, "repository already exists")
 		return
 	}
+	if !s.completeFork(w, r, claims.Iss, url, repo.RepoID) {
+		return
+	}
 
 	writeJSON(w, http.StatusCreated, createRepoResponse{
 		RepoID:   repo.RepoID,
@@ -397,6 +402,37 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
 		Message:  repoCreatedMsg(repo.URL),
 	})
+}
+
+// completeFork marks the fork's create complete after its won CASRef and
+// reports whether the caller may answer 201 (issue #388). Only the request
+// that inserted the row completes it. A failure, which may be the request's
+// cancellation, is retried once on a detached, bounded context; then the
+// create answers 500 and the row stays pending, so plain and copy creates
+// of the name answer 503 until DELETE /repos/delete clears it. A delete
+// that landed first wins: 404, never 201. AlreadyComplete is a success: a
+// failed attempt can have committed before its error (the retry then sees
+// complete), and S3-WAL's ambiguous-PUT recovery answers it on purpose.
+func (s *server) completeFork(w http.ResponseWriter, r *http.Request, org, url, repoID string) bool {
+	assertf(org != "" && url != "" && repoID != "", "completeFork: missing inputs")
+	out, err := s.store.CompleteRepoCreate(r.Context(), org, repoID)
+	if err != nil {
+		s.logger.Warn("complete fork create; retrying once", "org", org, "repo_id", repoID, "err", err)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+		defer cancel()
+		out, err = s.store.CompleteRepoCreate(ctx, org, repoID)
+	}
+	switch {
+	case err != nil:
+		s.internalErr(w, r, "complete fork create; the name stays pending", err)
+		return false
+	case out == meta.CreateDeleted:
+		writeErr(w, http.StatusNotFound, repoDeletedMsg(url))
+		return false
+	}
+	assertf(out == meta.CreateCompleted || out == meta.CreateAlreadyComplete,
+		"CompleteRepoCreate of fork %s: outcome %d", repoID, out)
+	return true
 }
 
 // forkAbandon soft-deletes the shell repo row after a post-create failure
