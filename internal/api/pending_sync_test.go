@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	stdsync "sync"
 	"testing"
 	"time"
@@ -222,15 +223,18 @@ func TestPendingSyncCreate(t *testing.T) {
 			// fork, the row stays pending until an authorized DELETE.
 			s := newPendingSyncStack(t, e, true)
 			s.q.setHook(func(repoID string) error { return s.q.es.DeleteRepoUpstream(context.Background(), repoID) })
-			if code, hdr, msg := s.create(t, "det", pendingSyncBody); code != http.StatusServiceUnavailable || hdr.Get("Retry-After") == "" {
-				t.Fatalf("create detached before completion = %d %q, want 503 + Retry-After", code, msg)
+			code, hdr, msg := s.create(t, "det", pendingSyncBody)
+			if code != http.StatusServiceUnavailable || hdr.Get("Retry-After") != "" || !strings.Contains(msg, "DELETE /repos/delete") {
+				t.Fatalf("create detached before completion = %d (Retry-After %q) %q, want 503 naming DELETE, no Retry-After", code, hdr.Get("Retry-After"), msg)
 			}
 			s.q.setHook(nil)
 			if code, msg := s.pull(t, s.token(t, "det", "", auth.ScopeGitWrite)); code != http.StatusBadRequest {
 				t.Fatalf("pull-upstream on a detached pending row = %d %q, want 400", code, msg)
 			}
-			if code, _, _ := s.create(t, "det", ""); code != http.StatusConflict {
-				t.Fatalf("plain create of a detached pending row = %d, want 409", code)
+			for _, b := range []string{"", pendingSyncBody} {
+				if code, _, _ := s.create(t, "det", b); code != http.StatusConflict {
+					t.Fatalf("create %q of a detached pending row = %d, want 409", b, code)
+				}
 			}
 			s.expect(t, "detached", "det", 2, 0, 0, meta.CreateStatePending)
 		})
@@ -326,9 +330,10 @@ func TestPendingSyncPolicyRestricted(t *testing.T) {
 			}
 			unchanged(op + " finishPendingSync")
 		}
-		for _, b := range []string{string(body), pendingSyncBody, ""} { // still 409 until PR 2 of #388
-			if code, _, _ := s.create(t, name, b); code != http.StatusConflict {
-				t.Fatalf("repeat create %q of a pending sync row = %d, want 409", b, code)
+		// repo:write alone cannot finish it (403), and other forms are 409.
+		for b, want := range map[string]int{string(body): http.StatusForbidden, pendingSyncBody: http.StatusConflict, "": http.StatusConflict} {
+			if code, _, msg := s.create(t, name, b); code != want {
+				t.Fatalf("repeat create %q of a pending sync row = %d %q, want %d", b, code, msg, want)
 			}
 		}
 		unchanged("repeat creates")
