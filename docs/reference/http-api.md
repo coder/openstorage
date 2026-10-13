@@ -89,7 +89,7 @@ about the endpoint's rollout status on upstream clusters.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 409 = a live repo holds the name; 404 = a deleted repo holds the name; 503 = a sync create's first sync could not be scheduled (below). |
+| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 200 = a sync create of a repo with the same upstream; 409 = another live repo holds the name; 404 = a deleted repo holds the name; 503 = a sync create is not finished (below). |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
@@ -142,19 +142,24 @@ about the endpoint's rollout status on upstream clusters.
 **Repeat creates** (upstream spec 2026-10-07; open.storage covers part of it, see [#388](https://github.com/coder/openstorage/issues/388)):
 
 - A new repository → **201** `Repository '<name>' created`.
-- A live repo already holds the name → **409** `repository already exists`, for every create
-  form (plain, `upstream` sync, `base_repo` copy or fork), even for an identical request.
-  Upstream answers 200 unless the upstream differs. open.storage cannot yet tell a finished
-  repo from a create that is still in progress, so a 200 could name a repo that the failing
-  create then deletes. [#388](https://github.com/coder/openstorage/issues/388) tracks the fix.
+- A sync create (`upstream`, or a `base_repo` sync) of a repo with the same upstream →
+  **200** `Repository '<name>' already exists`, with the existing `repo_id`. "Same" means the
+  same stored provider, host, owner and name, and the same `forward_pushes`. The request's
+  `ref`, `default_branch` and `auth` are ignored, and nothing is scheduled.
+- Any other create of a live name → **409**: a different upstream or `forward_pushes`, a sync
+  create of a repo without an upstream, and every plain, copy and fork create (upstream
+  answers 200 there; [#388](https://github.com/coder/openstorage/issues/388) tracks it).
+  Repos created before this release, and every S3-WAL repo (#335), answer 409 to every
+  repeat create, because open.storage cannot tell whether their create finished.
 - A deleted repo keeps its name → **404**. Nothing is restored.
-- A sync create whose first sync cannot be scheduled → **503** with `Retry-After`. The repo
-  and its upstream link and credential exist, but the create is pending, and a repeat
-  create answers 409. `POST /repos/pull-upstream` finishes the create: it needs `git:write`
-  and a token without ref-policy ops, uses the stored link, and answers 202.
+- A sync create whose first sync cannot be scheduled → **503** with `Retry-After`. The repo,
+  its upstream link and its credential exist, but the create is pending. Either of these
+  finishes it, with the stored link, and needs `git:write` and a token without ref-policy
+  ops: a compatible repeat create (→ 200), or `POST /repos/pull-upstream` (→ 202). A
+  repeat create with `repo:write` only → 403, naming `pull-upstream`.
 - A pending sync create whose upstream link was removed (`DELETE /repos/base`) stays
-  pending: `pull-upstream` → 400. Only `DELETE /repos/delete` clears it (the name then
-  answers 404).
+  pending → **503** without `Retry-After`, and `pull-upstream` → 400. Only
+  `DELETE /repos/delete` clears it (the name then answers 404).
 
 **`PATCH /repo` rules:**
 

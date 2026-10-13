@@ -322,6 +322,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var repo meta.Repo
+	var link meta.RepoUpstream
 	tracked := spec != nil && s.firstSync != nil
 	switch {
 	case spec == nil:
@@ -334,15 +335,17 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		if spec.Auth != nil && spec.Auth.Token != "" {
 			cred = &meta.GitCredential{Password: spec.Auth.Token}
 		}
-		repo, err = s.linked().CreateLinkedRepo(r.Context(), claims.Iss, url, branch, meta.RepoUpstream{
-			Provider: spec.Provider, Owner: spec.Owner, Name: spec.Name,
-			UpstreamHost: upstreamHost, ForwardOnPush: spec.ForwardPushes,
-		}, cred)
+		link = meta.RepoUpstream{Provider: spec.Provider, Owner: spec.Owner, Name: spec.Name,
+			UpstreamHost: upstreamHost, ForwardOnPush: spec.ForwardPushes}
+		repo, err = s.linked().CreateLinkedRepo(r.Context(), claims.Iss, url, branch, link, cred)
 	default:
 		// The store tracks no create state (S3-WAL, #335): a legacy row.
 		repo, err = s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
 	}
 	switch {
+	case errors.Is(err, meta.ErrAlreadyExists) && tracked:
+		s.answerTakenSyncName(w, r, claims, url, link)
+		return
 	case errors.Is(err, meta.ErrAlreadyExists):
 		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url)
 		return
@@ -421,26 +424,89 @@ const pendingSyncRetryAfter = "5"
 // request just inserted, and marks the create complete (issue #388). It
 // reports whether the caller may answer 201; otherwise it wrote the
 // error. The request already passed #395's ref-policy refusal, before the
-// insert. A scheduling failure keeps every row and answers 503:
-// pull-upstream (finishPendingSync) completes the create later. A delete
-// that landed first answers 404, never 201.
+// insert.
 func (s *syncServer) completeOwnSyncCreate(w http.ResponseWriter, r *http.Request, org, url, repoID string) bool {
 	assertf(s.firstSync != nil && org != "" && url != "" && repoID != "", "completeOwnSyncCreate: missing inputs")
 	out, err := s.firstSync.CompleteSyncCreate(r.Context(), org, repoID)
+	return s.syncCompletionOK(w, r, org, url, repoID, out, err)
+}
+
+// syncCompletionOK reports whether a sync create's completion succeeded
+// (completed, or a concurrent completion won); otherwise it writes the
+// answer. A scheduling failure keeps every row and answers 503: a retry or
+// pull-upstream (finishPendingSync) completes the create later. An
+// upstream link removed first leaves the create pending for good (#388
+// desk decision): 503 without Retry-After, naming the only way out. A
+// delete that landed first answers 404, never success.
+func (s *syncServer) syncCompletionOK(w http.ResponseWriter, r *http.Request, org, url, repoID string, out meta.CreateOutcome, err error) bool {
 	switch {
-	case err != nil: // includes a concurrently detached upstream (ErrNotFound)
+	case errors.Is(err, meta.ErrNotFound):
+		s.logger.Warn("upstream link removed before the first sync was scheduled; the repository stays pending", "org", org, "repo_id", repoID, "err", err)
+		writeErr(w, http.StatusServiceUnavailable,
+			"the repository exists, but its upstream link was removed before its first sync was scheduled; DELETE /repos/delete clears the name")
+		return false
+	case err != nil:
 		s.logger.Error("schedule first sync; the repository stays pending", "org", org, "repo_id", repoID, "err", err)
 		w.Header().Set("Retry-After", pendingSyncRetryAfter)
 		writeErr(w, http.StatusServiceUnavailable,
-			"the repository exists, but its first sync could not be scheduled; POST /repos/pull-upstream with a git:write token finishes the create")
+			"the repository exists, but its first sync could not be scheduled; retry the create with a git:write token, or POST /repos/pull-upstream")
 		return false
 	case out == meta.CreateDeleted:
 		writeErr(w, http.StatusNotFound, "repository "+strconv.Quote(url)+" was deleted, and its name cannot be reused")
 		return false
 	}
-	// AlreadyComplete: a pull-upstream finished this create first.
 	assertf(out == meta.CreateCompleted || out == meta.CreateAlreadyComplete, "CompleteSyncCreate outcome %d", out)
 	return true
+}
+
+// answerTakenSyncName answers a sync create of a taken name on a store that
+// tracks create state (issue #388). Only a repo with the same stored
+// upstream (provider, host, owner, name) and the same forward_pushes is
+// compatible: a 200 must not hide that the repo forwards pushes when the
+// caller asked it not to. The request's ref, default_branch and auth are
+// ignored. A complete repo answers 200 and schedules nothing, so repo:write
+// alone never triggers a sync. A pending one is finished only through
+// finishPendingSync, with its stored link. Legacy and deleted rows keep
+// answerTakenName's answers.
+func (s *syncServer) answerTakenSyncName(w http.ResponseWriter, r *http.Request, claims *auth.Claims, url string, want meta.RepoUpstream) {
+	assertf(claims != nil && url != "" && want.Provider != "", "answerTakenSyncName: missing inputs")
+	org := claims.Iss
+	repo, err := s.store.GetRepoByURL(r.Context(), org, url)
+	if err != nil || repo.CreateState == meta.CreateStateLegacy {
+		answerTakenName(w, r, s.store, s.internalErr, org, url) // 404 deleted, 409 legacy, or 500
+		return
+	}
+	up, err := s.ups.GetUpstream(r.Context(), repo.RepoID)
+	switch {
+	case errors.Is(err, upsync.ErrNotFound): // a plain repo, a fork, or a detached sync
+		writeErr(w, http.StatusConflict, "repository already exists")
+		return
+	case err != nil:
+		s.internalErr(w, r, "get existing upstream", err)
+		return
+	case up.Provider != want.Provider || up.UpstreamHost != want.UpstreamHost || up.Owner != want.Owner || up.Name != want.Name:
+		writeErr(w, http.StatusConflict, "repository already exists with a different upstream")
+		return
+	case up.ForwardOnPush != want.ForwardOnPush:
+		writeErr(w, http.StatusConflict, "repository already exists with a different forward_pushes setting")
+		return
+	}
+	if repo.CreateState == meta.CreateStatePending {
+		denial, out, err := s.finishPendingSync(r.Context(), claims, repo)
+		if denial != "" {
+			writeErr(w, http.StatusForbidden, denial)
+			return
+		}
+		if !s.syncCompletionOK(w, r, org, url, repo.RepoID, out, err) {
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, createRepoResponse{
+		RepoID:   repo.RepoID,
+		RepoName: repo.URL,
+		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
+		Message:  "Repository '" + repo.URL + "' already exists",
+	})
 }
 
 // finishPendingSync completes a pending sync create for a request other
