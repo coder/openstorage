@@ -41,7 +41,7 @@ func (s *server) handleGetRepoURL(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.store.GetRepoByID(r.Context(), claims.Iss, repoID)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return
 	case err != nil:
 		s.internalErr(w, r, "resolve repo url", err)

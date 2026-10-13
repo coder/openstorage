@@ -117,11 +117,11 @@ func decodeEnvelope(t *testing.T, rr *httptest.ResponseRecorder) string {
 
 func TestWriteErrEnvelope(t *testing.T) {
 	rr := httptest.NewRecorder()
-	writeErr(rr, http.StatusNotFound, "repository not found")
+	writeErr(rr, http.StatusNotFound, "webhook not found")
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rr.Code)
 	}
-	if msg := decodeEnvelope(t, rr); msg != "repository not found" {
+	if msg := decodeEnvelope(t, rr); msg != "webhook not found" {
 		t.Fatalf("error = %q", msg)
 	}
 	if rr.Header().Get("WWW-Authenticate") != "" {

@@ -249,7 +249,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !req.repoNameMatches(url) {
-		writeErr(w, http.StatusBadRequest, repoNameMismatchMsg)
+		writeProblem(w, http.StatusBadRequest, codeRepoNameMismatch, repoNameMismatchMsg)
 		return
 	}
 
@@ -511,7 +511,7 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return
 	case err != nil:
 		s.internalErr(w, r, "resolve pull-upstream repo", err)
@@ -603,7 +603,7 @@ func (s *syncServer) handlePushUpstream(w http.ResponseWriter, r *http.Request) 
 	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return
 	case err != nil:
 		s.internalErr(w, r, "resolve push-upstream repo", err)
@@ -668,7 +668,7 @@ func (s *syncServer) handleDetachBase(w http.ResponseWriter, r *http.Request) {
 	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return
 	case err != nil:
 		s.internalErr(w, r, "resolve detach repo", err)

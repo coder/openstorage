@@ -141,7 +141,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	// Before the source token is even verified: a body repo_name can only
 	// confirm the destination claim, never redirect the fork.
 	if !req.repoNameMatches(url) {
-		writeErr(w, http.StatusBadRequest, repoNameMismatchMsg)
+		writeProblem(w, http.StatusBadRequest, codeRepoNameMismatch, repoNameMismatchMsg)
 		return
 	}
 
@@ -179,7 +179,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 	if !srcClaims.HasScope(auth.ScopeGitRead) {
-		writeErr(w, http.StatusForbidden, "base_repo.auth.token is missing required scope "+auth.ScopeGitRead)
+		writeProblem(w, http.StatusForbidden, codeInsufficientScope, "base_repo.auth.token is missing required scope "+auth.ScopeGitRead)
 		return
 	}
 
@@ -189,7 +189,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	srcRepo, err := meta.ResolveRepoKey(ctx, s.store, srcClaims.Iss, srcClaims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "fork source repository not found")
+		writeProblem(w, http.StatusNotFound, codeRepositoryNotFound, "fork source repository not found")
 		return
 	case err != nil:
 		s.internalErr(w, r, "resolve fork source", err)

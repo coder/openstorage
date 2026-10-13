@@ -407,19 +407,20 @@ func TestForkRepo(t *testing.T) {
 				name     string
 				body     map[string]any
 				wantCode int
+				problem  string // upstream problem `code`
 			}{
 				{"missing auth", map[string]any{"base_repo": map[string]any{
-					"provider": "code", "operation": "fork"}}, http.StatusBadRequest},
-				{"empty token", forkBody("", nil), http.StatusBadRequest},
-				{"invalid token", forkBody("not-a-jwt", nil), http.StatusForbidden},
-				{"expired token", forkBody(expiredTok, nil), http.StatusForbidden},
-				{"wrong-scope token", forkBody(writeOnlyTok, nil), http.StatusForbidden},
-				{"org-scoped token", forkBody(orgTok, nil), http.StatusForbidden},
-				{"unknown source", forkBody(unknownSrcTok, nil), http.StatusNotFound},
-				{"bad ref", forkBody(srcReadTok, map[string]any{"ref": "no-such-branch"}), http.StatusBadRequest},
+					"provider": "code", "operation": "fork"}}, http.StatusBadRequest, "bad_request"},
+				{"empty token", forkBody("", nil), http.StatusBadRequest, "bad_request"},
+				{"invalid token", forkBody("not-a-jwt", nil), http.StatusForbidden, "forbidden"},
+				{"expired token", forkBody(expiredTok, nil), http.StatusForbidden, "forbidden"},
+				{"wrong-scope token", forkBody(writeOnlyTok, nil), http.StatusForbidden, "insufficient_scope"},
+				{"org-scoped token", forkBody(orgTok, nil), http.StatusForbidden, "forbidden"},
+				{"unknown source", forkBody(unknownSrcTok, nil), http.StatusNotFound, "repository_not_found"},
+				{"bad ref", forkBody(srcReadTok, map[string]any{"ref": "no-such-branch"}), http.StatusBadRequest, "bad_request"},
 				{"unknown sha", forkBody(srcReadTok, map[string]any{
-					"sha": strings.Repeat("beef1234", 5)}), http.StatusBadRequest},
-				{"malformed sha", forkBody(srcReadTok, map[string]any{"sha": "zzzz"}), http.StatusBadRequest},
+					"sha": strings.Repeat("beef1234", 5)}), http.StatusBadRequest, "bad_request"},
+				{"malformed sha", forkBody(srcReadTok, map[string]any{"sha": "zzzz"}), http.StatusBadRequest, "bad_request"},
 			}
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {
@@ -430,6 +431,9 @@ func TestForkRepo(t *testing.T) {
 					}
 					if msg, _ := body["error"].(string); msg == "" {
 						t.Fatalf("body %v is not an error envelope", body)
+					}
+					if body["code"] != tc.problem {
+						t.Fatalf("code = %v, want %q (body %v)", body["code"], tc.problem, body)
 					}
 					forkRequireNoRepoRow(t, e, caller.org, caller.url)
 				})

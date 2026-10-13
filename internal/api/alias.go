@@ -176,7 +176,7 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 		repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, name)
 		switch {
 		case errors.Is(err, meta.ErrNotFound):
-			aliasFail(w, ar.flavor, http.StatusNotFound, "repository not found")
+			aliasRepoNotFound(w, ar.flavor)
 			return
 		case err != nil:
 			s.aliasInternal(w, r, ar.flavor, "resolve alias repo name", err)
@@ -188,14 +188,14 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 			claimRepo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 			switch {
 			case errors.Is(err, meta.ErrNotFound):
-				aliasFail(w, ar.flavor, http.StatusNotFound, "repository not found")
+				aliasRepoNotFound(w, ar.flavor)
 				return
 			case err != nil:
 				s.aliasInternal(w, r, ar.flavor, "resolve alias repo claim", err)
 				return
 			}
 			if claimRepo.RepoID != repo.RepoID {
-				aliasFail(w, ar.flavor, http.StatusNotFound, "repository not found")
+				aliasRepoNotFound(w, ar.flavor)
 				return
 			}
 		}
@@ -232,6 +232,16 @@ func aliasFail(w http.ResponseWriter, flavor routeFlavor, httpCode int, msg stri
 		"status":  statusForHTTP(httpCode),
 		"message": msg,
 	}})
+}
+
+// aliasRepoNotFound writes the alias's repository-lookup 404 in the
+// route's envelope flavor; the plain body carries `repository_not_found`.
+func aliasRepoNotFound(w http.ResponseWriter, flavor routeFlavor) {
+	if flavor == routeRead {
+		writeRepoNotFound(w)
+		return
+	}
+	aliasFail(w, flavor, http.StatusNotFound, repoNotFoundMsg)
 }
 
 // aliasInternal logs the real error and writes the generic 500 in the

@@ -45,15 +45,28 @@ type errorEnvelope struct {
 	Instance string `json:"instance,omitempty"`
 }
 
-// writeErr writes the plain error envelope with the given status.
+// writeErr writes the plain error envelope with the given status and
+// upstream's generic code for it.
 // 401 responses additionally carry `WWW-Authenticate: Bearer` (docs/reference/authentication.md).
 func writeErr(w http.ResponseWriter, status int, msg string) {
-	assertf(status >= 400 && status < 600, "writeErr called with non-error status %d", status)
-	assertf(msg != "", "writeErr called with empty message")
+	writeProblem(w, status, genericProblemCode(status), msg)
+}
+
+// writeProblem writes the plain error envelope. It is the only writer of
+// errorEnvelope. code is the generic code for status, or a specific code
+// from specificProblemCodes whose upstream status is status.
+func writeProblem(w http.ResponseWriter, status int, code, msg string) {
+	assertf(status >= 400 && status < 600, "writeProblem called with non-error status %d", status)
+	assertf(msg != "", "writeProblem called with empty message")
 	// RFC 9457 `title` is the status text, so only registered statuses are
 	// valid here (499 is never emitted: ADR-26).
 	title := http.StatusText(status)
-	assertf(title != "", "writeErr called with unregistered status %d", status)
+	assertf(title != "", "writeProblem called with unregistered status %d", status)
+	if specific, ok := specificProblemCodes[code]; ok {
+		assertf(specific == status, "writeProblem: code %q is upstream's code for %d, not %d", code, specific, status)
+	} else {
+		assertf(code == genericProblemCode(status), "writeProblem: code %q is neither specific nor the generic code for %d", code, status)
+	}
 	if status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 	}
@@ -62,10 +75,38 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 		Type:     "about:blank",
 		Title:    title,
 		Status:   status,
-		Code:     genericProblemCode(status),
+		Code:     code,
 		Detail:   msg,
 		Instance: problemInstance(w),
 	})
+}
+
+// Specific problem codes open.storage emits, from the "Specific codes:"
+// list in the "Error codes" section of docs/upstream/openapi.yaml.
+// A specific code replaces the generic one only where the meaning matches
+// upstream's exactly (issue #352).
+const (
+	codeInsufficientScope  = "insufficient_scope"
+	codeRepoNameMismatch   = "repo_name_mismatch"
+	codeRepositoryNotFound = "repository_not_found"
+)
+
+// specificProblemCodes maps each specific code to its upstream status
+// (TestSpecificProblemCodesMatchUpstream pins it to the snapshot).
+var specificProblemCodes = map[string]int{
+	codeInsufficientScope:  http.StatusForbidden,
+	codeRepoNameMismatch:   http.StatusBadRequest,
+	codeRepositoryNotFound: http.StatusNotFound,
+}
+
+// repoNotFoundMsg is the message of every repository-lookup 404.
+const repoNotFoundMsg = "repository not found"
+
+// writeRepoNotFound writes the repository-lookup 404: the repository does
+// not exist or the token cannot access it (upstream's
+// `repository_not_found`).
+func writeRepoNotFound(w http.ResponseWriter) {
+	writeProblem(w, http.StatusNotFound, codeRepositoryNotFound, repoNotFoundMsg)
 }
 
 // instanceWriter carries the RFC 9457 `instance` of one request: the
