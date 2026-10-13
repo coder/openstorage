@@ -6,7 +6,7 @@
 # multi-platform index digest: release images must not depend on a mutable tag.
 # The build stage runs on the builder's native platform and cross-compiles
 # (pure Go, CGO off), so a multi-platform build emulates only the runtime stage.
-FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
 ARG TARGETOS TARGETARCH
 # Release builds (.github/workflows/image.yml) stamp `openstorage --version`
 # like scripts/release-archives.sh does. .git is not in the build context, so
