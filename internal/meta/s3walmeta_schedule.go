@@ -11,10 +11,10 @@
 //
 // Ambiguous PUTs: like FinishSync, the finish transitions classify a
 // superseded write by its effect. A thief that stole and finished an
-// expired claim produces the same effect, so either verdict leaves the
-// stored schedule correct; only the caller's report can differ (success,
-// ErrClaimLost or ErrNotFound), and no outcome is ever applied twice,
-// because the holder guard fails once the claim is released.
+// expired claim can move the counters exactly as ours did, so either
+// verdict leaves the stored schedule correct; only the caller's report can
+// differ (success, ErrClaimLost or ErrNotFound). No outcome is ever applied
+// twice, because the holder guard fails once the claim is released.
 
 package meta
 
@@ -124,8 +124,8 @@ func (s s3walLocalSchedule) ClaimDueSync(ctx context.Context, repoID, holder str
 // FinishPushOutcome ends holder's push run and schedules what follows in
 // the same CAS, as on SQLite. Recovery class PRED: our claim still in place
 // means the write never landed; otherwise a run-counting outcome landed iff
-// the run counter advanced by one, and a restore landed iff the lane is
-// released with its level re-marked. A restore superseded by a new claim
+// the run and success counters and the attempt moved exactly as ours, and a
+// restore landed iff the lane is released with its level re-marked. A restore superseded by a new claim
 // reruns and reports ErrClaimLost or ErrNotFound, but its effect stands.
 func (s s3walLocalSchedule) FinishPushOutcome(ctx context.Context, repoID, holder string, o PushOutcome) (RepoUpstream, error) {
 	assertf(repoID != "", "FinishPushOutcome: empty repo id")
@@ -137,7 +137,7 @@ func (s s3walLocalSchedule) FinishPushOutcome(ctx context.Context, repoID, holde
 		level = 2
 	}
 	var up RepoUpstream
-	var prevRun int
+	var prevRun, prevSuccess, prevAttempt int
 	err := s.mutate(ctx, s3walMetaMutation{
 		op: "finish push outcome",
 		fn: func(doc *s3walMetaDoc) (bool, error) {
@@ -145,7 +145,7 @@ func (s s3walLocalSchedule) FinishPushOutcome(ctx context.Context, repoID, holde
 			if err := laneHeld(repoID, u != nil && u.PushSyncing, func() string { return u.PushClaimHolder }, holder); err != nil {
 				return false, err
 			}
-			prevRun = u.PushRunCount
+			prevRun, prevSuccess, prevAttempt = u.PushRunCount, u.PushSuccessCount, u.PushAttempt
 			u.PushSyncing, u.PushClaimHolder, u.PushClaimExpiresAt, u.PushClaimForce = false, "", 0, false
 			switch o.Kind {
 			case OutcomeDone:
@@ -173,7 +173,8 @@ func (s s3walLocalSchedule) FinishPushOutcome(ctx context.Context, repoID, holde
 			switch {
 			case u == nil, u.PushSyncing && u.PushClaimHolder == holder:
 				return s3walMetaRerun
-			case o.Kind != OutcomeRestore && u.PushRunCount == prevRun+1,
+			case o.Kind == OutcomeDone && u.PushRunCount == prevRun+1 && u.PushSuccessCount == prevSuccess+b2i(o.Success) && u.PushAttempt == 0,
+				o.Kind == OutcomeRetry && u.PushRunCount == prevRun+1 && u.PushSuccessCount == prevSuccess && u.PushAttempt == prevAttempt+1,
 				o.Kind == OutcomeRestore && !u.PushSyncing && u.PushPending >= level:
 				return s3walMetaApplied
 			}
@@ -199,7 +200,7 @@ func (s s3walLocalSchedule) FinishSyncOutcome(ctx context.Context, repoID, holde
 	}
 	nowNanos, _ := s.nowNano()
 	var up RepoUpstream
-	var prevRun int
+	var prevRun, prevSuccess int
 	err := s.mutate(ctx, s3walMetaMutation{
 		op: "finish sync outcome",
 		fn: func(doc *s3walMetaDoc) (bool, error) {
@@ -207,7 +208,7 @@ func (s s3walLocalSchedule) FinishSyncOutcome(ctx context.Context, repoID, holde
 			if err := laneHeld(repoID, u != nil && u.Syncing, func() string { return u.SyncClaimHolder }, holder); err != nil {
 				return false, err
 			}
-			prevRun = u.RunCount
+			prevRun, prevSuccess = u.RunCount, u.SuccessCount
 			u.Syncing, u.SyncClaimHolder, u.SyncClaimExpiresAt = false, "", 0
 			switch o.Kind {
 			case OutcomeDone:
@@ -227,7 +228,7 @@ func (s s3walLocalSchedule) FinishSyncOutcome(ctx context.Context, repoID, holde
 			switch {
 			case u == nil, u.Syncing && u.SyncClaimHolder == holder:
 				return s3walMetaRerun
-			case o.Kind == OutcomeDone && u.RunCount == prevRun+1,
+			case o.Kind == OutcomeDone && u.RunCount == prevRun+1 && u.SuccessCount == prevSuccess+b2i(o.Success),
 				o.Kind == OutcomeRestore && !u.Syncing && u.SyncPending:
 				return s3walMetaApplied
 			}
@@ -288,4 +289,11 @@ func (s s3walLocalSchedule) ListLocalWork(ctx context.Context, org, after string
 		work = work[:limit]
 	}
 	return work, nil
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
