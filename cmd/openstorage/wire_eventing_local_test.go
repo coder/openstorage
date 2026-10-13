@@ -33,7 +33,10 @@ func TestBuildLocalSyncQueueUsesDurableScheduleOnSQLite(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	worker := &upsync.Worker{}
 	deliverer := &events.Deliverer{Webhooks: events.MetaWebhookStore{Store: ms}, Logger: logger}
-	queue, cleanup := buildLocalSyncQueue(ms, "org", t.TempDir(), worker, deliverer, nil, logger)
+	queue, cleanup, err := buildLocalSyncQueue(ms, "org", t.TempDir(), worker, deliverer, nil, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer cleanup()
 	if worker.Local == nil || worker.WaitPublication == nil {
 		t.Fatal("SQLite worker has no local schedule or publication wait")

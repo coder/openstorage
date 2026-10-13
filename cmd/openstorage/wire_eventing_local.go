@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -21,8 +23,9 @@ const localSweepInterval = time.Second
 // SQLite provides the durable local schedule: runs claim through the row,
 // a sweep replaces boot recovery and the process-local retry timers, and
 // explicit enqueues record their request before offering a run. S3WAL
-// keeps the in-process queue with boot recovery (issue #335).
-func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Worker, deliverer *events.Deliverer, repack *jobs.Repacker, logger *slog.Logger) (jobs.Queue, func()) {
+// keeps the in-process queue with boot recovery (issue #335); it fails
+// when the boot re-mark of orphaned pull claims fails (issue #424).
+func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Worker, deliverer *events.Deliverer, repack *jobs.Repacker, logger *slog.Logger) (jobs.Queue, func(), error) {
 	if lanes, ok := upsync.MetaLocalLanes(ms); ok {
 		assertf(cacheDir != "", "buildLocalSyncQueue: the publication wait needs the cache directory")
 		worker.Local = lanes
@@ -37,7 +40,11 @@ func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Wor
 		// recovery it replaces; claims left by a dead process become due
 		// when their lease expires.
 		sched.Start(pendingSyncRecoveryDelay, localSweepInterval)
-		return queue, queue.Close
+		return queue, queue.Close, nil
+	}
+	// Before the queue exists, so no claim of this process can be seen.
+	if err := remarkOrphanedSyncClaims(ms); err != nil {
+		return nil, nil, err
 	}
 	queue := jobs.NewLocal(deliverer, worker.Run, worker.RunPush, repack, logger)
 	// Pending pull-upstream requests that arrive while a run is in
@@ -96,5 +103,38 @@ func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Wor
 	return queue, func() {
 		recovery.Stop()
 		queue.Close()
+	}, nil
+}
+
+// remarkOrphanedSyncTimeout bounds each boot re-mark call.
+const remarkOrphanedSyncTimeout = 30 * time.Second
+
+// remarkOrphanedSyncClaims re-marks sync_pending on every repo the boot
+// scan lists (issue #424). A pull that crashed while it held its claim
+// consumed the marker, so without the re-mark its recovered run meets
+// the dead, unexpired lease, skips, and arms no deferred retry. The
+// caller runs it before this process can claim anything: S3-WAL serve
+// holds the instance lease by now, so every claim seen here is dead. If
+// an operator disabled the instance lease and a second serve holds a
+// live claim, the re-mark costs one follow-up run after that run
+// finishes, never a concurrent one: TryBeginSync refuses every claim
+// until its lease expires. An error fails the boot, because a later
+// retry would race this process's own claims; nothing is consumed, so
+// the next boot retries.
+func remarkOrphanedSyncClaims(ms meta.Store) error {
+	ctx, cancel := context.WithTimeout(context.Background(), remarkOrphanedSyncTimeout)
+	ids, err := ms.PendingSyncRepoIDs(ctx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("re-mark orphaned sync claims: %w", err)
 	}
+	for _, id := range ids {
+		ctx, cancel := context.WithTimeout(context.Background(), remarkOrphanedSyncTimeout)
+		err := ms.RequestSync(ctx, id)
+		cancel()
+		if err != nil && !errors.Is(err, meta.ErrNotFound) { // detached meanwhile: nothing owed
+			return fmt.Errorf("re-mark orphaned sync claim of repo %s: %w", id, err)
+		}
+	}
+	return nil
 }

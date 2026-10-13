@@ -754,8 +754,8 @@ func (s *S3WAL) RequestSync(ctx context.Context, repoID string) error {
 	})
 }
 
-// PendingSyncRepoIDs lists repos with the sync_pending marker set (boot
-// recovery, issue #86), ordered by repo id.
+// PendingSyncRepoIDs lists repos with the sync_pending marker set or an
+// in-flight claim (boot recovery, issues #86 and #424), ordered by repo id.
 func (s *S3WAL) PendingSyncRepoIDs(ctx context.Context) ([]string, error) {
 	doc, err := s.viewDoc(ctx)
 	if err != nil {
@@ -763,7 +763,7 @@ func (s *S3WAL) PendingSyncRepoIDs(ctx context.Context) ([]string, error) {
 	}
 	var ids []string
 	for id, u := range doc.Upstreams {
-		if u.SyncPending {
+		if u.SyncPending || u.Syncing {
 			ids = append(ids, id)
 		}
 	}

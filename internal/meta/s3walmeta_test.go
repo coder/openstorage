@@ -92,6 +92,7 @@ func TestS3WALMetaConformance(t *testing.T) {
 		{"SyncClaimLease", testSyncClaimLease},
 		{"FinishSyncRequiresInFlightRun", testFinishSyncRequiresInFlightRun},
 		{"RequestSyncPendingLifecycle", testRequestSyncPendingLifecycle},
+		{"PendingSyncIncludesOrphanedClaims", testPendingSyncOrphans},
 		{"PushClaimLease", testPushClaimLease},
 		{"PushClaimForceInheritance", testPushClaimForceInheritance},
 		{"PendingPushIncludesOrphanedClaims", testPendingPushOrphans},
