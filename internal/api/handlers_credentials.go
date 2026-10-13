@@ -49,7 +49,7 @@ type syncServer struct {
 	logger *slog.Logger // never nil
 
 	// firstSync is the queue's scheduler when it tracks create state
-	// (issue #388); nil on S3-WAL (#335), whose sync creates stay legacy.
+	// (issue #388); nil on S3-WAL's queue (#335), so its sync creates stay legacy.
 	firstSync upsync.FirstSyncScheduler
 }
 

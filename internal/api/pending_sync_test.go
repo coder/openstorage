@@ -181,7 +181,7 @@ func (s *pendingSyncStack) createPending(t *testing.T, name, body string) meta.R
 	s.q.setHook(func(string) error { return errors.New("injected schedule failure") })
 	code, hdr, msg := s.create(t, name, body)
 	s.q.setHook(nil)
-	if code != http.StatusServiceUnavailable || hdr.Get("Retry-After") != pendingSyncRetryAfter {
+	if code != http.StatusServiceUnavailable || hdr.Get("Retry-After") != pendingCreateRetryAfter {
 		t.Fatalf("create with a failed schedule = %d (Retry-After %q) %q, want 503 + Retry-After", code, hdr.Get("Retry-After"), msg)
 	}
 	r, err := s.e.store.GetRepoByURL(context.Background(), s.org, name)
@@ -231,9 +231,11 @@ func TestPendingSyncCreate(t *testing.T) {
 			if code, msg := s.pull(t, s.token(t, "det", "", auth.ScopeGitWrite)); code != http.StatusBadRequest {
 				t.Fatalf("pull-upstream on a detached pending row = %d %q, want 400", code, msg)
 			}
-			for _, b := range []string{"", pendingSyncBody} {
-				if code, _, _ := s.create(t, "det", b); code != http.StatusConflict {
-					t.Fatalf("create %q of a detached pending row = %d, want 409", b, code)
+			// Like a crashed fork: a plain create may retry (503), and a
+			// sync create finds no link (409).
+			for b, want := range map[string]int{"": http.StatusServiceUnavailable, pendingSyncBody: http.StatusConflict} {
+				if code, _, _ := s.create(t, "det", b); code != want {
+					t.Fatalf("create %q of a detached pending row = %d, want %d", b, code, want)
 				}
 			}
 			s.expect(t, "detached", "det", 2, 0, 0, meta.CreateStatePending)
@@ -251,6 +253,17 @@ func TestPendingSyncCreate(t *testing.T) {
 				t.Fatalf("pull-upstream on a legacy row = %d %q, want 202", code, msg)
 			}
 			s.expect(t, "untracked", "legacy", 0, 0, 2, meta.CreateStateLegacy)
+			// A pending fork row (S3-WAL stores create state since ADR-51
+			// v2): a plain create may retry, and a sync create is 409, as on
+			// a tracked store.
+			if _, err := e.store.CreateRepoWithState(context.Background(), s.org, "forking", "main", meta.CreateStatePending); err != nil {
+				t.Fatal(err)
+			}
+			for b, want := range map[string]int{"": http.StatusServiceUnavailable, pendingSyncBody: http.StatusConflict} {
+				if code, _, msg := s.create(t, "forking", b); code != want {
+					t.Fatalf("untracked create %q of a pending fork row = %d %q, want %d", b, code, msg, want)
+				}
+			}
 		})
 	})
 }
