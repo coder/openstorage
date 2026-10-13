@@ -297,7 +297,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	allocate := req.TargetBranch == nil
 	var targetBranch string
 	if !allocate && (json.Unmarshal(req.TargetBranch, &targetBranch) != nil || !wrefValidBranchInput(targetBranch)) {
-		writeErr(w, http.StatusBadRequest, "invalid target_branch")
+		writeInvalidField(w, "target_branch", "must be a valid branch name", "invalid target_branch")
 		return
 	}
 	if allocate && req.Force {
@@ -537,7 +537,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !wrefValidBranchInput(req.Name) {
-		writeErr(w, http.StatusBadRequest, "invalid tag name")
+		writeInvalidField(w, "name", "must be a valid tag name", "invalid tag name")
 		return
 	}
 	// openapi (issue #17): ref is the current field, target the deprecated
@@ -545,7 +545,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	// commit) — ResolveRef peels to a commit either way.
 	target := wrefAliasField(req.Ref, req.Target)
 	if target == "" {
-		writeErr(w, http.StatusBadRequest, "ref is required")
+		writeInvalidField(w, "ref", "is required", "ref is required")
 		return
 	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
@@ -608,7 +608,7 @@ func (s *server) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !wrefValidBranchInput(req.Name) {
-		writeErr(w, http.StatusBadRequest, "invalid tag name")
+		writeInvalidField(w, "name", "must be a valid tag name", "invalid tag name")
 		return
 	}
 	refName := "refs/tags/" + req.Name
@@ -773,7 +773,7 @@ func checkStrictObject(raw []byte, t reflect.Type, path string) error {
 	var notObject error = errors.New("body must be a JSON object")
 	if path != "" {
 		name := strings.TrimSuffix(path, ".")
-		notObject = newFieldError(name, "must be a JSON object", name+" must be a JSON object")
+		notObject = newFieldError(name, "must be an object", name+" must be a JSON object")
 	}
 	fields := make(map[string]reflect.Type, t.NumField())
 	for i := range t.NumField() {

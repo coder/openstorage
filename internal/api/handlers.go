@@ -284,7 +284,11 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		branch = "main"
 	}
 	if !validBranchName(branch) {
-		writeErr(w, http.StatusBadRequest, "invalid default_branch")
+		if req.DefaultBranch == "" { // the query parameter: no body field to name
+			writeErr(w, http.StatusBadRequest, "invalid default_branch")
+		} else {
+			writeInvalidField(w, "default_branch", "is not a valid branch name", "invalid default_branch")
+		}
 		return
 	}
 
@@ -433,7 +437,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	if branch == "" {
 		// openapi.yaml: the body is required and default_branch must be a
 		// non-empty branch name.
-		writeErr(w, http.StatusBadRequest, "default_branch is required")
+		writeInvalidField(w, "default_branch", "is required", "default_branch is required")
 		return
 	}
 	// default_branch names a BRANCH: a plain name (validated with the same
@@ -450,7 +454,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	target := githttp.HeadTarget(branch)
 	shortName := strings.TrimPrefix(branch, "refs/heads/")
 	if strings.HasPrefix(shortName, "refs/") || !validBranchName(shortName) || !validRefFormat(r.Context(), target) {
-		writeErr(w, http.StatusBadRequest, "invalid default_branch")
+		writeInvalidField(w, "default_branch", "is not a valid branch name", "invalid default_branch")
 		return
 	}
 	// The policy target is the derived HEAD symref target, not the

@@ -140,7 +140,7 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if req.Password == "" {
-		writeErr(w, http.StatusBadRequest, "password is required")
+		writeInvalidField(w, "password", "is required", "password is required")
 		return
 	}
 	repoKey := req.RepoID
@@ -173,7 +173,7 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 		writeProblem(w, http.StatusConflict, codeCredentialExists, "credential already exists")
 		return
 	case errors.Is(err, meta.ErrReservedSecret):
-		writeErr(w, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
+		writeInvalidField(w, "password", "is a reserved value", "invalid password: "+meta.ErrReservedSecret.Error())
 		return
 	case err != nil:
 		s.internalErr(w, r, "create credential", err)
@@ -226,11 +226,11 @@ func (s *syncServer) handleUpdateCredential(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if req.ID == "" {
-		writeErr(w, http.StatusBadRequest, "id is required")
+		writeInvalidField(w, "id", "is required", "id is required")
 		return
 	}
 	if req.Password == "" {
-		writeErr(w, http.StatusBadRequest, "password is required")
+		writeInvalidField(w, "password", "is required", "password is required")
 		return
 	}
 	if _, ok := s.gcredForOrg(w, r, claims.Iss, req.ID); !ok {
@@ -243,7 +243,7 @@ func (s *syncServer) handleUpdateCredential(w http.ResponseWriter, r *http.Reque
 		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return
 	case errors.Is(err, meta.ErrReservedSecret):
-		writeErr(w, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
+		writeInvalidField(w, "password", "is a reserved value", "invalid password: "+meta.ErrReservedSecret.Error())
 		return
 	case err != nil:
 		s.internalErr(w, r, "update credential", err)
@@ -268,7 +268,7 @@ func (s *syncServer) handleDeleteCredential(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if req.ID == "" {
-		writeErr(w, http.StatusBadRequest, "id is required")
+		writeInvalidField(w, "id", "is required", "id is required")
 		return
 	}
 	if _, ok := s.gcredForOrg(w, r, claims.Iss, req.ID); !ok {

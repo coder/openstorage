@@ -44,11 +44,14 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   field, and `reason` is the rule its value breaks. open.storage sends it when a body
   field has the wrong JSON type (for example `{"name":"default_branch","reason":"must be
   a string"}`; nested fields such as `base_repo.auth.token` and array elements such as
-  `paths.0` too), and when a strictly decoded body has an unknown, duplicate, or `null`
-  member, or a member that must be an object. It leaves the member out when it cannot
-  name one field: an unreadable or empty body, a JSON syntax error, a body that is not
-  an object, and unknown fields on the other bodies. The message in `detail` does not
-  change.
+  `paths.0` too), when a strictly decoded body has an unknown, duplicate, or `null`
+  member, or a member that must be an object, and when a body field fails a check of
+  its own: a required field, an allowed value, a range, or a name format (for example
+  `{"name":"limits.max_lines","reason":"must be between 1 and 2000"}`). It leaves the
+  member out when it cannot name the fields: an unreadable or empty body, a JSON syntax
+  error, a body that is not an object, an empty member name, unknown fields on the
+  other bodies, rules across fields (such as `base_repo` and `upstream` together), and
+  query parameters. The message in `detail` does not change.
   The content type stays `application/json`. `status` is a JSON number, as in upstream's
   bodies: decode the body into a struct or a map of arbitrary values, not a string-only
   map (such as Go's `map[string]string`). Ref-moving write

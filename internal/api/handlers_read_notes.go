@@ -70,7 +70,7 @@ func (s *server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 		// commit, mirroring the notes write surface.
 		resolved, err := gitread.ResolveRef(r.Context(), repoPath, sha, false)
 		if errors.Is(err, gitread.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "object_ref does not resolve to a commit: "+sha)
+			writeProblem(w, http.StatusNotFound, codeRefNotFound, "object_ref does not resolve to a commit: "+sha)
 			return
 		} else if err != nil {
 			s.internalErr(w, r, "resolve note object_ref", err)

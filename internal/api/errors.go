@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -106,6 +107,8 @@ func writeProblemParams(w http.ResponseWriter, status int, code, msg string, par
 	})
 }
 
+var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+
 // writeInvalid writes the 400 for a request body that is not valid. msg
 // is the message; cause adds `invalid_params` when it names a field
 // (invalidParamsFor).
@@ -135,6 +138,27 @@ func newFieldErrors(msg string, params ...invalidParam) *fieldError {
 		assertf(p.Name != "" && p.Reason != "", "newFieldErrors: incomplete param %+v", p)
 	}
 	return &fieldError{params: params, msg: msg}
+}
+
+// requiredFields returns a fieldError naming each empty field of fields
+// (dotted wire path -> value), in the order given, or nil when none is
+// empty.
+func requiredFields(msg string, fields ...[2]string) error {
+	var params []invalidParam
+	for _, f := range fields {
+		if f[1] == "" {
+			params = append(params, invalidParam{Name: f[0], Reason: "is required"})
+		}
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return newFieldErrors(msg, params...)
+}
+
+// writeInvalidField writes the 400 for one invalid request-body field.
+func writeInvalidField(w http.ResponseWriter, name, reason, msg string) {
+	writeInvalid(w, msg, newFieldError(name, reason, msg))
 }
 
 // fieldErrorUnder returns an error with message msg that names the field
@@ -182,6 +206,10 @@ func invalidParamsFor(err error) []invalidParam {
 func jsonKind(t reflect.Type) string {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	// encoding/json decodes these from a JSON string, whatever their kind.
+	if reflect.PointerTo(t).Implements(textUnmarshalerType) || (t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8) {
+		return "a string"
 	}
 	switch t.Kind() {
 	case reflect.String:
