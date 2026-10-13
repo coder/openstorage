@@ -20,7 +20,7 @@ Its schema is `s3walMetaDoc` in `internal/meta/s3walmeta.go`, with
 baseline `d94125f6`. The first release that contains the baseline is
 v0.16.0.
 
-Four facts shape the format decision:
+Five facts shape the format decision:
 
 1. **A v1 binary rejects every other version.** `decodeS3WALMetaDoc`
    returns `document version N unsupported (want 1)` for any `v` other than
@@ -35,15 +35,24 @@ Four facts shape the format decision:
    `signing-key` and `purge-repo` commands open it directly and do not take
    the instance lease. The `openstorage hook` subprocess reads it today
    (sync fence, signing keys, webhooks), and under #335 it also records push
-   intent. Git runs the hook through a script that names the path
-   `os.Executable()` returned to `serve` (`internal/githttp/hydrate.go`). If an
-   operator replaces the binary at that path while the old `serve` runs, new
-   hook subprocesses run the new binary.
+   and pull intent (`RequestPush`, `RequestSync`). Git runs the hook through a
+   script that names the path `os.Executable()` returned to `serve`
+   (`internal/githttp/hydrate.go`). If an operator replaces the binary at that
+   path while the old `serve` runs, new hook subprocesses run the new binary.
+   The `reference-transaction` hook, installed only if absent, can keep an
+   older path, but it never reads metadata.
 4. **The instance lease detects a second `serve`, it does not enforce
    one.** The background org-key refresher of a running process drops read
    errors and keeps its last snapshot. A process that stays up across a
    conversion keeps answering token checks from that snapshot, while each of
-   its foreground metadata operations fails.
+   its foreground metadata operations fails. Git requests then answer 404,
+   because repository resolution maps every metadata error to "not found"
+   (`cmd/openstorage/main.go`, `ResolveRepo`).
+5. **Hook eventing fails open.** If the hook cannot use the metadata store,
+   it logs `hook eventing disabled` and accepts the push without events
+   (`cmd/openstorage/wire_eventing.go`). These hooks run after the ref update
+   commits. A hook that cannot decode the document therefore drops the push's
+   webhooks and, under #335, its push and pull intent.
 
 ## Fields and features that need v2
 
@@ -55,16 +64,20 @@ conversion lossy but safe.
 | Field (v2) | Type | Meaning | Absent value means | Consumer |
 |---|---|---|---|---|
 | `upstreams[id].push_attempt` | int | Retry position of outstanding push work (0 = first attempt). It stays in the row while the run executes. | first attempt | #335 ([ADR-50](050-local-scheduling-state-is-row-owned.md) parity) |
-| `upstreams[id].push_due` | int64 unix ns | Push work is not claimable before this time. | due now | #335 |
+| `upstreams[id].push_due` | int64 unix ns | Push work is not claimable before this time. While a run holds the lane, it holds the claim time, and `RequestPushNow` sets it to 0 to mark an explicit request made during the run (ADR-50, `internal/meta/sqlite_schedule.go`). | due now, and during a claim: an explicit request arrived | #335 |
 | `upstreams[id].sync_due` | int64 unix ns | Pull work is not claimable before this time. Set only by a `restore` after a failed publication wait or a shutdown. | due now | #335, [#343](https://github.com/coder/openstorage/issues/343) |
 | `repos[id].create_state` | int | 0 legacy, 1 pending, 2 complete, as in `repos.create_state` on PostgreSQL and SQLite. | legacy (a repeat create answers 409) | [#388](https://github.com/coder/openstorage/issues/388), remaining criteria of [#387](https://github.com/coder/openstorage/issues/387) |
 
 The three schedule fields carry the ADR-50 transitions (`RequestPushNow`,
 `ClaimDuePush`, `ClaimDueSync`, `FinishPushOutcome`, `FinishSyncOutcome`,
-`ListLocalWork`) to S3WAL. With them, S3WAL gets:
+`ListLocalWork`, `CompleteSyncRepoCreate`) to S3WAL. On S3WAL,
+`ClaimDueSync` keeps the existing fence-token write into the
+repository-group manifest and the pre-clear on steal
+(`internal/meta/s3walmeta_eventing.go`, `TryBeginSync`). With them, S3WAL
+gets:
 
-- Git-surface push scheduling: a hook records intent with one metadata CAS,
-  as on SQLite. This closes the S3WAL gap in
+- Git-surface push scheduling: a hook records push or pull intent with one
+  metadata CAS, as on SQLite. This closes the S3WAL gap in
   [wire compatibility](../explanation/wire-compatibility.md) and the
   S3WAL part of #192 criterion E1.
 - Retries that survive a restart, which replaces the in-process
@@ -87,6 +100,13 @@ These are not consumers:
 
 Repository-group manifests stay v1. This record covers `_wal/meta.json`
 only.
+
+**The rule during a claim.** A v1 document can hold a claim left by a
+stopped or crashed process. After conversion to v2, that lane reads
+`push_due = 0`, which during a claim means "an explicit request arrived".
+No run holds that claim any more, so no `retry` or `restore` reads that
+mark. The next `ClaimDuePush` steals the expired claim and writes its own
+claim time.
 
 Due times use the same process wall clock as the existing claim leases
 (`WithNowFunc`). A skewed clock can only start a retry early or late. No
@@ -112,6 +132,14 @@ binary reads v2. Conversion between v1 and v2 is an explicit, fenced command
   and stay, so the v1 boot recovery runs them at once with a fresh retry
   budget. The cost is at most one extra retry series against an unreachable
   upstream. In-flight backoff and attempt counts are lost.
+- **Rollback and in-flight claims.** v1 boot recovery lists pull lanes only
+  by `sync_pending` (`PendingSyncRepoIDs`), and v1 has no sweep that steals
+  an expired pull claim. A lane left with `syncing = true` and
+  `sync_pending = false` (for example after a failed shutdown `restore`)
+  is stranded under v1. So `--to 1` refuses while any claim is live,
+  and it sets `sync_pending` on every lane that holds an expired pull claim.
+  The push lane needs no change: v1 boot recovery already lists
+  `push_syncing` lanes.
 - **Verdict.** It meets all three policy obligations, and old binaries fail
   closed instead of guessing.
 
@@ -176,6 +204,7 @@ fields under `v: 1`.
 | Variant | Behavior of the v2 release | For | Against |
 |---|---|---|---|
 | **R1: convert before serve** | `serve`, `hook`, `signing-key` and `purge-repo` read v2 only. On a v1 document they stop with an error that names the conversion command, and they write nothing. Only the conversion command reads v1. A new, empty bucket starts at v2. | One scheduling path per binary. Small test matrix. Every write and its meaning are unambiguous. | The upgrade has one extra step. There is no trial run of the new binary on unconverted data. |
+| **R1b: `serve` converts at start** | As R1, but `serve` converts a v1 document after its probe and lease acquisition when an explicit setting asks for it. This follows the SQLite precedent of an idempotent upgrade at start. | No extra command for the upgrade. Reuses the probe, lease and heartbeat of `serve`. | The downgrade still needs a separate command with the same fencing, so two conversion paths exist. A setting left on converts every bucket the process starts against. |
 | **R2: dual-format window** | The v2 release also serves v1 documents, with the v2 features off, and converts later on command. A later release drops v1. | Plain binary swap. Rollback before conversion is a plain downgrade. | Each binary keeps the timer path for v1 documents and the durable path for v2, chosen on each read: the two-path state that ADR-50 removed on SQLite. Two releases carry the extra path and its tests. |
 
 ## Recommendation: Option A with rollout R1
@@ -187,16 +216,29 @@ fields under `v: 1`.
    every other version, and the encoder asserts v2.
 3. **Conversion command.** A new subcommand, proposed name
    `openstorage s3wal-meta convert --to 2` (and `--to 1`):
-   - It acquires the instance lease (`s3wal.AcquireInstanceLease`). It
-     refuses while a fresh lease held by another process exists, so it
-     cannot run under a live `serve`. It releases the lease when done.
+   - It first runs the conditional-write probe, as `serve` does. Then it
+     acquires the instance lease (`s3wal.AcquireInstanceLease`). It refuses
+     while a fresh lease held by another process exists, so it cannot run
+     under a live `serve`. It ignores `OPENSTORAGE_S3WAL_LEASE_TTL=0`: the
+     lease is always on for a conversion. A `serve` started with the lease
+     off is invisible to the command, and the procedure says so.
+   - It renews the lease (`Heartbeat`) for its whole run, and it stops
+     before its write if a renewal fails. It joins the heartbeat before it
+     releases the lease.
+   - It can steal the expired lease of a `serve` that hangs but is still
+     alive. That `serve` stops at its next renewal. CAS keeps the document
+     safe meanwhile (fact 2).
    - It reads the document, checks the source version, writes the converted
-     document with `If-Match`, and re-reads it to verify. An ambiguous PUT
-     resolves through the writer nonce, as every other metadata write does.
+     document with `If-Match`, and re-reads it to verify. It has its own
+     encoder and a recovery read that decodes both versions: `mutate`
+     cannot serve here, because its recovery read rejects every version but
+     the binary's own. An ambiguous PUT resolves through the writer nonce.
+   - It compares the decoded tables of the source and the result, apart
+     from the four fields, `v`, `seq` and `writer`. It reports a mismatch
+     and exits non-zero. It prints the version, `seq`, and row counts per
+     table for both documents.
    - Re-running it on a document already at the target version changes
      nothing and exits 0.
-   - It prints the source and target version, `seq`, and row counts per
-     table.
    - `--to 1` is the downgrade path. It takes the same lease and applies the
      zero-value rule in reverse: it drops the four fields.
 4. **Supported sources.** v1 documents written by v0.16.0 or later (the
@@ -204,8 +246,15 @@ fields under `v: 1`.
    to the last v1 release, as the release-pair harness already covers for
    v0.15.0 to v0.16.0.
 5. **No automatic conversion.** Neither `serve` nor any other command
-   converts on its own. An irreversible format change happens only on an
-   explicit operator command.
+   converts on its own. A format change happens only on an explicit
+   operator command. R1b is an acceptable alternative for the upgrade
+   direction, and the format does not depend on the choice.
+6. **Create state before #388 resumes.** S3WAL writes a create state only
+   where an S3WAL completion path exists. `CreateRepoWithState` stores the
+   requested state (today only plain creates call it, with `complete`), and
+   `CompleteRepoCreate` stores `complete`. `CreateLinkedRepo` inserts
+   legacy rows until S3WAL implements `CompleteSyncRepoCreate` (PR 3), so no
+   S3WAL row stays pending without a way to finish.
 
 Reasons:
 
@@ -228,22 +277,30 @@ Reasons:
 
 **Upgrade (v1 release to the first v2 release).**
 
-1. Stop `serve` with SIGTERM and wait for it to exit. It releases the
-   instance lease. Do not run `signing-key` or `purge-repo` until step 5
-   ends.
+1. Stop `serve` with SIGTERM. Wait for the process and its hook children
+   to exit, as the [backup runbook](../how-to/backup-restore-s3wal.md)
+   requires. Do not run `signing-key` or `purge-repo` until step 5 ends.
 2. Take a verified [stopped-node backup](../how-to/backup-restore-s3wal.md).
 3. Replace the binary. Replace it only while `serve` is stopped: hook
    subprocesses run whatever binary is at the path (fact 3).
 4. Run `openstorage s3wal-meta convert --to 2` with the serve configuration.
-   Check the printed counts against the backup inventory.
+   `serve` releases its lease on SIGTERM within a bounded, best-effort
+   window. If the command reports a fresh lease after step 1, confirm that
+   no `serve` runs, wait for the recorded lease TTL plus the store-clock
+   margin, and run it again. The
+   command checks its own result (see above) and exits non-zero on a
+   mismatch.
 5. Start `serve`. Pending push and pull work runs at once, at the first
    attempt.
 
 **Downgrade (back to a v1 release).** Its support status is open decision
 3.
 
-1. Stop `serve` and wait for it to exit.
-2. Run `openstorage s3wal-meta convert --to 1` with the v2 binary.
+1. Stop `serve` with SIGTERM. Wait for the process and its hook children
+   to exit. Do not run `signing-key` or `purge-repo` until step 3 ends.
+2. Run `openstorage s3wal-meta convert --to 1` with the v2 binary. A fresh
+   lease is handled as in upgrade step 4. The command refuses while any
+   claim is live.
 3. Replace the binary with the v1 release and start it.
 
 Data written after the upgrade stays. Backoff positions are lost, and every
@@ -254,14 +311,17 @@ backup.
 **What a missed step does.** A v1 binary on a v2 bucket stops at its first
 metadata read with `document version 2 unsupported (want 1)`. A v2 binary on
 a v1 bucket stops with an error that names the conversion command. Neither
-writes the document.
+writes `meta.json`. A `serve` can still write its lease and probe objects
+before its first metadata read. A binary replaced under a running `serve`
+is the exception: its hooks accept pushes and drop their events (fact 5).
 
 ## Mixed-version behavior (R1)
 
 | Process | Document v1 | Document v2 |
 |---|---|---|
 | v1 `serve`, `hook`, `signing-key`, `purge-repo` | works (today) | fails closed at the first metadata read. A process started before the conversion fails its next foreground metadata operation, because the conditional GET returns the v2 body. Its org-key refresher keeps the last snapshot, so the procedure stops it first. |
-| v2 `serve`, `hook`, `signing-key`, `purge-repo` | fails closed with the conversion hint, no write | works |
+| v2 `serve`, `signing-key`, `purge-repo` | fails closed with the conversion hint, no write to `meta.json` | works |
+| v2 `hook` (binary replaced under a running v1 `serve`) | Enforcement reads (sync fence, signature keys), where a push needs them, refuse the ref update. Eventing fails open: the push is accepted, and its webhooks and intent are dropped with a log line (fact 5). | works |
 | v2 `s3wal-meta convert --to 2` | converts (under the lease) | no change, exit 0 |
 | v2 `s3wal-meta convert --to 1` | no change, exit 0 | converts (under the lease) |
 
@@ -274,6 +334,8 @@ Tests are listed with the PR that adds them.
      versions 1 and 3 on normal paths. The encoder asserts v2.
    - Every v2 entry point fails on a v1 document with the conversion hint and
      no write: the document `seq` and ETag do not change.
+   - A v2 hook on a v1 document: the push is accepted without events, the
+     log line names the version error, and `meta.json` is unchanged.
 2. **Conversion (PR 1).**
    - A v1 fixture corpus (documents written by the official v0.16.0 and
      v0.17.0 binaries through the release-upgrade harness) converts to v2.
@@ -284,26 +346,38 @@ Tests are listed with the PR that adds them.
      command gets 412, re-reads, and keeps the writer's change. A v1 writer
      whose write lands after the conversion gets 412, then a decode error,
      and the v2 document is unchanged.
-   - An injected ambiguous PUT resolves by the writer nonce.
+   - An injected ambiguous PUT resolves by the writer nonce, both when the
+     PUT was lost and when it landed.
+   - The command ignores `OPENSTORAGE_S3WAL_LEASE_TTL=0`. It stops before its
+     write when a lease renewal fails.
+   - `--to 1` refuses while a claim is live. It sets `sync_pending` on a lane
+     with an expired pull claim, and the official v1 binary then runs that
+     pull at boot.
 3. **Zero-value rule (PR 1).**
    - Property test: for random v2 documents d, `to2(to1(d))` equals d with
      the four fields cleared.
    - The cleared document behaves as v1: rows are legacy (repeat create 409),
      and lanes are due now at attempt 0.
+   - Behavior, not only data: a document with a live claim, an expired
+     claim, a backoff and a pending create converts in both directions. The
+     official v1 binary and the v2 binary each serve the result, and every
+     lane runs at most once per request.
 4. **Release pair (PR 1, then the release).** Extend
    [`TestS3WAL_ReleaseUpgrade`](../how-to/test-release-upgrade.md):
    - The official last-v1 binary writes and stops. The candidate converts,
      then serves with the existing checks.
    - Downgrade drill: the candidate runs `--to 1`, then the official v1
      binary serves the same checks.
-   - The official v1 binary on a v2 bucket fails at startup and writes
-     nothing.
+   - The official v1 binary on a v2 bucket fails at startup and does not
+     change `meta.json`.
 5. **Schedule (PRs 2 to 4).**
    - The ADR-50 per-transition conformance table and the C12 model check
      (random transitions against a pure-Go reference model) run on SQLite
      and S3WAL from one shared suite.
    - C1 to C11 of the [#266 design note](https://github.com/coder/openstorage/issues/266#issuecomment-5826596313)
      run at worker level on S3WAL in the `test-s3wal` CI job (SeaweedFS).
+   - `ClaimDueSync` on S3WAL writes the manifest fence token and pre-clears
+     it on steal, as `TryBeginSync` does.
    - The S3WAL skips in `local_hook_e2e_test.go`,
      `local_forward_e2e_test.go`, `local_pull_publication_e2e_test.go` and
      `e2e_sync_shutdown_test.go` are removed.
@@ -319,8 +393,9 @@ Each PR has at most 500 changed lines.
 
 1. v2 codec, conversion command, zero-value tests, release-pair extension,
    and the operator procedure in `storage-engine.md`, `deploy-production.md`
-   and `backup-restore-s3wal.md`. S3WAL `CreateRepoWithState` stores the
-   state. The API keeps answering 409 for S3WAL until #388 resumes.
+   and `backup-restore-s3wal.md`. S3WAL stores create states as in
+   recommendation item 6. The API keeps answering 409 for S3WAL until #388
+   resumes.
 2. `meta.LocalScheduleStore` on `*meta.S3WAL`, with no callers.
 3. The S3WAL worker on the sweep, and shutdown `restore` (#343).
 4. Hook marking on S3WAL, the census update, and the wire-compatibility row.
@@ -372,7 +447,7 @@ procedure documented and tested.
 
 **For the maintainer desk.**
 
-- The choice among Options A, A′, B and C, and between R1 and R2 once
+- The choice among Options A, A′, B and C, and among R1, R1b and R2 once
   decision 1 is made.
 - The field list, the zero-value rule, the command name and flags, and the
   supported source versions.
