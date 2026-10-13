@@ -43,7 +43,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   upstream's `ValidationProblemDetails`): `name` is the dotted wire path of the invalid
   field, and `reason` is the rule its value breaks. open.storage sends it when a body
   field has the wrong JSON type (for example `{"name":"default_branch","reason":"must be
-  a string"}`), and when a strictly decoded body has an unknown, duplicate, or `null`
+  a string"}`; nested fields such as `base_repo.auth.token` and array elements such as
+  `paths.0` too), and when a strictly decoded body has an unknown, duplicate, or `null`
   member, or a member that must be an object. It leaves the member out when it cannot
   name one field: an unreadable or empty body, a JSON syntax error, a body that is not
   an object, and unknown fields on the other bodies. The message in `detail` does not

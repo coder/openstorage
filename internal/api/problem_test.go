@@ -382,6 +382,9 @@ func TestInvalidParamsFor(t *testing.T) {
 		{`{"auth":{"token":1}}`, "auth.token", "must be a string"},
 		{`{"auth":3}`, "auth", "must be an object"},
 		{`{"tags":"x"}`, "tags", "must be an array"},
+		// An element error names the element (Go 1.27 encoding/json).
+		{`{"tags":["a",1]}`, "tags.1", "must be a string"},
+		{`{"meta":{"k":1}}`, "meta.k", "must be a string"},
 		{`{"meta":[]}`, "meta", "must be an object"},
 		{`[]`, "", ""},             // the body itself has the wrong type
 		{`{`, "", ""},              // syntax error
@@ -439,6 +442,39 @@ func TestInvalidParamsFor(t *testing.T) {
 	}
 	if err := strictJSON([]byte(`[]`), new(strictReq)); err == nil || invalidParamsFor(err) != nil {
 		t.Errorf("non-object body: %v, invalidParamsFor = %+v, want none", err, invalidParamsFor(err))
+	}
+	// An empty member name has no dotted path: the old message, no item.
+	for _, body := range []string{`{"":1}`, `{"author":{"":1}}`} {
+		err := strictJSON([]byte(body), new(strictReq))
+		if err == nil || !strings.HasPrefix(err.Error(), "unknown field ") || invalidParamsFor(err) != nil {
+			t.Errorf("%s: err %v, invalidParamsFor = %+v, want an unknown-field error and none", body, err, invalidParamsFor(err))
+		}
+	}
+	// A member decoded on its own names fields below its prefix.
+	type sub struct {
+		Auth struct {
+			Token string `json:"token"`
+		} `json:"auth"`
+	}
+	for _, tc := range []struct{ body, name, reason string }{
+		{`{"auth":{"token":1}}`, "base_repo.auth.token", "must be a string"},
+		{`3`, "base_repo", "must be an object"},
+		{`{`, "", ""},
+	} {
+		err := fieldErrorUnder("base_repo", "invalid base_repo", json.Unmarshal([]byte(tc.body), new(sub)))
+		got := invalidParamsFor(err)
+		if err.Error() != "invalid base_repo" {
+			t.Errorf("%s: message = %q", tc.body, err)
+		}
+		if tc.name == "" {
+			if got != nil {
+				t.Errorf("%s: invalidParamsFor = %+v, want none", tc.body, got)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0] != (invalidParam{Name: tc.name, Reason: tc.reason}) {
+			t.Errorf("%s: invalidParamsFor = %+v, want [{%s %s}]", tc.body, got, tc.name, tc.reason)
+		}
 	}
 }
 
@@ -664,6 +700,13 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 		{"create type error", http.MethodPost, "/api/v1/repos", freshTok, `{"default_branch":true}`, &param{"default_branch", "must be a string"}},
 		{"create branch type error", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":"x","force":"yes"}`, &param{"force", "must be a boolean"}},
 		{"strict unknown field", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"sha":"main","note":"n","bogus":1}`, &param{"bogus", "is not a known field"}},
+		{"nested base_repo type", http.MethodPost, "/api/v1/repos", freshTok, `{"base_repo":{"provider":"github","owner":"o","name":"n","auth":{"token":1}}}`,
+			&param{"base_repo.auth.token", "must be a string"}},
+		{"nested upstream type", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":1,"name":"n"}}`,
+			&param{"upstream.owner", "must be a string"}},
+		{"upstream not an object", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":3}`, &param{"upstream", "must be an object"}},
+		{"upstream unknown field", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":"o","name":"n","x":1}}`, nil},
+		{"strict empty member name", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"":1}`, nil},
 		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, nil},
 		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, nil},
 	} {
@@ -686,7 +729,7 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != tc.want.name || p.InvalidParams[0].Reason != tc.want.reason {
 				t.Fatalf("invalid_params = %+v, want [{%s %s}] (body %s)", p.InvalidParams, tc.want.name, tc.want.reason, body)
 			}
-			if !strings.HasPrefix(p.Error, "invalid JSON body: ") {
+			if !strings.HasPrefix(p.Error, "invalid ") {
 				t.Fatalf("error = %q, want the unchanged decode message", p.Error)
 			}
 		})

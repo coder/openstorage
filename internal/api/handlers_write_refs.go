@@ -810,7 +810,11 @@ func checkStrictObject(raw []byte, t reflect.Type, path string) error {
 		}
 		ft, ok := fields[name]
 		if !ok {
-			return newFieldError(path+name, "is not a known field", fmt.Sprintf("unknown field %q", path+name))
+			msg := fmt.Sprintf("unknown field %q", path+name)
+			if name == "" { // an empty member name has no dotted wire path
+				return errors.New(msg)
+			}
+			return newFieldError(path+name, "is not a known field", msg)
 		}
 		if seen[name] {
 			return newFieldError(path+name, "appears more than once", fmt.Sprintf("duplicate field %q", path+name))

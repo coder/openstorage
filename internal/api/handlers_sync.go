@@ -132,8 +132,9 @@ const upstreamAppAccessMsg = `upstream access "app" (the default for github) is 
 
 // parseUpstreamConfig decodes and validates an UpstreamConfig and maps it
 // onto the sync machinery's spec (no credential, no push forwarding).
-// errMsg != "" means 400 with that envelope message; nothing is stored.
-func parseUpstreamConfig(raw json.RawMessage) (spec *usyncBaseRepo, host, errMsg string) {
+// A non-nil err means 400 with its message, naming the invalid upstream
+// fields where it can; nothing is stored.
+func parseUpstreamConfig(raw json.RawMessage) (spec *usyncBaseRepo, host string, err error) {
 	assertf(jsonPresent(raw), "parseUpstreamConfig: absent upstream")
 	var cfg upstreamConfig
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -141,39 +142,39 @@ func parseUpstreamConfig(raw json.RawMessage) (spec *usyncBaseRepo, host, errMsg
 	// a branch) would silently change what the link syncs.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, "", "invalid upstream: " + err.Error()
+		return nil, "", fieldErrorUnder("upstream", "invalid upstream: "+err.Error(), err)
 	}
 	if cfg.Provider == "" || cfg.Owner == "" || cfg.Name == "" {
-		return nil, "", "upstream provider, owner, and name are required"
+		return nil, "", errors.New("upstream provider, owner, and name are required")
 	}
 	// ProviderHost knows exactly upstream's UpstreamConfig provider enum;
 	// code/code.storage are not in it (a copy uses base_repo).
 	defaultHost, known := upsync.ProviderHost(cfg.Provider)
 	if !known {
-		return nil, "", "unsupported upstream provider " + strconv.Quote(cfg.Provider)
+		return nil, "", errors.New("unsupported upstream provider " + strconv.Quote(cfg.Provider))
 	}
 	switch cfg.Access {
 	case "", "app", "public":
 	default:
-		return nil, "", "invalid upstream access " + strconv.Quote(cfg.Access)
+		return nil, "", errors.New("invalid upstream access " + strconv.Quote(cfg.Access))
 	}
 	if cfg.Provider != "github" && cfg.Access != "" {
-		return nil, "", "upstream access applies to provider github only"
+		return nil, "", errors.New("upstream access applies to provider github only")
 	}
 	if cfg.Provider == "github" && cfg.Access != "public" {
-		return nil, "", upstreamAppAccessMsg
+		return nil, "", errors.New(upstreamAppAccessMsg)
 	}
 	host = cfg.Host
 	if host != "" && !validUpstreamHost(host) {
-		return nil, "", "invalid upstream host " + strconv.Quote(cfg.Host)
+		return nil, "", errors.New("invalid upstream host " + strconv.Quote(cfg.Host))
 	}
 	if host == "" {
 		host = defaultHost
 	}
 	if host == "" {
-		return nil, "", "upstream host is required for provider " + strconv.Quote(cfg.Provider)
+		return nil, "", errors.New("upstream host is required for provider " + strconv.Quote(cfg.Provider))
 	}
-	return &usyncBaseRepo{Provider: cfg.Provider, Owner: cfg.Owner, Name: cfg.Name}, host, ""
+	return &usyncBaseRepo{Provider: cfg.Provider, Owner: cfg.Owner, Name: cfg.Name}, host, nil
 }
 
 // validUpstreamHost accepts the two documented upstream_host shapes — a
@@ -263,16 +264,17 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	upstreamHost, hostField := "", ""
 	switch {
 	case jsonPresent(req.Upstream):
-		var errMsg string
-		if spec, upstreamHost, errMsg = parseUpstreamConfig(req.Upstream); errMsg != "" {
-			writeErr(w, http.StatusBadRequest, errMsg)
+		var err error
+		if spec, upstreamHost, err = parseUpstreamConfig(req.Upstream); err != nil {
+			writeInvalid(w, err.Error(), err)
 			return
 		}
 		hostField = "upstream host"
 	case jsonPresent(req.BaseRepo):
 		spec = &usyncBaseRepo{}
 		if err := json.Unmarshal(req.BaseRepo, spec); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid base_repo: "+err.Error())
+			fe := fieldErrorUnder("base_repo", "invalid base_repo: "+err.Error(), err)
+			writeInvalid(w, fe.Error(), fe)
 			return
 		}
 		var errMsg string

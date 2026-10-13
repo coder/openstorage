@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -112,11 +113,11 @@ func writeInvalid(w http.ResponseWriter, msg string, cause error) {
 	writeProblemParams(w, http.StatusBadRequest, genericProblemCode(http.StatusBadRequest), msg, invalidParamsFor(cause))
 }
 
-// fieldError is a request-body error that names one field. Error()
-// returns msg, the message the body already carries.
+// fieldError is a request-body error that names its invalid fields.
+// Error() returns msg, the message the body already carries.
 type fieldError struct {
-	param invalidParam
-	msg   string
+	params []invalidParam
+	msg    string
 }
 
 func (e *fieldError) Error() string { return e.msg }
@@ -124,18 +125,49 @@ func (e *fieldError) Error() string { return e.msg }
 // newFieldError returns a fieldError for the field at the dotted wire path
 // name.
 func newFieldError(name, reason, msg string) *fieldError {
-	assertf(name != "" && reason != "" && msg != "", "newFieldError(%q, %q, %q): empty argument", name, reason, msg)
-	return &fieldError{param: invalidParam{Name: name, Reason: reason}, msg: msg}
+	return newFieldErrors(msg, invalidParam{Name: name, Reason: reason})
+}
+
+// newFieldErrors returns a fieldError for several fields, one item each.
+func newFieldErrors(msg string, params ...invalidParam) *fieldError {
+	assertf(msg != "" && len(params) > 0, "newFieldErrors(%q, %d params): empty argument", msg, len(params))
+	for _, p := range params {
+		assertf(p.Name != "" && p.Reason != "", "newFieldErrors: incomplete param %+v", p)
+	}
+	return &fieldError{params: params, msg: msg}
+}
+
+// fieldErrorUnder returns an error with message msg that names the field
+// cause names, below the request-body member prefix: for a member that
+// is decoded on its own from a json.RawMessage. A type error on the
+// member itself names prefix. When cause names no field, the error names
+// none either.
+func fieldErrorUnder(prefix, msg string, cause error) error {
+	assertf(prefix != "" && msg != "", "fieldErrorUnder(%q, %q): empty argument", prefix, msg)
+	if te, ok := errors.AsType[*json.UnmarshalTypeError](cause); ok && te.Field == "" && te.Type != nil {
+		if kind := jsonKind(te.Type); kind != "" {
+			return newFieldError(prefix, "must be "+kind, msg)
+		}
+	}
+	params := invalidParamsFor(cause)
+	if len(params) == 0 {
+		return errors.New(msg)
+	}
+	for i := range params {
+		params[i].Name = prefix + "." + params[i].Name
+	}
+	return newFieldErrors(msg, params...)
 }
 
 // invalidParamsFor names the request-body field that err is about: a
 // *fieldError, or encoding/json's *UnmarshalTypeError with a field path
-// and a JSON kind. It returns nil when it cannot name one (syntax errors,
+// and a JSON kind (encoding/json reports an array element or map value
+// by its index or key, as in `paths.0`). It returns nil when it cannot name one (syntax errors,
 // a wrong top-level type, encoding/json's unknown-field error, which has
 // no path): upstream then leaves `invalid_params` out.
 func invalidParamsFor(err error) []invalidParam {
 	if fe, ok := errors.AsType[*fieldError](err); ok {
-		return []invalidParam{fe.param}
+		return slices.Clone(fe.params)
 	}
 	if te, ok := errors.AsType[*json.UnmarshalTypeError](err); ok && te.Field != "" && te.Type != nil {
 		if kind := jsonKind(te.Type); kind != "" {
