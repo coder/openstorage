@@ -773,7 +773,7 @@ func checkStrictObject(raw []byte, t reflect.Type, path string) error {
 	var notObject error = errors.New("body must be a JSON object")
 	if path != "" {
 		name := strings.TrimSuffix(path, ".")
-		notObject = newFieldError(name, "must be a JSON object", name+" must be a JSON object")
+		notObject = newFieldError(name, "must be an object", name+" must be a JSON object")
 	}
 	fields := make(map[string]reflect.Type, t.NumField())
 	for i := range t.NumField() {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -106,6 +107,8 @@ func writeProblemParams(w http.ResponseWriter, status int, code, msg string, par
 	})
 }
 
+var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+
 // writeInvalid writes the 400 for a request body that is not valid. msg
 // is the message; cause adds `invalid_params` when it names a field
 // (invalidParamsFor).
@@ -203,6 +206,10 @@ func invalidParamsFor(err error) []invalidParam {
 func jsonKind(t reflect.Type) string {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	// encoding/json decodes these from a JSON string, whatever their kind.
+	if reflect.PointerTo(t).Implements(textUnmarshalerType) || (t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8) {
+		return "a string"
 	}
 	switch t.Kind() {
 	case reflect.String:

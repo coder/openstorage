@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/openstorage/internal/auth"
 )
@@ -372,6 +373,8 @@ func TestInvalidParamsFor(t *testing.T) {
 		Auth  *auth             `json:"auth"`
 		Tags  []string          `json:"tags"`
 		Meta  map[string]string `json:"meta"`
+		When  time.Time         `json:"when"`
+		Raw   []byte            `json:"raw"`
 		Any   any               `json:"any"`
 	}
 	for _, tc := range []struct {
@@ -388,6 +391,9 @@ func TestInvalidParamsFor(t *testing.T) {
 		{`{"tags":["a",1]}`, "tags.1", "must be a string"},
 		{`{"meta":{"k":1}}`, "meta.k", "must be a string"},
 		{`{"meta":[]}`, "meta", "must be an object"},
+		// Types that decode from a JSON string.
+		{`{"when":1}`, "when", "must be a string"},
+		{`{"raw":1}`, "raw", "must be a string"},
 		{`[]`, "", ""},             // the body itself has the wrong type
 		{`{`, "", ""},              // syntax error
 		{`{"name":"a"} x`, "", ""}, // trailing data
@@ -428,7 +434,7 @@ func TestInvalidParamsFor(t *testing.T) {
 		{`{"author":{"name":"a","x":1}}`, "author.x", "is not a known field", `unknown field "author.x"`},
 		{`{"ref":"a","ref":"b"}`, "ref", "appears more than once", `duplicate field "ref"`},
 		{`{"ref":null}`, "ref", "must not be null", "ref must not be null"},
-		{`{"author":3}`, "author", "must be a JSON object", "author must be a JSON object"},
+		{`{"author":3}`, "author", "must be an object", "author must be a JSON object"},
 		{`{"ref":3}`, "ref", "must be a string", ""},
 	} {
 		err := strictJSON([]byte(tc.body), new(strictReq))
@@ -784,6 +790,8 @@ func testInvalidParamsOnValidators(t *testing.T, e *testEnv) {
 		{"tag name", http.MethodPost, "/api/v1/repos/tags", gitTok, `{"name":"bad..name","ref":"main"}`, []param{req("name", "must be a valid tag name")}},
 		{"tag ref", http.MethodPost, "/api/v1/repos/tags", gitTok, `{"name":"v1"}`, []param{req("ref", "is required")}},
 		{"target_branch", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":"bad..name","base_ref":"main"}`,
+			[]param{req("target_branch", "must be a valid branch name")}},
+		{"target_branch type", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":5,"base_ref":"main"}`,
 			[]param{req("target_branch", "must be a valid branch name")}},
 		{"force without target", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"force":true,"base_ref":"main"}`, nil},
 		{"grep pattern", http.MethodPost, "/api/v1/repos/grep", gitTok, `{"query":{"pattern":""}}`, []param{req("query.pattern", "is required")}},
