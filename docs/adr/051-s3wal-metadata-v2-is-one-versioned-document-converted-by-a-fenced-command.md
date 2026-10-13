@@ -1,7 +1,6 @@
 # ADR-51: S3WAL metadata v2 is one versioned document, converted by a fenced command
 
-> **Status: Proposed.** Not accepted. No code implements it. This record
-> answers the open format question of issue
+> **Status: Accepted.** This record answers the format question of issue
 > [#335](https://github.com/coder/openstorage/issues/335) (S3WAL Git-push
 > scheduling) and the S3WAL part of
 > [#388](https://github.com/coder/openstorage/issues/388) (create state). It
@@ -132,14 +131,17 @@ binary reads v2. Conversion between v1 and v2 is an explicit, fenced command
   and stay, so the v1 boot recovery runs them at once with a fresh retry
   budget. The cost is at most one extra retry series against an unreachable
   upstream. In-flight backoff and attempt counts are lost.
-- **Rollback and in-flight claims.** v1 boot recovery lists pull lanes only
-  by `sync_pending` (`PendingSyncRepoIDs`), and v1 has no sweep that steals
-  an expired pull claim. A lane left with `syncing = true` and
-  `sync_pending = false` (for example after a failed shutdown `restore`)
-  is stranded under v1. So `--to 1` refuses while any claim is live,
-  and it sets `sync_pending` on every lane that holds an expired pull claim.
-  The push lane needs no change: v1 boot recovery already lists
-  `push_syncing` lanes.
+- **Rollback and in-flight claims.** A pull claim consumes `sync_pending`.
+  A lane whose run stopped while it held the claim (for example after a
+  failed shutdown `restore`) has `syncing = true` and `sync_pending = false`.
+  v1 binaries built after [#427](https://github.com/coder/openstorage/pull/427)
+  list such lanes at boot and set `sync_pending` again before they claim
+  anything. v0.16.0 and v0.17.0 list pull lanes only by `sync_pending`, so
+  they never run that pull. `--to 1` therefore sets `sync_pending` on every
+  lane with `syncing = true`, which is the #427 boot step done ahead of
+  time. Every supported v1 target then runs the pull once the dead claim
+  expires. The push lane needs no change: every v1 release lists
+  `push_syncing` lanes at boot and sets the pending level again.
 - **Verdict.** It meets all three policy obligations, and old binaries fail
   closed instead of guessing.
 
@@ -207,14 +209,14 @@ fields under `v: 1`.
 | **R1b: `serve` converts at start** | As R1, but `serve` converts a v1 document after its probe and lease acquisition when an explicit setting asks for it. This follows the SQLite precedent of an idempotent upgrade at start. | No extra command for the upgrade. Reuses the probe, lease and heartbeat of `serve`. | The downgrade still needs a separate command with the same fencing, so two conversion paths exist. A setting left on converts every bucket the process starts against. |
 | **R2: dual-format window** | The v2 release also serves v1 documents, with the v2 features off, and converts later on command. A later release drops v1. | Plain binary swap. Rollback before conversion is a plain downgrade. | Each binary keeps the timer path for v1 documents and the durable path for v2, chosen on each read: the two-path state that ADR-50 removed on SQLite. Two releases carry the extra path and its tests. |
 
-## Recommendation: Option A with rollout R1
+## Decision: Option A with rollout R1
 
 1. **Format.** `_wal/meta.json` v2 = v1 plus the four fields above, with no
    other change. `s3walMetaVersion` becomes 2. Repository-group manifests
    stay v1.
 2. **Readers.** Normal code paths decode v2 only. The decoder still rejects
    every other version, and the encoder asserts v2.
-3. **Conversion command.** A new subcommand, proposed name
+3. **Conversion command.** A new subcommand,
    `openstorage s3wal-meta convert --to 2` (and `--to 1`):
    - It first runs the conditional-write probe, as `serve` does. Then it
      acquires the instance lease (`s3wal.AcquireInstanceLease`). It refuses
@@ -239,22 +241,26 @@ fields under `v: 1`.
      table for both documents.
    - Re-running it on a document already at the target version changes
      nothing and exits 0.
-   - `--to 1` is the downgrade path. It takes the same lease and applies the
-     zero-value rule in reverse: it drops the four fields.
+   - `--to 1` is the supported downgrade path. It takes the same lease and
+     applies the zero-value rule in reverse: it drops the four fields, and
+     it sets `sync_pending` on every lane with `syncing = true` (see Option
+     A, rollback). Supported targets are v1 releases from v0.16.0 on.
 4. **Supported sources.** v1 documents written by v0.16.0 or later (the
    releases that contain the baseline). An older installation first upgrades
    to the last v1 release, as the release-pair harness already covers for
    v0.15.0 to v0.16.0.
 5. **No automatic conversion.** Neither `serve` nor any other command
    converts on its own. A format change happens only on an explicit
-   operator command. R1b is an acceptable alternative for the upgrade
-   direction, and the format does not depend on the choice.
+   operator command.
 6. **Create state before #388 resumes.** S3WAL writes a create state only
    where an S3WAL completion path exists. `CreateRepoWithState` stores the
    requested state (today only plain creates call it, with `complete`), and
    `CompleteRepoCreate` stores `complete`. `CreateLinkedRepo` inserts
    legacy rows until S3WAL implements `CompleteSyncRepoCreate` (PR 3), so no
-   S3WAL row stays pending without a way to finish.
+   S3WAL row stays pending without a way to finish. From PR 3 on, S3WAL
+   follows the SQL backends: a sync create is pending until its first sync
+   is recorded, and `pull-upstream` can finish it
+   ([#432](https://github.com/coder/openstorage/pull/432)).
 
 Reasons:
 
@@ -293,14 +299,13 @@ Reasons:
 5. Start `serve`. Pending push and pull work runs at once, at the first
    attempt.
 
-**Downgrade (back to a v1 release).** Its support status is open decision
-3.
+**Downgrade (back to a v1 release from v0.16.0 on).** This is a supported
+path.
 
 1. Stop `serve` with SIGTERM. Wait for the process and its hook children
    to exit. Do not run `signing-key` or `purge-repo` until step 3 ends.
 2. Run `openstorage s3wal-meta convert --to 1` with the v2 binary. A fresh
-   lease is handled as in upgrade step 4. The command refuses while any
-   claim is live.
+   lease is handled as in upgrade step 4.
 3. Replace the binary with the v1 release and start it.
 
 Data written after the upgrade stays. Backoff positions are lost, and every
@@ -350,9 +355,8 @@ Tests are listed with the PR that adds them.
      PUT was lost and when it landed.
    - The command ignores `OPENSTORAGE_S3WAL_LEASE_TTL=0`. It stops before its
      write when a lease renewal fails.
-   - `--to 1` refuses while a claim is live. It sets `sync_pending` on a lane
-     with an expired pull claim, and the official v1 binary then runs that
-     pull at boot.
+   - `--to 1` sets `sync_pending` on a lane whose pull claim is set. The
+     official v0.17.0 binary then runs that pull after the claim expires.
 3. **Zero-value rule (PR 1).**
    - Property test: for random v2 documents d, `to2(to1(d))` equals d with
      the four fields cleared.
@@ -394,7 +398,7 @@ Each PR has at most 500 changed lines.
 1. v2 codec, conversion command, zero-value tests, release-pair extension,
    and the operator procedure in `storage-engine.md`, `deploy-production.md`
    and `backup-restore-s3wal.md`. S3WAL stores create states as in
-   recommendation item 6. The API keeps answering 409 for S3WAL until #388
+   decision item 6. The API keeps answering 409 for S3WAL until #388
    resumes.
 2. `meta.LocalScheduleStore` on `*meta.S3WAL`, with no callers.
 3. The S3WAL worker on the sweep, and shutdown `restore` (#343).
@@ -405,7 +409,7 @@ the procedure above.
 
 ## Effect on #335 and #192
 
-**#335.** Accepting this record removes the blocker. PRs 1 to 4 deliver the
+**#335.** This record removes the blocker. PRs 1 to 4 deliver the
 acceptance criteria of #335: the #266 invariant, transitions and controls on
 S3WAL, qualified against SeaweedFS, with the v2 conversion and the upgrade
 procedure documented and tested.
@@ -415,43 +419,27 @@ procedure documented and tested.
 - **E1 (beta to GA, stage 2).** PR 4 closes the S3WAL part of E1. Git-surface
   pushes then schedule on all three backends.
 - **D1 (format policy).** It stays done. `storage-engine.md` records v2 as
-  the frozen metadata format from the format release on. If open decision 3
-  picks (a), it also replaces "Downgrade after incompatible-format writes is
-  unsupported" for metadata with the `--to 1` procedure.
+  the frozen metadata format from the format release on. For metadata, it
+  replaces "Downgrade after incompatible-format writes is unsupported" with
+  the `--to 1` procedure.
 - **D2 (release-pair upgrade).** The v1 to v2 pair becomes a required run
-  for the format release, with conversion and downgrade drills. It is still
-  blocked on the release-publication hold, not on this record.
+  for the format release, with conversion and downgrade drills.
 - **A4 (operation census).** It needs a re-pin after PR 4.
 - **C1 and F1 (backup and runbooks).** Backups record the format version. A
   restore still uses the binary that made the backup. F1 gains the upgrade
   runbook.
 - **A1 to A3, G1, G2.** No effect. Beta still waits for the real-S3 runs.
 
-## Open decisions
+## Decisions on scope and order
 
-**Owner decision (open).**
-
-1. **Experimental status and the compatibility window.** R1 relies on S3WAL
-   staying experimental: the format release needs a conversion step, and
-   there is no release in which v1 and v2 binaries share a bucket.
-   Choice (a): accept R1. Choice (b): require R2, one release that serves
-   both formats.
-2. **Order against the A1 kill path.** If the real-S3 starvation re-run (A1)
-   trips again, #192 becomes a deprecation plan and this work is wasted.
-   Choice (a): implement after A1, which needs approved AWS access.
-   Choice (b): implement now and accept the risk, which keeps the format
-   change before any beta label.
-3. **Downgrade support.** Choice (a): support `--to 1` as a documented
-   downgrade. Choice (b): ship it as a tested recovery tool only and keep
-   "downgrade unsupported", with the backup as the only supported way back.
-
-**For the maintainer desk.**
-
-- The choice among Options A, A′, B and C, and among R1, R1b and R2 once
-  decision 1 is made.
-- The field list, the zero-value rule, the command name and flags, and the
-  supported source versions.
-- The PR split, the test plan, and the census budgets.
+- **Compatibility window (D6).** S3WAL is experimental. The format release
+  has a required offline conversion (rollout R1), and no release serves both
+  formats.
+- **Order (D7).** v2 is implemented now, before the real-S3 starvation
+  re-run (#192 A1). If A1 trips again, the deprecation plan covers this work
+  too.
+- **Downgrade (D8).** `convert --to 1` is a supported downgrade path, and
+  the release-pair tests cover it.
 
 ## Consequences
 
