@@ -481,5 +481,10 @@ func requireEnvelope(t *testing.T, resp *http.Response, body []byte) string {
 		}
 	}
 	assertProblemFields(t, resp.StatusCode, body)
+	// `instance` is the escaped path the client sent, without the query
+	// (issue #352): for an alias route, not the v1 path it dispatches to.
+	if want := resp.Request.URL.EscapedPath(); envlp.Instance != want {
+		t.Fatalf("instance = %q, want the request path %q (body %s)", envlp.Instance, want, body)
+	}
 	return envlp.Error
 }

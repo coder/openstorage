@@ -443,6 +443,9 @@ func TestGitRateLimit429Envelope(t *testing.T) {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 	assertProblemFields(t, w.Code, w.Body.Bytes())
+	if body.Instance != "/probe" {
+		t.Errorf("instance = %q, want /probe (the git limiter runs outside api.New)", body.Instance)
+	}
 	// A different client IP still has its own full bucket.
 	if w := rlRequest(t, h, "10.0.0.10:1"); w.Code != http.StatusOK {
 		t.Fatalf("other client = %d, want 200 (per-client isolation)", w.Code)
