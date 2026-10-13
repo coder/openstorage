@@ -142,7 +142,7 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, repoKey)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return
 	case err != nil:
 		s.internalErr(w, r, "resolve credential repo", err)

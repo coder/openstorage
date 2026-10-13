@@ -261,7 +261,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !req.repoNameMatches(url) {
-		writeErr(w, http.StatusBadRequest, repoNameMismatchMsg)
+		writeProblem(w, http.StatusBadRequest, codeRepoNameMismatch, repoNameMismatchMsg)
 		return
 	}
 	// Fork/upstream sync is a later phase; silently dropping base_repo would
@@ -322,7 +322,7 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return
 	case err != nil:
 		s.internalErr(w, r, "get repository", err)
@@ -472,7 +472,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
 		// The repo was soft-deleted between the read above and the CAS.
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return
 	case err != nil:
 		s.internalErr(w, r, "update default branch", err)
@@ -628,7 +628,7 @@ func (s *server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.store.SoftDeleteRepo(r.Context(), claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return
 	case errors.Is(err, meta.ErrAlreadyDeleted):
 		writeErr(w, http.StatusConflict, "repository already deleted")

@@ -117,6 +117,131 @@ func TestGenericProblemCodeFallback(t *testing.T) {
 	}
 }
 
+var (
+	upstreamSpecificOnce sync.Once
+	upstreamSpecific     map[string]int
+	upstreamSpecificErr  string
+)
+
+// upstreamSpecificCodes parses the "Specific codes:" list of the vendored
+// spec's "Error codes" section into code -> status. An item with several
+// statuses ("412, or the 4xx status from the upstream") maps to the first.
+func upstreamSpecificCodes(t *testing.T) map[string]int {
+	t.Helper()
+	upstreamSpecificOnce.Do(func() {
+		raw, err := os.ReadFile(upstreamSpecPath)
+		if err != nil {
+			upstreamSpecificErr = err.Error()
+			return
+		}
+		item := regexp.MustCompile("^- `([a-z0-9_]+)` \\(([0-9]{3})[,)]")
+		codes := map[string]int{}
+		in := false
+		for l := range strings.SplitSeq(string(raw), "\n") {
+			l = strings.TrimSpace(l)
+			switch {
+			case l == "Specific codes:":
+				if in || len(codes) > 0 {
+					upstreamSpecificErr = "spec has more than one \"Specific codes:\" line"
+					return
+				}
+				in = true
+			case !in || l == "":
+			case strings.HasPrefix(l, "- "):
+				m := item.FindStringSubmatch(l)
+				if m == nil {
+					upstreamSpecificErr = "unparsed specific-code item: " + l
+					return
+				}
+				if _, dup := codes[m[1]]; dup {
+					upstreamSpecificErr = "spec lists code " + m[1] + " twice"
+					return
+				}
+				codes[m[1]], _ = strconv.Atoi(m[2])
+			default:
+				in = false
+			}
+		}
+		upstreamSpecific = codes
+	})
+	if upstreamSpecificErr != "" {
+		t.Fatalf("parse %s: %s", upstreamSpecPath, upstreamSpecificErr)
+	}
+	return upstreamSpecific
+}
+
+// TestSpecificProblemCodesMatchUpstream pins every specific code
+// open.storage emits to upstream's list, with the same status.
+func TestSpecificProblemCodesMatchUpstream(t *testing.T) {
+	spec := upstreamSpecificCodes(t)
+	// Guard the parser itself: upstream's 2026-10-08 list has 22 items.
+	if len(spec) != 22 {
+		t.Fatalf("parsed %d specific codes from the spec, want 22: %v", len(spec), spec)
+	}
+	for code, status := range specificProblemCodes {
+		if want, ok := spec[code]; !ok || want != status {
+			t.Errorf("specificProblemCodes[%q] = %d, upstream lists it as %d (present %v)", code, status, want, ok)
+		}
+		if genericProblemCode(status) == code {
+			t.Errorf("specific code %q equals the generic code for %d", code, status)
+		}
+	}
+}
+
+// TestWriteProblemCodeAssertions: writeProblem refuses a specific code on
+// a status upstream does not list for it, and an unknown code.
+func TestWriteProblemCodeAssertions(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+	}{
+		{http.StatusForbidden, codeRepositoryNotFound},
+		{http.StatusNotFound, "not_a_code"},
+		{http.StatusNotFound, "conflict"},
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("writeProblem(%d, %q) did not panic", tc.status, tc.code)
+				}
+			}()
+			writeProblem(httptest.NewRecorder(), tc.status, tc.code, "boom")
+		}()
+	}
+	rr := httptest.NewRecorder()
+	writeProblem(rr, http.StatusNotFound, codeRepositoryNotFound, repoNotFoundMsg)
+	if msg := assertProblemFields(t, rr.Code, rr.Body.Bytes()); msg != "repository not found" {
+		t.Fatalf("error = %q", msg)
+	}
+}
+
+// expectedProblemCode is the test oracle for `code`: upstream's specific
+// code for the failures open.storage maps (issue #352), keyed on status
+// and message independently of the implementation, else the generic code.
+func expectedProblemCode(t *testing.T, status int, msg string) string {
+	t.Helper()
+	code := ""
+	switch {
+	case status == http.StatusNotFound && msg == "repository not found":
+		code = "repository_not_found"
+	case status == http.StatusForbidden && strings.HasPrefix(msg, "missing required scope "):
+		code = "insufficient_scope"
+	case status == http.StatusBadRequest && msg == "repo_name must equal the JWT repo claim":
+		code = "repo_name_mismatch"
+	}
+	if code != "" {
+		if got := upstreamSpecificCodes(t)[code]; got != status {
+			t.Fatalf("upstream lists %q for status %d, not %d", code, got, status)
+		}
+		return code
+	}
+	generic, ok := upstreamGenericCodes(t)[status]
+	if !ok {
+		t.Fatalf("status %d is not in upstream's generic table; add an explicit expectation", status)
+	}
+	return generic
+}
+
 // problemBody is the wire shape the tests expect. It is declared here, not
 // shared with the implementation, so the tests pin the JSON names.
 type problemBody struct {
@@ -131,18 +256,15 @@ type problemBody struct {
 
 // assertProblemFields checks the RFC 9457 fields of a plain-envelope error
 // body against its HTTP status and returns the legacy `error` message.
-// Every status the API emits through writeErr is in upstream's generic
-// table; a status outside it needs an explicit expectation here.
+// `code` must be the one expectedProblemCode derives from the status and
+// message.
 func assertProblemFields(t *testing.T, status int, body []byte) string {
 	t.Helper()
 	var p problemBody
 	if err := json.Unmarshal(body, &p); err != nil {
 		t.Fatalf("error body %q is not JSON: %v", body, err)
 	}
-	wantCode, ok := upstreamGenericCodes(t)[status]
-	if !ok {
-		t.Fatalf("status %d is not in upstream's generic table; add an explicit expectation (body %s)", status, body)
-	}
+	wantCode := expectedProblemCode(t, status, p.Error)
 	if p.Type != "about:blank" || p.Title != http.StatusText(status) || p.Status != status || p.Code != wantCode {
 		t.Fatalf("problem fields = {type %q, title %q, status %d, code %q}, want {about:blank, %q, %d, %q} (body %s)",
 			p.Type, p.Title, p.Status, p.Code, http.StatusText(status), status, wantCode, body)
@@ -211,7 +333,7 @@ func TestProblemInstanceThroughWrappers(t *testing.T) {
 // TestErrorBodiesCarryProblemFields exercises representative routes and
 // failure classes through the full server on both backends: the auth
 // middleware (401, 403), repo resolution (404), body validation (400), and
-// the org-level create path (409).
+// the org-level create path (409), with the exact `code` of each.
 func TestErrorBodiesCarryProblemFields(t *testing.T) {
 	runBackends(t, testErrorBodiesCarryProblemFields)
 }
@@ -227,25 +349,32 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 	nested := "pd/missing-" + randomHex(t, 4)
 	nestedTok := e.mint(t, tokenSpec{iss: org, repo: nested, scopes: []string{auth.ScopeGitRead}})
 	nestedPath := "/api/repos/" + strings.ReplaceAll(nested, "/", "%2F") + "/branches"
+	orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeGitRead}})
 
 	for _, tc := range []struct {
 		name, method, path, token string
 		body                      []byte
 		want                      int
+		code                      string
 	}{
-		{"no token", http.MethodGet, "/api/v1/repo", "", nil, http.StatusUnauthorized},
-		{"missing scope", http.MethodGet, "/api/v1/repo", writeTok, nil, http.StatusForbidden},
-		{"repo not found", http.MethodGet, "/api/v1/repo", missingTok, nil, http.StatusNotFound},
+		{"no token", http.MethodGet, "/api/v1/repo", "", nil, http.StatusUnauthorized, "unauthorized"},
+		{"missing scope", http.MethodGet, "/api/v1/repo", writeTok, nil, http.StatusForbidden, "insufficient_scope"},
+		{"repo not found", http.MethodGet, "/api/v1/repo", missingTok, nil, http.StatusNotFound, "repository_not_found"},
 		// `instance` leaves out the query.
-		{"bad cursor", http.MethodGet, "/api/v1/repos/branches?cursor=%21%21", readTok, nil, http.StatusBadRequest},
+		{"bad cursor", http.MethodGet, "/api/v1/repos/branches?cursor=%21%21", readTok, nil, http.StatusBadRequest, "bad_request"},
 		// `instance` is the alias path the client sent, both for the
 		// alias's own repo lookup and after it dispatches to the v1 route.
-		{"alias repo not found", http.MethodGet, "/api/repos/" + missing + "/branches", missingTok, nil, http.StatusNotFound},
-		{"encoded alias name", http.MethodGet, nestedPath, nestedTok, nil, http.StatusNotFound},
-		{"alias bad cursor", http.MethodGet, "/api/repos/" + url + "/branches?cursor=%21%21", readTok, nil, http.StatusBadRequest},
-		{"invalid JSON", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{`), http.StatusBadRequest},
-		{"repo exists", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{"default_branch":"main"}`), http.StatusConflict},
-		{"read ok control", http.MethodGet, "/api/v1/repo", readTok, nil, http.StatusOK},
+		{"alias repo not found", http.MethodGet, "/api/repos/" + missing + "/branches", missingTok, nil, http.StatusNotFound, "repository_not_found"},
+		{"encoded alias name", http.MethodGet, nestedPath, nestedTok, nil, http.StatusNotFound, "repository_not_found"},
+		{"alias bad cursor", http.MethodGet, "/api/repos/" + url + "/branches?cursor=%21%21", readTok, nil, http.StatusBadRequest, "bad_request"},
+		{"invalid JSON", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{`), http.StatusBadRequest, "bad_request"},
+		{"repo exists", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{"default_branch":"main"}`), http.StatusConflict, "conflict"},
+		// The alias's own lookup of the token's repo claim.
+		{"alias claim not found", http.MethodGet, "/api/repos/" + url + "/branches", missingTok, nil, http.StatusNotFound, "repository_not_found"},
+		{"repo name mismatch", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{"repo_name":"pd-other"}`), http.StatusBadRequest, "repo_name_mismatch"},
+		// Other 403s keep the generic code.
+		{"org token on repo route", http.MethodGet, "/api/v1/repo", orgTok, nil, http.StatusForbidden, "forbidden"},
+		{"read ok control", http.MethodGet, "/api/v1/repo", readTok, nil, http.StatusOK, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, body := e.doReq(t, tc.method, tc.path, tc.token, tc.body, "")
@@ -262,6 +391,9 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 			}
 			if want, _, _ := strings.Cut(tc.path, "?"); p.Instance != want {
 				t.Fatalf("instance = %q, want %q", p.Instance, want)
+			}
+			if p.Code != tc.code {
+				t.Fatalf("code = %q, want %q (body %s)", p.Code, tc.code, body)
 			}
 		})
 	}

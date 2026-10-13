@@ -26,8 +26,13 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `/api/repos/{repo_name}/...` alias, the alias path). `code` is upstream's
   generic code for the status (`bad_request`, `unauthorized`, `forbidden`, `not_found`,
   `conflict`, `unprocessable_entity`, `rate_limited`, `internal_error`,
-  `service_unavailable`, …); open.storage emits none of upstream's specific codes such
-  as `repository_not_found`. Branch on the status code or `code`, not on the message.
+  `service_unavailable`, …), except for these specific upstream codes:
+  `repository_not_found` (404: the repository does not exist or the token cannot
+  access it), `insufficient_scope` (403: the token lacks a required scope), and
+  `repo_name_mismatch` (400: the create body's `repo_name` differs from the token's
+  `repo` claim). open.storage emits no other specific codes. As upstream advises, treat
+  an unknown code as the generic code for its status. Branch on the status code or
+  `code`, not on the message.
   Upstream's 400 bodies can also carry `invalid_params` (`[{name, reason}]`, one item
   per invalid request field). The member is optional upstream, and open.storage never
   sends it: read the message in `detail`.

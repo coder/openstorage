@@ -56,7 +56,7 @@ func (s *server) resolveQueryRepo(w http.ResponseWriter, r *http.Request) (meta.
 	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return meta.Repo{}, "", false
 	case err != nil:
 		s.internalErr(w, r, "resolve repository", err)

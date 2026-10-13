@@ -109,7 +109,7 @@ func bearerToken(r *http.Request) (string, bool) {
 // verified claims are injected into the request context; per-repo handlers
 // can rely on a non-empty, non-"org" repo claim.
 func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScopes ...string) middleware {
-	return requireAuthWith(verifier, org, orgLevel, writeErr, requiredScopes...)
+	return requireAuthWith(verifier, org, orgLevel, writeProblem, requiredScopes...)
 }
 
 // authFailStatus maps the two auth-failure HTTP codes onto the docs/explanation/streaming-commit-protocols.md
@@ -128,7 +128,9 @@ func authFailStatus(httpCode int) string {
 // routes: auth failures carry the result envelope ({"result": {success,
 // status, message}}) instead of the plain {"error"} body, so SDKs can map
 // them onto typed RefUpdateErrors. 401 keeps WWW-Authenticate (RFC 9110).
-func writeAuthEnvelope(w http.ResponseWriter, httpCode int, msg string) {
+// The result envelope carries no problem `code` (issue #352 tier 3), so
+// the code argument is unused.
+func writeAuthEnvelope(w http.ResponseWriter, httpCode int, _ string, msg string) {
 	assertf(msg != "", "writeAuthEnvelope: empty message")
 	if httpCode == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", "Bearer")
@@ -146,7 +148,11 @@ func requireAuthWrite(verifier auth.Verifier, org string, orgLevel bool, require
 	return requireAuthWith(verifier, org, orgLevel, writeAuthEnvelope, requiredScopes...)
 }
 
-func requireAuthWith(verifier auth.Verifier, org string, orgLevel bool, fail func(http.ResponseWriter, int, string), requiredScopes ...string) middleware {
+// authFailWriter writes one auth failure: HTTP status, problem code (the
+// generic code for the status, or a specific one), and message.
+type authFailWriter func(w http.ResponseWriter, status int, code, msg string)
+
+func requireAuthWith(verifier auth.Verifier, org string, orgLevel bool, fail authFailWriter, requiredScopes ...string) middleware {
 	assertf(verifier != nil, "requireAuth: nil verifier")
 	assertf(fail != nil, "requireAuth: nil failure writer")
 	assertf(len(requiredScopes) > 0, "requireAuth: no required scopes")
@@ -157,12 +163,12 @@ func requireAuthWith(verifier auth.Verifier, org string, orgLevel bool, fail fun
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token, ok := bearerToken(r)
 			if !ok {
-				fail(w, http.StatusUnauthorized, "missing or malformed authorization header")
+				fail(w, http.StatusUnauthorized, genericProblemCode(http.StatusUnauthorized), "missing or malformed authorization header")
 				return
 			}
 			claims, err := verifier.Verify(r.Context(), token)
 			if err != nil {
-				fail(w, http.StatusUnauthorized, "invalid token")
+				fail(w, http.StatusUnauthorized, genericProblemCode(http.StatusUnauthorized), "invalid token")
 				return
 			}
 			assertf(claims != nil, "Verifier returned nil claims without error")
@@ -172,21 +178,21 @@ func requireAuthWith(verifier auth.Verifier, org string, orgLevel bool, fail fun
 			// this deployment's REST surface. Checked before scopes so the
 			// failure mode matches the git path's ordering.
 			if org != "" && claims.Iss != org {
-				fail(w, http.StatusForbidden, fmt.Sprintf("token issued for org %q, not served here", claims.Iss))
+				fail(w, http.StatusForbidden, genericProblemCode(http.StatusForbidden), fmt.Sprintf("token issued for org %q, not served here", claims.Iss))
 				return
 			}
 			for _, scope := range requiredScopes {
 				if !claims.HasScope(scope) {
-					fail(w, http.StatusForbidden, "missing required scope "+scope)
+					fail(w, http.StatusForbidden, codeInsufficientScope, "missing required scope "+scope)
 					return
 				}
 			}
 			if orgLevel && claims.Repo != auth.RepoClaimOrg {
-				fail(w, http.StatusForbidden, "token is not org-scoped")
+				fail(w, http.StatusForbidden, genericProblemCode(http.StatusForbidden), "token is not org-scoped")
 				return
 			}
 			if !orgLevel && (claims.Repo == "" || claims.Repo == auth.RepoClaimOrg) {
-				fail(w, http.StatusForbidden, "token is not repo-scoped")
+				fail(w, http.StatusForbidden, genericProblemCode(http.StatusForbidden), "token is not repo-scoped")
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(auth.WithClaims(r.Context(), claims)))

@@ -141,7 +141,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	// Before the source token is even verified: a body repo_name can only
 	// confirm the destination claim, never redirect the fork.
 	if !req.repoNameMatches(url) {
-		writeErr(w, http.StatusBadRequest, repoNameMismatchMsg)
+		writeProblem(w, http.StatusBadRequest, codeRepoNameMismatch, repoNameMismatchMsg)
 		return
 	}
 
