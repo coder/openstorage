@@ -322,12 +322,24 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var repo meta.Repo
-	if spec == nil {
-		// A plain create finishes at insert (issue #388). A sync create
-		// stays legacy (never treated as complete) until its first-sync
-		// schedule is tracked.
+	tracked := spec != nil && s.firstSync != nil
+	switch {
+	case spec == nil:
+		// A plain create finishes at insert (issue #388).
 		repo, err = s.store.CreateRepoWithState(r.Context(), claims.Iss, url, branch, meta.CreateStateComplete)
-	} else {
+	case tracked:
+		// Repo, upstream and credential in one write, pending until the
+		// first sync is scheduled below (issue #388).
+		var cred *meta.GitCredential
+		if spec.Auth != nil && spec.Auth.Token != "" {
+			cred = &meta.GitCredential{Password: spec.Auth.Token}
+		}
+		repo, err = s.linked().CreateLinkedRepo(r.Context(), claims.Iss, url, branch, meta.RepoUpstream{
+			Provider: spec.Provider, Owner: spec.Owner, Name: spec.Name,
+			UpstreamHost: upstreamHost, ForwardOnPush: spec.ForwardPushes,
+		}, cred)
+	default:
+		// The store tracks no create state (S3-WAL, #335): a legacy row.
 		repo, err = s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
 	}
 	switch {
@@ -343,7 +355,10 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
 
-	if spec != nil {
+	if tracked && !s.completeOwnSyncCreate(w, r, claims.Iss, url, repo.RepoID) {
+		return
+	}
+	if spec != nil && !tracked {
 		// Order matters: the credential must exist before the first sync
 		// run can start (the queue spawns the worker immediately). Each
 		// post-create failure abandons the fresh repo row (docs/archive/phases/14-phase5-implementation-notes.md
@@ -388,6 +403,71 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
 		Message:  repoCreatedMsg(repo.URL),
 	})
+}
+
+// linked is the store's atomic linked create. Every store that tracks
+// create state (PostgreSQL, SQLite) is an EventingStore.
+func (s *syncServer) linked() meta.EventingStore {
+	es, ok := s.store.(meta.EventingStore)
+	assertf(ok, "sync create: store %T tracks create state but is not an EventingStore", s.store)
+	return es
+}
+
+// pendingSyncRetryAfter is the Retry-After (seconds) of a 503 for a
+// pending sync create.
+const pendingSyncRetryAfter = "5"
+
+// completeOwnSyncCreate schedules the first sync of the pending repo this
+// request just inserted, and marks the create complete (issue #388). It
+// reports whether the caller may answer 201; otherwise it wrote the
+// error. The request already passed #395's ref-policy refusal, before the
+// insert. A scheduling failure keeps every row and answers 503:
+// pull-upstream (finishPendingSync) completes the create later. A delete
+// that landed first answers 404, never 201.
+func (s *syncServer) completeOwnSyncCreate(w http.ResponseWriter, r *http.Request, org, url, repoID string) bool {
+	assertf(s.firstSync != nil && org != "" && url != "" && repoID != "", "completeOwnSyncCreate: missing inputs")
+	out, err := s.firstSync.CompleteSyncCreate(r.Context(), org, repoID)
+	switch {
+	case err != nil: // includes a concurrently detached upstream (ErrNotFound)
+		s.logger.Error("schedule first sync; the repository stays pending", "org", org, "repo_id", repoID, "err", err)
+		w.Header().Set("Retry-After", pendingSyncRetryAfter)
+		writeErr(w, http.StatusServiceUnavailable,
+			"the repository exists, but its first sync could not be scheduled; POST /repos/pull-upstream with a git:write token finishes the create")
+		return false
+	case out == meta.CreateDeleted:
+		writeErr(w, http.StatusNotFound, "repository "+strconv.Quote(url)+" was deleted, and its name cannot be reused")
+		return false
+	}
+	// AlreadyComplete: a pull-upstream finished this create first.
+	assertf(out == meta.CreateCompleted || out == meta.CreateAlreadyComplete, "CompleteSyncCreate outcome %d", out)
+	return true
+}
+
+// finishPendingSync completes a pending sync create for a request other
+// than the one that inserted it (issue #388). It is the only such path,
+// and it enforces the authority of pull-upstream itself, whatever its
+// caller checked: the first sync mirror-pushes every head and tag through
+// the unpoliced loopback with force refspecs, so it can overwrite refs that
+// clients pushed into the pending repo. A token with any ref-policy op, or
+// without git:write, gets a non-empty denial and nothing is scheduled.
+// Otherwise it returns CompleteSyncCreate's result, which uses the STORED
+// upstream and credential; the job carries no ref.
+func (s *syncServer) finishPendingSync(ctx context.Context, claims *auth.Claims, repo meta.Repo) (denial string, out meta.CreateOutcome, err error) {
+	assertf(claims != nil && repo.RepoID != "", "finishPendingSync: nil claims or empty repo")
+	assertf(s.firstSync != nil && repo.CreateState == meta.CreateStatePending,
+		"finishPendingSync: repo %s create_state %d, scheduler %v", repo.RepoID, repo.CreateState, s.firstSync != nil)
+	policies, err := refPolicies(claims)
+	if err != nil {
+		return err.Error(), 0, nil
+	}
+	if op, denied := policyDeniesPullUpstream(policies); denied {
+		return "ref policy op " + strconv.Quote(op) + " denies completing a pending sync create", 0, nil
+	}
+	if !claims.HasScope(auth.ScopeGitWrite) {
+		return "completing a pending sync create needs scope " + auth.ScopeGitWrite + "; POST /repos/pull-upstream with a git:write token finishes it", 0, nil
+	}
+	out, err = s.firstSync.CompleteSyncCreate(ctx, claims.Iss, repo.RepoID)
+	return "", out, err
 }
 
 // createAbandon undoes the rows a failed post-CreateRepo step left behind,
@@ -516,6 +596,31 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 	case err != nil:
 		s.internalErr(w, r, "resolve pull-upstream repo", err)
 		return
+	}
+	if s.firstSync != nil && repo.CreateState == meta.CreateStatePending {
+		// A sync create whose first sync was never scheduled (issue #388).
+		// A pending fork has no upstream: ErrNotFound, as below.
+		denial, out, err := s.finishPendingSync(r.Context(), claims, repo)
+		switch {
+		case denial != "":
+			writeErr(w, http.StatusForbidden, denial)
+			return
+		case errors.Is(err, meta.ErrNotFound):
+			writeErr(w, http.StatusBadRequest, "repository has no upstream base_repo")
+			return
+		case err != nil:
+			s.internalErr(w, r, "complete pending sync create", err)
+			return
+		case out == meta.CreateDeleted:
+			writeErr(w, http.StatusNotFound, "repository not found")
+			return
+		case out == meta.CreateCompleted:
+			// CompleteSyncCreate recorded the request and scheduled the run.
+			writeJSON(w, http.StatusAccepted, map[string]string{"message": pullUpstreamAcceptedMsg})
+			return
+		}
+		// AlreadyComplete: a concurrent completion won; sync as usual.
+		assertf(out == meta.CreateAlreadyComplete, "CompleteSyncCreate outcome %d", out)
 	}
 	// RequestSync doubles as the has-upstream precheck AND makes the 202
 	// promise durable (issue #79): the pending marker is set BEFORE the
