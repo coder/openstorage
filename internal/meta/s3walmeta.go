@@ -32,6 +32,7 @@ import (
 	mrand "math/rand/v2"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -252,7 +253,7 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 			// ADR-51 rollout R1: only the offline conversion reads v1.
 			return nil, fmt.Errorf("s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2` (docs/how-to/deploy-production.md#upgrading-the-s3wal-metadata-format)")
 		}
-		return nil, fmt.Errorf("s3walmeta: document version %d unsupported (want %d)", doc.V, s3walMetaVersion)
+		return nil, fmt.Errorf("s3walmeta: document version %d unsupported (want %s)", doc.V, wantVersions(versions))
 	}
 	if doc.Seq < 1 {
 		return nil, fmt.Errorf("s3walmeta: document seq %d invalid (stored documents start at 1)", doc.Seq)
@@ -263,6 +264,16 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 	assertf(doc.NextOrgID >= 0 && doc.NextKeyID >= 0,
 		"s3walmeta: document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
 	return &doc, nil
+}
+
+// wantVersions renders the accepted versions for an error message: "1",
+// or "1 or 2".
+func wantVersions(versions []int) string {
+	parts := make([]string, len(versions))
+	for i, v := range versions {
+		parts[i] = strconv.Itoa(v)
+	}
+	return strings.Join(parts, " or ")
 }
 
 // encodeAdvance encodes the NEXT version of doc: seq+1 and a fresh 128-bit
@@ -279,8 +290,8 @@ func (doc *s3walMetaDoc) encodeAdvance() ([]byte, error) {
 // encodeNext is encodeAdvance for any known version. Only the format
 // conversion calls it directly.
 func (doc *s3walMetaDoc) encodeNext() ([]byte, error) {
-	assertf(doc.V == s3walMetaV1 || doc.V == s3walMetaV2, "encodeAdvance: version %d", doc.V)
-	assertf(doc.Seq >= 0, "encodeAdvance: seq %d", doc.Seq)
+	assertf(doc.V == s3walMetaV1 || doc.V == s3walMetaV2, "encodeNext: version %d", doc.V)
+	assertf(doc.Seq >= 0, "encodeNext: seq %d", doc.Seq)
 	for name := range doc.Orgs {
 		assertf(utf8.ValidString(name),
 			"encodeAdvance: org key %q is not valid UTF-8 — JSON encoding would alias it onto its U+FFFD spelling", name)
