@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -123,7 +124,7 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 		}
 		t.Log(message)
 	}
-	phase("inputs verified and frozen; official v0.15.0 -> exact candidate, local fixture only")
+	phase("inputs verified and frozen; official " + upgradeOldTag + " -> exact candidate -> official (ADR-51 downgrade), local fixture only")
 	// startSeaweedFS retains this context for container teardown. t.Context is
 	// canceled before cleanup callbacks, so keep teardown independently live.
 	containerCtx, cancelContainer := context.WithTimeout(context.WithoutCancel(t.Context()), 12*time.Minute)
@@ -252,6 +253,73 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 		phase(name + ": lease absent; all-key hash/metadata inventory quiescent for 2s")
 	}
 
+	// ADR-51: the official release writes metadata format v1 and the
+	// candidate format v2. Each refuses the other's bucket without writing
+	// meta.json, and s3wal-meta convert moves the stopped bucket between
+	// them.
+	metaObject := func() (version int, etag string) {
+		t.Helper()
+		obj, err := client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: new(bucket), Key: new("_wal/meta.json")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(obj.Body)
+		_ = obj.Body.Close()
+		var doc struct {
+			V int `json:"v"`
+		}
+		if err != nil || json.Unmarshal(body, &doc) != nil {
+			t.Fatal("meta.json unreadable")
+		}
+		return doc.V, *obj.ETag
+	}
+	refuse := func(binary, name, want string) {
+		t.Helper()
+		_, before := metaObject()
+		log, err := os.OpenFile(filepath.Join(upgradeAttempt, name+".stderr"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer log.Close()
+		if n, err := startBinaryNode(binary, t.TempDir(), log, "OPENSTORAGE_TEST_MODE=", "OPENSTORAGE_S3WAL_LEASE_TTL=1m", "OPENSTORAGE_SECRETS_KEY="+secretsKey); err == nil {
+			n.stop()
+			t.Fatalf("%s served a bucket of the other metadata format", name)
+		}
+		stderr, err := os.ReadFile(log.Name())
+		if err != nil || !bytes.Contains(stderr, []byte(want)) {
+			t.Fatalf("%s did not refuse with %q", name, want)
+		}
+		if _, after := metaObject(); after != before {
+			t.Fatalf("%s changed meta.json while refusing", name)
+		}
+		if _, held := s3BackupInventory(t, client, bucket)["_wal/instance-lease"]; held {
+			t.Fatalf("%s left its lease behind", name)
+		}
+		phase(name + ": refused with " + strconv.Quote(want) + "; meta.json unchanged; lease released")
+	}
+	convert := func(to string) {
+		t.Helper()
+		if err := upgradePair.recheck(); err != nil {
+			t.Fatal("pre-invocation input integrity: ", err)
+		}
+		cmd := exec.Command(upgradePair.CandidateBinary, "s3wal-meta", "convert", "--to", to)
+		cmd.Env = append(os.Environ(), "OPENSTORAGE_PG_URL="+dbURL)
+		out, err := cmd.CombinedOutput()
+		if werr := os.WriteFile(filepath.Join(upgradeAttempt, "convert-to-"+to+".out"), out, 0o600); werr != nil {
+			t.Fatal(werr)
+		}
+		if err != nil || !bytes.Contains(out, []byte("verified")) {
+			t.Fatalf("convert --to %s: %v", to, err)
+		}
+		if v, _ := metaObject(); strconv.Itoa(v) != to {
+			t.Fatalf("convert --to %s left meta.json at v%d", to, v)
+		}
+		if _, held := s3BackupInventory(t, client, bucket)["_wal/instance-lease"]; held {
+			t.Fatal("convert left its lease behind")
+		}
+		phase("candidate s3wal-meta convert --to " + to + ": verified; lease released")
+	}
+
 	old := start(upgradePair.OldBinary, "official")
 	const repoName = "upgrade-fixture"
 	token := mintTestToken(t, repoName, "repo:write,git:read,git:write", "")
@@ -259,7 +327,7 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	var created struct {
 		RepoID string `json:"repo_id"`
 	}
-	if status := apiJSON(t, old, http.MethodPost, token, "/api/v1/repos", `{"default_branch":"main"}`, &created); status != http.StatusOK || created.RepoID == "" {
+	if status := apiJSON(t, old, http.MethodPost, token, "/api/v1/repos", `{"default_branch":"main"}`, &created); status != http.StatusCreated || created.RepoID == "" {
 		t.Fatalf("official create repo status=%d", status)
 	}
 	type repoMetadata struct {
@@ -319,7 +387,7 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	if err != nil || bytes.Contains(stored, []byte(webhookSecret)) || !bytes.Contains(stored, []byte("enc:v1:")) {
 		t.Fatal("old secret was not encrypted at rest")
 	}
-	check := func(n *testNode) string {
+	check := func(n *testNode, label string) string {
 		t.Helper()
 		if apiGet(t, n, "invalid", "/api/v1/repo", nil) != http.StatusUnauthorized {
 			t.Fatal("candidate did not reject unauthenticated access")
@@ -346,11 +414,17 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 		if err != nil || !bytes.Equal(gotBytes, content) {
 			t.Fatal("candidate LFS bytes differ")
 		}
-		phase("candidate: old token accepted, invalid token rejected; repo/webhook metadata equal; Git HEAD/fsck and materialized LFS bytes equal")
+		phase(label + ": old token accepted, invalid token rejected; repo/webhook metadata equal; Git HEAD/fsck and materialized LFS bytes equal")
 		return clone
 	}
+	if v, _ := metaObject(); v != 1 {
+		t.Fatalf("official release wrote meta.json v%d, want 1", v)
+	}
+	refuse(upgradePair.CandidateBinary, "candidate-on-v1", "document version 1 needs conversion")
+	convert("2")
+	refuse(upgradePair.OldBinary, "official-on-v2", "document version 2 unsupported")
 	candidate := start(upgradePair.CandidateBinary, "candidate-first")
-	clone := check(candidate)
+	clone := check(candidate, "candidate")
 	content = append(content, []byte("new candidate bytes\n")...)
 	writeFile(t, clone, "asset.bin", string(content))
 	git(clone, "add", ".")
@@ -361,7 +435,14 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	phase("candidate: new Git/LFS write accepted; original encrypted webhook secret verified through delivery HMAC")
 	stop(candidate, "candidate-first")
 	second := start(upgradePair.CandidateBinary, "candidate-second")
-	check(second)
+	check(second, "candidate")
 	stop(second, "candidate-second")
-	phase("PASS: exact official-to-candidate fixture; second cold restart/read verified; all application writers reaped")
+	// The supported downgrade (ADR-51 D8): convert back, then the official
+	// release serves everything the candidate wrote.
+	convert("1")
+	refuse(upgradePair.CandidateBinary, "candidate-on-v1-again", "document version 1 needs conversion")
+	back := start(upgradePair.OldBinary, "official-downgrade")
+	check(back, "official after --to 1")
+	stop(back, "official-downgrade")
+	phase("PASS: exact official-to-candidate-to-official fixture; conversion both ways verified; all application writers reaped")
 }

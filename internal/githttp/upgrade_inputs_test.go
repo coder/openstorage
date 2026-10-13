@@ -1,7 +1,7 @@
 package githttp
 
 // Test-only input identity helpers for the release-candidate upgrade lane
-// (issue #267): prepareUpgradeInputs freezes the official v0.15.0
+// (issue #267): prepareUpgradeInputs freezes the official v0.18.0
 // linux/amd64 archive, its checksum file, and the locally built candidate
 // into an exclusively owned attempt directory, verifies every identity
 // (pinned digests, embedded VCS build info, clean source checkout), and
@@ -27,17 +27,18 @@ import (
 	"strings"
 )
 
-// Official v0.15.0 release identities, verified against the primary GitHub
+// Official v0.18.0 release identities, verified against the primary GitHub
 // release assets: checksums.txt is GNU sha256sum output, the archive holds
-// exactly one entry (openstorage), and that binary is stamped with the tag
-// commit under the pre-rename module path.
+// openstorage then LICENSE, and that binary is stamped with the tag commit.
+// v0.18.0 is the last release that writes S3WAL metadata format v1
+// (ADR-51), so this pair also exercises the v1 -> v2 conversion.
 const (
-	upgradeOldTag            = "v0.15.0"
-	upgradeOldCommit         = "d65da6e53ee62145a0cb78a0f89bf6839c8f9171"
-	upgradeOldMainPath       = "github.com/coder/open-storage/cmd/openstorage"
-	upgradeArchiveName       = "openstorage_0.15.0_linux_amd64.tar.gz"
-	upgradeArchiveSHA256     = "b9465088ebf371f2dcd9bed2c3012ea81fd687d39611aff3c1dfdd6ace842611"
-	upgradeChecksumsSHA256   = "3aea91fdc66009fbf6e67ea00405cfa88869cd8a69fe320aab52f953937c3175"
+	upgradeOldTag            = "v0.18.0"
+	upgradeOldCommit         = "1438d3dc1e8913c5f26995ad4b251077e39be55e"
+	upgradeOldMainPath       = "github.com/coder/openstorage/cmd/openstorage"
+	upgradeArchiveName       = "openstorage_0.18.0_linux_amd64.tar.gz"
+	upgradeArchiveSHA256     = "943bba3db97668e76a8dcfe09cb9da6edc09793337468d0ec07b10dae307120d"
+	upgradeChecksumsSHA256   = "491bd396f802e5810cc84e14e5db64e50e68d358189c2edbdabd2decc0495043"
 	upgradeCandidateMainPath = "github.com/coder/openstorage/cmd/openstorage"
 )
 
@@ -294,8 +295,10 @@ func upgradeListedDigest(checksums, name string) (string, error) {
 	return found, nil
 }
 
-// extractUpgradeBinary writes the archive's single regular entry, named
-// exactly openstorage, to dst (0500). Paths, links, and extra entries fail.
+// extractUpgradeBinary writes the archive's first entry, a regular file
+// named exactly openstorage, to dst (0500). One following regular LICENSE
+// entry (the layout from v0.16.0 on) is skipped. Paths, links, and any other
+// entry fail.
 func extractUpgradeBinary(archive, dst string) error {
 	f, err := os.Open(archive)
 	if err != nil {
@@ -323,12 +326,20 @@ func extractUpgradeBinary(archive, dst string) error {
 	if err := writeUpgradeFile(dst, 0o500, tr); err != nil {
 		return err
 	}
-	if next, err := tr.Next(); err == nil {
-		return fmt.Errorf("upgrade inputs: archive has an extra entry %q after openstorage", next.Name)
-	} else if !errors.Is(err, io.EOF) {
-		return fmt.Errorf("upgrade inputs: archive %s: %w", archive, err)
+	licensed := false
+	for {
+		next, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("upgrade inputs: archive %s: %w", archive, err)
+		}
+		if licensed || next.Name != "LICENSE" || next.Typeflag != tar.TypeReg {
+			return fmt.Errorf("upgrade inputs: archive has an extra entry %q after openstorage", next.Name)
+		}
+		licensed = true
 	}
-	return nil
 }
 
 func verifyUpgradeBinary(path, mainPath, commit string) error {

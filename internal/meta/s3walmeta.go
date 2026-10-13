@@ -32,6 +32,7 @@ import (
 	mrand "math/rand/v2"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -252,7 +253,7 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 			// ADR-51 rollout R1: only the offline conversion reads v1.
 			return nil, fmt.Errorf("s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2` (docs/how-to/deploy-production.md#upgrading-the-s3wal-metadata-format)")
 		}
-		return nil, fmt.Errorf("s3walmeta: document version %d unsupported (want %d)", doc.V, s3walMetaVersion)
+		return nil, fmt.Errorf("s3walmeta: document version %d unsupported (want %s)", doc.V, wantVersions(versions))
 	}
 	if doc.Seq < 1 {
 		return nil, fmt.Errorf("s3walmeta: document seq %d invalid (stored documents start at 1)", doc.Seq)
@@ -263,6 +264,16 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 	assertf(doc.NextOrgID >= 0 && doc.NextKeyID >= 0,
 		"s3walmeta: document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
 	return &doc, nil
+}
+
+// wantVersions renders the accepted versions for an error message: "2",
+// or "1 or 2".
+func wantVersions(versions []int) string {
+	parts := make([]string, len(versions))
+	for i, v := range versions {
+		parts[i] = strconv.Itoa(v)
+	}
+	return strings.Join(parts, " or ")
 }
 
 // encodeAdvance encodes the NEXT version of doc: seq+1 and a fresh 128-bit
@@ -279,8 +290,8 @@ func (doc *s3walMetaDoc) encodeAdvance() ([]byte, error) {
 // encodeNext is encodeAdvance for any known version. Only the format
 // conversion calls it directly.
 func (doc *s3walMetaDoc) encodeNext() ([]byte, error) {
-	assertf(doc.V == s3walMetaV1 || doc.V == s3walMetaV2, "encodeAdvance: version %d", doc.V)
-	assertf(doc.Seq >= 0, "encodeAdvance: seq %d", doc.Seq)
+	assertf(doc.V == s3walMetaV1 || doc.V == s3walMetaV2, "encodeNext: version %d", doc.V)
+	assertf(doc.Seq >= 0, "encodeNext: seq %d", doc.Seq)
 	for name := range doc.Orgs {
 		assertf(utf8.ValidString(name),
 			"encodeAdvance: org key %q is not valid UTF-8 — JSON encoding would alias it onto its U+FFFD spelling", name)
@@ -725,6 +736,7 @@ func (r *s3walMetaRepo) toRepo(repoID string) Repo {
 		URL:           r.URL,
 		DefaultBranch: r.DefaultBranch,
 		CreatedAt:     time.Unix(0, r.CreatedAt).UTC(),
+		CreateState:   knownCreateState(repoID, CreateState(r.CreateState)),
 	}
 	if r.DeletedAt != 0 {
 		utc := time.Unix(0, r.DeletedAt).UTC()
@@ -829,6 +841,12 @@ func (s *S3WAL) OrgNames(ctx context.Context) ([]string, error) {
 // per-run RepoID is random and never reused, so its presence on the fresh
 // snapshot proves OUR insert landed.
 func (s *S3WAL) CreateRepo(ctx context.Context, org, url, defaultBranch string) (Repo, error) {
+	return s.createRepo(ctx, org, url, defaultBranch, CreateStateLegacy)
+}
+
+// createRepo inserts a repo row with the given create state (ADR-51 v2
+// field; CreateStateLegacy stores nothing).
+func (s *S3WAL) createRepo(ctx context.Context, org, url, defaultBranch string, state CreateState) (Repo, error) {
 	assertf(url != "", "CreateRepo: empty url for org %q", org)
 	assertf(defaultBranch != "", "CreateRepo: empty default branch for %q (caller defaults to main)", url)
 	for what, v := range map[string]string{"url": url, "default branch": defaultBranch} {
@@ -855,8 +873,8 @@ func (s *S3WAL) CreateRepo(ctx context.Context, org, url, defaultBranch string) 
 			if doc.Repos == nil {
 				doc.Repos = make(map[string]*s3walMetaRepo)
 			}
-			doc.Repos[repoID] = &s3walMetaRepo{OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: nanos}
-			repo = Repo{RepoID: repoID, OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt}
+			doc.Repos[repoID] = &s3walMetaRepo{OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: nanos, CreateState: int(state)}
+			repo = Repo{RepoID: repoID, OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt, CreateState: state}
 			return true, nil
 		},
 		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
@@ -921,34 +939,45 @@ func (s *S3WAL) GetRepoByID(ctx context.Context, org, repoID string) (Repo, erro
 	return r.toRepo(repoID), nil
 }
 
-// CreateRepoWithState is CreateRepo: the frozen v1 document has no
-// create_state field (issue #335), so every S3-WAL row reads
-// CreateStateLegacy and a repeat create stays 409.
+// CreateRepoWithState is CreateRepo with an explicit create state, stored
+// in the v2 create_state field (ADR-51).
 func (s *S3WAL) CreateRepoWithState(ctx context.Context, org, url, defaultBranch string, state CreateState) (Repo, error) {
 	assertf(state == CreateStatePending || state == CreateStateComplete, "CreateRepoWithState: state %d", state)
-	return s.CreateRepo(ctx, org, url, defaultBranch)
+	return s.createRepo(ctx, org, url, defaultBranch, state)
 }
 
-// CompleteRepoCreate stores nothing (see CreateRepoWithState). It still
-// reports CreateDeleted for a repo deleted before its create finished.
+// CompleteRepoCreate marks a pending row complete (Store contract, issue
+// #388). Recovery class PRED: a rerun on a fresh snapshot after an
+// ambiguous PUT that landed answers CreateAlreadyComplete, which callers
+// treat as success, like a lost race against a concurrent completion.
 func (s *S3WAL) CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error) {
 	assertf(repoID != "", "CompleteRepoCreate: empty repo id for org %q", org)
-	doc, err := s.viewDoc(ctx)
+	var out CreateOutcome
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "complete repo create",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			out = 0
+			orgRow, err := lookupOrg(doc, org)
+			if err != nil {
+				return false, err
+			}
+			r := doc.Repos[repoID]
+			if r == nil || r.OrgID != orgRow.ID {
+				return false, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+			}
+			if r.DeletedAt != 0 || CreateState(r.CreateState) != CreateStatePending {
+				out, err = completeOutcome(r.toRepo(repoID))
+				return false, err
+			}
+			r.CreateState = int(CreateStateComplete)
+			out = CreateCompleted
+			return true, nil
+		},
+	})
 	if err != nil {
 		return 0, err
 	}
-	orgRow, err := lookupOrg(doc, org)
-	if err != nil {
-		return 0, err
-	}
-	r := doc.Repos[repoID]
-	switch {
-	case r == nil || r.OrgID != orgRow.ID:
-		return 0, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
-	case r.DeletedAt != 0:
-		return CreateDeleted, nil
-	}
-	return CreateCompleted, nil
+	return out, nil
 }
 
 // UpdateRepoDefaultBranch CASes the live repo's default branch (Store
