@@ -174,6 +174,13 @@ func testCRUDHappyPath(t *testing.T, e *testEnv) {
 	if msg := requireEnvelope(t, resp, body); msg != "repository already deleted" {
 		t.Fatalf("re-delete error = %q", msg)
 	}
+	// The canonical alias resolves names without deleted repositories, so
+	// its re-delete is a repository-lookup 404 (issue #352).
+	resp, body = e.doReq(t, http.MethodDelete, "/api/repos/"+url.PathEscape(repoURL), writeTok, nil, "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("alias re-delete status = %d, want 404 (body %s)", resp.StatusCode, body)
+	}
+	requireProblemCode(t, resp, body, "repository_not_found")
 
 	createRepo(t, e, org, repoURL, nil, http.StatusNotFound) // the deleted repo keeps its name (#387)
 }

@@ -216,11 +216,17 @@ func TestWriteProblemCodeAssertions(t *testing.T) {
 	}
 }
 
-// expectedProblemCode is the test oracle for `code`: upstream's specific
+// expectedProblemCodes is the test oracle for `code`: upstream's specific
 // code for the failures open.storage maps (issue #352), keyed on status
 // and message independently of the implementation, else the generic code.
-func expectedProblemCode(t *testing.T, status int, msg string) string {
+// "branch not found" has two answers: list commits says it for a missing
+// `ref` (ref_not_found) and for a missing branch (branch_not_found);
+// TestErrorBodiesCarryProblemFields pins each.
+func expectedProblemCodes(t *testing.T, status int, msg string) []string {
 	t.Helper()
+	if status == http.StatusNotFound && msg == "branch not found" {
+		return []string{"branch_not_found", "ref_not_found"}
+	}
 	code := ""
 	switch {
 	case status == http.StatusNotFound && (msg == "repository not found" || msg == "fork source repository not found"):
@@ -230,8 +236,8 @@ func expectedProblemCode(t *testing.T, status int, msg string) string {
 		code = "insufficient_scope"
 	case status == http.StatusBadRequest && msg == "repo_name must equal the JWT repo claim":
 		code = "repo_name_mismatch"
-	case status == http.StatusNotFound && (msg == "branch not found" ||
-		(strings.HasPrefix(msg, "source branch ") || strings.HasPrefix(msg, "target branch ")) && strings.HasSuffix(msg, " not found")):
+	case status == http.StatusNotFound &&
+		(strings.HasPrefix(msg, "source branch ") || strings.HasPrefix(msg, "target branch ")) && strings.HasSuffix(msg, " not found"):
 		code = "branch_not_found"
 	case status == http.StatusNotFound && slices.Contains([]string{"ref not found", "tag not found", "commit not found",
 		"base commit not found", "base not found", "base ref not found", "ref does not resolve to a commit"}, msg):
@@ -247,13 +253,13 @@ func expectedProblemCode(t *testing.T, status int, msg string) string {
 		if got := upstreamSpecificCodes(t)[code]; got != status {
 			t.Fatalf("upstream lists %q for status %d, not %d", code, got, status)
 		}
-		return code
+		return []string{code}
 	}
 	generic, ok := upstreamGenericCodes(t)[status]
 	if !ok {
 		t.Fatalf("status %d is not in upstream's generic table; add an explicit expectation", status)
 	}
-	return generic
+	return []string{generic}
 }
 
 // requireProblemCode asserts a plain problem body (requireEnvelope) with
@@ -284,7 +290,7 @@ type problemBody struct {
 
 // assertProblemFields checks the RFC 9457 fields of a plain-envelope error
 // body against its HTTP status and returns the legacy `error` message.
-// `code` must be the one expectedProblemCode derives from the status and
+// `code` must be one expectedProblemCodes derives from the status and
 // message.
 func assertProblemFields(t *testing.T, status int, body []byte) string {
 	t.Helper()
@@ -292,10 +298,10 @@ func assertProblemFields(t *testing.T, status int, body []byte) string {
 	if err := json.Unmarshal(body, &p); err != nil {
 		t.Fatalf("error body %q is not JSON: %v", body, err)
 	}
-	wantCode := expectedProblemCode(t, status, p.Error)
-	if p.Type != "about:blank" || p.Title != http.StatusText(status) || p.Status != status || p.Code != wantCode {
-		t.Fatalf("problem fields = {type %q, title %q, status %d, code %q}, want {about:blank, %q, %d, %q} (body %s)",
-			p.Type, p.Title, p.Status, p.Code, http.StatusText(status), status, wantCode, body)
+	wantCodes := expectedProblemCodes(t, status, p.Error)
+	if p.Type != "about:blank" || p.Title != http.StatusText(status) || p.Status != status || !slices.Contains(wantCodes, p.Code) {
+		t.Fatalf("problem fields = {type %q, title %q, status %d, code %q}, want {about:blank, %q, %d, one of %q} (body %s)",
+			p.Type, p.Title, p.Status, p.Code, http.StatusText(status), status, wantCodes, body)
 	}
 	if p.Error == "" || p.Detail != p.Error {
 		t.Fatalf("detail = %q, error = %q: want equal and non-empty (body %s)", p.Detail, p.Error, body)
@@ -405,6 +411,10 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 		{"branch not found", http.MethodGet, "/api/v1/repos/branch?name=nope", readTok, nil, http.StatusNotFound, "branch_not_found"},
 		{"alias branch not found", http.MethodGet, "/api/repos/" + url + "/branch?name=nope", readTok, nil, http.StatusNotFound, "branch_not_found"},
 		{"ref not found", http.MethodGet, "/api/v1/repos/commit?ref=nope", readTok, nil, http.StatusNotFound, "ref_not_found"},
+		// List commits: `ref` is any revision, the deprecated `branch` a branch.
+		{"commits ref not found", http.MethodGet, "/api/v1/repos/commits?ref=nope", readTok, nil, http.StatusNotFound, "ref_not_found"},
+		{"commits branch not found", http.MethodGet, "/api/v1/repos/commits?branch=nope", readTok, nil, http.StatusNotFound, "branch_not_found"},
+		{"commits default branch not found", http.MethodGet, "/api/v1/repos/commits", readTok, nil, http.StatusNotFound, "branch_not_found"},
 		{"tag not found", http.MethodGet, "/api/v1/repos/tag?name=nope", readTok, nil, http.StatusNotFound, "ref_not_found"},
 		// "path not found" and similar keep the generic code.
 		{"read ok control", http.MethodGet, "/api/v1/repo", readTok, nil, http.StatusOK, ""},

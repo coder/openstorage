@@ -33,7 +33,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `repo_name_mismatch` (400: the create body's `repo_name` differs from the token's
   `repo` claim), `branch_not_found` (404), `ref_not_found` (404: a ref, tag, or
   revision does not resolve), `credential_not_found` (404), `credential_exists` (409),
-  and `repository_deleted` (409: the repository is already deleted). open.storage
+  and `repository_deleted` (409: `DELETE /api/v1/repos/delete` on a deleted repository;
+  `DELETE /api/repos/{repo_name}` answers that case with 404 `repository_not_found`,
+  because its name lookup skips deleted repositories). open.storage
   emits no other specific codes. As upstream advises, treat
   an unknown code as the generic code for its status. Branch on the status code or
   `code`, not on the message.

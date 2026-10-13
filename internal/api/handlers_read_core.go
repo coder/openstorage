@@ -536,12 +536,18 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		branch := coreAliasParam(q, "ref", "branch")
+		// `ref` names a branch, tag, or commit; the deprecated `branch`
+		// and the default branch name a branch.
+		notFound := codeBranchNotFound
+		if q.Get("ref") != "" {
+			notFound = codeRefNotFound
+		}
 		if branch == "" {
 			branch = repo.DefaultBranch
 		}
 		anchor, err = gitread.ResolveRef(r.Context(), repoPath, branch, ephemeral)
 		if errors.Is(err, gitread.ErrNotFound) {
-			writeProblem(w, http.StatusNotFound, codeBranchNotFound, "branch not found")
+			writeProblem(w, http.StatusNotFound, notFound, "branch not found")
 			return
 		} else if err != nil {
 			s.internalErr(w, r, "resolve branch", err)
