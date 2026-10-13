@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	stdsync "sync"
 	"sync/atomic"
@@ -64,8 +65,10 @@ func TestRiverCompleteSyncCreate(t *testing.T) {
 		}
 		return n
 	}
-	if !q.TracksCreateState() {
-		t.Fatal("River must track create state")
+	inproc := NewLocal(&events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}, noop, noop, nil, slog.New(slog.DiscardHandler))
+	t.Cleanup(inproc.Close)
+	if !q.TracksCreateState() || inproc.TracksCreateState() {
+		t.Fatal("River tracks create state; the in-process queue (S3-WAL, #335) does not")
 	}
 	r, err := ms.CreateLinkedRepo(ctx, "acme", "race", "main",
 		meta.RepoUpstream{Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}, nil)
@@ -95,4 +98,23 @@ func TestRiverCompleteSyncCreate(t *testing.T) {
 		t.Fatalf("repo = %+v, %v; want complete", got, err)
 	}
 
+	if up, err := ms.GetRepoUpstream(ctx, r.RepoID); err != nil || !up.SyncPending {
+		t.Fatalf("upstream = %+v, %v; want the durable first-sync request", up, err)
+	}
+
+	// A detach before completion fails it: no job, and the repo stays pending.
+	det, err := ms.CreateLinkedRepo(ctx, "acme", "detached", "main",
+		meta.RepoUpstream{Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.DeleteRepoUpstream(ctx, det.RepoID); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := q.CompleteSyncCreate(ctx, "acme", det.RepoID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("detached: %v, %v; want ErrNotFound", out, err)
+	}
+	if got, err := ms.GetRepoByID(ctx, "acme", det.RepoID); err != nil || got.CreateState != meta.CreateStatePending || jobs(det.RepoID) != 0 {
+		t.Fatalf("detached repo = %+v, %v, %d jobs; want pending, no job", got, err, jobs(det.RepoID))
+	}
 }
