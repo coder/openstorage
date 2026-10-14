@@ -841,7 +841,8 @@ The downgrade keeps all data. It loses retry backoff positions, and every reposi
 create state reads legacy, so a repeat create answers 409.
 
 **Hook refusals.** A v2 hook refuses a ref update when `_wal/meta.json` has the wrong
-format version or does not decode (`_wal/meta.json is corrupt`). It writes nothing. For a
+format version, does not decode, or holds ids no writer can produce, such as a negative
+id counter (`_wal/meta.json is corrupt`). It writes nothing. For a
 corrupt document, keep `serve` stopped and
 [restore from a verified stopped-node backup](backup-restore-s3wal.md#restore-and-validate-before-cutover).
 Do not edit the document. If the hook cannot reach the store, it still accepts the push

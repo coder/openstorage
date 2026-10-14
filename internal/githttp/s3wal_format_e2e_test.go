@@ -21,34 +21,41 @@ import (
 
 // TestS3WALHookRefusesUnusableMetadata: a v2 hook that meets a v1
 // metadata document (issue #445: the binary was replaced under an older
-// serve) or a corrupt one (issue #466) refuses the push with a message that
-// names the fix. It neither accepts the push without its events nor writes
-// meta.json. The document changes while the update hook waits before its
+// serve) or a corrupt one (issues #466, #478) refuses the push with a
+// message that names the fix. It neither accepts the push without its
+// events nor writes meta.json, and serve keeps running. The document changes while the update hook waits before its
 // CAS, after the serve resolved the repo.
 func TestS3WALHookRefusesUnusableMetadata(t *testing.T) {
 	if testBackend != backendS3WAL {
 		t.Skip("the metadata document is S3WAL-only (ADR-51)")
+	}
+	setField := func(field, value string) func(t *testing.T, v2 []byte) []byte {
+		return func(t *testing.T, v2 []byte) []byte {
+			var doc map[string]json.RawMessage
+			if err := json.Unmarshal(v2, &doc); err != nil {
+				t.Fatal(err)
+			}
+			doc[field] = json.RawMessage(value)
+			out, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return out
+		}
 	}
 	for _, tc := range []struct {
 		name   string
 		mutate func(t *testing.T, v2 []byte) []byte
 		want   []string
 	}{
-		{"v1", func(t *testing.T, v2 []byte) []byte {
-			// Only the version matters here: the hook must stop at it.
-			var doc map[string]json.RawMessage
-			if err := json.Unmarshal(v2, &doc); err != nil {
-				t.Fatal(err)
-			}
-			doc["v"] = json.RawMessage("1")
-			v1, err := json.Marshal(doc)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return v1
-		}, []string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
+		// Only the version matters here: the hook must stop at it.
+		{"v1", setField("v", "1"),
+			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
 		{"truncated", func(_ *testing.T, v2 []byte) []byte { return v2[:len(v2)/2] },
 			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
+		// Issue #478: a decodable document with impossible id counters.
+		{"negative counter", setField("next_org_id", "-1"),
+			[]string{"_wal/meta.json is corrupt (", "negative id counters", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) { hookRefusesMetadata(t, tc.mutate, tc.want) })
 	}
@@ -132,6 +139,16 @@ func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, v2 []byte) []by
 	defer rs.Close()
 	if got, err := rs.GetRef(t.Context(), created.RepoID, "refs/heads/main"); !errors.Is(err, ref.ErrNotFound) {
 		t.Fatalf("authority refs/heads/main = %q, %v; want unset", got, err)
+	}
+	// serve must survive the document too (issue #478): its org-key
+	// refresher rereads it every 15 s, and a foreground metadata read
+	// fails with an error, not a panic.
+	time.Sleep(16 * time.Second)
+	if status := apiGet(t, node, token, "/api/v1/repo", nil); status/100 == 2 {
+		t.Fatalf("repo read on the replaced document answered %d, want an error", status)
+	}
+	if code, _ := httpGet(t, "http://"+node.addr+"/healthz", ""); code != http.StatusOK {
+		t.Fatalf("serve /healthz = %d after the refusal, want 200 (serve died?)", code)
 	}
 	// Stop serve (and its hook children) before the final read, so no
 	// late writer can hide behind it.
