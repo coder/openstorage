@@ -242,8 +242,7 @@ func TestPendingSyncCreate(t *testing.T) {
 		})
 
 		t.Run("an untracked store keeps the legacy create", func(t *testing.T) {
-			// A queue that tracks no create state: the scheduler panics if
-			// anything calls it.
+			// S3-WAL (#335): the scheduler panics if anything calls it.
 			s := newPendingSyncStack(t, e, false)
 			for i, want := range []int{http.StatusCreated, http.StatusConflict} {
 				if code, _, msg := s.create(t, "legacy", pendingSyncBody); code != want {
