@@ -217,19 +217,49 @@ func repoDeletedMsg(url string) string {
 // create that is not finished (issue #388).
 const pendingCreateRetryAfter = "5"
 
-// answerTakenName answers a create whose name is taken (CreateRepo returned
-// meta.ErrAlreadyExists). A soft-deleted or purged repo keeps its name
-// reserved: 404, and nothing is restored. A pending repo without an
-// upstream link (a fork or copy still publishing, one that crashed, or a
-// sync create whose link was removed while pending) answers 503: the
-// create may still finish, or fail and delete the row, so a 200 or a 409
-// could be wrong (issue #388). A sync-form request gets 409 there instead:
-// a repo without a link can never match it. Every other live repo is 409. The caller
-// already passed the create route's auth (repo:write, repo claim = this
-// name, the token's org), so the lookups read nothing outside what that
-// token can see.
+// writeRepoExists answers a repeat create of a finished repo: 200 with the
+// existing repo, as upstream does (spec 2026-10-07, issue #388).
+func writeRepoExists(w http.ResponseWriter, httpBaseURL string, repo meta.Repo) {
+	assertf(repo.RepoID != "" && repo.URL != "", "writeRepoExists: repo %+v", repo)
+	writeJSON(w, http.StatusOK, createRepoResponse{
+		RepoID:   repo.RepoID,
+		RepoName: repo.URL,
+		HTTPURL:  httpBaseURL + "/" + repo.RepoID + ".git",
+		Message:  "Repository '" + repo.URL + "' already exists",
+	})
+}
+
+// repoLinked reports whether the repo has an upstream link.
+func repoLinked(ctx context.Context, store meta.Store, repoID string) (bool, error) {
+	_, err := store.GetRepoUpstream(ctx, repoID)
+	if errors.Is(err, meta.ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// answerTakenName answers a plain, copy or fork create (syncForm false), or
+// a sync create on a store that tracks no sync create state (syncForm
+// true), whose name is taken: CreateRepo returned meta.ErrAlreadyExists.
+// Issue #388:
+//   - A soft-deleted or purged repo keeps its name reserved: 404, and
+//     nothing is restored.
+//   - A finished repo without an upstream link (plain, copy, fork, or a
+//     sync create whose link was removed) answers a non-sync form with
+//     200 and changes nothing: no copy, no schedule.
+//   - A pending repo without a link (a fork or copy still publishing, one
+//     that crashed, or a sync create whose link was removed while pending)
+//     answers a non-sync form with 503: the create may still finish, or
+//     fail and delete the row, so neither 200 nor 409 is safe.
+//   - Everything else is 409: legacy rows (their create may never have
+//     finished), linked repos (only a sync create can match them), and any
+//     sync form here (a repo without a link never matches one).
+//
+// The caller already passed the create route's auth (repo:write, repo
+// claim = this name, the token's org), so the lookups read nothing outside
+// what that token can see.
 func answerTakenName(w http.ResponseWriter, r *http.Request, store meta.Store,
-	internalErr func(http.ResponseWriter, *http.Request, string, error), org, url string, syncForm bool,
+	internalErr func(http.ResponseWriter, *http.Request, string, error), httpBaseURL, org, url string, syncForm bool,
 ) {
 	assertf(store != nil && internalErr != nil && org != "" && url != "", "answerTakenName: missing inputs")
 	repo, err := store.GetRepoByURL(r.Context(), org, url)
@@ -240,21 +270,23 @@ func answerTakenName(w http.ResponseWriter, r *http.Request, store meta.Store,
 	case err != nil:
 		internalErr(w, r, "get existing repository", err)
 		return
-	case repo.CreateState != meta.CreateStatePending || syncForm:
+	case repo.CreateState == meta.CreateStateLegacy || syncForm:
 		writeErr(w, http.StatusConflict, "repository already exists")
 		return
 	}
-	// A pending sync create keeps its link, and only a sync create or
-	// pull-upstream finishes it: any other form is 409 either way.
-	switch _, err := store.GetRepoUpstream(r.Context(), repo.RepoID); {
-	case errors.Is(err, meta.ErrNotFound):
+	linked, err := repoLinked(r.Context(), store, repo.RepoID)
+	switch {
+	case err != nil:
+		internalErr(w, r, "get existing upstream", err)
+	case linked: // only a sync create or pull-upstream finishes or matches it
+		writeErr(w, http.StatusConflict, "repository already exists")
+	case repo.CreateState == meta.CreateStateComplete:
+		writeRepoExists(w, httpBaseURL, repo)
+	default:
+		assertf(repo.CreateState == meta.CreateStatePending, "answerTakenName: create_state %d", repo.CreateState)
 		w.Header().Set("Retry-After", pendingCreateRetryAfter)
 		writeErr(w, http.StatusServiceUnavailable,
 			"a create is still running for this name; if it never finishes, DELETE /repos/delete clears the name")
-	case err != nil:
-		internalErr(w, r, "get existing upstream", err)
-	default:
-		writeErr(w, http.StatusConflict, "repository already exists")
 	}
 }
 
@@ -322,7 +354,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
 	switch {
 	case errors.Is(err, meta.ErrAlreadyExists):
-		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url, false)
+		answerTakenName(w, r, s.store, s.internalErr, s.httpBaseURL, claims.Iss, url, false)
 		return
 	case errors.Is(err, meta.ErrNotFound):
 		// Unreachable after successful auth (the org must exist to have

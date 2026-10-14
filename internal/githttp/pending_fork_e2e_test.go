@@ -13,9 +13,11 @@ import (
 
 // TestFork_PendingNameAnswers503 (issue #388) runs on every lane, S3-WAL
 // included (ADR-51 v2 stores create state): a fork through the real server
-// ends complete. A fork row left pending, as a crash before its last step
-// leaves it, answers plain, copy and fork creates with 503 + Retry-After
-// and a sync create with 409, until DELETE clears the name.
+// ends complete, and repeat plain, copy and fork creates of it answer 200.
+// A fork row left pending, as a crash before its last step leaves it,
+// answers plain, copy and fork creates with 503 + Retry-After and a sync
+// create with 409, until DELETE clears the name. A legacy row is 409, and a
+// repeat sync create is 200 (S3-WAL tracks sync creates since #451).
 func TestFork_PendingNameAnswers503(t *testing.T) {
 	src := registerRepo(t, "pending-fork-src")
 	work := initWorkRepo(t)
@@ -48,6 +50,26 @@ func TestFork_PendingNameAnswers503(t *testing.T) {
 	}
 	if r, err := testMeta.GetRepoByURL(context.Background(), testOrg, "pending-fork-done"); err != nil || r.CreateState != meta.CreateStateComplete {
 		t.Fatalf("forked repo = %+v, %v; want complete", r, err)
+	}
+	legacy := registerRepo(t, "pending-fork-legacy") // CreateRepo: a legacy row
+	if code, _ := post("pending-fork-sync", syncBody); code != http.StatusCreated {
+		t.Fatalf("sync create = %d, want 201", code)
+	}
+	for _, c := range []struct {
+		name, form, body string
+		want             int
+	}{
+		{"pending-fork-done", "plain", "", http.StatusOK}, {"pending-fork-done", "copy", copyBody, http.StatusOK},
+		{"pending-fork-done", "fork", fork, http.StatusOK}, {"pending-fork-done", "sync", syncBody, http.StatusConflict},
+		{"pending-fork-legacy", "plain", "", http.StatusConflict}, {"pending-fork-legacy", "copy", copyBody, http.StatusConflict},
+		{"pending-fork-sync", "sync", syncBody, http.StatusOK}, {"pending-fork-sync", "plain", "", http.StatusConflict},
+	} {
+		if code, _ := post(c.name, c.body); code != c.want {
+			t.Fatalf("repeat %s create of %s = %d, want %d", c.form, c.name, code, c.want)
+		}
+	}
+	if r, err := testMeta.GetRepoByID(context.Background(), testOrg, legacy); err != nil || r.CreateState != meta.CreateStateLegacy {
+		t.Fatalf("legacy row = %+v, %v; want legacy", r, err)
 	}
 
 	// The row a crash before the fork's last step leaves behind.

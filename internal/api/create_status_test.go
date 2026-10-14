@@ -62,8 +62,14 @@ func TestCreateRepoStatusCodes(t *testing.T) {
 					s.waitEvent(t, upsync.EventSyncStarted)
 					s.waitEvent(t, upsync.EventSyncSucceeded)
 				}
-				// A live name stays 409 until issue #388, even for the same request.
-				if got := post(t, repoURL, c.body, http.StatusConflict); got["error"] != "repository already exists" {
+				// Issue #388: a finished plain repo answers its repeat with 200.
+				// This stack's queue tracks no sync create state (legacy
+				// rows), so a repeat sync create stays 409.
+				if c.body == nil {
+					if got := post(t, repoURL, nil, http.StatusOK); got["repo_id"] != created["repo_id"] || got["message"] != "Repository '"+repoURL+"' already exists" {
+						t.Fatalf("repeat create = %v", got)
+					}
+				} else if got := post(t, repoURL, c.body, http.StatusConflict); got["error"] != "repository already exists" {
 					t.Fatalf("repeat create = %v", got)
 				}
 				if _, err := e.store.SoftDeleteRepo(context.Background(), s.org, repoURL); err != nil {

@@ -383,13 +383,13 @@ func TestForkRepo(t *testing.T) {
 			}
 		})
 
-		t.Run("fork onto an existing url is 409", func(t *testing.T) {
+		t.Run("a repeat fork of a finished fork is 200", func(t *testing.T) {
 			caller := newForkCaller(t, e, "")
 			resp, body := forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
-			forkRequireCreated(t, resp, body)
+			id := forkRequireCreated(t, resp, body)
 			resp, body = forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
-			if resp.StatusCode != http.StatusConflict || body["error"] == "" {
-				t.Fatalf("second fork: status %d body %v, want 409 envelope", resp.StatusCode, body)
+			if resp.StatusCode != http.StatusOK || body["repo_id"] != id {
+				t.Fatalf("second fork: status %d body %v, want 200 for repo %s (issue #388)", resp.StatusCode, body, id)
 			}
 		})
 
