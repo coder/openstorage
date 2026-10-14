@@ -4,11 +4,12 @@ package githttp
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -26,9 +27,10 @@ func nodeSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGKILL}
 }
 
-// sessionMembers lists the PIDs whose session is sid, zombies included,
-// from /proc/<pid>/stat (session is field 6; fields 3 on follow the
-// parenthesized command name).
+// sessionMembers lists the live (not zombie) processes whose session is
+// sid, from /proc/<pid>/stat: state is field 3 and session field 6, both
+// after the parenthesized command name. A zombie can no longer write, and
+// an init that does not reap adopted children keeps it forever.
 func sessionMembers(sid int) []int {
 	stats, err := filepath.Glob("/proc/[0-9]*/stat")
 	if err != nil {
@@ -48,7 +50,7 @@ func sessionMembers(sid int) []int {
 		if len(fields) < 4 {
 			panic(fmt.Sprintf("unparsable %s: %q", path, data))
 		}
-		if s, err := strconv.Atoi(string(fields[3])); err == nil && s == sid {
+		if s, err := strconv.Atoi(string(fields[3])); err == nil && s == sid && string(fields[0]) != "Z" {
 			pid, err := strconv.Atoi(filepath.Base(filepath.Dir(path)))
 			if err != nil {
 				panic(err)
@@ -57,6 +59,43 @@ func sessionMembers(sid int) []int {
 		}
 	}
 	return pids
+}
+
+// liveNodeSessions holds the session IDs of nodes not yet stopped, for
+// killNodesOnSignal.
+var (
+	liveNodeSessions    sync.Map // session ID (int) -> struct{}
+	installSignalKiller sync.Once
+)
+
+// trackNodeSession records a started node's session. The first call also
+// installs killNodesOnSignal: the nodes' sessions are outside the test
+// binary's process group, so a Ctrl-C or a runner's SIGTERM to that group
+// reaches neither serve nor its git children. Pdeathsig ends serve when
+// the test binary dies, but not serve's children.
+func trackNodeSession(sid int) {
+	installSignalKiller.Do(func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		go killNodesOnSignal(ch)
+	})
+	liveNodeSessions.Store(sid, struct{}{})
+}
+
+func untrackNodeSession(sid int) { liveNodeSessions.Delete(sid) }
+
+// killNodesOnSignal SIGKILLs every process in every live node session when
+// the test binary gets a termination signal, then dies by that signal.
+func killNodesOnSignal(ch <-chan os.Signal) {
+	sig := <-ch
+	liveNodeSessions.Range(func(sid, _ any) bool {
+		for _, pid := range sessionMembers(sid.(int)) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		return true
+	})
+	signal.Reset(os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	_ = syscall.Kill(os.Getpid(), sig.(syscall.Signal))
 }
 
 // serveChildren lists the processes in n's session other than serve.
@@ -100,10 +139,8 @@ func TestNodeStopKillsGitChildren(t *testing.T) {
 	}
 
 	node.stop()
-	for _, pid := range children {
-		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-			t.Errorf("serve child %d still exists after stop (kill 0: %v)", pid, err)
-		}
+	if left := sessionMembers(node.cmd.Process.Pid); len(left) != 0 {
+		t.Errorf("serve children %v still run after stop (before: %v)", left, children)
 	}
 	select {
 	case err := <-done:

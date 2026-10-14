@@ -15,3 +15,7 @@ func nodeSysProcAttr() *syscall.SysProcAttr {
 // sessionMembers needs /proc: without it testNode.stop reaches serve's
 // own process group only.
 func sessionMembers(int) []int { return nil }
+
+// Node tracking for a signal handler needs sessionMembers: a no-op here.
+func trackNodeSession(int)   {}
+func untrackNodeSession(int) {}
