@@ -837,9 +837,9 @@ release first.
 2. Take a verified [stopped-node backup](backup-restore-s3wal.md). The conversion drops
    the retry positions and create states, and the backup is the only way back to them.
 3. Run `openstorage s3wal-meta convert --to 1` with the v2 binary. A held lease is handled
-   as in upgrade step 4. If the command refuses because of unfinished fork or copy
-   creates, it names them: delete them with `DELETE /repos/delete` (with `serve` on this
-   release), stop `serve` again, and rerun, or add `--force`
+   as in upgrade step 4. If the command refuses because of unfinished creates without an
+   upstream link (forks, copies), it names them: delete them with `DELETE /repos/delete`
+   (with `serve` on this release), stop `serve` again, and rerun, or add `--force`
    ([details](../reference/cli.md#openstorage-s3wal-meta)).
 4. Replace the binary with the v1 release and start it.
 

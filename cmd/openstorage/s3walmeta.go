@@ -116,7 +116,7 @@ func runS3WALMetaConvert(ctx context.Context, cs s3wal.ConditionalStore, to int,
 			for i, c := range res.ForcedCreates {
 				names[i] = c.String() // quotes the URL: it comes from a token claim
 			}
-			fmt.Fprintf(out, "--force: %d unfinished fork or copy creates now read as finished, possibly empty repositories: %s\n",
+			fmt.Fprintf(out, "--force: %d unfinished creates without an upstream link now read as finished, possibly empty repositories: %s\n",
 				n, strings.Join(names, ", "))
 		}
 	}

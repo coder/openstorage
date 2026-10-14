@@ -63,7 +63,8 @@ func (c S3WALPendingCreate) String() string {
 	return fmt.Sprintf("%s (%q)", c.RepoID, c.URL)
 }
 
-// S3WALPendingCreatesError refuses --to 1 while fork or copy creates are
+// S3WALPendingCreatesError refuses --to 1 while creates without an
+// upstream link (forks, copies, sync creates whose link was removed) are
 // unfinished: v1 stores no create state, so on a v1 release each one reads
 // as a finished, possibly empty repository. Nothing was written.
 type S3WALPendingCreatesError struct {
@@ -75,7 +76,8 @@ func (e *S3WALPendingCreatesError) Error() string {
 	for i, c := range e.Creates {
 		names[i] = c.String()
 	}
-	return fmt.Sprintf("s3walmeta convert: %d unfinished fork or copy create(s): %s. "+
+	return fmt.Sprintf("s3walmeta convert: %d unfinished create(s) without an upstream link "+
+		"(a fork, a copy, or a sync create whose link was removed): %s. "+
 		"A v1 release reads them as finished, possibly empty repositories. "+
 		"Start serve on this release, remove them with DELETE /repos/delete, stop serve and convert again, "+
 		"or rerun with --force to downgrade anyway", len(e.Creates), strings.Join(names, ", "))
