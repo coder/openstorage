@@ -570,13 +570,30 @@ func utf8OK(what, v string) error {
 	return nil
 }
 
-// checkSeq enforces the stale-read watermark; caller holds mu.
-func (s *S3WAL) checkSeq(seq int64) {
-	assertf(seq >= s.lastSeq,
-		"s3walmeta stale read: store served seq %d after this process observed %d", seq, s.lastSeq)
-	if seq > s.lastSeq {
-		s.lastSeq = seq
+// StaleDocumentError reports a fetched metadata document whose seq is
+// below one this process already observed (plan §2.3 stale-read
+// watermark). The bytes come from the bucket, so this is not an internal
+// invariant: the store served a stale read, or the object was replaced
+// while this process ran (issue #488). The process keeps its newer view
+// and refuses to read or write through the older document, but it must
+// not crash: the org-key refresher meets this on its next tick.
+type StaleDocumentError struct {
+	Got  int64 // the fetched document's seq
+	Seen int64 // the highest seq this process observed
+}
+
+func (e *StaleDocumentError) Error() string {
+	return fmt.Sprintf("s3walmeta: %s went back to seq %d after this process saw seq %d: the store served a stale read, or the object was replaced while serve ran. This process will not read or write through the older document. If the bucket was restored on purpose, stop serve, then follow docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover", s3walMetaKey, e.Got, e.Seen)
+}
+
+// observeSeq applies the stale-read watermark to a fetched document;
+// caller holds mu.
+func (s *S3WAL) observeSeq(seq int64) error {
+	if seq < s.lastSeq {
+		return &StaleDocumentError{Got: seq, Seen: s.lastSeq}
 	}
+	s.lastSeq = seq
+	return nil
 }
 
 // readDoc fetches the current document, validating the process-local
@@ -629,7 +646,9 @@ func (s *S3WAL) adoptRead(obj s3wal.Object) (*s3walMetaDoc, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	s.checkSeq(doc.Seq)
+	if err := s.observeSeq(doc.Seq); err != nil {
+		return nil, "", err // keep the newer cache: nothing adopts the older body
+	}
 	s.cacheBody, s.cacheETag = obj.Body, obj.ETag
 	s.adoptOrgKeys(doc)
 	return doc, obj.ETag, nil
@@ -732,7 +751,10 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 			newETag, werr = s.cas.Advance(ctx, s3walMetaKey, body, etag)
 		}
 		if werr == nil {
-			s.checkSeq(ourSeq)
+			// Internal invariant: ourSeq is one past a read that passed
+			// observeSeq (or past our own last write).
+			assertf(ourSeq > s.lastSeq, "s3walmeta %s: wrote seq %d, not past observed seq %d", mu.op, ourSeq, s.lastSeq)
+			s.lastSeq = ourSeq
 			s.cacheBody, s.cacheETag = body, newETag
 			// Our CAS landed: the mutated doc IS the latest observed
 			// state, so a local key registration is visible to the very

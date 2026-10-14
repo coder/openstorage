@@ -209,6 +209,78 @@ func TestS3WALMetaCorruptCountersNoPanic(t *testing.T) {
 	}
 }
 
+// waitReads waits until cas has served n more document reads, failing the
+// test instead of hanging when the refresher stops reading.
+func waitReads(t *testing.T, cas *countGetsCAS, n int32) {
+	t.Helper()
+	start := cas.reads.Load()
+	for deadline := time.Now().Add(10 * time.Second); cas.reads.Load() < start+n; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the org-key refresher made %d of %d reads in 10 s", cas.reads.Load()-start, n)
+		}
+	}
+}
+
+// TestS3WALMetaStaleDocumentNoPanic (issue #488): when the stored document
+// goes back to an older seq while the process runs (a stale read, or the
+// object replaced out of band), every read and write returns the typed
+// error and writes nothing, and the org-key refresher keeps running. Before
+// the fix, the watermark assertion panicked serve on the refresher's next
+// tick. A document at or past the watermark is served again.
+func TestS3WALMetaStaleDocumentNoPanic(t *testing.T) {
+	ctx := t.Context()
+	mem := s3wal.NewMemCAS()
+	cas := &countGetsCAS{ConditionalStore: mem}
+	st := newS3WALStore(cas, nil, nil, resolveOptions([]Option{withKeyRefreshInterval(time.Millisecond)}))
+	t.Cleanup(st.Close)
+	if _, err := st.UpsertOrgWithKeys(ctx, "o", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := mem.Get(ctx, s3walMetaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := st.CreateRepo(ctx, "o", "https://example.com/stale.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newest, err := mem.Get(ctx, s3walMetaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Put the older document back, as a restore into the live bucket would.
+	if _, err := mem.Advance(ctx, s3walMetaKey, old.Body, newest.ETag); err != nil {
+		t.Fatal(err)
+	}
+	replaced, _ := mem.Get(ctx, s3walMetaKey)
+
+	var stale *StaleDocumentError
+	if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); !errors.As(err, &stale) || stale.Got != 1 || stale.Seen != 2 {
+		t.Fatalf("GetRepoByID = %v, want a *StaleDocumentError for seq 1 after seq 2", err)
+	}
+	for _, want := range []string{"_wal/meta.json went back to seq 1 after this process saw seq 2", "backup-restore-s3wal.md#restore-and-validate-before-cutover"} {
+		if !strings.Contains(stale.Error(), want) {
+			t.Fatalf("error %q lacks %q", stale, want)
+		}
+	}
+	if _, err := st.CreateRepo(ctx, "o", "https://example.com/other.git", "main"); !errors.As(err, &stale) {
+		t.Fatalf("CreateRepo = %v, want a *StaleDocumentError", err)
+	}
+	waitReads(t, cas, 3) // a panicking refresher kills the test binary
+	if got, _ := mem.Get(ctx, s3walMetaKey); got.ETag != replaced.ETag {
+		t.Fatalf("the store wrote through the older document: %s", got.Body)
+	}
+
+	// A document back at the watermark is served again (a stale read
+	// that the store later corrects).
+	if _, err := mem.Advance(ctx, s3walMetaKey, newest.Body, replaced.ETag); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.GetRepoByID(ctx, "o", repo.RepoID); err != nil || got.RepoID != repo.RepoID {
+		t.Fatalf("GetRepoByID after the store caught up = %+v, %v", got, err)
+	}
+}
+
 // s3walBackend is the s3wal lane fixture: a fresh MemCAS-backed store per
 // subtest (like the sqlite lane's fresh DB file).
 func s3walBackend(t *testing.T) Backend {
