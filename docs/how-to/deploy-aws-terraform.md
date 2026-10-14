@@ -176,6 +176,9 @@ mise exec -- terraform -chdir=deploy/terraform/aws output -json deployment \
 - Cloud-init fetches the release from the private artifact bucket, verifies SHA-256
   and embedded version, and starts a non-root systemd service with automatic
   restart and a managed-password refresh timer.
+- The service stops with `KillMode=mixed` and `TimeoutStopSec=30s`: systemd sends
+  `SIGTERM` to the server only, and the server drains and stops its own Git processes
+  ([rolling upgrades and restarts](deploy-production.md#rolling-upgrades-and-restarts)).
 - Bootstrap needs HTTPS egress to AWS package repos, S3, Secrets Manager, and the
   RDS CA endpoint.
 - The AMI comes from AWS's AL2023 parameter; pass output `ami_id` back as an input

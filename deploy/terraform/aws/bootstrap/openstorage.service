@@ -15,6 +15,13 @@ ExecStart=/usr/local/bin/openstorage serve --cache-dir=/var/cache/openstorage
 Restart=on-failure
 RestartSec=10s
 TimeoutStartSec=120s
+# Stop: SIGTERM goes to serve only (mixed). serve drains for at most 10 s,
+# including the 1 s between its own SIGTERM and SIGKILL to the Git processes
+# of unfinished requests, then shuts down its workers and stores. The
+# default control-group mode would also send SIGTERM to those Git processes
+# at once and fail every in-flight push. systemd sends SIGKILL to whatever
+# is left in the unit after TimeoutStopSec: 30 s, well above the 10 s drain.
+KillMode=mixed
 TimeoutStopSec=30s
 UMask=0077
 LimitCORE=0
