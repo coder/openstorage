@@ -1,13 +1,16 @@
-// Worker-level controls for the SQLite local schedule (issue #266 PR2,
-// ADR-50): real SQLite metadata, real git transfers, store time injected
-// through meta.WithNowFunc. Every control drives the scheduler through
-// SweepOnce and explicit enqueues; nothing sleeps for a backoff.
+// Worker-level controls for the local schedule (issue #266 PR2, ADR-50)
+// on SQLite and, with OPENSTORAGE_TEST_BACKEND=s3wal, on S3WAL metadata
+// over an in-memory bucket (ADR-51): real metadata, real git transfers,
+// store time injected through meta.WithNowFunc. Every control drives the
+// scheduler through SweepOnce and explicit enqueues; nothing sleeps for a
+// backoff.
 
 package sync
 
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -20,7 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/openstorage/internal/envconfig"
 	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // gateLanes wraps LocalLanes so a test can pause or fail one method for
@@ -205,12 +210,14 @@ func (u *httpUpstream) addRepo(t *testing.T, owner, name string) string {
 	return bare
 }
 
-// localSchedFixture is a worker plus LocalScheduler over a real SQLite
-// store with an injected, mutable clock.
+// localSchedFixture is a worker plus LocalScheduler over a real SQLite or
+// S3WAL store with an injected, mutable clock.
 type localSchedFixture struct {
 	wf        *workerFixture
-	ms        *meta.SQLite
-	db        *sql.DB // read-only view of the schedule columns
+	ms        localSchedStore
+	ls        meta.LocalScheduleStore
+	db        *sql.DB       // SQLite: read-only view of the schedule columns
+	cas       *s3wal.MemCAS // S3WAL: the bucket holding the metadata document
 	gate      *gateLanes
 	sched     *LocalScheduler
 	clock     atomic.Int64
@@ -218,38 +225,61 @@ type localSchedFixture struct {
 	lookupErr stdsync.Map // repoID -> error returned by the worker's repo lookup
 }
 
+// localSchedStore is the metadata surface the fixture and its tests use.
+type localSchedStore interface {
+	meta.Backend
+	meta.EventingStore
+}
+
+// newLocalSchedFixture builds the fixture on the backend that
+// OPENSTORAGE_TEST_BACKEND selects: unset for SQLite, s3wal for S3WAL.
 func newLocalSchedFixture(t *testing.T) *localSchedFixture {
 	t.Helper()
 	f := &localSchedFixture{wf: newWorkerFixture(t), org: "sched-org"}
 	// Store time starts at wall time: the worker derives its loopback
 	// token TTL from claim expiries with the real clock.
 	f.clock.Store(time.Now().UnixNano())
-	dbPath := filepath.Join(t.TempDir(), "meta.sqlite")
-	ms, err := meta.OpenSQLite(t.Context(), "sqlite://"+dbPath,
-		meta.WithNowFunc(func() time.Time { return time.Unix(0, f.clock.Load()) }))
-	if err != nil {
+	now := meta.WithNowFunc(func() time.Time { return time.Unix(0, f.clock.Load()) })
+	switch backend := envconfig.Getenv("OPENSTORAGE_TEST_BACKEND"); backend {
+	case "", "local", "pg":
+		// local and pg name internal/githttp lanes; this package has no
+		// PG schedule, so they run SQLite here.
+		dbPath := filepath.Join(t.TempDir(), "meta.sqlite")
+		ms, err := meta.OpenSQLite(t.Context(), "sqlite://"+dbPath, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.ms = ms
+		db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		f.db = db
+	case "s3wal":
+		f.cas = s3wal.NewMemCAS()
+		f.ms = meta.NewS3WAL(f.cas, now)
+	default:
+		t.Fatalf("OPENSTORAGE_TEST_BACKEND=%q: unknown backend (want s3wal, local, pg, or unset)", backend)
+	}
+	t.Cleanup(f.ms.Close)
+	if err := f.ms.InitSchema(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(ms.Close)
-	if err := ms.InitSchema(t.Context()); err != nil {
+	if _, err := f.ms.UpsertOrgWithKeys(t.Context(), f.org, []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ms.UpsertOrgWithKeys(t.Context(), f.org, []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {
-		t.Fatal(err)
-	}
-	f.ms = ms
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	f.db = db
-	lanes, ok := MetaLocalLanes(ms)
+	ls, ok := meta.LocalSchedule(f.ms)
 	if !ok {
-		t.Fatal("SQLite store does not provide local lanes")
+		t.Fatalf("%T does not provide the local schedule", f.ms)
+	}
+	f.ls = ls
+	lanes, ok := MetaLocalLanes(f.ms)
+	if !ok {
+		t.Fatalf("%T does not provide local lanes", f.ms)
 	}
 	f.gate = newGateLanes(lanes)
-	creds, ups := MetaStores(ms)
+	creds, ups := MetaStores(f.ms)
 	w := f.wf.worker
 	w.Upstreams, w.Credentials, w.Local = ups, creds, f.gate
 	w.Repos = func(_ context.Context, _, repoID string) (RepoInfo, error) {
@@ -292,10 +322,31 @@ func (f *localSchedFixture) row(t *testing.T, repoID string) meta.RepoUpstream {
 	return up
 }
 
-// readSchedule reads the SQLite-only schedule columns (push_attempt,
-// push_due) straight from the database file.
+// readSchedule reads the schedule fields (push_attempt, push_due) straight
+// from the store: the SQLite database file, or the S3WAL v2 document.
 func (f *localSchedFixture) readSchedule(t *testing.T, repoID string) (attempt int, due int64) {
 	t.Helper()
+	if f.cas != nil {
+		obj, err := f.cas.Get(t.Context(), "_wal/meta.json")
+		if err != nil {
+			t.Fatalf("read schedule: %v", err)
+		}
+		var doc struct {
+			V         int `json:"v"`
+			Upstreams map[string]struct {
+				PushAttempt int   `json:"push_attempt"`
+				PushDue     int64 `json:"push_due"`
+			} `json:"upstreams"`
+		}
+		if err := json.Unmarshal(obj.Body, &doc); err != nil {
+			t.Fatalf("read schedule: %v", err)
+		}
+		up, ok := doc.Upstreams[repoID]
+		if doc.V != 2 || !ok {
+			t.Fatalf("read schedule: document v%d, upstream %q present=%v", doc.V, repoID, ok)
+		}
+		return up.PushAttempt, up.PushDue
+	}
 	if err := f.db.QueryRowContext(t.Context(),
 		`SELECT push_attempt, push_due FROM repo_upstreams WHERE repo_id = ?`, repoID).Scan(&attempt, &due); err != nil {
 		t.Fatalf("read schedule: %v", err)
@@ -399,7 +450,7 @@ func TestLocalScheduleFinalP2Replay(t *testing.T) {
 	// The upstream recovers; an explicit request (API push-upstream:
 	// RequestPushNow, then the hint) expedites and covers the retry.
 	up.up(t)
-	if err := f.ms.RequestPushNow(t.Context(), repo, false); err != nil {
+	if err := f.ls.RequestPushNow(t.Context(), repo, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.sched.EnqueuePush(t.Context(), Job{Org: f.org, RepoID: repo}); err != nil {
@@ -476,7 +527,7 @@ func TestLocalScheduleNewerIntentSurvives(t *testing.T) {
 			<-reached
 			var err error
 			if explicit {
-				err = f.ms.RequestPushNow(t.Context(), repo, false)
+				err = f.ls.RequestPushNow(t.Context(), repo, false)
 			} else {
 				err = f.ms.RequestPush(t.Context(), repo, false)
 			}
@@ -789,7 +840,7 @@ func TestLocalScheduleClaimRecovery(t *testing.T) {
 			f.advance(time.Minute)
 			switch mode {
 			case "crash":
-				c, err := f.ms.ClaimDuePush(t.Context(), repo, "dead-process", claimLease(time.Minute))
+				c, err := f.ls.ClaimDuePush(t.Context(), repo, "dead-process", claimLease(time.Minute))
 				if err != nil || !c.Claimed {
 					t.Fatalf("simulated claim: %+v %v", c, err)
 				}
