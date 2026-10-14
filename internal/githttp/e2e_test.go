@@ -358,7 +358,10 @@ func testMainInner(m *testing.M) int {
 // shared bucket and the recovery drill's three keep theirs for the run.
 // privateStores deletes its bucket when its test ends, which frees the
 // slots (#452 item 7), so private buckets need room for one at a time
-// (tests run serially). 80 slots leave room for more. Automatic sizing can
+// (tests run serially). 80 slots leave room for more, and the extra slots
+// also cover slots SeaweedFS frees late after a bucket delete: a run with
+// exactly one private bucket of headroom failed with "no writable volume",
+// so do not lower the limit to the exact count. Automatic sizing can
 // exhaust slots on small CI disks even with tiny fixture payloads.
 func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
 	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,

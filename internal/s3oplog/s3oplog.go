@@ -9,7 +9,8 @@
 // role is derived from the process argv (serve vs hook subprocesses), so a
 // log shared by one push's processes attributes each round trip to its
 // origin. Background work tags its context with WithScope, and its round
-// trips log as role:scope, so a census can tell them from request work. The seam exists to census and regression-guard the per-push S3
+// trips log as role:scope, so a census can tell them from request work.
+// The seam exists to census and regression-guard the per-push S3
 // round-trip count; it is diagnostics, not telemetry — unset (the default)
 // it installs nothing and costs nothing.
 //
