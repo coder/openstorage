@@ -102,40 +102,56 @@ func assertHookAccepts(t *testing.T, ctx context.Context, rs ref.RefStore) {
 	}
 }
 
-// Issue #445: a v2 hook on a v1 bucket (binary replaced under an older
-// serve) refuses the ref update with the conversion hint before its CAS,
-// instead of accepting the push and dropping its events. It writes nothing.
-func TestHookEventingRefusesMetaFormatMismatch(t *testing.T) {
-	fake := &fakeMetaS3{body: []byte(`{"v":1,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`)}
-	srv := httptest.NewServer(fake)
-	defer srv.Close()
-	logs := hookEventingEnv(t, "s3wal://b?endpoint="+srv.URL)
-	cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
-	defer cleanup()
-	rs := hookRefStore(t)
+// Issues #445 and #466: a v2 hook on a v1 bucket (binary replaced under an
+// older serve), or on a corrupt document, refuses the ref update before its
+// CAS, instead of accepting the push and dropping its events. The refusal
+// names the fix, and the hook writes nothing.
+func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{"v1", `{"v":1,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`,
+			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
+		{"truncated", `{"v":2,"seq":3,"writer":"0123`,
+			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
+		{"no writer", `{"v":2,"seq":3,"next_org_id":1,"next_key_id":0}`,
+			[]string{"_wal/meta.json is corrupt (document seq 3 has no writer nonce)", "backup-restore-s3wal.md"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeMetaS3{body: []byte(tc.body)}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+			logs := hookEventingEnv(t, "s3wal://b?endpoint="+srv.URL)
+			cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+			defer cleanup()
+			rs := hookRefStore(t)
 
-	wrapped, err := githttp.WrapHookRefStore(t.Context(), rs)
-	if err == nil || wrapped != nil {
-		t.Fatalf("WrapHookRefStore = %v, %v; want a refusal", wrapped, err)
-	}
-	for _, want := range []string{"refusing the ref update", "document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("refusal %q lacks %q", err, want)
-		}
-	}
-	if got, err := rs.GetRef(t.Context(), "repo-1", "refs/heads/main"); !errors.Is(err, ref.ErrNotFound) {
-		t.Fatalf("authority ref = %q, %v; want unset", got, err)
-	}
-	if fake.gets.Load() == 0 {
-		t.Fatal("the hook never read meta.json")
-	}
-	if n := fake.writes.Load(); n != 0 {
-		t.Fatalf("the hook sent %d write requests to the bucket; want none", n)
+			wrapped, err := githttp.WrapHookRefStore(t.Context(), rs)
+			if err == nil || wrapped != nil {
+				t.Fatalf("WrapHookRefStore = %v, %v; want a refusal", wrapped, err)
+			}
+			for _, want := range append([]string{"refusing the ref update"}, tc.want...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("refusal %q lacks %q", err, want)
+				}
+			}
+			if got, err := rs.GetRef(t.Context(), "repo-1", "refs/heads/main"); !errors.Is(err, ref.ErrNotFound) {
+				t.Fatalf("authority ref = %q, %v; want unset", got, err)
+			}
+			if fake.gets.Load() == 0 {
+				t.Fatal("the hook never read meta.json")
+			}
+			if n := fake.writes.Load(); n != 0 {
+				t.Fatalf("the hook sent %d write requests to the bucket; want none", n)
+			}
+		})
 	}
 }
 
 // A metadata store the hook cannot reach keeps today's fail-open behavior
-// (issue #445): the push is accepted without events, because the ref store
+// (issues #445, #466): the push is accepted without events, because the ref store
 // would fail too if the store were truly down.
 func TestHookEventingFailsOpenOnTransientMetaErrors(t *testing.T) {
 	t.Run("format read fails", func(t *testing.T) {

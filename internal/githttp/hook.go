@@ -126,8 +126,9 @@ func testMode() bool { return envconfig.Getenv(EnvTestMode) == "1" }
 // exactly like API writes (that decorator wraps ref.IdempotentCAS itself).
 // The eventless default keeps hooks working before/without eventing wiring,
 // wrapping just the CAS-recovery decorator so ambiguous outcomes still
-// reconcile. An error refuses the ref update before its CAS (issue #445:
-// the metadata store is in a format this binary cannot write events to).
+// reconcile. An error refuses the ref update before its CAS (issues #445,
+// #466: the metadata document is in a format this binary cannot write
+// events to, or corrupt).
 var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
 	return ref.IdempotentCAS{RefStore: st}, nil
 }

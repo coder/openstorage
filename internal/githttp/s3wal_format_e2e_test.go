@@ -19,15 +19,42 @@ import (
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
 
-// TestS3WALHookRefusesV1Metadata (issue #445): a v2 hook that meets a v1
-// metadata document, as when the binary is replaced under an older serve,
-// refuses the push with the conversion hint. It neither accepts the push
-// without its events nor writes meta.json. The bucket turns v1 while the
-// update hook waits before its CAS, after the serve resolved the repo.
-func TestS3WALHookRefusesV1Metadata(t *testing.T) {
+// TestS3WALHookRefusesUnusableMetadata: a v2 hook that meets a v1
+// metadata document (issue #445: the binary was replaced under an older
+// serve) or a corrupt one (issue #466) refuses the push with a message that
+// names the fix. It neither accepts the push without its events nor writes
+// meta.json. The document changes while the update hook waits before its
+// CAS, after the serve resolved the repo.
+func TestS3WALHookRefusesUnusableMetadata(t *testing.T) {
 	if testBackend != backendS3WAL {
-		t.Skip("the metadata format version is S3WAL-only (ADR-51)")
+		t.Skip("the metadata document is S3WAL-only (ADR-51)")
 	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T, v2 []byte) []byte
+		want   []string
+	}{
+		{"v1", func(t *testing.T, v2 []byte) []byte {
+			// Only the version matters here: the hook must stop at it.
+			var doc map[string]json.RawMessage
+			if err := json.Unmarshal(v2, &doc); err != nil {
+				t.Fatal(err)
+			}
+			doc["v"] = json.RawMessage("1")
+			v1, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return v1
+		}, []string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
+		{"truncated", func(_ *testing.T, v2 []byte) []byte { return v2[:len(v2)/2] },
+			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { hookRefusesMetadata(t, tc.mutate, tc.want) })
+	}
+}
+
+func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, v2 []byte) []byte, want []string) {
 	db, blobs := privateStores(t, t.TempDir())
 	cache := t.TempDir()
 	node, err := startNode(cache, "OPENSTORAGE_PG_URL="+db, "OPENSTORAGE_S3_URL="+blobs, EnvHookDelay+"=3000")
@@ -56,8 +83,7 @@ func TestS3WALHookRefusesV1Metadata(t *testing.T) {
 	}()
 	waitForPushHold(t, cache, created.RepoID, "refs/heads/main", done)
 
-	// Render the stored v2 document as v1, conditionally on the version
-	// read. Only the version matters here: the hook must stop at it.
+	// Replace the stored v2 document, conditionally on the version read.
 	u, err := url.Parse(db)
 	if err != nil {
 		t.Fatal(err)
@@ -78,32 +104,25 @@ func TestS3WALHookRefusesV1Metadata(t *testing.T) {
 		return body, aws.ToString(obj.ETag)
 	}
 	v2, etag := readMeta()
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(v2, &doc); err != nil {
-		t.Fatal(err)
+	var stored struct{ V int }
+	if err := json.Unmarshal(v2, &stored); err != nil || stored.V != 2 {
+		t.Fatalf("stored document is v%d (%v), want 2", stored.V, err)
 	}
-	if string(doc["v"]) != "2" {
-		t.Fatalf("stored document is v%s, want 2", doc["v"])
-	}
-	doc["v"] = json.RawMessage("1")
-	v1, err := json.Marshal(doc)
-	if err != nil {
-		t.Fatal(err)
-	}
+	bad := mutate(t, v2)
 	if _, err := client.PutObject(t.Context(), &s3.PutObjectInput{
-		Bucket: aws.String(bucket), Key: aws.String("_wal/meta.json"), Body: bytes.NewReader(v1), IfMatch: aws.String(etag),
+		Bucket: aws.String(bucket), Key: aws.String("_wal/meta.json"), Body: bytes.NewReader(bad), IfMatch: aws.String(etag),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	res := <-done
-	t.Logf("push on a v1 document:\n%s", res.out)
+	t.Logf("push on the replaced document:\n%s", res.out)
 	if res.err == nil {
-		t.Fatal("the push was accepted on a v1 document")
+		t.Fatal("the push was accepted on the replaced document")
 	}
-	for _, want := range []string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"} {
-		if !strings.Contains(res.out, want) {
-			t.Fatalf("refusal lacks %q:\n%s", want, res.out)
+	for _, w := range want {
+		if !strings.Contains(res.out, w) {
+			t.Fatalf("refusal lacks %q:\n%s", w, res.out)
 		}
 	}
 	rs, err := ref.Open(t.Context(), db)
@@ -120,9 +139,9 @@ func TestS3WALHookRefusesV1Metadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := waitNodeExit(t, node, 30*time.Second); err != nil {
-		t.Logf("serve exit on a v1 document: %v", err)
+		t.Logf("serve exit on the replaced document: %v", err)
 	}
-	if got, _ := readMeta(); !bytes.Equal(got, v1) {
-		t.Fatalf("meta.json changed after the refusal:\nwant %s\ngot  %s", v1, got)
+	if got, _ := readMeta(); !bytes.Equal(got, bad) {
+		t.Fatalf("meta.json changed after the refusal:\nwant %s\ngot  %s", bad, got)
 	}
 }

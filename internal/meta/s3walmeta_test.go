@@ -29,7 +29,9 @@ import (
 func TestS3WALMetaDecode(t *testing.T) {
 	const fields = `"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`
 	for _, tc := range []struct{ name, body, wantErr string }{
-		{"malformed JSON", `{`, "s3walmeta: document decode:"},
+		{"malformed JSON", `{`, "s3walmeta: _wal/meta.json is corrupt (document decode:"},
+		{"seq zero", `{"v":2,"seq":0,"writer":"w"}`, "document seq 0 invalid"},
+		{"no writer", `{"v":2,"seq":1}`, "document seq 1 has no writer nonce"},
 		{"missing version", `{` + fields, "s3walmeta: document version 0 unsupported (want 2)"},
 		{"zero version", `{"v":0,` + fields, "s3walmeta: document version 0 unsupported (want 2)"},
 		{"v1 needs conversion", `{"v":1,` + fields, "s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2`"},
@@ -45,11 +47,19 @@ func TestS3WALMetaDecode(t *testing.T) {
 				if doc != nil {
 					t.Fatalf("rejected document = %+v, want nil", doc)
 				}
-				// Only version rejections are typed (issue #445): the hook
-				// refuses on them and fails open on everything else.
+				// Every rejection is typed (issues #445, #466): the hook
+				// refuses on both types and fails open only on store errors.
 				var fv *FormatVersionError
-				if typed, want := errors.As(err, &fv), strings.Contains(tc.wantErr, "version"); typed != want {
-					t.Fatalf("decode error %v: typed = %v, want %v", err, typed, want)
+				var cd *CorruptDocumentError
+				version := strings.Contains(tc.wantErr, "version")
+				isVersion, isCorrupt := errors.As(err, &fv), errors.As(err, &cd)
+				if isVersion != version || isCorrupt == version {
+					t.Fatalf("decode error %v: version-typed = %v, corrupt-typed = %v", err, isVersion, isCorrupt)
+				}
+				for _, want := range []string{"_wal/meta.json is corrupt", "backup-restore-s3wal.md#restore-and-validate-before-cutover"} {
+					if isCorrupt && !strings.Contains(err.Error(), want) {
+						t.Fatalf("corrupt-document error %q lacks %q", err, want)
+					}
 				}
 				return
 			}
@@ -72,24 +82,26 @@ func (failGetCAS) Get(context.Context, string) (s3wal.Object, error) {
 	return s3wal.Object{}, errStoreDown
 }
 
-// TestCheckFormat: CheckFormat types a wrong format and only that (issue
-// #445). It reads without writing, and backends without a format version
-// pass without I/O.
+// TestCheckFormat: CheckFormat types a wrong format (issue #445) and a
+// corrupt document (issue #466), never a store error. It reads without
+// writing, and backends without a format version pass without I/O.
 func TestCheckFormat(t *testing.T) {
 	const v1 = `{"v":1,"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`
 	var fv *FormatVersionError
+	var cd *CorruptDocumentError
 	for _, tc := range []struct {
-		name     string
-		seed     string // "" leaves the document missing
-		down     bool
-		wantType bool
-		wantErr  string
+		name        string
+		seed        string // "" leaves the document missing
+		down        bool
+		wantType    bool // a *FormatVersionError
+		wantCorrupt bool // a *CorruptDocumentError
+		wantErr     string
 	}{
 		{name: "missing document"},
 		{name: "v2", seed: `{"v":2,"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`},
 		{name: "v1", seed: v1, wantType: true, wantErr: "convert --to 2"},
 		{name: "v3", seed: `{"v":3,"seq":1}`, wantType: true, wantErr: "document version 3 unsupported (want 2)"},
-		{name: "corrupt", seed: `{`, wantErr: "document decode"},
+		{name: "corrupt", seed: `{`, wantCorrupt: true, wantErr: "document decode"},
 		{name: "store down", down: true, wantErr: errStoreDown.Error()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,6 +128,9 @@ func TestCheckFormat(t *testing.T) {
 			}
 			if got := errors.As(err, &fv); got != tc.wantType {
 				t.Fatalf("CheckFormat error %v: typed = %v, want %v", err, got, tc.wantType)
+			}
+			if got := errors.As(err, &cd); got != tc.wantCorrupt {
+				t.Fatalf("CheckFormat error %v: corrupt-typed = %v, want %v", err, got, tc.wantCorrupt)
 			}
 			after, _ := mem.Get(t.Context(), s3walMetaKey)
 			if !bytes.Equal(before.Body, after.Body) || before.ETag != after.ETag {
