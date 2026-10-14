@@ -25,7 +25,7 @@ func TestLocalHookAcceptedPushRecordsIntent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// No seed marker or active claim: boot recovery cannot manufacture the
+	// No seed marker or active claim: the sweep cannot manufacture the
 	// trigger we are testing. The closed loopback endpoint avoids external upstream I/O.
 	work := initWorkRepo(t)
 	head := revParse(t, work, "HEAD")

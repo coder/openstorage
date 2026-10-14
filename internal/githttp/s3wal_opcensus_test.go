@@ -67,7 +67,16 @@ func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 	}
 	window := raw[*offset:]
 	*offset = int64(len(raw))
-	return parseOpLog(t, string(window))
+	// The sync schedule's sweeps and runs are background work, logged
+	// under the ":schedule" scope (internal/sync opLogScope). Any serve
+	// process in the lane bucket can sweep during a window (#452 item 6).
+	var push []opLogLine
+	for _, l := range parseOpLog(t, string(window)) {
+		if !strings.HasSuffix(l.role, ":schedule") {
+			push = append(push, l)
+		}
+	}
+	return push
 }
 
 // censusTable renders one push window as a readable table for the census.
@@ -105,11 +114,23 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// scanners are already off by default: LFS reclamation and absence
 	// reconciliation ship interval 0, and the reconcile ticker needs the
 	// non-default v0.2.0 write-compat flag (or a partial Heal) to start.
-	// The sync schedule's sweep (ADR-51) makes its first pass 15 s after
-	// boot (pendingSyncRecoveryDelay), after these pushes.
+	// The sync schedule's sweep (ADR-51) is not disabled: opLogWindow
+	// drops its round trips by their op-log scope. The pushes start only
+	// once the sweep runs (its first pass is 15 s after boot), so every
+	// window overlaps sweep passes and the filter is exercised.
 	opLog := filepath.Join(t.TempDir(), "s3ops.log")
 	node := startNodeT(t, "OPENSTORAGE_S3_OP_LOG="+opLog, "OPENSTORAGE_REPACK_THRESHOLD=0",
 		"OPENSTORAGE_SWEEP_INTERVAL=0")
+	for deadline := time.Now().Add(60 * time.Second); ; {
+		raw, _ := os.ReadFile(opLog)
+		if strings.Contains(string(raw), ":schedule ") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no schedule-scoped op-log line within 60 s of boot: the sweep is not running or its round trips are not tagged")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 
 	repo := registerRepo(t, "t-s3wal-op-census")
 	work := initWorkRepo(t)

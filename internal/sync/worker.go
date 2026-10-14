@@ -174,7 +174,8 @@ type Worker struct {
 	// (river insert-time uniqueness, a held local claim) then survives to
 	// that run's completion gate instead of silently dropping the
 	// promised mirror. Enqueue failures are logged; the marker carries
-	// the request to boot recovery or the next finisher. Both wirings
+	// the request to the next finisher (or, on the local schedule, the
+	// next sweep). Both wirings
 	// point it at the queue's EnqueueSync.
 	AfterForward func(ctx context.Context, job Job) error
 

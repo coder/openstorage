@@ -221,7 +221,7 @@ func TestPushRunAuthFailure(t *testing.T) {
 
 // TestPushRunUnreachableRemarksPending: an unreachable upstream is the
 // transient class — the run re-marks the durable pending level so the
-// backoff retry (or a restart's boot recovery) can converge later.
+// backoff retry (or, after a restart, the next sweep) can converge later.
 func TestPushRunUnreachableRemarksPending(t *testing.T) {
 	f := newWorkerFixture(t)
 	seedLocalRepo(t, f, "repo_pf")

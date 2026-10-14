@@ -514,6 +514,7 @@ func testLocalListLocalWork(t *testing.T, newSchedFixture func(*testing.T) *sche
 	backoffRepo, _ := f.addRepo(t, f.org, "backoff")
 	pullRepo, _ := f.addRepo(t, f.org, "pull")
 	deadRepo, _ := f.addRepo(t, f.org, "dead")
+	deadPullRepo, _ := f.addRepo(t, f.org, "deadpull")
 	liveRepo, _ := f.addRepo(t, f.org, "live")
 	idleRepo, _ := f.addRepo(t, f.org, "idle")
 	otherRepo, _ := f.addRepo(t, "other-org", "other")
@@ -525,7 +526,13 @@ func testLocalListLocalWork(t *testing.T, newSchedFixture func(*testing.T) *sche
 		must(f.s.RequestPush(ctx, deadRepo, false))
 		f.claimPush(t, "dead")
 	})
-	f.advance(schedLease) // dead's claim expires
+	// A pull claim held by a process that died: its claim consumed
+	// sync_pending, so only the expired claim makes it work (#475).
+	withRepo(deadPullRepo, func() {
+		must(f.s.RequestSync(ctx, deadPullRepo))
+		f.claimSync(t, "dead")
+	})
+	f.advance(schedLease) // the dead claims expire
 	withRepo(backoffRepo, func() { f.backoff(t, false, time.Minute) })
 	withRepo(liveRepo, func() {
 		must(f.s.RequestPush(ctx, liveRepo, false))
@@ -537,7 +544,6 @@ func testLocalListLocalWork(t *testing.T, newSchedFixture func(*testing.T) *sche
 	if _, err := f.s.SoftDeleteRepo(ctx, f.org, deletedURL); err != nil {
 		t.Fatalf("SoftDeleteRepo: %v", err)
 	}
-	_ = idleRepo
 
 	all := func() []LocalWork {
 		t.Helper()
@@ -558,7 +564,8 @@ func testLocalListLocalWork(t *testing.T, newSchedFixture func(*testing.T) *sche
 			after = page[len(page)-1].RepoID
 		}
 	}
-	want := []LocalWork{{RepoID: f.repo, Push: true}, {RepoID: pullRepo, Pull: true}, {RepoID: deadRepo, Push: true}}
+	want := []LocalWork{{RepoID: f.repo, Push: true}, {RepoID: pullRepo, Pull: true}, {RepoID: deadRepo, Push: true},
+		{RepoID: deadPullRepo, Pull: true}}
 	slices.SortFunc(want, func(a, b LocalWork) int {
 		if a.RepoID < b.RepoID {
 			return -1
@@ -575,6 +582,27 @@ func testLocalListLocalWork(t *testing.T, newSchedFixture func(*testing.T) *sche
 	}
 	if work, err := f.s.ListLocalWork(ctx, "unknown-org", "", 16); err != nil || len(work) != 0 {
 		t.Fatalf("unknown org = %+v, %v; want no work", work, err)
+	}
+
+	// SQLite only: a lapsed adopted legacy pull claim is work only with
+	// the operator's steal opt-in, as ClaimDueSync claims it only then.
+	lite, ok := f.s.(*SQLite)
+	if !ok {
+		return
+	}
+	if _, err := lite.db.ExecContext(ctx, `UPDATE repo_upstreams SET syncing = 1, sync_pending = 0,
+		sync_claim_holder = ?, sync_claim_expires_at = 1 WHERE repo_id = ?`, LegacyClaimHolder, idleRepo); err != nil {
+		t.Fatal(err)
+	}
+	isWork := func() bool {
+		return slices.ContainsFunc(all(), func(w LocalWork) bool { return w.RepoID == idleRepo && w.Pull })
+	}
+	if isWork() {
+		t.Fatal("lapsed legacy claim listed as work without the steal opt-in")
+	}
+	t.Setenv(EnvSyncStealLegacy, "true")
+	if !isWork() {
+		t.Fatal("lapsed legacy claim not listed as work with the steal opt-in")
 	}
 }
 

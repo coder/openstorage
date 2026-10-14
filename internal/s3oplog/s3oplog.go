@@ -8,7 +8,8 @@
 //
 // role is derived from the process argv (serve vs hook subprocesses), so a
 // log shared by one push's processes attributes each round trip to its
-// origin. The seam exists to census and regression-guard the per-push S3
+// origin. Background work tags its context with WithScope, and its round
+// trips log as role:scope, so a census can tell them from request work. The seam exists to census and regression-guard the per-push S3
 // round-trip count; it is diagnostics, not telemetry — unset (the default)
 // it installs nothing and costs nothing.
 //
@@ -84,6 +85,18 @@ func procRole() string {
 	return strings.Join(strings.Fields(strings.Join(parts, ":")), "_")
 }
 
+type scopeKey struct{}
+
+// WithScope returns ctx tagged with scope: S3 round trips made under it log
+// their role as role:scope. scope must be one non-empty word (no
+// whitespace or colon), so the line stays field-splittable.
+func WithScope(ctx context.Context, scope string) context.Context {
+	if scope == "" || strings.ContainsAny(scope, ": \t\n") {
+		panic(fmt.Sprintf("s3oplog.WithScope: invalid scope %q", scope))
+	}
+	return context.WithValue(ctx, scopeKey{}, scope)
+}
+
 // APIOption returns the smithy API option installing the op-log middleware
 // and whether the seam is enabled. Callers append it to s3.Options
 // .APIOptions exactly like the expected-bucket-owner option.
@@ -116,8 +129,12 @@ func logOp(ctx context.Context, in middleware.DeserializeInput, next middleware.
 	if resp, ok := out.RawResponse.(*smithyhttp.Response); ok && resp != nil && resp.Response != nil {
 		status = resp.StatusCode
 	}
+	r := role
+	if scope, ok := ctx.Value(scopeKey{}).(string); ok {
+		r += ":" + scope
+	}
 	line := fmt.Sprintf("%d %d %s %s %d %d %s\n",
-		start.UnixNano(), os.Getpid(), role, awsmiddleware.GetOperationName(ctx), status, dur.Microseconds(), key)
+		start.UnixNano(), os.Getpid(), r, awsmiddleware.GetOperationName(ctx), status, dur.Microseconds(), key)
 	_, _ = logFile.WriteString(line)
 	return out, md, err
 }
