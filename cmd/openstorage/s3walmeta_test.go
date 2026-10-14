@@ -89,7 +89,7 @@ func TestS3WALMetaConvertPendingCreatesCommand(t *testing.T) {
 	if err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{Force: true}, s3wal.LeaseConfig{}, &out); err != nil || storedVersion(t, cas) != `{"v":1` {
 		t.Fatalf("forced = %q, %v", out.String(), err)
 	}
-	for _, want := range []string{"first sync requested (the v1 release runs it at boot): " + sync.RepoID, "--force: 1 unfinished fork or copy creates", fork.RepoID + ` ("fork-pending")`} {
+	for _, want := range []string{"first sync requested (the v1 release runs it at boot): " + sync.RepoID, "--force: 1 unfinished creates without an upstream link", fork.RepoID + ` ("fork-pending")`} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("forced output %q lacks %q", out.String(), want)
 		}

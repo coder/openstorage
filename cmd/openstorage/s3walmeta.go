@@ -30,7 +30,7 @@ func cmdS3WALMeta(ctx context.Context, args []string) error {
 	}
 	fs := flag.NewFlagSet("s3wal-meta convert", flag.ExitOnError)
 	to := fs.Int("to", 0, "target metadata format version: 2 to upgrade, 1 to downgrade")
-	force := fs.Bool("force", false, "with --to 1: convert even while a fork or copy create is unfinished")
+	force := fs.Bool("force", false, "with --to 1: convert even while a create without an upstream link (fork, copy) is unfinished")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -116,7 +116,7 @@ func runS3WALMetaConvert(ctx context.Context, cs s3wal.ConditionalStore, to int,
 			for i, c := range res.ForcedCreates {
 				names[i] = c.String() // quotes the URL: it comes from a token claim
 			}
-			fmt.Fprintf(out, "--force: %d unfinished fork or copy creates now read as finished, possibly empty repositories: %s\n",
+			fmt.Fprintf(out, "--force: %d unfinished creates without an upstream link now read as finished, possibly empty repositories: %s\n",
 				n, strings.Join(names, ", "))
 		}
 	}

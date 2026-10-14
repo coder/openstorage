@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cgi"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
 
@@ -202,7 +204,8 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 		t.Cleanup(func() { _ = log.Close() })
 		n, err := startBinaryNode(binary, t.TempDir(), log,
 			"OPENSTORAGE_TEST_MODE=", "OPENSTORAGE_S3WAL_LEASE_TTL=1m",
-			"OPENSTORAGE_SECRETS_KEY="+secretsKey, "OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE=true")
+			"OPENSTORAGE_SECRETS_KEY="+secretsKey, "OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE=true",
+			"OPENSTORAGE_SYNC_ALLOW_PRIVATE=true") // the sync fixture's upstream is on loopback
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -463,12 +466,66 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 		t.Fatal("stopped v2 document lacks create_state 2 for the candidate-created repository")
 	}
 	phase("candidate-second: stopped v2 document stores create_state 2 for the candidate-created repository")
+	// A sync create that crashed after its insert (issue #452 item 5): the
+	// repo is pending with its upstream link and still owes its first sync.
+	// convert --to 1 must request that sync, and the official release must
+	// run it at boot.
+	upRoot := t.TempDir()
+	upBare := filepath.Join(upRoot, "up", "mirror.git")
+	git("", "init", "--bare", "-b", "main", upBare)
+	upWork := initWorkRepo(t)
+	git(upWork, "push", upBare, "HEAD:refs/heads/main")
+	upHead := git(upWork, "rev-parse", "HEAD")
+	upstream := httptest.NewServer(&cgi.Handler{
+		Path: filepath.Join(git("", "--exec-path"), "git-http-backend"),
+		Env: []string{"GIT_PROJECT_ROOT=" + upRoot, "GIT_HTTP_EXPORT_ALL=1",
+			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"},
+	})
+	t.Cleanup(upstream.Close)
+	const syncRepo = "upgrade-sync-fixture"
+	syncToken := mintTestToken(t, syncRepo, "git:read", "")
+	ms, err := meta.Open(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, ok := ms.(interface {
+		CreateLinkedRepo(ctx context.Context, org, url, defaultBranch string, up meta.RepoUpstream, cred *meta.GitCredential) (meta.Repo, error)
+	})
+	if !ok {
+		t.Fatal("S3WAL metadata store does not create linked repositories")
+	}
+	pendingSync, err := linked.CreateLinkedRepo(t.Context(), testOrg, syncRepo, "main",
+		meta.RepoUpstream{Provider: "github", Owner: "up", Name: "mirror", UpstreamHost: upstream.URL}, nil)
+	ms.Close()
+	if err != nil || pendingSync.CreateState != meta.CreateStatePending {
+		t.Fatalf("seed pending sync create: state=%d err=%v", pendingSync.CreateState, err)
+	}
+	phase("stopped v2 bucket: pending sync create seeded (repo, upstream link, no first sync), as after a crash")
 	// The supported downgrade (ADR-51 D8): convert back, then the official
 	// release serves everything the candidate wrote.
 	convert("1")
+	if out, err := os.ReadFile(filepath.Join(upgradeAttempt, "convert-to-1.out")); err != nil ||
+		!bytes.Contains(out, []byte("first sync requested (the v1 release runs it at boot): "+pendingSync.RepoID)) {
+		t.Fatal("convert --to 1 did not report the pending sync create as repaired")
+	}
 	refuse(upgradePair.CandidateBinary, "candidate-on-v1-again", "document version 1 needs conversion")
 	back := start(upgradePair.OldBinary, "official-downgrade")
 	check(back, "official after --to 1")
+	// No API call requests this sync: only the converted sync_pending can
+	// make the official release pull the upstream.
+	synced := false
+	for deadline := time.Now().Add(60 * time.Second); !synced && time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
+		// A hung server or upstream must not stall the poll past its deadline.
+		out, err := tryGitDeadline("", time.Until(deadline), "ls-remote", remoteURL(back, pendingSync.RepoID, syncToken), "refs/heads/main")
+		if _, logErr := fmt.Fprintf(gitLog, "operation=ls-remote result=%v\n%s\n", err, out); logErr != nil {
+			t.Fatal(logErr)
+		}
+		synced = err == nil && strings.HasPrefix(out, upHead+"\t")
+	}
+	if !synced {
+		t.Fatal("official after --to 1: the repaired sync create did not sync its upstream at boot")
+	}
+	phase("official after --to 1: repaired sync create pulled its upstream at boot; refs/heads/main matches")
 	var candidateGot repoMetadata
 	if status := apiGet(t, back, candidateToken, "/api/v1/repo", &candidateGot); status != http.StatusOK || candidateGot.RepoID != candidateCreated.RepoID || candidateGot.RepoName != candidateRepo || candidateGot.DefaultBranch != "main" {
 		t.Fatalf("official after --to 1: candidate-created repository status=%d or metadata invalid", status)
