@@ -341,6 +341,20 @@ class UnitTests(unittest.TestCase):
         self.assertNotIn("Requires=openstorage", service)
         self.assertIn("OnUnitInactiveSec=1min", timer)
 
+    def test_stop_lets_serve_drain_its_git_children(self):
+        # serve's SIGTERM drain stops its own Git children within 10 s
+        # (issue #440). KillMode=mixed keeps systemd's SIGTERM away from them,
+        # and the stop timeout must cover the drain plus teardown, which can
+        # spend up to 5 s releasing the instance lease (leaseReleaseTimeout),
+        # plus margin.
+        service = (Path(__file__).parent / "openstorage.service").read_text()
+        settings = [line for line in service.splitlines() if not line.startswith("#")]
+        self.assertIn("KillMode=mixed", settings)
+        timeouts = [line.removeprefix("TimeoutStopSec=") for line in settings if line.startswith("TimeoutStopSec=")]
+        self.assertEqual(len(timeouts), 1)
+        self.assertRegex(timeouts[0], r"^[0-9]+s$")
+        self.assertGreaterEqual(int(timeouts[0].removesuffix("s")), 20)
+
 
 if __name__ == "__main__":
     unittest.main()

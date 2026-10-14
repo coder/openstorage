@@ -452,6 +452,16 @@ So roll one replica at a time, using the proxy:
 3. Stop it, start the new version, and wait for `/healthz`.
 4. Re-register it and move to the next replica.
 
+Send the stop signal to the server process only. The server stops its own Git processes
+during the drain, and a supervisor that signals every process fails every push in flight
+at once. Under systemd, set `KillMode=mixed`: the default, `control-group`, sends
+`SIGTERM` to every process of the unit. Set `TimeoutStopSec` to at least 20 seconds: the
+10-second drain, then teardown, which in zero-infra mode includes up to 5 seconds of
+instance-lease release, plus margin. After it, systemd sends `SIGKILL` to every process
+left, and a server killed during lease release leaves the lease behind. The
+[AWS reference unit](../../deploy/terraform/aws/bootstrap/openstorage.service) uses
+`KillMode=mixed` and `TimeoutStopSec=30s`.
+
 **Interrupted work cannot corrupt data.** Pack data reaches the bucket *before* any ref
 moves, so a killed push never leaves a ref pointing at missing objects. It can leave
 storage behind:
