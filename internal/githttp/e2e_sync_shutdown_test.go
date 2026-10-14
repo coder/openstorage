@@ -23,6 +23,8 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/coder/openstorage/internal/meta"
@@ -35,7 +37,7 @@ import (
 // (local schedule sweeps, River workers) and would otherwise pick up or
 // steal the run. On PostgreSQL the database is a fresh database on the
 // lane's server. On S3WAL both stores are one fresh bucket on the lane's
-// SeaweedFS.
+// SeaweedFS, deleted when the test ends.
 func privateStores(t *testing.T, dataDir string) (metaURL, blobsURL string) {
 	t.Helper()
 	fileBlobs := "file://" + filepath.Join(dataDir, "blobs")
@@ -71,16 +73,20 @@ func privateStores(t *testing.T, dataDir string) (metaURL, blobsURL string) {
 		u.Path = "/" + name
 		return u.String(), fileBlobs
 	case backendS3WAL:
-		// TestMain owns the SeaweedFS container, so the bucket goes with it.
 		base, err := url.Parse(blobURL)
 		if err != nil {
 			t.Fatal(err)
 		}
-		bucket := "shutdown-" + uuid.New().String()
+		bucket := "private-" + uuid.New().String()
 		client := s3waltest.RawS3Client(base.Query().Get("endpoint"), "us-east-1", s3AccessKey, s3SecretKey)
 		if err := s3waltest.EnsureBucket(t.Context(), client, bucket); err != nil {
 			t.Fatal(err)
 		}
+		// Registered first, so it runs after the nodes and stores close.
+		// Deleting the bucket frees its SeaweedFS volume slots (seven per
+		// bucket): private buckets do not add to the shared container's
+		// -volume.max budget (startSeaweedFS, #452 item 7).
+		t.Cleanup(func() { deleteBucket(t, client, bucket) })
 		db, err := url.Parse(dbURL)
 		if err != nil {
 			t.Fatal(err)
@@ -90,6 +96,33 @@ func privateStores(t *testing.T, dataDir string) (metaURL, blobsURL string) {
 	default:
 		t.Fatalf("unknown test backend %q", testBackend)
 		return "", ""
+	}
+}
+
+// deleteBucket removes every object in bucket, then the bucket itself.
+func deleteBucket(t *testing.T, client *s3.Client, bucket string) {
+	t.Helper()
+	ctx := context.Background()
+	p := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			t.Errorf("delete bucket %s: list: %v", bucket, err)
+			return
+		}
+		for _, obj := range page.Contents {
+			if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: obj.Key}); err != nil {
+				t.Errorf("delete bucket %s: object %s: %v", bucket, aws.ToString(obj.Key), err)
+				return
+			}
+		}
+	}
+	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Errorf("delete bucket %s: %v", bucket, err)
+		return
+	}
+	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
+		t.Errorf("delete bucket %s: the bucket still exists", bucket)
 	}
 }
 
