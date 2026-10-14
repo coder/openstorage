@@ -439,7 +439,7 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	// A candidate-written create_state (v2) must survive convert --to 1 for
 	// the official release.
 	const candidateRepo = "upgrade-candidate-fixture"
-	candidateToken := mintTestToken(t, candidateRepo, "repo:write", "")
+	candidateToken := mintTestToken(t, candidateRepo, "repo:write,git:read", "")
 	var candidateCreated struct {
 		RepoID string `json:"repo_id"`
 	}
@@ -455,8 +455,8 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	back := start(upgradePair.OldBinary, "official-downgrade")
 	check(back, "official after --to 1")
 	var candidateGot repoMetadata
-	if apiGet(t, back, candidateToken, "/api/v1/repo", &candidateGot) != http.StatusOK || candidateGot.RepoID != candidateCreated.RepoID || candidateGot.RepoName != candidateRepo || candidateGot.DefaultBranch != "main" {
-		t.Fatal("official after --to 1: candidate-created repository metadata invalid")
+	if status := apiGet(t, back, candidateToken, "/api/v1/repo", &candidateGot); status != http.StatusOK || candidateGot.RepoID != candidateCreated.RepoID || candidateGot.RepoName != candidateRepo || candidateGot.DefaultBranch != "main" {
+		t.Fatalf("official after --to 1: candidate-created repository status=%d or metadata invalid", status)
 	}
 	phase("official after --to 1: candidate-created repository readable with its token")
 	stop(back, "official-downgrade")
