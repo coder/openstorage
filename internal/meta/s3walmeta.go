@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	mrand "math/rand/v2"
 	"reflect"
 	"slices"
@@ -276,6 +277,20 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 func (doc *s3walMetaDoc) checkIDs() error {
 	if doc.NextOrgID < 0 || doc.NextKeyID < 0 {
 		return fmt.Errorf("document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
+	}
+	// The next write bumps seq, and the next mint bumps a counter: at
+	// MaxInt64 either one would wrap negative (issue #487).
+	if doc.Seq == math.MaxInt64 || doc.NextOrgID == math.MaxInt64 || doc.NextKeyID == math.MaxInt64 {
+		return fmt.Errorf("document seq %d: seq or an id counter (%d, %d) is at its maximum", doc.Seq, doc.NextOrgID, doc.NextKeyID)
+	}
+	// Upstream lanes (issue #481): no writer leaves a claim without its
+	// holder, and the schedule fields only count up from 0.
+	for _, repoID := range slices.Sorted(maps.Keys(doc.Upstreams)) {
+		if u := doc.Upstreams[repoID]; u != nil {
+			if err := checkUpstreamShape(repoID, u); err != nil {
+				return fmt.Errorf("document seq %d: %w", doc.Seq, err)
+			}
+		}
 	}
 	orgIDs := make(map[int64]bool, len(doc.Orgs))
 	keyIDs := make(map[int64]bool)
@@ -857,7 +872,11 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 			return fmt.Errorf("s3walmeta %s: %w (recovery read failed: %v)", mu.op, werr, rerr)
 		}
 		if fresh.Writer == ourNonce {
-			assertf(fresh.Seq == ourSeq, "s3walmeta %s: our nonce at foreign seq %d (wrote %d)", mu.op, fresh.Seq, ourSeq)
+			if fresh.Seq != ourSeq {
+				// Our 128-bit nonce at another seq: only an out-of-band
+				// edit produces that (issue #481).
+				return &CorruptDocumentError{Err: fmt.Errorf("document seq %d carries this process's writer nonce from seq %d", fresh.Seq, ourSeq)}
+			}
 			return nil // our write landed and is the latest
 		}
 		verdict := s3walMetaRerun

@@ -201,9 +201,7 @@ func TestS3WALMetaCorruptCountersNoPanic(t *testing.T) {
 	if err := CheckFormat(t.Context(), st); !errors.As(err, &cd) || !strings.Contains(err.Error(), "negative id counters") {
 		t.Fatalf("CheckFormat = %v, want the negative-counter *CorruptDocumentError", err)
 	}
-	for start := cas.reads.Load(); cas.reads.Load() < start+3; {
-		time.Sleep(time.Millisecond) // a panicking refresher kills the test binary
-	}
+	waitReads(t, cas, 3) // a panicking refresher kills the test binary; a stopped one fails (issue #487)
 	got, _ := mem.Get(t.Context(), s3walMetaKey)
 	if !bytes.Equal(got.Body, body) {
 		t.Fatalf("the store changed the document: %s", got.Body)

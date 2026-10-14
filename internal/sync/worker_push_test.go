@@ -7,6 +7,7 @@ package sync
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // seedLocalRepo populates the fixture's loopback repo with one commit on
@@ -704,5 +707,20 @@ func TestPushRetryDelayBackoff(t *testing.T) {
 		if got := PushRetryDelay(i + 1); got != w {
 			t.Fatalf("PushRetryDelay(%d) = %v, want %v", i+1, got, w)
 		}
+	}
+}
+
+// A stored retry position past the budget (an out-of-band edit of the
+// S3-WAL document, issue #481) ends the run without a retry. It used to
+// panic the sweep-started worker.
+func TestLocalPushOutcomeAttemptPastBudget(t *testing.T) {
+	unreachable := &syncFailure{code: FailUnreachable, cause: errors.New("unreachable")}
+	for _, attempt := range []int{MaxPushTransientRetries, MaxPushTransientRetries + 1, 1 << 30} {
+		if o := localPushOutcome(unreachable, attempt, false); o.Kind != meta.OutcomeDone || o.Success {
+			t.Fatalf("attempt %d: outcome %+v, want done without success", attempt, o)
+		}
+	}
+	if o := localPushOutcome(unreachable, MaxPushTransientRetries-1, false); o.Kind != meta.OutcomeRetry {
+		t.Fatalf("last budgeted attempt: outcome %+v, want a retry", o)
 	}
 }

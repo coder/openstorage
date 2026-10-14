@@ -689,7 +689,6 @@ func (s *S3WAL) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 			if u == nil {
 				return false, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
 			}
-			assertNoLegacyClaim(repoID, u)
 			createdAt, holder = u.CreatedAt, u.SyncClaimHolder
 			if u.Detaching {
 				return false, nil // resume of an interrupted detach: mark already durable
@@ -723,7 +722,11 @@ func (s *S3WAL) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 			if u == nil || u.CreatedAt != createdAt {
 				return false, nil // a concurrent detach completed ours: same terminal state
 			}
-			assertf(u.Detaching, "s3walmeta: detaching mark vanished for repo %q (nothing unmarks)", repoID)
+			if !u.Detaching {
+				// Nothing unmarks a durable mark: only an out-of-band
+				// edit clears it (issue #481).
+				return false, &CorruptDocumentError{Err: fmt.Errorf("upstream %q: detaching mark vanished during detach", repoID)}
+			}
 			delete(doc.Upstreams, repoID)
 			return true, nil
 		},
@@ -756,14 +759,23 @@ func (s *S3WAL) RequestSync(ctx context.Context, repoID string) error {
 	})
 }
 
-// assertNoLegacyClaim crashes on claim shapes only pre-lease SQL replicas
-// can write: no pre-s3walmeta binary exists, so hitting one means the
-// document was corrupted or edited out-of-band.
-func assertNoLegacyClaim(repoID string, u *s3walMetaUpstream) {
-	assertf(!(u.Syncing && u.SyncClaimHolder == ""),
-		"s3walmeta: repo %q claim has no holder (only pre-lease SQL replicas write that shape)", repoID)
-	assertf(u.SyncClaimHolder != LegacyClaimHolder,
-		"s3walmeta: repo %q claim held by %q (no legacy adoption lane exists here)", repoID, LegacyClaimHolder)
+// checkUpstreamShape rejects lane states no s3walmeta writer produces
+// (decode runs it on every upstream row, issue #481). The claim shapes are
+// what only pre-lease SQL replicas write, and no pre-s3walmeta binary
+// exists, so a match means the document was corrupted or edited out of
+// band: an error, never a panic.
+func checkUpstreamShape(repoID string, u *s3walMetaUpstream) error {
+	switch {
+	case u.Syncing && u.SyncClaimHolder == "":
+		return fmt.Errorf("upstream %q: pull claim has no holder", repoID)
+	case u.SyncClaimHolder == LegacyClaimHolder:
+		return fmt.Errorf("upstream %q: pull claim held by %q (no legacy adoption lane exists here)", repoID, LegacyClaimHolder)
+	case u.PushSyncing && u.PushClaimHolder == "":
+		return fmt.Errorf("upstream %q: push claim has no holder", repoID)
+	case u.PushAttempt < 0 || u.PushDue < 0 || u.SyncDue < 0:
+		return fmt.Errorf("upstream %q: negative schedule (push_attempt %d, push_due %d, sync_due %d)", repoID, u.PushAttempt, u.PushDue, u.SyncDue)
+	}
+	return nil
 }
 
 // errStealVictimUncleared aborts a begin-sync CAS (nothing written) whose
@@ -837,7 +849,6 @@ func (s *S3WAL) beginSync(ctx context.Context, repoID, holder string, lease time
 				if err != nil {
 					return false, err
 				}
-				assertNoLegacyClaim(repoID, u)
 				if u.Detaching {
 					// A durable detaching mark refuses new claims so no new
 					// fence can be installed once DeleteRepoUpstream's phase 1
@@ -1121,8 +1132,6 @@ func (s *S3WAL) beginPush(ctx context.Context, repoID, holder string, lease time
 			if err != nil {
 				return false, err
 			}
-			assertf(!(u.PushSyncing && u.PushClaimHolder == ""),
-				"s3walmeta: repo %q push claim has no holder", repoID)
 			if u.PushSyncing && u.PushClaimExpiresAt > nowNanos {
 				up, busy = u.toRepoUpstream(repoID), true // unexpired claim in flight: refused
 				return false, nil
