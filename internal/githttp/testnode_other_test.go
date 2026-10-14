@@ -1,0 +1,17 @@
+//go:build !linux
+
+package githttp
+
+import "syscall"
+
+// nodeSysProcAttr starts serve as a session leader, so testNode.stop can
+// kill serve together with its git children (issue #439). Only Linux has
+// Pdeathsig (see testnode_linux_test.go): here a test binary that dies
+// before its cleanups run leaves serve running.
+func nodeSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setsid: true}
+}
+
+// sessionMembers needs /proc: without it testNode.stop reaches serve's
+// own process group only.
+func sessionMembers(int) []int { return nil }

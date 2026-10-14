@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +33,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -406,10 +408,42 @@ type testNode struct {
 	addr string
 }
 
+// stop SIGKILLs serve and every process in serve's session, then waits
+// until the session is empty (issue #439). startBinaryNode makes serve a
+// session leader, and its git children (receive-pack, upload-pack, hooks)
+// stay in the session: killing serve alone left them writing into the
+// test's cache dir while t.TempDir cleanup removed it ("directory not
+// empty"). A process-group kill is not enough, because sync runs start
+// `git push` in its own group (internal/sync setProcGroup). A node the
+// test already stopped (waitNodeExit) still gets the kill, which ends any
+// child that outlived serve. Without /proc (non-Linux), stop reaches
+// serve's own process group only.
 func (n *testNode) stop() {
-	if n.cmd.Process != nil {
-		_ = n.cmd.Process.Kill()
-		_ = n.cmd.Wait()
+	if n.cmd.Process == nil {
+		return
+	}
+	sid := n.cmd.Process.Pid
+	kill := func() []int {
+		_ = syscall.Kill(-sid, syscall.SIGKILL)
+		members := sessionMembers(sid)
+		for _, pid := range members {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		return members
+	}
+	kill()
+	_ = n.cmd.Wait()
+	// Wait returns once serve is reaped; its children are reparented and
+	// may still be exiting (a SIGKILL lands after an in-flight write).
+	// Poll until no process is left in the session.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		members := kill()
+		if len(members) == 0 && errors.Is(syscall.Kill(-sid, 0), syscall.ESRCH) {
+			return
+		}
+		if time.Now().After(deadline) {
+			panic(fmt.Sprintf("serve session %d still has members %v 10s after SIGKILL", sid, members))
+		}
 	}
 }
 
@@ -441,6 +475,7 @@ func startBinaryNode(binary, cacheDir string, stderr io.Writer, extraEnv ...stri
 		cmd.Env = append(cmd.Env, "OPENSTORAGE_S3WAL_LEASE_TTL=0")
 	}
 	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.SysProcAttr = nodeSysProcAttr()
 	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
