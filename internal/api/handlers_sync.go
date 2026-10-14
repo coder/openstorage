@@ -6,6 +6,7 @@ package api
 //	                                                or base_repo {operation: "sync"} -> mirror link + first sync
 //	POST   /api/v1/repos/pull-upstream  git:write   {ref?, after?} -> 202 {"message": "Repository sync initiated successfully"}
 //	DELETE /api/v1/repos/base           repo:write  idempotent detach -> 200 {"message": "repository detached"}
+//	                                                (DELETE .../upstream without an upstream: "repository already detached")
 //
 // api.New calls registerSyncRoutes and wires (*syncServer).handleCreateRepo
 // — which extends the frozen (*server).handleCreateRepo flow with base_repo
@@ -869,13 +870,32 @@ func (s *syncServer) handleDetachBase(w http.ResponseWriter, r *http.Request) {
 		s.internalErr(w, r, "resolve detach repo", err)
 		return
 	}
+	msg := "repository detached"
 	err = s.ups.DeleteUpstream(r.Context(), repo.RepoID)
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
-		// Already detached: idempotent success (openapi).
+		// Already detached: idempotent success (openapi). Only the
+		// path-style route names it (changelog 2026-10-07, issue #459):
+		// the deprecated base routes keep their old text.
+		if isUpstreamDetach(r.Context()) {
+			msg = "repository already detached"
+		}
 	case err != nil:
 		s.internalErr(w, r, "detach upstream", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"message": "repository detached"})
+	writeJSON(w, http.StatusOK, map[string]string{"message": msg})
+}
+
+// upstreamDetachKey marks a request re-dispatched from DELETE
+// /api/repos/{repo_name}/upstream (alias.go); only the alias layer sets it.
+type upstreamDetachKey struct{}
+
+func withUpstreamDetach(ctx context.Context) context.Context {
+	return context.WithValue(ctx, upstreamDetachKey{}, true)
+}
+
+func isUpstreamDetach(ctx context.Context) bool {
+	v, _ := ctx.Value(upstreamDetachKey{}).(bool)
+	return v
 }

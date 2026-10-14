@@ -122,7 +122,8 @@ func aliasRoutes() []aliasRoute {
 		// 2026-10-05, issue #378): same handlers, bodies and scopes.
 		{method: http.MethodPost, suffix: "/upstream/pull", v1Path: "/api/v1/repos/pull-upstream",
 			flavor: routeRead, scopes: []string{auth.ScopeGitWrite}, mark: withStrictPullBody},
-		read(http.MethodDelete, "/upstream", "/api/v1/repos/base", auth.ScopeRepoWrite),
+		{method: http.MethodDelete, suffix: "/upstream", v1Path: "/api/v1/repos/base",
+			flavor: routeRead, scopes: []string{auth.ScopeRepoWrite}, mark: withUpstreamDetach},
 		read(http.MethodPost, "/git-credentials", "/api/v1/repos/git-credentials", auth.ScopeRepoWrite),
 		{method: http.MethodPut, suffix: "/git-credentials", v1Path: "/api/v1/repos/git-credentials",
 			flavor: routeRead, orgLevel: true, scopes: []string{auth.ScopeRepoWrite}},

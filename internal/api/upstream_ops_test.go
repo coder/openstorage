@@ -7,12 +7,15 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/ref"
 	upsync "github.com/coder/openstorage/internal/sync"
 )
@@ -256,10 +259,16 @@ func TestUpstreamPathRoutes(t *testing.T) {
 			if resp, b := s.req(t, http.MethodDelete, base+"/upstream", writeTok, nil); resp.StatusCode != http.StatusForbidden {
 				t.Fatalf("git:write only detach = %d %s, want 403", resp.StatusCode, b)
 			}
-			for range 2 {
+			// The first detach removes the link; the repeat finds none
+			// and names it (changelog 2026-10-07, issue #459).
+			for _, want := range []string{"repository detached", "repository already detached"} {
 				resp, respBody := s.req(t, http.MethodDelete, base+"/upstream", repoTok, nil)
-				if resp.StatusCode != http.StatusOK || !strings.Contains(string(respBody), `"repository detached"`) {
-					t.Fatalf("detach: status %d body %s", resp.StatusCode, respBody)
+				var got map[string]string
+				if err := json.Unmarshal(respBody, &got); err != nil {
+					t.Fatalf("decode %s: %v", respBody, err)
+				}
+				if resp.StatusCode != http.StatusOK || len(got) != 1 || got["message"] != want {
+					t.Fatalf("detach: status %d body %s, want 200 {\"message\": %q}", resp.StatusCode, respBody, want)
 				}
 			}
 			resp, respBody := s.req(t, http.MethodPost, base+"/upstream/pull", writeTok, nil)
@@ -268,5 +277,68 @@ func TestUpstreamPathRoutes(t *testing.T) {
 			}
 			s.assertNoEvent(t)
 		})
+	})
+}
+
+// TestDetachMessages pins the detach text of all three detach routes (issue
+// #459): only DELETE .../upstream names a repeat detach. The deprecated base
+// routes answer "repository detached" in both cases.
+func TestDetachMessages(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		verifier := auth.NewVerifier(e.store)
+		mem := upsync.NewMemStore()
+		ss := newSyncServer(e.store, mem, mem, envSyncQueue{}, testHTTPBaseURL, events.TargetGuard{}, discardLogger())
+		mux := http.NewServeMux()
+		registerSyncRoutes(mux, verifier, org, ss, nil)
+		registerAliasRoutes(mux, &server{store: e.store, logger: discardLogger()}, ss, verifier, org, nil)
+		srv := httptest.NewServer(withProblemInstance(mux))
+		t.Cleanup(srv.Close)
+
+		for _, tc := range []struct {
+			name      string
+			path      func(repoURL string) string
+			wantAgain string
+		}{
+			{"v1 base", func(string) string { return "/api/v1/repos/base" }, "repository detached"},
+			{"alias base", func(u string) string { return "/api/repos/" + url.PathEscape(u) + "/base" }, "repository detached"},
+			{"alias upstream", func(u string) string { return "/api/repos/" + url.PathEscape(u) + "/upstream" }, "repository already detached"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				repoURL := "team/detach-" + randomHex(t, 4)
+				repo, err := e.store.CreateRepo(t.Context(), org, repoURL, "main")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := mem.PutUpstream(t.Context(), upsync.Upstream{RepoID: repo.RepoID,
+					Provider: "github", Owner: "own", Name: "proj"}); err != nil {
+					t.Fatal(err)
+				}
+				tok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+				for i, want := range []string{"repository detached", tc.wantAgain} {
+					req, err := http.NewRequest(http.MethodDelete, srv.URL+tc.path(repoURL), nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					req.Header.Set("Authorization", "Bearer "+tok)
+					resp, err := srv.Client().Do(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var got map[string]string
+					err = json.NewDecoder(resp.Body).Decode(&got)
+					resp.Body.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if resp.StatusCode != http.StatusOK || len(got) != 1 || got["message"] != want {
+						t.Fatalf("detach %d: status %d body %v, want 200 {\"message\": %q}", i+1, resp.StatusCode, got, want)
+					}
+					if _, err := mem.GetUpstream(t.Context(), repo.RepoID); !errors.Is(err, upsync.ErrNotFound) {
+						t.Fatalf("detach %d: upstream still linked (err %v)", i+1, err)
+					}
+				}
+			})
+		}
 	})
 }

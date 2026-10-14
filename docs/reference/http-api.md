@@ -110,8 +110,8 @@ about the endpoint's rollout status on upstream clusters.
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
 | `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value. An open.storage extension: upstream removed the route from its spec on 2026-10-05, and open.storage keeps serving it for existing clients |
-| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). Deprecated upstream (2026-10-05) for `DELETE /api/repos/{repo_name}/upstream`, which runs the same handler; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header |
-| `DELETE /api/repos/{repo_name}/upstream` | repo:write | Path style only (spec 2026-10-05). Same handler, scope and responses as `DELETE /repos/base` |
+| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). → 200 `{message: "repository detached"}`, also when the repo has no upstream. Deprecated upstream (2026-10-05) for `DELETE /api/repos/{repo_name}/upstream`, which runs the same handler; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header |
+| `DELETE /api/repos/{repo_name}/upstream` | repo:write | Path style only (spec 2026-10-05). Same handler and scope as `DELETE /repos/base`. → 200 `{message: "repository detached"}`. A repo without an upstream → 200 `{message: "repository already detached"}` (changelog 2026-10-07); the deprecated `base` routes keep `repository detached` in that case |
 
 **`POST /repos` body:**
 
