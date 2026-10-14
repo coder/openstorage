@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/s3oplog"
 )
 
 // LocalLanes is the durable local schedule (issue #266, ADR-50): the lane
@@ -144,12 +145,17 @@ type LocalScheduler struct {
 
 var _ Queue = (*LocalScheduler)(nil)
 
+// opLogScope tags the S3 round trips of sweeps and runs in the op log
+// (s3oplog): they are background work, not part of the request that
+// recorded the intent (issue #452 item 6, TestS3WAL_PushOpCensus).
+const opLogScope = "schedule"
+
 // NewLocalScheduler builds a scheduler for org's repos over lanes, running
 // runSync ((*Worker).Run) and runPush ((*Worker).RunPush).
 func NewLocalScheduler(lanes LocalLanes, org string, runSync, runPush func(ctx context.Context, job Job) error, logger *slog.Logger) *LocalScheduler {
 	assertf(lanes != nil && org != "" && runSync != nil && runPush != nil && logger != nil,
 		"NewLocalScheduler: missing dependency")
-	runCtx, cancelRuns := context.WithCancelCause(context.Background())
+	runCtx, cancelRuns := context.WithCancelCause(s3oplog.WithScope(context.Background(), opLogScope))
 	return &LocalScheduler{lanes: lanes, org: org, runSync: runSync, runPush: runPush, logger: logger,
 		slots: make(chan struct{}, localSweepSlots), inflight: make(map[string]bool),
 		runCtx: runCtx, cancelRuns: cancelRuns}
@@ -301,7 +307,7 @@ func (s *LocalScheduler) SweepOnce(ctx context.Context) error {
 // before recovered runs push) and then every interval, until Close.
 func (s *LocalScheduler) Start(delay, interval time.Duration) {
 	assertf(delay >= 0 && interval > 0, "Start: bad delay %v or interval %v", delay, interval)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s3oplog.WithScope(context.Background(), opLogScope))
 	s.mu.Lock()
 	assertf(s.stop == nil && !s.closed, "LocalScheduler started twice or after Close")
 	s.stop = cancel

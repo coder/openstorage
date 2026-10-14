@@ -17,6 +17,7 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -414,7 +415,7 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 // later `symbolic-ref HEAD <target>` succeeds.
 func validRefFormat(ctx context.Context, target string) bool {
 	assertf(strings.HasPrefix(target, "refs/"), "validRefFormat: unqualified target %q", target)
-	return exec.CommandContext(ctx, "git", "check-ref-format", target).Run() == nil
+	return gitlimit.Run(exec.CommandContext(ctx, "git", "check-ref-format", target)) == nil
 }
 
 // policyDeniesDefaultBranchChange reports whether the token's ref policies

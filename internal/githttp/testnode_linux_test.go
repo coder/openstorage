@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -233,7 +235,7 @@ func TestServeDrainTimeoutStopsGitChildren(t *testing.T) {
 			for _, want := range []string{
 				"openstorage serve: drain incomplete",
 				"openstorage serve: still active: POST \"/" + repo + ".git/git-receive-pack\" running for ",
-				"openstorage serve: stopped 1 git process group(s) of unfinished requests",
+				"openstorage serve: stopped 1 git process group(s)\n",
 			} {
 				if !strings.Contains(log, want) {
 					t.Errorf("serve stderr lacks %q", want)
@@ -283,6 +285,114 @@ func TestServeDrainTimeoutStopsGitChildren(t *testing.T) {
 			}
 			clone := filepath.Join(t.TempDir(), "clone")
 			mustGit(t, "", "clone", "--config", "maintenance.auto=false", url, clone)
+			if got := revParse(t, clone, "HEAD"); got != head {
+				t.Fatalf("clone HEAD = %s, want %s", got, head)
+			}
+			mustGit(t, clone, "fsck", "--full")
+		})
+	}
+}
+
+// TestServeDrainTimeoutStopsRESTAndHydrationGit (issue #462): the drain
+// timeout also stops the git children of REST reads, REST writes and cache
+// hydration. A `git` wrapper first on serve's PATH parks the one git
+// subcommand under test (it sleeps before exec-ing the real git), so the
+// request outlives the drain.
+func TestServeDrainTimeoutStopsRESTAndHydrationGit(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, park, method, path, body, scopes string
+	}{
+		{name: "REST read", park: "log", method: http.MethodGet, path: "/api/v1/repos/commits?branch=main", scopes: "git:read"},
+		{name: "REST write", park: "notes", method: http.MethodPost, path: "/api/v1/repos/notes", body: `{"sha":"%s","note":"n"}`, scopes: "git:read,git:write"},
+		{name: "hydration", park: "index-pack", method: http.MethodGet, path: "/%s.git/info/refs?service=git-upload-pack", scopes: "git:read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := registerRepo(t, "t-drain-rest-"+strconv.FormatInt(time.Now().UnixNano(), 36))
+			work := initWorkRepo(t)
+			head := revParse(t, work, "HEAD")
+			mustGit(t, work, "push", remoteURL(nodeA, repo, mintTestToken(t, repo, "git:read,git:write", "")), "HEAD:refs/heads/main")
+
+			bin := t.TempDir()
+			parked := filepath.Join(bin, "parked")
+			script := fmt.Sprintf("#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = %q ]; then : > %q; sleep 60; fi; done\nexec %q \"$@\"\n", tc.park, parked, realGit)
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			cache := t.TempDir()
+			node, err := startBinaryNode(binPath, cache, io.MultiWriter(os.Stderr, &stderr), "PATH="+bin+":"+os.Getenv("PATH"))
+			if err != nil {
+				t.Fatalf("start node: %v", err)
+			}
+			t.Cleanup(node.stop)
+
+			path, body := tc.path, tc.body
+			if strings.Contains(path, "%s") {
+				path = fmt.Sprintf(path, repo)
+			}
+			if body != "" {
+				body = fmt.Sprintf(body, head)
+			}
+			req, err := http.NewRequest(tc.method, "http://"+node.addr+path, strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			token := mintTestToken(t, repo, tc.scopes, "")
+			if strings.HasPrefix(path, "/api/") {
+				req.Header.Set("Authorization", "Bearer "+token)
+				req.Header.Set("Content-Type", "application/json")
+			} else {
+				req.SetBasicAuth("t", token)
+			}
+			done := make(chan error, 1)
+			go func() {
+				resp, err := http.DefaultClient.Do(req)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+				done <- err
+			}()
+			waitForFile(t, parked, 30*time.Second)
+
+			if err := node.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			if err := waitNodeExit(t, node, 30*time.Second); err != nil {
+				t.Fatalf("serve did not exit cleanly after the drain timed out: %v", err)
+			}
+			for deadline := time.Now().Add(2 * time.Second); len(sessionMembers(node.cmd.Process.Pid)) > 0; time.Sleep(10 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("git children %v still run after serve exited", sessionMembers(node.cmd.Process.Pid))
+				}
+			}
+			reqPath, _, _ := strings.Cut(path, "?")
+			for _, want := range []string{
+				"openstorage serve: still active: " + tc.method + " \"" + reqPath + "\" running for ",
+				"openstorage serve: stopped 1 git process group(s)\n",
+			} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("serve stderr lacks %q", want)
+				}
+			}
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Fatal("client request still running 30s after serve exited")
+			}
+
+			// A new node on the same cache serves the repository.
+			next, err := startNode(cache)
+			if err != nil {
+				t.Fatalf("restart node: %v", err)
+			}
+			t.Cleanup(next.stop)
+			clone := filepath.Join(t.TempDir(), "clone")
+			mustGit(t, "", "clone", "--config", "maintenance.auto=false", remoteURL(next, repo, mintTestToken(t, repo, "git:read", "")), clone)
 			if got := revParse(t, clone, "HEAD"); got != head {
 				t.Fatalf("clone HEAD = %s, want %s", got, head)
 			}

@@ -354,19 +354,19 @@ func testMainInner(m *testing.M) int {
 // asynchronously — so the callers' EnsureBucket retry is the actual
 // readiness signal (the s3wal lane additionally gates on a scratch write
 // roundtrip before its no-retry boot probe runs — issue #165). Shared by
-// the pg and s3wal lanes. Reserve 88 volume slots for twelve buckets at
-// seven volumes each: the shared bucket, the recovery drill's three, and
-// one per privateStores test (the shutdown test, four hook-scheduling
-// tests, and the three metadata-refusal subtests).
-// Automatic sizing can exhaust slots on small CI disks even with tiny
-// fixture payloads.
+// the pg and s3wal lanes. Each bucket takes seven volume slots. The
+// shared bucket and the recovery drill's three keep theirs for the run.
+// privateStores deletes its bucket when its test ends, which frees the
+// slots (#452 item 7), so private buckets need room for one at a time
+// (tests run serially). 80 slots leave room for more. Automatic sizing can
+// exhaust slots on small CI disks even with tiny fixture payloads.
 func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
 	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
 		s3AccessKey, s3SecretKey)
 	seaweedC, err := seaweedcapture.Start(ctx, testcontainers.GenericContainerRequest{
 		Image:        "chrislusf/seaweedfs:4.48",
 		ExposedPorts: []string{"8333/tcp"},
-		Cmd:          []string{"server", "-s3", "-dir=/data", "-volume.max=88", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
+		Cmd:          []string{"server", "-s3", "-dir=/data", "-volume.max=80", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
 		Files: []testcontainers.ContainerFile{{
 			Reader:            strings.NewReader(s3Config),
 			ContainerFilePath: "/etc/seaweedfs/s3.json",

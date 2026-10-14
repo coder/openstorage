@@ -32,6 +32,7 @@ import (
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
 	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
@@ -116,11 +117,11 @@ const shutdownRestoreWait = 2 * time.Second
 
 // shutdownGitStopWait is the last part of shutdownDrainTimeout (issue
 // #440). When the HTTP drain has not finished by then, serve logs the
-// requests still running and stops their git children: SIGTERM to each
-// child's process group, SIGKILL after half of this wait, and the rest
-// lets the handlers return, so their deferred cleanup (push holds,
-// verify-sig state) runs before serve exits. No git child of a handler
-// outlives serve.
+// requests still running and stops every tracked git child (requests and
+// cache hydration, gitlimit.StopChildren): SIGTERM to each child's process
+// group, SIGKILL after half of this wait, and the rest lets the handlers
+// return, so their deferred cleanup (push holds, verify-sig state, scratch
+// repos) runs before serve exits. No tracked git child outlives serve.
 const shutdownGitStopWait = 2 * time.Second
 
 func cmdServe(ctx context.Context, args []string) error {
@@ -395,7 +396,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		stopSignals()
 		go func() {
 			sig := <-second
-			srv.StopGitChildren(200 * time.Millisecond)
+			gitlimit.StopChildren(200 * time.Millisecond)
 			signal.Reset(os.Interrupt, syscall.SIGTERM)
 			p, err := os.FindProcess(os.Getpid())
 			assertf(err == nil, "find own process: %v", err)
@@ -420,13 +421,12 @@ func cmdServe(ctx context.Context, args []string) error {
 			for _, line := range active.describe(time.Now()) {
 				fmt.Fprintf(os.Stderr, "openstorage serve: still active: %s\n", line)
 			}
-		}
-		// Unconditional: after a complete drain no handler runs, so this
-		// only makes later git starts fail.
-		if n := srv.StopGitChildren(shutdownGitStopWait / 2); n > 0 {
-			fmt.Fprintf(os.Stderr, "openstorage serve: stopped %d git process group(s) of unfinished requests\n", n)
-		}
-		if err != nil {
+			// Only on a timeout (issue #462): background cache work
+			// (repack materialization) also runs tracked git children, and
+			// after a complete drain the teardown below must let it finish.
+			if n := gitlimit.StopChildren(shutdownGitStopWait / 2); n > 0 {
+				fmt.Fprintf(os.Stderr, "openstorage serve: stopped %d git process group(s)\n", n)
+			}
 			if err := httpSrv.Shutdown(dctx); err != nil {
 				fmt.Fprintf(os.Stderr, "openstorage serve: requests still running at exit: %v\n", err)
 			}

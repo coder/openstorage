@@ -9,6 +9,7 @@ package githttp
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,16 +59,36 @@ func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 	// logged by the time the push command exits; a short settle covers
 	// OS buffering only.
 	time.Sleep(200 * time.Millisecond)
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read op log: %v", err)
+	// The sync schedule sweeps once a second and logs under the
+	// ":schedule" scope (internal/sync opLogScope). Extend the window
+	// until it holds a sweep pass, so every window exercises the filter
+	// below (#452 item 6). The push's own ops have all been logged by now.
+	var window []byte
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read op log: %v", err)
+		}
+		if int64(len(raw)) < *offset {
+			t.Fatalf("op log shrank: len %d < offset %d", len(raw), *offset)
+		}
+		window = raw[*offset:]
+		if strings.Contains(string(window), ":schedule ") {
+			*offset = int64(len(raw))
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no sweep pass logged within 10 s: the sweep is not running or its round trips are not tagged")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if int64(len(raw)) < *offset {
-		t.Fatalf("op log shrank: len %d < offset %d", len(raw), *offset)
+	var push []opLogLine
+	for _, l := range parseOpLog(t, string(window)) {
+		if !strings.HasSuffix(l.role, ":schedule") {
+			push = append(push, l)
+		}
 	}
-	window := raw[*offset:]
-	*offset = int64(len(raw))
-	return parseOpLog(t, string(window))
+	return push
 }
 
 // censusTable renders one push window as a readable table for the census.
@@ -105,15 +126,37 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// scanners are already off by default: LFS reclamation and absence
 	// reconciliation ship interval 0, and the reconcile ticker needs the
 	// non-default v0.2.0 write-compat flag (or a partial Heal) to start.
-	// The sync schedule's sweep (ADR-51) makes its first pass 15 s after
-	// boot (pendingSyncRecoveryDelay), after these pushes.
+	// The sync schedule's sweep (ADR-51) is not disabled: opLogWindow
+	// drops its round trips by their op-log scope, and waits for one in
+	// every window. The node gets a private bucket (privateStores), so its
+	// sweep never finds runnable work: a scheduled run's loopback push and
+	// hooks would log without the scope. The pushes start once the first
+	// sweep has run (15 s after boot).
 	opLog := filepath.Join(t.TempDir(), "s3ops.log")
+	db, blobs := privateStores(t, t.TempDir())
 	node := startNodeT(t, "OPENSTORAGE_S3_OP_LOG="+opLog, "OPENSTORAGE_REPACK_THRESHOLD=0",
-		"OPENSTORAGE_SWEEP_INTERVAL=0")
+		"OPENSTORAGE_SWEEP_INTERVAL=0", "OPENSTORAGE_PG_URL="+db, "OPENSTORAGE_S3_URL="+blobs)
+	for deadline := time.Now().Add(60 * time.Second); ; {
+		raw, _ := os.ReadFile(opLog)
+		if strings.Contains(string(raw), ":schedule ") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no schedule-scoped op-log line within 60 s of boot: the sweep is not running or its round trips are not tagged")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 
-	repo := registerRepo(t, "t-s3wal-op-census")
+	repoURL := "t-s3wal-op-census"
+	var created struct {
+		RepoID string `json:"repo_id"`
+	}
+	if status := apiJSON(t, node, http.MethodPost, mintTestToken(t, repoURL, "repo:write", ""), "/api/v1/repos", "{}", &created); status != http.StatusCreated || created.RepoID == "" {
+		t.Fatalf("create census repo: status %d, id %q", status, created.RepoID)
+	}
+	repo := created.RepoID
 	work := initWorkRepo(t)
-	token := mintTestToken(t, repo, "git:read,git:write", "")
+	token := mintTestToken(t, repo, "git:read,git:write", "") // by ID: a URL claim costs serve a lookup
 	url := remoteURL(node, repo, token)
 
 	var offset int64

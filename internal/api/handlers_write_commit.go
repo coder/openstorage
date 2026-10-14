@@ -50,6 +50,7 @@ import (
 	"strings"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -603,7 +604,7 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	cmd.Stdin = stdin
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := gitlimit.Output(cmd)
 	if err != nil {
 		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
@@ -642,7 +643,7 @@ func (sc *wcScratch) startBlobSink(ctx context.Context) (*wcBlobSink, error) {
 		return nil, err
 	}
 	sink.stdin = stdin
-	if err := sink.cmd.Start(); err != nil {
+	if err := gitlimit.Start(sink.cmd); err != nil {
 		return nil, err
 	}
 	return sink, nil
@@ -658,7 +659,7 @@ func (b *wcBlobSink) finish() (string, error) {
 	if err := b.stdin.Close(); err != nil {
 		return "", err
 	}
-	if err := b.cmd.Wait(); err != nil {
+	if err := gitlimit.Wait(b.cmd); err != nil {
 		return "", fmt.Errorf("hash-object: %w: %s", err, strings.TrimSpace(b.stderr.String()))
 	}
 	sha := strings.TrimSpace(b.stdout.String())
@@ -674,7 +675,7 @@ func (b *wcBlobSink) abort() {
 	if b.cmd.Process != nil {
 		_ = b.cmd.Process.Kill()
 	}
-	_ = b.cmd.Wait()
+	_ = gitlimit.Wait(b.cmd)
 }
 
 // wcIndexEntry is one tree operation: Delete when SHA is empty.

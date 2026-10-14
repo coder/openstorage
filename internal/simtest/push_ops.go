@@ -4,8 +4,7 @@
 // the real meta store (no real git — the transfer is a seeded number of
 // sim steps) with seeded crash injection between claim and finish, seeded
 // transfer outcomes mirroring the worker's failure taxonomy (success /
-// transient re-mark / terminal non-FF rejection), and a boot-recovery op
-// mirroring local-mode rescue. Node crash ops kill the node's in-flight
+// transient re-mark / terminal non-FF rejection). Node crash ops kill the node's in-flight
 // push runs too. The store's clock is the simulation's logical clock, so
 // lease expiry is a pure function of the seed.
 //

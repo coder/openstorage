@@ -286,7 +286,7 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 	cmd.WaitDelay = commitGraphKillDelay
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err := gitlimit.Run(cmd)
 	if err == nil {
 		return nil
 	}

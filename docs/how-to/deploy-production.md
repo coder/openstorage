@@ -436,9 +436,11 @@ or reschedules them. The server then
 stops accepting connections and drains in-flight requests until 8 seconds have passed.
 If requests are still running then, the server prints `drain incomplete` and one
 `still active` line per request (method, path and age) to stderr. It then stops the Git
-processes of unfinished clone, fetch and push requests (`upload-pack`, `receive-pack`
-and its hooks): `SIGTERM` first, `SIGKILL` 1 second later, and the last second lets the
-requests end. None of them outlives the server. It then stops background workers and, in
+processes of unfinished requests (clone, fetch and push, including `receive-pack`'s
+hooks, REST reads and writes) and of cache hydration, including hydration for repacks:
+`SIGTERM` first, `SIGKILL` 1 second later, and the last second lets the requests end.
+None of them outlives the server, and the server starts no new one. It then stops
+background workers and, in
 [zero-infra mode](#zero-infrastructure-mode-experimental-one-bucket-one-node), releases
 the instance lease so a successor need not wait out the lease TTL. A second signal
 during the drain stops those Git processes within 0.2 seconds and then kills the server.
@@ -457,8 +459,9 @@ during the drain, and a supervisor that signals every process fails every push i
 at once. Under systemd, set `KillMode=mixed`: the default, `control-group`, sends
 `SIGTERM` to every process of the unit. Set `TimeoutStopSec` to at least 20 seconds: the
 10-second drain, then teardown, which in zero-infra mode includes up to 5 seconds of
-instance-lease release, plus margin. After it, systemd sends `SIGKILL` to every process
-left, and a server killed during lease release leaves the lease behind. The
+instance-lease release, plus margin. When the server exits, or when that timeout passes,
+systemd sends `SIGKILL` to every process left, and a server killed during lease release
+leaves the lease behind. The
 [AWS reference unit](../../deploy/terraform/aws/bootstrap/openstorage.service) uses
 `KillMode=mixed` and `TimeoutStopSec=30s`.
 
@@ -699,7 +702,7 @@ This is a deliberate single-node design that trades throughput for zero infrastr
 | One CAS point per repository group | Concurrent pushes to the *same* repository serialize on one object; hot-repo write throughput is a handful of ref flips per second, and contention shows up as CAS retries. Different repositories don't contend. |
 | Every ref/metadata operation is an S3 round trip | Latency floors are S3 latency, not local-disk or Postgres latency. Same-region compute is assumed. |
 | Manifest size | A repository group's whole registry lives in one JSON object: growth-guarded mutations warn above 4 MiB and are refused above 16 MiB; see the [size-guard scope](#s3wal-operational-signals) below. |
-| Background jobs are in-process | Tickers, no durable River queue: queued webhook deliveries and other in-process jobs die with the process. The sync and push schedule, including retry backoffs, lives in the metadata document, as it lives in SQLite in local mode. Its sweep reads that document once a second, idle or not: about 86,400 conditional GETs a day, and a full decode of the document on each pass (measured at about 2.5 ms per 1,000 repositories). A git push only records its sync work: when the schedule is idle, the next pass starts the forward or pull within about a second. Each pass picks up at most 16 due repositories and runs at most 4 sweep-started jobs at once, so under load a pushed ref can wait several passes. |
+| Background jobs are in-process | Tickers, no durable River queue: queued webhook deliveries and other in-process jobs die with the process. The sync and push schedule, including retry backoffs, lives in the metadata document, as it lives in SQLite in local mode. Its sweep reads that document once a second, idle or not: about 86,400 conditional GETs a day, and a full decode of the document on each pass (measured at about 2.5 ms per 1,000 repositories). A git push only records its sync work: when the schedule is idle, the next pass starts the forward or pull within about a second. The first pass runs 15 s after boot, so a push in those first seconds waits for it. Each pass picks up at most 16 due repositories and runs at most 4 sweep-started jobs at once, so under load a pushed ref can wait several passes. |
 
 If any of these bind, use local mode (SQLite on a persistent volume) or the Postgres
 topology. Small single-tenant deployments, the target, sit far below them.

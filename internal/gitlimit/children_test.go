@@ -1,4 +1,4 @@
-package githttp
+package gitlimit
 
 import (
 	"bufio"
@@ -16,7 +16,7 @@ import (
 // later children. (The SIGTERM path runs in the e2e
 // TestServeDrainTimeoutStopsGitChildren.)
 func TestGitChildrenStopKillsAfterGrace(t *testing.T) {
-	var g gitChildren
+	var g registry
 	// The ignored SIGTERM is inherited by sleep across exec.
 	cmd := exec.Command("sh", "-c", "trap '' TERM; sleep 60 & echo $!; wait")
 	out, err := cmd.StdoutPipe()
@@ -54,7 +54,7 @@ func TestGitChildrenStopKillsAfterGrace(t *testing.T) {
 			t.Fatalf("grandchild %d still exists", grandchild)
 		}
 	}
-	if err := g.start(exec.Command("true")); !errors.Is(err, errServerStopping) {
-		t.Fatalf("start after stop = %v, want errServerStopping", err)
+	if err := g.start(exec.Command("true")); !errors.Is(err, ErrStopping) {
+		t.Fatalf("start after stop = %v, want ErrStopping", err)
 	}
 }
