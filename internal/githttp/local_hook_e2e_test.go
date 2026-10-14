@@ -2,9 +2,11 @@ package githttp
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -38,6 +40,54 @@ func TestLocalHookAcceptedPushRecordsIntent(t *testing.T) {
 	}
 	if up.PushPending == 0 && !up.PushSyncing && up.PushRunCount == 0 {
 		t.Fatal("authority accepted the commit, but no durable push intent or claimed run exists")
+	}
+}
+
+// C10 of the #266 design note: while a pull run holds its claim, an
+// accepted push records no pull intent (the running pull mirrors the
+// upstream anyway). Once the claim is released, the next push records
+// intent again. On S3WAL this needs the hook to read the claim from the
+// metadata document in SeaweedFS.
+func TestLocalHookLivePullClaimSuppressesPullIntent(t *testing.T) {
+	skipUnlessLocalSchedule(t)
+	ctx := t.Context()
+	url := fmt.Sprintf("https://example.com/local-hook-c10-%d.git", time.Now().UnixNano())
+	id := registerRepo(t, url)
+	if _, err := testMeta.SetRepoUpstream(ctx, meta.RepoUpstream{
+		RepoID: id, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "http://127.0.0.1:1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = testMeta.DeleteRepoUpstream(context.Background(), id) })
+	// A claim no serve process holds: its lease outlives the test, so no
+	// sweep can steal it.
+	const holder = "c10-live-run"
+	if _, claimed, _, err := testMeta.TryBeginSync(ctx, id, holder, 10*time.Minute); err != nil || !claimed {
+		t.Fatalf("claim = (%v, %v), want claimed", claimed, err)
+	}
+	work := initWorkRepo(t)
+	token := mintTestToken(t, url, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, id, token), "HEAD:refs/heads/main")
+	up, err := testMeta.GetRepoUpstream(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.SyncPending || !up.Syncing || up.SyncClaimHolder != holder || up.RunCount != 0 {
+		t.Fatalf("push under a live pull claim: row %+v, want the claim kept and no pull intent", up)
+	}
+
+	if _, err := testMeta.FinishSync(ctx, id, holder, true); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, work, "commit", "--allow-empty", "-m", "after the claim")
+	mustGit(t, work, "push", remoteURL(nodeA, id, token), "HEAD:refs/heads/main")
+	up, err = testMeta.GetRepoUpstream(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The serve sweep may already have claimed or run the recorded pull.
+	if !up.SyncPending && !up.Syncing && up.RunCount < 2 {
+		t.Fatalf("push after the claim was released: row %+v, want pull intent", up)
 	}
 }
 

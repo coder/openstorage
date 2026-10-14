@@ -1,6 +1,6 @@
 // Worker-level controls for the local schedule (issue #266 PR2, ADR-50)
 // on SQLite and, with OPENSTORAGE_TEST_BACKEND=s3wal, on S3WAL metadata
-// over an in-memory bucket (ADR-51): real metadata, real git transfers,
+// in a SeaweedFS bucket (ADR-51, local_schedule_s3wal_test.go): real metadata, real git transfers,
 // store time injected through meta.WithNowFunc. Every control drives the
 // scheduler through SweepOnce and explicit enqueues; nothing sleeps for a
 // backoff.
@@ -216,8 +216,8 @@ type localSchedFixture struct {
 	wf        *workerFixture
 	ms        localSchedStore
 	ls        meta.LocalScheduleStore
-	db        *sql.DB       // SQLite: read-only view of the schedule columns
-	cas       *s3wal.MemCAS // S3WAL: the bucket holding the metadata document
+	db        *sql.DB                // SQLite: read-only view of the schedule columns
+	cas       s3wal.ConditionalStore // S3WAL: the bucket holding the metadata document
 	gate      *gateLanes
 	sched     *LocalScheduler
 	clock     atomic.Int64
@@ -257,7 +257,7 @@ func newLocalSchedFixture(t *testing.T) *localSchedFixture {
 		t.Cleanup(func() { _ = db.Close() })
 		f.db = db
 	case "s3wal":
-		f.cas = s3wal.NewMemCAS()
+		f.cas = seaweedScheduleStore(t)
 		f.ms = meta.NewS3WAL(f.cas, now)
 	default:
 		t.Fatalf("OPENSTORAGE_TEST_BACKEND=%q: unknown backend (want s3wal, local, pg, or unset)", backend)

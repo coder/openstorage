@@ -149,8 +149,9 @@ jobs:
   # (the s3wal CAS/qualification suites in internal/ref/s3wal and the
   # MemCAS-backed s3wal meta suite in internal/meta already run there
   # unconditionally). The sync step runs the worker-level controls of the
-  # #266 design note (C1 to C9 and C11; C10 lives in cmd/openstorage) on
-  # S3WAL metadata over an in-memory bucket (ADR-51 test plan item 5).
+  # #266 design note (C1 to C9 and C11) on S3WAL metadata in a SeaweedFS
+  # bucket (ADR-51 test plan item 5); C10 is the githttp hook e2e test
+  # TestLocalHookLivePullClaimSuppressesPullIntent.
   # The githttp harness itself exports OPENSTORAGE_S3WAL_LEASE_TTL=0
   # to its serve children (many serve processes legitimately share the one
   # lane bucket); the job only selects the lane.
