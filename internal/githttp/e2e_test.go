@@ -32,6 +32,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -403,15 +404,53 @@ func mustPubPEM(key crypto.Signer) []byte {
 }
 
 type testNode struct {
-	cmd  *exec.Cmd
-	addr string
+	cmd      *exec.Cmd
+	addr     string
+	stopOnce sync.Once
 }
 
+// stop SIGKILLs serve and every process in serve's session, then waits
+// until no live process is left in it (issue #439). startBinaryNode makes
+// serve a session leader, and its git children (receive-pack, upload-pack,
+// hooks) stay in the session: killing serve alone left them writing into
+// the test's cache dir while t.TempDir cleanup removed it ("directory not
+// empty"). A process-group kill is not enough, because sync runs start
+// `git push` in its own group (internal/sync setProcGroup). A node the
+// test already reaped (waitNodeExit) gets the session scan only: once
+// serve is reaped, its PID can name another process group. Linux keeps
+// the session ID from reuse while any member, zombies included, exists.
+// Without /proc (non-Linux), stop reaches serve's own process group only.
 func (n *testNode) stop() {
-	if n.cmd.Process != nil {
-		_ = n.cmd.Process.Kill()
-		_ = n.cmd.Wait()
-	}
+	n.stopOnce.Do(func() {
+		if n.cmd.Process == nil {
+			return
+		}
+		sid := n.cmd.Process.Pid
+		defer untrackNodeSession(sid)
+		kill := func() []int {
+			members := sessionMembers(sid)
+			for _, pid := range members {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+			return members
+		}
+		if n.cmd.ProcessState == nil {
+			_ = syscall.Kill(-sid, syscall.SIGKILL)
+			kill()
+			_ = n.cmd.Wait()
+		}
+		// Wait returns once serve is reaped; its children are reparented and
+		// may still be exiting (a SIGKILL lands after an in-flight write).
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			members := kill()
+			if len(members) == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				panic(fmt.Sprintf("serve session %d still has live members %v 10s after SIGKILL", sid, members))
+			}
+		}
+	})
 }
 
 // startNode runs `openstorage serve` in single-org mode. Later duplicate
@@ -442,6 +481,7 @@ func startBinaryNode(binary, cacheDir string, stderr io.Writer, extraEnv ...stri
 		cmd.Env = append(cmd.Env, "OPENSTORAGE_S3WAL_LEASE_TTL=0")
 	}
 	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.SysProcAttr = nodeSysProcAttr()
 	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -450,6 +490,7 @@ func startBinaryNode(binary, cacheDir string, stderr io.Writer, extraEnv ...stri
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	trackNodeSession(cmd.Process.Pid)
 	sc := bufio.NewScanner(stdout)
 	lineCh := make(chan string, 1)
 	go func() {
@@ -462,14 +503,12 @@ func startBinaryNode(binary, cacheDir string, stderr io.Writer, extraEnv ...stri
 	select {
 	case line, ok := <-lineCh:
 		if !ok || !strings.HasPrefix(line, "listening on ") {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
+			(&testNode{cmd: cmd}).stop()
 			return nil, fmt.Errorf("node did not announce address (got %q)", line)
 		}
 		return &testNode{cmd: cmd, addr: strings.TrimPrefix(line, "listening on ")}, nil
 	case <-time.After(30 * time.Second):
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		(&testNode{cmd: cmd}).stop()
 		return nil, fmt.Errorf("node startup timed out")
 	}
 }
