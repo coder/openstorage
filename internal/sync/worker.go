@@ -178,15 +178,15 @@ type Worker struct {
 	// point it at the queue's EnqueueSync.
 	AfterForward func(ctx context.Context, job Job) error
 
-	// Local, when non-nil, is the durable local schedule (SQLite, issue
-	// #266, ADR-50): runs claim through ClaimDue* (refused claims end the
+	// Local, when non-nil, is the durable local schedule (SQLite and
+	// S3WAL, issue #266, ADR-50, ADR-51): runs claim through ClaimDue* (refused claims end the
 	// run with nothing written), and one end-of-run write schedules any
 	// retry, follow-up, or mirror-back in the row. Requeue, RequeuePush,
 	// AfterForward and the deferred-retry timers are then unused: a
 	// LocalScheduler sweep turns due rows into runs.
 	Local LocalLanes
 
-	// WaitPublication, when non-nil (SQLite local mode, with Local set),
+	// WaitPublication, when non-nil (local mode, with Local set),
 	// blocks until no in-flight push still holds the repo's cache refs
 	// unpublished (githttp.WaitForPushPublication). A local run calls it
 	// after its claim and before its snapshot and started event: a hook
@@ -418,7 +418,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	if runErr != nil && shutdownAborted(ctx) {
 		// Shutdown cancelled the run: keep its request for the next
 		// process instead of counting a failure.
-		if w.Local != nil { // SQLite (issue #342)
+		if w.Local != nil { // SQLite and S3WAL (issue #342)
 			return w.restoreForShutdown(ctx, "sync", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
 				return w.Local.FinishSyncOutcome(fctx, job.RepoID, holder, meta.SyncOutcome{Kind: meta.OutcomeRestore, Delay: shutdownRestoreDelay})
 			})
@@ -534,7 +534,7 @@ func (w *Worker) claimLocal(ctx context.Context, claim func(context.Context) (La
 // the request until its lease expires (issue #342), but a stalled store
 // must not hold shutdown past its budget either (issue #343 review). A
 // claim that still commits unseen is recovered once its lease expires: by
-// SQLite's sweep, or by the River job that shutdownSnooze keeps.
+// the local schedule's sweep, or by the River job that shutdownSnooze keeps.
 func claimContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
 	stop := context.AfterFunc(ctx, func() { time.AfterFunc(shutdownRestoreTimeout, cancel) })
@@ -555,7 +555,7 @@ func shutdownErr(ctx context.Context, err error) error {
 }
 
 // restoreForShutdown ends a run that a shutdown drain cancelled with
-// finish, a restore write (OutcomeRestore on SQLite, issue #342;
+// finish, a restore write (OutcomeRestore on the local schedule, #342;
 // ShutdownRestorer on PostgreSQL, issue #343): the request stays pending
 // for the next process, no run is counted, and no terminal event is
 // emitted (like detach and claim-steal abandonment).

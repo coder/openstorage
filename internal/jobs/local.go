@@ -140,8 +140,8 @@ func (q *Local) OfferSync(ctx context.Context, job sync.Job) error {
 	return q.syncq.EnqueueSync(ctx, job)
 }
 
-// TracksCreateState is true only on the SQLite schedule; the in-process
-// queue serves S3-WAL, which stores no create state (issue #335).
+// TracksCreateState is true only on the local schedule (SQLite, S3WAL);
+// the in-process queue never completes a create.
 func (q *Local) TracksCreateState() bool {
 	_, ok := q.syncq.(sync.FirstSyncScheduler)
 	return ok

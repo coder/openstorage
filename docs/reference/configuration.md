@@ -111,7 +111,8 @@ Database URL for the ref authority (CAS) and metadata store.
 - The store must also provide strong read-after-write and list-after-write consistency.
   This is not probed; see the
   [store requirements](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
-- Jobs run on the in-process queue and tickers, like local mode.
+- Upstream sync runs use the durable local schedule in the metadata document, like
+  SQLite local mode. Other jobs run on the in-process queue and tickers.
 - All S3WAL targets remain **experimental**. See the
   [storage qualification matrix](../explanation/storage-engine.md#storage-compatibility-and-qualification)
   for release-scoped evidence and conditional future promotion targets.

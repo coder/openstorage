@@ -12,8 +12,8 @@ import (
 )
 
 // LocalLanes is the durable local schedule (issue #266, ADR-50): the lane
-// row owns pending level, due time, retry position, and claim. Only SQLite
-// provides it (meta.LocalScheduleStore). A worker with Local set claims
+// row owns pending level, due time, retry position, and claim. SQLite and
+// S3WAL provide it (meta.LocalSchedule). A worker with Local set claims
 // through ClaimDue* and ends runs through Finish*Outcome, and keeps no
 // process-local retry or defer timers.
 type LocalLanes interface {
@@ -37,11 +37,11 @@ type LaneClaim struct {
 	StolenFrom string
 }
 
-// MetaLocalLanes adapts ms when it provides the local schedule (SQLite);
-// ok is false for PG and S3WAL, which keep their existing scheduling.
+// MetaLocalLanes adapts ms when it provides the local schedule (SQLite,
+// S3WAL); ok is false for PG, which schedules through River.
 func MetaLocalLanes(ms meta.EventingStore) (LocalLanes, bool) {
 	assertf(ms != nil, "MetaLocalLanes: nil meta store")
-	ls, ok := ms.(meta.LocalScheduleStore)
+	ls, ok := meta.LocalSchedule(ms)
 	if !ok {
 		return nil, false
 	}

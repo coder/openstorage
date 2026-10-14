@@ -16,12 +16,10 @@ func TestCreateState(t *testing.T) { runBackends(t, testCreateState) }
 // testCreateState: the create-state marker (issue #388). Only a pending
 // row completes, a delete before completion wins, legacy rows are never
 // completed, and concurrent completions have one winner. S3-WAL stores the
-// state in its v2 document (ADR-51), but CreateLinkedRepo inserts legacy
-// rows there until S3-WAL schedules a first sync with the completion.
+// state in its v2 document (ADR-51).
 func testCreateState(t *testing.T, s Backend) {
 	ctx := t.Context()
 	org := seedOrg(t, s)
-	_, isS3WAL := s.(*S3WAL)
 	state := func(t *testing.T, name string) CreateState {
 		t.Helper()
 		r, err := s.GetRepoByURL(ctx, org, name)
@@ -89,12 +87,8 @@ func testCreateState(t *testing.T, s Backend) {
 	}
 	linked, err := s.CreateLinkedRepo(ctx, org, "linked", "main",
 		RepoUpstream{Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}, nil)
-	wantLinked := CreateStatePending
-	if isS3WAL {
-		wantLinked = CreateStateLegacy
-	}
-	if err != nil || state(t, "linked") != wantLinked {
-		t.Fatalf("CreateLinkedRepo = %+v, %v; state %d, want %d", linked, err, state(t, "linked"), wantLinked)
+	if err != nil || linked.CreateState != CreateStatePending || state(t, "linked") != CreateStatePending {
+		t.Fatalf("CreateLinkedRepo = %+v, %v; state %d, want pending", linked, err, state(t, "linked"))
 	}
 
 	// Concurrent completions of one pending row: exactly one finishes it.

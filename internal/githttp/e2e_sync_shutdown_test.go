@@ -1,6 +1,6 @@
 package githttp
 
-// Acceptance for issues #342 (SQLite) and #343 (PostgreSQL/River):
+// Acceptance for issues #342 (SQLite, S3WAL) and #343 (PostgreSQL/River):
 // SIGTERM while a pull is in flight must not use up the pull's request.
 // Before the fixes, serve stopped its listener first; the run then finished
 // its upstream fetch, failed its loopback push to this process's own
@@ -21,22 +21,27 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
+	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
 
-// privateDatabase returns a database URL no other serve process in the lane
-// uses: the lane's shared nodes run their own sync workers (SQLite sweeps,
-// River workers) and would otherwise pick up or steal the run. On
-// PostgreSQL it is a fresh database on the lane's server.
-func privateDatabase(t *testing.T, dataDir string) string {
+// privateStores returns metadata and blob store URLs no other serve process
+// in the lane uses: the lane's shared nodes run their own sync workers
+// (local schedule sweeps, River workers) and would otherwise pick up or
+// steal the run. On PostgreSQL the database is a fresh database on the
+// lane's server. On S3WAL both stores are one fresh bucket on the lane's
+// SeaweedFS.
+func privateStores(t *testing.T, dataDir string) (metaURL, blobsURL string) {
 	t.Helper()
+	fileBlobs := "file://" + filepath.Join(dataDir, "blobs")
 	switch testBackend {
 	case backendLocal:
-		return "sqlite://" + filepath.Join(dataDir, "codestorage.db")
+		return "sqlite://" + filepath.Join(dataDir, "codestorage.db"), fileBlobs
 	case backendPG:
 		conn, err := pgx.Connect(t.Context(), dbURL)
 		if err != nil {
@@ -64,10 +69,27 @@ func privateDatabase(t *testing.T, dataDir string) string {
 			t.Fatal(err)
 		}
 		u.Path = "/" + name
-		return u.String()
+		return u.String(), fileBlobs
+	case backendS3WAL:
+		// TestMain owns the SeaweedFS container, so the bucket goes with it.
+		base, err := url.Parse(blobURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bucket := "shutdown-" + uuid.New().String()
+		client := s3waltest.RawS3Client(base.Query().Get("endpoint"), "us-east-1", s3AccessKey, s3SecretKey)
+		if err := s3waltest.EnsureBucket(t.Context(), client, bucket); err != nil {
+			t.Fatal(err)
+		}
+		db, err := url.Parse(dbURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Host, base.Host = bucket, bucket
+		return db.String(), base.String()
 	default:
-		t.Skip("S3-WAL shutdown is issue #335")
-		return ""
+		t.Fatalf("unknown test backend %q", testBackend)
+		return "", ""
 	}
 }
 
@@ -133,8 +155,8 @@ func waitForRepoMain(t *testing.T, st ref.RefStore, repoID, want string) {
 func TestSync_ShutdownKeepsInFlightPullRequest(t *testing.T) {
 	// A private database and blob store (see privateDatabase).
 	dataDir := t.TempDir()
-	dbURL := privateDatabase(t, dataDir)
-	env := []string{"OPENSTORAGE_PG_URL=" + dbURL, "OPENSTORAGE_S3_URL=file://" + filepath.Join(dataDir, "blobs")}
+	dbURL, blobURL := privateStores(t, dataDir)
+	env := []string{"OPENSTORAGE_PG_URL=" + dbURL, "OPENSTORAGE_S3_URL=" + blobURL}
 	cacheDir := t.TempDir()
 
 	up, stall := newStallingSyncUpstream(t)

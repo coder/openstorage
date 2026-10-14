@@ -165,8 +165,8 @@ about the endpoint's rollout status on upstream clusters.
   create of a repo without an upstream, and every plain, copy and fork create (upstream
   answers 200 there; [#388](https://github.com/coder/openstorage/issues/388) tracks it).
   Repos created before create tracking answer 409 to every repeat create, because
-  open.storage cannot tell whether their create finished. On S3-WAL, sync creates are not
-  tracked yet (#335), so a repeat sync create there → 409.
+  open.storage cannot tell whether their create finished. On S3-WAL, these include sync
+  creates made before #335.
 - A deleted repo keeps its name → **404**. Nothing is restored.
 - A sync create whose first sync cannot be scheduled → **503** with `Retry-After`. The repo,
   its upstream link and its credential exist, but the create is pending. Either of these
@@ -398,7 +398,7 @@ timestamp and `committer_date` the committer timestamp, as in upstream's spec of
 
 **Events and cancellation:** outbound runs emit `repo.push_upstream.*` events
 ([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. `DELETE /repos/base` silently cancels
-in-flight runs in both directions. With a SQLite or PostgreSQL database, a run that
+in-flight runs in both directions. A run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
 a new `repo.sync.started` (outbound: `repo.push_upstream.started`).

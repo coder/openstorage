@@ -350,7 +350,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			UpstreamHost: upstreamHost, ForwardOnPush: spec.ForwardPushes}
 		repo, err = s.linked().CreateLinkedRepo(r.Context(), claims.Iss, url, branch, link, cred)
 	default:
-		// The store tracks no create state (S3-WAL, #335): a legacy row.
+		// The queue tracks no create state: a legacy row.
 		repo, err = s.store.CreateRepo(r.Context(), claims.Iss, url, branch)
 	}
 	switch {
