@@ -25,8 +25,9 @@ const staleRefLockAge = time.Minute
 // processInRepo): every git that can own a cache-repo ref lock
 // (receive-pack, its hooks, hydration, the REST writers) runs that way.
 // Without that proof (no /proc, an unreadable process table) nothing is
-// removed. It returns the number of locks removed.
-func removeStaleRefLocks(repoPath string, names []string) int {
+// removed. exclude is a PID that cannot own a ref lock (hydration's own
+// for-each-ref), or 0. It returns the number of locks removed.
+func removeStaleRefLocks(repoPath string, names []string, exclude int) int {
 	type staleLock struct {
 		path string
 		fi   os.FileInfo
@@ -42,7 +43,7 @@ func removeStaleRefLocks(repoPath string, names []string) int {
 	if len(stale) == 0 {
 		return 0
 	}
-	if pid, err := processInRepo(repoPath); err != nil {
+	if pid, err := processInRepo(repoPath, exclude); err != nil {
 		log.Printf("hydrate %s: keeping %d old ref lock(s): cannot check for processes in the repository: %v", repoPath, len(stale), err)
 		return 0
 	} else if pid != 0 {

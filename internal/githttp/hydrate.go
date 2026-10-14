@@ -1275,6 +1275,9 @@ type refCmdBatch struct {
 	cmds     []refCmd
 	skipped  bool
 	holds    *pushHoldDirCache // lazily built by flush, reused across flushes
+	// enumerator is the pass's own for-each-ref child, if any: it works in
+	// the repo while it streams, but it cannot own a ref lock (#464).
+	enumerator *localRefSeq
 }
 
 func (b *refCmdBatch) add(name, line string) error {
@@ -1318,7 +1321,11 @@ func (b *refCmdBatch) flush() error {
 	// A git killed inside its ref transaction leaves a lock that fails
 	// every later batch for that ref (issue #464): remove it only when
 	// it is provably stale, then retry once.
-	if err != nil && removeStaleRefLocks(b.repoPath, kept) > 0 {
+	exclude := 0
+	if b.enumerator != nil && !b.enumerator.waited {
+		exclude = b.enumerator.cmd.Process.Pid // not yet reaped, so the PID is still its own
+	}
+	if err != nil && removeStaleRefLocks(b.repoPath, kept, exclude) > 0 {
 		err = updateRefStdin(b.repoPath, sb.String())
 	}
 	return err
@@ -1383,7 +1390,7 @@ func syncRefsPassOne(ctx context.Context, repoPath string, store refSeq, batch i
 		return false, false, err
 	}
 	defer local.close()
-	dels := &refCmdBatch{repoPath: repoPath, cap: batch}
+	dels := &refCmdBatch{repoPath: repoPath, cap: batch, enumerator: local}
 	var upds []refCmd
 	spool := func(name, sha string) {
 		if overflow {

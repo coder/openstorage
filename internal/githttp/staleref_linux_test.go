@@ -25,6 +25,7 @@ func TestRemoveStaleRefLocks(t *testing.T) {
 		lock    string    // relative to the repo
 		mtime   time.Time // zero: now
 		process func(repo, real string) *exec.Cmd
+		exclude bool // pass the process as the excluded PID
 		removed int
 	}{
 		{name: "old loose lock", lock: "refs/heads/x.lock", mtime: old, removed: 1},
@@ -34,6 +35,11 @@ func TestRemoveStaleRefLocks(t *testing.T) {
 		{name: "process works in the repo", lock: "refs/heads/x.lock", mtime: old, process: func(repo, _ string) *exec.Cmd {
 			cmd := exec.Command("sleep", "30")
 			cmd.Dir = filepath.Join(repo, "refs")
+			return cmd
+		}},
+		{name: "excluded process works in the repo", lock: "refs/heads/x.lock", mtime: old, exclude: true, removed: 1, process: func(repo, _ string) *exec.Cmd {
+			cmd := exec.Command("sleep", "30")
+			cmd.Dir = repo
 			return cmd
 		}},
 		{name: "process names the repo", lock: "refs/heads/x.lock", mtime: old, process: func(repo, _ string) *exec.Cmd {
@@ -77,20 +83,53 @@ func TestRemoveStaleRefLocks(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			exclude := 0
 			if tc.process != nil {
 				cmd := tc.process(repo, real)
 				if err := cmd.Start(); err != nil {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+				if tc.exclude {
+					exclude = cmd.Process.Pid
+				}
 			}
-			if got := removeStaleRefLocks(repo, []string{"refs/heads/x"}); got != tc.removed {
+			if got := removeStaleRefLocks(repo, []string{"refs/heads/x"}, exclude); got != tc.removed {
 				t.Fatalf("removed %d locks, want %d", got, tc.removed)
 			}
 			if _, err := os.Lstat(lock); (err == nil) != (tc.removed == 0) {
 				t.Fatalf("lock exists = %v after removing %d", err == nil, tc.removed)
 			}
 		})
+	}
+}
+
+// TestProcessChecksWithoutHostInputs covers inputs this test host cannot
+// produce: another user's process and a hidepid /proc mount.
+func TestProcessChecksWithoutHostInputs(t *testing.T) {
+	for _, tc := range []struct {
+		cmdline string
+		err     error
+		want    bool
+	}{
+		{"/usr/bin/git\x00update-ref\x00", nil, true},
+		{"git-receive-pack\x00/cache/r.git\x00", nil, true},
+		{"/usr/sbin/sshd\x00-D\x00", nil, false},
+		{"", nil, false}, // kernel thread
+		{"", os.ErrPermission, true},
+	} {
+		if got := unreadableMayOwn([]byte(tc.cmdline), tc.err); got != tc.want {
+			t.Errorf("unreadableMayOwn(%q, %v) = %v, want %v", tc.cmdline, tc.err, got, tc.want)
+		}
+	}
+	for mounts, want := range map[string]bool{
+		"proc /proc proc rw,nosuid,relatime 0 0\n":                    false,
+		"proc /proc proc rw,hidepid=2 0 0\n":                          true,
+		"proc /other proc rw,hidepid=2 0 0\nproc /proc proc rw 0 0\n": false,
+	} {
+		if got := procHidesPIDs([]byte(mounts)); got != want {
+			t.Errorf("procHidesPIDs(%q) = %v, want %v", mounts, got, want)
+		}
 	}
 }
 

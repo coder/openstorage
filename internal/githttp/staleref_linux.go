@@ -18,9 +18,12 @@ import (
 // Every git that can own a cache-repo ref lock does one of these. It scans
 // every process this one can read. Processes of other users are unreadable
 // here, and they cannot write a cache repo, which is private to the
-// server's user (only root could). It fails when /proc does not list this
-// process, because then it cannot prove anything.
-func processInRepo(repoPath string) (int, error) {
+// server's user. Only root could: an unreadable process counts as working
+// in the repository when it may be git (unreadableMayOwn). It fails when
+// /proc does not list this process or hides other users' processes
+// (hidepid), because then it cannot prove anything. The process exclude
+// (0 for none) is never counted.
+func processInRepo(repoPath string, exclude int) (int, error) {
 	abs, err := filepath.Abs(repoPath)
 	if err != nil {
 		return 0, err
@@ -43,23 +46,29 @@ func processInRepo(repoPath string) (int, error) {
 	if _, err := os.Stat(fmt.Sprintf("/proc/%d", self)); err != nil {
 		return 0, fmt.Errorf("process table unavailable: %w", err)
 	}
+	if mounts, err := os.ReadFile("/proc/self/mounts"); err != nil || procHidesPIDs(mounts) {
+		return 0, fmt.Errorf("process table may hide processes (hidepid or unreadable mounts: %v)", err)
+	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0, err
 	}
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == self {
+		if err != nil || pid == self || pid == exclude {
 			continue
 		}
+		cmdline, cmdErr := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 		cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
 		if err != nil {
-			continue // exited, or not ours (another user cannot write the cache)
+			if _, serr := os.Stat(fmt.Sprintf("/proc/%d", pid)); serr == nil && unreadableMayOwn(cmdline, cmdErr) {
+				return pid, nil // another user's live git (root can write the cache)
+			}
+			continue // exited, or another user's non-git process
 		}
 		if inside(cwd) {
 			return pid, nil
 		}
-		cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 		base := cwd
 		args := strings.Split(string(cmdline), "\x00")
 		for i, arg := range args {
@@ -99,4 +108,33 @@ func evalOr(p string) string {
 		return real
 	}
 	return p
+}
+
+// unreadableMayOwn reports whether a process whose working directory this
+// process cannot read may still own a cache-repo ref lock: when its command
+// line is unreadable, or when its program is git. Kernel threads (an empty
+// command line) and other programs cannot.
+func unreadableMayOwn(cmdline []byte, err error) bool {
+	if err != nil {
+		return true
+	}
+	argv0, _, _ := strings.Cut(string(cmdline), "\x00")
+	return strings.HasPrefix(filepath.Base(argv0), "git")
+}
+
+// procHidesPIDs reports whether /proc is mounted with hidepid set to hide
+// other users' processes (/proc/self/mounts content).
+func procHidesPIDs(mounts []byte) bool {
+	for _, line := range strings.Split(string(mounts), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || f[1] != "/proc" || f[2] != "proc" {
+			continue
+		}
+		for _, opt := range strings.Split(f[3], ",") {
+			if v, ok := strings.CutPrefix(opt, "hidepid="); ok && v != "0" && v != "off" {
+				return true
+			}
+		}
+	}
+	return false
 }
