@@ -358,7 +358,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		s.answerTakenSyncName(w, r, claims, url, link)
 		return
 	case errors.Is(err, meta.ErrAlreadyExists):
-		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url, spec != nil)
+		answerTakenName(w, r, s.store, s.internalErr, s.httpBaseURL, claims.Iss, url, spec != nil)
 		return
 	case errors.Is(err, meta.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "organization not found")
@@ -480,7 +480,7 @@ func (s *syncServer) answerTakenSyncName(w http.ResponseWriter, r *http.Request,
 	org := claims.Iss
 	repo, err := s.store.GetRepoByURL(r.Context(), org, url)
 	if err != nil || repo.CreateState == meta.CreateStateLegacy {
-		answerTakenName(w, r, s.store, s.internalErr, org, url, true) // 404 deleted, 409 legacy, or 500
+		answerTakenName(w, r, s.store, s.internalErr, s.httpBaseURL, org, url, true) // 404 deleted, 409 legacy, or 500
 		return
 	}
 	up, err := s.ups.GetUpstream(r.Context(), repo.RepoID)
@@ -508,12 +508,7 @@ func (s *syncServer) answerTakenSyncName(w http.ResponseWriter, r *http.Request,
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, createRepoResponse{
-		RepoID:   repo.RepoID,
-		RepoName: repo.URL,
-		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
-		Message:  "Repository '" + repo.URL + "' already exists",
-	})
+	writeRepoExists(w, s.httpBaseURL, repo)
 }
 
 // finishPendingSync completes a pending sync create for a request other

@@ -56,7 +56,8 @@ func (b gatedBlobStore) UploadFile(ctx context.Context, key, path string) error 
 // fork dispatcher, as api.New wires it, over a source repo in another org.
 type pendingForkStack struct {
 	*pendingSyncStack
-	fork, copy string // request bodies
+	fork, copy string      // request bodies
+	src        wrefFixture // the source repo, in another org
 }
 
 func newPendingForkStack(t *testing.T, e *testEnv, blobs blob.BlobStore, store meta.Store) *pendingForkStack {
@@ -71,6 +72,7 @@ func newPendingForkStack(t *testing.T, e *testEnv, blobs blob.BlobStore, store m
 	s.srv = httptest.NewServer(withProblemInstance(mux))
 	t.Cleanup(s.srv.Close)
 	src := wrefSeedFixture(t, e)
+	s.src = src
 	tok := e.mint(t, tokenSpec{iss: src.org, repo: src.url, scopes: []string{auth.ScopeGitRead}})
 	s.fork = `{"base_repo":{"provider":"code","operation":"fork","auth":{"token":"` + tok + `"}}}`
 	s.copy = `{"base_repo":{"name":"` + src.url + `","auth":{"token":"` + tok + `"}}}`
@@ -113,7 +115,7 @@ func TestPendingFork(t *testing.T) {
 				if st, err := s.state(t, name); err != nil || st != meta.CreateStateComplete {
 					t.Fatalf("%s create_state = %d, %v; want complete", name, st, err)
 				}
-				s.answers(t, name+" complete", name, 409, 409, 409, 409)
+				s.answers(t, name+" complete", name, 200, 200, 200, 409)
 				if _, err := e.store.SoftDeleteRepo(context.Background(), s.org, name); err != nil {
 					t.Fatal(err)
 				}
@@ -223,7 +225,7 @@ func TestPendingFork(t *testing.T) {
 				if code != http.StatusCreated {
 					t.Fatalf("fork = %d, want 201", code)
 				}
-				s.answers(t, "after the fork", "racing", 409, 409, 409, 409) // 200 for plain and copy in PR 4
+				s.answers(t, "after the fork", "racing", 200, 200, 200, 409)
 			})
 		}
 	})

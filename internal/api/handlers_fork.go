@@ -169,6 +169,18 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		writeInvalidField(w, "base_repo.auth.token", "is required", "base_repo.auth.token is required for provider "+strconv.Quote(spec.Provider))
 		return
 	}
+	// A repeat of a finished copy or fork answers 200 before any source
+	// work (issue #388): it copies nothing, so it must not fail because its
+	// old source or token is gone. The CreateRepo conflict below answers a
+	// race with the same rules.
+	switch done, err := s.finishedUnlinked(r.Context(), claims.Iss, url); {
+	case err != nil:
+		s.internalErr(w, r, "get existing repository", err)
+		return
+	case done.RepoID != "":
+		writeRepoExists(w, s.httpBaseURL, done)
+		return
+	}
 	srcClaims, err := verifier.Verify(r.Context(), spec.Auth.Token)
 	if err != nil {
 		writeErr(w, http.StatusForbidden, "base_repo.auth.token: invalid token")
@@ -343,7 +355,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	repo, err := s.store.CreateRepoWithState(ctx, claims.Iss, url, branch, meta.CreateStatePending)
 	switch {
 	case errors.Is(err, meta.ErrAlreadyExists):
-		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url, false)
+		answerTakenName(w, r, s.store, s.internalErr, s.httpBaseURL, claims.Iss, url, false)
 		return
 	case errors.Is(err, meta.ErrNotFound):
 		// Unreachable after successful auth (the org must exist to have
@@ -433,6 +445,25 @@ func (s *server) completeFork(w http.ResponseWriter, r *http.Request, org, url, 
 	assertf(out == meta.CreateCompleted || out == meta.CreateAlreadyComplete,
 		"CompleteRepoCreate of fork %s: outcome %d", repoID, out)
 	return true
+}
+
+// finishedUnlinked returns the live repo at url when its create finished
+// and it has no upstream link, the repos a repeat copy or fork create
+// answers with 200. Otherwise it returns a zero Repo: the normal flow then
+// answers (404, 409 or 503 at CreateRepo).
+func (s *server) finishedUnlinked(ctx context.Context, org, url string) (meta.Repo, error) {
+	repo, err := s.store.GetRepoByURL(ctx, org, url)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		return meta.Repo{}, nil
+	case err != nil || repo.CreateState != meta.CreateStateComplete:
+		return meta.Repo{}, err
+	}
+	linked, err := repoLinked(ctx, s.store, repo.RepoID)
+	if err != nil || linked {
+		return meta.Repo{}, err
+	}
+	return repo, nil
 }
 
 // forkAbandon soft-deletes the shell repo row after a post-create failure

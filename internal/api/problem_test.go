@@ -641,7 +641,8 @@ func testErrorBodiesCarryProblemFields(t *testing.T, e *testEnv) {
 		{"encoded alias name", http.MethodGet, nestedPath, nestedTok, nil, http.StatusNotFound, "repository_not_found"},
 		{"alias bad cursor", http.MethodGet, "/api/repos/" + url + "/branches?cursor=%21%21", readTok, nil, http.StatusBadRequest, "bad_request"},
 		{"invalid JSON", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{`), http.StatusBadRequest, "bad_request"},
-		{"repo exists", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{"default_branch":"main"}`), http.StatusConflict, "conflict"},
+		// A sync create of a plain repo (a repeat plain create is 200, #388).
+		{"repo exists", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"upstream.invalid"}}`), http.StatusConflict, "conflict"},
 		// The alias's own lookup of the token's repo claim.
 		{"alias claim not found", http.MethodGet, "/api/repos/" + url + "/branches", missingTok, nil, http.StatusNotFound, "repository_not_found"},
 		{"repo name mismatch", http.MethodPost, "/api/v1/repos", writeTok, []byte(`{"repo_name":"pd-other"}`), http.StatusBadRequest, "repo_name_mismatch"},

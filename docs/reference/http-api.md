@@ -104,7 +104,7 @@ about the endpoint's rollout status on upstream clusters.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 200 = a sync create of a repo with the same upstream; 409 = another live repo holds the name; 404 = a deleted repo holds the name; 503 = a sync create is not finished (below). |
+| `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 200 = the name holds a finished repo the request matches; 409 = another live repo holds the name; 404 = a deleted repo holds the name; 503 = a create of the name is not finished (below). |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
@@ -154,19 +154,27 @@ about the endpoint's rollout status on upstream clusters.
   run after every won local push. It also inverts the sync conflict rule: local wins, and
   inbound syncs never force-rewind local refs. See [Upstream sync](#upstream-sync).
 
-**Repeat creates** (upstream spec 2026-10-07; open.storage covers part of it, see [#388](https://github.com/coder/openstorage/issues/388)):
+**Repeat creates** (upstream spec 2026-10-07, [#388](https://github.com/coder/openstorage/issues/388)):
 
 - A new repository → **201** `Repository '<name>' created`.
 - A sync create (`upstream`, or a `base_repo` sync) of a repo with the same upstream →
   **200** `Repository '<name>' already exists`, with the existing `repo_id`. "Same" means the
   same stored provider, host, owner and name, and the same `forward_pushes`. The request's
   `ref`, `default_branch` and `auth` are ignored, and nothing is scheduled.
+- A plain, copy or fork create of a finished repo without an upstream (a plain repo, a copy,
+  or a fork) → **200** `Repository '<name>' already exists`, with the existing `repo_id`.
+  It changes nothing: a copy or fork copies nothing, and it answers before it reads its
+  source, so it succeeds after the source is deleted or its token expired. The request's
+  `ref`, `sha` and `default_branch` are ignored.
 - Any other create of a live name → **409**: a different upstream or `forward_pushes`, a sync
-  create of a repo without an upstream, and every plain, copy and fork create (upstream
-  answers 200 there; [#388](https://github.com/coder/openstorage/issues/388) tracks it).
-  Repos created before create tracking answer 409 to every repeat create, because
-  open.storage cannot tell whether their create finished. On S3-WAL, these include sync
-  creates made before #335.
+  create of a repo without an upstream, and a plain, copy or fork create of a repo with an
+  upstream.
+- Known gaps (409 where upstream answers 200): a repo whose create was not tracked answers
+  409 to every repeat create, because open.storage cannot tell whether that create finished.
+  That covers plain repos created before v0.16.0, sync repos created before v0.18.0, copies
+  and forks created by v0.18.0 or earlier, every S3-WAL repo created by v0.18.0 or earlier
+  (its metadata format v1 stores no create state, #335), and repos that an older server
+  created during a rolling upgrade.
 - A deleted repo keeps its name → **404**. Nothing is restored.
 - A sync create whose first sync cannot be scheduled → **503** with `Retry-After`. The repo,
   its upstream link and its credential exist, but the create is pending. Either of these
