@@ -13,9 +13,7 @@ import (
 // The external serve binary is essential: in-process fixtures dispatch hooks
 // through this package's TestMain, which does not wire command-side eventing.
 func TestLocalHookAcceptedPushRecordsIntent(t *testing.T) {
-	if testBackend != backendLocal {
-		t.Skip("SQLite hook scheduling (ADR-50); S3WAL hooks do not schedule (#335)")
-	}
+	skipUnlessLocalSchedule(t)
 	ctx := t.Context()
 	repo := "https://example.com/local-hook-intent.git"
 	id := registerRepo(t, repo)
@@ -46,9 +44,7 @@ func TestLocalHookAcceptedPushRecordsIntent(t *testing.T) {
 // A non-zero Git exit is not proof that every command was rejected. Conversely
 // no-op and atomic/rejected pushes must not manufacture sync intent.
 func TestLocalHookIntentTracksAcceptedCommands(t *testing.T) {
-	if testBackend != backendLocal {
-		t.Skip("SQLite hook scheduling (ADR-50); S3WAL hooks do not schedule (#335)")
-	}
+	skipUnlessLocalSchedule(t)
 	for _, tc := range []struct {
 		name                                   string
 		noop, partial, atomic, denied, forward bool
@@ -127,9 +123,7 @@ func TestLocalHookIntentTracksAcceptedCommands(t *testing.T) {
 }
 
 func TestLocalHookCommittedDeleteThen413KeepsIntent(t *testing.T) {
-	if testBackend != backendLocal {
-		t.Skip("SQLite hook scheduling (ADR-50); S3WAL hooks do not schedule (#335)")
-	}
+	skipUnlessLocalSchedule(t)
 	node := startNodeT(t, fmt.Sprintf("OPENSTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
 	url := "https://example.com/local-hook-413.git"
 	id := registerRepo(t, url)

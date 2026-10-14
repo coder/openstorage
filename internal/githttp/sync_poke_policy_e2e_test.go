@@ -31,9 +31,6 @@ func TestSyncPokeRefPolicyGate(t *testing.T) {
 		{"git_restricted", "git", restricted, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.surface == "git" && testBackend == backendS3WAL {
-				t.Skip("S3WAL hooks do not schedule sync (#335)")
-			}
 			up := newSyncUpstream(t)
 			url := "sync-poke-" + tc.name
 			id := createSyncedRepo(t, nodeA, up, url)

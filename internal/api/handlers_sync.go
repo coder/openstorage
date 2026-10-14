@@ -787,7 +787,7 @@ func (s *syncServer) handlePushUpstream(w http.ResponseWriter, r *http.Request) 
 	// protocol (issue #79): a request that coalesces with a run that
 	// already claimed survives to that run's FinishPush. Force rides the
 	// durable marker, not the job — queue deduplication is keyed by repo.
-	// A store with due times (the SQLite local schedule, ADR-50) records
+	// A store with due times (the local schedule, ADR-50) records
 	// it with RequestPushNow: an explicit request makes a waiting retry
 	// due now and keeps its retry position. Implicit forward requests use
 	// RequestPush and join the backoff.

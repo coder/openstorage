@@ -17,9 +17,7 @@ import (
 // claiming that marker must not compare against the stale cache: after the
 // publication it must still restore upstream-wins. S3WAL uses owned SeaweedFS.
 func TestLocalHookPullBeforeCachePublication(t *testing.T) {
-	if testBackend != backendLocal {
-		t.Skip("SQLite hook scheduling (ADR-50); S3WAL hooks do not schedule (#335)")
-	}
+	skipUnlessLocalSchedule(t)
 	root := t.TempDir()
 	bare := filepath.Join(root, "up", "mirror.git")
 	mustGit(t, "", "init", "--bare", "-b", "main", bare)

@@ -2,10 +2,12 @@ package githttp
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,23 +15,34 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
 
-// localSchedulingStorage gives a test its own SQLite authority and blob
+// skipUnlessLocalSchedule skips a test of git-surface hook scheduling on
+// PostgreSQL, which schedules through River instead of the local schedule
+// (ADR-50 on SQLite, ADR-51 on S3WAL).
+func skipUnlessLocalSchedule(t *testing.T) {
+	t.Helper()
+	if testBackend == backendPG {
+		t.Skip("local schedule hook scheduling (ADR-50, ADR-51); PostgreSQL uses River")
+	}
+}
+
+// localSchedulingStorage gives a test its own metadata authority and blob
 // storage: TestMain's node must not consume these markers under a
 // different egress policy or repair their claims.
 func localSchedulingStorage(t *testing.T) (string, string) {
 	t.Helper()
-	assertf(testBackend == backendLocal, "localSchedulingStorage: SQLite only")
-	root := t.TempDir()
-	return "sqlite://" + filepath.Join(root, "meta.db"), "file://" + filepath.Join(root, "blobs")
+	assertf(testBackend == backendLocal || testBackend == backendS3WAL, "localSchedulingStorage: %s has no local schedule", testBackend)
+	return privateStores(t, t.TempDir())
 }
 
 func TestLocalHookLiveForwardAndPendingRestart(t *testing.T) {
-	if testBackend != backendLocal {
-		t.Skip("SQLite hook scheduling (ADR-50); S3WAL hooks do not schedule (#335)")
-	}
+	skipUnlessLocalSchedule(t)
 	root := t.TempDir()
 	bare := filepath.Join(root, "up", "mirror.git")
 	mustGit(t, "", "init", "--bare", "-b", "main", bare)
@@ -135,9 +148,7 @@ func TestLocalHookLiveForwardAndPendingRestart(t *testing.T) {
 // Reproduce a real live consumer covering an authority CAS before receive-pack
 // publishes that same ref in its cache. S3WAL uses owned SeaweedFS, not MemCAS.
 func TestLocalHookForwardBeforeCachePublication(t *testing.T) {
-	if testBackend != backendLocal {
-		t.Skip("SQLite hook scheduling (ADR-50); S3WAL hooks do not schedule (#335)")
-	}
+	skipUnlessLocalSchedule(t)
 	root := t.TempDir()
 	bare := filepath.Join(root, "up", "mirror.git")
 	mustGit(t, "", "init", "--bare", "-b", "main", bare)
@@ -288,14 +299,54 @@ func (u *toggledUpstream) up(t *testing.T) {
 	u.serve(ln)
 }
 
+// readPushSchedule reads repoID's push retry position from the private
+// store at dbURL: the SQLite row, or the S3WAL metadata document.
+func readPushSchedule(t *testing.T, dbURL, repoID string) (attempt int, due int64) {
+	t.Helper()
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Scheme == "sqlite" {
+		db, err := sql.Open("sqlite", "file:"+u.Path+"?mode=ro&_pragma=busy_timeout(5000)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		if err := db.QueryRowContext(t.Context(), `SELECT push_attempt, push_due FROM repo_upstreams WHERE repo_id = ?`, repoID).Scan(&attempt, &due); err != nil {
+			t.Fatal(err)
+		}
+		return attempt, due
+	}
+	assertf(u.Scheme == "s3wal", "readPushSchedule: scheme %q", u.Scheme)
+	client := s3waltest.RawS3Client(u.Query().Get("endpoint"), "us-east-1", s3AccessKey, s3SecretKey)
+	obj, err := client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: aws.String(u.Host), Key: aws.String("_wal/meta.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = obj.Body.Close() }()
+	var doc struct {
+		Upstreams map[string]struct {
+			PushAttempt int   `json:"push_attempt"`
+			PushDue     int64 `json:"push_due"`
+		} `json:"upstreams"`
+	}
+	if err := json.NewDecoder(obj.Body).Decode(&doc); err != nil {
+		t.Fatal(err)
+	}
+	lane, ok := doc.Upstreams[repoID]
+	if !ok {
+		t.Fatalf("metadata document has no upstream for %s", repoID)
+	}
+	return lane.PushAttempt, lane.PushDue
+}
+
 // TestLocalHookForwardBackoffSurvivesRestart: a git push to a forwarding
-// repo while the upstream is down schedules a retry in the SQLite row
+// repo while the upstream is down schedules a retry in the schedule row
 // (attempt 1, due one backoff later). A serve restart keeps it and does not
 // run early; an explicit push-upstream then expedites it and converges.
 func TestLocalHookForwardBackoffSurvivesRestart(t *testing.T) {
-	if testBackend != backendLocal {
-		t.Skip("SQLite hook scheduling (ADR-50); S3WAL hooks do not schedule (#335)")
-	}
+	skipUnlessLocalSchedule(t)
 	root := t.TempDir()
 	bare := filepath.Join(root, "up", "mirror.git")
 	mustGit(t, "", "init", "--bare", "-b", "main", bare)
@@ -321,11 +372,6 @@ func TestLocalHookForwardBackoffSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ms.Close()
-	sqlDB, err := sql.Open("sqlite", "file:"+strings.TrimPrefix(db, "sqlite://")+"?mode=ro&_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqlDB.Close()
 	url := "https://example.com/backoff-forward.git"
 	token := mintTestToken(t, url, "repo:write,git:read,git:write", "")
 	var created struct {
@@ -342,9 +388,7 @@ func TestLocalHookForwardBackoffSurvivesRestart(t *testing.T) {
 	}
 	schedule := func() (attempt int, due int64, up meta.RepoUpstream) {
 		t.Helper()
-		if err := sqlDB.QueryRowContext(t.Context(), `SELECT push_attempt, push_due FROM repo_upstreams WHERE repo_id = ?`, id).Scan(&attempt, &due); err != nil {
-			t.Fatal(err)
-		}
+		attempt, due = readPushSchedule(t, db, id)
 		up, err := ms.GetRepoUpstream(t.Context(), id)
 		if err != nil {
 			t.Fatal(err)

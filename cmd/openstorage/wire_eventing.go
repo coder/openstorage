@@ -450,10 +450,9 @@ func hookWebhookAllowPrivate(logger *slog.Logger) bool {
 // Cross-process queue story (ADR): pg-mode hooks insert durable River jobs
 // worked by the serve process. Local mode has no shared durable queue, so
 // hook deliveries run synchronously (bounded attempts) inside the hook
-// subprocess. On SQLite (ADR-50) an authorized git-surface push records
-// durable intent in the schedule row, and the serve sweep turns it into a
-// run. S3WAL git-surface pushes do NOT schedule upstream syncs (API writes
-// still do; issue #335).
+// subprocess. On the local schedule (SQLite, S3WAL; ADR-50, ADR-51) an
+// authorized git-surface push records durable intent in the schedule row,
+// and the serve sweep turns it into a run.
 func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	org := envconfig.Getenv(envOrg)
 	dbURL := envconfig.First("OPENSTORAGE_PG_URL", "PG_URL")
@@ -530,8 +529,8 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		local := jobs.NewLocal(deliverer, neverRun, neverRun, nil /* hook subprocesses never fold */, logger)
 		cleanups = append(cleanups, local.Close) // waits for in-flight deliveries
 		enqueueDelivery = local.EnqueueWebhookDelivery
-		if _, ok := ms.(meta.LocalScheduleStore); ok {
-			// SQLite: record intent only. The hook never starts a run;
+		if _, ok := meta.LocalSchedule(ms); ok {
+			// SQLite and S3WAL: record intent only. The hook never starts a run;
 			// the serve sweep claims the row once the push's cache refs
 			// are published (the worker's publication wait).
 			denied, pullDenied := hookCallerDeniedForward(), hookCallerDeniedPull()
@@ -544,7 +543,6 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 				func(context.Context) bool { return denied },
 				func(context.Context) bool { return pullDenied })
 		}
-		// S3WAL leaves enqueueSync nil: the documented gap (issue #335).
 	}
 
 	if envconfig.Getenv(githttp.EnvSyncClaim) != "" {
