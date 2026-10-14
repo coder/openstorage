@@ -42,6 +42,7 @@ import (
 
 	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/s3oplog"
 	"github.com/coder/openstorage/internal/secrets"
 )
 
@@ -482,7 +483,9 @@ func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) er
 	if s.keyRefreshEvery == 0 {
 		s.keyRefreshEvery = s3walKeyRefreshInterval
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	// The refresher's GETs are background work, not part of any request:
+	// the op log tags them (issue #484, TestS3WAL_PushOpCensus).
+	ctx, cancel := context.WithCancel(s3oplog.WithScope(context.Background(), s3walKeyRefreshScope))
 	s.refreshCancel = cancel
 	go s.orgKeyRefreshLoop(ctx)
 	return s
@@ -534,6 +537,10 @@ func (s *S3WAL) Close() {
 		s.closeFn()
 	}
 }
+
+// s3walKeyRefreshScope is the op-log scope (s3oplog) of the org-key
+// refresher's round trips.
+const s3walKeyRefreshScope = "keyrefresh"
 
 // orgKeyRefreshLoop keeps the org-key snapshot warm across processes: one
 // goroutine, one conditional GET per keyRefreshEvery (304-answered while

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,12 @@ func parseOpLog(t *testing.T, raw string) []opLogLine {
 	return out
 }
 
+// backgroundScopes are the op-log scopes of serve's background work: the
+// sync schedule (internal/sync opLogScope) and the S3WAL org-key refresher
+// (internal/meta s3walKeyRefreshScope). Their round trips belong to no
+// push, so opLogWindow drops them (issue #484).
+var backgroundScopes = []string{":schedule", ":keyrefresh"}
+
 // opLogWindow reads the op-log lines appended since *offset and advances
 // the offset — one push's window when called around a single git command.
 func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
@@ -84,7 +91,7 @@ func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 	}
 	var push []opLogLine
 	for _, l := range parseOpLog(t, string(window)) {
-		if !strings.HasSuffix(l.role, ":schedule") {
+		if !slices.ContainsFunc(backgroundScopes, func(scope string) bool { return strings.HasSuffix(l.role, scope) }) {
 			push = append(push, l)
 		}
 	}
@@ -126,8 +133,9 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// scanners are already off by default: LFS reclamation and absence
 	// reconciliation ship interval 0, and the reconcile ticker needs the
 	// non-default v0.2.0 write-compat flag (or a partial Heal) to start.
-	// The sync schedule's sweep (ADR-51) is not disabled: opLogWindow
-	// drops its round trips by their op-log scope, and waits for one in
+	// The sync schedule's sweep (ADR-51) and the S3WAL org-key refresher
+	// are not disabled: opLogWindow drops their round trips by their
+	// op-log scope (backgroundScopes), and waits for a sweep pass in
 	// every window. The node gets a private bucket (privateStores), so its
 	// sweep never finds runnable work: a scheduled run's loopback push and
 	// hooks would log without the scope. The pushes start once the first
