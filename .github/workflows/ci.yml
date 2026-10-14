@@ -142,12 +142,16 @@ jobs:
   # the packs/LFS blobs — and drives real `git` against child serve
   # processes: the full shared e2e suite plus the lane-only drills
   # (restart-from-bucket, SIGTERM lease release, dual-serve refusal).
-  # Scoped to ./internal/githttp deliberately: that TestMain is the only
-  # consumer of OPENSTORAGE_TEST_BACKEND, so a full ./... run under this
-  # lane would replay every other package byte-identically with the `test`
-  # job above (the s3wal CAS/qualification suites in internal/ref/s3wal and
-  # the MemCAS-backed s3wal meta suite in internal/meta already run there
-  # unconditionally). The harness itself exports OPENSTORAGE_S3WAL_LEASE_TTL=0
+  # Scoped to ./internal/githttp and the worker-level local-schedule tests
+  # in ./internal/sync deliberately: they are the only consumers of
+  # OPENSTORAGE_TEST_BACKEND, so a full ./... run under this lane would
+  # replay every other package byte-identically with the `test` job above
+  # (the s3wal CAS/qualification suites in internal/ref/s3wal and the
+  # MemCAS-backed s3wal meta suite in internal/meta already run there
+  # unconditionally). The sync step runs the worker-level controls of the
+  # #266 design note (C1 to C9 and C11; C10 lives in cmd/openstorage) on
+  # S3WAL metadata over an in-memory bucket (ADR-51 test plan item 5).
+  # The githttp harness itself exports OPENSTORAGE_S3WAL_LEASE_TTL=0
   # to its serve children (many serve processes legitimately share the one
   # lane bucket); the job only selects the lane.
   test-s3wal:
@@ -160,5 +164,8 @@ jobs:
           go-version-file: go.mod
       - run: git lfs version
       - run: go test ./internal/githttp -count=1 -race -timeout=25m
+        env:
+          OPENSTORAGE_TEST_BACKEND: s3wal
+      - run: go test ./internal/sync -run 'TestLocalSchedule' -count=1 -race -timeout=10m
         env:
           OPENSTORAGE_TEST_BACKEND: s3wal
