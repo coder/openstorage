@@ -126,9 +126,10 @@ func testMode() bool { return envconfig.Getenv(EnvTestMode) == "1" }
 // exactly like API writes (that decorator wraps ref.IdempotentCAS itself).
 // The eventless default keeps hooks working before/without eventing wiring,
 // wrapping just the CAS-recovery decorator so ambiguous outcomes still
-// reconcile.
-var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) ref.RefStore {
-	return ref.IdempotentCAS{RefStore: st}
+// reconcile. An error refuses the ref update before its CAS (issue #445:
+// the metadata store is in a format this binary cannot write events to).
+var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
+	return ref.IdempotentCAS{RefStore: st}, nil
 }
 
 // mustEnv reads an alias chain by presence: an explicitly empty canonical
@@ -1771,7 +1772,10 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	if testMode() {
 		inner = injectCASDrop(inner)
 	}
-	store := WrapHookRefStore(ctx, inner)
+	store, err := WrapHookRefStore(ctx, inner)
+	if err != nil {
+		return err
+	}
 	assertf(store != nil, "WrapHookRefStore returned nil")
 	won, casGen, err := store.CASRefGen(ctx, repo, refName, old, new)
 	if err != nil {

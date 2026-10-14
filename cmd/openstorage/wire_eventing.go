@@ -555,7 +555,20 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		enqueueSync = nil
 	}
 
-	githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) ref.RefStore {
+	githttp.WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
+		// meta.Open reads nothing, so a wrong metadata format would only
+		// surface after the CAS, when emission drops the push's events
+		// (issue #445: a hook binary replaced under an older serve). Read
+		// the format first: a wrong one refuses the update, so no push is
+		// accepted without its events. A failed read keeps failing open,
+		// as for the open error above.
+		if err := meta.CheckFormat(ctx, ms); err != nil {
+			var fv *meta.FormatVersionError
+			if errors.As(err, &fv) {
+				return nil, fmt.Errorf("refusing the ref update: %w", err)
+			}
+			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
+		}
 		return events.NewRefStore(st, events.RefStoreOptions{
 			Org:             org,
 			Repos:           ms,
@@ -563,7 +576,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			EnqueueDelivery: enqueueDelivery,
 			EnqueueSync:     enqueueSync,
 			Logger:          logger,
-		})
+		}), nil
 	}
 	return cleanup
 }
