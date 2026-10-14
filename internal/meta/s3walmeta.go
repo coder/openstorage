@@ -246,16 +246,16 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 	assertf(len(versions) > 0, "decodeS3WALMetaDocVersion: no versions")
 	var doc s3walMetaDoc
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, fmt.Errorf("s3walmeta: document decode: %w", err)
+		return nil, &CorruptDocumentError{Err: fmt.Errorf("document decode: %w", err)}
 	}
 	if !slices.Contains(versions, doc.V) {
 		return nil, &FormatVersionError{Got: doc.V, Want: versions}
 	}
 	if doc.Seq < 1 {
-		return nil, fmt.Errorf("s3walmeta: document seq %d invalid (stored documents start at 1)", doc.Seq)
+		return nil, &CorruptDocumentError{Err: fmt.Errorf("document seq %d invalid (stored documents start at 1)", doc.Seq)}
 	}
 	if doc.Writer == "" {
-		return nil, fmt.Errorf("s3walmeta: document seq %d has no writer nonce", doc.Seq)
+		return nil, &CorruptDocumentError{Err: fmt.Errorf("document seq %d has no writer nonce", doc.Seq)}
 	}
 	assertf(doc.NextOrgID >= 0 && doc.NextKeyID >= 0,
 		"s3walmeta: document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
@@ -280,10 +280,25 @@ func (e *FormatVersionError) Error() string {
 	return fmt.Sprintf("s3walmeta: document version %d unsupported (want %s)", e.Got, wantVersions(e.Want))
 }
 
+// CorruptDocumentError reports a stored metadata document that does not
+// decode or fails a structural guard. Like FormatVersionError it is not
+// transient: the store answered, every metadata read fails on the same
+// bytes, and only a restore helps. The hook refuses on it (issue #466).
+type CorruptDocumentError struct {
+	Err error // what is wrong with the document
+}
+
+func (e *CorruptDocumentError) Error() string {
+	return "s3walmeta: " + s3walMetaKey + " is corrupt (" + e.Err.Error() + "): do not edit it; keep serve stopped and restore the bucket from a verified stopped-node backup (docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover)"
+}
+
+func (e *CorruptDocumentError) Unwrap() error { return e.Err }
+
 // CheckFormat reads b's stored metadata document once and returns its
-// error: a *FormatVersionError when the format is wrong, a store error
-// when the read failed, nil otherwise (including a missing document, the
-// empty state). Backends without a format version (PostgreSQL, SQLite)
+// error: a *FormatVersionError when the format is wrong, a
+// *CorruptDocumentError when the document is damaged, a store error when
+// the read failed, nil otherwise (including a missing document, the empty
+// state). Backends without a format version (PostgreSQL, SQLite)
 // return nil without I/O. meta.Open never reads the document, so this is
 // the cheap way to learn the format before a write that must not proceed
 // on the wrong one.

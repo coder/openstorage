@@ -10,11 +10,19 @@
 > upgrade procedure. S3WAL stays experimental. Nothing here changes a
 > [#192](https://github.com/coder/openstorage/issues/192) promotion gate.
 >
-> **Amended by [#445](https://github.com/coder/openstorage/issues/445):** a v2 hook on a
-> v1 document now refuses the ref update with the conversion hint and writes nothing.
-> It no longer accepts the push without its events. A metadata store the hook cannot
-> reach still fails open. Fact 5, the missed-step note, the `hook` row of the
+> **Amended by [#445](https://github.com/coder/openstorage/issues/445) and
+> [#466](https://github.com/coder/openstorage/issues/466):** a v2 hook on a v1 document
+> now refuses the ref update with the conversion hint and writes nothing. A document that
+> does not decode is refused the same way, with a pointer to the stopped-node restore.
+> The hook no longer accepts such a push without its events. A metadata store the hook
+> cannot reach still fails open. Fact 5, the missed-step note, the `hook` row of the
 > mixed-version table, and test-plan item 1 below predate that change.
+>
+> **Known limit (#466):** the hook checks the document before its ref update, not
+> inside it. A conversion that runs between the check and the update lets that push
+> commit without its events. The procedure stops `serve` and its hooks before any
+> conversion, which closes the window. Closing it in code would need a format check
+> inside every push's update.
 
 ## Context
 

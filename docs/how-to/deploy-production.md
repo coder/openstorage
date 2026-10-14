@@ -822,6 +822,19 @@ release first.
 The downgrade keeps all data. It loses retry backoff positions, and every repository's
 create state reads legacy, so a repeat create answers 409.
 
+**Hook refusals.** A v2 hook refuses a ref update when `_wal/meta.json` has the wrong
+format version or does not decode (`_wal/meta.json is corrupt`). It writes nothing. For a
+corrupt document, keep `serve` stopped and
+[restore from a verified stopped-node backup](backup-restore-s3wal.md#restore-and-validate-before-cutover).
+Do not edit the document. If the hook cannot reach the store, it still accepts the push
+without its webhooks.
+
+**Known limit: the check-to-update window.** The hook checks the document before its ref
+update, not inside it. A conversion that runs while a push is between the check and its
+ref update lets that push commit without its webhooks and its push and pull intent.
+Step 1 of both procedures closes this window: stop `serve` and wait for its hook
+children before you convert.
+
 ### S3WAL shutdown and restart
 
 > [!WARNING]

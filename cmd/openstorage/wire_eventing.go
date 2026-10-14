@@ -559,12 +559,19 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		// meta.Open reads nothing, so a wrong metadata format would only
 		// surface after the CAS, when emission drops the push's events
 		// (issue #445: a hook binary replaced under an older serve). Read
-		// the format first: a wrong one refuses the update, so no push is
-		// accepted without its events. A failed read keeps failing open,
-		// as for the open error above.
+		// the document first: a wrong format or a corrupt document (issue
+		// #466) refuses the update, so no push is accepted without its
+		// events. A failed read keeps failing open, as for the open error
+		// above.
+		//
+		// Known limit (issue #466): a format change between this check and
+		// the CAS still commits the push without events. Formats change
+		// only while serve and its hooks are stopped, and closing the
+		// window would need a format check inside every push's CAS.
 		if err := meta.CheckFormat(ctx, ms); err != nil {
 			var fv *meta.FormatVersionError
-			if errors.As(err, &fv) {
+			var cd *meta.CorruptDocumentError
+			if errors.As(err, &fv) || errors.As(err, &cd) {
 				return nil, fmt.Errorf("refusing the ref update: %w", err)
 			}
 			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
