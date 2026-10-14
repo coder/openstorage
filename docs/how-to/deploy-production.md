@@ -483,7 +483,12 @@ instance-lease release, plus margin. When the server exits, or when that timeout
 systemd sends `SIGKILL` to every process left, and a server killed during lease release
 leaves the lease behind. The
 [AWS reference unit](../../deploy/terraform/aws/bootstrap/openstorage.service) uses
-`KillMode=mixed` and `TimeoutStopSec=30s`.
+`KillMode=mixed` and `TimeoutStopSec=30s`. Under Docker, `docker stop` sends `SIGTERM` to
+the server only, because it is the container's main process, and `SIGKILL` after 10
+seconds by default. Raise that timeout to at least 20 seconds too: set
+`stop_grace_period` in Compose or pass `--stop-timeout` to `docker run`. The
+[Compose file](../../docker-compose.yml) and the
+[quickstart Compose file](../../compose.quickstart.yml) use `stop_grace_period: 30s`.
 
 **Interrupted work cannot corrupt data.** Pack data reaches the bucket *before* any ref
 moves, so a killed push never leaves a ref pointing at missing objects. It can leave
@@ -722,7 +727,7 @@ This is a deliberate single-node design that trades throughput for zero infrastr
 | One CAS point per repository group | Concurrent pushes to the *same* repository serialize on one object; hot-repo write throughput is a handful of ref flips per second, and contention shows up as CAS retries. Different repositories don't contend. |
 | Every ref/metadata operation is an S3 round trip | Latency floors are S3 latency, not local-disk or Postgres latency. Same-region compute is assumed. |
 | Manifest size | A repository group's whole registry lives in one JSON object: growth-guarded mutations warn above 4 MiB and are refused above 16 MiB; see the [size-guard scope](#s3wal-operational-signals) below. |
-| Background jobs are in-process | Tickers, no durable River queue: queued webhook deliveries and other in-process jobs die with the process. The sync and push schedule, including retry backoffs, lives in the metadata document, as it lives in SQLite in local mode. Its sweep reads that document once a second, idle or not: about 86,400 conditional GETs a day, and a full decode of the document on each pass (measured at about 2.5 ms per 1,000 repositories). A git push only records its sync work: when the schedule is idle, the next pass starts the forward or pull within about a second. The first pass runs 15 s after boot, so a push in those first seconds waits for it. Each pass picks up at most 16 due repositories and runs at most 4 sweep-started jobs at once, so under load a pushed ref can wait several passes. |
+| Background jobs are in-process | Tickers, no durable River queue: queued webhook deliveries and other in-process jobs die with the process. The sync and push schedule, including retry backoffs, lives in the metadata document, as it lives in SQLite in local mode. Its sweep reads that document once a second, idle or not: about 86,400 conditional GETs a day. A quiet pass reuses the decoded document, so it costs a scan of the lanes, not a decode (measured at about 0.4 ms per pass at 10,000 repositories, against about 22 ms for a decode). A git push only records its sync work: when the schedule is idle, the next pass starts the forward or pull within about a second. The first pass runs 15 s after boot, so a push in those first seconds waits for it. Each pass picks up at most 16 due repositories and runs at most 4 sweep-started jobs at once, so under load a pushed ref can wait several passes. |
 
 If any of these bind, use local mode (SQLite on a persistent volume) or the Postgres
 topology. Small single-tenant deployments, the target, sit far below them.
