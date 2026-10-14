@@ -268,6 +268,26 @@ openstorage never removes this lock itself. It cannot prove that no live process
 the lock: a crashed server can leave its Git child running, and other Git processes do
 not take openstorage's lock.
 
+**Stale ref locks.** A Git process killed inside a ref transaction (SIGKILL, the OOM
+killer, a crash) can leave `refs/<name>.lock` or `packed-refs.lock` in a cache repository.
+Every later hydration of that repository then fails with Git's `Unable to create
+'<path>.lock': File exists`, so clones and fetches of it fail on that replica. When a ref
+update fails, hydration logs `hydrate <repo>: <n> ref lock(s) older than 1m0s block ref
+updates`. openstorage never removes a ref lock itself, for the same reason as above. To
+recover, rebuild that repository's cache:
+
+1. Take the repository path from that log line (the text after `hydrate`). It is
+   `<cache dir>/<repo ID>.git`, built from the cache directory and the validated repo ID.
+   Use only that path. Never build a path from a ref name: ref names can contain shell
+   syntax such as `$(...)`.
+2. Drain and stop the replica, and make sure no Git process works in the cache, as in
+   steps 2 and 3 above.
+3. Delete that repository's cache directory, for example
+   `rm -rf -- '<cache dir>/<repo ID>.git'`. Losing the cache is safe (see
+   [Local disk: the cache directory](#local-disk-the-cache-directory)).
+4. Start the replica. The next clone or fetch hydrates the repository again from the
+   ref store and the bucket.
+
 ## Concurrent boot: schema setup and migrations
 
 Replicas race at boot by design: deploy tooling starts them all at once against the same

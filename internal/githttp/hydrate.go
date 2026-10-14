@@ -1301,20 +1301,27 @@ func (b *refCmdBatch) flush() error {
 	}
 	holds, _ := b.holds.load()
 	var sb strings.Builder
-	kept := 0
+	var kept []string
 	for _, c := range b.cmds {
 		if holds.covers(c.name) {
 			b.skipped = true
 			continue
 		}
 		sb.WriteString(c.line)
-		kept++
+		kept = append(kept, c.name)
 	}
 	b.cmds = b.cmds[:0]
-	if kept == 0 {
+	if len(kept) == 0 {
 		return nil
 	}
-	return updateRefStdin(b.repoPath, sb.String())
+	err := updateRefStdin(b.repoPath, sb.String())
+	if err != nil {
+		// A git killed inside its ref transaction leaves a lock that fails
+		// every later batch for that ref (issue #464). Name it for the
+		// operator; removing it safely needs a stopped replica.
+		reportOldRefLocks(b.repoPath, kept)
+	}
+	return err
 }
 
 // syncRefsStreamed makes the local ref store match the given stream exactly
