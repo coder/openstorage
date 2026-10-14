@@ -390,17 +390,17 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	check := func(n *testNode, label string) string {
 		t.Helper()
 		if apiGet(t, n, "invalid", "/api/v1/repo", nil) != http.StatusUnauthorized {
-			t.Fatal("candidate did not reject unauthenticated access")
+			t.Fatal(label + " did not reject unauthenticated access")
 		}
 		var got repoMetadata
 		if apiGet(t, n, token, "/api/v1/repo", &got) != http.StatusOK || got != wantRepo {
-			t.Fatal("candidate repository metadata differs")
+			t.Fatal(label + " repository metadata differs")
 		}
 		var hooks struct {
 			Webhooks []webhookMetadata `json:"webhooks"`
 		}
 		if apiGet(t, n, orgToken, "/api/v1/webhooks", &hooks) != http.StatusOK || len(hooks.Webhooks) != 1 || hooks.Webhooks[0] != wantHook {
-			t.Fatal("candidate webhook metadata differs")
+			t.Fatal(label + " webhook metadata differs")
 		}
 		clone := filepath.Join(t.TempDir(), "clone")
 		git("", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.required=false", "clone", remoteURL(n, created.RepoID, token), clone)
@@ -408,11 +408,11 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 		git(clone, "lfs", "pull")
 		git(clone, "fsck", "--strict")
 		if git(clone, "rev-parse", "HEAD") != head {
-			t.Fatal("candidate Git HEAD differs")
+			t.Fatal(label + " Git HEAD differs")
 		}
 		gotBytes, err := os.ReadFile(filepath.Join(clone, "asset.bin"))
 		if err != nil || !bytes.Equal(gotBytes, content) {
-			t.Fatal("candidate LFS bytes differ")
+			t.Fatal(label + " LFS bytes differ")
 		}
 		phase(label + ": old token accepted, invalid token rejected; repo/webhook metadata equal; Git HEAD/fsck and materialized LFS bytes equal")
 		return clone
@@ -436,6 +436,17 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	stop(candidate, "candidate-first")
 	second := start(upgradePair.CandidateBinary, "candidate-second")
 	check(second, "candidate")
+	// A candidate-written create_state (v2) must survive convert --to 1 for
+	// the official release.
+	const candidateRepo = "upgrade-candidate-fixture"
+	candidateToken := mintTestToken(t, candidateRepo, "repo:write", "")
+	var candidateCreated struct {
+		RepoID string `json:"repo_id"`
+	}
+	if status := apiJSON(t, second, http.MethodPost, candidateToken, "/api/v1/repos", `{"default_branch":"main"}`, &candidateCreated); status != http.StatusCreated || candidateCreated.RepoID == "" {
+		t.Fatalf("candidate create repo status=%d", status)
+	}
+	phase("candidate: authenticated repo create (stored create_state) accepted")
 	stop(second, "candidate-second")
 	// The supported downgrade (ADR-51 D8): convert back, then the official
 	// release serves everything the candidate wrote.
@@ -443,6 +454,11 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	refuse(upgradePair.CandidateBinary, "candidate-on-v1-again", "document version 1 needs conversion")
 	back := start(upgradePair.OldBinary, "official-downgrade")
 	check(back, "official after --to 1")
+	var candidateGot repoMetadata
+	if apiGet(t, back, candidateToken, "/api/v1/repo", &candidateGot) != http.StatusOK || candidateGot.RepoID != candidateCreated.RepoID || candidateGot.RepoName != candidateRepo || candidateGot.DefaultBranch != "main" {
+		t.Fatal("official after --to 1: candidate-created repository metadata invalid")
+	}
+	phase("official after --to 1: candidate-created repository readable with its token")
 	stop(back, "official-downgrade")
 	phase("PASS: exact official-to-candidate-to-official fixture; conversion both ways verified; all application writers reaped")
 }
