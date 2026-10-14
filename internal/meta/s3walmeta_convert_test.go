@@ -366,7 +366,8 @@ func TestS3WALMetaConvertRace(t *testing.T) {
 			var racedETag string
 			cas := &raceCAS{MemCAS: mem, before: func() {
 				doc, _ := storedS3WALMeta(t, mem)
-				doc.Orgs["raced"] = &s3walMetaOrg{ID: 9, PublicKeys: []string{"pem"}}
+				doc.NextOrgID++ // mint like a real writer: decode rejects ids above the counter (#478)
+				doc.Orgs["raced"] = &s3walMetaOrg{ID: doc.NextOrgID, PublicKeys: []string{"pem"}}
 				putS3WALMeta(t, mem, doc, from)
 				obj, err := mem.Get(ctx, s3walMetaKey)
 				if err != nil {

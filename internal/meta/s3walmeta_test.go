@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,11 +33,21 @@ func TestS3WALMetaDecode(t *testing.T) {
 		{"malformed JSON", `{`, "s3walmeta: _wal/meta.json is corrupt (document decode:"},
 		{"seq zero", `{"v":2,"seq":0,"writer":"w"}`, "document seq 0 invalid"},
 		{"no writer", `{"v":2,"seq":1}`, "document seq 1 has no writer nonce"},
+		// Impossible id counters (issue #478): typed, never a panic.
+		{"negative org counter", `{"v":2,"seq":1,"writer":"w","next_org_id":-1,"next_key_id":0}`, "document seq 1 has negative id counters (-1, 0)"},
+		{"negative key counter", `{"v":2,"seq":1,"writer":"w","next_org_id":0,"next_key_id":-3}`, "document seq 1 has negative id counters (0, -3)"},
+		{"org id zero", `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":0,"created_at":1,"public_keys":[]}}}`, `document seq 1: org "o" has id 0 outside 1..1`},
+		{"org id above counter", `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":2,"created_at":1,"public_keys":[]}}}`, `document seq 1: org "o" has id 2 outside 1..1`},
+		{"duplicate org id", `{"v":2,"seq":1,"writer":"w","next_org_id":2,"next_key_id":0,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[]},"b":{"id":1,"created_at":1,"public_keys":[]}}}`, "document seq 1: org id 1 is used twice"},
+		{"key id above counter", `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":1,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":2,"key_text":"k","created_at":1}]}}}`, `document seq 1: org "o" signing key id 2 outside 1..1`},
+		{"null org row", `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":null}}`, `document seq 1: org "o" has no row`},
+		{"duplicate key id", `{"v":2,"seq":1,"writer":"w","next_org_id":2,"next_key_id":1,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":1,"key_text":"k","created_at":1}]},"b":{"id":2,"created_at":1,"public_keys":[],"signing_keys":[{"id":1,"key_text":"k","created_at":1}]}}}`, "document seq 1: signing key id 1 is used twice"},
 		{"missing version", `{` + fields, "s3walmeta: document version 0 unsupported (want 2)"},
 		{"zero version", `{"v":0,` + fields, "s3walmeta: document version 0 unsupported (want 2)"},
 		{"v1 needs conversion", `{"v":1,` + fields, "s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2`"},
 		{"foreign version", `{"v":3,` + fields, "s3walmeta: document version 3 unsupported (want 2)"},
 		{"valid v2", `{"v":2,` + fields, ""},
+		{"valid v2 with ids", `{"v":2,"seq":1,"writer":"w","next_org_id":3,"next_key_id":2,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":2,"key_text":"k","created_at":1}]},"b":{"id":3,"created_at":1,"public_keys":[]}}}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			doc, err := decodeS3WALMetaDoc([]byte(tc.body))
@@ -65,6 +76,12 @@ func TestS3WALMetaDecode(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+			if tc.name == "valid v2 with ids" {
+				if doc == nil || doc.NextOrgID != 3 || doc.NextKeyID != 2 || len(doc.Orgs) != 2 {
+					t.Fatalf("decoded document = %+v, want the valid control with ids", doc)
+				}
+				return
 			}
 			if doc == nil || doc.V != 2 || doc.Seq != 1 || doc.Writer != "0123456789abcdef0123456789abcdef" || doc.NextOrgID != 0 || doc.NextKeyID != 0 {
 				t.Fatalf("decoded document = %+v, want the valid v2 control", doc)
@@ -144,6 +161,52 @@ func TestCheckFormat(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+// countGetsCAS counts document reads, so a test can wait for the org-key
+// refresher to run.
+type countGetsCAS struct {
+	s3wal.ConditionalStore
+	reads atomic.Int32
+}
+
+func (c *countGetsCAS) Get(ctx context.Context, key string) (s3wal.Object, error) {
+	c.reads.Add(1)
+	return c.ConditionalStore.Get(ctx, key)
+}
+
+func (c *countGetsCAS) GetIfChanged(ctx context.Context, key, etag string) (s3wal.Object, error) {
+	c.reads.Add(1)
+	return c.ConditionalStore.GetIfChanged(ctx, key, etag)
+}
+
+// TestS3WALMetaCorruptCountersNoPanic (issue #478): a stored document with
+// a negative id counter is damaged input, so the store returns the typed
+// error to every reader, and its org-key refresher keeps running. Before
+// the fix, the decode assertion panicked serve and the hook.
+func TestS3WALMetaCorruptCountersNoPanic(t *testing.T) {
+	mem := s3wal.NewMemCAS()
+	body := []byte(`{"v":2,"seq":4,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`)
+	if _, err := mem.Create(t.Context(), s3walMetaKey, body); err != nil {
+		t.Fatal(err)
+	}
+	cas := &countGetsCAS{ConditionalStore: mem}
+	st := newS3WALStore(cas, nil, nil, resolveOptions([]Option{withKeyRefreshInterval(time.Millisecond)}))
+	t.Cleanup(st.Close)
+	var cd *CorruptDocumentError
+	if _, err := st.GetRepoByID(t.Context(), "o", "repo-1"); !errors.As(err, &cd) {
+		t.Fatalf("GetRepoByID = %v, want a *CorruptDocumentError", err)
+	}
+	if err := CheckFormat(t.Context(), st); !errors.As(err, &cd) || !strings.Contains(err.Error(), "negative id counters") {
+		t.Fatalf("CheckFormat = %v, want the negative-counter *CorruptDocumentError", err)
+	}
+	for start := cas.reads.Load(); cas.reads.Load() < start+3; {
+		time.Sleep(time.Millisecond) // a panicking refresher kills the test binary
+	}
+	got, _ := mem.Get(t.Context(), s3walMetaKey)
+	if !bytes.Equal(got.Body, body) {
+		t.Fatalf("the store changed the document: %s", got.Body)
+	}
 }
 
 // s3walBackend is the s3wal lane fixture: a fresh MemCAS-backed store per

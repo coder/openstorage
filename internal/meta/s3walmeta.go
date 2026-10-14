@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	mrand "math/rand/v2"
 	"slices"
 	"sort"
@@ -257,9 +258,47 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 	if doc.Writer == "" {
 		return nil, &CorruptDocumentError{Err: fmt.Errorf("document seq %d has no writer nonce", doc.Seq)}
 	}
-	assertf(doc.NextOrgID >= 0 && doc.NextKeyID >= 0,
-		"s3walmeta: document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
+	if err := doc.checkIDs(); err != nil {
+		return nil, &CorruptDocumentError{Err: err}
+	}
 	return &doc, nil
+}
+
+// checkIDs rejects id counters no writer can produce (issue #478): the
+// bytes come from the bucket, so a violation is a damaged document, not a
+// broken invariant, and must not panic serve or the hook. Writers mint ids
+// as counter+1, so every org id lies in 1..NextOrgID and every signing key
+// id in 1..NextKeyID, each used once. With these checked, lookupOrg's
+// positive-id assertion stays a real internal invariant.
+func (doc *s3walMetaDoc) checkIDs() error {
+	if doc.NextOrgID < 0 || doc.NextKeyID < 0 {
+		return fmt.Errorf("document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
+	}
+	orgIDs := make(map[int64]bool, len(doc.Orgs))
+	keyIDs := make(map[int64]bool)
+	for _, name := range slices.Sorted(maps.Keys(doc.Orgs)) { // sorted: one stable message
+		org := doc.Orgs[name]
+		if org == nil {
+			return fmt.Errorf("document seq %d: org %q has no row", doc.Seq, name)
+		}
+		if org.ID < 1 || org.ID > doc.NextOrgID {
+			return fmt.Errorf("document seq %d: org %q has id %d outside 1..%d", doc.Seq, name, org.ID, doc.NextOrgID)
+		}
+		if orgIDs[org.ID] {
+			return fmt.Errorf("document seq %d: org id %d is used twice", doc.Seq, org.ID)
+		}
+		orgIDs[org.ID] = true
+		for _, key := range org.SigningKeys {
+			if key.ID < 1 || key.ID > doc.NextKeyID {
+				return fmt.Errorf("document seq %d: org %q signing key id %d outside 1..%d", doc.Seq, name, key.ID, doc.NextKeyID)
+			}
+			if keyIDs[key.ID] {
+				return fmt.Errorf("document seq %d: signing key id %d is used twice", doc.Seq, key.ID)
+			}
+			keyIDs[key.ID] = true
+		}
+	}
+	return nil
 }
 
 // FormatVersionError reports a readable metadata document whose format

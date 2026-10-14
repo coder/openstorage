@@ -118,6 +118,8 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
 		{"no writer", `{"v":2,"seq":3,"next_org_id":1,"next_key_id":0}`,
 			[]string{"_wal/meta.json is corrupt (document seq 3 has no writer nonce)", "backup-restore-s3wal.md"}},
+		{"negative counter", `{"v":2,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`,
+			[]string{"_wal/meta.json is corrupt (document seq 3 has negative id counters (-1, 0))", "backup-restore-s3wal.md"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeMetaS3{body: []byte(tc.body)}
