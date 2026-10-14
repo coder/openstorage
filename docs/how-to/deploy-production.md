@@ -483,7 +483,12 @@ instance-lease release, plus margin. When the server exits, or when that timeout
 systemd sends `SIGKILL` to every process left, and a server killed during lease release
 leaves the lease behind. The
 [AWS reference unit](../../deploy/terraform/aws/bootstrap/openstorage.service) uses
-`KillMode=mixed` and `TimeoutStopSec=30s`.
+`KillMode=mixed` and `TimeoutStopSec=30s`. Under Docker, `docker stop` sends `SIGTERM` to
+the server only, because it is the container's main process, and `SIGKILL` after 10
+seconds by default. Raise that timeout to at least 20 seconds too: set
+`stop_grace_period` in Compose or pass `--stop-timeout` to `docker run`. The
+[Compose file](../../docker-compose.yml) and the
+[quickstart Compose file](../../compose.quickstart.yml) use `stop_grace_period: 30s`.
 
 **Interrupted work cannot corrupt data.** Pack data reaches the bucket *before* any ref
 moves, so a killed push never leaves a ref pointing at missing objects. It can leave
