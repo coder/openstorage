@@ -26,10 +26,11 @@ const s3walConvertReleaseTimeout = 5 * time.Second
 
 func cmdS3WALMeta(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] != "convert" {
-		return errors.New("usage: openstorage s3wal-meta convert --to <1|2>")
+		return errors.New("usage: openstorage s3wal-meta convert --to <1|2> [--force]")
 	}
 	fs := flag.NewFlagSet("s3wal-meta convert", flag.ExitOnError)
 	to := fs.Int("to", 0, "target metadata format version: 2 to upgrade, 1 to downgrade")
+	force := fs.Bool("force", false, "with --to 1: convert even while a fork or copy create is unfinished")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -38,6 +39,9 @@ func cmdS3WALMeta(ctx context.Context, args []string) error {
 	}
 	if *to != 1 && *to != 2 {
 		return errors.New("--to must be 1 or 2")
+	}
+	if *force && *to != 1 {
+		return errors.New("--force applies only to --to 1")
 	}
 	urls, err := resolveStorageURLs(envconfig.LookupEnv, "")
 	if err != nil {
@@ -60,7 +64,7 @@ func cmdS3WALMeta(ctx context.Context, args []string) error {
 	if err := s3wal.Probe(ctx, c); err != nil {
 		return fmt.Errorf("s3wal-meta convert: %w", err)
 	}
-	return runS3WALMetaConvert(ctx, c, *to, s3wal.LeaseConfig{}, os.Stdout)
+	return runS3WALMetaConvert(ctx, c, *to, meta.S3WALConvertOptions{Force: *force}, s3wal.LeaseConfig{}, os.Stdout)
 }
 
 // runS3WALMetaConvert converts under the instance lease. It ignores
@@ -68,7 +72,7 @@ func cmdS3WALMeta(ctx context.Context, args []string) error {
 // (which holds a fresh lease) makes it refuse. The conversion context is
 // cancelled when a renewal fails, and the heartbeat is joined before the
 // lease is released.
-func runS3WALMetaConvert(ctx context.Context, cs s3wal.ConditionalStore, to int, lc s3wal.LeaseConfig, out io.Writer) error {
+func runS3WALMetaConvert(ctx context.Context, cs s3wal.ConditionalStore, to int, opts meta.S3WALConvertOptions, lc s3wal.LeaseConfig, out io.Writer) error {
 	assertf(cs != nil && out != nil, "runS3WALMetaConvert: nil store or writer")
 	lease, err := s3wal.AcquireInstanceLease(ctx, cs, lc)
 	if err != nil {
@@ -83,7 +87,7 @@ func runS3WALMetaConvert(ctx context.Context, cs s3wal.ConditionalStore, to int,
 		}
 		hbDone <- err
 	}()
-	res, convErr := meta.ConvertS3WALMeta(cctx, cs, to)
+	res, convErr := meta.ConvertS3WALMeta(cctx, cs, to, opts)
 	cancel(nil)
 	hbErr := <-hbDone
 	rctx, rcancel := context.WithTimeout(context.Background(), s3walConvertReleaseTimeout)
@@ -103,6 +107,18 @@ func runS3WALMetaConvert(ctx context.Context, cs s3wal.ConditionalStore, to int,
 	default:
 		fmt.Fprintf(out, "converted version %d -> %d (seq %d -> %d), verified\n", res.From, res.To, res.SeqBefore, res.SeqAfter)
 		fmt.Fprintf(out, "rows before: %s\nrows after:  %s\n", formatS3WALMetaCounts(res.Before), formatS3WALMetaCounts(res.After))
+		if n := len(res.RepairedSyncCreates); n > 0 {
+			fmt.Fprintf(out, "unfinished sync creates: %d, first sync requested (the v1 release runs it at boot): %s\n",
+				n, strings.Join(res.RepairedSyncCreates, ", "))
+		}
+		if n := len(res.ForcedCreates); n > 0 {
+			names := make([]string, n)
+			for i, c := range res.ForcedCreates {
+				names[i] = fmt.Sprintf("%s (%s)", c.RepoID, c.URL)
+			}
+			fmt.Fprintf(out, "--force: %d unfinished fork or copy creates now read as finished, possibly empty repositories: %s\n",
+				n, strings.Join(names, ", "))
+		}
 	}
 	return nil
 }

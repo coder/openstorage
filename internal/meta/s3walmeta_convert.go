@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/coder/openstorage/internal/ref/s3wal"
@@ -34,6 +36,42 @@ type S3WALMetaConversion struct {
 	SeqBefore, SeqAfter int64
 	// Before and After count the rows of the source and the result.
 	Before, After S3WALMetaCounts
+	// RepairedSyncCreates (--to 1) lists the pending sync creates whose
+	// first-sync request the conversion recorded, by repo ID.
+	RepairedSyncCreates []string
+	// ForcedCreates (--to 1 with Force) lists the pending fork or copy
+	// creates that now read as finished.
+	ForcedCreates []S3WALPendingCreate
+}
+
+// S3WALConvertOptions changes how ConvertS3WALMeta treats unfinished
+// creates on --to 1.
+type S3WALConvertOptions struct {
+	// Force converts even when a fork or copy create is unfinished.
+	Force bool
+}
+
+// S3WALPendingCreate is a live repo whose create had not finished.
+type S3WALPendingCreate struct {
+	RepoID, URL string
+}
+
+// S3WALPendingCreatesError refuses --to 1 while fork or copy creates are
+// unfinished: v1 stores no create state, so on a v1 release each one reads
+// as a finished, possibly empty repository. Nothing was written.
+type S3WALPendingCreatesError struct {
+	Creates []S3WALPendingCreate
+}
+
+func (e *S3WALPendingCreatesError) Error() string {
+	names := make([]string, len(e.Creates))
+	for i, c := range e.Creates {
+		names[i] = fmt.Sprintf("%s (%s)", c.RepoID, c.URL)
+	}
+	return fmt.Sprintf("s3walmeta convert: %d unfinished fork or copy create(s): %s. "+
+		"A v1 release reads them as finished, possibly empty repositories. "+
+		"Start serve on this release, remove them with DELETE /repos/delete, stop serve and convert again, "+
+		"or rerun with --force to downgrade anyway", len(e.Creates), strings.Join(names, ", "))
 }
 
 // s3walConvertAttempts bounds lost-race retries, as mutate does.
@@ -43,10 +81,13 @@ const s3walConvertAttempts = 16
 // (1 or 2). It applies the zero-value rule of ADR-51: to 2 changes only
 // the version; to 1 drops the four v2 fields and sets sync_pending on
 // every lane whose pull claim is set, so v1 boot recovery of any release
-// restarts that pull. After the write it re-reads the document and checks
-// it equals the expected conversion of the source. Re-running on a
-// document at the target version writes nothing.
-func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int) (S3WALMetaConversion, error) {
+// restarts that pull. It also sets sync_pending for every unfinished sync
+// create, which v1 then completes with its first sync, and refuses with
+// *S3WALPendingCreatesError (nothing written) while a fork or copy create
+// is unfinished, unless opts.Force. After the write it re-reads the
+// document and checks it equals the expected conversion of the source.
+// Re-running on a document at the target version writes nothing.
+func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int, opts S3WALConvertOptions) (S3WALMetaConversion, error) {
 	assertf(cs != nil, "ConvertS3WALMeta: nil conditional store")
 	if to != s3walMetaV1 && to != s3walMetaV2 {
 		return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: target version %d unsupported (want 1 or 2)", to)
@@ -72,9 +113,16 @@ func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int) (S
 		if src.V == to {
 			return res, nil
 		}
-		want, err := convertS3WALMetaDoc(obj.Body, to)
+		want, pending, err := convertS3WALMetaDoc(obj.Body, to)
 		if err != nil {
 			return S3WALMetaConversion{}, err
+		}
+		res.RepairedSyncCreates = pending.repaired
+		if len(pending.blocked) > 0 {
+			if !opts.Force {
+				return S3WALMetaConversion{}, &S3WALPendingCreatesError{Creates: pending.blocked}
+			}
+			res.ForcedCreates = pending.blocked
 		}
 		body, err := want.encodeNext()
 		if err != nil {
@@ -122,19 +170,41 @@ func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int) (S
 	return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: %d attempts: %w", s3walConvertAttempts, s3wal.ErrCASContention)
 }
 
+// s3walPendingCreates sorts the unfinished creates a --to 1 conversion
+// found: sync creates it repaired, and fork or copy creates it cannot.
+type s3walPendingCreates struct {
+	repaired []string
+	blocked  []S3WALPendingCreate
+}
+
 // convertS3WALMetaDoc decodes body (v1 or v2) fresh and applies the ADR-51
 // conversion to version to. Decoding fresh keeps the result from aliasing
 // any snapshot the caller compares against.
-func convertS3WALMetaDoc(body []byte, to int) (*s3walMetaDoc, error) {
+func convertS3WALMetaDoc(body []byte, to int) (*s3walMetaDoc, s3walPendingCreates, error) {
+	var pending s3walPendingCreates
 	doc, err := decodeS3WALMetaDocVersion(body, s3walMetaV1, s3walMetaV2)
 	if err != nil {
-		return nil, fmt.Errorf("s3walmeta convert: %w", err)
+		return nil, pending, fmt.Errorf("s3walmeta convert: %w", err)
 	}
 	doc.V = to
 	if to == s3walMetaV1 {
-		for _, r := range doc.Repos {
+		for id, r := range doc.Repos {
+			if r.DeletedAt == 0 && CreateState(r.CreateState) == CreateStatePending {
+				// A sync create has its upstream link: record the first
+				// sync it is still owed, as CompleteSyncRepoCreate would.
+				// A fork or copy has none (nor has a sync create whose
+				// link was removed, which serve treats like a crashed fork).
+				if u := doc.Upstreams[id]; u != nil && !u.Detaching {
+					u.SyncPending = true
+					pending.repaired = append(pending.repaired, id)
+				} else {
+					pending.blocked = append(pending.blocked, S3WALPendingCreate{RepoID: id, URL: r.URL})
+				}
+			}
 			r.CreateState = 0
 		}
+		sort.Strings(pending.repaired)
+		sort.Slice(pending.blocked, func(i, j int) bool { return pending.blocked[i].RepoID < pending.blocked[j].RepoID })
 		for _, u := range doc.Upstreams {
 			u.PushAttempt, u.PushDue, u.SyncDue = 0, 0, 0
 			// A pull claim consumed sync_pending. v1 releases before
@@ -146,7 +216,7 @@ func convertS3WALMetaDoc(body []byte, to int) (*s3walMetaDoc, error) {
 			}
 		}
 	}
-	return doc, nil
+	return doc, pending, nil
 }
 
 // verifyS3WALMetaConversion re-reads the stored document and checks it is
