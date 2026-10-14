@@ -615,8 +615,8 @@ func (s *PG) FinishSync(ctx context.Context, repoID, holder string, success bool
 }
 
 // RunRestoreStore ends runs that serve's shutdown cancelled without counting
-// them (issue #343). Only *PG implements it: SQLite restores through
-// LocalScheduleStore (ADR-50), and S3WAL runs are never shutdown-cancelled.
+// them (issue #343). Only *PG implements it: SQLite and S3WAL restore
+// through LocalSchedule (ADR-50, ADR-51).
 type RunRestoreStore interface {
 	RestoreSync(ctx context.Context, repoID, holder string) (RepoUpstream, error)
 	RestorePush(ctx context.Context, repoID, holder string, force bool) (RepoUpstream, error)

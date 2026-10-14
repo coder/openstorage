@@ -484,7 +484,8 @@ func (s *S3WAL) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch st
 			if doc.Repos == nil {
 				doc.Repos = make(map[string]*s3walMetaRepo)
 			}
-			doc.Repos[repoID] = &s3walMetaRepo{OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: nanos}
+			doc.Repos[repoID] = &s3walMetaRepo{OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: nanos,
+				CreateState: int(CreateStatePending)}
 			if cred != nil {
 				if doc.Credentials == nil {
 					doc.Credentials = make(map[string]*s3walMetaCredential)
@@ -498,7 +499,8 @@ func (s *S3WAL) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch st
 				Provider: up.Provider, Owner: up.Owner, Name: up.Name, UpstreamHost: up.UpstreamHost,
 				ForwardOnPush: up.ForwardOnPush, CreatedAt: nanos,
 			}
-			repo = Repo{RepoID: repoID, OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt}
+			repo = Repo{RepoID: repoID, OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt,
+				CreateState: CreateStatePending}
 			return true, nil
 		},
 		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {

@@ -173,7 +173,7 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	if runErr != nil && shutdownAborted(ctx) {
 		// Shutdown cancelled the run: keep its request, force level, and
 		// retry position for the next process.
-		if w.Local != nil { // SQLite (issue #342)
+		if w.Local != nil { // SQLite and S3WAL (issue #342)
 			return w.restoreForShutdown(ctx, "push", job, holder, runErr, func(fctx context.Context) (Upstream, error) {
 				return w.Local.FinishPushOutcome(fctx, job.RepoID, holder, meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: shutdownRestoreDelay})
 			})

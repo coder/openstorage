@@ -163,11 +163,11 @@ func (s metaUpstreams) RequestPush(ctx context.Context, repoID string, force boo
 }
 
 // RequestPushNow records an explicit push request (API push-upstream). On
-// the SQLite local schedule (ADR-50) the same write makes a waiting retry
-// due now and keeps its retry position. Other backends have no due time,
-// so it is RequestPush there.
+// the local schedule (ADR-50: SQLite, S3WAL) the same write makes a
+// waiting retry due now and keeps its retry position. PostgreSQL has no
+// due time, so it is RequestPush there.
 func (s metaUpstreams) RequestPushNow(ctx context.Context, repoID string, force bool) error {
-	if ls, ok := s.ms.(meta.LocalScheduleStore); ok {
+	if ls, ok := meta.LocalSchedule(s.ms); ok {
 		return mapMetaErr(ls.RequestPushNow(ctx, repoID, force), ErrNotFound, nil)
 	}
 	return s.RequestPush(ctx, repoID, force)
@@ -187,7 +187,7 @@ func (s metaUpstreams) BeginPush(ctx context.Context, repoID, holder string, lea
 // ShutdownRestorer ends a run that serve's shutdown cancelled without
 // counting it (issue #343, PostgreSQL): the claim is released and the
 // request (for push, the consumed level) re-marked. MemStore and PG-backed
-// stores implement it; SQLite restores through LocalLanes instead.
+// stores implement it; SQLite and S3WAL restore through LocalLanes instead.
 type ShutdownRestorer interface {
 	RestoreSync(ctx context.Context, repoID, holder string) (Upstream, error)
 	RestorePush(ctx context.Context, repoID, holder string, force bool) (Upstream, error)

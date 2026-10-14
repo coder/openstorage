@@ -425,14 +425,14 @@ replica identity or network policy.
 
 ## Rolling upgrades and restarts
 
-On `SIGTERM`/`SIGINT` the server drains for a **bounded 10 seconds** in total. With a
-SQLite or PostgreSQL database, it first stops starting upstream sync runs and gives runs
+On `SIGTERM`/`SIGINT` the server drains for a **bounded 10 seconds** in total. It first
+stops starting upstream sync runs and gives runs
 in flight up to 5 seconds of that budget, still accepting connections, because those runs
 push to the server's own listener. Runs still going then are cancelled and get up to 2
 more seconds to record that their requests stay pending; a later run picks them up (on
 PostgreSQL, possibly on another replica). On PostgreSQL the stop and the wait cover every
 River job, and other jobs still running when the wait ends are cancelled; River retries
-or reschedules them. (S3WAL does not have this step yet; see issue #335.) The server then
+or reschedules them. The server then
 stops accepting connections and drains in-flight requests
 for the rest of the budget. It then stops background workers and, in
 [zero-infra mode](#zero-infrastructure-mode-experimental-one-bucket-one-node), releases

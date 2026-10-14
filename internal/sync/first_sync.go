@@ -9,8 +9,8 @@ import (
 // FirstSyncScheduler is a Queue that schedules a sync create's first sync
 // in the transaction that marks the create complete (issue #388).
 type FirstSyncScheduler interface {
-	// TracksCreateState is false when the backend stores no create state
-	// (S3-WAL, #335): callers then never call CompleteSyncCreate.
+	// TracksCreateState is false when the queue cannot complete a create
+	// (the in-process queue): callers then never call CompleteSyncCreate.
 	TracksCreateState() bool
 	// CompleteSyncCreate atomically schedules the first sync (no ref: the
 	// worker mirrors all heads and tags) and marks the create complete,
@@ -37,7 +37,8 @@ func (s *LocalScheduler) CompleteSyncCreate(ctx context.Context, org, repoID str
 	return out, nil
 }
 
-// TracksCreateState: the local schedule runs only on SQLite.
+// TracksCreateState: every local schedule store (SQLite, S3WAL) stores
+// create state.
 func (s *LocalScheduler) TracksCreateState() bool { return true }
 
 func (m metaLocalLanes) CompleteSyncRepoCreate(ctx context.Context, org, repoID string) (meta.CreateOutcome, error) {

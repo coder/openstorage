@@ -1,6 +1,6 @@
 // wire_eventing.go is the phase-5 sibling of wire.go: it assembles the
 // eventing/sync stack (docs/reference/webhooks.md, docs/archive/phases/07-implementation-roadmap.md p5) from the slice-owned packages —
-// jobs queue (River on pg / in-process in local mode), webhook deliverer,
+// jobs queue (River on pg / the local schedule otherwise), webhook deliverer,
 // upstream-sync worker with loopback push, and the events.RefStore CASRef
 // decorator — for both the serve process and the `openstorage hook`
 // subprocess git re-execs.
@@ -29,8 +29,8 @@ import (
 	upsync "github.com/coder/openstorage/internal/sync"
 )
 
-// pendingSyncRecoveryDelay defers the local-mode boot recovery scan until
-// the serve listener is up (the recovered runs loopback-push to it).
+// pendingSyncRecoveryDelay defers the local schedule's first sweep until
+// the serve listener is up (the swept runs loopback-push to it).
 const pendingSyncRecoveryDelay = 15 * time.Second
 
 // loopbackTokenTTL is the CEILING for the internally minted git:write JWT

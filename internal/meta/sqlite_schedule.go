@@ -23,9 +23,9 @@ import (
 	"time"
 )
 
-// LocalScheduleStore is the local serve process's durable schedule. It is
-// an optional interface (type-assert a Store): only *SQLite implements it
-// on a Store today (the S3WAL transitions are not wired yet).
+// LocalScheduleStore is the local serve process's durable schedule. Get it
+// with LocalSchedule: *SQLite implements it, and S3WAL provides it through
+// an adapter (ADR-51).
 type LocalScheduleStore interface {
 	// CompleteSyncRepoCreate marks a pending sync create complete and
 	// records its first-sync request in one write (issue #388).
@@ -55,6 +55,21 @@ type LocalScheduleStore interface {
 }
 
 var _ LocalScheduleStore = (*SQLite)(nil)
+
+// LocalSchedule returns ms's durable local schedule (ADR-50). SQLite is
+// one; S3WAL provides it through s3walLocalSchedule (ADR-51). ok is false
+// for PostgreSQL, which schedules through River.
+func LocalSchedule(ms any) (LocalScheduleStore, bool) {
+	switch s := ms.(type) {
+	case *S3WAL:
+		assertf(s != nil, "LocalSchedule: nil S3WAL store")
+		return s3walLocalSchedule{s}, true
+	case LocalScheduleStore:
+		return s, true
+	default:
+		return nil, false
+	}
+}
 
 // LocalClaim is the result of a conditional claim. Exactly one of Claimed,
 // Busy, or neither (no durable work due) holds.

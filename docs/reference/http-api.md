@@ -164,8 +164,9 @@ about the endpoint's rollout status on upstream clusters.
 - Any other create of a live name → **409**: a different upstream or `forward_pushes`, a sync
   create of a repo without an upstream, and every plain, copy and fork create (upstream
   answers 200 there; [#388](https://github.com/coder/openstorage/issues/388) tracks it).
-  Repos created before this release, and every S3-WAL repo (#335), answer 409 to every
-  repeat create, because open.storage cannot tell whether their create finished.
+  Repos without a stored create state answer 409 to every repeat create, because
+  open.storage cannot tell whether their create finished. These are repos created before
+  this release, and S3-WAL repos created before S3-WAL stored the create state (#335).
 - A deleted repo keeps its name → **404**. Nothing is restored.
 - A sync create whose first sync cannot be scheduled → **503** with `Retry-After`. The repo,
   its upstream link and its credential exist, but the create is pending. Either of these

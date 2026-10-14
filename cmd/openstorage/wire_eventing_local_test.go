@@ -15,21 +15,34 @@ import (
 	"github.com/coder/openstorage/internal/jobs"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 	upsync "github.com/coder/openstorage/internal/sync"
 )
 
-// SQLite serves get the durable local schedule (issue #266): the worker
-// claims through the row, and the queue is the scheduler, not the
-// in-process queue with boot recovery and retry timers.
-func TestBuildLocalSyncQueueUsesDurableScheduleOnSQLite(t *testing.T) {
-	ms, err := meta.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "meta.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(ms.Close)
-	if err := ms.InitSchema(t.Context()); err != nil {
-		t.Fatal(err)
-	}
+// SQLite and S3WAL serves get the durable local schedule (issue #266,
+// ADR-51): the worker claims through the row, and the queue is the
+// scheduler, not the in-process queue with boot recovery and retry timers.
+func TestBuildLocalSyncQueueUsesDurableSchedule(t *testing.T) {
+	t.Run("sqlite", func(t *testing.T) {
+		ms, err := meta.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "meta.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(ms.Close)
+		if err := ms.InitSchema(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		assertDurableLocalQueue(t, ms)
+	})
+	t.Run("s3wal", func(t *testing.T) {
+		ms := meta.NewS3WAL(s3wal.NewMemCAS())
+		t.Cleanup(ms.Close)
+		assertDurableLocalQueue(t, ms)
+	})
+}
+
+func assertDurableLocalQueue(t *testing.T, ms meta.Store) {
+	t.Helper()
 	logger := slog.New(slog.DiscardHandler)
 	worker := &upsync.Worker{}
 	deliverer := &events.Deliverer{Webhooks: events.MetaWebhookStore{Store: ms}, Logger: logger}
@@ -39,13 +52,13 @@ func TestBuildLocalSyncQueueUsesDurableScheduleOnSQLite(t *testing.T) {
 	}
 	defer cleanup()
 	if worker.Local == nil || worker.WaitPublication == nil {
-		t.Fatal("SQLite worker has no local schedule or publication wait")
+		t.Fatal("worker has no local schedule or publication wait")
 	}
-	if _, ok := queue.(*jobs.Local); !ok {
-		t.Fatalf("queue is %T, want *jobs.Local", queue)
+	if q, ok := queue.(*jobs.Local); !ok || !q.TracksCreateState() {
+		t.Fatalf("queue is %T, want *jobs.Local over the local schedule (it tracks create state)", queue)
 	}
 	if worker.Requeue != nil || worker.RequeuePush != nil {
-		t.Fatal("SQLite worker still wires process-local requeue")
+		t.Fatal("worker still wires process-local requeue")
 	}
 	// The API's explicit triggers reach the schedule through these
 	// optional extensions: pull-upstream offers without re-marking, and

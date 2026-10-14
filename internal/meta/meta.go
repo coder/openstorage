@@ -156,13 +156,12 @@ type Store interface {
 	CreateRepo(ctx context.Context, org, url, defaultBranch string) (Repo, error)
 
 	// CreateRepoWithState is CreateRepo with an explicit CreateState
-	// (pending or complete). S3-WAL stores no state: its rows read legacy.
+	// (pending or complete).
 	CreateRepoWithState(ctx context.Context, org, url, defaultBranch string, state CreateState) (Repo, error)
 
 	// CompleteRepoCreate moves a pending repo to complete. A soft-deleted
 	// repo returns CreateDeleted, even if it was complete. ErrNotFound when
-	// no row exists. On a legacy row it returns an error on PostgreSQL and
-	// SQLite, and CreateCompleted on S3-WAL (whose rows are all legacy).
+	// no row exists. On a legacy row it returns an error.
 	CompleteRepoCreate(ctx context.Context, org, repoID string) (CreateOutcome, error)
 
 	// GetRepoByURL returns the live repo with the given url;
