@@ -110,7 +110,7 @@ about the endpoint's rollout status on upstream clusters.
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
 | `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value. An open.storage extension: upstream removed the route from its spec on 2026-10-05, and open.storage keeps serving it for existing clients |
-| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). Deprecated upstream (2026-10-05) for `DELETE /api/repos/{repo_name}/upstream`, which runs the same handler; still served |
+| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). Deprecated upstream (2026-10-05) for `DELETE /api/repos/{repo_name}/upstream`, which runs the same handler; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header |
 | `DELETE /api/repos/{repo_name}/upstream` | repo:write | Path style only (spec 2026-10-05). Same handler, scope and responses as `DELETE /repos/base` |
 
 **`POST /repos` body:**
@@ -372,9 +372,22 @@ timestamp and `committer_date` the committer timestamp, as in upstream's spec of
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | Optional body `{ref?, after?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. Both body fields are accepted and ignored: every pull syncs all branches and tags of the upstream. Upstream deprecated the body on 2026-10-08 |
+| `POST /repos/pull-upstream` | git:write | Optional body `{ref?, after?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header. Both body fields are accepted and ignored: every pull syncs all branches and tags of the upstream. Upstream deprecated the body on 2026-10-08 |
 | `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional, deprecated body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400. Its fields are ignored |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
+
+#### Deprecation header
+
+Every response of the four deprecated routes carries `Deprecation: @1791331200`:
+`POST /api/v1/repos/pull-upstream`, `POST /api/repos/{repo_name}/pull-upstream`,
+`DELETE /api/v1/repos/base` and `DELETE /api/repos/{repo_name}/base`. Error responses
+carry it too: 400, 401, 403, 404, 429 and 500. The replacements
+(`POST .../upstream/pull`, `DELETE .../upstream`) and `push-upstream` send no such header.
+
+The value is an [RFC 9745](https://www.rfc-editor.org/rfc/rfc9745) date: deprecated since
+2026-10-07T00:00:00Z, the date of upstream's changelog entry that announced the header.
+Upstream documents no value and no `Link` or `Sunset` header, so open.storage sends no
+`Link` or `Sunset` ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)).
 
 **Both triggers:**
 

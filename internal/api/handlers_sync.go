@@ -41,7 +41,7 @@ func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, 
 	assertf(verifier != nil, "registerSyncRoutes: nil verifier")
 	assertf(s != nil, "registerSyncRoutes: nil syncServer")
 	mux.Handle("POST /api/v1/repos/pull-upstream",
-		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handlePullUpstream))))
+		deprecated(rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handlePullUpstream)))))
 	// push-upstream requires git:read ON TOP of git:write (Codex security
 	// round on #90): the forward exports every local head and tag to the
 	// upstream, so a write-only token could otherwise exfiltrate
@@ -51,7 +51,29 @@ func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, 
 	mux.Handle("POST /api/v1/repos/push-upstream",
 		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitWrite, auth.ScopeGitRead)(http.HandlerFunc(s.handlePushUpstream))))
 	mux.Handle("DELETE /api/v1/repos/base",
-		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDetachBase))))
+		deprecated(rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDetachBase)))))
+}
+
+// deprecationHeader is the RFC 9745 Deprecation value (a structured-field
+// date: "@" + Unix seconds) of the deprecated pull-upstream and base routes:
+// 2026-10-07T00:00:00Z, the date of upstream's "Upstream Paths" changelog
+// entry. Upstream documents the header but not its value (issue #456).
+const deprecationHeader = "@1791331200"
+
+// deprecated sets the Deprecation header on every response of a deprecated
+// route. It wraps the route's whole chain (limiter, auth, handler), so 429s,
+// 401/403s and handler errors carry it too. A request that the alias layer
+// re-dispatched passes through unmarked: the alias route decides, so the
+// replacements (.../upstream/pull, DELETE .../upstream), which share these
+// v1 handlers, carry no header.
+func deprecated(next http.Handler) http.Handler {
+	assertf(next != nil, "deprecated: nil handler")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isAliasDispatch(r.Context()) {
+			w.Header().Set("Deprecation", deprecationHeader)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // usyncBaseRepo is the POST /repos base_repo object (docs/reference/http-api.md).

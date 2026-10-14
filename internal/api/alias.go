@@ -51,6 +51,10 @@ type aliasRoute struct {
 	// shared v1 handler can apply a path-style operation's own contract
 	// (POST .../notes/append, issue #378). Clients cannot set it.
 	mark func(context.Context) context.Context
+	// deprecated sets the Deprecation header on every response of the
+	// alias (issue #456). The v1 twin cannot decide it: its handler also
+	// serves the non-deprecated path-style replacements.
+	deprecated bool
 }
 
 // aliasRoutes mirrors every repo-scoped v1 route registered in api.go /
@@ -63,6 +67,10 @@ func aliasRoutes() []aliasRoute {
 	}
 	write := func(method, suffix, v1Path string, scopes ...string) aliasRoute {
 		return aliasRoute{method: method, suffix: suffix, v1Path: v1Path, flavor: routeWrite, scopes: scopes}
+	}
+	deprecatedRoute := func(ar aliasRoute) aliasRoute {
+		ar.deprecated = true
+		return ar
 	}
 	return []aliasRoute{
 		// Repo root: GET/PATCH /api/v1/repo and DELETE /api/v1/repos/delete.
@@ -107,9 +115,9 @@ func aliasRoutes() []aliasRoute {
 
 		// Sync + credentials (requireAuth with the {"error"} envelope, per
 		// their v1 registrations).
-		read(http.MethodPost, "/pull-upstream", "/api/v1/repos/pull-upstream", auth.ScopeGitWrite),
+		deprecatedRoute(read(http.MethodPost, "/pull-upstream", "/api/v1/repos/pull-upstream", auth.ScopeGitWrite)),
 		read(http.MethodPost, "/push-upstream", "/api/v1/repos/push-upstream", auth.ScopeGitWrite, auth.ScopeGitRead),
-		read(http.MethodDelete, "/base", "/api/v1/repos/base", auth.ScopeRepoWrite),
+		deprecatedRoute(read(http.MethodDelete, "/base", "/api/v1/repos/base", auth.ScopeRepoWrite)),
 		// Path-style replacements of pull-upstream and base (spec
 		// 2026-10-05, issue #378): same handlers, bodies and scopes.
 		{method: http.MethodPost, suffix: "/upstream/pull", v1Path: "/api/v1/repos/pull-upstream",
@@ -143,7 +151,11 @@ func registerAliasRoutes(mux *http.ServeMux, s *server, ss *syncServer, verifier
 		if ar.flavor == routeWrite {
 			authMW = requireAuthWrite
 		}
-		mux.Handle(pattern, rl.limit(ar.flavor)(authMW(verifier, org, ar.orgLevel, ar.scopes...)(s.aliasHandler(mux, ar))))
+		h := rl.limit(ar.flavor)(authMW(verifier, org, ar.orgLevel, ar.scopes...)(s.aliasHandler(mux, ar)))
+		if ar.deprecated {
+			h = deprecated(h)
+		}
+		mux.Handle(pattern, h)
 	}
 
 	// Path-id git-credentials routes (openapi.yaml; docs/archive/phases/15-phase6-implementation-notes.md deferred #1):
@@ -205,7 +217,7 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 		// above, so the v1 handler reads it from the start. The exempt
 		// marker stops the v1 limiter from charging a second token — this
 		// request already paid at the alias registration.
-		ctx := rateLimitExempt(r.Context())
+		ctx := withAliasDispatch(rateLimitExempt(r.Context()))
 		if ar.mark != nil {
 			ctx = ar.mark(ctx)
 		}
@@ -215,6 +227,19 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 		r2.RequestURI = r2.URL.RequestURI()
 		mux.ServeHTTP(w, r2)
 	}
+}
+
+// aliasDispatchKey marks a request that aliasHandler re-dispatched to its
+// v1 twin; only aliasHandler sets it.
+type aliasDispatchKey struct{}
+
+func withAliasDispatch(ctx context.Context) context.Context {
+	return context.WithValue(ctx, aliasDispatchKey{}, true)
+}
+
+func isAliasDispatch(ctx context.Context) bool {
+	v, _ := ctx.Value(aliasDispatchKey{}).(bool)
+	return v
 }
 
 // aliasFail writes an alias-layer failure in the route's envelope flavor:
