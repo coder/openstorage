@@ -56,6 +56,13 @@ type S3WALPendingCreate struct {
 	RepoID, URL string
 }
 
+// String renders the create for an operator's terminal. The URL comes from
+// a token's repo claim, so it is quoted: control bytes and escape
+// sequences print escaped and cannot restyle or forge the output.
+func (c S3WALPendingCreate) String() string {
+	return fmt.Sprintf("%s (%q)", c.RepoID, c.URL)
+}
+
 // S3WALPendingCreatesError refuses --to 1 while fork or copy creates are
 // unfinished: v1 stores no create state, so on a v1 release each one reads
 // as a finished, possibly empty repository. Nothing was written.
@@ -66,7 +73,7 @@ type S3WALPendingCreatesError struct {
 func (e *S3WALPendingCreatesError) Error() string {
 	names := make([]string, len(e.Creates))
 	for i, c := range e.Creates {
-		names[i] = fmt.Sprintf("%s (%s)", c.RepoID, c.URL)
+		names[i] = c.String()
 	}
 	return fmt.Sprintf("s3walmeta convert: %d unfinished fork or copy create(s): %s. "+
 		"A v1 release reads them as finished, possibly empty repositories. "+

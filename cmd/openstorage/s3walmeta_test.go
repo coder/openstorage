@@ -80,7 +80,7 @@ func TestS3WALMetaConvertPendingCreatesCommand(t *testing.T) {
 	}
 	var out bytes.Buffer
 	err = runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out)
-	if err == nil || !strings.Contains(err.Error(), fork.RepoID+" (fork-pending)") || !strings.Contains(err.Error(), "DELETE /repos/delete") || storedVersion(t, cas) != `{"v":2` {
+	if err == nil || !strings.Contains(err.Error(), fork.RepoID+` ("fork-pending")`) || !strings.Contains(err.Error(), "DELETE /repos/delete") || storedVersion(t, cas) != `{"v":2` {
 		t.Fatalf("refusal = %v, stored %s; want the fork named and v2 kept", err, storedVersion(t, cas))
 	}
 	if _, err := cas.Get(ctx, s3wal.LeaseKey); !errors.Is(err, s3wal.ErrNotExist) {
@@ -89,9 +89,43 @@ func TestS3WALMetaConvertPendingCreatesCommand(t *testing.T) {
 	if err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{Force: true}, s3wal.LeaseConfig{}, &out); err != nil || storedVersion(t, cas) != `{"v":1` {
 		t.Fatalf("forced = %q, %v", out.String(), err)
 	}
-	for _, want := range []string{"first sync requested (the v1 release runs it at boot): " + sync.RepoID, "--force: 1 unfinished fork or copy creates", fork.RepoID + " (fork-pending)"} {
+	for _, want := range []string{"first sync requested (the v1 release runs it at boot): " + sync.RepoID, "--force: 1 unfinished fork or copy creates", fork.RepoID + ` ("fork-pending")`} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("forced output %q lacks %q", out.String(), want)
+		}
+	}
+}
+
+// Repo URLs come from token claims: the conversion output must never pass
+// control bytes or escape sequences to the operator's terminal.
+func TestS3WALMetaConvertQuotesRepoURLs(t *testing.T) {
+	ctx := context.Background()
+	cas := s3wal.NewMemCAS()
+	st := meta.NewS3WAL(cas)
+	defer st.Close()
+	if _, err := st.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	const hostile = "fork\x1b]52;c;aGk=\x07\r\nconverted\u009b31m"
+	if _, err := st.CreateRepoWithState(ctx, "org", hostile, "main", meta.CreateStatePending); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out)
+	if err == nil {
+		t.Fatal("refusal expected")
+	}
+	if err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{Force: true}, s3wal.LeaseConfig{}, &out); err != nil {
+		t.Fatal(err)
+	}
+	for name, s := range map[string]string{"refusal": err.Error(), "forced output": out.String()} {
+		// Raw ESC, BEL, CR and CSI must not appear; a raw newline would let
+		// the URL start a forged line.
+		if strings.ContainsAny(s, "\x1b\x07\r\u009b") || strings.Contains(s, "\nconverted") {
+			t.Fatalf("%s passes control bytes through: %q", name, s)
+		}
+		if !strings.Contains(s, `\x1b]52;c;aGk=\a\r\nconverted\u009b31m`) {
+			t.Fatalf("%s lacks the escaped URL: %q", name, s)
 		}
 	}
 }
