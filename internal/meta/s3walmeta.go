@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"maps"
 	mrand "math/rand/v2"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -431,6 +432,12 @@ type S3WAL struct {
 	cacheETag string
 	cacheBody []byte
 	lastSeq   int64
+	// cacheView is cacheBody decoded once, shared by every viewDoc caller
+	// until the cache changes (issue #470: the 1 s sync sweep otherwise
+	// decodes the whole document on every 304). It is READ-ONLY: viewDoc
+	// callers must never mutate it. Mutations decode their own copy.
+	// nil means not decoded yet.
+	cacheView *s3walMetaDoc
 
 	// orgKeys is the in-memory org public-key snapshot (PR #168 security
 	// P2): PublicKeysForOrg is auth.KeySource — the verifier selects keys
@@ -585,6 +592,13 @@ func (s *S3WAL) checkSeq(seq int64) {
 // A missing object is the empty state with etag "" (create path). Caller
 // holds mu.
 func (s *S3WAL) readDoc(ctx context.Context) (*s3walMetaDoc, string, error) {
+	return s.readDocShared(ctx, false)
+}
+
+// readDocShared is readDoc. With shared (read-only callers), a 304 answers
+// the cached decoded view instead of decoding the body again, and a fresh
+// read installs its decode as that view. Caller holds mu.
+func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, string, error) {
 	if s.cacheETag == "" {
 		obj, err := s.cas.Get(ctx, s3walMetaKey)
 		if errors.Is(err, s3wal.ErrNotExist) {
@@ -598,13 +612,20 @@ func (s *S3WAL) readDoc(ctx context.Context) (*s3walMetaDoc, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("s3walmeta read: %w", err)
 		}
-		return s.adoptRead(obj)
+		return s.adoptRead(obj, shared)
 	}
 	obj, err := s.cas.GetIfChanged(ctx, s3walMetaKey, s.cacheETag)
 	if errors.Is(err, s3wal.ErrNotModified) {
+		if shared && s.cacheView != nil {
+			s.checkViewIntact()
+			return s.cacheView, s.cacheETag, nil
+		}
 		doc, derr := decodeS3WALMetaDoc(s.cacheBody)
 		if derr != nil {
 			return nil, "", derr
+		}
+		if shared {
+			s.cacheView = doc
 		}
 		return doc, s.cacheETag, nil
 	}
@@ -617,20 +638,42 @@ func (s *S3WAL) readDoc(ctx context.Context) (*s3walMetaDoc, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("s3walmeta read: %w", err)
 	}
-	return s.adoptRead(obj)
+	return s.adoptRead(obj, shared)
+}
+
+// checkSharedView turns on checkViewIntact. Only this package's tests set
+// it (s3walmeta_view_test.go): production skips the decode the shared view
+// exists to avoid.
+var checkSharedView bool
+
+// checkViewIntact asserts that the shared view still equals a fresh decode
+// of the cached body, so a viewDoc caller that wrote into it fails fast.
+// Caller holds mu.
+func (s *S3WAL) checkViewIntact() {
+	if !checkSharedView {
+		return
+	}
+	fresh, err := decodeS3WALMetaDoc(s.cacheBody)
+	assertf(err == nil, "s3walmeta view check: cached body does not decode: %v", err)
+	assertf(reflect.DeepEqual(fresh, s.cacheView), "s3walmeta view check: a viewDoc caller mutated the shared view (seq %d)", s.cacheView.Seq)
 }
 
 // adoptRead decodes a freshly fetched body, checks the seq watermark, and
 // installs it as the new cache (plus the org-key snapshot — readDoc's 304
 // path needs no install because the snapshot always matches the cache it
-// revalidated). Caller holds mu.
-func (s *S3WAL) adoptRead(obj s3wal.Object) (*s3walMetaDoc, string, error) {
+// revalidated). With shared, the decode also becomes the shared view;
+// otherwise the caller may mutate it, so the view is cleared. Caller holds
+// mu.
+func (s *S3WAL) adoptRead(obj s3wal.Object, shared bool) (*s3walMetaDoc, string, error) {
 	doc, err := decodeS3WALMetaDoc(obj.Body)
 	if err != nil {
 		return nil, "", err
 	}
 	s.checkSeq(doc.Seq)
-	s.cacheBody, s.cacheETag = obj.Body, obj.ETag
+	s.cacheBody, s.cacheETag, s.cacheView = obj.Body, obj.ETag, nil
+	if shared {
+		s.cacheView = doc
+	}
 	s.adoptOrgKeys(doc)
 	return doc, obj.ETag, nil
 }
@@ -650,11 +693,13 @@ func (s *S3WAL) adoptOrgKeys(doc *s3walMetaDoc) {
 	s.orgKeysMu.Unlock()
 }
 
-// viewDoc is the read-only entry point: lock, fetch, return.
+// viewDoc is the read-only entry point: lock, fetch, return. The returned
+// document is shared with other viewDoc callers (cacheView): read it, never
+// write it.
 func (s *S3WAL) viewDoc(ctx context.Context) (*s3walMetaDoc, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	doc, _, err := s.readDoc(ctx)
+	doc, _, err := s.readDocShared(ctx, true)
 	return doc, err
 }
 
@@ -733,7 +778,7 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 		}
 		if werr == nil {
 			s.checkSeq(ourSeq)
-			s.cacheBody, s.cacheETag = body, newETag
+			s.cacheBody, s.cacheETag, s.cacheView = body, newETag, nil
 			// Our CAS landed: the mutated doc IS the latest observed
 			// state, so a local key registration is visible to the very
 			// next lookup (read-your-writes). The ambiguity paths below
