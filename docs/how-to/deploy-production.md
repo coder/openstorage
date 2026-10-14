@@ -433,12 +433,16 @@ more seconds to record that their requests stay pending; a later run picks them 
 PostgreSQL, possibly on another replica). On PostgreSQL the stop and the wait cover every
 River job, and other jobs still running when the wait ends are cancelled; River retries
 or reschedules them. The server then
-stops accepting connections and drains in-flight requests
-for the rest of the budget. It then stops background workers and, in
+stops accepting connections and drains in-flight requests until 8 seconds have passed.
+If requests are still running then, the server prints `drain incomplete` and one
+`still active` line per request (method, path and age) to stderr. It then stops the Git
+processes of unfinished clone, fetch and push requests (`upload-pack`, `receive-pack`
+and its hooks): `SIGTERM` first, `SIGKILL` 1 second later, and the last second lets the
+requests end. None of them outlives the server. It then stops background workers and, in
 [zero-infra mode](#zero-infrastructure-mode-experimental-one-bucket-one-node), releases
 the instance lease so a successor need not wait out the lease TTL. A second signal
-during the drain kills the process immediately. Requests still running after the drain
-are dropped; a dropped push is safe for data (see below) but fails for the client.
+during the drain stops those Git processes within 0.2 seconds and then kills the server.
+A push stopped this way fails for the client and is safe for data (see below).
 
 So roll one replica at a time, using the proxy:
 
@@ -457,6 +461,10 @@ storage behind:
   Its objects stay quota-counted and repack carries them forward
   ([why](../explanation/storage-engine.md#why-repack-packs-the-union-not-reachable-objects)).
   A client retry of the same push deduplicates against it and makes it reachable.
+
+A push stopped after its ref update reached the ref store keeps that ref, although the
+client sees an error. The next request heals the node's cache to the stored ref. The
+push's webhook and its sync trigger can be lost in that case, as after a crash.
 
 **A mixed-version fleet mid-roll is expected and fine**: schema upgrades use the same
 [boot-time locking](#concurrent-boot-schema-setup-and-migrations). Two deliberate
