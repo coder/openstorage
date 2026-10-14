@@ -5,10 +5,13 @@ package githttp
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -149,5 +152,141 @@ func TestNodeStopKillsGitChildren(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("client push still running 30s after stop")
+	}
+}
+
+// TestServeDrainTimeoutStopsGitChildren (issue #440): a push outlives the
+// SIGTERM drain. serve must name the request still running, stop the
+// push's git children before it exits 0, and leave the repository in a
+// state the next node serves correctly: either the push never reached the
+// authority (the client retries), or its ref CAS committed and hydration
+// brings the cache up to the authority.
+func TestServeDrainTimeoutStopsGitChildren(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		committed bool // the authority CAS commits before the stop
+	}{
+		{name: "before CAS"},
+		{name: "after CAS", committed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := registerRepo(t, "t-drain-stop-"+strconv.FormatInt(time.Now().UnixNano(), 36))
+			work := initWorkRepo(t)
+			head := revParse(t, work, "HEAD")
+			token := mintTestToken(t, repo, "git:read,git:write", "")
+			nodeCache := t.TempDir()
+			barrier := filepath.Join(t.TempDir(), "update-barrier")
+			// Both knobs park the update hook past the drain: the delay
+			// before its CAS, the barrier after it (for up to 30s).
+			env := EnvHookDelay + "=60000"
+			if tc.committed {
+				env = EnvUpdateBarrier + "=" + barrier
+			}
+			var stderr bytes.Buffer
+			node, err := startBinaryNode(binPath, nodeCache, io.MultiWriter(os.Stderr, &stderr), env)
+			if err != nil {
+				t.Fatalf("start node: %v", err)
+			}
+			t.Cleanup(node.stop)
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+				done <- err
+			}()
+			if tc.committed {
+				waitForFile(t, barrier+".ready", 30*time.Second)
+			} else {
+				waitForPushHold(t, nodeCache, repo, "refs/heads/main", done)
+			}
+			children := serveChildren(node)
+			if len(children) == 0 {
+				t.Fatal("no git child of serve while a push is parked in its hook")
+			}
+			for _, pid := range children {
+				if pgid, err := syscall.Getpgid(pid); err == nil && pgid == node.cmd.Process.Pid {
+					t.Fatalf("git child %d runs in serve's process group, want its own", pid)
+				}
+			}
+
+			sigterm := time.Now()
+			if err := node.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			if err := waitNodeExit(t, node, 30*time.Second); err != nil {
+				t.Fatalf("serve did not exit cleanly after the drain timed out: %v", err)
+			}
+			t.Logf("serve exited %v after SIGTERM", time.Since(sigterm))
+			// A child SIGKILLed just before serve exited can still be in the
+			// kernel's exit path: allow it a moment, never minutes (the
+			// hook would otherwise sleep for 30-60s).
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				running := sessionMembers(node.cmd.Process.Pid)
+				if len(running) == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("git children %v still run after serve exited", running)
+				}
+			}
+			log := stderr.String()
+			for _, want := range []string{
+				"openstorage serve: drain incomplete",
+				"openstorage serve: still active: POST \"/" + repo + ".git/git-receive-pack\" running for ",
+				"openstorage serve: stopped 1 git process group(s) of unfinished requests",
+			} {
+				if !strings.Contains(log, want) {
+					t.Errorf("serve stderr lacks %q", want)
+				}
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("push succeeded although serve stopped it")
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("client push still running 30s after serve exited")
+			}
+
+			// What the stopped push left in the cache repo: the handler
+			// returned before serve exited, so its hold is released, and
+			// git ended on SIGTERM, so no ref lock or quarantine remains.
+			repoPath := RepoPath(nodeCache, repo)
+			if holds, err := readPushHolds(filepath.Join(repoPath, pushHoldDir), ""); err != nil || len(holds.names) != 0 {
+				t.Errorf("push holds after the stop = %v (err %v), want none", holds.names, err)
+			}
+			_ = filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				rel, _ := filepath.Rel(repoPath, path)
+				if strings.HasPrefix(rel, "objects/tmp_objdir-incoming-") ||
+					rel == "packed-refs.lock" || (strings.HasPrefix(rel, "refs/") && strings.HasSuffix(rel, ".lock")) {
+					t.Errorf("stopped push left %s in the cache repo", rel)
+				}
+				return nil
+			})
+
+			// A new node on the same cache serves the authority's state.
+			next, err := startNode(nodeCache)
+			if err != nil {
+				t.Fatalf("restart node: %v", err)
+			}
+			t.Cleanup(next.stop)
+			url := remoteURL(next, repo, token)
+			refs := mustGit(t, "", "ls-remote", url)
+			if tc.committed != strings.Contains(refs, head+"\trefs/heads/main") {
+				t.Fatalf("after the stop, ls-remote = %q, want main at %s: %v", refs, head, tc.committed)
+			}
+			if !tc.committed {
+				mustGit(t, work, "push", url, "HEAD:refs/heads/main")
+			}
+			clone := filepath.Join(t.TempDir(), "clone")
+			mustGit(t, "", "clone", "--config", "maintenance.auto=false", url, clone)
+			if got := revParse(t, clone, "HEAD"); got != head {
+				t.Fatalf("clone HEAD = %s, want %s", got, head)
+			}
+			mustGit(t, clone, "fsck", "--full")
+		})
 	}
 }

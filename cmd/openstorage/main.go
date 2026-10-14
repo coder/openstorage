@@ -114,6 +114,15 @@ const shutdownRunWait = 5 * time.Second
 // so the restore commits inside a supervisor's kill grace window.
 const shutdownRestoreWait = 2 * time.Second
 
+// shutdownGitStopWait is the last part of shutdownDrainTimeout (issue
+// #440). When the HTTP drain has not finished by then, serve logs the
+// requests still running and stops their git children: SIGTERM to each
+// child's process group, SIGKILL after half of this wait, and the rest
+// lets the handlers return, so their deferred cleanup (push holds,
+// verify-sig state) runs before serve exits. No git child of a handler
+// outlives serve.
+const shutdownGitStopWait = 2 * time.Second
+
 func cmdServe(ctx context.Context, args []string) error {
 	// A termination signal cancels the serve context (issue #174): the
 	// select at the bottom then drains HTTP and RETURNS, letting every
@@ -363,7 +372,8 @@ func cmdServe(ctx context.Context, args []string) error {
 	// context), so work admitted before the signal completes normally
 	// within the bounded drain.
 	// Instrument the whole mux (ADR-48) so its own redirects count too.
-	httpSrv := &http.Server{Handler: metrics.InstrumentMux(mux, metricsSurface)}
+	active := newActiveRequests()
+	httpSrv := &http.Server{Handler: active.wrap(metrics.InstrumentMux(mux, metricsSurface))}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpSrv.Serve(ln) }()
 	select {
@@ -374,9 +384,23 @@ func cmdServe(ctx context.Context, args []string) error {
 		// serving unmonitored (ADR-48).
 		return fmt.Errorf("metrics listener stopped: %w", err)
 	case <-ctx.Done():
-		// Restore default signal disposition first: a second signal
-		// during the drain kills immediately (operator escape hatch).
+		// A second signal during the drain kills immediately (operator
+		// escape hatch). The git children lead their own process groups,
+		// so a signal to serve's group no longer reaches them: stop them
+		// first, then die by the signal as the default disposition would.
+		// The short grace lets git remove its ref locks on SIGTERM before
+		// SIGKILL follows.
+		second := make(chan os.Signal, 1)
+		signal.Notify(second, os.Interrupt, syscall.SIGTERM)
 		stopSignals()
+		go func() {
+			sig := <-second
+			srv.StopGitChildren(200 * time.Millisecond)
+			signal.Reset(os.Interrupt, syscall.SIGTERM)
+			p, err := os.FindProcess(os.Getpid())
+			assertf(err == nil, "find own process: %v", err)
+			_ = p.Signal(sig)
+		}()
 		fmt.Fprintln(os.Stderr, "openstorage serve: termination signal received; draining")
 		dctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 		defer cancel()
@@ -387,8 +411,25 @@ func cmdServe(ctx context.Context, args []string) error {
 		rctx, rcancel := context.WithTimeout(dctx, shutdownRunWait+shutdownRestoreWait)
 		drainRuns(rctx, shutdownRunWait)
 		rcancel()
-		if err := httpSrv.Shutdown(dctx); err != nil {
-			fmt.Fprintf(os.Stderr, "openstorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)
+		deadline, _ := dctx.Deadline()
+		hctx, hcancel := context.WithDeadline(dctx, deadline.Add(-shutdownGitStopWait))
+		err := httpSrv.Shutdown(hctx)
+		hcancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "openstorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout-shutdownGitStopWait, err)
+			for _, line := range active.describe(time.Now()) {
+				fmt.Fprintf(os.Stderr, "openstorage serve: still active: %s\n", line)
+			}
+		}
+		// Unconditional: after a complete drain no handler runs, so this
+		// only makes later git starts fail.
+		if n := srv.StopGitChildren(shutdownGitStopWait / 2); n > 0 {
+			fmt.Fprintf(os.Stderr, "openstorage serve: stopped %d git process group(s) of unfinished requests\n", n)
+		}
+		if err != nil {
+			if err := httpSrv.Shutdown(dctx); err != nil {
+				fmt.Fprintf(os.Stderr, "openstorage serve: requests still running at exit: %v\n", err)
+			}
 		}
 		if metricsSrv != nil {
 			if err := metricsSrv.Shutdown(dctx); err != nil {
