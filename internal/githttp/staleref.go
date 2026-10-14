@@ -42,8 +42,11 @@ func removeStaleRefLocks(repoPath string, names []string) int {
 	if len(stale) == 0 {
 		return 0
 	}
-	if pid, err := processInRepo(repoPath); err != nil || pid != 0 {
-		log.Printf("hydrate %s: keeping %d old ref lock(s): process %d works in the repository (%v)", repoPath, len(stale), pid, err)
+	if pid, err := processInRepo(repoPath); err != nil {
+		log.Printf("hydrate %s: keeping %d old ref lock(s): cannot check for processes in the repository: %v", repoPath, len(stale), err)
+		return 0
+	} else if pid != 0 {
+		log.Printf("hydrate %s: keeping %d old ref lock(s): process %d works in the repository", repoPath, len(stale), pid)
 		return 0
 	}
 	removed := 0
