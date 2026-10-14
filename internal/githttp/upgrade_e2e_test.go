@@ -515,7 +515,8 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	// make the official release pull the upstream.
 	synced := false
 	for deadline := time.Now().Add(60 * time.Second); !synced && time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
-		out, err := tryGit("", "ls-remote", remoteURL(back, pendingSync.RepoID, syncToken), "refs/heads/main")
+		// A hung server or upstream must not stall the poll past its deadline.
+		out, err := tryGitDeadline("", time.Until(deadline), "ls-remote", remoteURL(back, pendingSync.RepoID, syncToken), "refs/heads/main")
 		if _, logErr := fmt.Fprintf(gitLog, "operation=ls-remote result=%v\n%s\n", err, out); logErr != nil {
 			t.Fatal(logErr)
 		}

@@ -47,7 +47,7 @@ type S3WALMetaConversion struct {
 // S3WALConvertOptions changes how ConvertS3WALMeta treats unfinished
 // creates on --to 1.
 type S3WALConvertOptions struct {
-	// Force converts even when a fork or copy create is unfinished.
+	// Force converts even when a create without an upstream link is unfinished.
 	Force bool
 }
 

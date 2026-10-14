@@ -262,7 +262,7 @@ openstorage s3wal-meta convert --to <1|2> [--force]
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to` | required | Target version: `2` to upgrade, `1` to downgrade |
-| `--force` | off | With `--to 1` only: convert even while a fork or copy create is unfinished |
+| `--force` | off | With `--to 1` only: convert even while a create without an upstream link (a fork, a copy, or a sync create whose link was removed) is unfinished |
 
 The database URL (`OPENSTORAGE_PG_URL`) must be an `s3wal://` URL. The command:
 
