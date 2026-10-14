@@ -58,9 +58,9 @@ type Repo struct {
 type CreateState int
 
 const (
-	// CreateStateLegacy: the row predates create tracking, or the backend
-	// cannot store it (S3-WAL's frozen v1 format, issue #335). A crashed
-	// fork can look like this, so the row is never treated as complete.
+	// CreateStateLegacy: the row predates create tracking (on S3-WAL, an
+	// S3-WAL metadata v1 row; v2 stores the state, ADR-51). A crashed fork
+	// can look like this, so the row is never treated as complete.
 	CreateStateLegacy CreateState = 0
 	// CreateStatePending: inserted, and the create has not finished.
 	CreateStatePending CreateState = 1

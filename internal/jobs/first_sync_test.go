@@ -68,7 +68,7 @@ func TestRiverCompleteSyncCreate(t *testing.T) {
 	inproc := NewLocal(&events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}, noop, noop, nil, slog.New(slog.DiscardHandler))
 	t.Cleanup(inproc.Close)
 	if !q.TracksCreateState() || inproc.TracksCreateState() {
-		t.Fatal("River tracks create state; the in-process queue (S3-WAL, #335) does not")
+		t.Fatal("River tracks create state; the in-process queue does not")
 	}
 	r, err := ms.CreateLinkedRepo(ctx, "acme", "race", "main",
 		meta.RepoUpstream{Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}, nil)

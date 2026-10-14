@@ -12,6 +12,7 @@ package meta
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -187,6 +188,65 @@ func TestS3WALMetaRecoveryFinishSync(t *testing.T) {
 				t.Fatalf("stored row = (%+v, %v), want counters advanced exactly once", got, err)
 			}
 		})
+	}
+}
+
+// TestS3WALMetaRecoveryCompleteCreate: an ambiguous completion PUT, landed
+// or dropped and superseded by a competitor either way, must leave the row
+// complete and answer completed or already complete (#452 item 11). The
+// sync variant must also leave its first-sync request recorded.
+func TestS3WALMetaRecoveryCompleteCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault s3wal.PutFault
+	}{
+		{"applied", s3wal.FaultAmbiguousApplied},
+		{"dropped", s3wal.FaultAmbiguousDropped},
+	} {
+		for _, sync := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/sync=%v", tc.name, sync), func(t *testing.T) {
+				ctx := context.Background()
+				cas, a, b := newS3WALMetaPair(t)
+				if _, err := a.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+					t.Fatalf("seed org: %v", err)
+				}
+				var repo Repo
+				var err error
+				if sync {
+					repo, err = a.CreateLinkedRepo(ctx, "org", "https://example.com/amb.git", "main",
+						RepoUpstream{Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com"}, nil)
+				} else {
+					repo, err = a.CreateRepoWithState(ctx, "org", "https://example.com/amb.git", "main", CreateStatePending)
+				}
+				if err != nil || repo.CreateState != CreateStatePending {
+					t.Fatalf("seed pending repo = (%+v, %v)", repo, err)
+				}
+				armAmbiguousPut(t, cas, tc.fault, func() {
+					if _, err := b.UpsertOrgWithKeys(ctx, "interloper", []string{"pem"}); err != nil {
+						t.Errorf("interleaved write: %v", err)
+					}
+				})
+				var out CreateOutcome
+				if sync {
+					out, err = s3walLocalSchedule{a}.CompleteSyncRepoCreate(ctx, "org", repo.RepoID)
+				} else {
+					out, err = a.CompleteRepoCreate(ctx, "org", repo.RepoID)
+				}
+				if err != nil || (out != CreateCompleted && out != CreateAlreadyComplete) {
+					t.Fatalf("completion through ambiguity = (%d, %v), want completed or already complete", out, err)
+				}
+				got, err := a.GetRepoByID(ctx, "org", repo.RepoID)
+				if err != nil || got.CreateState != CreateStateComplete {
+					t.Fatalf("stored row = (%+v, %v), want complete", got, err)
+				}
+				if sync {
+					up, err := a.GetRepoUpstream(ctx, repo.RepoID)
+					if err != nil || !up.SyncPending {
+						t.Fatalf("upstream = (%+v, %v), want the first sync requested", up, err)
+					}
+				}
+			})
+		}
 	}
 }
 
