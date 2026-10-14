@@ -203,16 +203,6 @@ type EventingStore interface {
 	// survives to that run's FinishSync and the finisher schedules a
 	// follow-up run. ErrNotFound when detached.
 	RequestSync(ctx context.Context, repoID string) error
-	// PendingSyncRepoIDs lists repos owing an inbound run at boot: a set
-	// sync_pending marker (accepted pull-upstream requests not yet
-	// covered by a claimed run) OR an in-flight claim (Syncing). The
-	// claim consumes the marker, so a run that crashed holding its claim
-	// is visible only through Syncing (issue #424). Local-mode boot
-	// recovery re-enqueues them (issue #86): queued local work dies with
-	// the process, and the restart that applies the EnvSyncStealLegacy
-	// opt-in would otherwise strand the very requests it is meant to
-	// heal until an unrelated trigger arrives.
-	PendingSyncRepoIDs(ctx context.Context) ([]string, error)
 	// TryBeginSync atomically claims a sync run (syncing false -> true)
 	// under a lease and returns the row as of the claim. holder is the
 	// caller's per-run claim token; the claim records it with an expiry
@@ -252,15 +242,6 @@ type EventingStore interface {
 	// levels only coalesce upward (issue #90). Same mark-before-enqueue
 	// protocol as RequestSync. ErrNotFound when detached.
 	RequestPush(ctx context.Context, repoID string, force bool) error
-	// PendingPushRepoIDs lists repos owing an outbound run at boot: a set
-	// PushPending level (accepted requests not yet covered by a claimed
-	// run) OR an in-flight claim (PushSyncing) — in local single-process
-	// mode any claim observed at boot belongs to the previous process and
-	// is provably dead, and its consumed marker means the plain pending
-	// scan would strand the accepted push. Local-mode boot recovery
-	// re-marks and re-enqueues these; the pg deployment recovers through
-	// River's durable job rescue instead and never calls this.
-	PendingPushRepoIDs(ctx context.Context) ([]string, error)
 	// TryBeginPush is TryBeginSync on the push_* lane: it claims the
 	// outbound run under a lease and consumes PushPending whole,
 	// reporting whether the run must force. There is no legacy adoption —

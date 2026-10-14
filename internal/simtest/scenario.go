@@ -182,7 +182,6 @@ const (
 	opSyncRequest
 	opPushRequest
 	opPushClaim
-	opPushRescue
 )
 
 var opTable = []struct {
@@ -206,7 +205,6 @@ var opTable = []struct {
 	{opSyncRequest, "sync-request", 4},
 	{opPushRequest, "push-request", 6},
 	{opPushClaim, "push-claim", 10},
-	{opPushRescue, "push-rescue", 3},
 }
 
 // simRepo is one simulated repository: its storage key plus the scratch
@@ -548,8 +546,6 @@ func (s *sim) doStep() error {
 		return s.doPushRequest(name, node, repo)
 	case opPushClaim:
 		return s.doPushClaim(name, node, repo)
-	case opPushRescue:
-		return s.doPushRescue(name, node)
 	}
 	panic(fmt.Sprintf("simtest: unhandled op kind %d", kind))
 }

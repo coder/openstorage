@@ -163,13 +163,13 @@ func TestS3WALMetaConvert(t *testing.T) {
 	if got, _ := storedS3WALMeta(t, cas); got.V != 1 || got.Seq != v1Seq {
 		t.Fatalf("refused write left v%d seq %d, want v1 seq %d", got.V, got.Seq, v1Seq)
 	}
-	// Back to v2: the claimed lane is pending, and v2 boot lists it.
+	// Back to v2: the claimed lane is still claimed and pending, so the
+	// sweep runs it once the claim expires.
 	if _, err := ConvertS3WALMeta(ctx, cas, 2); err != nil {
 		t.Fatal(err)
 	}
-	ids, err := st.PendingSyncRepoIDs(ctx)
-	if err != nil || len(ids) != 1 || ids[0] != repoID {
-		t.Fatalf("PendingSyncRepoIDs = %v, %v", ids, err)
+	if up, err := st.GetRepoUpstream(ctx, repoID); err != nil || !up.Syncing || !up.SyncPending {
+		t.Fatalf("lane after --to 2 = %+v, %v; want claimed and pending", up, err)
 	}
 }
 

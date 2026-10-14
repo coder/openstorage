@@ -126,52 +126,6 @@ func testPushClaimForceInheritance(t *testing.T, s Backend) {
 	}
 }
 
-func TestPendingPushIncludesOrphanedClaims(t *testing.T) { runBackends(t, testPendingPushOrphans) }
-
-// Local-mode boot recovery must see repos whose previous process died AFTER
-// its claim consumed the pending marker: PendingPushRepoIDs lists in-flight
-// claims too, not only marked rows.
-func testPendingPushOrphans(t *testing.T, s Backend) {
-	ctx := t.Context()
-	repoID := testRepoID(t, s, "")
-	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{
-		RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
-	}); err != nil {
-		t.Fatalf("SetRepoUpstream: %v", err)
-	}
-	if err := s.RequestPush(ctx, repoID, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, claimed, _, _, err := s.TryBeginPush(ctx, repoID, "holder-orphan", time.Minute); err != nil || !claimed {
-		t.Fatalf("claim = (%v, %v), want claimed", claimed, err)
-	}
-	// Marker consumed, claim in flight — the crashed-process row shape.
-	ids, err := s.PendingPushRepoIDs(ctx)
-	if err != nil {
-		t.Fatalf("PendingPushRepoIDs: %v", err)
-	}
-	found := false
-	for _, id := range ids {
-		found = found || id == repoID
-	}
-	if !found {
-		t.Fatalf("PendingPushRepoIDs = %v, want to include orphan-claimed %s", ids, repoID)
-	}
-	// A finished run clears the row out of the listing.
-	if _, err := s.FinishPush(ctx, repoID, "holder-orphan", true); err != nil {
-		t.Fatal(err)
-	}
-	ids, err = s.PendingPushRepoIDs(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range ids {
-		if id == repoID {
-			t.Fatalf("idle repo %s still listed for recovery", repoID)
-		}
-	}
-}
-
 func TestPushPendingLevels(t *testing.T) { runBackends(t, testPushPendingLevels) }
 
 func testPushPendingLevels(t *testing.T, s Backend) {
@@ -196,21 +150,6 @@ func testPushPendingLevels(t *testing.T, s Backend) {
 	}
 	if up.PushPending != 2 {
 		t.Fatalf("PushPending = %d after force+plain, want 2", up.PushPending)
-	}
-
-	// PendingPushRepoIDs surfaces the marked repo for boot recovery.
-	ids, err := s.PendingPushRepoIDs(ctx)
-	if err != nil {
-		t.Fatalf("PendingPushRepoIDs: %v", err)
-	}
-	found := false
-	for _, id := range ids {
-		if id == repoID {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("PendingPushRepoIDs = %v, want to include %s", ids, repoID)
 	}
 
 	// The claim consumes the marker whole and reports its force bit.

@@ -37,14 +37,12 @@ processes on a host):
   runs on the simulation's logical clock (`meta.WithNowFunc`), so lease
   expiry is a pure function of the seed;
 - **outbound push-forward claim leases and pending markers** (issue #136,
-  `push-request` / `push-claim` / `push-rescue`): the push_* lane PR #137
+  `push-request` / `push-claim`): the push_* lane PR #137
   added, driven the same way (RequestPush/TryBeginPush/FinishPush against
   the real meta store on the logical clock) with seeded transfer outcomes
   mirroring the worker's failure taxonomy — success, transient failure
   (the actor re-marks the durable pending level with the run's force,
-  like `schedulePushRetry`), terminal non-FF rejection (no retry) — plus
-  a boot-recovery op mirroring local-mode rescue (`PendingPushRepoIDs` +
-  plain re-mark).
+  like `schedulePushRetry`), terminal non-FF rejection (no retry).
 
 Storage calls pass through `SimRefStore`/`SimBlobStore`, which inject:
 
@@ -125,9 +123,8 @@ Checked from clean (never fault-injected) handles:
    covered == local; *force monotonicity* — the pending level only
    coalesces upward until a claim consumes it whole, the force
    TryBeginPush reports must equal the model mandate (marker force OR
-   inherited from a dead claim's persisted `push_claim_force`), and the
-   `push-rescue` op exercises the documented plain re-mark downgrade whose
-   mandate must survive on the claim row alone; *lease safety* — the #88
+   inherited from a dead claim's persisted `push_claim_force`), so a dead
+   claim's mandate survives on the claim row alone; *lease safety* — the #88
    liveness/steal/late-finish choreography, push edition; *lane isolation*
    — one shared full-row mirror (`checkUpstreamMirror`) compares every
    sync_* AND push_* column after every mutation point in either lane, so
