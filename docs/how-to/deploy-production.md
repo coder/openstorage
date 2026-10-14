@@ -436,9 +436,11 @@ or reschedules them. The server then
 stops accepting connections and drains in-flight requests until 8 seconds have passed.
 If requests are still running then, the server prints `drain incomplete` and one
 `still active` line per request (method, path and age) to stderr. It then stops the Git
-processes of unfinished clone, fetch and push requests (`upload-pack`, `receive-pack`
-and its hooks): `SIGTERM` first, `SIGKILL` 1 second later, and the last second lets the
-requests end. None of them outlives the server. It then stops background workers and, in
+processes of unfinished requests (clone, fetch and push, including `receive-pack`'s
+hooks, REST reads and writes) and of cache hydration, including hydration for repacks:
+`SIGTERM` first, `SIGKILL` 1 second later, and the last second lets the requests end.
+None of them outlives the server, and the server starts no new one. It then stops
+background workers and, in
 [zero-infra mode](#zero-infrastructure-mode-experimental-one-bucket-one-node), releases
 the instance lease so a successor need not wait out the lease TTL. A second signal
 during the drain stops those Git processes within 0.2 seconds and then kills the server.
@@ -457,8 +459,9 @@ during the drain, and a supervisor that signals every process fails every push i
 at once. Under systemd, set `KillMode=mixed`: the default, `control-group`, sends
 `SIGTERM` to every process of the unit. Set `TimeoutStopSec` to at least 20 seconds: the
 10-second drain, then teardown, which in zero-infra mode includes up to 5 seconds of
-instance-lease release, plus margin. After it, systemd sends `SIGKILL` to every process
-left, and a server killed during lease release leaves the lease behind. The
+instance-lease release, plus margin. When the server exits, or when that timeout passes,
+systemd sends `SIGKILL` to every process left, and a server killed during lease release
+leaves the lease behind. The
 [AWS reference unit](../../deploy/terraform/aws/bootstrap/openstorage.service) uses
 `KillMode=mixed` and `TimeoutStopSec=30s`.
 

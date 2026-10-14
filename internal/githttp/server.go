@@ -25,6 +25,7 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -172,9 +173,6 @@ type Server struct {
 	// bounded by lfsMaxVerifyResumes.
 	lfsVerifyResumes  map[string]lfsVerifyResume
 	lfsVerifyResumeMu sync.Mutex
-	// gitChildren tracks the handlers' git service children for
-	// StopGitChildren (issue #440).
-	gitChildren gitChildren
 }
 
 // lfsMaxStagingOps bounds concurrent staging operations per replica
@@ -652,9 +650,9 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", "--advertise-refs", repoPath)
 	cmd.Stdout = w
 	cmd.Stderr = os.Stderr
-	if err := s.gitChildren.run(cmd); err != nil {
+	if err := gitlimit.Run(cmd); err != nil {
 		log.Printf("advertise %s %s: %v", service, repo, err)
-		s.gitChildren.abortIfStopped(err)
+		abortIfStopped(err)
 	}
 }
 
@@ -1018,7 +1016,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
-		if err := s.gitChildren.start(cmd); err != nil {
+		if err := gitlimit.Start(cmd); err != nil {
 			log.Printf("%s %s: start: %v", service, repo, err)
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
@@ -1117,13 +1115,13 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if err := gate.settle(overflow); err != nil {
 			log.Printf("%s %s: response: %v", service, repo, err)
 		}
-		runErr := s.gitChildren.wait(cmd)
+		runErr := gitlimit.Wait(cmd)
 		// receive-pack has exited: its local ref transaction is done and
 		// nothing the holds protect can still happen — release them
 		// before the repack trigger below (round-19 P2; the deferred
 		// release becomes a no-op).
 		releasePushHold()
-		s.gitChildren.abortIfStopped(runErr)
+		abortIfStopped(runErr)
 		if overflow {
 			// On the normal overflow path git saw the truncated stream
 			// during unpack — before any hook could run — and discarded
@@ -1160,7 +1158,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	} else {
 		cmd.Stdin = body
 		cmd.Stdout = w
-		runErr := s.gitChildren.run(cmd)
+		runErr := gitlimit.Run(cmd)
 		if runErr != nil {
 			// Headers are already sent; the pkt-line stream carries per-ref
 			// errors to the client. Just log.
@@ -1169,7 +1167,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// As on the capped path: the process has exited, so release the
 		// push holds before the repack trigger below (round-19 P2).
 		releasePushHold()
-		s.gitChildren.abortIfStopped(runErr)
+		abortIfStopped(runErr)
 	}
 	if service == "receive-pack" && s.MaybeRepack != nil {
 		// Unconditionally on completion, not only on success: pre-receive
@@ -1273,5 +1271,16 @@ func (s *Server) repackProbeWorker() {
 			delete(s.repackProbeQueued, repo)
 		}
 		s.repackProbeMu.Unlock()
+	}
+}
+
+// abortIfStopped aborts the response when a git child failed after
+// gitlimit.StopChildren began, so most likely by its signals: git 2.55
+// push waits forever on a 200 whose stream was cut off, but fails at once
+// on a dropped connection. The panic still runs the handler's deferred
+// cleanup.
+func abortIfStopped(err error) {
+	if err != nil && gitlimit.Stopping() {
+		panic(http.ErrAbortHandler)
 	}
 }

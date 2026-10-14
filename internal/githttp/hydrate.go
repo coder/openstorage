@@ -93,7 +93,7 @@ func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) 
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := gitlimit.Output(cmd)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			err = fmt.Errorf("%w: %w", cerr, err)
@@ -1215,7 +1215,7 @@ func startLocalRefSeq(ctx context.Context, repoPath string) (*localRefSeq, error
 	if err != nil {
 		return nil, err
 	}
-	if err := l.cmd.Start(); err != nil {
+	if err := gitlimit.Start(l.cmd); err != nil {
 		return nil, fmt.Errorf("git for-each-ref: %w", err)
 	}
 	l.sc = bufio.NewScanner(stdout)
@@ -1238,7 +1238,7 @@ func (l *localRefSeq) next() (string, string, bool, error) {
 		return "", "", false, fmt.Errorf("git for-each-ref: %w", err)
 	}
 	l.waited = true
-	if err := l.cmd.Wait(); err != nil {
+	if err := gitlimit.Wait(l.cmd); err != nil {
 		return "", "", false, fmt.Errorf("git for-each-ref: %w: %s", err, strings.TrimSpace(l.stderr.String()))
 	}
 	return "", "", false, nil
@@ -1252,7 +1252,7 @@ func (l *localRefSeq) close() {
 	}
 	l.waited = true
 	_ = l.cmd.Process.Kill()
-	_ = l.cmd.Wait()
+	_ = gitlimit.Wait(l.cmd)
 }
 
 // refCmd is one update-ref --stdin command plus the ref name it targets,
@@ -1506,7 +1506,7 @@ func updateRefStdin(repoPath, commands string) error {
 	cmd := exec.Command("git", "update-ref", "--stdin")
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(commands)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := gitlimit.CombinedOutput(cmd); err != nil {
 		return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
