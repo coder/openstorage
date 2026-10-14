@@ -45,6 +45,12 @@ func TestS3WALMetaDecode(t *testing.T) {
 				if doc != nil {
 					t.Fatalf("rejected document = %+v, want nil", doc)
 				}
+				// Only version rejections are typed (issue #445): the hook
+				// refuses on them and fails open on everything else.
+				var fv *FormatVersionError
+				if typed, want := errors.As(err, &fv), strings.Contains(tc.wantErr, "version"); typed != want {
+					t.Fatalf("decode error %v: typed = %v, want %v", err, typed, want)
+				}
 				return
 			}
 			if err != nil {
@@ -55,6 +61,74 @@ func TestS3WALMetaDecode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// failGetCAS makes every document read fail like an unreachable store.
+type failGetCAS struct{ s3wal.ConditionalStore }
+
+var errStoreDown = errors.New("store down")
+
+func (failGetCAS) Get(context.Context, string) (s3wal.Object, error) {
+	return s3wal.Object{}, errStoreDown
+}
+
+// TestCheckFormat: CheckFormat types a wrong format and only that (issue
+// #445). It reads without writing, and backends without a format version
+// pass without I/O.
+func TestCheckFormat(t *testing.T) {
+	const v1 = `{"v":1,"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`
+	var fv *FormatVersionError
+	for _, tc := range []struct {
+		name     string
+		seed     string // "" leaves the document missing
+		down     bool
+		wantType bool
+		wantErr  string
+	}{
+		{name: "missing document"},
+		{name: "v2", seed: `{"v":2,"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`},
+		{name: "v1", seed: v1, wantType: true, wantErr: "convert --to 2"},
+		{name: "v3", seed: `{"v":3,"seq":1}`, wantType: true, wantErr: "document version 3 unsupported (want 2)"},
+		{name: "corrupt", seed: `{`, wantErr: "document decode"},
+		{name: "store down", down: true, wantErr: errStoreDown.Error()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := s3wal.NewMemCAS()
+			if tc.seed != "" {
+				if _, err := mem.Create(t.Context(), s3walMetaKey, []byte(tc.seed)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var cas s3wal.ConditionalStore = mem
+			if tc.down {
+				cas = failGetCAS{mem}
+			}
+			st := NewS3WAL(cas)
+			t.Cleanup(st.Close)
+			before, _ := mem.Get(t.Context(), s3walMetaKey)
+			err := CheckFormat(t.Context(), st)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("CheckFormat = %v, want %q", err, tc.wantErr)
+			}
+			if got := errors.As(err, &fv); got != tc.wantType {
+				t.Fatalf("CheckFormat error %v: typed = %v, want %v", err, got, tc.wantType)
+			}
+			after, _ := mem.Get(t.Context(), s3walMetaKey)
+			if !bytes.Equal(before.Body, after.Body) || before.ETag != after.ETag {
+				t.Fatalf("CheckFormat changed the document: %q -> %q", before.Body, after.Body)
+			}
+		})
+	}
+	t.Run("sqlite", func(t *testing.T) {
+		st := sqliteBackend(t)
+		if err := CheckFormat(t.Context(), st); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 // s3walBackend is the s3wal lane fixture: a fresh MemCAS-backed store per

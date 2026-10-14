@@ -9,6 +9,12 @@
 > without a version bump, a tested in-place migration, and an operator
 > upgrade procedure. S3WAL stays experimental. Nothing here changes a
 > [#192](https://github.com/coder/openstorage/issues/192) promotion gate.
+>
+> **Amended by [#445](https://github.com/coder/openstorage/issues/445):** a v2 hook on a
+> v1 document now refuses the ref update with the conversion hint and writes nothing.
+> It no longer accepts the push without its events. A metadata store the hook cannot
+> reach still fails open. Fact 5, the missed-step note, the `hook` row of the
+> mixed-version table, and test-plan item 1 below predate that change.
 
 ## Context
 

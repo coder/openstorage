@@ -799,8 +799,9 @@ release first.
    not run `signing-key` or `purge-repo` until step 5 ends.
 2. Take a verified [stopped-node backup](backup-restore-s3wal.md).
 3. Replace the binary. Replace it only while `serve` is stopped: hooks run the binary at
-   the path `serve` started from, and a v2 hook on a v1 bucket accepts pushes but drops
-   their webhooks.
+   the path `serve` started from, and a v2 hook on a v1 bucket refuses every push with
+   `document version 1 needs conversion` until step 4 converts the bucket. The refusal
+   writes nothing.
 4. Run `openstorage s3wal-meta convert --to 2` with the serve environment. If it reports
    a held lease, confirm that no `serve` runs, wait the holder's recorded TTL plus 2s
    (step 3 of [shutdown and restart](#s3wal-shutdown-and-restart)), and run it again. A

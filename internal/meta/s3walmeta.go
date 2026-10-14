@@ -249,11 +249,7 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 		return nil, fmt.Errorf("s3walmeta: document decode: %w", err)
 	}
 	if !slices.Contains(versions, doc.V) {
-		if doc.V == s3walMetaV1 {
-			// ADR-51 rollout R1: only the offline conversion reads v1.
-			return nil, fmt.Errorf("s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2` (docs/how-to/deploy-production.md#upgrading-the-s3wal-metadata-format)")
-		}
-		return nil, fmt.Errorf("s3walmeta: document version %d unsupported (want %s)", doc.V, wantVersions(versions))
+		return nil, &FormatVersionError{Got: doc.V, Want: versions}
 	}
 	if doc.Seq < 1 {
 		return nil, fmt.Errorf("s3walmeta: document seq %d invalid (stored documents start at 1)", doc.Seq)
@@ -264,6 +260,40 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 	assertf(doc.NextOrgID >= 0 && doc.NextKeyID >= 0,
 		"s3walmeta: document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
 	return &doc, nil
+}
+
+// FormatVersionError reports a readable metadata document whose format
+// version this read does not accept (ADR-51). Unlike a store error it is
+// not transient: the store answered, and only a format conversion (or the
+// matching binary) helps. Callers that fail open on store trouble, such as
+// the hook's eventing (issue #445), refuse on this error instead.
+type FormatVersionError struct {
+	Got  int   // the stored document's version
+	Want []int // the versions this read accepts
+}
+
+func (e *FormatVersionError) Error() string {
+	if e.Got == s3walMetaV1 {
+		// ADR-51 rollout R1: only the offline conversion reads v1.
+		return "s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2` (docs/how-to/deploy-production.md#upgrading-the-s3wal-metadata-format)"
+	}
+	return fmt.Sprintf("s3walmeta: document version %d unsupported (want %s)", e.Got, wantVersions(e.Want))
+}
+
+// CheckFormat reads b's stored metadata document once and returns its
+// error: a *FormatVersionError when the format is wrong, a store error
+// when the read failed, nil otherwise (including a missing document, the
+// empty state). Backends without a format version (PostgreSQL, SQLite)
+// return nil without I/O. meta.Open never reads the document, so this is
+// the cheap way to learn the format before a write that must not proceed
+// on the wrong one.
+func CheckFormat(ctx context.Context, b Backend) error {
+	s, ok := b.(*S3WAL)
+	if !ok {
+		return nil
+	}
+	_, err := s.viewDoc(ctx)
+	return err
 }
 
 // wantVersions renders the accepted versions for an error message: "2",

@@ -179,7 +179,10 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 			if tc.disconnect {
 				inner = cancelAfterCAS{RefStore: rs, cancel: cancel}
 			}
-			wrapped := githttp.WrapHookRefStore(ctx, inner)
+			wrapped, err := githttp.WrapHookRefStore(ctx, inner)
+			if err != nil {
+				t.Fatal(err)
+			}
 			sha := strings.Repeat("a", 40)
 			won, err := wrapped.CASRef(pushCtx, repo.RepoID, "refs/heads/main", ref.ZeroSHA, sha)
 			if err != nil || !won {

@@ -150,13 +150,16 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// update hook's upstream lookup for sync intent (ADR-51): one
 	// conditional GET of _wal/meta.json. This repo has no upstream link,
 	// so the hook records nothing. A linked repo also records its intent
-	// with one metadata CAS, which this census does not measure.
-	const steadyBudget = 20
+	// with one metadata CAS, which this census does not measure. 21 = the
+	// update hook's format check before its CAS (issue #445): one GET of
+	// _wal/meta.json, so a wrong metadata format refuses the update instead
+	// of dropping its events. The post-CAS reads then revalidate with 304s.
+	const steadyBudget = 21
 	if len(steady) > steadyBudget {
 		t.Errorf("steady-state push cost %d S3 round trips, budget is %d:\n%s",
 			len(steady), steadyBudget, censusTable(steady))
 	}
-	const deleteBudget = 10 // 9 plus the same upstream lookup
+	const deleteBudget = 11 // 9 plus the same upstream lookup and format check
 	if len(deleteOnly) > deleteBudget {
 		t.Errorf("delete-only push cost %d S3 round trips, budget is %d:\n%s",
 			len(deleteOnly), deleteBudget, censusTable(deleteOnly))
