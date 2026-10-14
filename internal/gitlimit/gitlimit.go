@@ -3,7 +3,8 @@
 // admission pool, the per-child heap cap, and their error values. The
 // read API (internal/gitread, ADR-049) and cache maintenance
 // (internal/githttp's commit-graph refresh, ADR-47) both use it, so they
-// share one admission pool instead of each bounding itself. It is a leaf
+// share one admission pool instead of each bounding itself. It also tracks
+// serve's git children for the shutdown stop (children.go). It is a leaf
 // package: gitread imports githttp, so the shared pieces cannot live in
 // gitread.
 package gitlimit

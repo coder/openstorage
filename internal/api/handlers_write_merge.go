@@ -58,6 +58,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -163,7 +164,7 @@ var wmGitProbe struct {
 // --write-tree` and returns a clear error for older versions.
 func wmEnsureMergeTreeGit(ctx context.Context) error {
 	wmGitProbe.once.Do(func() {
-		out, err := exec.CommandContext(ctx, "git", "version").Output()
+		out, err := gitlimit.Output(exec.CommandContext(ctx, "git", "version"))
 		if err != nil {
 			wmGitProbe.err = fmt.Errorf("probe git version: %w", err)
 			return

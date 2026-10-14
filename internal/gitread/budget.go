@@ -405,7 +405,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 		out = &limitedBuffer{allow: b, kill: kill}
 		cmd.Stdout = out
 	}
-	err := cmd.Run()
+	err := gitlimit.Run(cmd)
 	stdout := ""
 	if out != nil {
 		stdout = out.buf.String()
