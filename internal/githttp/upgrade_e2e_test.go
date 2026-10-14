@@ -446,8 +446,23 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	if status := apiJSON(t, second, http.MethodPost, candidateToken, "/api/v1/repos", `{"default_branch":"main"}`, &candidateCreated); status != http.StatusCreated || candidateCreated.RepoID == "" {
 		t.Fatalf("candidate create repo status=%d", status)
 	}
-	phase("candidate: authenticated repo create (stored create_state) accepted")
+	phase("candidate: authenticated repo create accepted")
 	stop(second, "candidate-second")
+	obj, err = client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: new(bucket), Key: new("_wal/meta.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err = io.ReadAll(obj.Body)
+	_ = obj.Body.Close()
+	var v2 struct {
+		Repos map[string]struct {
+			CreateState int `json:"create_state"`
+		} `json:"repos"`
+	}
+	if err != nil || json.Unmarshal(stored, &v2) != nil || v2.Repos[candidateCreated.RepoID].CreateState != 2 {
+		t.Fatal("stopped v2 document lacks create_state 2 for the candidate-created repository")
+	}
+	phase("candidate-second: stopped v2 document stores create_state 2 for the candidate-created repository")
 	// The supported downgrade (ADR-51 D8): convert back, then the official
 	// release serves everything the candidate wrote.
 	convert("1")
