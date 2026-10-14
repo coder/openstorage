@@ -211,9 +211,10 @@ client and the `s3wal://` conditional client, in `serve` and in git-hook subproc
   process.
 - `role` comes from argv (`openstorage:serve`, `openstorage:hook:pre-receive`, …), so a
   shared log attributes each round trip to its process.
-- Background work in `serve` adds a scope to the role, so it is not mistaken for request
-  work: `openstorage:serve:schedule` for the sync schedule and
-  `openstorage:serve:keyrefresh` for the S3WAL org-key refresh.
+- Background work adds a scope to the role, so it is not mistaken for request work:
+  `openstorage:serve:schedule` for the sync schedule, and `<role>:keyrefresh` (for
+  example `openstorage:serve:keyrefresh`) for the S3WAL org-key refresh, which runs in
+  every process that opens an S3WAL metadata store.
 - Use it to count the S3 round trips (WAN round trips on real S3) behind a request.
 - Writes are `O_APPEND` one-line syscalls, safe for concurrent processes.
 - The log grows without bound and includes object keys. Use it temporarily, like a debug
