@@ -18,6 +18,12 @@
 > cannot reach still fails open. Fact 5, the missed-step note, the `hook` row of the
 > mixed-version table, and test-plan item 1 below predate that change.
 >
+> **Amended by [#452](https://github.com/coder/openstorage/issues/452) item 5:**
+> `--to 1` now also sets `sync_pending` on every unfinished sync create (pending, with a
+> live upstream link), so the v1 release runs its first sync at boot. It refuses, and
+> writes nothing, while a fork or copy create is unfinished, and names each repo. `--force`
+> converts anyway. The downgrade text below predates that change.
+>
 > **Known limit (#466):** the hook checks the document before its ref update, not
 > inside it. A conversion that runs between the check and the update lets that push
 > commit without its events. The procedure stops `serve` and its hooks before any

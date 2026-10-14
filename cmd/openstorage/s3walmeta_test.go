@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
@@ -38,7 +39,7 @@ func TestS3WALMetaConvertCommand(t *testing.T) {
 	ctx := context.Background()
 	cas := newV1Bucket(t)
 	var out bytes.Buffer
-	if err := runS3WALMetaConvert(ctx, cas, 2, s3wal.LeaseConfig{}, &out); err != nil {
+	if err := runS3WALMetaConvert(ctx, cas, 2, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "converted version 1 -> 2 (seq 1 -> 2), verified") || storedVersion(t, cas) != `{"v":2` {
@@ -48,12 +49,84 @@ func TestS3WALMetaConvertCommand(t *testing.T) {
 		t.Fatalf("lease after convert = %v, want released", err)
 	}
 	out.Reset()
-	if err := runS3WALMetaConvert(ctx, cas, 2, s3wal.LeaseConfig{}, &out); err != nil || !strings.Contains(out.String(), "already at version 2") {
+	if err := runS3WALMetaConvert(ctx, cas, 2, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil || !strings.Contains(out.String(), "already at version 2") {
 		t.Fatalf("re-run = %q, %v", out.String(), err)
 	}
 	out.Reset()
-	if err := runS3WALMetaConvert(ctx, cas, 1, s3wal.LeaseConfig{}, &out); err != nil || storedVersion(t, cas) != `{"v":1` {
+	if err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil || storedVersion(t, cas) != `{"v":1` {
 		t.Fatalf("downgrade = %q, %v", out.String(), err)
+	}
+}
+
+// --to 1 with an unfinished fork refuses, names the repo and the way out,
+// and releases the lease. --force converts and reports both kinds of
+// unfinished creates.
+func TestS3WALMetaConvertPendingCreatesCommand(t *testing.T) {
+	ctx := context.Background()
+	cas := s3wal.NewMemCAS()
+	st := meta.NewS3WAL(cas)
+	defer st.Close()
+	if _, err := st.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	fork, err := st.CreateRepoWithState(ctx, "org", "fork-pending", "main", meta.CreateStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sync, err := st.CreateLinkedRepo(ctx, "org", "sync-pending", "main",
+		meta.RepoUpstream{Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err = runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out)
+	if err == nil || !strings.Contains(err.Error(), fork.RepoID+` ("fork-pending")`) || !strings.Contains(err.Error(), "DELETE /repos/delete") || storedVersion(t, cas) != `{"v":2` {
+		t.Fatalf("refusal = %v, stored %s; want the fork named and v2 kept", err, storedVersion(t, cas))
+	}
+	if _, err := cas.Get(ctx, s3wal.LeaseKey); !errors.Is(err, s3wal.ErrNotExist) {
+		t.Fatalf("lease after refusal = %v, want released", err)
+	}
+	if err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{Force: true}, s3wal.LeaseConfig{}, &out); err != nil || storedVersion(t, cas) != `{"v":1` {
+		t.Fatalf("forced = %q, %v", out.String(), err)
+	}
+	for _, want := range []string{"first sync requested (the v1 release runs it at boot): " + sync.RepoID, "--force: 1 unfinished fork or copy creates", fork.RepoID + ` ("fork-pending")`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("forced output %q lacks %q", out.String(), want)
+		}
+	}
+}
+
+// Repo URLs come from token claims: the conversion output must never pass
+// control bytes or escape sequences to the operator's terminal.
+func TestS3WALMetaConvertQuotesRepoURLs(t *testing.T) {
+	ctx := context.Background()
+	cas := s3wal.NewMemCAS()
+	st := meta.NewS3WAL(cas)
+	defer st.Close()
+	if _, err := st.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	const hostile = "fork\x1b]52;c;aGk=\x07\r\nconverted\u009b31m"
+	if _, err := st.CreateRepoWithState(ctx, "org", hostile, "main", meta.CreateStatePending); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out)
+	if err == nil {
+		t.Fatal("refusal expected")
+	}
+	if err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{Force: true}, s3wal.LeaseConfig{}, &out); err != nil {
+		t.Fatal(err)
+	}
+	for name, s := range map[string]string{"refusal": err.Error(), "forced output": out.String()} {
+		// Raw ESC, BEL, CR and CSI must not appear; a raw newline would let
+		// the URL start a forged line.
+		if strings.ContainsAny(s, "\x1b\x07\r\u009b") || strings.Contains(s, "\nconverted") {
+			t.Fatalf("%s passes control bytes through: %q", name, s)
+		}
+		if !strings.Contains(s, `\x1b]52;c;aGk=\a\r\nconverted\u009b31m`) {
+			t.Fatalf("%s lacks the escaped URL: %q", name, s)
+		}
 	}
 }
 
@@ -67,7 +140,7 @@ func TestS3WALMetaConvertRefusesHeldLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer serve.Release(ctx)
-	err = runS3WALMetaConvert(ctx, cas, 2, s3wal.LeaseConfig{}, &bytes.Buffer{})
+	err = runS3WALMetaConvert(ctx, cas, 2, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &bytes.Buffer{})
 	if _, ok := errors.AsType[*s3wal.LeaseHeldError](err); !ok || !strings.Contains(err.Error(), "stop serve first") {
 		t.Fatalf("convert under a held lease = %v", err)
 	}
@@ -100,7 +173,7 @@ func TestS3WALMetaConvertStopsOnLeaseLoss(t *testing.T) {
 		return s3wal.FaultNone
 	}
 	slow := &slowGetCAS{MemCAS: cas, delay: 300 * time.Millisecond}
-	err := runS3WALMetaConvert(context.Background(), slow, 2, s3wal.LeaseConfig{TTL: 40 * time.Millisecond, Cadence: 10 * time.Millisecond}, &bytes.Buffer{})
+	err := runS3WALMetaConvert(context.Background(), slow, 2, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{TTL: 40 * time.Millisecond, Cadence: 10 * time.Millisecond}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "instance lease lost") {
 		t.Fatalf("convert = %v, want a lease loss", err)
 	}
@@ -129,7 +202,7 @@ func TestS3WALMetaConvertInterruptReleasesLease(t *testing.T) {
 	cas := newV1Bucket(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	err := runS3WALMetaConvert(ctx, &cancelGetCAS{MemCAS: cas, cancel: cancel}, 2, s3wal.LeaseConfig{}, &bytes.Buffer{})
+	err := runS3WALMetaConvert(ctx, &cancelGetCAS{MemCAS: cas, cancel: cancel}, 2, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &bytes.Buffer{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("interrupted convert = %v, want context.Canceled", err)
 	}

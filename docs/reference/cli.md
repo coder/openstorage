@@ -256,12 +256,13 @@ from a v1 release, and with `--to 1` before you go back to one. The steps are in
 [deployment guide](../how-to/deploy-production.md#upgrading-the-s3wal-metadata-format).
 
 ```
-openstorage s3wal-meta convert --to <1|2>
+openstorage s3wal-meta convert --to <1|2> [--force]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to` | required | Target version: `2` to upgrade, `1` to downgrade |
+| `--force` | off | With `--to 1` only: convert even while a fork or copy create is unfinished |
 
 The database URL (`OPENSTORAGE_PG_URL`) must be an `s3wal://` URL. The command:
 
@@ -275,7 +276,18 @@ The database URL (`OPENSTORAGE_PG_URL`) must be an `s3wal://` URL. The command:
 
 `--to 2` changes only the version. `--to 1` drops the four v2 fields and sets
 `sync_pending` on every lane whose pull claim is set, so a v1 release restarts that pull
-at boot. A document already at the target version is left unchanged (exit 0). A bucket
+at boot.
+
+`--to 1` also handles creates that had not finished (v1 stores no create state):
+
+- An unfinished sync create (a pending repo with its upstream link) keeps its first
+  sync: the command sets `sync_pending`, and the v1 release runs that sync at boot. The
+  output lists these repos.
+- An unfinished fork or copy create (a pending repo without an upstream link) would read
+  as a finished, possibly empty repository on v1. The command refuses, writes nothing,
+  and names each repo. Remove them first: start `serve` on this release, call
+  `DELETE /repos/delete` for each, stop `serve`, and convert again. `--force` converts
+  anyway and lists the repos in its output. A document already at the target version is left unchanged (exit 0). A bucket
 without a metadata document needs nothing: `serve` creates a v2 document.
 
 ## `openstorage version`
