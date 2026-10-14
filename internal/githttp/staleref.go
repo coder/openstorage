@@ -10,61 +10,32 @@ import (
 )
 
 // staleRefLockAge is how old a ref lock in a cache repo must be before
-// hydration may remove it (issue #464). Git holds a ref lock for the
-// milliseconds of one ref transaction, so a lock this old was left by a
-// killed git (SIGKILL inside the transaction, the OOM killer, a crash).
+// hydration reports it (issue #464). Git holds a ref lock for the
+// milliseconds of one ref transaction, so a lock this old was most likely
+// left by a killed git (SIGKILL inside the transaction, the OOM killer, a
+// crash).
 const staleRefLockAge = time.Minute
 
-// removeStaleRefLocks removes the stale locks that block an update-ref
-// batch for names in the cache repo at repoPath (issue #464): a git killed
-// inside its ref transaction leaves `<ref>.lock` (or `packed-refs.lock`)
-// behind, and nothing else removes it, so every later hydration of the
-// repository fails. The caller holds the repository's hydrate lock and
-// filtered out push-held refs. A lock is removed only when it is older
-// than staleRefLockAge and no process works in the repository (see
-// processInRepo): every git that can own a cache-repo ref lock
-// (receive-pack, its hooks, hydration, the REST writers) runs that way.
-// Without that proof (no /proc, an unreadable process table) nothing is
-// removed. exclude is a PID that cannot own a ref lock (hydration's own
-// for-each-ref), or 0. It returns the number of locks removed.
-func removeStaleRefLocks(repoPath string, names []string, exclude int) int {
-	type staleLock struct {
-		path string
-		fi   os.FileInfo
-	}
-	var stale []staleLock
+// reportOldRefLocks logs each lock older than staleRefLockAge that can
+// block a failed update-ref batch for names in the cache repo at repoPath
+// (issue #464), so an operator can follow the stale-ref-lock runbook in
+// docs/how-to/deploy-production.md. It never removes a lock: it cannot
+// prove that no live git owns one. It returns the number of locks logged.
+func reportOldRefLocks(repoPath string, names []string) int {
+	n := 0
 	for _, p := range refLockPaths(repoPath, names) {
 		fi, err := os.Lstat(p)
-		if err != nil || !fi.Mode().IsRegular() || time.Since(fi.ModTime()) < staleRefLockAge {
+		if err != nil || !fi.Mode().IsRegular() {
 			continue
 		}
-		stale = append(stale, staleLock{p, fi})
-	}
-	if len(stale) == 0 {
-		return 0
-	}
-	if pid, err := processInRepo(repoPath, exclude); err != nil {
-		log.Printf("hydrate %s: keeping %d old ref lock(s): cannot check for processes in the repository: %v", repoPath, len(stale), err)
-		return 0
-	} else if pid != 0 {
-		log.Printf("hydrate %s: keeping %d old ref lock(s): process %d works in the repository", repoPath, len(stale), pid)
-		return 0
-	}
-	removed := 0
-	for _, l := range stale {
-		// The pathname must still name the inspected file: a lock that a
-		// new writer created after the old one went away is live.
-		if fi, err := os.Lstat(l.path); err != nil || !os.SameFile(fi, l.fi) || !fi.ModTime().Equal(l.fi.ModTime()) {
+		age := time.Since(fi.ModTime())
+		if age < staleRefLockAge {
 			continue
 		}
-		if err := os.Remove(l.path); err != nil {
-			log.Printf("hydrate %s: remove stale ref lock: %v", repoPath, err)
-			continue
-		}
-		log.Printf("hydrate %s: removed stale ref lock %s (older than %v, no process works in the repository)", repoPath, strings.TrimPrefix(l.path, repoPath+string(filepath.Separator)), staleRefLockAge)
-		removed++
+		log.Printf("hydrate %s: ref lock %s is %v old and blocks ref updates; a killed git can leave one behind: see \"Stale ref locks\" in docs/how-to/deploy-production.md", repoPath, strings.TrimPrefix(p, repoPath+string(filepath.Separator)), age.Round(time.Second))
+		n++
 	}
-	return removed
+	return n
 }
 
 // refLockPaths lists the lock files that can block an update-ref batch for

@@ -271,16 +271,18 @@ not take openstorage's lock.
 **Stale ref locks.** A Git process killed inside a ref transaction (SIGKILL, the OOM
 killer, a crash) can leave `refs/<name>.lock` or `packed-refs.lock` in a cache repository.
 Every later hydration of that repository then fails with Git's `Unable to create
-'<path>.lock': File exists`, so clones and fetches of it fail on that replica. On Linux,
-hydration removes such a lock (also one below the ref, which blocks a directory/file
-rename) and retries once, when the lock is older than 1 minute and no process works in the
-repository: none has its working directory inside it, and no command-line path or
-`GIT_DIR` of a process, resolved against its working directory and symlinks, points
-inside it. Each removal logs `removed stale ref lock <path>`. Other
-platforms never remove one: stop the replica, check as in step 3 above that no Git
-process works in the cache, and delete the lock file. A Git process in another PID
-namespace (another container that shares the cache volume) is invisible to this check.
-Do not share a cache directory between containers.
+'<path>.lock': File exists`, so clones and fetches of it fail on that replica. When a ref
+update fails, hydration logs `hydrate <repo>: ref lock <path> is <age> old and blocks ref
+updates` for each such lock older than 1 minute, also for a lock below the ref (it blocks
+a directory/file rename). openstorage never removes a ref lock itself, for the same
+reason as above. To recover:
+
+1. Take the repository path and the lock path from that log line. The lock path is
+   relative to the repository.
+2. Drain and stop the replica, and make sure no Git process works in the cache, as in
+   steps 2 and 3 above.
+3. Remove each lock file the log names: `rm <repo>/<path>`.
+4. Start the replica. The next clone or fetch hydrates the repository again.
 
 ## Concurrent boot: schema setup and migrations
 
