@@ -16,14 +16,9 @@ import (
 	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
-// Serve gets the durable schedule through LocalSchedule on SQLite and
-// S3WAL. The hook subprocess still asserts LocalScheduleStore to decide
-// whether it records intent, so *S3WAL itself must not satisfy it until
-// S3WAL hooks record intent (issue #335).
+// Serve and the hook subprocess get the durable schedule through
+// LocalSchedule on SQLite and S3WAL, and never on PostgreSQL.
 func TestLocalScheduleBackends(t *testing.T) {
-	if _, ok := any(&S3WAL{}).(LocalScheduleStore); ok {
-		t.Fatal("*S3WAL satisfies LocalScheduleStore: S3WAL hooks would record intent")
-	}
 	s3 := &S3WAL{}
 	if ls, ok := LocalSchedule(s3); !ok || ls != (s3walLocalSchedule{s3}) {
 		t.Fatalf("LocalSchedule(*S3WAL) = (%v, %v), want the S3WAL adapter", ls, ok)

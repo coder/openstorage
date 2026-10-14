@@ -4,10 +4,8 @@
 // of _wal/meta.json, and every transition that ends a run is guarded by
 // that run's claim holder.
 //
-// The transitions live on s3walLocalSchedule, not on *S3WAL, so that
-// *S3WAL does not satisfy LocalScheduleStore: serve gets the schedule
-// through LocalSchedule, while the hook subprocess still type-asserts the
-// interface and does not record intent on S3WAL yet (issue #335).
+// The transitions live on s3walLocalSchedule, not on *S3WAL: serve and the
+// hook subprocess get the schedule through LocalSchedule.
 //
 // Ambiguous PUTs: like FinishSync, the finish transitions classify a
 // superseded write by its effect. A thief that stole and finished an

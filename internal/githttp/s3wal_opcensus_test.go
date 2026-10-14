@@ -105,6 +105,8 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// scanners are already off by default: LFS reclamation and absence
 	// reconciliation ship interval 0, and the reconcile ticker needs the
 	// non-default v0.2.0 write-compat flag (or a partial Heal) to start.
+	// The sync schedule's sweep (ADR-51) makes its first pass 15 s after
+	// boot (pendingSyncRecoveryDelay), after these pushes.
 	opLog := filepath.Join(t.TempDir(), "s3ops.log")
 	node := startNodeT(t, "OPENSTORAGE_S3_OP_LOG="+opLog, "OPENSTORAGE_REPACK_THRESHOLD=0",
 		"OPENSTORAGE_SWEEP_INTERVAL=0")
@@ -144,13 +146,17 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// bound requires justifying the new round trip against the census in
 	// that issue — on real S3 each one is user-visible push latency.
 	// 19 = ReservePackBytes reads fresh by design (s3walMutation.noSeed:
-	// its lapse-evidence write must never derive from a seed).
-	const steadyBudget = 19
+	// its lapse-evidence write must never derive from a seed). 20 = the
+	// update hook's upstream lookup for sync intent (ADR-51): one
+	// conditional GET of _wal/meta.json. This repo has no upstream link,
+	// so the hook records nothing. A linked repo also records its intent
+	// with one metadata CAS, which this census does not measure.
+	const steadyBudget = 20
 	if len(steady) > steadyBudget {
 		t.Errorf("steady-state push cost %d S3 round trips, budget is %d:\n%s",
 			len(steady), steadyBudget, censusTable(steady))
 	}
-	const deleteBudget = 9
+	const deleteBudget = 10 // 9 plus the same upstream lookup
 	if len(deleteOnly) > deleteBudget {
 		t.Errorf("delete-only push cost %d S3 round trips, budget is %d:\n%s",
 			len(deleteOnly), deleteBudget, censusTable(deleteOnly))
