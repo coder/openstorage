@@ -681,7 +681,7 @@ This is a deliberate single-node design that trades throughput for zero infrastr
 | One CAS point per repository group | Concurrent pushes to the *same* repository serialize on one object; hot-repo write throughput is a handful of ref flips per second, and contention shows up as CAS retries. Different repositories don't contend. |
 | Every ref/metadata operation is an S3 round trip | Latency floors are S3 latency, not local-disk or Postgres latency. Same-region compute is assumed. |
 | Manifest size | A repository group's whole registry lives in one JSON object: growth-guarded mutations warn above 4 MiB and are refused above 16 MiB; see the [size-guard scope](#s3wal-operational-signals) below. |
-| Background jobs are in-process | Tickers, no durable River queue; queued work dies with the process (durable request markers are re-enqueued at boot). Local mode instead keeps its sync and push schedule, including retry backoffs, in SQLite. |
+| Background jobs are in-process | Tickers, no durable River queue: queued webhook deliveries and other in-process jobs die with the process. The sync and push schedule, including retry backoffs, lives in the metadata document, as it lives in SQLite in local mode. |
 
 If any of these bind, use local mode (SQLite on a persistent volume) or the Postgres
 topology. Small single-tenant deployments, the target, sit far below them.

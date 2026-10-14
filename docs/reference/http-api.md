@@ -389,7 +389,7 @@ timestamp and `committer_date` the committer timestamp, as in upstream's spec of
 
 **Events and cancellation:** outbound runs emit `repo.push_upstream.*` events
 ([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. `DELETE /repos/base` silently cancels
-in-flight runs in both directions. With a SQLite or PostgreSQL database, a run that
+in-flight runs in both directions. A run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
 a new `repo.sync.started` (outbound: `repo.push_upstream.started`).
