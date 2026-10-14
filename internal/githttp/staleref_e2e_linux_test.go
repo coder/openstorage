@@ -18,9 +18,9 @@ import (
 // TestHydrateReportsStaleRefLock (issue #464): receive-pack's process group
 // is SIGKILLed while its ref transaction holds refs/heads/feat.lock, after
 // the ref store committed feat. Every fetch of that repository on the node
-// then fails. Once the lock is old, hydration names it in the log and
-// keeps it; the runbook (stop the node, remove the lock, start it) heals
-// the node.
+// then fails. Once the lock is old, hydration reports it in the log and
+// keeps it; the runbook (stop the node, delete the repository's cache
+// directory, start it) heals the node.
 func TestHydrateReportsStaleRefLock(t *testing.T) {
 	repo := registerRepo(t, "t-stale-lock-"+strconv.FormatInt(time.Now().UnixNano(), 36))
 	work := initWorkRepo(t)
@@ -93,13 +93,14 @@ func TestHydrateReportsStaleRefLock(t *testing.T) {
 	if _, err := os.Lstat(lock); err != nil {
 		t.Fatalf("hydration removed the lock: %v", err)
 	}
-	if !strings.Contains(stderr.String(), "ref lock refs/heads/feat.lock is ") {
+	if !strings.Contains(stderr.String(), repoPath+": 1 ref lock(s) older than") {
 		t.Error("serve did not report the stale lock")
 	}
 
-	// The runbook: stop the node, remove the lock, start the node.
+	// The runbook: stop the node, delete the repository's cache
+	// directory, start the node.
 	node.stop()
-	if err := os.Remove(lock); err != nil {
+	if err := os.RemoveAll(repoPath); err != nil {
 		t.Fatal(err)
 	}
 	node, err = startBinaryNode(binPath, cache, os.Stderr)

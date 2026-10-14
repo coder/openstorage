@@ -16,24 +16,22 @@ import (
 // crash).
 const staleRefLockAge = time.Minute
 
-// reportOldRefLocks logs each lock older than staleRefLockAge that can
-// block a failed update-ref batch for names in the cache repo at repoPath
-// (issue #464), so an operator can follow the stale-ref-lock runbook in
-// docs/how-to/deploy-production.md. It never removes a lock: it cannot
-// prove that no live git owns one. It returns the number of locks logged.
+// reportOldRefLocks logs one line when locks older than staleRefLockAge
+// can block a failed update-ref batch for names in the cache repo at
+// repoPath (issue #464), so an operator can follow the stale-ref-lock
+// runbook in docs/how-to/deploy-production.md. The line carries only a
+// count: a batch can leave thousands of locks, and their paths come from
+// ref names. It never removes a lock: it cannot prove that no live git
+// owns one. It returns the number of old locks.
 func reportOldRefLocks(repoPath string, names []string) int {
 	n := 0
 	for _, p := range refLockPaths(repoPath, names) {
-		fi, err := os.Lstat(p)
-		if err != nil || !fi.Mode().IsRegular() {
-			continue
+		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && time.Since(fi.ModTime()) >= staleRefLockAge {
+			n++
 		}
-		age := time.Since(fi.ModTime())
-		if age < staleRefLockAge {
-			continue
-		}
-		log.Printf("hydrate %s: ref lock %s is %v old and blocks ref updates; a killed git can leave one behind: see \"Stale ref locks\" in docs/how-to/deploy-production.md", repoPath, strings.TrimPrefix(p, repoPath+string(filepath.Separator)), age.Round(time.Second))
-		n++
+	}
+	if n > 0 {
+		log.Printf("hydrate %s: %d ref lock(s) older than %v block ref updates; a killed git can leave them behind: see \"Stale ref locks\" in docs/how-to/deploy-production.md", repoPath, n, staleRefLockAge)
 	}
 	return n
 }
