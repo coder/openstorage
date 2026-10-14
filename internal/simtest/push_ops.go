@@ -19,16 +19,15 @@
 //     covers through its snapshot. At quiescence every accepted request
 //     must be covered by a postdating successful run, terminally rejected
 //     (non-FF, needs a human), or still CARRIED (pending marker set or an
-//     orphaned claim a rescue scan finds) — and the final claim+finish per
+//     orphaned claim a later steal takes over) — and the final claim+finish per
 //     repo converges covered == local (upstream refs equal local refs);
 //  2. force monotonicity: the model pending level only coalesces upward
 //     until a claim consumes it whole, the force TryBeginPush reports must
 //     equal the model mandate (pending == force OR inherited from a dead
 //     claim's persisted push_claim_force), and the full-row mirror turns
 //     any unmodeled marker downgrade into a violation at the very next
-//     observation. The push-rescue op exercises the documented downgrade:
-//     boot recovery re-marks at the PLAIN level, so the mandate must
-//     survive on the dead claim's push_claim_force alone;
+//     observation. A dead claim's force mandate survives on its
+//     push_claim_force alone, and the steal inherits it;
 //  3. lease safety: at most one unexpired holder per repo (fresh claims
 //     only against idle rows, steals only of expired claims naming the
 //     exact previous holder, refusals only against live ones), and a
@@ -45,7 +44,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/coder/openstorage/internal/meta"
@@ -295,57 +293,6 @@ func (s *sim) checkPushRow(ctx context.Context, repoKey string, now time.Time, o
 	return s.checkUpstreamMirror(ctx, repoKey, op)
 }
 
-// doPushRescue mimics local-mode boot recovery (cmd/openstorage
-// wire_eventing.go, issue #90): PendingPushRepoIDs lists repos owing an
-// outbound run — pending marker set OR an in-flight claim — and each gets
-// re-marked at the PLAIN level. This is the documented once-per-rescue
-// marker downgrade: the force mandate is NOT on the marker but on the
-// claim's push_claim_force, which the eventual steal inherits (the
-// claim-time force cross-check in doPushClaim proves it survived).
-func (s *sim) doPushRescue(name string, node *simNode) error {
-	ctx := context.Background()
-	ids, err := node.metaStore.PendingPushRepoIDs(ctx)
-	if err != nil {
-		return fmt.Errorf("step %d: PendingPushRepoIDs: %w", s.step, err)
-	}
-	// The listed set must be exactly the repos the model says owe a run.
-	var want []string
-	for _, r := range s.repos {
-		if s.pushPending[r.key] > 0 || s.pushClaims[r.key] != nil {
-			want = append(want, r.key)
-		}
-	}
-	// The store lists repo_ids in byte order; the sim's creation order
-	// diverges from it at >= 11 repos (simrepo10 < simrepo2).
-	sort.Strings(want)
-	if len(ids) != len(want) {
-		s.violate("step %d: push-rescue: PendingPushRepoIDs = %v, model owes %v", s.step, ids, want)
-		return nil
-	}
-	for i := range ids {
-		if ids[i] != want[i] {
-			s.violate("step %d: push-rescue: PendingPushRepoIDs = %v, model owes %v", s.step, ids, want)
-			return nil
-		}
-	}
-	for _, id := range ids {
-		if err := node.metaStore.RequestPush(ctx, id, false); err != nil {
-			return fmt.Errorf("step %d: rescue RequestPush %s: %w", s.step, id, err)
-		}
-		if s.pushPending[id] < 1 {
-			s.pushPending[id] = 1
-		}
-		if err := s.checkUpstreamMirror(ctx, id, "push-rescue"); err != nil {
-			return err
-		}
-		if s.stopped {
-			return nil
-		}
-	}
-	s.tracef("step=%04d op=%s node=%d rescued=%d", s.step, name, node.id, len(ids))
-	return nil
-}
-
 // processPushFinishes completes every live run whose transfer duration has
 // elapsed (called at the start of each step, before the step's op).
 // Crashed runs are dropped without a FinishPush — their claims must be
@@ -484,7 +431,7 @@ func (s *sim) pushKillNode(nodeID int) int {
 // re-marks included), then check the #79-style coverage argument — an
 // accepted request not covered by a postdating successful run and not
 // terminally rejected must still be CARRIED by the pending marker or an
-// orphaned claim (exactly what a rescue scan finds) — and run one final
+// orphaned claim (which a later steal takes over) — and run one final
 // claim+finish per repo, which must succeed (a refusal is a wedged row),
 // carry any inherited force mandate, and converge the upstream: covered
 // version equals local version, i.e. upstream refs equal local refs.

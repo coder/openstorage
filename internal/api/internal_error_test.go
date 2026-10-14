@@ -129,8 +129,6 @@ func (f failingStore) DeleteRepoUpstream(context.Context, string) error { return
 
 func (f failingStore) RequestSync(context.Context, string) error { return f.err }
 
-func (f failingStore) PendingSyncRepoIDs(context.Context) ([]string, error) { return nil, f.err }
-
 func (f failingStore) TryBeginSync(context.Context, string, string, time.Duration) (meta.RepoUpstream, bool, string, error) {
 	return meta.RepoUpstream{}, false, "", f.err
 }
@@ -140,8 +138,6 @@ func (f failingStore) FinishSync(context.Context, string, string, bool) (meta.Re
 }
 
 func (f failingStore) RequestPush(context.Context, string, bool) error { return f.err }
-
-func (f failingStore) PendingPushRepoIDs(context.Context) ([]string, error) { return nil, f.err }
 
 func (f failingStore) TryBeginPush(context.Context, string, string, time.Duration) (meta.RepoUpstream, bool, bool, string, error) {
 	return meta.RepoUpstream{}, false, false, "", f.err

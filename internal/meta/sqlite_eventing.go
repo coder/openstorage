@@ -477,29 +477,6 @@ func (s *SQLite) RequestSync(ctx context.Context, repoID string) error {
 	return nil
 }
 
-// PendingSyncRepoIDs lists repos with the sync_pending marker set or an
-// in-flight claim (see the EventingStore contract; issues #86 and #424).
-func (s *SQLite) PendingSyncRepoIDs(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT repo_id FROM repo_upstreams WHERE sync_pending = 1 OR syncing = 1 ORDER BY repo_id`)
-	if err != nil {
-		return nil, fmt.Errorf("list pending sync repos: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("list pending sync repos: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list pending sync repos: %w", err)
-	}
-	return ids, nil
-}
-
 // TryBeginSync atomically claims a sync run (syncing false -> true) under
 // a lease and consumes sync_pending (the claimed run's fetch postdates
 // every request marked before the claim). An EXPIRED claim is stolen in
@@ -694,30 +671,6 @@ func (s *SQLite) RequestPush(ctx context.Context, repoID string, force bool) err
 	}
 	assertf(n == 1, "UPDATE by primary key affected %d rows", n)
 	return nil
-}
-
-// PendingPushRepoIDs lists repos owing an outbound run at boot — pending
-// marker set OR orphaned in-flight claim (see the EventingStore contract;
-// local-mode boot recovery, issue #90).
-func (s *SQLite) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT repo_id FROM repo_upstreams WHERE push_pending > 0 OR push_syncing = 1 ORDER BY repo_id`)
-	if err != nil {
-		return nil, fmt.Errorf("list pending push repos: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("list pending push repos: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list pending push repos: %w", err)
-	}
-	return ids, nil
 }
 
 // TryBeginPush is TryBeginSync on the push_* lane (issue #90): BEGIN

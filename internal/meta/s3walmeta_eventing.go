@@ -756,23 +756,6 @@ func (s *S3WAL) RequestSync(ctx context.Context, repoID string) error {
 	})
 }
 
-// PendingSyncRepoIDs lists repos with the sync_pending marker set or an
-// in-flight claim (boot recovery, issues #86 and #424), ordered by repo id.
-func (s *S3WAL) PendingSyncRepoIDs(ctx context.Context) ([]string, error) {
-	doc, err := s.viewDoc(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var ids []string
-	for id, u := range doc.Upstreams {
-		if u.SyncPending || u.Syncing {
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	return ids, nil
-}
-
 // assertNoLegacyClaim crashes on claim shapes only pre-lease SQL replicas
 // can write: no pre-s3walmeta binary exists, so hitting one means the
 // document was corrupted or edited out-of-band.
@@ -1100,24 +1083,6 @@ func (s *S3WAL) RequestPush(ctx context.Context, repoID string, force bool) erro
 			return true, nil
 		},
 	})
-}
-
-// PendingPushRepoIDs lists repos owing an outbound run at boot — pending
-// marker set OR orphaned in-flight claim (see the EventingStore
-// contract), ordered by repo id.
-func (s *S3WAL) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
-	doc, err := s.viewDoc(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var ids []string
-	for id, u := range doc.Upstreams {
-		if u.PushPending > 0 || u.PushSyncing {
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	return ids, nil
 }
 
 // TryBeginPush is TryBeginSync on the push_* lane (issue #90): claims the
