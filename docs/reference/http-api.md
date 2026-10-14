@@ -164,18 +164,27 @@ about the endpoint's rollout status on upstream clusters.
 - Any other create of a live name → **409**: a different upstream or `forward_pushes`, a sync
   create of a repo without an upstream, and every plain, copy and fork create (upstream
   answers 200 there; [#388](https://github.com/coder/openstorage/issues/388) tracks it).
-  Repos without a stored create state answer 409 to every repeat create, because
-  open.storage cannot tell whether their create finished. These are repos created before
-  this release, and S3-WAL repos created before S3-WAL stored the create state (#335).
+  Repos created before create tracking answer 409 to every repeat create, because
+  open.storage cannot tell whether their create finished. On S3-WAL, these include sync
+  creates made before #335.
 - A deleted repo keeps its name → **404**. Nothing is restored.
 - A sync create whose first sync cannot be scheduled → **503** with `Retry-After`. The repo,
   its upstream link and its credential exist, but the create is pending. Either of these
   finishes it, with the stored link, and needs `git:write` and a token without ref-policy
   ops: a compatible repeat create (→ 200), or `POST /repos/pull-upstream` (→ 202). A
   repeat create with `repo:write` only → 403, naming `pull-upstream`.
-- A pending sync create whose upstream link was removed (`DELETE /repos/base`) stays
-  pending → **503** without `Retry-After`, and `pull-upstream` → 400. Only
-  `DELETE /repos/delete` clears it (the name then answers 404).
+- A copy or fork create is pending from its insert until its default branch is written.
+  Meanwhile a plain, copy or fork create of the name → **503** with `Retry-After`, and a
+  sync create → 409. When the fork fails, the repo is deleted and the name answers 404.
+  When it succeeds, repeat creates answer as for any complete repo.
+- A pending create can stay pending, and repeat creates then answer the same until
+  `DELETE /repos/delete` clears the name (it then answers 404):
+  - a fork or copy whose server crashed, or whose last step (marking the create complete)
+    failed and answered 500: plain, copy and fork creates → 503;
+  - a sync create whose upstream link was removed (`DELETE /repos/base`) before its first
+    sync was scheduled: the create that finds the link gone → **503** without
+    `Retry-After`. After that the repo has no link, so a plain, copy or fork create →
+    503, a sync create → 409, and `pull-upstream` → 400.
 
 **`PATCH /repo` rules:**
 

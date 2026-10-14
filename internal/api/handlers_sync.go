@@ -358,7 +358,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		s.answerTakenSyncName(w, r, claims, url, link)
 		return
 	case errors.Is(err, meta.ErrAlreadyExists):
-		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url)
+		answerTakenName(w, r, s.store, s.internalErr, claims.Iss, url, spec != nil)
 		return
 	case errors.Is(err, meta.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "organization not found")
@@ -427,10 +427,6 @@ func (s *syncServer) linked() meta.EventingStore {
 	return es
 }
 
-// pendingSyncRetryAfter is the Retry-After (seconds) of a 503 for a
-// pending sync create.
-const pendingSyncRetryAfter = "5"
-
 // completeOwnSyncCreate schedules the first sync of the pending repo this
 // request just inserted, and marks the create complete (issue #388). It
 // reports whether the caller may answer 201; otherwise it wrote the
@@ -458,12 +454,12 @@ func (s *syncServer) syncCompletionOK(w http.ResponseWriter, r *http.Request, or
 		return false
 	case err != nil:
 		s.logger.Error("schedule first sync; the repository stays pending", "org", org, "repo_id", repoID, "err", err)
-		w.Header().Set("Retry-After", pendingSyncRetryAfter)
+		w.Header().Set("Retry-After", pendingCreateRetryAfter)
 		writeErr(w, http.StatusServiceUnavailable,
 			"the repository exists, but its first sync could not be scheduled; retry the create with a git:write token, or POST /repos/pull-upstream")
 		return false
 	case out == meta.CreateDeleted:
-		writeErr(w, http.StatusNotFound, "repository "+strconv.Quote(url)+" was deleted, and its name cannot be reused")
+		writeErr(w, http.StatusNotFound, repoDeletedMsg(url))
 		return false
 	}
 	assertf(out == meta.CreateCompleted || out == meta.CreateAlreadyComplete, "CompleteSyncCreate outcome %d", out)
@@ -484,7 +480,7 @@ func (s *syncServer) answerTakenSyncName(w http.ResponseWriter, r *http.Request,
 	org := claims.Iss
 	repo, err := s.store.GetRepoByURL(r.Context(), org, url)
 	if err != nil || repo.CreateState == meta.CreateStateLegacy {
-		answerTakenName(w, r, s.store, s.internalErr, org, url) // 404 deleted, 409 legacy, or 500
+		answerTakenName(w, r, s.store, s.internalErr, org, url, true) // 404 deleted, 409 legacy, or 500
 		return
 	}
 	up, err := s.ups.GetUpstream(r.Context(), repo.RepoID)
