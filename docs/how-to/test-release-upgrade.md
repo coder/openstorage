@@ -16,7 +16,9 @@ conversion to v2 and the supported `s3wal-meta convert --to 1` downgrade.
 - Linux amd64, Docker, Git, Git-LFS, and authenticated `gh`.
 - Pinned tools from [`mise.toml`](../../mise.toml) (`mise install`).
 - A committed candidate: dirty source and unstamped binaries are rejected.
-- Inputs, logs, and receipts go outside the checkout.
+- Inputs, logs, and receipts go outside the checkout, under `EVIDENCE_BASE`
+  (default `${TMPDIR:-/tmp}`). Pick a filesystem that allows executables (the
+  attempt runs its frozen binaries) and keeps files until you archive them.
 
 ## Prepare immutable inputs
 
@@ -25,7 +27,7 @@ Download and verify the official release, then build the candidate:
 ```bash
 set -euo pipefail
 umask 077
-EVIDENCE=$(mktemp -d "$HOME/openstorage-upgrade.XXXXXX")
+EVIDENCE=$(mktemp -d "${EVIDENCE_BASE:-${TMPDIR:-/tmp}}/openstorage-upgrade.XXXXXX")
 mkdir "$EVIDENCE/inputs"
 # Deliberate operator acquisition, never performed by ordinary tests.
 TAG=$(git ls-remote origin refs/tags/v0.18.0 | cut -f1)
@@ -124,10 +126,12 @@ resolve the pinned compiler. Never change global Git or tool-manager settings.
    - matches clone HEAD, `git fsck --strict`, and materialized LFS bytes.
 5. A candidate Git/LFS write yields a webhook whose HMAC verifies with the original
    secret and names the new HEAD. A second cold restart serves the new HEAD and
-   bytes, stops cleanly, and releases its lease.
+   bytes, creates a repository, stops cleanly, and releases its lease. The stopped
+   v2 `meta.json` stores `create_state: 2` for that repository.
 6. `s3wal-meta convert --to 1` verifies, the candidate refuses the result, and the
    cold official release passes the same checks as step 4 on the candidate's HEAD and
-   LFS bytes.
+   LFS bytes. It also answers an authenticated `GET /api/v1/repo` for the
+   candidate-created repository with the same ID, name, and default branch.
 
 The attempt keeps `inputs.json`, frozen inputs, `phases.log`, active lease documents,
 quiescent inventories, per-process stderr, `convert-to-*.out`, and `inner-exit.txt`.
@@ -145,7 +149,8 @@ dumps, private `git.log`, or server stderr. Inspect artifacts before attaching a
 verify uploads with authenticated downloads.
 
 **Cleanup:** the test removes its processes, caches, Git repositories, ephemeral
-keys, receiver, and disposable SeaweedFS container with its bucket.
+keys, receiver, and disposable SeaweedFS container with its bucket. It never
+removes `$EVIDENCE`.
 
 - After an external kill, inspect the recorded process/container state and clean up
   only that attempt's resources.
