@@ -272,9 +272,11 @@ not take openstorage's lock.
 killer, a crash) can leave `refs/<name>.lock` or `packed-refs.lock` in a cache repository.
 Every later hydration of that repository then fails with Git's `Unable to create
 '<path>.lock': File exists`, so clones and fetches of it fail on that replica. On Linux,
-hydration removes such a lock and retries once when the lock is older than 1 minute and
-no process works in the repository: none has its working directory inside it, and none
-names it on its command line. Each removal logs `removed stale ref lock <path>`. Other
+hydration removes such a lock (also one below the ref, which blocks a directory/file
+rename) and retries once, when the lock is older than 1 minute and no process works in the
+repository: none has its working directory inside it, and no command-line path or
+`GIT_DIR` of a process, resolved against its working directory and symlinks, points
+inside it. Each removal logs `removed stale ref lock <path>`. Other
 platforms never remove one: stop the replica, check as in step 3 above that no Git
 process works in the cache, and delete the lock file. A Git process in another PID
 namespace (another container that shares the cache volume) is invisible to this check.

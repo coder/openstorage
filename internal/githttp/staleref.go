@@ -1,6 +1,7 @@
 package githttp
 
 import (
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -20,20 +21,23 @@ const staleRefLockAge = time.Minute
 // behind, and nothing else removes it, so every later hydration of the
 // repository fails. The caller holds the repository's hydrate lock and
 // filtered out push-held refs. A lock is removed only when it is older
-// than staleRefLockAge and no process works in the repository (its
-// working directory is inside it, or its command line names it): every
-// git that can own a cache-repo ref lock (receive-pack, its hooks,
-// hydration, the REST writers) runs that way. Without that proof (no
-// /proc, an unreadable process table) nothing is removed. It returns the
-// number of locks removed.
+// than staleRefLockAge and no process works in the repository (see
+// processInRepo): every git that can own a cache-repo ref lock
+// (receive-pack, its hooks, hydration, the REST writers) runs that way.
+// Without that proof (no /proc, an unreadable process table) nothing is
+// removed. It returns the number of locks removed.
 func removeStaleRefLocks(repoPath string, names []string) int {
-	var stale []string
+	type staleLock struct {
+		path string
+		fi   os.FileInfo
+	}
+	var stale []staleLock
 	for _, p := range refLockPaths(repoPath, names) {
 		fi, err := os.Lstat(p)
 		if err != nil || !fi.Mode().IsRegular() || time.Since(fi.ModTime()) < staleRefLockAge {
 			continue
 		}
-		stale = append(stale, p)
+		stale = append(stale, staleLock{p, fi})
 	}
 	if len(stale) == 0 {
 		return 0
@@ -43,27 +47,41 @@ func removeStaleRefLocks(repoPath string, names []string) int {
 		return 0
 	}
 	removed := 0
-	for _, p := range stale {
-		if err := os.Remove(p); err != nil {
+	for _, l := range stale {
+		// The pathname must still name the inspected file: a lock that a
+		// new writer created after the old one went away is live.
+		if fi, err := os.Lstat(l.path); err != nil || !os.SameFile(fi, l.fi) || !fi.ModTime().Equal(l.fi.ModTime()) {
+			continue
+		}
+		if err := os.Remove(l.path); err != nil {
 			log.Printf("hydrate %s: remove stale ref lock: %v", repoPath, err)
 			continue
 		}
-		log.Printf("hydrate %s: removed stale ref lock %s (older than %v, no process works in the repository)", repoPath, strings.TrimPrefix(p, repoPath+string(filepath.Separator)), staleRefLockAge)
+		log.Printf("hydrate %s: removed stale ref lock %s (older than %v, no process works in the repository)", repoPath, strings.TrimPrefix(l.path, repoPath+string(filepath.Separator)), staleRefLockAge)
 		removed++
 	}
 	return removed
 }
 
 // refLockPaths lists the lock files that can block an update-ref batch for
-// names: each loose ref's lock, and packed-refs.lock (deletions rewrite
-// packed-refs). Names that do not map to a path inside refs/ are skipped.
+// names: each loose ref's lock, the locks below it (a stale
+// `refs/heads/foo/bar.lock` keeps the directory that blocks creating
+// `refs/heads/foo`), and packed-refs.lock (deletions rewrite packed-refs).
+// Names that do not map to a path inside refs/ are skipped.
 func refLockPaths(repoPath string, names []string) []string {
 	paths := []string{filepath.Join(repoPath, "packed-refs.lock")}
 	for _, name := range names {
 		if !strings.HasPrefix(name, "refs/") || filepath.Clean(name) != name || strings.Contains(name, "..") {
 			continue
 		}
-		paths = append(paths, filepath.Join(repoPath, filepath.FromSlash(name))+".lock")
+		p := filepath.Join(repoPath, filepath.FromSlash(name))
+		paths = append(paths, p+".lock")
+		_ = filepath.WalkDir(p, func(sub string, d fs.DirEntry, err error) error {
+			if err == nil && d.Type().IsRegular() && strings.HasSuffix(sub, ".lock") {
+				paths = append(paths, sub)
+			}
+			return nil // a missing or unreadable directory just has no locks to offer
+		})
 	}
 	return paths
 }

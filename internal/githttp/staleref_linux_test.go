@@ -29,6 +29,7 @@ func TestRemoveStaleRefLocks(t *testing.T) {
 	}{
 		{name: "old loose lock", lock: "refs/heads/x.lock", mtime: old, removed: 1},
 		{name: "old packed-refs lock", lock: "packed-refs.lock", mtime: old, removed: 1},
+		{name: "old lock below the ref", lock: "refs/heads/x/y.lock", mtime: old, removed: 1},
 		{name: "young lock", lock: "refs/heads/x.lock"},
 		{name: "process works in the repo", lock: "refs/heads/x.lock", mtime: old, process: func(repo, _ string) *exec.Cmd {
 			cmd := exec.Command("sleep", "30")
@@ -43,17 +44,31 @@ func TestRemoveStaleRefLocks(t *testing.T) {
 			cmd.Dir = real
 			return cmd
 		}},
+		{name: "process names the repo relatively", lock: "refs/heads/x.lock", mtime: old, process: func(repo, _ string) *exec.Cmd {
+			cmd := exec.Command("sh", "-c", "sleep 30", "--git-dir="+filepath.Base(repo))
+			cmd.Dir = filepath.Dir(repo)
+			return cmd
+		}},
+		{name: "process with GIT_DIR", lock: "refs/heads/x.lock", mtime: old, process: func(repo, _ string) *exec.Cmd {
+			cmd := exec.Command("sleep", "30")
+			cmd.Dir = filepath.Dir(repo)
+			cmd.Env = append(os.Environ(), "GIT_DIR="+filepath.Base(repo))
+			return cmd
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			real := filepath.Join(t.TempDir(), "r.git")
 			if err := os.MkdirAll(filepath.Join(real, "refs", "heads"), 0o700); err != nil {
 				t.Fatal(err)
 			}
+			lock := filepath.Join(real, tc.lock)
+			if err := os.MkdirAll(filepath.Dir(lock), 0o700); err != nil {
+				t.Fatal(err)
+			}
 			repo := filepath.Join(t.TempDir(), "link.git") // the path hydration uses
 			if err := os.Symlink(real, repo); err != nil {
 				t.Fatal(err)
 			}
-			lock := filepath.Join(real, tc.lock)
 			if err := os.WriteFile(lock, []byte("0000000000000000000000000000000000000000\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
