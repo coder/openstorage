@@ -11,6 +11,13 @@
 > instead of `repo.sync.*` with `direction: "push"`, so the `repo.sync.*` bodies match
 > upstream's schemas. Mentions of `repo.sync.failed` for outbound runs below predate that
 > change.
+>
+> **Amended by [#451](https://github.com/coder/openstorage/pull/451) and
+> [#474](https://github.com/coder/openstorage/pull/474):** local-mode boot recovery and
+> `PendingPushRepoIDs` no longer exist. SQLite and S3WAL serves recover through the local
+> schedule's sweep, which lists expired claims as due work (`ListLocalWork`, ADR-50,
+> ADR-51), and the steal still inherits the dead claim's force mandate. The boot-recovery
+> text below predates that change.
 
 An outbound run is [ADR-30](030-upstream-sync-mirror-fetch-loopback-push-through-our-own-front-door.md)'s
 mirror image: mirror-fetch the LOCAL refs through this server's own
