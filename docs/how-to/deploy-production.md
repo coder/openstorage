@@ -277,11 +277,21 @@ updates` for each such lock older than 1 minute, also for a lock below the ref (
 a directory/file rename). openstorage never removes a ref lock itself, for the same
 reason as above. To recover:
 
-1. Take the repository path and the lock path from that log line. The lock path is
-   relative to the repository.
+1. Take the repository path from that log line (the text after `hydrate`). The server
+   builds it from your cache directory and a validated repository name. Do not use the
+   lock path after `ref lock` in a shell: it comes from a ref name, and a ref name can
+   contain shell syntax such as `$(...)`.
 2. Drain and stop the replica, and make sure no Git process works in the cache, as in
-   steps 2 and 3 above.
-3. Remove each lock file the log names: `rm <repo>/<path>`.
+   steps 2 and 3 above. Then no lock in that repository has a live owner.
+3. Remove the ref locks of that repository. Git refuses ref names that end in `.lock`,
+   so this removes no ref:
+
+   ```sh
+   repo='<repository path>'
+   test -d "$repo/refs" && find "$repo/refs" -type f -name '*.lock' -delete &&
+     rm -f -- "$repo/packed-refs.lock"
+   ```
+
 4. Start the replica. The next clone or fetch hydrates the repository again.
 
 ## Concurrent boot: schema setup and migrations
