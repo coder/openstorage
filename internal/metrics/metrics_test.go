@@ -65,6 +65,7 @@ func TestExpositionHasEveryFamilyWithInitializedSeries(t *testing.T) {
 		`openstorage_s3wal_manifest_size_guard_total{result="refuse"} `,
 		`openstorage_s3wal_meta_refused_total{class="decode"} `,
 		`openstorage_s3wal_meta_refused_total{class="vanished"} `,
+		`openstorage_s3wal_meta_refused_total{class="foreign_nonce"} `,
 		`openstorage_s3wal_meta_refused_total{class="vanished_mark"} `,
 		`openstorage_job_runs_total{job="orphan_sweep",result="success"} `,
 		`openstorage_job_runs_total{job="repack",result="noop"} `,

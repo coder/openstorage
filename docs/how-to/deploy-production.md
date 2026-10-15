@@ -884,7 +884,10 @@ and keeps running. It writes nothing. For a
 corrupt document, keep `serve` stopped and
 [restore from a verified stopped-node backup](backup-restore-s3wal.md#restore-and-validate-before-cutover).
 Do not edit the document. If the hook cannot reach the store, it still accepts the push
-without its webhooks.
+without its webhooks. A running `serve` that finds an edit only after it adopted the
+edited copy quarantines instead: every metadata operation and token check fails until a
+restart (`this process stopped trusting _wal/meta.json` in
+[S3WAL operational signals](#s3wal-operational-signals)). Restore first, then restart.
 
 **Known limit: the check-to-update window.** The hook checks the document before its ref
 update, not inside it. A conversion that runs while a push is between the check and its
