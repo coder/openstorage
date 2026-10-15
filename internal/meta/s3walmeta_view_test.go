@@ -90,9 +90,10 @@ func BenchmarkS3WALQuietRead(b *testing.B) {
 				if _, err := cas.Create(context.Background(), s3walMetaKey, body); err != nil {
 					b.Fatal(err)
 				}
+				// Before NewS3WAL: its key refresher reads the flag.
+				checkSharedView = mode == "sweep-checked"
 				st := NewS3WAL(cas)
 				defer st.Close()
-				checkSharedView = mode == "sweep-checked"
 				read := func() {
 					if strings.HasPrefix(mode, "sweep") {
 						if mode == "sweep-decode" {

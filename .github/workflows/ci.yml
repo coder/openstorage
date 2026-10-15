@@ -167,7 +167,7 @@ jobs:
         with:
           go-version-file: go.mod
       - run: git lfs version
-      - run: go test ./internal/githttp -count=1 -race -timeout=25m
+      - run: go test ./internal/githttp -tags=openstorage_viewcheck -count=1 -race -timeout=25m
         env:
           OPENSTORAGE_TEST_BACKEND: s3wal
       - run: go test ./internal/sync -tags=openstorage_viewcheck -run 'TestLocalSchedule' -count=1 -race -timeout=10m

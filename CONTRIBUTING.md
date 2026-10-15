@@ -7,7 +7,8 @@ Test lanes in depth: [testing reference](docs/reference/testing.md).
 
 1. Install the [prerequisites](#prerequisites), then `mise install`.
 2. Build: `go build ./cmd/openstorage`.
-3. Test: `go test ./... -count=1 -race -timeout=30m` plus the [other two lanes](#tests).
+3. Test: `go test ./... -tags=openstorage_viewcheck -count=1 -race -timeout=30m` plus the
+   [other two lanes](#tests).
 4. Lint: `golangci-lint run`.
 5. Open a PR with a [conventional title](#commit-and-pr-conventions); meet the [review bar](#the-review-bar).
 
@@ -123,7 +124,7 @@ CI gates every PR on these three lanes. The
 ```sh
 # 1. Default lane — the full suite on the production backends.
 #    Needs Docker (testcontainers boots Postgres + SeaweedFS) and git-lfs.
-go test ./... -count=1 -race -timeout=30m
+go test ./... -tags=openstorage_viewcheck -count=1 -race -timeout=30m
 
 # 2. Local lane — the git e2e suite on the zero-container backends
 #    (SQLite + file blobs). No Docker needed.
@@ -132,7 +133,7 @@ OPENSTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeou
 # 3. s3wal lane — the same git e2e suite on the zero-infra topology: ONE
 #    SeaweedFS bucket carrying refs + metadata + blobs, plus lane-only drills
 #    (restart-from-bucket-only, dual-serve refusal). Needs Docker.
-OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m
+OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -tags=openstorage_viewcheck -count=1 -race -timeout=25m
 ```
 
 The default lane also fans `internal/api`, `internal/meta`, and `internal/ref`
