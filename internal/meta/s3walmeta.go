@@ -518,12 +518,8 @@ type S3WAL struct {
 	cacheETag string
 	cacheBody []byte
 	lastSeq   int64
-	// rolledBack latches once a fetched document does not continue the
-	// cached one, the object vanishes (issue #488), or it changes into
-	// bytes that do not decode (issue #501): from then on only
-	// the cached document itself (the same bytes, or a 304 on its ETag)
-	// is accepted again, because a restored or recreated lineage can
-	// advance back to any seq with different contents.
+	// rolledBack is the before-adoption latch of the refusal model
+	// (issue #516, s3walmeta_refuse.go). Only refuse and heal write it.
 	rolledBack bool
 	// quarantined, once set, answers every read until the process
 	// restarts: the cached document is known corrupt but decodes, so
@@ -706,10 +702,10 @@ func (s *S3WAL) observeDoc(doc *s3walMetaDoc, body []byte) error {
 	same := bytes.Equal(body, s.cacheBody)
 	switch {
 	case s.rolledBack && !same, doc.Seq < s.lastSeq, doc.Seq == s.lastSeq && !same:
-		s.rolledBack = true
-		return &StaleDocumentError{Got: doc.Seq, Seen: s.lastSeq}
+		return s.refuse(refuseStale, &StaleDocumentError{Got: doc.Seq, Seen: s.lastSeq})
 	}
-	s.lastSeq, s.rolledBack = doc.Seq, false
+	s.lastSeq = doc.Seq
+	s.heal()
 	return nil
 }
 
@@ -746,7 +742,7 @@ func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, 
 	}
 	obj, err := s.cas.GetIfChanged(ctx, s3walMetaKey, s.cacheETag)
 	if errors.Is(err, s3wal.ErrNotModified) {
-		s.rolledBack = false // the store holds the cached document again
+		s.heal() // the store holds the cached document again
 		if shared && s.cacheView != nil {
 			s.checkViewIntact()
 			return s.cacheView, s.cacheETag, nil
@@ -766,8 +762,7 @@ func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, 
 		// lastSeq was observed is store infidelity or operator surgery.
 		// Latch it: a lineage recreated after the vanish is not the
 		// cached document either.
-		s.rolledBack = true
-		return nil, "", fmt.Errorf("s3walmeta read: %s vanished after seq %d was observed (the meta object is never deleted)", s3walMetaKey, s.lastSeq)
+		return nil, "", s.refuse(refuseVanished, fmt.Errorf("s3walmeta read: %s vanished after seq %d was observed (the meta object is never deleted)", s3walMetaKey, s.lastSeq))
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("s3walmeta read: %w", err)
@@ -821,8 +816,9 @@ func (s *S3WAL) adoptRead(obj s3wal.Object, shared bool) (*s3walMetaDoc, string,
 		if s.cacheETag != "" {
 			// The cached object changed into bytes that do not decode
 			// (issue #501). Latch like a vanish: a valid lineage that
-			// replaces them later is not the cached document either.
-			s.rolledBack = true
+			// replaces them later is not the cached document either. A
+			// first read has nothing to keep, so it only fails.
+			return nil, "", s.refuse(refuseDecode, err)
 		}
 		return nil, "", err
 	}
