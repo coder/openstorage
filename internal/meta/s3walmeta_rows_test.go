@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"maps"
@@ -121,6 +122,13 @@ func sweepAndPurgeS3WALMeta(t testing.TB, body []byte) *s3wal.MemCAS {
 	if err != nil {
 		return cas
 	}
+	s3walMetaPass(ctx, st, doc)
+	return cas
+}
+
+// s3walMetaPass is the pass of sweepAndPurgeS3WALMeta over st, for the
+// rows of doc.
+func s3walMetaPass(ctx context.Context, st *S3WAL, doc *s3walMetaDoc) {
 	orgs := slices.Sorted(maps.Keys(doc.Orgs))
 	repos := slices.Sorted(maps.Keys(doc.Repos))
 	hooks := slices.Sorted(maps.Keys(doc.Webhooks))
@@ -154,7 +162,6 @@ func sweepAndPurgeS3WALMeta(t testing.TB, body []byte) *s3wal.MemCAS {
 	for _, c := range cands {
 		_ = st.PurgeRepoMeta(ctx, c.RepoID)
 	}
-	return cas
 }
 
 // TestS3WALMetaSweepAndPurgeWriterDoc: the pass itself works on a document
@@ -200,5 +207,49 @@ func FuzzS3WALMetaDocument(f *testing.F) {
 			return
 		}
 		sweepAndPurgeS3WALMeta(t, body)
+	})
+}
+
+// FuzzS3WALMetaSuccessor (issue #519, from the #516 design): a running
+// store that trusts a writer document meets the fuzzed bytes in its place.
+// It never panics, and once it refuses them (latch or quarantine), the
+// background-loop pass writes nothing.
+func FuzzS3WALMetaSuccessor(f *testing.F) {
+	trusted := writerS3WALMetaDoc(f)
+	f.Add(trusted)
+	for _, s := range s3walCorruptRowSeeds() {
+		f.Add([]byte(s.body))
+	}
+	f.Add([]byte(`{`))
+	f.Fuzz(func(t *testing.T, body []byte) {
+		ctx := context.Background()
+		cas := s3wal.NewMemCAS()
+		if _, err := cas.Create(ctx, s3walMetaKey, trusted); err != nil {
+			t.Fatal(err)
+		}
+		st := NewS3WAL(cas)
+		defer st.Close()
+		doc, err := st.viewDoc(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur, err := cas.Get(ctx, s3walMetaKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cas.Advance(ctx, s3walMetaKey, append([]byte{}, body...), cur.ETag); err != nil {
+			t.Fatal(err)
+		}
+		_ = CheckFormat(ctx, st)
+		st.mu.Lock()
+		refused := st.rolledBack || st.quarantined != nil
+		st.mu.Unlock()
+		if next, err := st.viewDoc(ctx); err == nil {
+			doc = next
+		}
+		s3walMetaPass(ctx, st, doc)
+		if after, err := cas.Get(ctx, s3walMetaKey); refused && (err != nil || !bytes.Equal(after.Body, body)) {
+			t.Fatalf("a store that refused the document wrote meta.json (err %v)", err)
+		}
 	})
 }
