@@ -186,6 +186,12 @@ func testMainInner(m *testing.M) int {
 	if viewCheckBuild(os.Args[1:]) {
 		buildArgs = append(buildArgs, "-tags=openstorage_viewcheck")
 		viewCheckLog = filepath.Join(scratch, "viewcheck.log")
+		// In this process's environment, so every launcher that passes
+		// os.Environ() to serve (startBinaryNode, startMetricsNode, …) and
+		// every hook serve spawns inherits it.
+		if err := os.Setenv(meta.ViewCheckLogEnv, viewCheckLog); err != nil {
+			panic(err)
+		}
 	}
 	build := exec.Command("go", append(buildArgs, "-o", binPath, "./cmd/openstorage")...)
 	build.Dir = "../.."
@@ -364,6 +370,10 @@ func testMainInner(m *testing.M) int {
 	defer nodeA.stop()
 
 	code := m.Run()
+	// Stop the shared node first: until it is reaped, its background work
+	// or hooks could still append a failure after the read below. Per-test
+	// nodes are already stopped by their tests' cleanups.
+	nodeA.stop()
 	if viewCheckLog != "" {
 		if raw, err := os.ReadFile(viewCheckLog); err == nil && len(raw) > 0 {
 			fmt.Fprintf(os.Stderr, "FAIL: a serve or hook process failed the shared metadata view check (issue #503):\n%s", raw)
@@ -511,9 +521,6 @@ func startBinaryNode(binary, cacheDir string, stderr io.Writer, extraEnv ...stri
 		// disable it by default; the dual-serve drill re-enables it via
 		// extraEnv (later duplicate wins).
 		cmd.Env = append(cmd.Env, "OPENSTORAGE_S3WAL_LEASE_TTL=0")
-	}
-	if viewCheckLog != "" {
-		cmd.Env = append(cmd.Env, meta.ViewCheckLogEnv+"="+viewCheckLog)
 	}
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.SysProcAttr = nodeSysProcAttr()
