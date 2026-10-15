@@ -162,3 +162,78 @@ func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, v2 []byte) []by
 		t.Fatalf("meta.json changed after the refusal:\nwant %s\ngot  %s", bad, got)
 	}
 }
+
+// TestS3WALServeSurvivesOlderMetadata (issue #488): when meta.json goes
+// back to an older seq while serve runs (here: an older copy put back, as a
+// restore into the live bucket would), serve keeps running. Metadata reads
+// answer errors, and serve writes nothing through the older document.
+// Before the fix, serve's org-key refresher panicked within 15 s.
+func TestS3WALServeSurvivesOlderMetadata(t *testing.T) {
+	if testBackend != backendS3WAL {
+		t.Skip("the metadata document is S3WAL-only (ADR-51)")
+	}
+	db, blobs := privateStores(t, t.TempDir())
+	node, err := startNode(t.TempDir(), "OPENSTORAGE_PG_URL="+db, "OPENSTORAGE_S3_URL="+blobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(node.stop)
+	u, err := url.Parse(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := u.Host
+	client := s3waltest.RawS3Client(u.Query().Get("endpoint"), "us-east-1", s3AccessKey, s3SecretKey)
+	readMeta := func() ([]byte, string) {
+		t.Helper()
+		obj, err := client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("_wal/meta.json")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = obj.Body.Close() }()
+		body, err := io.ReadAll(obj.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body, aws.ToString(obj.ETag)
+	}
+	create := func(name string) (string, string) {
+		t.Helper()
+		token := mintTestToken(t, "https://example.com/"+name+".git", "repo:write,git:read", "")
+		var created struct {
+			RepoID string `json:"repo_id"`
+		}
+		if status := apiJSON(t, node, http.MethodPost, token, "/api/v1/repos", "{}", &created); status != http.StatusCreated || created.RepoID == "" {
+			t.Fatalf("create %s: status=%d id=%q", name, status, created.RepoID)
+		}
+		return created.RepoID, token
+	}
+	// Read back a repo that both documents hold: serve answers it only if
+	// it adopted the older document.
+	_, token := create("older-488")
+	older, _ := readMeta()
+	create("newer-488")
+	_, etag := readMeta()
+	if _, err := client.PutObject(t.Context(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("_wal/meta.json"), Body: bytes.NewReader(older), IfMatch: aws.String(etag),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(16 * time.Second) // past one org-key refresher tick (15 s)
+	if code, _ := httpGet(t, "http://"+node.addr+"/healthz", ""); code != http.StatusOK {
+		t.Fatalf("serve /healthz = %d after meta.json went back, want 200 (serve died?)", code)
+	}
+	if status := apiGet(t, node, token, "/api/v1/repo", nil); status/100 == 2 {
+		t.Fatalf("repo read through the older document answered %d, want an error", status)
+	}
+	if err := node.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitNodeExit(t, node, 30*time.Second); err != nil {
+		t.Logf("serve exit after meta.json went back: %v", err)
+	}
+	if got, _ := readMeta(); !bytes.Equal(got, older) {
+		t.Fatalf("serve wrote meta.json through the older document:\nwant %s\ngot  %s", older, got)
+	}
+}

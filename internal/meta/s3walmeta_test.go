@@ -17,6 +17,7 @@ package meta
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -206,6 +207,170 @@ func TestS3WALMetaCorruptCountersNoPanic(t *testing.T) {
 	got, _ := mem.Get(t.Context(), s3walMetaKey)
 	if !bytes.Equal(got.Body, body) {
 		t.Fatalf("the store changed the document: %s", got.Body)
+	}
+}
+
+// waitReads waits until cas has served n more document reads, failing the
+// test instead of hanging when the refresher stops reading.
+func waitReads(t *testing.T, cas *countGetsCAS, n int32) {
+	t.Helper()
+	start := cas.reads.Load()
+	for deadline := time.Now().Add(10 * time.Second); cas.reads.Load() < start+n; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the org-key refresher made %d of %d reads in 10 s", cas.reads.Load()-start, n)
+		}
+	}
+}
+
+// TestS3WALMetaStaleDocumentNoPanic (issue #488): when the stored document
+// goes back to an older seq while the process runs (a stale read, or the
+// object replaced out of band), every read and write returns the typed
+// error and writes nothing, and the org-key refresher keeps running. Before
+// the fix, the watermark assertion panicked serve on the refresher's next
+// tick. A document at or past the watermark is served again.
+func TestS3WALMetaStaleDocumentNoPanic(t *testing.T) {
+	ctx := t.Context()
+	mem := s3wal.NewMemCAS()
+	cas := &countGetsCAS{ConditionalStore: mem}
+	st := newS3WALStore(cas, nil, nil, resolveOptions([]Option{withKeyRefreshInterval(time.Millisecond)}))
+	t.Cleanup(st.Close)
+	if _, err := st.UpsertOrgWithKeys(ctx, "o", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := mem.Get(ctx, s3walMetaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := st.CreateRepo(ctx, "o", "https://example.com/stale.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newest, err := mem.Get(ctx, s3walMetaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Put the older document back, as a restore into the live bucket would.
+	if _, err := mem.Advance(ctx, s3walMetaKey, old.Body, newest.ETag); err != nil {
+		t.Fatal(err)
+	}
+	replaced, _ := mem.Get(ctx, s3walMetaKey)
+
+	var stale *StaleDocumentError
+	if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); !errors.As(err, &stale) || stale.Got != 1 || stale.Seen != 2 {
+		t.Fatalf("GetRepoByID = %v, want a *StaleDocumentError for seq 1 after seq 2", err)
+	}
+	for _, want := range []string{"_wal/meta.json at seq 1 does not continue the document this process last saw at seq 2", "backup-restore-s3wal.md#restore-and-validate-before-cutover"} {
+		if !strings.Contains(stale.Error(), want) {
+			t.Fatalf("error %q lacks %q", stale, want)
+		}
+	}
+	if _, err := st.CreateRepo(ctx, "o", "https://example.com/other.git", "main"); !errors.As(err, &stale) {
+		t.Fatalf("CreateRepo = %v, want a *StaleDocumentError", err)
+	}
+	waitReads(t, cas, 3) // a panicking refresher kills the test binary
+	if got, _ := mem.Get(ctx, s3walMetaKey); got.ETag != replaced.ETag {
+		t.Fatalf("the store wrote through the older document: %s", got.Body)
+	}
+
+	// A fresh process (a hook) advances the restored lineage back to seq 2
+	// with different contents. The numeric catch-up must not end the
+	// refusal: the regression latches (Codex P1 on #496).
+	fresh := NewS3WAL(mem)
+	t.Cleanup(fresh.Close)
+	if _, err := fresh.CreateRepo(ctx, "o", "https://example.com/fork.git", "main"); err != nil {
+		t.Fatal(err)
+	}
+	forked, _ := mem.Get(ctx, s3walMetaKey)
+	if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); !errors.As(err, &stale) || stale.Got != 2 || stale.Seen != 2 {
+		t.Fatalf("GetRepoByID on the forked seq 2 = %v, want a *StaleDocumentError", err)
+	}
+
+	// Same seq and writer nonce as the cached document, other rows (an
+	// out-of-band edit that keeps the version fields), and the cached
+	// document reformatted: neither is the same bytes, so neither ends
+	// the refusal (Codex P2 on #496).
+	var edited map[string]any
+	if err := json.Unmarshal(newest.Body, &edited); err != nil {
+		t.Fatal(err)
+	}
+	delete(edited, "repos")
+	editedBody, err := json.Marshal(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var indented bytes.Buffer
+	if err := json.Indent(&indented, newest.Body, "", "  "); err != nil {
+		t.Fatal(err)
+	}
+	prev := forked.ETag
+	for name, body := range map[string][]byte{"edited": editedBody, "reformatted": indented.Bytes()} {
+		etag, err := mem.Advance(ctx, s3walMetaKey, body, prev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prev = etag
+		if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); !errors.As(err, &stale) || stale.Got != 2 {
+			t.Fatalf("GetRepoByID on the %s seq 2 = %v, want a *StaleDocumentError", name, err)
+		}
+	}
+
+	// The exact document this process last saw is served again (a stale
+	// read that the store later corrects): reads succeed.
+	if _, err := mem.Advance(ctx, s3walMetaKey, newest.Body, prev); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.GetRepoByID(ctx, "o", repo.RepoID); err != nil || got.RepoID != repo.RepoID {
+		t.Fatalf("GetRepoByID after the store caught up = %+v, %v", got, err)
+	}
+}
+
+// TestS3WALMetaVanishedDocumentLatches (Codex P2 on #496): when meta.json
+// vanishes while the process runs and another process recreates a new
+// lineage past the cached seq, the process keeps refusing it. Only the
+// cached document itself ends the refusal.
+func TestS3WALMetaVanishedDocumentLatches(t *testing.T) {
+	ctx := t.Context()
+	mem := s3wal.NewMemCAS()
+	st := NewS3WAL(mem)
+	t.Cleanup(st.Close)
+	if _, err := st.UpsertOrgWithKeys(ctx, "o", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := st.CreateRepo(ctx, "o", "https://example.com/vanish.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached, _ := mem.Get(ctx, s3walMetaKey) // seq 2
+	if err := mem.Delete(ctx, s3walMetaKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); err == nil || !strings.Contains(err.Error(), "vanished after seq 2") {
+		t.Fatalf("GetRepoByID after the vanish = %v, want the vanished error", err)
+	}
+	// A fresh process recreates the document and advances it to seq 3.
+	fresh := NewS3WAL(mem)
+	t.Cleanup(fresh.Close)
+	for _, name := range []string{"a", "b", "c"} {
+		if _, err := fresh.UpsertOrgWithKeys(ctx, name, []string{"pem"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recreated, _ := mem.Get(ctx, s3walMetaKey)
+	var stale *StaleDocumentError
+	if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); !errors.As(err, &stale) || stale.Got != 3 || stale.Seen != 2 {
+		t.Fatalf("GetRepoByID on the recreated seq 3 = %v, want a *StaleDocumentError", err)
+	}
+	if _, err := st.CreateRepo(ctx, "o", "https://example.com/other.git", "main"); !errors.As(err, &stale) {
+		t.Fatalf("CreateRepo = %v, want a *StaleDocumentError", err)
+	}
+	if got, _ := mem.Get(ctx, s3walMetaKey); got.ETag != recreated.ETag {
+		t.Fatal("the store wrote through the recreated document")
+	}
+	if _, err := mem.Advance(ctx, s3walMetaKey, cached.Body, recreated.ETag); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.GetRepoByID(ctx, "o", repo.RepoID); err != nil || got.RepoID != repo.RepoID {
+		t.Fatalf("GetRepoByID after the cached document returned = %+v, %v", got, err)
 	}
 }
 
