@@ -33,6 +33,11 @@ silently skipping LFS coverage.
 
 - `OPENSTORAGE_TEST_BACKEND` accepts `pg` (or unset), `local`, and `s3wal`;
   anything else panics in `TestMain` (`internal/githttp/e2e_test.go`).
+- The `openstorage_viewcheck` build tag makes every S3WAL metadata store check that no
+  caller wrote into its shared, read-only metadata view, and panic if one did. The
+  serve binary that `internal/githttp` builds always has the tag. CI's `test` job and
+  the s3wal lane's `internal/sync` step add `-tags=openstorage_viewcheck` to
+  `go test`, so add it locally to match CI. Release builds never set it.
 - The s3wal lane sets `OPENSTORAGE_S3WAL_LEASE_TTL=0`, because its shared-bucket
   multi-node tests are the topology the instance lease refuses. The dual-serve
   drill re-enables the lease.

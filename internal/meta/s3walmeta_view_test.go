@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/coder/openstorage/internal/ref/s3wal"
@@ -73,16 +74,17 @@ func TestS3WALSharedViewMutationAsserts(t *testing.T) {
 // BenchmarkS3WALQuietRead measures one quiet (304) read of the metadata
 // document by a read-only caller, as the sync sweep does once a second.
 // "decode" is the cost before #470 (decode on every 304), "shared" after.
-// "sweep" is one whole quiet sweep pass after #470: the shared read plus
-// ListLocalWork's scan of every lane.
+// The sweep modes time one whole quiet sweep pass (ListLocalWork, nothing
+// due): "sweep-decode" as before #470 (each pass decodes, then scans every
+// lane), "sweep" after it (shared view, then the scan), and "sweep-checked"
+// with the view check that tests and openstorage_viewcheck builds turn on
+// (issue #497). Release builds run "sweep".
 func BenchmarkS3WALQuietRead(b *testing.B) {
-	// Production has no view check; the test-only check decodes again.
 	saved := checkSharedView
-	checkSharedView = false
 	b.Cleanup(func() { checkSharedView = saved })
 	for _, n := range []int{1000, 10000} {
 		body := benchMetaDoc(b, n)
-		for _, mode := range []string{"decode", "shared", "sweep"} {
+		for _, mode := range []string{"decode", "shared", "sweep-decode", "sweep", "sweep-checked"} {
 			b.Run(fmt.Sprintf("repos=%d/%s", n, mode), func(b *testing.B) {
 				cas := s3wal.NewMemCAS()
 				if _, err := cas.Create(context.Background(), s3walMetaKey, body); err != nil {
@@ -90,8 +92,14 @@ func BenchmarkS3WALQuietRead(b *testing.B) {
 				}
 				st := NewS3WAL(cas)
 				defer st.Close()
+				checkSharedView = mode == "sweep-checked"
 				read := func() {
-					if mode == "sweep" {
+					if strings.HasPrefix(mode, "sweep") {
+						if mode == "sweep-decode" {
+							st.mu.Lock()
+							st.cacheView = nil // the 304 decodes again, as before #470
+							st.mu.Unlock()
+						}
 						if _, err := (s3walLocalSchedule{st}).ListLocalWork(context.Background(), "org", "", 16); err != nil {
 							b.Fatal(err)
 						}

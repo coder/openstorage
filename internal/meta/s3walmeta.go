@@ -648,9 +648,10 @@ func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, 
 	return s.adoptRead(obj, shared)
 }
 
-// checkSharedView turns on checkViewIntact. Only this package's tests set
-// it (s3walmeta_view_test.go): production skips the decode the shared view
-// exists to avoid.
+// checkSharedView turns on checkViewIntact. This package's tests set it
+// (s3walmeta_view_test.go), and so does any binary built with the
+// openstorage_viewcheck tag (s3walmeta_viewcheck.go). Release builds skip
+// the decode the shared view exists to avoid.
 var checkSharedView bool
 
 // checkViewIntact asserts that the shared view still equals a fresh decode

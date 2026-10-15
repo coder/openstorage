@@ -81,7 +81,9 @@ jobs:
               GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -o /dev/null ./...
             done
           done
-      - run: go test ./... -count=1 -race -timeout=30m
+      # openstorage_viewcheck: S3WAL stores assert that no caller wrote
+      # into the shared metadata view (internal/meta, issue #497).
+      - run: go test ./... -tags=openstorage_viewcheck -count=1 -race -timeout=30m
 
   # Build locally, never push. Check runtime tools and exercise the unchanged
   # single-node Compose reference with this exact candidate image ID, natively
@@ -168,6 +170,6 @@ jobs:
       - run: go test ./internal/githttp -count=1 -race -timeout=25m
         env:
           OPENSTORAGE_TEST_BACKEND: s3wal
-      - run: go test ./internal/sync -run 'TestLocalSchedule' -count=1 -race -timeout=10m
+      - run: go test ./internal/sync -tags=openstorage_viewcheck -run 'TestLocalSchedule' -count=1 -race -timeout=10m
         env:
           OPENSTORAGE_TEST_BACKEND: s3wal
