@@ -3,6 +3,7 @@ package meta
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"slices"
@@ -211,45 +212,101 @@ func FuzzS3WALMetaDocument(f *testing.F) {
 }
 
 // FuzzS3WALMetaSuccessor (issue #519, from the #516 design): a running
-// store that trusts a writer document meets the fuzzed bytes in its place.
-// It never panics, and once it refuses them (latch or quarantine), the
+// store that trusts a writer document meets the fuzzed bytes in its place,
+// either as a plain replacement or, with ambiguous, inside the recovery
+// read of an ambiguous write of its own, with the bytes carrying its
+// writer nonce at a later seq (the foreign-nonce quarantine, #527). It
+// never panics, and once it refuses the bytes (latch or quarantine), the
 // background-loop pass writes nothing.
 func FuzzS3WALMetaSuccessor(f *testing.F) {
 	trusted := writerS3WALMetaDoc(f)
-	f.Add(trusted)
-	for _, s := range s3walCorruptRowSeeds() {
-		f.Add([]byte(s.body))
+	for _, ambiguous := range []bool{false, true} {
+		f.Add(trusted, ambiguous)
+		for _, s := range s3walCorruptRowSeeds() {
+			f.Add([]byte(s.body), ambiguous)
+		}
+		f.Add([]byte(`{`), ambiguous)
 	}
-	f.Add([]byte(`{`))
-	f.Fuzz(func(t *testing.T, body []byte) {
-		ctx := context.Background()
-		cas := s3wal.NewMemCAS()
-		if _, err := cas.Create(ctx, s3walMetaKey, trusted); err != nil {
-			t.Fatal(err)
-		}
-		st := NewS3WAL(cas)
-		defer st.Close()
-		doc, err := st.viewDoc(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
+	f.Fuzz(func(t *testing.T, body []byte, ambiguous bool) { s3walSuccessorPass(t, trusted, body, ambiguous) })
+}
+
+// TestS3WALMetaSuccessorReachesBothTiers: the successor pass reaches the
+// latch (an older copy) and the quarantine (the trusted bytes inside an
+// ambiguous write), so both halves of its no-write check run.
+func TestS3WALMetaSuccessorReachesBothTiers(t *testing.T) {
+	trusted := writerS3WALMetaDoc(t)
+	var older map[string]any
+	if err := json.Unmarshal(trusted, &older); err != nil {
+		t.Fatal(err)
+	}
+	older["seq"] = 1
+	olderBody, err := json.Marshal(older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latched, quarantined := s3walSuccessorPass(t, trusted, olderBody, false); !latched || quarantined {
+		t.Fatalf("an older copy: latched %v, quarantined %v; want the latch", latched, quarantined)
+	}
+	if _, quarantined := s3walSuccessorPass(t, trusted, trusted, true); !quarantined {
+		t.Fatal("the trusted bytes inside an ambiguous write did not quarantine")
+	}
+}
+
+// s3walSuccessorPass runs one FuzzS3WALMetaSuccessor input and reports
+// the refusal state before the pass.
+func s3walSuccessorPass(t *testing.T, trusted, body []byte, ambiguous bool) (latched, quarantined bool) {
+	ctx := context.Background()
+	cas := s3wal.NewMemCAS()
+	if _, err := cas.Create(ctx, s3walMetaKey, trusted); err != nil {
+		t.Fatal(err)
+	}
+	st := NewS3WAL(cas)
+	defer st.Close()
+	doc, err := st.viewDoc(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := append([]byte{}, body...)
+	replace := func() {
 		cur, err := cas.Get(ctx, s3walMetaKey)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := cas.Advance(ctx, s3walMetaKey, append([]byte{}, body...), cur.ETag); err != nil {
+		if _, err := cas.Advance(ctx, s3walMetaKey, stored, cur.ETag); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if ambiguous {
+		armAmbiguousPut(t, cas, s3wal.FaultAmbiguousApplied, func() {
+			// Our landed write's nonce at a later seq: only an
+			// out-of-band edit produces that (bytes that are no JSON
+			// object stay as they are and refuse at decode).
+			landed, _ := storedS3WALMeta(t, cas)
+			var top map[string]json.RawMessage
+			if json.Unmarshal(stored, &top) == nil && top != nil {
+				top["writer"], _ = json.Marshal(landed.Writer)
+				top["seq"], _ = json.Marshal(landed.Seq + 5)
+				if b, err := json.Marshal(top); err == nil {
+					stored = b
+				}
+			}
+			replace()
+		})
+		_, _ = st.CreateRepo(ctx, "org", "https://example.com/successor.git", "main")
+		cas.Hooks = s3wal.MemCASHooks{}
+	} else {
+		replace()
 		_ = CheckFormat(ctx, st)
-		st.mu.Lock()
-		refused := st.rolledBack || st.quarantined != nil
-		st.mu.Unlock()
-		if next, err := st.viewDoc(ctx); err == nil {
-			doc = next
-		}
-		s3walMetaPass(ctx, st, doc)
-		if after, err := cas.Get(ctx, s3walMetaKey); refused && (err != nil || !bytes.Equal(after.Body, body)) {
-			t.Fatalf("a store that refused the document wrote meta.json (err %v)", err)
-		}
-	})
+	}
+	st.mu.Lock()
+	latched, quarantined = st.rolledBack, st.quarantined != nil
+	st.mu.Unlock()
+	if next, err := st.viewDoc(ctx); err == nil {
+		doc = next
+	}
+	s3walMetaPass(ctx, st, doc)
+	if after, err := cas.Get(ctx, s3walMetaKey); (latched || quarantined) && (err != nil || !bytes.Equal(after.Body, stored)) {
+		t.Fatalf("a store that refused the document wrote meta.json (latched %v, quarantined %v, err %v)", latched, quarantined, err)
+	}
+	return latched, quarantined
 }
