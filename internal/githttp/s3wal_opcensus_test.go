@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/openstorage/internal/s3oplog"
 )
 
 // opLogLine is one parsed s3oplog line:
@@ -50,11 +52,13 @@ func parseOpLog(t *testing.T, raw string) []opLogLine {
 	return out
 }
 
-// backgroundScopes are the op-log scopes of serve's background work: the
-// sync schedule (internal/sync opLogScope) and the S3WAL org-key refresher
-// (internal/meta s3walKeyRefreshScope). Their round trips belong to no
-// push, so opLogWindow drops them (issue #484).
-var backgroundScopes = []string{":schedule", ":keyrefresh"}
+// isBackground reports whether role carries an op-log scope: background
+// work (the sync schedule, the S3WAL org-key refresher) whose round trips
+// belong to no push, so opLogWindow drops them (issues #484, #499).
+// s3oplog.WithScope accepts only s3oplog.Scopes, so this list is complete.
+func isBackground(role string) bool {
+	return slices.ContainsFunc(s3oplog.Scopes(), func(scope string) bool { return strings.HasSuffix(role, ":"+scope) })
+}
 
 // opLogWindow reads the op-log lines appended since *offset and advances
 // the offset — one push's window when called around a single git command.
@@ -67,7 +71,7 @@ func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 	// OS buffering only.
 	time.Sleep(200 * time.Millisecond)
 	// The sync schedule sweeps once a second and logs under the
-	// ":schedule" scope (internal/sync opLogScope). Extend the window
+	// s3oplog.ScopeSchedule scope. Extend the window
 	// until it holds a sweep pass, so every window exercises the filter
 	// below (#452 item 6). The push's own ops have all been logged by now.
 	var window []byte
@@ -80,7 +84,7 @@ func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 			t.Fatalf("op log shrank: len %d < offset %d", len(raw), *offset)
 		}
 		window = raw[*offset:]
-		if strings.Contains(string(window), ":schedule ") {
+		if strings.Contains(string(window), ":"+s3oplog.ScopeSchedule+" ") {
 			*offset = int64(len(raw))
 			break
 		}
@@ -91,7 +95,7 @@ func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 	}
 	var push []opLogLine
 	for _, l := range parseOpLog(t, string(window)) {
-		if !slices.ContainsFunc(backgroundScopes, func(scope string) bool { return strings.HasSuffix(l.role, scope) }) {
+		if !isBackground(l.role) {
 			push = append(push, l)
 		}
 	}
@@ -135,7 +139,7 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// non-default v0.2.0 write-compat flag (or a partial Heal) to start.
 	// The sync schedule's sweep (ADR-51) and the S3WAL org-key refresher
 	// are not disabled: opLogWindow drops their round trips by their
-	// op-log scope (backgroundScopes), and waits for a sweep pass in
+	// op-log scope (isBackground), and waits for a sweep pass in
 	// every window. The node gets a private bucket (privateStores), so its
 	// sweep never finds runnable work: a scheduled run's loopback push and
 	// hooks would log without the scope. The pushes start once the first

@@ -148,7 +148,7 @@ var _ Queue = (*LocalScheduler)(nil)
 // opLogScope tags the S3 round trips of sweeps and runs in the op log
 // (s3oplog): they are background work, not part of the request that
 // recorded the intent (issue #452 item 6, TestS3WAL_PushOpCensus).
-const opLogScope = "schedule"
+const opLogScope = s3oplog.ScopeSchedule
 
 // NewLocalScheduler builds a scheduler for org's repos over lanes, running
 // runSync ((*Worker).Run) and runPush ((*Worker).RunPush).

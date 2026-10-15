@@ -42,7 +42,7 @@ func TestLogOpLine(t *testing.T) {
 		wantRole string
 	}{
 		{"request", context.Background(), "openstorage:serve"},
-		{"scoped", WithScope(context.Background(), "keyrefresh"), "openstorage:serve:keyrefresh"},
+		{"scoped", WithScope(context.Background(), ScopeKeyRefresh), "openstorage:serve:keyrefresh"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := awsmiddleware.SetOperationName(tc.ctx, "GetObject")
@@ -72,10 +72,23 @@ func TestLogOpLine(t *testing.T) {
 	}
 }
 
-// A scope that is empty or holds a colon or whitespace would break the
-// line's field split or the role:scope suffix, so WithScope panics.
-func TestWithScopeRejectsInvalidScope(t *testing.T) {
-	for _, scope := range []string{"", "a:b", "a b", "a\tb", "a\nb"} {
+// Every scope is one non-empty word (no colon or whitespace), so the line
+// stays field-splittable and a census can match the ":scope" suffix.
+func TestScopesAreWords(t *testing.T) {
+	if len(Scopes()) == 0 {
+		t.Fatal("no scopes")
+	}
+	for _, scope := range Scopes() {
+		if scope == "" || strings.ContainsAny(scope, ": \t\n") {
+			t.Errorf("scope %q is not one word", scope)
+		}
+	}
+}
+
+// WithScope accepts only the listed scopes, so a scope the census does not
+// know about fails at its first use, not in a rare census window.
+func TestWithScopeRejectsUnknownScope(t *testing.T) {
+	for _, scope := range []string{"", "a:b", "a b", "unknown", "Schedule"} {
 		t.Run(strconv.Quote(scope), func(t *testing.T) {
 			defer func() {
 				if recover() == nil {

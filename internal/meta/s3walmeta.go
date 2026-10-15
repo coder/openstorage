@@ -540,7 +540,7 @@ func (s *S3WAL) Close() {
 
 // s3walKeyRefreshScope is the op-log scope (s3oplog) of the org-key
 // refresher's round trips.
-const s3walKeyRefreshScope = "keyrefresh"
+const s3walKeyRefreshScope = s3oplog.ScopeKeyRefresh
 
 // orgKeyRefreshLoop keeps the org-key snapshot warm across processes: one
 // goroutine, one conditional GET per keyRefreshEvery (304-answered while

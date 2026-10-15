@@ -39,8 +39,8 @@ type S3WALMetaConversion struct {
 	// RepairedSyncCreates (--to 1) lists the pending sync creates whose
 	// first-sync request the conversion recorded, by repo ID.
 	RepairedSyncCreates []string
-	// ForcedCreates (--to 1 with Force) lists the pending fork or copy
-	// creates that now read as finished.
+	// ForcedCreates (--to 1 with Force) lists the pending creates without
+	// an upstream link that now read as finished.
 	ForcedCreates []S3WALPendingCreate
 }
 
@@ -92,8 +92,8 @@ const s3walConvertAttempts = 16
 // every lane whose pull claim is set, so v1 boot recovery of any release
 // restarts that pull. It also sets sync_pending for every unfinished sync
 // create, which v1 then completes with its first sync, and refuses with
-// *S3WALPendingCreatesError (nothing written) while a fork or copy create
-// is unfinished, unless opts.Force. After the write it re-reads the
+// *S3WALPendingCreatesError (nothing written) while a create without an
+// upstream link is unfinished, unless opts.Force. After the write it re-reads the
 // document and checks it equals the expected conversion of the source.
 // Re-running on a document at the target version writes nothing.
 func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int, opts S3WALConvertOptions) (S3WALMetaConversion, error) {
@@ -180,7 +180,8 @@ func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int, op
 }
 
 // s3walPendingCreates sorts the unfinished creates a --to 1 conversion
-// found: sync creates it repaired, and fork or copy creates it cannot.
+// found: sync creates it repaired, and creates without an upstream link
+// that it cannot repair.
 type s3walPendingCreates struct {
 	repaired []string
 	blocked  []S3WALPendingCreate
