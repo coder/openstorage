@@ -46,7 +46,7 @@ jobs:
         # build that sees untracked files, and older tags do not gitignore
         # dist/ (#414).
         run: ./scripts/release-archives.sh "$TAG" "$RUNNER_TEMP/dist"
-      - name: Require a clean VCS stamp on every binary
+      - name: Require a clean VCS stamp and no test build tag on every binary
         run: |
           cd "$RUNNER_TEMP/dist"
           bad=0
@@ -56,6 +56,11 @@ jobs:
               echo "clean VCS stamp: $archive"
             else
               echo "::error title=Dirty VCS stamp::$archive does not report vcs.modified=false"
+              bad=1
+            fi
+            # openstorage_viewcheck is test-only (internal/meta, #503).
+            if go version -m "$RUNNER_TEMP/vcs-check" | grep -q 'openstorage_viewcheck'; then
+              echo "::error title=Test build tag::$archive was built with the openstorage_viewcheck tag"
               bad=1
             fi
           done
