@@ -46,6 +46,25 @@ func TestFuzzSkipEnvBoot(t *testing.T) {
 	}
 }
 
+// A benchmark run measures the release binary; every other run builds
+// serve with the openstorage_viewcheck tag (issue #503).
+func TestViewCheckBuild(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{nil, true},
+		{[]string{"-test.run=TestPush", "-test.count=1"}, true},
+		{[]string{"-test.bench="}, true},
+		{[]string{"-test.run=^$", "-test.bench=BenchmarkPushE2E"}, false},
+		{[]string{"-test.bench", "."}, false},
+	} {
+		if got := viewCheckBuild(tc.args); got != tc.want {
+			t.Errorf("viewCheckBuild(%q) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
 // fuzzPkt frames payload as one pkt-line.
 func fuzzPkt(payload string) string {
 	return fmt.Sprintf("%04x", len(payload)+4) + payload

@@ -91,6 +91,7 @@ var (
 	testBlob     blob.BlobStore
 	testMeta     meta.Backend
 	nodeA        *testNode
+	viewCheckLog string // view-check failures of tagged serve and hook processes ("" in benchmark runs)
 )
 
 func TestMain(m *testing.M) {
@@ -128,22 +129,7 @@ func TestMain(m *testing.M) {
 // targets touch the e2e environment; plain `go test` — including the
 // seed-corpus replay of the fuzz targets — never sees these flags.
 func fuzzSkipEnvBoot(args []string) bool {
-	flagValue := func(name string) (string, bool) {
-		for i, arg := range args {
-			a := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
-			if a == name {
-				// Bare-flag spelling; a non-bool flag's value is the next arg.
-				if i+1 < len(args) {
-					return args[i+1], true
-				}
-				return "", true
-			}
-			if v, ok := strings.CutPrefix(a, name+"="); ok {
-				return v, true
-			}
-		}
-		return "", false
-	}
+	flagValue := func(name string) (string, bool) { return testFlag(args, name) }
 	if _, worker := flagValue("test.fuzzworker"); worker {
 		return true
 	}
@@ -152,6 +138,31 @@ func fuzzSkipEnvBoot(args []string) bool {
 	}
 	runPat, ok := flagValue("test.run")
 	return ok && runPat == "^$"
+}
+
+// viewCheckBuild reports whether TestMain builds serve with the
+// openstorage_viewcheck tag: always, except in a benchmark run (issue #503).
+func viewCheckBuild(args []string) bool {
+	bench, _ := testFlag(args, "test.bench")
+	return bench == ""
+}
+
+// testFlag reads a test flag's value from args before flag.Parse runs.
+func testFlag(args []string, name string) (string, bool) {
+	for i, arg := range args {
+		a := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+		if a == name {
+			// Bare-flag spelling; a non-bool flag's value is the next arg.
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", true
+		}
+		if v, ok := strings.CutPrefix(a, name+"="); ok {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 func testMainInner(m *testing.M) int {
@@ -166,8 +177,17 @@ func testMainInner(m *testing.M) int {
 	// Build the binary once.
 	binPath = filepath.Join(scratch, "openstorage")
 	// openstorage_viewcheck: every S3WAL serve and hook process asserts
-	// that no caller wrote into the shared metadata view (issue #497).
-	build := exec.Command("go", "build", "-tags=openstorage_viewcheck", "-o", binPath, "./cmd/openstorage")
+	// that no caller wrote into the shared metadata view (issue #497), and
+	// logs each failure to viewCheckLog, which fails the run below: serve
+	// can turn the panic into a 500 or crash after a test's last request.
+	// A benchmark run builds the release binary instead, so its numbers
+	// stay release-equivalent (issue #503).
+	buildArgs := []string{"build"}
+	if viewCheckBuild(os.Args[1:]) {
+		buildArgs = append(buildArgs, "-tags=openstorage_viewcheck")
+		viewCheckLog = filepath.Join(scratch, "viewcheck.log")
+	}
+	build := exec.Command("go", append(buildArgs, "-o", binPath, "./cmd/openstorage")...)
 	build.Dir = "../.."
 	if out, err := build.CombinedOutput(); err != nil {
 		panic(fmt.Sprintf("go build: %v: %s", err, out))
@@ -343,7 +363,14 @@ func testMainInner(m *testing.M) int {
 	}
 	defer nodeA.stop()
 
-	return m.Run()
+	code := m.Run()
+	if viewCheckLog != "" {
+		if raw, err := os.ReadFile(viewCheckLog); err == nil && len(raw) > 0 {
+			fmt.Fprintf(os.Stderr, "FAIL: a serve or hook process failed the shared metadata view check (issue #503):\n%s", raw)
+			code = 1
+		}
+	}
+	return code
 }
 
 // startSeaweedFS boots the qualified SeaweedFS recipe (Gate 1a-A, PR
@@ -484,6 +511,9 @@ func startBinaryNode(binary, cacheDir string, stderr io.Writer, extraEnv ...stri
 		// disable it by default; the dual-serve drill re-enables it via
 		// extraEnv (later duplicate wins).
 		cmd.Env = append(cmd.Env, "OPENSTORAGE_S3WAL_LEASE_TTL=0")
+	}
+	if viewCheckLog != "" {
+		cmd.Env = append(cmd.Env, meta.ViewCheckLogEnv+"="+viewCheckLog)
 	}
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.SysProcAttr = nodeSysProcAttr()

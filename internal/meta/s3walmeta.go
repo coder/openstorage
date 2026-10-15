@@ -689,16 +689,32 @@ func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, 
 // the decode the shared view exists to avoid.
 var checkSharedView bool
 
+// ViewCheckLogEnv names a file that builds with the openstorage_viewcheck
+// tag append each failed view check to before they panic. Serve can lose
+// the panic (the API turns a handler panic into a 500), so the e2e harness
+// in internal/githttp sets it and fails the run on any line (issue #503).
+const ViewCheckLogEnv = "OPENSTORAGE_TEST_VIEWCHECK_LOG"
+
+// reportViewCheck runs with the message of a failed view check, before the
+// panic. s3walmeta_viewcheck.go writes it to ViewCheckLogEnv.
+var reportViewCheck = func(string) {}
+
 // checkViewIntact asserts that the shared view still equals a fresh decode
 // of the cached body, so a viewDoc caller that wrote into it fails fast.
+// It runs on every shared 304 read and before the view is discarded (a
+// fresh read or our own write), so no write into the view goes unseen.
 // Caller holds mu.
 func (s *S3WAL) checkViewIntact() {
-	if !checkSharedView {
+	if !checkSharedView || s.cacheView == nil {
 		return
 	}
 	fresh, err := decodeS3WALMetaDoc(s.cacheBody)
 	assertf(err == nil, "s3walmeta view check: cached body does not decode: %v", err)
-	assertf(reflect.DeepEqual(fresh, s.cacheView), "s3walmeta view check: a viewDoc caller mutated the shared view (seq %d)", s.cacheView.Seq)
+	if !reflect.DeepEqual(fresh, s.cacheView) {
+		msg := fmt.Sprintf("s3walmeta view check: a viewDoc caller mutated the shared view (seq %d)", s.cacheView.Seq)
+		reportViewCheck(msg)
+		assertf(false, "%s", msg)
+	}
 }
 
 // adoptRead decodes a freshly fetched body, checks the seq watermark, and
@@ -715,6 +731,7 @@ func (s *S3WAL) adoptRead(obj s3wal.Object, shared bool) (*s3walMetaDoc, string,
 	if err := s.observeDoc(doc, obj.Body); err != nil {
 		return nil, "", err // keep the newer cache: nothing adopts the older body
 	}
+	s.checkViewIntact() // before the fresh read discards the view
 	s.cacheBody, s.cacheETag, s.cacheView = obj.Body, obj.ETag, nil
 	if shared {
 		s.cacheView = doc
@@ -826,6 +843,7 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 			// observeDoc (or past our own last write).
 			assertf(ourSeq > s.lastSeq && !s.rolledBack, "s3walmeta %s: wrote seq %d, not past observed seq %d (rolled back: %v)", mu.op, ourSeq, s.lastSeq, s.rolledBack)
 			s.lastSeq = ourSeq
+			s.checkViewIntact() // before our own write discards the view
 			s.cacheBody, s.cacheETag, s.cacheView = body, newETag, nil
 			// Our CAS landed: the mutated doc IS the latest observed
 			// state, so a local key registration is visible to the very

@@ -50,25 +50,59 @@ func TestS3WALSharedView(t *testing.T) {
 	}
 }
 
-// The check catches a viewDoc caller that writes into the shared view.
+// The check catches a viewDoc caller that writes into the shared view,
+// whatever comes next: a quiet 304 read, a fresh read after another
+// writer, or our own write (issue #503). Each failure is reported before
+// the panic, for the e2e harness.
 func TestS3WALSharedViewMutationAsserts(t *testing.T) {
-	ctx := context.Background()
-	st := NewS3WAL(s3wal.NewMemCAS())
-	t.Cleanup(st.Close)
-	if _, err := st.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name string
+		next func(ctx context.Context, st, other *S3WAL) error
+	}{
+		{"quiet read", func(ctx context.Context, st, _ *S3WAL) error {
+			_, err := st.viewDoc(ctx)
+			return err
+		}},
+		{"fresh read after another writer", func(ctx context.Context, st, other *S3WAL) error {
+			if _, err := other.CreateRepo(ctx, "org", "other-write", "main"); err != nil {
+				return err
+			}
+			_, err := st.viewDoc(ctx)
+			return err
+		}},
+		{"own write", func(ctx context.Context, st, _ *S3WAL) error {
+			_, err := st.CreateRepo(ctx, "org", "own-write", "main")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			cas := s3wal.NewMemCAS()
+			st, other := NewS3WAL(cas), NewS3WAL(cas)
+			t.Cleanup(func() { st.Close(); other.Close() })
+			if _, err := st.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+				t.Fatal(err)
+			}
+			view, err := st.viewDoc(ctx) // a 304 read: installs the shared view
+			if err != nil {
+				t.Fatal(err)
+			}
+			var reported []string
+			saved := reportViewCheck
+			reportViewCheck = func(msg string) { reported = append(reported, msg) }
+			t.Cleanup(func() { reportViewCheck = saved })
+			view.NextOrgID += 100 // a buggy caller
+			defer func() {
+				if recover() == nil {
+					t.Fatal("mutated shared view went undetected")
+				}
+				if len(reported) != 1 || !strings.Contains(reported[0], "mutated the shared view") {
+					t.Fatalf("reported %q, want one view-check failure", reported)
+				}
+			}()
+			_ = tc.next(ctx, st, other)
+		})
 	}
-	view, err := st.viewDoc(ctx) // a 304 read: installs the shared view
-	if err != nil {
-		t.Fatal(err)
-	}
-	view.NextOrgID += 100 // a buggy caller
-	defer func() {
-		if recover() == nil {
-			t.Fatal("mutated shared view went undetected")
-		}
-	}()
-	_, _ = st.viewDoc(ctx)
 }
 
 // BenchmarkS3WALQuietRead measures one quiet (304) read of the metadata
