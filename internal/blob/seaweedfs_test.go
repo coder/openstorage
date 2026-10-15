@@ -33,6 +33,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/coder/openstorage/internal/testutil/seaweedcapture"
+	"github.com/coder/openstorage/internal/testutil/testimages"
 
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
@@ -40,7 +41,7 @@ import (
 // Qualified SeaweedFS recipe (Gate 1a-A, PR #142): pinned image,
 // one-process `weed server -s3`, S3 gateway on 8333. Versioning and
 // object-lock are never enabled on data buckets (seaweedfs#8073 avoidance).
-const seaweedFSImage = "chrislusf/seaweedfs:4.48"
+const seaweedFSImage = testimages.SeaweedFS
 
 // Static identity for the auth-enforcing lane (see startSeaweedFS): with an
 // s3.config mounted, SeaweedFS validates SigV4 on every request, which the

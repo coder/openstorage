@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/openstorage/internal/ref/s3wal"
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/openstorage/internal/testutil/testimages"
 )
 
 var (
@@ -38,7 +39,7 @@ func pgTestStore(t *testing.T) *PG {
 	pgOnce.Do(func() {
 		ctx := context.Background()
 
-		pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+		pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
 			tcpostgres.WithDatabase("postgres"),
 			tcpostgres.WithUsername("postgres"),
 			tcpostgres.WithPassword("postgres"),

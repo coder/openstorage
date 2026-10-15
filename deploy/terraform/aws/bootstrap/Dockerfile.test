@@ -1,5 +1,6 @@
 # Build from this directory; run the resulting image with --network=none.
-FROM amazonlinux:2023
+# amazonlinux:2023 by OCI index digest (the 2026-10-05 build).
+FROM amazonlinux:2023@sha256:8ed3c0a996841537f75607e7d1de2114d8150391f75792e8da9268738547e73f
 RUN dnf install -y --allowerasing git gnupg2 openssh-clients python3 awscli-2 openssl shadow-utils ca-certificates systemd \
     && dnf clean all
 WORKDIR /probe

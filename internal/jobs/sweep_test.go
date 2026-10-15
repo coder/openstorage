@@ -19,6 +19,7 @@ import (
 	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/ref"
 	"github.com/coder/openstorage/internal/sync"
+	"github.com/coder/openstorage/internal/testutil/testimages"
 )
 
 // sweepFixture is one zero-container sweep environment: a fileblob store, a
@@ -1210,7 +1211,7 @@ func TestRiverSweepPeriodic(t *testing.T) {
 		t.Skip("river periodic sweep needs docker")
 	}
 	ctx := context.Background()
-	pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
 		tcpostgres.WithDatabase("postgres"),
 		tcpostgres.WithUsername("postgres"),
 		tcpostgres.WithPassword("postgres"),

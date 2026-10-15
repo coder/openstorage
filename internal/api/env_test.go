@@ -44,6 +44,7 @@ import (
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 	upsync "github.com/coder/openstorage/internal/sync"
+	"github.com/coder/openstorage/internal/testutil/testimages"
 )
 
 const testHTTPBaseURL = "https://selfhost.open.storage"
@@ -117,7 +118,7 @@ func newTestDeps(ctx context.Context, metaURL string) (meta.Store, auth.Verifier
 func backendMetaURL(ctx context.Context, backend string) (string, error) {
 	switch backend {
 	case "pg":
-		pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+		pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
 			tcpostgres.WithDatabase("postgres"),
 			tcpostgres.WithUsername("postgres"),
 			tcpostgres.WithPassword("postgres"),

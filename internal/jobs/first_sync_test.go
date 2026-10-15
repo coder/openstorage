@@ -13,6 +13,7 @@ import (
 	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/sync"
+	"github.com/coder/openstorage/internal/testutil/testimages"
 )
 
 // TestRiverCompleteSyncCreate: the first-sync job and the complete mark
@@ -23,7 +24,7 @@ func TestRiverCompleteSyncCreate(t *testing.T) {
 		t.Skip("needs docker")
 	}
 	ctx := context.Background()
-	pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine", tcpostgres.WithPassword("postgres"), tcpostgres.BasicWaitStrategies())
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres, tcpostgres.WithPassword("postgres"), tcpostgres.BasicWaitStrategies())
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
 	}

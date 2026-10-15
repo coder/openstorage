@@ -34,6 +34,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/coder/openstorage/internal/testutil/seaweedcapture"
+	"github.com/coder/openstorage/internal/testutil/testimages"
 )
 
 // Store image pins. SeaweedFS is the self-hosted store of record (plan
@@ -43,7 +44,7 @@ import (
 // the MinIO pin only resolves on hosts that still hold this exact digest;
 // its lane is opt-in (OPENSTORAGE_TEST_MINIO_LEGACY in internal/ref/s3wal).
 const (
-	SeaweedFSImage   = "chrislusf/seaweedfs:4.48"
+	SeaweedFSImage   = testimages.SeaweedFS
 	MinIOLegacyImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z@sha256:4c4a4876193f030c81f57aabb22bcb9a73462010eb61fcab66908e03e5484af8"
 	// FlociImage pins the qualified stable release by OCI index digest.
 	// Release 2.2.0 includes the GetObject torn-read fix floci-io/floci#2874
