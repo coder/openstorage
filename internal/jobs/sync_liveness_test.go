@@ -21,6 +21,7 @@ import (
 
 	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/sync"
+	"github.com/coder/openstorage/internal/testutil/testimages"
 )
 
 // TestSyncSnoozeDelayLegacyBackoff: a lapsed LEGACY claim may be
@@ -50,7 +51,7 @@ func livenessPG(t *testing.T, ctx context.Context) string {
 	if testing.Short() {
 		t.Skip("river liveness tests need docker")
 	}
-	pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
 		tcpostgres.WithDatabase("postgres"),
 		tcpostgres.WithUsername("postgres"),
 		tcpostgres.WithPassword("postgres"),

@@ -31,6 +31,7 @@ import (
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/ref"
 	"github.com/coder/openstorage/internal/sync"
+	"github.com/coder/openstorage/internal/testutil/testimages"
 )
 
 // testGit runs git hermetically (host config/identity must not leak into
@@ -1587,7 +1588,7 @@ func TestRepackTrigger_Threshold(t *testing.T) {
 func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	// Keep the consumer alive for the whole test; observer waits have their own budget.
 	ctx := t.Context()
-	pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
 		tcpostgres.WithDatabase("postgres"),
 		tcpostgres.WithUsername("postgres"),
 		tcpostgres.WithPassword("postgres"),
