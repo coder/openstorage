@@ -179,8 +179,9 @@ func TestS3WALMetaConvert(t *testing.T) {
 }
 
 // --to 1 records the first sync an unfinished sync create is owed, and
-// refuses while a fork or copy create is unfinished: on v1 it would read as
-// a finished, possibly empty repository (#452 item 5, Option B).
+// refuses while a create without an upstream link is unfinished: on v1 it
+// would read as a finished, possibly empty repository (#452 item 5,
+// Option B).
 func TestS3WALMetaConvertPendingCreates(t *testing.T) {
 	ctx := context.Background()
 	cas := s3wal.NewMemCAS()

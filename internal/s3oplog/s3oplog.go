@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -88,12 +89,27 @@ func procRole() string {
 
 type scopeKey struct{}
 
+// The op-log scopes of background work. Every scope is listed here, so a
+// census (TestS3WAL_PushOpCensus) can drop all background round trips
+// with Scopes, and a renamed or new scope cannot drift from its list.
+const (
+	// ScopeSchedule tags the sync schedule's sweeps and runs (internal/sync).
+	ScopeSchedule = "schedule"
+	// ScopeKeyRefresh tags the S3WAL org-key refresher (internal/meta).
+	ScopeKeyRefresh = "keyrefresh"
+)
+
+var scopes = []string{ScopeSchedule, ScopeKeyRefresh}
+
+// Scopes returns every scope WithScope accepts.
+func Scopes() []string { return slices.Clone(scopes) }
+
 // WithScope returns ctx tagged with scope: S3 round trips made under it log
-// their role as role:scope. scope must be one non-empty word (no
-// whitespace or colon), so the line stays field-splittable.
+// their role as role:scope. scope must be one of the Scope constants: a
+// scope missing from Scopes would escape the census filter.
 func WithScope(ctx context.Context, scope string) context.Context {
-	if scope == "" || strings.ContainsAny(scope, ": \t\n") {
-		panic(fmt.Sprintf("s3oplog.WithScope: invalid scope %q", scope))
+	if !slices.Contains(scopes, scope) {
+		panic(fmt.Sprintf("s3oplog.WithScope: unknown scope %q (add it to s3oplog's Scope constants)", scope))
 	}
 	return context.WithValue(ctx, scopeKey{}, scope)
 }

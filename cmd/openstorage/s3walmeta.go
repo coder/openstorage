@@ -30,7 +30,7 @@ func cmdS3WALMeta(ctx context.Context, args []string) error {
 	}
 	fs := flag.NewFlagSet("s3wal-meta convert", flag.ExitOnError)
 	to := fs.Int("to", 0, "target metadata format version: 2 to upgrade, 1 to downgrade")
-	force := fs.Bool("force", false, "with --to 1: convert even while a create without an upstream link (fork, copy) is unfinished")
+	force := fs.Bool("force", false, "with --to 1: convert even while a create without an upstream link (a fork, a copy, or a sync create whose link was removed) is unfinished")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
