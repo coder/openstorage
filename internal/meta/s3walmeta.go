@@ -23,6 +23,7 @@
 package meta
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -433,13 +434,11 @@ type S3WAL struct {
 	cacheETag string
 	cacheBody []byte
 	lastSeq   int64
-	// lastWriter is the writer nonce of the document at lastSeq (the
-	// cached one). rolledBack latches once a fetched document does not
-	// continue it (issue #488): from then on only that exact document
-	// (same seq and nonce, or a 304 on its ETag) is accepted again,
-	// because a restored lineage can advance back to the same seq
-	// numerically with different contents.
-	lastWriter string
+	// rolledBack latches once a fetched document does not continue the
+	// cached one, or the object vanishes (issue #488): from then on only
+	// the cached document itself (the same bytes, or a 304 on its ETag)
+	// is accepted again, because a restored or recreated lineage can
+	// advance back to any seq with different contents.
 	rolledBack bool
 	// cacheView is cacheBody decoded once, shared by every viewDoc caller
 	// until the cache changes (issue #470: the 1 s sync sweep otherwise
@@ -610,16 +609,18 @@ func (e *StaleDocumentError) Error() string {
 	return fmt.Sprintf("s3walmeta: %s at seq %d does not continue the document this process last saw at seq %d: the store served a stale read, or the object was replaced while serve ran. This process will not read or write through it until the store serves that document again or the process restarts. If the bucket was restored on purpose, stop serve, then follow docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover", s3walMetaKey, e.Got, e.Seen)
 }
 
-// observeDoc applies the stale-read watermark to a fetched document;
-// caller holds mu.
-func (s *S3WAL) observeDoc(doc *s3walMetaDoc) error {
-	same := doc.Seq == s.lastSeq && doc.Writer == s.lastWriter
+// observeDoc applies the stale-read watermark to a fetched document and
+// its bytes. The cached body is the document at lastSeq, so "the same
+// document" means the same bytes: seq and writer nonce live in the body
+// and survive an out-of-band edit of the other fields. Caller holds mu.
+func (s *S3WAL) observeDoc(doc *s3walMetaDoc, body []byte) error {
+	same := bytes.Equal(body, s.cacheBody)
 	switch {
 	case s.rolledBack && !same, doc.Seq < s.lastSeq, doc.Seq == s.lastSeq && !same:
 		s.rolledBack = true
 		return &StaleDocumentError{Got: doc.Seq, Seen: s.lastSeq}
 	}
-	s.lastSeq, s.lastWriter, s.rolledBack = doc.Seq, doc.Writer, false
+	s.lastSeq, s.rolledBack = doc.Seq, false
 	return nil
 }
 
@@ -653,7 +654,7 @@ func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, 
 	}
 	obj, err := s.cas.GetIfChanged(ctx, s3walMetaKey, s.cacheETag)
 	if errors.Is(err, s3wal.ErrNotModified) {
-		s.rolledBack = false // the store holds the cached document (lastSeq, lastWriter) again
+		s.rolledBack = false // the store holds the cached document again
 		if shared && s.cacheView != nil {
 			s.checkViewIntact()
 			return s.cacheView, s.cacheETag, nil
@@ -671,6 +672,9 @@ func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, 
 		// The document is never deleted once created (purge stamps a
 		// tombstone field, exactly like manifests): a vanish after seq
 		// lastSeq was observed is store infidelity or operator surgery.
+		// Latch it: a lineage recreated after the vanish is not the
+		// cached document either.
+		s.rolledBack = true
 		return nil, "", fmt.Errorf("s3walmeta read: %s vanished after seq %d was observed (the meta object is never deleted)", s3walMetaKey, s.lastSeq)
 	}
 	if err != nil {
@@ -707,7 +711,7 @@ func (s *S3WAL) adoptRead(obj s3wal.Object, shared bool) (*s3walMetaDoc, string,
 	if err != nil {
 		return nil, "", err
 	}
-	if err := s.observeDoc(doc); err != nil {
+	if err := s.observeDoc(doc, obj.Body); err != nil {
 		return nil, "", err // keep the newer cache: nothing adopts the older body
 	}
 	s.cacheBody, s.cacheETag, s.cacheView = obj.Body, obj.ETag, nil
@@ -820,7 +824,7 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 			// Internal invariant: ourSeq is one past a read that passed
 			// observeDoc (or past our own last write).
 			assertf(ourSeq > s.lastSeq && !s.rolledBack, "s3walmeta %s: wrote seq %d, not past observed seq %d (rolled back: %v)", mu.op, ourSeq, s.lastSeq, s.rolledBack)
-			s.lastSeq, s.lastWriter = ourSeq, ourNonce
+			s.lastSeq = ourSeq
 			s.cacheBody, s.cacheETag, s.cacheView = body, newETag, nil
 			// Our CAS landed: the mutated doc IS the latest observed
 			// state, so a local key registration is visible to the very
