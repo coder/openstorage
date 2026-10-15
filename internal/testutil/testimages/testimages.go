@@ -6,6 +6,7 @@
 // the tag. To bump a pin, resolve the new index digest with
 // `docker buildx imagetools inspect <image>:<tag>` and update
 // docker-compose.yml, README.md and CONTRIBUTING.md to the same digest.
+// TestDigestCopiesMatch fails until every copy matches.
 package testimages
 
 const (
