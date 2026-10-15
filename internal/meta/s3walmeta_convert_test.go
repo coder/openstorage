@@ -399,9 +399,10 @@ func TestS3WALMetaConvertProperty(t *testing.T) {
 	for i := range 300 {
 		d := &s3walMetaDoc{V: 2, Seq: 1, Writer: "w", Repos: map[string]*s3walMetaRepo{}, Upstreams: map[string]*s3walMetaUpstream{}}
 		for j := range rng.IntN(4) {
-			id := fmt.Sprintf("r%d", j)
-			d.Repos[id] = &s3walMetaRepo{OrgID: 1, URL: id, CreateState: rng.IntN(3), DeletedAt: rng.Int64N(2)}
+			id := fmt.Sprintf("repo_%012x", j) // the minted id shape decode requires (issue #492)
+			d.Repos[id] = &s3walMetaRepo{OrgID: 1, URL: id, DefaultBranch: "main", CreateState: rng.IntN(3), DeletedAt: rng.Int64N(2)}
 			u := &s3walMetaUpstream{
+				Owner: "o", Name: "n", UpstreamHost: "h",
 				Syncing: rng.IntN(2) == 0, SyncPending: rng.IntN(2) == 0, PushSyncing: rng.IntN(2) == 0,
 				PushPending: rng.IntN(3), PushAttempt: rng.IntN(6), PushDue: rng.Int64N(3), SyncDue: rng.Int64N(3),
 			}

@@ -34,6 +34,7 @@ import (
 	"math"
 	mrand "math/rand/v2"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -265,7 +266,68 @@ func decodeS3WALMetaDocVersion(body []byte, versions ...int) (*s3walMetaDoc, err
 	if err := doc.checkIDs(); err != nil {
 		return nil, &CorruptDocumentError{Err: err}
 	}
+	if err := doc.checkRows(); err != nil {
+		return nil, &CorruptDocumentError{Err: fmt.Errorf("document seq %d: %w", doc.Seq, err)}
+	}
 	return &doc, nil
+}
+
+// s3walRepoIDPattern is the only repo id shape newRepoID mints.
+var s3walRepoIDPattern = regexp.MustCompile(`^repo_[0-9a-f]{12}$`)
+
+// checkRows rejects row contents no writer produces and later code relies
+// on (issue #492): an empty org name, webhook or credential id, a null row
+// in any table, a repo or upstream key that
+// is not a minted repo id, and the strings every write path requires (a
+// repo's url and default branch, an upstream's owner, name and host, a
+// webhook's url and stored secret). Decode is the one boundary, so the
+// readers keep their assertions as internal invariants. Sorted keys give
+// one stable message.
+func (doc *s3walMetaDoc) checkRows() error {
+	if _, ok := doc.Orgs[""]; ok {
+		return errors.New("an org has an empty name")
+	}
+	for _, id := range slices.Sorted(maps.Keys(doc.Repos)) {
+		r := doc.Repos[id]
+		switch {
+		case r == nil:
+			return fmt.Errorf("repo %q has no row", id)
+		case !s3walRepoIDPattern.MatchString(id):
+			return fmt.Errorf("repo id %q is not a minted repo id", id)
+		case r.URL == "" || r.DefaultBranch == "":
+			return fmt.Errorf("repo %q has an empty url or default branch", id)
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(doc.Upstreams)) {
+		u := doc.Upstreams[id]
+		switch {
+		case u == nil:
+			return fmt.Errorf("upstream %q has no row", id)
+		case !s3walRepoIDPattern.MatchString(id):
+			return fmt.Errorf("upstream key %q is not a minted repo id", id)
+		case u.Owner == "" || u.Name == "" || u.UpstreamHost == "":
+			return fmt.Errorf("upstream %q has an empty owner, name or host", id)
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(doc.Webhooks)) {
+		switch w := doc.Webhooks[id]; {
+		case id == "":
+			return errors.New("a webhook has an empty id")
+		case w == nil:
+			return fmt.Errorf("webhook %q has no row", id)
+		case w.URL == "" || w.Secret == "":
+			return fmt.Errorf("webhook %q has an empty url or secret", id)
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(doc.Credentials)) {
+		switch {
+		case id == "":
+			return errors.New("a credential has an empty id")
+		case doc.Credentials[id] == nil:
+			return fmt.Errorf("credential %q has no row", id)
+		}
+	}
+	return nil
 }
 
 // checkIDs rejects id counters no writer can produce (issue #478): the

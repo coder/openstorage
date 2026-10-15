@@ -19,12 +19,12 @@ import (
 func TestS3WALMetaDecodeLaneShapes(t *testing.T) {
 	const head = `{"v":2,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[]}},`
 	up := func(fields string) string {
-		return head + `"seq":1,"upstreams":{"r":{"provider":"github","owner":"a","name":"b","upstream_host":"h","created_at":1` + fields + `}}}`
+		return head + `"seq":1,"upstreams":{"repo_00000000000a":{"provider":"github","owner":"a","name":"b","upstream_host":"h","created_at":1` + fields + `}}}`
 	}
 	for _, tc := range []struct{ name, body, wantErr string }{
-		{"pull claim without holder", up(`,"syncing":true`), `upstream "r": pull claim has no holder`},
+		{"pull claim without holder", up(`,"syncing":true`), `upstream "repo_00000000000a": pull claim has no holder`},
 		{"legacy pull holder", up(`,"syncing":true,"sync_claim_holder":"!legacy-grace"`), `pull claim held by "!legacy-grace"`},
-		{"push claim without holder", up(`,"push_syncing":true`), `upstream "r": push claim has no holder`},
+		{"push claim without holder", up(`,"push_syncing":true`), `upstream "repo_00000000000a": push claim has no holder`},
 		{"negative push attempt", up(`,"push_attempt":-1`), "negative schedule (push_attempt -1, push_due 0, sync_due 0)"},
 		{"negative sync due", up(`,"sync_due":-5`), "negative schedule (push_attempt 0, push_due 0, sync_due -5)"},
 	} {
