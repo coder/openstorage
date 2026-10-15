@@ -93,8 +93,9 @@ const s3walConvertAttempts = 16
 // restarts that pull. It also sets sync_pending for every unfinished sync
 // create, which v1 then completes with its first sync, and refuses with
 // *S3WALPendingCreatesError (nothing written) while a create without an
-// upstream link is unfinished, unless opts.Force. After the write it re-reads the
-// document and checks it equals the expected conversion of the source.
+// upstream link is unfinished, unless opts.Force. After the write it
+// re-reads the document and checks it equals the expected conversion of
+// the source.
 // Re-running on a document at the target version writes nothing.
 func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int, opts S3WALConvertOptions) (S3WALMetaConversion, error) {
 	assertf(cs != nil, "ConvertS3WALMeta: nil conditional store")

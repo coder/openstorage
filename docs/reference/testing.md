@@ -11,9 +11,9 @@ One suite, several storage stacks. `TestMain` picks the stack for the whole run.
 
 | Lane | Command | Backends | Needs |
 |---|---|---|---|
-| **Default (`pg`)** | `go test ./... -count=1 -race -timeout=30m` | Postgres 17 + SeaweedFS, booted per run via [testcontainers](https://golang.testcontainers.org/) | Docker, git, git-lfs |
+| **Default (`pg`)** | `go test ./... -tags=openstorage_viewcheck -count=1 -race -timeout=30m` | Postgres 17 + SeaweedFS, booted per run via [testcontainers](https://golang.testcontainers.org/) | Docker, git, git-lfs |
 | **Local** | `OPENSTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m` | SQLite (`sqlite://`) + plain-file blobs (`file://`) | git, git-lfs — **no Docker** |
-| **s3wal** | `OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m` | ONE SeaweedFS bucket carrying refs + metadata (`s3wal://`, the `_wal/` prefix) AND the blobs (`s3://`) — the zero-infra topology (ADR-46), plus its lane-only drills (restart-from-bucket-only, dual-serve refusal) | Docker, git, git-lfs |
+| **s3wal** | `OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -tags=openstorage_viewcheck -count=1 -race -timeout=25m` | ONE SeaweedFS bucket carrying refs + metadata (`s3wal://`, the `_wal/` prefix) AND the blobs (`s3://`) — the zero-infra topology (ADR-46), plus its lane-only drills (restart-from-bucket-only, dual-serve refusal) | Docker, git, git-lfs |
 | **Backend fan-out** | part of the default lane | `internal/api`, `internal/meta`, and `internal/ref` run every integration/conformance test twice, as `/pg` and `/sqlite` subtests | Docker (for the `/pg` half) |
 
 **Nightly lanes** — not PR gates; each can also be dispatched manually:
@@ -33,6 +33,12 @@ silently skipping LFS coverage.
 
 - `OPENSTORAGE_TEST_BACKEND` accepts `pg` (or unset), `local`, and `s3wal`;
   anything else panics in `TestMain` (`internal/githttp/e2e_test.go`).
+- The `openstorage_viewcheck` build tag makes every S3WAL metadata store check that no
+  caller wrote into its shared, read-only metadata view, and panic if one did. The
+  serve binary that `internal/githttp` builds always has the tag. The default and s3wal
+  lane commands above pass `-tags=openstorage_viewcheck` to `go test` for the
+  in-process stores, as CI's `test` and `test-s3wal` jobs do. Release builds never set
+  it.
 - The s3wal lane sets `OPENSTORAGE_S3WAL_LEASE_TTL=0`, because its shared-bucket
   multi-node tests are the topology the instance lease refuses. The dual-serve
   drill re-enables the lease.

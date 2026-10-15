@@ -165,7 +165,9 @@ func testMainInner(m *testing.M) int {
 
 	// Build the binary once.
 	binPath = filepath.Join(scratch, "openstorage")
-	build := exec.Command("go", "build", "-o", binPath, "./cmd/openstorage")
+	// openstorage_viewcheck: every S3WAL serve and hook process asserts
+	// that no caller wrote into the shared metadata view (issue #497).
+	build := exec.Command("go", "build", "-tags=openstorage_viewcheck", "-o", binPath, "./cmd/openstorage")
 	build.Dir = "../.."
 	if out, err := build.CombinedOutput(); err != nil {
 		panic(fmt.Sprintf("go build: %v: %s", err, out))
