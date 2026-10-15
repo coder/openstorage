@@ -518,13 +518,11 @@ type S3WAL struct {
 	cacheETag string
 	cacheBody []byte
 	lastSeq   int64
-	// rolledBack is the before-adoption latch of the refusal model
-	// (issue #516, s3walmeta_refuse.go). Only refuse and heal write it.
-	rolledBack bool
-	// quarantined, once set, answers every read until the process
-	// restarts: the cached document is known corrupt but decodes, so
-	// neither the cache nor a 304 may serve it again (issue #481).
-	quarantined error
+	// rolledBack is the before-adoption latch and quarantined the
+	// after-adoption quarantine of the refusal model (issue #516,
+	// s3walmeta_refuse.go). Only refuse and heal write them.
+	rolledBack  bool
+	quarantined *QuarantinedError
 	// cacheView is cacheBody decoded once, shared by every viewDoc caller
 	// until the cache changes (issue #470: the 1 s sync sweep otherwise
 	// decodes the whole document on every 304). It is READ-ONLY: viewDoc
@@ -545,6 +543,9 @@ type S3WAL struct {
 	// read. orgKeysMu guards only the map pointer, never spanning I/O.
 	orgKeysMu sync.RWMutex
 	orgKeys   map[string][]string
+	// keysRefused, once set by a quarantine, answers every key lookup
+	// from memory (auth fails closed, issue #516).
+	keysRefused error
 	// keyRefreshEvery is the refresh cadence (s3walKeyRefreshInterval
 	// unless a test overrides it); refreshCancel/refreshDone bound the
 	// refresher goroutine's lifetime to Close.
@@ -723,7 +724,7 @@ func (s *S3WAL) readDoc(ctx context.Context) (*s3walMetaDoc, string, error) {
 // read installs its decode as that view. Caller holds mu.
 func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, string, error) {
 	if s.quarantined != nil {
-		return nil, "", s.quarantined
+		return nil, "", s.quarantined // no store read: a quarantine is final
 	}
 	if s.cacheETag == "" {
 		obj, err := s.cas.Get(ctx, s3walMetaKey)
@@ -972,10 +973,9 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 			if fresh.Seq != ourSeq {
 				// Our 128-bit nonce at another seq: only an out-of-band
 				// edit produces that (issue #481).
-				// The recovery read already cached that body: quarantine
-				// it so no later operation reads or writes through it.
-				s.quarantined = &CorruptDocumentError{Err: fmt.Errorf("document seq %d carries this process's writer nonce from seq %d", fresh.Seq, ourSeq)}
-				return s.quarantined
+				// The recovery read already adopted that body and its
+				// keys: quarantine.
+				return s.refuse(refuseForeignNonce, &CorruptDocumentError{Err: fmt.Errorf("document seq %d carries this process's writer nonce from seq %d", fresh.Seq, ourSeq)})
 			}
 			return nil // our write landed and is the latest
 		}
@@ -1100,8 +1100,11 @@ func (s *S3WAL) UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKey
 func (s *S3WAL) PublicKeysForOrg(ctx context.Context, name string) ([]string, error) {
 	assertf(name != "", "PublicKeysForOrg: empty org name")
 	s.orgKeysMu.RLock()
-	snap := s.orgKeys
+	snap, refused := s.orgKeys, s.keysRefused
 	s.orgKeysMu.RUnlock()
+	if refused != nil {
+		return nil, refused // quarantined: fail closed from memory (issue #516)
+	}
 	if snap == nil {
 		doc, err := s.viewDoc(ctx) // populates the snapshot via adoptOrgKeys
 		if err != nil {

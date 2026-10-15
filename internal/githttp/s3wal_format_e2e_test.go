@@ -232,7 +232,7 @@ func TestS3WALServeSurvivesOlderMetadata(t *testing.T) {
 		t.Fatalf("serve wrote meta.json through the older document:\nwant %s\ngot  %s", older, got)
 	}
 	// The refusal ends when the bucket holds the exact bytes serve last
-	// saw again (issue #516), here under a new ETag.
+	// saw again (issue #516).
 	_, etag = readMeta()
 	if _, err := client.PutObject(t.Context(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String("_wal/meta.json"), Body: bytes.NewReader(newer), IfMatch: aws.String(etag),

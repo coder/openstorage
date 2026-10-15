@@ -725,7 +725,9 @@ func (s *S3WAL) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 			if !u.Detaching {
 				// Nothing unmarks a durable mark: only an out-of-band
 				// edit clears it (issue #481).
-				return false, &CorruptDocumentError{Err: fmt.Errorf("upstream %q: detaching mark vanished during detach", repoID)}
+				// The phase-3 read already adopted the edited body and
+				// its keys: quarantine.
+				return false, s.refuse(refuseVanishedMark, &CorruptDocumentError{Err: fmt.Errorf("upstream %q: detaching mark vanished during detach", repoID)})
 			}
 			delete(doc.Upstreams, repoID)
 			return true, nil
