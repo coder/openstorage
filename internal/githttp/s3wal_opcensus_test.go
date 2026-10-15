@@ -150,7 +150,7 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 		"OPENSTORAGE_SWEEP_INTERVAL=0", "OPENSTORAGE_PG_URL="+db, "OPENSTORAGE_S3_URL="+blobs)
 	for deadline := time.Now().Add(60 * time.Second); ; {
 		raw, _ := os.ReadFile(opLog)
-		if strings.Contains(string(raw), ":schedule ") {
+		if strings.Contains(string(raw), ":"+s3oplog.ScopeSchedule+" ") {
 			break
 		}
 		if time.Now().After(deadline) {
