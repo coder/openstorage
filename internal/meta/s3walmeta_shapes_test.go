@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -21,9 +22,6 @@ func TestS3WALMetaDecodeLaneShapes(t *testing.T) {
 		return head + `"seq":1,"upstreams":{"r":{"provider":"github","owner":"a","name":"b","upstream_host":"h","created_at":1` + fields + `}}}`
 	}
 	for _, tc := range []struct{ name, body, wantErr string }{
-		{"seq at max", `{"v":2,"seq":9223372036854775807,"writer":"w","next_org_id":0,"next_key_id":0}`, "seq or an id counter (0, 0) is at its maximum"},
-		{"org counter at max", `{"v":2,"seq":1,"writer":"w","next_org_id":9223372036854775807,"next_key_id":0}`, "is at its maximum"},
-		{"key counter at max", `{"v":2,"seq":1,"writer":"w","next_org_id":0,"next_key_id":9223372036854775807}`, "is at its maximum"},
 		{"pull claim without holder", up(`,"syncing":true`), `upstream "r": pull claim has no holder`},
 		{"legacy pull holder", up(`,"syncing":true,"sync_claim_holder":"!legacy-grace"`), `pull claim held by "!legacy-grace"`},
 		{"push claim without holder", up(`,"push_syncing":true`), `upstream "r": push claim has no holder`},
@@ -38,10 +36,10 @@ func TestS3WALMetaDecodeLaneShapes(t *testing.T) {
 			}
 		})
 	}
-	// Controls: the largest values a writer can still bump, and a held
-	// claim, decode.
+	// Controls: counters at their maximum, and a held claim, decode (only
+	// the write that would wrap them is refused).
 	for _, body := range []string{
-		`{"v":2,"seq":9223372036854775806,"writer":"w","next_org_id":9223372036854775806,"next_key_id":9223372036854775806}`,
+		`{"v":2,"seq":9223372036854775807,"writer":"w","next_org_id":9223372036854775807,"next_key_id":9223372036854775807}`,
 		up(`,"syncing":true,"sync_claim_holder":"h1","push_syncing":true,"push_claim_holder":"h2","push_attempt":5,"push_due":7`),
 	} {
 		if _, err := decodeS3WALMetaDoc([]byte(body)); err != nil {
@@ -152,5 +150,94 @@ func TestS3WALMetaForeignSeqNonceNoPanic(t *testing.T) {
 	var cd *CorruptDocumentError
 	if _, err := a.CreateRepo(ctx, "org", "https://example.com/nonce.git", "main"); !errors.As(err, &cd) || !strings.Contains(err.Error(), "carries this process's writer nonce") {
 		t.Fatalf("CreateRepo = %v, want the foreign-seq-nonce *CorruptDocumentError", err)
+	}
+	// The recovery read cached the edited body. It stays quarantined: no
+	// later read or write goes through it (Codex P2 on #509).
+	edited, _ := cas.Get(ctx, s3walMetaKey)
+	if _, err := a.CreateRepo(ctx, "org", "https://example.com/again.git", "main"); !errors.As(err, &cd) {
+		t.Fatalf("second CreateRepo = %v, want the quarantined *CorruptDocumentError", err)
+	}
+	if _, err := a.ListRepos(ctx, "org", ListParams{Limit: 10}); !errors.As(err, &cd) {
+		t.Fatalf("ListRepos = %v, want the quarantined *CorruptDocumentError", err)
+	}
+	if got, _ := cas.Get(ctx, s3walMetaKey); got.ETag != edited.ETag {
+		t.Fatal("a later write went through the quarantined document")
+	}
+}
+
+// Seq and id counters at MaxInt64 (an out-of-band edit, issue #487): the
+// document stays readable, and only the write or mint that would wrap is
+// refused, with nothing written. A write at MaxInt64-1 commits a readable
+// MaxInt64 document (Codex P2 on #509).
+func TestS3WALMetaCountersAtMaximum(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		field string
+		value int64
+		write func(st *S3WAL) error
+		want  string
+	}{
+		{"seq", "seq", math.MaxInt64, func(st *S3WAL) error {
+			_, err := st.CreateRepo(ctx, "org", "https://example.com/max.git", "main")
+			return err
+		}, "seq 9223372036854775807 is at its maximum"},
+		{"org counter", "next_org_id", math.MaxInt64, func(st *S3WAL) error {
+			_, err := st.UpsertOrgWithKeys(ctx, "new-org", []string{"pem"})
+			return err
+		}, "next_org_id 9223372036854775807 is at its maximum"},
+		{"key counter", "next_key_id", math.MaxInt64, func(st *S3WAL) error {
+			_, err := st.AddSigningKey(ctx, "org", "ssh-ed25519 AAAAtest key")
+			return err
+		}, "next_key_id 9223372036854775807 is at its maximum"},
+		{"seq one below", "seq", math.MaxInt64 - 1, func(st *S3WAL) error {
+			_, err := st.CreateRepo(ctx, "org", "https://example.com/last.git", "main")
+			return err
+		}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cas := s3wal.NewMemCAS()
+			seed := NewS3WAL(cas)
+			t.Cleanup(seed.Close)
+			if _, err := seed.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+				t.Fatal(err)
+			}
+			doc, _ := storedS3WALMeta(t, cas)
+			switch tc.field {
+			case "seq":
+				doc.Seq = tc.value
+			case "next_org_id":
+				doc.NextOrgID = tc.value
+			case "next_key_id":
+				doc.NextKeyID = tc.value
+			}
+			body, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			putRawS3WALMeta(t, cas, body)
+			before, _ := cas.Get(ctx, s3walMetaKey)
+			st := NewS3WAL(cas)
+			t.Cleanup(st.Close)
+			if _, err := st.ListRepos(ctx, "org", ListParams{Limit: 10}); err != nil {
+				t.Fatalf("read at %s=%d: %v", tc.field, tc.value, err)
+			}
+			err = tc.write(st)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := NewS3WAL(cas).ListRepos(ctx, "org", ListParams{Limit: 10}); err != nil {
+					t.Fatalf("the committed MaxInt64 document does not read back: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("write at %s=%d = %v, want %q", tc.field, tc.value, err, tc.want)
+			}
+			if got, _ := cas.Get(ctx, s3walMetaKey); got.ETag != before.ETag {
+				t.Fatal("the refused write changed the document")
+			}
+		})
 	}
 }

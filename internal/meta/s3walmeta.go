@@ -278,11 +278,6 @@ func (doc *s3walMetaDoc) checkIDs() error {
 	if doc.NextOrgID < 0 || doc.NextKeyID < 0 {
 		return fmt.Errorf("document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
 	}
-	// The next write bumps seq, and the next mint bumps a counter: at
-	// MaxInt64 either one would wrap negative (issue #487).
-	if doc.Seq == math.MaxInt64 || doc.NextOrgID == math.MaxInt64 || doc.NextKeyID == math.MaxInt64 {
-		return fmt.Errorf("document seq %d: seq or an id counter (%d, %d) is at its maximum", doc.Seq, doc.NextOrgID, doc.NextKeyID)
-	}
 	// Upstream lanes (issue #481): no writer leaves a claim without its
 	// holder, and the schedule fields only count up from 0.
 	for _, repoID := range slices.Sorted(maps.Keys(doc.Upstreams)) {
@@ -398,6 +393,11 @@ func (doc *s3walMetaDoc) encodeNext() ([]byte, error) {
 		assertf(utf8.ValidString(name),
 			"encodeAdvance: org key %q is not valid UTF-8 — JSON encoding would alias it onto its U+FFFD spelling", name)
 	}
+	if doc.Seq == math.MaxInt64 {
+		// The bump would wrap negative (issue #487). The document stays
+		// readable; only writes are refused.
+		return nil, errCounterExhausted("seq", doc.Seq)
+	}
 	doc.Seq++
 	doc.Writer = newS3WALMetaNonce()
 	body, err := json.Marshal(doc)
@@ -405,6 +405,13 @@ func (doc *s3walMetaDoc) encodeNext() ([]byte, error) {
 		return nil, fmt.Errorf("s3walmeta: document encode: %w", err)
 	}
 	return body, nil
+}
+
+// errCounterExhausted refuses a write whose seq or id bump would wrap
+// negative (issue #487). No writer reaches MaxInt64, so this only answers an
+// out-of-band edit; the document itself stays readable.
+func errCounterExhausted(field string, v int64) error {
+	return fmt.Errorf("s3walmeta: %s %d is at its maximum: refusing the write (the document was edited out of band; see docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover)", field, v)
 }
 
 // newS3WALMetaNonce mints the 128-bit hex writer nonce.
@@ -455,6 +462,10 @@ type S3WAL struct {
 	// is accepted again, because a restored or recreated lineage can
 	// advance back to any seq with different contents.
 	rolledBack bool
+	// quarantined, once set, answers every read until the process
+	// restarts: the cached document is known corrupt but decodes, so
+	// neither the cache nor a 304 may serve it again (issue #481).
+	quarantined error
 	// cacheView is cacheBody decoded once, shared by every viewDoc caller
 	// until the cache changes (issue #470: the 1 s sync sweep otherwise
 	// decodes the whole document on every 304). It is READ-ONLY: viewDoc
@@ -652,6 +663,9 @@ func (s *S3WAL) readDoc(ctx context.Context) (*s3walMetaDoc, string, error) {
 // the cached decoded view instead of decoding the body again, and a fresh
 // read installs its decode as that view. Caller holds mu.
 func (s *S3WAL) readDocShared(ctx context.Context, shared bool) (*s3walMetaDoc, string, error) {
+	if s.quarantined != nil {
+		return nil, "", s.quarantined
+	}
 	if s.cacheETag == "" {
 		obj, err := s.cas.Get(ctx, s3walMetaKey)
 		if errors.Is(err, s3wal.ErrNotExist) {
@@ -875,7 +889,10 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) (err error) {
 			if fresh.Seq != ourSeq {
 				// Our 128-bit nonce at another seq: only an out-of-band
 				// edit produces that (issue #481).
-				return &CorruptDocumentError{Err: fmt.Errorf("document seq %d carries this process's writer nonce from seq %d", fresh.Seq, ourSeq)}
+				// The recovery read already cached that body: quarantine
+				// it so no later operation reads or writes through it.
+				s.quarantined = &CorruptDocumentError{Err: fmt.Errorf("document seq %d carries this process's writer nonce from seq %d", fresh.Seq, ourSeq)}
+				return s.quarantined
 			}
 			return nil // our write landed and is the latest
 		}
@@ -965,6 +982,9 @@ func (s *S3WAL) UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKey
 		fn: func(doc *s3walMetaDoc) (bool, error) {
 			row := doc.Orgs[name]
 			if row == nil {
+				if doc.NextOrgID == math.MaxInt64 {
+					return false, errCounterExhausted("next_org_id", doc.NextOrgID)
+				}
 				doc.NextOrgID++
 				row = &s3walMetaOrg{ID: doc.NextOrgID, CreatedAt: nanos}
 				if doc.Orgs == nil {
@@ -1358,6 +1378,9 @@ func (s *S3WAL) AddSigningKey(ctx context.Context, org, keyText string) (Signing
 			orgRow, err := lookupOrg(doc, org)
 			if err != nil {
 				return false, err
+			}
+			if doc.NextKeyID == math.MaxInt64 {
+				return false, errCounterExhausted("next_key_id", doc.NextKeyID)
 			}
 			doc.NextKeyID++
 			orgRow.SigningKeys = append(orgRow.SigningKeys, s3walMetaSigningKey{ID: doc.NextKeyID, KeyText: keyText, CreatedAt: nanos})
