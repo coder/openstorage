@@ -38,9 +38,8 @@ func (s s3walLocalSchedule) readLocalSchedule(ctx context.Context, repoID string
 	if err != nil {
 		return localSchedule{}, ErrNotFound
 	}
-	sc := localSchedule{pushAttempt: u.PushAttempt, pushDue: u.PushDue, syncDue: u.SyncDue}
-	assertf(sc.pushAttempt >= 0 && sc.pushDue >= 0 && sc.syncDue >= 0, "corrupt schedule for %q: %+v", repoID, sc)
-	return sc, nil
+	// Decode rejects negative schedules (checkUpstreamShape).
+	return localSchedule{pushAttempt: u.PushAttempt, pushDue: u.PushDue, syncDue: u.SyncDue}, nil
 }
 
 // CompleteSyncRepoCreate is CompleteRepoCreate that also records the

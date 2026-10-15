@@ -401,10 +401,19 @@ func TestS3WALMetaConvertProperty(t *testing.T) {
 		for j := range rng.IntN(4) {
 			id := fmt.Sprintf("r%d", j)
 			d.Repos[id] = &s3walMetaRepo{OrgID: 1, URL: id, CreateState: rng.IntN(3), DeletedAt: rng.Int64N(2)}
-			d.Upstreams[id] = &s3walMetaUpstream{
+			u := &s3walMetaUpstream{
 				Syncing: rng.IntN(2) == 0, SyncPending: rng.IntN(2) == 0, PushSyncing: rng.IntN(2) == 0,
 				PushPending: rng.IntN(3), PushAttempt: rng.IntN(6), PushDue: rng.Int64N(3), SyncDue: rng.Int64N(3),
 			}
+			// A held claim has its holder, as every writer leaves it
+			// (decode rejects holderless claims, issue #481).
+			if u.Syncing {
+				u.SyncClaimHolder = "h"
+			}
+			if u.PushSyncing {
+				u.PushClaimHolder = "p"
+			}
+			d.Upstreams[id] = u
 		}
 		body, err := json.Marshal(d)
 		if err != nil {

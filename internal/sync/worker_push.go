@@ -435,8 +435,12 @@ func (w *Worker) finishPush(ctx context.Context, repoID, holder string, success 
 // policy is main's: only unreachable upstreams retry, one initial attempt
 // plus MaxPushTransientRetries retries, after PushRetryDelay. Success also
 // marks the mirror-back pull in the same write (see Worker.AfterForward).
+//
+// attempt is the stored retry position. The store rejects negative ones,
+// and one past the budget (an out-of-band edit, issue #481) means the
+// budget is spent: no retry, never a panic.
 func localPushOutcome(runErr error, attempt int, force bool) meta.PushOutcome {
-	assertf(attempt >= 0 && attempt <= MaxPushTransientRetries, "local push attempt %d out of range", attempt)
+	assertf(attempt >= 0, "local push attempt %d is negative", attempt)
 	switch {
 	case runErr == nil:
 		return meta.PushOutcome{Kind: meta.OutcomeDone, Success: true, MirrorBack: true}
