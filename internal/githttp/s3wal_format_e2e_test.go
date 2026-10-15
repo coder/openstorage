@@ -166,8 +166,9 @@ func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, v2 []byte) []by
 // TestS3WALServeSurvivesOlderMetadata (issue #488): when meta.json goes
 // back to an older seq while serve runs (here: an older copy put back, as a
 // restore into the live bucket would), serve keeps running. Metadata reads
-// answer errors, and serve writes nothing through the older document.
-// Before the fix, serve's org-key refresher panicked within 15 s.
+// answer errors, serve writes nothing through the older document, and it
+// recovers once the newer bytes come back (issue #516). Before the #488
+// fix, serve's org-key refresher panicked within 15 s.
 func TestS3WALServeSurvivesOlderMetadata(t *testing.T) {
 	if testBackend != backendS3WAL {
 		t.Skip("the metadata document is S3WAL-only (ADR-51)")
@@ -213,7 +214,7 @@ func TestS3WALServeSurvivesOlderMetadata(t *testing.T) {
 	_, token := create("older-488")
 	older, _ := readMeta()
 	create("newer-488")
-	_, etag := readMeta()
+	newer, etag := readMeta()
 	if _, err := client.PutObject(t.Context(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String("_wal/meta.json"), Body: bytes.NewReader(older), IfMatch: aws.String(etag),
 	}); err != nil {
@@ -227,13 +228,18 @@ func TestS3WALServeSurvivesOlderMetadata(t *testing.T) {
 	if status := apiGet(t, node, token, "/api/v1/repo", nil); status/100 == 2 {
 		t.Fatalf("repo read through the older document answered %d, want an error", status)
 	}
-	if err := node.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	if err := waitNodeExit(t, node, 30*time.Second); err != nil {
-		t.Logf("serve exit after meta.json went back: %v", err)
-	}
 	if got, _ := readMeta(); !bytes.Equal(got, older) {
 		t.Fatalf("serve wrote meta.json through the older document:\nwant %s\ngot  %s", older, got)
+	}
+	// The refusal ends when the bucket holds the exact bytes serve last
+	// saw again (issue #516), here under a new ETag.
+	_, etag = readMeta()
+	if _, err := client.PutObject(t.Context(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("_wal/meta.json"), Body: bytes.NewReader(newer), IfMatch: aws.String(etag),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if status := apiGet(t, node, token, "/api/v1/repo", nil); status != http.StatusOK {
+		t.Fatalf("repo read after the exact bytes came back answered %d, want 200", status)
 	}
 }

@@ -49,6 +49,19 @@ const (
 
 var sizeGuardNames = [...]string{SizeGuardWarn: "warn", SizeGuardRefuse: "refuse"}
 
+// MetaRefusal is the class of an S3WAL meta.json refusal (issue #516).
+type MetaRefusal int
+
+const (
+	MetaRefusedDecode MetaRefusal = iota
+	MetaRefusedStale
+	MetaRefusedVanished
+)
+
+var metaRefusalNames = [...]string{MetaRefusedDecode: "decode", MetaRefusedStale: "stale", MetaRefusedVanished: "vanished"}
+
+func (c MetaRefusal) String() string { return name(metaRefusalNames[:], c) }
+
 // Job names a background job whose executions are counted.
 type Job int
 
@@ -129,6 +142,10 @@ var (
 		Name: "openstorage_s3wal_manifest_size_guard_total",
 		Help: "S3WAL manifest size-guard events in this process: warn = once-per-repository warning logged, refuse = final refusal of a growing mutation.",
 	}, []string{"result"})
+	s3walMetaRefused = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "openstorage_s3wal_meta_refused_total",
+		Help: "Times this process entered a refusal of S3WAL meta.json, by fixed class: decode, stale and vanished latch until the store serves the cached document again.",
+	}, []string{"class"})
 	commitGraphRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "openstorage_commit_graph_refresh_total",
 		Help: "Commit-graph refreshes of cache repositories after full hydrates in this process, by fixed outcome (no repository label).",
@@ -141,7 +158,10 @@ var (
 
 func init() {
 	registry.MustRegister(httpRequests, httpDuration, s3walContention, s3walLeaseRenewalFailures,
-		s3walLeaseHeld, s3walSizeGuard, jobRuns, commitGraphRefresh)
+		s3walLeaseHeld, s3walSizeGuard, s3walMetaRefused, jobRuns, commitGraphRefresh)
+	for _, c := range metaRefusalNames {
+		s3walMetaRefused.WithLabelValues(c)
+	}
 	for _, o := range commitGraphOutcomeNames {
 		commitGraphRefresh.WithLabelValues(o)
 	}
@@ -195,6 +215,11 @@ func SetS3WALLeaseHeld(held bool) {
 // S3WALManifestSizeGuard counts one manifest size-guard event.
 func S3WALManifestSizeGuard(r SizeGuardResult) {
 	s3walSizeGuard.WithLabelValues(name(sizeGuardNames[:], r)).Inc()
+}
+
+// S3WALMetaRefused counts one entry into a meta.json refusal state.
+func S3WALMetaRefused(c MetaRefusal) {
+	s3walMetaRefused.WithLabelValues(c.String()).Inc()
 }
 
 // CommitGraphRefresh counts one cache commit-graph refresh outcome.
