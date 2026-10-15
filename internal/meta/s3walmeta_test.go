@@ -258,7 +258,7 @@ func TestS3WALMetaStaleDocumentNoPanic(t *testing.T) {
 	if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); !errors.As(err, &stale) || stale.Got != 1 || stale.Seen != 2 {
 		t.Fatalf("GetRepoByID = %v, want a *StaleDocumentError for seq 1 after seq 2", err)
 	}
-	for _, want := range []string{"_wal/meta.json went back to seq 1 after this process saw seq 2", "backup-restore-s3wal.md#restore-and-validate-before-cutover"} {
+	for _, want := range []string{"_wal/meta.json at seq 1 does not continue the document this process last saw at seq 2", "backup-restore-s3wal.md#restore-and-validate-before-cutover"} {
 		if !strings.Contains(stale.Error(), want) {
 			t.Fatalf("error %q lacks %q", stale, want)
 		}
@@ -271,9 +271,22 @@ func TestS3WALMetaStaleDocumentNoPanic(t *testing.T) {
 		t.Fatalf("the store wrote through the older document: %s", got.Body)
 	}
 
-	// A document back at the watermark is served again (a stale read
-	// that the store later corrects).
-	if _, err := mem.Advance(ctx, s3walMetaKey, newest.Body, replaced.ETag); err != nil {
+	// A fresh process (a hook) advances the restored lineage back to seq 2
+	// with different contents. The numeric catch-up must not end the
+	// refusal: the regression latches (Codex P1 on #496).
+	fresh := NewS3WAL(mem)
+	t.Cleanup(fresh.Close)
+	if _, err := fresh.CreateRepo(ctx, "o", "https://example.com/fork.git", "main"); err != nil {
+		t.Fatal(err)
+	}
+	forked, _ := mem.Get(ctx, s3walMetaKey)
+	if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); !errors.As(err, &stale) || stale.Got != 2 || stale.Seen != 2 {
+		t.Fatalf("GetRepoByID on the forked seq 2 = %v, want a *StaleDocumentError", err)
+	}
+
+	// The exact document this process last saw is served again (a stale
+	// read that the store later corrects): reads succeed.
+	if _, err := mem.Advance(ctx, s3walMetaKey, newest.Body, forked.ETag); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := st.GetRepoByID(ctx, "o", repo.RepoID); err != nil || got.RepoID != repo.RepoID {
