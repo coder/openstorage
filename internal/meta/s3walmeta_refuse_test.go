@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"math"
 	"path/filepath"
 	"slices"
@@ -18,12 +19,14 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/metrics"
+	"github.com/coder/openstorage/internal/ref"
 	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // refuseCAS counts document reads and fails them on demand. With newETag,
-// it answers every conditional read in full under a new ETag, as S3 does
-// for a restored copy of the same bytes (MemCAS ETags derive from content).
+// it answers every conditional read in full under a new ETag, so a row can
+// reach the exact-bytes heal: MemCAS ETags, like single-part S3 ETags,
+// derive from content, so the same bytes otherwise answer 304.
 type refuseCAS struct {
 	*s3wal.MemCAS
 	reads   atomic.Int32
@@ -55,7 +58,8 @@ func (c *refuseCAS) GetIfChanged(ctx context.Context, key, etag string) (s3wal.O
 // refuseFixture: a store with a 1 ms org-key refresher over a trusted
 // document (org "org" with key "pem", a repo with an upstream), or over
 // cold bytes it never adopted. prev is the document one seq before
-// trusted.
+// trusted. The claim sink clears the detaching mark with the claim, as an
+// out-of-band edit would (the vanished-mark row).
 type refuseFixture struct {
 	t              *testing.T
 	mem            *s3wal.MemCAS
@@ -101,14 +105,15 @@ func newRefuseFixture(t *testing.T, cold []byte) *refuseFixture {
 		}
 	}
 	f.cas = &refuseCAS{MemCAS: f.mem}
-	o := resolveOptions([]Option{withKeyRefreshInterval(time.Millisecond)})
+	refStore := ref.NewS3WAL(f.mem, nil)
+	o := resolveOptions([]Option{withKeyRefreshInterval(time.Millisecond), WithSyncClaimSink(unmarkOnClearSink{SyncClaimSink: refStore, t: t, cas: f.mem})})
 	if cold != nil {
 		if _, err := f.mem.Create(ctx, s3walMetaKey, cold); err != nil {
 			t.Fatal(err)
 		}
 	}
 	f.st = newS3WALStore(f.cas, nil, nil, o)
-	t.Cleanup(f.st.Close)
+	t.Cleanup(func() { f.st.Close(); refStore.Close() })
 	if cold == nil {
 		f.repoID = seedS3WALUpstream(t, f.st)
 		f.prev, _ = f.mem.Get(ctx, s3walMetaKey)
@@ -123,7 +128,7 @@ func newRefuseFixture(t *testing.T, cold []byte) *refuseFixture {
 
 func refusedTotal() float64 {
 	var sum float64
-	for _, c := range []string{"decode", "stale", "vanished"} {
+	for _, c := range []string{"decode", "stale", "vanished", "foreign_nonce", "vanished_mark"} {
 		sum += metrics.Value("openstorage_s3wal_meta_refused_total", map[string]string{"class": c})
 	}
 	return sum
@@ -186,7 +191,8 @@ func isType[E error](err error) bool { var e E; return errors.As(err, &e) }
 // TestS3WALMetaRefusalMatrix is the issue #516 test matrix: every
 // before-adoption refusal class and three controls, each checked for its
 // error, the state it keeps, auth, the refresher, the metric, a later
-// write, and how it ends.
+// write, and how it ends. TestS3WALMetaQuarantineMatrix has the
+// after-adoption rows.
 func TestS3WALMetaRefusalMatrix(t *testing.T) {
 	ctx := context.Background()
 	garbage := []byte(`{"v":2,"seq":`)
@@ -298,11 +304,106 @@ func TestS3WALMetaRefusalMatrix(t *testing.T) {
 	}
 }
 
-// TestS3WALMetaRefuseIsTheOnlyWriter guards the choke point: only refuse
-// and heal may assign the latch.
+// TestS3WALMetaQuarantineMatrix is the after-adoption half of the issue
+// #516 test matrix: a refusal found after the edited body was installed
+// drops the cache, the shared view and the key snapshot, fails every
+// operation and key lookup without a store read, and ends only at a
+// restart. A claim this process held can no longer finish, and another
+// process steals it after its lease.
+func TestS3WALMetaQuarantineMatrix(t *testing.T) {
+	ctx := context.Background()
+	for _, row := range []struct {
+		name string
+		arm  func(f *refuseFixture) error
+	}{
+		{"foreign nonce", func(f *refuseFixture) error {
+			// Our writer nonce at seq+5: only an out-of-band edit of our
+			// ambiguous write produces it (issue #481).
+			f.armPut(s3wal.FaultAmbiguousApplied, func() {
+				var doc map[string]any
+				o, _ := f.mem.Get(ctx, s3walMetaKey)
+				_ = json.Unmarshal(o.Body, &doc)
+				doc["seq"] = doc["seq"].(float64) + 5
+				doc["orgs"].(map[string]any)["org"].(map[string]any)["public_keys"] = []string{"edited-pem"}
+				b, _ := json.Marshal(doc)
+				f.put(b)
+			})
+			_, err := f.st.CreateRepo(ctx, "org", "https://example.com/nonce.git", "main")
+			return err
+		}},
+		{"vanished mark", func(f *refuseFixture) error {
+			// The claim sink clears the detaching mark with the claim.
+			return f.st.DeleteRepoUpstream(ctx, f.repoID)
+		}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newRefuseFixture(t, nil)
+			if _, ok, _, err := f.st.TryBeginSync(ctx, f.repoID, "h1", 20*time.Millisecond); err != nil || !ok {
+				t.Fatalf("TryBeginSync = %v, %v", ok, err)
+			}
+			f.snap()
+			var cd *CorruptDocumentError
+			if err := row.arm(f); !isType[*QuarantinedError](err) || !errors.As(err, &cd) {
+				t.Fatalf("refusal error = %v, want a *QuarantinedError wrapping a *CorruptDocumentError", err)
+			}
+			if got := f.state(); !got.quarantine || got.body != nil || got.etag != "" || got.view != nil {
+				t.Fatalf("quarantine kept state: %+v", got)
+			}
+			// Key lookups fail from memory: they do not wait for mu.
+			f.st.mu.Lock()
+			keysErr := make(chan error, 1)
+			go func() { _, err := f.st.PublicKeysForOrg(ctx, "org"); keysErr <- err }()
+			select {
+			case err := <-keysErr:
+				if !isType[*QuarantinedError](err) {
+					t.Errorf("PublicKeysForOrg = %v; want the quarantine error", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("PublicKeysForOrg waited for the store lock under quarantine")
+			}
+			f.st.mu.Unlock()
+			if _, err := f.st.GetWebhook(ctx, "wh_1"); !isType[*QuarantinedError](err) {
+				t.Fatalf("GetWebhook = %v; want the quarantine error, not a gone webhook", err)
+			}
+			if _, err := f.st.FinishSync(ctx, f.repoID, "h1", true); !isType[*QuarantinedError](err) {
+				t.Fatalf("FinishSync of the held claim = %v; want the quarantine error", err)
+			}
+			reads := f.cas.reads.Load()
+			time.Sleep(20 * time.Millisecond) // about 20 refresher ticks
+			if n := f.cas.reads.Load() - reads; n != 0 {
+				t.Fatalf("the quarantined store made %d store reads", n)
+			}
+			if d := refusedTotal() - f.metricsAtStart; d != 1 {
+				t.Fatalf("refusals counted = %v, want 1 (once per entry)", d)
+			}
+			before, _ := f.mem.Get(ctx, s3walMetaKey)
+			if _, err := f.st.CreateRepo(ctx, "org", "https://example.com/later.git", "main"); !isType[*QuarantinedError](err) {
+				t.Fatalf("later write = %v, want the quarantine error", err)
+			}
+			if after, _ := f.mem.Get(ctx, s3walMetaKey); after.ETag != before.ETag {
+				t.Fatal("a quarantined process wrote meta.json")
+			}
+			// Another process, fresh on the bucket, steals the claim.
+			other := NewS3WAL(f.mem)
+			defer other.Close()
+			if _, ok, _, err := other.TryBeginSync(ctx, f.repoID, "h2", time.Minute); err != nil || !ok {
+				t.Fatalf("another process's TryBeginSync after the lease = %v, %v; want the claim", ok, err)
+			}
+			f.put(f.trusted.Body) // exact trusted bytes do not end a quarantine
+			if err := CheckFormat(ctx, f.st); !isType[*QuarantinedError](err) {
+				t.Fatalf("after the trusted bytes came back: %v, want the quarantine error", err)
+			}
+		})
+	}
+}
+
+// TestS3WALMetaRefuseIsTheOnlyWriter guards the choke point: only the
+// S3WAL methods refuse, heal and adoptOrgKeys may assign the refusal
+// state, take its address, or set it in a composite literal.
 func TestS3WALMetaRefuseIsTheOnlyWriter(t *testing.T) {
 	allowed := map[string][]string{
-		"rolledBack": {"refuse", "heal"},
+		"rolledBack": {"refuse", "heal"}, "quarantined": {"refuse"},
+		"keysRefused": {"refuse"}, "orgKeys": {"refuse", "adoptOrgKeys"},
 	}
 	files, err := filepath.Glob("s3walmeta*.go")
 	if err != nil || len(files) == 0 {
@@ -322,16 +423,30 @@ func TestS3WALMetaRefuseIsTheOnlyWriter(t *testing.T) {
 			if !ok || fn.Body == nil {
 				continue
 			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				as, ok := n.(*ast.AssignStmt)
-				if !ok {
-					return true
+			name := fn.Name.Name
+			if fn.Recv == nil || types.ExprString(fn.Recv.List[0].Type) != "*S3WAL" {
+				name = "func " + name // only the S3WAL methods are allowed
+			}
+			check := func(pos token.Pos, field, how string) {
+				if fns, guarded := allowed[field]; guarded && !slices.Contains(fns, name) {
+					t.Errorf("%s: %s %s %s outside %v", fset.Position(pos), name, how, field, fns)
 				}
-				for _, lhs := range as.Lhs {
-					if sel, ok := lhs.(*ast.SelectorExpr); ok {
-						if fns, guarded := allowed[sel.Sel.Name]; guarded && !slices.Contains(fns, fn.Name.Name) {
-							t.Errorf("%s: %s assigns %s outside %v", fset.Position(as.Pos()), fn.Name.Name, sel.Sel.Name, fns)
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.AssignStmt:
+					for _, lhs := range n.Lhs {
+						if sel, ok := lhs.(*ast.SelectorExpr); ok {
+							check(n.Pos(), sel.Sel.Name, "assigns")
 						}
+					}
+				case *ast.UnaryExpr:
+					if sel, ok := n.X.(*ast.SelectorExpr); ok && n.Op == token.AND {
+						check(n.Pos(), sel.Sel.Name, "takes the address of")
+					}
+				case *ast.KeyValueExpr:
+					if id, ok := n.Key.(*ast.Ident); ok {
+						check(n.Pos(), id.Name, "sets")
 					}
 				}
 				return true

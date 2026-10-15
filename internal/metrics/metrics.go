@@ -49,16 +49,23 @@ const (
 
 var sizeGuardNames = [...]string{SizeGuardWarn: "warn", SizeGuardRefuse: "refuse"}
 
-// MetaRefusal is the class of an S3WAL meta.json refusal (issue #516).
+// MetaRefusal is the class of an S3WAL meta.json refusal (issue #516):
+// the latch classes keep the last trusted state, the quarantine classes
+// drop it until restart.
 type MetaRefusal int
 
 const (
 	MetaRefusedDecode MetaRefusal = iota
 	MetaRefusedStale
 	MetaRefusedVanished
+	MetaRefusedForeignNonce
+	MetaRefusedVanishedMark
 )
 
-var metaRefusalNames = [...]string{MetaRefusedDecode: "decode", MetaRefusedStale: "stale", MetaRefusedVanished: "vanished"}
+var metaRefusalNames = [...]string{
+	MetaRefusedDecode: "decode", MetaRefusedStale: "stale", MetaRefusedVanished: "vanished",
+	MetaRefusedForeignNonce: "foreign_nonce", MetaRefusedVanishedMark: "vanished_mark",
+}
 
 func (c MetaRefusal) String() string { return name(metaRefusalNames[:], c) }
 
@@ -144,7 +151,7 @@ var (
 	}, []string{"result"})
 	s3walMetaRefused = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "openstorage_s3wal_meta_refused_total",
-		Help: "Times this process entered a refusal of S3WAL meta.json, by fixed class: decode, stale and vanished latch until the store serves the cached document again.",
+		Help: "Times this process entered a refusal of S3WAL meta.json, by fixed class: decode, stale and vanished latch until the store serves the cached document again; foreign_nonce and vanished_mark quarantine until restart.",
 	}, []string{"class"})
 	commitGraphRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "openstorage_commit_graph_refresh_total",
