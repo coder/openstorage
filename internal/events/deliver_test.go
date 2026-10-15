@@ -315,3 +315,25 @@ func TestZeroValueDelivererRefusesRedirects(t *testing.T) {
 		t.Errorf("redirect target saw %d requests, want 0 (redirect must not be followed)", got)
 	}
 }
+
+// A webhook whose secret decrypts to "" (issue #492: the S3-WAL decoder
+// rejects an empty stored value, but not an envelope of "") fails the
+// attempt with an error instead of panicking the delivery goroutine.
+func TestAttemptRefusesEmptyWebhookFields(t *testing.T) {
+	rc := &receiver{statuses: []int{http.StatusOK}}
+	srv := httptest.NewServer(rc.handler())
+	defer srv.Close()
+	for name, wh := range map[string]Webhook{
+		"empty secret": {ID: "wh_1", URL: srv.URL},
+		"empty url":    {ID: "wh_1", Secret: "s"},
+	} {
+		d := &Deliverer{Webhooks: &fakeLookup{hooks: map[string]Webhook{"wh_1": wh}}, Logger: testLogger()}
+		err := d.Attempt(context.Background(), Delivery{WebhookID: "wh_1", Event: EventPush, Payload: []byte("{}")})
+		if err == nil || !strings.Contains(err.Error(), "has an empty url or secret") || errors.Is(err, ErrWebhookGone) {
+			t.Fatalf("%s: Attempt = %v, want a retryable empty-field error", name, err)
+		}
+	}
+	if got := rc.requests(); len(got) != 0 {
+		t.Errorf("receiver saw %d requests, want 0", len(got))
+	}
+}

@@ -7,8 +7,12 @@ package meta
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -525,4 +529,45 @@ func TestSecretsDecryptOnlyStaging(t *testing.T) {
 			t.Errorf("staging CreateWebhook reserved prefix: err = %v, want ErrReservedSecret", err)
 		}
 	})
+}
+
+// sealRaw seals plaintext under the base64 key exactly as secrets.Codec
+// does, without Encrypt's double-encryption assertion, to build the crafted
+// value below.
+func sealRaw(t *testing.T, key, plaintext string) string {
+	t.Helper()
+	kb, err := base64.StdEncoding.DecodeString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := aes.NewCipher(kb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(kb)
+	return secrets.Marker + hex.EncodeToString(sum[:])[:8] + ":" + base64.StdEncoding.EncodeToString(aead.Seal(nonce, nonce, []byte(plaintext), nil))
+}
+
+// An envelope that decrypts to another envelope (issue #492) is an error.
+// Before, the lazy rewrite passed it to Encrypt, whose double-encryption
+// assertion panicked the reading process.
+func TestDecodeSecretRefusesNestedEnvelope(t *testing.T) {
+	k := newTestKey(t)
+	c := newCodec(t, k)
+	inner := c.Encrypt("x")
+	outer := sealRaw(t, k, inner)
+	if pt, _, err := decodeSecret(c, sealRaw(t, k, "plain"), "control"); err != nil || pt != "plain" {
+		t.Fatalf("control envelope = %q, %v; want plain", pt, err)
+	}
+	if pt, rewrite, err := decodeSecret(c, outer, "webhook \"w\" secret"); err == nil || !strings.Contains(err.Error(), "decrypts to another") || pt != "" || rewrite {
+		t.Fatalf("decodeSecret(nested) = %q, %v, %v; want the nested-envelope error", pt, rewrite, err)
+	}
 }

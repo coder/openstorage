@@ -110,6 +110,12 @@ func decodeSecret(c *secrets.Codec, stored, what string) (plaintext string, rewr
 		if err != nil {
 			return "", false, fmt.Errorf("%s: %w", what, err)
 		}
+		if secrets.IsEncrypted(pt) {
+			// No write path seals an envelope (Encrypt asserts it), so a
+			// sealed envelope is a crafted value (issue #492). Refuse it
+			// instead of reaching that assertion in the rewrite.
+			return "", false, fmt.Errorf("%s decrypts to another %q envelope", what, secrets.Marker)
+		}
 		return pt, stale && !c.DecryptOnly, nil
 	}
 	// Legacy plaintext row: readable in both modes; rewrite into an

@@ -134,7 +134,12 @@ func (d *Deliverer) Attempt(ctx context.Context, del Delivery) error {
 	if err != nil {
 		return fmt.Errorf("load webhook %s: %w", del.WebhookID, err)
 	}
-	assertf(wh.URL != "" && wh.Secret != "", "stored webhook %s has empty url or secret", wh.ID)
+	if wh.URL == "" || wh.Secret == "" {
+		// The S3-WAL decoder rejects an empty stored url or secret, but an
+		// envelope can still decrypt to "" (issue #492). Fail the attempt:
+		// retries are bounded, and the error names the webhook.
+		return fmt.Errorf("webhook %s has an empty url or secret", wh.ID)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wh.URL, bytes.NewReader(del.Payload))
 	if err != nil {

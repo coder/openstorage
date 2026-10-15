@@ -53,6 +53,7 @@ jobs:
             ./internal/api:FuzzClientKey
             ./internal/api:FuzzCoreCursor
             ./internal/sync:FuzzParsePushRejections
+            ./internal/meta:FuzzS3WALMetaDocument
           "
           failed=0
           for t in $targets; do
