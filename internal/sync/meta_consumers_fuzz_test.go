@@ -24,7 +24,7 @@ import (
 )
 
 // consumerFuzzCap bounds the rows one input drives (orgs, repos, local
-// work, webhooks per org, purge candidates), so an input with many rows
+// work, webhook rows, purge candidates), so an input with many rows
 // costs the fuzzer no more than a few runs.
 const consumerFuzzCap = 4
 
@@ -42,13 +42,31 @@ func newConsumerStore(t testing.TB, cas *s3wal.MemCAS, encrypted bool) *meta.S3W
 	return meta.NewS3WAL(cas, meta.WithSecretsCodec(codec))
 }
 
-// cappedHooks lists at most consumerFuzzCap webhooks per org, so a large
-// webhook table does not multiply every delivery fan-out.
-type cappedHooks struct{ events.MetaWebhookStore }
-
-func (h cappedHooks) ListWebhooks(ctx context.Context, org string) ([]events.Webhook, error) {
-	l, err := h.MetaWebhookStore.ListWebhooks(ctx, org)
-	return l[:min(len(l), consumerFuzzCap)], err
+// capWebhookRows keeps the first consumerFuzzCap webhook rows (by id) of
+// a JSON object document and drops the rest, before the store reads it:
+// with a codec, ListWebhooks decrypts every row and rewrites each
+// plaintext secret, so a large table would multiply every delivery
+// fan-out. FuzzS3WALMetaDocument covers large tables in internal/meta.
+// Other bytes pass through unchanged.
+func capWebhookRows(body []byte) []byte {
+	var top map[string]json.RawMessage
+	var hooks map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil || json.Unmarshal(top["webhooks"], &hooks) != nil || len(hooks) <= consumerFuzzCap {
+		return body
+	}
+	for _, id := range slices.Sorted(maps.Keys(hooks))[consumerFuzzCap:] {
+		delete(hooks, id)
+	}
+	trimmed, err := json.Marshal(hooks)
+	if err != nil {
+		return body
+	}
+	top["webhooks"] = trimmed
+	out, err := json.Marshal(top)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // okTransport answers every webhook POST with 200 and never dials.
@@ -61,17 +79,22 @@ func (okTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 // deliverSink is the sync worker's event sink: like serve's, it fans an
 // event out to the org's webhooks, and here it runs each attempt at once.
 type deliverSink struct {
-	hooks cappedHooks
+	hooks events.MetaWebhookStore
 	d     *events.Deliverer
 	n     *consumerCounts
 }
 
 func (s deliverSink) Emit(ctx context.Context, org, eventType string, payload []byte) {
-	s.n.events++
+	// Count each run family on its own: one lane must not hide the other.
+	emitted, delivered := &s.n.pullEvents, &s.n.pullDeliveries
+	if strings.HasPrefix(eventType, "repo.push_upstream.") {
+		emitted, delivered = &s.n.pushRunEvents, &s.n.pushRunDeliveries
+	}
+	*emitted++
 	hooks, _ := s.hooks.ListWebhooks(ctx, org)
 	for _, h := range hooks {
 		if s.d.Attempt(ctx, events.Delivery{WebhookID: h.ID, Event: eventType, Payload: payload}) == nil {
-			s.n.eventDeliveries++
+			*delivered++
 		}
 	}
 }
@@ -79,7 +102,8 @@ func (s deliverSink) Emit(ctx context.Context, org, eventType string, payload []
 // consumerCounts records what one pass reached, so a test can prove that
 // the pass drives each consumer on a real document.
 type consumerCounts struct {
-	resolved, refUpdates, pushDeliveries, events, eventDeliveries, purgeGroups int
+	resolved, refUpdates, pushDeliveries, purgeGroups            int
+	pullEvents, pullDeliveries, pushRunEvents, pushRunDeliveries int
 }
 
 // consumerSeed is a writer-produced document with an org, a linked repo
@@ -137,14 +161,50 @@ func FuzzS3WALMetaConsumers(f *testing.F) {
 
 // TestS3WALMetaConsumersWriterDoc: on a writer-produced document, with
 // and without a codec, the pass reaches every consumer (resolve, ref
-// update, push-event delivery, run events and their delivery, purge
-// group), so the fuzz target tests something.
+// update, push-event delivery, the pull run's and the push run's events
+// and their deliveries, purge group), so the fuzz target tests something.
 func TestS3WALMetaConsumersWriterDoc(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		n := driveMetaConsumers(t, consumerSeed(t, encrypted), encrypted)
-		if n.resolved == 0 || n.refUpdates == 0 || n.pushDeliveries == 0 || n.events < 2 || n.eventDeliveries < 2 || n.purgeGroups == 0 {
+		if n.resolved == 0 || n.refUpdates == 0 || n.pushDeliveries == 0 || n.purgeGroups == 0 ||
+			n.pullEvents < 2 || n.pullDeliveries < 2 || n.pushRunEvents < 2 || n.pushRunDeliveries < 2 {
 			t.Fatalf("encrypted=%v: the pass missed a consumer: %+v", encrypted, n)
 		}
+	}
+}
+
+// TestCapWebhookRows: a writer document with more webhooks than the cap
+// keeps exactly consumerFuzzCap of them, and the store still accepts it.
+func TestCapWebhookRows(t *testing.T) {
+	ctx := context.Background()
+	cas := s3wal.NewMemCAS()
+	st := newConsumerStore(t, cas, true)
+	defer st.Close()
+	if _, err := st.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	for range consumerFuzzCap + 2 {
+		if _, err := st.CreateWebhook(ctx, "org", "https://hooks.example.com/x", "s3cret"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	obj, err := cas.Get(ctx, "_wal/meta.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Webhooks map[string]json.RawMessage `json:"webhooks"`
+	}
+	capped := capWebhookRows(obj.Body)
+	if err := json.Unmarshal(capped, &doc); err != nil || len(doc.Webhooks) != consumerFuzzCap {
+		t.Fatalf("capped document has %d webhooks (%v), want %d", len(doc.Webhooks), err, consumerFuzzCap)
+	}
+	other := s3wal.NewMemCAS()
+	if _, err := other.Create(ctx, "_wal/meta.json", capped); err != nil {
+		t.Fatal(err)
+	}
+	if err := meta.CheckFormat(ctx, newConsumerStore(t, other, true)); err != nil {
+		t.Fatalf("the store refuses the capped document: %v", err)
 	}
 }
 
@@ -152,6 +212,7 @@ func TestS3WALMetaConsumersWriterDoc(t *testing.T) {
 // Errors are fine; a panic fails the caller.
 func driveMetaConsumers(t testing.TB, body []byte, encrypted bool) (n consumerCounts) {
 	ctx := context.Background()
+	body = capWebhookRows(body)
 	cas := s3wal.NewMemCAS()
 	if _, err := cas.Create(ctx, "_wal/meta.json", body); err != nil {
 		t.Fatal(err)
@@ -171,7 +232,7 @@ func driveMetaConsumers(t testing.TB, body []byte, encrypted bool) (n consumerCo
 		t.Fatalf("the store accepted a document that encoding/json rejects: %v", err)
 	}
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	hooks := cappedHooks{events.MetaWebhookStore{Store: st}}
+	hooks := events.MetaWebhookStore{Store: st}
 	deliverer := &events.Deliverer{Webhooks: hooks, Client: &http.Client{Transport: okTransport{}}, MaxAttempts: 1, Logger: quiet}
 	refs := ref.NewS3WAL(s3wal.NewMemCAS(), nil)
 	defer refs.Close()
