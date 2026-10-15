@@ -102,7 +102,8 @@ func (s deliverSink) Emit(ctx context.Context, org, eventType string, payload []
 // consumerCounts records what one pass reached, so a test can prove that
 // the pass drives each consumer on a real document.
 type consumerCounts struct {
-	resolved, refUpdates, pushDeliveries, purgeGroups            int
+	resolvedByID, resolvedByURL, refUpdates, pushDeliveries      int
+	queuedDeliveries, purgeGroups                                int
 	pullEvents, pullDeliveries, pushRunEvents, pushRunDeliveries int
 }
 
@@ -160,13 +161,13 @@ func FuzzS3WALMetaConsumers(f *testing.F) {
 }
 
 // TestS3WALMetaConsumersWriterDoc: on a writer-produced document, with
-// and without a codec, the pass reaches every consumer (resolve, ref
-// update, push-event delivery, the pull run's and the push run's events
+// and without a codec, the pass reaches every consumer (resolve by id and
+// by url, ref update, push-event delivery, queued delivery by id, the pull run's and the push run's events
 // and their deliveries, purge group), so the fuzz target tests something.
 func TestS3WALMetaConsumersWriterDoc(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		n := driveMetaConsumers(t, consumerSeed(t, encrypted), encrypted)
-		if n.resolved == 0 || n.refUpdates == 0 || n.pushDeliveries == 0 || n.purgeGroups == 0 ||
+		if n.resolvedByID == 0 || n.resolvedByURL == 0 || n.refUpdates == 0 || n.pushDeliveries == 0 || n.queuedDeliveries == 0 || n.purgeGroups == 0 ||
 			n.pullEvents < 2 || n.pullDeliveries < 2 || n.pushRunEvents < 2 || n.pushRunDeliveries < 2 {
 			t.Fatalf("encrypted=%v: the pass missed a consumer: %+v", encrypted, n)
 		}
@@ -208,6 +209,15 @@ func TestCapWebhookRows(t *testing.T) {
 	}
 }
 
+// TestS3WALMetaConsumersDanglingWebhook: a webhook whose org_id names no
+// org is never listed, but a queued delivery still reloads and posts it.
+func TestS3WALMetaConsumersDanglingWebhook(t *testing.T) {
+	body := `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"public_keys":["k"]}},"webhooks":{"wh_1":{"org_id":2,"url":"https://h/x","secret":"s","created_at":1}}}`
+	if n := driveMetaConsumers(t, []byte(body), false); n.queuedDeliveries != 1 || n.pushDeliveries != 0 {
+		t.Fatalf("dangling webhook: %+v, want one queued delivery and no push delivery", n)
+	}
+}
+
 // driveMetaConsumers runs the pass of FuzzS3WALMetaConsumers over body.
 // Errors are fine; a panic fails the caller.
 func driveMetaConsumers(t testing.TB, body []byte, encrypted bool) (n consumerCounts) {
@@ -227,6 +237,7 @@ func driveMetaConsumers(t testing.TB, body []byte, encrypted bool) (n consumerCo
 		Repos map[string]struct {
 			URL string `json:"url"`
 		} `json:"repos"`
+		Webhooks map[string]json.RawMessage `json:"webhooks"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
 		t.Fatalf("the store accepted a document that encoding/json rejects: %v", err)
@@ -273,12 +284,16 @@ func driveMetaConsumers(t testing.TB, body []byte, encrypted bool) (n consumerCo
 		for _, id := range repoIDs[:min(len(repoIDs), consumerFuzzCap)] {
 			// The git surface resolves the URL path element, then
 			// keys refs and quota by the resolved repo_id.
-			for _, key := range []string{id, doc.Repos[id].URL} {
+			for i, key := range []string{id, doc.Repos[id].URL} {
 				repo, err := meta.ResolveRepoKey(ctx, st, org, key)
 				if err != nil {
 					continue
 				}
-				n.resolved++
+				if i == 0 {
+					n.resolvedByID++
+				} else {
+					n.resolvedByURL++
+				}
 				_ = blob.QuotaRepoGroup(repo.RepoID)
 				if won, _ := delivering.CASRef(ctx, repo.RepoID, "refs/heads/main", ref.ZeroSHA, strings.Repeat("a", 40)); won {
 					n.refUpdates++
@@ -293,6 +308,13 @@ func driveMetaConsumers(t testing.TB, body []byte, encrypted bool) (n consumerCo
 			if w.Push {
 				_ = worker.RunPush(ctx, upsync.Job{Org: org, RepoID: w.RepoID})
 			}
+		}
+	}
+	// A queued delivery reloads its webhook by id, whatever its org_id
+	// (#527): drive one for every (capped) webhook row.
+	for _, id := range slices.Sorted(maps.Keys(doc.Webhooks)) {
+		if deliverer.Attempt(ctx, events.Delivery{WebhookID: id, Event: events.EventPush, Payload: []byte(`{}`)}) == nil {
+			n.queuedDeliveries++
 		}
 	}
 	cands, _ := st.PurgeableRepos(ctx, time.Unix(1<<32, 0), meta.PurgeCandidate{}, consumerFuzzCap)
