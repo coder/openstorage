@@ -435,7 +435,8 @@ type S3WAL struct {
 	cacheBody []byte
 	lastSeq   int64
 	// rolledBack latches once a fetched document does not continue the
-	// cached one, or the object vanishes (issue #488): from then on only
+	// cached one, the object vanishes (issue #488), or it changes into
+	// bytes that do not decode (issue #501): from then on only
 	// the cached document itself (the same bytes, or a 304 on its ETag)
 	// is accepted again, because a restored or recreated lineage can
 	// advance back to any seq with different contents.
@@ -710,6 +711,12 @@ func (s *S3WAL) checkViewIntact() {
 func (s *S3WAL) adoptRead(obj s3wal.Object, shared bool) (*s3walMetaDoc, string, error) {
 	doc, err := decodeS3WALMetaDoc(obj.Body)
 	if err != nil {
+		if s.cacheETag != "" {
+			// The cached object changed into bytes that do not decode
+			// (issue #501). Latch like a vanish: a valid lineage that
+			// replaces them later is not the cached document either.
+			s.rolledBack = true
+		}
 		return nil, "", err
 	}
 	if err := s.observeDoc(doc, obj.Body); err != nil {

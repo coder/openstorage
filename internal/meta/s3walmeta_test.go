@@ -374,6 +374,70 @@ func TestS3WALMetaVanishedDocumentLatches(t *testing.T) {
 	}
 }
 
+// TestS3WALMetaUndecodableReplacementLatches (issue #501): when the cached
+// meta.json changes into bytes that do not decode (corrupt, or a wrong
+// format version) and a valid document from another lineage at a higher
+// seq replaces those, the process keeps refusing. Only the cached
+// document itself ends the refusal.
+func TestS3WALMetaUndecodableReplacementLatches(t *testing.T) {
+	for _, tc := range []struct{ name, bad, wantErr string }{
+		{"corrupt", `{"v":2,"seq":`, "_wal/meta.json is corrupt"},
+		{"v1", `{"v":1,"seq":2,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`, "document version 1 needs conversion"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			mem := s3wal.NewMemCAS()
+			st := NewS3WAL(mem)
+			t.Cleanup(st.Close)
+			if _, err := st.UpsertOrgWithKeys(ctx, "o", []string{"pem"}); err != nil {
+				t.Fatal(err)
+			}
+			repo, err := st.CreateRepo(ctx, "o", "https://example.com/undecodable.git", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cached, _ := mem.Get(ctx, s3walMetaKey) // seq 2
+			etag, err := mem.Advance(ctx, s3walMetaKey, []byte(tc.bad), cached.ETag)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("GetRepoByID on the %s bytes = %v, want %q", tc.name, err, tc.wantErr)
+			}
+			// A valid document from another lineage at seq 5: the cached
+			// rows with a foreign writer nonce.
+			var foreign map[string]any
+			if err := json.Unmarshal(cached.Body, &foreign); err != nil {
+				t.Fatal(err)
+			}
+			foreign["seq"], foreign["writer"] = 5, "fedcba9876543210fedcba9876543210"
+			foreignBody, err := json.Marshal(foreign)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if etag, err = mem.Advance(ctx, s3walMetaKey, foreignBody, etag); err != nil {
+				t.Fatal(err)
+			}
+			var stale *StaleDocumentError
+			if _, err := st.GetRepoByID(ctx, "o", repo.RepoID); !errors.As(err, &stale) || stale.Got != 5 || stale.Seen != 2 {
+				t.Fatalf("GetRepoByID on the foreign seq 5 = %v, want a *StaleDocumentError", err)
+			}
+			if _, err := st.CreateRepo(ctx, "o", "https://example.com/other.git", "main"); !errors.As(err, &stale) {
+				t.Fatalf("CreateRepo = %v, want a *StaleDocumentError", err)
+			}
+			if got, _ := mem.Get(ctx, s3walMetaKey); got.ETag != etag {
+				t.Fatal("the store wrote through the foreign document")
+			}
+			if _, err := mem.Advance(ctx, s3walMetaKey, cached.Body, etag); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := st.GetRepoByID(ctx, "o", repo.RepoID); err != nil || got.RepoID != repo.RepoID {
+				t.Fatalf("GetRepoByID after the cached document returned = %+v, %v", got, err)
+			}
+		})
+	}
+}
+
 // s3walBackend is the s3wal lane fixture: a fresh MemCAS-backed store per
 // subtest (like the sqlite lane's fresh DB file).
 func s3walBackend(t *testing.T) Backend {
