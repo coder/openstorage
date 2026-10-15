@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"errors"
 	"log/slog"
 
 	"github.com/coder/openstorage/internal/metrics"
@@ -46,7 +47,13 @@ type QuarantinedError struct {
 }
 
 func (e *QuarantinedError) Error() string {
-	return "s3walmeta: this process stopped trusting _wal/meta.json (" + e.Err.Error() + "). Restore the bucket from a verified stopped-node backup first, then restart serve: a restart adopts whatever the bucket holds (docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover)"
+	// Name only the corrupt document's cause: its own text carries a
+	// "keep serve stopped" hint that would contradict this one (#525).
+	cause := e.Err.Error()
+	if cd, ok := errors.AsType[*CorruptDocumentError](e.Err); ok {
+		cause = s3walMetaKey + " was edited out of band: " + cd.Err.Error()
+	}
+	return "s3walmeta: this process stopped trusting " + s3walMetaKey + " (" + cause + "). Restore the bucket from a verified stopped-node backup first, then restart serve: a restart adopts whatever the bucket holds (docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover)"
 }
 
 func (e *QuarantinedError) Unwrap() error { return e.Err }
@@ -66,7 +73,7 @@ func (s *S3WAL) refuse(class refuseClass, err error) error {
 		s.orgKeysMu.Unlock()
 		metrics.S3WALMetaRefused(class)
 		slog.Error("s3walmeta: quarantined _wal/meta.json until restart; every metadata operation and token check fails",
-			"class", class.String(), "err", err, "restore_first", "docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover")
+			"class", class.String(), "err", q, "restore_first", "docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover")
 		return q
 	}
 	if !s.rolledBack {

@@ -343,8 +343,14 @@ func TestS3WALMetaQuarantineMatrix(t *testing.T) {
 			}
 			f.snap()
 			var cd *CorruptDocumentError
-			if err := row.arm(f); !isType[*QuarantinedError](err) || !errors.As(err, &cd) {
+			err := row.arm(f)
+			if !isType[*QuarantinedError](err) || !errors.As(err, &cd) {
 				t.Fatalf("refusal error = %v, want a *QuarantinedError wrapping a *CorruptDocumentError", err)
+			}
+			// One clear message: one prefix, one restore hint (#525).
+			if msg := err.Error(); strings.Count(msg, "s3walmeta:") != 1 || strings.Contains(msg, "keep serve stopped") ||
+				!strings.Contains(msg, cd.Err.Error()) || !strings.Contains(msg, "first, then restart serve") {
+				t.Fatalf("quarantine error text = %q", msg)
 			}
 			if got := f.state(); !got.quarantine || got.body != nil || got.etag != "" || got.view != nil {
 				t.Fatalf("quarantine kept state: %+v", got)
