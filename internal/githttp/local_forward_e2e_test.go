@@ -127,8 +127,8 @@ func TestLocalHookLiveForwardAndPendingRestart(t *testing.T) {
 	if got := revParse(t, bare, "refs/heads/main"); got != first {
 		t.Fatalf("write-only token exported %s", got)
 	}
-	if out := mustGit(t, "", "ls-remote", remoteURL(node, id, token), "refs/heads/main"); !strings.HasPrefix(out, second) {
-		t.Fatalf("accepted denied-forward write was reverted: %s", out)
+	if got := lsRemoteSHA(t, "", remoteURL(node, id, token), "refs/heads/main"); got != second {
+		t.Fatalf("accepted denied-forward write was reverted: main = %q, want %s", got, second)
 	}
 	// Restart tests the existing durable-pending contract, not persistence of
 	// retry timers: seed precisely that marker while no worker can consume it.
@@ -230,8 +230,8 @@ func TestLocalHookForwardBeforeCachePublication(t *testing.T) {
 	if res.err != nil {
 		t.Fatalf("real push failed: %v\n%s", res.err, res.out)
 	}
-	if out := mustGit(t, "", "ls-remote", remoteURL(node, id, token), "refs/heads/main"); !strings.HasPrefix(out, want) {
-		t.Fatalf("accepted cache ref missing after publication: %s", out)
+	if got := lsRemoteSHA(t, "", remoteURL(node, id, token), "refs/heads/main"); got != want {
+		t.Fatalf("accepted cache ref missing after publication: main = %q, want %s", got, want)
 	}
 	// Observe actual upstream convergence, not just a successful metadata run.
 	var got string
