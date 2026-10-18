@@ -2114,6 +2114,11 @@ components:
         committer:
           $ref: "#/components/schemas/GitIdentity"
           description: Committer identity for the merge commit. Defaults to author when omitted.
+        expected_source_sha:
+          description: Optional source commit guard. The merge uses this commit instead of the current tip of source_ref, and fails if source_ref does not contain it when the merge starts. A later advance of source_ref does not change the merged commit.
+          examples:
+            - 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1
+          type: string
         expected_target_sha:
           description: Optional branch tip guard. The merge fails if the target has moved since this SHA.
           examples:
@@ -7212,7 +7217,7 @@ paths:
   /api/repos/{repo_name}/merge:
     post:
       description: |-
-        Merge changes between branches without cloning the repository or shelling out to Git. This endpoint also supports promoting work from ephemeral branches into long-lived branches such as `main`. Omit `expected_target_sha` to merge into the current target tip and allow the gateway to retry stale target/repository movement internally; set `expected_target_sha` to require a strict target-tip precondition. GitHub-backed public targets currently do not use automatic retry.
+        Merge changes between branches without cloning the repository or shelling out to Git. This endpoint also supports promoting work from ephemeral branches into long-lived branches such as `main`. Set `expected_source_sha` to merge the exact source commit that a preview returned, even if the source branch advances. Omit `expected_target_sha` to merge into the current target tip and allow the gateway to retry stale target/repository movement internally; set `expected_target_sha` to require a strict target-tip precondition. GitHub-backed public targets currently do not use automatic retry.
 
         Scope: `git:write` on the repository.
       operationId: repos-merge
@@ -7235,6 +7240,7 @@ paths:
               committer:
                 email: review@example.com
                 name: Review Bot
+              expected_source_sha: 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1
               expected_target_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               source_is_ephemeral: true
               source_ref: feature/preview
@@ -7243,7 +7249,7 @@ paths:
               target_branch: main
             schema:
               $ref: "#/components/schemas/ReposMergeRequest"
-        description: Merge a source branch into a target branch using a merge commit, fast-forward only, or fast-forward preferred behaviour. Source and target can live in the default or ephemeral namespace. When expected_target_sha is omitted, the gateway may retry stale target updates internally while keeping the originally resolved source commit pinned. Automatic stale-target retry is disabled for GitHub-backed public targets.
+        description: "Merge a source branch into a target branch using a merge commit, fast-forward only, or fast-forward preferred behaviour. Source and target can live in the default or ephemeral namespace. Set expected_source_sha to merge the source commit that a preview returned: the merge uses that commit, and fails if source_ref no longer contains it. When expected_target_sha is omitted, the gateway may retry stale target updates internally while keeping the originally resolved source commit pinned. Automatic stale-target retry is disabled for GitHub-backed public targets."
         required: true
       responses:
         "200":
@@ -7310,7 +7316,17 @@ paths:
                 error: merge conflict
               schema:
                 $ref: "#/components/schemas/MergeConflict"
-          description: The merge could not be completed because of file-level conflicts, or an automatic stale-target retry could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed.
+            application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: "source branch moved: the source branch does not contain commit 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1"
+                code: conflict
+                error: "source branch moved: the source branch does not contain commit 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1"
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "The merge could not be completed. An `application/json` body reports file-level conflicts, or an automatic stale-target retry that could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed. A problem body reports any other conflict. A failed guard has the code `conflict`: the target no longer matches `expected_target_sha`, or the source branch no longer contains `expected_source_sha`."
         "429":
           content:
             application/json:
@@ -13370,7 +13386,7 @@ paths:
     post:
       deprecated: true
       description: |-
-        Merge changes between branches without cloning the repository or shelling out to Git. This endpoint also supports promoting work from ephemeral branches into long-lived branches such as `main`. Omit `expected_target_sha` to merge into the current target tip and allow the gateway to retry stale target/repository movement internally; set `expected_target_sha` to require a strict target-tip precondition. GitHub-backed public targets currently do not use automatic retry.
+        Merge changes between branches without cloning the repository or shelling out to Git. This endpoint also supports promoting work from ephemeral branches into long-lived branches such as `main`. Set `expected_source_sha` to merge the exact source commit that a preview returned, even if the source branch advances. Omit `expected_target_sha` to merge into the current target tip and allow the gateway to retry stale target/repository movement internally; set `expected_target_sha` to require a strict target-tip precondition. GitHub-backed public targets currently do not use automatic retry.
 
         Scope: `git:write` on the repository.
 
@@ -13387,6 +13403,7 @@ paths:
               committer:
                 email: review@example.com
                 name: Review Bot
+              expected_source_sha: 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1
               expected_target_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               source_branch: feature/preview
               source_is_ephemeral: true
@@ -13396,7 +13413,7 @@ paths:
               target_branch: main
             schema:
               $ref: "#/components/schemas/ReposMergeRequest"
-        description: Merge a source branch into a target branch using a merge commit, fast-forward only, or fast-forward preferred behaviour. Source and target can live in the default or ephemeral namespace. When expected_target_sha is omitted, the gateway may retry stale target updates internally while keeping the originally resolved source commit pinned. Automatic stale-target retry is disabled for GitHub-backed public targets.
+        description: "Merge a source branch into a target branch using a merge commit, fast-forward only, or fast-forward preferred behaviour. Source and target can live in the default or ephemeral namespace. Set expected_source_sha to merge the source commit that a preview returned: the merge uses that commit, and fails if source_ref no longer contains it. When expected_target_sha is omitted, the gateway may retry stale target updates internally while keeping the originally resolved source commit pinned. Automatic stale-target retry is disabled for GitHub-backed public targets."
         required: true
       responses:
         "200":
@@ -13464,7 +13481,17 @@ paths:
                 error: merge conflict
               schema:
                 $ref: "#/components/schemas/MergeConflict"
-          description: The merge could not be completed because of file-level conflicts, or an automatic stale-target retry could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed.
+            application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: "source branch moved: the source branch does not contain commit 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1"
+                code: conflict
+                error: "source branch moved: the source branch does not contain commit 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1"
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "The merge could not be completed. An `application/json` body reports file-level conflicts, or an automatic stale-target retry that could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed. A problem body reports any other conflict. A failed guard has the code `conflict`: the target no longer matches `expected_target_sha`, or the source branch no longer contains `expected_source_sha`."
         "429":
           content:
             application/json:

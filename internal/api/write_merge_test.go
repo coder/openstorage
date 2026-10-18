@@ -150,6 +150,7 @@ var wmTargets = []string{
 	"t-squash", "t-eph-ff", "t-eph-merge", "t-unrel",
 	"t-pol-nopush", "t-pol-nff", "t-pol-vs-ff", "t-pol-vs-merge",
 	"t-alias-ref", "t-alias-refsheads", "t-alias-both",
+	"t-pin-ff", "t-pin-merge", "t-pin-alias",
 }
 
 // wmFixture is one seeded repo for the merge tests.
