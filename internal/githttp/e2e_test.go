@@ -610,6 +610,28 @@ func mustGitEnv(t *testing.T, dir string, env []string, args ...string) string {
 	return out
 }
 
+// lsRemoteSHA returns the sha that `git ls-remote <remote> <ref>` lists for
+// exactly ref, or "" if ref is absent. It reads stdout only: some git
+// builds print "warning: redirecting to ..." on stderr (#534). The failure
+// message leaves out the remote, which can carry a token.
+func lsRemoteSHA(t *testing.T, dir, remote, ref string) string {
+	t.Helper()
+	cmd := exec.Command("git", "ls-remote", remote, ref)
+	cmd.Dir = dir
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git ls-remote %s: %v\n%s", ref, err, stderr.String())
+	}
+	for line := range strings.Lines(string(out)) {
+		if sha, name, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok && name == ref {
+			return sha
+		}
+	}
+	return ""
+}
+
 func revParse(t *testing.T, dir, rev string) string {
 	t.Helper()
 	return strings.TrimSpace(mustGit(t, dir, "rev-parse", rev))

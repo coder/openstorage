@@ -87,8 +87,8 @@ func TestLocalHookPullBeforeCachePublication(t *testing.T) {
 	if !settled(up, 1) || up.SuccessCount != 1 {
 		t.Fatalf("setup pull did not settle: %+v", up)
 	}
-	if out := mustGit(t, "", "ls-remote", remoteURL(node, id, token), "refs/heads/main"); !strings.HasPrefix(out, upHead) {
-		t.Fatalf("setup pull did not mirror upstream %s: %s", upHead, out)
+	if got := lsRemoteSHA(t, "", remoteURL(node, id, token), "refs/heads/main"); got != upHead {
+		t.Fatalf("setup pull did not mirror upstream %s: main = %q", upHead, got)
 	}
 
 	accepted := commitFile(t, work, "local.txt", "local only\n", "accepted local write", nil)
@@ -140,12 +140,12 @@ func TestLocalHookPullBeforeCachePublication(t *testing.T) {
 	var got string
 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
 		up = get()
-		got = strings.TrimSpace(mustGit(t, "", "ls-remote", remoteURL(node, id, token), "refs/heads/main"))
-		if settled(up, 2) && strings.HasPrefix(got, upHead) {
+		got = lsRemoteSHA(t, "", remoteURL(node, id, token), "refs/heads/main")
+		if settled(up, 2) && got == upHead {
 			break
 		}
 	}
-	if !settled(up, 2) || !strings.HasPrefix(got, upHead) {
+	if !settled(up, 2) || got != upHead {
 		t.Fatalf("after publication local main=%q, want upstream %s over accepted %s; metadata=%+v", got, upHead, accepted, up)
 	}
 	if out := strings.TrimSpace(mustGit(t, bare, "for-each-ref", "--format=%(objectname)", "refs/heads/main")); out != upHead {

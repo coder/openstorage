@@ -237,7 +237,7 @@ func TestS3WAL_OfflineBackupRestore(t *testing.T) {
 	git(clone, "lfs", "install", "--local")
 	followup := commitFile(t, clone, "after.txt", "after restore\n", "write after restore", nil)
 	git(clone, "push", "origin", "HEAD:refs/heads/main")
-	if got := git(clone, "ls-remote", "origin", "refs/heads/main"); strings.TrimSpace(got) != followup+"\trefs/heads/main" {
+	if got := lsRemoteSHA(t, clone, "origin", "refs/heads/main"); got != followup {
 		t.Fatal("follow-up push did not update the restored authority")
 	}
 	t.Log("7. Offline recovery passed: original source absent, history and LFS intact, writes accepted")
