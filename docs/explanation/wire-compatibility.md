@@ -234,9 +234,13 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-09 (upstream
-  `Last-Modified` 2026-10-08 19:00:21 GMT), SHA-256
-  `9f8e372a29576963499f73d1ed1301cae4719107fa3effb6d9fccf30da2cac9a`.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-18 (upstream
+  `Last-Modified` 2026-10-16 23:14:10 GMT), SHA-256
+  `e0447438f0f8f76a238f85bcfedfff1f2eba63e0d77ff3c8bfbc19079532ade3`. On that day
+  [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served
+  the previous snapshot (`9f8e372a29576963499f73d1ed1301cae4719107fa3effb6d9fccf30da2cac9a`),
+  so the merge `expected_source_sha` guard follows the published docs, not proven
+  upstream deployment.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled

@@ -300,6 +300,21 @@ func wmIsAncestor(ctx context.Context, sc *wcScratch, a, b string) (bool, error)
 	return false, err
 }
 
+// wmSourceContains reports whether pin is a commit reachable from (or
+// equal to) sourceTip. An id the odb lacks, or one naming a tree, blob or
+// tag object, is not contained: git merge-base would fail on it.
+func wmSourceContains(ctx context.Context, sc *wcScratch, pin, sourceTip string) (bool, error) {
+	assertf(ref.ValidSHA(pin) && ref.ValidSHA(sourceTip), "wmSourceContains: malformed shas %q %q", pin, sourceTip)
+	out, err := sc.git(ctx, strings.NewReader(pin+"\n"), nil, "cat-file", "--batch-check=%(objecttype)")
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(out) != "commit" { // "<pin> missing" or another type
+		return false, nil
+	}
+	return wmIsAncestor(ctx, sc, pin, sourceTip)
+}
+
 // wmCommitTree creates the merge/squash commit in the scratch odb.
 // Committer defaults are the caller's concern; parents order is
 // [target, source] for merge commits and [target] for squash.
@@ -432,6 +447,12 @@ type wmMergeRequest struct {
 	Committer               *wcAuthor `json:"committer"`
 	AllowUnrelatedHistories bool      `json:"allow_unrelated_histories"`
 	Squash                  bool      `json:"squash"`
+
+	// ExpectedSourceSHA pins the source commit (spec 2026-10-16, #531).
+	// It stays raw so an explicit null or "" is a 400, not an absent
+	// guard. wmValidateMergeRequest stores the checked id in sourcePin.
+	ExpectedSourceSHA json.RawMessage `json:"expected_source_sha"`
+	sourcePin         string
 }
 
 // wmValidateMergeRequest checks the request fields shared by every merge
@@ -468,6 +489,13 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	if req.ExpectedTargetSHA != "" && !ref.ValidSHA(req.ExpectedTargetSHA) {
 		return errors.New("expected_target_sha must be a 40-hex sha")
 	}
+	if req.ExpectedSourceSHA != nil {
+		var pin string
+		if err := json.Unmarshal(req.ExpectedSourceSHA, &pin); err != nil || !ref.ValidSHA(lowerFullSHA(pin)) {
+			return errors.New("expected_source_sha must be a 40-hex sha")
+		}
+		req.sourcePin = lowerFullSHA(pin)
+	}
 	if req.Author != nil {
 		if err := wcValidateAuthor("author", *req.Author); err != nil {
 			return err
@@ -482,7 +510,8 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 }
 
 // handleMerge implements POST /repos/merge (docs/reference/http-api.md): resolve both branch
-// tips from the ref authority, guard on expected_target_sha (412), decide
+// tips from the ref authority, guard on expected_target_sha (412) and
+// expected_source_sha (409), decide
 // the outcome (no_op / fast_forward / merge_commit / squash), run
 // merge-tree in the scratch odb, enforce ref policies, and publish under
 // CAS.
@@ -551,6 +580,22 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer sc.close()
+
+	// expected_source_sha: merge the pinned commit instead of the source
+	// tip, but only if the source branch still contains it. Like the target
+	// guard, this runs before any merge work.
+	if req.sourcePin != "" {
+		contained, err := wmSourceContains(ctx, sc, req.sourcePin, sourceSHA)
+		if err != nil {
+			s.wmInternal(w, r, "check expected_source_sha ancestry", err)
+			return
+		}
+		if !contained {
+			writeErr(w, http.StatusConflict, "source branch moved: the source branch does not contain commit "+req.sourcePin)
+			return
+		}
+		sourceSHA = req.sourcePin
+	}
 
 	base, hasBase, err := mergeBaseSHA(ctx, repoPath, targetSHA, sourceSHA)
 	if err != nil {
