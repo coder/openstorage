@@ -556,20 +556,26 @@ func TestMergeConflictsAndGuards(t *testing.T) {
 			}
 		})
 
-		t.Run("stale expected_target_sha is 412 and leaves state", func(t *testing.T) {
+		t.Run("stale expected_target_sha is 409 conflict and leaves state", func(t *testing.T) {
+			// #532: upstream's merge contract answers a failed guard with a
+			// problem body, code conflict, not ADR-22's 412.
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("feature", "main", "merge", map[string]any{
 					"author": wmTestAuthor, "expected_target_sha": fx.c1, // stale
 				}))
-			if resp.StatusCode != http.StatusPreconditionFailed {
+			if resp.StatusCode != http.StatusConflict {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
-			res := wmResult(t, wmDecode(t, raw))
-			if res["status"] != "precondition_failed" || res["old_sha"] != fx.c2 {
-				t.Fatalf("result = %v", res)
+			body := wmDecode(t, raw)
+			want := "expected_target_sha " + fx.c1 + " does not match current tip " + fx.c2
+			if body["code"] != "conflict" || body["status"] != float64(http.StatusConflict) || body["detail"] != want || body["error"] != want {
+				t.Fatalf("body = %v, want problem code conflict and %q", body, want)
+			}
+			if _, has := body["result"]; has {
+				t.Fatalf("stale guard carries a result envelope: %v", body)
 			}
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/main"]; got != fx.c2 {
-				t.Fatalf("main moved to %q after 412", got)
+				t.Fatalf("main moved to %q after a stale guard", got)
 			}
 		})
 	})

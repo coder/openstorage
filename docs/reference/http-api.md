@@ -58,8 +58,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   endpoints return the richer `result` envelope
   ([streaming protocols](../explanation/streaming-commit-protocols.md)), even on 4xx/5xx
   statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. One exception:
-  the merge `409` for a source branch that no longer contains `expected_source_sha` uses
-  the error body above, as upstream documents ([details](#pinning-the-merge-source)).
+  a merge `409` for a failed guard (a stale `expected_target_sha`, or a source branch
+  that no longer contains `expected_source_sha`) uses the error body above, as upstream
+  documents ([details](#merge-guards)).
 - **Throttling**: every `429` (the gateway [rate limiter](configuration.md#rate-limiting)
   and transient busy/backpressure answers) carries:
   - `Retry-After` (delay-seconds), which takes precedence over the `RateLimit` window;
@@ -276,10 +277,17 @@ Each page runs one `git rev-list --topo-order` walk for `order`, as one more git
 | `POST /repos/branches/create` | git:write | `{target_branch?, base_ref?\|base_branch?(deprecated), preferred_base?, base_is_ephemeral?, target_is_ephemeral?, force?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
 | `DELETE /repos/branches` | git:write | Query `target_branch`, `ephemeral?`. The deprecated body `{target_branch (deprecated alias name), ephemeral?}` still works; a query parameter that is present wins over its body field, even when empty → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent): 409 for the query form, 403 for the body form |
 | `GET /repos/branches/diff` | git:read | **Deprecated upstream** (both path styles); still implemented. Use `GET /repos/diff` ([migration](#migrating-from-branchesdiff)). `branch` (req), `base?` (defaults to the repo default branch), `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, merge_base_sha, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}`; `merge_base_sha` is empty when the histories are unrelated (direct `base..branch` diff) |
-| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`). `expected_source_sha` pins the source commit ([details](#pinning-the-merge-source)) |
+| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`). A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: conflict` ([details](#merge-guards)) |
 | `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
 
-#### Pinning the merge source
+#### Merge guards
+
+`expected_target_sha` (a full 40-hex commit SHA) requires the target branch to still
+point at that commit. If it does not, the merge answers `409` with the error body
+(`code: conflict`, `detail` "expected_target_sha … does not match current tip …")
+before any merge work, and nothing changes. v0.18.0 and earlier answered `412`
+`precondition_failed` with a `result` object
+([#532](https://github.com/coder/openstorage/issues/532)).
 
 `expected_source_sha` (a full 40-hex commit SHA) makes `POST /repos/merge` merge that
 commit instead of the current tip of `source_ref`. Use it to merge exactly the
@@ -292,7 +300,8 @@ moved on since.
   any merge work, and nothing changes.
 - `source.sha` in the response is the pinned commit.
 - An explicit `null`, `""` or any value that is not a full SHA is `400`.
-- `expected_target_sha` is checked first, so a stale target still answers `412`.
+- `expected_target_sha` is checked first. When both guards fail, the `detail` names the
+  target.
 
 This follows the [public OpenAPI](https://code.storage/docs/openapi.yaml) of
 2026-10-16. On 2026-10-18 the cluster OpenAPI did not list the field yet
@@ -528,7 +537,7 @@ Other limits and gaps:
 | 400 | invalid input; also "custom notes refs not enabled" |
 | 401 / 403 | auth failed / permission or ref-policy denied |
 | 404 | repo/object/branch not found; unborn-branch file metadata |
-| 409 | repo exists, repo already deleted, credential exists, merge conflict, merge source moved (`expected_source_sha`), CAS conflict |
+| 409 | repo exists, repo already deleted, credential exists, merge conflict, failed merge guard (`expected_target_sha`, `expected_source_sha`), CAS conflict |
 | 412 | CAS precondition failed |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit ("unavailable" to ref-update clients) |

@@ -13,8 +13,9 @@
 // immutable pack. The preview endpoint never publishes anything — the
 // scratch odb is deleted with the request (docs/explanation/domain-model.md invariant 6).
 //
-// Status mapping (docs/archive/phases/13-phase4-implementation-notes.md ADR-22): a stale expected_target_sha is a 412
-// `precondition_failed`; merge conflicts, ff_only non-fast-forwards,
+// Status mapping (ADR-22, amended by #532 for merge): a stale
+// expected_target_sha or expected_source_sha is a 409 problem body with
+// code `conflict`, as upstream documents; merge conflicts, ff_only non-fast-forwards,
 // unrelated histories without allow_unrelated_histories, and CAS races
 // lost at publish time are 409 `conflict` (merge conflicts additionally
 // carry conflict_paths + merge_base_sha, docs/reference/http-api.md).
@@ -510,8 +511,8 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 }
 
 // handleMerge implements POST /repos/merge (docs/reference/http-api.md): resolve both branch
-// tips from the ref authority, guard on expected_target_sha (412) and
-// expected_source_sha (409), decide
+// tips from the ref authority, guard on expected_target_sha and
+// expected_source_sha (409 problem bodies), decide
 // the outcome (no_op / fast_forward / merge_commit / squash), run
 // merge-tree in the scratch odb, enforce ref policies, and publish under
 // CAS.
@@ -557,11 +558,11 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		wmFail(w, http.StatusNotFound, "not_found", "target branch "+req.TargetBranch+" not found", req.TargetBranch, "")
 		return
 	}
-	// ADR-22: a stale guard is a 412 before any merge work happens.
+	// A stale guard is a 409 problem body (code conflict) before any merge
+	// work happens (ADR-22 as amended by #532: upstream's merge contract).
 	if req.ExpectedTargetSHA != "" && strings.ToLower(req.ExpectedTargetSHA) != targetSHA {
-		wmFail(w, http.StatusPreconditionFailed, "precondition_failed",
-			fmt.Sprintf("expected_target_sha %s does not match current tip %s", req.ExpectedTargetSHA, targetSHA),
-			req.TargetBranch, targetSHA)
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("expected_target_sha %s does not match current tip %s", req.ExpectedTargetSHA, targetSHA))
 		return
 	}
 
