@@ -440,7 +440,8 @@ func TestRestoreCommitTagBaseRef(t *testing.T) {
 
 // TestGuardSHAUppercase covers issue #385: every full-SHA guard field
 // accepts an uppercase 40-hex value. A stale uppercase guard still fails
-// the guard (412), not validation (400), and a current one passes.
+// the guard (412, or 409 on merge per #532), not validation (400), and a
+// current one passes.
 func TestGuardSHAUppercase(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)
@@ -526,8 +527,12 @@ func TestGuardSHAUppercase(t *testing.T) {
 		} {
 			t.Run(tc.name+" "+tc.field, func(t *testing.T) {
 				current, stale := tc.tips(t)
-				if code, body := tc.send(t, map[string]any{tc.field: strings.ToUpper(stale)}); code != http.StatusPreconditionFailed {
-					t.Fatalf("stale uppercase guard: %d %s, want 412", code, body)
+				want := http.StatusPreconditionFailed
+				if tc.name == "merge" {
+					want = http.StatusConflict // #532: upstream's merge guard status
+				}
+				if code, body := tc.send(t, map[string]any{tc.field: strings.ToUpper(stale)}); code != want {
+					t.Fatalf("stale uppercase guard: %d %s, want %d", code, body, want)
 				}
 				if code, body := tc.send(t, map[string]any{tc.field: strings.ToUpper(current)}); code != http.StatusOK {
 					t.Fatalf("current uppercase guard: %d %s, want 200", code, body)
