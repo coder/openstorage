@@ -31,7 +31,7 @@ clients ──► reverse proxy (TLS) ──► N × openstorage serve ──►
 
 ### Runtime base and support
 
-The Dockerfile pins the runtime base to **Alpine 3.24.2 by multi-platform image index
+The Dockerfile pins the runtime base to **Alpine 3.24.3 by multi-platform image index
 digest**. This does **not** make the full build reproducible or guarantee current
 package fixes:
 
