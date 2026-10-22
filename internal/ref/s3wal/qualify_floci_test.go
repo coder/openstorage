@@ -8,7 +8,7 @@
 // mode — the pinned build passes them all now that upstream fixed the
 // torn-read bug (floci-io/floci#2874), so a regression in either Floci or
 // s3wal's own S3 usage fails the test. delete-if-match stays a RECORD-mode
-// row: Floci ignored the condition through 2.1.0 (issue #201) and 2.2.0
+// row: Floci ignored the condition through 2.1.0 (issue #201) and since 2.2.0
 // honors it, but s3wal never depends on it (ADR-46). Like the SeaweedFS
 // and MinIO lanes, this test is gated only by -short, so it runs wherever
 // `go test ./...` runs — the per-PR `test` job included, as the

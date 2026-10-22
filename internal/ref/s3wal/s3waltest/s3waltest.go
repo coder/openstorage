@@ -47,14 +47,14 @@ const (
 	SeaweedFSImage   = testimages.SeaweedFS
 	MinIOLegacyImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z@sha256:4c4a4876193f030c81f57aabb22bcb9a73462010eb61fcab66908e03e5484af8"
 	// FlociImage pins the qualified stable release by OCI index digest.
-	// Release 2.2.0 includes the GetObject torn-read fix floci-io/floci#2874
-	// and follow-up #2901. The linux/amd64 image (config b12af5357828,
-	// upstream revision 17c99047) passed all 22 standard surfaces plus
+	// Release 2.3.0 includes the GetObject torn-read fix floci-io/floci#2874
+	// and follow-up #2901. The linux/amd64 image (config 2093a63dd3a3,
+	// upstream revision ee15f502) passed all 22 standard surfaces plus
 	// get-under-overwrite in REQUIRE mode. It honors DeleteObject+If-Match
 	// (412), but that row stays record-only, never a correctness guard.
 	// Keep both Floci workflows in sync with this pin. See
 	// docs/reference/testing.md for credential coverage and remaining gaps.
-	FlociImage = "floci/floci:2.2.0@sha256:e97cd0c1dc2aa14e7697fb5ef5018404c4d6345169dbd276315f0bed2c7b0520"
+	FlociImage = "floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9"
 )
 
 // SeaweedFS's `weed server -s3` anonymous mode accepts any static

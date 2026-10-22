@@ -6,11 +6,11 @@
 # with OPENSTORAGE_TEST_S3_URL pointed at it. That gates the env-gated
 # endpoint tests (internal/blob/s3endpoint_test.go), which pin real SigV4
 # verification on presigned URLs: valid signature ⇒ 200 + exact bytes,
-# corrupted signature ⇒ 403 SignatureDoesNotMatch. Releases 2.1.0 and
-# 2.2.0 also reject wrong header-auth secrets and invalid temporary-session
+# corrupted signature ⇒ 403 SignatureDoesNotMatch. Releases 2.1.0 to
+# 2.3.0 also reject wrong header-auth secrets and invalid temporary-session
 # tokens in the GetObject probes. Remaining gaps on this pin: an explicit
 # IAM Deny s3:GetObject does not deny reads and x-amz-expected-bucket-owner
-# is ignored. Do not use this lane to assert those properties. 2.2.0
+# is ignored. Do not use this lane to assert those properties. 2.3.0
 # honors DeleteObject+If-Match (412). The release includes the torn-read
 # fix (floci-io/floci#2874 and #2901). A second job runs the Floci row of the
 # s3wal qualification matrix. Full gap list + local repro:
@@ -40,7 +40,7 @@ jobs:
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-            floci/floci:2.2.0@sha256:e97cd0c1dc2aa14e7697fb5ef5018404c4d6345169dbd276315f0bed2c7b0520
+            floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9
           for i in $(seq 1 60); do
             if curl -s -o /dev/null http://127.0.0.1:4566/; then
               echo "floci ready after ${i}s"
@@ -104,7 +104,7 @@ jobs:
   # same-key overwrite — s3wal's production read-vs-CAS shape) run in
   # REQUIRE mode: the pinned build passes them since upstream fixed the
   # torn-read bug (floci-io/floci#2874), so a regression fails this job.
-  # delete-if-match stays record-only (2.2.0 honors it, but s3wal
+  # delete-if-match stays record-only (2.3.0 honors it, but s3wal
   # never relies on it — ADR-46). Second-implementation regression armor
   # only — not #192 promotion evidence. TestQualifyFloci is not env-gated,
   # so it also runs wherever `go test ./...` runs (the per-PR `test` job
