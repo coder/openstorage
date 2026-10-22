@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # mise.toml is the single source of truth for the Go and golangci-lint
       # pins; install both here so CI lints with exactly the local toolchain.
-      - uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
       - run: golangci-lint run
 
   terraform:
@@ -45,7 +45,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
       # Offline/mock gates only. This job has no AWS credentials and never applies.
       - run: terraform -chdir=deploy/terraform/aws fmt -check -recursive
       - run: terraform -chdir=deploy/terraform/aws init -backend=false -lockfile=readonly -input=false

@@ -380,7 +380,7 @@ func TestServeDrainTimeoutStopsRESTAndHydrationGit(t *testing.T) {
 				}
 			}
 			select {
-			case <-done:
+			case <-done: //nolint:errcheck // the request may fail once serve exits: only its end matters
 			case <-time.After(30 * time.Second):
 				t.Fatal("client request still running 30s after serve exited")
 			}

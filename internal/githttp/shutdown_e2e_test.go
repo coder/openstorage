@@ -23,7 +23,7 @@ func waitNodeExit(t *testing.T, n *testNode, timeout time.Duration) error {
 		return err
 	case <-time.After(timeout):
 		_ = n.cmd.Process.Kill()
-		<-done // Reap the killed child before failing or cleaning up its backend.
+		<-done //nolint:errcheck // Reap the killed child before failing or cleaning up its backend.
 		t.Fatalf("serve still running %v after the termination signal", timeout)
 		return nil
 	}

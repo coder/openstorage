@@ -165,7 +165,7 @@ exec "$CANCEL_REAL_GIT" "$@"
 					break
 				} else if !errors.Is(err, os.ErrNotExist) {
 					cancel()
-					<-done
+					<-done //nolint:errcheck // only wait for the canceled call to return
 					t.Fatal(err)
 				}
 				select {
@@ -265,7 +265,7 @@ func TestHydrate_ColdInitializationCancellation(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		unlock()
-		<-done
+		<-done //nolint:errcheck // only wait for the unblocked call to return
 		t.Fatal("cold hydrate ignored cancellation while waiting for initialization")
 	}
 	if lp, lr, gg := st.counts(); lp != 0 || lr != 0 || gg != 0 {

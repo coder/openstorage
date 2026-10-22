@@ -3660,7 +3660,7 @@ func TestLFSUpload_StalledClientReleasesStaging(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	pw.Close()
-	<-stalled // the stalled request ends with a connection/HTTP error either way
+	<-stalled //nolint:errcheck // the stalled request ends with a connection/HTTP error either way
 }
 
 // slowClaimStore delays TryAdoptionClaim well past the idle read deadline
