@@ -1,13 +1,13 @@
 terraform {
-  required_version = "= 1.16.6"
+  required_version = "= 1.17.0"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "= 6.69.0"
+      version = "= 6.70.0"
     }
     tls = {
       source  = "hashicorp/tls"
-      version = "= 4.4.1"
+      version = "= 4.4.2"
     }
   }
 }
