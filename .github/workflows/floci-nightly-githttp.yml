@@ -5,7 +5,7 @@
 # test-only OPENSTORAGE_TEST_S3_ENDPOINT override in the suite's TestMain.
 # Credentials come from a real chain no other lane exercises: IAM
 # CreateAccessKey → STS AssumeRole → session credentials. Releases 2.1.0
-# and 2.2.0 reject wrong header-auth secrets and missing, forged, or
+# through 2.3.0 reject wrong header-auth secrets and missing, forged, or
 # mismatched temporary-session tokens in the GetObject probes. This lane
 # runs the whole Git/LFS surface on those temporary credentials, including
 # AWS_SESSION_TOKEN plumbing (env → SDK → serve children).
@@ -38,12 +38,12 @@ jobs:
       - run: git lfs version
       - name: boot floci
         # Keep this OCI index digest in sync with s3waltest.FlociImage and
-        # floci-nightly.yml. Release 2.2.0 passed the baseline/candidate
+        # floci-nightly.yml. Release 2.3.0 passed the baseline/candidate
         # qualification and credential lanes before adoption.
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-            floci/floci:2.2.0@sha256:e97cd0c1dc2aa14e7697fb5ef5018404c4d6345169dbd276315f0bed2c7b0520
+            floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9
           for i in $(seq 1 60); do
             if curl -s -o /dev/null http://127.0.0.1:4566/; then
               echo "floci ready after ${i}s"
