@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -464,57 +465,79 @@ func (s slowUploadStore) UploadFile(ctx context.Context, key, path string) error
 // outlives the last stale-floor commit); a failed post-publication
 // refresh is surfaced WITH the restore reported, so callers still bump
 // the floor generation.
+//
+// The test runs in a synctest bubble with the production cadence (#545):
+// with millisecond knobs on the wall clock, a host stall of a few tens of
+// milliseconds aged the cover past its budget and the seam correctly
+// reported a gap. Fake time advances only while every goroutine in the
+// bubble is blocked, so the test asserts the exact deadlines instead.
 func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
-	ctx := context.Background()
-	oldInterval, oldBudget := coverRenewInterval, coverLapseBudget
-	coverRenewInterval, coverLapseBudget = 20*time.Millisecond, 80*time.Millisecond
-	t.Cleanup(func() { coverRenewInterval, coverLapseBudget = oldInterval, oldBudget })
-
-	key := PackKey("r1", "renewed")
-	b := seededFile(t, key, "pack-bytes")
-	src := filepath.Join(t.TempDir(), "src")
-	if err := os.WriteFile(src, []byte("pack-bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Delete(ctx, key); err != nil {
-		t.Fatal(err)
-	}
-
-	slow := slowUploadStore{BlobStore: b, delay: 110 * time.Millisecond}
-	var calls atomic.Int32
-	restored, err := EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
-		calls.Add(1)
-		return nil
-	}, nil)
-	if err != nil || !restored {
-		t.Fatalf("EnsurePublished(slow restore) = (%v, %v), want (true, nil)", restored, err)
-	}
-	// 1 initial + ≥2 mid-upload renewals (110ms across 20ms ticks, half
-	// slack for scheduler noise) + 1 post-publication refresh.
-	if n := calls.Load(); n < 4 {
-		t.Fatalf("cover calls = %d, want ≥ 4 (initial + renewals through the upload + post-publication refresh)", n)
-	}
-
-	// Once every renewal fails, continuity runs out MID-UPLOAD and the
-	// restore aborts (Codex rounds 62+63): uncovered bytes must never
-	// become physical.
-	if err := b.Delete(ctx, key); err != nil {
-		t.Fatal(err)
-	}
-	first := true
-	restored, err = EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
-		if first {
-			first = false
-			return nil // the initial cover succeeds
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		// The upload outlives the continuity budget (so renewals must carry
+		// it) and ends between two ticks (so the call count has no tie).
+		const uploadDelay = 110 * time.Second
+		if uploadDelay <= coverLapseBudget || uploadDelay%coverRenewInterval == 0 {
+			t.Fatalf("uploadDelay %v must exceed coverLapseBudget %v and fall between ticks of %v", uploadDelay, coverLapseBudget, coverRenewInterval)
 		}
-		return errors.New("ledger unreachable") // every renewal fails
-	}, nil)
-	if restored || err == nil || !strings.Contains(err.Error(), "restore cover continuity lost") {
-		t.Fatalf("EnsurePublished(dead ledger) = (%v, %v), want an aborted, unpublished restore", restored, err)
-	}
-	if _, serr := b.Stat(ctx, key); !errors.Is(serr, ErrNotFound) {
-		t.Fatalf("aborted restore published anyway (stat: %v)", serr)
-	}
+
+		key := PackKey("r1", "renewed")
+		b := seededFile(t, key, "pack-bytes")
+		src := filepath.Join(t.TempDir(), "src")
+		if err := os.WriteFile(src, []byte("pack-bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Delete(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+
+		slow := slowUploadStore{BlobStore: b, delay: uploadDelay}
+		var calls atomic.Int32
+		start := time.Now()
+		restored, err := EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
+			calls.Add(1)
+			return nil
+		}, nil)
+		if err != nil || !restored {
+			t.Fatalf("EnsurePublished(slow restore) = (%v, %v), want (true, nil)", restored, err)
+		}
+		if got := time.Since(start); got != uploadDelay {
+			t.Fatalf("slow restore took %v, want exactly the upload delay %v", got, uploadDelay)
+		}
+		// 1 initial + one renewal per tick during the upload + 1
+		// post-publication refresh.
+		if got, want := calls.Load(), int32(1+uploadDelay/coverRenewInterval+1); got != want {
+			t.Fatalf("cover calls = %d, want %d (initial + renewals through the upload + post-publication refresh)", got, want)
+		}
+
+		// Once every renewal fails, continuity runs out MID-UPLOAD and the
+		// restore aborts (Codex rounds 62+63): uncovered bytes must never
+		// become physical. The abort lands exactly at the budget deadline,
+		// measured from the initial cover.
+		if err := b.Delete(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+		calls.Store(0)
+		start = time.Now()
+		restored, err = EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
+			if calls.Add(1) == 1 {
+				return nil // the initial cover succeeds
+			}
+			return errors.New("ledger unreachable") // every renewal fails
+		}, nil)
+		if restored || err == nil || !strings.Contains(err.Error(), "restore cover continuity lost") {
+			t.Fatalf("EnsurePublished(dead ledger) = (%v, %v), want an aborted, unpublished restore", restored, err)
+		}
+		if got := time.Since(start); got != coverLapseBudget {
+			t.Fatalf("dead-ledger restore aborted after %v, want exactly the continuity budget %v", got, coverLapseBudget)
+		}
+		if got, want := calls.Load(), int32(1+coverLapseBudget/coverRenewInterval); got != want {
+			t.Fatalf("dead-ledger cover calls = %d, want %d (initial + failed renewals before the deadline)", got, want)
+		}
+		if _, serr := b.Stat(ctx, key); !errors.Is(serr, ErrNotFound) {
+			t.Fatalf("aborted restore published anyway (stat: %v)", serr)
+		}
+	})
 }
 
 // TestWithRenewedCoverAbortsOnLapse (Codex round 62): a renewal stalling
