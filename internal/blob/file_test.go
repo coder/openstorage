@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -547,37 +548,66 @@ func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
 // attempt is now deadline-bounded (a stall costs one attempt, not the
 // loop), and once coverLapseBudget passes without a successful renewal
 // the op's context is canceled: an uncovered restore must never publish.
+//
+// The WithRenewedCover tests run in synctest bubbles with the production
+// cadence (#549): fake time advances only while every goroutine in the
+// bubble is blocked, so a host stall cannot move a deadline and each test
+// asserts exact times instead of wall-clock slack.
 func TestWithRenewedCoverAbortsOnLapse(t *testing.T) {
-	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
-	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 5*time.Millisecond, 40*time.Millisecond
-	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
-
-	// The initial cover succeeds; every later renewal stalls until its
-	// per-attempt deadline: the loop must keep making (failing) attempts
-	// and abort the op at the budget.
-	initial := true
-	renew := func(rctx context.Context) error {
-		if initial {
-			initial = false
-			return nil
+	synctest.Test(t, func(t *testing.T) {
+		// The first stalled attempt gets its full timeout; the second
+		// starts with less than that left in the budget.
+		if coverRenewInterval+coverRenewTimeout > coverLapseBudget || 2*coverRenewInterval >= coverLapseBudget || 2*coverRenewInterval+coverRenewTimeout <= coverLapseBudget {
+			t.Fatalf("cadence %v/%v/%v no longer caps the second stalled attempt at the budget", coverRenewInterval, coverRenewTimeout, coverLapseBudget)
 		}
-		<-rctx.Done()
-		return rctx.Err()
-	}
-	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
-		select {
-		case <-opCtx.Done():
-			return context.Cause(opCtx)
-		case <-time.After(2 * time.Second):
-			return nil // the abort never came: uncovered bytes would publish
+		// The initial cover succeeds; every later renewal stalls until its
+		// per-attempt deadline: the loop must keep making (failing) attempts
+		// and abort the op at the budget.
+		start := time.Now()
+		var deadlines []time.Duration // per renewal, relative to start
+		renew := func(rctx context.Context) error {
+			d, ok := rctx.Deadline()
+			if !ok {
+				return errors.New("unbounded renewal attempt")
+			}
+			deadlines = append(deadlines, d.Sub(start))
+			if len(deadlines) == 1 {
+				return nil
+			}
+			<-rctx.Done()
+			return rctx.Err()
 		}
-	}, nil)
-	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
-		t.Fatalf("opErr = %v, want a cover-lapse abort", opErr)
-	}
-	if renewErr != nil {
-		t.Fatalf("renewErr = %v, want nil (op failed, no final refresh)", renewErr)
-	}
+		var abortedAt time.Duration
+		opErr, renewErr := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+			select {
+			case <-opCtx.Done():
+				abortedAt = time.Since(start)
+				return context.Cause(opCtx)
+			case <-time.After(time.Hour):
+				return nil // the abort never came: uncovered bytes would publish
+			}
+		}, nil)
+		if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
+			t.Fatalf("opErr = %v, want a cover-lapse abort", opErr)
+		}
+		if renewErr != nil {
+			t.Fatalf("renewErr = %v, want nil (op failed, no final refresh)", renewErr)
+		}
+		if abortedAt != coverLapseBudget {
+			t.Fatalf("op aborted after %v, want exactly the continuity budget %v", abortedAt, coverLapseBudget)
+		}
+		// Initial attempt, then one stalled attempt per tick: the first
+		// gets the full per-attempt timeout, the last is capped at the
+		// remaining budget (Codex round 66).
+		want := []time.Duration{
+			coverRenewTimeout,
+			coverRenewInterval + coverRenewTimeout,
+			coverLapseBudget,
+		}
+		if !slices.Equal(deadlines, want) {
+			t.Fatalf("renewal deadlines = %v, want %v", deadlines, want)
+		}
+	})
 }
 
 // TestWithRenewedCoverRejectsLateSuccess (Codex round 63): a renewal that
@@ -586,26 +616,44 @@ func TestWithRenewedCoverAbortsOnLapse(t *testing.T) {
 // an uncovered gap a stale-floor admission can commit in — so it must
 // abort exactly like a lapse instead of resetting the coverage anchor.
 func TestWithRenewedCoverRejectsLateSuccess(t *testing.T) {
-	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
-	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 100*time.Millisecond, 25*time.Millisecond
-	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
-
-	// Every renewal SUCCEEDS — but only after the budget window passed.
-	renew := func(context.Context) error {
-		time.Sleep(40 * time.Millisecond)
-		return nil
-	}
-	opErr, _ := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
-		select {
-		case <-opCtx.Done():
-			return context.Cause(opCtx)
-		case <-time.After(2 * time.Second):
-			return nil // late successes were accepted: the gap went unnoticed
+	synctest.Test(t, func(t *testing.T) {
+		// The initial cover is prompt. Every renewal SUCCEEDS, but it
+		// ignores its deadline and completes only after the budget window.
+		const latency = 30 * time.Second
+		if coverRenewInterval+latency <= coverLapseBudget {
+			t.Fatalf("latency %v must end the first renewal past the budget %v", latency, coverLapseBudget)
 		}
-	}, nil)
-	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
-		t.Fatalf("opErr = %v, want a continuity abort on late-completing renewals", opErr)
-	}
+		calls := 0
+		renew := func(context.Context) error {
+			calls++
+			if calls > 1 {
+				time.Sleep(latency)
+			}
+			return nil
+		}
+		start := time.Now()
+		var abortedAt time.Duration
+		opErr, _ := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+			select {
+			case <-opCtx.Done():
+				abortedAt = time.Since(start)
+				return context.Cause(opCtx)
+			case <-time.After(time.Hour):
+				return nil // late successes were accepted: the gap went unnoticed
+			}
+		}, nil)
+		// The abort comes from the late success itself (its error is nil),
+		// when it completes, not from the budget timer.
+		if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost (last renewal: <nil>)") {
+			t.Fatalf("opErr = %v, want a continuity abort on the late-completing renewal", opErr)
+		}
+		if want := coverRenewInterval + latency; abortedAt != want {
+			t.Fatalf("op aborted after %v, want %v (when the first late renewal completed)", abortedAt, want)
+		}
+		if calls != 2 {
+			t.Fatalf("renew calls = %d, want 2 (initial + the rejected late renewal)", calls)
+		}
+	})
 }
 
 // TestWithRenewedCoverBudgetExpiryAbortsBetweenTicks (Codex round 66):
@@ -617,38 +665,41 @@ func TestWithRenewedCoverRejectsLateSuccess(t *testing.T) {
 // own timer: op is canceled AT covered+coverLapseBudget, not at whatever
 // later tick happens to notice.
 func TestWithRenewedCoverBudgetExpiryAbortsBetweenTicks(t *testing.T) {
-	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
-	// Ticks land far past the budget: only a budget-deadline timer can
-	// abort in time.
-	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 300*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond
-	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
-
-	initial := true
-	renew := func(context.Context) error {
-		if initial {
-			initial = false
-			return nil // the initial cover succeeds; nothing renews it
+	synctest.Test(t, func(t *testing.T) {
+		// The budget ends between two ticks: only a budget-deadline timer
+		// can abort on time.
+		if coverLapseBudget%coverRenewInterval == 0 {
+			t.Fatalf("budget %v falls on a tick of %v", coverLapseBudget, coverRenewInterval)
 		}
-		return errors.New("ledger down")
-	}
-	start := time.Now()
-	opErr, _ := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
-		select {
-		case <-opCtx.Done():
-			return context.Cause(opCtx)
-		case <-time.After(2 * time.Second):
-			return nil // never aborted: uncovered bytes would publish
+		calls := 0
+		renew := func(context.Context) error {
+			calls++
+			if calls == 1 {
+				return nil // the initial cover succeeds; nothing renews it
+			}
+			return errors.New("ledger down")
 		}
-	}, nil)
-	elapsed := time.Since(start)
-	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
-		t.Fatalf("opErr = %v, want a budget-expiry abort", opErr)
-	}
-	// The abort must come from the budget deadline (~50ms), not the
-	// first tick (~300ms); generous slack for scheduler noise.
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("abort took %v, want ≈coverLapseBudget (the budget timer, not the next tick)", elapsed)
-	}
+		start := time.Now()
+		var abortedAt time.Duration
+		opErr, _ := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+			select {
+			case <-opCtx.Done():
+				abortedAt = time.Since(start)
+				return context.Cause(opCtx)
+			case <-time.After(time.Hour):
+				return nil // never aborted: uncovered bytes would publish
+			}
+		}, nil)
+		if opErr == nil || !strings.Contains(opErr.Error(), "budget expired without a renewed cover") {
+			t.Fatalf("opErr = %v, want a budget-expiry abort", opErr)
+		}
+		if abortedAt != coverLapseBudget {
+			t.Fatalf("op aborted after %v, want exactly the continuity budget %v (the budget timer, not the next tick)", abortedAt, coverLapseBudget)
+		}
+		if want := 1 + int(coverLapseBudget/coverRenewInterval); calls != want {
+			t.Fatalf("renew calls = %d, want %d (initial + one failure per tick before the deadline)", calls, want)
+		}
+	})
 }
 
 // TestWithRenewedCoverTakesInitialCoverItself (Codex round 64): a
@@ -697,38 +748,42 @@ func TestWithRenewedCoverTakesInitialCoverItself(t *testing.T) {
 // proven cover, retried — alternating with renewals — until it commits;
 // only lost continuity gives up (and surfaces renewErr).
 func TestWithRenewedCoverHandoffRetriesUnderLiveCover(t *testing.T) {
-	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
-	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 50*time.Millisecond, 200*time.Millisecond
-	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
-
-	var renews atomic.Int32
-	renew := func(context.Context) error {
-		renews.Add(1)
-		return nil // the cover stays renewable throughout
-	}
-	handoffs := 0
-	lastRenewsSeen := int32(0)
-	handoff := func(hctx context.Context) error {
-		handoffs++
-		if d, ok := hctx.Deadline(); !ok || time.Until(d) > CoverHandoffTimeout+time.Second {
-			t.Fatalf("handoff attempt %d unbounded or over the handoff window", handoffs)
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		var renews int32
+		renew := func(context.Context) error {
+			renews++
+			return nil // the cover stays renewable throughout
 		}
-		if r := renews.Load(); r <= lastRenewsSeen {
-			t.Fatalf("handoff attempt %d ran without a fresh cover renewal since the last attempt", handoffs)
+		var handoffAt []time.Duration
+		lastRenewsSeen := int32(0)
+		handoff := func(hctx context.Context) error {
+			handoffAt = append(handoffAt, time.Since(start))
+			if d, ok := hctx.Deadline(); !ok || time.Until(d) != CoverHandoffTimeout {
+				t.Fatalf("handoff attempt %d deadline (%v, %v), want exactly %v ahead", len(handoffAt), d, ok, CoverHandoffTimeout)
+			}
+			if renews <= lastRenewsSeen {
+				t.Fatalf("handoff attempt %d ran without a fresh cover renewal since the last attempt", len(handoffAt))
+			}
+			lastRenewsSeen = renews
+			if len(handoffAt) < 3 {
+				return errors.New("ledger transiently down") // the invalidation must be RETRIED
+			}
+			return nil
 		}
-		lastRenewsSeen = renews.Load()
-		if handoffs < 3 {
-			return errors.New("ledger transiently down") // the invalidation must be RETRIED
+		opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
+		if opErr != nil || renewErr != nil {
+			t.Fatalf("WithRenewedCover = (%v, %v), want (nil, nil) once the handoff lands", opErr, renewErr)
 		}
-		return nil
-	}
-	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
-	if opErr != nil || renewErr != nil {
-		t.Fatalf("WithRenewedCover = (%v, %v), want (nil, nil) once the handoff lands", opErr, renewErr)
-	}
-	if handoffs != 3 {
-		t.Fatalf("handoff attempts = %d, want 3 (two transient failures retried under live covers)", handoffs)
-	}
+		// Two transient failures, each retried one renewal interval later
+		// under a fresh cover.
+		if want := []time.Duration{0, coverRenewInterval, 2 * coverRenewInterval}; !slices.Equal(handoffAt, want) {
+			t.Fatalf("handoff attempts at %v, want %v", handoffAt, want)
+		}
+		if renews != 4 {
+			t.Fatalf("renew calls = %d, want 4 (initial + one fresh cover before each handoff attempt)", renews)
+		}
+	})
 }
 
 // TestWithRenewedCoverTailPersistsThroughContinuityLoss (Codex round 72,
@@ -739,42 +794,47 @@ func TestWithRenewedCoverHandoffRetriesUnderLiveCover(t *testing.T) {
 // loss the seam must keep attempting both through the tail: a handoff
 // success still invalidates every stale floor.
 func TestWithRenewedCoverTailPersistsThroughContinuityLoss(t *testing.T) {
-	oldI, oldT, oldB, oldTail := coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail
-	coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail =
-		10*time.Millisecond, 5*time.Millisecond, 25*time.Millisecond, 2*time.Second
-	t.Cleanup(func() {
-		coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail = oldI, oldT, oldB, oldTail
-	})
+	synctest.Test(t, func(t *testing.T) {
+		// A tail long enough for three post-loss attempts on the renewal
+		// cadence, so no attempt lands on the tail's edge.
+		oldTail := staleFloorTail
+		staleFloorTail = coverLapseBudget + 3*coverRenewInterval
+		t.Cleanup(func() { staleFloorTail = oldTail })
 
-	initial := true
-	renew := func(rctx context.Context) error {
-		if initial {
-			initial = false
-			return nil // the initial cover; every later renewal fails
+		calls := 0
+		renew := func(context.Context) error {
+			calls++
+			if calls == 1 {
+				return nil // the initial cover; every later renewal fails
+			}
+			return errors.New("ledger down")
 		}
-		return errors.New("ledger down")
-	}
-	handoffs := 0
-	handoff := func(context.Context) error {
-		handoffs++
-		if handoffs < 3 {
-			return errors.New("ledger still down") // recovery on the 3rd try
+		start := time.Now()
+		var handoffAt []time.Duration
+		handoff := func(context.Context) error {
+			handoffAt = append(handoffAt, time.Since(start))
+			if len(handoffAt) < 3 {
+				return errors.New("ledger still down") // recovery on the 3rd try
+			}
+			return nil
 		}
-		return nil
-	}
-	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
-	if opErr != nil {
-		t.Fatalf("opErr = %v, want nil", opErr)
-	}
-	// The repairs landed — but a post-gap success must REPORT the gap
-	// (Codex round 73): a write settled in the uncovered window cannot
-	// be revoked, so a gapped restore is never clean.
-	if renewErr == nil || !strings.Contains(renewErr.Error(), "uncovered cover gap") {
-		t.Fatalf("renewErr = %v, want the gap report on a post-loss repair", renewErr)
-	}
-	if handoffs < 3 {
-		t.Fatalf("handoff attempts = %d, want ≥3 (post-loss retries through the stale-floor tail)", handoffs)
-	}
+		opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
+		if opErr != nil {
+			t.Fatalf("opErr = %v, want nil", opErr)
+		}
+		// The repairs landed — but a post-gap success must REPORT the gap
+		// (Codex round 73): a write settled in the uncovered window cannot
+		// be revoked, so a gapped restore is never clean.
+		if renewErr == nil || !strings.Contains(renewErr.Error(), "uncovered cover gap") {
+			t.Fatalf("renewErr = %v, want the gap report on a post-loss repair", renewErr)
+		}
+		// The loss is noticed at the budget deadline, and the handoff is
+		// retried on the renewal cadence inside the tail.
+		want := []time.Duration{coverLapseBudget, coverLapseBudget + coverRenewInterval, coverLapseBudget + 2*coverRenewInterval}
+		if !slices.Equal(handoffAt, want) {
+			t.Fatalf("handoff attempts at %v, want %v (post-loss retries through the stale-floor tail)", handoffAt, want)
+		}
+	})
 }
 
 // TestWithRenewedCoverAbandonsAfterStaleFloorTail (Codex rounds 67+72):
@@ -784,36 +844,48 @@ func TestWithRenewedCoverTailPersistsThroughContinuityLoss(t *testing.T) {
 // abandonment is reported. It must not give up earlier (round 72: floors
 // outlive the continuity budget) nor persist forever.
 func TestWithRenewedCoverAbandonsAfterStaleFloorTail(t *testing.T) {
-	oldI, oldT, oldB, oldTail := coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail
-	coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail =
-		10*time.Millisecond, 5*time.Millisecond, 25*time.Millisecond, 150*time.Millisecond
-	t.Cleanup(func() {
-		coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail = oldI, oldT, oldB, oldTail
-	})
-
-	initial := true
-	renew := func(context.Context) error {
-		if initial {
-			initial = false
-			return nil // the initial cover succeeds
+	synctest.Test(t, func(t *testing.T) {
+		// Renewals fail at once; each handoff is wedged until its own
+		// deadline. A wedged attempt is also what moves fake time past the
+		// tail's edge: instant failures would retry at the same instant.
+		calls := 0
+		renew := func(context.Context) error {
+			calls++
+			if calls == 1 {
+				return nil // the initial cover succeeds
+			}
+			return errors.New("ledger down") // and never recovers
 		}
-		return errors.New("ledger down") // and never recovers
-	}
-	start := time.Now()
-	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil },
-		func(context.Context) error { return errors.New("ledger down") })
-	elapsed := time.Since(start)
-	if opErr != nil {
-		t.Fatalf("opErr = %v, want nil (op is instant)", opErr)
-	}
-	if renewErr == nil || !strings.Contains(renewErr.Error(), "abandoned after the stale-floor tail") {
-		t.Fatalf("renewErr = %v, want the tail-abandonment report", renewErr)
-	}
-	// Give-up lands ≈ the tail's end (150ms) — after the continuity
-	// budget (25ms: too early) and well before forever.
-	if elapsed < 100*time.Millisecond || elapsed > time.Second {
-		t.Fatalf("abandonment took %v, want ≈staleFloorTail", elapsed)
-	}
+		handoffs := 0
+		handoff := func(hctx context.Context) error {
+			handoffs++
+			if handoffs > 100 {
+				t.Fatalf("still retrying after %d handoff attempts: the seam never gives up", handoffs)
+			}
+			<-hctx.Done()
+			return hctx.Err()
+		}
+		// The loss lands at the budget; wedged handoffs run at the loss and
+		// at the tail's edge, and the check after the second one gives up.
+		if coverLapseBudget+CoverHandoffTimeout > staleFloorTail || staleFloorTail-coverLapseBudget-CoverHandoffTimeout >= coverRenewInterval {
+			t.Fatalf("cadence %v/%v/%v no longer puts the second handoff on the tail's edge", coverLapseBudget, CoverHandoffTimeout, staleFloorTail)
+		}
+		start := time.Now()
+		opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
+		elapsed := time.Since(start)
+		if opErr != nil {
+			t.Fatalf("opErr = %v, want nil (op is instant)", opErr)
+		}
+		if renewErr == nil || !strings.Contains(renewErr.Error(), "abandoned after the stale-floor tail") {
+			t.Fatalf("renewErr = %v, want the tail-abandonment report", renewErr)
+		}
+		if want := staleFloorTail + CoverHandoffTimeout; elapsed != want {
+			t.Fatalf("abandonment took %v, want %v (the first check after the tail)", elapsed, want)
+		}
+		if handoffs != 2 {
+			t.Fatalf("handoff attempts = %d, want 2 (at the loss and at the tail's edge)", handoffs)
+		}
+	})
 }
 
 // TestWithRenewedCoverRefreshSurvivesOpDeadline (Codex round 60): the
