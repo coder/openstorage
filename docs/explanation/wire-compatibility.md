@@ -211,6 +211,7 @@ the [archived phase notes](../archive/phases/)):
 | One ephemeral namespace across git and REST | Two separate ref spaces: git push to `/{repo}+ephemeral.git` writes a distinct `+ephemeral` storage key; REST `ephemeral=true` reads/writes `refs/namespaces/ephemeral/…` under the base repository. Ephemeral state does not cross surfaces | Recorded cross-surface split ([phase-4 notes](../archive/phases/13-phase4-implementation-notes.md)): REST writes follow the REST read surface, so API-created ephemeral refs stay visible to `GET .../branches?ephemeral=true` and merge promotion |
 | Implicit push forwarding: in upstream's GitHub App mode every `git push` to the default remote is proxied straight to GitHub, always on, with no REST trigger ([integrations guide](../upstream/guides/integrations.md)) | Explicit `POST /repos/push-upstream` (non-force by default, `force: true` opt-in) plus an opt-in per-repo `base_repo.forward_pushes` flag (default **off**) that schedules a forward after every won local push and mirrors back on success. A rejected non-fast-forward fails the run with per-ref reasons instead of rewriting upstream history. Ref deletions are not propagated in either direction (the inbound mirror deliberately avoids `--mirror` for the same reason). With `forward_pushes` off, a local push still triggers the inbound mirror, which force-resets local refs to upstream state ("upstream wins") | Recorded deviation ([ADR-44](../adr/044-outbound-push-forwarding-rides-a-separate-push-claim-lane.md), issue #90): implicit always-on forwarding invites silent divergence and needs GitHub App infrastructure this backend does not have. The explicit trigger + opt-in flag keep the direction observable (`repo.push_upstream.*` events) and non-destructive by default |
 | `GET .../file` and `POST .../archive`: no documented file-size cap and no `422`; `archive` has only the caller-chosen `max_blob_size` | `file` and `archive` answer 422 for a file over 100 MiB (`archive` can skip such files with `max_blob_size`), before any response byte. The other read-side git [resource limits](../reference/http-api.md#resource-limits-on-git-reads) apply too. After an `archive` response has started, a limit closes the connection instead of returning a status | Hardening ([ADR-49](../adr/049-read-side-git-children-run-under-one-per-request-budget.md)): the limits bound server memory, temporary disk and delivery time for data that anyone who can push controls. Fetch larger files with git |
+| Every `503` response can carry an optional `Retry-After` header, the minimum delay in seconds before a retry (spec 2026-10-21) | Two 503s leave `Retry-After` out: a git read that exceeds its [time budget](../reference/http-api.md#resource-limits-on-git-reads), and a sync create whose upstream link was removed before its first sync was scheduled ([pending creates](../reference/http-api.md#repository-lifecycle-repowrite--orgread)). The 503 for exhausted git concurrency and the 503s for a create that is not finished carry `Retry-After` | A retry of either request fails the same way, so a `Retry-After` would invite a useless retry. The same page needs the same git time ([ADR-49](../adr/049-read-side-git-children-run-under-one-per-request-budget.md)). The pending create stays pending until `DELETE /repos/delete` clears the name ([#388](https://github.com/coder/openstorage/issues/388)) |
 
 Extensions that upstream's spec does not list:
 
@@ -236,13 +237,12 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-18 (upstream
-  `Last-Modified` 2026-10-16 23:14:10 GMT), SHA-256
-  `e0447438f0f8f76a238f85bcfedfff1f2eba63e0d77ff3c8bfbc19079532ade3`. On that day
-  [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served
-  the previous snapshot (`9f8e372a29576963499f73d1ed1301cae4719107fa3effb6d9fccf30da2cac9a`),
-  so the merge `expected_source_sha` guard follows the published docs, not proven
-  upstream deployment.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-22 (upstream
+  `Last-Modified` 2026-10-21 20:50:01 GMT), SHA-256
+  `d817e3f229c0ed1c469aef07fba9caf4bed261937355688c873ab719fc1f005a`. On that day
+  [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) served the
+  same bytes, so it lists the merge `expected_source_sha` guard too. A spec that the
+  cluster serves does not prove how the cluster behaves.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled

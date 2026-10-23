@@ -304,7 +304,8 @@ moved on since.
   target.
 
 This follows the [public OpenAPI](https://code.storage/docs/openapi.yaml) of
-2026-10-16. On 2026-10-18 the cluster OpenAPI did not list the field yet
+2026-10-16. On 2026-10-22 the cluster OpenAPI served the same spec bytes as the docs,
+so it lists the field too
 ([snapshot provenance](../explanation/wire-compatibility.md#how-drift-is-tracked)).
 
 #### Migrating from `branches/diff`

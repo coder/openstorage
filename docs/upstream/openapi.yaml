@@ -3078,6 +3078,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - org:read
@@ -3232,6 +3237,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - org:read
@@ -3431,6 +3441,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -3564,6 +3579,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -3684,6 +3704,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -3846,6 +3871,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: The current `HEAD` value could not be read from storage, so no compare-and-swap was attempted and nothing was changed.
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -3991,6 +4021,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -4110,6 +4145,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -4273,6 +4313,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -4403,6 +4448,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -4553,6 +4603,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -4691,6 +4746,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -4821,6 +4881,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -4997,6 +5062,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -5139,6 +5209,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -5307,6 +5382,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -5474,6 +5554,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -5665,6 +5750,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -5819,6 +5909,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -6096,6 +6191,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -6358,6 +6458,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -6520,6 +6625,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -6682,6 +6792,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -6808,6 +6923,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -6925,6 +7045,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -7057,6 +7182,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -7204,6 +7334,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -7363,6 +7498,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -7536,6 +7676,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -7681,6 +7826,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -7821,6 +7971,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -7965,6 +8120,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -8115,6 +8275,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -8255,6 +8420,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -8381,6 +8551,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -8539,6 +8714,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -8691,6 +8871,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -8815,6 +9000,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -8948,6 +9138,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -9074,6 +9269,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -9198,6 +9398,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -9315,6 +9520,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -9436,6 +9646,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -9558,6 +9773,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -9719,6 +9939,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: The current `HEAD` value could not be read from storage, so no compare-and-swap was attempted and nothing was changed.
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -9884,6 +10109,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - org:read
@@ -10089,6 +10319,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -10230,6 +10465,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -10342,6 +10582,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -10501,6 +10746,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -10653,6 +10903,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -10788,6 +11043,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -10914,6 +11174,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -11084,6 +11349,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -11222,6 +11492,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -11386,6 +11661,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -11550,6 +11830,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -11679,6 +11964,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -11867,6 +12157,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -12017,6 +12312,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -12291,6 +12591,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -12550,6 +12855,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -12709,6 +13019,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -12868,6 +13183,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -12982,6 +13302,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -13105,6 +13430,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -13228,6 +13558,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - repo:write
@@ -13371,6 +13706,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -13528,6 +13868,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -13698,6 +14043,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -13849,6 +14199,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -13986,6 +14341,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -14129,6 +14489,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -14266,6 +14631,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -14385,6 +14755,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -14538,6 +14913,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -14686,6 +15066,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
@@ -14807,6 +15192,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -14939,6 +15329,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:read
@@ -15062,6 +15457,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Service Unavailable
+          headers:
+            Retry-After:
+              description: Minimum delay in seconds before retrying.
+              schema:
+                type: string
       security:
         - bearerAuth:
             - git:write
