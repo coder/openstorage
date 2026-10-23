@@ -31,11 +31,11 @@ clients ──► reverse proxy (TLS) ──► N × openstorage serve ──►
 
 ### Runtime base and support
 
-The Dockerfile pins the runtime base to **Alpine 3.24.3 by multi-platform image index
-digest**. This does **not** make the full build reproducible or guarantee current
+The Dockerfile pins both base images by **multi-platform image index digest**: the
+runtime base, **Alpine 3.24.3**, and the Go builder, whose Go version follows
+`mise.toml`. This does **not** make the full build reproducible or guarantee current
 package fixes:
 
-- The Go builder version follows `mise.toml`, but its image tag is not digest-pinned.
 - `apk add --no-cache` resolves packages from the Alpine v3.24 repositories at build
   time, so an uncached rebuild re-resolves them. It does not upgrade every package
   inherited from the base.
