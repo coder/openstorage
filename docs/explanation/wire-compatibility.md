@@ -237,9 +237,9 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-22 (upstream
-  `Last-Modified` 2026-10-21 20:50:01 GMT), SHA-256
-  `d817e3f229c0ed1c469aef07fba9caf4bed261937355688c873ab719fc1f005a`. On that day
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-23 (upstream
+  `Last-Modified` 2026-10-22 21:43:10 GMT), SHA-256
+  `10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356`. On that day
   [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) served the
   same bytes, so it lists the merge `expected_source_sha` guard too. A spec that the
   cluster serves does not prove how the cluster behaves.
