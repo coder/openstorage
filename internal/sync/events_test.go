@@ -3,53 +3,73 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
 
-// upstreamSyncEventProps are the property names of upstream's
-// GitSyncStartedEvent / GitSyncSucceededEvent / GitSyncFailedEvent schemas
-// (docs/upstream/openapi.yaml, 2026-09-29 20:33:38 GMT snapshot). All three
-// set additionalProperties: false, so a repo.sync.* body may carry no other
-// key.
-var upstreamSyncEventProps = map[string]bool{
-	"type": true, "repository": true, "run_count": true, "is_first_sync": true,
-	"started_at": true, "completed_at": true, "error": true, "lifecycle_id": true,
-	"org": true,
+// upstreamSyncEventSchemas are the property names and `required` lists of
+// upstream's GitSyncStartedEvent, GitSyncSucceededEvent and
+// GitSyncFailedEvent schemas (docs/upstream/openapi.yaml, 2026-10-22
+// 21:43:10 GMT snapshot, issue #560). All three set additionalProperties:
+// false, so a repo.sync.* body may carry no other key. A started event has
+// no completed_at or error; a succeeded event requires completed_at and has
+// no error; a failed event requires both.
+var upstreamSyncEventSchemas = map[string]struct {
+	props    []string
+	required []string
+}{
+	EventSyncStarted: {
+		props:    []string{"type", "repository", "run_count", "is_first_sync", "started_at", "lifecycle_id", "org"},
+		required: []string{"type", "repository", "run_count", "is_first_sync", "started_at"},
+	},
+	EventSyncSucceeded: {
+		props:    []string{"type", "repository", "run_count", "is_first_sync", "started_at", "completed_at", "lifecycle_id", "org"},
+		required: []string{"type", "repository", "run_count", "is_first_sync", "started_at", "completed_at"},
+	},
+	EventSyncFailed: {
+		props:    []string{"type", "repository", "run_count", "is_first_sync", "started_at", "completed_at", "error", "lifecycle_id", "org"},
+		required: []string{"type", "repository", "run_count", "is_first_sync", "started_at", "completed_at", "error"},
+	},
 }
 
 // upstreamWebhookRepositoryProps are the property names of upstream's
 // WebhookRepository schema (same snapshot, additionalProperties: false).
 var upstreamWebhookRepositoryProps = map[string]bool{"id": true, "url": true, "repo_name": true}
 
-// upstreamSyncEventRequired is those schemas' `required` list.
-var upstreamSyncEventRequired = []string{"type", "repository", "run_count", "is_first_sync", "started_at"}
-
-// assertUpstreamSyncShape fails unless body matches the upstream sync event
-// schemas' key set: every required key present, no key outside the schema.
+// assertUpstreamSyncShape fails unless body matches the upstream schema of
+// its event type: every required key present, no key outside the schema.
 func assertUpstreamSyncShape(t *testing.T, body []byte) {
 	t.Helper()
 	var got map[string]json.RawMessage
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
+	var typ string
+	if err := json.Unmarshal(got["type"], &typ); err != nil {
+		t.Fatalf("repo.sync.* body type: %v: %s", err, body)
+	}
+	schema, ok := upstreamSyncEventSchemas[typ]
+	if !ok {
+		t.Fatalf("body type %q is not a repo.sync.* event: %s", typ, body)
+	}
 	for k := range got {
-		if !upstreamSyncEventProps[k] {
-			t.Errorf("repo.sync.* body carries %q, which upstream's schema forbids: %s", k, body)
+		if !slices.Contains(schema.props, k) {
+			t.Errorf("%s body carries %q, which upstream's schema forbids: %s", typ, k, body)
 		}
 	}
-	for _, k := range upstreamSyncEventRequired {
+	for _, k := range schema.required {
 		if _, ok := got[k]; !ok {
-			t.Errorf("repo.sync.* body lacks required %q: %s", k, body)
+			t.Errorf("%s body lacks required %q: %s", typ, k, body)
 		}
 	}
 	var repo map[string]json.RawMessage
 	if err := json.Unmarshal(got["repository"], &repo); err != nil {
-		t.Fatalf("repo.sync.* body repository: %v: %s", err, body)
+		t.Fatalf("%s body repository: %v: %s", typ, err, body)
 	}
 	for k := range repo {
 		if !upstreamWebhookRepositoryProps[k] {
-			t.Errorf("repo.sync.* repository carries %q, which upstream's schema forbids: %s", k, body)
+			t.Errorf("%s repository carries %q, which upstream's schema forbids: %s", typ, k, body)
 		}
 	}
 }

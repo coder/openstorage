@@ -666,11 +666,11 @@ components:
       description: Sent when a repository sync run fails, including failures after retries are exhausted and infrastructure failures. Internal cancellations do not produce this event. run_count includes the run that just finished.
       properties:
         completed_at:
-          description: When the sync run finished, as an RFC 3339 timestamp. Absent on started events.
+          description: When the sync run finished, as an RFC 3339 timestamp.
           format: date-time
           type: string
         error:
-          description: The failure message. Absent unless the sync failed.
+          description: The failure message.
           type: string
         is_first_sync:
           description: Whether the repository had never synced successfully before this run began.
@@ -703,18 +703,13 @@ components:
         - run_count
         - is_first_sync
         - started_at
+        - completed_at
+        - error
       type: object
     GitSyncStartedEvent:
       additionalProperties: false
       description: Sent when a repository sync run begins, before the upstream fetch starts. run_count counts previously completed runs.
       properties:
-        completed_at:
-          description: When the sync run finished, as an RFC 3339 timestamp. Absent on started events.
-          format: date-time
-          type: string
-        error:
-          description: The failure message. Absent unless the sync failed.
-          type: string
         is_first_sync:
           description: Whether the repository had never synced successfully before this run began.
           type: boolean
@@ -752,11 +747,8 @@ components:
       description: Sent when a repository sync run completes successfully. run_count includes the run that just finished.
       properties:
         completed_at:
-          description: When the sync run finished, as an RFC 3339 timestamp. Absent on started events.
+          description: When the sync run finished, as an RFC 3339 timestamp.
           format: date-time
-          type: string
-        error:
-          description: The failure message. Absent unless the sync failed.
           type: string
         is_first_sync:
           description: Whether the repository had never synced successfully before this run began.
@@ -789,6 +781,7 @@ components:
         - run_count
         - is_first_sync
         - started_at
+        - completed_at
       type: object
     GrepContext:
       additionalProperties: false
