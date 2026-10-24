@@ -6,8 +6,10 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -28,19 +30,55 @@ func TestDigestCopiesMatch(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Fatalf("repository root not found at %s: %v", root, err)
 	}
-	out, err := exec.Command("git", "-C", root, "ls-files", "-z").Output()
-	if err != nil {
-		t.Fatalf("git ls-files: %v", err)
+	pins := []struct {
+		pin      string
+		required []string
+	}{
+		{Postgres, []string{"docker-compose.yml"}},
+		{SeaweedFS, []string{"docker-compose.yml", "README.md", "CONTRIBUTING.md"}},
+	}
+	// A source tree without Git metadata (an archive) has no file list, so
+	// the test then reads only the files that must hold a copy.
+	var names []string
+	for _, tc := range pins {
+		for _, name := range tc.required {
+			if !slices.Contains(names, name) {
+				names = append(names, name)
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
+		out, err := exec.Command("git", "-C", root, "ls-files", "-z").Output()
+		if err != nil {
+			t.Fatalf("git ls-files: %v", err)
+		}
+		names = strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+		if !slices.Contains(names, "go.mod") {
+			t.Fatalf("git ls-files in %s did not list go.mod", root)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stat .git: %v", err)
 	}
 	// Only files that hold a digest reference in any case reach the
 	// regexps, which are slow on the whole tree.
 	type file struct{ name, text string }
 	var files []file
-	listed := false
-	for _, name := range strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00") {
-		listed = listed || name == "go.mod"
+	opened := map[string]bool{}
+	for _, name := range names {
 		if strings.HasPrefix(name, "vendor/") || strings.HasPrefix(name, "docs/plans/") || strings.HasPrefix(name, "docs/archive/") {
 			continue
+		}
+		// Go reuses a cached pass until a file or directory that the test
+		// opened changes. Opening each directory on the way to a scanned
+		// file makes a newly added file rerun the test.
+		for dir := path.Dir(name); !opened[dir]; dir = path.Dir(dir) {
+			opened[dir] = true
+			if d, err := os.Open(filepath.Join(root, filepath.FromSlash(dir))); err == nil {
+				_ = d.Close()
+			}
+			if dir == "." {
+				break
+			}
 		}
 		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
 		if errors.Is(err, fs.ErrNotExist) {
@@ -53,27 +91,19 @@ func TestDigestCopiesMatch(t *testing.T) {
 			files = append(files, file{name, string(b)})
 		}
 	}
-	if !listed {
-		t.Fatalf("git ls-files in %s did not list go.mod", root)
-	}
-	for _, tc := range []struct {
-		pin      string
-		required []string
-	}{
-		{Postgres, []string{"docker-compose.yml"}},
-		{SeaweedFS, []string{"docker-compose.yml", "README.md", "CONTRIBUTING.md"}},
-	} {
+	for _, tc := range pins {
 		if !pinShape.MatchString(tc.pin) {
 			t.Fatalf("pin %q is not repository:tag@sha256:<64 hex>", tc.pin)
 		}
 		repo, _, _ := strings.Cut(tc.pin, ":")
 		// Group 1 is an optional registry host (it has a dot or a port, or
-		// is localhost), plus "library/" for Docker Hub official images.
+		// is localhost, as in the reference grammar), plus "library/" for
+		// Docker Hub official images.
 		// The leading class stops "postgres" from matching inside another
 		// name. The digest takes any hex length and (?i) takes any letter
 		// case, so a cut-off or wrong-case copy is a mismatch instead of a
 		// miss.
-		prefix := `(?:(?:localhost|[\w-]+(?:\.[\w-]+)+)(?::\d+)?/)?`
+		prefix := `(?:(?:(?:localhost|[\w-]+(?:\.[\w-]+)+)(?::\d+)?|[\w-]+:\d+)/)?`
 		if !strings.Contains(repo, "/") {
 			prefix += `(?:library/)?`
 		}
