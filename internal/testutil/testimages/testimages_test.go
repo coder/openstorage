@@ -96,18 +96,19 @@ func TestDigestCopiesMatch(t *testing.T) {
 			t.Fatalf("pin %q is not repository:tag@sha256:<64 hex>", tc.pin)
 		}
 		repo, _, _ := strings.Cut(tc.pin, ":")
-		// Group 1 is an optional registry host (it has a dot or a port, or
-		// is localhost or a bracketed IPv6 address, as in the reference
-		// grammar), plus "library/" for Docker Hub official images.
+		// Group 1 is an optional registry host plus "library/" for Docker
+		// Hub official images. As in the reference grammar, a first path
+		// component is a host when it has a dot, a port or an uppercase
+		// letter, is localhost, or is a bracketed IPv6 address.
 		// The leading class stops "postgres" from matching inside another
-		// name. The tag is optional, the digest takes any hex length and
-		// (?i) takes any letter case, so a tag-less, cut-off or wrong-case
-		// copy is a mismatch instead of a miss.
-		prefix := `(?:(?:(?:localhost|\[[0-9a-f:]+\]|[\w-]+(?:\.[\w-]+)+)(?::\d+)?|[\w-]+:\d+)/)?`
+		// name or in another image's tag. The tag is optional, the digest
+		// takes any hex length and (?i) takes any letter case, so a
+		// tag-less, cut-off or wrong-case copy is a mismatch, not a miss.
+		prefix := `(?:(?:localhost|\[[0-9a-f:]+\](?::\d+)?|[\w-]+(?:\.[\w-]+)+(?::\d+)?|[\w-]+:\d+|(?-i:[\w-]*[A-Z][\w-]*))/)?`
 		if !strings.Contains(repo, "/") {
 			prefix += `(?:library/)?`
 		}
-		ref := regexp.MustCompile(`(?i)(?:^|[^\w./-])(` + prefix + `)(` + regexp.QuoteMeta(repo) + `(?::[\w.-]+)?@sha256:[0-9a-f]+)`)
+		ref := regexp.MustCompile(`(?i)(?:^|[^\w./:-])(` + prefix + `)(` + regexp.QuoteMeta(repo) + `(?::[\w.-]+)?@sha256:[0-9a-f]+)`)
 		found := map[string]bool{}
 		for _, f := range files {
 			name, text := f.name, f.text
