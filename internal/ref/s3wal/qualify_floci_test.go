@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -194,6 +195,7 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		readers    = 2
 		minReads   = 50 // below this a "pass" would be too weak to record
 		minWrites  = 50 // verified A↔B version transitions needed to have exercised the race at all
+		maxLogged  = 3  // read errors quoted in the verdict detail (issue #566)
 	)
 	opts := e.raw.Options()
 	opts.HTTPClient = awshttp.NewBuildableClient()
@@ -305,17 +307,30 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 			}
 		}
 	}()
+	// The first few read errors go into the verdict detail, so an
+	// inconclusive run shows whether a GET hit the op deadline, a reset
+	// connection, or a framing error (issue #566).
+	var errLogMu sync.Mutex
+	var errLog []string
+	raceStart := time.Now()
 	readersDone := make(chan struct{}, readers)
 	for range readers {
 		go func() {
 			defer func() { readersDone <- struct{}{} }()
 			for raceCtx.Err() == nil {
+				opStart := time.Now()
 				opCtx, cancel := context.WithTimeout(raceCtx, opTimeout)
 				body, etag, err := getWithETag(opCtx, client, e.bucket, key)
 				cancel()
 				if err != nil {
 					if raceCtx.Err() == nil {
 						readErrs.Add(1)
+						errLogMu.Lock()
+						if len(errLog) < maxLogged {
+							errLog = append(errLog, fmt.Sprintf("{at=+%s elapsed=%s opTimeout=%s err=%q}",
+								opStart.Sub(raceStart).Round(time.Millisecond), time.Since(opStart).Round(time.Millisecond), opTimeout, err.Error()))
+						}
+						errLogMu.Unlock()
 					}
 					continue
 				}
@@ -344,6 +359,11 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 
 	detail := fmt.Sprintf("reads=%d tornBody=%d tornMeta=%d readErrs=%d writeOKs=%d writeErrs=%d metaCheck=%t window=%s",
 		reads.Load(), tornBody.Load(), tornMeta.Load(), readErrs.Load(), writeOKs.Load(), writeErrs.Load(), metaCheck, raceWindow)
+	// Every reader has exited, so errLog is no longer written.
+	assertf(int64(len(errLog)) == min(readErrs.Load(), maxLogged), "logged %d read errors, counted %d", len(errLog), readErrs.Load())
+	if len(errLog) > 0 {
+		detail += fmt.Sprintf(" firstReadErrs(%d of %d)=%s", len(errLog), readErrs.Load(), strings.Join(errLog, " "))
+	}
 	switch {
 	case tornBody.Load() > 0:
 		return []verdict{{name, verdictMishandles, "torn body: a racing GET returned bytes of neither whole version — " + detail}}
@@ -375,7 +395,9 @@ func getWithETag(ctx context.Context, client *s3.Client, bucket, key string) (bo
 	defer func() { _ = out.Body.Close() }()
 	b, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, "", err
+		// A short body that stalls until the deadline is the framing
+		// shape; a stall before the headers is not (issue #566).
+		return nil, "", fmt.Errorf("read body after headers (%d of Content-Length %d bytes): %w", len(b), aws.ToInt64(out.ContentLength), err)
 	}
 	return b, aws.ToString(out.ETag), nil
 }
