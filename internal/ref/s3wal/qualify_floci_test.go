@@ -374,7 +374,13 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		// classifiable torn body (a short-for-Content-Length response
 		// blocks until the op deadline; a poisoned keep-alive breaks the
 		// next request). Without a classified tear those failures make the
-		// probe inconclusive — never a clean pass.
+		// probe inconclusive — never a clean pass. Reading firstReadErrs
+		// (issue #566): "read body after headers (n of Content-Length m)"
+		// with n < m is the framing shape, and a non-zero StatusCode is
+		// a Floci error reply. A 2.5 s pause of the Floci container gave a
+		// deadline error with elapsed≈opTimeout on both readers plus a
+		// writeErr. A 2.5 s SIGSTOP of the test process gave elapsed above
+		// opTimeout, or no error at all.
 		return []verdict{{name, verdictError, "racing GETs failed without a classifiable torn read — inconclusive (possible framing corruption) — " + detail}}
 	case reads.Load() < minReads || writeOKs.Load() < minWrites:
 		return []verdict{{name, verdictError, "too few successful reads/overwrites to have exercised the race — " + detail}}
