@@ -281,7 +281,8 @@ func expectedProblemCodes(t *testing.T, status int, msg string) []string {
 	case status == http.StatusConflict && msg == "repository already deleted":
 		code = "repository_deleted"
 	case status == http.StatusConflict && (strings.HasPrefix(msg, "source branch moved: ") ||
-		strings.HasPrefix(msg, "expected_target_sha ") && strings.Contains(msg, " does not match current tip ")):
+		strings.HasPrefix(msg, "expected_target_sha ") && strings.Contains(msg, " does not match current tip ") ||
+		strings.HasPrefix(msg, "expected_notes_ref_sha ") && strings.Contains(msg, " does not match ")):
 		code = "ref_guard_failed"
 	}
 	if code != "" {
@@ -339,10 +340,22 @@ var problemMembers = []string{"code", "detail", "error", "instance", "invalid_pa
 // no other body may (TestProblemMembersMatchUpstream pins them).
 var refGuardMembers = []string{"current_sha", "guard"}
 
+// notesGuardMembers are the note-write members that
+// NotesWriteRefGuardProblemDetails keeps next to the problem members
+// (TestProblemMembersMatchUpstream pins them).
+var notesGuardMembers = []string{"base_commit", "new_ref_sha", "notes_ref", "result", "sha", "target_ref"}
+
 // upstreamRefGuardSchema returns the properties of RefGuardProblemDetails'
-// own allOf item and the `guard` enum, by indentation: the schema at 4
-// spaces, "- properties:" at 8, each property at 12, enum items at 16.
+// own allOf item and the `guard` enum.
 func upstreamRefGuardSchema(t *testing.T) (props, guards []string) {
+	t.Helper()
+	return upstreamAllOfProperties(t, "RefGuardProblemDetails")
+}
+
+// upstreamAllOfProperties returns the properties of a schema's own allOf
+// item and any `guard` enum, by indentation: the schema at 4 spaces,
+// "- properties:" at 8, each property at 12, enum items at 16.
+func upstreamAllOfProperties(t *testing.T, schema string) (props, guards []string) {
 	t.Helper()
 	raw, err := os.ReadFile(upstreamSpecPath)
 	if err != nil {
@@ -353,7 +366,7 @@ func upstreamRefGuardSchema(t *testing.T) (props, guards []string) {
 		indent := len(l) - len(strings.TrimLeft(l, " "))
 		trimmed := strings.TrimSpace(l)
 		switch {
-		case indent == 4 && trimmed == "RefGuardProblemDetails:":
+		case indent == 4 && trimmed == schema+":":
 			inSchema = true
 		case inSchema && indent <= 4 && trimmed != "":
 			inSchema, inProps = false, false
@@ -368,8 +381,8 @@ func upstreamRefGuardSchema(t *testing.T) (props, guards []string) {
 			guards = append(guards, strings.TrimPrefix(trimmed, "- "))
 		}
 	}
-	if len(props) == 0 || len(guards) == 0 {
-		t.Fatalf("RefGuardProblemDetails has properties %v and guards %v in %s", props, guards, upstreamSpecPath)
+	if len(props) == 0 || (schema == "RefGuardProblemDetails") != (len(guards) > 0) {
+		t.Fatalf("%s has properties %v and guards %v in %s", schema, props, guards, upstreamSpecPath)
 	}
 	slices.Sort(props)
 	return props, guards
@@ -424,6 +437,9 @@ func TestProblemMembersMatchUpstream(t *testing.T) {
 	}
 	if want := []string{"expected_target_sha", "expected_source_sha", "expected_notes_ref_sha"}; !slices.Equal(guards, want) {
 		t.Fatalf("RefGuardProblemDetails guard enum = %v, want %v", guards, want)
+	}
+	if got, _ := upstreamAllOfProperties(t, "NotesWriteRefGuardProblemDetails"); !slices.Equal(got, notesGuardMembers) {
+		t.Fatalf("NotesWriteRefGuardProblemDetails properties = %v, want %v", got, notesGuardMembers)
 	}
 	raw, err := os.ReadFile(upstreamSpecPath)
 	if err != nil {
@@ -638,6 +654,37 @@ func assertProblemFields(t *testing.T, status int, body []byte) string {
 		}
 	}
 	return p.Error
+}
+
+// assertNotesRefGuard checks a stale expected_notes_ref_sha on a notes
+// route with upstream's 409 (#568): a NotesWriteRefGuardProblemDetails
+// body, that is the note-write members with a failed result plus the
+// problem members, which the oracle checks once the note members are
+// removed.
+func assertNotesRefGuard(t *testing.T, status int, body map[string]any, sha, notesRef, currentSHA string) {
+	t.Helper()
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body %v)", status, body)
+	}
+	res, _ := body["result"].(map[string]any)
+	if body["sha"] != sha || body["notes_ref"] != notesRef || body["target_ref"] != notesRef || body["new_ref_sha"] != currentSHA ||
+		res["success"] != false || res["status"] != "conflict" || res["message"] != body["detail"] {
+		t.Fatalf("note members = %v, want sha %s, notes_ref %s, new_ref_sha %s and a failed conflict result", body, sha, notesRef, currentSHA)
+	}
+	if body["guard"] != "expected_notes_ref_sha" || body["current_sha"] != currentSHA {
+		t.Fatalf("guard members = %v, want expected_notes_ref_sha and current_sha %s", body, currentSHA)
+	}
+	problem := map[string]any{}
+	for k, v := range body {
+		if !slices.Contains(notesGuardMembers, k) {
+			problem[k] = v
+		}
+	}
+	raw, err := json.Marshal(problem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProblemFields(t, status, raw)
 }
 
 // TestWriteErrProblemFields: writeErr adds the problem fields for every
