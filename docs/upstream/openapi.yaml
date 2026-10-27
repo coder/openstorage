@@ -287,6 +287,18 @@ components:
         - committer_email
         - date
       type: object
+    CommitWriteRefGuardProblemDetails:
+      allOf:
+        - $ref: "#/components/schemas/RefGuardProblemDetails"
+        - properties:
+            result:
+              $ref: "#/components/schemas/RefUpdateResult"
+              description: Final branch update outcome.
+          required:
+            - result
+          type: object
+      description: Problem details of a commit write whose `expected_target_sha` guard failed. The body keeps `result`, and `commit` is null.
+      type: object
     CommitWriteResponse:
       additionalProperties: false
       description: Result of applying an NDJSON commit pack, including the resulting commit and branch update.
@@ -1121,6 +1133,48 @@ components:
         - ref
         - sha
       type: object
+    NotesWriteRefGuardProblemDetails:
+      allOf:
+        - $ref: "#/components/schemas/RefGuardProblemDetails"
+        - properties:
+            base_commit:
+              description: Previous notes ref commit SHA.
+              examples:
+                - 0c8b5bb9d550d58fcfd651a4fdce8024ef7f1492
+              type: string
+            new_ref_sha:
+              description: New notes ref SHA after the operation.
+              examples:
+                - 3a1d9f7d6b6d482c970554e2a6ef980ecf4f1d55
+              type: string
+            notes_ref:
+              description: The notes ref the operation updates.
+              examples:
+                - refs/notes/commits
+              type: string
+            result:
+              $ref: "#/components/schemas/NotesWriteResult"
+              description: Operation result with success, status, and optional message.
+            sha:
+              description: The commit SHA the note is attached to.
+              examples:
+                - b003fc78805954584e1ee364a4ad39d7c79e819a
+              type: string
+            target_ref:
+              deprecated: true
+              description: "Deprecated: use notes_ref. The notes ref the operation updates."
+              examples:
+                - refs/notes/commits
+              type: string
+          required:
+            - sha
+            - notes_ref
+            - target_ref
+            - new_ref_sha
+            - result
+          type: object
+      description: Problem details of a notes write whose `expected_notes_ref_sha` guard failed. The body keeps the members of the notes write body.
+      type: object
     NotesWriteResponse:
       additionalProperties: false
       description: Result of a notes write operation, including the resulting notes ref state.
@@ -1284,6 +1338,28 @@ components:
         - title
         - status
         - code
+      type: object
+    RefGuardProblemDetails:
+      allOf:
+        - $ref: "#/components/schemas/ProblemDetails"
+        - properties:
+            current_sha:
+              description: The commit of the guarded ref when the server checked the guard, or 40 zeros when the ref does not exist. Send it as the guard of the next attempt. A commit write to a new branch with `base_branch` compares the guard with the tip of `base_branch`, so `current_sha` is that tip.
+              examples:
+                - c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+              type: string
+            guard:
+              description: The request field of the guard that failed. A request that sends a deprecated alias of the field gets the standard name.
+              enum:
+                - expected_target_sha
+                - expected_source_sha
+                - expected_notes_ref_sha
+              type: string
+          required:
+            - guard
+            - current_sha
+          type: object
+      description: Problem details of a failed ref guard, with the code `ref_guard_failed`. `guard` names the request field of the guard, and `current_sha` is the commit of the guarded ref.
       type: object
     RefUpdateResult:
       additionalProperties: false
@@ -1804,7 +1880,7 @@ components:
             $ref: "#/components/schemas/FilteredFile"
           type: array
         merge_base_sha:
-          description: Merge base SHA used for explicit baseSha three-dot comparisons. Empty for single-commit diffs.
+          description: "The merge base of base_ref and ref: the commit where the diff starts. Empty for a single-commit diff."
           examples:
             - a2d127e6a4d54bb7390de828a99e36411f0c84df
           type: string
@@ -2709,6 +2785,18 @@ components:
         - default_branch
         - created_at
       type: object
+    RestoreCommitRefGuardProblemDetails:
+      allOf:
+        - $ref: "#/components/schemas/RefGuardProblemDetails"
+        - properties:
+            result:
+              $ref: "#/components/schemas/RefUpdateResult"
+              description: Branch update result.
+          required:
+            - result
+          type: object
+      description: Problem details of a restore whose `expected_target_sha` guard failed. The body keeps `result`, and `commit` is null.
+      type: object
     RestoredCommit:
       additionalProperties: false
       description: Commit object generated by a restore-commit operation.
@@ -2954,6 +3042,7 @@ info:
     - `branch_not_found` (404): the branch does not exist.
     - `ref_not_found` (404): the ref or revision does not exist.
     - `merge_conflict` (409): the merge has file conflicts.
+    - `ref_guard_failed` (409): a ref guard such as `expected_target_sha` does not match the ref; `guard` names it and `current_sha` is the commit of the ref.
     - `credential_not_found` (404): the Git credential does not exist.
     - `credential_exists` (409): the repository already has a Git credential.
     - `github_app_not_configured` (412): the organization does not have exactly one GitHub App.
@@ -5324,7 +5413,28 @@ paths:
                   target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: The branch moved or the requested update could not be applied cleanly.
+            application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                code: ref_guard_failed
+                error: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                guard: expected_target_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                commit: null
+                result:
+                  target_branch: main
+                  branch: main
+                  old_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                  new_sha: ""
+                  success: false
+                  status: conflict
+                  message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+              schema:
+                $ref: "#/components/schemas/CommitWriteRefGuardProblemDetails"
+          description: "The branch moved or the requested update could not be applied cleanly. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "413":
           content:
             application/json:
@@ -5589,7 +5699,7 @@ paths:
           name: sha
           schema:
             type: string
-        - description: Optional base branch, tag, or commit to diff against. When omitted, the diff is generated against the commit's parent. Provide `base_ref` or the deprecated `baseSha`.
+        - description: Optional base branch, tag, or commit to diff against. When omitted, the diff is generated against the commit's parent. When set, the diff starts at the merge base of `base_ref` and `ref`, as `git diff base_ref...ref` does, and `merge_base_sha` gives that commit. So the diff holds only the changes on `ref` after the two histories split. When `ref` is an ancestor of `base_ref`, the merge base is `ref`, and the diff is empty. Provide `base_ref` or the deprecated `baseSha`.
           example: a4d39d7c79e819ab003fc78805954584e1ee36
           in: query
           name: base_ref
@@ -5865,7 +5975,28 @@ paths:
                   target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: The diff could not be applied cleanly or the target branch tip changed.
+            application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                code: ref_guard_failed
+                error: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                guard: expected_target_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                commit: null
+                result:
+                  target_branch: main
+                  branch: main
+                  old_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                  new_sha: ""
+                  success: false
+                  status: conflict
+                  message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+              schema:
+                $ref: "#/components/schemas/CommitWriteRefGuardProblemDetails"
+          description: "The diff could not be applied cleanly or the target branch tip changed. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "429":
           content:
             application/json:
@@ -6505,12 +6636,11 @@ paths:
           name: cursor
           schema:
             type: string
-        - description: Maximum number of paths to return. Defaults to 1000.
+        - description: Maximum number of paths to return. A call with no `limit` and no `cursor` returns every path in one response, with `has_more` false. A `limit` of 0 is the same as no `limit`. A call with a `cursor` and no `limit` returns up to 1000 paths.
           example: 1000
           in: query
           name: limit
           schema:
-            default: 1000
             maximum: 5000
             minimum: 0
             type: integer
@@ -6638,6 +6768,8 @@ paths:
       description: |-
         Return a recursive file tree together with per-file commit metadata in one request. Each file also includes a derived `type` field for symmetry with `/files`.
 
+        The server reads the last commit of each file under `path`, also when the call sends a `limit` or a `cursor`. When those files have more than 50,000 distinct last commits, the call fails with a 429 response, and a retry gets the same response. To list such a tree, send a narrower `path`.
+
         Scope: `git:read` on the repository.
       operationId: repos-files-metadata-list
       parameters:
@@ -6672,12 +6804,11 @@ paths:
           name: cursor
           schema:
             type: string
-        - description: Maximum number of files to return. Defaults to 200.
+        - description: Maximum number of files to return. A call with no `limit` and no `cursor` returns every file in one response, with `has_more` false. A `limit` of 0 is the same as no `limit`. A call with a `cursor` and no `limit` returns up to 200 files.
           example: 200
           in: query
           name: limit
           schema:
-            default: 200
             maximum: 1000
             minimum: 0
             type: integer
@@ -7450,11 +7581,13 @@ paths:
                 title: Conflict
                 status: 409
                 detail: "source branch moved: the source branch does not contain commit 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1"
-                code: conflict
+                code: ref_guard_failed
                 error: "source branch moved: the source branch does not contain commit 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1"
+                guard: expected_source_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
-          description: "The merge could not be completed. An `application/json` body reports file-level conflicts, or an automatic stale-target retry that could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed. A problem body reports any other conflict. A failed guard has the code `conflict`: the target no longer matches `expected_target_sha`, or the source branch no longer contains `expected_source_sha`."
+          description: "The merge could not be completed. An `application/json` body reports file-level conflicts, or an automatic stale-target retry that could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed. A problem body reports any other conflict. A failed guard has the code `ref_guard_failed`: the target no longer matches `expected_target_sha`, or the source branch no longer contains `expected_source_sha`. Its body is a `RefGuardProblemDetails`: `guard` names the guard, and `current_sha` is the tip of the guarded branch, or 40 zeros when the source branch does not exist."
         "429":
           content:
             application/json:
@@ -7780,9 +7913,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                code: ref_guard_failed
+                error: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                guard: expected_notes_ref_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                sha: b003fc78805954584e1ee364a4ad39d7c79e819a
+                notes_ref: refs/notes/commits
+                target_ref: refs/notes/commits
+                new_ref_sha: ""
+                result:
+                  success: false
+                  status: conflict
+                  message: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/NotesWriteRefGuardProblemDetails"
+          description: "Conflict. When `expected_notes_ref_sha` is not the SHA of the notes ref, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the SHA of the notes ref, or 40 zeros when the notes ref does not exist. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "429":
           content:
             application/json:
@@ -8074,9 +8224,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                code: ref_guard_failed
+                error: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                guard: expected_notes_ref_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                sha: b003fc78805954584e1ee364a4ad39d7c79e819a
+                notes_ref: refs/notes/commits
+                target_ref: refs/notes/commits
+                new_ref_sha: ""
+                result:
+                  success: false
+                  status: conflict
+                  message: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/NotesWriteRefGuardProblemDetails"
+          description: "Conflict. When `expected_notes_ref_sha` is not the SHA of the notes ref, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the SHA of the notes ref, or 40 zeros when the notes ref does not exist. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "429":
           content:
             application/json:
@@ -8229,9 +8396,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                code: ref_guard_failed
+                error: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                guard: expected_notes_ref_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                sha: b003fc78805954584e1ee364a4ad39d7c79e819a
+                notes_ref: refs/notes/commits
+                target_ref: refs/notes/commits
+                new_ref_sha: ""
+                result:
+                  success: false
+                  status: conflict
+                  message: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/NotesWriteRefGuardProblemDetails"
+          description: "Conflict. When `expected_notes_ref_sha` is not the SHA of the notes ref, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the SHA of the notes ref, or 40 zeros when the notes ref does not exist. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "429":
           content:
             application/json:
@@ -8653,9 +8837,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                code: ref_guard_failed
+                error: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                guard: expected_target_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                commit: null
+                result:
+                  target_branch: main
+                  branch: main
+                  old_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                  new_sha: ""
+                  success: false
+                  status: conflict
+                  message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/RestoreCommitRefGuardProblemDetails"
+          description: "Conflict. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "412":
           content:
             application/json:
@@ -8810,9 +9012,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                code: ref_guard_failed
+                error: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                guard: expected_target_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                commit: null
+                result:
+                  target_branch: main
+                  branch: main
+                  old_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                  new_sha: ""
+                  success: false
+                  status: conflict
+                  message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/RestoreCommitRefGuardProblemDetails"
+          description: "Conflict. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "412":
           content:
             application/json:
@@ -11603,7 +11823,28 @@ paths:
                   target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: The branch moved or the requested update could not be applied cleanly.
+            application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                code: ref_guard_failed
+                error: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                guard: expected_target_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                commit: null
+                result:
+                  target_branch: main
+                  branch: main
+                  old_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                  new_sha: ""
+                  success: false
+                  status: conflict
+                  message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+              schema:
+                $ref: "#/components/schemas/CommitWriteRefGuardProblemDetails"
+          description: "The branch moved or the requested update could not be applied cleanly. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "413":
           content:
             application/json:
@@ -11996,7 +12237,7 @@ paths:
           name: sha
           schema:
             type: string
-        - description: Optional base branch, tag, or commit to diff against. When omitted, the diff is generated against the commit's parent. Provide `base_ref` or the deprecated `baseSha`.
+        - description: Optional base branch, tag, or commit to diff against. When omitted, the diff is generated against the commit's parent. When set, the diff starts at the merge base of `base_ref` and `ref`, as `git diff base_ref...ref` does, and `merge_base_sha` gives that commit. So the diff holds only the changes on `ref` after the two histories split. When `ref` is an ancestor of `base_ref`, the merge base is `ref`, and the diff is empty. Provide `base_ref` or the deprecated `baseSha`.
           example: a4d39d7c79e819ab003fc78805954584e1ee36
           in: query
           name: base_ref
@@ -12268,7 +12509,28 @@ paths:
                   target_branch: main
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: The diff could not be applied cleanly or the target branch tip changed.
+            application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                code: ref_guard_failed
+                error: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                guard: expected_target_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                commit: null
+                result:
+                  target_branch: main
+                  branch: main
+                  old_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                  new_sha: ""
+                  success: false
+                  status: conflict
+                  message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+              schema:
+                $ref: "#/components/schemas/CommitWriteRefGuardProblemDetails"
+          description: "The diff could not be applied cleanly or the target branch tip changed. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "429":
           content:
             application/json:
@@ -12899,12 +13161,11 @@ paths:
           name: cursor
           schema:
             type: string
-        - description: Maximum number of paths to return. Defaults to 1000.
+        - description: Maximum number of paths to return. A call with no `limit` and no `cursor` returns every path in one response, with `has_more` false. A `limit` of 0 is the same as no `limit`. A call with a `cursor` and no `limit` returns up to 1000 paths.
           example: 1000
           in: query
           name: limit
           schema:
-            default: 1000
             maximum: 5000
             minimum: 0
             type: integer
@@ -13034,6 +13295,8 @@ paths:
       description: |-
         Return a recursive file tree together with per-file commit metadata in one request. Each file also includes a derived `type` field for symmetry with `/files`.
 
+        The server reads the last commit of each file under `path`, also when the call sends a `limit` or a `cursor`. When those files have more than 50,000 distinct last commits, the call fails with a 429 response, and a retry gets the same response. To list such a tree, send a narrower `path`.
+
         Scope: `git:read` on the repository.
 
         Deprecated: Use `/api/repos/{repo_name}/files/metadata` instead.
@@ -13063,12 +13326,11 @@ paths:
           name: cursor
           schema:
             type: string
-        - description: Maximum number of files to return. Defaults to 200.
+        - description: Maximum number of files to return. A call with no `limit` and no `cursor` returns every file in one response, with `has_more` false. A `limit` of 0 is the same as no `limit`. A call with a `cursor` and no `limit` returns up to 200 files.
           example: 200
           in: query
           name: limit
           schema:
-            default: 200
             maximum: 1000
             minimum: 0
             type: integer
@@ -13820,11 +14082,13 @@ paths:
                 title: Conflict
                 status: 409
                 detail: "source branch moved: the source branch does not contain commit 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1"
-                code: conflict
+                code: ref_guard_failed
                 error: "source branch moved: the source branch does not contain commit 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1"
+                guard: expected_source_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
-          description: "The merge could not be completed. An `application/json` body reports file-level conflicts, or an automatic stale-target retry that could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed. A problem body reports any other conflict. A failed guard has the code `conflict`: the target no longer matches `expected_target_sha`, or the source branch no longer contains `expected_source_sha`."
+          description: "The merge could not be completed. An `application/json` body reports file-level conflicts, or an automatic stale-target retry that could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed. A problem body reports any other conflict. A failed guard has the code `ref_guard_failed`: the target no longer matches `expected_target_sha`, or the source branch no longer contains `expected_source_sha`. Its body is a `RefGuardProblemDetails`: `guard` names the guard, and `current_sha` is the tip of the guarded branch, or 40 zeros when the source branch does not exist."
         "429":
           content:
             application/json:
@@ -14153,9 +14417,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                code: ref_guard_failed
+                error: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                guard: expected_notes_ref_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                sha: b003fc78805954584e1ee364a4ad39d7c79e819a
+                notes_ref: refs/notes/commits
+                target_ref: refs/notes/commits
+                new_ref_sha: ""
+                result:
+                  success: false
+                  status: conflict
+                  message: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/NotesWriteRefGuardProblemDetails"
+          description: "Conflict. When `expected_notes_ref_sha` is not the SHA of the notes ref, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the SHA of the notes ref, or 40 zeros when the notes ref does not exist. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "429":
           content:
             application/json:
@@ -14443,9 +14724,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                code: ref_guard_failed
+                error: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
+                guard: expected_notes_ref_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                sha: b003fc78805954584e1ee364a4ad39d7c79e819a
+                notes_ref: refs/notes/commits
+                target_ref: refs/notes/commits
+                new_ref_sha: ""
+                result:
+                  success: false
+                  status: conflict
+                  message: "notes ref mismatch: got c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2, expected d34db33fd34db33fd34db33fd34db33fd34db33f"
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/NotesWriteRefGuardProblemDetails"
+          description: "Conflict. When `expected_notes_ref_sha` is not the SHA of the notes ref, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the SHA of the notes ref, or 40 zeros when the notes ref does not exist. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "429":
           content:
             application/json:
@@ -14852,9 +15150,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                code: ref_guard_failed
+                error: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                guard: expected_target_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                commit: null
+                result:
+                  target_branch: main
+                  branch: main
+                  old_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                  new_sha: ""
+                  success: false
+                  status: conflict
+                  message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/RestoreCommitRefGuardProblemDetails"
+          description: "Conflict. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "412":
           content:
             application/json:
@@ -15005,9 +15321,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
             application/problem+json:
+              example:
+                type: about:blank
+                title: Conflict
+                status: 409
+                detail: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                code: ref_guard_failed
+                error: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                guard: expected_target_sha
+                current_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                commit: null
+                result:
+                  target_branch: main
+                  branch: main
+                  old_sha: c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
+                  new_sha: ""
+                  success: false
+                  status: conflict
+                  message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
-                $ref: "#/components/schemas/ProblemDetails"
-          description: Conflict
+                $ref: "#/components/schemas/RestoreCommitRefGuardProblemDetails"
+          description: "Conflict. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
         "412":
           content:
             application/json:

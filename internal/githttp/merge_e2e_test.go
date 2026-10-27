@@ -13,8 +13,8 @@ import (
 // TestMerge_ExpectedSourceSHA drives the merge source pin (#531) through a
 // real serve node on every lane (pg, local, s3wal): the merge uses the
 // pinned commit although the source branch has moved past it, and a pin
-// that the source branch does not contain is a 409 with code conflict that
-// leaves the target unchanged.
+// that the source branch does not contain is a 409 with code
+// ref_guard_failed (#568) that leaves the target unchanged.
 func TestMerge_ExpectedSourceSHA(t *testing.T) {
 	repoURL := fmt.Sprintf("t531-merge-pin-%d", time.Now().UnixNano())
 	repoID := registerRepo(t, repoURL)
@@ -68,8 +68,9 @@ func TestMerge_ExpectedSourceSHA(t *testing.T) {
 	}
 
 	status, body := merge(side)
-	if status != http.StatusConflict || body["code"] != "conflict" {
-		t.Fatalf("pin on another branch: %d %v, want 409 code conflict", status, body)
+	if status != http.StatusConflict || body["code"] != "ref_guard_failed" ||
+		body["guard"] != "expected_source_sha" || body["current_sha"] != tipOf("feature") {
+		t.Fatalf("pin on another branch: %d %v, want 409 ref_guard_failed with the feature tip", status, body)
 	}
 	if got := tipOf("target"); got != base {
 		t.Fatalf("target moved to %s after a refused merge, want %s", got, base)

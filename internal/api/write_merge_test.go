@@ -92,6 +92,27 @@ func wmDecode(t *testing.T, body []byte) map[string]any {
 	return decoded
 }
 
+// wmRequireRefGuard asserts a failed merge guard (#568): 409 with a
+// RefGuardProblemDetails body (code ref_guard_failed, the oracle in
+// assertProblemFields), the exact guard, current_sha and detail, and no
+// result envelope.
+func wmRequireRefGuard(t *testing.T, resp *http.Response, raw []byte, guard, currentSHA, detail string) {
+	t.Helper()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body %s)", resp.StatusCode, raw)
+	}
+	if msg := requireEnvelope(t, resp, raw); msg != detail {
+		t.Fatalf("error = %q, want %q", msg, detail)
+	}
+	body := wmDecode(t, raw)
+	if body["code"] != "ref_guard_failed" || body["guard"] != guard || body["current_sha"] != currentSHA {
+		t.Fatalf("body = %s, want code ref_guard_failed, guard %s, current_sha %s", raw, guard, currentSHA)
+	}
+	if _, has := body["result"]; has {
+		t.Fatalf("failed guard carries a result envelope: %s", raw)
+	}
+}
+
 // wmResult extracts the failure envelope's result object.
 func wmResult(t *testing.T, body map[string]any) map[string]any {
 	t.Helper()
@@ -556,24 +577,15 @@ func TestMergeConflictsAndGuards(t *testing.T) {
 			}
 		})
 
-		t.Run("stale expected_target_sha is 409 conflict and leaves state", func(t *testing.T) {
-			// #532: upstream's merge contract answers a failed guard with a
-			// problem body, code conflict, not ADR-22's 412.
+		t.Run("stale expected_target_sha is 409 ref_guard_failed and leaves state", func(t *testing.T) {
+			// #532, #568: upstream's merge contract answers a failed guard
+			// with a RefGuardProblemDetails body, not ADR-22's 412.
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("feature", "main", "merge", map[string]any{
 					"author": wmTestAuthor, "expected_target_sha": fx.c1, // stale
 				}))
-			if resp.StatusCode != http.StatusConflict {
-				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
-			}
-			body := wmDecode(t, raw)
-			want := "expected_target_sha " + fx.c1 + " does not match current tip " + fx.c2
-			if body["code"] != "conflict" || body["status"] != float64(http.StatusConflict) || body["detail"] != want || body["error"] != want {
-				t.Fatalf("body = %v, want problem code conflict and %q", body, want)
-			}
-			if _, has := body["result"]; has {
-				t.Fatalf("stale guard carries a result envelope: %v", body)
-			}
+			wmRequireRefGuard(t, resp, raw, "expected_target_sha", fx.c2,
+				"expected_target_sha "+fx.c1+" does not match current tip "+fx.c2)
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/main"]; got != fx.c2 {
 				t.Fatalf("main moved to %q after a stale guard", got)
 			}

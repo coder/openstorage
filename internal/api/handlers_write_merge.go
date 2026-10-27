@@ -512,7 +512,7 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 
 // handleMerge implements POST /repos/merge (docs/reference/http-api.md): resolve both branch
 // tips from the ref authority, guard on expected_target_sha and
-// expected_source_sha (409 problem bodies), decide
+// expected_source_sha (409 ref_guard_failed problem bodies), decide
 // the outcome (no_op / fast_forward / merge_commit / squash), run
 // merge-tree in the scratch odb, enforce ref policies, and publish under
 // CAS.
@@ -548,8 +548,11 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	}
 	sourceRef := wcRefName(req.SourceBranch, req.SourceIsEphemeral)
 	targetRef := wcRefName(req.TargetBranch, req.TargetIsEphemeral)
-	sourceSHA, ok := tips[sourceRef]
-	if !ok {
+	// With expected_source_sha, a missing source branch fails the source
+	// guard below (upstream: current_sha is 40 zeros), after the target
+	// checks.
+	sourceSHA, sourceExists := tips[sourceRef]
+	if !sourceExists && req.sourcePin == "" {
 		wmFail(w, http.StatusNotFound, "not_found", "source branch "+req.SourceBranch+" not found", req.TargetBranch, "")
 		return
 	}
@@ -558,11 +561,17 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		wmFail(w, http.StatusNotFound, "not_found", "target branch "+req.TargetBranch+" not found", req.TargetBranch, "")
 		return
 	}
-	// A stale guard is a 409 problem body (code conflict) before any merge
-	// work happens (ADR-22 as amended by #532: upstream's merge contract).
+	// A stale guard is a 409 ref_guard_failed problem body before any
+	// merge work happens (ADR-22 as amended by #532 and #568: upstream's
+	// merge contract).
 	if req.ExpectedTargetSHA != "" && strings.ToLower(req.ExpectedTargetSHA) != targetSHA {
-		writeErr(w, http.StatusConflict,
+		writeRefGuardFailed(w, "expected_target_sha", targetSHA,
 			fmt.Sprintf("expected_target_sha %s does not match current tip %s", req.ExpectedTargetSHA, targetSHA))
+		return
+	}
+	sourceMovedMsg := "source branch moved: the source branch does not contain commit " + req.sourcePin
+	if !sourceExists {
+		writeRefGuardFailed(w, "expected_source_sha", ref.ZeroSHA, sourceMovedMsg)
 		return
 	}
 
@@ -592,7 +601,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !contained {
-			writeErr(w, http.StatusConflict, "source branch moved: the source branch does not contain commit "+req.sourcePin)
+			writeRefGuardFailed(w, "expected_source_sha", sourceSHA, sourceMovedMsg)
 			return
 		}
 		sourceSHA = req.sourcePin
