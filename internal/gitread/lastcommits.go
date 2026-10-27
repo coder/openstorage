@@ -19,9 +19,10 @@ import (
 var ErrTooManyLastCommits = errors.New("too many distinct last commits")
 
 // LastCommits returns, for every path in paths (entries of rev's tree), the
-// commit that `git log -1 rev -- <path>` names, with literal pathspecs. It
-// fails with ErrTooManyLastCommits as soon as more than maxDistinct
-// distinct commits are found.
+// commit that `git log -1 rev -- <path>` names, with literal pathspecs. One
+// difference: a submodule's `ignore` setting in .gitmodules never hides a
+// gitlink change. It fails with ErrTooManyLastCommits as soon as more than
+// maxDistinct distinct commits are found.
 //
 // One walk replaces a `git log -1` per path. `rev-list --topo-order
 // --parents rev` is spooled to a temporary file. Then `diff-tree --stdin`
@@ -80,7 +81,7 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 		fed <- feedPairs(stdinW, spool)
 		_ = stdinW.Close()
 	}()
-	args := []string{"diff-tree", "--stdin", "--root", "--always", "-r", "--raw", "-z", "--no-renames"}
+	args := []string{"diff-tree", "--stdin", "--root", "--always", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none"}
 	if spec := commonPathspec(paths); spec != "" {
 		args = append(args, "--", ":(literal)"+spec)
 	}

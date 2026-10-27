@@ -8,8 +8,10 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitread"
 )
 
 // filesFastImportRepo creates a repo in e from a git fast-import stream
@@ -110,8 +112,8 @@ func TestFilesListingsWithoutLimitReturnEveryEntry(t *testing.T) {
 				for _, q := range []string{"", "&limit=0"} {
 					l := getFilesListing(t, e, tc.path+"&cursor="+first.cursor+q, token)
 					if len(l.paths) != tc.pageSize || !l.hasMore || l.paths[0] == first.paths[0] {
-						t.Fatalf("cursor%s without limit: %d entries from %q, has_more %v; want the %d-entry page after %q",
-							q, len(l.paths), l.paths[0], l.hasMore, tc.pageSize, first.paths[0])
+						t.Fatalf("cursor%s without limit: %d entries %.80v, has_more %v; want the %d-entry page after %q",
+							q, len(l.paths), l.paths, l.hasMore, tc.pageSize, first.paths[0])
 					}
 				}
 			})
@@ -156,6 +158,9 @@ func TestFilesMetadataOverDistinctLastCommitsAnswers429(t *testing.T) {
 	}
 
 	runBackends(t, func(t *testing.T, e *testEnv) {
+		// The 50,000-file listing below is slow under -race; this test is
+		// about the limit, not the default 30 s git time budget.
+		withGitReadPolicy(t, testGitReadPolicy(2, 2*time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
 		token, dir := filesFastImportRepo(t, e, in.String())
 		parent := coreRevParse(t, dir, "main^")
 
@@ -167,8 +172,10 @@ func TestFilesMetadataOverDistinctLastCommitsAnswers429(t *testing.T) {
 			if problem.Code != "rate_limited" || !strings.Contains(problem.Detail, "50,000 distinct last commits") {
 				t.Fatalf("files/metadata%s problem = %+v", q, problem)
 			}
-			if h := resp.Header.Get("Retry-After"); h != "" {
-				t.Fatalf("files/metadata%s Retry-After = %q, want none: a retry gets the same 429", q, h)
+			for _, h := range []string{"Retry-After", "RateLimit"} {
+				if v := resp.Header.Get(h); v != "" {
+					t.Fatalf("files/metadata%s %s = %q, want none: a retry gets the same 429", q, h, v)
+				}
 			}
 		}
 

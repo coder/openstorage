@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // lcFile is one tree entry of a generated commit.
@@ -182,7 +184,7 @@ func TestLastCommitsMatchesGitLog(t *testing.T) {
 	}
 	// Every subtree was checked at least once.
 	if len(subtrees) != 4 {
-		t.Fatalf("checked subtrees %v, want all three", subtrees)
+		t.Fatalf("checked subtrees %v, want all four", subtrees)
 	}
 }
 
@@ -275,7 +277,7 @@ func TestLastCommitWalkFieldsSplitAcrossWrites(t *testing.T) {
 	if err := feedPairs(&pairs, strings.NewReader(revList)); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("git", "diff-tree", "--stdin", "--root", "--always", "-r", "--raw", "-z", "--no-renames")
+	cmd := exec.Command("git", "diff-tree", "--stdin", "--root", "--always", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none")
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(pairs.String())
 	out, err := cmd.Output()
@@ -302,4 +304,73 @@ func TestLastCommitWalkFieldsSplitAcrossWrites(t *testing.T) {
 			t.Errorf("%s = %s, want %s", p, w.last[i], want[p])
 		}
 	}
+}
+
+// lcFastImport builds a repo from a fast-import stream on refs/heads/main.
+func lcFastImport(t *testing.T, stream string) string {
+	t.Helper()
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	cmd := exec.Command("git", "fast-import", "--quiet")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), gitEnv...)
+	cmd.Stdin = strings.NewReader(stream)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fast-import: %v\n%s", err, out)
+	}
+	return dir
+}
+
+// TestLastCommitsSeesIgnoredSubmodules: an `ignore = all` submodule in
+// .gitmodules must not hide the gitlink change that is its last commit.
+func TestLastCommitsSeesIgnoredSubmodules(t *testing.T) {
+	gm := "[submodule \"mod\"]\n\tpath = mod\n\turl = https://example.com/mod\n\tignore = all\n"
+	dir := lcFastImport(t, fmt.Sprintf("commit refs/heads/main\nmark :1\ncommitter T <t@example.com> 1700000000 +0000\ndata 0\n"+
+		"M 100644 inline .gitmodules\ndata %d\n%s\nM 160000 %s mod\n\n"+
+		"commit refs/heads/main\nmark :2\ncommitter T <t@example.com> 1700000001 +0000\ndata 0\nfrom :1\nM 160000 %s mod\n\n",
+		len(gm), gm, strings.Repeat("1", 40), strings.Repeat("2", 40)))
+	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
+	got, err := LastCommits(context.Background(), dir, tip, []string{".gitmodules", "mod"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main^")); got["mod"] != tip || got[".gitmodules"] != root {
+		t.Fatalf("got %v, want mod at the tip %s and .gitmodules at the root %s", got, tip, root)
+	}
+}
+
+// TestLastCommitsStopsEarlyWithoutLeaks: every path resolves at the tip of
+// a long history, so the walk stops while the feeder still has most of
+// the rev-list to write. The call must return, end its goroutine, and
+// remove its spool.
+func TestLastCommitsStopsEarlyWithoutLeaks(t *testing.T) {
+	const n = 20000 // about 1.6 MB of pairs, far more than a pipe holds
+	var in strings.Builder
+	for i := range n {
+		fmt.Fprintf(&in, "commit refs/heads/main\nmark :%d\ncommitter T <t@example.com> %d +0000\ndata 0\n", i+1, 1700000000+i)
+		if i > 0 {
+			fmt.Fprintf(&in, "from :%d\n", i)
+		}
+		fmt.Fprintf(&in, "M 100644 inline hot.txt\ndata %d\n%d\n\n", len(fmt.Sprint(i))+1, i)
+	}
+	dir := lcFastImport(t, in.String())
+	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
+	spools := t.TempDir()
+	t.Setenv("TMPDIR", spools)
+	before := runtime.NumGoroutine()
+	got, err := LastCommits(context.Background(), dir, tip, []string{"hot.txt"}, 1)
+	if err != nil || got["hot.txt"] != tip {
+		t.Fatalf("got %v, err %v; want hot.txt at the tip", got, err)
+	}
+	if left, err := os.ReadDir(spools); err != nil || len(left) != 0 {
+		t.Fatalf("temp dir holds %v (err %v), want no spool", left, err)
+	}
+	// The feeder ends once its write fails; give the scheduler a moment.
+	for range 100 {
+		if runtime.NumGoroutine() <= before {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("goroutines %d after the call, %d before", runtime.NumGoroutine(), before)
 }

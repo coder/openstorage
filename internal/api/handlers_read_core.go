@@ -632,7 +632,8 @@ func (s *server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
 // 2b: GET /repos/files + GET /repos/files/metadata
 
 // files/files-metadata limits (openapi list_files/list_files_metadata).
-// The default sizes apply only to a call with a cursor and no limit.
+// The default sizes apply only to a call with a cursor and no limit (or
+// limit=0).
 const (
 	defaultFilesLimit     = 1000
 	maxFilesLimit         = 5000
