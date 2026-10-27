@@ -177,9 +177,9 @@ func upstreamSpecificCodes(t *testing.T) map[string]int {
 // open.storage emits to upstream's list, with the same status.
 func TestSpecificProblemCodesMatchUpstream(t *testing.T) {
 	spec := upstreamSpecificCodes(t)
-	// Guard the parser itself: upstream's 2026-10-08 list has 22 items.
-	if len(spec) != 22 {
-		t.Fatalf("parsed %d specific codes from the spec, want 22: %v", len(spec), spec)
+	// Guard the parser itself: upstream's 2026-10-27 list has 23 items.
+	if len(spec) != 23 {
+		t.Fatalf("parsed %d specific codes from the spec, want 23: %v", len(spec), spec)
 	}
 	for code, status := range specificProblemCodes {
 		if want, ok := spec[code]; !ok || want != status {
@@ -218,6 +218,35 @@ func TestWriteProblemCodeAssertions(t *testing.T) {
 	}
 }
 
+// TestWriteRefGuardFailed: ref_guard_failed always carries a known guard
+// and a full current_sha, and writeProblem cannot send it without them.
+func TestWriteRefGuardFailed(t *testing.T) {
+	zero := strings.Repeat("0", 40)
+	for name, write := range map[string]func(){
+		"writeProblem":  func() { writeProblem(httptest.NewRecorder(), http.StatusConflict, "ref_guard_failed", "boom") },
+		"unknown guard": func() { writeRefGuardFailed(httptest.NewRecorder(), "expected_ref_sha", zero, "boom") },
+		"short sha":     func() { writeRefGuardFailed(httptest.NewRecorder(), "expected_target_sha", "abc", "boom") },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s did not panic", name)
+				}
+			}()
+			write()
+		}()
+	}
+	rr := httptest.NewRecorder()
+	msg := "source branch moved: the source branch does not contain commit " + zero
+	writeRefGuardFailed(rr, "expected_source_sha", zero, msg)
+	if got := assertProblemFields(t, rr.Code, rr.Body.Bytes()); got != msg {
+		t.Fatalf("error = %q", got)
+	}
+	if body := rr.Body.String(); !strings.Contains(body, `"guard":"expected_source_sha","current_sha":"`+zero+`"`) {
+		t.Fatalf("body = %s", body)
+	}
+}
+
 // expectedProblemCodes is the test oracle for `code`: upstream's specific
 // code for the failures open.storage maps (issue #352), keyed on status
 // and message independently of the implementation, else the generic code.
@@ -251,6 +280,9 @@ func expectedProblemCodes(t *testing.T, status int, msg string) []string {
 		code = "credential_exists"
 	case status == http.StatusConflict && msg == "repository already deleted":
 		code = "repository_deleted"
+	case status == http.StatusConflict && (strings.HasPrefix(msg, "source branch moved: ") ||
+		strings.HasPrefix(msg, "expected_target_sha ") && strings.Contains(msg, " does not match current tip ")):
+		code = "ref_guard_failed"
 	}
 	if code != "" {
 		if got := upstreamSpecificCodes(t)[code]; got != status {
@@ -289,6 +321,8 @@ type problemBody struct {
 	Detail        string `json:"detail"`
 	Error         string `json:"error"`
 	Instance      string `json:"instance"`
+	Guard         string `json:"guard"`
+	CurrentSHA    string `json:"current_sha"`
 	InvalidParams []struct {
 		Name   string `json:"name"`
 		Reason string `json:"reason"`
@@ -299,6 +333,47 @@ type problemBody struct {
 // ProblemDetails plus ValidationProblemDetails' invalid_params
 // (TestProblemMembersMatchUpstream pins it to the spec).
 var problemMembers = []string{"code", "detail", "error", "instance", "invalid_params", "status", "title", "type"}
+
+// refGuardMembers are the members RefGuardProblemDetails adds to
+// ProblemDetails. A body with code ref_guard_failed must carry both, and
+// no other body may (TestProblemMembersMatchUpstream pins them).
+var refGuardMembers = []string{"current_sha", "guard"}
+
+// upstreamRefGuardSchema returns the properties of RefGuardProblemDetails'
+// own allOf item and the `guard` enum, by indentation: the schema at 4
+// spaces, "- properties:" at 8, each property at 12, enum items at 16.
+func upstreamRefGuardSchema(t *testing.T) (props, guards []string) {
+	t.Helper()
+	raw, err := os.ReadFile(upstreamSpecPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inSchema, inProps, inEnum := false, false, false
+	for l := range strings.SplitSeq(string(raw), "\n") {
+		indent := len(l) - len(strings.TrimLeft(l, " "))
+		trimmed := strings.TrimSpace(l)
+		switch {
+		case indent == 4 && trimmed == "RefGuardProblemDetails:":
+			inSchema = true
+		case inSchema && indent <= 4 && trimmed != "":
+			inSchema, inProps = false, false
+		case inSchema && indent == 8:
+			inProps = trimmed == "- properties:"
+		case inProps && indent == 12 && strings.HasSuffix(trimmed, ":"):
+			props = append(props, strings.TrimSuffix(trimmed, ":"))
+			inEnum = false
+		case inProps && indent == 14:
+			inEnum = props[len(props)-1] == "guard" && trimmed == "enum:"
+		case inEnum && indent == 16 && strings.HasPrefix(trimmed, "- "):
+			guards = append(guards, strings.TrimPrefix(trimmed, "- "))
+		}
+	}
+	if len(props) == 0 || len(guards) == 0 {
+		t.Fatalf("RefGuardProblemDetails has properties %v and guards %v in %s", props, guards, upstreamSpecPath)
+	}
+	slices.Sort(props)
+	return props, guards
+}
 
 // upstreamSchemaProperties returns the property names of one schema under
 // components/schemas in the vendored spec, by indentation: the schema at
@@ -342,6 +417,13 @@ func TestProblemMembersMatchUpstream(t *testing.T) {
 	}
 	if got := upstreamSchemaProperties(t, "InvalidParam"); !slices.Equal(got, []string{"name", "reason"}) {
 		t.Fatalf("InvalidParam properties = %v, want [name reason]", got)
+	}
+	props, guards := upstreamRefGuardSchema(t)
+	if !slices.Equal(props, refGuardMembers) {
+		t.Fatalf("RefGuardProblemDetails properties = %v, want %v", props, refGuardMembers)
+	}
+	if want := []string{"expected_target_sha", "expected_source_sha", "expected_notes_ref_sha"}; !slices.Equal(guards, want) {
+		t.Fatalf("RefGuardProblemDetails guard enum = %v, want %v", guards, want)
 	}
 	raw, err := os.ReadFile(upstreamSpecPath)
 	if err != nil {
@@ -508,6 +590,9 @@ func TestWriteProblemInvalidParamsAssertions(t *testing.T) {
 	}
 }
 
+// fullSHARE matches a full lowercase SHA-1 object id.
+var fullSHARE = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
 // assertProblemFields checks the RFC 9457 fields of a plain-envelope error
 // body against its HTTP status and returns the legacy `error` message.
 // `code` must be one expectedProblemCodes derives from the status and
@@ -530,9 +615,16 @@ func assertProblemFields(t *testing.T, status int, body []byte) string {
 	if err := json.Unmarshal(body, &members); err != nil {
 		t.Fatal(err)
 	}
+	refGuard := p.Code == "ref_guard_failed"
 	for m := range members {
-		if !slices.Contains(problemMembers, m) {
+		if !slices.Contains(problemMembers, m) && !(refGuard && slices.Contains(refGuardMembers, m)) {
 			t.Fatalf("problem body has member %q outside upstream's schema (body %s)", m, body)
+		}
+	}
+	if refGuard {
+		_, guards := upstreamRefGuardSchema(t)
+		if _, ok := members["current_sha"]; !ok || !slices.Contains(guards, p.Guard) || !fullSHARE.MatchString(p.CurrentSHA) {
+			t.Fatalf("ref_guard_failed body needs guard in %v and a 40-hex current_sha (body %s)", guards, body)
 		}
 	}
 	if raw, ok := members["invalid_params"]; ok {

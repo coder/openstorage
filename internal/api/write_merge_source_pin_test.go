@@ -12,7 +12,7 @@ import (
 // TestMergeExpectedSourceSHA pins the source commit with
 // expected_source_sha (spec 2026-10-16, #531): the merge uses the pinned
 // commit, not the source tip, and a pin that source_ref does not contain
-// is a 409 problem body with code conflict before any merge work.
+// is a 409 ref_guard_failed problem body before any merge work (#568).
 func TestMergeExpectedSourceSHA(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wmServer(t, e)
@@ -50,7 +50,7 @@ func TestMergeExpectedSourceSHA(t *testing.T) {
 			}
 		})
 
-		t.Run("pin outside source_ref is 409 conflict and mutates nothing", func(t *testing.T) {
+		t.Run("pin outside source_ref is 409 ref_guard_failed and mutates nothing", func(t *testing.T) {
 			tree := coreRevParse(t, fx.work, fx.c2+"^{tree}")
 			// featTip is a commit on another branch, 1111… is absent from
 			// the odb, and tree is not a commit. Source "conflict" would
@@ -65,16 +65,10 @@ func TestMergeExpectedSourceSHA(t *testing.T) {
 					wmMergeBody("conflict", "main", "merge", map[string]any{
 						"author": wmTestAuthor, "expected_source_sha": pin,
 					}))
-				if resp.StatusCode != http.StatusConflict {
-					t.Fatalf("pin %s: status = %d, body %s", pin, resp.StatusCode, raw)
-				}
-				body := wmDecode(t, raw)
-				want := "source branch moved: the source branch does not contain commit " + pin
-				if body["code"] != "conflict" || body["detail"] != want || body["error"] != want {
-					t.Fatalf("pin %s: body = %v, want problem code conflict and %q", pin, body, want)
-				}
-				if _, has := body["conflict_paths"]; has {
-					t.Fatalf("pin %s: merge ran before the guard: %v", pin, body)
+				wmRequireRefGuard(t, resp, raw, "expected_source_sha", fx.conflictTip,
+					"source branch moved: the source branch does not contain commit "+pin)
+				if _, has := wmDecode(t, raw)["conflict_paths"]; has {
+					t.Fatalf("pin %s: merge ran before the guard: %s", pin, raw)
 				}
 				if refsAfter := wmRefsSnapshot(t, e, fx.repoID); !reflect.DeepEqual(refsBefore, refsAfter) {
 					t.Fatalf("pin %s: refs changed on a refused merge", pin)
@@ -86,6 +80,35 @@ func TestMergeExpectedSourceSHA(t *testing.T) {
 				if !reflect.DeepEqual(packsBefore, packsAfter) {
 					t.Fatalf("pin %s: packs registered on a refused merge", pin)
 				}
+			}
+		})
+
+		t.Run("pin on a missing source branch is 409 with 40 zeros", func(t *testing.T) {
+			// Upstream (spec 2026-10-27, changelog 2026-10-22): a source
+			// branch that does not exist fails the guard, and current_sha is
+			// 40 zeros. Without a pin it stays a 404.
+			refsBefore := wmRefsSnapshot(t, e, fx.repoID)
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+				wmMergeBody("gone", "main", "merge", map[string]any{"author": wmTestAuthor, "expected_source_sha": fx.featTip}))
+			wmRequireRefGuard(t, resp, raw, "expected_source_sha", strings.Repeat("0", 40),
+				"source branch moved: the source branch does not contain commit "+fx.featTip)
+			if refsAfter := wmRefsSnapshot(t, e, fx.repoID); !reflect.DeepEqual(refsBefore, refsAfter) {
+				t.Fatal("refs changed on a refused merge")
+			}
+			resp, raw = wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+				wmMergeBody("gone", "main", "merge", map[string]any{"author": wmTestAuthor}))
+			if resp.StatusCode != http.StatusNotFound || wmResult(t, wmDecode(t, raw))["message"] != "source branch gone not found" {
+				t.Fatalf("no pin: status %d body %s, want 404 source branch gone not found", resp.StatusCode, raw)
+			}
+			// The target guard runs first, and a missing target is a 404.
+			resp, raw = wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+				wmMergeBody("gone", "main", "merge", map[string]any{"expected_source_sha": fx.featTip, "expected_target_sha": fx.c1}))
+			wmRequireRefGuard(t, resp, raw, "expected_target_sha", fx.c2,
+				"expected_target_sha "+fx.c1+" does not match current tip "+fx.c2)
+			resp, raw = wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+				wmMergeBody("gone", "nope", "merge", map[string]any{"expected_source_sha": fx.featTip}))
+			if resp.StatusCode != http.StatusNotFound || wmResult(t, wmDecode(t, raw))["message"] != "target branch nope not found" {
+				t.Fatalf("missing target: status %d body %s, want 404 target branch nope not found", resp.StatusCode, raw)
 			}
 		})
 
@@ -112,9 +135,8 @@ func TestMergeExpectedSourceSHA(t *testing.T) {
 				return e.doReq(t, http.MethodPost, path, fx.token, payload, "")
 			}
 			resp, raw := post(fx.featTip)
-			if resp.StatusCode != http.StatusConflict || wmDecode(t, raw)["code"] != "conflict" {
-				t.Fatalf("stale pin: status %d body %s, want 409 conflict", resp.StatusCode, raw)
-			}
+			wmRequireRefGuard(t, resp, raw, "expected_source_sha", fx.ffTip,
+				"source branch moved: the source branch does not contain commit "+fx.featTip)
 			resp, raw = post(fx.ffMid)
 			if body := wmDecode(t, raw); resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.ffMid {
 				t.Fatalf("status %d body %s, want fast_forward to %s", resp.StatusCode, raw, fx.ffMid)

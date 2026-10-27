@@ -6,7 +6,7 @@
 
 > **Amended by [#532](https://github.com/coder/openstorage/issues/532) (merge only):** a
 > stale `expected_target_sha` on `POST .../merge` answers **409** with the problem body,
-> code `conflict`, as upstream's merge contract documents (spec 2026-10-16), the same as a
+> code `conflict` (`ref_guard_failed` since [#568](https://github.com/coder/openstorage/issues/568)), as upstream's merge contract documents (spec 2026-10-16), the same as a
 > source branch that no longer contains `expected_source_sha`. The guard still runs
 > before any merge work. Every other route keeps the 412 rule below.
 
