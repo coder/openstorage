@@ -694,6 +694,30 @@ func wrefNoteFail(w http.ResponseWriter, httpStatus int, msg, sha, targetRef, ba
 	})
 }
 
+// wrefNoteGuardBody is upstream's NotesWriteRefGuardProblemDetails: the
+// note-write failure envelope plus the ref_guard_failed problem members.
+type wrefNoteGuardBody struct {
+	errorEnvelope
+	wrefNoteResponse
+}
+
+// wrefNoteGuardFail writes the 409 of a stale expected_notes_ref_sha on the
+// forms that answer upstream's status (#568). currentSHA is the notes
+// ref's tip, or the zero sha when unborn, as current_sha and new_ref_sha.
+func wrefNoteGuardFail(w http.ResponseWriter, msg, sha, targetRef, baseCommit, currentSHA string) {
+	writeJSON(w, http.StatusConflict, wrefNoteGuardBody{
+		errorEnvelope: refGuardProblem(w, "expected_notes_ref_sha", currentSHA, msg),
+		wrefNoteResponse: wrefNoteResponse{
+			SHA:        sha,
+			NotesRef:   targetRef,
+			TargetRef:  targetRef,
+			BaseCommit: baseCommit,
+			NewRefSHA:  currentSHA,
+			Result:     wrefNoteResult{Success: false, Status: statusForHTTP(http.StatusConflict), Message: msg},
+		},
+	})
+}
+
 // wrefNotesRefName resolves the request `notes_ref` field (deprecated
 // alias `ref`) to a full notes ref: empty picks the default
 // refs/notes/commits, a bare name goes under refs/notes/, and a fully
@@ -1003,11 +1027,15 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 
 	// Invariant 1: expected_notes_ref_sha is the notes-ref CAS guard; the
-	// zero sha asserts the ref is unborn.
+	// zero sha asserts the ref is unborn. The 409 forms carry upstream's
+	// ref_guard_failed problem members next to the note members.
 	if expectedRefSHA != "" && expectedRefSHA != oldOrZero {
-		wrefNoteFail(w, staleGuardStatus,
-			fmt.Sprintf("expected_notes_ref_sha %.8s does not match %s tip %.8s", expectedRefSHA, targetRef, oldOrZero),
-			objectSHA, targetRef, old, oldOrZero)
+		msg := fmt.Sprintf("expected_notes_ref_sha %.8s does not match %s tip %.8s", expectedRefSHA, targetRef, oldOrZero)
+		if staleGuardStatus == http.StatusConflict {
+			wrefNoteGuardFail(w, msg, objectSHA, targetRef, old, oldOrZero)
+		} else {
+			wrefNoteFail(w, staleGuardStatus, msg, objectSHA, targetRef, old, oldOrZero)
+		}
 		return
 	}
 

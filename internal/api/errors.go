@@ -75,9 +75,9 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeProblem(w, status, genericProblemCode(status), msg)
 }
 
-// writeProblem writes the plain error envelope. It is the only writer of
-// errorEnvelope. code is the generic code for status, or a specific code
-// from specificProblemCodes whose upstream status is status.
+// writeProblem writes the plain error envelope. code is the generic code
+// for status, or a specific code from specificProblemCodes whose upstream
+// status is status.
 func writeProblem(w http.ResponseWriter, status int, code, msg string) {
 	writeProblemParams(w, status, code, msg, nil)
 }
@@ -93,13 +93,25 @@ func writeProblemParams(w http.ResponseWriter, status int, code, msg string, par
 // standard name of the request field; currentSHA is the guarded ref's
 // commit, or ref.ZeroSHA when the ref does not exist.
 func writeRefGuardFailed(w http.ResponseWriter, guard, currentSHA, msg string) {
+	writeJSON(w, http.StatusConflict, refGuardProblem(w, guard, currentSHA, msg))
+}
+
+// refGuardProblem builds the 409 ref_guard_failed problem members for a
+// body that keeps other members next to them (the notes routes).
+func refGuardProblem(w http.ResponseWriter, guard, currentSHA, msg string) errorEnvelope {
 	assertf(guard == "expected_target_sha" || guard == "expected_source_sha" || guard == "expected_notes_ref_sha",
-		"writeRefGuardFailed: unknown guard %q", guard)
-	assertf(ref.ValidSHA(currentSHA), "writeRefGuardFailed: current_sha %q is not a full sha", currentSHA)
-	writeProblemBody(w, http.StatusConflict, codeRefGuardFailed, msg, nil, guard, currentSHA)
+		"refGuardProblem: unknown guard %q", guard)
+	assertf(ref.ValidSHA(currentSHA), "refGuardProblem: current_sha %q is not a full sha", currentSHA)
+	return newProblem(w, http.StatusConflict, codeRefGuardFailed, msg, nil, guard, currentSHA)
 }
 
 func writeProblemBody(w http.ResponseWriter, status int, code, msg string, params []invalidParam, guard, currentSHA string) {
+	writeJSON(w, status, newProblem(w, status, code, msg, params, guard, currentSHA))
+}
+
+// newProblem is the only builder of errorEnvelope. It checks every member
+// against upstream's rules and sets WWW-Authenticate on a 401.
+func newProblem(w http.ResponseWriter, status int, code, msg string, params []invalidParam, guard, currentSHA string) errorEnvelope {
 	assertf(status >= 400 && status < 600, "writeProblem called with non-error status %d", status)
 	assertf((guard != "") == (code == codeRefGuardFailed) && (guard != "") == (currentSHA != ""),
 		"writeProblem: code %q with guard %q and current_sha %q", code, guard, currentSHA)
@@ -120,7 +132,7 @@ func writeProblemBody(w http.ResponseWriter, status int, code, msg string, param
 	if status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 	}
-	writeJSON(w, status, errorEnvelope{
+	return errorEnvelope{
 		Error:         msg,
 		Type:          "about:blank",
 		Title:         title,
@@ -131,7 +143,7 @@ func writeProblemBody(w http.ResponseWriter, status int, code, msg string, param
 		InvalidParams: params,
 		Guard:         guard,
 		CurrentSHA:    currentSHA,
-	})
+	}
 }
 
 var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()

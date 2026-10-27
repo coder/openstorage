@@ -36,7 +36,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `repository_deleted` (409: `DELETE /api/v1/repos/delete` on a deleted repository;
   `DELETE /api/repos/{repo_name}` answers that case with 404 `repository_not_found`,
   because its name lookup skips deleted repositories), and `ref_guard_failed` (409: a
-  failed merge guard, with `guard` and `current_sha`, [details](#merge-guards)). open.storage
+  failed merge guard, with `guard` and `current_sha`, [details](#merge-guards), and a
+  stale notes guard on the forms that answer 409, [details](#notes)). open.storage
   emits no other specific codes. As upstream advises, treat
   an unknown code as the generic code for its status. Branch on the status code or
   `code`, not on the message.
@@ -401,7 +402,7 @@ timestamp and `committer_date` the committer timestamp, as in upstream's spec of
 |---|---|---|
 | `GET /repos/notes` | git:read | `object_ref` (req; deprecated alias `sha`), `notes_ref?` (deprecated alias `ref`) → `{sha, note, ref_sha}` |
 | `POST /repos/notes` | git:write | `{object_ref (deprecated alias sha), action: "add"\|"append" (deprecated upstream), note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}` → `{sha, notes_ref, target_ref (deprecated mirror), base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
-| `POST /api/repos/{repo_name}/notes/append` | git:write | Path style only (spec 2026-10-05). `{object_ref (deprecated alias sha), note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}`, decoded strictly: `action`, any unknown field, or a `null` → 400. Appends, or creates the note when the object has none → **201** with the same envelope. A stale guard → 409 `conflict` and nothing is appended |
+| `POST /api/repos/{repo_name}/notes/append` | git:write | Path style only (spec 2026-10-05). `{object_ref (deprecated alias sha), note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}`, decoded strictly: `action`, any unknown field, or a `null` → 400. Appends, or creates the note when the object has none → **201** with the same envelope. A stale guard → 409 `ref_guard_failed` and nothing is appended |
 | `DELETE /repos/notes` | git:write | Query `object_ref`, `notes_ref?`, `expected_notes_ref_sha?`. The deprecated body `{object_ref (deprecated alias sha), notes_ref?, expected_notes_ref_sha?, author?}` still works; a query parameter that is present wins over its body field, even when empty → same envelope |
 | `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. 400 if custom notes refs disabled server-side |
 
@@ -410,8 +411,15 @@ timestamp and `committer_date` the committer timestamp, as in upstream's spec of
   tag, short SHA, or other revision that resolves to a commit. Unresolvable → 404.
 - Responses echo the resolved object id in `sha`.
 - A stale `expected_notes_ref_sha` → 412 `precondition_failed`, except `POST .../notes/append`
-  and the `DELETE` query parameter form, which answer 409 `conflict` as upstream documents
-  (the SDKs send the body forms and read `result.status`).
+  and the `DELETE` query parameter form, which answer 409 as upstream documents (the SDKs
+  send the body forms and read `result.status`).
+- That 409 keeps the note envelope (`result.status` `conflict`) and adds the problem
+  members of the error body: `code: ref_guard_failed`, `guard: expected_notes_ref_sha`
+  (also when the request sent the deprecated `expected_ref_sha`), and `current_sha`, the
+  notes ref's tip or 40 zeros when it does not exist. `new_ref_sha` repeats
+  `current_sha`. The content type stays `application/json`. Before
+  [#568](https://github.com/coder/openstorage/issues/568), the body had no problem
+  members.
 
 ### Upstream sync
 

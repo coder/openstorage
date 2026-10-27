@@ -308,17 +308,18 @@ func TestDeleteBranchAndNoteQueryParams(t *testing.T) {
 			}
 		})
 
-		t.Run("stale query guard is 409, body guard stays 412", func(t *testing.T) {
+		t.Run("stale query guard is 409 ref_guard_failed, body guard stays 412", func(t *testing.T) {
 			tip := addNote(t, fx.c2, "")
 			resp, body := del(t, "/api/v1/repos/notes",
 				url.Values{"object_ref": {fx.c2}, "expected_notes_ref_sha": {ref.ZeroSHA}}, nil)
-			if resp.StatusCode != http.StatusConflict || wrefNoteResultOf(t, body)["status"] != "conflict" {
-				t.Fatalf("query guard: status %d body %v, want 409 conflict", resp.StatusCode, body)
-			}
+			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", tip)
 			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": fx.c2, "expected_ref_sha": ref.ZeroSHA})
 			if resp.StatusCode != http.StatusPreconditionFailed {
 				t.Fatalf("body guard: status %d body %v, want 412", resp.StatusCode, body)
+			}
+			if _, has := body["code"]; has {
+				t.Fatalf("body guard carries problem members: %v", body)
 			}
 			if got := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]; got != tip {
 				t.Fatalf("notes ref moved to %q after failed guards", got)
