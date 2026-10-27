@@ -145,6 +145,22 @@ func lcOracle(t *testing.T, dir, rev string, paths []string) map[string]string {
 	return want
 }
 
+// lastCommitsByPath is LastCommits keyed by path.
+func lastCommitsByPath(ctx context.Context, dir, rev string, paths []string, maxDistinct int) (map[string]string, error) {
+	last, err := LastCommits(ctx, dir, rev, paths, maxDistinct)
+	if err != nil {
+		return nil, err
+	}
+	if len(last) != len(paths) {
+		return nil, fmt.Errorf("%d answers for %d paths", len(last), len(paths))
+	}
+	m := make(map[string]string, len(paths))
+	for i, p := range paths {
+		m[p] = last[i]
+	}
+	return m, nil
+}
+
 // TestLastCommitsMatchesGitLog checks the one-walk answer against one
 // `git log -1 -- <path>` per file, on random histories, at several revs,
 // for the whole tree and for one subtree.
@@ -172,7 +188,7 @@ func TestLastCommitsMatchesGitLog(t *testing.T) {
 					continue
 				}
 				subtrees[sub]++
-				got, err := LastCommits(ctx, dir, rev, paths, 1000)
+				got, err := lastCommitsByPath(ctx, dir, rev, paths, 1000)
 				if err != nil {
 					t.Fatalf("seed %d rev %s sub %q: %v", seed, rev, sub, err)
 				}
@@ -200,7 +216,7 @@ func TestLastCommitsDistinctLimit(t *testing.T) {
 		paths = append(paths, e.Path)
 	}
 	// c2 changed some files; the rest still date from c1.
-	got, err := LastCommits(ctx, f.dir, f.c2, paths, 2)
+	got, err := lastCommitsByPath(ctx, f.dir, f.c2, paths, 2)
 	if err != nil {
 		t.Fatalf("2 distinct commits with limit 2: %v", err)
 	}
@@ -268,7 +284,7 @@ func TestLastCommitWalkFieldsSplitAcrossWrites(t *testing.T) {
 	for _, e := range entries {
 		paths = append(paths, e.Path)
 	}
-	want, err := LastCommits(ctx, dir, rev, paths, 1000)
+	want, err := lastCommitsByPath(ctx, dir, rev, paths, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +346,7 @@ func TestLastCommitsSeesIgnoredSubmodules(t *testing.T) {
 		"commit refs/heads/main\nmark :2\ncommitter T <t@example.com> 1700000001 +0000\ndata 0\nfrom :1\nM 160000 %s mod\n\n",
 		len(gm), gm, strings.Repeat("1", 40), strings.Repeat("2", 40)))
 	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
-	got, err := LastCommits(context.Background(), dir, tip, []string{".gitmodules", "mod"}, 10)
+	got, err := lastCommitsByPath(context.Background(), dir, tip, []string{".gitmodules", "mod"}, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +374,7 @@ func TestLastCommitsStopsEarlyWithoutLeaks(t *testing.T) {
 	spools := t.TempDir()
 	t.Setenv("TMPDIR", spools)
 	before := runtime.NumGoroutine()
-	got, err := LastCommits(context.Background(), dir, tip, []string{"hot.txt"}, 1)
+	got, err := lastCommitsByPath(context.Background(), dir, tip, []string{"hot.txt"}, 1)
 	if err != nil || got["hot.txt"] != tip {
 		t.Fatalf("got %v, err %v; want hot.txt at the tip", got, err)
 	}

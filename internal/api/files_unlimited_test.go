@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"strings"
 	"testing"
@@ -192,4 +193,37 @@ func TestFilesMetadataOverDistinctLastCommitsAnswers429(t *testing.T) {
 			t.Fatalf("ref=main^: %d files, %d distinct last commits, has_more %v; want %d of each", len(l.paths), len(distinct), l.hasMore, n-1)
 		}
 	})
+}
+
+// TestWriteJSONListsMatchesWriteJSON: the streamed listings are the bytes
+// writeJSON writes for the whole response.
+func TestWriteJSONListsMatchesWriteJSON(t *testing.T) {
+	entries := []fileEntry{{Path: "a<&>.txt", Type: "blob", Mode: "100644"}, {Path: "d", Type: "tree", Mode: "040000"}, {Path: "é\"x", Type: "blob", Mode: "100755"}}
+	for _, next := range []string{"", "Y3Vyc29y"} {
+		whole := httptest.NewRecorder()
+		writeJSON(whole, http.StatusOK, listFilesResponse{Paths: []string{"a<&>.txt", "é\"x"}, Ref: "main", Entries: entries, NextCursor: next, HasMore: next != ""})
+		streamed := httptest.NewRecorder()
+		writeJSONLists(streamed, http.StatusOK, listFilesResponse{Paths: []string{}, Ref: "main", Entries: []fileEntry{}, NextCursor: next, HasMore: next != ""},
+			jsonList{"paths", func(yield func(any) bool) { _ = yield("a<&>.txt") && yield("é\"x") }},
+			jsonList{"entries", func(yield func(any) bool) {
+				for _, e := range entries {
+					if !yield(e) {
+						return
+					}
+				}
+			}})
+		if whole.Body.String() != streamed.Body.String() || streamed.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf("streamed %q (%v), want %q", streamed.Body, streamed.Header(), whole.Body)
+		}
+	}
+	whole := httptest.NewRecorder()
+	files := []fileMetaEntry{{Path: "x", Mode: "100644", Size: 3, LastCommitSHA: "c1", Type: "blob"}}
+	commits := map[string]fileMetaCommit{"c1": {Author: "a", Date: "d", Message: "m", Order: 0}, "c0": {Order: 1}}
+	writeJSON(whole, http.StatusOK, listFilesMetadataResponse{Files: files, Commits: commits, Ref: "r"})
+	streamed := httptest.NewRecorder()
+	writeJSONLists(streamed, http.StatusOK, listFilesMetadataResponse{Files: []fileMetaEntry{}, Commits: commits, Ref: "r"},
+		jsonList{"files", func(yield func(any) bool) { yield(files[0]) }})
+	if whole.Body.String() != streamed.Body.String() {
+		t.Fatalf("streamed %q, want %q", streamed.Body, whole.Body)
+	}
 }

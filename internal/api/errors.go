@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bufio"
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"errors"
+	"iter"
 	"net/http"
 	"reflect"
 	"slices"
@@ -393,6 +396,50 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	// Encoding a value we constructed cannot fail; a write error just means
 	// the client went away, which is not actionable here.
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// jsonList is one list of a writeJSONLists body: key's value, which is an
+// empty list in the template, is replaced by items.
+type jsonList struct {
+	key   string
+	items iter.Seq[any]
+}
+
+// writeJSONLists writes the same bytes writeJSON writes for v with every
+// list in lists filled in, but marshals one list item at a time, so a body
+// with hundreds of thousands of entries is never buffered whole. v is the
+// response with those lists empty; lists are in the order v encodes them.
+func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList) {
+	assertf(status >= 200 && status < 300, "writeJSONLists called with status %d", status)
+	tmpl, err := json.Marshal(v)
+	assertf(err == nil, "writeJSONLists: marshal template: %v", err)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	// Write errors mean the client went away, as in writeJSON.
+	bw := bufio.NewWriterSize(w, 64<<10)
+	for _, l := range lists {
+		// A string value cannot contain this marker: its quotes would be
+		// escaped. Each list key appears once in our response types.
+		marker := []byte(`"` + l.key + `":[]`)
+		i := bytes.Index(tmpl, marker)
+		assertf(i >= 0 && bytes.Count(tmpl, marker) == 1, "writeJSONLists: %s is not one empty list in %.200s", l.key, tmpl)
+		cut := i + len(marker) - 1 // just after "["
+		_, _ = bw.Write(tmpl[:cut])
+		sep := false
+		for item := range l.items {
+			b, err := json.Marshal(item)
+			assertf(err == nil, "writeJSONLists: marshal %s item: %v", l.key, err)
+			if sep {
+				_ = bw.WriteByte(',')
+			}
+			_, _ = bw.Write(b)
+			sep = true
+		}
+		tmpl = tmpl[cut:]
+	}
+	_, _ = bw.Write(tmpl)
+	_ = bw.WriteByte('\n') // json.Encoder ends each value with a newline
+	_ = bw.Flush()
 }
 
 // statusForHTTP maps an HTTP failure code onto the docs/explanation/streaming-commit-protocols.md result-envelope

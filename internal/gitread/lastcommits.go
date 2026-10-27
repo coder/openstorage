@@ -19,7 +19,9 @@ import (
 var ErrTooManyLastCommits = errors.New("too many distinct last commits")
 
 // LastCommits returns, for every path in paths (entries of rev's tree), the
-// commit that `git log -1 rev -- <path>` names, with literal pathspecs. One
+// commit that `git log -1 rev -- <path>` names, with literal pathspecs, in
+// the order of paths (a slice, not a map: a listing can hold hundreds of
+// thousands of paths). One
 // difference: a submodule's `ignore` setting in .gitmodules never hides a
 // gitlink change. It fails with ErrTooManyLastCommits as soon as more than
 // maxDistinct distinct commits are found.
@@ -37,11 +39,11 @@ var ErrTooManyLastCommits = errors.New("too many distinct last commits")
 //
 // Both children are Heavy and run one after the other under the request's
 // budget (see Run).
-func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxDistinct int) (map[string]string, error) {
+func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxDistinct int) ([]string, error) {
 	assertf(ref.ValidSHA(rev), "LastCommits: unresolved rev %q", rev)
 	assertf(maxDistinct > 0, "LastCommits: maxDistinct %d", maxDistinct)
 	if len(paths) == 0 {
-		return map[string]string{}, nil
+		return []string{}, nil
 	}
 	assertf(repoPath != "", "LastCommits: empty repoPath")
 	w := newLastCommitWalk(rev, paths, maxDistinct)
@@ -104,11 +106,7 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 		}
 	}
 	assertf(w.left == 0, "LastCommits: %d paths unresolved after the walk", w.left)
-	out := make(map[string]string, len(paths))
-	for i, p := range w.paths {
-		out[p] = w.last[i]
-	}
-	return out, nil
+	return w.last, nil
 }
 
 // feedPairs writes diff-tree's input lines for every rev-list line.
