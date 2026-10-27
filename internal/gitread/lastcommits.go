@@ -112,10 +112,17 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 // feedPairs writes diff-tree's input lines for every rev-list line.
 func feedPairs(dst io.Writer, spool io.Reader) error {
 	bw := bufio.NewWriter(dst)
-	sc := bufio.NewScanner(spool)
-	sc.Buffer(nil, 1<<20) // an octopus merge line can be long
-	for sc.Scan() {
-		f := strings.Fields(sc.Text())
+	br := bufio.NewReader(spool)
+	for {
+		// No line-length cap: an octopus merge line can list any number
+		// of parents.
+		line, err := br.ReadString('\n')
+		if err == io.EOF && line == "" {
+			break
+		} else if err != nil && err != io.EOF {
+			return err
+		}
+		f := strings.Fields(line)
 		if len(f) == 1 {
 			if _, err := bw.WriteString(f[0] + "\n"); err != nil {
 				return err
@@ -126,9 +133,6 @@ func feedPairs(dst io.Writer, spool io.Reader) error {
 				return err
 			}
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return err
 	}
 	return bw.Flush()
 }

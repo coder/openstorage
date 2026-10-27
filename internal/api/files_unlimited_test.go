@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -225,5 +226,36 @@ func TestWriteJSONListsMatchesWriteJSON(t *testing.T) {
 		jsonList{"files", func(yield func(any) bool) { yield(files[0]) }})
 	if whole.Body.String() != streamed.Body.String() {
 		t.Fatalf("streamed %q, want %q", streamed.Body, whole.Body)
+	}
+}
+
+// failingWriter is a ResponseWriter whose body writes fail, like a gone
+// client's.
+type failingWriter struct{ h http.Header }
+
+func (f *failingWriter) Header() http.Header       { return f.h }
+func (f *failingWriter) WriteHeader(int)           {}
+func (f *failingWriter) Write([]byte) (int, error) { return 0, errors.New("client gone") }
+
+// TestWriteJSONListsStopsAtTheFirstWriteError: a gone client ends the
+// listing after at most one buffer of entries, not after all of them.
+func TestWriteJSONListsStopsAtTheFirstWriteError(t *testing.T) {
+	const n = 100000
+	yielded := 0
+	writeJSONLists(&failingWriter{h: http.Header{}}, http.StatusOK, listFilesResponse{Paths: []string{}, Entries: []fileEntry{}},
+		jsonList{"paths", func(yield func(any) bool) {
+			for i := range n {
+				yielded++
+				if !yield(fmt.Sprintf("dir/file%06d.txt", i)) {
+					return
+				}
+			}
+		}},
+		jsonList{"entries", func(yield func(any) bool) {
+			t.Error("entries listed after the client went away")
+		}})
+	// One 64 KiB buffer holds about 3,500 of these paths.
+	if yielded >= n/10 {
+		t.Fatalf("listed %d of %d paths after the first failed write", yielded, n)
 	}
 }

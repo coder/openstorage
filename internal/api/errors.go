@@ -415,7 +415,9 @@ func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList)
 	assertf(err == nil, "writeJSONLists: marshal template: %v", err)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	// Write errors mean the client went away, as in writeJSON.
+	// A write error means the client went away or missed a delivery
+	// deadline: stop at once, so the handler releases its git-read slot
+	// and the listing. bufio.Writer keeps failing after its first error.
 	bw := bufio.NewWriterSize(w, 64<<10)
 	for _, l := range lists {
 		// A string value cannot contain this marker: its quotes would be
@@ -424,7 +426,9 @@ func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList)
 		i := bytes.Index(tmpl, marker)
 		assertf(i >= 0 && bytes.Count(tmpl, marker) == 1, "writeJSONLists: %s is not one empty list in %.200s", l.key, tmpl)
 		cut := i + len(marker) - 1 // just after "["
-		_, _ = bw.Write(tmpl[:cut])
+		if _, err := bw.Write(tmpl[:cut]); err != nil {
+			return
+		}
 		sep := false
 		for item := range l.items {
 			b, err := json.Marshal(item)
@@ -432,7 +436,9 @@ func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList)
 			if sep {
 				_ = bw.WriteByte(',')
 			}
-			_, _ = bw.Write(b)
+			if _, err := bw.Write(b); err != nil {
+				return
+			}
 			sep = true
 		}
 		tmpl = tmpl[cut:]

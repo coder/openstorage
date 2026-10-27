@@ -390,3 +390,29 @@ func TestLastCommitsStopsEarlyWithoutLeaks(t *testing.T) {
 	}
 	t.Fatalf("goroutines %d after the call, %d before", runtime.NumGoroutine(), before)
 }
+
+// TestLastCommitsOctopusWithManyParents: an octopus merge's rev-list line
+// can be longer than any fixed line buffer (30,000 parents: 1.2 MB).
+func TestLastCommitsOctopusWithManyParents(t *testing.T) {
+	const roots = 30000
+	var in strings.Builder
+	in.WriteString("commit refs/heads/r0\nmark :1\ncommitter T <t@example.com> 1700000000 +0000\ndata 0\nM 100644 inline a.txt\ndata 2\na\n\n")
+	for i := 1; i < roots; i++ { // empty root commits; reset makes each a root
+		fmt.Fprintf(&in, "reset refs/heads/r\ncommit refs/heads/r\nmark :%d\ncommitter T <t@example.com> 1700000000 +0000\ndata 0\n\n", i+1)
+	}
+	in.WriteString("commit refs/heads/main\ncommitter T <t@example.com> 1700000001 +0000\ndata 0\nfrom :1\n")
+	for i := 2; i <= roots; i++ {
+		fmt.Fprintf(&in, "merge :%d\n", i)
+	}
+	in.WriteString("M 100644 inline b.txt\ndata 2\nb\n\n")
+	dir := lcFastImport(t, in.String())
+	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
+	paths := []string{"a.txt", "b.txt"}
+	got, err := lastCommitsByPath(context.Background(), dir, tip, paths, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := lcOracle(t, dir, tip, paths); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
