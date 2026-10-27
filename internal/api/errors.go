@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // internalErrorMsg is the only 500 body clients ever see: raw error strings
@@ -50,6 +52,12 @@ type errorEnvelope struct {
 	// InvalidParams is upstream's ValidationProblemDetails member: only on
 	// a 400 for a request body, only when the server can name the field.
 	InvalidParams []invalidParam `json:"invalid_params,omitempty"`
+	// Guard and CurrentSHA are upstream's RefGuardProblemDetails members,
+	// set together and only on code ref_guard_failed: the request field of
+	// the failed guard, and the commit of the guarded ref (40 zeros when
+	// the ref does not exist).
+	Guard      string `json:"guard,omitempty"`
+	CurrentSHA string `json:"current_sha,omitempty"`
 }
 
 // invalidParam is one item of upstream's `invalid_params` (InvalidParam):
@@ -77,7 +85,24 @@ func writeProblem(w http.ResponseWriter, status int, code, msg string) {
 // writeProblemParams is writeProblem with `invalid_params`, which only a
 // 400 may carry.
 func writeProblemParams(w http.ResponseWriter, status int, code, msg string, params []invalidParam) {
+	writeProblemBody(w, status, code, msg, params, "", "")
+}
+
+// writeRefGuardFailed writes the 409 ref_guard_failed problem body of a
+// failed ref guard (upstream's RefGuardProblemDetails). guard is the
+// standard name of the request field; currentSHA is the guarded ref's
+// commit, or ref.ZeroSHA when the ref does not exist.
+func writeRefGuardFailed(w http.ResponseWriter, guard, currentSHA, msg string) {
+	assertf(guard == "expected_target_sha" || guard == "expected_source_sha" || guard == "expected_notes_ref_sha",
+		"writeRefGuardFailed: unknown guard %q", guard)
+	assertf(ref.ValidSHA(currentSHA), "writeRefGuardFailed: current_sha %q is not a full sha", currentSHA)
+	writeProblemBody(w, http.StatusConflict, codeRefGuardFailed, msg, nil, guard, currentSHA)
+}
+
+func writeProblemBody(w http.ResponseWriter, status int, code, msg string, params []invalidParam, guard, currentSHA string) {
 	assertf(status >= 400 && status < 600, "writeProblem called with non-error status %d", status)
+	assertf((guard != "") == (code == codeRefGuardFailed) && (guard != "") == (currentSHA != ""),
+		"writeProblem: code %q with guard %q and current_sha %q", code, guard, currentSHA)
 	assertf(len(params) == 0 || status == http.StatusBadRequest, "writeProblem: invalid_params on status %d", status)
 	for _, p := range params {
 		assertf(p.Name != "" && p.Reason != "", "writeProblem: incomplete invalid param %+v", p)
@@ -104,6 +129,8 @@ func writeProblemParams(w http.ResponseWriter, status int, code, msg string, par
 		Detail:        msg,
 		Instance:      problemInstance(w),
 		InvalidParams: params,
+		Guard:         guard,
+		CurrentSHA:    currentSHA,
 	})
 }
 
@@ -238,6 +265,7 @@ const (
 	codeCredentialExists   = "credential_exists"
 	codeCredentialNotFound = "credential_not_found"
 	codeInsufficientScope  = "insufficient_scope"
+	codeRefGuardFailed     = "ref_guard_failed"
 	codeRefNotFound        = "ref_not_found"
 	codeRepoNameMismatch   = "repo_name_mismatch"
 	codeRepositoryDeleted  = "repository_deleted"
@@ -251,6 +279,7 @@ var specificProblemCodes = map[string]int{
 	codeCredentialExists:   http.StatusConflict,
 	codeCredentialNotFound: http.StatusNotFound,
 	codeInsufficientScope:  http.StatusForbidden,
+	codeRefGuardFailed:     http.StatusConflict,
 	codeRefNotFound:        http.StatusNotFound,
 	codeRepoNameMismatch:   http.StatusBadRequest,
 	codeRepositoryDeleted:  http.StatusConflict,

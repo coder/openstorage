@@ -35,9 +35,10 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `repo_name_mismatch` (400: the create body's `repo_name` differs from the token's
   `repo` claim), `branch_not_found` (404), `ref_not_found` (404: a ref, tag, or
   revision does not resolve), `credential_not_found` (404), `credential_exists` (409),
-  and `repository_deleted` (409: `DELETE /api/v1/repos/delete` on a deleted repository;
+  `repository_deleted` (409: `DELETE /api/v1/repos/delete` on a deleted repository;
   `DELETE /api/repos/{repo_name}` answers that case with 404 `repository_not_found`,
-  because its name lookup skips deleted repositories). open.storage
+  because its name lookup skips deleted repositories), and `ref_guard_failed` (409: a
+  failed merge guard, with `guard` and `current_sha`, [details](#merge-guards)). open.storage
   emits no other specific codes. As upstream advises, treat
   an unknown code as the generic code for its status. Branch on the status code or
   `code`, not on the message.
@@ -61,8 +62,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   ([streaming protocols](../explanation/streaming-commit-protocols.md)), even on 4xx/5xx
   statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. One exception:
   a merge `409` for a failed guard (a stale `expected_target_sha`, or a source branch
-  that no longer contains `expected_source_sha`) uses the error body above, as upstream
-  documents ([details](#merge-guards)).
+  that no longer contains `expected_source_sha`) uses the error body above with code
+  `ref_guard_failed`, as upstream documents ([details](#merge-guards)).
 - **Throttling**: every `429` (the gateway [rate limiter](configuration.md#rate-limiting)
   and transient busy/backpressure answers) carries:
   - `Retry-After` (delay-seconds), which takes precedence over the `RateLimit` window;
@@ -279,15 +280,27 @@ Each page runs one `git rev-list --topo-order` walk for `order`, as one more git
 | `POST /repos/branches/create` | git:write | `{target_branch?, base_ref?\|base_branch?(deprecated), preferred_base?, base_is_ephemeral?, target_is_ephemeral?, force?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
 | `DELETE /repos/branches` | git:write | Query `target_branch`, `ephemeral?`. The deprecated body `{target_branch (deprecated alias name), ephemeral?}` still works; a query parameter that is present wins over its body field, even when empty → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent): 409 for the query form, 403 for the body form |
 | `GET /repos/branches/diff` | git:read | **Deprecated upstream** (both path styles); still implemented. Use `GET /repos/diff` ([migration](#migrating-from-branchesdiff)). `branch` (req), `base?` (defaults to the repo default branch), `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, merge_base_sha, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}`; `merge_base_sha` is empty when the histories are unrelated (direct `base..branch` diff) |
-| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`). A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: conflict` ([details](#merge-guards)) |
+| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`). A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: ref_guard_failed` ([details](#merge-guards)) |
 | `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
 
 #### Merge guards
 
+A failed guard answers `409` with the error body before any merge work, and nothing
+changes. The body has `code: ref_guard_failed` and two more members, as upstream's
+`RefGuardProblemDetails`:
+
+- `guard`: the request field of the guard that failed, `expected_target_sha` or
+  `expected_source_sha`.
+- `current_sha`: the tip of the guarded branch when the server checked the guard, or
+  40 zeros when the source branch does not exist. Send it as the guard of the next
+  attempt.
+
+Before [#568](https://github.com/coder/openstorage/issues/568), the code was
+`conflict`, without `guard` and `current_sha`.
+
 `expected_target_sha` (a full 40-hex commit SHA) requires the target branch to still
-point at that commit. If it does not, the merge answers `409` with the error body
-(`code: conflict`, `detail` "expected_target_sha … does not match current tip …")
-before any merge work, and nothing changes. v0.18.0 and earlier answered `412`
+point at that commit. If it does not, the guard fails (`detail` "expected_target_sha …
+does not match current tip …"). v0.18.0 and earlier answered `412`
 `precondition_failed` with a `result` object
 ([#532](https://github.com/coder/openstorage/issues/532)).
 
@@ -297,17 +310,18 @@ commit instead of the current tip of `source_ref`. Use it to merge exactly the
 moved on since.
 
 - The source branch must still contain the commit: the commit is the tip or one of its
-  ancestors. Otherwise the merge answers `409` with the error body (`code: conflict`,
-  `detail` "source branch moved: the source branch does not contain commit …") before
-  any merge work, and nothing changes.
+  ancestors. Otherwise the guard fails (`detail` "source branch moved: the source
+  branch does not contain commit …").
+- A source branch that does not exist fails the guard too, with `current_sha` 40
+  zeros. Without `expected_source_sha`, a missing source branch is `404`.
 - `source.sha` in the response is the pinned commit.
 - An explicit `null`, `""` or any value that is not a full SHA is `400`.
-- `expected_target_sha` is checked first. When both guards fail, the `detail` names the
-  target.
+- `expected_target_sha` is checked first, after both branches are looked up. When both
+  guards fail, the body names the target. A missing target branch is `404`.
 
 This follows the [public OpenAPI](https://code.storage/docs/openapi.yaml) of
-2026-10-16. On 2026-10-22 the cluster OpenAPI served the same spec bytes as the docs,
-so it lists the field too
+2026-10-16 (the field) and 2026-10-27 (`ref_guard_failed`). On 2026-10-27 the cluster
+OpenAPI still served the older spec
 ([snapshot provenance](../explanation/wire-compatibility.md#how-drift-is-tracked)).
 
 #### Migrating from `branches/diff`
