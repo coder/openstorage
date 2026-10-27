@@ -76,6 +76,42 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 	return commits, nil
 }
 
+// CommitsBySHA loads the given commits (resolved full SHAs, duplicates
+// allowed) with one `git log --no-walk --stdin` child, keyed by SHA. It is
+// Heavy: the output grows with the number of commits.
+func CommitsBySHA(ctx context.Context, repoPath string, shas []string) (map[string]Commit, error) {
+	out := make(map[string]Commit, len(shas))
+	if len(shas) == 0 {
+		return out, nil
+	}
+	var in strings.Builder
+	for _, sha := range shas {
+		assertf(ref.ValidSHA(sha), "CommitsBySHA: unresolved sha %q", sha)
+		in.WriteString(sha + "\n")
+	}
+	stdout, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdin: strings.NewReader(in.String()),
+		Args: []string{"log", "--no-walk", "--stdin", "-z", "--format=" + logFormat}})
+	if err != nil {
+		return nil, err
+	}
+	for rec := range strings.SplitSeq(stdout, "\x00") {
+		if rec == "" {
+			continue // trailing record separator
+		}
+		c, err := parseLogRecord(rec)
+		if err != nil {
+			return nil, err
+		}
+		out[c.SHA] = c
+	}
+	for _, sha := range shas {
+		if _, ok := out[sha]; !ok {
+			return nil, fmt.Errorf("log --no-walk did not print commit %s", sha)
+		}
+	}
+	return out, nil
+}
+
 // parseLogRecord parses one \x1f-separated logFormat record.
 func parseLogRecord(rec string) (Commit, error) {
 	fields := strings.Split(rec, "\x1f")

@@ -91,7 +91,7 @@ func TestFilesListingsWithoutLimitReturnEveryEntry(t *testing.T) {
 			pageSize   int
 		}{
 			{"files", "/api/v1/repos/files?recursive=true", 1000},
-			{"files/metadata", "/api/v1/repos/files/metadata", 200},
+			{"files/metadata", "/api/v1/repos/files/metadata?recursive=true", 200},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				for _, q := range []string{"", "&limit=0"} {

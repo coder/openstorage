@@ -17,8 +17,10 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `pagination: {cursor, limit}` in the body). Response: `next_cursor` (opaque string,
   sent only when `has_more` is true; grep alone sends `""` when exhausted) + `has_more`
   (bool). Documented default limit 20, max 100.
-  SDK-observed server defaults differ: files 1000/max 5000, files/metadata 200/max 1000,
-  notes refs 20.
+  `files` and `files/metadata` differ (spec 2026-10-27): with no `limit` and no
+  `cursor`, or `limit=0`, they return every entry with `has_more` false. With a `cursor`
+  and no `limit`, they return pages of 1000 (`files`, max 5000) and 200
+  (`files/metadata`, max 1000). Notes refs default to 20.
 - **Errors**: `{"error": "<unstable human string>"}` + status code, with RFC 9457
   problem-details fields alongside `error`: `type` (`about:blank`), `title` (the status
   text), `status`, `code`, `detail` (same string as `error`), and `instance` (the
@@ -254,8 +256,8 @@ or NUL fails the sync as a configuration error.
 |---|---|---|
 | `GET /repos/file` | `path` (req), `ref`, `ephemeral`, `ephemeral_base`; headers `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` | Raw blob stream. Status 200/206/304/412/416. Headers: `X-Blob-Sha`, `X-Last-Commit-Sha`, `ETag`, `Last-Modified`, `Accept-Ranges`, `Content-Range`, `Content-Type`, `Content-Length` |
 | `HEAD /repos/file` | same | headers only |
-| `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], ref, entries: [{path, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type` |
-| `GET /repos/files/metadata` | same | `{files: [{path, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. **404 on unborn branch** |
+| `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], ref, entries: [{path, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type`. No `limit` and no `cursor` (or `limit=0`): every entry |
+| `GET /repos/files/metadata` | same | `{files: [{path, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. No `limit` and no `cursor` (or `limit=0`): every file. **429** when the files under `path` have more than 50,000 distinct last commits, also with `limit` or `cursor`: a retry gets the same 429 (no `Retry-After`), so send a narrower `path`. **404 on unborn branch** |
 | `POST /repos/archive` | body `{ref?, include_globs?, exclude_globs?, max_blob_size?, archive?: {prefix}}` | tar.gz stream |
 | `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, file_filters?: {include_globs, exclude_globs, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
 | `GET /repos/blame` | `path` (req), `ref`, `ephemeral`, `range` (repeatable, `git blame -L` specs like `1,10`), `detect_moves` | `{ref, path, commit_sha, lines: [{line_number, commit_sha, original_line_number, original_path, previous_commit_sha?, author_name, author_email, author_time, committer_name, committer_email, committer_time, summary}]}` |
@@ -504,7 +506,7 @@ The `git:read` endpoints answer from git subprocesses over a cache repository. A
 | File size | 100 MiB per file, checked from the tree before the file is read. | 422 for `file` (GET and HEAD) and `archive`, before any response byte. |
 | Delivery | Each 64 KiB of a response must reach the client within 30 seconds, and the whole response within 2 minutes of its first byte (`file` and `archive`: 10 minutes). | The connection is closed. The request's slot, memory and temporary files are released. |
 
-The largest git heap measured on a 300,000-commit linear history is 184 MB, for `git log -1 -- <file added in the root commit>`, so such histories are served. Histories past roughly 400,000 commits can get 422 for per-file history walks and `blame` of old files. Deep `commits` pages need less memory: they still fit at 1,000,000 commits (at most 232 MiB) and are estimated to reach the cap at roughly 1.1 million. A `files/metadata` page whose per-file walks and `order` walk need more than 30 seconds in total gets 503; request smaller pages with `limit`. Commit-graphs, which full hydrates now write ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)), make these walks cheaper when present, but the limits do not depend on them: the measurements above are without a commit-graph.
+On a 300,000-commit linear history, `git log -1 -- <file added in the root commit>` needs 184 MB of git heap, and the `files/metadata` history walk for files that date from the root commit needs 226 MiB, so such histories are served. Histories past roughly 400,000 commits can get 422 for per-file history walks and `blame` of old files. Deep `commits` pages need less memory: they still fit at 1,000,000 commits (at most 232 MiB) and are estimated to reach the cap at roughly 1.1 million. Every `files/metadata` call, whatever its `limit`, walks history once for all files under `path`, down to the oldest of their last commits. A call whose walks need more than 30 seconds in total gets 503; send a narrower `path`. On that 300,000-commit history, a call took 20 seconds. Commit-graphs, which full hydrates now write ([ADR-47](../adr/047-cache-repos-get-split-commit-graphs-written-by-full-hydrates.md)), make these walks cheaper when present, but the limits do not depend on them: the measurements above are without a commit-graph.
 
 | Endpoint | git work | Cost grows with |
 |---|---|---|
@@ -512,7 +514,7 @@ The largest git heap measured on a 300,000-commit linear history is 184 MB, for 
 | `commits` | `git log --skip=<cursor offset> -n <limit+1> [-- path]` | cursor offset; history searched for `path` |
 | `commit` | `git log -n 1`, `git cat-file commit` | the commit object (single object) |
 | `files` | `git ls-tree [-r]` | tree size |
-| `files/metadata` | `git ls-tree -r`, then one `git log -1 -- <path>` per listed file, then one `git rev-list --topo-order` for `order` | tree size; page size × history depth; history depth |
+| `files/metadata` | `git ls-tree -r`; `git rev-list --topo-order --parents` and `git diff-tree --stdin` for the last commit of every file under `path`; `git log --no-walk` for the listed files' commits; `git rev-list --topo-order` for `order` | tree size; history depth to the oldest last commit; history depth |
 | `file` | `git ls-tree`, `git log -1 -- <path>`, `git cat-file blob` | history depth; file size |
 | `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git ls-tree` and `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
 | `blame` | `git blame` | file length × history depth |
