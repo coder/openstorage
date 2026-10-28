@@ -120,7 +120,9 @@ func parseBlamePorcelain(out string) ([]BlameLine, error) {
 				}
 				meta.previous = prevSHA
 			case "filename":
-				meta.filename = value
+				if meta.filename, err = unquoteGitPath(value); err != nil {
+					return nil, err
+				}
 			default:
 				// author-tz/committer-tz (read via blameTZ), boundary, and
 				// any future keys are intentionally skipped.
@@ -146,6 +148,65 @@ func parseBlamePorcelain(out string) ([]BlameLine, error) {
 	}
 	return lines, nil
 }
+
+// unquoteGitPath reverses git's C-style path quoting (quote_c_style in
+// git's quote.c). git prints a name verbatim unless it holds a control
+// character, `"` or `\`, or (with core.quotePath, the default) a byte of
+// 0x80 or above. Then git prints it in double quotes, with \a \b \t \n \v
+// \f \r \" \\ and three-digit octal escapes. Raw bytes inside the quotes
+// are kept, so the result is the tree entry name with either
+// core.quotePath setting (#590).
+func unquoteGitPath(s string) (string, error) {
+	if !strings.HasPrefix(s, `"`) {
+		return s, nil
+	}
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if c == '"' {
+			if i != len(s)-1 {
+				return "", fmt.Errorf("git quoted path %q has bytes after the closing quote", s)
+			}
+			return b.String(), nil
+		}
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		if i++; i == len(s) {
+			break
+		}
+		switch e := s[i]; e {
+		case 'a':
+			b.WriteByte('\a')
+		case 'b':
+			b.WriteByte('\b')
+		case 't':
+			b.WriteByte('\t')
+		case 'n':
+			b.WriteByte('\n')
+		case 'v':
+			b.WriteByte('\v')
+		case 'f':
+			b.WriteByte('\f')
+		case 'r':
+			b.WriteByte('\r')
+		case '"', '\\':
+			b.WriteByte(e)
+		case '0', '1', '2', '3':
+			if i+2 >= len(s) || !isOctal(s[i+1]) || !isOctal(s[i+2]) {
+				return "", fmt.Errorf("git quoted path %q has a bad octal escape", s)
+			}
+			b.WriteByte((e-'0')<<6 | (s[i+1]-'0')<<3 | (s[i+2] - '0'))
+			i += 2
+		default:
+			return "", fmt.Errorf("git quoted path %q has escape \\%c", s, e)
+		}
+	}
+	return "", fmt.Errorf("git quoted path %q has no closing quote", s)
+}
+
+func isOctal(c byte) bool { return '0' <= c && c <= '7' }
 
 // parseBlameHeader parses `<sha> <orig-line> <final-line> [<group-size>]`.
 func parseBlameHeader(line string) (sha string, origLine, finalLine int, err error) {
