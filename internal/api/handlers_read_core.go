@@ -556,9 +556,10 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 	}
 
 	commits, err := gitread.Log(r.Context(), repoPath, anchor, gitread.LogOptions{
-		Path:     q.Get("path"),
-		Skip:     offset,
-		MaxCount: limit + 1,
+		Path:        q.Get("path"),
+		Skip:        offset,
+		MaxCount:    limit + 1,
+		SubjectOnly: true,
 	})
 	if err != nil {
 		s.internalErr(w, r, "list commits", err)

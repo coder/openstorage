@@ -22,8 +22,8 @@ type Commit struct {
 	CommitterName  string
 	CommitterEmail string
 	CommitterDate  time.Time
-	Message        string // full raw message (%B): subject + body, usually newline-terminated
-	Subject        string // subject line (%s): the first paragraph as one line, no newline
+	Message        string // full raw message (%B): subject + body, usually newline-terminated; "" under LogOptions.SubjectOnly
+	Subject        string // subject line (%s), set only under LogOptions.SubjectOnly
 }
 
 // LogOptions tune one Log invocation. The zero value lists the full history.
@@ -31,18 +31,27 @@ type LogOptions struct {
 	Path     string // non-empty limits to commits touching Path (`-- <path>`, no --follow)
 	Skip     int    // --skip offset (tip-anchored cursor pagination)
 	MaxCount int    // >0 caps the returned commits (-n); 0 = unlimited
+	// SubjectOnly renders the subject line (%s: the first paragraph as one
+	// line) into Commit.Subject instead of the full message, so git prints
+	// no body.
+	SubjectOnly bool
 }
 
-// logFormat renders one record as 11 \x1f-separated fields; records are
-// \x00-separated via -z. %aI/%cI are strict ISO 8601 (RFC 3339).
-const logFormat = "%H%x1f%T%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%s%x1f%B"
+// logFormat renders one record as 10 \x1f-separated fields; records are
+// \x00-separated via -z. %aI/%cI are strict ISO 8601 (RFC 3339). Log swaps
+// the final %B for %s under LogOptions.SubjectOnly.
+const logFormat = "%H%x1f%T%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%B"
 
 // Log lists commits reachable from rev (a resolved full SHA), newest first
 // in commit-graph order (git log default — invariant 9).
 func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, error) {
 	assertf(ref.ValidSHA(rev), "Log: unresolved rev %q", rev)
 	assertf(opts.Skip >= 0 && opts.MaxCount >= 0, "Log: negative Skip/MaxCount %+v", opts)
-	args := []string{"log", "-z", "--format=" + logFormat}
+	format := logFormat
+	if opts.SubjectOnly {
+		format = strings.TrimSuffix(logFormat, "%B") + "%s"
+	}
+	args := []string{"log", "-z", "--format=" + format}
 	if opts.Skip > 0 {
 		args = append(args, "--skip="+strconv.Itoa(opts.Skip))
 	}
@@ -72,6 +81,12 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 		if err != nil {
 			return nil, err
 		}
+		if opts.SubjectOnly {
+			if strings.Contains(c.Message, "\n") {
+				return nil, fmt.Errorf("log emitted multi-line subject in %.80q", rec)
+			}
+			c.Subject, c.Message = c.Message, ""
+		}
 		commits = append(commits, c)
 	}
 	return commits, nil
@@ -80,7 +95,7 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 // parseLogRecord parses one \x1f-separated logFormat record.
 func parseLogRecord(rec string) (Commit, error) {
 	fields := strings.Split(rec, "\x1f")
-	if len(fields) != 11 {
+	if len(fields) != 10 {
 		return Commit{}, fmt.Errorf("log emitted %d fields in %.80q", len(fields), rec)
 	}
 	c := Commit{
@@ -91,14 +106,10 @@ func parseLogRecord(rec string) (Commit, error) {
 		AuthorEmail:    fields[4],
 		CommitterName:  fields[6],
 		CommitterEmail: fields[7],
-		Subject:        fields[9],
-		Message:        fields[10],
+		Message:        fields[9],
 	}
 	if !ref.ValidSHA(c.SHA) || !ref.ValidSHA(c.TreeSHA) {
 		return Commit{}, fmt.Errorf("log emitted malformed sha in %.80q", rec)
-	}
-	if strings.Contains(c.Subject, "\n") {
-		return Commit{}, fmt.Errorf("log emitted multi-line subject in %.80q", rec)
 	}
 	for p := range strings.FieldsSeq(fields[2]) {
 		if !ref.ValidSHA(p) {
