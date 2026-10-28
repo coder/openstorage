@@ -1,8 +1,10 @@
 package gitread
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"io"
@@ -392,6 +394,201 @@ func TestLastCommitsKeepsBudgetErrorsOfDiffTree(t *testing.T) {
 	assertNoChildren(t)
 }
 
+// execDiffer answers each walk request with its own `git diff-tree` run,
+// parsed by a diffReader, and counts the requests in flight.
+type execDiffer struct {
+	t        *testing.T
+	dir      string
+	index    map[string]int32
+	queue    []diffSection
+	inputs   []string
+	inFlight int // most requests sent and not yet received
+}
+
+func (e *execDiffer) send(input string) error {
+	args := append([]string{"diff-tree", "--root", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none"}, strings.Fields(input)...)
+	out := mustGit(e.t, e.dir, args...)
+	d := &diffReader{index: e.index, sections: make(chan diffSection, 1)}
+	if _, err := d.Write([]byte(out + "\n")); err != nil {
+		return d.err
+	}
+	e.queue = append(e.queue, <-d.sections)
+	e.inputs = append(e.inputs, input)
+	e.inFlight = max(e.inFlight, len(e.queue))
+	return nil
+}
+
+func (e *execDiffer) recv() (diffSection, error) {
+	if len(e.queue) == 0 {
+		return diffSection{}, errors.New("recv with no request in flight")
+	}
+	s := e.queue[0]
+	e.queue = e.queue[1:]
+	return s, nil
+}
+
+// TestLastCommitWalkSendsAheadWithinWindow pins #588: on a linear history
+// the walk keeps lastCommitWindow requests in flight instead of one, never
+// more than one past the window, and still finds every answer and rank.
+func TestLastCommitWalkSendsAheadWithinWindow(t *testing.T) {
+	const n = 60
+	var in strings.Builder
+	for i := range n {
+		fmt.Fprintf(&in, "commit refs/heads/main\nmark :%d\ncommitter T <t@example.com> %d +0000\ndata 0\n", i+1, 1700000000+i)
+		if i == 0 {
+			in.WriteString("M 100644 inline cold.txt\ndata 5\ncold\n")
+		} else {
+			fmt.Fprintf(&in, "from :%d\n", i)
+		}
+		if i == n/2 {
+			in.WriteString("M 100644 inline mid.txt\ndata 4\nmid\n")
+		}
+		fmt.Fprintf(&in, "M 100644 inline hot.txt\ndata %d\n%d\n\n", len(fmt.Sprint(i))+1, i)
+	}
+	dir := lcFastImport(t, in.String())
+	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
+	paths := []string{"cold.txt", "hot.txt", "mid.txt"}
+	w := newLastCommitWalk(tip, paths, 10)
+	e := &execDiffer{t: t, dir: dir, index: w.index}
+	spool := bufio.NewReaderSize(strings.NewReader(mustGit(t, dir, "rev-list", "--topo-order", "--parents", tip)), maxParentsLine+1)
+	if err := w.walk(spool, e); err != nil {
+		t.Fatal(err)
+	}
+	want := lcOracle(t, dir, tip, paths)
+	ranks := lcRanks(t, dir, tip)
+	for i, p := range paths {
+		if w.last[i] != want[p] || w.order[w.last[i]] != ranks[w.last[i]] {
+			t.Errorf("%s = %s rank %d, want %s rank %d", p, w.last[i], w.order[w.last[i]], want[p], ranks[want[p]])
+		}
+	}
+	if e.inFlight != lastCommitWindow {
+		t.Errorf("at most %d requests in flight, want %d", e.inFlight, lastCommitWindow)
+	}
+	// Every commit holds a waiting path, so each is diffed exactly once.
+	if len(e.inputs) != n {
+		t.Errorf("%d requests for %d commits: %q", len(e.inputs), n, e.inputs)
+	}
+}
+
+// TestLastCommitWalkBoundsRequestsInFlight: the tip is a merge whose path
+// comes from the second parent, while the first-parent chain rewrites it.
+// The walk must not send that chain ahead (a merge's paths may all leave by
+// a later parent, so nothing is sent ahead past a merge), and must keep the
+// requests in flight within the window.
+func TestLastCommitWalkBoundsRequestsInFlight(t *testing.T) {
+	const n = 3 * lastCommitWindow
+	var in strings.Builder
+	mark := 1
+	commit := func(from int, file, data string) int {
+		fmt.Fprintf(&in, "commit refs/heads/b%d\nmark :%d\ncommitter T <t@example.com> %d +0000\ndata 0\n", mark, mark, 1700000000+mark)
+		if from > 0 {
+			fmt.Fprintf(&in, "from :%d\n", from)
+		}
+		fmt.Fprintf(&in, "M 100644 inline %s\ndata %d\n%s\n\n", file, len(data), data)
+		mark++
+		return mark - 1
+	}
+	root := commit(0, "p.txt", "p\n")
+	side, mainline := root, commit(root, "p.txt", "changed on the first-parent side\n")
+	for i := range n {
+		side = commit(side, "b.txt", fmt.Sprint(i))
+		mainline = commit(mainline, "a.txt", fmt.Sprint(i))
+	}
+	// The tip takes p.txt from the second parent's side.
+	fmt.Fprintf(&in, "commit refs/heads/main\ncommitter T <t@example.com> 1800000000 +0000\ndata 0\nfrom :%d\nmerge :%d\nM 100644 inline p.txt\ndata 2\np\n\n", mainline, side)
+	dir := lcFastImport(t, in.String())
+	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
+	w := newLastCommitWalk(tip, []string{"p.txt"}, 10)
+	e := &execDiffer{t: t, dir: dir, index: w.index}
+	spool := bufio.NewReaderSize(strings.NewReader(mustGit(t, dir, "rev-list", "--topo-order", "--parents", tip)), maxParentsLine+1)
+	if err := w.walk(spool, e); err != nil {
+		t.Fatal(err)
+	}
+	if want := lcOracle(t, dir, tip, []string{"p.txt"}); w.last[0] != want["p.txt"] {
+		t.Fatalf("p.txt = %s, want %s", w.last[0], want["p.txt"])
+	}
+	if e.inFlight > lastCommitWindow+1 {
+		t.Fatalf("%d requests in flight, want at most %d", e.inFlight, lastCommitWindow+1)
+	}
+	// The chain below the tip's first parent, without the shared root.
+	rootSHA := strings.TrimSpace(mustGit(t, dir, "rev-list", "--max-parents=0", "main"))
+	firstParent := strings.Fields(mustGit(t, dir, "rev-list", "--first-parent", "main~1", "^"+rootSHA))
+	for _, input := range e.inputs {
+		if slices.Contains(firstParent, strings.Fields(input)[0]) {
+			t.Fatalf("the walk diffed first-parent commit %s, which no path reaches (inputs %q)", input, e.inputs)
+		}
+	}
+}
+
+// tableDiffer answers walk requests from a table of changed paths per
+// diff-tree input ("" lists nothing), for spools that git would not print
+// but that the walk must handle: any order with children before parents.
+type tableDiffer struct {
+	changed map[string][]int32
+	queue   []diffSection
+	inputs  []string
+}
+
+func (d *tableDiffer) send(input string) error {
+	d.queue = append(d.queue, diffSection{changed: d.changed[input]})
+	d.inputs = append(d.inputs, input)
+	return nil
+}
+
+func (d *tableDiffer) recv() (diffSection, error) {
+	if len(d.queue) == 0 {
+		return diffSection{}, errors.New("recv with no request in flight")
+	}
+	s := d.queue[0]
+	d.queue = d.queue[1:]
+	return s, nil
+}
+
+// TestLastCommitWalkCancelsDeadChains: the tip T merges chains D and E,
+// whose lines the spool interleaves. p takes D and resolves at D1, so the
+// rest of D is dead, while q walks all of E, and each E line makes the walk
+// wait. The walk must stop sending D ahead once D1 resolves: at most one
+// window of D's diffs is wasted, not the whole chain.
+func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
+	const n = 4 * lastCommitWindow
+	id := func(name string) string { return fmt.Sprintf("%x", sha1.Sum([]byte(name))) }
+	p, q := int32(0), int32(1)
+	tip, root := id("T"), id("R")
+	changed := map[string][]int32{tip + " " + id("D1"): {q}, id("D1") + " " + id("D2"): {p}, root: {p, q}}
+	var spool strings.Builder
+	fmt.Fprintf(&spool, "%s %s %s\n", tip, id("D1"), id("E1"))
+	for i := 1; i <= n; i++ {
+		next := func(chain string) string {
+			if i == n {
+				return root
+			}
+			return id(fmt.Sprintf("%s%d", chain, i+1))
+		}
+		fmt.Fprintf(&spool, "%s %s\n%s %s\n", id(fmt.Sprintf("D%d", i)), next("D"), id(fmt.Sprintf("E%d", i)), next("E"))
+	}
+	spool.WriteString(root + "\n")
+
+	w := newLastCommitWalk(tip, []string{"p", "q"}, 10)
+	d := &tableDiffer{changed: changed}
+	if err := w.walk(bufio.NewReader(strings.NewReader(spool.String())), d); err != nil {
+		t.Fatal(err)
+	}
+	if w.last[p] != id("D1") || w.last[q] != root {
+		t.Fatalf("answers %v, want p at D1 and q at the root", w.last)
+	}
+	wasted := 0
+	for _, input := range d.inputs {
+		for i := 2; i <= n; i++ {
+			if strings.HasPrefix(input, id(fmt.Sprintf("D%d", i))) {
+				wasted++
+			}
+		}
+	}
+	if wasted > lastCommitWindow {
+		t.Fatalf("%d of the %d dead D commits were diffed, want at most %d", wasted, n-1, lastCommitWindow)
+	}
+}
+
 // TestDiffReaderFieldsSplitAcrossWrites feeds real diff-tree answers to
 // the reader one byte per Write, since pipes split fields anywhere, and
 // compares them with the answers from one Write.
@@ -567,6 +764,16 @@ func TestDiffReaderCapsFields(t *testing.T) {
 	}
 	if !errors.Is(err, ErrStop) || !errors.Is(d.err, ErrOutputLimit) {
 		t.Fatalf("long field: err %v / %v, want ErrStop and ErrOutputLimit", err, d.err)
+	}
+}
+
+// TestDiffReaderStopsGitOnceTheWalkIsDone: after the walk ends, output
+// for requests still in flight stops git and is not parsed.
+func TestDiffReaderStopsGitOnceTheWalkIsDone(t *testing.T) {
+	d := &diffReader{index: map[string]int32{"x": 0}, sections: make(chan diffSection, 1)}
+	d.done.Store(true)
+	if n, err := d.Write([]byte(strings.Repeat("a", 40) + "\x00\n")); n != 0 || !errors.Is(err, ErrStop) || len(d.sections) != 0 {
+		t.Fatalf("Write after done = %d, %v, %d answers; want 0, ErrStop, none", n, err, len(d.sections))
 	}
 }
 
