@@ -231,15 +231,15 @@ type lastCommitWalk struct {
 	max     int
 	expect  *bufio.Reader // the spooled rev-list output
 
-	// The commit whose diffs are arriving.
+	// The commit whose diffs are arriving, one section per parent.
 	cur      string
-	curSet   pathSet // the paths waiting on cur
+	curSet   pathSet // paths waiting on cur that every diff so far changed
 	parents  []string
-	sections int       // headers seen for cur
-	changed  []pathSet // per parent: waiting paths that differ
-	present  pathSet   // root: waiting paths in its tree
-	partial  []byte    // an unterminated field
-	pathNext bool      // the next field is a raw record's path
+	sections int     // headers seen for cur
+	changed  pathSet // curSet paths the current section's diff changes
+	present  pathSet // root: waiting paths in its tree
+	partial  []byte  // an unterminated field
+	pathNext bool    // the next field is a raw record's path
 	err      error
 }
 
@@ -321,13 +321,9 @@ func (w *lastCommitWalk) field(f []byte) error {
 		}
 		if len(w.parents) == 0 {
 			w.present[i] = struct{}{}
-			return nil
+		} else {
+			w.changed[i] = struct{}{}
 		}
-		k := w.sections - 1
-		if w.changed[k] == nil {
-			w.changed[k] = pathSet{}
-		}
-		w.changed[k][i] = struct{}{}
 		return nil
 	case len(f) > 0 && f[0] == ':':
 		if w.cur == "" {
@@ -349,6 +345,7 @@ func (w *lastCommitWalk) field(f []byte) error {
 		if sha != w.cur {
 			return fmt.Errorf("diff-tree: header %s, want %s", sha, w.cur)
 		}
+		w.endSection()
 		w.sections++
 		return nil
 	}
@@ -365,9 +362,22 @@ func (w *lastCommitWalk) field(f []byte) error {
 	}
 	w.cur, w.curSet, w.parents, w.sections = sha, w.waiting[sha], fields[1:], 1
 	delete(w.waiting, sha) // no later commit hands paths to cur
-	w.changed = make([]pathSet, len(w.parents))
-	w.present = pathSet{}
+	w.changed, w.present = pathSet{}, pathSet{}
 	return nil
+}
+
+// endSection ends the diff against parent k = sections-1. The waiting
+// paths it leaves unchanged go to that parent: git follows the first
+// TREESAME parent. The paths it changed stay for the next parent's diff.
+// So the state per commit is one set of paths, not one per parent.
+func (w *lastCommitWalk) endSection() {
+	for i := range w.changed {
+		delete(w.curSet, i)
+	}
+	if len(w.curSet) > 0 {
+		w.hand(w.parents[w.sections-1], w.curSet)
+	}
+	w.curSet, w.changed = w.changed, pathSet{}
 }
 
 // finish moves or resolves the paths waiting on the current commit, once
@@ -379,9 +389,8 @@ func (w *lastCommitWalk) finish() error {
 	if w.pathNext || len(w.partial) > 0 || w.sections != max(1, len(w.parents)) {
 		return fmt.Errorf("diff-tree: output for %s ended early", w.cur)
 	}
-	set := w.curSet
 	if len(w.parents) == 0 {
-		for i := range set {
+		for i := range w.curSet {
 			if _, ok := w.present[i]; !ok {
 				return fmt.Errorf("path %q is not in the tree of %s", w.paths[i], w.rev)
 			}
@@ -389,26 +398,11 @@ func (w *lastCommitWalk) finish() error {
 				return err
 			}
 		}
-	} else if len(set) > 0 {
-		// The paths the diff against the first parent leaves unchanged go
-		// to that parent together. Each other path goes to its first
-		// TREESAME parent, as git's simplification does; with none, cur
-		// changed it.
-		for i := range w.changed[0] {
-			delete(set, i)
-		}
-		w.hand(w.parents[0], set)
-		for i := range w.changed[0] {
-			next := ""
-			for k := 1; k < len(w.parents); k++ {
-				if _, ch := w.changed[k][i]; !ch {
-					next = w.parents[k]
-					break
-				}
-			}
-			if next != "" {
-				w.hand(next, pathSet{i: {}})
-			} else if err := w.resolve(i); err != nil {
+	} else {
+		w.endSection()
+		// Changed against every parent: cur is the answer.
+		for i := range w.curSet {
+			if err := w.resolve(i); err != nil {
 				return err
 			}
 		}

@@ -940,10 +940,12 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 		next = coreCursorEncode(cursorKindFileMeta, page[len(page)-1].Path)
 	}
 	assertPageCursor(hasMore, next)
-	// Without a limit the page is the whole tree: stream its files.
+	// Without a limit the page is the whole tree: stream its files, and
+	// its commits (up to 50,000 push-controlled messages, which JSON
+	// escaping can grow 6-fold).
 	writeJSONLists(w, http.StatusOK, listFilesMetadataResponse{
 		Files:      []fileMetaEntry{},
-		Commits:    commitsMap,
+		Commits:    map[string]fileMetaCommit{},
 		Ref:        refLabel,
 		NextCursor: next,
 		HasMore:    hasMore,
@@ -959,6 +961,12 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 				LastCommitSHA: pageLast[i],
 				Type:          e.Type,
 			}) {
+				return
+			}
+		}
+	}}, jsonList{"commits", func(yield func(any) bool) {
+		for _, sha := range slices.Sorted(maps.Keys(commitsMap)) {
+			if !yield(jsonMember{sha, commitsMap[sha]}) {
 				return
 			}
 		}

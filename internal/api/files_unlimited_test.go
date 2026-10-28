@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -219,11 +221,18 @@ func TestWriteJSONListsMatchesWriteJSON(t *testing.T) {
 	}
 	whole := httptest.NewRecorder()
 	files := []fileMetaEntry{{Path: "x", Mode: "100644", Size: 3, LastCommitSHA: "c1", Type: "blob"}}
-	commits := map[string]fileMetaCommit{"c1": {Author: "a", Date: "d", Message: "m", Order: 0}, "c0": {Order: 1}}
+	commits := map[string]fileMetaCommit{"c1": {Author: "a", Date: "d", Message: "m <&>\x01", Order: 0}, "c0": {Order: 1}, "b<": {Order: 2}}
 	writeJSON(whole, http.StatusOK, listFilesMetadataResponse{Files: files, Commits: commits, Ref: "r"})
 	streamed := httptest.NewRecorder()
-	writeJSONLists(streamed, http.StatusOK, listFilesMetadataResponse{Files: []fileMetaEntry{}, Commits: commits, Ref: "r"},
-		jsonList{"files", func(yield func(any) bool) { yield(files[0]) }})
+	writeJSONLists(streamed, http.StatusOK, listFilesMetadataResponse{Files: []fileMetaEntry{}, Commits: map[string]fileMetaCommit{}, Ref: "r"},
+		jsonList{"files", func(yield func(any) bool) { yield(files[0]) }},
+		jsonList{"commits", func(yield func(any) bool) {
+			for _, sha := range slices.Sorted(maps.Keys(commits)) {
+				if !yield(jsonMember{sha, commits[sha]}) {
+					return
+				}
+			}
+		}})
 	if whole.Body.String() != streamed.Body.String() {
 		t.Fatalf("streamed %q, want %q", streamed.Body, whole.Body)
 	}

@@ -398,17 +398,26 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// jsonList is one list of a writeJSONLists body: key's value, which is an
-// empty list in the template, is replaced by items.
+// jsonList is one list or object of a writeJSONLists body: key's value,
+// an empty list or object in the template, is filled with items. An
+// object's items are jsonMembers, in the order json.Marshal sorts a map's
+// keys.
 type jsonList struct {
 	key   string
 	items iter.Seq[any]
 }
 
+// jsonMember is one name and value of a streamed JSON object.
+type jsonMember struct {
+	name  string
+	value any
+}
+
 // writeJSONLists writes the same bytes writeJSON writes for v with every
-// list in lists filled in, but marshals one list item at a time, so a body
-// with hundreds of thousands of entries is never buffered whole. v is the
-// response with those lists empty; lists are in the order v encodes them.
+// list in lists filled in, but marshals one item at a time, so a body with
+// hundreds of thousands of entries is never buffered whole. v is the
+// response with those lists and objects empty; lists are in the order v
+// encodes them.
 func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList) {
 	assertf(status >= 200 && status < 300, "writeJSONLists called with status %d", status)
 	tmpl, err := json.Marshal(v)
@@ -420,19 +429,35 @@ func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList)
 	// and the listing. bufio.Writer keeps failing after its first error.
 	bw := bufio.NewWriterSize(w, 64<<10)
 	for _, l := range lists {
-		// A string value cannot contain this marker: its quotes would be
+		// A string value cannot contain these markers: its quotes would be
 		// escaped. Each list key appears once in our response types.
-		marker := []byte(`"` + l.key + `":[]`)
+		list, object := []byte(`"`+l.key+`":[]`), []byte(`"`+l.key+`":{}`)
+		isObject := bytes.Contains(tmpl, object)
+		marker := list
+		if isObject {
+			marker = object
+		}
 		i := bytes.Index(tmpl, marker)
-		assertf(i >= 0 && bytes.Count(tmpl, marker) == 1, "writeJSONLists: %s is not one empty list in %.200s", l.key, tmpl)
-		cut := i + len(marker) - 1 // just after "["
+		assertf(i >= 0 && bytes.Count(tmpl, list)+bytes.Count(tmpl, object) == 1, "writeJSONLists: %s is not one empty list or object in %.200s", l.key, tmpl)
+		cut := i + len(marker) - 1 // just after "[" or "{"
 		if _, err := bw.Write(tmpl[:cut]); err != nil {
 			return
 		}
 		sep := false
 		for item := range l.items {
-			b, err := json.Marshal(item)
-			assertf(err == nil, "writeJSONLists: marshal %s item: %v", l.key, err)
+			var b []byte
+			m, ok := item.(jsonMember)
+			assertf(ok == isObject, "writeJSONLists: %s: member %v, object %v", l.key, ok, isObject)
+			if ok {
+				name, err := json.Marshal(m.name)
+				assertf(err == nil, "writeJSONLists: marshal %s name: %v", l.key, err)
+				value, err := json.Marshal(m.value)
+				assertf(err == nil, "writeJSONLists: marshal %s value: %v", l.key, err)
+				b = append(append(name, ':'), value...)
+			} else {
+				b, err = json.Marshal(item)
+				assertf(err == nil, "writeJSONLists: marshal %s item: %v", l.key, err)
+			}
 			if sep {
 				_ = bw.WriteByte(',') // a failure sticks: the next Write reports it
 			}
