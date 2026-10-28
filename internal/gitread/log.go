@@ -42,9 +42,10 @@ type LogOptions struct {
 // fields are NUL-separated, and -z ends each record with a NUL. git prints
 // no NUL inside a field (it stops a message at its first NUL byte), while
 // names, emails and messages may hold any other byte, 0x1f included (#580).
-// %aI/%cI are strict ISO 8601 (RFC 3339). Log swaps the final %B for %s
-// under LogOptions.SubjectOnly.
-const logFormat = "%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B"
+// The dates are Unix seconds (%at/%ct), which identTime reads: %aI/%cI
+// print themselves literally when git cannot parse the ident (#581). Log
+// swaps the final %B for %s under LogOptions.SubjectOnly.
+const logFormat = "%H%x00%T%x00%P%x00%an%x00%ae%x00%at%x00%cn%x00%ce%x00%ct%x00%B"
 
 // logFields is the number of fields in one logFormat record.
 const logFields = 10
@@ -190,11 +191,11 @@ func parseLogRecord(fields []string) (Commit, error) {
 		c.ParentSHAs = append(c.ParentSHAs, p)
 	}
 	var err error
-	if c.AuthorDate, err = time.Parse(time.RFC3339, fields[5]); err != nil {
-		return Commit{}, fmt.Errorf("log emitted author date %q: %w", fields[5], err)
+	if c.AuthorDate, err = identTime(fields[5]); err != nil {
+		return Commit{}, fmt.Errorf("log author date of %s: %w", c.SHA, err)
 	}
-	if c.CommitterDate, err = time.Parse(time.RFC3339, fields[8]); err != nil {
-		return Commit{}, fmt.Errorf("log emitted committer date %q: %w", fields[8], err)
+	if c.CommitterDate, err = identTime(fields[8]); err != nil {
+		return Commit{}, fmt.Errorf("log committer date of %s: %w", c.SHA, err)
 	}
 	return c, nil
 }
