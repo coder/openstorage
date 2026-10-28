@@ -13,8 +13,8 @@ import (
 	"github.com/coder/openstorage/internal/ref"
 )
 
-// maxParentsLine bounds one `rev-list --parents` line, which LastCommits
-// reads twice: about 25,000 parents. A commit with more (git allows any
+// maxParentsLine bounds one `rev-list --parents` line and one diff-tree
+// field: about 25,000 parents. A commit with more (git allows any
 // number, also of duplicates) fails with ErrOutputLimit instead of costing
 // the server memory per parent.
 const maxParentsLine = 1 << 20
@@ -78,36 +78,43 @@ var ErrTooManyLastCommits = errors.New("too many distinct last commits")
 // LastCommits returns, for every path in paths (entries of rev's tree), the
 // commit that `git log -1 rev -- <path>` names, with literal pathspecs, in
 // the order of paths (a slice, not a map: a listing can hold hundreds of
-// thousands of paths). One
-// difference: a submodule's `ignore` setting in .gitmodules never hides a
-// gitlink change. It fails with ErrTooManyLastCommits as soon as more than
-// maxDistinct distinct commits are found.
+// thousands of paths). One difference: a submodule's `ignore` setting in
+// .gitmodules never hides a gitlink change. It also returns the rank of
+// each of those commits: its 0-based position in `git rev-list
+// --topo-order rev` (files/metadata `order`). It fails with
+// ErrTooManyLastCommits as soon as more than maxDistinct distinct commits
+// are found.
 //
 // One walk replaces a `git log -1` per path. `rev-list --topo-order
-// --parents rev` is spooled to a temporary file. Then `diff-tree --stdin`
-// diffs each commit against each parent, in that order. Each path waits at
-// one commit, starting at rev, and moves the way git's default history
-// simplification moves for that path alone. A root commit, or a commit
-// whose diff against every parent changes the path, is the answer. A
-// commit whose diff against a parent leaves the path unchanged hands it to
-// the first such parent. Topological order puts every commit before its
-// parents, so a commit has collected every path waiting on it before its
-// diffs arrive. The walk stops once every path has its commit.
+// --parents rev` is spooled to a temporary file and read one line, so one
+// commit, at a time; the line number is the rank (--parents does not change
+// the order). Each path waits at one commit, starting at rev, and moves the
+// way git's default history simplification moves for that path alone.
+// Topological order puts every commit before its parents, so a commit has
+// collected every path waiting on it when its line is read. The walk asks
+// one `diff-tree --stdin` child for the diff of such a commit against each
+// parent in turn, and waits for each answer. The paths a diff leaves
+// unchanged go to that parent (git follows the first TREESAME parent); the
+// paths it changes stay for the next parent's diff. A root commit, or a
+// commit whose diff against every parent changes the path, is the answer.
+// So a commit that no path waits on is never diffed, and a merge's later
+// parents are not diffed once no path is left: on a history with many
+// merges, the diffs against second parents are most of the work (#576).
+// The walk stops once every path has its commit.
 //
-// Both children are Heavy and run one after the other under the request's
-// budget (see Run).
-func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxDistinct int) ([]string, error) {
+// Both children are Heavy and run under the request's budget (see Run).
+func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxDistinct int) ([]string, map[string]int, error) {
 	assertf(ref.ValidSHA(rev), "LastCommits: unresolved rev %q", rev)
 	assertf(maxDistinct > 0, "LastCommits: maxDistinct %d", maxDistinct)
 	if len(paths) == 0 {
-		return []string{}, nil
+		return []string{}, map[string]int{}, nil
 	}
 	assertf(repoPath != "", "LastCommits: empty repoPath")
 	w := newLastCommitWalk(rev, paths, maxDistinct)
 
 	spool, err := os.CreateTemp("", "openstorage-lastcommits-*")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() {
 		_ = spool.Close()
@@ -115,85 +122,68 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 	}()
 	sw := &spoolWriter{f: spool}
 	if _, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdout: sw, Args: []string{"rev-list", "--topo-order", "--parents", rev}}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if sw.err != nil {
-		return nil, sw.err
+		return nil, nil, sw.err
 	}
-	expect, err := os.Open(spool.Name())
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = expect.Close() }()
-	w.expect = bufio.NewReaderSize(expect, maxParentsLine+1)
 	if _, err := spool.Seek(0, io.SeekStart); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	// diff-tree reads one "<commit> <parent>" line per pair (a root: the
-	// commit alone, diffed against the empty tree by --root) and, with
-	// --always, prints one header per line even when the diff is empty.
-	// The feeder and the walk read the same spool, so the walk knows which
-	// pair each header belongs to.
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	fed := make(chan error, 1)
-	go func() {
-		fed <- feedPairs(stdinW, spool)
-		_ = stdinW.Close()
-	}()
-	args := []string{"diff-tree", "--stdin", "--root", "--always", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none"}
+	d := &diffReader{index: w.index, sections: make(chan diffSection, 1)}
+	args := []string{"diff-tree", "--stdin", "--root", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none"}
 	if spec := commonPathspec(paths); spec != "" {
 		args = append(args, "--", ":(literal)"+spec)
 	}
-	_, err = Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdin: stdinR, Stdout: w, Args: args})
-	// git is reaped: closing the read end fails the feeder's next write.
-	_ = stdinR.Close()
-	feedErr := <-fed
+	ran := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdin: stdinR, Stdout: d, Args: args})
+		// git is reaped: closing the read end fails the walk's next write.
+		_ = stdinR.Close()
+		ran <- err
+	}()
+	var runErr error
+	running := true
+	walkErr := w.walk(bufio.NewReaderSize(spool, maxParentsLine+1), func(input string) (diffSection, error) {
+		// An input line, then an empty line, which diff-tree echoes
+		// after the diff: it marks where the answer ends.
+		if _, err := io.WriteString(stdinW, input+"\n\n"); err != nil {
+			return diffSection{}, fmt.Errorf("diff-tree input: %w", err)
+		}
+		select {
+		case s := <-d.sections:
+			return s, s.err
+		case runErr = <-ran:
+			running = false
+			if runErr == nil {
+				runErr = errors.New("diff-tree ended before its answer")
+			}
+			return diffSection{}, runErr
+		}
+	})
+	// EOF on stdin ends git normally once the walk is done or failed.
+	_ = stdinW.Close()
+	if running {
+		runErr = <-ran
+	}
+	// git's own failure comes before the walk's: a budget kill between two
+	// answers makes the walk's next write fail with EPIPE, but the request
+	// must get the budget error (503 or 422), not that write error.
 	switch {
-	case w.err != nil:
-		return nil, w.err
-	case err != nil:
-		return nil, err
-	case w.left > 0:
-		if feedErr != nil {
-			return nil, feedErr
-		}
-		// git ended on its own: the last commit's diffs are complete.
-		if err := w.finish(); err != nil && !errors.Is(err, ErrStop) {
-			return nil, err
-		}
+	case d.err != nil: // read after Run returned, which reaped git
+		return nil, nil, d.err
+	case runErr != nil:
+		return nil, nil, runErr
+	case walkErr != nil:
+		return nil, nil, walkErr
 	}
 	assertf(w.left == 0, "LastCommits: %d paths unresolved after the walk", w.left)
-	return w.last, nil
-}
-
-// feedPairs writes diff-tree's input lines for every rev-list line.
-func feedPairs(dst io.Writer, spool io.Reader) error {
-	bw := bufio.NewWriter(dst)
-	br := bufio.NewReaderSize(spool, maxParentsLine+1)
-	for {
-		line, err := readRevListLine(br)
-		if err == io.EOF && line == "" {
-			break
-		} else if err != nil && err != io.EOF {
-			return err
-		}
-		f := strings.Fields(line)
-		if len(f) == 1 {
-			if _, err := bw.WriteString(f[0] + "\n"); err != nil {
-				return err
-			}
-		}
-		for _, p := range f[1:] {
-			if _, err := bw.WriteString(f[0] + " " + p + "\n"); err != nil {
-				return err
-			}
-		}
-	}
-	return bw.Flush()
+	return w.last, w.order, nil
 }
 
 // commonPathspec returns the deepest directory that contains every path
@@ -219,7 +209,7 @@ func commonPathspec(paths []string) string {
 	return lo[:i]
 }
 
-// lastCommitWalk consumes diff-tree's -z raw output (an io.Writer for Run).
+// lastCommitWalk holds the paths waiting at each commit.
 type lastCommitWalk struct {
 	rev     string
 	paths   []string
@@ -227,20 +217,8 @@ type lastCommitWalk struct {
 	last    []string         // the answer per path; "" while unresolved
 	waiting map[string]pathSet
 	left    int
-	commits map[string]struct{} // distinct answers
+	order   map[string]int // distinct answers -> rank
 	max     int
-	expect  *bufio.Reader // the spooled rev-list output
-
-	// The commit whose diffs are arriving, one section per parent.
-	cur      string
-	curSet   pathSet // paths waiting on cur that every diff so far changed
-	parents  []string
-	sections int     // headers seen for cur
-	changed  pathSet // curSet paths the current section's diff changes
-	present  pathSet // root: waiting paths in its tree
-	partial  []byte  // an unterminated field
-	pathNext bool    // the next field is a raw record's path
-	err      error
 }
 
 type pathSet map[int32]struct{}
@@ -253,7 +231,7 @@ func newLastCommitWalk(rev string, paths []string, maxDistinct int) *lastCommitW
 		last:    make([]string, len(paths)),
 		waiting: map[string]pathSet{},
 		left:    len(paths),
-		commits: map[string]struct{}{},
+		order:   map[string]int{},
 		max:     maxDistinct,
 	}
 	all := make(pathSet, len(paths))
@@ -280,148 +258,184 @@ func (w *lastCommitWalk) hand(c string, set pathSet) {
 	w.waiting[c] = have
 }
 
-func (w *lastCommitWalk) Write(p []byte) (int, error) {
+// walk reads the spooled rev-list one commit at a time and moves the paths
+// waiting on it (see LastCommits). diff answers one diff-tree input line:
+// "<commit> <parent>", or "<commit>" for a root (diffed against the empty
+// tree, so it lists the paths in the root's tree).
+func (w *lastCommitWalk) walk(spool *bufio.Reader, diff func(input string) (diffSection, error)) error {
+	for rank := 0; w.left > 0; rank++ {
+		line, err := readRevListLine(spool)
+		if err != nil && (err != io.EOF || line == "") {
+			if err == io.EOF {
+				return fmt.Errorf("rev-list of %s ended with %d paths unresolved", w.rev, w.left)
+			}
+			return err
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !ref.ValidSHA(fields[0]) {
+			return fmt.Errorf("rev-list emitted %.80q", line)
+		}
+		c, parents := fields[0], fields[1:]
+		set := w.waiting[c]
+		delete(w.waiting, c) // no later commit hands paths to c
+		if len(set) == 0 {
+			continue
+		}
+		if len(parents) == 0 {
+			s, err := w.diffOf(diff, c, c)
+			if err != nil {
+				return err
+			}
+			present := make(pathSet, len(set))
+			for _, i := range s.changed {
+				present[i] = struct{}{}
+			}
+			for i := range set {
+				if _, ok := present[i]; !ok {
+					return fmt.Errorf("path %q is not in the tree of %s", w.paths[i], w.rev)
+				}
+			}
+		}
+		for _, p := range parents {
+			s, err := w.diffOf(diff, c, c+" "+p)
+			if err != nil {
+				return err
+			}
+			changed := pathSet{}
+			for _, i := range s.changed {
+				if _, ok := set[i]; ok {
+					changed[i] = struct{}{}
+					delete(set, i)
+				}
+			}
+			if len(set) > 0 {
+				w.hand(p, set)
+			}
+			if set = changed; len(set) == 0 {
+				break // later parents cannot change an answer
+			}
+		}
+		// A root, or changed against every parent: c is the answer.
+		for i := range set {
+			if err := w.resolve(i, c, rank); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// diffOf runs one diff and checks that its header (printed only for a
+// non-empty diff) names c.
+func (w *lastCommitWalk) diffOf(diff func(string) (diffSection, error), c, input string) (diffSection, error) {
+	s, err := diff(input)
+	if err == nil && s.header != "" && s.header != c {
+		err = fmt.Errorf("diff-tree: header %s for input %q", s.header, input)
+	}
+	return s, err
+}
+
+// resolve records commit c, of rank rank, as the answer for path i.
+func (w *lastCommitWalk) resolve(i int32, c string, rank int) error {
+	w.last[i] = c
+	w.left--
+	w.order[c] = rank
+	if len(w.order) > w.max {
+		return fmt.Errorf("%w: more than %d", ErrTooManyLastCommits, w.max)
+	}
+	return nil
+}
+
+// diffSection is diff-tree's answer to one input line: the header (empty
+// for an empty diff) and the listed paths that are in the walk's index.
+type diffSection struct {
+	header  string
+	changed []int32
+	err     error
+}
+
+// diffReader parses diff-tree's -z raw output (an io.Writer for Run) into
+// one diffSection per input line. Each answer ends with the echoed empty
+// input line: a "\n" where a header or a record would start, which neither
+// can (a path can, so it is recognized only between records).
+type diffReader struct {
+	index    map[string]int32
+	sections chan diffSection // capacity 1: the walk writes the next line only after reading an answer
+
+	cur      diffSection
+	partial  []byte // an unterminated field
+	pathNext bool   // the next field is a raw record's path
+	err      error  // read by LastCommits only after Run returned
+}
+
+func (d *diffReader) Write(p []byte) (int, error) {
 	n := len(p)
 	for len(p) > 0 {
+		if len(d.partial) == 0 && !d.pathNext && p[0] == '\n' {
+			p = p[1:]
+			select {
+			case d.sections <- d.cur:
+				d.cur = diffSection{}
+				continue
+			default:
+				return 0, d.fail(errors.New("diff-tree answered more lines than it was given"))
+			}
+		}
 		i := bytes.IndexByte(p, 0)
 		if i < 0 {
 			// A path from any commit of the walk, not only from rev's
 			// tree, so the ls-tree output allowance does not bound it.
-			if w.partial = append(w.partial, p...); len(w.partial) > maxParentsLine {
-				w.err = fmt.Errorf("diff-tree field over %d bytes: %w", maxParentsLine, ErrOutputLimit)
-				return 0, ErrStop
+			if d.partial = append(d.partial, p...); len(d.partial) > maxParentsLine {
+				return 0, d.fail(fmt.Errorf("diff-tree field over %d bytes: %w", maxParentsLine, ErrOutputLimit))
 			}
 			break
 		}
 		field := p[:i]
-		if len(w.partial) > 0 {
-			field = append(w.partial, field...)
-			w.partial = nil
+		if len(d.partial) > 0 {
+			field = append(d.partial, field...)
+			d.partial = nil
 		}
 		p = p[i+1:]
-		if err := w.field(field); err != nil {
-			if !errors.Is(err, ErrStop) {
-				w.err = err
-			}
-			return 0, ErrStop
+		if err := d.field(field); err != nil {
+			return 0, d.fail(err)
 		}
 	}
 	return n, nil
 }
 
+// fail keeps err, wakes a walk that waits for an answer, and stops git.
+func (d *diffReader) fail(err error) error {
+	d.err = err
+	select {
+	case d.sections <- diffSection{err: err}:
+	default:
+	}
+	return ErrStop
+}
+
 // field handles one NUL-terminated field: a header (a commit SHA), a raw
 // record (":<modes> <oids> <status>"), or the path that follows a record.
-func (w *lastCommitWalk) field(f []byte) error {
+func (d *diffReader) field(f []byte) error {
 	switch {
-	case w.pathNext:
-		w.pathNext = false
-		i, ok := w.index[string(f)]
-		if _, waits := w.curSet[i]; !ok || !waits {
-			return nil
-		}
-		if len(w.parents) == 0 {
-			w.present[i] = struct{}{}
-		} else {
-			w.changed[i] = struct{}{}
+	case d.pathNext:
+		d.pathNext = false
+		if i, ok := d.index[string(f)]; ok {
+			if len(d.cur.changed) == len(d.index) {
+				return fmt.Errorf("diff-tree listed more than %d paths for one input line", len(d.index))
+			}
+			d.cur.changed = append(d.cur.changed, i)
 		}
 		return nil
 	case len(f) > 0 && f[0] == ':':
-		if w.cur == "" {
-			return fmt.Errorf("diff-tree: record %q before any header", f)
-		}
 		// --no-renames: one path per record, never a rename or copy.
 		if parts := bytes.Split(f, []byte(" ")); len(parts) != 5 || len(parts[4]) != 1 || bytes.ContainsAny(parts[4], "RC") {
 			return fmt.Errorf("diff-tree: unexpected raw record %q", f)
 		}
-		w.pathNext = true
+		d.pathNext = true
+		return nil
+	case d.cur.header == "" && ref.ValidSHA(string(f)):
+		d.cur.header = string(f)
 		return nil
 	}
-	sha := string(f)
-	if !ref.ValidSHA(sha) {
-		return fmt.Errorf("diff-tree: unexpected field %.80q", f)
-	}
-	if w.cur != "" && w.sections < max(1, len(w.parents)) {
-		// Another diff of the same commit, against its next parent.
-		if sha != w.cur {
-			return fmt.Errorf("diff-tree: header %s, want %s", sha, w.cur)
-		}
-		w.endSection()
-		w.sections++
-		return nil
-	}
-	if err := w.finish(); err != nil {
-		return err
-	}
-	line, err := readRevListLine(w.expect)
-	if err != nil {
-		return fmt.Errorf("rev-list spool: %w", err)
-	}
-	fields := strings.Fields(line)
-	if len(fields) == 0 || fields[0] != sha {
-		return fmt.Errorf("diff-tree: header %s, want rev-list line %q", sha, strings.TrimSpace(line))
-	}
-	w.cur, w.curSet, w.parents, w.sections = sha, w.waiting[sha], fields[1:], 1
-	delete(w.waiting, sha) // no later commit hands paths to cur
-	w.changed, w.present = pathSet{}, pathSet{}
-	return nil
-}
-
-// endSection ends the diff against parent k = sections-1. The waiting
-// paths it leaves unchanged go to that parent: git follows the first
-// TREESAME parent. The paths it changed stay for the next parent's diff.
-// So the state per commit is one set of paths, not one per parent.
-func (w *lastCommitWalk) endSection() {
-	for i := range w.changed {
-		delete(w.curSet, i)
-	}
-	if len(w.curSet) > 0 {
-		w.hand(w.parents[w.sections-1], w.curSet)
-	}
-	w.curSet, w.changed = w.changed, pathSet{}
-}
-
-// finish moves or resolves the paths waiting on the current commit, once
-// all of its diffs have arrived. It returns ErrStop when the walk is done.
-func (w *lastCommitWalk) finish() error {
-	if w.cur == "" {
-		return nil
-	}
-	if w.pathNext || len(w.partial) > 0 || w.sections != max(1, len(w.parents)) {
-		return fmt.Errorf("diff-tree: output for %s ended early", w.cur)
-	}
-	if len(w.parents) == 0 {
-		for i := range w.curSet {
-			if _, ok := w.present[i]; !ok {
-				return fmt.Errorf("path %q is not in the tree of %s", w.paths[i], w.rev)
-			}
-			if err := w.resolve(i); err != nil {
-				return err
-			}
-		}
-	} else {
-		w.endSection()
-		// Changed against every parent: cur is the answer.
-		for i := range w.curSet {
-			if err := w.resolve(i); err != nil {
-				return err
-			}
-		}
-	}
-	w.curSet = nil
-	w.cur = ""
-	if w.left == 0 {
-		return ErrStop
-	}
-	return nil
-}
-
-// resolve records the current commit as the answer for path i.
-func (w *lastCommitWalk) resolve(i int32) error {
-	w.last[i] = w.cur
-	w.left--
-	w.commits[w.cur] = struct{}{}
-	if len(w.commits) > w.max {
-		return fmt.Errorf("%w: more than %d", ErrTooManyLastCommits, w.max)
-	}
-	return nil
+	return fmt.Errorf("diff-tree: unexpected field %.80q", f)
 }

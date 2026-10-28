@@ -1,12 +1,12 @@
 package gitread
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ type lcFile struct{ mode, data string }
 func lcHistory(t *testing.T, seed uint64, n int) (dir string, shas []string) {
 	t.Helper()
 	rng := rand.New(rand.NewPCG(seed, 569))
-	paths := []string{"a.txt", "b.txt", "dir/c.txt", "dir/sub/d.txt", "g*.txt", "gx.txt", "g?.txt", "[x].txt", "x.txt", "[d]/e.txt", "[d]/f.txt", ":(attr:x)p/q.txt", "df", "df/in", "link", "mod"}
+	paths := []string{"a.txt", "b.txt", "dir/c.txt", "dir/sub/d.txt", "g*.txt", "gx.txt", "g?.txt", "[x].txt", "x.txt", "[d]/e.txt", "[d]/f.txt", ":(attr:x)p/q.txt", "df", "df/in", "link", "mod", "\nnl.txt"}
 	value := func(p string) lcFile {
 		v := []string{"one", "two", "three"}[rng.IntN(3)]
 		switch p {
@@ -99,7 +100,7 @@ func lcHistory(t *testing.T, seed uint64, n int) (dir string, shas []string) {
 				fmt.Fprintf(&in, "M 160000 %s %s\n", f.data, p)
 				continue
 			}
-			fmt.Fprintf(&in, "M %s inline %s\ndata %d\n%s\n", f.mode, p, len(f.data), f.data)
+			fmt.Fprintf(&in, "M %s inline %s\ndata %d\n%s\n", f.mode, lcQuote(p), len(f.data), f.data)
 		}
 		in.WriteString("\n")
 	}
@@ -129,6 +130,15 @@ func lcHistory(t *testing.T, seed uint64, n int) (dir string, shas []string) {
 	return dir, shas
 }
 
+// lcQuote quotes a fast-import path that holds a newline (a diff-tree
+// answer ends with an echoed newline, so such names must stay paths).
+func lcQuote(p string) string {
+	if strings.Contains(p, "\n") {
+		return strconv.Quote(p)
+	}
+	return p
+}
+
 // lcOracle returns what `git log -1 rev -- <path>` names for each path,
 // with literal pathspecs (the glob-like names above match only themselves).
 func lcOracle(t *testing.T, dir, rev string, paths []string) map[string]string {
@@ -147,20 +157,38 @@ func lcOracle(t *testing.T, dir, rev string, paths []string) map[string]string {
 	return want
 }
 
-// lastCommitsByPath is LastCommits keyed by path.
-func lastCommitsByPath(ctx context.Context, dir, rev string, paths []string, maxDistinct int) (map[string]string, error) {
-	last, err := LastCommits(ctx, dir, rev, paths, maxDistinct)
+// lastCommitsByPath is LastCommits keyed by path. It also checks that the
+// ranks cover exactly the answers.
+func lastCommitsByPath(ctx context.Context, dir, rev string, paths []string, maxDistinct int) (map[string]string, map[string]int, error) {
+	last, ranks, err := LastCommits(ctx, dir, rev, paths, maxDistinct)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(last) != len(paths) {
-		return nil, fmt.Errorf("%d answers for %d paths", len(last), len(paths))
+		return nil, nil, fmt.Errorf("%d answers for %d paths", len(last), len(paths))
 	}
 	m := make(map[string]string, len(paths))
 	for i, p := range paths {
 		m[p] = last[i]
+		if _, ok := ranks[last[i]]; !ok {
+			return nil, nil, fmt.Errorf("no rank for %s", last[i])
+		}
 	}
-	return m, nil
+	if distinct := len(slices.Compact(slices.Sorted(maps.Values(m)))); len(ranks) != distinct {
+		return nil, nil, fmt.Errorf("%d ranks for %d distinct answers", len(ranks), distinct)
+	}
+	return m, ranks, nil
+}
+
+// lcRanks returns every commit's 0-based position in `git rev-list
+// --topo-order rev`, the documented files/metadata `order`.
+func lcRanks(t *testing.T, dir, rev string) map[string]int {
+	t.Helper()
+	ranks := map[string]int{}
+	for i, sha := range strings.Fields(mustGit(t, dir, "rev-list", "--topo-order", rev)) {
+		ranks[sha] = i
+	}
+	return ranks
 }
 
 // TestLastCommitsMatchesGitLog checks the one-walk answer against one
@@ -190,12 +218,18 @@ func TestLastCommitsMatchesGitLog(t *testing.T) {
 					continue
 				}
 				subtrees[sub]++
-				got, err := lastCommitsByPath(ctx, dir, rev, paths, 1000)
+				got, ranks, err := lastCommitsByPath(ctx, dir, rev, paths, 1000)
 				if err != nil {
 					t.Fatalf("seed %d rev %s sub %q: %v", seed, rev, sub, err)
 				}
 				if want := lcOracle(t, dir, rev, paths); fmt.Sprint(got) != fmt.Sprint(want) {
 					t.Fatalf("seed %d rev %s sub %q:\n got %v\nwant %v", seed, rev, sub, got, want)
+				}
+				all := lcRanks(t, dir, rev)
+				for sha, rank := range ranks {
+					if rank != all[sha] {
+						t.Fatalf("seed %d rev %s: rank of %s = %d, want %d (rev-list --topo-order)", seed, rev, sha, rank, all[sha])
+					}
 				}
 			}
 		}
@@ -218,7 +252,7 @@ func TestLastCommitsDistinctLimit(t *testing.T) {
 		paths = append(paths, e.Path)
 	}
 	// c2 changed some files; the rest still date from c1.
-	got, err := lastCommitsByPath(ctx, f.dir, f.c2, paths, 2)
+	got, _, err := lastCommitsByPath(ctx, f.dir, f.c2, paths, 2)
 	if err != nil {
 		t.Fatalf("2 distinct commits with limit 2: %v", err)
 	}
@@ -230,7 +264,7 @@ func TestLastCommitsDistinctLimit(t *testing.T) {
 	if commits = slices.Compact(commits); len(commits) != 2 {
 		t.Fatalf("distinct last commits = %v, want c1 and c2", commits)
 	}
-	if _, err := LastCommits(ctx, f.dir, f.c2, paths, 1); !errors.Is(err, ErrTooManyLastCommits) {
+	if _, _, err := LastCommits(ctx, f.dir, f.c2, paths, 1); !errors.Is(err, ErrTooManyLastCommits) {
 		t.Fatalf("2 distinct commits with limit 1: err = %v, want ErrTooManyLastCommits", err)
 	}
 }
@@ -238,16 +272,16 @@ func TestLastCommitsDistinctLimit(t *testing.T) {
 func TestLastCommitsRejectsPathNotInRev(t *testing.T) {
 	f := newFixture(t)
 	// feature.txt exists only on the feature branch (c3), not at c2.
-	_, err := LastCommits(context.Background(), f.dir, f.c2, []string{"README.md", "feature.txt"}, 10)
+	_, _, err := LastCommits(context.Background(), f.dir, f.c2, []string{"README.md", "feature.txt"}, 10)
 	if err == nil || !strings.Contains(err.Error(), "feature.txt") {
 		t.Fatalf("err = %v, want an error naming feature.txt", err)
 	}
 }
 
 func TestLastCommitsNoPathsRunsNoGit(t *testing.T) {
-	got, err := LastCommits(context.Background(), "/nonexistent/repo", strings.Repeat("a", 40), nil, 1)
-	if err != nil || got == nil || len(got) != 0 {
-		t.Fatalf("got %#v, err %v; want an empty non-nil map", got, err)
+	got, ranks, err := LastCommits(context.Background(), "/nonexistent/repo", strings.Repeat("a", 40), nil, 1)
+	if err != nil || got == nil || len(got) != 0 || ranks == nil || len(ranks) != 0 {
+		t.Fatalf("got %#v %#v, err %v; want empty non-nil results", got, ranks, err)
 	}
 }
 
@@ -272,55 +306,148 @@ func TestCommitsBySHA(t *testing.T) {
 	}
 }
 
-// TestLastCommitWalkFieldsSplitAcrossWrites feeds real diff-tree output to
-// the walk one byte per Write: pipes split fields anywhere.
-func TestLastCommitWalkFieldsSplitAcrossWrites(t *testing.T) {
-	ctx := context.Background()
+// TestLastCommitsDiffsOnlyWhatCanChangeAnAnswer pins #576: a side branch
+// that no waiting path reaches is never diffed, and a merge is not diffed
+// against its second parent once its first parent took every path. A git
+// wrapper on PATH logs the lines diff-tree reads.
+func TestLastCommitsDiffsOnlyWhatCanChangeAnAnswer(t *testing.T) {
+	commit := func(ref string, mark, from int, merge int, file, data string) string {
+		s := fmt.Sprintf("commit refs/heads/%s\nmark :%d\ncommitter T <t@example.com> %d +0000\ndata 0\n", ref, mark, 1700000000+mark)
+		if from > 0 {
+			s += fmt.Sprintf("from :%d\n", from)
+		}
+		if merge > 0 {
+			s += fmt.Sprintf("merge :%d\n", merge)
+		}
+		return s + fmt.Sprintf("M 100644 inline %s\ndata %d\n%s\n", file, len(data), data)
+	}
+	stream := commit("main", 1, 0, 0, "a.txt", "a\n") + "M 100644 inline b.txt\ndata 2\nb\n\n" +
+		commit("side", 2, 1, 0, "b.txt", "s1\n") + "\n" +
+		commit("side", 3, 2, 0, "b.txt", "s2\n") + "\n" +
+		commit("main", 4, 1, 0, "c.txt", "c\n") + "\n" +
+		commit("main", 5, 4, 3, "b.txt", "s2\n") + "\n"
+	dir := lcFastImport(t, stream)
+	sha := func(rev string) string { return strings.TrimSpace(mustGit(t, dir, "rev-parse", rev)) }
+	root, m4, tip := sha("main~2"), sha("main~1"), sha("main")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	log := filepath.Join(bin, "diff-tree-input")
+	wrapper := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = diff-tree ]; then tee -a %q | %q \"$@\"; exit $?; fi\nexec %q \"$@\"\n", log, realGit, realGit)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	got, _, err := lastCommitsByPath(context.Background(), dir, tip, []string{"a.txt", "c.txt"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["a.txt"] != root || got["c.txt"] != m4 {
+		t.Fatalf("got %v, want a.txt at the root %s and c.txt at %s", got, root, m4)
+	}
+	raw, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for line := range strings.SplitSeq(string(raw), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if want := []string{tip + " " + m4, m4 + " " + root, root}; !slices.Equal(lines, want) {
+		t.Fatalf("diff-tree read %q, want %q", lines, want)
+	}
+}
+
+// TestLastCommitsKeepsBudgetErrorsOfDiffTree: when the heap cap kills
+// diff-tree in the middle of the walk, the call fails with ErrMemoryLimit
+// (the documented 422), whether the walk was waiting for an answer or
+// writing its next line. A git wrapper on PATH answers the first line,
+// then dies the way git dies under the cap.
+func TestLastCommitsKeepsBudgetErrorsOfDiffTree(t *testing.T) {
+	if !HeapLimitSupported() {
+		t.Skip("heap cap is Linux-only")
+	}
+	dir, tip, _ := deepHistory(t, 50)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	wrapper := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = diff-tree ]; then head -n 2 | %q \"$@\"; kill -SEGV $$; fi\nexec %q \"$@\"\n", realGit, realGit)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes)
+	defer b.Close()
+	if _, _, err := LastCommits(WithBudget(context.Background(), b), dir, tip, []string{"cold.txt"}, 10); !errors.Is(err, ErrMemoryLimit) {
+		t.Fatalf("err = %v, want ErrMemoryLimit", err)
+	}
+	assertNoChildren(t)
+}
+
+// TestDiffReaderFieldsSplitAcrossWrites feeds real diff-tree answers to
+// the reader one byte per Write, since pipes split fields anywhere, and
+// compares them with the answers from one Write.
+func TestDiffReaderFieldsSplitAcrossWrites(t *testing.T) {
 	dir, shas := lcHistory(t, 7, 25)
 	rev := shas[len(shas)-1]
-	entries, err := LsTree(ctx, dir, rev, "", true)
+	entries, err := LsTree(context.Background(), dir, rev, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var paths []string
-	for _, e := range entries {
-		paths = append(paths, e.Path)
+	index := map[string]int32{}
+	for i, e := range entries {
+		index[e.Path] = int32(i)
 	}
-	want, err := lastCommitsByPath(ctx, dir, rev, paths, 1000)
-	if err != nil {
-		t.Fatal(err)
+	// Every input line with its empty end-of-answer line.
+	var in strings.Builder
+	n := 0
+	for line := range strings.SplitSeq(strings.TrimSpace(mustGit(t, dir, "rev-list", "--topo-order", "--parents", rev)), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 1 {
+			in.WriteString(f[0] + "\n\n")
+			n++
+		}
+		for _, p := range f[1:] {
+			in.WriteString(f[0] + " " + p + "\n\n")
+			n++
+		}
 	}
-	revList := mustGit(t, dir, "rev-list", "--topo-order", "--parents", rev)
-	var pairs strings.Builder
-	if err := feedPairs(&pairs, strings.NewReader(revList)); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command("git", "diff-tree", "--stdin", "--root", "--always", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none")
+	cmd := exec.Command("git", "diff-tree", "--stdin", "--root", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none")
 	cmd.Dir = dir
-	cmd.Stdin = strings.NewReader(pairs.String())
+	cmd.Stdin = strings.NewReader(in.String())
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := newLastCommitWalk(rev, paths, 1000)
-	w.expect = bufio.NewReader(strings.NewReader(revList))
-	for i := range out {
-		if _, err := w.Write(out[i : i+1]); err != nil {
-			break // ErrStop: done, or w.err
+	read := func(chunk int) []diffSection {
+		// Room for every answer: here git had all input lines at once.
+		d := &diffReader{index: index, sections: make(chan diffSection, n)}
+		for i := 0; i < len(out); i += chunk {
+			if _, err := d.Write(out[i:min(i+chunk, len(out))]); err != nil {
+				t.Fatalf("chunk %d at %d: %v", chunk, i, d.err)
+			}
 		}
-	}
-	if w.err == nil && w.left > 0 {
-		if err := w.finish(); err != nil && !errors.Is(err, ErrStop) {
-			t.Fatal(err)
+		close(d.sections)
+		var got []diffSection
+		for s := range d.sections {
+			got = append(got, s)
 		}
+		return got
 	}
-	if w.err != nil || w.left != 0 {
-		t.Fatalf("walk err %v, %d paths unresolved", w.err, w.left)
+	whole, bytewise := read(len(out)), read(1)
+	if len(bytewise) != n {
+		t.Fatalf("%d answers for %d input lines", len(bytewise), n)
 	}
-	for i, p := range paths {
-		if w.last[i] != want[p] {
-			t.Errorf("%s = %s, want %s", p, w.last[i], want[p])
-		}
+	if fmt.Sprint(whole) != fmt.Sprint(bytewise) {
+		t.Fatalf("answers differ:\n whole %v\n bytes %v", whole, bytewise)
 	}
 }
 
@@ -348,7 +475,7 @@ func TestLastCommitsSeesIgnoredSubmodules(t *testing.T) {
 		"commit refs/heads/main\nmark :2\ncommitter T <t@example.com> 1700000001 +0000\ndata 0\nfrom :1\nM 160000 %s mod\n\n",
 		len(gm), gm, strings.Repeat("1", 40), strings.Repeat("2", 40)))
 	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
-	got, err := lastCommitsByPath(context.Background(), dir, tip, []string{".gitmodules", "mod"}, 10)
+	got, _, err := lastCommitsByPath(context.Background(), dir, tip, []string{".gitmodules", "mod"}, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,9 +485,8 @@ func TestLastCommitsSeesIgnoredSubmodules(t *testing.T) {
 }
 
 // TestLastCommitsStopsEarlyWithoutLeaks: every path resolves at the tip of
-// a long history, so the walk stops while the feeder still has most of
-// the rev-list to write. The call must return, end its goroutine, and
-// remove its spool.
+// a long history, so the walk stops with most of the rev-list unread. The
+// call must return, end its goroutine, and remove its spool.
 func TestLastCommitsStopsEarlyWithoutLeaks(t *testing.T) {
 	const n = 20000 // about 1.6 MB of pairs, far more than a pipe holds
 	var in strings.Builder
@@ -376,14 +502,14 @@ func TestLastCommitsStopsEarlyWithoutLeaks(t *testing.T) {
 	spools := t.TempDir()
 	t.Setenv("TMPDIR", spools)
 	before := runtime.NumGoroutine()
-	got, err := lastCommitsByPath(context.Background(), dir, tip, []string{"hot.txt"}, 1)
+	got, _, err := lastCommitsByPath(context.Background(), dir, tip, []string{"hot.txt"}, 1)
 	if err != nil || got["hot.txt"] != tip {
 		t.Fatalf("got %v, err %v; want hot.txt at the tip", got, err)
 	}
 	if left, err := os.ReadDir(spools); err != nil || len(left) != 0 {
 		t.Fatalf("temp dir holds %v (err %v), want no spool", left, err)
 	}
-	// The feeder ends once its write fails; give the scheduler a moment.
+	// The goroutine that runs diff-tree ends after git; give the scheduler a moment.
 	for range 100 {
 		if runtime.NumGoroutine() <= before {
 			return
@@ -414,7 +540,7 @@ func TestLastCommitsOctopusParentLimit(t *testing.T) {
 		dir := lcFastImport(t, in.String())
 		tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
 		paths := []string{"a.txt", "b.txt"}
-		got, err := lastCommitsByPath(context.Background(), dir, tip, paths, 10)
+		got, _, err := lastCommitsByPath(context.Background(), dir, tip, paths, 10)
 		if tc.limited {
 			if !errors.Is(err, ErrOutputLimit) || !IsBudgetError(err) {
 				t.Fatalf("%d parents: err = %v, want ErrOutputLimit", tc.roots, err)
@@ -430,17 +556,26 @@ func TestLastCommitsOctopusParentLimit(t *testing.T) {
 	}
 }
 
-// TestLastCommitWalkCapsFields: a path in an old commit is not bounded by
-// rev's tree, so the walk caps an unterminated diff-tree field.
-func TestLastCommitWalkCapsFields(t *testing.T) {
-	w := newLastCommitWalk(strings.Repeat("a", 40), []string{"x"}, 1)
+// TestDiffReaderCapsFields: a path in an old commit is not bounded by
+// rev's tree, so the reader caps an unterminated diff-tree field.
+func TestDiffReaderCapsFields(t *testing.T) {
+	d := &diffReader{index: map[string]int32{"x": 0}, sections: make(chan diffSection, 1)}
 	piece := bytes.Repeat([]byte("p"), 64<<10)
 	var err error
 	for i := 0; err == nil && i <= maxParentsLine/len(piece); i++ {
-		_, err = w.Write(piece)
+		_, err = d.Write(piece)
 	}
-	if !errors.Is(err, ErrStop) || !errors.Is(w.err, ErrOutputLimit) {
-		t.Fatalf("long field: err %v / %v, want ErrStop and ErrOutputLimit", err, w.err)
+	if !errors.Is(err, ErrStop) || !errors.Is(d.err, ErrOutputLimit) {
+		t.Fatalf("long field: err %v / %v, want ErrStop and ErrOutputLimit", err, d.err)
+	}
+}
+
+// TestDiffReaderRejectsAnswersAheadOfInput: an answer the walk did not ask
+// for yet is an error, not the next line's answer.
+func TestDiffReaderRejectsAnswersAheadOfInput(t *testing.T) {
+	d := &diffReader{index: map[string]int32{"x": 0}, sections: make(chan diffSection, 1)}
+	if _, err := d.Write([]byte("\n\n")); !errors.Is(err, ErrStop) || d.err == nil {
+		t.Fatalf("two answers at once: err %v / %v, want ErrStop and an error", err, d.err)
 	}
 }
 
