@@ -373,7 +373,7 @@ This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster 
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `GET /repos/commits` | git:read | `ref?` (deprecated alias `branch`), `cursor?, limit?, ephemeral?, path?` → `{commits: [CommitInfo], next_cursor, has_more}`, newest first; defaults to default branch |
+| `GET /repos/commits` | git:read | `ref?` (deprecated alias `branch`), `cursor?, limit?, ephemeral?, path?` → `{commits: [CommitInfo], next_cursor, has_more}`, newest first; defaults to default branch. Each entry's `message` is the subject line only (below the table) |
 | `GET /repos/commit` | git:read | `ref` (req; deprecated alias `sha`; branch name, tag, short or full SHA) → `{commit: CommitInfo & {signature?, payload?}}` (signed commits: armored sig + exact signed payload bytes) |
 | `GET /repos/diff` | git:read | `ref` (req; deprecated alias `sha`), `base_ref?` (deprecated alias `baseSha`), `ref_is_ephemeral?`, `base_is_ephemeral?`, `git_apply_compatible?` (deprecated alias `gitApplyCompatible`), `path` (repeatable) → `{sha, base_sha, merge_base_sha, stats, files: [FileDiff], filtered_files}`. `base_sha` is the commit `base_ref` resolved to, empty for a single-commit diff. On alias conflict the current name wins |
 | `POST /repos/commit-pack` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
@@ -386,6 +386,14 @@ committer_email, date (RFC3339), committer_date (RFC3339)}`. `date` is the autho
 timestamp and `committer_date` the committer timestamp, as in upstream's spec of
 2026-10-08. A rebase or cherry-pick changes only `committer_date`. Before that spec,
 `date` carried the committer timestamp.
+
+`GET /repos/commit` sends the full `message`, with trailing newlines removed. `GET
+/repos/commits` sends only the subject line, as in upstream's docs spec of 2026-10-27:
+the first paragraph of the message as one line, without the body and the trailers. This
+is git's `%s`: blank lines before the first paragraph are skipped, a whitespace-only
+line ends it, its lines are joined with one space after their trailing whitespace is
+removed, and an empty message gives `""`. Before that spec, list entries carried the
+full message.
 
 ### Tags
 

@@ -250,7 +250,7 @@ components:
             - "2024-01-15T14:32:18Z"
           type: string
         message:
-          description: The commit message.
+          description: "The commit message. In repos.commits.get responses, the full message. In repos.commits.list responses, only the subject line: the first paragraph of the message as one line, without the body and the trailers."
           examples:
             - "fix: resolve scrolling issue in dashboard"
           type: string
@@ -452,7 +452,7 @@ components:
             - "2026-02-18T10:30:00Z"
           type: string
         message:
-          description: Commit message.
+          description: "The subject line of the commit message: the first paragraph of the message as one line, without the body and the trailers. repos.commits.get returns the full message."
           examples:
             - add list files with metadata endpoint
           type: string
