@@ -238,16 +238,19 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-27 (upstream
-  `Last-Modified` 2026-10-27 21:25:57 GMT), SHA-256
-  `c494c01b2299053d8e6591a4aa794e65d2e38859407da6d320322d9f0d0119d0`. It adds the
-  `ref_guard_failed` code ([#568](https://github.com/coder/openstorage/issues/568)).
-  At 21:47 UTC that day
-  [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served the
-  previous snapshot (`10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356`),
-  so the change is documented in the docs only. A spec that the cluster serves does not
-  prove how the cluster behaves either. The docs spec changed again at 21:45:58 GMT.
-  [#570](https://github.com/coder/openstorage/issues/570) tracks that revision.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-28 (upstream
+  `Last-Modified` 2026-10-27 21:45:58 GMT), SHA-256
+  `b598ce96ab0f7bef25f9efd1e32a9b201e781dabab894fc7f53cb8b4e430ec70`. Against the
+  previous snapshot (`c494c01b`, which added the `ref_guard_failed` code,
+  [#568](https://github.com/coder/openstorage/issues/568)) it changes only two
+  descriptions: commit list entries and `files/metadata` commits carry the subject line
+  of the message. `GET /repos/commits` follows it. `files/metadata` still sends the full
+  message ([#570](https://github.com/coder/openstorage/issues/570)). At 00:09 UTC on
+  2026-10-28
+  [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served an
+  older snapshot (`10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356`),
+  so both changes are documented in the docs only. A spec that the cluster serves does
+  not prove how the cluster behaves either.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled

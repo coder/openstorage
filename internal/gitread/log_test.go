@@ -60,6 +60,24 @@ func TestLog(t *testing.T) {
 	}
 }
 
+// SubjectOnly fills Subject with %s and leaves Message empty, so a caller
+// that reads Message by mistake gets "" instead of a silent subject.
+func TestLogSubjectOnly(t *testing.T) {
+	f := newFixture(t)
+	commits, err := Log(context.Background(), f.dir, f.c2, LogOptions{SubjectOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commits) != 2 {
+		t.Fatalf("got %d commits, want 2", len(commits))
+	}
+	for i, want := range []string{"second commit", "root commit"} {
+		if c := commits[i]; c.Subject != want || c.Message != "" {
+			t.Errorf("commits[%d] subject, message = %q, %q, want %q, \"\"", i, c.Subject, c.Message, want)
+		}
+	}
+}
+
 func TestLogSkipMaxCountAndPathFilter(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()

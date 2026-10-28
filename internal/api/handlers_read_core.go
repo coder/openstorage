@@ -556,9 +556,10 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 	}
 
 	commits, err := gitread.Log(r.Context(), repoPath, anchor, gitread.LogOptions{
-		Path:     q.Get("path"),
-		Skip:     offset,
-		MaxCount: limit + 1,
+		Path:        q.Get("path"),
+		Skip:        offset,
+		MaxCount:    limit + 1,
+		SubjectOnly: true,
 	})
 	if err != nil {
 		s.internalErr(w, r, "list commits", err)
@@ -570,7 +571,11 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := make([]commitInfo, 0, len(commits))
 	for _, c := range commits {
-		entries = append(entries, toCommitInfo(c))
+		entry := toCommitInfo(c)
+		// List entries carry only the subject line (upstream spec
+		// 2026-10-27, #570); GET /repos/commit keeps the full message.
+		entry.Message = c.Subject
+		entries = append(entries, entry)
 	}
 	next := ""
 	if hasMore {
