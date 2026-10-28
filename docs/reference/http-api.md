@@ -84,8 +84,10 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   hold any byte except NUL and `/`. Each byte of a name that is not valid UTF-8 comes
   back as U+FFFD, so two names can list as the same path: `a<0xff>b` and `a<0xfe>b`
   both list as `a\ufffdb`. Paging still visits both, because `next_cursor` keeps the
-  raw bytes. The U+FFFD form names no file. To read such a file, send the raw bytes of
-  its name percent-encoded in the `path` query parameter, for example
+  raw bytes. The listed U+FFFD form does not name the original file. It can name a
+  different file whose valid UTF-8 name holds a real U+FFFD (`a\ufffdb`), so a client
+  that sends a listed path back can read the wrong file. To read such a file, send the
+  raw bytes of its name percent-encoded in the `path` query parameter, for example
   `file?path=a%FFb`. `file`, `files`, `files/metadata`, `commits`, `diff`,
   `branches/diff` and `blame` read `path` byte for byte. An `archive` (tar member
   names) or a git clone gives the raw names. A JSON request body cannot hold such a
