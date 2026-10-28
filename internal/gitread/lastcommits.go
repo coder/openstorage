@@ -171,13 +171,16 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 	if running {
 		runErr = <-ran
 	}
+	// git's own failure comes before the walk's: a budget kill between two
+	// answers makes the walk's next write fail with EPIPE, but the request
+	// must get the budget error (503 or 422), not that write error.
 	switch {
 	case d.err != nil: // read after Run returned, which reaped git
 		return nil, nil, d.err
-	case walkErr != nil:
-		return nil, nil, walkErr
 	case runErr != nil:
 		return nil, nil, runErr
+	case walkErr != nil:
+		return nil, nil, walkErr
 	}
 	assertf(w.left == 0, "LastCommits: %d paths unresolved after the walk", w.left)
 	return w.last, w.order, nil

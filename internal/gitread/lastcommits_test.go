@@ -364,6 +364,34 @@ func TestLastCommitsDiffsOnlyWhatCanChangeAnAnswer(t *testing.T) {
 	}
 }
 
+// TestLastCommitsKeepsBudgetErrorsOfDiffTree: when the heap cap kills
+// diff-tree in the middle of the walk, the call fails with ErrMemoryLimit
+// (the documented 422), whether the walk was waiting for an answer or
+// writing its next line. A git wrapper on PATH answers the first line,
+// then dies the way git dies under the cap.
+func TestLastCommitsKeepsBudgetErrorsOfDiffTree(t *testing.T) {
+	if !HeapLimitSupported() {
+		t.Skip("heap cap is Linux-only")
+	}
+	dir, tip, _ := deepHistory(t, 50)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	wrapper := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = diff-tree ]; then head -n 2 | %q \"$@\"; kill -SEGV $$; fi\nexec %q \"$@\"\n", realGit, realGit)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes)
+	defer b.Close()
+	if _, _, err := LastCommits(WithBudget(context.Background(), b), dir, tip, []string{"cold.txt"}, 10); !errors.Is(err, ErrMemoryLimit) {
+		t.Fatalf("err = %v, want ErrMemoryLimit", err)
+	}
+	assertNoChildren(t)
+}
+
 // TestDiffReaderFieldsSplitAcrossWrites feeds real diff-tree answers to
 // the reader one byte per Write, since pipes split fields anywhere, and
 // compares them with the answers from one Write.
