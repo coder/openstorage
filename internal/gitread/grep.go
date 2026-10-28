@@ -123,33 +123,47 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 	return parseGrepOutput(out, commit)
 }
 
-// parseGrepOutput parses `git grep -n --null <tree>` lines:
+// parseGrepOutput parses `git grep -n --null <tree>` output, a sequence of
 //
-//	<tree>:<path> \0 <lineno> \0 <text>
-//	--                                     (hunk separator)
+//	<tree>:<path> \0 <lineno> \0 <text> \n
+//	--\n                                   (hunk separator)
+//
+// It reads each field up to its own terminator, never splitting the whole
+// output on newlines first: a path may hold a newline (`git fsck --strict`
+// accepts one in a tree entry name, #583), and git prints it raw under
+// --null. A path cannot hold a NUL, and a line's text cannot hold a
+// newline (it may hold a NUL), so the framing is unambiguous. A record
+// starts with the tree's SHA, so "--\n" there is always a separator.
 func parseGrepOutput(out, commit string) ([]GrepFile, error) {
 	files := []GrepFile{}
 	index := map[string]int{} // path -> files idx
-	for line := range strings.SplitSeq(out, "\n") {
-		if line == "" || line == "--" {
+	prefix := commit + ":"
+	for out != "" {
+		if rest, ok := strings.CutPrefix(out, "--\n"); ok {
+			out = rest
 			continue
 		}
-		name, rest, found := strings.Cut(line, "\x00")
+		name, rest, found := strings.Cut(out, "\x00")
 		if !found {
-			return nil, fmt.Errorf("grep emitted %q", line)
+			return nil, fmt.Errorf("grep emitted %.80q", out)
 		}
-		path, ok := strings.CutPrefix(name, commit+":")
+		path, ok := strings.CutPrefix(name, prefix)
 		if !ok || path == "" {
-			return nil, fmt.Errorf("grep emitted file name %q", name)
+			return nil, fmt.Errorf("grep emitted file name %.80q", name)
 		}
-		lineno, text, found := strings.Cut(rest, "\x00")
+		lineno, rest, found := strings.Cut(rest, "\x00")
 		if !found {
-			return nil, fmt.Errorf("grep emitted %q", line)
+			return nil, fmt.Errorf("grep emitted %.80q after %.80q", lineno, name)
 		}
 		n, err := strconv.Atoi(lineno)
 		if err != nil || n < 1 {
-			return nil, fmt.Errorf("grep emitted line number %q", lineno)
+			return nil, fmt.Errorf("grep emitted line number %.80q", lineno)
 		}
+		text, rest, found := strings.Cut(rest, "\n")
+		if !found {
+			return nil, fmt.Errorf("grep output does not end with a newline: %.80q", text)
+		}
+		out = rest
 		idx, seen := index[path]
 		if !seen {
 			idx = len(files)
