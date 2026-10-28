@@ -853,8 +853,8 @@ type listFilesMetadataResponse struct {
 // deduplicated into the `commits` map. Unborn branch -> 404 (invariant 3).
 // Like upstream (spec c494c01b), every call finds the last commit of every
 // file under `path`, in one history walk (gitread.LastCommits), and
-// answers 429 past maxFilesMetaLastCommits; the page's commits then cost
-// one `git log --no-walk` and one `git rev-list --topo-order` for `order`.
+// answers 429 past maxFilesMetaLastCommits. The walk also ranks each last
+// commit for `order`; the page's commits then cost one `git log --no-walk`.
 func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -892,7 +892,7 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	for _, e := range entries {
 		paths = append(paths, e.Path)
 	}
-	last, err := gitread.LastCommits(r.Context(), repoPath, commit, paths, maxFilesMetaLastCommits)
+	last, ranks, err := gitread.LastCommits(r.Context(), repoPath, commit, paths, maxFilesMetaLastCommits)
 	if errors.Is(err, gitread.ErrTooManyLastCommits) {
 		// No Retry-After: a retry gets the same answer (spec c494c01b).
 		writeErr(w, http.StatusTooManyRequests,
@@ -925,17 +925,12 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// openapi (#292): `order` is the topological rank relative to the
-	// resolved ref, from ONE walk per page (gitread.TopoRanks documents the
-	// tie-break). Ranks are relative to commit, not to the page, so they
-	// agree across pages of the same listing.
-	ranks, err := gitread.TopoRanks(r.Context(), repoPath, commit, slices.Collect(maps.Keys(commitsMap)))
-	if err != nil {
-		s.internalErr(w, r, "topological commit order", err)
-		return
-	}
+	// resolved ref: the commit's line in the walk's `rev-list --topo-order`
+	// (#576). Ranks are relative to commit, not to the page, so they agree
+	// across pages of the same listing.
 	for sha, c := range commitsMap {
 		rank, ok := ranks[sha]
-		// TopoRanks errors instead of omitting a wanted commit.
+		// LastCommits ranks every commit it answers with.
 		assertf(ok, "files/metadata: no topo rank for %s", sha)
 		c.Order = rank
 		commitsMap[sha] = c
