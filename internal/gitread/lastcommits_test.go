@@ -1,6 +1,7 @@
 package gitread
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -390,6 +391,123 @@ func TestLastCommitsKeepsBudgetErrorsOfDiffTree(t *testing.T) {
 		t.Fatalf("err = %v, want ErrMemoryLimit", err)
 	}
 	assertNoChildren(t)
+}
+
+// execDiffer answers each walk request with its own `git diff-tree` run,
+// parsed by a diffReader, and counts the requests in flight.
+type execDiffer struct {
+	t        *testing.T
+	dir      string
+	index    map[string]int32
+	queue    []diffSection
+	inputs   []string
+	inFlight int // most requests sent and not yet received
+}
+
+func (e *execDiffer) send(input string) error {
+	args := append([]string{"diff-tree", "--root", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none"}, strings.Fields(input)...)
+	out := mustGit(e.t, e.dir, args...)
+	d := &diffReader{index: e.index, sections: make(chan diffSection, 1)}
+	if _, err := d.Write([]byte(out + "\n")); err != nil {
+		return d.err
+	}
+	e.queue = append(e.queue, <-d.sections)
+	e.inputs = append(e.inputs, input)
+	e.inFlight = max(e.inFlight, len(e.queue))
+	return nil
+}
+
+func (e *execDiffer) recv() (diffSection, error) {
+	if len(e.queue) == 0 {
+		return diffSection{}, errors.New("recv with no request in flight")
+	}
+	s := e.queue[0]
+	e.queue = e.queue[1:]
+	return s, nil
+}
+
+// TestLastCommitWalkSendsAheadWithinWindow pins #588: on a linear history
+// the walk keeps lastCommitWindow requests in flight instead of one, never
+// more than one past the window, and still finds every answer and rank.
+func TestLastCommitWalkSendsAheadWithinWindow(t *testing.T) {
+	const n = 60
+	var in strings.Builder
+	for i := range n {
+		fmt.Fprintf(&in, "commit refs/heads/main\nmark :%d\ncommitter T <t@example.com> %d +0000\ndata 0\n", i+1, 1700000000+i)
+		if i == 0 {
+			in.WriteString("M 100644 inline cold.txt\ndata 5\ncold\n")
+		} else {
+			fmt.Fprintf(&in, "from :%d\n", i)
+		}
+		if i == n/2 {
+			in.WriteString("M 100644 inline mid.txt\ndata 4\nmid\n")
+		}
+		fmt.Fprintf(&in, "M 100644 inline hot.txt\ndata %d\n%d\n\n", len(fmt.Sprint(i))+1, i)
+	}
+	dir := lcFastImport(t, in.String())
+	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
+	paths := []string{"cold.txt", "hot.txt", "mid.txt"}
+	w := newLastCommitWalk(tip, paths, 10)
+	e := &execDiffer{t: t, dir: dir, index: w.index}
+	spool := bufio.NewReaderSize(strings.NewReader(mustGit(t, dir, "rev-list", "--topo-order", "--parents", tip)), maxParentsLine+1)
+	if err := w.walk(spool, e); err != nil {
+		t.Fatal(err)
+	}
+	want := lcOracle(t, dir, tip, paths)
+	ranks := lcRanks(t, dir, tip)
+	for i, p := range paths {
+		if w.last[i] != want[p] || w.order[w.last[i]] != ranks[w.last[i]] {
+			t.Errorf("%s = %s rank %d, want %s rank %d", p, w.last[i], w.order[w.last[i]], want[p], ranks[want[p]])
+		}
+	}
+	if e.inFlight != lastCommitWindow {
+		t.Errorf("at most %d requests in flight, want %d", e.inFlight, lastCommitWindow)
+	}
+	// Every commit holds a waiting path, so each is diffed exactly once.
+	if len(e.inputs) != n {
+		t.Errorf("%d requests for %d commits: %q", len(e.inputs), n, e.inputs)
+	}
+}
+
+// TestLastCommitWalkBoundsRequestsInFlight: the first-parent chain of the
+// tip is sent ahead although no path waits on it (the path took the second
+// parent), so its answers are dropped. They stay in flight until the walk
+// next waits, and the window must still bound them.
+func TestLastCommitWalkBoundsRequestsInFlight(t *testing.T) {
+	const n = 3 * lastCommitWindow
+	var in strings.Builder
+	mark := 1
+	commit := func(from int, file, data string) int {
+		fmt.Fprintf(&in, "commit refs/heads/b%d\nmark :%d\ncommitter T <t@example.com> %d +0000\ndata 0\n", mark, mark, 1700000000+mark)
+		if from > 0 {
+			fmt.Fprintf(&in, "from :%d\n", from)
+		}
+		fmt.Fprintf(&in, "M 100644 inline %s\ndata %d\n%s\n\n", file, len(data), data)
+		mark++
+		return mark - 1
+	}
+	root := commit(0, "p.txt", "p\n")
+	side, mainline := root, commit(root, "p.txt", "changed on the first-parent side\n")
+	for i := range n {
+		side = commit(side, "b.txt", fmt.Sprint(i))
+		mainline = commit(mainline, "a.txt", fmt.Sprint(i))
+	}
+	// The tip takes p.txt from the second parent's side.
+	fmt.Fprintf(&in, "commit refs/heads/main\ncommitter T <t@example.com> 1800000000 +0000\ndata 0\nfrom :%d\nmerge :%d\nM 100644 inline p.txt\ndata 2\np\n\n", mainline, side)
+	dir := lcFastImport(t, in.String())
+	tip := strings.TrimSpace(mustGit(t, dir, "rev-parse", "main"))
+	w := newLastCommitWalk(tip, []string{"p.txt"}, 10)
+	e := &execDiffer{t: t, dir: dir, index: w.index}
+	spool := bufio.NewReaderSize(strings.NewReader(mustGit(t, dir, "rev-list", "--topo-order", "--parents", tip)), maxParentsLine+1)
+	if err := w.walk(spool, e); err != nil {
+		t.Fatal(err)
+	}
+	if want := lcOracle(t, dir, tip, []string{"p.txt"}); w.last[0] != want["p.txt"] {
+		t.Fatalf("p.txt = %s, want %s", w.last[0], want["p.txt"])
+	}
+	if e.inFlight > lastCommitWindow+1 {
+		t.Fatalf("%d requests in flight, want at most %d", e.inFlight, lastCommitWindow+1)
+	}
 }
 
 // TestDiffReaderFieldsSplitAcrossWrites feeds real diff-tree answers to
