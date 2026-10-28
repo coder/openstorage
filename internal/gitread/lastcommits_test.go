@@ -2,9 +2,11 @@ package gitread
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -425,5 +427,37 @@ func TestLastCommitsOctopusParentLimit(t *testing.T) {
 		if want := lcOracle(t, dir, tip, paths); fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Fatalf("%d parents: got %v, want %v", tc.roots, got, want)
 		}
+	}
+}
+
+// TestSpoolWriterLimits: the rev-list spool stops git at a line longer
+// than maxParentsLine, also when the line arrives in pieces, and past
+// maxSpoolBytes in total.
+func TestSpoolWriterLimits(t *testing.T) {
+	line := []byte(strings.Repeat("a", 40) + " " + strings.Repeat("b", 40) + "\n")
+	var out strings.Builder
+	s := &spoolWriter{f: &out}
+	if _, err := s.Write(append(line, line...)); err != nil || s.err != nil || out.Len() != 2*len(line) {
+		t.Fatalf("short lines: err %v / %v, wrote %d", err, s.err, out.Len())
+	}
+
+	s = &spoolWriter{f: io.Discard}
+	piece := bytes.Repeat([]byte("p"), 64<<10)
+	var err error
+	for i := 0; err == nil && i <= maxParentsLine/len(piece); i++ {
+		_, err = s.Write(piece)
+	}
+	if !errors.Is(err, ErrStop) || !errors.Is(s.err, ErrOutputLimit) {
+		t.Fatalf("long line in pieces: err %v / %v, want ErrStop and ErrOutputLimit", err, s.err)
+	}
+
+	s = &spoolWriter{f: io.Discard}
+	chunk := bytes.Repeat(line, (64<<10)/len(line))
+	err = nil
+	for written := 0; err == nil && written <= maxSpoolBytes; written += len(chunk) {
+		_, err = s.Write(chunk)
+	}
+	if !errors.Is(err, ErrStop) || !errors.Is(s.err, ErrOutputLimit) {
+		t.Fatalf("large spool: err %v / %v, want ErrStop and ErrOutputLimit", err, s.err)
 	}
 }

@@ -19,6 +19,46 @@ import (
 // the server memory per parent.
 const maxParentsLine = 1 << 20
 
+// maxSpoolBytes bounds the spooled rev-list (about 3 million single-parent
+// commits); a longer history fails with ErrOutputLimit.
+const maxSpoolBytes = 256 << 20
+
+// spoolWriter writes rev-list output to the spool. On a line longer than
+// maxParentsLine or a spool larger than maxSpoolBytes it stops git (ErrStop)
+// and keeps ErrOutputLimit in err.
+type spoolWriter struct {
+	f    io.Writer
+	n    int64
+	line int // bytes of the current, unterminated line
+	err  error
+}
+
+func (s *spoolWriter) Write(p []byte) (int, error) {
+	s.n += int64(len(p))
+	for rest := p; ; {
+		i := bytes.IndexByte(rest, '\n')
+		if i < 0 {
+			s.line += len(rest)
+			break
+		}
+		s.line += i
+		if s.line > maxParentsLine {
+			break
+		}
+		s.line, rest = 0, rest[i+1:]
+	}
+	switch {
+	case s.line > maxParentsLine:
+		s.err = fmt.Errorf("rev-list line over %d bytes: %w", maxParentsLine, ErrOutputLimit)
+	case s.n > maxSpoolBytes:
+		s.err = fmt.Errorf("rev-list output over %d bytes: %w", maxSpoolBytes, ErrOutputLimit)
+	}
+	if s.err != nil {
+		return 0, ErrStop
+	}
+	return s.f.Write(p)
+}
+
 // readRevListLine reads one spooled rev-list line of at most
 // maxParentsLine bytes from br, which must buffer that many.
 func readRevListLine(br *bufio.Reader) (string, error) {
@@ -72,8 +112,12 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 		_ = spool.Close()
 		_ = os.Remove(spool.Name())
 	}()
-	if _, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdout: spool, Args: []string{"rev-list", "--topo-order", "--parents", rev}}); err != nil {
+	sw := &spoolWriter{f: spool}
+	if _, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdout: sw, Args: []string{"rev-list", "--topo-order", "--parents", rev}}); err != nil {
 		return nil, err
+	}
+	if sw.err != nil {
+		return nil, sw.err
 	}
 	expect, err := os.Open(spool.Name())
 	if err != nil {
