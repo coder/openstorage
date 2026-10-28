@@ -36,7 +36,7 @@ type DiffStats struct {
 
 // DiffOptions tune one Diff invocation. The zero value diffs the full trees.
 type DiffOptions struct {
-	Paths []string // optional pathspec filter (`-- <path>...`, repeatable `path` params)
+	Paths []string // optional literal path filter (`-- :(literal)<path>...`, repeatable `path` params)
 }
 
 // Diff computes the tree diff base..target (both resolved full SHAs; pass
@@ -49,7 +49,10 @@ func Diff(ctx context.Context, repoPath, base, target string, opts DiffOptions) 
 
 	common := []string{"-M", base, target}
 	if len(opts.Paths) > 0 {
-		common = append(append(common, "--"), opts.Paths...)
+		common = append(common, "--")
+		for _, p := range opts.Paths {
+			common = append(common, ":(literal)"+p)
+		}
 	}
 
 	nameStatus, err := runGit(ctx, Heavy, repoPath, append([]string{"diff", "--no-color", "--name-status", "-z"}, common...)...)

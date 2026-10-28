@@ -77,6 +77,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   SHA in either case.
 - **Booleans in query strings** are literal `"true"` / `"false"`.
 - **Repeated params**: `path` may repeat on diff endpoints; `range` may repeat on blame.
+- **Paths are literal**: a `path` param names a file or directory. Wildcards
+  (`*`, `?`, `[`) and git pathspec magic (`:(...)`) match only a path of that name.
 - **No client retries**: no SDK retries; every error surfaces immediately. Python
   client-side timeouts: 30s default, 60s diff/grep, 180s
   branch-create/merge/merge-preview/commit/tag/restore-commit.
