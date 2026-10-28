@@ -13,6 +13,22 @@ import (
 	"github.com/coder/openstorage/internal/ref"
 )
 
+// maxParentsLine bounds one `rev-list --parents` line, which LastCommits
+// reads twice: about 25,000 parents. A commit with more (git allows any
+// number, also of duplicates) fails with ErrOutputLimit instead of costing
+// the server memory per parent.
+const maxParentsLine = 1 << 20
+
+// readRevListLine reads one spooled rev-list line of at most
+// maxParentsLine bytes from br, which must buffer that many.
+func readRevListLine(br *bufio.Reader) (string, error) {
+	line, err := br.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return "", fmt.Errorf("rev-list line over %d bytes: %w", maxParentsLine, ErrOutputLimit)
+	}
+	return string(line), err
+}
+
 // ErrTooManyLastCommits reports that the files passed to LastCommits have
 // more distinct last commits than its limit. It is not a budget error: the
 // same request fails the same way every time.
@@ -64,7 +80,7 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 		return nil, err
 	}
 	defer func() { _ = expect.Close() }()
-	w.expect = bufio.NewReader(expect)
+	w.expect = bufio.NewReaderSize(expect, maxParentsLine)
 	if _, err := spool.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -112,11 +128,9 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 // feedPairs writes diff-tree's input lines for every rev-list line.
 func feedPairs(dst io.Writer, spool io.Reader) error {
 	bw := bufio.NewWriter(dst)
-	br := bufio.NewReader(spool)
+	br := bufio.NewReaderSize(spool, maxParentsLine)
 	for {
-		// No line-length cap: an octopus merge line can list any number
-		// of parents.
-		line, err := br.ReadString('\n')
+		line, err := readRevListLine(br)
 		if err == io.EOF && line == "" {
 			break
 		} else if err != nil && err != io.EOF {
@@ -291,7 +305,7 @@ func (w *lastCommitWalk) field(f []byte) error {
 	if err := w.finish(); err != nil {
 		return err
 	}
-	line, err := w.expect.ReadString('\n')
+	line, err := readRevListLine(w.expect)
 	if err != nil {
 		return fmt.Errorf("rev-list spool: %w", err)
 	}
