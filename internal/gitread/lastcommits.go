@@ -336,8 +336,9 @@ type diffReq struct {
 // sent. A single-parent commit hands every path it does not resolve to that
 // parent, so a linear history takes one request per commit without a round
 // trip per commit. A request sent ahead is wasted only below a commit that
-// resolves all of its paths (at most one window of them), and its answer is
-// dropped. Nothing is sent ahead past a merge, whose paths may all leave by
+// resolves all of its paths, and its answer is dropped; the walk then
+// cancels the rest of that chain (see cancel), so at most one window is
+// wasted. Nothing is sent ahead past a merge, whose paths may all leave by
 // a later parent: later parents are sent only when needed, and the walk
 // then waits for them.
 func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
@@ -379,6 +380,30 @@ func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
 		}
 		if len(expect) < maxExpected {
 			expect[strings.Clone(l.parents[0])] = struct{}{} // see hand
+		}
+	}
+	// cancel ends the chain sent ahead below l, which hands no path to its
+	// parent: through the window, every line marked expected only by that
+	// chain is unmarked, and the first one past the window is forgotten.
+	// So a dead chain wastes at most the window it was sent in.
+	cancel := func(l *walkLine) {
+		for len(l.parents) == 1 {
+			var next *walkLine
+			for _, o := range window {
+				if o.c == l.parents[0] {
+					next = o
+					break
+				}
+			}
+			if next == nil {
+				delete(expect, l.parents[0])
+				return
+			}
+			if !next.expected || len(w.waiting[next.c]) > 0 {
+				return // not this chain's, or needed anyway
+			}
+			next.expected = false
+			l = next
 		}
 	}
 	for rank := 0; w.left > 0; {
@@ -429,7 +454,10 @@ func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
 		set := w.waiting[l.c]
 		delete(w.waiting, l.c) // no later commit hands paths to l.c
 		if len(set) == 0 {
-			continue // an answer sent ahead for l is received and dropped later
+			if l.first != nil {
+				cancel(l) // sent ahead, but no path reached it
+			}
+			continue // its answer is received and dropped later
 		}
 		// diff answers l's diff against parent k (k 0 of a root: against
 		// the empty tree), sending it now unless it was sent ahead.
@@ -476,6 +504,8 @@ func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
 			}
 			if len(set) > 0 {
 				w.hand(p, set)
+			} else if len(l.parents) == 1 {
+				cancel(l) // every path resolves here
 			}
 			if set = changed; len(set) == 0 {
 				break // later parents cannot change an answer

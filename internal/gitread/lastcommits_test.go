@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"io"
@@ -516,6 +517,75 @@ func TestLastCommitWalkBoundsRequestsInFlight(t *testing.T) {
 		if slices.Contains(firstParent, strings.Fields(input)[0]) {
 			t.Fatalf("the walk diffed first-parent commit %s, which no path reaches (inputs %q)", input, e.inputs)
 		}
+	}
+}
+
+// tableDiffer answers walk requests from a table of changed paths per
+// diff-tree input ("" lists nothing), for spools that git would not print
+// but that the walk must handle: any order with children before parents.
+type tableDiffer struct {
+	changed map[string][]int32
+	queue   []diffSection
+	inputs  []string
+}
+
+func (d *tableDiffer) send(input string) error {
+	d.queue = append(d.queue, diffSection{changed: d.changed[input]})
+	d.inputs = append(d.inputs, input)
+	return nil
+}
+
+func (d *tableDiffer) recv() (diffSection, error) {
+	if len(d.queue) == 0 {
+		return diffSection{}, errors.New("recv with no request in flight")
+	}
+	s := d.queue[0]
+	d.queue = d.queue[1:]
+	return s, nil
+}
+
+// TestLastCommitWalkCancelsDeadChains: the tip T merges chains D and E,
+// whose lines the spool interleaves. p takes D and resolves at D1, so the
+// rest of D is dead, while q walks all of E, and each E line makes the walk
+// wait. The walk must stop sending D ahead once D1 resolves: at most one
+// window of D's diffs is wasted, not the whole chain.
+func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
+	const n = 4 * lastCommitWindow
+	id := func(name string) string { return fmt.Sprintf("%x", sha1.Sum([]byte(name))) }
+	p, q := int32(0), int32(1)
+	tip, root := id("T"), id("R")
+	changed := map[string][]int32{tip + " " + id("D1"): {q}, id("D1") + " " + id("D2"): {p}, root: {p, q}}
+	var spool strings.Builder
+	fmt.Fprintf(&spool, "%s %s %s\n", tip, id("D1"), id("E1"))
+	for i := 1; i <= n; i++ {
+		next := func(chain string) string {
+			if i == n {
+				return root
+			}
+			return id(fmt.Sprintf("%s%d", chain, i+1))
+		}
+		fmt.Fprintf(&spool, "%s %s\n%s %s\n", id(fmt.Sprintf("D%d", i)), next("D"), id(fmt.Sprintf("E%d", i)), next("E"))
+	}
+	spool.WriteString(root + "\n")
+
+	w := newLastCommitWalk(tip, []string{"p", "q"}, 10)
+	d := &tableDiffer{changed: changed}
+	if err := w.walk(bufio.NewReader(strings.NewReader(spool.String())), d); err != nil {
+		t.Fatal(err)
+	}
+	if w.last[p] != id("D1") || w.last[q] != root {
+		t.Fatalf("answers %v, want p at D1 and q at the root", w.last)
+	}
+	wasted := 0
+	for _, input := range d.inputs {
+		for i := 2; i <= n; i++ {
+			if strings.HasPrefix(input, id(fmt.Sprintf("D%d", i))) {
+				wasted++
+			}
+		}
+	}
+	if wasted > lastCommitWindow {
+		t.Fatalf("%d of the %d dead D commits were diffed, want at most %d", wasted, n-1, lastCommitWindow)
 	}
 }
 
