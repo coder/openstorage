@@ -434,7 +434,7 @@ func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList)
 			b, err := json.Marshal(item)
 			assertf(err == nil, "writeJSONLists: marshal %s item: %v", l.key, err)
 			if sep {
-				_ = bw.WriteByte(',')
+				_ = bw.WriteByte(',') // a failure sticks: the next Write reports it
 			}
 			if _, err := bw.Write(b); err != nil {
 				return

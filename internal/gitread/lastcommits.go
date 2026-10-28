@@ -60,7 +60,8 @@ func (s *spoolWriter) Write(p []byte) (int, error) {
 }
 
 // readRevListLine reads one spooled rev-list line of at most
-// maxParentsLine bytes from br, which must buffer that many.
+// maxParentsLine bytes plus its newline from br, which must buffer that
+// many.
 func readRevListLine(br *bufio.Reader) (string, error) {
 	line, err := br.ReadSlice('\n')
 	if errors.Is(err, bufio.ErrBufferFull) {
@@ -124,7 +125,7 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 		return nil, err
 	}
 	defer func() { _ = expect.Close() }()
-	w.expect = bufio.NewReaderSize(expect, maxParentsLine)
+	w.expect = bufio.NewReaderSize(expect, maxParentsLine+1)
 	if _, err := spool.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -172,7 +173,7 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 // feedPairs writes diff-tree's input lines for every rev-list line.
 func feedPairs(dst io.Writer, spool io.Reader) error {
 	bw := bufio.NewWriter(dst)
-	br := bufio.NewReaderSize(spool, maxParentsLine)
+	br := bufio.NewReaderSize(spool, maxParentsLine+1)
 	for {
 		line, err := readRevListLine(br)
 		if err == io.EOF && line == "" {
@@ -284,7 +285,12 @@ func (w *lastCommitWalk) Write(p []byte) (int, error) {
 	for len(p) > 0 {
 		i := bytes.IndexByte(p, 0)
 		if i < 0 {
-			w.partial = append(w.partial, p...)
+			// A path from any commit of the walk, not only from rev's
+			// tree, so the ls-tree output allowance does not bound it.
+			if w.partial = append(w.partial, p...); len(w.partial) > maxParentsLine {
+				w.err = fmt.Errorf("diff-tree field over %d bytes: %w", maxParentsLine, ErrOutputLimit)
+				return 0, ErrStop
+			}
 			break
 		}
 		field := p[:i]

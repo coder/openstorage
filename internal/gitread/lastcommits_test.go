@@ -430,6 +430,20 @@ func TestLastCommitsOctopusParentLimit(t *testing.T) {
 	}
 }
 
+// TestLastCommitWalkCapsFields: a path in an old commit is not bounded by
+// rev's tree, so the walk caps an unterminated diff-tree field.
+func TestLastCommitWalkCapsFields(t *testing.T) {
+	w := newLastCommitWalk(strings.Repeat("a", 40), []string{"x"}, 1)
+	piece := bytes.Repeat([]byte("p"), 64<<10)
+	var err error
+	for i := 0; err == nil && i <= maxParentsLine/len(piece); i++ {
+		_, err = w.Write(piece)
+	}
+	if !errors.Is(err, ErrStop) || !errors.Is(w.err, ErrOutputLimit) {
+		t.Fatalf("long field: err %v / %v, want ErrStop and ErrOutputLimit", err, w.err)
+	}
+}
+
 // TestSpoolWriterLimits: the rev-list spool stops git at a line longer
 // than maxParentsLine, also when the line arrives in pieces, and past
 // maxSpoolBytes in total.
