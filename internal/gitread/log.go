@@ -3,6 +3,7 @@ package gitread
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,10 +38,16 @@ type LogOptions struct {
 	SubjectOnly bool
 }
 
-// logFormat renders one record as 10 \x1f-separated fields; records are
-// \x00-separated via -z. %aI/%cI are strict ISO 8601 (RFC 3339). Log swaps
-// the final %B for %s under LogOptions.SubjectOnly.
-const logFormat = "%H%x1f%T%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%B"
+// logFormat renders one record as logFields NUL-terminated fields: the
+// fields are NUL-separated, and -z ends each record with a NUL. git prints
+// no NUL inside a field (it stops a message at its first NUL byte), while
+// names, emails and messages may hold any other byte, 0x1f included (#580).
+// %aI/%cI are strict ISO 8601 (RFC 3339). Log swaps the final %B for %s
+// under LogOptions.SubjectOnly.
+const logFormat = "%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B"
+
+// logFields is the number of fields in one logFormat record.
+const logFields = 10
 
 // logSubjectFormat is logFormat with %s (the subject line) in place of the
 // final %B.
@@ -76,11 +83,12 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 	if err != nil {
 		return nil, err
 	}
-	commits := []Commit{}
-	for rec := range strings.SplitSeq(out, "\x00") {
-		if rec == "" {
-			continue // trailing record separator
-		}
+	recs, err := logRecords(out)
+	if err != nil {
+		return nil, err
+	}
+	commits := make([]Commit, 0, len(recs))
+	for _, rec := range recs {
 		c, err := parse(rec)
 		if err != nil {
 			return nil, err
@@ -88,6 +96,23 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 		commits = append(commits, c)
 	}
 	return commits, nil
+}
+
+// logRecords splits `git log -z` output of logFormat or logSubjectFormat
+// into records of logFields fields each.
+func logRecords(out string) ([][]string, error) {
+	if out == "" {
+		return nil, nil
+	}
+	body, ok := strings.CutSuffix(out, "\x00")
+	if !ok {
+		return nil, fmt.Errorf("log output does not end with a NUL: %.80q", out[max(0, len(out)-80):])
+	}
+	fields := strings.Split(body, "\x00")
+	if len(fields)%logFields != 0 {
+		return nil, fmt.Errorf("log emitted %d fields, not a multiple of %d", len(fields), logFields)
+	}
+	return slices.Collect(slices.Chunk(fields, logFields)), nil
 }
 
 // CommitsBySHA loads the given commits (resolved full SHAs, duplicates
@@ -109,10 +134,11 @@ func CommitsBySHA(ctx context.Context, repoPath string, shas []string) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	for rec := range strings.SplitSeq(stdout, "\x00") {
-		if rec == "" {
-			continue // trailing record separator
-		}
+	recs, err := logRecords(stdout)
+	if err != nil {
+		return nil, err
+	}
+	for _, rec := range recs {
 		c, err := parseSubjectRecord(rec)
 		if err != nil {
 			return nil, err
@@ -129,24 +155,21 @@ func CommitsBySHA(ctx context.Context, repoPath string, shas []string) (map[stri
 
 // parseSubjectRecord parses one logSubjectFormat record: the last field is
 // the subject line, so it fills Subject and leaves Message empty.
-func parseSubjectRecord(rec string) (Commit, error) {
+func parseSubjectRecord(rec []string) (Commit, error) {
 	c, err := parseLogRecord(rec)
 	if err != nil {
 		return Commit{}, err
 	}
 	if strings.Contains(c.Message, "\n") {
-		return Commit{}, fmt.Errorf("log emitted multi-line subject in %.80q", rec)
+		return Commit{}, fmt.Errorf("log emitted multi-line subject for %s: %.80q", c.SHA, c.Message)
 	}
 	c.Subject, c.Message = c.Message, ""
 	return c, nil
 }
 
-// parseLogRecord parses one \x1f-separated logFormat record.
-func parseLogRecord(rec string) (Commit, error) {
-	fields := strings.Split(rec, "\x1f")
-	if len(fields) != 10 {
-		return Commit{}, fmt.Errorf("log emitted %d fields in %.80q", len(fields), rec)
-	}
+// parseLogRecord parses the fields of one logFormat record.
+func parseLogRecord(fields []string) (Commit, error) {
+	assertf(len(fields) == logFields, "parseLogRecord: %d fields", len(fields))
 	c := Commit{
 		SHA:            fields[0],
 		TreeSHA:        fields[1],
@@ -158,7 +181,7 @@ func parseLogRecord(rec string) (Commit, error) {
 		Message:        fields[9],
 	}
 	if !ref.ValidSHA(c.SHA) || !ref.ValidSHA(c.TreeSHA) {
-		return Commit{}, fmt.Errorf("log emitted malformed sha in %.80q", rec)
+		return Commit{}, fmt.Errorf("log emitted malformed sha in %.80q", fields[:2])
 	}
 	for p := range strings.FieldsSeq(fields[2]) {
 		if !ref.ValidSHA(p) {
