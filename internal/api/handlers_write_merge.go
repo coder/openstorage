@@ -1048,7 +1048,7 @@ func wmBlobMode(mode string) bool {
 // (e.g. one side of a delete/modify conflict).
 func wmTreePathEntry(ctx context.Context, sc *wcScratch, tree, path string) (wmStageEntry, error) {
 	assertf(ref.ValidSHA(tree) && path != "", "wmTreePathEntry: bad inputs %q %q", tree, path)
-	out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree, "--", path)
+	out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree, "--", ":(literal)"+path)
 	if err != nil {
 		return wmStageEntry{}, err
 	}

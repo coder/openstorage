@@ -28,7 +28,7 @@ type Commit struct {
 
 // LogOptions tune one Log invocation. The zero value lists the full history.
 type LogOptions struct {
-	Path     string // non-empty limits to commits touching Path (`-- <path>`, no --follow)
+	Path     string // non-empty limits to commits touching Path (`-- :(literal)<path>`, no --follow)
 	Skip     int    // --skip offset (tip-anchored cursor pagination)
 	MaxCount int    // >0 caps the returned commits (-n); 0 = unlimited
 	// SubjectOnly renders the subject line (%s: the first paragraph as one
@@ -64,7 +64,7 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 	}
 	args = append(args, rev)
 	if opts.Path != "" {
-		args = append(args, "--", opts.Path)
+		args = append(args, "--", ":(literal)"+opts.Path)
 	}
 	// One commit with no path filter or skip is a single-object read;
 	// anything else walks history.

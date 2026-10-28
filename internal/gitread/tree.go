@@ -30,7 +30,9 @@ type TreeEntry struct {
 
 // LsTree lists the tree at commit (a resolved full SHA). path filters with
 // git's `ls-tree <commit> -- <path>` semantics: "" lists the root, "dir/"
-// lists a directory's contents, "dir" lists the entry itself. recursive
+// lists a directory's contents, "dir" lists the entry itself. The path is
+// literal: pathspec magic and wildcards match only their own name (#577).
+// recursive
 // descends into subtrees (blobs only, git -r semantics). A path that
 // matches nothing yields an empty slice, NOT an error — the handler decides
 // whether that is a 404.
@@ -42,7 +44,7 @@ func LsTree(ctx context.Context, repoPath, commit, path string, recursive bool) 
 	}
 	args = append(args, commit)
 	if path != "" {
-		args = append(args, "--", path)
+		args = append(args, "--", ":(literal)"+path)
 	}
 	out, err := runGit(ctx, Heavy, repoPath, args...)
 	if err != nil {
