@@ -244,8 +244,8 @@ Upstream evolves continuously, so drift is tracked in the open:
   previous snapshot (`c494c01b`, which added the `ref_guard_failed` code,
   [#568](https://github.com/coder/openstorage/issues/568)) it changes only two
   descriptions: commit list entries and `files/metadata` commits carry the subject line
-  of the message. `GET /repos/commits` follows it. `files/metadata` still sends the full
-  message ([#570](https://github.com/coder/openstorage/issues/570)). At 00:09 UTC on
+  of the message. Both follow it
+  ([#570](https://github.com/coder/openstorage/issues/570)). At 00:09 UTC on
   2026-10-28
   [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served an
   older snapshot (`10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356`),

@@ -259,7 +259,7 @@ func TestCommitsBySHA(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, sha := range []string{f.c1, f.c2} {
-		want, err := Log(ctx, f.dir, sha, LogOptions{MaxCount: 1})
+		want, err := Log(ctx, f.dir, sha, LogOptions{MaxCount: 1, SubjectOnly: true})
 		if err != nil {
 			t.Fatal(err)
 		}
