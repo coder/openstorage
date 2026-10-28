@@ -688,6 +688,16 @@ func TestDiffReaderCapsFields(t *testing.T) {
 	}
 }
 
+// TestDiffReaderStopsGitOnceTheWalkIsDone: after the walk ends, output
+// for requests still in flight stops git and is not parsed.
+func TestDiffReaderStopsGitOnceTheWalkIsDone(t *testing.T) {
+	d := &diffReader{index: map[string]int32{"x": 0}, sections: make(chan diffSection, 1)}
+	d.done.Store(true)
+	if n, err := d.Write([]byte(strings.Repeat("a", 40) + "\x00\n")); n != 0 || !errors.Is(err, ErrStop) || len(d.sections) != 0 {
+		t.Fatalf("Write after done = %d, %v, %d answers; want 0, ErrStop, none", n, err, len(d.sections))
+	}
+}
+
 // TestDiffReaderRejectsAnswersAheadOfInput: an answer the walk did not ask
 // for yet is an error, not the next line's answer.
 func TestDiffReaderRejectsAnswersAheadOfInput(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -153,7 +154,9 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 	}()
 	pd := &pipeDiffer{stdin: stdinW, sections: d.sections, ran: ran, running: true}
 	walkErr := w.walk(bufio.NewReaderSize(spool, maxParentsLine+1), pd)
-	// EOF on stdin ends git normally once the walk is done or failed.
+	// Up to lastCommitWindow requests can still be in flight. git's next
+	// output for them stops it, and EOF on stdin ends it if none is left.
+	d.done.Store(true)
 	_ = stdinW.Close()
 	if pd.running {
 		pd.runErr = <-ran
@@ -507,7 +510,10 @@ type diffSection struct {
 // can (a path can, so it is recognized only between records).
 type diffReader struct {
 	index    map[string]int32
-	sections chan diffSection // capacity 1: the walk writes the next line only after reading an answer
+	sections chan diffSection // room for every request in flight
+	// done is set once the walk ends: answers to requests still in flight
+	// are not needed, so the next output stops git instead of being parsed.
+	done atomic.Bool
 
 	cur      diffSection
 	partial  []byte // an unterminated field
@@ -516,6 +522,9 @@ type diffReader struct {
 }
 
 func (d *diffReader) Write(p []byte) (int, error) {
+	if d.done.Load() {
+		return 0, ErrStop
+	}
 	n := len(p)
 	for len(p) > 0 {
 		if len(d.partial) == 0 && !d.pathNext && p[0] == '\n' {
