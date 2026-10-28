@@ -5,16 +5,30 @@ package api
 // for a date git cannot read or RFC 3339 cannot write) instead of 500.
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/openstorage/internal/auth"
 )
+
+func mustRFC3339(t *testing.T, s string) time.Time {
+	t.Helper()
+	when, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return when
+}
 
 var identCases = []struct {
 	name, ident        string // ident: the line after "author "/"committer "
@@ -126,6 +140,14 @@ func TestCommitReadsMalformedIdents(t *testing.T) {
 			if got := resp.Header.Get("X-Last-Commit-Sha"); got != shas[i] {
 				t.Errorf("%s HEAD file: X-Last-Commit-Sha = %q, want %s", c.name, got, shas[i])
 			}
+			// http.ServeContent sends no Last-Modified for the epoch.
+			wantLM := ""
+			if when := mustRFC3339(t, c.wantDate); when.Unix() != 0 {
+				wantLM = when.Format(http.TimeFormat)
+			}
+			if got := resp.Header.Get("Last-Modified"); got != wantLM {
+				t.Errorf("%s HEAD file: Last-Modified = %q, want %q", c.name, got, wantLM)
+			}
 
 			resp, body = coreGet(t, e, "GET", "/api/v1/repos/blame?path="+file, token, nil)
 			coreRequireStatus(t, resp, body, 200)
@@ -144,6 +166,17 @@ func TestCommitReadsMalformedIdents(t *testing.T) {
 
 			resp, body = e.doReq(t, "POST", "/api/v1/repos/archive", token, []byte(`{"ref":"`+shas[i]+`"}`), "")
 			coreRequireStatus(t, resp, body, 200)
+			gz, err := gzip.NewReader(bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("%s archive: %v", c.name, err)
+			}
+			hdr, err := tar.NewReader(gz).Next()
+			if err != nil {
+				t.Fatalf("%s archive: %v", c.name, err)
+			}
+			if want := mustRFC3339(t, c.wantDate); !hdr.ModTime.Equal(want) {
+				t.Errorf("%s archive: %s mtime %v, want %v", c.name, hdr.Name, hdr.ModTime, want)
+			}
 		}
 	})
 }

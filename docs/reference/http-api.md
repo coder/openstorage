@@ -397,7 +397,8 @@ fallbacks:
 
 - If git cannot split the line into a name and an `<email>` (for example, a NUL byte in
   the name), `author_name` and `author_email` (or the committer pair) are `""`, as git's
-  `%an` and `%ae` print them. Blame sends git blame's `(unknown)` instead.
+  `%an` and `%ae` print them. Blame sends git blame's `(unknown)` instead. The date is
+  `1970-01-01T00:00:00Z`. `git log` shows neither the person nor a date for such a line.
 - If git cannot read the date (no date, a date that is not a number, no time zone),
   `date` (or `committer_date`) is `1970-01-01T00:00:00Z`. `git log` shows the same epoch
   for such a line.
