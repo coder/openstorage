@@ -36,7 +36,7 @@ Full endpoint catalogs: [HTTP API](../reference/http-api.md) (REST),
 | Surface | Status | Notes |
 |---|---|---|
 | Repository lifecycle | ✅ | Create (incl. Git Sync via `upstream`, and copy or fork via `base_repo`), get (with `upstream` for sync-linked repos), `PATCH` (default branch), list, delete, `GET /api/repo-urls/{repo_id}` (an extension, see below) |
-| Read surface | ✅ | Files (conditional/range streaming), file listings + metadata, branches, tags, commits, diff, branches-diff, blame, grep, archive, notes — cursor pagination throughout |
+| Read surface | ✅ | Files (conditional/range streaming), file listings + metadata, branches, tags, commits, diff, branches-diff, blame, grep, archive, notes — cursor pagination throughout. File listings without `limit` and `cursor` return every entry, and `files/metadata` answers `429` past 50,000 distinct last commits (spec 2026-10-27) |
 | Single-item lookups | ✅ | `GET .../branch`, `GET .../tag` — served although the vendored spec omits them (SDK-relied surface) |
 | Write surface | ✅ | NDJSON `commit-pack` and `diff-commit` streaming, `restore-commit`, branch/tag/notes writes — compare-and-swap (`expected_head_sha` etc.) and ref policies everywhere |
 | Merge | ✅ | `POST .../merge` + read-only `GET .../merge/preview` |
@@ -47,7 +47,7 @@ Full endpoint catalogs: [HTTP API](../reference/http-api.md) (REST),
 | Git LFS | ✅ | Batch API on the same remote; presigned S3 downloads with a server-proxied fallback, verified server-proxied uploads ([below](#git-lfs-transfer-semantics)) |
 | Webhooks | ✅ | HMAC-signed `push` and `repo.sync.*` events, plus webhook CRUD. Outbound push-upstream runs send the extension events `repo.push_upstream.*` |
 | Upstream sync & credentials | ✅ | `pull-upstream`, `push-upstream` (outbound forwarding: explicit trigger plus opt-in `base_repo.forward_pushes`; trigger semantics differ from upstream's implicit forwarding, see the [deviation](#known-deviations-from-the-vendored-spec)), detach base, git-credential CRUD. SQLite local mode and experimental s3wal mode schedule git-surface pushes like Postgres: an authorized push records durable intent that the serve process runs once the push's refs are published |
-| Throttled responses | ✅ | Every HTTP-level `429` (gateway [rate limiter](../reference/configuration.md#rate-limiting) and busy/backpressure paths) carries both upstream-documented headers: `Retry-After` (delay-seconds) and the IETF `RateLimit` service-limit field (`"default";r=0;t=<retry-after-secs>`); `Retry-After` takes precedence |
+| Throttled responses | ✅ | Every HTTP-level `429` (gateway [rate limiter](../reference/configuration.md#rate-limiting) and busy/backpressure paths) carries both upstream-documented headers: `Retry-After` (delay-seconds) and the IETF `RateLimit` service-limit field (`"default";r=0;t=<retry-after-secs>`); `Retry-After` takes precedence. The `files/metadata` `429` for more than 50,000 distinct last commits carries neither: upstream says a retry gets the same response (spec 2026-10-27) |
 | Auth model | ✅ | Customer-signed JWTs (`ES256`/`RS256`/`EdDSA`/`PS256`/`ES384`/`ES512`), scopes `git:read` / `git:write` / `repo:write` / `org:read` (exact matching — no scope implies another), `refs` policy tuples ([auth spec](../reference/authentication.md)) |
 
 ### Server-allocated branch contract

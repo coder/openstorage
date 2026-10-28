@@ -632,12 +632,31 @@ func (s *server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
 // 2b: GET /repos/files + GET /repos/files/metadata
 
 // files/files-metadata limits (openapi list_files/list_files_metadata).
+// The default sizes apply only to a call with a cursor and no limit (or
+// limit=0).
 const (
 	defaultFilesLimit     = 1000
 	maxFilesLimit         = 5000
 	defaultFilesMetaLimit = 200
 	maxFilesMetaLimit     = 1000
+	// files/metadata answers 429 when the files under `path` have more
+	// distinct last commits than this (spec c494c01b, #569).
+	maxFilesMetaLastCommits = 50000
 )
+
+// filesLimitParam parses `limit` for files and files/metadata (spec
+// c494c01b): no limit (absent or 0) means every entry, returned as 0,
+// unless the call sends a cursor, which gets the def page.
+func filesLimitParam(q url.Values, def, max int) (int, error) {
+	if q.Get("cursor") == "" {
+		if raw := q.Get("limit"); raw == "" {
+			return 0, nil
+		} else if n, err := strconv.Atoi(raw); err == nil && n == 0 {
+			return 0, nil
+		}
+	}
+	return coreLimitParam(q, def, max)
+}
 
 // resolveFilesRequest validates the params shared by the files listings and
 // resolves ref -> commit. Returns ok=false with the response written.
@@ -705,20 +724,21 @@ func (s *server) listTreePage(w http.ResponseWriter, r *http.Request, repoPath, 
 	return entries, true
 }
 
-// pageTreeEntries applies the (cursorKind, cursor, limit) keyset window.
-func pageTreeEntries(entries []gitread.TreeEntry, after string, limit int) (page []gitread.TreeEntry, hasMore bool) {
-	assertf(limit > 0, "pageTreeEntries: limit %d", limit)
-	page = []gitread.TreeEntry{}
-	for _, e := range entries {
-		if after != "" && e.Path <= after {
-			continue
-		}
-		if len(page) == limit {
-			return page, true
-		}
-		page = append(page, e)
+// pageTreeEntries applies the (cursorKind, cursor, limit) keyset window to
+// entries (sorted by path, as listTreePage returns them). The page is
+// entries[start:start+len(page)]. limit 0 (no limit and no cursor) returns
+// every entry.
+func pageTreeEntries(entries []gitread.TreeEntry, after string, limit int) (start int, page []gitread.TreeEntry, hasMore bool) {
+	assertf(limit >= 0, "pageTreeEntries: limit %d", limit)
+	if limit == 0 {
+		assertf(after == "", "pageTreeEntries: no limit with cursor %q", after)
+		return 0, entries, false
 	}
-	return page, false
+	if after != "" {
+		start = sort.Search(len(entries), func(i int) bool { return entries[i].Path > after })
+	}
+	end := min(start+limit, len(entries))
+	return start, entries[start:end], end < len(entries)
 }
 
 type fileEntry struct {
@@ -744,7 +764,7 @@ func (s *server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	limit, err := coreLimitParam(q, defaultFilesLimit, maxFilesLimit)
+	limit, err := filesLimitParam(q, defaultFilesLimit, maxFilesLimit)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -771,28 +791,32 @@ func (s *server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	page, hasMore := pageTreeEntries(entries, after, limit)
-
-	respEntries := make([]fileEntry, 0, len(page))
-	paths := []string{}
-	for _, e := range page {
-		respEntries = append(respEntries, fileEntry{Path: e.Path, Type: e.Type, Mode: e.Mode})
-		if e.Type == gitread.EntryBlob {
-			paths = append(paths, e.Path)
-		}
-	}
+	_, page, hasMore := pageTreeEntries(entries, after, limit)
 	next := ""
 	if hasMore {
 		next = coreCursorEncode(cursorKindFiles, page[len(page)-1].Path)
 	}
 	assertPageCursor(hasMore, next)
-	writeJSON(w, http.StatusOK, listFilesResponse{
-		Paths:      paths,
+	// Without a limit the page is the whole tree: stream its entries.
+	writeJSONLists(w, http.StatusOK, listFilesResponse{
+		Paths:      []string{},
 		Ref:        refLabel,
-		Entries:    respEntries,
+		Entries:    []fileEntry{},
 		NextCursor: next,
 		HasMore:    hasMore,
-	})
+	}, jsonList{"paths", func(yield func(any) bool) {
+		for _, e := range page {
+			if e.Type == gitread.EntryBlob && !yield(e.Path) {
+				return
+			}
+		}
+	}}, jsonList{"entries", func(yield func(any) bool) {
+		for _, e := range page {
+			if !yield(fileEntry{Path: e.Path, Type: e.Type, Mode: e.Mode}) {
+				return
+			}
+		}
+	}})
 }
 
 type fileMetaEntry struct {
@@ -822,15 +846,17 @@ type listFilesMetadataResponse struct {
 // recursive (the `recursive` flag is accepted for symmetry, openapi), each
 // page entry annotated with the last commit touching it, commit details
 // deduplicated into the `commits` map. Unborn branch -> 404 (invariant 3).
-// The per-path `git log -1` is O(page) subprocesses — accepted for p3 —
-// plus one `git rev-list --topo-order` walk per page for the `order` ranks.
+// Like upstream (spec c494c01b), every call finds the last commit of every
+// file under `path`, in one history walk (gitread.LastCommits), and
+// answers 429 past maxFilesMetaLastCommits; the page's commits then cost
+// one `git log --no-walk` and one `git rev-list --topo-order` for `order`.
 func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
 		return
 	}
 	q := r.URL.Query()
-	limit, err := coreLimitParam(q, defaultFilesMetaLimit, maxFilesMetaLimit)
+	limit, err := filesLimitParam(q, defaultFilesMetaLimit, maxFilesMetaLimit)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -857,38 +883,40 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	page, hasMore := pageTreeEntries(entries, after, limit)
-
-	files := make([]fileMetaEntry, 0, len(page))
-	commitsMap := map[string]fileMetaCommit{}
-	for _, e := range page {
-		last, err := gitread.Log(r.Context(), repoPath, commit, gitread.LogOptions{Path: e.Path, MaxCount: 1})
-		if err != nil {
-			s.internalErr(w, r, "last commit for path", err)
-			return
-		}
-		if len(last) == 0 {
-			// ls-tree listed the path at this commit, so some reachable
-			// commit must have introduced it.
-			s.internalErr(w, r, "last commit for path", fmt.Errorf("no commit touches %q at %s", e.Path, commit))
-			return
-		}
-		size := max(e.Size,
-			// submodules: ls-tree reports no blob size
-			0)
-		files = append(files, fileMetaEntry{
-			Path:          e.Path,
-			Mode:          e.Mode,
-			Size:          size,
-			LastCommitSHA: last[0].SHA,
-			Type:          e.Type,
-		})
-		commitsMap[last[0].SHA] = fileMetaCommit{
-			Author: last[0].AuthorName,
+	paths := make([]string, 0, len(entries))
+	for _, e := range entries {
+		paths = append(paths, e.Path)
+	}
+	last, err := gitread.LastCommits(r.Context(), repoPath, commit, paths, maxFilesMetaLastCommits)
+	if errors.Is(err, gitread.ErrTooManyLastCommits) {
+		// No Retry-After: a retry gets the same answer (spec c494c01b).
+		writeErr(w, http.StatusTooManyRequests,
+			"the files under path have more than 50,000 distinct last commits; send a narrower path")
+		return
+	} else if err != nil {
+		s.internalErr(w, r, "last commit per path", err)
+		return
+	}
+	assertf(len(last) == len(entries), "files/metadata: %d last commits for %d entries", len(last), len(entries))
+	start, page, hasMore := pageTreeEntries(entries, after, limit)
+	pageLast := last[start : start+len(page)]
+	pageCommits := map[string]struct{}{}
+	for _, sha := range pageLast {
+		pageCommits[sha] = struct{}{}
+	}
+	details, err := gitread.CommitsBySHA(r.Context(), repoPath, slices.Collect(maps.Keys(pageCommits)))
+	if err != nil {
+		s.internalErr(w, r, "page commits", err)
+		return
+	}
+	commitsMap := make(map[string]fileMetaCommit, len(details))
+	for sha, c := range details {
+		commitsMap[sha] = fileMetaCommit{
+			Author: c.AuthorName,
 			// openapi: "RFC 3339 author date for the commit", like
 			// commitInfo.Date.
-			Date:    last[0].AuthorDate.UTC().Format(time.RFC3339),
-			Message: strings.TrimRight(last[0].Message, "\n"),
+			Date:    c.AuthorDate.UTC().Format(time.RFC3339),
+			Message: strings.TrimRight(c.Message, "\n"),
 		}
 	}
 	// openapi (#292): `order` is the topological rank relative to the
@@ -912,13 +940,37 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 		next = coreCursorEncode(cursorKindFileMeta, page[len(page)-1].Path)
 	}
 	assertPageCursor(hasMore, next)
-	writeJSON(w, http.StatusOK, listFilesMetadataResponse{
-		Files:      files,
-		Commits:    commitsMap,
+	// Without a limit the page is the whole tree: stream its files, and
+	// its commits (up to 50,000 push-controlled messages, which JSON
+	// escaping can grow 6-fold).
+	writeJSONLists(w, http.StatusOK, listFilesMetadataResponse{
+		Files:      []fileMetaEntry{},
+		Commits:    map[string]fileMetaCommit{},
 		Ref:        refLabel,
 		NextCursor: next,
 		HasMore:    hasMore,
-	})
+	}, jsonList{"files", func(yield func(any) bool) {
+		for i, e := range page {
+			assertf(pageLast[i] != "", "files/metadata: no last commit for %q", e.Path)
+			if !yield(fileMetaEntry{
+				Path: e.Path,
+				Mode: e.Mode,
+				Size: max(e.Size,
+					// submodules: ls-tree reports no blob size
+					0),
+				LastCommitSHA: pageLast[i],
+				Type:          e.Type,
+			}) {
+				return
+			}
+		}
+	}}, jsonList{"commits", func(yield func(any) bool) {
+		for _, sha := range slices.Sorted(maps.Keys(commitsMap)) {
+			if !yield(jsonMember{sha, commitsMap[sha]}) {
+				return
+			}
+		}
+	}})
 }
 
 // ---------------------------------------------------------------------------
