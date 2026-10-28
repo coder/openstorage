@@ -259,7 +259,7 @@ or NUL fails the sync as a configuration error.
 | `GET /repos/file` | `path` (req), `ref`, `ephemeral`, `ephemeral_base`; headers `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` | Raw blob stream. Status 200/206/304/412/416. Headers: `X-Blob-Sha`, `X-Last-Commit-Sha`, `ETag`, `Last-Modified`, `Accept-Ranges`, `Content-Range`, `Content-Type`, `Content-Length` |
 | `HEAD /repos/file` | same | headers only |
 | `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], ref, entries: [{path, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type`. No `cursor` and no `limit` (or `limit=0`): every entry |
-| `GET /repos/files/metadata` | same | `{files: [{path, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. No `cursor` and no `limit` (or `limit=0`): every file. **429** when the files under `path` have more than 50,000 distinct last commits, also with `limit` or `cursor`: a retry gets the same 429 (no `Retry-After`), so send a narrower `path`. **404 on unborn branch** |
+| `GET /repos/files/metadata` | same | `{files: [{path, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. `message` is the subject line only, as in the commits list ([Commits](#commits)). No `cursor` and no `limit` (or `limit=0`): every file. **429** when the files under `path` have more than 50,000 distinct last commits, also with `limit` or `cursor`: a retry gets the same 429 (no `Retry-After`), so send a narrower `path`. **404 on unborn branch** |
 | `POST /repos/archive` | body `{ref?, include_globs?, exclude_globs?, max_blob_size?, archive?: {prefix}}` | tar.gz stream |
 | `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, file_filters?: {include_globs, exclude_globs, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
 | `GET /repos/blame` | `path` (req), `ref`, `ephemeral`, `range` (repeatable, `git blame -L` specs like `1,10`), `detect_moves` | `{ref, path, commit_sha, lines: [{line_number, commit_sha, original_line_number, original_path, previous_commit_sha?, author_name, author_email, author_time, committer_name, committer_email, committer_time, summary}]}` |
@@ -390,12 +390,13 @@ timestamp and `committer_date` the committer timestamp, as in upstream's spec of
 `date` carried the committer timestamp.
 
 `GET /repos/commit` sends the full `message`, with trailing newlines removed. `GET
-/repos/commits` sends only the subject line, as in upstream's docs spec of 2026-10-27:
-the first paragraph of the message as one line, without the body and the trailers. This
-is git's `%s`: blank lines before the first paragraph are skipped, a whitespace-only
-line ends it, its lines are joined with one space after their trailing whitespace is
-removed, and an empty message gives `""`. Before that spec, list entries carried the
-full message.
+/repos/commits` and the `files/metadata` `commits` map send only the subject line, as in
+upstream's docs spec of 2026-10-27: the first paragraph of the message as one line,
+without the body and the trailers. This is git's `%s`: blank lines before the first
+paragraph are skipped, a whitespace-only line ends it, its lines are joined with one
+space after their trailing whitespace is removed, and an empty message gives `""`. A
+continuation line keeps its leading whitespace, so `"subj\n  next"` gives `subj   next`.
+Before that spec, both carried the full message.
 
 ### Tags
 

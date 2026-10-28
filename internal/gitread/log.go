@@ -42,14 +42,18 @@ type LogOptions struct {
 // the final %B for %s under LogOptions.SubjectOnly.
 const logFormat = "%H%x1f%T%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%B"
 
+// logSubjectFormat is logFormat with %s (the subject line) in place of the
+// final %B.
+var logSubjectFormat = strings.TrimSuffix(logFormat, "%B") + "%s"
+
 // Log lists commits reachable from rev (a resolved full SHA), newest first
 // in commit-graph order (git log default — invariant 9).
 func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, error) {
 	assertf(ref.ValidSHA(rev), "Log: unresolved rev %q", rev)
 	assertf(opts.Skip >= 0 && opts.MaxCount >= 0, "Log: negative Skip/MaxCount %+v", opts)
-	format := logFormat
+	format, parse := logFormat, parseLogRecord
 	if opts.SubjectOnly {
-		format = strings.TrimSuffix(logFormat, "%B") + "%s"
+		format, parse = logSubjectFormat, parseSubjectRecord
 	}
 	args := []string{"log", "-z", "--format=" + format}
 	if opts.Skip > 0 {
@@ -77,15 +81,9 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 		if rec == "" {
 			continue // trailing record separator
 		}
-		c, err := parseLogRecord(rec)
+		c, err := parse(rec)
 		if err != nil {
 			return nil, err
-		}
-		if opts.SubjectOnly {
-			if strings.Contains(c.Message, "\n") {
-				return nil, fmt.Errorf("log emitted multi-line subject in %.80q", rec)
-			}
-			c.Subject, c.Message = c.Message, ""
 		}
 		commits = append(commits, c)
 	}
@@ -93,8 +91,9 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 }
 
 // CommitsBySHA loads the given commits (resolved full SHAs, duplicates
-// allowed) with one `git log --no-walk --stdin` child, keyed by SHA. It is
-// Heavy: the output grows with the number of commits.
+// allowed) with one `git log --no-walk --stdin` child, keyed by SHA, with
+// Subject set and Message empty (as LogOptions.SubjectOnly). It is Heavy:
+// the output grows with the number of commits.
 func CommitsBySHA(ctx context.Context, repoPath string, shas []string) (map[string]Commit, error) {
 	out := make(map[string]Commit, len(shas))
 	if len(shas) == 0 {
@@ -106,7 +105,7 @@ func CommitsBySHA(ctx context.Context, repoPath string, shas []string) (map[stri
 		in.WriteString(sha + "\n")
 	}
 	stdout, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdin: strings.NewReader(in.String()),
-		Args: []string{"log", "--no-walk", "--stdin", "-z", "--format=" + logFormat}})
+		Args: []string{"log", "--no-walk", "--stdin", "-z", "--format=" + logSubjectFormat}})
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +113,7 @@ func CommitsBySHA(ctx context.Context, repoPath string, shas []string) (map[stri
 		if rec == "" {
 			continue // trailing record separator
 		}
-		c, err := parseLogRecord(rec)
+		c, err := parseSubjectRecord(rec)
 		if err != nil {
 			return nil, err
 		}
@@ -126,6 +125,20 @@ func CommitsBySHA(ctx context.Context, repoPath string, shas []string) (map[stri
 		}
 	}
 	return out, nil
+}
+
+// parseSubjectRecord parses one logSubjectFormat record: the last field is
+// the subject line, so it fills Subject and leaves Message empty.
+func parseSubjectRecord(rec string) (Commit, error) {
+	c, err := parseLogRecord(rec)
+	if err != nil {
+		return Commit{}, err
+	}
+	if strings.Contains(c.Message, "\n") {
+		return Commit{}, fmt.Errorf("log emitted multi-line subject in %.80q", rec)
+	}
+	c.Subject, c.Message = c.Message, ""
+	return c, nil
 }
 
 // parseLogRecord parses one \x1f-separated logFormat record.

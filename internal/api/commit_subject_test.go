@@ -1,12 +1,13 @@
 package api
 
 // Issue #570 (upstream docs spec b598ce96): GET /repos/commits list entries
-// carry only the subject line, "the first paragraph of the message as one
-// line, without the body and the trailers"; GET /repos/commit keeps the full
-// message.
+// and GET /repos/files/metadata commits carry only the subject line, "the
+// first paragraph of the message as one line, without the body and the
+// trailers"; GET /repos/commit keeps the full message.
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,18 +16,25 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 )
 
-// upstreamSubjectWording is the vendored spec's Commit.message rule that
-// subjectCases encode. If a spec refresh rewords it, recheck the cases.
-const upstreamSubjectWording = "In repos.commits.list responses, only the subject line: " +
-	"the first paragraph of the message as one line, without the body and the trailers."
+// upstreamSubjectWording holds the vendored spec's Commit.message and
+// FileLastCommit.message rules that subjectCases encode. If a spec refresh
+// rewords them, recheck the cases.
+var upstreamSubjectWording = []string{
+	"In repos.commits.list responses, only the subject line: " +
+		"the first paragraph of the message as one line, without the body and the trailers.",
+	"The subject line of the commit message: " +
+		"the first paragraph of the message as one line, without the body and the trailers.",
+}
 
 func TestCommitSubjectWordingMatchesUpstream(t *testing.T) {
 	raw, err := os.ReadFile(upstreamSpecPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := strings.Count(string(raw), upstreamSubjectWording); n != 1 {
-		t.Fatalf("%s holds the Commit.message subject rule %d times, want 1", upstreamSpecPath, n)
+	for _, rule := range upstreamSubjectWording {
+		if n := strings.Count(string(raw), rule); n != 1 {
+			t.Fatalf("%s holds the subject rule %q %d times, want 1", upstreamSpecPath, rule, n)
+		}
 	}
 }
 
@@ -48,6 +56,9 @@ var subjectCases = []subjectCase{
 	// A multi-line first paragraph becomes one line: lines joined by one
 	// space, trailing whitespace of each line dropped.
 	{"multi-line first paragraph", "first line  \nsecond line\t\nthird line\n\nbody\n", "first line second line third line"},
+	// Leading whitespace of a continuation line stays: one joining space
+	// plus the line's own two.
+	{"indented continuation line", "subj\n  next\n\nbody\n", "subj   next"},
 	{"crlf", "subject one\r\nsubject two\r\n\r\nbody\r\n", "subject one subject two"},
 	// A whitespace-only line ends the paragraph.
 	{"whitespace-only separator", "para one\n \t\npara two\n", "para one"},
@@ -84,13 +95,14 @@ func TestCommitListMessageIsSubjectLine(t *testing.T) {
 		}
 		dir := t.TempDir()
 		coreGit(t, dir, "init", "-q", "-b", "main", ".")
-		coreWriteFile(t, dir, "a.txt", "a\n")
-		coreGit(t, dir, "add", ".")
-		tree := strings.TrimSpace(coreGit(t, dir, "write-tree"))
-
 		shas := make([]string, len(subjectCases)) // oldest first
 		parent := ""
 		for i, c := range subjectCases {
+			// Each commit adds its own file, so files/metadata names it
+			// as that file's last commit.
+			coreWriteFile(t, dir, fmt.Sprintf("f%02d.txt", i), c.name+"\n")
+			coreGit(t, dir, "add", ".")
+			tree := strings.TrimSpace(coreGit(t, dir, "write-tree"))
 			shas[i] = subjectCommit(t, dir, tree, parent, c.raw)
 			parent = shas[i]
 			// The oracle literal must be what git's %s prints: the
@@ -121,6 +133,22 @@ func TestCommitListMessageIsSubjectLine(t *testing.T) {
 			msg, ok := entry["message"].(string)
 			if !ok || msg != c.subject {
 				t.Errorf("%s: list message = %#v, want %q", c.name, entry["message"], c.subject)
+			}
+		}
+
+		resp, body = coreGet(t, e, "GET", "/api/v1/repos/files/metadata", token, nil)
+		coreRequireStatus(t, resp, body, 200)
+		var meta struct {
+			Commits map[string]map[string]any `json:"commits"`
+		}
+		coreDecode(t, body, &meta)
+		if len(meta.Commits) != len(subjectCases) {
+			t.Fatalf("files/metadata has %d commits, want %d: %s", len(meta.Commits), len(subjectCases), body)
+		}
+		for i, c := range subjectCases {
+			msg, ok := meta.Commits[shas[i]]["message"].(string)
+			if !ok || msg != c.subject {
+				t.Errorf("%s: files/metadata message = %#v, want %q", c.name, meta.Commits[shas[i]]["message"], c.subject)
 			}
 		}
 

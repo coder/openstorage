@@ -921,7 +921,7 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 			// openapi: "RFC 3339 author date for the commit", like
 			// commitInfo.Date.
 			Date:    c.AuthorDate.UTC().Format(time.RFC3339),
-			Message: strings.TrimRight(c.Message, "\n"),
+			Message: c.Subject, // the subject line only (upstream spec 2026-10-27, #570)
 		}
 	}
 	// openapi (#292): `order` is the topological rank relative to the
