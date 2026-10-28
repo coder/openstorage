@@ -173,17 +173,19 @@ func blameTZ(raw []string, timeIdx int) string {
 	return "+0000"
 }
 
-// parseBlameTime combines porcelain unix seconds with a ±HHMM offset.
+// parseBlameTime combines porcelain unix seconds with a ±HHMM offset. An
+// offset or local time that RFC 3339 cannot write (+9999, year 10000)
+// reads as UTC (#581).
 func parseBlameTime(sec, tz string) (time.Time, error) {
-	n, err := strconv.ParseInt(sec, 10, 64)
+	t, err := identTime(sec)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("blame emitted time %q: %w", sec, err)
+		return time.Time{}, fmt.Errorf("blame time: %w", err)
 	}
 	loc := time.UTC
 	if len(tz) == 5 && (tz[0] == '+' || tz[0] == '-') {
 		hh, errH := strconv.Atoi(tz[1:3])
 		mm, errM := strconv.Atoi(tz[3:5])
-		if errH == nil && errM == nil {
+		if errH == nil && errM == nil && hh < 24 && mm < 60 {
 			offset := hh*3600 + mm*60
 			if tz[0] == '-' {
 				offset = -offset
@@ -191,5 +193,8 @@ func parseBlameTime(sec, tz string) (time.Time, error) {
 			loc = time.FixedZone(tz, offset)
 		}
 	}
-	return time.Unix(n, 0).In(loc), nil
+	if t.In(loc).Year() > 9999 {
+		loc = time.UTC
+	}
+	return t.In(loc), nil
 }

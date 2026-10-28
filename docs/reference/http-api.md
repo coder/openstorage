@@ -391,6 +391,24 @@ timestamp and `committer_date` the committer timestamp, as in upstream's spec of
 2026-10-08. A rebase or cherry-pick changes only `committer_date`. Before that spec,
 `date` carried the committer timestamp.
 
+A push can hold a commit whose author or committer line git cannot parse, because the
+server runs no fsck on a push. Reads of such a commit answer 200 with git's own
+fallbacks:
+
+- If git cannot split the line into a name and an `<email>` (for example, a NUL byte in
+  the name), `author_name` and `author_email` (or the committer pair) are `""`, as git's
+  `%an` and `%ae` print them. Blame sends git blame's `(unknown)` instead.
+- If git cannot read the date (no date, a date that is not a number, no time zone),
+  `date` (or `committer_date`) is `1970-01-01T00:00:00Z`. `git log` shows the same epoch
+  for such a line.
+- A date after `9999-12-31T23:59:59Z` also gives `1970-01-01T00:00:00Z`, because RFC 3339
+  cannot write it.
+
+The `files/metadata` `commits` map and blame's `author_time` and `committer_time` follow
+the same rules. Blame keeps the line's time zone offset, except an offset that RFC 3339
+cannot write (24 hours or more, or 60 minutes or more) or one that moves the local date
+past the year 9999. Then it sends UTC.
+
 `GET /repos/commit` sends the full `message`, with trailing newlines removed. `GET
 /repos/commits` and the `files/metadata` `commits` map send only the subject line, as in
 upstream's docs spec of 2026-10-27: the first paragraph of the message as one line,
