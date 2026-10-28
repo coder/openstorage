@@ -236,7 +236,9 @@ func newLastCommitWalk(rev string, paths []string, maxDistinct int) *lastCommitW
 }
 
 // hand moves set to the paths waiting on commit c. Merging the smaller set
-// into the larger keeps the total work O(paths * log paths).
+// into the larger keeps the total work O(paths * log paths). c is cloned:
+// it is a substring of a rev-list line of up to maxParentsLine bytes, which
+// the map would otherwise keep alive (Go stores the newest key).
 func (w *lastCommitWalk) hand(c string, set pathSet) {
 	have := w.waiting[c]
 	if len(have) < len(set) {
@@ -245,7 +247,7 @@ func (w *lastCommitWalk) hand(c string, set pathSet) {
 	for i := range set {
 		have[i] = struct{}{}
 	}
-	w.waiting[c] = have
+	w.waiting[strings.Clone(c)] = have
 }
 
 // lastCommitWindow bounds the diff-tree requests that the walk sends ahead
@@ -374,7 +376,7 @@ func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
 			}
 		}
 		if len(expect) < maxExpected {
-			expect[l.parents[0]] = struct{}{}
+			expect[strings.Clone(l.parents[0])] = struct{}{} // see hand
 		}
 	}
 	for rank := 0; w.left > 0; {
@@ -476,8 +478,9 @@ func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
 			}
 		}
 		// A root, or changed against every parent: l.c is the answer.
+		c := strings.Clone(l.c) // kept in last and order; see hand
 		for i := range set {
-			if err := w.resolve(i, l.c, l.rank); err != nil {
+			if err := w.resolve(i, c, l.rank); err != nil {
 				return err
 			}
 		}
