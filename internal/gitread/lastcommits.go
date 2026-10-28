@@ -257,9 +257,9 @@ func (w *lastCommitWalk) hand(c string, set pathSet) {
 // at most one entry per path.
 const lastCommitWindow = 16
 
-// maxExpected bounds the expected first parents that the walk has not
-// read yet (one per line sent ahead whose parent comes later in the
-// spool, such as a mainline commit after a merge's side branch). Past it,
+// maxExpected bounds the expected parents that the walk has not read yet
+// (one per single-parent line sent ahead whose parent comes later in the
+// spool, such as a branch point with other children in between). Past it,
 // the walk only sends fewer lines ahead; the answers do not change.
 const maxExpected = 4096
 
@@ -332,12 +332,14 @@ type diffReq struct {
 //
 // It keeps a window of up to lastCommitWindow lines ahead and sends their
 // first diffs before it needs them: for every line that a path already
-// waits on, and for the first parent of every line whose diff it sent,
-// since paths mostly move to first parents. That keeps a linear history to
-// one request per commit without a round trip per commit. A line sent
-// ahead that no path reaches costs one diff whose answer is dropped. Later
-// parents of a merge are sent only when needed, and the walk then waits
-// for them.
+// waits on, and for the parent of every single-parent line whose diff it
+// sent. A single-parent commit hands every path it does not resolve to that
+// parent, so a linear history takes one request per commit without a round
+// trip per commit. A request sent ahead is wasted only below a commit that
+// resolves all of its paths (at most one window of them), and its answer is
+// dropped. Nothing is sent ahead past a merge, whose paths may all leave by
+// a later parent: later parents are sent only when needed, and the walk
+// then waits for them.
 func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
 	var window []*walkLine
 	var flight []*diffReq           // sent, not yet received, in send order
@@ -417,7 +419,9 @@ func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
 				return err
 			}
 			l.first = r
-			expectParent(l)
+			if len(l.parents) == 1 {
+				expectParent(l)
+			}
 		}
 
 		l := window[0]

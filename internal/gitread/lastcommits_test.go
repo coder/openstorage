@@ -469,10 +469,11 @@ func TestLastCommitWalkSendsAheadWithinWindow(t *testing.T) {
 	}
 }
 
-// TestLastCommitWalkBoundsRequestsInFlight: the first-parent chain of the
-// tip is sent ahead although no path waits on it (the path took the second
-// parent), so its answers are dropped. They stay in flight until the walk
-// next waits, and the window must still bound them.
+// TestLastCommitWalkBoundsRequestsInFlight: the tip is a merge whose path
+// comes from the second parent, while the first-parent chain rewrites it.
+// The walk must not send that chain ahead (a merge's paths may all leave by
+// a later parent, so nothing is sent ahead past a merge), and must keep the
+// requests in flight within the window.
 func TestLastCommitWalkBoundsRequestsInFlight(t *testing.T) {
 	const n = 3 * lastCommitWindow
 	var in strings.Builder
@@ -507,6 +508,14 @@ func TestLastCommitWalkBoundsRequestsInFlight(t *testing.T) {
 	}
 	if e.inFlight > lastCommitWindow+1 {
 		t.Fatalf("%d requests in flight, want at most %d", e.inFlight, lastCommitWindow+1)
+	}
+	// The chain below the tip's first parent, without the shared root.
+	rootSHA := strings.TrimSpace(mustGit(t, dir, "rev-list", "--max-parents=0", "main"))
+	firstParent := strings.Fields(mustGit(t, dir, "rev-list", "--first-parent", "main~1", "^"+rootSHA))
+	for _, input := range e.inputs {
+		if slices.Contains(firstParent, strings.Fields(input)[0]) {
+			t.Fatalf("the walk diffed first-parent commit %s, which no path reaches (inputs %q)", input, e.inputs)
+		}
 	}
 }
 
