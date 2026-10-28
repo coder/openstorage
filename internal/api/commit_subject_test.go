@@ -64,6 +64,8 @@ var subjectCases = []subjectCase{
 	{"whitespace-only separator", "para one\n \t\npara two\n", "para one"},
 	// Blank lines before the first paragraph are not a paragraph.
 	{"leading blank lines", "\n \n\nreal subject\n\nbody\n", "real subject"},
+	// 0x1f is an ordinary message byte (#580).
+	{"unit separator", "sub\x1fject\n\nbody\x1ftext\n", "sub\x1fject"},
 }
 
 // subjectCommit writes one commit object with exactly raw as its message
