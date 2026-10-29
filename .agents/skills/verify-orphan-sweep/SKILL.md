@@ -112,7 +112,7 @@ When check.sh says STALE, or when you change covered code on purpose:
 2. For each change, decide: no effect on what the model describes, the model no longer describes the code (a step split in two, a new branch, a moved check, a guard that became conditional, a new path that writes the same keys or rows), or the promise changed on purpose (cite the doc comment, test, or ADR that says so). The facts check call order, not conditions, so a guard wrapped in a new `if` can keep its fact TRUE: read every changed branch around a guard.
 3. Update `model/PackSweep.tla` from the code, not from the result. Keep one indivisible call as one action. If a fact's guard moved or was renamed, update `facts/facts.go` too.
 4. Rerun check.sh. If it passes, break the new code once in a scratch edit (remove the new check, or reorder the new step) and confirm that check.sh fails. Then drop the scratch edit.
-5. Run `check.sh --record`. It rewrites `model/fingerprints.txt` and the sync commit below. Run it only after steps 1 to 4. It refuses when a property fails, a fact is FALSE, or `--only` is set.
+5. Run `check.sh --record`. It rewrites `model/fingerprints.txt` and the sync commit below. Run it only after steps 1 to 4. It refuses when a property fails, a fact is FALSE, a probe passes, `--only` is set, or a covered file has uncommitted changes. It records the merge base with `origin/main` when the covered files match it there, so a squash merge does not orphan the sync commit.
 
 ## Scope
 
@@ -133,7 +133,7 @@ When check.sh says STALE, or when you change covered code on purpose:
 **Simplifications:** each one gives the model at least the behaviors of the code, or the same outcome:
 
 - The sweeper ignores blob age and the `packs/` listing. It can pick K as a candidate at any time, even a blob a writer uploaded a moment ago, so the model checks a more aggressive sweeper than the code.
-- Merged calls, where no other process can change the outcome in between: the classify and revalidate registry reads, the writer's `HasPack` probe with its upload, `EnsurePublished`'s Stat with its re-upload, and the heal's Stat with its restore.
+- Merged calls, where the merged action still has every outcome the two calls can have: the classify and revalidate registry reads, the writer's `HasPack` probe with its upload (upload, or skip while K is registered), `EnsurePublished`'s Stat with its re-upload, and the heal's Stat with its restore.
 - Error returns that end a process the same way as a crash are modeled as that crash.
 - A behavior has at most two sweeper handshakes (one per backup slot).
 - A fold may drop K's row only while K's bytes are present. The code checks presence only when the repack downloads K, so the model allows fewer folds. That is deliberate: a fold that drops the row of a missing pack would hide a lost pack from `NoLostPack`.
@@ -142,7 +142,7 @@ When check.sh says STALE, or when you change covered code on purpose:
 
 ## Validation
 
-Every fact was broken once in the real code, in a scratch checkout at the sync commit. Each scratch break compiled, turned its fact FALSE (removing the `EnsurePublished` call also turns `VerifyOnRegisterError` FALSE), and made check.sh fail with a property violation, not only STALE. The other properties passed:
+Every fact was broken in the real code, in a scratch checkout whose covered code equals the sync commit. Each scratch break compiled, turned its fact FALSE (removing the `EnsurePublished` call also turns `VerifyOnRegisterError` FALSE), and made check.sh fail with a property violation, not only STALE. The other properties passed:
 
 | Scratch break | Fact | Failed |
 |---|---|---|
@@ -155,6 +155,8 @@ Every fact was broken once in the real code, in a scratch checkout at the sync c
 | drop the age test from the purge gate | `PurgeAgeGated` | `NoLostPack`, `NoWaitForHeal`, `BytesComeBack` |
 | `QuarantinePurgeFloor = 1 * sweepRecoveryTimeout` | `PurgeFloorCoversHandshake` | `NoLostPack`, `NoWaitForHeal`, `BytesComeBack` |
 | `quarantinePurgeAge` returns `QuarantinePurgeFloor` | `PurgeAgeCoversThreshold` | `NoLostPack`, `BytesComeBack` |
+| remove the won-path `verifyPublished` after `ReplacePacks` in `Repacker.repack` | `WriterVerifies` | `NoWaitForHeal` |
+| `if regErr != nil { break }` at the top of `preReceive`'s `EnsurePublished` loop | `VerifyOnRegisterError` | `NoWaitForHeal` |
 
 A worked example of a moved guard: moving `safeDelete`'s `s.registered(rctx, repo, key)` above the delete turns `RecheckAfterDelete` FALSE, and `NoTiming.cfg` fails. Its first trace (the write registers before the sweeper's copy) does not replay, because the moved read still sees that registration. With the read modeled before the delete, TLC finds the real path: the read sees "unregistered", the write registers and verifies, and then the delete removes the bytes of a committed pack.
 
