@@ -592,6 +592,50 @@ func TestCommitPackValidation(t *testing.T) {
 	})
 }
 
+// TestCommitPackTotalSizeLimit (#597, spec 2026-10-28): commit-pack answers
+// 413 payload_too_large once the decoded file contents of one commit pass
+// 262144000 bytes, summed over every chunk of every file, and moves no ref.
+// The test lowers the limit so it can cross it with a few bytes.
+func TestCommitPackTotalSizeLimit(t *testing.T) {
+	if wcMaxCommitBlobBytes != 262144000 {
+		t.Fatalf("wcMaxCommitBlobBytes = %d, want the spec's 262144000", wcMaxCommitBlobBytes)
+	}
+	old := wcMaxCommitBlobBytes
+	wcMaxCommitBlobBytes = 10
+	t.Cleanup(func() { wcMaxCommitBlobBytes = old })
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		repo, writeTok, readTok := wctRepo(t, e)
+		upsert := func(path, id string) map[string]any {
+			return map[string]any{"path": path, "content_id": id, "operation": "upsert"}
+		}
+		post := func(frames ...any) (*http.Response, []byte) {
+			t.Helper()
+			return wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, frames...)))
+		}
+
+		// Exactly at the limit: 3+2 bytes of a.txt and 5 of b.txt.
+		resp, body := post(wctMeta("main", "at limit", []map[string]any{upsert("a.txt", "ida"), upsert("b.txt", "idb")}, nil),
+			wctChunk("ida", []byte("aaa"), false), wctChunk("ida", []byte("aa"), true), wctChunk("idb", []byte("bbbbb"), true))
+		c1 := wctRequireOK(t, resp, body)
+
+		// One byte over, reached in the second file's second chunk.
+		before := wmRefsSnapshot(t, e, repo.RepoID)
+		resp, body = post(wctMeta("main", "over limit", []map[string]any{upsert("c.txt", "idc"), upsert("d.txt", "idd")}, nil),
+			wctChunk("idc", []byte("ccccc"), true), wctChunk("idd", []byte("ddd"), false), wctChunk("idd", []byte("ddd"), true))
+		env := wctRequireFail(t, resp, body, http.StatusRequestEntityTooLarge, "payload_too_large")
+		if env.Result.Message != "commit payload too large: exceeds total blob limit (10 bytes)" || env.Commit != nil {
+			t.Fatalf("413 body = %s, want the total blob limit message and no commit", body)
+		}
+		if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
+			t.Fatalf("over-limit write moved refs: %v -> %v", before, after)
+		}
+		if tip := wctBranchTip(t, e, readTok, "main", false); tip != c1.Commit.CommitSHA {
+			t.Fatalf("tip = %q, want %q", tip, c1.Commit.CommitSHA)
+		}
+	})
+}
+
 // TestCommitPackCASRace loses the publish-time CAS deterministically: the
 // handler snapshots the ref BEFORE materializing the cache (fresh repo -> no
 // cache dir yet), so once the cache dir appears the snapshot is taken and

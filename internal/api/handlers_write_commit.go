@@ -71,6 +71,11 @@ const (
 	wcMaxGitlinkBytes = 64
 )
 
+// wcMaxCommitBlobBytes caps the decoded file contents of one commit-pack
+// request, summed over every chunk of every file (spec 2026-10-28, #597:
+// 413 above 262144000 bytes). A var so tests can cross it cheaply.
+var wcMaxCommitBlobBytes int64 = 262144000
+
 // registerWriteCommitRoutes mounts the three write-commit endpoints (called
 // from api.New). All require a repo-scoped token with git:write (docs/reference/authentication.md
 // scope table).
@@ -976,7 +981,8 @@ func wcRejectNoChanges(w http.ResponseWriter, md *wcMetadata, plan *wcPlan, base
 
 // wcStreamBlobs drives the blob_chunk state machine (docs/explanation/streaming-commit-protocols.md §1): chunks
 // per file are contiguous and eof-terminated; every upsert must be fed;
-// deletes must not be; decoded chunks are capped at 4 MiB. Content bytes
+// deletes must not be; decoded chunks are capped at 4 MiB, and their sum
+// over the request at wcMaxCommitBlobBytes (413). Content bytes
 // stream straight into hash-object — except 160000 gitlinks, whose payload
 // is the referenced commit sha in hex (they have no blob). Returns
 // content_id -> object sha. On failure the 4xx envelope is written.
@@ -996,6 +1002,7 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		}
 	}
 	var open *blobState // the file currently receiving chunks
+	var total int64     // decoded bytes so far, over every file
 	fail := func(code int, msg string) (map[string]string, bool) {
 		if open != nil && open.sink != nil {
 			open.sink.abort()
@@ -1038,6 +1045,11 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 			}
 			if len(data) > wcMaxChunkBytes {
 				return fail(http.StatusBadRequest, fmt.Sprintf("chunk exceeds %d bytes for content_id %s", wcMaxChunkBytes, ch.ContentID))
+			}
+			total += int64(len(data))
+			if total > wcMaxCommitBlobBytes {
+				return fail(http.StatusRequestEntityTooLarge,
+					fmt.Sprintf("commit payload too large: exceeds total blob limit (%d bytes)", wcMaxCommitBlobBytes))
 			}
 			if !st.started {
 				st.started = true

@@ -503,6 +503,8 @@ func statusForHTTP(httpStatus int) string {
 		return "conflict"
 	case http.StatusPreconditionFailed:
 		return "precondition_failed"
+	case http.StatusRequestEntityTooLarge:
+		return "payload_too_large" // commit-pack total size limit (#597)
 	case http.StatusTooManyRequests:
 		return "unavailable" // docs/reference/http-api.md: rate limit ("unavailable" to ref-update clients)
 	case http.StatusInternalServerError:
