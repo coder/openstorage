@@ -349,7 +349,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	// (issue #599, recorded in the upstream row).
 	omitted := branch == "" && spec != nil && spec.Provider == "github"
 	if branch == "" {
-		branch = "main"
+		branch = meta.OmittedDefaultBranch
 	}
 	if !validBranchName(branch) {
 		if branchPath == "" { // the query parameter: no body field to name

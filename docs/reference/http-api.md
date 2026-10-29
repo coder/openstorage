@@ -145,6 +145,17 @@ about the endpoint's rollout status on upstream clusters.
   normalization. A mismatch, including an empty string, returns 400 and creates nothing,
   for forks too. `null` or an omitted `repo_name` changes nothing.
 - Query `default_branch` (deprecated upstream) is a fallback, used only when the body omits it.
+- Without a `default_branch` in the body, in `base_repo` or in the query, a sync from
+  `github` takes the GitHub repository's default branch
+  ([#599](https://github.com/coder/openstorage/issues/599)). The create makes no network
+  call, so the repository starts on `main`, and `GET /repo` shows `main`. The first
+  successful sync reads the upstream `HEAD` and records its branch before it sends
+  `repo.sync.succeeded`, so `GET /repo` then shows that branch. If the sync cannot use
+  `HEAD` (no HEAD branch is advertised, or the fetch did not return that branch), the
+  repository keeps `main`, the server logs a `WARN` line, and the next successful sync
+  tries again. Later changes of the GitHub default branch do not move it, and a
+  `PATCH /repo` ends the wait. Other providers use `main`. The S3-WAL backend keeps `main`
+  ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)).
 - `upstream` (Git Sync): `{provider, owner, name, access?, host?}`. It creates a sync link
   and schedules the first sync, like the deprecated `base_repo` sync form. Unknown fields
   → 400.

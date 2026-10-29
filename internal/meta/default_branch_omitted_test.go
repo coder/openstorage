@@ -71,6 +71,13 @@ func testAdoptUpstreamDefaultBranch(t *testing.T, s Backend) {
 	}
 	expect("stale PATCH", lost, "main", true)
 
+	// An older binary's PATCH (rolling upgrade) changes the branch without
+	// clearing the flag: adopt then only clears the flag.
+	oldPatch := create("old-patch", true)
+	rawExec(t, s, `UPDATE repos SET default_branch = 'dev' WHERE repo_id = '`+oldPatch.RepoID+`'`)
+	adopt("adopt after an old-binary PATCH", oldPatch, "trunk", false)
+	expect("adopt after an old-binary PATCH", oldPatch, "dev", false)
+
 	detached := create("detached", true)
 	if err := s.DeleteRepoUpstream(ctx, detached.RepoID); err != nil {
 		t.Fatal(err)
@@ -177,5 +184,23 @@ func upgradeDefaultBranchOmitted(t *testing.T, s Backend, initSchema func(contex
 	}
 	if adopted, err := s.AdoptUpstreamDefaultBranch(ctx, repo.RepoID, "trunk"); err != nil || adopted {
 		t.Fatalf("adopt on an upgraded row = %v, %v; want false", adopted, err)
+	}
+}
+
+// rawExec runs one SQL statement on the backend's own handle, to write
+// what an older binary would.
+func rawExec(t *testing.T, s Backend, q string) {
+	t.Helper()
+	var err error
+	switch b := s.(type) {
+	case *PG:
+		_, err = b.pool.Exec(t.Context(), q)
+	case *SQLite:
+		_, err = b.db.ExecContext(t.Context(), q)
+	default:
+		t.Fatalf("rawExec: backend %T", s)
+	}
+	if err != nil {
+		t.Fatalf("rawExec %q: %v", q, err)
 	}
 }

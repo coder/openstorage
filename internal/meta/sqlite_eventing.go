@@ -415,7 +415,8 @@ func (s *SQLite) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch 
 		if n, err := res.RowsAffected(); err != nil || n == 0 {
 			return err
 		}
-		res, err = tx.ExecContext(ctx, `UPDATE repos SET default_branch = ? WHERE repo_id = ?`, branch, repoID)
+		res, err = tx.ExecContext(ctx, `UPDATE repos SET default_branch = ? WHERE repo_id = ? AND default_branch = ?`,
+			branch, repoID, OmittedDefaultBranch)
 		if err != nil {
 			return err
 		}
@@ -423,8 +424,8 @@ func (s *SQLite) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch 
 		if err != nil {
 			return err
 		}
-		assertf(n == 1, "adopt default branch of live repo %q affected %d rows", repoID, n)
-		adopted = true
+		assertf(n == 0 || n == 1, "adopt default branch of live repo %q affected %d rows", repoID, n)
+		adopted = n == 1
 		return nil
 	})
 	if err != nil {

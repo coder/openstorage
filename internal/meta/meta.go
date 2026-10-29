@@ -53,6 +53,11 @@ type Repo struct {
 	CreateState   CreateState
 }
 
+// OmittedDefaultBranch is the default branch a sync create stores when the
+// request names none. A GitHub sync later adopts the upstream HEAD in its
+// place (RepoUpstream.DefaultBranchOmitted, issue #599).
+const OmittedDefaultBranch = "main"
+
 // CreateState records whether a repo's create finished (issue #388). A
 // repeat POST /repos may answer 200 only for CreateStateComplete.
 type CreateState int
