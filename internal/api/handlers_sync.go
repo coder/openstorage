@@ -343,6 +343,11 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		// does not already specify a default branch.
 		branch, branchPath = r.URL.Query().Get("default_branch"), ""
 	}
+	// Upstream: an omitted default branch on a sync from GitHub takes the
+	// GitHub repository's default. The create makes no network call, so
+	// the repo starts on "main" and a sync adopts the upstream HEAD later
+	// (issue #599, recorded in the upstream row).
+	omitted := branch == "" && spec != nil && spec.Provider == "github"
 	if branch == "" {
 		branch = "main"
 	}
@@ -370,7 +375,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			cred = &meta.GitCredential{Password: spec.Auth.Token}
 		}
 		link = meta.RepoUpstream{Provider: spec.Provider, Owner: spec.Owner, Name: spec.Name,
-			UpstreamHost: upstreamHost, ForwardOnPush: spec.ForwardPushes}
+			UpstreamHost: upstreamHost, ForwardOnPush: spec.ForwardPushes, DefaultBranchOmitted: omitted}
 		repo, err = s.linked().CreateLinkedRepo(r.Context(), claims.Iss, url, branch, link, cred)
 	default:
 		// The queue tracks no create state: a legacy row.

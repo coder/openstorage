@@ -121,6 +121,10 @@ func (f failingStore) CreateLinkedRepo(context.Context, string, string, string, 
 	return meta.Repo{}, f.err
 }
 
+func (f failingStore) AdoptUpstreamDefaultBranch(context.Context, string, string) (bool, error) {
+	return false, f.err
+}
+
 func (f failingStore) GetRepoUpstream(context.Context, string) (meta.RepoUpstream, error) {
 	return meta.RepoUpstream{}, f.err
 }

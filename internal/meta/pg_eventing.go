@@ -21,7 +21,7 @@ const (
 	// scanRepoUpstream (shared with sqlite_eventing.go like repoCols).
 	webhookCols       = "id, org_id, url, secret, created_at"
 	gitCredentialCols = "id, repo_id, username, password, created_at"
-	repoUpstreamCols  = "repo_id, provider, owner, name, upstream_host, run_count, success_count, syncing, sync_pending, sync_claim_holder, sync_claim_expires_at, forward_on_push, push_pending, push_syncing, push_claim_holder, push_claim_expires_at, push_claim_force, push_run_count, push_success_count, created_at"
+	repoUpstreamCols  = "repo_id, provider, owner, name, upstream_host, run_count, success_count, syncing, sync_pending, sync_claim_holder, sync_claim_expires_at, forward_on_push, push_pending, push_syncing, push_claim_holder, push_claim_expires_at, push_claim_force, push_run_count, push_success_count, default_branch_omitted, created_at"
 )
 
 // scanWebhook scans one row of webhookCols; CreatedAt normalized to UTC.
@@ -52,7 +52,7 @@ func scanRepoUpstream(row pgx.Row) (RepoUpstream, error) {
 		&up.SyncClaimHolder, &up.SyncClaimExpiresAt,
 		&up.ForwardOnPush, &up.PushPending, &up.PushSyncing,
 		&up.PushClaimHolder, &up.PushClaimExpiresAt, &up.PushClaimForce,
-		&up.PushRunCount, &up.PushSuccessCount, &up.CreatedAt); err != nil {
+		&up.PushRunCount, &up.PushSuccessCount, &up.DefaultBranchOmitted, &up.CreatedAt); err != nil {
 		return RepoUpstream{}, err
 	}
 	up.SyncClaimExpiresAt = up.SyncClaimExpiresAt.UTC()
@@ -370,6 +370,41 @@ func (s *PG) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch strin
 	return repo, nil
 }
 
+// AdoptUpstreamDefaultBranch (meta.EventingStore contract). The repos row
+// is locked first, as UpdateRepoDefaultBranch does, so a concurrent PATCH
+// either clears the flag before this reads it or waits for this commit.
+func (s *PG) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch string) (bool, error) {
+	assertf(repoID != "" && branch != "", "AdoptUpstreamDefaultBranch: empty repo id %q or branch %q", repoID, branch)
+	adopted := false
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var one int
+		err := tx.QueryRow(ctx,
+			`SELECT 1 FROM repos WHERE repo_id = $1 AND deleted_at IS NULL FOR UPDATE`, repoID).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("adopt default branch of repo %q: %w", repoID, ErrNotFound)
+		}
+		if err != nil {
+			return err
+		}
+		ct, err := tx.Exec(ctx,
+			`UPDATE repo_upstreams SET default_branch_omitted = false WHERE repo_id = $1 AND default_branch_omitted`, repoID)
+		if err != nil || ct.RowsAffected() == 0 {
+			return err
+		}
+		ct, err = tx.Exec(ctx, `UPDATE repos SET default_branch = $2 WHERE repo_id = $1`, repoID, branch)
+		if err != nil {
+			return err
+		}
+		assertf(ct.RowsAffected() == 1, "adopt default branch of locked repo %q affected %d rows", repoID, ct.RowsAffected())
+		adopted = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return adopted, nil
+}
+
 func pgSetRepoUpstream(ctx context.Context, q pgQueryRower, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
@@ -380,11 +415,11 @@ func pgSetRepoUpstream(ctx context.Context, q pgQueryRower, up RepoUpstream) (Re
 	// #52, PR #105 round 6): no upstream link may attach to a deleted or
 	// purged repository.
 	err := q.QueryRow(ctx,
-		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host, forward_on_push)
-		 SELECT $1, $2, $3, $4, $5, $6
+		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host, forward_on_push, default_branch_omitted)
+		 SELECT $1, $2, $3, $4, $5, $6, $7
 		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = $1 AND deleted_at IS NULL FOR UPDATE)
 		 RETURNING created_at`,
-		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, up.ForwardOnPush).Scan(&up.CreatedAt)
+		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, up.ForwardOnPush, up.DefaultBranchOmitted).Scan(&up.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RepoUpstream{}, fmt.Errorf("upstream for deleted or unknown repo %q: %w", up.RepoID, ErrNotFound)
 	}

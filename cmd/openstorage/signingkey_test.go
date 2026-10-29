@@ -173,6 +173,10 @@ func (failingStore) CreateLinkedRepo(context.Context, string, string, string, me
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) AdoptUpstreamDefaultBranch(context.Context, string, string) (bool, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (failingStore) GetRepoUpstream(context.Context, string) (meta.RepoUpstream, error) {
 	panic("not used by signing-key CLI")
 }

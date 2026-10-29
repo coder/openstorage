@@ -96,7 +96,13 @@ type RepoUpstream struct {
 	PushClaimForce   bool
 	PushRunCount     int // completed outbound runs (success + failure)
 	PushSuccessCount int // completed successful outbound runs
-	CreatedAt        time.Time
+	// DefaultBranchOmitted marks a GitHub sync create that named no default
+	// branch (issue #599): the repo starts on "main" until a successful sync
+	// adopts the upstream HEAD (AdoptUpstreamDefaultBranch), which clears
+	// it. An explicit default-branch change clears it too. S3-WAL stores no
+	// such field (metadata v2 is frozen) and always reads false.
+	DefaultBranchOmitted bool
+	CreatedAt            time.Time
 }
 
 // NewEventingID returns "<prefix>_<16 hex>" — the shared ID shape for
@@ -192,6 +198,12 @@ type EventingStore interface {
 	// when (org, url) is taken, and then nothing is written. The repo is
 	// CreateStatePending until CompleteRepoCreate.
 	CreateLinkedRepo(ctx context.Context, org, url, defaultBranch string, up RepoUpstream, cred *GitCredential) (Repo, error)
+	// AdoptUpstreamDefaultBranch sets the live repo's default branch to
+	// branch and clears DefaultBranchOmitted in one write, only while the
+	// flag is set (issue #599). adopted is false, and nothing changes, when
+	// the flag is clear or the repo is detached. ErrNotFound when the repo
+	// is deleted.
+	AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch string) (adopted bool, err error)
 	// GetRepoUpstream returns the row; ErrNotFound when detached/never linked.
 	GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstream, error)
 	// DeleteRepoUpstream detaches the repo; ErrNotFound when already detached.

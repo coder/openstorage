@@ -58,7 +58,7 @@ func scanRepoUpstreamSQLite(row sqlRow) (RepoUpstream, error) {
 		&up.SyncClaimHolder, &claimExpires,
 		&up.ForwardOnPush, &up.PushPending, &up.PushSyncing,
 		&up.PushClaimHolder, &pushClaimExpires, &up.PushClaimForce,
-		&up.PushRunCount, &up.PushSuccessCount, &createdAt); err != nil {
+		&up.PushRunCount, &up.PushSuccessCount, &up.DefaultBranchOmitted, &createdAt); err != nil {
 		return RepoUpstream{}, err
 	}
 	up.SyncClaimExpiresAt = time.Unix(0, claimExpires).UTC()
@@ -392,6 +392,47 @@ func (s *SQLite) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch s
 	return repo, nil
 }
 
+// AdoptUpstreamDefaultBranch (meta.EventingStore contract) in one BEGIN
+// IMMEDIATE transaction.
+func (s *SQLite) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch string) (bool, error) {
+	assertf(repoID != "" && branch != "", "AdoptUpstreamDefaultBranch: empty repo id %q or branch %q", repoID, branch)
+	adopted := false
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		var one int
+		err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM repos WHERE repo_id = ? AND deleted_at IS NULL`, repoID).Scan(&one)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("adopt default branch of repo %q: %w", repoID, ErrNotFound)
+		}
+		if err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE repo_upstreams SET default_branch_omitted = 0 WHERE repo_id = ? AND default_branch_omitted`, repoID)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return err
+		}
+		res, err = tx.ExecContext(ctx, `UPDATE repos SET default_branch = ? WHERE repo_id = ?`, branch, repoID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		assertf(n == 1, "adopt default branch of live repo %q affected %d rows", repoID, n)
+		adopted = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return adopted, nil
+}
+
 func (s *SQLite) setRepoUpstream(ctx context.Context, q sqliteExecer, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	nanos, createdAt := s.nowNano()
@@ -405,10 +446,10 @@ func (s *SQLite) setRepoUpstream(ctx context.Context, q sqliteExecer, up RepoUps
 	res, err := q.ExecContext(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host,
 		        run_count, success_count, syncing, sync_pending,
-		        sync_claim_holder, sync_claim_expires_at, forward_on_push, created_at)
-		 SELECT ?, ?, ?, ?, ?, 0, 0, 0, 0, '', 0, ?, ?
+		        sync_claim_holder, sync_claim_expires_at, forward_on_push, default_branch_omitted, created_at)
+		 SELECT ?, ?, ?, ?, ?, 0, 0, 0, 0, '', 0, ?, ?, ?
 		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = ? AND deleted_at IS NULL)`,
-		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, up.ForwardOnPush, nanos, up.RepoID)
+		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, up.ForwardOnPush, up.DefaultBranchOmitted, nanos, up.RepoID)
 	// The only constraint on repo_upstreams is the repo_id PRIMARY KEY.
 	if isPrimaryKeyViolation(err) {
 		return RepoUpstream{}, fmt.Errorf("upstream for repo %q: %w", up.RepoID, ErrAlreadyExists)
