@@ -372,7 +372,7 @@ class CitationTests(CheckerTestCase):
             "pkg/flow.js": 'export const meta = {\n  argsSchema: 1,\n};\n'
                            'function gate() {\n  const rule = 1;\n}\nconst $handler = 1;\n'
                            'const { actual = fn(stale, ghost), keep } = api;\n',
-            "pkg/app.service": "[Unit]\nDescription=x \\\n[Install]\n[Service]\nExecStart=/bin/true\n",
+            "pkg/app.service": "[Unit]\nDescription=x \\\n# note\n[Install]\n[Service]\nExecStart=/bin/true\n",
         }
         ok = ["[tool.py:LIMIT]", "[tool.py:os.chdir]", "[tool.py:Box.open]", "[tool.py:Wide.run]",
               "[tool.py:main]", "[tool.py:__main__]", "[flow.js:meta]", "[flow.js:gate]",

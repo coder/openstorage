@@ -500,6 +500,8 @@ class ShellMentions:
 def unit_names(text):
     names, continued = set(), False
     for line in text.splitlines():
+        if line.lstrip().startswith(("#", ";")):
+            continue
         m = None if continued else re.match(r"\[([\w-]+)\]", line)
         if m:
             names.add(m.group(1))
