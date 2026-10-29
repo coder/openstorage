@@ -61,8 +61,10 @@ On a fresh `weed server`, 4.50 and 4.51 hold the first object write for about
 12 to 15 s: the master defers volume allocation and the filer waits up to
 10 s before it joins the S3 lock ring
 ([seaweedfs#12145](https://github.com/seaweedfs/seaweedfs/issues/12145), fixed
-upstream after 4.51). The write blocks instead of failing, and the
-write-readiness check absorbs it.
+upstream after 4.51). While the lock ring is empty, a PUT waits for its
+object-write lock and fails after 15 s. In local runs the ring formed 2 to
+12 s after the first lock attempt, so the first PUT waited and succeeded. The
+write-readiness check retries a failed write for 60 s.
 
 SHA-256 digests of the Docker Hub image metadata (retrieved 2026-10-29; a
 published manifest does not prove runtime qualification):
