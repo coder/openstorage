@@ -139,7 +139,7 @@ NDJSON
 - `data` is the base64 of the file bytes. `content_id` ties chunks to a `files` entry. An empty file sends one chunk, `{"data":"","eof":true}`. A `delete` sends no chunk.
 - `target_branch` is a short name. A `refs/` prefix is refused.
 - Write the frames with a quoted heredoc. An unquoted one lets the shell expand `$` inside the JSON.
-- A stale `expected_target_sha` (or the deprecated `expected_head_sha`) answers HTTP `412` with `result.status` `precondition_failed`. `docs/explanation/streaming-commit-protocols.md` ("Server semantics", step 2) says `status: "conflict"`. Live behavior on 2026-10-29 (commit 5620494) was `precondition_failed`. A `409` with `result.status` `failed` means a lost race with another writer, which this recipe cannot force.
+- A stale `expected_target_sha` (or the deprecated `expected_head_sha`) answers HTTP `412` with `result.status` `precondition_failed`. A `409` with `result.status` `failed` means a lost race with another writer, which this recipe cannot force.
 - Auth failures on commit-pack answer in the `result` envelope (`{"result":{"status":"forbidden",...}}`), not in the `{"error":...}` body of read endpoints.
 - Without `committer`, the committer is the author.
 - `list-packs` reads the blob store only. Run it with `env -i PATH="$PATH"` so an inherited `OPENSTORAGE_S3_URL` does not point it at another store.
