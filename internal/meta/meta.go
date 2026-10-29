@@ -180,7 +180,8 @@ type Store interface {
 	// update is "a transactional compare-and-swap" against the value the
 	// caller read). won=false (no error) when the live row's default
 	// branch is no longer oldBranch — someone else changed it first;
-	// ErrNotFound when no live repo matches.
+	// ErrNotFound when no live repo matches. A won swap also clears the
+	// upstream's DefaultBranchOmitted: an explicit choice wins (#599).
 	UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, newBranch string) (won bool, err error)
 
 	// SoftDeleteRepo sets deleted_at and returns the affected repo.

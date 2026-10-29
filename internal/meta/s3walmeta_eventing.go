@@ -575,6 +575,21 @@ func (s *S3WAL) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstr
 	return up, nil
 }
 
+// AdoptUpstreamDefaultBranch never adopts (meta.EventingStore contract):
+// metadata v2 is frozen, so S3-WAL stores no DefaultBranchOmitted flag
+// and its sync repos keep "main" (issue #599, a recorded deviation).
+func (s *S3WAL) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch string) (bool, error) {
+	assertf(repoID != "" && branch != "", "AdoptUpstreamDefaultBranch: empty repo id %q or branch %q", repoID, branch)
+	doc, err := s.viewDoc(ctx)
+	if err != nil {
+		return false, err
+	}
+	if r := doc.Repos[repoID]; r == nil || r.DeletedAt != 0 {
+		return false, fmt.Errorf("adopt default branch of repo %q: %w", repoID, ErrNotFound)
+	}
+	return false, nil
+}
+
 // GetRepoUpstream returns the row; ErrNotFound when detached/never linked.
 func (s *S3WAL) GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstream, error) {
 	doc, err := s.viewDoc(ctx)

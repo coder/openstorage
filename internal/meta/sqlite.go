@@ -174,6 +174,7 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		    push_attempt          INTEGER NOT NULL DEFAULT 0,
 		    push_due              INTEGER NOT NULL DEFAULT 0,
 		    sync_due              INTEGER NOT NULL DEFAULT 0,
+		    default_branch_omitted INTEGER NOT NULL DEFAULT 0,
 		    created_at    INTEGER NOT NULL
 		)`,
 	} {
@@ -207,6 +208,9 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		{"repo_upstreams", "push_attempt", `push_attempt INTEGER NOT NULL DEFAULT 0`},
 		{"repo_upstreams", "push_due", `push_due INTEGER NOT NULL DEFAULT 0`},
 		{"repo_upstreams", "sync_due", `sync_due INTEGER NOT NULL DEFAULT 0`},
+		// GitHub sync create without a default branch (issue #599): rows
+		// that predate the column keep their branch.
+		{"repo_upstreams", "default_branch_omitted", `default_branch_omitted INTEGER NOT NULL DEFAULT 0`},
 		// Purge tombstone column (issue #52) for data dirs predating it.
 		{"repos", "purged_at", `purged_at INTEGER`},
 		// Create state (issue #388): 0 legacy, 1 pending, 2 complete.
@@ -565,7 +569,11 @@ func (s *SQLite) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranc
 		assertf(n == 0 || n == 1, "default-branch CAS of %q/%q affected %d rows", org, url, n)
 		if n == 1 {
 			won = true
-			return nil
+			_, err := tx.ExecContext(ctx,
+				`UPDATE repo_upstreams SET default_branch_omitted = 0
+				 WHERE default_branch_omitted AND repo_id = (SELECT repo_id FROM repos WHERE org_id = ? AND url = ? AND deleted_at IS NULL)`,
+				orgID, url)
+			return err
 		}
 		// No row matched: absent/soft-deleted repo (404) or a concurrently
 		// changed default branch (won=false -> caller's 409).
