@@ -1,6 +1,8 @@
 /.envrc
+/conformance/testdata/
 /go.work.sum
 /internal/cmd/riverbench/riverbench
 /river
 /riverdriver/riverdrivertest/example_libsql_test.libsql
 /sqlite/
+/rust/**/target/
