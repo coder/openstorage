@@ -12,7 +12,13 @@ Both streaming endpoints follow these transport rules:
 - The backend MUST process lines incrementally (streaming parse, not
   buffer-then-parse): uploads can exceed memory.
 - All three SDKs implement byte-identical framing. The chunk max is **4 MiB raw bytes
-  before base64** (`4 * 1024 * 1024`), standard base64 alphabet.
+  before base64** (`4 * 1024 * 1024`), standard base64 alphabet. A decoded chunk over
+  4 MiB gets 400 `invalid`.
+- `commit-pack` limits the decoded file contents of one request to 262144000 bytes
+  (250 MiB), summed over every chunk of every file. Past that, the server stops reading
+  and answers 413 with `result.status: "payload_too_large"` (a value of the upstream
+  `RefUpdateResult.status` enum) and the message
+  `commit payload too large: exceeds total blob limit (262144000 bytes)`. No ref moves.
 
 ## 1. `POST /api/v1/repos/commit-pack` — commit from file operations
 

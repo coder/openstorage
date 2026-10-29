@@ -610,6 +610,7 @@ Other limits and gaps:
 | 404 | repo/object/branch not found; unborn-branch file metadata |
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, failed merge guard (`expected_target_sha`, `expected_source_sha`), CAS conflict |
 | 412 | CAS precondition failed; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
+| 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit ("unavailable" to ref-update clients) |
 | 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |
