@@ -22,7 +22,8 @@
 #
 # --record rewrites model/fingerprints.txt and the sync commit in SKILL.md
 # to the current code. Use it only after you confirmed that the model
-# describes the code at HEAD. It refuses unless the properties hold. The
+# describes the code at HEAD. It refuses unless the properties hold, both
+# probes fail, and the covered files have no uncommitted changes. The
 # sync commit is the merge base with origin/main (OPENSTORAGE_MAIN_REF)
 # when the covered files match it, so a squash merge does not orphan it.
 #
@@ -44,11 +45,16 @@ model="$skill_dir/model"
 out="" record=0 only=" "
 while [ $# -gt 0 ]; do
   case $1 in
-    --out) out=${2:?--out needs a directory}; shift 2 ;;
+    --out) [ $# -ge 2 ] || { echo "check.sh: --out needs a directory" >&2; exit 3; }
+           out=$2; shift 2 ;;
     --record) record=1; shift ;;
-    --only) [ -f "$model/${2:?--only needs a config name}" ] || { echo "check.sh: no config model/$2" >&2; exit 3; }
+    --only) [ $# -ge 2 ] || { echo "check.sh: --only needs a config name" >&2; exit 3; }
+            case $2 in
+              PackSweep.cfg|NoTiming.cfg|Liveness.cfg|NoThresholdAssumption.cfg|SlowHealEntry.cfg) ;;
+              *) echo "check.sh: --only takes PackSweep.cfg, NoTiming.cfg, Liveness.cfg, NoThresholdAssumption.cfg or SlowHealEntry.cfg" >&2; exit 3 ;;
+            esac
             only="$only$2 "; shift 2 ;;
-    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR > 1 && /^set -uo pipefail/ { exit } NR > 1' "$0"; exit 0 ;;
     *) echo "check.sh: unknown argument $1" >&2; exit 3 ;;
   esac
 done
@@ -125,6 +131,7 @@ run_tlc() {
 # Print a TLC trace as "step: action" plus the variables that changed.
 summarize() {
   awk '
+    /^Back to state [0-9]+:/ { split($0, h, " line "); back = h[1] ">"; next }
     /^State [0-9]+:/ { n++; split($0, h, " line "); act[n] = h[1] (h[2] != "" ? ">" : ""); cur = ""; next }
     n && /^\/\\ / { sub(/^\/\\ /, ""); cur = $1; val[n, cur] = substr($0, index($0, "=") + 2); names[cur] = 1; next }
     n && cur != "" && /^   / { gsub(/^ +/, " "); val[n, cur] = val[n, cur] $0; next }
@@ -133,6 +140,7 @@ summarize() {
         print act[i]
         for (v in names) if (i == 1 || val[i, v] != val[i - 1, v]) printf "      %s = %s\n", v, val[i, v]
       }
+      if (back != "") print back "  (the behavior loops from here forever)"
     }' "$1"
 }
 
@@ -159,7 +167,7 @@ done
 
 # Probes drop one timing assumption each; NoLostPack must then fail. One
 # worker keeps the trace the shortest one.
-stale=0
+stale=0 probe_passed=0
 [ "$false_facts" -eq 0 ] || stale=1
 for cfg in NoThresholdAssumption.cfg SlowHealEntry.cfg; do
   selected "$cfg" || continue
@@ -172,7 +180,7 @@ for cfg in NoThresholdAssumption.cfg SlowHealEntry.cfg; do
       else
         verdict "$cfg" "UNEXPECTED: $(grep -m1 'is violated' "$out/${cfg%.cfg}.out")"; status=1
       fi ;;
-    0) verdict "$cfg" "PASSES: this timing assumption no longer matters. Review the model and SKILL.md"; stale=1 ;;
+    0) verdict "$cfg" "PASSES: this timing assumption no longer matters. Review the model and SKILL.md"; stale=1; probe_passed=1 ;;
     *) verdict "$cfg" "ERROR: TLC exit $rc"; sed -n '1,40p' "$out/${cfg%.cfg}.out" >&2; exit 3 ;;
   esac
 done
@@ -194,14 +202,17 @@ else
 fi
 
 if [ "$record" = 1 ]; then
-  if [ "$status" -ne 0 ] || [ "$false_facts" -ne 0 ] || [ "$only" != " " ]; then
-    echo "check.sh: --record refused: a property failed, a fact is FALSE, or --only was given" >&2; exit 3
+  files=$(cut -d: -f1 "$out/fingerprints.now" | sort -u)
+  # shellcheck disable=SC2086 # $files holds one path per word
+  if [ "$status" -ne 0 ] || [ "$false_facts" -ne 0 ] || [ "$only" != " " ] || [ "$probe_passed" -ne 0 ]; then
+    echo "check.sh: --record refused: a property failed, a fact is FALSE, a probe passed, or --only was given" >&2; exit 3
+  elif ! git -C "$repo" diff --quiet HEAD -- $files; then
+    echo "check.sh: --record refused: commit the covered files first (the fingerprints must match a commit)" >&2; exit 3
   fi
   # The sync commit must survive a squash merge: use the merge base with
   # main when the covered files are the same there, else HEAD with a warning.
   head=$(git -C "$repo" rev-parse HEAD)
   main=${OPENSTORAGE_MAIN_REF:-origin/main}
-  files=$(cut -d: -f1 "$out/fingerprints.now" | sort -u)
   # shellcheck disable=SC2086 # $files holds one path per word
   if mb=$(git -C "$repo" merge-base HEAD "$main" 2>/dev/null) &&
      git -C "$repo" diff --quiet "$mb" HEAD -- $files; then

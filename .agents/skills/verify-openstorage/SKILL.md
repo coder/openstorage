@@ -11,7 +11,7 @@ The node is the real product: the same binary, the same `serve` command, and the
 
 Requirements:
 
-- bash on Linux or macOS, plus `go` (the `go` line in `go.mod`), `git`, `curl`, and `python3` on `PATH`. The repo's own smoke script needs the same tools. The helper is tested on Linux only. Its macOS branches (`lsof`, `ps`, no `setsid`) are untested.
+- bash on Linux or macOS, plus `go` (the `go` line in `go.mod`), `git` 2.32 or newer (older git ignores `GIT_CONFIG_GLOBAL` and reads your global config), `curl`, and `python3` on `PATH`. The repo's own smoke script needs the same tools. The helper is tested on Linux only. Its macOS branches (`lsof`, `ps`, no `setsid`) are untested.
 - Run the commands from the repository root.
 - Choose a new run directory for every run, outside the checkout. `launch` refuses a directory inside the checkout (it would dirty `git status`) and a directory that is not empty.
 
@@ -64,7 +64,7 @@ A `build` FAIL means the checkout moved after launch. Clean up and launch a new 
 
 ## Drive
 
-Every drive command takes the run directory first and a label second. The label names the evidence files, so it must be unique in the run and match `[A-Za-z0-9._-]+`.
+`api`, `git`, and `eq` take the run directory first and a label second. The label names the evidence files, so it must be unique in the run and match `[A-Za-z0-9._-]+`. `token` takes the run directory and a token name (`[A-Za-z0-9_-]+`, no dots), and `json` takes a file and a field path.
 
 Mint tokens with the run's org key. The flags after the name go to `openstorage mint` (`--repo`, `--scopes`, `--ttl`, `--refs`):
 

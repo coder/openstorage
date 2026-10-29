@@ -12,6 +12,8 @@
 (*   writers  internal/githttp/hook.go   preReceive, publication block     *)
 (*            internal/api/publish.go    server.publishPack                *)
 (*            internal/blob/blob.go      EnsurePublished                   *)
+(*            internal/jobs/repack.go    Repacker.repack publishing its    *)
+(*            consolidated pack (UploadFile, ReplacePacks, verifyPublished) *)
 (*   sweeper  internal/jobs/sweep.go     Sweeper.sweep, classify,          *)
 (*            revalidateOrphan, safeDelete, restoreFromQuarantine,         *)
 (*            healQuarantine, healQuarantineEntry, quarantinePurgeAge      *)
@@ -36,18 +38,21 @@ CONSTANTS
     Sweepers,   \* sweep runs, one per replica (River periodic job or ticker)
     Nonces,     \* write-once quarantine keys sweep/quarantine/<nonce>/K
     NoNonce,    \* "no backup" marker, not in Nonces
-    MaxFaults,  \* bound on sweeper crashes and ambiguous sweeper deletes
+    MaxFaults,  \* bound on sweeper crashes
     MaxFolds,   \* bound on repack folds that drop K's registry row
 
     \* Code facts. check.sh reads each one from the Go source (facts.go)
     \* and writes it into the config, so a code change flips the model.
     WriterVerifies,
         \* hook.go preReceive and publish.go publishPack call
-        \* blob.EnsurePublished after RegisterPacks, and EnsurePublished
-        \* re-uploads the local pack file when Stat says ErrNotFound.
+        \* blob.EnsurePublished after RegisterPacks, Repacker.repack calls
+        \* verifyPublished after ReplacePacks, and both re-upload the local
+        \* pack file when Stat says ErrNotFound.
     VerifyOnRegisterError,
-        \* no return between RegisterPacks and EnsurePublished in either
-        \* writer: an ambiguous RegisterPacks error still gets verified.
+        \* nothing between RegisterPacks and EnsurePublished in either
+        \* writer can skip the verify (no return, break, continue or goto,
+        \* no condition on regErr): an ambiguous RegisterPacks error still
+        \* gets verified.
     CopyBeforeDelete,
         \* safeDelete calls s.blobs.Copy(qKey, key) before s.blobs.Delete.
     RecheckAfterDelete,
@@ -98,7 +103,7 @@ VARIABLES
     todo,        \* heal: listed backups not visited yet
     cur,         \* heal: backup being visited
     hs,          \* safeDelete: this handshake's backup
-    faults,      \* sweeper crashes and ambiguous deletes so far
+    faults,      \* sweeper crashes so far
     folds        \* repack folds so far
 
 writerVars  == <<wpc, regOk>>
@@ -149,8 +154,11 @@ Init ==
 -----------------------------------------------------------------------------
 (* Writers. hook.go preReceive and publish.go publishPack run the same      *)
 (* pipeline: Stat -> UploadFile -> RegisterPacks -> EnsurePublished ->      *)
-(* ref CAS. A writer can crash at any step in flight (WriterCrash); that    *)
-(* also stands for every error return, which ends the write the same way.   *)
+(* ref CAS. A repack publishing its consolidated pack runs UploadFile ->    *)
+(* ReplacePacks -> verifyPublished: the same steps, except that it uploads  *)
+(* a present key again, which changes nothing here. A writer can crash at   *)
+(* any step in flight (WriterCrash); that also stands for every error       *)
+(* return, which ends the write the same way.                               *)
 
 Go(w, step) == wpc' = [wpc EXCEPT ![w] = step]
 Finish(w, ok) == Go(w, IF ok THEN "done" ELSE "failed")
@@ -163,12 +171,14 @@ WriterStat(w) ==
     /\ UNCHANGED <<present, registered, backup, witness, faults, folds,
                    regOk, sweeperVars>>
 
-\* bl.UploadFile / s.blobStore.UploadFile. Merged with the writer's HasPack
-\* probe: when the probe finds K registered the code skips this upload and
-\* EnsurePublished uploads K instead, which ends in the same state.
+\* st.HasPack / s.refStore.HasPack, then bl.UploadFile / s.blobStore.UploadFile.
+\* Merged: a probe that finds K registered skips the upload (EnsurePublished
+\* uploads K later), and an upload is always allowed, which covers a probe
+\* that ran before a registration.
 WriterUpload(w) ==
     /\ wpc[w] = "upload"
-    /\ present' = TRUE
+    /\ \/ present' = TRUE
+       \/ registered /\ UNCHANGED present
     /\ Go(w, "register")
     /\ UNCHANGED <<registered, backup, witness, faults, folds, regOk,
                    sweeperVars>>
@@ -319,13 +329,10 @@ Delete(s) ==
           /\ IF RecheckAfterDelete
              THEN S(s, "sd_recheck") /\ UNCHANGED hs
              ELSE EndHandshake(s)
-          /\ UNCHANGED faults
-       \/ /\ faults < MaxFaults
-          /\ faults' = faults + 1
-          /\ present' \in {present, FALSE}
+       \/ /\ present' \in {present, FALSE}
           /\ S(s, "sd_restore")
           /\ UNCHANGED hs
-    /\ UNCHANGED <<registered, backup, folds, writerVars, todo, cur>>
+    /\ UNCHANGED <<registered, backup, faults, folds, writerVars, todo, cur>>
 
 \* safeDelete: s.registered(rctx, repo, key) after the delete. A registered
 \* key goes to restoreFromQuarantine; an unregistered key is reaped.
@@ -370,7 +377,8 @@ SweeperStep(s) ==
 
 \* repack.go: r.store.ReplacePacks drops K's row after folding its objects
 \* into a new pack (K becomes a retained, superseded blob). The repack
-\* hydrates first, so it folds only a present K.
+\* downloads K before it folds. The model allows a fold only while K is
+\* present, so a fold can never hide a lost pack by dropping its row.
 Fold ==
     /\ registered /\ present /\ folds < MaxFolds
     /\ registered' = FALSE
@@ -399,7 +407,7 @@ Next ==
     \/ Fold
     \/ \E n \in Nonces : AgeBackup(n)
 
-\* Live processes keep taking steps. Faults are bounded, so every sweeper
+\* Live processes keep taking steps. Crashes are bounded, so every sweeper
 \* eventually runs clean sweeps. Time (AgeBackup) and repack (Fold) need no
 \* fairness.
 Fairness ==

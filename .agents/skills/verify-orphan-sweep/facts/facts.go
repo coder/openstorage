@@ -166,17 +166,40 @@ func all(cs []call, fun string) []token.Pos {
 	return out
 }
 
-// returnBetween reports a return statement outside func literals strictly
-// between a and b.
-func returnBetween(n ast.Node, a, b token.Pos) bool {
+// exitBetween reports a return, break, continue or goto outside func
+// literals strictly between a and b: any of them can skip the call at b.
+func exitBetween(n ast.Node, a, b token.Pos) bool {
 	found := false
 	ast.Inspect(n, func(m ast.Node) bool {
 		switch m := m.(type) {
 		case *ast.FuncLit:
 			return false
-		case *ast.ReturnStmt:
+		case *ast.ReturnStmt, *ast.BranchStmt:
 			if m.Pos() > a && m.Pos() < b {
 				found = true
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// guardedBy reports whether the call at pos sits inside an if statement
+// whose condition mentions name.
+func (s *source) guardedBy(n ast.Node, pos token.Pos, name string) bool {
+	var stack []ast.Node
+	found := false
+	ast.Inspect(n, func(m ast.Node) bool {
+		if m == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		stack = append(stack, m)
+		if c, ok := m.(*ast.CallExpr); ok && c.Pos() == pos {
+			for _, p := range stack {
+				if is, ok := p.(*ast.IfStmt); ok && strings.Contains(s.text(is.Cond), name) {
+					found = true
+				}
 			}
 		}
 		return true
@@ -241,7 +264,8 @@ func main() {
 		wv.need(rp.IsValid(), "%s calls %s", w.label, w.register)
 		wv.need(ep.IsValid(), "%s calls blob.EnsurePublished after %s", w.label, w.register)
 		if rp.IsValid() && ep.IsValid() {
-			vr.need(!returnBetween(w.fn.Body, rp, ep), "%s has no return between %s and blob.EnsurePublished", w.label, w.register)
+			vr.need(!exitBetween(w.fn.Body, rp, ep), "%s has no return, break, continue or goto between %s and blob.EnsurePublished", w.label, w.register)
+			vr.need(!w.src.guardedBy(w.fn.Body, ep, "regErr"), "%s does not make blob.EnsurePublished conditional on regErr", w.label)
 		} else {
 			vr.need(false, "%s: RegisterPacks/EnsurePublished pair not found", w.label)
 		}
@@ -260,6 +284,35 @@ func main() {
 		wv.need(st.IsValid(), "EnsurePublished calls b.Stat(ctx, key)")
 		wv.need(nf.IsValid(), "EnsurePublished checks errors.Is(err, ErrNotFound) after b.Stat")
 		wv.need(up.IsValid(), "EnsurePublished calls b.UploadFile after the ErrNotFound check")
+	}
+	{
+		// The repack publishes its consolidated pack the same way:
+		// UploadFile, ReplacePacks (the registration), verifyPublished.
+		// It verifies on the won path, the ambiguous-error path and the
+		// lost-but-registered path.
+		rp := repack.fn("Repacker", "repack")
+		cs := repack.calls(rp.Body)
+		swap := first(cs, "r.store.ReplacePacks", "", false)
+		wv.need(swap.IsValid(), "Repacker.repack calls r.store.ReplacePacks")
+		n := 0
+		for _, c := range cs {
+			if c.fun == "verifyPublished" && c.pos > swap && !c.inClose {
+				n++
+			}
+		}
+		wv.need(n >= 3, "Repacker.repack calls verifyPublished after ReplacePacks on its won, ambiguous and lost-but-registered paths (found %d calls, want 3)", n)
+		vp := repack.fn("", "verifyPublished")
+		vcs := repack.calls(vp.Body)
+		st := first(vcs, "bl.Stat", "key", false)
+		nf := token.NoPos
+		for _, c := range vcs {
+			if c.fun == "errors.Is" && strings.Contains(c.args, "ErrNotFound") && c.pos > st {
+				nf = c.pos
+				break
+			}
+		}
+		wv.need(st.IsValid() && nf.IsValid() && firstAfter(vcs, "bl.UploadFile", nf).IsValid(),
+			"verifyPublished calls bl.Stat, checks ErrNotFound, then bl.UploadFile")
 	}
 	facts = append(facts, wv, vr)
 
@@ -375,6 +428,7 @@ func main() {
 		cover{blobGo, "internal/blob/blob.go:EnsurePublished", ensure},
 		cover{publish, "internal/api/publish.go:server.publishPack", publishPack},
 		cover{repack, "internal/jobs/repack.go:Repacker.repack", repack.fn("Repacker", "repack")},
+		cover{repack, "internal/jobs/repack.go:verifyPublished", repack.fn("", "verifyPublished")},
 	)
 	for _, c := range covers {
 		fmt.Printf("FP %s %s\n", strings.ReplaceAll(c.label, " ", "_"), c.src.fingerprint(c.node.Pos(), c.node.End()))
