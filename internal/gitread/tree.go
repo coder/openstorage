@@ -1,7 +1,9 @@
 package gitread
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -61,6 +63,119 @@ func LsTree(ctx context.Context, repoPath, commit, path string, recursive bool) 
 		entries = append(entries, e)
 	}
 	return entries, nil
+}
+
+// ErrUnsortedTree: git listed a tree's entries out of byte order (a tree
+// that fsck rejects as treeNotSorted), so LsTreePage cannot page it.
+var ErrUnsortedTree = errors.New("ls-tree listed entries out of order")
+
+// LsTreePage returns one page of LsTree(ctx, repoPath, commit, path, true)
+// sorted by Path: up to limit entries whose Path sorts after `after`, and
+// whether more follow (#612). git prints a recursive listing of a
+// well-formed tree in byte order of the full paths, so LsTreePage streams
+// `ls-tree -r` and stops git one entry past the page: its cost grows with
+// the entries up to the page, not with the tree. Only the page counts
+// against the request's output allowance, and only once the page is
+// complete, so a failed or refused page charges nothing. found reports
+// whether path matched any entry. A listing out of order up to one entry
+// past the page returns ErrUnsortedTree. An inversion after that is not
+// read, so a tree stored out of order (fsck's treeNotSorted, which git's
+// own path lookups do not handle either) can page in git's order.
+func LsTreePage(ctx context.Context, repoPath, commit, path, after string, limit int) (page []TreeEntry, hasMore, found bool, err error) {
+	assertf(ref.ValidSHA(commit) || commit == EmptyTreeSHA, "LsTreePage: unresolved commit %q", commit)
+	assertf(limit > 0, "LsTreePage: limit %d", limit)
+	args := []string{"ls-tree", "--long", "-z", "-r", commit}
+	if path != "" {
+		args = append(args, "--", ":(literal)"+path)
+	}
+	p := &lsTreePager{after: after, limit: limit, budget: BudgetFrom(ctx)}
+	if _, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdout: p, Args: args}); err != nil {
+		return nil, false, false, err
+	}
+	if p.err == nil && len(p.pending) > 0 && !p.hasMore {
+		p.err = fmt.Errorf("ls-tree output ended inside a record: %q", p.pending)
+	}
+	if p.err == nil && p.budget != nil && !p.budget.take(int64(p.kept)) {
+		p.err = fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
+	}
+	if p.err != nil {
+		return nil, false, false, p.err
+	}
+	return p.page, p.hasMore, p.found, nil
+}
+
+// lsTreePager is LsTreePage's streaming consumer of `ls-tree --long -z`.
+// It stops git (ErrStop) at the first record past the page or the first
+// error, which it keeps in err.
+type lsTreePager struct {
+	after   string
+	limit   int
+	budget  *Budget // nil: no output allowance
+	kept    int     // bytes of the page's records
+	pending []byte  // the start of a record split across writes
+	prev    string  // the last path read, for the order check
+	found   bool
+	page    []TreeEntry
+	hasMore bool
+	err     error
+}
+
+func (p *lsTreePager) Write(b []byte) (int, error) {
+	n := len(b)
+	for len(b) > 0 {
+		i := bytes.IndexByte(b, 0)
+		if i < 0 {
+			p.within(len(p.pending) + len(b))
+			p.pending = append(p.pending, b...)
+			break
+		}
+		rec := b[:i]
+		if len(p.pending) > 0 {
+			rec = append(p.pending, rec...)
+		}
+		b = b[i+1:]
+		p.record(string(rec))
+		p.pending = p.pending[:0]
+		if p.err != nil || p.hasMore {
+			return n, ErrStop
+		}
+	}
+	if p.err != nil {
+		return n, ErrStop
+	}
+	return n, nil
+}
+
+// within checks that n retained bytes fit in the output allowance left:
+// the page with a record that joins it, or one record split across writes,
+// which may be the lookahead or a record before the cursor. It charges
+// nothing: LsTreePage charges the page once it is complete.
+func (p *lsTreePager) within(n int) {
+	if p.err == nil && p.budget != nil && int64(n) > p.budget.remaining() {
+		p.err = fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
+	}
+}
+
+func (p *lsTreePager) record(rec string) {
+	e, err := parseLsTreeRecord(rec)
+	if err != nil {
+		p.err = err
+		return
+	}
+	if p.found && e.Path <= p.prev {
+		p.err = fmt.Errorf("%w: %q after %q", ErrUnsortedTree, e.Path, p.prev)
+		return
+	}
+	p.found, p.prev = true, e.Path
+	switch {
+	case e.Path <= p.after:
+	case len(p.page) == p.limit:
+		p.hasMore = true
+	default:
+		p.within(p.kept + len(rec))
+		p.kept += len(rec)
+		p.page = append(p.page, e)
+	}
 }
 
 // parseLsTreeRecord parses one `ls-tree --long -z` record:

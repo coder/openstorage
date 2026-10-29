@@ -698,11 +698,7 @@ func (s *server) resolveFilesRequest(w http.ResponseWriter, r *http.Request, rep
 // path that names a blob/symlink/submodule yields that single entry; a path
 // that matches nothing is a 404. Returns ok=false with the response written.
 func (s *server) listTreePage(w http.ResponseWriter, r *http.Request, repoPath, commit string, recursive bool) ([]gitread.TreeEntry, bool) {
-	subtree := strings.TrimSuffix(r.URL.Query().Get("path"), "/")
-	listPath := ""
-	if subtree != "" {
-		listPath = subtree + "/"
-	}
+	subtree, listPath := filesListPath(r)
 	entries, err := gitread.LsTree(r.Context(), repoPath, commit, listPath, recursive)
 	if err != nil {
 		s.internalErr(w, r, "list tree", err)
@@ -727,6 +723,40 @@ func (s *server) listTreePage(w http.ResponseWriter, r *http.Request, repoPath, 
 	// against the same order they were minted in.
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	return entries, true
+}
+
+// filesListPath reads the `path` query param of the files listings: the
+// subtree without a trailing slash, and the ls-tree path that lists it.
+func filesListPath(r *http.Request) (subtree, listPath string) {
+	subtree = strings.TrimSuffix(r.URL.Query().Get("path"), "/")
+	if subtree != "" {
+		listPath = subtree + "/"
+	}
+	return subtree, listPath
+}
+
+// pageRecursiveTree is listTreePage plus pageTreeEntries for a recursive
+// listing with a limit, without listing the whole tree (#612): git stops
+// after the page, so a tree past the output allowance still pages. A path
+// that is not a folder, and a tree stored out of order, take listTreePage.
+// Returns ok=false with the response written.
+func (s *server) pageRecursiveTree(w http.ResponseWriter, r *http.Request, repoPath, commit, after string, limit int) ([]gitread.TreeEntry, bool, bool) {
+	assertf(limit > 0, "pageRecursiveTree: limit %d", limit)
+	subtree, listPath := filesListPath(r)
+	page, hasMore, found, err := gitread.LsTreePage(r.Context(), repoPath, commit, listPath, after, limit)
+	if errors.Is(err, gitread.ErrUnsortedTree) || (err == nil && !found && subtree != "") {
+		entries, ok := s.listTreePage(w, r, repoPath, commit, true)
+		if !ok {
+			return nil, false, false
+		}
+		_, page, hasMore = pageTreeEntries(entries, after, limit)
+		return page, hasMore, true
+	}
+	if err != nil {
+		s.internalErr(w, r, "list tree", err)
+		return nil, false, false
+	}
+	return page, hasMore, true
 }
 
 // pageTreeEntries applies the (cursorKind, cursor, limit) keyset window to
@@ -795,11 +825,19 @@ func (s *server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	entries, ok := s.listTreePage(w, r, repoPath, commit, recursive)
+	var page []gitread.TreeEntry
+	var hasMore bool
+	if recursive && limit > 0 {
+		page, hasMore, ok = s.pageRecursiveTree(w, r, repoPath, commit, after, limit)
+	} else {
+		var entries []gitread.TreeEntry
+		if entries, ok = s.listTreePage(w, r, repoPath, commit, recursive); ok {
+			_, page, hasMore = pageTreeEntries(entries, after, limit)
+		}
+	}
 	if !ok {
 		return
 	}
-	_, page, hasMore := pageTreeEntries(entries, after, limit)
 	next := ""
 	if hasMore {
 		next = coreCursorEncode(cursorKindFiles, page[len(page)-1].Path)
