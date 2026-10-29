@@ -30,7 +30,7 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 - `[check-doc-links.py:go_names]` Go: functions, methods (`T.M` and `M`), types, struct fields and interface methods (`T.F` and `F`), constants, variables, and flags (`flag -name`).
 - `[check-doc-links.py:tf_names]` Terraform: `T` and `T.N` for resources, `data.T.N`, `var.N` and `N`, `output.N` and `N`, `provider.N`, `module.N`, `local.K`, `terraform`, and `ADDRESS.B` for a block `B` nested in a resource or data block.
 - `[check-doc-links.py:py_names]` Python: `def` and `class` names (`C.m` and `m`), module-level assignments and calls (`os.chdir`), and `__main__` when the file has a main guard.
-- `[check-doc-links.py:js_names]` JavaScript: function, class, `const`, `let`, and `var` names, and `NAME.key` for the first-level keys of a top-level object literal.
+- `[check-doc-links.py:js_names]` JavaScript: function, class, `const`, `let`, and `var` names (destructured names too), and `NAME.key` for the first-level keys of a top-level object literal.
 - `[check-doc-links.py:ShellMentions]` Shell: any phrase that appears as whole tokens in the script's code, with comments removed (`destroy`, `set -euo pipefail`, `config.json`).
 - `[check-doc-links.py:unit_names]` systemd units: section names (`Service`). `[check-doc-links.py:dockerfile_names]` Dockerfiles: instructions (`CMD`).
 - `[check-doc-links.py:gh_anchor]` Converts heading text to a GitHub-style anchor slug.
@@ -102,7 +102,7 @@ No child directories.
 - `[check-doc-links.py:citation_problem]` Checks the symbol's form before the file. An empty symbol (`[path:]`) fails as `EMPTY CITATION`. A line number or range fails as `LINE NUMBER CITATION`. Cite a name instead.
 - `[check-doc-links.py:citation_problem]` A citation path is relative to the directory of its `README.md`. After symlinks are resolved, it must name a file inside the repository, else `MISSING CITED FILE`.
 - `[check-doc-links.py:go_names]` `[check-doc-links.py:tf_names]` `[check-doc-links.py:py_names]` `[check-doc-links.py:js_names]` A citation of a Go, Terraform, Python, or JavaScript file resolves only to a declaration. `masked` runs first, so a declaration-shaped line inside a comment, a string, a raw string, a heredoc, or a docstring does not count. A call that mentions the name does not count either. `go_names` relies on `gofmt` layout.
-- `[check-doc-links.py:ShellMentions]` A citation of a shell script resolves to whole tokens in code. A `#` at the start of a line or after whitespace starts a comment, even inside quotes. A name that appears only in a comment does not count, and `config` does not match inside `config.json`.
+- `[check-doc-links.py:ShellMentions]` A citation of a shell script resolves to whole tokens in code. A `#` at the start of a line, after whitespace, or after `;`, `&`, `|`, `(`, or `)` starts a comment, even inside quotes. A name that appears only in a comment does not count, and `config` does not match inside `config.json`.
 
 ### `release-archives.sh`
 

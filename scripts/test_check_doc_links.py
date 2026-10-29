@@ -342,26 +342,29 @@ class CitationTests(CheckerTestCase):
 
     def test_shell_citations_are_whole_tokens_in_code(self):
         sh = ('#!/usr/bin/env bash\n# cleanup is documented here only\nset -euo pipefail\n'
-              'destroy() {\n  docker compose down\n}\nprintf x >"$work/config.json"\ndestroy\n')
+              'destroy() {\n  docker compose down\n}\nprintf x >"$work/config.json"\ndestroy\ntrue;# obsolete_fn\n')
         ok = ["[run.sh:destroy]", "[run.sh:set -euo pipefail]", "[run.sh:config.json]", "[run.sh:compose down]"]
-        bad = ["[run.sh:cleanup]", "[run.sh:config]", "[run.sh:pose]", "[run.sh:$1]"]
+        bad = ["[run.sh:cleanup]", "[run.sh:config]", "[run.sh:pose]", "[run.sh:$1]", "[run.sh:obsolete_fn]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
     def test_python_js_unit_and_dockerfile_citations(self):
         files = {
             "pkg/tool.py": 'import os\nLIMIT = 3\nos.chdir("/")\n\nclass Box:\n    def open(self):\n'
-                           '        inner = 1\n        def helper():\n            pass\n\ndef main():\n    pass\n\nif __name__ == "__main__":\n    main()\n',
+                           '        inner = 1\n        def helper():\n            pass\n\nclass Wide(\n    Box,\n):\n    def run(self):\n        pass\n\ndef main():\n    pass\n\nif __name__ == "__main__":\n    main()\n',
             "pkg/flow.js": 'export const meta = {\n  argsSchema: 1,\n  nested: { deep: 2 },\n};\n'
-                           'function gate() {\n  const rule = 1;\n}\nconst $handler = 1;\n',
+                           'function gate() {\n  const rule = 1;\n}\nconst $handler = 1;\n'
+                           'const routes = {\n  "health-check": 1,\n  ready: 2,\n};\n'
+                           'const { handler, base: alias } = api;\nlet [first, , third] = values;\n',
             "pkg/app.service": "[Unit]\nDescription=x\n[Service]\nExecStart=/bin/true\n",
             "pkg/Dockerfile.test": "FROM alpine\nCMD [\"true\"]\n",
         }
         ok = ["[tool.py:LIMIT]", "[tool.py:os.chdir]", "[tool.py:Box.open]", "[tool.py:main]",
               "[tool.py:__main__]", "[flow.js:meta]", "[flow.js:meta.argsSchema]", "[flow.js:gate]",
-              "[flow.js:rule]", "[flow.js:$handler]", "[app.service:Service]", "[Dockerfile.test:CMD]"]
+              "[flow.js:rule]", "[flow.js:$handler]", "[flow.js:routes.ready]", "[flow.js:handler]",
+              "[flow.js:alias]", "[flow.js:first]", "[flow.js:third]", "[tool.py:Wide.run]", "[app.service:Service]", "[Dockerfile.test:CMD]"]
         bad = ["[tool.py:inner]", "[tool.py:os]", "[tool.py:Box.helper]", "[flow.js:meta.deep]", "[app.service:ExecStart]",
-               "[Dockerfile.test:RUN]"]
+               "[Dockerfile.test:RUN]", "[flow.js:base]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **files)
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
@@ -378,12 +381,14 @@ class CitationTests(CheckerTestCase):
 
     def test_malformed_and_unsupported_citations_fail_with_their_kind(self):
         result = self.check_readme(
-            "[run.sh:8] [run.sh:4-7] [demo.go:] [new.rs:Missing] [notes.txt:Intro] [notes.txt] [gone.txt]\n",
+            "[run.sh:8] [run.sh:4-7] [demo.go:] [new.rs:Missing] [notes.txt:Intro] [notes.txt] [gone.txt] "
+            "[a+b.go:Handler]\n",
             **{"pkg/run.sh": "echo\n", "pkg/notes.txt": "Intro\n"})
         self.assert_failures(result, ("LINE NUMBER CITATION", "[run.sh:8]"),
                              ("LINE NUMBER CITATION", "[run.sh:4-7]"), ("EMPTY CITATION", "[demo.go:]"),
                              ("UNSUPPORTED CITATION", "[new.rs:Missing]"),
-                             ("UNSUPPORTED CITATION", "[notes.txt:Intro]"), ("MISSING CITED FILE", "[gone.txt]"))
+                             ("UNSUPPORTED CITATION", "[notes.txt:Intro]"), ("MISSING CITED FILE", "[gone.txt]"),
+                             ("MISSING CITED FILE", "[a+b.go:Handler]"))
 
     def test_citations_count_in_code_spans_not_code_blocks(self):
         readme = ("Inline `[run.sh:gone]`.\n\n```text\n[run.sh:fenced]\n```\n\n    [run.sh:indented]\n\n"

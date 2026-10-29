@@ -29,7 +29,8 @@ readers return declarations only, with comments and string literals blanked
 first. The shell reader accepts any whole-token phrase outside comments. An
 empty symbol, a line number ([path:12], [path:3-9]), or a symbol in a file
 kind with no reader fails. Citations count inside code spans, not inside
-fenced or indented code. The Go reader assumes gofmt layout.
+fenced or indented code. The Go reader assumes gofmt layout. A reader that
+misses a rare declaration form fails closed: cite another name or the file.
 
 Unsupported-but-valid Markdown fails closed rather than silently passing:
 reference-style links ([text][ref] with a [ref]: destination line) and
@@ -405,11 +406,13 @@ def go_names(text):
 
 
 def py_names(text):
-    names, scopes = set(), []
+    names, scopes, depth = set(), [], 0
     for line, source in zip(masked(text, PY_LEXER).split("\n"), text.split("\n")):
         line = line.rstrip()
         stripped = line.lstrip()
-        if not stripped:
+        continued = depth > 0
+        depth += len(re.findall(r"[(\[{]", line)) - len(re.findall(r"[)\]}]", line))
+        if continued or not stripped:
             continue
         indent = len(line) - len(stripped)
         while scopes and indent <= scopes[-1][0]:
@@ -473,18 +476,23 @@ def tf_names(text):
 
 def js_names(text):
     names, owner, key_indent = set(), None, None
-    for line in masked(text, JS_LEXER).split("\n"):
+    for line, source in zip(masked(text, JS_LEXER).split("\n"), text.split("\n")):
         line = line.rstrip()
         if owner:
             if line.startswith("}"):
                 owner = None
                 continue
-            indent = len(line) - len(line.lstrip())
+            indent = len(source) - len(source.lstrip())
             if line.strip() and key_indent is None:
                 key_indent = indent
             m = re.match(r"\s*([\w$]+)\s*[:(]", line)
             if m and indent == key_indent:
                 names.add(f"{owner}.{m.group(1)}")
+            continue
+        m = re.match(r"\s*(?:export )?(?:const|let|var) ([{\[].*?[}\]])\s*=", line)
+        if m:
+            bindings = re.sub(r"=[^,}\]]*", "", m.group(1))
+            names.update(re.findall(r"[A-Za-z_$][\w$]*(?![\w$])(?!\s*:)", bindings))
             continue
         m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )([\w$]+)", line)
         if m:
@@ -498,7 +506,7 @@ def js_names(text):
 # whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
-        self.code = "\n".join(re.sub(r"(?:^|(?<=\s))#.*", "", line) for line in text.splitlines())
+        self.code = "\n".join(re.sub(r"(?:^|(?<=[\s;&|()]))#.*", "", line) for line in text.splitlines())
 
     def __contains__(self, symbol):
         pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)"
@@ -519,7 +527,8 @@ LANGUAGES = {
 }
 # Independent of LANGUAGES, so a citation of a file kind without a reader
 # fails instead of going unchecked.
-CITATION = re.compile(r"\[((?:[\w.-]+/)*(?:[\w.-]*\.[A-Za-z]\w*|Dockerfile[\w.-]*))(?::([^\]]*))?\](?![(\[])")
+CITATION = re.compile(r"\[((?:[^\s\[\]():/`]+/)*(?:[^\s\[\]():/`]*\.[A-Za-z]\w*|Dockerfile[^\s\[\]():/`]*))"
+                      r"(?::([^\]]*))?\](?![(\[])")
 LINE_NUMBER = re.compile(r"\d+(?:-\d+)?")
 
 
