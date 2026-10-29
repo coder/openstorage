@@ -105,8 +105,15 @@ func fromMetaUpstream(u meta.RepoUpstream) Upstream {
 		PushSyncing: u.PushSyncing, PushClaimHolder: u.PushClaimHolder,
 		PushClaimExpiresAt: u.PushClaimExpiresAt, PushClaimForce: u.PushClaimForce,
 		PushRunCount: u.PushRunCount, PushSuccessCount: u.PushSuccessCount,
-		CreatedAt: u.CreatedAt,
+		DefaultBranchOmitted: u.DefaultBranchOmitted, CreatedAt: u.CreatedAt,
 	}
+}
+
+var _ DefaultBranchAdopter = metaUpstreams{}
+
+func (s metaUpstreams) AdoptDefaultBranch(ctx context.Context, repoID, branch string) (bool, error) {
+	adopted, err := s.ms.AdoptUpstreamDefaultBranch(ctx, repoID, branch)
+	return adopted, mapMetaErr(err, ErrNotFound, nil)
 }
 
 func (s metaUpstreams) PutUpstream(ctx context.Context, up Upstream) (Upstream, error) {

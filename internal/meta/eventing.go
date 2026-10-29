@@ -201,8 +201,10 @@ type EventingStore interface {
 	// AdoptUpstreamDefaultBranch sets the live repo's default branch to
 	// branch and clears DefaultBranchOmitted in one write, only while the
 	// flag is set (issue #599). adopted is false, and nothing changes, when
-	// the flag is clear or the repo is detached. ErrNotFound when the repo
-	// is deleted.
+	// the flag is clear or the repo is detached. When the branch is no
+	// longer OmittedDefaultBranch (a PATCH by an older binary, which does
+	// not clear the flag, during a rolling upgrade), it only clears the
+	// flag: the explicit choice wins. ErrNotFound when the repo is deleted.
 	AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch string) (adopted bool, err error)
 	// GetRepoUpstream returns the row; ErrNotFound when detached/never linked.
 	GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstream, error)

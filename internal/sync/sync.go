@@ -116,7 +116,10 @@ type Upstream struct {
 	PushClaimForce   bool
 	PushRunCount     int // completed outbound runs (success + failure)
 	PushSuccessCount int // completed successful outbound runs
-	CreatedAt        time.Time
+	// DefaultBranchOmitted: the create named no default branch, so a
+	// successful run adopts the upstream HEAD (meta.RepoUpstream, #599).
+	DefaultBranchOmitted bool
+	CreatedAt            time.Time
 }
 
 // PushPending levels (issue #90). Force must dominate: markers coalesce by

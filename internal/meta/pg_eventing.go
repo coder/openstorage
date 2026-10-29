@@ -391,12 +391,14 @@ func (s *PG) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch stri
 		if err != nil || ct.RowsAffected() == 0 {
 			return err
 		}
-		ct, err = tx.Exec(ctx, `UPDATE repos SET default_branch = $2 WHERE repo_id = $1`, repoID, branch)
+		ct, err = tx.Exec(ctx, `UPDATE repos SET default_branch = $2 WHERE repo_id = $1 AND default_branch = $3`,
+			repoID, branch, OmittedDefaultBranch)
 		if err != nil {
 			return err
 		}
-		assertf(ct.RowsAffected() == 1, "adopt default branch of locked repo %q affected %d rows", repoID, ct.RowsAffected())
-		adopted = true
+		n := ct.RowsAffected()
+		assertf(n == 0 || n == 1, "adopt default branch of locked repo %q affected %d rows", repoID, n)
+		adopted = n == 1
 		return nil
 	})
 	if err != nil {

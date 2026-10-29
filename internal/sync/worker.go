@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -800,6 +801,13 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		claimExpiresAt = cur.SyncClaimExpiresAt
 	}
 
+	// A create that named no default branch takes the upstream HEAD
+	// (issue #599); adoptHead records it before the run is finished.
+	var head string
+	if up.DefaultBranchOmitted {
+		head = w.upstreamHead(ctx, job, mirror, fetchEnv, up.CloneURL())
+	}
+
 	// Empty upstream: nothing to push, the run still counts as a success.
 	refs, stderr, err := runGitOut(ctx, mirror, hermeticGitEnv(w.allowProtocol()), "for-each-ref", "--count=1", "--format=%(refname)")
 	if err != nil {
@@ -866,10 +874,12 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		if rejected := parsePushRejections(stdout); up.ForwardOnPush && allLocalWins(rejected) {
 			w.Logger.Info("mirror-back kept newer local refs (forward-on-push: local wins)",
 				"org", job.Org, "repo", job.RepoID, "refused", len(rejected))
+			w.adoptHead(ctx, job, head)
 			return nil
 		}
 		return &syncFailure{code: FailPush, cause: fmt.Errorf("git push: %w: %s", err, stderr)}
 	}
+	w.adoptHead(ctx, job, head)
 	return nil
 }
 
@@ -1088,12 +1098,19 @@ func runGit(ctx context.Context, dir string, env []string, args ...string) (stde
 }
 
 func runGitOut(ctx context.Context, dir string, env []string, args ...string) (stdout, stderr string, err error) {
-	assertf(dir != "" && len(args) > 0, "runGit: missing dir/args")
+	var outBuf bytes.Buffer
+	stderr, err = runGitTo(ctx, dir, env, &outBuf, args...)
+	return outBuf.String(), stderr, err
+}
+
+// runGitTo runs git with stdout written to out.
+func runGitTo(ctx context.Context, dir string, env []string, out io.Writer, args ...string) (stderr string, err error) {
+	assertf(dir != "" && len(args) > 0 && out != nil, "runGit: missing dir/args/stdout")
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = env
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
+	var errBuf bytes.Buffer
+	cmd.Stdout = out
 	cmd.Stderr = &errBuf
 	cmd.Stdin = bytes.NewReader(nil)
 	// Cancellation must kill git's whole process group (setProcGroup):
@@ -1107,5 +1124,5 @@ func runGitOut(ctx context.Context, dir string, env []string, args ...string) (s
 	if err != nil && ctx.Err() != nil {
 		err = fmt.Errorf("%w (%v)", ctx.Err(), err)
 	}
-	return outBuf.String(), errBuf.String(), err
+	return errBuf.String(), err
 }
