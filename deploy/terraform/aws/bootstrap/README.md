@@ -48,7 +48,7 @@ This directory holds the files that cloud-init copies to the EC2 instance of the
 
 ### Test harness (not installed on the instance)
 
-- `Dockerfile.test`: an `amazonlinux:2023` image pinned by digest. Its `CMD` runs `python3 -m unittest discover -v && python3 container_probe.py` [Dockerfile.test:CMD].
+- `Dockerfile.test`: an `amazonlinux:2023` image pinned by digest. Its `CMD` runs `python3 -m unittest discover -v && python3 container_probe.py` [Dockerfile.test].
 - `ContainerProbe.test_bootstrap_and_runtime`: a destructive end-to-end probe of `bootstrap.bootstrap()` and `runtime.refresh()` with `aws` and `systemctl` stubbed. `setUpClass` refuses to run unless the process is root inside a Docker container on Amazon Linux [container_probe.py:ContainerProbe].
 
 ## Invariants

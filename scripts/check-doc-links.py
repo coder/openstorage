@@ -342,7 +342,7 @@ def masked(text, lexer):
 GO_LEXER = re.compile(r"(?P<blank>//[^\n]*|/\*.*?\*/|`[^`]*`|'(?:\\.|[^'\\\n])*')"
                       r'|(?P<quoted>"(?:\\.|[^"\\\n])*")', re.S)
 TF_LEXER = re.compile(r"(?P<blank>#[^\n]*|//[^\n]*|/\*.*?\*/"
-                      r"|<<-?(?P<tag>\w+)[^\n]*\n.*?^[ \t]*(?P=tag)[ \t]*$)"
+                      r"|<<(?P<dash>-)?(?P<tag>\w+)[^\n]*\n.*?^(?(dash)[ \t]*)(?P=tag)[ \t]*$)"
                       r'|(?P<quoted>"(?:\\.|\$\{(?:"(?:\\.|[^"\\])*"|[^"}])*\}|[^"\\\n])*")', re.S | re.M)
 PY_LEXER = re.compile(r"(?P<blank>#[^\n]*|\"\"\"(?:\\.|[^\\])*?\"\"\"|'''(?:\\.|[^\\])*?'''"
                       r"|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')", re.S)
@@ -361,7 +361,7 @@ def go_names(text):
         if owner:
             if line == close:
                 owner = None
-            else:
+            elif "|" not in line and not line.lstrip().startswith("~"):
                 m = (re.match(member + r"(\w+(?:, \w+)*)(?:\(| )", line)
                      or re.match(member + r"\*?(?:\w+\.)?(\w+)(?:\[.*\])?$", line))
                 if m:
@@ -397,10 +397,13 @@ def go_names(text):
         m = re.match(r"(?:const|var) (\w+(?:, \w+)*)", line)
         if m:
             names.update(m.group(1).split(", "))
-    for m in re.finditer(r"\b\w+\.(?:Bool|Duration|Float64|Func|Int|Int64|String|"
+    flag_sets = {"flag"}
+    for m in re.finditer(r"\b(\w+) :?= flag\.NewFlagSet\(|\b(\w+) \*flag\.FlagSet\b", code):
+        flag_sets.add(m.group(1) or m.group(2))
+    for m in re.finditer(r"\b(\w+)\.(?:Bool|Duration|Float64|Func|Int|Int64|String|"
                          r"TextVar|Uint|Uint64|Var)(?:Var)?\((?:&[\w.]+, )?\"", code):
         flag = re.match(r'"([\w-]+)"', text[m.end() - 1:])
-        if flag:
+        if flag and m.group(1) in flag_sets:
             names.add(f"flag -{flag.group(1)}")
     return names
 
@@ -489,11 +492,6 @@ def js_names(text):
             if m and indent == key_indent:
                 names.add(f"{owner}.{m.group(1)}")
             continue
-        m = re.match(r"\s*(?:export )?(?:const|let|var) ([{\[].*?[}\]])\s*=", line)
-        if m:
-            bindings = re.sub(r"=[^,}\]]*", "", m.group(1))
-            names.update(re.findall(r"[A-Za-z_$][\w$]*(?![\w$])(?!\s*:)", bindings))
-            continue
         m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )([\w$]+)", line)
         if m:
             names.add(m.group(1))
@@ -517,13 +515,9 @@ def unit_names(text):
     return set(re.findall(r"^\[([\w-]+)\]", text, re.M))
 
 
-def dockerfile_names(text):
-    return set(re.findall(r"^([A-Z]+)\s", text, re.M))
-
-
 LANGUAGES = {
     ".go": go_names, ".py": py_names, ".tf": tf_names, ".js": js_names, ".sh": ShellMentions,
-    ".service": unit_names, ".timer": unit_names, "Dockerfile": dockerfile_names,
+    ".service": unit_names, ".timer": unit_names,
 }
 # Independent of LANGUAGES, so a citation of a file kind without a reader
 # fails instead of going unchecked.
@@ -533,8 +527,7 @@ LINE_NUMBER = re.compile(r"\d+(?:-\d+)?")
 
 
 def language(path):
-    name = posixpath.basename(path)
-    return LANGUAGES.get("Dockerfile" if name.startswith("Dockerfile") else posixpath.splitext(name)[1])
+    return LANGUAGES.get(posixpath.splitext(path)[1])
 
 
 @functools.cache

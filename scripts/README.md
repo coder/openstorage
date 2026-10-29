@@ -23,16 +23,16 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 - `[check-doc-links.py:anchors]` The heading slugs and explicit anchors of one Markdown file. Cached per file.
 - `[check-doc-links.py:citation_failures]` Failure lines for the citations on one raw line.
 - `[check-doc-links.py:citation_problem]` The failure kind and hint for one citation, or `None` when it resolves.
-- `[check-doc-links.py:LANGUAGES]` One reader per citable file kind, keyed by extension or `Dockerfile`. A reader takes the file text and returns the names a citation may use.
+- `[check-doc-links.py:LANGUAGES]` One reader per citable file kind, keyed by extension. A reader takes the file text and returns the names a citation may use.
 - `[check-doc-links.py:language]` The `LANGUAGES` reader for a path, or `None`.
 - `[check-doc-links.py:citable]` The names of one cited file, from its reader. Cached per file.
 - `[check-doc-links.py:masked]` Blanks the comments and string literals that a lexer matches. Every line and column stays in place. A quoted literal keeps its delimiters.
-- `[check-doc-links.py:go_names]` Go: functions, methods (`T.M` and `M`), types, struct fields and interface methods (`T.F` and `F`), constants, variables, and flags (`flag -name`).
+- `[check-doc-links.py:go_names]` Go: functions, methods (`T.M` and `M`), types, struct fields and interface methods (`T.F` and `F`), constants, variables, and flags (`flag -name`) that the `flag` package or a `flag.FlagSet` defines.
 - `[check-doc-links.py:tf_names]` Terraform: `T` and `T.N` for resources, `data.T.N`, `var.N` and `N`, `output.N` and `N`, `provider.N`, `module.N`, `local.K`, `terraform`, and `ADDRESS.B` for a block `B` nested in a resource or data block.
 - `[check-doc-links.py:py_names]` Python: `def` and `class` names (`C.m` and `m`), module-level assignments and calls (`os.chdir`), and `__main__` when the file has a main guard.
-- `[check-doc-links.py:js_names]` JavaScript: function, class, `const`, `let`, and `var` names (destructured names too), and `NAME.key` for the first-level keys of a top-level object literal.
+- `[check-doc-links.py:js_names]` JavaScript: function, class, `const`, `let`, and `var` names, and `NAME.key` for the first-level keys of a top-level object literal.
 - `[check-doc-links.py:ShellMentions]` Shell: any phrase that appears as whole tokens in the script's code, with comments removed (`destroy`, `set -euo pipefail`, `config.json`).
-- `[check-doc-links.py:unit_names]` systemd units: section names (`Service`). `[check-doc-links.py:dockerfile_names]` Dockerfiles: instructions (`CMD`).
+- `[check-doc-links.py:unit_names]` systemd units: section names (`Service`).
 - `[check-doc-links.py:gh_anchor]` Converts heading text to a GitHub-style anchor slug.
 - `[check-doc-links.py:ExplicitAnchors]` `HTMLParser` subclass. Collects `<a name>` and `<a id>` values into `.anchors`.
 - `[check-doc-links.py:scan_blocks]` Yields the non-code Markdown blocks of one file as numbered lines.
