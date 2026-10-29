@@ -42,9 +42,9 @@ A clean run ends like this:
    WriterVerifies             TRUE
    ... (9 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/orphan-sweep-check.Ab12Cd)
-   PackSweep.cfg               PASS (3738864 distinct states)
-   NoTiming.cfg                PASS (6269431 distinct states)
-   Liveness.cfg                PASS (1072878 distinct states)
+   PackSweep.cfg               PASS (3950676 distinct states)
+   NoTiming.cfg                PASS (6636617 distinct states)
+   Liveness.cfg                PASS (1138212 distinct states)
    NoThresholdAssumption.cfg   fails as expected (trace: ...)
    SlowHealEntry.cfg           fails as expected (trace: ...)
 == Coverage (sync commit 5620494c...)
