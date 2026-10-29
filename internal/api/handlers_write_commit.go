@@ -923,12 +923,34 @@ func (s *server) handleCommitPack(w http.ResponseWriter, r *http.Request) {
 		s.wcInternal(w, r, "build tree", err)
 		return
 	}
+	if wcRejectNoChanges(w, md, plan, baseTree, tree) {
+		return
+	}
 	commit, err := sc.commitTree(r.Context(), tree, plan.parent, md)
 	if err != nil {
 		s.wcInternal(w, r, "create commit", err)
 		return
 	}
 	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, tree, commit, &blobCount)
+}
+
+// wcRejectNoChanges writes upstream's 412 "no changes to commit" (spec
+// 2026-10-28, #595) when the new tree equals the base tree: the tip's
+// tree, or the empty tree on an unborn branch. This covers a request
+// without file operations, files that match the tip, deletes of missing
+// paths and an empty diff. Returns true when it wrote the failure.
+func wcRejectNoChanges(w http.ResponseWriter, md *wcMetadata, plan *wcPlan, baseTree, tree string) bool {
+	assertf(ref.ValidSHA(tree), "wcRejectNoChanges: malformed tree %q", tree)
+	assertf(baseTree == "" || ref.ValidSHA(baseTree), "wcRejectNoChanges: malformed base tree %q", baseTree)
+	assertf((baseTree == "") == (plan.parent == ""), "wcRejectNoChanges: base tree %q for parent %q", baseTree, plan.parent)
+	if baseTree == "" {
+		baseTree = gitread.EmptyTreeSHA
+	}
+	if tree != baseTree {
+		return false
+	}
+	wcFail(w, http.StatusPreconditionFailed, "precondition_failed", "no changes to commit", md.TargetBranch, plan.oldSHA)
+	return true
 }
 
 // wcStreamBlobs drives the blob_chunk state machine (docs/explanation/streaming-commit-protocols.md §1): chunks
@@ -957,7 +979,7 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		if open != nil && open.sink != nil {
 			open.sink.abort()
 		}
-		wcFail(w, code, "invalid", msg, "", "")
+		wcFail(w, code, statusForHTTP(code), msg, "", "")
 		return nil, false
 	}
 
@@ -1046,12 +1068,15 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		}
 	}
 	if open != nil {
-		return fail(http.StatusBadRequest, "stream ended before eof for content_id "+open.op.ContentID)
+		// A file without its final eof chunk is upstream's 412 malformed
+		// stream (spec 2026-10-28, #595); NDJSON syntax and frame-order
+		// errors above stay 400.
+		return fail(http.StatusPreconditionFailed, "stream ended before eof for content_id "+open.op.ContentID)
 	}
 	shas := make(map[string]string, len(states))
 	for id, st := range states {
 		if !st.done {
-			return fail(http.StatusBadRequest, "no blob chunks received for content_id "+id)
+			return fail(http.StatusPreconditionFailed, "no blob chunks received for content_id "+id)
 		}
 		shas[id] = st.sha
 	}
@@ -1063,8 +1088,9 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 
 // handleDiffCommit implements docs/explanation/streaming-commit-protocols.md §2: same metadata frame (no files),
 // diff_chunk frames spooled to a scratch file and applied to the base tree
-// with `git apply --cached`. An empty diff yields an empty commit; a patch
-// that does not apply is `invalid` (422).
+// with `git apply --cached`. A diff that changes nothing (an empty one
+// included) is 412 "no changes to commit"; a patch that does not apply is
+// `invalid` (422).
 func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.wcResolveRepo(w, r)
 	if !ok {
@@ -1152,6 +1178,9 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 		s.wcInternal(w, r, "write tree", fmt.Errorf("write-tree emitted %q", tree))
 		return
 	}
+	if wcRejectNoChanges(w, md, plan, baseTree, treeSHA) {
+		return
+	}
 	commit, err := sc.commitTree(r.Context(), treeSHA, plan.parent, md)
 	if err != nil {
 		s.wcInternal(w, r, "create commit", err)
@@ -1162,8 +1191,8 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 
 // wcSpoolDiff reads diff_chunk frames until eof:true, appending decoded
 // bytes to a scratch file (patches can be large; never buffered in memory).
-// Returns the spooled path and byte count; on failure the 400 envelope is
-// written.
+// Returns the spooled path and byte count; on failure the 400 (or, for a
+// stream without its eof chunk, 412) envelope is written.
 func (s *server) wcSpoolDiff(w http.ResponseWriter, lr *wcLineReader, sc *wcScratch) (string, int64, bool) {
 	path := filepath.Join(sc.dir, "patch.diff")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
@@ -1173,6 +1202,7 @@ func (s *server) wcSpoolDiff(w http.ResponseWriter, lr *wcLineReader, sc *wcScra
 	}
 	defer f.Close()
 	var total int64
+	chunks := 0
 	sawEOF := false
 	for !sawEOF {
 		line, err := lr.next()
@@ -1209,10 +1239,16 @@ func (s *server) wcSpoolDiff(w http.ResponseWriter, lr *wcLineReader, sc *wcScra
 			return "", 0, false
 		}
 		total += int64(len(data))
+		chunks++
 		sawEOF = frame.DiffChunk.EOF
 	}
+	if chunks == 0 {
+		wcFail(w, http.StatusBadRequest, "invalid", "diff content missing", "", "")
+		return "", 0, false
+	}
 	if !sawEOF {
-		wcFail(w, http.StatusBadRequest, "invalid", "stream ended before diff_chunk eof", "", "")
+		// Upstream's 412 malformed stream (spec 2026-10-28, #595).
+		wcFail(w, http.StatusPreconditionFailed, "precondition_failed", "stream ended before diff_chunk eof", "", "")
 		return "", 0, false
 	}
 	if err := f.Close(); err != nil {
