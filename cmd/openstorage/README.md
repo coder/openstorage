@@ -45,7 +45,7 @@ The files split by role:
 
 `[config.go:resolveServeConfig]` resolves everything into `[config.go:serveConfig]`. Each resolver reads through an injected lookup (`[config.go:envLookup]`), not `os.Getenv` directly.
 
-| Group | Variables (`[config.go:const]`) | Resolver |
+| Group | Variables (the `env*` constants, such as `[config.go:envListen]`) | Resolver |
 |---|---|---|
 | Storage | `OPENSTORAGE_PG_URL` (aliases `SPIKE_PG_URL`, `PG_URL`), `OPENSTORAGE_S3_URL` (aliases `SPIKE_S3_URL`, `BLOB_URL`), `OPENSTORAGE_DATA_DIR` | `[config.go:resolveStorageURLs]` |
 | Listeners and URLs | `OPENSTORAGE_LISTEN`, `OPENSTORAGE_METRICS_LISTEN`, `OPENSTORAGE_BASE_URL`, `OPENSTORAGE_TRUSTED_PROXIES` | `[config.go:normalizeBaseURL]`, `[config.go:resolveTrustedProxies]` |

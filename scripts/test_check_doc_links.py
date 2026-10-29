@@ -8,7 +8,7 @@ import unittest
 
 
 class CheckerTestCase(unittest.TestCase):
-    def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), git=True):
+    def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -23,6 +23,9 @@ class CheckerTestCase(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding="utf-8")
+            for name, target in (symlinks or {}).items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).symlink_to(target)
             if git:
                 subprocess.run(["git", "init", "-q"], cwd=root, check=True)
                 subprocess.run(["git", "add", "-f", "."], cwd=root, check=True)
@@ -234,6 +237,159 @@ class DocLinkCheckerTests(CheckerTestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(diagnostic, result.stdout)
                 self.assertTrue(result.stdout.endswith('broken links: 1\n'))
+
+
+GO = """package demo
+
+import "flag"
+
+// Run is mentioned here and called below, but declared in another file.
+const (
+	Limit = 3
+	lower, upper = 1, 2
+)
+
+type Slots struct {
+	Size  int
+	a, b  string
+}
+
+type Pool interface {
+	Acquire(n int) error
+}
+
+func NewSlots(n int) *Slots { return &Slots{Size: n} }
+
+func (s *Slots) Close() error { Run(); return nil }
+
+func main() {
+	seed := flag.Uint64("seed", 0, "simulation seed")
+	_ = seed
+}
+"""
+
+
+class CitationTests(CheckerTestCase):
+    def check_readme(self, readme, **files):
+        return self.run_checker("", files={"pkg/README.md": readme, **files})
+
+    def assert_failures(self, result, *expected):
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[-1], f"broken links: {len(expected)}", result.stdout + result.stderr)
+        for kind, citation in expected:
+            self.assertTrue(any(l.startswith(kind) and f"-> {citation}" in l for l in lines),
+                            f"{kind} {citation} not in:\n{result.stdout}")
+
+    def test_go_citations_resolve_to_declarations(self):
+        citations = ["[demo.go:NewSlots]", "[demo.go:Slots]", "[demo.go:Slots.Close]", "[demo.go:Close]",
+                     "[demo.go:Slots.Size]", "[demo.go:Slots.b]", "[demo.go:Pool.Acquire]", "[demo.go:Limit]",
+                     "[demo.go:upper]", "[demo.go:main]", "[demo.go:flag -seed]", "[demo.go]"]
+        result = self.check_readme(" ".join(citations) + "\n", **{"pkg/demo.go": GO})
+        self.assert_failures(result)
+        self.assertEqual(result.returncode, 0)
+
+    def test_go_mentions_are_not_declarations(self):
+        # `Run` is called and commented on, `demo` is the package clause, `seed` is a local.
+        bad = ["[demo.go:Run]", "[demo.go:demo]", "[demo.go:seed]", "[demo.go:Slots.Acquire]"]
+        result = self.check_readme(" ".join(bad) + "\n", **{"pkg/demo.go": GO})
+        self.assertEqual(result.returncode, 1)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_declarations_in_comments_and_strings_do_not_count(self):
+        cases = {
+            "demo.go": ('package demo\n\n/*\nfunc BlockComment() {}\n*/\n// func LineComment() {}\n'
+                        'var (\n\tusage = `\n)\nfunc RawString() {}\n`\n\tAfter = 1\n)\n'
+                        'var quoted = "func Quoted() {}"\n\nfunc main() {\n'
+                        '\t// flag.Int("ghost", 0, "")\n\t_ = flag.Int("live", 0, "")\n}\n',
+                        ["After", "main", "flag -live"],
+                        ["BlockComment", "LineComment", "RawString", "Quoted", "flag -ghost"]),
+            "main.tf": ('# resource "aws_hash" "comment" {}\n// resource "aws_slash" "comment" {}\n'
+                        '/*\nresource "aws_block" "comment" {}\n*/\nlocals {\n  policy = <<-EOT\n'
+                        '    resource "aws_heredoc" "doc" {\n  EOT\n  arn = "${aws_s3_bucket.data.arn}/*"\n}\n'
+                        'resource "aws_lb" "after" {}\n',
+                        ["local.policy", "local.arn", "aws_lb.after"],
+                        ["aws_hash.comment", "aws_slash.comment", "aws_block.comment", "aws_heredoc.doc"]),
+            "tool.py": ('"""Module docstring.\n\ndef docstring_def():\n"""\n# def comment_def():\n'
+                        'TEMPLATE = """\nclass TemplateClass:\n"""\ndef real():\n    pass\n',
+                        ["TEMPLATE", "real"], ["docstring_def", "comment_def", "TemplateClass"]),
+            "flow.js": ('/* function blockComment() {} */\n// const lineComment = 1;\n'
+                        'const tmpl = `\nfunction templateFn() {}\n`;\nconst str = "class StrClass {}";\n'
+                        'function realFn() {}\n',
+                        ["tmpl", "str", "realFn"], ["blockComment", "lineComment", "templateFn", "StrClass"]),
+        }
+        for name, (source, declared, mentioned) in cases.items():
+            with self.subTest(file=name):
+                cite = lambda symbol: f"[{name}:{symbol}]"
+                result = self.check_readme(" ".join(map(cite, declared + mentioned)) + "\n",
+                                           **{f"pkg/{name}": source})
+                self.assert_failures(result, *[("UNRESOLVED CITATION", cite(s)) for s in mentioned])
+
+    def test_terraform_citations_resolve_to_block_addresses(self):
+        tf = ('locals {\n  cloud_config = {\n    a = "{"\n  }\n}\n'
+              'resource "aws_lb" "this" {\n  name = "x"\n  lifecycle {\n    precondition {\n'
+              '      condition = true\n    }\n  }\n}\n'
+              'data "aws_partition" "current" {}\nvariable "region" {}\nprovider "aws" {\n  region = var.region\n}\n')
+        ok = ["[main.tf:aws_lb]", "[main.tf:aws_lb.this]", "[main.tf:aws_lb.this.precondition]",
+              "[main.tf:data.aws_partition.current]", "[main.tf:region]", "[main.tf:var.region]",
+              "[main.tf:provider.aws]", "[main.tf:local.cloud_config]"]
+        bad = ["[main.tf:aws_lb.main]", "[main.tf:data]", "[main.tf:local.a]", "[main.tf:aws_lb.this.name]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/main.tf": tf})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_shell_citations_are_whole_tokens_in_code(self):
+        sh = ('#!/usr/bin/env bash\n# cleanup is documented here only\nset -euo pipefail\n'
+              'destroy() {\n  docker compose down\n}\nprintf x >"$work/config.json"\ndestroy\n')
+        ok = ["[run.sh:destroy]", "[run.sh:set -euo pipefail]", "[run.sh:config.json]", "[run.sh:compose down]"]
+        bad = ["[run.sh:cleanup]", "[run.sh:config]", "[run.sh:pose]", "[run.sh:$1]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_python_js_unit_and_dockerfile_citations(self):
+        files = {
+            "pkg/tool.py": 'import os\nLIMIT = 3\nos.chdir("/")\n\nclass Box:\n    def open(self):\n'
+                           '        inner = 1\n\ndef main():\n    pass\n\nif __name__ == "__main__":\n    main()\n',
+            "pkg/flow.js": 'export const meta = {\n  argsSchema: 1,\n  nested: { deep: 2 },\n};\n'
+                           'function gate() {\n  const rule = 1;\n}\n',
+            "pkg/app.service": "[Unit]\nDescription=x\n[Service]\nExecStart=/bin/true\n",
+            "pkg/Dockerfile.test": "FROM alpine\nCMD [\"true\"]\n",
+        }
+        ok = ["[tool.py:LIMIT]", "[tool.py:os.chdir]", "[tool.py:Box.open]", "[tool.py:main]",
+              "[tool.py:__main__]", "[flow.js:meta]", "[flow.js:meta.argsSchema]", "[flow.js:gate]",
+              "[flow.js:rule]", "[app.service:Service]", "[Dockerfile.test:CMD]"]
+        bad = ["[tool.py:inner]", "[tool.py:os]", "[flow.js:meta.deep]", "[app.service:ExecStart]",
+               "[Dockerfile.test:RUN]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_cited_paths_are_relative_to_the_readme_and_stay_in_the_repo(self):
+        files = {"cmd/dst/README.md": "[internal/sim/run.go:Run] [../../internal/sim/run.go:Run] "
+                                      "[../../../run.go] [gone.go] [escape.py:CheckerTestCase]\n",
+                 "internal/sim/run.go": "package sim\n\nfunc Run() {}\n"}
+        result = self.run_checker("", files=files,
+                                  symlinks={"cmd/dst/escape.py": Path(__file__).resolve()})
+        self.assert_failures(result, *[("MISSING CITED FILE", c) for c in
+                                       ["[internal/sim/run.go:Run]", "[../../../run.go]", "[gone.go]",
+                                        "[escape.py:CheckerTestCase]"]])
+        self.assertIn("cmd/dst/README.md:1 -> [internal/sim/run.go:Run]", result.stdout)
+
+    def test_malformed_and_unsupported_citations_fail_with_their_kind(self):
+        result = self.check_readme(
+            "[run.sh:8] [run.sh:4-7] [demo.go:] [new.rs:Missing] [notes.txt:Intro] [notes.txt] [gone.txt]\n",
+            **{"pkg/run.sh": "echo\n", "pkg/notes.txt": "Intro\n"})
+        self.assert_failures(result, ("LINE NUMBER CITATION", "[run.sh:8]"),
+                             ("LINE NUMBER CITATION", "[run.sh:4-7]"), ("EMPTY CITATION", "[demo.go:]"),
+                             ("UNSUPPORTED CITATION", "[new.rs:Missing]"),
+                             ("UNSUPPORTED CITATION", "[notes.txt:Intro]"), ("MISSING CITED FILE", "[gone.txt]"))
+
+    def test_citations_count_in_code_spans_not_code_blocks(self):
+        readme = ("Inline `[run.sh:gone]`.\n\n```text\n[run.sh:fenced]\n```\n\n    [run.sh:indented]\n\n"
+                  "Not citations: [run.sh](run.sh) [!WARNING] `[a-z]` [-steps N] [1, 100] [v1.2] [run.sh][ref].\n")
+        result = self.check_readme(readme, **{"pkg/run.sh": "echo\n"})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[run.sh:gone]"))
+
+    def test_only_readmes_carry_citations(self):
+        result = self.run_checker("", docs={"guide.md": "[run.sh:gone]\n"}, files={"run.sh": "echo\n"})
+        self.assert_failures(result)
 
 
 class FileSelectionTests(CheckerTestCase):

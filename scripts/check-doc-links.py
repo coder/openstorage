@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline checker for the relative links in this repository's docs.
+"""Offline checker for the relative links and code citations in this repository's docs.
 
     python3 scripts/check-doc-links.py
 
@@ -19,6 +19,17 @@ checking follows GitHub's algorithm (lowercase, strip backticks/asterisks,
 spaces to hyphens, dedupe with -1/-2 suffixes). Explicit <a name="..."> and
 <a id="..."> anchors retain their exact values; anchors demonstrated in
 fenced, indented, or inline code do not create destinations.
+
+In a README.md, [path:symbol] or [path] cites code when path ends in a
+letter-led extension or names a Dockerfile, and no "(" or "[" follows the
+bracket. path is relative to the README's directory and must resolve, after
+symlinks, to a file inside the repository. symbol must be a name that the
+file's LANGUAGES reader returns. The Go, Terraform, Python, and JavaScript
+readers return declarations only, with comments and string literals blanked
+first. The shell reader accepts any whole-token phrase outside comments. An
+empty symbol, a line number ([path:12], [path:3-9]), or a symbol in a file
+kind with no reader fails. Citations count inside code spans, not inside
+fenced or indented code. The Go reader assumes gofmt layout.
 
 Unsupported-but-valid Markdown fails closed rather than silently passing:
 reference-style links ([text][ref] with a [ref]: destination line) and
@@ -257,9 +268,12 @@ def doc_files():
     return sorted(name for name in names if not name.startswith("vendor/") and os.path.isfile(name))
 
 
+def is_readme(path):
+    return posixpath.basename(path) == "README.md"
+
+
 def links_apply(path):
-    return (posixpath.basename(path) == "README.md" or path in ("CONTRIBUTING.md", "CHANGELOG.md")
-            or path.startswith("docs/"))
+    return is_readme(path) or path in ("CONTRIBUTING.md", "CHANGELOG.md") or path.startswith("docs/")
 
 
 @functools.cache
@@ -314,11 +328,245 @@ def link_failures(path, lineno, ln):
     return failures
 
 
+def masked(text, lexer):
+    # Same length and newlines as text, so declarations keep their line and
+    # column. A quoted literal keeps its delimiters, so go_names and tf_names
+    # can find a flag name or a block label in the code and read it from text.
+    def blank(m):
+        token, keep = m.group(), 1 if m.groupdict().get("quoted") else 0
+        return token[:keep] + re.sub(r"[^\n]", " ", token[keep:len(token) - keep]) + token[len(token) - keep:]
+    return lexer.sub(blank, text)
+
+
+GO_LEXER = re.compile(r"(?P<blank>//[^\n]*|/\*.*?\*/|`[^`]*`|'(?:\\.|[^'\\\n])*')"
+                      r'|(?P<quoted>"(?:\\.|[^"\\\n])*")', re.S)
+TF_LEXER = re.compile(r"(?P<blank>#[^\n]*|//[^\n]*|/\*.*?\*/"
+                      r"|<<-?(?P<tag>\w+)[^\n]*\n.*?^[ \t]*(?P=tag)[ \t]*$)"
+                      r'|(?P<quoted>"(?:\\.|\$\{(?:"(?:\\.|[^"\\])*"|[^"}])*\}|[^"\\\n])*")', re.S | re.M)
+PY_LEXER = re.compile(r"(?P<blank>#[^\n]*|\"\"\"(?:\\.|[^\\])*?\"\"\"|'''(?:\\.|[^\\])*?'''"
+                      r"|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')", re.S)
+JS_LEXER = re.compile(r"(?P<blank>//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'"
+                      r"|`(?:\\.|[^`\\])*`)", re.S)
+
+
+def go_names(text):
+    # Assumes gofmt layout, where declarations start in column 0 and members one tab in.
+    code = masked(text, GO_LEXER)
+    names = set()
+    owner, close, member = None, None, None
+    group, group_close = None, None
+    for line in code.split("\n"):
+        line = line.rstrip()
+        if owner:
+            if line == close:
+                owner = None
+            else:
+                m = re.match(member + r"(\w+(?:, \w+)*)(?:\(| )", line)
+                if m:
+                    for name in m.group(1).split(", "):
+                        names |= {name, f"{owner}.{name}"}
+            continue
+        if group:
+            if line == group_close:
+                group = None
+                continue
+            m = re.match(r"\t(\w+(?:, \w+)*)\b", line)
+            if m:
+                names.update(m.group(1).split(", "))
+                if group == "type" and re.search(r"\b(struct|interface) \{$", line):
+                    owner, close, member = m.group(1), "\t}", r"\t\t"
+            continue
+        m = re.match(r"func (?:\((?:\w+ )?\*?(\w+)(?:\[[^\]]*\])?\) )?(\w+)", line)
+        if m:
+            names.add(m.group(2))
+            if m.group(1):
+                names.add(f"{m.group(1)}.{m.group(2)}")
+            continue
+        m = re.match(r"(type|const|var) \($", line)
+        if m:
+            group, group_close = m.group(1), ")"
+            continue
+        m = re.match(r"type (\w+)", line)
+        if m:
+            names.add(m.group(1))
+            if re.search(r"\b(struct|interface) \{$", line):
+                owner, close, member = m.group(1), "}", r"\t"
+            continue
+        m = re.match(r"(?:const|var) (\w+(?:, \w+)*)", line)
+        if m:
+            names.update(m.group(1).split(", "))
+    for m in re.finditer(r"\b\w+\.(?:Bool|Duration|Float64|Func|Int|Int64|String|"
+                         r"TextVar|Uint|Uint64|Var)(?:Var)?\((?:&[\w.]+, )?\"", code):
+        flag = re.match(r'"([\w-]+)"', text[m.end() - 1:])
+        if flag:
+            names.add(f"flag -{flag.group(1)}")
+    return names
+
+
+def py_names(text):
+    names, classes = set(), []
+    for line, source in zip(masked(text, PY_LEXER).split("\n"), text.split("\n")):
+        line = line.rstrip()
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        indent = len(line) - len(stripped)
+        while classes and indent <= classes[-1][0]:
+            classes.pop()
+        m = re.match(r"(?:async )?(def|class) (\w+)", stripped)
+        if m:
+            name = m.group(2)
+            qualified = f"{classes[-1][1]}.{name}" if classes else name
+            names |= {name, qualified}
+            if m.group(1) == "class":
+                classes.append((indent, qualified))
+            continue
+        if indent:
+            continue
+        m = re.match(r"(\w+(?:\s*,\s*\w+)*)\s*(?::[^=]*)?=(?!=)", line)
+        if m:
+            names.update(re.split(r"\s*,\s*", m.group(1)))
+        m = re.match(r"([A-Za-z_][\w.]*)\(", line)
+        if m:
+            names.add(m.group(1))
+        if line.startswith("if __name__ == ") and re.match(r"if __name__ == [\"']__main__[\"']", source):
+            names.add("__main__")
+    return names
+
+
+def tf_names(text):
+    names, depth, top = set(), 0, None
+    for line, source in zip(masked(text, TF_LEXER).split("\n"), text.split("\n")):
+        block = re.match(r'\s*([\w-]+)((?:\s+"[^"]*")*)\s*\{', line)
+        if block:
+            labels = re.findall(r'"([^"]*)"', source[block.start(2):block.end(2)])
+            kind = block.group(1)
+            if depth == 0:
+                if kind == "resource" and len(labels) == 2:
+                    top = ".".join(labels)
+                    names |= {labels[0], top}
+                elif kind == "data" and len(labels) == 2:
+                    top = "data." + ".".join(labels)
+                    names.add(top)
+                elif kind in ("variable", "output") and len(labels) == 1:
+                    top = None
+                    names |= {labels[0], f"{'var' if kind == 'variable' else 'output'}.{labels[0]}"}
+                elif kind in ("provider", "module") and len(labels) == 1:
+                    top = None
+                    names.add(f"{kind}.{labels[0]}")
+                elif not labels:
+                    top = "local" if kind == "locals" else None
+                    if kind != "locals":
+                        names.add(kind)
+            elif top and top != "local":
+                names.add(f"{top}.{kind}")
+        elif depth == 1 and top == "local":
+            m = re.match(r"\s*(\w+)\s*=", line)
+            if m:
+                names.add(f"local.{m.group(1)}")
+        depth += line.count("{") - line.count("}")
+        if depth == 0:
+            top = None
+    return names
+
+
+def js_names(text):
+    names, owner, key_indent = set(), None, None
+    for line in masked(text, JS_LEXER).split("\n"):
+        line = line.rstrip()
+        if owner:
+            if line.startswith("}"):
+                owner = None
+                continue
+            indent = len(line) - len(line.lstrip())
+            if line.strip() and key_indent is None:
+                key_indent = indent
+            m = re.match(r"\s*(\w+)\s*[:(]", line)
+            if m and indent == key_indent:
+                names.add(f"{owner}.{m.group(1)}")
+            continue
+        m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )(\w+)", line)
+        if m:
+            names.add(m.group(1))
+            if not line[0].isspace() and re.search(r"=\s*\{$", line):
+                owner, key_indent = m.group(1), None
+    return names
+
+
+# A shell contract cites commands, options, and file names, which have no
+# declaration, so a shell citation is a whole-token phrase in code.
+class ShellMentions:
+    def __init__(self, text):
+        self.code = "\n".join(re.sub(r"(?:^|(?<=\s))#.*", "", line) for line in text.splitlines())
+
+    def __contains__(self, symbol):
+        pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)"
+        return re.search(pattern, self.code) is not None
+
+
+def unit_names(text):
+    return set(re.findall(r"^\[([\w-]+)\]", text, re.M))
+
+
+def dockerfile_names(text):
+    return set(re.findall(r"^([A-Z]+)\s", text, re.M))
+
+
+LANGUAGES = {
+    ".go": go_names, ".py": py_names, ".tf": tf_names, ".js": js_names, ".sh": ShellMentions,
+    ".service": unit_names, ".timer": unit_names, "Dockerfile": dockerfile_names,
+}
+# Independent of LANGUAGES, so a citation of a file kind without a reader
+# fails instead of going unchecked.
+CITATION = re.compile(r"\[((?:[\w.-]+/)*(?:[\w.-]*\.[A-Za-z]\w*|Dockerfile[\w.-]*))(?::([^\]]*))?\](?![(\[])")
+LINE_NUMBER = re.compile(r"\d+(?:-\d+)?")
+
+
+def language(path):
+    name = posixpath.basename(path)
+    return LANGUAGES.get("Dockerfile" if name.startswith("Dockerfile") else posixpath.splitext(name)[1])
+
+
+@functools.cache
+def citable(path):
+    with open(path, encoding="utf-8") as source:
+        return language(path)(source.read())
+
+
+def citation_problem(path, symbol):
+    if symbol == "":
+        return "EMPTY CITATION", " (name a symbol after the colon, or cite the file alone)"
+    if symbol is not None and LINE_NUMBER.fullmatch(symbol):
+        return "LINE NUMBER CITATION", " (cite a name; line numbers drift)"
+    if symbol is not None and language(path) is None:
+        return "UNSUPPORTED CITATION", " (LANGUAGES has no reader for this file kind; cite the file alone)"
+    root, real = os.path.realpath(os.curdir), os.path.realpath(path)
+    if os.path.commonpath([root, real]) != root:
+        return "MISSING CITED FILE", " (outside the repository)"
+    if not os.path.isfile(real):
+        return "MISSING CITED FILE", ""
+    if symbol is not None and symbol not in citable(path):
+        return "UNRESOLVED CITATION", f" (no such name in {path})"
+    return None
+
+
+def citation_failures(readme, lineno, raw):
+    failures = []
+    for m in CITATION.finditer(raw):
+        cited, symbol = m.groups()
+        problem = citation_problem(posixpath.normpath(posixpath.join(posixpath.dirname(readme), cited)), symbol)
+        if problem:
+            failures.append(f"{problem[0]} {readme}:{lineno} -> {m.group()}{problem[1]}")
+    return failures
+
+
 def check():
     failures = []
     for path in filter(links_apply, doc_files()):
-        for lineno, _, visible in scan_lines(path):
+        for lineno, raw, visible in scan_lines(path):
             failures += link_failures(path, lineno, visible)
+            if is_readme(path):
+                failures += citation_failures(path, lineno, raw)
     for failure in failures:
         print(failure)
     print("broken links:", len(failures))

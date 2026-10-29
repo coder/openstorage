@@ -47,7 +47,7 @@ A non-sensitive handoff object [outputs.tf:deployment] with these keys: `schema_
 
 ### Resources by file
 
-- `versions.tf`: data sources `aws_caller_identity.current`, `aws_partition.current`, `aws_availability_zones.available`, and `aws_ssm_parameter.al2023` (the current AL2023 x86_64 AMI) [versions.tf:data].
+- `versions.tf`: data sources `aws_caller_identity.current` [versions.tf:data.aws_caller_identity.current], `aws_partition.current` [versions.tf:data.aws_partition.current], `aws_availability_zones.available` [versions.tf:data.aws_availability_zones.available], and `aws_ssm_parameter.al2023` (the current AL2023 x86_64 AMI) [versions.tf:data.aws_ssm_parameter.al2023].
 - `compute.tf`: `local.service_url` (`https://<ALB DNS name>`), `local.runtime_config` (the instance `config.json`), `local.cloud_config`, and `aws_instance.server` (`t3.small`, 50 GiB encrypted `gp3` root volume) [compute.tf:aws_instance.server].
 - `iam.tf`: `aws_iam_role.server`, `aws_iam_role_policy.server`, `aws_iam_instance_profile.server` [iam.tf].
 - `load-balancer.tf`: `aws_lb.this`, the CA and server keys and certificates (`tls_private_key.ca`, `tls_self_signed_cert.ca`, `tls_private_key.server`, `tls_cert_request.server`, `tls_locally_signed_cert.server`), `aws_acm_certificate.server`, `aws_lb_target_group.this` (HTTP 8080, health check `/healthz` expecting `200`), `aws_lb_listener.https` (443), `aws_lb_target_group_attachment.server` [load-balancer.tf].
@@ -58,7 +58,7 @@ A non-sensitive handoff object [outputs.tf:deployment] with these keys: `schema_
 
 - `local.runtime_config` must keep exactly the keys that `runtime.py validate_config` accepts: `region`, `account_id`, `org`, `service_url`, `artifact_bucket`, `artifact_key`, `release_sha256`, `release_tag`, `postgres_host`, `postgres_port`, `postgres_database`, `postgres_secret_arn`, `data_bucket`, `trusted_proxy_cidrs`. The instance refuses to start with any other key set [compute.tf:local.runtime_config] [bootstrap/runtime.py:validate_config].
 - `postgres_port` is the literal `5432`, and `trusted_proxy_cidrs` is the list of public subnet CIDRs [compute.tf:local.runtime_config].
-- The keys of the `deployment` output that `smoke.sh` reads must stay present, with `schema_version = 1` and `topology = "postgres-s3-single-node"` [outputs.tf:deployment] [scripts/smoke.sh:29].
+- The keys of the `deployment` output that `smoke.sh` reads must stay present, with `schema_version = 1` and `topology = "postgres-s3-single-node"` [outputs.tf:deployment] [scripts/smoke.sh:postgres-s3-single-node].
 - The VPC precondition requires the `aws` partition and at least two available AZs [network.tf:aws_vpc.this].
 - The compressed user data must be at most 21844 base64 characters (the AWS 16 KiB limit) [compute.tf:aws_instance.server.precondition].
 - The `aws_s3_object.release` precondition requires `filesha256(var.release_archive) == var.release_sha256`. A missing or changed archive fails the plan [storage.tf:aws_s3_object.release].
