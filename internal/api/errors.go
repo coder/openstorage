@@ -489,6 +489,8 @@ func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList)
 // status string the SDKs convert into typed RefUpdateErrors. This is the
 // single authoritative table for the write surface (wcFail, wmFailConflict,
 // wrefNoteFail); an unmapped code is a programming error and fails fast.
+// One documented exception sends another status: the lost-CAS 409 of
+// commit-pack and diff-commit says "failed" (wcFailLostCAS, #596).
 func statusForHTTP(httpStatus int) string {
 	switch httpStatus {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:

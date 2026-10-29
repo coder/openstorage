@@ -119,10 +119,16 @@ typed `RefUpdateError`s with this table:
 | 403 | `forbidden` |
 | 404 | `not_found` |
 | 408, 499, 504 | `timeout` |
-| 409 | `conflict` |
+| 409 | `conflict`; `failed` for a lost CAS on `commit-pack` and `diff-commit` (below) |
 | 412 | `precondition_failed` |
 | 429, 502, 503 | `unavailable` |
 | 500 | `internal` |
+
+When another writer moves the branch after the server wrote the commit (a lost CAS),
+`commit-pack` and `diff-commit` answer 409 with `result.status: "failed"`. `commit` and
+`result.new_sha` name the commit that the branch did not get, and `result.old_sha` is the
+tip the server built on. `restore-commit` answers a lost CAS with 409 `conflict` and no
+`commit`.
 
 The envelope must be returned as the JSON body on any of the statuses
 `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. Clients parse the body on
