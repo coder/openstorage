@@ -474,7 +474,10 @@ func TestGuardSHAUppercase(t *testing.T) {
 			return mainTip(t), stale
 		}
 		diff := func(t *testing.T, extra map[string]any) (int, []byte) {
-			return post(t, "/api/v1/repos/diff-commit", wctMeta("main", "diff", nil, extra), wctDiffChunk(nil, true))
+			// A new file per call: a diff that changes nothing is 412 (#595).
+			name := "diff-" + randomHex(t, 4) + ".txt"
+			patch := "diff --git a/" + name + " b/" + name + "\nnew file mode 100644\n--- /dev/null\n+++ b/" + name + "\n@@ -0,0 +1 @@\n+d\n"
+			return post(t, "/api/v1/repos/diff-commit", wctMeta("main", "diff", nil, extra), wctDiffChunk([]byte(patch), true))
 		}
 		restore := func(t *testing.T, extra map[string]any) (int, []byte) {
 			md := map[string]any{"target_branch": "main", "author": wctAuthor, "target_commit_sha": root}

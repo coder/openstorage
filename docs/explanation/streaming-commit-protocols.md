@@ -56,7 +56,10 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
 - `content_id` ties chunks to the metadata `files` entry (UUIDv4 in practice; treat as
   an opaque unique string).
 - The final chunk per file sets `eof: true`. Empty files send exactly one frame:
-  `{"data": "", "eof": true}`.
+  `{"data": "", "eof": true}`. A stream that ends before a file's `eof` chunk, or that
+  sends no chunk for an `upsert` file, gets 412 `precondition_failed`. Other malformed
+  frames (bad JSON, unknown frames, chunks out of order or after `eof`, bad base64)
+  get 400 `invalid`.
 - Clients normalize paths (leading slashes stripped); the backend should still reject
   `..` traversal and absolute paths defensively.
 - Modes: `100644`, `100755`, `120000` (symlink), `160000` (submodule).
@@ -68,7 +71,11 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
    root commit.
 2. CAS check (`expected_head_sha` mismatch → `status: "conflict"`, HTTP 409/412).
 3. Write blobs, build the tree on the base tree (upserts + deletes), create the commit,
-   and atomically advance the ref (respecting JWT ref policies).
+   and atomically advance the ref (respecting JWT ref policies). If the new tree equals
+   the base tree (or the empty tree on an unborn branch), the server answers 412
+   `precondition_failed` with the message `no changes to commit` and moves no ref. This
+   covers a request without file operations, files that match the tip, and deletes of
+   paths that do not exist.
 4. Emit a `push` webhook and schedule upstream sync (persistent namespace only).
 
 ## 2. `POST /api/v1/repos/diff-commit` — commit from a git patch
@@ -80,8 +87,10 @@ Line 1 is the same metadata frame **without** `files`. Lines 2..N are diff chunk
 ```
 
 The patch is a standard git unified diff (binary patches per official docs: output of
-`git diff --binary`). The server applies it to the base tree and commits. An empty diff
-is one `{"data": "", "eof": true}` frame.
+`git diff --binary`). The server applies it to the base tree and commits. A diff that
+changes nothing, such as an empty diff (one `{"data": "", "eof": true}` frame), gets 412
+`precondition_failed` with the message `no changes to commit`. A stream that ends before
+the `eof` chunk gets 412 too, and a stream without any `diff_chunk` frame gets 400.
 
 ## 3. Response envelope (shared, also used by restore-commit)
 
