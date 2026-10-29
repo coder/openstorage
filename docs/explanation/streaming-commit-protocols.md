@@ -75,7 +75,8 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
 1. Resolve the base: `expected_head_sha` / current tip of `target_branch`. If the branch
    does not exist and `base_branch` is given, branch from that tip; otherwise create a
    root commit.
-2. CAS check (`expected_head_sha` mismatch → `status: "conflict"`, HTTP 409/412).
+2. CAS check: a stale `expected_target_sha` (or the deprecated `expected_head_sha`) gets
+   HTTP 412 `precondition_failed` and moves no ref.
 3. Write blobs, build the tree on the base tree (upserts + deletes), create the commit,
    and atomically advance the ref (respecting JWT ref policies). If the new tree equals
    the base tree (or the empty tree on an unborn branch), the server answers 412
