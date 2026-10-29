@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
     push_claim_force      boolean NOT NULL DEFAULT false,
     push_run_count        integer NOT NULL DEFAULT 0,
     push_success_count    integer NOT NULL DEFAULT 0,
+    default_branch_omitted boolean NOT NULL DEFAULT false,
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 -- Upgrade path for deployments whose repo_upstreams predates the
@@ -167,6 +168,9 @@ ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_claim_expires_at timest
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_claim_force boolean NOT NULL DEFAULT false;
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_run_count integer NOT NULL DEFAULT 0;
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_success_count integer NOT NULL DEFAULT 0;
+-- GitHub sync create without a default branch (issue #599): rows that
+-- predate the column keep their branch.
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS default_branch_omitted boolean NOT NULL DEFAULT false;
 -- Upgrade path for repos predating the purge tombstone column (issue #52).
 ALTER TABLE repos ADD COLUMN IF NOT EXISTS purged_at timestamptz;
 -- Create state (issue #388): 0 legacy, 1 pending, 2 complete. Rows that
@@ -467,7 +471,11 @@ func (s *PG) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, n
 		assertf(n == 0 || n == 1, "default-branch CAS of %q/%q affected %d rows", org, url, n)
 		if n == 1 {
 			won = true
-			return nil
+			_, err := tx.Exec(ctx,
+				`UPDATE repo_upstreams SET default_branch_omitted = false
+				 WHERE default_branch_omitted AND repo_id = (SELECT repo_id FROM repos WHERE org_id = $1 AND url = $2 AND deleted_at IS NULL)`,
+				orgID, url)
+			return err
 		}
 		// No row matched: absent/soft-deleted repo (404) or a concurrently
 		// changed default branch (won=false -> caller's 409).

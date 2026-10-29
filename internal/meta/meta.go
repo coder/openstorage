@@ -53,6 +53,11 @@ type Repo struct {
 	CreateState   CreateState
 }
 
+// OmittedDefaultBranch is the default branch a sync create stores when the
+// request names none. A GitHub sync later adopts the upstream HEAD in its
+// place (RepoUpstream.DefaultBranchOmitted, issue #599).
+const OmittedDefaultBranch = "main"
+
 // CreateState records whether a repo's create finished (issue #388). A
 // repeat POST /repos may answer 200 only for CreateStateComplete.
 type CreateState int
@@ -180,7 +185,8 @@ type Store interface {
 	// update is "a transactional compare-and-swap" against the value the
 	// caller read). won=false (no error) when the live row's default
 	// branch is no longer oldBranch — someone else changed it first;
-	// ErrNotFound when no live repo matches.
+	// ErrNotFound when no live repo matches. A won swap also clears the
+	// upstream's DefaultBranchOmitted: an explicit choice wins (#599).
 	UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, newBranch string) (won bool, err error)
 
 	// SoftDeleteRepo sets deleted_at and returns the affected repo.

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -512,10 +513,10 @@ func TestCommitPackValidation(t *testing.T) {
 			{"missing eof",
 				[]any{wctMeta("main", "m", []map[string]any{upsert("a", "id1")}, nil),
 					wctChunk("id1", []byte("x"), false)},
-				http.StatusBadRequest, "before eof"},
+				http.StatusPreconditionFailed, "before eof"},
 			{"upsert without chunks",
 				[]any{wctMeta("main", "m", []map[string]any{upsert("a", "id1")}, nil)},
-				http.StatusBadRequest, "no blob chunks"},
+				http.StatusPreconditionFailed, "no blob chunks"},
 			{"malformed base64",
 				[]any{wctMeta("main", "m", []map[string]any{upsert("a", "id1")}, nil),
 					map[string]any{"blob_chunk": map[string]any{"content_id": "id1", "data": "!!!", "eof": true}}},
@@ -537,11 +538,7 @@ func TestCommitPackValidation(t *testing.T) {
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, tc.frames...)))
-				wantStatus := "invalid"
-				if tc.wantCode == http.StatusNotFound {
-					wantStatus = "not_found"
-				}
-				env := wctRequireFail(t, resp, body, tc.wantCode, wantStatus)
+				env := wctRequireFail(t, resp, body, tc.wantCode, statusForHTTP(tc.wantCode))
 				if !strings.Contains(env.Result.Message, tc.wantMsg) {
 					t.Errorf("message %q does not mention %q", env.Result.Message, tc.wantMsg)
 				}
@@ -750,24 +747,18 @@ func TestDiffCommit(t *testing.T) {
 			return
 		}
 
-		t.Run("empty diff is an empty commit", func(t *testing.T) {
+		t.Run("empty diff is 412 no changes", func(t *testing.T) {
 			frames := wctLines(t,
 				wctMeta("main", "empty", nil, nil),
 				wctDiffChunk(nil, true),
 			)
 			resp, respBody := wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(frames))
-			env := wctRequireOK(t, resp, respBody)
-			if env.Result.OldSHA != diffTip {
-				t.Errorf("old_sha = %q, want %q", env.Result.OldSHA, diffTip)
+			env := wctRequireFail(t, resp, respBody, http.StatusPreconditionFailed, "precondition_failed")
+			if env.Result.Message != "no changes to commit" || env.Result.OldSHA != diffTip || env.Commit != nil {
+				t.Errorf("empty diff result = %s, want no changes to commit on %s", respBody, diffTip)
 			}
-			if env.Commit.BlobCount == nil || *env.Commit.BlobCount != 0 {
-				t.Errorf("blob_count = %v, want 0", env.Commit.BlobCount)
-			}
-			// Same tree as the parent: an empty commit.
-			var commits listCommitsResponse
-			wctReadJSON(t, e, "/api/v1/repos/commits?branch=main&limit=1", readTok, &commits)
-			if len(commits.Commits) != 1 || commits.Commits[0].SHA != env.Commit.CommitSHA {
-				t.Errorf("tip = %+v, want %q", commits.Commits, env.Commit.CommitSHA)
+			if tip := wctBranchTip(t, e, readTok, "main", false); tip != diffTip {
+				t.Errorf("tip = %q after an empty diff, want %q", tip, diffTip)
 			}
 		})
 
@@ -803,6 +794,109 @@ func TestDiffCommit(t *testing.T) {
 				t.Errorf("message %q does not mention base64", env.Result.Message)
 			}
 		})
+	})
+}
+
+// TestCommitWriteNoChanges (#595, spec 2026-10-28): commit-pack and
+// diff-commit answer 412 precondition_failed "no changes to commit" when the
+// new tree equals the base tree (or the empty tree on an unborn branch), and
+// a stream whose last file or diff has no eof chunk answers 412 too. Nothing
+// is published and no ref moves.
+func TestCommitWriteNoChanges(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		repo, writeTok, readTok := wctRepo(t, e)
+		upsert := func(path, id string) map[string]any {
+			return map[string]any{"path": path, "content_id": id, "operation": "upsert"}
+		}
+		post := func(route string, frames ...any) (*http.Response, []byte) {
+			t.Helper()
+			return wctPost(t, srv, "/api/v1/repos/"+route, writeTok, bytes.NewReader(wctLines(t, frames...)))
+		}
+		// requireNoMove asserts the failure and that every ref is unchanged.
+		requireNoMove := func(t *testing.T, wantCode int, wantMsg string, route string, frames ...any) {
+			t.Helper()
+			before := wmRefsSnapshot(t, e, repo.RepoID)
+			resp, body := post(route, frames...)
+			env := wctRequireFail(t, resp, body, wantCode, statusForHTTP(wantCode))
+			if !strings.Contains(env.Result.Message, wantMsg) || env.Commit != nil {
+				t.Fatalf("result = %s, want message %q and no commit", body, wantMsg)
+			}
+			if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
+				t.Fatalf("refs moved: %v -> %v", before, after)
+			}
+		}
+
+		t.Run("unborn branch without file operations", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no changes to commit", "commit-pack", wctMeta("main", "m", nil, nil))
+		})
+		t.Run("unborn branch deleting a missing path", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no changes to commit", "commit-pack",
+				wctMeta("main", "m", []map[string]any{{"path": "nope.txt", "content_id": "d", "operation": "delete"}}, nil))
+		})
+		t.Run("unborn branch empty diff", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no changes to commit", "diff-commit",
+				wctMeta("main", "m", nil, nil), wctDiffChunk(nil, true))
+		})
+		if t.Failed() {
+			return
+		}
+
+		resp, body := post("commit-pack", wctMeta("main", "c1", []map[string]any{upsert("a.txt", "ida")}, nil),
+			wctChunk("ida", []byte("a\n"), true))
+		c1 := wctRequireOK(t, resp, body)
+
+		t.Run("same content as the tip", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no changes to commit", "commit-pack",
+				wctMeta("main", "m", []map[string]any{upsert("a.txt", "ida")}, nil), wctChunk("ida", []byte("a\n"), true))
+		})
+		t.Run("no file operations", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no changes to commit", "commit-pack", wctMeta("main", "m", nil, nil))
+		})
+		t.Run("deletes only missing paths", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no changes to commit", "commit-pack",
+				wctMeta("main", "m", []map[string]any{{"path": "nope.txt", "content_id": "d", "operation": "delete"}}, nil))
+		})
+		t.Run("new branch from base_branch without changes", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no changes to commit", "commit-pack",
+				wctMeta("side", "m", nil, map[string]any{"base_branch": "main"}))
+		})
+		t.Run("empty diff", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no changes to commit", "diff-commit",
+				wctMeta("main", "m", nil, nil), wctDiffChunk(nil, true))
+		})
+		t.Run("file without its eof chunk", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "before eof", "commit-pack",
+				wctMeta("main", "m", []map[string]any{upsert("b.txt", "idb")}, nil), wctChunk("idb", []byte("b"), false))
+		})
+		t.Run("file without chunks", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "no blob chunks", "commit-pack",
+				wctMeta("main", "m", []map[string]any{upsert("b.txt", "idb")}, nil))
+		})
+		t.Run("diff without its eof chunk", func(t *testing.T) {
+			requireNoMove(t, http.StatusPreconditionFailed, "before diff_chunk eof", "diff-commit",
+				wctMeta("main", "m", nil, nil), wctDiffChunk([]byte("diff --git a/x b/x\n"), false))
+		})
+		// The NDJSON syntax and validation errors keep 400 (spec: "The NDJSON
+		// stream was malformed or metadata validation failed").
+		t.Run("diff-commit without diff chunks stays 400", func(t *testing.T) {
+			requireNoMove(t, http.StatusBadRequest, "diff content missing", "diff-commit", wctMeta("main", "m", nil, nil))
+		})
+
+		// Real changes still commit: an upsert that changes content, and a
+		// delete of an existing path.
+		resp, body = post("commit-pack", wctMeta("main", "c2", []map[string]any{upsert("a.txt", "ida")}, nil),
+			wctChunk("ida", []byte("changed\n"), true))
+		c2 := wctRequireOK(t, resp, body)
+		if c2.Result.OldSHA != c1.Commit.CommitSHA {
+			t.Fatalf("c2 old_sha = %q, want %q", c2.Result.OldSHA, c1.Commit.CommitSHA)
+		}
+		resp, body = post("commit-pack",
+			wctMeta("main", "c3", []map[string]any{{"path": "a.txt", "content_id": "d", "operation": "delete"}}, nil))
+		c3 := wctRequireOK(t, resp, body)
+		if tip := wctBranchTip(t, e, readTok, "main", false); tip != c3.Commit.CommitSHA {
+			t.Fatalf("tip = %q, want %q", tip, c3.Commit.CommitSHA)
+		}
 	})
 }
 
@@ -1054,6 +1148,122 @@ func TestCommitPackQuota(t *testing.T) {
 		after, err := blob.StorageUsageBytes(context.Background(), e.blobStore, repo.RepoID)
 		if err != nil || after != usage {
 			t.Fatalf("denied write changed usage: %d -> %d (err %v)", usage, after, err)
+		}
+	})
+}
+
+// TestWriteReservationCapAnswers429 (#594): when the repository's active
+// pack-reservation rows are at the ledger's cap, commit-pack, diff-commit,
+// restore-commit and merge answer the retryable 429 with the upstream
+// RefUpdateResult status "unavailable", Retry-After and RateLimit, and
+// leave every ref alone. These handlers used to send status "busy", which
+// statusForHTTP(429) rejects, so the assert panicked into a 500.
+func TestWriteReservationCapAnswers429(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		ctx := context.Background()
+		plain := wctServer(t, e)
+		repo, writeTok, _ := wctRepo(t, e)
+		commit := func(branch, msg, path string, extra map[string]any) wcEnvelope {
+			t.Helper()
+			body := wctLines(t,
+				wctMeta(branch, msg, []map[string]any{
+					{"path": path, "content_id": "id-" + path, "operation": "upsert"},
+				}, extra),
+				wctChunk("id-"+path, []byte(msg+"\n"), true),
+			)
+			resp, respBody := wctPost(t, plain, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
+			return wctRequireOK(t, resp, respBody)
+		}
+		c1 := commit("main", "c1", "a.txt", nil)
+		commit("feature", "feat", "f.txt", map[string]any{"base_branch": "main"})
+		commit("main", "c2", "m.txt", map[string]any{"expected_head_sha": c1.Commit.CommitSHA})
+
+		// Fill the active-row cap (ref.maxActiveReservations, 10,000) with
+		// one admitted batch, then prove it is full: a denied probe
+		// inserts no row.
+		group := blob.QuotaRepoGroup(repo.RepoID)
+		fill := make([]ref.Pack, 10_000)
+		for i := range fill {
+			fill[i] = ref.Pack{Key: blob.PackKey(repo.RepoID, fmt.Sprintf("fill%06d", i)), Size: 1}
+		}
+		dec, err := e.refStore.ReservePackBytes(ctx, group, fill, ref.NewReservationOwner(), 0, ref.ReserveNoFloorGen, math.MaxInt64, time.Hour)
+		if err != nil || !dec.OK {
+			t.Fatalf("fill ReservePackBytes = (%+v, %v), want admitted", dec, err)
+		}
+		probe := []ref.Pack{{Key: blob.PackKey(repo.RepoID, "probe"), Size: 1}}
+		dec, err = e.refStore.ReservePackBytes(ctx, group, probe, ref.NewReservationOwner(), 0, ref.ReserveNoFloorGen, math.MaxInt64, time.Hour)
+		if err != nil || !dec.KeyCapExceeded {
+			t.Fatalf("probe ReservePackBytes = (%+v, %v), want KeyCapExceeded", dec, err)
+		}
+
+		// A quota-enforcing server: only the quota path reserves rows.
+		s := &server{
+			store:              e.store,
+			httpBaseURL:        testHTTPBaseURL,
+			logger:             discardLogger(),
+			refStore:           e.refStore,
+			blobStore:          e.blobStore,
+			cacheDir:           e.cacheDir,
+			packQuotaBytes:     1 << 40,
+			packReservationTTL: time.Hour,
+		}
+		mux := http.NewServeMux()
+		verifier := auth.NewVerifier(e.store)
+		registerWriteCommitRoutes(mux, s, verifier, "", nil)
+		s.registerWriteMergeRoutes(mux, verifier, "", nil)
+		srv := httptest.NewServer(withProblemInstance(recoverPanics(discardLogger())(mux)))
+		t.Cleanup(srv.Close)
+
+		patch := "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n"
+		restore, err := json.Marshal(map[string]any{"metadata": map[string]any{
+			"target_branch": "main", "target_commit_sha": c1.Commit.CommitSHA, "author": wctAuthor,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases := []struct {
+			name string
+			do   func() (*http.Response, []byte)
+		}{
+			{"commit-pack", func() (*http.Response, []byte) {
+				body := wctLines(t,
+					wctMeta("main", "c3", []map[string]any{
+						{"path": "b.txt", "content_id": "id-b", "operation": "upsert"},
+					}, nil),
+					wctChunk("id-b", []byte("b\n"), true),
+				)
+				return wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
+			}},
+			{"diff-commit", func() (*http.Response, []byte) {
+				body := wctLines(t, wctMeta("main", "d", nil, nil), wctDiffChunk([]byte(patch), true))
+				return wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(body))
+			}},
+			{"restore-commit", func() (*http.Response, []byte) {
+				return wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(restore))
+			}},
+			{"merge", func() (*http.Response, []byte) {
+				return wmDo(t, srv, http.MethodPost, "/api/v1/repos/merge", writeTok,
+					wmMergeBody("feature", "main", "merge", map[string]any{"author": wctAuthor}))
+			}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				before := wmRefsSnapshot(t, e, repo.RepoID)
+				resp, body := tc.do()
+				env := wctRequireFail(t, resp, body, http.StatusTooManyRequests, "unavailable")
+				if env.Result.Branch != "main" || !strings.Contains(env.Result.Message, "retry later") {
+					t.Fatalf("429 result = %+v, want branch main and a retry message", env.Result)
+				}
+				if got := resp.Header.Get("Retry-After"); got != "10" {
+					t.Fatalf("Retry-After = %q, want 10", got)
+				}
+				if got := resp.Header.Get("RateLimit"); got != `"default";r=0;t=10` {
+					t.Fatalf("RateLimit = %q, want the default service limit with t=10", got)
+				}
+				if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
+					t.Fatalf("denied write moved refs: %v -> %v", before, after)
+				}
+			})
 		}
 	})
 }
