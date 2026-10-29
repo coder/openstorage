@@ -761,7 +761,7 @@ type listFilesResponse struct {
 }
 
 // handleListFiles implements GET /api/v1/repos/files: ls-tree at the
-// resolved ref (recursive flag honored), keyset cursor = last path.
+// resolved ref (recursive unless recursive=false), keyset cursor = last path.
 // `paths` mirrors the page's plain blob entries (openapi list_files).
 func (s *server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
@@ -774,10 +774,13 @@ func (s *server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	recursive, err := coreBoolParam(q, "recursive")
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	// Upstream spec 40e43e00 (#598): no recursive (or an empty one) is true.
+	recursive := true
+	if q.Get("recursive") != "" {
+		if recursive, err = coreBoolParam(q, "recursive"); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	after := ""
 	if cursor := q.Get("cursor"); cursor != "" {
