@@ -28,7 +28,7 @@ The REST API (`/api/v1/...`) and its `/api/repos/{repo_name}` alias layer. `New`
 - `validBranchName` rejects names over 255 bytes, `..`, `.lock` components, and characters outside a conservative set [handlers.go:validBranchName]
 - Ref policies deny `no-push`, non-fast-forward under `no-force-push`, server-created commits under `verify-sig`, and unknown ops (fail closed) [handlers_write_refs.go:wrefPolicyCheck] [handlers_write_commit.go:wcCheckRefPolicy]
 - Write-commit paths reject `.git` components, absolute or dot paths, and control bytes; a stale `expected_head_sha` is 412 [handlers_write_commit.go:wcValidPath] [handlers_write_commit.go:wcPlanCommit]
-- Merges need a git that supports `merge-tree --write-tree` and refuse unrelated histories unless allowed; a stale target SHA is 409 [handlers_write_merge.go:wmCheckGitVersion] [handlers_write_merge.go:handleMerge]
+- Merges need git >= 2.38 and refuse unrelated histories unless allowed; a stale target SHA is 409 [handlers_write_merge.go:wmCheckGitVersion] [handlers_write_merge.go:handleMerge]
 - Fork and copy check the source token for `git:read` and the pack size against quota before creating any row [handlers_fork.go:handleForkRepo]
 - `publishPack` denies over-quota packs before upload and fails closed on a second stale usage floor [publish.go:publishPack]
 - `validUpstreamHost` rejects userinfo, query, fragment, and non-http(s) schemes [handlers_sync.go:validUpstreamHost]

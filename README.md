@@ -25,7 +25,7 @@ of replicas on Postgres and S3. The code.storage SDKs work against it, with
 
 ## Install
 
-Install a release binary with mise, or build from source with Go at or above the `go` directive in `go.mod`:
+Install a release binary with mise, or build from source with Go 1.27.3 or newer:
 
 ```sh
 # Install a release binary:
