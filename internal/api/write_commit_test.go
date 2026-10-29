@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -594,84 +595,110 @@ func TestCommitPackValidation(t *testing.T) {
 // TestCommitPackCASRace loses the publish-time CAS deterministically: the
 // handler snapshots the ref BEFORE materializing the cache (fresh repo -> no
 // cache dir yet), so once the cache dir appears the snapshot is taken and
-// the test moves the ref out from under it before releasing the blob frames.
+// the test moves the ref out from under it before releasing the content
+// frames. commit-pack and diff-commit answer upstream's lost-CAS 409 (spec
+// 2026-10-28, #596): result.status "failed", and `commit` plus
+// result.new_sha name the commit the branch did not get.
 func TestCommitPackCASRace(t *testing.T) {
-	runBackends(t, func(t *testing.T, e *testEnv) {
-		srv := wctServer(t, e)
-		repo, writeTok, _ := wctRepo(t, e)
+	patch := "diff --git a/b.txt b/b.txt\nnew file mode 100644\n--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1 @@\n+b\n"
+	for _, tc := range []struct {
+		route   string
+		files   []map[string]any
+		content any
+	}{
+		{"commit-pack", []map[string]any{{"path": "b.txt", "content_id": "id-b", "operation": "upsert"}}, wctChunk("id-b", []byte("b\n"), true)},
+		{"diff-commit", nil, wctDiffChunk([]byte(patch), true)},
+	} {
+		t.Run(tc.route, func(t *testing.T) {
+			runBackends(t, func(t *testing.T, e *testEnv) {
+				srv := wctServer(t, e)
+				repo, writeTok, readTok := wctRepo(t, e)
 
-		// Seed main=c1 with c2 already registered in the pack store (the
-		// concurrent "winner" the test will move the ref to) — without
-		// materializing the cache.
-		dir := t.TempDir()
-		coreGit(t, dir, "init", "-q", "-b", "main", ".")
-		coreWriteFile(t, dir, "a.txt", "one\n")
-		coreGit(t, dir, "add", ".")
-		coreGit(t, dir, "commit", "-q", "-m", "c1")
-		c1 := coreRevParse(t, dir, "HEAD")
-		coreWriteFile(t, dir, "a.txt", "two\n")
-		coreGit(t, dir, "add", ".")
-		coreGit(t, dir, "commit", "-q", "-m", "c2")
-		c2 := coreRevParse(t, dir, "HEAD")
-		coreSeedStores(t, e, repo.RepoID, dir, map[string]string{"refs/heads/main": c1})
+				// Seed main=c1 with c2 already registered in the pack store (the
+				// concurrent "winner" the test will move the ref to) — without
+				// materializing the cache.
+				dir := t.TempDir()
+				coreGit(t, dir, "init", "-q", "-b", "main", ".")
+				coreWriteFile(t, dir, "a.txt", "one\n")
+				coreGit(t, dir, "add", ".")
+				coreGit(t, dir, "commit", "-q", "-m", "c1")
+				c1 := coreRevParse(t, dir, "HEAD")
+				coreWriteFile(t, dir, "a.txt", "two\n")
+				coreGit(t, dir, "add", ".")
+				coreGit(t, dir, "commit", "-q", "-m", "c2")
+				c2 := coreRevParse(t, dir, "HEAD")
+				coreSeedStores(t, e, repo.RepoID, dir, map[string]string{"refs/heads/main": c1})
 
-		cacheMarker := filepath.Join(e.cacheDir, repo.RepoID+".git", "HEAD")
-		if _, err := os.Stat(cacheMarker); err == nil {
-			t.Fatal("test bug: cache repo already materialized")
-		}
-
-		pr, pw := io.Pipe()
-		go func() {
-			defer pw.Close()
-			_, _ = pw.Write(wctLines(t, wctMeta("main", "raced", []map[string]any{
-				{"path": "b.txt", "content_id": "id-b", "operation": "upsert"},
-			}, nil)))
-			// The handler lists refs (snapshotting old=c1) strictly before
-			// materializing; wait for the cache repo to appear, then move
-			// the ref to c2 before releasing the blob frame.
-			deadline := time.Now().Add(10 * time.Second)
-			for {
+				cacheMarker := filepath.Join(e.cacheDir, repo.RepoID+".git", "HEAD")
 				if _, err := os.Stat(cacheMarker); err == nil {
-					break
+					t.Fatal("test bug: cache repo already materialized")
 				}
-				if time.Now().After(deadline) {
-					_ = pw.CloseWithError(fmt.Errorf("cache repo never materialized"))
-					return
+
+				pr, pw := io.Pipe()
+				go func() {
+					defer pw.Close()
+					_, _ = pw.Write(wctLines(t, wctMeta("main", "raced", tc.files, nil)))
+					// The handler lists refs (snapshotting old=c1) strictly before
+					// materializing; wait for the cache repo to appear, then move
+					// the ref to c2 before releasing the content frame.
+					deadline := time.Now().Add(10 * time.Second)
+					for {
+						if _, err := os.Stat(cacheMarker); err == nil {
+							break
+						}
+						if time.Now().After(deadline) {
+							_ = pw.CloseWithError(fmt.Errorf("cache repo never materialized"))
+							return
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+					won, err := e.refStore.CASRef(context.Background(), repo.RepoID, "refs/heads/main", c1, c2)
+					if err != nil || !won {
+						_ = pw.CloseWithError(fmt.Errorf("concurrent move failed: won=%v err=%v", won, err))
+						return
+					}
+					_, _ = pw.Write(wctLines(t, tc.content))
+				}()
+
+				req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/repos/"+tc.route, pr)
+				if err != nil {
+					t.Fatal(err)
 				}
-				time.Sleep(5 * time.Millisecond)
-			}
-			won, err := e.refStore.CASRef(context.Background(), repo.RepoID, "refs/heads/main", c1, c2)
-			if err != nil || !won {
-				_ = pw.CloseWithError(fmt.Errorf("concurrent move failed: won=%v err=%v", won, err))
-				return
-			}
-			_, _ = pw.Write(wctLines(t, wctChunk("id-b", []byte("b\n"), true)))
-		}()
+				req.Header.Set("Authorization", "Bearer "+writeTok)
+				req.Header.Set("Content-Type", "application/x-ndjson")
+				resp, err := srv.Client().Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+				env := wctRequireFail(t, resp, body, http.StatusConflict, "failed")
+				if env.Result.OldSHA != c1 || env.Result.Branch != "main" {
+					t.Errorf("lost-CAS result = %+v, want branch main and the stale snapshot %q", env.Result, c1)
+				}
+				cm := env.Commit
+				if cm == nil || !ref.ValidSHA(cm.CommitSHA) || cm.CommitSHA != env.Result.NewSHA || cm.CommitSHA == c2 ||
+					!ref.ValidSHA(cm.TreeSHA) || cm.TargetBranch != "main" || cm.PackBytes <= 0 || cm.BlobCount == nil || *cm.BlobCount != 1 {
+					t.Fatalf("lost-CAS commit = %s, want the written commit in commit and result.new_sha", body)
+				}
 
-		req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/repos/commit-pack", pr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Authorization", "Bearer "+writeTok)
-		req.Header.Set("Content-Type", "application/x-ndjson")
-		resp, err := srv.Client().Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		env := wctRequireFail(t, resp, body, http.StatusConflict, "conflict")
-		if env.Result.OldSHA != c1 {
-			t.Errorf("conflict old_sha = %q, want the stale snapshot %q", env.Result.OldSHA, c1)
-		}
-
-		// The loser's ref must be untouched and its pack merely
-		// unreferenced: main still points at the winner.
-		tips, err := e.refStore.ListRefs(context.Background(), repo.RepoID)
-		if err != nil || tips["refs/heads/main"] != c2 {
-			t.Errorf("main = %q (err %v), want winner %q", tips["refs/heads/main"], err, c2)
-		}
-	})
+				// The loser's ref must be untouched and its pack merely
+				// unreferenced: main still points at the winner, and the
+				// reported commit is the loser's (parent c1, with b.txt).
+				tips, err := e.refStore.ListRefs(context.Background(), repo.RepoID)
+				if err != nil || tips["refs/heads/main"] != c2 {
+					t.Errorf("main = %q (err %v), want winner %q", tips["refs/heads/main"], err, c2)
+				}
+				var got struct {
+					Commit commitInfo `json:"commit"`
+				}
+				wctReadJSON(t, e, "/api/v1/repos/commit?ref="+cm.CommitSHA, readTok, &got)
+				if !slices.Equal(got.Commit.ParentSHAs, []string{c1}) || got.Commit.Message != "raced" {
+					t.Errorf("reported commit %s = %+v, want message raced on parent %s", cm.CommitSHA, got.Commit, c1)
+				}
+			})
+		})
+	}
 }
 
 func TestDiffCommit(t *testing.T) {

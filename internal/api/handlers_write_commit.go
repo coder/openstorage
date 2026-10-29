@@ -127,6 +127,18 @@ func wcFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA str
 	}})
 }
 
+// wcFailLostCAS writes upstream's 409 for a commit that storage wrote but
+// the branch did not get (spec 2026-10-28, #596): result.status "failed",
+// the commit in `commit` and result.new_sha. It is the one 409 whose
+// status is not statusForHTTP(409).
+func wcFailLostCAS(w http.ResponseWriter, info *wcCommitInfo, msg, oldSHA string) {
+	assertf(info != nil && ref.ValidSHA(info.CommitSHA) && ref.ValidSHA(info.TreeSHA), "wcFailLostCAS: incomplete commit %+v", info)
+	assertf(info.TargetBranch != "" && msg != "", "wcFailLostCAS: empty branch or message")
+	writeJSON(w, http.StatusConflict, wcEnvelope{Commit: info, Result: wcResult{
+		Branch: info.TargetBranch, OldSHA: oldSHA, NewSHA: info.CommitSHA, Success: false, Status: "failed", Message: msg,
+	}})
+}
+
 // wcInternal is internalErr's envelope-flavored twin: log the real error,
 // leak nothing (docs/reference/http-api.md: clients branch on codes, bodies stay generic).
 func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
@@ -805,8 +817,12 @@ func (s *server) wcPublish(ctx context.Context, sc *wcScratch, repoID string, pl
 }
 
 // wcFinishCommit runs the shared tail of all three handlers: publish, map
-// the CAS outcome, and write the 200 envelope.
-func (s *server) wcFinishCommit(w http.ResponseWriter, r *http.Request, sc *wcScratch, repoID string, plan *wcPlan, md *wcMetadata, tree, commit string, blobCount *int) {
+// the CAS outcome, and write the 200 envelope. lostCASFailed selects
+// upstream's lost-CAS 409 for commit-pack and diff-commit (spec
+// 2026-10-28, #596): status "failed" with the written commit. The spec
+// documents it for those two routes only, so restore-commit keeps
+// "conflict".
+func (s *server) wcFinishCommit(w http.ResponseWriter, r *http.Request, sc *wcScratch, repoID string, plan *wcPlan, md *wcMetadata, tree, commit string, blobCount *int, lostCASFailed bool) {
 	packBytes, won, err := s.wcPublish(r.Context(), sc, repoID, plan, commit)
 	if errors.Is(err, errPackQuotaExceeded) {
 		// md.TargetBranch is the request's bare branch name — the failure
@@ -825,22 +841,27 @@ func (s *server) wcFinishCommit(w http.ResponseWriter, r *http.Request, sc *wcSc
 		s.wcInternal(w, r, "publish commit", err)
 		return
 	}
+	info := &wcCommitInfo{
+		CommitSHA:    commit,
+		TreeSHA:      tree,
+		TargetBranch: md.TargetBranch,
+		PackBytes:    packBytes,
+		BlobCount:    blobCount,
+	}
 	if !won {
 		// Guard already validated (or absent): losing the CAS here means a
 		// concurrent writer moved the ref in the race window -> 409
 		// (decision #2).
-		wcFail(w, http.StatusConflict, "conflict",
-			"ref "+plan.refName+" moved concurrently", md.TargetBranch, plan.oldSHA)
+		msg := "ref " + plan.refName + " moved concurrently"
+		if lostCASFailed {
+			wcFailLostCAS(w, info, msg, plan.oldSHA)
+			return
+		}
+		wcFail(w, http.StatusConflict, "conflict", msg, md.TargetBranch, plan.oldSHA)
 		return
 	}
 	writeJSON(w, http.StatusOK, wcEnvelope{
-		Commit: &wcCommitInfo{
-			CommitSHA:    commit,
-			TreeSHA:      tree,
-			TargetBranch: md.TargetBranch,
-			PackBytes:    packBytes,
-			BlobCount:    blobCount,
-		},
+		Commit: info,
 		Result: wcResult{
 			Branch:  md.TargetBranch,
 			OldSHA:  plan.oldSHA,
@@ -931,7 +952,7 @@ func (s *server) handleCommitPack(w http.ResponseWriter, r *http.Request) {
 		s.wcInternal(w, r, "create commit", err)
 		return
 	}
-	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, tree, commit, &blobCount)
+	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, tree, commit, &blobCount, true)
 }
 
 // wcRejectNoChanges writes upstream's 412 "no changes to commit" (spec
@@ -1186,7 +1207,7 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 		s.wcInternal(w, r, "create commit", err)
 		return
 	}
-	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, treeSHA, commit, &blobCount)
+	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, treeSHA, commit, &blobCount, true)
 }
 
 // wcSpoolDiff reads diff_chunk frames until eof:true, appending decoded
@@ -1359,7 +1380,7 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		s.wcInternal(w, r, "create commit", err)
 		return
 	}
-	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, tree, commit, nil)
+	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, tree, commit, nil, false)
 }
 
 // wcRestoreMoves enforces the spec's restore preconditions for the base_ref
