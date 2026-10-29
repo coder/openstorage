@@ -197,7 +197,6 @@ the [archived phase notes](../archive/phases/)):
 | `POST /repos` `upstream.host`: a bare hostname | Also accepts an `http(s)://` base URL, as `base_repo.upstream_host` does | Self-hosted forges on plain HTTP or a sub-path; the same validation and egress policy apply |
 | `Deprecation` header on the deprecated `pull-upstream` and `base` routes: the spec defines none. Upstream's changelog of 2026-10-07 says every response carries one but gives no value | `Deprecation: @1791331200` (RFC 9745 date, 2026-10-07T00:00:00Z) on every response of the four routes, errors included ([details](../reference/http-api.md#deprecation-header)). No `Link` or `Sunset` | Upstream's exact value is undocumented, so open.storage uses the standard form |
 | `POST /repos` with both `upstream` and `base_repo`: "do not set" both, no documented error | 400 | Ambiguous request; failing loudly beats guessing which form wins |
-| `POST /repos` `base_repo` copy: default branch defaults to `main` when omitted | Without a top-level `default_branch`, a copy takes the source's default branch name (fork behavior) | A copy runs the fork implementation |
 | `POST /repos` without `default_branch`: a sync from GitHub takes the GitHub repository's default branch (spec `40e43e00`, 2026-10-28) | PostgreSQL and SQLite: the repository starts on `main`, and the first successful sync adopts the upstream `HEAD` branch before it sends `repo.sync.succeeded`. S3-WAL: the repository keeps `main` | The create makes no network call ([#599](https://github.com/coder/openstorage/issues/599)). S3-WAL metadata v2 is frozen and cannot store the "branch omitted" flag ([#603](https://github.com/coder/openstorage/issues/603), trigger: the next S3-WAL metadata format change) |
 | `POST /repos` is idempotent on the name: `200` for any existing name unless its upstream differs (spec 2026-10-07) | A finished repo answers `200` to a matching repeat create: a sync create with the same upstream and `forward_pushes`, or a plain, copy or fork create of a repo without an upstream. A different upstream is `409`, as upstream documents, and so is a create form that does not match the repo (sync onto a plain repo, plain onto a synced repo). Repos created before create tracking (on S3-WAL, every repo created by v0.18.0 or earlier) answer `409` to every repeat. While a copy or fork create is still running, plain, copy and fork creates of the name are `503` with `Retry-After`. A pending sync create is finished by a matching sync create with `git:write` (`200`); other forms are `409` ([Repeat creates](../reference/http-api.md#repository-lifecycle-repowrite--orgread)). A name a deleted repo holds is `404` | A `200` names a repo only after its create finished, so it never names a repo that the failing create then deletes ([#388](https://github.com/coder/openstorage/issues/388)). A form mismatch is `409` because a `200` would hide that the request was not applied. Older repos store no create state (#335 for S3-WAL) |
 | `GET`/`POST /api/repos` (bare collection routes) | `/api/v1/repos` only; named-repo aliases exist for repo-scoped routes, not org-scoped collections | The alias layer covers the styles SDKs use |
@@ -241,19 +240,33 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-28 (upstream
-  `Last-Modified` 2026-10-27 21:45:58 GMT), SHA-256
-  `b598ce96ab0f7bef25f9efd1e32a9b201e781dabab894fc7f53cb8b4e430ec70`. Against the
-  previous snapshot (`c494c01b`, which added the `ref_guard_failed` code,
-  [#568](https://github.com/coder/openstorage/issues/568)) it changes only two
-  descriptions: commit list entries and `files/metadata` commits carry the subject line
-  of the message. Both follow it
-  ([#570](https://github.com/coder/openstorage/issues/570)). At 00:09 UTC on
-  2026-10-28
-  [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served an
-  older snapshot (`10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356`),
-  so both changes are documented in the docs only. A spec that the cluster serves does
-  not prove how the cluster behaves either.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-29 (upstream
+  `Last-Modified` 2026-10-28 22:23:55 GMT), SHA-256
+  `40e43e00b8a35664099d41e7c4b93a02b6fe48b29aa4822b82b4f8ba9427ce13`.
+  [The cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) served the
+  same bytes at 00:45 UTC on 2026-10-29. The cluster never served the previous
+  snapshot (`b598ce96`, subject-line commit messages,
+  [#570](https://github.com/coder/openstorage/issues/570)) in any check: it served
+  `10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356` at 00:09 UTC on
+  2026-10-28, and `40e43e00` at the next check. A spec that the cluster serves does not
+  prove how the cluster behaves. Against `b598ce96`, the snapshot changes:
+  - `files` lists recursively when the call sends no `recursive`
+    ([#598](https://github.com/coder/openstorage/issues/598));
+  - `commit-pack` and `diff-commit` answer `412` `no changes to commit`, and `412` for a
+    malformed stream, such as a file without its final `eof` chunk. open.storage does
+    both ([#595](https://github.com/coder/openstorage/issues/595)). Its other malformed
+    frames stay `400` ([streaming protocols](streaming-commit-protocols.md)). They answer
+    `409` `failed` with the unpublished commit when the ref update is lost
+    ([#596](https://github.com/coder/openstorage/issues/596)). `commit-pack` answers
+    `413` when the decoded file contents pass 262,144,000 bytes
+    ([#597](https://github.com/coder/openstorage/issues/597));
+  - `RefUpdateResult.status` gets a closed enum without `busy`, which open.storage no
+    longer sends ([#594](https://github.com/coder/openstorage/issues/594));
+  - an omitted `default_branch` follows the source of a copy, as open.storage already
+    did, and the GitHub repository of a sync
+    ([#599](https://github.com/coder/openstorage/issues/599), with an S3-WAL deviation
+    above);
+  - `archive` no longer requires `ref`, which open.storage already treats as optional.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled
