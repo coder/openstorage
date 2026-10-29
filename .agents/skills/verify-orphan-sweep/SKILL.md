@@ -32,7 +32,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX")
 
 - Needs Go (the `go.mod` version), Java 11 or newer, and `curl`. The first run downloads `tla2tools.jar` 1.7.4 (sha256-pinned) into `${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla`. Set `JAVA`, `GO`, or `OPENSTORAGE_TLA_CACHE` to override.
 - It takes about 3 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`).
-- `--out` keeps every TLC output, the generated configs, and trace summaries. Without it, check.sh makes a temporary directory and prints its path.
+- `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path.
 - `--only <cfg>` runs one config, for example `--only NoTiming.cfg`. It is for quick iteration. Finish with a full run.
 
 A clean run ends like this:
@@ -112,7 +112,7 @@ When check.sh says STALE, or when you change covered code on purpose:
 2. For each change, decide: no effect on what the model describes, the model no longer describes the code (a step split in two, a new branch, a moved check, a guard that became conditional, a new path that writes the same keys or rows), or the promise changed on purpose (cite the doc comment, test, or ADR that says so). The facts check call order, not conditions, so a guard wrapped in a new `if` can keep its fact TRUE: read every changed branch around a guard.
 3. Update `model/PackSweep.tla` from the code, not from the result. Keep one indivisible call as one action. If a fact's guard moved or was renamed, update `facts/facts.go` too.
 4. Rerun check.sh. If it passes, break the new code once in a scratch edit (remove the new check, or reorder the new step) and confirm that check.sh fails. Then drop the scratch edit.
-5. Run `check.sh --record`. It rewrites `model/fingerprints.txt` and the sync commit below. Run it only after steps 1 to 4. It refuses when a property fails, a fact is FALSE, a probe passes, `--only` is set, or a covered file has uncommitted changes. It records the merge base with `origin/main` when the covered files match it there, so a squash merge does not orphan the sync commit.
+5. Run `check.sh --record`. It rewrites `model/fingerprints.txt` and the sync commit below. Run it only after steps 1 to 4. It refuses when a property fails, a fact is FALSE, a probe passes, `--only` is set, a covered file has uncommitted changes, or SKILL.md does not have exactly one `Sync commit:` line. It records the merge base with `origin/main` when the covered files match it there, so a squash merge does not orphan the sync commit.
 
 ## Scope
 

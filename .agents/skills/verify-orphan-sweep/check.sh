@@ -62,6 +62,8 @@ if [ -z "$out" ]; then
   out=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX") || exit 3
 else
   mkdir -p "$out" || exit 3
+  # A reused directory would keep an old config's trace next to a new PASS.
+  [ -z "$(ls -A "$out")" ] || { echo "check.sh: --out $out is not empty: use a new directory for every run" >&2; exit 3; }
 fi
 out=$(cd "$out" && pwd -P)
 
@@ -209,6 +211,9 @@ if [ "$record" = 1 ]; then
   elif ! git -C "$repo" diff --quiet HEAD -- $files; then
     echo "check.sh: --record refused: commit the covered files first (the fingerprints must match a commit)" >&2; exit 3
   fi
+  # shellcheck disable=SC2016 # the backticks are literal Markdown
+  [ "$(grep -c '^Sync commit: `[0-9a-f]*`' "$skill_dir/SKILL.md")" = 1 ] ||
+    die "--record refused: SKILL.md must have exactly one line that starts with Sync commit: \`<sha>\`"
   # The sync commit must survive a squash merge: use the merge base with
   # main when the covered files are the same there, else HEAD with a warning.
   head=$(git -C "$repo" rev-parse HEAD)
@@ -224,6 +229,7 @@ if [ "$record" = 1 ]; then
     echo "# check.sh --record rewrites this file; SKILL.md holds the sync commit."
     cat "$out/fingerprints.now"; } >"$model/fingerprints.txt"
   sed -i.bak "s/^Sync commit: \`[0-9a-f]*\`/Sync commit: \`$head\`/" "$skill_dir/SKILL.md" && rm -f "$skill_dir/SKILL.md.bak"
+  grep -q "^Sync commit: \`$head\`" "$skill_dir/SKILL.md" || die "could not write the sync commit into SKILL.md"
   echo "== Recorded fingerprints and sync commit $head"
   stale=0
 fi

@@ -27,6 +27,18 @@ die() { printf 'osv: %s\n' "$*" >&2; exit 1; }
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# private_dir <dir>: refuse a directory that another local user could change.
+# It must be owned by the current user and not writable by group or others,
+# because env and every drive command source <run>/work/state.env.
+private_dir() {
+	local om uid mode
+	om=$(stat -c '%u %a' "$1" 2>/dev/null || stat -f '%u %Lp' "$1" 2>/dev/null) || die "cannot stat $1"
+	uid=${om%% *} mode=${om##* }
+	[[ $uid == "$(id -u)" ]] || die "$1 is owned by uid $uid, not by you: refusing to use it"
+	((8#$mode & 8#022)) && die "$1 is writable by group or others (mode $mode): refusing to use it"
+	return 0
+}
+
 # run_paths <run>: resolve RUN/WORK/EVID for an existing run dir.
 run_paths() {
 	[[ $# -ge 1 && -n $1 ]] || die "missing <run> directory argument"
@@ -34,6 +46,8 @@ run_paths() {
 	WORK=$RUN/work
 	EVID=$RUN/evidence
 	BIN=$WORK/bin/openstorage
+	private_dir "$RUN"
+	[[ ! -e $WORK ]] || private_dir "$WORK"
 	[[ -f $RUN/.osv-run ]] || die "$RUN has no .osv-run marker: it was not created by 'osv.sh launch'"
 }
 
@@ -48,6 +62,9 @@ load_state() {
 
 check_label() {
 	[[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || die "label '$1' must match [A-Za-z0-9._-]+ (it names evidence files)"
+	if [[ -s $EVID/log.tsv ]] && cut -f2 "$EVID/log.tsv" | grep -qxF -- "$1"; then
+		die "label '$1' is already used in $EVID/log.tsv: give every api, git, and eq call its own label"
+	fi
 }
 
 # record <label> <kind> <what> <token> <result> <expect> <verdict>: one row in evidence/log.tsv.
@@ -102,6 +119,9 @@ cmd_launch() {
 	[[ ! -e $RUN || -z $(ls -A "$RUN") ]] || die "run dir $RUN is not empty: use a fresh directory for every run"
 	for tool in go git curl python3; do command -v "$tool" >/dev/null || die "$tool is not on PATH"; done
 	mkdir -p "$RUN"
+	chmod 700 "$RUN" || die "cannot chmod 700 $RUN"
+	private_dir "$RUN"
+	[[ -z $(ls -A "$RUN") ]] || die "run dir $RUN changed while launch prepared it: use a fresh directory"
 	WORK=$RUN/work EVID=$RUN/evidence BIN=$RUN/work/bin/openstorage
 	: >"$RUN/.osv-run"
 	mkdir -p "$WORK/bin" "$WORK/keys" "$WORK/tokens" "$WORK/home" "$WORK/tmp" "$EVID"
@@ -324,6 +344,9 @@ cmd_git() {
 		export GIT_CONFIG_KEY_3=credential.helper GIT_CONFIG_VALUE_3=
 		export GIT_CONFIG_KEY_4=advice.detachedHead GIT_CONFIG_VALUE_4=false
 		export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
+		# askpass.sh matches git's English "Username"/"Password" prompts, and
+		# the recipes grep git's English messages.
+		export LC_ALL=C
 		cd "$WORK"
 		exec git "$@"
 	) >"$WORK/tmp/git.out" 2>&1 || rc=$?

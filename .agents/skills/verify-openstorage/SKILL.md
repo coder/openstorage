@@ -13,7 +13,7 @@ Requirements:
 
 - bash on Linux or macOS, plus `go` (the `go` line in `go.mod`), `git` 2.32 or newer (older git ignores `GIT_CONFIG_GLOBAL` and reads your global config), `curl`, and `python3` on `PATH`. The repo's own smoke script needs the same tools. The helper is tested on Linux only. Its macOS branches (`lsof`, `ps`, no `setsid`) are untested.
 - Run the commands from the repository root.
-- Choose a new run directory for every run, outside the checkout. `launch` refuses a directory inside the checkout (it would dirty `git status`) and a directory that is not empty.
+- Choose a new run directory for every run, outside the checkout. `launch` refuses a directory inside the checkout (it would dirty `git status`) and a directory that is not empty. It sets the run directory to mode 700, and every command refuses a run directory (or its `work/`) that another user owns or that group or others can write, because the commands source `work/state.env`.
 
 ## Launch
 
@@ -64,7 +64,7 @@ A `build` FAIL means the checkout moved after launch. Clean up and launch a new 
 
 ## Drive
 
-`api`, `git`, and `eq` take the run directory first and a label second. The label names the evidence files, so it must be unique in the run and match `[A-Za-z0-9._-]+`. `token` takes the run directory and a token name (`[A-Za-z0-9_-]+`, no dots), and `json` takes a file and a field path.
+`api`, `git`, and `eq` take the run directory first and a label second. The label names the evidence files, so it must match `[A-Za-z0-9._-]+` and be unique in the run across all three commands: a label already in `log.tsv` is refused. `token` takes the run directory and a token name (`[A-Za-z0-9_-]+`, no dots), and `json` takes a file and a field path.
 
 Mint tokens with the run's org key. The flags after the name go to `openstorage mint` (`--repo`, `--scopes`, `--ttl`, `--refs`):
 
@@ -105,7 +105,7 @@ printf 'hello\n' >"$OSV_WORK/clone/hello.txt"
 ```
 
 - git runs in `$OSV_WORK`, so relative paths such as `clone` resolve there, never in the checkout.
-- The helper removes inherited `GIT_*` variables. It sets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, and `GIT_CONFIG_NOSYSTEM=1`, pins the author and committer to `osv <osv@example.invalid>`, turns off the credential helper and background maintenance, and answers git's credential prompt through `scripts/askpass.sh` (user `t`, the token as the password). The token never enters the remote URL.
+- The helper removes inherited `GIT_*` variables. It sets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, and `GIT_CONFIG_NOSYSTEM=1`, pins the author and committer to `osv <osv@example.invalid>`, sets `LC_ALL=C` (English prompts and messages), turns off the credential helper and background maintenance, and answers git's credential prompt through `scripts/askpass.sh` (user `t`, the token as the password). The token never enters the remote URL.
 - stdout is git's combined stdout and stderr. `--expect <exit>` (default `0`) sets the expected exit code. A different exit code returns 1.
 
 Read the result through a second view and record the comparison:

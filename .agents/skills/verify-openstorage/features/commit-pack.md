@@ -115,6 +115,7 @@ cat >"$OSV_EVIDENCE/cp-branch.ndjson" <<'NDJSON'
 NDJSON
 "$OSV" api "$RUN" cp-branch --token rw --expect 200 POST /api/v1/repos/commit-pack \
   -H 'Content-Type: application/x-ndjson' --data-binary "@$OSV_EVIDENCE/cp-branch.ndjson"
+"$OSV" eq "$RUN" cp-branch-old-sha 0000000000000000000000000000000000000000 "$("$OSV" json "$OSV_EVIDENCE/cp-branch.body" result.old_sha)"
 "$OSV" api "$RUN" cp-branch-files --token rw --expect 200 GET '/api/v1/repos/files?ref=feature'
 "$OSV" eq "$RUN" cp-branch-paths '["hello.txt"]' "$("$OSV" json "$OSV_EVIDENCE/cp-branch-files.body" paths)"
 ```
