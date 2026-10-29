@@ -250,11 +250,14 @@ const (
 )
 
 type Slots struct {
+	sync.Mutex
+	*Pool
 	Size  int
 	a, b  string
 }
 
 type Pool interface {
+	fmt.Stringer
 	Acquire(n int) error
 }
 
@@ -283,7 +286,8 @@ class CitationTests(CheckerTestCase):
     def test_go_citations_resolve_to_declarations(self):
         citations = ["[demo.go:NewSlots]", "[demo.go:Slots]", "[demo.go:Slots.Close]", "[demo.go:Close]",
                      "[demo.go:Slots.Size]", "[demo.go:Slots.b]", "[demo.go:Pool.Acquire]", "[demo.go:Limit]",
-                     "[demo.go:upper]", "[demo.go:main]", "[demo.go:flag -seed]", "[demo.go]"]
+                     "[demo.go:upper]", "[demo.go:main]", "[demo.go:flag -seed]", "[demo.go]",
+                     "[demo.go:Slots.Mutex]", "[demo.go:Slots.Pool]", "[demo.go:Pool.Stringer]"]
         result = self.check_readme(" ".join(citations) + "\n", **{"pkg/demo.go": GO})
         self.assert_failures(result)
         self.assertEqual(result.returncode, 0)
@@ -325,13 +329,13 @@ class CitationTests(CheckerTestCase):
                 self.assert_failures(result, *[("UNRESOLVED CITATION", cite(s)) for s in mentioned])
 
     def test_terraform_citations_resolve_to_block_addresses(self):
-        tf = ('locals {\n  cloud_config = {\n    a = "{"\n  }\n}\n'
+        tf = ('locals {\n  cloud-init = 1\n  cloud_config = {\n    a = "{"\n  }\n}\n'
               'resource "aws_lb" "this" {\n  name = "x"\n  lifecycle {\n    precondition {\n'
               '      condition = true\n    }\n  }\n}\n'
               'data "aws_partition" "current" {}\nvariable "region" {}\nprovider "aws" {\n  region = var.region\n}\n')
         ok = ["[main.tf:aws_lb]", "[main.tf:aws_lb.this]", "[main.tf:aws_lb.this.precondition]",
               "[main.tf:data.aws_partition.current]", "[main.tf:region]", "[main.tf:var.region]",
-              "[main.tf:provider.aws]", "[main.tf:local.cloud_config]"]
+              "[main.tf:provider.aws]", "[main.tf:local.cloud_config]", "[main.tf:local.cloud-init]"]
         bad = ["[main.tf:aws_lb.main]", "[main.tf:data]", "[main.tf:local.a]", "[main.tf:aws_lb.this.name]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/main.tf": tf})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
@@ -347,16 +351,16 @@ class CitationTests(CheckerTestCase):
     def test_python_js_unit_and_dockerfile_citations(self):
         files = {
             "pkg/tool.py": 'import os\nLIMIT = 3\nos.chdir("/")\n\nclass Box:\n    def open(self):\n'
-                           '        inner = 1\n\ndef main():\n    pass\n\nif __name__ == "__main__":\n    main()\n',
+                           '        inner = 1\n        def helper():\n            pass\n\ndef main():\n    pass\n\nif __name__ == "__main__":\n    main()\n',
             "pkg/flow.js": 'export const meta = {\n  argsSchema: 1,\n  nested: { deep: 2 },\n};\n'
-                           'function gate() {\n  const rule = 1;\n}\n',
+                           'function gate() {\n  const rule = 1;\n}\nconst $handler = 1;\n',
             "pkg/app.service": "[Unit]\nDescription=x\n[Service]\nExecStart=/bin/true\n",
             "pkg/Dockerfile.test": "FROM alpine\nCMD [\"true\"]\n",
         }
         ok = ["[tool.py:LIMIT]", "[tool.py:os.chdir]", "[tool.py:Box.open]", "[tool.py:main]",
               "[tool.py:__main__]", "[flow.js:meta]", "[flow.js:meta.argsSchema]", "[flow.js:gate]",
-              "[flow.js:rule]", "[app.service:Service]", "[Dockerfile.test:CMD]"]
-        bad = ["[tool.py:inner]", "[tool.py:os]", "[flow.js:meta.deep]", "[app.service:ExecStart]",
+              "[flow.js:rule]", "[flow.js:$handler]", "[app.service:Service]", "[Dockerfile.test:CMD]"]
+        bad = ["[tool.py:inner]", "[tool.py:os]", "[tool.py:Box.helper]", "[flow.js:meta.deep]", "[app.service:ExecStart]",
                "[Dockerfile.test:RUN]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **files)
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])

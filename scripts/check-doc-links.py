@@ -361,7 +361,8 @@ def go_names(text):
             if line == close:
                 owner = None
             else:
-                m = re.match(member + r"(\w+(?:, \w+)*)(?:\(| )", line)
+                m = (re.match(member + r"(\w+(?:, \w+)*)(?:\(| )", line)
+                     or re.match(member + r"\*?(?:\w+\.)?(\w+)(?:\[.*\])?$", line))
                 if m:
                     for name in m.group(1).split(", "):
                         names |= {name, f"{owner}.{name}"}
@@ -404,22 +405,22 @@ def go_names(text):
 
 
 def py_names(text):
-    names, classes = set(), []
+    names, scopes = set(), []
     for line, source in zip(masked(text, PY_LEXER).split("\n"), text.split("\n")):
         line = line.rstrip()
         stripped = line.lstrip()
         if not stripped:
             continue
         indent = len(line) - len(stripped)
-        while classes and indent <= classes[-1][0]:
-            classes.pop()
+        while scopes and indent <= scopes[-1][0]:
+            scopes.pop()
         m = re.match(r"(?:async )?(def|class) (\w+)", stripped)
         if m:
-            name = m.group(2)
-            qualified = f"{classes[-1][1]}.{name}" if classes else name
+            kind, name = m.groups()
+            in_class = scopes and scopes[-1][2]
+            qualified = f"{scopes[-1][1]}.{name}" if in_class else name
             names |= {name, qualified}
-            if m.group(1) == "class":
-                classes.append((indent, qualified))
+            scopes.append((indent, qualified, kind == "class"))
             continue
         if indent:
             continue
@@ -461,7 +462,7 @@ def tf_names(text):
             elif top and top != "local":
                 names.add(f"{top}.{kind}")
         elif depth == 1 and top == "local":
-            m = re.match(r"\s*(\w+)\s*=", line)
+            m = re.match(r"\s*([\w-]+)\s*=", line)
             if m:
                 names.add(f"local.{m.group(1)}")
         depth += line.count("{") - line.count("}")
@@ -481,11 +482,11 @@ def js_names(text):
             indent = len(line) - len(line.lstrip())
             if line.strip() and key_indent is None:
                 key_indent = indent
-            m = re.match(r"\s*(\w+)\s*[:(]", line)
+            m = re.match(r"\s*([\w$]+)\s*[:(]", line)
             if m and indent == key_indent:
                 names.add(f"{owner}.{m.group(1)}")
             continue
-        m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )(\w+)", line)
+        m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )([\w$]+)", line)
         if m:
             names.add(m.group(1))
             if not line[0].isspace() and re.search(r"=\s*\{$", line):
