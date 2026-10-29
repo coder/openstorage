@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/tidwall/gjson"
 
@@ -44,12 +46,18 @@ func (*ResumableMiddleware) Work(ctx context.Context, job *rivertype.JobRow, doI
 		state.ResumeMatched = false
 	}
 
-	hadCursors := false
 	if cursorJSON := gjson.GetBytes(job.Metadata, rivercommon.MetadataKeyResumableCursor); cursorJSON.Exists() && cursorJSON.Type == gjson.JSON {
 		if err := json.Unmarshal([]byte(cursorJSON.Raw), &state.Cursors); err != nil {
 			return fmt.Errorf("river: unmarshal resumable cursors: %w", err)
 		}
-		hadCursors = len(state.Cursors) > 0
+	}
+
+	// Cursor-only progress has no skip boundary. Track its targets separately
+	// so a missing step cannot turn partially processed work into a success.
+	// Older jobs with a step marker may contain stale cursors; preserve their
+	// existing behavior rather than interpreting every cursor as unfinished.
+	if state.ResumeStep == "" {
+		state.PendingCursorSteps = slices.Sorted(maps.Keys(state.Cursors))
 	}
 
 	ctx = context.WithValue(ctx, ResumableContextKey{}, state)
@@ -61,19 +69,25 @@ func (*ResumableMiddleware) Work(ctx context.Context, job *rivertype.JobRow, doI
 			err = state.Err
 		case state.ResumeStep != "" && !state.ResumeMatched:
 			err = fmt.Errorf("river: resumable step %q not found in Worker", state.ResumeStep)
+		case len(state.PendingCursorSteps) > 0:
+			err = fmt.Errorf("river: resumable cursor step %q not found in Worker", state.PendingCursorSteps[0])
 		}
 	}
 
-	if err != nil && state.CompletedStep != "" {
-		if len(state.Cursors) > 0 {
+	// Advancing the skip boundary before finding the cursor could make that
+	// step unreachable even after the worker restores it on a later attempt.
+	if err != nil && len(state.PendingCursorSteps) == 0 {
+		if state.CursorsDirty && len(state.Cursors) > 0 {
 			metadataUpdates[rivercommon.MetadataKeyResumableCursor] = state.Cursors
-		} else if hadCursors {
+		} else if state.CursorsDirty {
 			// All cursors were consumed (their steps completed). Write null
 			// to clear the stale cursor metadata, since the metadata merge
 			// is additive and wouldn't remove the old key on its own.
 			metadataUpdates[rivercommon.MetadataKeyResumableCursor] = nil
 		}
-		metadataUpdates[rivercommon.MetadataKeyResumableStep] = state.CompletedStep
+		if state.CompletedStep != "" {
+			metadataUpdates[rivercommon.MetadataKeyResumableStep] = state.CompletedStep
+		}
 	}
 
 	return err
@@ -85,10 +99,14 @@ type ResumableState struct {
 	AllStepNames  map[string]struct{}
 	CompletedStep string
 	Cursors       map[string]json.RawMessage
+	CursorsDirty  bool
 	Err           error
-	ResumeMatched bool
-	ResumeStep    string
-	StepName      string
+	// PendingCursorSteps contains unmatched targets from cursor-only metadata.
+	PendingCursorSteps []string
+	ResumeMatched      bool
+	ResumeStep         string
+	StepActive         bool
+	StepName           string
 }
 
 // ResumableContextKey is the context key for ResumableState.

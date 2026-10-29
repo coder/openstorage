@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/riverqueue/river/internal/riverplugin"
 )
@@ -15,7 +16,8 @@ var (
 )
 
 // ResumableSetCursor records a cursor for the current resumable cursor step.
-// The cursor is stored only if the job attempt ends in an error, allowing a
+// The cursor is stored if the job attempt ends in an error, snooze, or
+// cooperative cancellation, allowing a
 // later retry to resume the same step from the recorded position.
 //
 // Alternatively, ResumableSetStepCursorTx is available to persist a step and
@@ -36,6 +38,7 @@ func ResumableSetCursor[TCursor any](ctx context.Context, cursor TCursor) error 
 		state.Cursors = make(map[string]json.RawMessage)
 	}
 	state.Cursors[state.StepName] = json.RawMessage(cursorBytes)
+	state.CursorsDirty = true
 	return nil
 }
 
@@ -47,6 +50,7 @@ type StepOpts struct{}
 // an earlier attempt already completed it successfully.
 // Step names must be unique across all ResumableStep and ResumableStepCursor
 // calls in the same Worker execution.
+// Steps cannot be nested inside other step callbacks.
 //
 // After a step returns an error, no subsequent steps will be run and the
 // overall job will be marked as failed with that error. Be careful to put all
@@ -62,6 +66,10 @@ func ResumableStep(ctx context.Context, name string, opts *StepOpts, stepFunc fu
 	if !registerResumableStepName(state, name) {
 		return
 	}
+	if slices.Contains(state.PendingCursorSteps, name) {
+		state.Err = fmt.Errorf("river: resumable cursor step %q requires a cursor step", name)
+		return
+	}
 
 	if !state.ResumeMatched {
 		if name == state.ResumeStep {
@@ -71,12 +79,18 @@ func ResumableStep(ctx context.Context, name string, opts *StepOpts, stepFunc fu
 		return
 	}
 
-	previousStepName := state.StepName
+	state.StepActive = true
 	state.StepName = name
-	defer func() { state.StepName = previousStepName }()
+	defer func() {
+		state.StepActive = false
+		state.StepName = ""
+	}()
 
 	if err := stepFunc(ctx); err != nil {
 		state.Err = err
+		return
+	}
+	if state.Err != nil {
 		return
 	}
 
@@ -85,9 +99,13 @@ func ResumableStep(ctx context.Context, name string, opts *StepOpts, stepFunc fu
 
 // ResumableStepCursor runs a resumable step that also receives a persisted
 // cursor value from an earlier failed attempt, if one was recorded with
-// ResumableSetCursor.
+// ResumableSetCursor. If no step has completed yet, the retry starts at the
+// beginning and supplies the saved cursor when it reaches its named step.
+// A cursor-only checkpoint must be reached through ResumableStepCursor before
+// the attempt can complete or another step can persist a transactional checkpoint.
 // Step names must be unique across all ResumableStep and ResumableStepCursor
 // calls in the same Worker execution.
+// Steps cannot be nested inside other step callbacks.
 //
 // The cursor type T is user-specified. It may be a primitive value like an
 // integer ID, or a more complex type like a struct with multiple fields. It's
@@ -137,17 +155,28 @@ func ResumableStepCursor[TCursor any](ctx context.Context, name string, opts *St
 		}
 	}
 
-	previousStepName := state.StepName
+	state.StepActive = true
 	state.StepName = name
-	defer func() { state.StepName = previousStepName }()
+	defer func() {
+		state.StepActive = false
+		state.StepName = ""
+	}()
+
+	state.PendingCursorSteps = slices.DeleteFunc(state.PendingCursorSteps, func(pending string) bool { return pending == name })
 
 	if err := stepFunc(ctx, cursor); err != nil {
 		state.Err = err
 		return
 	}
+	if state.Err != nil {
+		return
+	}
 
 	state.CompletedStep = name
-	delete(state.Cursors, name)
+	if _, ok := state.Cursors[name]; ok {
+		delete(state.Cursors, name)
+		state.CursorsDirty = true
+	}
 }
 
 func mustResumableState(ctx context.Context) *riverplugin.ResumableState {
@@ -160,6 +189,11 @@ func mustResumableState(ctx context.Context) *riverplugin.ResumableState {
 }
 
 func registerResumableStepName(state *riverplugin.ResumableState, name string) bool {
+	if state.StepActive {
+		state.Err = errors.New("river: resumable steps cannot be nested")
+		return false
+	}
+
 	if _, ok := state.AllStepNames[name]; ok {
 		state.Err = fmt.Errorf("river: duplicate resumable step name %q", name)
 		return false
