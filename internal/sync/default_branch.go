@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DefaultBranchAdopter is an UpstreamStore that records the upstream
@@ -23,6 +24,10 @@ type DefaultBranchAdopter interface {
 // /HEAD, so the upstream controls the line count. git prints the HEAD
 // symref line first, so the capped prefix keeps it.
 const lsRemoteOutputCap = 64 << 10
+
+// headLookupTimeout bounds the upstream HEAD lookup; it gets at most a
+// quarter of the time left in the run.
+const headLookupTimeout = 30 * time.Second
 
 // cappedBuffer keeps the first n bytes written and discards the rest,
 // so the writer never blocks or fails the child.
@@ -43,8 +48,16 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 // HEAD cannot be used: the repo keeps its branch, the flag stays set, and
 // a later sync retries.
 func (w *Worker) upstreamHead(ctx context.Context, job Job, mirror string, env []string, url string) string {
+	// The lookup is optional: its own deadline keeps a stalled upstream
+	// from spending the run budget that the push still needs.
+	budget := headLookupTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		budget = min(budget, time.Until(dl)/4)
+	}
+	lctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 	out := &cappedBuffer{n: lsRemoteOutputCap}
-	stderr, err := runGitTo(ctx, mirror, env, out, "ls-remote", "--symref", url, "HEAD")
+	stderr, err := runGitTo(lctx, mirror, env, out, "ls-remote", "--symref", url, "HEAD")
 	var branch, reason string
 	if err != nil {
 		reason = fmt.Sprintf("git ls-remote: %v: %s", err, strings.TrimSpace(stderr))

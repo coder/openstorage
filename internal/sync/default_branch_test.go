@@ -2,10 +2,14 @@ package sync
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestParseHeadSymref: only a HEAD symref to a valid branch names a
@@ -70,5 +74,26 @@ func TestUpstreamHeadNeedsFetchedBranch(t *testing.T) {
 	testGit(t, mirror, append([]string{"fetch", "file://" + bare}, mirrorRefspecs...)...)
 	if got := w.upstreamHead(t.Context(), job, mirror, env, "file://"+bare); got != "trunk" {
 		t.Fatalf("HEAD after the fetch = %q, want trunk", got)
+	}
+}
+
+// TestUpstreamHeadOwnDeadline: a stalled HEAD lookup gives up within its
+// share of the run budget and leaves the run's context alive for the push.
+func TestUpstreamHeadOwnDeadline(t *testing.T) {
+	release := make(chan struct{})
+	stall := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer stall.Close()
+	defer close(release)
+	w := &Worker{AllowProtocol: "http", Logger: discardTestLogger()}
+	mirror := filepath.Join(t.TempDir(), "mirror.git")
+	testGit(t, t.TempDir(), "init", "--bare", mirror)
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	defer cancel()
+	start := time.Now()
+	if got := w.upstreamHead(ctx, Job{Org: "o", RepoID: "repo_0123456789ab"}, mirror, hermeticGitEnv(w.allowProtocol()), stall.URL+"/o/n.git"); got != "" {
+		t.Fatalf("stalled lookup = %q, want none", got)
+	}
+	if elapsed := time.Since(start); elapsed > 2500*time.Millisecond || ctx.Err() != nil {
+		t.Fatalf("stalled lookup took %v (run context err %v), want about a quarter of the 4s budget and a live run context", elapsed, ctx.Err())
 	}
 }
