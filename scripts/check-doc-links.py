@@ -12,9 +12,9 @@ Zero dependencies besides git. CI runs it in the required lint job of
 .github/workflows/ci.yml.
 
 Every relative INLINE link must name an existing file. A #fragment on a .md
-target must name one of that file's anchors. Anchors are computed on demand,
-so the target need not be a scanned file. Anchors of docs/upstream/ targets
-are not checked, because those files are verbatim upstream copies. Anchor
+target must name one of that file's anchors, even when the target is not a
+scanned file. Anchors of docs/upstream/ targets are not checked, because those
+files are verbatim upstream copies. Anchor
 checking follows GitHub's algorithm (lowercase, strip backticks/asterisks,
 spaces to hyphens, dedupe with -1/-2 suffixes). Explicit <a name="..."> and
 <a id="..."> anchors retain their exact values; anchors demonstrated in
@@ -244,7 +244,6 @@ def scan_lines(path):
 
 
 def doc_files():
-    """Markdown files in git's index, outside vendor/, that exist in the working tree."""
     try:
         listed = subprocess.run(["git", "ls-files", "-z", "--", "*.md"], capture_output=True)
         failure = listed.returncode and (listed.stderr.decode(errors="replace").strip()
@@ -265,7 +264,6 @@ def links_apply(path):
 
 @functools.cache
 def anchors(path):
-    """Heading slugs and explicit <a name|id> values of one Markdown file."""
     found = set()
     for block in scan_blocks(path):
         explicit = ExplicitAnchors()

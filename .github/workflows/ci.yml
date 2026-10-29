@@ -39,7 +39,6 @@ jobs:
       # pins; install both here so CI lints with exactly the local toolchain.
       - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
       - run: golangci-lint run
-      # Docs links (scripts/README.md). -B keeps scripts/__pycache__/ out of the checkout.
       - run: python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
       - run: python3 scripts/check-doc-links.py
 

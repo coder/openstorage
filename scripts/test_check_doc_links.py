@@ -1,7 +1,4 @@
-"""Regression tests for the documented check-doc-links.py command.
-
-Run with: python3 -B -m unittest discover -s scripts -p 'test_*.py'
-"""
+"""Regression tests for the documented check-doc-links.py command."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,13 +8,7 @@ import unittest
 
 
 class CheckerTestCase(unittest.TestCase):
-    def run_checker(self, readme, docs=None, files=None, worktree=None, git=True):
-        """Run a copy of the checker in a scratch repository.
-
-        README.md, CONTRIBUTING.md, CHANGELOG.md, docs (under docs/), and files
-        (repo-relative) are staged with git add. worktree edits then change only
-        the working tree: a text writes an untracked file, None deletes one.
-        """
+    def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), git=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -35,13 +26,12 @@ class CheckerTestCase(unittest.TestCase):
             if git:
                 subprocess.run(["git", "init", "-q"], cwd=root, check=True)
                 subprocess.run(["git", "add", "-f", "."], cwd=root, check=True)
-            for name, text in (worktree or {}).items():
+            for name, text in (untracked or {}).items():
                 path = root / name
-                if text is None:
-                    path.unlink()
-                else:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(text, encoding="utf-8")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            for name in deleted:
+                (root / name).unlink()
             return subprocess.run(
                 [sys.executable, str(checker)], cwd=root, text=True,
                 capture_output=True, timeout=10,
@@ -264,7 +254,8 @@ class FileSelectionTests(CheckerTestCase):
         result = self.run_checker(
             "",
             files={"vendor/mod/README.md": broken, "notes.md": broken, "docs/old.md": broken},
-            worktree={"internal/new/README.md": broken, "docs/old.md": None},
+            untracked={"internal/new/README.md": broken},
+            deleted=["docs/old.md"],
         )
         self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
         self.assertEqual(result.returncode, 0)
