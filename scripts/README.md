@@ -4,20 +4,22 @@
 
 Standalone maintenance scripts for docs, releases, and the Compose quickstart. None of them is a Go package, and `go test ./...` does not run them.
 
-- `check-doc-links.py`: an offline, zero-dependency checker for relative inline Markdown links and anchors in the top-level docs and `docs/`. CI runs it in `.github/workflows/ci.yml`.
+- `check-doc-links.py`: an offline, standard-library-only checker for relative inline Markdown links and anchors in every tracked `README.md`, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and `docs/`. It needs a git checkout. CI runs it in the required `lint` job of `.github/workflows/ci.yml`.
 - `release-archives.sh`: cross-compiles `./cmd/openstorage` for four platforms, packages each binary with `LICENSE`, and writes `checksums.txt`. `.github/workflows/release.yml` runs it.
 - `smoke-compose-quickstart.sh`: an end-to-end smoke test of `compose.quickstart.yml` against a local image. It covers key init, the HTTP API, Git and Git LFS push and clone, restart persistence, and fail-closed init faults. CI runs it in `.github/workflows/ci.yml` and `.github/workflows/image.yml`.
 
 `test_check_doc_links.py` holds the regression tests for `check-doc-links.py`. It is a test file, not a script.
 
-Note: the module docstring of `check-doc-links.py` says it is "Not wired into CI on purpose". This is out of date: `.github/workflows/ci.yml` runs `python3 scripts/check-doc-links.py`.
-
 ## Interface
 
 ### `check-doc-links.py`
 
-- `[check-doc-links.py:__main__]` CLI: `python3 scripts/check-doc-links.py`. It takes no arguments. It exits 1 when `check()` returns a non-zero count, else 0.
-- `[check-doc-links.py:check]` Returns the broken-link count. Prints one line per failure (`BROKEN FILE`, `BROKEN FILE (escapes repo)`, `BROKEN ANCHOR`, `UNSUPPORTED REF-STYLE LINK DEF`, `UNSUPPORTED ANGLE-BRACKET DEST`, `UNSUPPORTED UNPARSED LINK`), then `broken links: N`.
+- `[check-doc-links.py:__main__]` CLI: `python3 scripts/check-doc-links.py`. It takes no arguments. It exits 1 when `check()` returns a non-zero count, 2 when `doc_files()` cannot list the files, else 0.
+- `[check-doc-links.py:check]` Checks the links of every `doc_files()` entry that `links_apply` selects. Prints one line per failure (`BROKEN FILE`, `BROKEN FILE (escapes repo)`, `BROKEN ANCHOR`, `UNSUPPORTED REF-STYLE LINK DEF`, `UNSUPPORTED ANGLE-BRACKET DEST`, `UNSUPPORTED UNPARSED LINK`), then `broken links: N`. Returns N.
+- `[check-doc-links.py:doc_files]` The sorted `.md` paths in git's index (`git ls-files`), minus `vendor/` and files deleted from the working tree.
+- `[check-doc-links.py:links_apply]` True for every `README.md`, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and every file under `docs/`.
+- `[check-doc-links.py:link_failures]` Failure lines for the inline links on one line, with inline code masked.
+- `[check-doc-links.py:anchors]` The heading slugs and explicit anchors of one Markdown file. Cached per file.
 - `[check-doc-links.py:gh_anchor]` Converts heading text to a GitHub-style anchor slug.
 - `[check-doc-links.py:ExplicitAnchors]` `HTMLParser` subclass. Collects `<a name>` and `<a id>` values into `.anchors`.
 - `[check-doc-links.py:scan_blocks]` Yields the non-code Markdown blocks of one file as numbered lines.
@@ -67,13 +69,15 @@ No child directories.
 
 ### `check-doc-links.py`
 
-- `[check-doc-links.py:check]` Scans only `README.md`, `CONTRIBUTING.md`, and `CHANGELOG.md` at the repository root, plus every `.md` file under `docs/`. Other Markdown files, including this one, are not checked.
+- `[check-doc-links.py:doc_files]` Lists only Markdown that git tracks. Untracked files, git-ignored files, and files under `vendor/` are never listed. A tracked file deleted from the working tree is skipped.
+- `[check-doc-links.py:doc_files]` When `git ls-files` fails (outside a checkout, or without `git`), it prints the reason to stderr and exits 2 without checking anything.
+- `[check-doc-links.py:links_apply]` Checks the links in every `README.md` (this one included), the root `CONTRIBUTING.md` and `CHANGELOG.md`, and every `.md` file under `docs/`. Other Markdown files, such as `.agents/skills/*/SKILL.md`, are not scanned.
 - `[check-doc-links.py:os.chdir]` Resolves all paths from the repository root (the parent of `scripts/`), whatever the caller's working directory is.
-- `[check-doc-links.py:check]` Skips targets that match `^[a-z]+:` (URLs) or start with `/`.
-- `[check-doc-links.py:check]` Reports a relative target that resolves outside the repository as `BROKEN FILE (escapes repo)`.
-- `[check-doc-links.py:check]` Checks anchors only for `.md` targets outside `docs/upstream`.
+- `[check-doc-links.py:link_failures]` Skips targets that match `^[a-z]+:` (URLs) or start with `/`.
+- `[check-doc-links.py:link_failures]` Reports a relative target that resolves outside the repository as `BROKEN FILE (escapes repo)`.
+- `[check-doc-links.py:link_failures]` Checks anchors only for `.md` targets. `[check-doc-links.py:anchors]` computes them on demand for any such file, scanned or not. Anchors of `docs/upstream/` targets are not checked, because those files are verbatim upstream copies.
 - `[check-doc-links.py:REFDEF]` `[check-doc-links.py:ANGLE]` `[check-doc-links.py:LINK]` Fails closed: reference-style link definitions, angle-bracket destinations, and any `](` that `LINK` cannot consume on one line are reported as failures.
-- `[check-doc-links.py:gh_anchor]` Anchor slugs: lowercase, strip backticks and asterisks, drop characters other than word characters, `-`, and space, then turn spaces into hyphens. `check` adds `-1`, `-2` suffixes to duplicate headings.
+- `[check-doc-links.py:gh_anchor]` Anchor slugs: lowercase, strip backticks and asterisks, drop characters other than word characters, `-`, and space, then turn spaces into hyphens. `anchors` adds `-1`, `-2` suffixes to duplicate headings.
 - `[check-doc-links.py:ExplicitAnchors]` Explicit `<a name>` and `<a id>` values keep their exact text.
 - `[check-doc-links.py:markdown_blocks]` `[check-doc-links.py:without_inline_code]` Fenced, indented, and inline code create no anchors and no link destinations.
 
@@ -112,6 +116,7 @@ No child directories.
 ### `check-doc-links.py`
 
 - `[check-doc-links.py:os.chdir]` Changes the process working directory to the repository root.
+- `[check-doc-links.py:doc_files]` Runs `git ls-files` (read-only).
 - `[check-doc-links.py:check]` Reads Markdown files and checks that link targets exist. Writes nothing to disk. Prints results to stdout.
 
 ### `release-archives.sh`
@@ -135,8 +140,8 @@ No child directories.
 
 ## Verification
 
-- Doc links: `python3 scripts/check-doc-links.py` (from `.github/workflows/ci.yml`).
-- Checker tests: `python3 -B -m unittest discover -s scripts -p 'test_check_doc_links.py'` (from the docstring of `scripts/test_check_doc_links.py`).
+- Doc links: `python3 scripts/check-doc-links.py` (from the `lint` job in `.github/workflows/ci.yml`).
+- Checker tests: `python3 -B -m unittest discover -s scripts -p 'test_*.py' -v` (from the `lint` job in `.github/workflows/ci.yml`). `-B` keeps `scripts/__pycache__/` out of the checkout.
 - Smoke syntax: `bash -n scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml`).
 - Smoke run (needs Docker and a local image): `OPENSTORAGE_IMAGE=<local-image> bash scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml` and `.github/workflows/image.yml`).
 - Release archives (needs Go): `./scripts/release-archives.sh <tag> <outdir>` (from `.github/workflows/release.yml`). Use an `<outdir>` outside the checkout. Untracked files in the checkout make Go stamp `vcs.modified=true` (see the comment in `.github/workflows/release.yml`).

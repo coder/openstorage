@@ -211,9 +211,9 @@ type(scope)?: summary
 
 A PR merges when all of these hold:
 
-1. **CI is green** — every job in `ci.yml`: `lint`, `terraform` (offline
-   Terraform checks + docs link check), `test` (default lane), `test-local`,
-   `test-s3wal` (S3-only storage lane), and `image` (Docker build +
+1. **CI is green** — every job in `ci.yml`: `lint` (golangci-lint + docs
+   checks), `terraform` (offline Terraform checks), `test` (default lane),
+   `test-local`, `test-s3wal` (S3-only storage lane), and `image` (Docker build +
    runtime-dependency smoke test), plus the `pr-title` check. Release PRs need
    their held `ci` and `pr-title` runs approved; see the
    [release runbook](docs/how-to/release.md).

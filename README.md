@@ -418,7 +418,8 @@ Verification).
 - Run: `go test ./... -tags=openstorage_viewcheck -count=1 -race -timeout=30m` (needs
   Docker, git, and git-lfs).
 - Run: `golangci-lint run`
-- Run: `python3 scripts/check-doc-links.py`
+- Run: `python3 scripts/check-doc-links.py` and
+  `python3 -B -m unittest discover -s scripts -p 'test_*.py'`
 - The local and s3wal test lanes are in the [testing reference](docs/reference/testing.md).
   The Terraform gates are in [deploy/terraform/aws/README.md](./deploy/terraform/aws/README.md).
 
