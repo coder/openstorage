@@ -838,7 +838,7 @@ func TestReadCoreFiles(t *testing.T) {
 		}
 
 		t.Run("root non-recursive", func(t *testing.T) {
-			resp, body := coreGet(t, e, "GET", "/api/v1/repos/files", fx.token, nil)
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/files?recursive=false", fx.token, nil)
 			coreRequireStatus(t, resp, body, 200)
 			var got listFilesResponse
 			coreDecode(t, body, &got)
@@ -878,7 +878,7 @@ func TestReadCoreFiles(t *testing.T) {
 		})
 
 		t.Run("subtree path", func(t *testing.T) {
-			resp, body := coreGet(t, e, "GET", "/api/v1/repos/files?path=src", fx.token, nil)
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/files?path=src&recursive=false", fx.token, nil)
 			coreRequireStatus(t, resp, body, 200)
 			var got listFilesResponse
 			coreDecode(t, body, &got)

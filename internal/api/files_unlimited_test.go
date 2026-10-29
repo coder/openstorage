@@ -97,6 +97,9 @@ func TestFilesListingsWithoutLimitReturnEveryEntry(t *testing.T) {
 			pageSize   int
 		}{
 			{"files", "/api/v1/repos/files?recursive=true", 1000},
+			// No recursive lists the whole tree too (#598), so no limit
+			// and no recursive return every file under every folder.
+			{"files without recursive", "/api/v1/repos/files?ref=main", 1000},
 			{"files/metadata", "/api/v1/repos/files/metadata?recursive=true", 200},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
