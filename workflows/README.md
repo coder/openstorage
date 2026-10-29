@@ -30,7 +30,7 @@ The `specRefs` strings in `[build-phase.js:PHASES]` cite the living docs [`docs/
 ## Interface
 
 - `[build-phase.js:meta]` Exported workflow metadata: `description` and `argsSchema` (built with the global `mux.schema`, `additionalProperties: false`).
-- `[build-phase.js:meta.argsSchema]` Run arguments:
+- `[build-phase.js:meta]` Run arguments (`meta.argsSchema`):
 
   | Arg | Type | Required | Notes |
   |---|---|---|---|

@@ -274,6 +274,7 @@ func main() {
 	_ = seed
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	fs.Int("listen-port", 0, "")
+	flag.BoolFunc("verbose", "", nil)
 	parser.String("ghost-flag", 1)
 }
 
@@ -297,7 +298,7 @@ class CitationTests(CheckerTestCase):
                      "[demo.go:Slots.Size]", "[demo.go:Slots.b]", "[demo.go:Pool.Acquire]", "[demo.go:Limit]",
                      "[demo.go:upper]", "[demo.go:main]", "[demo.go:flag -seed]", "[demo.go]",
                      "[demo.go:Slots.Mutex]", "[demo.go:Slots.Pool]", "[demo.go:Pool.Stringer]",
-                     "[demo.go:flag -listen-port]", "[demo.go:flag -param-flag]"]
+                     "[demo.go:flag -listen-port]", "[demo.go:flag -param-flag]", "[demo.go:flag -verbose]"]
         result = self.check_readme(" ".join(citations) + "\n", **{"pkg/demo.go": GO})
         self.assert_failures(result)
         self.assertEqual(result.returncode, 0)
@@ -322,10 +323,11 @@ class CitationTests(CheckerTestCase):
                         '/*\nresource "aws_block" "comment" {}\n*/\nlocals {\n  policy = <<-EOT\n'
                         '    resource "aws_heredoc" "doc" {\n  EOT\n  arn = "${aws_s3_bucket.data.arn}/*"\n}\n'
                         'resource "aws_lb" "after" {}\n'
-                        'resource "aws_instance" "x" {\n  user_data = <<EOT\n  EOT\n  lifecycle {\n  }\nEOT\n}\n',
+                        'resource "aws_instance" "x" {\n  user_data = <<EOT\n  EOT\n  lifecycle {\n  }\nEOT\n'
+                        '  tags = <<END-DATA\n  provisioner {\n  }\nEND-DATA\n}\n',
                         ["local.policy", "local.arn", "aws_lb.after", "aws_instance.x"],
                         ["aws_hash.comment", "aws_slash.comment", "aws_block.comment", "aws_heredoc.doc",
-                         "aws_instance.x.lifecycle"]),
+                         "aws_instance.x.lifecycle", "aws_instance.x.provisioner"]),
             "tool.py": ('"""Module docstring.\n\ndef docstring_def():\n"""\n# def comment_def():\n'
                         'TEMPLATE = """\nclass TemplateClass:\n"""\ndef real():\n    pass\n',
                         ["TEMPLATE", "real"], ["docstring_def", "comment_def", "TemplateClass"]),
@@ -367,18 +369,16 @@ class CitationTests(CheckerTestCase):
                            '        inner = 1\n        def helper():\n            pass\n\n'
                            'class Wide(\n    Box,\n):\n    def run(self):\n        pass\n\n'
                            'def main():\n    pass\n\nif __name__ == "__main__":\n    main()\n',
-            "pkg/flow.js": 'export const meta = {\n  argsSchema: 1,\n  nested: { deep: 2 },\n};\n'
+            "pkg/flow.js": 'export const meta = {\n  argsSchema: 1,\n};\n'
                            'function gate() {\n  const rule = 1;\n}\nconst $handler = 1;\n'
-                           'const routes = {\n  "health-check": 1,\n  ready: 2,\n};\n'
                            'const { actual = fn(stale, ghost), keep } = api;\n',
-            "pkg/app.service": "[Unit]\nDescription=x\n[Service]\nExecStart=/bin/true\n",
+            "pkg/app.service": "[Unit]\nDescription=x \\\n[Install]\n[Service]\nExecStart=/bin/true\n",
         }
         ok = ["[tool.py:LIMIT]", "[tool.py:os.chdir]", "[tool.py:Box.open]", "[tool.py:Wide.run]",
-              "[tool.py:main]", "[tool.py:__main__]", "[flow.js:meta]", "[flow.js:meta.argsSchema]",
-              "[flow.js:gate]", "[flow.js:rule]", "[flow.js:$handler]", "[flow.js:routes.ready]",
-              "[app.service:Service]"]
-        bad = ["[tool.py:inner]", "[tool.py:os]", "[tool.py:Box.helper]", "[flow.js:meta.deep]",
-               "[flow.js:ghost]", "[app.service:ExecStart]"]
+              "[tool.py:main]", "[tool.py:__main__]", "[flow.js:meta]", "[flow.js:gate]",
+              "[flow.js:rule]", "[flow.js:$handler]", "[app.service:Service]"]
+        bad = ["[tool.py:inner]", "[tool.py:os]", "[tool.py:Box.helper]", "[flow.js:meta.argsSchema]",
+               "[flow.js:ghost]", "[app.service:ExecStart]", "[app.service:Install]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **files)
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 

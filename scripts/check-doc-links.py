@@ -342,7 +342,7 @@ def masked(text, lexer):
 GO_LEXER = re.compile(r"(?P<blank>//[^\n]*|/\*.*?\*/|`[^`]*`|'(?:\\.|[^'\\\n])*')"
                       r'|(?P<quoted>"(?:\\.|[^"\\\n])*")', re.S)
 TF_LEXER = re.compile(r"(?P<blank>#[^\n]*|//[^\n]*|/\*.*?\*/"
-                      r"|<<(?P<dash>-)?(?P<tag>\w+)[^\n]*\n.*?^(?(dash)[ \t]*)(?P=tag)[ \t]*$)"
+                      r"|<<(?P<dash>-)?(?P<tag>[\w-]+)[^\n]*\n.*?^(?(dash)[ \t]*)(?P=tag)[ \t]*$)"
                       r'|(?P<quoted>"(?:\\.|\$\{(?:"(?:\\.|[^"\\])*"|[^"}])*\}|[^"\\\n])*")', re.S | re.M)
 PY_LEXER = re.compile(r"(?P<blank>#[^\n]*|\"\"\"(?:\\.|[^\\])*?\"\"\"|'''(?:\\.|[^\\])*?'''"
                       r"|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')", re.S)
@@ -400,7 +400,7 @@ def go_names(text):
     flag_sets = {"flag"}
     for m in re.finditer(r"\b(\w+) :?= flag\.NewFlagSet\(|\b(\w+) \*flag\.FlagSet\b", code):
         flag_sets.add(m.group(1) or m.group(2))
-    for m in re.finditer(r"\b(\w+)\.(?:Bool|Duration|Float64|Func|Int|Int64|String|"
+    for m in re.finditer(r"\b(\w+)\.(?:BoolFunc|Bool|Duration|Float64|Func|Int|Int64|String|"
                          r"TextVar|Uint|Uint64|Var)(?:Var)?\((?:&[\w.]+, )?\"", code):
         flag = re.match(r'"([\w-]+)"', text[m.end() - 1:])
         if flag and m.group(1) in flag_sets:
@@ -478,25 +478,11 @@ def tf_names(text):
 
 
 def js_names(text):
-    names, owner, key_indent = set(), None, None
-    for line, source in zip(masked(text, JS_LEXER).split("\n"), text.split("\n")):
-        line = line.rstrip()
-        if owner:
-            if line.startswith("}"):
-                owner = None
-                continue
-            indent = len(source) - len(source.lstrip())
-            if line.strip() and key_indent is None:
-                key_indent = indent
-            m = re.match(r"\s*([\w$]+)\s*[:(]", line)
-            if m and indent == key_indent:
-                names.add(f"{owner}.{m.group(1)}")
-            continue
+    names = set()
+    for line in masked(text, JS_LEXER).split("\n"):
         m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )([\w$]+)", line)
         if m:
             names.add(m.group(1))
-            if not line[0].isspace() and re.search(r"=\s*\{$", line):
-                owner, key_indent = m.group(1), None
     return names
 
 
@@ -512,7 +498,13 @@ class ShellMentions:
 
 
 def unit_names(text):
-    return set(re.findall(r"^\[([\w-]+)\]", text, re.M))
+    names, continued = set(), False
+    for line in text.splitlines():
+        m = None if continued else re.match(r"\[([\w-]+)\]", line)
+        if m:
+            names.add(m.group(1))
+        continued = line.endswith("\\")
+    return names
 
 
 LANGUAGES = {
