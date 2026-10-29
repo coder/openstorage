@@ -125,7 +125,7 @@ func (p *lsTreePager) Write(b []byte) (int, error) {
 	for len(b) > 0 {
 		i := bytes.IndexByte(b, 0)
 		if i < 0 {
-			p.fits(len(p.pending) + len(b))
+			p.within(len(p.pending) + len(b))
 			p.pending = append(p.pending, b...)
 			break
 		}
@@ -146,11 +146,12 @@ func (p *lsTreePager) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-// fits checks that the page plus n more retained bytes stay within the
-// output allowance left. It charges nothing: LsTreePage charges the page
-// once it is complete.
-func (p *lsTreePager) fits(n int) {
-	if p.err == nil && p.budget != nil && int64(p.kept+n) > p.budget.remaining() {
+// within checks that n retained bytes fit in the output allowance left:
+// the page with a record that joins it, or one record split across writes,
+// which may be the lookahead or a record before the cursor. It charges
+// nothing: LsTreePage charges the page once it is complete.
+func (p *lsTreePager) within(n int) {
+	if p.err == nil && p.budget != nil && int64(n) > p.budget.remaining() {
 		p.err = fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
 	}
 }
@@ -171,7 +172,7 @@ func (p *lsTreePager) record(rec string) {
 	case len(p.page) == p.limit:
 		p.hasMore = true
 	default:
-		p.fits(len(rec))
+		p.within(p.kept + len(rec))
 		p.kept += len(rec)
 		p.page = append(p.page, e)
 	}

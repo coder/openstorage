@@ -184,8 +184,11 @@ func TestLsTreePagerStopsAfterThePage(t *testing.T) {
 	rec := func(p string) string { return "100644 blob " + strings.Repeat("a", 40) + "       1\t" + p + "\x00" }
 	head := rec("a") + rec("b") + rec("c") + rec("d")
 	stream := head + rec("e")
-	// Records before the cursor, split byte by byte, charge nothing.
-	_, b := budgeted(t, 1<<10)
+	// Records before the cursor and the lookahead, split byte by byte,
+	// charge nothing, and the lookahead need not fit next to a page that
+	// uses the whole allowance.
+	pageBytes := 2 * (len(rec("b")) - 1)
+	_, b := budgeted(t, int64(pageBytes))
 	p := &lsTreePager{after: "a", limit: 2, budget: b}
 	stopped := -1
 	for i := range len(stream) {
@@ -199,7 +202,7 @@ func TestLsTreePagerStopsAfterThePage(t *testing.T) {
 	if stopped != len(head)-1 || p.err != nil || !p.hasMore || len(p.page) != 2 || p.page[0].Path != "b" || p.page[1].Path != "c" {
 		t.Fatalf("stopped at byte %d (want %d), err %v, more %v, page %v", stopped, len(head)-1, p.err, p.hasMore, p.page)
 	}
-	if left := b.remaining(); left != 1<<10 || p.kept != 2*(len(rec("b"))-1) {
-		t.Fatalf("pager charged %d bytes and kept %d; want none charged and the 2 page records kept", 1<<10-left, p.kept)
+	if left := b.remaining(); left != int64(pageBytes) || p.kept != pageBytes {
+		t.Fatalf("pager charged %d bytes and kept %d; want none charged and the %d page bytes kept", int64(pageBytes)-left, p.kept, pageBytes)
 	}
 }
