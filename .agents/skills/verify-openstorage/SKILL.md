@@ -11,9 +11,9 @@ The node is the real product: the same binary, the same `serve` command, and the
 
 Requirements:
 
-- bash on Linux or macOS, plus `go` (the `go` line in `go.mod`), `git` 2.32 or newer (older git ignores `GIT_CONFIG_GLOBAL` and reads your global config), `curl`, and `python3` on `PATH`. The repo's own smoke script needs the same tools. The helper is tested on Linux only. Its macOS branches (`lsof`, `ps`, no `setsid`) are untested.
+- bash on Linux or macOS, plus `go` (the `go` line in `go.mod`), `git` 2.32 or newer (older git ignores `GIT_CONFIG_GLOBAL` and reads your global config, so `launch` and `git` refuse it), `curl`, and `python3` on `PATH`. The repo's own smoke script needs the same tools. The helper is tested on Linux only. Its macOS branches (`lsof`, `ps`, no `setsid`) are untested.
 - Run the commands from the repository root.
-- Choose a new run directory for every run, outside the checkout. `launch` refuses a directory inside the checkout (it would dirty `git status`) and a directory that is not empty. It sets the run directory to mode 700, and every command refuses a run directory (or its `work/`) that another user owns or that group or others can write, because the commands source `work/state.env`.
+- Choose a new run directory for every run, outside the checkout. `launch` refuses a directory inside the checkout (it would dirty `git status`) and a directory that is not empty. It sets the run directory to mode 700, and every command refuses a run directory (or its `work/`) that another user owns or that group or others can write, because the commands source `work/state.env`. Every command also refuses a run directory with a parent that another user owns (root is allowed) or that group or others can write without the sticky bit, because that user could swap the run directory. `/tmp` passes: its sticky bit stops other users from renaming your entries.
 
 ## Launch
 
@@ -57,7 +57,7 @@ Doctor is read-only. Run it first whenever a result looks wrong. It prints one l
 | `port` | That PID owns the listening socket (`ss`, else `lsof`; SKIP when neither is installed). |
 | `healthz` | `GET /healthz` answers `{"status":"ok"}`. |
 | `auth+db` | A fresh `org:read` token gets 200 from `GET /api/v1/repos`. |
-| `build` | `openstorage version` names the checkout's `HEAD` commit. A `WARN build ... +dirty` line means the binary includes uncommitted changes. |
+| `build` | `openstorage version` names the checkout's `HEAD` commit. A `WARN build ... vcs.modified=true` line (read with `go version -m`) means the binary includes uncommitted changes. |
 | `data-dir` | `$RUN/work/data/codestorage.db` exists. |
 
 A `build` FAIL means the checkout moved after launch. Clean up and launch a new run.
@@ -143,7 +143,7 @@ Proof standards:
 - Record each denied request with `--expect`, so a 401 or 403 is proof and not a silent failure.
 - Report a failed step with its label and evidence files. Do not report an entry point as verified through a different entry point.
 - serve logs `/api` requests (method, path, status) on stderr. It does not log Git smart-HTTP requests, so prove Git behavior from git's exit code and output.
-- The helper never writes token values to evidence. As a safeguard, cleanup also replaces any stored token value that it finds in the evidence with `<token:name>`. Tokens expire after 1 hour (`mint --ttl`), so mint a new one for a long run.
+- The helper does not write token values to evidence. One exception: a failed `api` call keeps curl's stderr, and with `-v` that shows the `Authorization` header. Cleanup replaces every stored token value in the evidence with `<token:name>`, and its Basic-auth form `base64("t:<token>")` with `<basic:name>`. Tokens expire after 1 hour (`mint --ttl`), so mint a new one for a long run.
 
 ## Cleanup
 

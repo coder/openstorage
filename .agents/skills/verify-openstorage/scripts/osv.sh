@@ -39,6 +39,33 @@ private_dir() {
 	return 0
 }
 
+# safe_parents <dir>: refuse a path where another local user could rename
+# <dir> or one of its parents and put their own state.env in its place. Every
+# parent must be owned by root or by you, and not writable by group or others
+# unless it has the sticky bit (as /tmp has: there only an entry's owner can
+# rename it). <dir> must be a physical path (pwd -P).
+safe_parents() {
+	local d=$1 om uid mode
+	while [[ $d != / ]]; do
+		d=$(dirname "$d")
+		om=$(stat -c '%u %a' "$d" 2>/dev/null || stat -f '%u %p' "$d" 2>/dev/null) || die "cannot stat $d"
+		uid=${om%% *} mode=${om##* }
+		[[ $uid == 0 || $uid == "$(id -u)" ]] || die "$d is owned by uid $uid: that user could swap the run dir: pick a run dir under directories that you or root own"
+		if ((8#$mode & 8#022)) && ! ((8#$mode & 8#1000)); then
+			die "$d is writable by group or others without the sticky bit (mode $mode): another user could swap the run dir"
+		fi
+	done
+}
+
+# require_git: git 2.32 or newer, the first release that honors GIT_CONFIG_GLOBAL.
+# Older git reads the caller's ~/.gitconfig despite cmd_git's isolation.
+require_git() {
+	local v
+	v=$(git --version) || die "git --version failed"
+	[[ $v =~ ([0-9]+)\.([0-9]+) ]] || die "cannot parse '$v'"
+	((BASH_REMATCH[1] > 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] >= 32))) || die "$v is older than 2.32: it ignores GIT_CONFIG_GLOBAL"
+}
+
 # run_paths <run>: resolve RUN/WORK/EVID for an existing run dir.
 run_paths() {
 	[[ $# -ge 1 && -n $1 ]] || die "missing <run> directory argument"
@@ -46,6 +73,7 @@ run_paths() {
 	WORK=$RUN/work
 	EVID=$RUN/evidence
 	BIN=$WORK/bin/openstorage
+	safe_parents "$RUN"
 	private_dir "$RUN"
 	[[ ! -e $WORK ]] || private_dir "$WORK"
 	[[ -f $RUN/.osv-run ]] || die "$RUN has no .osv-run marker: it was not created by 'osv.sh launch'"
@@ -118,6 +146,8 @@ cmd_launch() {
 	case $RUN/ in "$REPO"/*) die "run dir $RUN is inside the checkout $REPO: pick one outside it so git status stays clean" ;; esac
 	[[ ! -e $RUN || -z $(ls -A "$RUN") ]] || die "run dir $RUN is not empty: use a fresh directory for every run"
 	for tool in go git curl python3; do command -v "$tool" >/dev/null || die "$tool is not on PATH"; done
+	require_git
+	safe_parents "$RUN"
 	mkdir -p "$RUN"
 	chmod 700 "$RUN" || die "cannot chmod 700 $RUN"
 	private_dir "$RUN"
@@ -208,7 +238,10 @@ cmd_doctor() {
 		head_sha=$(git -C "$REPO" rev-parse HEAD)
 		built=$("$BIN" version 2>&1) || true
 		if [[ $built == *"commit $head_sha"* ]]; then say PASS build "$built"; else say FAIL build "binary is '$built' but the checkout HEAD is $head_sha: start a new run"; fi
-		[[ $built != *+dirty* ]] || say WARN build "+dirty: built from a checkout with uncommitted changes"
+		# Go records uncommitted changes in the build setting vcs.modified=true.
+		if go version -m "$BIN" 2>/dev/null | grep -q 'vcs\.modified=true'; then
+			say WARN build "vcs.modified=true: built from a checkout with uncommitted changes"
+		fi
 
 		if [[ -f $WORK/data/codestorage.db ]]; then say PASS data-dir "$WORK/data (sqlite + file blobs)"; else say FAIL data-dir "$WORK/data/codestorage.db is missing"; fi
 		echo "doctor: $fails failure(s)"
@@ -320,6 +353,7 @@ cmd_git() {
 	[[ ${1-} == -- ]] || die "usage: osv.sh git <run> <label> [--token <name>|none] [--expect <exit>] -- <git args...>"
 	shift
 	[[ $# -gt 0 ]] || die "no git arguments after --"
+	require_git
 	[[ ! -e $EVID/$label.git.txt ]] || die "label '$label' is already used in $EVID"
 	local tokfile=''
 	[[ $TOKEN == none ]] || tokfile=$WORK/tokens/$TOKEN
@@ -437,15 +471,18 @@ cmd_cleanup() {
 			[[ -e $t ]] || continue
 			printf '%s: %s\n' "$(basename "$t" .desc)" "$(<"$t")"
 		done >"$EVID/tokens.txt"
-		# Replace every stored token value with <token:name> in the evidence.
+		# Replace every stored token value with <token:name> in the evidence, and
+		# its Basic-auth form base64("t:<token>"), which curl -v prints in a
+		# failed call's stderr that cmd_api keeps.
 		python3 - "$WORK/tokens" "$EVID" <<'PYEOF'
-import os, sys
+import base64, os, sys
 tokdir, evid = sys.argv[1], sys.argv[2]
 toks = {}
 for n in os.listdir(tokdir):
     if not n.endswith(".desc"):
         v = open(os.path.join(tokdir, n), "rb").read()
         if len(v) >= 8:
+            toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
             toks[v] = b"<token:" + n.encode() + b">"
 for n in os.listdir(evid):
     p = os.path.join(evid, n)
