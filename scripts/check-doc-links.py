@@ -329,9 +329,9 @@ def link_failures(path, lineno, ln):
 
 
 def masked(text, lexer):
-    # Same length and newlines as text, so declarations keep their line and
-    # column. A quoted literal keeps its delimiters, so go_names and tf_names
-    # can find a flag name or a block label in the code and read it from text.
+    # Same length and newlines as text, so line, column, and offset survive.
+    # Quoted literals keep their quotes, so go_names and tf_names can find a
+    # flag name or block label here and read its value from text.
     def blank(m):
         token, keep = m.group(), 1 if m.groupdict().get("quoted") else 0
         return token[:keep] + re.sub(r"[^\n]", " ", token[keep:len(token) - keep]) + token[len(token) - keep:]
@@ -350,7 +350,7 @@ JS_LEXER = re.compile(r"(?P<blank>//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:
 
 
 def go_names(text):
-    # Assumes gofmt layout, where declarations start in column 0 and members one tab in.
+    # Assumes gofmt layout: declarations in column 0, members one tab in.
     code = masked(text, GO_LEXER)
     names = set()
     owner, close, member = None, None, None
@@ -493,8 +493,8 @@ def js_names(text):
     return names
 
 
-# A shell contract cites commands, options, and file names, which have no
-# declaration, so a shell citation is a whole-token phrase in code.
+# Shell commands, options, and file names have no declaration, so any
+# whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
         self.code = "\n".join(re.sub(r"(?:^|(?<=\s))#.*", "", line) for line in text.splitlines())
