@@ -197,7 +197,6 @@ the [archived phase notes](../archive/phases/)):
 | `POST /repos` `upstream.host`: a bare hostname | Also accepts an `http(s)://` base URL, as `base_repo.upstream_host` does | Self-hosted forges on plain HTTP or a sub-path; the same validation and egress policy apply |
 | `Deprecation` header on the deprecated `pull-upstream` and `base` routes: the spec defines none. Upstream's changelog of 2026-10-07 says every response carries one but gives no value | `Deprecation: @1791331200` (RFC 9745 date, 2026-10-07T00:00:00Z) on every response of the four routes, errors included ([details](../reference/http-api.md#deprecation-header)). No `Link` or `Sunset` | Upstream's exact value is undocumented, so open.storage uses the standard form |
 | `POST /repos` with both `upstream` and `base_repo`: "do not set" both, no documented error | 400 | Ambiguous request; failing loudly beats guessing which form wins |
-| `POST /repos` `base_repo` copy: default branch defaults to `main` when omitted | Without a top-level `default_branch`, a copy takes the source's default branch name (fork behavior) | A copy runs the fork implementation |
 | `POST /repos` is idempotent on the name: `200` for any existing name unless its upstream differs (spec 2026-10-07) | A finished repo answers `200` to a matching repeat create: a sync create with the same upstream and `forward_pushes`, or a plain, copy or fork create of a repo without an upstream. A different upstream is `409`, as upstream documents, and so is a create form that does not match the repo (sync onto a plain repo, plain onto a synced repo). Repos created before create tracking (on S3-WAL, every repo created by v0.18.0 or earlier) answer `409` to every repeat. While a copy or fork create is still running, plain, copy and fork creates of the name are `503` with `Retry-After`. A pending sync create is finished by a matching sync create with `git:write` (`200`); other forms are `409` ([Repeat creates](../reference/http-api.md#repository-lifecycle-repowrite--orgread)). A name a deleted repo holds is `404` | A `200` names a repo only after its create finished, so it never names a repo that the failing create then deletes ([#388](https://github.com/coder/openstorage/issues/388)). A form mismatch is `409` because a `200` would hide that the request was not applied. Older repos store no create state (#335 for S3-WAL) |
 | `GET`/`POST /api/repos` (bare collection routes) | `/api/v1/repos` only; named-repo aliases exist for repo-scoped routes, not org-scoped collections | The alias layer covers the styles SDKs use |
 | RFC 9457 problem-details error bodies (spec). Since upstream's 2026-09-24 spec update, `ProblemDetails` requires a snake_case `code` and tells clients to branch on `code`, not on `detail` | The plain `{"error":"<msg>"}` envelope carries problem-details fields next to `error`: `type` (`about:blank`), `title`, `status`, `detail` (same string as `error`), `code` ([#349](https://github.com/coder/openstorage/issues/349)), and `instance`, the request path without the query ([#352](https://github.com/coder/openstorage/issues/352)). `code` is upstream's generic per-status code, except for nine of upstream's specific codes: `repository_not_found`, `insufficient_scope`, `repo_name_mismatch`, `branch_not_found`, `ref_not_found`, `credential_not_found`, `credential_exists`, `repository_deleted` ([#352](https://github.com/coder/openstorage/issues/352)), and `ref_guard_failed` with its `guard` and `current_sha` members on a failed merge guard and on the 409 notes guards ([#568](https://github.com/coder/openstorage/issues/568)). A 400 for a request body carries the optional `invalid_params` list (`ValidationProblemDetails`, spec 2026-10-08, [#396](https://github.com/coder/openstorage/issues/396)) when open.storage can name the invalid fields: body decode failures (wrong JSON type, and unknown, duplicate or `null` members of strictly decoded bodies) and single-field checks (required fields, allowed values, ranges, name formats). Not emitted: upstream's other specific codes (such as `route_not_found`), `invalid_params` for failures that cannot name one field, and the `application/problem+json` content type. The [streaming protocols](streaming-commit-protocols.md) `{"result":{"success":false,…}}` envelope carries no problem-details fields, except the 409 notes guard body, which keeps the note members and adds the problem members as upstream's `NotesWriteRefGuardProblemDetails`. Failures use one of these two shapes, by route and failure class. Do not assume one shape per route family: branch on the status code, or check both shapes. Per-route contracts are in [HTTP API](../reference/http-api.md) and [streaming protocols](streaming-commit-protocols.md) | Recorded deviations ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md), [ADR-26](../adr/026-result-envelope-statuses-499-is-not-emittable.md)): all three SDKs branch on status codes. At the 2026-09-25 audit this held for SDK `1.17.1` (stable) and `1.18.0-beta.0` (beta): no SDK reads `code`, `detail`, or any problem-details field other than the legacy `error` string. The beta Go and TypeScript clients additionally accept `application/problem+json` error bodies; the content type stays `application/json` because the `1.17.1` Go and TypeScript clients parse error JSON only for that type. Upstream says to treat an unknown code as the generic code for its status, so a client that follows that guidance handles every `code` open.storage sends; a client that expects one of the specific codes open.storage does not emit sees the generic one instead (for example `not_found` for `route_not_found`). `status` is a JSON number, as in upstream's bodies: a client that decoded the old `{"error"}` body into a string-only map (such as Go's `map[string]string`) must switch to a struct or `map[string]any`. At the 2026-10-08 audit, no SDK (`1.17.1`, `1.18.0-beta.1`) reads `invalid_params`; the member is optional, so a client that ignores it sees no change |
@@ -239,19 +238,30 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-28 (upstream
-  `Last-Modified` 2026-10-27 21:45:58 GMT), SHA-256
-  `b598ce96ab0f7bef25f9efd1e32a9b201e781dabab894fc7f53cb8b4e430ec70`. Against the
-  previous snapshot (`c494c01b`, which added the `ref_guard_failed` code,
-  [#568](https://github.com/coder/openstorage/issues/568)) it changes only two
-  descriptions: commit list entries and `files/metadata` commits carry the subject line
-  of the message. Both follow it
-  ([#570](https://github.com/coder/openstorage/issues/570)). At 00:09 UTC on
-  2026-10-28
-  [the cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served an
-  older snapshot (`10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356`),
-  so both changes are documented in the docs only. A spec that the cluster serves does
-  not prove how the cluster behaves either.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-29 (upstream
+  `Last-Modified` 2026-10-28 22:23:55 GMT), SHA-256
+  `40e43e00b8a35664099d41e7c4b93a02b6fe48b29aa4822b82b4f8ba9427ce13`.
+  [The cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) served the
+  same bytes at 00:45 UTC on 2026-10-29. The cluster never served the previous
+  snapshot (`b598ce96`, subject-line commit messages,
+  [#570](https://github.com/coder/openstorage/issues/570)) in any check: it served
+  `10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356` at 00:09 UTC on
+  2026-10-28, and `40e43e00` at the next check. A spec that the cluster serves does not
+  prove how the cluster behaves. Against `b598ce96`, the snapshot changes:
+  - `files` lists recursively when the call sends no `recursive`
+    ([#598](https://github.com/coder/openstorage/issues/598));
+  - `commit-pack` and `diff-commit` answer `412` `no changes to commit`
+    ([#595](https://github.com/coder/openstorage/issues/595)), and `409` `failed` with
+    the unpublished commit when the ref update is lost
+    ([#596](https://github.com/coder/openstorage/issues/596)). `commit-pack` answers
+    `413` when the decoded file contents pass 262,144,000 bytes
+    ([#597](https://github.com/coder/openstorage/issues/597));
+  - `RefUpdateResult.status` gets a closed enum without `busy`
+    ([#594](https://github.com/coder/openstorage/issues/594));
+  - an omitted `default_branch` follows the source of a copy, as open.storage already
+    does, and the GitHub repository of a sync
+    ([#599](https://github.com/coder/openstorage/issues/599));
+  - `archive` no longer requires `ref`, which open.storage already treats as optional.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled
