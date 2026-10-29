@@ -98,6 +98,20 @@ changes nothing, such as an empty diff (one `{"data": "", "eof": true}` frame), 
 `precondition_failed` with the message `no changes to commit`. A stream that ends before
 the `eof` chunk gets 412 too, and a stream without any `diff_chunk` frame gets 400.
 
+When the patch cannot be used, the answer depends on why:
+
+- The payload is not a patch that git can parse (no diff, a corrupt hunk, a binary diff
+  without its data): 400 `invalid`.
+- The patch names a path no tree may hold (absolute, a `.` or `..` segment, a `.git`
+  component): 400 `invalid`, with the same wording as `commit-pack`.
+- The patch does not apply to the base tree (context that does not match, a file that is
+  missing or already exists, a binary preimage that differs, a path beyond a symlink, a
+  file where a directory is): 409 `conflict` with the message `patch does not apply: …`
+  and git's own error. No ref moves.
+
+Before [#608](https://github.com/coder/openstorage/issues/608), all of these answered 422
+`invalid`.
+
 ## 3. Response envelope (shared, also used by restore-commit)
 
 Success (HTTP 200):

@@ -833,14 +833,14 @@ func TestDiffCommit(t *testing.T) {
 			}
 		})
 
-		t.Run("non-applying patch is 422", func(t *testing.T) {
+		t.Run("non-applying patch is 409 conflict", func(t *testing.T) {
 			// The same patch again: a.txt no longer has "line2" context.
 			frames := wctLines(t,
 				wctMeta("main", "conflict", nil, nil),
 				wctDiffChunk([]byte(patch), true),
 			)
 			resp, respBody := wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(frames))
-			wctRequireFail(t, resp, respBody, http.StatusUnprocessableEntity, "invalid")
+			wctRequireFail(t, resp, respBody, http.StatusConflict, "conflict")
 		})
 
 		t.Run("files in metadata rejected", func(t *testing.T) {
@@ -865,6 +865,112 @@ func TestDiffCommit(t *testing.T) {
 				t.Errorf("message %q does not mention base64", env.Result.Message)
 			}
 		})
+	})
+}
+
+// TestDiffCommitApplyFailures (#608; spec 409: "When the diff does not
+// apply, the body is application/json and result.status is conflict"):
+// a parseable patch that does not apply to the base tree answers 409
+// conflict, and a payload that is not a patch or names a path no tree can
+// hold answers 400 invalid (spec 400: "the diff payload was invalid").
+// Neither moves a ref.
+func TestDiffCommitApplyFailures(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		repo, writeTok, _ := wctRepo(t, e)
+		upsert := func(path, mode string) map[string]any {
+			return map[string]any{"path": path, "content_id": "id-" + path, "operation": "upsert", "mode": mode}
+		}
+		binBase := []byte{0x00, 0x01, 'b', 'i', 'n'}
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "base", []map[string]any{
+				upsert("a.txt", "100644"), upsert("link", "120000"), upsert("d/f", "100644"), upsert("bin.dat", "100644"),
+			}, nil),
+			wctChunk("id-a.txt", []byte("line1\nline2\nline3\n"), true),
+			wctChunk("id-link", []byte("a.txt"), true),
+			wctChunk("id-d/f", []byte("x\n"), true),
+			wctChunk("id-bin.dat", binBase, true),
+		)))
+		wctRequireOK(t, resp, body)
+
+		// A real binary patch whose preimage is not the server's bin.dat.
+		dir := t.TempDir()
+		coreGit(t, dir, "init", "-q", "-b", "main", ".")
+		if err := os.WriteFile(filepath.Join(dir, "bin.dat"), []byte{0x00, 0x02, 'o', 't', 'h'}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		coreGit(t, dir, "add", ".")
+		coreGit(t, dir, "commit", "-q", "-m", "other")
+		if err := os.WriteFile(filepath.Join(dir, "bin.dat"), []byte{0x00, 0x03, 'n', 'e', 'w'}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		binPatch := coreGit(t, dir, "diff", "--binary")
+		if !strings.Contains(binPatch, "GIT binary patch") {
+			t.Fatalf("test bug: no binary hunk:\n%s", binPatch)
+		}
+
+		newFile := func(path string) string {
+			return "diff --git a/" + path + " b/" + path + "\nnew file mode 100644\n--- /dev/null\n+++ b/" + path + "\n@@ -0,0 +1 @@\n+x\n"
+		}
+		for _, tc := range []struct {
+			name, patch string
+			wantCode    int
+			wantMsg     string
+		}{
+			{"context mismatch", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n line1\n-XXXX\n+LINE2\n line3\n",
+				http.StatusConflict, "patch does not apply"},
+			{"modify a missing file", "diff --git a/nope.txt b/nope.txt\n--- a/nope.txt\n+++ b/nope.txt\n@@ -1 +1 @@\n-a\n+b\n",
+				http.StatusConflict, "does not exist in index"},
+			{"create an existing file", newFile("a.txt"), http.StatusConflict, "already exists in index"},
+			{"delete a missing file", "diff --git a/nope.txt b/nope.txt\ndeleted file mode 100644\n--- a/nope.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n",
+				http.StatusConflict, "does not exist in index"},
+			{"rename a missing file", "diff --git a/nope.txt b/new.txt\nsimilarity index 100%\nrename from nope.txt\nrename to new.txt\n",
+				http.StatusConflict, "does not exist in index"},
+			{"mode change on a missing file", "diff --git a/nope.txt b/nope.txt\nold mode 100644\nnew mode 100755\n",
+				http.StatusConflict, "does not exist in index"},
+			{"path beyond a symlink", newFile("link/x"), http.StatusConflict, "beyond a symbolic link"},
+			{"file where a directory is", newFile("d"), http.StatusConflict, "both a file and as a directory"},
+			{"binary preimage mismatch", binPatch, http.StatusConflict, "does not match the current contents"},
+			{"not a patch", "hello world\nnot a patch\n", http.StatusBadRequest, "No valid patches"},
+			{"corrupt hunk", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n line1\n",
+				http.StatusBadRequest, "corrupt patch"},
+			{"binary diff without data", "diff --git a/bin.dat b/bin.dat\nBinary files a/bin.dat and b/bin.dat differ\n",
+				http.StatusBadRequest, "No valid patches"},
+			{".git path", newFile(".git/config"), http.StatusBadRequest, ".git component"},
+			{"parent path", newFile("../x"), http.StatusBadRequest, "invalid path segment"},
+			{"absolute path", "diff --git a//etc/x b//etc/x\nnew file mode 100644\n--- /dev/null\n+++ b//etc/x\n@@ -0,0 +1 @@\n+x\n",
+				http.StatusBadRequest, "absolute path"},
+			{"rename into .git", "diff --git a/a.txt b/.git/x\nsimilarity index 100%\nrename from a.txt\nrename to .git/x\n",
+				http.StatusBadRequest, ".git component"},
+			// git apply names only the new path of a rename; an old path no
+			// tree may hold is never in the base, so the patch does not apply.
+			{"rename from a .git path", "diff --git a/.git/x b/c.txt\nsimilarity index 100%\nrename from .git/x\nrename to c.txt\n",
+				http.StatusConflict, "does not exist in index"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				before := wmRefsSnapshot(t, e, repo.RepoID)
+				resp, body := wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok,
+					bytes.NewReader(wctLines(t, wctMeta("main", "d", nil, nil), wctDiffChunk([]byte(tc.patch), true))))
+				env := wctRequireFail(t, resp, body, tc.wantCode, statusForHTTP(tc.wantCode))
+				if !strings.Contains(env.Result.Message, tc.wantMsg) || env.Commit != nil {
+					t.Fatalf("result = %s, want message containing %q and no commit", body, tc.wantMsg)
+				}
+				// git reads the patch from stdin: no server path or command line.
+				if strings.Contains(env.Result.Message, "patch.diff") || strings.Contains(env.Result.Message, "--cached") {
+					t.Fatalf("message %q leaks the server's scratch path or git command", env.Result.Message)
+				}
+				if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
+					t.Fatalf("refs moved: %v -> %v", before, after)
+				}
+			})
+		}
+
+		// Control: a rename that fits the base commits, as one file.
+		resp, body = wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(wctLines(t, wctMeta("main", "mv", nil, nil),
+			wctDiffChunk([]byte("diff --git a/a.txt b/b.txt\nsimilarity index 100%\nrename from a.txt\nrename to b.txt\n"), true))))
+		if env := wctRequireOK(t, resp, body); env.Commit.BlobCount == nil || *env.Commit.BlobCount != 1 {
+			t.Fatalf("rename blob_count = %v, want 1", env.Commit.BlobCount)
+		}
 	})
 }
 

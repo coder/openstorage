@@ -369,16 +369,27 @@ func wcReadMetadata(w http.ResponseWriter, lr *wcLineReader) (*wcMetadata, bool)
 // or the repository itself (control bytes, `.git` components, `.` segments,
 // empty segments/trailing slash).
 func wcValidPath(p string) error {
-	if p == "" {
-		return errors.New("empty path")
-	}
-	if strings.HasPrefix(p, "/") {
-		return fmt.Errorf("absolute path %q", p)
+	if err := wcPathShapeError(p); err != nil {
+		return err
 	}
 	for _, r := range p {
 		if r < 0x20 || r == 0x7f {
 			return fmt.Errorf("control character in path %q", p)
 		}
+	}
+	return nil
+}
+
+// wcPathShapeError rejects a path no tree may hold: empty, absolute, an
+// empty, "." or ".." segment, or a .git component. diff-commit checks
+// patch paths with it alone (#608): git patches may name control
+// characters, which commit-pack's JSON paths may not.
+func wcPathShapeError(p string) error {
+	if p == "" {
+		return errors.New("empty path")
+	}
+	if strings.HasPrefix(p, "/") {
+		return fmt.Errorf("absolute path %q", p)
 	}
 	for seg := range strings.SplitSeq(p, "/") {
 		switch {
@@ -626,6 +637,65 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
+}
+
+// wcMaxApplyMsgBytes caps the git apply message a client sees.
+const wcMaxApplyMsgBytes = 4096
+
+// applyPatch runs `git apply` on the spooled patch. The patch goes on
+// stdin, so git's messages name <stdin>, never the scratch path. When git
+// itself rejects the patch (it exits with a status), gitMsg is git's
+// stderr, cut to wcMaxApplyMsgBytes, and safe to show the client.
+// Any other failure (a canceled request, a git killed by a signal, a
+// server shutdown) leaves gitMsg empty and returns err.
+func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...string) (out, gitMsg string, err error) {
+	f, err := os.Open(patchPath)
+	if err != nil {
+		return "", "", fmt.Errorf("open patch: %w", err)
+	}
+	defer f.Close()
+	cmd := sc.gitCmd(ctx, nil, append([]string{"apply"}, args...)...)
+	cmd.Stdin = f
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	o, err := gitlimit.Output(cmd)
+	if err == nil {
+		return string(o), "", nil
+	}
+	var exit *exec.ExitError
+	if ctx.Err() != nil || !errors.As(err, &exit) || exit.ExitCode() < 0 {
+		return "", "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	gitMsg = strings.TrimSpace(stderr.String())
+	if len(gitMsg) > wcMaxApplyMsgBytes {
+		gitMsg = strings.ToValidUTF8(gitMsg[:wcMaxApplyMsgBytes], "") + " …"
+	}
+	if gitMsg == "" {
+		gitMsg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
+	}
+	return "", gitMsg, err
+}
+
+// wcNumstatPaths parses `git apply --numstat -z`: one record per file,
+// "added<TAB>deleted<TAB>path<NUL>". The path is the file's new name (its
+// old name for a deletion): unlike `git diff`, git apply prints one name
+// for a rename or copy too. A rename's old name must exist in the base
+// tree, and a bad one never does, so that patch does not apply (409).
+func wcNumstatPaths(out string) ([]string, error) {
+	var paths []string
+	for rest := out; rest != ""; {
+		rec, after, ok := strings.Cut(rest, "\x00")
+		if !ok {
+			return nil, fmt.Errorf("numstat record without NUL: %q", rest)
+		}
+		fields := strings.SplitN(rec, "\t", 3)
+		if len(fields) != 3 || fields[2] == "" {
+			return nil, fmt.Errorf("numstat record %q", rec)
+		}
+		paths = append(paths, fields[2])
+		rest = after
+	}
+	return paths, nil
 }
 
 // resolveTree resolves a commit sha to its tree sha.
@@ -1122,8 +1192,9 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 // handleDiffCommit implements docs/explanation/streaming-commit-protocols.md §2: same metadata frame (no files),
 // diff_chunk frames spooled to a scratch file and applied to the base tree
 // with `git apply --cached`. A diff that changes nothing (an empty one
-// included) is 412 "no changes to commit"; a patch that does not apply is
-// `invalid` (422).
+// included) is 412 "no changes to commit"; a payload that is not a patch,
+// or names a path no tree may hold, is 400 `invalid`; a patch that does not
+// apply to the base is 409 `conflict` (#608).
 func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.wcResolveRepo(w, r)
 	if !ok {
@@ -1180,26 +1251,44 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	blobCount := 0
 	if patchBytes > 0 {
-		if _, err := sc.git(r.Context(), nil, nil, "apply", "--cached", "--binary", "--whitespace=nowarn", patchPath); err != nil {
-			// The patch is client input: rejection is an envelope, never
-			// a 500 (docs/explanation/streaming-commit-protocols.md maps 422 -> invalid).
-			wcFail(w, http.StatusUnprocessableEntity, "invalid", "patch does not apply: "+err.Error(),
-				md.TargetBranch, plan.oldSHA)
+		// The patch is client input, so a rejection is an envelope, never
+		// a 500 (#608). `git apply --numstat` parses without applying: a
+		// parse failure means the payload is not a patch (400, spec "the
+		// diff payload was invalid").
+		numstat, gitMsg, err := sc.applyPatch(r.Context(), patchPath, "--numstat", "-z")
+		if gitMsg != "" {
+			wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+gitMsg, md.TargetBranch, plan.oldSHA)
+			return
+		} else if err != nil {
+			s.wcInternal(w, r, "parse patch", err)
+			return
+		}
+		paths, err := wcNumstatPaths(numstat)
+		if err != nil {
+			s.wcInternal(w, r, "parse patch numstat", err)
+			return
+		}
+		// A path that no tree may hold is invalid on every base (400),
+		// with commit-pack's wording.
+		for _, p := range paths {
+			if err := wcPathShapeError(p); err != nil {
+				wcFail(w, http.StatusBadRequest, "invalid", "invalid patch: "+err.Error(), md.TargetBranch, plan.oldSHA)
+				return
+			}
+		}
+		// Any other failure means the patch does not fit the base tree:
+		// 409 conflict, upstream's "the diff does not apply".
+		if _, gitMsg, err := sc.applyPatch(r.Context(), patchPath, "--cached", "--binary", "--whitespace=nowarn"); gitMsg != "" {
+			wcFail(w, http.StatusConflict, "conflict", "patch does not apply: "+gitMsg, md.TargetBranch, plan.oldSHA)
+			return
+		} else if err != nil {
+			s.wcInternal(w, r, "apply patch", err)
 			return
 		}
 		// blob_count: the SDK ack schema requires a number on diff-commit
 		// too; report the count of files the patch touches (one numstat
-		// line per file).
-		numstat, err := sc.git(r.Context(), nil, nil, "apply", "--numstat", patchPath)
-		if err != nil {
-			s.wcInternal(w, r, "numstat patch", err)
-			return
-		}
-		for ln := range strings.SplitSeq(numstat, "\n") {
-			if strings.TrimSpace(ln) != "" {
-				blobCount++
-			}
-		}
+		// record per file).
+		blobCount = len(paths)
 	}
 	tree, err := sc.git(r.Context(), nil, nil, "write-tree")
 	if err != nil {

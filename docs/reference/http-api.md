@@ -623,7 +623,7 @@ Other limits and gaps:
 | 400 | invalid input; also "custom notes refs not enabled" |
 | 401 / 403 | auth failed / permission or ref-policy denied |
 | 404 | repo/object/branch not found; unborn-branch file metadata |
-| 409 | repo exists, repo already deleted, credential exists, merge conflict, failed merge guard (`expected_target_sha`, `expected_source_sha`), CAS conflict |
+| 409 | repo exists, repo already deleted, credential exists, merge conflict, failed merge guard (`expected_target_sha`, `expected_source_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 412 | CAS precondition failed; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
