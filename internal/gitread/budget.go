@@ -240,6 +240,13 @@ func (b *Budget) start(ctx context.Context) (deadline time.Time, err error) {
 	return deadline, nil
 }
 
+// remaining returns the buffered-output allowance left.
+func (b *Budget) remaining() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.outputLeft
+}
+
 // take reserves n bytes of buffered output; false means the allowance is
 // exhausted (the reservation is not made).
 func (b *Budget) take(n int64) bool {

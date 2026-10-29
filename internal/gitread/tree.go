@@ -75,8 +75,10 @@ var ErrUnsortedTree = errors.New("ls-tree listed entries out of order")
 // well-formed tree in byte order of the full paths, so LsTreePage streams
 // `ls-tree -r` and stops git one entry past the page: its cost grows with
 // the entries up to the page, not with the tree. Only the page counts
-// against the request's output allowance. found reports whether path
-// matched any entry. A listing out of order returns ErrUnsortedTree.
+// against the request's output allowance, and only once the page is
+// complete, so a failed or refused page charges nothing. found reports
+// whether path matched any entry. A listing out of order returns
+// ErrUnsortedTree.
 func LsTreePage(ctx context.Context, repoPath, commit, path, after string, limit int) (page []TreeEntry, hasMore, found bool, err error) {
 	assertf(ref.ValidSHA(commit) || commit == EmptyTreeSHA, "LsTreePage: unresolved commit %q", commit)
 	assertf(limit > 0, "LsTreePage: limit %d", limit)
@@ -91,6 +93,9 @@ func LsTreePage(ctx context.Context, repoPath, commit, path, after string, limit
 	if p.err == nil && len(p.pending) > 0 && !p.hasMore {
 		p.err = fmt.Errorf("ls-tree output ended inside a record: %q", p.pending)
 	}
+	if p.err == nil && p.budget != nil && !p.budget.take(int64(p.kept)) {
+		p.err = fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
+	}
 	if p.err != nil {
 		return nil, false, false, p.err
 	}
@@ -104,6 +109,7 @@ type lsTreePager struct {
 	after   string
 	limit   int
 	budget  *Budget // nil: no output allowance
+	kept    int     // bytes of the page's records
 	pending []byte  // the start of a record split across writes
 	prev    string  // the last path read, for the order check
 	found   bool
@@ -117,7 +123,7 @@ func (p *lsTreePager) Write(b []byte) (int, error) {
 	for len(b) > 0 {
 		i := bytes.IndexByte(b, 0)
 		if i < 0 {
-			p.keep(len(b))
+			p.fits(len(p.pending) + len(b))
 			p.pending = append(p.pending, b...)
 			break
 		}
@@ -138,9 +144,11 @@ func (p *lsTreePager) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-// keep charges n retained bytes to the output allowance.
-func (p *lsTreePager) keep(n int) {
-	if p.err == nil && p.budget != nil && !p.budget.take(int64(n)) {
+// fits checks that the page plus n more retained bytes stay within the
+// output allowance left. It charges nothing: LsTreePage charges the page
+// once it is complete.
+func (p *lsTreePager) fits(n int) {
+	if p.err == nil && p.budget != nil && int64(p.kept+n) > p.budget.remaining() {
 		p.err = fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
 	}
 }
@@ -161,7 +169,8 @@ func (p *lsTreePager) record(rec string) {
 	case len(p.page) == p.limit:
 		p.hasMore = true
 	default:
-		p.keep(len(rec))
+		p.fits(len(rec))
+		p.kept += len(rec)
 		p.page = append(p.page, e)
 	}
 }

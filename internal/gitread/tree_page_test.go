@@ -110,17 +110,30 @@ func TestLsTreePageRefusesAnUnsortedTree(t *testing.T) {
 	tree := gitIn(t, dir, "100644 b\x00"+string(raw)+"100644 a\x00"+string(raw),
 		"hash-object", "-t", "tree", "--literally", "-w", "--stdin")
 	commit := gitIn(t, dir, "", "commit-tree", tree, "-m", "unsorted")
-	ctx := context.Background()
-
-	all, err := LsTree(ctx, dir, commit, "", true)
+	all, err := LsTree(context.Background(), dir, commit, "", true)
 	if err != nil || len(all) != 2 || all[0].Path != "b" {
 		t.Fatalf("control: LsTree = %v, %v; want b before a", all, err)
 	}
+	// The refused page charges nothing, so the caller's whole-tree
+	// fallback gets the full allowance.
 	for _, limit := range []int{1, 5} {
+		ctx, b := budgeted(t, 1<<20)
 		if _, _, _, err := LsTreePage(ctx, dir, commit, "", "", limit); !errors.Is(err, ErrUnsortedTree) {
 			t.Fatalf("limit %d: err = %v, want ErrUnsortedTree", limit, err)
 		}
+		if left := b.remaining(); left != 1<<20 {
+			t.Fatalf("limit %d: %d bytes of allowance left, want all %d", limit, left, 1<<20)
+		}
 	}
+}
+
+// budgeted returns a context whose Budget allows output bytes of
+// buffered output.
+func budgeted(t *testing.T, output int64) (context.Context, *Budget) {
+	t.Helper()
+	b := NewBudget(NewSlots(1, 1, 0), "repo", time.Minute, output)
+	t.Cleanup(b.Close)
+	return WithBudget(context.Background(), b), b
 }
 
 func TestLsTreePageCountsOnlyThePage(t *testing.T) {
@@ -135,23 +148,33 @@ func TestLsTreePageCountsOnlyThePage(t *testing.T) {
 	if err != nil || len(all) != n {
 		t.Fatalf("LsTree: %d entries, %v", len(all), err)
 	}
-	// 4 KiB holds a page of 10 records (about 80 bytes each), not the tree.
-	budgeted := func() context.Context {
-		b := NewBudget(NewSlots(1, 1, 0), "repo", time.Minute, 4<<10)
-		t.Cleanup(b.Close)
-		return WithBudget(context.Background(), b)
+	recLen := map[string]int{}
+	for rec := range strings.SplitSeq(gitIn(t, dir, "", "ls-tree", "--long", "-z", "-r", commit), "\x00") {
+		_, path, _ := strings.Cut(rec, "\t")
+		recLen[path] = len(rec)
 	}
-
-	if _, err := LsTree(budgeted(), dir, commit, "", true); !errors.Is(err, ErrOutputLimit) {
+	// 4 KiB holds a page of 10 records (about 80 bytes each), not the tree.
+	const allowance = 4 << 10
+	ctx, _ := budgeted(t, allowance)
+	if _, err := LsTree(ctx, dir, commit, "", true); !errors.Is(err, ErrOutputLimit) {
 		t.Fatalf("control: whole listing err = %v, want ErrOutputLimit", err)
 	}
-	// A deep cursor walks the whole prefix, but discards it uncounted.
-	page, more, _, err := LsTreePage(budgeted(), dir, commit, "", all[n-3].Path, 10)
+	// A deep cursor walks the whole prefix, whose records git splits
+	// across writes, but charges only the page.
+	ctx, b := budgeted(t, allowance)
+	page, more, _, err := LsTreePage(ctx, dir, commit, "", all[n-3].Path, 10)
 	if err != nil || !slices.Equal(page, all[n-2:]) || more {
 		t.Fatalf("deep cursor: %v, more %v, err %v; want the last 2 entries", page, more, err)
 	}
-	if _, _, _, err := LsTreePage(budgeted(), dir, commit, "", "", 1000); !errors.Is(err, ErrOutputLimit) {
+	if used, want := allowance-b.remaining(), int64(recLen[all[n-2].Path]+recLen[all[n-1].Path]); used != want {
+		t.Fatalf("deep cursor charged %d bytes, want the page's %d", used, want)
+	}
+	ctx, b = budgeted(t, allowance)
+	if _, _, _, err := LsTreePage(ctx, dir, commit, "", "", 1000); !errors.Is(err, ErrOutputLimit) {
 		t.Fatalf("1000-entry page err = %v, want ErrOutputLimit: the page itself is counted", err)
+	}
+	if left := b.remaining(); left != allowance {
+		t.Fatalf("refused page charged %d bytes, want none", allowance-left)
 	}
 }
 
@@ -161,7 +184,9 @@ func TestLsTreePagerStopsAfterThePage(t *testing.T) {
 	rec := func(p string) string { return "100644 blob " + strings.Repeat("a", 40) + "       1\t" + p + "\x00" }
 	head := rec("a") + rec("b") + rec("c") + rec("d")
 	stream := head + rec("e")
-	p := &lsTreePager{after: "a", limit: 2}
+	// Records before the cursor, split byte by byte, charge nothing.
+	_, b := budgeted(t, 1<<10)
+	p := &lsTreePager{after: "a", limit: 2, budget: b}
 	stopped := -1
 	for i := range len(stream) {
 		if _, err := p.Write([]byte{stream[i]}); errors.Is(err, ErrStop) {
@@ -173,5 +198,8 @@ func TestLsTreePagerStopsAfterThePage(t *testing.T) {
 	}
 	if stopped != len(head)-1 || p.err != nil || !p.hasMore || len(p.page) != 2 || p.page[0].Path != "b" || p.page[1].Path != "c" {
 		t.Fatalf("stopped at byte %d (want %d), err %v, more %v, page %v", stopped, len(head)-1, p.err, p.hasMore, p.page)
+	}
+	if left := b.remaining(); left != 1<<10 || p.kept != 2*(len(rec("b"))-1) {
+		t.Fatalf("pager charged %d bytes and kept %d; want none charged and the 2 page records kept", 1<<10-left, p.kept)
 	}
 }
