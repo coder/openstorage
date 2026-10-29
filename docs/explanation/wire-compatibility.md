@@ -250,9 +250,10 @@ Upstream evolves continuously, so drift is tracked in the open:
   prove how the cluster behaves. Against `b598ce96`, the snapshot changes:
   - `files` lists recursively when the call sends no `recursive`
     ([#598](https://github.com/coder/openstorage/issues/598));
-  - `commit-pack` and `diff-commit` answer `412` `no changes to commit`
-    ([#595](https://github.com/coder/openstorage/issues/595)), and `409` `failed` with
-    the unpublished commit when the ref update is lost
+  - `commit-pack` and `diff-commit` answer `412` `no changes to commit`, and `412` for a
+    malformed stream, such as a file without its final `eof` chunk, where open.storage
+    answers `400` ([#595](https://github.com/coder/openstorage/issues/595)). They answer
+    `409` `failed` with the unpublished commit when the ref update is lost
     ([#596](https://github.com/coder/openstorage/issues/596)). `commit-pack` answers
     `413` when the decoded file contents pass 262,144,000 bytes
     ([#597](https://github.com/coder/openstorage/issues/597));
