@@ -326,6 +326,102 @@ and S3-only test lanes and the simulation harness.
 
 </details>
 
+## System Overview
+
+open.storage is one Go module, `github.com/coder/openstorage`. `cmd/` holds its two
+binaries, and `internal/` holds the server packages. Requests enter through `internal/api`
+(REST) and `internal/githttp` (Git smart HTTP, Git LFS, and the Git hooks). Both use
+`internal/auth` for JWTs, `internal/meta` for metadata, `internal/ref` for refs, packs, and
+quota, and `internal/blob` for pack and LFS bytes. `internal/jobs` and `internal/sync` run
+the background work. [How it works](#how-it-works) shows the deployed shape.
+
+The sections below index the per-directory contracts (Interface, Invariants, Side Effects,
+Verification).
+
+## Subdirectories & System Boundaries
+
+- cmd: [./cmd/README.md](./cmd/README.md) - The `openstorage` service binary (`serve`,
+  `hook`, and operator subcommands) and `dst`, the deterministic-simulation replay tool.
+  `cmd/openstorage` is the composition root: it resolves `OPENSTORAGE_*` settings and
+  wires every `internal/` package.
+- internal: [./internal/README.md](./internal/README.md) - All server packages: `api`,
+  `githttp`, `auth`, `meta`, `ref` (with `ref/s3wal`), `blob`, `gitread`, `gitlimit`,
+  `jobs`, `sync`, `events`, `lfsscan`, `metrics`, `envconfig`, `secrets`, `s3oplog`,
+  `version`, the `simtest` simulation harness, and `testutil`.
+- deploy: [./deploy/README.md](./deploy/README.md) - The Terraform reference deployment
+  for AWS (ALB, EC2, RDS PostgreSQL 17, S3), evaluation only. It installs a
+  checksum-verified release binary with cloud-init.
+- scripts: [./scripts/README.md](./scripts/README.md) - The docs link checker, the
+  release archive builder, and the Compose quickstart smoke test. CI runs the link
+  checker and the smoke test. `release.yml` runs the archive builder.
+- workflows: [./workflows/README.md](./workflows/README.md) - `build-phase.js`, a Xum
+  workflow script that an operator starts by hand. No build or CI step runs it.
+- `docs/` (human documentation, start at the [index](docs/README.md)), `testdata/`, and
+  `vendor/` have no contract files.
+
+## Global Invariants
+
+- Pack bytes are durable before a ref moves. On an API write, `wcPublish` calls
+  `publishPack`, which uploads and registers the pack, and then runs the ref CAS
+  [internal/api/handlers_write_commit.go:wcPublish] [internal/api/publish.go:publishPack].
+  On a Git push, `preReceive`
+  uploads and registers packs, and `updateHook` then runs the CAS
+  [internal/githttp/hook.go:preReceive] [internal/githttp/hook.go:updateHook].
+- Refs change only through compare-and-swap on the ref store. Postgres, SQLite, and s3wal
+  all implement the same `RefStore` contract [internal/ref/ref.go:RefStore]
+  [internal/ref/ref.go:CASRef].
+- Every API and Git request carries an organization-signed JWT. A bad token gets 401. A
+  wrong org, scope, or repo claim gets 403 [internal/api/middleware.go:requireAuthWith]
+  [internal/githttp/server.go:verifyClaims] [internal/auth/verifier.go:Verify].
+- Startup fails fast on bad configuration. `OPENSTORAGE_ORG` and `OPENSTORAGE_ORG_PUBKEYS`
+  are required, and an `s3wal://` store requires an `s3://` blob store
+  [cmd/openstorage/config.go:resolveServeConfig]
+  [cmd/openstorage/config.go:validateZeroInfraPairing]. A `CODESTORAGE_*` setting without
+  its `OPENSTORAGE_*` replacement refuses startup [internal/envconfig/envconfig.go:CheckLegacy].
+- An s3wal deployment serves from one process only. The instance lease refuses a second
+  server, and `serve` exits when it loses the lease [internal/ref/s3wal/lease.go:AcquireInstanceLease]
+  [cmd/openstorage/main.go:cmdServe].
+- Outbound webhook and upstream sync traffic goes through an SSRF guard. The guard always
+  denies metadata, unspecified, multicast, and broadcast addresses, and denies private
+  addresses unless allowed [internal/events/guard.go:deniedReason]
+  [internal/sync/egress.go:startEgressProxy].
+- Git subprocesses run under shared admission slots, in tracked process groups that
+  shutdown stops [internal/gitlimit/gitlimit.go:ReadSlots]
+  [internal/gitlimit/children.go:StopChildren].
+- The orphan sweeper never acts on a key under `_wal/` [internal/jobs/sweep.go:assertNotWAL].
+
+## Global Side Effects
+
+- Refs and metadata live in Postgres, SQLite, or an s3wal bucket. `serve` runs schema DDL at
+  startup [internal/ref/ref.go:InitSchema] [internal/meta/pg.go:InitSchema].
+- Packs and LFS objects live in an S3-compatible bucket or a local directory, under
+  `packs/<repo>/` and `lfs/<repo>/` [internal/blob/blob.go:PackKey]
+  [internal/blob/blob.go:LFSKey]. s3wal state lives under `_wal/` in the same bucket
+  [internal/ref/s3wal/manifest.go:RepoPrefix] [internal/ref/s3wal/lease.go:LeaseKey].
+- Each node keeps rebuildable bare cache repos on local disk, hydrated from the stores
+  [internal/githttp/hydrate.go:Hydrate].
+- The server runs `git` subprocesses, and its cache repos have hook scripts that re-run
+  this binary as `openstorage hook` [internal/githttp/hydrate.go:hookScript]
+  [internal/githttp/hook.go:RunHook].
+- Outbound HTTP: signed webhook deliveries and upstream Git fetch and push
+  [internal/events/deliver.go:Attempt] [internal/sync/worker.go:runGitTo].
+- Background work runs as River jobs on Postgres or as in-process goroutines: sweeps,
+  repacks, LFS reclamation, absence reconciliation, webhooks, and sync
+  [internal/jobs/river.go:NewRiver] [internal/jobs/local.go:Local].
+- Optional: a separate `/metrics` listener and a per-process S3 operation log
+  [internal/metrics/metrics.go:NewServer] [internal/s3oplog/s3oplog.go:setup].
+- CAUTION: `terraform apply` in `deploy/terraform/aws` creates billable AWS resources
+  ([deploy/terraform/aws/README.md](./deploy/terraform/aws/README.md)).
+
+## System Verification
+
+- Run: `go test ./... -tags=openstorage_viewcheck -count=1 -race -timeout=30m` (needs
+  Docker, git, and git-lfs).
+- Run: `golangci-lint run`
+- Run: `python3 scripts/check-doc-links.py`
+- The local and s3wal test lanes are in the [testing reference](docs/reference/testing.md).
+  The Terraform gates are in [deploy/terraform/aws/README.md](./deploy/terraform/aws/README.md).
+
 ## License
 
 [Apache License 2.0](LICENSE).
