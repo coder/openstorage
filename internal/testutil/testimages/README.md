@@ -4,8 +4,8 @@
 Pins the container images that tests and fixtures start. The package declares two string constants, each a tag plus an OCI image index digest. It has no imports and no executable code.
 
 ## Interface
-- `Postgres` — pinned `postgres:17-alpine@sha256:...` reference [testimages.go:Postgres]
-- `SeaweedFS` — pinned `chrislusf/seaweedfs:4.48@sha256:...` reference [testimages.go:SeaweedFS]
+- `Postgres` — pinned `postgres` image reference, tag plus index digest [testimages.go:Postgres]
+- `SeaweedFS` — pinned `chrislusf/seaweedfs` image reference, tag plus index digest [testimages.go:SeaweedFS]
 
 ## Invariants
 - Each constant has the form `<image>:<tag>@sha256:<digest>` [testimages.go:Postgres]

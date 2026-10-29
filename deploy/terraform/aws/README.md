@@ -23,7 +23,7 @@ Human guide: [Deploy on AWS with Terraform](../../../docs/how-to/deploy-aws-terr
 
 ### Tool and provider pins
 
-- Terraform `= 1.17.1`, `hashicorp/aws = 6.71.0`, `hashicorp/tls = 4.4.2` [versions.tf:terraform]. `.terraform.lock.hcl` locks the provider hashes.
+- `versions.tf` pins the exact Terraform version and the exact `hashicorp/aws` and `hashicorp/tls` provider versions [versions.tf:terraform]. `.terraform.lock.hcl` locks the provider hashes.
 - The `aws` provider uses `region = var.region` and adds the default tags `Project = "openstorage-reference"` and `Deployment = var.name` [versions.tf:provider.aws].
 
 ### Input variables
@@ -85,7 +85,7 @@ A non-sensitive handoff object [outputs.tf:deployment] with these keys: `schema_
 
 ## Verification
 
-These are the offline gates. They need no AWS credentials and never apply. Run them from the repository root. CI runs the same commands in the `terraform` job of `.github/workflows/ci.yml`. `mise.toml` pins Terraform `1.17.1`.
+These are the offline gates. They need no AWS credentials and never apply. Run them from the repository root. CI runs the same commands in the `terraform` job of `.github/workflows/ci.yml`. `mise.toml` pins the Terraform version that CI installs.
 
 ```sh
 terraform -chdir=deploy/terraform/aws fmt -check -recursive
