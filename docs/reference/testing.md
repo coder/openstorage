@@ -49,20 +49,31 @@ silently skipping LFS coverage.
 ### SeaweedFS fixture image
 
 The fixtures and reference Compose file pin SeaweedFS
-[4.48](https://github.com/seaweedfs/seaweedfs/releases/tag/4.48), published
-2026-09-28. [Changes since 4.47](https://github.com/seaweedfs/seaweedfs/compare/4.47...4.48)
-touch S3 request-body draining on error responses, list-marker handling,
-ListMultipartUploads timestamps, POST-policy versioning, Object Lock
-permissions, volume and erasure-coding input validation, and filer shutdown.
+[4.51](https://github.com/seaweedfs/seaweedfs/releases/tag/4.51), published
+2026-10-25. [Changes since 4.48](https://github.com/seaweedfs/seaweedfs/compare/4.48...4.51)
+touch S3 authorization (POST policy uploads, wildcard policy targets, POST
+Object ACL fields), GET/HEAD tag and attribute echoing, delete-marker reads,
+filer and master startup, and the `-ip.bind` listeners. With `-ip.bind` set,
+each port now binds only that address, so `-ip.bind=0.0.0.0` still answers
+on loopback.
 
-SHA-256 digests of the Docker Hub image metadata (retrieved 2026-10-01; a
+On a fresh `weed server`, 4.50 and 4.51 hold the first object write for about
+12 to 15 s: the master defers volume allocation and the filer waits up to
+10 s before it joins the S3 lock ring
+([seaweedfs#12145](https://github.com/seaweedfs/seaweedfs/issues/12145), fixed
+upstream after 4.51). While the lock ring is empty, a PUT waits for its
+object-write lock and fails after 15 s. In local runs the ring formed 2 to
+12 s after the first lock attempt, so the first PUT waited and succeeded. The
+write-readiness check retries a failed write for 60 s.
+
+SHA-256 digests of the Docker Hub image metadata (retrieved 2026-10-29; a
 published manifest does not prove runtime qualification):
 
-| Image metadata | 4.47 | 4.48 |
+| Image metadata | 4.48 | 4.51 |
 |---|---|---|
-| Multi-platform index | `ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882` | `4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d` |
-| Linux/amd64 manifest | `f83509b0721dfd8e2e07faf76c0a899f67a8a889c89abe2fa0a5227ba1320362` | `aba492e2a4e4c90bff795745e8e660affa1f09e7650f5981bd7bccd1a06cd931` |
-| Linux/arm64 manifest | `d4cf67729aa8777e1a43a5b61d72e5b96179e4b7bac9a221cb14cbc2036cb32e` | `f1f303474940e9e088edbd2c1658f7ac38cb0dd90f91a2b0a51916d74b8575a1` |
+| Multi-platform index | `4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d` | `f7a49e3f3972ebed5be2ed4befa4a0c68eb7bdddba6e692d42729ceb545134b8` |
+| Linux/amd64 manifest | `aba492e2a4e4c90bff795745e8e660affa1f09e7650f5981bd7bccd1a06cd931` | `3a522c379599e163433a636e75022630848b63a74f08ea37bf06f8d776e9a707` |
+| Linux/arm64 manifest | `f1f303474940e9e088edbd2c1658f7ac38cb0dd90f91a2b0a51916d74b8575a1` | `7e68a388de0806ed8d96f30cb7e927182a3d80d42920cb87d97d23311a7a1a77` |
 
 On every pin change:
 
