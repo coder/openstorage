@@ -727,6 +727,9 @@ var (
 	_ sync.FirstSyncScheduler = (*River)(nil)
 )
 
+// River's default job timeout is 1 minute, shorter than every worker budget (issue #632).
+const riverJobTimeout = 2 * time.Hour
+
 // NewRiver opens a dedicated pool on pgURL, applies the river migrations
 // (serve owns DDL, mirroring meta/ref InitSchema), and starts workers that
 // share the delivery/sync code with the local queue. upstreams is the
@@ -745,6 +748,9 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	assertf(sweep == nil || (sweep.Sweeper != nil && sweep.Interval > 0),
 		"NewRiver: sweep schedule missing sweeper or interval: %+v", sweep)
 	assertf(logger != nil, "NewRiver: nil logger")
+	assertf(riverJobTimeout > max(lfsReclaimPassTimeout, absencePassTimeout)+sweepRecoveryTimeout,
+		"NewRiver: job timeout %v does not cover the longest pass cap plus its tail", riverJobTimeout)
+	rescueAfter := riverJobTimeout + 2*sweepRecoveryTimeout
 
 	pool, err := pgxpool.New(ctx, pgURL)
 	if err != nil {
@@ -842,10 +848,12 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		queues[absenceQueue] = river.QueueConfig{MaxWorkers: 1}
 	}
 	client, err := river.NewClient(driver, &river.Config{
-		Queues:       queues,
-		Workers:      workers,
-		PeriodicJobs: periodic,
-		Logger:       logger,
+		Queues:               queues,
+		Workers:              workers,
+		PeriodicJobs:         periodic,
+		Logger:               logger,
+		JobTimeout:           riverJobTimeout,
+		RescueStuckJobsAfter: rescueAfter,
 	})
 	if err != nil {
 		cancelRuns(nil)
