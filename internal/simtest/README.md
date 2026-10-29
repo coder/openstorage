@@ -1,5 +1,7 @@
 # simtest — deterministic simulation testing (DST)
 
+## Overview
+
 Deterministic, seeded simulation of a multi-node open.storage cluster with
 fault injection, ported from waltier's SimStore + DST design (issue #3).
 Everything runs in one process — zero containers — on two authority-store
@@ -42,14 +44,21 @@ processes on a host):
   the real meta store on the logical clock) with seeded transfer outcomes
   mirroring the worker's failure taxonomy — success, transient failure
   (the actor re-marks the durable pending level with the run's force,
-  like `schedulePushRetry`), terminal non-FF rejection (no retry).
+  like `schedulePushRetry`), terminal non-FF rejection (no retry);
+- **quota reservations** (issues #29/#31, `reserve-crash` /
+  `reserve-sweep`): a `ReservePackBytes` admission whose pusher then
+  crashes, which leaks the reservation, and a sweep that prunes every
+  reservation through the node's fault-injected stores.
 
 Storage calls pass through `SimRefStore`/`SimBlobStore`, which inject:
 
 - **clean faults** — the op never executes; the error satisfies pgconn's
   `SafeToRetry`, like the real stores' acquire-stage failures;
 - **ambiguous faults** — the op executes, the result is lost (the class
-  behind issue #2);
+  behind issue #2). This holds for mutating ops and for blob downloads
+  (`DownloadFile`, `DownloadFileCapped`). Ref-store reads such as `ListRefs`,
+  `GetRef`, and `ListPacks`, and blob `List`, skip the inner call under an
+  ambiguous fault, exactly like a clean fault;
 - **transient not-found faults** — a pack download reports
   `blob.ErrNotFound` once (the vanished-pack class behind issue #6).
 
@@ -135,8 +144,8 @@ Checked from clean (never fault-injected) handles:
 
 | What | How |
 | --- | --- |
-| PR gate (fast) | `TestDSTFast`, `TestDSTDeterminism` — run in the normal `go test ./...` pipeline, one subtest per backend lane |
-| Reproduce a seed | `DST_SEED=<seed> [DST_STEPS=<n>] [DST_REF_BACKEND=s3wal] go test ./internal/simtest -run 'TestDSTSeed' -v` |
+| PR gate (fast) | `TestDSTFast`, `TestDSTDeterminism`, `TestDSTRegressions` (the pinned-seed corpus) — run in the normal `go test ./...` pipeline, one subtest per backend lane |
+| Reproduce a seed | `DST_SEED=<seed> [DST_STEPS=<n>] [DST_REF_BACKEND=s3wal] go test ./internal/simtest -run 'TestDSTSeed' -v -count=1` |
 | CLI repro | `go run ./cmd/dst -seed <seed> [-steps N] [-backend s3wal] [-v] [-keep]` |
 | Nightly sweep | `.github/workflows/dst-nightly.yml` → `TestDSTSweep` (`DST_SWEEP_SEEDS`, `DST_SWEEP_BASE`, `DST_STEPS`, `DST_REF_BACKEND` — one job per backend lane) |
 
@@ -211,3 +220,86 @@ sequential pack ids, sorted iteration in checks, and path-free trace lines.
 When extending the harness, never iterate a Go map into scheduler decisions
 or trace lines, never read wall-clock time, and route every random choice
 through the two seeded streams.
+
+## Interface
+
+- `Run` — runs one deterministic simulation; infrastructure errors return as
+  `error`, invariant breaches as `Result.Violations` [scenario.go:Run]
+- `Config`, `Result` — run inputs (seed, steps, nodes, repos, branches,
+  `RefBackend`, `FullCheckEvery`, `Dir`, `KeepDir`, `Trace`) and outputs
+  (trace hash, violations, counters) [scenario.go:Config]
+- `RefBackend`, `RefBackendSQLite`, `RefBackendS3WAL` — authority-store lane
+  (`"sqlite"` or `"s3wal"`) [scenario.go:RefBackend]
+- `Injector`, `NewInjector` — seeded fault injector; `FailNext`, `FailNth`,
+  `SetProbs`, `Count`, `Counts`, `Fired`, `FiredSince`, `Seq` [fault.go:NewInjector]
+- `FaultClass` (`FaultNone`, `FaultClean`, `FaultAmbiguous`, `FaultNotFound`),
+  `FaultEvent`, `Probs`, `ErrInjectedClean`, `ErrInjectedAmbiguous` [fault.go:FaultClass]
+- `FaultClass.String` — the fault class name for traces [fault.go:FaultClass.String]
+- Op names `OpRef*`, `OpBlob*`, `OpCASGet`, `OpCASCreate`, `OpCASAdvance`,
+  `OpCASList` — the injection points [fault.go:OpRefListRefs]
+- `SimRefStore`, `NewSimRefStore` — fault-injecting `ref.RefStore` decorator
+  [simref.go:SimRefStore]
+- `SimBlobStore`, `NewSimBlobStore` — fault-injecting `blob.BlobStore`
+  decorator [simblob.go:SimBlobStore]
+- `SimCAS`, `NewSimCAS` — per-node fault-injecting view of a shared
+  `s3wal.MemCAS` [simcas.go:SimCAS]
+
+## Invariants
+
+- `Config.withDefaults` asserts positive dimensions and a known `RefBackend`
+  [scenario.go:withDefaults]
+- `FailNth` asserts a non-empty op, n >= 1, and a clean, ambiguous, or
+  not-found class; `SetProbs` asserts non-negative probabilities that sum to
+  at most 1 [fault.go:SetProbs]
+- One-shot plans fire before probabilistic faults [fault.go:Injector.begin]
+- A clean fault satisfies `SafeToRetry`, so `ref.IdempotentCAS` treats it as
+  non-execution [fault.go:cleanFaultError]
+- On a clean fault the inner call never runs; on an ambiguous fault a
+  mutating inner call runs and the caller gets an error [simref.go:CASRef]
+  [simblob.go:UploadFile]. Ref-store reads and blob `List` skip the inner
+  call under an ambiguous fault [simref.go:refReadFault] [simblob.go:List].
+  Blob `DownloadFile` and `DownloadFileCapped` still run the inner call
+  [simblob.go:DownloadFile] [simblob.go:DownloadFileCapped]
+- `SimCAS` returns a definitive store rejection as a real verdict and never
+  injects stale reads, 409 exhaustion, or Delete faults [simcas.go:put]
+- `violate` records the breach and stops the run at the first violation
+  [scenario.go:violate]
+- `casAttempt` flags a ref moved to anything but the target, a win that does
+  not match the tip, and an ambiguous committed write not reported as a win
+  [scenario.go:casAttempt]
+- The quota ledger oracle requires usage == registered pack bytes + retained
+  bytes after every step [quota_ops.go:checkQuotaLedger]
+- After a completed full reservation sweep, every repo must hold
+  `ReservedBytes == 0` [quota_ops.go:doReserveSweep]
+- Repack oracles require the post-op pack set to equal the pre-set or the
+  folded set [repack_ops.go:doRepack]
+- Sync and push oracles check lease liveness, steal safety, late-finish
+  errors, and a full-row mirror of the upstream row [sync_ops.go:checkUpstreamMirror]
+  [push_ops.go:doPushClaim]
+
+## Side Effects
+
+- `Run` creates a temp run dir (removed unless `KeepDir`), a shared
+  `meta.sqlite` file, a fileblob dir, and per-node cache dirs. The ref
+  authority is a shared `refs.sqlite` file on the sqlite lane and a shared
+  in-memory `s3wal.MemCAS` on the s3wal lane [scenario.go:Run]
+  [cluster.go:newCluster]
+- Runs hermetic `git` subprocesses (`init --bare`, `config gc.auto 0`,
+  `hash-object`, `mktree`, `commit-tree`, `pack-objects`, `for-each-ref`,
+  `fsck`) [gitenv.go:simGit] [gitenv.go:initScratchRepo]
+- Drives the real stores: `RegisterPacks`, `CASRef`, `ReservePackBytes`,
+  `TryBeginSync`, `TryBeginPush`, and `githttp.Hydrate` [scenario.go:doPush]
+  [quota_ops.go:doReserveCrash] [sync_ops.go:doSyncClaim]
+  [push_ops.go:doPushClaim] [oracle.go:doHydrate]
+- `initSync` inserts `orgs` and `repos` rows with raw SQL [sync_ops.go:initSync]
+- Cold crashes remove a node's cache dir [cluster.go:crashNode]
+- `tracef` hashes every trace line and writes it to `Config.Trace` when set
+  [scenario.go:tracef]
+
+## Verification
+
+- Run: `go test ./internal/simtest/... -tags=openstorage_viewcheck -count=1 -race -timeout=30m`
+- Nightly sweep (`.github/workflows/dst-nightly.yml`, one job per backend):
+  `DST_SWEEP_BASE=<base> DST_SWEEP_SEEDS=48 DST_STEPS=300 DST_REF_BACKEND=<sqlite|s3wal> go test ./internal/simtest -count=1 -race -run 'TestDSTSweep' -v -timeout=110m`
+  (the workflow defaults; the nightly job runs once per backend and takes `<base>` from its `base` input, else `github.run_id % 1000000000`)
+- Reproduce a seed: `DST_SEED=<seed> DST_STEPS=<steps> go test ./internal/simtest -run 'TestDSTSeed' -v -count=1`
