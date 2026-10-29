@@ -77,8 +77,10 @@ var ErrUnsortedTree = errors.New("ls-tree listed entries out of order")
 // the entries up to the page, not with the tree. Only the page counts
 // against the request's output allowance, and only once the page is
 // complete, so a failed or refused page charges nothing. found reports
-// whether path matched any entry. A listing out of order returns
-// ErrUnsortedTree.
+// whether path matched any entry. A listing out of order up to one entry
+// past the page returns ErrUnsortedTree. An inversion after that is not
+// read, so a tree stored out of order (fsck's treeNotSorted, which git's
+// own path lookups do not handle either) can page in git's order.
 func LsTreePage(ctx context.Context, repoPath, commit, path, after string, limit int) (page []TreeEntry, hasMore, found bool, err error) {
 	assertf(ref.ValidSHA(commit) || commit == EmptyTreeSHA, "LsTreePage: unresolved commit %q", commit)
 	assertf(limit > 0, "LsTreePage: limit %d", limit)
