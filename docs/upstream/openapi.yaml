@@ -1380,6 +1380,19 @@ components:
           type: string
         status:
           description: Status code (ok, conflict, precondition_failed, etc.).
+          enum:
+            - ok
+            - failed
+            - precondition_failed
+            - conflict
+            - not_found
+            - unauthorized
+            - forbidden
+            - timeout
+            - invalid
+            - payload_too_large
+            - unavailable
+            - internal
           type: string
         success:
           description: Whether the operation succeeded.
@@ -1421,8 +1434,6 @@ components:
         ref:
           description: Branch, tag, or commit to archive. When omitted, the default branch or HEAD is used.
           type: string
-      required:
-        - ref
       type: object
     ReposBlameGetResponse:
       additionalProperties: false
@@ -1790,7 +1801,7 @@ components:
           $ref: "#/components/schemas/BaseRepo"
           description: Code Storage repository to copy once. The new repository keeps no link to it. Do not set it together with upstream.
         default_branch:
-          description: Default branch for the new repository. Defaults to main when omitted.
+          description: Default branch for the new repository. When omitted, a copy takes the default branch of the source, a sync from GitHub takes the default branch of the GitHub repository, and any other repository uses main.
           examples:
             - main
           type: string
@@ -5363,13 +5374,14 @@ paths:
           content:
             application/json:
               example:
+                commit: null
                 result:
-                  message: expected branch head did not match current tip
+                  message: first payload must be metadata
                   new_sha: ""
                   old_sha: ""
-                  status: precondition_failed
+                  status: invalid
                   success: false
-                  target_branch: main
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The NDJSON stream was malformed or metadata validation failed.
@@ -5404,11 +5416,17 @@ paths:
           content:
             application/json:
               example:
+                commit:
+                  blob_count: 1
+                  commit_sha: 7b3e9f2a1c4d5e6f708192a3b4c5d6e7f8091a2b
+                  pack_bytes: 1024
+                  target_branch: main
+                  tree_sha: e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4
                 result:
-                  message: expected branch head did not match current tip
-                  new_sha: ""
-                  old_sha: ""
-                  status: precondition_failed
+                  message: failed to update ref
+                  new_sha: 7b3e9f2a1c4d5e6f708192a3b4c5d6e7f8091a2b
+                  old_sha: d34db33fd34db33fd34db33fd34db33fd34db33f
+                  status: failed
                   success: false
                   target_branch: main
               schema:
@@ -5434,21 +5452,37 @@ paths:
                   message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
                 $ref: "#/components/schemas/CommitWriteRefGuardProblemDetails"
-          description: "The branch moved or the requested update could not be applied cleanly. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
+          description: "The branch moved or the requested update could not be applied cleanly. When the branch moves after storage writes the commit, the body is `application/json`: `result.status` is `failed`, and `commit` is the commit that the branch did not get. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
+        "412":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: no changes to commit
+                  new_sha: ""
+                  old_sha: ""
+                  status: precondition_failed
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/CommitWriteResponse"
+          description: "The commit makes no changes to the branch: the files match its tip, the request has no file operations, or it deletes only paths that do not exist. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a file without its final `eof` chunk, also gets `412`, with another message."
         "413":
           content:
             application/json:
               example:
+                commit: null
                 result:
-                  message: blob chunk size 5242881 exceeds maximum 4194304
+                  message: "commit payload too large: exceeds total blob limit (262144000 bytes)"
                   new_sha: ""
                   old_sha: ""
                   status: payload_too_large
                   success: false
-                  target_branch: main
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: A decoded blob chunk exceeded the 4 MiB limit.
+          description: The decoded file contents of the commit exceeded the total size limit.
         "429":
           content:
             application/json:
@@ -5925,13 +5959,14 @@ paths:
           content:
             application/json:
               example:
+                commit: null
                 result:
-                  message: diff payload could not be decoded
+                  message: diff content missing
                   new_sha: ""
                   old_sha: ""
-                  status: invalid_diff
+                  status: invalid
                   success: false
-                  target_branch: main
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The NDJSON stream or diff payload was invalid.
@@ -5966,11 +6001,17 @@ paths:
           content:
             application/json:
               example:
+                commit:
+                  blob_count: 1
+                  commit_sha: 7b3e9f2a1c4d5e6f708192a3b4c5d6e7f8091a2b
+                  pack_bytes: 1024
+                  target_branch: main
+                  tree_sha: e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4
                 result:
-                  message: patch does not apply cleanly
-                  new_sha: ""
-                  old_sha: ""
-                  status: conflict
+                  message: failed to update ref
+                  new_sha: 7b3e9f2a1c4d5e6f708192a3b4c5d6e7f8091a2b
+                  old_sha: d34db33fd34db33fd34db33fd34db33fd34db33f
+                  status: failed
                   success: false
                   target_branch: main
               schema:
@@ -5996,7 +6037,22 @@ paths:
                   message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
                 $ref: "#/components/schemas/CommitWriteRefGuardProblemDetails"
-          description: "The diff could not be applied cleanly or the target branch tip changed. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
+          description: "The diff could not be applied cleanly or the target branch tip changed. When the diff does not apply, the body is `application/json` and `result.status` is `conflict`. When the branch moves after storage writes the commit, the body is `application/json`: `result.status` is `failed`, and `commit` is the commit that the branch did not get. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
+        "412":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: no changes to commit
+                  new_sha: ""
+                  old_sha: ""
+                  status: precondition_failed
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/CommitWriteResponse"
+          description: Applying the diff makes no changes to the branch. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a stream without its final `eof` chunk, also gets `412`, with another message.
         "429":
           content:
             application/json:
@@ -6624,11 +6680,12 @@ paths:
           name: path
           schema:
             type: string
-        - description: When true, include descendants recursively. When false, only direct children are returned.
+        - description: When true, include descendants recursively. When false, only direct children are returned. Defaults to true.
           example: false
           in: query
           name: recursive
           schema:
+            default: true
             type: boolean
         - description: Pagination cursor returned by a previous `list_files` response.
           example: docs/guide.md
@@ -11773,13 +11830,14 @@ paths:
           content:
             application/json:
               example:
+                commit: null
                 result:
-                  message: expected branch head did not match current tip
+                  message: first payload must be metadata
                   new_sha: ""
                   old_sha: ""
-                  status: precondition_failed
+                  status: invalid
                   success: false
-                  target_branch: main
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The NDJSON stream was malformed or metadata validation failed.
@@ -11814,11 +11872,17 @@ paths:
           content:
             application/json:
               example:
+                commit:
+                  blob_count: 1
+                  commit_sha: 7b3e9f2a1c4d5e6f708192a3b4c5d6e7f8091a2b
+                  pack_bytes: 1024
+                  target_branch: main
+                  tree_sha: e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4
                 result:
-                  message: expected branch head did not match current tip
-                  new_sha: ""
-                  old_sha: ""
-                  status: precondition_failed
+                  message: failed to update ref
+                  new_sha: 7b3e9f2a1c4d5e6f708192a3b4c5d6e7f8091a2b
+                  old_sha: d34db33fd34db33fd34db33fd34db33fd34db33f
+                  status: failed
                   success: false
                   target_branch: main
               schema:
@@ -11844,21 +11908,37 @@ paths:
                   message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
                 $ref: "#/components/schemas/CommitWriteRefGuardProblemDetails"
-          description: "The branch moved or the requested update could not be applied cleanly. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
+          description: "The branch moved or the requested update could not be applied cleanly. When the branch moves after storage writes the commit, the body is `application/json`: `result.status` is `failed`, and `commit` is the commit that the branch did not get. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
+        "412":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: no changes to commit
+                  new_sha: ""
+                  old_sha: ""
+                  status: precondition_failed
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/CommitWriteResponse"
+          description: "The commit makes no changes to the branch: the files match its tip, the request has no file operations, or it deletes only paths that do not exist. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a file without its final `eof` chunk, also gets `412`, with another message."
         "413":
           content:
             application/json:
               example:
+                commit: null
                 result:
-                  message: blob chunk size 5242881 exceeds maximum 4194304
+                  message: "commit payload too large: exceeds total blob limit (262144000 bytes)"
                   new_sha: ""
                   old_sha: ""
                   status: payload_too_large
                   success: false
-                  target_branch: main
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: A decoded blob chunk exceeded the 4 MiB limit.
+          description: The decoded file contents of the commit exceeded the total size limit.
         "429":
           content:
             application/json:
@@ -12459,13 +12539,14 @@ paths:
           content:
             application/json:
               example:
+                commit: null
                 result:
-                  message: diff payload could not be decoded
+                  message: diff content missing
                   new_sha: ""
                   old_sha: ""
-                  status: invalid_diff
+                  status: invalid
                   success: false
-                  target_branch: main
+                  target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
           description: The NDJSON stream or diff payload was invalid.
@@ -12500,11 +12581,17 @@ paths:
           content:
             application/json:
               example:
+                commit:
+                  blob_count: 1
+                  commit_sha: 7b3e9f2a1c4d5e6f708192a3b4c5d6e7f8091a2b
+                  pack_bytes: 1024
+                  target_branch: main
+                  tree_sha: e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4
                 result:
-                  message: patch does not apply cleanly
-                  new_sha: ""
-                  old_sha: ""
-                  status: conflict
+                  message: failed to update ref
+                  new_sha: 7b3e9f2a1c4d5e6f708192a3b4c5d6e7f8091a2b
+                  old_sha: d34db33fd34db33fd34db33fd34db33fd34db33f
+                  status: failed
                   success: false
                   target_branch: main
               schema:
@@ -12530,7 +12617,22 @@ paths:
                   message: base_ref (d34db33fd34db33fd34db33fd34db33fd34db33f) does not match current head c4f0fdfc41adab56630b34f5f4fd4e84a2c5b4d2
               schema:
                 $ref: "#/components/schemas/CommitWriteRefGuardProblemDetails"
-          description: "The diff could not be applied cleanly or the target branch tip changed. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
+          description: "The diff could not be applied cleanly or the target branch tip changed. When the diff does not apply, the body is `application/json` and `result.status` is `conflict`. When the branch moves after storage writes the commit, the body is `application/json`: `result.status` is `failed`, and `commit` is the commit that the branch did not get. When `expected_target_sha` is not the tip of the branch, the body is `application/problem+json` with the code `ref_guard_failed`: `guard` names the guard, and `current_sha` is the tip of the branch, which `result.old_sha` repeats. The body keeps the members of the failure body, and `result.status` is `conflict`."
+        "412":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: no changes to commit
+                  new_sha: ""
+                  old_sha: ""
+                  status: precondition_failed
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/CommitWriteResponse"
+          description: Applying the diff makes no changes to the branch. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a stream without its final `eof` chunk, also gets `412`, with another message.
         "429":
           content:
             application/json:
@@ -13149,11 +13251,12 @@ paths:
           name: path
           schema:
             type: string
-        - description: When true, include descendants recursively. When false, only direct children are returned.
+        - description: When true, include descendants recursively. When false, only direct children are returned. Defaults to true.
           example: false
           in: query
           name: recursive
           schema:
+            default: true
             type: boolean
         - description: Pagination cursor returned by a previous `list_files` response.
           example: docs/guide.md
