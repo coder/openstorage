@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1054,6 +1055,122 @@ func TestCommitPackQuota(t *testing.T) {
 		after, err := blob.StorageUsageBytes(context.Background(), e.blobStore, repo.RepoID)
 		if err != nil || after != usage {
 			t.Fatalf("denied write changed usage: %d -> %d (err %v)", usage, after, err)
+		}
+	})
+}
+
+// TestWriteReservationCapAnswers429 (#594): when the repository's active
+// pack-reservation rows are at the ledger's cap, commit-pack, diff-commit,
+// restore-commit and merge answer the retryable 429 with the upstream
+// RefUpdateResult status "unavailable", Retry-After and RateLimit, and
+// leave every ref alone. These handlers used to send status "busy", which
+// statusForHTTP(429) rejects, so the assert panicked into a 500.
+func TestWriteReservationCapAnswers429(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		ctx := context.Background()
+		plain := wctServer(t, e)
+		repo, writeTok, _ := wctRepo(t, e)
+		commit := func(branch, msg, path string, extra map[string]any) wcEnvelope {
+			t.Helper()
+			body := wctLines(t,
+				wctMeta(branch, msg, []map[string]any{
+					{"path": path, "content_id": "id-" + path, "operation": "upsert"},
+				}, extra),
+				wctChunk("id-"+path, []byte(msg+"\n"), true),
+			)
+			resp, respBody := wctPost(t, plain, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
+			return wctRequireOK(t, resp, respBody)
+		}
+		c1 := commit("main", "c1", "a.txt", nil)
+		commit("feature", "feat", "f.txt", map[string]any{"base_branch": "main"})
+		commit("main", "c2", "m.txt", map[string]any{"expected_head_sha": c1.Commit.CommitSHA})
+
+		// Fill the active-row cap (ref.maxActiveReservations, 10,000) with
+		// one admitted batch, then prove it is full: a denied probe
+		// inserts no row.
+		group := blob.QuotaRepoGroup(repo.RepoID)
+		fill := make([]ref.Pack, 10_000)
+		for i := range fill {
+			fill[i] = ref.Pack{Key: blob.PackKey(repo.RepoID, fmt.Sprintf("fill%06d", i)), Size: 1}
+		}
+		dec, err := e.refStore.ReservePackBytes(ctx, group, fill, ref.NewReservationOwner(), 0, ref.ReserveNoFloorGen, math.MaxInt64, time.Hour)
+		if err != nil || !dec.OK {
+			t.Fatalf("fill ReservePackBytes = (%+v, %v), want admitted", dec, err)
+		}
+		probe := []ref.Pack{{Key: blob.PackKey(repo.RepoID, "probe"), Size: 1}}
+		dec, err = e.refStore.ReservePackBytes(ctx, group, probe, ref.NewReservationOwner(), 0, ref.ReserveNoFloorGen, math.MaxInt64, time.Hour)
+		if err != nil || !dec.KeyCapExceeded {
+			t.Fatalf("probe ReservePackBytes = (%+v, %v), want KeyCapExceeded", dec, err)
+		}
+
+		// A quota-enforcing server: only the quota path reserves rows.
+		s := &server{
+			store:              e.store,
+			httpBaseURL:        testHTTPBaseURL,
+			logger:             discardLogger(),
+			refStore:           e.refStore,
+			blobStore:          e.blobStore,
+			cacheDir:           e.cacheDir,
+			packQuotaBytes:     1 << 40,
+			packReservationTTL: time.Hour,
+		}
+		mux := http.NewServeMux()
+		verifier := auth.NewVerifier(e.store)
+		registerWriteCommitRoutes(mux, s, verifier, "", nil)
+		s.registerWriteMergeRoutes(mux, verifier, "", nil)
+		srv := httptest.NewServer(withProblemInstance(recoverPanics(discardLogger())(mux)))
+		t.Cleanup(srv.Close)
+
+		patch := "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n"
+		restore, err := json.Marshal(map[string]any{"metadata": map[string]any{
+			"target_branch": "main", "target_commit_sha": c1.Commit.CommitSHA, "author": wctAuthor,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases := []struct {
+			name string
+			do   func() (*http.Response, []byte)
+		}{
+			{"commit-pack", func() (*http.Response, []byte) {
+				body := wctLines(t,
+					wctMeta("main", "c3", []map[string]any{
+						{"path": "b.txt", "content_id": "id-b", "operation": "upsert"},
+					}, nil),
+					wctChunk("id-b", []byte("b\n"), true),
+				)
+				return wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
+			}},
+			{"diff-commit", func() (*http.Response, []byte) {
+				body := wctLines(t, wctMeta("main", "d", nil, nil), wctDiffChunk([]byte(patch), true))
+				return wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(body))
+			}},
+			{"restore-commit", func() (*http.Response, []byte) {
+				return wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(restore))
+			}},
+			{"merge", func() (*http.Response, []byte) {
+				return wmDo(t, srv, http.MethodPost, "/api/v1/repos/merge", writeTok,
+					wmMergeBody("feature", "main", "merge", map[string]any{"author": wctAuthor}))
+			}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				before := wmRefsSnapshot(t, e, repo.RepoID)
+				resp, body := tc.do()
+				env := wctRequireFail(t, resp, body, http.StatusTooManyRequests, "unavailable")
+				if env.Result.Branch != "main" || !strings.Contains(env.Result.Message, "retry later") {
+					t.Fatalf("429 result = %+v, want branch main and a retry message", env.Result)
+				}
+				if got := resp.Header.Get("Retry-After"); got != "10" {
+					t.Fatalf("Retry-After = %q, want 10", got)
+				}
+				if got := resp.Header.Get("RateLimit"); got != `"default";r=0;t=10` {
+					t.Fatalf("RateLimit = %q, want the default service limit with t=10", got)
+				}
+				if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
+					t.Fatalf("denied write moved refs: %v -> %v", before, after)
+				}
+			})
 		}
 	})
 }
