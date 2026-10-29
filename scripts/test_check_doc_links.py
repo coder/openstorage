@@ -1,7 +1,4 @@
-"""Regression tests for the documented check-doc-links.py command.
-
-Run with: python3 -B -m unittest discover -s scripts -p 'test_check_doc_links.py'
-"""
+"""Regression tests for the documented check-doc-links.py command."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,8 +7,8 @@ import tempfile
 import unittest
 
 
-class DocLinkCheckerTests(unittest.TestCase):
-    def run_checker(self, readme, docs=None):
+class CheckerTestCase(unittest.TestCase):
+    def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), git=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -21,15 +18,27 @@ class DocLinkCheckerTests(unittest.TestCase):
             (root / "README.md").write_text(readme, encoding="utf-8")
             for name in ["CONTRIBUTING.md", "CHANGELOG.md"]:
                 (root / name).write_text("", encoding="utf-8")
-            for name, text in (docs or {}).items():
-                path = root / "docs" / name
+            staged = {f"docs/{name}": text for name, text in (docs or {}).items()}
+            for name, text in {**staged, **(files or {})}.items():
+                path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding="utf-8")
+            if git:
+                subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+                subprocess.run(["git", "add", "-f", "."], cwd=root, check=True)
+            for name, text in (untracked or {}).items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            for name in deleted:
+                (root / name).unlink()
             return subprocess.run(
                 [sys.executable, str(checker)], cwd=root, text=True,
                 capture_output=True, timeout=10,
             )
 
+
+class DocLinkCheckerTests(CheckerTestCase):
     def test_named_anchor_resolves_local_and_cross_file_links(self):
         result = self.run_checker(
             '<a name="try-local"></a>\n[Start here](#try-local)\n',
@@ -225,6 +234,37 @@ class DocLinkCheckerTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(diagnostic, result.stdout)
                 self.assertTrue(result.stdout.endswith('broken links: 1\n'))
+
+
+class FileSelectionTests(CheckerTestCase):
+    def test_nested_readmes_are_link_checked(self):
+        result = self.run_checker("", files={"internal/pkg/README.md": "[Gone](gone.md)\n"})
+        self.assertEqual(result.stdout, "BROKEN FILE internal/pkg/README.md:1 -> gone.md\nbroken links: 1\n")
+        self.assertEqual(result.returncode, 1)
+
+    def test_anchors_resolve_in_markdown_that_is_not_scanned(self):
+        files = {".agents/skill/SKILL.md": "# Skill\n\n## Launch\n",
+                 ".agents/skill/features/README.md": "[Launch](../SKILL.md#launch) [Gone](../SKILL.md#gone)\n"}
+        result = self.run_checker("", files=files)
+        self.assertEqual(result.stdout, "BROKEN ANCHOR .agents/skill/features/README.md:1 -> "
+                                        "../SKILL.md#gone\nbroken links: 1\n")
+
+    def test_only_tracked_markdown_outside_vendor_is_read(self):
+        broken = "[Gone](gone.md)\n"
+        result = self.run_checker(
+            "",
+            files={"vendor/mod/README.md": broken, "notes.md": broken, "docs/old.md": broken},
+            untracked={"internal/new/README.md": broken},
+            deleted=["docs/old.md"],
+        )
+        self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
+        self.assertEqual(result.returncode, 0)
+
+    def test_outside_a_git_checkout_exits_2_without_checking(self):
+        result = self.run_checker("[Gone](gone.md)\n", git=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("needs a git checkout", result.stderr)
 
 
 if __name__ == "__main__":

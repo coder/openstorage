@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
-"""Offline docs link checker: validates every relative INLINE markdown link
-(file + heading or explicit HTML anchor) under README.md, CONTRIBUTING.md,
-CHANGELOG.md, and docs/.
+"""Offline checker for the relative links in this repository's docs.
+
+    python3 scripts/check-doc-links.py
+
+Reads the Markdown files in git's index (`git ls-files`), minus vendor/ and
+files deleted from the working tree: every README.md, the root CONTRIBUTING.md
+and CHANGELOG.md, and every .md file under docs/. Prints one line per failure,
+then `broken links: N`. Exits 1 when N > 0. Exits 2, without checking
+anything, when git cannot list the files (for example, outside a checkout).
+Zero dependencies besides git. CI runs it in the required lint job of
+.github/workflows/ci.yml.
+
+Every relative INLINE link must name an existing file. A #fragment on a .md
+target must name one of that file's anchors, even when the target is not a
+scanned file. Anchors of docs/upstream/ targets are not checked, because those
+files are verbatim upstream copies. Anchor
+checking follows GitHub's algorithm (lowercase, strip backticks/asterisks,
+spaces to hyphens, dedupe with -1/-2 suffixes). Explicit <a name="..."> and
+<a id="..."> anchors retain their exact values; anchors demonstrated in
+fenced, indented, or inline code do not create destinations.
 
 Unsupported-but-valid Markdown fails closed rather than silently passing:
 reference-style links ([text][ref] with a [ref]: destination line) and
@@ -9,21 +26,11 @@ angle-bracket destinations ([text](<file.md>)) are not resolved — this tree
 uses neither, and any occurrence outside code is itself reported as a
 failure so it cannot bypass validation.
 
-Zero dependencies. Not wired into CI on purpose — run it when touching docs:
-
-    python3 scripts/check-doc-links.py
-
-Exits non-zero and prints one line per broken link. Anchor checking follows
-GitHub's algorithm (lowercase, strip backticks/asterisks, spaces to hyphens,
-dedupe with -1/-2 suffixes) and skips docs/upstream/ anchors (vendor copies).
-Explicit <a name="..."> and <a id="..."> anchors retain their exact values;
-anchors demonstrated in fenced, indented, or inline code do not create destinations.
-
 Deliberately minimal: it parses the Markdown this tree actually writes.
 Destinations may contain balanced (single-level) parentheses and an optional
 quoted title; fences track their opening character and length per CommonMark.
 """
-import os, re, sys, posixpath
+import functools, os, posixpath, re, subprocess, sys
 from html.parser import HTMLParser
 
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -236,73 +243,86 @@ def scan_lines(path):
             yield lineno, raw, visible
 
 
+def doc_files():
+    try:
+        listed = subprocess.run(["git", "ls-files", "-z", "--", "*.md"], capture_output=True)
+        failure = listed.returncode and (listed.stderr.decode(errors="replace").strip()
+                                         or f"git ls-files exited {listed.returncode}")
+    except OSError as err:
+        failure = str(err)
+    if failure:
+        print(f"check-doc-links.py needs a git checkout: {failure}", file=sys.stderr)
+        sys.exit(2)
+    names = {os.fsdecode(name) for name in listed.stdout.split(b"\0") if name}
+    return sorted(name for name in names if not name.startswith("vendor/") and os.path.isfile(name))
+
+
+def links_apply(path):
+    return (posixpath.basename(path) == "README.md" or path in ("CONTRIBUTING.md", "CHANGELOG.md")
+            or path.startswith("docs/"))
+
+
+@functools.cache
+def anchors(path):
+    found = set()
+    for block in scan_blocks(path):
+        explicit = ExplicitAnchors()
+        explicit.feed(without_inline_code("".join(ln for _, ln in block)))
+        explicit.close()
+        # Keep HTML parsing within a block, so omitted code cannot join tags.
+        found.update(explicit.anchors)
+    headings = set()
+    for _, ln, _ in scan_lines(path):
+        m = HEADING.match(ln)
+        if m:
+            # strip an optional ATX closing sequence ("## Title ##")
+            base = gh_anchor(re.sub(r"\s+#+\s*$", "", m.group(2)))
+            a, i = base, 1
+            while a in headings:
+                a = f"{base}-{i}"; i += 1
+            headings.add(a)
+    # Explicit anchors must not change GitHub's heading duplicate suffixes.
+    return found | headings
+
+
+def link_failures(path, lineno, ln):
+    d = posixpath.dirname(path) or "."
+    if REFDEF.match(ln):
+        return [f"UNSUPPORTED REF-STYLE LINK DEF {path}:{lineno} -> {ln.strip()[:60]}"]
+    if ANGLE.search(ln):
+        return [f"UNSUPPORTED ANGLE-BRACKET DEST {path}:{lineno} -> {ln.strip()[:60]}"]
+    # fail closed on any ]( this parser cannot consume on one line
+    # (e.g. a link whose destination/title spans a line ending)
+    if "](" in LINK.sub("", ln):
+        return [f"UNSUPPORTED UNPARSED LINK {path}:{lineno} -> {ln.strip()[:60]}"]
+    failures = []
+    for m in LINK.finditer(ln):
+        target, anchor = m.group(1), m.group(2)
+        if re.match(r"^[a-z]+:", target) or target.startswith("/"):
+            continue
+        if not target and not anchor:
+            continue
+        # fragment-only links resolve to the current file
+        resolved = path if not target else posixpath.normpath(posixpath.join(d, target))
+        if resolved == ".." or resolved.startswith("../"):
+            failures.append(f"BROKEN FILE (escapes repo) {path}:{lineno} -> {target}")
+        elif not os.path.exists(resolved):
+            failures.append(f"BROKEN FILE {path}:{lineno} -> {target}")
+        elif (anchor and anchor != "#" and resolved.endswith(".md")
+              and not resolved.startswith("docs/upstream") and anchor[1:] not in anchors(resolved)):
+            failures.append(f"BROKEN ANCHOR {path}:{lineno} -> {target}{anchor}")
+    return failures
+
+
 def check():
-    md = ["README.md", "CONTRIBUTING.md", "CHANGELOG.md"]
-    for dirpath, dirs, files in os.walk("docs"):
-        for f in files:
-            if f.endswith(".md"):
-                md.append(os.path.join(dirpath, f))
-    anchors = {}
-    for path in md:
-        aset = set()
-        for block in scan_blocks(path):
-            explicit = ExplicitAnchors()
-            explicit.feed(without_inline_code("".join(ln for _, ln in block)))
-            explicit.close()
-            # Keep HTML parsing within a block, so omitted code cannot join tags.
-            aset.update(explicit.anchors)
-        headings = set()
-        for _, ln, _ in scan_lines(path):
-            m = HEADING.match(ln)
-            if m:
-                # strip an optional ATX closing sequence ("## Title ##")
-                base = gh_anchor(re.sub(r"\s+#+\s*$", "", m.group(2)))
-                a, i = base, 1
-                while a in headings:
-                    a = f"{base}-{i}"; i += 1
-                headings.add(a)
-        # Explicit anchors must not change GitHub's heading duplicate suffixes.
-        aset.update(headings)
-        anchors[path] = aset
-    bad = 0
-    for path in md:
-        d = posixpath.dirname(path) or "."
-        for lineno, _, ln in scan_lines(path):
-            if REFDEF.match(ln):
-                print(f"UNSUPPORTED REF-STYLE LINK DEF {path}:{lineno} -> {ln.strip()[:60]}")
-                bad += 1
-                continue
-            if ANGLE.search(ln):
-                print(f"UNSUPPORTED ANGLE-BRACKET DEST {path}:{lineno} -> {ln.strip()[:60]}")
-                bad += 1
-                continue
-            # fail closed on any ]( this parser cannot consume on one line
-            # (e.g. a link whose destination/title spans a line ending)
-            if "](" in LINK.sub("", ln):
-                print(f"UNSUPPORTED UNPARSED LINK {path}:{lineno} -> {ln.strip()[:60]}")
-                bad += 1
-                continue
-            for m in LINK.finditer(ln):
-                target, anchor = m.group(1), m.group(2)
-                if re.match(r"^[a-z]+:", target) or target.startswith("/"):
-                    continue
-                if not target and not anchor:
-                    continue
-                # fragment-only links resolve to the current file
-                resolved = path if not target else posixpath.normpath(posixpath.join(d, target))
-                if resolved == ".." or resolved.startswith("../"):
-                    print(f"BROKEN FILE (escapes repo) {path}:{lineno} -> {target}")
-                    bad += 1
-                    continue
-                if not os.path.exists(resolved):
-                    print(f"BROKEN FILE {path}:{lineno} -> {target}")
-                    bad += 1
-                elif anchor and anchor != "#" and resolved.endswith(".md") and not resolved.startswith("docs/upstream"):
-                    if anchor[1:] not in anchors.get(resolved, set()):
-                        print(f"BROKEN ANCHOR {path}:{lineno} -> {target}{anchor}")
-                        bad += 1
-    print("broken links:", bad)
-    return bad
+    failures = []
+    for path in filter(links_apply, doc_files()):
+        for lineno, _, visible in scan_lines(path):
+            failures += link_failures(path, lineno, visible)
+    for failure in failures:
+        print(failure)
+    print("broken links:", len(failures))
+    return len(failures)
 
 
 if __name__ == "__main__":
