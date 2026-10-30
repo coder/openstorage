@@ -32,7 +32,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX")
 
 - Needs Go (the `go.mod` version), Java 11 or newer, and `curl`. The first run downloads `tla2tools.jar` 1.7.4 (sha256-pinned) into `${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla`. Set `JAVA`, `GO`, or `OPENSTORAGE_TLA_CACHE` to override.
 - It takes about 3 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`).
-- `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path.
+- `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path. With `--fingerprints-only` and no `--out`, check.sh deletes that directory on exit.
 - `--only <cfg>` runs one config, for example `--only NoTiming.cfg`. It is for quick iteration. Finish with a full run.
 - `--fingerprints-only` checks the code facts and the fingerprints without TLC or Java, in about a second. CI runs it in the `orphan-sweep-fingerprints` job of `.github/workflows/ci.yml`, so a change to covered code fails CI until someone brings the model in line and runs `check.sh --record`. CI does not run TLC: a pass says that the covered code is the code the model was checked against, not that the properties hold.
 
@@ -57,7 +57,7 @@ RESULT: PASS
 |---|---|---|
 | 0 | PASS | Nothing. |
 | 1 | FAIL: a property broke | [Read the failure](#read-a-failure). |
-| 2 | STALE: the properties hold on the model, but covered code changed since the sync commit, a fact is FALSE, or a probe stopped failing | [Bring the model in line](#bring-the-model-in-line). |
+| 2 | STALE: covered code changed since the sync commit, a fact is FALSE, or a probe stopped failing. In a full run, the properties hold on the model. With `--fingerprints-only`, TLC did not run, so the result says nothing about the properties | [Bring the model in line](#bring-the-model-in-line). |
 | 3 | The check could not run | Fix the tool problem it prints (Go, Java, download, a TLA+ parse error, or a covered function that facts.go cannot find). |
 
 ## How the check follows the code

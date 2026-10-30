@@ -67,8 +67,10 @@ done
 if [ "$fp_only" = 1 ] && { [ "$record" = 1 ] || [ "$only" != " " ]; }; then
   echo "check.sh: --fingerprints-only runs no TLC, so it takes no --record or --only" >&2; exit 3
 fi
+tmp_out=""
 if [ -z "$out" ]; then
   out=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX") || exit 3
+  [ "$fp_only" = 1 ] && tmp_out=$out
 else
   mkdir -p "$out" || exit 3
   # A reused directory would keep an old config's trace next to a new PASS.
@@ -77,7 +79,7 @@ fi
 out=$(cd "$out" && pwd -P)
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-work.XXXXXX") || exit 3
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work" ${tmp_out:+"$tmp_out"}' EXIT
 
 die() { echo "check.sh: $*" >&2; exit 3; }
 
