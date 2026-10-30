@@ -1031,11 +1031,36 @@ func withShutdown(ctx, runs context.Context) (context.Context, func()) {
 	return rctx, release
 }
 
-// Close stops the workers (waiting for in-flight jobs) and closes the pool.
-// Unfinished durable jobs remain in Postgres and resume on next start.
+// closeTimeout bounds Close (issue #636). It covers a cancelled run's
+// restore and its snooze read.
+const closeTimeout = 5 * time.Second
+
+// Close cancels the jobs still running, closes the pool, and returns within
+// closeTimeout. Sync and push runs are cancelled with sync.ErrShutdown and
+// keep their jobs (shutdownSnooze). River makes the other cancelled jobs
+// available again. A job still running at the deadline keeps its row running
+// until River rescues it (RescueStuckJobsAfter), as after a crash. Closing
+// the pool rejects new work but also waits for every held connection, so
+// Close stops waiting for it at the deadline. After a complete DrainSyncRuns,
+// Close only closes the pool.
 func (q *River) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer cancel()
 	if q.started {
-		_ = q.client.Stop(context.Background())
+		select {
+		case <-q.client.Stopped():
+		default:
+			q.cancelRuns(sync.ErrShutdown)
+			_ = q.client.StopAndCancel(ctx)
+		}
 	}
-	q.pool.Close()
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		q.pool.Close()
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+	}
 }
