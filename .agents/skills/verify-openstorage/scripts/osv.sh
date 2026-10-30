@@ -426,10 +426,7 @@ print(v if isinstance(v, str) else json.dumps(v))
 PYEOF
 }
 
-# save_evidence: copy the serve logs, state.env and the token list into the
-# evidence, then redact every regular file in it. Cleanup calls it before it
-# refuses a foreign PID, stops at a leftover, or deletes $WORK.
-save_evidence() {
+save_redacted_evidence() {
 	[[ -d $WORK ]] || return 0
 	[[ -f $WORK/serve.out ]] && cp "$WORK/serve.out" "$EVID/serve.stdout.log"
 	[[ -f $WORK/serve.err ]] && cp "$WORK/serve.err" "$EVID/serve.stderr.log"
@@ -472,7 +469,7 @@ cmd_cleanup() {
 	local pid='' kids='' left=''
 	[[ -s $WORK/serve.pid ]] && pid=$(<"$WORK/serve.pid")
 	if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
-		is_our_serve "$pid" || { save_evidence; die "pid $pid is alive but does not run $BIN: refusing to signal it"; }
+		is_our_serve "$pid" || { save_redacted_evidence; die "pid $pid is alive but does not run $BIN: refusing to signal it"; }
 		kids=$(descendants_of "$pid" | tr '\n' ' ')
 		kill -TERM "$pid"
 		local deadline=$((SECONDS + 30))
@@ -495,7 +492,7 @@ cmd_cleanup() {
 		done
 	fi
 	echo "== cleanup $(now)" >>"$EVID/doctor.txt"
-	save_evidence
+	save_redacted_evidence
 	if [[ -n $left ]]; then
 		# Keep $WORK: a rerun must still see these processes by their cwd.
 		echo "LEFTOVER processes:$left" | tee -a "$EVID/doctor.txt" >&2
