@@ -1,5 +1,98 @@
 # Changelog
 
+## [0.19.0](https://github.com/coder/openstorage/compare/v0.18.0...v0.19.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **api:** a diff-commit patch that does not apply now gets 409 conflict instead of 422 invalid, and a diff payload that is not a valid patch or that names an invalid path now gets 400 invalid instead of 422.
+* **api:** `GET .../files` without `recursive` lists every file in the tree instead of the direct children. It answers 422 when that listing passes the 64 MiB git output budget. Send `recursive=false` to get the direct children.
+* **api:** when another writer moves the branch after the server wrote the commit, commit-pack and diff-commit now answer 409 with result.status failed instead of conflict, and the body carries the written commit in commit and result.new_sha.
+* **api:** GitHub sync creates during a rolling upgrade. Only an upgraded worker adopts the GitHub default branch for a sync create that omits default_branch. A sync that an older worker runs leaves the repo on main until the next sync by an upgraded worker. An older replica's PATCH /repo to main before that sync does not stop the adoption, so the repo still moves to the GitHub branch. Upgrade every replica before you send GitHub sync creates that omit default_branch, or send default_branch explicitly. Tracked in #609.
+* **api:** a commit-pack or diff-commit request that changes nothing now gets 412 precondition_failed "no changes to commit" instead of an empty commit. A commit-pack or diff-commit stream that ends before its eof chunk now gets 412 instead of 400.
+* **api:** GET /api/v1/repos/files/metadata and GET /api/repos/{repo_name}/files/metadata now send only the subject line of each commit message in the commits map (the first paragraph as one line, the same as git's %s). Clients that need the body or the trailers must read GET /api/v1/repos/commit.
+* **api:** GET /api/v1/repos/commits and GET /api/repos/{repo_name}/commits now send only the subject line of each commit message (the first paragraph as one line, the same as git's %s). Clients that need the body or the trailers must read GET /api/v1/repos/commit.
+* **api:** `files` and `files/metadata` calls without `limit` and `cursor` return every entry instead of one page, and `files/metadata` answers 429 when the files under `path` have more than 50,000 distinct last commits.
+* **api:** a failed merge guard on POST /api/v1/repos/merge and POST /api/repos/{repo_name}/merge now answers code ref_guard_failed instead of conflict, with guard and current_sha members. A merge with expected_source_sha whose source branch does not exist answers 409 ref_guard_failed with current_sha 40 zeros instead of 404. Clients that branch on code conflict for a merge guard must check ref_guard_failed.
+* **api:** a stale expected_target_sha on POST /api/v1/repos/merge and POST /api/repos/{repo_name}/merge now answers 409 with a problem body, code conflict, instead of 412 with result.status precondition_failed. Raw HTTP callers that check for 412 must check for 409 and the conflict code. SDK callers keep the same error type.
+* **api:** `POST /repos` now answers 200 with the existing repo instead of 409 for a plain, copy or fork create of a name that a finished repo without an upstream holds. A repeat copy or fork answers before it reads its source.
+* **api:** `POST /repos` now answers 503 with `Retry-After` instead of 409 for a plain, copy or fork create of a name whose fork or copy create has not finished, including one that crashed or whose last step failed. A sync create pending after its upstream link was removed gets the same answer. `DELETE /repos/delete` clears such a name.
+* **s3wal:** S3WAL only, PostgreSQL and SQLite are not affected. An S3WAL bucket written by v0.16.0 through v0.18.0 must be converted before this release serves it. Stop `serve` and wait for it to exit, take a backup, replace the binary, run `openstorage s3wal-meta convert --to 2`, then start `serve`. Upgrade an older bucket to v0.18.0 first. To go back, stop `serve`, take a backup, and run `openstorage s3wal-meta convert --to 1` with this release before starting the older release. See docs/how-to/deploy-production.md#upgrading-the-s3wal-metadata-format.
+* **api:** `POST /repos` with `upstream` or a `base_repo` sync, for a name that a repo with the same upstream and the same `forward_pushes` holds, now answers 200 with the existing repo instead of 409. A repeat create of a pending sync repo by a token with only `repo:write` now answers 403 instead of 409.
+
+### Features
+
+* **api:** a fork or copy is pending until its ref write ([#450](https://github.com/coder/openstorage/issues/450)) ([49bc1ac](https://github.com/coder/openstorage/commit/49bc1acd7cdb1579fa34e76e09b741673f20649d))
+* **api:** a repeat create of a finished repo answers 200 ([#453](https://github.com/coder/openstorage/issues/453)) ([295de82](https://github.com/coder/openstorage/commit/295de82d0eb8ec9da1f30dc6ce230bdb300ac910))
+* **api:** a repeat sync create of the same upstream answers 200 ([#438](https://github.com/coder/openstorage/issues/438)) ([0a4994f](https://github.com/coder/openstorage/commit/0a4994f2b6f92a34cc94af4304b572edbfc48917))
+* **api:** answer a stale merge expected_target_sha with 409 conflict ([#536](https://github.com/coder/openstorage/issues/536)) ([198cc45](https://github.com/coder/openstorage/commit/198cc4554547f63247f35eef94e65f7478df07f4))
+* **api:** answer failed merge guards with 409 ref_guard_failed ([#571](https://github.com/coder/openstorage/issues/571)) ([d7c1eb8](https://github.com/coder/openstorage/commit/d7c1eb806b70957a0544701c9f7f731e7175d559))
+* **api:** honor expected_source_sha on merge ([#535](https://github.com/coder/openstorage/issues/535)) ([0341af9](https://github.com/coder/openstorage/commit/0341af91c465ffb3e979929846a0996cd95adfd6))
+* **api:** name invalid fields from the single-field body validators ([#443](https://github.com/coder/openstorage/issues/443)) ([e1beeeb](https://github.com/coder/openstorage/commit/e1beeeb81f8d291bb5d2f35fbc6574621dd136c3))
+* **api:** name the invalid field in invalid_params on body decode failures ([#436](https://github.com/coder/openstorage/issues/436)) ([66f5c32](https://github.com/coder/openstorage/commit/66f5c3293c17e8ef5a5bc1e29e0d6f7580347866))
+* **api:** send a Deprecation header on the deprecated pull-upstream and base routes ([#460](https://github.com/coder/openstorage/issues/460)) ([ea43a01](https://github.com/coder/openstorage/commit/ea43a01c041a9f7545fa8da4c9115755a5beafe4))
+* **api:** send only the subject line in commit list entries ([#575](https://github.com/coder/openstorage/issues/575)) ([f0c975a](https://github.com/coder/openstorage/commit/f0c975ad87dadee2ee76873dc94c0432ba3755d4))
+* **api:** send only the subject line in files/metadata commits ([#579](https://github.com/coder/openstorage/issues/579)) ([5e9bbe6](https://github.com/coder/openstorage/commit/5e9bbe655c5233ea65cead4663854f1cd1625935))
+* **meta:** add the ADR-50 schedule transitions for S3WAL metadata v2 ([#448](https://github.com/coder/openstorage/issues/448)) ([27b24bd](https://github.com/coder/openstorage/commit/27b24bd35caf2cba631c68c579b9f7e0ca091bb0))
+* **meta:** add the S3WAL metadata v1/v2 conversion (ADR-51) ([#441](https://github.com/coder/openstorage/issues/441)) ([ba8365a](https://github.com/coder/openstorage/commit/ba8365a78e420a088deb53440d2d58750345df98))
+* **meta:** complete the S3WAL local schedule ([#449](https://github.com/coder/openstorage/issues/449)) ([ae6e3a0](https://github.com/coder/openstorage/commit/ae6e3a03b0271ec312ca9dcefdd3e27361e634ea))
+* **s3wal:** repair or refuse unfinished creates on convert --to 1 ([#489](https://github.com/coder/openstorage/issues/489)) ([5b06087](https://github.com/coder/openstorage/commit/5b0608718a1fe2b123af47d838cc868ca745f308))
+* **s3wal:** run S3WAL upstream syncs on the durable local schedule ([#451](https://github.com/coder/openstorage/issues/451)) ([f0153d4](https://github.com/coder/openstorage/commit/f0153d41b0415f3d53bfeb0c9b0a145bc1f97f09))
+* **s3wal:** schedule upstream syncs from S3WAL git-surface pushes ([#454](https://github.com/coder/openstorage/issues/454)) ([f5d362a](https://github.com/coder/openstorage/commit/f5d362ab0dff6de49df68b78cbc7b372cc50c36e))
+* **s3wal:** serve reads metadata format v2; add s3wal-meta convert ([#444](https://github.com/coder/openstorage/issues/444)) ([116175f](https://github.com/coder/openstorage/commit/116175fc28c6581b0b402f49b0b760a55c75fa19))
+* **s3wal:** store create state in metadata v2; release-pair harness covers conversion and downgrade ([#446](https://github.com/coder/openstorage/issues/446)) ([cb885a7](https://github.com/coder/openstorage/commit/cb885a78482ab9c352eab8108551d1dadb627543))
+
+
+### Bug Fixes
+
+* **api:** add ref_guard_failed problem members to the notes 409s ([#573](https://github.com/coder/openstorage/issues/573)) ([0e6133b](https://github.com/coder/openstorage/commit/0e6133beb9f1bfb9738b2f81bec344a81dbee147))
+* **api:** answer "repository already detached" on DELETE .../upstream without an upstream ([#468](https://github.com/coder/openstorage/issues/468)) ([6005169](https://github.com/coder/openstorage/commit/60051699a3128b57c0f0fba700b45e8178b48f04))
+* **api:** answer 409 conflict when a diff-commit patch does not apply ([#611](https://github.com/coder/openstorage/issues/611)) ([77424c8](https://github.com/coder/openstorage/commit/77424c86a21facfc163ce320e9f96cc2279714b8))
+* **api:** answer 412 no changes to commit on commit writes that change nothing ([#605](https://github.com/coder/openstorage/issues/605)) ([54f9bca](https://github.com/coder/openstorage/commit/54f9bca65684b0daaa92c674fbb393e6fd63b99e))
+* **api:** answer 413 when a commit-pack passes 262144000 decoded bytes ([#610](https://github.com/coder/openstorage/issues/610)) ([e491cf4](https://github.com/coder/openstorage/commit/e491cf45542e365a854b75ffdc820ecb5ea1f5d2))
+* **api:** answer a lost commit CAS with 409 failed and the written commit ([#606](https://github.com/coder/openstorage/issues/606)) ([9cec7ea](https://github.com/coder/openstorage/commit/9cec7ea3dbba6731297f41fc1ca1fe4ba1e7735d))
+* **api:** answer the pack-reservation 429 with status unavailable ([#600](https://github.com/coder/openstorage/issues/600)) ([dc40992](https://github.com/coder/openstorage/commit/dc40992ea2403053df9960a5676d0517613e20c6))
+* **api:** list files recursively when the call sends no recursive ([#602](https://github.com/coder/openstorage/issues/602)) ([8cb2588](https://github.com/coder/openstorage/commit/8cb258898844280a300d15fa8063daccba7b8f96))
+* **api:** page recursive files listings without listing the whole tree ([#614](https://github.com/coder/openstorage/issues/614)) ([5620494](https://github.com/coder/openstorage/commit/5620494ca88650825618a0bbb731000ee586bb8f))
+* **api:** read path params and tree paths literally in git pathspecs ([#578](https://github.com/coder/openstorage/issues/578)) ([0a39336](https://github.com/coder/openstorage/commit/0a39336e234504fc059deecc2ef3bcd6d1967af1))
+* **api:** return every entry from file listings without limit or cursor ([#572](https://github.com/coder/openstorage/issues/572)) ([3ff6012](https://github.com/coder/openstorage/commit/3ff6012568312778e822e8168b6d07fc4dd4747f))
+* **api:** take the GitHub default branch when a sync create omits default_branch ([#607](https://github.com/coder/openstorage/issues/607)) ([f6d96da](https://github.com/coder/openstorage/commit/f6d96da578938e63576328fecac4cf81de813fc9))
+* **compose:** give serve 30 s to drain and tear down on docker stop ([#493](https://github.com/coder/openstorage/issues/493)) ([a09d656](https://github.com/coder/openstorage/commit/a09d6563ff383e94bb34e964f4b2258b5927a5b7))
+* **deploy:** stop the AWS systemd unit with KillMode=mixed ([#479](https://github.com/coder/openstorage/issues/479)) ([a4be26e](https://github.com/coder/openstorage/commit/a4be26e562d773e8bc03a8fbda8800da5deed886))
+* **deps:** bump Go toolchain to 1.27.3 for GO-2026-6809 ([#546](https://github.com/coder/openstorage/issues/546)) ([f58a6f0](https://github.com/coder/openstorage/commit/f58a6f0575780396b6f9aafac01c649c1bd77147))
+* **deps:** bump gocloud.dev to v0.47.0 for the fileblob root-key fix ([#510](https://github.com/coder/openstorage/issues/510)) ([0274c7e](https://github.com/coder/openstorage/commit/0274c7ed8e74efd312be19e511264ccbe7715b95))
+* **deps:** bump golang.org/x/net to v0.62.0 (GO-2026-6860, GO-2026-6866) ([#622](https://github.com/coder/openstorage/issues/622)) ([7a11b9c](https://github.com/coder/openstorage/commit/7a11b9ce193f2bd13d7f780e85941ab814d57bc7))
+* **githttp:** report stale ref locks and document their manual removal ([#485](https://github.com/coder/openstorage/issues/485)) ([dda15af](https://github.com/coder/openstorage/commit/dda15aff526e5a12071dfa80a15edeb66370fbd2))
+* **gitread:** frame git log fields with NUL bytes ([#582](https://github.com/coder/openstorage/issues/582)) ([6458ece](https://github.com/coder/openstorage/commit/6458eced58babd55fc01d1b083f6da5a5d85af1e))
+* **gitread:** read commit dates that git cannot parse ([#584](https://github.com/coder/openstorage/issues/584)) ([fca3943](https://github.com/coder/openstorage/commit/fca3943cb0a6e7f4566d38c056e01606ea3a0dc9))
+* **gitread:** read grep paths that hold a newline ([#585](https://github.com/coder/openstorage/issues/585)) ([e42338e](https://github.com/coder/openstorage/commit/e42338ed81eb07b16b4f9d392b5ece85db9e4a0c))
+* **gitread:** return blame original_path unquoted ([#591](https://github.com/coder/openstorage/issues/591)) ([d283ba4](https://github.com/coder/openstorage/commit/d283ba45419c5b0d6a9c2519d120519e1a27be77))
+* **image:** bump the alpine runtime base to 3.24.3 ([#551](https://github.com/coder/openstorage/issues/551)) ([302960e](https://github.com/coder/openstorage/commit/302960e15a2277bda22569fc07cb46b99624de31))
+* **jobs:** bound River.Close when no drain stopped the jobs ([#642](https://github.com/coder/openstorage/issues/642)) ([23b715e](https://github.com/coder/openstorage/commit/23b715ebf9075c42905415e6a2c513ad18ea7914))
+* **jobs:** give River jobs a 2-hour deadline instead of River's 1-minute default ([#637](https://github.com/coder/openstorage/issues/637)) ([47cc9bc](https://github.com/coder/openstorage/commit/47cc9bc7920899307d46ffb3eac39e2adfeaf3dc))
+* **jobs:** rescue crashed sync and push jobs once their claim lease expires ([#644](https://github.com/coder/openstorage/issues/644)) ([c82e7dc](https://github.com/coder/openstorage/commit/c82e7dccd19f0cbcd1ed7e1509c32830f8dc27b1))
+* **s3wal:** complete the --force help and share the op-log scope names ([#500](https://github.com/coder/openstorage/issues/500)) ([f69d4f6](https://github.com/coder/openstorage/commit/f69d4f6c942683ab8b84a4ca62d17615834dabe6))
+* **s3wal:** give the meta.json quarantine one clear error and document it at the hook ([#528](https://github.com/coder/openstorage/issues/528)) ([e182cba](https://github.com/coder/openstorage/commit/e182cba77792ac958f4ce7d31ff8d69ab80532a3))
+* **s3wal:** keep serve running when meta.json goes back to an older seq ([#496](https://github.com/coder/openstorage/issues/496)) ([287cda6](https://github.com/coder/openstorage/commit/287cda69db83eb0361e03f27cb853cd56e826eb6))
+* **s3wal:** latch the rollback refusal when a cached meta.json stops decoding ([#514](https://github.com/coder/openstorage/issues/514)) ([5cbaba6](https://github.com/coder/openstorage/commit/5cbaba62359c872ec034ebef02c7ec21c2feac46))
+* **s3wal:** quarantine meta.json until restart when an edit is found after adoption ([#523](https://github.com/coder/openstorage/issues/523)) ([d45ad2a](https://github.com/coder/openstorage/commit/d45ad2a6ff85466a6586733b3813a2bfb6211d43))
+* **s3wal:** refuse a hook ref update on a corrupt meta.json ([#476](https://github.com/coder/openstorage/issues/476)) ([aab68a4](https://github.com/coder/openstorage/commit/aab68a4d3c42ece6b5aa6afd141f3e9cfb30ff35))
+* **s3wal:** refuse a hook ref update on a metadata format mismatch ([#465](https://github.com/coder/openstorage/issues/465)) ([c3f6d8c](https://github.com/coder/openstorage/commit/c3f6d8c984a1694ab6a8fdac6cee1e7d9f6a2d77))
+* **s3wal:** reject every row content the background loops rely on at meta.json decode ([#518](https://github.com/coder/openstorage/issues/518)) ([3fb638d](https://github.com/coder/openstorage/commit/3fb638deb798cfba47d025dce844f92b14aec6f3))
+* **s3wal:** reject impossible id counters in meta.json instead of panicking ([#486](https://github.com/coder/openstorage/issues/486)) ([48076b6](https://github.com/coder/openstorage/commit/48076b620b7491225dff5c2663c29a4af3f5e2b4))
+* **s3wal:** route every meta.json latch through one refusal choke point ([#522](https://github.com/coder/openstorage/issues/522)) ([c49b99b](https://github.com/coder/openstorage/commit/c49b99b1c77e54b61e961a17a3a998e3a3c228dc))
+* **s3wal:** tag org-key refresh round trips in the S3 op log ([#498](https://github.com/coder/openstorage/issues/498)) ([8ae1314](https://github.com/coder/openstorage/commit/8ae13145cea7daf57fdf80da464545faa4fe306d))
+* **s3wal:** turn meta.json lane-shape and counter panics into corrupt-document errors ([#509](https://github.com/coder/openstorage/issues/509)) ([2c70de2](https://github.com/coder/openstorage/commit/2c70de2f84d6e82064a6f8aa551c00656315e54c))
+* **serve:** stop git children when the shutdown drain times out ([#472](https://github.com/coder/openstorage/issues/472)) ([66fedf1](https://github.com/coder/openstorage/commit/66fedf187cf716ca0c1fe764b2f98fea78a87609))
+* **serve:** stop REST and hydration git children on drain timeout ([#483](https://github.com/coder/openstorage/issues/483)) ([84394f6](https://github.com/coder/openstorage/commit/84394f6573a3e00d36afe6aa83f4b5d2fce41650))
+
+
+### Performance Improvements
+
+* **gitread:** diff only what can change a files/metadata answer ([#586](https://github.com/coder/openstorage/issues/586)) ([38fb0be](https://github.com/coder/openstorage/commit/38fb0be2c6412ff9d3306940e32d8a9887e6f31d))
+* **gitread:** send last-commit diffs ahead within a window ([#589](https://github.com/coder/openstorage/issues/589)) ([e5d34fd](https://github.com/coder/openstorage/commit/e5d34fdb4041c25b51c1d2ce02efa76c7a8345fa))
+* **s3wal:** reuse the decoded meta.json on a 304 for read-only callers ([#495](https://github.com/coder/openstorage/issues/495)) ([1a1a201](https://github.com/coder/openstorage/commit/1a1a2016b228f87c27a6c62e7ebecc2dededaf94))
+
 ## [0.18.0](https://github.com/coder/openstorage/compare/v0.17.0...v0.18.0) (2026-10-13)
 
 
