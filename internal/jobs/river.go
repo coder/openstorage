@@ -1039,10 +1039,10 @@ const closeTimeout = 5 * time.Second
 // closeTimeout. Sync and push runs are cancelled with sync.ErrShutdown and
 // keep their jobs (shutdownSnooze). River makes the other cancelled jobs
 // available again. A job still running at the deadline keeps its row running
-// until River rescues it (RescueStuckJobsAfter), as after a crash. The pool
-// rejects new work at once, but its close waits for every held connection,
-// so Close stops waiting for it at the deadline. After a complete
-// DrainSyncRuns, Close only closes the pool.
+// until River rescues it (RescueStuckJobsAfter), as after a crash. Closing
+// the pool rejects new work but also waits for every held connection, so
+// Close stops waiting for it at the deadline. After a complete DrainSyncRuns,
+// Close only closes the pool.
 func (q *River) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()

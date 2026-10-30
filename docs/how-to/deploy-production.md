@@ -478,8 +478,8 @@ Send the stop signal to the server process only. The server stops its own Git pr
 during the drain, and a supervisor that signals every process fails every push in flight
 at once. Under systemd, set `KillMode=mixed`: the default, `control-group`, sends
 `SIGTERM` to every process of the unit. Set `TimeoutStopSec` to at least 20 seconds: the
-10-second drain, then teardown, which in zero-infra mode includes up to 5 seconds of
-instance-lease release, plus margin. When the server exits, or when that timeout passes,
+10-second drain, then teardown, which includes up to 5 seconds for River jobs on
+PostgreSQL and up to 5 seconds of instance-lease release in zero-infra mode, plus margin. When the server exits, or when that timeout passes,
 systemd sends `SIGKILL` to every process left, and a server killed during lease release
 leaves the lease behind. The
 [AWS reference unit](../../deploy/terraform/aws/bootstrap/openstorage.service) uses

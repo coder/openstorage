@@ -377,9 +377,9 @@ func TestRiverCloseBoundedWhenJobOutlivesCancel(t *testing.T) {
 	if state, _ := riverJob(t, pgURL, "upstream_sync", "repo_stuck"); state != "running" {
 		t.Fatalf("job state %q, want running until River rescues it", state)
 	}
-	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_late"}); err == nil {
-		t.Fatal("EnqueueSync after Close succeeded, want it rejected")
-	}
+	waitFor(t, "the closing pool to reject an enqueue", func() bool {
+		return q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_late"}) != nil
+	})
 }
 
 // A run that ends within the wait finishes normally: DrainSyncRuns cancels
