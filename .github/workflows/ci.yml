@@ -175,9 +175,6 @@ jobs:
         env:
           OPENSTORAGE_TEST_BACKEND: s3wal
 
-  # The verify-orphan-sweep skill model-checks the sweeper with TLC, which
-  # CI does not run. This job only checks that the code the model describes
-  # still matches model/fingerprints.txt, so it needs Go and no Java.
   orphan-sweep-fingerprints:
     runs-on: ubuntu-latest
     timeout-minutes: 10
