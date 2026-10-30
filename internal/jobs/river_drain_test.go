@@ -234,8 +234,6 @@ func TestRiverDrainSyncRunsKeepsRequests(t *testing.T) {
 // DrainSyncRuns: serve's whole signal drain gets 10 seconds.
 const closeExitBound = 10 * time.Second
 
-// closeWithin runs q.Close and fails the test when it does not return
-// within closeExitBound.
 func closeWithin(t *testing.T, q *River) {
 	t.Helper()
 	closed := make(chan struct{})
