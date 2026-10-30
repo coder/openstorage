@@ -774,11 +774,10 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	jobTimeout := sync.DefaultClaimLease()
 	assertf(repack == nil || repack.durationBudget()+repackTriggerTimeout < jobTimeout,
 		"NewRiver: job timeout %v does not cover the repack fold budget plus its probe", jobTimeout)
-	// River counts from the job's start, but a sync or push lease starts at
-	// its claim, which comes before the job deadline. A rescue before the
-	// deadline plus one lease can find a crashed run's claim still held, and
-	// the rescued run then skips the crashed run's request.
-	rescueAfter := jobTimeout + sync.DefaultClaimLease()
+	// River rescues by the leader's clock, counted from the job's start. A
+	// rescue while a crashed sync or push run's claim can still be held
+	// skips that run's request.
+	rescueAfter := sync.ClaimHeldWithin(jobTimeout)
 
 	pool, err := pgxpool.New(ctx, pgURL)
 	if err != nil {

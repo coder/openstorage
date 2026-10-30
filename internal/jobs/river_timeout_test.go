@@ -160,8 +160,8 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 	}
 	defer ins.Close()
 	stillRunning := map[string]int64{
-		"sync 29m after its start":           orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_live"}, 29*time.Minute),
-		"push 29m after its start":           orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_live"}, 29*time.Minute),
+		"sync 32m after its start":           orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_live"}, 32*time.Minute),
+		"push 32m after its start":           orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_live"}, 32*time.Minute),
 		"absence pass 1h10m after its start": orphanJob(t, ins, absenceReconcileArgs{}, time.Hour+10*time.Minute),
 		"LFS reclaim 1h10m after its start":  orphanJob(t, ins, lfsReclaimArgs{}, time.Hour+10*time.Minute),
 		"sweep 2h10m after its start":        orphanJob(t, ins, sweepArgs{}, 2*time.Hour+10*time.Minute),
@@ -186,7 +186,7 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 		select {
 		case repo := <-ran:
 			if repo == "repo_live" {
-				t.Errorf("repo_live re-ran 29 minutes after its start, while its crashed run can still hold the claim")
+				t.Errorf("repo_live re-ran 32 minutes after its start, while its crashed run can still hold the claim")
 			}
 			crashedRan = repo == "repo_crashed"
 		case <-deadline:
