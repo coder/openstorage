@@ -441,6 +441,8 @@ save_redacted_evidence() {
 	# failed call's stderr that cmd_api keeps.
 	python3 - "$WORK/tokens" "$EVID" <<'PYEOF'
 import base64, os, stat, sys
+def fail(e):
+    raise e
 tokdir, evid = sys.argv[1], sys.argv[2]
 toks = {}
 for n in os.listdir(tokdir):
@@ -449,7 +451,7 @@ for n in os.listdir(tokdir):
         if len(v) >= 8:
             toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
             toks[v] = b"<token:" + n.encode() + b">"
-for d, _, names in os.walk(evid):
+for d, _, names in os.walk(evid, onerror=fail):
     for n in names:
         p = os.path.join(d, n)
         if not stat.S_ISREG(os.lstat(p).st_mode):
@@ -466,10 +468,11 @@ PYEOF
 cmd_cleanup() {
 	run_paths "$@"
 	case $WORK in "$RUN"/work) ;; *) die "refusing to delete unexpected path $WORK" ;; esac
+	trap save_redacted_evidence EXIT
 	local pid='' kids='' left=''
 	[[ -s $WORK/serve.pid ]] && pid=$(<"$WORK/serve.pid")
 	if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
-		is_our_serve "$pid" || { save_redacted_evidence; die "pid $pid is alive but does not run $BIN: refusing to signal it"; }
+		is_our_serve "$pid" || die "pid $pid is alive but does not run $BIN: refusing to signal it"
 		kids=$(descendants_of "$pid" | tr '\n' ' ')
 		kill -TERM "$pid"
 		local deadline=$((SECONDS + 30))
@@ -492,7 +495,6 @@ cmd_cleanup() {
 		done
 	fi
 	echo "== cleanup $(now)" >>"$EVID/doctor.txt"
-	save_redacted_evidence
 	if [[ -n $left ]]; then
 		# Keep $WORK: a rerun must still see these processes by their cwd.
 		echo "LEFTOVER processes:$left" | tee -a "$EVID/doctor.txt" >&2
@@ -500,6 +502,8 @@ cmd_cleanup() {
 		return 1
 	fi
 
+	trap - EXIT
+	save_redacted_evidence
 	rm -rf "$WORK"
 	echo "no process from this run is alive; deleted $WORK" | tee -a "$EVID/doctor.txt"
 	echo "evidence: $EVID ($(find "$EVID" -type f | wc -l | tr -d ' ') files)"
