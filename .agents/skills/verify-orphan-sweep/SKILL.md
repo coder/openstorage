@@ -34,6 +34,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX")
 - It takes about 3 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`).
 - `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path.
 - `--only <cfg>` runs one config, for example `--only NoTiming.cfg`. It is for quick iteration. Finish with a full run.
+- `--fingerprints-only` checks the code facts and the fingerprints without TLC or Java, in about a second. CI runs it in the `orphan-sweep-fingerprints` job of `.github/workflows/ci.yml`, so a change to covered code fails CI until someone brings the model in line and runs `check.sh --record`. CI does not run TLC: a pass says that the covered code is the code the model was checked against, not that the properties hold.
 
 A clean run ends like this:
 
@@ -178,7 +179,7 @@ Sync commit: `5620494ca88650825618a0bbb731000ee586bb8f` (the last commit at whic
 
 | File | Purpose |
 |---|---|
-| `check.sh` | The one command: facts, TLC runs, fingerprints, `--record`. |
+| `check.sh` | The one command: facts, TLC runs, fingerprints, `--record`, and the TLC-free `--fingerprints-only` that CI runs. |
 | `facts/facts.go` | Reads the code facts and fingerprints from the Go source (standard library only; the dot directory keeps it out of `./...`). |
 | `model/PackSweep.tla` | The model. |
 | `model/PackSweep.cfg`, `NoTiming.cfg`, `Liveness.cfg` | Property configs; each must pass. |
