@@ -771,9 +771,14 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	assertf(logger != nil, "NewRiver: nil logger")
 	assertf(passJobTimeout > max(lfsReclaimPassTimeout, absencePassTimeout)+sweepRecoveryTimeout,
 		"NewRiver: pass job timeout %v does not cover the longest pass cap plus its tail", passJobTimeout)
-	syncClaimLease := sync.DefaultClaimLease()
-	assertf(repack == nil || repack.durationBudget()+repackTriggerTimeout < syncClaimLease,
-		"NewRiver: sync claim lease %v does not cover the repack fold budget plus its probe", syncClaimLease)
+	jobTimeout := sync.DefaultClaimLease()
+	assertf(repack == nil || repack.durationBudget()+repackTriggerTimeout < jobTimeout,
+		"NewRiver: job timeout %v does not cover the repack fold budget plus its probe", jobTimeout)
+	// River counts from the job's start, but a sync or push lease starts at
+	// its claim, which comes before the job deadline. A rescue before the
+	// deadline plus one lease can find a crashed run's claim still held, and
+	// the rescued run then skips the crashed run's request.
+	rescueAfter := jobTimeout + sync.DefaultClaimLease()
 
 	pool, err := pgxpool.New(ctx, pgURL)
 	if err != nil {
@@ -879,8 +884,8 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		Workers:              workers,
 		PeriodicJobs:         periodic,
 		Logger:               logger,
-		JobTimeout:           syncClaimLease,
-		RescueStuckJobsAfter: syncClaimLease,
+		JobTimeout:           jobTimeout,
+		RescueStuckJobsAfter: rescueAfter,
 	})
 	if err != nil {
 		cancelRuns(nil)

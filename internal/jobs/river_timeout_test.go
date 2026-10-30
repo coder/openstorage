@@ -160,13 +160,14 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 	}
 	defer ins.Close()
 	stillRunning := map[string]int64{
-		"sync 10m after its start":         orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_live"}, 10*time.Minute),
-		"absence pass 50m after its start": orphanJob(t, ins, absenceReconcileArgs{}, 50*time.Minute),
-		"LFS reclaim 50m after its start":  orphanJob(t, ins, lfsReclaimArgs{}, 50*time.Minute),
-		"sweep 2h10m after its start":      orphanJob(t, ins, sweepArgs{}, 2*time.Hour+10*time.Minute),
+		"sync 29m after its start":           orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_live"}, 29*time.Minute),
+		"push 29m after its start":           orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_live"}, 29*time.Minute),
+		"absence pass 1h10m after its start": orphanJob(t, ins, absenceReconcileArgs{}, time.Hour+10*time.Minute),
+		"LFS reclaim 1h10m after its start":  orphanJob(t, ins, lfsReclaimArgs{}, time.Hour+10*time.Minute),
+		"sweep 2h10m after its start":        orphanJob(t, ins, sweepArgs{}, 2*time.Hour+10*time.Minute),
 	}
-	orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_crashed"}, 30*time.Minute)
-	crashedPush := orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_crashed"}, 30*time.Minute)
+	orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_crashed"}, 40*time.Minute)
+	crashedPush := orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_crashed"}, 40*time.Minute)
 
 	ran := make(chan string, 4)
 	leaderWithPassesOff := startTimeoutRiver(t, pgURL, func(_ context.Context, job sync.Job) error {
@@ -185,11 +186,11 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 		select {
 		case repo := <-ran:
 			if repo == "repo_live" {
-				t.Errorf("repo_live re-ran 10 minutes after its start, while its run can still hold the claim")
+				t.Errorf("repo_live re-ran 29 minutes after its start, while its crashed run can still hold the claim")
 			}
 			crashedRan = repo == "repo_crashed"
 		case <-deadline:
-			t.Fatal("repo_crashed's sync orphaned 30 minutes ago was never rescued")
+			t.Fatal("repo_crashed's sync orphaned 40 minutes ago was never rescued")
 		}
 	}
 	jobState := func(id int64) (state string, attempt int) {
@@ -205,6 +206,6 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 		}
 	}
 	if state, attempt := jobState(crashedPush); state == "running" && attempt == 1 {
-		t.Errorf("repo_crashed's push orphaned 30 minutes ago was not rescued with its sync")
+		t.Errorf("repo_crashed's push orphaned 40 minutes ago was not rescued with its sync")
 	}
 }
