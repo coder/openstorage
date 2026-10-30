@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	stdsync "sync"
 	"sync/atomic"
 	"testing"
@@ -224,6 +226,147 @@ func TestRiverDrainSyncRunsKeepsRequests(t *testing.T) {
 		if n := rec2.count(repo); n != 1 {
 			t.Fatalf("%s ran %d times after restart, want exactly 1", repo, n)
 		}
+	}
+}
+
+// closeExitBound is how long Close may take on an exit that skipped
+// DrainSyncRuns: serve's whole signal drain gets 10 seconds.
+const closeExitBound = 10 * time.Second
+
+// closeWithin runs q.Close and fails the test when it does not return
+// within closeExitBound.
+func closeWithin(t *testing.T, q *River) {
+	t.Helper()
+	closed := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(closed)
+		q.Close()
+	}()
+	select {
+	case <-closed:
+		t.Logf("Close returned after %v", time.Since(start).Round(time.Millisecond))
+	case <-time.After(closeExitBound):
+		t.Fatalf("Close did not return within %v", closeExitBound)
+	}
+}
+
+// Serve's startup-failure and listener exits call Close without
+// DrainSyncRuns (issue #636). Close cancels the running jobs and returns
+// within the bound. The sync run keeps its request, and River makes the
+// cancelled delivery available again without counting an attempt.
+func TestRiverCloseWithoutDrainKeepsJobs(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_pull", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var posted atomic.Bool
+	hook := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		posted.Store(true)
+		select {
+		case <-r.Context().Done():
+		case <-stop:
+		}
+	}))
+	defer hook.Close()
+	defer close(stop)
+	deliverer := &events.Deliverer{
+		Webhooks: stubWebhooks{"wh_1": {ID: "wh_1", URL: hook.URL, Secret: "s"}},
+		Client:   hook.Client(),
+		Logger:   slog.New(slog.DiscardHandler),
+	}
+	var inFlight atomic.Bool
+	hang := func(ctx context.Context, job sync.Job) error {
+		if _, _, err := store.BeginSync(ctx, job.RepoID, "p1", time.Minute); err != nil {
+			return err
+		}
+		inFlight.Store(true)
+		<-ctx.Done()
+		if !errors.Is(context.Cause(ctx), sync.ErrShutdown) {
+			return ctx.Err()
+		}
+		_, err := store.RestoreSync(context.WithoutCancel(ctx), job.RepoID, "p1")
+		return errors.Join(err, sync.ErrShutdown)
+	}
+	q, err := NewRiver(ctx, pgURL, deliverer, hang, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	if err := store.RequestSync(ctx, "repo_pull"); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_pull"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.EnqueueWebhookDelivery(ctx, events.Delivery{WebhookID: "wh_1", Event: "repo.created", Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "sync run and delivery in flight", func() bool { return inFlight.Load() && posted.Load() })
+
+	closeWithin(t, q)
+
+	if up, _ := store.GetUpstream(ctx, "repo_pull"); up.RunCount != 0 || !up.SyncPending || up.Syncing {
+		t.Fatalf("pull after Close: %+v, want no run counted, the request pending, no claim", up)
+	}
+	if state, _ := riverJob(t, pgURL, "upstream_sync", "repo_pull"); state != "available" && state != "scheduled" {
+		t.Fatalf("sync job state %q, want it kept for the next process", state)
+	}
+	conn, err := pgx.Connect(ctx, pgURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var state string
+	var attempt, errs int
+	if err := conn.QueryRow(ctx,
+		`SELECT state::text, attempt, coalesce(array_length(errors, 1), 0) FROM river_job WHERE kind = 'webhook_delivery'`,
+	).Scan(&state, &attempt, &errs); err != nil {
+		t.Fatal(err)
+	}
+	if state != "available" || attempt != 0 || errs != 0 {
+		t.Fatalf("delivery job: state %q attempt %d errors %d, want available with no attempt counted", state, attempt, errs)
+	}
+}
+
+// A job that outlives its cancellation, as the sweep's detached recovery
+// can, does not hold Close past the bound. Its row stays running, as after
+// a crash, until River rescues it (RescueStuckJobsAfter).
+func TestRiverCloseBoundedWhenJobOutlivesCancel(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_stuck", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var inFlight atomic.Bool
+	stuck := func(context.Context, sync.Job) error {
+		inFlight.Store(true)
+		<-release
+		return nil
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, stuck, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_stuck"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "run in flight", inFlight.Load)
+
+	closeWithin(t, q)
+
+	if state, _ := riverJob(t, pgURL, "upstream_sync", "repo_stuck"); state != "running" {
+		t.Fatalf("job state %q, want running until River rescues it", state)
 	}
 }
 
