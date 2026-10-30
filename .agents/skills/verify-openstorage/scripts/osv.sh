@@ -426,13 +426,53 @@ print(v if isinstance(v, str) else json.dumps(v))
 PYEOF
 }
 
+# save_evidence: copy the serve logs, state.env and the token list into the
+# evidence, then redact every regular file in it. Cleanup calls it before it
+# refuses a foreign PID, stops at a leftover, or deletes $WORK.
+save_evidence() {
+	[[ -d $WORK ]] || return 0
+	[[ -f $WORK/serve.out ]] && cp "$WORK/serve.out" "$EVID/serve.stdout.log"
+	[[ -f $WORK/serve.err ]] && cp "$WORK/serve.err" "$EVID/serve.stderr.log"
+	[[ -f $WORK/state.env ]] && cp "$WORK/state.env" "$EVID/state.env"
+	local t
+	for t in "$WORK"/tokens/*.desc; do
+		[[ -e $t ]] || continue
+		printf '%s: %s\n' "$(basename "$t" .desc)" "$(<"$t")"
+	done >"$EVID/tokens.txt"
+	# Replace every stored token value with <token:name> in the evidence, and
+	# its Basic-auth form base64("t:<token>"), which curl -v prints in a
+	# failed call's stderr that cmd_api keeps.
+	python3 - "$WORK/tokens" "$EVID" <<'PYEOF'
+import base64, os, stat, sys
+tokdir, evid = sys.argv[1], sys.argv[2]
+toks = {}
+for n in os.listdir(tokdir):
+    if not n.endswith(".desc"):
+        v = open(os.path.join(tokdir, n), "rb").read()
+        if len(v) >= 8:
+            toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
+            toks[v] = b"<token:" + n.encode() + b">"
+for d, _, names in os.walk(evid):
+    for n in names:
+        p = os.path.join(d, n)
+        if not stat.S_ISREG(os.lstat(p).st_mode):
+            continue
+        b = open(p, "rb").read()
+        r = b
+        for v, s in toks.items():
+            r = r.replace(v, s)
+        if r != b:
+            open(p, "wb").write(r)
+PYEOF
+}
+
 cmd_cleanup() {
 	run_paths "$@"
 	case $WORK in "$RUN"/work) ;; *) die "refusing to delete unexpected path $WORK" ;; esac
 	local pid='' kids='' left=''
 	[[ -s $WORK/serve.pid ]] && pid=$(<"$WORK/serve.pid")
 	if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
-		is_our_serve "$pid" || die "pid $pid is alive but does not run $BIN: refusing to signal it"
+		is_our_serve "$pid" || { save_evidence; die "pid $pid is alive but does not run $BIN: refusing to signal it"; }
 		kids=$(descendants_of "$pid" | tr '\n' ' ')
 		kill -TERM "$pid"
 		local deadline=$((SECONDS + 30))
@@ -455,6 +495,7 @@ cmd_cleanup() {
 		done
 	fi
 	echo "== cleanup $(now)" >>"$EVID/doctor.txt"
+	save_evidence
 	if [[ -n $left ]]; then
 		# Keep $WORK: a rerun must still see these processes by their cwd.
 		echo "LEFTOVER processes:$left" | tee -a "$EVID/doctor.txt" >&2
@@ -462,39 +503,7 @@ cmd_cleanup() {
 		return 1
 	fi
 
-	if [[ -d $WORK ]]; then
-		[[ -f $WORK/serve.out ]] && cp "$WORK/serve.out" "$EVID/serve.stdout.log"
-		[[ -f $WORK/serve.err ]] && cp "$WORK/serve.err" "$EVID/serve.stderr.log"
-		[[ -f $WORK/state.env ]] && cp "$WORK/state.env" "$EVID/state.env"
-		local t
-		for t in "$WORK"/tokens/*.desc; do
-			[[ -e $t ]] || continue
-			printf '%s: %s\n' "$(basename "$t" .desc)" "$(<"$t")"
-		done >"$EVID/tokens.txt"
-		# Replace every stored token value with <token:name> in the evidence, and
-		# its Basic-auth form base64("t:<token>"), which curl -v prints in a
-		# failed call's stderr that cmd_api keeps.
-		python3 - "$WORK/tokens" "$EVID" <<'PYEOF'
-import base64, os, sys
-tokdir, evid = sys.argv[1], sys.argv[2]
-toks = {}
-for n in os.listdir(tokdir):
-    if not n.endswith(".desc"):
-        v = open(os.path.join(tokdir, n), "rb").read()
-        if len(v) >= 8:
-            toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
-            toks[v] = b"<token:" + n.encode() + b">"
-for n in os.listdir(evid):
-    p = os.path.join(evid, n)
-    b = open(p, "rb").read()
-    r = b
-    for v, s in toks.items():
-        r = r.replace(v, s)
-    if r != b:
-        open(p, "wb").write(r)
-PYEOF
-		rm -rf "$WORK"
-	fi
+	rm -rf "$WORK"
 	echo "no process from this run is alive; deleted $WORK" | tee -a "$EVID/doctor.txt"
 	echo "evidence: $EVID ($(find "$EVID" -type f | wc -l | tr -d ' ') files)"
 	if [[ -f $EVID/log.tsv ]]; then
