@@ -168,12 +168,19 @@ func (lfsReclaimArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+var errScheduleOff = errors.New("jobs: this replica has the pass schedule off")
+
 type lfsReclaimWorker struct {
 	river.WorkerDefaults[lfsReclaimArgs]
 	schedule *LFSReclaimSchedule
 }
 
+func (*lfsReclaimWorker) Timeout(*river.Job[lfsReclaimArgs]) time.Duration { return passJobTimeout }
+
 func (w *lfsReclaimWorker) Work(ctx context.Context, _ *river.Job[lfsReclaimArgs]) error {
+	if w.schedule == nil {
+		return errScheduleOff
+	}
 	_, err := w.schedule.Reclaimer.Run(ctx)
 	return err
 }
@@ -220,7 +227,12 @@ type absenceReconcileWorker struct {
 	schedule *AbsenceReconcileSchedule
 }
 
+func (*absenceReconcileWorker) Timeout(*river.Job[absenceReconcileArgs]) time.Duration {
+	return passJobTimeout
+}
+
 func (w *absenceReconcileWorker) Work(ctx context.Context, _ *river.Job[absenceReconcileArgs]) error {
+	assertf(w.schedule != nil, "absenceReconcileWorker: absence job fetched without the absence queue")
 	_, err := w.schedule.Reconciler.Run(ctx)
 	return err
 }
@@ -398,7 +410,14 @@ type sweepWorker struct {
 	schedule *SweepSchedule
 }
 
+func (*sweepWorker) Timeout(*river.Job[sweepArgs]) time.Duration { return sweepRescueAfter }
+
 func (w *sweepWorker) Work(ctx context.Context, _ *river.Job[sweepArgs]) error {
+	if w.schedule == nil {
+		return errScheduleOff
+	}
+	ctx, cancel := context.WithTimeout(ctx, passJobTimeout)
+	defer cancel()
 	return w.schedule.runOnce(ctx)
 }
 
@@ -727,8 +746,10 @@ var (
 	_ sync.FirstSyncScheduler = (*River)(nil)
 )
 
-// River's default job timeout is 1 minute, shorter than every worker budget (issue #632).
-const riverJobTimeout = 2 * time.Hour
+const (
+	passJobTimeout   = 2 * time.Hour
+	sweepRescueAfter = passJobTimeout + 2*sweepRecoveryTimeout
+)
 
 // NewRiver opens a dedicated pool on pgURL, applies the river migrations
 // (serve owns DDL, mirroring meta/ref InitSchema), and starts workers that
@@ -748,9 +769,15 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	assertf(sweep == nil || (sweep.Sweeper != nil && sweep.Interval > 0),
 		"NewRiver: sweep schedule missing sweeper or interval: %+v", sweep)
 	assertf(logger != nil, "NewRiver: nil logger")
-	assertf(riverJobTimeout > max(lfsReclaimPassTimeout, absencePassTimeout)+sweepRecoveryTimeout,
-		"NewRiver: job timeout %v does not cover the longest pass cap plus its tail", riverJobTimeout)
-	rescueAfter := riverJobTimeout + 2*sweepRecoveryTimeout
+	assertf(passJobTimeout > max(lfsReclaimPassTimeout, absencePassTimeout)+sweepRecoveryTimeout,
+		"NewRiver: pass job timeout %v does not cover the longest pass cap plus its tail", passJobTimeout)
+	jobTimeout := sync.DefaultClaimLease()
+	assertf(repack == nil || repack.durationBudget()+repackTriggerTimeout < jobTimeout,
+		"NewRiver: job timeout %v does not cover the repack fold budget plus its probe", jobTimeout)
+	// River rescues by the leader's clock, counted from the job's start. A
+	// rescue while a crashed sync or push run's claim can still be held
+	// skips that run's request.
+	rescueAfter := sync.ClaimHeldWithin(jobTimeout)
 
 	pool, err := pgxpool.New(ctx, pgURL)
 	if err != nil {
@@ -805,9 +832,15 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	if repack != nil {
 		river.AddWorker(workers, &repackWorker{repacker: repack, pool: pool})
 	}
+	// The pass workers register even with their schedule off: the leader
+	// rescues a running job by its worker's Timeout, and it discards a kind
+	// it has no worker for once RescueStuckJobsAfter passes, while another
+	// replica can still be running that pass.
+	river.AddWorker(workers, &sweepWorker{schedule: sweep})
+	river.AddWorker(workers, &lfsReclaimWorker{schedule: lfsReclaim})
+	river.AddWorker(workers, &absenceReconcileWorker{schedule: absence})
 	var periodic []*river.PeriodicJob
 	if sweep != nil {
-		river.AddWorker(workers, &sweepWorker{schedule: sweep})
 		periodic = append(periodic, river.NewPeriodicJob(
 			river.PeriodicInterval(sweep.Interval),
 			func() (river.JobArgs, *river.InsertOpts) { return sweepArgs{}, nil },
@@ -819,7 +852,6 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		))
 	}
 	if lfsReclaim != nil {
-		river.AddWorker(workers, &lfsReclaimWorker{schedule: lfsReclaim})
 		periodic = append(periodic, river.NewPeriodicJob(
 			river.PeriodicInterval(lfsReclaim.Interval),
 			func() (river.JobArgs, *river.InsertOpts) { return lfsReclaimArgs{}, nil },
@@ -831,7 +863,6 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		))
 	}
 	if absence != nil {
-		river.AddWorker(workers, &absenceReconcileWorker{schedule: absence})
 		periodic = append(periodic, river.NewPeriodicJob(
 			river.PeriodicInterval(absence.Interval),
 			func() (river.JobArgs, *river.InsertOpts) { return absenceReconcileArgs{}, nil },
@@ -852,7 +883,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		Workers:              workers,
 		PeriodicJobs:         periodic,
 		Logger:               logger,
-		JobTimeout:           riverJobTimeout,
+		JobTimeout:           jobTimeout,
 		RescueStuckJobsAfter: rescueAfter,
 	})
 	if err != nil {

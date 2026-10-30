@@ -82,6 +82,16 @@ func claimLease(timeout time.Duration) time.Duration {
 	return timeout + 2*detachedOpTimeout + claimLeaseSlack
 }
 
+func DefaultClaimLease() time.Duration { return claimLease(defaultRunTimeout) }
+
+// ClaimHeldWithin is how long after its start a run with the default
+// Timeout can still hold its claim when its context ends at deadline: it
+// claims before then and holds the claim for one lease. claimFenceMargin
+// absorbs clock skew against the database clock, which times the lease.
+func ClaimHeldWithin(deadline time.Duration) time.Duration {
+	return deadline + claimLease(defaultRunTimeout) + claimFenceMargin
+}
+
 // claimFenceMargin is how long BEFORE the lease expiry the run's loopback
 // token dies (the push fence, issue #86): a steal is only possible at
 // expiry, so no zombie can authenticate a new push request within the

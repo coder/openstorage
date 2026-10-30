@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/riverqueue/river"
+
+	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/ref"
 	"github.com/coder/openstorage/internal/sync"
@@ -35,17 +38,19 @@ func migrateRiver(t *testing.T, pgURL string) {
 	startTimeoutRiver(t, pgURL, func(context.Context, sync.Job) error { return nil }, nil).Close()
 }
 
-func orphanSyncJob(t *testing.T, ins *River, repo string, age time.Duration) {
+func orphanJob(t *testing.T, ins *River, args river.JobArgs, age time.Duration) int64 {
 	t.Helper()
 	ctx := context.Background()
-	if err := ins.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: repo}); err != nil {
-		t.Fatalf("enqueue %s: %v", repo, err)
+	res, err := ins.client.Insert(ctx, args, nil)
+	if err != nil {
+		t.Fatalf("insert %s: %v", args.Kind(), err)
 	}
 	if _, err := ins.pool.Exec(ctx, `UPDATE river_job
 		SET state = 'running', attempt = 1, attempted_at = now() - make_interval(secs => $2), attempted_by = ARRAY['crashed-client']
-		WHERE kind = 'upstream_sync' AND args->>'repo_id' = $1`, repo, age.Seconds()); err != nil {
-		t.Fatalf("orphan %s: %v", repo, err)
+		WHERE id = $1`, res.Job.ID, age.Seconds()); err != nil {
+		t.Fatalf("orphan %s: %v", args.Kind(), err)
 	}
+	return res.Job.ID
 }
 
 func receiveLeft(t *testing.T, what string, left <-chan time.Duration) time.Duration {
@@ -110,7 +115,41 @@ func TestRiverAbsencePassKeepsItsHourCap(t *testing.T) {
 	}
 }
 
-func TestRiverRescuesOnlyOrphansPastTheJobDeadline(t *testing.T) {
+type firstListDeadlineBlobs struct {
+	blob.BlobStore
+	left chan time.Duration
+}
+
+func (b *firstListDeadlineBlobs) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	select {
+	case b.left <- timeLeft(ctx):
+	default:
+	}
+	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+}
+
+func TestRiverSweepPassEndsBeforeItsRescue(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	f := newSweepFixture(t)
+
+	blobs := &firstListDeadlineBlobs{BlobStore: f.blobs, left: make(chan time.Duration, 1)}
+	sweeper := NewSweeper(blobs, f.store, SweepConfig{Threshold: 24 * time.Hour}, slog.New(slog.DiscardHandler))
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	noop := func(context.Context, sync.Job) error { return nil }
+	q, err := NewRiver(ctx, pgURL, deliverer, noop, noop, sync.NewMemStore(),
+		&SweepSchedule{Sweeper: sweeper, Interval: time.Hour}, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+
+	if got := receiveLeft(t, "sweep pass", blobs.left); got > passJobTimeout || got < passJobTimeout-time.Minute {
+		t.Errorf("sweep pass context has %v left, want it to end %v after the start", got, passJobTimeout)
+	}
+}
+
+func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 	ctx := context.Background()
 	pgURL := livenessPG(t, ctx)
 	migrateRiver(t, pgURL)
@@ -120,39 +159,53 @@ func TestRiverRescuesOnlyOrphansPastTheJobDeadline(t *testing.T) {
 		t.Fatalf("NewRiverInsertOnly: %v", err)
 	}
 	defer ins.Close()
-	orphanSyncJob(t, ins, "repo_recent", 65*time.Minute)
-	orphanSyncJob(t, ins, "repo_stale", 24*time.Hour)
+	stillRunning := map[string]int64{
+		"sync 32m after its start":           orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_live"}, 32*time.Minute),
+		"push 32m after its start":           orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_live"}, 32*time.Minute),
+		"absence pass 1h10m after its start": orphanJob(t, ins, absenceReconcileArgs{}, time.Hour+10*time.Minute),
+		"LFS reclaim 1h10m after its start":  orphanJob(t, ins, lfsReclaimArgs{}, time.Hour+10*time.Minute),
+		"sweep 2h10m after its start":        orphanJob(t, ins, sweepArgs{}, 2*time.Hour+10*time.Minute),
+	}
+	orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_crashed"}, 40*time.Minute)
+	crashedPush := orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_crashed"}, 40*time.Minute)
 
 	ran := make(chan string, 4)
-	q := startTimeoutRiver(t, pgURL, func(_ context.Context, job sync.Job) error {
+	leaderWithPassesOff := startTimeoutRiver(t, pgURL, func(_ context.Context, job sync.Job) error {
 		select {
 		case ran <- job.RepoID:
 		default:
 		}
 		return nil
 	}, nil)
-	defer q.Close()
+	defer leaderWithPassesOff.Close()
 
 	// Rescue runs on the elected leader every 30s, then the retry waits
 	// about 1s and the scheduler promotes it within 5s.
 	deadline := time.After(90 * time.Second)
-	for staleRan := false; !staleRan; {
+	for crashedRan := false; !crashedRan; {
 		select {
 		case repo := <-ran:
-			if repo == "repo_recent" {
-				t.Errorf("repo_recent re-ran 65 minutes after its start, inside the job deadline")
+			if repo == "repo_live" {
+				t.Errorf("repo_live re-ran 32 minutes after its start, while its crashed run can still hold the claim")
 			}
-			staleRan = repo == "repo_stale"
+			crashedRan = repo == "repo_crashed"
 		case <-deadline:
-			t.Fatal("repo_stale's orphaned job was never rescued")
+			t.Fatal("repo_crashed's sync orphaned 40 minutes ago was never rescued")
 		}
 	}
-	var state string
-	var attempt int
-	if err := ins.pool.QueryRow(ctx, `SELECT state, attempt FROM river_job WHERE kind = 'upstream_sync' AND args->>'repo_id' = 'repo_recent'`).Scan(&state, &attempt); err != nil {
-		t.Fatalf("read repo_recent job: %v", err)
+	jobState := func(id int64) (state string, attempt int) {
+		t.Helper()
+		if err := ins.pool.QueryRow(ctx, `SELECT state, attempt FROM river_job WHERE id = $1`, id).Scan(&state, &attempt); err != nil {
+			t.Fatalf("read job %d: %v", id, err)
+		}
+		return state, attempt
 	}
-	if state != "running" || attempt != 1 {
-		t.Errorf("repo_recent job = %s at attempt %d, want still running at attempt 1", state, attempt)
+	for what, id := range stillRunning {
+		if state, attempt := jobState(id); state != "running" || attempt != 1 {
+			t.Errorf("%s = %s at attempt %d, want still running at attempt 1", what, state, attempt)
+		}
+	}
+	if state, attempt := jobState(crashedPush); state == "running" && attempt == 1 {
+		t.Errorf("repo_crashed's push orphaned 40 minutes ago was not rescued with its sync")
 	}
 }
