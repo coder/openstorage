@@ -1031,31 +1031,36 @@ func withShutdown(ctx, runs context.Context) (context.Context, func()) {
 	return rctx, release
 }
 
-// closeTimeout bounds Close on an exit that skipped DrainSyncRuns or ended it
-// early (issue #636). It covers a cancelled run's restore and its snooze read.
+// closeTimeout bounds Close (issue #636). It covers a cancelled run's
+// restore and its snooze read.
 const closeTimeout = 5 * time.Second
 
-// Close cancels the jobs still running, waits up to closeTimeout for them to
-// record their state, and closes the pool. Sync and push runs are cancelled
-// with sync.ErrShutdown and keep their jobs (shutdownSnooze). River makes the
-// other cancelled jobs available again. A job still running after the wait
-// keeps its row running until River rescues it (RescueStuckJobsAfter), as
-// after a crash. The pool then stays open, since closing it waits for every
-// connection that job holds. After a complete DrainSyncRuns, Close only closes
-// the pool.
+// Close cancels the jobs still running, closes the pool, and returns within
+// closeTimeout. Sync and push runs are cancelled with sync.ErrShutdown and
+// keep their jobs (shutdownSnooze). River makes the other cancelled jobs
+// available again. A job still running at the deadline keeps its row running
+// until River rescues it (RescueStuckJobsAfter), as after a crash. The pool
+// rejects new work at once, but its close waits for every held connection,
+// so Close stops waiting for it at the deadline. After a complete
+// DrainSyncRuns, Close only closes the pool.
 func (q *River) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer cancel()
 	if q.started {
 		select {
 		case <-q.client.Stopped():
 		default:
 			q.cancelRuns(sync.ErrShutdown)
-			ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-			err := q.client.StopAndCancel(ctx)
-			cancel()
-			if err != nil {
-				return
-			}
+			_ = q.client.StopAndCancel(ctx)
 		}
 	}
-	q.pool.Close()
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		q.pool.Close()
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+	}
 }
