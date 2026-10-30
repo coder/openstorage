@@ -156,7 +156,7 @@ Run cleanup after every run, also after a failed launch or a failed drive. It:
 1. Checks that the saved PID runs this run's binary. It refuses to signal any other process.
 2. Records the PIDs of serve's descendants, sends SIGTERM to serve (the drain takes up to 10 s), waits up to 30 s, then sends SIGKILL to serve and the recorded descendants that are still alive.
 3. Looks for leftovers: a recorded process that is still alive, or (on Linux) any process whose working directory is under `$RUN/work`. When it finds one, it prints `LEFTOVER processes: <pid> ...`, keeps `$RUN/work`, and exits 1.
-4. Copies the serve logs, `state.env`, and the token list into the evidence, and replaces token values in the evidence.
+4. Copies the serve logs, `state.env`, and the token list into the evidence, and replaces token values in every regular file under the evidence, subdirectories included. It does not follow symlinks, and it exits 1 when it cannot read a file or directory there. It also does this when it stops early: at a leftover, at a refused PID, or on an error.
 5. Deletes `$RUN/work`: the binary, keys, tokens, data directory, cache, and clones.
 6. Prints `no process from this run is alive`, the evidence path, and the PASS and FAIL counts from `log.tsv`.
 

@@ -426,9 +426,49 @@ print(v if isinstance(v, str) else json.dumps(v))
 PYEOF
 }
 
+save_redacted_evidence() {
+	[[ -d $WORK ]] || return 0
+	[[ -f $WORK/serve.out ]] && cp "$WORK/serve.out" "$EVID/serve.stdout.log"
+	[[ -f $WORK/serve.err ]] && cp "$WORK/serve.err" "$EVID/serve.stderr.log"
+	[[ -f $WORK/state.env ]] && cp "$WORK/state.env" "$EVID/state.env"
+	local t
+	for t in "$WORK"/tokens/*.desc; do
+		[[ -e $t ]] || continue
+		printf '%s: %s\n' "$(basename "$t" .desc)" "$(<"$t")"
+	done >"$EVID/tokens.txt"
+	# Replace every stored token value with <token:name> in the evidence, and
+	# its Basic-auth form base64("t:<token>"), which curl -v prints in a
+	# failed call's stderr that cmd_api keeps.
+	python3 - "$WORK/tokens" "$EVID" <<'PYEOF'
+import base64, os, stat, sys
+def fail(e):
+    raise e
+tokdir, evid = sys.argv[1], sys.argv[2]
+toks = {}
+for n in os.listdir(tokdir):
+    if not n.endswith(".desc"):
+        v = open(os.path.join(tokdir, n), "rb").read()
+        if len(v) >= 8:
+            toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
+            toks[v] = b"<token:" + n.encode() + b">"
+for d, _, names in os.walk(evid, onerror=fail):
+    for n in names:
+        p = os.path.join(d, n)
+        if not stat.S_ISREG(os.lstat(p).st_mode):
+            continue
+        b = open(p, "rb").read()
+        r = b
+        for v, s in toks.items():
+            r = r.replace(v, s)
+        if r != b:
+            open(p, "wb").write(r)
+PYEOF
+}
+
 cmd_cleanup() {
 	run_paths "$@"
 	case $WORK in "$RUN"/work) ;; *) die "refusing to delete unexpected path $WORK" ;; esac
+	trap save_redacted_evidence EXIT
 	local pid='' kids='' left=''
 	[[ -s $WORK/serve.pid ]] && pid=$(<"$WORK/serve.pid")
 	if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
@@ -462,39 +502,9 @@ cmd_cleanup() {
 		return 1
 	fi
 
-	if [[ -d $WORK ]]; then
-		[[ -f $WORK/serve.out ]] && cp "$WORK/serve.out" "$EVID/serve.stdout.log"
-		[[ -f $WORK/serve.err ]] && cp "$WORK/serve.err" "$EVID/serve.stderr.log"
-		[[ -f $WORK/state.env ]] && cp "$WORK/state.env" "$EVID/state.env"
-		local t
-		for t in "$WORK"/tokens/*.desc; do
-			[[ -e $t ]] || continue
-			printf '%s: %s\n' "$(basename "$t" .desc)" "$(<"$t")"
-		done >"$EVID/tokens.txt"
-		# Replace every stored token value with <token:name> in the evidence, and
-		# its Basic-auth form base64("t:<token>"), which curl -v prints in a
-		# failed call's stderr that cmd_api keeps.
-		python3 - "$WORK/tokens" "$EVID" <<'PYEOF'
-import base64, os, sys
-tokdir, evid = sys.argv[1], sys.argv[2]
-toks = {}
-for n in os.listdir(tokdir):
-    if not n.endswith(".desc"):
-        v = open(os.path.join(tokdir, n), "rb").read()
-        if len(v) >= 8:
-            toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
-            toks[v] = b"<token:" + n.encode() + b">"
-for n in os.listdir(evid):
-    p = os.path.join(evid, n)
-    b = open(p, "rb").read()
-    r = b
-    for v, s in toks.items():
-        r = r.replace(v, s)
-    if r != b:
-        open(p, "wb").write(r)
-PYEOF
-		rm -rf "$WORK"
-	fi
+	trap - EXIT
+	save_redacted_evidence
+	rm -rf "$WORK"
 	echo "no process from this run is alive; deleted $WORK" | tee -a "$EVID/doctor.txt"
 	echo "evidence: $EVID ($(find "$EVID" -type f | wc -l | tr -d ' ') files)"
 	if [[ -f $EVID/log.tsv ]]; then
