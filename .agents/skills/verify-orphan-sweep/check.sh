@@ -2,6 +2,7 @@
 # check.sh: model-check the orphan-pack sweeper against pack writers.
 #
 #   .agents/skills/verify-orphan-sweep/check.sh [--out DIR] [--only CFG]... [--record]
+#   .agents/skills/verify-orphan-sweep/check.sh --fingerprints-only
 #
 # 1. Reads the code facts and fingerprints from the Go source (facts/facts.go).
 # 2. Runs TLC on model/PackSweep.tla with each config in model/, the facts
@@ -19,6 +20,10 @@
 #
 # --only CFG runs only that config from model/ (repeatable). A partial run
 # proves nothing about the other configs: finish with a full run.
+#
+# --fingerprints-only skips TLC and Java: it checks the facts and the
+# fingerprints only, and exits 0, 2 or 3. CI runs it. A pass says the covered
+# code is the code the model was checked against, not that the model holds.
 #
 # --record rewrites model/fingerprints.txt and the sync commit in SKILL.md
 # to the current code. Use it only after you confirmed that the model
@@ -42,12 +47,13 @@ repo=$(git -C "$skill_dir" rev-parse --show-toplevel 2>/dev/null) || {
   echo "check.sh: not inside a git checkout" >&2; exit 3; }
 model="$skill_dir/model"
 
-out="" record=0 only=" "
+out="" record=0 only=" " fp_only=0
 while [ $# -gt 0 ]; do
   case $1 in
     --out) [ $# -ge 2 ] || { echo "check.sh: --out needs a directory" >&2; exit 3; }
            out=$2; shift 2 ;;
     --record) record=1; shift ;;
+    --fingerprints-only) fp_only=1; shift ;;
     --only) [ $# -ge 2 ] || { echo "check.sh: --only needs a config name" >&2; exit 3; }
             case $2 in
               PackSweep.cfg|NoTiming.cfg|Liveness.cfg|NoThresholdAssumption.cfg|SlowHealEntry.cfg) ;;
@@ -58,6 +64,9 @@ while [ $# -gt 0 ]; do
     *) echo "check.sh: unknown argument $1" >&2; exit 3 ;;
   esac
 done
+if [ "$fp_only" = 1 ] && { [ "$record" = 1 ] || [ "$only" != " " ]; }; then
+  echo "check.sh: --fingerprints-only runs no TLC, so it takes no --record or --only" >&2; exit 3
+fi
 if [ -z "$out" ]; then
   out=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX") || exit 3
 else
@@ -99,21 +108,23 @@ while read -r _ name value evidence; do
 done < <(grep '^FACT ' "$out/facts.txt")
 
 # --- 2. TLC -----------------------------------------------------------------
-JAVA=${JAVA:-java}
-command -v "$JAVA" >/dev/null || die "needs Java 11+ (set JAVA=/path/to/java)"
-jv=$("$JAVA" -version 2>&1 | sed -n 's/.*version "\([0-9][0-9]*\)[."].*/\1/p' | head -n 1)
-[ -n "$jv" ] && [ "$jv" -ge 11 ] || die "needs Java 11+, found: $("$JAVA" -version 2>&1 | head -n 1)"
+if [ "$fp_only" = 0 ]; then
+  JAVA=${JAVA:-java}
+  command -v "$JAVA" >/dev/null || die "needs Java 11+ (set JAVA=/path/to/java)"
+  jv=$("$JAVA" -version 2>&1 | sed -n 's/.*version "\([0-9][0-9]*\)[."].*/\1/p' | head -n 1)
+  [ -n "$jv" ] && [ "$jv" -ge 11 ] || die "needs Java 11+, found: $("$JAVA" -version 2>&1 | head -n 1)"
 
-cache=${OPENSTORAGE_TLA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla}
-jar="$cache/tla2tools-$TLC_VERSION.jar"
-sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'; }
-if [ ! -f "$jar" ]; then
-  mkdir -p "$cache" || die "cannot create $cache"
-  echo "== Downloading TLC $TLC_VERSION to $cache"
-  curl -fsSL -o "$jar.tmp.$$" "$TLC_URL" || die "download failed: $TLC_URL"
-  mv "$jar.tmp.$$" "$jar"
+  cache=${OPENSTORAGE_TLA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla}
+  jar="$cache/tla2tools-$TLC_VERSION.jar"
+  sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'; }
+  if [ ! -f "$jar" ]; then
+    mkdir -p "$cache" || die "cannot create $cache"
+    echo "== Downloading TLC $TLC_VERSION to $cache"
+    curl -fsSL -o "$jar.tmp.$$" "$TLC_URL" || die "download failed: $TLC_URL"
+    mv "$jar.tmp.$$" "$jar"
+  fi
+  [ "$(sha256 "$jar")" = "$TLC_SHA256" ] || die "$jar does not match sha256 $TLC_SHA256; delete it and rerun"
 fi
-[ "$(sha256 "$jar")" = "$TLC_SHA256" ] || die "$jar does not match sha256 $TLC_SHA256; delete it and rerun"
 
 # run_tlc CFG WORKERS EXTRA_ARGS... -> exit code of TLC; output in $out/CFG.out
 run_tlc() {
@@ -147,9 +158,9 @@ summarize() {
 }
 
 status=0
-selected() { [ "$only" = " " ] || case $only in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+selected() { [ "$fp_only" = 0 ] || return 1; [ "$only" = " " ] || case $only in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 verdict() { printf '   %-27s %s\n' "$1" "$2"; }
-echo "== TLC $TLC_VERSION (outputs in $out)"
+if [ "$fp_only" = 1 ]; then echo "== TLC skipped (--fingerprints-only)"; else echo "== TLC $TLC_VERSION (outputs in $out)"; fi
 for cfg in PackSweep.cfg NoTiming.cfg Liveness.cfg; do
   selected "$cfg" || continue
   extra=()
@@ -199,6 +210,8 @@ if [ -n "$changed" ]; then
   echo "   STALE: these covered functions changed since the sync commit:"
   while read -r f; do echo "     $f"; done <<<"$changed"
   echo "   Read their diff (git diff ${sync:-<sync>} -- <file>) and update the model if it no longer describes them."
+  echo "   Then run .agents/skills/verify-orphan-sweep/check.sh --record (needs Java) and commit"
+  echo "   model/fingerprints.txt and SKILL.md. See \"Bring the model in line\" in SKILL.md."
 else
   echo "   every covered function matches model/fingerprints.txt"
 fi
@@ -237,7 +250,13 @@ fi
 if [ "$status" -ne 0 ]; then
   echo "RESULT: FAIL (a property broke; read the trace before you touch the model)"; exit 1
 elif [ "$stale" -ne 0 ]; then
+  if [ "$fp_only" = 1 ]; then
+    echo "RESULT: STALE (TLC not run; run .agents/skills/verify-orphan-sweep/check.sh without --fingerprints-only)"; exit 2
+  fi
   echo "RESULT: STALE (properties hold on the model; the model may not describe the code)"; exit 2
+fi
+if [ "$fp_only" = 1 ]; then
+  echo "RESULT: PASS for facts and fingerprints only (TLC not run)"; exit 0
 fi
 if [ "$only" != " " ]; then
   echo "RESULT: PASS for the selected configs only:$only"; exit 0
