@@ -1032,8 +1032,7 @@ func withShutdown(ctx, runs context.Context) (context.Context, func()) {
 }
 
 // closeTimeout bounds Close on an exit that skipped DrainSyncRuns or ended it
-// early (issue #636). It covers a cancelled run's restore and its snooze read
-// (2 seconds each).
+// early (issue #636). It covers a cancelled run's restore and its snooze read.
 const closeTimeout = 5 * time.Second
 
 // Close cancels the jobs still running, waits up to closeTimeout for them to
@@ -1042,11 +1041,12 @@ const closeTimeout = 5 * time.Second
 // other cancelled jobs available again. A job still running after the wait
 // keeps its row running until River rescues it (RescueStuckJobsAfter), as
 // after a crash. The pool then stays open, since closing it waits for every
-// connection that job holds.
+// connection that job holds. After a complete DrainSyncRuns, Close only closes
+// the pool.
 func (q *River) Close() {
 	if q.started {
 		select {
-		case <-q.client.Stopped(): // DrainSyncRuns finished every job
+		case <-q.client.Stopped():
 		default:
 			q.cancelRuns(sync.ErrShutdown)
 			ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)

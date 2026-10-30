@@ -230,8 +230,8 @@ func TestRiverDrainSyncRunsKeepsRequests(t *testing.T) {
 	}
 }
 
-// closeExitBound is how long Close may take on an exit that skipped
-// DrainSyncRuns: serve's whole signal drain gets 10 seconds.
+// closeExitBound is the exit delay Close may add: the bound of serve's own
+// signal drain (shutdownDrainTimeout in cmd/openstorage).
 const closeExitBound = 10 * time.Second
 
 func closeWithin(t *testing.T, q *River) {
@@ -251,9 +251,7 @@ func closeWithin(t *testing.T, q *River) {
 }
 
 // Serve's startup-failure and listener exits call Close without
-// DrainSyncRuns (issue #636). Close cancels the running jobs and returns
-// within the bound. The sync run keeps its request, and River makes the
-// cancelled delivery available again without counting an attempt.
+// DrainSyncRuns (issue #636).
 func TestRiverCloseWithoutDrainKeepsJobs(t *testing.T) {
 	ctx := context.Background()
 	pgURL := livenessPG(t, ctx)
@@ -333,8 +331,7 @@ func TestRiverCloseWithoutDrainKeepsJobs(t *testing.T) {
 }
 
 // A job that outlives its cancellation, as the sweep's detached recovery
-// can, does not hold Close past the bound. Its row stays running, as after
-// a crash, until River rescues it (RescueStuckJobsAfter).
+// can, does not hold Close past the bound.
 func TestRiverCloseBoundedWhenJobOutlivesCancel(t *testing.T) {
 	ctx := context.Background()
 	pgURL := livenessPG(t, ctx)
@@ -348,8 +345,7 @@ func TestRiverCloseBoundedWhenJobOutlivesCancel(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 	pools := make(chan *pgxpool.Pool, 1)
 	var inFlight atomic.Bool
-	stuck := func(ctx context.Context, _ sync.Job) error {
-		// Holds a queue connection, as a stuck completion transaction does.
+	stuckWithConn := func(ctx context.Context, _ sync.Job) error {
 		conn, err := (<-pools).Acquire(ctx)
 		if err != nil {
 			return err
@@ -360,7 +356,7 @@ func TestRiverCloseBoundedWhenJobOutlivesCancel(t *testing.T) {
 		return nil
 	}
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, stuck, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	q, err := NewRiver(ctx, pgURL, deliverer, stuckWithConn, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
