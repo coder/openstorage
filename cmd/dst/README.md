@@ -18,7 +18,7 @@ go run ./cmd/dst -seed <seed> [-steps N] [-v] [-keep]
   | Flag | Type | Default | Meaning |
   |---|---|---|---|
   | `-seed` `[main.go:flag -seed]` | uint64 | `0` | Simulation seed (`DST_SEED` in the DST tests). Sets `Config.Seed`. |
-  | `-steps` `[main.go:flag -steps]` | int | `0` | Scheduler steps. `0` uses the simtest default (150, `[internal/simtest/scenario.go:withDefaults]`). |
+  | `-steps` `[main.go:flag -steps]` | int | `0` | Scheduler steps. `0` uses the simtest default (150, `[../../internal/simtest/scenario.go:withDefaults]`). |
   | `-nodes` `[main.go:flag -nodes]` | int | `0` | Simulated nodes. `0` uses the simtest default (3). |
   | `-backend` `[main.go:flag -backend]` | string | `""` | Authority-store lane: `sqlite` or `s3wal` (`DST_REF_BACKEND`). Empty means `sqlite` (`simtest.RefBackendSQLite`). |
   | `-v` `[main.go:flag -v]` | bool | `false` | Sets `Config.Trace = os.Stdout`, so the trace prints while the run executes. |
@@ -32,10 +32,10 @@ go run ./cmd/dst -seed <seed> [-steps N] [-v] [-keep]
 
 ## Invariants
 
-- `[main.go:main]` Exit code `1` means only "invariant violation". `simtest.Run` reports invariant breaches in `Result.Violations`, not as an error `[internal/simtest/scenario.go:Run]`.
-- `[main.go:main]` Exit code `2` does not mean only "infrastructure failure". A flag parse error also exits `2`. An unrecovered panic, such as a failed simtest `assertf` `[internal/simtest/fault.go:assertf]`, also exits `2` with a Go panic trace on stderr.
-- `[internal/simtest/scenario.go:withDefaults]` `-backend` must be empty, `sqlite`, or `s3wal`. Any other value fails an `assertf` in simtest and the process panics. `main` does not validate the value itself.
-- `[internal/simtest/scenario.go:withDefaults]` Steps and nodes must be positive after defaults. A negative `-steps` or `-nodes` panics through `assertf`.
+- `[main.go:main]` Exit code `1` means only "invariant violation". `simtest.Run` reports invariant breaches in `Result.Violations`, not as an error `[../../internal/simtest/scenario.go:Run]`.
+- `[main.go:main]` Exit code `2` does not mean only "infrastructure failure". A flag parse error also exits `2`. An unrecovered panic, such as a failed simtest `assertf` `[../../internal/simtest/fault.go:assertf]`, also exits `2` with a Go panic trace on stderr.
+- `[../../internal/simtest/scenario.go:withDefaults]` `-backend` must be empty, `sqlite`, or `s3wal`. Any other value fails an `assertf` in simtest and the process panics. `main` does not validate the value itself.
+- `[../../internal/simtest/scenario.go:withDefaults]` Steps and nodes must be positive after defaults. A negative `-steps` or `-nodes` panics through `assertf`.
 - `[main.go:main]` The same seed, steps, nodes, and backend replay the same op trace as the DST tests (doc comment in `main.go`). Compare the printed `trace=` hash to confirm a replay.
 
 ## Side Effects
@@ -43,7 +43,7 @@ go run ./cmd/dst -seed <seed> [-steps N] [-v] [-keep]
 - `[main.go:main]` Writes the summary, the violation or `ok` lines, and the `run dir:` line to stdout. With `-v`, simtest also writes trace lines to stdout.
 - `[main.go:main]` Writes `dst: infrastructure failure: <err>` or `dst: <err>` to stderr before `os.Exit(2)`.
 - `[main.go:flag -keep]` Creates a temporary directory with `os.MkdirTemp("", "dst-seed<seed>-*")`. Nothing removes it. Delete it by hand after inspection.
-- `[internal/simtest/scenario.go:Run]` Without `-keep`, simtest creates a run-scoped scratch directory and removes it after the run.
+- `[../../internal/simtest/scenario.go:Run]` Without `-keep`, simtest creates a run-scoped scratch directory and removes it after the run.
 
 ## Verification
 
