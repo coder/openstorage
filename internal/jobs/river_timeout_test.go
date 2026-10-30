@@ -21,11 +21,11 @@ func timeLeft(ctx context.Context) time.Duration {
 	return math.MaxInt64
 }
 
-func startTimeoutRiver(t *testing.T, pgURL string, runSync SyncRunner, sweep *SweepSchedule, absence *AbsenceReconcileSchedule) *River {
+func startTimeoutRiver(t *testing.T, pgURL string, runSync SyncRunner, absence *AbsenceReconcileSchedule) *River {
 	t.Helper()
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
 	noop := func(context.Context, sync.Job) error { return nil }
-	q, err := NewRiver(context.Background(), pgURL, deliverer, runSync, noop, sync.NewMemStore(), sweep, nil, absence, nil, slog.New(slog.DiscardHandler))
+	q, err := NewRiver(context.Background(), pgURL, deliverer, runSync, noop, sync.NewMemStore(), nil, nil, absence, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
@@ -34,7 +34,7 @@ func startTimeoutRiver(t *testing.T, pgURL string, runSync SyncRunner, sweep *Sw
 
 func migrateRiver(t *testing.T, pgURL string) {
 	t.Helper()
-	startTimeoutRiver(t, pgURL, func(context.Context, sync.Job) error { return nil }, nil, nil).Close()
+	startTimeoutRiver(t, pgURL, func(context.Context, sync.Job) error { return nil }, nil).Close()
 }
 
 func orphanJob(t *testing.T, ins *River, args river.JobArgs, age time.Duration) int64 {
@@ -74,7 +74,7 @@ func TestRiverSyncRunKeepsItsOwnBudget(t *testing.T) {
 		default:
 		}
 		return nil
-	}, nil, nil)
+	}, nil)
 	defer q.Close()
 
 	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_budget"}); err != nil {
@@ -106,7 +106,7 @@ func TestRiverAbsencePassKeepsItsHourCap(t *testing.T) {
 	coverTTL := 4 * absencePassTimeout
 	rec := NewAbsenceReconciler(reg, f.blobs, false, MinAbsenceReconcileBudget, coverTTL, time.Hour, slog.New(slog.DiscardHandler))
 	q := startTimeoutRiver(t, pgURL, func(context.Context, sync.Job) error { return nil },
-		nil, &AbsenceReconcileSchedule{Reconciler: rec, Interval: time.Hour})
+		&AbsenceReconcileSchedule{Reconciler: rec, Interval: time.Hour})
 	defer q.Close()
 
 	if got := receiveLeft(t, "absence pass", reg.left); got < absencePassTimeout-time.Minute {
@@ -127,13 +127,14 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 	stillRunning := map[string]int64{
 		"sync 10m after its start":         orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_live"}, 10*time.Minute),
 		"absence pass 50m after its start": orphanJob(t, ins, absenceReconcileArgs{}, 50*time.Minute),
+		"LFS reclaim 50m after its start":  orphanJob(t, ins, lfsReclaimArgs{}, 50*time.Minute),
 		"sweep 2h10m after its start":      orphanJob(t, ins, sweepArgs{}, 2*time.Hour+10*time.Minute),
 	}
 	orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_crashed"}, 30*time.Minute)
 	crashedPush := orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_crashed"}, 30*time.Minute)
 
-	f := newSweepFixture(t)
-	rec := NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, false, MinAbsenceReconcileBudget, 4*absencePassTimeout, time.Hour, slog.New(slog.DiscardHandler))
+	// This client becomes the leader and runs no pass schedule, like a
+	// replica with those passes off: another replica can still run them.
 	ran := make(chan string, 4)
 	q := startTimeoutRiver(t, pgURL, func(_ context.Context, job sync.Job) error {
 		select {
@@ -141,8 +142,7 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 		default:
 		}
 		return nil
-	}, &SweepSchedule{Sweeper: f.sweeper(SweepConfig{Threshold: 24 * time.Hour}), Interval: time.Hour},
-		&AbsenceReconcileSchedule{Reconciler: rec, Interval: time.Hour})
+	}, nil)
 	defer q.Close()
 
 	// Rescue runs on the elected leader every 30s, then the retry waits
