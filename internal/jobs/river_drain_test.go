@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/sync"
@@ -347,8 +348,15 @@ func TestRiverCloseBoundedWhenJobOutlivesCancel(t *testing.T) {
 	}
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
+	pools := make(chan *pgxpool.Pool, 1)
 	var inFlight atomic.Bool
-	stuck := func(context.Context, sync.Job) error {
+	stuck := func(ctx context.Context, _ sync.Job) error {
+		// Holds a queue connection, as a stuck completion transaction does.
+		conn, err := (<-pools).Acquire(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Release()
 		inFlight.Store(true)
 		<-release
 		return nil
@@ -358,6 +366,7 @@ func TestRiverCloseBoundedWhenJobOutlivesCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
+	pools <- q.pool
 	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_stuck"}); err != nil {
 		t.Fatal(err)
 	}
