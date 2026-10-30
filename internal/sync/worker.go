@@ -82,6 +82,8 @@ func claimLease(timeout time.Duration) time.Duration {
 	return timeout + 2*detachedOpTimeout + claimLeaseSlack
 }
 
+func DefaultClaimLease() time.Duration { return claimLease(defaultRunTimeout) }
+
 // claimFenceMargin is how long BEFORE the lease expiry the run's loopback
 // token dies (the push fence, issue #86): a steal is only possible at
 // expiry, so no zombie can authenticate a new push request within the

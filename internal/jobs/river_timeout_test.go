@@ -9,6 +9,7 @@ import (
 
 	"github.com/riverqueue/river"
 
+	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/ref"
 	"github.com/coder/openstorage/internal/sync"
@@ -114,6 +115,40 @@ func TestRiverAbsencePassKeepsItsHourCap(t *testing.T) {
 	}
 }
 
+type firstListDeadlineBlobs struct {
+	blob.BlobStore
+	left chan time.Duration
+}
+
+func (b *firstListDeadlineBlobs) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	select {
+	case b.left <- timeLeft(ctx):
+	default:
+	}
+	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+}
+
+func TestRiverSweepPassEndsBeforeItsRescue(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	f := newSweepFixture(t)
+
+	blobs := &firstListDeadlineBlobs{BlobStore: f.blobs, left: make(chan time.Duration, 1)}
+	sweeper := NewSweeper(blobs, f.store, SweepConfig{Threshold: 24 * time.Hour}, slog.New(slog.DiscardHandler))
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	noop := func(context.Context, sync.Job) error { return nil }
+	q, err := NewRiver(ctx, pgURL, deliverer, noop, noop, sync.NewMemStore(),
+		&SweepSchedule{Sweeper: sweeper, Interval: time.Hour}, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+
+	if got := receiveLeft(t, "sweep pass", blobs.left); got > passJobTimeout || got < passJobTimeout-time.Minute {
+		t.Errorf("sweep pass context has %v left, want it to end %v after the start", got, passJobTimeout)
+	}
+}
+
 func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 	ctx := context.Background()
 	pgURL := livenessPG(t, ctx)
@@ -133,17 +168,15 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 	orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_crashed"}, 30*time.Minute)
 	crashedPush := orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_crashed"}, 30*time.Minute)
 
-	// This client becomes the leader and runs no pass schedule, like a
-	// replica with those passes off: another replica can still run them.
 	ran := make(chan string, 4)
-	q := startTimeoutRiver(t, pgURL, func(_ context.Context, job sync.Job) error {
+	leaderWithPassesOff := startTimeoutRiver(t, pgURL, func(_ context.Context, job sync.Job) error {
 		select {
 		case ran <- job.RepoID:
 		default:
 		}
 		return nil
 	}, nil)
-	defer q.Close()
+	defer leaderWithPassesOff.Close()
 
 	// Rescue runs on the elected leader every 30s, then the retry waits
 	// about 1s and the scheduler promotes it within 5s.
