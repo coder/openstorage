@@ -21,7 +21,7 @@ Run these commands from the checkout root, in the same shell. First set
 
 ### Option A: use a published image
 
-Version `0.17.0` is published for linux/amd64 and linux/arm64. Pin it by version
+Version `0.19.0` is published for linux/amd64 and linux/arm64. Pin it by version
 and index digest.
 
 The package is **private** and inherits this internal repository's access: people
@@ -30,7 +30,7 @@ the `read:packages` scope. Without such a token, use option B.
 
 ```sh
 docker login ghcr.io  # GitHub token with read:packages
-export OPENSTORAGE_IMAGE=ghcr.io/coder/openstorage:0.17.0@sha256:db15dca024218292ad1b9e52aab3c19a2d727e4438a555c30b46b5807c90df59
+export OPENSTORAGE_IMAGE=ghcr.io/coder/openstorage:0.19.0@sha256:992076aacf677e17c8b7c213d81961f02af7f9a63ff9918b76829df6c9380745
 ```
 
 ### Option B: build locally
