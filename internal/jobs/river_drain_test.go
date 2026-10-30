@@ -304,6 +304,12 @@ func TestRiverCloseWithoutDrainKeepsJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "sync run and delivery in flight", func() bool { return inFlight.Load() && posted.Load() })
+	// As an API handler's CompleteSyncCreate transaction does.
+	held, err := q.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
 
 	closeWithin(t, q)
 
@@ -370,6 +376,9 @@ func TestRiverCloseBoundedWhenJobOutlivesCancel(t *testing.T) {
 
 	if state, _ := riverJob(t, pgURL, "upstream_sync", "repo_stuck"); state != "running" {
 		t.Fatalf("job state %q, want running until River rescues it", state)
+	}
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_late"}); err == nil {
+		t.Fatal("EnqueueSync after Close succeeded, want it rejected")
 	}
 }
 
