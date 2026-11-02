@@ -114,7 +114,8 @@ const (
 // value here (default 20, max 100); the opaque cursor is validated by the
 // store (ErrInvalidCursor).
 type ListParams struct {
-	Q      string // case-insensitive substring filter on URL, pre-trimmed; "" = no filter
+	Q      string // case-insensitive substring filter on URL, pre-trimmed; "" = no filter; with Prefix set, only the URL after the prefix
+	Prefix string // case-insensitive filter on the start of URL, pre-trimmed; "" = no filter
 	Cursor string // opaque cursor from a previous ListResult; "" = first page
 	Limit  int    // page size, already clamped/validated by the caller
 }

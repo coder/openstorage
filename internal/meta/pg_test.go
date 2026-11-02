@@ -475,13 +475,24 @@ func testUpdateRepoDefaultBranch(t *testing.T, s Backend) {
 // invariants, and returns every row seen plus the page sizes.
 func listAll(t *testing.T, s Backend, org, q string, pageSize int) ([]Repo, []int) {
 	t.Helper()
+	return listAllParams(t, s, org, ListParams{Q: q, Limit: pageSize})
+}
+
+// listAllParams is listAll with every filter of p; p.Cursor must be "".
+func listAllParams(t *testing.T, s Backend, org string, p ListParams) ([]Repo, []int) {
+	t.Helper()
+	if p.Cursor != "" {
+		t.Fatalf("listAllParams: start cursor %q, want \"\"", p.Cursor)
+	}
+	pageSize := p.Limit
 	var all []Repo
 	var pages []int
 	cursor := ""
 	for range 100 { // hard stop: a cursor bug must not loop forever
-		res, err := s.ListRepos(t.Context(), org, ListParams{Q: q, Cursor: cursor, Limit: pageSize})
+		p.Cursor = cursor
+		res, err := s.ListRepos(t.Context(), org, p)
 		if err != nil {
-			t.Fatalf("ListRepos(q=%q, cursor=%q): %v", q, cursor, err)
+			t.Fatalf("ListRepos(q=%q, prefix=%q, cursor=%q): %v", p.Q, p.Prefix, cursor, err)
 		}
 		if res.Repos == nil {
 			t.Fatalf("Repos is nil (contract: never nil)")
@@ -636,6 +647,78 @@ func testListReposQFilter(t *testing.T, s Backend) {
 	}
 	if res.Repos == nil || len(res.Repos) != 0 || res.HasMore || res.NextCursor != "" {
 		t.Errorf("no-match result = %+v, want empty non-nil, no more", res)
+	}
+}
+
+func TestListReposPrefixFilter(t *testing.T) { runBackends(t, testListReposPrefixFilter) }
+
+// testListReposPrefixFilter pins the upstream `prefix` semantics (spec
+// 34ac6de1): case-insensitive start-of-url match, ANDed with q, and with a
+// prefix set q matches only the url after the prefix.
+func testListReposPrefixFilter(t *testing.T, s Backend) {
+	ctx := t.Context()
+	org := seedOrg(t, s)
+	all := []string{
+		"pierre/sdk-documentation",
+		"pierre/example",
+		"Pierre/Upper-SDK",
+		"pierre/pierre-mirror",
+		"acme/pierre-tools",
+		"50%/off",
+		"500/decoy", // matches prefix '50%' only if % is unescaped
+		"a_b/one",
+		"axb/decoy", // matches prefix 'a_b' only if _ is unescaped
+		`back\slash/one`,
+	}
+	for _, url := range all {
+		if _, err := s.CreateRepo(ctx, org, url, "main"); err != nil {
+			t.Fatalf("create %s: %v", url, err)
+		}
+	}
+	urls := func(rs []Repo) []string {
+		out := make([]string, len(rs))
+		for i, r := range rs {
+			out[i] = r.URL
+		}
+		slices.Sort(out)
+		return out
+	}
+	sorted := func(in ...string) []string {
+		out := slices.Clone(in)
+		slices.Sort(out)
+		return out
+	}
+	pierre := sorted("pierre/sdk-documentation", "pierre/example", "Pierre/Upper-SDK", "pierre/pierre-mirror")
+
+	for _, tc := range []struct {
+		name, prefix, q string
+		want            []string
+	}{
+		{"empty prefix is no filter", "", "", sorted(all...)},
+		{"prefix alone, case-insensitive", "PIERRE/", "", pierre},
+		{"upstream prefix+q example", "pierre/", "sdk", sorted("pierre/sdk-documentation", "Pierre/Upper-SDK")},
+		{"q matches only after the prefix", "pierre/", "pierre", sorted("pierre/pierre-mirror")},
+		{"q inside the prefix does not match", "pierre/sdk", "sdk", []string{}},
+		{"no prefix match", "nobody/", "", []string{}},
+		{"literal percent", "50%", "", sorted("50%/off")},
+		{"literal underscore", "a_b", "", sorted("a_b/one")},
+		{"literal backslash", `back\`, "", sorted(`back\slash/one`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Page size 1 walks a cursor per row: every match exactly once.
+			rows, _ := listAllParams(t, s, org, ListParams{Q: tc.q, Prefix: tc.prefix, Limit: 1})
+			got := urls(rows)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("prefix=%q q=%q -> %v, want %v", tc.prefix, tc.q, got, tc.want)
+			}
+			res, err := s.ListRepos(ctx, org, ListParams{Q: tc.q, Prefix: tc.prefix, Limit: 100})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if one := urls(res.Repos); res.HasMore || !slices.Equal(one, tc.want) {
+				t.Errorf("single page prefix=%q q=%q -> %v (HasMore=%v), want %v", tc.prefix, tc.q, one, res.HasMore, tc.want)
+			}
+		})
 	}
 }
 

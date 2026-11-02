@@ -461,6 +461,7 @@ func TestS3WALMetaConformance(t *testing.T) {
 		{"UpdateRepoDefaultBranch", testUpdateRepoDefaultBranch},
 		{"ListReposPagination", testListReposPagination},
 		{"ListReposQFilter", testListReposQFilter},
+		{"ListReposPrefixFilter", testListReposPrefixFilter},
 		{"ListReposErrors", testListReposErrors},
 		{"Webhooks", testWebhooks},
 		{"GitCredentials", testGitCredentials},

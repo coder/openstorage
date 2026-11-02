@@ -604,7 +604,8 @@ const (
 )
 
 // handleListRepos implements GET /api/v1/repos (scope org:read, repo claim
-// "org"): keyset pagination via opaque cursor, `q` substring filter on url.
+// "org"): keyset pagination via opaque cursor, `q` substring and `prefix`
+// start-of-url filters on url (with `prefix` set, `q` matches only the rest).
 func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	query := r.URL.Query()
@@ -621,6 +622,7 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.store.ListRepos(r.Context(), claims.Iss, meta.ListParams{
 		Q:      strings.TrimSpace(query.Get("q")),
+		Prefix: strings.TrimSpace(query.Get("prefix")),
 		Cursor: query.Get("cursor"),
 		Limit:  limit,
 	})

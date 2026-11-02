@@ -6,7 +6,7 @@ A user creates, inspects, lists, and deletes repositories, and changes a reposit
 
 - `repo-create` answers `201` for a new name and `200` (`already exists`) for the same request again.
 - `repo-get` returns the record for the token's repo.
-- `repo-list` lists the organization's repos with an `org:read` token, filters with `q`, and pages with `limit`.
+- `repo-list` lists the organization's repos with an `org:read` token, filters with `q` and `prefix`, and pages with `limit`.
 - `repo-url` resolves a `repo_id` to its name (`GET /api/repo-urls/{repo_id}`).
 - `org-meta` returns the organization metadata (`GET /api/meta`).
 - `repo-default-branch` changes the default branch with `PATCH /api/v1/repo`.
@@ -61,6 +61,15 @@ SCRATCH_ID=$("$OSV" json "$OSV_EVIDENCE/repo-create-scratch.body" repo_id)
 "$OSV" eq "$RUN" repo-list-q-only '["tools"]' "$("$OSV" json "$OSV_EVIDENCE/repo-list-q.body" 'repos.*.repo_name')"
 "$OSV" api "$RUN" repo-list-page --token org --expect 200 GET '/api/v1/repos?limit=1'
 "$OSV" eq "$RUN" repo-list-page-more true "$("$OSV" json "$OSV_EVIDENCE/repo-list-page.body" has_more)"
+```
+
+- **Filter by prefix.** `prefix=T` matches the start of the name without case, so it returns only `tools`. With `prefix` set, `q` matches only the rest of the name after the prefix: `prefix=t&q=t` returns no repo, because `ools` has no `t`.
+
+```sh
+"$OSV" api "$RUN" repo-list-prefix --token org --expect 200 GET '/api/v1/repos?prefix=T'
+"$OSV" eq "$RUN" repo-list-prefix-only '["tools"]' "$("$OSV" json "$OSV_EVIDENCE/repo-list-prefix.body" 'repos.*.repo_name')"
+"$OSV" api "$RUN" repo-list-prefix-q --token org --expect 200 GET '/api/v1/repos?prefix=t&q=t'
+"$OSV" eq "$RUN" repo-list-prefix-q-none '[]' "$("$OSV" json "$OSV_EVIDENCE/repo-list-prefix-q.body" 'repos.*.repo_name')"
 ```
 
 - **Resolve an ID and read the org metadata.** Resolve `SCRATCH_ID`, then read `/api/meta`. The ID resolves to `scratch`. The metadata is `{"ips":{"api":[],"git":[]},"provider":{"name":"","region":""}}`.

@@ -240,33 +240,18 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-10-29 (upstream
-  `Last-Modified` 2026-10-28 22:23:55 GMT), SHA-256
-  `40e43e00b8a35664099d41e7c4b93a02b6fe48b29aa4822b82b4f8ba9427ce13`.
-  [The cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) served the
-  same bytes at 00:45 UTC on 2026-10-29. The cluster never served the previous
-  snapshot (`b598ce96`, subject-line commit messages,
-  [#570](https://github.com/coder/openstorage/issues/570)) in any check: it served
-  `10f3e009d55fc521ff38c88b3231433317545cc3fbaac7d021cf8b8184f8e356` at 00:09 UTC on
-  2026-10-28, and `40e43e00` at the next check. A spec that the cluster serves does not
-  prove how the cluster behaves. Against `b598ce96`, the snapshot changes:
-  - `files` lists recursively when the call sends no `recursive`
-    ([#598](https://github.com/coder/openstorage/issues/598));
-  - `commit-pack` and `diff-commit` answer `412` `no changes to commit`, and `412` for a
-    malformed stream, such as a file without its final `eof` chunk. open.storage does
-    both ([#595](https://github.com/coder/openstorage/issues/595)). Its other malformed
-    frames stay `400` ([streaming protocols](streaming-commit-protocols.md)). They answer
-    `409` `failed` with the unpublished commit when the ref update is lost
-    ([#596](https://github.com/coder/openstorage/issues/596)). `commit-pack` answers
-    `413` when the decoded file contents pass 262,144,000 bytes
-    ([#597](https://github.com/coder/openstorage/issues/597));
-  - `RefUpdateResult.status` gets a closed enum without `busy`, which open.storage no
-    longer sends ([#594](https://github.com/coder/openstorage/issues/594));
-  - an omitted `default_branch` follows the source of a copy, as open.storage already
-    did, and the GitHub repository of a sync
-    ([#599](https://github.com/coder/openstorage/issues/599), with an S3-WAL deviation
-    above);
-  - `archive` no longer requires `ref`, which open.storage already treats as optional.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-11-02 (upstream
+  `Last-Modified` 2026-11-01 21:40:55 GMT), SHA-256
+  `34ac6de1b16702f1ccc0d4b37c0c2ba7d607c627150e0d13c4fd7f3388dcb122`.
+  [The cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served
+  the previous snapshot (`40e43e00`) at 06:17 and 06:23 UTC on 2026-11-02, so this
+  change is documented drift, not a proven deployment change (a spec that the cluster
+  serves would not prove how the cluster behaves either). Against `40e43e00`, the
+  snapshot adds a
+  `prefix` query parameter to `GET /repos`: a case-insensitive filter on the start of
+  `repo_name`, combined with `q`, which then matches only the rest of the name after
+  the prefix. open.storage does both
+  ([#651](https://github.com/coder/openstorage/issues/651)).
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled

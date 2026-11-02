@@ -739,8 +739,8 @@ func (s *SQLite) ListRepos(ctx context.Context, org string, params ListParams) (
 
 	query := `SELECT ` + repoCols + ` FROM repos WHERE org_id = ? AND deleted_at IS NULL`
 	args := []any{orgID}
-	if params.Q != "" {
-		args = append(args, "%"+escapeLike(params.Q)+"%")
+	if pattern := listURLPattern(params); pattern != "" {
+		args = append(args, pattern)
 		query += ` AND lower(url) LIKE lower(?) ESCAPE '\'`
 	}
 	if params.Cursor != "" {
