@@ -1391,9 +1391,10 @@ func (s *S3WAL) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, erro
 // ListRepos pages live repos for the org, keyset-ordered by
 // (created_at DESC, repo_id DESC) with the shared opaque cursor
 // (cursor.go). The Q and Prefix filters are literal case-insensitive
-// substring and start-of-url matches; folding is Unicode-wide here (strings.ToLower) where SQLite
-// folds ASCII only and PG folds per locale — an accepted divergence of
-// the same kind the SQL twins already document against each other.
+// substring and start-of-url matches; folding is Unicode-wide here
+// (strings.ToLower) where SQLite folds ASCII only and PG folds per locale —
+// an accepted divergence of the same kind the SQL twins already document
+// against each other.
 func (s *S3WAL) ListRepos(ctx context.Context, org string, params ListParams) (ListResult, error) {
 	assertf(params.Limit >= 1 && params.Limit <= 100,
 		"ListRepos: limit %d outside contract range [1,100]", params.Limit)
