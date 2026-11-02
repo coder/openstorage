@@ -9,9 +9,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -629,6 +631,63 @@ func testListPaginationAndQ(t *testing.T, e *testEnv) {
 	listPage(url.Values{"limit": {"0"}}, http.StatusBadRequest)
 	listPage(url.Values{"limit": {"101"}}, http.StatusBadRequest)
 	listPage(url.Values{"limit": {"abc"}}, http.StatusBadRequest)
+}
+
+// TestListPrefix pins GET /api/v1/repos `prefix` (upstream spec 34ac6de1):
+// trimmed, case-insensitive start of repo_name, and with `prefix` set `q`
+// matches only the rest after it.
+func TestListPrefix(t *testing.T) { runBackends(t, testListPrefix) }
+
+func testListPrefix(t *testing.T, e *testEnv) {
+	org := e.newOrg(t)
+	for _, name := range []string{"pierre/sdk-documentation", "pierre/example", "Pierre/Upper-SDK", "acme/pierre-tools", "acme/sdk-tools"} {
+		createRepo(t, e, org, name, nil, http.StatusCreated)
+	}
+	orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}})
+
+	// list walks every page and returns the sorted repo_names.
+	list := func(params url.Values) []string {
+		t.Helper()
+		params = maps.Clone(params)
+		var names []string
+		for range 10 {
+			resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos?"+params.Encode(), orgTok, nil, "")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET /repos?%s status = %d (body %s)", params.Encode(), resp.StatusCode, body)
+			}
+			var page listReposResponse
+			if err := json.Unmarshal(body, &page); err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range page.Repos {
+				names = append(names, r.RepoName)
+			}
+			if !page.HasMore {
+				slices.Sort(names)
+				return names
+			}
+			params.Set("cursor", page.NextCursor)
+		}
+		t.Fatalf("GET /repos?%s did not end after 10 pages", params.Encode())
+		return nil
+	}
+
+	for _, tc := range []struct {
+		params url.Values
+		want   []string
+	}{
+		{url.Values{"prefix": {"pierre/"}}, []string{"Pierre/Upper-SDK", "pierre/example", "pierre/sdk-documentation"}},
+		{url.Values{"prefix": {"  PIERRE/ "}, "limit": {"1"}}, []string{"Pierre/Upper-SDK", "pierre/example", "pierre/sdk-documentation"}},
+		{url.Values{"prefix": {"pierre/"}, "q": {"sdk"}}, []string{"Pierre/Upper-SDK", "pierre/sdk-documentation"}},
+		{url.Values{"prefix": {"pierre/"}, "q": {"pierre"}}, nil},
+		{url.Values{"prefix": {"acme/"}, "q": {"pierre"}}, []string{"acme/pierre-tools"}},
+		{url.Values{"prefix": {"  "}, "limit": {"1"}}, []string{"Pierre/Upper-SDK", "acme/pierre-tools", "acme/sdk-tools", "pierre/example", "pierre/sdk-documentation"}},
+		{url.Values{"prefix": {"pierre_"}}, nil},
+	} {
+		if got := list(tc.params); !slices.Equal(got, tc.want) {
+			t.Errorf("GET /repos?%s -> %v, want %v", tc.params.Encode(), got, tc.want)
+		}
+	}
 }
 
 // TestAuthMatrix drives the docs/reference/http-api.md 401/403 failure map across all four

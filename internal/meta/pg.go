@@ -610,6 +610,23 @@ func escapeLike(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
+// listURLPattern returns the LIKE/ILIKE pattern for the ListParams url
+// filters, or "" when neither applies. `prefix%q%` anchors the literal
+// prefix at the start, which consumes exactly the prefix's characters, so q
+// can only match the rest of the url after it.
+func listURLPattern(p ListParams) string {
+	assertf(p.Q == strings.TrimSpace(p.Q) && p.Prefix == strings.TrimSpace(p.Prefix),
+		"ListRepos: untrimmed filters q=%q prefix=%q", p.Q, p.Prefix)
+	if p.Q == "" && p.Prefix == "" {
+		return ""
+	}
+	pattern := escapeLike(p.Prefix) + "%"
+	if p.Q != "" {
+		pattern += escapeLike(p.Q) + "%"
+	}
+	return pattern
+}
+
 // ListRepos pages live repos for the org, keyset-ordered by
 // (created_at DESC, repo_id DESC).
 func (s *PG) ListRepos(ctx context.Context, org string, params ListParams) (ListResult, error) {
@@ -624,8 +641,8 @@ func (s *PG) ListRepos(ctx context.Context, org string, params ListParams) (List
 
 	sql := `SELECT ` + repoCols + ` FROM repos WHERE org_id = $1 AND deleted_at IS NULL`
 	args := []any{orgID}
-	if params.Q != "" {
-		args = append(args, "%"+escapeLike(params.Q)+"%")
+	if pattern := listURLPattern(params); pattern != "" {
+		args = append(args, pattern)
 		sql += fmt.Sprintf(` AND url ILIKE $%d`, len(args))
 	}
 	if params.Cursor != "" {
