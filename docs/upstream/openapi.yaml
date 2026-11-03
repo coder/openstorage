@@ -3056,7 +3056,7 @@ info:
     - `ref_guard_failed` (409): a ref guard such as `expected_target_sha` does not match the ref; `guard` names it and `current_sha` is the commit of the ref.
     - `credential_not_found` (404): the Git credential does not exist.
     - `credential_exists` (409): the repository already has a Git credential.
-    - `github_app_not_configured` (412): the organization does not have exactly one GitHub App.
+    - `github_app_not_configured` (412): no GitHub App is set up for the organization, or the GitHub App of the repository has no usable private key.
     - `github_repository_inaccessible` (412, or the 4xx status from the upstream): GitHub does not give access to the upstream repository.
     - `hosting_not_enabled` (403): hosting is not enabled for the organization.
     - `hosting_project_not_found` (404): the repository has no hosting project.
@@ -4666,6 +4666,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: The branch could not be deleted because it is the repository default branch.
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -4693,6 +4702,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -4944,6 +4962,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Conflict
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -4971,6 +4998,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -5473,7 +5509,7 @@ paths:
                   target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: "The commit makes no changes to the branch: the files match its tip, the request has no file operations, or it deletes only paths that do not exist. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a file without its final `eof` chunk, also gets `412`, with another message."
+          description: "The commit makes no changes to the branch: the files match its tip, the request has no file operations, or it deletes only paths that do not exist. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a file without its final `eof` chunk, also gets `412`, with another message. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the GitHub App has no usable private key, GitHub does not give the App access to the repository, or GitHub refuses the push with `401`, `403` or `404`. Then `result.status` is `failed` and `result.message` explains the failure."
         "413":
           content:
             application/json:
@@ -5516,6 +5552,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: upstream Git server request failed; the push may or may not have been applied, check the branch before retrying
+                  new_sha: ""
+                  old_sha: ""
+                  status: internal
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/CommitWriteResponse"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying. `result.status` is `failed` when GitHub answers the push with a server error, and `commit` is the commit that the write tried to set. `result.status` is `internal` and `commit` is `null` when the push request fails, or when GitHub answers with a server error or cannot be reached while the gateway gets its GitHub token. `result.message` explains the failure.
         "503":
           content:
             application/json:
@@ -6058,7 +6109,7 @@ paths:
                   target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: Applying the diff makes no changes to the branch. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a stream without its final `eof` chunk, also gets `412`, with another message.
+          description: "Applying the diff makes no changes to the branch. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a stream without its final `eof` chunk, also gets `412`, with another message. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the GitHub App has no usable private key, GitHub does not give the App access to the repository, or GitHub refuses the push with `401`, `403` or `404`. Then `result.status` is `failed` and `result.message` explains the failure."
         "429":
           content:
             application/json:
@@ -6086,6 +6137,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: upstream Git server request failed; the push may or may not have been applied, check the branch before retrying
+                  new_sha: ""
+                  old_sha: ""
+                  status: internal
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/CommitWriteResponse"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying. `result.status` is `failed` when GitHub answers the push with a server error, and `commit` is the commit that the write tried to set. `result.status` is `internal` and `commit` is `null` when the push request fails, or when GitHub answers with a server error or cannot be reached while the gateway gets its GitHub token. `result.message` explains the failure.
         "503":
           content:
             application/json:
@@ -7651,6 +7717,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: "The merge could not be completed. An `application/json` body reports file-level conflicts, or an automatic stale-target retry that could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed. A problem body reports any other conflict. A failed guard has the code `ref_guard_failed`: the target no longer matches `expected_target_sha`, or the source branch no longer contains `expected_source_sha`. Its body is a `RefGuardProblemDetails`: `guard` names the guard, and `current_sha` is the tip of the guarded branch, or 40 zeros when the source branch does not exist."
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -7678,6 +7753,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -8935,7 +9019,7 @@ paths:
                   target_branch: ""
               schema:
                 $ref: "#/components/schemas/ReposCommitsRestoreResponse"
-          description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`."
+          description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the GitHub App has no usable private key, GitHub does not give the App access to the repository, or GitHub refuses the push with `401`, `403` or `404`. Then `result.status` is `failed` and `result.message` explains the failure."
         "429":
           content:
             application/json:
@@ -8963,6 +9047,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: upstream Git server request failed; the push may or may not have been applied, check the branch before retrying
+                  new_sha: ""
+                  old_sha: ""
+                  status: internal
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/ReposCommitsRestoreResponse"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying. `result.status` is `failed` when GitHub answers the push with a server error, and `commit` is the commit that the write tried to set. `result.status` is `internal` and `commit` is `null` when the push request fails, or when GitHub answers with a server error or cannot be reached while the gateway gets its GitHub token. `result.message` explains the failure.
         "503":
           content:
             application/json:
@@ -9110,7 +9209,7 @@ paths:
                   target_branch: ""
               schema:
                 $ref: "#/components/schemas/ReposCommitsRestoreResponse"
-          description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`."
+          description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the GitHub App has no usable private key, GitHub does not give the App access to the repository, or GitHub refuses the push with `401`, `403` or `404`. Then `result.status` is `failed` and `result.message` explains the failure."
         "429":
           content:
             application/json:
@@ -9138,6 +9237,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: upstream Git server request failed; the push may or may not have been applied, check the branch before retrying
+                  new_sha: ""
+                  old_sha: ""
+                  status: internal
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/ReposCommitsRestoreResponse"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying. `result.status` is `failed` when GitHub answers the push with a server error, and `commit` is the commit that the write tried to set. `result.status` is `internal` and `commit` is `null` when the push request fails, or when GitHub answers with a server error or cannot be reached while the gateway gets its GitHub token. `result.message` explains the failure.
         "503":
           content:
             application/json:
@@ -9509,6 +9623,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Conflict
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -9536,6 +9659,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -9638,6 +9770,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Conflict
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -9665,6 +9806,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -11149,6 +11299,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: The branch could not be deleted because it is the repository default branch.
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -11176,6 +11335,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -11420,6 +11588,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Conflict
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -11447,6 +11624,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -11935,7 +12121,7 @@ paths:
                   target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: "The commit makes no changes to the branch: the files match its tip, the request has no file operations, or it deletes only paths that do not exist. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a file without its final `eof` chunk, also gets `412`, with another message."
+          description: "The commit makes no changes to the branch: the files match its tip, the request has no file operations, or it deletes only paths that do not exist. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a file without its final `eof` chunk, also gets `412`, with another message. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the GitHub App has no usable private key, GitHub does not give the App access to the repository, or GitHub refuses the push with `401`, `403` or `404`. Then `result.status` is `failed` and `result.message` explains the failure."
         "413":
           content:
             application/json:
@@ -11978,6 +12164,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: upstream Git server request failed; the push may or may not have been applied, check the branch before retrying
+                  new_sha: ""
+                  old_sha: ""
+                  status: internal
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/CommitWriteResponse"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying. `result.status` is `failed` when GitHub answers the push with a server error, and `commit` is the commit that the write tried to set. `result.status` is `internal` and `commit` is `null` when the push request fails, or when GitHub answers with a server error or cannot be reached while the gateway gets its GitHub token. `result.message` explains the failure.
         "503":
           content:
             application/json:
@@ -12644,7 +12845,7 @@ paths:
                   target_branch: ""
               schema:
                 $ref: "#/components/schemas/CommitWriteResponse"
-          description: Applying the diff makes no changes to the branch. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a stream without its final `eof` chunk, also gets `412`, with another message.
+          description: "Applying the diff makes no changes to the branch. `result.status` is `precondition_failed` and `result.message` is `no changes to commit`. A malformed stream, such as a stream without its final `eof` chunk, also gets `412`, with another message. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the GitHub App has no usable private key, GitHub does not give the App access to the repository, or GitHub refuses the push with `401`, `403` or `404`. Then `result.status` is `failed` and `result.message` explains the failure."
         "429":
           content:
             application/json:
@@ -12672,6 +12873,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: upstream Git server request failed; the push may or may not have been applied, check the branch before retrying
+                  new_sha: ""
+                  old_sha: ""
+                  status: internal
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/CommitWriteResponse"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying. `result.status` is `failed` when GitHub answers the push with a server error, and `commit` is the commit that the write tried to set. `result.status` is `internal` and `commit` is `null` when the push request fails, or when GitHub answers with a server error or cannot be reached while the gateway gets its GitHub token. `result.message` explains the failure.
         "503":
           content:
             application/json:
@@ -14204,6 +14420,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: "The merge could not be completed. An `application/json` body reports file-level conflicts, or an automatic stale-target retry that could not absorb concurrent target/repository movement. Inspect conflict_type to distinguish merge_conflict, target_moved, and repo_changed. A problem body reports any other conflict. A failed guard has the code `ref_guard_failed`: the target no longer matches `expected_target_sha`, or the source branch no longer contains `expected_source_sha`. Its body is a `RefGuardProblemDetails`: `guard` names the guard, and `current_sha` is the tip of the guarded branch, or 40 zeros when the source branch does not exist."
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -14231,6 +14456,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -15300,7 +15534,7 @@ paths:
                   target_branch: ""
               schema:
                 $ref: "#/components/schemas/ReposCommitsRestoreResponse"
-          description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`."
+          description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the GitHub App has no usable private key, GitHub does not give the App access to the repository, or GitHub refuses the push with `401`, `403` or `404`. Then `result.status` is `failed` and `result.message` explains the failure."
         "429":
           content:
             application/json:
@@ -15328,6 +15562,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: upstream Git server request failed; the push may or may not have been applied, check the branch before retrying
+                  new_sha: ""
+                  old_sha: ""
+                  status: internal
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/ReposCommitsRestoreResponse"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying. `result.status` is `failed` when GitHub answers the push with a server error, and `commit` is the commit that the write tried to set. `result.status` is `internal` and `commit` is `null` when the push request fails, or when GitHub answers with a server error or cannot be reached while the gateway gets its GitHub token. `result.message` explains the failure.
         "503":
           content:
             application/json:
@@ -15471,7 +15720,7 @@ paths:
                   target_branch: ""
               schema:
                 $ref: "#/components/schemas/ReposCommitsRestoreResponse"
-          description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`."
+          description: "Storage rejected the restore because the branch cannot move as requested: the branch already points at `base_ref`, the restore would produce no change, or `base_ref` is not an ancestor of the current tip. The body carries the restore result with `result.status` set to `precondition_failed`. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the GitHub App has no usable private key, GitHub does not give the App access to the repository, or GitHub refuses the push with `401`, `403` or `404`. Then `result.status` is `failed` and `result.message` explains the failure."
         "429":
           content:
             application/json:
@@ -15499,6 +15748,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              example:
+                commit: null
+                result:
+                  message: upstream Git server request failed; the push may or may not have been applied, check the branch before retrying
+                  new_sha: ""
+                  old_sha: ""
+                  status: internal
+                  success: false
+                  target_branch: ""
+              schema:
+                $ref: "#/components/schemas/ReposCommitsRestoreResponse"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying. `result.status` is `failed` when GitHub answers the push with a server error, and `commit` is the commit that the write tried to set. `result.status` is `internal` and `commit` is `null` when the push request fails, or when GitHub answers with a server error or cannot be reached while the gateway gets its GitHub token. `result.message` explains the failure.
         "503":
           content:
             application/json:
@@ -15598,6 +15862,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Conflict
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -15625,6 +15898,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
@@ -15863,6 +16145,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Conflict
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: "`412` has more than one cause. Storage returns `precondition_failed` for a write-specific reason, such as a merge with no common ancestor between source and target, a merge target that moved off a fast-forward under the `ff_only` strategy, or a branch creation whose target cannot be fast-forwarded. A repository with a GitHub upstream also gets `412` when the write cannot reach GitHub: the code is `github_app_not_configured` when the GitHub App has no usable private key, `github_repository_inaccessible` when GitHub does not give the App access to the repository, and `precondition_failed` when GitHub refuses the push for another reason, such as an archived repository. `detail` explains the failure."
         "429":
           content:
             application/json:
@@ -15890,6 +16181,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Internal Server Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: A storage node, the upstream Git server or GitHub failed or could not be reached. When the push request to the upstream failed or got a server error, the write may have been applied; check the branch before retrying.
         "503":
           content:
             application/json:
