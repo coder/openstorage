@@ -217,6 +217,6 @@ func TestTagDeleteInPath(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("DELETE tag in path without git:read = %d (%s), want 403", resp.StatusCode, body)
 		}
-		requireAuthResultEnvelope(t, body, "forbidden")
+		requireEnvelope(t, resp, body)
 	})
 }

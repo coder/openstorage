@@ -193,13 +193,13 @@ func TestAliasNotFound(t *testing.T) {
 		}
 		requireEnvelope(t, resp, body)
 
-		// Write route, claim repo != path repo -> 404 result envelope.
+		// Write route, claim repo != path repo -> 404 problem body.
 		resp, body = e.doReq(t, http.MethodPost, "/api/repos/"+esc+"/tags", otherWrite,
 			[]byte(`{"name": "x", "target": "main"}`), "")
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("write mismatch = %d (%s), want 404", resp.StatusCode, body)
 		}
-		requireAuthResultEnvelope(t, body, "not_found")
+		requireEnvelope(t, resp, body)
 
 		// Claim repo that never existed -> 404 (claim-side resolution).
 		ghost := e.mint(t, tokenSpec{iss: org, repo: "https://example.com/" + org + "/ghost",
@@ -252,7 +252,7 @@ func TestAliasAuthWiring(t *testing.T) {
 			}
 		}
 
-		// Write-flavor alias: docs/explanation/streaming-commit-protocols.md result envelopes (ADR-26).
+		// Write alias: plain problem bodies, as upstream documents (#352 item 3).
 		writePath := "/api/repos/" + esc + "/tags"
 		resp, body := e.doReq(t, http.MethodPost, writePath, "", nil, "")
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -261,12 +261,12 @@ func TestAliasAuthWiring(t *testing.T) {
 		if got := resp.Header.Get("WWW-Authenticate"); got != "Bearer" {
 			t.Errorf("write alias 401 WWW-Authenticate = %q, want Bearer", got)
 		}
-		requireAuthResultEnvelope(t, body, "unauthorized")
+		requireEnvelope(t, resp, body)
 		resp, body = e.doReq(t, http.MethodPost, writePath, readToken, nil, "")
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("write alias wrong scope = %d, want 403", resp.StatusCode)
 		}
-		requireAuthResultEnvelope(t, body, "forbidden")
+		requireEnvelope(t, resp, body)
 
 		// Org-level alias rejects repo-scoped tokens.
 		repoWriteToken := e.mint(t, tokenSpec{iss: org, repo: fx.repo.URL, scopes: []string{auth.ScopeRepoWrite}})

@@ -93,11 +93,11 @@ func registerCredentialRoutes(mux *http.ServeMux, verifier auth.Verifier, org st
 	assertf(verifier != nil, "registerCredentialRoutes: nil verifier")
 	assertf(s != nil, "registerCredentialRoutes: nil syncServer")
 	mux.Handle("POST /api/v1/repos/git-credentials",
-		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleCreateCredential))))
+		rl.limit()(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleCreateCredential))))
 	mux.Handle("PUT /api/v1/repos/git-credentials",
-		rl.limit(routeRead)(requireAuth(verifier, org, true, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleUpdateCredential))))
+		rl.limit()(requireAuth(verifier, org, true, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleUpdateCredential))))
 	mux.Handle("DELETE /api/v1/repos/git-credentials",
-		rl.limit(routeRead)(requireAuth(verifier, org, true, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDeleteCredential))))
+		rl.limit()(requireAuth(verifier, org, true, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDeleteCredential))))
 }
 
 // gcredDecodeBody reads and unmarshals a bounded JSON body. false = a 400
@@ -293,25 +293,17 @@ func (s *syncServer) handleDeleteCredential(w http.ResponseWriter, r *http.Reque
 //	DELETE /api/repos/{repo_name}/git-credentials/{git_credential_id}  repo:write (per repo)  -> 204
 //
 // Registered by registerAliasRoutes (alias.go) as direct routes — there is
-// no v1 twin to re-dispatch to. Auth is requireAuthWrite (per-repo
-// repo:write, ADR-26 result envelopes), so every failure here carries the
-// write flavor; the success bodies match the v1 PUT/DELETE exactly.
-
-// internalErrResult mirrors internalErr with the docs/explanation/streaming-commit-protocols.md result envelope
-// (the path-id credential routes are write-flavored, ADR-26).
-func (s *syncServer) internalErrResult(w http.ResponseWriter, r *http.Request, op string, err error) {
-	assertf(s != nil && s.logger != nil, "internalErrResult: nil syncServer deps")
-	assertf(err != nil && op != "", "internalErrResult: nil error or empty op")
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
-	aliasFail(w, routeWrite, http.StatusInternalServerError, internalErrorMsg)
-}
+// no v1 twin to re-dispatch to. Auth is per-repo repo:write. Failures use
+// the v1 handlers' problem bodies (upstream documents ProblemDetails for
+// every git-credentials failure), and the success bodies match the v1
+// PUT/DELETE exactly.
 
 // gcredByPath resolves the {repo_name} and {git_credential_id} path values:
 // the name must resolve in the token's org AND match the token's repo claim
 // (aliasHandler's 404-on-mismatch rule, so foreign tokens cannot probe name
 // existence), and the credential must exist and be attached to that repo
 // (404 otherwise — no cross-repo existence oracle). false = a failure
-// envelope was already written.
+// body was already written.
 func (s *syncServer) gcredByPath(w http.ResponseWriter, r *http.Request) (upsync.Credential, bool) {
 	assertf(s != nil && s.store != nil && s.creds != nil, "gcredByPath: nil syncServer deps")
 	name := r.PathValue("repo_name")
@@ -323,26 +315,26 @@ func (s *syncServer) gcredByPath(w http.ResponseWriter, r *http.Request) (upsync
 	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, name)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		aliasFail(w, routeWrite, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return upsync.Credential{}, false
 	case err != nil:
-		s.internalErrResult(w, r, "resolve credential repo name", err)
+		s.internalErr(w, r, "resolve credential repo name", err)
 		return upsync.Credential{}, false
 	}
 
-	// requireAuthWrite(orgLevel=false) guarantees a non-empty, non-"org"
+	// requireAuth(orgLevel=false) guarantees a non-empty, non-"org"
 	// repo claim; it may carry the repo url or the repo_id (docs/reference/authentication.md).
 	claimRepo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		aliasFail(w, routeWrite, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return upsync.Credential{}, false
 	case err != nil:
-		s.internalErrResult(w, r, "resolve credential repo claim", err)
+		s.internalErr(w, r, "resolve credential repo claim", err)
 		return upsync.Credential{}, false
 	}
 	if claimRepo.RepoID != repo.RepoID {
-		aliasFail(w, routeWrite, http.StatusNotFound, "repository not found")
+		writeRepoNotFound(w)
 		return upsync.Credential{}, false
 	}
 
@@ -352,15 +344,15 @@ func (s *syncServer) gcredByPath(w http.ResponseWriter, r *http.Request) (upsync
 	cred, err := s.creds.CredentialMeta(r.Context(), credID)
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
-		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return upsync.Credential{}, false
 	case err != nil:
-		s.internalErrResult(w, r, "load credential", err)
+		s.internalErr(w, r, "load credential", err)
 		return upsync.Credential{}, false
 	}
 	if cred.RepoID != repo.RepoID {
 		// Another repo's credential answers exactly like a missing one.
-		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return upsync.Credential{}, false
 	}
 	return cred, true
@@ -383,33 +375,33 @@ func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		aliasFail(w, routeWrite, http.StatusBadRequest, "read request body: "+err.Error())
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
 		return
 	}
 	if len(body) == 0 {
-		aliasFail(w, routeWrite, http.StatusBadRequest, "request body is required")
+		writeErr(w, http.StatusBadRequest, "request body is required")
 		return
 	}
 	var req gcredPathUpdateRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		aliasFail(w, routeWrite, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}
 	if req.Password == "" {
-		aliasFail(w, routeWrite, http.StatusBadRequest, "password is required")
+		writeInvalidField(w, "password", "is required", "password is required")
 		return
 	}
 	updated, err := s.creds.UpdateCredential(r.Context(), cred.ID, req.Username, req.Password)
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
 		// Deleted between the path resolution and the update.
-		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return
 	case errors.Is(err, meta.ErrReservedSecret):
-		aliasFail(w, routeWrite, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
+		writeInvalidField(w, "password", "is a reserved value", "invalid password: "+meta.ErrReservedSecret.Error())
 		return
 	case err != nil:
-		s.internalErrResult(w, r, "update credential", err)
+		s.internalErr(w, r, "update credential", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -430,10 +422,10 @@ func (s *syncServer) handleDeleteCredentialByPath(w http.ResponseWriter, r *http
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
 		// Deleted between the path resolution and this delete.
-		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return
 	case err != nil:
-		s.internalErrResult(w, r, "delete credential", err)
+		s.internalErr(w, r, "delete credential", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

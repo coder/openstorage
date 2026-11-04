@@ -42,7 +42,7 @@ func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, 
 	assertf(verifier != nil, "registerSyncRoutes: nil verifier")
 	assertf(s != nil, "registerSyncRoutes: nil syncServer")
 	mux.Handle("POST /api/v1/repos/pull-upstream",
-		deprecated(rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handlePullUpstream)))))
+		deprecated(rl.limit()(requireAuth(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handlePullUpstream)))))
 	// push-upstream requires git:read ON TOP of git:write (Codex security
 	// round on #90): the forward exports every local head and tag to the
 	// upstream, so a write-only token could otherwise exfiltrate
@@ -50,9 +50,9 @@ func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, 
 	// loopback read token, so the caller's own read authority is the only
 	// gate. requireAuth demands ALL listed scopes.
 	mux.Handle("POST /api/v1/repos/push-upstream",
-		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitWrite, auth.ScopeGitRead)(http.HandlerFunc(s.handlePushUpstream))))
+		rl.limit()(requireAuth(verifier, org, false, auth.ScopeGitWrite, auth.ScopeGitRead)(http.HandlerFunc(s.handlePushUpstream))))
 	mux.Handle("DELETE /api/v1/repos/base",
-		deprecated(rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDetachBase)))))
+		deprecated(rl.limit()(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDetachBase)))))
 }
 
 // deprecationHeader is the RFC 9745 Deprecation value (a structured-field

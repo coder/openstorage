@@ -150,7 +150,6 @@ branch-protection mechanism; there is no server-side protection config.
 
 Error body: `{"error": "<message>"}` plus the problem-details fields described under
 [HTTP API conventions](http-api.md#conventions) (`type`, `title`, `status`, a generic
-`code` such as `unauthorized` or `forbidden`, and `detail`). Ref-moving write endpoints
-answer with the `result` envelope instead
-([streaming protocols](../explanation/streaming-commit-protocols.md)). Clients branch on
-status codes (or `code` where present), not messages.
+`code` such as `unauthorized` or `forbidden`, and `detail`), on every route, the
+ref-moving write endpoints included. Clients branch on status codes (or `code`), not
+messages.

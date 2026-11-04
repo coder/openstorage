@@ -41,9 +41,7 @@ type webhooksAPI struct {
 
 // RegisterWebhookRoutes mounts the webhook CRUD routes on mux. All three
 // routes are org-level (docs/reference/authentication.md: `repo` claim == "org") and require
-// repo:write, with the plain {"error"} envelope on failures — these are
-// management routes, not docs/explanation/streaming-commit-protocols.md ref-write routes, so requireAuth (not
-// requireAuthWrite) is correct.
+// repo:write, with the plain {"error"} envelope on failures.
 func RegisterWebhookRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, store events.WebhookStore, guard events.TargetGuard, logger *slog.Logger, rl *rateLimiter) {
 	assertf(mux != nil, "RegisterWebhookRoutes: nil mux")
 	assertf(verifier != nil, "RegisterWebhookRoutes: nil verifier")
@@ -53,7 +51,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, verifier auth.Verifier, org strin
 	}
 	h := &webhooksAPI{store: store, guard: guard, logger: logger}
 	route := func(pattern string, hf http.HandlerFunc) {
-		mux.Handle(pattern, rl.limit(routeRead)(requireAuth(verifier, org, true, auth.ScopeRepoWrite)(hf)))
+		mux.Handle(pattern, rl.limit()(requireAuth(verifier, org, true, auth.ScopeRepoWrite)(hf)))
 	}
 	route("POST /api/v1/webhooks", h.handleCreate)
 	route("GET /api/v1/webhooks", h.handleList)

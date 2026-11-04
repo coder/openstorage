@@ -19,7 +19,7 @@ import (
 func registerRepoURLRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerRepoURLRoutes: nil dependency")
 	mux.Handle("GET /api/repo-urls/{repo_id}",
-		rl.limit(routeRead)(requireAuth(verifier, org, true, auth.ScopeOrgRead)(http.HandlerFunc(s.handleGetRepoURL))))
+		rl.limit()(requireAuth(verifier, org, true, auth.ScopeOrgRead)(http.HandlerFunc(s.handleGetRepoURL))))
 }
 
 // repoURLResponse is the get_repo_url_by_id 200 shape (openapi.yaml).

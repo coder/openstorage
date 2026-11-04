@@ -62,20 +62,6 @@ type RateLimitConfig struct {
 	TrustedProxies []netip.Prefix
 }
 
-// routeFlavor selects the 429 body shape, matching the existing envelope
-// split of the route's auth middleware.
-type routeFlavor int
-
-const (
-	// routeRead: routes registered with requireAuth answer 429 with the
-	// plain {"error": ...} envelope.
-	routeRead routeFlavor = iota
-	// routeWrite: routes registered with requireAuthWrite answer 429 with
-	// the docs/explanation/streaming-commit-protocols.md §3 result envelope ({"result": {success: false, status:
-	// "unavailable", ...}}, docs/reference/http-api.md status mapping).
-	routeWrite
-)
-
 // sweepInterval is how often the bucket map drops stale (fully refilled)
 // entries. Eviction is behavior-neutral: a dropped bucket is recreated full,
 // exactly what refilling it to burst would have produced.
@@ -166,11 +152,9 @@ func rateLimitExempt(ctx context.Context) context.Context {
 	return context.WithValue(ctx, rlExemptKey{}, true)
 }
 
-// limit returns the pre-auth middleware for one REST route; flavor picks the
-// 429 envelope shape and must match the route's auth-failure envelope.
-// 429 responses carry the Retry-After + RateLimit header pair.
-func (l *rateLimiter) limit(flavor routeFlavor) middleware {
-	assertf(flavor == routeRead || flavor == routeWrite, "limit: unknown flavor %d", flavor)
+// limit returns the pre-auth middleware for one REST route. Its 429 is the
+// plain problem body, with the Retry-After + RateLimit header pair.
+func (l *rateLimiter) limit() middleware {
 	if l == nil {
 		return func(next http.Handler) http.Handler { return next }
 	}
@@ -183,16 +167,7 @@ func (l *rateLimiter) limit(flavor routeFlavor) middleware {
 			ok, retryAfter := l.admit(l.clientKey(r))
 			if !ok {
 				rateLimited(w, retryAfter)
-				const msg = "rate limit exceeded"
-				if flavor == routeRead {
-					writeErr(w, http.StatusTooManyRequests, msg)
-					return
-				}
-				writeJSON(w, http.StatusTooManyRequests, map[string]any{"result": map[string]any{
-					"success": false,
-					"status":  statusForHTTP(http.StatusTooManyRequests),
-					"message": msg,
-				}})
+				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
 				return
 			}
 			next.ServeHTTP(w, r)
