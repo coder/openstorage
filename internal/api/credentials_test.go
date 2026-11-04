@@ -62,6 +62,13 @@ func TestCredentialCreate(t *testing.T) {
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("unknown repo: status %d, want 404", resp.StatusCode)
 		}
+		// A body repo_id equal to the org sentinel names no repository: 404,
+		// never the handler's repo-claim assertion (a 500).
+		resp, orgBody := s.req(t, http.MethodPost, "/api/v1/repos/git-credentials", repoToken,
+			[]byte(`{"repo_id":"org","password":"p"}`))
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("repo_id org: status %d, want 404: %s", resp.StatusCode, orgBody)
+		}
 
 		// Claim/target mismatch -> 403: token scoped to another repo.
 		otherURL := "team/other-" + randomHex(t, 4)

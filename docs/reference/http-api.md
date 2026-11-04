@@ -141,7 +141,7 @@ about the endpoint's rollout status on upstream clusters.
 | Method & path | Scope | Notes |
 |---|---|---|
 | `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 200 = the name holds a finished repo the request matches; 409 = another live repo holds the name; 404 = a deleted repo holds the name; 503 = a create of the name is not finished (below). |
-| `GET /repos` | org:read (repo="org") | Query `cursor, limit, q, prefix`. `q` is a case-insensitive substring of repo `url`, and `prefix` a case-insensitive start of it, both trimmed (empty = no filter). With `prefix` set, `q` matches only the rest of `url` after the prefix: `prefix=pierre/&q=sdk` returns `pierre/sdk-documentation`, not `pierre/example`. → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
+| `GET /repos` | org:read (repo="org" or no repo) | Query `cursor, limit, q, prefix`. `q` is a case-insensitive substring of repo `url`, and `prefix` a case-insensitive start of it, both trimmed (empty = no filter). With `prefix` set, `q` matches only the rest of `url` after the prefix: `prefix=pierre/&q=sdk` returns `pierre/sdk-documentation`, not `pierre/example`. → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
@@ -266,8 +266,8 @@ the same scopes, query parameters and responses.
 | Method & path | Scope | Body → Response |
 |---|---|---|
 | `POST /repos/git-credentials` | repo:write (repo=repoId) | `{repo_id, password, username?}` → `{id}`; 409 = exists |
-| `PUT /repos/git-credentials` | repo:write (repo="org") | `{id, password, username?}` → `{id, created_at}`; 404 |
-| `DELETE /repos/git-credentials` | repo:write (repo="org") | `{id}` → 200/204; 404 |
+| `PUT /repos/git-credentials` | repo:write (repo="org" or no repo) | `{id, password, username?}` → `{id, created_at}`; 404 |
+| `DELETE /repos/git-credentials` | repo:write (repo="org" or no repo) | `{id}` → 200/204; 404 |
 
 `username` is optional on create and update, on these routes and on the path-style
 `/repos/{repo_name}/git-credentials` routes. Only `password` is required. The server
