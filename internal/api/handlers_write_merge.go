@@ -117,9 +117,11 @@ type wmMergeResponse struct {
 }
 
 // wmConflictBody is upstream's MergeConflict, the 409 application/json body
-// for file conflicts (conflict_type merge_conflict) and for a target that
-// moved during the merge (target_moved). Every other merge failure is a
-// plain problem body, as upstream documents (#352 item 3).
+// for file conflicts (conflict_type merge_conflict). Upstream also sends it
+// when an automatic stale-target retry fails (target_moved, repo_changed).
+// open.storage has no such retry, so a target that moved is "any other
+// conflict": a plain problem body, like every other merge failure (#352
+// item 3).
 type wmConflictBody struct {
 	Error         string   `json:"error"`
 	ConflictType  string   `json:"conflict_type"`
@@ -127,16 +129,12 @@ type wmConflictBody struct {
 	MergeBaseSHA  string   `json:"merge_base_sha,omitempty"`
 }
 
-// wmFailConflict writes the 409 MergeConflict body. Only file conflicts
-// carry paths.
-func wmFailConflict(w http.ResponseWriter, conflictType, msg string, conflictPaths []string, mergeBase string) {
-	assertf(msg != "", "wmFailConflict: empty message")
-	assertf(conflictType == "merge_conflict" && len(conflictPaths) > 0 ||
-		conflictType == "target_moved" && len(conflictPaths) == 0 && mergeBase == "",
-		"wmFailConflict: conflict_type %q with %d paths", conflictType, len(conflictPaths))
+// wmFailConflict writes the 409 MergeConflict body for file conflicts.
+func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, mergeBase string) {
+	assertf(msg != "" && len(conflictPaths) > 0, "wmFailConflict: message %q with %d paths", msg, len(conflictPaths))
 	writeJSON(w, http.StatusConflict, wmConflictBody{
 		Error:         msg,
-		ConflictType:  conflictType,
+		ConflictType:  "merge_conflict",
 		ConflictPaths: conflictPaths,
 		MergeBaseSHA:  mergeBase,
 	})
@@ -686,7 +684,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !won {
-			wmFailConflict(w, "target_moved", "ref "+targetRef+" moved concurrently", nil, "")
+			writeErr(w, http.StatusConflict, "ref "+targetRef+" moved concurrently")
 			return
 		}
 		respond("fast_forward", sourceSHA, tree, sourceSHA, promoted)
@@ -714,13 +712,13 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		if hasBase {
 			mergeBase = base
 		}
-		wmFailConflict(w, "merge_conflict",
+		wmFailConflict(w,
 			fmt.Sprintf("merge of %s into %s has %d conflicting paths", req.SourceBranch, req.TargetBranch, len(mt.paths)),
 			mt.paths, mergeBase)
 		return
 	}
 	if req.Author == nil {
-		writeErr(w, http.StatusBadRequest, "author is required when the merge creates a commit")
+		writeInvalidField(w, "author", "is required", "author is required when the merge creates a commit")
 		return
 	}
 	committer := *req.Author
@@ -772,7 +770,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !won {
-		wmFailConflict(w, "target_moved", "ref "+targetRef+" moved concurrently", nil, "")
+		writeErr(w, http.StatusConflict, "ref "+targetRef+" moved concurrently")
 		return
 	}
 	respond(outcome, commit, mt.tree, commit, promoted)

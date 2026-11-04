@@ -329,9 +329,10 @@ func (s losingCAS) CASRef(ctx context.Context, repo, name, old, new string) (boo
 	return s.RefStore.CASRef(ctx, repo, name, old, new)
 }
 
-// TestLostCASBodies: a merge whose target moved answers upstream's 409
-// MergeConflict (conflict_type target_moved), and a note write whose
-// notes ref moved answers a plain 409 problem body (#352 item 3).
+// TestLostCASBodies: a merge whose target moved and a note write whose
+// notes ref moved answer a plain 409 problem body (#352 item 3). Upstream's
+// MergeConflict target_moved needs an automatic retry, which open.storage
+// does not do.
 func TestLostCASBodies(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := wmSeedFixture(t, e)
@@ -351,11 +352,15 @@ func TestLostCASBodies(t *testing.T) {
 			"merge commit": wmMergeBody("feature", "main", "merge", map[string]any{"author": wmTestAuthor}),
 		} {
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, body)
-			got := wmDecode(t, raw)
-			if keys := slices.Sorted(maps.Keys(got)); resp.StatusCode != http.StatusConflict ||
-				resp.Header.Get("Content-Type") != "application/json" || !slices.Equal(keys, []string{"conflict_type", "error"}) ||
-				got["conflict_type"] != "target_moved" || got["error"] != "ref refs/heads/main moved concurrently" {
-				t.Errorf("%s: %d %s, want 409 MergeConflict target_moved", name, resp.StatusCode, raw)
+			if resp.StatusCode != http.StatusConflict {
+				t.Errorf("%s: status %d %s, want 409", name, resp.StatusCode, raw)
+				continue
+			}
+			if msg := wmProblem(t, resp, raw); msg != "ref refs/heads/main moved concurrently" {
+				t.Errorf("%s: error = %q", name, msg)
+			}
+			if _, has := wmDecode(t, raw)["conflict_type"]; has {
+				t.Errorf("%s: problem body carries conflict_type: %s", name, raw)
 			}
 		}
 		if tip := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/main"]; tip != fx.c2 {
@@ -826,6 +831,9 @@ func TestMergeValidationAndAuth(t *testing.T) {
 			}
 			if msg := wmProblem(t, resp, raw); !strings.Contains(msg, "author") {
 				t.Fatalf("error = %q", msg)
+			}
+			if !strings.Contains(string(raw), `"invalid_params":[{"name":"author","reason":"is required"}]`) {
+				t.Fatalf("body %s does not name author in invalid_params", raw)
 			}
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/main"]; got != fx.c2 {
 				t.Fatalf("main moved to %q", got)
