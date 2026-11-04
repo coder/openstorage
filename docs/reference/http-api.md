@@ -144,6 +144,10 @@ about the endpoint's rollout status on upstream clusters.
 | `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). → 200 `{message: "repository detached"}`, also when the repo has no upstream. Deprecated upstream (2026-10-05) for `DELETE /api/repos/{repo_name}/upstream`, which runs the same handler; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header |
 | `DELETE /api/repos/{repo_name}/upstream` | repo:write | Path style only (spec 2026-10-05). Same handler and scope as `DELETE /repos/base`. → 200 `{message: "repository detached"}`. A repo without an upstream → 200 `{message: "repository already detached"}` (changelog 2026-10-07); the deprecated `base` routes keep `repository detached` in that case |
 
+`POST /repos` and `GET /repos` are also served at the canonical paths `POST /api/repos`
+and `GET /api/repos` (no `/v1`), which SDK 0.1.0 calls. They run the same handlers with
+the same scopes, query parameters and responses.
+
 **`POST /repos` body:**
 
 - The JWT `repo` claim always names the new repository. The optional `repo_name` (it can
@@ -464,6 +468,7 @@ Before that spec, both carried the full message.
 | `GET /repos/tag` | git:read | `name` (req) → `{tag: {name, sha}}` — one tag by exact short name, `sha` dereferenced to commit; 404 when absent |
 | `POST /repos/tags` | git:write | `{name, ref (deprecated alias target)}` → `{name, sha, message}` — lightweight only; name must not start with `refs/` |
 | `DELETE /repos/tags` | git:read+git:write | `{name}` → `{name, message}` — resolves stored ref for lightweight & annotated |
+| `DELETE /api/repos/{repo_name}/tags/{tag_name}` | git:read+git:write | Path style only (the form SDK 0.1.0 calls). Same handler, scopes and responses as `DELETE /repos/tags`, with the tag name from the path (a `/` in it is sent as `%2F`). A request body is not read |
 
 ### Notes
 

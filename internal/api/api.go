@@ -186,10 +186,17 @@ func New(cfg Config) (http.Handler, error) {
 	// specs dispatch to the synchronous fork (handlers_fork.go); everything
 	// else falls back to the sync-aware creator (which embeds the frozen
 	// (*server).handleCreateRepo flow).
-	route("POST /api/v1/repos", false, s.forkAwareCreateRepo(cfg.Verifier, ss.handleCreateRepo), auth.ScopeRepoWrite)
+	// The canonical collection routes POST/GET /api/repos (the ones SDK
+	// 0.1.0 calls, issue #656) share the v1 handlers, scopes and org-level
+	// flags; they are direct registrations, not aliases, because they
+	// have no {repo_name} to resolve.
+	createRepo := s.forkAwareCreateRepo(cfg.Verifier, ss.handleCreateRepo)
+	route("POST /api/v1/repos", false, createRepo, auth.ScopeRepoWrite)
+	route("POST /api/repos", false, createRepo, auth.ScopeRepoWrite)
 	route("GET /api/v1/repo", false, s.handleGetRepo, auth.ScopeGitRead)
 	route("PATCH /api/v1/repo", false, s.handlePatchRepo, auth.ScopeRepoWrite)
 	route("GET /api/v1/repos", true, s.handleListRepos, auth.ScopeOrgRead)
+	route("GET /api/repos", true, s.handleListRepos, auth.ScopeOrgRead)
 	route("DELETE /api/v1/repos/delete", false, s.handleDeleteRepo, auth.ScopeRepoWrite)
 
 	// git:read surface (docs/archive/phases/07-implementation-roadmap.md p3, docs/reference/http-api.md; scope table docs/reference/authentication.md:56). Go's
