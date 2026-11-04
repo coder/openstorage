@@ -9,7 +9,7 @@ A user commits files to a branch without git: `POST /api/v1/repos/commit-pack` t
 - `cp-readback-git` shows the same commit and bytes in a fresh clone, with the old tip as its parent.
 - `cp-pack` stores one new pack file for the repo.
 - `cp-no-change` answers `412` `precondition_failed` with `no changes to commit` for a commit that changes nothing, and leaves the tip alone.
-- `cp-stale-guard` answers `412` `precondition_failed` for a stale `expected_target_sha`, and leaves the tip alone.
+- `cp-stale-guard` answers `409` `ref_guard_failed` for a stale `expected_target_sha`, with `current_sha` = the tip, and leaves the tip alone.
 - `cp-new-branch` creates `feature` from `main` with `base_branch` and deletes a path with `operation: "delete"`.
 - `cp-unborn` makes the first commit of an empty repo (`result.old_sha` is 40 zeros).
 
@@ -93,16 +93,18 @@ env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WOR
 "$OSV" eq "$RUN" cp-no-change-message 'no changes to commit' "$("$OSV" json "$OSV_EVIDENCE/cp-no-change.body" result.message)"
 ```
 
-- **Refuse a stale guard.** Send a commit whose `expected_target_sha` is `SEED`. The status is `412`, `result.status` is `precondition_failed`, and the tip is still `NEW`.
+- **Refuse a stale guard.** Send a commit whose `expected_target_sha` is `SEED`. The status is `409`, `code` is `ref_guard_failed`, `current_sha` is `NEW`, `result.status` is `conflict`, and the tip is still `NEW`.
 
 ```sh
 sed "s/@SEED@/$SEED/" >"$OSV_EVIDENCE/cp-stale.ndjson" <<'NDJSON'
 {"metadata":{"target_branch":"main","commit_message":"Stale","author":{"name":"Demo","email":"demo@example.com"},"expected_target_sha":"@SEED@","files":[{"path":"stale.txt","content_id":"s","operation":"upsert"}]}}
 {"blob_chunk":{"content_id":"s","data":"c3RhbGUK","eof":true}}
 NDJSON
-"$OSV" api "$RUN" cp-stale --token rw --expect 412 POST /api/v1/repos/commit-pack \
+"$OSV" api "$RUN" cp-stale --token rw --expect 409 POST /api/v1/repos/commit-pack \
   -H 'Content-Type: application/x-ndjson' --data-binary "@$OSV_EVIDENCE/cp-stale.ndjson"
-"$OSV" eq "$RUN" cp-stale-status precondition_failed "$("$OSV" json "$OSV_EVIDENCE/cp-stale.body" result.status)"
+"$OSV" eq "$RUN" cp-stale-code ref_guard_failed "$("$OSV" json "$OSV_EVIDENCE/cp-stale.body" code)"
+"$OSV" eq "$RUN" cp-stale-current "$NEW" "$("$OSV" json "$OSV_EVIDENCE/cp-stale.body" current_sha)"
+"$OSV" eq "$RUN" cp-stale-status conflict "$("$OSV" json "$OSV_EVIDENCE/cp-stale.body" result.status)"
 "$OSV" api "$RUN" cp-tip-final --token rw --expect 200 GET '/api/v1/repos/branch?name=main'
 "$OSV" eq "$RUN" cp-tip-unchanged "$NEW" "$("$OSV" json "$OSV_EVIDENCE/cp-tip-final.body" branch.head_sha)"
 ```
@@ -139,7 +141,7 @@ NDJSON
 - `data` is the base64 of the file bytes. `content_id` ties chunks to a `files` entry. An empty file sends one chunk, `{"data":"","eof":true}`. A `delete` sends no chunk.
 - `target_branch` is a short name. A `refs/` prefix is refused.
 - Write the frames with a quoted heredoc. An unquoted one lets the shell expand `$` inside the JSON.
-- A stale `expected_target_sha` (or the deprecated `expected_head_sha`) answers HTTP `412` with `result.status` `precondition_failed`. A `409` with `result.status` `failed` means a lost race with another writer, which this recipe cannot force.
+- A stale `expected_target_sha` (or the deprecated `expected_head_sha`) answers HTTP `409` with `code` `ref_guard_failed`, `guard`, `current_sha` and `result.status` `conflict`. A `409` with `result.status` `failed` and no `code` means a lost race with another writer, which this recipe cannot force.
 - Auth failures on commit-pack answer in the `result` envelope (`{"result":{"status":"forbidden",...}}`), not in the `{"error":...}` body of read endpoints.
 - Without `committer`, the committer is the author.
 - `list-packs` reads the blob store only. Run it with `env -i PATH="$PATH"` so an inherited `OPENSTORAGE_S3_URL` does not point it at another store.

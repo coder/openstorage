@@ -54,8 +54,11 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
    - `commit-pack`, `diff-commit`, `restore-commit`: `expected_head_sha` vs current branch tip.
    - `merge`: `expected_target_sha` vs target branch tip.
    - notes write/delete: `expected_ref_sha` vs notes ref tip.
-   - On mismatch: fail with HTTP 409/412 and a `result` object
-     `{success: false, status: "conflict"|"precondition_failed", branch, old_sha, new_sha}`.
+   - On mismatch: fail with HTTP 409, code `ref_guard_failed`, `guard` and `current_sha`.
+     The commit writes keep their `result` object
+     `{target_branch, branch, old_sha, new_sha: "", success: false, status: "conflict"}`
+     with `commit: null`, and the notes writes keep
+     the note envelope with `result.status` `conflict`.
      Clients (e.g. `just-code-storage` push) map this to git's "failed to push some refs"
      UX, so the shape is load-bearing.
 2. **Root-commit signaling.** For a first commit on an unborn branch, `result.old_sha` is
