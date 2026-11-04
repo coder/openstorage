@@ -605,7 +605,11 @@ func (s *server) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req wrefDeleteTagRequest
-	if !wrefDecodeBody(w, r, &req) {
+	if tag, ok := pathTag(r.Context()); ok {
+		// DELETE .../tags/{tag_name} has no request body in the spec: the
+		// path names the tag, and a body is not read.
+		req.Name = tag
+	} else if !wrefDecodeBody(w, r, &req) {
 		return
 	}
 	if !wrefValidBranchInput(req.Name) {
@@ -737,6 +741,21 @@ func wrefNotesRefName(raw string) (string, error) {
 		return "", fmt.Errorf("invalid notes ref name %q", raw)
 	}
 	return "refs/notes/" + raw, nil
+}
+
+// pathTagKey carries the {tag_name} segment of a request re-dispatched from
+// DELETE /api/repos/{repo_name}/tags/{tag_name} (alias.go). Only the alias
+// layer sets it; a direct /api/v1 request never carries it.
+type pathTagKey struct{}
+
+func withPathTag(ctx context.Context, tag string) context.Context {
+	assertf(tag != "", "withPathTag: empty tag name")
+	return context.WithValue(ctx, pathTagKey{}, tag)
+}
+
+func pathTag(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(pathTagKey{}).(string)
+	return v, ok
 }
 
 // noteAppendKey marks a request re-dispatched from POST
