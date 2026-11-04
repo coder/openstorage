@@ -112,42 +112,6 @@ func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScop
 	return requireAuthWith(verifier, org, orgLevel, writeProblem, requiredScopes...)
 }
 
-// authFailStatus maps the two auth-failure HTTP codes onto the docs/explanation/streaming-commit-protocols.md
-// result-envelope status strings.
-func authFailStatus(httpCode int) string {
-	switch httpCode {
-	case http.StatusUnauthorized:
-		return "unauthorized"
-	case http.StatusForbidden:
-		return "forbidden"
-	}
-	panic(fmt.Sprintf("api assertion failed: authFailStatus: unexpected code %d", httpCode))
-}
-
-// writeAuthEnvelope is the docs/explanation/streaming-commit-protocols.md §3 / ADR-26 failure writer for write
-// routes: auth failures carry the result envelope ({"result": {success,
-// status, message}}) instead of the plain {"error"} body, so SDKs can map
-// them onto typed RefUpdateErrors. 401 keeps WWW-Authenticate (RFC 9110).
-// The result envelope carries no problem `code` (issue #352 tier 3), so
-// the code argument is unused.
-func writeAuthEnvelope(w http.ResponseWriter, httpCode int, _ string, msg string) {
-	assertf(msg != "", "writeAuthEnvelope: empty message")
-	if httpCode == http.StatusUnauthorized {
-		w.Header().Set("WWW-Authenticate", "Bearer")
-	}
-	writeJSON(w, httpCode, map[string]any{"result": map[string]any{
-		"success": false,
-		"status":  authFailStatus(httpCode),
-		"message": msg,
-	}})
-}
-
-// requireAuthWrite is requireAuth with ADR-26 envelope-shaped 401/403
-// bodies; every docs/explanation/streaming-commit-protocols.md write route must use it.
-func requireAuthWrite(verifier auth.Verifier, org string, orgLevel bool, requiredScopes ...string) middleware {
-	return requireAuthWith(verifier, org, orgLevel, writeAuthEnvelope, requiredScopes...)
-}
-
 // authFailWriter writes one auth failure: HTTP status, problem code (the
 // generic code for the status, or a specific one), and message.
 type authFailWriter func(w http.ResponseWriter, status int, code, msg string)

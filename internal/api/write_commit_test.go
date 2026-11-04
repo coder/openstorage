@@ -53,7 +53,7 @@ func wctServer(t *testing.T, e *testEnv) *httptest.Server {
 	}
 	mux := http.NewServeMux()
 	registerWriteCommitRoutes(mux, s, auth.NewVerifier(e.store), "", nil)
-	srv := httptest.NewServer(recoverPanics(discardLogger())(mux))
+	srv := httptest.NewServer(withProblemInstance(recoverPanics(discardLogger())(mux)))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -567,7 +567,7 @@ func TestCommitPackValidation(t *testing.T) {
 
 		// ADR-26: auth failures on write routes carry the docs/explanation/streaming-commit-protocols.md result
 		// envelope (not the read-route {"error"} body).
-		t.Run("missing token is 401 with result envelope", func(t *testing.T) {
+		t.Run("missing token is 401 with a problem body", func(t *testing.T) {
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", "", bytes.NewReader(wctLines(t, wctMeta("main", "m", nil, nil))))
 			if resp.StatusCode != http.StatusUnauthorized {
 				t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -575,16 +575,16 @@ func TestCommitPackValidation(t *testing.T) {
 			if got := resp.Header.Get("WWW-Authenticate"); got != "Bearer" {
 				t.Fatalf("WWW-Authenticate = %q, want Bearer", got)
 			}
-			requireAuthResultEnvelope(t, body, "unauthorized")
+			requireEnvelope(t, resp, body)
 		})
 
-		t.Run("git:read scope is 403 with result envelope", func(t *testing.T) {
+		t.Run("git:read scope is 403 with a problem body", func(t *testing.T) {
 			_, _, readTok := wctRepo(t, e)
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", readTok, bytes.NewReader(wctLines(t, wctMeta("main", "m", nil, nil))))
 			if resp.StatusCode != http.StatusForbidden {
 				t.Fatalf("status = %d, want 403", resp.StatusCode)
 			}
-			requireAuthResultEnvelope(t, body, "forbidden")
+			requireEnvelope(t, resp, body)
 		})
 
 		t.Run("unknown repo is enveloped 404", func(t *testing.T) {
