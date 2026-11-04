@@ -74,8 +74,15 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `409` for file conflicts or a target that moved returns upstream's `MergeConflict`
   ([merge](#branches)), and the `409` for a stale guard on a commit write or a notes
   write keeps its `result` envelope and adds the problem members
-  ([commit writes](#commit-write-guards), [notes](#notes)). A merge `409` for a failed
-  guard (a stale `expected_target_sha`, or a source branch that no longer contains
+  ([commit writes](#commit-write-guards), [notes](#notes)). The commit-write `result` is
+  upstream's `RefUpdateResult`: it has every member that the schema requires, with empty
+  strings where there is no value: `target_branch`, the deprecated `branch` (the same
+  value), `old_sha`, `new_sha`, `success` and `status`. A failure envelope sends
+  `commit: null`, except a lost CAS on `commit-pack` and `diff-commit`. Before
+  [#665](https://github.com/coder/openstorage/issues/665), `result` had no
+  `target_branch`, most failures left out empty members, and failure envelopes sent no
+  `commit`. A merge `409` for a failed guard (a stale `expected_target_sha`, or a source
+  branch that no longer contains
   `expected_source_sha`) uses the error body above with code `ref_guard_failed`
   ([details](#merge-guards)).
 - **Throttling**: every `429` (the gateway [rate limiter](configuration.md#rate-limiting)

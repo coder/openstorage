@@ -130,7 +130,8 @@ Success (HTTP 200):
     "blob_count": 2            // commit-pack only
   },
   "result": {
-    "branch": "main",
+    "target_branch": "main",
+    "branch": "main",           // deprecated upstream, same value as target_branch
     "old_sha": "<40-hex or 40 zeros for root commit>",
     "new_sha": "<40-hex>",
     "success": true,
@@ -140,10 +141,33 @@ Success (HTTP 200):
 }
 ```
 
-Failure uses the same envelope with `result.success = false` and `result.status` one of
-`precondition_failed, conflict, not_found, invalid, timeout, unauthorized, forbidden,
-unavailable, internal, failed`. SDKs map these strings (or the numeric HTTP status) to
-typed `RefUpdateError`s with this table:
+`result` is upstream's `RefUpdateResult`. Every `result` object sends `target_branch`,
+`branch`, `old_sha`, `new_sha`, `success` and `status`. A member with no value is an
+empty string.
+
+A failure envelope (on the statuses listed at the end of this section) has the same
+shape, with `commit: null` (except a lost CAS, below), `result.success = false` and
+`result.status` one of `precondition_failed, conflict, not_found, invalid, timeout,
+unauthorized, forbidden, unavailable, payload_too_large, internal, failed`. For example, a
+frame that is not a metadata frame answers 400:
+
+```json
+{
+  "commit": null,
+  "result": {
+    "target_branch": "",
+    "branch": "",
+    "old_sha": "",
+    "new_sha": "",
+    "success": false,
+    "status": "invalid",
+    "message": "first frame must be a metadata frame"
+  }
+}
+```
+
+SDKs map these strings (or the numeric HTTP status) to typed `RefUpdateError`s with this
+table:
 
 | HTTP | status string |
 |---|---|
@@ -154,6 +178,7 @@ typed `RefUpdateError`s with this table:
 | 408, 499, 504 | `timeout` |
 | 409 | `conflict`; `failed` for a lost CAS on `commit-pack` and `diff-commit` (below) |
 | 412 | `precondition_failed` |
+| 413 | `payload_too_large` (`commit-pack`) |
 | 429, 502, 503 | `unavailable` |
 | 500 | `internal` |
 

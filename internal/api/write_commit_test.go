@@ -154,15 +154,46 @@ func wctDecode(t *testing.T, body []byte) wcEnvelope {
 	return env
 }
 
+// wctRequireRefUpdate asserts the raw members of a commit-write envelope
+// (#665): `commit` is present (null on a failure other than a lost CAS),
+// and `result` has every member RefUpdateResult requires, no member it
+// lacks, and a target_branch equal to the deprecated branch.
+func wctRequireRefUpdate(t *testing.T, body []byte) {
+	t.Helper()
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode envelope %q: %v", body, err)
+	}
+	commit, hasCommit := env["commit"]
+	var res map[string]any
+	if err := json.Unmarshal(env["result"], &res); err != nil {
+		t.Fatalf("decode result of %s: %v", body, err)
+	}
+	if !hasCommit || (res["status"] != "ok" && res["status"] != "failed") != (string(commit) == "null") {
+		t.Fatalf("commit = %s (present %v), want an object on success and on a lost CAS, else null (body %s)", commit, hasCommit, body)
+	}
+	keys := slices.DeleteFunc(slices.Sorted(maps.Keys(res)), func(k string) bool { return k == "message" })
+	if !slices.Equal(keys, refUpdateRequired) {
+		t.Fatalf("result members = %v (and message), want RefUpdateResult's %v (body %s)", keys, refUpdateRequired, body)
+	}
+	if res["target_branch"] != res["branch"] {
+		t.Fatalf("target_branch %v != branch %v (body %s)", res["target_branch"], res["branch"], body)
+	}
+}
+
 // wctRequireOK asserts a 200 success envelope and returns it.
 func wctRequireOK(t *testing.T, resp *http.Response, body []byte) wcEnvelope {
 	t.Helper()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
 	}
+	wctRequireRefUpdate(t, body)
 	env := wctDecode(t, body)
 	if env.Commit == nil || !env.Result.Success || env.Result.Status != "ok" {
 		t.Fatalf("success envelope = %s", body)
+	}
+	if env.Result.TargetBranch == "" || env.Result.TargetBranch != env.Commit.TargetBranch {
+		t.Fatalf("result.target_branch %q, want commit.target_branch %q", env.Result.TargetBranch, env.Commit.TargetBranch)
 	}
 	if !ref.ValidSHA(env.Commit.CommitSHA) || !ref.ValidSHA(env.Commit.TreeSHA) {
 		t.Fatalf("malformed shas in envelope %s", body)
@@ -178,8 +209,9 @@ func wctRequireOK(t *testing.T, resp *http.Response, body []byte) wcEnvelope {
 
 // wctRequireFail asserts a failed commit write with the given HTTP/status
 // pair. Where upstream documents the docs/explanation/streaming-commit-protocols.md failure envelope for the
-// route and status (upstreamEnvelopeStatuses), it asserts that envelope and
-// returns it. Otherwise it asserts the plain problem body with no `result`
+// route and status (upstreamEnvelopeStatuses), it asserts that envelope,
+// with every RefUpdateResult member (wctRequireRefUpdate), and returns it.
+// Otherwise it asserts the plain problem body with no `result`
 // and returns the zero envelope.
 func wctRequireFail(t *testing.T, resp *http.Response, body []byte, wantCode int, wantStatus string) wcEnvelope {
 	t.Helper()
@@ -197,6 +229,7 @@ func wctRequireFail(t *testing.T, resp *http.Response, body []byte, wantCode int
 		}
 		return wcEnvelope{}
 	}
+	wctRequireRefUpdate(t, body)
 	env := wctDecode(t, body)
 	if env.Result.Success || env.Result.Status != wantStatus {
 		t.Fatalf("failure envelope = %s, want status %q", body, wantStatus)

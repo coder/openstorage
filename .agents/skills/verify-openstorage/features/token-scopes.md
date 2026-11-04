@@ -8,7 +8,7 @@ Every REST and Git request carries a JWT that the organization signed with its o
 - `auth-malformed` answers `401` `invalid token` for a value that is not a JWT.
 - `auth-wrong-key` answers `401` for a token signed by a key that the server does not hold.
 - `auth-expired` answers `401` for a token past its `exp`.
-- `auth-scope-write` refuses writes for a `git:read` token: commit-pack `403` (result envelope), repo create `403` `insufficient_scope`, and git push `403`.
+- `auth-scope-write` refuses writes for a `git:read` token: commit-pack `403` `insufficient_scope`, repo create `403` `insufficient_scope`, and git push `403`.
 - `auth-scope-read` refuses reads for a `git:write` token without `git:read`.
 - `auth-scope-org` refuses `GET /api/v1/repos` for a repo token (`403` `missing required scope org:read`).
 - `auth-repo-mismatch` refuses a token for repo `other` on `demo`: Git `403` `jwt repo claim mismatch`, path-style REST `404` `repository_not_found`.
@@ -68,7 +68,7 @@ sleep 3
 "$OSV" api "$RUN" auth-expired --token short --expect 401 GET /api/v1/repo
 ```
 
-- **Write with a read-only token.** Try commit-pack, repo create, and git push with `ro`. commit-pack answers `403` with `result.status` `forbidden`. Create answers `403` with `code` `insufficient_scope`. git push exits `128` with `The requested URL returned error: 403`. The `main` tip is still `SEED`.
+- **Write with a read-only token.** Try commit-pack, repo create, and git push with `ro`. commit-pack answers `403` with `code` `insufficient_scope`. Create answers `403` with `code` `insufficient_scope`. git push exits `128` with `The requested URL returned error: 403`. The `main` tip is still `SEED`.
 
 ```sh
 cat >"$OSV_EVIDENCE/auth-ro.ndjson" <<'NDJSON'
@@ -77,7 +77,7 @@ cat >"$OSV_EVIDENCE/auth-ro.ndjson" <<'NDJSON'
 NDJSON
 "$OSV" api "$RUN" auth-ro-commit --token ro --expect 403 POST /api/v1/repos/commit-pack \
   -H 'Content-Type: application/x-ndjson' --data-binary "@$OSV_EVIDENCE/auth-ro.ndjson"
-"$OSV" eq "$RUN" auth-ro-commit-status forbidden "$("$OSV" json "$OSV_EVIDENCE/auth-ro-commit.body" result.status)"
+"$OSV" eq "$RUN" auth-ro-commit-code insufficient_scope "$("$OSV" json "$OSV_EVIDENCE/auth-ro-commit.body" code)"
 "$OSV" api "$RUN" auth-ro-create --token ro --expect 403 POST /api/v1/repos -d '{}'
 "$OSV" eq "$RUN" auth-ro-create-code insufficient_scope "$("$OSV" json "$OSV_EVIDENCE/auth-ro-create.body" code)"
 printf 'denied\n' >"$OSV_WORK/seed/denied.txt"
@@ -120,7 +120,7 @@ printf 'denied\n' >"$OSV_WORK/seed/denied.txt"
 - `--token none` on `osv.sh git` never sends credentials: git stops at `could not read Username ... terminal prompts disabled` (exit `128`) and the server sees no authenticated request. Prove the server's `401` with `osv.sh api --token none` on `/demo.git/info/refs?service=git-upload-pack`.
 - git reports a `401` as `Authentication failed` and a `403` as `The requested URL returned error: 403`. Both exit `128`.
 - For `/api/v1/...` the repo comes from the token, so a token for another repo reads that repo, or gets `404` `repository_not_found` when it does not exist. A mismatch is only visible on Git URLs and `/api/repos/{repo_name}/...` aliases.
-- Write endpoints that move refs (commit-pack, merge, branch and tag writes) answer auth failures in the `result` envelope. Read endpoints use `{"error": ..., "code": ...}`.
+- Every endpoint answers auth failures with the problem body (`{"error": ..., "code": ...}`), write endpoints that move refs included. Only some failures inside the commit-pack, diff-commit and restore-commit handlers, and the notes stale-guard 409, use a `result` envelope.
 - The Git surface wants Basic auth with user `t`. `osv.sh api` sends Basic on every non-`/api` path. A Bearer header there answers `401` `basic auth with username 't' required`.
 - `mint` refuses a zero or negative `--ttl`. Mint a short one and wait for it to expire.
 - The REST `401` messages are generic (`invalid token`). The Git surface answers with more detail, for example `jwt must be a compact JWS (header.payload.signature)`. Branch on status codes, not messages.
