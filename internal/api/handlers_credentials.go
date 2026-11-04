@@ -147,8 +147,8 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 	repoKey := req.RepoID
 	if repoKey == "" {
 		repoKey = claims.Repo
+		assertf(repoKey != "" && repoKey != auth.RepoClaimOrg, "handleCreateCredential: unusable repo claim %q", repoKey)
 	}
-	assertf(repoKey != "" && repoKey != auth.RepoClaimOrg, "handleCreateCredential: unusable repo key %q", repoKey)
 	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, repoKey)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
