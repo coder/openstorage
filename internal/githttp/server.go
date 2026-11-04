@@ -194,7 +194,7 @@ var lfsMaxRepoStagingOps = 32
 // pool's FREE capacity (Codex round 37, security): the fixed shares above
 // still summed to the global cap, so an actor holding git:write tokens
 // for just 8 repositories — the wire carries no finer caller identity;
-// auth.SubjectLiteral is one literal for every vendor SDK — could park
+// `sub` is free text that any token signer picks — could park
 // 8 × 32 bodyless PUTs and starve the node. Each new slot must fit
 // min(lfsMaxRepoStagingOps, max(1, free/lfsRepoStagingShareDiv)), so
 // allowances shrink as the pool fills: a k-repo coalition equilibrates

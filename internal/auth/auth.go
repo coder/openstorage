@@ -19,11 +19,14 @@ import (
 	"slices"
 )
 
-// SubjectLiteral is the fixed `sub` claim used by all vendor SDKs (docs/reference/authentication.md).
+// SubjectLiteral is the `sub` claim that open.storage mints and that SDK
+// 1.17.1 (@pierre/storage) sends. Verification accepts any non-empty `sub`
+// (docs/reference/authentication.md): SDK 0.1.0 sends pierre-sdk-go,
+// pierre-sdk-python or pierre-sdk-typescript.
 const SubjectLiteral = "@pierre/storage"
 
 // RepoClaimOrg is the sentinel `repo` claim value for org-level operations
-// (GET /repos).
+// (GET /repos). Verify also gives it to a token without a `repo` claim.
 const RepoClaimOrg = "org"
 
 // Scopes (docs/reference/authentication.md scope table). Matching is exact: no scope implies another.
@@ -64,8 +67,9 @@ func (c *Claims) HasScope(scope string) bool {
 
 // Verifier authenticates a compact JWT. Implementations must verify the
 // signature against the issuing org's registered public keys (per
-// AllowedAlgorithms), require `exp` in the future and `sub` ==
-// SubjectLiteral, and resolve the org from the `iss` claim.
+// AllowedAlgorithms), require `exp` in the future and a non-empty `sub`,
+// resolve the org from the `iss` claim, and return Repo == RepoClaimOrg for
+// a token without a `repo` claim.
 //
 // Any failure — malformed token, bad signature, disallowed algorithm,
 // expired, unknown issuer — returns a non-nil error and maps to 401.

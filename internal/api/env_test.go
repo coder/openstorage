@@ -322,17 +322,18 @@ func (e *testEnv) newOrg(t *testing.T) string {
 }
 
 // tokenSpec describes one JWT to mint. Zero values pick the happy-path
-// defaults (ES256, registered key, fixed sub literal, exp in one hour).
+// defaults (ES256, registered key, auth.SubjectLiteral, exp in one hour).
 type tokenSpec struct {
 	alg    string // default "ES256"
 	iss    string
 	sub    string // default auth.SubjectLiteral
 	repo   string
 	scopes []string
-	refs   string        // raw `refs` claim JSON (docs/reference/authentication.md policy tuples); "" omits
-	ops    []string      // deprecated repo-wide `ops` claim; nil omits
-	expIn  time.Duration // default 1h; negative mints an expired token
-	key    any           // signing key override (default: env key for alg)
+	refs   string         // raw `refs` claim JSON (docs/reference/authentication.md policy tuples); "" omits
+	ops    []string       // deprecated repo-wide `ops` claim; nil omits
+	expIn  time.Duration  // default 1h; negative mints an expired token
+	key    any            // signing key override (default: env key for alg)
+	claims map[string]any // set last over the claims above; a nil value omits the claim
 }
 
 // signingKey returns the environment's private key for alg.
@@ -386,6 +387,13 @@ func (e *testEnv) mint(t *testing.T, spec tokenSpec) string {
 	}
 	if spec.ops != nil {
 		claims["ops"] = spec.ops
+	}
+	for name, v := range spec.claims {
+		if v == nil {
+			delete(claims, name)
+			continue
+		}
+		claims[name] = v
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {

@@ -18,6 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jws"
+
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/meta"
 )
@@ -105,6 +108,18 @@ func TestAuthenticate_FailureMapping(t *testing.T) {
 		{"repo claim mismatch", "t", mintUnitToken(t, orgKey, "ES256", unitClaims("org1", "otherrepo", auth.ScopeGitRead)),
 			auth.ScopeGitRead, http.StatusForbidden},
 		{"missing scope", "t", okToken, auth.ScopeGitWrite, http.StatusForbidden},
+		// `sub` is free text (issue #658): an SDK 0.1.0 subject passes, an
+		// empty one does not.
+		{"sdk subject", "t", mintUnitToken(t, orgKey, "ES256", func() auth.Claims {
+			c := unitClaims("org1", repo, auth.ScopeGitRead)
+			c.Sub = "pierre-sdk-typescript"
+			return c
+		}()), auth.ScopeGitRead, 0},
+		{"empty subject", "t", mintUnitToken(t, orgKey, "ES256", func() auth.Claims {
+			c := unitClaims("org1", repo, auth.ScopeGitRead)
+			c.Sub = ""
+			return c
+		}()), auth.ScopeGitRead, http.StatusUnauthorized},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -125,17 +140,34 @@ func TestAuthenticate_FailureMapping(t *testing.T) {
 	}
 }
 
-// A token with the org-level sentinel (or an empty) `repo` claim must never
-// pass the git repo gate — not even for a repo literally named "org", which
-// would otherwise satisfy the verbatim claim/target compare.
+// A token with the org-level sentinel (or an empty, or no) `repo` claim must
+// never pass the git repo gate — not even for a repo literally named "org",
+// which would otherwise satisfy the verbatim claim/target compare.
 func TestAuthenticate_RejectsNonRepoScopedClaims(t *testing.T) {
 	key, pemBlock := genKeyPEM(t, "ES256")
 	srv := &Server{Verifier: auth.NewVerifier(memKeys{"org1": {pemBlock}}), Org: "org1"}
+	tokens := map[string]string{}
 	for _, claim := range []string{auth.RepoClaimOrg, ""} {
-		token := mintUnitToken(t, key, "ES256", unitClaims("org1", claim, auth.ScopeGitRead))
+		tokens["repo "+claim] = mintUnitToken(t, key, "ES256", unitClaims("org1", claim, auth.ScopeGitRead))
+	}
+	// SDK 0.1.0 omits `repo` for org-wide tokens (issue #658).
+	now := time.Now()
+	payload, err := json.Marshal(map[string]any{
+		"iss": "org1", "sub": "pierre-sdk-go", "scopes": []string{auth.ScopeGitRead},
+		"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens["no repo claim"] = string(signed)
+	for name, token := range tokens {
 		_, status, err := srv.authenticate(authReq("/org.git/info/refs", "t", token), "org", auth.ScopeGitRead)
 		if err == nil || status != http.StatusForbidden {
-			t.Fatalf("repo claim %q: status = %d, err = %v; want 403", claim, status, err)
+			t.Fatalf("%s: status = %d, err = %v; want 403", name, status, err)
 		}
 	}
 }

@@ -144,7 +144,8 @@ func (s unionKeySource) PublicKeysForOrg(ctx context.Context, name string) ([]st
 
 // Verify authenticates a compact JWT per the Verifier contract: allowed
 // algorithm, valid signature for one of the issuer's registered keys,
-// `exp` in the future, `sub` == SubjectLiteral. Any failure maps to 401.
+// `exp` in the future, a non-empty `sub`. Any failure maps to 401. A token
+// without a `repo` claim verifies with Repo == RepoClaimOrg.
 func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, error) {
 	// Bearer tokens are compact JWS only; rejecting other serializations up
 	// front keeps the single-signature/protected-header assumptions below.
@@ -228,6 +229,20 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return nil, fmt.Errorf("jwt claims: %w", err)
 	}
+	// A token without a `repo` claim is org-wide ("omit for org-wide
+	// tokens", docs/upstream/getting-started/authentication.md), so it gets
+	// RepoClaimOrg and every caller's org/repo gate treats it exactly like
+	// `repo: "org"`. A present `""` or null stays "" and is refused by both
+	// gates. The second decode uses the same struct-tag key matching as the
+	// first, so "present" means the key that filled c.Repo.
+	var repo struct {
+		Repo json.RawMessage `json:"repo"`
+	}
+	err = json.Unmarshal(payload, &repo)
+	assertf(err == nil, "claims decoded but the repo presence decode failed: %v", err)
+	if repo.Repo == nil {
+		c.Repo = RepoClaimOrg
+	}
 	if err := validateClaims(&c); err != nil {
 		return nil, err
 	}
@@ -235,15 +250,18 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 }
 
 // validateClaims enforces the claim requirements from the Verifier contract:
-// `exp` in the future (a missing exp unmarshals to 0 and fails too) and the
-// fixed `sub` literal. `iat` is carried but intentionally not validated —
-// docs/reference/authentication.md imposes no requirement on it and clock skew would break SDKs.
+// `exp` in the future (a missing exp unmarshals to 0 and fails too) and a
+// non-empty `sub`. `sub` is caller-chosen free text ("Agent identity (for
+// logging)", docs/upstream/getting-started/authentication.md), so any
+// non-empty value passes and nothing may treat it as an identity. `iat` is
+// carried but intentionally not validated — docs/reference/authentication.md
+// imposes no requirement on it and clock skew would break SDKs.
 func validateClaims(c *Claims) error {
 	if c.Exp <= time.Now().Unix() {
 		return errors.New("jwt expired")
 	}
-	if c.Sub != SubjectLiteral {
-		return fmt.Errorf("jwt sub %q != %q", c.Sub, SubjectLiteral)
+	if c.Sub == "" {
+		return errors.New("jwt missing sub claim")
 	}
 	return nil
 }

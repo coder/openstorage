@@ -775,8 +775,13 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 				wantStatus: http.StatusUnauthorized,
 			},
 			{
-				name:       "wrong sub literal",
-				token:      e.mint(t, tokenSpec{iss: org, sub: "someone-else", repo: claim, scopes: goodScopes}),
+				name:       "empty sub",
+				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, claims: map[string]any{"sub": ""}}),
+				wantStatus: http.StatusUnauthorized,
+			},
+			{
+				name:       "missing sub",
+				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, claims: map[string]any{"sub": nil}}),
 				wantStatus: http.StatusUnauthorized,
 			},
 			{

@@ -4393,7 +4393,7 @@ func TestLFSStaging_RepoSlotShareIsolatesRepos(t *testing.T) {
 
 // TestLFSStaging_RepoCoalitionCannotExhaustNode (Codex round 37,
 // security): tokens carry no caller identity beyond the repo claim
-// (auth.SubjectLiteral is one fixed literal for every vendor SDK), so a
+// (`sub` is free text that any token signer picks), so a
 // writer holding git:write tokens for several repositories could park
 // bodyless PUTs whose fixed per-repo shares SUM to the node cap
 // (8 × 32 = 256) and starve every other repository's uploads and
