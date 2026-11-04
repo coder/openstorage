@@ -185,16 +185,25 @@ table:
 When another writer moves the branch after the server wrote the commit (a lost CAS),
 `commit-pack` and `diff-commit` answer 409 with `result.status: "failed"`. `commit` and
 `result.new_sha` name the commit that the branch did not get, and `result.old_sha` is the
-tip the server built on. `restore-commit` answers a lost CAS with 409 `conflict` and
-`commit: null`. A stale guard also answers 409 on all three routes, and its envelope carries
-the problem members of §1 step 2.
+tip the server built on. `restore-commit` answers a lost CAS with a 409 problem body
+(code `conflict`), as below. A stale guard answers 409 on all three routes, with the
+`result` envelope plus the problem members of §1 step 2.
 
-The handler returns the envelope as the JSON body on any of the statuses
-`[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. Clients parse the body on
-these codes rather than treating them as opaque failures. Auth failures (401, 403), the
-gateway rate limiter's 429 and the path-style alias 404 happen before the handler: they
-use the plain problem body of the [HTTP API](../reference/http-api.md#conventions), as
-upstream documents.
+The failure envelope is the body only on the statuses for which upstream documents it
+([#352](https://github.com/coder/openstorage/issues/352) item 3):
+
+| Route | Envelope statuses |
+|---|---|
+| `commit-pack` | 400, 409, 412, 413 |
+| `diff-commit` | 400, 409, 412 |
+| `restore-commit` | 412 |
+
+Every other failure, on these routes included, is the plain problem body of the
+[HTTP API](../reference/http-api.md#conventions): auth failures (401, 403), 404 (with
+`repository_not_found`, `branch_not_found` or `ref_not_found`), ref-policy and quota
+403s, 422, 429, 500 and 503, and `restore-commit`'s 400 and 409 (except the stale-guard
+409 above). The status strings
+above still name the HTTP status in every envelope.
 
 ## 4. `POST /api/v1/repos/restore-commit` — plain JSON, same ack
 

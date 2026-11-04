@@ -47,6 +47,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -81,12 +82,61 @@ var wcMaxCommitBlobBytes int64 = 262144000
 // scope table).
 func registerWriteCommitRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteCommitRoutes: nil dependency")
-	route := func(pattern string, h http.HandlerFunc) {
-		mux.Handle(pattern, rl.limit()(requireAuth(verifier, org, false, auth.ScopeGitWrite)(h)))
+	route := func(path string, h http.HandlerFunc) {
+		envelope, ok := commitWriteEnvelopeStatuses[path]
+		assertf(ok, "registerWriteCommitRoutes: no envelope statuses for %s", path)
+		mux.Handle("POST "+path, rl.limit()(requireAuth(verifier, org, false, auth.ScopeGitWrite)(withResultEnvelope(envelope, h))))
 	}
-	route("POST /api/v1/repos/commit-pack", s.handleCommitPack)
-	route("POST /api/v1/repos/diff-commit", s.handleDiffCommit)
-	route("POST /api/v1/repos/restore-commit", s.handleRestoreCommit)
+	route("/api/v1/repos/commit-pack", s.handleCommitPack)
+	route("/api/v1/repos/diff-commit", s.handleDiffCommit)
+	route("/api/v1/repos/restore-commit", s.handleRestoreCommit)
+}
+
+// commitWriteEnvelopeStatuses lists, per commit write route, the failure
+// statuses for which upstream documents the result envelope (spec
+// 412b90c3, pinned by TestCommitWriteEnvelopeStatusesMatchUpstream; the
+// spec also lists 502, which these handlers never send). Every other
+// failure is a plain problem body.
+var commitWriteEnvelopeStatuses = map[string][]int{
+	"/api/v1/repos/commit-pack":    {400, 409, 412, 413},
+	"/api/v1/repos/diff-commit":    {400, 409, 412},
+	"/api/v1/repos/restore-commit": {412},
+}
+
+// envelopeWriter carries the failure statuses for which the route answers
+// with the result envelope (wcFail).
+type envelopeWriter struct {
+	http.ResponseWriter
+	statuses []int
+}
+
+// Unwrap exposes the wrapped writer to http.ResponseController.
+func (w *envelopeWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// withResultEnvelope records the route's envelope statuses for wcFail. The
+// /api/repos/{repo_name}/... aliases re-dispatch through the v1 route, so
+// they get the same set.
+func withResultEnvelope(statuses []int, h http.HandlerFunc) http.HandlerFunc {
+	assertf(len(statuses) > 0 && h != nil, "withResultEnvelope: no statuses or nil handler")
+	return func(w http.ResponseWriter, r *http.Request) {
+		h(&envelopeWriter{ResponseWriter: w, statuses: statuses}, r)
+	}
+}
+
+// usesResultEnvelope reports whether the route answers httpCode with the
+// result envelope. It finds the envelopeWriter under w through the Unwrap
+// chain, as problemInstance does, and every commit write route has one.
+func usesResultEnvelope(w http.ResponseWriter, httpCode int) bool {
+	for {
+		switch t := w.(type) {
+		case *envelopeWriter:
+			return slices.Contains(t.statuses, httpCode)
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		default:
+			panic("api assertion failed: usesResultEnvelope: no withResultEnvelope on this route")
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -132,13 +182,21 @@ type wcEnvelope struct {
 	Result wcResult      `json:"result"`
 }
 
-// wcFail writes the failure envelope. The status string must agree with the
+// wcFail writes the failure envelope, or the plain problem body (generic
+// code) when upstream documents ProblemDetails for httpCode on this route
+// (usesResultEnvelope). The status string must agree with the
 // docs/explanation/streaming-commit-protocols.md HTTP mapping table (statusForHTTP, errors.go) — enforced here so a
 // drifting call site fails fast in tests instead of shipping a mismatched
 // pair.
 func wcFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string) {
 	assertf(statusForHTTP(httpCode) == status, "wcFail: status %q does not map to HTTP %d", status, httpCode)
 	assertf(msg != "", "wcFail: empty message")
+	// 404 is a problem body on every route, with a specific code.
+	assertf(httpCode != http.StatusNotFound, "wcFail: write a 404 with writeProblem and its specific code")
+	if !usesResultEnvelope(w, httpCode) {
+		writeErr(w, httpCode, msg)
+		return
+	}
 	writeJSON(w, httpCode, wcEnvelope{Result: wcRefUpdate(branch, oldSHA, "", status, msg)})
 }
 
@@ -149,6 +207,7 @@ func wcFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA str
 func wcFailLostCAS(w http.ResponseWriter, info *wcCommitInfo, msg, oldSHA string) {
 	assertf(info != nil && ref.ValidSHA(info.CommitSHA) && ref.ValidSHA(info.TreeSHA), "wcFailLostCAS: incomplete commit %+v", info)
 	assertf(info.TargetBranch != "" && msg != "", "wcFailLostCAS: empty branch or message")
+	assertf(usesResultEnvelope(w, http.StatusConflict), "wcFailLostCAS: route has no 409 envelope")
 	writeJSON(w, http.StatusConflict, wcEnvelope{Commit: info, Result: wcRefUpdate(info.TargetBranch, oldSHA, info.CommitSHA, "failed", msg)})
 }
 
@@ -174,12 +233,14 @@ func wcFailRefGuard(w http.ResponseWriter, msg, branch, oldSHA, currentSHA strin
 	})
 }
 
-// wcInternal is internalErr's envelope-flavored twin: log the real error,
-// leak nothing (docs/reference/http-api.md: clients branch on codes, bodies stay generic).
+// wcInternal logs the real error and writes the generic 500 problem body,
+// leaking nothing (docs/reference/http-api.md: clients branch on codes, bodies stay generic).
+// Unlike internalErr it does not map git read limits. A 500 is a problem
+// body on every route, so merge can share it through wcResolveRepo.
 func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wcInternal: nil error or empty op")
 	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
-	wcFail(w, http.StatusInternalServerError, "internal", internalErrorMsg, "", "")
+	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +257,7 @@ func (s *server) wcResolveRepo(w http.ResponseWriter, r *http.Request) (meta.Rep
 	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
-		wcFail(w, http.StatusNotFound, "not_found", "repository not found", "", "")
+		writeRepoNotFound(w)
 		return meta.Repo{}, false
 	case err != nil:
 		s.wcInternal(w, r, "resolve repository", err)
@@ -572,8 +633,7 @@ func (s *server) wcPlanCommit(w http.ResponseWriter, r *http.Request, repoID str
 	} else if md.BaseBranch != "" {
 		baseTip, ok := tips[wcRefName(md.BaseBranch, md.EphemeralBase)]
 		if !ok {
-			wcFail(w, http.StatusNotFound, "not_found", "base branch "+md.BaseBranch+" not found",
-				md.TargetBranch, ref.ZeroSHA)
+			writeProblem(w, http.StatusNotFound, codeBranchNotFound, "base branch "+md.BaseBranch+" not found")
 			return nil, false
 		}
 		plan.parent = baseTip
@@ -1455,8 +1515,7 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if plan.oldSHA == ref.ZeroSHA {
-		wcFail(w, http.StatusNotFound, "not_found", "target branch "+md.TargetBranch+" not found",
-			md.TargetBranch, ref.ZeroSHA)
+		writeProblem(w, http.StatusNotFound, codeBranchNotFound, "target branch "+md.TargetBranch+" not found")
 		return
 	}
 	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID, repo.DefaultBranch)
@@ -1478,8 +1537,7 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 		// it is 40 hex characters: a branch may have such a name.
 		resolved, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
 		if errors.Is(err, gitread.ErrNotFound) {
-			wcFail(w, http.StatusNotFound, "not_found", "base_ref "+target+" does not resolve to a commit",
-				md.TargetBranch, plan.oldSHA)
+			writeProblem(w, http.StatusNotFound, codeRefNotFound, "base_ref "+target+" does not resolve to a commit")
 			return
 		} else if err != nil {
 			s.wcInternal(w, r, "resolve restore base_ref", err)
@@ -1491,8 +1549,7 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	// new commit's tree verbatim.
 	tree, err := sc.resolveTree(r.Context(), target)
 	if err != nil {
-		wcFail(w, http.StatusNotFound, "not_found", "restore target "+target+" not found",
-			md.TargetBranch, plan.oldSHA)
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "restore target "+target+" not found")
 		return
 	}
 	if revision && !s.wcRestoreMoves(w, r, sc, md, plan, target, tree) {

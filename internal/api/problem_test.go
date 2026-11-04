@@ -7,6 +7,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -272,12 +273,14 @@ func expectedProblemCodes(t *testing.T, status int, msg string) []string {
 		code = "insufficient_scope"
 	case status == http.StatusBadRequest && msg == "repo_name must equal the JWT repo claim":
 		code = "repo_name_mismatch"
-	case status == http.StatusNotFound &&
-		(strings.HasPrefix(msg, "source branch ") || strings.HasPrefix(msg, "target branch ")) && strings.HasSuffix(msg, " not found"):
+	case status == http.StatusNotFound && (strings.HasPrefix(msg, "source branch ") || strings.HasPrefix(msg, "target branch ") ||
+		strings.HasPrefix(msg, "base branch ")) && strings.HasSuffix(msg, " not found"):
 		code = "branch_not_found"
 	case status == http.StatusNotFound && (slices.Contains([]string{"ref not found", "tag not found", "commit not found",
 		"base commit not found", "base not found", "base ref not found", "ref does not resolve to a commit"}, msg) ||
-		strings.HasPrefix(msg, "object_ref does not resolve to a commit: ")):
+		strings.HasPrefix(msg, "object_ref does not resolve to a commit: ") ||
+		strings.HasPrefix(msg, "base_ref ") && strings.HasSuffix(msg, " does not resolve to a commit") ||
+		strings.HasPrefix(msg, "restore target ") && strings.HasSuffix(msg, " not found")):
 		code = "ref_not_found"
 	case status == http.StatusNotFound && msg == "credential not found":
 		code = "credential_not_found"
@@ -850,7 +853,7 @@ func TestWriteErrProblemFields(t *testing.T) {
 func TestResultEnvelopeContentType(t *testing.T) {
 	for name, write := range map[string]func(http.ResponseWriter){
 		"wcFail": func(w http.ResponseWriter) {
-			wcFail(w, http.StatusConflict, "conflict", "branch moved", "main", ref.ZeroSHA)
+			wcFail(&envelopeWriter{ResponseWriter: w, statuses: []int{http.StatusConflict}}, http.StatusConflict, "conflict", "branch moved", "main", ref.ZeroSHA)
 		},
 		"wmFailConflict": func(w http.ResponseWriter) {
 			wmFailConflict(w, http.StatusConflict, "conflict", "merge conflict", "main", ref.ZeroSHA, []string{"a"}, ref.ZeroSHA)
@@ -878,6 +881,116 @@ func TestCommitRefGuardContentType(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
 	}
 	assertCommitRefGuard(t, rr.Code, rr.Body.Bytes(), "main", tip, tip)
+}
+
+// upstreamEnvelopeStatuses returns the failure statuses for which the
+// vendored spec documents a non-problem application/json body on POST
+// path: a $ref other than ProblemDetails, by indentation (path at 2
+// spaces, method at 4, status at 8, media type at 12, $ref at 16).
+func upstreamEnvelopeStatuses(t *testing.T, path string) []int {
+	t.Helper()
+	raw, err := os.ReadFile(upstreamSpecPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statuses []int
+	inPath, inPost, status, inJSON := false, false, 0, false
+	for l := range strings.SplitSeq(string(raw), "\n") {
+		indent := len(l) - len(strings.TrimLeft(l, " "))
+		trimmed := strings.TrimSpace(l)
+		switch {
+		case indent == 2 && trimmed != "":
+			inPath = trimmed == path+":"
+			inPost = false
+		case inPath && indent == 4 && trimmed != "":
+			inPost = trimmed == "post:"
+		case inPost && indent == 8 && strings.HasPrefix(trimmed, `"`):
+			status, _ = strconv.Atoi(strings.Trim(trimmed, `":`))
+			inJSON = false
+		case inPost && indent == 12 && trimmed != "":
+			inJSON = trimmed == "application/json:"
+		case inJSON && indent == 16 && strings.HasPrefix(trimmed, "$ref: "):
+			if status >= 400 && !strings.HasSuffix(trimmed, `/ProblemDetails"`) && !slices.Contains(statuses, status) {
+				statuses = append(statuses, status)
+			}
+		}
+	}
+	if len(statuses) == 0 {
+		t.Fatalf("no envelope statuses for POST %s in %s", path, upstreamSpecPath)
+	}
+	return statuses
+}
+
+// TestCommitWriteEnvelopeStatusesMatchUpstream pins the routes' envelope
+// statuses to the spec, minus 502, which the handlers never send.
+func TestCommitWriteEnvelopeStatusesMatchUpstream(t *testing.T) {
+	for path, got := range commitWriteEnvelopeStatuses {
+		want := slices.DeleteFunc(upstreamEnvelopeStatuses(t, path), func(s int) bool { return s == http.StatusBadGateway })
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s: envelope statuses %v, upstream documents %v", path, got, want)
+		}
+		alias := strings.Replace(path, "/api/v1/repos/", "/api/repos/{repo_name}/", 1)
+		if a := upstreamEnvelopeStatuses(t, alias); !slices.Equal(a, upstreamEnvelopeStatuses(t, path)) {
+			t.Errorf("%s: path-style statuses %v differ from %v", alias, a, upstreamEnvelopeStatuses(t, path))
+		}
+	}
+}
+
+// TestWcFailEnvelopeStatuses: wcFail sends the result envelope only for the
+// statuses that the route lists (upstream's CommitWriteResponse statuses),
+// and the plain problem body for the rest (#352 item 3).
+func TestWcFailEnvelopeStatuses(t *testing.T) {
+	restore := []int{http.StatusPreconditionFailed}
+	for _, tc := range []struct {
+		status   int
+		envelope bool
+	}{
+		{http.StatusPreconditionFailed, true},
+		{http.StatusBadRequest, false},
+		{http.StatusConflict, false},
+		{http.StatusForbidden, false},
+		{http.StatusTooManyRequests, false},
+		{http.StatusInternalServerError, false},
+		{http.StatusUnprocessableEntity, false},
+	} {
+		rr := httptest.NewRecorder()
+		wcFail(&envelopeWriter{ResponseWriter: rr, statuses: restore}, tc.status, statusForHTTP(tc.status), "boom", "main", ref.ZeroSHA)
+		var body map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		_, hasResult := body["result"]
+		if rr.Code != tc.status || hasResult != tc.envelope {
+			t.Errorf("status %d: got %d with result=%v, want result=%v (body %s)", tc.status, rr.Code, hasResult, tc.envelope, rr.Body)
+			continue
+		}
+		if !tc.envelope {
+			assertProblemFields(t, tc.status, rr.Body.Bytes())
+		}
+	}
+	// wcInternal needs no envelopeWriter: merge reaches it through
+	// wcResolveRepo.
+	rr := httptest.NewRecorder()
+	(&server{logger: discardLogger()}).wcInternal(rr, httptest.NewRequest(http.MethodPost, "/api/v1/repos/merge", nil), "op", errors.New("boom"))
+	if msg := assertProblemFields(t, rr.Code, rr.Body.Bytes()); rr.Code != http.StatusInternalServerError || msg != internalErrorMsg {
+		t.Errorf("wcInternal = %d %q, want 500 %q", rr.Code, msg, internalErrorMsg)
+	}
+	for name, write := range map[string]func(){
+		"no envelopeWriter": func() { wcFail(httptest.NewRecorder(), http.StatusConflict, "conflict", "boom", "", "") },
+		"404": func() {
+			wcFail(&envelopeWriter{ResponseWriter: httptest.NewRecorder(), statuses: restore}, http.StatusNotFound, "not_found", "boom", "", "")
+		},
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: wcFail did not panic", name)
+				}
+			}()
+			write()
+		}()
+	}
 }
 
 // TestProblemInstanceThroughWrappers: writeErr finds `instance` under the

@@ -7,8 +7,8 @@ egress rules: [`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`](configuration.md#openstorage
 ## Endpoint management
 
 The public SDKs do not manage endpoints; upstream uses its dashboard/control plane.
-open.storage adds its own org-level routes. All require `repo:write` with `repo: "org"`
-and return the plain `{"error"}` envelope on failure.
+open.storage adds its own org-level routes. All require `repo:write` with `repo: "org"` (or
+no `repo` claim) and return the plain `{"error"}` envelope on failure.
 
 | Method & path | Body → Response |
 |---|---|

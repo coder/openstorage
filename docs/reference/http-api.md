@@ -68,16 +68,19 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   map (such as Go's `map[string]string`). Ref-moving write
   endpoints return the richer `result` envelope
   ([streaming protocols](../explanation/streaming-commit-protocols.md)) for failures in
-  the handler. The `result` of `commit-pack`, `diff-commit` and `restore-commit` is
-  upstream's `RefUpdateResult`: it has every member that the schema requires, with empty
-  strings where there is no value: `target_branch`, the deprecated `branch` (the same
-  value), `old_sha`, `new_sha`, `success` and `status`. A failed commit write sends
-  `commit: null`, except a lost CAS on `commit-pack` and `diff-commit`. Before
+  the handler. `commit-pack`, `diff-commit` and `restore-commit` send it only on the
+  statuses for which upstream documents it (the streaming protocols list them), and the
+  error body above on every other failure. Their `result` is upstream's
+  `RefUpdateResult`: it has every member that the schema requires, with empty strings
+  where there is no value: `target_branch`, the deprecated `branch` (the same value),
+  `old_sha`, `new_sha`, `success` and `status`. A failure envelope sends `commit: null`,
+  except a lost CAS on `commit-pack` and `diff-commit`. Before
   [#665](https://github.com/coder/openstorage/issues/665), `result` had no
-  `target_branch`, most failures left out empty members, and failed commit writes sent
-  no `commit`. Auth failures (401, 403), the gateway rate limiter's 429 and the
-  path-style alias 404 use the error body above on every route, as upstream documents
-  ([#352](https://github.com/coder/openstorage/issues/352) item 3). Failed ref
+  `target_branch`, most failures left out empty members, and failure envelopes sent no
+  `commit`. Auth failures (401, 403), the gateway rate limiter's 429 and the
+  path-style alias 404 use the error body above on every route,
+  as upstream documents ([#352](https://github.com/coder/openstorage/issues/352)
+  item 3). Failed ref
   guards are the exception, as upstream documents: a merge `409` for a failed guard (a
   stale `expected_target_sha`, or a source branch that no longer contains
   `expected_source_sha`) uses the error body above with code `ref_guard_failed`
@@ -150,11 +153,11 @@ about the endpoint's rollout status on upstream clusters.
 | Method & path | Scope | Notes |
 |---|---|---|
 | `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 200 = the name holds a finished repo the request matches; 409 = another live repo holds the name; 404 = a deleted repo holds the name; 503 = a create of the name is not finished (below). |
-| `GET /repos` | org:read (repo="org") | Query `cursor, limit, q, prefix`. `q` is a case-insensitive substring of repo `url`, and `prefix` a case-insensitive start of it, both trimmed (empty = no filter). With `prefix` set, `q` matches only the rest of `url` after the prefix: `prefix=pierre/&q=sdk` returns `pierre/sdk-documentation`, not `pierre/example`. → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
+| `GET /repos` | org:read (repo="org" or no repo) | Query `cursor, limit, q, prefix`. `q` is a case-insensitive substring of repo `url`, and `prefix` a case-insensitive start of it, both trimmed (empty = no filter). With `prefix` set, `q` matches only the rest of `url` after the prefix: `prefix=pierre/&q=sdk` returns `pierre/sdk-documentation`, not `pierre/example`. → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
-| `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value. An open.storage extension: upstream removed the route from its spec on 2026-10-05, and open.storage keeps serving it for existing clients |
+| `GET /api/repo-urls/{repo_id}` | org:read (repo="org" or no repo) | (No /v1 prefix.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value. An open.storage extension: upstream removed the route from its spec on 2026-10-05, and open.storage keeps serving it for existing clients |
 | `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs). → 200 `{message: "repository detached"}`, also when the repo has no upstream. Deprecated upstream (2026-10-05) for `DELETE /api/repos/{repo_name}/upstream`, which runs the same handler; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header |
 | `DELETE /api/repos/{repo_name}/upstream` | repo:write | Path style only (spec 2026-10-05). Same handler and scope as `DELETE /repos/base`. → 200 `{message: "repository detached"}`. A repo without an upstream → 200 `{message: "repository already detached"}` (changelog 2026-10-07); the deprecated `base` routes keep `repository detached` in that case |
 
@@ -275,8 +278,8 @@ the same scopes, query parameters and responses.
 | Method & path | Scope | Body → Response |
 |---|---|---|
 | `POST /repos/git-credentials` | repo:write (repo=repoId) | `{repo_id, password, username?}` → `{id}`; 409 = exists |
-| `PUT /repos/git-credentials` | repo:write (repo="org") | `{id, password, username?}` → `{id, created_at}`; 404 |
-| `DELETE /repos/git-credentials` | repo:write (repo="org") | `{id}` → 200/204; 404 |
+| `PUT /repos/git-credentials` | repo:write (repo="org" or no repo) | `{id, password, username?}` → `{id, created_at}`; 404 |
+| `DELETE /repos/git-credentials` | repo:write (repo="org" or no repo) | `{id}` → 200/204; 404 |
 
 `username` is optional on create and update, on these routes and on the path-style
 `/repos/{repo_name}/git-credentials` routes. Only `password` is required. The server
@@ -685,5 +688,5 @@ Other limits and gaps:
 | 412 | a failed `restore-commit` `base_ref` precondition; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
-| 429 | rate limit (plain problem body on every route); a write handler's busy or backpressure answer (`unavailable` in its result envelope) |
+| 429 | rate limit, busy or backpressure (plain problem body; merge and notes busy answers use `unavailable` in their result envelope) |
 | 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |
