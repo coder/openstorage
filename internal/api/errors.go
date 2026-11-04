@@ -42,8 +42,8 @@ func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, 
 // problem-details fields upstream documents (issue #349). `code` is the
 // generic per-status code only; `detail` mirrors `error`; `instance` is the
 // request path (issue #352). Clients branch on the status code or `code`,
-// never on the message. The content type stays application/json: SDK 1.17.1
-// parses error JSON only for that type.
+// never on the message. writeProblemJSON sends it as
+// application/problem+json, the type upstream documents for problem bodies.
 type errorEnvelope struct {
 	Error    string `json:"error"`
 	Type     string `json:"type"`
@@ -96,7 +96,7 @@ func writeProblemParams(w http.ResponseWriter, status int, code, msg string, par
 // standard name of the request field; currentSHA is the guarded ref's
 // commit, or ref.ZeroSHA when the ref does not exist.
 func writeRefGuardFailed(w http.ResponseWriter, guard, currentSHA, msg string) {
-	writeJSON(w, http.StatusConflict, refGuardProblem(w, guard, currentSHA, msg))
+	writeProblemJSON(w, http.StatusConflict, refGuardProblem(w, guard, currentSHA, msg))
 }
 
 // refGuardProblem builds the 409 ref_guard_failed problem members for a
@@ -109,7 +109,7 @@ func refGuardProblem(w http.ResponseWriter, guard, currentSHA, msg string) error
 }
 
 func writeProblemBody(w http.ResponseWriter, status int, code, msg string, params []invalidParam, guard, currentSHA string) {
-	writeJSON(w, status, newProblem(w, status, code, msg, params, guard, currentSHA))
+	writeProblemJSON(w, status, newProblem(w, status, code, msg, params, guard, currentSHA))
 }
 
 // newProblem is the only builder of errorEnvelope. It checks every member
@@ -403,7 +403,25 @@ func genericProblemCode(status int) string {
 // writeJSON writes v as the JSON response body with the given status.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	assertf(status >= 200 && status < 600, "writeJSON called with invalid status %d", status)
-	w.Header().Set("Content-Type", "application/json")
+	writeJSONAs(w, status, "application/json", v)
+}
+
+// problemMediaType is the content type of every body that carries the
+// problem members (newProblem). Upstream's spec says problem details come
+// "under application/problem+json", and its write 409s use that type for
+// the problem body and application/json for the result envelope. Result
+// envelopes and success bodies stay application/json.
+const problemMediaType = "application/problem+json"
+
+// writeProblemJSON writes v, a body built on newProblem, as
+// application/problem+json.
+func writeProblemJSON(w http.ResponseWriter, status int, v any) {
+	assertf(status >= 400 && status < 600, "writeProblemJSON called with non-error status %d", status)
+	writeJSONAs(w, status, problemMediaType, v)
+}
+
+func writeJSONAs(w http.ResponseWriter, status int, contentType string, v any) {
+	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(status)
 	// Encoding a value we constructed cannot fail; a write error just means
 	// the client went away, which is not actionable here.

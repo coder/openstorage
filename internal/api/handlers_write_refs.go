@@ -709,7 +709,7 @@ type wrefNoteGuardBody struct {
 // forms that answer upstream's status (#568). currentSHA is the notes
 // ref's tip, or the zero sha when unborn, as current_sha and new_ref_sha.
 func wrefNoteGuardFail(w http.ResponseWriter, msg, sha, targetRef, baseCommit, currentSHA string) {
-	writeJSON(w, http.StatusConflict, wrefNoteGuardBody{
+	writeProblemJSON(w, http.StatusConflict, wrefNoteGuardBody{
 		errorEnvelope: refGuardProblem(w, "expected_notes_ref_sha", currentSHA, msg),
 		wrefNoteResponse: wrefNoteResponse{
 			SHA:        sha,

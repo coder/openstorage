@@ -56,7 +56,13 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   error, a body that is not an object, an empty member name, unknown fields on the
   other bodies, rules across fields (such as `base_repo` and `upstream` together), and
   query parameters. The message in `detail` does not change.
-  The content type stays `application/json`. `status` is a JSON number, as in upstream's
+  These bodies have `Content-Type: application/problem+json`, the type upstream documents
+  for problem details, whatever the request's `Accept` header says. Before
+  [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
+  `application/json`: SDK `1.17.1` Go and TypeScript clients parse error JSON only for
+  `application/json`, so they now show the raw body as the error message. SDK `0.1.0`
+  (Go, Python, TypeScript) reads the body whatever the type. Result envelopes and success
+  bodies stay `application/json`. `status` is a JSON number, as in upstream's
   bodies: decode the body into a struct or a map of arbitrary values, not a string-only
   map (such as Go's `map[string]string`). Ref-moving write
   endpoints return the richer `result` envelope
@@ -485,7 +491,8 @@ Before that spec, both carried the full message.
   members of the error body: `code: ref_guard_failed`, `guard: expected_notes_ref_sha`
   (also when the request sent the deprecated `expected_ref_sha`), and `current_sha`, the
   notes ref's tip or 40 zeros when it does not exist. `new_ref_sha` repeats
-  `current_sha`. The content type stays `application/json`. Before
+  `current_sha`. Its content type is `application/problem+json`, as for every body with
+  the problem members. Before
   [#568](https://github.com/coder/openstorage/issues/568), the body had no problem
   members.
 
