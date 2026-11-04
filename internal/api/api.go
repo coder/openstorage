@@ -35,9 +35,8 @@ func assertf(cond bool, format string, args ...any) {
 // Fallback (optional) receives every request outside /api/ that ServeMux
 // does not redirect first (it redirects /api to /api/ and cleans unclean
 // paths): an unmatched /api/ path gets unmatchedAPIRoute's problem body.
-// The serve command does
-// not set it: it mounts this handler at /api/ in its own mux, next to the
-// git smart-HTTP handler.
+// The serve command does not set it: it mounts this handler at /api/ in
+// its own mux, next to the git smart-HTTP handler.
 type Config struct {
 	Store    meta.Store
 	Verifier auth.Verifier
