@@ -189,11 +189,11 @@ func wctRequireOK(t *testing.T, resp *http.Response, body []byte) wcEnvelope {
 	}
 	wctRequireRefUpdate(t, body)
 	env := wctDecode(t, body)
-	if env.Result.TargetBranch == "" || env.Result.TargetBranch != env.Commit.TargetBranch {
-		t.Fatalf("result.target_branch %q, want commit.target_branch %q", env.Result.TargetBranch, env.Commit.TargetBranch)
-	}
 	if env.Commit == nil || !env.Result.Success || env.Result.Status != "ok" {
 		t.Fatalf("success envelope = %s", body)
+	}
+	if env.Result.TargetBranch == "" || env.Result.TargetBranch != env.Commit.TargetBranch {
+		t.Fatalf("result.target_branch %q, want commit.target_branch %q", env.Result.TargetBranch, env.Commit.TargetBranch)
 	}
 	if !ref.ValidSHA(env.Commit.CommitSHA) || !ref.ValidSHA(env.Commit.TreeSHA) {
 		t.Fatalf("malformed shas in envelope %s", body)
