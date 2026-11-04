@@ -246,7 +246,7 @@ func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, e
 // ---------------------------------------------------------------------------
 // Repo resolution + ref policy
 
-// wcResolveRepo maps the JWT repo claim to its live repo row with envelope
+// wcResolveRepo maps the JWT repo claim to its live repo row with problem-body
 // errors. The claim may carry the repo url or the server-generated repo_id
 // (docs/reference/authentication.md: auth accepts both), resolved through the shared
 // meta.ResolveRepoKey (ADR-21: repo_id first, then url).
@@ -499,13 +499,13 @@ var wcValidModes = map[string]bool{"100644": true, "100755": true, "120000": tru
 // no refs/ prefix; conservative component rule shared with repo creation).
 func wcValidateBranchParam(field, name string) error {
 	if name == "" {
-		return fmt.Errorf("missing %s", field)
+		return newFieldError(field, "is required", "missing "+field)
 	}
 	if strings.HasPrefix(name, "refs/") {
-		return fmt.Errorf("%s must not include the refs/ prefix", field)
+		return newFieldError(field, "must not include the refs/ prefix", field+" must not include the refs/ prefix")
 	}
 	if !validBranchName(name) {
-		return fmt.Errorf("invalid %s", field)
+		return newFieldError(field, "must be a valid branch name", "invalid "+field)
 	}
 	return nil
 }
@@ -513,11 +513,12 @@ func wcValidateBranchParam(field, name string) error {
 // wcValidateAuthor validates one ident. Newlines would corrupt the
 // GIT_AUTHOR_*/GIT_COMMITTER_* env-based ident encoding.
 func wcValidateAuthor(field string, a wcAuthor) error {
-	if a.Name == "" || a.Email == "" {
-		return fmt.Errorf("%s name and email are required", field)
+	if err := requiredFields(field+" name and email are required",
+		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email}); err != nil {
+		return err
 	}
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
-		return fmt.Errorf("%s contains newlines", field)
+		return newFieldError(field, "must not contain newlines", field+" contains newlines")
 	}
 	return nil
 }

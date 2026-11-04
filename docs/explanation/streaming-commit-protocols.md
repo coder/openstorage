@@ -198,6 +198,9 @@ The failure envelope is the body only on the statuses for which upstream documen
 | `diff-commit` | 400, 409, 412 |
 | `restore-commit` | 412 |
 
+Upstream also documents the envelope for a 502 on all three routes. These handlers
+never answer 502, so the table leaves it out.
+
 Every other failure, on these routes included, is the plain problem body of the
 [HTTP API](../reference/http-api.md#conventions): auth failures (401, 403), 404 (with
 `repository_not_found`, `branch_not_found` or `ref_not_found`), ref-policy and quota

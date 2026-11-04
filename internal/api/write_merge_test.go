@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -113,14 +114,14 @@ func wmRequireRefGuard(t *testing.T, resp *http.Response, raw []byte, guard, cur
 	}
 }
 
-// wmResult extracts the failure envelope's result object.
-func wmResult(t *testing.T, body map[string]any) map[string]any {
+// wmProblem asserts a merge failure that upstream documents as a plain
+// problem body (#352 item 3): no result envelope. It returns `error`.
+func wmProblem(t *testing.T, resp *http.Response, raw []byte) string {
 	t.Helper()
-	res, ok := body["result"].(map[string]any)
-	if !ok {
-		t.Fatalf("body has no result object: %v", body)
+	if _, has := wmDecode(t, raw)["result"]; has {
+		t.Fatalf("merge failure carries a result envelope: %s", raw)
 	}
-	return res
+	return requireEnvelope(t, resp, raw)
 }
 
 // wmRefsSnapshot snapshots the ref authority for the fixture repo.
@@ -314,6 +315,66 @@ func wmSeedFixture(t *testing.T, e *testEnv) wmFixture {
 
 // ---------------------------------------------------------------------------
 
+// losingCAS loses every CAS on ref name, as when another writer moves the
+// ref between the handler's read and its update.
+type losingCAS struct {
+	ref.RefStore
+	name string
+}
+
+func (s losingCAS) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	if name == s.name {
+		return false, nil
+	}
+	return s.RefStore.CASRef(ctx, repo, name, old, new)
+}
+
+// TestLostCASBodies: a merge whose target moved and a note write whose
+// notes ref moved answer a plain 409 problem body (#352 item 3). Upstream's
+// MergeConflict target_moved needs an automatic retry, which open.storage
+// does not do.
+func TestLostCASBodies(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wmSeedFixture(t, e)
+		serve := func(name string) *httptest.Server {
+			s := &server{store: e.store, httpBaseURL: testHTTPBaseURL, logger: discardLogger(),
+				refStore: losingCAS{RefStore: e.refStore, name: name}, blobStore: e.blobStore, cacheDir: e.cacheDir}
+			mux := http.NewServeMux()
+			s.registerWriteMergeRoutes(mux, auth.NewVerifier(e.store), "", nil)
+			s.registerWriteRefRoutes(mux, auth.NewVerifier(e.store), "", nil)
+			srv := httptest.NewServer(withProblemInstance(recoverPanics(s.logger)(mux)))
+			t.Cleanup(srv.Close)
+			return srv
+		}
+		srv := serve("refs/heads/main")
+		for name, body := range map[string]map[string]any{
+			"fast-forward": wmMergeBody("ffsrc", "main", "ff_prefer", nil),
+			"merge commit": wmMergeBody("feature", "main", "merge", map[string]any{"author": wmTestAuthor}),
+		} {
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, body)
+			if resp.StatusCode != http.StatusConflict {
+				t.Errorf("%s: status %d %s, want 409", name, resp.StatusCode, raw)
+				continue
+			}
+			if msg := wmProblem(t, resp, raw); msg != "ref refs/heads/main moved concurrently" {
+				t.Errorf("%s: error = %q", name, msg)
+			}
+			if _, has := wmDecode(t, raw)["conflict_type"]; has {
+				t.Errorf("%s: problem body carries conflict_type: %s", name, raw)
+			}
+		}
+		if tip := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/main"]; tip != fx.c2 {
+			t.Fatalf("main moved to %s on a lost CAS", tip)
+		}
+
+		resp, raw := wmDo(t, serve("refs/notes/commits"), "POST", "/api/v1/repos/notes", fx.token,
+			map[string]any{"sha": fx.c1, "note": "x"})
+		if msg := wmProblem(t, resp, raw); resp.StatusCode != http.StatusConflict || msg != "refs/notes/commits moved concurrently" {
+			t.Fatalf("note write = %d %s, want a 409 problem body", resp.StatusCode, raw)
+		}
+	})
+}
+
 func TestMergeStrategies(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wmServer(t, e)
@@ -406,12 +467,11 @@ func TestMergeStrategies(t *testing.T) {
 		t.Run("ff_only rejects non-fast-forward", func(t *testing.T) {
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("feature", "main", "ff_only", nil))
-			if resp.StatusCode != http.StatusConflict {
+			if resp.StatusCode != http.StatusPreconditionFailed {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
-			res := wmResult(t, wmDecode(t, raw))
-			if res["status"] != "conflict" || res["success"] != false {
-				t.Fatalf("result = %v", res)
+			if msg := wmProblem(t, resp, raw); !strings.Contains(msg, "not a fast-forward") {
+				t.Fatalf("error = %q", msg)
 			}
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/main"]; got != fx.c2 {
 				t.Fatalf("main moved to %q after refused ff_only", got)
@@ -517,10 +577,15 @@ func TestMergeConflictsAndGuards(t *testing.T) {
 			if resp.StatusCode != http.StatusConflict {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
+			// Upstream's MergeConflict body: application/json, no result
+			// envelope and no problem members.
 			body := wmDecode(t, raw)
-			res := wmResult(t, body)
-			if res["status"] != "conflict" || res["old_sha"] != fx.c2 {
-				t.Fatalf("result = %v", res)
+			if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", ct)
+			}
+			if keys := slices.Sorted(maps.Keys(body)); !slices.Equal(keys, []string{"conflict_paths", "conflict_type", "error", "merge_base_sha"}) ||
+				body["conflict_type"] != "merge_conflict" || body["error"] == "" {
+				t.Fatalf("body = %s, want a MergeConflict with conflict_type merge_conflict", raw)
 			}
 			if !reflect.DeepEqual(body["conflict_paths"], []any{"a.txt"}) {
 				t.Fatalf("conflict_paths = %v, want [a.txt]", body["conflict_paths"])
@@ -543,12 +608,11 @@ func TestMergeConflictsAndGuards(t *testing.T) {
 		t.Run("unrelated histories rejected without flag", func(t *testing.T) {
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("orphan", "t-unrel", "merge", map[string]any{"author": wmTestAuthor}))
-			if resp.StatusCode != http.StatusConflict {
+			if resp.StatusCode != http.StatusPreconditionFailed {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
-			res := wmResult(t, wmDecode(t, raw))
-			if !strings.Contains(res["message"].(string), "unrelated") {
-				t.Fatalf("message = %v", res["message"])
+			if msg := wmProblem(t, resp, raw); !strings.Contains(msg, "unrelated") {
+				t.Fatalf("error = %q", msg)
 			}
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/t-unrel"]; got != fx.c2 {
 				t.Fatalf("t-unrel moved to %q", got)
@@ -685,9 +749,8 @@ func TestMergeRefPolicies(t *testing.T) {
 			if resp.StatusCode != http.StatusForbidden {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
-			res := wmResult(t, wmDecode(t, raw))
-			if res["status"] != "forbidden" || !strings.Contains(res["message"].(string), "no-push") {
-				t.Fatalf("result = %v", res)
+			if msg := wmProblem(t, resp, raw); !strings.Contains(msg, "no-push") {
+				t.Fatalf("error = %q", msg)
 			}
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/t-pol-nopush"]; got != fx.c2 {
 				t.Fatalf("t-pol-nopush moved to %q", got)
@@ -724,9 +787,8 @@ func TestMergeRefPolicies(t *testing.T) {
 			if resp.StatusCode != http.StatusForbidden {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
-			res := wmResult(t, wmDecode(t, raw))
-			if !strings.Contains(res["message"].(string), "verify-sig") {
-				t.Fatalf("result = %v", res)
+			if msg := wmProblem(t, resp, raw); !strings.Contains(msg, "verify-sig") {
+				t.Fatalf("error = %q", msg)
 			}
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/t-pol-vs-merge"]; got != fx.c2 {
 				t.Fatalf("t-pol-vs-merge moved to %q", got)
@@ -757,9 +819,7 @@ func TestMergeValidationAndAuth(t *testing.T) {
 					t.Errorf("%s: status = %d, body %s", name, resp.StatusCode, raw)
 					continue
 				}
-				if res := wmResult(t, wmDecode(t, raw)); res["status"] != "invalid" {
-					t.Errorf("%s: result = %v", name, res)
-				}
+				wmProblem(t, resp, raw)
 			}
 		})
 
@@ -769,9 +829,11 @@ func TestMergeValidationAndAuth(t *testing.T) {
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
-			res := wmResult(t, wmDecode(t, raw))
-			if !strings.Contains(res["message"].(string), "author") {
-				t.Fatalf("result = %v", res)
+			if msg := wmProblem(t, resp, raw); !strings.Contains(msg, "author") {
+				t.Fatalf("error = %q", msg)
+			}
+			if !strings.Contains(string(raw), `"invalid_params":[{"name":"author","reason":"is required"}]`) {
+				t.Fatalf("body %s does not name author in invalid_params", raw)
 			}
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/main"]; got != fx.c2 {
 				t.Fatalf("main moved to %q", got)

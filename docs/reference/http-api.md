@@ -65,28 +65,26 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   (Go, Python, TypeScript) reads the body whatever the type. Result envelopes and success
   bodies stay `application/json`. `status` is a JSON number, as in upstream's
   bodies: decode the body into a struct or a map of arbitrary values, not a string-only
-  map (such as Go's `map[string]string`). Ref-moving write
-  endpoints return the richer `result` envelope
-  ([streaming protocols](../explanation/streaming-commit-protocols.md)) for failures in
-  the handler. `commit-pack`, `diff-commit` and `restore-commit` send it only on the
-  statuses for which upstream documents it (the streaming protocols list them), and the
-  error body above on every other failure. Their `result` is upstream's
-  `RefUpdateResult`: it has every member that the schema requires, with empty strings
-  where there is no value: `target_branch`, the deprecated `branch` (the same value),
-  `old_sha`, `new_sha`, `success` and `status`. A failure envelope sends `commit: null`,
-  except a lost CAS on `commit-pack` and `diff-commit`. Before
+  map (such as Go's `map[string]string`). Every failure on every route uses the error
+  body above, except where upstream documents another body
+  ([#352](https://github.com/coder/openstorage/issues/352) item 3):
+  `commit-pack`, `diff-commit` and `restore-commit` return the richer `result` envelope
+  on the statuses that the
+  [streaming protocols](../explanation/streaming-commit-protocols.md) list, a merge
+  `409` for file conflicts returns upstream's `MergeConflict`
+  ([merge](#branches)), and the `409` for a stale guard on a commit write or a notes
+  write keeps its `result` envelope and adds the problem members
+  ([commit writes](#commit-write-guards), [notes](#notes)). The commit-write `result` is
+  upstream's `RefUpdateResult`: it has every member that the schema requires, with empty
+  strings where there is no value: `target_branch`, the deprecated `branch` (the same
+  value), `old_sha`, `new_sha`, `success` and `status`. A failure envelope sends
+  `commit: null`, except a lost CAS on `commit-pack` and `diff-commit`. Before
   [#665](https://github.com/coder/openstorage/issues/665), `result` had no
   `target_branch`, most failures left out empty members, and failure envelopes sent no
-  `commit`. Auth failures (401, 403), the gateway rate limiter's 429 and the
-  path-style alias 404 use the error body above on every route,
-  as upstream documents ([#352](https://github.com/coder/openstorage/issues/352)
-  item 3). Failed ref
-  guards are the exception, as upstream documents: a merge `409` for a failed guard (a
-  stale `expected_target_sha`, or a source branch that no longer contains
+  `commit`. A merge `409` for a failed guard (a stale `expected_target_sha`, or a source
+  branch that no longer contains
   `expected_source_sha`) uses the error body above with code `ref_guard_failed`
-  ([details](#merge-guards)). The `409` for a stale guard on a commit write or a notes
-  write keeps its `result` envelope and adds the same problem members
-  ([commit writes](#commit-write-guards), [notes](#notes)).
+  ([details](#merge-guards)).
 - **Throttling**: every `429` (the gateway [rate limiter](configuration.md#rate-limiting)
   and transient busy/backpressure answers) carries:
   - `Retry-After` (delay-seconds), which takes precedence over the `RateLimit` window;
@@ -341,7 +339,7 @@ Ties between commits that ancestry does not order follow git's topo-order walk, 
 | `POST /repos/branches/create` | git:write | `{target_branch?, base_ref?\|base_branch?(deprecated), preferred_base?, base_is_ephemeral?, target_is_ephemeral?, force?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
 | `DELETE /repos/branches` | git:write | Query `target_branch`, `ephemeral?`. The deprecated body `{target_branch (deprecated alias name), ephemeral?}` still works; a query parameter that is present wins over its body field, even when empty → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent): 409 for the query form, 403 for the body form |
 | `GET /repos/branches/diff` | git:read | **Deprecated upstream** (both path styles); still implemented. Use `GET /repos/diff` ([migration](#migrating-from-branchesdiff)). `branch` (req), `base?` (defaults to the repo default branch), `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, merge_base_sha, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}`; `merge_base_sha` is empty when the histories are unrelated (direct `base..branch` diff) |
-| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`). A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: ref_guard_failed` ([details](#merge-guards)) |
+| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. File conflicts → 409 `MergeConflict` `{error, conflict_type: merge_conflict, conflict_paths, merge_base_sha?}`; a target that moved during the merge → 409 error body, `code: conflict` (upstream's `target_moved` reports a failed automatic retry, and open.storage does not retry); an `ff_only` merge that is not a fast-forward, and unrelated histories without `allow_unrelated_histories` → 412 error body, `code: precondition_failed`, as upstream documents. A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: ref_guard_failed` ([details](#merge-guards)) |
 | `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
 
 #### Merge guards
@@ -536,8 +534,10 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
   deprecated body. Before [#647](https://github.com/coder/openstorage/issues/647), the
   `POST .../notes` and `DELETE` body forms answered 412 `precondition_failed` with the
   note envelope and no problem members.
-- The 409 keeps the note envelope (`result.status` `conflict`) and adds the problem
-  members of the error body: `code: ref_guard_failed`, `guard: expected_notes_ref_sha`
+- Every other note-write failure is the plain error body (no note envelope), as upstream
+  documents. A notes ref that moves while the write runs (a lost CAS) → 409 `conflict`.
+- The stale-guard 409 keeps the note envelope (`result.status` `conflict`) and adds
+  the problem members of the error body: `code: ref_guard_failed`, `guard: expected_notes_ref_sha`
   (also when the request sent the deprecated `expected_ref_sha`), and `current_sha`, the
   notes ref's tip or 40 zeros when it does not exist. `new_ref_sha` repeats
   `current_sha`. Its content type is `application/problem+json`, as for every body with
@@ -685,8 +685,8 @@ Other limits and gaps:
 | 401 / 403 | auth failed / permission or ref-policy denied |
 | 404 | repo/object/branch not found; unborn-branch file metadata |
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, failed ref guard (`expected_target_sha`, `expected_source_sha`, `expected_notes_ref_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
-| 412 | a failed `restore-commit` `base_ref` precondition; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
+| 412 | a failed `restore-commit` `base_ref` precondition; a merge that is not a fast-forward under `ff_only`, or of unrelated histories without `allow_unrelated_histories`; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
-| 429 | rate limit, busy or backpressure (plain problem body; merge and notes busy answers use `unavailable` in their result envelope) |
+| 429 | rate limit, busy or backpressure (plain problem body) |
 | 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |

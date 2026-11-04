@@ -15,6 +15,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,7 +41,7 @@ func newWrefServer(t *testing.T, e *testEnv) *httptest.Server {
 	}
 	mux := http.NewServeMux()
 	s.registerWriteRefRoutes(mux, auth.NewVerifier(e.store), "", nil)
-	srv := httptest.NewServer(recoverPanics(s.logger)(mux))
+	srv := httptest.NewServer(withProblemInstance(recoverPanics(s.logger)(mux)))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -546,6 +547,20 @@ func TestWriteRefsTags(t *testing.T) {
 	})
 }
 
+// wrefProblem asserts a note-write failure that upstream documents as a
+// plain problem body (#352 item 3): no note envelope. It returns `error`.
+func wrefProblem(t *testing.T, resp *http.Response, body map[string]any) string {
+	t.Helper()
+	if _, has := body["result"]; has {
+		t.Fatalf("note-write failure carries a result envelope: %v", body)
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return requireEnvelope(t, resp, raw)
+}
+
 // wrefNoteBody asserts the note-write envelope shape and returns result.
 func wrefNoteResultOf(t *testing.T, body map[string]any) map[string]any {
 	t.Helper()
@@ -618,9 +633,7 @@ func TestWriteRefsNotes(t *testing.T) {
 			if resp.StatusCode != http.StatusConflict {
 				t.Fatalf("status = %d body %v, want 409", resp.StatusCode, body)
 			}
-			if result := wrefNoteResultOf(t, body); result["status"] != "conflict" || result["success"] != false {
-				t.Fatalf("result = %v", result)
-			}
+			wrefProblem(t, resp, body)
 		})
 
 		t.Run("append appends and add works for another object", func(t *testing.T) {
@@ -700,34 +713,50 @@ func TestWriteRefsNotes(t *testing.T) {
 			if resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("second delete: status = %d body %v, want 404", resp.StatusCode, body)
 			}
-			if result := wrefNoteResultOf(t, body); result["status"] != "not_found" {
-				t.Fatalf("result = %v", result)
-			}
+			wrefProblem(t, resp, body)
 		})
 
 		t.Run("invalid input", func(t *testing.T) {
-			for name, req := range map[string]map[string]any{
-				"missing sha":        {"note": "x"},
-				"bad action":         {"sha": fx.c1, "action": "replace", "note": "x"},
-				"missing note":       {"sha": fx.c1, "action": "add"},
-				"non-notes full ref": {"sha": fx.c1, "note": "x", "ref": "refs/heads/main"},
-				"bad expected sha":   {"sha": fx.c1, "note": "x", "expected_ref_sha": "xyz"},
-				"author sans email":  {"sha": fx.c1, "note": "x", "author": map[string]any{"name": "n"}},
+			// Each body failure names the member the request sent in
+			// invalid_params ("name reason").
+			for name, tc := range map[string]struct {
+				req  map[string]any
+				want string
+			}{
+				"missing sha":        {map[string]any{"note": "x"}, "object_ref is required"},
+				"bad action":         {map[string]any{"sha": fx.c1, "action": "replace", "note": "x"}, "action must be add or append"},
+				"missing note":       {map[string]any{"sha": fx.c1, "action": "add"}, "note is required"},
+				"non-notes full ref": {map[string]any{"sha": fx.c1, "note": "x", "ref": "refs/heads/main"}, "ref must be a valid notes ref"},
+				"bad notes_ref":      {map[string]any{"sha": fx.c1, "note": "x", "notes_ref": "bad..name"}, "notes_ref must be a valid notes ref"},
+				"bad expected sha":   {map[string]any{"sha": fx.c1, "note": "x", "expected_ref_sha": "xyz"}, "expected_ref_sha must be a full 40-hex object id"},
+				"bad guard":          {map[string]any{"sha": fx.c1, "note": "x", "expected_notes_ref_sha": "xyz"}, "expected_notes_ref_sha must be a full 40-hex object id"},
+				"author sans email":  {map[string]any{"sha": fx.c1, "note": "x", "author": map[string]any{"name": "n"}}, "author.email is required"},
 			} {
-				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token, req)
+				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token, tc.req)
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Errorf("%s: status = %d body %v, want 400", name, resp.StatusCode, body)
 					continue
 				}
-				if result := wrefNoteResultOf(t, body); result["status"] != "invalid" {
-					t.Errorf("%s: result = %v", name, result)
+				wrefProblem(t, resp, body)
+				params, _ := body["invalid_params"].([]any)
+				if len(params) != 1 {
+					t.Errorf("%s: invalid_params = %v, want one item", name, body["invalid_params"])
+					continue
+				}
+				p, _ := params[0].(map[string]any)
+				if got := fmt.Sprint(p["name"], " ", p["reason"]); got != tc.want {
+					t.Errorf("%s: invalid_params[0] = %q, want %q", name, got, tc.want)
 				}
 			}
-			// Unknown target object -> 404 not_found.
+			// Unknown target object -> 404 ref_not_found, as for a
+			// revision that does not resolve.
 			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": strings.Repeat("ab", 20), "note": "x"})
 			if resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("unknown object: status = %d body %v, want 404", resp.StatusCode, body)
+			}
+			if body["code"] != "ref_not_found" {
+				t.Fatalf("unknown object: code = %v, want ref_not_found", body["code"])
 			}
 		})
 
@@ -812,9 +841,7 @@ func TestWriteRefsNotes(t *testing.T) {
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("missing object_ref: status %d body %v, want 400", resp.StatusCode, body)
 			}
-			if result := wrefNoteResultOf(t, body); result["status"] != "invalid" {
-				t.Fatalf("result = %v", result)
-			}
+			wrefProblem(t, resp, body)
 		})
 
 		// Issue #161: object_ref accepts revisions — a branch, tag, short
@@ -864,9 +891,7 @@ func TestWriteRefsNotes(t *testing.T) {
 				if resp.StatusCode != http.StatusNotFound {
 					t.Fatalf("%s no-such-rev: status = %d body %v, want 404", method, resp.StatusCode, body)
 				}
-				if result := wrefNoteResultOf(t, body); result["status"] != "not_found" {
-					t.Fatalf("%s no-such-rev: result = %v", method, result)
-				}
+				wrefProblem(t, resp, body)
 			}
 
 			// Unchanged 40-hex fast path: the annotated tag OBJECT takes a
@@ -943,8 +968,8 @@ func TestWriteRefsPolicies(t *testing.T) {
 			if resp.StatusCode != http.StatusForbidden {
 				t.Fatalf("status = %d body %v, want 403", resp.StatusCode, body)
 			}
-			if result := wrefNoteResultOf(t, body); result["status"] != "forbidden" || result["success"] != false {
-				t.Fatalf("result = %v", result)
+			if msg := wrefProblem(t, resp, body); !strings.Contains(msg, "no-push") {
+				t.Fatalf("error = %q", msg)
 			}
 			if _, exists := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]; exists {
 				t.Fatal("denied notes ref was created")
@@ -1127,7 +1152,7 @@ func TestNotesQuota(t *testing.T) {
 			}
 			mux := http.NewServeMux()
 			s.registerWriteRefRoutes(mux, auth.NewVerifier(e.store), "", nil)
-			srv := httptest.NewServer(recoverPanics(s.logger)(mux))
+			srv := httptest.NewServer(withProblemInstance(recoverPanics(s.logger)(mux)))
 			t.Cleanup(srv.Close)
 			return srv
 		}
@@ -1143,15 +1168,14 @@ func TestNotesQuota(t *testing.T) {
 			t.Fatalf("usage after note = (%d, %v), want > 0", usage, err)
 		}
 
-		// 1-byte quota: denied with the note envelope's 403, nothing stored.
+		// 1-byte quota: denied with a 403 problem body, nothing stored.
 		resp, body = wrefDo(t, quotaSrv(1), "POST", "/api/v1/repos/notes", fx.token,
 			map[string]any{"sha": fx.c2, "action": "add", "note": "over quota"})
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("over-quota note = %d body %v", resp.StatusCode, body)
 		}
-		result := wrefNoteResultOf(t, body)
-		if result["success"] != false || !strings.Contains(result["message"].(string), "quota") {
-			t.Fatalf("result = %v, want quota failure", result)
+		if msg := wrefProblem(t, resp, body); !strings.Contains(msg, "quota") {
+			t.Fatalf("error = %q, want quota failure", msg)
 		}
 		after, err := blob.StorageUsageBytes(context.Background(), e.blobStore, fx.repoID)
 		if err != nil || after != usage {

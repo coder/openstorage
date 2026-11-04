@@ -116,50 +116,36 @@ type wmMergeResponse struct {
 	PromotedCommits int           `json:"promoted_commits"`
 }
 
-// wmFailBody is the merge failure envelope: the docs/explanation/streaming-commit-protocols.md result object,
-// plus conflict_paths + merge_base_sha on merge conflicts (docs/reference/http-api.md).
-type wmFailBody struct {
-	Result        wmFailResult `json:"result"`
-	ConflictPaths []string     `json:"conflict_paths,omitempty"`
-	MergeBaseSHA  string       `json:"merge_base_sha,omitempty"`
+// wmConflictBody is upstream's MergeConflict, the 409 application/json body
+// for file conflicts (conflict_type merge_conflict). Upstream also sends it
+// when an automatic stale-target retry fails (target_moved, repo_changed).
+// open.storage has no such retry, so a target that moved is "any other
+// conflict": a plain problem body, like every other merge failure (#352
+// item 3).
+type wmConflictBody struct {
+	Error         string   `json:"error"`
+	ConflictType  string   `json:"conflict_type"`
+	ConflictPaths []string `json:"conflict_paths,omitempty"`
+	MergeBaseSHA  string   `json:"merge_base_sha,omitempty"`
 }
 
-// wmFailResult is the merge failure `result`. Upstream's merge failures
-// are problem bodies, not RefUpdateResult, so it keeps the short form that
-// the other write routes' failure envelopes use.
-type wmFailResult struct {
-	Branch  string `json:"branch,omitempty"`
-	OldSHA  string `json:"old_sha,omitempty"`
-	Success bool   `json:"success"`
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
-}
-
-// wmFail writes the merge failure envelope; the status string must agree
-// with the docs/explanation/streaming-commit-protocols.md HTTP mapping (same fail-fast table as wcFail).
-func wmFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string) {
-	wmFailConflict(w, httpCode, status, msg, branch, oldSHA, nil, "")
-}
-
-// wmFailConflict is wmFail plus the 409 merge-conflict extras. The
-// status/code pairing is checked against the shared docs/explanation/streaming-commit-protocols.md table
-// (statusForHTTP, errors.go).
-func wmFailConflict(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string, conflictPaths []string, mergeBase string) {
-	assertf(statusForHTTP(httpCode) == status, "wmFail: status %q does not map to HTTP %d", status, httpCode)
-	assertf(msg != "", "wmFail: empty message")
-	writeJSON(w, httpCode, wmFailBody{
-		Result:        wmFailResult{Branch: branch, OldSHA: oldSHA, Success: false, Status: status, Message: msg},
+// wmFailConflict writes the 409 MergeConflict body for file conflicts.
+func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, mergeBase string) {
+	assertf(msg != "" && len(conflictPaths) > 0, "wmFailConflict: message %q with %d paths", msg, len(conflictPaths))
+	writeJSON(w, http.StatusConflict, wmConflictBody{
+		Error:         msg,
+		ConflictType:  "merge_conflict",
 		ConflictPaths: conflictPaths,
 		MergeBaseSHA:  mergeBase,
 	})
 }
 
-// wmInternal logs the real error and writes the generic 500 envelope
+// wmInternal logs the real error and writes the generic 500 problem body
 // (docs/reference/http-api.md: raw error strings never leak onto the wire).
 func (s *server) wmInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wmInternal: nil error or empty op")
 	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
-	wmFail(w, http.StatusInternalServerError, "internal", internalErrorMsg, "", "")
+	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
 // ---------------------------------------------------------------------------
@@ -397,12 +383,12 @@ func wmPromotedCommits(ctx context.Context, sc *wcScratch, tips map[string]strin
 
 // wmCheckRefPolicy enforces the token ref policies (docs/reference/authentication.md, invariant 5)
 // for the merge-driven target update, mirroring the git update hook (see
-// package comment for the per-op semantics). Writes the 403 envelope and
+// package comment for the per-op semantics). Writes the 403 problem body and
 // returns false on denial.
 func (s *server) wmCheckRefPolicy(w http.ResponseWriter, r *http.Request, sc *wcScratch, refName, old, new string, serverCreatedCommit bool, targetBranch string) bool {
 	assertf(ref.ValidSHA(old) && ref.ValidSHA(new), "wmCheckRefPolicy: malformed shas %q %q", old, new)
 	deny := func(msg string) bool {
-		wmFail(w, http.StatusForbidden, "forbidden", msg, targetBranch, old)
+		writeErr(w, http.StatusForbidden, msg)
 		return false
 	}
 	policies, perr := refPolicies(mustClaims(r))
@@ -478,10 +464,13 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	// stays as the deprecated bare-name alias, the current name winning
 	// on conflict. Canonicalize into SourceBranch so the merge flow and
 	// the response echo one bare branch name.
+	sourceField := "source_ref"
 	if req.SourceRef != "" {
 		req.SourceBranch = strings.TrimPrefix(req.SourceRef, "refs/heads/")
+	} else if req.SourceBranch != "" {
+		sourceField = "source_branch"
 	}
-	if err := wcValidateBranchParam("source_ref", req.SourceBranch); err != nil {
+	if err := wcValidateBranchParam(sourceField, req.SourceBranch); err != nil {
 		return err
 	}
 	if err := wcValidateBranchParam("target_branch", req.TargetBranch); err != nil {
@@ -490,21 +479,22 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	switch req.Strategy {
 	case "merge", "ff_only", "ff_prefer":
 	case "":
-		return errors.New("missing strategy")
+		return newFieldError("strategy", "is required", "missing strategy")
 	default:
-		return fmt.Errorf("invalid strategy %q (want merge|ff_only|ff_prefer)", req.Strategy)
+		return newFieldError("strategy", "must be merge, ff_only or ff_prefer",
+			fmt.Sprintf("invalid strategy %q (want merge|ff_only|ff_prefer)", req.Strategy))
 	}
 	if req.Squash && req.Strategy == "ff_only" {
 		return errors.New("squash is incompatible with the ff_only strategy")
 	}
 	req.ExpectedTargetSHA = lowerFullSHA(req.ExpectedTargetSHA)
 	if req.ExpectedTargetSHA != "" && !ref.ValidSHA(req.ExpectedTargetSHA) {
-		return errors.New("expected_target_sha must be a 40-hex sha")
+		return newFieldError("expected_target_sha", "must be a 40-hex sha", "expected_target_sha must be a 40-hex sha")
 	}
 	if req.ExpectedSourceSHA != nil {
 		var pin string
 		if err := json.Unmarshal(req.ExpectedSourceSHA, &pin); err != nil || !ref.ValidSHA(lowerFullSHA(pin)) {
-			return errors.New("expected_source_sha must be a 40-hex sha")
+			return newFieldError("expected_source_sha", "must be a 40-hex sha", "expected_source_sha must be a 40-hex sha")
 		}
 		req.sourcePin = lowerFullSHA(pin)
 	}
@@ -534,20 +524,20 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		wmFail(w, http.StatusBadRequest, "invalid", "read request body: "+err.Error(), "", "")
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
 		return
 	}
 	var req wmMergeRequest
 	if len(body) == 0 {
-		wmFail(w, http.StatusBadRequest, "invalid", "missing request body", "", "")
+		writeErr(w, http.StatusBadRequest, "missing request body")
 		return
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		wmFail(w, http.StatusBadRequest, "invalid", "invalid JSON body: "+err.Error(), "", "")
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}
 	if err := wmValidateMergeRequest(&req); err != nil {
-		wmFail(w, http.StatusBadRequest, "invalid", err.Error(), req.TargetBranch, "")
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 
@@ -564,12 +554,12 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	// checks.
 	sourceSHA, sourceExists := tips[sourceRef]
 	if !sourceExists && req.sourcePin == "" {
-		wmFail(w, http.StatusNotFound, "not_found", "source branch "+req.SourceBranch+" not found", req.TargetBranch, "")
+		writeProblem(w, http.StatusNotFound, codeBranchNotFound, "source branch "+req.SourceBranch+" not found")
 		return
 	}
 	targetSHA, ok := tips[targetRef]
 	if !ok {
-		wmFail(w, http.StatusNotFound, "not_found", "target branch "+req.TargetBranch+" not found", req.TargetBranch, "")
+		writeProblem(w, http.StatusNotFound, codeBranchNotFound, "target branch "+req.TargetBranch+" not found")
 		return
 	}
 	// A stale guard is a 409 ref_guard_failed problem body before any
@@ -694,22 +684,21 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !won {
-			wmFail(w, http.StatusConflict, "conflict", "ref "+targetRef+" moved concurrently", req.TargetBranch, targetSHA)
+			writeErr(w, http.StatusConflict, "ref "+targetRef+" moved concurrently")
 			return
 		}
 		respond("fast_forward", sourceSHA, tree, sourceSHA, promoted)
 		return
 	}
+	// Upstream's merge 412 names both refusals: "a merge with no common
+	// ancestor" and a target "that moved off a fast-forward under the
+	// ff_only strategy".
 	if req.Strategy == "ff_only" {
-		wmFail(w, http.StatusConflict, "conflict",
-			"merge of "+req.SourceBranch+" into "+req.TargetBranch+" is not a fast-forward",
-			req.TargetBranch, targetSHA)
+		writeErr(w, http.StatusPreconditionFailed, "merge of "+req.SourceBranch+" into "+req.TargetBranch+" is not a fast-forward")
 		return
 	}
 	if !hasBase && !req.AllowUnrelatedHistories {
-		wmFail(w, http.StatusConflict, "conflict",
-			"refusing to merge unrelated histories (set allow_unrelated_histories)",
-			req.TargetBranch, targetSHA)
+		writeErr(w, http.StatusPreconditionFailed, "refusing to merge unrelated histories (set allow_unrelated_histories)")
 		return
 	}
 
@@ -723,13 +712,13 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		if hasBase {
 			mergeBase = base
 		}
-		wmFailConflict(w, http.StatusConflict, "conflict",
+		wmFailConflict(w,
 			fmt.Sprintf("merge of %s into %s has %d conflicting paths", req.SourceBranch, req.TargetBranch, len(mt.paths)),
-			req.TargetBranch, targetSHA, mt.paths, mergeBase)
+			mt.paths, mergeBase)
 		return
 	}
 	if req.Author == nil {
-		wmFail(w, http.StatusBadRequest, "invalid", "author is required when the merge creates a commit", req.TargetBranch, targetSHA)
+		writeInvalidField(w, "author", "is required", "author is required when the merge creates a commit")
 		return
 	}
 	committer := *req.Author
@@ -767,13 +756,13 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	// strands only an unreferenced immutable pack (invariant 1).
 	_, won, err := s.wcPublish(ctx, sc, repo.RepoID, &wcPlan{refName: targetRef, oldSHA: targetSHA, tips: tips}, commit)
 	if errors.Is(err, errPackQuotaExceeded) {
-		wmFail(w, http.StatusForbidden, "forbidden", err.Error(), req.TargetBranch, targetSHA)
+		writeErr(w, http.StatusForbidden, err.Error())
 		return
 	}
 	if errors.Is(err, errPackReservationsBusy) {
 		// Transient row-cap denial (Codex round 43): retryable.
 		rateLimited(w, 10)
-		wmFail(w, http.StatusTooManyRequests, "unavailable", err.Error(), req.TargetBranch, targetSHA)
+		writeErr(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
 	if err != nil {
@@ -781,7 +770,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !won {
-		wmFail(w, http.StatusConflict, "conflict", "ref "+targetRef+" moved concurrently", req.TargetBranch, targetSHA)
+		writeErr(w, http.StatusConflict, "ref "+targetRef+" moved concurrently")
 		return
 	}
 	respond(outcome, commit, mt.tree, commit, promoted)

@@ -278,7 +278,7 @@ func expectedProblemCodes(t *testing.T, status int, msg string) []string {
 		code = "branch_not_found"
 	case status == http.StatusNotFound && (slices.Contains([]string{"ref not found", "tag not found", "commit not found",
 		"base commit not found", "base not found", "base ref not found", "ref does not resolve to a commit"}, msg) ||
-		strings.HasPrefix(msg, "object_ref does not resolve to a commit: ") ||
+		strings.HasPrefix(msg, "object_ref does not resolve to a commit: ") || strings.HasPrefix(msg, "object not found: ") ||
 		strings.HasPrefix(msg, "base_ref ") && strings.HasSuffix(msg, " does not resolve to a commit") ||
 		strings.HasPrefix(msg, "restore target ") && strings.HasSuffix(msg, " not found")):
 		code = "ref_not_found"
@@ -856,10 +856,7 @@ func TestResultEnvelopeContentType(t *testing.T) {
 			wcFail(&envelopeWriter{ResponseWriter: w, statuses: []int{http.StatusConflict}}, http.StatusConflict, "conflict", "branch moved", "main", ref.ZeroSHA)
 		},
 		"wmFailConflict": func(w http.ResponseWriter) {
-			wmFailConflict(w, http.StatusConflict, "conflict", "merge conflict", "main", ref.ZeroSHA, []string{"a"}, ref.ZeroSHA)
-		},
-		"wrefNoteFail": func(w http.ResponseWriter) {
-			wrefNoteFail(w, http.StatusConflict, "notes moved", ref.ZeroSHA, "refs/notes/commits", "", ref.ZeroSHA)
+			wmFailConflict(w, "merge conflict", []string{"a"}, ref.ZeroSHA)
 		},
 	} {
 		rr := httptest.NewRecorder()
@@ -1237,6 +1234,22 @@ func testInvalidParamsOnValidators(t *testing.T, e *testEnv) {
 			[]param{req("archive.prefix", "must be a relative path inside the archive")}},
 		{"credential password", http.MethodPost, "/api/v1/repos/git-credentials", repoTok, `{"repo_id":"` + created.RepoID + `"}`, []param{req("password", "is required")}},
 		{"credential id", http.MethodPut, "/api/v1/repos/git-credentials", orgTok, `{"password":"p"}`, []param{req("id", "is required")}},
+		{"merge source", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"target_branch":"main","strategy":"merge"}`, []param{req("source_ref", "is required")}},
+		{"merge deprecated source", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_branch":"bad..name","target_branch":"main","strategy":"merge"}`,
+			[]param{req("source_branch", "must be a valid branch name")}},
+		{"merge target prefix", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"refs/heads/main","strategy":"merge"}`,
+			[]param{req("target_branch", "must not include the refs/ prefix")}},
+		{"merge strategy", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"main","strategy":"rebase"}`,
+			[]param{req("strategy", "must be merge, ff_only or ff_prefer")}},
+		{"merge guard", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"main","strategy":"merge","expected_target_sha":"x"}`,
+			[]param{req("expected_target_sha", "must be a 40-hex sha")}},
+		{"merge author", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"main","strategy":"merge","author":{"email":"e"}}`,
+			[]param{req("author.name", "is required")}},
+		{"merge squash ff_only", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"main","strategy":"ff_only","squash":true}`, nil},
+		{"note delete body", http.MethodDelete, "/api/v1/repos/notes", gitTok, `{"object_ref":"main","expected_notes_ref_sha":"x"}`,
+			[]param{req("expected_notes_ref_sha", "must be a full 40-hex object id")}},
+		{"note delete query", http.MethodDelete, "/api/v1/repos/notes?object_ref=main&expected_notes_ref_sha=x", gitTok, ``, nil},
+		{"note delete nothing", http.MethodDelete, "/api/v1/repos/notes", gitTok, ``, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(tc.body), "")
