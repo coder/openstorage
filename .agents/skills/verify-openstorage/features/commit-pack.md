@@ -148,6 +148,6 @@ NDJSON
 - `target_branch` is a short name. A `refs/` prefix is refused.
 - Write the frames with a quoted heredoc. An unquoted one lets the shell expand `$` inside the JSON.
 - A stale `expected_target_sha` (or the deprecated `expected_head_sha`) answers HTTP `409` with `code` `ref_guard_failed`, `guard`, `current_sha` and `result.status` `conflict`. A `409` with `result.status` `failed` and no `code` means a lost race with another writer, which this recipe cannot force.
-- Auth failures on commit-pack (`401`, `403`) answer with the problem body of every route (`code` `unauthorized` or `insufficient_scope`). Failures inside the handler answer in the `result` envelope (`{"commit":null,"result":{"target_branch":...,"status":"not_found",...}}`).
+- Auth failures on commit-pack (`401`, `403`) answer with the problem body of every route (`code` `unauthorized` or `insufficient_scope`). Its `400`, `409`, `412` and `413` answer in the `result` envelope (`{"commit":null,"result":{"target_branch":"main",...,"status":"precondition_failed",...}}`). Its other failures, `404` included, answer with the problem body.
 - Without `committer`, the committer is the author.
 - `list-packs` reads the blob store only. Run it with `env -i PATH="$PATH"` so an inherited `OPENSTORAGE_S3_URL` does not point it at another store.

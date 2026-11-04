@@ -145,8 +145,8 @@ Success (HTTP 200):
 `branch`, `old_sha`, `new_sha`, `success` and `status`. A member with no value is an
 empty string.
 
-Failure uses the same envelope with `commit: null` (except a lost CAS, below),
-`result.success = false` and
+A failure envelope (on the statuses listed at the end of this section) has the same
+shape, with `commit: null` (except a lost CAS, below), `result.success = false` and
 `result.status` one of `precondition_failed, conflict, not_found, invalid, timeout,
 unauthorized, forbidden, unavailable, payload_too_large, internal, failed`. For example, a
 frame that is not a metadata frame answers 400:

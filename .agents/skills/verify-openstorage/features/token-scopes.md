@@ -120,7 +120,7 @@ printf 'denied\n' >"$OSV_WORK/seed/denied.txt"
 - `--token none` on `osv.sh git` never sends credentials: git stops at `could not read Username ... terminal prompts disabled` (exit `128`) and the server sees no authenticated request. Prove the server's `401` with `osv.sh api --token none` on `/demo.git/info/refs?service=git-upload-pack`.
 - git reports a `401` as `Authentication failed` and a `403` as `The requested URL returned error: 403`. Both exit `128`.
 - For `/api/v1/...` the repo comes from the token, so a token for another repo reads that repo, or gets `404` `repository_not_found` when it does not exist. A mismatch is only visible on Git URLs and `/api/repos/{repo_name}/...` aliases.
-- Every endpoint answers auth failures with the problem body (`{"error": ..., "code": ...}`), write endpoints that move refs included. Only failures inside the commit-pack, diff-commit, restore-commit, merge and notes handlers use a `result` envelope.
+- Every endpoint answers auth failures with the problem body (`{"error": ..., "code": ...}`), write endpoints that move refs included. Only some failures inside the commit-pack, diff-commit, restore-commit, merge and notes handlers use a `result` envelope.
 - The Git surface wants Basic auth with user `t`. `osv.sh api` sends Basic on every non-`/api` path. A Bearer header there answers `401` `basic auth with username 't' required`.
 - `mint` refuses a zero or negative `--ttl`. Mint a short one and wait for it to expire.
 - The REST `401` messages are generic (`invalid token`). The Git surface answers with more detail, for example `jwt must be a compact JWS (header.payload.signature)`. Branch on status codes, not messages.
