@@ -1444,19 +1444,9 @@ func TestWriteReservationCapAnswers429(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				before := wmRefsSnapshot(t, e, repo.RepoID)
 				resp, body := tc.do()
-				if tc.name == "merge" {
-					// Merge handler failures keep the envelope until #352 item 3
-					// reaches merge.
-					env := wctDecode(t, body)
-					if resp.StatusCode != http.StatusTooManyRequests || env.Result.Status != "unavailable" ||
-						env.Result.Branch != "main" || !strings.Contains(env.Result.Message, "retry later") {
-						t.Fatalf("429 = %d %s, want an unavailable envelope for main with a retry message", resp.StatusCode, body)
-					}
-				} else {
-					wctRequireFail(t, resp, body, http.StatusTooManyRequests, "unavailable")
-					if msg := requireEnvelope(t, resp, body); !strings.Contains(msg, "retry later") {
-						t.Fatalf("429 error = %q, want a retry message", msg)
-					}
+				wctRequireFail(t, resp, body, http.StatusTooManyRequests, "unavailable")
+				if msg := requireEnvelope(t, resp, body); !strings.Contains(msg, "retry later") {
+					t.Fatalf("429 error = %q, want a retry message", msg)
 				}
 				if got := resp.Header.Get("Retry-After"); got != "10" {
 					t.Fatalf("Retry-After = %q, want 10", got)

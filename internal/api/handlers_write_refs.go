@@ -682,22 +682,6 @@ type wrefNoteResponse struct {
 	Result     wrefNoteResult `json:"result"`
 }
 
-// wrefNoteFail writes the docs/reference/http-api.md note-write envelope with a failure result
-// (SDKs parse this body on every 4xx/5xx and raise typed RefUpdateErrors).
-// newRefSHA is the notes ref's current tip, or the zero sha when unborn.
-func wrefNoteFail(w http.ResponseWriter, httpStatus int, msg, sha, targetRef, baseCommit, newRefSHA string) {
-	assertf(httpStatus >= 400 && httpStatus < 600, "wrefNoteFail: non-error status %d", httpStatus)
-	assertf(msg != "", "wrefNoteFail: empty message")
-	writeJSON(w, httpStatus, wrefNoteResponse{
-		SHA:        sha,
-		NotesRef:   targetRef,
-		TargetRef:  targetRef,
-		BaseCommit: baseCommit,
-		NewRefSHA:  newRefSHA,
-		Result:     wrefNoteResult{Success: false, Status: statusForHTTP(httpStatus), Message: msg},
-	})
-}
-
 // wrefNoteGuardBody is upstream's NotesWriteRefGuardProblemDetails: the
 // note-write failure envelope plus the ref_guard_failed problem members.
 type wrefNoteGuardBody struct {
@@ -967,11 +951,11 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 	targetRef, err := wrefNotesRefName(notesRefRaw)
 	if err != nil {
-		wrefNoteFail(w, http.StatusBadRequest, err.Error(), objectSHA, notesRefRaw, "", ref.ZeroSHA)
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if objectSHA == "" {
-		wrefNoteFail(w, http.StatusBadRequest, "object_ref is required", objectSHA, targetRef, "", ref.ZeroSHA)
+		writeErr(w, http.StatusBadRequest, "object_ref is required")
 		return
 	}
 	action := "remove"
@@ -982,23 +966,23 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			action = "add"
 		}
 		if action != "add" && action != "append" {
-			wrefNoteFail(w, http.StatusBadRequest, "action must be add or append", objectSHA, targetRef, "", ref.ZeroSHA)
+			writeErr(w, http.StatusBadRequest, "action must be add or append")
 			return
 		}
 		if req.Note == "" {
-			wrefNoteFail(w, http.StatusBadRequest, "note is required", objectSHA, targetRef, "", ref.ZeroSHA)
+			writeErr(w, http.StatusBadRequest, "note is required")
 			return
 		}
 	}
 	expectedRefSHA = lowerFullSHA(expectedRefSHA)
 	if expectedRefSHA != "" && !ref.ValidSHA(expectedRefSHA) {
-		wrefNoteFail(w, http.StatusBadRequest, "expected_notes_ref_sha must be a full 40-hex object id", objectSHA, targetRef, "", ref.ZeroSHA)
+		writeErr(w, http.StatusBadRequest, "expected_notes_ref_sha must be a full 40-hex object id")
 		return
 	}
 	author := wrefNoteAuthor{Name: "open.storage", Email: "notes@openstorage.invalid"}
 	if req.Author != nil {
 		if req.Author.Name == "" || req.Author.Email == "" {
-			wrefNoteFail(w, http.StatusBadRequest, "author name and email are required when author is provided", objectSHA, targetRef, "", ref.ZeroSHA)
+			writeErr(w, http.StatusBadRequest, "author name and email are required when author is provided")
 			return
 		}
 		author = *req.Author
@@ -1028,7 +1012,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		// (the stale-guard 409 included) reports the resolved id in `sha`.
 		resolved, err := gitread.ResolveRef(ctx, repoPath, objectSHA, false)
 		if errors.Is(err, gitread.ErrNotFound) {
-			wrefNoteFail(w, http.StatusNotFound, "object_ref does not resolve to a commit: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
+			writeProblem(w, http.StatusNotFound, codeRefNotFound, "object_ref does not resolve to a commit: "+objectSHA)
 			return
 		} else if err != nil {
 			s.internalErr(w, r, "resolve note object_ref", err)
@@ -1051,7 +1035,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	// revision-resolved objectSHA re-verifies trivially).
 	if _, err := wrefGit(ctx, repoPath, nil, nil,
 		"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
-		wrefNoteFail(w, http.StatusNotFound, "object not found: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
+		writeErr(w, http.StatusNotFound, "object not found: "+objectSHA)
 		return
 	}
 	// Existence check drives add-vs-existing (409) and delete-missing (404).
@@ -1063,11 +1047,11 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		}
 	}
 	if action == "add" && noteExists {
-		wrefNoteFail(w, http.StatusConflict, "note already exists for "+objectSHA, objectSHA, targetRef, old, oldOrZero)
+		writeErr(w, http.StatusConflict, "note already exists for "+objectSHA)
 		return
 	}
 	if deleteNote && !noteExists {
-		wrefNoteFail(w, http.StatusNotFound, "no note found for "+objectSHA, objectSHA, targetRef, old, oldOrZero)
+		writeErr(w, http.StatusNotFound, "no note found for "+objectSHA)
 		return
 	}
 
@@ -1091,21 +1075,21 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		return
 	}
 	if deny != "" {
-		wrefNoteFail(w, http.StatusForbidden, deny, objectSHA, targetRef, old, oldOrZero)
+		writeErr(w, http.StatusForbidden, deny)
 		return
 	}
 
 	if err := s.wrefPublish(ctx, repoPath, repo.RepoID, scratchEnv, oldOrZero, newSHA); err != nil {
 		if errors.Is(err, errPackQuotaExceeded) {
 			// Same 403 quota denial as commit-pack/merge/pre-receive
-			// (issue #21), in this route's note envelope.
-			wrefNoteFail(w, http.StatusForbidden, err.Error(), objectSHA, targetRef, old, oldOrZero)
+			// (issue #21).
+			writeErr(w, http.StatusForbidden, err.Error())
 			return
 		}
 		if errors.Is(err, errPackReservationsBusy) {
 			// Transient row-cap denial (Codex round 43): retryable.
 			rateLimited(w, 10)
-			wrefNoteFail(w, http.StatusTooManyRequests, err.Error(), objectSHA, targetRef, old, oldOrZero)
+			writeErr(w, http.StatusTooManyRequests, err.Error())
 			return
 		}
 		s.internalErr(w, r, "publish notes objects", err)
@@ -1119,7 +1103,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	if !won {
 		// Lost CAS race: the published pack stays registered but
 		// unreferenced (immutable, same as the push-hook pipeline).
-		wrefNoteFail(w, http.StatusConflict, targetRef+" moved concurrently", objectSHA, targetRef, old, oldOrZero)
+		writeErr(w, http.StatusConflict, targetRef+" moved concurrently")
 		return
 	}
 	okStatus := http.StatusOK // recorded deviation: the legacy routes answer 200

@@ -253,7 +253,7 @@ func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, e
 // ---------------------------------------------------------------------------
 // Repo resolution + ref policy
 
-// wcResolveRepo maps the JWT repo claim to its live repo row with envelope
+// wcResolveRepo maps the JWT repo claim to its live repo row with problem-body
 // errors. The claim may carry the repo url or the server-generated repo_id
 // (docs/reference/authentication.md: auth accepts both), resolved through the shared
 // meta.ResolveRepoKey (ADR-21: repo_id first, then url).

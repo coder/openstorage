@@ -506,7 +506,7 @@ Per-repository storage quota (packs + LFS), enforced at every external storage w
 - **Where it is enforced:**
   - Git pushes that would grow `packs/` past the quota: refused at pre-receive, before
     anything is stored.
-  - REST pack writes (commit-pack, merge, notes, fork): `403` envelope.
+  - REST pack writes (commit-pack, merge, notes, fork): `403` problem body.
   - Git LFS uploads: per-object `507` batch errors before any transfer URL is issued. The
     verified upload re-checks the actual `Content-Length`, so under-declared sizes cannot
     bypass it.

@@ -97,7 +97,7 @@ func TestMergeExpectedSourceSHA(t *testing.T) {
 			}
 			resp, raw = wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("gone", "main", "merge", map[string]any{"author": wmTestAuthor}))
-			if resp.StatusCode != http.StatusNotFound || wmResult(t, wmDecode(t, raw))["message"] != "source branch gone not found" {
+			if resp.StatusCode != http.StatusNotFound || wmProblem(t, resp, raw) != "source branch gone not found" {
 				t.Fatalf("no pin: status %d body %s, want 404 source branch gone not found", resp.StatusCode, raw)
 			}
 			// The target guard runs first, and a missing target is a 404.
@@ -107,7 +107,7 @@ func TestMergeExpectedSourceSHA(t *testing.T) {
 				"expected_target_sha "+fx.c1+" does not match current tip "+fx.c2)
 			resp, raw = wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("gone", "nope", "merge", map[string]any{"expected_source_sha": fx.featTip}))
-			if resp.StatusCode != http.StatusNotFound || wmResult(t, wmDecode(t, raw))["message"] != "target branch nope not found" {
+			if resp.StatusCode != http.StatusNotFound || wmProblem(t, resp, raw) != "target branch nope not found" {
 				t.Fatalf("missing target: status %d body %s, want 404 target branch nope not found", resp.StatusCode, raw)
 			}
 		})
@@ -119,8 +119,8 @@ func TestMergeExpectedSourceSHA(t *testing.T) {
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Fatalf("pin %#v: status = %d, body %s", pin, resp.StatusCode, raw)
 				}
-				if res := wmResult(t, wmDecode(t, raw)); res["message"] != "expected_source_sha must be a 40-hex sha" {
-					t.Fatalf("pin %#v: result = %v", pin, res)
+				if msg := wmProblem(t, resp, raw); msg != "expected_source_sha must be a 40-hex sha" {
+					t.Fatalf("pin %#v: error = %q", pin, msg)
 				}
 			}
 		})

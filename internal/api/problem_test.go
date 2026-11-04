@@ -781,10 +781,7 @@ func TestResultEnvelopeContentType(t *testing.T) {
 			wcFail(&envelopeWriter{ResponseWriter: w, statuses: []int{http.StatusConflict}}, http.StatusConflict, "conflict", "branch moved", "main", ref.ZeroSHA)
 		},
 		"wmFailConflict": func(w http.ResponseWriter) {
-			wmFailConflict(w, http.StatusConflict, "conflict", "merge conflict", "main", ref.ZeroSHA, []string{"a"}, ref.ZeroSHA)
-		},
-		"wrefNoteFail": func(w http.ResponseWriter) {
-			wrefNoteFail(w, http.StatusConflict, "notes moved", ref.ZeroSHA, "refs/notes/commits", "", ref.ZeroSHA)
+			wmFailConflict(w, "merge_conflict", "merge conflict", []string{"a"}, ref.ZeroSHA)
 		},
 	} {
 		rr := httptest.NewRecorder()
