@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // middleware is a plain http.Handler decorator.
@@ -101,7 +103,8 @@ func bearerToken(r *http.Request) (string, bool) {
 }
 
 // requireAuth enforces the docs/reference/authentication.md failure map for one route: missing or
-// unverifiable token -> 401 (+WWW-Authenticate via writeErr); verified token
+// unverifiable token -> 401 (+WWW-Authenticate via writeErr); a key store
+// failure -> 403 authentication_unavailable; verified token
 // issued for another org (issue #47), missing ANY of the required scopes
 // (docs/reference/authentication.md: e.g. DELETE /repos/tags demands both git:read and git:write), a
 // non-"org" repo claim on an org-level route, or an empty/"org" repo claim
@@ -122,6 +125,13 @@ func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScop
 				return
 			}
 			claims, err := verifier.Verify(r.Context(), token)
+			var keysErr *auth.KeySourceError
+			if errors.As(err, &keysErr) && !errors.Is(err, meta.ErrNotFound) {
+				// The key store failed: the token may be valid, so ask the
+				// client to retry, as upstream's code says.
+				writeProblem(w, http.StatusForbidden, codeAuthenticationUnavailable, "cannot verify the token now, retry")
+				return
+			}
 			if err != nil {
 				writeProblem(w, http.StatusUnauthorized, genericProblemCode(http.StatusUnauthorized), "invalid token")
 				return

@@ -2,7 +2,7 @@ package api
 
 // Route coverage for the stable upstream SDK (issue #656): every operation
 // that github.com/pierrecomputer/sdk/go v0.1.0 calls must reach a handler,
-// never the ServeMux's own 404/405, plus the behavior of the three routes
+// never unmatchedAPIRoute's 404/405, plus the behavior of the three routes
 // that #656 added (GET/POST /api/repos and DELETE .../tags/{tag_name}).
 
 import (
@@ -62,12 +62,17 @@ var sdk010Routes = []struct{ id, method, path string }{
 	{"repos.delete", http.MethodDelete, "/api/repos/{repo_name}"},
 }
 
-// muxFallback reports whether a response came from http.ServeMux itself
-// (no pattern matched the path, or none matched the method) rather than
-// from a registered route: those answer in text/plain, every route in JSON.
-func muxFallback(resp *http.Response) bool {
-	return (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed) &&
-		strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain")
+// muxFallback reports whether a response came from unmatchedAPIRoute (no
+// pattern matched the path, or none matched the method) rather than from a
+// registered route: those answer route_not_found or method_not_allowed,
+// which no route sends.
+func muxFallback(resp *http.Response, body []byte) bool {
+	var p struct {
+		Code string `json:"code"`
+	}
+	_ = json.Unmarshal(body, &p)
+	return resp.StatusCode == http.StatusNotFound && p.Code == codeRouteNotFound ||
+		resp.StatusCode == http.StatusMethodNotAllowed && p.Code == genericProblemCode(http.StatusMethodNotAllowed)
 }
 
 func TestSDK010RoutesServed(t *testing.T) {
@@ -81,15 +86,15 @@ func TestSDK010RoutesServed(t *testing.T) {
 		scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite, auth.ScopeRepoWrite}})
 	orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}})
 
-	// Control: an unregistered path and an unregistered method get the
-	// mux's own answers, which muxFallback must recognize.
+	// Control: an unregistered path and an unregistered method get
+	// unmatchedAPIRoute's answers, which muxFallback must recognize.
 	for _, c := range []struct{ method, path string }{
 		{http.MethodGet, "/api/repos/" + url.PathEscape(fx.repo.URL) + "/no-such-route"},
 		{http.MethodPut, "/api/repos"},
 	} {
 		resp, body := e.doReq(t, c.method, c.path, repoTok, nil, "")
-		if !muxFallback(resp) {
-			t.Fatalf("control %s %s = %d %q (%s), want a ServeMux 404/405",
+		if !muxFallback(resp, body) {
+			t.Fatalf("control %s %s = %d %q (%s), want unmatchedAPIRoute's 404/405",
 				c.method, c.path, resp.StatusCode, resp.Header.Get("Content-Type"), body)
 		}
 	}
@@ -106,7 +111,7 @@ func TestSDK010RoutesServed(t *testing.T) {
 		}
 		// Without a token, the route's auth answers 401 in JSON.
 		resp, body := e.doReq(t, op.method, path, "", nil, "")
-		if resp.StatusCode != http.StatusUnauthorized || muxFallback(resp) {
+		if resp.StatusCode != http.StatusUnauthorized || muxFallback(resp, body) {
 			t.Errorf("%s %s %s without token = %d %q (%s), want the route's 401",
 				op.id, op.method, path, resp.StatusCode, resp.Header.Get("Content-Type"), body)
 		}
@@ -122,7 +127,7 @@ func TestSDK010RoutesServed(t *testing.T) {
 			reqBody = []byte(`{`)
 		}
 		resp, body = e.doReq(t, op.method, path, tok, reqBody, "")
-		if muxFallback(resp) || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if muxFallback(resp, body) || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			t.Errorf("%s %s %s with token = %d %q (%s), want a handler answer",
 				op.id, op.method, path, resp.StatusCode, resp.Header.Get("Content-Type"), body)
 		}

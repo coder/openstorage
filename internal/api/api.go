@@ -242,10 +242,44 @@ func New(cfg Config) (http.Handler, error) {
 	// dispatch to.
 	registerAliasRoutes(mux, s, ss, cfg.Verifier, cfg.Org, rl)
 	registerRepoURLRoutes(mux, s, cfg.Verifier, cfg.Org, rl)
+	mux.Handle(apiPrefix, unmatchedAPIRoute(mux))
 
 	if cfg.Fallback != nil {
 		mux.Handle("/", cfg.Fallback)
 	}
 
 	return withProblemInstance(recoverPanics(logger)(logRequests(logger)(mux))), nil
+}
+
+// apiPrefix is the pattern of unmatchedAPIRoute: every /api/ path that no
+// route matches.
+const apiPrefix = "/api/"
+
+// probeMethods are the methods unmatchedAPIRoute tries for a 405 Allow list.
+var probeMethods = []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
+
+// unmatchedAPIRoute answers an /api/ request that no route matches with
+// upstream's problem bodies (live answers checked 2026-11-04): 405
+// method_not_allowed with an Allow header when the path has routes for
+// other methods, else 404 route_not_found. Registering it stops ServeMux
+// from writing its own plain-text 405s, so it finds the other methods by
+// asking mux which pattern each one would match.
+func unmatchedAPIRoute(mux *http.ServeMux) http.Handler {
+	assertf(mux != nil, "unmatchedAPIRoute: nil mux")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var allow []string
+		for _, m := range probeMethods {
+			probe := r.Clone(r.Context())
+			probe.Method = m
+			if _, pattern := mux.Handler(probe); m != r.Method && pattern != "" && pattern != apiPrefix {
+				allow = append(allow, m)
+			}
+		}
+		if len(allow) > 0 {
+			w.Header().Set("Allow", strings.Join(allow, ", "))
+			writeErr(w, http.StatusMethodNotAllowed, "method "+r.Method+" is not supported for this path")
+			return
+		}
+		writeProblem(w, http.StatusNotFound, codeRouteNotFound, "no API route matches the path")
+	})
 }

@@ -276,29 +276,33 @@ func jsonKind(t reflect.Type) string {
 // A specific code replaces the generic one only where the meaning matches
 // upstream's exactly (issue #352).
 const (
-	codeBranchNotFound     = "branch_not_found"
-	codeCredentialExists   = "credential_exists"
-	codeCredentialNotFound = "credential_not_found"
-	codeInsufficientScope  = "insufficient_scope"
-	codeRefGuardFailed     = "ref_guard_failed"
-	codeRefNotFound        = "ref_not_found"
-	codeRepoNameMismatch   = "repo_name_mismatch"
-	codeRepositoryDeleted  = "repository_deleted"
-	codeRepositoryNotFound = "repository_not_found"
+	codeAuthenticationUnavailable = "authentication_unavailable"
+	codeBranchNotFound            = "branch_not_found"
+	codeCredentialExists          = "credential_exists"
+	codeCredentialNotFound        = "credential_not_found"
+	codeInsufficientScope         = "insufficient_scope"
+	codeRefGuardFailed            = "ref_guard_failed"
+	codeRefNotFound               = "ref_not_found"
+	codeRepoNameMismatch          = "repo_name_mismatch"
+	codeRepositoryDeleted         = "repository_deleted"
+	codeRepositoryNotFound        = "repository_not_found"
+	codeRouteNotFound             = "route_not_found"
 )
 
 // specificProblemCodes maps each specific code to its upstream status
 // (TestSpecificProblemCodesMatchUpstream pins it to the snapshot).
 var specificProblemCodes = map[string]int{
-	codeBranchNotFound:     http.StatusNotFound,
-	codeCredentialExists:   http.StatusConflict,
-	codeCredentialNotFound: http.StatusNotFound,
-	codeInsufficientScope:  http.StatusForbidden,
-	codeRefGuardFailed:     http.StatusConflict,
-	codeRefNotFound:        http.StatusNotFound,
-	codeRepoNameMismatch:   http.StatusBadRequest,
-	codeRepositoryDeleted:  http.StatusConflict,
-	codeRepositoryNotFound: http.StatusNotFound,
+	codeAuthenticationUnavailable: http.StatusForbidden,
+	codeBranchNotFound:            http.StatusNotFound,
+	codeCredentialExists:          http.StatusConflict,
+	codeCredentialNotFound:        http.StatusNotFound,
+	codeInsufficientScope:         http.StatusForbidden,
+	codeRefGuardFailed:            http.StatusConflict,
+	codeRefNotFound:               http.StatusNotFound,
+	codeRepoNameMismatch:          http.StatusBadRequest,
+	codeRepositoryDeleted:         http.StatusConflict,
+	codeRepositoryNotFound:        http.StatusNotFound,
+	codeRouteNotFound:             http.StatusNotFound,
 }
 
 // repoNotFoundMsg is the message of every repository-lookup 404.

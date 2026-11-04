@@ -6,6 +6,10 @@ package api
 // changes upstream's table fails here until the map is updated.
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +27,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -194,6 +199,93 @@ func TestSpecificProblemCodesMatchUpstream(t *testing.T) {
 	}
 }
 
+// TestUnmatchedAPIRoutes: an /api/ path with no route answers upstream's
+// 404 route_not_found, and a path with routes for other methods answers
+// 405 method_not_allowed with Allow, both as problem bodies (#352 item 1).
+func TestUnmatchedAPIRoutes(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		for _, path := range []string{"/api/nope", "/api/v1/nope", "/api/repos/x/nope", "/api/v1/repos/file/extra"} {
+			resp, body := e.doReq(t, http.MethodGet, path, "", nil, "")
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("GET %s = %d %s, want 404", path, resp.StatusCode, body)
+				continue
+			}
+			requireProblemCode(t, resp, body, "route_not_found")
+		}
+		for _, tc := range []struct{ method, path, allow string }{
+			{http.MethodDelete, "/api/meta", "GET, HEAD"},
+			{http.MethodPut, "/api/v1/repos", "GET, HEAD, POST"},
+			{http.MethodGet, "/api/v1/repos/commit-pack", "POST"},
+		} {
+			resp, body := e.doReq(t, tc.method, tc.path, "", nil, "")
+			if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != tc.allow {
+				t.Errorf("%s %s = %d Allow %q (%s), want 405 Allow %q", tc.method, tc.path, resp.StatusCode, resp.Header.Get("Allow"), body, tc.allow)
+				continue
+			}
+			requireProblemCode(t, resp, body, "method_not_allowed")
+		}
+		// A matched route still authenticates first.
+		if resp, body := e.doReq(t, http.MethodGet, "/api/meta", "", nil, ""); resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("GET /api/meta without a token = %d %s, want 401", resp.StatusCode, body)
+		}
+	})
+}
+
+// failingKeys is a KeySource whose store is down; unknownOrgKeys knows no
+// org.
+type (
+	failingKeys    struct{}
+	unknownOrgKeys struct{}
+)
+
+func (failingKeys) PublicKeysForOrg(context.Context, string) ([]string, error) {
+	return nil, errors.New("connection refused")
+}
+
+func (unknownOrgKeys) PublicKeysForOrg(_ context.Context, name string) ([]string, error) {
+	return nil, fmt.Errorf("org %q: %w", name, meta.ErrNotFound)
+}
+
+// TestAuthenticationUnavailable: a key store failure is upstream's 403
+// authentication_unavailable, not a 401 for a token that may be valid. An
+// unknown issuer stays 401.
+func TestAuthenticationUnavailable(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := auth.MintToken(key, "ES256", auth.Claims{Iss: "acme", Sub: auth.SubjectLiteral, Repo: "r",
+		Scopes: []string{auth.ScopeGitRead}, Exp: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		keys   auth.KeySource
+		status int
+		code   string
+	}{
+		{failingKeys{}, http.StatusForbidden, "authentication_unavailable"},
+		{unknownOrgKeys{}, http.StatusUnauthorized, "unauthorized"},
+	} {
+		h := requireAuth(auth.NewVerifier(tc.keys), "", false, auth.ScopeGitRead)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Error("handler ran")
+		}))
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/repo", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		h.ServeHTTP(rr, req)
+		if rr.Code != tc.status {
+			t.Errorf("%T: status %d (%s), want %d", tc.keys, rr.Code, rr.Body, tc.status)
+			continue
+		}
+		var p problemBody
+		if err := json.Unmarshal(rr.Body.Bytes(), &p); err != nil || p.Code != tc.code {
+			t.Errorf("%T: body %s, want code %s", tc.keys, rr.Body, tc.code)
+		}
+		assertProblemFields(t, rr.Code, rr.Body.Bytes())
+	}
+}
+
 // TestWriteProblemCodeAssertions: writeProblem refuses a specific code on
 // a status upstream does not list for it, and an unknown code.
 func TestWriteProblemCodeAssertions(t *testing.T) {
@@ -273,6 +365,10 @@ func expectedProblemCodes(t *testing.T, status int, msg string) []string {
 		code = "insufficient_scope"
 	case status == http.StatusBadRequest && msg == "repo_name must equal the JWT repo claim":
 		code = "repo_name_mismatch"
+	case status == http.StatusNotFound && msg == "no API route matches the path":
+		code = "route_not_found"
+	case status == http.StatusForbidden && msg == "cannot verify the token now, retry":
+		code = "authentication_unavailable"
 	case status == http.StatusNotFound && (strings.HasPrefix(msg, "source branch ") || strings.HasPrefix(msg, "target branch ") ||
 		strings.HasPrefix(msg, "base branch ")) && strings.HasSuffix(msg, " not found"):
 		code = "branch_not_found"
