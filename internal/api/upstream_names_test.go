@@ -40,9 +40,9 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 		c2Env := wctRequireOK(t, resp, body)
 		c2, c2Tree := c2Env.Commit.CommitSHA, c2Env.Commit.TreeSHA
 
-		t.Run("stale expected_target_sha is 412", func(t *testing.T) {
+		t.Run("stale expected_target_sha is 409 ref_guard_failed", func(t *testing.T) {
 			resp, body := pack(t, "main", "stale", "x.txt", map[string]any{"expected_target_sha": c1})
-			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
+			assertCommitRefGuard(t, resp.StatusCode, body, "main", c2, c2)
 		})
 
 		t.Run("expected_target_sha wins over expected_head_sha", func(t *testing.T) {
@@ -50,7 +50,7 @@ func TestCommitMetadataCurrentNames(t *testing.T) {
 			tip := wctBranchTip(t, e, readTok, "main", false)
 			resp, body := pack(t, "main", "stale-current", "y.txt",
 				map[string]any{"expected_target_sha": c1, "expected_head_sha": tip})
-			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
+			assertCommitRefGuard(t, resp.StatusCode, body, "main", tip, tip)
 		})
 
 		t.Run("present empty expected_target_sha drops the legacy guard", func(t *testing.T) {
@@ -308,19 +308,14 @@ func TestDeleteBranchAndNoteQueryParams(t *testing.T) {
 			}
 		})
 
-		t.Run("stale query guard is 409 ref_guard_failed, body guard stays 412", func(t *testing.T) {
+		t.Run("stale query and body guards are 409 ref_guard_failed", func(t *testing.T) {
 			tip := addNote(t, fx.c2, "")
 			resp, body := del(t, "/api/v1/repos/notes",
 				url.Values{"object_ref": {fx.c2}, "expected_notes_ref_sha": {ref.ZeroSHA}}, nil)
 			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", tip)
 			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": fx.c2, "expected_ref_sha": ref.ZeroSHA})
-			if resp.StatusCode != http.StatusPreconditionFailed {
-				t.Fatalf("body guard: status %d body %v, want 412", resp.StatusCode, body)
-			}
-			if _, has := body["code"]; has {
-				t.Fatalf("body guard carries problem members: %v", body)
-			}
+			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", tip)
 			if got := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]; got != tip {
 				t.Fatalf("notes ref moved to %q after failed guards", got)
 			}
@@ -441,8 +436,8 @@ func TestRestoreCommitTagBaseRef(t *testing.T) {
 
 // TestGuardSHAUppercase covers issue #385: every full-SHA guard field
 // accepts an uppercase 40-hex value. A stale uppercase guard still fails
-// the guard (412, or 409 on merge per #532), not validation (400), and a
-// current one passes.
+// the guard (409 ref_guard_failed, #532 and #647), not validation (400),
+// and a current one passes.
 func TestGuardSHAUppercase(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)
@@ -531,12 +526,14 @@ func TestGuardSHAUppercase(t *testing.T) {
 		} {
 			t.Run(tc.name+" "+tc.field, func(t *testing.T) {
 				current, stale := tc.tips(t)
-				want := http.StatusPreconditionFailed
-				if tc.name == "merge" {
-					want = http.StatusConflict // #532: upstream's merge guard status
-				}
-				if code, body := tc.send(t, map[string]any{tc.field: strings.ToUpper(stale)}); code != want {
-					t.Fatalf("stale uppercase guard: %d %s, want %d", code, body, want)
+				code, body := tc.send(t, map[string]any{tc.field: strings.ToUpper(stale)})
+				switch tc.name {
+				case "commit-pack", "diff-commit", "restore-commit":
+					assertCommitRefGuard(t, code, body, "main", current, current)
+				default:
+					if code != http.StatusConflict || !strings.Contains(string(body), `"code":"ref_guard_failed"`) {
+						t.Fatalf("stale uppercase guard: %d %s, want 409 ref_guard_failed", code, body)
+					}
 				}
 				if code, body := tc.send(t, map[string]any{tc.field: strings.ToUpper(current)}); code != http.StatusOK {
 					t.Fatalf("current uppercase guard: %d %s, want 200", code, body)

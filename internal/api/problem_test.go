@@ -345,6 +345,11 @@ var refGuardMembers = []string{"current_sha", "guard"}
 // (TestProblemMembersMatchUpstream pins them).
 var notesGuardMembers = []string{"base_commit", "new_ref_sha", "notes_ref", "result", "sha", "target_ref"}
 
+// commitGuardMembers is the member that CommitWriteRefGuardProblemDetails
+// and RestoreCommitRefGuardProblemDetails keep next to the problem members
+// (TestProblemMembersMatchUpstream pins it).
+var commitGuardMembers = []string{"result"}
+
 // upstreamRefGuardSchema returns the properties of RefGuardProblemDetails'
 // own allOf item and the `guard` enum.
 func upstreamRefGuardSchema(t *testing.T) (props, guards []string) {
@@ -440,6 +445,11 @@ func TestProblemMembersMatchUpstream(t *testing.T) {
 	}
 	if got, _ := upstreamAllOfProperties(t, "NotesWriteRefGuardProblemDetails"); !slices.Equal(got, notesGuardMembers) {
 		t.Fatalf("NotesWriteRefGuardProblemDetails properties = %v, want %v", got, notesGuardMembers)
+	}
+	for _, schema := range []string{"CommitWriteRefGuardProblemDetails", "RestoreCommitRefGuardProblemDetails"} {
+		if got, _ := upstreamAllOfProperties(t, schema); !slices.Equal(got, commitGuardMembers) {
+			t.Fatalf("%s properties = %v, want %v", schema, got, commitGuardMembers)
+		}
 	}
 	raw, err := os.ReadFile(upstreamSpecPath)
 	if err != nil {
@@ -685,6 +695,42 @@ func assertNotesRefGuard(t *testing.T, status int, body map[string]any, sha, not
 		t.Fatal(err)
 	}
 	assertProblemFields(t, status, raw)
+}
+
+// assertCommitRefGuard checks a stale expected_target_sha (or its alias
+// expected_head_sha) on commit-pack, diff-commit or restore-commit (#647):
+// a CommitWriteRefGuardProblemDetails body, that is a failed conflict
+// result plus the problem members, which the oracle checks once `result`
+// is removed. oldSHA is the target tip (40 zeros for a new branch) and
+// currentSHA the tip the guard was checked against.
+func assertCommitRefGuard(t *testing.T, status int, raw []byte, branch, oldSHA, currentSHA string) {
+	t.Helper()
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body %s)", status, raw)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("body %q is not JSON: %v", raw, err)
+	}
+	res, _ := body["result"].(map[string]any)
+	if res["success"] != false || res["status"] != "conflict" || res["branch"] != branch || res["old_sha"] != oldSHA ||
+		res["message"] != body["detail"] || body["commit"] != nil {
+		t.Fatalf("result = %v, want a failed conflict result on %s with old_sha %s and no commit (body %s)", res, branch, oldSHA, raw)
+	}
+	if body["guard"] != "expected_target_sha" || body["current_sha"] != currentSHA {
+		t.Fatalf("guard members = %s, want expected_target_sha and current_sha %s", raw, currentSHA)
+	}
+	problem := map[string]any{}
+	for k, v := range body {
+		if !slices.Contains(commitGuardMembers, k) {
+			problem[k] = v
+		}
+	}
+	rawProblem, err := json.Marshal(problem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProblemFields(t, status, rawProblem)
 }
 
 // TestWriteErrProblemFields: writeErr adds the problem fields for every

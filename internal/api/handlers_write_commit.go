@@ -13,8 +13,8 @@
 // odb, then publish in hook order — pack-objects, blob upload, RegisterPacks,
 // CASRef — so a lost CAS race leaves only an unreferenced immutable pack.
 //
-// Status mapping (plan decision #2): expected_head_sha mismatch -> 412
-// precondition_failed; CAS race lost at publish time -> 409 conflict; root
+// Status mapping (plan decision #2): expected_head_sha mismatch -> 409
+// ref_guard_failed (#647); CAS race lost at publish time -> 409 conflict; root
 // commits report old_sha = 40 zeros (docs/explanation/domain-model.md invariant 2). Success is 200
 // (decision #3). Failures carry the docs/explanation/streaming-commit-protocols.md result envelope; the auth
 // middleware's plain {"error"} bodies on 401/403 are SDK-compatible (the
@@ -142,6 +142,29 @@ func wcFailLostCAS(w http.ResponseWriter, info *wcCommitInfo, msg, oldSHA string
 	writeJSON(w, http.StatusConflict, wcEnvelope{Commit: info, Result: wcResult{
 		Branch: info.TargetBranch, OldSHA: oldSHA, NewSHA: info.CommitSHA, Success: false, Status: "failed", Message: msg,
 	}})
+}
+
+// wcGuardBody is upstream's CommitWriteRefGuardProblemDetails and
+// RestoreCommitRefGuardProblemDetails: the failure envelope's `result`
+// plus the ref_guard_failed problem members.
+type wcGuardBody struct {
+	errorEnvelope
+	Result wcResult `json:"result"`
+}
+
+// wcFailRefGuard writes the 409 of a stale expected_target_sha (spec
+// 2026-10-27, #647). currentSHA is the tip the guard was checked against:
+// the target tip, or the base_branch tip for a new branch, whose oldSHA
+// is 40 zeros.
+func wcFailRefGuard(w http.ResponseWriter, msg, branch, oldSHA, currentSHA string) {
+	assertf(branch != "" && ref.ValidSHA(oldSHA), "wcFailRefGuard: branch %q old_sha %q", branch, oldSHA)
+	assertf(oldSHA == currentSHA || oldSHA == ref.ZeroSHA, "wcFailRefGuard: old_sha %s is neither current_sha %s nor zero", oldSHA, currentSHA)
+	writeJSON(w, http.StatusConflict, wcGuardBody{
+		errorEnvelope: refGuardProblem(w, "expected_target_sha", currentSHA, msg),
+		Result: wcResult{
+			Branch: branch, OldSHA: oldSHA, Success: false, Status: statusForHTTP(http.StatusConflict), Message: msg,
+		},
+	})
 }
 
 // wcInternal is internalErr's envelope-flavored twin: log the real error,
@@ -534,7 +557,7 @@ func (s *server) wcPlanCommit(w http.ResponseWriter, r *http.Request, repoID str
 	// when branching an unborn target from base_branch — the base tip. The
 	// vendor SDK's full-workflow conformance drive sends the base branch's
 	// head as expected_head_sha when creating a feature branch, so guarding
-	// against the (zero) unborn target would 412 every guarded branch
+	// against the (zero) unborn target would 409 every guarded branch
 	// creation.
 	casTip := plan.oldSHA
 	if plan.oldSHA != ref.ZeroSHA {
@@ -549,12 +572,11 @@ func (s *server) wcPlanCommit(w http.ResponseWriter, r *http.Request, repoID str
 		plan.parent = baseTip
 		casTip = baseTip
 	}
-	// CAS guard (decision #2): a stale expected_target_sha (deprecated
-	// expected_head_sha) is a 412.
+	// CAS guard: a stale expected_target_sha (deprecated expected_head_sha)
+	// is upstream's 409 ref_guard_failed (#647), with current_sha = casTip.
 	if md.ExpectedHeadSHA != "" && strings.ToLower(md.ExpectedHeadSHA) != casTip {
-		wcFail(w, http.StatusPreconditionFailed, "precondition_failed",
-			fmt.Sprintf("expected target sha %s does not match current tip %s", md.ExpectedHeadSHA, casTip),
-			md.TargetBranch, plan.oldSHA)
+		wcFailRefGuard(w, fmt.Sprintf("expected_target_sha %s does not match current tip %s", md.ExpectedHeadSHA, casTip),
+			md.TargetBranch, plan.oldSHA, casTip)
 		return nil, false
 	}
 	if !wcCheckRefPolicy(w, mustClaims(r), plan.refName) {

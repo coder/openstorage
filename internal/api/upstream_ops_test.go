@@ -117,12 +117,15 @@ func TestNotesAppendRoute(t *testing.T) {
 			}
 		})
 
-		t.Run("legacy POST notes keeps 200 and 412", func(t *testing.T) {
+		t.Run("legacy POST notes keeps 200 and answers a stale guard with 409", func(t *testing.T) {
+			tip := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]
 			raw := []byte(`{"sha":"` + fx.c2 + `","action":"append","note":"x","expected_ref_sha":"` + ref.ZeroSHA + `"}`)
-			resp, _ := e.doReq(t, http.MethodPost, "/api/repos/"+url.PathEscape(fx.url)+"/notes", fx.token, raw, "")
-			if resp.StatusCode != http.StatusPreconditionFailed {
-				t.Fatalf("legacy stale guard = %d, want 412", resp.StatusCode)
+			resp, out := e.doReq(t, http.MethodPost, "/api/repos/"+url.PathEscape(fx.url)+"/notes", fx.token, raw, "")
+			var body map[string]any
+			if err := json.Unmarshal(out, &body); err != nil {
+				t.Fatalf("legacy stale guard body %q: %v", out, err)
 			}
+			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", tip)
 			raw = []byte(`{"sha":"` + fx.c2 + `","action":"append","note":"legacy"}`)
 			resp, _ = e.doReq(t, http.MethodPost, "/api/v1/repos/notes", fx.token, raw, "")
 			if resp.StatusCode != http.StatusOK {

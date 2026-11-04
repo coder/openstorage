@@ -664,18 +664,10 @@ func TestWriteRefsNotes(t *testing.T) {
 			if cur == "" {
 				t.Fatal("missing notes ref")
 			}
-			// Mismatch -> 412 precondition_failed.
+			// Mismatch -> 409 ref_guard_failed (#647).
 			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": fx.c2, "action": "append", "note": "x", "expected_ref_sha": fx.c1})
-			if resp.StatusCode != http.StatusPreconditionFailed {
-				t.Fatalf("status = %d body %v, want 412", resp.StatusCode, body)
-			}
-			if result := wrefNoteResultOf(t, body); result["status"] != "precondition_failed" {
-				t.Fatalf("result = %v", result)
-			}
-			if body["new_ref_sha"] != cur {
-				t.Fatalf("412 new_ref_sha = %v, want current tip %s", body["new_ref_sha"], cur)
-			}
+			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", cur)
 			// Matching guard succeeds.
 			resp, _ = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": fx.c2, "action": "append", "note": "guarded", "expected_ref_sha": cur})
@@ -906,12 +898,12 @@ func TestWriteRefsNotes(t *testing.T) {
 			}
 
 			// PR #163 review (P2): resolution precedes the CAS guard — a
-			// mismatched guard 412s with the RESOLVED id in the envelope,
+			// mismatched guard 409s with the RESOLVED id in the envelope,
 			// and an unresolvable revision 404s despite a stale guard.
 			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
 				map[string]any{"object_ref": "feature", "note": "x", "notes_ref": "rev-notes", "expected_notes_ref_sha": fx.c2})
-			if resp.StatusCode != http.StatusPreconditionFailed || body["sha"] != fx.c1 {
-				t.Fatalf("guarded revision: status = %d sha %v, want 412 with resolved %s", resp.StatusCode, body["sha"], fx.c1)
+			if resp.StatusCode != http.StatusConflict || body["sha"] != fx.c1 {
+				t.Fatalf("guarded revision: status = %d sha %v, want 409 with resolved %s", resp.StatusCode, body["sha"], fx.c1)
 			}
 			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
 				map[string]any{"object_ref": "no-such-rev", "notes_ref": "rev-notes", "expected_notes_ref_sha": fx.c2})
