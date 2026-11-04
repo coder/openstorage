@@ -745,44 +745,52 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 			token      string // "" = none
 			authHeader string // verbatim override
 			wantStatus int
+			wantDetail string // "" = not checked
 		}{
-			{name: "no authorization header", wantStatus: http.StatusUnauthorized},
-			{name: "basic auth header", authHeader: "Basic dXNlcjpwYXNz", wantStatus: http.StatusUnauthorized},
-			{name: "garbage token", token: "garbage.token.value", wantStatus: http.StatusUnauthorized},
+			{name: "no authorization header", wantStatus: http.StatusUnauthorized, wantDetail: "Authentication required"},
+			{name: "basic auth header", authHeader: "Basic dXNlcjpwYXNz", wantStatus: http.StatusUnauthorized, wantDetail: "Authentication required"},
+			{name: "garbage token", token: "garbage.token.value", wantStatus: http.StatusForbidden, wantDetail: "Invalid or expired token"},
 			{
 				name:       "expired token",
 				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, expIn: -time.Minute}),
-				wantStatus: http.StatusUnauthorized,
+				wantStatus: http.StatusForbidden,
+				wantDetail: "Invalid or expired token",
 			},
 			{
 				name:       "alg none",
 				token:      algNone(org, claim, goodScopes),
-				wantStatus: http.StatusUnauthorized,
+				wantStatus: http.StatusForbidden,
+				wantDetail: "Invalid or expired token",
 			},
 			{
 				name:       "HS256 signed",
 				token:      e.mint(t, tokenSpec{alg: "HS256", iss: org, repo: claim, scopes: goodScopes}),
-				wantStatus: http.StatusUnauthorized,
+				wantStatus: http.StatusForbidden,
+				wantDetail: "Invalid or expired token",
 			},
 			{
 				name:       "signed by unregistered key",
 				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, key: newUnregisteredES256Key(t)}),
-				wantStatus: http.StatusUnauthorized,
+				wantStatus: http.StatusForbidden,
+				wantDetail: "Invalid or expired token",
 			},
 			{
 				name:       "unknown issuer",
 				token:      e.mint(t, tokenSpec{iss: "no-such-org", repo: claim, scopes: goodScopes}),
-				wantStatus: http.StatusUnauthorized,
+				wantStatus: http.StatusForbidden,
+				wantDetail: "Invalid or expired token",
 			},
 			{
 				name:       "empty sub",
 				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, claims: map[string]any{"sub": ""}}),
-				wantStatus: http.StatusUnauthorized,
+				wantStatus: http.StatusForbidden,
+				wantDetail: "Invalid or expired token",
 			},
 			{
 				name:       "missing sub",
 				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, claims: map[string]any{"sub": nil}}),
-				wantStatus: http.StatusUnauthorized,
+				wantStatus: http.StatusForbidden,
+				wantDetail: "Invalid or expired token",
 			},
 			{
 				name:       "missing required scope",
@@ -796,6 +804,7 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 				token      string
 				authHeader string
 				wantStatus int
+				wantDetail string
 			}{
 				name:       "repo claim not org",
 				token:      e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: goodScopes}),
@@ -809,7 +818,9 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 				if resp.StatusCode != tc.wantStatus {
 					t.Fatalf("status = %d, want %d (body %s)", resp.StatusCode, tc.wantStatus, body)
 				}
-				requireEnvelope(t, resp, body)
+				if msg := requireEnvelope(t, resp, body); tc.wantDetail != "" && msg != tc.wantDetail {
+					t.Fatalf("detail = %q, want %q", msg, tc.wantDetail)
+				}
 			})
 		}
 	}

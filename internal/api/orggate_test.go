@@ -75,8 +75,8 @@ func TestOrgGate_ForeignIssuer403(t *testing.T) {
 			t.Fatalf("read route with foreign-issuer token: status %d, want 403 (body %v)", status, body)
 		}
 		msg, ok := body["error"].(string)
-		if !ok || !strings.Contains(msg, "not served here") {
-			t.Fatalf(`read route 403 body = %v, want {"error": "token issued for org ..."}`, body)
+		if !ok || msg != "Credential is not valid for this tenant" {
+			t.Fatalf(`read route 403 body = %v, want {"error": "Credential is not valid for this tenant"}`, body)
 		}
 
 		// Write route: 403 with the same problem body (upstream documents
@@ -86,7 +86,7 @@ func TestOrgGate_ForeignIssuer403(t *testing.T) {
 			t.Fatalf("write route with foreign-issuer token: status %d, want 403 (body %v)", status, body)
 		}
 		msg, ok = body["error"].(string)
-		if _, hasResult := body["result"]; !ok || hasResult || body["code"] != "forbidden" || !strings.Contains(msg, "not served here") {
+		if _, hasResult := body["result"]; !ok || hasResult || body["code"] != "forbidden" || msg != "Credential is not valid for this tenant" {
 			t.Fatalf(`write route 403 body = %v, want a problem body with code forbidden and no result`, body)
 		}
 
