@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/lestrrat-go/jwx/v3/jwa"
 	"github.com/lestrrat-go/jwx/v3/jws"
@@ -202,11 +201,12 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	if unverified.Iss == "" {
 		return nil, errors.New("jwt missing iss claim")
 	}
-	// A control character cannot be in an org name, and a NUL fails the
-	// PostgreSQL lookup: refuse it here, so a KeySourceError always means
-	// the key store failed, not that the token is malformed.
-	if strings.ContainsFunc(unverified.Iss, unicode.IsControl) {
-		return nil, errors.New("jwt iss claim has a control character")
+	// A NUL fails the PostgreSQL lookup: refuse it here, so a
+	// KeySourceError always means the key store failed, not that the token
+	// is malformed. No configured org has one (an environment variable
+	// cannot hold a NUL). json.Unmarshal already made iss valid UTF-8.
+	if strings.ContainsRune(unverified.Iss, 0) {
+		return nil, errors.New("jwt iss claim has a NUL character")
 	}
 
 	pems, err := v.keys.PublicKeysForOrg(ctx, unverified.Iss)
