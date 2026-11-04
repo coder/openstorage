@@ -240,14 +240,14 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-11-03 (upstream
-  `Last-Modified` 2026-11-02 18:01:41 GMT), SHA-256
-  `412b90c384befbe066772111f1a655056102df48a756840a1b97dd800cd1d9f4`.
-  [The cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) still served
-  `40e43e00` at 08:15 and 08:21 UTC on 2026-11-03, so the changes since `40e43e00` are
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-11-04 (upstream
+  `Last-Modified` 2026-11-04 02:26:55 GMT), SHA-256
+  `ee8092bfc51e6a94187e1c26574505aa941eb7cd6c2aaa4f8258cd0fd9d5c3ff`.
+  [The cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) served
+  `412b90c3` at 10:07 and 10:11 UTC on 2026-11-04, so the change since `412b90c3` is
   documented drift, not a proven deployment change (a spec that the cluster serves
-  would not prove how the cluster behaves either). Against `40e43e00`, the snapshot
-  adds two things:
+  would not prove how the cluster behaves either). Against `40e43e00` (2026-10-28),
+  the snapshot adds three things:
   - A `prefix` query parameter on `GET /repos` (snapshot `34ac6de1`, 2026-11-01): a
     case-insensitive filter on the start of `repo_name`, combined with `q`, which then
     matches only the rest of the name after the prefix. open.storage does both
@@ -261,6 +261,11 @@ Upstream evolves continuously, so drift is tracked in the open:
     implicit push forwarding row under
     [known deviations](#known-deviations-from-the-vendored-spec),
     [#654](https://github.com/coder/openstorage/issues/654)).
+  - Wording on empty repositories (snapshot `ee8092bf`, 2026-11-04): a new
+    repository has no branch until its first commit, so `GET .../branch` answers
+    `404`, the branch list is empty, and `branches/create` answers `404` because its
+    base does not exist. Only descriptions changed, and open.storage already behaves
+    this way ([#657](https://github.com/coder/openstorage/issues/657)).
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled
