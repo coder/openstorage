@@ -15,6 +15,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -716,26 +717,46 @@ func TestWriteRefsNotes(t *testing.T) {
 		})
 
 		t.Run("invalid input", func(t *testing.T) {
-			for name, req := range map[string]map[string]any{
-				"missing sha":        {"note": "x"},
-				"bad action":         {"sha": fx.c1, "action": "replace", "note": "x"},
-				"missing note":       {"sha": fx.c1, "action": "add"},
-				"non-notes full ref": {"sha": fx.c1, "note": "x", "ref": "refs/heads/main"},
-				"bad expected sha":   {"sha": fx.c1, "note": "x", "expected_ref_sha": "xyz"},
-				"author sans email":  {"sha": fx.c1, "note": "x", "author": map[string]any{"name": "n"}},
+			// Each body failure names the member the request sent in
+			// invalid_params ("name reason").
+			for name, tc := range map[string]struct {
+				req  map[string]any
+				want string
+			}{
+				"missing sha":        {map[string]any{"note": "x"}, "object_ref is required"},
+				"bad action":         {map[string]any{"sha": fx.c1, "action": "replace", "note": "x"}, "action must be add or append"},
+				"missing note":       {map[string]any{"sha": fx.c1, "action": "add"}, "note is required"},
+				"non-notes full ref": {map[string]any{"sha": fx.c1, "note": "x", "ref": "refs/heads/main"}, "ref must be a valid notes ref"},
+				"bad notes_ref":      {map[string]any{"sha": fx.c1, "note": "x", "notes_ref": "bad..name"}, "notes_ref must be a valid notes ref"},
+				"bad expected sha":   {map[string]any{"sha": fx.c1, "note": "x", "expected_ref_sha": "xyz"}, "expected_ref_sha must be a full 40-hex object id"},
+				"bad guard":          {map[string]any{"sha": fx.c1, "note": "x", "expected_notes_ref_sha": "xyz"}, "expected_notes_ref_sha must be a full 40-hex object id"},
+				"author sans email":  {map[string]any{"sha": fx.c1, "note": "x", "author": map[string]any{"name": "n"}}, "author.email is required"},
 			} {
-				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token, req)
+				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token, tc.req)
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Errorf("%s: status = %d body %v, want 400", name, resp.StatusCode, body)
 					continue
 				}
 				wrefProblem(t, resp, body)
+				params, _ := body["invalid_params"].([]any)
+				if len(params) != 1 {
+					t.Errorf("%s: invalid_params = %v, want one item", name, body["invalid_params"])
+					continue
+				}
+				p, _ := params[0].(map[string]any)
+				if got := fmt.Sprint(p["name"], " ", p["reason"]); got != tc.want {
+					t.Errorf("%s: invalid_params[0] = %q, want %q", name, got, tc.want)
+				}
 			}
-			// Unknown target object -> 404 not_found.
+			// Unknown target object -> 404 ref_not_found, as for a
+			// revision that does not resolve.
 			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": strings.Repeat("ab", 20), "note": "x"})
 			if resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("unknown object: status = %d body %v, want 404", resp.StatusCode, body)
+			}
+			if body["code"] != "ref_not_found" {
+				t.Fatalf("unknown object: code = %v, want ref_not_found", body["code"])
 			}
 		})
 

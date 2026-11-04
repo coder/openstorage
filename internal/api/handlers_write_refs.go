@@ -115,6 +115,16 @@ func wrefAliasField(current, deprecated string) string {
 	return deprecated
 }
 
+// wrefAliasName returns the wire name of the member that
+// wrefAliasField(current, deprecated) takes its value from: currentName
+// unless only the deprecated member is set.
+func wrefAliasName(currentName, current, deprecatedName, deprecated string) string {
+	if current == "" && deprecated != "" {
+		return deprecatedName
+	}
+	return currentName
+}
+
 // lowerFullSHA lowercases a full 40-hex object id in either case (git
 // object names are case-insensitive) and returns anything else unchanged.
 // The notes surface addresses ANY object by its full id, so an uppercase id
@@ -934,28 +944,45 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	objectSHA := wrefAliasField(req.ObjectRef, req.SHA)
 	notesRefRaw := wrefAliasField(req.NotesRef, req.Ref)
 	expectedRefSHA := wrefAliasField(req.ExpectedNotesRefSHA, req.ExpectedRefSHA)
+	// invalid writes a 400 for one field. A body member is named in
+	// invalid_params (the member the request sent, alias included); a
+	// DELETE query parameter is not, and neither is a DELETE field that
+	// the body did not carry, because its current form is the query.
+	objectField := wrefAliasName("object_ref", req.ObjectRef, "sha", req.SHA)
+	notesRefField := wrefAliasName("notes_ref", req.NotesRef, "ref", req.Ref)
+	guardField := wrefAliasName("expected_notes_ref_sha", req.ExpectedNotesRefSHA, "expected_ref_sha", req.ExpectedRefSHA)
+	if deleteNote && objectSHA == "" {
+		objectField = ""
+	}
+	invalid := func(field, reason, msg string) {
+		if field == "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		writeInvalidField(w, field, reason, msg)
+	}
 	// The 2026-10-05 spec (issue #378) moves the DELETE fields to query
 	// parameters: a present query parameter wins over the body, even when
 	// empty.
 	if deleteNote {
 		q := r.URL.Query()
 		if q.Has("object_ref") {
-			objectSHA = q.Get("object_ref")
+			objectSHA, objectField = q.Get("object_ref"), ""
 		}
 		if q.Has("notes_ref") {
-			notesRefRaw = q.Get("notes_ref")
+			notesRefRaw, notesRefField = q.Get("notes_ref"), ""
 		}
 		if q.Has("expected_notes_ref_sha") {
-			expectedRefSHA = q.Get("expected_notes_ref_sha")
+			expectedRefSHA, guardField = q.Get("expected_notes_ref_sha"), ""
 		}
 	}
 	targetRef, err := wrefNotesRefName(notesRefRaw)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		invalid(notesRefField, "must be a valid notes ref", err.Error())
 		return
 	}
 	if objectSHA == "" {
-		writeErr(w, http.StatusBadRequest, "object_ref is required")
+		invalid(objectField, "is required", "object_ref is required")
 		return
 	}
 	action := "remove"
@@ -966,23 +993,24 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			action = "add"
 		}
 		if action != "add" && action != "append" {
-			writeErr(w, http.StatusBadRequest, "action must be add or append")
+			writeInvalidField(w, "action", "must be add or append", "action must be add or append")
 			return
 		}
 		if req.Note == "" {
-			writeErr(w, http.StatusBadRequest, "note is required")
+			writeInvalidField(w, "note", "is required", "note is required")
 			return
 		}
 	}
 	expectedRefSHA = lowerFullSHA(expectedRefSHA)
 	if expectedRefSHA != "" && !ref.ValidSHA(expectedRefSHA) {
-		writeErr(w, http.StatusBadRequest, "expected_notes_ref_sha must be a full 40-hex object id")
+		invalid(guardField, "must be a full 40-hex object id", "expected_notes_ref_sha must be a full 40-hex object id")
 		return
 	}
 	author := wrefNoteAuthor{Name: "open.storage", Email: "notes@openstorage.invalid"}
 	if req.Author != nil {
-		if req.Author.Name == "" || req.Author.Email == "" {
-			writeErr(w, http.StatusBadRequest, "author name and email are required when author is provided")
+		const msg = "author name and email are required when author is provided"
+		if err := requiredFields(msg, [2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}); err != nil {
+			writeInvalid(w, msg, err)
 			return
 		}
 		author = *req.Author
@@ -1035,7 +1063,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	// revision-resolved objectSHA re-verifies trivially).
 	if _, err := wrefGit(ctx, repoPath, nil, nil,
 		"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
-		writeErr(w, http.StatusNotFound, "object not found: "+objectSHA)
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "object not found: "+objectSHA)
 		return
 	}
 	// Existence check drives add-vs-existing (409) and delete-missing (404).

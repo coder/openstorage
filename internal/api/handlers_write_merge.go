@@ -466,10 +466,13 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	// stays as the deprecated bare-name alias, the current name winning
 	// on conflict. Canonicalize into SourceBranch so the merge flow and
 	// the response echo one bare branch name.
+	sourceField := "source_ref"
 	if req.SourceRef != "" {
 		req.SourceBranch = strings.TrimPrefix(req.SourceRef, "refs/heads/")
+	} else if req.SourceBranch != "" {
+		sourceField = "source_branch"
 	}
-	if err := wcValidateBranchParam("source_ref", req.SourceBranch); err != nil {
+	if err := wcValidateBranchParam(sourceField, req.SourceBranch); err != nil {
 		return err
 	}
 	if err := wcValidateBranchParam("target_branch", req.TargetBranch); err != nil {
@@ -478,21 +481,22 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	switch req.Strategy {
 	case "merge", "ff_only", "ff_prefer":
 	case "":
-		return errors.New("missing strategy")
+		return newFieldError("strategy", "is required", "missing strategy")
 	default:
-		return fmt.Errorf("invalid strategy %q (want merge|ff_only|ff_prefer)", req.Strategy)
+		return newFieldError("strategy", "must be merge, ff_only or ff_prefer",
+			fmt.Sprintf("invalid strategy %q (want merge|ff_only|ff_prefer)", req.Strategy))
 	}
 	if req.Squash && req.Strategy == "ff_only" {
 		return errors.New("squash is incompatible with the ff_only strategy")
 	}
 	req.ExpectedTargetSHA = lowerFullSHA(req.ExpectedTargetSHA)
 	if req.ExpectedTargetSHA != "" && !ref.ValidSHA(req.ExpectedTargetSHA) {
-		return errors.New("expected_target_sha must be a 40-hex sha")
+		return newFieldError("expected_target_sha", "must be a 40-hex sha", "expected_target_sha must be a 40-hex sha")
 	}
 	if req.ExpectedSourceSHA != nil {
 		var pin string
 		if err := json.Unmarshal(req.ExpectedSourceSHA, &pin); err != nil || !ref.ValidSHA(lowerFullSHA(pin)) {
-			return errors.New("expected_source_sha must be a 40-hex sha")
+			return newFieldError("expected_source_sha", "must be a 40-hex sha", "expected_source_sha must be a 40-hex sha")
 		}
 		req.sourcePin = lowerFullSHA(pin)
 	}
