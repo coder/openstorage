@@ -71,7 +71,7 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `commit-pack`, `diff-commit` and `restore-commit` return the richer `result` envelope
   on the statuses that the
   [streaming protocols](../explanation/streaming-commit-protocols.md) list, a merge
-  `409` for file conflicts or a target that moved returns upstream's `MergeConflict`
+  `409` for file conflicts returns upstream's `MergeConflict`
   ([merge](#branches)), and the `409` for a stale guard on a commit write or a notes
   write keeps its `result` envelope and adds the problem members
   ([commit writes](#commit-write-guards), [notes](#notes)). The commit-write `result` is
