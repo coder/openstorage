@@ -70,7 +70,7 @@ func TestNotesAppendRoute(t *testing.T) {
 			tip := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]
 			resp, body := post(t, fx.token, map[string]any{"object_ref": fx.c1, "note": "retry",
 				"expected_notes_ref_sha": ref.ZeroSHA})
-			assertNotesRefGuard(t, resp.StatusCode, body, fx.c1, "refs/notes/commits", tip)
+			assertNotesRefGuard(t, resp, body, fx.c1, "refs/notes/commits", tip)
 			if body["instance"] != path {
 				t.Fatalf("instance = %v, want %s", body["instance"], path)
 			}
@@ -78,7 +78,7 @@ func TestNotesAppendRoute(t *testing.T) {
 			// alias reports the standard guard name.
 			resp, body = post(t, fx.token, map[string]any{"object_ref": fx.c1, "note": "retry",
 				"notes_ref": "unborn", "expected_ref_sha": tip})
-			assertNotesRefGuard(t, resp.StatusCode, body, fx.c1, "refs/notes/unborn", ref.ZeroSHA)
+			assertNotesRefGuard(t, resp, body, fx.c1, "refs/notes/unborn", ref.ZeroSHA)
 			if got := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]; got != tip {
 				t.Fatalf("notes ref moved %s -> %s", tip, got)
 			}
@@ -125,7 +125,7 @@ func TestNotesAppendRoute(t *testing.T) {
 			if err := json.Unmarshal(out, &body); err != nil {
 				t.Fatalf("legacy stale guard body %q: %v", out, err)
 			}
-			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", tip)
+			assertNotesRefGuard(t, resp, body, fx.c2, "refs/notes/commits", tip)
 			raw = []byte(`{"sha":"` + fx.c2 + `","action":"append","note":"legacy"}`)
 			resp, _ = e.doReq(t, http.MethodPost, "/api/v1/repos/notes", fx.token, raw, "")
 			if resp.StatusCode != http.StatusOK {

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // upstreamSpecPath is the vendored upstream OpenAPI snapshot, relative to
@@ -245,6 +246,9 @@ func TestWriteRefGuardFailed(t *testing.T) {
 	}
 	if body := rr.Body.String(); !strings.Contains(body, `"guard":"expected_source_sha","current_sha":"`+zero+`"`) {
 		t.Fatalf("body = %s", body)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
 	}
 }
 
@@ -672,8 +676,12 @@ func assertProblemFields(t *testing.T, status int, body []byte) string {
 // body, that is the note-write members with a failed result plus the
 // problem members, which the oracle checks once the note members are
 // removed.
-func assertNotesRefGuard(t *testing.T, status int, body map[string]any, sha, notesRef, currentSHA string) {
+func assertNotesRefGuard(t *testing.T, resp *http.Response, body map[string]any, sha, notesRef, currentSHA string) {
 	t.Helper()
+	status := resp.StatusCode
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+	}
 	if status != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body %v)", status, body)
 	}
@@ -743,7 +751,8 @@ func assertCommitRefGuard(t *testing.T, status int, raw []byte, branch, oldSHA, 
 }
 
 // TestWriteErrProblemFields: writeErr adds the problem fields for every
-// status it is called with, and keeps `error` and the JSON content type.
+// status it is called with, keeps `error`, and sends the problem content
+// type that upstream documents (application/problem+json, #352 item 5).
 func TestWriteErrProblemFields(t *testing.T) {
 	for _, status := range []int{400, 401, 403, 404, 409, 422, 429, 500, 503} {
 		rr := httptest.NewRecorder()
@@ -751,13 +760,49 @@ func TestWriteErrProblemFields(t *testing.T) {
 		if rr.Code != status {
 			t.Fatalf("status = %d, want %d", rr.Code, status)
 		}
-		if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
-			t.Fatalf("Content-Type = %q, want application/json", ct)
+		if ct := rr.Header().Get("Content-Type"); ct != "application/problem+json" {
+			t.Fatalf("Content-Type = %q, want application/problem+json", ct)
 		}
 		if msg := assertProblemFields(t, status, rr.Body.Bytes()); msg != "boom "+strconv.Itoa(status) {
 			t.Fatalf("error = %q", msg)
 		}
 	}
+}
+
+// TestResultEnvelopeContentType: failure bodies without the problem members
+// are not problem bodies, so they keep application/json (upstream lists
+// CommitWriteResponse and MergeConflict under that type).
+func TestResultEnvelopeContentType(t *testing.T) {
+	for name, write := range map[string]func(http.ResponseWriter){
+		"wcFail": func(w http.ResponseWriter) {
+			wcFail(w, http.StatusConflict, "conflict", "branch moved", "main", ref.ZeroSHA)
+		},
+		"wmFailConflict": func(w http.ResponseWriter) {
+			wmFailConflict(w, http.StatusConflict, "conflict", "merge conflict", "main", ref.ZeroSHA, []string{"a"}, ref.ZeroSHA)
+		},
+		"wrefNoteFail": func(w http.ResponseWriter) {
+			wrefNoteFail(w, http.StatusConflict, "notes moved", ref.ZeroSHA, "refs/notes/commits", "", ref.ZeroSHA)
+		},
+	} {
+		rr := httptest.NewRecorder()
+		write(rr)
+		if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("%s: Content-Type = %q, want application/json", name, ct)
+		}
+	}
+}
+
+// TestCommitRefGuardContentType: the commit-write guard 409 carries the
+// problem members, so it is a problem body (application/problem+json), as
+// upstream's commit-pack, diff-commit and restore-commit 409s document.
+func TestCommitRefGuardContentType(t *testing.T) {
+	rr := httptest.NewRecorder()
+	tip := strings.Repeat("ab", 20)
+	wcFailRefGuard(rr, "expected_target_sha "+ref.ZeroSHA+" does not match current tip "+tip, "main", tip, tip)
+	if ct := rr.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+	}
+	assertCommitRefGuard(t, rr.Code, rr.Body.Bytes(), "main", tip, tip)
 }
 
 // TestProblemInstanceThroughWrappers: writeErr finds `instance` under the

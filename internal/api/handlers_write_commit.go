@@ -172,7 +172,7 @@ type wcGuardResult struct {
 func wcFailRefGuard(w http.ResponseWriter, msg, branch, oldSHA, currentSHA string) {
 	assertf(branch != "" && ref.ValidSHA(oldSHA), "wcFailRefGuard: branch %q old_sha %q", branch, oldSHA)
 	assertf(oldSHA == currentSHA || oldSHA == ref.ZeroSHA, "wcFailRefGuard: old_sha %s is neither current_sha %s nor zero", oldSHA, currentSHA)
-	writeJSON(w, http.StatusConflict, wcGuardBody{
+	writeProblemJSON(w, http.StatusConflict, wcGuardBody{
 		errorEnvelope: refGuardProblem(w, "expected_target_sha", currentSHA, msg),
 		Result: wcGuardResult{
 			TargetBranch: branch, Branch: branch, OldSHA: oldSHA, NewSHA: "",

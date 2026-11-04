@@ -78,7 +78,8 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
 2. CAS check: a stale `expected_target_sha` (or the deprecated `expected_head_sha`) gets
    HTTP 409 and moves no ref. The body is the failure envelope (`result.status`
    `conflict`) plus the problem members `code: ref_guard_failed`, `guard` and
-   `current_sha` ([details](../reference/http-api.md#commit-write-guards)).
+   `current_sha`, sent as `application/problem+json`
+   ([details](../reference/http-api.md#commit-write-guards)).
 3. Write blobs, build the tree on the base tree (upserts + deletes), create the commit,
    and atomically advance the ref (respecting JWT ref policies). If the new tree equals
    the base tree (or the empty tree on an unborn branch), the server answers 412

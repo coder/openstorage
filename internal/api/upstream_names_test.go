@@ -312,10 +312,10 @@ func TestDeleteBranchAndNoteQueryParams(t *testing.T) {
 			tip := addNote(t, fx.c2, "")
 			resp, body := del(t, "/api/v1/repos/notes",
 				url.Values{"object_ref": {fx.c2}, "expected_notes_ref_sha": {ref.ZeroSHA}}, nil)
-			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", tip)
+			assertNotesRefGuard(t, resp, body, fx.c2, "refs/notes/commits", tip)
 			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": fx.c2, "expected_ref_sha": ref.ZeroSHA})
-			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", tip)
+			assertNotesRefGuard(t, resp, body, fx.c2, "refs/notes/commits", tip)
 			if got := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]; got != tip {
 				t.Fatalf("notes ref moved to %q after failed guards", got)
 			}

@@ -667,7 +667,7 @@ func TestWriteRefsNotes(t *testing.T) {
 			// Mismatch -> 409 ref_guard_failed (#647).
 			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": fx.c2, "action": "append", "note": "x", "expected_ref_sha": fx.c1})
-			assertNotesRefGuard(t, resp.StatusCode, body, fx.c2, "refs/notes/commits", cur)
+			assertNotesRefGuard(t, resp, body, fx.c2, "refs/notes/commits", cur)
 			// Matching guard succeeds.
 			resp, _ = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
 				map[string]any{"sha": fx.c2, "action": "append", "note": "guarded", "expected_ref_sha": cur})

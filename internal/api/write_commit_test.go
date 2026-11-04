@@ -326,6 +326,9 @@ func TestCommitPack(t *testing.T) {
 			)
 			resp, respBody := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
 			assertCommitRefGuard(t, resp.StatusCode, respBody, "main", tip2, tip2)
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want application/problem+json", ct)
+			}
 		})
 
 		t.Run("branch from base_branch", func(t *testing.T) {
