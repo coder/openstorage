@@ -101,8 +101,8 @@ func TestPublishPack_CanceledUploadStillRetiresReservation(t *testing.T) {
 
 func decodeEnvelope(t *testing.T, rr *httptest.ResponseRecorder) string {
 	t.Helper()
-	if got := rr.Header().Get("Content-Type"); got != "application/json" {
-		t.Fatalf("Content-Type = %q, want application/json", got)
+	if got := rr.Header().Get("Content-Type"); got != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", got)
 	}
 	var env errorEnvelope
 	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {

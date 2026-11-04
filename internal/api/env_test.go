@@ -469,8 +469,8 @@ func requireAuthResultEnvelope(t *testing.T, body []byte, wantStatus string) {
 // (and WWW-Authenticate on 401), returning the message.
 func requireEnvelope(t *testing.T, resp *http.Response, body []byte) string {
 	t.Helper()
-	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
-		t.Fatalf("error Content-Type = %q, want application/json (body %q)", ct, body)
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("error Content-Type = %q, want application/problem+json (body %q)", ct, body)
 	}
 	var envlp errorEnvelope
 	if err := json.Unmarshal(body, &envlp); err != nil || envlp.Error == "" {

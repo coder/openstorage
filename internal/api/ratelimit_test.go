@@ -132,8 +132,8 @@ func TestRateLimit429ReadEnvelope(t *testing.T) {
 		t.Errorf("Retry-After = %q, want %q", ra, "1")
 	}
 	assertRateLimited(t, w.Header())
-	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json", ct)
+	if ct := w.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want application/problem+json", ct)
 	}
 	var body struct {
 		Error string `json:"error"`
@@ -439,8 +439,8 @@ func TestGitRateLimit429Envelope(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Error == "" {
 		t.Fatalf("expected {\"error\"} envelope, got %q (err %v)", w.Body.String(), err)
 	}
-	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json", ct)
+	if ct := w.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want application/problem+json", ct)
 	}
 	assertProblemFields(t, w.Code, w.Body.Bytes())
 	if body.Instance != "/probe" {
