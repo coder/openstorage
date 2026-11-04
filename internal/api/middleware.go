@@ -2,7 +2,6 @@ package api
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -112,9 +111,10 @@ func keyStoreFailed(err error) bool {
 }
 
 // requireAuth enforces the docs/reference/authentication.md failure map for one route: missing or
-// unverifiable token -> 401 (+WWW-Authenticate via writeErr); a key store
-// failure -> 403 authentication_unavailable; verified token
-// issued for another org (issue #47), missing ANY of the required scopes
+// non-Bearer Authorization header -> 401 (+WWW-Authenticate via writeErr);
+// a token that fails verification -> 403 forbidden, as upstream answers
+// (issue #664); a key store failure -> 403 authentication_unavailable;
+// verified token issued for another org (issue #47), missing ANY of the required scopes
 // (docs/reference/authentication.md: e.g. DELETE /repos/tags demands both git:read and git:write), a
 // non-"org" repo claim on an org-level route, or an empty/"org" repo claim
 // on a per-repo route -> 403 (claim mismatch with target). On success the
@@ -130,7 +130,7 @@ func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScop
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token, ok := bearerToken(r)
 			if !ok {
-				writeProblem(w, http.StatusUnauthorized, genericProblemCode(http.StatusUnauthorized), "missing or malformed authorization header")
+				writeProblem(w, http.StatusUnauthorized, genericProblemCode(http.StatusUnauthorized), "Authentication required")
 				return
 			}
 			claims, err := verifier.Verify(r.Context(), token)
@@ -139,7 +139,7 @@ func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScop
 				return
 			}
 			if err != nil {
-				writeProblem(w, http.StatusUnauthorized, genericProblemCode(http.StatusUnauthorized), "invalid token")
+				writeProblem(w, http.StatusForbidden, genericProblemCode(http.StatusForbidden), "Invalid or expired token")
 				return
 			}
 			assertf(claims != nil, "Verifier returned nil claims without error")
@@ -149,7 +149,7 @@ func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScop
 			// this deployment's REST surface. Checked before scopes so the
 			// failure mode matches the git path's ordering.
 			if org != "" && claims.Iss != org {
-				writeProblem(w, http.StatusForbidden, genericProblemCode(http.StatusForbidden), fmt.Sprintf("token issued for org %q, not served here", claims.Iss))
+				writeProblem(w, http.StatusForbidden, genericProblemCode(http.StatusForbidden), "Credential is not valid for this tenant")
 				return
 			}
 			for _, scope := range requiredScopes {

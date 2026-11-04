@@ -73,7 +73,7 @@ Mint tokens with the run's org key. The flags after the name go to `openstorage 
 "$OSV" token "$RUN" rw     --repo demo --scopes git:read,git:write
 "$OSV" token "$RUN" ro     --repo demo --scopes git:read
 "$OSV" token "$RUN" org    --repo org  --scopes org:read
-"$OSV" token "$RUN" junk   --raw not-a-jwt      # stores a literal value, for 401 checks
+"$OSV" token "$RUN" junk   --raw not-a-jwt      # stores a literal value, for invalid-token checks
 ```
 
 Tokens stay in `$RUN/work/tokens/`. The commands below take a token name, never the value. `--token none` sends no credentials.

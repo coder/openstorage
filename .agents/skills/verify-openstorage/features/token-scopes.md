@@ -1,13 +1,13 @@
 # Token auth and scopes
 
-Every REST and Git request carries a JWT that the organization signed with its own key. The server answers `401` when the token is missing, malformed, signed by another key, or expired, and `403` when a valid token lacks the scope or names another repo. A refused write changes nothing.
+Every REST and Git request carries a JWT that the organization signed with its own key. REST answers `401` when the token is missing and `403` `forbidden` when it is malformed, signed by another key, or expired. Git answers `401` in all four cases, so that git asks for credentials. Both answer `403` when a valid token lacks the scope or names another repo. A refused write changes nothing.
 
 ## Sub-features
 
 - `auth-missing` answers `401` without a token, on REST and on Git (with `WWW-Authenticate: Basic realm="open.storage"`).
-- `auth-malformed` answers `401` `invalid token` for a value that is not a JWT.
-- `auth-wrong-key` answers `401` for a token signed by a key that the server does not hold.
-- `auth-expired` answers `401` for a token past its `exp`.
+- `auth-malformed` answers REST `403` `Invalid or expired token` for a value that is not a JWT.
+- `auth-wrong-key` answers REST `403` for a token signed by a key that the server does not hold, and Git `401`.
+- `auth-expired` answers REST `403` for a token past its `exp`.
 - `auth-scope-write` refuses writes for a `git:read` token: commit-pack `403` `insufficient_scope`, repo create `403` `insufficient_scope`, and git push `403`.
 - `auth-scope-read` refuses reads for a `git:write` token without `git:read`.
 - `auth-scope-org` refuses `GET /api/v1/repos` for a repo token (`403` `missing required scope org:read`).
@@ -51,21 +51,21 @@ env -i PATH="$PATH" "$OSV_BIN" keygen --out "$OSV_WORK/keys/foreign" >/dev/null
 
 ```sh
 "$OSV" api "$RUN" auth-missing-api --token none --expect 401 GET /api/v1/repo
-"$OSV" eq "$RUN" auth-missing-api-msg 'missing or malformed authorization header' "$("$OSV" json "$OSV_EVIDENCE/auth-missing-api.body" error)"
+"$OSV" eq "$RUN" auth-missing-api-msg 'Authentication required' "$("$OSV" json "$OSV_EVIDENCE/auth-missing-api.body" error)"
 "$OSV" api "$RUN" auth-missing-git --token none --expect 401 GET '/demo.git/info/refs?service=git-upload-pack'
 "$OSV" eq "$RUN" auth-missing-git-challenge 'Basic realm="open.storage"' "$(sed -n 's/^Www-Authenticate: //p' "$OSV_EVIDENCE/auth-missing-git.headers" | tr -d '\r')"
 ```
 
-- **Malformed, wrong-key, and expired tokens.** Read with `junk`, `foreign`, and (after 3 s) `short`. All answer `401` with `invalid token`. git clone with `foreign` fails with `Authentication failed` (exit `128`).
+- **Malformed, wrong-key, and expired tokens.** Read with `junk`, `foreign`, and (after 3 s) `short`. All answer `403` with `code` `forbidden` and `Invalid or expired token`. git clone with `foreign` gets `401` and fails with `Authentication failed` (exit `128`).
 
 ```sh
-"$OSV" api "$RUN" auth-junk --token junk --expect 401 GET /api/v1/repo
-"$OSV" api "$RUN" auth-foreign --token foreign --expect 401 GET /api/v1/repo
-"$OSV" eq "$RUN" auth-foreign-msg 'invalid token' "$("$OSV" json "$OSV_EVIDENCE/auth-foreign.body" error)"
+"$OSV" api "$RUN" auth-junk --token junk --expect 403 GET /api/v1/repo
+"$OSV" api "$RUN" auth-foreign --token foreign --expect 403 GET /api/v1/repo
+"$OSV" eq "$RUN" auth-foreign-msg 'Invalid or expired token' "$("$OSV" json "$OSV_EVIDENCE/auth-foreign.body" error)"
 "$OSV" git "$RUN" auth-foreign-clone --token foreign --expect 128 -- clone -q "$OSV_URL/demo.git" foreign-clone
 "$OSV" eq "$RUN" auth-foreign-clone-msg yes "$(grep -q 'Authentication failed' "$OSV_EVIDENCE/auth-foreign-clone.git.txt" && echo yes || echo no)"
 sleep 3
-"$OSV" api "$RUN" auth-expired --token short --expect 401 GET /api/v1/repo
+"$OSV" api "$RUN" auth-expired --token short --expect 403 GET /api/v1/repo
 ```
 
 - **Write with a read-only token.** Try commit-pack, repo create, and git push with `ro`. commit-pack answers `403` with `code` `insufficient_scope`. Create answers `403` with `code` `insufficient_scope`. git push exits `128` with `The requested URL returned error: 403`. The `main` tip is still `SEED`.
@@ -123,4 +123,4 @@ printf 'denied\n' >"$OSV_WORK/seed/denied.txt"
 - Every endpoint answers auth failures with the problem body (`{"error": ..., "code": ...}`), write endpoints that move refs included. Only some failures inside the commit-pack, diff-commit and restore-commit handlers, and the notes stale-guard 409, use a `result` envelope.
 - The Git surface wants Basic auth with user `t`. `osv.sh api` sends Basic on every non-`/api` path. A Bearer header there answers `401` `basic auth with username 't' required`.
 - `mint` refuses a zero or negative `--ttl`. Mint a short one and wait for it to expire.
-- The REST `401` messages are generic (`invalid token`). The Git surface answers with more detail, for example `jwt must be a compact JWS (header.payload.signature)`. Branch on status codes, not messages.
+- The REST messages are generic (`Authentication required`, `Invalid or expired token`). The Git surface answers with more detail, for example `jwt must be a compact JWS (header.payload.signature)`. Branch on status codes, not messages.

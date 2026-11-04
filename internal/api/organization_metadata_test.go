@@ -28,7 +28,7 @@ func TestOrganizationMetadata(t *testing.T) {
 		}{
 			{"org read", orgRead, http.StatusOK},
 			{"unauthenticated", "", http.StatusUnauthorized},
-			{"invalid token", "invalid", http.StatusUnauthorized},
+			{"invalid token", "invalid", http.StatusForbidden},
 			{"missing scope", e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeGitRead}}), http.StatusForbidden},
 			{"wrong org", e.mint(t, tokenSpec{iss: foreignOrg, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}}), http.StatusForbidden},
 			{"repo scoped", e.mint(t, tokenSpec{iss: org, repo: "a-repo", scopes: []string{auth.ScopeOrgRead}}), http.StatusForbidden},

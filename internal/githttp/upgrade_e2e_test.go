@@ -392,7 +392,8 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	}
 	check := func(n *testNode, label string) string {
 		t.Helper()
-		if apiGet(t, n, "invalid", "/api/v1/repo", nil) != http.StatusUnauthorized {
+		// Releases before #664 answer an invalid token with 401, later ones with 403.
+		if code := apiGet(t, n, "invalid", "/api/v1/repo", nil); code != http.StatusUnauthorized && code != http.StatusForbidden {
 			t.Fatal(label + " did not reject unauthenticated access")
 		}
 		var got repoMetadata

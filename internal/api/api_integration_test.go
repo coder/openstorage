@@ -749,6 +749,7 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 		}{
 			{name: "no authorization header", wantStatus: http.StatusUnauthorized, wantDetail: "Authentication required"},
 			{name: "basic auth header", authHeader: "Basic dXNlcjpwYXNz", wantStatus: http.StatusUnauthorized, wantDetail: "Authentication required"},
+			{name: "bearer without token", authHeader: "Bearer ", wantStatus: http.StatusUnauthorized, wantDetail: "Authentication required"},
 			{name: "garbage token", token: "garbage.token.value", wantStatus: http.StatusForbidden, wantDetail: "Invalid or expired token"},
 			{
 				name:       "expired token",
