@@ -67,17 +67,17 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   bodies: decode the body into a struct or a map of arbitrary values, not a string-only
   map (such as Go's `map[string]string`). Ref-moving write
   endpoints return the richer `result` envelope
-  ([streaming protocols](../explanation/streaming-commit-protocols.md)), even on 4xx/5xx
-  statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. The `result` of
-  `commit-pack`, `diff-commit` and `restore-commit` is upstream's `RefUpdateResult`, also on
-  auth, rate-limit and path-style lookup failures. It has every member that the
-  schema requires, with empty strings where
-  there is no value: `target_branch`, the deprecated `branch` (the same value), `old_sha`,
-  `new_sha`, `success` and `status`. A failed commit write sends `commit: null`, except a
-  lost CAS on `commit-pack` and `diff-commit`. Before
+  ([streaming protocols](../explanation/streaming-commit-protocols.md)) for failures in
+  the handler. The `result` of `commit-pack`, `diff-commit` and `restore-commit` is
+  upstream's `RefUpdateResult`: it has every member that the schema requires, with empty
+  strings where there is no value: `target_branch`, the deprecated `branch` (the same
+  value), `old_sha`, `new_sha`, `success` and `status`. A failed commit write sends
+  `commit: null`, except a lost CAS on `commit-pack` and `diff-commit`. Before
   [#665](https://github.com/coder/openstorage/issues/665), `result` had no
   `target_branch`, most failures left out empty members, and failed commit writes sent
-  no `commit`. Failed ref
+  no `commit`. Auth failures (401, 403), the gateway rate limiter's 429 and the
+  path-style alias 404 use the error body above on every route, as upstream documents
+  ([#352](https://github.com/coder/openstorage/issues/352) item 3). Failed ref
   guards are the exception, as upstream documents: a merge `409` for a failed guard (a
   stale `expected_target_sha`, or a source branch that no longer contains
   `expected_source_sha`) uses the error body above with code `ref_guard_failed`
@@ -685,5 +685,5 @@ Other limits and gaps:
 | 412 | a failed `restore-commit` `base_ref` precondition; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
-| 429 | rate limit ("unavailable" to ref-update clients) |
+| 429 | rate limit (plain problem body on every route); a write handler's busy or backpressure answer (`unavailable` in its result envelope) |
 | 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |

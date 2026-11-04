@@ -73,7 +73,7 @@ func TestRateLimitDisabledPassthrough(t *testing.T) {
 	if rl != nil || err != nil {
 		t.Fatalf("newRateLimiter(zero) = (%v, %v), want (nil, nil) (disabled)", rl, err)
 	}
-	h := rl.limit(routeRead)(okHandler())
+	h := rl.limit()(okHandler())
 	for i := range 10 {
 		if w := rlRequest(t, h, "10.0.0.1:1234"); w.Code != http.StatusOK {
 			t.Fatalf("request %d through disabled limiter = %d, want 200", i, w.Code)
@@ -119,7 +119,7 @@ func newTestLimiter(cfg RateLimitConfig, base time.Time) (*rateLimiter, *time.Ti
 
 func TestRateLimit429ReadEnvelope(t *testing.T) {
 	rl, _ := newTestLimiter(RateLimitConfig{RPS: 1, Burst: 1}, time.Unix(1000, 0))
-	h := rl.limit(routeRead)(okHandler())
+	h := rl.limit()(okHandler())
 
 	if w := rlRequest(t, h, "10.0.0.1:1234"); w.Code != http.StatusOK {
 		t.Fatalf("first request = %d, want 200", w.Code)
@@ -147,60 +147,9 @@ func TestRateLimit429ReadEnvelope(t *testing.T) {
 	assertProblemFields(t, w.Code, w.Body.Bytes())
 }
 
-func TestRateLimit429WriteEnvelope(t *testing.T) {
-	rl, _ := newTestLimiter(RateLimitConfig{RPS: 1, Burst: 1}, time.Unix(1000, 0))
-	h := rl.limit(routeWrite)(okHandler())
-
-	if w := rlRequest(t, h, "10.0.0.1:1234"); w.Code != http.StatusOK {
-		t.Fatalf("first request = %d, want 200", w.Code)
-	}
-	w := rlRequest(t, h, "10.0.0.1:1234")
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("second request = %d, want 429", w.Code)
-	}
-	if ra := w.Header().Get("Retry-After"); ra == "" {
-		t.Error("Retry-After header missing")
-	}
-	assertRateLimited(t, w.Header())
-	var body struct {
-		Result struct {
-			Success bool   `json:"success"`
-			Status  string `json:"status"`
-			Message string `json:"message"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal 429 body %q: %v", w.Body.Bytes(), err)
-	}
-	if body.Result.Success || body.Result.Status != "unavailable" || body.Result.Message == "" {
-		t.Errorf("result envelope = %+v, want success=false status=unavailable non-empty message", body.Result)
-	}
-}
-
-// TestRateLimit429CommitWriteEnvelope: the commit writes' 429 is their
-// full CommitWriteResponse envelope, with commit null and every member
-// RefUpdateResult requires (#665).
-func TestRateLimit429CommitWriteEnvelope(t *testing.T) {
-	rl, _ := newTestLimiter(RateLimitConfig{RPS: 1, Burst: 1}, time.Unix(1000, 0))
-	h := rl.limit(routeCommitWrite)(okHandler())
-	if w := rlRequest(t, h, "10.0.0.1:1234"); w.Code != http.StatusOK {
-		t.Fatalf("first request = %d, want 200", w.Code)
-	}
-	w := rlRequest(t, h, "10.0.0.1:1234")
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("second request = %d, want 429", w.Code)
-	}
-	assertRateLimited(t, w.Header())
-	wctRequireRefUpdate(t, w.Body.Bytes())
-	env := wctDecode(t, w.Body.Bytes())
-	if env.Result.Success || env.Result.Status != "unavailable" || env.Result.Message != "rate limit exceeded" {
-		t.Fatalf("result = %+v, want a failed unavailable result", env.Result)
-	}
-}
-
 func TestRateLimitDeterministicRefill(t *testing.T) {
 	rl, now := newTestLimiter(RateLimitConfig{RPS: 2, Burst: 2}, time.Unix(1000, 0))
-	h := rl.limit(routeRead)(okHandler())
+	h := rl.limit()(okHandler())
 	const addr = "10.0.0.1:1"
 
 	// Drain the burst.
@@ -225,7 +174,7 @@ func TestRateLimitDeterministicRefill(t *testing.T) {
 
 func TestRateLimitPerClientIsolation(t *testing.T) {
 	rl, _ := newTestLimiter(RateLimitConfig{RPS: 1, Burst: 1}, time.Unix(1000, 0))
-	h := rl.limit(routeRead)(okHandler())
+	h := rl.limit()(okHandler())
 
 	if w := rlRequest(t, h, "10.0.0.1:1"); w.Code != http.StatusOK {
 		t.Fatalf("client A first request = %d, want 200", w.Code)
@@ -241,7 +190,7 @@ func TestRateLimitPerClientIsolation(t *testing.T) {
 
 func TestRateLimitStaleEviction(t *testing.T) {
 	rl, now := newTestLimiter(RateLimitConfig{RPS: 1, Burst: 1}, time.Unix(1000, 0))
-	h := rl.limit(routeRead)(okHandler())
+	h := rl.limit()(okHandler())
 
 	rlRequest(t, h, "10.0.0.1:1")
 	rlRequest(t, h, "10.0.0.2:1")
@@ -378,8 +327,8 @@ func TestClientKeyTrustedProxies(t *testing.T) {
 func TestRateLimitAliasSingleCharge(t *testing.T) {
 	rl, _ := newTestLimiter(RateLimitConfig{RPS: 0.001, Burst: 1}, time.Unix(1000, 0))
 	mux := http.NewServeMux()
-	mux.Handle("GET /v1/x", rl.limit(routeRead)(okHandler()))
-	mux.Handle("GET /alias/x", rl.limit(routeRead)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /v1/x", rl.limit()(okHandler()))
+	mux.Handle("GET /alias/x", rl.limit()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r2 := r.Clone(rateLimitExempt(r.Context()))
 		r2.URL.Path = "/v1/x"
 		r2.RequestURI = r2.URL.RequestURI()
@@ -520,7 +469,7 @@ func TestGitRateLimitMinimumBurst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rest := restRL.limit(routeRead)(okHandler())
+	rest := restRL.limit()(okHandler())
 	if w := rlRequest(t, rest, "10.0.0.8:1"); w.Code != http.StatusOK {
 		t.Fatalf("first REST request = %d, want 200", w.Code)
 	}
@@ -543,7 +492,7 @@ func TestGitRateLimitSeparateBucketState(t *testing.T) {
 		t.Fatal(err)
 	}
 	git := gitMW(okHandler())
-	rest := restRL.limit(routeRead)(okHandler())
+	rest := restRL.limit()(okHandler())
 
 	// Drain the git bucket (raised to the gitMinBurst floor).
 	for i := range gitMinBurst {
@@ -686,7 +635,7 @@ func TestRateLimitMappedPrefixNormalization(t *testing.T) {
 func TestRateLimitTrustedProxyBuckets(t *testing.T) {
 	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
 	rl, _ := newTestLimiter(RateLimitConfig{RPS: 0.001, Burst: 1, TrustedProxies: trusted}, time.Unix(1000, 0))
-	h := rl.limit(routeRead)(okHandler())
+	h := rl.limit()(okHandler())
 	const proxy = "10.0.0.5:1234"
 
 	// Two clients behind the same proxy connection source: separate buckets.
@@ -718,7 +667,7 @@ func TestRateLimitTrustedProxyBuckets(t *testing.T) {
 // address shares the proxy's bucket.
 func TestRateLimitNoTrustBucketCollapse(t *testing.T) {
 	rl, _ := newTestLimiter(RateLimitConfig{RPS: 0.001, Burst: 1}, time.Unix(1000, 0))
-	h := rl.limit(routeRead)(okHandler())
+	h := rl.limit()(okHandler())
 	const proxy = "10.0.0.5:1234"
 
 	if w := rlRequestXFF(t, h, proxy, "203.0.113.9"); w.Code != http.StatusOK {

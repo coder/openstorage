@@ -79,18 +79,15 @@ func TestOrgGate_ForeignIssuer403(t *testing.T) {
 			t.Fatalf(`read route 403 body = %v, want {"error": "token issued for org ..."}`, body)
 		}
 
-		// Write route: 403 with the ADR-26 result envelope.
+		// Write route: 403 with the same problem body (upstream documents
+		// ProblemDetails for every write-route 403, #352 item 3).
 		status, body = orgGateDo(t, srv, http.MethodPost, "/api/v1/repos/branches/create", foreignWrite)
 		if status != http.StatusForbidden {
 			t.Fatalf("write route with foreign-issuer token: status %d, want 403 (body %v)", status, body)
 		}
-		result, ok := body["result"].(map[string]any)
-		if !ok {
-			t.Fatalf("write route 403 body = %v, want a result envelope", body)
-		}
-		if result["success"] != false || result["status"] != "forbidden" ||
-			!strings.Contains(result["message"].(string), "not served here") {
-			t.Fatalf("write route result envelope = %v", result)
+		msg, ok = body["error"].(string)
+		if _, hasResult := body["result"]; !ok || hasResult || body["code"] != "forbidden" || !strings.Contains(msg, "not served here") {
+			t.Fatalf(`write route 403 body = %v, want a problem body with code forbidden and no result`, body)
 		}
 
 		// The same token shape for the SERVED org passes the gate (the

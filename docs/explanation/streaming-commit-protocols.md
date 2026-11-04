@@ -142,8 +142,8 @@ Success (HTTP 200):
 ```
 
 `result` is upstream's `RefUpdateResult`. Every `result` object sends `target_branch`,
-`branch`, `old_sha`, `new_sha`, `success` and `status`, also on auth, rate-limit and
-path-style lookup failures. A member with no value is an empty string.
+`branch`, `old_sha`, `new_sha`, `success` and `status`. A member with no value is an
+empty string.
 
 Failure uses the same envelope with `commit: null` (except a lost CAS, below),
 `result.success = false` and
@@ -189,9 +189,12 @@ tip the server built on. `restore-commit` answers a lost CAS with 409 `conflict`
 `commit: null`. A stale guard also answers 409 on all three routes, and its envelope carries
 the problem members of §1 step 2.
 
-The envelope must be returned as the JSON body on any of the statuses
+The handler returns the envelope as the JSON body on any of the statuses
 `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. Clients parse the body on
-these codes rather than treating them as opaque failures.
+these codes rather than treating them as opaque failures. Auth failures (401, 403), the
+gateway rate limiter's 429 and the path-style alias 404 happen before the handler: they
+use the plain problem body of the [HTTP API](../reference/http-api.md#conventions), as
+upstream documents.
 
 ## 4. `POST /api/v1/repos/restore-commit` — plain JSON, same ack
 

@@ -43,7 +43,7 @@ func TestAuth_ExistingWeakRSAKeys(t *testing.T) {
 				if resp.StatusCode != http.StatusUnauthorized {
 					t.Fatalf("write with legacy weak keys: status %d, want 401; body %s", resp.StatusCode, body)
 				}
-				requireAuthResultEnvelope(t, body, "unauthorized")
+				requireEnvelope(t, resp, body)
 			}
 		}
 		if _, err := e.store.UpsertOrgWithKeys(t.Context(), org, []string{string(strongPEM)}); err != nil {

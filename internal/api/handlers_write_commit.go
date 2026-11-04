@@ -82,7 +82,7 @@ var wcMaxCommitBlobBytes int64 = 262144000
 func registerWriteCommitRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteCommitRoutes: nil dependency")
 	route := func(pattern string, h http.HandlerFunc) {
-		mux.Handle(pattern, rl.limit(routeCommitWrite)(requireAuthCommitWrite(verifier, org, false, auth.ScopeGitWrite)(h)))
+		mux.Handle(pattern, rl.limit()(requireAuth(verifier, org, false, auth.ScopeGitWrite)(h)))
 	}
 	route("POST /api/v1/repos/commit-pack", s.handleCommitPack)
 	route("POST /api/v1/repos/diff-commit", s.handleDiffCommit)
