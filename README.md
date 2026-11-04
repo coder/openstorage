@@ -371,7 +371,7 @@ Verification).
   all implement the same `RefStore` contract [internal/ref/ref.go:RefStore]
   [internal/ref/ref.go:CASRef].
 - Every API and Git request carries an organization-signed JWT. A bad token gets 401. A
-  wrong org, scope, or repo claim gets 403 [internal/api/middleware.go:requireAuthWith]
+  wrong org, scope, or repo claim gets 403 [internal/api/middleware.go:requireAuth]
   [internal/githttp/server.go:verifyClaims] [internal/auth/verifier.go:Verify].
 - Startup fails fast on bad configuration. `OPENSTORAGE_ORG` and `OPENSTORAGE_ORG_PUBKEYS`
   are required, and an `s3wal://` store requires an `s3://` blob store

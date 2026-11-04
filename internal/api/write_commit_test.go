@@ -176,12 +176,26 @@ func wctRequireOK(t *testing.T, resp *http.Response, body []byte) wcEnvelope {
 	return env
 }
 
-// wctRequireFail asserts the docs/explanation/streaming-commit-protocols.md failure envelope with the given
-// HTTP/status pair and returns it.
+// wctRequireFail asserts a failed commit write with the given HTTP/status
+// pair. Where upstream documents the docs/explanation/streaming-commit-protocols.md failure envelope for the
+// route and status (upstreamEnvelopeStatuses), it asserts that envelope and
+// returns it. Otherwise it asserts the plain problem body with no `result`
+// and returns the zero envelope.
 func wctRequireFail(t *testing.T, resp *http.Response, body []byte, wantCode int, wantStatus string) wcEnvelope {
 	t.Helper()
 	if resp.StatusCode != wantCode {
 		t.Fatalf("status = %d, want %d (body %s)", resp.StatusCode, wantCode, body)
+	}
+	path := resp.Request.URL.Path
+	if strings.HasPrefix(path, "/api/repos/") { // alias: its last segment names the v1 route
+		path = "/api/v1/repos/" + path[strings.LastIndex(path, "/")+1:]
+	}
+	if !slices.Contains(upstreamEnvelopeStatuses(t, path), wantCode) {
+		requireEnvelope(t, resp, body)
+		if bytes.Contains(body, []byte(`"result"`)) {
+			t.Fatalf("problem body carries a result envelope: %s", body)
+		}
+		return wcEnvelope{}
 	}
 	env := wctDecode(t, body)
 	if env.Result.Success || env.Result.Status != wantStatus {
@@ -543,9 +557,9 @@ func TestCommitPackValidation(t *testing.T) {
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, tc.frames...)))
-				env := wctRequireFail(t, resp, body, tc.wantCode, statusForHTTP(tc.wantCode))
-				if !strings.Contains(env.Result.Message, tc.wantMsg) {
-					t.Errorf("message %q does not mention %q", env.Result.Message, tc.wantMsg)
+				wctRequireFail(t, resp, body, tc.wantCode, statusForHTTP(tc.wantCode))
+				if !bytes.Contains(body, []byte(tc.wantMsg)) {
+					t.Errorf("body %s does not mention %q", body, tc.wantMsg)
 				}
 			})
 		}
@@ -1209,9 +1223,8 @@ func TestWriteCommitRefPolicies(t *testing.T) {
 		t.Run("no-push denies", func(t *testing.T) {
 			tok := mint(`[["refs/heads/main", ["no-push"]]]`, nil)
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", tok, bytes.NewReader(commitBody("main", nil)))
-			env := wctRequireFail(t, resp, body, http.StatusForbidden, "forbidden")
-			if !strings.Contains(env.Result.Message, "no-push") {
-				t.Errorf("message = %q", env.Result.Message)
+			if msg := requireEnvelope(t, resp, body); resp.StatusCode != http.StatusForbidden || !strings.Contains(msg, "no-push") {
+				t.Errorf("status %d, message = %q", resp.StatusCode, msg)
 			}
 		})
 
@@ -1291,7 +1304,7 @@ func TestCommitPackQuota(t *testing.T) {
 			}
 			mux := http.NewServeMux()
 			registerWriteCommitRoutes(mux, s, auth.NewVerifier(e.store), "", nil)
-			srv := httptest.NewServer(recoverPanics(discardLogger())(mux))
+			srv := httptest.NewServer(withProblemInstance(recoverPanics(discardLogger())(mux)))
 			t.Cleanup(srv.Close)
 			return srv
 		}
@@ -1316,19 +1329,15 @@ func TestCommitPackQuota(t *testing.T) {
 			t.Fatalf("usage after first commit = (%d, %v), want > 0", usage, err)
 		}
 
-		// A 1-byte quota refuses new bytes with the 403 forbidden envelope
-		// and stores nothing new.
+		// A 1-byte quota refuses new bytes with a 403 problem body and
+		// stores nothing new.
 		tiny := quotaSrv(1)
 		resp, respBody = wctPost(t, tiny, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(smallBody("c2", "b.txt")))
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("over-quota commit-pack = %d, want 403; body: %s", resp.StatusCode, respBody)
 		}
-		var env wcEnvelope
-		if err := json.Unmarshal(respBody, &env); err != nil {
-			t.Fatalf("non-JSON quota body %q: %v", respBody, err)
-		}
-		if env.Result.Success || env.Result.Status != "forbidden" || !strings.Contains(env.Result.Message, "quota") {
-			t.Fatalf("unexpected result envelope: %+v", env.Result)
+		if msg := requireEnvelope(t, resp, respBody); !strings.Contains(msg, "quota") {
+			t.Fatalf("over-quota error = %q, want a quota message", msg)
 		}
 		after, err := blob.StorageUsageBytes(context.Background(), e.blobStore, repo.RepoID)
 		if err != nil || after != usage {
@@ -1435,9 +1444,19 @@ func TestWriteReservationCapAnswers429(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				before := wmRefsSnapshot(t, e, repo.RepoID)
 				resp, body := tc.do()
-				env := wctRequireFail(t, resp, body, http.StatusTooManyRequests, "unavailable")
-				if env.Result.Branch != "main" || !strings.Contains(env.Result.Message, "retry later") {
-					t.Fatalf("429 result = %+v, want branch main and a retry message", env.Result)
+				if tc.name == "merge" {
+					// Merge handler failures keep the envelope until #352 item 3
+					// reaches merge.
+					env := wctDecode(t, body)
+					if resp.StatusCode != http.StatusTooManyRequests || env.Result.Status != "unavailable" ||
+						env.Result.Branch != "main" || !strings.Contains(env.Result.Message, "retry later") {
+						t.Fatalf("429 = %d %s, want an unavailable envelope for main with a retry message", resp.StatusCode, body)
+					}
+				} else {
+					wctRequireFail(t, resp, body, http.StatusTooManyRequests, "unavailable")
+					if msg := requireEnvelope(t, resp, body); !strings.Contains(msg, "retry later") {
+						t.Fatalf("429 error = %q, want a retry message", msg)
+					}
 				}
 				if got := resp.Header.Get("Retry-After"); got != "10" {
 					t.Fatalf("Retry-After = %q, want 10", got)

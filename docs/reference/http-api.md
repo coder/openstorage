@@ -68,9 +68,12 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   map (such as Go's `map[string]string`). Ref-moving write
   endpoints return the richer `result` envelope
   ([streaming protocols](../explanation/streaming-commit-protocols.md)) for failures in
-  the handler. Auth failures (401, 403), the gateway rate limiter's 429 and the
-  path-style alias 404 use the error body above on every route, as upstream documents
-  ([#352](https://github.com/coder/openstorage/issues/352) item 3). Failed ref
+  the handler. `commit-pack`, `diff-commit` and `restore-commit` send it only on the
+  statuses for which upstream documents it (the streaming protocols list them), and the
+  error body above on every other failure. Auth failures (401, 403), the gateway rate
+  limiter's 429 and the path-style alias 404 use the error body above on every route,
+  as upstream documents ([#352](https://github.com/coder/openstorage/issues/352)
+  item 3). Failed ref
   guards are the exception, as upstream documents: a merge `409` for a failed guard (a
   stale `expected_target_sha`, or a source branch that no longer contains
   `expected_source_sha`) uses the error body above with code `ref_guard_failed`
@@ -678,5 +681,5 @@ Other limits and gaps:
 | 412 | a failed `restore-commit` `base_ref` precondition; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
-| 429 | rate limit (plain problem body on every route); a write handler's busy or backpressure answer (`unavailable` in its result envelope) |
+| 429 | rate limit, busy or backpressure (plain problem body; merge and notes busy answers use `unavailable` in their result envelope) |
 | 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |
