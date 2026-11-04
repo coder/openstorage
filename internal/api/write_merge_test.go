@@ -462,7 +462,7 @@ func TestMergeStrategies(t *testing.T) {
 		t.Run("ff_only rejects non-fast-forward", func(t *testing.T) {
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("feature", "main", "ff_only", nil))
-			if resp.StatusCode != http.StatusConflict {
+			if resp.StatusCode != http.StatusPreconditionFailed {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
 			if msg := wmProblem(t, resp, raw); !strings.Contains(msg, "not a fast-forward") {
@@ -603,7 +603,7 @@ func TestMergeConflictsAndGuards(t *testing.T) {
 		t.Run("unrelated histories rejected without flag", func(t *testing.T) {
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("orphan", "t-unrel", "merge", map[string]any{"author": wmTestAuthor}))
-			if resp.StatusCode != http.StatusConflict {
+			if resp.StatusCode != http.StatusPreconditionFailed {
 				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
 			}
 			if msg := wmProblem(t, resp, raw); !strings.Contains(msg, "unrelated") {

@@ -692,12 +692,15 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		respond("fast_forward", sourceSHA, tree, sourceSHA, promoted)
 		return
 	}
+	// Upstream's merge 412 names both refusals: "a merge with no common
+	// ancestor" and a target "that moved off a fast-forward under the
+	// ff_only strategy".
 	if req.Strategy == "ff_only" {
-		writeErr(w, http.StatusConflict, "merge of "+req.SourceBranch+" into "+req.TargetBranch+" is not a fast-forward")
+		writeErr(w, http.StatusPreconditionFailed, "merge of "+req.SourceBranch+" into "+req.TargetBranch+" is not a fast-forward")
 		return
 	}
 	if !hasBase && !req.AllowUnrelatedHistories {
-		writeErr(w, http.StatusConflict, "refusing to merge unrelated histories (set allow_unrelated_histories)")
+		writeErr(w, http.StatusPreconditionFailed, "refusing to merge unrelated histories (set allow_unrelated_histories)")
 		return
 	}
 
