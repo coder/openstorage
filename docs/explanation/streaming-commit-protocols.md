@@ -147,9 +147,9 @@ empty string.
 
 A failure envelope (on the statuses listed at the end of this section) has the same
 shape, with `commit: null` (except a lost CAS, below), `result.success = false` and
-`result.status` one of `precondition_failed, conflict, not_found, invalid, timeout,
-unauthorized, forbidden, unavailable, payload_too_large, internal, failed`. For example, a
-frame that is not a metadata frame answers 400:
+`result.status` naming the HTTP status: `invalid` (400), `conflict` or `failed` (409),
+`precondition_failed` (412) or `payload_too_large` (413). For example, a frame that is not
+a metadata frame answers 400:
 
 ```json
 {
