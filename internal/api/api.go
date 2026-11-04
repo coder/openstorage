@@ -32,8 +32,10 @@ func assertf(cond bool, format string, args ...any) {
 
 // Config wires the API service. Store, Verifier, HTTPBaseURL, RefStore,
 // BlobStore, and CacheDir are required; Logger defaults to slog.Default();
-// Fallback (optional) receives every request not matching an /api/v1 route —
-// the serve command mounts the git smart-HTTP handler there.
+// Fallback (optional) receives every request outside /api/: an unmatched
+// /api/ path gets unmatchedAPIRoute's problem body. The serve command does
+// not set it: it mounts this handler at /api/ in its own mux, next to the
+// git smart-HTTP handler.
 type Config struct {
 	Store    meta.Store
 	Verifier auth.Verifier
