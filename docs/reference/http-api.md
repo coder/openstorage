@@ -70,8 +70,15 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   ([streaming protocols](../explanation/streaming-commit-protocols.md)) for failures in
   the handler. `commit-pack`, `diff-commit` and `restore-commit` send it only on the
   statuses for which upstream documents it (the streaming protocols list them), and the
-  error body above on every other failure. Auth failures (401, 403), the gateway rate
-  limiter's 429 and the path-style alias 404 use the error body above on every route,
+  error body above on every other failure. Their `result` is upstream's
+  `RefUpdateResult`: it has every member that the schema requires, with empty strings
+  where there is no value: `target_branch`, the deprecated `branch` (the same value),
+  `old_sha`, `new_sha`, `success` and `status`. A failure envelope sends `commit: null`,
+  except a lost CAS on `commit-pack` and `diff-commit`. Before
+  [#665](https://github.com/coder/openstorage/issues/665), `result` had no
+  `target_branch`, most failures left out empty members, and failure envelopes sent no
+  `commit`. Auth failures (401, 403), the gateway rate limiter's 429 and the
+  path-style alias 404 use the error body above on every route,
   as upstream documents ([#352](https://github.com/coder/openstorage/issues/352)
   item 3). Failed ref
   guards are the exception, as upstream documents: a merge `409` for a failed guard (a

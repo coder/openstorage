@@ -109,7 +109,8 @@ ones. On conflict:
 Where upstream does, responses mirror legacy names alongside current ones, so older SDK
 response parsing keeps working. Examples: `url` mirrors `repo_name`; delete-repo
 responses carry `repo_name` plus the deprecated `repo_id`; deleted-branch responses carry
-both `target_branch` and `name`; [webhook](../reference/webhooks.md) bodies carry
+both `target_branch` and `name`; commit-write `result` objects carry both `target_branch`
+and `branch`; [webhook](../reference/webhooks.md) bodies carry
 `repository.repo_name` and `org` next to the deprecated `repository.url` and `customer_id`.
 
 ### Git protocol semantics

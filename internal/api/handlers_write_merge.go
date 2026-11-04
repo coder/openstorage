@@ -119,9 +119,20 @@ type wmMergeResponse struct {
 // wmFailBody is the merge failure envelope: the docs/explanation/streaming-commit-protocols.md result object,
 // plus conflict_paths + merge_base_sha on merge conflicts (docs/reference/http-api.md).
 type wmFailBody struct {
-	Result        wcResult `json:"result"`
-	ConflictPaths []string `json:"conflict_paths,omitempty"`
-	MergeBaseSHA  string   `json:"merge_base_sha,omitempty"`
+	Result        wmFailResult `json:"result"`
+	ConflictPaths []string     `json:"conflict_paths,omitempty"`
+	MergeBaseSHA  string       `json:"merge_base_sha,omitempty"`
+}
+
+// wmFailResult is the merge failure `result`. Upstream's merge failures
+// are problem bodies, not RefUpdateResult, so it keeps the short form that
+// the other write routes' failure envelopes use.
+type wmFailResult struct {
+	Branch  string `json:"branch,omitempty"`
+	OldSHA  string `json:"old_sha,omitempty"`
+	Success bool   `json:"success"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
 }
 
 // wmFail writes the merge failure envelope; the status string must agree
@@ -137,7 +148,7 @@ func wmFailConflict(w http.ResponseWriter, httpCode int, status, msg, branch, ol
 	assertf(statusForHTTP(httpCode) == status, "wmFail: status %q does not map to HTTP %d", status, httpCode)
 	assertf(msg != "", "wmFail: empty message")
 	writeJSON(w, httpCode, wmFailBody{
-		Result:        wcResult{Branch: branch, OldSHA: oldSHA, Success: false, Status: status, Message: msg},
+		Result:        wmFailResult{Branch: branch, OldSHA: oldSHA, Success: false, Status: status, Message: msg},
 		ConflictPaths: conflictPaths,
 		MergeBaseSHA:  mergeBase,
 	})

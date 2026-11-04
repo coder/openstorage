@@ -432,6 +432,81 @@ func upstreamSchemaProperties(t *testing.T, schema string) []string {
 	return props
 }
 
+// upstreamSchemaRequired returns the required list of one schema under
+// components/schemas in the vendored spec, by indentation: the schema at
+// 4 spaces, "required:" at 6, each item at 8.
+func upstreamSchemaRequired(t *testing.T, schema string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(upstreamSpecPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req []string
+	inSchema, inReq := false, false
+	for l := range strings.SplitSeq(string(raw), "\n") {
+		indent := len(l) - len(strings.TrimLeft(l, " "))
+		switch {
+		case indent == 4 && strings.TrimSpace(l) == schema+":":
+			inSchema = true
+		case inSchema && indent <= 4 && strings.TrimSpace(l) != "":
+			inSchema, inReq = false, false
+		case inSchema && indent == 6:
+			inReq = strings.TrimSpace(l) == "required:"
+		case inReq && indent == 8 && strings.HasPrefix(strings.TrimSpace(l), "- "):
+			req = append(req, strings.TrimPrefix(strings.TrimSpace(l), "- "))
+		}
+	}
+	if len(req) == 0 {
+		t.Fatalf("schema %s has no required list in %s", schema, upstreamSpecPath)
+	}
+	slices.Sort(req)
+	return req
+}
+
+// jsonKeys returns the sorted top-level member names of a JSON object.
+func jsonKeys(t *testing.T, v any) []string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	return slices.Sorted(maps.Keys(m))
+}
+
+// refUpdateRequired is RefUpdateResult's required list, which every
+// commit-write `result` sends; its one optional member is message.
+// TestRefUpdateResultMatchesUpstream pins both to the spec.
+var refUpdateRequired = []string{"branch", "new_sha", "old_sha", "status", "success", "target_branch"}
+
+// TestRefUpdateResultMatchesUpstream pins the commit-write result object
+// to the spec (#665): an empty result still sends exactly the members
+// RefUpdateResult requires, a full one sends exactly its properties, and
+// the envelope sends the members CommitWriteResponse and
+// ReposCommitsRestoreResponse require.
+func TestRefUpdateResultMatchesUpstream(t *testing.T) {
+	if got := upstreamSchemaRequired(t, "RefUpdateResult"); !slices.Equal(got, refUpdateRequired) {
+		t.Fatalf("RefUpdateResult required = %v, want %v", got, refUpdateRequired)
+	}
+	if got, want := upstreamSchemaProperties(t, "RefUpdateResult"), slices.Sorted(slices.Values(append([]string{"message"}, refUpdateRequired...))); !slices.Equal(got, want) {
+		t.Fatalf("RefUpdateResult properties = %v, want %v", got, want)
+	}
+	if got := jsonKeys(t, wcRefUpdate("", "", "", "invalid", "")); !slices.Equal(got, refUpdateRequired) {
+		t.Fatalf("empty result members = %v, want %v", got, refUpdateRequired)
+	}
+	if got, want := jsonKeys(t, wcRefUpdate("main", ref.ZeroSHA, ref.ZeroSHA, "ok", "m")), upstreamSchemaProperties(t, "RefUpdateResult"); !slices.Equal(got, want) {
+		t.Fatalf("full result members = %v, want RefUpdateResult's properties %v", got, want)
+	}
+	for _, schema := range []string{"CommitWriteResponse", "ReposCommitsRestoreResponse"} {
+		if got, want := jsonKeys(t, wcEnvelope{}), upstreamSchemaRequired(t, schema); !slices.Equal(got, want) {
+			t.Fatalf("envelope members = %v, want %s's required %v", got, schema, want)
+		}
+	}
+}
+
 // TestProblemMembersMatchUpstream pins the problem members and the
 // InvalidParam item to the spec, and the invalid_params example that
 // upstream documents for a type error.
