@@ -130,7 +130,8 @@ Success (HTTP 200):
     "blob_count": 2            // commit-pack only
   },
   "result": {
-    "branch": "main",
+    "target_branch": "main",
+    "branch": "main",           // deprecated upstream, same value as target_branch
     "old_sha": "<40-hex or 40 zeros for root commit>",
     "new_sha": "<40-hex>",
     "success": true,
@@ -140,10 +141,33 @@ Success (HTTP 200):
 }
 ```
 
-Failure uses the same envelope with `result.success = false` and `result.status` one of
-`precondition_failed, conflict, not_found, invalid, timeout, unauthorized, forbidden,
-unavailable, internal, failed`. SDKs map these strings (or the numeric HTTP status) to
-typed `RefUpdateError`s with this table:
+`result` is upstream's `RefUpdateResult`. Every `result` object sends `target_branch`,
+`branch`, `old_sha`, `new_sha`, `success` and `status`, also on auth, rate-limit and
+path-style lookup failures. A member with no value is an empty string.
+
+Failure uses the same envelope with `commit: null` (except a lost CAS, below),
+`result.success = false` and
+`result.status` one of `precondition_failed, conflict, not_found, invalid, timeout,
+unauthorized, forbidden, unavailable, payload_too_large, internal, failed`. For example, a
+frame that is not a metadata frame answers 400:
+
+```json
+{
+  "commit": null,
+  "result": {
+    "target_branch": "",
+    "branch": "",
+    "old_sha": "",
+    "new_sha": "",
+    "success": false,
+    "status": "invalid",
+    "message": "first frame must be a metadata frame"
+  }
+}
+```
+
+SDKs map these strings (or the numeric HTTP status) to typed `RefUpdateError`s with this
+table:
 
 | HTTP | status string |
 |---|---|
@@ -154,14 +178,15 @@ typed `RefUpdateError`s with this table:
 | 408, 499, 504 | `timeout` |
 | 409 | `conflict`; `failed` for a lost CAS on `commit-pack` and `diff-commit` (below) |
 | 412 | `precondition_failed` |
+| 413 | `payload_too_large` (`commit-pack`) |
 | 429, 502, 503 | `unavailable` |
 | 500 | `internal` |
 
 When another writer moves the branch after the server wrote the commit (a lost CAS),
 `commit-pack` and `diff-commit` answer 409 with `result.status: "failed"`. `commit` and
 `result.new_sha` name the commit that the branch did not get, and `result.old_sha` is the
-tip the server built on. `restore-commit` answers a lost CAS with 409 `conflict` and no
-`commit`. A stale guard also answers 409 on all three routes, and its envelope carries
+tip the server built on. `restore-commit` answers a lost CAS with 409 `conflict` and
+`commit: null`. A stale guard also answers 409 on all three routes, and its envelope carries
 the problem members of §1 step 2.
 
 The envelope must be returned as the JSON body on any of the statuses

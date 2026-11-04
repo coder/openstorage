@@ -177,6 +177,27 @@ func TestRateLimit429WriteEnvelope(t *testing.T) {
 	}
 }
 
+// TestRateLimit429CommitWriteEnvelope: the commit writes' 429 is their
+// full CommitWriteResponse envelope, with commit null and every member
+// RefUpdateResult requires (#665).
+func TestRateLimit429CommitWriteEnvelope(t *testing.T) {
+	rl, _ := newTestLimiter(RateLimitConfig{RPS: 1, Burst: 1}, time.Unix(1000, 0))
+	h := rl.limit(routeCommitWrite)(okHandler())
+	if w := rlRequest(t, h, "10.0.0.1:1234"); w.Code != http.StatusOK {
+		t.Fatalf("first request = %d, want 200", w.Code)
+	}
+	w := rlRequest(t, h, "10.0.0.1:1234")
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request = %d, want 429", w.Code)
+	}
+	assertRateLimited(t, w.Header())
+	wctRequireRefUpdate(t, w.Body.Bytes())
+	env := wctDecode(t, w.Body.Bytes())
+	if env.Result.Success || env.Result.Status != "unavailable" || env.Result.Message != "rate limit exceeded" {
+		t.Fatalf("result = %+v, want a failed unavailable result", env.Result)
+	}
+}
+
 func TestRateLimitDeterministicRefill(t *testing.T) {
 	rl, now := newTestLimiter(RateLimitConfig{RPS: 2, Burst: 2}, time.Unix(1000, 0))
 	h := rl.limit(routeRead)(okHandler())

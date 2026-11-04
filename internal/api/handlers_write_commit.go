@@ -82,7 +82,7 @@ var wcMaxCommitBlobBytes int64 = 262144000
 func registerWriteCommitRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteCommitRoutes: nil dependency")
 	route := func(pattern string, h http.HandlerFunc) {
-		mux.Handle(pattern, rl.limit(routeWrite)(requireAuthWrite(verifier, org, false, auth.ScopeGitWrite)(h)))
+		mux.Handle(pattern, rl.limit(routeCommitWrite)(requireAuthCommitWrite(verifier, org, false, auth.ScopeGitWrite)(h)))
 	}
 	route("POST /api/v1/repos/commit-pack", s.handleCommitPack)
 	route("POST /api/v1/repos/diff-commit", s.handleDiffCommit)
@@ -103,20 +103,32 @@ type wcCommitInfo struct {
 	BlobCount    *int   `json:"blob_count,omitempty"`
 }
 
-// wcResult is the shared `result` object; on failure only Status is
-// mandatory (SDK refUpdateResultWithOptionalsSchema), known fields are
-// included for context.
+// wcResult is upstream's RefUpdateResult, the shared `result` object. It
+// sends every member the spec requires, with empty strings where there is
+// no value, as upstream's failure examples do (#665).
 type wcResult struct {
-	Branch  string `json:"branch,omitempty"`
-	OldSHA  string `json:"old_sha,omitempty"`
-	NewSHA  string `json:"new_sha,omitempty"`
-	Success bool   `json:"success"`
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
+	TargetBranch string `json:"target_branch"`
+	Branch       string `json:"branch"` // deprecated upstream; mirrors target_branch
+	OldSHA       string `json:"old_sha"`
+	NewSHA       string `json:"new_sha"`
+	Success      bool   `json:"success"`
+	Status       string `json:"status"`
+	Message      string `json:"message,omitempty"`
 }
 
+// wcRefUpdate builds every wcResult, so target_branch and branch always
+// name the same branch and success is true only for status "ok".
+func wcRefUpdate(branch, oldSHA, newSHA, status, msg string) wcResult {
+	return wcResult{
+		TargetBranch: branch, Branch: branch, OldSHA: oldSHA, NewSHA: newSHA,
+		Success: status == "ok", Status: status, Message: msg,
+	}
+}
+
+// wcEnvelope is upstream's CommitWriteResponse and
+// ReposCommitsRestoreResponse, which require `commit`: failures send null.
 type wcEnvelope struct {
-	Commit *wcCommitInfo `json:"commit,omitempty"`
+	Commit *wcCommitInfo `json:"commit"`
 	Result wcResult      `json:"result"`
 }
 
@@ -127,9 +139,7 @@ type wcEnvelope struct {
 func wcFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string) {
 	assertf(statusForHTTP(httpCode) == status, "wcFail: status %q does not map to HTTP %d", status, httpCode)
 	assertf(msg != "", "wcFail: empty message")
-	writeJSON(w, httpCode, wcEnvelope{Result: wcResult{
-		Branch: branch, OldSHA: oldSHA, Success: false, Status: status, Message: msg,
-	}})
+	writeJSON(w, httpCode, wcEnvelope{Result: wcRefUpdate(branch, oldSHA, "", status, msg)})
 }
 
 // wcFailLostCAS writes upstream's 409 for a commit that storage wrote but
@@ -139,9 +149,7 @@ func wcFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA str
 func wcFailLostCAS(w http.ResponseWriter, info *wcCommitInfo, msg, oldSHA string) {
 	assertf(info != nil && ref.ValidSHA(info.CommitSHA) && ref.ValidSHA(info.TreeSHA), "wcFailLostCAS: incomplete commit %+v", info)
 	assertf(info.TargetBranch != "" && msg != "", "wcFailLostCAS: empty branch or message")
-	writeJSON(w, http.StatusConflict, wcEnvelope{Commit: info, Result: wcResult{
-		Branch: info.TargetBranch, OldSHA: oldSHA, NewSHA: info.CommitSHA, Success: false, Status: "failed", Message: msg,
-	}})
+	writeJSON(w, http.StatusConflict, wcEnvelope{Commit: info, Result: wcRefUpdate(info.TargetBranch, oldSHA, info.CommitSHA, "failed", msg)})
 }
 
 // wcGuardBody is upstream's CommitWriteRefGuardProblemDetails and
@@ -150,19 +158,7 @@ func wcFailLostCAS(w http.ResponseWriter, info *wcCommitInfo, msg, oldSHA string
 type wcGuardBody struct {
 	errorEnvelope
 	Commit *wcCommitInfo `json:"commit"` // always nil: the spec sends null
-	Result wcGuardResult `json:"result"`
-}
-
-// wcGuardResult is upstream's RefUpdateResult with every member it
-// requires, which the other failure envelopes (wcResult) do not all send.
-type wcGuardResult struct {
-	TargetBranch string `json:"target_branch"`
-	Branch       string `json:"branch"`
-	OldSHA       string `json:"old_sha"`
-	NewSHA       string `json:"new_sha"`
-	Success      bool   `json:"success"`
-	Status       string `json:"status"`
-	Message      string `json:"message"`
+	Result wcResult      `json:"result"`
 }
 
 // wcFailRefGuard writes the 409 of a stale expected_target_sha (spec
@@ -174,10 +170,7 @@ func wcFailRefGuard(w http.ResponseWriter, msg, branch, oldSHA, currentSHA strin
 	assertf(oldSHA == currentSHA || oldSHA == ref.ZeroSHA, "wcFailRefGuard: old_sha %s is neither current_sha %s nor zero", oldSHA, currentSHA)
 	writeProblemJSON(w, http.StatusConflict, wcGuardBody{
 		errorEnvelope: refGuardProblem(w, "expected_target_sha", currentSHA, msg),
-		Result: wcGuardResult{
-			TargetBranch: branch, Branch: branch, OldSHA: oldSHA, NewSHA: "",
-			Success: false, Status: statusForHTTP(http.StatusConflict), Message: msg,
-		},
+		Result:        wcRefUpdate(branch, oldSHA, "", statusForHTTP(http.StatusConflict), msg),
 	})
 }
 
@@ -973,14 +966,7 @@ func (s *server) wcFinishCommit(w http.ResponseWriter, r *http.Request, sc *wcSc
 	}
 	writeJSON(w, http.StatusOK, wcEnvelope{
 		Commit: info,
-		Result: wcResult{
-			Branch:  md.TargetBranch,
-			OldSHA:  plan.oldSHA,
-			NewSHA:  commit,
-			Success: true,
-			Status:  "ok",
-			Message: "commit created",
-		},
+		Result: wcRefUpdate(md.TargetBranch, plan.oldSHA, commit, "ok", "commit created"),
 	})
 }
 

@@ -125,27 +125,30 @@ func authFailStatus(httpCode int) string {
 }
 
 // writeAuthEnvelope is the docs/explanation/streaming-commit-protocols.md §3 / ADR-26 failure writer for write
-// routes: auth failures carry the result envelope ({"result": {success,
-// status, message}}) instead of the plain {"error"} body, so SDKs can map
-// them onto typed RefUpdateErrors. 401 keeps WWW-Authenticate (RFC 9110).
+// routes: auth failures carry the flavor's result envelope (writeResultFail)
+// instead of the plain {"error"} body, so SDKs can map them onto typed
+// RefUpdateErrors. 401 keeps WWW-Authenticate (RFC 9110).
 // The result envelope carries no problem `code` (issue #352 tier 3), so
 // the code argument is unused.
-func writeAuthEnvelope(w http.ResponseWriter, httpCode int, _ string, msg string) {
-	assertf(msg != "", "writeAuthEnvelope: empty message")
-	if httpCode == http.StatusUnauthorized {
-		w.Header().Set("WWW-Authenticate", "Bearer")
+func writeAuthEnvelope(flavor routeFlavor) authFailWriter {
+	return func(w http.ResponseWriter, httpCode int, _ string, msg string) {
+		if httpCode == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+		}
+		writeResultFail(w, flavor, httpCode, authFailStatus(httpCode), msg)
 	}
-	writeJSON(w, httpCode, map[string]any{"result": map[string]any{
-		"success": false,
-		"status":  authFailStatus(httpCode),
-		"message": msg,
-	}})
 }
 
 // requireAuthWrite is requireAuth with ADR-26 envelope-shaped 401/403
 // bodies; every docs/explanation/streaming-commit-protocols.md write route must use it.
 func requireAuthWrite(verifier auth.Verifier, org string, orgLevel bool, requiredScopes ...string) middleware {
-	return requireAuthWith(verifier, org, orgLevel, writeAuthEnvelope, requiredScopes...)
+	return requireAuthWith(verifier, org, orgLevel, writeAuthEnvelope(routeWrite), requiredScopes...)
+}
+
+// requireAuthCommitWrite is requireAuthWrite for commit-pack, diff-commit
+// and restore-commit, whose 401/403 send the full CommitWriteResponse.
+func requireAuthCommitWrite(verifier auth.Verifier, org string, orgLevel bool, requiredScopes ...string) middleware {
+	return requireAuthWith(verifier, org, orgLevel, writeAuthEnvelope(routeCommitWrite), requiredScopes...)
 }
 
 // authFailWriter writes one auth failure: HTTP status, problem code (the

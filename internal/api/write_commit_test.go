@@ -154,13 +154,44 @@ func wctDecode(t *testing.T, body []byte) wcEnvelope {
 	return env
 }
 
+// wctRequireRefUpdate asserts the raw members of a commit-write envelope
+// (#665): `commit` is present (null on a failure other than a lost CAS),
+// and `result` has every member RefUpdateResult requires, no member it
+// lacks, and a target_branch equal to the deprecated branch.
+func wctRequireRefUpdate(t *testing.T, body []byte) {
+	t.Helper()
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode envelope %q: %v", body, err)
+	}
+	commit, hasCommit := env["commit"]
+	var res map[string]any
+	if err := json.Unmarshal(env["result"], &res); err != nil {
+		t.Fatalf("decode result of %s: %v", body, err)
+	}
+	if !hasCommit || (res["status"] != "ok" && res["status"] != "failed") != (string(commit) == "null") {
+		t.Fatalf("commit = %s (present %v), want an object on success and on a lost CAS, else null (body %s)", commit, hasCommit, body)
+	}
+	keys := slices.DeleteFunc(slices.Sorted(maps.Keys(res)), func(k string) bool { return k == "message" })
+	if !slices.Equal(keys, refUpdateRequired) {
+		t.Fatalf("result members = %v (and message), want RefUpdateResult's %v (body %s)", keys, refUpdateRequired, body)
+	}
+	if res["target_branch"] != res["branch"] {
+		t.Fatalf("target_branch %v != branch %v (body %s)", res["target_branch"], res["branch"], body)
+	}
+}
+
 // wctRequireOK asserts a 200 success envelope and returns it.
 func wctRequireOK(t *testing.T, resp *http.Response, body []byte) wcEnvelope {
 	t.Helper()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, body)
 	}
+	wctRequireRefUpdate(t, body)
 	env := wctDecode(t, body)
+	if env.Result.TargetBranch == "" || env.Result.TargetBranch != env.Commit.TargetBranch {
+		t.Fatalf("result.target_branch %q, want commit.target_branch %q", env.Result.TargetBranch, env.Commit.TargetBranch)
+	}
 	if env.Commit == nil || !env.Result.Success || env.Result.Status != "ok" {
 		t.Fatalf("success envelope = %s", body)
 	}
@@ -176,9 +207,17 @@ func wctRequireOK(t *testing.T, resp *http.Response, body []byte) wcEnvelope {
 	return env
 }
 
-// wctRequireFail asserts the docs/explanation/streaming-commit-protocols.md failure envelope with the given
-// HTTP/status pair and returns it.
+// wctRequireFail asserts the docs/explanation/streaming-commit-protocols.md failure envelope of a commit
+// write with the given HTTP/status pair and returns it.
 func wctRequireFail(t *testing.T, resp *http.Response, body []byte, wantCode int, wantStatus string) wcEnvelope {
+	t.Helper()
+	wctRequireRefUpdate(t, body)
+	return wctRequireShortFail(t, resp, body, wantCode, wantStatus)
+}
+
+// wctRequireShortFail is wctRequireFail for the write routes other than
+// the commit writes (merge), whose `result` keeps the short form.
+func wctRequireShortFail(t *testing.T, resp *http.Response, body []byte, wantCode int, wantStatus string) wcEnvelope {
 	t.Helper()
 	if resp.StatusCode != wantCode {
 		t.Fatalf("status = %d, want %d (body %s)", resp.StatusCode, wantCode, body)
@@ -575,16 +614,13 @@ func TestCommitPackValidation(t *testing.T) {
 			if got := resp.Header.Get("WWW-Authenticate"); got != "Bearer" {
 				t.Fatalf("WWW-Authenticate = %q, want Bearer", got)
 			}
-			requireAuthResultEnvelope(t, body, "unauthorized")
+			wctRequireFail(t, resp, body, http.StatusUnauthorized, "unauthorized")
 		})
 
 		t.Run("git:read scope is 403 with result envelope", func(t *testing.T) {
 			_, _, readTok := wctRepo(t, e)
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", readTok, bytes.NewReader(wctLines(t, wctMeta("main", "m", nil, nil))))
-			if resp.StatusCode != http.StatusForbidden {
-				t.Fatalf("status = %d, want 403", resp.StatusCode)
-			}
-			requireAuthResultEnvelope(t, body, "forbidden")
+			wctRequireFail(t, resp, body, http.StatusForbidden, "forbidden")
 		})
 
 		t.Run("unknown repo is enveloped 404", func(t *testing.T) {
@@ -592,6 +628,20 @@ func TestCommitPackValidation(t *testing.T) {
 			tok := e.mint(t, tokenSpec{iss: org, repo: "https://example.com/" + org + "/ghost", scopes: []string{auth.ScopeGitWrite}})
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", tok, bytes.NewReader(wctLines(t, wctMeta("main", "m", nil, nil))))
 			wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
+		})
+
+		// The path-style aliases answer their own auth and lookup failures
+		// before re-dispatch, in the same full envelope (#665).
+		t.Run("path-style alias failures carry the full envelope", func(t *testing.T) {
+			repo, writeTok, readTok := wctRepo(t, e)
+			for _, route := range []string{"commit-pack", "diff-commit", "restore-commit"} {
+				resp, body := wctPost(t, e.srv, "/api/repos/"+repo.RepoID+"/"+route, "", strings.NewReader("{}"))
+				wctRequireFail(t, resp, body, http.StatusUnauthorized, "unauthorized")
+				resp, body = wctPost(t, e.srv, "/api/repos/"+repo.RepoID+"/"+route, readTok, strings.NewReader("{}"))
+				wctRequireFail(t, resp, body, http.StatusForbidden, "forbidden")
+				resp, body = wctPost(t, e.srv, "/api/repos/ghost-"+route+"/"+route, writeTok, strings.NewReader("{}"))
+				wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
+			}
 		})
 	})
 }
@@ -1435,7 +1485,11 @@ func TestWriteReservationCapAnswers429(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				before := wmRefsSnapshot(t, e, repo.RepoID)
 				resp, body := tc.do()
-				env := wctRequireFail(t, resp, body, http.StatusTooManyRequests, "unavailable")
+				check := wctRequireFail
+				if tc.name == "merge" {
+					check = wctRequireShortFail
+				}
+				env := check(t, resp, body, http.StatusTooManyRequests, "unavailable")
 				if env.Result.Branch != "main" || !strings.Contains(env.Result.Message, "retry later") {
 					t.Fatalf("429 result = %+v, want branch main and a retry message", env.Result)
 				}

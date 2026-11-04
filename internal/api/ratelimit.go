@@ -74,7 +74,31 @@ const (
 	// the docs/explanation/streaming-commit-protocols.md §3 result envelope ({"result": {success: false, status:
 	// "unavailable", ...}}, docs/reference/http-api.md status mapping).
 	routeWrite
+	// routeCommitWrite: commit-pack, diff-commit and restore-commit
+	// (requireAuthCommitWrite) answer with their full CommitWriteResponse
+	// envelope (#665).
+	routeCommitWrite
 )
+
+// writeResultFail writes a failure that a write route answers outside its
+// handler (rate limit, auth, alias lookup) in the route's result envelope:
+// the full CommitWriteResponse for the commit writes, the short
+// {"result": {success, status, message}} for the other write routes.
+func writeResultFail(w http.ResponseWriter, flavor routeFlavor, httpCode int, status, msg string) {
+	assertf(msg != "", "writeResultFail: empty message")
+	switch flavor {
+	case routeCommitWrite:
+		writeJSON(w, httpCode, wcEnvelope{Result: wcRefUpdate("", "", "", status, msg)})
+	case routeWrite:
+		writeJSON(w, httpCode, map[string]any{"result": map[string]any{
+			"success": false,
+			"status":  status,
+			"message": msg,
+		}})
+	default:
+		assertf(false, "writeResultFail: flavor %d has no result envelope", flavor)
+	}
+}
 
 // sweepInterval is how often the bucket map drops stale (fully refilled)
 // entries. Eviction is behavior-neutral: a dropped bucket is recreated full,
@@ -170,7 +194,7 @@ func rateLimitExempt(ctx context.Context) context.Context {
 // 429 envelope shape and must match the route's auth-failure envelope.
 // 429 responses carry the Retry-After + RateLimit header pair.
 func (l *rateLimiter) limit(flavor routeFlavor) middleware {
-	assertf(flavor == routeRead || flavor == routeWrite, "limit: unknown flavor %d", flavor)
+	assertf(flavor == routeRead || flavor == routeWrite || flavor == routeCommitWrite, "limit: unknown flavor %d", flavor)
 	if l == nil {
 		return func(next http.Handler) http.Handler { return next }
 	}
@@ -188,11 +212,7 @@ func (l *rateLimiter) limit(flavor routeFlavor) middleware {
 					writeErr(w, http.StatusTooManyRequests, msg)
 					return
 				}
-				writeJSON(w, http.StatusTooManyRequests, map[string]any{"result": map[string]any{
-					"success": false,
-					"status":  statusForHTTP(http.StatusTooManyRequests),
-					"message": msg,
-				}})
+				writeResultFail(w, flavor, http.StatusTooManyRequests, statusForHTTP(http.StatusTooManyRequests), msg)
 				return
 			}
 			next.ServeHTTP(w, r)

@@ -41,7 +41,8 @@ type aliasRoute struct {
 	v1Path string
 	// flavor selects the auth middleware and the alias-layer failure
 	// envelope: routeRead → requireAuth + {"error"}, routeWrite →
-	// requireAuthWrite + docs/explanation/streaming-commit-protocols.md result envelope.
+	// requireAuthWrite + docs/explanation/streaming-commit-protocols.md result envelope,
+	// routeCommitWrite → requireAuthCommitWrite + the full commit-write envelope.
 	flavor routeFlavor
 	// orgLevel mirrors the v1 route's requireAuth org-level flag (only the
 	// PUT/DELETE git-credentials routes). Org tokens carry repo claim
@@ -73,6 +74,9 @@ func aliasRoutes() []aliasRoute {
 	write := func(method, suffix, v1Path string, scopes ...string) aliasRoute {
 		return aliasRoute{method: method, suffix: suffix, v1Path: v1Path, flavor: routeWrite, scopes: scopes}
 	}
+	commitWrite := func(suffix, v1Path string) aliasRoute {
+		return aliasRoute{method: http.MethodPost, suffix: suffix, v1Path: v1Path, flavor: routeCommitWrite, scopes: []string{auth.ScopeGitWrite}}
+	}
 	deprecatedRoute := func(ar aliasRoute) aliasRoute {
 		ar.deprecated = true
 		return ar
@@ -103,9 +107,9 @@ func aliasRoutes() []aliasRoute {
 		read(http.MethodGet, "/merge/preview", "/api/v1/repos/merge/preview", auth.ScopeGitRead),
 
 		// git:write surface (result-envelope auth failures, ADR-26).
-		write(http.MethodPost, "/commit-pack", "/api/v1/repos/commit-pack", auth.ScopeGitWrite),
-		write(http.MethodPost, "/diff-commit", "/api/v1/repos/diff-commit", auth.ScopeGitWrite),
-		write(http.MethodPost, "/restore-commit", "/api/v1/repos/restore-commit", auth.ScopeGitWrite),
+		commitWrite("/commit-pack", "/api/v1/repos/commit-pack"),
+		commitWrite("/diff-commit", "/api/v1/repos/diff-commit"),
+		commitWrite("/restore-commit", "/api/v1/repos/restore-commit"),
 		write(http.MethodPost, "/branches/create", "/api/v1/repos/branches/create", auth.ScopeGitWrite),
 		write(http.MethodDelete, "/branches", "/api/v1/repos/branches", auth.ScopeGitWrite),
 		write(http.MethodPost, "/tags", "/api/v1/repos/tags", auth.ScopeGitWrite),
@@ -158,8 +162,11 @@ func registerAliasRoutes(mux *http.ServeMux, s *server, ss *syncServer, verifier
 		seen[pattern] = true
 
 		authMW := requireAuth
-		if ar.flavor == routeWrite {
+		switch ar.flavor {
+		case routeWrite:
 			authMW = requireAuthWrite
+		case routeCommitWrite:
+			authMW = requireAuthCommitWrite
 		}
 		h := rl.limit(ar.flavor)(authMW(verifier, org, ar.orgLevel, ar.scopes...)(s.aliasHandler(mux, ar)))
 		if ar.deprecated {
@@ -267,12 +274,7 @@ func aliasFail(w http.ResponseWriter, flavor routeFlavor, httpCode int, msg stri
 		writeErr(w, httpCode, msg)
 		return
 	}
-	assertf(flavor == routeWrite, "aliasFail: unknown flavor %d", flavor)
-	writeJSON(w, httpCode, map[string]any{"result": map[string]any{
-		"success": false,
-		"status":  statusForHTTP(httpCode),
-		"message": msg,
-	}})
+	writeResultFail(w, flavor, httpCode, statusForHTTP(httpCode), msg)
 }
 
 // aliasRepoNotFound writes the alias's repository-lookup 404 in the

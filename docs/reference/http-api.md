@@ -68,7 +68,16 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   map (such as Go's `map[string]string`). Ref-moving write
   endpoints return the richer `result` envelope
   ([streaming protocols](../explanation/streaming-commit-protocols.md)), even on 4xx/5xx
-  statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. Failed ref
+  statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. The `result` of
+  `commit-pack`, `diff-commit` and `restore-commit` is upstream's `RefUpdateResult`, also on
+  auth, rate-limit and path-style lookup failures. It has every member that the
+  schema requires, with empty strings where
+  there is no value: `target_branch`, the deprecated `branch` (the same value), `old_sha`,
+  `new_sha`, `success` and `status`. A failed commit write sends `commit: null`, except a
+  lost CAS on `commit-pack` and `diff-commit`. Before
+  [#665](https://github.com/coder/openstorage/issues/665), `result` had no
+  `target_branch`, most failures left out empty members, and failed commit writes sent
+  no `commit`. Failed ref
   guards are the exception, as upstream documents: a merge `409` for a failed guard (a
   stale `expected_target_sha`, or a source branch that no longer contains
   `expected_source_sha`) uses the error body above with code `ref_guard_failed`

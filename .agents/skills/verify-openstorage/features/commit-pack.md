@@ -4,11 +4,11 @@ A user commits files to a branch without git: `POST /api/v1/repos/commit-pack` t
 
 ## Sub-features
 
-- `cp-upsert` adds `hello.txt` on `main`. The answer is `200` with `commit.commit_sha`, and `result.old_sha` is the previous tip.
+- `cp-upsert` adds `hello.txt` on `main`. The answer is `200` with `commit.commit_sha`, `result.target_branch` and the deprecated `result.branch` are `main`, and `result.old_sha` is the previous tip.
 - `cp-readback-api` shows the new bytes, blob SHA, tip, and commit message through REST.
 - `cp-readback-git` shows the same commit and bytes in a fresh clone, with the old tip as its parent.
 - `cp-pack` stores one new pack file for the repo.
-- `cp-no-change` answers `412` `precondition_failed` with `no changes to commit` for a commit that changes nothing, and leaves the tip alone.
+- `cp-no-change` answers `412` `precondition_failed` with `no changes to commit`, `commit: null` and `result.target_branch` `main` for a commit that changes nothing, and leaves the tip alone.
 - `cp-stale-guard` answers `409` `ref_guard_failed` for a stale `expected_target_sha`, with `current_sha` = the tip, and leaves the tip alone.
 - `cp-new-branch` creates `feature` from `main` with `base_branch` and deletes a path with `operation: "delete"`.
 - `cp-unborn` makes the first commit of an empty repo (`result.old_sha` is 40 zeros).
@@ -35,7 +35,7 @@ Preconditions:
 env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data" >"$OSV_EVIDENCE/cp-packs-before.txt"
 ```
 
-- **Commit a file.** Write the frames, then send them. The status is `200`, `result.status` is `ok`, and `result.old_sha` is `SEED`.
+- **Commit a file.** Write the frames, then send them. The status is `200`, `result.status` is `ok`, `result.target_branch` and `result.branch` are `main`, and `result.old_sha` is `SEED`.
 
 ```sh
 cat >"$OSV_EVIDENCE/cp-upsert.ndjson" <<'NDJSON'
@@ -47,6 +47,8 @@ NDJSON
   --data-binary "@$OSV_EVIDENCE/cp-upsert.ndjson"
 NEW=$("$OSV" json "$OSV_EVIDENCE/cp-upsert.body" commit.commit_sha)
 "$OSV" eq "$RUN" cp-result-ok ok "$("$OSV" json "$OSV_EVIDENCE/cp-upsert.body" result.status)"
+"$OSV" eq "$RUN" cp-target-branch main "$("$OSV" json "$OSV_EVIDENCE/cp-upsert.body" result.target_branch)"
+"$OSV" eq "$RUN" cp-branch-mirror main "$("$OSV" json "$OSV_EVIDENCE/cp-upsert.body" result.branch)"
 "$OSV" eq "$RUN" cp-old-sha "$SEED" "$("$OSV" json "$OSV_EVIDENCE/cp-upsert.body" result.old_sha)"
 "$OSV" eq "$RUN" cp-new-sha "$NEW" "$("$OSV" json "$OSV_EVIDENCE/cp-upsert.body" result.new_sha)"
 ```
@@ -85,12 +87,16 @@ env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WOR
   "$(grep -c '\.pack' "$OSV_EVIDENCE/cp-packs-after.txt")"
 ```
 
-- **Refuse a commit with no changes.** Send the same frames again. The status is `412`, `result.message` is `no changes to commit`, and the tip is still `NEW`.
+- **Refuse a commit with no changes.** Send the same frames again. The status is `412`, `result.message` is `no changes to commit`, `commit` is `null`, `result` has every `RefUpdateResult` member (`target_branch` and `branch` are `main`, `old_sha` is `NEW`, `new_sha` is empty), and the tip is still `NEW`.
 
 ```sh
 "$OSV" api "$RUN" cp-no-change --token rw --expect 412 POST /api/v1/repos/commit-pack \
   -H 'Content-Type: application/x-ndjson' --data-binary "@$OSV_EVIDENCE/cp-upsert.ndjson"
 "$OSV" eq "$RUN" cp-no-change-message 'no changes to commit' "$("$OSV" json "$OSV_EVIDENCE/cp-no-change.body" result.message)"
+"$OSV" eq "$RUN" cp-no-change-commit null "$("$OSV" json "$OSV_EVIDENCE/cp-no-change.body" commit)"
+"$OSV" eq "$RUN" cp-no-change-result \
+  "{\"target_branch\": \"main\", \"branch\": \"main\", \"old_sha\": \"$NEW\", \"new_sha\": \"\", \"success\": false, \"status\": \"precondition_failed\", \"message\": \"no changes to commit\"}" \
+  "$("$OSV" json "$OSV_EVIDENCE/cp-no-change.body" result)"
 ```
 
 - **Refuse a stale guard.** Send a commit whose `expected_target_sha` is `SEED`. The status is `409`, `code` is `ref_guard_failed`, `current_sha` is `NEW`, `result.status` is `conflict`, and the tip is still `NEW`.
@@ -142,6 +148,6 @@ NDJSON
 - `target_branch` is a short name. A `refs/` prefix is refused.
 - Write the frames with a quoted heredoc. An unquoted one lets the shell expand `$` inside the JSON.
 - A stale `expected_target_sha` (or the deprecated `expected_head_sha`) answers HTTP `409` with `code` `ref_guard_failed`, `guard`, `current_sha` and `result.status` `conflict`. A `409` with `result.status` `failed` and no `code` means a lost race with another writer, which this recipe cannot force.
-- Auth failures on commit-pack answer in the `result` envelope (`{"result":{"status":"forbidden",...}}`), not in the `{"error":...}` body of read endpoints.
+- Auth failures on commit-pack answer in the `result` envelope (`{"commit":null,"result":{"status":"forbidden",...}}`), not in the `{"error":...}` body of read endpoints.
 - Without `committer`, the committer is the author.
 - `list-packs` reads the blob store only. Run it with `env -i PATH="$PATH"` so an inherited `OPENSTORAGE_S3_URL` does not point it at another store.
