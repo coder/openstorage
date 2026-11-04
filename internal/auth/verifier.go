@@ -90,6 +90,19 @@ type KeySource interface {
 	PublicKeysForOrg(ctx context.Context, name string) ([]string, error)
 }
 
+// KeySourceError is a Verify failure from the KeySource: the org is not
+// registered, or the key store failed. The caller tells them apart with
+// errors.Is on the store's not-found error.
+type KeySourceError struct {
+	Org string
+	Err error
+}
+
+func (e *KeySourceError) Error() string { return fmt.Sprintf("issuer %q: %v", e.Org, e.Err) }
+
+// Unwrap exposes the KeySource error.
+func (e *KeySourceError) Unwrap() error { return e.Err }
+
 // OrgKeyVerifier implements Verifier: it resolves the issuing org's public
 // keys through a KeySource and verifies the token signature against them,
 // restricted to AllowedAlgorithms.
@@ -188,10 +201,17 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	if unverified.Iss == "" {
 		return nil, errors.New("jwt missing iss claim")
 	}
+	// A NUL fails the PostgreSQL lookup: refuse it here, so a
+	// KeySourceError always means the key store failed, not that the token
+	// is malformed. No configured org has one (an environment variable
+	// cannot hold a NUL). json.Unmarshal already made iss valid UTF-8.
+	if strings.ContainsRune(unverified.Iss, 0) {
+		return nil, errors.New("jwt iss claim has a NUL character")
+	}
 
 	pems, err := v.keys.PublicKeysForOrg(ctx, unverified.Iss)
 	if err != nil {
-		return nil, fmt.Errorf("issuer %q: %w", unverified.Iss, err)
+		return nil, &KeySourceError{Org: unverified.Iss, Err: err}
 	}
 	var pubs []crypto.PublicKey
 	for i, p := range pems {

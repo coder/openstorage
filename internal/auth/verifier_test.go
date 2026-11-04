@@ -72,6 +72,28 @@ func validClaims(iss string) Claims {
 	}
 }
 
+// TestVerify_KeySourceError: a KeySource failure comes back as a
+// *KeySourceError wrapping the store's error, and an iss with a NUL is
+// refused before the KeySource is asked. Other control characters reach
+// the KeySource: an org name may hold them.
+func TestVerify_KeySourceError(t *testing.T) {
+	key := mustGenerateKey(t, "ES256")
+	v := NewVerifier(fakeKeySource{})
+	_, err := v.Verify(context.Background(), mustMint(t, key, "ES256", validClaims("acme")))
+	var kse *KeySourceError
+	if !errors.As(err, &kse) || kse.Org != "acme" || err.Error() != `issuer "acme": org not found` {
+		t.Fatalf("Verify = %v, want a KeySourceError for acme", err)
+	}
+	_, err = v.Verify(context.Background(), mustMint(t, key, "ES256", validClaims("ac\x00me")))
+	if err == nil || errors.As(err, &kse) {
+		t.Errorf("iss with NUL: Verify = %v, want a refusal before the key lookup", err)
+	}
+	_, err = v.Verify(context.Background(), mustMint(t, key, "ES256", validClaims("ac\tme")))
+	if !errors.As(err, &kse) || kse.Org != "ac\tme" {
+		t.Errorf("iss with a tab: Verify = %v, want the key lookup to run", err)
+	}
+}
+
 // TestVerify_AlgorithmMatrix covers each allowed algorithm: a token signed
 // with the registered key verifies; a token signed with an unregistered key
 // of the same algorithm does not.

@@ -485,6 +485,33 @@ func TestForkRepo(t *testing.T) {
 	})
 }
 
+// TestForkSourceKeyStoreFailure: a key store failure while the server
+// verifies base_repo.auth.token is upstream's 403
+// authentication_unavailable, as for the caller's own token, and creates
+// no repository.
+func TestForkSourceKeyStoreFailure(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		src := wrefSeedFixture(t, e)
+		srcReadTok := e.mint(t, tokenSpec{iss: src.org, repo: src.url, scopes: []string{auth.ScopeGitRead}})
+		caller := newForkCaller(t, e, "")
+		s := &server{store: e.store, httpBaseURL: testHTTPBaseURL, logger: discardLogger(),
+			refStore: e.refStore, blobStore: e.blobStore, cacheDir: e.cacheDir}
+		mux := http.NewServeMux()
+		mux.Handle("POST /api/v1/repos", requireAuth(auth.NewVerifier(e.store), "", false, auth.ScopeRepoWrite)(
+			s.forkAwareCreateRepo(auth.NewVerifier(failingKeys{}), s.handleCreateRepo)))
+		srv := httptest.NewServer(recoverPanics(s.logger)(mux))
+		t.Cleanup(srv.Close)
+
+		resp, body := forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
+		if resp.StatusCode != http.StatusForbidden || body["code"] != "authentication_unavailable" {
+			t.Fatalf("status %d body %v, want 403 authentication_unavailable", resp.StatusCode, body)
+		}
+		if _, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url); !errors.Is(err, meta.ErrNotFound) {
+			t.Fatalf("repo lookup after refused fork: err = %v, want ErrNotFound", err)
+		}
+	})
+}
+
 // TestForkRelativeCacheDir: --cache-dir may be relative, and then
 // gitread.Materialize returns a relative repo path that git also uses as
 // its working directory. Paths handed to git through the environment must
