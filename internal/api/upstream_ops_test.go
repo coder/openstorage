@@ -70,7 +70,7 @@ func TestNotesAppendRoute(t *testing.T) {
 			tip := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]
 			resp, body := post(t, fx.token, map[string]any{"object_ref": fx.c1, "note": "retry",
 				"expected_notes_ref_sha": ref.ZeroSHA})
-			assertNotesRefGuard(t, resp.StatusCode, body, fx.c1, "refs/notes/commits", tip)
+			assertNotesRefGuard(t, resp, body, fx.c1, "refs/notes/commits", tip)
 			if body["instance"] != path {
 				t.Fatalf("instance = %v, want %s", body["instance"], path)
 			}
@@ -78,7 +78,7 @@ func TestNotesAppendRoute(t *testing.T) {
 			// alias reports the standard guard name.
 			resp, body = post(t, fx.token, map[string]any{"object_ref": fx.c1, "note": "retry",
 				"notes_ref": "unborn", "expected_ref_sha": tip})
-			assertNotesRefGuard(t, resp.StatusCode, body, fx.c1, "refs/notes/unborn", ref.ZeroSHA)
+			assertNotesRefGuard(t, resp, body, fx.c1, "refs/notes/unborn", ref.ZeroSHA)
 			if got := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]; got != tip {
 				t.Fatalf("notes ref moved %s -> %s", tip, got)
 			}
