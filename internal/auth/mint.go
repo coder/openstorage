@@ -67,7 +67,7 @@ func DefaultAlgorithm(key crypto.Signer) (string, error) {
 
 // MintToken signs c into a compact JWT with header {"alg": alg, "typ":
 // "JWT"}. Claims are marshaled exactly as given so tests can mint invalid
-// tokens (expired, wrong sub, ...); typical callers set Sub:
+// tokens (expired, empty sub, ...); typical callers set Sub:
 // SubjectLiteral, Iat: now, Exp: now+ttl. Errors when alg is not allowed or
 // does not fit the key.
 func MintToken(key crypto.Signer, alg string, c Claims) (string, error) {

@@ -73,8 +73,8 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
 ```json
 {
   "iss": "<org name>",                     // must match the org of the request host
-  "sub": "@pierre/storage",                // fixed literal in all three SDKs
-  "repo": "<repo url|id>" | "org",         // target repo; "org" for org-level operations
+  "sub": "<any non-empty string>",         // caller label, e.g. "pierre-sdk-go"
+  "repo": "<repo url|id>" | "org",         // target repo; "org" or omitted for org-level operations
   "scopes": ["git:read", "git:write"],     // see scope table
   "iat": 1700000000,                       // seconds
   "exp": 1700003600,                       // seconds; SDK defaults: 1h per API call,
@@ -86,9 +86,19 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
 ```
 
 - `repo` carries the repository **url** value (what `GET /api/repo-urls/{repo_id}` returns).
-- A token verifies when: the signature is valid for the org, `exp` is in the future, `repo`
-  matches the target repo (or is `"org"` for org-scoped endpoints), and the required
-  scopes are present.
+- A token with no `repo` claim is org-wide and behaves exactly like `repo: "org"`:
+  org-scoped endpoints accept it, and repository endpoints and the git surface refuse it
+  with `403`. A `repo` that is present but empty (`""` or `null`) is not org-wide: every
+  endpoint refuses it with `403`.
+- `sub` is a free-text label that the signer picks ("Agent identity (for logging)" in the
+  [upstream guide](../upstream/getting-started/authentication.md)). Any non-empty string
+  verifies, and an empty or missing `sub` is a `401`. It grants nothing, and open.storage
+  does not log it or key anything on it. SDK 1.17.1 and `openstorage mint` send
+  `@pierre/storage`. SDK 0.1.0 sends `pierre-sdk-go`, `pierre-sdk-python` or
+  `pierre-sdk-typescript`, and omits `repo` for org-wide calls.
+- A token verifies when: the signature is valid for the org, `exp` is in the future, `sub`
+  is not empty, `repo` matches the target repo (or is `"org"` or omitted for org-scoped
+  endpoints), and the required scopes are present.
 - SDKs mint a fresh JWT per request when configured with a private key, and send
   pre-minted tokens verbatim. The backend must not assume token reuse or caching.
 
@@ -99,7 +109,7 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
 | `git:read` | all read endpoints (files, branches, tags, commits, diffs, blame, grep, notes read, merge preview, `GET /repo` metadata) + git clone/fetch |
 | `git:write` | ref mutations (commit-pack, diff-commit, restore-commit, branch create/delete, merge, tag create, notes write/append/delete, pull-upstream and `upstream/pull`) + git push |
 | `repo:write` | repo lifecycle (create/delete repo, git-credentials CRUD, unset base repo via `DELETE .../base` or `DELETE .../upstream`) |
-| `org:read` | organization metadata (`GET /api/meta`, `repo: "org"`) and org-wide listing (`GET /repos`, `GET /api/repo-urls/{repo_id}`) |
+| `org:read` | organization metadata (`GET /api/meta`, `repo: "org"` or no `repo`) and org-wide listing (`GET /repos`, `GET /api/repo-urls/{repo_id}`) |
 
 Endpoint quirks (verified across all three SDKs):
 
@@ -107,7 +117,8 @@ Endpoint quirks (verified across all three SDKs):
 - `createRepo` mints `repo:write` with `repo` = the *new* repo id (client-generated UUID if
   unspecified).
 - `listRepos`, `updateGitCredential`, `deleteGitCredential` use `repo: "org"`;
-  `createGitCredential` uses `repo: <repoId>`.
+  `createGitCredential` uses `repo: <repoId>`. SDK 0.1.0 omits `repo` for these org-wide
+  calls instead.
 
 ## Ref policies (`refs` claim) — branch protection embedded in tokens
 

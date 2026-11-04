@@ -115,7 +115,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
 
 `GET /api/meta` — absolute path, no `/v1`, and no `/api/v1/meta` alias.
 
-- **Auth:** org-scoped token (`repo: "org"`) with `org:read` for the served organization.
+- **Auth:** org-scoped token (`repo: "org"`, or no `repo` claim) with `org:read` for the
+  served organization.
 - **Rate limit:** the ordinary pre-auth limiter.
 - **Response:** `200` with this exact shape:
 

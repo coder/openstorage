@@ -117,8 +117,8 @@ func FuzzVerify(f *testing.F) {
 	}
 	expired := good
 	expired.Exp = 946684800 // fixed: 2000-01-01T00:00:00Z
-	wrongSub := good
-	wrongSub.Sub = "someone-else"
+	emptySub := good
+	emptySub.Sub = ""
 	wrongOrg := good
 	wrongOrg.Iss = "evil"
 
@@ -172,7 +172,7 @@ func FuzzVerify(f *testing.F) {
 		fuzzRS256Token,
 		fuzzPS256Token,
 		mint(registered, expired),  // signed but expired
-		mint(registered, wrongSub), // signed but wrong sub
+		mint(registered, emptySub), // signed but empty sub
 		mint(registered, wrongOrg), // signed but unknown issuer
 		hs256,
 		hs256RSA,

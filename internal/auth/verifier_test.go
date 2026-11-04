@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lestrrat-go/jwx/v3/jws"
 )
 
 // fakeKeySource is an in-memory KeySource: org name → PEM public key blocks.
@@ -158,8 +160,8 @@ func TestVerify_Negatives(t *testing.T) {
 	expired.Exp = time.Now().Add(-time.Minute).Unix()
 	noExp := validClaims("acme")
 	noExp.Exp = 0
-	wrongSub := validClaims("acme")
-	wrongSub.Sub = "@evil/storage"
+	emptySub := validClaims("acme")
+	emptySub.Sub = ""
 	unknownIss := validClaims("ghost")
 	noIss := validClaims("")
 
@@ -189,7 +191,8 @@ func TestVerify_Negatives(t *testing.T) {
 		"alg HS256":                 hsToken,
 		"expired":                   mustMint(t, key, "ES256", expired),
 		"missing exp":               mustMint(t, key, "ES256", noExp),
-		"wrong sub":                 mustMint(t, key, "ES256", wrongSub),
+		"empty sub":                 mustMint(t, key, "ES256", emptySub),
+		"missing sub":               mustMintPayload(t, key, "ES256", claimsWithout(t, validClaims("acme"), "sub")),
 		"unknown issuer":            mustMint(t, key, "ES256", unknownIss),
 		"missing iss":               mustMint(t, key, "ES256", noIss),
 		"other org's key":           mustMint(t, otherOrgKey, "ES256", validClaims("acme")),
@@ -199,6 +202,112 @@ func TestVerify_Negatives(t *testing.T) {
 		if _, err := v.Verify(context.Background(), token); err == nil {
 			t.Errorf("%s: Verify accepted the token", name)
 		}
+	}
+}
+
+// mustMintPayload signs payload verbatim, so a test can omit a claim that
+// MintToken would always marshal.
+func mustMintPayload(t *testing.T, key crypto.Signer, alg string, payload map[string]any) string {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdrs := jws.NewHeaders()
+	if err := hdrs.Set("typ", "JWT"); err != nil {
+		t.Fatal(err)
+	}
+	signed, err := jws.Sign(body, jws.WithKey(signatureAlgorithms[alg], key, jws.WithProtectedHeaders(hdrs)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(signed)
+}
+
+// claimsWithout returns c as a JSON object with the named claims removed.
+func claimsWithout(t *testing.T, c Claims, names ...string) map[string]any {
+	t.Helper()
+	body, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		if _, ok := m[n]; !ok {
+			t.Fatalf("claimsWithout: claim %q not in %s", n, body)
+		}
+		delete(m, n)
+	}
+	return m
+}
+
+// TestVerify_AcceptsAnyNonEmptySubject: `sub` is caller-chosen free text
+// (issue #658). The SDK 0.1.0 subjects, our own literal and an arbitrary
+// string all verify and come back verbatim; empty and missing `sub` are
+// covered by TestVerify_Negatives.
+func TestVerify_AcceptsAnyNonEmptySubject(t *testing.T) {
+	key := mustGenerateKey(t, "ES256")
+	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
+	for _, sub := range []string{
+		SubjectLiteral,
+		"pierre-sdk-go",
+		"pierre-sdk-python",
+		"pierre-sdk-typescript",
+		"ci-pipeline-prod",
+		"x",
+		"\"quoted\"\n\x00\u202e" + strings.Repeat("long", 1024),
+	} {
+		c := validClaims("acme")
+		c.Sub = sub
+		got, err := v.Verify(context.Background(), mustMint(t, key, "ES256", c))
+		if err != nil {
+			t.Fatalf("sub %q: Verify: %v", sub, err)
+		}
+		if got.Sub != sub || got.Repo != "repo-1" {
+			t.Fatalf("sub %q: claims = %+v", sub, got)
+		}
+	}
+}
+
+// TestVerify_RepoClaimPresence: a token without a `repo` claim is org-wide
+// and verifies with RepoClaimOrg, exactly like `repo: "org"` (issue #658).
+// A present but empty or null claim is not org-wide: it stays "" for the
+// callers' gates to refuse.
+func TestVerify_RepoClaimPresence(t *testing.T) {
+	key := mustGenerateKey(t, "ES256")
+	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
+	withRepo := func(repo any) map[string]any {
+		m := claimsWithout(t, validClaims("acme"), "repo")
+		m["repo"] = repo
+		return m
+	}
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+		want    string
+	}{
+		{"missing", claimsWithout(t, validClaims("acme"), "repo"), RepoClaimOrg},
+		{"org", withRepo(RepoClaimOrg), RepoClaimOrg},
+		{"repo url", withRepo("team/project-alpha"), "team/project-alpha"},
+		{"empty string", withRepo(""), ""},
+		{"null", withRepo(nil), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", tc.payload))
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if got.Repo != tc.want {
+				t.Fatalf("repo = %q, want %q", got.Repo, tc.want)
+			}
+		})
+	}
+	// A non-string repo claim is malformed, present or not.
+	if _, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", withRepo(42))); err == nil {
+		t.Fatal("Verify accepted a numeric repo claim")
 	}
 }
 
