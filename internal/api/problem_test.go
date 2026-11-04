@@ -701,8 +701,8 @@ func assertNotesRefGuard(t *testing.T, status int, body map[string]any, sha, not
 // assertCommitRefGuard checks a stale expected_target_sha (or its alias
 // expected_head_sha) on commit-pack, diff-commit or restore-commit (#647):
 // a CommitWriteRefGuardProblemDetails body, that is a failed conflict
-// result plus the problem members, which the oracle checks once `result`
-// is removed. oldSHA is the target tip (40 zeros for a new branch) and
+// result and a null commit plus the problem members, which the oracle
+// checks once `result` and `commit` are removed. oldSHA is the target tip (40 zeros for a new branch) and
 // currentSHA the tip the guard was checked against.
 func assertCommitRefGuard(t *testing.T, status int, raw []byte, branch, oldSHA, currentSHA string) {
 	t.Helper()
@@ -714,9 +714,10 @@ func assertCommitRefGuard(t *testing.T, status int, raw []byte, branch, oldSHA, 
 		t.Fatalf("body %q is not JSON: %v", raw, err)
 	}
 	res, _ := body["result"].(map[string]any)
+	commit, hasCommit := body["commit"]
 	if res["success"] != false || res["status"] != "conflict" || res["target_branch"] != branch || res["branch"] != branch ||
-		res["old_sha"] != oldSHA || res["new_sha"] != "" || res["message"] != body["detail"] || body["commit"] != nil {
-		t.Fatalf("result = %v, want a failed conflict result on %s with old_sha %s and no commit (body %s)", res, branch, oldSHA, raw)
+		res["old_sha"] != oldSHA || res["new_sha"] != "" || res["message"] != body["detail"] || !hasCommit || commit != nil {
+		t.Fatalf("result = %v, want a failed conflict result on %s with old_sha %s and commit null (body %s)", res, branch, oldSHA, raw)
 	}
 	// RefUpdateResult has additionalProperties: false, and the guard body
 	// sends every member, so its members are exactly the schema's.
@@ -726,9 +727,11 @@ func assertCommitRefGuard(t *testing.T, status int, raw []byte, branch, oldSHA, 
 	if body["guard"] != "expected_target_sha" || body["current_sha"] != currentSHA {
 		t.Fatalf("guard members = %s, want expected_target_sha and current_sha %s", raw, currentSHA)
 	}
+	// The spec's descriptions say `commit` is null; it is not an allOf
+	// member, so the oracle checks it here and drops it.
 	problem := map[string]any{}
 	for k, v := range body {
-		if !slices.Contains(commitGuardMembers, k) {
+		if !slices.Contains(commitGuardMembers, k) && k != "commit" {
 			problem[k] = v
 		}
 	}

@@ -145,10 +145,11 @@ func wcFailLostCAS(w http.ResponseWriter, info *wcCommitInfo, msg, oldSHA string
 }
 
 // wcGuardBody is upstream's CommitWriteRefGuardProblemDetails and
-// RestoreCommitRefGuardProblemDetails: a `result` plus the
-// ref_guard_failed problem members.
+// RestoreCommitRefGuardProblemDetails: a `result`, a null `commit`, and
+// the ref_guard_failed problem members.
 type wcGuardBody struct {
 	errorEnvelope
+	Commit *wcCommitInfo `json:"commit"` // always nil: the spec sends null
 	Result wcGuardResult `json:"result"`
 }
 

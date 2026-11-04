@@ -56,7 +56,8 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
    - notes write/delete: `expected_ref_sha` vs notes ref tip.
    - On mismatch: fail with HTTP 409, code `ref_guard_failed`, `guard` and `current_sha`.
      The commit writes keep their `result` object
-     `{success: false, status: "conflict", branch, old_sha}`, and the notes writes keep
+     `{target_branch, branch, old_sha, new_sha: "", success: false, status: "conflict"}`
+     with `commit: null`, and the notes writes keep
      the note envelope with `result.status` `conflict`.
      Clients (e.g. `just-code-storage` push) map this to git's "failed to push some refs"
      UX, so the shape is load-bearing.

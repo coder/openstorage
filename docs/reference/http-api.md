@@ -474,7 +474,8 @@ plus the problem members of the error body, as upstream's
 - `result` has every member of upstream's `RefUpdateResult`: `target_branch` and `branch`
   name the target branch, `new_sha` is empty, `success` is `false`, and `status` is
   `conflict`. `old_sha` is the tip of the target branch, so it repeats `current_sha`,
-  except on a new branch, where it is 40 zeros. The body has no `commit`.
+  except on a new branch, where it is 40 zeros. `commit` is `null`, as upstream's
+  schema descriptions say.
 
 The content type stays `application/json`. A CAS race lost at publish time is a
 different `409`, without the problem members
