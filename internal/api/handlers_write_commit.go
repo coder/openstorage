@@ -145,11 +145,23 @@ func wcFailLostCAS(w http.ResponseWriter, info *wcCommitInfo, msg, oldSHA string
 }
 
 // wcGuardBody is upstream's CommitWriteRefGuardProblemDetails and
-// RestoreCommitRefGuardProblemDetails: the failure envelope's `result`
-// plus the ref_guard_failed problem members.
+// RestoreCommitRefGuardProblemDetails: a `result` plus the
+// ref_guard_failed problem members.
 type wcGuardBody struct {
 	errorEnvelope
-	Result wcResult `json:"result"`
+	Result wcGuardResult `json:"result"`
+}
+
+// wcGuardResult is upstream's RefUpdateResult with every member it
+// requires, which the other failure envelopes (wcResult) do not all send.
+type wcGuardResult struct {
+	TargetBranch string `json:"target_branch"`
+	Branch       string `json:"branch"`
+	OldSHA       string `json:"old_sha"`
+	NewSHA       string `json:"new_sha"`
+	Success      bool   `json:"success"`
+	Status       string `json:"status"`
+	Message      string `json:"message"`
 }
 
 // wcFailRefGuard writes the 409 of a stale expected_target_sha (spec
@@ -161,8 +173,9 @@ func wcFailRefGuard(w http.ResponseWriter, msg, branch, oldSHA, currentSHA strin
 	assertf(oldSHA == currentSHA || oldSHA == ref.ZeroSHA, "wcFailRefGuard: old_sha %s is neither current_sha %s nor zero", oldSHA, currentSHA)
 	writeJSON(w, http.StatusConflict, wcGuardBody{
 		errorEnvelope: refGuardProblem(w, "expected_target_sha", currentSHA, msg),
-		Result: wcResult{
-			Branch: branch, OldSHA: oldSHA, Success: false, Status: statusForHTTP(http.StatusConflict), Message: msg,
+		Result: wcGuardResult{
+			TargetBranch: branch, Branch: branch, OldSHA: oldSHA, NewSHA: "",
+			Success: false, Status: statusForHTTP(http.StatusConflict), Message: msg,
 		},
 	})
 }

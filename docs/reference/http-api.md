@@ -471,9 +471,10 @@ plus the problem members of the error body, as upstream's
 - `current_sha`: the commit the guard was checked against, that is the tip of the target
   branch, or the tip of `base_branch` for a new branch. Send it as the guard of the next
   attempt.
-- `result.status` is `conflict`. `result.old_sha` is the tip of the target branch, so it
-  repeats `current_sha`, except on a new branch, where it is 40 zeros. The body has no
-  `commit`.
+- `result` has every member of upstream's `RefUpdateResult`: `target_branch` and `branch`
+  name the target branch, `new_sha` is empty, `success` is `false`, and `status` is
+  `conflict`. `old_sha` is the tip of the target branch, so it repeats `current_sha`,
+  except on a new branch, where it is 40 zeros. The body has no `commit`.
 
 The content type stays `application/json`. A CAS race lost at publish time is a
 different `409`, without the problem members

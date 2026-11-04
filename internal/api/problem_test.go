@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -713,9 +714,14 @@ func assertCommitRefGuard(t *testing.T, status int, raw []byte, branch, oldSHA, 
 		t.Fatalf("body %q is not JSON: %v", raw, err)
 	}
 	res, _ := body["result"].(map[string]any)
-	if res["success"] != false || res["status"] != "conflict" || res["branch"] != branch || res["old_sha"] != oldSHA ||
-		res["message"] != body["detail"] || body["commit"] != nil {
+	if res["success"] != false || res["status"] != "conflict" || res["target_branch"] != branch || res["branch"] != branch ||
+		res["old_sha"] != oldSHA || res["new_sha"] != "" || res["message"] != body["detail"] || body["commit"] != nil {
 		t.Fatalf("result = %v, want a failed conflict result on %s with old_sha %s and no commit (body %s)", res, branch, oldSHA, raw)
+	}
+	// RefUpdateResult has additionalProperties: false, and the guard body
+	// sends every member, so its members are exactly the schema's.
+	if got, want := slices.Sorted(maps.Keys(res)), upstreamSchemaProperties(t, "RefUpdateResult"); !slices.Equal(got, want) {
+		t.Fatalf("result members = %v, want RefUpdateResult's %v", got, want)
 	}
 	if body["guard"] != "expected_target_sha" || body["current_sha"] != currentSHA {
 		t.Fatalf("guard members = %s, want expected_target_sha and current_sha %s", raw, currentSHA)
