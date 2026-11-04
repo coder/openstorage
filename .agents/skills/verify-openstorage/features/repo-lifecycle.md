@@ -17,7 +17,7 @@ A user creates, inspects, lists, and deletes repositories, and changes a reposit
 - `POST /api/v1/repos`, `PATCH /api/v1/repo`, and `DELETE /api/v1/repos/delete` with a `repo:write` token for the repo.
 - `GET /api/v1/repo` with a `git:read` token for the repo.
 - `GET /api/v1/repos`, `GET /api/repo-urls/{repo_id}`, and `GET /api/meta` with an `org:read` token whose `repo` claim is `org`.
-- The path-style aliases `GET`, `PATCH`, and `DELETE /api/repos/{repo_name}`.
+- The path-style aliases `GET`, `PATCH`, and `DELETE /api/repos/{repo_name}`, and the canonical `POST /api/repos` and `GET /api/repos`, with the same tokens as their `/api/v1` twins.
 
 ## Driving it with osv.sh
 

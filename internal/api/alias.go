@@ -5,7 +5,8 @@
 //
 //   - One alias per repo-scoped v1 route, registered with the SAME
 //     scopes as its v1 twin. Org-scoped routes (GET/POST
-//     /api/v1/repos list+create, webhooks) get NO alias.
+//     /api/v1/repos list+create, webhooks) get NO alias; api.go registers
+//     GET/POST /api/repos directly on the v1 list and create handlers.
 //   - Handler shape: decode r.PathValue("repo_name") (Go 1.22 mux matches
 //     the escaped path, so "pierre%2Fexample" stays one segment) →
 //     meta.ResolveRepoKey for both the path name and the token's repo claim
@@ -51,6 +52,10 @@ type aliasRoute struct {
 	// alias (issue #456). The v1 twin cannot decide it: its handler also
 	// serves the non-deprecated path-style replacements.
 	deprecated bool
+	// tagInPath passes the {tag_name} path segment to the v1 tag-delete
+	// handler, which then takes the tag name from it instead of the body
+	// (DELETE .../tags/{tag_name}, issue #656).
+	tagInPath bool
 }
 
 // aliasRoutes mirrors every repo-scoped v1 route registered in api.go /
@@ -98,6 +103,10 @@ func aliasRoutes() []aliasRoute {
 		alias(http.MethodDelete, "/branches", "/api/v1/repos/branches", auth.ScopeGitWrite),
 		alias(http.MethodPost, "/tags", "/api/v1/repos/tags", auth.ScopeGitWrite),
 		alias(http.MethodDelete, "/tags", "/api/v1/repos/tags", auth.ScopeGitRead, auth.ScopeGitWrite),
+		// Tag-in-path delete (the form SDK 0.1.0 calls, issue #656): same
+		// handler and scopes as the body form.
+		{method: http.MethodDelete, suffix: "/tags/{tag_name}", v1Path: "/api/v1/repos/tags",
+			scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite}, tagInPath: true},
 		alias(http.MethodPost, "/notes", "/api/v1/repos/notes", auth.ScopeGitWrite),
 		alias(http.MethodDelete, "/notes", "/api/v1/repos/notes", auth.ScopeGitWrite),
 		// Path-style append (spec 2026-10-05, issue #378): no v1 twin, so it
@@ -209,6 +218,12 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 		ctx := withAliasDispatch(rateLimitExempt(r.Context()))
 		if ar.mark != nil {
 			ctx = ar.mark(ctx)
+		}
+		if ar.tagInPath {
+			// A {tag_name} wildcard never matches an empty segment.
+			tag := r.PathValue("tag_name")
+			assertf(tag != "", "aliasHandler: empty tag_name path value")
+			ctx = withPathTag(ctx, tag)
 		}
 		r2 := r.Clone(ctx)
 		r2.URL.Path = ar.v1Path
