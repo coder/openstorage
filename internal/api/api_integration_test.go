@@ -690,8 +690,9 @@ func testListPrefix(t *testing.T, e *testEnv) {
 	}
 }
 
-// TestAuthMatrix drives the docs/reference/http-api.md 401/403 failure map across all four
-// endpoints, asserting status, envelope shape, and WWW-Authenticate on 401.
+// TestAuthMatrix drives the docs/reference/http-api.md 401/403 failure map across the
+// repo lifecycle endpoints (create and list on both path styles), asserting status,
+// envelope shape, and WWW-Authenticate on 401.
 func TestAuthMatrix(t *testing.T) { runBackends(t, testAuthMatrix) }
 
 func testAuthMatrix(t *testing.T, e *testEnv) {
@@ -709,6 +710,8 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 		{"create", http.MethodPost, "/api/v1/repos", auth.ScopeRepoWrite, false},
 		{"get", http.MethodGet, "/api/v1/repo", auth.ScopeGitRead, false},
 		{"list", http.MethodGet, "/api/v1/repos", auth.ScopeOrgRead, true},
+		{"create canonical", http.MethodPost, "/api/repos", auth.ScopeRepoWrite, false},
+		{"list canonical", http.MethodGet, "/api/repos", auth.ScopeOrgRead, true},
 		{"delete", http.MethodDelete, "/api/v1/repos/delete", auth.ScopeRepoWrite, false},
 	}
 
