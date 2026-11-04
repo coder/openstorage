@@ -705,8 +705,8 @@ type wrefNoteGuardBody struct {
 	wrefNoteResponse
 }
 
-// wrefNoteGuardFail writes the 409 of a stale expected_notes_ref_sha on the
-// forms that answer upstream's status (#568). currentSHA is the notes
+// wrefNoteGuardFail writes the 409 of a stale expected_notes_ref_sha
+// (#568, #647). currentSHA is the notes
 // ref's tip, or the zero sha when unborn, as current_sha and new_ref_sha.
 func wrefNoteGuardFail(w http.ResponseWriter, msg, sha, targetRef, baseCommit, currentSHA string) {
 	writeProblemJSON(w, http.StatusConflict, wrefNoteGuardBody{
@@ -915,7 +915,7 @@ func (s *server) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 // wrefHandleNote implements the shared POST/DELETE notes flow: validate
 // (object_ref is a full object SHA or a revision resolving to a commit,
 // issue #161; success responses echo the resolved id in `sha`), CAS-guard
-// on expected_notes_ref_sha (412; 409 for the DELETE query form), run the notes operation on a request-
+// on expected_notes_ref_sha (409 ref_guard_failed), run the notes operation on a request-
 // scoped temp ref with a scratch object directory, policy-check, publish the
 // new objects (pack → upload → register), and CAS the notes ref (409 on a
 // lost race). Domain failures answer with the note-write envelope.
@@ -950,16 +950,9 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	objectSHA := wrefAliasField(req.ObjectRef, req.SHA)
 	notesRefRaw := wrefAliasField(req.NotesRef, req.Ref)
 	expectedRefSHA := wrefAliasField(req.ExpectedNotesRefSHA, req.ExpectedRefSHA)
-	// A stale guard is a 412 on the legacy body forms. The 2026-10-05 spec
-	// (issue #378) moves the DELETE fields to query parameters (present
-	// query wins over the body, even when empty) and documents 409 for a
-	// stale query guard; the SDKs still send the body form and surface
-	// result.status, so only the query form answers 409.
-	staleGuardStatus := http.StatusPreconditionFailed
-	if appendRoute {
-		// POST .../notes/append documents 409 for a stale guard.
-		staleGuardStatus = http.StatusConflict
-	}
+	// The 2026-10-05 spec (issue #378) moves the DELETE fields to query
+	// parameters: a present query parameter wins over the body, even when
+	// empty.
 	if deleteNote {
 		q := r.URL.Query()
 		if q.Has("object_ref") {
@@ -970,7 +963,6 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		}
 		if q.Has("expected_notes_ref_sha") {
 			expectedRefSHA = q.Get("expected_notes_ref_sha")
-			staleGuardStatus = http.StatusConflict
 		}
 	}
 	targetRef, err := wrefNotesRefName(notesRefRaw)
@@ -1033,7 +1025,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		// branch, tag, short SHA, or full ref — that must resolve to a
 		// commit; unresolvable input fails like an unknown object id.
 		// Resolution runs before the CAS guard below so every envelope
-		// (the 412 included) reports the resolved id in `sha`.
+		// (the stale-guard 409 included) reports the resolved id in `sha`.
 		resolved, err := gitread.ResolveRef(ctx, repoPath, objectSHA, false)
 		if errors.Is(err, gitread.ErrNotFound) {
 			wrefNoteFail(w, http.StatusNotFound, "object_ref does not resolve to a commit: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
@@ -1046,15 +1038,12 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 
 	// Invariant 1: expected_notes_ref_sha is the notes-ref CAS guard; the
-	// zero sha asserts the ref is unborn. The 409 forms carry upstream's
-	// ref_guard_failed problem members next to the note members.
+	// zero sha asserts the ref is unborn. Every form answers upstream's 409
+	// with the ref_guard_failed problem members next to the note members
+	// (#647).
 	if expectedRefSHA != "" && expectedRefSHA != oldOrZero {
 		msg := fmt.Sprintf("expected_notes_ref_sha %.8s does not match %s tip %.8s", expectedRefSHA, targetRef, oldOrZero)
-		if staleGuardStatus == http.StatusConflict {
-			wrefNoteGuardFail(w, msg, objectSHA, targetRef, old, oldOrZero)
-		} else {
-			wrefNoteFail(w, staleGuardStatus, msg, objectSHA, targetRef, old, oldOrZero)
-		}
+		wrefNoteGuardFail(w, msg, objectSHA, targetRef, old, oldOrZero)
 		return
 	}
 

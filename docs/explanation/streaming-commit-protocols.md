@@ -76,7 +76,10 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
    does not exist and `base_branch` is given, branch from that tip; otherwise create a
    root commit.
 2. CAS check: a stale `expected_target_sha` (or the deprecated `expected_head_sha`) gets
-   HTTP 412 `precondition_failed` and moves no ref.
+   HTTP 409 and moves no ref. The body is the failure envelope (`result.status`
+   `conflict`) plus the problem members `code: ref_guard_failed`, `guard` and
+   `current_sha`, sent as `application/problem+json`
+   ([details](../reference/http-api.md#commit-write-guards)).
 3. Write blobs, build the tree on the base tree (upserts + deletes), create the commit,
    and atomically advance the ref (respecting JWT ref policies). If the new tree equals
    the base tree (or the empty tree on an unborn branch), the server answers 412
@@ -158,7 +161,8 @@ When another writer moves the branch after the server wrote the commit (a lost C
 `commit-pack` and `diff-commit` answer 409 with `result.status: "failed"`. `commit` and
 `result.new_sha` name the commit that the branch did not get, and `result.old_sha` is the
 tip the server built on. `restore-commit` answers a lost CAS with 409 `conflict` and no
-`commit`.
+`commit`. A stale guard also answers 409 on all three routes, and its envelope carries
+the problem members of §1 step 2.
 
 The envelope must be returned as the JSON body on any of the statuses
 `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. Clients parse the body on

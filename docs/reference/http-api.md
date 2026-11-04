@@ -38,8 +38,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `repository_deleted` (409: `DELETE /api/v1/repos/delete` on a deleted repository;
   `DELETE /api/repos/{repo_name}` answers that case with 404 `repository_not_found`,
   because its name lookup skips deleted repositories), and `ref_guard_failed` (409: a
-  failed merge guard, with `guard` and `current_sha`, [details](#merge-guards), and a
-  stale notes guard on the forms that answer 409, [details](#notes)). open.storage
+  failed ref guard, with `guard` and `current_sha`: on a merge, [details](#merge-guards),
+  on a commit write, [details](#commit-write-guards), and on a notes write,
+  [details](#notes)). open.storage
   emits no other specific codes. As upstream advises, treat
   an unknown code as the generic code for its status. Branch on the status code or
   `code`, not on the message.
@@ -67,10 +68,13 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   map (such as Go's `map[string]string`). Ref-moving write
   endpoints return the richer `result` envelope
   ([streaming protocols](../explanation/streaming-commit-protocols.md)), even on 4xx/5xx
-  statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. One exception:
-  a merge `409` for a failed guard (a stale `expected_target_sha`, or a source branch
-  that no longer contains `expected_source_sha`) uses the error body above with code
-  `ref_guard_failed`, as upstream documents ([details](#merge-guards)).
+  statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`. Failed ref
+  guards are the exception, as upstream documents: a merge `409` for a failed guard (a
+  stale `expected_target_sha`, or a source branch that no longer contains
+  `expected_source_sha`) uses the error body above with code `ref_guard_failed`
+  ([details](#merge-guards)). The `409` for a stale guard on a commit write or a notes
+  write keeps its `result` envelope and adds the same problem members
+  ([commit writes](#commit-write-guards), [notes](#notes)).
 - **Throttling**: every `429` (the gateway [rate limiter](configuration.md#rate-limiting)
   and transient busy/backpressure answers) carries:
   - `Retry-After` (delay-seconds), which takes precedence over the `RateLimit` window;
@@ -460,6 +464,36 @@ space after their trailing whitespace is removed, and an empty message gives `""
 continuation line keeps its leading whitespace, so `"subj\n  next"` gives `subj   next`.
 Before that spec, both carried the full message.
 
+#### Commit write guards
+
+`commit-pack`, `diff-commit` and `restore-commit` take `expected_target_sha` (deprecated
+alias `expected_head_sha`, a full 40-hex commit SHA): the target branch must still point
+at that commit. When the target branch does not exist and a `commit-pack` or
+`diff-commit` names `base_branch`, the guard compares with the tip of `base_branch`. When the guard fails,
+no ref moves, and the answer is `409` with the
+[result envelope](../explanation/streaming-commit-protocols.md#3-response-envelope-shared-also-used-by-restore-commit)
+plus the problem members of the error body, as upstream's
+`CommitWriteRefGuardProblemDetails` and `RestoreCommitRefGuardProblemDetails`:
+
+- `code: ref_guard_failed` (`detail` "expected_target_sha … does not match current tip
+  …").
+- `guard: expected_target_sha`, also when the request sent `expected_head_sha`.
+- `current_sha`: the commit the guard was checked against, that is the tip of the target
+  branch, or the tip of `base_branch` for a new branch. Send it as the guard of the next
+  attempt.
+- `result` has every member of upstream's `RefUpdateResult`: `target_branch` and `branch`
+  name the target branch, `new_sha` is empty, `success` is `false`, and `status` is
+  `conflict`. `old_sha` is the tip of the target branch, so it repeats `current_sha`,
+  except on a new branch, where it is 40 zeros. `commit` is `null`, as upstream's
+  schema descriptions say.
+
+The content type is `application/problem+json`, as for every body with the problem
+members. A CAS race lost at publish time is a different `409`, an `application/json`
+result envelope without the problem members
+([streaming protocols](../explanation/streaming-commit-protocols.md#3-response-envelope-shared-also-used-by-restore-commit)).
+Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard answered
+`412` `precondition_failed` with the result envelope only.
+
 ### Tags
 
 | Method & path | Scope | Body/query |
@@ -484,10 +518,12 @@ Before that spec, both carried the full message.
 - `object_ref`: a full object SHA (commit, tree, blob, or annotated tag), or a branch,
   tag, short SHA, or other revision that resolves to a commit. Unresolvable → 404.
 - Responses echo the resolved object id in `sha`.
-- A stale `expected_notes_ref_sha` → 412 `precondition_failed`, except `POST .../notes/append`
-  and the `DELETE` query parameter form, which answer 409 as upstream documents (the SDKs
-  send the body forms and read `result.status`).
-- That 409 keeps the note envelope (`result.status` `conflict`) and adds the problem
+- A stale `expected_notes_ref_sha` → 409 on every form: `POST .../notes`, `POST
+  .../notes/append`, and `DELETE .../notes` with the guard in the query or in the
+  deprecated body. Before [#647](https://github.com/coder/openstorage/issues/647), the
+  `POST .../notes` and `DELETE` body forms answered 412 `precondition_failed` with the
+  note envelope and no problem members.
+- The 409 keeps the note envelope (`result.status` `conflict`) and adds the problem
   members of the error body: `code: ref_guard_failed`, `guard: expected_notes_ref_sha`
   (also when the request sent the deprecated `expected_ref_sha`), and `current_sha`, the
   notes ref's tip or 40 zeros when it does not exist. `new_ref_sha` repeats
@@ -635,8 +671,8 @@ Other limits and gaps:
 | 400 | invalid input; also "custom notes refs not enabled" |
 | 401 / 403 | auth failed / permission or ref-policy denied |
 | 404 | repo/object/branch not found; unborn-branch file metadata |
-| 409 | repo exists, repo already deleted, credential exists, merge conflict, failed merge guard (`expected_target_sha`, `expected_source_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
-| 412 | CAS precondition failed; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
+| 409 | repo exists, repo already deleted, credential exists, merge conflict, failed ref guard (`expected_target_sha`, `expected_source_sha`, `expected_notes_ref_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
+| 412 | a failed `restore-commit` `base_ref` precondition; a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit ("unavailable" to ref-update clients) |

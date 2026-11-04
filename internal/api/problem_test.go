@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -349,6 +350,11 @@ var refGuardMembers = []string{"current_sha", "guard"}
 // (TestProblemMembersMatchUpstream pins them).
 var notesGuardMembers = []string{"base_commit", "new_ref_sha", "notes_ref", "result", "sha", "target_ref"}
 
+// commitGuardMembers is the member that CommitWriteRefGuardProblemDetails
+// and RestoreCommitRefGuardProblemDetails keep next to the problem members
+// (TestProblemMembersMatchUpstream pins it).
+var commitGuardMembers = []string{"result"}
+
 // upstreamRefGuardSchema returns the properties of RefGuardProblemDetails'
 // own allOf item and the `guard` enum.
 func upstreamRefGuardSchema(t *testing.T) (props, guards []string) {
@@ -444,6 +450,11 @@ func TestProblemMembersMatchUpstream(t *testing.T) {
 	}
 	if got, _ := upstreamAllOfProperties(t, "NotesWriteRefGuardProblemDetails"); !slices.Equal(got, notesGuardMembers) {
 		t.Fatalf("NotesWriteRefGuardProblemDetails properties = %v, want %v", got, notesGuardMembers)
+	}
+	for _, schema := range []string{"CommitWriteRefGuardProblemDetails", "RestoreCommitRefGuardProblemDetails"} {
+		if got, _ := upstreamAllOfProperties(t, schema); !slices.Equal(got, commitGuardMembers) {
+			t.Fatalf("%s properties = %v, want %v", schema, got, commitGuardMembers)
+		}
 	}
 	raw, err := os.ReadFile(upstreamSpecPath)
 	if err != nil {
@@ -695,6 +706,50 @@ func assertNotesRefGuard(t *testing.T, resp *http.Response, body map[string]any,
 	assertProblemFields(t, status, raw)
 }
 
+// assertCommitRefGuard checks a stale expected_target_sha (or its alias
+// expected_head_sha) on commit-pack, diff-commit or restore-commit (#647):
+// a CommitWriteRefGuardProblemDetails body, that is a failed conflict
+// result and a null commit plus the problem members, which the oracle
+// checks once `result` and `commit` are removed. oldSHA is the target tip (40 zeros for a new branch) and
+// currentSHA the tip the guard was checked against.
+func assertCommitRefGuard(t *testing.T, status int, raw []byte, branch, oldSHA, currentSHA string) {
+	t.Helper()
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body %s)", status, raw)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("body %q is not JSON: %v", raw, err)
+	}
+	res, _ := body["result"].(map[string]any)
+	commit, hasCommit := body["commit"]
+	if res["success"] != false || res["status"] != "conflict" || res["target_branch"] != branch || res["branch"] != branch ||
+		res["old_sha"] != oldSHA || res["new_sha"] != "" || res["message"] != body["detail"] || !hasCommit || commit != nil {
+		t.Fatalf("result = %v, want a failed conflict result on %s with old_sha %s and commit null (body %s)", res, branch, oldSHA, raw)
+	}
+	// RefUpdateResult has additionalProperties: false, and the guard body
+	// sends every member, so its members are exactly the schema's.
+	if got, want := slices.Sorted(maps.Keys(res)), upstreamSchemaProperties(t, "RefUpdateResult"); !slices.Equal(got, want) {
+		t.Fatalf("result members = %v, want RefUpdateResult's %v", got, want)
+	}
+	if body["guard"] != "expected_target_sha" || body["current_sha"] != currentSHA {
+		t.Fatalf("guard members = %s, want expected_target_sha and current_sha %s", raw, currentSHA)
+	}
+	// The spec's descriptions say `commit` is null; it is not an allOf
+	// member, so the oracle checks it here and drops it.
+	problem := map[string]any{}
+	for k, v := range body {
+		if !slices.Contains(commitGuardMembers, k) && k != "commit" {
+			problem[k] = v
+		}
+	}
+	rawProblem, err := json.Marshal(problem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProblemFields(t, status, rawProblem)
+}
+
 // TestWriteErrProblemFields: writeErr adds the problem fields for every
 // status it is called with, keeps `error`, and sends the problem content
 // type that upstream documents (application/problem+json, #352 item 5).
@@ -735,6 +790,19 @@ func TestResultEnvelopeContentType(t *testing.T) {
 			t.Errorf("%s: Content-Type = %q, want application/json", name, ct)
 		}
 	}
+}
+
+// TestCommitRefGuardContentType: the commit-write guard 409 carries the
+// problem members, so it is a problem body (application/problem+json), as
+// upstream's commit-pack, diff-commit and restore-commit 409s document.
+func TestCommitRefGuardContentType(t *testing.T) {
+	rr := httptest.NewRecorder()
+	tip := strings.Repeat("ab", 20)
+	wcFailRefGuard(rr, "expected_target_sha "+ref.ZeroSHA+" does not match current tip "+tip, "main", tip, tip)
+	if ct := rr.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+	}
+	assertCommitRefGuard(t, rr.Code, rr.Body.Bytes(), "main", tip, tip)
 }
 
 // TestProblemInstanceThroughWrappers: writeErr finds `instance` under the

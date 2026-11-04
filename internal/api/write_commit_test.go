@@ -317,7 +317,7 @@ func TestCommitPack(t *testing.T) {
 			return
 		}
 
-		t.Run("stale guard is 412", func(t *testing.T) {
+		t.Run("stale guard is 409 ref_guard_failed", func(t *testing.T) {
 			body := wctLines(t,
 				wctMeta("main", "stale", []map[string]any{
 					{"path": "x.txt", "content_id": "id-x", "operation": "upsert"},
@@ -325,9 +325,9 @@ func TestCommitPack(t *testing.T) {
 				wctChunk("id-x", []byte("x"), true),
 			)
 			resp, respBody := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
-			env := wctRequireFail(t, resp, respBody, http.StatusPreconditionFailed, "precondition_failed")
-			if env.Result.OldSHA != tip2 {
-				t.Errorf("412 old_sha = %q, want current tip %q", env.Result.OldSHA, tip2)
+			assertCommitRefGuard(t, resp.StatusCode, respBody, "main", tip2, tip2)
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want application/problem+json", ct)
 			}
 		})
 
@@ -370,7 +370,8 @@ func TestCommitPack(t *testing.T) {
 				t.Errorf("branch creation old_sha = %q, want 40 zeros", env.Result.OldSHA)
 			}
 
-			// A stale guard against the base tip is still a 412.
+			// A stale guard against the base tip fails too: current_sha is
+			// the base tip, old_sha the unborn target's 40 zeros.
 			body = wctLines(t,
 				wctMeta("feature3", "f3", []map[string]any{
 					{"path": "feature3.txt", "content_id": "id-f3", "operation": "upsert"},
@@ -378,7 +379,10 @@ func TestCommitPack(t *testing.T) {
 				wctChunk("id-f3", []byte("feature3\n"), true),
 			)
 			resp, respBody = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
-			wctRequireFail(t, resp, respBody, http.StatusPreconditionFailed, "precondition_failed")
+			assertCommitRefGuard(t, resp.StatusCode, respBody, "feature3", ref.ZeroSHA, tip)
+			if got := wctBranchTip(t, e, readTok, "feature3", false); got != "" {
+				t.Fatalf("feature3 = %q after a failed guard, want no branch", got)
+			}
 		})
 
 		t.Run("ephemeral namespace write", func(t *testing.T) {
@@ -1143,14 +1147,18 @@ func TestRestoreCommit(t *testing.T) {
 			}
 		})
 
-		t.Run("stale guard is 412", func(t *testing.T) {
+		t.Run("stale guard is 409 ref_guard_failed", func(t *testing.T) {
+			tip := wctBranchTip(t, e, readTok, "main", false)
 			resp, body := restore(map[string]any{
 				"target_branch":     "main",
 				"target_commit_sha": c1.Commit.CommitSHA,
 				"author":            wctAuthor,
 				"expected_head_sha": c1.Commit.CommitSHA, // stale
 			})
-			wctRequireFail(t, resp, body, http.StatusPreconditionFailed, "precondition_failed")
+			assertCommitRefGuard(t, resp.StatusCode, body, "main", tip, tip)
+			if got := wctBranchTip(t, e, readTok, "main", false); got != tip {
+				t.Fatalf("main moved to %q after a failed guard, want %q", got, tip)
+			}
 		})
 
 		t.Run("unknown target commit is 404", func(t *testing.T) {
