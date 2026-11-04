@@ -145,7 +145,7 @@ branch-protection mechanism; there is no server-side protection config.
 | Condition | Status |
 |---|---|
 | missing/invalid/expired token | 401 |
-| the key store fails while the server verifies the token | 403 `authentication_unavailable` (retry) |
+| the key store fails while the server verifies the token | REST API, fork source tokens included: 403 `authentication_unavailable` (retry). Git and LFS transports: 401, as for an invalid token |
 | valid token, insufficient scope or ref policy denies | 403 |
 | `repo` claim mismatch with target | 403 (do not leak existence: 404 acceptable per vendor error-string instability) |
 

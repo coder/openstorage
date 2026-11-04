@@ -102,6 +102,15 @@ func bearerToken(r *http.Request) (string, bool) {
 	return token, true
 }
 
+// keyStoreFailed reports whether a Verify error is a key store failure:
+// the token may be valid, so the REST surface answers upstream's 403
+// authentication_unavailable and the client retries. An unknown issuer
+// (meta.ErrNotFound) is an invalid token.
+func keyStoreFailed(err error) bool {
+	var keysErr *auth.KeySourceError
+	return errors.As(err, &keysErr) && !errors.Is(err, meta.ErrNotFound)
+}
+
 // requireAuth enforces the docs/reference/authentication.md failure map for one route: missing or
 // unverifiable token -> 401 (+WWW-Authenticate via writeErr); a key store
 // failure -> 403 authentication_unavailable; verified token
@@ -125,10 +134,7 @@ func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScop
 				return
 			}
 			claims, err := verifier.Verify(r.Context(), token)
-			var keysErr *auth.KeySourceError
-			if errors.As(err, &keysErr) && !errors.Is(err, meta.ErrNotFound) {
-				// The key store failed: the token may be valid, so ask the
-				// client to retry, as upstream's code says.
+			if keyStoreFailed(err) {
 				writeProblem(w, http.StatusForbidden, codeAuthenticationUnavailable, "cannot verify the token now, retry")
 				return
 			}

@@ -367,7 +367,7 @@ func expectedProblemCodes(t *testing.T, status int, msg string) []string {
 		code = "repo_name_mismatch"
 	case status == http.StatusNotFound && msg == "no API route matches the path":
 		code = "route_not_found"
-	case status == http.StatusForbidden && msg == "cannot verify the token now, retry":
+	case status == http.StatusForbidden && (msg == "cannot verify the token now, retry" || msg == "cannot verify base_repo.auth.token now, retry"):
 		code = "authentication_unavailable"
 	case status == http.StatusNotFound && (strings.HasPrefix(msg, "source branch ") || strings.HasPrefix(msg, "target branch ") ||
 		strings.HasPrefix(msg, "base branch ")) && strings.HasSuffix(msg, " not found"):
