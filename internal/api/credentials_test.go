@@ -288,12 +288,12 @@ func TestCredentialPathIDRoundTrip(t *testing.T) {
 			t.Fatalf("204 body = %q, want empty", body)
 		}
 
-		// Repeat DELETE -> 404 (write-flavor result envelope, ADR-26).
+		// Repeat DELETE -> 404 credential_not_found.
 		resp, body = e.doReq(t, http.MethodDelete, "/api/repos/"+esc+"/git-credentials/"+credID, writeTok, nil, "")
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("second DELETE status %d: %s", resp.StatusCode, body)
 		}
-		requireAuthResultEnvelope(t, body, "not_found")
+		requireEnvelope(t, resp, body)
 
 		// The repo slot frees up: a new credential can be stored.
 		gcredCreateEnv(t, e, org, repoURL, repo.RepoID)
@@ -316,7 +316,7 @@ func TestCredentialPathIDNegatives(t *testing.T) {
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("unknown repo_name = %d (%s), want 404", resp.StatusCode, body)
 		}
-		requireAuthResultEnvelope(t, body, "not_found")
+		requireEnvelope(t, resp, body)
 
 		// Unknown credential id -> 404.
 		resp, body = e.doReq(t, http.MethodPut, "/api/repos/"+esc+"/git-credentials/ggc_0000000000000000", writeTok, putBody, "")
@@ -342,15 +342,15 @@ func TestCredentialPathIDNegatives(t *testing.T) {
 			if resp.StatusCode != http.StatusNotFound {
 				t.Errorf("%s claim mismatch = %d (%s), want 404", method, resp.StatusCode, body)
 			}
-			requireAuthResultEnvelope(t, body, "not_found")
+			requireEnvelope(t, resp, body)
 		}
 
-		// Missing password / missing body -> 400 (result envelope).
+		// Missing password / missing body -> 400.
 		resp, body = e.doReq(t, http.MethodPut, putPath, writeTok, []byte(`{"username":"git"}`), "")
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("missing password = %d (%s), want 400", resp.StatusCode, body)
 		}
-		requireAuthResultEnvelope(t, body, "invalid")
+		requireEnvelope(t, resp, body)
 		resp, body = e.doReq(t, http.MethodPut, putPath, writeTok, nil, "")
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("missing body = %d (%s), want 400", resp.StatusCode, body)
@@ -362,9 +362,9 @@ func TestCredentialPathIDNegatives(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("org token = %d (%s), want 403", resp.StatusCode, body)
 		}
-		requireAuthResultEnvelope(t, body, "forbidden")
+		requireEnvelope(t, resp, body)
 
-		// No token -> 401 result envelope with WWW-Authenticate: Bearer.
+		// No token -> 401 with WWW-Authenticate: Bearer.
 		resp, body = e.doReq(t, http.MethodPut, putPath, "", putBody, "")
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("no token = %d (%s), want 401", resp.StatusCode, body)
@@ -372,7 +372,7 @@ func TestCredentialPathIDNegatives(t *testing.T) {
 		if got := resp.Header.Get("WWW-Authenticate"); got != "Bearer" {
 			t.Errorf("401 WWW-Authenticate = %q, want Bearer", got)
 		}
-		requireAuthResultEnvelope(t, body, "unauthorized")
+		requireEnvelope(t, resp, body)
 
 		// None of the negatives touched the credential: rotate + delete
 		// still succeed with the right token.

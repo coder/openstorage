@@ -79,12 +79,12 @@ const wmFilteredReasonTooLarge = "max_content_bytes_exceeded"
 func (s *server) registerWriteMergeRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteMergeRoutes: nil dependency")
 	mux.Handle("POST /api/v1/repos/merge",
-		rl.limit(routeWrite)(requireAuthWrite(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handleMerge))))
+		rl.limit()(requireAuth(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handleMerge))))
 	// Preview is a read (docs/reference/http-api.md: git:read) and keeps the {"error"} body.
 	// Its git children run under the read budget (#313); the scratch git
 	// runner (wcScratch.git) switches to gitread.Run when one is present.
 	mux.Handle("GET /api/v1/repos/merge/preview",
-		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitRead)(s.withGitReadBudget(s.handleMergePreview))))
+		rl.limit()(requireAuth(verifier, org, false, auth.ScopeGitRead)(s.withGitReadBudget(s.handleMergePreview))))
 }
 
 // ---------------------------------------------------------------------------

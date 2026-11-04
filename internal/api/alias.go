@@ -3,17 +3,17 @@
 // identical bodies by construction. Contract (frozen by the phase-6
 // foundation):
 //
-//   - One alias per repo-scoped v1 route, registered with the SAME auth
-//     flavor and scopes as its v1 twin. Org-scoped routes (GET/POST
+//   - One alias per repo-scoped v1 route, registered with the SAME
+//     scopes as its v1 twin. Org-scoped routes (GET/POST
 //     /api/v1/repos list+create, webhooks) get NO alias.
 //   - Handler shape: decode r.PathValue("repo_name") (Go 1.22 mux matches
 //     the escaped path, so "pierre%2Fexample" stays one segment) →
 //     meta.ResolveRepoKey for both the path name and the token's repo claim
-//     → unknown name or RepoID mismatch ⇒ 404 (error envelope on read
-//     routes, result envelope on write routes) → rewrite a cloned
+//     → unknown name or RepoID mismatch ⇒ 404 `repository_not_found`
+//     → rewrite a cloned
 //     *http.Request to the v1 path (query preserved) and re-dispatch through
 //     mux. Double JWT verification is accepted.
-//   - Every alias is registered through rl.limit(flavor) BEFORE auth,
+//   - Every alias is registered through rl.limit() BEFORE auth,
 //     exactly like the v1 routes. The re-dispatch runs the v1 chain again,
 //     so the rewritten request carries the rateLimitExempt context marker:
 //     the v1 twin's limiter passes it through and each aliased request is
@@ -32,16 +32,12 @@ import (
 )
 
 // aliasRoute maps METHOD /api/repos/{repo_name}<suffix> onto METHOD <v1Path>
-// with the v1 route's exact auth flavor, org-level flag, and scopes.
+// with the v1 route's exact org-level flag and scopes.
 type aliasRoute struct {
 	method string
 	// suffix is the path after {repo_name} ("" aliases the repo root).
 	suffix string
 	v1Path string
-	// flavor selects the auth middleware and the alias-layer failure
-	// envelope: routeRead → requireAuth + {"error"}, routeWrite →
-	// requireAuthWrite + docs/explanation/streaming-commit-protocols.md result envelope.
-	flavor routeFlavor
 	// orgLevel mirrors the v1 route's requireAuth org-level flag (only the
 	// PUT/DELETE git-credentials routes). Org tokens carry repo claim
 	// "org", so these skip the path-vs-claim repo check.
@@ -58,15 +54,12 @@ type aliasRoute struct {
 }
 
 // aliasRoutes mirrors every repo-scoped v1 route registered in api.go /
-// handlers_write_*.go / handlers_credentials.go / handlers_sync.go. Flavor,
-// org-level flag, and scopes are copied verbatim from the v1 registration
+// handlers_write_*.go / handlers_credentials.go / handlers_sync.go. The
+// org-level flag and scopes are copied verbatim from the v1 registration
 // sites; keep the two tables in lockstep.
 func aliasRoutes() []aliasRoute {
-	read := func(method, suffix, v1Path string, scopes ...string) aliasRoute {
-		return aliasRoute{method: method, suffix: suffix, v1Path: v1Path, flavor: routeRead, scopes: scopes}
-	}
-	write := func(method, suffix, v1Path string, scopes ...string) aliasRoute {
-		return aliasRoute{method: method, suffix: suffix, v1Path: v1Path, flavor: routeWrite, scopes: scopes}
+	alias := func(method, suffix, v1Path string, scopes ...string) aliasRoute {
+		return aliasRoute{method: method, suffix: suffix, v1Path: v1Path, scopes: scopes}
 	}
 	deprecatedRoute := func(ar aliasRoute) aliasRoute {
 		ar.deprecated = true
@@ -74,61 +67,60 @@ func aliasRoutes() []aliasRoute {
 	}
 	return []aliasRoute{
 		// Repo root: GET/PATCH /api/v1/repo and DELETE /api/v1/repos/delete.
-		read(http.MethodGet, "", "/api/v1/repo", auth.ScopeGitRead),
-		read(http.MethodPatch, "", "/api/v1/repo", auth.ScopeRepoWrite),
-		read(http.MethodDelete, "", "/api/v1/repos/delete", auth.ScopeRepoWrite),
+		alias(http.MethodGet, "", "/api/v1/repo", auth.ScopeGitRead),
+		alias(http.MethodPatch, "", "/api/v1/repo", auth.ScopeRepoWrite),
+		alias(http.MethodDelete, "", "/api/v1/repos/delete", auth.ScopeRepoWrite),
 
 		// git:read surface (api.go route table).
-		read(http.MethodGet, "/file", "/api/v1/repos/file", auth.ScopeGitRead),
-		read(http.MethodGet, "/files", "/api/v1/repos/files", auth.ScopeGitRead),
-		read(http.MethodGet, "/files/metadata", "/api/v1/repos/files/metadata", auth.ScopeGitRead),
-		read(http.MethodGet, "/branches", "/api/v1/repos/branches", auth.ScopeGitRead),
-		read(http.MethodGet, "/branch", "/api/v1/repos/branch", auth.ScopeGitRead),
-		read(http.MethodGet, "/branches/diff", "/api/v1/repos/branches/diff", auth.ScopeGitRead),
-		read(http.MethodGet, "/commits", "/api/v1/repos/commits", auth.ScopeGitRead),
-		read(http.MethodGet, "/commit", "/api/v1/repos/commit", auth.ScopeGitRead),
-		read(http.MethodGet, "/diff", "/api/v1/repos/diff", auth.ScopeGitRead),
-		read(http.MethodGet, "/tags", "/api/v1/repos/tags", auth.ScopeGitRead),
-		read(http.MethodGet, "/tag", "/api/v1/repos/tag", auth.ScopeGitRead),
-		read(http.MethodGet, "/blame", "/api/v1/repos/blame", auth.ScopeGitRead),
-		read(http.MethodPost, "/grep", "/api/v1/repos/grep", auth.ScopeGitRead),
-		read(http.MethodPost, "/archive", "/api/v1/repos/archive", auth.ScopeGitRead),
-		read(http.MethodGet, "/notes", "/api/v1/repos/notes", auth.ScopeGitRead),
-		read(http.MethodGet, "/notes/refs", "/api/v1/repos/notes/refs", auth.ScopeGitRead),
-		read(http.MethodGet, "/merge/preview", "/api/v1/repos/merge/preview", auth.ScopeGitRead),
+		alias(http.MethodGet, "/file", "/api/v1/repos/file", auth.ScopeGitRead),
+		alias(http.MethodGet, "/files", "/api/v1/repos/files", auth.ScopeGitRead),
+		alias(http.MethodGet, "/files/metadata", "/api/v1/repos/files/metadata", auth.ScopeGitRead),
+		alias(http.MethodGet, "/branches", "/api/v1/repos/branches", auth.ScopeGitRead),
+		alias(http.MethodGet, "/branch", "/api/v1/repos/branch", auth.ScopeGitRead),
+		alias(http.MethodGet, "/branches/diff", "/api/v1/repos/branches/diff", auth.ScopeGitRead),
+		alias(http.MethodGet, "/commits", "/api/v1/repos/commits", auth.ScopeGitRead),
+		alias(http.MethodGet, "/commit", "/api/v1/repos/commit", auth.ScopeGitRead),
+		alias(http.MethodGet, "/diff", "/api/v1/repos/diff", auth.ScopeGitRead),
+		alias(http.MethodGet, "/tags", "/api/v1/repos/tags", auth.ScopeGitRead),
+		alias(http.MethodGet, "/tag", "/api/v1/repos/tag", auth.ScopeGitRead),
+		alias(http.MethodGet, "/blame", "/api/v1/repos/blame", auth.ScopeGitRead),
+		alias(http.MethodPost, "/grep", "/api/v1/repos/grep", auth.ScopeGitRead),
+		alias(http.MethodPost, "/archive", "/api/v1/repos/archive", auth.ScopeGitRead),
+		alias(http.MethodGet, "/notes", "/api/v1/repos/notes", auth.ScopeGitRead),
+		alias(http.MethodGet, "/notes/refs", "/api/v1/repos/notes/refs", auth.ScopeGitRead),
+		alias(http.MethodGet, "/merge/preview", "/api/v1/repos/merge/preview", auth.ScopeGitRead),
 
-		// git:write surface (result-envelope auth failures, ADR-26).
-		write(http.MethodPost, "/commit-pack", "/api/v1/repos/commit-pack", auth.ScopeGitWrite),
-		write(http.MethodPost, "/diff-commit", "/api/v1/repos/diff-commit", auth.ScopeGitWrite),
-		write(http.MethodPost, "/restore-commit", "/api/v1/repos/restore-commit", auth.ScopeGitWrite),
-		write(http.MethodPost, "/branches/create", "/api/v1/repos/branches/create", auth.ScopeGitWrite),
-		write(http.MethodDelete, "/branches", "/api/v1/repos/branches", auth.ScopeGitWrite),
-		write(http.MethodPost, "/tags", "/api/v1/repos/tags", auth.ScopeGitWrite),
-		write(http.MethodDelete, "/tags", "/api/v1/repos/tags", auth.ScopeGitRead, auth.ScopeGitWrite),
-		write(http.MethodPost, "/notes", "/api/v1/repos/notes", auth.ScopeGitWrite),
-		write(http.MethodDelete, "/notes", "/api/v1/repos/notes", auth.ScopeGitWrite),
+		// git:write surface.
+		alias(http.MethodPost, "/commit-pack", "/api/v1/repos/commit-pack", auth.ScopeGitWrite),
+		alias(http.MethodPost, "/diff-commit", "/api/v1/repos/diff-commit", auth.ScopeGitWrite),
+		alias(http.MethodPost, "/restore-commit", "/api/v1/repos/restore-commit", auth.ScopeGitWrite),
+		alias(http.MethodPost, "/branches/create", "/api/v1/repos/branches/create", auth.ScopeGitWrite),
+		alias(http.MethodDelete, "/branches", "/api/v1/repos/branches", auth.ScopeGitWrite),
+		alias(http.MethodPost, "/tags", "/api/v1/repos/tags", auth.ScopeGitWrite),
+		alias(http.MethodDelete, "/tags", "/api/v1/repos/tags", auth.ScopeGitRead, auth.ScopeGitWrite),
+		alias(http.MethodPost, "/notes", "/api/v1/repos/notes", auth.ScopeGitWrite),
+		alias(http.MethodDelete, "/notes", "/api/v1/repos/notes", auth.ScopeGitWrite),
 		// Path-style append (spec 2026-10-05, issue #378): no v1 twin, so it
 		// re-dispatches to the notes write route marked as an append.
 		{method: http.MethodPost, suffix: "/notes/append", v1Path: "/api/v1/repos/notes",
-			flavor: routeWrite, scopes: []string{auth.ScopeGitWrite}, mark: withNoteAppend},
-		write(http.MethodPost, "/merge", "/api/v1/repos/merge", auth.ScopeGitWrite),
+			scopes: []string{auth.ScopeGitWrite}, mark: withNoteAppend},
+		alias(http.MethodPost, "/merge", "/api/v1/repos/merge", auth.ScopeGitWrite),
 
-		// Sync + credentials (requireAuth with the {"error"} envelope, per
-		// their v1 registrations).
-		deprecatedRoute(read(http.MethodPost, "/pull-upstream", "/api/v1/repos/pull-upstream", auth.ScopeGitWrite)),
-		read(http.MethodPost, "/push-upstream", "/api/v1/repos/push-upstream", auth.ScopeGitWrite, auth.ScopeGitRead),
-		deprecatedRoute(read(http.MethodDelete, "/base", "/api/v1/repos/base", auth.ScopeRepoWrite)),
+		// Sync + credentials.
+		deprecatedRoute(alias(http.MethodPost, "/pull-upstream", "/api/v1/repos/pull-upstream", auth.ScopeGitWrite)),
+		alias(http.MethodPost, "/push-upstream", "/api/v1/repos/push-upstream", auth.ScopeGitWrite, auth.ScopeGitRead),
+		deprecatedRoute(alias(http.MethodDelete, "/base", "/api/v1/repos/base", auth.ScopeRepoWrite)),
 		// Path-style replacements of pull-upstream and base (spec
 		// 2026-10-05, issue #378): same handlers, bodies and scopes.
 		{method: http.MethodPost, suffix: "/upstream/pull", v1Path: "/api/v1/repos/pull-upstream",
-			flavor: routeRead, scopes: []string{auth.ScopeGitWrite}, mark: withStrictPullBody},
+			scopes: []string{auth.ScopeGitWrite}, mark: withStrictPullBody},
 		{method: http.MethodDelete, suffix: "/upstream", v1Path: "/api/v1/repos/base",
-			flavor: routeRead, scopes: []string{auth.ScopeRepoWrite}, mark: withUpstreamDetach},
-		read(http.MethodPost, "/git-credentials", "/api/v1/repos/git-credentials", auth.ScopeRepoWrite),
+			scopes: []string{auth.ScopeRepoWrite}, mark: withUpstreamDetach},
+		alias(http.MethodPost, "/git-credentials", "/api/v1/repos/git-credentials", auth.ScopeRepoWrite),
 		{method: http.MethodPut, suffix: "/git-credentials", v1Path: "/api/v1/repos/git-credentials",
-			flavor: routeRead, orgLevel: true, scopes: []string{auth.ScopeRepoWrite}},
+			orgLevel: true, scopes: []string{auth.ScopeRepoWrite}},
 		{method: http.MethodDelete, suffix: "/git-credentials", v1Path: "/api/v1/repos/git-credentials",
-			flavor: routeRead, orgLevel: true, scopes: []string{auth.ScopeRepoWrite}},
+			orgLevel: true, scopes: []string{auth.ScopeRepoWrite}},
 	}
 }
 
@@ -148,11 +140,7 @@ func registerAliasRoutes(mux *http.ServeMux, s *server, ss *syncServer, verifier
 		assertf(!seen[pattern], "duplicate alias pattern %q", pattern)
 		seen[pattern] = true
 
-		authMW := requireAuth
-		if ar.flavor == routeWrite {
-			authMW = requireAuthWrite
-		}
-		h := rl.limit(ar.flavor)(authMW(verifier, org, ar.orgLevel, ar.scopes...)(s.aliasHandler(mux, ar)))
+		h := rl.limit()(requireAuth(verifier, org, ar.orgLevel, ar.scopes...)(s.aliasHandler(mux, ar)))
 		if ar.deprecated {
 			h = deprecated(h)
 		}
@@ -162,8 +150,8 @@ func registerAliasRoutes(mux *http.ServeMux, s *server, ss *syncServer, verifier
 	// Path-id git-credentials routes (openapi.yaml; docs/archive/phases/15-phase6-implementation-notes.md deferred #1):
 	// direct routes with NO v1 twin to re-dispatch to — the handlers own
 	// the alias-layer repo_name resolution themselves
-	// (handlers_credentials.go). Auth is per-repo repo:write with ADR-26
-	// result envelopes (requireAuthWrite) behind rl.limit(routeWrite).
+	// (handlers_credentials.go). Auth is per-repo repo:write behind
+	// rl.limit().
 	for _, route := range []struct {
 		method  string
 		handler http.HandlerFunc
@@ -172,7 +160,7 @@ func registerAliasRoutes(mux *http.ServeMux, s *server, ss *syncServer, verifier
 		{http.MethodDelete, ss.handleDeleteCredentialByPath},
 	} {
 		mux.Handle(route.method+" /api/repos/{repo_name}/git-credentials/{git_credential_id}",
-			rl.limit(routeWrite)(requireAuthWrite(verifier, org, false, auth.ScopeRepoWrite)(route.handler)))
+			rl.limit()(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(route.handler)))
 	}
 }
 
@@ -189,10 +177,10 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 		repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, name)
 		switch {
 		case errors.Is(err, meta.ErrNotFound):
-			aliasRepoNotFound(w, ar.flavor)
+			writeRepoNotFound(w)
 			return
 		case err != nil:
-			s.aliasInternal(w, r, ar.flavor, "resolve alias repo name", err)
+			s.internalErr(w, r, "resolve alias repo name", err)
 			return
 		}
 
@@ -201,14 +189,14 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 			claimRepo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 			switch {
 			case errors.Is(err, meta.ErrNotFound):
-				aliasRepoNotFound(w, ar.flavor)
+				writeRepoNotFound(w)
 				return
 			case err != nil:
-				s.aliasInternal(w, r, ar.flavor, "resolve alias repo claim", err)
+				s.internalErr(w, r, "resolve alias repo claim", err)
 				return
 			}
 			if claimRepo.RepoID != repo.RepoID {
-				aliasRepoNotFound(w, ar.flavor)
+				writeRepoNotFound(w)
 				return
 			}
 		}
@@ -241,40 +229,4 @@ func withAliasDispatch(ctx context.Context) context.Context {
 func isAliasDispatch(ctx context.Context) bool {
 	v, _ := ctx.Value(aliasDispatchKey{}).(bool)
 	return v
-}
-
-// aliasFail writes an alias-layer failure in the route's envelope flavor:
-// read routes use the {"error"} envelope, write routes the docs/explanation/streaming-commit-protocols.md result
-// envelope (status via the shared statusForHTTP table).
-func aliasFail(w http.ResponseWriter, flavor routeFlavor, httpCode int, msg string) {
-	assertf(msg != "", "aliasFail: empty message")
-	if flavor == routeRead {
-		writeErr(w, httpCode, msg)
-		return
-	}
-	assertf(flavor == routeWrite, "aliasFail: unknown flavor %d", flavor)
-	writeJSON(w, httpCode, map[string]any{"result": map[string]any{
-		"success": false,
-		"status":  statusForHTTP(httpCode),
-		"message": msg,
-	}})
-}
-
-// aliasRepoNotFound writes the alias's repository-lookup 404 in the
-// route's envelope flavor; the plain body carries `repository_not_found`.
-func aliasRepoNotFound(w http.ResponseWriter, flavor routeFlavor) {
-	if flavor == routeRead {
-		writeRepoNotFound(w)
-		return
-	}
-	aliasFail(w, flavor, http.StatusNotFound, repoNotFoundMsg)
-}
-
-// aliasInternal logs the real error and writes the generic 500 in the
-// route's envelope flavor (docs/reference/http-api.md: raw errors never reach the wire).
-func (s *server) aliasInternal(w http.ResponseWriter, r *http.Request, flavor routeFlavor, op string, err error) {
-	assertf(err != nil, "aliasInternal called with nil error")
-	assertf(op != "", "aliasInternal called with empty op")
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
-	aliasFail(w, flavor, http.StatusInternalServerError, internalErrorMsg)
 }

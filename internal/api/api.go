@@ -178,7 +178,7 @@ func New(cfg Config) (http.Handler, error) {
 
 	mux := http.NewServeMux()
 	route := func(pattern string, orgLevel bool, h http.HandlerFunc, scopes ...string) {
-		mux.Handle(pattern, rl.limit(routeRead)(requireAuth(cfg.Verifier, cfg.Org, orgLevel, scopes...)(h)))
+		mux.Handle(pattern, rl.limit()(requireAuth(cfg.Verifier, cfg.Org, orgLevel, scopes...)(h)))
 	}
 	route("GET /api/meta", true, handleOrganizationMetadata, auth.ScopeOrgRead)
 
