@@ -37,6 +37,55 @@ die() { printf 'osv: %s\n' "$*" >&2; exit 1; }
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# evidence_put <src|-> <dst> [-a|-x]: write the evidence file <dst> from the
+# file <src>, or from stdin for "-". -a appends instead of truncating. -x
+# creates <dst> and refuses one that exists. The redaction walk never leaves
+# the evidence tree, so a symlink planted at <dst> would take raw bytes (serve
+# logs, container logs) out of its reach. The helper opens <src> and <dst>
+# with O_NOFOLLOW, so the open is the check and no link can appear between a
+# test and a write. It also refuses a <dst> that is not a regular file or has
+# a second hard link. A refusal prints the paths, sets EVIDENCE_FAILED, and
+# returns 1. Cleanup then finishes its other copies and its redaction, keeps
+# work/, and exits 1.
+# launch.txt and build.txt are the only evidence files that this helper does
+# not write: launch writes them into the evidence directory it created a
+# moment earlier.
+EVIDENCE_FAILED=''
+# shellcheck disable=SC2016 # Python source, not shell
+EVIDENCE_PUT_PY='import errno, os, shutil, stat, sys
+src, dst, *opt = sys.argv[1:]
+def opened(path, flags, who):
+    try:
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    except OSError as e:
+        why = {errno.ELOOP: "it is a symbolic link", errno.EEXIST: "it exists already, as a file or a link"}.get(e.errno, e.strerror)
+        sys.exit("osv: cannot write evidence %s from %s: %s is refused: %s" % (dst, src, who, why))
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or (who == "target" and st.st_nlink != 1):
+        sys.exit("osv: cannot write evidence %s from %s: %s is refused: it is not a regular file with one link" % (dst, src, who))
+    return os.fdopen(fd, "rb" if who == "source" else "wb")
+append, excl = opt == ["-a"], opt == ["-x"]
+with (sys.stdin.buffer if src == "-" else opened(src, os.O_RDONLY, "source")) as i, opened(dst, os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else 0) | (os.O_EXCL if excl else 0), "target") as o:
+    if not append:
+        o.truncate(0)
+    shutil.copyfileobj(i, o)
+'
+evidence_put() {
+	python3 -c "$EVIDENCE_PUT_PY" "$@" || { EVIDENCE_FAILED=1; return 1; }
+}
+
+# evidence_new <dst>...: create each <dst> empty and refuse one that exists,
+# as a file or as a link. A later write by path (a redirect, curl -o) then
+# reaches the file created here, never a link planted before. When one is
+# refused, it removes the files that it created, so a retry starts clean.
+evidence_new() {
+	local f made=()
+	for f in "$@"; do
+		evidence_put - "$f" -x </dev/null || { rm -f ${made[@]+"${made[@]}"}; return 1; }
+		made+=("$f")
+	done
+}
+
 # private_dir <dir>: refuse a directory that another local user could change.
 # It must be owned by the current user and not writable by group or others,
 # because env and every drive command source <run>/work/state.env.
@@ -86,6 +135,7 @@ run_paths() {
 	safe_parents "$RUN"
 	private_dir "$RUN"
 	[[ ! -e $WORK ]] || private_dir "$WORK"
+	[[ ! -L $EVID ]] || die "$EVID is a symbolic link: refusing to write evidence through it"
 	[[ -f $RUN/.osv-run ]] || die "$RUN has no .osv-run marker: it was not created by 'osv.sh launch'"
 }
 
@@ -112,8 +162,8 @@ check_label() {
 
 # record <label> <kind> <what> <token> <result> <expect> <verdict>: one row in evidence/log.tsv.
 record() {
-	[[ -s $EVID/log.tsv ]] || printf 'time\tlabel\tkind\twhat\ttoken\tresult\texpect\tverdict\n' >"$EVID/log.tsv"
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$@" >>"$EVID/log.tsv"
+	[[ -s $EVID/log.tsv ]] || evidence_put - "$EVID/log.tsv" <<<$'time\tlabel\tkind\twhat\ttoken\tresult\texpect\tverdict'
+	evidence_put - "$EVID/log.tsv" -a < <(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$@")
 }
 
 token_desc() {
@@ -444,7 +494,7 @@ cmd_doctor() {
 		exit $((fails > 0))
 	) || fails=1
 	printf '%s\n' "$out"
-	printf '== doctor %s\n%s\n' "$(now)" "$out" >>"$EVID/doctor.txt"
+	evidence_put - "$EVID/doctor.txt" -a <<<"== doctor $(now)"$'\n'"$out"
 	return "$fails"
 }
 
@@ -484,7 +534,10 @@ cmd_stop() {
 	LEFT=''
 	stop_serve "$pidfile"
 	[[ -z $LEFT ]] || die "node $2: processes still alive:$LEFT"
-	echo "== stop node $2 $(now): no process of node $2 is alive" | tee -a "$EVID/doctor.txt"
+	local msg
+	msg="== stop node $2 $(now): no process of node $2 is alive"
+	echo "$msg"
+	evidence_put - "$EVID/doctor.txt" -a <<<"$msg"
 }
 
 cmd_token() {
@@ -545,6 +598,7 @@ cmd_api() {
 	shift 2
 	[[ $path == /* ]] || die "path '$path' must start with / (it is appended to $OSV_URL)"
 	[[ ! -e $EVID/$label.request.txt ]] || die "label '$label' is already used in $EVID"
+	evidence_new "$EVID/$label.request.txt" "$EVID/$label.body" "$EVID/$label.headers"
 	local hdr=() auth=$WORK/tmp/auth.$$
 	if [[ $TOKEN != none ]]; then
 		# /api/* takes a Bearer token; the Git smart-HTTP surface takes Basic
@@ -594,6 +648,7 @@ cmd_git() {
 	[[ $# -gt 0 ]] || die "no git arguments after --"
 	require_git
 	[[ ! -e $EVID/$label.git.txt ]] || die "label '$label' is already used in $EVID"
+	evidence_new "$EVID/$label.git.txt"
 	local tokfile=''
 	[[ $TOKEN == none ]] || tokfile=$WORK/tokens/$TOKEN
 	local rc=0
@@ -640,6 +695,7 @@ cmd_eq() {
 	local label=$2 want=$3 got=$4 verdict=FAIL
 	check_label "$label"
 	[[ -n $want && $want == "$got" ]] && verdict=PASS
+	evidence_new "$EVID/$label.eq.txt"
 	printf 'expected: %s\nactual:   %s\n%s\n' "$want" "$got" "$verdict" >"$EVID/$label.eq.txt"
 	record "$label" eq "equal" - "$got" "$want" "$verdict"
 	echo "$verdict $label: expected '$want', actual '$got'"
@@ -665,51 +721,89 @@ print(v if isinstance(v, str) else json.dumps(v))
 PYEOF
 }
 
+# save_redacted_evidence: copy the serve logs, the staged container logs,
+# state.env, and the token list into the evidence, then replace every token and secret value in every regular
+# file there. A copy that evidence_put refuses and a path that the redaction
+# cannot read or write do not stop the rest: everything else is copied and
+# redacted first, then the function returns 1 (EVIDENCE_FAILED), and cleanup
+# keeps work/ so that a rerun can finish.
 save_redacted_evidence() {
 	[[ -d $WORK ]] || return 0
-	[[ -f $WORK/serve.out ]] && cp "$WORK/serve.out" "$EVID/serve.stdout.log"
-	[[ -f $WORK/serve.err ]] && cp "$WORK/serve.err" "$EVID/serve.stderr.log"
-	[[ -f $WORK/serve-b.out ]] && cp "$WORK/serve-b.out" "$EVID/serve-b.stdout.log"
-	[[ -f $WORK/serve-b.err ]] && cp "$WORK/serve-b.err" "$EVID/serve-b.stderr.log"
-	[[ -f $WORK/state.env ]] && cp "$WORK/state.env" "$EVID/state.env"
-	local t
+	local pair src t desc lines=''
+	for src in "$WORK"/tmp/container-*.log; do
+		[[ ! -e $src && ! -L $src ]] || evidence_put "$src" "$EVID/${src##*/}" || :
+	done
+	for pair in serve.out:serve.stdout.log serve.err:serve.stderr.log serve-b.out:serve-b.stdout.log serve-b.err:serve-b.stderr.log state.env:state.env; do
+		src=$WORK/${pair%%:*}
+		[[ ! -e $src && ! -L $src ]] || evidence_put "$src" "$EVID/${pair##*:}" || :
+	done
 	for t in "$WORK"/tokens/*.desc; do
-		[[ -e $t ]] || continue
-		printf '%s: %s\n' "$(basename "$t" .desc)" "$(<"$t")"
-	done >"$EVID/tokens.txt"
+		[[ -e $t || -L $t ]] || continue
+		if [[ -L $t || ! -f $t ]] || ! desc=$(<"$t"); then
+			echo "osv: cannot read $t: its token is missing from tokens.txt" >&2
+			EVIDENCE_FAILED=1
+			continue
+		fi
+		lines+="$(basename "$t" .desc): $desc"$'\n'
+	done
+	evidence_put - "$EVID/tokens.txt" < <(printf '%s' "$lines") || :
 	# Replace every stored token value with <token:name> in the evidence, and
 	# its Basic-auth form base64("t:<token>"), which curl -v prints in a
 	# failed call's stderr that cmd_api keeps.
 	# Fleet runs also replace their store secrets with <secret:name>.
-	python3 - "$WORK/tokens" "$EVID" "$WORK/secrets" <<'PYEOF'
+	python3 - "$WORK/tokens" "$EVID" "$WORK/secrets" <<'PYEOF' || EVIDENCE_FAILED=1
 import base64, os, stat, sys
-def fail(e):
-    raise e
-tokdir, evid, secdir = sys.argv[1], sys.argv[2], sys.argv[3]
+tokdir, evid, secdir = sys.argv[1:]
+bad = 0
+def note(path, e):
+    global bad
+    bad += 1
+    print("osv: cannot redact %s: %s" % (path, getattr(e, "strerror", None) or e), file=sys.stderr)
+def nofollow(path, flags):
+    return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
 toks = {}
-for n in os.listdir(tokdir):
-    if not n.endswith(".desc"):
-        v = open(os.path.join(tokdir, n), "rb").read()
+for d, is_token in ((tokdir, True), (secdir, False)):
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        continue
+    except OSError as e:
+        note(d, e)
+        continue
+    for n in names:
+        if is_token and n.endswith(".desc"):
+            continue
+        p = os.path.join(d, n)
+        try:
+            with open(p, "rb", opener=nofollow) as f:
+                v = f.read()
+        except OSError as e:
+            note(p, e)
+            continue
         if len(v) >= 8:
-            toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
-            toks[v] = b"<token:" + n.encode() + b">"
-if os.path.isdir(secdir):
-    for n in os.listdir(secdir):
-        v = open(os.path.join(secdir, n), "rb").read()
-        if len(v) >= 8:
-            toks[v] = b"<secret:" + n.encode() + b">"
-for d, _, names in os.walk(evid, onerror=fail):
+            if is_token:
+                toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
+            toks[v] = (b"<token:" if is_token else b"<secret:") + n.encode() + b">"
+for d, _, names in os.walk(evid, onerror=lambda e: note(e.filename, e)):
     for n in names:
         p = os.path.join(d, n)
-        if not stat.S_ISREG(os.lstat(p).st_mode):
-            continue
-        b = open(p, "rb").read()
-        r = b
-        for v, s in toks.items():
-            r = r.replace(v, s)
-        if r != b:
-            open(p, "wb").write(r)
+        try:
+            if not stat.S_ISREG(os.lstat(p).st_mode):
+                continue
+            with open(p, "rb", opener=nofollow) as f:
+                b = f.read()
+            r = b
+            for v, s in toks.items():
+                r = r.replace(v, s)
+            if r != b:
+                with open(p, "wb", opener=nofollow) as f:
+                    f.write(r)
+        except OSError as e:
+            note(p, e)
+if bad:
+    sys.exit("osv: %d evidence path(s) could not be redacted: see above" % bad)
 PYEOF
+	[[ -z $EVIDENCE_FAILED ]]
 }
 
 # stop_serve <pid file>: stop one serve of this run and add the PIDs that
@@ -738,16 +832,19 @@ stop_serve() {
 	return 0
 }
 
-# remove_containers: save the logs of each container with this run's label,
-# remove it and its anonymous volumes, and add any that remain to LEFT.
+# remove_containers: stage the logs of each container with this run's label in
+# work/tmp, remove it and its anonymous volumes, and add any that remain to LEFT.
 remove_containers() {
 	command -v docker >/dev/null || die "docker is not on PATH: cannot remove this run's containers (label $LABEL=$RUN)"
 	local ids id name
 	ids=$(run_containers) || die "docker ps failed: cannot list this run's containers (label $LABEL=$RUN)"
+	[[ -z $ids ]] || mkdir -p "$WORK/tmp"
 	for id in $ids; do
 		# postgres or seaweedfs, from the image reference.
 		name=$(docker inspect -f '{{.Config.Image}}' "$id" 2>/dev/null | sed 's|^.*/||; s|[:@].*||') || true
-		docker logs --tail 5000 "$id" >"$EVID/container-${name:-unknown}-${id:0:12}.log" 2>&1 || true
+		# The log goes to work/tmp first: save_redacted_evidence copies it, so a
+		# refused evidence path loses nothing and a cleanup rerun copies it again.
+		docker logs --tail 5000 "$id" >"$WORK/tmp/container-${name:-unknown}-${id:0:12}.log" 2>&1 || true
 		docker rm -f -v "$id" >/dev/null || true
 	done
 	ids=$(run_containers) || die "docker ps failed: cannot list this run's containers (label $LABEL=$RUN)"
@@ -772,18 +869,24 @@ cmd_cleanup() {
 			[[ $c == "$WORK" || $c == "$WORK"/* ]] && LEFT="$LEFT ${d#/proc/}(cwd)"
 		done
 	fi
-	echo "== cleanup $(now)" >>"$EVID/doctor.txt"
+	evidence_put - "$EVID/doctor.txt" -a <<<"== cleanup $(now)" || :
 	if [[ -n $LEFT ]]; then
 		# Keep $WORK: a rerun must still see these processes by their cwd.
-		echo "LEFTOVER processes:$LEFT" | tee -a "$EVID/doctor.txt" >&2
+		echo "LEFTOVER processes:$LEFT" >&2
+		evidence_put - "$EVID/doctor.txt" -a <<<"LEFTOVER processes:$LEFT" || :
 		echo "osv: kept $WORK. Check each PID; a shell whose cwd is under $WORK is listed too. Kill only what you started, then run cleanup again" >&2
 		return 1
 	fi
 
 	trap - EXIT
-	save_redacted_evidence
+	if ! save_redacted_evidence; then
+		echo "osv: the evidence is incomplete or not fully redacted (see above). Kept $WORK. Fix each path named above, then run cleanup again" >&2
+		return 1
+	fi
 	rm -rf "$WORK"
-	echo "no process or container from this run is alive; deleted $WORK" | tee -a "$EVID/doctor.txt"
+	local msg="no process or container from this run is alive; deleted $WORK"
+	echo "$msg"
+	evidence_put - "$EVID/doctor.txt" -a <<<"$msg"
 	echo "evidence: $EVID ($(find "$EVID" -type f | wc -l | tr -d ' ') files)"
 	if [[ -f $EVID/log.tsv ]]; then
 		awk -F'\t' 'NR > 1 { n[$8]++ } END { printf "checks: %d PASS, %d FAIL, %d unchecked\n", n["PASS"], n["FAIL"], n["-"] }' "$EVID/log.tsv"

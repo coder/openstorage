@@ -180,9 +180,9 @@ Run cleanup after every run, also after a failed launch or a failed drive. It:
 
 1. Checks that each saved serve PID (node b first in fleet mode, then node a) runs this run's binary. It never signals any other process: a node that exited is skipped, also when its PID now belongs to another process.
 2. Records the PIDs of serve's descendants, sends SIGTERM to serve (the drain takes up to 10 s), waits up to 30 s, then sends SIGKILL to serve and the recorded descendants that are still alive.
-3. Fleet mode: saves each labeled container's log to the evidence, then removes the container and its anonymous volumes with `docker rm -f -v`. It finds the containers by this run's label, never by name or image, so it touches no other container.
+3. Fleet mode: stages each labeled container's log under `$RUN/work/tmp`, then removes the container and its anonymous volumes with `docker rm -f -v`. It finds the containers by this run's label, never by name or image, so it touches no other container. Step 5 copies the staged logs.
 4. Looks for leftovers: a recorded process or labeled container that is still alive, or (on Linux) any process whose working directory is under `$RUN/work`. When it finds one, it prints `LEFTOVER processes: <pid> ...` (a container shows as `container:<id>`), keeps `$RUN/work`, and exits 1.
-5. Copies the serve logs, `state.env`, and the token list into the evidence, and replaces token values in every regular file under the evidence, subdirectories included. It does not follow symlinks, and it exits 1 when it cannot read a file or directory there. It also does this when it stops early: at a leftover or on an error.
+5. Copies the serve logs, the staged container logs, `state.env`, and the token list into the evidence, and replaces token values (and, in fleet mode, store secrets) in every regular file under the evidence, subdirectories included. It never writes through a link. At each fixed evidence path (`serve*.log`, `state.env`, `tokens.txt`, `container-*.log`, `doctor.txt`) it refuses a symlink, a second hard link, and a file that is not a regular file. It also refuses a symlink where it reads a copy source or a token or secret file, and a symlink in place of the `evidence` directory. A refusal or a path it cannot read or write does not stop the rest: it copies and redacts everything else first. Then it names each path, keeps `$RUN/work`, and exits 1. Remove the link or fix the mode, then run cleanup again. It also does this when it stops early: at a leftover or on an error. `api`, `git`, `eq`, and `stop` refuse a symlink at `log.tsv` and `doctor.txt` the same way.
 6. Deletes `$RUN/work`: the binary, keys, tokens, data directory, caches, and clones.
 7. Prints `no process or container from this run is alive`, the evidence path, and the PASS and FAIL counts from `log.tsv`.
 
@@ -205,6 +205,7 @@ After a `LEFTOVER` line, check each PID before you act. Your own shell is a comm
 | `scripts/osv.sh stop <run> a\|b` | Stop one node of the run. Exits 1 when a process of that node is still alive. |
 | `scripts/osv.sh cleanup <run>` | Stop serve and remove the run's containers, delete `<run>/work`, keep `<run>/evidence`. |
 | `scripts/askpass.sh` | The `GIT_ASKPASS` program that `osv.sh git` uses. Do not call it yourself. |
+| `scripts/test-cleanup.sh` | Check cleanup's evidence handling (planted links, unreadable paths, container logs) on made-up run directories. It needs no build, server, or Docker. Run it after you change `osv.sh`'s cleanup or evidence code. `OSV=<path>` checks another copy of `osv.sh`. |
 
 `scripts/osv.sh help` prints the same summary.
 
