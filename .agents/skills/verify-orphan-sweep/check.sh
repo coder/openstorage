@@ -59,6 +59,7 @@ SlowHealEntry.cfg PackSweep probe NoLostPack
 PurgeControl.cfg RepoPurge pass -
 PurgeSafety.cfg RepoPurge pass -
 PurgeLiveness.cfg RepoPurge live -
+PurgeQuarantine.cfg RepoPurge live -
 PurgeNoThreshold.cfg RepoPurge probe NoDanglingRow
 PurgeSlowHeal.cfg RepoPurge probe NoDanglingRow"
 # The code facts each module declares as constants.
