@@ -160,7 +160,11 @@ publishes the cache ref, so a River push run waits for the repository's
 publication on its own node (holds are per node, and its loopback fetch
 reads that node's cache) after its claim, as local runs do. A failed wait
 restores the request (`RestorePush`), and the job's completion gate
-snoozes it.
+snoozes it. The gate also never completes the job while a push claim is
+held: a run whose finish or restore write failed leaves its claim holding
+the request it consumed, so the job waits for the lease, and its re-run
+steals the claim with its force level. Only a job whose repository was
+deleted completes over a held claim.
 
 **Egress.** The push targets exactly the `CloneURL` the inbound fetch
 already dials — a host validated at link time (`validUpstreamHost`,
