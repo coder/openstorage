@@ -72,8 +72,10 @@ func (c *Claims) HasScope(scope string) bool {
 // a token without a `repo` claim.
 //
 // Any failure — malformed token, bad signature, disallowed algorithm,
-// expired, unknown issuer — returns a non-nil error and maps to 401.
-// Scope and repo-claim checks are the caller's responsibility (403).
+// expired, unknown issuer — returns a non-nil error. Each transport picks
+// the status: the REST API answers 403, the Git and LFS transports 401
+// (docs/reference/authentication.md). Scope and repo-claim checks are the
+// caller's responsibility (403).
 type Verifier interface {
 	Verify(ctx context.Context, token string) (*Claims, error)
 }

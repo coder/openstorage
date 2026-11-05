@@ -146,7 +146,8 @@ branch-protection mechanism; there is no server-side protection config.
 
 | Condition | Status |
 |---|---|
-| no `Authorization` header, or a scheme other than `Bearer` | REST API: 401 `unauthorized` (`Authentication required`). Git and LFS transports: 401 |
+| REST API: no `Authorization` header, or a scheme other than `Bearer` | 401 `unauthorized` (`Authentication required`) |
+| Git transport: no Basic auth with the user `t`. LFS transport: neither that nor an `Authorization: Bearer` token | 401 |
 | the token fails verification (malformed, bad signature, expired, unknown issuer) | REST API: 403 `forbidden` (`Invalid or expired token`), as upstream answers. Git and LFS transports: 401, so that git asks for credentials ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)) |
 | a verified token issued for another organization | 403 `forbidden`; the REST detail is `Credential is not valid for this tenant` |
 | the key store fails while the server verifies the token | REST API, fork source tokens included: 403 `authentication_unavailable` (retry). Git and LFS transports: 401, as for an invalid token |
