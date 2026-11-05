@@ -574,7 +574,8 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		// the document first: a wrong format or a corrupt document (issue
 		// #466) refuses the update, so no push is accepted without its
 		// events. A failed read keeps failing open, as for the open error
-		// above.
+		// above. On the local schedule BeforeCAS then reads the document
+		// again for the push's intent, and refuses the update if it fails.
 		//
 		// Known limit (issue #466): a format change between this check and
 		// the CAS still commits the push without events. Formats change

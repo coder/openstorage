@@ -85,7 +85,8 @@ that a later push then held, while the cache still had a value older than
 the authority (after a REST write, or a push that died after its CAS), and
 end `done` without forwarding the newer value. Now a forwarding push's hook
 records `RequestPush` before its authority CAS, after the ref's push hold is
-in place, and a failed write refuses the ref update. The intent after the
+in place. A failed write, or a failed read of the repository's upstream
+link, refuses the ref update. The intent after the
 CAS stays, and still does the pull marking. A local push run's loopback
 fetch fails with HTTP 423 when its hydrate would skip a push-held ref whose
 cached value is older than the authority, and the run ends with `restore`,

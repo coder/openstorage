@@ -152,22 +152,44 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 	}
 }
 
-// A metadata store the hook cannot reach keeps today's fail-open behavior
-// (issues #445, #466): the push is accepted without events, because the ref store
-// would fail too if the store were truly down.
+// On the local schedule a hook that cannot read the metadata document
+// refuses the update before its CAS: the format check fails open (issues
+// #445, #466), but the push's forward intent must be in the row before the
+// CAS (ADR-50 amendment), and without the document the hook cannot tell
+// whether the repository forwards. The bucket sees no write.
+func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
+	fake := &fakeMetaS3{down: true}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	logs := hookEventingEnv(t, "s3wal://b?endpoint="+srv.URL)
+	cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+	defer cleanup()
+	rs := hookRefStore(t)
+	wrapped, err := githttp.WrapHookRefStore(t.Context(), rs)
+	if err != nil {
+		t.Fatalf("format check did not fail open: %v", err)
+	}
+	if !strings.Contains(logs.String(), "metadata format check failed") {
+		t.Fatalf("missing fail-open log: %s", logs)
+	}
+	won, err := wrapped.CASRef(t.Context(), "repo-1", "refs/heads/main", ref.ZeroSHA, strings.Repeat("a", 40))
+	if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update") {
+		t.Fatalf("CAS = %v, %v; want the update refused before its CAS", won, err)
+	}
+	if got, err := rs.GetRef(t.Context(), "repo-1", "refs/heads/main"); !errors.Is(err, ref.ErrNotFound) {
+		t.Fatalf("authority ref = %q, %v; want unset", got, err)
+	}
+	if n := fake.writes.Load(); n != 0 {
+		t.Fatalf("the hook sent %d write requests to the bucket; want none", n)
+	}
+}
+
+// A PostgreSQL metadata store the hook cannot reach keeps today's
+// fail-open behavior (issues #445, #466): the push is accepted without
+// events, because the ref store would fail too if the store were truly
+// down. River schedules PostgreSQL forwards; the intent before the CAS
+// belongs to the local schedule.
 func TestHookEventingFailsOpenOnTransientMetaErrors(t *testing.T) {
-	t.Run("format read fails", func(t *testing.T) {
-		fake := &fakeMetaS3{down: true}
-		srv := httptest.NewServer(fake)
-		defer srv.Close()
-		logs := hookEventingEnv(t, "s3wal://b?endpoint="+srv.URL)
-		cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
-		defer cleanup()
-		assertHookAccepts(t, t.Context(), hookRefStore(t))
-		if !strings.Contains(logs.String(), "metadata format check failed") {
-			t.Fatalf("missing fail-open log: %s", logs)
-		}
-	})
 	t.Run("open fails", func(t *testing.T) {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
