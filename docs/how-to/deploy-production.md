@@ -835,36 +835,54 @@ also have a metric are listed in the [metrics and log mapping](#metrics-and-log-
 
 ### Upgrading the S3WAL metadata format
 
-A release with metadata format v2
+A release with metadata format v3
 ([ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md))
-does not serve a v1 bucket. It stops at startup with `document version 1 needs
-conversion`. A v1 release stops on a v2 bucket with `document version 2 unsupported`.
-Neither writes the metadata document.
+does not serve a v1 or v2 bucket. It stops at startup with `document version 1 needs
+conversion` or `document version 2 needs conversion`. An older release stops on a newer
+bucket with `document version N unsupported`, where N is the bucket's version. No release
+writes the metadata document of another version.
 
-**Upgrade from a v1 release (v0.16.0 or later).** Upgrade an older install to a v1
-release first.
+The releases that write each version: v1 is v0.16.0 through v0.18.0, v2 is v0.19.0, and
+v3 is every later release.
+
+**Upgrade from a v1 or v2 release.** Upgrade an older install to v0.16.0 or later first.
 
 1. Stop `serve` with `SIGTERM`. Wait for the process and its hook children to exit. Do
    not run `signing-key` or `purge-repo` until step 5 ends.
 2. Take a verified [stopped-node backup](backup-restore-s3wal.md).
 3. Replace the binary. Replace it only while `serve` is stopped: hooks run the binary at
-   the path `serve` started from, and a v2 hook on a v1 bucket refuses every push with
-   `document version 1 needs conversion` until step 4 converts the bucket. The refusal
-   writes nothing.
-4. Run `openstorage s3wal-meta convert --to 2` with the serve environment. If it reports
+   the path `serve` started from, and a v3 hook on a v1 or v2 bucket refuses every push
+   with `document version 1 needs conversion` (or `2`) until step 4 converts the bucket.
+   The refusal writes nothing.
+4. Run `openstorage s3wal-meta convert --to 3` with the serve environment. If it reports
    a held lease, confirm that no `serve` runs, wait the holder's recorded TTL plus 2s
    (step 3 of [shutdown and restart](#s3wal-shutdown-and-restart)), and run it again. A
    `serve` started with `OPENSTORAGE_S3WAL_LEASE_TTL=0` holds no lease, so the command
    cannot detect it.
 5. Start `serve`. Pending push and pull work runs at once, at the first attempt.
 
-**Downgrade to a v1 release (v0.16.0 or later).**
+**Downgrade to a v2 release (v0.19.0).**
 
 1. Stop `serve` and wait for the process and its hook children to exit, as in upgrade
    step 1.
 2. Take a verified [stopped-node backup](backup-restore-s3wal.md). The conversion drops
-   the retry positions and create states, and the backup is the only way back to them.
-3. Run `openstorage s3wal-meta convert --to 1` with the v2 binary. A held lease is handled
+   the v3 field `upstreams[].default_branch_omitted`, and the backup is the only way
+   back to it.
+3. Run `openstorage s3wal-meta convert --to 2` with the v3 binary. A held lease is handled
+   as in upgrade step 4.
+4. Replace the binary with the v2 release and start it.
+
+The downgrade keeps all data. A GitHub sync repository that still waits to adopt the
+GitHub default branch stops waiting and keeps the branch it has.
+
+**Downgrade to a v1 release (v0.16.0 through v0.18.0).**
+
+1. Stop `serve` and wait for the process and its hook children to exit, as in upgrade
+   step 1.
+2. Take a verified [stopped-node backup](backup-restore-s3wal.md). The conversion drops
+   the retry positions, the create states and the v3 field, and the backup is the only
+   way back to them.
+3. Run `openstorage s3wal-meta convert --to 1` with the v3 binary. A held lease is handled
    as in upgrade step 4. If the command refuses because of unfinished creates without an
    upstream link (a fork, a copy, or a sync create whose link was removed), it names
    them: delete them with `DELETE /repos/delete` (with `serve` on this release), stop
@@ -876,7 +894,7 @@ The downgrade keeps all data. It loses retry backoff positions, and every reposi
 create state reads legacy, so a repeat create answers 409. An unfinished sync create keeps
 its first sync: the v1 release runs it at boot.
 
-**Hook refusals.** A v2 hook refuses a ref update when `_wal/meta.json` has the wrong
+**Hook refusals.** A hook refuses a ref update when `_wal/meta.json` has the wrong
 format version, does not decode, or holds ids or rows no writer can produce, such as a
 negative id counter, a holderless claim, a null row or an empty required field
 (`_wal/meta.json is corrupt`). `serve` refuses the same documents at every metadata read

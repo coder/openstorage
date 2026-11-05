@@ -249,19 +249,20 @@ same quarantine handshake.
 
 ## `openstorage s3wal-meta`
 
-Converts an S3WAL bucket's metadata document (`_wal/meta.json`) between format versions 1
-and 2 ([ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md)).
-`serve` reads only version 2. Run the command once with the new binary when you upgrade
-from a v1 release, and with `--to 1` before you go back to one. The steps are in the
+Converts an S3WAL bucket's metadata document (`_wal/meta.json`) between format versions 1,
+2 and 3 ([ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md)).
+`serve` reads only version 3. Run the command once with the new binary when you upgrade
+from a v1 or v2 release, and with `--to 2` or `--to 1` before you go back to one. The
+steps are in the
 [deployment guide](../how-to/deploy-production.md#upgrading-the-s3wal-metadata-format).
 
 ```
-openstorage s3wal-meta convert --to <1|2> [--force]
+openstorage s3wal-meta convert --to <1|2|3> [--force]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--to` | required | Target version: `2` to upgrade, `1` to downgrade |
+| `--to` | required | Target version: `3` to upgrade, `2` or `1` to downgrade |
 | `--force` | off | With `--to 1` only: convert even while a create without an upstream link (a fork, a copy, or a sync create whose link was removed) is unfinished |
 
 The database URL (`OPENSTORAGE_PG_URL`) must be an `s3wal://` URL. The command:
@@ -274,9 +275,10 @@ The database URL (`OPENSTORAGE_PG_URL`) must be an `s3wal://` URL. The command:
    it equals the expected conversion. It prints the version, `seq` and row counts.
 4. Releases the lease.
 
-`--to 2` changes only the version. `--to 1` drops the four v2 fields and sets
-`sync_pending` on every lane whose pull claim is set, so a v1 release restarts that pull
-at boot.
+`--to 3` changes only the version. `--to 2` drops the v3 field
+`upstreams[].default_branch_omitted`. `--to 1` drops that field and the four v2 fields,
+and sets `sync_pending` on every lane whose pull claim is set, so a v1 release restarts
+that pull at boot.
 
 `--to 1` also handles creates that had not finished (v1 stores no create state):
 
@@ -290,7 +292,7 @@ at boot.
   again. `--force` converts anyway and lists the repos in its output.
 
 A document already at the target version is left unchanged (exit 0). A bucket without a
-metadata document needs nothing: `serve` creates a v2 document.
+metadata document needs nothing: `serve` creates a v3 document.
 
 ## `openstorage version`
 

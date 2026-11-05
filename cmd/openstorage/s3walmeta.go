@@ -1,7 +1,7 @@
 // s3wal-meta convert rewrites an S3WAL bucket's metadata document between
-// format versions 1 and 2 (ADR-51, rollout R1): serve reads only v2, so an
-// operator converts a stopped bucket once per format release, and back with
-// --to 1 before a downgrade.
+// format versions 1, 2 and 3 (ADR-51, rollout R1): serve reads only v3, so
+// an operator converts a stopped bucket once per format release, and back
+// with --to 2 or --to 1 before a downgrade.
 package main
 
 import (
@@ -26,10 +26,10 @@ const s3walConvertReleaseTimeout = 5 * time.Second
 
 func cmdS3WALMeta(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] != "convert" {
-		return errors.New("usage: openstorage s3wal-meta convert --to <1|2> [--force]")
+		return errors.New("usage: openstorage s3wal-meta convert --to <1|2|3> [--force]")
 	}
 	fs := flag.NewFlagSet("s3wal-meta convert", flag.ExitOnError)
-	to := fs.Int("to", 0, "target metadata format version: 2 to upgrade, 1 to downgrade")
+	to := fs.Int("to", 0, "target metadata format version: 3 to upgrade, 2 or 1 to downgrade")
 	force := fs.Bool("force", false, "with --to 1: convert even while a create without an upstream link (a fork, a copy, or a sync create whose link was removed) is unfinished")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -37,8 +37,8 @@ func cmdS3WALMeta(ctx context.Context, args []string) error {
 	if fs.NArg() > 0 {
 		return fmt.Errorf("s3wal-meta convert: unexpected arguments %q", fs.Args())
 	}
-	if *to != 1 && *to != 2 {
-		return errors.New("--to must be 1 or 2")
+	if *to < 1 || *to > 3 {
+		return errors.New("--to must be 1, 2 or 3")
 	}
 	if *force && *to != 1 {
 		return errors.New("--force applies only to --to 1")
@@ -101,7 +101,7 @@ func runS3WALMetaConvert(ctx context.Context, cs s3wal.ConditionalStore, to int,
 	}
 	switch {
 	case res.Missing:
-		fmt.Fprintln(out, "no metadata document: nothing to convert (serve creates a v2 document on its first write)")
+		fmt.Fprintln(out, "no metadata document: nothing to convert (serve creates a v3 document on its first write)")
 	case res.From == res.To:
 		fmt.Fprintf(out, "already at version %d (seq %d): nothing to do\n", res.To, res.SeqAfter)
 	default:

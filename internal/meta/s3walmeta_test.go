@@ -32,23 +32,24 @@ func TestS3WALMetaDecode(t *testing.T) {
 	const fields = `"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`
 	for _, tc := range []struct{ name, body, wantErr string }{
 		{"malformed JSON", `{`, "s3walmeta: _wal/meta.json is corrupt (document decode:"},
-		{"seq zero", `{"v":2,"seq":0,"writer":"w"}`, "document seq 0 invalid"},
-		{"no writer", `{"v":2,"seq":1}`, "document seq 1 has no writer nonce"},
+		{"seq zero", `{"v":3,"seq":0,"writer":"w"}`, "document seq 0 invalid"},
+		{"no writer", `{"v":3,"seq":1}`, "document seq 1 has no writer nonce"},
 		// Impossible id counters (issue #478): typed, never a panic.
-		{"negative org counter", `{"v":2,"seq":1,"writer":"w","next_org_id":-1,"next_key_id":0}`, "document seq 1 has negative id counters (-1, 0)"},
-		{"negative key counter", `{"v":2,"seq":1,"writer":"w","next_org_id":0,"next_key_id":-3}`, "document seq 1 has negative id counters (0, -3)"},
-		{"org id zero", `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":0,"created_at":1,"public_keys":[]}}}`, `document seq 1: org "o" has id 0 outside 1..1`},
-		{"org id above counter", `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":2,"created_at":1,"public_keys":[]}}}`, `document seq 1: org "o" has id 2 outside 1..1`},
-		{"duplicate org id", `{"v":2,"seq":1,"writer":"w","next_org_id":2,"next_key_id":0,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[]},"b":{"id":1,"created_at":1,"public_keys":[]}}}`, "document seq 1: org id 1 is used twice"},
-		{"key id above counter", `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":1,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":2,"key_text":"k","created_at":1}]}}}`, `document seq 1: org "o" signing key id 2 outside 1..1`},
-		{"null org row", `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":null}}`, `document seq 1: org "o" has no row`},
-		{"duplicate key id", `{"v":2,"seq":1,"writer":"w","next_org_id":2,"next_key_id":1,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":1,"key_text":"k","created_at":1}]},"b":{"id":2,"created_at":1,"public_keys":[],"signing_keys":[{"id":1,"key_text":"k","created_at":1}]}}}`, "document seq 1: signing key id 1 is used twice"},
-		{"missing version", `{` + fields, "s3walmeta: document version 0 unsupported (want 2)"},
-		{"zero version", `{"v":0,` + fields, "s3walmeta: document version 0 unsupported (want 2)"},
-		{"v1 needs conversion", `{"v":1,` + fields, "s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2`"},
-		{"foreign version", `{"v":3,` + fields, "s3walmeta: document version 3 unsupported (want 2)"},
-		{"valid v2", `{"v":2,` + fields, ""},
-		{"valid v2 with ids", `{"v":2,"seq":1,"writer":"w","next_org_id":3,"next_key_id":2,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":2,"key_text":"k","created_at":1}]},"b":{"id":3,"created_at":1,"public_keys":[]}}}`, ""},
+		{"negative org counter", `{"v":3,"seq":1,"writer":"w","next_org_id":-1,"next_key_id":0}`, "document seq 1 has negative id counters (-1, 0)"},
+		{"negative key counter", `{"v":3,"seq":1,"writer":"w","next_org_id":0,"next_key_id":-3}`, "document seq 1 has negative id counters (0, -3)"},
+		{"org id zero", `{"v":3,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":0,"created_at":1,"public_keys":[]}}}`, `document seq 1: org "o" has id 0 outside 1..1`},
+		{"org id above counter", `{"v":3,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":2,"created_at":1,"public_keys":[]}}}`, `document seq 1: org "o" has id 2 outside 1..1`},
+		{"duplicate org id", `{"v":3,"seq":1,"writer":"w","next_org_id":2,"next_key_id":0,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[]},"b":{"id":1,"created_at":1,"public_keys":[]}}}`, "document seq 1: org id 1 is used twice"},
+		{"key id above counter", `{"v":3,"seq":1,"writer":"w","next_org_id":1,"next_key_id":1,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":2,"key_text":"k","created_at":1}]}}}`, `document seq 1: org "o" signing key id 2 outside 1..1`},
+		{"null org row", `{"v":3,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":null}}`, `document seq 1: org "o" has no row`},
+		{"duplicate key id", `{"v":3,"seq":1,"writer":"w","next_org_id":2,"next_key_id":1,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":1,"key_text":"k","created_at":1}]},"b":{"id":2,"created_at":1,"public_keys":[],"signing_keys":[{"id":1,"key_text":"k","created_at":1}]}}}`, "document seq 1: signing key id 1 is used twice"},
+		{"missing version", `{` + fields, "s3walmeta: document version 0 unsupported (want 3)"},
+		{"zero version", `{"v":0,` + fields, "s3walmeta: document version 0 unsupported (want 3)"},
+		{"v1 needs conversion", `{"v":1,` + fields, "s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 3`"},
+		{"v2 needs conversion", `{"v":2,` + fields, "s3walmeta: document version 2 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 3`"},
+		{"foreign version", `{"v":4,` + fields, "s3walmeta: document version 4 unsupported (want 3)"},
+		{"valid v3", `{"v":3,` + fields, ""},
+		{"valid v3 with ids", `{"v":3,"seq":1,"writer":"w","next_org_id":3,"next_key_id":2,"orgs":{"a":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[{"id":2,"key_text":"k","created_at":1}]},"b":{"id":3,"created_at":1,"public_keys":[]}}}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			doc, err := decodeS3WALMetaDoc([]byte(tc.body))
@@ -78,14 +79,14 @@ func TestS3WALMetaDecode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.name == "valid v2 with ids" {
+			if tc.name == "valid v3 with ids" {
 				if doc == nil || doc.NextOrgID != 3 || doc.NextKeyID != 2 || len(doc.Orgs) != 2 {
 					t.Fatalf("decoded document = %+v, want the valid control with ids", doc)
 				}
 				return
 			}
-			if doc == nil || doc.V != 2 || doc.Seq != 1 || doc.Writer != "0123456789abcdef0123456789abcdef" || doc.NextOrgID != 0 || doc.NextKeyID != 0 {
-				t.Fatalf("decoded document = %+v, want the valid v2 control", doc)
+			if doc == nil || doc.V != 3 || doc.Seq != 1 || doc.Writer != "0123456789abcdef0123456789abcdef" || doc.NextOrgID != 0 || doc.NextKeyID != 0 {
+				t.Fatalf("decoded document = %+v, want the valid v3 control", doc)
 			}
 		})
 	}
@@ -116,9 +117,10 @@ func TestCheckFormat(t *testing.T) {
 		wantErr     string
 	}{
 		{name: "missing document"},
-		{name: "v2", seed: `{"v":2,"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`},
-		{name: "v1", seed: v1, wantType: true, wantErr: "convert --to 2"},
-		{name: "v3", seed: `{"v":3,"seq":1}`, wantType: true, wantErr: "document version 3 unsupported (want 2)"},
+		{name: "v3", seed: `{"v":3,"seq":1,"writer":"0123456789abcdef0123456789abcdef","next_org_id":0,"next_key_id":0}`},
+		{name: "v2", seed: strings.Replace(v1, `"v":1`, `"v":2`, 1), wantType: true, wantErr: "convert --to 3"},
+		{name: "v1", seed: v1, wantType: true, wantErr: "convert --to 3"},
+		{name: "v4", seed: `{"v":4,"seq":1}`, wantType: true, wantErr: "document version 4 unsupported (want 3)"},
 		{name: "corrupt", seed: `{`, wantCorrupt: true, wantErr: "document decode"},
 		{name: "store down", down: true, wantErr: errStoreDown.Error()},
 	} {
@@ -187,7 +189,7 @@ func (c *countGetsCAS) GetIfChanged(ctx context.Context, key, etag string) (s3wa
 // the fix, the decode assertion panicked serve and the hook.
 func TestS3WALMetaCorruptCountersNoPanic(t *testing.T) {
 	mem := s3wal.NewMemCAS()
-	body := []byte(`{"v":2,"seq":4,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`)
+	body := []byte(`{"v":3,"seq":4,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`)
 	if _, err := mem.Create(t.Context(), s3walMetaKey, body); err != nil {
 		t.Fatal(err)
 	}
@@ -379,8 +381,9 @@ func TestS3WALMetaVanishedDocumentLatches(t *testing.T) {
 // document itself ends the refusal.
 func TestS3WALMetaUndecodableReplacementLatches(t *testing.T) {
 	for _, tc := range []struct{ name, bad, wantErr string }{
-		{"corrupt", `{"v":2,"seq":`, "_wal/meta.json is corrupt"},
+		{"corrupt", `{"v":3,"seq":`, "_wal/meta.json is corrupt"},
 		{"v1", `{"v":1,"seq":2,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`, "document version 1 needs conversion"},
+		{"v2", `{"v":2,"seq":2,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`, "document version 2 needs conversion"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()

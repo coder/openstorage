@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"v\":3,\"seq\":1,\"writer\":\"0\",\"neXt_org_id\":1,\"orgs\":{\"\":{\"id\":1}}}")

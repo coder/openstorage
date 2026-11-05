@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -39,22 +40,35 @@ func TestS3WALMetaConvertCommand(t *testing.T) {
 	ctx := context.Background()
 	cas := newV1Bucket(t)
 	var out bytes.Buffer
-	if err := runS3WALMetaConvert(ctx, cas, 2, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil {
+	if err := runS3WALMetaConvert(ctx, cas, 3, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "converted version 1 -> 2 (seq 1 -> 2), verified") || storedVersion(t, cas) != `{"v":2` {
+	if !strings.Contains(out.String(), "converted version 1 -> 3 (seq 1 -> 2), verified") || storedVersion(t, cas) != `{"v":3` {
 		t.Fatalf("output %q, stored %s", out.String(), storedVersion(t, cas))
 	}
 	if _, err := cas.Get(ctx, s3wal.LeaseKey); !errors.Is(err, s3wal.ErrNotExist) {
 		t.Fatalf("lease after convert = %v, want released", err)
 	}
 	out.Reset()
-	if err := runS3WALMetaConvert(ctx, cas, 2, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil || !strings.Contains(out.String(), "already at version 2") {
+	if err := runS3WALMetaConvert(ctx, cas, 3, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil || !strings.Contains(out.String(), "already at version 3") {
 		t.Fatalf("re-run = %q, %v", out.String(), err)
 	}
-	out.Reset()
-	if err := runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil || storedVersion(t, cas) != `{"v":1` {
-		t.Fatalf("downgrade = %q, %v", out.String(), err)
+	for _, to := range []int{2, 3, 1} {
+		out.Reset()
+		if err := runS3WALMetaConvert(ctx, cas, to, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out); err != nil || storedVersion(t, cas) != fmt.Sprintf(`{"v":%d`, to) {
+			t.Fatalf("convert to %d = %q, %v, stored %s", to, out.String(), err, storedVersion(t, cas))
+		}
+	}
+}
+
+// --to accepts exactly the versions the conversion writes, and a bad value
+// fails before the command touches the bucket.
+func TestS3WALMetaConvertRejectsUnknownTarget(t *testing.T) {
+	for _, to := range []string{"0", "4"} {
+		err := cmdS3WALMeta(t.Context(), []string{"convert", "--to", to})
+		if err == nil || !strings.Contains(err.Error(), "--to must be 1, 2 or 3") {
+			t.Fatalf("--to %s = %v, want the range refusal", to, err)
+		}
 	}
 }
 
@@ -80,8 +94,8 @@ func TestS3WALMetaConvertPendingCreatesCommand(t *testing.T) {
 	}
 	var out bytes.Buffer
 	err = runS3WALMetaConvert(ctx, cas, 1, meta.S3WALConvertOptions{}, s3wal.LeaseConfig{}, &out)
-	if err == nil || !strings.Contains(err.Error(), fork.RepoID+` ("fork-pending")`) || !strings.Contains(err.Error(), "DELETE /repos/delete") || storedVersion(t, cas) != `{"v":2` {
-		t.Fatalf("refusal = %v, stored %s; want the fork named and v2 kept", err, storedVersion(t, cas))
+	if err == nil || !strings.Contains(err.Error(), fork.RepoID+` ("fork-pending")`) || !strings.Contains(err.Error(), "DELETE /repos/delete") || storedVersion(t, cas) != `{"v":3` {
+		t.Fatalf("refusal = %v, stored %s; want the fork named and v3 kept", err, storedVersion(t, cas))
 	}
 	if _, err := cas.Get(ctx, s3wal.LeaseKey); !errors.Is(err, s3wal.ErrNotExist) {
 		t.Fatalf("lease after refusal = %v, want released", err)

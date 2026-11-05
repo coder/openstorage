@@ -15,8 +15,11 @@ import (
 	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
-// v2OnlyKeys are the JSON names ADR-51 adds in v2.
-var v2OnlyKeys = []string{"create_state", "push_attempt", "push_due", "sync_due"}
+// v2OnlyKeys and v3OnlyKeys are the JSON names ADR-51 adds in v2 and v3.
+var (
+	v2OnlyKeys = []string{"create_state", "push_attempt", "push_due", "sync_due"}
+	v3OnlyKeys = []string{"default_branch_omitted"}
+)
 
 // storedS3WALMeta decodes the stored document at any known version.
 func storedS3WALMeta(t *testing.T, cas s3wal.ConditionalStore) (*s3walMetaDoc, []byte) {
@@ -25,7 +28,7 @@ func storedS3WALMeta(t *testing.T, cas s3wal.ConditionalStore) (*s3walMetaDoc, [
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc, err := decodeS3WALMetaDocVersion(obj.Body, s3walMetaV1, s3walMetaV2)
+	doc, err := decodeS3WALMetaDocVersion(obj.Body, s3walConvertVersions...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +67,11 @@ func expectedS3WALMeta(t *testing.T, src *s3walMetaDoc, to int) *s3walMetaDoc {
 		t.Fatal(err)
 	}
 	want.V = to
+	if to < s3walMetaV3 {
+		for _, u := range want.Upstreams {
+			u.DefaultBranchOmitted = false
+		}
+	}
 	if to == s3walMetaV1 {
 		for id, r := range want.Repos {
 			// An unfinished sync create keeps its owed first sync.
@@ -81,7 +89,7 @@ func expectedS3WALMeta(t *testing.T, src *s3walMetaDoc, to int) *s3walMetaDoc {
 }
 
 // assertConverted checks the stored document against the rule, apart
-// from seq and writer, and checks a v1 body names no v2 field.
+// from seq and writer, and checks a body names no field of a later version.
 func assertConverted(t *testing.T, cas s3wal.ConditionalStore, src *s3walMetaDoc, to int) {
 	t.Helper()
 	got, body := storedS3WALMeta(t, cas)
@@ -90,11 +98,14 @@ func assertConverted(t *testing.T, cas s3wal.ConditionalStore, src *s3walMetaDoc
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("stored document:\n%+v\nwant:\n%+v", got, want)
 	}
-	if to == s3walMetaV1 {
-		for _, k := range v2OnlyKeys {
-			if strings.Contains(string(body), `"`+k+`"`) {
-				t.Fatalf("v1 body names v2 field %q: %s", k, body)
-			}
+	for _, k := range v3OnlyKeys {
+		if to < s3walMetaV3 && strings.Contains(string(body), `"`+k+`"`) {
+			t.Fatalf("v%d body names v3 field %q: %s", to, k, body)
+		}
+	}
+	for _, k := range v2OnlyKeys {
+		if to == s3walMetaV1 && strings.Contains(string(body), `"`+k+`"`) {
+			t.Fatalf("v1 body names v2 field %q: %s", k, body)
 		}
 	}
 }
@@ -131,50 +142,51 @@ func TestS3WALMetaConvert(t *testing.T) {
 	cas := s3wal.NewMemCAS()
 	repoID, v1 := seedS3WALMetaClaim(t, cas)
 
-	res, err := ConvertS3WALMeta(ctx, cas, 2, S3WALConvertOptions{})
+	res, err := ConvertS3WALMeta(ctx, cas, 3, S3WALConvertOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Missing || res.From != 1 || res.To != 2 || res.SeqAfter != res.SeqBefore+1 || res.Before != res.After || res.Before.Repos != 1 || res.Before.Webhooks != 1 {
-		t.Fatalf("convert to 2 = %+v", res)
+	if res.Missing || res.From != 1 || res.To != 3 || res.SeqAfter != res.SeqBefore+1 || res.Before != res.After || res.Before.Repos != 1 || res.Before.Webhooks != 1 {
+		t.Fatalf("convert to 3 = %+v", res)
 	}
-	assertConverted(t, cas, v1, 2)
+	assertConverted(t, cas, v1, 3)
 
-	again, err := ConvertS3WALMeta(ctx, cas, 2, S3WALConvertOptions{})
-	if err != nil || again.From != 2 || again.SeqAfter != res.SeqAfter {
+	again, err := ConvertS3WALMeta(ctx, cas, 3, S3WALConvertOptions{})
+	if err != nil || again.From != 3 || again.SeqAfter != res.SeqAfter {
 		t.Fatalf("re-run = %+v, %v; want no write at seq %d", again, err, res.SeqAfter)
 	}
 
-	// Give the v2 document values in every v2 field, then go back.
-	v2, _ := storedS3WALMeta(t, cas)
-	for _, r := range v2.Repos {
+	// Give the v3 document values in every v2 and v3 field, then go back.
+	v3, _ := storedS3WALMeta(t, cas)
+	for _, r := range v3.Repos {
 		r.CreateState = int(CreateStateComplete)
 	}
-	v2.Upstreams[repoID].PushAttempt, v2.Upstreams[repoID].PushDue, v2.Upstreams[repoID].SyncDue = 3, 42, 43
-	putS3WALMeta(t, cas, v2, 2)
-	v2, _ = storedS3WALMeta(t, cas)
+	v3.Upstreams[repoID].PushAttempt, v3.Upstreams[repoID].PushDue, v3.Upstreams[repoID].SyncDue = 3, 42, 43
+	v3.Upstreams[repoID].DefaultBranchOmitted = true
+	putS3WALMeta(t, cas, v3, 3)
+	v3, _ = storedS3WALMeta(t, cas)
 	if _, err := ConvertS3WALMeta(ctx, cas, 1, S3WALConvertOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	assertConverted(t, cas, v2, 1)
+	assertConverted(t, cas, v3, 1)
 
-	// The normal (v2) path refuses the v1 document and writes nothing.
+	// The normal (v3) path refuses the v1 document and writes nothing.
 	st := NewS3WAL(cas)
 	defer st.Close()
 	v1Seq := res.SeqAfter + 2
-	if _, err := st.UpsertOrgWithKeys(ctx, "new", []string{"pem"}); err == nil || !strings.Contains(err.Error(), "convert --to 2") {
-		t.Fatalf("v2 write on v1 = %v, want the conversion hint", err)
+	if _, err := st.UpsertOrgWithKeys(ctx, "new", []string{"pem"}); err == nil || !strings.Contains(err.Error(), "convert --to 3") {
+		t.Fatalf("v3 write on v1 = %v, want the conversion hint", err)
 	}
 	if got, _ := storedS3WALMeta(t, cas); got.V != 1 || got.Seq != v1Seq {
 		t.Fatalf("refused write left v%d seq %d, want v1 seq %d", got.V, got.Seq, v1Seq)
 	}
-	// Back to v2: the claimed lane is still claimed and pending, so the
+	// Back to v3: the claimed lane is still claimed and pending, so the
 	// sweep runs it once the claim expires.
-	if _, err := ConvertS3WALMeta(ctx, cas, 2, S3WALConvertOptions{}); err != nil {
+	if _, err := ConvertS3WALMeta(ctx, cas, 3, S3WALConvertOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if up, err := st.GetRepoUpstream(ctx, repoID); err != nil || !up.Syncing || !up.SyncPending {
-		t.Fatalf("lane after --to 2 = %+v, %v; want claimed and pending", up, err)
+		t.Fatalf("lane after --to 3 = %+v, %v; want claimed and pending", up, err)
 	}
 }
 
@@ -226,8 +238,8 @@ func TestS3WALMetaConvertPendingCreates(t *testing.T) {
 	if !ok || !slices.Equal(pe.Creates, want) || !strings.Contains(err.Error(), "DELETE /repos/delete") || !strings.Contains(err.Error(), "--force") {
 		t.Fatalf("--to 1 with unfinished forks = %v, want a refusal naming %v", err, want)
 	}
-	if got, _ := storedS3WALMeta(t, cas); got.V != 2 || got.Seq != before.Seq {
-		t.Fatalf("refusal wrote v%d seq %d, want v2 seq %d", got.V, got.Seq, before.Seq)
+	if got, _ := storedS3WALMeta(t, cas); got.V != 3 || got.Seq != before.Seq {
+		t.Fatalf("refusal wrote v%d seq %d, want v3 seq %d", got.V, got.Seq, before.Seq)
 	}
 
 	// Forced: converted, the sync create keeps its owed first sync, and
@@ -268,7 +280,7 @@ func TestS3WALMetaConvertRepairsSyncCreates(t *testing.T) {
 
 func TestS3WALMetaConvertEdges(t *testing.T) {
 	ctx := context.Background()
-	if res, err := ConvertS3WALMeta(ctx, s3wal.NewMemCAS(), 2, S3WALConvertOptions{}); err != nil || !res.Missing {
+	if res, err := ConvertS3WALMeta(ctx, s3wal.NewMemCAS(), 3, S3WALConvertOptions{}); err != nil || !res.Missing {
 		t.Fatalf("missing document = %+v, %v", res, err)
 	}
 	// Empty tables, which the encoder omits, still verify.
@@ -276,14 +288,14 @@ func TestS3WALMetaConvertEdges(t *testing.T) {
 	if _, err := empty.Create(ctx, s3walMetaKey, []byte(`{"v":1,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[],"signing_keys":[]}},"repos":{}}`)); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := ConvertS3WALMeta(ctx, empty, 2, S3WALConvertOptions{}); err != nil || res.SeqAfter != 2 || res.After.Orgs != 1 {
+	if res, err := ConvertS3WALMeta(ctx, empty, 3, S3WALConvertOptions{}); err != nil || res.SeqAfter != 2 || res.After.Orgs != 1 {
 		t.Fatalf("empty-table document = %+v, %v", res, err)
 	}
 	cas := s3wal.NewMemCAS()
 	_, src := seedS3WALMetaClaim(t, cas)
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := ConvertS3WALMeta(cctx, cas, 2, S3WALConvertOptions{}); !errors.Is(err, context.Canceled) {
+	if _, err := ConvertS3WALMeta(cctx, cas, 3, S3WALConvertOptions{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled convert = %v", err)
 	}
 	if got, _ := storedS3WALMeta(t, cas); got.V != 1 || got.Seq != src.Seq {
@@ -297,11 +309,11 @@ func TestS3WALMetaConvertAmbiguous(t *testing.T) {
 			cas := s3wal.NewMemCAS()
 			_, src := seedS3WALMetaClaim(t, cas)
 			armAmbiguousPut(t, cas, f, func() {})
-			res, err := ConvertS3WALMeta(context.Background(), cas, 2, S3WALConvertOptions{})
+			res, err := ConvertS3WALMeta(context.Background(), cas, 3, S3WALConvertOptions{})
 			if err != nil || res.SeqAfter != src.Seq+1 {
 				t.Fatalf("convert = %+v, %v; want exactly one write", res, err)
 			}
-			assertConverted(t, cas, src, 2)
+			assertConverted(t, cas, src, 3)
 		})
 	}
 }
@@ -327,7 +339,7 @@ func TestS3WALMetaConvertCancelDuringRead(t *testing.T) {
 	_, src := seedS3WALMetaClaim(t, mem)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if _, err := ConvertS3WALMeta(ctx, &cancelOnGetCAS{MemCAS: mem, cancel: cancel}, 2, S3WALConvertOptions{}); !errors.Is(err, context.Canceled) {
+	if _, err := ConvertS3WALMeta(ctx, &cancelOnGetCAS{MemCAS: mem, cancel: cancel}, 3, S3WALConvertOptions{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("convert = %v, want context.Canceled", err)
 	}
 	if got, _ := storedS3WALMeta(t, mem); got.V != src.V || got.Seq != src.Seq {
@@ -353,14 +365,14 @@ func (r *raceCAS) Advance(ctx context.Context, key string, body []byte, etag str
 // and write survives, the conversion applies to it, and its next CAS, made
 // on the ETag it read, loses without changing the converted document.
 func TestS3WALMetaConvertRace(t *testing.T) {
-	for _, to := range []int{2, 1} {
-		t.Run(fmt.Sprintf("to%d", to), func(t *testing.T) {
+	for _, tc := range []struct{ from, to int }{{1, 3}, {2, 3}, {3, 2}, {3, 1}} {
+		from, to := tc.from, tc.to
+		t.Run(fmt.Sprintf("v%dtov%d", from, to), func(t *testing.T) {
 			ctx := context.Background()
 			mem := s3wal.NewMemCAS()
 			repoID, _ := seedS3WALMetaClaim(t, mem)
-			from := 3 - to
-			if from == 2 {
-				if _, err := ConvertS3WALMeta(ctx, mem, 2, S3WALConvertOptions{}); err != nil {
+			if from != 1 {
+				if _, err := ConvertS3WALMeta(ctx, mem, from, S3WALConvertOptions{}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -391,13 +403,13 @@ func TestS3WALMetaConvertRace(t *testing.T) {
 	}
 }
 
-// Zero-value rule property: for random v2 documents d, to2(to1(d)) is d
-// with the v2 fields cleared and sync_pending set on claimed pull lanes and
-// on unfinished sync creates.
+// Zero-value rule property: for random v3 documents d, to3(to2(to1(d))) is d
+// with the v2 and v3 fields cleared and sync_pending set on claimed pull
+// lanes and on unfinished sync creates, and to1(d) equals to1(to2(d)).
 func TestS3WALMetaConvertProperty(t *testing.T) {
 	rng := mrand.New(mrand.NewPCG(51, 51))
 	for i := range 300 {
-		d := &s3walMetaDoc{V: 2, Seq: 1, Writer: "w", Repos: map[string]*s3walMetaRepo{}, Upstreams: map[string]*s3walMetaUpstream{}}
+		d := &s3walMetaDoc{V: 3, Seq: 1, Writer: "w", Repos: map[string]*s3walMetaRepo{}, Upstreams: map[string]*s3walMetaUpstream{}}
 		for j := range rng.IntN(4) {
 			id := fmt.Sprintf("repo_%012x", j) // the minted id shape decode requires (issue #492)
 			d.Repos[id] = &s3walMetaRepo{OrgID: 1, URL: id, DefaultBranch: "main", CreateState: rng.IntN(3), DeletedAt: rng.Int64N(2)}
@@ -405,6 +417,7 @@ func TestS3WALMetaConvertProperty(t *testing.T) {
 				Owner: "o", Name: "n", UpstreamHost: "h",
 				Syncing: rng.IntN(2) == 0, SyncPending: rng.IntN(2) == 0, PushSyncing: rng.IntN(2) == 0,
 				PushPending: rng.IntN(3), PushAttempt: rng.IntN(6), PushDue: rng.Int64N(3), SyncDue: rng.Int64N(3),
+				DefaultBranchOmitted: rng.IntN(2) == 0,
 			}
 			// A held claim has its holder, as every writer leaves it
 			// (decode rejects holderless claims, issue #481).
@@ -432,10 +445,103 @@ func TestS3WALMetaConvertProperty(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		twoBody, err := json.Marshal(two)
+		if err != nil {
+			t.Fatal(err)
+		}
+		three, _, err := convertS3WALMetaDoc(twoBody, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
 		want := expectedS3WALMeta(t, d, 1)
-		want.V = 2
-		if !reflect.DeepEqual(two, want) {
-			t.Fatalf("case %d: to2(to1(d)) =\n%+v\nwant\n%+v", i, two, want)
+		want.V = 3
+		if !reflect.DeepEqual(three, want) {
+			t.Fatalf("case %d: to3(to2(to1(d))) =\n%+v\nwant\n%+v", i, three, want)
+		}
+		// Dropping the v3 field first changes nothing about the v1 result.
+		viaTwo, _, err := convertS3WALMetaDoc(mustMarshalS3WALMeta(t, expectedS3WALMeta(t, d, 2)), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(viaTwo, one) {
+			t.Fatalf("case %d: to1(to2(d)) =\n%+v\nwant to1(d) =\n%+v", i, viaTwo, one)
+		}
+	}
+}
+
+func mustMarshalS3WALMeta(t *testing.T, doc *s3walMetaDoc) []byte {
+	t.Helper()
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// seedV3Flags returns a stored document at version v with two upstreams,
+// one of them with the v3 default_branch_omitted flag, so each conversion
+// direction has a field to keep or drop.
+func seedV3Flags(t *testing.T, v int) (*s3wal.MemCAS, string, string) {
+	t.Helper()
+	cas := s3wal.NewMemCAS()
+	st := NewS3WAL(cas)
+	t.Cleanup(st.Close)
+	if _, err := st.UpsertOrgWithKeys(context.Background(), "org", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	up := RepoUpstream{Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com"}
+	flagged, err := st.CreateLinkedRepo(context.Background(), "org", "flagged", "main", up, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := st.CreateLinkedRepo(context.Background(), "org", "plain", "main", up, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := storedS3WALMeta(t, cas)
+	doc.Upstreams[flagged.RepoID].DefaultBranchOmitted = v == s3walMetaV3
+	putS3WALMeta(t, cas, doc, v)
+	return cas, flagged.RepoID, plain.RepoID
+}
+
+// TestS3WALMetaConvertV3ZeroValue pins the ADR-51 zero-value rule for the
+// v3 field default_branch_omitted (issue #603): going up to v3 changes
+// only the version, and going down drops the field alone, so a repository
+// that still waits for adoption keeps its branch.
+func TestS3WALMetaConvertV3ZeroValue(t *testing.T) {
+	ctx := context.Background()
+	// The decoded flag reaches the interface type, and it survives a
+	// document round trip, so a v3 writer finds what it stored.
+	cas, flagged, plain := seedV3Flags(t, 3)
+	st := NewS3WAL(cas)
+	defer st.Close()
+	for id, want := range map[string]bool{flagged: true, plain: false} {
+		if up, err := st.GetRepoUpstream(ctx, id); err != nil || up.DefaultBranchOmitted != want {
+			t.Fatalf("upstream %s: DefaultBranchOmitted = %v, %v; want %v", id, up.DefaultBranchOmitted, err, want)
+		}
+	}
+	if _, err := st.UpsertOrgWithKeys(ctx, "other", []string{"pem"}); err != nil {
+		t.Fatal(err)
+	}
+	if doc, _ := storedS3WALMeta(t, cas); !doc.Upstreams[flagged].DefaultBranchOmitted {
+		t.Fatal("a v3 write dropped default_branch_omitted")
+	}
+
+	for _, tc := range []struct{ from, to int }{{3, 2}, {3, 1}, {2, 3}, {1, 3}, {1, 2}, {2, 1}} {
+		t.Run(fmt.Sprintf("v%dtov%d", tc.from, tc.to), func(t *testing.T) {
+			cas, _, _ := seedV3Flags(t, tc.from)
+			src, _ := storedS3WALMeta(t, cas)
+			if _, err := ConvertS3WALMeta(ctx, cas, tc.to, S3WALConvertOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			assertConverted(t, cas, src, tc.to)
+		})
+	}
+
+	// The target check names every version.
+	for _, to := range []int{0, 4} {
+		if _, err := ConvertS3WALMeta(ctx, s3wal.NewMemCAS(), to, S3WALConvertOptions{}); err == nil || !strings.Contains(err.Error(), "want 1, 2 or 3") {
+			t.Fatalf("--to %d = %v, want a refusal naming 1, 2 or 3", to, err)
 		}
 	}
 }

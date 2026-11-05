@@ -102,10 +102,10 @@ func assertHookAccepts(t *testing.T, ctx context.Context, rs ref.RefStore) {
 	}
 }
 
-// Issues #445 and #466: a v2 hook on a v1 bucket (binary replaced under an
-// older serve), or on a corrupt document, refuses the ref update before its
-// CAS, instead of accepting the push and dropping its events. The refusal
-// names the fix, and the hook writes nothing.
+// Issues #445 and #466: a hook on a bucket with an older metadata version
+// (binary replaced under an older serve), or on a corrupt document, refuses
+// the ref update before its CAS, instead of accepting the push and dropping
+// its events. The refusal names the fix, and the hook writes nothing.
 func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -113,12 +113,14 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 		want []string
 	}{
 		{"v1", `{"v":1,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`,
-			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
-		{"truncated", `{"v":2,"seq":3,"writer":"0123`,
+			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 3"}},
+		{"v2", `{"v":2,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`,
+			[]string{"document version 2 needs conversion", "openstorage s3wal-meta convert --to 3"}},
+		{"truncated", `{"v":3,"seq":3,"writer":"0123`,
 			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
-		{"no writer", `{"v":2,"seq":3,"next_org_id":1,"next_key_id":0}`,
+		{"no writer", `{"v":3,"seq":3,"next_org_id":1,"next_key_id":0}`,
 			[]string{"_wal/meta.json is corrupt (document seq 3 has no writer nonce)", "backup-restore-s3wal.md"}},
-		{"negative counter", `{"v":2,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`,
+		{"negative counter", `{"v":3,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`,
 			[]string{"_wal/meta.json is corrupt (document seq 3 has negative id counters (-1, 0))", "backup-restore-s3wal.md"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -17,7 +17,7 @@ import (
 // no writer produces, and that a later operation used to assert on, are a
 // typed corrupt-document error at decode, never a panic.
 func TestS3WALMetaDecodeLaneShapes(t *testing.T) {
-	const head = `{"v":2,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[]}},`
+	const head = `{"v":3,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"created_at":1,"public_keys":[]}},`
 	up := func(fields string) string {
 		return head + `"seq":1,"upstreams":{"repo_00000000000a":{"provider":"github","owner":"a","name":"b","upstream_host":"h","created_at":1` + fields + `}}}`
 	}
@@ -39,7 +39,7 @@ func TestS3WALMetaDecodeLaneShapes(t *testing.T) {
 	// Controls: counters at their maximum, and a held claim, decode (only
 	// the write that would wrap them is refused).
 	for _, body := range []string{
-		`{"v":2,"seq":9223372036854775807,"writer":"w","next_org_id":9223372036854775807,"next_key_id":9223372036854775807}`,
+		`{"v":3,"seq":9223372036854775807,"writer":"w","next_org_id":9223372036854775807,"next_key_id":9223372036854775807}`,
 		up(`,"syncing":true,"sync_claim_holder":"h1","push_syncing":true,"push_claim_holder":"h2","push_attempt":5,"push_due":7`),
 	} {
 		if _, err := decodeS3WALMetaDoc([]byte(body)); err != nil {

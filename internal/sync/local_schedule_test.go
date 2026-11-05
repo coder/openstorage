@@ -342,7 +342,7 @@ func (f *localSchedFixture) readSchedule(t *testing.T, repoID string) (attempt i
 			t.Fatalf("read schedule: %v", err)
 		}
 		up, ok := doc.Upstreams[repoID]
-		if doc.V != 2 || !ok {
+		if doc.V != 3 || !ok {
 			t.Fatalf("read schedule: document v%d, upstream %q present=%v", doc.V, repoID, ok)
 		}
 		return up.PushAttempt, up.PushDue

@@ -24,14 +24,14 @@ type s3walRowSeed struct{ name, body, wantErr string }
 // FuzzS3WALMetaDocument.
 func s3walCorruptRowSeeds() []s3walRowSeed {
 	const (
-		head = `{"v":2,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"created_at":1,"public_keys":["pem"]}}`
+		head = `{"v":3,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"created_at":1,"public_keys":["pem"]}}`
 		repo = `"repo_0123456789ab":{"org_id":1,"url":"https://example.com/r.git","default_branch":"main","created_at":1}`
 		up   = `"repo_0123456789ab":{"provider":"github","owner":"a","name":"b","upstream_host":"github.com","created_at":1}`
 	)
 	return []s3walRowSeed{
-		{"empty org name", `{"v":2,"seq":1,"writer":"0","next_org_id":1,"orgs":{"":{"id":1}}}`, "an org has an empty name"},
-		{"empty webhook id", `{"v":2,"seq":1,"writer":"0","webhooks":{"":{"url":"0","secret":"0"}}}`, "a webhook has an empty id"},
-		{"empty credential id", `{"v":2,"seq":1,"writer":"0","credentials":{"":{"repo_id":"r","password":"p"}}}`, "a credential has an empty id"},
+		{"empty org name", `{"v":3,"seq":1,"writer":"0","next_org_id":1,"orgs":{"":{"id":1}}}`, "an org has an empty name"},
+		{"empty webhook id", `{"v":3,"seq":1,"writer":"0","webhooks":{"":{"url":"0","secret":"0"}}}`, "a webhook has an empty id"},
+		{"empty credential id", `{"v":3,"seq":1,"writer":"0","credentials":{"":{"repo_id":"r","password":"p"}}}`, "a credential has an empty id"},
 		{"null repo row", head + `,"repos":{"repo_0123456789ab":null}}`, `repo "repo_0123456789ab" has no row`},
 		{"null credential row", head + `,"repos":{` + repo + `},"credentials":{"c":null}}`, `credential "c" has no row`},
 		{"null upstream row", head + `,"repos":{` + repo + `},"upstreams":{"repo_0123456789ab":null}}`, `upstream "repo_0123456789ab" has no row`},
@@ -196,10 +196,12 @@ func FuzzS3WALMetaDocument(f *testing.F) {
 	for _, s := range []string{
 		`{`,
 		`{"v":1,"seq":1,"writer":"w","next_org_id":0,"next_key_id":0}`,
-		`{"v":2,"seq":1,"writer":"w","next_org_id":-1,"next_key_id":0}`,
-		`{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":null}}`,
-		`{"v":2,"seq":9223372036854775807,"writer":"w","next_org_id":9223372036854775807,"next_key_id":9223372036854775807}`,
-		`{"v":2,"seq":1,"writer":"w","next_org_id":0,"next_key_id":0,"upstreams":{"repo_0123456789ab":{"owner":"a","name":"b","upstream_host":"h","syncing":true,"push_attempt":9}}}`,
+		`{"v":3,"seq":1,"writer":"w","next_org_id":-1,"next_key_id":0}`,
+		`{"v":3,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":null}}`,
+		`{"v":3,"seq":9223372036854775807,"writer":"w","next_org_id":9223372036854775807,"next_key_id":9223372036854775807}`,
+		`{"v":3,"seq":1,"writer":"w","next_org_id":0,"next_key_id":0,"upstreams":{"repo_0123456789ab":{"owner":"a","name":"b","upstream_host":"h","syncing":true,"push_attempt":9}}}`,
+		`{"v":2,"seq":1,"writer":"w","next_org_id":0,"next_key_id":0}`,
+		`{"v":3,"seq":1,"writer":"w","next_org_id":0,"next_key_id":0,"upstreams":{"repo_0123456789ab":{"owner":"a","name":"b","upstream_host":"h","default_branch_omitted":true}}}`,
 	} {
 		f.Add([]byte(s))
 	}

@@ -35,7 +35,7 @@ The metadata store: orgs, public and signing keys, repos, webhooks, git credenti
 - S3WAL decode rejects unknown versions (`FormatVersionError`), `seq < 1`, empty writer nonces, and malformed rows; `observeDoc` refuses seq regressions with `StaleDocumentError` [s3walmeta.go:decodeS3WALMetaDocVersion] [s3walmeta.go:observeDoc]
 - S3WAL `refuse` quarantines the process on foreign-nonce and vanished-mark classes; a quarantined store returns `QuarantinedError` without store reads [s3walmeta_refuse.go:refuse]
 - S3WAL `DeleteRepoUpstream` without a `SyncClaimSink` deletes the row in one mutation; with a sink it runs mark, fence clear (only when a sync holder is set), then row delete [s3walmeta_eventing.go:DeleteRepoUpstream]
-- `ConvertS3WALMeta` accepts target 1 or 2 only and refuses pending creates unless `Force` [s3walmeta_convert.go:ConvertS3WALMeta]
+- `ConvertS3WALMeta` accepts target 1, 2 or 3 only and refuses pending creates unless `Force` [s3walmeta_convert.go:ConvertS3WALMeta]
 
 ## Side Effects
 - `PG` uses a pgx pool; `InitSchema` runs DDL in one transaction under advisory lock `0x4D455441` [pg.go:InitSchema]

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -86,9 +87,15 @@ func (e *S3WALPendingCreatesError) Error() string {
 // s3walConvertAttempts bounds lost-race retries, as mutate does.
 const s3walConvertAttempts = 16
 
+// s3walConvertVersions are the versions the conversion reads and writes.
+var s3walConvertVersions = []int{s3walMetaV1, s3walMetaV2, s3walMetaV3}
+
 // ConvertS3WALMeta rewrites the bucket's metadata document to version to
-// (1 or 2). It applies the zero-value rule of ADR-51: to 2 changes only
-// the version; to 1 drops the four v2 fields and sets sync_pending on
+// (1, 2 or 3). It applies the zero-value rule of ADR-51: going up changes
+// only the version; going down drops the fields of the versions it leaves.
+// To 2 drops the v3 field default_branch_omitted, so a repository still
+// waiting to adopt the upstream's default branch keeps its current one.
+// To 1 also drops the four v2 fields and sets sync_pending on
 // every lane whose pull claim is set, so v1 boot recovery of any release
 // restarts that pull. It also sets sync_pending for every unfinished sync
 // create, which v1 then completes with its first sync, and refuses with
@@ -99,8 +106,8 @@ const s3walConvertAttempts = 16
 // Re-running on a document at the target version writes nothing.
 func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int, opts S3WALConvertOptions) (S3WALMetaConversion, error) {
 	assertf(cs != nil, "ConvertS3WALMeta: nil conditional store")
-	if to != s3walMetaV1 && to != s3walMetaV2 {
-		return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: target version %d unsupported (want 1 or 2)", to)
+	if !slices.Contains(s3walConvertVersions, to) {
+		return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: target version %d unsupported (want %s)", to, wantVersions(s3walConvertVersions))
 	}
 	for attempt := 0; attempt < s3walConvertAttempts; attempt++ {
 		// The caller cancels ctx when its fence (the lease) is lost:
@@ -115,7 +122,7 @@ func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int, op
 		if err != nil {
 			return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: read: %w", err)
 		}
-		src, err := decodeS3WALMetaDocVersion(obj.Body, s3walMetaV1, s3walMetaV2)
+		src, err := decodeS3WALMetaDocVersion(obj.Body, s3walConvertVersions...)
 		if err != nil {
 			return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: %w", err)
 		}
@@ -162,7 +169,7 @@ func ConvertS3WALMeta(ctx context.Context, cs s3wal.ConditionalStore, to int, op
 			if rerr != nil {
 				return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: write: %w (recovery read failed: %v)", werr, rerr)
 			}
-			doc, derr := decodeS3WALMetaDocVersion(fresh.Body, s3walMetaV1, s3walMetaV2)
+			doc, derr := decodeS3WALMetaDocVersion(fresh.Body, s3walConvertVersions...)
 			if derr != nil {
 				return S3WALMetaConversion{}, fmt.Errorf("s3walmeta convert: recovery read: %w", derr)
 			}
@@ -188,16 +195,21 @@ type s3walPendingCreates struct {
 	blocked  []S3WALPendingCreate
 }
 
-// convertS3WALMetaDoc decodes body (v1 or v2) fresh and applies the ADR-51
+// convertS3WALMetaDoc decodes body (any version) fresh and applies the ADR-51
 // conversion to version to. Decoding fresh keeps the result from aliasing
 // any snapshot the caller compares against.
 func convertS3WALMetaDoc(body []byte, to int) (*s3walMetaDoc, s3walPendingCreates, error) {
 	var pending s3walPendingCreates
-	doc, err := decodeS3WALMetaDocVersion(body, s3walMetaV1, s3walMetaV2)
+	doc, err := decodeS3WALMetaDocVersion(body, s3walConvertVersions...)
 	if err != nil {
 		return nil, pending, fmt.Errorf("s3walmeta convert: %w", err)
 	}
 	doc.V = to
+	if to < s3walMetaV3 {
+		for _, u := range doc.Upstreams {
+			u.DefaultBranchOmitted = false
+		}
+	}
 	if to == s3walMetaV1 {
 		for id, r := range doc.Repos {
 			if r.DeletedAt == 0 && CreateState(r.CreateState) == CreateStatePending {
