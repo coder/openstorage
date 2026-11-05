@@ -249,6 +249,75 @@ func TestRepoPurgeSeams(t *testing.T) {
 	})
 }
 
+// TestReplacePacksPurgeFence: a repack fold that uploaded its pack before
+// the purge fenced the repository must not register it afterwards — a
+// purge-aware sweep treats a fenced repo's unregistered blobs as permanent
+// garbage and may already have reaped the fold's bytes. The refused fold
+// changes nothing; the unfenced control repo still folds.
+func TestReplacePacksPurgeFence(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ps, ok := s.(purgeStore)
+		if !ok {
+			t.Fatalf("store %T lacks purge seams", s)
+		}
+		ctx := context.Background()
+		base := t.Name()
+		other := base + "-other"
+		packsOf := func(repo string) []Pack {
+			return []Pack{
+				{ID: "a", Key: "packs/" + repo + "/pack-a.pack", Size: 10},
+				{ID: "b", Key: "packs/" + repo + "/pack-b.pack", Size: 20},
+			}
+		}
+		foldOf := func(repo string) Pack {
+			return Pack{ID: "fold", Key: "packs/" + repo + "/pack-fold.pack", Size: 25}
+		}
+		for _, repo := range []string{base, base + "+import", other} {
+			if err := s.RegisterPacks(ctx, repo, packsOf(repo)); err != nil {
+				t.Fatalf("RegisterPacks(%s): %v", repo, err)
+			}
+		}
+		if err := ps.FenceRepoPurge(ctx, base); err != nil {
+			t.Fatalf("FenceRepoPurge: %v", err)
+		}
+
+		for _, repo := range []string{base, base + "+import"} {
+			ledgerBefore := ledgerState(t, s, purgeGroupOf(base))
+			genBefore, err := s.GetGeneration(ctx, repo)
+			if err != nil {
+				t.Fatalf("GetGeneration(%s): %v", repo, err)
+			}
+			won, err := s.ReplacePacks(ctx, repo, packsOf(repo), foldOf(repo))
+			if won || !errors.Is(err, ErrRepoPurged) {
+				t.Fatalf("ReplacePacks(fenced %s) = (%v, %v), want ErrRepoPurged", repo, won, err)
+			}
+			packs, err := s.ListPacks(ctx, repo)
+			if err != nil || len(packs) != 2 || packs[0].ID != "a" || packs[1].ID != "b" {
+				t.Fatalf("packs of %s after refused fold: %v err=%v (want a, b)", repo, packs, err)
+			}
+			if has, err := s.HasPack(ctx, repo, foldOf(repo).Key); err != nil || has {
+				t.Fatalf("fold row of %s registered: has=%v err=%v", repo, has, err)
+			}
+			if retained, err := s.IsRetainedPack(ctx, repo, packsOf(repo)[0].Key); err != nil || retained {
+				t.Fatalf("old row of %s retained by refused fold: %v err=%v", repo, retained, err)
+			}
+			if got := ledgerState(t, s, purgeGroupOf(base)); got != ledgerBefore {
+				t.Fatalf("ledger moved by refused fold of %s: %+v -> %+v", repo, ledgerBefore, got)
+			}
+			if gen, err := s.GetGeneration(ctx, repo); err != nil || gen != genBefore {
+				t.Fatalf("generation of %s moved by refused fold: %d -> %d err=%v", repo, genBefore, gen, err)
+			}
+		}
+
+		if won, err := s.ReplacePacks(ctx, other, packsOf(other), foldOf(other)); err != nil || !won {
+			t.Fatalf("control ReplacePacks = (%v, %v), want won", won, err)
+		}
+		if packs, err := s.ListPacks(ctx, other); err != nil || len(packs) != 1 || packs[0].ID != "fold" {
+			t.Fatalf("control packs after fold: %v err=%v (want fold)", packs, err)
+		}
+	})
+}
+
 func ledgerState(t *testing.T, s Store, group []string) PackQuotaLedgerState {
 	t.Helper()
 	state, err := s.QuotaLedgerState(context.Background(), group, time.Hour)
