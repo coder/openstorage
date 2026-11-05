@@ -15,6 +15,7 @@ CONSTANTS
     Writers,           \* git pushes; each writes the ref once
     QuietWriters,      \* git pushes that record no intent (forward denied, sync loopback)
     RestWriters,       \* REST writes in serve; each writes the ref once
+    QuietRestWriters,  \* REST writes that record no intent (forward denied)
     Runners,           \* push runs (any process); a runner runs one at a time
     ApiCalls,          \* explicit push-upstream calls: a subset of {"plain", "force"}
     MaxRetries,        \* MaxPushTransientRetries, scaled down
@@ -29,7 +30,7 @@ CONSTANTS
     StealInheritsForce, RunPassesForce, WaitBeforeSnapshot, ShutdownRestores
 
 ASSUME ApiCalls \subseteq {"plain", "force"}
-ASSUME QuietWriters \subseteq Writers
+ASSUME QuietWriters \subseteq Writers /\ QuietRestWriters \subseteq RestWriters
 ASSUME MaxRetries \in Nat /\ MaxOutages \in Nat /\ MaxFaults \in Nat
 
 NoOne == "none"
@@ -166,22 +167,25 @@ WCrash(w) ==
 -----------------------------------------------------------------------------
 (* REST writes: an internal/api handler's CASRef through events.RefStore   *)
 (* changes the authority only (no hold, no cache update), then emitPush    *)
-(* records the intent through the serve queue's EnqueuePush.               *)
+(* records the intent through the serve queue's EnqueuePush, unless the    *)
+(* caller may not forward (forwardDeniedFromContext).                      *)
 
 RCas(x) ==
     /\ restState[x] = "idle"
     /\ authority' = authority + 1
     /\ restVer' = [restVer EXCEPT ![x] = authority + 1]
     /\ restState' = [restState EXCEPT ![x] = "cas"]
-    /\ owed' = authority + 1
+    /\ owed' = IF x \in QuietRestWriters THEN owed ELSE authority + 1
     /\ UNCHANGED <<cacheRef, hold, wState, wVer, rowVars, runVars, envVars,
                    forceOwed, explicitOwed, spent, rewound, hammered>>
 
 RMark(x) ==
     /\ restState[x] = "cas"
-    /\ pending' = Max(pending, 1)
     /\ restState' = [restState EXCEPT ![x] = "done"]
-    /\ spent' = FALSE
+    /\ IF x \in QuietRestWriters
+       THEN UNCHANGED <<pending, spent>>
+       ELSE /\ pending' = Max(pending, 1)
+            /\ spent' = FALSE
     /\ UNCHANGED <<authority, cacheRef, hold, wState, wVer, restVer, due, attempt, claim,
                    runVars, envVars, forceOwed, explicitOwed, rewound, hammered, owed>>
 
@@ -417,6 +421,10 @@ ExplicitNotDelayed == explicitOwed => due = "zero"
 \* A retry or restore waits out its delay unless an explicit request came
 \* during the run: the claim time in push_due tells the two apart.
 BackoffKept == ~hammered
+
+\* Versions grow in write order, and every write descends from the one before.
+\* A rewrite (a force-updated branch, a replaced tag) is out of scope: its plain
+\* forward fails as FailRejected with a failed event, by design.
 
 \* The upstream ref never moves backwards.
 NoRewind == ~rewound
