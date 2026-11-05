@@ -108,6 +108,9 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if code, ok := nodeHelperMain(m); ok {
+		os.Exit(code)
+	}
 	if os.Getenv("OPENSTORAGE_TEST_UPGRADE") != "" {
 		os.Exit(upgradeTestMain(m))
 	}
