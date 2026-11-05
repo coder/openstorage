@@ -66,11 +66,16 @@ osv() {
 
 case_begin() { CASE=$1 WHY=''; }
 case_end() {
-	if [[ -n $WHY ]]; then printf 'FAIL %s: %s\n' "$CASE" "$WHY"; nfail=$((nfail + 1)); else printf 'PASS %s\n' "$CASE"; npass=$((npass + 1)); fi
+	if [[ -n $WHY ]]; then
+		printf 'FAIL %s: %s\n' "$CASE" "$WHY"
+		nfail=$((nfail + 1))
+		[[ -z ${TEST_VERBOSE-} ]] || tail -n 5 "$T/out" | sed 's/^/     | /'
+	else printf 'PASS %s\n' "$CASE"; npass=$((npass + 1)); fi
 }
 # want <what> <command...>: record <what> in WHY when the command fails.
 want() { local what=$1; shift; "$@" >/dev/null 2>&1 || WHY+="${WHY:+; }$what"; }
-rc_is() { [[ $RC == "$1" ]]; }
+# want_rc <code> [what]: record the exit status of the last osv call when it differs.
+want_rc() { [[ $RC == "$1" ]] || WHY+="${WHY:+; }${2:+$2 }exit $1 (got $RC)"; }
 out_has() { grep -q -- "$1" "$T/out"; }
 # raw_count <dir>: files under <dir> that hold the fake token or its Basic form or the secret.
 raw_count() { grep -rlsF -e "$TOK" -e "$TOKB64" -e "$SECV" "$1" | wc -l | tr -d ' '; }
@@ -85,7 +90,7 @@ new_victim() { printf '%s\n' "$VICTIM_TEXT" >"$1"; }
 case_begin "cleanup copies and redacts when nothing is planted"
 mkrun control
 osv cleanup "$RUN"
-want "exit 0" rc_is 0
+want_rc 0
 want "work/ deleted" test ! -e "$RUN/work"
 for f in serve.stdout.log serve.stderr.log serve-b.stdout.log serve-b.stderr.log; do
 	want "$f redacted" redacted "$EVID/$f"
@@ -115,7 +120,7 @@ for kind in symlink dangling; do
 	for t in $targets; do rm "$EVID/$t"; done
 	osv cleanup "$RUN"
 	case_begin "$kind: rerun after removing the links finishes"
-	want "exit 0" rc_is 0
+	want_rc 0
 	want "work/ deleted" test ! -e "$RUN/work"
 	want "no raw value left" test "$(raw_count "$EVID")" = 0
 	want "serve.stdout.log redacted" redacted "$EVID/serve.stdout.log"
@@ -127,7 +132,7 @@ mkrun partial
 new_victim "$T/victim-partial"
 ln -s "$T/victim-partial" "$EVID/serve.stdout.log"
 osv cleanup "$RUN"
-want "exit 1" rc_is 1
+want_rc 1
 want "victim unchanged" victim_ok "$T/victim-partial"
 for f in serve.stderr.log serve-b.stdout.log serve-b.stderr.log; do
 	want "$f copied and redacted" redacted "$EVID/$f"
@@ -142,7 +147,7 @@ mkrun hardlink
 printf '%s %s\n' "$VICTIM_TEXT" "$TOK" >"$T/victim-hl"
 ln "$T/victim-hl" "$EVID/serve.stderr.log"
 osv cleanup "$RUN"
-want "exit 1" rc_is 1
+want_rc 1
 want "victim keeps its bytes, token included" test "$(<"$T/victim-hl")" = "$VICTIM_TEXT $TOK"
 want "redaction names the hard link" out_has "more than one hard link"
 case_end
@@ -151,7 +156,7 @@ case_begin "directory at evidence/state.env is refused"
 mkrun dirtarget
 mkdir "$EVID/state.env"
 osv cleanup "$RUN"
-want "exit 1" rc_is 1
+want_rc 1
 want "work/ kept" test -d "$RUN/work"
 case_end
 
@@ -159,7 +164,7 @@ case_begin "FIFO at evidence/tokens.txt is refused without a hang"
 mkrun fifo
 mkfifo "$EVID/tokens.txt"
 osv cleanup "$RUN"
-want "exit 1 (124 means a hang)" rc_is 1
+want_rc 1
 case_end
 
 case_begin "symlink at work/serve.err (a copy source) is refused"
@@ -168,7 +173,7 @@ new_victim "$T/victim-src"
 rm "$RUN/work/serve.err"
 ln -s "$T/victim-src" "$RUN/work/serve.err"
 osv cleanup "$RUN"
-want "exit 1" rc_is 1
+want_rc 1
 want "nothing copied from the link" test ! -e "$EVID/serve.stderr.log"
 case_end
 
@@ -177,7 +182,7 @@ mkrun evsym
 mkdir "$T/elsewhere"
 rmdir "$EVID" && ln -s "$T/elsewhere" "$EVID"
 osv cleanup "$RUN"
-want "exit 1" rc_is 1
+want_rc 1
 want "nothing written through the link" test -z "$(ls -A "$T/elsewhere")"
 case_end
 
@@ -205,13 +210,22 @@ for cmd in api git; do
 	done
 done
 
-case_begin "stop refuses a symlink at evidence/doctor.txt"
+case_begin "stop refuses a symlink at evidence/doctor.txt before it stops the node"
 mkrun docsym
 new_victim "$T/victim-doc"
 ln -s "$T/victim-doc" "$EVID/doctor.txt"
+mkdir -p "$RUN/work/bin"
+cp "$(command -v bash)" "$RUN/work/bin/openstorage"
+mkfifo "$RUN/work/hold"
+"$RUN/work/bin/openstorage" -c 'read -t 120 x' <>"$RUN/work/hold" &
+fakepid=$!
+echo "$fakepid" >"$RUN/work/serve.pid"
 osv stop "$RUN" a
 want "non-zero exit" test "$RC" != 0
 want "victim unchanged" victim_ok "$T/victim-doc"
+want "the node was not stopped" kill -0 "$fakepid"
+kill "$fakepid" 2>/dev/null
+wait "$fakepid" 2>/dev/null
 case_end
 
 # label files: api, git, and eq create them empty first and refuse a planted link
@@ -239,7 +253,7 @@ done
 case_begin "container log is copied and redacted, and the container is removed"
 mkrun fleet fleet
 osv cleanup "$RUN"
-want "exit 0" rc_is 0
+want_rc 0
 want "container removed" test -e "$RUN/docker/removed"
 want "log redacted" redacted "$EVID/container-postgres-${FAKEID:0:12}.log"
 want "no raw value left" test "$(raw_count "$EVID")" = 0
@@ -250,13 +264,13 @@ mkrun fleetsym fleet
 new_victim "$T/victim-ct"
 ln -s "$T/victim-ct" "$EVID/container-postgres-${FAKEID:0:12}.log"
 osv cleanup "$RUN"
-want "exit 1" rc_is 1
+want_rc 1
 want "victim unchanged" victim_ok "$T/victim-ct"
 want "container still removed" test -e "$RUN/docker/removed"
 want "staged log kept in work/" test -n "$(find "$RUN/work/tmp" -name "container-postgres-${FAKEID:0:12}.log" -size +0)"
 rm "$EVID/container-postgres-${FAKEID:0:12}.log"
 osv cleanup "$RUN"
-want "rerun exit 0" rc_is 0
+want_rc 0 rerun
 want "rerun saves the log redacted" redacted "$EVID/container-postgres-${FAKEID:0:12}.log"
 case_end
 
@@ -265,7 +279,7 @@ mkrun fleetstage fleet
 new_victim "$T/victim-stage"
 ln -s "$T/victim-stage" "$RUN/work/tmp/container-postgres-${FAKEID:0:12}.log"
 osv cleanup "$RUN"
-want "exit 0" rc_is 0
+want_rc 0
 want "victim unchanged" victim_ok "$T/victim-stage"
 want "log redacted in the evidence" redacted "$EVID/container-postgres-${FAKEID:0:12}.log"
 case_end
@@ -287,14 +301,14 @@ if unreadable_works; then
 	printf 'file %s\n' "$TOK" >"$EVID/lockeddir/f.txt"
 	chmod 000 "$EVID/lockeddir"
 	osv cleanup "$RUN"
-	want "exit 1" rc_is 1
+	want_rc 1
 	want "message counts 5 paths" out_has '5 evidence path(s) could not be redacted'
 	want "work/ kept" test -d "$RUN/work"
 	want "every readable file redacted" test "$(raw_count "$EVID")" = 0
 	chmod 600 "$EVID"/locked?.txt
 	chmod 700 "$EVID/lockeddir"
 	osv cleanup "$RUN"
-	want "rerun exit 0" rc_is 0
+	want_rc 0 rerun
 	want "rerun redacts the formerly locked files" test "$(raw_count "$EVID")" = 0
 	case_end
 
@@ -304,13 +318,13 @@ if unreadable_works; then
 	printf '%s' pgvalue-0123456789 >"$RUN/work/secrets/pg"
 	chmod 000 "$RUN/work/secrets/pg"
 	osv cleanup "$RUN"
-	want "exit 1" rc_is 1
+	want_rc 1
 	want "message names work/secrets/pg" out_has "work/secrets/pg"
 	want "token and s3 secret redacted anyway" test "$(raw_count "$EVID")" = 0
 	want "work/ kept" test -d "$RUN/work"
 	chmod 600 "$RUN/work/secrets/pg"
 	osv cleanup "$RUN"
-	want "rerun exit 0" rc_is 0
+	want_rc 0 rerun
 	case_end
 else
 	skip "unreadable evidence paths do not stop the walk" "running as root reads every file"
@@ -323,7 +337,7 @@ new_victim "$T/victim-key"
 ln -s "$T/victim-key" "$RUN/work/secrets/pg"
 printf 'extra %s\n' "$VICTIM_TEXT" >"$EVID/extra.txt"
 osv cleanup "$RUN"
-want "exit 1" rc_is 1
+want_rc 1
 want "link target text not replaced" grep -qF "$VICTIM_TEXT" "$EVID/extra.txt"
 want "victim unchanged" victim_ok "$T/victim-key"
 case_end

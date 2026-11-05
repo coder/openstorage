@@ -534,6 +534,8 @@ cmd_stop() {
 	[[ $2 == a || $OSV_MODE == fleet ]] || die "node b exists only in a run launched with --fleet"
 	local pidfile=$WORK/serve.pid
 	[[ $2 == a ]] || pidfile=$WORK/serve-b.pid
+	# Refuse an unusable doctor.txt before the stop, not after it.
+	evidence_put - "$EVID/doctor.txt" -a </dev/null
 	LEFT=''
 	stop_serve "$pidfile"
 	[[ -z $LEFT ]] || die "node $2: processes still alive:$LEFT"
