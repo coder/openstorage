@@ -564,6 +564,17 @@ func (s *Sweeper) quarantinePurgeAge() time.Duration {
 	return max(s.cfg.Threshold, QuarantinePurgeFloor)
 }
 
+// healEntryTimeout bounds one quarantine heal entry, from its registry read
+// to its purge. A backup is purged once it is older than quarantinePurgeAge,
+// and the purge is safe only when no write that began before the backup's
+// handshake can register after this entry's registry read (the model's
+// HealEntryBounded fact). Without a bound, a stalled blob call could let that
+// read go stale for as long as the whole sweep ran. The bound is one
+// restore copy, which sweepRecoveryTimeout already sizes for the largest
+// supported packs, and it must leave QuarantinePurgeFloor room for the two
+// phases of a handshake (2×sweepRecoveryTimeout) besides.
+const healEntryTimeout = sweepRecoveryTimeout
+
 // registered dispatches the authoritative membership lookup by key class:
 // lfs/ keys consult the LFS registry (issue #51), everything else the pack
 // registry. Keys are self-describing (disjoint prefixes), so no class needs
@@ -1293,6 +1304,8 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge
 // healQuarantineEntry disposes of one quarantine backup per the
 // healQuarantine contract.
 func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, report *SweepReport, purgeAll, purgeFenced bool) error {
+	ctx, cancel := context.WithTimeout(ctx, healEntryTimeout)
+	defer cancel()
 	orig, ok := parseQuarantineKey(q.Key)
 	var repo string
 	if ok {

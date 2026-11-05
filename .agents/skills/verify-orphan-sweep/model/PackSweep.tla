@@ -26,7 +26,7 @@
 (*    OPENSTORAGE_SWEEP_AGE_THRESHOLD, so the model checks a strictly more *)
 (*    aggressive sweeper.                                                  *)
 (*  - Time enters only as "a quarantine backup reaches purge age"          *)
-(*    (AgeBackup), gated by the code facts and the timing assumptions.     *)
+(*    (AgeBackup), gated by the code facts and the timing assumption.      *)
 (*  - Delete mode is on: OPENSTORAGE_SWEEP_DELETE_ENABLED, or a retained   *)
 (*    superseded record (OPENSTORAGE_SWEEP_DELETE_SUPERSEDED, default on). *)
 (*    Quota covers, LFS keys and truncated blobs are out of scope.         *)
@@ -72,21 +72,24 @@ CONSTANTS
         \* handshake still runs.
     PurgeAgeCoversThreshold,
         \* quarantinePurgeAge = max(s.cfg.Threshold, QuarantinePurgeFloor).
+    HealEntryBounded,
+        \* healQuarantineEntry runs under context.WithTimeout(ctx,
+        \* healEntryTimeout) from its first statement, and healEntryTimeout
+        \* + 2 x sweepRecoveryTimeout <= QuarantinePurgeFloor. So a heal
+        \* gets from its registry read to its age gate within
+        \* healEntryTimeout (15 min). In the model: a backup does not reach
+        \* purge age while a heal visits it.
 
-    \* Timing assumptions. The code does not enforce either one.
-    WritesFinishWithinThreshold,
+    \* Timing assumption. The code does not enforce it.
+    WritesFinishWithinThreshold
         \* A write that is in flight when a backup is copied, or when its
         \* handshake deletes K, finishes before that backup reaches purge
         \* age. The delete runs at most sweepRecoveryTimeout (15 min) after
         \* the copy, so this holds when every write finishes within
-        \* quarantinePurgeAge minus 15 min, minus the HealEntryIsQuick
-        \* bound. SweepConfig.Threshold documents the stronger rule that the
+        \* quarantinePurgeAge minus 15 min, minus healEntryTimeout (15
+        \* min). SweepConfig.Threshold documents the stronger rule that the
         \* threshold "must comfortably exceed the longest possible
         \* push/import duration"; no code enforces either.
-    HealEntryIsQuick
-        \* healQuarantineEntry runs from its registry read to its age gate
-        \* within the margin above. No deadline bounds it. In the model: a
-        \* backup does not reach purge age while a heal visits it.
 
 ASSUME NoNonce \notin Nonces
 ASSUME MaxFaults \in Nat /\ MaxFolds \in Nat
@@ -388,14 +391,14 @@ Fold ==
 \* Backup n passes quarantinePurgeAge. PurgeFloorCoversHandshake: not while
 \* the handshake that wrote it still runs. The threshold assumption plus
 \* PurgeAgeCoversThreshold: not while a writer that was in flight at its
-\* copy or delete still runs. HealEntryIsQuick: not while a heal visits it.
+\* copy or delete still runs. HealEntryBounded: not while a heal visits it.
 AgeBackup(n) ==
     /\ backup[n] = "fresh"
     /\ PurgeFloorCoversHandshake =>
          ~\E s \in Sweepers : hs[s] = n /\ spc[s] \in Handshake
     /\ (WritesFinishWithinThreshold /\ PurgeAgeCoversThreshold) =>
          \A w \in witness[n] : ~InFlight(w)
-    /\ HealEntryIsQuick =>
+    /\ HealEntryBounded =>
          ~\E s \in Sweepers : cur[s] = n /\ spc[s] \in HealVisit
     /\ backup' = [backup EXCEPT ![n] = "aged"]
     /\ UNCHANGED <<present, registered, witness, faults, folds, writerVars,

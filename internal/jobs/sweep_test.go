@@ -1096,6 +1096,78 @@ func TestSweep_HealToleratesPeerPurgedBackup(t *testing.T) {
 	}
 }
 
+// deadlineCalls records the time left on the context of each call a heal
+// entry makes, by call name.
+type deadlineCalls struct {
+	left map[string]time.Duration
+}
+
+func (d *deadlineCalls) record(call string, ctx context.Context) {
+	d.left[call] = timeLeft(ctx)
+}
+
+type deadlineBlobs struct {
+	blob.BlobStore
+	calls *deadlineCalls
+}
+
+func (b *deadlineBlobs) Stat(ctx context.Context, key string) (int64, error) {
+	b.calls.record("Stat", ctx)
+	return b.BlobStore.Stat(ctx, key)
+}
+
+func (b *deadlineBlobs) Copy(ctx context.Context, dst, src string) error {
+	b.calls.record("Copy", ctx)
+	return b.BlobStore.Copy(ctx, dst, src)
+}
+
+func (b *deadlineBlobs) Delete(ctx context.Context, key string) error {
+	b.calls.record("Delete", ctx)
+	return b.BlobStore.Delete(ctx, key)
+}
+
+type deadlinePacks struct {
+	PackRegistry
+	calls *deadlineCalls
+}
+
+func (p *deadlinePacks) HasPack(ctx context.Context, repo, key string) (bool, error) {
+	p.calls.record("HasPack", ctx)
+	return p.PackRegistry.HasPack(ctx, repo, key)
+}
+
+// A quarantine heal entry runs from its registry read to its purge under its
+// own deadline, even when the sweep's context has none: the quarantine purge
+// age model needs a stalled entry to end well before the smallest margin.
+func TestSweep_HealEntryRunsUnderItsOwnDeadline(t *testing.T) {
+	f := newSweepFixture(t)
+	lost := blob.PackKey("r1", "lost")
+	qKey := quarantinePrefix + "00112233aabbccdd/" + lost
+	f.upload(qKey, "lost-bytes")
+	f.register("r1", "lost", lost) // registered, original missing: restore, then purge the aged backup
+
+	calls := &deadlineCalls{left: map[string]time.Duration{}}
+	s := NewSweeper(&deadlineBlobs{BlobStore: f.blobs, calls: calls}, &deadlinePacks{PackRegistry: f.store, calls: calls},
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	entry := blob.ListedObject{Key: qKey, Size: int64(len("lost-bytes")), ModTime: time.Now().Add(-25 * time.Hour)}
+	if err := s.healQuarantineEntry(context.Background(), entry, &SweepReport{}, true, false); err != nil {
+		t.Fatalf("healQuarantineEntry: %v", err)
+	}
+	if !f.exists(lost) || f.exists(qKey) {
+		t.Fatalf("heal did not restore %q and purge its aged backup (original exists %v, backup exists %v)", lost, f.exists(lost), f.exists(qKey))
+	}
+	for _, call := range []string{"HasPack", "Stat", "Copy", "Delete"} {
+		got, ok := calls.left[call]
+		if !ok {
+			t.Errorf("heal entry never called %s", call)
+			continue
+		}
+		if got > healEntryTimeout || got < healEntryTimeout-time.Minute {
+			t.Errorf("%s ran with %v left, want about the %v entry deadline", call, got, healEntryTimeout)
+		}
+	}
+}
+
 // ambiguousDelete executes deletes of the target key for real but reports
 // failure — the "delete executed, response lost" class (simtest's
 // FaultAmbiguous on blob.Delete).

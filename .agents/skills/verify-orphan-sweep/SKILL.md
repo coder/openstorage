@@ -15,7 +15,7 @@ The orphan sweeper deletes unregistered pack bytes. It races every pack writer: 
 | `NoWaitForHeal` | While nothing crashes, a registered pack is missing only while the write or the sweeper handshake that puts it back is still running. | Clones and reads fail for up to one sweep interval (`OPENSTORAGE_SWEEP_INTERVAL`, default 1 h) after a race the code claims to repair on the spot. |
 | `BytesComeBack` | A registered pack with missing bytes gets them back. | Same as `NoLostPack`, through a repair that never happens. |
 
-`NoWaitForHeal` is the claim in the `Sweeper.sweep` doc comment: "the recheck and the writer verify jointly cover every interleaving with no timing assumptions". `NoTiming.cfg` checks it with both timing assumptions off.
+`NoWaitForHeal` is the claim in the `Sweeper.sweep` doc comment: "the recheck and the writer verify jointly cover every interleaving with no timing assumptions". `NoTiming.cfg` checks it with the timing assumption off and `HealEntryBounded` pinned FALSE.
 
 ## When to run it
 
@@ -41,7 +41,7 @@ A clean run ends like this:
 ```text
 == Code facts (HEAD 5620494c)
    WriterVerifies             TRUE
-   ... (9 facts, all TRUE)
+   ... (10 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/orphan-sweep-check.Ab12Cd)
    PackSweep.cfg               PASS (3950676 distinct states)
    NoTiming.cfg                PASS (6636617 distinct states)
@@ -64,7 +64,7 @@ RESULT: PASS
 
 The model (`model/PackSweep.tla`) is a hand-written description of the code. Two things tie it to the code:
 
-1. **Code facts.** `facts/facts.go` parses the Go source and checks 9 guards by call order. check.sh writes each one into the TLC config as a constant. When you remove or reorder a guard, its fact turns FALSE and the model takes the broken branch, so TLC finds the bug. The facts:
+1. **Code facts.** `facts/facts.go` parses the Go source and checks 10 guards by call order. check.sh writes each one into the TLC config as a constant. When you remove or reorder a guard, its fact turns FALSE and the model takes the broken branch, so TLC finds the bug. The facts:
 
    | Fact | Guard in the code | Property that fails without it |
    |---|---|---|
@@ -76,6 +76,7 @@ The model (`model/PackSweep.tla`) is a hand-written description of the code. Two
    | `HealRestores` | `healQuarantineEntry` calls `restoreFromQuarantine` before its purge | `NoLostPack`, `BytesComeBack` |
    | `PurgeAgeGated` | `healQuarantineEntry` returns early when the backup is younger than `s.quarantinePurgeAge()` | all three |
    | `PurgeFloorCoversHandshake` | `QuarantinePurgeFloor = N * sweepRecoveryTimeout` with N >= 2, and `safeDelete` bounds two phases with `context.WithTimeout(..., sweepRecoveryTimeout)` | all three |
+   | `HealEntryBounded` | `healQuarantineEntry` starts with `ctx, cancel := context.WithTimeout(ctx, healEntryTimeout)`, and `healEntryTimeout` plus 2 x `sweepRecoveryTimeout` fits in `QuarantinePurgeFloor` | `NoLostPack`, `BytesComeBack` |
    | `PurgeAgeCoversThreshold` | `quarantinePurgeAge` returns `max(s.cfg.Threshold, QuarantinePurgeFloor)` | `NoLostPack`, `BytesComeBack` |
 
    The "property that fails" column is measured: each guard was broken once in the real code, and check.sh failed with that property (see [Validation](#validation)).
@@ -125,11 +126,10 @@ When check.sh says STALE, or when you change covered code on purpose:
 - A quarantine backup's ModTime is close to the end of its copy. On AWS S3 a multipart copy (packs over 5 GiB) gets the start time of the upload, and the copy runs on the sweep's context. A copy that takes longer than the purge floor's spare time (about 30 min) can let a backup reach purge age while its handshake still runs. This was not tested against S3.
 - Pack keys are content-addressed, so every writer and every restore puts identical bytes under a key.
 - Live processes keep taking steps, and faults are bounded (for `BytesComeBack`).
-- Two timing assumptions that the code does not enforce. `NoLostPack` and `BytesComeBack` need both. `NoWaitForHeal` needs neither.
-  - `WritesFinishWithinThreshold`: a write that is in flight when a sweeper copies or deletes a blob finishes before that backup reaches purge age (`max(OPENSTORAGE_SWEEP_AGE_THRESHOLD, 1 h)`). The delete runs at most 15 min after the copy, so this holds when every write finishes within the purge age minus 15 min. `SweepConfig.Threshold` documents a stronger rule: the threshold "must comfortably exceed the longest possible push/import duration".
-  - `HealEntryIsQuick`: `healQuarantineEntry` gets from its registry read to its age gate within that same margin. In local mode (`StartSweepTicker`) no deadline bounds the sweep. In PostgreSQL mode the sweep is a River job, and its pass ends after 2 hours (`passJobTimeout` in `internal/jobs/river.go`). That bound keeps a heal entry within the margin only when the purge age is more than 2 h 15 min. The default threshold of 24 h gives a margin of 23 h 45 min. With a threshold of 2 h 15 min or less, the PostgreSQL bound does not enforce the assumption. Between the two steps the entry makes blob calls on the sweep's context, such as `Stat` and a restore copy when the original is missing (read from code, not run).
+- One timing assumption that the code does not enforce: `WritesFinishWithinThreshold`. `NoLostPack` and `BytesComeBack` need it. `NoWaitForHeal` does not. A write that is in flight when a sweeper copies or deletes a blob finishes before that backup reaches purge age (`max(OPENSTORAGE_SWEEP_AGE_THRESHOLD, 1 h)`). The delete runs at most 15 min after the copy, and a heal entry runs at most `healEntryTimeout` (15 min) from its registry read to its age gate, so this holds when every write finishes within the purge age minus 30 min. `SweepConfig.Threshold` documents a stronger rule: the threshold "must comfortably exceed the longest possible push/import duration".
+- The heal entry bound is a code fact, not an assumption: `HealEntryBounded`. Every entry, in PostgreSQL mode and in local mode, runs under its own `healEntryTimeout`, which is one restore copy and does not depend on the sweep's context or on `passJobTimeout`. The entry's blob calls, such as `Stat` and a restore copy when the original is missing, share that deadline. An entry that hits it fails with a deadline error and the next sweep visits it again.
 
-**Probes:** `NoThresholdAssumption.cfg` and `SlowHealEntry.cfg` each drop one timing assumption, and `NoLostPack` must then fail. Both fail on the same path: a write finds an old orphan blob present and adopts it, a sweeper quarantines and deletes the blob, the write's `RegisterPacks` commits, the write dies before `EnsurePublished`, and a heal that read the registry before the registration purges the aged backup. The registered pack then has no bytes anywhere. If a probe starts passing, the code or the model changed. Review it before you update this file.
+**Probes:** `NoThresholdAssumption.cfg` drops the timing assumption. `SlowHealEntry.cfg` pins the `HealEntryBounded` fact to FALSE, as if `healQuarantineEntry` had no deadline. Each configuration drops one timing guarantee, and `NoLostPack` must then fail. Both fail on the same path: a write finds an old orphan blob present and adopts it, a sweeper quarantines and deletes the blob, the write's `RegisterPacks` commits, the write dies before `EnsurePublished`, and a heal that read the registry before the registration purges the aged backup. The registered pack then has no bytes anywhere. If a probe starts passing, the code or the model changed. Review it before you update this file.
 
 **Simplifications:** each one gives the model at least the behaviors of the code, or the same outcome:
 
@@ -167,7 +167,7 @@ Sync commit: `5620494ca88650825618a0bbb731000ee586bb8f` (the last commit at whic
 
 | File | Covered code |
 |---|---|
-| `internal/jobs/sweep.go` | `Sweeper.sweep`, `classify`, `revalidateOrphan`, `freshModTime`, `registered`, `safeDelete`, `restoreFromQuarantine`, `healQuarantine`, `healQuarantineEntry`, `healPresentOriginal`, `quarantinePurgeAge`, `quarantineKey`, `const QuarantinePurgeFloor`, `const sweepRecoveryTimeout` |
+| `internal/jobs/sweep.go` | `Sweeper.sweep`, `classify`, `revalidateOrphan`, `freshModTime`, `registered`, `safeDelete`, `restoreFromQuarantine`, `healQuarantine`, `healQuarantineEntry`, `healPresentOriginal`, `quarantinePurgeAge`, `quarantineKey`, `const QuarantinePurgeFloor`, `const sweepRecoveryTimeout`, `const healEntryTimeout` |
 | `internal/blob/blob.go` | `EnsurePublished` |
 | `internal/githttp/hook.go` | `preReceive`, from `published := ...` through the `EnsurePublished` loop |
 | `internal/api/publish.go` | `server.publishPack` |
@@ -182,7 +182,7 @@ Sync commit: `5620494ca88650825618a0bbb731000ee586bb8f` (the last commit at whic
 | `check.sh` | The one command: facts, TLC runs, fingerprints, `--record`, and the TLC-free `--fingerprints-only` that CI runs. |
 | `facts/facts.go` | Reads the code facts and fingerprints from the Go source (standard library only; the dot directory keeps it out of `./...`). |
 | `model/PackSweep.tla` | The model. |
-| `model/PackSweep.cfg`, `NoTiming.cfg`, `Liveness.cfg` | Property configs; each must pass. |
+| `model/PackSweep.cfg`, `NoTiming.cfg`, `Liveness.cfg` | Property configs; each must pass. A config may pin a fact (`NoTiming.cfg` pins `HealEntryBounded`); check.sh adds the other facts from the code. |
 | `model/NoThresholdAssumption.cfg`, `SlowHealEntry.cfg` | Probes; each must fail `NoLostPack`. |
 | `model/view.mjs` | State and step labels for the pstack `/statechart` skill (optional; not part of this repo). |
 | `model/fingerprints.txt` | Fingerprints at the sync commit. |

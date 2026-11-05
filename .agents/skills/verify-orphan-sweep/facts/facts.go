@@ -389,6 +389,22 @@ func main() {
 	pf.need(timeouts >= 2, "safeDelete bounds two phases with context.WithTimeout(..., sweepRecoveryTimeout) (found %d)", timeouts)
 	facts = append(facts, pf)
 
+	// HealEntryBounded: healQuarantineEntry's first statement bounds the
+	// whole entry, from its registry read to its purge, and the bound leaves
+	// the purge floor room for the handshake's two phases besides.
+	hb := newFact("HealEntryBounded")
+	first0 := ""
+	if len(healEntry.Body.List) > 0 {
+		first0 = sweep.text(healEntry.Body.List[0])
+	}
+	hb.need(first0 == "ctx, cancel := context.WithTimeout(ctx, healEntryTimeout)",
+		"healQuarantineEntry starts with ctx, cancel := context.WithTimeout(ctx, healEntryTimeout) (found %q)", first0)
+	healUnits := constUnits(sweep, "healEntryTimeout", "sweepRecoveryTimeout")
+	floorUnits := constUnits(sweep, "QuarantinePurgeFloor", "sweepRecoveryTimeout")
+	hb.need(healUnits >= 1 && healUnits+2 <= floorUnits,
+		"healEntryTimeout + 2 x sweepRecoveryTimeout <= QuarantinePurgeFloor (healEntryTimeout is %d x, the floor %d x sweepRecoveryTimeout)", healUnits, floorUnits)
+	facts = append(facts, hb)
+
 	// PurgeAgeCoversThreshold: return max(s.cfg.Threshold, QuarantinePurgeFloor).
 	pt := newFact("PurgeAgeCoversThreshold")
 	ret := ""
@@ -425,6 +441,7 @@ func main() {
 		cover{sweep, "internal/jobs/sweep.go:quarantineKey", sweep.fn("", "quarantineKey")},
 		cover{sweep, "internal/jobs/sweep.go:const QuarantinePurgeFloor", constSpec(sweep, "QuarantinePurgeFloor")},
 		cover{sweep, "internal/jobs/sweep.go:const sweepRecoveryTimeout", constSpec(sweep, "sweepRecoveryTimeout")},
+		cover{sweep, "internal/jobs/sweep.go:const healEntryTimeout", constSpec(sweep, "healEntryTimeout")},
 		cover{blobGo, "internal/blob/blob.go:EnsurePublished", ensure},
 		cover{publish, "internal/api/publish.go:server.publishPack", publishPack},
 		cover{repack, "internal/jobs/repack.go:Repacker.repack", repack.fn("Repacker", "repack")},
@@ -479,6 +496,21 @@ func constMultiplier(s *source, name, unit string) int {
 		return 0
 	}
 	return n
+}
+
+// constUnits returns N for `const name = N * unit`, 1 for `const name = unit`,
+// or 0.
+func constUnits(s *source, name, unit string) int {
+	if n := constMultiplier(s, name, unit); n > 0 {
+		return n
+	}
+	v := constSpec(s, name).(*ast.ValueSpec)
+	if len(v.Values) == 1 {
+		if id, ok := v.Values[0].(*ast.Ident); ok && id.Name == unit {
+			return 1
+		}
+	}
+	return 0
 }
 
 func publicationBlock(s *source, f *ast.FuncDecl) (token.Pos, token.Pos) {

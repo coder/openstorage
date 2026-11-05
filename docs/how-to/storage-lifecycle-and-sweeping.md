@@ -325,8 +325,12 @@ A sweep never hard-deletes directly:
   bytes or provably re-publishes them.
 
 Quarantine backups are purged only while a destructive mode is on, and only once older
-than `max(age threshold, 1h)`; a low age threshold does not shorten the 1h floor. A
-backup is also kept while its original cannot be verified complete:
+than `max(age threshold, 1h)`; a low age threshold does not shorten the 1h floor. A push
+that started before a backup was written must finish and register at least 30 minutes
+before the backup reaches that age: a delete handshake takes up to 15 minutes, and the
+heal examines each backup under its own 15-minute deadline. An entry that overruns the
+deadline fails, and the next sweep visits it again. The 24h default leaves hours of
+room. A backup is also kept while its original cannot be verified complete:
 
 - Pack rows registered before the size column existed (`bytes=0`) keep their backups
   until a repack fold records a size (logged as
