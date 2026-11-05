@@ -320,9 +320,10 @@ func (e laneScanEnv) lockJob(t *testing.T, ctx context.Context, repoID string) (
 	return func() { _ = tx.Rollback(ctx) }
 }
 
-// TestRiverLaneScanResumesAfterTimeout: a pass that runs out of time ends
-// within laneScanTimeout and keeps its cursor, and the next pass continues
-// after the last lane it handled instead of starting over.
+// TestRiverLaneScanResumesAfterTimeout: a pass that handled lanes until
+// laneScanTimeout ends with errScanOutOfTime and keeps its cursor, and the
+// next pass continues after the last lane it handled instead of starting
+// over. A pass that handled no lane in that time reports a plain deadline.
 func TestRiverLaneScanResumesAfterTimeout(t *testing.T) {
 	ctx := context.Background()
 	env := newLaneScanEnv(t, ctx)
@@ -333,7 +334,7 @@ func TestRiverLaneScanResumesAfterTimeout(t *testing.T) {
 	defer q.Close()
 	q.logger = slog.New(slog.DiscardHandler)
 	prev := laneScanTimeout
-	laneScanTimeout = time.Second
+	laneScanTimeout = 2 * time.Second // below laneRequeueTimeout: a blocked lane ends the pass
 	t.Cleanup(func() { laneScanTimeout = prev })
 
 	a, b, c := env.laneTrio(t, ctx)
@@ -345,34 +346,41 @@ func TestRiverLaneScanResumesAfterTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn2.Close(context.Background()) })
-	releaseB := env.lockJob(t, ctx, b) // b's insert waits: the pass times out there
+	releaseB := env.lockJob(t, ctx, b) // b's insert waits: passes time out there
 
-	type pass struct {
+	type result struct {
 		requeued int
 		err      error
 	}
-	done := make(chan pass, 1)
-	go func() {
-		n, err := q.scanLanes(ctx, "org")
-		done <- pass{n, err}
-	}()
-	var first pass
-	select {
-	case first = <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("the pass waited at b past laneScanTimeout")
+	pass := func(what string) result {
+		t.Helper()
+		done := make(chan result, 1)
+		go func() {
+			n, err := q.scanLanes(ctx, "org")
+			done <- result{n, err}
+		}()
+		select {
+		case r := <-done:
+			return r
+		case <-time.After(20 * time.Second):
+			t.Fatalf("%s pass waited past laneScanTimeout", what)
+			return result{}
+		}
 	}
-	if !errors.Is(first.err, context.DeadlineExceeded) || first.requeued != 1 || q.scanCursor != a {
-		t.Fatalf("first pass = %d requeued, cursor %q, err %v; want a's job, then a timeout at b with the cursor at a",
-			first.requeued, q.scanCursor, first.err)
+	if r := pass("first"); !errors.Is(r.err, errScanOutOfTime) || r.requeued != 1 || q.scanCursor != a {
+		t.Fatalf("first pass = %d requeued, cursor %q, err %v; want a's job, then errScanOutOfTime at b with the cursor at a",
+			r.requeued, q.scanCursor, r.err)
+	}
+	if r := pass("stuck"); errors.Is(r.err, errScanOutOfTime) || !errors.Is(r.err, context.DeadlineExceeded) || r.requeued != 0 || q.scanCursor != a {
+		t.Fatalf("stuck pass = %d requeued, cursor %q, err %v; want a plain deadline with no lane handled and the cursor kept at a",
+			r.requeued, q.scanCursor, r.err)
 	}
 	// A pass that started over would now wait at a.
 	releaseA := laneScanEnv{conn: conn2}.lockJob(t, ctx, a)
 	defer releaseA()
 	releaseB()
-	requeued, err := q.scanLanes(ctx, "org")
-	if err != nil || requeued != 1 || q.scanCursor != "" {
-		t.Fatalf("second pass = %d requeued, cursor %q, err %v; want c's job and a full traversal", requeued, q.scanCursor, err)
+	if r := pass("resumed"); r.err != nil || r.requeued != 1 || q.scanCursor != "" {
+		t.Fatalf("resumed pass = %d requeued, cursor %q, err %v; want c's job and a full traversal", r.requeued, q.scanCursor, r.err)
 	}
 	if n := env.liveJobs(t, ctx, "upstream_push", c); n != 1 {
 		t.Fatalf("c has %d live push jobs, want 1", n)
@@ -387,23 +395,26 @@ func TestRiverLaneScanResumesAfterTimeout(t *testing.T) {
 	}
 }
 
-// TestRiverLaneScanSkipsFailingLane: a lane whose requeue fails does not
-// stop the pass. The lanes after it still get their jobs.
+// TestRiverLaneScanSkipsFailingLane: a lane whose requeue waits on a
+// locked job row past laneRequeueTimeout fails alone. The pass goes on,
+// and the lanes after it still get their jobs.
 func TestRiverLaneScanSkipsFailingLane(t *testing.T) {
 	ctx := context.Background()
 	env := newLaneScanEnv(t, ctx)
-	// Every statement of this client gives up on a lock after half a second.
-	q, err := NewRiverInsertOnly(ctx, env.pgURL+"&options=-c%20lock_timeout%3D500")
+	q, err := NewRiverInsertOnly(ctx, env.pgURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer q.Close()
 	q.logger = slog.New(slog.DiscardHandler)
+	if laneScanTimeout <= 2*laneRequeueTimeout {
+		t.Fatalf("laneScanTimeout %v leaves no room for a failed lane of %v", laneScanTimeout, laneRequeueTimeout)
+	}
 	a, b, c := env.laneTrio(t, ctx)
 	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: b}); err != nil {
 		t.Fatal(err)
 	}
-	defer env.lockJob(t, ctx, b)() // b's requeue fails on the lock
+	defer env.lockJob(t, ctx, b)() // b's requeue times out on the lock
 
 	requeued, err := q.scanLanes(ctx, "org")
 	if err != nil || requeued != 2 || q.scanCursor != "" {
@@ -455,26 +466,25 @@ func TestRiverLaneScanRunsStrandedLanes(t *testing.T) {
 
 	// DrainSyncRuns stops the scan, and so does Close of a River that never
 	// drained.
-	scanStops := func(what string, q *River) {
+	stops := func(what string, q *River, stop func()) {
 		t.Helper()
 		stopped := make(chan struct{})
 		go func() {
+			stop()
 			q.scanning.Wait()
 			close(stopped)
 		}()
 		select {
 		case <-stopped:
-		case <-time.After(10 * time.Second):
+		case <-time.After(15 * time.Second):
 			t.Fatalf("%s left the lane scan running", what)
 		}
 	}
-	q.DrainSyncRuns(ctx, time.Second)
-	scanStops("DrainSyncRuns", q)
+	stops("DrainSyncRuns", q, func() { q.DrainSyncRuns(ctx, time.Second) })
 	closed, err := NewRiver(ctx, env.pgURL, deliverer, noRun, push, ups, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
 	closed.StartLaneScan("org", time.Hour, time.Hour)
-	closed.Close()
-	scanStops("Close", closed)
+	stops("Close", closed, closed.Close)
 }

@@ -37,8 +37,15 @@ var laneScanPage = 1000
 // lane it handled.
 var laneScanTimeout = 30 * time.Second
 
+// laneRequeueTimeout bounds one lane's requeue. An insert that waits on a
+// locked job row then fails, and the pass goes on to the next lane.
+const laneRequeueTimeout = 5 * time.Second
+
 // errLaneCovered rolls back a scan insert that the lane does not need.
 var errLaneCovered = errors.New("lane covered")
+
+// errScanOutOfTime ends a pass that handled lanes until laneScanTimeout.
+var errScanOutOfTime = errors.New("lane scan pass ran out of time")
 
 // StartLaneScan scans org's lanes (scanLanes) after delay and then every
 // interval, until DrainSyncRuns or Close stops it.
@@ -61,7 +68,7 @@ func (q *River) StartLaneScan(org string, delay, interval time.Duration) {
 			_, err := q.scanLanes(ctx, org)
 			switch {
 			case ctx.Err() != nil:
-			case errors.Is(err, context.DeadlineExceeded):
+			case errors.Is(err, errScanOutOfTime):
 				// Expected while many lanes need a job: the next pass
 				// continues from the cursor.
 				q.logger.Info("lane scan: pass ran out of time", "timeout", laneScanTimeout)
@@ -90,12 +97,25 @@ func (q *River) stopLaneScan() {
 // it lists pages of lanes with work (meta.PGListLaneWork) and requeues
 // each lane's job (requeueLane). It moves q.scanCursor past each lane it
 // handled, back to "" after a full traversal, and returns how many jobs it
-// inserted. A pass that ran out of time returns context.DeadlineExceeded.
-func (q *River) scanLanes(ctx context.Context, org string) (int, error) {
+// inserted. A pass that handled lanes until laneScanTimeout returns
+// errScanOutOfTime. One that handled none in that time returns an error
+// that wraps context.DeadlineExceeded: the database or its list query is
+// too slow.
+func (q *River) scanLanes(parent context.Context, org string) (int, error) {
 	assertf(org != "", "scanLanes: empty org")
-	ctx, cancel := context.WithTimeout(ctx, laneScanTimeout)
+	ctx, cancel := context.WithTimeout(parent, laneScanTimeout)
 	defer cancel()
-	requeued := 0
+	requeued, moved := 0, false
+	outOfTime := func() (int, error) {
+		switch {
+		case parent.Err() != nil:
+			return requeued, parent.Err()
+		case moved:
+			return requeued, errScanOutOfTime
+		default:
+			return requeued, fmt.Errorf("lane scan handled no lane in %v: %w", laneScanTimeout, ctx.Err())
+		}
+	}
 	for {
 		var page []meta.LocalWork
 		if err := pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
@@ -104,7 +124,7 @@ func (q *River) scanLanes(ctx context.Context, org string) (int, error) {
 			return err
 		}); err != nil {
 			if ctx.Err() != nil {
-				return requeued, ctx.Err()
+				return outOfTime()
 			}
 			return requeued, err
 		}
@@ -115,7 +135,7 @@ func (q *River) scanLanes(ctx context.Context, org string) (int, error) {
 				}
 				inserted, err := q.requeueLane(ctx, org, w.RepoID, push)
 				if ctx.Err() != nil {
-					return requeued, ctx.Err()
+					return outOfTime()
 				}
 				if err != nil {
 					// The next traversal tries this lane again; the
@@ -126,7 +146,7 @@ func (q *River) scanLanes(ctx context.Context, org string) (int, error) {
 					requeued++
 				}
 			}
-			q.scanCursor = w.RepoID
+			q.scanCursor, moved = w.RepoID, true
 		}
 		if len(page) < laneScanPage {
 			q.scanCursor = ""
@@ -152,6 +172,8 @@ func (q *River) requeueLane(ctx context.Context, org, repoID string, push bool) 
 	if push {
 		lane, args = "push", pushArgs{Org: org, RepoID: repoID}
 	}
+	ctx, cancel := context.WithTimeout(ctx, laneRequeueTimeout)
+	defer cancel()
 	err := pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
 		res, err := q.client.InsertTx(ctx, tx, args, nil)
 		if err != nil {
