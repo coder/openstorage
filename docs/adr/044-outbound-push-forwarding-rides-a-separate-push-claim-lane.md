@@ -145,6 +145,21 @@ marker survives restarts via boot recovery). Permanent failures (auth,
 config, rejected refs) emit `repo.sync.failed` and stop — hammering a 401
 is abuse-shaped, and a rejected non-fast-forward needs a human decision.
 
+**Amendment: PostgreSQL records the intent with the ref.** The poke runs
+after the ref CAS commits, and River's job rescue covers only jobs that
+exist, so a hook or serve process that died between the CAS and
+`RequestPush`, or a failed `RequestPush` or enqueue, lost the forward
+until the next trigger. On PostgreSQL the CAS transaction now writes the
+intent itself: for a write that the poke would forward, it raises
+`push_pending` and inserts the River push job before COMMIT (metadata and
+refs share one database). The poke still runs afterwards and only
+duplicates the intent. The hook's job also exists before receive-pack
+publishes the cache ref, so a River push run waits for the repository's
+publication on its own node (holds are per node, and its loopback fetch
+reads that node's cache) after its claim, as local runs do. A failed wait
+restores the request (`RestorePush`), and the job's completion gate
+snoozes it.
+
 **Egress.** The push targets exactly the `CloneURL` the inbound fetch
 already dials — a host validated at link time (`validUpstreamHost`,
 provider defaults) — under the same hermetic git environment and
