@@ -130,6 +130,7 @@ func (sweepArgs) Kind() string { return "orphan_pack_sweep" }
 
 func (sweepArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
+		Queue:       sweepQueue,
 		MaxAttempts: 1,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs: true,
@@ -154,6 +155,7 @@ func (lfsReclaimArgs) Kind() string { return "lfs_reclaim" }
 
 func (lfsReclaimArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
+		Queue:       lfsReclaimQueue,
 		MaxAttempts: 1,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs: true,
@@ -168,6 +170,11 @@ func (lfsReclaimArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+// errScheduleOff fails a sweep or LFS reclaim job that reached a replica with
+// that schedule off. Only a job an older binary inserted on the default queue
+// can: since the passes got their own queues, a replica fetches such a queue
+// only when its schedule is on (NewRiver). River discards the job because its
+// MaxAttempts is 1, so a rolling upgrade can lose one tick.
 var errScheduleOff = errors.New("jobs: this replica has the pass schedule off")
 
 type lfsReclaimWorker struct {
@@ -192,10 +199,19 @@ func (w *lfsReclaimWorker) Work(ctx context.Context, _ *river.Job[lfsReclaimArgs
 // attacker-controlled endpoints that can hold each attempt for its full
 // timeout, delaying a default-queue renewal past the cover TTL. A
 // reserved queue bounds renewal latency by the job's own runtime (the
-// TTL/4 pass cap), not by tenant traffic. The sweep/reclaim jobs stay on
-// the default queue deliberately: starving them delays convergence, never
-// a safety property.
+// TTL/4 pass cap), not by tenant traffic.
 const absenceQueue = "absence_reconcile"
+
+// sweepQueue and lfsReclaimQueue are the single-worker queues of the sweep
+// and LFS reclaim jobs. A replica registers a queue only when its schedule
+// is on (NewRiver), so a replica with the schedule off never fetches such a
+// job. On the shared default queue it did, returned errScheduleOff, and
+// River discarded the job (MaxAttempts 1): the tick was lost. Each job is
+// unique, so a second worker would stay idle.
+const (
+	sweepQueue      = "orphan_pack_sweep"
+	lfsReclaimQueue = "lfs_reclaim"
+)
 
 // absenceReconcileArgs is one scheduled registry-vs-storage absence
 // reconciliation pass (issue #101), unique across the active states like
@@ -835,7 +851,8 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	// The pass workers register even with their schedule off: the leader
 	// rescues a running job by its worker's Timeout, and it discards a kind
 	// it has no worker for once RescueStuckJobsAfter passes, while another
-	// replica can still be running that pass.
+	// replica can still be running that pass. Registering a worker does not
+	// fetch its jobs: that takes the kind's queue, added below.
 	river.AddWorker(workers, &sweepWorker{schedule: sweep})
 	river.AddWorker(workers, &lfsReclaimWorker{schedule: lfsReclaim})
 	river.AddWorker(workers, &absenceReconcileWorker{schedule: absence})
@@ -873,6 +890,12 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		))
 	}
 	queues := map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 8}}
+	if sweep != nil {
+		queues[sweepQueue] = river.QueueConfig{MaxWorkers: 1}
+	}
+	if lfsReclaim != nil {
+		queues[lfsReclaimQueue] = river.QueueConfig{MaxWorkers: 1}
+	}
 	if absence != nil {
 		// Reserved queue — see absenceQueue: cover renewal is TTL-coupled
 		// and must not wait behind tenant-scalable default-queue work.

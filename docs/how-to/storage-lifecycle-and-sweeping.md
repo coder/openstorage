@@ -243,6 +243,13 @@ Blobs with no registry row older than
 [`OPENSTORAGE_SWEEP_AGE_THRESHOLD`](../reference/configuration.md#openstorage_sweep_age_threshold)
 (default 24h) are orphan candidates.
 
+On PostgreSQL the sweep is a River job on its own single-worker queue, `orphan_pack_sweep`.
+A replica works that queue only while its sweep schedule is on, so a replica with
+`OPENSTORAGE_SWEEP_INTERVAL=0` never fetches a sweep that another replica queued. During
+a rolling upgrade, a sweep that an older replica queued on the default queue can still
+reach a replica with the schedule off. That replica fails it and River discards it, and
+the next interval runs the sweep again.
+
 Independent flags control what a sweep may *do*:
 
 | Mode | Default | Acts on |
@@ -408,6 +415,11 @@ namespace group. It runs every
    [`OPENSTORAGE_LFS_GC_GRACE`](../reference/configuration.md#openstorage_lfs_gc_grace).
 5. Refunds the freed object slots and quota bytes on a later run, once a destructive LFS
    sweep that **started after** the retirement completes cleanly.
+
+On PostgreSQL the job runs on its own single-worker River queue, `lfs_reclaim`, which only
+replicas with `OPENSTORAGE_LFS_GC_INTERVAL` set work. A replica with the job off never
+fetches a run that another replica queued. The rolling-upgrade note under
+[the orphan sweeper](#the-orphan-sweeper) applies here too.
 
 A `507`-wedged repository accepts new objects again once enough junk rows retire and a
 covering sweep settles their refunds.
