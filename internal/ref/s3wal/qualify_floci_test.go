@@ -190,12 +190,13 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
 	const name = "get-under-overwrite"
 	const (
-		raceWindow = 15 * time.Second
-		opTimeout  = 2 * time.Second
-		readers    = 2
-		minReads   = 50 // below this a "pass" would be too weak to record
-		minWrites  = 50 // verified A↔B version transitions needed to have exercised the race at all
-		maxLogged  = 3  // read errors quoted in the verdict detail (issue #566)
+		raceWindow      = 15 * time.Second
+		opTimeout       = 2 * time.Second
+		readers         = 2
+		minReads        = 50  // below this a "pass" would be too weak to record
+		minWrites       = 50  // verified A↔B version transitions needed to have exercised the race at all
+		maxLogged       = 3   // read errors quoted in the verdict detail (issue #566)
+		maxReadFailures = 256 // failed reads kept for classification; the rest count as unexplained
 	)
 	opts := e.raw.Options()
 	opts.HTTPClient = awshttp.NewBuildableClient()
@@ -307,34 +308,38 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 			}
 		}
 	}()
-	// The first few read errors go into the verdict detail, so an
-	// inconclusive run shows whether a GET hit the op deadline, a reset
-	// connection, or a framing error (issue #566).
-	var errLogMu sync.Mutex
-	var errLog []string
+	// Failed reads are kept (up to maxReadFailures) and classified once the
+	// race is over, when the heartbeat has recorded every stall of the test
+	// process (issue #566).
+	var failuresMu sync.Mutex
+	var failures []readFailure
+	stopStalls := watchStalls()
+	defer stopStalls()
 	raceStart := time.Now()
-	readersDone := make(chan struct{}, readers)
+	readersDone := make(chan time.Duration, readers) // each reader's slowest successful GET
 	for range readers {
 		go func() {
-			defer func() { readersDone <- struct{}{} }()
+			var slowest time.Duration
+			defer func() { readersDone <- slowest }()
 			for raceCtx.Err() == nil {
 				opStart := time.Now()
 				opCtx, cancel := context.WithTimeout(raceCtx, opTimeout)
 				body, etag, err := getWithETag(opCtx, client, e.bucket, key)
 				cancel()
+				opEnd := time.Now()
 				if err != nil {
 					if raceCtx.Err() == nil {
 						readErrs.Add(1)
-						errLogMu.Lock()
-						if len(errLog) < maxLogged {
-							errLog = append(errLog, fmt.Sprintf("{at=+%s elapsed=%s opTimeout=%s err=%q}",
-								opStart.Sub(raceStart).Round(time.Millisecond), time.Since(opStart).Round(time.Millisecond), opTimeout, err.Error()))
+						failuresMu.Lock()
+						if len(failures) < maxReadFailures {
+							failures = append(failures, readFailure{start: opStart, end: opEnd, err: err})
 						}
-						errLogMu.Unlock()
+						failuresMu.Unlock()
 					}
 					continue
 				}
 				reads.Add(1)
+				slowest = max(slowest, opEnd.Sub(opStart))
 				want, whole := etagOf[string(body)]
 				switch {
 				case !whole:
@@ -353,34 +358,48 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	}
 	stopRace()
 	<-writerDone
+	var maxRead time.Duration
 	for range readers {
-		<-readersDone
+		maxRead = max(maxRead, <-readersDone)
 	}
 
-	detail := fmt.Sprintf("reads=%d tornBody=%d tornMeta=%d readErrs=%d writeOKs=%d writeErrs=%d metaCheck=%t window=%s",
-		reads.Load(), tornBody.Load(), tornMeta.Load(), readErrs.Load(), writeOKs.Load(), writeErrs.Load(), metaCheck, raceWindow)
-	// Every reader has exited, so errLog is no longer written.
-	assertf(int64(len(errLog)) == min(readErrs.Load(), maxLogged), "logged %d read errors, counted %d", len(errLog), readErrs.Load())
-	if len(errLog) > 0 {
-		detail += fmt.Sprintf(" firstReadErrs(%d of %d)=%s", len(errLog), readErrs.Load(), strings.Join(errLog, " "))
+	// Every reader has exited, so failures is no longer written.
+	spans := stopStalls()
+	explained := int64(0)
+	var quoted []string
+	for _, f := range failures {
+		stalled := explainedByStall(f, spans, opTimeout)
+		if stalled {
+			explained++
+		}
+		if len(quoted) < maxLogged {
+			quoted = append(quoted, fmt.Sprintf("{at=+%s elapsed=%s awake=%s class=%s explainedByStall=%t err=%q}",
+				f.start.Sub(raceStart).Round(time.Millisecond), f.elapsed().Round(time.Millisecond),
+				(f.elapsed()-f.stalledFor(spans)).Round(time.Millisecond), readErrClass(f.err), stalled, f.err.Error()))
+		}
+	}
+	assertf(int64(len(failures)) == min(readErrs.Load(), maxReadFailures), "kept %d read failures, counted %d", len(failures), readErrs.Load())
+	detail := fmt.Sprintf("reads=%d tornBody=%d tornMeta=%d readErrs=%d stallErrs=%d writeOKs=%d writeErrs=%d metaCheck=%t window=%s maxRead=%s maxStall=%s",
+		reads.Load(), tornBody.Load(), tornMeta.Load(), readErrs.Load(), explained, writeOKs.Load(), writeErrs.Load(), metaCheck, raceWindow,
+		maxRead.Round(time.Millisecond), longestStall(spans).Round(time.Millisecond))
+	if len(quoted) > 0 {
+		detail += fmt.Sprintf(" firstReadErrs(%d of %d)=%s", len(quoted), readErrs.Load(), strings.Join(quoted, " "))
 	}
 	switch {
 	case tornBody.Load() > 0:
 		return []verdict{{name, verdictMishandles, "torn body: a racing GET returned bytes of neither whole version — " + detail}}
 	case tornMeta.Load() > 0:
 		return []verdict{{name, verdictMishandles, "torn metadata: a racing GET returned one whole version with the other version's ETag — " + detail}}
-	case readErrs.Load() > 0:
+	case readErrs.Load() > explained:
 		// Framing corruption can surface as failed reads rather than a
 		// classifiable torn body (a short-for-Content-Length response
 		// blocks until the op deadline; a poisoned keep-alive breaks the
-		// next request). Without a classified tear those failures make the
-		// probe inconclusive — never a clean pass. Reading firstReadErrs
-		// (issue #566): "read body after headers (n of Content-Length m)"
-		// with n < m is the framing shape, and a non-zero StatusCode is
-		// a Floci error reply. A 2.5 s pause of the Floci container gave a
-		// deadline error with elapsed≈opTimeout on both readers plus a
-		// writeErr. A 2.5 s SIGSTOP of the test process gave elapsed above
-		// opTimeout, or no error at all.
+		// next request). A read failure counts as runner noise only when
+		// the test process itself stopped for it (explainedByStall). Any
+		// other failure makes the probe inconclusive, never a clean pass.
+		// firstReadErrs names the class of the first few (issue #566):
+		// "short-body" is the framing shape, "reset" a closed connection,
+		// and "deadline" with a long awake time a Floci or network stall.
 		return []verdict{{name, verdictError, "racing GETs failed without a classifiable torn read — inconclusive (possible framing corruption) — " + detail}}
 	case reads.Load() < minReads || writeOKs.Load() < minWrites:
 		return []verdict{{name, verdictError, "too few successful reads/overwrites to have exercised the race — " + detail}}
