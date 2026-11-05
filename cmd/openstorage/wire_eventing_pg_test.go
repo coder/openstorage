@@ -15,6 +15,7 @@ import (
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
+	"github.com/coder/openstorage/internal/testutil/pgfault"
 	"github.com/coder/openstorage/internal/testutil/testimages"
 )
 
@@ -357,5 +358,104 @@ func TestHookRecordsNoForwardForSyncLoopbackPush(t *testing.T) {
 				t.Fatalf("push jobs %d, push_pending %d; want %d and %d", jobs, up.PushPending, tc.want, tc.want)
 			}
 		})
+	}
+}
+
+// TestServeSkipsPokeAfterLostCommitReply: the CAS of a forward_on_push
+// repository commits its forward intent, the COMMIT reply is lost, and a
+// run claims the new job before the CAS learns the outcome. The CAS must
+// report the win that its transaction committed, and the decorator's sync
+// poke must see that the transaction recorded the forward and must not mark
+// the level again: that would schedule a second forward run.
+func TestServeSkipsPokeAfterLostCommitReply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs docker")
+	}
+	ctx := t.Context()
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
+		tcpostgres.WithDatabase("postgres"),
+		tcpostgres.WithUsername("postgres"),
+		tcpostgres.WithPassword("postgres"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+	t.Cleanup(func() { _ = pgC.Terminate(context.Background()) })
+	dbURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := meta.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ms.Close)
+	if err := ms.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	proxy, proxied := pgfault.Start(t, dbURL)
+	rs, err := ref.OpenPG(ctx, proxied) // the ref store's connections run through the proxy
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rs.Close)
+	if err := rs.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key, pub, err := newLoopbackKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const org = "org"
+	if _, err := ms.UpsertOrgWithKeys(ctx, org, []string{pub}); err != nil {
+		t.Fatal(err)
+	}
+	_, decorate, cleanup, err := buildServeEventing(ctx, ms, dbURL, org, "http://127.0.0.1:1", t.TempDir(), key,
+		nil, nil, nil, nil, false, syncEgressSettings{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cleanup)
+	repo, err := ms.CreateRepo(ctx, org, "https://example.com/lost-commit-reply.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.SetRepoUpstream(ctx, meta.RepoUpstream{
+		RepoID: repo.RepoID, Provider: "github", Owner: "up", Name: "mirror",
+		UpstreamHost: "https://example.invalid", ForwardOnPush: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A run takes the new job between the commit and the recovery.
+	claimed := make(chan error, 1)
+	proxy.Arm(pgfault.DropReply, func() {
+		_, ok, _, _, err := ms.TryBeginPush(context.Background(), repo.RepoID, "run-1", time.Hour)
+		if err == nil && !ok {
+			err = fmt.Errorf("the push lane was not claimable")
+		}
+		claimed <- err
+	})
+
+	cctx := auth.WithClaims(ctx, &auth.Claims{Iss: org, Sub: auth.SubjectLiteral, Repo: repo.URL,
+		Scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite}})
+	const sha = "1111111111111111111111111111111111111111"
+	if won, err := decorate(rs).CASRef(cctx, repo.RepoID, "refs/heads/main", ref.ZeroSHA, sha); err != nil || !won {
+		t.Fatalf("CASRef = %v, %v; want a win recovered after the lost COMMIT reply", won, err)
+	}
+	select {
+	case err := <-claimed:
+		if err != nil {
+			t.Fatalf("claim after the commit: %v", err)
+		}
+	default:
+		t.Fatal("the COMMIT reply was never dropped")
+	}
+	up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.PushPending != 0 || !up.PushSyncing {
+		t.Fatalf("the poke re-marked a forward the committed CAS recorded: %+v", up)
 	}
 }
