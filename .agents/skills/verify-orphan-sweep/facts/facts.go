@@ -724,7 +724,7 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 		}
 	}
 	swCalls := sweep.calls(sweepFn.Body)
-	hq := first(swCalls, "s.healQuarantine", "purgeMode", false)
+	hq := first(swCalls, "s.healQuarantine", "", false)
 	cl := first(swCalls, "s.classify", "purgeMode", true)
 	sg.need(gpos.IsValid(), "sweep sets purgeMode to false when s.cfg.DeleteGuard(ctx) fails")
 	sg.need(gpos.IsValid() && hq.IsValid() && cl.IsValid() && gpos < hq && gpos < cl,
