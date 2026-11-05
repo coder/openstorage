@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -111,6 +113,25 @@ func TestServeRecordsForwardIntentWithTheCAS(t *testing.T) {
 		return n
 	}
 
+	forwardRepo := func(t *testing.T, name string) meta.Repo {
+		t.Helper()
+		repo, err := ms.CreateRepo(ctx, org, "https://example.com/"+name+".git", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ms.SetRepoUpstream(ctx, meta.RepoUpstream{
+			RepoID: repo.RepoID, Provider: "github", Owner: "up", Name: "mirror",
+			UpstreamHost: "https://example.invalid", ForwardOnPush: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return repo
+	}
+	claims := func(repo meta.Repo, scopes ...string) context.Context {
+		return auth.WithClaims(ctx, &auth.Claims{Iss: org, Sub: auth.SubjectLiteral, Repo: repo.URL, Scopes: scopes})
+	}
+	const sha = "1111111111111111111111111111111111111111"
+
 	for _, tc := range []struct {
 		name     string
 		scopes   []string
@@ -120,19 +141,8 @@ func TestServeRecordsForwardIntentWithTheCAS(t *testing.T) {
 		{"write_only", []string{auth.ScopeGitWrite}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			repo, err := ms.CreateRepo(ctx, org, "https://example.com/"+tc.name+".git", "main")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := ms.SetRepoUpstream(ctx, meta.RepoUpstream{
-				RepoID: repo.RepoID, Provider: "github", Owner: "up", Name: "mirror",
-				UpstreamHost: "https://example.invalid", ForwardOnPush: true,
-			}); err != nil {
-				t.Fatal(err)
-			}
-			cctx := auth.WithClaims(ctx, &auth.Claims{Iss: org, Sub: auth.SubjectLiteral, Repo: repo.URL, Scopes: tc.scopes})
-			sha := "1111111111111111111111111111111111111111"
-			if won, err := store.CASRef(cctx, repo.RepoID, "refs/heads/main", ref.ZeroSHA, sha); won || err == nil {
+			repo := forwardRepo(t, tc.name)
+			if won, err := store.CASRef(claims(repo, tc.scopes...), repo.RepoID, "refs/heads/main", ref.ZeroSHA, sha); won || err == nil {
 				t.Fatalf("CASRef: won=%v err=%v, want the injected death", won, err)
 			}
 			if got, err := rs.GetRef(ctx, repo.RepoID, "refs/heads/main"); err != nil || got != sha {
@@ -150,4 +160,41 @@ func TestServeRecordsForwardIntentWithTheCAS(t *testing.T) {
 			}
 		})
 	}
+
+	// A run that claims the new job before the decorator's sync poke runs
+	// has consumed the intent and snapshots the new ref. The poke must not
+	// mark the level again: that would schedule a second forward run.
+	t.Run("claimed_before_poke", func(t *testing.T) {
+		repo := forwardRepo(t, "claimed-before-poke")
+		st := decorate(claimAfterCAS{RefStore: rs, ms: ms})
+		if won, err := st.CASRef(claims(repo, auth.ScopeGitRead, auth.ScopeGitWrite), repo.RepoID, "refs/heads/main", ref.ZeroSHA, sha); !won || err != nil {
+			t.Fatalf("CASRef: won=%v err=%v", won, err)
+		}
+		up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if up.PushPending != 0 || up.PushRunCount == 0 && !up.PushSyncing {
+			t.Fatalf("the poke re-marked a consumed forward: %+v", up)
+		}
+	})
+}
+
+// claimAfterCAS claims the push lane right after the CAS commits, as a
+// River run that takes the new job at once does. The node's own worker
+// may get there first; either way a run has consumed the intent.
+type claimAfterCAS struct {
+	ref.RefStore
+	ms meta.Backend
+}
+
+func (s claimAfterCAS) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
+	if err != nil || !won {
+		return won, err
+	}
+	if _, _, _, _, err := s.ms.TryBeginPush(ctx, repo, "claimed-before-poke", time.Hour); err != nil {
+		return false, fmt.Errorf("claim after the CAS: %w", err)
+	}
+	return true, nil
 }
