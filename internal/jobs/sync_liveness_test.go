@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/coder/openstorage/internal/events"
@@ -412,6 +413,56 @@ func TestRiverPushFailedFinishKeepsJobUntilClaimExpires(t *testing.T) {
 				t.Errorf("held request not forwarded by one counted run: %+v", up)
 			}
 		})
+	}
+}
+
+// A push job whose repository was deleted completes, even though an
+// earlier run of it left the claim held: RunPush returns ErrRepoGone
+// before it could steal the claim, and the job has nothing left to do.
+func TestRiverPushDeletedRepoCompletesWithClaimHeld(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_gone", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test", ForwardOnPush: true,
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+	var attempts atomic.Int32
+	pushRunner := func(ctx context.Context, job sync.Job) error {
+		if attempts.Add(1) > 1 {
+			return fmt.Errorf("push %s: %w", job.RepoID, sync.ErrRepoGone)
+		}
+		if _, _, _, err := store.BeginPush(ctx, job.RepoID, "push-1", 2*time.Second); err != nil {
+			return err
+		}
+		return errors.New("finish push: database unreachable")
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, pushRunner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+	if err := store.RequestPush(ctx, "repo_gone", false); err != nil {
+		t.Fatalf("RequestPush: %v", err)
+	}
+	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: "repo_gone"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	conn, err := pgx.Connect(ctx, pgURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	waitFor(t, "the deleted repo's job to complete", func() bool {
+		var state string
+		err := conn.QueryRow(ctx, `SELECT state FROM river_job WHERE kind = 'upstream_push'`).Scan(&state)
+		return err == nil && state == "completed"
+	})
+	if n := attempts.Load(); n != 2 {
+		t.Fatalf("%d runs, want the failed run and one that found the repo gone", n)
 	}
 }
 

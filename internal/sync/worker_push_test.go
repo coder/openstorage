@@ -257,6 +257,28 @@ func TestPushRunUnreachableRemarksPending(t *testing.T) {
 	}
 }
 
+// TestPushRunDeletedRepoOnRiverLane: a River push run for a repository
+// deleted while queued returns ErrRepoGone, so its job completes, and
+// touches nothing.
+func TestPushRunDeletedRepoOnRiverLane(t *testing.T) {
+	f := newWorkerFixture(t)
+	f.putUpstream(t, "repo_pg", "own", "proj", "file://"+f.upstreamDir)
+	if err := f.store.RequestPush(context.Background(), "repo_pg", false); err != nil {
+		t.Fatal(err)
+	}
+	f.worker.Repos = func(context.Context, string, string) (RepoInfo, error) { return RepoInfo{}, ErrNotFound }
+	if err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pg"}); !errors.Is(err, ErrRepoGone) {
+		t.Fatalf("RunPush = %v, want ErrRepoGone", err)
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_pg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.PushPending != PushPendingPush || up.PushSyncing || len(f.rec.list()) != 0 {
+		t.Fatalf("deleted repo's run touched the lane: %+v, %d events", up, len(f.rec.list()))
+	}
+}
+
 // TestPushRunWaitsForPublicationOnRiverLane: a River push run (no Local)
 // waits for the push's cache publication after its claim and before its
 // snapshot, the same as a local run.

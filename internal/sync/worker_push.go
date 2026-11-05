@@ -70,6 +70,11 @@ var pushRefspecs = []string{"refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/
 // every few seconds only while `git push` is actually running.
 const defaultDetachPoll = 2 * time.Second
 
+// ErrRepoGone is RunPush's error on the River lane when the repository was
+// deleted while its job was queued. The job has nothing left to do, so its
+// completion gate completes it even if a push claim is still held.
+var ErrRepoGone = errors.New("repository deleted")
+
 // RunPush executes one outbound push-upstream run for job. Lifecycle,
 // abandonment, and event semantics mirror Run: detach cancels silently at
 // every stage, a stolen claim abandons loudly without terminal events, and
@@ -86,7 +91,11 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 
 	repo, err := w.Repos(ctx, job.Org, job.RepoID)
 	if errors.Is(err, ErrNotFound) {
-		return nil // repo deleted while queued: nothing to push or emit
+		// Repo deleted while queued: nothing to push or emit.
+		if w.Local != nil {
+			return nil
+		}
+		return fmt.Errorf("push %s: %w", job.RepoID, ErrRepoGone)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve repo %s: %w", job.RepoID, err)

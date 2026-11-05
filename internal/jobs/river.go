@@ -623,8 +623,10 @@ func pushSnoozeDelay(up sync.Upstream) time.Duration {
 // pushWorker executes one outbound push-upstream run (issue #90). It is
 // syncWorker's mirror on the push_* lane: the run owns outcomes and events,
 // and completion is transactional with a gated successor insert — the
-// swallowed-request coverage argument in syncWorker.Work applies verbatim
-// with RequestPush/BeginPush/push_pending substituted. One addition: a run
+// swallowed-request coverage argument in syncWorker.Work applies with
+// RequestPush/BeginPush/push_pending substituted. Additions: the gate
+// never completes while a push claim is held (it holds a consumed
+// request), except for a deleted repository; and a run
 // that failed TRANSIENTLY (upstream unreachable) re-marked its own pending
 // level (sync.Worker.RunPush), so the gate schedules its successor with the
 // worker-defined exponential backoff and an incremented retry counter
@@ -660,6 +662,9 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 	if errors.Is(runErr, sync.ErrShutdown) {
 		return shutdownSnooze(ctx, w.upstreams, job.Args.RepoID, pushSnoozeDelay, w.logger)
 	}
+	if errors.Is(runErr, sync.ErrRepoGone) {
+		return nil // nothing left to push, whatever claim the row still shows
+	}
 
 	assertf(w.pool != nil, "pushWorker: pool not wired")
 	completionFailed := func(stage string, err error) error {
@@ -688,11 +693,12 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.PushSyncing, "err", runErr)
 		return river.JobSnooze(delay)
 	case up.PushSyncing:
-		// A push claim is still held. Only this job runs the repo's push
-		// lane, so the holder is one of its own runs whose finish or
-		// restore write failed, or that died: the claim holds the request
-		// it consumed, and completing would lose it. The re-run after the
-		// lease steals the claim and its force level.
+		// A push claim is still held, and it holds the request it
+		// consumed: completing would lose it. Push jobs are unique by
+		// repo, so the holder is a run of this job whose finish or restore
+		// write failed or that died, or a run of an older job that an
+		// older binary completed. The re-run after the lease steals the
+		// claim and its force level.
 		delay := pushSnoozeDelay(up)
 		w.logger.Warn("push: claim still held at completion; snoozing until it can be stolen",
 			"repo", job.Args.RepoID, "delay", delay, "err", runErr)
@@ -978,9 +984,9 @@ func (q *River) EnqueuePush(ctx context.Context, job sync.Job) error {
 // tx, the transaction of the ref CAS that accepted the write: the push job
 // and the pending level commit with the ref, or not at all. It reports
 // whether it marked the pending level of a forward_on_push row. A
-// repository that does not forward
-// gets no write; one whose forward_on_push turns off between the read and
-// the update gets only a job, which forwards once.
+// repository that does not forward gets no write; one whose
+// forward_on_push turns off between the read and the update gets only a
+// job, which forwards once.
 //
 // The job comes first. Its insert is EnqueuePush's, deduplicated by repo,
 // and it waits for a push job whose completion transaction holds the row.
