@@ -515,7 +515,9 @@ type syncWorker struct {
 // at all, so completing would strand the accepted request — that case
 // SNOOZES the job to retry the whole run (which then claims and consumes
 // the marker), mirroring the transient-failure retry the completion path
-// already uses.
+// already uses. Nor does the gate complete while a sync claim is held: the
+// claim holds a consumed request that no counted run covers yet. Only a
+// deleted repository's job completes then.
 func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 	// Pre-run baseline: RunCount changing across this job proves a claimed
 	// run completed while it was active. A failed read degrades to
@@ -534,6 +536,9 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 	rctx, done := withShutdown(ctx, w.runs)
 	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref})
 	done()
+	if errors.Is(runErr, sync.ErrRepoGone) {
+		return nil // nothing left to pull, whatever claim the row still shows
+	}
 	if runErr != nil {
 		w.logger.Warn("sync run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
@@ -590,6 +595,19 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 		delay := syncSnoozeDelay(up)
 		w.logger.Warn("sync: uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.Syncing, "err", runErr)
+		return river.JobSnooze(delay)
+	case up.Syncing:
+		// A sync claim is still held, and it holds the request it
+		// consumed (a pull-upstream, or the mirror-back a forward marked):
+		// completing would lose it. Sync jobs are unique by repo, so the
+		// holder is a run of this job that died, whose claim committed but
+		// reported an error, or whose finish write failed, or a run of an
+		// older job that an older binary completed. The re-run after the
+		// lease steals the claim; a lapsed legacy claim waits at legacy
+		// pace for its holder or the steal opt-in.
+		delay := syncSnoozeDelay(up)
+		w.logger.Warn("sync: claim still held at completion; snoozing until it can be stolen",
+			"repo", job.Args.RepoID, "delay", delay, "err", runErr)
 		return river.JobSnooze(delay)
 	case up.SyncPending && (!preKnown || up.RunCount != preRuns):
 		if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx,
@@ -1060,10 +1078,9 @@ const shutdownSnoozeFallback = 30 * time.Minute
 // the gate, so it is not rerun. A
 // restored run left its request pending and no claim; the snooze then
 // matches the gate's own uncovered-pending snooze. A failed restore left
-// the claim held and the request consumed; the sync lane's gate would
-// complete the job (no pending mark), and the request would be lost once
-// the claim expired. The delay therefore waits past any claim on the fresh row, and
-// the next run steals it and does the work. No successor is inserted: this
+// the claim held and the request consumed; the gate snoozes such a job
+// too, and so does this: the delay waits past any claim on the fresh row,
+// and the next run steals it and does the work. No successor is inserted: this
 // job stays the only one for the lane and repo, and its next run's claim
 // covers every request marked before it.
 func shutdownSnooze(ctx context.Context, upstreams sync.UpstreamStore, repoID string,
