@@ -156,10 +156,11 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			}
 			return fmt.Errorf("push %s: %w", job.RepoID, ErrShutdown)
 		}
+		// The drain can cancel the run during this restore, too.
 		if rerr := w.restoreLocal(ctx, job, holder, "push", err, restore); rerr != nil {
-			return rerr
+			return shutdownErr(ctx, rerr)
 		}
-		return fmt.Errorf("push %s: %w", job.RepoID, err)
+		return shutdownErr(ctx, fmt.Errorf("push %s: %w", job.RepoID, err))
 	}
 
 	startedAt := eventTime(time.Now())

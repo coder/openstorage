@@ -687,6 +687,15 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 		w.logger.Warn("push: uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.PushSyncing, "err", runErr)
 		return river.JobSnooze(delay)
+	case runErr != nil && up.PushSyncing && preKnown && up.PushRunCount == preRuns:
+		// A failed run that counted nothing and left a claim held: its
+		// finish or restore write failed, so the claim still holds the
+		// request it consumed. Completing would lose that request. The
+		// re-run after the lease steals the claim and its force level.
+		delay := pushSnoozeDelay(up)
+		w.logger.Warn("push: failed run left its claim held; snoozing until the claim can be stolen",
+			"repo", job.Args.RepoID, "delay", delay, "err", runErr)
+		return river.JobSnooze(delay)
 	default:
 		if up.PushPending != sync.PushPendingNone && (!preKnown || up.PushRunCount != preRuns) {
 			successor := pushArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}
@@ -967,16 +976,18 @@ func (q *River) EnqueuePush(ctx context.Context, job sync.Job) error {
 // RecordForwardTx records a forward_on_push repository's forward intent in
 // tx, the transaction of the ref CAS that accepted the write: the push job
 // and the pending level commit with the ref, or not at all. It reports
-// whether it recorded them; a repository that does not forward gets
-// nothing.
+// whether it raised the pending level. A repository that does not forward
+// gets no write; one whose forward_on_push turns off between the read and
+// the update gets only a job, which forwards once.
 //
 // The job comes first. Its insert is EnqueuePush's, deduplicated by repo,
 // and it waits for a push job whose completion transaction holds the row.
-// That completion reads the upstream row through another pool, so tx must
-// not hold the upstream row while it waits. Either the completion commits
-// first, and the insert joins its successor or adds a new job, or the
-// insert locks the live job first, and the completion waits for tx, reads
-// the new pending level and schedules a successor.
+// That completion then reads the upstream row from the metadata pool. If tx
+// held the upstream row while it waited, writers queued on that row could
+// take every connection of the pool, and neither side could move. Either
+// the completion commits first, and the insert joins its successor or adds
+// a new job, or the insert locks the live job first, and the completion
+// waits for tx, reads the new pending level and schedules a successor.
 func (q *River) RecordForwardTx(ctx context.Context, tx pgx.Tx, job sync.Job) (bool, error) {
 	assertf(job.Org != "" && job.RepoID != "" && job.Retry == 0, "RecordForwardTx: bad job %+v", job)
 	forwards, err := meta.PGForwardsOnPush(ctx, tx, job.RepoID)
