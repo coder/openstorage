@@ -81,6 +81,7 @@ func TestLocalForwardHeldStaleRefRestores(t *testing.T) {
 		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
 			return repo, base == id
 		},
+		StrictSyncFetch: true, // as serve sets it on the local schedule
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)

@@ -78,6 +78,14 @@ type Server struct {
 	// (a pack-count read plus at most one job enqueue) and must never
 	// block on the fold itself. Nil disables triggering.
 	MaybeRepack func(ctx context.Context, repo string)
+	// StrictSyncFetch makes a push run's loopback fetch (an upload-pack
+	// whose token carries a sync claim) fail with 423 Locked when its
+	// hydrate skips a push-held ref that the cache has not caught up
+	// with, instead of serving the stale value for forwarding. The local
+	// schedule (SQLite, S3WAL; ADR-50) sets it: its runs restore their
+	// request on that answer. PostgreSQL runs have no restore and leave it
+	// off.
+	StrictSyncFetch bool
 
 	// repackProbeMu guards the asynchronous post-push repack probe
 	// machinery (see dispatchRepackProbe): repackProbeQueued marks repos
@@ -597,8 +605,14 @@ func serviceScope(service string) string {
 // on the read path (stale advertisement would break clone correctness) but
 // tolerated on the receive path, where a concurrent receive-pack may hold
 // ref locks and git re-validates client old-SHAs itself.
-func (s *Server) hydrate(ctx context.Context, repo, service, defaultBranch string) (string, error) {
-	repoPath, refsErr, err := Hydrate(ctx, s.Store, s.Blob, s.CacheDir, repo, defaultBranch)
+//
+// A push run's loopback fetch (an upload-pack whose token carries a sync
+// claim) hydrates strictly under StrictSyncFetch: a held ref the cache
+// has not caught up with fails it with ErrHeldRefStale.
+func (s *Server) hydrate(ctx context.Context, repo, service, defaultBranch string, claims *auth.Claims) (string, error) {
+	assertf(claims != nil, "hydrate: nil claims")
+	strict := s.StrictSyncFetch && service == "upload-pack" && claims.SyncClaim != ""
+	repoPath, refsErr, err := hydrateRefs(ctx, s.Store, s.Blob, s.CacheDir, repo, defaultBranch, strict)
 	if err != nil {
 		return "", err
 	}
@@ -611,6 +625,18 @@ func (s *Server) hydrate(ctx context.Context, repo, service, defaultBranch strin
 	return repoPath, nil
 }
 
+// hydrateFailed answers a failed hydrate. ErrHeldRefStale is 423 Locked:
+// the push run that asked restores its request and retries once the
+// push that holds the ref has published or exited.
+func hydrateFailed(w http.ResponseWriter, repo string, err error) {
+	log.Printf("hydrate %s: %v", repo, err)
+	if errors.Is(err, ErrHeldRefStale) {
+		httpError(w, http.StatusLocked, "a push holds a ref this fetch would serve stale; retry")
+		return
+	}
+	httpError(w, http.StatusInternalServerError, "hydration failed")
+}
+
 func pktLine(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
 
 func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo string) {
@@ -620,7 +646,8 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 		return
 	}
 	service := strings.TrimPrefix(svcParam, "git-")
-	if _, status, err := s.authenticate(r, repo, serviceScope(service)); err != nil {
+	claims, status, err := s.authenticate(r, repo, serviceScope(service))
+	if err != nil {
 		// RFC 9110 §11.6.1: the challenge belongs to 401 only; a 403 means
 		// the presented credentials were understood but denied.
 		if status == http.StatusUnauthorized {
@@ -636,10 +663,9 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 		httpError(w, http.StatusNotFound, "repository not found")
 		return
 	}
-	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch)
+	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch, claims)
 	if err != nil {
-		log.Printf("hydrate %s: %v", target.key, err)
-		httpError(w, http.StatusInternalServerError, "hydration failed")
+		hydrateFailed(w, target.key, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-"+svcParam+"-advertisement")
@@ -852,10 +878,9 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			log.Printf("quota: receive-pack for %s at/over quota (%d pack bytes stored >= %d): enforcement defers to pre-receive", target.key, usage, s.PackQuotaBytes)
 		}
 	}
-	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch)
+	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch, claims)
 	if err != nil {
-		log.Printf("hydrate %s: %v", target.key, err)
-		httpError(w, http.StatusInternalServerError, "hydration failed")
+		hydrateFailed(w, target.key, err)
 		return
 	}
 

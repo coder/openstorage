@@ -17,6 +17,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -495,6 +496,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	var (
 		enqueueDelivery func(ctx context.Context, d events.Delivery) error
 		enqueueSync     func(ctx context.Context, repoID string) error
+		beforeCAS       func(ctx context.Context, repoID string) error
 	)
 	if isPGURL(dbURL) {
 		q, err := jobs.NewRiverInsertOnly(ctx, dbURL)
@@ -534,14 +536,24 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			// the serve sweep claims the row once the push's cache refs
 			// are published (the worker's publication wait).
 			denied, pullDenied := hookCallerDeniedForward(), hookCallerDeniedPull()
-			enqueueSync = enqueueSyncOrForward(ms,
+			forwardDenied := func(context.Context) bool { return denied }
+			pullDeniedFn := func(context.Context) bool { return pullDenied }
+			row := &hookUpstreamRow{EventingStore: ms}
+			noop := func(context.Context, upsync.Job) error { return nil }
+			// The forward intent goes in the row BEFORE the authority CAS
+			// (ADR-50 amendment), behind the forward poke's own gates: a
+			// hook killed after the CAS, or a failed intent write, can then
+			// never leave an accepted push that no run forwards. The ref's
+			// push hold is already in place, so a run that claims this
+			// intent waits for the push's publication. An error refuses
+			// the update.
+			beforeCAS = enqueueSyncOrForward(row, noop, noop, org, forwardDenied, pullDeniedFn)
+			enqueueSync = enqueueSyncOrForward(row,
 				func(ctx context.Context, job upsync.Job) error {
 					return ms.RequestSync(ctx, job.RepoID)
 				},
 				// enqueueSyncOrForward already recorded RequestPush.
-				func(context.Context, upsync.Job) error { return nil }, org,
-				func(context.Context) bool { return denied },
-				func(context.Context) bool { return pullDenied })
+				noop, org, forwardDenied, pullDeniedFn)
 		}
 	}
 
@@ -552,7 +564,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		// in-flight claim check; the forward poke (issue #90) must be
 		// suppressed here or every inbound mirror update would enqueue
 		// an outbound no-op forward. Push webhooks still emit.
-		enqueueSync = nil
+		enqueueSync, beforeCAS = nil, nil
 	}
 
 	githttp.WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
@@ -582,10 +594,36 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			Webhooks:        whStore,
 			EnqueueDelivery: enqueueDelivery,
 			EnqueueSync:     enqueueSync,
+			BeforeCAS:       beforeCAS,
 			Logger:          logger,
 		}), nil
 	}
 	return cleanup
+}
+
+// hookUpstreamRow serves an update hook's one upstream-row read to both
+// the intent recorded before the CAS and the sync poke after it: the hook
+// handles one ref of one repository, and a second read would cost every
+// push on S3WAL one more round trip. The poke's in-flight-pull check then
+// sees the row as it was just before the CAS.
+type hookUpstreamRow struct {
+	meta.EventingStore
+	mu     sync.Mutex
+	read   bool
+	repoID string
+	up     meta.RepoUpstream
+	err    error
+}
+
+func (h *hookUpstreamRow) GetRepoUpstream(ctx context.Context, repoID string) (meta.RepoUpstream, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.read {
+		h.read, h.repoID = true, repoID
+		h.up, h.err = h.EventingStore.GetRepoUpstream(ctx, repoID)
+	}
+	assertf(repoID == h.repoID, "hookUpstreamRow: read of %q after %q (an update hook writes one repository)", repoID, h.repoID)
+	return h.up, h.err
 }
 
 // slogForHook builds the hook subprocess logger (stderr reaches the git

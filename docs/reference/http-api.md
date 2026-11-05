@@ -604,7 +604,10 @@ Upstream documents no value and no `Link` or `Sunset` header, so open.storage se
 in-flight runs in both directions. A run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
-a new `repo.sync.started` (outbound: `repo.push_upstream.started`).
+a new `repo.sync.started` (outbound: `repo.push_upstream.started`). On SQLite and S3WAL,
+an outbound run also ends without a terminal event when a git push in progress holds a
+ref that the run would otherwise forward at an older value: the request stays pending,
+and the run starts again a few seconds later.
 
 **Ref policies fail closed:** any policy op denies pull-upstream, push-upstream, and a
 sync create at `POST /repos` (403).

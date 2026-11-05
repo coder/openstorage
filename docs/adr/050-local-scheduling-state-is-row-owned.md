@@ -76,6 +76,21 @@ repository's publication (`githttp.WaitForPushPublication`) after its claim
 and before its snapshot and `repo.sync.started` event. A failed wait ends
 the run with `restore`, due again after a few seconds.
 
+**Amendment: forward intent before the CAS.** A model check of this
+schedule (`.agents/skills/verify-lane-schedule`) found two ways to lose a
+forward with the order above. A hook that dies, or whose `RequestPush`
+fails, after its authority CAS leaves an accepted push that no run
+forwards. And a run that passed its publication wait could snapshot a ref
+that a later push then held, while the cache still had a value older than
+the authority (after a REST write, or a push that died after its CAS), and
+end `done` without forwarding the newer value. Now a forwarding push's hook
+records `RequestPush` before its authority CAS, after the ref's push hold is
+in place, and a failed write refuses the ref update. The intent after the
+CAS stays, and still does the pull marking. A local push run's loopback
+fetch fails with HTTP 423 when its hydrate would skip a push-held ref whose
+cached value is older than the authority, and the run ends with `restore`,
+as after a failed publication wait.
+
 **Rollout.** The store transitions landed first, with no callers (#336). The
 SQLite worker and its sweep followed (#341), and hook marking came last,
 after its consumer was qualified.

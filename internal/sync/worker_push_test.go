@@ -724,3 +724,19 @@ func TestLocalPushOutcomeAttemptPastBudget(t *testing.T) {
 		t.Fatalf("last budgeted attempt: outcome %+v, want a retry", o)
 	}
 }
+
+// TestHeldRefStaleReadsGit423: the two ways git reports the server's 423
+// Locked on a loopback fetch (verified with git 2.55, protocol v0 and v2),
+// and nothing else.
+func TestHeldRefStaleReadsGit423(t *testing.T) {
+	for stderr, want := range map[string]bool{
+		"fatal: unable to access 'http://127.0.0.1:1/r.git/': The requested URL returned error: 423":                         true,
+		"error: RPC failed; HTTP 423 curl 22 The requested URL returned error: 423\nfatal: expected flush after ref listing": true,
+		"fatal: unable to access 'http://127.0.0.1:1/r.git/': The requested URL returned error: 500":                         false,
+		"error: RPC failed; HTTP 500 curl 22 The requested URL returned error: 500":                                          false,
+	} {
+		if got := heldRefStale(stderr); got != want {
+			t.Errorf("heldRefStale(%q) = %v, want %v", stderr, got, want)
+		}
+	}
+}

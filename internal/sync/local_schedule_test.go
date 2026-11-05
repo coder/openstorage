@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cgi"
+	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
 	stdsync "sync"
@@ -1124,6 +1125,46 @@ func TestLocalSchedulePublicationFence(t *testing.T) {
 		}
 		if got := upstreamHead(t, bare); got != before {
 			t.Fatalf("upstream changed after a failed wait: %q", got)
+		}
+	})
+	t.Run("stale held snapshot restores force and attempt", func(t *testing.T) {
+		f := newLocalSchedFixture(t)
+		up := newHTTPUpstream(t)
+		bare := up.addRepo(t, "own", "p4")
+		repo, head := f.addRepo(t, "p4", up.host())
+		before := upstreamHead(t, bare)
+		up.down(t)
+		if err := f.ms.RequestPush(t.Context(), repo, true); err != nil {
+			t.Fatal(err)
+		}
+		f.sweep(t) // transient failure: attempt 1, force kept
+		f.advance(time.Minute)
+		// The server refuses the loopback fetch: a push holds a ref the
+		// cache has not caught up with (githttp.Server.StrictSyncFetch).
+		locked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "held", http.StatusLocked)
+		}))
+		t.Cleanup(locked.Close)
+		loopback := f.wf.worker.Loopback.BaseURL
+		f.wf.worker.Loopback.BaseURL = locked.URL
+		up.up(t)
+		f.sweep(t) // the retry claims, then its snapshot is refused
+		r := f.row(t, repo)
+		attempt, due := f.readSchedule(t, repo)
+		if r.PushSyncing || r.PushPending != 2 || r.PushRunCount != 1 || attempt != 1 ||
+			due != f.now().Add(localPublicationRetryDelay).UnixNano() {
+			t.Fatalf("after a refused snapshot: row %+v attempt %d due %d; want force kept, attempt 1, due +%v, no new run",
+				r, attempt, due, localPublicationRetryDelay)
+		}
+		assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamFailed, EventPushUpstreamStarted)
+		if got := upstreamHead(t, bare); got != before {
+			t.Fatalf("upstream changed after a refused snapshot: %q", got)
+		}
+		f.wf.worker.Loopback.BaseURL = loopback
+		f.advance(localPublicationRetryDelay)
+		f.sweep(t)
+		if r := f.row(t, repo); r.PushPending != 0 || r.PushSuccessCount != 1 || upstreamHead(t, bare) != head {
+			t.Fatalf("restored run did not forward: row %+v upstream %q want %q", r, upstreamHead(t, bare), head)
 		}
 	})
 	t.Run("failed pull wait restores the request", func(t *testing.T) {
