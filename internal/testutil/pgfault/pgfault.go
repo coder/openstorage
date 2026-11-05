@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Fault is what the proxy does to the next COMMIT.
@@ -29,7 +30,14 @@ const (
 	// CutAll drops the COMMIT like DropCommit, then closes every relayed
 	// connection and the listener: no later connection reaches the server.
 	CutAll
+	// DelayCommit closes the client side, then relays the COMMIT after
+	// CommitDelay: the transaction stays in progress for CommitDelay, then
+	// commits, and the client never learns it.
+	DelayCommit
 )
+
+// CommitDelay is how long DelayCommit holds the COMMIT.
+const CommitDelay = 300 * time.Millisecond
 
 // commitMsg is COMMIT as pgx sends it: one simple-protocol Query message.
 var commitMsg = append([]byte{'Q', 0, 0, 0, 11}, "commit\x00"...)
@@ -75,12 +83,12 @@ func Start(t testing.TB, dbURL string) (*Proxy, string) {
 }
 
 // Arm makes the next COMMIT that any relayed connection sends suffer f.
-// onFault, when not nil, runs once the fault took effect and before the
-// client side closes, so Fired is true by the time the client sees the
-// fault. For DropReply it runs after the server's reply arrived: the
-// transaction committed.
+// onFault, when not nil, runs once before the proxy closes any connection,
+// so Fired is true by the time the client sees the fault. For DropReply it
+// runs after the server's reply arrived: the transaction committed. For the
+// other faults it runs when the proxy holds the COMMIT.
 func (p *Proxy) Arm(f Fault, onFault func()) {
-	if f < DropReply || f > CutAll {
+	if f < DropReply || f > DelayCommit {
 		panic("pgfault: unknown fault")
 	}
 	p.mu.Lock()
@@ -143,8 +151,8 @@ func (p *Proxy) relay(client net.Conn) {
 					onReply = fn
 					swallow.Store(true)
 				case DropCommit:
-					_ = server.Close()
 					p.fire(fn)
+					_ = server.Close()
 					_ = client.Close()
 					return
 				case HoldCommit:
@@ -152,11 +160,15 @@ func (p *Proxy) relay(client net.Conn) {
 					_ = client.Close()
 					return // the server side stays open until cleanup
 				case CutAll:
-					_ = p.ln.Close()
-					_ = server.Close()
 					p.fire(fn)
 					p.closeAll()
 					return
+				case DelayCommit:
+					p.fire(fn)
+					_ = client.Close()
+					time.Sleep(CommitDelay)
+					_, _ = server.Write(buf[:n])
+					return // the server side stays open until cleanup
 				}
 			}
 			if n > 0 {

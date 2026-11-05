@@ -1094,6 +1094,10 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 		if n == 0 {
 			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
 		}
+		// commitStatus needs a pool slot, and this connection can be the
+		// pool's last one. The transaction is closed, so the deferred
+		// Rollback and Release no longer touch it.
+		conn.Release()
 		switch s.commitStatus(ctx, xid) {
 		case "committed": // a lost reply: the swap and the hook's writes committed
 		case "aborted":
@@ -1112,7 +1116,7 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 // cancellation-detached context like the IdempotentCAS recheck.
 const commitStatusTimeout = 5 * time.Second
 
-// commitStatus asks PostgreSQL, on another pooled connection, whether
+// commitStatus asks PostgreSQL, on a pooled connection, whether
 // transaction xid committed. It returns "committed" or "aborted", or "" when
 // the answer is unknown: the query failed, the id is too old for
 // txid_status, or the transaction was still in progress when
