@@ -7,8 +7,9 @@
 // A FACT is one guard the model depends on, checked in the AST (call
 // order, SQL text, assignments) on both local-schedule backends, SQLite and
 // S3-WAL; check.sh writes it into the TLC config, so breaking the guard in
-// the code flips the model. An FP fingerprints one covered function's
-// tokens (comments and formatting ignored); check.sh compares it with
+// the code flips the model. An FP fingerprints the tokens of one
+// declaration (an import, function, method, const, var or type) of a
+// covered file (comments and formatting ignored); check.sh compares it with
 // model/fingerprints.txt to tell when covered code changed.
 //
 // Run from the repository root:
@@ -459,7 +460,8 @@ func main() {
 		fmt.Printf("FP %s %s\n", label, hash)
 	}
 	for _, src := range []*source{sqlSched, sqlEvt, walSched, walEvt, push, worker, sched,
-		refstore, wireEvt, wireLocal, pub, hydrate, hook, load("internal/api/handlers_sync.go")} {
+		refstore, wireEvt, wireLocal, pub, hydrate, hook, load("internal/api/handlers_sync.go"),
+		load("internal/sync/metastore.go"), load("internal/sync/pushstatus.go")} {
 		for _, d := range src.file.Decls {
 			switch d := d.(type) {
 			case *ast.FuncDecl:
@@ -469,12 +471,11 @@ func main() {
 				}
 				emit(src.path+":"+label, src.fingerprint(d.Pos(), d.End()))
 			case *ast.GenDecl:
-				if d.Tok == token.IMPORT {
-					continue
-				}
 				for _, sp := range d.Specs {
 					var names []string
 					switch sp := sp.(type) {
+					case *ast.ImportSpec:
+						names = append(names, sp.Path.Value)
 					case *ast.ValueSpec:
 						for _, n := range sp.Names {
 							names = append(names, n.Name)
