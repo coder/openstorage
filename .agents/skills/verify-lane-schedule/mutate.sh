@@ -7,7 +7,8 @@
 # Each mutation edits one covered file, checks that its package still
 # compiles, runs `check.sh --only <config>`, and restores the file with
 # `git checkout`. It prints one line per mutation and a COUNT line, and
-# exits 0 only when every mutation failed as expected. Each config it uses
+# exits 0 only when every mutation failed as expected, and 3 when check.sh
+# cannot run at all (Go, Java, TLC download). Each config it uses
 # must first pass unmodified. The covered files must have no uncommitted
 # changes; an interrupted run restores the file it broke. Outputs stay in
 # one private temporary directory.
@@ -47,7 +48,12 @@ base_ok() { # config
   local cfg=$1
   if [ -z "${baseline[$cfg]:-}" ]; then
     local d="$work/base-${cfg%.cfg}"
-    "$skill_dir/check.sh" --out "$d/tlc" --only "$cfg" >"$d.txt" 2>&1
+    local rc=0; "$skill_dir/check.sh" --out "$d/tlc" --only "$cfg" >"$d.txt" 2>&1 || rc=$?
+    if [ "$rc" = 3 ]; then # a tool problem, not the model: nothing below can count
+      local why; why=$(grep -m1 -E '^(check\.sh: |Error: )' "$d.txt" || tail -n 1 "$d.txt")
+      echo "mutate.sh: check.sh could not run on unmodified $cfg (exit 3, $d.txt): $why" >&2
+      exit 3
+    fi
     if grep -qE "^   $cfg +PASS \(" "$d.txt"; then baseline[$cfg]=ok; else baseline[$cfg]=bad; fi
     [ "${baseline[$cfg]}" = ok ] || echo "BASELINE $cfg does not pass unmodified ($d.txt): its mutations cannot count"
   fi
@@ -57,6 +63,7 @@ base_ok() { # config
 mut() { # name file old new config expected
   local name=$1 file=$2 old=$3 new=$4 cfg=$5 want=$6
   total=$((total + 1))
+  [ -n "${baseline[$cfg]:-}" ] || { echo "mutate.sh: $cfg is not in the baseline list below; add it" >&2; exit 3; }
   if [ "$model" = 1 ]; then
     base_ok "$cfg" || { echo "$name: ERROR baseline $cfg fails"; return; }
     local d="$work/$name"; mkdir -p "$d"
@@ -86,6 +93,10 @@ judge() { # name rc expected output: exactly this fact FALSE, and the property f
     echo "$1: MISMATCH rc=$2 false_facts=[$fact] output=$4"
   fi
 }
+
+# Every config the table uses, run unmodified before any break, so a tool
+# error (exit 3) stops the run before it edits code.
+for cfg in Liveness.cfg LaneSchedule.cfg; do base_ok "$cfg" || true; done
 
 mut ClaimConsumesPending internal/meta/sqlite_eventing.go 'SET push_syncing = 1, push_pending = 0, push_claim_holder' 'SET push_syncing = 1, push_claim_holder' Liveness.cfg 'Temporal properties were violated'
 mut ClaimMarksDue internal/meta/s3walmeta_eventing.go 'attempt, u.PushDue = u.PushAttempt, nowNanos' 'attempt = u.PushAttempt' LaneSchedule.cfg 'Invariant BackoffKept is violated'

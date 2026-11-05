@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
@@ -618,44 +619,52 @@ func TestLFSReclaim_WalkDeadline(t *testing.T) {
 // budget, so many wedged repositories could hold one pass for ten minutes
 // each. The whole-pass cap ends the run instead; the rotation cursor makes
 // the next pass resume after the last attempted repository.
+//
+// It runs on synctest's fake clock. The 50 ms pass cap must fire while the
+// first repository's walk is wedged, so the registry reads before that walk
+// have to cost no time: on a loaded host, real reads took longer than 50 ms
+// of wall clock, the cap expired before any repository was attempted, and the
+// cursor never advanced.
 func TestLFSReclaim_PassDeadline(t *testing.T) {
-	ctx := context.Background()
-	store, reg := newReclaimStore(t)
-	for _, base := range []string{"wedged-a", "wedged-b", "wedged-c"} {
-		key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
-		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
-			t.Fatal(err)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		store, reg := newReclaimStore(t)
+		for _, base := range []string{"wedged-a", "wedged-b", "wedged-c"} {
+			key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+			if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+				t.Fatal(err)
+			}
+			if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("88", 20)); err != nil || !won {
+				t.Fatalf("CASRef = (%v, %v)", won, err)
+			}
 		}
-		if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("88", 20)); err != nil || !won {
-			t.Fatalf("CASRef = (%v, %v)", won, err)
+		instantHydrate := func(context.Context, string, string) (string, error) {
+			return t.TempDir(), nil
 		}
-	}
-	instantHydrate := func(context.Context, string, string) (string, error) {
-		return t.TempDir(), nil
-	}
-	stuckWalk := func(ctx context.Context, _ string, _ int64) (map[string]struct{}, int64, error) {
-		<-ctx.Done() // every walk hangs until some deadline fires
-		return nil, 0, ctx.Err()
-	}
-	r := NewLFSReclaimer(reg, instantHydrate, stuckWalk, alwaysMain,
-		time.Hour, 1_000, true, true, slog.New(slog.DiscardHandler))
-	// Per-member deadline generous, pass deadline tiny: the pass cap must
-	// end the run — without it, three wedged repos would serially consume
-	// three per-member windows.
-	r.walkTimeout = time.Hour
-	r.passTimeout = 50 * time.Millisecond
+		stuckWalk := func(ctx context.Context, _ string, _ int64) (map[string]struct{}, int64, error) {
+			<-ctx.Done() // every walk hangs until some deadline fires
+			return nil, 0, ctx.Err()
+		}
+		r := NewLFSReclaimer(reg, instantHydrate, stuckWalk, alwaysMain,
+			time.Hour, 1_000, true, true, slog.New(slog.DiscardHandler))
+		// Per-member deadline generous, pass deadline tiny: the pass cap must
+		// end the run — without it, three wedged repos would serially consume
+		// three per-member windows.
+		r.walkTimeout = time.Hour
+		r.passTimeout = 50 * time.Millisecond
 
-	start := time.Now()
-	_, err := r.Run(ctx)
-	if err == nil || !strings.Contains(err.Error(), "deadline") {
-		t.Fatalf("run err = %v, want pass deadline", err)
-	}
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Fatalf("pass ran %v, want the pass cap to end it promptly", elapsed)
-	}
-	if st, ok, err := reg.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRotation); err != nil || !ok || st.Payload == "" {
-		t.Fatalf("rotation cursor = (%+v, %v, %v); want a durably parked advance so the next pass does not retry the same repo first", st, ok, err)
-	}
+		start := time.Now()
+		_, err := r.Run(ctx)
+		if err == nil || !strings.Contains(err.Error(), "deadline") {
+			t.Fatalf("run err = %v, want pass deadline", err)
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			t.Fatalf("pass ran %v, want the pass cap to end it promptly", elapsed)
+		}
+		if st, ok, err := reg.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRotation); err != nil || !ok || st.Payload == "" {
+			t.Fatalf("rotation cursor = (%+v, %v, %v); want a durably parked advance so the next pass does not retry the same repo first", st, ok, err)
+		}
+	})
 }
 
 // TestLFSReclaim_VanishedRefundsSettleDespiteBurnedDeadline (Codex round
