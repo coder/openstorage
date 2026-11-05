@@ -71,24 +71,43 @@ var ErrUnsortedTree = errors.New("ls-tree listed entries out of order")
 
 // LsTreePage returns one page of LsTree(ctx, repoPath, commit, path, true)
 // sorted by Path: up to limit entries whose Path sorts after `after`, and
-// whether more follow (#612). git prints a recursive listing of a
-// well-formed tree in byte order of the full paths, so LsTreePage streams
-// `ls-tree -r` and stops git one entry past the page: its cost grows with
-// the entries up to the page, not with the tree. Only the page counts
-// against the request's output allowance, and only once the page is
-// complete, so a failed or refused page charges nothing. found reports
-// whether path matched any entry. A listing out of order up to one entry
-// past the page returns ErrUnsortedTree. An inversion after that is not
-// read, so a tree stored out of order (fsck's treeNotSorted, which git's
-// own path lookups do not handle either) can page in git's order.
+// whether more follow (#612). found reports whether path matched any
+// entry.
+//
+// Without a cursor it streams `ls-tree -r` and stops git one entry past the
+// page, so its cost grows with the page. With a cursor it reads only the
+// trees on the cursor's path and the ones after them (resumeTreePage,
+// #615), so a deep cursor costs about what a shallow one does. A tree that
+// walk does not handle (see errDeclined) is paged by the stream, which
+// reads the listing from its start up to the page.
+//
+// git prints a recursive listing of a well-formed tree in byte order of
+// the full paths. Only the page counts against the request's output
+// allowance, and only once the page is complete, so a failed or refused
+// page charges nothing. A listing out of order up to one entry past the
+// page returns ErrUnsortedTree. An inversion after that is not read, so a
+// tree stored out of order (fsck's treeNotSorted, which git's own path
+// lookups do not handle either) can page in git's order.
 func LsTreePage(ctx context.Context, repoPath, commit, path, after string, limit int) (page []TreeEntry, hasMore, found bool, err error) {
 	assertf(ref.ValidSHA(commit) || commit == EmptyTreeSHA, "LsTreePage: unresolved commit %q", commit)
 	assertf(limit > 0, "LsTreePage: limit %d", limit)
+	if after != "" {
+		page, hasMore, found, err = resumeTreePage(ctx, repoPath, commit, path, after, limit)
+		if !errors.Is(err, errDeclined) {
+			return page, hasMore, found, err
+		}
+	}
+	return streamTreePage(ctx, repoPath, commit, path, after, limit, BudgetFrom(ctx))
+}
+
+// streamTreePage pages `ls-tree -r` as a stream from its first entry.
+// budget is the output allowance the page is charged to (nil: none).
+func streamTreePage(ctx context.Context, repoPath, commit, path, after string, limit int, budget *Budget) (page []TreeEntry, hasMore, found bool, err error) {
 	args := []string{"ls-tree", "--long", "-z", "-r", commit}
 	if path != "" {
 		args = append(args, "--", ":(literal)"+path)
 	}
-	p := &lsTreePager{after: after, limit: limit, budget: BudgetFrom(ctx)}
+	p := &lsTreePager{after: after, limit: limit, budget: budget}
 	if _, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdout: p, Args: args}); err != nil {
 		return nil, false, false, err
 	}
