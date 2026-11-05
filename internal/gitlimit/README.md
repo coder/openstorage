@@ -22,7 +22,7 @@ Shared admission and process control for git subprocesses. It provides a slot po
 - `registry.start` panics if `SysProcAttr` is already set, forces `Setpgid`, and refuses new children with `ErrStopping` after stop began [children.go:start]
 - `registry.stop` sends SIGTERM before SIGKILL so git can clean its lock files [children.go:stop]
 - `registry` signals only a group whose leader it has not reaped: `wait` leaves the registry before it reaps, and `stop` signals only groups it finds registered while it holds the lock, so a signal cannot reach a group whose ID the kernel recycled (#473) [children.go:wait] [children.go:stop]
-- On Linux a leader that exits after `stop` began stays an unreaped zombie until `stop` has sent its final SIGKILL, which still ends a member the leader left behind. Other platforms reap first and `stop` no longer signals that group [children.go:wait] [exit_linux.go:awaitExit]
+- On Linux a leader that exits after `stop` began stays an unreaped zombie until `stop` has sent its final SIGKILL, which still ends a member the leader left behind. Other platforms reap first and remove the group right after, so a signal sent in between can reach a recycled ID [children.go:wait] [exit_other.go:awaitExit]
 - The Linux wrapper keeps a stricter inherited soft limit and exits 125 if it cannot read or set the limit [heaplimit_linux.go:heapLimitWrapper]
 - `HeapFailure` ignores SIGKILL and matches git diagnostics only at line start [heaplimit_linux.go:HeapFailure]
 - Non-Linux `Command` asserts maxHeapBytes == 0 [heaplimit_other.go:Command]

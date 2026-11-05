@@ -119,9 +119,11 @@ func (g *registry) start(cmd *exec.Cmd) error {
 //     sent its final SIGKILL. That kill still reaches a member the leader
 //     left behind, such as a hook that ignored SIGTERM.
 //
-// Where the platform cannot wait for an exit without reaping (everything
-// but Linux), the leader is reaped first, and stop no longer signals its
-// group.
+// Where the platform has no wait for an exit that leaves the child
+// unreaped (everything but Linux; Go's own os package has none on macOS
+// either), the leader is reaped first and removed right after, so a signal
+// that stop sends between the two can still reach a recycled ID. I did
+// not close that window: it lasts until wait takes the lock.
 func (g *registry) wait(cmd *exec.Cmd) error {
 	pid := cmd.Process.Pid
 	if !awaitExit(pid) {
