@@ -454,9 +454,10 @@ func (w *lastCommitWalk) walk(spool *bufio.Reader, d differ) error {
 		set := w.waiting[l.c]
 		delete(w.waiting, l.c) // no later commit hands paths to l.c
 		if len(set) == 0 {
-			if l.first != nil {
-				cancel(l) // sent ahead, but no path reached it
-			}
+			// No path reached it. If it was sent ahead, the line that resolved
+			// every path above it has cancelled its chain already, and
+			// cancelling again could only cut another child's chain at a
+			// shared parent.
 			continue // its answer is received and dropped later
 		}
 		// diff answers l's diff against parent k (k 0 of a root: against
