@@ -473,13 +473,7 @@ func (n *testNode) stop() {
 		}
 		sid := n.cmd.Process.Pid
 		defer untrackNodeSession(sid)
-		kill := func() []int {
-			members := sessionMembers(sid)
-			for _, pid := range members {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-			return members
-		}
+		kill := func() []int { return killSessionMembers(sid) }
 		if n.cmd.ProcessState == nil {
 			_ = syscall.Kill(-sid, syscall.SIGKILL)
 			kill()
@@ -536,7 +530,10 @@ func startBinaryNode(binary, cacheDir string, stderr io.Writer, extraEnv ...stri
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	trackNodeSession(cmd.Process.Pid)
+	if err := trackNodeSession(cmd.Process.Pid); err != nil {
+		(&testNode{cmd: cmd}).stop()
+		return nil, err
+	}
 	sc := bufio.NewScanner(stdout)
 	lineCh := make(chan string, 1)
 	go func() {

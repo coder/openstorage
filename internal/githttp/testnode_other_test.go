@@ -20,7 +20,9 @@ func nodeSysProcAttr() *syscall.SysProcAttr {
 func sessionMembers(int) []int { return nil }
 
 // Node tracking (the node guard in testnode_linux_test.go) needs /proc: a no-op here.
-func trackNodeSession(int)   {}
-func untrackNodeSession(int) {}
+func trackNodeSession(int) error { return nil }
+func untrackNodeSession(int)     {}
+
+func killSessionMembers(int) []int { return nil }
 
 func nodeHelperMain(*testing.M) (int, bool) { return 0, false }
