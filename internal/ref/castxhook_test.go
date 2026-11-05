@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,11 @@ func TestPGCASTxHookCommitsWithSwap(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS cas_tx_hook_probe (repo text, sha text)`); err != nil {
 		t.Fatal(err)
 	}
+	// A row whose deferred foreign key has no parent fails only at COMMIT.
+	if _, err := s.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS cas_tx_hook_parent (id int PRIMARY KEY);
+		CREATE TABLE IF NOT EXISTS cas_tx_hook_orphan (parent int REFERENCES cas_tx_hook_parent (id) DEFERRABLE INITIALLY DEFERRED)`); err != nil {
+		t.Fatal(err)
+	}
 	repo := fmt.Sprintf("castxhook-%d", time.Now().UnixNano())
 	probes := func() int {
 		t.Helper()
@@ -31,11 +37,17 @@ func TestPGCASTxHookCommitsWithSwap(t *testing.T) {
 	}
 	calls, committed := 0, 0
 	hookErr := error(nil)
+	failCommit := false
 	hctx := WithCASTxHook(ctx, CASTxHook{
 		InTx: func(ctx context.Context, tx pgx.Tx) error {
 			calls++
 			if _, err := tx.Exec(ctx, `INSERT INTO cas_tx_hook_probe VALUES ($1, 'x')`, repo); err != nil {
 				return err
+			}
+			if failCommit {
+				if _, err := tx.Exec(ctx, `INSERT INTO cas_tx_hook_orphan VALUES (-1)`); err != nil {
+					return err
+				}
 			}
 			return hookErr
 		},
@@ -67,5 +79,18 @@ func TestPGCASTxHookCommitsWithSwap(t *testing.T) {
 	}
 	if calls != 2 || committed != 1 || probes() != 1 {
 		t.Fatalf("failing hook's write survived: calls=%d committed=%d probe rows=%d", calls, committed, probes())
+	}
+
+	// A COMMIT that fails after the hook ran: Committed must not run, and
+	// nothing the transaction wrote survives.
+	hookErr, failCommit = nil, true
+	if won, err := s.CASRef(hctx, repo, "refs/heads/main", a, b); won || err == nil || !strings.Contains(err.Error(), "commit") {
+		t.Fatalf("failed commit: won=%v err=%v, want a commit error", won, err)
+	}
+	if got, err := s.GetRef(ctx, repo, "refs/heads/main"); err != nil || got != a {
+		t.Fatalf("failed commit left main = %q (err %v), want %s", got, err, a)
+	}
+	if calls != 3 || committed != 1 || probes() != 1 {
+		t.Fatalf("failed commit: calls=%d committed=%d probe rows=%d, want 3, 1, 1 (Committed must wait for COMMIT)", calls, committed, probes())
 	}
 }
