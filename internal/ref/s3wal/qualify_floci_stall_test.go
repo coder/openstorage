@@ -114,8 +114,9 @@ func explainedByStall(f readFailure, spans []stallSpan, opTimeout time.Duration)
 
 // readErrClass names the shape of a failed read for the verdict detail.
 // "short-body" is the framing shape: the response ended before its
-// Content-Length.
+// Content-Length. "status" is an error reply from the store.
 func readErrClass(err error) string {
+	var reply *awshttp.ResponseError
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return "deadline"
@@ -123,6 +124,8 @@ func readErrClass(err error) string {
 		return "short-body"
 	case errors.Is(err, io.EOF), errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE), errors.Is(err, net.ErrClosed):
 		return "reset"
+	case errors.As(err, &reply) && reply.HTTPStatusCode() != 0:
+		return "status"
 	default:
 		return "other"
 	}
@@ -218,7 +221,7 @@ func TestReadFailureShapes(t *testing.T) {
 	opts.Retryer = aws.NopRetryer{}
 	client := s3.New(opts)
 	for _, tc := range []struct{ key, class string }{
-		{"hang", "deadline"}, {"short", "short-body"}, {"closed", "reset"}, {"status", "other"},
+		{"hang", "deadline"}, {"short", "short-body"}, {"closed", "reset"}, {"status", "status"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
