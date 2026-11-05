@@ -107,19 +107,22 @@ func genName(r *rand.Rand) string {
 	return sb.String()
 }
 
-func genDir(r *rand.Rand, depth int) map[string]*memEntry {
+func genDir(r *rand.Rand, depth int, empties bool) map[string]*memEntry {
 	dir := map[string]*memEntry{}
 	for range r.IntN(7) {
 		name := genName(r)
 		switch k := r.IntN(20); {
 		case dir[name] != nil:
 		case depth < 4 && k < 7:
-			dir[name] = &memEntry{mode: modeTree, sub: genDir(r, depth+1)}
-		case k < 8: // an empty folder: git can store one, ls-tree lists nothing in it
+			dir[name] = &memEntry{mode: modeTree, sub: genDir(r, depth+1, empties)}
+		case k < 8 && empties: // an empty folder: git can store one, ls-tree lists nothing in it
 			dir[name] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
 		default:
 			dir[name] = &memEntry{mode: []uint32{modeBlob, modeBlob, modeBlob, modeExec, modeSymlink, modeGitlink}[r.IntN(6)]}
 		}
+	}
+	if !empties && depth > 0 && len(dir) == 0 {
+		dir[genName(r)] = &memEntry{mode: modeBlob} // every folder holds a file
 	}
 	return dir
 }
@@ -222,7 +225,7 @@ func paths(es []TreeEntry) []string {
 func TestTreeWalkMatchesTheSortedListing(t *testing.T) {
 	for seed := range uint64(400) {
 		r := rand.New(rand.NewPCG(seed, 615))
-		root := genDir(r, 0)
+		root := genDir(r, 0, true)
 		m := newMemTrees(root)
 		dirs := folders(root, "", nil)
 		for range 12 {
@@ -237,6 +240,42 @@ func TestTreeWalkMatchesTheSortedListing(t *testing.T) {
 	}
 }
 
+// countingTrees counts the reads of each tree.
+type countingTrees struct {
+	*memTrees
+	opens map[string]int
+}
+
+func (c *countingTrees) open(rev string) (*treeBody, error) {
+	c.opens[rev]++
+	return c.memTrees.open(rev)
+}
+
+// A page that the trees it reads can fill opens each tree once: the walk keeps
+// the entry past the page with the others, and does not read a level
+// again to find it.
+func TestTreeWalkReadsEachTreeOnce(t *testing.T) {
+	for seed := range uint64(300) {
+		r := rand.New(rand.NewPCG(seed, 2615))
+		root := genDir(r, 0, false)
+		m := newMemTrees(root)
+		for range 8 {
+			c := &countingTrees{memTrees: m, opens: map[string]int{}}
+			after, limit := genCursor(r, m), 1+r.IntN(len(m.leaves)+2)
+			rest, _ := cursorWithin("", after)
+			w := &treeWalk{src: c, limit: limit, room: math.MaxInt64}
+			if err := w.run(memCommit, "", nil, rest); err != nil {
+				t.Fatal(err)
+			}
+			for rev, n := range c.opens {
+				if n > 1 {
+					t.Fatalf("seed %d: tree %s read %d times for after %q, limit %d", seed, rev, n, after, limit)
+				}
+			}
+		}
+	}
+}
+
 // A short allowance cuts what a level buffers, and folders without files
 // make a level yield less than the page needs: the walk reads the level
 // again and skips what it used.
@@ -244,7 +283,7 @@ func TestTreeWalkReadsALevelAgain(t *testing.T) {
 	var reread int
 	for seed := range uint64(300) {
 		r := rand.New(rand.NewPCG(seed, 1615))
-		root := genDir(r, 0)
+		root := genDir(r, 0, true)
 		m := newMemTrees(root)
 		for range 10 {
 			path := folders(root, "", nil)[0]
@@ -299,7 +338,7 @@ func FuzzTreeWalk(f *testing.F) {
 	f.Add(uint64(11), uint64(5), "a/", uint8(2), uint8(255))
 	f.Fuzz(func(t *testing.T, s1, s2 uint64, cursor string, limit, roomK uint8) {
 		r := rand.New(rand.NewPCG(s1, s2))
-		root := genDir(r, 0)
+		root := genDir(r, 0, true)
 		m := newMemTrees(root)
 		dirs := folders(root, "", nil)
 		path := dirs[r.IntN(len(dirs))]
