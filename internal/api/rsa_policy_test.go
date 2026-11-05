@@ -35,13 +35,13 @@ func TestAuth_ExistingWeakRSAKeys(t *testing.T) {
 			}
 			for _, token := range []string{weakToken, strongToken} {
 				resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos", token, nil, "")
-				if resp.StatusCode != http.StatusUnauthorized {
-					t.Fatalf("legacy weak keys: status %d, want 401; body %s", resp.StatusCode, body)
+				if resp.StatusCode != http.StatusForbidden {
+					t.Fatalf("legacy weak keys: status %d, want 403; body %s", resp.StatusCode, body)
 				}
 				requireEnvelope(t, resp, body)
 				resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos/branches/create", token, []byte("{}"), "")
-				if resp.StatusCode != http.StatusUnauthorized {
-					t.Fatalf("write with legacy weak keys: status %d, want 401; body %s", resp.StatusCode, body)
+				if resp.StatusCode != http.StatusForbidden {
+					t.Fatalf("write with legacy weak keys: status %d, want 403; body %s", resp.StatusCode, body)
 				}
 				requireEnvelope(t, resp, body)
 			}
@@ -54,8 +54,8 @@ func TestAuth_ExistingWeakRSAKeys(t *testing.T) {
 			t.Fatalf("rotated key: status %d, want 200; body %s", resp.StatusCode, body)
 		}
 		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos", weakToken, nil, "")
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("removed key: status %d, want 401; body %s", resp.StatusCode, body)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("removed key: status %d, want 403; body %s", resp.StatusCode, body)
 		}
 	})
 }

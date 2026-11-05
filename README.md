@@ -370,7 +370,8 @@ Verification).
 - Refs change only through compare-and-swap on the ref store. Postgres, SQLite, and s3wal
   all implement the same `RefStore` contract [internal/ref/ref.go:RefStore]
   [internal/ref/ref.go:CASRef].
-- Every API and Git request carries an organization-signed JWT. A bad token gets 401. A
+- Every API and Git request carries an organization-signed JWT. A missing token gets 401.
+  A token that fails verification gets 403 on the API and 401 on Git. A
   wrong org, scope, or repo claim gets 403 [internal/api/middleware.go:requireAuth]
   [internal/githttp/server.go:verifyClaims] [internal/auth/verifier.go:Verify].
 - Startup fails fast on bad configuration. `OPENSTORAGE_ORG` and `OPENSTORAGE_ORG_PUBKEYS`

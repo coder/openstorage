@@ -247,8 +247,8 @@ func (unknownOrgKeys) PublicKeysForOrg(_ context.Context, name string) ([]string
 }
 
 // TestAuthenticationUnavailable: a key store failure is upstream's 403
-// authentication_unavailable, not a 401 for a token that may be valid. An
-// unknown issuer stays 401.
+// authentication_unavailable, not the 403 forbidden of a token that
+// fails verification. An unknown issuer is such a token.
 func TestAuthenticationUnavailable(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -265,7 +265,7 @@ func TestAuthenticationUnavailable(t *testing.T) {
 		code   string
 	}{
 		{failingKeys{}, http.StatusForbidden, "authentication_unavailable"},
-		{unknownOrgKeys{}, http.StatusUnauthorized, "unauthorized"},
+		{unknownOrgKeys{}, http.StatusForbidden, "forbidden"},
 	} {
 		h := requireAuth(auth.NewVerifier(tc.keys), "", false, auth.ScopeGitRead)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 			t.Error("handler ran")

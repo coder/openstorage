@@ -687,7 +687,8 @@ Other limits and gaps:
 | 202 | pull-upstream / push-upstream accepted |
 | 206/304/412/416 | file conditional/range results (passed through) |
 | 400 | invalid input; also "custom notes refs not enabled" |
-| 401 / 403 | auth failed / permission or ref-policy denied; 403 `authentication_unavailable` when the key store fails (retry) |
+| 401 | no `Authorization` header, or a scheme other than `Bearer` (`Authentication required`) |
+| 403 | a token that fails verification (`Invalid or expired token`); permission or ref-policy denied; `authentication_unavailable` when the key store fails (retry) ([failure mapping](authentication.md#failure-mapping)) |
 | 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`) |
 | 405 | the path has routes, but not for this method (`Allow` lists them) |
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, failed ref guard (`expected_target_sha`, `expected_source_sha`, `expected_notes_ref_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |

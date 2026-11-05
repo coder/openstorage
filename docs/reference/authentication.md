@@ -33,7 +33,8 @@ A token is a compact JWS: three segments (header, payload, signature) separated 
 
 - Each segment must be canonical unpadded base64url (RFC 7515): no `=` padding, no `+`
   or `/`, no spaces or line breaks, and unused trailing bits set to zero. Any other
-  spelling gets **401**, even when it decodes to the same bytes.
+  spelling fails verification (see [Failure mapping](#failure-mapping)), even when it
+  decodes to the same bytes.
 - The rule applies to the token itself. The HTTP API trims spaces around the
   `Authorization` value; the Git Basic-auth password is checked as sent.
 - Standard JWT libraries emit this form, including the ones the SDKs use (`jose`, PyJWT,
@@ -53,8 +54,9 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
 - **Startup** rejects a weak RSA key, reporting the file path and required minimum.
 - **Every request** checks every registered PEM block, including keys stored before the
   upgrade.
-- **One weak key rejects the whole set:** even a token signed by a strong key gets
-  **401**, not 500. Weak keys are never silently skipped, and there is no override.
+- **One weak key rejects the whole set:** even a token signed by a strong key fails
+  verification (see [Failure mapping](#failure-mapping)), not 500. Weak keys are never
+  silently skipped, and there is no override.
 - **Scope:** public authentication keys only. Client-side private-key parsing and
   token-minting helpers are unchanged, so a successfully minted token does not mean the
   server accepts its key.
@@ -92,7 +94,7 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
   endpoint refuses it with `403`.
 - `sub` is a free-text label that the signer picks ("Agent identity (for logging)" in the
   [upstream guide](../upstream/getting-started/authentication.md)). Any non-empty string
-  verifies, and an empty or missing `sub` is a `401`. It grants nothing, and open.storage
+  verifies, and a token with an empty or missing `sub` fails verification. It grants nothing, and open.storage
   does not log it or key anything on it. SDK 1.17.1 and `openstorage mint` send
   `@pierre/storage`. SDK 0.1.0 sends `pierre-sdk-go`, `pierre-sdk-python` or
   `pierre-sdk-typescript`, and omits `repo` for org-wide calls.
@@ -144,7 +146,10 @@ branch-protection mechanism; there is no server-side protection config.
 
 | Condition | Status |
 |---|---|
-| missing/invalid/expired token | 401 |
+| REST API: no `Authorization` header, or a scheme other than `Bearer` | 401 `unauthorized` (`Authentication required`) |
+| Git transport: no Basic auth with the user `t`. LFS transport: neither that nor an `Authorization: Bearer` token | 401 |
+| the token fails verification (malformed, bad signature, expired, unknown issuer) | REST API: 403 `forbidden` (`Invalid or expired token`), as upstream answers. Git and LFS transports: 401, so that git asks for credentials ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)) |
+| a verified token issued for another organization | 403 `forbidden`; the REST detail is `Credential is not valid for this tenant` |
 | the key store fails while the server verifies the token | REST API, fork source tokens included: 403 `authentication_unavailable` (retry). Git and LFS transports: 401, as for an invalid token |
 | valid token, insufficient scope or ref policy denies | 403 |
 | `repo` claim mismatch with target | 403 (do not leak existence: 404 acceptable per vendor error-string instability) |

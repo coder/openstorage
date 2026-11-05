@@ -331,7 +331,7 @@ func TestWebhookAuth(t *testing.T) {
 		want  int
 	}{
 		"no token":      {"", http.StatusUnauthorized},
-		"garbage token": {"not-a-jwt", http.StatusUnauthorized},
+		"garbage token": {"not-a-jwt", http.StatusForbidden},
 		"repo-scoped token": {
 			e.mint(t, tokenSpec{iss: org, repo: "acme/repo", scopes: []string{auth.ScopeRepoWrite}}),
 			http.StatusForbidden,
