@@ -85,7 +85,7 @@ The model (`model/LaneSchedule.tla`) is a hand-written description of the code. 
 
    The "property that fails" column is measured: each guard was broken once in the real code, and check.sh failed with the first property listed (see [Validation](#validation)). For the two rows that list `NoLostForward` second, a model run with that fact FALSE and only `NoLostForward` checked fails it too.
 
-2. **Fingerprints.** facts.go hashes the tokens of every covered function (comments and layout do not count). check.sh compares the hashes with `model/fingerprints.txt`, recorded at the sync commit. A change that the facts do not see, such as a new branch or a new call, still shows as STALE. A STALE result is never a pass.
+2. **Fingerprints.** facts.go hashes the tokens of every declaration (function, method, const, var, type) in every covered file. Comments and layout do not count. check.sh compares the hashes with `model/fingerprints.txt`, recorded at the sync commit. A change that the facts do not see, such as a new branch, a new call or a changed helper or constant, still shows as STALE. Whole files are covered on purpose: a covered path calls many helpers, and any of them can change what the model describes. Most STALE results in these files touch nothing the model describes. Confirm that, and run `--record`. A STALE result is never a pass.
 
 Each TLA+ action names the Go call it stands for:
 
@@ -210,24 +210,20 @@ With every fact TRUE, each fact flipped in the model alone fails the same proper
 
 Sync commit: `849b9a27d39f6d9f7d24158dd7721fd292c26c4b` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
-| File | Covered code |
-|---|---|
-| `internal/meta/sqlite_schedule.go` | `SQLite.RequestPushNow`, `ClaimDuePush`, `FinishPushOutcome`, `finishLane`, `ListLocalWork`, `PushOutcome.validate` |
-| `internal/meta/sqlite_eventing.go` | `SQLite.RequestPush`, `SQLite.beginPush` |
-| `internal/meta/s3walmeta_schedule.go` | `s3walLocalSchedule.RequestPushNow`, `ClaimDuePush`, `FinishPushOutcome`, `ListLocalWork`, `laneHeld` |
-| `internal/meta/s3walmeta_eventing.go` | `S3WAL.RequestPush`, `S3WAL.beginPush` |
-| `internal/sync/worker_push.go` | `Worker.RunPush`, `Worker.transferPush`, `localPushOutcome`, `TransientPushFailure`, `PushRetryDelay`, `heldRefStale`, `const MaxPushTransientRetries`, `var pushRefspecs` |
-| `internal/sync/worker.go` | `Worker.waitPublication`, `restoreLocal`, `claimLocal`, `restoreForShutdown`, `retryFinish`, `retryFinishWithin`, `claimContext`, `claimLease`, `var mirrorRefspecs` |
-| `internal/sync/local_schedule.go` | `LocalScheduler.offer`, `SweepOnce`, `Start`, `Drain`, `shutdownAborted` |
-| `internal/events/refstore.go` | every function (`CASRef`, `CASRefGen`, `emitPush` and helpers) |
-| `cmd/openstorage/wire_eventing.go` | `enqueueSyncOrForward`, `wireHookEventing`, `hookUpstreamRow.GetRepoUpstream` |
-| `cmd/openstorage/wire_eventing_local.go` | `buildLocalSyncQueue` |
-| `internal/githttp/publication.go` | every function |
-| `internal/githttp/hydrate.go` | `Hydrate`, `hydrateRefs`, `refCmdBatch.flush` (the held-ref skip), `appendPushReleased`, and every function whose name contains `Hold`/`hold` or starts with `syncRefs` |
-| `internal/githttp/server.go` | `Server.hydrate`, `hydrateFailed` |
-| `internal/githttp/hook.go` | `referenceTransactionHook`, `updateHook`, and in `preReceive` the `reserveHoldsAndProbe` closure |
+Every declaration in these files is covered:
 
-`model/fingerprints.txt` holds one hash per entry.
+- `internal/meta/sqlite_schedule.go`, `internal/meta/sqlite_eventing.go` (the SQLite lane transitions)
+- `internal/meta/s3walmeta_schedule.go`, `internal/meta/s3walmeta_eventing.go` (the S3-WAL lane transitions)
+- `internal/sync/worker_push.go`, `internal/sync/worker.go`, `internal/sync/local_schedule.go` (runs, retries, leases, the sweep, the drain, failure classification, the stale-held restore)
+- `internal/events/refstore.go` (the intent decorator around the ref CAS, and its `BeforeCAS` step)
+- `cmd/openstorage/wire_eventing.go`, `cmd/openstorage/wire_eventing_local.go` (hook and serve wiring, forward gates, the intent before the CAS, the sync-claim suppression)
+- `internal/api/handlers_sync.go` (`push-upstream` and its `RequestPushNow`)
+- `internal/githttp/publication.go`, `internal/githttp/hydrate.go`, `internal/githttp/hook.go` (push holds, their release, the publication wait, the held-ref skip and the strict sync fetch)
+- `internal/githttp/server.go` (which fetches hydrate strictly, and the 423 answer)
+
+`cmd/openstorage/main.go` sets `StrictSyncFetch` for the local schedule. Only the `StrictSnapshot` fact checks that line: the file is mostly unrelated serve wiring.
+
+`model/fingerprints.txt` holds one hash per declaration.
 
 ## Files
 
