@@ -12,6 +12,8 @@
 #   osv.sh git     <run> <label> [--token <name>|none] [--expect <exit>] -- <git args...>
 #   osv.sh eq      <run> <label> <expected> <actual>
 #   osv.sh json    <file> <dotted.path>          print one JSON field; * maps a list (python3)
+#   osv.sh packs   <run> <repo id>               list the repo's stored packs (read-only)
+#   osv.sh stop    <run> a|b                     stop one node (fleet: check the other keeps serving)
 #   osv.sh cleanup <run>                         stop serve and containers, delete <run>/work, keep <run>/evidence
 #
 # <run> is a caller-chosen directory outside the checkout. Scratch state lives in
@@ -21,10 +23,11 @@ umask 077
 
 ORG=selfhost
 # Fleet mode: every container carries this label with the run dir as its value,
-# so cleanup removes only this run's containers. The S3 identity is the dev
-# credential from docker-compose.yml; the bucket is created by serve.
+# so cleanup removes only this run's containers. The PostgreSQL password and the
+# S3 secret key are random per run (work/secrets/), so another local user who
+# reaches the loopback ports cannot use the stores. serve creates the bucket.
 LABEL=dev.openstorage.osv.run
-S3_KEY=codestorage
+S3_ID=osv
 BUCKET=openstorage
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 REPO=$(cd "$SCRIPT_DIR/../../../.." && pwd -P)
@@ -162,12 +165,14 @@ start_serve() {
 	# The inner bash closes every inherited descriptor above stderr. Otherwise
 	# serve keeps the caller's open files, such as a flock that the caller holds
 	# around launch, and a cleanup under the same lock waits for serve forever.
+	# Never redirect the loop's stderr: bash saves fd 2 above 9 for the loop,
+	# the loop closes that copy, and serve then starts with stderr on /dev/null.
 	# shellcheck disable=SC2016 # $$, $f, and $1 expand in the inner bash
 	${setsid[@]+"${setsid[@]}"} bash -c 'echo $$ >"$1"; shift
 		for f in /proc/$$/fd/* /dev/fd/*; do
 			f=${f##*/}
 			[[ $f =~ ^[0-9]+$ ]] && ((f > 2)) && eval "exec $f>&-"
-		done 2>/dev/null
+		done
 		exec "$@"' osv-serve "$p.pid" \
 		env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="$WORK/tmp" \
 		OPENSTORAGE_ORG="$ORG" OPENSTORAGE_ORG_PUBKEYS="$WORK/keys/org.pub.pem" \
@@ -198,8 +203,16 @@ compose_image() {
 }
 
 # s3 <curl args...>: one SigV4-signed request to this run's SeaweedFS gateway.
+# The credential goes to curl on stdin, never on its command line.
 s3() {
-	curl -q -sS --noproxy '*' --max-time 30 --aws-sigv4 aws:amz:us-east-1:s3 --user "$S3_KEY:$S3_KEY" "$@"
+	printf 'user = "%s:%s"\n' "$S3_ID" "$(<"$WORK/secrets/s3")" |
+		curl -q -sS --noproxy '*' --max-time 30 --aws-sigv4 aws:amz:us-east-1:s3 -K - "$@"
+}
+
+# new_secret <name>: write a random 32-hex-digit secret to work/secrets/<name>.
+new_secret() {
+	mkdir -p "$WORK/secrets"
+	python3 -c 'import secrets; print(secrets.token_hex(16), end="")' >"$WORK/secrets/$1"
 }
 
 # run_containers: IDs of every container that carries this run's label.
@@ -212,18 +225,26 @@ run_containers() {
 start_backends() {
 	command -v docker >/dev/null || die "docker is not on PATH (--fleet needs it)"
 	docker info >/dev/null 2>&1 || die "'docker info' failed: the docker daemon is not reachable"
-	local pg_img s3_img pg_id s3_id
+	local pg_img s3_img pg_id s3_id old
+	# Containers from an unfinished cleanup of an earlier run at this path
+	# carry the same label, and doctor and cleanup would count them too.
+	old=$(run_containers) || die "docker ps failed"
+	[[ -z $old ]] || die "containers with label $LABEL=$RUN already exist (an earlier run at this path was not cleaned up): remove them, or pick a new run dir"
+	new_secret pg
+	new_secret s3
 	pg_img=$(compose_image postgres)
 	s3_img=$(compose_image chrislusf/seaweedfs)
 	printf 'postgres image: %s\nseaweedfs image: %s\n' "$pg_img" "$s3_img" >>"$EVID/launch.txt"
 
 	echo "osv: starting postgres and seaweedfs containers (label $LABEL=$RUN)" >&2
 	# Ports bind to loopback only; docker picks the host port.
-	pg_id=$(docker create --label "$LABEL=$RUN" -e POSTGRES_PASSWORD=postgres -p 127.0.0.1::5432 "$pg_img") ||
+	# "-e NAME" without a value copies NAME from the docker client's env, so
+	# the password stays off the command line.
+	pg_id=$(POSTGRES_PASSWORD=$(<"$WORK/secrets/pg") docker create --label "$LABEL=$RUN" -e POSTGRES_PASSWORD -p 127.0.0.1::5432 "$pg_img") ||
 		die "docker create postgres failed (run 'osv.sh cleanup $RUN')"
 	docker start "$pg_id" >/dev/null || die "docker start postgres failed (run 'osv.sh cleanup $RUN')"
 	printf '{"identities":[{"name":"%s","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","List","Tagging","Write"]}]}\n' \
-		"$S3_KEY" "$S3_KEY" "$S3_KEY" >"$WORK/s3.json"
+		"$S3_ID" "$S3_ID" "$(<"$WORK/secrets/s3")" >"$WORK/s3.json"
 	s3_id=$(docker create --label "$LABEL=$RUN" -p 127.0.0.1::8333 "$s3_img" \
 		server -s3 -dir=/data -ip.bind=0.0.0.0 -s3.config=/osv-s3.json) ||
 		die "docker create seaweedfs failed (run 'osv.sh cleanup $RUN')"
@@ -238,7 +259,7 @@ start_backends() {
 	# socket-only server first, so wait for a TCP query on the final server.
 	local deadline=$((SECONDS + 90)) ok=''
 	while ((SECONDS < deadline)); do
-		if [[ $(docker exec -e PGPASSWORD=postgres "$pg_id" psql -h 127.0.0.1 -U postgres -tAc 'select 1' 2>/dev/null) == 1 ]]; then
+		if [[ $(PGPASSWORD=$(<"$WORK/secrets/pg") docker exec -e PGPASSWORD "$pg_id" psql -h 127.0.0.1 -U postgres -tAc 'select 1' 2>/dev/null) == 1 ]]; then
 			ok=1
 			break
 		fi
@@ -314,7 +335,7 @@ cmd_launch() {
 	else
 		start_backends
 		local pg_url s3_url node pfx addr_a pid_a
-		pg_url="postgres://postgres:postgres@127.0.0.1:$PG_PORT/postgres?sslmode=disable"
+		pg_url="postgres://postgres:$(<"$WORK/secrets/pg")@127.0.0.1:$PG_PORT/postgres?sslmode=disable"
 		s3_url="s3://$BUCKET?endpoint=http://127.0.0.1:$S3_PORT&s3ForcePathStyle=true&region=us-east-1"
 		# Node a starts alone, so it runs the migrations and creates the bucket
 		# before node b boots. Each node has its own cache: only the database
@@ -324,15 +345,15 @@ cmd_launch() {
 			[[ $node == a ]] || pfx=$WORK/serve-$node
 			start_serve "$pfx" \
 				OPENSTORAGE_PG_URL="$pg_url" OPENSTORAGE_S3_URL="$s3_url" \
-				AWS_ACCESS_KEY_ID="$S3_KEY" AWS_SECRET_ACCESS_KEY="$S3_KEY" \
+				AWS_ACCESS_KEY_ID="$S3_ID" AWS_SECRET_ACCESS_KEY="$(<"$WORK/secrets/s3")" \
 				"$BIN" serve --listen 127.0.0.1:0 --cache-dir "$WORK/cache-$node"
 			printf 'node %s: serve pid %s, listen http://%s, cache %s\n' "$node" "$SERVE_PID" "$SERVE_ADDR" "$WORK/cache-$node" >>"$EVID/launch.txt"
 			echo "osv: node $node: serve pid $SERVE_PID listening on http://$SERVE_ADDR" >&2
 			[[ $node == b ]] || addr_a=$SERVE_ADDR pid_a=$SERVE_PID
 		done
-		printf 'database: %s\nbucket: %s\n' "$pg_url" "$s3_url" >>"$EVID/launch.txt"
-		printf 'OSV_MODE=fleet\nOSV_ADDR=%s\nOSV_PID=%s\nOSV_ADDR_B=%s\nOSV_PID_B=%s\nOSV_PG_URL=%q\nOSV_S3_URL=%q\nOSV_S3_PORT=%s\n' \
-			"$addr_a" "$pid_a" "$SERVE_ADDR" "$SERVE_PID" "$pg_url" "$s3_url" "$S3_PORT" >"$WORK/state.env"
+		printf 'database: postgres://postgres:<secret:pg>@127.0.0.1:%s/postgres\nbucket: %s\n' "$PG_PORT" "$s3_url" >>"$EVID/launch.txt"
+		printf 'OSV_MODE=fleet\nOSV_ADDR=%s\nOSV_PID=%s\nOSV_ADDR_B=%s\nOSV_PID_B=%s\nOSV_S3_URL=%q\nOSV_S3_PORT=%s\n' \
+			"$addr_a" "$pid_a" "$SERVE_ADDR" "$SERVE_PID" "$s3_url" "$S3_PORT" >"$WORK/state.env"
 	fi
 	cmd_doctor "$RUN"
 }
@@ -410,10 +431,37 @@ cmd_env() {
 	printf 'export OSV_MODE=%q OSV_RUN=%q OSV_URL=%q OSV_BIN=%q OSV_WORK=%q OSV_EVIDENCE=%q OSV_ORG=%q\n' \
 		"$OSV_MODE" "$RUN" "$OSV_URL" "$BIN" "$WORK" "$EVID" "$ORG"
 	[[ $OSV_MODE == fleet ]] || return 0
-	# The stores' URLs and the dev S3 credential, for read-only CLI checks such
-	# as list-packs. They are development values, like docker-compose.yml's.
-	printf 'export OSV_URL_B=%q OSV_PG_URL=%q OSV_S3_URL=%q OSV_S3_KEY=%q\n' \
-		"$OSV_URL_B" "$OSV_PG_URL" "$OSV_S3_URL" "$S3_KEY"
+	printf 'export OSV_URL_B=%q\n' "$OSV_URL_B"
+}
+
+# cmd_packs: list the repo's stored packs, from the data dir in local mode and
+# from the shared bucket in fleet mode. Read-only.
+cmd_packs() {
+	run_paths "${1-}"
+	[[ $# -eq 2 && -n $2 ]] || die "usage: osv.sh packs <run> <repo id>"
+	load_state
+	if [[ $OSV_MODE == fleet ]]; then
+		env -i PATH="$PATH" OPENSTORAGE_S3_URL="$OSV_S3_URL" \
+			AWS_ACCESS_KEY_ID="$S3_ID" AWS_SECRET_ACCESS_KEY="$(<"$WORK/secrets/s3")" \
+			"$BIN" list-packs --repo "$2"
+	else
+		env -i PATH="$PATH" "$BIN" list-packs --repo "$2" --data-dir "$WORK/data"
+	fi
+}
+
+# cmd_stop: stop one node of this run (SIGTERM, then SIGKILL after 30 s), for
+# recipes that check what happens when a replica goes away.
+cmd_stop() {
+	run_paths "${1-}"
+	[[ $# -eq 2 && ($2 == a || $2 == b) ]] || die "usage: osv.sh stop <run> a|b"
+	load_state
+	[[ $2 == a || $OSV_MODE == fleet ]] || die "node b exists only in a run launched with --fleet"
+	local pidfile=$WORK/serve.pid
+	[[ $2 == a ]] || pidfile=$WORK/serve-b.pid
+	LEFT=''
+	stop_serve "$pidfile"
+	[[ -z $LEFT ]] || die "node $2: processes still alive:$LEFT"
+	echo "== stop node $2 $(now): no process of node $2 is alive" | tee -a "$EVID/doctor.txt"
 }
 
 cmd_token() {
@@ -609,11 +657,12 @@ save_redacted_evidence() {
 	# Replace every stored token value with <token:name> in the evidence, and
 	# its Basic-auth form base64("t:<token>"), which curl -v prints in a
 	# failed call's stderr that cmd_api keeps.
-	python3 - "$WORK/tokens" "$EVID" <<'PYEOF'
+	# Fleet runs also replace their store secrets with <secret:name>.
+	python3 - "$WORK/tokens" "$EVID" "$WORK/secrets" <<'PYEOF'
 import base64, os, stat, sys
 def fail(e):
     raise e
-tokdir, evid = sys.argv[1], sys.argv[2]
+tokdir, evid, secdir = sys.argv[1], sys.argv[2], sys.argv[3]
 toks = {}
 for n in os.listdir(tokdir):
     if not n.endswith(".desc"):
@@ -621,6 +670,11 @@ for n in os.listdir(tokdir):
         if len(v) >= 8:
             toks[base64.b64encode(b"t:" + v)] = b"<basic:" + n.encode() + b">"
             toks[v] = b"<token:" + n.encode() + b">"
+if os.path.isdir(secdir):
+    for n in os.listdir(secdir):
+        v = open(os.path.join(secdir, n), "rb").read()
+        if len(v) >= 8:
+            toks[v] = b"<secret:" + n.encode() + b">"
 for d, _, names in os.walk(evid, onerror=fail):
     for n in names:
         p = os.path.join(d, n)
@@ -640,8 +694,12 @@ PYEOF
 stop_serve() {
 	local pid='' kids='' p k deadline
 	[[ -s $1 ]] && pid=$(<"$1")
+	if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && ! is_our_serve "$pid"; then
+		# Our serve exited and the PID was reused: never signal that process.
+		echo "osv: pid $pid from $1 no longer runs $BIN: treating that serve as exited" >&2
+		return 0
+	fi
 	if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
-		is_our_serve "$pid" || die "pid $pid is alive but does not run $BIN: refusing to signal it"
 		kids=$(descendants_of "$pid" | tr '\n' ' ')
 		kill -TERM "$pid"
 		deadline=$((SECONDS + 30))
@@ -710,10 +768,10 @@ cmd_cleanup() {
 }
 
 sub=${1-}
-[[ -n $sub ]] || { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ -n $sub ]] || { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 shift
 case $sub in
-	launch | doctor | env | token | api | git | eq | json | cleanup) "cmd_$sub" "$@" ;;
-	-h | --help | help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+	launch | doctor | env | token | api | git | eq | json | packs | stop | cleanup) "cmd_$sub" "$@" ;;
+	-h | --help | help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
 	*) die "unknown subcommand '$sub' (try: osv.sh help)" ;;
 esac

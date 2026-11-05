@@ -48,16 +48,16 @@ Teardown is `"$OSV" cleanup "$RUN"` (see [Cleanup](#cleanup)).
 
 ```sh
 "$OSV" launch "$RUN" --fleet
-eval "$("$OSV" env "$RUN")"   # also exports OSV_URL_B OSV_PG_URL OSV_S3_URL OSV_S3_KEY
+eval "$("$OSV" env "$RUN")"   # also exports OSV_URL_B
 ```
 
 `--fleet` replaces step 3 above with these steps:
 
-1. Starts a PostgreSQL container and a SeaweedFS container (`weed server -s3` with the development S3 identity `codestorage` from `docker-compose.yml`). Each carries the label `dev.openstorage.osv.run=<run dir>` and publishes its port on a free `127.0.0.1` port.
+1. Starts a PostgreSQL container and a SeaweedFS container (`weed server -s3`). Each carries the label `dev.openstorage.osv.run=<run dir>` and publishes its port on a free `127.0.0.1` port. The PostgreSQL password and the S3 secret key are random for each run and stay in `$RUN/work/secrets/`, so another local user who reaches the ports cannot use the stores. Cleanup replaces them with `<secret:pg>` and `<secret:s3>` in the evidence. `launch` refuses a run directory that already has containers with its label.
 2. Waits up to 90 s until PostgreSQL answers a TCP query, and up to 120 s until SeaweedFS stores an object in the probe bucket `osv-ready`. A fresh SeaweedFS can hold its first write for 10 to 15 s, so a passing `/healthz` alone is not ready.
 3. Starts node a, waits for its address, then starts node b. Both get `OPENSTORAGE_PG_URL` and `OPENSTORAGE_S3_URL` for the shared stores (bucket `openstorage`, which node a creates) and their own `--cache-dir` (`$RUN/work/cache-a`, `$RUN/work/cache-b`). Node a runs the migrations before node b boots.
 
-`OSV_URL` is node a and `OSV_URL_B` is node b. `api` calls go to node a unless you pass `--node b`. git picks the node from the URL in its arguments. A fleet launch takes about 20 s with cached images. The recipe for cross-node behavior is [`features/replicas.md`](features/replicas.md). The other recipes run unchanged on node a.
+`OSV_URL` is node a and `OSV_URL_B` is node b. `api` calls go to node a unless you pass `--node b`. git picks the node from the URL in its arguments. `"$OSV" stop "$RUN" b` stops node b for a recipe that checks the other node alone. A fleet launch takes about 20 s with cached images. The recipe for cross-node behavior is [`features/replicas.md`](features/replicas.md). The other recipes run unchanged on node a.
 
 ## Doctor
 
@@ -144,7 +144,7 @@ Read the result through a second view and record the comparison:
 
 `eq` takes the expected value first. It exits 1 on a mismatch, and also when the expected value is empty, so a failed lookup never passes.
 
-Use the open.storage CLI directly for read-only checks of stored state, for example `env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data"`. In fleet mode, pass the shared stores instead of `--data-dir`: `OPENSTORAGE_PG_URL="$OSV_PG_URL" OPENSTORAGE_S3_URL="$OSV_S3_URL" AWS_ACCESS_KEY_ID="$OSV_S3_KEY" AWS_SECRET_ACCESS_KEY="$OSV_S3_KEY"`.
+Check stored packs with `"$OSV" packs "$RUN" "$REPO_ID"`. It runs `openstorage list-packs` on the data directory in local mode and on the shared bucket in fleet mode. Use the open.storage CLI directly for other read-only checks, for example `env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data"` in local mode.
 
 ## Evidence
 
@@ -178,7 +178,7 @@ Proof standards:
 
 Run cleanup after every run, also after a failed launch or a failed drive. It:
 
-1. Checks that each saved serve PID (node b first in fleet mode, then node a) runs this run's binary. It refuses to signal any other process. A node that already exited is skipped.
+1. Checks that each saved serve PID (node b first in fleet mode, then node a) runs this run's binary. It never signals any other process: a node that exited is skipped, also when its PID now belongs to another process.
 2. Records the PIDs of serve's descendants, sends SIGTERM to serve (the drain takes up to 10 s), waits up to 30 s, then sends SIGKILL to serve and the recorded descendants that are still alive.
 3. Fleet mode: saves each labeled container's log to the evidence, then removes the container and its anonymous volumes with `docker rm -f -v`. It finds the containers by this run's label, never by name or image, so it touches no other container.
 4. Looks for leftovers: a recorded process or labeled container that is still alive, or (on Linux) any process whose working directory is under `$RUN/work`. When it finds one, it prints `LEFTOVER processes: <pid> ...` (a container shows as `container:<id>`), keeps `$RUN/work`, and exits 1.
@@ -194,13 +194,15 @@ After a `LEFTOVER` line, check each PID before you act. Your own shell is a comm
 |---|---|
 | `scripts/osv.sh launch <run> [--fleet]` | Build, generate keys, start serve (with `--fleet`: the containers and two nodes), wait for ready, run doctor. |
 | `scripts/osv.sh doctor <run>` | Read-only health check (see [Doctor](#doctor)). |
-| `scripts/osv.sh env <run>` | Print `export OSV_MODE=... OSV_RUN=... OSV_URL=... OSV_BIN=... OSV_WORK=... OSV_EVIDENCE=... OSV_ORG=...` for `eval`, plus `OSV_URL_B`, `OSV_PG_URL`, `OSV_S3_URL`, and `OSV_S3_KEY` in fleet mode. |
+| `scripts/osv.sh env <run>` | Print `export OSV_MODE=... OSV_RUN=... OSV_URL=... OSV_BIN=... OSV_WORK=... OSV_EVIDENCE=... OSV_ORG=...` for `eval`, plus `OSV_URL_B` in fleet mode. |
 | `scripts/osv.sh token <run> <name> <mint flags>` | Mint a token with the run's org key (`--iss selfhost` is preset). A later `--key <pem>` replaces the run's key, for wrong-key checks. |
 | `scripts/osv.sh token <run> <name> --raw <value>` | Store a literal token value. |
 | `scripts/osv.sh api <run> <label> [--node a\|b] [--token <name>\|none] [--expect <code>] <METHOD> <path> [curl args]` | One HTTP request, recorded. |
 | `scripts/osv.sh git <run> <label> [--token <name>\|none] [--expect <exit>] -- <git args>` | One hermetic git command in `$OSV_WORK`, recorded. |
 | `scripts/osv.sh eq <run> <label> <expected> <actual>` | Record an equality check. Exits 1 on a mismatch or an empty expected value. |
 | `scripts/osv.sh json <file> <dotted.path>` | Print one JSON field, for example `commits.0.sha`. A `*` segment maps a list: `commits.*.sha` prints a JSON list. |
+| `scripts/osv.sh packs <run> <repo id>` | List the repo's stored packs (read-only), in either mode. |
+| `scripts/osv.sh stop <run> a\|b` | Stop one node of the run. Exits 1 when a process of that node is still alive. |
 | `scripts/osv.sh cleanup <run>` | Stop serve and remove the run's containers, delete `<run>/work`, keep `<run>/evidence`. |
 | `scripts/askpass.sh` | The `GIT_ASKPASS` program that `osv.sh git` uses. Do not call it yourself. |
 

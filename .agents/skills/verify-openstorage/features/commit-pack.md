@@ -32,7 +32,7 @@ Preconditions:
 ```sh
 "$OSV" api "$RUN" cp-tip-before --token rw --expect 200 GET '/api/v1/repos/branch?name=main'
 "$OSV" eq "$RUN" cp-tip-before-is-seed "$SEED" "$("$OSV" json "$OSV_EVIDENCE/cp-tip-before.body" branch.head_sha)"
-env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data" >"$OSV_EVIDENCE/cp-packs-before.txt"
+"$OSV" packs "$RUN" "$REPO_ID" >"$OSV_EVIDENCE/cp-packs-before.txt"
 ```
 
 - **Commit a file.** Write the frames, then send them. The status is `200`, `result.status` is `ok`, `result.target_branch` and `result.branch` are `main`, and `result.old_sha` is `SEED`.
@@ -82,7 +82,7 @@ NEW=$("$OSV" json "$OSV_EVIDENCE/cp-upsert.body" commit.commit_sha)
 - **Check the stored pack.** List the packs again. There is exactly one more pack than before.
 
 ```sh
-env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data" >"$OSV_EVIDENCE/cp-packs-after.txt"
+"$OSV" packs "$RUN" "$REPO_ID" >"$OSV_EVIDENCE/cp-packs-after.txt"
 "$OSV" eq "$RUN" cp-one-new-pack "$(($(grep -c '\.pack' "$OSV_EVIDENCE/cp-packs-before.txt") + 1))" \
   "$(grep -c '\.pack' "$OSV_EVIDENCE/cp-packs-after.txt")"
 ```
