@@ -32,7 +32,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/lane-schedule-check.XXXXXX")
 ```
 
 - Needs Go (the `go.mod` version), Java 11 or newer, and `curl`. The first run downloads `tla2tools.jar` 1.7.4 (sha256-pinned) into `${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla`, the cache `verify-orphan-sweep` uses too. Set `JAVA`, `GO`, or `OPENSTORAGE_TLA_CACHE` to override.
-- It takes about 3 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`); about 90 s with `TLC_WORKERS=8`.
+- A passing run takes about 2 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), and about 90 s with `TLC_WORKERS=8`. A failing run usually takes seconds, because TLC stops at the first violation.
 - `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path.
 - `--only <cfg>` runs one config, for example `--only LaneSchedule.cfg`. It is for quick iteration. Finish with a full run.
 - `--fingerprints-only` checks the code facts and the fingerprints without TLC or Java, in about a second. CI runs it in the `lane-schedule-fingerprints` job of `.github/workflows/ci.yml`, so a change to covered code fails CI until someone brings the model in line and runs `check.sh --record`. CI does not run TLC: a pass says that the covered code is the code the model was checked against, not that the properties hold.
@@ -56,7 +56,7 @@ RESULT: PASS
 | Exit | Meaning | What you do |
 |---|---|---|
 | 0 | PASS | Nothing. |
-| 1 | FAIL: a property broke | [Read the failure](#read-a-failure). |
+| 1 | FAIL: a property broke. FAIL outranks STALE: the same run can also print a STALE coverage block, and then `--record` refuses until the failure is gone | [Read the failure](#read-a-failure). |
 | 2 | STALE: covered code changed since the sync commit, a fact is FALSE, or a probe stopped failing. In a full run, the properties hold on the model. With `--fingerprints-only`, TLC did not run, so the result says nothing about the properties | [Bring the model in line](#bring-the-model-in-line). |
 | 3 | The check could not run | Fix the tool problem it prints (Go, Java, download, a TLA+ parse error, or a covered function that facts.go cannot find). |
 
@@ -103,9 +103,22 @@ Each TLA+ action names the Go call it stands for:
 | `RCancel` | `LocalScheduler.Drain` cancels the run with `ErrShutdown` |
 | `RCrash` | the run's process dies, its claim commits unseen (`claimContext`), or every `retryFinish` attempt fails |
 
+### Model variables
+
+| Variable | Code |
+|---|---|
+| `pending` | `push_pending` (S3-WAL `PushPending`): 0, 1 (plain) or 2 (force) |
+| `due` | `push_due`: `"zero"` is 0 (due now, or an explicit request during a run), `"claim"` is a claim time, `"future"` a backoff, `"elapsed"` a backoff that ended |
+| `attempt` | `push_attempt` |
+| `claim` | `push_syncing` (`held`), `push_claim_holder` (`holder`), `push_claim_force` (`force`), lease ran out (`expired`), holder's run ended (`dead`), and the history field `owes` (it took a force request) |
+| `authority`, `cacheRef`, `upstream` | the ref's version in the ref store, in the cache repo, and upstream |
+| `hold` | the push whose live push hold names the ref |
+| `wState`, `rState` | each push's and each run's phase, named after the action that entered it |
+| `forceOwed`, `explicitOwed`, `spent`, `rewound`, `hammered` | history variables that only feed the properties |
+
 ## Read a failure
 
-1. Open the trace that check.sh names, `<out>/<config>.trace.txt`. It lists each step (the TLA+ action) and the variables that changed. A liveness trace ends with the step that loops back. For a picture in plain words, read the result with the pstack `/statechart` skill if you have it: give it `model/LaneSchedule.tla` and `<out>/<config>.run.cfg` (the config with the facts check.sh used). It shows an invariant violation as its shortest path in plain words, and draws how the lane moves between states when the check passes.
+1. Open the trace that check.sh names, such as `<out>/LaneSchedule.trace.txt`. It lists each step (the TLA+ action) and the variables that changed (see [Model variables](#model-variables)). A liveness trace ends with the step that loops back. A probe line that says `UNEXPECTED` means the probe failed on another property than its own: a FALSE fact or a model change broke that property too. Read that probe's trace like any other failure. For a picture in plain words, read the result with the pstack `/statechart` skill if you have it: give it `model/LaneSchedule.tla` and `<out>/<config>.run.cfg` (the config with the facts check.sh used). It shows an invariant violation as its shortest path in plain words, and draws how the lane moves between states when the check passes.
 2. Look at the code facts first. A FALSE fact names the guard your change removed or moved. That is the likely cause. The model treats a FALSE guard as absent. If your change moved the guard instead of removing it, the trace can show a path that the moved guard still handles.
 3. Replay the trace against the code, one step per action, using the action table above. Ask for each step: can this call happen at this point in the real code, with these values?
    - If some step cannot happen in the code, the model is wrong. Fix the model to match the code, say what was wrong, and rerun.
