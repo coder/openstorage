@@ -544,49 +544,137 @@ func (d *tableDiffer) recv() (diffSection, error) {
 	return s, nil
 }
 
-// TestLastCommitWalkCancelsDeadChains: the tip T merges chains D and E,
-// whose lines the spool interleaves. p takes D and resolves at D1, so the
-// rest of D is dead, while q walks all of E, and each E line makes the walk
-// wait. The walk must stop sending D ahead once D1 resolves: at most one
-// window of D's diffs is wasted, not the whole chain.
+// TestLastCommitWalkCancelsDeadChains (#588, #593): a diff sent ahead is
+// wasted when no path reaches its commit, and the walk cancels such a chain
+// in two places. Each case is a spool that git would not print, answered by
+// a table, and needs one of the calls on its own: removing the other call
+// leaves it green. The inputs the walk sends name which diffs were wasted.
 func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
-	const n = 4 * lastCommitWindow
 	id := func(name string) string { return fmt.Sprintf("%x", sha1.Sum([]byte(name))) }
-	p, q := int32(0), int32(1)
-	tip, root := id("T"), id("R")
-	changed := map[string][]int32{tip + " " + id("D1"): {q}, id("D1") + " " + id("D2"): {p}, root: {p, q}}
-	var spool strings.Builder
-	fmt.Fprintf(&spool, "%s %s %s\n", tip, id("D1"), id("E1"))
-	for i := 1; i <= n; i++ {
-		next := func(chain string) string {
-			if i == n {
-				return root
+	chain := func(prefix string, n int, end string) []string {
+		var lines []string
+		for i := 1; i <= n; i++ {
+			next := end
+			if i < n {
+				next = fmt.Sprintf("%s%d", prefix, i+1)
 			}
-			return id(fmt.Sprintf("%s%d", chain, i+1))
+			lines = append(lines, fmt.Sprintf("%s%d %s", prefix, i, next))
 		}
-		fmt.Fprintf(&spool, "%s %s\n%s %s\n", id(fmt.Sprintf("D%d", i)), next("D"), id(fmt.Sprintf("E%d", i)), next("E"))
+		return lines
 	}
-	spool.WriteString(root + "\n")
+	for _, tc := range []struct {
+		name string
+		// spool lists the commits, children first, as "commit parent...";
+		// the first is the tip. changed maps a diff-tree input to the paths
+		// it lists. last maps each path to its answer.
+		spool   []string
+		changed map[string][]string
+		last    map[string]string
+		// dead names the commits that no path reaches; maxDiffed bounds the
+		// diffs sent for them.
+		dead      func(commit string) bool
+		maxDiffed int
+	}{{
+		// The tip T merges chains D and E, whose lines the spool interleaves.
+		// p takes D and resolves at D1, so the rest of D is dead, while q
+		// walks all of E, and each E line makes the walk wait. D1 resolves
+		// every path it holds, so the walk cancels the chain below it. Only
+		// the diffs sent before that are wasted: D2 to D8, as the window
+		// holds eight lines of each chain. Without that cancel, the chain
+		// stays marked until D2 pops, and the next pass sends one more.
+		name:      "a line that resolves every path cancels the chain below it",
+		spool:     slices.Concat([]string{"T D1 E1"}, interleave(chain("D", 4*lastCommitWindow, "R"), chain("E", 4*lastCommitWindow, "R")), []string{"R"}),
+		changed:   map[string][]string{"T D1": {"q"}, "D1 D2": {"p"}, "R": {"p", "q"}},
+		last:      map[string]string{"p": "D1", "q": "R"},
+		dead:      func(c string) bool { return strings.HasPrefix(c, "D") && c != "D1" },
+		maxDiffed: lastCommitWindow/2 - 1,
+	}, {
+		// H and HZ are two dead chains below the shared parent P2. H resolves
+		// p, and its cancel forgets P2. M then hands q to HZ, which is sent
+		// ahead and marks P2 again, past the window. P1, sent ahead with no
+		// path, pops next, and P2 enters the window at exactly the line where
+		// it would be sent, before HZ pops and resolves q. P1's cancel is the
+		// one that forgets P2 this time.
+		name:      "a line sent ahead with no path forgets the parent a sibling chain marked",
+		spool:     slices.Concat([]string{"T H M", "H P1", "M HZ R", "P1 P2", "HZ P2"}, fillers("F", 5, 18, "R"), []string{"P2 R", "R"}),
+		changed:   map[string][]string{"T H": {"q"}, "H P1": {"p"}, "HZ P2": {"q"}, "R": {"p", "q"}},
+		last:      map[string]string{"p": "H", "q": "HZ"},
+		dead:      func(c string) bool { return c == "P2" },
+		maxDiffed: 0,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := []string{"p", "q"}
+			ids := map[string]string{}
+			name := func(c string) string { // symbolic names to commit ids
+				if ids[c] == "" {
+					ids[c] = id(c)
+				}
+				return ids[c]
+			}
+			byID := map[string]string{}
+			var spool strings.Builder
+			for _, line := range tc.spool {
+				var out []string
+				for _, c := range strings.Fields(line) {
+					out = append(out, name(c))
+					byID[name(c)] = c
+				}
+				spool.WriteString(strings.Join(out, " ") + "\n")
+			}
+			changed := map[string][]int32{}
+			for input, ps := range tc.changed {
+				var out []string
+				for _, c := range strings.Fields(input) {
+					out = append(out, name(c))
+				}
+				for _, p := range ps {
+					changed[strings.Join(out, " ")] = append(changed[strings.Join(out, " ")], int32(slices.Index(paths, p)))
+				}
+			}
+			w := newLastCommitWalk(name(strings.Fields(tc.spool[0])[0]), paths, 10)
+			d := &tableDiffer{changed: changed}
+			if err := w.walk(bufio.NewReader(strings.NewReader(spool.String())), d); err != nil {
+				t.Fatal(err)
+			}
+			for i, p := range paths {
+				if got := byID[w.last[i]]; got != tc.last[p] {
+					t.Fatalf("%s resolved at %q, want %q", p, got, tc.last[p])
+				}
+			}
+			var diffed []string
+			for _, input := range d.inputs {
+				if c := byID[strings.Fields(input)[0]]; tc.dead(c) {
+					diffed = append(diffed, c)
+				}
+			}
+			if len(diffed) > tc.maxDiffed {
+				t.Fatalf("%d diffs went to commits that no path reaches, want at most %d: %v", len(diffed), tc.maxDiffed, diffed)
+			}
+		})
+	}
+}
 
-	w := newLastCommitWalk(tip, []string{"p", "q"}, 10)
-	d := &tableDiffer{changed: changed}
-	if err := w.walk(bufio.NewReader(strings.NewReader(spool.String())), d); err != nil {
-		t.Fatal(err)
-	}
-	if w.last[p] != id("D1") || w.last[q] != root {
-		t.Fatalf("answers %v, want p at D1 and q at the root", w.last)
-	}
-	wasted := 0
-	for _, input := range d.inputs {
-		for i := 2; i <= n; i++ {
-			if strings.HasPrefix(input, id(fmt.Sprintf("D%d", i))) {
-				wasted++
-			}
+// interleave returns the lines of a and b alternately.
+func interleave(a, b []string) []string {
+	var out []string
+	for i := range max(len(a), len(b)) {
+		if i < len(a) {
+			out = append(out, a[i])
+		}
+		if i < len(b) {
+			out = append(out, b[i])
 		}
 	}
-	if wasted > lastCommitWindow {
-		t.Fatalf("%d of the %d dead D commits were diffed, want at most %d", wasted, n-1, lastCommitWindow)
+	return out
+}
+
+// fillers returns the lines "<prefix>i parent" for i from..to.
+func fillers(prefix string, from, to int, parent string) []string {
+	var out []string
+	for i := from; i <= to; i++ {
+		out = append(out, fmt.Sprintf("%s%d %s", prefix, i, parent))
 	}
+	return out
 }
 
 // TestDiffReaderFieldsSplitAcrossWrites feeds real diff-tree answers to
