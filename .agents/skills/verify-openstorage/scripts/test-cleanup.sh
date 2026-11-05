@@ -8,8 +8,9 @@
 #   OSV=/path/to/other/osv.sh .agents/skills/verify-openstorage/scripts/test-cleanup.sh
 #
 # Prints one line per case and ends with a count line. Exit 0 when no case
-# failed. Cases that need an unreadable file are skipped when the user is root,
-# who reads everything. The fake token is made up. The script prints only
+# failed. It needs timeout (gtimeout on macOS) to stop a hung case. Cases that
+# need an unreadable file are skipped when the user is root, who reads
+# everything. The fake token is made up. The script prints only
 # counts of matches, never file contents.
 set -uo pipefail
 umask 077
@@ -17,6 +18,10 @@ umask 077
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 OSV=${OSV:-$here/osv.sh}
 [[ -f $OSV ]] || { echo "test-cleanup: no $OSV" >&2; exit 2; }
+TIMEOUT=$(command -v timeout || command -v gtimeout) || {
+	echo "test-cleanup: needs timeout (GNU coreutils; on macOS: brew install coreutils, which provides gtimeout)" >&2
+	exit 2
+}
 T=$(mktemp -d "${TMPDIR:-/tmp}/osv-test-XXXXXX") || exit 2
 T=$(cd "$T" && pwd -P)
 trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
@@ -60,7 +65,7 @@ mkrun() {
 # osv <args...>: run osv.sh with the fake docker first on PATH; output in $T/out, status in RC.
 osv() {
 	local state=$RUN/docker
-	timeout 60 env PATH="$T/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_ID=$FAKEID FAKE_DOCKER_TOKEN=$TOK bash "$OSV" "$@" >"$T/out" 2>&1
+	"$TIMEOUT" 60 env PATH="$T/bin:$PATH" FAKE_DOCKER_STATE="$state" FAKE_DOCKER_ID=$FAKEID FAKE_DOCKER_TOKEN=$TOK bash "$OSV" "$@" >"$T/out" 2>&1
 	RC=$?
 }
 
