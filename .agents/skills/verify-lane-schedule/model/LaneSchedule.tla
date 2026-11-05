@@ -1,0 +1,359 @@
+---------------------------- MODULE LaneSchedule ----------------------------
+(***************************************************************************)
+(* The push lane of one repository's lane row (ADR-50), the writers that   *)
+(* record forward intent on it, and the runs that forward the repository   *)
+(* upstream. Each action is one atomic step of the code: one row           *)
+(* transaction on SQLite, one meta.json CAS on S3-WAL, one hook step, or   *)
+(* one run step. SKILL.md maps every action to its Go call.                *)
+(*                                                                         *)
+(* One ref with versions 0..Cardinality(Writers): every accepted write is  *)
+(* one larger number, so "the upstream has write v" is upstream >= v.      *)
+(***************************************************************************)
+EXTENDS Naturals, FiniteSets
+
+CONSTANTS
+    Writers,           \* git pushes; each writes the ref once
+    Runners,           \* push runs (any process); a runner runs one at a time
+    ApiCalls,          \* explicit push-upstream calls: a subset of {"plain", "force"}
+    MaxRetries,        \* MaxPushTransientRetries, scaled down
+    MaxOutages,        \* transient upstream failures in one behavior
+    MaxFaults,         \* run crashes, failed finish writes, shutdown cancels, writer crashes
+    \* Assumptions the code relies on; each probe config drops one.
+    LeaseOutlivesRun,  \* a claim expires only after its run ended
+    PushCompletes,     \* a push whose authority CAS won records its intent and commits its cache ref
+    \* Code facts (facts/facts.go); FALSE takes the broken branch.
+    ClaimConsumesPending, ClaimMarksDue, DoneKeepsPending, RetryRemarks, FinishKeepsExplicit,
+    StealInheritsForce, RunPassesForce, WaitBeforeSnapshot, ShutdownRestores
+
+ASSUME ApiCalls \subseteq {"plain", "force"}
+ASSUME MaxRetries \in Nat /\ MaxOutages \in Nat /\ MaxFaults \in Nat
+
+NoOne == "none"
+Max(a, b) == IF a >= b THEN a ELSE b
+Level(force) == IF force THEN 2 ELSE 1
+
+Released == [held |-> FALSE, holder |-> NoOne, force |-> FALSE,
+             expired |-> FALSE, dead |-> FALSE, owes |-> FALSE]
+
+VARIABLES
+    authority,     \* the ref store's value (the authority CAS)
+    cacheRef,      \* the cache repo's ref, which a loopback fetch serves
+    hold,          \* writer whose live push hold names the ref, or NoOne
+    wState, wVer,  \* writer phase and the version its CAS wrote
+    pending,       \* push_pending: 0, 1 (plain) or 2 (force)
+    due,           \* push_due: "zero", "claim" (claim time), "future", "elapsed"
+    attempt,       \* push_attempt
+    claim,         \* push_syncing, holder, push_claim_force, lease state
+    rState, rSnap, rForce, rAttempt,
+    upstream,      \* the upstream's ref
+    apiLeft, outages, faults,
+    \* History variables: they only feed the properties.
+    forceOwed,     \* a force request that no claim has taken yet
+    explicitOwed,  \* an explicit request that no claim has taken yet
+    spent,         \* a run gave up after its retry budget, and no request came since
+    rewound,       \* a push moved the upstream backwards
+    hammered       \* a retry or restore with no explicit request left the lane due now
+
+writerVars == <<authority, cacheRef, hold, wState, wVer>>
+rowVars == <<pending, due, attempt, claim>>
+runVars == <<rState, rSnap, rForce, rAttempt>>
+envVars == <<upstream, apiLeft, outages, faults>>
+ghostVars == <<forceOwed, explicitOwed, spent, rewound, hammered>>
+vars == <<writerVars, rowVars, runVars, envVars, ghostVars>>
+
+TypeOK ==
+    /\ authority \in 0..Cardinality(Writers)
+    /\ cacheRef \in 0..Cardinality(Writers)
+    /\ upstream \in 0..Cardinality(Writers)
+    /\ hold \in Writers \cup {NoOne}
+    /\ wState \in [Writers -> {"idle", "held", "cas", "marked", "done", "dead"}]
+    /\ pending \in 0..2
+    /\ due \in {"zero", "claim", "future", "elapsed"}
+    /\ attempt \in 0..MaxRetries
+    /\ claim.held \in BOOLEAN /\ claim.holder \in Runners \cup {NoOne}
+    /\ rState \in [Runners -> {"idle", "claimed", "waited", "snapped", "passed",
+                               "ok", "rejected", "transient"}]
+
+Init ==
+    /\ authority = 0 /\ cacheRef = 0 /\ hold = NoOne
+    /\ wState = [w \in Writers |-> "idle"] /\ wVer = [w \in Writers |-> 0]
+    /\ pending = 0 /\ due = "zero" /\ attempt = 0 /\ claim = Released
+    /\ rState = [r \in Runners |-> "idle"] /\ rSnap = [r \in Runners |-> 0]
+    /\ rForce = [r \in Runners |-> FALSE] /\ rAttempt = [r \in Runners |-> 0]
+    /\ upstream = 0 /\ apiLeft = ApiCalls /\ outages = 0 /\ faults = 0
+    /\ forceOwed = FALSE /\ explicitOwed = FALSE /\ spent = FALSE /\ rewound = FALSE
+    /\ hammered = FALSE
+
+-----------------------------------------------------------------------------
+(* Writers: githttp preReceive reserves the hold, the update hook's CASRef *)
+(* wins (authority), events.RefStore.emitPush records the intent           *)
+(* (RequestPush), receive-pack commits the cache ref and the               *)
+(* reference-transaction hook releases the hold.                           *)
+
+WReserve(w) ==
+    /\ wState[w] = "idle" /\ hold = NoOne
+    /\ hold' = w
+    /\ wState' = [wState EXCEPT ![w] = "held"]
+    /\ UNCHANGED <<authority, cacheRef, wVer, rowVars, runVars, envVars, ghostVars>>
+
+WCas(w) ==
+    /\ wState[w] = "held"
+    /\ authority' = authority + 1
+    /\ wVer' = [wVer EXCEPT ![w] = authority + 1]
+    /\ wState' = [wState EXCEPT ![w] = "cas"]
+    /\ UNCHANGED <<cacheRef, hold, rowVars, runVars, envVars, ghostVars>>
+
+WMark(w) ==
+    /\ wState[w] = "cas"
+    /\ pending' = Max(pending, 1)
+    /\ wState' = [wState EXCEPT ![w] = "marked"]
+    /\ spent' = FALSE
+    /\ UNCHANGED <<authority, cacheRef, hold, wVer, due, attempt, claim,
+                   runVars, envVars, forceOwed, explicitOwed, rewound, hammered>>
+
+WPublish(w) ==
+    /\ wState[w] = "marked"
+    /\ cacheRef' = Max(cacheRef, wVer[w])
+    /\ hold' = IF hold = w THEN NoOne ELSE hold
+    /\ wState' = [wState EXCEPT ![w] = "done"]
+    /\ UNCHANGED <<authority, wVer, rowVars, runVars, envVars, ghostVars>>
+
+\* The push dies (hook or receive-pack killed, or a failed RequestPush,
+\* which emitPush only logs as "sync poke lost"). Its hold goes with it.
+\* Before the CAS this loses nothing. After the CAS it can lose the intent
+\* ("cas"), or leave the cache ref stale ("marked") until a read hydrates
+\* it with no hold on the ref; PushCompletes rules both out.
+WCrash(w) ==
+    /\ faults < MaxFaults
+    /\ wState[w] \in {"held"} \cup (IF PushCompletes THEN {} ELSE {"cas", "marked"})
+    /\ hold' = IF hold = w THEN NoOne ELSE hold
+    /\ wState' = [wState EXCEPT ![w] = "dead"]
+    /\ faults' = faults + 1
+    /\ UNCHANGED <<authority, cacheRef, wVer, rowVars, runVars,
+                   upstream, apiLeft, outages, ghostVars>>
+
+-----------------------------------------------------------------------------
+(* Explicit push-upstream (RequestPushNow) and time.                       *)
+
+Api(a) ==
+    /\ a \in apiLeft
+    /\ apiLeft' = apiLeft \ {a}
+    /\ pending' = Max(pending, Level(a = "force"))
+    /\ due' = "zero"
+    /\ explicitOwed' = TRUE
+    /\ forceOwed' = (forceOwed \/ a = "force")
+    /\ spent' = FALSE
+    /\ UNCHANGED <<writerVars, attempt, claim, runVars, upstream, outages,
+                   faults, rewound, hammered>>
+
+\* A backoff ends: push_due <= now.
+Tick ==
+    /\ due = "future"
+    /\ due' = "elapsed"
+    /\ UNCHANGED <<writerVars, pending, attempt, claim, runVars, envVars, ghostVars>>
+
+\* A lease expires. With LeaseOutlivesRun only a dead run's claim expires.
+Expire ==
+    /\ claim.held /\ ~claim.expired
+    /\ claim.dead \/ ~LeaseOutlivesRun
+    /\ claim' = [claim EXCEPT !.expired = TRUE]
+    /\ UNCHANGED <<writerVars, pending, due, attempt, runVars, envVars, ghostVars>>
+
+-----------------------------------------------------------------------------
+(* Runs: Worker.RunPush on the local schedule.                             *)
+
+Holds(r) == claim.held /\ claim.holder = r
+
+\* ClaimDuePush: beginPush with requireDue.
+Claimable ==
+    \/ ~claim.held /\ pending > 0 /\ due \in {"zero", "elapsed"}
+    \/ claim.held /\ claim.expired
+
+RClaim(r) ==
+    /\ rState[r] = "idle" /\ Claimable
+    /\ LET steal == claim.held
+           f == pending = 2 \/ (StealInheritsForce /\ steal /\ claim.force)
+       IN /\ claim' = [held |-> TRUE, holder |-> r, force |-> f, expired |-> FALSE,
+                       dead |-> FALSE, owes |-> (forceOwed \/ (steal /\ claim.owes))]
+          /\ rForce' = [rForce EXCEPT ![r] = f]
+    /\ pending' = IF ClaimConsumesPending THEN 0 ELSE pending
+    /\ due' = IF ClaimMarksDue THEN "claim" ELSE due
+    /\ rState' = [rState EXCEPT ![r] = "claimed"]
+    /\ rAttempt' = [rAttempt EXCEPT ![r] = attempt]
+    /\ forceOwed' = FALSE
+    /\ explicitOwed' = FALSE
+    /\ UNCHANGED <<writerVars, attempt, rSnap, envVars, spent, rewound, hammered>>
+
+\* End-of-run writes (FinishPushOutcome). Each is guarded by the holder:
+\* a run that lost its claim abandons without writing.
+NextDue == IF FinishKeepsExplicit /\ due = "zero" THEN "zero" ELSE "future"
+Remark(r) == IF RetryRemarks THEN Max(pending, Level(RunPassesForce /\ rForce[r]))
+             ELSE pending
+
+Done(r) ==
+    /\ claim' = Released
+    /\ attempt' = 0
+    /\ due' = "zero"
+    /\ pending' = IF DoneKeepsPending THEN pending ELSE 0
+    /\ rState' = [rState EXCEPT ![r] = "idle"]
+    /\ UNCHANGED <<forceOwed, hammered>>
+
+Retry(r) ==
+    /\ claim' = Released
+    /\ attempt' = attempt + 1
+    /\ due' = NextDue
+    /\ pending' = Remark(r)
+    /\ forceOwed' = (forceOwed \/ claim.owes)
+    /\ hammered' = (hammered \/ (~explicitOwed /\ NextDue = "zero"))
+    /\ rState' = [rState EXCEPT ![r] = "idle"]
+
+Restore(r) ==
+    /\ claim' = Released
+    /\ due' = NextDue
+    /\ pending' = Remark(r)
+    /\ forceOwed' = (forceOwed \/ claim.owes)
+    /\ hammered' = (hammered \/ (~explicitOwed /\ NextDue = "zero"))
+    /\ rState' = [rState EXCEPT ![r] = "idle"]
+    /\ UNCHANGED attempt
+
+Abandon(r) ==
+    /\ rState' = [rState EXCEPT ![r] = "idle"]
+    /\ UNCHANGED <<rowVars, forceOwed, hammered>>
+
+\* waitPublication: blocks while a live hold names the ref.
+RWait(r) ==
+    /\ rState[r] = "claimed"
+    /\ WaitBeforeSnapshot => hold = NoOne
+    /\ rState' = [rState EXCEPT ![r] = "waited"]
+    /\ UNCHANGED <<writerVars, rowVars, rSnap, rForce, rAttempt, envVars, ghostVars>>
+
+\* The wait times out (localPublicationWaitTimeout): restoreLocal.
+RWaitFail(r) ==
+    /\ rState[r] = "claimed" /\ WaitBeforeSnapshot /\ hold # NoOne
+    /\ IF Holds(r) THEN Restore(r) ELSE Abandon(r)
+    /\ UNCHANGED <<writerVars, rSnap, rForce, rAttempt, envVars,
+                   explicitOwed, spent, rewound>>
+
+\* transferPush's loopback fetch. Hydration copies the authority into the
+\* cache unless a live hold names the ref.
+RSnap(r) ==
+    /\ rState[r] = "waited"
+    /\ LET v == IF hold = NoOne THEN authority ELSE cacheRef
+       IN /\ rSnap' = [rSnap EXCEPT ![r] = v]
+          /\ cacheRef' = v
+    /\ rState' = [rState EXCEPT ![r] = "snapped"]
+    /\ UNCHANGED <<authority, hold, wState, wVer, rowVars, rForce, rAttempt,
+                   envVars, ghostVars>>
+
+\* The detach/steal barrier before the upstream push.
+RBarrier(r) ==
+    /\ rState[r] = "snapped"
+    /\ rState' = [rState EXCEPT ![r] = IF Holds(r) THEN "passed" ELSE "idle"]
+    /\ UNCHANGED <<writerVars, rowVars, rSnap, rForce, rAttempt, envVars, ghostVars>>
+
+\* git push --atomic: a plain push applies only as a fast-forward.
+RPush(r) ==
+    /\ rState[r] = "passed"
+    /\ IF rForce[r] \/ rSnap[r] >= upstream
+       THEN /\ upstream' = rSnap[r]
+            /\ rewound' = (rewound \/ rSnap[r] < upstream)
+            /\ rState' = [rState EXCEPT ![r] = "ok"]
+       ELSE /\ rState' = [rState EXCEPT ![r] = "rejected"]
+            /\ UNCHANGED <<upstream, rewound>>
+    /\ UNCHANGED <<writerVars, rowVars, rSnap, rForce, rAttempt, apiLeft,
+                   outages, faults, forceOwed, explicitOwed, spent, hammered>>
+
+\* The upstream is unreachable (FailUnreachable).
+RTransient(r) ==
+    /\ rState[r] = "passed" /\ outages < MaxOutages
+    /\ outages' = outages + 1
+    /\ rState' = [rState EXCEPT ![r] = "transient"]
+    /\ UNCHANGED <<writerVars, rowVars, rSnap, rForce, rAttempt, upstream,
+                   apiLeft, faults, ghostVars>>
+
+\* localPushOutcome, then FinishPushOutcome.
+RFinish(r) ==
+    /\ rState[r] \in {"ok", "rejected", "transient"}
+    /\ IF ~Holds(r) THEN Abandon(r) /\ UNCHANGED spent
+       ELSE IF rState[r] = "transient" /\ rAttempt[r] < MaxRetries
+            THEN Retry(r) /\ UNCHANGED spent
+            ELSE Done(r) /\ spent' = (spent \/ rState[r] = "transient")
+    /\ UNCHANGED <<writerVars, rSnap, rForce, rAttempt, envVars, explicitOwed, rewound>>
+
+\* LocalScheduler.Drain cancels the run with ErrShutdown. A run still in
+\* its publication wait always restores (restoreLocal); a later one
+\* restores only through the shutdownAborted branch of RunPush.
+RCancel(r) ==
+    /\ rState[r] \in {"claimed", "waited", "snapped", "passed"}
+    /\ faults < MaxFaults
+    /\ faults' = faults + 1
+    /\ IF ~Holds(r) THEN Abandon(r)
+       ELSE IF rState[r] = "claimed" \/ ShutdownRestores THEN Restore(r)
+       ELSE Done(r)
+    /\ UNCHANGED <<writerVars, rSnap, rForce, rAttempt, upstream, apiLeft,
+                   outages, explicitOwed, spent, rewound>>
+
+\* The run's process dies, or every retry of its finish write fails. The
+\* claim stays in the row until its lease expires.
+RCrash(r) ==
+    /\ rState[r] # "idle" /\ faults < MaxFaults
+    /\ faults' = faults + 1
+    /\ rState' = [rState EXCEPT ![r] = "idle"]
+    /\ claim' = IF Holds(r) THEN [claim EXCEPT !.dead = TRUE] ELSE claim
+    /\ UNCHANGED <<writerVars, pending, due, attempt, rSnap, rForce, rAttempt,
+                   upstream, apiLeft, outages, ghostVars>>
+
+-----------------------------------------------------------------------------
+
+Next ==
+    \/ \E w \in Writers : WReserve(w) \/ WCas(w) \/ WMark(w) \/ WPublish(w) \/ WCrash(w)
+    \/ \E a \in ApiCalls : Api(a)
+    \/ Tick \/ Expire
+    \/ \E r \in Runners : \/ RClaim(r) \/ RWait(r) \/ RWaitFail(r) \/ RSnap(r)
+                          \/ RBarrier(r) \/ RPush(r) \/ RTransient(r) \/ RFinish(r)
+                          \/ RCancel(r) \/ RCrash(r)
+
+Fairness ==
+    /\ \A w \in Writers : WF_vars(WCas(w)) /\ WF_vars(WMark(w)) /\ WF_vars(WPublish(w))
+    /\ \A r \in Runners : /\ WF_vars(RWait(r)) /\ WF_vars(RSnap(r)) /\ WF_vars(RBarrier(r))
+                          /\ WF_vars(RPush(r)) /\ WF_vars(RFinish(r))
+    /\ WF_vars(\E r \in Runners : RClaim(r))
+    /\ WF_vars(Tick) /\ WF_vars(Expire)
+
+Spec == Init /\ [][Next]_vars
+FairSpec == Spec /\ Fairness
+
+-----------------------------------------------------------------------------
+(* Properties.                                                             *)
+
+\* Nothing is outstanding: no write in flight, no request, no run.
+Quiescent ==
+    /\ \A w \in Writers : wState[w] \in {"idle", "done", "dead"}
+    /\ pending = 0 /\ ~claim.held
+    /\ \A r \in Runners : rState[r] = "idle"
+
+\* Once nothing is outstanding, the upstream has every accepted write,
+\* unless the last run spent its retry budget (the documented give-up)
+\* and no request was recorded after it.
+NoLostForward == Quiescent => (upstream = authority \/ spent)
+
+\* A force request is never downgraded: until a run takes it, the row
+\* holds level 2, and the claim that took it pushes with force.
+ForceKept ==
+    /\ forceOwed => pending = 2
+    /\ (claim.held /\ claim.owes) => claim.force
+
+\* An explicit request is due now until a run takes it, even when a run
+\* that held the lane ends in retry or restore.
+ExplicitNotDelayed == explicitOwed => due = "zero"
+
+\* A retry or restore waits out its delay unless an explicit request came
+\* during the run: the claim time in push_due tells the two apart.
+BackoffKept == ~hammered
+
+\* The upstream ref never moves backwards.
+NoRewind == ~rewound
+
+\* The lane always goes idle and stays idle.
+Settles == <>[]Quiescent
+=============================================================================
