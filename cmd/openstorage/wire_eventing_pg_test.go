@@ -178,6 +178,25 @@ func TestServeRecordsForwardIntentWithTheCAS(t *testing.T) {
 			t.Fatalf("the poke re-marked a consumed forward: %+v", up)
 		}
 	})
+
+	// A caller that may not forward already wrote the same value, so this
+	// CAS loses and ref.IdempotentCAS reports a win it did not commit. Its
+	// transaction recorded nothing, so the poke must forward.
+	t.Run("recovered_twin", func(t *testing.T) {
+		repo := forwardRepo(t, "recovered-twin")
+		const base = "2222222222222222222222222222222222222222"
+		for _, step := range [][2]string{{ref.ZeroSHA, base}, {base, sha}} {
+			if won, err := rs.CASRef(ctx, repo.RepoID, "refs/heads/main", step[0], step[1]); !won || err != nil {
+				t.Fatalf("seed %s: won=%v err=%v", step[1], won, err)
+			}
+		}
+		if won, err := decorate(rs).CASRef(claims(repo, auth.ScopeGitRead, auth.ScopeGitWrite), repo.RepoID, "refs/heads/main", base, sha); !won || err != nil {
+			t.Fatalf("CASRef: won=%v err=%v, want a recovered win", won, err)
+		}
+		if n := pushJobs(repo.RepoID); n != 1 {
+			t.Fatalf("recovered win scheduled %d push jobs, want 1", n)
+		}
+	})
 }
 
 // claimAfterCAS claims the push lane right after the CAS commits, as a
