@@ -1,17 +1,18 @@
 ---
 name: verify-openstorage
-description: Drive a real, disposable open.storage node the way a user does and keep the proof. One `openstorage serve` listener in local mode (SQLite + file blobs, no containers) serves the REST API (`/api/v1/...`) and Git smart HTTP (`/<repo>.git`); the helper builds it from this checkout, starts it on a free loopback port, drives it with curl and real git, and tears it down. Use it to verify REST or Git behavior end to end, to reproduce a bug against a live server, or to collect evidence for a PR.
+description: Drive a real, disposable open.storage deployment the way a user does and keep the proof. By default one `openstorage serve` listener in local mode (SQLite + file blobs, no containers); with `--fleet`, two serve replicas on shared PostgreSQL + SeaweedFS (S3) containers. Each node serves the REST API (`/api/v1/...`) and Git smart HTTP (`/<repo>.git`); the helper builds serve from this checkout, starts it on free loopback ports, drives it with curl and real git, and tears everything down. Use it to verify REST or Git behavior end to end, to check that replicas share state, to reproduce a bug against a live server, or to collect evidence for a PR.
 ---
 
 # Verify open.storage
 
-`scripts/osv.sh` builds `openstorage` from this checkout, starts one local-mode node with an empty data directory, drives it with `curl` and real `git`, records every request and result, and keeps the evidence after teardown. The feature recipes are in [`features/README.md`](features/README.md). Read it before you drive a feature.
+`scripts/osv.sh` builds `openstorage` from this checkout, starts one local-mode node with an empty data directory, drives it with `curl` and real `git`, records every request and result, and keeps the evidence after teardown. With `launch --fleet` it starts two nodes on shared PostgreSQL and SeaweedFS containers instead (see [Fleet mode](#fleet-mode)). The feature recipes are in [`features/README.md`](features/README.md). Read it before you drive a feature.
 
-The node is the real product: the same binary, the same `serve` command, and the same auth path as a self-hosted install. Nothing is mocked. The map does not cover LFS, webhooks, upstream sync, multi-node (PostgreSQL + S3), or S3WAL yet.
+The node is the real product: the same binary, the same `serve` command, and the same auth path as a self-hosted install. Nothing is mocked. The map does not cover LFS, webhooks, upstream sync, or S3WAL yet.
 
 Requirements:
 
 - bash on Linux or macOS, plus `go` (the `go` line in `go.mod`), `git` 2.32 or newer (older git ignores `GIT_CONFIG_GLOBAL` and reads your global config, so `launch` and `git` refuse it), `curl`, and `python3` on `PATH`. The repo's own smoke script needs the same tools. The helper is tested on Linux only. Its macOS branches (`lsof`, `ps`, no `setsid`) are untested.
+- Fleet mode only: a reachable Docker daemon (`docker info` must work). The images are the digest-pinned `postgres` and `chrislusf/seaweedfs` references in the repo's `docker-compose.yml`, pulled on first use.
 - Run the commands from the repository root.
 - Choose a new run directory for every run, outside the checkout. `launch` refuses a directory inside the checkout (it would dirty `git status`) and a directory that is not empty. It sets the run directory to mode 700, and every command refuses a run directory (or its `work/`) that another user owns or that group or others can write, because the commands source `work/state.env`. Every command also refuses a run directory with a parent that another user owns (root is allowed) or that group or others can write without the sticky bit, because that user could swap the run directory. `/tmp` passes: its sticky bit stops other users from renaming your entries.
 
@@ -43,6 +44,21 @@ Two runs can work side by side: each run has its own port, data directory, keys,
 
 Teardown is `"$OSV" cleanup "$RUN"` (see [Cleanup](#cleanup)).
 
+### Fleet mode
+
+```sh
+"$OSV" launch "$RUN" --fleet
+eval "$("$OSV" env "$RUN")"   # also exports OSV_URL_B OSV_PG_URL OSV_S3_URL OSV_S3_KEY
+```
+
+`--fleet` replaces step 3 above with these steps:
+
+1. Starts a PostgreSQL container and a SeaweedFS container (`weed server -s3` with the development S3 identity `codestorage` from `docker-compose.yml`). Each carries the label `dev.openstorage.osv.run=<run dir>` and publishes its port on a free `127.0.0.1` port.
+2. Waits up to 90 s until PostgreSQL answers a TCP query, and up to 120 s until SeaweedFS stores an object in the probe bucket `osv-ready`. A fresh SeaweedFS can hold its first write for 10 to 15 s, so a passing `/healthz` alone is not ready.
+3. Starts node a, waits for its address, then starts node b. Both get `OPENSTORAGE_PG_URL` and `OPENSTORAGE_S3_URL` for the shared stores (bucket `openstorage`, which node a creates) and their own `--cache-dir` (`$RUN/work/cache-a`, `$RUN/work/cache-b`). Node a runs the migrations before node b boots.
+
+`OSV_URL` is node a and `OSV_URL_B` is node b. `api` calls go to node a unless you pass `--node b`. git picks the node from the URL in its arguments. A fleet launch takes about 20 s with cached images. The recipe for cross-node behavior is [`features/replicas.md`](features/replicas.md). The other recipes run unchanged on node a.
+
 ## Doctor
 
 ```sh
@@ -58,7 +74,14 @@ Doctor is read-only. Run it first whenever a result looks wrong. It prints one l
 | `healthz` | `GET /healthz` answers `{"status":"ok"}`. |
 | `auth+db` | A fresh `org:read` token gets 200 from `GET /api/v1/repos`. |
 | `build` | `openstorage version` names the checkout's `HEAD` commit. A `WARN build ... vcs.modified=true` line (read with `go version -m`) means the binary includes uncommitted changes. |
-| `data-dir` | `$RUN/work/data/codestorage.db` exists. |
+| `data-dir` | `$RUN/work/data/codestorage.db` exists. Local mode only. |
+
+In fleet mode, doctor runs `process`, `port`, `healthz`, and `auth+db` once per node, as `process:a`, `process:b`, and so on. `auth+db` then proves that PostgreSQL holds the migrated schema. Two checks replace `data-dir`:
+
+| Check | PASS means |
+|---|---|
+| `containers` | Exactly two containers carry this run's label, and both run. |
+| `bucket` | A signed `HEAD` of bucket `openstorage` on the SeaweedFS port answers 200. |
 
 A `build` FAIL means the checkout moved after launch. Clean up and launch a new run.
 
@@ -89,6 +112,7 @@ REPO_ID=$("$OSV" json "$OSV_EVIDENCE/create-repo.body" repo_id)   # one field of
 ```
 
 - The path is appended to `$OSV_URL` and must start with `/`. Arguments after the path go to curl unchanged.
+- `--node b` sends the request to node b of a fleet run. `log.tsv` and `<label>.request.txt` name the node. In local mode `--node b` is refused.
 - `/api/...` paths get `Authorization: Bearer <token>`. Every other path is the Git surface and gets Basic auth with the user `t` and the token as the password.
 - stdout is the HTTP status code. With `--expect <code>`, a different code prints the first 400 bytes of the body to stderr and exits 1.
 - Write each request body to `$OSV_EVIDENCE/<label>.ndjson` (or `.json`) first, and send it with `--data-binary @file`. Then the body is part of the proof.
@@ -120,7 +144,7 @@ Read the result through a second view and record the comparison:
 
 `eq` takes the expected value first. It exits 1 on a mismatch, and also when the expected value is empty, so a failed lookup never passes.
 
-Use the open.storage CLI directly for read-only checks of stored state, for example `env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data"`.
+Use the open.storage CLI directly for read-only checks of stored state, for example `env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data"`. In fleet mode, pass the shared stores instead of `--data-dir`: `OPENSTORAGE_PG_URL="$OSV_PG_URL" OPENSTORAGE_S3_URL="$OSV_S3_URL" AWS_ACCESS_KEY_ID="$OSV_S3_KEY" AWS_SECRET_ACCESS_KEY="$OSV_S3_KEY"`.
 
 ## Evidence
 
@@ -133,7 +157,8 @@ Evidence goes to `$RUN/evidence/` (`$OSV_EVIDENCE`). Cleanup never deletes it.
 | `<label>.git.txt` | The git command, its working directory, the token, the output, and the exit code. |
 | `<label>.eq.txt` | Expected value, actual value, and verdict. |
 | `launch.txt`, `build.txt`, `doctor.txt` | Checkout commit, tool versions, binary version, PID, address, and every doctor and cleanup result. |
-| `serve.stdout.log`, `serve.stderr.log`, `state.env`, `tokens.txt` | Server logs, the address and PID, and each token's mint flags. Cleanup copies them here. |
+| `serve.stdout.log`, `serve.stderr.log`, `state.env`, `tokens.txt` | Server logs, the address and PID, and each token's mint flags. Cleanup copies them here. In fleet mode `serve.*` is node a and `serve-b.*` is node b. |
+| `container-postgres-<id>.log`, `container-seaweedfs-<id>.log` | Fleet mode: the last 5,000 lines of each container's log, saved by cleanup before it removes the container. |
 
 Proof standards:
 
@@ -153,12 +178,13 @@ Proof standards:
 
 Run cleanup after every run, also after a failed launch or a failed drive. It:
 
-1. Checks that the saved PID runs this run's binary. It refuses to signal any other process.
+1. Checks that each saved serve PID (node b first in fleet mode, then node a) runs this run's binary. It refuses to signal any other process. A node that already exited is skipped.
 2. Records the PIDs of serve's descendants, sends SIGTERM to serve (the drain takes up to 10 s), waits up to 30 s, then sends SIGKILL to serve and the recorded descendants that are still alive.
-3. Looks for leftovers: a recorded process that is still alive, or (on Linux) any process whose working directory is under `$RUN/work`. When it finds one, it prints `LEFTOVER processes: <pid> ...`, keeps `$RUN/work`, and exits 1.
-4. Copies the serve logs, `state.env`, and the token list into the evidence, and replaces token values in every regular file under the evidence, subdirectories included. It does not follow symlinks, and it exits 1 when it cannot read a file or directory there. It also does this when it stops early: at a leftover, at a refused PID, or on an error.
-5. Deletes `$RUN/work`: the binary, keys, tokens, data directory, cache, and clones.
-6. Prints `no process from this run is alive`, the evidence path, and the PASS and FAIL counts from `log.tsv`.
+3. Fleet mode: saves each labeled container's log to the evidence, then removes the container and its anonymous volumes with `docker rm -f -v`. It finds the containers by this run's label, never by name or image, so it touches no other container.
+4. Looks for leftovers: a recorded process or labeled container that is still alive, or (on Linux) any process whose working directory is under `$RUN/work`. When it finds one, it prints `LEFTOVER processes: <pid> ...` (a container shows as `container:<id>`), keeps `$RUN/work`, and exits 1.
+5. Copies the serve logs, `state.env`, and the token list into the evidence, and replaces token values in every regular file under the evidence, subdirectories included. It does not follow symlinks, and it exits 1 when it cannot read a file or directory there. It also does this when it stops early: at a leftover, at a refused PID, or on an error.
+6. Deletes `$RUN/work`: the binary, keys, tokens, data directory, caches, and clones.
+7. Prints `no process or container from this run is alive`, the evidence path, and the PASS and FAIL counts from `log.tsv`.
 
 After a `LEFTOVER` line, check each PID before you act. Your own shell is a common one: `cd` out of the run directory. Kill only a PID that you started, never by process name (`pkill`, `killall`), then run cleanup again. Cleanup is safe to repeat. A cleaned run directory cannot launch again, so use a new directory for the next run.
 
@@ -166,16 +192,16 @@ After a `LEFTOVER` line, check each PID before you act. Your own shell is a comm
 
 | Command | Purpose |
 |---|---|
-| `scripts/osv.sh launch <run>` | Build, generate keys, start serve, wait for ready, run doctor. |
+| `scripts/osv.sh launch <run> [--fleet]` | Build, generate keys, start serve (with `--fleet`: the containers and two nodes), wait for ready, run doctor. |
 | `scripts/osv.sh doctor <run>` | Read-only health check (see [Doctor](#doctor)). |
-| `scripts/osv.sh env <run>` | Print `export OSV_RUN=... OSV_URL=... OSV_BIN=... OSV_WORK=... OSV_EVIDENCE=... OSV_ORG=...` for `eval`. |
+| `scripts/osv.sh env <run>` | Print `export OSV_MODE=... OSV_RUN=... OSV_URL=... OSV_BIN=... OSV_WORK=... OSV_EVIDENCE=... OSV_ORG=...` for `eval`, plus `OSV_URL_B`, `OSV_PG_URL`, `OSV_S3_URL`, and `OSV_S3_KEY` in fleet mode. |
 | `scripts/osv.sh token <run> <name> <mint flags>` | Mint a token with the run's org key (`--iss selfhost` is preset). A later `--key <pem>` replaces the run's key, for wrong-key checks. |
 | `scripts/osv.sh token <run> <name> --raw <value>` | Store a literal token value. |
-| `scripts/osv.sh api <run> <label> [--token <name>\|none] [--expect <code>] <METHOD> <path> [curl args]` | One HTTP request, recorded. |
+| `scripts/osv.sh api <run> <label> [--node a\|b] [--token <name>\|none] [--expect <code>] <METHOD> <path> [curl args]` | One HTTP request, recorded. |
 | `scripts/osv.sh git <run> <label> [--token <name>\|none] [--expect <exit>] -- <git args>` | One hermetic git command in `$OSV_WORK`, recorded. |
 | `scripts/osv.sh eq <run> <label> <expected> <actual>` | Record an equality check. Exits 1 on a mismatch or an empty expected value. |
 | `scripts/osv.sh json <file> <dotted.path>` | Print one JSON field, for example `commits.0.sha`. A `*` segment maps a list: `commits.*.sha` prints a JSON list. |
-| `scripts/osv.sh cleanup <run>` | Stop serve, delete `<run>/work`, keep `<run>/evidence`. |
+| `scripts/osv.sh cleanup <run>` | Stop serve and remove the run's containers, delete `<run>/work`, keep `<run>/evidence`. |
 | `scripts/askpass.sh` | The `GIT_ASKPASS` program that `osv.sh git` uses. Do not call it yourself. |
 
 `scripts/osv.sh help` prints the same summary.
