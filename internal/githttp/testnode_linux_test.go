@@ -585,6 +585,10 @@ func TestNodeCrasherHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := trackNodeSession(cmd.Process.Pid); err != nil {
+		// Pdeathsig would kill only the leader, so end the whole session.
+		start, _ := processStart(cmd.Process.Pid)
+		reapNodeSession(cmd.Process.Pid, start, 10*time.Second)
+		_ = cmd.Wait()
 		t.Fatal(err)
 	}
 	line, err := bufio.NewReader(stdout).ReadString('\n')
@@ -606,8 +610,12 @@ func TestNodeCrasherHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	childStart, err := processStart(child)
+	if err != nil {
+		t.Fatal(err)
+	}
 	out := os.Getenv(nodeCrasherOutEnv)
-	if err := os.WriteFile(out+".tmp", []byte(fmt.Sprintf("%d %d %d\n", serve, child, start)), 0o600); err != nil {
+	if err := os.WriteFile(out+".tmp", []byte(fmt.Sprintf("%d %d %d %d\n", serve, child, start, childStart)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(out+".tmp", out); err != nil {
@@ -639,21 +647,21 @@ func TestNodeGuardKillsSessionWhenTestBinaryDies(t *testing.T) {
 		name, mode   string
 		timeout      string // -test.timeout of the crasher
 		ignoreSIGINT bool   // the crasher starts with SIGINT ignored
-		die          func(t *testing.T, crasher *exec.Cmd, child int)
+		die          func(t *testing.T, crasher *exec.Cmd, childAlive func() bool)
 		wantExit     int // exit code of a crasher that ends by itself, or -1
 	}{
-		{name: "SIGKILL", mode: "wait", wantExit: -1, die: func(t *testing.T, c *exec.Cmd, _ int) { _ = c.Process.Kill() }},
+		{name: "SIGKILL", mode: "wait", wantExit: -1, die: func(t *testing.T, c *exec.Cmd, _ func() bool) { _ = c.Process.Kill() }},
 		{name: "panic", mode: "panic", wantExit: 2},
 		{name: "test timeout", mode: "wait", timeout: "5s", wantExit: 2}, // long enough to report its node on a loaded host
-		{name: "SIGINT", mode: "wait", wantExit: -1, die: func(t *testing.T, c *exec.Cmd, _ int) { _ = c.Process.Signal(syscall.SIGINT) }},
-		{name: "SIGINT ignored, then SIGKILL", mode: "wait", ignoreSIGINT: true, wantExit: -1, die: func(t *testing.T, c *exec.Cmd, child int) {
+		{name: "SIGINT", mode: "wait", wantExit: -1, die: func(t *testing.T, c *exec.Cmd, _ func() bool) { _ = c.Process.Signal(syscall.SIGINT) }},
+		{name: "SIGINT ignored, then SIGKILL", mode: "wait", ignoreSIGINT: true, wantExit: -1, die: func(t *testing.T, c *exec.Cmd, childAlive func() bool) {
 			_ = c.Process.Signal(syscall.SIGINT)
 			time.Sleep(time.Second)
 			if err := c.Process.Signal(syscall.Signal(0)); err != nil {
 				t.Fatalf("the test binary died of an ignored SIGINT: %v", err)
 			}
-			if st := procState(child); st == "" || st == "Z" {
-				t.Fatalf("the node's git child %d died (state %q) of a SIGINT the test binary ignores", child, st)
+			if !childAlive() {
+				t.Fatal("the node's git child died of a SIGINT the test binary ignores")
 			}
 			_ = c.Process.Kill()
 		}},
@@ -684,11 +692,11 @@ func TestNodeGuardKillsSessionWhenTestBinaryDies(t *testing.T) {
 			})
 
 			var serve, child int
-			var start uint64
+			var start, childStart uint64
 			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 				data, err := os.ReadFile(outFile)
 				if err == nil {
-					if _, err := fmt.Sscanf(string(data), "%d %d %d", &serve, &child, &start); err != nil {
+					if _, err := fmt.Sscanf(string(data), "%d %d %d %d", &serve, &child, &start, &childStart); err != nil {
 						t.Fatalf("unparsable node report %q: %v", data, err)
 					}
 					break
@@ -701,8 +709,20 @@ func TestNodeGuardKillsSessionWhenTestBinaryDies(t *testing.T) {
 				reapNodeSession(serve, start, 10*time.Second)
 			})
 
+			// The kernel reuses PIDs: a process counts as the node's only
+			// while its start time is the one reported.
+			childAlive := func() bool {
+				state, _, cs, err := procStat(child)
+				return err == nil && state != "Z" && cs == childStart
+			}
+			sessionLive := func() []int {
+				if cur, err := processStart(serve); err == nil && cur != start {
+					return nil // an unrelated session took the ID over
+				}
+				return sessionMembers(serve)
+			}
 			if tc.die != nil {
-				tc.die(t, crasher, child)
+				tc.die(t, crasher, childAlive)
 			}
 			waitErr := crasher.Wait()
 			reaped = true
@@ -717,13 +737,12 @@ func TestNodeGuardKillsSessionWhenTestBinaryDies(t *testing.T) {
 			}
 
 			for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-				members := sessionMembers(serve)
-				childGone := errors.Is(syscall.Kill(child, 0), syscall.ESRCH) || procState(child) == "Z"
-				if len(members) == 0 && childGone {
+				members := sessionLive()
+				if len(members) == 0 && !childAlive() {
 					return
 				}
 				if time.Now().After(deadline) {
-					t.Fatalf("15s after the test binary died, node session %d still has live members %v (git child %d gone: %v)", serve, members, child, childGone)
+					t.Fatalf("15s after the test binary died, node session %d still has live members %v (git child %d alive: %v)", serve, members, child, childAlive())
 				}
 			}
 		})
