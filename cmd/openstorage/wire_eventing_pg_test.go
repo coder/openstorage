@@ -1,0 +1,153 @@
+package main
+
+import (
+	"context"
+	"log/slog"
+	"testing"
+
+	"github.com/jackc/pgx/v5"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/meta"
+	"github.com/coder/openstorage/internal/ref"
+	"github.com/coder/openstorage/internal/testutil/testimages"
+)
+
+// diedAfterCAS stands for a serve process that dies right after its ref
+// CAS commits: the swap runs, and the caller never learns that it won.
+// The error is definitive (SafeToRetry), so ref.IdempotentCAS does not
+// recover the win and the decorator's sync poke never runs.
+type diedAfterCAS struct{ ref.RefStore }
+
+type diedAfterCASError struct{}
+
+func (diedAfterCASError) Error() string     { return "process died after the CAS" }
+func (diedAfterCASError) SafeToRetry() bool { return true }
+
+func (s diedAfterCAS) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	if won, err := s.RefStore.CASRef(ctx, repo, name, old, new); err != nil || !won {
+		return false, err
+	}
+	return false, diedAfterCASError{}
+}
+
+func (s diedAfterCAS) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	if won, _, err := s.RefStore.CASRefGen(ctx, repo, name, old, new); err != nil || !won {
+		return false, 0, err
+	}
+	return false, 0, diedAfterCASError{}
+}
+
+// TestServeRecordsForwardIntentWithTheCAS: on PostgreSQL a REST write
+// through the serve decorator records a forward_on_push repository's
+// forward intent in the CAS transaction. A process that dies right after
+// the CAS commits leaves the push job behind; a caller that may not
+// forward leaves nothing.
+func TestServeRecordsForwardIntentWithTheCAS(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs docker")
+	}
+	ctx := t.Context()
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
+		tcpostgres.WithDatabase("postgres"),
+		tcpostgres.WithUsername("postgres"),
+		tcpostgres.WithPassword("postgres"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+	t.Cleanup(func() { _ = pgC.Terminate(context.Background()) })
+	dbURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := meta.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ms.Close)
+	if err := ms.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := ref.OpenPG(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rs.Close)
+	if err := rs.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key, pub, err := newLoopbackKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const org = "org"
+	if _, err := ms.UpsertOrgWithKeys(ctx, org, []string{pub}); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.DiscardHandler)
+	_, decorate, cleanup, err := buildServeEventing(ctx, ms, dbURL, org, "http://127.0.0.1:1", t.TempDir(), key,
+		nil, nil, nil, nil, false, syncEgressSettings{}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cleanup)
+	store := decorate(diedAfterCAS{rs})
+
+	pool, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+	pushJobs := func(repoID string) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM river_job WHERE kind = 'upstream_push' AND args->>'repo_id' = $1`, repoID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	for _, tc := range []struct {
+		name     string
+		scopes   []string
+		wantJobs bool
+	}{
+		{"may_forward", []string{auth.ScopeGitRead, auth.ScopeGitWrite}, true},
+		{"write_only", []string{auth.ScopeGitWrite}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, err := ms.CreateRepo(ctx, org, "https://example.com/"+tc.name+".git", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ms.SetRepoUpstream(ctx, meta.RepoUpstream{
+				RepoID: repo.RepoID, Provider: "github", Owner: "up", Name: "mirror",
+				UpstreamHost: "https://example.invalid", ForwardOnPush: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cctx := auth.WithClaims(ctx, &auth.Claims{Iss: org, Sub: auth.SubjectLiteral, Repo: repo.URL, Scopes: tc.scopes})
+			sha := "1111111111111111111111111111111111111111"
+			if won, err := store.CASRef(cctx, repo.RepoID, "refs/heads/main", ref.ZeroSHA, sha); won || err == nil {
+				t.Fatalf("CASRef: won=%v err=%v, want the injected death", won, err)
+			}
+			if got, err := rs.GetRef(ctx, repo.RepoID, "refs/heads/main"); err != nil || got != sha {
+				t.Fatalf("authority main = %q (err %v), want the committed %s", got, err, sha)
+			}
+			up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The node's worker may already have claimed the job.
+			if n := pushJobs(repo.RepoID); tc.wantJobs && n != 1 {
+				t.Fatalf("intent lost with the process: %d push jobs, upstream %+v", n, up)
+			} else if !tc.wantJobs && (n != 0 || up.PushPending != 0) {
+				t.Fatalf("a write-only caller recorded forward intent: %d push jobs, upstream %+v", n, up)
+			}
+		})
+	}
+}
