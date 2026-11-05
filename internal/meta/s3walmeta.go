@@ -1317,7 +1317,7 @@ func (s *S3WAL) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch
 			if err != nil {
 				return false, err
 			}
-			_, r := doc.liveRepoByURL(orgRow.ID, url)
+			id, r := doc.liveRepoByURL(orgRow.ID, url)
 			if r == nil {
 				return false, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
 			}
@@ -1325,6 +1325,11 @@ func (s *S3WAL) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch
 				return false, nil // changed concurrently: won=false, no error
 			}
 			r.DefaultBranch = newBranch
+			// An explicit change ends the wait for adoption in the same
+			// write, as on PostgreSQL and SQLite (issue #603).
+			if u := doc.Upstreams[id]; u != nil {
+				u.DefaultBranchOmitted = false
+			}
 			won = true
 			return true, nil
 		},

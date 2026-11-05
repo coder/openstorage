@@ -99,8 +99,8 @@ type RepoUpstream struct {
 	// DefaultBranchOmitted marks a GitHub sync create that named no default
 	// branch (issue #599): the repo starts on "main" until a successful sync
 	// adopts the upstream HEAD (AdoptUpstreamDefaultBranch), which clears
-	// it. An explicit default-branch change clears it too. S3-WAL stores no
-	// such field (metadata v2 is frozen) and always reads false.
+	// it. An explicit default-branch change clears it too. S3-WAL keeps it
+	// in the metadata v3 document (issue #603).
 	DefaultBranchOmitted bool
 	CreatedAt            time.Time
 }

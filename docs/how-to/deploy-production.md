@@ -842,8 +842,8 @@ conversion` or `document version 2 needs conversion`. An older release stops on 
 bucket with `document version N unsupported`, where N is the bucket's version. No release
 writes the metadata document of another version.
 
-The releases that write each version: v1 is v0.16.0 through v0.18.0, v2 is v0.19.0, and
-v3 is every later release.
+The releases that write each version, from v0.16.0: v1 is v0.16.0 through v0.18.0, v2 is
+v0.19.0, and v3 is every later release.
 
 **Upgrade from a v1 or v2 release.** Upgrade an older install to v0.16.0 or later first.
 
@@ -859,7 +859,8 @@ v3 is every later release.
    (step 3 of [shutdown and restart](#s3wal-shutdown-and-restart)), and run it again. A
    `serve` started with `OPENSTORAGE_S3WAL_LEASE_TTL=0` holds no lease, so the command
    cannot detect it.
-5. Start `serve`. Pending push and pull work runs at once, at the first attempt.
+5. Start `serve`. From a v1 bucket, pending push and pull work runs at once, at the first
+   attempt. From a v2 bucket, retry positions and due times carry over.
 
 **Downgrade to a v2 release (v0.19.0).**
 

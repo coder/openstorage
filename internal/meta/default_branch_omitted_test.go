@@ -96,8 +96,8 @@ func testAdoptUpstreamDefaultBranch(t *testing.T, s Backend) {
 	}
 }
 
-// TestS3WALDropsDefaultBranchOmitted: metadata v2 is frozen, so S3-WAL
-// stores no flag and never adopts (issue #599 deviation).
+// TestS3WALDropsDefaultBranchOmitted: until S3-WAL create writes the v3
+// field, it stores no flag and never adopts (issue #599 deviation, #603).
 func TestS3WALDropsDefaultBranchOmitted(t *testing.T) {
 	s := s3walBackend(t)
 	ctx := t.Context()

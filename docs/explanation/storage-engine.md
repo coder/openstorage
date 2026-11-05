@@ -408,8 +408,8 @@ release must:
 These are release requirements, not an upgrade engine supplied today.
 
 > [!WARNING]
-> Downgrade after incompatible-format writes is unsupported, with one exception: a
-> metadata v3 bucket goes back to a v2 release (v0.19.0) through
+> Downgrade after incompatible-format writes is unsupported, with one exception: the
+> metadata document. A v3 bucket goes back to a v2 release (v0.19.0) through
 > `openstorage s3wal-meta convert --to 2`, and to a v1 release (v0.16.0 through
 > v0.18.0) through `openstorage s3wal-meta convert --to 1`.
 

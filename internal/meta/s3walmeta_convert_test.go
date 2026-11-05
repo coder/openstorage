@@ -545,3 +545,37 @@ func TestS3WALMetaConvertV3ZeroValue(t *testing.T) {
 		}
 	}
 }
+
+// TestS3WALUpdateRepoDefaultBranchClearsFlag (issue #603): an explicit
+// default-branch change ends the wait for adoption in the same write, as on
+// PostgreSQL and SQLite. A lost compare-and-swap and another repository's
+// change leave the flag alone.
+func TestS3WALUpdateRepoDefaultBranchClearsFlag(t *testing.T) {
+	ctx := context.Background()
+	cas, flagged, plain := seedV3Flags(t, 3)
+	st := NewS3WAL(cas)
+	defer st.Close()
+	omitted := func(repoID string) bool {
+		t.Helper()
+		up, err := st.GetRepoUpstream(ctx, repoID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return up.DefaultBranchOmitted
+	}
+	patch := func(url, from, to string, wantWon bool) {
+		t.Helper()
+		if won, err := st.UpdateRepoDefaultBranch(ctx, "org", url, from, to); err != nil || won != wantWon {
+			t.Fatalf("PATCH %s %s -> %s = %v, %v; want won=%v", url, from, to, won, err, wantWon)
+		}
+	}
+	patch("flagged", "stale", "dev", false)
+	patch("plain", "main", "dev", true)
+	if !omitted(flagged) {
+		t.Fatal("a lost compare-and-swap or another repository's change cleared the flag")
+	}
+	patch("flagged", "main", "main", true) // the value does not change, the wait still ends
+	if omitted(flagged) || omitted(plain) {
+		t.Fatalf("after the PATCH: flagged %v, plain %v; want both clear", omitted(flagged), omitted(plain))
+	}
+}
