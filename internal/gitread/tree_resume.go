@@ -58,6 +58,9 @@ const (
 	// maxWalkDepth bounds the recursion: a tree nested deeper is left to
 	// the stream.
 	maxWalkDepth = 1024
+	// maxWalkPath bounds the path of a folder the walk enters: every level of
+	// the walk holds its own path, so memory grows with depth times path.
+	maxWalkPath = 16 << 10
 	// entryFloor is the size of an `ls-tree --long` record less its path:
 	// mode, type, object id, a size field of its minimum width and the
 	// separators. The walk bounds what it holds by it, the page is charged
@@ -100,21 +103,24 @@ func resumeTreePage(ctx context.Context, repoPath, commit, path, after string, l
 			return nil, false, false, err
 		}
 	} else {
-		w = &treeWalk{limit: limit}
+		w = &treeWalk{}
 	}
 
 	page = w.page
-	if hasMore = len(page) > limit; hasMore {
-		page = page[:limit]
-	}
 	if len(page) == 0 {
-		// Nothing sorts after the cursor. Whether path matched anything
-		// is what the first entry of its listing says.
-		_, _, found, err = streamTreePage(ctx, repoPath, commit, path, "", 1, nil)
-		return nil, false, found, err
+		// Nothing sorts after the cursor, which the stream proves by reading
+		// the whole listing (a stale cursor: it is not on a page boundary
+		// of a listing that goes on). Its answer includes every error the
+		// listing has after the cursor, so that is the answer.
+		return streamTreePage(ctx, repoPath, commit, path, after, limit, budget)
 	}
+	// The entry past the page needs its size too: ls-tree --long fails on
+	// a blob it cannot read, whether or not the entry is on the page.
 	if err := fillSizes(ctx, repoPath, page); err != nil {
 		return nil, false, false, err
+	}
+	if hasMore = len(page) > limit; hasMore {
+		page = page[:limit]
 	}
 	var total int64
 	for _, e := range page {
@@ -238,15 +244,18 @@ func (w *treeWalk) walk(rev, prefix, rest string, depth int) error {
 	if depth > maxWalkDepth {
 		return errDeclined
 	}
-	// A level has more entries than the walk buffers when its first
-	// entries are folders without files, or the allowance is short:
-	// read it again and skip the ones used.
-	for skip, first := 0, true; !w.full(); first = false {
-		sc, err := w.scan(rev, prefix, rest, skip, w.limit+1-len(w.page))
+	// A scan keeps the entries the page can still take, fewer when the
+	// allowance is short. When the page is short after them (a folder in
+	// them held no file) or the scan stopped early, read the level again
+	// and skip the entries used. Each pass keeps twice as many, so a
+	// level of folders without files takes a few passes, not one for each.
+	for pass, skip := 0, 0; !w.full(); pass++ {
+		need := w.limit + 1 - len(w.page)
+		sc, err := w.scan(rev, prefix, rest, skip, int(min(int64(need)<<min(pass, 24), math.MaxInt32)))
 		if err != nil {
 			return err
 		}
-		if err := w.use(prefix, rest, sc, first, depth); err != nil {
+		if err := w.use(prefix, rest, sc, pass == 0, depth); err != nil {
 			return err
 		}
 		if !sc.more {
@@ -264,6 +273,9 @@ func (w *treeWalk) use(prefix, rest string, sc treeScan, first bool, depth int) 
 	defer func() { w.held -= left }()
 	if first && sc.hasCand {
 		c := sc.cand
+		if len(prefix)+len(c.name)+1 > maxWalkPath {
+			return errDeclined
+		}
 		if err := w.walk(hex.EncodeToString(c.oid[:]), prefix+c.name+"/", rest[len(c.name)+1:], depth+1); err != nil {
 			return err
 		}
@@ -275,6 +287,9 @@ func (w *treeWalk) use(prefix, rest string, sc treeScan, first bool, depth int) 
 		w.held -= e.cost
 		left -= e.cost
 		if e.mode == modeTree {
+			if len(prefix)+len(e.name)+1 > maxWalkPath {
+				return errDeclined
+			}
 			if err := w.walk(hex.EncodeToString(e.oid[:]), prefix+e.name+"/", "", depth+1); err != nil {
 				return err
 			}
@@ -288,7 +303,7 @@ func (w *treeWalk) use(prefix, rest string, sc treeScan, first bool, depth int) 
 }
 
 // add appends a file to the page. The entry past the limit is not
-// charged: it only tells that the listing goes on.
+// charged against the page: it only tells that the listing goes on.
 func (w *treeWalk) add(prefix string, e rawEntry) error {
 	te := TreeEntry{Path: prefix + e.name, Mode: modeText(e.mode), Type: EntryBlob, SHA: hex.EncodeToString(e.oid[:]), Size: -1}
 	switch e.mode {
@@ -297,12 +312,16 @@ func (w *treeWalk) add(prefix string, e rawEntry) error {
 	case modeGitlink:
 		te.Type = EntrySubmodule
 	}
+	cost := entryFloor + int64(len(te.Path))
 	if len(w.page) < w.limit {
-		cost := entryFloor + int64(len(te.Path))
 		if w.bytes+cost > w.room {
 			return fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
 		}
 		w.bytes += cost
+	} else if cost > w.room {
+		// The entry past the page is not charged, but it must fit the
+		// allowance on its own, like any record the stream reads.
+		return fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
 	}
 	w.page = append(w.page, te)
 	return nil

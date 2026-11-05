@@ -193,7 +193,9 @@ func TestLsTreePageCursorFallsBack(t *testing.T) {
 }
 
 // rawTree stores a tree object with exactly these entries, in this order,
-// and returns its id. A "40000" entry names a tree id; any other names a blob.
+// and returns its id. An entry's second element is a tree or commit id for
+// a "40000" or "160000" entry, "id:<hex>" for an object that need not
+// exist, and the content of a new blob otherwise.
 func rawTree(t testing.TB, dir string, entries ...[2]string) string {
 	t.Helper()
 	var raw strings.Builder
@@ -203,7 +205,9 @@ func rawTree(t testing.TB, dir string, entries ...[2]string) string {
 			t.Fatalf("bad entry %q", e[0])
 		}
 		id := e[1]
-		if mode != "40000" && mode != "160000" {
+		if hexID, ok := strings.CutPrefix(id, "id:"); ok {
+			id = hexID // an object that may not exist
+		} else if mode != "40000" && mode != "160000" {
 			id = gitIn(t, dir, e[1], "hash-object", "-w", "--stdin")
 		}
 		b := make([]byte, 20)
@@ -437,6 +441,80 @@ func TestLsTreePageCursorReapsItsChild(t *testing.T) {
 	}
 	if kids := catFileChildren(t); len(kids) != 0 {
 		t.Fatalf("cat-file children left: %q", kids)
+	}
+}
+
+// Whatever the old stream reads after the cursor, the page reads too: an
+// object that is missing after it fails both, and a page past the end is the
+// stream's own answer.
+func TestLsTreePageCursorOnMissingObjects(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	ctx := context.Background()
+	missing := "id:" + strings.Repeat("ab", 20)
+	sub := rawTree(t, dir, [2]string{"100644 x", "1"})
+	for name, c := range map[string]struct {
+		tree        string
+		after       string
+		limit       int
+		wantFailure bool
+	}{
+		// The entry past the page needs its size, as ls-tree --long reads it.
+		"lookahead blob": {rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"100644 b", missing}), "\x00", 1, true},
+		"page blob":      {rawTree(t, dir, [2]string{"100644 a", missing}, [2]string{"100644 b", "2"}), "\x00", 1, true},
+		"after the page": {rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"100644 b", "2"}, [2]string{"100644 c", missing}), "\x00", 1, false},
+		// A page past the end reads the whole listing, as the stream does.
+		"empty page":   {rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"100644 b", "2"}, [2]string{"40000 c", missing}), "z", 1, true},
+		"empty folder": {rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"40000 b", sub}), "z", 1, false},
+	} {
+		commit := commitOf(t, dir, c.tree)
+		page, more, found, err := LsTreePage(ctx, dir, commit, "", c.after, c.limit)
+		wp, wm, wf, werr := pageOracle(ctx, dir, commit, "", c.after, c.limit)
+		if (err != nil) != c.wantFailure || (werr != nil) != c.wantFailure || err == nil && (!slices.Equal(page, wp) || more != wm || found != wf) {
+			t.Errorf("%s: LsTreePage = %v, %v, %v, %v; stream = %v, %v, %v, %v; want failure %v", name, paths(page), more, found, err, paths(wp), wm, wf, werr, c.wantFailure)
+		}
+	}
+}
+
+// The record past the page has to fit the allowance on its own, as the
+// stream's check of a long record does.
+func TestLsTreePageCursorLongRecordPastThePage(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	long := strings.Repeat("z", 40000)
+	commit := commitOf(t, dir, rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"100644 " + long, "2"}))
+	for _, allowance := range []int64{100, 1 << 20} {
+		ctx, b := budgeted(t, allowance)
+		_, _, _, err := LsTreePage(ctx, dir, commit, "", "\x00", 1)
+		octx, ob := budgeted(t, allowance)
+		_, _, _, oerr := pageOracle(octx, dir, commit, "", "\x00", 1)
+		if errors.Is(err, ErrOutputLimit) != errors.Is(oerr, ErrOutputLimit) || b.remaining() != ob.remaining() {
+			t.Errorf("allowance %d: err %v, %d left; stream: err %v, %d left", allowance, err, b.remaining(), oerr, ob.remaining())
+		}
+	}
+}
+
+// A folder with thousands of empty folders in front of the first file is
+// read in a few passes, not once for each empty folder.
+func TestLsTreePageCursorOnManyEmptyFolders(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	empty := gitIn(t, dir, "", "hash-object", "-t", "tree", "-w", "--stdin")
+	var entries [][2]string
+	for i := range 20000 {
+		entries = append(entries, [2]string{fmt.Sprintf("40000 e%06d", i), empty})
+	}
+	entries = append(entries, [2]string{"100644 z", "1"})
+	commit := commitOf(t, dir, rawTree(t, dir, entries...))
+	b := NewBudget(NewSlots(1, 1, 0), "repo", 60*time.Second, 1<<20)
+	t.Cleanup(b.Close)
+	start := time.Now()
+	page, more, found, err := LsTreePage(WithBudget(context.Background(), b), dir, commit, "", "\x00", 1)
+	if err != nil || !found || more || len(page) != 1 || page[0].Path != "z" {
+		t.Fatalf("page %v, more %v, found %v, err %v; want [z]", paths(page), more, found, err)
+	}
+	if d := time.Since(start); d > 30*time.Second {
+		t.Fatalf("took %v", d)
 	}
 }
 

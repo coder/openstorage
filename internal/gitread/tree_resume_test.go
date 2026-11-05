@@ -276,6 +276,49 @@ func TestTreeWalkReadsEachTreeOnce(t *testing.T) {
 	}
 }
 
+// Folders without files in front of the first file are read in a few passes,
+// not one pass each: every pass reads twice the entries of the last.
+func TestTreeWalkPassesOverEmptyFolders(t *testing.T) {
+	root := map[string]*memEntry{"z": {mode: modeBlob}}
+	for i := range 3000 {
+		root[fmt.Sprintf("e%05d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
+	}
+	m := newMemTrees(root)
+	c := &countingTrees{memTrees: m, opens: map[string]int{}}
+	w := &treeWalk{src: c, limit: 1, room: math.MaxInt64}
+	if err := w.run(memCommit, "", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := paths(w.page), []string{"z"}; !slices.Equal(got, want) {
+		t.Fatalf("page %v, want %v", got, want)
+	}
+	if n := c.opens[memCommit+"^{tree}"]; n > 16 {
+		t.Fatalf("the root was read %d times", n)
+	}
+}
+
+// A path longer than maxWalkPath is left to the stream.
+func TestTreeWalkDeclinesALongPath(t *testing.T) {
+	chain := func(depth int) map[string]*memEntry {
+		root := map[string]*memEntry{}
+		dir := root
+		name := strings.Repeat("n", 99)
+		for range depth {
+			next := map[string]*memEntry{}
+			dir[name] = &memEntry{mode: modeTree, sub: next}
+			dir = next
+		}
+		dir["f"] = &memEntry{mode: modeBlob}
+		return root
+	}
+	short := newMemTrees(chain(maxWalkPath/100 - 2))
+	checkWalk(t, short, "", "\x00", 5, math.MaxInt64)
+	long := newMemTrees(chain(maxWalkPath/100 + 2))
+	if _, err := walkMem(long, "", "\x00", 5, math.MaxInt64); !errors.Is(err, errDeclined) {
+		t.Fatalf("walk of paths past %d bytes: err = %v, want errDeclined", maxWalkPath, err)
+	}
+}
+
 // A short allowance cuts what a level buffers, and folders without files
 // make a level yield less than the page needs: the walk reads the level
 // again and skips what it used.
