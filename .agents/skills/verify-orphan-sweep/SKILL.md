@@ -156,6 +156,7 @@ Every fact was broken in the real code, in a scratch checkout whose covered code
 | drop the age test from the purge gate | `PurgeAgeGated` | `NoLostPack`, `NoWaitForHeal`, `BytesComeBack` |
 | `QuarantinePurgeFloor = 1 * sweepRecoveryTimeout` | `PurgeFloorCoversHandshake` | `NoLostPack`, `NoWaitForHeal`, `BytesComeBack` |
 | `quarantinePurgeAge` returns `QuarantinePurgeFloor` | `PurgeAgeCoversThreshold` | `NoLostPack`, `BytesComeBack` |
+| remove `ctx, cancel := context.WithTimeout(ctx, healEntryTimeout)` from `healQuarantineEntry` | `HealEntryBounded` | `NoLostPack`, `BytesComeBack` |
 | remove the won-path `verifyPublished` after `ReplacePacks` in `Repacker.repack` | `WriterVerifies` | `NoWaitForHeal` |
 | `if regErr != nil { break }` at the top of `preReceive`'s `EnsurePublished` loop | `VerifyOnRegisterError` | `NoWaitForHeal` |
 
@@ -163,7 +164,7 @@ A worked example of a moved guard: moving `safeDelete`'s `s.registered(rctx, rep
 
 ## Coverage record
 
-Sync commit: `5620494ca88650825618a0bbb731000ee586bb8f` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
+Sync commit: `b06d5c829dffd053e27973fedf80e3121c86c1fd` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
 | File | Covered code |
 |---|---|
