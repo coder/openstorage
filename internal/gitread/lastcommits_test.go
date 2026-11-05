@@ -591,12 +591,14 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 	}, {
 		// H and HZ are two dead chains below the shared parent P2. H resolves
 		// p, and its cancel forgets P2. M then hands q to HZ, which is sent
-		// ahead and marks P2 again, past the window. P1, sent ahead with no
-		// path, pops next, and P2 enters the window at exactly the line where
-		// it would be sent, before HZ pops and resolves q. P1's cancel is the
-		// one that forgets P2 this time.
+		// ahead and marks P2 again, past the window. M's second parent heads
+		// a chain F1 to F14 that no path reaches and that holds P2 outside
+		// the window. P1, sent ahead with no path, pops next, and P2 enters
+		// the window at exactly the line where it would be sent, before HZ
+		// pops and resolves q. P1's cancel is the one that forgets P2 this
+		// time.
 		name:      "a line sent ahead with no path forgets the parent a sibling chain marked",
-		spool:     slices.Concat([]string{"T H M", "H P1", "M HZ R", "P1 P2", "HZ P2"}, fillers("F", 5, 18, "R"), []string{"P2 R", "R"}),
+		spool:     slices.Concat([]string{"T H M", "H P1", "M HZ F1", "P1 P2", "HZ P2"}, chain("F", 14, "R"), []string{"P2 R", "R"}),
 		changed:   map[string][]string{"T H": {"q"}, "H P1": {"p"}, "HZ P2": {"q"}, "R": {"p", "q"}},
 		last:      map[string]string{"p": "H", "q": "HZ"},
 		dead:      func(c string) bool { return c == "P2" },
@@ -613,9 +615,19 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 			}
 			byID := map[string]string{}
 			var spool strings.Builder
+			// Every line must be a parent of an earlier one, so that git could
+			// print the spool, in an order that has children before parents.
+			named := map[string]bool{strings.Fields(tc.spool[0])[0]: true}
 			for _, line := range tc.spool {
+				fields := strings.Fields(line)
+				if !named[fields[0]] {
+					t.Fatalf("spool line %q is not a parent of an earlier line", line)
+				}
+				for _, p := range fields[1:] {
+					named[p] = true
+				}
 				var out []string
-				for _, c := range strings.Fields(line) {
+				for _, c := range fields {
 					out = append(out, name(c))
 					byID[name(c)] = c
 				}
@@ -664,15 +676,6 @@ func interleave(a, b []string) []string {
 		if i < len(b) {
 			out = append(out, b[i])
 		}
-	}
-	return out
-}
-
-// fillers returns the lines "<prefix>i parent" for i from..to.
-func fillers(prefix string, from, to int, parent string) []string {
-	var out []string
-	for i := from; i <= to; i++ {
-		out = append(out, fmt.Sprintf("%s%d %s", prefix, i, parent))
 	}
 	return out
 }
