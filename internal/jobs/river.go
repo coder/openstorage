@@ -977,7 +977,8 @@ func (q *River) EnqueuePush(ctx context.Context, job sync.Job) error {
 // RecordForwardTx records a forward_on_push repository's forward intent in
 // tx, the transaction of the ref CAS that accepted the write: the push job
 // and the pending level commit with the ref, or not at all. It reports
-// whether it raised the pending level. A repository that does not forward
+// whether it marked the pending level of a forward_on_push row. A
+// repository that does not forward
 // gets no write; one whose forward_on_push turns off between the read and
 // the update gets only a job, which forwards once.
 //
@@ -1052,9 +1053,9 @@ const shutdownSnoozeFallback = 30 * time.Minute
 // the gate, so it is not rerun. A
 // restored run left its request pending and no claim; the snooze then
 // matches the gate's own uncovered-pending snooze. A failed restore left
-// the claim held and the request consumed; the gate would complete the
-// job (no pending mark), and the request would be lost once the claim
-// expired. The delay therefore waits past any claim on the fresh row, and
+// the claim held and the request consumed; the sync lane's gate would
+// complete the job (no pending mark), and the request would be lost once
+// the claim expired. The delay therefore waits past any claim on the fresh row, and
 // the next run steals it and does the work. No successor is inserted: this
 // job stays the only one for the lane and repo, and its next run's claim
 // covers every request marked before it.

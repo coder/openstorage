@@ -335,10 +335,14 @@ func TestRiverPushFailedFinishKeepsJobUntilClaimExpires(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		failCall int32
+		// The job waits for the lease, so the stealing run comes right
+		// after it: the failed run, the skip that a failed completion
+		// causes, then the steal.
+		maxAttempts int32
 	}{
-		{"plain", 0},
-		{"pre_run_read_fails", 1},
-		{"completion_fails_once", 2},
+		{"plain", 0, 2},
+		{"pre_run_read_fails", 1, 2},
+		{"completion_fails_once", 2, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -396,6 +400,9 @@ func TestRiverPushFailedFinishKeepsJobUntilClaimExpires(t *testing.T) {
 			}
 			if got := stolenFrom.Load(); got != "push-1 force=true" {
 				t.Errorf("re-run stole %v, want push-1 force=true", got)
+			}
+			if n := attempts.Load(); n > tc.maxAttempts {
+				t.Errorf("%d runs before the steal, want at most %d: the job did not wait for the lease", n, tc.maxAttempts)
 			}
 			up, err := store.GetUpstream(ctx, "repo_held")
 			if err != nil {
