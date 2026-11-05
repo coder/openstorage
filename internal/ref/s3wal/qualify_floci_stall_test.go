@@ -220,11 +220,14 @@ func TestReadFailureShapes(t *testing.T) {
 	opts.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	opts.Retryer = aws.NopRetryer{}
 	client := s3.New(opts)
-	for _, tc := range []struct{ key, class string }{
-		{"hang", "deadline"}, {"short", "short-body"}, {"closed", "reset"}, {"status", "status"},
+	for _, tc := range []struct {
+		key, class string
+		timeout    time.Duration // only the hang may reach it
+	}{
+		{"hang", "deadline", 300 * time.Millisecond}, {"short", "short-body", time.Minute}, {"closed", "reset", time.Minute}, {"status", "status", time.Minute},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+			ctx, cancel := context.WithTimeout(t.Context(), tc.timeout)
 			defer cancel()
 			_, _, err := getWithETag(ctx, client, "b", tc.key)
 			if err == nil {
