@@ -1071,7 +1071,8 @@ func TestDiffCommitGitFaultIs500(t *testing.T) {
 	}
 	// The wrapper makes git's own work fail just before `git apply --cached`
 	// runs. Mode "lock" holds the scratch index lock. Mode "objects" makes the
-	// scratch object directory unwritable for that one run.
+	// scratch object directory unwritable for that one run. Mode "config"
+	// breaks the config that `git apply --numstat` reads.
 	bin := t.TempDir()
 	modeFile := filepath.Join(bin, "mode")
 	wrapper := fmt.Sprintf(`#!/bin/sh
@@ -1079,6 +1080,7 @@ cached=
 if [ "$1" = apply ]; then for a in "$@"; do [ "$a" = --cached ] && cached=1; done; fi
 mode=$(cat %[1]q 2>/dev/null)
 if [ -n "$cached" ] && [ "$mode" = lock ]; then : > "$GIT_INDEX_FILE.lock"; fi
+if [ "$mode" = config ]; then for a in "$@"; do [ "$a" = --numstat ] && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.bare GIT_CONFIG_VALUE_0=maybe exec %[2]q "$@"; done; fi
 if [ -n "$cached" ] && [ "$mode" = objects ]; then
 	chmod 500 "$GIT_OBJECT_DIRECTORY"
 	%[2]q "$@"; rc=$?
@@ -1099,6 +1101,7 @@ exec %[2]q "$@"
 		name, mode, patch string
 	}{
 		{"held index lock", "lock", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"},
+		{"broken config in the parse step", "config", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"},
 		{"unwritable object directory", "objects", newFile("n.txt")},
 		// git prints a name as it is, so these names put a line of a payload
 		// error and of a clash into the stderr of a server fault.
@@ -1128,7 +1131,7 @@ exec %[2]q "$@"
 				if !bytes.Contains(body, []byte(internalErrorMsg)) {
 					t.Fatalf("body %s does not carry the generic internal error", body)
 				}
-				for _, leak := range []string{"index.lock", "openstorage-write-", os.TempDir(), "git apply", "fatal", "insufficient permission", "objects"} {
+				for _, leak := range []string{"index.lock", "openstorage-write-", os.TempDir(), "git apply", "fatal", "insufficient permission", "objects", "config", "core.bare"} {
 					if bytes.Contains(body, []byte(leak)) {
 						t.Fatalf("body %s leaks %q from git's stderr", body, leak)
 					}
@@ -1141,10 +1144,11 @@ exec %[2]q "$@"
 	}
 }
 
-// TestApplyPatchNamesServerPath: git's stderr that names the server's scratch
-// directory or the cached repository answers 500, whatever lines it holds,
-// and the same lines without a server path keep their status.
-func TestApplyPatchNamesServerPath(t *testing.T) {
+// TestApplyPatchServerFailure: git's stderr that names the server's scratch
+// directory or the cached repository, or that has a fatal line, is a failure
+// of the server's git whatever other lines it holds, and the same lines
+// without that keep their status.
+func TestApplyPatchServerFailure(t *testing.T) {
 	bin := t.TempDir()
 	stderrFile, exitFile := filepath.Join(bin, "stderr"), filepath.Join(bin, "exit")
 	wrapper := fmt.Sprintf("#!/bin/sh\ncat %q >&2\nexit $(cat %q)\n", stderrFile, exitFile)
@@ -1166,12 +1170,15 @@ func TestApplyPatchNamesServerPath(t *testing.T) {
 		name, stderr string
 		exit         string
 		want         int
+		server       bool
 	}{
-		{"payload line", "error: invalid path 'z'", "128", http.StatusBadRequest},
-		{"payload line after a name that holds the scratch path", "error: unable to create backing store for newly created file n\nerror: invalid path '" + sc.dir + "/objects'", "128", http.StatusInternalServerError},
-		{"clash line and the cached repository", "error: unable to add cache entry for " + repoPath + "/objects\n", "128", http.StatusInternalServerError},
-		{"does not apply and the scratch path", "error: patch failed: " + sc.dir + ":1", "1", http.StatusInternalServerError},
-		{"does not apply", "error: patch failed: f:1", "1", http.StatusConflict},
+		{"payload line", "error: invalid path 'z'", "128", http.StatusBadRequest, false},
+		{"payload line after a name that holds the scratch path", "error: unable to create backing store for newly created file n\nerror: invalid path '" + sc.dir + "/objects'", "128", http.StatusInternalServerError, true},
+		{"clash line and the cached repository", "error: unable to add cache entry for " + repoPath + "/objects\n", "128", http.StatusInternalServerError, true},
+		{"does not apply and the scratch path", "error: patch failed: " + sc.dir + ":1", "1", http.StatusInternalServerError, true},
+		{"does not apply", "error: patch failed: f:1", "1", http.StatusConflict, false},
+		{"fatal line", "fatal: bad config line 5 in file ./config", "128", http.StatusInternalServerError, true},
+		{"fatal line after a payload line", "error: invalid path 'z'\nfatal: unable to read blob object 0000", "128", http.StatusInternalServerError, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := os.WriteFile(stderrFile, []byte(tc.stderr), 0o600); err != nil {
@@ -1182,8 +1189,8 @@ func TestApplyPatchNamesServerPath(t *testing.T) {
 			}
 			_, err := sc.applyPatch(context.Background(), patch, "--cached")
 			var rej *wcApplyRejection
-			if !errors.As(err, &rej) || rej.status != tc.want {
-				t.Fatalf("err = %v, want a rejection with status %d", err, tc.want)
+			if !errors.As(err, &rej) || rej.status != tc.want || rej.server != tc.server {
+				t.Fatalf("err = %v, want a rejection with status %d and server %v", err, tc.want, tc.server)
 			}
 		})
 	}

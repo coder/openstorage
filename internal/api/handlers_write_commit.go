@@ -740,7 +740,8 @@ const wcMaxApplyMsgBytes = 4096
 // whole stderr, which a long path can push far past wcMaxApplyMsgBytes.
 type wcApplyRejection struct {
 	exit   int
-	status int    // wcApplyStatus of git's whole stderr, 500 if it names a server path
+	status int    // wcApplyStatus of git's whole stderr, 500 if server is set
+	server bool   // that stderr shows a failure of the server's own git (see wcApplyServerFailure)
 	msg    string // that stderr cut to wcMaxApplyMsgBytes
 }
 
@@ -754,7 +755,7 @@ func (r *wcApplyRejection) Error() string {
 // hold a newline, and git prints names unquoted, so a name can put any of
 // these lines into stderr: they say what git was told, not what failed.
 // applyPatch therefore never shows a message that names the server's own
-// paths (see namesServerPath), whatever these lines say.
+// paths (see wcApplyServerFailure), whatever these lines say.
 var (
 	// A patch that no base tree can make apply: a name that git's own path
 	// rules reject (`.git.`, `git~1`, a symlinked `.gitmodules`), a patch
@@ -793,12 +794,18 @@ func wcApplyStatus(exit int, stderr string) int {
 	return http.StatusInternalServerError
 }
 
-// namesServerPath reports whether git's stderr names a path of the server's:
-// the scratch directory or the cached repository. Only git's own failure
-// prints one, whatever file names the patch chose, so such a message is the
-// server's and the client never sees it.
-func (sc *wcScratch) namesServerPath(stderr string) bool {
-	assertf(sc.dir != "" && sc.repoPath != "", "namesServerPath: empty scratch path")
+// wcApplyServerFailure reports whether git's stderr shows a failure of the
+// server's own git, whatever the patch holds, so that the client never sees
+// it: it names a path of the server's (the scratch directory or the cached
+// repository), or it has a fatal line. git dies for a broken config, a held
+// lock or a missing object, and reports a bad patch with error lines.
+func (sc *wcScratch) wcApplyServerFailure(stderr string) bool {
+	assertf(sc.dir != "" && sc.repoPath != "", "wcApplyServerFailure: empty scratch path")
+	for line := range strings.Lines(stderr) {
+		if strings.HasPrefix(line, "fatal: ") {
+			return true
+		}
+	}
 	for _, dir := range []string{sc.dir, sc.repoPath} {
 		if strings.Contains(stderr, dir) {
 			return true
@@ -842,11 +849,12 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	if msg == "" {
 		msg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
 	}
+	server := sc.wcApplyServerFailure(full)
 	status := wcApplyStatus(exit.ExitCode(), full)
-	if sc.namesServerPath(full) {
+	if server {
 		status = http.StatusInternalServerError
 	}
-	return "", &wcApplyRejection{exit: exit.ExitCode(), status: status, msg: msg}
+	return "", &wcApplyRejection{exit: exit.ExitCode(), status: status, server: server, msg: msg}
 }
 
 // wcNumstatPaths parses `git apply --numstat -z`: one record per file,
@@ -1423,7 +1431,7 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 		// diff payload was invalid").
 		var rej *wcApplyRejection
 		numstat, err := sc.applyPatch(r.Context(), patchPath, "--numstat", "-z")
-		if errors.As(err, &rej) {
+		if errors.As(err, &rej) && !rej.server {
 			wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+rej.msg, md.TargetBranch, plan.oldSHA)
 			return
 		} else if err != nil {

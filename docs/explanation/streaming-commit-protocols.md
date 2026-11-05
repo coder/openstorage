@@ -116,11 +116,11 @@ When the patch cannot be used, the answer depends on why:
   missing or already exists, a binary preimage that differs, a path beyond a symlink, a
   file where a directory is): 409 `conflict` with the message `patch does not apply: …`
   and git's own error. No ref moves.
-- Git itself fails while it applies a patch that fits (a held index lock, a full disk, an
-  unreadable index): 500 with the generic `internal error` body. Git's message can name the
-  server's scratch directory, so the server logs it and the client gets only the generic
-  body. A message that names the scratch directory or the cached repository answers 500
-  whatever file names the patch holds. No ref moves.
+- Git itself fails while it reads or applies a patch (a broken config, a held index lock, a
+  full disk, an unreadable index): 500 with the generic `internal error` body. Git's message
+  can name the server's scratch directory, so the server logs it and the client gets only
+  the generic body. A message that names the scratch directory or the cached repository, or
+  that has a `fatal:` line, answers 500 whatever file names the patch holds. No ref moves.
 
 Before [#608](https://github.com/coder/openstorage/issues/608), all of these answered 422
 `invalid`.
