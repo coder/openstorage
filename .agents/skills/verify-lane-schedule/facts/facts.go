@@ -255,6 +255,8 @@ func main() {
 	wireEvt := load("cmd/openstorage/wire_eventing.go")
 	wireLocal := load("cmd/openstorage/wire_eventing_local.go")
 	pub := load("internal/githttp/publication.go")
+	hydrate := load("internal/githttp/hydrate.go")
+	hook := load("internal/githttp/hook.go")
 
 	sqlBegin := sqlEvt.fn("SQLite", "beginPush")
 	walBegin := walEvt.fn("S3WAL", "beginPush")
@@ -462,13 +464,16 @@ func main() {
 		{push, "", []string{"localPushOutcome", "TransientPushFailure", "PushRetryDelay"}},
 		{worker, "Worker", []string{"waitPublication", "restoreLocal", "claimLocal", "restoreForShutdown", "retryFinish", "retryFinishWithin"}},
 		{worker, "", []string{"claimContext", "claimLease"}},
-		{sched, "LocalScheduler", []string{"offer", "SweepOnce", "Drain"}},
+		{sched, "LocalScheduler", []string{"offer", "SweepOnce", "Start", "Drain"}},
 		{sched, "", []string{"shutdownAborted"}},
 		{refstore, "RefStore", []string{"CASRef", "emitPush"}},
 		{wireEvt, "", []string{"enqueueSyncOrForward"}},
 		{wireLocal, "", []string{"buildLocalSyncQueue"}},
 		{pub, "", []string{"WaitForPushPublication"}},
 		{pub, "publicationWait", []string{"wait"}},
+		{hydrate, "", []string{"Hydrate", "reservePushHolds", "removePushHolds", "appendPushReleased", "pushHoldLive", "readPushHolds"}},
+		{hydrate, "refCmdBatch", []string{"flush"}},
+		{hook, "", []string{"referenceTransactionHook", "updateHook"}},
 	} {
 		for _, n := range c.names {
 			f := c.src.fn(c.recv, n)
@@ -483,6 +488,50 @@ func main() {
 		v := constSpec(push, k)
 		fmt.Printf("FP %s:const_%s %s\n", push.path, k, push.fingerprint(v.Pos(), v.End()))
 	}
+	// transferPush names these refspecs; their values decide what a plain
+	// and a forced forward may do upstream.
+	for _, v := range []struct {
+		src  *source
+		name string
+	}{{push, "pushRefspecs"}, {worker, "mirrorRefspecs"}} {
+		n := varSpec(v.src, v.name)
+		fmt.Printf("FP %s:var_%s %s\n", v.src.path, v.name, v.src.fingerprint(n.Pos(), n.End()))
+	}
+	// preReceive is long: fingerprint only the closure that reserves the
+	// push's holds (reserveHoldsAndProbe = func() ...).
+	pr := hook.fn("", "preReceive")
+	var reserve ast.Node
+	ast.Inspect(pr.Body, func(m ast.Node) bool {
+		if as, ok := m.(*ast.AssignStmt); ok && len(as.Lhs) == 1 && hook.text(as.Lhs[0]) == "reserveHoldsAndProbe" {
+			if _, ok := as.Rhs[0].(*ast.FuncLit); ok {
+				reserve = as
+			}
+		}
+		return true
+	})
+	if reserve == nil {
+		fail("%s: preReceive's reserveHoldsAndProbe = func() ... not found", hook.path)
+	}
+	fmt.Printf("FP %s:preReceive[reserveHoldsAndProbe] %s\n", hook.path, hook.fingerprint(reserve.Pos(), reserve.End()))
+}
+
+func varSpec(s *source, name string) ast.Node {
+	for _, d := range s.file.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.VAR {
+			continue
+		}
+		for _, sp := range g.Specs {
+			v := sp.(*ast.ValueSpec)
+			for _, n := range v.Names {
+				if n.Name == name {
+					return v
+				}
+			}
+		}
+	}
+	fail("%s: var %s not found", s.path, name)
+	return nil
 }
 
 func constSpec(s *source, name string) ast.Node {

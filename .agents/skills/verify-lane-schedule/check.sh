@@ -11,10 +11,10 @@
 # 3. Compares the fingerprints with model/fingerprints.txt.
 #
 # Exit codes:
-#   0  every property holds, both probes fail as expected, no covered code
+#   0  every property holds, all three probes fail as expected, no covered code
 #      changed since the sync commit
-#   1  a property failed in LaneSchedule.cfg or Liveness.cfg. Read the
-#      trace in --out.
+#   1  a property failed in LaneSchedule.cfg, OtherWriters.cfg or
+#      Liveness.cfg. Read the trace in --out.
 #   2  STALE: the properties hold, but covered code changed since the sync
 #      commit, or a probe stopped failing. Review the model against the code.
 #   3  the check could not run (Go, Java, TLC download, parse error)
@@ -28,8 +28,8 @@
 #
 # --record rewrites model/fingerprints.txt and the sync commit in SKILL.md
 # to the current code. Use it only after you confirmed that the model
-# describes the code at HEAD. It refuses unless the properties hold, both
-# probes fail, and the covered files have no uncommitted changes. The
+# describes the code at HEAD. It refuses unless the properties hold, every
+# probe fails, and the covered files have no uncommitted changes. The
 # sync commit is the merge base with origin/main (OPENSTORAGE_MAIN_REF)
 # when the covered files match it, so a squash merge does not orphan it.
 #
@@ -57,8 +57,8 @@ while [ $# -gt 0 ]; do
     --fingerprints-only) fp_only=1; shift ;;
     --only) [ $# -ge 2 ] || { echo "check.sh: --only needs a config name" >&2; exit 3; }
             case $2 in
-              LaneSchedule.cfg|Liveness.cfg|NoLeaseAssumption.cfg|NoCompletionAssumption.cfg) ;;
-              *) echo "check.sh: --only takes LaneSchedule.cfg, Liveness.cfg, NoLeaseAssumption.cfg or NoCompletionAssumption.cfg" >&2; exit 3 ;;
+              LaneSchedule.cfg|OtherWriters.cfg|Liveness.cfg|NoLeaseAssumption.cfg|NoCompletionAssumption.cfg|NoFreshnessAssumption.cfg) ;;
+              *) echo "check.sh: --only takes LaneSchedule.cfg, OtherWriters.cfg, Liveness.cfg, NoLeaseAssumption.cfg, NoCompletionAssumption.cfg or NoFreshnessAssumption.cfg" >&2; exit 3 ;;
             esac
             only="$only$2 "; shift 2 ;;
     -h|--help) awk 'NR > 1 && /^set -uo pipefail/ { exit } NR > 1' "$0"; exit 0 ;;
@@ -164,7 +164,7 @@ status=0
 selected() { [ "$fp_only" = 0 ] || return 1; [ "$only" = " " ] || case $only in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 verdict() { printf '   %-27s %s\n' "$1" "$2"; }
 if [ "$fp_only" = 1 ]; then echo "== TLC skipped (--fingerprints-only)"; else echo "== TLC $TLC_VERSION (outputs in $out)"; fi
-for cfg in LaneSchedule.cfg Liveness.cfg; do
+for cfg in LaneSchedule.cfg OtherWriters.cfg Liveness.cfg; do
   selected "$cfg" || continue
   extra=()
   [ "$cfg" = Liveness.cfg ] && extra=(-lncheck final)
@@ -182,11 +182,12 @@ for cfg in LaneSchedule.cfg Liveness.cfg; do
 done
 
 # Each probe drops one assumption the code relies on, and one property must
-# then fail: NoRewind without the lease assumption, NoLostForward without
-# the push-completion assumption. One worker keeps the trace the shortest one.
+# then fail: NoRewind without the lease assumption, NoLostForward without the
+# write-completion or the held-ref freshness assumption. One worker keeps the
+# trace the shortest one.
 stale=0 probe_passed=0
 [ "$false_facts" -eq 0 ] || stale=1
-for probe in NoLeaseAssumption.cfg:NoRewind NoCompletionAssumption.cfg:NoLostForward; do
+for probe in NoLeaseAssumption.cfg:NoRewind NoCompletionAssumption.cfg:NoLostForward NoFreshnessAssumption.cfg:NoLostForward; do
   cfg=${probe%%:*} want=${probe#*:}
   selected "$cfg" || continue
   rc=0; run_tlc "$cfg" 1 || rc=$?

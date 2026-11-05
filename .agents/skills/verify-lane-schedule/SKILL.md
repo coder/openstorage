@@ -1,6 +1,6 @@
 ---
 name: verify-lane-schedule
-description: Model-check the local push-lane schedule (ADR-50: meta.LocalScheduleStore on SQLite and S3-WAL, sync.Worker.RunPush, LocalScheduler) with TLA+ and TLC, so no interleaving of git pushes, push-upstream calls, claims, steals, retries, restores, crashes and shutdown loses an accepted push's forward, downgrades a force request, or delays an explicit request. Use before you merge any change to RequestPush, RequestPushNow, ClaimDuePush, FinishPushOutcome, beginPush, RunPush, localPushOutcome, waitPublication, the shutdown restore, events.RefStore.emitPush or enqueueSyncOrForward; and whenever check.sh says STALE.
+description: Model-check the local push-lane schedule (ADR-50: meta.LocalScheduleStore on SQLite and S3-WAL, sync.Worker.RunPush, LocalScheduler) with TLA+ and TLC, so no interleaving of git pushes, push-upstream calls, claims, steals, retries, restores, crashes and shutdown loses an accepted push's forward, downgrades a force request, or delays an explicit request. Use before you merge any change to RequestPush, RequestPushNow, ClaimDuePush, FinishPushOutcome, beginPush, RunPush, localPushOutcome, waitPublication, the shutdown restore, events.RefStore.emitPush, enqueueSyncOrForward, or the push-hold code (reservePushHolds, referenceTransactionHook, Hydrate's held-ref skip); and whenever check.sh says STALE.
 ---
 
 # Verify the local push-lane schedule
@@ -11,12 +11,14 @@ On SQLite and S3-WAL, a repository with `forward_on_push` forwards every accepte
 
 | Property | Rule, in one sentence | Harm if it breaks |
 |---|---|---|
-| `NoLostForward` | Once no write, request or run is outstanding, the upstream has every accepted write, unless the last run spent its retry budget and nothing was requested since. | The upstream silently misses an accepted push until the next push or push-upstream call. |
+| `NoLostForward` | Once no write, request or run is outstanding, the upstream has every accepted write by a caller that may forward, and every value a push-upstream call saw, unless the last run spent its retry budget and nothing was requested since. | The upstream silently misses an accepted push until the next push or push-upstream call. |
 | `ForceKept` | A force request keeps level 2 in the row until a claim takes it, and that claim pushes with force, also after a steal or a retry. | A forced push-upstream becomes a plain push; a rewritten branch stays rejected upstream. |
 | `ExplicitNotDelayed` | An explicit request stays due now until a run takes it, even when the run that held the lane ends in retry or restore. | A push-upstream call made during a backoff waits up to 16 minutes. |
 | `BackoffKept` | A retry or restore with no explicit request during the run waits out its delay. | Retries run back to back and spend the budget (1 + 5 attempts) in seconds; an upstream outage longer than that loses the forward. |
 | `NoRewind` | The upstream ref never moves backwards. | A stale forced push rewinds the upstream. |
 | `Settles` | The lane always goes idle and stays idle. | Runs repeat forever, or the lane wedges. |
+
+"Accepted write" means a ref creation or update. Ref deletions are not forwarded, by design: `transferPush` uses no `--prune` and no delete refspecs (`internal/sync/worker_push.go`, file comment). A write by a caller that may not forward (a write-only token, any ref-policy operation, or a sync run's own loopback push) records no intent on purpose (`enqueueSyncOrForward`), and stays local until an authorized trigger.
 
 ## When to run it
 
@@ -32,7 +34,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/lane-schedule-check.XXXXXX")
 ```
 
 - Needs Go (the `go.mod` version), Java 11 or newer, and `curl`. The first run downloads `tla2tools.jar` 1.7.4 (sha256-pinned) into `${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla`, the cache `verify-orphan-sweep` uses too. Set `JAVA`, `GO`, or `OPENSTORAGE_TLA_CACHE` to override.
-- A passing run takes about 2 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), and about 90 s with `TLC_WORKERS=8`. A failing run usually takes seconds, because TLC stops at the first violation.
+- A passing run takes about a minute with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), and about 35 s with `TLC_WORKERS=8`. A failing run usually takes seconds, because TLC stops at the first violation.
 - `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path.
 - `--only <cfg>` runs one config, for example `--only LaneSchedule.cfg`. It is for quick iteration. Finish with a full run.
 - `--fingerprints-only` checks the code facts and the fingerprints without TLC or Java, in about a second. CI runs it in the `lane-schedule-fingerprints` job of `.github/workflows/ci.yml`, so a change to covered code fails CI until someone brings the model in line and runs `check.sh --record`. CI does not run TLC: a pass says that the covered code is the code the model was checked against, not that the properties hold.
@@ -44,10 +46,12 @@ A clean run ends like this:
    ClaimConsumesPending       TRUE
    ... (9 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/lane-schedule-check.Ab12Cd)
-   LaneSchedule.cfg            PASS (15067285 distinct states)
-   Liveness.cfg                PASS (163238 distinct states)
+   LaneSchedule.cfg            PASS (2694082 distinct states)
+   OtherWriters.cfg            PASS (947602 distinct states)
+   Liveness.cfg                PASS (255510 distinct states)
    NoLeaseAssumption.cfg       fails as expected (trace: ...)
    NoCompletionAssumption.cfg  fails as expected (trace: ...)
+   NoFreshnessAssumption.cfg   fails as expected (trace: ...)
 == Coverage (sync commit 4e30915c...)
    every covered function matches model/fingerprints.txt
 RESULT: PASS
@@ -87,10 +91,12 @@ Each TLA+ action names the Go call it stands for:
 | Model action | Code |
 |---|---|
 | `WReserve` | `preReceive` reserves the push's holds (`reservePushHolds`), before any update-hook CAS |
+| `WAbort` | the push's CAS fails (a stale base, a denial), or the push dies before it: nothing is accepted |
 | `WCas` | the update hook's `CASRefGen` through `events.RefStore` wins the authority CAS |
-| `WMark` | `events.RefStore.emitPush` calls the sync seam: `enqueueSyncOrForward` runs `RequestPush(repo, false)` |
+| `WMark` | `events.RefStore.emitPush` calls the sync seam: `enqueueSyncOrForward` runs `RequestPush(repo, false)`, except for a push in `QuietWriters` (forward denied, or `EnvSyncClaim`), which records nothing |
 | `WPublish` | receive-pack commits the cache ref; `referenceTransactionHook` releases the hold (`appendPushReleased`) |
-| `WCrash` | the hook or receive-pack dies (serve's shutdown kills git children too), or `RequestPush` returns an error, which `emitPush` only logs as "sync poke lost" |
+| `WCrash` | after the CAS, the hook or receive-pack dies (serve's shutdown kills git children too), or `RequestPush` returns an error, which `emitPush` only logs as "sync poke lost" |
+| `RCas`, `RMark`, `RCrashRest` | a REST write (`internal/api` handlers' `CASRef` through `events.RefStore`): the authority CAS with no hold and no cache update, then `emitPush`'s `RequestPush` through the serve queue, or serve dying or `RequestPush` failing between the two |
 | `Api` | `POST /repos/push-upstream`: `RequestPushNow` |
 | `Tick` | a backoff ends (`push_due <= now`) |
 | `Expire` | a claim's lease (`claimLease`) runs out |
@@ -113,7 +119,9 @@ Each TLA+ action names the Go call it stands for:
 | `claim` | `push_syncing` (`held`), `push_claim_holder` (`holder`), `push_claim_force` (`force`), lease ran out (`expired`), holder's run ended (`dead`), and the history field `owes` (it took a force request) |
 | `authority`, `cacheRef`, `upstream` | the ref's version in the ref store, in the cache repo, and upstream |
 | `hold` | the push whose live push hold names the ref |
-| `wState`, `rState` | each push's and each run's phase, named after the action that entered it |
+| `wState`, `restState`, `rState` | each git push's, REST write's and run's phase, named after the action that entered it |
+| `wVer`, `restVer` | the version each write's CAS wrote |
+| `owed` | history: the newest version the lane must forward |
 | `forceOwed`, `explicitOwed`, `spent`, `rewound`, `hammered` | history variables that only feed the properties |
 
 ## Read a failure
@@ -137,7 +145,7 @@ When check.sh says STALE, or when you change covered code on purpose:
 
 ## Scope
 
-**Verified, within these bounds:** one repository and one ref, three git pushes, two runs at a time (from any processes), one plain and one force push-upstream call, a retry budget of 2, three upstream outages (enough to spend the budget), and two faults (run crashes, failed finish writes, shutdown cancels, and pushes that die before their CAS) (`LaneSchedule.cfg`). Liveness uses two pushes, a budget of 1, one outage and one fault (`Liveness.cfg`). TLC checks every interleaving of the modeled steps. A pass covers the model at these bounds, not the whole system.
+**Verified, within these bounds:** one repository and one ref, two runs at a time (from any processes), a plain and a force push-upstream call, a retry budget of 2, three upstream outages (enough to spend the budget), and two faults (run crashes, failed finish writes, shutdown cancels, pushes that die after their CAS), with two git pushes (`LaneSchedule.cfg`). `OtherWriters.cfg` swaps one push for a push that records no intent and adds a REST write, with one force call, a budget of 1, one outage and one fault. Liveness uses two pushes, a budget of 1, one outage and one fault (`Liveness.cfg`). A push's CAS can always fail instead (`WAbort`, not counted as a fault). TLC checks every interleaving of the modeled steps. A pass covers the model at these bounds, not the whole system.
 
 **Assumptions:**
 
@@ -145,33 +153,36 @@ When check.sh says STALE, or when you change covered code on purpose:
 - An ambiguous S3-WAL PUT is classified correctly by the `recover` predicates of `FinishPushOutcome` and `beginPush`. A finish whose effect is unknown at worst reports `ErrClaimLost` or `ErrNotFound` to the run, which then abandons, so the model treats it like a successful finish followed by an abandon. Checking those predicates against a dropped-versus-applied PUT is left out.
 - The upstream has no other writers: a plain push is rejected only when the snapshot is older than the upstream.
 - Live processes keep taking steps, and faults are bounded (for `Settles`).
-- Two assumptions that the code relies on but does not enforce. Each probe drops one:
+- Three assumptions that the code relies on but does not enforce. Each probe drops one:
   - `LeaseOutlivesRun`: a claim expires only after its run ended. `claimLease` is the run timeout plus two `detachedOpTimeout` windows plus 5 minutes, and every step of `RunPush` runs inside those windows. A process frozen past the lease (SIGSTOP, a VM pause) breaks it.
-  - `PushCompletes`: a git push whose authority CAS won lives to record its intent and to commit its cache ref.
+  - `WritesComplete`: a writer whose authority CAS won lives to record its intent, and its `RequestPush` succeeds.
+  - `HeldRefsFresh`: when a push reserves its hold, the cache already has every earlier write to that ref.
 
 **Probes:**
 
 - `NoLeaseAssumption.cfg` drops `LeaseOutlivesRun`, and `NoRewind` must fail. The path: a forced run claims and is frozen past its lease, a push lands, a second run steals the claim (keeping force) and forwards the new value, and the frozen run, which passed its steal barrier before the steal, force-pushes its older snapshot. This is the residual window that `transferPush`'s barrier comment names ("only a FORCED zombie inside that window could rewind the upstream").
-- `NoCompletionAssumption.cfg` drops `PushCompletes`, and `NoLostForward` must fail. This probe is a finding in the current code; see below.
+- `NoCompletionAssumption.cfg` drops `WritesComplete`, and `NoLostForward` must fail. This is finding 1 below.
+- `NoFreshnessAssumption.cfg` drops `HeldRefsFresh`, and `NoLostForward` must fail with no fault at all. This is finding 2 below.
 
 If a probe starts passing, the code or the model changed. Review it before you update this file.
 
-**Findings in the current code** (the `NoCompletionAssumption.cfg` probe; replayed against the code step by step, not yet reproduced in a test):
+**Findings in the current code** (the last two probes; replayed against the code step by step, not yet reproduced in a test). Both break domain-model invariant 11 ("Non-ephemeral ref mutations on synced repos schedule background sync"):
 
-1. *Intent lost after the CAS.* A push's update hook wins the authority CAS, then dies or gets an error from `RequestPush` before the row records the intent. `events.RefStore.emitPush` only logs "sync poke lost". The lane stays idle, and the upstream misses the push until the next push or push-upstream call. Serve's shutdown can cause this: it kills git children (`gitlimit.StopChildren`) that may be between the two steps. TLC's trace: `WReserve`, `WCas`, `WCrash`.
-2. *Stale snapshot after a dead push.* Push A wins its CAS and records intent, then receive-pack dies before it commits the cache ref. A run claims A's intent and passes its publication wait. Push B to the same ref then reserves its hold (its advertisement came from the cache while A still held the ref). The run's loopback fetch skips hydrating the held ref, snapshots the old value, forwards it, and ends `done`. Push B's CAS fails on its stale base, as `hydrate.go`'s push-hold comment describes, so nothing records intent again. TLC's trace: `WReserve`, `WCas`, `WMark`, `WCrash`, `RClaim`, `RWait`, `WReserve`, `RSnap`, `WCrash`, `RBarrier`, `RPush`, `RFinish`.
+1. *Intent lost after the CAS.* A git push's update hook, or a REST write, wins the authority CAS, then dies or gets an error from `RequestPush` before the row records the intent. `events.RefStore.emitPush` only logs "sync poke lost". The lane stays idle, and the upstream misses the write until the next push or push-upstream call. Serve's shutdown can cause this: it kills git children (`gitlimit.StopChildren`) that may be between the two steps. TLC's trace: `WReserve`, `WCas`, `WCrash`.
+2. *Stale held snapshot.* A REST write changes only the authority and records intent. A run claims it and passes its publication wait, because nothing holds the ref yet. A push whose advertisement predates the REST write (here one with a forward-denied token, so it records nothing) then reserves its hold on the ref. The run's loopback fetch skips hydrating the held ref, snapshots the old value, forwards it, and ends `done`. The push's CAS fails on its stale base, and nothing records intent again. No crash is needed. A push that dies after its CAS and before its cache commit leaves the same stale cache. TLC's trace: `RCas`, `RMark`, `RClaim`, `RWait`, `WReserve`, `RSnap`, `WAbort`, `RBarrier`, `RPush`, `RFinish`.
 
-Both are narrow crash windows. Both break domain-model invariant 11 ("Non-ephemeral ref mutations on synced repos schedule background sync"). When a fix lands, this probe passes, check.sh reports STALE, and the fix must move `PushCompletes` out of the assumptions (set it TRUE in no config, or delete it) and update this section.
+When a fix lands, its probe passes and check.sh reports STALE. The fix must then delete the assumption it removes (and its probe), and update this section.
 
 **Simplifications:** each one gives the model at least the behaviors of the code, or the same outcome:
 
-- One ref with versions 0..3 stands for the repository: each accepted write is one larger number, and the forward is one atomic `git push --atomic`.
+- One ref with versions 0..`MaxVersion` stands for the repository: each accepted write is one larger number, and the forward is one atomic `git push --atomic`.
 - Hydration happens only at a run's snapshot. Real reads also hydrate the cache, which only makes it fresher, so the model allows staler caches than the code.
 - Runs are not limited by the sweep's slots, the `inflight` map, or `ListLocalWork` paging: any idle runner may claim whenever the row allows. `ClaimDuePush` is the only admission gate in the code too.
 - Error returns that end a run the same way as a crash are modeled as that crash. A claim that commits unseen is a crash right after the claim.
+- A run's other failures (a failed loopback fetch, a rejected or misconfigured push) end `done` with a `repo.push_upstream.failed` event, by design (`TransientPushFailure`): they are modeled only as the rejected plain push.
 - `MaxRetries = 2` stands for `MaxPushTransientRetries = 5`, and delays are one abstract "future" due time.
 
-**Left out (a pass says nothing about these):** the pull lane (`ClaimDueSync`, `FinishSyncOutcome`, the mirror-back pull that a successful forward marks, and the hook's pull poke), PostgreSQL (River schedules its push jobs), detach (`DELETE /repos/base`), the event payloads and their run counts, the egress guard, REST writes (they record intent after their CAS in serve, like the hook, but take no push hold), and the S3-WAL ambiguous-PUT recovery above.
+**Left out (a pass says nothing about these):** the pull lane (`ClaimDueSync`, `FinishSyncOutcome`, the mirror-back pull that a successful forward marks, and the hook's pull poke), PostgreSQL (River schedules its push jobs), detach (`DELETE /repos/base`), ref deletions (not forwarded, see above), the event payloads and their run counts, the egress guard, the push-hold details that one `hold` stands for (per-ref holds, sidecars, TTL refresh, epochs, held markers), and the S3-WAL ambiguous-PUT recovery above.
 
 ## Validation
 
@@ -189,7 +200,7 @@ Every fact was broken in the real code, one at a time, on a checkout whose cover
 | replace `w.waitPublication(ctx, job.RepoID)` in `RunPush` with `error(nil)` | `WaitBeforeSnapshot` | `LaneSchedule.cfg` | `NoLostForward` |
 | `errors.Is(runErr, ErrShutdown)` instead of `shutdownAborted(ctx)` in `RunPush` (a cancelled git child returns `context.Canceled`) | `ShutdownRestores` | `LaneSchedule.cfg` | `NoLostForward` |
 
-With every fact TRUE, each fact flipped in the model alone fails the same property, so no fact is dead weight. Both probes fail on the current code, and the main configs pass with the bounds in [Scope](#scope).
+With every fact TRUE, each fact flipped in the model alone fails the same property, so no fact is dead weight. All three probes fail on the current code, and the property configs pass with the bounds in [Scope](#scope).
 
 ## Coverage record
 
@@ -201,13 +212,15 @@ Sync commit: `4e30915ceb0fe663f80cb0730721fdf28152c1a6` (the last commit at whic
 | `internal/meta/sqlite_eventing.go` | `SQLite.RequestPush`, `SQLite.beginPush` |
 | `internal/meta/s3walmeta_schedule.go` | `s3walLocalSchedule.RequestPushNow`, `ClaimDuePush`, `FinishPushOutcome`, `ListLocalWork`, `laneHeld` |
 | `internal/meta/s3walmeta_eventing.go` | `S3WAL.RequestPush`, `S3WAL.beginPush` |
-| `internal/sync/worker_push.go` | `Worker.RunPush`, `Worker.transferPush`, `localPushOutcome`, `TransientPushFailure`, `PushRetryDelay`, `const MaxPushTransientRetries` |
-| `internal/sync/worker.go` | `Worker.waitPublication`, `restoreLocal`, `claimLocal`, `restoreForShutdown`, `retryFinish`, `retryFinishWithin`, `claimContext`, `claimLease` |
-| `internal/sync/local_schedule.go` | `LocalScheduler.offer`, `SweepOnce`, `Drain`, `shutdownAborted` |
+| `internal/sync/worker_push.go` | `Worker.RunPush`, `Worker.transferPush`, `localPushOutcome`, `TransientPushFailure`, `PushRetryDelay`, `const MaxPushTransientRetries`, `var pushRefspecs` |
+| `internal/sync/worker.go` | `Worker.waitPublication`, `restoreLocal`, `claimLocal`, `restoreForShutdown`, `retryFinish`, `retryFinishWithin`, `claimContext`, `claimLease`, `var mirrorRefspecs` |
+| `internal/sync/local_schedule.go` | `LocalScheduler.offer`, `SweepOnce`, `Start`, `Drain`, `shutdownAborted` |
 | `internal/events/refstore.go` | `RefStore.CASRef`, `RefStore.emitPush` |
 | `cmd/openstorage/wire_eventing.go` | `enqueueSyncOrForward` |
 | `cmd/openstorage/wire_eventing_local.go` | `buildLocalSyncQueue` |
 | `internal/githttp/publication.go` | `WaitForPushPublication`, `publicationWait.wait` |
+| `internal/githttp/hydrate.go` | `Hydrate`, `refCmdBatch.flush` (the held-ref skip), `reservePushHolds`, `removePushHolds`, `appendPushReleased`, `pushHoldLive`, `readPushHolds` |
+| `internal/githttp/hook.go` | `referenceTransactionHook`, `updateHook`, and in `preReceive` the `reserveHoldsAndProbe` closure |
 
 `model/fingerprints.txt` holds one hash per entry.
 
@@ -218,8 +231,8 @@ Sync commit: `4e30915ceb0fe663f80cb0730721fdf28152c1a6` (the last commit at whic
 | `check.sh` | The one command: facts, TLC runs, fingerprints, `--record`, and the TLC-free `--fingerprints-only` that CI runs. |
 | `facts/facts.go` | Reads the code facts and fingerprints from the Go source (standard library only; the dot directory keeps it out of `./...`). |
 | `model/LaneSchedule.tla` | The model. |
-| `model/LaneSchedule.cfg`, `Liveness.cfg` | Property configs; each must pass. |
-| `model/NoLeaseAssumption.cfg`, `NoCompletionAssumption.cfg` | Probes; each must fail, `NoRewind` and `NoLostForward`. |
+| `model/LaneSchedule.cfg`, `OtherWriters.cfg`, `Liveness.cfg` | Property configs; each must pass. |
+| `model/NoLeaseAssumption.cfg`, `NoCompletionAssumption.cfg`, `NoFreshnessAssumption.cfg` | Probes; each must fail: `NoRewind`, `NoLostForward`, `NoLostForward`. |
 | `model/fingerprints.txt` | Fingerprints at the sync commit. |
 
 To bring this verification back in line after changes that skipped this skill, use the pstack `/maintain-formal-verification-skill` skill if you have it, or follow [Bring the model in line](#bring-the-model-in-line).
