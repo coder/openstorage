@@ -34,7 +34,7 @@ cat >"$T/bin/docker" <<'DOCKEREOF'
 # fake docker: one postgres container per run until `rm` is called
 case $1 in
 	ps) [[ -e $FAKE_DOCKER_STATE/removed ]] || echo "$FAKE_DOCKER_ID" ;;
-	inspect) echo 'docker.io/library/postgres:17@sha256:0000' ;;
+	inspect) echo 'docker.io/library/postgres:17' ;;
 	logs) echo "postgres log: connection from token $FAKE_DOCKER_TOKEN" ;;
 	rm) : >"$FAKE_DOCKER_STATE/removed" ;;
 esac
