@@ -385,12 +385,22 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	if len(quoted) > 0 {
 		detail += fmt.Sprintf(" firstReadErrs(%d of %d)=%s", len(quoted), readErrs.Load(), strings.Join(quoted, " "))
 	}
+	tally := raceTally{reads.Load(), tornBody.Load(), tornMeta.Load(), readErrs.Load(), explained, writeOKs.Load()}
+	return []verdict{raceVerdict(name, tally, minReads, minWrites, detail)}
+}
+
+// raceTally is what one get-under-overwrite race window counted.
+// stallErrs are the failed reads that a stall of the test process explains.
+type raceTally struct{ reads, tornBody, tornMeta, readErrs, stallErrs, writeOKs int64 }
+
+// raceVerdict turns a race window's counts into the surface's verdict.
+func raceVerdict(name string, c raceTally, minReads, minWrites int64, detail string) verdict {
 	switch {
-	case tornBody.Load() > 0:
-		return []verdict{{name, verdictMishandles, "torn body: a racing GET returned bytes of neither whole version — " + detail}}
-	case tornMeta.Load() > 0:
-		return []verdict{{name, verdictMishandles, "torn metadata: a racing GET returned one whole version with the other version's ETag — " + detail}}
-	case readErrs.Load() > explained:
+	case c.tornBody > 0:
+		return verdict{name, verdictMishandles, "torn body: a racing GET returned bytes of neither whole version — " + detail}
+	case c.tornMeta > 0:
+		return verdict{name, verdictMishandles, "torn metadata: a racing GET returned one whole version with the other version's ETag — " + detail}
+	case c.readErrs > c.stallErrs:
 		// Framing corruption can surface as failed reads rather than a
 		// classifiable torn body (a short-for-Content-Length response
 		// blocks until the op deadline; a poisoned keep-alive breaks the
@@ -400,11 +410,11 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		// firstReadErrs names the class of the first few (issue #566):
 		// "short-body" is the framing shape, "reset" a closed connection,
 		// and "deadline" with a long awake time a Floci or network stall.
-		return []verdict{{name, verdictError, "racing GETs failed without a classifiable torn read — inconclusive (possible framing corruption) — " + detail}}
-	case reads.Load() < minReads || writeOKs.Load() < minWrites:
-		return []verdict{{name, verdictError, "too few successful reads/overwrites to have exercised the race — " + detail}}
+		return verdict{name, verdictError, "racing GETs failed without a classifiable torn read — inconclusive (possible framing corruption) — " + detail}
+	case c.reads < minReads || c.writeOKs < minWrites:
+		return verdict{name, verdictError, "too few successful reads/overwrites to have exercised the race — " + detail}
 	default:
-		return []verdict{{name, verdictPass, "every racing GET returned one whole version with its own ETag — " + detail}}
+		return verdict{name, verdictPass, "every racing GET returned one whole version with its own ETag — " + detail}
 	}
 }
 

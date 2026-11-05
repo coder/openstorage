@@ -490,6 +490,20 @@ are unchanged, and Floci is not a qualified `s3wal://` store. Like the
 SeaweedFS lane, the test is gated only by `-short`, so it also runs in the
 per-PR `test` job. The nightly job also asserts a complete VERDICT transcript.
 
+**Read failures in `get-under-overwrite`.** A racing GET that fails is never a
+clean pass. The row ends `mishandles` on a torn body or ETag, and `error`
+(inconclusive, possible framing corruption) on any other failed read, except one
+that the test process explains. A heartbeat in the test process records every
+time it was frozen (a paused runner, a throttled cgroup, `SIGSTOP`). A failed
+read counts in `stallErrs`, and does not fail the row, only when it hit the 2 s
+op deadline and the process was frozen for all but a quarter of that deadline.
+The verdict quotes the first three failures with `class` (`deadline`,
+`short-body`, `reset` or `other`), `elapsed`, `awake` (the time the process ran
+during the read) and `explainedByStall`. `short-body` is the framing shape. A
+`deadline` with a long `awake` time is a stall of Floci or the network, because
+the test process kept running. `maxRead` and `maxStall` give the slowest
+successful GET and the longest freeze of the run.
+
 Run it locally (Docker + the `aws` CLI):
 
 ```sh

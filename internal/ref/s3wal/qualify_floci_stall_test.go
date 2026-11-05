@@ -167,11 +167,13 @@ func TestExplainedByStall(t *testing.T) {
 func TestStallTracker(t *testing.T) {
 	t0 := time.Unix(1000, 0)
 	tr := &stallTracker{last: t0, minGap: 20 * time.Millisecond}
-	for _, ms := range []int{5, 10, 15, 2500, 2505, 2530, 2535} {
-		tr.tick(t0.Add(time.Duration(ms) * time.Millisecond))
+	for _, n := range []int{5, 10, 15, 2500, 2505, 2530, 2550} {
+		tr.tick(t0.Add(time.Duration(n) * time.Millisecond))
 	}
-	// 15 ms to 2500 ms is a stall, and 2505 ms to 2530 ms is a stall too (25 ms is over the gap).
-	want := []stallSpan{{t0.Add(15 * time.Millisecond), t0.Add(2500 * time.Millisecond)}, {t0.Add(2505 * time.Millisecond), t0.Add(2530 * time.Millisecond)}}
+	// 15 ms to 2500 ms is a stall. So are 2505 ms to 2530 ms (25 ms) and
+	// 2530 ms to 2550 ms (exactly the 20 ms gap).
+	ms := func(n int) time.Time { return t0.Add(time.Duration(n) * time.Millisecond) }
+	want := []stallSpan{{ms(15), ms(2500)}, {ms(2505), ms(2530)}, {ms(2530), ms(2550)}}
 	if !slices.Equal(tr.spans, want) {
 		t.Fatalf("spans = %v, want %v", tr.spans, want)
 	}
@@ -227,6 +229,32 @@ func TestReadFailureShapes(t *testing.T) {
 			}
 			if got := readErrClass(err); got != tc.class {
 				t.Fatalf("readErrClass = %q, want %q for %v", got, tc.class, err)
+			}
+		})
+	}
+}
+
+// TestRaceVerdict is the rule of the surface: a failed read that nothing
+// explains never gives a pass, and a stall explains only the reads it covers.
+func TestRaceVerdict(t *testing.T) {
+	clean := raceTally{reads: 20000, writeOKs: 7000}
+	for _, tc := range []struct {
+		name string
+		c    raceTally
+		want string
+	}{
+		{"clean race", clean, verdictPass},
+		{"every failed read explained by a stall", raceTally{reads: 20000, writeOKs: 7000, readErrs: 2, stallErrs: 2}, verdictPass},
+		{"one failed read nothing explains", raceTally{reads: 20000, writeOKs: 7000, readErrs: 1}, verdictError},
+		{"one failed read of two explained", raceTally{reads: 20000, writeOKs: 7000, readErrs: 2, stallErrs: 1}, verdictError},
+		{"torn body", raceTally{reads: 20000, writeOKs: 7000, tornBody: 1}, verdictMishandles},
+		{"torn metadata beside an explained stall", raceTally{reads: 20000, writeOKs: 7000, tornMeta: 1, readErrs: 1, stallErrs: 1}, verdictMishandles},
+		{"too few reads", raceTally{reads: 49, writeOKs: 7000}, verdictError},
+		{"too few overwrites", raceTally{reads: 20000, writeOKs: 49}, verdictError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := raceVerdict("get-under-overwrite", tc.c, 50, 50, "detail").class; got != tc.want {
+				t.Fatalf("verdict class = %q, want %q", got, tc.want)
 			}
 		})
 	}
