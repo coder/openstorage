@@ -75,9 +75,10 @@ func Start(t testing.TB, dbURL string) (*Proxy, string) {
 }
 
 // Arm makes the next COMMIT that any relayed connection sends suffer f.
-// onFault, when not nil, runs once the fault took effect: for DropReply
-// after the server's reply arrived, so the transaction committed, and
-// before the client side closes.
+// onFault, when not nil, runs once the fault took effect and before the
+// client side closes, so Fired is true by the time the client sees the
+// fault. For DropReply it runs after the server's reply arrived: the
+// transaction committed.
 func (p *Proxy) Arm(f Fault, onFault func()) {
 	if f < DropReply || f > CutAll {
 		panic("pgfault: unknown fault")
@@ -147,12 +148,14 @@ func (p *Proxy) relay(client net.Conn) {
 					_ = client.Close()
 					return
 				case HoldCommit:
-					_ = client.Close()
 					p.fire(fn)
+					_ = client.Close()
 					return // the server side stays open until cleanup
 				case CutAll:
-					p.closeAll()
+					_ = p.ln.Close()
+					_ = server.Close()
 					p.fire(fn)
+					p.closeAll()
 					return
 				}
 			}
