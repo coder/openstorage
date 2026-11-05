@@ -375,9 +375,12 @@ class CitationTests(CheckerTestCase):
               'echo "it\'s" # comment-five\n'
               "echo x # 'quoted in a comment' # comment-six\n"
               "echo it's\" # comment-seven 'x'\n"
-              "echo \"it's\" don't # comment-eight\n")
+              "echo \"it's\" don't # comment-eight\n"
+              'echo "$(printf "%s # nested-sub" x)"\n'
+              "printf '%s\\n' $'it\\'s # ansi-quote'\n")
         ok = ["[run.sh:feature-name]", "[run.sh:double-quoted]"]
         bad = [f"[run.sh:comment-{n}]" for n in ("one", "two", "three", "four", "five", "six", "seven", "eight")]
+        bad += ["[run.sh:nested-sub]", "[run.sh:ansi-quote]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
@@ -390,12 +393,13 @@ class CitationTests(CheckerTestCase):
               "function declared() {}\nconst plain = 'text'\nfunction afterString() {}\n"
               "export default\nfunction defaulted() {}\n"
               "counter++\nfunction afterIncrement() {}\ncounter--\nfunction afterDecrement() {}\n"
+              "const quotient = 1 /\n  function divided() {}\n"
               "const re = /a+/\nfunction afterRegex() {}\n"
               "async function work() {\n  return\n  function afterReturn() {}\n}\n")
         ok = ["viaEquals", "viaClass", "either", "arrow", "pick", "list", "declared", "plain", "afterString",
-              "defaulted", "afterIncrement", "afterDecrement", "afterRegex", "work", "afterReturn"]
+              "defaulted", "afterIncrement", "afterDecrement", "work", "afterReturn"]
         bad = ["equalsNamed", "ClassNamed", "argNamed", "listNamed", "orNamed", "arrowNamed", "thenNamed",
-               "elseNamed", "bracketNamed"]
+               "elseNamed", "bracketNamed", "divided", "afterRegex"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n",
                                    **{"pkg/flow.js": js})
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
@@ -413,9 +417,9 @@ class CitationTests(CheckerTestCase):
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
 
     def test_every_javascript_continuation_ending_keeps_the_next_line_in_its_expression(self):
-        endings = ["=", "(", "[", ",", "?", ":", "+", "-", "*", "%", "&", "|", "^", "<", ">", "!", "~", ".",
+        endings = ["=", "(", "[", ",", "?", ":", "+", "-", "*", "/", "%", "&", "|", "^", "<", ">", "!", "~", ".",
                    "&&", "||", "??", "=>", "await", "delete", "in", "instanceof", "new", "typeof", "void"]
-        ends_a_statement = ["++", "--", "/", "return", "throw", "yield", "default", "obj.await", "obj.new"]
+        ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new"]
         js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}\n" for i, op in enumerate(endings))
         js += "".join(f"x {op}\nfunction closed{i}() {{}}\n" for i, op in enumerate(ends_a_statement))
         cited = [f"[flow.js:open{i}]" for i in range(len(endings))]

@@ -511,11 +511,13 @@ def tf_names(text):
 
 # A line that ends in one of these leaves its expression open, so the next
 # line continues it and a function or class there is not a declaration. A
-# postfix `++` or `--` and a regex literal (`/`) end a statement, so they are
-# left out, and so are `return`, `throw` and `yield`, which end at a line
-# break. A string keeps its quotes in the masked text, so a line that ends in
-# a string never looks like a dangling `=`.
-JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*%&|^<>!~.]$"
+# postfix `++` or `--` ends a statement, so it is left out, and so are
+# `return`, `throw` and `yield`, which end at a line break. A trailing `/` is
+# read as division, never as the end of a regex literal: a statement that
+# ends in a regex literal and has no `;` fails closed. A string keeps its
+# quotes in the masked text, so a line that ends in a string never looks like
+# a dangling `=`.
+JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*/%&|^<>!~.]$"
                           r"|(?<![\w$.])(?:await|delete|in|instanceof|new|typeof|void)$")
 
 
@@ -532,13 +534,13 @@ def js_names(text):
     return names
 
 
-# A quote opens and closes on one line, and quotes pair in the order they
-# appear. A quote that spans lines is not tracked. A line with a quote that
-# does not close (`stray`) cannot be paired, so its comment is dropped even
-# when a quote opened before it: one stray apostrophe cannot hide the comment
-# words of its line or of the lines below it. A quote inside `$(...)` in a
-# double-quoted string pairs with the outer one. In both cases a `#` is still
-# dropped as a comment, which fails closed.
+# The reader knows one quoting form: a plain '...' or "..." that opens and
+# closes on one line, paired in the order they appear, and a backslash escape.
+# It does not read `$(...)`, `${...}`, `$'...'` or a quote that spans lines.
+# A `#` after one of those can start a comment, and a line with a quote that
+# does not close (`stray`) drops its comment whatever the pairing. Both fail
+# closed: a valid citation of a word there is rejected, and no comment word
+# is accepted.
 SHELL_COMMENT = re.compile(r"(?:^|(?<=[\s;&|()]))#.*")
 SHELL_LEXER = re.compile(r"""(?P<text>'[^']*'|"(?:\\.|[^"\\])*"|\\.)|(?P<stray>['"])|""" + SHELL_COMMENT.pattern)
 
