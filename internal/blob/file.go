@@ -26,7 +26,10 @@ type File struct {
 	dir    string
 }
 
-var _ BlobStore = (*File)(nil)
+var (
+	_ BlobStore       = (*File)(nil)
+	_ PageListerAfter = (*File)(nil)
+)
 
 // OpenFile opens a file:// blob URL, e.g. file:///abs/dir (empty host, so the
 // directory is always absolute). The root directory is created up front —
@@ -104,6 +107,12 @@ func (b *File) List(ctx context.Context, prefix string) ([]ListedObject, error) 
 // ListPages streams objects under prefix in key order, one page at a time.
 func (b *File) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]ListedObject) error) error {
 	return bucketListPages(ctx, b.bucket, prefix, pageSize, fn)
+}
+
+// ListPagesAfter is ListPages from the first key after after. The directory
+// walk still visits the keys it skips: fileblob has no way to start inside it.
+func (b *File) ListPagesAfter(ctx context.Context, prefix, after string, pageSize int, fn func([]ListedObject) error) error {
+	return bucketListPagesAfter(ctx, b.bucket, prefix, after, nil, pageSize, fn)
 }
 
 // SignedURL is unsupported on the filesystem backend: it returns
@@ -309,10 +318,19 @@ func bucketList(ctx context.Context, bucket *gcblob.Bucket, prefix string) ([]Li
 // BlobStores; the underlying iterator fetches provider pages lazily, so
 // memory stays bounded by pageSize regardless of prefix population.
 func bucketListPages(ctx context.Context, bucket *gcblob.Bucket, prefix string, pageSize int, fn func([]ListedObject) error) error {
+	return bucketListPagesAfter(ctx, bucket, prefix, "", nil, pageSize, fn)
+}
+
+// bucketListPagesAfter is bucketListPages that skips every key at or before
+// after. The skip is a client-side filter, so the contract holds on every
+// driver. beforeList, when non-nil, is a gocloud ListOptions.BeforeList hook
+// that asks the provider to start after the key, so the filter never has to
+// read the keys it drops.
+func bucketListPagesAfter(ctx context.Context, bucket *gcblob.Bucket, prefix, after string, beforeList func(func(any) bool) error, pageSize int, fn func([]ListedObject) error) error {
 	assertf(bucket != nil, "bucketListPages(%q): nil bucket", prefix)
 	assertf(pageSize > 0, "bucketListPages(%q): non-positive page size %d", prefix, pageSize)
 	assertf(fn != nil, "bucketListPages(%q): nil fn", prefix)
-	iter := bucket.List(&gcblob.ListOptions{Prefix: prefix})
+	iter := bucket.List(&gcblob.ListOptions{Prefix: prefix, BeforeList: beforeList})
 	page := make([]ListedObject, 0, pageSize)
 	for {
 		obj, err := iter.Next(ctx)
@@ -321,6 +339,9 @@ func bucketListPages(ctx context.Context, bucket *gcblob.Bucket, prefix string, 
 		}
 		if err != nil {
 			return err
+		}
+		if obj.Key <= after {
+			continue
 		}
 		page = append(page, ListedObject{Key: obj.Key, Size: obj.Size, ModTime: obj.ModTime})
 		if len(page) == pageSize {
