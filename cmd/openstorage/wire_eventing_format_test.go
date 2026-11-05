@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -181,6 +182,25 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 	}
 	if n := fake.writes.Load(); n != 0 {
 		t.Fatalf("the hook sent %d write requests to the bucket; want none", n)
+	}
+}
+
+// A local-schedule metadata store the hook cannot open refuses the update
+// too: the intent before the CAS needs it.
+func TestHookEventingRefusesUnopenableLocalSchedule(t *testing.T) {
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := hookEventingEnv(t, "sqlite://"+filepath.Join(notADir, "meta.db"))
+	cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+	defer cleanup()
+	wrapped, err := githttp.WrapHookRefStore(t.Context(), hookRefStore(t))
+	if err == nil || wrapped != nil || !strings.Contains(err.Error(), "refusing the ref update: open metadata store") {
+		t.Fatalf("WrapHookRefStore = %v, %v; want a refusal", wrapped, err)
+	}
+	if !strings.Contains(logs.String(), "hook refuses ref updates: open meta store") {
+		t.Fatalf("missing refusal log: %s", logs)
 	}
 }
 

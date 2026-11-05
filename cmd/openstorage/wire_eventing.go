@@ -484,6 +484,16 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 
 	// Hooks never run DDL: meta.Open without InitSchema (serve owns it).
 	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))
+	if err != nil && !isPGURL(dbURL) {
+		// The local schedule records the push's forward intent before
+		// the CAS (ADR-50 amendment): without the store it cannot, so the
+		// update is refused rather than accepted with no intent.
+		logger.Error("hook refuses ref updates: open meta store", "err", err)
+		githttp.WrapHookRefStore = func(context.Context, ref.RefStore) (ref.RefStore, error) {
+			return nil, fmt.Errorf("refusing the ref update: open metadata store: %w", err)
+		}
+		return func() {}
+	}
 	if err != nil {
 		// Fail open (eventless) rather than denying the push: the ref
 		// store open below would fail too if the DB were truly down.
