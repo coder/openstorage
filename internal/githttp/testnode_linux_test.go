@@ -580,7 +580,7 @@ func TestNodeGuardKillsSessionWhenTestBinaryDies(t *testing.T) {
 	}{
 		{name: "SIGKILL", mode: "wait", wantExit: -1, die: func(t *testing.T, c *exec.Cmd, _ int) { _ = c.Process.Kill() }},
 		{name: "panic", mode: "panic", wantExit: 2},
-		{name: "test timeout", mode: "wait", timeout: "2s", wantExit: 2},
+		{name: "test timeout", mode: "wait", timeout: "5s", wantExit: 2}, // long enough to report its node on a loaded host
 		{name: "SIGINT", mode: "wait", wantExit: -1, die: func(t *testing.T, c *exec.Cmd, _ int) { _ = c.Process.Signal(syscall.SIGINT) }},
 		{name: "SIGINT ignored, then SIGKILL", mode: "wait", ignoreSIGINT: true, wantExit: -1, die: func(t *testing.T, c *exec.Cmd, child int) {
 			_ = c.Process.Signal(syscall.SIGINT)
