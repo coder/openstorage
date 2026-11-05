@@ -89,7 +89,7 @@ GO=${GO:-go}
 command -v "$GO" >/dev/null || die "needs Go (set GO=/path/to/go)"
 if ! (cd "$repo" && "$GO" run "$skill_dir/facts/facts.go" -root "$repo") >"$out/facts.txt" 2>"$out/facts.err"; then
   cat "$out/facts.err" >&2
-  die "facts.go failed (a covered function moved or was renamed?)"
+  die "facts.go failed (a covered file or a function a fact reads moved or was renamed?)"
 fi
 facts_cfg="$work/facts.cfg"
 {
@@ -213,13 +213,13 @@ echo "== Coverage (sync commit ${sync:-unknown})"
 changed=$(join -a1 -a2 -e MISSING -o 0,1.2,2.2 "$work/fingerprints.rec" "$out/fingerprints.now" | awk '$2 != $3 {print $1}')
 if [ -n "$changed" ]; then
   stale=1
-  echo "   STALE: these covered functions changed since the sync commit:"
+  echo "   STALE: these covered declarations changed since the sync commit:"
   while read -r f; do echo "     $f"; done <<<"$changed"
   echo "   Read their diff (git diff ${sync:-<sync>} -- <file>) and update the model if it no longer describes them."
   echo "   Then run .agents/skills/verify-lane-schedule/check.sh --record (needs Java) and commit"
   echo "   model/fingerprints.txt and SKILL.md. See \"Bring the model in line\" in SKILL.md."
 else
-  echo "   every covered function matches model/fingerprints.txt"
+  echo "   every covered declaration matches model/fingerprints.txt"
 fi
 
 if [ "$record" = 1 ]; then

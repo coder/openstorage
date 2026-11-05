@@ -22,7 +22,7 @@ On SQLite and S3-WAL, a repository with `forward_on_push` forwards every accepte
 
 ## When to run it
 
-Run it when your change touches any code in the [coverage record](#coverage-record), or any other code that writes `push_pending`, `push_due`, `push_attempt` or the push claim columns (`PushPending`, `PushDue`, `PushAttempt`, `PushClaim*` on S3-WAL). Also run it when `check.sh` prints STALE.
+Run it when your change touches any file in the [coverage record](#coverage-record), or any other code that writes `push_pending`, `push_due`, `push_attempt` or the push claim columns (`PushPending`, `PushDue`, `PushAttempt`, `PushClaim*` on S3-WAL). Also run it when you change what makes a store transition atomic, which the model assumes and the fingerprints do not see: `SQLite.inTx` (`internal/meta/sqlite.go`), and `S3WAL.mutate` with its `recover` handling and `toRepoUpstream` (`internal/meta/s3walmeta.go`). Also run it when `check.sh` prints STALE.
 
 ## Run
 
@@ -84,7 +84,7 @@ The model (`model/LaneSchedule.tla`) is a hand-written description of the code. 
 
    The "property that fails" column is measured: each guard was broken once in the real code, and check.sh failed with the first property listed (see [Validation](#validation)). For the two rows that list `NoLostForward` second, a model run with that fact FALSE and only `NoLostForward` checked fails it too.
 
-2. **Fingerprints.** facts.go hashes the tokens of every declaration (function, method, const, var, type) in every covered file. Comments and layout do not count. check.sh compares the hashes with `model/fingerprints.txt`, recorded at the sync commit. A change that the facts do not see, such as a new branch, a new call or a changed helper or constant, still shows as STALE. Whole files are covered on purpose: a covered path calls many helpers, and any of them can change what the model describes. Most STALE results in these files touch nothing the model describes. Confirm that, and run `--record`. A STALE result is never a pass.
+2. **Fingerprints.** facts.go hashes the tokens of every declaration (import, function, method, const, var, type) in every covered file. Comments and layout do not count. check.sh compares the hashes with `model/fingerprints.txt`, recorded at the sync commit. A change that the facts do not see, such as a new branch, a new call, a changed import or a changed helper or constant in a covered file, still shows as STALE. Whole files are covered on purpose: a covered path calls many helpers, and any of them can change what the model describes. Most STALE results in these files touch nothing the model describes. Confirm that, and run `--record`. A STALE result is never a pass.
 
 Each TLA+ action names the Go call it stands for:
 
@@ -182,11 +182,20 @@ When a fix lands, its probe passes and check.sh reports STALE. The fix must then
 - A run's other failures (a failed loopback fetch, a rejected or misconfigured push) end `done` with a `repo.push_upstream.failed` event, by design (`TransientPushFailure`): they are modeled only as the rejected plain push.
 - `MaxRetries = 2` stands for `MaxPushTransientRetries = 5`, and delays are one abstract "future" due time.
 
-**Left out (a pass says nothing about these):** the pull lane (`ClaimDueSync`, `FinishSyncOutcome`, the mirror-back pull that a successful forward marks, and the hook's pull poke), PostgreSQL (River schedules its push jobs), detach (`DELETE /repos/base`), ref deletions (not forwarded, see above), the event payloads and their run counts, the egress guard, the push-hold details that one `hold` stands for (per-ref holds, sidecars, TTL refresh, epochs, held markers), and the S3-WAL ambiguous-PUT recovery above.
+**Left out.** A pass says nothing about these. Each line says what a user sees when that part goes wrong:
+
+- The pull lane (`ClaimDueSync`, `FinishSyncOutcome`, the mirror-back pull that a successful forward marks, the hook's pull poke): the repository stops picking up upstream changes, or keeps a pre-forward snapshot.
+- PostgreSQL (River schedules its push jobs): the same lost or stale forward, on PostgreSQL deployments.
+- Detach (`DELETE /repos/base`): a forward that runs after the detach answered, or a lane row left behind.
+- Ref deletions (not forwarded, see above): none by design. A deleted branch stays upstream.
+- The event payloads and their run counts: wrong or missing `repo.push_upstream.*` webhooks, with the forward itself correct.
+- The egress guard: a forward that dials a denied destination, or a denied forward to an allowed one.
+- The push-hold details that one `hold` stands for (per-ref holds, sidecars, TTL refresh, epochs, held markers): a push rejected though its CAS won, or a run that waits on or skips the wrong ref.
+- The S3-WAL ambiguous-PUT recovery above: an outcome applied twice or reported wrongly after a timed-out PUT.
 
 ## Validation
 
-Every fact was broken in the real code, one at a time, on a checkout whose covered code equals the sync commit. Each scratch break compiled (`go build` of its package), turned exactly its own fact FALSE, and made `check.sh --only <config>` fail with a property violation, not only STALE. The harness script printed `COUNT: 9/9`:
+Every fact was broken in the real code, one at a time, on a checkout whose covered code equals the sync commit. Each scratch break compiled (`go build` of its package), turned exactly its own fact FALSE, and made `check.sh --only <config>` fail with a property violation, not only STALE. `mutate.sh` runs these breaks and restores each file. It printed `COUNT: 9/9`. When you add, move or rename a fact's guard, update its line in `mutate.sh`:
 
 | Scratch break | Fact | Config | Failed |
 |---|---|---|---|
@@ -211,6 +220,7 @@ Every declaration in these files is covered:
 - `internal/meta/sqlite_schedule.go`, `internal/meta/sqlite_eventing.go` (the SQLite lane transitions)
 - `internal/meta/s3walmeta_schedule.go`, `internal/meta/s3walmeta_eventing.go` (the S3-WAL lane transitions)
 - `internal/sync/worker_push.go`, `internal/sync/worker.go`, `internal/sync/local_schedule.go` (runs, retries, leases, the sweep, the drain, failure classification)
+- `internal/sync/metastore.go`, `internal/sync/pushstatus.go` (the store adapter's error mapping, the upstream rejection parser)
 - `internal/events/refstore.go` (the intent decorator around the ref CAS)
 - `cmd/openstorage/wire_eventing.go`, `cmd/openstorage/wire_eventing_local.go` (hook and serve wiring, forward gates, the sync-claim suppression)
 - `internal/api/handlers_sync.go` (`push-upstream` and its `RequestPushNow`)
@@ -224,6 +234,7 @@ Every declaration in these files is covered:
 |---|---|
 | `check.sh` | The one command: facts, TLC runs, fingerprints, `--record`, and the TLC-free `--fingerprints-only` that CI runs. |
 | `facts/facts.go` | Reads the code facts and fingerprints from the Go source (standard library only; the dot directory keeps it out of `./...`). |
+| `mutate.sh` | Breaks each fact once in the real code and checks that check.sh fails with the expected property (the Validation table). |
 | `model/LaneSchedule.tla` | The model. |
 | `model/LaneSchedule.cfg`, `OtherWriters.cfg`, `Liveness.cfg` | Property configs; each must pass. |
 | `model/NoLeaseAssumption.cfg`, `NoCompletionAssumption.cfg`, `NoFreshnessAssumption.cfg` | Probes; each must fail: `NoRewind`, `NoLostForward`, `NoLostForward`. |
