@@ -32,7 +32,7 @@ Preconditions:
 ```sh
 "$OSV" api "$RUN" cp-tip-before --token rw --expect 200 GET '/api/v1/repos/branch?name=main'
 "$OSV" eq "$RUN" cp-tip-before-is-seed "$SEED" "$("$OSV" json "$OSV_EVIDENCE/cp-tip-before.body" branch.head_sha)"
-env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data" >"$OSV_EVIDENCE/cp-packs-before.txt"
+"$OSV" packs "$RUN" "$REPO_ID" >"$OSV_EVIDENCE/cp-packs-before.txt"
 ```
 
 - **Commit a file.** Write the frames, then send them. The status is `200`, `result.status` is `ok`, `result.target_branch` and `result.branch` are `main`, and `result.old_sha` is `SEED`.
@@ -82,7 +82,7 @@ NEW=$("$OSV" json "$OSV_EVIDENCE/cp-upsert.body" commit.commit_sha)
 - **Check the stored pack.** List the packs again. There is exactly one more pack than before.
 
 ```sh
-env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data" >"$OSV_EVIDENCE/cp-packs-after.txt"
+"$OSV" packs "$RUN" "$REPO_ID" >"$OSV_EVIDENCE/cp-packs-after.txt"
 "$OSV" eq "$RUN" cp-one-new-pack "$(($(grep -c '\.pack' "$OSV_EVIDENCE/cp-packs-before.txt") + 1))" \
   "$(grep -c '\.pack' "$OSV_EVIDENCE/cp-packs-after.txt")"
 ```
@@ -150,4 +150,4 @@ NDJSON
 - A stale `expected_target_sha` (or the deprecated `expected_head_sha`) answers HTTP `409` with `code` `ref_guard_failed`, `guard`, `current_sha` and `result.status` `conflict`. A `409` with `result.status` `failed` and no `code` means a lost race with another writer, which this recipe cannot force.
 - Auth failures on commit-pack (`401`, `403`) answer with the problem body of every route (`code` `unauthorized` or `insufficient_scope`). Its `400`, `409`, `412` and `413` answer in the `result` envelope (`{"commit":null,"result":{"target_branch":"main",...,"status":"precondition_failed",...}}`). Its other failures, `404` included, answer with the problem body.
 - Without `committer`, the committer is the author.
-- `list-packs` reads the blob store only. Run it with `env -i PATH="$PATH"` so an inherited `OPENSTORAGE_S3_URL` does not point it at another store.
+- `osv.sh packs` runs `openstorage list-packs`, which reads the blob store only. It runs it in a clean env, so an inherited `OPENSTORAGE_S3_URL` does not point it at another store.
