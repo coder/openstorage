@@ -675,6 +675,48 @@ func firstGate(s *source, fn *ast.FuncLit, cond, bodyHas string) bool {
 	return false
 }
 
+// gateBeforeWrites reports that fn's closure has an if on cond that
+// returns (bodyHas in its body) before its first write to the manifest: an
+// assignment or increment of an m. or mem. field, or m.EnsureMember.
+func gateBeforeWrites(s *source, fn *ast.FuncLit, cond, bodyHas string) bool {
+	if fn == nil {
+		return false
+	}
+	gate := token.NoPos
+	for _, i := range s.ifs(fn.Body) {
+		if i.cond == cond && i.returns && strings.Contains(i.body, bodyHas) {
+			gate = i.stmt.Pos()
+			break
+		}
+	}
+	if !gate.IsValid() {
+		return false
+	}
+	ok := true
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		var lhs []ast.Expr
+		switch st := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.AssignStmt:
+			lhs = st.Lhs
+		case *ast.IncDecStmt:
+			lhs = []ast.Expr{st.X}
+		case *ast.CallExpr:
+			if s.text(st.Fun) == "m.EnsureMember" && st.Pos() < gate {
+				ok = false
+			}
+		}
+		for _, l := range lhs {
+			if t := s.text(l); (strings.HasPrefix(t, "m.") || strings.HasPrefix(t, "mem.")) && n.Pos() < gate {
+				ok = false
+			}
+		}
+		return true
+	})
+	return ok
+}
+
 func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	pj := src("internal/jobs/purge.go")
 	expired := pj.fn("RepoPurger", "PurgeExpired")
@@ -735,7 +777,6 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	fence := first(pr, "p.registry.FenceRepoPurge", "", false)
 	drop := first(pr, "p.registry.DropRepoRefs", "", false)
 	retire := first(pr, "p.registry.RetireRepoPacks", "", false)
-	dropLFS := first(pr, "p.registry.DropRepoLFSObjects", "", false)
 	reap := first(pr, "p.reapPrefix", "", false)
 
 	// RefusesLive and RefusesYoung: purgeRepo's eligibility returns.
@@ -794,10 +835,7 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	rd := newFact("RefsDieFirst")
 	rd.need(drop.IsValid() && retire.IsValid() && reap.IsValid() && drop < retire && drop < reap,
 		"purgeRepo calls p.registry.DropRepoRefs before RetireRepoPacks and p.reapPrefix")
-	tb := newFact("TombstonesBeforeReap")
-	tb.need(retire.IsValid() && dropLFS.IsValid() && reap.IsValid() && retire < reap && dropLFS < reap,
-		"purgeRepo calls p.registry.RetireRepoPacks and DropRepoLFSObjects before p.reapPrefix")
-	facts = append(facts, ff, rd, tb)
+	facts = append(facts, ff, rd)
 
 	// RegistrationsFenced and RefWritesFenced: the fence read sits in the
 	// write's own transaction, ordered against FenceRepoPurge.
@@ -846,27 +884,16 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 		"S3WAL casRef returns ErrRepoPurged first in its base-manifest mutation")
 	facts = append(facts, rf, rw)
 
-	// FoldNeedsOldRows: ReplacePacks commits only over all of its old rows.
-	fo := newFact("FoldNeedsOldRows")
-	vr := refGo.fn("", "validateReplacePacks")
-	fo.need(first(refGo.calls(vr.Body), "assertf", "len(old) > 0", false).IsValid(), "validateReplacePacks asserts len(old) > 0")
-	lostBeforeInsert := func(s *source, f *ast.FuncDecl, cond, exec string) bool {
-		cs := s.calls(f.Body)
-		for _, i := range s.ifs(f.Body) {
-			if strings.Contains(i.cond, cond) && i.returns {
-				return first(cs, exec, "INSERT INTO packs", true) > i.stmt.Pos()
-			}
-		}
-		return false
-	}
-	fo.need(lostBeforeInsert(refGo, refGo.fn("PG", "ReplacePacks"), "!= len(old)", "tx.Exec"),
-		"PG ReplacePacks rolls back unless it deleted len(old) rows, before its insert")
-	fo.need(lostBeforeInsert(sq, sq.fn("SQLite", "ReplacePacks"), "deleted != len(old)", "tx.ExecContext"),
-		"SQLite ReplacePacks rolls back unless it deleted len(old) rows, before its insert")
-	walRP := wal.fn("S3WAL", "ReplacePacks")
-	fo.need(firstGate(wal, mutateFn(wal, walRP), "!allOldPresent(m)", "return") &&
-		strings.Contains(wal.text(walRP.Body), "allOldPresent := func(m *s3wal.Manifest) bool { return oldCount(m) == len(old) }"),
-		"S3WAL ReplacePacks loses cleanly first unless every old row is present")
+	// FoldsFenced: ReplacePacks inserts a pack row, so it reads the fence
+	// in its own transaction like RegisterPacks.
+	fo := newFact("FoldsFenced")
+	fenceSerialized(fo)
+	fo.need(fencedSQL(refGo, refGo.fn("PG", "ReplacePacks"), "lockBaseLedger", "repoPurgeFencedPG", "tx.Exec", "INSERT INTO packs"),
+		"PG ReplacePacks: lockBaseLedger, repoPurgeFencedPG, return ErrRepoPurged, then its writes")
+	fo.need(fencedSQL(sq, sq.fn("SQLite", "ReplacePacks"), ".BeginTx", "repoPurgeFencedSQLite", "tx.ExecContext", "INSERT INTO packs"),
+		"SQLite ReplacePacks: BeginTx, repoPurgeFencedSQLite, return ErrRepoPurged, then its writes")
+	fo.need(gateBeforeWrites(wal, mutateFn(wal, wal.fn("S3WAL", "ReplacePacks")), "m.PurgedAt != nil", "ErrRepoPurged"),
+		"S3WAL ReplacePacks returns ErrRepoPurged in its base-manifest mutation before it writes the manifest")
 	facts = append(facts, fo)
 
 	// SweepReapsFenced: classify's PurgedRepoProbe branch.

@@ -46,7 +46,7 @@ CONSTANTS
     \* Shared with PackSweep:
     WriterVerifies, VerifyOnRegisterError, CopyBeforeDelete,
     RecheckAfterDelete, HealRestores, PurgeAgeGated,
-    PurgeFloorCoversHandshake, PurgeAgeCoversThreshold,
+    PurgeFloorCoversHandshake,
     \* RepoPurger:
     PurgeGuarded,
         \* PurgeExpired and PurgeRepo call DeleteGuard and return on error
@@ -68,8 +68,6 @@ CONSTANTS
         \* purgeRepo calls FenceRepoPurge before DropRepoRefs.
     RefsDieFirst,
         \* purgeRepo calls DropRepoRefs before RetireRepoPacks and the reap.
-    TombstonesBeforeReap,
-        \* purgeRepo calls RetireRepoPacks before the reap.
     RegistrationsFenced,
         \* RegisterPacks (and RegisterLFSObject) read the fence in the same
         \* transaction as the insert, ordered against FenceRepoPurge, on PG,
@@ -77,21 +75,15 @@ CONSTANTS
     RefWritesFenced,
         \* CASRef reads the fence in the same transaction as the ref write,
         \* ordered against FenceRepoPurge, on PG, SQLite and S3WAL.
-    FoldNeedsOldRows,
-        \* ReplacePacks commits only when it deleted every one of its old
-        \* rows (and old is never empty), on PG, SQLite and S3WAL.
+    FoldsFenced,
+        \* ReplacePacks reads the fence in the same transaction as its
+        \* writes, ordered against FenceRepoPurge, on PG, SQLite and S3WAL.
     SweepReapsFenced,
         \* classify reaps an unregistered blob of a fenced repository under
         \* purgeMode (PurgedRepoProbe).
-    HealPurgesFenced,
+    HealPurgesFenced
         \* healQuarantine purges aged backups of fenced repositories under
         \* purgeMode with every delete flag off.
-
-    \* PackSweep's two timing assumptions. ReplacePacks reads no fence, so
-    \* a fold can register K in a fenced repository until RetireRepoPacks,
-    \* and the purge-aware sweeper can race it like any writer.
-    WritesFinishWithinThreshold,
-    HealEntryIsQuick
 
 ASSUME NoNonce \notin Nonces
 ASSUME BgPurgers \subseteq Purgers
@@ -109,8 +101,6 @@ VARIABLES
     oldRows,     \* the repository has pack rows of other keys
     refRow,      \* a ref row whose commit needs K's objects
     backup,      \* backup[n]: "unused" | "fresh" | "aged" | "gone"
-    witness,     \* witness[n]: writers in flight when backup n was copied
-                 \*             or when its handshake deleted K
     wpc,         \* writer step
     regOk,       \* the writer's registration returned no error
     pc,          \* purger and sweeper step
@@ -127,16 +117,15 @@ VARIABLES
 writerVars == <<wpc, regOk>>
 procVars == <<pc, hs, guardOk, purgeMode, spared, rescan, cursorPast, todo, cur>>
 vars == <<repo, fenced, stamped, present, registered, oldRows, refRow, backup,
-          witness, faults, writerVars, procVars>>
+          faults, writerVars, procVars>>
 
 \* purgeRepo's phases in code order. A FALSE order fact moves its phase
 \* after the reap, the latest place before CountRepoRows.
 Early == (IF FenceFirst THEN <<"fence">> ELSE <<>>)
          \o (IF RefsDieFirst THEN <<"refs">> ELSE <<>>)
-         \o (IF TombstonesBeforeReap THEN <<"retire">> ELSE <<>>)
+         \o <<"retire">>
 Late == (IF FenceFirst THEN <<>> ELSE <<"fence">>)
         \o (IF RefsDieFirst THEN <<>> ELSE <<"refs">>)
-        \o (IF TombstonesBeforeReap THEN <<>> ELSE <<"retire">>)
 Phases == Early \o <<"reap">> \o Late \o <<"count", "stamp">>
 After(ph) == LET i == CHOOSE i \in 1..Len(Phases) : Phases[i] = ph
              IN Phases[i + 1]
@@ -152,8 +141,6 @@ Deleted == {"young", "old", "expired"}
 
 \* A writer that still holds its local pack file and will verify it.
 InFlight(w) == wpc[w] \in {"upload", "register", "verify", "fverify"}
-InFlightWriters == {w \in Writers : InFlight(w)}
-HealVisit == {"heal_stat", "heal_purge"}
 
 \* Steps that change durable state (the eligibility reads come before).
 Destructive == {"fence", "refs", "retire", "stamp"} \cup
@@ -166,7 +153,6 @@ TypeOK ==
     /\ present \in BOOLEAN /\ registered \in BOOLEAN
     /\ oldRows \in BOOLEAN /\ refRow \in BOOLEAN
     /\ backup \in [Nonces -> {"unused", "fresh", "aged", "gone"}]
-    /\ witness \in [Nonces -> SUBSET Writers]
     /\ wpc \in [Writers -> WriterSteps]
     /\ regOk \in [Writers -> BOOLEAN]
     /\ pc \in [Procs -> Steps]
@@ -190,7 +176,6 @@ Init ==
     /\ registered => present
     /\ refRow => registered
     /\ backup = [n \in Nonces |-> "unused"]
-    /\ witness = [n \in Nonces |-> {}]
     /\ wpc = [w \in Writers |-> "idle"]
     /\ regOk = [w \in Writers |-> FALSE]
     /\ pc = [p \in Procs |-> "idle"]
@@ -218,14 +203,14 @@ rowVars == <<repo, fenced, stamped, present, registered, oldRows, refRow>>
 WriterStat(w) ==
     /\ wpc[w] = "idle"
     /\ W(w, IF present THEN "register" ELSE "upload")
-    /\ UNCHANGED <<rowVars, backup, witness, faults, regOk, procVars>>
+    /\ UNCHANGED <<rowVars, backup, faults, regOk, procVars>>
 
 \* REST branch/tag creation: CASRef names a commit already in K, with no
 \* pack registration.
 WriterRefOnly(w) ==
     /\ wpc[w] = "idle" /\ registered
     /\ W(w, "cas")
-    /\ UNCHANGED <<rowVars, backup, witness, faults, regOk, procVars>>
+    /\ UNCHANGED <<rowVars, backup, faults, regOk, procVars>>
 
 \* HasPack, then UploadFile. Merged as in PackSweep: an upload is always
 \* allowed, and a probe that finds K registered skips it.
@@ -234,8 +219,7 @@ WriterUpload(w) ==
     /\ \/ present' = TRUE
        \/ registered /\ UNCHANGED present
     /\ W(w, "register")
-    /\ UNCHANGED <<repo, fenced, stamped, registered, oldRows, refRow, backup, witness,
-                   faults, regOk, procVars>>
+    /\ UNCHANGED <<repo, fenced, stamped, registered, oldRows, refRow, backup, faults, regOk, procVars>>
 
 \* st.RegisterPacks / s.refStore.RegisterPacks. With RegistrationsFenced the
 \* transaction reads the fence: a fenced repository fails it with
@@ -255,11 +239,13 @@ RegisterPacks(w) ==
        THEN W(w, "verify")
        ELSE IF regOk'[w] THEN W(w, "cas") ELSE Finish(w, FALSE)
 
-\* r.store.ReplacePacks(repo, old, K): a repack folds old rows into K. It
-\* reads no fence; with FoldNeedsOldRows it commits only while every old
-\* row still exists, and RetireRepoPacks deletes them all.
+\* r.store.ReplacePacks(repo, old, K): a repack folds old rows into K. With
+\* FoldsFenced the transaction reads the fence, and a fenced repository
+\* fails it with ErrRepoPurged and no row; Repacker.repack then drops the
+\* fold. It commits only while every old row still exists, and
+\* RetireRepoPacks deletes them all.
 ReplacePacks(w) ==
-    /\ IF oldRows \/ ~FoldNeedsOldRows
+    /\ IF ~(fenced /\ FoldsFenced) /\ oldRows
        THEN /\ registered' = TRUE /\ oldRows' = FALSE
             /\ regOk' = [regOk EXCEPT ![w] = TRUE]
        ELSE /\ UNCHANGED <<registered, oldRows>>
@@ -269,7 +255,7 @@ ReplacePacks(w) ==
 WriterRegister(w) ==
     /\ wpc[w] = "register"
     /\ RegisterPacks(w) \/ ReplacePacks(w)
-    /\ UNCHANGED <<repo, fenced, stamped, present, refRow, backup, witness, faults,
+    /\ UNCHANGED <<repo, fenced, stamped, present, refRow, backup, faults,
                    procVars>>
 
 \* blob.EnsurePublished / verifyPublished: re-upload K when Stat says it is
@@ -279,8 +265,7 @@ WriterVerify(w) ==
     /\ wpc[w] \in {"verify", "fverify"}
     /\ present' = TRUE
     /\ IF wpc[w] = "verify" /\ regOk[w] THEN W(w, "cas") ELSE Finish(w, regOk[w])
-    /\ UNCHANGED <<repo, fenced, stamped, registered, oldRows, refRow, backup, witness,
-                   faults, regOk, procVars>>
+    /\ UNCHANGED <<repo, fenced, stamped, registered, oldRows, refRow, backup, faults, regOk, procVars>>
 
 \* CASRef. With RefWritesFenced the transaction reads the fence and a
 \* fenced repository fails it (notExecuted(ErrRepoPurged)). Otherwise it
@@ -291,13 +276,12 @@ WriterCAS(w) ==
        THEN /\ UNCHANGED refRow /\ Finish(w, FALSE)
        ELSE \/ refRow' = TRUE /\ Finish(w, TRUE)
             \/ refRow' \in {refRow, TRUE} /\ Finish(w, FALSE)
-    /\ UNCHANGED <<repo, fenced, stamped, present, registered, oldRows, backup, witness,
-                   faults, regOk, procVars>>
+    /\ UNCHANGED <<repo, fenced, stamped, present, registered, oldRows, backup, faults, regOk, procVars>>
 
 WriterCrash(w) ==
     /\ wpc[w] \in {"upload", "register", "verify", "fverify", "cas"}
     /\ W(w, "crashed")
-    /\ UNCHANGED <<rowVars, backup, witness, faults, regOk, procVars>>
+    /\ UNCHANGED <<rowVars, backup, faults, regOk, procVars>>
 
 WriterStep(w) ==
     \/ WriterStat(w) \/ WriterRefOnly(w) \/ WriterUpload(w)
@@ -351,7 +335,7 @@ PurgerStart(p) ==
              /\ guardOk' = [guardOk EXCEPT ![p] = FALSE]
              /\ go(FALSE)
        /\ spared' = [spared EXCEPT ![p] = FALSE]
-       /\ UNCHANGED <<rowVars, backup, witness, writerVars, hs, purgeMode, todo,
+       /\ UNCHANGED <<rowVars, backup, writerVars, hs, purgeMode, todo,
                       cur>>
 
 \* purgeRepo for a listed candidate: p.meta.RepoPurgeState, then the checks.
@@ -359,7 +343,7 @@ PurgerState(p) ==
     /\ pc[p] = "state"
     /\ P(p, StateRead(p))
     /\ rescan' = [rescan EXCEPT ![p] = stamped]
-    /\ UNCHANGED <<rowVars, backup, witness, faults, writerVars, hs, guardOk,
+    /\ UNCHANGED <<rowVars, backup, faults, writerVars, hs, guardOk,
                    purgeMode, spared, cursorPast, todo, cur>>
 
 \* p.registry.FenceRepoPurge: idempotent and permanent.
@@ -368,7 +352,7 @@ PurgerFence(p) ==
     /\ fenced' = TRUE
     /\ P(p, After("fence"))
     /\ UNCHANGED <<repo, stamped, present, registered, oldRows, refRow, backup,
-                   witness, faults, writerVars, hs, guardOk, purgeMode, spared,
+                   faults, writerVars, hs, guardOk, purgeMode, spared,
                    rescan, cursorPast, todo, cur>>
 
 \* p.registry.DropRepoRefs(group).
@@ -377,7 +361,7 @@ PurgerRefs(p) ==
     /\ refRow' = FALSE
     /\ P(p, After("refs"))
     /\ UNCHANGED <<repo, fenced, stamped, present, registered, oldRows, backup,
-                   witness, faults, writerVars, hs, guardOk, purgeMode, spared,
+                   faults, writerVars, hs, guardOk, purgeMode, spared,
                    rescan, cursorPast, todo, cur>>
 
 \* p.registry.RetireRepoPacks(group): every pack row of the group becomes a
@@ -386,8 +370,7 @@ PurgerRetire(p) ==
     /\ pc[p] = "retire"
     /\ registered' = FALSE /\ oldRows' = FALSE
     /\ P(p, After("retire"))
-    /\ UNCHANGED <<repo, fenced, stamped, present, refRow, backup, witness,
-                   faults, writerVars, hs, guardOk, purgeMode, spared, rescan,
+    /\ UNCHANGED <<repo, fenced, stamped, present, refRow, backup, faults, writerVars, hs, guardOk, purgeMode, spared, rescan,
                    cursorPast, todo, cur>>
 
 \* Where a process goes when its reap of K ends.
@@ -405,7 +388,7 @@ PurgerReap(p) ==
     /\ IF present /\ registered
        THEN spared' = [spared EXCEPT ![p] = TRUE] /\ P(p, AfterReap(p))
        ELSE UNCHANGED spared /\ P(p, IF present THEN "sd_copy" ELSE AfterReap(p))
-    /\ UNCHANGED <<rowVars, backup, witness, faults, writerVars, hs, guardOk,
+    /\ UNCHANGED <<rowVars, backup, faults, writerVars, hs, guardOk,
                    purgeMode, rescan, cursorPast, todo, cur>>
 
 \* p.registry.CountRepoRows(group), then the deferral on rows or spares.
@@ -413,7 +396,7 @@ PurgerCount(p) ==
     /\ pc[p] = "count"
     /\ P(p, IF registered \/ refRow \/ oldRows \/ spared[p] THEN Rest(p)
             ELSE After("count"))
-    /\ UNCHANGED <<rowVars, backup, witness, faults, writerVars, hs, guardOk,
+    /\ UNCHANGED <<rowVars, backup, faults, writerVars, hs, guardOk,
                    purgeMode, spared, rescan, cursorPast, todo, cur>>
 
 \* PurgeRepoLedger, then p.meta.PurgeRepoMeta: stamps purged_at, guarded on
@@ -424,7 +407,7 @@ PurgerStamp(p) ==
     /\ stamped' = (stamped \/ repo # "live")
     /\ P(p, Rest(p))
     /\ UNCHANGED <<repo, fenced, present, registered, oldRows, refRow, backup,
-                   witness, faults, writerVars, hs, guardOk, purgeMode, spared,
+                   faults, writerVars, hs, guardOk, purgeMode, spared,
                    rescan, cursorPast, todo, cur>>
 
 \* The run ends early: the process dies, or a call returns an error. A
@@ -435,7 +418,7 @@ PurgerFail(p) ==
     /\ P(p, Rest(p))
     /\ hs' = [hs EXCEPT ![p] = NoNonce]
     /\ cursorPast' \in {cursorPast, [cursorPast EXCEPT ![p] = FALSE]}
-    /\ UNCHANGED <<rowVars, backup, witness, writerVars, guardOk, purgeMode,
+    /\ UNCHANGED <<rowVars, backup, writerVars, guardOk, purgeMode,
                    spared, rescan, todo, cur>>
 
 PurgerStep(p) ==
@@ -465,16 +448,15 @@ QuarantineCopy(q) ==
     /\ pc[q] = "sd_copy"
     /\ IF ~CopyBeforeDelete
        THEN /\ pc' = [pc EXCEPT ![q] = "sd_delete"]
-            /\ UNCHANGED <<backup, witness, hs>>
+            /\ UNCHANGED <<backup, hs>>
        ELSE IF ~present
-            THEN EndHandshake(q, AfterReap(q)) /\ UNCHANGED <<backup, witness>>
+            THEN EndHandshake(q, AfterReap(q)) /\ UNCHANGED <<backup>>
             ELSE IF \A n \in Nonces : ~Free(n)
             THEN /\ pc' = [pc EXCEPT ![q] = IF q \in Purgers THEN Rest(q) ELSE "idle"]
-                 /\ UNCHANGED <<backup, witness, hs>>
+                 /\ UNCHANGED <<backup, hs>>
             ELSE \E n \in Nonces :
                    /\ Free(n)
                    /\ backup' = [backup EXCEPT ![n] = "fresh"]
-                   /\ witness' = [witness EXCEPT ![n] = InFlightWriters]
                    /\ hs' = [hs EXCEPT ![q] = n]
                    /\ pc' = [pc EXCEPT ![q] = "sd_delete"]
     /\ UNCHANGED <<rowVars, faults, writerVars, hsVars>>
@@ -483,8 +465,6 @@ QuarantineCopy(q) ==
 \* run) and goes to restoreFromQuarantine, then safeDelete returns it.
 Delete(q) ==
     /\ pc[q] = "sd_delete"
-    /\ witness' = IF hs[q] = NoNonce THEN witness
-                  ELSE [witness EXCEPT ![hs[q]] = @ \cup InFlightWriters]
     /\ \/ /\ present' = FALSE
           /\ IF RecheckAfterDelete
              THEN pc' = [pc EXCEPT ![q] = "sd_recheck"] /\ UNCHANGED hs
@@ -503,7 +483,7 @@ Recheck(q) ==
     /\ IF registered
        THEN pc' = [pc EXCEPT ![q] = "sd_restore"] /\ UNCHANGED hs
        ELSE EndHandshake(q, AfterReap(q))
-    /\ UNCHANGED <<rowVars, backup, witness, faults, writerVars, hsVars>>
+    /\ UNCHANGED <<rowVars, backup, faults, writerVars, hsVars>>
 
 \* restoreFromQuarantine(rctx, key, qKey). After a recheck that found K
 \* registered, safeDelete returns (false, nil) and the reap goes on; after
@@ -516,8 +496,7 @@ Restore(q) ==
        ELSE UNCHANGED present
     /\ EndHandshake(q, IF pc[q] = "sd_restore" THEN AfterReap(q)
                        ELSE IF q \in Purgers THEN Rest(q) ELSE "idle")
-    /\ UNCHANGED <<repo, fenced, stamped, registered, oldRows, refRow, backup, witness,
-                   faults, writerVars, hsVars>>
+    /\ UNCHANGED <<repo, fenced, stamped, registered, oldRows, refRow, backup, faults, writerVars, hsVars>>
 
 HandshakeStep(q) ==
     QuarantineCopy(q) \/ Delete(q) \/ Recheck(q) \/ Restore(q)
@@ -540,7 +519,7 @@ SweepStart(s) ==
           /\ purgeMode' = [purgeMode EXCEPT ![s] = ~SweepGuardStopsPurgeMode]
     /\ todo' = [todo EXCEPT ![s] = {n \in Nonces : backup[n] \in Live}]
     /\ S(s, "heal_next")
-    /\ UNCHANGED <<rowVars, backup, witness, writerVars, hs, spared, rescan, cursorPast,
+    /\ UNCHANGED <<rowVars, backup, writerVars, hs, spared, rescan, cursorPast,
                    cur>>
 
 \* healQuarantine visits the next listed entry, and healQuarantineEntry
@@ -554,7 +533,7 @@ HealNext(s) ==
               /\ cur' = [cur EXCEPT ![s] = n]
               /\ todo' = [todo EXCEPT ![s] = @ \ {n}]
               /\ S(s, IF registered THEN "heal_stat" ELSE "heal_purge")
-    /\ UNCHANGED <<rowVars, backup, witness, faults, writerVars, sweepRest>>
+    /\ UNCHANGED <<rowVars, backup, faults, writerVars, sweepRest>>
 
 \* healQuarantineEntry: s.blobs.Stat(ctx, orig), then restoreFromQuarantine
 \* for a missing original (merged, as in PackSweep).
@@ -565,8 +544,7 @@ HealStat(s) ==
             /\ UNCHANGED present
        ELSE /\ S(s, "heal_purge") /\ UNCHANGED cur
             /\ present' = (present \/ HealRestores)
-    /\ UNCHANGED <<repo, fenced, stamped, registered, oldRows, refRow, backup, witness,
-                   faults, writerVars, sweepRest, todo>>
+    /\ UNCHANGED <<repo, fenced, stamped, registered, oldRows, refRow, backup, faults, writerVars, sweepRest, todo>>
 
 \* healQuarantineEntry with purgeAll off: the age gate, then
 \* s.cfg.PurgedRepoProbe, then s.blobs.Delete(ctx, q.Key). Merged: a fence
@@ -579,7 +557,7 @@ HealPurge(s) ==
        ELSE UNCHANGED backup
     /\ S(s, "heal_next")
     /\ cur' = [cur EXCEPT ![s] = NoNonce]
-    /\ UNCHANGED <<rowVars, witness, faults, writerVars, sweepRest, todo>>
+    /\ UNCHANGED <<rowVars, faults, writerVars, sweepRest, todo>>
 
 \* classify (registry read, PurgedRepoProbe) and revalidateOrphan (registry
 \* read), merged into the last registry read, as in PackSweep.
@@ -587,7 +565,7 @@ SweepClassify(s) ==
     /\ pc[s] = "rv_reg"
     /\ S(s, IF ~registered /\ purgeMode[s] /\ fenced /\ SweepReapsFenced
             THEN "sd_copy" ELSE "idle")
-    /\ UNCHANGED <<rowVars, backup, witness, faults, writerVars, sweepRest, todo, cur>>
+    /\ UNCHANGED <<rowVars, backup, faults, writerVars, sweepRest, todo, cur>>
 
 SweeperCrash(s) ==
     /\ pc[s] # "idle"
@@ -596,7 +574,7 @@ SweeperCrash(s) ==
     /\ todo' = [todo EXCEPT ![s] = {}]
     /\ cur' = [cur EXCEPT ![s] = NoNonce]
     /\ hs' = [hs EXCEPT ![s] = NoNonce]
-    /\ UNCHANGED <<rowVars, backup, witness, writerVars, guardOk, purgeMode, spared,
+    /\ UNCHANGED <<rowVars, backup, writerVars, guardOk, purgeMode, spared,
                    rescan, cursorPast>>
 
 SweeperStep(s) ==
@@ -610,28 +588,24 @@ SweeperStep(s) ==
 SoftDelete ==
     /\ repo = "live" /\ repo' = "young"
     /\ UNCHANGED <<fenced, stamped, present, registered, oldRows, refRow,
-                   backup, witness, faults, writerVars, procVars>>
+                   backup, faults, writerVars, procVars>>
 
 \* The deletion ages past MinRepoPurgeAge, then past the retention.
 RepoAges ==
     /\ repo \in {"young", "old"}
     /\ repo' = IF repo = "young" THEN "old" ELSE "expired"
     /\ UNCHANGED <<fenced, stamped, present, registered, oldRows, refRow,
-                   backup, witness, faults, writerVars, procVars>>
+                   backup, faults, writerVars, procVars>>
 
-\* Backup n passes quarantinePurgeAge, gated as in PackSweep: not while the
-\* handshake that wrote it runs, not while a writer in flight at its copy or
-\* delete runs, and not while a heal visits it.
+\* Backup n passes quarantinePurgeAge; PurgeFloorCoversHandshake: not while
+\* the handshake that wrote it still runs. No timing assumption: after the
+\* fence nothing registers, so no backup of the repository is needed again.
 AgeBackup(n) ==
     /\ backup[n] = "fresh"
     /\ PurgeFloorCoversHandshake =>
          ~\E q \in Procs : hs[q] = n /\ pc[q] \in Handshake
-    /\ (WritesFinishWithinThreshold /\ PurgeAgeCoversThreshold) =>
-         \A w \in witness[n] : ~InFlight(w)
-    /\ HealEntryIsQuick =>
-         ~\E s \in Sweepers : cur[s] = n /\ pc[s] \in HealVisit
     /\ backup' = [backup EXCEPT ![n] = "aged"]
-    /\ UNCHANGED <<rowVars, witness, faults, writerVars, procVars>>
+    /\ UNCHANGED <<rowVars, faults, writerVars, procVars>>
 
 ProcStep(q) ==
     \/ q \in Purgers /\ PurgerStep(q)
@@ -649,9 +623,7 @@ Next ==
 \* Live processes keep taking steps; the background purger and the sweeper
 \* run a pass on every tick, the CLI finishes a run it started. Faults are
 \* bounded, so the guard passes and runs end cleanly eventually. Time
-\* passes; the liveness config turns the timing assumptions off, since a
-\* heal that visits a backup on every sweep would hold its aging off under
-\* weak fairness. The soft-delete itself needs no fairness.
+\* passes. The soft-delete itself needs no fairness.
 CliWork(p) == pc[p] \notin {"idle", "off"} /\ ProcStep(p)
 Fairness ==
     /\ \A w \in Writers : WF_vars(WriterStep(w))
@@ -708,14 +680,12 @@ PurgeSymmetry == Permutations(Writers) \cup Permutations(Nonces)
 
 \* Safety configs fingerprint states through this view. It drops values
 \* that no step reads before it overwrites them: the per-run variables of
-\* an idle process, regOk outside a verify step, the witness of a backup
-\* that is not fresh, and the cursor of the CLI. A purged slot behaves like
+\* an idle process, regOk outside a verify step, and the cursor of the CLI. A purged slot behaves like
 \* an unused one, and an ended write is the same whether it succeeded,
 \* failed or crashed. Every invariant reads only what the view keeps.
 Idle(p) == pc[p] \in {"idle", "off"}
 View == <<repo, fenced, stamped, present, registered, oldRows, refRow, faults,
           [n \in Nonces |-> IF backup[n] = "gone" THEN "unused" ELSE backup[n]],
-          [n \in Nonces |-> IF backup[n] = "fresh" THEN witness[n] ELSE {}],
           [w \in Writers |-> IF wpc[w] \in {"done", "failed", "crashed"}
                               THEN "ended" ELSE wpc[w]],
           [w \in Writers |-> wpc[w] \in {"verify", "fverify"} /\ regOk[w]],

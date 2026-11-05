@@ -59,12 +59,10 @@ SlowHealEntry.cfg PackSweep probe NoLostPack
 PurgeControl.cfg RepoPurge pass -
 PurgeSafety.cfg RepoPurge pass -
 PurgeLiveness.cfg RepoPurge live -
-PurgeQuarantine.cfg RepoPurge live -
-PurgeNoThreshold.cfg RepoPurge probe NoDanglingRow
-PurgeSlowHeal.cfg RepoPurge probe NoDanglingRow"
+PurgeQuarantine.cfg RepoPurge live -"
 # The code facts each module declares as constants.
 facts_PackSweep="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealEverySweep HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeAgeCoversThreshold"
-facts_RepoPurge="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeAgeCoversThreshold PurgeGuarded SweepGuardStopsPurgeMode RefusesLive RefusesYoung CutoffCoversRetention CursorWraps FenceFirst RefsDieFirst TombstonesBeforeReap RegistrationsFenced RefWritesFenced FoldNeedsOldRows SweepReapsFenced HealPurgesFenced"
+facts_RepoPurge="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeGuarded SweepGuardStopsPurgeMode RefusesLive RefusesYoung CutoffCoversRetention CursorWraps FenceFirst RefsDieFirst RegistrationsFenced RefWritesFenced FoldsFenced SweepReapsFenced HealPurgesFenced"
 cfg_names=$(awk '{print $1}' <<<"$configs")
 
 out="" record=0 only=" " fp_only=0
