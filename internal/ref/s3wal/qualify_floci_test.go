@@ -313,20 +313,20 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	// process (issue #566).
 	var failuresMu sync.Mutex
 	var failures []readFailure
-	stopStalls := watchStalls()
-	defer stopStalls()
 	raceStart := time.Now()
+	stopStalls := watchStalls(raceStart)
+	defer stopStalls()
 	readersDone := make(chan time.Duration, readers) // each reader's slowest successful GET
 	for range readers {
 		go func() {
 			var slowest time.Duration
 			defer func() { readersDone <- slowest }()
 			for raceCtx.Err() == nil {
-				opStart := time.Now()
+				opStart := time.Since(raceStart)
 				opCtx, cancel := context.WithTimeout(raceCtx, opTimeout)
 				body, etag, err := getWithETag(opCtx, client, e.bucket, key)
 				cancel()
-				opEnd := time.Now()
+				opEnd := time.Since(raceStart)
 				if err != nil {
 					if raceCtx.Err() == nil {
 						readErrs.Add(1)
@@ -339,7 +339,7 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 					continue
 				}
 				reads.Add(1)
-				slowest = max(slowest, opEnd.Sub(opStart))
+				slowest = max(slowest, opEnd-opStart)
 				want, whole := etagOf[string(body)]
 				switch {
 				case !whole:
@@ -374,7 +374,7 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		}
 		if len(quoted) < maxLogged {
 			quoted = append(quoted, fmt.Sprintf("{at=+%s elapsed=%s awake=%s class=%s explainedByStall=%t err=%q}",
-				f.start.Sub(raceStart).Round(time.Millisecond), f.elapsed().Round(time.Millisecond),
+				f.start.Round(time.Millisecond), f.elapsed().Round(time.Millisecond),
 				(f.elapsed()-f.stalledFor(spans)).Round(time.Millisecond), readErrClass(f.err), stalled, f.err.Error()))
 		}
 	}

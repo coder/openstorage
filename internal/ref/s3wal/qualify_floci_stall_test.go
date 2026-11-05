@@ -37,28 +37,32 @@ const (
 	maxReadFailures = 256 // failed reads kept for classification; the rest count as unexplained
 )
 
+// Every time here is an offset from the start of the race, taken with
+// time.Since on a time.Now base, so it reads the monotonic clock only: a
+// correction of the wall clock cannot move a stall or a read (issue #566).
+
 // stallSpan is a time during which the test process ran nothing.
-type stallSpan struct{ from, to time.Time }
+type stallSpan struct{ from, to time.Duration }
 
 // stallTracker turns heartbeat ticks into the spans between two ticks that
 // were at least minGap apart.
 type stallTracker struct {
-	last   time.Time
+	last   time.Duration
 	minGap time.Duration
 	spans  []stallSpan
 }
 
-func (s *stallTracker) tick(now time.Time) {
-	if now.Sub(s.last) >= s.minGap {
-		s.spans = append(s.spans, stallSpan{s.last, now})
+func (s *stallTracker) tick(at time.Duration) {
+	if at-s.last >= s.minGap {
+		s.spans = append(s.spans, stallSpan{s.last, at})
 	}
-	s.last = now
+	s.last = at
 }
 
-// watchStalls starts the heartbeat. The returned stop ends it and returns
-// the spans. It may be called more than once.
-func watchStalls() (stop func() []stallSpan) {
-	tr := &stallTracker{last: time.Now(), minGap: stallGap}
+// watchStalls starts the heartbeat at base. The returned stop ends it and
+// returns the spans. It may be called more than once.
+func watchStalls(base time.Time) (stop func() []stallSpan) {
+	tr := &stallTracker{minGap: stallGap}
 	quit, done := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(done)
@@ -67,10 +71,10 @@ func watchStalls() (stop func() []stallSpan) {
 		for {
 			select {
 			case <-quit:
-				tr.tick(time.Now())
+				tr.tick(time.Since(base))
 				return
 			case <-t.C:
-				tr.tick(time.Now())
+				tr.tick(time.Since(base))
 			}
 		}
 	}()
@@ -83,24 +87,24 @@ func watchStalls() (stop func() []stallSpan) {
 
 func longestStall(spans []stallSpan) (longest time.Duration) {
 	for _, s := range spans {
-		longest = max(longest, s.to.Sub(s.from))
+		longest = max(longest, s.to-s.from)
 	}
 	return longest
 }
 
 // readFailure is one racing GET that failed.
 type readFailure struct {
-	start, end time.Time
+	start, end time.Duration
 	err        error
 }
 
-func (f readFailure) elapsed() time.Duration { return f.end.Sub(f.start) }
+func (f readFailure) elapsed() time.Duration { return f.end - f.start }
 
 // stalledFor is how long the test process ran nothing during the read.
 func (f readFailure) stalledFor(spans []stallSpan) (frozen time.Duration) {
 	for _, s := range spans {
-		if from, to := max(f.start.UnixNano(), s.from.UnixNano()), min(f.end.UnixNano(), s.to.UnixNano()); to > from {
-			frozen += time.Duration(to - from)
+		if from, to := max(f.start, s.from), min(f.end, s.to); to > from {
+			frozen += to - from
 		}
 	}
 	return frozen
@@ -144,9 +148,7 @@ func readErrClass(err error) string {
 
 func TestExplainedByStall(t *testing.T) {
 	const opTimeout = 2 * time.Second
-	t0 := time.Unix(1000, 0)
-	at := func(d time.Duration) time.Time { return t0.Add(d) }
-	span := func(from, to time.Duration) stallSpan { return stallSpan{at(from), at(to)} }
+	span := func(from, to time.Duration) stallSpan { return stallSpan{from, to} }
 	deadline := fmt.Errorf("read body after headers (0 of Content-Length 256 bytes): %w", context.DeadlineExceeded)
 	for _, tc := range []struct {
 		name  string
@@ -170,7 +172,7 @@ func TestExplainedByStall(t *testing.T) {
 		{"connection reset during a freeze", syscall.ECONNRESET, 0, 2500 * time.Millisecond, []stallSpan{span(0, 2500*time.Millisecond)}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := readFailure{start: at(tc.start), end: at(tc.end), err: tc.err}
+			f := readFailure{start: tc.start, end: tc.end, err: tc.err}
 			if got := explainedByStall(f, tc.spans, opTimeout); got != tc.want {
 				t.Fatalf("explainedByStall = %t, want %t (elapsed %s, stalled %s)", got, tc.want, f.elapsed(), f.stalledFor(tc.spans))
 			}
@@ -181,31 +183,29 @@ func TestExplainedByStall(t *testing.T) {
 // TestStallGapIgnoresHostJitter: the delays a busy host gives the heartbeat
 // are not freezes, and a stop of the whole process is.
 func TestStallGapIgnoresHostJitter(t *testing.T) {
-	t0 := time.Unix(1000, 0)
-	tr := &stallTracker{last: t0, minGap: stallGap}
-	now := t0
+	tr := &stallTracker{minGap: stallGap}
+	var now time.Duration
 	for _, step := range []time.Duration{5, 25, 70, 40, 80, 5, 60, 99} {
-		now = now.Add(step * time.Millisecond)
+		now += step * time.Millisecond
 		tr.tick(now)
 	}
 	if len(tr.spans) != 0 {
 		t.Fatalf("host jitter recorded as freezes: %v", tr.spans)
 	}
-	tr.tick(now.Add(2500 * time.Millisecond))
+	tr.tick(now + 2500*time.Millisecond)
 	if len(tr.spans) != 1 || longestStall(tr.spans) != 2500*time.Millisecond {
 		t.Fatalf("a 2.5 s stop recorded as %v", tr.spans)
 	}
 }
 
 func TestStallTracker(t *testing.T) {
-	t0 := time.Unix(1000, 0)
-	tr := &stallTracker{last: t0, minGap: 20 * time.Millisecond}
+	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	tr := &stallTracker{minGap: 20 * time.Millisecond}
 	for _, n := range []int{5, 10, 15, 2500, 2505, 2530, 2550} {
-		tr.tick(t0.Add(time.Duration(n) * time.Millisecond))
+		tr.tick(ms(n))
 	}
 	// 15 ms to 2500 ms is a stall. So are 2505 ms to 2530 ms (25 ms) and
 	// 2530 ms to 2550 ms (exactly the 20 ms gap).
-	ms := func(n int) time.Time { return t0.Add(time.Duration(n) * time.Millisecond) }
 	want := []stallSpan{{ms(15), ms(2500)}, {ms(2505), ms(2530)}, {ms(2530), ms(2550)}}
 	if !slices.Equal(tr.spans, want) {
 		t.Fatalf("spans = %v, want %v", tr.spans, want)
