@@ -602,11 +602,15 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	return cleanup
 }
 
-// hookUpstreamRow serves an update hook's one upstream-row read to both
-// the intent recorded before the CAS and the sync poke after it: the hook
-// handles one ref of one repository, and a second read would cost every
-// push on S3WAL one more round trip. The poke's in-flight-pull check then
-// sees the row as it was just before the CAS.
+// hookUpstreamRow lets an update hook's intent step before the CAS and its
+// sync poke after the CAS share one upstream-row read where the poke cannot
+// depend on what changed in between: the hook handles one ref of one
+// repository, and a second read costs every push on S3WAL one more round
+// trip. It reuses a missing link (the API links a repository only while it
+// creates it) and a forwarding link (the forward poke reads only
+// ForwardOnPush). A pull poke reads the row again: a pull that finished
+// after the first read cannot have seen this write, and its stale Syncing
+// would suppress the poke.
 type hookUpstreamRow struct {
 	meta.EventingStore
 	mu     sync.Mutex
@@ -619,11 +623,14 @@ type hookUpstreamRow struct {
 func (h *hookUpstreamRow) GetRepoUpstream(ctx context.Context, repoID string) (meta.RepoUpstream, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.read {
-		h.read, h.repoID = true, repoID
-		h.up, h.err = h.EventingStore.GetRepoUpstream(ctx, repoID)
+	if h.read {
+		assertf(repoID == h.repoID, "hookUpstreamRow: read of %q after %q (an update hook writes one repository)", repoID, h.repoID)
+		if errors.Is(h.err, meta.ErrNotFound) || (h.err == nil && h.up.ForwardOnPush) {
+			return h.up, h.err
+		}
 	}
-	assertf(repoID == h.repoID, "hookUpstreamRow: read of %q after %q (an update hook writes one repository)", repoID, h.repoID)
+	h.read, h.repoID = true, repoID
+	h.up, h.err = h.EventingStore.GetRepoUpstream(ctx, repoID)
 	return h.up, h.err
 }
 

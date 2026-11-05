@@ -126,6 +126,7 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, scopes, refs, ops, claim            string
 		forward, syncing, disconnect, storeClosed bool
+		pullEndsAtCAS                             bool
 		wantPull, wantPush, wantRefused           bool
 	}{
 		{name: "forward", scopes: rw, forward: true, wantPush: true},
@@ -147,6 +148,9 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 		{name: "pull_malformed_refs", scopes: rw, refs: `{bad`},
 		{name: "pull_malformed_ops", scopes: rw, ops: `{bad`},
 		{name: "pull_in_flight", scopes: rw, syncing: true},
+		// The pull claimed when the intent step read the row ends before the
+		// poke: it cannot have seen this write, so the poke must mark.
+		{name: "pull_ends_during_update", scopes: rw, syncing: true, pullEndsAtCAS: true, wantPull: true},
 		{name: "disconnect_after_commit", scopes: rw, forward: true, disconnect: true, wantPush: true},
 		{name: "metadata_unavailable", scopes: rw, forward: true, storeClosed: true, wantRefused: true},
 	} {
@@ -211,6 +215,11 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 					t.Errorf("read the row at the CAS: %v", err)
 				}
 				pushAtCAS = up.PushPending
+				if tc.pullEndsAtCAS {
+					if _, err := ms.FinishSync(ctx, repo.RepoID, "holder", true); err != nil {
+						t.Errorf("end the pull: %v", err)
+					}
+				}
 			}}
 			wrapped, err := githttp.WrapHookRefStore(ctx, inner)
 			if err != nil {
