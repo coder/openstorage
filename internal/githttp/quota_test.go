@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -346,25 +347,42 @@ func (b *slowListBlob) ListPages(ctx context.Context, prefix string, pageSize in
 // the hook's bounded reserve lands. One retry covers a transient stall;
 // persistently slow scans fail CLOSED (deny the push) instead of
 // admitting against the stale floor.
+//
+// Each case runs on synctest's fake clock: the stall and the freshness
+// window are fake time, and the real SQLite and file work between them
+// costs none, so host load cannot expire the retry's window. The private
+// TMPDIR keeps every slot free: a slot held elsewhere would burn the fake
+// window at once.
 func TestHookSelfListFloorRejectsSlowScans(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
 	old := hookFloorFreshness
 	hookFloorFreshness = 50 * time.Millisecond
 	t.Cleanup(func() { hookFloorFreshness = old })
 
 	t.Run("retry-covers-a-transient-stall", func(t *testing.T) {
-		bl := &slowListBlob{BlobStore: openTestBlob(t), delay: 100 * time.Millisecond, limit: 1}
-		seedPack(t, bl.BlobStore, "repo_slowhook", "aaaa", 25)
-		got, _, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_slowhook")
-		if err != nil || got != 25 {
-			t.Fatalf("floor after one slow scan = (%d, %v), want (25, nil) via retry", got, err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			bl := &slowListBlob{BlobStore: openTestBlob(t), delay: 100 * time.Millisecond, limit: 1}
+			seedPack(t, bl.BlobStore, "repo_slowhook", "aaaa", 25)
+			start := time.Now()
+			got, _, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_slowhook")
+			if err != nil || got != 25 {
+				t.Fatalf("floor after one slow scan = (%d, %v), want (25, nil) via retry", got, err)
+			}
+			// Exactly the one stall: the first attempt hit it, and the
+			// retry took no fake time.
+			if elapsed := time.Since(start); elapsed != bl.delay {
+				t.Fatalf("self-list took %v of fake time, want exactly the one %v stall", elapsed, bl.delay)
+			}
+		})
 	})
 
 	t.Run("persistently-slow-fails-closed", func(t *testing.T) {
-		bl := &slowListBlob{BlobStore: openTestBlob(t), delay: 100 * time.Millisecond, limit: 1 << 30}
-		if got, _, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_alwaysslow"); err == nil {
-			t.Fatalf("persistently slow self-list served floor %d, want fail-closed error", got)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			bl := &slowListBlob{BlobStore: openTestBlob(t), delay: 100 * time.Millisecond, limit: 1 << 30}
+			if got, _, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_alwaysslow"); err == nil {
+				t.Fatalf("persistently slow self-list served floor %d, want fail-closed error", got)
+			}
+		})
 	})
 }
 
@@ -697,39 +715,45 @@ func TestUsageFloorInFlightScanInvalidatedByAdoption(t *testing.T) {
 // this test, in production by other hook processes), a scan must wait
 // bounded by its attempt deadline and fail closed WITHOUT listing, and
 // releasing a slot must let the next attempt succeed.
+//
+// It runs on synctest's fake clock, like TestHookSelfListFloorRejectsSlowScans:
+// the slot wait burns fake time and the real store reads of the scan after
+// the release cost none, so host load cannot expire its window.
 func TestHookFloorScansAreSlotBoundedAcrossProcesses(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir()) // isolate the slot files from parallel suites
 	oldFresh := hookFloorFreshness
 	hookFloorFreshness = 100 * time.Millisecond
 	t.Cleanup(func() { hookFloorFreshness = oldFresh })
 
-	// Hold every slot, as concurrent hook processes would.
-	var unlocks []func()
-	for range hookFloorScanSlots {
-		u, err := acquireHookFloorScanSlot(context.Background())
-		if err != nil {
-			t.Fatal(err)
+	synctest.Test(t, func(t *testing.T) {
+		// Hold every slot, as concurrent hook processes would.
+		var unlocks []func()
+		for range hookFloorScanSlots {
+			u, err := acquireHookFloorScanSlot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			unlocks = append(unlocks, u)
 		}
-		unlocks = append(unlocks, u)
-	}
 
-	cb := &countingBlob{BlobStore: openTestBlob(t)}
-	st := openTestRefStore(t)
-	if _, _, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err == nil {
-		t.Fatal("slot-starved floor scan did not fail closed")
-	}
-	if got := cb.lists.Load(); got != 0 {
-		t.Fatalf("slot-starved floor scan ran %d listings, want 0 (the slot must gate the scan)", got)
-	}
+		cb := &countingBlob{BlobStore: openTestBlob(t)}
+		st := openTestRefStore(t)
+		if _, _, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err == nil {
+			t.Fatal("slot-starved floor scan did not fail closed")
+		}
+		if got := cb.lists.Load(); got != 0 {
+			t.Fatalf("slot-starved floor scan ran %d listings, want 0 (the slot must gate the scan)", got)
+		}
 
-	// Freeing one slot lets the scan through.
-	unlocks[0]()
-	if floor, _, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err != nil || floor != 0 {
-		t.Fatalf("post-release floor = (%d, %v), want (0, nil)", floor, err)
-	}
-	for _, u := range unlocks[1:] {
-		u()
-	}
+		// Freeing one slot lets the scan through.
+		unlocks[0]()
+		if floor, _, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err != nil || floor != 0 {
+			t.Fatalf("post-release floor = (%d, %v), want (0, nil)", floor, err)
+		}
+		for _, u := range unlocks[1:] {
+			u()
+		}
+	})
 }
 
 // TestUsageFloorScanExpiredResultFailsClosed (Codex round 41): the
