@@ -257,6 +257,83 @@ func TestPushRunUnreachableRemarksPending(t *testing.T) {
 	}
 }
 
+// TestPushRunWaitsForPublicationOnRiverLane: a River push run (no Local)
+// waits for the push's cache publication after its claim and before its
+// snapshot, the same as a local run.
+func TestPushRunWaitsForPublicationOnRiverLane(t *testing.T) {
+	f := newWorkerFixture(t)
+	headSHA := seedLocalRepo(t, f, "repo_pw")
+	bare := addEmptyUpstream(t, f.upstreamDir, "own", "proj")
+	f.putUpstream(t, "repo_pw", "own", "proj", "file://"+f.upstreamDir)
+	if err := f.store.RequestPush(context.Background(), "repo_pw", false); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	f.worker.WaitPublication = func(ctx context.Context, repoID string) error {
+		waited = true
+		up, err := f.store.GetUpstream(ctx, repoID)
+		if err != nil || !up.PushSyncing || up.PushPending != PushPendingNone {
+			t.Errorf("wait ran outside a claim: %+v, %v", up, err)
+		}
+		if out := testGit(t, f.upstreamDir, "-C", bare, "for-each-ref"); out != "" {
+			t.Errorf("upstream written before the wait: %s", out)
+		}
+		if n := len(f.rec.list()); n != 0 {
+			t.Errorf("%d events before the wait", n)
+		}
+		return nil
+	}
+	if err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pw"}); err != nil {
+		t.Fatalf("RunPush: %v", err)
+	}
+	if !waited {
+		t.Fatal("RunPush never waited for publication")
+	}
+	if got := testGit(t, f.upstreamDir, "-C", bare, "rev-parse", "refs/heads/main"); got != headSHA {
+		t.Fatalf("upstream main = %s, want %s", got, headSHA)
+	}
+}
+
+// TestPushRunFailedPublicationWaitRestoresOnRiverLane: a River push run
+// whose wait fails hands its request back (force kept, no run counted, no
+// event) and returns an error, so the job's completion gate snoozes it.
+func TestPushRunFailedPublicationWaitRestoresOnRiverLane(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprintf("force=%v", force), func(t *testing.T) {
+			f := newWorkerFixture(t)
+			seedLocalRepo(t, f, "repo_pr")
+			bare := addEmptyUpstream(t, f.upstreamDir, "own", "proj")
+			f.putUpstream(t, "repo_pr", "own", "proj", "file://"+f.upstreamDir)
+			if err := f.store.RequestPush(context.Background(), "repo_pr", force); err != nil {
+				t.Fatal(err)
+			}
+			waitErr := errors.New("hold unreadable")
+			f.worker.WaitPublication = func(context.Context, string) error { return waitErr }
+			err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pr"})
+			if !errors.Is(err, waitErr) || errors.Is(err, ErrShutdown) {
+				t.Fatalf("RunPush = %v, want the wait error without ErrShutdown", err)
+			}
+			want := PushPendingPush
+			if force {
+				want = PushPendingForce
+			}
+			up, err := f.store.GetUpstream(context.Background(), "repo_pr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if up.PushPending != want || up.PushSyncing || up.PushClaimHolder != "" || up.PushRunCount != 0 {
+				t.Fatalf("request not handed back: %+v, want pending %d", up, want)
+			}
+			if n := len(f.rec.list()); n != 0 {
+				t.Fatalf("%d events for a run that never started", n)
+			}
+			if out := testGit(t, f.upstreamDir, "-C", bare, "for-each-ref"); out != "" {
+				t.Fatalf("upstream written after a failed wait: %s", out)
+			}
+		})
+	}
+}
+
 // TestPushRunRetryBudgetExhausted: past MaxPushTransientRetries the run
 // stops re-marking — the chain ends and the failed event stands.
 func TestPushRunRetryBudgetExhausted(t *testing.T) {

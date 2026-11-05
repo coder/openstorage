@@ -361,6 +361,15 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// uniqueness would swallow a requeue of a still-running job; the
 		// river sync/push workers schedule successors transactionally
 		// instead (issue #79).
+		//
+		// A push's job exists from its authority CAS on, before
+		// receive-pack publishes the cache ref, so push runs wait for
+		// publication too. Holds live in each node's cache, and the
+		// run's loopback fetch reads this node's cache.
+		assertf(cacheDir != "", "buildServeEventing: the publication wait needs the cache directory")
+		worker.WaitPublication = func(ctx context.Context, repoID string) error {
+			return githttp.WaitForPushPublication(ctx, cacheDir, repoID)
+		}
 		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, worker.RunPush, ups, sweep, lfsReclaim, absence, repack, logger)
 		if err != nil {
 			return nil, nil, nil, err

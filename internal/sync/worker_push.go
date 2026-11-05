@@ -137,13 +137,22 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			"org", job.Org, "repo", job.RepoID, "holder", holder, "stolen_from", stolenFrom)
 	}
 
-	if w.Local != nil {
-		if err := w.waitPublication(ctx, job.RepoID); err != nil {
+	if err := w.waitPublication(ctx, job.RepoID); err != nil {
+		if w.Local != nil {
 			return w.restoreLocal(ctx, job, holder, "push", err, func(fctx context.Context) (Upstream, error) {
 				return w.Local.FinishPushOutcome(fctx, job.RepoID, holder,
 					meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: localPublicationRetryDelay})
 			})
 		}
+		// River: hand the request back and fail the run, so the job's
+		// completion gate snoozes it as an uncovered pending request.
+		rs := w.Upstreams.(ShutdownRestorer)
+		if rerr := w.restoreLocal(ctx, job, holder, "push", err, func(fctx context.Context) (Upstream, error) {
+			return rs.RestorePush(fctx, job.RepoID, holder, force)
+		}); rerr != nil {
+			return shutdownErr(ctx, rerr)
+		}
+		return shutdownErr(ctx, fmt.Errorf("push %s: %w", job.RepoID, err))
 	}
 
 	startedAt := eventTime(time.Now())
