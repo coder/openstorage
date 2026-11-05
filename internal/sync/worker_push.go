@@ -147,12 +147,19 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 		// River: hand the request back and fail the run, so the job's
 		// completion gate snoozes it as an uncovered pending request.
 		rs := w.Upstreams.(ShutdownRestorer)
-		if rerr := w.restoreLocal(ctx, job, holder, "push", err, func(fctx context.Context) (Upstream, error) {
+		restore := func(fctx context.Context) (Upstream, error) {
 			return rs.RestorePush(fctx, job.RepoID, holder, force)
-		}); rerr != nil {
-			return shutdownErr(ctx, rerr)
 		}
-		return shutdownErr(ctx, fmt.Errorf("push %s: %w", job.RepoID, err))
+		if shutdownAborted(ctx) {
+			if rerr := w.restoreForShutdown(ctx, "push", job, holder, err, restore); rerr != nil {
+				return rerr
+			}
+			return fmt.Errorf("push %s: %w", job.RepoID, ErrShutdown)
+		}
+		if rerr := w.restoreLocal(ctx, job, holder, "push", err, restore); rerr != nil {
+			return rerr
+		}
+		return fmt.Errorf("push %s: %w", job.RepoID, err)
 	}
 
 	startedAt := eventTime(time.Now())

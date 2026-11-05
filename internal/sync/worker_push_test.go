@@ -296,25 +296,45 @@ func TestPushRunWaitsForPublicationOnRiverLane(t *testing.T) {
 
 // TestPushRunFailedPublicationWaitRestoresOnRiverLane: a River push run
 // whose wait fails hands its request back (force kept, no run counted, no
-// event) and returns an error, so the job's completion gate snoozes it.
+// event) and returns an error, so the job's completion gate snoozes it. A
+// wait that shutdown cancels returns ErrShutdown, so River keeps the job.
 func TestPushRunFailedPublicationWaitRestoresOnRiverLane(t *testing.T) {
-	for _, force := range []bool{false, true} {
-		t.Run(fmt.Sprintf("force=%v", force), func(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		force, shutdown bool
+	}{
+		{"plain", false, false},
+		{"force", true, false},
+		{"shutdown", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			f := newWorkerFixture(t)
 			seedLocalRepo(t, f, "repo_pr")
 			bare := addEmptyUpstream(t, f.upstreamDir, "own", "proj")
 			f.putUpstream(t, "repo_pr", "own", "proj", "file://"+f.upstreamDir)
-			if err := f.store.RequestPush(context.Background(), "repo_pr", force); err != nil {
+			if err := f.store.RequestPush(context.Background(), "repo_pr", tc.force); err != nil {
 				t.Fatal(err)
 			}
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
 			waitErr := errors.New("hold unreadable")
-			f.worker.WaitPublication = func(context.Context, string) error { return waitErr }
-			err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pr"})
-			if !errors.Is(err, waitErr) || errors.Is(err, ErrShutdown) {
+			f.worker.WaitPublication = func(wctx context.Context, _ string) error {
+				if !tc.shutdown {
+					return waitErr
+				}
+				cancel(ErrShutdown)
+				<-wctx.Done()
+				return wctx.Err()
+			}
+			err := f.worker.RunPush(ctx, Job{Org: "acme", RepoID: "repo_pr"})
+			if tc.shutdown && !errors.Is(err, ErrShutdown) {
+				t.Fatalf("RunPush = %v, want ErrShutdown", err)
+			}
+			if !tc.shutdown && (!errors.Is(err, waitErr) || errors.Is(err, ErrShutdown)) {
 				t.Fatalf("RunPush = %v, want the wait error without ErrShutdown", err)
 			}
 			want := PushPendingPush
-			if force {
+			if tc.force {
 				want = PushPendingForce
 			}
 			up, err := f.store.GetUpstream(context.Background(), "repo_pr")
