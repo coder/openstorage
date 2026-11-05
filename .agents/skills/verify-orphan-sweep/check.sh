@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# check.sh: model-check the orphan-pack sweeper against pack writers.
+# check.sh: model-check the orphan-pack sweeper against pack writers, and
+# the repository purger against writers, a second purger and the sweeper.
 #
 #   .agents/skills/verify-orphan-sweep/check.sh [--out DIR] [--only CFG]... [--record]
 #   .agents/skills/verify-orphan-sweep/check.sh --fingerprints-only
 #
 # 1. Reads the code facts and fingerprints from the Go source (facts/facts.go).
-# 2. Runs TLC on model/PackSweep.tla with each config in model/, the facts
-#    written into the config.
+# 2. Runs TLC on each config in model/ against its module (PackSweep.tla or
+#    RepoPurge.tla), the module's facts written into the config.
 # 3. Compares the fingerprints with model/fingerprints.txt.
 #
 # Exit codes:
-#   0  every property holds, both probes fail as expected, no covered code
+#   0  every property holds, every probe fails as expected, no covered code
 #      changed since the sync commit
 #   1  a property failed: NoLostPack (PackSweep.cfg), NoWaitForHeal
-#      (NoTiming.cfg) or BytesComeBack (Liveness.cfg). Read the trace in --out.
+#      (NoTiming.cfg), BytesComeBack (Liveness.cfg), or a RepoPurge property
+#      (Purge*.cfg). Read the trace in --out.
 #   2  STALE: the properties hold, but covered code changed since the sync
 #      commit, or a probe stopped failing. Review the model against the code.
 #   3  the check could not run (Go, Java, TLC download, parse error)
@@ -27,8 +29,8 @@
 #
 # --record rewrites model/fingerprints.txt and the sync commit in SKILL.md
 # to the current code. Use it only after you confirmed that the model
-# describes the code at HEAD. It refuses unless the properties hold, both
-# probes fail, and the covered files have no uncommitted changes. The
+# describes the code at HEAD. It refuses unless the properties hold, every
+# probe fails, and the covered files have no uncommitted changes. The
 # sync commit is the merge base with origin/main (OPENSTORAGE_MAIN_REF)
 # when the covered files match it, so a squash merge does not orphan it.
 #
@@ -47,6 +49,23 @@ repo=$(git -C "$skill_dir" rev-parse --show-toplevel 2>/dev/null) || {
   echo "check.sh: not inside a git checkout" >&2; exit 3; }
 model="$skill_dir/model"
 
+# Configs in run order: name, module, kind (pass: invariants must hold; live:
+# temporal properties must hold; probe: the named invariant must fail).
+configs="PackSweep.cfg PackSweep pass -
+NoTiming.cfg PackSweep pass -
+Liveness.cfg PackSweep live -
+NoThresholdAssumption.cfg PackSweep probe NoLostPack
+SlowHealEntry.cfg PackSweep probe NoLostPack
+PurgeControl.cfg RepoPurge pass -
+PurgeSafety.cfg RepoPurge pass -
+PurgeLiveness.cfg RepoPurge live -
+PurgeNoThreshold.cfg RepoPurge probe NoDanglingRow
+PurgeSlowHeal.cfg RepoPurge probe NoDanglingRow"
+# The code facts each module declares as constants.
+facts_PackSweep="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealEverySweep HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeAgeCoversThreshold"
+facts_RepoPurge="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeAgeCoversThreshold PurgeGuarded SweepGuardStopsPurgeMode RefusesLive RefusesYoung CutoffCoversRetention CursorWraps FenceFirst RefsDieFirst TombstonesBeforeReap RegistrationsFenced RefWritesFenced FoldNeedsOldRows SweepReapsFenced HealPurgesFenced"
+cfg_names=$(awk '{print $1}' <<<"$configs")
+
 out="" record=0 only=" " fp_only=0
 while [ $# -gt 0 ]; do
   case $1 in
@@ -55,10 +74,8 @@ while [ $# -gt 0 ]; do
     --record) record=1; shift ;;
     --fingerprints-only) fp_only=1; shift ;;
     --only) [ $# -ge 2 ] || { echo "check.sh: --only needs a config name" >&2; exit 3; }
-            case $2 in
-              PackSweep.cfg|NoTiming.cfg|Liveness.cfg|NoThresholdAssumption.cfg|SlowHealEntry.cfg) ;;
-              *) echo "check.sh: --only takes PackSweep.cfg, NoTiming.cfg, Liveness.cfg, NoThresholdAssumption.cfg or SlowHealEntry.cfg" >&2; exit 3 ;;
-            esac
+            grep -qxF -- "$2" <<<"$cfg_names" || {
+              echo "check.sh: --only takes one of: $(tr '\n' ' ' <<<"$cfg_names")" >&2; exit 3; }
             only="$only$2 "; shift 2 ;;
     -h|--help) awk 'NR > 1 && /^set -uo pipefail/ { exit } NR > 1' "$0"; exit 0 ;;
     *) echo "check.sh: unknown argument $1" >&2; exit 3 ;;
@@ -90,14 +107,21 @@ if ! (cd "$repo" && "$GO" run "$skill_dir/facts/facts.go" -root "$repo") >"$out/
   cat "$out/facts.err" >&2
   die "facts.go failed (a covered function moved or was renamed?)"
 fi
-facts_cfg="$work/facts.cfg"
-{
-  echo "\\* Code facts from facts/facts.go at $(git -C "$repo" rev-parse --short HEAD)"
-  echo "CONSTANTS"
-  awk '$1 == "FACT" { printf "    %s = %s\n", $2, $3 }' "$out/facts.txt"
-} >"$facts_cfg"
-nfacts=$(grep -c '^FACT ' "$out/facts.txt")
-[ "$nfacts" -eq 9 ] || die "expected 9 facts from facts.go, got $nfacts"
+# Every fact facts.go prints belongs to some module, and every module's
+# facts are printed.
+want=$(tr ' ' '\n' <<<"$facts_PackSweep $facts_RepoPurge" | sort -u)
+got=$(awk '$1 == "FACT" {print $2}' "$out/facts.txt" | sort)
+[ "$want" = "$got" ] || die "facts.go printed facts [$(tr '\n' ' ' <<<"$got")], expected [$(tr '\n' ' ' <<<"$want")]"
+for module in PackSweep RepoPurge; do
+  names="facts_$module"
+  {
+    echo "\\* Code facts from facts/facts.go at $(git -C "$repo" rev-parse --short HEAD)"
+    echo "CONSTANTS"
+    for f in ${!names}; do
+      awk -v f="$f" '$1 == "FACT" && $2 == f { printf "    %s = %s\n", $2, $3 }' "$out/facts.txt"
+    done
+  } >"$work/facts-$module.cfg"
+done
 echo "== Code facts (HEAD $(git -C "$repo" rev-parse --short HEAD))"
 false_facts=0
 while read -r _ name value evidence; do
@@ -128,18 +152,18 @@ if [ "$fp_only" = 0 ]; then
   [ "$(sha256 "$jar")" = "$TLC_SHA256" ] || die "$jar does not match sha256 $TLC_SHA256; delete it and rerun"
 fi
 
-# run_tlc CFG WORKERS EXTRA_ARGS... -> exit code of TLC; output in $out/CFG.out
+# run_tlc CFG MODULE WORKERS EXTRA_ARGS... -> exit code of TLC; output in $out/CFG.out
 run_tlc() {
-  local cfg=$1 workers=$2; shift 2
+  local cfg=$1 module=$2 workers=$3; shift 3
   local d="$work/${cfg%.cfg}"
   mkdir -p "$d/tmp"
-  cp "$model/PackSweep.tla" "$d/"
-  cat "$model/$cfg" "$facts_cfg" >"$d/run.cfg"
+  cp "$model/$module.tla" "$d/"
+  cat "$model/$cfg" "$work/facts-$module.cfg" >"$d/run.cfg"
   cp "$d/run.cfg" "$out/${cfg%.cfg}.run.cfg"
   local rc=0
   (cd "$d" && "$JAVA" -Djava.io.tmpdir="$d/tmp" -Xmx"${TLC_HEAP:-4g}" -XX:+UseParallelGC \
      -cp "$jar" tlc2.TLC -workers "$workers" -cleanup -metadir "$d/meta" "$@" \
-     -config run.cfg PackSweep.tla) >"$out/${cfg%.cfg}.out" 2>&1 || rc=$?
+     -config run.cfg "$module.tla") >"$out/${cfg%.cfg}.out" 2>&1 || rc=$?
   return "$rc"
 }
 
@@ -163,11 +187,12 @@ status=0
 selected() { [ "$fp_only" = 0 ] || return 1; [ "$only" = " " ] || case $only in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 verdict() { printf '   %-27s %s\n' "$1" "$2"; }
 if [ "$fp_only" = 1 ]; then echo "== TLC skipped (--fingerprints-only)"; else echo "== TLC $TLC_VERSION (outputs in $out)"; fi
-for cfg in PackSweep.cfg NoTiming.cfg Liveness.cfg; do
+while read -r cfg module kind _; do
+  [ "$kind" != probe ] || continue
   selected "$cfg" || continue
   extra=()
-  [ "$cfg" = Liveness.cfg ] && extra=(-lncheck final)
-  rc=0; run_tlc "$cfg" "${TLC_WORKERS:-4}" ${extra[@]+"${extra[@]}"} || rc=$?
+  [ "$kind" = live ] && extra=(-lncheck final)
+  rc=0; run_tlc "$cfg" "$module" "${TLC_WORKERS:-4}" ${extra[@]+"${extra[@]}"} || rc=$?
   states=$(grep -o '[0-9,]* distinct states found, 0 states left' "$out/${cfg%.cfg}.out" | tail -n 1 | cut -d' ' -f1)
   case $rc in
     0) verdict "$cfg" "PASS ($states distinct states)" ;;
@@ -178,18 +203,19 @@ for cfg in PackSweep.cfg NoTiming.cfg Liveness.cfg; do
       status=1 ;;
     *) verdict "$cfg" "ERROR: TLC exit $rc"; sed -n '1,40p' "$out/${cfg%.cfg}.out" >&2; exit 3 ;;
   esac
-done
+done <<<"$configs"
 
-# Probes drop one timing assumption each; NoLostPack must then fail. One
-# worker keeps the trace the shortest one.
+# Probes drop one timing assumption each; their named invariant must then
+# fail. One worker keeps the trace the shortest one.
 stale=0 probe_passed=0
 [ "$false_facts" -eq 0 ] || stale=1
-for cfg in NoThresholdAssumption.cfg SlowHealEntry.cfg; do
+while read -r cfg module kind expect; do
+  [ "$kind" = probe ] || continue
   selected "$cfg" || continue
-  rc=0; run_tlc "$cfg" 1 || rc=$?
+  rc=0; run_tlc "$cfg" "$module" 1 || rc=$?
   case $rc in
     12)
-      if grep -q 'Invariant NoLostPack is violated' "$out/${cfg%.cfg}.out"; then
+      if grep -q "Invariant $expect is violated" "$out/${cfg%.cfg}.out"; then
         summarize "$out/${cfg%.cfg}.out" >"$out/${cfg%.cfg}.trace.txt"
         verdict "$cfg" "fails as expected (trace: $out/${cfg%.cfg}.trace.txt)"
       else
@@ -198,7 +224,7 @@ for cfg in NoThresholdAssumption.cfg SlowHealEntry.cfg; do
     0) verdict "$cfg" "PASSES: this timing assumption no longer matters. Review the model and SKILL.md"; stale=1; probe_passed=1 ;;
     *) verdict "$cfg" "ERROR: TLC exit $rc"; sed -n '1,40p' "$out/${cfg%.cfg}.out" >&2; exit 3 ;;
   esac
-done
+done <<<"$configs"
 
 # --- 3. Fingerprints --------------------------------------------------------
 # shellcheck disable=SC2016 # the backticks are literal Markdown
@@ -240,7 +266,7 @@ if [ "$record" = 1 ]; then
   else
     echo "check.sh: covered code differs from $main; recording HEAD. Re-run --record after the merge." >&2
   fi
-  { echo "# Token fingerprints of the code model/PackSweep.tla describes (facts/facts.go)."
+  { echo "# Token fingerprints of the code model/PackSweep.tla and model/RepoPurge.tla describe (facts/facts.go)."
     echo "# check.sh --record rewrites this file; SKILL.md holds the sync commit."
     cat "$out/fingerprints.now"; } >"$model/fingerprints.txt"
   sed -i.bak "s/^Sync commit: \`[0-9a-f]*\`/Sync commit: \`$head\`/" "$skill_dir/SKILL.md" && rm -f "$skill_dir/SKILL.md.bak"
