@@ -16,7 +16,7 @@ const sweep = {
   idle: "between sweeps",
   heal_next: "heal: next backup",
   heal_reg: "heal: reads registry",
-  heal_stat: "heal: K registered, stats K",
+  heal_stat: "heal: K registered, restores or stats K",
   heal_purge: "heal: at the purge age gate",
   rv_reg: "revalidate: reads registry",
   sd_copy: "copies K to quarantine",

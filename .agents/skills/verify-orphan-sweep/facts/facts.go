@@ -389,16 +389,57 @@ func main() {
 	pf.need(timeouts >= 2, "safeDelete bounds two phases with context.WithTimeout(..., sweepRecoveryTimeout) (found %d)", timeouts)
 	facts = append(facts, pf)
 
-	// HealEntryBounded: healQuarantineEntry's first statement bounds the
-	// whole entry, from its registry read to its purge, and the bound leaves
-	// the purge floor room for the handshake's two phases besides.
+	// HealEntryBounded: healQuarantineEntry's first statement starts a bound
+	// that covers an unregistered key from its registry read to its purge. A
+	// registered key restores or heals its original on the caller's context,
+	// which no fixed bound fits, then opens a new bound and stats the original
+	// again: the purge relies on that read. No other call passes the bare
+	// context. The bound leaves the purge floor room for the handshake's two
+	// phases besides.
 	hb := newFact("HealEntryBounded")
 	first0 := ""
 	if len(healEntry.Body.List) > 0 {
 		first0 = sweep.text(healEntry.Body.List[0])
 	}
-	hb.need(first0 == "ctx, cancel := context.WithTimeout(ctx, healEntryTimeout)",
-		"healQuarantineEntry starts with ctx, cancel := context.WithTimeout(ctx, healEntryTimeout) (found %q)", first0)
+	hb.need(first0 == "ectx, cancel := context.WithTimeout(ctx, healEntryTimeout)",
+		"healQuarantineEntry starts with ectx, cancel := context.WithTimeout(ctx, healEntryTimeout) (found %q)", first0)
+	hb.need(first(hCalls, "s.registered", "ectx, repo, orig", false).IsValid(),
+		"healQuarantineEntry reads the registry as s.registered(ectx, repo, orig)")
+	var regBlock *ast.BlockStmt
+	rebound := token.NoPos
+	ast.Inspect(healEntry.Body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok && sweep.text(is.Cond) == "registered" {
+			regBlock = is.Body
+			for _, st := range is.Body.List {
+				if sweep.text(st) == "bound, boundCancel := context.WithTimeout(ctx, healEntryTimeout)" {
+					rebound = st.Pos()
+				}
+			}
+		}
+		return true
+	})
+	hb.need(regBlock != nil && rebound.IsValid() && hreg.IsValid() && hreg < rebound,
+		"after the registry read, `if registered` opens a new bound: bound, boundCancel := context.WithTimeout(ctx, healEntryTimeout)")
+	stat2 := first(hCalls, "s.blobs.Stat", "ectx, orig", false)
+	hb.need(rebound.IsValid() && stat2.IsValid() && rebound < stat2 && regBlock != nil && stat2 < regBlock.End(),
+		"the registered block stats the original again as s.blobs.Stat(ectx, orig) after the new bound")
+	bare := 0
+	bad := 0
+	ast.Inspect(healEntry.Body, func(n ast.Node) bool {
+		c, ok := n.(*ast.CallExpr)
+		if !ok || len(c.Args) == 0 || sweep.text(c.Fun) == "context.WithTimeout" {
+			return true
+		}
+		if id, ok := c.Args[0].(*ast.Ident); ok && id.Name == "ctx" {
+			bare++
+			if regBlock == nil || c.Pos() < regBlock.Pos() || c.Pos() > regBlock.End() || !rebound.IsValid() || c.Pos() > rebound {
+				bad++
+			}
+		}
+		return true
+	})
+	hb.need(bare > 0 && bad == 0,
+		"only the registered block, before its new bound, passes bare ctx as a first argument (%d calls do, %d outside it)", bare, bad)
 	healUnits := constUnits(sweep, "healEntryTimeout", "sweepRecoveryTimeout")
 	floorUnits := constUnits(sweep, "QuarantinePurgeFloor", "sweepRecoveryTimeout")
 	hb.need(healUnits >= 1 && healUnits+2 <= floorUnits,
