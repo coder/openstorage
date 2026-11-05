@@ -440,6 +440,51 @@ func TestLsTreePageCursorReapsItsChild(t *testing.T) {
 	}
 }
 
+// A walk that ends while git still has a large tree to write kills git: it
+// does not wait for a pipe that nobody reads.
+func TestLsTreePageCursorAbandonsALargeTree(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	blob := gitIn(t, dir, "x", "hash-object", "-w", "--stdin")
+	var names []string
+	for i := range 60000 {
+		names = append(names, fmt.Sprintf("f%07d", i))
+	}
+	names[1], names[2] = names[2], names[1] // out of order, early on
+	commit := commitOf(t, dir, rawTreeBlob(t, dir, blob, names))
+	b := NewBudget(NewSlots(1, 1, 0), "repo", 20*time.Second, 1<<20)
+	t.Cleanup(b.Close)
+	start := time.Now()
+	_, _, _, err := LsTreePage(WithBudget(context.Background(), b), dir, commit, "", "f0000000", 3)
+	if !errors.Is(err, ErrUnsortedTree) {
+		t.Fatalf("err = %v, want ErrUnsortedTree", err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("took %v: git was not killed", d)
+	}
+	if kids := catFileChildren(t); len(kids) != 0 {
+		t.Fatalf("cat-file children left: %q", kids)
+	}
+}
+
+// rawTreeBlob stores a tree of files that share one blob, in this order.
+func rawTreeBlob(t testing.TB, dir, blob string, names []string) string {
+	t.Helper()
+	id := make([]byte, 20)
+	for i := range id {
+		v, err := strconv.ParseUint(blob[2*i:2*i+2], 16, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id[i] = byte(v)
+	}
+	var raw strings.Builder
+	for _, name := range names {
+		raw.WriteString("100644 " + name + "\x00" + string(id))
+	}
+	return gitIn(t, dir, raw.String(), "hash-object", "-t", "tree", "--literally", "-w", "--stdin")
+}
+
 // A git that stops answering is killed at the request's time budget, and
 // the request gets the budget error, not a decline.
 func TestLsTreePageCursorTimeBudget(t *testing.T) {

@@ -361,13 +361,9 @@ func (w *treeWalk) scan(rev, prefix, rest string, skip, max int) (sc treeScan, e
 		if seen++; seen <= skip {
 			continue
 		}
-		// The entry past the limit is not charged, so it need not fit.
-		var cost int64
-		if len(sc.later) < w.limit-len(w.page) {
-			cost = entryFloor + int64(len(prefix)+len(name))
-		}
 		// A scan always keeps its first entry, so every level goes on, and
 		// the entries kept at once stay within the allowance otherwise.
+		cost := entryFloor + int64(len(prefix)+len(name))
 		if len(sc.later) == max || len(sc.later) > 0 && w.bytes+w.held+cost > w.room {
 			sc.more = true
 			break
