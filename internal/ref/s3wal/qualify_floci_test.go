@@ -432,7 +432,7 @@ func getWithETag(ctx context.Context, client *s3.Client, bucket, key string) (bo
 	if err != nil {
 		// A short body that stalls until the deadline is the framing
 		// shape; a stall before the headers is not (issue #566).
-		return nil, "", fmt.Errorf("read body after headers (%d of Content-Length %d bytes): %w", len(b), aws.ToInt64(out.ContentLength), err)
+		return nil, "", shortBodyError{fmt.Errorf("read body after headers (%d of Content-Length %d bytes): %w", len(b), aws.ToInt64(out.ContentLength), err)}
 	}
 	return b, aws.ToString(out.ETag), nil
 }

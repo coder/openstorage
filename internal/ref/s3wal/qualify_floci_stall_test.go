@@ -112,16 +112,24 @@ func explainedByStall(f readFailure, spans []stallSpan, opTimeout time.Duration)
 	return errors.Is(f.err, context.DeadlineExceeded) && f.elapsed()-f.stalledFor(spans) < opTimeout/4
 }
 
+// shortBodyError marks a GET whose headers arrived and whose body did not
+// complete.
+type shortBodyError struct{ error }
+
+func (e shortBodyError) Unwrap() error { return e.error }
+
 // readErrClass names the shape of a failed read for the verdict detail.
-// "short-body" is the framing shape: the response ended before its
-// Content-Length. "status" is an error reply from the store.
+// "short-body" is the framing shape: the headers came and the body ended
+// early or stopped coming before its Content-Length. "deadline" is a read
+// that hit the op deadline before any header. "status" is an error reply
+// from the store.
 func readErrClass(err error) string {
 	var reply *awshttp.ResponseError
 	switch {
+	case errors.As(err, new(shortBodyError)):
+		return "short-body"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "deadline"
-	case errors.Is(err, io.ErrUnexpectedEOF):
-		return "short-body"
 	case errors.Is(err, io.EOF), errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE), errors.Is(err, net.ErrClosed):
 		return "reset"
 	case errors.As(err, &reply) && reply.HTTPStatusCode() != 0:
@@ -193,6 +201,11 @@ func TestReadFailureShapes(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/hang"):
 			<-r.Context().Done()
+		case strings.HasSuffix(r.URL.Path, "/stallbody"):
+			w.Header().Set("Content-Length", "100")
+			_, _ = w.Write(bytes.Repeat([]byte("a"), 10))
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
 		case strings.HasSuffix(r.URL.Path, "/short"):
 			w.Header().Set("Content-Length", "100")
 			_, _ = w.Write(bytes.Repeat([]byte("a"), 10))
@@ -224,7 +237,8 @@ func TestReadFailureShapes(t *testing.T) {
 		key, class string
 		timeout    time.Duration // only the hang may reach it
 	}{
-		{"hang", "deadline", 300 * time.Millisecond}, {"short", "short-body", time.Minute}, {"closed", "reset", time.Minute}, {"status", "status", time.Minute},
+		{"hang", "deadline", 300 * time.Millisecond}, {"stallbody", "short-body", 300 * time.Millisecond},
+		{"short", "short-body", time.Minute}, {"closed", "reset", time.Minute}, {"status", "status", time.Minute},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), tc.timeout)

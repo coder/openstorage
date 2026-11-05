@@ -500,10 +500,11 @@ op deadline and the process was frozen for all but a quarter of that deadline.
 The verdict quotes the first three failures with `class` (`deadline`,
 `short-body`, `reset`, `status` or `other`), `elapsed`, `awake` (the time the
 process ran during the read) and `explainedByStall`. `short-body` is the framing
-shape, and `status` is an error reply from Floci. A `deadline` with a long
-`awake` time is a stall of Floci or the network, because the test process kept
-running. `maxRead` and `maxStall` give the slowest successful GET and the
-longest freeze of the run.
+shape: the headers arrived and the body did not finish. `deadline` is a read
+that got no headers in time, and `status` is an error reply from Floci. A
+`short-body` or `deadline` read with a long `awake` time is a stall of Floci or
+the network, because the test process kept running. `maxRead` and `maxStall`
+give the slowest successful GET and the longest freeze of the run.
 
 Run it locally (Docker + the `aws` CLI):
 
