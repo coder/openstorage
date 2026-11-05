@@ -285,21 +285,31 @@ def repo_path(path):
 
 
 def indexed(path):
-    """True when git's index holds the file that path names and every symlink on the way to it.
+    """True when git's index holds the file that path names and every symlink that resolving it follows.
 
-    A clean checkout has no untracked symlink, so one that resolves to a tracked file still breaks there.
+    A clean checkout has no untracked symlink, so a path through one breaks there even when it resolves to a
+    tracked file. Each symlink is followed by hand, so a symlink that another symlink points at is checked too.
+    Both callers check that the path exists first, so the OS has already refused a symlink loop.
     """
-    if repo_path(path) not in tracked():
-        return False
-    parent = "."
-    for name in path.split("/"):
-        entry = posixpath.normpath(posixpath.join(parent, name))
-        if os.path.islink(entry) and entry not in tracked():
+    pending, current = path.split("/")[::-1], "."
+    while pending:
+        name = pending.pop()
+        if name in ("", "."):
+            continue
+        if name == "..":
+            if current == ".":
+                return False
+            current = posixpath.dirname(current) or "."
+            continue
+        entry = posixpath.normpath(posixpath.join(current, name))
+        if not os.path.islink(entry):
+            current = entry
+            continue
+        target = os.readlink(entry)
+        if entry not in tracked() or posixpath.isabs(target):
             return False
-        parent = repo_path(entry)
-        if parent is None:
-            return False
-    return True
+        pending.extend(reversed(target.split("/")))
+    return current in tracked()
 
 
 @functools.cache
@@ -554,17 +564,19 @@ def js_names(text):
 
 # The reader knows one quoting form: a plain '...' or "..." that opens and
 # closes on one line, paired in the order they appear, and a backslash escape.
-# It does not read `$(...)`, `${...}`, `$'...'` or a quote that spans lines.
-# A `#` after one of those can start a comment, and a line with a quote that
-# does not close (`stray`) drops its comment whatever the pairing. Both fail
-# closed: a valid citation of a word there is rejected, and no comment word
-# is accepted.
+# It does not read `$(...)`, `${...}`, a backtick, `$'...'` or a quote that
+# spans lines. A line that holds one of the first four (`SHELL_UNREAD`), or a
+# quote that does not close (`stray`), ignores quotes and drops its comment,
+# as every line did before quotes were read. That fails closed: a valid
+# citation of a word after such a `#` is rejected, and no comment word is
+# accepted.
 SHELL_COMMENT = re.compile(r"(?:^|(?<=[\s;&|()]))#.*")
+SHELL_UNREAD = re.compile(r"\$['({]|`")
 SHELL_LEXER = re.compile(r"""(?P<text>'[^']*'|"(?:\\.|[^"\\])*"|\\.)|(?P<stray>['"])|""" + SHELL_COMMENT.pattern)
 
 
 def shell_code(line):
-    if any(m.group("stray") for m in SHELL_LEXER.finditer(line)):
+    if SHELL_UNREAD.search(line) or any(m.group("stray") for m in SHELL_LEXER.finditer(line)):
         return SHELL_COMMENT.sub("", line)
     return SHELL_LEXER.sub(lambda m: m.group("text") or "", line)
 

@@ -381,10 +381,14 @@ class CitationTests(CheckerTestCase):
               "echo it's\" # comment-seven 'x'\n"
               "echo \"it's\" don't # comment-eight\n"
               'echo "$(printf "%s # nested-sub" x)"\n'
-              "printf '%s\\n' $'it\\'s # ansi-quote'\n")
+              "printf '%s\\n' $'it\\'s # ansi-quote'\n"
+              "printf '%s\\n' $'it\\'s' # stale-name'\n"
+              'echo "${x:-"a # braced-word"}"\n'
+              'echo "`printf "%s # tick-word" x`"\n')
         ok = ["[run.sh:feature-name]", "[run.sh:double-quoted]"]
         bad = [f"[run.sh:comment-{n}]" for n in ("one", "two", "three", "four", "five", "six", "seven", "eight")]
-        bad += ["[run.sh:nested-sub]", "[run.sh:ansi-quote]"]
+        bad += ["[run.sh:nested-sub]", "[run.sh:ansi-quote]", "[run.sh:stale-name]", "[run.sh:braced-word]",
+                "[run.sh:tick-word]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
@@ -399,11 +403,12 @@ class CitationTests(CheckerTestCase):
               "counter++\nfunction afterIncrement() {}\ncounter--\nfunction afterDecrement() {}\n"
               "const quotient = 1 /\n  function divided() {}\n"
               "const re = /a+/\nfunction afterRegex() {}\n"
-              "async function work() {\n  return\n  function afterReturn() {}\n}\n")
+              "async function work() {\n  return\n  function afterReturn() {}\n}\n"
+              "switch (x) {\ncase 1:\n  function inCase() {}\n}\n")
         ok = ["viaEquals", "viaClass", "either", "arrow", "pick", "list", "declared", "plain", "afterString",
               "defaulted", "afterIncrement", "afterDecrement", "work", "afterReturn"]
         bad = ["equalsNamed", "ClassNamed", "argNamed", "listNamed", "orNamed", "arrowNamed", "thenNamed",
-               "elseNamed", "bracketNamed", "divided", "afterRegex"]
+               "elseNamed", "bracketNamed", "divided", "afterRegex", "inCase"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n",
                                    **{"pkg/flow.js": js})
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
@@ -540,12 +545,16 @@ class FileSelectionTests(CheckerTestCase):
 
     def test_links_follow_tracked_symlinks_like_citations(self):
         result = self.run_checker(
-            "[Real](notes/real.txt) [Untracked](notes/alias.txt) [Outside](notes/out.txt)\n",
+            "[Real](notes/real.txt) [Untracked](notes/alias.txt) [Outside](notes/out.txt) [Root](notes/root/) "
+            "[Up](notes/up/)\n",
             files={"notes/real.txt": "x\n"},
-            symlinks={"notes/alias.txt": "new.txt", "notes/out.txt": Path(__file__).resolve()},
+            symlinks={"notes/alias.txt": "new.txt", "notes/out.txt": Path(__file__).resolve(), "notes/root": "/",
+                      "notes/up": "../.."},
             untracked={"notes/new.txt": "x\n"})
         self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> notes/alias.txt\n"
-                                        "BROKEN FILE (escapes repo) README.md:1 -> notes/out.txt\nbroken links: 2\n")
+                                        "BROKEN FILE (escapes repo) README.md:1 -> notes/out.txt\n"
+                                        "BROKEN FILE (escapes repo) README.md:1 -> notes/root/\n"
+                                        "BROKEN FILE (escapes repo) README.md:1 -> notes/up/\nbroken links: 4\n")
 
     def test_an_untracked_symlink_to_a_tracked_file_is_not_tracked(self):
         result = self.run_checker(
@@ -557,10 +566,21 @@ class FileSelectionTests(CheckerTestCase):
                                         "BROKEN FILE (not tracked by git) README.md:1 -> dirlink/real.md\n"
                                         "broken links: 3\n")
 
+    def test_every_symlink_that_resolving_a_link_follows_must_be_tracked(self):
+        result = self.run_checker(
+            "[Chain](alias/guide.md) [Tracked](full/guide.md) [Loop](loop-a.md)\n",
+            files={"docs/guide.md": "# Guide\n"},
+            symlinks={"alias": "hidden", "full": "middle", "middle": "docs", "loop-a.md": "loop-b.md",
+                      "loop-b.md": "loop-a.md"},
+            untracked_symlinks={"hidden": "docs"})
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> alias/guide.md\n"
+                                        "BROKEN FILE README.md:1 -> loop-a.md\nbroken links: 2\n")
+
     def test_a_tracked_symlink_below_a_tracked_directory_symlink_resolves(self):
         result = self.run_checker(
-            "[Chain](alias/inner/link.md)\n", files={"docs/inner/real.md": "# Real\n"},
-            symlinks={"alias": "docs", "docs/inner/link.md": "real.md"})
+            "[Chain](alias/inner/link.md) [Up](alias/inner/up.md)\n",
+            files={"docs/inner/real.md": "# Real\n", "docs/top.md": "# Top\n"},
+            symlinks={"alias": "docs", "docs/inner/link.md": "real.md", "docs/inner/up.md": "../top.md"})
         self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
 
     def test_a_link_through_a_tracked_directory_symlink_resolves_to_the_tracked_file(self):
