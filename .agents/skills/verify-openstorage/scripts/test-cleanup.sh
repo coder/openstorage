@@ -253,11 +253,21 @@ osv cleanup "$RUN"
 want "exit 1" rc_is 1
 want "victim unchanged" victim_ok "$T/victim-ct"
 want "container still removed" test -e "$RUN/docker/removed"
-want "staged log kept in work/" test -s "$RUN/work/tmp/container-postgres-${FAKEID:0:12}.log"
+want "staged log kept in work/" test -n "$(find "$RUN/work/tmp" -name "container-postgres-${FAKEID:0:12}.log" -size +0)"
 rm "$EVID/container-postgres-${FAKEID:0:12}.log"
 osv cleanup "$RUN"
 want "rerun exit 0" rc_is 0
 want "rerun saves the log redacted" redacted "$EVID/container-postgres-${FAKEID:0:12}.log"
+case_end
+
+case_begin "a link at the old staging path of a container log is not followed"
+mkrun fleetstage fleet
+new_victim "$T/victim-stage"
+ln -s "$T/victim-stage" "$RUN/work/tmp/container-postgres-${FAKEID:0:12}.log"
+osv cleanup "$RUN"
+want "exit 0" rc_is 0
+want "victim unchanged" victim_ok "$T/victim-stage"
+want "log redacted in the evidence" redacted "$EVID/container-postgres-${FAKEID:0:12}.log"
 case_end
 
 # --- the redaction walk redacts every readable file, then fails on the rest

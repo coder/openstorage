@@ -734,7 +734,7 @@ PYEOF
 save_redacted_evidence() {
 	[[ -d $WORK ]] || return 0
 	local pair src t desc lines=''
-	for src in "$WORK"/tmp/container-*.log; do
+	for src in "$WORK"/tmp/containers.*/container-*.log; do
 		[[ ! -e $src && ! -L $src ]] || evidence_put "$src" "$EVID/${src##*/}" || :
 	done
 	for pair in serve.out:serve.stdout.log serve.err:serve.stderr.log serve-b.out:serve-b.stdout.log serve-b.err:serve-b.stderr.log state.env:state.env; do
@@ -848,18 +848,20 @@ stop_serve() {
 }
 
 # remove_containers: stage the logs of each container with this run's label in
-# work/tmp, remove it and its anonymous volumes, and add any that remain to LEFT.
+# a new directory under work/tmp, remove it and its anonymous volumes, and add any that remain to LEFT.
 remove_containers() {
 	command -v docker >/dev/null || die "docker is not on PATH: cannot remove this run's containers (label $LABEL=$RUN)"
-	local ids id name
+	local ids id name stage
 	ids=$(run_containers) || die "docker ps failed: cannot list this run's containers (label $LABEL=$RUN)"
-	[[ -z $ids ]] || mkdir -p "$WORK/tmp"
+	# A new directory with a random name, so no link can wait at a log's path.
+	[[ -z $ids ]] || stage=$(mktemp -d "$WORK/tmp/containers.XXXXXX") || die "cannot make a staging directory under $WORK/tmp"
 	for id in $ids; do
 		# postgres or seaweedfs, from the image reference.
 		name=$(docker inspect -f '{{.Config.Image}}' "$id" 2>/dev/null | sed 's|^.*/||; s|[:@].*||') || true
-		# The log goes to work/tmp first: save_redacted_evidence copies it, so a
-		# refused evidence path loses nothing and a cleanup rerun copies it again.
-		docker logs --tail 5000 "$id" >"$WORK/tmp/container-${name:-unknown}-${id:0:12}.log" 2>&1 || true
+		# The log goes to the staging directory first: save_redacted_evidence
+		# copies it, so a refused evidence path loses nothing and a cleanup
+		# rerun copies it again.
+		docker logs --tail 5000 "$id" >"$stage/container-${name:-unknown}-${id:0:12}.log" 2>&1 || true
 		docker rm -f -v "$id" >/dev/null || true
 	done
 	ids=$(run_containers) || die "docker ps failed: cannot list this run's containers (label $LABEL=$RUN)"
