@@ -347,11 +347,14 @@ class CitationTests(CheckerTestCase):
         tf = ('locals {\n  cloud-init = 1\n  cloud_config = {\n    a = "{"\n  }\n}\n'
               'resource "aws_lb" "this" {\n  name = "x"\n  lifecycle {\n    precondition {\n'
               '      condition = true\n    }\n  }\n}\n'
-              'data "aws_partition" "current" {}\nvariable "region" {}\nprovider "aws" {\n  region = var.region\n}\n')
+              'data "aws_partition" "current" {}\nvariable "region" {}\nprovider "aws" {\n  region = var.region\n}\n'
+              'ephemeral "random_password" "db" {\n  length = 16\n  lifecycle {\n    postcondition {\n    }\n  }\n}\n')
         ok = ["[main.tf:aws_lb]", "[main.tf:aws_lb.this]", "[main.tf:aws_lb.this.precondition]",
               "[main.tf:data.aws_partition.current]", "[main.tf:region]", "[main.tf:var.region]",
-              "[main.tf:provider.aws]", "[main.tf:local.cloud_config]", "[main.tf:local.cloud-init]"]
-        bad = ["[main.tf:aws_lb.main]", "[main.tf:data]", "[main.tf:local.a]", "[main.tf:aws_lb.this.name]"]
+              "[main.tf:provider.aws]", "[main.tf:local.cloud_config]", "[main.tf:local.cloud-init]",
+              "[main.tf:ephemeral.random_password.db]", "[main.tf:ephemeral.random_password.db.postcondition]"]
+        bad = ["[main.tf:aws_lb.main]", "[main.tf:data]", "[main.tf:local.a]", "[main.tf:aws_lb.this.name]",
+               "[main.tf:random_password.db]", "[main.tf:ephemeral.random_password.db.length]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/main.tf": tf})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
@@ -362,6 +365,32 @@ class CitationTests(CheckerTestCase):
         bad = ["[run.sh:cleanup]", "[run.sh:config]", "[run.sh:pose]", "[run.sh:$1]", "[run.sh:obsolete_fn]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_shell_comments_end_at_a_hash_outside_quotes_on_the_same_line(self):
+        sh = ("echo 'requires # feature-name'\n"
+              'echo "tag # double-quoted" # comment-one\n'
+              "echo it\\'s # comment-two\n"
+              "echo don't\n# comment-three\n"
+              'echo "it\'s" # comment-four\n'
+              "echo x # 'quoted in a comment' # comment-five\n")
+        ok = ["[run.sh:feature-name]", "[run.sh:double-quoted]"]
+        bad = [f"[run.sh:comment-{n}]" for n in ("one", "two", "three", "four", "five")]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_javascript_expressions_after_a_dangling_operator_are_not_declarations(self):
+        js = ("const viaEquals =\n  function equalsNamed() {};\nconst viaClass =\n  class ClassNamed {};\n"
+              "register(\n  function argNamed() {},\n  function listNamed() {},\n);\n"
+              "const either = a ||\n  function orNamed() {};\nconst arrow = () =>\n  function arrowNamed() {};\n"
+              "const pick = ok ?\n  function thenNamed() {} :\n  function elseNamed() {};\n"
+              "function declared() {}\nconst plain = 'text'\nfunction afterString() {}\n"
+              "export default\nfunction defaulted() {}\n")
+        ok = ["viaEquals", "viaClass", "either", "arrow", "pick", "declared", "plain", "afterString", "defaulted"]
+        bad = ["equalsNamed", "ClassNamed", "argNamed", "listNamed", "orNamed", "arrowNamed", "thenNamed",
+               "elseNamed"]
+        result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n",
+                                   **{"pkg/flow.js": js})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
 
     def test_python_js_and_unit_citations(self):
         files = {
@@ -392,6 +421,15 @@ class CitationTests(CheckerTestCase):
                                        ["[internal/sim/run.go:Run]", "[../../../run.go]", "[gone.go]",
                                         "[escape.py:CheckerTestCase]"]])
         self.assertIn("cmd/dst/README.md:1 -> [internal/sim/run.go:Run]", result.stdout)
+
+    def test_cited_files_must_be_tracked_even_through_a_symlink(self):
+        source = "package p\n\nfunc Run() {}\n"
+        result = self.run_checker(
+            "", files={"pkg/README.md": "[new.go:Run] [new.go] [link.go:Run] [kept.go:Run]\n", "pkg/kept.go": source},
+            symlinks={"pkg/link.go": "new.go"}, untracked={"pkg/new.go": source})
+        self.assert_failures(result, *[("MISSING CITED FILE", c) for c in
+                                       ["[new.go:Run]", "[new.go]", "[link.go:Run]"]])
+        self.assertEqual(result.stdout.count(" (not tracked by git)\n"), 3, result.stdout)
 
     def test_malformed_and_unsupported_citations_fail_with_their_kind(self):
         result = self.check_readme(
@@ -429,16 +467,32 @@ class FileSelectionTests(CheckerTestCase):
         self.assertEqual(result.stdout, "BROKEN ANCHOR .agents/skill/features/README.md:1 -> "
                                         "../SKILL.md#gone\nbroken links: 1\n")
 
-    def test_only_tracked_markdown_outside_vendor_is_read(self):
+    def test_untracked_markdown_is_read_unless_ignored_or_vendored(self):
         broken = "[Gone](gone.md)\n"
         result = self.run_checker(
             "",
-            files={"vendor/mod/README.md": broken, "notes.md": broken, "docs/old.md": broken},
-            untracked={"internal/new/README.md": broken},
+            files={"vendor/mod/README.md": broken, "notes.md": broken, "docs/old.md": broken, ".gitignore": "ignored/\n"},
+            untracked={"internal/new/README.md": broken, "docs/new.md": broken, "ignored/README.md": broken,
+                       "vendor/new/README.md": broken},
             deleted=["docs/old.md"],
         )
-        self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "BROKEN FILE docs/new.md:1 -> gone.md\n"
+                                        "BROKEN FILE internal/new/README.md:1 -> gone.md\nbroken links: 2\n")
+        self.assertEqual(result.returncode, 1)
+
+    def test_links_resolve_only_to_tracked_files_and_directories(self):
+        readme = ("[Dir](docs/) [Root](./) [Tracked](docs/old.md) [Self](#top) [Fragment](docs/guide.md#guide)\n"
+                  "[New file](docs/new.md) [New dir](fresh/) [New with fragment](docs/new.md#x) [Gone](docs/gone.md)\n")
+        result = self.run_checker(
+            "# Top\n" + readme, docs={"old.md": "", "gone.md": "", "guide.md": "# Guide\n"},
+            untracked={"docs/new.md": "# New\n", "fresh/file.txt": ""}, deleted=["docs/gone.md"])
+        untracked = "BROKEN FILE (not tracked by git) README.md:3 -> "
+        self.assertEqual(result.stdout, f"{untracked}docs/new.md\n{untracked}fresh/\n{untracked}docs/new.md\n"
+                                        "BROKEN FILE README.md:3 -> docs/gone.md\nbroken links: 4\n")
+
+    def test_an_untracked_readme_can_link_to_itself(self):
+        result = self.run_checker("", untracked={"pkg/README.md": "# Top\n[Self](#top) [Missing](#absent)\n"})
+        self.assertEqual(result.stdout, "BROKEN ANCHOR pkg/README.md:2 -> #absent\nbroken links: 1\n")
 
     def test_outside_a_git_checkout_exits_2_without_checking(self):
         result = self.run_checker("[Gone](gone.md)\n", git=False)
