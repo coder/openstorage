@@ -29,9 +29,12 @@ import (
 // apart for one failed read (issue #566).
 
 const (
-	stallTick       = 5 * time.Millisecond  // heartbeat period
-	stallGap        = 20 * time.Millisecond // two ticks this far apart mean the process was frozen
-	maxReadFailures = 256                   // failed reads kept for classification; the rest count as unexplained
+	stallTick = 5 * time.Millisecond // heartbeat period
+	// stallGap is the gap between two ticks that counts as a freeze. A busy
+	// host delays the heartbeat by 20 to 80 ms without freezing the process,
+	// and a read that Floci holds must not look frozen because of that.
+	stallGap        = 100 * time.Millisecond
+	maxReadFailures = 256 // failed reads kept for classification; the rest count as unexplained
 )
 
 // stallSpan is a time during which the test process ran nothing.
@@ -172,6 +175,25 @@ func TestExplainedByStall(t *testing.T) {
 				t.Fatalf("explainedByStall = %t, want %t (elapsed %s, stalled %s)", got, tc.want, f.elapsed(), f.stalledFor(tc.spans))
 			}
 		})
+	}
+}
+
+// TestStallGapIgnoresHostJitter: the delays a busy host gives the heartbeat
+// are not freezes, and a stop of the whole process is.
+func TestStallGapIgnoresHostJitter(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	tr := &stallTracker{last: t0, minGap: stallGap}
+	now := t0
+	for _, step := range []time.Duration{5, 25, 70, 40, 80, 5, 60, 99} {
+		now = now.Add(step * time.Millisecond)
+		tr.tick(now)
+	}
+	if len(tr.spans) != 0 {
+		t.Fatalf("host jitter recorded as freezes: %v", tr.spans)
+	}
+	tr.tick(now.Add(2500 * time.Millisecond))
+	if len(tr.spans) != 1 || longestStall(tr.spans) != 2500*time.Millisecond {
+		t.Fatalf("a 2.5 s stop recorded as %v", tr.spans)
 	}
 }
 
