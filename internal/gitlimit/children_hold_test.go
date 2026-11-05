@@ -1,13 +1,10 @@
-//go:build linux
+//go:build unix
 
 package gitlimit
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
-	"fmt"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -17,38 +14,24 @@ import (
 	"time"
 )
 
-// procState returns the state letter of process pid from /proc/<pid>/stat
-// (the field after the parenthesized name), or "" when the process is gone.
-// A zombie shows as "Z": the PID is still taken.
-func procState(pid int) string {
-	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		return ""
-	}
-	end := bytes.LastIndexByte(data, ')')
-	if end < 0 || end+2 >= len(data) {
-		panic(fmt.Sprintf("unparsable /proc/%d/stat: %q", pid, data))
-	}
-	return string(data[end+2])
-}
-
-// groupSignals records every signal the registry sends to a group, with the
-// state of the group's leader at that moment.
+// groupSignals records every signal the registry sends to a group, and
+// whether the group's leader still existed (running or a zombie) at that
+// moment: a reaped leader gives its PID back to the kernel.
 type groupSignals struct {
 	mu   sync.Mutex
 	sent []sentSignal
 }
 
 type sentSignal struct {
-	pgid        int
-	sig         syscall.Signal
-	leaderState string
+	pgid         int
+	sig          syscall.Signal
+	leaderExists bool
 }
 
 func (r *groupSignals) send(pgid int, sig syscall.Signal) error {
-	state := procState(pgid)
+	exists := syscall.Kill(pgid, 0) == nil
 	r.mu.Lock()
-	r.sent = append(r.sent, sentSignal{pgid, sig, state})
+	r.sent = append(r.sent, sentSignal{pgid, sig, exists})
 	r.mu.Unlock()
 	return syscall.Kill(-pgid, sig)
 }
@@ -60,6 +43,9 @@ func (r *groupSignals) send(pgid int, sig syscall.Signal) error {
 // holding its PID, until stop has sent SIGKILL, and that SIGKILL still
 // ends the member the leader left behind.
 func TestStopSignalsOnlyGroupsWithAnUnreapedLeader(t *testing.T) {
+	if !leaderHoldSupported() {
+		t.Skip("this platform cannot wait for an exit without reaping")
+	}
 	var rec groupSignals
 	g := registry{signalGroup: rec.send}
 	// The leader dies on SIGTERM; its background child ignores it (the
@@ -98,8 +84,8 @@ func TestStopSignalsOnlyGroupsWithAnUnreapedLeader(t *testing.T) {
 	if len(rec.sent) != 2 || rec.sent[0].sig != syscall.SIGTERM || rec.sent[1].sig != syscall.SIGKILL {
 		t.Fatalf("signals = %+v, want SIGTERM then SIGKILL to group %d", rec.sent, leader)
 	}
-	if got := rec.sent[1].leaderState; got != "Z" {
-		t.Fatalf("leader state at the final SIGKILL = %q, want %q (exited, not reaped)", got, "Z")
+	if !rec.sent[1].leaderExists {
+		t.Fatalf("the leader was reaped before the final SIGKILL, want it exited and not reaped")
 	}
 	for deadline := time.Now().Add(5 * time.Second); !errors.Is(syscall.Kill(orphan, 0), syscall.ESRCH); time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
@@ -109,8 +95,11 @@ func TestStopSignalsOnlyGroupsWithAnUnreapedLeader(t *testing.T) {
 }
 
 // TestStopNeverSignalsAReapedLeader runs short children against stops: no
-// signal may go to a group whose leader is already gone from /proc.
+// signal may go to a group whose leader is already reaped.
 func TestStopNeverSignalsAReapedLeader(t *testing.T) {
+	if !leaderHoldSupported() {
+		t.Skip("this platform reaps a leader before it removes the group")
+	}
 	var rec groupSignals
 	g := registry{signalGroup: rec.send}
 	var wg sync.WaitGroup
@@ -136,7 +125,7 @@ func TestStopNeverSignalsAReapedLeader(t *testing.T) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	for _, s := range rec.sent {
-		if s.leaderState == "" {
+		if !s.leaderExists {
 			t.Fatalf("%v sent to group %d whose leader was already reaped", s.sig, s.pgid)
 		}
 	}

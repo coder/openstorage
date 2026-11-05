@@ -4,6 +4,10 @@ package gitlimit
 
 import "golang.org/x/sys/unix"
 
+// leaderHoldSupported reports whether awaitExit can wait for a child's exit
+// without reaping it. Linux always can.
+func leaderHoldSupported() bool { return true }
+
 // awaitExit blocks until the child with the given PID has exited, without
 // reaping it, and reports true. The zombie keeps the PID from reuse until
 // the caller reaps it. A false return means the child is already gone.
