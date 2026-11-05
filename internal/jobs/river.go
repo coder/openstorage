@@ -473,10 +473,12 @@ func syncSnoozeDelay(up sync.Upstream) time.Duration {
 	return delay
 }
 
-// syncWorker executes one sync run. Run's error return is for logging only
-// (documented failure outcomes already emitted repo.sync.failed), so the
-// job always completes — through the gated transactional completion below,
-// which closes the uniqueness window for pull-upstream requests (issue #79).
+// syncWorker executes one sync run. Run's error return is mostly for
+// logging (documented failure outcomes already emitted repo.sync.failed);
+// only ErrShutdown and ErrRepoGone steer the job. Otherwise the job ends
+// through the gated transactional completion below, which closes the
+// uniqueness window for pull-upstream requests (issue #79) and snoozes
+// the job while a request or a held claim has no coverage.
 type syncWorker struct {
 	river.WorkerDefaults[syncArgs]
 	run       SyncRunner
@@ -508,9 +510,10 @@ type syncWorker struct {
 //
 // The RunCount half of the gate keeps successor chains bounded: a job that
 // never claimed (skip on ErrSyncInProgress) leaves the counters untouched
-// and schedules nothing — a skip implies the claim holder was live after
-// this job's pre-read, so the holder's own gated completion covers
-// concurrent requests. A run that FAILED before claiming is different: a
+// and schedules nothing of its own. If the claim it skipped is still held
+// at completion, the job snoozes until the claim can be stolen (see the
+// held-claim case below); a claim released by then had a counted run whose
+// gated completion covered concurrent requests. A run that FAILED before claiming is different: a
 // pending marker with no counted run and no claim holder has no coverage
 // at all, so completing would strand the accepted request — that case
 // SNOOZES the job to retry the whole run (which then claims and consumes

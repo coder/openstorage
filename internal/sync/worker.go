@@ -327,7 +327,9 @@ func (w *Worker) restoreLocal(ctx context.Context, job Job, holder, lane string,
 
 // Run executes one sync run for job. It returns an error for logging by the
 // queue; documented outcomes (detached, overlapping run, failed sync with an
-// emitted event) are not errors to the caller beyond that.
+// emitted event) are not errors to the caller beyond that. Two errors steer
+// River's sync job: ErrShutdown (keep the job) and ErrRepoGone (complete
+// it).
 func (w *Worker) Run(ctx context.Context, job Job) error {
 	w.assertReady()
 	assertf(job.Org != "" && job.RepoID != "", "Run: incomplete job %+v", job)

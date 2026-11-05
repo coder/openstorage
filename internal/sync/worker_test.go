@@ -481,7 +481,16 @@ func TestWorkerDeletedRepoOnRiverLane(t *testing.T) {
 	if !up.SyncPending || up.Syncing || len(f.rec.list()) != 0 {
 		t.Fatalf("deleted repo's run touched the lane: %+v, %d events", up, len(f.rec.list()))
 	}
+	// The local schedule keeps its silent return: its sweep has no job to
+	// complete. Run returns before it uses any lane method.
+	f.worker.Local = unusedLocalLanes{}
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_gone"}); err != nil {
+		t.Fatalf("local Run = %v, want nil", err)
+	}
 }
+
+// unusedLocalLanes is a LocalLanes whose methods must not be called.
+type unusedLocalLanes struct{ LocalLanes }
 
 // detachDuringFetch wraps the store so the detach re-check (GetUpstream
 // after the fetch) observes a row deleted mid-run.
