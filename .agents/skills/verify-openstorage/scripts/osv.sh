@@ -158,13 +158,13 @@ descendants_of() {
 # shellcheck disable=SC2016 # expands in the inner bash
 SECRET_SHIM='if [[ -n ${OSV_SECRET_DIR-} ]]; then
 	export AWS_SECRET_ACCESS_KEY=$(<"$OSV_SECRET_DIR/s3")
-	[[ -z ${OPENSTORAGE_PG_URL-} ]] || export OPENSTORAGE_PG_URL=${OPENSTORAGE_PG_URL/@PGSECRET@/$(<"$OSV_SECRET_DIR/pg")}
+	[[ -z ${OPENSTORAGE_PG_URL-} ]] || export OPENSTORAGE_PG_URL=${OPENSTORAGE_PG_URL/@PGSECRET@/"$(<"$OSV_SECRET_DIR/pg")"}
 	unset OSV_SECRET_DIR
 fi'
 
 # clean_argv [VAR=value...]: set CLEAN to an argv prefix that runs a command
-# with only PATH, a private HOME and TMPDIR, the given variables, and the store
-# secrets (see SECRET_SHIM). A caller's HOME would hand the child the caller's
+# with PATH, a private HOME and TMPDIR, the given variables, and the store
+# secrets (see SECRET_SHIM). The shim bash adds only PWD and SHLVL. A caller's HOME would hand the child the caller's
 # git and AWS config, and an inherited OPENSTORAGE_* URL would replace the
 # stores. Run a command as "${CLEAN[@]}" <command...>.
 clean_argv() {
