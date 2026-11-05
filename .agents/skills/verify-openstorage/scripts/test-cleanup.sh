@@ -137,13 +137,14 @@ want "no raw value left" test "$(raw_count "$EVID")" = 0
 case_end
 
 # --- other refusals: hard link, directory, FIFO, symlinked source
-case_begin "hard link at evidence/serve.stderr.log is refused"
+case_begin "hard link at evidence/serve.stderr.log is refused, copy and redaction"
 mkrun hardlink
-new_victim "$T/victim-hl"
+printf '%s %s\n' "$VICTIM_TEXT" "$TOK" >"$T/victim-hl"
 ln "$T/victim-hl" "$EVID/serve.stderr.log"
 osv cleanup "$RUN"
 want "exit 1" rc_is 1
-want "victim unchanged" victim_ok "$T/victim-hl"
+want "victim keeps its bytes, token included" test "$(<"$T/victim-hl")" = "$VICTIM_TEXT $TOK"
+want "redaction names the hard link" out_has "more than one hard link"
 case_end
 
 case_begin "directory at evidence/state.env is refused"
@@ -190,6 +191,20 @@ want "non-zero exit" test "$RC" != 0
 want "victim unchanged" victim_ok "$T/victim-log"
 case_end
 
+for cmd in api git; do
+	for kind in symlink hardlink; do
+		case_begin "$cmd refuses a $kind at evidence/log.tsv before it does anything"
+		mkrun "logpre-$cmd-$kind"
+		new_victim "$T/victim-logpre-$cmd-$kind"
+		if [[ $kind == symlink ]]; then ln -s "$T/victim-logpre-$cmd-$kind" "$EVID/log.tsv"; else ln "$T/victim-logpre-$cmd-$kind" "$EVID/log.tsv"; fi
+		if [[ $cmd == api ]]; then osv api "$RUN" lbl GET /api/v1/repos; else osv git "$RUN" lbl -- status; fi
+		want "non-zero exit" test "$RC" != 0
+		want "victim unchanged" victim_ok "$T/victim-logpre-$cmd-$kind"
+		want "no label file created (the command did not start)" test "$(find "$EVID" -type f -name 'lbl.*' | wc -l | tr -d ' ')" = 0
+		case_end
+	done
+done
+
 case_begin "stop refuses a symlink at evidence/doctor.txt"
 mkrun docsym
 new_victim "$T/victim-doc"
@@ -215,7 +230,7 @@ for cmd in api git eq; do
 		osv "${args[@]}"
 		want "non-zero exit" test "$RC" != 0
 		if [[ $kind == symlink ]]; then want "victim unchanged" victim_ok "$victim"; else want "no file created at the link target" test ! -e "$victim"; fi
-		want "no other label file left behind" test "$(find "$EVID" -type f | wc -l | tr -d ' ')" = 0
+		want "no other label file left behind" test "$(find "$EVID" -type f ! -name log.tsv | wc -l | tr -d ' ')" = 0
 		case_end
 	done
 done

@@ -155,6 +155,9 @@ load_state() {
 
 check_label() {
 	[[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || die "label '$1' must match [A-Za-z0-9._-]+ (it names evidence files)"
+	# Refuse an unusable log.tsv now: record runs after the request or the git
+	# command, and a failure there would hide an operation that already happened.
+	evidence_put - "$EVID/log.tsv" -a </dev/null
 	if [[ -s $EVID/log.tsv ]] && cut -f2 "$EVID/log.tsv" | grep -qxF -- "$1"; then
 		die "label '$1' is already used in $EVID/log.tsv: give every api, git, and eq call its own label"
 	fi
@@ -722,11 +725,12 @@ PYEOF
 }
 
 # save_redacted_evidence: copy the serve logs, the staged container logs,
-# state.env, and the token list into the evidence, then replace every token and secret value in every regular
-# file there. A copy that evidence_put refuses and a path that the redaction
-# cannot read or write do not stop the rest: everything else is copied and
-# redacted first, then the function returns 1 (EVIDENCE_FAILED), and cleanup
-# keeps work/ so that a rerun can finish.
+# state.env, and the token list into the evidence, then replace every token
+# and secret value in every regular file there. A copy that evidence_put
+# refuses and a path that the redaction cannot read or write do not stop the
+# rest: everything else is copied and redacted first, then the function
+# returns 1 (EVIDENCE_FAILED), and cleanup keeps work/ so that a rerun can
+# finish.
 save_redacted_evidence() {
 	[[ -d $WORK ]] || return 0
 	local pair src t desc lines=''
@@ -752,7 +756,7 @@ save_redacted_evidence() {
 	# failed call's stderr that cmd_api keeps.
 	# Fleet runs also replace their store secrets with <secret:name>.
 	python3 - "$WORK/tokens" "$EVID" "$WORK/secrets" <<'PYEOF' || EVIDENCE_FAILED=1
-import base64, os, stat, sys
+import base64, errno, os, stat, sys
 tokdir, evid, secdir = sys.argv[1:]
 bad = 0
 def note(path, e):
@@ -761,6 +765,13 @@ def note(path, e):
     print("osv: cannot redact %s: %s" % (path, getattr(e, "strerror", None) or e), file=sys.stderr)
 def nofollow(path, flags):
     return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+def regular_single(fd):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EINVAL, "it is not a regular file")
+    if st.st_nlink != 1:
+        raise OSError(errno.EMLINK, "it has more than one hard link, so a write would change the other name too")
+    return st.st_dev, st.st_ino
 toks = {}
 for d, is_token in ((tokdir, True), (secdir, False)):
     try:
@@ -791,12 +802,16 @@ for d, _, names in os.walk(evid, onerror=lambda e: note(e.filename, e)):
             if not stat.S_ISREG(os.lstat(p).st_mode):
                 continue
             with open(p, "rb", opener=nofollow) as f:
+                ident = regular_single(f.fileno())
                 b = f.read()
             r = b
             for v, s in toks.items():
                 r = r.replace(v, s)
             if r != b:
-                with open(p, "wb", opener=nofollow) as f:
+                with open(nofollow(p, os.O_WRONLY), "wb", closefd=True) as f:
+                    if regular_single(f.fileno()) != ident:
+                        raise OSError(errno.EBUSY, "it changed while it was redacted")
+                    f.truncate(0)
                     f.write(r)
         except OSError as e:
             note(p, e)
