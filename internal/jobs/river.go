@@ -655,15 +655,15 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 	rctx, done := withShutdown(ctx, w.runs)
 	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Retry: job.Args.Retry})
 	done()
+	if errors.Is(runErr, sync.ErrRepoGone) {
+		return nil // nothing left to push, whatever claim the row still shows
+	}
 	if runErr != nil {
 		w.logger.Warn("push run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
 	}
 	if errors.Is(runErr, sync.ErrShutdown) {
 		return shutdownSnooze(ctx, w.upstreams, job.Args.RepoID, pushSnoozeDelay, w.logger)
-	}
-	if errors.Is(runErr, sync.ErrRepoGone) {
-		return nil // nothing left to push, whatever claim the row still shows
 	}
 
 	assertf(w.pool != nil, "pushWorker: pool not wired")
@@ -695,10 +695,11 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 	case up.PushSyncing:
 		// A push claim is still held, and it holds the request it
 		// consumed: completing would lose it. Push jobs are unique by
-		// repo, so the holder is a run of this job whose finish or restore
-		// write failed or that died, or a run of an older job that an
-		// older binary completed. The re-run after the lease steals the
-		// claim and its force level.
+		// repo, so the holder is a run of this job that died, whose claim
+		// committed but reported an error, or whose finish or restore
+		// write failed, or a run of an older job that an older binary
+		// completed. The re-run after the lease steals the claim and its
+		// force level.
 		delay := pushSnoozeDelay(up)
 		w.logger.Warn("push: claim still held at completion; snoozing until it can be stolen",
 			"repo", job.Args.RepoID, "delay", delay, "err", runErr)
