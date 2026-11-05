@@ -644,8 +644,41 @@ func TestSweepSchedule_RunsPurge(t *testing.T) {
 	sweeper := f.purgeAwareSweeper()
 	purger := NewRepoPurger(sweeper, f.store.(RepoPurgeRegistry), f.meta.(RepoPurgeMeta), time.Hour, slog.New(slog.DiscardHandler))
 	schedule := &SweepSchedule{Sweeper: sweeper, Interval: time.Hour, Purger: purger}
-	if err := schedule.runOnce(context.Background()); err != nil {
+	if err := schedule.runOnce(context.Background(), 0, 0); err != nil {
 		t.Fatalf("runOnce: %v", err)
+	}
+	f.assertPurged(repo.RepoID)
+}
+
+// listUntilDone is a blob store whose listings never finish: they return when
+// their context ends, like a sweep that needs more than its budget.
+type listUntilDone struct {
+	blob.BlobStore
+}
+
+func (listUntilDone) ListPages(ctx context.Context, _ string, _ int, _ func([]blob.ListedObject) error) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A sweep that uses its whole budget must still leave the purge its own: the
+// purge ran on the sweep's expired context before, so soft-deleted
+// repositories were never reclaimed on a fleet whose sweep outgrew its pass.
+func TestSweepSchedule_PurgeKeepsItsOwnBudgetWhenTheSweepUsesItsWhole(t *testing.T) {
+	f := newPurgeFixture(t)
+	repo := f.seedRepo("https://example.com/starved.git")
+	f.metaNow = func() time.Time { return time.Now().Add(-3 * time.Hour) }
+	f.softDelete(repo.URL)
+	f.metaNow = time.Now
+
+	stuck := NewSweeper(listUntilDone{f.blobs}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged}, slog.New(slog.DiscardHandler))
+	purger := NewRepoPurger(f.purgeAwareSweeper(), f.store.(RepoPurgeRegistry), f.meta.(RepoPurgeMeta), time.Hour, slog.New(slog.DiscardHandler))
+	schedule := &SweepSchedule{Sweeper: stuck, Interval: time.Hour, Purger: purger}
+
+	err := schedule.runOnce(context.Background(), 50*time.Millisecond, time.Minute)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runOnce = %v, want the sweep's deadline error", err)
 	}
 	f.assertPurged(repo.RepoID)
 }

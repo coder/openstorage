@@ -657,6 +657,11 @@ Background jobs run through a queue seam: durable [River](https://riverqueue.com
 Postgres, in-process in local mode. For procedures and run reports, see
 [Operate the storage lifecycle](../how-to/storage-lifecycle-and-sweeping.md).
 
+On PostgreSQL, one sweep job gives the sweep 1 h 45 min. The repository purge
+([`OPENSTORAGE_REPO_RETENTION`](#openstorage_repo_retention)) then gets its own 15 min, so
+a sweep that uses all of its time cannot starve the purge. A purge that is cut short
+continues on the next pass. Local mode sets no deadline on either.
+
 ### `OPENSTORAGE_SWEEP_INTERVAL`
 
 Interval between orphan sweeps. The sweeper diffs the blob store's `packs/` and `lfs/`

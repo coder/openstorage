@@ -1711,11 +1711,30 @@ type SweepSchedule struct {
 // runOnce executes one scheduled tick: the sweep, then — even when the
 // sweep errored, so a noisy orphan backlog cannot starve reclamation — the
 // retention purge pass. Errors are joined for the caller's reporting.
-func (s *SweepSchedule) runOnce(ctx context.Context) error {
-	_, sweepErr := s.Sweeper.Sweep(ctx)
+//
+// A positive sweepBudget ends the sweep that long after the start. A
+// positive purgeBudget gives the purge its own deadline, counted from when
+// the purge starts and derived from ctx, not from the sweep's: a sweep that
+// uses its whole budget no longer leaves the purge an expired context. Zero
+// leaves that phase on ctx alone, as in local mode, which has no deadline.
+func (s *SweepSchedule) runOnce(ctx context.Context, sweepBudget, purgeBudget time.Duration) error {
+	assertf(sweepBudget >= 0 && purgeBudget >= 0, "runOnce: negative budget (sweep %v, purge %v)", sweepBudget, purgeBudget)
+	sweepCtx := ctx
+	if sweepBudget > 0 {
+		var cancel context.CancelFunc
+		sweepCtx, cancel = context.WithTimeout(ctx, sweepBudget)
+		defer cancel()
+	}
+	_, sweepErr := s.Sweeper.Sweep(sweepCtx)
 	var purgeErr error
 	if s.Purger != nil {
-		_, purgeErr = s.Purger.PurgeExpired(ctx)
+		purgeCtx := ctx
+		if purgeBudget > 0 {
+			var cancel context.CancelFunc
+			purgeCtx, cancel = context.WithTimeout(ctx, purgeBudget)
+			defer cancel()
+		}
+		_, purgeErr = s.Purger.PurgeExpired(purgeCtx)
 	}
 	return errors.Join(sweepErr, purgeErr)
 }
@@ -1734,7 +1753,7 @@ func StartSweepTicker(schedule *SweepSchedule) (stop func()) {
 		ticker := time.NewTicker(schedule.Interval)
 		defer ticker.Stop()
 		for {
-			if err := schedule.runOnce(ctx); err != nil && ctx.Err() == nil {
+			if err := schedule.runOnce(ctx, 0, 0); err != nil && ctx.Err() == nil {
 				schedule.Sweeper.logger.Error("scheduled sweep failed", "err", err)
 			}
 			select {
