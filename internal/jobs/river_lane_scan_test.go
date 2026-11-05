@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	stdsync "sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -487,4 +488,64 @@ func TestRiverLaneScanRunsStrandedLanes(t *testing.T) {
 	}
 	closed.StartLaneScan("org", time.Hour, time.Hour)
 	stops("Close", closed, closed.Close)
+}
+
+// scanLogs records the lane scan's outcome log records in order.
+type scanLogs struct {
+	mu   stdsync.Mutex
+	recs []slog.Record
+}
+
+func (l *scanLogs) Enabled(context.Context, slog.Level) bool { return true }
+func (l *scanLogs) WithAttrs([]slog.Attr) slog.Handler       { return l }
+func (l *scanLogs) WithGroup(string) slog.Handler            { return l }
+func (l *scanLogs) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "lane scan: pass ran out of time" || r.Message == "lane scan failed" {
+		l.mu.Lock()
+		l.recs = append(l.recs, r.Clone())
+		l.mu.Unlock()
+	}
+	return nil
+}
+
+func (l *scanLogs) levels() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, r := range l.recs {
+		out = append(out, r.Level.String()+" "+r.Message)
+	}
+	return out
+}
+
+// TestRiverLaneScanLogsOutOfTimeAtInfo: a pass that handled lanes until
+// the pass timeout logs at Info, and a pass that handled none, as behind a
+// lane blocked on a locked job row, logs a warning.
+func TestRiverLaneScanLogsOutOfTimeAtInfo(t *testing.T) {
+	ctx := context.Background()
+	env := newLaneScanEnv(t, ctx)
+	_, ups := sync.MetaStores(env.ms)
+	noRun := func(context.Context, sync.Job) error { return nil }
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	logs := &scanLogs{}
+	q, err := NewRiver(ctx, env.pgURL, deliverer, noRun, noRun, ups, nil, nil, nil, nil, slog.New(logs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	prev := laneScanTimeout
+	laneScanTimeout = 2 * time.Second // below laneRequeueTimeout: the blocked lane ends each pass
+	t.Cleanup(func() { laneScanTimeout = prev })
+	_, b, _ := env.laneTrio(t, ctx)
+	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: b}); err != nil {
+		t.Fatal(err)
+	}
+	defer env.lockJob(t, ctx, b)()
+
+	q.StartLaneScan("org", 0, 100*time.Millisecond)
+	waitFor(t, "two pass outcomes", func() bool { return len(logs.levels()) >= 2 })
+	got := logs.levels()
+	if got[0] != "INFO lane scan: pass ran out of time" || got[1] != "WARN lane scan failed" {
+		t.Fatalf("pass outcome logs = %q; want Info for the pass that handled a, then a warning for the pass stuck at b", got)
+	}
 }
