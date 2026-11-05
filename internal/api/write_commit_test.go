@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -27,6 +28,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -997,6 +999,18 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 			// tree may hold is never in the base, so the patch does not apply.
 			{"rename from a .git path", "diff --git a/.git/x b/c.txt\nsimilarity index 100%\nrename from .git/x\nrename to c.txt\n",
 				http.StatusConflict, "does not exist in index"},
+			// Only git refuses these after --numstat parsed them (#613): its
+			// own path rules (core.protectNTFS is on by default) and a mode
+			// line that changes nothing git can record. No base tree helps.
+			{".git. path", newFile(".git./x"), http.StatusBadRequest, "invalid path '.git./x'"},
+			{"git~1 path", newFile("git~1/x"), http.StatusBadRequest, "invalid path 'git~1/x'"},
+			{"nested .git. path", newFile("d/.git./x"), http.StatusBadRequest, "invalid path 'd/.git./x'"},
+			{".gitmodules symlink", "diff --git a/.gitmodules b/.gitmodules\nnew file mode 120000\n--- /dev/null\n+++ b/.gitmodules\n@@ -0,0 +1 @@\n+a.txt\n\\ No newline at end of file\n",
+				http.StatusBadRequest, "invalid path '.gitmodules'"},
+			{"unusable new mode", "diff --git a/a.txt b/a.txt\nold mode 100644\nnew mode 100664\n", http.StatusBadRequest, "patch with only garbage"},
+			{"unusable new mode alone", "diff --git a/a.txt b/a.txt\nnew mode 100664\n", http.StatusBadRequest, "patch with only garbage"},
+			{"submodule without a commit", "diff --git a/sub b/sub\nnew file mode 160000\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit zzz\n",
+				http.StatusBadRequest, "corrupt patch for submodule sub"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				before := wmRefsSnapshot(t, e, repo.RepoID)
@@ -1022,7 +1036,124 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 		if env := wctRequireOK(t, resp, body); env.Commit.BlobCount == nil || *env.Commit.BlobCount != 1 {
 			t.Fatalf("rename blob_count = %v, want 1", env.Commit.BlobCount)
 		}
+
+		// Controls for #613: git takes a regular .gitmodules and a mode line
+		// that changes the mode, so neither is a blanket 400.
+		for name, patch := range map[string]string{
+			".gitmodules file": newFile(".gitmodules"),
+			"mode change":      "diff --git a/b.txt b/b.txt\nold mode 100644\nnew mode 100755\n",
+		} {
+			resp, body = wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(wctLines(t, wctMeta("main", name, nil, nil), wctDiffChunk([]byte(patch), true))))
+			wctRequireOK(t, resp, body)
+		}
 	})
+}
+
+// TestDiffCommitGitFaultIs500 (#613): git apply exits 128 for a failure of
+// its own index just as it does for a patch it refuses on sight, so only
+// its message tells them apart. A locked index is the server's fault: 500
+// with the generic body, never git's stderr (which names the scratch
+// directory), and no ref moves.
+func TestDiffCommitGitFaultIs500(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The wrapper locks the scratch index just before `git apply --cached`
+	// runs, which makes git's own write fail the way a held lock does.
+	bin := t.TempDir()
+	wrapper := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = apply ]; then for a in \"$@\"; do [ \"$a\" = --cached ] && : > \"$GIT_INDEX_FILE.lock\"; done; fi\nexec %q \"$@\"\n", realGit)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		repo, writeTok, _ := wctRepo(t, e)
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "base", []map[string]any{{"path": "a.txt", "content_id": "id-a", "operation": "upsert"}}, nil),
+			wctChunk("id-a", []byte("one\n"), true),
+		)))
+		wctRequireOK(t, resp, body)
+
+		before := wmRefsSnapshot(t, e, repo.RepoID)
+		patch := "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+		resp, body = wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok,
+			bytes.NewReader(wctLines(t, wctMeta("main", "d", nil, nil), wctDiffChunk([]byte(patch), true))))
+		wctRequireFail(t, resp, body, http.StatusInternalServerError, statusForHTTP(http.StatusInternalServerError))
+		if !bytes.Contains(body, []byte(internalErrorMsg)) {
+			t.Fatalf("body %s does not carry the generic internal error", body)
+		}
+		for _, leak := range []string{"index.lock", "openstorage-write-", os.TempDir(), "git apply", "fatal"} {
+			if bytes.Contains(body, []byte(leak)) {
+				t.Fatalf("body %s leaks %q from git's stderr", body, leak)
+			}
+		}
+		if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
+			t.Fatalf("refs moved: %v -> %v", before, after)
+		}
+	})
+}
+
+// TestApplyPatchRunsGitInEnglish: the 400 and 500 split reads git's English
+// messages, so git runs under LC_ALL=C whatever locale the server has.
+func TestApplyPatchRunsGitInEnglish(t *testing.T) {
+	bin := t.TempDir()
+	wrapper := "#!/bin/sh\necho \"locale=$LC_ALL\" >&2\nexit 128\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	sc, err := wcNewScratch(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.close()
+	patch := filepath.Join(sc.dir, "patch.diff")
+	if err := os.WriteFile(patch, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = sc.applyPatch(context.Background(), patch, "--cached")
+	var rej *wcApplyRejection
+	if !errors.As(err, &rej) || rej.exit != 128 || rej.msg != "locale=C" {
+		t.Fatalf("err = %v, want exit 128 with message %q", err, "locale=C")
+	}
+}
+
+// TestApplyRejectionStatus: which statuses git apply's exit codes and
+// messages map to. The messages are git 2.55's; TestDiffCommitApplyFailures
+// pins them against the git that runs the tests.
+func TestApplyRejectionStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exit int
+		msg  string
+		want int
+	}{
+		{"unsafe name", 128, "error: invalid path '.git./x'", http.StatusBadRequest},
+		{"unusable mode", 128, "error: patch with only garbage at <stdin>:4", http.StatusBadRequest},
+		{"submodule without a commit", 128, "error: corrupt patch for submodule sub", http.StatusBadRequest},
+		{"after another line", 128, "warning: noise\nerror: invalid path 'git~1/x'", http.StatusBadRequest},
+		{"file and directory", 128, "error: 'd' appears as both a file and as a directory\nerror: unable to add cache entry for d", http.StatusConflict},
+		{"does not apply", 1, "error: patch failed: f:1\nerror: f: patch does not apply", http.StatusConflict},
+		{"status 1 is never a payload error", 1, "error: invalid path 'a'", http.StatusConflict},
+		{"locked index", 128, "fatal: Unable to create '/tmp/openstorage-write-1/index.lock': File exists.", http.StatusInternalServerError},
+		{"unreadable index", 128, "error: unable to read index file", http.StatusInternalServerError},
+		{"unwritable index", 128, "error: Unable to write new index file", http.StatusInternalServerError},
+		{"no room for the blob", 128, "error: unable to create backing store for newly created file a", http.StatusInternalServerError},
+		{"no message", 128, "", http.StatusInternalServerError},
+		{"not at a line start", 128, "fatal: x error: invalid path 'a'", http.StatusInternalServerError},
+		{"a line that quotes the message", 128, "fatal: Unable to create '/tmp/x'\nhint: error: invalid path", http.StatusInternalServerError},
+		{"other status", 129, "error: invalid path 'a'", http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (&wcApplyRejection{exit: tc.exit, msg: tc.msg}).status(); got != tc.want {
+				t.Fatalf("status(%d, %q) = %d, want %d", tc.exit, tc.msg, got, tc.want)
+			}
+		})
+	}
 }
 
 // TestCommitWriteNoChanges (#595, spec 2026-10-28): commit-pack and

@@ -732,38 +732,94 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 // wcMaxApplyMsgBytes caps the git apply message a client sees.
 const wcMaxApplyMsgBytes = 4096
 
+// wcApplyRejection is git apply exiting with a status: git's stderr, cut
+// to wcMaxApplyMsgBytes, and the status. git exits 1 when the patch does
+// not apply to the tree and 128 for every "bad error": a patch it refuses
+// on sight, a patch that clashes with the tree while it writes the index,
+// and a failure of the index itself (unreadable, locked, no room to
+// write). Only git's message tells those apart.
+type wcApplyRejection struct {
+	exit int
+	msg  string
+}
+
+func (r *wcApplyRejection) Error() string {
+	return fmt.Sprintf("git apply exited with status %d: %s", r.exit, r.msg)
+}
+
+// The lines git apply 2.55 writes, in English (see applyPatch), for the
+// exit-128 failures that a patch causes and `--numstat` does not see. Each
+// names only the patch's own paths. Every other 128 is the server's.
+var (
+	// A patch that no base tree can make apply: a name that git's own path
+	// rules reject (`.git.`, `git~1`, a symlinked `.gitmodules`), a patch
+	// whose only change is a mode git reads as the old one, a submodule
+	// patch without a commit.
+	wcApplyPayloadLines = []string{"error: invalid path '", "error: patch with only garbage at ", "error: corrupt patch for submodule "}
+	// A file where the tree has a directory, or a directory where it has a
+	// file: the index refuses the entry.
+	wcApplyClashLine = "error: unable to add cache entry for "
+)
+
+// status is the HTTP status for the refusal: 409 for a patch that does not
+// fit the base tree, 400 for one that fits no tree, and 500 for the
+// server's own failure, whose stderr names scratch paths and stays in the
+// log.
+func (r *wcApplyRejection) status() int {
+	switch r.exit {
+	case 1:
+		return http.StatusConflict
+	case 128:
+	default:
+		return http.StatusInternalServerError
+	}
+	clash := false
+	for line := range strings.Lines(r.msg) {
+		for _, p := range wcApplyPayloadLines {
+			if strings.HasPrefix(line, p) {
+				return http.StatusBadRequest
+			}
+		}
+		clash = clash || strings.HasPrefix(line, wcApplyClashLine)
+	}
+	if clash {
+		return http.StatusConflict
+	}
+	return http.StatusInternalServerError
+}
+
 // applyPatch runs `git apply` on the spooled patch. The patch goes on
-// stdin, so git's messages name <stdin>, never the scratch path. When git
-// itself rejects the patch (it exits with a status), gitMsg is git's
-// stderr, cut to wcMaxApplyMsgBytes, and safe to show the client.
-// Any other failure (a canceled request, a git killed by a signal, a
-// server shutdown) leaves gitMsg empty and returns err.
-func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...string) (out, gitMsg string, err error) {
+// stdin, so git's messages name <stdin>, never the scratch path, and
+// LC_ALL=C keeps them in English for status. When git exits with a status
+// the error is a *wcApplyRejection, whose message is safe to show the
+// client only when status says 400 or 409. Any other failure (a canceled
+// request, a git killed by a signal, a server shutdown) is a plain error.
+func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...string) (out string, err error) {
 	f, err := os.Open(patchPath)
 	if err != nil {
-		return "", "", fmt.Errorf("open patch: %w", err)
+		return "", fmt.Errorf("open patch: %w", err)
 	}
 	defer f.Close()
-	cmd := sc.gitCmd(ctx, nil, append([]string{"apply"}, args...)...)
+	cmd := sc.gitCmd(ctx, []string{"LC_ALL=C"}, append([]string{"apply"}, args...)...)
 	cmd.Stdin = f
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	o, err := gitlimit.Output(cmd)
 	if err == nil {
-		return string(o), "", nil
+		return string(o), nil
 	}
 	var exit *exec.ExitError
 	if ctx.Err() != nil || !errors.As(err, &exit) || exit.ExitCode() < 0 {
-		return "", "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	gitMsg = strings.TrimSpace(stderr.String())
-	if len(gitMsg) > wcMaxApplyMsgBytes {
-		gitMsg = strings.ToValidUTF8(gitMsg[:wcMaxApplyMsgBytes], "") + " …"
+	msg := strings.TrimSpace(stderr.String())
+	if len(msg) > wcMaxApplyMsgBytes {
+		msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
 	}
-	if gitMsg == "" {
-		gitMsg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
+	if msg == "" {
+		msg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
 	}
-	return "", gitMsg, err
+	return "", &wcApplyRejection{exit: exit.ExitCode(), msg: msg}
 }
 
 // wcNumstatPaths parses `git apply --numstat -z`: one record per file,
@@ -1338,9 +1394,10 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 		// a 500 (#608). `git apply --numstat` parses without applying: a
 		// parse failure means the payload is not a patch (400, spec "the
 		// diff payload was invalid").
-		numstat, gitMsg, err := sc.applyPatch(r.Context(), patchPath, "--numstat", "-z")
-		if gitMsg != "" {
-			wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+gitMsg, md.TargetBranch, plan.oldSHA)
+		var rej *wcApplyRejection
+		numstat, err := sc.applyPatch(r.Context(), patchPath, "--numstat", "-z")
+		if errors.As(err, &rej) {
+			wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+rej.msg, md.TargetBranch, plan.oldSHA)
 			return
 		} else if err != nil {
 			s.wcInternal(w, r, "parse patch", err)
@@ -1359,13 +1416,19 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// Any other failure means the patch does not fit the base tree:
-		// 409 conflict, upstream's "the diff does not apply".
-		if _, gitMsg, err := sc.applyPatch(r.Context(), patchPath, "--cached", "--binary", "--whitespace=nowarn"); gitMsg != "" {
-			wcFail(w, http.StatusConflict, "conflict", "patch does not apply: "+gitMsg, md.TargetBranch, plan.oldSHA)
-			return
-		} else if err != nil {
-			s.wcInternal(w, r, "apply patch", err)
+		// git checks names and modes only here, so a patch that only git
+		// refuses is a 400 as well. A patch that does not fit the base tree
+		// is a 409 conflict, upstream's "the diff does not apply". Any other
+		// failure is the server's own git (a locked or full index): a 500.
+		if _, err := sc.applyPatch(r.Context(), patchPath, "--cached", "--binary", "--whitespace=nowarn"); err != nil {
+			switch {
+			case !errors.As(err, &rej), rej.status() == http.StatusInternalServerError:
+				s.wcInternal(w, r, "apply patch", err)
+			case rej.status() == http.StatusBadRequest:
+				wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+rej.msg, md.TargetBranch, plan.oldSHA)
+			default:
+				wcFail(w, http.StatusConflict, "conflict", "patch does not apply: "+rej.msg, md.TargetBranch, plan.oldSHA)
+			}
 			return
 		}
 		// blob_count: the SDK ack schema requires a number on diff-commit
