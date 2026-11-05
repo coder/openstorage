@@ -351,8 +351,8 @@ func (b *slowListBlob) ListPages(ctx context.Context, prefix string, pageSize in
 // Each case runs on synctest's fake clock: the stall and the freshness
 // window are fake time, and the real SQLite and file work between them
 // costs none, so host load cannot expire the retry's window. The private
-// TMPDIR keeps every slot free: a slot held elsewhere would burn the fake
-// window at once.
+// TMPDIR keeps the slots free: if other processes held all of them, the
+// slot wait would burn the fake window at once.
 func TestHookSelfListFloorRejectsSlowScans(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	old := hookFloorFreshness
