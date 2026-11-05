@@ -277,4 +277,29 @@ func TestRiverLaneScanRunsStrandedLanes(t *testing.T) {
 			return err == nil && up.PushPending == 0 && !up.PushSyncing
 		})
 	}
+
+	// DrainSyncRuns stops the scan, and so does Close of a River that never
+	// drained.
+	scanStops := func(what string, q *River) {
+		t.Helper()
+		stopped := make(chan struct{})
+		go func() {
+			q.scanning.Wait()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s left the lane scan running", what)
+		}
+	}
+	q.DrainSyncRuns(ctx, time.Second)
+	scanStops("DrainSyncRuns", q)
+	closed, err := NewRiver(ctx, env.pgURL, deliverer, noRun, push, ups, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.StartLaneScan("org", time.Hour, time.Hour)
+	closed.Close()
+	scanStops("Close", closed)
 }
