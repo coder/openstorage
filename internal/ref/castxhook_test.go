@@ -1,0 +1,67 @@
+package ref
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// TestPGCASTxHookCommitsWithSwap: a CASTxHook runs only for a CAS that
+// changed a row, its writes commit with the swap, and its error rolls the
+// swap back as a definitive failure that IdempotentCAS does not recover.
+func TestPGCASTxHookCommitsWithSwap(t *testing.T) {
+	s := pgTestStore(t)
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS cas_tx_hook_probe (repo text, sha text)`); err != nil {
+		t.Fatal(err)
+	}
+	repo := fmt.Sprintf("castxhook-%d", time.Now().UnixNano())
+	probes := func() int {
+		t.Helper()
+		var n int
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM cas_tx_hook_probe WHERE repo = $1`, repo).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	calls := 0
+	hookErr := error(nil)
+	hctx := WithCASTxHook(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		calls++
+		if _, err := tx.Exec(ctx, `INSERT INTO cas_tx_hook_probe VALUES ($1, 'x')`, repo); err != nil {
+			return err
+		}
+		return hookErr
+	})
+	a, b := testSHA(1), testSHA(2)
+
+	if won, _, err := s.CASRefGen(hctx, repo, "refs/heads/main", ZeroSHA, a); err != nil || !won {
+		t.Fatalf("create: won=%v err=%v", won, err)
+	}
+	if calls != 1 || probes() != 1 {
+		t.Fatalf("won create: hook calls=%d probe rows=%d, want 1 and 1", calls, probes())
+	}
+
+	if won, err := s.CASRef(hctx, repo, "refs/heads/main", b, a); err != nil || won {
+		t.Fatalf("stale update: won=%v err=%v", won, err)
+	}
+	if calls != 1 || probes() != 1 {
+		t.Fatalf("lost CAS ran the hook: calls=%d probe rows=%d", calls, probes())
+	}
+
+	hookErr = errors.New("intent write failed")
+	won, err := IdempotentCAS{RefStore: s}.CASRef(hctx, repo, "refs/heads/main", a, b)
+	if won || !errors.Is(err, hookErr) {
+		t.Fatalf("failing hook: won=%v err=%v, want the hook error", won, err)
+	}
+	if got, err := s.GetRef(ctx, repo, "refs/heads/main"); err != nil || got != a {
+		t.Fatalf("failing hook left main = %q (err %v), want %s", got, err, a)
+	}
+	if calls != 2 || probes() != 1 {
+		t.Fatalf("failing hook's write survived: calls=%d probe rows=%d", calls, probes())
+	}
+}

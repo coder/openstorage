@@ -881,6 +881,24 @@ func WithSyncClaimFence(ctx context.Context, repo, holder string) context.Contex
 	return context.WithValue(ctx, syncClaimFenceKey{}, syncClaimFence{repo: repo, holder: holder})
 }
 
+// casTxHookKey carries an optional CASTxHook to the PostgreSQL CAS through
+// the context, like the sync-claim fence above, so every decorator passes
+// it on untouched.
+type casTxHookKey struct{}
+
+// CASTxHook writes more rows inside a won PostgreSQL CAS's transaction.
+type CASTxHook func(ctx context.Context, tx pgx.Tx) error
+
+// WithCASTxHook makes every PostgreSQL CAS under the returned context that
+// changes a row run hook in its own transaction, after the swap statement
+// and before COMMIT, so hook's writes commit exactly when the swap does. A
+// hook error rolls the swap back, and the CAS fails with that error,
+// marked as never executed. The other backends ignore the hook.
+func WithCASTxHook(ctx context.Context, hook CASTxHook) context.Context {
+	assertf(hook != nil, "WithCASTxHook: nil hook")
+	return context.WithValue(ctx, casTxHookKey{}, hook)
+}
+
 // casFence extracts the sync-claim fence, verifying it targets this repo.
 func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 	f, ok := ctx.Value(syncClaimFenceKey{}).(syncClaimFence)
@@ -1016,6 +1034,12 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 	}
 	n := ct.RowsAffected()
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
+	if hook, ok := ctx.Value(casTxHookKey{}).(CASTxHook); ok && n == 1 {
+		// Before the generation row, which stays the last lock taken.
+		if herr := hook(ctx, tx); herr != nil {
+			return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, notExecuted(herr))
+		}
+	}
 	if wantGen && n == 1 {
 		// Exact attribution under the deferred bump trigger: the
 		// generation row is locked HERE (created first if virgin, the

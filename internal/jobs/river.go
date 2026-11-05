@@ -964,6 +964,22 @@ func (q *River) EnqueuePush(ctx context.Context, job sync.Job) error {
 	return err
 }
 
+// RecordForwardTx records a forward_on_push repository's forward intent in
+// tx, the transaction of the ref CAS that accepted the write: the pending
+// level and the push job commit with the ref, or not at all. A repository
+// that does not forward gets nothing. The job insert is EnqueuePush's,
+// deduplicated by repo; against a running job it row-locks that job until
+// tx commits, so the job's completion gate reads the new pending level.
+func (q *River) RecordForwardTx(ctx context.Context, tx pgx.Tx, job sync.Job) error {
+	assertf(job.Org != "" && job.RepoID != "" && job.Retry == 0, "RecordForwardTx: bad job %+v", job)
+	forwards, err := meta.PGRequestForward(ctx, tx, job.RepoID)
+	if err != nil || !forwards {
+		return err
+	}
+	_, err = q.client.InsertTx(ctx, tx, pushArgs{Org: job.Org, RepoID: job.RepoID}, nil)
+	return err
+}
+
 // EnqueueRepack inserts one unique-by-repo repack job. Refused when this
 // client has no repack worker registered: a durable job nobody works would
 // sit queued forever AND its uniqueness would swallow every later insert.
