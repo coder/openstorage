@@ -186,10 +186,15 @@ the same scopes, query parameters and responses.
   tries again. Later changes of the GitHub default branch do not move it, and a
   `PATCH /repo` ends the wait. Other providers use `main`. The S3-WAL backend keeps `main`
   ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)).
-  During a rolling upgrade from a release without this rule, two limits apply. A sync that
-  an older worker runs does not adopt the branch, so the repository keeps `main` until the
-  next sync by an upgraded worker. An older replica's `PATCH /repo` to `main` before that
-  sync looks the same as the create's `main`, so the sync still adopts the GitHub branch.
+  During a rolling upgrade from a release without this rule, one limit applies: a sync
+  that an older worker runs does not adopt the branch, so the repository keeps `main`
+  until the next sync by an upgraded worker. On PostgreSQL, a database trigger that an
+  upgraded replica installs at startup clears the wait on any write to the default
+  branch, so an older replica's `PATCH /repo` to `main` ends it too, and the sync keeps
+  `main`. The trigger cannot see a `PATCH /repo` that an older replica served before the
+  first upgraded replica started. If a v0.19.0 replica had flagged the repository by
+  then, the next successful sync adopts the GitHub branch. A new `PATCH /repo` to `main`
+  keeps `main`.
 - `upstream` (Git Sync): `{provider, owner, name, access?, host?}`. It creates a sync link
   and schedules the first sync, like the deprecated `base_repo` sync form. Unknown fields
   → 400.
