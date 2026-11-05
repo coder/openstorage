@@ -313,6 +313,67 @@ func TestRiverPushRestoredRunSnoozesForRetry(t *testing.T) {
 	}
 }
 
+// A push run whose finish (or restore) write fails leaves its claim held
+// with the request it consumed. The job must snooze until the lease
+// expires, and its re-run must steal the claim and forward.
+func TestRiverPushFailedFinishKeepsJobUntilClaimExpires(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_held", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test", ForwardOnPush: true,
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+
+	var attempts, finished atomic.Int32
+	var stolenFrom atomic.Value
+	pushRunner := func(ctx context.Context, job sync.Job) error {
+		holder := fmt.Sprintf("push-%d", attempts.Add(1))
+		_, force, stolen, err := store.BeginPush(ctx, job.RepoID, holder, 2*time.Second)
+		if errors.Is(err, sync.ErrPushInProgress) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if holder == "push-1" {
+			return errors.New("finish push: database unreachable")
+		}
+		stolenFrom.Store(fmt.Sprintf("%s force=%v", stolen, force))
+		finished.Add(1)
+		_, err = store.FinishPush(ctx, job.RepoID, holder, true)
+		return err
+	}
+
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, pushRunner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+
+	if err := store.RequestPush(ctx, "repo_held", true); err != nil {
+		t.Fatalf("RequestPush: %v", err)
+	}
+	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: "repo_held"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	waitFor(t, "re-run that steals the held claim", func() bool { return finished.Load() >= 1 })
+	if got := stolenFrom.Load(); got != "push-1 force=true" {
+		t.Errorf("re-run stole %v, want push-1 force=true", got)
+	}
+	up, err := store.GetUpstream(ctx, "repo_held")
+	if err != nil {
+		t.Fatalf("GetUpstream: %v", err)
+	}
+	if up.PushSyncing || up.PushRunCount != 1 {
+		t.Errorf("held request not forwarded by one counted run: %+v", up)
+	}
+}
+
 // A run that SKIPS because a dead holder's unexpired lease refuses the
 // steal must not complete its only job over the pending request: the
 // gated completion snoozes until just past the observed expiry, and the
