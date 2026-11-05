@@ -210,6 +210,11 @@ sync=$(sed -n 's/^Sync commit: `\([0-9a-f]\{7,40\}\)`.*/\1/p' "$skill_dir/SKILL.
 grep '^FP ' "$out/facts.txt" | awk '{print $2, $3}' | sort >"$out/fingerprints.now"
 grep -v '^#' "$model/fingerprints.txt" | sort >"$work/fingerprints.rec"
 echo "== Coverage (sync commit ${sync:-unknown})"
+if [ -n "$sync" ] && ! git -C "$repo" cat-file -e "$sync^{commit}" 2>/dev/null; then
+  # A squash merge leaves a PR's recorded head off main; GitHub keeps it.
+  echo "   note: sync commit $sync is not in this clone. Fetch PR heads with"
+  echo "   git fetch origin '+refs/pull/*/head:refs/remotes/origin/pull/*'"
+fi
 changed=$(join -a1 -a2 -e MISSING -o 0,1.2,2.2 "$work/fingerprints.rec" "$out/fingerprints.now" | awk '$2 != $3 {print $1}')
 if [ -n "$changed" ]; then
   stale=1

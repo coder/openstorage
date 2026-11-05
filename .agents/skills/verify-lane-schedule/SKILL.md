@@ -137,7 +137,7 @@ Each TLA+ action names the Go call it stands for:
 
 When check.sh says STALE, or when you change covered code on purpose:
 
-1. List what changed: `git diff <sync commit> -- <files in the coverage record>`.
+1. List what changed: `git diff <sync commit> -- <files in the coverage record>`. A PR that changes covered code records its own head, which a squash merge leaves off main. GitHub keeps it under `refs/pull/<N>/head`: if git does not know the sync commit, fetch PR heads with `git fetch origin '+refs/pull/*/head:refs/remotes/origin/pull/*'`, as check.sh prints.
 2. For each change, decide: no effect on what the model describes, the model no longer describes the code (a step split in two, a new branch, a moved check, a guard that became conditional, a new writer of the push lane columns), or the promise changed on purpose (cite the doc comment, test, or ADR that says so). The facts check call order and literal text, not conditions, so a guard wrapped in a new `if` can keep its fact TRUE: read every changed branch around a guard.
 3. Update `model/LaneSchedule.tla` from the code, not from the result. Keep one indivisible step (one SQLite transaction, one S3-WAL CAS, one hook step) as one action. If a fact's guard moved or was renamed, update `facts/facts.go` too.
 4. Rerun check.sh. If it passes, break the new code once in a scratch edit (remove the new check, or reorder the new step) and confirm that check.sh fails. Then drop the scratch edit.
