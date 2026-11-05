@@ -484,13 +484,17 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 
 	// Hooks never run DDL: meta.Open without InitSchema (serve owns it).
 	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))
-	if err != nil && !isPGURL(dbURL) {
+	if err != nil && !isPGURL(dbURL) && envconfig.Getenv(githttp.EnvSyncClaim) == "" {
 		// The local schedule records the push's forward intent before
-		// the CAS (ADR-50 amendment): without the store it cannot, so the
-		// update is refused rather than accepted with no intent.
+		// the CAS (ADR-50 amendment): without the store it cannot, so an
+		// update that would record intent is refused rather than accepted
+		// with none. Ephemeral updates and a sync run's own loopback push
+		// record no intent, so they keep failing open, as on a failed
+		// read (the loopback push's claim fence refuses it anyway).
 		logger.Error("hook refuses ref updates: open meta store", "err", err)
-		githttp.WrapHookRefStore = func(context.Context, ref.RefStore) (ref.RefStore, error) {
-			return nil, fmt.Errorf("refusing the ref update: open metadata store: %w", err)
+		refusal := fmt.Errorf("refusing the ref update: open metadata store: %w", err)
+		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
+			return intentlessRefStore{RefStore: st, refusal: refusal}, nil
 		}
 		return func() {}
 	}
@@ -610,6 +614,30 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		}), nil
 	}
 	return cleanup
+}
+
+// intentlessRefStore is the hook's ref store when the local schedule's
+// metadata store does not open: it refuses every update that would record
+// forward intent, and passes ephemeral updates through.
+type intentlessRefStore struct {
+	ref.RefStore
+	refusal error
+}
+
+func (s intentlessRefStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	if !events.EphemeralUpdate(repo, name) {
+		return false, s.refusal
+	}
+	return s.RefStore.CASRef(ctx, repo, name, old, new)
+}
+
+// CASRefGen mirrors CASRef (an explicit override: interface embedding
+// would forward past the refusal).
+func (s intentlessRefStore) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	if !events.EphemeralUpdate(repo, name) {
+		return false, 0, s.refusal
+	}
+	return s.RefStore.CASRefGen(ctx, repo, name, old, new)
 }
 
 // hookUpstreamRow lets an update hook's intent step before the CAS and its
