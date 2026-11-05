@@ -7,6 +7,7 @@ package gitread
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -476,20 +477,90 @@ func TestLsTreePageCursorOnMissingObjects(t *testing.T) {
 	}
 }
 
-// The record past the page has to fit the allowance on its own, as the
-// stream's check of a long record does.
-func TestLsTreePageCursorLongRecordPastThePage(t *testing.T) {
+// The entry past the page, long or short, against a short allowance: when the
+// allowance cannot hold what the walk keeps, the stream answers, so the page,
+// the error and the charge are the stream's.
+func TestLsTreePageCursorLookaheadAgainstTheAllowance(t *testing.T) {
 	dir := t.TempDir()
 	mustGit(t, dir, "init", "-q", "--bare", ".")
-	long := strings.Repeat("z", 40000)
-	commit := commitOf(t, dir, rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"100644 " + long, "2"}))
-	for _, allowance := range []int64{100, 1 << 20} {
-		ctx, b := budgeted(t, allowance)
-		_, _, _, err := LsTreePage(ctx, dir, commit, "", "\x00", 1)
-		octx, ob := budgeted(t, allowance)
-		_, _, _, oerr := pageOracle(octx, dir, commit, "", "\x00", 1)
-		if errors.Is(err, ErrOutputLimit) != errors.Is(oerr, ErrOutputLimit) || b.remaining() != ob.remaining() {
-			t.Errorf("allowance %d: err %v, %d left; stream: err %v, %d left", allowance, err, b.remaining(), oerr, ob.remaining())
+	for _, c := range []struct {
+		nameLen   int
+		allowance int64
+	}{{40000, 100}, {40000, 1 << 20}, {100, 70}, {100, 1 << 20}, {100, 62}, {100, 61}} {
+		commit := commitOf(t, dir, rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"100644 " + strings.Repeat("z", c.nameLen), "2"}))
+		bctx, b := budgeted(t, c.allowance)
+		page, more, found, err := LsTreePage(bctx, dir, commit, "", "\x00", 1)
+		octx, ob := budgeted(t, c.allowance)
+		wp, wm, wf, werr := pageOracle(octx, dir, commit, "", "\x00", 1)
+		if !slices.Equal(page, wp) || more != wm || found != wf || errors.Is(err, ErrOutputLimit) != errors.Is(werr, ErrOutputLimit) || (err == nil) != (werr == nil) || b.remaining() != ob.remaining() {
+			t.Errorf("%+v: page %v, more %v, found %v, err %v, %d left\nstream: %v, %v, %v, %v, %d left", c, paths(page), more, found, err, b.remaining(), paths(wp), wm, wf, werr, ob.remaining())
+		}
+	}
+}
+
+// A tree nested past git's own limit is an error for the stream, so it is
+// for a page whose path holds the nesting.
+func TestLsTreePageCursorOnADeepPath(t *testing.T) {
+	deep := strings.Repeat("a/", 2100) + "f"
+	dir, commit := fiRepo(t, []fiFile{{"100644", deep, "x"}})
+	ctx := context.Background()
+	for _, path := range []string{strings.Repeat("a/", 1500), strings.Repeat("a/", 100), ""} {
+		page, more, found, err := LsTreePage(ctx, dir, commit, path, "\x00", 1)
+		wp, wm, wf, werr := pageOracle(ctx, dir, commit, path, "\x00", 1)
+		if (err == nil) != (werr == nil) || err == nil && (!slices.Equal(page, wp) || more != wm || found != wf) {
+			t.Errorf("path of %d bytes: LsTreePage = %d entries, %v, %v, %v; stream = %d entries, %v, %v, %v", len(path), len(page), more, found, err, len(wp), wm, wf, werr)
+		}
+	}
+}
+
+// A page that does not fit the allowance and holds a blob git cannot read
+// has the error the stream reaches first.
+func TestLsTreePageCursorErrorOrder(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	missing := "id:" + strings.Repeat("ab", 20)
+	for name, entries := range map[string][][2]string{
+		"missing, then overflow": {{"100644 a", missing}, {"100644 b", "2"}},
+		"overflow, then missing": {{"100644 a", "1"}, {"100644 b", missing}},
+		"overflow":               {{"100644 a", "1"}, {"100644 b", "2"}},
+	} {
+		commit := commitOf(t, dir, rawTree(t, dir, entries...))
+		for _, allowance := range []int64{61, 70, 100, 1 << 20} {
+			ctx, b := budgeted(t, allowance)
+			_, _, _, err := LsTreePage(ctx, dir, commit, "", "\x00", 10)
+			octx, ob := budgeted(t, allowance)
+			_, _, _, oerr := pageOracle(octx, dir, commit, "", "\x00", 10)
+			if (err == nil) != (oerr == nil) || errors.Is(err, ErrOutputLimit) != errors.Is(oerr, ErrOutputLimit) || b.remaining() != ob.remaining() {
+				t.Errorf("%s, allowance %d: err %v, %d left; stream: err %v, %d left", name, allowance, err, b.remaining(), oerr, ob.remaining())
+			}
+		}
+	}
+}
+
+// An ancestor of the folder that git reads whole is read whole: two folders
+// of one name list both, and a tree that ends inside an entry is an error,
+// as for the stream.
+func TestLsTreePageCursorOnTheAncestorsOfAFolder(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	ctx := context.Background()
+	da := rawTree(t, dir, [2]string{"100644 a", "1"})
+	db := rawTree(t, dir, [2]string{"100644 b", "2"})
+	oid, err := hex.DecodeString(da)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tree := range map[string]string{
+		"two folders of one name": rawTree(t, dir, [2]string{"40000 d", da}, [2]string{"40000 d", db}),
+		"cut after the folder":    gitIn(t, dir, "40000 d\x00"+string(oid)+"100644 z", "hash-object", "-t", "tree", "--literally", "-w", "--stdin"),
+		"a file of that name":     rawTree(t, dir, [2]string{"100644 d", "1"}),
+		"intact":                  rawTree(t, dir, [2]string{"40000 d", da}, [2]string{"100644 z", "3"}),
+	} {
+		commit := commitOf(t, dir, tree)
+		page, more, found, err := LsTreePage(ctx, dir, commit, "d/", "\x00", 1)
+		wp, wm, wf, werr := pageOracle(ctx, dir, commit, "d/", "\x00", 1)
+		if (err == nil) != (werr == nil) || err == nil && (!slices.Equal(page, wp) || more != wm || found != wf) {
+			t.Errorf("%s: LsTreePage = %v, %v, %v, %v; stream = %v, %v, %v, %v", name, paths(page), more, found, err, paths(wp), wm, wf, werr)
 		}
 	}
 }
@@ -515,6 +586,19 @@ func TestLsTreePageCursorOnManyEmptyFolders(t *testing.T) {
 	}
 	if d := time.Since(start); d > 30*time.Second {
 		t.Fatalf("took %v", d)
+	}
+	// With an allowance for the page and not for what the walk keeps, the
+	// level goes to the stream at once.
+	ctx, b2 := budgeted(t, 70)
+	start = time.Now()
+	page, more, found, err = LsTreePage(ctx, dir, commit, "", "\x00", 1)
+	octx, ob := budgeted(t, 70)
+	wp, wm, wf, werr := pageOracle(octx, dir, commit, "", "\x00", 1)
+	if !slices.Equal(page, wp) || more != wm || found != wf || (err == nil) != (werr == nil) || b2.remaining() != ob.remaining() {
+		t.Fatalf("short allowance: %v, %v, %v, %v, %d left; stream %v, %v, %v, %v, %d left", paths(page), more, found, err, b2.remaining(), paths(wp), wm, wf, werr, ob.remaining())
+	}
+	if d := time.Since(start); d > 30*time.Second {
+		t.Fatalf("short allowance took %v", d)
 	}
 }
 

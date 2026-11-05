@@ -297,6 +297,28 @@ func TestTreeWalkPassesOverEmptyFolders(t *testing.T) {
 	}
 }
 
+// The folders of the query path count towards the depth limit: only 50
+// folders are left to walk below this path, and the walk still declines.
+func TestTreeWalkCountsThePathInTheDepth(t *testing.T) {
+	chain := func(depth int) *memTrees {
+		root := map[string]*memEntry{}
+		dir := root
+		for range depth {
+			next := map[string]*memEntry{}
+			dir["a"] = &memEntry{mode: modeTree, sub: next}
+			dir = next
+		}
+		dir["f"] = &memEntry{mode: modeBlob}
+		return newMemTrees(root)
+	}
+	if _, err := walkMem(chain(maxWalkDepth-24), strings.Repeat("a/", maxWalkDepth-74), "\x00", 1, math.MaxInt64); err != nil {
+		t.Fatalf("a tree %d folders deep: %v", maxWalkDepth-24, err)
+	}
+	if _, err := walkMem(chain(maxWalkDepth+50), strings.Repeat("a/", maxWalkDepth), "\x00", 1, math.MaxInt64); !errors.Is(err, errDeclined) {
+		t.Fatalf("a path %d folders deep in a tree %d deep: err = %v, want errDeclined", maxWalkDepth, maxWalkDepth+50, err)
+	}
+}
+
 // A path longer than maxWalkPath is left to the stream.
 func TestTreeWalkDeclinesALongPath(t *testing.T) {
 	chain := func(depth int) map[string]*memEntry {
@@ -319,35 +341,53 @@ func TestTreeWalkDeclinesALongPath(t *testing.T) {
 	}
 }
 
-// A short allowance cuts what a level buffers, and folders without files
-// make a level yield less than the page needs: the walk reads the level
-// again and skips what it used.
-func TestTreeWalkReadsALevelAgain(t *testing.T) {
-	var reread int
+// An allowance too short for what a level keeps leaves the level to the
+// stream: the walk gives the exact page or declines, never another page.
+func TestTreeWalkUnderAShortAllowance(t *testing.T) {
+	var walked, declined int
 	for seed := range uint64(300) {
 		r := rand.New(rand.NewPCG(seed, 1615))
 		root := genDir(r, 0, true)
 		m := newMemTrees(root)
 		for range 10 {
-			path := folders(root, "", nil)[0]
 			after := genCursor(r, m)
 			limit := 1 + r.IntN(len(m.leaves)+2)
 			room := int64(entryFloor+4) * int64(1+r.IntN(3*limit+3))
-			got, err := walkMem(m, path, after, limit, room)
-			if errors.Is(err, ErrOutputLimit) {
-				continue // an entry that does not fit alone, as with ls-tree
-			}
-			if err != nil {
+			got, err := walkMem(m, "", after, limit, room)
+			switch {
+			case errors.Is(err, errDeclined):
+				declined++
+			case errors.Is(err, ErrOutputLimit):
+				// The page itself does not fit.
+			case err != nil:
 				t.Fatal(err)
+			default:
+				if want := m.windowAfter("", after, limit); !slices.Equal(got, want) {
+					t.Fatalf("seed %d: walk(after %q, limit %d, room %d)\n got  %v\n want %v", seed, after, limit, room, paths(got), paths(want))
+				}
+				walked++
 			}
-			if want := m.windowAfter(path, after, limit); !slices.Equal(got, want) {
-				t.Fatalf("seed %d: walk(after %q, limit %d, room %d)\n got  %v\n want %v", seed, after, limit, room, paths(got), paths(want))
-			}
-			reread++
 		}
 	}
-	if reread < 1000 {
-		t.Fatalf("only %d walks completed under a short allowance", reread)
+	if walked < 300 || declined < 100 {
+		t.Fatalf("%d walks gave the page and %d declined under a short allowance", walked, declined)
+	}
+}
+
+// With an allowance that holds one entry of a level, folders without files
+// are not read one pass each: the level is left to the stream at once.
+func TestTreeWalkDeclinesAShortAllowanceOnEmptyFolders(t *testing.T) {
+	root := map[string]*memEntry{"z": {mode: modeBlob}}
+	for i := range 3000 {
+		root[fmt.Sprintf("e%05d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
+	}
+	c := &countingTrees{memTrees: newMemTrees(root), opens: map[string]int{}}
+	w := &treeWalk{src: c, limit: 1, room: entryFloor + 10}
+	if err := w.run(memCommit, "", nil, ""); !errors.Is(err, errDeclined) {
+		t.Fatalf("err = %v, want errDeclined", err)
+	}
+	if n := c.opens[memCommit+"^{tree}"]; n != 1 {
+		t.Fatalf("the root was read %d times", n)
 	}
 }
 
@@ -391,7 +431,7 @@ func FuzzTreeWalk(f *testing.F) {
 			room = int64(entryFloor+4) * (1 + int64(roomK))
 		}
 		got, err := walkMem(m, path, cursor, l, room)
-		if errors.Is(err, ErrOutputLimit) && room != math.MaxInt64 {
+		if (errors.Is(err, ErrOutputLimit) || errors.Is(err, errDeclined)) && room != math.MaxInt64 {
 			return
 		}
 		if err != nil {

@@ -127,7 +127,7 @@ func resumeTreePage(ctx context.Context, repoPath, commit, path, after string, l
 		total += recordLen(e)
 	}
 	if budget != nil && (total > budget.remaining() || !budget.take(total)) {
-		return nil, false, false, fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
+		return nil, false, false, errDeclined // the stream refuses the page
 	}
 	return page, hasMore, true, nil
 }
@@ -235,7 +235,9 @@ func (w *treeWalk) run(commit, path string, comps []string, rest string) error {
 			return err
 		}
 	}
-	return w.walk(rev, path, rest, 0)
+	// The folders of path count: git refuses a tree nested past its own
+	// limit (2048), and so does the stream, which a deep path declines to.
+	return w.walk(rev, path, rest, len(comps))
 }
 
 // walk lists the entries of tree rev, whose path is prefix, that sort after
@@ -302,8 +304,8 @@ func (w *treeWalk) use(prefix, rest string, sc treeScan, first bool, depth int) 
 	return nil
 }
 
-// add appends a file to the page. The entry past the limit is not
-// charged against the page: it only tells that the listing goes on.
+// add appends a file to the page. The entry past the limit is not charged
+// or refused: it only tells that the listing goes on.
 func (w *treeWalk) add(prefix string, e rawEntry) error {
 	te := TreeEntry{Path: prefix + e.name, Mode: modeText(e.mode), Type: EntryBlob, SHA: hex.EncodeToString(e.oid[:]), Size: -1}
 	switch e.mode {
@@ -312,16 +314,12 @@ func (w *treeWalk) add(prefix string, e rawEntry) error {
 	case modeGitlink:
 		te.Type = EntrySubmodule
 	}
-	cost := entryFloor + int64(len(te.Path))
 	if len(w.page) < w.limit {
+		cost := entryFloor + int64(len(te.Path))
 		if w.bytes+cost > w.room {
-			return fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
+			return errDeclined // the stream says which error comes first
 		}
 		w.bytes += cost
-	} else if cost > w.room {
-		// The entry past the page is not charged, but it must fit the
-		// allowance on its own, like any record the stream reads.
-		return fmt.Errorf("git ls-tree: %w", ErrOutputLimit)
 	}
 	w.page = append(w.page, te)
 	return nil
@@ -387,12 +385,17 @@ func (w *treeWalk) scan(rev, prefix, rest string, skip, max int) (sc treeScan, e
 		if seen++; seen <= skip {
 			continue
 		}
-		// A scan always keeps its first entry, so every level goes on, and
-		// the entries kept at once stay within the allowance otherwise.
-		cost := entryFloor + int64(len(prefix)+len(name))
-		if len(sc.later) == max || len(sc.later) > 0 && w.bytes+w.held+cost > w.room {
+		if len(sc.later) == max {
 			sc.more = true
 			break
+		}
+		// What the walk holds stays within the allowance. A level that does
+		// not fit is left to the stream: reading it again for the entries
+		// that do not fit would cost a pass for each of them.
+		cost := entryFloor + int64(len(prefix)+len(name))
+		if w.bytes+w.held+cost > w.room {
+			w.held -= sc.held
+			return sc, errDeclined
 		}
 		w.held += cost
 		sc.held += cost
@@ -650,20 +653,20 @@ func (s *treeSource) open(rev string) (*treeBody, error) {
 
 // childTree returns the object id of the folder name in tree rev. A tree
 // without one, or a file of that name only, declines: the stream lists it
-// as git's pathspec rules say.
+// as git's pathspec rules say. The whole tree is read, so a tree that git
+// would refuse or list twice (two folders of one name) declines too.
 func childTree(src treeReader, rev, name string) (string, error) {
 	body, err := src.open(rev)
 	if err != nil {
 		return "", err
 	}
-	want := []byte(name)
 	id := ""
-	for id == "" {
+	for {
 		n, mode, oid, ok, err := body.next()
 		if err != nil {
 			return "", err
 		}
-		if !ok || entryOrder(n, mode == modeTree, want, true) > 0 {
+		if !ok {
 			break
 		}
 		if mode == modeTree && string(n) == name {
