@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -651,34 +652,51 @@ func TestSweepSchedule_RunsPurge(t *testing.T) {
 }
 
 // listUntilDone is a blob store whose listings never finish: they return when
-// their context ends, like a sweep that needs more than its budget.
+// their context ends, then a further lateBy later, like a sweep that needs
+// more than its budget and then spends a detached recovery step.
 type listUntilDone struct {
 	blob.BlobStore
+	lateBy time.Duration
+	once   stdsync.Once
 }
 
-func (listUntilDone) ListPages(ctx context.Context, _ string, _ int, _ func([]blob.ListedObject) error) error {
+func (b *listUntilDone) ListPages(ctx context.Context, _ string, _ int, _ func([]blob.ListedObject) error) error {
 	<-ctx.Done()
+	b.once.Do(func() { time.Sleep(b.lateBy) })
 	return ctx.Err()
 }
 
-// A sweep that uses its whole budget must still leave the purge its own: the
-// purge ran on the sweep's expired context before, so soft-deleted
-// repositories were never reclaimed on a fleet whose sweep outgrew its pass.
-func TestSweepSchedule_PurgeKeepsItsOwnBudgetWhenTheSweepUsesItsWhole(t *testing.T) {
+// A sweep that uses its whole budget, and then returns late, must still leave
+// the purge its own time counted from when the purge starts. The purge ran on
+// the sweep's expired context before, so soft-deleted repositories were never
+// reclaimed on a fleet whose sweep outgrew its pass.
+func TestSweepSchedule_PurgeKeepsItsOwnTimeWhenTheSweepRunsLate(t *testing.T) {
 	f := newPurgeFixture(t)
 	repo := f.seedRepo("https://example.com/starved.git")
 	f.metaNow = func() time.Time { return time.Now().Add(-3 * time.Hour) }
 	f.softDelete(repo.URL)
 	f.metaNow = time.Now
 
-	stuck := NewSweeper(listUntilDone{f.blobs}, f.store,
-		SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged}, slog.New(slog.DiscardHandler))
-	purger := NewRepoPurger(f.purgeAwareSweeper(), f.store.(RepoPurgeRegistry), f.meta.(RepoPurgeMeta), time.Hour, slog.New(slog.DiscardHandler))
+	probe := f.store.(RepoPurgeRegistry).IsRepoPurged
+	stuck := NewSweeper(&listUntilDone{BlobStore: f.blobs, lateBy: 1500 * time.Millisecond}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: probe}, slog.New(slog.DiscardHandler))
+	purgeLeft := make(chan time.Duration, 4)
+	purgeSweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: probe,
+		DeleteGuard: func(ctx context.Context) error {
+			purgeLeft <- timeLeft(ctx)
+			return nil
+		}})
+	purger := NewRepoPurger(purgeSweeper, f.store.(RepoPurgeRegistry), f.meta.(RepoPurgeMeta), time.Hour, slog.New(slog.DiscardHandler))
 	schedule := &SweepSchedule{Sweeper: stuck, Interval: time.Hour, Purger: purger}
 
-	err := schedule.runOnce(context.Background(), 50*time.Millisecond, time.Minute)
+	// The sweep gets 1 s, returns 1.5 s later at 2.5 s, and the purge keeps 2 s
+	// from there. Counted from the job's start the purge would have 0.5 s.
+	err := schedule.runOnce(context.Background(), 3*time.Second, 2*time.Second)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("runOnce = %v, want the sweep's deadline error", err)
+	}
+	if got := receiveLeft(t, "the purge's delete guard", purgeLeft); got < 1500*time.Millisecond {
+		t.Errorf("the purge started with %v left, want about its own 2s", got)
 	}
 	f.assertPurged(repo.RepoID)
 }

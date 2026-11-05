@@ -416,7 +416,7 @@ func (w *sweepWorker) Work(ctx context.Context, _ *river.Job[sweepArgs]) error {
 	if w.schedule == nil {
 		return errScheduleOff
 	}
-	return w.schedule.runOnce(ctx, sweepPassTimeout, sweepPurgeTimeout)
+	return w.schedule.runOnce(ctx, passJobTimeout, sweepPurgeTimeout)
 }
 
 // deliveryWorker performs one signed POST per job attempt; River owns the
@@ -747,12 +747,16 @@ var (
 const (
 	passJobTimeout = 2 * time.Hour
 	// A sweep job is the sweep, then the retention purge (SweepSchedule.runOnce).
-	// The purge runs on its own sweepPurgeTimeout, so a sweep that uses its
-	// whole sweepPassTimeout cannot starve it: the purge's deletes are
-	// durable, and a purge cut short finishes over later passes.
+	// The purge keeps sweepPurgeTimeout of its own whatever the sweep did, so
+	// a sweep that uses its whole time cannot starve it. The purge's deletes
+	// are durable, and a purge cut short finishes over later passes.
+	//
+	// Worst case, a job ends passJobTimeout - sweepPurgeTimeout after its
+	// start, plus a recovery tail (the sweep's detached safeDelete step), plus
+	// sweepPurgeTimeout, plus a second tail from the purge's own safeDelete:
+	// 2 h 30 min. The rescue horizon adds one more tail of margin.
 	sweepPurgeTimeout = 15 * time.Minute
-	sweepPassTimeout  = passJobTimeout - sweepPurgeTimeout
-	sweepRescueAfter  = passJobTimeout + 2*sweepRecoveryTimeout
+	sweepRescueAfter  = passJobTimeout + 3*sweepRecoveryTimeout
 )
 
 // NewRiver opens a dedicated pool on pgURL, applies the river migrations
@@ -775,8 +779,6 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	assertf(logger != nil, "NewRiver: nil logger")
 	assertf(passJobTimeout > max(lfsReclaimPassTimeout, absencePassTimeout)+sweepRecoveryTimeout,
 		"NewRiver: pass job timeout %v does not cover the longest pass cap plus its tail", passJobTimeout)
-	assertf(sweepPassTimeout+sweepRecoveryTimeout+sweepPurgeTimeout <= sweepRescueAfter,
-		"NewRiver: sweep pass %v, its recovery tail and the purge %v do not fit the rescue horizon %v", sweepPassTimeout, sweepPurgeTimeout, sweepRescueAfter)
 	jobTimeout := sync.DefaultClaimLease()
 	assertf(repack == nil || repack.durationBudget()+repackTriggerTimeout < jobTimeout,
 		"NewRiver: job timeout %v does not cover the repack fold budget plus its probe", jobTimeout)

@@ -1712,15 +1712,23 @@ type SweepSchedule struct {
 // sweep errored, so a noisy orphan backlog cannot starve reclamation — the
 // retention purge pass. Errors are joined for the caller's reporting.
 //
-// A positive sweepBudget ends the sweep that long after the start. A
-// positive purgeBudget gives the purge its own deadline, counted from when
-// the purge starts and derived from ctx, not from the sweep's: a sweep that
-// uses its whole budget no longer leaves the purge an expired context. Zero
-// leaves that phase on ctx alone, as in local mode, which has no deadline.
-func (s *SweepSchedule) runOnce(ctx context.Context, sweepBudget, purgeBudget time.Duration) error {
-	assertf(sweepBudget >= 0 && purgeBudget >= 0, "runOnce: negative budget (sweep %v, purge %v)", sweepBudget, purgeBudget)
+// A positive jobBudget bounds the whole tick, counted from its start. With a
+// purger, the sweep ends purgeFloor before that, so a sweep that uses its
+// whole time still leaves the purge purgeFloor, counted from when the purge
+// starts and so also after a sweep that returned late. The purge may use more
+// when the sweep finished early, up to the end of jobBudget. Without a
+// purger the sweep gets all of jobBudget. Zero leaves the tick on ctx alone,
+// as in local mode, which has no deadline.
+func (s *SweepSchedule) runOnce(ctx context.Context, jobBudget, purgeFloor time.Duration) error {
+	assertf(jobBudget >= 0 && purgeFloor >= 0 && (jobBudget == 0 || purgeFloor < jobBudget),
+		"runOnce: job budget %v, purge floor %v", jobBudget, purgeFloor)
+	start := time.Now()
 	sweepCtx := ctx
-	if sweepBudget > 0 {
+	if jobBudget > 0 {
+		sweepBudget := jobBudget
+		if s.Purger != nil {
+			sweepBudget -= purgeFloor
+		}
 		var cancel context.CancelFunc
 		sweepCtx, cancel = context.WithTimeout(ctx, sweepBudget)
 		defer cancel()
@@ -1729,9 +1737,13 @@ func (s *SweepSchedule) runOnce(ctx context.Context, sweepBudget, purgeBudget ti
 	var purgeErr error
 	if s.Purger != nil {
 		purgeCtx := ctx
-		if purgeBudget > 0 {
+		if jobBudget > 0 {
+			deadline := start.Add(jobBudget)
+			if floor := time.Now().Add(purgeFloor); deadline.Before(floor) {
+				deadline = floor
+			}
 			var cancel context.CancelFunc
-			purgeCtx, cancel = context.WithTimeout(ctx, purgeBudget)
+			purgeCtx, cancel = context.WithDeadline(ctx, deadline)
 			defer cancel()
 		}
 		_, purgeErr = s.Purger.PurgeExpired(purgeCtx)

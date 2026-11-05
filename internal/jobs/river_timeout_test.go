@@ -144,34 +144,53 @@ func TestRiverSweepPassEndsBeforeItsRescue(t *testing.T) {
 	}
 	defer q.Close()
 
-	if got := receiveLeft(t, "sweep pass", blobs.left); got > sweepPassTimeout || got < sweepPassTimeout-time.Minute {
-		t.Errorf("sweep pass context has %v left, want it to end %v after the start", got, sweepPassTimeout)
+	if got := receiveLeft(t, "sweep pass", blobs.left); got > passJobTimeout || got < passJobTimeout-time.Minute {
+		t.Errorf("sweep pass context has %v left, want it to end %v after the start", got, passJobTimeout)
 	}
 }
 
-// The purge half of a sweep job must have its own budget at the start of its
-// pass, whatever is left of the sweep's.
-func TestSweepWorkerGivesThePurgeItsOwnBudget(t *testing.T) {
-	f := newPurgeFixture(t)
-	left := make(chan time.Duration, 4)
-	guard := func(ctx context.Context) error {
-		left <- timeLeft(ctx)
-		return nil
-	}
-	cfg := SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged, DeleteGuard: guard}
-	sweeper := NewSweeper(f.blobs, f.store, cfg, slog.New(slog.DiscardHandler))
-	purger := NewRepoPurger(sweeper, f.store.(RepoPurgeRegistry), f.meta.(RepoPurgeMeta), time.Hour, slog.New(slog.DiscardHandler))
-	w := &sweepWorker{schedule: &SweepSchedule{Sweeper: sweeper, Interval: time.Hour, Purger: purger}}
+// With a purger, the sweep ends sweepPurgeTimeout early so the purge keeps its
+// own time, and the purge may use the rest of the job when the sweep is short.
+// Without one, the sweep gets the whole job.
+func TestSweepWorkerSplitsItsJobBetweenSweepAndPurge(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		purger    bool
+		wantSweep time.Duration
+	}{
+		{"with a purger", true, passJobTimeout - sweepPurgeTimeout},
+		{"without a purger", false, passJobTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPurgeFixture(t)
+			left := make(chan time.Duration, 4)
+			guard := func(ctx context.Context) error {
+				left <- timeLeft(ctx)
+				return nil
+			}
+			cfg := SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged, DeleteGuard: guard}
+			sweeper := NewSweeper(f.blobs, f.store, cfg, slog.New(slog.DiscardHandler))
+			schedule := &SweepSchedule{Sweeper: sweeper, Interval: time.Hour}
+			if tc.purger {
+				schedule.Purger = NewRepoPurger(sweeper, f.store.(RepoPurgeRegistry), f.meta.(RepoPurgeMeta), time.Hour, slog.New(slog.DiscardHandler))
+			}
+			w := &sweepWorker{schedule: schedule}
 
-	if err := w.Work(context.Background(), nil); err != nil {
-		t.Fatalf("Work: %v", err)
-	}
-	sweepLeft, purgeLeft := receiveLeft(t, "the sweep's delete guard", left), receiveLeft(t, "the purge's delete guard", left)
-	if sweepLeft > sweepPassTimeout || sweepLeft < sweepPassTimeout-time.Minute {
-		t.Errorf("sweep context has %v left, want about %v", sweepLeft, sweepPassTimeout)
-	}
-	if purgeLeft > sweepPurgeTimeout || purgeLeft < sweepPurgeTimeout-time.Minute {
-		t.Errorf("purge context has %v left, want about %v", purgeLeft, sweepPurgeTimeout)
+			if err := w.Work(context.Background(), nil); err != nil {
+				t.Fatalf("Work: %v", err)
+			}
+			sweepLeft := receiveLeft(t, "the sweep's delete guard", left)
+			if sweepLeft > tc.wantSweep || sweepLeft < tc.wantSweep-time.Minute {
+				t.Errorf("sweep context has %v left, want about %v", sweepLeft, tc.wantSweep)
+			}
+			if !tc.purger {
+				return
+			}
+			// The sweep was instant, so the purge keeps the rest of the job.
+			if purgeLeft := receiveLeft(t, "the purge's delete guard", left); purgeLeft > passJobTimeout || purgeLeft < passJobTimeout-time.Minute {
+				t.Errorf("purge context has %v left, want about %v", purgeLeft, passJobTimeout)
+			}
+		})
 	}
 }
 
