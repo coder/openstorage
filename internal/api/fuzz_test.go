@@ -159,7 +159,7 @@ func FuzzCoreCursor(f *testing.F) {
 	})
 }
 
-// FuzzApplyRejection: wcApplyRejection.status reads git apply's stderr,
+// FuzzApplyRejection: wcApplyStatus reads git apply's stderr,
 // which can quote any file name the client sent. It must be total, answer
 // 409 for exit 1, 500 for any status but 1 and 128, and for 128 read only
 // whole lines that start with a known message, ignoring the lines before.
@@ -191,7 +191,7 @@ func FuzzApplyRejection(f *testing.F) {
 		return strings.HasPrefix(msg, prefix) || strings.Contains(msg, "\n"+prefix)
 	}
 	f.Fuzz(func(t *testing.T, exit int, msg string) {
-		got := (&wcApplyRejection{exit: exit, msg: msg}).status()
+		got := wcApplyStatus(exit, msg)
 		want := http.StatusInternalServerError
 		switch {
 		case exit == 1:
@@ -203,9 +203,9 @@ func FuzzApplyRejection(f *testing.F) {
 			want = http.StatusConflict
 		}
 		if got != want {
-			t.Fatalf("status(%d, %q) = %d, want %d", exit, msg, got, want)
+			t.Fatalf("wcApplyStatus(%d, %q) = %d, want %d", exit, msg, got, want)
 		}
-		if noisy := (&wcApplyRejection{exit: exit, msg: "noise\n" + msg}).status(); noisy != got {
+		if noisy := wcApplyStatus(exit, "noise\n"+msg); noisy != got {
 			t.Fatalf("a line before %q changed the status of exit %d from %d to %d", msg, exit, got, noisy)
 		}
 	})

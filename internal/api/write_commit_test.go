@@ -935,14 +935,18 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 			return map[string]any{"path": path, "content_id": "id-" + path, "operation": "upsert", "mode": mode}
 		}
 		binBase := []byte{0x00, 0x01, 'b', 'i', 'n'}
+		// A path whose name pushes git's second clash line past the first
+		// wcMaxApplyMsgBytes of stderr (#613).
+		longFile := strings.Repeat(strings.Repeat("a", 200)+"/", 24) + "f"
 		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
 			wctMeta("main", "base", []map[string]any{
-				upsert("a.txt", "100644"), upsert("link", "120000"), upsert("d/f", "100644"), upsert("bin.dat", "100644"),
+				upsert("a.txt", "100644"), upsert("link", "120000"), upsert("d/f", "100644"), upsert("bin.dat", "100644"), upsert(longFile, "100644"),
 			}, nil),
 			wctChunk("id-a.txt", []byte("line1\nline2\nline3\n"), true),
 			wctChunk("id-link", []byte("a.txt"), true),
 			wctChunk("id-d/f", []byte("x\n"), true),
 			wctChunk("id-bin.dat", binBase, true),
+			wctChunk("id-"+longFile, []byte("x\n"), true),
 		)))
 		wctRequireOK(t, resp, body)
 
@@ -983,6 +987,8 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 				http.StatusConflict, "does not exist in index"},
 			{"path beyond a symlink", newFile("link/x"), http.StatusConflict, "beyond a symbolic link"},
 			{"file where a directory is", newFile("d"), http.StatusConflict, "both a file and as a directory"},
+			// git's clash line starts past the first 4096 bytes of stderr.
+			{"directory where a long-named file is", newFile(longFile + "/x"), http.StatusConflict, "patch does not apply"},
 			{"binary preimage mismatch", binPatch, http.StatusConflict, "does not match the current contents"},
 			{"not a patch", "hello world\nnot a patch\n", http.StatusBadRequest, "No valid patches"},
 			{"corrupt hunk", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n line1\n",
@@ -1117,7 +1123,7 @@ func TestApplyPatchRunsGitInEnglish(t *testing.T) {
 	}
 	_, err = sc.applyPatch(context.Background(), patch, "--cached")
 	var rej *wcApplyRejection
-	if !errors.As(err, &rej) || rej.exit != 128 || rej.msg != "locale=C" {
+	if !errors.As(err, &rej) || rej.exit != 128 || rej.status != http.StatusInternalServerError || rej.msg != "locale=C" {
 		t.Fatalf("err = %v, want exit 128 with message %q", err, "locale=C")
 	}
 }
@@ -1137,6 +1143,7 @@ func TestApplyRejectionStatus(t *testing.T) {
 		{"submodule without a commit", 128, "error: corrupt patch for submodule sub", http.StatusBadRequest},
 		{"after another line", 128, "warning: noise\nerror: invalid path 'git~1/x'", http.StatusBadRequest},
 		{"file and directory", 128, "error: 'd' appears as both a file and as a directory\nerror: unable to add cache entry for d", http.StatusConflict},
+		{"file and directory under a long path", 128, "error: '" + strings.Repeat("a", 3*wcMaxApplyMsgBytes) + "' appears as both a file and as a directory\nerror: unable to add cache entry for x", http.StatusConflict},
 		{"does not apply", 1, "error: patch failed: f:1\nerror: f: patch does not apply", http.StatusConflict},
 		{"status 1 is never a payload error", 1, "error: invalid path 'a'", http.StatusConflict},
 		{"locked index", 128, "fatal: Unable to create '/tmp/openstorage-write-1/index.lock': File exists.", http.StatusInternalServerError},
@@ -1149,8 +1156,8 @@ func TestApplyRejectionStatus(t *testing.T) {
 		{"other status", 129, "error: invalid path 'a'", http.StatusInternalServerError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := (&wcApplyRejection{exit: tc.exit, msg: tc.msg}).status(); got != tc.want {
-				t.Fatalf("status(%d, %q) = %d, want %d", tc.exit, tc.msg, got, tc.want)
+			if got := wcApplyStatus(tc.exit, tc.msg); got != tc.want {
+				t.Fatalf("wcApplyStatus(%d, %q) = %d, want %d", tc.exit, tc.msg, got, tc.want)
 			}
 		})
 	}
