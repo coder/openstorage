@@ -257,6 +257,8 @@ func main() {
 	pub := load("internal/githttp/publication.go")
 	hydrate := load("internal/githttp/hydrate.go")
 	hook := load("internal/githttp/hook.go")
+	server := load("internal/githttp/server.go")
+	serve := load("cmd/openstorage/main.go")
 
 	sqlBegin := sqlEvt.fn("SQLite", "beginPush")
 	walBegin := walEvt.fn("S3WAL", "beginPush")
@@ -439,6 +441,126 @@ func main() {
 	sr.need(shut.IsValid() && lo.IsValid() && shut < lo, "that branch comes before localPushOutcome")
 	facts = append(facts, sr)
 
+	// MarkBeforeCas: the update hook records the push's forward intent
+	// before its authority CAS, after the ref's hold is in place, and a
+	// failed intent write refuses the update.
+	mb := newFact("MarkBeforeCas")
+	for _, m := range []string{"CASRef", "CASRefGen"} {
+		body := refstore.fn("RefStore", m).Body
+		refused := token.NoPos
+		ast.Inspect(body, func(n ast.Node) bool {
+			if is, ok := n.(*ast.IfStmt); ok && is.Init != nil && refstore.text(is.Init) == "err := s.runBeforeCAS(ctx, repo, name)" &&
+				refstore.text(is.Cond) == "err != nil" && len(is.Body.List) == 1 {
+				if _, ok := is.Body.List[0].(*ast.ReturnStmt); ok {
+					refused = is.Pos()
+				}
+			}
+			return true
+		})
+		inner := first(refstore.calls(body), "s.RefStore."+m)
+		mb.need(refused.IsValid() && inner.IsValid() && refused < inner, "RefStore.%s returns runBeforeCAS's error before it calls s.RefStore.%s", m, m)
+	}
+	mb.need(first(refstore.calls(refstore.fn("RefStore", "runBeforeCAS").Body), "s.beforeCAS").IsValid(), "RefStore.runBeforeCAS calls s.beforeCAS")
+	whe := wireEvt.fn("", "wireHookEventing")
+	localMark := false
+	ast.Inspect(whe.Body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok && is.Init != nil && strings.Contains(wireEvt.text(is.Init), "meta.LocalSchedule(ms)") {
+			for _, a := range wireEvt.assigns(is.Body) {
+				localMark = localMark || (a.lhs == "beforeCAS" && strings.HasPrefix(a.rhs, "enqueueSyncOrForward("))
+			}
+		}
+		return true
+	})
+	mb.need(localMark, "wireHookEventing's local-schedule branch sets beforeCAS = enqueueSyncOrForward(...)")
+	bcWired := 0
+	for _, l := range wireEvt.literals(whe.Body, "events.RefStoreOptions") {
+		if strings.Contains(l, "BeforeCAS:") && strings.Contains(l, "beforeCAS") {
+			bcWired++
+		}
+	}
+	mb.need(bcWired == 1, "wireHookEventing passes BeforeCAS: beforeCAS to events.NewRefStore (found %d)", bcWired)
+	ucs := hook.calls(hook.fn("", "updateHook").Body)
+	rp, cg := first(ucs, "reservePushHoldsCovering"), first(ucs, "store.CASRefGen")
+	mb.need(rp.IsValid() && cg.IsValid() && rp < cg, "updateHook reserves the ref's hold (reservePushHoldsCovering) before store.CASRefGen")
+	facts = append(facts, mb)
+
+	// StrictSnapshot: a local push run's loopback fetch refuses a held ref
+	// whose cached value is older than the authority (423 Locked), and the
+	// run restores its request instead of forwarding the stale ref.
+	ss := newFact("StrictSnapshot")
+	sh := server.fn("Server", "hydrate")
+	ss.need(assigned(server.assigns(sh.Body), "strict", `s.StrictSyncFetch && service == "upload-pack" && claims.SyncClaim != ""`),
+		`Server.hydrate computes strict := s.StrictSyncFetch && service == "upload-pack" && claims.SyncClaim != ""`)
+	strictCall := false
+	for _, c := range server.calls(sh.Body) {
+		if c.fun == "hydrateRefs" && len(c.node.Args) > 0 && server.text(c.node.Args[len(c.node.Args)-1]) == "strict" {
+			strictCall = true
+		}
+	}
+	ss.need(strictCall, "Server.hydrate calls hydrateRefs(..., strict)")
+	sfLocked := false
+	ast.Inspect(server.fn("", "hydrateFailed").Body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok && server.text(is.Cond) == "errors.Is(err, ErrHeldRefStale)" && strings.Contains(server.text(is.Body), "http.StatusLocked") {
+			sfLocked = true
+		}
+		return true
+	})
+	ss.need(sfLocked, "hydrateFailed answers ErrHeldRefStale with http.StatusLocked")
+	hr := hydrate.fn("", "hydrateRefs")
+	marks, guardedMarks, refuses := 0, 0, false
+	for _, c := range hydrate.calls(hr.Body) {
+		if c.fun == "heldMarkerValid" {
+			marks++
+		}
+	}
+	ast.Inspect(hr.Body, func(n ast.Node) bool {
+		is, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		cond := hydrate.text(is.Cond)
+		if strings.HasPrefix(cond, "!strictHeld && heldMarkerValid(") {
+			guardedMarks++
+		}
+		if cond == "refsErr == nil && skippedHeld && strictHeld" && assigned(hydrate.assigns(is.Body), "refsErr", "ErrHeldRefStale") {
+			refuses = true
+		}
+		return true
+	})
+	ss.need(marks > 0 && guardedMarks == marks, "hydrateRefs takes every held-skip short cut only under !strictHeld (%d of %d)", guardedMarks, marks)
+	ss.need(refuses, "hydrateRefs sets refsErr = ErrHeldRefStale when refsErr == nil && skippedHeld && strictHeld")
+	ss.need(anyContains(strs(push.fn("", "heldRefStale").Body), "HTTP 423"), `heldRefStale matches git's "HTTP 423"`)
+	wraps := false
+	ast.Inspect(push.fn("Worker", "transferPush").Body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok && push.text(is.Cond) == "heldRefStale(stderr)" && strings.Contains(push.text(is.Body), "errHeldRefStale") {
+			wraps = true
+		}
+		return true
+	})
+	ss.need(wraps, "transferPush wraps errHeldRefStale when heldRefStale(stderr)")
+	heldRestore := token.NoPos
+	ast.Inspect(runPush.Body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok && push.text(is.Cond) == "w.Local != nil && errors.Is(runErr, errHeldRefStale)" {
+			if body := push.text(is.Body); strings.Contains(body, "w.restoreLocal(") && strings.Contains(body, "meta.OutcomeRestore") {
+				heldRestore = is.Pos()
+			}
+		}
+		return true
+	})
+	ss.need(heldRestore.IsValid() && lo.IsValid() && heldRestore < lo,
+		"Worker.RunPush restores through w.restoreLocal with meta.OutcomeRestore on errHeldRefStale, before localPushOutcome")
+	strictServe := false
+	ast.Inspect(serve.file, func(n ast.Node) bool {
+		if as, ok := n.(*ast.AssignStmt); ok {
+			for _, a := range serve.assigns(as) {
+				strictServe = strictServe || (a.lhs == "srv.StrictSyncFetch" && strings.HasPrefix(a.rhs, "meta.LocalSchedule("))
+			}
+		}
+		return true
+	})
+	ss.need(strictServe, "serve sets srv.StrictSyncFetch from meta.LocalSchedule(...)")
+	facts = append(facts, ss)
+
 	for _, f := range facts {
 		ev := "ok"
 		if !f.ok {
@@ -461,14 +583,17 @@ func main() {
 		{walSched, "", []string{"laneHeld"}},
 		{walEvt, "S3WAL", []string{"RequestPush", "beginPush"}},
 		{push, "Worker", []string{"RunPush", "transferPush"}},
-		{push, "", []string{"localPushOutcome", "TransientPushFailure", "PushRetryDelay"}},
+		{push, "", []string{"localPushOutcome", "TransientPushFailure", "PushRetryDelay", "heldRefStale"}},
 		{worker, "Worker", []string{"waitPublication", "restoreLocal", "claimLocal", "restoreForShutdown", "retryFinish", "retryFinishWithin"}},
 		{worker, "", []string{"claimContext", "claimLease"}},
 		{sched, "LocalScheduler", []string{"offer", "SweepOnce", "Start", "Drain"}},
 		{sched, "", []string{"shutdownAborted"}},
-		{wireEvt, "", []string{"enqueueSyncOrForward"}},
+		{wireEvt, "", []string{"enqueueSyncOrForward", "wireHookEventing"}},
+		{wireEvt, "hookUpstreamRow", []string{"GetRepoUpstream"}},
 		{wireLocal, "", []string{"buildLocalSyncQueue"}},
-		{hydrate, "", []string{"Hydrate", "appendPushReleased"}},
+		{hydrate, "", []string{"Hydrate", "hydrateRefs", "appendPushReleased"}},
+		{server, "Server", []string{"hydrate"}},
+		{server, "", []string{"hydrateFailed"}},
 		{hydrate, "refCmdBatch", []string{"flush"}},
 		{hook, "", []string{"referenceTransactionHook", "updateHook"}},
 	} {

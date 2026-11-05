@@ -23,11 +23,11 @@ CONSTANTS
     MaxFaults,         \* run crashes, failed finish writes, shutdown cancels, writer crashes
     \* Assumptions the code relies on; each probe config drops one.
     LeaseOutlivesRun,  \* a claim expires only after its run ended
-    WritesComplete,    \* a writer whose authority CAS won records its intent
-    HeldRefsFresh,     \* a push reserves its hold on a cache that has every earlier write
+    WritesComplete,    \* a REST write whose authority CAS won records its intent
     \* Code facts (facts/facts.go); FALSE takes the broken branch.
     ClaimConsumesPending, ClaimMarksDue, DoneKeepsPending, RetryRemarks, FinishKeepsExplicit,
-    StealInheritsForce, RunPassesForce, WaitBeforeSnapshot, ShutdownRestores
+    StealInheritsForce, RunPassesForce, WaitBeforeSnapshot, ShutdownRestores,
+    MarkBeforeCas, StrictSnapshot
 
 ASSUME ApiCalls \subseteq {"plain", "force"}
 ASSUME QuietWriters \subseteq Writers /\ QuietRestWriters \subseteq RestWriters
@@ -76,7 +76,7 @@ TypeOK ==
     /\ cacheRef \in 0..MaxVersion
     /\ upstream \in 0..MaxVersion
     /\ hold \in Writers \cup {NoOne}
-    /\ wState \in [Writers -> {"idle", "held", "cas", "marked", "done", "dead"}]
+    /\ wState \in [Writers -> {"idle", "held", "marked", "cas", "poked", "done", "dead"}]
     /\ restState \in [RestWriters -> {"idle", "cas", "done", "dead"}]
     /\ pending \in 0..2
     /\ due \in {"zero", "claim", "future", "elapsed"}
@@ -97,23 +97,38 @@ Init ==
     /\ hammered = FALSE /\ owed = 0
 
 -----------------------------------------------------------------------------
-(* Writers: githttp preReceive reserves the hold, the update hook's CASRef *)
-(* wins (authority), events.RefStore.emitPush records the intent           *)
-(* (RequestPush), receive-pack commits the cache ref and the               *)
+(* Writers: githttp preReceive (or the update hook) reserves the hold;   *)
+(* the update hook records the intent (RequestPush through                 *)
+(* events.RefStore's BeforeCAS), wins the authority CAS (CASRefGen), and   *)
+(* pokes again (emitPush); receive-pack commits the cache ref and the      *)
 (* reference-transaction hook releases the hold.                           *)
 
-\* Under HeldRefsFresh the push's advertisement hydrated the cache with
-\* every earlier write. REST writes (which change only the authority) and a
-\* push that died after its CAS leave it stale instead.
+\* receive-pack's hydrate ran before the reservation, so the cache has the
+\* authority's value then, or an older one if a REST write or a push that
+\* died after its CAS landed in between, or another hold kept hydration off.
 WReserve(w) ==
     /\ wState[w] = "idle" /\ hold = NoOne
     /\ hold' = w
-    /\ cacheRef' = IF HeldRefsFresh THEN authority ELSE cacheRef
+    /\ cacheRef' \in cacheRef..authority
     /\ wState' = [wState EXCEPT ![w] = "held"]
     /\ UNCHANGED <<authority, wVer, restState, restVer, rowVars, runVars, envVars, ghostVars>>
 
-WCas(w) ==
+\* The intent before the CAS (MarkBeforeCas): enqueueSyncOrForward's
+\* RequestPush, unless the caller may not forward (forwardDenied) or the
+\* push is a sync run's own loopback push (EnvSyncClaim). Those quiet
+\* pushes record nothing. A failed write refuses the update (WAbort).
+WMark(w) ==
     /\ wState[w] = "held"
+    /\ wState' = [wState EXCEPT ![w] = "marked"]
+    /\ IF w \in QuietWriters \/ ~MarkBeforeCas
+       THEN UNCHANGED <<pending, spent>>
+       ELSE /\ pending' = Max(pending, 1)
+            /\ spent' = FALSE
+    /\ UNCHANGED <<authority, cacheRef, hold, wVer, restState, restVer, due, attempt, claim,
+                   runVars, envVars, forceOwed, explicitOwed, rewound, hammered, owed>>
+
+WCas(w) ==
+    /\ wState[w] = "marked"
     /\ authority' = authority + 1
     /\ wVer' = [wVer EXCEPT ![w] = authority + 1]
     /\ wState' = [wState EXCEPT ![w] = "cas"]
@@ -121,12 +136,10 @@ WCas(w) ==
     /\ UNCHANGED <<cacheRef, hold, restState, restVer, rowVars, runVars, envVars,
                    forceOwed, explicitOwed, spent, rewound, hammered>>
 
-\* enqueueSyncOrForward: RequestPush, unless the caller may not forward
-\* (forwardDenied) or the push is a sync run's own loopback push
-\* (EnvSyncClaim). Those quiet pushes record nothing.
-WMark(w) ==
+\* emitPush's poke after the CAS: the same RequestPush behind the same gates.
+WPoke(w) ==
     /\ wState[w] = "cas"
-    /\ wState' = [wState EXCEPT ![w] = "marked"]
+    /\ wState' = [wState EXCEPT ![w] = "poked"]
     /\ IF w \in QuietWriters
        THEN UNCHANGED <<pending, spent>>
        ELSE /\ pending' = Max(pending, 1)
@@ -135,29 +148,29 @@ WMark(w) ==
                    runVars, envVars, forceOwed, explicitOwed, rewound, hammered, owed>>
 
 WPublish(w) ==
-    /\ wState[w] = "marked"
+    /\ wState[w] = "poked"
     /\ cacheRef' = Max(cacheRef, wVer[w])
     /\ hold' = IF hold = w THEN NoOne ELSE hold
     /\ wState' = [wState EXCEPT ![w] = "done"]
     /\ UNCHANGED <<authority, wVer, restState, restVer, rowVars, runVars, envVars, ghostVars>>
 
-\* The push's CAS fails (a stale base, a policy denial), or the push dies
-\* before it. Its hold goes with it, and nothing was accepted.
+\* The push's intent write or CAS fails (a stale base, a policy denial, a
+\* metadata error), or the push dies before its CAS. Its hold goes with
+\* it, and nothing was accepted. A recorded intent stays: one extra run.
 WAbort(w) ==
-    /\ wState[w] = "held"
+    /\ wState[w] \in {"held", "marked"}
     /\ hold' = IF hold = w THEN NoOne ELSE hold
     /\ wState' = [wState EXCEPT ![w] = "dead"]
     /\ UNCHANGED <<authority, cacheRef, wVer, restState, restVer, rowVars, runVars,
                    envVars, ghostVars>>
 
-\* The push dies after its CAS: the hook or receive-pack is killed, or
-\* RequestPush fails, which emitPush only logs as "sync poke lost". Its hold
-\* goes with it. After the mark ("marked") the cache ref stays stale until a
-\* read hydrates it. Between the CAS and the mark ("cas") it loses the
-\* intent, which WritesComplete rules out.
+\* The push dies after its CAS: the hook or receive-pack is killed (serve's
+\* shutdown kills git children too), or the poke's RequestPush fails, which
+\* emitPush only logs as "sync poke lost". Its hold goes with it, and the
+\* cache ref stays stale until a read hydrates it.
 WCrash(w) ==
     /\ faults < MaxFaults
-    /\ wState[w] \in {"marked"} \cup (IF WritesComplete THEN {} ELSE {"cas"})
+    /\ wState[w] \in {"cas", "poked"}
     /\ hold' = IF hold = w THEN NoOne ELSE hold
     /\ wState' = [wState EXCEPT ![w] = "dead"]
     /\ faults' = faults + 1
@@ -190,6 +203,7 @@ RMark(x) ==
                    runVars, envVars, forceOwed, explicitOwed, rewound, hammered, owed>>
 
 \* Serve dies, or RequestPush fails, between the CAS and the intent write.
+\* WritesComplete rules this out (NoCompletionAssumption.cfg drops it).
 RCrashRest(x) ==
     /\ ~WritesComplete /\ faults < MaxFaults
     /\ restState[x] = "cas"
@@ -303,14 +317,25 @@ RWaitFail(r) ==
 
 \* transferPush's loopback fetch. Hydration copies the authority into the
 \* cache unless a live hold names the ref.
+StaleHeld == hold # NoOne /\ cacheRef # authority
+
 RSnap(r) ==
     /\ rState[r] = "waited"
+    /\ ~(StrictSnapshot /\ StaleHeld)
     /\ LET v == IF hold = NoOne THEN authority ELSE cacheRef
        IN /\ rSnap' = [rSnap EXCEPT ![r] = v]
           /\ cacheRef' = v
     /\ rState' = [rState EXCEPT ![r] = "snapped"]
     /\ UNCHANGED <<authority, hold, wState, wVer, restState, restVer, rowVars, rForce, rAttempt,
                    envVars, ghostVars>>
+
+\* StrictSnapshot: the strict hydrate refuses a held ref older than the
+\* authority (423 Locked), and RunPush restores through restoreLocal.
+RSnapHeld(r) ==
+    /\ rState[r] = "waited" /\ StrictSnapshot /\ StaleHeld
+    /\ IF Holds(r) THEN Restore(r) ELSE Abandon(r)
+    /\ UNCHANGED <<writerVars, rSnap, rForce, rAttempt, envVars,
+                   explicitOwed, spent, rewound, owed>>
 
 \* The detach/steal barrier before the upstream push.
 RBarrier(r) ==
@@ -373,18 +398,21 @@ RCrash(r) ==
 -----------------------------------------------------------------------------
 
 Next ==
-    \/ \E w \in Writers : WReserve(w) \/ WAbort(w) \/ WCas(w) \/ WMark(w) \/ WPublish(w) \/ WCrash(w)
+    \/ \E w \in Writers : \/ WReserve(w) \/ WMark(w) \/ WAbort(w) \/ WCas(w) \/ WPoke(w)
+                          \/ WPublish(w) \/ WCrash(w)
     \/ \E x \in RestWriters : RCas(x) \/ RMark(x) \/ RCrashRest(x)
     \/ \E a \in ApiCalls : Api(a)
     \/ Tick \/ Expire
-    \/ \E r \in Runners : \/ RClaim(r) \/ RWait(r) \/ RWaitFail(r) \/ RSnap(r)
+    \/ \E r \in Runners : \/ RClaim(r) \/ RWait(r) \/ RWaitFail(r) \/ RSnap(r) \/ RSnapHeld(r)
                           \/ RBarrier(r) \/ RPush(r) \/ RTransient(r) \/ RFinish(r)
                           \/ RCancel(r) \/ RCrash(r)
 
 Fairness ==
-    /\ \A w \in Writers : WF_vars(WCas(w)) /\ WF_vars(WMark(w)) /\ WF_vars(WPublish(w))
+    /\ \A w \in Writers : /\ WF_vars(WMark(w)) /\ WF_vars(WCas(w)) /\ WF_vars(WPoke(w))
+                          /\ WF_vars(WPublish(w))
     /\ \A x \in RestWriters : WF_vars(RMark(x))
-    /\ \A r \in Runners : /\ WF_vars(RWait(r)) /\ WF_vars(RSnap(r)) /\ WF_vars(RBarrier(r))
+    /\ \A r \in Runners : /\ WF_vars(RWait(r)) /\ WF_vars(RSnap(r)) /\ WF_vars(RSnapHeld(r))
+                          /\ WF_vars(RBarrier(r))
                           /\ WF_vars(RPush(r)) /\ WF_vars(RFinish(r))
     /\ WF_vars(\E r \in Runners : RClaim(r))
     /\ WF_vars(Tick) /\ WF_vars(Expire)
