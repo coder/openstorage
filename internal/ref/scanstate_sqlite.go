@@ -61,6 +61,35 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload,
 	return err
 }
 
+// PutJobScanStateIf — see the PG twin.
+func (s *SQLite) PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error {
+	assertf(job != "" && scope != "", "PutJobScanStateIf(%q, %q)", job, scope)
+	res, err := s.db.ExecContext(ctx, `
+UPDATE job_scan_state SET payload = ?, generation = ?, updated_at = strftime('%s','now') * 1000
+WHERE job = ? AND scope = ? AND generation = ?`,
+		payload, generation, job, scope, expectGeneration)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 1 {
+		return err
+	}
+	if expectGeneration == 0 {
+		res, err = s.db.ExecContext(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES (?, ?, ?, ?, strftime('%s','now') * 1000)
+ON CONFLICT (job, scope) DO NOTHING`,
+			job, scope, payload, generation)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 1 {
+			return err
+		}
+	}
+	return ErrScanStateConflict
+}
+
 // ArmAbsenceAdmissionFence — see the PG twin for the ordering contract.
 // SQLite needs no explicit lock: the upsert is one IMMEDIATE-mode write,
 // and ReservePackBytes' whole check-and-reserve runs in a single-writer

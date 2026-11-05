@@ -20,6 +20,11 @@ package ref
 //     last-writer-wins is exact, not merely convergent. Rows are
 //     bookkeeping, never authority: losing one restarts a scan from the
 //     top, which every consumer tolerates by construction.
+//   - A job that resumes from its row cannot rely on that: a run that
+//     outlives its rescue horizon can still be writing when the next run
+//     takes over. Such a job writes with PutJobScanStateIf, keyed on the
+//     generation it read, so the run that lost the row stops at its next
+//     write instead of overwriting the new run's state.
 
 import (
 	"context"
@@ -132,6 +137,11 @@ func DecodeReapWatermark(payload string) ReapWatermark {
 	return wm
 }
 
+// ErrScanStateConflict reports that PutJobScanStateIf found a row whose
+// generation was not the expected one: another run owns the row now.
+// Nothing was written.
+var ErrScanStateConflict = errors.New("scan state row changed: conditional write refused")
+
 // ErrLegacyReapUnarmed reports that a retirement verdict refused to retire
 // a LEGACY-SPELLED registry row because the freshest destructive-reap
 // watermark does not certify legacy reaping (see ReapWatermark). The
@@ -217,6 +227,12 @@ type ScanStateStore interface {
 	// PutJobScanState atomically upserts one row, stamping updated_at
 	// with the database clock.
 	PutJobScanState(ctx context.Context, job, scope, payload string, generation int64) error
+	// PutJobScanStateIf is PutJobScanState that writes only when the row's
+	// generation is expectGeneration (an absent row counts as generation
+	// 0). Otherwise it writes nothing and returns ErrScanStateConflict.
+	// It is how a run that holds a cursor learns that another run took
+	// the row over.
+	PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error
 	// DeleteJobScanState removes one row; deleting an absent row is a
 	// no-op.
 	DeleteJobScanState(ctx context.Context, job, scope string) error
@@ -293,6 +309,37 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
                                        updated_at = now()`,
 		job, scope, payload, generation)
 	return err
+}
+
+// PutJobScanStateIf — see ScanStateStore. An UPDATE guarded by the expected
+// generation, then, for an expected generation 0, an INSERT that yields to a
+// row that exists: a row at generation 0 still matches the UPDATE.
+func (s *PG) PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error {
+	assertf(job != "" && scope != "", "PutJobScanStateIf(%q, %q)", job, scope)
+	tag, err := s.pool.Exec(ctx, `
+UPDATE job_scan_state SET payload = $3, generation = $4, updated_at = now()
+WHERE job = $1 AND scope = $2 AND generation = $5`,
+		job, scope, payload, generation, expectGeneration)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	if expectGeneration == 0 {
+		tag, err = s.pool.Exec(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT (job, scope) DO NOTHING`,
+			job, scope, payload, generation)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 1 {
+			return nil
+		}
+	}
+	return ErrScanStateConflict
 }
 
 // ArmAbsenceAdmissionFence upserts the admission-fence marker under the
