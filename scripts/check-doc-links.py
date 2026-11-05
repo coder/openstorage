@@ -284,6 +284,24 @@ def repo_path(path):
     return os.path.relpath(real, root) if os.path.commonpath([root, real]) == root else None
 
 
+def indexed(path):
+    """True when git's index holds the file that path names and every symlink on the way to it.
+
+    A clean checkout has no untracked symlink, so one that resolves to a tracked file still breaks there.
+    """
+    if repo_path(path) not in tracked():
+        return False
+    parent = "."
+    for name in path.split("/"):
+        entry = posixpath.normpath(posixpath.join(parent, name))
+        if os.path.islink(entry) and entry not in tracked():
+            return False
+        parent = repo_path(entry)
+        if parent is None:
+            return False
+    return True
+
+
 @functools.cache
 def tracked():
     """The paths in git's index and every directory that holds one."""
@@ -351,8 +369,8 @@ def link_failures(path, lineno, ln):
             failures.append(f"BROKEN FILE (escapes repo) {path}:{lineno} -> {target}")
         elif not os.path.exists(resolved):
             failures.append(f"BROKEN FILE {path}:{lineno} -> {target}")
-        elif target and (real := repo_path(resolved)) not in tracked():
-            kind = "escapes repo" if real is None else "not tracked by git"
+        elif target and not indexed(resolved):
+            kind = "escapes repo" if repo_path(resolved) is None else "not tracked by git"
             failures.append(f"BROKEN FILE ({kind}) {path}:{lineno} -> {target}")
         elif (anchor and anchor != "#" and resolved.endswith(".md")
               and not resolved.startswith("docs/upstream") and anchor[1:] not in anchors(resolved)):
@@ -518,7 +536,7 @@ def tf_names(text):
 # quotes in the masked text, so a line that ends in a string never looks like
 # a dangling `=`.
 JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*/%&|^<>!~.]$"
-                          r"|(?<![\w$.])(?:await|delete|in|instanceof|new|typeof|void)$")
+                          r"|(?<![\w$.])(?:await|case|delete|extends|in|instanceof|new|of|typeof|void)$")
 
 
 def js_names(text):
@@ -607,7 +625,7 @@ def citation_problem(path, symbol):
         return "MISSING CITED FILE", " (outside the repository)"
     if not os.path.isfile(path):
         return "MISSING CITED FILE", ""
-    if real not in tracked():
+    if not indexed(path):
         return "MISSING CITED FILE", " (not tracked by git)"
     if symbol is not None and symbol not in citable(path):
         return "UNRESOLVED CITATION", f" (no such name in {path})"

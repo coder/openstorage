@@ -8,7 +8,8 @@ import unittest
 
 
 class CheckerTestCase(unittest.TestCase):
-    def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True):
+    def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True,
+                    untracked_symlinks=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -33,6 +34,9 @@ class CheckerTestCase(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding="utf-8")
+            for name, target in (untracked_symlinks or {}).items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).symlink_to(target)
             for name in deleted:
                 (root / name).unlink()
             return subprocess.run(
@@ -418,8 +422,9 @@ class CitationTests(CheckerTestCase):
 
     def test_every_javascript_continuation_ending_keeps_the_next_line_in_its_expression(self):
         endings = ["=", "(", "[", ",", "?", ":", "+", "-", "*", "/", "%", "&", "|", "^", "<", ">", "!", "~", ".",
-                   "&&", "||", "??", "=>", "await", "delete", "in", "instanceof", "new", "typeof", "void"]
-        ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new"]
+                   "&&", "||", "??", "=>", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof",
+                   "void"]
+        ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new", "obj.of"]
         js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}\n" for i, op in enumerate(endings))
         js += "".join(f"x {op}\nfunction closed{i}() {{}}\n" for i, op in enumerate(ends_a_statement))
         cited = [f"[flow.js:open{i}]" for i in range(len(endings))]
@@ -465,6 +470,14 @@ class CitationTests(CheckerTestCase):
         self.assert_failures(result, *[("MISSING CITED FILE", c) for c in
                                        ["[new.go:Run]", "[new.go]", "[link.go:Run]"]])
         self.assertEqual(result.stdout.count(" (not tracked by git)\n"), 3, result.stdout)
+
+    def test_an_untracked_symlink_is_not_a_tracked_cited_file(self):
+        source = "package p\n\nfunc Run() {}\n"
+        result = self.run_checker(
+            "", files={"pkg/README.md": "[alias.go:Run] [dirlink/real.go:Run] [real.go:Run]\n", "pkg/real.go": source},
+            untracked_symlinks={"pkg/alias.go": "real.go", "pkg/dirlink": "../pkg"})
+        self.assert_failures(result, *[("MISSING CITED FILE", c) for c in ["[alias.go:Run]", "[dirlink/real.go:Run]"]])
+        self.assertEqual(result.stdout.count(" (not tracked by git)\n"), 2, result.stdout)
 
     def test_malformed_and_unsupported_citations_fail_with_their_kind(self):
         result = self.check_readme(
@@ -533,6 +546,22 @@ class FileSelectionTests(CheckerTestCase):
             untracked={"notes/new.txt": "x\n"})
         self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> notes/alias.txt\n"
                                         "BROKEN FILE (escapes repo) README.md:1 -> notes/out.txt\nbroken links: 2\n")
+
+    def test_an_untracked_symlink_to_a_tracked_file_is_not_tracked(self):
+        result = self.run_checker(
+            "[Alias](alias.md) [Deep](dir/alias.md) [Through](dirlink/real.md) [Real](real.md)\n",
+            files={"real.md": "# Real\n", "dir/real.md": "# Deep\n"},
+            untracked_symlinks={"alias.md": "real.md", "dir/alias.md": "real.md", "dirlink": "dir"})
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> alias.md\n"
+                                        "BROKEN FILE (not tracked by git) README.md:1 -> dir/alias.md\n"
+                                        "BROKEN FILE (not tracked by git) README.md:1 -> dirlink/real.md\n"
+                                        "broken links: 3\n")
+
+    def test_a_tracked_symlink_below_a_tracked_directory_symlink_resolves(self):
+        result = self.run_checker(
+            "[Chain](alias/inner/link.md)\n", files={"docs/inner/real.md": "# Real\n"},
+            symlinks={"alias": "docs", "docs/inner/link.md": "real.md"})
+        self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
 
     def test_a_link_through_a_tracked_directory_symlink_resolves_to_the_tracked_file(self):
         result = self.run_checker("[Guide](alias/guide.md) [Dir](alias/)\n", docs={"guide.md": "# Guide\n"},
