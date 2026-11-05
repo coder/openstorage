@@ -46,9 +46,9 @@ A clean run ends like this:
    ClaimConsumesPending       TRUE
    ... (11 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/lane-schedule-check.Ab12Cd)
-   LaneSchedule.cfg            PASS (2694082 distinct states)
-   OtherWriters.cfg            PASS (14198464 distinct states)
-   Liveness.cfg                PASS (255510 distinct states)
+   LaneSchedule.cfg            PASS (3535660 distinct states)
+   OtherWriters.cfg            PASS (20496186 distinct states)
+   Liveness.cfg                PASS (348735 distinct states)
    NoLeaseAssumption.cfg       fails as expected (trace: ...)
    NoCompletionAssumption.cfg  fails as expected (trace: ...)
 == Coverage (sync commit 4e30915c...)
