@@ -1,8 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -89,18 +89,44 @@ func (s cancelAfterCAS) CASRef(ctx context.Context, repo, name, old, next string
 	return won, err
 }
 
+func (s cancelAfterCAS) CASRefGen(ctx context.Context, repo, name, old, next string) (bool, int64, error) {
+	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, next)
+	s.cancel()
+	return won, gen, err
+}
+
+// observeAtCAS calls observe the moment the authority CAS commits: a hook
+// that serve's shutdown kills right there leaves the row observe reads.
+type observeAtCAS struct {
+	ref.RefStore
+	observe func()
+}
+
+func (s observeAtCAS) CASRefGen(ctx context.Context, repo, name, old, next string) (bool, int64, error) {
+	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, next)
+	if won && err == nil {
+		s.observe()
+	}
+	return won, gen, err
+}
+
 // TestLocalHookIntentAuthorizationAndFailures (carried over from #271):
 // on SQLite an accepted git-surface ref write records durable intent for
 // the serve sweep, behind the same gates as the API. Forwarding needs
 // git:read and no ref-policy operations; pulling needs no ref-policy
 // operations; a sync run's own loopback push (claim env) records nothing;
 // a live pull claim suppresses pull marking (C10, shared with PG).
+//
+// The forward intent is in the row before the authority CAS commits
+// (verify-lane-schedule finding 1): a hook killed right after the CAS, or
+// one whose metadata store fails, never leaves an accepted write that no
+// run forwards. A failed intent write refuses the update instead.
 func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 	const rw = `["git:read","git:write"]`
 	for _, tc := range []struct {
 		name, scopes, refs, ops, claim            string
 		forward, syncing, disconnect, storeClosed bool
-		wantPull, wantPush                        bool
+		wantPull, wantPush, wantRefused           bool
 	}{
 		{name: "forward", scopes: rw, forward: true, wantPush: true},
 		{name: "write_only", scopes: `["git:write"]`, forward: true},
@@ -122,7 +148,7 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 		{name: "pull_malformed_ops", scopes: rw, ops: `{bad`},
 		{name: "pull_in_flight", scopes: rw, syncing: true},
 		{name: "disconnect_after_commit", scopes: rw, forward: true, disconnect: true, wantPush: true},
-		{name: "metadata_unavailable_after_commit", scopes: rw, forward: true, storeClosed: true},
+		{name: "metadata_unavailable", scopes: rw, forward: true, storeClosed: true, wantRefused: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
@@ -167,8 +193,7 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 			t.Setenv(githttp.EnvSyncClaim, tc.claim)
 			original := githttp.WrapHookRefStore
 			defer func() { githttp.WrapHookRefStore = original }()
-			var logs bytes.Buffer
-			cleanup := sync.OnceFunc(wireHookEventing(ctx, slog.New(slog.NewTextHandler(&logs, nil))))
+			cleanup := sync.OnceFunc(wireHookEventing(ctx, slog.New(slog.DiscardHandler)))
 			defer cleanup()
 			if tc.storeClosed {
 				cleanup()
@@ -179,14 +204,32 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 			if tc.disconnect {
 				inner = cancelAfterCAS{RefStore: rs, cancel: cancel}
 			}
+			pushAtCAS := -1
+			inner = observeAtCAS{RefStore: inner, observe: func() {
+				up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
+				if err != nil {
+					t.Errorf("read the row at the CAS: %v", err)
+				}
+				pushAtCAS = up.PushPending
+			}}
 			wrapped, err := githttp.WrapHookRefStore(ctx, inner)
 			if err != nil {
 				t.Fatal(err)
 			}
 			sha := strings.Repeat("a", 40)
-			won, err := wrapped.CASRef(pushCtx, repo.RepoID, "refs/heads/main", ref.ZeroSHA, sha)
+			won, _, err := wrapped.CASRefGen(pushCtx, repo.RepoID, "refs/heads/main", ref.ZeroSHA, sha)
+			if tc.wantRefused {
+				got, gerr := rs.GetRef(ctx, repo.RepoID, "refs/heads/main")
+				if err == nil || won || !errors.Is(gerr, ref.ErrNotFound) {
+					t.Fatalf("CAS = (won %v, err %v), authority main = (%q, %v); want the update refused before the CAS: an accepted write without its forward intent is never forwarded", won, err, got, gerr)
+				}
+				return
+			}
 			if err != nil || !won {
 				t.Fatalf("accepted CAS: %v %v", won, err)
+			}
+			if tc.wantPush && pushAtCAS <= 0 {
+				t.Fatalf("push_pending = %d when the authority CAS committed; a hook killed right there loses the forward", pushAtCAS)
 			}
 			up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
 			if err != nil {
@@ -194,9 +237,6 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 			}
 			if up.SyncPending != tc.wantPull || (up.PushPending > 0) != tc.wantPush {
 				t.Fatalf("pending pull=%v push=%d; want pull=%v push=%v", up.SyncPending, up.PushPending, tc.wantPull, tc.wantPush)
-			}
-			if tc.storeClosed && !strings.Contains(logs.String(), "sync poke lost") {
-				t.Fatalf("missing scheduling failure log: %s", logs.String())
 			}
 		})
 	}
