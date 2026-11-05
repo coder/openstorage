@@ -174,6 +174,7 @@ func FuzzApplyRejection(f *testing.F) {
 		{128, "error: patch with only garbage at <stdin>:4"},
 		{128, "error: patch with only garbage at <stdin>:3"},
 		{128, "error: corrupt patch for submodule sub"},
+		{128, "error: cache entry has null sha1: sub\nerror: Unable to write new index file"},
 		{128, "error: 'd' appears as both a file and as a directory\nerror: unable to add cache entry for d"},
 		{128, "fatal: Unable to create '/tmp/openstorage-write-1/index.lock': File exists."},
 		{128, "error: unable to read index file"},

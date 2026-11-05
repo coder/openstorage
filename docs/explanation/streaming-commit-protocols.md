@@ -111,15 +111,16 @@ When the patch cannot be used, the answer depends on why:
 - Git refuses the patch on every base tree, although it parses: 400 `invalid` with git's
   own error. That covers a name that git's path rules reject (`.git.`, `git~1`, a
   `.gitmodules` symlink), a mode line that changes nothing git can record (`new mode
-  100664`), and a submodule patch without a commit.
+  100664`), and a submodule patch without a commit or with a null one.
 - The patch does not apply to the base tree (context that does not match, a file that is
   missing or already exists, a binary preimage that differs, a path beyond a symlink, a
   file where a directory is): 409 `conflict` with the message `patch does not apply: …`
   and git's own error. No ref moves.
 - Git itself fails while it applies a patch that fits (a held index lock, a full disk, an
-  unreadable index): 500 with the generic `internal error` body. Git's message names the
-  server's scratch directory, so it goes to the server log and never to the client.
-  No ref moves.
+  unreadable index): 500 with the generic `internal error` body. Git's message can name the
+  server's scratch directory, so the server logs it and the client gets only the generic
+  body. A message that names the scratch directory or the cached repository answers 500
+  whatever file names the patch holds. No ref moves.
 
 Before [#608](https://github.com/coder/openstorage/issues/608), all of these answered 422
 `invalid`.

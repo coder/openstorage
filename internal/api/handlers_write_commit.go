@@ -740,7 +740,7 @@ const wcMaxApplyMsgBytes = 4096
 // whole stderr, which a long path can push far past wcMaxApplyMsgBytes.
 type wcApplyRejection struct {
 	exit   int
-	status int    // wcApplyStatus of git's whole stderr
+	status int    // wcApplyStatus of git's whole stderr, 500 if it names a server path
 	msg    string // that stderr cut to wcMaxApplyMsgBytes
 }
 
@@ -749,14 +749,18 @@ func (r *wcApplyRejection) Error() string {
 }
 
 // The lines git apply 2.55 writes, in English (see applyPatch), for the
-// exit-128 failures that a patch causes and `--numstat` does not see. Each
-// names only the patch's own paths. Every other 128 is the server's.
+// exit-128 failures that a patch causes and `--numstat` does not see. Every
+// other 128 is read as the server's. A file name that the client chose can
+// hold a newline, and git prints names unquoted, so a name can put any of
+// these lines into stderr: they say what git was told, not what failed.
+// applyPatch therefore never shows a message that names the server's own
+// paths (see namesServerPath), whatever these lines say.
 var (
 	// A patch that no base tree can make apply: a name that git's own path
 	// rules reject (`.git.`, `git~1`, a symlinked `.gitmodules`), a patch
 	// whose only change is a mode git reads as the old one, a submodule
-	// patch without a commit.
-	wcApplyPayloadLines = []string{"error: invalid path '", "error: patch with only garbage at ", "error: corrupt patch for submodule "}
+	// patch without a commit or with a null one.
+	wcApplyPayloadLines = []string{"error: invalid path '", "error: patch with only garbage at ", "error: corrupt patch for submodule ", "error: cache entry has null sha1: "}
 	// A file where the tree has a directory, or a directory where it has a
 	// file: the index refuses the entry.
 	wcApplyClashLine = "error: unable to add cache entry for "
@@ -787,6 +791,23 @@ func wcApplyStatus(exit int, stderr string) int {
 		return http.StatusConflict
 	}
 	return http.StatusInternalServerError
+}
+
+// namesServerPath reports whether git's stderr names a path of the server's:
+// the scratch directory or the cached repository. Only git's own failure
+// prints one, whatever file names the patch chose, so such a message is the
+// server's and the client never sees it.
+func (sc *wcScratch) namesServerPath(stderr string) bool {
+	assertf(sc.dir != "" && sc.repoPath != "", "namesServerPath: empty scratch path")
+	for _, dir := range []string{sc.dir, sc.repoPath} {
+		if strings.Contains(stderr, dir) {
+			return true
+		}
+		if real, err := filepath.EvalSymlinks(dir); err == nil && real != dir && strings.Contains(stderr, real) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyPatch runs `git apply` on the spooled patch. The patch goes on
@@ -821,7 +842,11 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	if msg == "" {
 		msg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
 	}
-	return "", &wcApplyRejection{exit: exit.ExitCode(), status: wcApplyStatus(exit.ExitCode(), full), msg: msg}
+	status := wcApplyStatus(exit.ExitCode(), full)
+	if sc.namesServerPath(full) {
+		status = http.StatusInternalServerError
+	}
+	return "", &wcApplyRejection{exit: exit.ExitCode(), status: status, msg: msg}
 }
 
 // wcNumstatPaths parses `git apply --numstat -z`: one record per file,

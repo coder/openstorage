@@ -1017,6 +1017,8 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 			{"unusable new mode alone", "diff --git a/a.txt b/a.txt\nnew mode 100664\n", http.StatusBadRequest, "patch with only garbage"},
 			{"submodule without a commit", "diff --git a/sub b/sub\nnew file mode 160000\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit zzz\n",
 				http.StatusBadRequest, "corrupt patch for submodule sub"},
+			{"submodule with a null commit", "diff --git a/sub b/sub\nnew file mode 160000\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit 0000000000000000000000000000000000000000\n",
+				http.StatusBadRequest, "cache entry has null sha1"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				before := wmRefsSnapshot(t, e, repo.RepoID)
@@ -1056,50 +1058,135 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 }
 
 // TestDiffCommitGitFaultIs500 (#613): git apply exits 128 for a failure of
-// its own index just as it does for a patch it refuses on sight, so only
-// its message tells them apart. A locked index is the server's fault: 500
-// with the generic body, never git's stderr (which names the scratch
-// directory), and no ref moves.
+// its own just as it does for a patch it refuses on sight, so only its message
+// tells them apart, and a file name that holds a newline can forge any message
+// line. A failure of the server's git is a 500 with the generic body and no
+// ref moves. The body never shows git's stderr when it names the server's
+// scratch directory, also when the patch's file names forge the lines that
+// the classifier reads for a 400 or a 409.
 func TestDiffCommitGitFaultIs500(t *testing.T) {
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The wrapper locks the scratch index just before `git apply --cached`
-	// runs, which makes git's own write fail the way a held lock does.
+	// The wrapper makes git's own work fail just before `git apply --cached`
+	// runs. Mode "lock" holds the scratch index lock. Mode "objects" makes the
+	// scratch object directory unwritable for that one run.
 	bin := t.TempDir()
-	wrapper := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = apply ]; then for a in \"$@\"; do [ \"$a\" = --cached ] && : > \"$GIT_INDEX_FILE.lock\"; done; fi\nexec %q \"$@\"\n", realGit)
+	modeFile := filepath.Join(bin, "mode")
+	wrapper := fmt.Sprintf(`#!/bin/sh
+cached=
+if [ "$1" = apply ]; then for a in "$@"; do [ "$a" = --cached ] && cached=1; done; fi
+mode=$(cat %[1]q 2>/dev/null)
+if [ -n "$cached" ] && [ "$mode" = lock ]; then : > "$GIT_INDEX_FILE.lock"; fi
+if [ -n "$cached" ] && [ "$mode" = objects ]; then
+	chmod 500 "$GIT_OBJECT_DIRECTORY"
+	%[2]q "$@"; rc=$?
+	chmod 700 "$GIT_OBJECT_DIRECTORY"
+	exit $rc
+fi
+exec %[2]q "$@"
+`, modeFile, realGit)
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	runBackends(t, func(t *testing.T, e *testEnv) {
-		srv := wctServer(t, e)
-		repo, writeTok, _ := wctRepo(t, e)
-		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
-			wctMeta("main", "base", []map[string]any{{"path": "a.txt", "content_id": "id-a", "operation": "upsert"}}, nil),
-			wctChunk("id-a", []byte("one\n"), true),
-		)))
-		wctRequireOK(t, resp, body)
-
-		before := wmRefsSnapshot(t, e, repo.RepoID)
-		patch := "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
-		resp, body = wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok,
-			bytes.NewReader(wctLines(t, wctMeta("main", "d", nil, nil), wctDiffChunk([]byte(patch), true))))
-		wctRequireFail(t, resp, body, http.StatusInternalServerError, statusForHTTP(http.StatusInternalServerError))
-		if !bytes.Contains(body, []byte(internalErrorMsg)) {
-			t.Fatalf("body %s does not carry the generic internal error", body)
-		}
-		for _, leak := range []string{"index.lock", "openstorage-write-", os.TempDir(), "git apply", "fatal"} {
-			if bytes.Contains(body, []byte(leak)) {
-				t.Fatalf("body %s leaks %q from git's stderr", body, leak)
+	newFile := func(quotedName string) string {
+		return "diff --git \"a/" + quotedName + "\" \"b/" + quotedName + "\"\nnew file mode 100644\n--- /dev/null\n+++ \"b/" + quotedName + "\"\n@@ -0,0 +1 @@\n+hi\n"
+	}
+	for _, tc := range []struct {
+		name, mode, patch string
+	}{
+		{"held index lock", "lock", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"},
+		{"unwritable object directory", "objects", newFile("n.txt")},
+		// git prints a name as it is, so these names put a line of a payload
+		// error and of a clash into the stderr of a server fault.
+		{"unwritable object directory, name forges an invalid path", "objects", newFile(`n\nerror: invalid path 'z`)},
+		{"unwritable object directory, name forges a clash", "objects", newFile(`m\nerror: unable to add cache entry for q`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.mode == "objects" && os.Geteuid() == 0 {
+				t.Skip("root ignores directory permissions")
 			}
-		}
-		if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
-			t.Fatalf("refs moved: %v -> %v", before, after)
-		}
-	})
+			if err := os.WriteFile(modeFile, []byte(tc.mode), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runBackends(t, func(t *testing.T, e *testEnv) {
+				srv := wctServer(t, e)
+				repo, writeTok, _ := wctRepo(t, e)
+				resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+					wctMeta("main", "base", []map[string]any{{"path": "a.txt", "content_id": "id-a", "operation": "upsert"}}, nil),
+					wctChunk("id-a", []byte("one\n"), true),
+				)))
+				wctRequireOK(t, resp, body)
+
+				before := wmRefsSnapshot(t, e, repo.RepoID)
+				resp, body = wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok,
+					bytes.NewReader(wctLines(t, wctMeta("main", "d", nil, nil), wctDiffChunk([]byte(tc.patch), true))))
+				wctRequireFail(t, resp, body, http.StatusInternalServerError, statusForHTTP(http.StatusInternalServerError))
+				if !bytes.Contains(body, []byte(internalErrorMsg)) {
+					t.Fatalf("body %s does not carry the generic internal error", body)
+				}
+				for _, leak := range []string{"index.lock", "openstorage-write-", os.TempDir(), "git apply", "fatal", "insufficient permission", "objects"} {
+					if bytes.Contains(body, []byte(leak)) {
+						t.Fatalf("body %s leaks %q from git's stderr", body, leak)
+					}
+				}
+				if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
+					t.Fatalf("refs moved: %v -> %v", before, after)
+				}
+			})
+		})
+	}
+}
+
+// TestApplyPatchNamesServerPath: git's stderr that names the server's scratch
+// directory or the cached repository answers 500, whatever lines it holds,
+// and the same lines without a server path keep their status.
+func TestApplyPatchNamesServerPath(t *testing.T) {
+	bin := t.TempDir()
+	stderrFile, exitFile := filepath.Join(bin, "stderr"), filepath.Join(bin, "exit")
+	wrapper := fmt.Sprintf("#!/bin/sh\ncat %q >&2\nexit $(cat %q)\n", stderrFile, exitFile)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	repoPath := t.TempDir()
+	sc, err := wcNewScratch(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.close()
+	patch := filepath.Join(sc.dir, "patch.diff")
+	if err := os.WriteFile(patch, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, stderr string
+		exit         string
+		want         int
+	}{
+		{"payload line", "error: invalid path 'z'", "128", http.StatusBadRequest},
+		{"payload line after a name that holds the scratch path", "error: unable to create backing store for newly created file n\nerror: invalid path '" + sc.dir + "/objects'", "128", http.StatusInternalServerError},
+		{"clash line and the cached repository", "error: unable to add cache entry for " + repoPath + "/objects\n", "128", http.StatusInternalServerError},
+		{"does not apply and the scratch path", "error: patch failed: " + sc.dir + ":1", "1", http.StatusInternalServerError},
+		{"does not apply", "error: patch failed: f:1", "1", http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(stderrFile, []byte(tc.stderr), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(exitFile, []byte(tc.exit), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := sc.applyPatch(context.Background(), patch, "--cached")
+			var rej *wcApplyRejection
+			if !errors.As(err, &rej) || rej.status != tc.want {
+				t.Fatalf("err = %v, want a rejection with status %d", err, tc.want)
+			}
+		})
+	}
 }
 
 // TestApplyPatchRunsGitInEnglish: the 400 and 500 split reads git's English
@@ -1141,6 +1228,7 @@ func TestApplyRejectionStatus(t *testing.T) {
 		{"unsafe name", 128, "error: invalid path '.git./x'", http.StatusBadRequest},
 		{"unusable mode", 128, "error: patch with only garbage at <stdin>:4", http.StatusBadRequest},
 		{"submodule without a commit", 128, "error: corrupt patch for submodule sub", http.StatusBadRequest},
+		{"submodule with a null commit", 128, "error: cache entry has null sha1: sub\nerror: Unable to write new index file", http.StatusBadRequest},
 		{"after another line", 128, "warning: noise\nerror: invalid path 'git~1/x'", http.StatusBadRequest},
 		{"file and directory", 128, "error: 'd' appears as both a file and as a directory\nerror: unable to add cache entry for d", http.StatusConflict},
 		{"file and directory under a long path", 128, "error: '" + strings.Repeat("a", 3*wcMaxApplyMsgBytes) + "' appears as both a file and as a directory\nerror: unable to add cache entry for x", http.StatusConflict},
