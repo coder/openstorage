@@ -589,11 +589,15 @@ job triggered through one replica may run (and log) on another. What the jobs do
 read their reports, and delete-mode prerequisites: see the
 [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 
-River discards an upstream sync or push job after its third crashed attempt, and the
-repository's upstream row still holds the request. Every replica scans for such requests
-every five minutes, the first time 15 seconds after boot, and enqueues the job again. Each
-requeue logs `lane scan: requeued a lane whose work had no job` with the `org`, `repo` and
-`lane` (`push` or `pull`) fields.
+An upstream sync or push request can lose its River job while the repository's upstream
+row still holds it: River discards a job after its third crashed attempt, an operator can
+delete job rows, and a replica can die or fail to insert the job right after it recorded
+the request. Every replica scans for such requests every five minutes, the first time 15
+seconds after boot, and enqueues the job again. Each requeue logs
+`lane scan: requeued a lane whose work had no job` with the `org`, `repo` and `lane`
+(`push` or `pull`) fields. The first scan after an upgrade to a release with the scan also
+runs requests that were stranded before it, and each of those runs emits its usual
+webhook events.
 
 ## What to monitor
 
@@ -605,7 +609,7 @@ requeue logs `lane scan: requeued a lane whose work had no job` with the `org`, 
 | `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
 | `commit-graph refresh outcome=…` log lines | A `repo=` that repeats `lock_held`, `timed_out`, or `failed` needs a look ([outcomes and stale-lock runbook](#commit-graph-refresh)) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
-| `lane scan: requeued a lane whose work had no job` log line | A sync or push job was lost (River discarded it, or its row was deleted) and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
+| `lane scan: requeued a lane whose work had no job` log line | A sync or push request lost its job and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
 the mapping below says which ones remain log-only.

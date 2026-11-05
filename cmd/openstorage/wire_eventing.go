@@ -36,10 +36,12 @@ const pendingSyncRecoveryDelay = 15 * time.Second
 
 // riverLaneScanInterval is how often each PostgreSQL replica scans for
 // upstream lanes whose durable work has no live River job
-// (jobs.River.StartLaneScan). Such a lane exists only after River discarded
-// a job or a job row was deleted. River discards a job only after its third
-// crashed attempt, and it rescues each attempt only after the claim lease,
-// so minutes of delay add little.
+// (jobs.River.StartLaneScan). Such a lane exists after River discarded a
+// job, after a job row was deleted, and after a process died or a job
+// insert failed between a request's mark and its insert (pull-upstream,
+// push-upstream and the forward poke mark first). No index covers the
+// lane guards, so each list query costs time in proportion to the number
+// of linked repositories, and the interval is minutes, not seconds.
 const riverLaneScanInterval = 5 * time.Minute
 
 // loopbackTokenTTL is the CEILING for the internally minted git:write JWT

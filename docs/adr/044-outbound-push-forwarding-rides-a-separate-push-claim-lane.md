@@ -171,7 +171,9 @@ dropped with its claim.
 
 **Amendment: PostgreSQL requeues lanes that lost their job.** River's job
 rescue (above) covers a crashed job only until its third attempt. Then
-River discards the job, and an operator can also delete job rows. The
+River discards the job. An operator can also delete job rows, and a
+process can die or a job insert can fail after a request's mark
+(pull-upstream, push-upstream and the forward poke mark first). The
 upstream row can keep `push_pending`, `sync_pending` or an expired claim
 with no job to run it. Each PostgreSQL serve replica therefore scans the
 served organization's live repositories every five minutes, the first time
@@ -182,9 +184,11 @@ inserts the job that `EnqueuePush` or `EnqueueSync` inserts. River turns
 that insert into a no-op while a live job covers the lane, so every replica
 can scan. A new job is kept only if the lane still has work after the
 insert, in the same transaction, so a run that consumed the work in between
-gets no second run. A pass reads 100 lanes per query in repository-ID
-order and ends within 30 seconds. The scan inserts only the existing job
-kinds, so older replicas run its jobs during a rolling upgrade.
+gets no second run. A pass reads up to 1,000 lanes per query in
+repository-ID order and ends within 30 seconds. No index covers the lane
+guards, so each query costs time in proportion to the number of linked
+repositories, whatever the page size. The scan inserts only the existing
+job kinds, so older replicas run its jobs during a rolling upgrade.
 
 **Egress.** The push targets exactly the `CloneURL` the inbound fetch
 already dials — a host validated at link time (`validUpstreamHost`,
