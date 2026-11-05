@@ -150,10 +150,12 @@ after the ref CAS commits, and River's job rescue covers only jobs that
 exist, so a hook or serve process that died between the CAS and
 `RequestPush`, or a failed `RequestPush` or enqueue, lost the forward
 until the next trigger. On PostgreSQL the CAS transaction now writes the
-intent itself: for a write that the poke would forward, it raises
-`push_pending` and inserts the River push job before COMMIT (metadata and
-refs share one database). The poke still runs afterwards and only
-duplicates the intent. The hook's job also exists before receive-pack
+intent itself: for a write that the poke would forward, it inserts the
+River push job and raises `push_pending` before COMMIT (metadata and refs
+share one database). The poke then skips that forward: marking it again
+after a run had claimed the new job would schedule a second run. The poke
+still forwards a win that `IdempotentCAS` recovered, which can be another
+caller's identical write. The hook's job also exists before receive-pack
 publishes the cache ref, so a River push run waits for the repository's
 publication on its own node (holds are per node, and its loopback fetch
 reads that node's cache) after its claim, as local runs do. A failed wait
