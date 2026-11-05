@@ -687,13 +687,14 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 		w.logger.Warn("push: uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.PushSyncing, "err", runErr)
 		return river.JobSnooze(delay)
-	case runErr != nil && up.PushSyncing && preKnown && up.PushRunCount == preRuns:
-		// A failed run that counted nothing and left a claim held: its
-		// finish or restore write failed, so the claim still holds the
-		// request it consumed. Completing would lose that request. The
-		// re-run after the lease steals the claim and its force level.
+	case up.PushSyncing:
+		// A push claim is still held. Only this job runs the repo's push
+		// lane, so the holder is one of its own runs whose finish or
+		// restore write failed, or that died: the claim holds the request
+		// it consumed, and completing would lose it. The re-run after the
+		// lease steals the claim and its force level.
 		delay := pushSnoozeDelay(up)
-		w.logger.Warn("push: failed run left its claim held; snoozing until the claim can be stolen",
+		w.logger.Warn("push: claim still held at completion; snoozing until it can be stolen",
 			"repo", job.Args.RepoID, "delay", delay, "err", runErr)
 		return river.JobSnooze(delay)
 	default:
