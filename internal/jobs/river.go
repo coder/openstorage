@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	stdsync "sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -777,6 +778,13 @@ type River struct {
 	// (DrainSyncRuns, issue #343); the workers derive each run's context
 	// from runs.
 	cancelRuns context.CancelCauseFunc
+	logger     *slog.Logger
+
+	// The lane scan (StartLaneScan): scanStop is set once, by the start or
+	// the first stop.
+	scanMu   stdsync.Mutex
+	scanStop context.CancelFunc
+	scanning stdsync.WaitGroup
 }
 
 var (
@@ -937,7 +945,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		pool.Close()
 		return nil, fmt.Errorf("jobs: start river client: %w", err)
 	}
-	return &River{client: client, pool: pool, started: true, repackEnabled: repack != nil, cancelRuns: cancelRuns}, nil
+	return &River{client: client, pool: pool, started: true, repackEnabled: repack != nil, cancelRuns: cancelRuns, logger: logger}, nil
 }
 
 // NewRiverInsertOnly connects an insert-only client (no migrations — hooks
@@ -1056,6 +1064,7 @@ func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
 	if !q.started {
 		return
 	}
+	q.stopLaneScan() // no new jobs from this process while it drains
 	wctx, cancel := context.WithTimeout(ctx, wait)
 	err := q.client.Stop(wctx) // soft: no new fetches, waits for running jobs
 	cancel()
@@ -1143,6 +1152,7 @@ func (q *River) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 	if q.started {
+		q.stopLaneScan()
 		select {
 		case <-q.client.Stopped():
 		default:
