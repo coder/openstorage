@@ -151,15 +151,38 @@ descendants_of() {
 		}'
 }
 
-# start_serve <file prefix> [VAR=value...] <serve command...>: start one serve in
-# its own session with a minimal env, wait for its address, and set SERVE_ADDR
-# and SERVE_PID. The prefix names <prefix>.pid, <prefix>.out, and <prefix>.err.
+# SECRET_SHIM runs inside a clean env, right before exec. With OSV_SECRET_DIR
+# set, it reads the store secrets from their files into AWS_SECRET_ACCESS_KEY
+# and into the @PGSECRET@ placeholder of OPENSTORAGE_PG_URL. So the secrets
+# reach the child's environment and never any command line.
+# shellcheck disable=SC2016 # expands in the inner bash
+SECRET_SHIM='if [[ -n ${OSV_SECRET_DIR-} ]]; then
+	export AWS_SECRET_ACCESS_KEY=$(<"$OSV_SECRET_DIR/s3")
+	[[ -z ${OPENSTORAGE_PG_URL-} ]] || export OPENSTORAGE_PG_URL=${OPENSTORAGE_PG_URL/@PGSECRET@/$(<"$OSV_SECRET_DIR/pg")}
+	unset OSV_SECRET_DIR
+fi'
+
+# clean_argv [VAR=value...]: set CLEAN to an argv prefix that runs a command
+# with only PATH, a private HOME and TMPDIR, the given variables, and the store
+# secrets (see SECRET_SHIM). A caller's HOME would hand the child the caller's
+# git and AWS config, and an inherited OPENSTORAGE_* URL would replace the
+# stores. Run a command as "${CLEAN[@]}" <command...>.
+clean_argv() {
+	CLEAN=(env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="$WORK/tmp" "$@" bash -c "$SECRET_SHIM
+exec \"\$@\"" osv-exec)
+}
+
+# start_serve <file prefix> [VAR=value...] -- <serve command...>: start one
+# serve in its own session with a clean env (see clean_argv), wait for its
+# address, and set SERVE_ADDR and SERVE_PID. The prefix names <prefix>.pid,
+# <prefix>.out, and <prefix>.err.
 start_serve() {
-	local p=$1
+	local p=$1 vars=()
 	shift
-	# Minimal env: an inherited OPENSTORAGE_* URL would silently override the
-	# stores, and the caller's HOME would hand serve's git children the
-	# caller's global git config.
+	while [[ $# -gt 0 && $1 != -- ]]; do vars+=("$1"); shift; done
+	[[ ${1-} == -- ]] || die "start_serve: missing --"
+	shift
+	clean_argv OPENSTORAGE_ORG="$ORG" OPENSTORAGE_ORG_PUBKEYS="$WORK/keys/org.pub.pem" ${vars[@]+"${vars[@]}"}
 	local setsid=()
 	command -v setsid >/dev/null && setsid=(setsid)
 	# The inner bash closes every inherited descriptor above stderr. Otherwise
@@ -173,10 +196,7 @@ start_serve() {
 			f=${f##*/}
 			[[ $f =~ ^[0-9]+$ ]] && ((f > 2)) && eval "exec $f>&-"
 		done
-		exec "$@"' osv-serve "$p.pid" \
-		env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="$WORK/tmp" \
-		OPENSTORAGE_ORG="$ORG" OPENSTORAGE_ORG_PUBKEYS="$WORK/keys/org.pub.pem" \
-		"$@" >"$p.out" 2>"$p.err" </dev/null &
+		exec "$@"' osv-serve "$p.pid" "${CLEAN[@]}" "$@" >"$p.out" 2>"$p.err" </dev/null &
 
 	local pid='' addr='' deadline=$((SECONDS + 60))
 	while ((SECONDS < deadline)); do
@@ -223,13 +243,7 @@ run_containers() {
 # start_backends: start PostgreSQL and SeaweedFS for a fleet run, wait until
 # each accepts real work, and set PG_PORT and S3_PORT.
 start_backends() {
-	command -v docker >/dev/null || die "docker is not on PATH (--fleet needs it)"
-	docker info >/dev/null 2>&1 || die "'docker info' failed: the docker daemon is not reachable"
-	local pg_img s3_img pg_id s3_id old
-	# Containers from an unfinished cleanup of an earlier run at this path
-	# carry the same label, and doctor and cleanup would count them too.
-	old=$(run_containers) || die "docker ps failed"
-	[[ -z $old ]] || die "containers with label $LABEL=$RUN already exist (an earlier run at this path was not cleaned up): remove them, or pick a new run dir"
+	local pg_img s3_img pg_id s3_id
 	new_secret pg
 	new_secret s3
 	pg_img=$(compose_image postgres)
@@ -300,6 +314,14 @@ cmd_launch() {
 	for tool in go git curl python3 ${fleet:+docker}; do command -v "$tool" >/dev/null || die "$tool is not on PATH"; done
 	require_git
 	safe_parents "$RUN"
+	if [[ -n $fleet ]]; then
+		docker info >/dev/null 2>&1 || die "'docker info' failed: the docker daemon is not reachable"
+		# Containers from an unfinished cleanup of an earlier run at this path
+		# carry the same label, and doctor and cleanup would count them too.
+		local old
+		old=$(run_containers) || die "docker ps failed"
+		[[ -z $old ]] || die "containers with label $LABEL=$RUN still exist from an earlier run at this path: check them, remove them with 'docker rm -f -v $(tr '\n' ' ' <<<"$old")', or use another run dir"
+	fi
 	mkdir -p "$RUN"
 	chmod 700 "$RUN" || die "cannot chmod 700 $RUN"
 	private_dir "$RUN"
@@ -328,14 +350,15 @@ cmd_launch() {
 	env -i PATH="$PATH" "$BIN" keygen --out "$WORK/keys/org" >/dev/null
 
 	if [[ -z $fleet ]]; then
-		start_serve "$WORK/serve" "$BIN" serve --listen 127.0.0.1:0 --data-dir "$WORK/data"
+		start_serve "$WORK/serve" -- "$BIN" serve --listen 127.0.0.1:0 --data-dir "$WORK/data"
 		printf 'OSV_MODE=local\nOSV_ADDR=%s\nOSV_PID=%s\n' "$SERVE_ADDR" "$SERVE_PID" >"$WORK/state.env"
 		printf 'serve pid: %s\nlisten: http://%s\ndata dir: %s\n' "$SERVE_PID" "$SERVE_ADDR" "$WORK/data" >>"$EVID/launch.txt"
 		echo "osv: serve pid $SERVE_PID listening on http://$SERVE_ADDR" >&2
 	else
 		start_backends
 		local pg_url s3_url node pfx addr_a pid_a
-		pg_url="postgres://postgres:$(<"$WORK/secrets/pg")@127.0.0.1:$PG_PORT/postgres?sslmode=disable"
+		# @PGSECRET@ is replaced inside the clean env (SECRET_SHIM).
+		pg_url="postgres://postgres:@PGSECRET@@127.0.0.1:$PG_PORT/postgres?sslmode=disable"
 		s3_url="s3://$BUCKET?endpoint=http://127.0.0.1:$S3_PORT&s3ForcePathStyle=true&region=us-east-1"
 		# Node a starts alone, so it runs the migrations and creates the bucket
 		# before node b boots. Each node has its own cache: only the database
@@ -345,7 +368,7 @@ cmd_launch() {
 			[[ $node == a ]] || pfx=$WORK/serve-$node
 			start_serve "$pfx" \
 				OPENSTORAGE_PG_URL="$pg_url" OPENSTORAGE_S3_URL="$s3_url" \
-				AWS_ACCESS_KEY_ID="$S3_ID" AWS_SECRET_ACCESS_KEY="$(<"$WORK/secrets/s3")" \
+				AWS_ACCESS_KEY_ID="$S3_ID" OSV_SECRET_DIR="$WORK/secrets" -- \
 				"$BIN" serve --listen 127.0.0.1:0 --cache-dir "$WORK/cache-$node"
 			printf 'node %s: serve pid %s, listen http://%s, cache %s\n' "$node" "$SERVE_PID" "$SERVE_ADDR" "$WORK/cache-$node" >>"$EVID/launch.txt"
 			echo "osv: node $node: serve pid $SERVE_PID listening on http://$SERVE_ADDR" >&2
@@ -441,11 +464,11 @@ cmd_packs() {
 	[[ $# -eq 2 && -n $2 ]] || die "usage: osv.sh packs <run> <repo id>"
 	load_state
 	if [[ $OSV_MODE == fleet ]]; then
-		env -i PATH="$PATH" OPENSTORAGE_S3_URL="$OSV_S3_URL" \
-			AWS_ACCESS_KEY_ID="$S3_ID" AWS_SECRET_ACCESS_KEY="$(<"$WORK/secrets/s3")" \
-			"$BIN" list-packs --repo "$2"
+		clean_argv OPENSTORAGE_S3_URL="$OSV_S3_URL" AWS_ACCESS_KEY_ID="$S3_ID" OSV_SECRET_DIR="$WORK/secrets"
+		"${CLEAN[@]}" "$BIN" list-packs --repo "$2"
 	else
-		env -i PATH="$PATH" "$BIN" list-packs --repo "$2" --data-dir "$WORK/data"
+		clean_argv
+		"${CLEAN[@]}" "$BIN" list-packs --repo "$2" --data-dir "$WORK/data"
 	fi
 }
 

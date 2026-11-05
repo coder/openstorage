@@ -144,7 +144,7 @@ Read the result through a second view and record the comparison:
 
 `eq` takes the expected value first. It exits 1 on a mismatch, and also when the expected value is empty, so a failed lookup never passes.
 
-Check stored packs with `"$OSV" packs "$RUN" "$REPO_ID"`. It runs `openstorage list-packs` on the data directory in local mode and on the shared bucket in fleet mode. Use the open.storage CLI directly for other read-only checks, for example `env -i PATH="$PATH" "$OSV_BIN" list-packs --repo "$REPO_ID" --data-dir "$OSV_WORK/data"` in local mode.
+Check stored packs with `"$OSV" packs "$RUN" "$REPO_ID"`. It runs `openstorage list-packs` on the data directory in local mode and on the shared bucket in fleet mode. In local mode, run other read-only CLI checks with `env -i PATH="$PATH" "$OSV_BIN" <command> --data-dir "$OSV_WORK/data"`. Fleet mode has no CLI access to the stores apart from `packs`: its store secrets never leave `$RUN/work/secrets/`, so prove fleet state through the nodes' REST and Git surfaces.
 
 ## Evidence
 
@@ -182,7 +182,7 @@ Run cleanup after every run, also after a failed launch or a failed drive. It:
 2. Records the PIDs of serve's descendants, sends SIGTERM to serve (the drain takes up to 10 s), waits up to 30 s, then sends SIGKILL to serve and the recorded descendants that are still alive.
 3. Fleet mode: saves each labeled container's log to the evidence, then removes the container and its anonymous volumes with `docker rm -f -v`. It finds the containers by this run's label, never by name or image, so it touches no other container.
 4. Looks for leftovers: a recorded process or labeled container that is still alive, or (on Linux) any process whose working directory is under `$RUN/work`. When it finds one, it prints `LEFTOVER processes: <pid> ...` (a container shows as `container:<id>`), keeps `$RUN/work`, and exits 1.
-5. Copies the serve logs, `state.env`, and the token list into the evidence, and replaces token values in every regular file under the evidence, subdirectories included. It does not follow symlinks, and it exits 1 when it cannot read a file or directory there. It also does this when it stops early: at a leftover, at a refused PID, or on an error.
+5. Copies the serve logs, `state.env`, and the token list into the evidence, and replaces token values in every regular file under the evidence, subdirectories included. It does not follow symlinks, and it exits 1 when it cannot read a file or directory there. It also does this when it stops early: at a leftover or on an error.
 6. Deletes `$RUN/work`: the binary, keys, tokens, data directory, caches, and clones.
 7. Prints `no process or container from this run is alive`, the evidence path, and the PASS and FAIL counts from `log.tsv`.
 
