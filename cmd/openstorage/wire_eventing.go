@@ -356,9 +356,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 	}
 
 	cleanup := func() { queue.Close() }
-	// forwardIntent wraps the ref store under the events decorator; only
-	// PostgreSQL records forward intent inside the CAS.
-	forwardIntent := func(inner ref.RefStore) ref.RefStore { return inner }
+	newEvents := newEventsStore
 	if isPGURL(dbURL) {
 		// worker.Requeue/RequeuePush stay nil on pg: river's insert-time
 		// uniqueness would swallow a requeue of a still-running job; the
@@ -378,8 +376,8 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			return nil, nil, nil, err
 		}
 		queue = q
-		forwardIntent = func(inner ref.RefStore) ref.RefStore {
-			return newForwardIntentStore(inner, q, org, forwardDeniedFromContext)
+		newEvents = func(inner ref.RefStore, opts events.RefStoreOptions) ref.RefStore {
+			return newPGEventsStore(inner, opts, q, forwardDeniedFromContext)
 		}
 	} else {
 		var err error
@@ -418,7 +416,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 	}
 
 	decorate := func(inner ref.RefStore) ref.RefStore {
-		return events.NewRefStore(forwardIntent(inner), events.RefStoreOptions{
+		return newEvents(inner, events.RefStoreOptions{
 			Org:             org,
 			Repos:           ms,
 			Webhooks:        whStore,
@@ -510,7 +508,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	var (
 		enqueueDelivery func(ctx context.Context, d events.Delivery) error
 		enqueueSync     func(ctx context.Context, repoID string) error
-		forwardIntent   = func(st ref.RefStore) ref.RefStore { return st }
+		newEvents       = newEventsStore
 	)
 	if isPGURL(dbURL) {
 		q, err := jobs.NewRiverInsertOnly(ctx, dbURL)
@@ -527,8 +525,8 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org,
 			func(context.Context) bool { return denied },
 			func(context.Context) bool { return pullDenied })
-		forwardIntent = func(st ref.RefStore) ref.RefStore {
-			return newForwardIntentStore(st, q, org, func(context.Context) bool { return denied })
+		newEvents = func(st ref.RefStore, opts events.RefStoreOptions) ref.RefStore {
+			return newPGEventsStore(st, opts, q, func(context.Context) bool { return denied })
 		}
 	} else {
 		// Local mode: deliver synchronously (bounded) before hook exit.
@@ -572,7 +570,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		// suppressed here or every inbound mirror update would enqueue
 		// an outbound no-op forward. Push webhooks still emit.
 		enqueueSync = nil
-		forwardIntent = func(st ref.RefStore) ref.RefStore { return st }
+		newEvents = newEventsStore // and no forward intent in the CAS
 	}
 
 	githttp.WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
@@ -596,7 +594,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			}
 			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
 		}
-		return events.NewRefStore(forwardIntent(st), events.RefStoreOptions{
+		return newEvents(st, events.RefStoreOptions{
 			Org:             org,
 			Repos:           ms,
 			Webhooks:        whStore,

@@ -886,16 +886,20 @@ func WithSyncClaimFence(ctx context.Context, repo, holder string) context.Contex
 // it on untouched.
 type casTxHookKey struct{}
 
-// CASTxHook writes more rows inside a won PostgreSQL CAS's transaction.
-type CASTxHook func(ctx context.Context, tx pgx.Tx) error
+// CASTxHook adds writes to a PostgreSQL CAS that changes a row. InTx runs
+// in the CAS transaction, after the swap statement and before COMMIT, so
+// its writes commit exactly when the swap does. An InTx error rolls the
+// swap back, and the CAS fails with that error, marked as never executed.
+// Committed, when set, runs after COMMIT succeeds, before the CAS returns.
+type CASTxHook struct {
+	InTx      func(ctx context.Context, tx pgx.Tx) error
+	Committed func()
+}
 
-// WithCASTxHook makes every PostgreSQL CAS under the returned context that
-// changes a row run hook in its own transaction, after the swap statement
-// and before COMMIT, so hook's writes commit exactly when the swap does. A
-// hook error rolls the swap back, and the CAS fails with that error,
-// marked as never executed. The other backends ignore the hook.
+// WithCASTxHook makes every PostgreSQL CAS under the returned context run
+// hook. The other backends ignore it.
 func WithCASTxHook(ctx context.Context, hook CASTxHook) context.Context {
-	assertf(hook != nil, "WithCASTxHook: nil hook")
+	assertf(hook.InTx != nil, "WithCASTxHook: nil InTx")
 	return context.WithValue(ctx, casTxHookKey{}, hook)
 }
 
@@ -1034,9 +1038,11 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 	}
 	n := ct.RowsAffected()
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
-	if hook, ok := ctx.Value(casTxHookKey{}).(CASTxHook); ok && n == 1 {
+	hook, hooked := ctx.Value(casTxHookKey{}).(CASTxHook)
+	hooked = hooked && n == 1
+	if hooked {
 		// Before the generation row, which stays the last lock taken.
-		if herr := hook(ctx, tx); herr != nil {
+		if herr := hook.InTx(ctx, tx); herr != nil {
 			return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, notExecuted(herr))
 		}
 	}
@@ -1071,6 +1077,9 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 	// IdempotentCAS recovery recheck exists for.
 	if err := tx.Commit(ctx); err != nil {
 		return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+	}
+	if hooked && hook.Committed != nil {
+		hook.Committed()
 	}
 	return n == 1, gen, nil
 }

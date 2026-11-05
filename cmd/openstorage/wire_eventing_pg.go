@@ -11,25 +11,48 @@ import (
 	upsync "github.com/coder/openstorage/internal/sync"
 )
 
-// forwardIntentStore records a forward_on_push repository's forward intent
-// inside each PostgreSQL ref CAS (ref.WithCASTxHook), so no accepted write
-// leaves a window in which a crash or a lost connection drops the intent.
-// Metadata and refs share the one PostgreSQL database. It sits under
-// events.RefStore and covers the writes that the decorator's sync poke
-// (enqueueSyncOrForward) forwards: refs outside the ephemeral namespace,
-// written by a caller that may forward. The poke still runs after the CAS;
-// it is a duplicate for these writes, and it covers a win that
-// ref.IdempotentCAS recovered from another caller's identical write.
+// newEventsStore is events.NewRefStore with the signature of
+// newPGEventsStore's first two parameters.
+func newEventsStore(inner ref.RefStore, opts events.RefStoreOptions) ref.RefStore {
+	return events.NewRefStore(inner, opts)
+}
+
+// newPGEventsStore is events.NewRefStore for PostgreSQL, where metadata
+// and refs share one database: each ref CAS records a forward_on_push
+// repository's forward intent in its own transaction, so no crash or lost
+// connection after the CAS can drop it. The intent covers the writes that
+// the decorator's sync poke (enqueueSyncOrForward) forwards: refs outside
+// the ephemeral namespace, by a caller that may forward. The poke skips a
+// forward that the CAS already recorded, so it neither re-marks a level
+// that a run has just consumed nor schedules a second run. It still runs
+// for a win that ref.IdempotentCAS recovered, which may be another
+// caller's identical write.
+func newPGEventsStore(inner ref.RefStore, opts events.RefStoreOptions, queue *jobs.River, forwardDenied func(ctx context.Context) bool) ref.RefStore {
+	assertf(queue != nil && forwardDenied != nil, "newPGEventsStore: missing deps")
+	if poke := opts.EnqueueSync; poke != nil {
+		opts.EnqueueSync = func(ctx context.Context, repoID string) error {
+			if rec, ok := ctx.Value(forwardRecordKey{}).(*forwardRecord); ok && rec.recorded {
+				return nil
+			}
+			return poke(ctx, repoID)
+		}
+	}
+	return forwardIntentStore{RefStore: events.NewRefStore(inner, opts), queue: queue, org: opts.Org, forwardDenied: forwardDenied}
+}
+
+// forwardRecord tells the sync poke of one CAS that the CAS's committed
+// transaction recorded the forward intent.
+type forwardRecord struct{ recorded bool }
+
+type forwardRecordKey struct{}
+
+// forwardIntentStore wraps the events decorator and gives each CAS its
+// intent hook and record.
 type forwardIntentStore struct {
 	ref.RefStore
 	queue         *jobs.River
 	org           string
 	forwardDenied func(ctx context.Context) bool
-}
-
-func newForwardIntentStore(inner ref.RefStore, queue *jobs.River, org string, forwardDenied func(ctx context.Context) bool) forwardIntentStore {
-	assertf(inner != nil && queue != nil && org != "" && forwardDenied != nil, "newForwardIntentStore: missing deps")
-	return forwardIntentStore{RefStore: inner, queue: queue, org: org, forwardDenied: forwardDenied}
 }
 
 // CASRef and CASRefGen are explicit overrides: interface embedding would
@@ -47,7 +70,14 @@ func (s forwardIntentStore) withIntent(ctx context.Context, repo, name string) c
 		return ctx
 	}
 	job := upsync.Job{Org: s.org, RepoID: events.BaseRepoID(repo)}
-	return ref.WithCASTxHook(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		return s.queue.RecordForwardTx(ctx, tx, job)
+	rec := &forwardRecord{}
+	var recorded bool
+	return ref.WithCASTxHook(context.WithValue(ctx, forwardRecordKey{}, rec), ref.CASTxHook{
+		InTx: func(ctx context.Context, tx pgx.Tx) error {
+			var err error
+			recorded, err = s.queue.RecordForwardTx(ctx, tx, job)
+			return err
+		},
+		Committed: func() { rec.recorded = recorded },
 	})
 }
