@@ -185,7 +185,9 @@ that insert into a no-op while a live job covers the lane, so every replica
 can scan. A new job is kept only if the lane still has work after the
 insert, in the same transaction, so a run that consumed the work in between
 gets no second run. A pass reads up to 1,000 lanes per query in
-repository-ID order and ends within 30 seconds. No index covers the lane
+repository-ID order and ends within 30 seconds. A lane whose insert waits
+more than five seconds on a locked job row is skipped until the next
+traversal. No index covers the lane
 guards, so each query costs time in proportion to the number of linked
 repositories, whatever the page size. The scan inserts only the existing
 job kinds, so older replicas run its jobs during a rolling upgrade.
