@@ -23,6 +23,8 @@ func sessionMembers(int) []int { return nil }
 func trackNodeSession(int) error { return nil }
 func untrackNodeSession(int)     {}
 
-func killSessionMembers(int) []int { return nil }
+func killSessionMembers(int, uint64) []int { return nil }
+
+func nodeStart(int) uint64 { return 0 }
 
 func nodeHelperMain(*testing.M) (int, bool) { return 0, false }

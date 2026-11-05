@@ -78,6 +78,18 @@ const nodeGuardArg = "nodeguard"
 // node's session ID.
 var nodeGuards sync.Map // session ID (int) -> *os.File
 
+// nodeStarts holds the start time of each tracked node's session leader, by
+// session ID (0 when the leader was already reaped).
+var nodeStarts sync.Map // session ID (int) -> uint64
+
+// nodeStart returns the start time that trackNodeSession recorded for the
+// leader of session sid, or 0.
+func nodeStart(sid int) uint64 {
+	start, _ := nodeStarts.Load(sid)
+	n, _ := start.(uint64)
+	return n
+}
+
 // nodeGuardExe is the program the guard runs as. Tests replace it to make
 // the guard fail to start.
 var nodeGuardExe = os.Executable
@@ -103,6 +115,7 @@ func trackNodeSession(sid int) error {
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("node session leader %d: %w", sid, err)
 	}
+	nodeStarts.Store(sid, start)
 	exe, err := nodeGuardExe()
 	if err != nil {
 		return fmt.Errorf("find the test binary for the node guard: %w", err)
@@ -127,6 +140,7 @@ func trackNodeSession(sid int) error {
 }
 
 func untrackNodeSession(sid int) {
+	nodeStarts.Delete(sid)
 	if w, ok := nodeGuards.LoadAndDelete(sid); ok {
 		_ = w.(*os.File).Close()
 	}
@@ -164,33 +178,50 @@ func processStart(pid int) (uint64, error) {
 	return start, err
 }
 
-// killSessionMembers SIGKILLs the live processes of session sid and returns
-// them. The kernel hands out a PID again once its owner has exited and has
-// been reaped, so a PID read from /proc can name another process by the time
-// kill(2) runs. Each member is therefore pinned with a pidfd first and
+// pidfdOpen is unix.PidfdOpen. Tests replace it to make pinning fail.
+var pidfdOpen = unix.PidfdOpen
+
+// killSessionMembers SIGKILLs the live processes of the node's session sid,
+// whose leader started at start (0: already reaped), and returns the members
+// it found alive. The kernel hands out a PID again once its owner has exited
+// and been reaped, so a PID read from /proc can name another process by the
+// time kill(2) runs. Each member is therefore pinned with a pidfd first and
 // signaled through it: the signal reaches the process that was checked, or
-// nothing.
-func killSessionMembers(sid int) []int {
-	var killed []int
+// nothing. A member that cannot be pinned (a kernel before 5.3, a seccomp
+// policy, no free descriptor) is not signaled and counts as alive, so the
+// caller's retries end in its timeout instead of a kill of a bare PID.
+//
+// The kernel also reuses a session ID once the session is empty. Just
+// before each signal the leader is checked again: a process with ID sid and
+// another start time is an unrelated session, and its members stay alone.
+func killSessionMembers(sid int, start uint64) []int {
+	var alive []int
 	for _, pid := range sessionMembers(sid) {
-		fd, err := unix.PidfdOpen(pid, 0)
+		fd, err := pidfdOpen(pid, 0)
 		if errors.Is(err, unix.ESRCH) {
 			continue
 		}
-		if err != nil { // no pidfd (kernel before 5.3): the unpinned kill
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-			killed = append(killed, pid)
+		if err != nil {
+			alive = append(alive, pid)
 			continue
 		}
 		// The pinned process is alive now and was alive when /proc was read
 		// if it has not exited since: only then did the read describe it.
-		if state, session, _, err := procStat(pid); err == nil && session == sid && state != "Z" && !pidfdExited(fd) {
+		if state, session, _, err := procStat(pid); err == nil && session == sid && state != "Z" && !pidfdExited(fd) && sessionLeaderIs(sid, start) {
 			_ = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
-			killed = append(killed, pid)
+			alive = append(alive, pid)
 		}
 		_ = unix.Close(fd)
 	}
-	return killed
+	return alive
+}
+
+// sessionLeaderIs reports whether session sid is still the node's: no
+// process has ID sid (its leader is gone), or the one that has started at
+// start.
+func sessionLeaderIs(sid int, start uint64) bool {
+	cur, err := processStart(sid)
+	return err != nil || cur == start
 }
 
 // pidfdExited reports whether the process behind pidfd fd has exited (the
@@ -206,17 +237,12 @@ func pidfdExited(fd int) bool {
 	}
 }
 
-// reapNodeSession SIGKILLs every live process in session sid until none is
-// left, and returns 0 (1 after timeout). The kernel reuses a session ID once
-// the session is empty, so a process with ID sid and a start time other than
-// start is an unrelated session leader, and its session stays alone.
+// reapNodeSession SIGKILLs every live process in session sid (see
+// killSessionMembers) until none is left, and returns 0 (1 after timeout).
 func reapNodeSession(sid int, start uint64, timeout time.Duration) int {
 	deadline := time.Now().Add(timeout)
 	for {
-		if cur, err := processStart(sid); err == nil && cur != start {
-			return 0
-		}
-		members := killSessionMembers(sid)
+		members := killSessionMembers(sid, start)
 		if len(members) == 0 {
 			return 0
 		}
@@ -766,7 +792,7 @@ func procState(pid int) string {
 // startStandInNode starts a stand-in node as the crasher does: bash as
 // session leader, and a child in a process group of its own. It returns
 // both PIDs and kills their session when the test ends.
-func startStandInNode(t *testing.T) (serve, child int, cmd *exec.Cmd) {
+func startStandInNode(t *testing.T) (serve, child int, start uint64, cmd *exec.Cmd) {
 	t.Helper()
 	cmd = exec.Command("bash", "-c", "set -m; sleep 600 & echo $!; wait")
 	cmd.SysProcAttr = nodeSysProcAttr()
@@ -778,8 +804,7 @@ func startStandInNode(t *testing.T) (serve, child int, cmd *exec.Cmd) {
 		t.Fatal(err)
 	}
 	serve = cmd.Process.Pid
-	start, err := processStart(serve)
-	if err != nil {
+	if start, err = processStart(serve); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -793,14 +818,14 @@ func startStandInNode(t *testing.T) (serve, child int, cmd *exec.Cmd) {
 	if child, err = strconv.Atoi(strings.TrimSpace(line)); err != nil {
 		t.Fatal(err)
 	}
-	return serve, child, cmd
+	return serve, child, start, cmd
 }
 
 // TestKillSessionMembers: killSessionMembers ends every live process of the
 // node's session, a child in a process group of its own included, and
 // leaves a process in another session alone.
 func TestKillSessionMembers(t *testing.T) {
-	serve, child, cmd := startStandInNode(t)
+	serve, child, start, cmd := startStandInNode(t)
 	bystander := exec.Command("sleep", "600")
 	bystander.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := bystander.Start(); err != nil {
@@ -811,7 +836,7 @@ func TestKillSessionMembers(t *testing.T) {
 		_ = bystander.Wait()
 	})
 
-	killed := killSessionMembers(serve)
+	killed := killSessionMembers(serve, start)
 	if len(killed) != 2 {
 		t.Fatalf("killed %v, want the leader %d and its child %d", killed, serve, child)
 	}
@@ -824,7 +849,7 @@ func TestKillSessionMembers(t *testing.T) {
 	if st := procState(bystander.Process.Pid); st == "" || st == "Z" {
 		t.Fatalf("a process of another session died (state %q)", st)
 	}
-	if got := killSessionMembers(serve); len(got) != 0 {
+	if got := killSessionMembers(serve, start); len(got) != 0 {
 		t.Fatalf("an empty session still yields members %v", got)
 	}
 }
@@ -834,7 +859,7 @@ func TestKillSessionMembers(t *testing.T) {
 // caller, which stops the node. It must not panic and leave the node running
 // without a guard.
 func TestTrackNodeSessionReportsGuardStartFailure(t *testing.T) {
-	serve, _, _ := startStandInNode(t)
+	serve, _, _, _ := startStandInNode(t)
 	old := nodeGuardExe
 	nodeGuardExe = func() (string, error) { return "/nonexistent/node-guard", nil }
 	t.Cleanup(func() { nodeGuardExe = old })
@@ -844,5 +869,41 @@ func TestTrackNodeSessionReportsGuardStartFailure(t *testing.T) {
 	}
 	if _, ok := nodeGuards.Load(serve); ok {
 		t.Fatal("a failed guard start left its pipe registered")
+	}
+}
+
+// TestKillSessionMembersLeavesAnotherSessionWithTheSameID: when the process
+// with the node's session ID started at another time, the ID went to an
+// unrelated session, and its members must not be signaled.
+func TestKillSessionMembersLeavesAnotherSessionWithTheSameID(t *testing.T) {
+	serve, child, start, _ := startStandInNode(t)
+	if got := killSessionMembers(serve, start+1); len(got) != 0 {
+		t.Fatalf("killSessionMembers returned %v for a session whose leader has another start time", got)
+	}
+	for _, pid := range []int{serve, child} {
+		if st := procState(pid); st == "" || st == "Z" {
+			t.Fatalf("process %d of the other session died (state %q)", pid, st)
+		}
+	}
+}
+
+// TestKillSessionMembersDoesNotSignalAnUnpinnedPID: when pidfd_open fails (a
+// kernel before 5.3, a seccomp policy, no free descriptor), a member must
+// not get a signal by its bare PID. It counts as alive, so the caller's
+// retries end in its timeout.
+func TestKillSessionMembersDoesNotSignalAnUnpinnedPID(t *testing.T) {
+	serve, child, start, _ := startStandInNode(t)
+	old := pidfdOpen
+	pidfdOpen = func(int, int) (int, error) { return -1, unix.ENOSYS }
+	t.Cleanup(func() { pidfdOpen = old })
+
+	if got := killSessionMembers(serve, start); len(got) != 2 {
+		t.Fatalf("killSessionMembers returned %v, want both members as still alive", got)
+	}
+	time.Sleep(300 * time.Millisecond) // a SIGKILL takes effect after kill(2) returns
+	for _, pid := range []int{serve, child} {
+		if st := procState(pid); st == "" || st == "Z" {
+			t.Fatalf("process %d got a signal through its bare PID (state %q)", pid, st)
+		}
 	}
 }

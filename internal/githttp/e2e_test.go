@@ -473,7 +473,7 @@ func (n *testNode) stop() {
 		}
 		sid := n.cmd.Process.Pid
 		defer untrackNodeSession(sid)
-		kill := func() []int { return killSessionMembers(sid) }
+		kill := func() []int { return killSessionMembers(sid, nodeStart(sid)) }
 		if n.cmd.ProcessState == nil {
 			_ = syscall.Kill(-sid, syscall.SIGKILL)
 			kill()
