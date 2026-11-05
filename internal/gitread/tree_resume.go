@@ -55,8 +55,8 @@ const (
 	// treeReadBuffer bounds one entry's mode and name: the walk reads
 	// them whole with bufio's ReadSlice.
 	treeReadBuffer = 64 << 10
-	// maxWalkDepth bounds the recursion, and with it the trees held
-	// open at once.
+	// maxWalkDepth bounds the recursion: a tree nested deeper is left to
+	// the stream.
 	maxWalkDepth = 1024
 	// entryFloor is the size of an `ls-tree --long` record less its path:
 	// mode, type, object id, a size field of its minimum width and the
@@ -84,8 +84,15 @@ func resumeTreePage(ctx context.Context, repoPath, commit, path, after string, l
 		if err != nil {
 			return nil, false, false, err
 		}
+		closed := false
+		defer func() { // a panic in the walk still reaps git
+			if !closed {
+				_ = src.close(true)
+			}
+		}()
 		w = &treeWalk{src: src, limit: limit, room: room}
 		err = w.run(commit, path, comps, rest)
+		closed = true
 		if cerr := src.close(err != nil); err == nil {
 			err = cerr
 		}
@@ -326,8 +333,8 @@ type rawEntry struct {
 
 // treeScan is what a walk keeps of one tree.
 type treeScan struct {
-	cand    rawEntry   // the folder that holds the cursor
-	hasCand bool       //
+	cand    rawEntry // the folder that holds the cursor, when hasCand
+	hasCand bool
 	later   []rawEntry // entries after the cursor, in order
 	more    bool       // another later entry follows
 	held    int64      // floor size of later, counted in treeWalk.held
@@ -439,27 +446,41 @@ func entryOrder(a []byte, aTree bool, b []byte, bTree bool) int {
 	return at(a, aTree) - at(b, bTree)
 }
 
-// treeBody reads the entries of one tree object from a treeSource.
+// treeBody reads the entries of one tree object from a reply stream. It
+// reads the object's bytes and no others: git sends no more until the next
+// request, so a read for the rest of a truncated entry would wait for it.
 type treeBody struct {
-	r        *bufio.Reader
-	left     int64 // bytes of the object not read yet
+	obj      *bufio.Reader // the object's bytes, in front of lim
+	lim      *io.LimitedReader
+	resp     *bufio.Reader // the reply stream: the object, then a line feed
 	cur      []byte
 	prev     []byte
 	prevTree bool
 	started  bool
 }
 
+// newTreeBody reads the next size bytes of resp. A non-nil buf is a reader
+// kept for reuse, which the body takes over.
+func newTreeBody(resp *bufio.Reader, size int64, buf *bufio.Reader) *treeBody {
+	lim := &io.LimitedReader{R: resp, N: size}
+	if buf == nil {
+		buf = bufio.NewReaderSize(lim, treeReadBuffer)
+	} else {
+		buf.Reset(lim)
+	}
+	return &treeBody{obj: buf, lim: lim, resp: resp}
+}
+
 // next reads the next entry: its name is valid until the next call. ok is
 // false at the end of the tree. Entries must come in git's tree order.
 func (b *treeBody) next() (name []byte, mode uint32, oid [20]byte, ok bool, err error) {
-	if b.left == 0 {
-		return nil, 0, oid, false, nil
-	}
-	m, err := b.r.ReadSlice(' ')
+	m, err := b.obj.ReadSlice(' ')
 	if err != nil {
+		if errors.Is(err, io.EOF) && len(m) == 0 && b.lim.N == 0 {
+			return nil, 0, oid, false, nil
+		}
 		return nil, 0, oid, false, readErr(err)
 	}
-	b.left -= int64(len(m))
 	switch string(m[:len(m)-1]) {
 	case "40000":
 		mode = modeTree
@@ -474,22 +495,18 @@ func (b *treeBody) next() (name []byte, mode uint32, oid [20]byte, ok bool, err 
 	default:
 		return nil, 0, oid, false, errDeclined
 	}
-	raw, err := b.r.ReadSlice(0)
+	raw, err := b.obj.ReadSlice(0)
 	if err != nil {
 		return nil, 0, oid, false, readErr(err)
 	}
-	b.left -= int64(len(raw))
 	raw = raw[:len(raw)-1]
 	if len(raw) == 0 || bytes.IndexByte(raw, '/') >= 0 {
 		return nil, 0, oid, false, errDeclined
 	}
 	// The next read can move the bytes raw points at.
 	b.cur = append(b.cur[:0], raw...)
-	if _, err := io.ReadFull(b.r, oid[:]); err != nil {
+	if _, err := io.ReadFull(b.obj, oid[:]); err != nil {
 		return nil, 0, oid, false, readErr(err)
-	}
-	if b.left -= int64(len(oid)); b.left < 0 {
-		return nil, 0, oid, false, errDeclined
 	}
 	isTree := mode == modeTree
 	if b.started && entryOrder(b.prev, b.prevTree, b.cur, isTree) >= 0 {
@@ -503,11 +520,13 @@ func (b *treeBody) next() (name []byte, mode uint32, oid [20]byte, ok bool, err 
 // finish reads what is left of the object and the line feed after it, so
 // the next reply starts the stream.
 func (b *treeBody) finish() error {
-	if _, err := io.CopyN(io.Discard, b.r, b.left); err != nil {
+	if _, err := io.Copy(io.Discard, b.lim); err != nil {
 		return readErr(err)
 	}
-	b.left = 0
-	c, err := b.r.ReadByte()
+	if b.lim.N != 0 {
+		return errDeclined // the stream ended inside the object
+	}
+	c, err := b.resp.ReadByte()
 	if err != nil {
 		return readErr(err)
 	}
@@ -532,6 +551,7 @@ func readErr(err error) error {
 type treeSource struct {
 	req    *os.File
 	resp   *bufio.Reader
+	obj    *bufio.Reader // reused by each tree body
 	respR  *io.PipeReader
 	cancel context.CancelFunc
 	done   chan error
@@ -548,7 +568,7 @@ func startTreeSource(ctx context.Context, repoPath string) (*treeSource, error) 
 	}
 	respR, respW := io.Pipe()
 	runCtx, cancel := context.WithCancel(ctx)
-	s := &treeSource{req: reqW, resp: bufio.NewReaderSize(respR, treeReadBuffer), respR: respR, cancel: cancel, done: make(chan error, 1)}
+	s := &treeSource{req: reqW, resp: bufio.NewReaderSize(respR, treeReadBuffer), obj: bufio.NewReaderSize(nil, treeReadBuffer), respR: respR, cancel: cancel, done: make(chan error, 1)}
 	go func() {
 		_, err := Run(runCtx, Cmd{Class: Heavy, Dir: repoPath, Stdin: reqR, Stdout: respW, Args: []string{"cat-file", "--batch"}})
 		// git is reaped: a later request fails, and a reader sees git's
@@ -606,7 +626,7 @@ func (s *treeSource) open(rev string) (*treeBody, error) {
 	if err != nil || size < 0 {
 		return nil, errDeclined
 	}
-	return &treeBody{r: s.resp, left: size}, nil
+	return newTreeBody(s.resp, size, s.obj), nil
 }
 
 // childTree returns the object id of the folder name in tree rev. A tree

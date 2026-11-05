@@ -43,7 +43,7 @@ func (m *memTrees) open(rev string) (*treeBody, error) {
 		return nil, errDeclined
 	}
 	obj := append(bytes.Clone(raw), '\n')
-	return &treeBody{r: bufio.NewReaderSize(bytes.NewReader(obj), treeReadBuffer), left: int64(len(raw))}, nil
+	return newTreeBody(bufio.NewReaderSize(bytes.NewReader(obj), treeReadBuffer), int64(len(raw)), nil), nil
 }
 
 var rawModes = map[uint32]string{modeTree: "40000", modeBlob: "100644", modeExec: "100755", modeSymlink: "120000", modeGitlink: "160000"}
@@ -376,7 +376,7 @@ func TestTreeOrderHelpers(t *testing.T) {
 }
 
 func rawBody(raw string) *treeBody {
-	return &treeBody{r: bufio.NewReaderSize(strings.NewReader(raw+"\n"), treeReadBuffer), left: int64(len(raw))}
+	return newTreeBody(bufio.NewReaderSize(strings.NewReader(raw+"\n"), treeReadBuffer), int64(len(raw)), nil)
 }
 
 func rawEnt(mode, name string) string { return mode + " " + name + "\x00" + strings.Repeat("\x01", 20) }
@@ -473,7 +473,7 @@ func FuzzTreeBody(f *testing.F) {
 		if err := b.finish(); err != nil && !errors.Is(err, errDeclined) {
 			t.Fatalf("finish: %v", err)
 		}
-		if _, err := b.r.ReadByte(); !errors.Is(err, io.EOF) {
+		if _, err := b.resp.ReadByte(); !errors.Is(err, io.EOF) {
 			t.Fatalf("bytes after the object: %v", err)
 		}
 	})

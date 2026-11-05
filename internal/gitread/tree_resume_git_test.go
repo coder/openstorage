@@ -440,6 +440,33 @@ func TestLsTreePageCursorReapsItsChild(t *testing.T) {
 	}
 }
 
+// git sends a tree object that ends inside an entry as it is and waits for
+// the next request, so the walk must not read past the object for the rest
+// of the entry: it would wait for the request's whole time budget.
+func TestLsTreePageCursorOnTruncatedTrees(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	oid := strings.Repeat("\x01", 20)
+	for name, raw := range map[string]string{
+		"mode only":        "100644",
+		"no name end":      "100644 abc",
+		"short object id":  "100644 a\x00" + oid[:5],
+		"second entry cut": "100644 a\x00" + oid + "100644 b",
+	} {
+		commit := commitOf(t, dir, gitIn(t, dir, raw, "hash-object", "-t", "tree", "--literally", "-w", "--stdin"))
+		b := NewBudget(NewSlots(1, 1, 0), "repo", 20*time.Second, 1<<20)
+		start := time.Now()
+		_, _, _, err := LsTreePage(WithBudget(context.Background(), b), dir, commit, "", "a", 3)
+		b.Close()
+		if err == nil || IsBudgetError(err) || time.Since(start) > 8*time.Second {
+			t.Errorf("%s: err = %v after %v, want git's own error at once", name, err, time.Since(start))
+		}
+	}
+	if kids := catFileChildren(t); len(kids) != 0 {
+		t.Fatalf("cat-file children left: %q", kids)
+	}
+}
+
 // A walk that ends while git still has a large tree to write kills git: it
 // does not wait for a pipe that nobody reads.
 func TestLsTreePageCursorAbandonsALargeTree(t *testing.T) {
