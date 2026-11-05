@@ -504,9 +504,10 @@ def tf_names(text):
 
 # A line that ends in one of these leaves its expression open, so the next
 # line continues it and a function or class there is not a declaration. A
-# string keeps its quotes in the masked text, so a line that ends in a string
-# never looks like a dangling `=`.
-JS_CONTINUES = re.compile(r"[=(\[,?:+\-*/%&|^<>!~.]$")
+# postfix `++` or `--` and a regex literal (`/`) end a statement, so they are
+# left out. A string keeps its quotes in the masked text, so a line that ends
+# in a string never looks like a dangling `=`.
+JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*%&|^<>!~.]$")
 
 
 def js_names(text):
@@ -522,9 +523,11 @@ def js_names(text):
     return names
 
 
-# A quote opens and closes on one line. A quote that spans lines is not
-# tracked, so a stray apostrophe (in a heredoc body, say) cannot hide the
-# comments below it: such a `#` is still dropped, which fails closed.
+# A quote opens and closes on one line, and quotes pair in the order they
+# appear. A quote that spans lines is not tracked, so a stray apostrophe (in a
+# heredoc body, say) cannot hide the comments below it. A quote inside `$(...)`
+# in a double-quoted string pairs with the outer one. In both cases a `#` is
+# still dropped as a comment, which fails closed.
 SHELL_LEXER = re.compile(r"""('[^']*'|"(?:\\.|[^"\\])*"|\\.)|(?:^|(?<=[\s;&|()]))#.*""")
 
 

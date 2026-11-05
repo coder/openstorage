@@ -384,8 +384,11 @@ class CitationTests(CheckerTestCase):
               "const either = a ||\n  function orNamed() {};\nconst arrow = () =>\n  function arrowNamed() {};\n"
               "const pick = ok ?\n  function thenNamed() {} :\n  function elseNamed() {};\n"
               "function declared() {}\nconst plain = 'text'\nfunction afterString() {}\n"
-              "export default\nfunction defaulted() {}\n")
-        ok = ["viaEquals", "viaClass", "either", "arrow", "pick", "declared", "plain", "afterString", "defaulted"]
+              "export default\nfunction defaulted() {}\n"
+              "counter++\nfunction afterIncrement() {}\ncounter--\nfunction afterDecrement() {}\n"
+              "const re = /a+/\nfunction afterRegex() {}\n")
+        ok = ["viaEquals", "viaClass", "either", "arrow", "pick", "declared", "plain", "afterString", "defaulted",
+              "afterIncrement", "afterDecrement", "afterRegex"]
         bad = ["equalsNamed", "ClassNamed", "argNamed", "listNamed", "orNamed", "arrowNamed", "thenNamed",
                "elseNamed"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n",
