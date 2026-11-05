@@ -186,6 +186,29 @@ ALTER TABLE repos ADD COLUMN IF NOT EXISTS create_state integer NOT NULL DEFAULT
 DROP INDEX IF EXISTS repos_deleted_idx;
 CREATE INDEX IF NOT EXISTS repos_purgeable_idx
     ON repos (deleted_at, repo_id) WHERE deleted_at IS NOT NULL AND purged_at IS NULL;
+-- Any write to repos.default_branch ends the wait for adoption (issue
+-- #609). The clear lives in a trigger, not only in Go: during a rolling
+-- upgrade a replica from before this rule still commits a plain UPDATE, and
+-- its PATCH to "main" changes nothing the adopt write could see (adoption
+-- requires default_branch = 'main'). An UPDATE OF trigger fires when the SET
+-- list names the column, even for an unchanged value. The catalog check
+-- installs it once, so a steady-state boot takes no lock on repos for it
+-- (DROP TRIGGER would take ACCESS EXCLUSIVE on every boot).
+CREATE OR REPLACE FUNCTION clear_default_branch_omitted() RETURNS trigger LANGUAGE plpgsql AS $clear$
+BEGIN
+    UPDATE repo_upstreams SET default_branch_omitted = false
+    WHERE repo_id = NEW.repo_id AND default_branch_omitted;
+    RETURN NULL;
+END $clear$;
+DO $install$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger
+                   WHERE tgname = 'repos_clear_default_branch_omitted' AND tgrelid = 'repos'::regclass) THEN
+        CREATE TRIGGER repos_clear_default_branch_omitted
+            AFTER UPDATE OF default_branch ON repos
+            FOR EACH ROW EXECUTE FUNCTION clear_default_branch_omitted();
+    END IF;
+END $install$;
 `)
 		return err
 	})
