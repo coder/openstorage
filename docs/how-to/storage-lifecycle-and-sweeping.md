@@ -250,6 +250,10 @@ a rolling upgrade, a sweep that an older replica queued on the default queue can
 reach a replica with the schedule off. That replica fails it and River discards it, and
 the next interval runs the sweep again.
 
+River queues a scheduled job only from the elected leader. Set `OPENSTORAGE_SWEEP_INTERVAL`
+the same on every replica: a leader with the schedule off queues no sweep, even when
+another replica has it on, until leadership moves.
+
 Independent flags control what a sweep may *do*:
 
 | Mode | Default | Acts on |
@@ -418,8 +422,9 @@ namespace group. It runs every
 
 On PostgreSQL the job runs on its own single-worker River queue, `lfs_reclaim`, which only
 replicas with `OPENSTORAGE_LFS_GC_INTERVAL` set work. A replica with the job off never
-fetches a run that another replica queued. The rolling-upgrade note under
-[the orphan sweeper](#the-orphan-sweeper) applies here too.
+fetches a run that another replica queued. The rolling-upgrade note and the leader note
+under [the orphan sweeper](#the-orphan-sweeper) apply here too, with
+`OPENSTORAGE_LFS_GC_INTERVAL` in place of the sweep interval.
 
 A `507`-wedged repository accepts new objects again once enough junk rows retire and a
 covering sweep settles their refunds.
