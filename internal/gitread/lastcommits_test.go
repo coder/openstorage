@@ -579,26 +579,27 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 		// p takes D and resolves at D1, so the rest of D is dead, while q
 		// walks all of E, and each E line makes the walk wait. D1 resolves
 		// every path it holds, so the walk cancels the chain below it. Only
-		// the diffs sent before that are wasted: D2 to D8, as the window
-		// holds eight lines of each chain. Without that cancel, the chain
-		// stays marked until D2 pops, and the next pass sends one more.
+		// the diffs sent before that are wasted: the first pass sends the
+		// window's lines in order, half of them of each chain, so D2 up to
+		// the last D line that fits. Without that cancel, the chain stays
+		// marked until D2 pops, and the next pass sends one more.
 		name:      "a line that resolves every path cancels the chain below it",
 		spool:     slices.Concat([]string{"T D1 E1"}, interleave(chain("D", 4*lastCommitWindow, "R"), chain("E", 4*lastCommitWindow, "R")), []string{"R"}),
 		changed:   map[string][]string{"T D1": {"q"}, "D1 D2": {"p"}, "R": {"p", "q"}},
 		last:      map[string]string{"p": "D1", "q": "R"},
 		dead:      func(c string) bool { return strings.HasPrefix(c, "D") && c != "D1" },
-		maxDiffed: lastCommitWindow/2 - 1,
+		maxDiffed: (lastCommitWindow+1)/2 - 1,
 	}, {
 		// H and HZ are two dead chains below the shared parent P2. H resolves
 		// p, and its cancel forgets P2. M then hands q to HZ, which is sent
 		// ahead and marks P2 again, past the window. M's second parent heads
-		// a chain F1 to F14 that no path reaches and that holds P2 outside
-		// the window. P1, sent ahead with no path, pops next, and P2 enters
+		// a chain that no path reaches and that holds P2 outside the window:
+		// it fills the spool until P2 is exactly one window after P1. P1, sent ahead with no path, pops next, and P2 enters
 		// the window at exactly the line where it would be sent, before HZ
 		// pops and resolves q. P1's cancel is the one that forgets P2 this
 		// time.
 		name:      "a line sent ahead with no path forgets the parent a sibling chain marked",
-		spool:     slices.Concat([]string{"T H M", "H P1", "M HZ F1", "P1 P2", "HZ P2"}, chain("F", 14, "R"), []string{"P2 R", "R"}),
+		spool:     slices.Concat([]string{"T H M", "H P1", "M HZ F1", "P1 P2", "HZ P2"}, chain("F", lastCommitWindow-2, "R"), []string{"P2 R", "R"}),
 		changed:   map[string][]string{"T H": {"q"}, "H P1": {"p"}, "HZ P2": {"q"}, "R": {"p", "q"}},
 		last:      map[string]string{"p": "H", "q": "HZ"},
 		dead:      func(c string) bool { return c == "P2" },
@@ -615,15 +616,21 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 			}
 			byID := map[string]string{}
 			var spool strings.Builder
-			// Every line must be a parent of an earlier one, so that git could
-			// print the spool, in an order that has children before parents.
+			// Every commit must be reachable from the tip, and no parent may
+			// come before one of its children, as in any order that git's
+			// rev-list can print.
 			named := map[string]bool{strings.Fields(tc.spool[0])[0]: true}
+			printed := map[string]bool{}
 			for _, line := range tc.spool {
 				fields := strings.Fields(line)
 				if !named[fields[0]] {
 					t.Fatalf("spool line %q is not a parent of an earlier line", line)
 				}
+				printed[fields[0]] = true
 				for _, p := range fields[1:] {
+					if printed[p] {
+						t.Fatalf("spool line %q names %s as a parent after its own line", line, p)
+					}
 					named[p] = true
 				}
 				var out []string
