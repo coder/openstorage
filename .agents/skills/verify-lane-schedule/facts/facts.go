@@ -466,12 +466,9 @@ func main() {
 		{worker, "", []string{"claimContext", "claimLease"}},
 		{sched, "LocalScheduler", []string{"offer", "SweepOnce", "Start", "Drain"}},
 		{sched, "", []string{"shutdownAborted"}},
-		{refstore, "RefStore", []string{"CASRef", "emitPush"}},
 		{wireEvt, "", []string{"enqueueSyncOrForward"}},
 		{wireLocal, "", []string{"buildLocalSyncQueue"}},
-		{pub, "", []string{"WaitForPushPublication"}},
-		{pub, "publicationWait", []string{"wait"}},
-		{hydrate, "", []string{"Hydrate", "reservePushHolds", "removePushHolds", "appendPushReleased", "pushHoldLive", "readPushHolds"}},
+		{hydrate, "", []string{"Hydrate", "appendPushReleased"}},
 		{hydrate, "refCmdBatch", []string{"flush"}},
 		{hook, "", []string{"referenceTransactionHook", "updateHook"}},
 	} {
@@ -482,6 +479,30 @@ func main() {
 				label = c.src.path + ":" + c.recv + "." + n
 			}
 			fmt.Printf("FP %s %s\n", label, c.src.fingerprint(f.Pos(), f.End()))
+		}
+	}
+	// Whole files: every function of the push-intent decorator and of the
+	// publication wait, and every push-hold and ref-sync helper of hydrate.
+	for _, f := range []struct {
+		src  *source
+		keep func(name string) bool
+	}{
+		{refstore, func(string) bool { return true }},
+		{pub, func(string) bool { return true }},
+		{hydrate, func(n string) bool {
+			return strings.Contains(n, "Hold") || strings.Contains(n, "hold") || strings.HasPrefix(n, "syncRefs")
+		}},
+	} {
+		for _, d := range f.src.file.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || !f.keep(fd.Name.Name) {
+				continue
+			}
+			label := f.src.path + ":" + fd.Name.Name
+			if r := recvName(fd); r != "" {
+				label = f.src.path + ":" + r + "." + fd.Name.Name
+			}
+			fmt.Printf("FP %s %s\n", label, f.src.fingerprint(fd.Pos(), fd.End()))
 		}
 	}
 	for _, k := range []string{"MaxPushTransientRetries"} {

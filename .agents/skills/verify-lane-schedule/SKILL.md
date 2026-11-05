@@ -18,7 +18,7 @@ On SQLite and S3-WAL, a repository with `forward_on_push` forwards every accepte
 | `NoRewind` | The upstream ref never moves backwards. | A stale forced push rewinds the upstream. |
 | `Settles` | The lane always goes idle and stays idle. | Runs repeat forever, or the lane wedges. |
 
-"Accepted write" means a ref creation or update. Ref deletions are not forwarded, by design: `transferPush` uses no `--prune` and no delete refspecs (`internal/sync/worker_push.go`, file comment). A write by a caller that may not forward (a write-only token, any ref-policy operation, or a sync run's own loopback push) records no intent on purpose (`enqueueSyncOrForward`), and stays local until an authorized trigger.
+"Accepted write" means a ref creation or update. Ref deletions are not forwarded, by design: `transferPush` uses no `--prune` and no delete refspecs (`internal/sync/worker_push.go`, file comment). A write by a caller that may not forward (a write-only token, any ref-policy operation, or a sync run's own loopback push), on the git or the REST surface, records no intent on purpose (`enqueueSyncOrForward`, `forwardDeniedFromContext`), and stays local until an authorized trigger. The model also takes every write as a descendant of the one before. A rewrite (a force-updated branch, a replaced tag) is out of scope: its plain forward fails as `FailRejected` with a `repo.push_upstream.failed` event, by design, and only a force push-upstream call publishes it.
 
 ## When to run it
 
@@ -34,7 +34,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/lane-schedule-check.XXXXXX")
 ```
 
 - Needs Go (the `go.mod` version), Java 11 or newer, and `curl`. The first run downloads `tla2tools.jar` 1.7.4 (sha256-pinned) into `${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla`, the cache `verify-orphan-sweep` uses too. Set `JAVA`, `GO`, or `OPENSTORAGE_TLA_CACHE` to override.
-- A passing run takes about a minute with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), and about 35 s with `TLC_WORKERS=8`. A failing run usually takes seconds, because TLC stops at the first violation.
+- A passing run takes about 2 to 3 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), and about 80 s with `TLC_WORKERS=8`. A failing run usually takes seconds, because TLC stops at the first violation.
 - `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path.
 - `--only <cfg>` runs one config, for example `--only LaneSchedule.cfg`. It is for quick iteration. Finish with a full run.
 - `--fingerprints-only` checks the code facts and the fingerprints without TLC or Java, in about a second. CI runs it in the `lane-schedule-fingerprints` job of `.github/workflows/ci.yml`, so a change to covered code fails CI until someone brings the model in line and runs `check.sh --record`. CI does not run TLC: a pass says that the covered code is the code the model was checked against, not that the properties hold.
@@ -47,7 +47,7 @@ A clean run ends like this:
    ... (9 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/lane-schedule-check.Ab12Cd)
    LaneSchedule.cfg            PASS (2694082 distinct states)
-   OtherWriters.cfg            PASS (947602 distinct states)
+   OtherWriters.cfg            PASS (14198464 distinct states)
    Liveness.cfg                PASS (255510 distinct states)
    NoLeaseAssumption.cfg       fails as expected (trace: ...)
    NoCompletionAssumption.cfg  fails as expected (trace: ...)
@@ -96,7 +96,7 @@ Each TLA+ action names the Go call it stands for:
 | `WMark` | `events.RefStore.emitPush` calls the sync seam: `enqueueSyncOrForward` runs `RequestPush(repo, false)`, except for a push in `QuietWriters` (forward denied, or `EnvSyncClaim`), which records nothing |
 | `WPublish` | receive-pack commits the cache ref; `referenceTransactionHook` releases the hold (`appendPushReleased`) |
 | `WCrash` | after the CAS, the hook or receive-pack dies (serve's shutdown kills git children too), or `RequestPush` returns an error, which `emitPush` only logs as "sync poke lost" |
-| `RCas`, `RMark`, `RCrashRest` | a REST write (`internal/api` handlers' `CASRef` through `events.RefStore`): the authority CAS with no hold and no cache update, then `emitPush`'s `RequestPush` through the serve queue, or serve dying or `RequestPush` failing between the two |
+| `RCas`, `RMark`, `RCrashRest` | a REST write (`internal/api` handlers' `CASRef` through `events.RefStore`): the authority CAS with no hold and no cache update, then `emitPush`'s `RequestPush` through the serve queue (nothing for a write in `QuietRestWriters`), or serve dying or `RequestPush` failing between the two |
 | `Api` | `POST /repos/push-upstream`: `RequestPushNow` |
 | `Tick` | a backoff ends (`push_due <= now`) |
 | `Expire` | a claim's lease (`claimLease`) runs out |
@@ -145,7 +145,7 @@ When check.sh says STALE, or when you change covered code on purpose:
 
 ## Scope
 
-**Verified, within these bounds:** one repository and one ref, two runs at a time (from any processes), a plain and a force push-upstream call, a retry budget of 2, three upstream outages (enough to spend the budget), and two faults (run crashes, failed finish writes, shutdown cancels, pushes that die after their CAS), with two git pushes (`LaneSchedule.cfg`). `OtherWriters.cfg` swaps one push for a push that records no intent and adds a REST write, with one force call, a budget of 1, one outage and one fault. Liveness uses two pushes, a budget of 1, one outage and one fault (`Liveness.cfg`). A push's CAS can always fail instead (`WAbort`, not counted as a fault). TLC checks every interleaving of the modeled steps. A pass covers the model at these bounds, not the whole system.
+**Verified, within these bounds:** one repository and one ref, two runs at a time (from any processes), a plain and a force push-upstream call, a retry budget of 2, three upstream outages (enough to spend the budget), and two faults (run crashes, failed finish writes, shutdown cancels, pushes that die after their CAS), with two git pushes (`LaneSchedule.cfg`). `OtherWriters.cfg` swaps one push for a push that records no intent and adds two REST writes, one of which records no intent, with one force call, a budget of 1, one outage and one fault. Liveness uses two pushes, a budget of 1, one outage and one fault (`Liveness.cfg`). A push's CAS can always fail instead (`WAbort`, not counted as a fault). TLC checks every interleaving of the modeled steps. A pass covers the model at these bounds, not the whole system.
 
 **Assumptions:**
 
@@ -215,11 +215,11 @@ Sync commit: `4e30915ceb0fe663f80cb0730721fdf28152c1a6` (the last commit at whic
 | `internal/sync/worker_push.go` | `Worker.RunPush`, `Worker.transferPush`, `localPushOutcome`, `TransientPushFailure`, `PushRetryDelay`, `const MaxPushTransientRetries`, `var pushRefspecs` |
 | `internal/sync/worker.go` | `Worker.waitPublication`, `restoreLocal`, `claimLocal`, `restoreForShutdown`, `retryFinish`, `retryFinishWithin`, `claimContext`, `claimLease`, `var mirrorRefspecs` |
 | `internal/sync/local_schedule.go` | `LocalScheduler.offer`, `SweepOnce`, `Start`, `Drain`, `shutdownAborted` |
-| `internal/events/refstore.go` | `RefStore.CASRef`, `RefStore.emitPush` |
+| `internal/events/refstore.go` | every function (`CASRef`, `CASRefGen`, `emitPush` and helpers) |
 | `cmd/openstorage/wire_eventing.go` | `enqueueSyncOrForward` |
 | `cmd/openstorage/wire_eventing_local.go` | `buildLocalSyncQueue` |
-| `internal/githttp/publication.go` | `WaitForPushPublication`, `publicationWait.wait` |
-| `internal/githttp/hydrate.go` | `Hydrate`, `refCmdBatch.flush` (the held-ref skip), `reservePushHolds`, `removePushHolds`, `appendPushReleased`, `pushHoldLive`, `readPushHolds` |
+| `internal/githttp/publication.go` | every function |
+| `internal/githttp/hydrate.go` | `Hydrate`, `refCmdBatch.flush` (the held-ref skip), `appendPushReleased`, and every function whose name contains `Hold`/`hold` or starts with `syncRefs` |
 | `internal/githttp/hook.go` | `referenceTransactionHook`, `updateHook`, and in `preReceive` the `reserveHoldsAndProbe` closure |
 
 `model/fingerprints.txt` holds one hash per entry.
