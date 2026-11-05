@@ -133,7 +133,8 @@ func (sweepArgs) InsertOpts() river.InsertOpts {
 		Queue:       sweepQueue,
 		MaxAttempts: 1,
 		UniqueOpts: river.UniqueOpts{
-			ByArgs: true,
+			ByArgs:  true,
+			ByQueue: true, // see sweepQueue
 			ByState: []rivertype.JobState{
 				rivertype.JobStateAvailable,
 				rivertype.JobStatePending,
@@ -158,7 +159,8 @@ func (lfsReclaimArgs) InsertOpts() river.InsertOpts {
 		Queue:       lfsReclaimQueue,
 		MaxAttempts: 1,
 		UniqueOpts: river.UniqueOpts{
-			ByArgs: true,
+			ByArgs:  true,
+			ByQueue: true, // see sweepQueue
 			ByState: []rivertype.JobState{
 				rivertype.JobStateAvailable,
 				rivertype.JobStatePending,
@@ -208,6 +210,11 @@ const absenceQueue = "absence_reconcile"
 // job. On the shared default queue it did, returned errScheduleOff, and
 // River discarded the job (MaxAttempts 1): the tick was lost. Each job is
 // unique, so a second worker would stay idle.
+//
+// The unique key includes the queue (ByQueue). An older binary inserts these
+// jobs on the default queue with a key that has no queue in it. If a rollback
+// strands an unfetched job in the new queue, no older replica fetches it, and
+// without ByQueue it would also block every insert from the older fleet.
 const (
 	sweepQueue      = "orphan_pack_sweep"
 	lfsReclaimQueue = "lfs_reclaim"

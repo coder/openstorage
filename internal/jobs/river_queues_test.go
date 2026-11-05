@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/rivertype"
 
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/events"
@@ -103,5 +104,46 @@ func TestRiverPassJobsWaitForAReplicaWithTheScheduleOn(t *testing.T) {
 	})
 	if blobs.lists.Load() == 0 || scans.scans.Load() == 0 {
 		t.Errorf("both jobs completed, but the sweep listed %d times and the reclaim scanned %d times", blobs.lists.Load(), scans.scans.Load())
+	}
+}
+
+// A rollback can strand an unfetched sweep or LFS reclaim job in its own
+// queue, where no older replica fetches it. It must not block the older
+// fleet's inserts, which carry a unique key without the queue.
+func TestRiverPassJobsDoNotBlockOlderDefaultQueueInserts(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	migrateRiver(t, pgURL)
+	ins, err := NewRiverInsertOnly(ctx, pgURL)
+	if err != nil {
+		t.Fatalf("NewRiverInsertOnly: %v", err)
+	}
+	defer ins.Close()
+
+	older := &river.InsertOpts{
+		Queue:       river.QueueDefault,
+		MaxAttempts: 1,
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+			ByState: []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRetryable,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			},
+		},
+	}
+	for _, args := range []river.JobArgs{sweepArgs{}, lfsReclaimArgs{}} {
+		stranded, err := ins.client.Insert(ctx, args, nil)
+		if err != nil || stranded.UniqueSkippedAsDuplicate {
+			t.Fatalf("insert %s: skipped=%v err=%v", args.Kind(), stranded.UniqueSkippedAsDuplicate, err)
+		}
+		if res, err := ins.client.Insert(ctx, args, older); err != nil || res.UniqueSkippedAsDuplicate {
+			t.Errorf("%s: an older binary's insert was deduplicated against a job stranded in its own queue (skipped=%v err=%v)", args.Kind(), res.UniqueSkippedAsDuplicate, err)
+		}
+		if res, err := ins.client.Insert(ctx, args, nil); err != nil || !res.UniqueSkippedAsDuplicate {
+			t.Errorf("%s: a second insert in the job's own queue was not deduplicated (skipped=%v err=%v)", args.Kind(), res.UniqueSkippedAsDuplicate, err)
+		}
 	}
 }
