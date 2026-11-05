@@ -184,3 +184,59 @@ func TestLocalForwardHeldStaleRefRestores(t *testing.T) {
 		t.Fatalf("lane idle with upstream main = %s, authority main = %s (cache held %s): the run forwarded the stale held snapshot and ended done, so the REST write is never forwarded", got, b, a)
 	}
 }
+
+// TestServeStrictSyncFetchOnLocalSchedule: serve turns on StrictSyncFetch
+// for the local schedule only. With a push holding main while the cache
+// lags the authority, a fetch whose token carries a sync claim (a push
+// run's loopback fetch) gets 423 Locked on SQLite and S3WAL; PostgreSQL
+// runs have no restore, so they keep reading. An ordinary fetch reads the
+// cached value on every backend.
+func TestServeStrictSyncFetchOnLocalSchedule(t *testing.T) {
+	ctx := t.Context()
+	db, blobs := privateStores(t, t.TempDir())
+	cache := t.TempDir()
+	node, err := startNode(cache, "OPENSTORAGE_PG_URL="+db, "OPENSTORAGE_S3_URL="+blobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.stop()
+	token := mintTestToken(t, "https://example.com/strict-fetch.git", "repo:write,git:read,git:write", "")
+	var created struct {
+		RepoID string `json:"repo_id"`
+	}
+	if status := apiJSON(t, node, "POST", token, "/api/v1/repos", "{}", &created); status != 201 || created.RepoID == "" {
+		t.Fatalf("create: status=%d id=%q", status, created.RepoID)
+	}
+	id := created.RepoID
+	work := initWorkRepo(t)
+	a := revParse(t, work, "HEAD")
+	mustGit(t, work, "push", remoteURL(node, id, token), "HEAD:refs/heads/main")
+	b := commitFile(t, work, "b.txt", "b\n", "b", nil)
+	mustGit(t, work, "push", remoteURL(node, id, token), "HEAD:refs/heads/other")
+
+	// A REST-style write moves main in the authority only, then a push
+	// holds main.
+	st, err := ref.Open(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if won, err := st.CASRef(ctx, id, "refs/heads/main", a, b); err != nil || !won {
+		t.Fatalf("authority write = (%v, %v)", won, err)
+	}
+	mintHold(t, RepoPath(cache, id), "refs/heads/main")
+
+	syncClaims := testClaims(id, "git:read,git:write")
+	syncClaims.SyncClaim = "holder"
+	out, err := tryGit("", "ls-remote", remoteURL(node, id, mintWith(t, orgES256Key, "ES256", syncClaims)), "refs/heads/main")
+	if testBackend == backendPG {
+		if err != nil {
+			t.Fatalf("PostgreSQL sync-claim fetch failed: %v\n%s", err, out)
+		}
+	} else if err == nil || !strings.Contains(out, "423") {
+		t.Fatalf("sync-claim fetch of a stale held ref = (%v)\n%s\nwant 423 Locked", err, out)
+	}
+	if got := lsRemoteSHA(t, "", remoteURL(node, id, token), "refs/heads/main"); got != a {
+		t.Fatalf("ordinary fetch read main = %q, want the cached %s", got, a)
+	}
+}
