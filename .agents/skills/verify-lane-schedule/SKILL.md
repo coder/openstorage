@@ -22,7 +22,7 @@ On SQLite and S3-WAL, a repository with `forward_on_push` forwards every accepte
 
 ## When to run it
 
-Run it when your change touches any file in the [coverage record](#coverage-record), or any other code that writes `push_pending`, `push_due`, `push_attempt` or the push claim columns (`PushPending`, `PushDue`, `PushAttempt`, `PushClaim*` on S3-WAL). Also run it when you change what makes a store transition atomic, which the model assumes and the fingerprints do not see: `SQLite.inTx` (`internal/meta/sqlite.go`), and `S3WAL.mutate` with its `recover` handling (`internal/meta/s3walmeta.go`). The same goes for `toRepoUpstream` (`internal/meta/s3walmeta.go`), which is outside coverage too: it copies the S3-WAL lane columns (`PushPending`, `PushSyncing`, `PushClaimHolder`, `PushClaimExpiresAt`, `PushClaimForce`) into the `RepoUpstream` that S3-WAL claims and reads return. Also run it when `check.sh` prints STALE.
+Run it when your change touches any file in the [coverage record](#coverage-record), or any other code that writes `push_pending`, `push_due`, `push_attempt` or the push claim columns (`PushPending`, `PushDue`, `PushAttempt`, `PushClaim*` on S3-WAL). Also run it when you change what makes a store transition atomic, which the model assumes and the fingerprints do not see: `SQLite.inTx` (`internal/meta/sqlite.go`), and `S3WAL.mutate` with its `recover` handling (`internal/meta/s3walmeta.go`). The same goes for `toRepoUpstream` (`internal/meta/s3walmeta.go`), which is outside coverage too: it copies the S3-WAL push-lane protocol columns (`PushPending`, `PushSyncing`, `PushClaimHolder`, `PushClaimExpiresAt`, `PushClaimForce`) into the `RepoUpstream` that S3-WAL claims and reads return. Also run it when `check.sh` prints STALE.
 
 ## Run
 
@@ -202,7 +202,7 @@ Every fact was broken in the real code, one at a time, on a checkout whose cover
 .agents/skills/verify-lane-schedule/mutate.sh
 ```
 
-It needs what check.sh needs, plus git, bash 4 or newer, and python3, and takes about 2 to 5 minutes, most of it the unmodified baseline runs. It prints one line per break and ends with `COUNT: 9/9 mutations failed check.sh as expected`. When check.sh cannot run at all (exit 3, such as a missing Java), mutate.sh stops with exit 3 and the check.sh error, before any break. When you add, move or rename a fact's guard, update its line in `mutate.sh`:
+It needs what check.sh needs, plus git, bash 4 or newer, and python3, and takes about 2 to 5 minutes, most of it the unmodified baseline runs. It prints one line per break and ends with `COUNT: 9/9 mutations failed check.sh as expected`. It first runs each config it uses unmodified. When check.sh cannot run at all there (exit 3, such as a missing Java or a TLC error), mutate.sh stops with exit 3 and check.sh's error line, before any break. When you add, move or rename a fact's guard, update its line in `mutate.sh`:
 
 | Scratch break | Fact | Config | Failed |
 |---|---|---|---|

@@ -50,7 +50,8 @@ base_ok() { # config
     local d="$work/base-${cfg%.cfg}"
     local rc=0; "$skill_dir/check.sh" --out "$d/tlc" --only "$cfg" >"$d.txt" 2>&1 || rc=$?
     if [ "$rc" = 3 ]; then # a tool problem, not the model: nothing below can count
-      echo "mutate.sh: check.sh could not run on unmodified $cfg (exit 3, $d.txt): $(tail -n 1 "$d.txt")" >&2
+      local why; why=$(grep -m1 -E '^(check\.sh: |Error: )' "$d.txt" || tail -n 1 "$d.txt")
+      echo "mutate.sh: check.sh could not run on unmodified $cfg (exit 3, $d.txt): $why" >&2
       exit 3
     fi
     if grep -qE "^   $cfg +PASS \(" "$d.txt"; then baseline[$cfg]=ok; else baseline[$cfg]=bad; fi
@@ -62,6 +63,7 @@ base_ok() { # config
 mut() { # name file old new config expected
   local name=$1 file=$2 old=$3 new=$4 cfg=$5 want=$6
   total=$((total + 1))
+  [ -n "${baseline[$cfg]:-}" ] || { echo "mutate.sh: $cfg is not in the baseline list below; add it" >&2; exit 3; }
   if [ "$model" = 1 ]; then
     base_ok "$cfg" || { echo "$name: ERROR baseline $cfg fails"; return; }
     local d="$work/$name"; mkdir -p "$d"
@@ -91,6 +93,10 @@ judge() { # name rc expected output: exactly this fact FALSE, and the property f
     echo "$1: MISMATCH rc=$2 false_facts=[$fact] output=$4"
   fi
 }
+
+# Every config the table uses, run unmodified before any break, so a tool
+# error (exit 3) stops the run before it edits code.
+for cfg in Liveness.cfg LaneSchedule.cfg; do base_ok "$cfg" || true; done
 
 mut ClaimConsumesPending internal/meta/sqlite_eventing.go 'SET push_syncing = 1, push_pending = 0, push_claim_holder' 'SET push_syncing = 1, push_claim_holder' Liveness.cfg 'Temporal properties were violated'
 mut ClaimMarksDue internal/meta/s3walmeta_eventing.go 'attempt, u.PushDue = u.PushAttempt, nowNanos' 'attempt = u.PushAttempt' LaneSchedule.cfg 'Invariant BackoffKept is violated'
