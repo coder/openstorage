@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -198,9 +199,9 @@ func TestRiverLaneScanRequeuesLanesWithoutJob(t *testing.T) {
 	prev := laneScanPage
 	laneScanPage = 2 // several pages per pass
 	t.Cleanup(func() { laneScanPage = prev })
-	cursor, requeued, err := q.scanLanes(ctx, "org", "")
-	if err != nil || cursor != "" || requeued != 4 {
-		t.Fatalf("scanLanes = cursor %q, %d requeued, err %v; want a full pass that requeued 4", cursor, requeued, err)
+	requeued, err := q.scanLanes(ctx, "org")
+	if err != nil || q.scanCursor != "" || requeued != 4 {
+		t.Fatalf("scanLanes = %d requeued, cursor %q, err %v; want a full pass that requeued 4", requeued, q.scanCursor, err)
 	}
 	for i, tc := range cases {
 		got := lanes{push: env.liveJobs(t, ctx, "upstream_push", repos[i]), pull: env.liveJobs(t, ctx, "upstream_sync", repos[i])}
@@ -208,8 +209,22 @@ func TestRiverLaneScanRequeuesLanesWithoutJob(t *testing.T) {
 			t.Errorf("%s: live jobs %+v, want %+v", tc.name, got, tc.want)
 		}
 	}
+	// The scan's jobs are the ones EnqueuePush and EnqueueSync insert.
+	for i, tc := range cases {
+		if tc.name != "push_pending_discarded" && tc.name != "pull_pending_discarded" {
+			continue
+		}
+		var same bool
+		if err := env.conn.QueryRow(ctx, `SELECT count(DISTINCT (kind, args, queue, max_attempts, priority)) = 1 AND count(*) = 2
+			FROM river_job WHERE args->>'repo_id' = $1`, repos[i]).Scan(&same); err != nil {
+			t.Fatal(err)
+		}
+		if !same {
+			t.Errorf("%s: the scan's job differs from the discarded job that the enqueue inserted", tc.name)
+		}
+	}
 	// Every lane with work now has a live job: the next pass adds none.
-	if _, requeued, err := q.scanLanes(ctx, "org", ""); err != nil || requeued != 0 {
+	if requeued, err := q.scanLanes(ctx, "org"); err != nil || requeued != 0 {
 		t.Fatalf("second pass requeued %d (err %v), want 0", requeued, err)
 	}
 }
@@ -227,17 +242,166 @@ func TestRiverLaneScanRechecksAfterInsert(t *testing.T) {
 	defer q.Close()
 	q.logger = slog.New(slog.DiscardHandler)
 	idle := env.linked(t, ctx, "org", "consumed").RepoID // as after the run's claim
-	for _, push := range []bool{true, false} {
-		if inserted, err := q.requeueLane(ctx, "org", idle, push); err != nil || inserted {
-			t.Fatalf("requeueLane(push=%v) on a lane without work = %v, %v; want no job", push, inserted, err)
+	pullOnly := env.linked(t, ctx, "org", "pull-only").RepoID
+	if err := env.ms.RequestSync(ctx, pullOnly); err != nil {
+		t.Fatal(err)
+	}
+	pushOnly := env.linked(t, ctx, "org", "push-only").RepoID
+	if err := env.ms.RequestPush(ctx, pushOnly, false); err != nil {
+		t.Fatal(err)
+	}
+	deleted := env.linked(t, ctx, "org", "deleted").RepoID
+	if err := env.ms.RequestPush(ctx, deleted, false); err != nil {
+		t.Fatal(err)
+	}
+	env.exec(t, ctx, `UPDATE repos SET deleted_at = now() WHERE repo_id = $1`, deleted)
+	unlinked, err := env.ms.CreateRepo(ctx, "org", "https://example.com/unlinked.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		repoID string
+		push   bool
+	}{
+		{"idle push", idle, true}, {"idle pull", idle, false},
+		{"push of a pull-only lane", pullOnly, true}, {"pull of a push-only lane", pushOnly, false},
+		{"deleted repo", deleted, true}, {"unlinked repo", unlinked.RepoID, true},
+	} {
+		if inserted, err := q.requeueLane(ctx, "org", tc.repoID, tc.push); err != nil || inserted {
+			t.Errorf("requeueLane(%s) = %v, %v; want no job", tc.name, inserted, err)
 		}
 	}
 	var n int
-	if err := env.conn.QueryRow(ctx, `SELECT count(*) FROM river_job WHERE args->>'repo_id' = $1`, idle).Scan(&n); err != nil {
+	if err := env.conn.QueryRow(ctx, `SELECT count(*) FROM river_job`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
-		t.Fatalf("%d job rows for a lane without work, want 0", n)
+		t.Fatalf("%d job rows for lanes without work, want 0", n)
+	}
+}
+
+// laneTrio links three repos of "org" with a push request each and returns
+// their IDs in the scan's order.
+func (e laneScanEnv) laneTrio(t *testing.T, ctx context.Context) (a, b, c string) {
+	t.Helper()
+	var ids []string
+	for _, name := range []string{"trio-1", "trio-2", "trio-3"} {
+		id := e.linked(t, ctx, "org", name).RepoID
+		if err := e.ms.RequestPush(ctx, id, false); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	rows, err := e.conn.Query(ctx, `SELECT id FROM unnest($1::text[]) AS id ORDER BY id`, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sorted, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || len(sorted) != 3 {
+		t.Fatalf("sort repo ids: %v %v", sorted, err)
+	}
+	return sorted[0], sorted[1], sorted[2]
+}
+
+// lockJob holds a row lock on repoID's push job until the returned release
+// runs, so a scan insert that meets the job waits.
+func (e laneScanEnv) lockJob(t *testing.T, ctx context.Context, repoID string) (release func()) {
+	t.Helper()
+	tx, err := e.conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := tx.QueryRow(ctx, `WITH l AS (SELECT id FROM river_job WHERE kind = 'upstream_push' AND args->>'repo_id' = $1
+		AND state = 'available' FOR UPDATE) SELECT count(*) FROM l`, repoID).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("lock the push job of %s: %d rows, %v", repoID, n, err)
+	}
+	return func() { _ = tx.Rollback(ctx) }
+}
+
+// TestRiverLaneScanResumesAfterTimeout: a pass that runs out of time ends
+// within laneScanTimeout and keeps its cursor, and the next pass continues
+// after the last lane it handled instead of starting over.
+func TestRiverLaneScanResumesAfterTimeout(t *testing.T) {
+	ctx := context.Background()
+	env := newLaneScanEnv(t, ctx)
+	q, err := NewRiverInsertOnly(ctx, env.pgURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	q.logger = slog.New(slog.DiscardHandler)
+	prev := laneScanTimeout
+	laneScanTimeout = time.Second
+	t.Cleanup(func() { laneScanTimeout = prev })
+
+	a, b, c := env.laneTrio(t, ctx)
+	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: b}); err != nil {
+		t.Fatal(err)
+	}
+	conn2, err := pgx.Connect(ctx, env.pgURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn2.Close(context.Background()) })
+	releaseB := env.lockJob(t, ctx, b) // b's insert waits: the pass times out there
+
+	start := time.Now()
+	requeued, err := q.scanLanes(ctx, "org")
+	if !errors.Is(err, context.DeadlineExceeded) || requeued != 1 || q.scanCursor != a {
+		t.Fatalf("first pass = %d requeued, cursor %q, err %v; want a's job, then a timeout at b with the cursor at a", requeued, q.scanCursor, err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("the pass took %v, want about laneScanTimeout", took)
+	}
+	// A pass that started over would now wait at a.
+	releaseA := laneScanEnv{conn: conn2}.lockJob(t, ctx, a)
+	defer releaseA()
+	releaseB()
+	requeued, err = q.scanLanes(ctx, "org")
+	if err != nil || requeued != 1 || q.scanCursor != "" {
+		t.Fatalf("second pass = %d requeued, cursor %q, err %v; want c's job and a full traversal", requeued, q.scanCursor, err)
+	}
+	if n := env.liveJobs(t, ctx, "upstream_push", c); n != 1 {
+		t.Fatalf("c has %d live push jobs, want 1", n)
+	}
+
+	// A pass whose list fails keeps the cursor too.
+	q.scanCursor = a
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := q.scanLanes(cancelled, "org"); err == nil || q.scanCursor != a {
+		t.Fatalf("cancelled pass: err %v, cursor %q; want an error and the cursor kept at a", err, q.scanCursor)
+	}
+}
+
+// TestRiverLaneScanSkipsFailingLane: a lane whose requeue fails does not
+// stop the pass. The lanes after it still get their jobs.
+func TestRiverLaneScanSkipsFailingLane(t *testing.T) {
+	ctx := context.Background()
+	env := newLaneScanEnv(t, ctx)
+	// Every statement of this client gives up on a lock after half a second.
+	q, err := NewRiverInsertOnly(ctx, env.pgURL+"&options=-c%20lock_timeout%3D500")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	q.logger = slog.New(slog.DiscardHandler)
+	a, b, c := env.laneTrio(t, ctx)
+	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: b}); err != nil {
+		t.Fatal(err)
+	}
+	defer env.lockJob(t, ctx, b)() // b's requeue fails on the lock
+
+	requeued, err := q.scanLanes(ctx, "org")
+	if err != nil || requeued != 2 || q.scanCursor != "" {
+		t.Fatalf("scanLanes = %d requeued, cursor %q, err %v; want a's and c's jobs and a full traversal", requeued, q.scanCursor, err)
+	}
+	for _, id := range []string{a, c} {
+		if n := env.liveJobs(t, ctx, "upstream_push", id); n != 1 {
+			t.Errorf("%s has %d live push jobs, want 1", id, n)
+		}
 	}
 }
 

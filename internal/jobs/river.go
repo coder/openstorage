@@ -745,11 +745,12 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 		}
 		// Stranded mirror-back rescue (Codex round 6): RunPush marks the
 		// mirror-back durable (RequestSync) BEFORE its direct enqueue,
-		// but on pg that enqueue is a plain insert with no boot-recovery
-		// scan behind it — if it fails transiently while no pull is in
-		// flight, the sync_pending marker has no job left to consume it,
-		// and a pull that fetched the pre-forward upstream could stand
-		// divergent forever. Covering the marker here makes mirror-back
+		// and on pg that enqueue is a plain insert. If it fails
+		// transiently while no pull is in flight, the sync_pending
+		// marker has no job left to consume it until the lane scan
+		// (StartLaneScan) finds it minutes later, and a pull that fetched
+		// the pre-forward upstream stands divergent until then. Covering
+		// the marker here makes mirror-back
 		// scheduling part of this push job's durable completion: the
 		// insert deduplicates against any live sync job (unique by
 		// repo), whose own completion gate re-checks the marker.
@@ -782,10 +783,12 @@ type River struct {
 	logger     *slog.Logger
 
 	// The lane scan (StartLaneScan): scanStop is set once, by the start or
-	// the first stop.
-	scanMu   stdsync.Mutex
-	scanStop context.CancelFunc
-	scanning stdsync.WaitGroup
+	// the first stop. Only scanLanes touches scanCursor, and only the scan
+	// goroutine calls it.
+	scanMu     stdsync.Mutex
+	scanStop   context.CancelFunc
+	scanning   stdsync.WaitGroup
+	scanCursor string
 }
 
 var (
