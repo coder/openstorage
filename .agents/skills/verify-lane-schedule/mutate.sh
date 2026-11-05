@@ -2,7 +2,7 @@
 # mutate.sh: break each code fact once in the real Go source and confirm
 # that check.sh fails with the property SKILL.md's Validation table names.
 #
-#   .agents/skills/verify-lane-schedule/mutate.sh
+#   .agents/skills/verify-lane-schedule/mutate.sh [--model]
 #
 # Each mutation edits one covered file, checks that its package still
 # compiles, runs `check.sh --only <config>`, and restores the file with
@@ -10,8 +10,25 @@
 # exits 0 only when every mutation failed as expected. Each config it uses
 # must first pass unmodified. The covered files must have no uncommitted
 # changes; an interrupted run restores the file it broke. Outputs stay in
-# one private temporary directory. Needs what check.sh needs (Go, Java).
+# one private temporary directory.
+#
+# --model edits no code: it sets each fact FALSE in the model only
+# (`check.sh --fact <fact>=FALSE`) and expects the same property to fail.
+#
+# Needs what check.sh needs (Go, Java 11+, curl for the first TLC download),
+# plus git, bash 4 or newer, and python3 (not for --model). Takes about 2 to
+# 5 minutes, most of it the unmodified baseline runs.
 set -uo pipefail
+[ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "mutate.sh: needs bash 4 or newer" >&2; exit 3; }
+model=0
+case ${1-} in
+  "") ;;
+  --model) model=1 ;;
+  *) echo "mutate.sh: unknown argument $1 (takes only --model)" >&2; exit 3 ;;
+esac
+if [ "$model" = 0 ] && ! python3 -c '' >/dev/null 2>&1; then
+  echo "mutate.sh: needs a working python3 to edit the Go source" >&2; exit 3
+fi
 skill_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(git -C "$skill_dir" rev-parse --show-toplevel) || exit 3
 cd "$repo" || exit 3
@@ -40,6 +57,12 @@ base_ok() { # config
 mut() { # name file old new config expected
   local name=$1 file=$2 old=$3 new=$4 cfg=$5 want=$6
   total=$((total + 1))
+  if [ "$model" = 1 ]; then
+    base_ok "$cfg" || { echo "$name: ERROR baseline $cfg fails"; return; }
+    local d="$work/$name"; mkdir -p "$d"
+    local rc=0; "$skill_dir/check.sh" --out "$d/tlc" --only "$cfg" --fact "$name=FALSE" >"$d/check.txt" 2>&1 || rc=$?
+    judge "$name" "$rc" "$want" "$d/check.txt"; return
+  fi
   if ! git diff --quiet HEAD -- "$file"; then echo "$name: ERROR $file has uncommitted changes"; return; fi
   base_ok "$cfg" || { echo "$name: ERROR baseline $cfg fails"; return; }
   local d="$work/$name"; mkdir -p "$d"
@@ -52,11 +75,15 @@ mut() { # name file old new config expected
   fi
   local rc=0; "$skill_dir/check.sh" --out "$d/tlc" --only "$cfg" >"$d/check.txt" 2>&1 || rc=$?
   restore
-  local fact; fact=$(grep -E "^   [A-Za-z]+ +FALSE" "$d/check.txt" | awk '{print $1}' | paste -sd, -)
-  if [ "$rc" = 1 ] && [ "$fact" = "$name" ] && grep -q "$want" "$d/check.txt"; then
-    pass=$((pass + 1)); echo "$name: OK ($want)"
+  judge "$name" "$rc" "$want" "$d/check.txt"
+}
+
+judge() { # name rc expected output: exactly this fact FALSE, and the property failed
+  local fact; fact=$(grep -E "^   [A-Za-z]+ +FALSE" "$4" | awk '{print $1}' | paste -sd, -)
+  if [ "$2" = 1 ] && [ "$fact" = "$1" ] && grep -q "$3" "$4"; then
+    pass=$((pass + 1)); echo "$1: OK ($3)"
   else
-    echo "$name: MISMATCH rc=$rc false_facts=[$fact] output=$d/check.txt"
+    echo "$1: MISMATCH rc=$2 false_facts=[$fact] output=$4"
   fi
 }
 

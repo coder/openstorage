@@ -2,7 +2,7 @@
 # check.sh: model-check the local push-lane schedule (ADR-50) against the
 # writers that record forward intent and the runs that forward it.
 #
-#   .agents/skills/verify-lane-schedule/check.sh [--out DIR] [--only CFG]... [--record]
+#   .agents/skills/verify-lane-schedule/check.sh [--out DIR] [--only CFG]... [--fact NAME=FALSE] [--record]
 #   .agents/skills/verify-lane-schedule/check.sh --fingerprints-only
 #
 # 1. Reads the code facts and fingerprints from the Go source (facts/facts.go).
@@ -16,11 +16,16 @@
 #   1  a property failed in LaneSchedule.cfg, OtherWriters.cfg or
 #      Liveness.cfg. Read the trace in --out.
 #   2  STALE: the properties hold, but covered code changed since the sync
-#      commit, or a probe stopped failing. Review the model against the code.
+#      commit, a fact is FALSE, or a probe stopped failing. Review the model
+#      against the code.
 #   3  the check could not run (Go, Java, TLC download, parse error)
 #
 # --only CFG runs only that config from model/ (repeatable). A partial run
 # proves nothing about the other configs: finish with a full run.
+#
+# --fact NAME=FALSE sets one code fact FALSE in the model only, whatever the
+# code says. mutate.sh --model uses it to show that each fact matters. A run
+# with it never exits 0.
 #
 # --fingerprints-only skips TLC and Java: it checks the facts and the
 # fingerprints only, and exits 0, 2 or 3. CI runs it. A pass says the covered
@@ -48,13 +53,18 @@ repo=$(git -C "$skill_dir" rev-parse --show-toplevel 2>/dev/null) || {
   echo "check.sh: not inside a git checkout" >&2; exit 3; }
 model="$skill_dir/model"
 
-out="" record=0 only=" " fp_only=0
+out="" record=0 only=" " fp_only=0 flip=""
 while [ $# -gt 0 ]; do
   case $1 in
     --out) [ $# -ge 2 ] || { echo "check.sh: --out needs a directory" >&2; exit 3; }
            out=$2; shift 2 ;;
     --record) record=1; shift ;;
     --fingerprints-only) fp_only=1; shift ;;
+    --fact) case ${2-} in
+              [A-Za-z]*=FALSE) flip=${2%=FALSE} ;;
+              *) echo "check.sh: --fact takes NAME=FALSE" >&2; exit 3 ;;
+            esac
+            shift 2 ;;
     --only) [ $# -ge 2 ] || { echo "check.sh: --only needs a config name" >&2; exit 3; }
             case $2 in
               LaneSchedule.cfg|OtherWriters.cfg|Liveness.cfg|NoLeaseAssumption.cfg|NoCompletionAssumption.cfg|NoFreshnessAssumption.cfg) ;;
@@ -90,6 +100,13 @@ command -v "$GO" >/dev/null || die "needs Go (set GO=/path/to/go)"
 if ! (cd "$repo" && "$GO" run "$skill_dir/facts/facts.go" -root "$repo") >"$out/facts.txt" 2>"$out/facts.err"; then
   cat "$out/facts.err" >&2
   die "facts.go failed (a covered file or a function a fact reads moved or was renamed?)"
+fi
+if [ -n "$flip" ]; then
+  awk -v f="$flip" '$1 == "FACT" && $2 == f { found = 1 } END { exit !found }' "$out/facts.txt" ||
+    die "--fact: facts.go has no fact $flip"
+  awk -v f="$flip" '$1 == "FACT" && $2 == f { $0 = "FACT " f " FALSE overridden by --fact" } { print }' \
+    "$out/facts.txt" >"$work/facts.txt" || die "--fact: cannot rewrite facts.txt"
+  mv "$work/facts.txt" "$out/facts.txt" || die "--fact: cannot rewrite facts.txt"
 fi
 facts_cfg="$work/facts.cfg"
 {
@@ -212,8 +229,9 @@ grep -v '^#' "$model/fingerprints.txt" | sort >"$work/fingerprints.rec"
 echo "== Coverage (sync commit ${sync:-unknown})"
 if [ -n "$sync" ] && ! git -C "$repo" cat-file -e "$sync^{commit}" 2>/dev/null; then
   # A squash merge leaves a PR's recorded head off main; GitHub keeps it.
-  echo "   note: sync commit $sync is not in this clone. Fetch PR heads with"
-  echo "   git fetch origin '+refs/pull/*/head:refs/remotes/origin/pull/*'"
+  echo "   note: sync commit $sync is not in this clone. In a shallow clone, fetch"
+  echo "   main's history (git fetch --unshallow origin). A sync commit recorded at a"
+  echo "   PR head is under refs/pull: git fetch origin '+refs/pull/*/head:refs/remotes/origin/pull/*'"
 fi
 changed=$(join -a1 -a2 -e MISSING -o 0,1.2,2.2 "$work/fingerprints.rec" "$out/fingerprints.now" | awk '$2 != $3 {print $1}')
 if [ -n "$changed" ]; then
