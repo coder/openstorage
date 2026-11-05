@@ -204,7 +204,7 @@ With every fact TRUE, each fact flipped in the model alone fails the same proper
 
 ## Coverage record
 
-Sync commit: `4e30915ceb0fe663f80cb0730721fdf28152c1a6` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
+Sync commit: `61a018a09a25e92af677144f17bc9dbc1f0765a3` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
 Every declaration in these files is covered:
 
