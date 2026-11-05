@@ -67,7 +67,8 @@ func (syncArgs) Kind() string { return "upstream_sync" }
 // re-run — whose claim attempt steals the dead holder's expired lease — is
 // that request's only follow-up. With a single attempt the rescuer could
 // only discard the orphan, stranding the accepted 202 until an unrelated
-// later trigger.
+// later trigger. A job discarded after its last attempt leaves its work to
+// the lane scan (StartLaneScan), which inserts the job again minutes later.
 const syncRescueAttempts = 3
 
 func (syncArgs) InsertOpts() river.InsertOpts {

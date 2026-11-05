@@ -589,6 +589,12 @@ job triggered through one replica may run (and log) on another. What the jobs do
 read their reports, and delete-mode prerequisites: see the
 [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 
+River discards an upstream sync or push job after its third crashed attempt, and the
+repository's upstream row still holds the request. Every replica scans for such requests
+every five minutes, the first time 15 seconds after boot, and enqueues the job again. Each
+requeue logs `lane scan: requeued a lane whose work had no job` with the `org`, `repo` and
+`lane` (`push` or `pull`) fields.
+
 ## What to monitor
 
 | Signal | Why |
@@ -599,6 +605,7 @@ read their reports, and delete-mode prerequisites: see the
 | `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
 | `commit-graph refresh outcome=…` log lines | A `repo=` that repeats `lock_held`, `timed_out`, or `failed` needs a look ([outcomes and stale-lock runbook](#commit-graph-refresh)) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
+| `lane scan: requeued a lane whose work had no job` log line | A sync or push job was lost (River discarded it, or its row was deleted) and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
 the mapping below says which ones remain log-only.
@@ -622,6 +629,7 @@ text appended after it is not part of the contract.
 | `repack: folded packs` / `repack trigger: scheduled fold` (What to monitor) | `openstorage_job_runs_total{job="repack"}` | Fold outcomes only; trigger lines stay **log only** |
 | Pack quota exceeded (What to monitor) | **log only** | Client-visible hook error plus the `quota: receive-pack … at/over quota` server line |
 | Postgres availability and advisory-lock waits (What to monitor) | **log only** | Observe PostgreSQL itself (`pg_locks`) |
+| `lane scan: requeued a lane whose work had no job` (What to monitor) | **log only** | Fields `org`, `repo` and `lane` |
 | S3WAL `… conditional-write contention retries exhausted` (S3WAL signals) | `openstorage_s3wal_cas_contention_exhausted_total` by `scope` | Serve-process mutations only; push-side failures reach the client and hook stderr |
 | `WARN s3wal manifest approaching size cap` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="warn"}` | Counts when the once-per-repository warning is logged |
 | S3WAL `manifest would grow to … refusing new registrations` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="refuse"}` | Serve-process refusals only |
