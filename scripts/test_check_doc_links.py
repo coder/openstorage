@@ -369,12 +369,15 @@ class CitationTests(CheckerTestCase):
     def test_shell_comments_end_at_a_hash_outside_quotes_on_the_same_line(self):
         sh = ("echo 'requires # feature-name'\n"
               'echo "tag # double-quoted" # comment-one\n'
-              "echo it\\'s # comment-two\n"
-              "echo don't\n# comment-three\n"
-              'echo "it\'s" # comment-four\n'
-              "echo x # 'quoted in a comment' # comment-five\n")
+              "echo it\\'s # comment-two 'x\n"
+              'echo \\" # comment-three "x\n'
+              "echo don't\n# comment-four\n"
+              'echo "it\'s" # comment-five\n'
+              "echo x # 'quoted in a comment' # comment-six\n"
+              "echo it's\" # comment-seven 'x'\n"
+              "echo \"it's\" don't # comment-eight\n")
         ok = ["[run.sh:feature-name]", "[run.sh:double-quoted]"]
-        bad = [f"[run.sh:comment-{n}]" for n in ("one", "two", "three", "four", "five")]
+        bad = [f"[run.sh:comment-{n}]" for n in ("one", "two", "three", "four", "five", "six", "seven", "eight")]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
@@ -383,17 +386,42 @@ class CitationTests(CheckerTestCase):
               "register(\n  function argNamed() {},\n  function listNamed() {},\n);\n"
               "const either = a ||\n  function orNamed() {};\nconst arrow = () =>\n  function arrowNamed() {};\n"
               "const pick = ok ?\n  function thenNamed() {} :\n  function elseNamed() {};\n"
+              "const list = [\n  function bracketNamed() {},\n];\n"
               "function declared() {}\nconst plain = 'text'\nfunction afterString() {}\n"
               "export default\nfunction defaulted() {}\n"
               "counter++\nfunction afterIncrement() {}\ncounter--\nfunction afterDecrement() {}\n"
-              "const re = /a+/\nfunction afterRegex() {}\n")
-        ok = ["viaEquals", "viaClass", "either", "arrow", "pick", "declared", "plain", "afterString", "defaulted",
-              "afterIncrement", "afterDecrement", "afterRegex"]
+              "const re = /a+/\nfunction afterRegex() {}\n"
+              "async function work() {\n  return\n  function afterReturn() {}\n}\n")
+        ok = ["viaEquals", "viaClass", "either", "arrow", "pick", "list", "declared", "plain", "afterString",
+              "defaulted", "afterIncrement", "afterDecrement", "afterRegex", "work", "afterReturn"]
         bad = ["equalsNamed", "ClassNamed", "argNamed", "listNamed", "orNamed", "arrowNamed", "thenNamed",
-               "elseNamed"]
+               "elseNamed", "bracketNamed"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n",
                                    **{"pkg/flow.js": js})
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
+
+    def test_javascript_continuation_skips_blank_and_comment_lines(self):
+        js = ("const a =\n  // why\n  function viaComment() {}\n"
+              "const b =\n\n  function viaBlank() {}\n"
+              "const c =\n  /* why\n  still why */\n  function viaBlock() {}\n"
+              "const d = // trailing\n  function viaTrailing() {}\n"
+              "const e = 1\n// why\nfunction afterComment() {}\n")
+        ok = ["a", "b", "c", "d", "e", "afterComment"]
+        bad = ["viaComment", "viaBlank", "viaBlock", "viaTrailing"]
+        result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n",
+                                   **{"pkg/flow.js": js})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
+
+    def test_every_javascript_continuation_ending_keeps_the_next_line_in_its_expression(self):
+        endings = ["=", "(", "[", ",", "?", ":", "+", "-", "*", "%", "&", "|", "^", "<", ">", "!", "~", ".",
+                   "&&", "||", "??", "=>", "await", "delete", "in", "instanceof", "new", "typeof", "void"]
+        ends_a_statement = ["++", "--", "/", "return", "throw", "yield", "default", "obj.await", "obj.new"]
+        js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}\n" for i, op in enumerate(endings))
+        js += "".join(f"x {op}\nfunction closed{i}() {{}}\n" for i, op in enumerate(ends_a_statement))
+        cited = [f"[flow.js:open{i}]" for i in range(len(endings))]
+        cited += [f"[flow.js:closed{i}]" for i in range(len(ends_a_statement))]
+        result = self.check_readme(" ".join(cited) + "\n", **{"pkg/flow.js": js})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:open{i}]") for i in range(len(endings))])
 
     def test_python_js_and_unit_citations(self):
         files = {
@@ -492,6 +520,20 @@ class FileSelectionTests(CheckerTestCase):
         untracked = "BROKEN FILE (not tracked by git) README.md:3 -> "
         self.assertEqual(result.stdout, f"{untracked}docs/new.md\n{untracked}fresh/\n{untracked}docs/new.md\n"
                                         "BROKEN FILE README.md:3 -> docs/gone.md\nbroken links: 4\n")
+
+    def test_links_follow_tracked_symlinks_like_citations(self):
+        result = self.run_checker(
+            "[Real](notes/real.txt) [Untracked](notes/alias.txt) [Outside](notes/out.txt)\n",
+            files={"notes/real.txt": "x\n"},
+            symlinks={"notes/alias.txt": "new.txt", "notes/out.txt": Path(__file__).resolve()},
+            untracked={"notes/new.txt": "x\n"})
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> notes/alias.txt\n"
+                                        "BROKEN FILE (escapes repo) README.md:1 -> notes/out.txt\nbroken links: 2\n")
+
+    def test_a_link_through_a_tracked_directory_symlink_resolves_to_the_tracked_file(self):
+        result = self.run_checker("[Guide](alias/guide.md) [Dir](alias/)\n", docs={"guide.md": "# Guide\n"},
+                                  symlinks={"alias": "docs"})
+        self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
 
     def test_an_untracked_readme_can_link_to_itself(self):
         result = self.run_checker("", untracked={"pkg/README.md": "# Top\n[Self](#top) [Missing](#absent)\n"})

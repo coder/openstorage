@@ -278,6 +278,12 @@ def doc_files():
     return sorted(name for name in names if not name.startswith("vendor/") and os.path.isfile(name))
 
 
+def repo_path(path):
+    """The path relative to the repository root after symlinks resolve, or None outside it."""
+    root, real = os.path.realpath(os.curdir), os.path.realpath(path)
+    return os.path.relpath(real, root) if os.path.commonpath([root, real]) == root else None
+
+
 @functools.cache
 def tracked():
     """The paths in git's index and every directory that holds one."""
@@ -345,8 +351,9 @@ def link_failures(path, lineno, ln):
             failures.append(f"BROKEN FILE (escapes repo) {path}:{lineno} -> {target}")
         elif not os.path.exists(resolved):
             failures.append(f"BROKEN FILE {path}:{lineno} -> {target}")
-        elif target and resolved not in tracked():
-            failures.append(f"BROKEN FILE (not tracked by git) {path}:{lineno} -> {target}")
+        elif target and (real := repo_path(resolved)) not in tracked():
+            kind = "escapes repo" if real is None else "not tracked by git"
+            failures.append(f"BROKEN FILE ({kind}) {path}:{lineno} -> {target}")
         elif (anchor and anchor != "#" and resolved.endswith(".md")
               and not resolved.startswith("docs/upstream") and anchor[1:] not in anchors(resolved)):
             failures.append(f"BROKEN ANCHOR {path}:{lineno} -> {target}{anchor}")
@@ -505,9 +512,11 @@ def tf_names(text):
 # A line that ends in one of these leaves its expression open, so the next
 # line continues it and a function or class there is not a declaration. A
 # postfix `++` or `--` and a regex literal (`/`) end a statement, so they are
-# left out. A string keeps its quotes in the masked text, so a line that ends
-# in a string never looks like a dangling `=`.
-JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*%&|^<>!~.]$")
+# left out, and so are `return`, `throw` and `yield`, which end at a line
+# break. A string keeps its quotes in the masked text, so a line that ends in
+# a string never looks like a dangling `=`.
+JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*%&|^<>!~.]$"
+                          r"|(?<![\w$.])(?:await|delete|in|instanceof|new|typeof|void)$")
 
 
 def js_names(text):
@@ -524,18 +533,27 @@ def js_names(text):
 
 
 # A quote opens and closes on one line, and quotes pair in the order they
-# appear. A quote that spans lines is not tracked, so a stray apostrophe (in a
-# heredoc body, say) cannot hide the comments below it. A quote inside `$(...)`
-# in a double-quoted string pairs with the outer one. In both cases a `#` is
-# still dropped as a comment, which fails closed.
-SHELL_LEXER = re.compile(r"""('[^']*'|"(?:\\.|[^"\\])*"|\\.)|(?:^|(?<=[\s;&|()]))#.*""")
+# appear. A quote that spans lines is not tracked. A line with a quote that
+# does not close (`stray`) cannot be paired, so its comment is dropped even
+# when a quote opened before it: one stray apostrophe cannot hide the comment
+# words of its line or of the lines below it. A quote inside `$(...)` in a
+# double-quoted string pairs with the outer one. In both cases a `#` is still
+# dropped as a comment, which fails closed.
+SHELL_COMMENT = re.compile(r"(?:^|(?<=[\s;&|()]))#.*")
+SHELL_LEXER = re.compile(r"""(?P<text>'[^']*'|"(?:\\.|[^"\\])*"|\\.)|(?P<stray>['"])|""" + SHELL_COMMENT.pattern)
+
+
+def shell_code(line):
+    if any(m.group("stray") for m in SHELL_LEXER.finditer(line)):
+        return SHELL_COMMENT.sub("", line)
+    return SHELL_LEXER.sub(lambda m: m.group("text") or "", line)
 
 
 # Shell commands, options, and file names have no declaration, so any
 # whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
-        self.code = "\n".join(SHELL_LEXER.sub(lambda m: m.group(1) or "", line) for line in text.splitlines())
+        self.code = "\n".join(map(shell_code, text.splitlines()))
 
     def __contains__(self, symbol):
         pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)"
@@ -582,12 +600,12 @@ def citation_problem(path, symbol):
         return "LINE NUMBER CITATION", " (cite a name; line numbers drift)"
     if symbol is not None and language(path) is None:
         return "UNSUPPORTED CITATION", " (LANGUAGES has no reader for this file kind; cite the file alone)"
-    root, real = os.path.realpath(os.curdir), os.path.realpath(path)
-    if os.path.commonpath([root, real]) != root:
+    real = repo_path(path)
+    if real is None:
         return "MISSING CITED FILE", " (outside the repository)"
-    if not os.path.isfile(real):
+    if not os.path.isfile(path):
         return "MISSING CITED FILE", ""
-    if os.path.relpath(real, root) not in tracked():
+    if real not in tracked():
         return "MISSING CITED FILE", " (not tracked by git)"
     if symbol is not None and symbol not in citable(path):
         return "UNRESOLVED CITATION", f" (no such name in {path})"
