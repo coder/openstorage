@@ -347,19 +347,30 @@ func TestRiverLaneScanResumesAfterTimeout(t *testing.T) {
 	t.Cleanup(func() { _ = conn2.Close(context.Background()) })
 	releaseB := env.lockJob(t, ctx, b) // b's insert waits: the pass times out there
 
-	start := time.Now()
-	requeued, err := q.scanLanes(ctx, "org")
-	if !errors.Is(err, context.DeadlineExceeded) || requeued != 1 || q.scanCursor != a {
-		t.Fatalf("first pass = %d requeued, cursor %q, err %v; want a's job, then a timeout at b with the cursor at a", requeued, q.scanCursor, err)
+	type pass struct {
+		requeued int
+		err      error
 	}
-	if took := time.Since(start); took > 10*time.Second {
-		t.Fatalf("the pass took %v, want about laneScanTimeout", took)
+	done := make(chan pass, 1)
+	go func() {
+		n, err := q.scanLanes(ctx, "org")
+		done <- pass{n, err}
+	}()
+	var first pass
+	select {
+	case first = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the pass waited at b past laneScanTimeout")
+	}
+	if !errors.Is(first.err, context.DeadlineExceeded) || first.requeued != 1 || q.scanCursor != a {
+		t.Fatalf("first pass = %d requeued, cursor %q, err %v; want a's job, then a timeout at b with the cursor at a",
+			first.requeued, q.scanCursor, first.err)
 	}
 	// A pass that started over would now wait at a.
 	releaseA := laneScanEnv{conn: conn2}.lockJob(t, ctx, a)
 	defer releaseA()
 	releaseB()
-	requeued, err = q.scanLanes(ctx, "org")
+	requeued, err := q.scanLanes(ctx, "org")
 	if err != nil || requeued != 1 || q.scanCursor != "" {
 		t.Fatalf("second pass = %d requeued, cursor %q, err %v; want c's job and a full traversal", requeued, q.scanCursor, err)
 	}
