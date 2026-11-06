@@ -122,6 +122,19 @@ jobs:
           echo "$out"
           grep -F "openstorage $TAG (commit $COMMIT, built $BUILD_DATE," <<<"$out"
           docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      - name: Check the words of the image's Git patch refusals
+        # internal/api reads Git's messages to pick a status, and the image's Git
+        # is Alpine's, so a reworded message must fail here. Tags cut before the
+        # script landed carry no cases and skip the check.
+        run: |
+          if [ ! -f scripts/check-apply-messages.sh ]; then
+            echo "::notice::$TAG has no scripts/check-apply-messages.sh, so its image's Git is not checked for patch messages"
+            exit 0
+          fi
+          docker run --rm --entrypoint /bin/sh \
+            -v "$PWD/scripts/check-apply-messages.sh:/check-apply-messages.sh:ro" \
+            -v "$PWD/internal/api/testdata/applymsg:/cases:ro" \
+            "$OPENSTORAGE_IMAGE" /check-apply-messages.sh /cases
       - name: Smoke the Compose quickstart
         run: bash scripts/smoke-compose-quickstart.sh
 
@@ -276,5 +289,18 @@ jobs:
           echo "$out"
           grep -F "openstorage $TAG (commit $COMMIT, built $BUILD_DATE," <<<"$out"
           docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      - name: Check the words of the image's Git patch refusals
+        # internal/api reads Git's messages to pick a status, and the image's Git
+        # is Alpine's, so a reworded message must fail here. Tags cut before the
+        # script landed carry no cases and skip the check.
+        run: |
+          if [ ! -f scripts/check-apply-messages.sh ]; then
+            echo "::notice::$TAG has no scripts/check-apply-messages.sh, so its image's Git is not checked for patch messages"
+            exit 0
+          fi
+          docker run --rm --entrypoint /bin/sh \
+            -v "$PWD/scripts/check-apply-messages.sh:/check-apply-messages.sh:ro" \
+            -v "$PWD/internal/api/testdata/applymsg:/cases:ro" \
+            "$OPENSTORAGE_IMAGE" /check-apply-messages.sh /cases
       - name: Smoke the Compose quickstart
         run: bash scripts/smoke-compose-quickstart.sh

@@ -114,7 +114,10 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 
    The `verify` jobs build the tag natively on linux/amd64 and linux/arm64 runners.
    Each job checks the platform, the `openstorage --version` stamp, and the runtime
-   tools, then runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
+   tools. It then runs [`scripts/check-apply-messages.sh`](../../scripts/check-apply-messages.sh)
+   inside the image, because the image's Git is Alpine's and the server reads its patch
+   refusals by their words (a tag cut before that script landed skips this check with a
+   notice). Last, it runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
 
 2. After that run is green, request the push:
 
