@@ -256,7 +256,7 @@ def markdown_blocks(lines):
 
 def scan_lines(path):
     for block in scan_blocks(path):
-        masked = without_inline_code("".join(ln for _, ln in block)).splitlines(keepends=True)
+        masked = re.findall(r"[^\n]*\n|[^\n]+", without_inline_code("".join(ln for _, ln in block)))
         for (lineno, raw), visible in zip(block, masked):
             yield lineno, raw, visible
 
@@ -740,7 +740,7 @@ def js_names(text):
 # whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
-        self.code = "\n".join(re.sub(r"(?:^|(?<=[\s;&|()]))#.*", "", line) for line in text.splitlines())
+        self.code = "\n".join(re.sub(r"(?:^|(?<=[\s;&|()]))#.*", "", line) for line in text.split("\n"))
 
     def __contains__(self, symbol):
         pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)"
@@ -749,7 +749,7 @@ class ShellMentions:
 
 def unit_names(text):
     names, continued = set(), False
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if line.lstrip().startswith(("#", ";")):
             continue
         m = None if continued else re.match(r"\[([\w-]+)\]", line)
@@ -776,8 +776,10 @@ def language(path):
 
 @functools.cache
 def citable(path):
-    with open(path, encoding="utf-8") as source:
-        return language(path)(source.read())
+    # newline="" keeps a lone carriage return, which only some languages treat as a line break. Readers see
+    # a line feed as the only line separator, so a separator that Python splits on does not end a comment.
+    with open(path, encoding="utf-8", newline="") as source:
+        return language(path)(source.read().replace("\r\n", "\n"))
 
 
 def citation_problem(path, symbol):

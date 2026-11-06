@@ -388,6 +388,44 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
+    def test_only_a_line_feed_ends_a_line_of_a_shell_script_or_a_unit_file(self):
+        # str.splitlines also splits on these, and neither bash nor systemd does: the rest of a comment stays a comment.
+        for name, sep in [("vt", "\x0b"), ("ff", "\x0c"), ("fs", "\x1c"), ("gs", "\x1d"), ("rs", "\x1e"), ("nel", "\x85"),
+                          ("ls", "\u2028"), ("ps", "\u2029"), ("cr", "\r")]:
+            with self.subTest(separator=name):
+                files = {"pkg/run.sh": f"echo ok # note{sep}hidden-word\nreal-word\n",
+                         "pkg/app.service": f"# note{sep}[Hidden]\n[Real]\n"}
+                cited = ["[run.sh:hidden-word]", "[run.sh:real-word]", "[app.service:Hidden]", "[app.service:Real]"]
+                result = self.check_readme(" ".join(cited) + "\n", **files)
+                self.assert_failures(result, ("UNRESOLVED CITATION", cited[0]), ("UNRESOLVED CITATION", cited[2]))
+
+    def test_a_carriage_return_line_feed_still_ends_a_line_in_every_reader(self):
+        files = {
+            "pkg/run.sh": "echo ok # note\r\nreal-word\r\n",
+            "pkg/app.service": "# note\r\n[Real]\r\n",
+            "pkg/demo.go": "package demo\r\n\r\n// func Hidden() {}\r\nfunc Real() {}\r\n",
+            "pkg/tool.py": "# def hidden(): pass\r\ndef real():\r\n    pass\r\n",
+            "pkg/main.tf": 'resource "aws_s3_bucket" "b" {\r\n  policy = <<EOT\r\n  hidden_block {\r\n  }\r\nEOT\r\n  lifecycle {\r\n  }\r\n}\r\n',
+            "pkg/flow.js": "// function hidden() {}\r\nfunction real() {}\r\n",
+        }
+        ok = ["[run.sh:real-word]", "[app.service:Real]", "[demo.go:Real]", "[tool.py:real]", "[main.tf:aws_s3_bucket.b]",
+              "[main.tf:aws_s3_bucket.b.lifecycle]", "[flow.js:real]"]
+        bad = ["[demo.go:Hidden]", "[tool.py:hidden]", "[main.tf:aws_s3_bucket.b.hidden_block]", "[flow.js:hidden]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_lone_carriage_return_does_not_end_a_comment_that_its_language_continues(self):
+        # Go and bash end a comment at a line feed only. Text mode would read the carriage return as a line feed.
+        files = {"pkg/demo.go": "package demo\n\n// note\rfunc Hidden() {}\nfunc Real() {}\n"}
+        result = self.check_readme("[demo.go:Hidden] [demo.go:Real]\n", **files)
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[demo.go:Hidden]"))
+
+    def test_markdown_line_numbers_and_links_survive_a_separator_that_only_python_splits_on(self):
+        for name, sep in [("vt", "\x0b"), ("ff", "\x0c"), ("fs", "\x1c"), ("nel", "\x85"), ("ls", "\u2028"), ("ps", "\u2029")]:
+            with self.subTest(separator=name):
+                result = self.run_checker(f"first{sep}half\n[Gone](gone.md)\n[Also](gone-too.md)\n")
+                self.assertEqual(result.stdout, "BROKEN FILE README.md:2 -> gone.md\nBROKEN FILE README.md:3 -> gone-too.md\nbroken links: 2\n")
+
     def test_javascript_expressions_after_a_dangling_operator_are_not_declarations(self):
         js = ("const viaEquals =\n  function equalsNamed() {};\nconst viaClass =\n  class ClassNamed {};\n"
               "register(\n  function argNamed() {},\n  function listNamed() {},\n);\n"
@@ -508,15 +546,15 @@ class CitationTests(CheckerTestCase):
         self.assertEqual(result.returncode, 0)
 
     def test_javascript_every_line_terminator_ends_a_line_and_blocks_a_postfix_operator(self):
-        # open() reads CR and CRLF as LF, so U+2028 and U+2029 are the line terminators that reach the reader.
-        js = ("const a = x\u2028++\n  function viaLs() {}.x\n"
+        js = ("const r = x\r++\n  function viaCr() {}.x\n"
+              "const a = x\u2028++\n  function viaLs() {}.x\n"
               "const b = x\u2029++\n  function viaPs() {}.x\n"
               "const c = x /*\u2029*/ ++\n  function viaComment() {}.x\n"
               "const d = a[0]\u2028++\n  function viaBracket() {}.x\n"
               "const e = x // note\u2028++\n  function viaLineComment() {}.x\n"
-              "const f = x++\u2028function afterLs() {}\u2029const g = 1\nfunction afterPs() {}\n")
-        ok = ["afterLs", "afterPs"]
-        bad = ["viaLs", "viaPs", "viaComment", "viaBracket", "viaLineComment"]
+              "const f = x++\u2028function afterLs() {}\u2029const g = 1\nfunction afterPs() {}\rconst h = 1\r\nfunction afterCr() {}\n")
+        ok = ["afterLs", "afterPs", "afterCr"]
+        bad = ["viaCr", "viaLs", "viaPs", "viaComment", "viaBracket", "viaLineComment"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
 
@@ -525,6 +563,10 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme("[flow.js:before] [flow.js:after]\n", **{"pkg/flow.js": js})
         self.assert_failures(result, ("UNRESOLVED CITATION", "[flow.js:after]"))
         self.assertIn("the JavaScript reader stops at line 2, where it cannot tell a regex literal from a division", result.stdout)
+        js = "function before() {}\rfunction mid() {}\r\nconst half = (a + b) / 2;\nfunction after() {}\n"
+        result = self.check_readme("[flow.js:mid] [flow.js:after]\n", **{"pkg/flow.js": js})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[flow.js:after]"))
+        self.assertIn("the JavaScript reader stops at line 3, where it cannot tell a regex literal from a division", result.stdout)
 
     def test_javascript_reader_stays_linear_on_a_long_run_of_signs(self):
         js = "const v = " + "+-" * 50000 + "a\nfunction afterSigns() {}\n"
