@@ -311,6 +311,20 @@ func TestReplacePacksPurgeFence(t *testing.T) {
 			}
 		}
 
+		// Once the purge retired the old rows, a late fold is a clean loss, not
+		// a fence error: Repacker.repack tells the two apart by its probe row.
+		if n, err := ps.RetireRepoPacks(ctx, purgeGroupOf(base)); err != nil || n == 0 {
+			t.Fatalf("RetireRepoPacks: n=%d err=%v", n, err)
+		}
+		for _, repo := range []string{base, base + "+import"} {
+			if won, err := s.ReplacePacks(ctx, repo, packsOf(repo), foldOf(repo)); won || err != nil {
+				t.Fatalf("ReplacePacks(%s, retired old rows) = (%v, %v), want (false, <nil>)", repo, won, err)
+			}
+			if has, err := s.HasPack(ctx, repo, foldOf(repo).Key); err != nil || has {
+				t.Fatalf("fold row of %s registered after the retire: has=%v err=%v", repo, has, err)
+			}
+		}
+
 		if won, err := s.ReplacePacks(ctx, other, packsOf(other), foldOf(other)); err != nil || !won {
 			t.Fatalf("control ReplacePacks = (%v, %v), want won", won, err)
 		}

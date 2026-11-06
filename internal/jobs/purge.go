@@ -45,7 +45,8 @@ import (
 type RepoPurgeRegistry interface {
 	// FenceRepoPurge durably write-fences the base repo (phase 0, before
 	// any tombstoning): pack/LFS registrations and repack folds for the
-	// group fail with ref.ErrRepoPurged from then on, so the later
+	// group fail with ref.ErrRepoPurged from then on (a fold whose old rows
+	// the purge already retired loses cleanly instead), so the later
 	// verification and completion cannot be raced by an in-flight
 	// pre-delete writer.
 	// Permanent, like the name burn; idempotent.
@@ -298,9 +299,10 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 	// pack registration), RegisterPacks, ReplacePacks, RegisterLFSObject —
 	// serializes against the fence in its own transaction, so a straggler
 	// write either committed before this fence (its rows are tombstoned
-	// by phases 1–3 / the next resume) or fails with ref.ErrRepoPurged:
-	// the phase-5 verification below can never be invalidated by a write
-	// settling after it (PR #105 security rounds 2 and 4).
+	// by phases 1–3 / the next resume) or fails with ref.ErrRepoPurged (a
+	// fold whose old rows phase 2 retired loses cleanly): the phase-5
+	// verification below can never be invalidated by a write settling
+	// after it (PR #105 security rounds 2 and 4).
 	if err := p.registry.FenceRepoPurge(ctx, repoID); err != nil {
 		return rep, fmt.Errorf("fence repo purge: %w", err)
 	}
