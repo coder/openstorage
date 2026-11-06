@@ -236,7 +236,7 @@ type ScanStateStore interface {
 	// one it read, and a generation never repeats. A job therefore keeps its
 	// row after its work ends and does not delete it, because a row that
 	// comes back at an old generation lets a stale run write again. The
-	// S3-WAL store has one serving process; a second process that wins its
+	// S3-WAL store has one serving process; a second process that loses its
 	// CAS race fails with the store's own error, not ErrScanStateConflict.
 	PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error
 	// DeleteJobScanState removes one row; deleting an absent row is a
