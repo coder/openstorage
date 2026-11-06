@@ -903,3 +903,43 @@ func TestHeldRefStaleReadsGit423(t *testing.T) {
 		}
 	}
 }
+
+// A River push run whose loopback fetch the server refuses with 423 (a push
+// holds a ref the cache has not caught up with, githttp.Server's
+// StrictSyncFetch) hands its request back with RestorePush and fails, so
+// River snoozes the job and runs it again, as after a failed publication
+// wait. Forwarding the snapshot would publish the held ref at its older
+// value, and a done run would consume the newer write's request. The run
+// emits no event and leaves the upstream untouched.
+func TestPushRunStaleHeldSnapshotRestoresRiverRequest(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedLocalRepo(t, f, "repo_h1")
+	bare := addEmptyUpstream(t, f.upstreamDir, "own", "h1")
+	f.putUpstream(t, "repo_h1", "own", "h1", "file://"+f.upstreamDir)
+	if err := f.store.RequestPush(t.Context(), "repo_h1", true); err != nil {
+		t.Fatal(err)
+	}
+	locked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "held", http.StatusLocked)
+	}))
+	t.Cleanup(locked.Close)
+	f.worker.Loopback.BaseURL = locked.URL
+
+	err := f.worker.RunPush(t.Context(), Job{Org: "org", RepoID: "repo_h1"})
+	if !errors.Is(err, errHeldRefStale) {
+		t.Fatalf("RunPush = %v, want an error wrapping errHeldRefStale, so River snoozes the job", err)
+	}
+	up, gerr := f.store.GetUpstream(t.Context(), "repo_h1")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if up.PushSyncing || up.PushPending != PushPendingForce || up.PushRunCount != 0 {
+		t.Fatalf("after a refused snapshot: %+v; want the force request handed back and no counted run", up)
+	}
+	if events := f.rec.list(); len(events) != 0 {
+		t.Fatalf("refused run emitted %+v; want no event", events)
+	}
+	if out := testGit(t, f.upstreamDir, "--git-dir", bare, "for-each-ref"); out != "" {
+		t.Fatalf("upstream changed after a refused snapshot: %q", out)
+	}
+}
