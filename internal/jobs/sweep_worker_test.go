@@ -1,10 +1,13 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
+	gosync "sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +27,10 @@ type blockingRestore struct {
 	entered chan struct{}
 	release chan struct{}
 	lists   atomic.Int32 // listings started: one per sweep pass at least
+	// afterRelease, when set, runs when the restore is released, and its error
+	// is the restore's: a panic or an error that ends the pass after Work
+	// returned.
+	afterRelease func() error
 }
 
 func (b *blockingRestore) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
@@ -38,6 +45,11 @@ func (b *blockingRestore) Copy(ctx context.Context, dst, src string) error {
 		default:
 		}
 		<-b.release
+		if b.afterRelease != nil {
+			if err := b.afterRelease(); err != nil {
+				return err
+			}
+		}
 	}
 	return b.BlobStore.Copy(ctx, dst, src)
 }
@@ -45,6 +57,30 @@ func (b *blockingRestore) Copy(ctx context.Context, dst, src string) error {
 // sweepInRecovery builds a sweeper that deletes one orphan, finds it
 // registered by the post-delete recheck, and parks in the restore copy.
 func sweepInRecovery(t *testing.T) (s *Sweeper, f *sweepFixture, key string, entered, release chan struct{}) {
+	t.Helper()
+	return sweepInRecoveryLogged(t, io.Discard)
+}
+
+// lockedBuffer is a log sink that the pass's goroutine and the test share.
+type lockedBuffer struct {
+	mu  gosync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// sweepInRecoveryLogged is sweepInRecovery with the sweeper's log in logs.
+func sweepInRecoveryLogged(t *testing.T, logs io.Writer) (s *Sweeper, f *sweepFixture, key string, entered, release chan struct{}) {
 	t.Helper()
 	f = newSweepFixture(t)
 	key = blob.PackKey("r1", "recovering")
@@ -60,7 +96,7 @@ func sweepInRecovery(t *testing.T) (s *Sweeper, f *sweepFixture, key string, ent
 	})
 	// Calls 1 and 2 see the pack unregistered; call 3, the recheck, registered.
 	s = NewSweeper(&blockingRestore{BlobStore: f.blobs, entered: entered, release: release}, &registeredAfterCall{after: 2},
-		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.NewTextHandler(logs, nil)))
 	return s, f, key, entered, release
 }
 
@@ -101,11 +137,14 @@ func (panicLister) ListPages(context.Context, string, int, func([]blob.ListedObj
 
 // The pass runs in its own goroutine, outside River's recovery boundary. A
 // panic in it comes back to Work's goroutine, where River records it as a
-// failed attempt, instead of ending the process. The gate is released first,
-// so the next tick is not turned away for the life of the process.
+// failed attempt instead of the process ending. The value carries the pass's
+// stack, because River records only the frames of the goroutine that raises it
+// again, and the log has it too. The gate is released first, so the next tick
+// is not turned away for the life of the process.
 func TestSweepWorkerRaisesAPanicOfItsPassInItsOwnGoroutine(t *testing.T) {
 	f := newSweepFixture(t)
-	s := NewSweeper(panicLister{f.blobs}, f.store, SweepConfig{Threshold: 24 * time.Hour}, slog.New(slog.DiscardHandler))
+	var logs lockedBuffer
+	s := NewSweeper(panicLister{f.blobs}, f.store, SweepConfig{Threshold: 24 * time.Hour}, slog.New(slog.NewTextHandler(&logs, nil)))
 	w := &sweepWorker{schedule: &SweepSchedule{Sweeper: s, Interval: time.Hour}}
 
 	got := func() (v any) {
@@ -113,11 +152,68 @@ func TestSweepWorkerRaisesAPanicOfItsPassInItsOwnGoroutine(t *testing.T) {
 		_ = w.Work(context.Background(), nil)
 		return nil
 	}()
-	if got != "simulated blob driver defect" {
+	raised, ok := got.(*sweepPanic)
+	if !ok || raised.val != "simulated blob driver defect" {
 		t.Fatalf("Work raised %v, want the panic of the pass", got)
+	}
+	// The frames of the pass, which Work's own stack at the re-raise lacks.
+	if !strings.Contains(raised.Error(), "panicLister.ListPages") {
+		t.Errorf("the raised panic's text lacks the pass's stack:\n%s", raised.Error())
+	}
+	if out := logs.String(); !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "the pass panicked") || !strings.Contains(out, "panicLister.ListPages") {
+		t.Errorf("the pass's panic was not logged with its stack:\n%s", out)
 	}
 	if w.running.Load() {
 		t.Fatal("the gate is still held after the pass panicked")
+	}
+}
+
+// What an abandoned pass ends with is logged, because Work returned already
+// and River sees nothing of it: a panic does not end the process, and a late
+// error is not dropped.
+func TestSweepWorkerLogsHowAnAbandonedPassEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		afterRelease func() error
+		want         []string
+	}{
+		{"panic", func() error { panic("simulated restore crash") }, []string{"level=ERROR", "the pass panicked", "simulated restore crash", "blockingRestore"}},
+		{"error", func() error { return errors.New("simulated restore failure") }, []string{"level=ERROR", "ended with an error", "simulated restore failure"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs lockedBuffer
+			s, _, _, entered, release := sweepInRecoveryLogged(t, &logs)
+			s.blobs.(*blockingRestore).afterRelease = tc.afterRelease
+			w := &sweepWorker{schedule: &SweepSchedule{Sweeper: s, Interval: time.Hour}}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			first := make(chan error, 1)
+			go func() { first <- w.Work(ctx, nil) }()
+			select {
+			case <-entered:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the sweep never reached its restore copy")
+			}
+			cancel()
+			select {
+			case err := <-first:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Work = %v, want an error that wraps the job's cancellation", err)
+				}
+			case <-time.After(sweepReturnGrace + 10*time.Second):
+				t.Fatal("Work still waits for the recovery step after its job ended")
+			}
+
+			close(release)
+			waitFor(t, "the abandoned pass to end", func() bool { return !w.running.Load() })
+			waitFor(t, "the end of the abandoned pass to be logged", func() bool { return strings.Contains(logs.String(), tc.want[1]) })
+			for _, want := range tc.want {
+				if !strings.Contains(logs.String(), want) {
+					t.Errorf("the log lacks %q:\n%s", want, logs.String())
+				}
+			}
+		})
 	}
 }
 
@@ -125,7 +221,8 @@ func TestSweepWorkerRaisesAPanicOfItsPassInItsOwnGoroutine(t *testing.T) {
 // does nothing: abandoned passes do not pile up in one process. The next tick
 // after the pass ended runs.
 func TestSweepWorkerDoesNothingWhileAnAbandonedPassStillRuns(t *testing.T) {
-	s, f, key, entered, release := sweepInRecovery(t)
+	var logs lockedBuffer
+	s, f, key, entered, release := sweepInRecoveryLogged(t, &logs)
 	lists := &s.blobs.(*blockingRestore).lists
 	w := &sweepWorker{schedule: &SweepSchedule{Sweeper: s, Interval: time.Hour}}
 
@@ -162,6 +259,10 @@ func TestSweepWorkerDoesNothingWhileAnAbandonedPassStillRuns(t *testing.T) {
 	if got := lists.Load(); got != started {
 		t.Fatalf("a tick while the abandoned pass runs listed %d times, want no new pass", got-started)
 	}
+	const skipped = `level=WARN msg="orphan pack sweep: a pass from an earlier job is still running`
+	if got := strings.Count(logs.String(), skipped); got != 1 {
+		t.Fatalf("the skipped tick logged %d warnings, want 1:\n%s", got, logs.String())
+	}
 
 	close(release)
 	waitFor(t, "the abandoned pass to end and restore the pack", func() bool { return f.exists(key) && !w.running.Load() })
@@ -170,6 +271,9 @@ func TestSweepWorkerDoesNothingWhileAnAbandonedPassStillRuns(t *testing.T) {
 	}
 	if lists.Load() == started {
 		t.Fatal("a tick after the abandoned pass ended did not run a pass")
+	}
+	if got := strings.Count(logs.String(), skipped); got != 1 {
+		t.Fatalf("a tick that ran logged a skipped-tick warning: %d lines in all, want 1:\n%s", got, logs.String())
 	}
 }
 
