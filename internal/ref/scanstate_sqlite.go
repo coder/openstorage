@@ -64,30 +64,29 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload,
 // PutJobScanStateIf — see the PG twin.
 func (s *SQLite) PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error {
 	assertf(job != "" && scope != "", "PutJobScanStateIf(%q, %q)", job, scope)
-	res, err := s.db.ExecContext(ctx, `
+	query := `
 UPDATE job_scan_state SET payload = ?, generation = ?, updated_at = strftime('%s','now') * 1000
-WHERE job = ? AND scope = ? AND generation = ?`,
-		payload, generation, job, scope, expectGeneration)
+WHERE job = ? AND scope = ? AND generation = ?`
+	args := []any{payload, generation, job, scope, expectGeneration}
+	if expectGeneration == 0 {
+		query = `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES (?, ?, ?, ?, strftime('%s','now') * 1000)
+ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload,
+  generation = excluded.generation, updated_at = excluded.updated_at
+WHERE job_scan_state.generation = ?`
+		args = []any{job, scope, payload, generation, expectGeneration}
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
-	if n, err := res.RowsAffected(); err != nil || n == 1 {
+	if n, err := res.RowsAffected(); err != nil {
 		return err
+	} else if n != 1 {
+		return ErrScanStateConflict
 	}
-	if expectGeneration == 0 {
-		res, err = s.db.ExecContext(ctx, `
-INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
-VALUES (?, ?, ?, ?, strftime('%s','now') * 1000)
-ON CONFLICT (job, scope) DO NOTHING`,
-			job, scope, payload, generation)
-		if err != nil {
-			return err
-		}
-		if n, err := res.RowsAffected(); err != nil || n == 1 {
-			return err
-		}
-	}
-	return ErrScanStateConflict
+	return nil
 }
 
 // ArmAbsenceAdmissionFence — see the PG twin for the ordering contract.

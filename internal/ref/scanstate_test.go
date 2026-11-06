@@ -182,6 +182,37 @@ func TestJobScanState_PutIf(t *testing.T) {
 	})
 }
 
+// TestJobScanState_PutIfCreateRace: writers that expect generation 0 on a row
+// that does not exist yet, and write generation 0 again, all succeed. The row
+// never leaves generation 0, so none of them may be told that another run took
+// it over.
+func TestJobScanState_PutIfCreateRace(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		ctx := context.Background()
+		const writers = 6
+		for round := range 8 {
+			scope := fmt.Sprintf("put-if-create/%s/%d", t.Name(), round)
+			errs := make(chan error, writers)
+			var wg sync.WaitGroup
+			for i := range writers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					errs <- ss.PutJobScanStateIf(ctx, "test-job", scope, fmt.Sprintf("writer %d", i), 0, 0)
+				}()
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				if err != nil {
+					t.Fatalf("round %d: a writer that expected generation 0 on a row at generation 0 got %v", round, err)
+				}
+			}
+		}
+	})
+}
+
 // TestJobScanState_ScopesIsolated: rows are keyed by (job, scope) — one
 // job's cursors never collide with another's.
 func TestJobScanState_ScopesIsolated(t *testing.T) {

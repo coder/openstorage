@@ -311,35 +311,32 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
 	return err
 }
 
-// PutJobScanStateIf — see ScanStateStore. An UPDATE guarded by the expected
-// generation, then, for an expected generation 0, an INSERT that yields to a
-// row that exists: a row at generation 0 still matches the UPDATE.
+// PutJobScanStateIf — see ScanStateStore. One statement decides it, so two
+// writers that expect generation 0 on an absent row cannot both miss: an
+// UPDATE guarded by the expected generation, or, for an expected generation
+// 0, an upsert whose update half is guarded the same way (an absent row
+// counts as generation 0, and the insert half creates it).
 func (s *PG) PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error {
 	assertf(job != "" && scope != "", "PutJobScanStateIf(%q, %q)", job, scope)
-	tag, err := s.pool.Exec(ctx, `
+	query := `
 UPDATE job_scan_state SET payload = $3, generation = $4, updated_at = now()
-WHERE job = $1 AND scope = $2 AND generation = $5`,
-		job, scope, payload, generation, expectGeneration)
+WHERE job = $1 AND scope = $2 AND generation = $5`
+	if expectGeneration == 0 {
+		query = `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
+  generation = EXCLUDED.generation, updated_at = now()
+WHERE job_scan_state.generation = $5`
+	}
+	tag, err := s.pool.Exec(ctx, query, job, scope, payload, generation, expectGeneration)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 1 {
-		return nil
+	if tag.RowsAffected() != 1 {
+		return ErrScanStateConflict
 	}
-	if expectGeneration == 0 {
-		tag, err = s.pool.Exec(ctx, `
-INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
-VALUES ($1, $2, $3, $4, now())
-ON CONFLICT (job, scope) DO NOTHING`,
-			job, scope, payload, generation)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 1 {
-			return nil
-		}
-	}
-	return ErrScanStateConflict
+	return nil
 }
 
 // ArmAbsenceAdmissionFence upserts the admission-fence marker under the
