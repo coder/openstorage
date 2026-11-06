@@ -9,7 +9,7 @@ Standalone maintenance scripts for docs, releases, the Compose quickstart, and t
 - `smoke-compose-quickstart.sh`: an end-to-end smoke test of `compose.quickstart.yml` against a local image. It covers key init, the HTTP API, Git and Git LFS push and clone, restart persistence, and fail-closed init faults. CI runs it in `.github/workflows/ci.yml` and `.github/workflows/image.yml`.
 - `check-apply-messages.sh`: runs the patch cases in `internal/api/testdata/applymsg` through the `git` on PATH and checks the exit status and the message lines that `internal/api` reads to pick an HTTP status. `TestApplyMessageCases` in `internal/api` runs it, the `image` job in `.github/workflows/ci.yml` runs it inside the built image, whose Git is Alpine's, and `.github/workflows/image.yml` runs it inside the staged release image (before publication) and the published one (after it) when the tag carries it.
 
-`test_check_doc_links.py` holds the regression tests for `check-doc-links.py`. It is a test file, not a script.
+`test_check_doc_links.py` holds the regression tests for `check-doc-links.py`. `test_image_workflow.py` runs the `publish` job's promote and check steps from `.github/workflows/image.yml` as `bash -e`, the shell of an Actions step that sets none, against a stand-in `docker` that serves canned `imagetools` output. It needs `jq`. Both are test files, not scripts.
 
 ## Interface
 
@@ -192,7 +192,7 @@ No child directories.
 ## Verification
 
 - Doc links and citations: `python3 scripts/check-doc-links.py` (from the `lint` job in `.github/workflows/ci.yml`).
-- Checker tests: `python3 -B -m unittest discover -s scripts -p 'test_*.py' -v` (from the `lint` job in `.github/workflows/ci.yml`). `-B` keeps `scripts/__pycache__/` out of the checkout.
+- Script tests, the checker's and the image workflow steps': `python3 -B -m unittest discover -s scripts -p 'test_*.py' -v` (from the `lint` job in `.github/workflows/ci.yml`). `-B` keeps `scripts/__pycache__/` out of the checkout.
 - Smoke syntax: `bash -n scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml`).
 - Smoke run (needs Docker and a local image): `OPENSTORAGE_IMAGE=<local-image> bash scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml` and `.github/workflows/image.yml`).
 - Git's patch refusals: `sh scripts/check-apply-messages.sh internal/api/testdata/applymsg` (from `TestApplyMessageCases` in `internal/api`, from the `image` job in `.github/workflows/ci.yml`, and from `.github/workflows/image.yml`, which run it inside the image).
