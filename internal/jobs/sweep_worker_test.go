@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -316,4 +317,84 @@ func TestRiverCloseDoesNotLeaveTheSweepRowRunning(t *testing.T) {
 		t.Errorf("sweep job is still running after Close gave up on its recovery")
 	}
 	t.Logf("sweep job state after Close: %s", state)
+}
+
+// lateErrorLister ignores its context and fails the pass with msg at the time
+// that endAt returns.
+type lateErrorLister struct {
+	blob.BlobStore
+	endAt func() time.Time
+	msg   string
+}
+
+func (l lateErrorLister) ListPages(context.Context, string, int, func([]blob.ListedObject) error) error {
+	time.Sleep(time.Until(l.endAt()))
+	return errors.New(l.msg)
+}
+
+// An error that Work returns is River's to record. The log has no line for it
+// as the end of an abandoned pass, because that line is for an error that
+// nobody takes.
+func TestSweepWorkerDoesNotLogTheErrorItReturns(t *testing.T) {
+	f := newSweepFixture(t)
+	var logs lockedBuffer
+	s := NewSweeper(lateErrorLister{BlobStore: f.blobs, endAt: time.Now, msg: "simulated listing failure"},
+		f.store, SweepConfig{Threshold: 24 * time.Hour}, slog.New(slog.NewTextHandler(&logs, nil)))
+	w := &sweepWorker{schedule: &SweepSchedule{Sweeper: s, Interval: time.Hour}}
+	if err := w.Work(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "simulated listing failure") {
+		t.Fatalf("Work = %v, want the pass's error", err)
+	}
+	// The pass's goroutine decides whether to log after it hands over the outcome.
+	time.Sleep(200 * time.Millisecond)
+	if out := logs.String(); strings.Contains(out, "ended with an error") {
+		t.Fatalf("an error that Work returned was also logged as the end of an abandoned pass:\n%s", out)
+	}
+}
+
+// A pass whose error arrives as Work's grace ends is not lost: Work returns it,
+// or the log has it. Many passes end within a few milliseconds of their own
+// grace, so that both orders of the race happen. The test does not ask that
+// no error is reported twice: when the goroutine sees the abandoned flag while
+// Work takes the outcome, both report it, which the design allows.
+func TestSweepWorkerNeverLosesTheErrorOfAPassThatEndsAsTheGraceEnds(t *testing.T) {
+	const passes = 400
+	f := newSweepFixture(t)
+	lost := make([]bool, passes)
+	var wg gosync.WaitGroup
+	for i := range passes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var logs lockedBuffer
+			msg := fmt.Sprintf("simulated late failure %d", i)
+			// The passes end from 6 ms before to 6 ms after their grace.
+			offset := time.Duration(i-passes/2) * 12 * time.Millisecond / passes
+			cancelAt := time.Now().Add(100 * time.Millisecond)
+			s := NewSweeper(lateErrorLister{BlobStore: f.blobs, msg: msg,
+				endAt: func() time.Time { return cancelAt.Add(sweepReturnGrace + offset) }},
+				f.store, SweepConfig{Threshold: 24 * time.Hour}, slog.New(slog.NewTextHandler(&logs, nil)))
+			w := &sweepWorker{schedule: &SweepSchedule{Sweeper: s, Interval: time.Hour}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			returned := make(chan error, 1)
+			go func() { returned <- w.Work(ctx, nil) }()
+			time.Sleep(time.Until(cancelAt))
+			cancel()
+			err := <-returned
+			time.Sleep(500 * time.Millisecond) // a late log line
+			inRiver := err != nil && strings.Contains(err.Error(), msg)
+			inLog := strings.Contains(logs.String(), msg)
+			lost[i] = !inRiver && !inLog
+		}()
+	}
+	wg.Wait()
+	n := 0
+	for _, l := range lost {
+		if l {
+			n++
+		}
+	}
+	if n > 0 {
+		t.Fatalf("the error of %d of %d passes reached neither Work's return value nor the log", n, passes)
+	}
 }
