@@ -4751,6 +4751,11 @@ func TestLFSPut_WriterVerifyBoundedByLease(t *testing.T) {
 		t.Fatalf("wedged-verify PUT status = %d, body %s (want 500)", w.Code, w.Body)
 	}
 	wedged.requireBounded(t, srv.lfsPublicationLease())
+	// The bound alone passes a verify under any shorter context, such as
+	// the 1-minute cleanup context: require that the lease itself applies.
+	if d := wedged.wedged[0].deadline.Sub(wedged.wedged[0].at); d < srv.lfsPublicationLease()/2 {
+		t.Fatalf("wedged verify deadline is %v after the call, want the lease %v", d, srv.lfsPublicationLease())
+	}
 	srv.lfsStagingMu.Lock()
 	ops, inflight := srv.lfsStagingOps, srv.lfsStagingInFlight
 	srv.lfsStagingMu.Unlock()
