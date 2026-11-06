@@ -105,9 +105,10 @@ func (s *source) text(n ast.Node) string {
 
 type call struct {
 	pos     token.Pos
-	fun     string // printed callee, e.g. "s.blobs.Copy"
-	args    string // printed arguments
-	inClose bool   // inside a func literal
+	fun     string   // printed callee, e.g. "s.blobs.Copy"
+	args    string   // printed arguments
+	argv    []string // printed arguments, one per argument
+	inClose bool     // inside a func literal
 }
 
 // calls lists every call in n in source order.
@@ -127,7 +128,7 @@ func (s *source) calls(n ast.Node) []call {
 				for _, a := range m.Args {
 					args = append(args, s.text(a))
 				}
-				out = append(out, call{pos: m.Pos(), fun: s.text(m.Fun), args: strings.Join(args, ", "), inClose: inClose})
+				out = append(out, call{pos: m.Pos(), fun: s.text(m.Fun), args: strings.Join(args, ", "), argv: args, inClose: inClose})
 			}
 			return true
 		})
@@ -141,6 +142,28 @@ func (s *source) calls(n ast.Node) []call {
 func first(cs []call, fun, argHas string, closures bool) token.Pos {
 	for _, c := range cs {
 		if c.fun == fun && strings.Contains(c.args, argHas) && (closures || !c.inClose) {
+			return c.pos
+		}
+	}
+	return token.NoPos
+}
+
+// hasArg reports whether c has the argument arg, or one that starts with
+// arg when arg ends in "(".
+func hasArg(c call, arg string) bool {
+	for _, a := range c.argv {
+		if a == arg || strings.HasSuffix(arg, "(") && strings.HasPrefix(a, arg) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstWithArg returns the first call to fun, func literals included, that
+// has the argument arg (see hasArg), or token.NoPos.
+func firstWithArg(cs []call, fun, arg string) token.Pos {
+	for _, c := range cs {
+		if c.fun == fun && hasArg(c, arg) {
 			return c.pos
 		}
 	}
@@ -439,10 +462,13 @@ func main() {
 	fmt.Printf("FP internal/githttp/hook.go:preReceive[publication] %s\n", hook.fingerprint(start, end))
 }
 
-func constSpec(s *source, name string) ast.Node {
+func constSpec(s *source, name string) ast.Node { return specOf(s, token.CONST, name) }
+
+// specOf returns the const or var spec (tok) that declares name.
+func specOf(s *source, tok token.Token, name string) ast.Node {
 	for _, d := range s.file.Decls {
 		g, ok := d.(*ast.GenDecl)
-		if !ok || g.Tok != token.CONST {
+		if !ok || g.Tok != tok {
 			continue
 		}
 		for _, sp := range g.Specs {
@@ -454,7 +480,7 @@ func constSpec(s *source, name string) ast.Node {
 			}
 		}
 	}
-	fail("%s: const %s not found", s.path, name)
+	fail("%s: %s %s not found", s.path, tok, name)
 	return nil
 }
 
@@ -570,6 +596,17 @@ func (s *source) ifs(n ast.Node) []ifInfo {
 	return out
 }
 
+// errorEndsRun reports an `if <...call(...)...>; err != nil` in n whose body
+// returns.
+func (s *source) errorEndsRun(n ast.Node, call string) bool {
+	for _, i := range s.ifs(n) {
+		if strings.Contains(i.init, call+"(") && i.cond == "err != nil" && i.returns {
+			return true
+		}
+	}
+	return false
+}
+
 // assignsFalse reports an assignment of false to name directly in body.
 func (s *source) assignsFalse(body *ast.BlockStmt, name string) bool {
 	for _, st := range body.List {
@@ -607,14 +644,15 @@ func writesAfter(cs []call, exec, stmt string, pos token.Pos) bool {
 }
 
 // fencedSQL checks a SQL registry write: lock (a call that must come before
-// the fence read), the fence read on tx, an if that returns ErrRepoPurged,
-// then every write statement.
-func fencedSQL(s *source, f *ast.FuncDecl, lock, fence, exec, stmt string) bool {
+// the fence read, with the argument lockArg unless it is empty), the fence
+// read with tx as an argument, an if that returns ErrRepoPurged, then every
+// write statement.
+func fencedSQL(s *source, f *ast.FuncDecl, lock, lockArg, fence, exec, stmt string) bool {
 	cs := s.calls(f.Body)
-	fp := first(cs, fence, "tx", true)
+	fp := firstWithArg(cs, fence, "tx")
 	lp := token.NoPos
 	for _, c := range cs {
-		if (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp {
+		if (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp && (lockArg == "" || hasArg(c, lockArg)) {
 			lp = c.pos
 			break
 		}
@@ -680,11 +718,11 @@ func firstGate(s *source, fn *ast.FuncLit, cond, bodyHas string) bool {
 // transaction (PG: the pgx.BeginFunc closure; SQLite: before tx.Commit).
 // A write before the read is rolled back by that return, so it may come
 // first (the fold's old-row delete is its precondition).
-func fencedFold(s *source, f *ast.FuncDecl, lock, fence string, pg bool) bool {
+func fencedFold(s *source, f *ast.FuncDecl, lock, lockArg, fence string, pg bool) bool {
 	cs := s.calls(f.Body)
 	fi := -1
 	for i, c := range cs {
-		if c.fun == fence && strings.Contains(c.args, "tx") {
+		if c.fun == fence && hasArg(c, "tx") {
 			fi = i
 			break
 		}
@@ -695,7 +733,7 @@ func fencedFold(s *source, f *ast.FuncDecl, lock, fence string, pg bool) bool {
 	fp := cs[fi].pos
 	locked, ret, inTx := false, false, false
 	for _, c := range cs {
-		if (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp {
+		if (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp && (lockArg == "" || hasArg(c, lockArg)) {
 			locked = true
 		}
 		if !pg && c.fun == "tx.Commit" && c.pos > fp {
@@ -866,13 +904,16 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	cw.need(wraps, "PurgeExpired resets p.cursor and relists when the batch is empty and the cursor is not")
 	facts = append(facts, cw)
 
-	// Phase order.
+	// Phase order. A phase whose error the run ignores has not happened
+	// before the later phases either.
 	ff := newFact("FenceFirst")
 	ff.need(fence.IsValid() && drop.IsValid() && retire.IsValid() && reap.IsValid() && fence < drop && fence < retire && fence < reap,
 		"purgeRepo calls p.registry.FenceRepoPurge before DropRepoRefs, RetireRepoPacks and p.reapPrefix")
+	ff.need(pj.errorEndsRun(purgeRepo.Body, "p.registry.FenceRepoPurge"), "purgeRepo returns when p.registry.FenceRepoPurge fails")
 	rd := newFact("RefsDieFirst")
 	rd.need(drop.IsValid() && retire.IsValid() && reap.IsValid() && drop < retire && drop < reap,
 		"purgeRepo calls p.registry.DropRepoRefs before RetireRepoPacks and p.reapPrefix")
+	rd.need(pj.errorEndsRun(purgeRepo.Body, "p.registry.DropRepoRefs"), "purgeRepo returns when p.registry.DropRepoRefs fails")
 	facts = append(facts, ff, rd)
 
 	// RegistrationsFenced and RefWritesFenced: the fence read sits in the
@@ -889,8 +930,8 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	})
 	fenceSerialized := func(f *fact) {
 		cs := purgePG.calls(purgePG.fn("PG", "FenceRepoPurge").Body)
-		lp := first(cs, "lockBaseLedger", "tx", true)
-		f.need(lp.IsValid() && writesAfter(cs, "tx.Exec", "INSERT INTO purged_repos", lp), "PG FenceRepoPurge takes lockBaseLedger before its insert")
+		lp := firstWithArg(cs, "lockBaseLedger", "tx")
+		f.need(lp.IsValid() && writesAfter(cs, "tx.Exec", "INSERT INTO purged_repos", lp), "PG FenceRepoPurge takes lockBaseLedger on tx before its insert")
 		f.need(immediate, "sqlite.go opens the database with _txlock=immediate (BEGIN IMMEDIATE serializes writers)")
 		f.need(first(purgeSQ.calls(purgeSQ.fn("SQLite", "FenceRepoPurge").Body), "s.db.ExecContext", "INSERT INTO purged_repos", false).IsValid(),
 			"SQLite FenceRepoPurge inserts the purged_repos row (one write, ordered by the database write lock)")
@@ -900,24 +941,24 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	}
 	rf := newFact("RegistrationsFenced")
 	fenceSerialized(rf)
-	rf.need(fencedSQL(refGo, refGo.fn("PG", "RegisterPacks"), "lockBaseLedger", "repoPurgeFencedPG", "tx.Exec", "INSERT INTO packs"),
-		"PG RegisterPacks: lockBaseLedger, repoPurgeFencedPG, return ErrRepoPurged, then its writes")
-	rf.need(fencedSQL(ledger, ledger.fn("PG", "registerLFSObjectTx"), "lockBaseLedger", "repoPurgeFencedPG", "tx.Exec", "INSERT INTO lfs_objects"),
-		"PG registerLFSObjectTx: lockBaseLedger, repoPurgeFencedPG, return ErrRepoPurged, then its writes")
-	rf.need(fencedSQL(sq, sq.fn("SQLite", "RegisterPacks"), ".BeginTx", "repoPurgeFencedSQLite", "tx.ExecContext", "INSERT INTO packs"),
-		"SQLite RegisterPacks: BeginTx, repoPurgeFencedSQLite, return ErrRepoPurged, then its writes")
-	rf.need(fencedSQL(ledgerSQ, ledgerSQ.fn("SQLite", "registerLFSObjectTx"), ".BeginTx", "repoPurgeFencedSQLite", "tx.ExecContext", "INSERT INTO lfs_objects"),
-		"SQLite registerLFSObjectTx: BeginTx, repoPurgeFencedSQLite, return ErrRepoPurged, then its writes")
+	rf.need(fencedSQL(refGo, refGo.fn("PG", "RegisterPacks"), "lockBaseLedger", "baseRepoOf(", "repoPurgeFencedPG", "tx.Exec", "INSERT INTO packs"),
+		"PG RegisterPacks: lockBaseLedger on baseRepoOf(...), repoPurgeFencedPG on tx, return ErrRepoPurged, then its writes")
+	rf.need(fencedSQL(ledger, ledger.fn("PG", "registerLFSObjectTx"), "lockBaseLedger", "repo", "repoPurgeFencedPG", "tx.Exec", "INSERT INTO lfs_objects"),
+		"PG registerLFSObjectTx: lockBaseLedger on repo (LFS repos are base repos, ADR-35), repoPurgeFencedPG on tx, return ErrRepoPurged, then its writes")
+	rf.need(fencedSQL(sq, sq.fn("SQLite", "RegisterPacks"), ".BeginTx", "", "repoPurgeFencedSQLite", "tx.ExecContext", "INSERT INTO packs"),
+		"SQLite RegisterPacks: BeginTx, repoPurgeFencedSQLite on tx, return ErrRepoPurged, then its writes")
+	rf.need(fencedSQL(ledgerSQ, ledgerSQ.fn("SQLite", "registerLFSObjectTx"), ".BeginTx", "", "repoPurgeFencedSQLite", "tx.ExecContext", "INSERT INTO lfs_objects"),
+		"SQLite registerLFSObjectTx: BeginTx, repoPurgeFencedSQLite on tx, return ErrRepoPurged, then its writes")
 	rf.need(firstGate(wal, mutateFn(wal, wal.fn("S3WAL", "RegisterPacks")), "m.PurgedAt != nil", "ErrRepoPurged"),
 		"S3WAL RegisterPacks returns ErrRepoPurged first in its base-manifest mutation")
 	rf.need(firstGate(walLFS, mutateFn(walLFS, walLFS.fn("S3WAL", "registerLFSObject")), "m.PurgedAt != nil", "ErrRepoPurged"),
 		"S3WAL registerLFSObject returns ErrRepoPurged first in its base-manifest mutation")
 	rw := newFact("RefWritesFenced")
 	fenceSerialized(rw)
-	rw.need(fencedSQL(refGo, refGo.fn("PG", "casRef"), "lockBaseLedger", "repoPurgeFencedPG", "tx.Exec", "INSERT INTO refs"),
-		"PG casRef: lockBaseLedger, repoPurgeFencedPG, return ErrRepoPurged, then its writes")
-	rw.need(fencedSQL(sq, sq.fn("SQLite", "casRef"), ".BeginTx", "repoPurgeFencedSQLite", "tx.ExecContext", "INSERT INTO refs"),
-		"SQLite casRef: BeginTx, repoPurgeFencedSQLite, return ErrRepoPurged, then its writes")
+	rw.need(fencedSQL(refGo, refGo.fn("PG", "casRef"), "lockBaseLedger", "baseRepoOf(", "repoPurgeFencedPG", "tx.Exec", "INSERT INTO refs"),
+		"PG casRef: lockBaseLedger on baseRepoOf(...), repoPurgeFencedPG on tx, return ErrRepoPurged, then its writes")
+	rw.need(fencedSQL(sq, sq.fn("SQLite", "casRef"), ".BeginTx", "", "repoPurgeFencedSQLite", "tx.ExecContext", "INSERT INTO refs"),
+		"SQLite casRef: BeginTx, repoPurgeFencedSQLite on tx, return ErrRepoPurged, then its writes")
 	rw.need(firstGate(wal, mutateFn(wal, wal.fn("S3WAL", "casRef")), "m.PurgedAt != nil", "ErrRepoPurged"),
 		"S3WAL casRef returns ErrRepoPurged first in its base-manifest mutation")
 	facts = append(facts, rf, rw)
@@ -926,10 +967,10 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	// in its own transaction like RegisterPacks.
 	fo := newFact("FoldsFenced")
 	fenceSerialized(fo)
-	fo.need(fencedFold(refGo, refGo.fn("PG", "ReplacePacks"), "lockBaseLedger", "repoPurgeFencedPG", true),
-		"PG ReplacePacks: lockBaseLedger, then repoPurgeFencedPG in its pgx.BeginFunc transaction, then return ErrRepoPurged")
-	fo.need(fencedFold(sq, sq.fn("SQLite", "ReplacePacks"), ".BeginTx", "repoPurgeFencedSQLite", false),
-		"SQLite ReplacePacks: BeginTx, then repoPurgeFencedSQLite, then return ErrRepoPurged, before tx.Commit")
+	fo.need(fencedFold(refGo, refGo.fn("PG", "ReplacePacks"), "lockBaseLedger", "baseRepoOf(", "repoPurgeFencedPG", true),
+		"PG ReplacePacks: lockBaseLedger on baseRepoOf(...), then repoPurgeFencedPG on tx in its pgx.BeginFunc transaction, then return ErrRepoPurged")
+	fo.need(fencedFold(sq, sq.fn("SQLite", "ReplacePacks"), ".BeginTx", "", "repoPurgeFencedSQLite", false),
+		"SQLite ReplacePacks: BeginTx, then repoPurgeFencedSQLite on tx, then return ErrRepoPurged, before tx.Commit")
 	fo.need(gateBeforeWrites(wal, mutateFn(wal, wal.fn("S3WAL", "ReplacePacks")), "m.PurgedAt != nil", "ErrRepoPurged"),
 		"S3WAL ReplacePacks returns ErrRepoPurged in its base-manifest mutation before it writes the manifest")
 	facts = append(facts, fo)
@@ -984,12 +1025,18 @@ func purgeCovers() []cover {
 		}
 	}
 	add("internal/jobs/purge.go", "RepoPurger", "PurgeExpired", "PurgeRepo", "purgeRepo", "rescanPurged", "reapPrefix")
+	// One pack key stands for a base key and its +namespace keys: the
+	// purge's group, the fence key and the sweeper's fence probe.
+	add("internal/blob/blob.go", "", "QuotaRepoGroup")
+	bg := src("internal/blob/blob.go")
+	out = append(out, cover{bg, "internal/blob/blob.go:var packNamespaceSuffixes", specOf(bg, token.VAR, "packNamespaceSuffixes")})
+	add("internal/jobs/sweep.go", "", "baseOf")
 	pj := src("internal/jobs/purge.go")
 	out = append(out, cover{pj, "internal/jobs/purge.go:const MinRepoPurgeAge", constSpec(pj, "MinRepoPurgeAge")})
 	add("internal/ref/ref.go", "PG", "casRef", "RegisterPacks", "ReplacePacks")
 	add("internal/ref/ref.go", "", "validateReplacePacks")
 	add("internal/ref/ledger.go", "PG", "registerLFSObjectTx")
-	add("internal/ref/ledger.go", "", "lockBaseLedger")
+	add("internal/ref/ledger.go", "", "lockBaseLedger", "baseRepoOf")
 	add("internal/ref/purge.go", "PG", "FenceRepoPurge", "IsRepoPurged", "DropRepoRefs", "RetireRepoPacks", "CountRepoRows")
 	add("internal/ref/purge.go", "", "repoPurgeFencedPG")
 	add("internal/ref/sqlite.go", "SQLite", "casRef", "RegisterPacks", "ReplacePacks")
