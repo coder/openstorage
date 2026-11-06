@@ -338,56 +338,67 @@ func TestReplacePacksPurgeFence(t *testing.T) {
 // transactions serialize every writer already, and S3-WAL's fold and fence
 // CAS the same manifest): a fold must read the fence under the base-ledger
 // lock, or a fold that reads "not fenced" while FenceRepoPurge is still
-// open would register its pack after the fence commits.
+// open would register its pack after the fence commits. A namespace fold
+// takes the BASE repository's lock: a lock keyed by "<base>+import" would
+// not wait for the fence and would register behind it.
 func TestReplacePacksSerializesWithPurgeFence(t *testing.T) {
-	ctx := context.Background()
 	s := pgTestStore(t)
-	base := t.Name()
-	old := []Pack{
-		{ID: "a", Key: "packs/" + base + "/pack-a.pack", Size: 10},
-		{ID: "b", Key: "packs/" + base + "/pack-b.pack", Size: 20},
-	}
-	if err := s.RegisterPacks(ctx, base, old); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range []struct{ name, suffix string }{
+		{"base", ""},
+		{"import", "+import"},
+		{"ephemeral", "+ephemeral"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			base := t.Name()
+			repo := base + tc.suffix
+			old := []Pack{
+				{ID: "a", Key: "packs/" + repo + "/pack-a.pack", Size: 10},
+				{ID: "b", Key: "packs/" + repo + "/pack-b.pack", Size: 20},
+			}
+			if err := s.RegisterPacks(ctx, repo, old); err != nil {
+				t.Fatal(err)
+			}
 
-	conn, err := pgx.Connect(ctx, pgTestURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = conn.Close(context.Background()) })
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	// FenceRepoPurge's transaction, held open just before its commit.
-	if err := lockBaseLedger(ctx, tx, base); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO purged_repos (repo) VALUES ($1)`, base); err != nil {
-		t.Fatal(err)
-	}
+			conn, err := pgx.Connect(ctx, pgTestURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close(context.Background()) })
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			// FenceRepoPurge's transaction, held open just before its commit.
+			if err := lockBaseLedger(ctx, tx, base); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO purged_repos (repo) VALUES ($1)`, base); err != nil {
+				t.Fatal(err)
+			}
 
-	type result struct {
-		won bool
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		won, err := s.ReplacePacks(ctx, base, old, Pack{ID: "fold", Key: "packs/" + base + "/pack-fold.pack", Size: 25})
-		done <- result{won, err}
-	}()
-	select {
-	case r := <-done:
-		t.Fatalf("ReplacePacks completed while the fence transaction held the base-ledger lock: (%v, %v)", r.won, r.err)
-	case <-time.After(300 * time.Millisecond):
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if r := <-done; r.won || !errors.Is(r.err, ErrRepoPurged) {
-		t.Fatalf("ReplacePacks after the fence committed = (%v, %v), want ErrRepoPurged", r.won, r.err)
+			type result struct {
+				won bool
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				won, err := s.ReplacePacks(ctx, repo, old, Pack{ID: "fold", Key: "packs/" + repo + "/pack-fold.pack", Size: 25})
+				done <- result{won, err}
+			}()
+			select {
+			case r := <-done:
+				t.Fatalf("ReplacePacks(%s) completed while the fence transaction held the base-ledger lock: (%v, %v)", repo, r.won, r.err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if r := <-done; r.won || !errors.Is(r.err, ErrRepoPurged) {
+				t.Fatalf("ReplacePacks(%s) after the fence committed = (%v, %v), want ErrRepoPurged", repo, r.won, r.err)
+			}
+		})
 	}
 }
 
