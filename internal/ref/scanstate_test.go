@@ -182,6 +182,36 @@ func TestJobScanState_PutIf(t *testing.T) {
 	})
 }
 
+// TestJobScanState_PutIfCreateWins: writers that expect generation 0 on a row
+// that does not exist yet and write generation 1 — each the start of the next
+// pass — have exactly one winner.
+func TestJobScanState_PutIfCreateWins(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		ctx := context.Background()
+		const writers = 6
+		var wins atomic.Int32
+		var wg sync.WaitGroup
+		for i := range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := ss.PutJobScanStateIf(ctx, "test-job", "put-if-create-wins/"+t.Name(), fmt.Sprintf("writer %d", i), 1, 0)
+				switch {
+				case err == nil:
+					wins.Add(1)
+				case !errors.Is(err, ErrScanStateConflict):
+					t.Errorf("writer %d: %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+		if wins.Load() != 1 {
+			t.Fatalf("%d writers created the row, want exactly 1", wins.Load())
+		}
+	})
+}
+
 // TestJobScanState_PutIfCreateRace: writers that expect generation 0 on a row
 // that does not exist yet, and write generation 0 again, all succeed. The row
 // never leaves generation 0, so none of them may be told that another run took
