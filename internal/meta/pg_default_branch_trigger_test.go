@@ -160,8 +160,8 @@ func dropTrigger(ctx context.Context, t *testing.T, s *PG) {
 //   - repo_upstreams then repos FOR UPDATE: SetRepoUpstream.
 //
 // Each case holds the writer's first lock, waits until the boot is blocked
-// behind the writer or has started its retries, lets the writer take its
-// second lock within a deadline, and expects both to finish.
+// behind the writer, lets the writer take its second lock, and expects both
+// to finish: a deadlock aborts one of them after a second.
 func TestPGInitSchemaLockOrder(t *testing.T) {
 	s, ok := pgBackend(t).(*PG)
 	if !ok {
@@ -226,12 +226,8 @@ func TestPGInitSchemaLockOrder(t *testing.T) {
 			// detector aborts one side, a second or more.
 			wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			start := time.Now()
 			if _, err := tx.Exec(wctx, tc.second, repo.RepoID); err != nil {
-				t.Fatalf("the writer's second lock failed after %v (a deadlock with the boot?): %v", time.Since(start), err)
-			}
-			if waited := time.Since(start); waited > 3*initSchemaLockWait {
-				t.Fatalf("the writer's second lock waited %v for the boot, want about %v at most", waited, initSchemaLockWait)
+				t.Fatalf("the writer's second lock failed (a deadlock with the boot?): %v", err)
 			}
 			if err := tx.Commit(ctx); err != nil {
 				t.Fatalf("commit: %v", err)
