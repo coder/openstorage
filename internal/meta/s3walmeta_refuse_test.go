@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"log"
 	"log/slog"
 	"math"
 	"path/filepath"
@@ -231,9 +232,24 @@ func captureSlog(t *testing.T) *syncBuffer {
 	t.Helper()
 	b := &syncBuffer{}
 	prev := slog.Default()
+	// slog.SetDefault also redirects the log package, and restoring slog's
+	// own default handler does not undo that.
+	prevOut, prevFlags := log.Writer(), log.Flags()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(b, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
 	return b
+}
+
+func TestCaptureSlogRestoresLogOutput(t *testing.T) {
+	out, flags := log.Writer(), log.Flags()
+	t.Run("capture", func(t *testing.T) { captureSlog(t) })
+	if log.Writer() != out || log.Flags() != flags {
+		t.Fatalf("log output after captureSlog = %T flags %d, want %T flags %d", log.Writer(), log.Flags(), out, flags)
+	}
 }
 
 // TestS3WALMetaRefusalMatrix is the issue #516 test matrix: every
