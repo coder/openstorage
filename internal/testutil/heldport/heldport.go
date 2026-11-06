@@ -1,6 +1,8 @@
 // Package heldport keeps a test server's TCP port reserved while the
 // server is down, so a test can stop a server and start it again on the
-// same address without another process taking the port in between.
+// same address. In between, only a socket that also sets SO_REUSEPORT and
+// binds that exact port (on Linux, only from a process of the same user)
+// can take the port.
 package heldport
 
 import (
@@ -58,12 +60,19 @@ func hold(t testing.TB, addr *net.TCPAddr) {
 	if ip == nil {
 		t.Fatalf("heldport: %v is not IPv4", addr)
 	}
+	// SOCK_CLOEXEC is Linux-only. As the standard library does where it
+	// is missing, hold ForkLock from socket creation to CloseOnExec, so
+	// no child process started in between inherits the socket.
+	syscall.ForkLock.RLock()
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err == nil {
+		unix.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
 	if err != nil {
 		t.Fatalf("heldport: socket: %v", err)
 	}
 	t.Cleanup(func() { _ = unix.Close(fd) })
-	unix.CloseOnExec(fd) // SOCK_CLOEXEC is Linux-only
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
 		t.Fatalf("heldport: SO_REUSEPORT: %v", err)
 	}

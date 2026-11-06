@@ -9,8 +9,8 @@ import (
 )
 
 // TestRelistenAfterClose: after Listen's listener closes, a dial is
-// refused and no other listener can bind the address; Relisten accepts
-// connections on it again.
+// refused and a listener without SO_REUSEPORT cannot bind the address;
+// Relisten accepts connections on it again.
 func TestRelistenAfterClose(t *testing.T) {
 	ln := Listen(t)
 	addr := ln.Addr().String()

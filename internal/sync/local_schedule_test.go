@@ -139,7 +139,8 @@ func (g *gateLanes) ListLocalWork(ctx context.Context, org, after string, limit 
 // httpUpstream is a git smart-HTTP upstream (git http-backend over CGI)
 // that can be taken down and brought back on the same address, so one repo
 // can fail as unreachable and later succeed. heldport keeps the port while
-// it is down, so no other server on the host can take it.
+// it is down: another server can take it only if it also sets SO_REUSEPORT
+// and binds that exact port.
 type httpUpstream struct {
 	root string
 	addr string
