@@ -3,6 +3,7 @@ package githttp
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/cgi"
@@ -12,11 +13,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"golang.org/x/sys/unix"
 
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
@@ -249,7 +252,10 @@ func TestLocalHookForwardBeforeCachePublication(t *testing.T) {
 
 // toggledUpstream is a smart-HTTP upstream on a fixed address that can be
 // taken down (connection refused: a transient push failure) and brought
-// back.
+// back. A socket that is bound to the address but never listens holds the
+// port the whole time: while the upstream is down, no other server on the
+// host can take the port and answer in its place (a 404 there is a
+// permanent push failure, and up could not listen again).
 type toggledUpstream struct {
 	addr    string
 	handler http.Handler
@@ -262,11 +268,9 @@ func newToggledUpstream(t *testing.T, root string) *toggledUpstream {
 	u := &toggledUpstream{handler: &cgi.Handler{Path: backend, Env: []string{
 		"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
 	}}}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenReusePort(t, "127.0.0.1:0")
 	u.addr = ln.Addr().String()
+	holdPort(t, ln.Addr().(*net.TCPAddr))
 	u.serve(ln)
 	t.Cleanup(func() {
 		if u.srv != nil {
@@ -292,11 +296,86 @@ func (u *toggledUpstream) down(t *testing.T) {
 
 func (u *toggledUpstream) up(t *testing.T) {
 	t.Helper()
-	ln, err := net.Listen("tcp", u.addr)
+	u.serve(listenReusePort(t, u.addr))
+}
+
+// listenReusePort listens on addr with SO_REUSEPORT, so it can share the
+// port with holdPort's socket.
+func listenReusePort(t *testing.T, addr string) net.Listener {
+	t.Helper()
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}}
+	ln, err := lc.Listen(t.Context(), "tcp4", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	u.serve(ln)
+	return ln
+}
+
+// holdPort binds a socket to addr with SO_REUSEPORT and never listens on
+// it, until the test ends. The kernel answers a dial to a port with no
+// listener with a reset (connection refused), and gives the port to no
+// socket that lacks SO_REUSEPORT.
+func holdPort(t *testing.T, addr *net.TCPAddr) {
+	t.Helper()
+	ip := addr.IP.To4()
+	if ip == nil {
+		t.Fatalf("holdPort: %v is not IPv4", addr)
+	}
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+		t.Fatal(err)
+	}
+	sa := &unix.SockaddrInet4{Port: addr.Port}
+	copy(sa.Addr[:], ip)
+	if err := unix.Bind(fd, sa); err != nil {
+		t.Fatalf("holdPort %v: %v", addr, err)
+	}
+}
+
+// TestToggledUpstreamHoldsItsPortWhileDown: while the upstream is down, a
+// dial is refused, and no other server can listen on its address; up
+// serves again on the same address.
+func TestToggledUpstreamHoldsItsPortWhileDown(t *testing.T) {
+	root := t.TempDir()
+	bare := filepath.Join(root, "up", "mirror.git")
+	mustGit(t, "", "init", "--bare", "-b", "main", bare)
+	u := newToggledUpstream(t, root)
+	refs := "http://" + u.addr + "/up/mirror.git/info/refs?service=git-upload-pack"
+	get := func() (int, error) {
+		resp, err := http.Get(refs)
+		if err != nil {
+			return 0, err
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode, nil
+	}
+	if code, err := get(); err != nil || code != http.StatusOK {
+		t.Fatalf("up: GET = %d, %v", code, err)
+	}
+	u.down(t)
+	if _, err := get(); err == nil || !errors.Is(err, unix.ECONNREFUSED) {
+		t.Fatalf("down: GET err = %v, want connection refused", err)
+	}
+	if ln, err := net.Listen("tcp4", u.addr); err == nil {
+		_ = ln.Close()
+		t.Fatalf("down: another server could listen on %s", u.addr)
+	}
+	u.up(t)
+	if code, err := get(); err != nil || code != http.StatusOK {
+		t.Fatalf("up again: GET = %d, %v", code, err)
+	}
 }
 
 // readPushSchedule reads repoID's push retry position from the private
