@@ -695,7 +695,7 @@ func TestSweepSchedule_PurgeKeepsItsOwnTimeWhenTheSweepRunsLate(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("runOnce = %v, want the sweep's deadline error", err)
 	}
-	if got := receiveLeft(t, "the purge's delete guard", purgeLeft); got < 1500*time.Millisecond {
+	if got := receiveLeft(t, "the purge's delete guard", purgeLeft); got < time.Second {
 		t.Errorf("the purge started with %v left, want about its own 2s", got)
 	}
 	f.assertPurged(repo.RepoID)

@@ -209,7 +209,7 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 		"push 32m after its start":           orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_live"}, 32*time.Minute),
 		"absence pass 1h10m after its start": orphanJob(t, ins, absenceReconcileArgs{}, time.Hour+10*time.Minute),
 		"LFS reclaim 1h10m after its start":  orphanJob(t, ins, lfsReclaimArgs{}, time.Hour+10*time.Minute),
-		"sweep 2h10m after its start":        orphanJob(t, ins, sweepArgs{}, 2*time.Hour+10*time.Minute),
+		"sweep 2h40m after its start":        orphanJob(t, ins, sweepArgs{}, 2*time.Hour+40*time.Minute),
 	}
 	orphanJob(t, ins, syncArgs{Org: "org", RepoID: "repo_crashed"}, 40*time.Minute)
 	crashedPush := orphanJob(t, ins, pushArgs{Org: "org", RepoID: "repo_crashed"}, 40*time.Minute)

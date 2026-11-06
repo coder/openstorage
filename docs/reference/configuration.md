@@ -657,11 +657,13 @@ Background jobs run through a queue seam: durable [River](https://riverqueue.com
 Postgres, in-process in local mode. For procedures and run reports, see
 [Operate the storage lifecycle](../how-to/storage-lifecycle-and-sweeping.md).
 
-On PostgreSQL, one sweep job lasts 2 hours. With
+On PostgreSQL, one sweep job has a 2-hour budget. With
 [`OPENSTORAGE_REPO_RETENTION`](#openstorage_repo_retention) set, the sweep ends 15 min
 early, so the repository purge keeps at least 15 min of its own, counted from when the
-purge starts. The purge may use more when the sweep is short. A purge that is cut short
-continues on a later pass. Local mode sets no deadline.
+purge starts. The purge may use more when the sweep is short. A sweep that returns late,
+because it finishes a delete handshake after its deadline, moves the purge later, so a job
+can run for up to about 2 h 30 min. A purge that is cut short continues on a later pass.
+Local mode sets no deadline.
 
 ### `OPENSTORAGE_SWEEP_INTERVAL`
 
@@ -764,7 +766,8 @@ synchronously for one repo.
   always waits at least an hour after deletion, so no in-flight pre-delete push can race
   it.
 - **Requires sweeping:** [`OPENSTORAGE_SWEEP_INTERVAL`](#openstorage_sweep_interval) > 0.
-  The purge rides the sweep schedule.
+  The purge rides the sweep schedule. On PostgreSQL, setting retention shortens each sweep
+  by 15 min, so that the purge keeps its own time (see [Maintenance jobs](#maintenance-jobs)).
 - **Fleet prerequisite** (also for `openstorage purge-repo`): enable only when **every**
   node (serve replicas *and* hook-running git nodes) runs a build with the purge write
   fence (ref updates and pack/LFS registrations reject purged repos). Otherwise an old
