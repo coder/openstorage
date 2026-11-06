@@ -427,6 +427,23 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme(" ".join(ok + bad) + "\n", **files)
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
+    def test_a_lone_carriage_return_does_not_end_a_go_or_terraform_comment(self):
+        files = {
+            "pkg/demo.go": "package demo\n\n// note\rfunc Hidden() {}\nfunc Real() {}\n",
+            "pkg/main.tf": '# c\rresource "a" "hidden" {}\nlocals {\n  a = 1 # c\rb = 2\n  c = 3\n}\n',
+        }
+        ok = ["[demo.go:Real]", "[main.tf:local.a]", "[main.tf:local.c]"]
+        bad = ["[demo.go:Hidden]", "[main.tf:a.hidden]", "[main.tf:local.b]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_line_feed_and_a_carriage_return_in_either_order_end_one_unit_file_line(self):
+        for name, end in [("lf_cr", "\n\r"), ("cr_lf", "\r\n"), ("cr", "\r"), ("lf", "\n")]:
+            with self.subTest(end=name):
+                unit = f"[Unit]{end}Description=a \\{end}[Hidden]{end}[Service]{end}ExecStart=/bin/true{end}"
+                result = self.check_readme("[app.service:Hidden] [app.service:Service]\n", **{"pkg/app.service": unit})
+                self.assert_failures(result, ("UNRESOLVED CITATION", "[app.service:Hidden]"))
+
     def test_a_unit_file_reads_a_section_header_and_a_comment_as_systemd_does(self):
         # systemd trims only a space and a tab, allows nothing after `]`, and ends a line at a NUL.
         files = {
@@ -444,6 +461,20 @@ class CitationTests(CheckerTestCase):
         py = "class A:\n    def m(self): pass\n\x0cdef hidden(): pass\ndef real(): pass\n"
         result = self.check_readme("[tool.py:A.m] [tool.py:A.hidden] [tool.py:real]\n", **{"pkg/tool.py": py})
         self.assert_failures(result, ("UNRESOLVED CITATION", "[tool.py:A.hidden]"))
+
+    def test_a_name_next_to_a_backslash_and_a_line_feed_is_not_mentioned_in_a_shell_script(self):
+        # `foo\\<LF>bar` is the word foobar in bash, and two literal lines inside single quotes. Neither reads as foo or bar.
+        sh = "echo foo\\\nbar\necho 'baz\\\nqux'\necho spaced \\\n  after\nreal-word\n"
+        ok = ["[run.sh:real-word]", "[run.sh:spaced]", "[run.sh:after]"]
+        bad = ["[run.sh:foo]", "[run.sh:bar]", "[run.sh:baz]", "[run.sh:qux]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_only_a_space_or_a_tab_puts_a_hash_at_the_start_of_a_shell_word(self):
+        # In bash `a<FF>#` is one word, so the `#` starts no comment and the next word is code.
+        sh = "echo a\x0c# real-word\necho b\t# hidden-word\n"
+        result = self.check_readme("[run.sh:real-word] [run.sh:hidden-word]\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[run.sh:hidden-word]"))
 
     def test_a_backtick_starts_a_shell_comment(self):
         sh = "echo `#hidden-word` shown-after\nreal-word\n"
@@ -465,6 +496,16 @@ class CitationTests(CheckerTestCase):
             with self.subTest(case=name):
                 result = self.run_checker(readme)
                 self.assertEqual(result.stdout, f"BROKEN FILE {where} -> gone.md\nbroken links: 1\n")
+
+    def test_only_spaces_and_tabs_separate_a_link_destination_from_its_title(self):
+        # CommonMark takes a form feed or NEL after a destination as part of the text, so the link below renders.
+        for name, sep in [("ff", "\x0c"), ("nel", "\x85"), ("ls", "\u2028")]:
+            with self.subTest(separator=name):
+                link = f"[a](README.md{sep}'[Gone](gone.md')"
+                result = self.run_checker(link + "\n")
+                self.assertEqual(result.stdout, f"UNSUPPORTED UNPARSED LINK README.md:1 -> {link}\nbroken links: 1\n")
+        result = self.run_checker("[a](README.md 'a title') [b](README.md\t\"a title\")\n")
+        self.assertEqual(result.stdout, "broken links: 0\n")
 
     def test_markdown_line_numbers_and_links_survive_a_separator_that_only_python_splits_on(self):
         for name, sep in [("vt", "\x0b"), ("ff", "\x0c"), ("fs", "\x1c"), ("nel", "\x85"), ("ls", "\u2028"), ("ps", "\u2029")]:

@@ -56,7 +56,7 @@ os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 # Destination: runs of non-space/non-paren/non-# chars, allowing one level of
 # balanced parens; then an optional #fragment and an optional quoted title.
 LINK = re.compile(
-    r"\]\(((?:[^()\s#]|\([^()\s]*\))*)(#[^)\s]*)?(?:\s+[\"\x27][^)]*[\"\x27])?\)")
+    r"\]\(((?:[^()\s#]|\([^()\s]*\))*)(#[^)\s]*)?(?:[ \t]+[\"\x27][^)]*[\"\x27])?\)")
 REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:")
 ANGLE = re.compile(r"\]\(\s*<")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -740,17 +740,19 @@ def js_names(text):
 # whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
-        self.code = "\n".join(re.sub(r"(?:^|(?<=[\s;&|()`]))#.*", "", line) for line in text.split("\n"))
+        self.code = "\n".join(re.sub(r"(?:^|(?<=[ \t;&|()`]))#.*", "", line) for line in text.split("\n"))
 
     def __contains__(self, symbol):
-        pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)"
+        # A backslash and a line feed join two lines, or are two literal characters inside single quotes. Without
+        # reading quotes the reader cannot tell which, so a name next to the pair is not mentioned.
+        pattern = r"(?<![\w-])(?<!\w\.)(?<!\\\n)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)(?!\\\n)"
         return re.search(pattern, self.code) is not None
 
 
 def unit_names(text):
     # systemd trims only a space and a tab, ends a line at a NUL too, and wants nothing after `]`. A NUL fails closed.
     names, continued = set(), False
-    for line in text.split("\n") if "\0" not in text else []:
+    for line in re.split(r"\r\n|\n\r|\r|\n", text) if "\0" not in text else []:
         if line.lstrip(" \t").startswith(("#", ";")):
             continue
         m = None if continued else re.match(r"\[([\w-]+)\][ \t]*$", line)
@@ -775,12 +777,18 @@ def language(path):
     return LANGUAGES.get(posixpath.splitext(path)[1])
 
 
+UNIT_KINDS = (".service", ".timer")
+KEEPS_CR = (".sh", ".go", ".tf", *UNIT_KINDS)
+
+
 @functools.cache
 def citable(path):
-    # Bash ends a line at a line feed only, so a shell script keeps its carriage returns. Python, systemd and the
-    # other readers end a line at a lone one too, and text mode turns each carriage return into a line feed.
-    with open(path, encoding="utf-8", newline="" if path.endswith(".sh") else None) as source:
-        return language(path)(source.read())
+    # Bash, Go and HCL end a line at a line feed only, and systemd also at a carriage return in any pair with a line
+    # feed, so those files keep their carriage returns. Python and JavaScript end a line at a lone one too, and
+    # text mode turns each carriage return into a line feed.
+    with open(path, encoding="utf-8", newline="" if path.endswith(KEEPS_CR) else None) as source:
+        text = source.read()
+    return language(path)(text if path.endswith(UNIT_KINDS) else text.replace("\r\n", "\n"))
 
 
 def citation_problem(path, symbol):
