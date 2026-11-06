@@ -19,7 +19,10 @@ type SimBlobStore struct {
 	inj   *Injector
 }
 
-var _ blob.BlobStore = (*SimBlobStore)(nil)
+var (
+	_ blob.BlobStore       = (*SimBlobStore)(nil)
+	_ blob.PageListerAfter = (*SimBlobStore)(nil)
+)
 
 // NewSimBlobStore wraps inner with fault injection driven by inj.
 func NewSimBlobStore(inner blob.BlobStore, inj *Injector) *SimBlobStore {
@@ -118,6 +121,22 @@ func (s *SimBlobStore) ListPages(ctx context.Context, prefix string, pageSize in
 		return ambiguousFaultError{op: OpBlobList}
 	case FaultNone:
 		return s.inner.ListPages(ctx, prefix, pageSize, fn)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobList))
+	}
+}
+
+// ListPagesAfter is ListPages from the first key after after, with the same
+// fault point: the helper uses the inner store's own ListPagesAfter if it has
+// one.
+func (s *SimBlobStore) ListPagesAfter(ctx context.Context, prefix, after string, pageSize int, fn func([]blob.ListedObject) error) error {
+	switch class := s.inj.begin(OpBlobList); class {
+	case FaultClean:
+		return cleanFaultError{op: OpBlobList}
+	case FaultAmbiguous:
+		return ambiguousFaultError{op: OpBlobList}
+	case FaultNone:
+		return blob.ListPagesAfter(ctx, s.inner, prefix, after, pageSize, fn)
 	default:
 		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobList))
 	}

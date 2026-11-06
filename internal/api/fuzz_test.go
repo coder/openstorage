@@ -2,8 +2,9 @@
 // clientKey derives the rate-limit bucket key pre-auth on every request
 // (RemoteAddr + client-controlled X-Forwarded-For), and coreCursorDecode
 // parses opaque pagination cursors. Both must stay total and fail closed on
-// arbitrary input. FuzzApplyRejection covers git apply's stderr, which holds
-// client-chosen path names (#613).
+// arbitrary input. FuzzApplyRejection covers git apply's stderr and
+// FuzzPatchModeError its summary, which both hold client-chosen path names
+// (#613).
 package api
 
 import (
@@ -15,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // fuzzB64 encodes a raw cursor body the way coreCursorEncode does.
@@ -108,6 +110,43 @@ func FuzzClientKey(f *testing.F) {
 		}
 		if !found {
 			t.Fatalf("derived key %q does not correspond to any XFF hop", key)
+		}
+	})
+}
+
+// FuzzRawPathBase64: a path sibling exists exactly for bytes that are not
+// valid UTF-8, and decodes (strictly) back to those bytes.
+func FuzzRawPathBase64(f *testing.F) {
+	for _, seed := range [][2]string{
+		{"", ""}, {"plain.txt", "a\ufffdb"}, {"a\xffb", "a\xfeb"}, {"caf\xe9.txt", "caf\u00e9.txt"},
+		{"\xc0\x80", "\xed\xa0\x80"}, {"d\xfe/x.txt", "\xf4\x90\x80\x80"}, {strings.Repeat("\xff", 200), "\x00"},
+	} {
+		f.Add(seed[0], seed[1])
+	}
+	f.Fuzz(func(t *testing.T, p, q string) {
+		one := rawPathBase64(p)
+		if utf8.ValidString(p) != (one == "") {
+			t.Fatalf("rawPathBase64(%q) = %q: present exactly when the path is not valid UTF-8", p, one)
+		}
+		if one != "" {
+			if raw, err := base64.StdEncoding.Strict().DecodeString(one); err != nil || string(raw) != p {
+				t.Fatalf("rawPathBase64(%q) = %q decodes to %q, %v", p, one, raw, err)
+			}
+		}
+		list := rawPathsBase64([]string{p, q})
+		if utf8.ValidString(p) && utf8.ValidString(q) {
+			if list != nil {
+				t.Fatalf("rawPathsBase64(%q, %q) = %q, want nil", p, q, list)
+			}
+			return
+		}
+		if len(list) != 2 {
+			t.Fatalf("rawPathsBase64(%q, %q) = %q, want 2 elements", p, q, list)
+		}
+		for i, want := range []string{p, q} {
+			if raw, err := base64.StdEncoding.Strict().DecodeString(list[i]); err != nil || string(raw) != want {
+				t.Fatalf("rawPathsBase64[%d] = %q decodes to %q, %v, want %q", i, list[i], raw, err, want)
+			}
 		}
 	})
 }
@@ -208,6 +247,39 @@ func FuzzApplyRejection(f *testing.F) {
 		}
 		if noisy := wcApplyStatus(exit, "noise\n"+msg); noisy != got {
 			t.Fatalf("a line before %q changed the status of exit %d from %d to %d", msg, exit, got, noisy)
+		}
+	})
+}
+
+// FuzzPatchModeError: wcPatchModeError reads `git apply --summary`, which
+// prints file names as they are. It must be total, a line that is not a mode
+// line or that holds a valid mode must not change its answer, and a directory
+// mode on a line of its own must always fail it.
+func FuzzPatchModeError(f *testing.F) {
+	for _, seed := range []string{
+		"",
+		" create mode 100644 a.txt\n",
+		" create mode 040000 dd\n",
+		" mode change 100644 => 040000 a.txt\n",
+		" mode change 100644 => 100755 a.txt\n create mode 160000 sub\n",
+		" rename a => b (100%)\n delete mode 040000 c\n",
+		" create mode 100644 x\n create mode 040000 y\n",
+		" mode change 100644\n",
+		" create mode ",
+		" create mode  \n",
+		"x create mode 040000 y",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, summary string) {
+		err := wcPatchModeError(summary)
+		for _, extra := range []string{"noise\n", " create mode 100644 x\n", " mode change 100644 => 100755 y\n", " delete mode 040000 z\n"} {
+			if got := wcPatchModeError(extra + summary); (got == nil) != (err == nil) {
+				t.Fatalf("the line %q changed the answer for %q from %v to %v", extra, summary, err, got)
+			}
+		}
+		if wcPatchModeError(" create mode 040000 dd\n"+summary) == nil {
+			t.Fatalf("a directory mode in front of %q passed", summary)
 		}
 	})
 }

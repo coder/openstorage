@@ -253,6 +253,44 @@ func TestSimBlobNotFoundFault(t *testing.T) {
 	}
 }
 
+// ListPagesAfter shares the listing fault point with List and ListPages, and
+// otherwise lists after the key.
+func TestSimBlobListPagesAfter(t *testing.T) {
+	ctx := context.Background()
+	inner := openBlobStore(t)
+	inj := NewInjector(1)
+	bl := NewSimBlobStore(inner, inj)
+
+	src := filepath.Join(t.TempDir(), "obj")
+	if err := os.WriteFile(src, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"1", "2", "3"} {
+		if err := bl.UploadFile(ctx, "packs/r/pack-"+id+".pack", src); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list := func() ([]string, error) {
+		var keys []string
+		err := bl.ListPagesAfter(ctx, "packs/", "packs/r/pack-1.pack", 10, func(page []blob.ListedObject) error {
+			for _, o := range page {
+				keys = append(keys, o.Key)
+			}
+			return nil
+		})
+		return keys, err
+	}
+
+	inj.FailNext(OpBlobList, FaultClean)
+	if _, err := list(); !errors.Is(err, ErrInjectedClean) {
+		t.Fatalf("ListPagesAfter = %v, want the injected clean fault", err)
+	}
+	keys, err := list()
+	if want := []string{"packs/r/pack-2.pack", "packs/r/pack-3.pack"}; err != nil || !reflect.DeepEqual(keys, want) {
+		t.Fatalf("ListPagesAfter = %q, %v; want %q", keys, err, want)
+	}
+}
+
 func TestSimBlobAmbiguousDownloadMaterializes(t *testing.T) {
 	ctx := context.Background()
 	inner := openBlobStore(t)

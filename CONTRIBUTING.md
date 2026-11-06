@@ -223,8 +223,10 @@ A PR merges when all of these hold:
 3. **A clean automated security round** — same protocol with
    `@codex security review`.
 4. **No unresolved review threads.**
-5. **The branch is up to date with `main`** — branch protection enforces it.
-   Prefer GitHub's *Update branch* over force-pushing.
+5. **The PR merges through the merge queue** — the queue squashes it onto the
+   latest `main` and runs the required checks there, so the branch does not
+   need to be up to date. When `main` conflicts with it, merge `main` into the
+   branch instead of force-pushing.
 
 Fixes land [**red-first**](docs/reference/testing.md#red-first-tests): the PR
 includes a test that fails on the pre-fix code. Verify docs claims against the
