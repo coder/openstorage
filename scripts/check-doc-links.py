@@ -579,9 +579,10 @@ JS_UNKNOWN = {"await", "of", "yield"}
 JS_LINE_BREAK = re.compile(r"[\n\r\u2028\u2029]")
 JS_NEWLINE = re.compile(r"\r\n?|[\n\u2028\u2029]")
 JS_SIGN = re.compile(r"\+\+|--|[+-]")
-# No declaration can name one of these: `let in x` and `let instanceof x` use
-# `let` as a variable, and `class extends X {}` has no name.
-JS_RESERVED = {"break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum",
+# No declaration is read as naming one of these. `let in x` and `let instanceof x`
+# use `let` as a variable, `class extends X {}` has no name, and `as` is the word
+# after the keyword in an import or export list, as in `export { class as k }`.
+JS_RESERVED = {"as", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum",
                "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "new", "null",
                "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with"}
 
@@ -686,12 +687,12 @@ def js_mask(text):
 
 
 # A declaration keyword starts a line and its name is followed by what a
-# declaration has there: `(` after a function name, `{`, `extends` or the end
-# of the line after a class name, and `=`, `;`, `,` or the end of the line
-# after a variable name. `function as x` in an import list is not one.
+# declaration has there: `(` or the end of the line after a function name,
+# `{`, `extends` or the end of the line after a class name, and `=`, `;`, `,`,
+# `}` or the end of the line after a variable name.
 JS_DECLARATION = re.compile(
-    r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? ([\w$]+)(?=\s*\()"
-    r"|class ([\w$]+)(?=\s*(?:\{|extends\b|$))|(?:const|let|var) ([\w$]+)(?=\s*(?:[=;,]|$)))")
+    r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? ([\w$]+)(?=\s*(?:\(|$))"
+    r"|class ([\w$]+)(?=\s*(?:\{|extends\b|$))|(?:const|let|var) ([\w$]+)(?=\s*(?:[=;,}]|$)))")
 
 
 class JsNames(set):

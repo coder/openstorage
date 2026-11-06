@@ -476,8 +476,10 @@ class CitationTests(CheckerTestCase):
               "const quote = '\\'' + \"say \\\"hi\\\"\";\n"
               'class Counter {\n  #count = 0;\n  get half() { return this.#count / 2; }\n}\n'
               'class Wide\n  extends Counter {\n}\nclass Tight{}\nconst pair = 1,\n  other = 2;\nlet late\n  = 3;\n'
+              'function broken\n  (a) {}\n{\n  var bare }\n'
               'function afterAll() {}\n')
-        ok = ["slug", "label", "ratio", "test", "first", "quote", "Counter", "Wide", "Tight", "pair", "late", "afterAll"]
+        ok = ["slug", "label", "ratio", "test", "first", "quote", "Counter", "Wide", "Tight", "pair", "late", "broken", "bare",
+              "afterAll"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result)
         self.assertEqual(result.returncode, 0)
@@ -517,10 +519,13 @@ class CitationTests(CheckerTestCase):
             "pkg/import.js": "import {\n  function as viaImport,\n} from 'm';\n",
             "pkg/export.js": "export {\n  class as viaExport,\n} from 'm';\n",
             "pkg/var.js": "import {\n  var as viaVar,\n} from 'm';\n",
+            "pkg/break_after.js": "import {\n  class as\n  k\n} from 'm';\n",
+            "pkg/break_comment.js": "export {\n  let as // note\n  k\n} from 'm';\n",
+            "pkg/extends_name.js": "export {\n  class as extends\n} from 'm';\n",
         }
         files = {name: source + "function after() {}\n" for name, source in files.items()}
         stale = ["[for_test.js:viaTest]", "[for_update.js:viaUpdate]", "[for_class.js:ViaClass]", "[import.js:as]",
-                 "[export.js:as]", "[var.js:as]"]
+                 "[export.js:as]", "[var.js:as]", "[break_after.js:as]", "[break_comment.js:as]", "[extends_name.js:as]"]
         result = self.check_readme(" ".join(stale + [f"[{name[4:]}:after]" for name in files]) + "\n", **files)
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in stale])
 
