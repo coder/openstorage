@@ -614,7 +614,9 @@ Upstream documents no value and no `Link` or `Sunset` header, so open.storage se
   opts internal forges in.
 
 **Events and cancellation:** outbound runs emit `repo.push_upstream.*` events
-([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. `DELETE /repos/base` silently cancels
+([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. An outbound run emits
+`repo.push_upstream.started` once its loopback fetch of this server has the snapshot it
+forwards, before it pushes to the upstream. `DELETE /repos/base` silently cancels
 in-flight runs in both directions. A run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
@@ -633,6 +635,13 @@ git:read, does not trigger the forward, since the forward publishes every head a
 The write stays local. Nothing polls the upstream, so the repository converges only on
 the next authorized trigger: a write, pull-upstream, or push-upstream that passes these
 gates.
+
+**Ref writes that forward:** on SQLite and S3WAL, a ref write through this API that
+triggers the forward (a `forward_pushes` repo and a token that passes the gates above)
+holds the ref and records the forward request before it changes the ref. It waits up to
+10 seconds for a git push or another such write that holds the same ref, then fails with
+**503** and `Retry-After: 1`. A write that loses its compare-and-swap (409) has recorded
+its request already, so the repository gets one forward run with nothing new to push.
 
 #### Egress policy
 
@@ -713,4 +722,4 @@ Other limits and gaps:
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit, busy or backpressure (plain problem body) |
-| 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)), and, on SQLite and S3WAL, for a ref write that forwards (to a `forward_on_push` repository, with a token that may forward) and waited 10 seconds for a concurrent git push or ref write that holds the same ref (with `Retry-After`) |
+| 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)), and, on SQLite and S3WAL, for a ref write that forwards and waited 10 seconds for a concurrent git push or ref write that holds the same ref (with `Retry-After`; [ref writes that forward](#upstream-sync)) |

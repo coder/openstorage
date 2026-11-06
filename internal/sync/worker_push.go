@@ -185,11 +185,12 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	}
 	started := base
 	started.Type = EventPushUpstreamStarted
-	// The started event goes out once the loopback fetch has its snapshot,
-	// or when the run ends before that. A local run whose fetch is refused
-	// for a stale held ref restores its request and emits nothing, like a
-	// failed publication wait: a started event with no terminal event
-	// would show a run that never ends.
+	// On every backend, the started event goes out once the loopback fetch
+	// has its snapshot, before the upstream push, or when the run ends
+	// before that (TestPushRunStartedPrecedesUpstreamPush). A local run
+	// whose fetch is refused for a stale held ref restores its request and
+	// emits nothing, like a failed publication wait: a started event with
+	// no terminal event would show a run that never ends.
 	startedSent := false
 	emitStarted := func() {
 		if !startedSent {
