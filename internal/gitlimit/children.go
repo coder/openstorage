@@ -29,6 +29,10 @@ type registry struct {
 	// final SIGKILLs. A leader that exits after the stop began stays
 	// unreaped until then (see wait).
 	killed chan struct{}
+	// hold waits for the leader pid to exit without reaping it and reports
+	// whether it did. Nil means awaitExit. Tests replace it to run the path
+	// of a platform that cannot hold a leader.
+	hold func(pid int) bool
 	// signalGroup sends sig to the process group pgid. Nil means
 	// syscall.Kill(-pgid, sig). Tests replace it to observe the leader at
 	// the moment the signal goes out.
@@ -109,7 +113,7 @@ func (g *registry) start(cmd *exec.Cmd) error {
 // wait returns once cmd's leader is reaped. A signal sent to a group whose
 // leader was reaped can reach an unrelated group: once the group has no
 // member left, the kernel can hand its ID to a new process (#473). So the
-// registry never signals a group whose leader may be reaped:
+// registry signals only groups whose leader it has not reaped:
 //
 //   - A leader leaves the registry under the lock before it is reaped, and
 //     stop signals only groups it finds in the registry while holding the
@@ -119,14 +123,19 @@ func (g *registry) start(cmd *exec.Cmd) error {
 //     sent its final SIGKILL. That kill still reaches a member the leader
 //     left behind, such as a hook that ignored SIGTERM.
 //
-// awaitExit waits with waitid and WNOWAIT on Linux and on macOS. Where it
-// cannot (macOS when its startup check of waitid fails, and every other
-// platform), the leader is reaped first and removed right after, so a
-// signal that stop sends between the two can still reach a recycled ID.
-// That window lasts until wait takes the lock.
+// Both rest on awaitExit, a wait that leaves the child unreaped. Only Linux
+// has one. Elsewhere wait reaps first and removes the group right after, so
+// stop sends no signal to a group that has left the registry. A leader that
+// exits during the grace gets no final SIGKILL there, and a member it left
+// behind lives on. What stays open is the time between the reap and the
+// next lock acquisition of this goroutine.
 func (g *registry) wait(cmd *exec.Cmd) error {
 	pid := cmd.Process.Pid
-	if !awaitExit(pid) {
+	hold := g.hold
+	if hold == nil {
+		hold = awaitExit
+	}
+	if !hold(pid) {
 		err := cmd.Wait()
 		g.mu.Lock()
 		delete(g.groups, pid)

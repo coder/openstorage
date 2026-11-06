@@ -21,8 +21,9 @@ Shared admission and process control for git subprocesses. It provides a slot po
 - `Output` panics if the caller already set Stdout; `CombinedOutput` panics if the caller already set Stdout or Stderr [children.go:Output] [children.go:CombinedOutput]
 - `registry.start` panics if `SysProcAttr` is already set, forces `Setpgid`, and refuses new children with `ErrStopping` after stop began [children.go:start]
 - `registry.stop` sends SIGTERM before SIGKILL so git can clean its lock files [children.go:stop]
-- `registry` signals only a group whose leader it has not reaped: `wait` leaves the registry before it reaps, and `stop` signals only groups it finds registered while it holds the lock, so a signal cannot reach a group whose ID the kernel recycled (#473) [children.go:wait] [children.go:stop]
-- A leader that exits after `stop` began stays an unreaped zombie until `stop` has sent its final SIGKILL, which still ends a member the leader left behind. `awaitExit` holds it with `waitid(WNOWAIT)` on Linux and on macOS (a startup check on macOS fails closed). A platform that cannot hold it reaps first and removes the group right after, so a signal sent in between can reach a recycled ID [children.go:wait] [exit_linux.go:awaitExit] [exit_darwin.go:awaitExit] [exit_other.go:awaitExit]
+- `stop` signals only groups it finds registered while it holds the registry lock, and on Linux `wait` removes a group from the registry before it reaps the leader, so a signal reaches a group whose leader still owns its ID and never one whose ID the kernel recycled (#473) [children.go:wait] [children.go:stop]
+- On Linux a leader that exits after `stop` began stays an unreaped zombie until `stop` has sent its final SIGKILL, which still ends a member the leader left behind. `awaitExit` waits for the exit with `waitid(WNOWAIT)` [children.go:wait] [exit_linux.go:awaitExit]
+- Other platforms (macOS) have no wait that leaves the child unreaped: Go's `os` package does not use `waitid` on macOS because it also returns for a stopped child (golang/go#19314). `wait` reaps first and removes the group right after, and `stop` sends no signal, SIGTERM or SIGKILL, to a group that is not registered. A leader that exits during the grace gets no final SIGKILL there, so a member it left behind is not killed. The ID can be recycled only between the reap and the next lock acquisition of the waiting goroutine [children.go:wait] [exit_other.go:awaitExit]
 - The Linux wrapper keeps a stricter inherited soft limit and exits 125 if it cannot read or set the limit [heaplimit_linux.go:heapLimitWrapper]
 - `HeapFailure` ignores SIGKILL and matches git diagnostics only at line start [heaplimit_linux.go:HeapFailure]
 - Non-Linux `Command` asserts maxHeapBytes == 0 [heaplimit_other.go:Command]
@@ -30,7 +31,7 @@ Shared admission and process control for git subprocesses. It provides a slot po
 ## Side Effects
 - Starts git children (through `/bin/sh` when a heap cap is set), each as its own process group [children.go:start]
 - Sends SIGTERM then SIGKILL to tracked groups in `StopChildren`, polling every 10 ms until every leader has exited or the grace deadline [children.go:stop]
-- Blocks one goroutine per child in `waitid(WNOWAIT)` until the leader exits, before it reaps (Linux, macOS) [exit_linux.go:awaitExit] [exit_darwin.go:awaitExit]
+- Blocks one goroutine per child until its leader exits: in `waitid(WNOWAIT)` before it reaps on Linux, in `Wait` elsewhere [exit_linux.go:awaitExit] [exit_other.go:awaitExit]
 - Holds mutexes on slot state and on the child registry; release closes and replaces the `freed` channel to wake waiters [gitlimit.go:Release]
 - `Output` and `CombinedOutput` buffer child output in memory [children.go:Output]
 
