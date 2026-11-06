@@ -8,7 +8,8 @@ import unittest
 
 
 class CheckerTestCase(unittest.TestCase):
-    def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True):
+    def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True,
+                    untracked_symlinks=None, intent_to_add=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -33,8 +34,13 @@ class CheckerTestCase(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding="utf-8")
+            for name, target in (untracked_symlinks or {}).items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).symlink_to(target)
             for name in deleted:
                 (root / name).unlink()
+            if intent_to_add:
+                subprocess.run(["git", "add", "-N", "--", *intent_to_add], cwd=root, check=True)
             return subprocess.run(
                 [sys.executable, str(checker)], cwd=root, text=True,
                 capture_output=True, timeout=10,
@@ -347,11 +353,14 @@ class CitationTests(CheckerTestCase):
         tf = ('locals {\n  cloud-init = 1\n  cloud_config = {\n    a = "{"\n  }\n}\n'
               'resource "aws_lb" "this" {\n  name = "x"\n  lifecycle {\n    precondition {\n'
               '      condition = true\n    }\n  }\n}\n'
-              'data "aws_partition" "current" {}\nvariable "region" {}\nprovider "aws" {\n  region = var.region\n}\n')
+              'data "aws_partition" "current" {}\nvariable "region" {}\nprovider "aws" {\n  region = var.region\n}\n'
+              'ephemeral "random_password" "db" {\n  length = 16\n  lifecycle {\n    postcondition {\n    }\n  }\n}\n')
         ok = ["[main.tf:aws_lb]", "[main.tf:aws_lb.this]", "[main.tf:aws_lb.this.precondition]",
               "[main.tf:data.aws_partition.current]", "[main.tf:region]", "[main.tf:var.region]",
-              "[main.tf:provider.aws]", "[main.tf:local.cloud_config]", "[main.tf:local.cloud-init]"]
-        bad = ["[main.tf:aws_lb.main]", "[main.tf:data]", "[main.tf:local.a]", "[main.tf:aws_lb.this.name]"]
+              "[main.tf:provider.aws]", "[main.tf:local.cloud_config]", "[main.tf:local.cloud-init]",
+              "[main.tf:ephemeral.random_password.db]", "[main.tf:ephemeral.random_password.db.postcondition]"]
+        bad = ["[main.tf:aws_lb.main]", "[main.tf:data]", "[main.tf:local.a]", "[main.tf:aws_lb.this.name]",
+               "[main.tf:random_password.db]", "[main.tf:ephemeral.random_password.db.length]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/main.tf": tf})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
@@ -362,6 +371,65 @@ class CitationTests(CheckerTestCase):
         bad = ["[run.sh:cleanup]", "[run.sh:config]", "[run.sh:pose]", "[run.sh:$1]", "[run.sh:obsolete_fn]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_shell_comments_start_at_a_hash_even_inside_quotes(self):
+        # Quotes are not read, so a quote that spans lines or a line separator
+        # that bash does not split on can never turn comment words into code.
+        sh = ("echo 'requires # quoted-word'\n"
+              "echo 'first line\nsecond line' # don't forget\n"
+              "echo 'x\x0cy' # feed-word 'z\n"
+              "echo 'x\u2028y' # sep-word 'z\n"
+              'echo "tag # double-word" # comment-one\n')
+        ok = ["[run.sh:requires]", "[run.sh:second line]", "[run.sh:tag]"]
+        bad = ["[run.sh:quoted-word]", "[run.sh:forget]", "[run.sh:feed-word]", "[run.sh:sep-word]",
+               "[run.sh:double-word]", "[run.sh:comment-one]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_javascript_expressions_after_a_dangling_operator_are_not_declarations(self):
+        js = ("const viaEquals =\n  function equalsNamed() {};\nconst viaClass =\n  class ClassNamed {};\n"
+              "register(\n  function argNamed() {},\n  function listNamed() {},\n);\n"
+              "const either = a ||\n  function orNamed() {};\nconst arrow = () =>\n  function arrowNamed() {};\n"
+              "const pick = ok ?\n  function thenNamed() {} :\n  function elseNamed() {};\n"
+              "const list = [\n  function bracketNamed() {},\n];\n"
+              "function declared() {}\nconst plain = 'text'\nfunction afterString() {}\n"
+              "export default\nfunction defaulted() {}\n"
+              "counter++\nfunction afterIncrement() {}\ncounter--\nfunction afterDecrement() {}\n"
+              "const quotient = 1 /\n  function divided() {}\n"
+              "const re = /a+/\nfunction afterRegex() {}\n"
+              "async function work() {\n  return\n  function afterReturn() {}\n}\n"
+              "switch (x) {\ncase 1:\n  function inCase() {}\n}\n")
+        ok = ["viaEquals", "viaClass", "either", "arrow", "pick", "list", "declared", "plain", "afterString",
+              "defaulted", "afterIncrement", "afterDecrement", "work", "afterReturn"]
+        bad = ["equalsNamed", "ClassNamed", "argNamed", "listNamed", "orNamed", "arrowNamed", "thenNamed",
+               "elseNamed", "bracketNamed", "divided", "afterRegex", "inCase"]
+        result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n",
+                                   **{"pkg/flow.js": js})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
+
+    def test_javascript_continuation_skips_blank_and_comment_lines(self):
+        js = ("const a =\n  // why\n  function viaComment() {}\n"
+              "const b =\n\n  function viaBlank() {}\n"
+              "const c =\n  /* why\n  still why */\n  function viaBlock() {}\n"
+              "const d = // trailing\n  function viaTrailing() {}\n"
+              "const e = 1\n// why\nfunction afterComment() {}\n")
+        ok = ["a", "b", "c", "d", "e", "afterComment"]
+        bad = ["viaComment", "viaBlank", "viaBlock", "viaTrailing"]
+        result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n",
+                                   **{"pkg/flow.js": js})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
+
+    def test_every_javascript_continuation_ending_keeps_the_next_line_in_its_expression(self):
+        endings = ["=", "(", "[", ",", "?", ":", "+", "-", "*", "/", "%", "&", "|", "^", "<", ">", "!", "~", ".",
+                   "&&", "||", "??", "=>", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof",
+                   "void"]
+        ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new", "obj.of"]
+        js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}\n" for i, op in enumerate(endings))
+        js += "".join(f"x {op}\nfunction closed{i}() {{}}\n" for i, op in enumerate(ends_a_statement))
+        cited = [f"[flow.js:open{i}]" for i in range(len(endings))]
+        cited += [f"[flow.js:closed{i}]" for i in range(len(ends_a_statement))]
+        result = self.check_readme(" ".join(cited) + "\n", **{"pkg/flow.js": js})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:open{i}]") for i in range(len(endings))])
 
     def test_python_js_and_unit_citations(self):
         files = {
@@ -392,6 +460,23 @@ class CitationTests(CheckerTestCase):
                                        ["[internal/sim/run.go:Run]", "[../../../run.go]", "[gone.go]",
                                         "[escape.py:CheckerTestCase]"]])
         self.assertIn("cmd/dst/README.md:1 -> [internal/sim/run.go:Run]", result.stdout)
+
+    def test_cited_files_must_be_tracked_even_through_a_symlink(self):
+        source = "package p\n\nfunc Run() {}\n"
+        result = self.run_checker(
+            "", files={"pkg/README.md": "[new.go:Run] [new.go] [link.go:Run] [kept.go:Run]\n", "pkg/kept.go": source},
+            symlinks={"pkg/link.go": "new.go"}, untracked={"pkg/new.go": source})
+        self.assert_failures(result, *[("MISSING CITED FILE", c) for c in
+                                       ["[new.go:Run]", "[new.go]", "[link.go:Run]"]])
+        self.assertEqual(result.stdout.count(" (not tracked by git)\n"), 3, result.stdout)
+
+    def test_an_untracked_symlink_is_not_a_tracked_cited_file(self):
+        source = "package p\n\nfunc Run() {}\n"
+        result = self.run_checker(
+            "", files={"pkg/README.md": "[alias.go:Run] [dirlink/real.go:Run] [real.go:Run]\n", "pkg/real.go": source},
+            untracked_symlinks={"pkg/alias.go": "real.go", "pkg/dirlink": "../pkg"})
+        self.assert_failures(result, *[("MISSING CITED FILE", c) for c in ["[alias.go:Run]", "[dirlink/real.go:Run]"]])
+        self.assertEqual(result.stdout.count(" (not tracked by git)\n"), 2, result.stdout)
 
     def test_malformed_and_unsupported_citations_fail_with_their_kind(self):
         result = self.check_readme(
@@ -429,16 +514,87 @@ class FileSelectionTests(CheckerTestCase):
         self.assertEqual(result.stdout, "BROKEN ANCHOR .agents/skill/features/README.md:1 -> "
                                         "../SKILL.md#gone\nbroken links: 1\n")
 
-    def test_only_tracked_markdown_outside_vendor_is_read(self):
+    def test_untracked_markdown_is_read_unless_ignored_or_vendored(self):
         broken = "[Gone](gone.md)\n"
         result = self.run_checker(
             "",
-            files={"vendor/mod/README.md": broken, "notes.md": broken, "docs/old.md": broken},
-            untracked={"internal/new/README.md": broken},
+            files={"vendor/mod/README.md": broken, "notes.md": broken, "docs/old.md": broken, ".gitignore": "ignored/\n"},
+            untracked={"internal/new/README.md": broken, "docs/new.md": broken, "ignored/README.md": broken,
+                       "vendor/new/README.md": broken},
             deleted=["docs/old.md"],
         )
+        self.assertEqual(result.stdout, "BROKEN FILE docs/new.md:1 -> gone.md\n"
+                                        "BROKEN FILE internal/new/README.md:1 -> gone.md\nbroken links: 2\n")
+        self.assertEqual(result.returncode, 1)
+
+    def test_links_resolve_only_to_tracked_files_and_directories(self):
+        readme = ("[Dir](docs/) [Root](./) [Tracked](docs/old.md) [Self](#top) [Fragment](docs/guide.md#guide)\n"
+                  "[New file](docs/new.md) [New dir](fresh/) [New with fragment](docs/new.md#x) [Gone](docs/gone.md)\n")
+        result = self.run_checker(
+            "# Top\n" + readme, docs={"old.md": "", "gone.md": "", "guide.md": "# Guide\n"},
+            untracked={"docs/new.md": "# New\n", "fresh/file.txt": ""}, deleted=["docs/gone.md"])
+        untracked = "BROKEN FILE (not tracked by git) README.md:3 -> "
+        self.assertEqual(result.stdout, f"{untracked}docs/new.md\n{untracked}fresh/\n{untracked}docs/new.md\n"
+                                        "BROKEN FILE README.md:3 -> docs/gone.md\nbroken links: 4\n")
+
+    def test_links_follow_tracked_symlinks_like_citations(self):
+        result = self.run_checker(
+            "[Real](notes/real.txt) [Untracked](notes/alias.txt) [Outside](notes/out.txt) [Root](notes/root/) "
+            "[Up](notes/up/)\n",
+            files={"notes/real.txt": "x\n"},
+            symlinks={"notes/alias.txt": "new.txt", "notes/out.txt": Path(__file__).resolve(), "notes/root": "/",
+                      "notes/up": "../.."},
+            untracked={"notes/new.txt": "x\n"})
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> notes/alias.txt\n"
+                                        "BROKEN FILE (escapes repo) README.md:1 -> notes/out.txt\n"
+                                        "BROKEN FILE (escapes repo) README.md:1 -> notes/root/\n"
+                                        "BROKEN FILE (escapes repo) README.md:1 -> notes/up/\nbroken links: 4\n")
+
+    def test_an_untracked_symlink_to_a_tracked_file_is_not_tracked(self):
+        result = self.run_checker(
+            "[Alias](alias.md) [Deep](dir/alias.md) [Through](dirlink/real.md) [Real](real.md)\n",
+            files={"real.md": "# Real\n", "dir/real.md": "# Deep\n"},
+            untracked_symlinks={"alias.md": "real.md", "dir/alias.md": "real.md", "dirlink": "dir"})
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> alias.md\n"
+                                        "BROKEN FILE (not tracked by git) README.md:1 -> dir/alias.md\n"
+                                        "BROKEN FILE (not tracked by git) README.md:1 -> dirlink/real.md\n"
+                                        "broken links: 3\n")
+
+    def test_every_symlink_that_resolving_a_link_follows_must_be_tracked(self):
+        result = self.run_checker(
+            "[Chain](alias/guide.md) [Tracked](full/guide.md) [Loop](loop-a.md)\n",
+            files={"docs/guide.md": "# Guide\n"},
+            symlinks={"alias": "hidden", "full": "middle", "middle": "docs", "loop-a.md": "loop-b.md",
+                      "loop-b.md": "loop-a.md"},
+            untracked_symlinks={"hidden": "docs"})
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> alias/guide.md\n"
+                                        "BROKEN FILE README.md:1 -> loop-a.md\nbroken links: 2\n")
+
+    def test_a_tracked_symlink_below_a_tracked_directory_symlink_resolves(self):
+        result = self.run_checker(
+            "[Chain](alias/inner/link.md) [Up](alias/inner/up.md)\n",
+            files={"docs/inner/real.md": "# Real\n", "docs/top.md": "# Top\n"},
+            symlinks={"alias": "docs", "docs/inner/link.md": "real.md", "docs/inner/up.md": "../top.md"})
         self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
-        self.assertEqual(result.returncode, 0)
+
+    def test_a_link_through_a_tracked_directory_symlink_resolves_to_the_tracked_file(self):
+        result = self.run_checker("[Guide](alias/guide.md) [Dir](alias/)\n", docs={"guide.md": "# Guide\n"},
+                                  symlinks={"alias": "docs"})
+        self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
+
+    def test_an_intent_to_add_target_is_not_tracked(self):
+        result = self.run_checker(
+            "[Target](docs/new.txt) [Cited](pkg/README.md)\n",
+            untracked={"docs/new.txt": "x\n", "pkg/README.md": "[run.go:Run]\n", "pkg/run.go": "func Run() {}\n"},
+            intent_to_add=["docs/new.txt", "pkg/README.md", "pkg/run.go"])
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> docs/new.txt\n"
+                                        "BROKEN FILE (not tracked by git) README.md:1 -> pkg/README.md\n"
+                                        "MISSING CITED FILE pkg/README.md:1 -> [run.go:Run] (not tracked by git)\n"
+                                        "broken links: 3\n")
+
+    def test_an_untracked_readme_can_link_to_itself(self):
+        result = self.run_checker("", untracked={"pkg/README.md": "# Top\n[Self](#top) [Missing](#absent)\n"})
+        self.assertEqual(result.stdout, "BROKEN ANCHOR pkg/README.md:2 -> #absent\nbroken links: 1\n")
 
     def test_outside_a_git_checkout_exits_2_without_checking(self):
         result = self.run_checker("[Gone](gone.md)\n", git=False)
