@@ -5,6 +5,7 @@ package githttp
 import (
 	"syscall"
 	"testing"
+	"time"
 )
 
 // nodeSysProcAttr starts serve as a session leader, so testNode.stop can
@@ -23,7 +24,9 @@ func sessionMembers(int) []int { return nil }
 func trackNodeSession(int) error { return nil }
 func untrackNodeSession(int)     {}
 
-func killSessionMembers(int, uint64) []int { return nil }
+func killSessionMembers(int, uint64) ([]int, error) { return nil, nil }
+
+func reapNodeSession(int, uint64, time.Duration) ([]int, error) { return nil, nil }
 
 func nodeStart(int) uint64 { return 0 }
 

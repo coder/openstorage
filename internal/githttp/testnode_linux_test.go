@@ -7,6 +7,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"io/fs"
 	"net/http"
@@ -36,11 +39,16 @@ func nodeSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGKILL}
 }
 
-// sessionMembers lists the live (not zombie) processes whose session is
+// sessionMembers lists the live processes of session sid (see
+// procSessionMembers). Tests replace it to hand killSessionMembers a listing
+// that has gone stale: a PID that now belongs to another session.
+var sessionMembers = procSessionMembers
+
+// procSessionMembers lists the live (not zombie) processes whose session is
 // sid, from /proc/<pid>/stat: state is field 3 and session field 6, both
 // after the parenthesized command name. A zombie can no longer write, and
 // an init that does not reap adopted children keeps it forever.
-func sessionMembers(sid int) []int {
+func procSessionMembers(sid int) []int {
 	stats, err := filepath.Glob("/proc/[0-9]*/stat")
 	if err != nil {
 		panic(err)
@@ -94,6 +102,13 @@ func nodeStart(sid int) uint64 {
 // the guard fail to start.
 var nodeGuardExe = os.Executable
 
+// nodeGuardReady is the line the guard writes to its stdout once it holds
+// the pipe and has read its arguments. nodeGuardReadyTimeout bounds the wait
+// for it (tests shorten it).
+const nodeGuardReady = "ready\n"
+
+var nodeGuardReadyTimeout = 30 * time.Second
+
 // trackNodeSession starts the guard of the node whose session leader is
 // sid: a process in a session of its own that holds the read end of a pipe
 // only this test binary writes to. When the test binary dies, however it
@@ -106,6 +121,10 @@ var nodeGuardExe = os.Executable
 // No signal handler is involved: the test binary keeps the disposition it
 // started with, so a SIGINT that its parent shell ignored (nohup, a
 // background job) neither kills the nodes nor escapes the test binary.
+//
+// A guard that started but exited at once (no memory for the process, a
+// test binary that cannot run itself) would leave the node unguarded, so
+// trackNodeSession returns only after the guard reports ready.
 //
 // An error means the node has no guard: the caller must stop the node.
 func trackNodeSession(sid int) error {
@@ -124,17 +143,45 @@ func trackNodeSession(sid int) error {
 	if err != nil {
 		return err
 	}
+	ready, readyW, err := os.Pipe()
+	if err != nil {
+		_ = r.Close()
+		_ = w.Close()
+		return err
+	}
 	guard := exec.Command(exe, nodeGuardArg, strconv.Itoa(sid), strconv.FormatUint(start, 10))
 	guard.Stdin = r
+	guard.Stdout = readyW
 	guard.Stderr = os.Stderr
 	guard.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	err = guard.Start()
 	_ = r.Close()
+	_ = readyW.Close()
 	if err != nil {
 		_ = w.Close()
+		_ = ready.Close()
 		return fmt.Errorf("start node guard: %w", err)
 	}
-	go func() { _ = guard.Wait() }()
+	waited := make(chan struct{})
+	go func() {
+		_ = guard.Wait()
+		close(waited)
+	}()
+
+	_ = ready.SetReadDeadline(time.Now().Add(nodeGuardReadyTimeout))
+	line, err := bufio.NewReader(ready).ReadString('\n')
+	_ = ready.Close()
+	if line != nodeGuardReady {
+		_ = w.Close()
+		switch {
+		case err == nil:
+			err = errors.New("unexpected output")
+		case errors.Is(err, io.EOF):
+			<-waited
+			err = fmt.Errorf("the guard exited: %v", guard.ProcessState)
+		}
+		return fmt.Errorf("node guard not ready (read %q): %w", line, err)
+	}
 	nodeGuards.Store(sid, w)
 	return nil
 }
@@ -188,14 +235,15 @@ var pidfdOpen = unix.PidfdOpen
 // time kill(2) runs. Each member is therefore pinned with a pidfd first and
 // signaled through it: the signal reaches the process that was checked, or
 // nothing. A member that cannot be pinned (a kernel before 5.3, a seccomp
-// policy, no free descriptor) is not signaled and counts as alive, so the
-// caller's retries end in its timeout instead of a kill of a bare PID.
+// policy, no free descriptor) is not signaled and counts as alive, and
+// pinErr holds the first such error: a retry may succeed (no free
+// descriptor), or the host denies pidfd_open for good (see pidfdDenied).
+// Nothing here signals a bare PID.
 //
 // The kernel also reuses a session ID once the session is empty. Just
 // before each signal the leader is checked again: a process with ID sid and
 // another start time is an unrelated session, and its members stay alone.
-func killSessionMembers(sid int, start uint64) []int {
-	var alive []int
+func killSessionMembers(sid int, start uint64) (alive []int, pinErr error) {
 	for _, pid := range sessionMembers(sid) {
 		fd, err := pidfdOpen(pid, 0)
 		if errors.Is(err, unix.ESRCH) {
@@ -203,6 +251,9 @@ func killSessionMembers(sid int, start uint64) []int {
 		}
 		if err != nil {
 			alive = append(alive, pid)
+			if pinErr == nil {
+				pinErr = fmt.Errorf("pidfd_open(%d): %w", pid, err)
+			}
 			continue
 		}
 		// The pinned process is alive now and was alive when /proc was read
@@ -213,7 +264,14 @@ func killSessionMembers(sid int, start uint64) []int {
 		}
 		_ = unix.Close(fd)
 	}
-	return alive
+	return alive, pinErr
+}
+
+// pidfdDenied reports whether err says that the host refuses pidfd_open (a
+// kernel before 5.3, a seccomp policy or a security module), which no retry
+// changes.
+func pidfdDenied(err error) bool {
+	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)
 }
 
 // sessionLeaderIs reports whether session sid is still the node's: no
@@ -238,25 +296,24 @@ func pidfdExited(fd int) bool {
 }
 
 // reapNodeSession SIGKILLs every live process in session sid (see
-// killSessionMembers) until none is left, and returns 0 (1 after timeout).
-func reapNodeSession(sid int, start uint64, timeout time.Duration) int {
+// killSessionMembers) until none is left. It stops when timeout has passed or
+// when the host denies pidfd_open, and returns the members still alive and
+// the pinning error, if any.
+func reapNodeSession(sid int, start uint64, timeout time.Duration) (alive []int, pinErr error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		members := killSessionMembers(sid, start)
-		if len(members) == 0 {
-			return 0
-		}
-		if time.Now().After(deadline) {
-			fmt.Fprintf(os.Stderr, "node guard: session %d still has live members %v after %v\n", sid, members, timeout)
-			return 1
+		alive, pinErr = killSessionMembers(sid, start)
+		if len(alive) == 0 || pidfdDenied(pinErr) || time.Now().After(deadline) {
+			return alive, pinErr
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 // nodeGuardMain is the guard process: args are the node's session ID and
-// its leader's start time. It returns once stdin reaches EOF (the test
-// binary closed the pipe or died) and the session is empty.
+// its leader's start time. It reports ready on stdout, then returns once
+// stdin reaches EOF (the test binary closed the pipe or died) and the session
+// is empty.
 func nodeGuardMain(args []string) int {
 	if len(args) != 2 {
 		fmt.Fprintf(os.Stderr, "node guard: want <sid> <start>, got %q\n", args)
@@ -268,8 +325,16 @@ func nodeGuardMain(args []string) int {
 		fmt.Fprintf(os.Stderr, "node guard: bad arguments %q\n", args)
 		return 2
 	}
+	if _, err := io.WriteString(os.Stdout, nodeGuardReady); err != nil {
+		fmt.Fprintf(os.Stderr, "node guard: %v\n", err)
+		return 2
+	}
 	_, _ = io.Copy(io.Discard, os.Stdin)
-	return reapNodeSession(sid, start, 10*time.Second)
+	if alive, pinErr := reapNodeSession(sid, start, 10*time.Second); len(alive) != 0 {
+		fmt.Fprintf(os.Stderr, "node guard: session %d still has live members %v (pinning: %v)\n", sid, alive, pinErr)
+		return 1
+	}
+	return 0
 }
 
 // nodeCrasherEnv selects the crasher helper: the test binary run as a
@@ -613,7 +678,7 @@ func TestNodeCrasherHelper(t *testing.T) {
 	if err := trackNodeSession(cmd.Process.Pid); err != nil {
 		// Pdeathsig would kill only the leader, so end the whole session.
 		start, _ := processStart(cmd.Process.Pid)
-		reapNodeSession(cmd.Process.Pid, start, 10*time.Second)
+		_, _ = reapNodeSession(cmd.Process.Pid, start, 10*time.Second)
 		_ = cmd.Wait()
 		t.Fatal(err)
 	}
@@ -680,6 +745,9 @@ func TestNodeGuardKillsSessionWhenTestBinaryDies(t *testing.T) {
 		{name: "panic", mode: "panic", wantExit: 2},
 		{name: "test timeout", mode: "wait", timeout: "5s", wantExit: 2}, // long enough to report its node on a loaded host
 		{name: "SIGINT", mode: "wait", wantExit: -1, die: func(t *testing.T, c *exec.Cmd, _ func() bool) { _ = c.Process.Signal(syscall.SIGINT) }},
+		// An interactive Ctrl-C and a runner that ends a job signal the whole
+		// process group, the guard's own included unless it has a session.
+		{name: "SIGINT to the process group", mode: "wait", wantExit: -1, die: func(t *testing.T, c *exec.Cmd, _ func() bool) { _ = syscall.Kill(-c.Process.Pid, syscall.SIGINT) }},
 		{name: "SIGINT ignored, then SIGKILL", mode: "wait", ignoreSIGINT: true, wantExit: -1, die: func(t *testing.T, c *exec.Cmd, childAlive func() bool) {
 			_ = c.Process.Signal(syscall.SIGINT)
 			time.Sleep(time.Second)
@@ -703,6 +771,7 @@ func TestNodeGuardKillsSessionWhenTestBinaryDies(t *testing.T) {
 				crasher = exec.Command("sh", append([]string{"-c", `trap '' INT; exec "$@"`, "sh", exe}, args...)...)
 			}
 			crasher.Env = append(os.Environ(), nodeCrasherEnv+"="+tc.mode, nodeCrasherOutEnv+"="+outFile)
+			crasher.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // a group of its own: the group signal must not reach this test
 			var log bytes.Buffer
 			crasher.Stdout, crasher.Stderr = &log, &log
 			crasher.WaitDelay = 30 * time.Second
@@ -732,7 +801,7 @@ func TestNodeGuardKillsSessionWhenTestBinaryDies(t *testing.T) {
 				}
 			}
 			t.Cleanup(func() {
-				reapNodeSession(serve, start, 10*time.Second)
+				_, _ = reapNodeSession(serve, start, 10*time.Second)
 			})
 
 			// The kernel reuses PIDs: a process counts as the node's only
@@ -808,7 +877,7 @@ func startStandInNode(t *testing.T) (serve, child int, start uint64, cmd *exec.C
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		reapNodeSession(serve, start, 10*time.Second)
+		_, _ = reapNodeSession(serve, start, 10*time.Second)
 		_ = cmd.Wait()
 	})
 	line, err := bufio.NewReader(stdout).ReadString('\n')
@@ -836,9 +905,9 @@ func TestKillSessionMembers(t *testing.T) {
 		_ = bystander.Wait()
 	})
 
-	killed := killSessionMembers(serve, start)
-	if len(killed) != 2 {
-		t.Fatalf("killed %v, want the leader %d and its child %d", killed, serve, child)
+	killed, pinErr := killSessionMembers(serve, start)
+	if len(killed) != 2 || pinErr != nil {
+		t.Fatalf("killed %v (pin error %v), want the leader %d and its child %d", killed, pinErr, serve, child)
 	}
 	_ = cmd.Wait()
 	for deadline := time.Now().Add(10 * time.Second); sessionMembers(serve) != nil; time.Sleep(10 * time.Millisecond) {
@@ -849,26 +918,114 @@ func TestKillSessionMembers(t *testing.T) {
 	if st := procState(bystander.Process.Pid); st == "" || st == "Z" {
 		t.Fatalf("a process of another session died (state %q)", st)
 	}
-	if got := killSessionMembers(serve, start); len(got) != 0 {
+	if got, _ := killSessionMembers(serve, start); len(got) != 0 {
 		t.Fatalf("an empty session still yields members %v", got)
 	}
 }
 
-// TestTrackNodeSessionReportsGuardStartFailure: a node whose guard cannot
-// start (the process or memory limit of a loaded host) is reported to the
-// caller, which stops the node. It must not panic and leave the node running
-// without a guard.
-func TestTrackNodeSessionReportsGuardStartFailure(t *testing.T) {
-	serve, _, _, _ := startStandInNode(t)
-	old := nodeGuardExe
-	nodeGuardExe = func() (string, error) { return "/nonexistent/node-guard", nil }
-	t.Cleanup(func() { nodeGuardExe = old })
-
-	if err := trackNodeSession(serve); err == nil {
-		t.Fatal("trackNodeSession succeeded although the guard cannot start")
+// TestTrackNodeSessionReportsGuardFailure: a node whose guard cannot start
+// (the process or memory limit of a loaded host), exits at once, or does not
+// report ready is reported to the caller, which stops the node. It must not
+// leave the node running without a guard.
+func TestTrackNodeSessionReportsGuardFailure(t *testing.T) {
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := nodeGuards.Load(serve); ok {
-		t.Fatal("a failed guard start left its pipe registered")
+	for _, tc := range []struct {
+		name    string
+		exe     string        // the guard's program, or "" for the test binary
+		timeout time.Duration // the wait for ready, or 0 for the default
+	}{
+		{name: "cannot start", exe: "/nonexistent/node-guard"},
+		{name: "exits at once", exe: trueBin},
+		{name: "not ready in time", timeout: time.Nanosecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serve, _, _, _ := startStandInNode(t)
+			oldExe, oldTimeout := nodeGuardExe, nodeGuardReadyTimeout
+			t.Cleanup(func() { nodeGuardExe, nodeGuardReadyTimeout = oldExe, oldTimeout })
+			if tc.exe != "" {
+				nodeGuardExe = func() (string, error) { return tc.exe, nil }
+			}
+			if tc.timeout != 0 {
+				nodeGuardReadyTimeout = tc.timeout
+			}
+
+			if err := trackNodeSession(serve); err == nil {
+				t.Fatal("trackNodeSession succeeded although the node has no working guard")
+			}
+			if _, ok := nodeGuards.Load(serve); ok {
+				t.Fatal("a failed guard left its pipe registered")
+			}
+		})
+	}
+}
+
+// processesWithArg lists the live processes that have arg as one of their
+// arguments (a zombie has no arguments).
+func processesWithArg(arg string) []int {
+	cmdlines, err := filepath.Glob("/proc/[0-9]*/cmdline")
+	if err != nil {
+		panic(err)
+	}
+	var pids []int
+	for _, path := range cmdlines {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // The process exited between the glob and the read.
+		}
+		for _, a := range bytes.Split(data, []byte{0}) {
+			if string(a) == arg {
+				pid, err := strconv.Atoi(filepath.Base(filepath.Dir(path)))
+				if err != nil {
+					panic(err)
+				}
+				pids = append(pids, pid)
+				break
+			}
+		}
+	}
+	return pids
+}
+
+// TestStartBinaryNodeStopsNodeWhenGuardFails: when the guard of a node
+// fails (see TestTrackNodeSessionReportsGuardFailure), startBinaryNode must
+// stop the node it started: serve ends with the test binary through
+// Pdeathsig only, so a node left running would outlive the failed test. The
+// stand-in serve is a shell loop that carries the --cache-dir argument.
+func TestStartBinaryNodeStopsNodeWhenGuardFails(t *testing.T) {
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, exe string }{
+		{"cannot start", "/nonexistent/node-guard"},
+		{"exits at once", trueBin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			standIn := filepath.Join(t.TempDir(), "serve")
+			if err := os.WriteFile(standIn, []byte("#!/bin/sh\nwhile :; do sleep 1; done\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			old := nodeGuardExe
+			nodeGuardExe = func() (string, error) { return tc.exe, nil }
+			t.Cleanup(func() { nodeGuardExe = old })
+
+			cache := t.TempDir()
+			node, err := startBinaryNode(standIn, cache, io.Discard)
+			if err == nil {
+				node.stop()
+				t.Fatal("startBinaryNode succeeded although the node has no guard")
+			}
+			if left := processesWithArg(cache); len(left) != 0 {
+				for _, pid := range left {
+					start, _ := processStart(pid)
+					_, _ = reapNodeSession(pid, start, 10*time.Second)
+				}
+				t.Fatalf("serve %v still runs after startBinaryNode failed: %v", left, err)
+			}
+		})
 	}
 }
 
@@ -877,7 +1034,7 @@ func TestTrackNodeSessionReportsGuardStartFailure(t *testing.T) {
 // unrelated session, and its members must not be signaled.
 func TestKillSessionMembersLeavesAnotherSessionWithTheSameID(t *testing.T) {
 	serve, child, start, _ := startStandInNode(t)
-	if got := killSessionMembers(serve, start+1); len(got) != 0 {
+	if got, _ := killSessionMembers(serve, start+1); len(got) != 0 {
 		t.Fatalf("killSessionMembers returned %v for a session whose leader has another start time", got)
 	}
 	for _, pid := range []int{serve, child} {
@@ -887,23 +1044,151 @@ func TestKillSessionMembersLeavesAnotherSessionWithTheSameID(t *testing.T) {
 	}
 }
 
+// TestKillSessionMembersLeavesAProcessOfAnotherSession: the listing of a
+// session can go stale before a member is pinned. The member exits, the
+// kernel gives its PID to a new process, and the pidfd then names that
+// process. killSessionMembers must read its session again after the pin
+// and leave it alone. The test hands it a listing with the PID of a process
+// in a session of its own.
+func TestKillSessionMembersLeavesAProcessOfAnotherSession(t *testing.T) {
+	serve, child, start, _ := startStandInNode(t)
+	bystander := exec.Command("sleep", "600")
+	bystander.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := bystander.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = bystander.Process.Kill()
+		_ = bystander.Wait()
+	})
+	old := sessionMembers
+	sessionMembers = func(sid int) []int { return append(old(sid), bystander.Process.Pid) }
+	t.Cleanup(func() { sessionMembers = old })
+
+	killed, _ := killSessionMembers(serve, start)
+	if len(killed) != 2 {
+		t.Fatalf("killSessionMembers returned %v, want the leader %d and its child %d", killed, serve, child)
+	}
+	time.Sleep(300 * time.Millisecond) // a SIGKILL takes effect after kill(2) returns
+	if st := procState(bystander.Process.Pid); st == "" || st == "Z" {
+		t.Fatalf("the process %d of another session died (state %q)", bystander.Process.Pid, st)
+	}
+}
+
 // TestKillSessionMembersDoesNotSignalAnUnpinnedPID: when pidfd_open fails (a
 // kernel before 5.3, a seccomp policy, no free descriptor), a member must
-// not get a signal by its bare PID. It counts as alive, so the caller's
-// retries end in its timeout.
+// not get a signal by its bare PID. It counts as alive, and the error
+// reaches the caller.
 func TestKillSessionMembersDoesNotSignalAnUnpinnedPID(t *testing.T) {
 	serve, child, start, _ := startStandInNode(t)
 	old := pidfdOpen
 	pidfdOpen = func(int, int) (int, error) { return -1, unix.ENOSYS }
 	t.Cleanup(func() { pidfdOpen = old })
 
-	if got := killSessionMembers(serve, start); len(got) != 2 {
-		t.Fatalf("killSessionMembers returned %v, want both members as still alive", got)
+	got, pinErr := killSessionMembers(serve, start)
+	if len(got) != 2 || !pidfdDenied(pinErr) {
+		t.Fatalf("killSessionMembers returned %v (pin error %v), want both members as still alive and a denied pidfd_open", got, pinErr)
 	}
 	time.Sleep(300 * time.Millisecond) // a SIGKILL takes effect after kill(2) returns
 	for _, pid := range []int{serve, child} {
 		if st := procState(pid); st == "" || st == "Z" {
 			t.Fatalf("process %d got a signal through its bare PID (state %q)", pid, st)
 		}
+	}
+}
+
+// TestStopWhenPidfdOpenIsDenied: on a host that denies pidfd_open, stop
+// cannot pin a git child, and it must not signal a bare PID. It must not
+// panic either, and it must not wait out its 10 s deadline for a member it
+// can never signal: it ends serve, reports the child it leaves running and
+// returns.
+func TestStopWhenPidfdOpenIsDenied(t *testing.T) {
+	serve, child, start, cmd := startStandInNode(t)
+	nodeStarts.Store(serve, start) // what trackNodeSession records, without a guard process
+	old := pidfdOpen
+	pidfdOpen = func(int, int) (int, error) { return -1, unix.ENOSYS }
+	t.Cleanup(func() { pidfdOpen = old })
+
+	began := time.Now()
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("stop panicked: %v", r)
+			}
+		}()
+		(&testNode{cmd: cmd}).stop()
+	}()
+	if took := time.Since(began); took > 5*time.Second {
+		t.Errorf("stop took %v, want it to give up at once on a host that denies pidfd_open", took)
+	}
+	if st := procState(serve); st != "" {
+		t.Errorf("serve %d is still there after stop (state %q)", serve, st)
+	}
+	if st := procState(child); st == "" || st == "Z" {
+		t.Errorf("git child %d got a signal through its bare PID (state %q)", child, st)
+	}
+}
+
+// TestEveryServeStartHasAGuard: a test helper that starts `serve` with
+// exec.Command must track the node's session (trackNodeSession), or the git
+// children of that serve outlive a test binary that dies (issue #471). The
+// test reads this package's test sources, so a new unguarded start fails
+// here.
+func TestEveryServeStartHasAGuard(t *testing.T) {
+	files, err := filepath.Glob("*_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calleeName := func(e ast.Expr) string {
+		switch f := e.(type) {
+		case *ast.Ident:
+			return f.Name
+		case *ast.SelectorExpr:
+			if x, ok := f.X.(*ast.Ident); ok {
+				return x.Name + "." + f.Sel.Name
+			}
+		}
+		return ""
+	}
+	fset := token.NewFileSet()
+	starts := 0
+	for _, file := range files {
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			var startsServe, tracks bool
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				switch calleeName(call.Fun) {
+				case "exec.Command", "exec.CommandContext":
+					for _, arg := range call.Args {
+						if lit, ok := arg.(*ast.BasicLit); ok && lit.Value == `"serve"` {
+							startsServe = true
+						}
+					}
+				case "trackNodeSession":
+					tracks = true
+				}
+				return true
+			})
+			if startsServe {
+				starts++
+				if !tracks {
+					t.Errorf("%s: %s starts serve without trackNodeSession", file, fn.Name.Name)
+				}
+			}
+		}
+	}
+	if starts < 3 { // startBinaryNode, startMetricsNode, tryServeExpectExit
+		t.Fatalf("found %d serve starts in the test sources, want at least 3: the scan no longer sees them", starts)
 	}
 }

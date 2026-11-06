@@ -466,6 +466,11 @@ type testNode struct {
 // serve is reaped, its PID can name another process group. Linux keeps
 // the session ID from reuse while any member, zombies included, exists.
 // Without /proc (non-Linux), stop reaches serve's own process group only.
+//
+// A host that denies pidfd_open (see pidfdDenied) lets stop signal no git
+// child, because it never signals a bare PID. stop then prints the members
+// it leaves running to stderr and returns, where a panic would end the whole
+// test binary.
 func (n *testNode) stop() {
 	n.stopOnce.Do(func() {
 		if n.cmd.Process == nil {
@@ -473,22 +478,21 @@ func (n *testNode) stop() {
 		}
 		sid := n.cmd.Process.Pid
 		defer untrackNodeSession(sid)
-		kill := func() []int { return killSessionMembers(sid, nodeStart(sid)) }
+		start := nodeStart(sid)
 		if n.cmd.ProcessState == nil {
 			_ = syscall.Kill(-sid, syscall.SIGKILL)
-			kill()
+			_, _ = killSessionMembers(sid, start)
 			_ = n.cmd.Wait()
 		}
 		// Wait returns once serve is reaped; its children are reparented and
 		// may still be exiting (a SIGKILL lands after an in-flight write).
-		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-			members := kill()
-			if len(members) == 0 {
-				return
-			}
-			if time.Now().After(deadline) {
-				panic(fmt.Sprintf("serve session %d still has live members %v 10s after SIGKILL", sid, members))
-			}
+		alive, pinErr := reapNodeSession(sid, start, 10*time.Second)
+		switch {
+		case len(alive) == 0:
+		case pinErr != nil:
+			fmt.Fprintf(os.Stderr, "serve session %d: members %v still run, because they cannot be signaled safely: %v\n", sid, alive, pinErr)
+		default:
+			panic(fmt.Sprintf("serve session %d still has live members %v 10s after SIGKILL", sid, alive))
 		}
 	})
 }
