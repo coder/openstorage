@@ -4,7 +4,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 ## Baseline preconditions
 
-- Launch a fresh run with `"$OSV" launch "$RUN"` (see [`../SKILL.md`](../SKILL.md#launch)). `$RUN` is an empty directory outside the checkout.
+- Launch a fresh run with `"$OSV" launch "$RUN"` (see [`../SKILL.md`](../SKILL.md#launch)). `$RUN` is an empty directory outside the checkout. A feature that needs two replicas says so and needs `"$OSV" launch "$RUN" --fleet` instead. In a fleet run the baseline and the other features run on node a.
 - Load the run's variables with `eval "$("$OSV" env "$RUN")"`.
 - Require `doctor: 0 failure(s)` from `"$OSV" doctor "$RUN"`.
 - Never drive a node that this run did not launch.
@@ -64,5 +64,6 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Read a repo through the REST API](./read-api.md) covers the repo record, file trees, raw files, branches, commits with paging, one commit, diffs, tags, path-style aliases, and reads of an empty repo.
 - [Manage repositories](./repo-lifecycle.md) covers create, get, list and filter, repo-URL lookup, organization metadata, default-branch changes, and soft delete with its follow-up answers.
 - [Token auth and scopes](./token-scopes.md) covers missing, malformed, wrong-key, and expired tokens, missing scopes, repo-claim mismatches, and the matching git failures.
+- [Two replicas share one store](./replicas.md) needs a fleet run (`launch --fleet`). It covers a clone, REST reads, and the repo list on node b after writes on node a, a REST commit on node b fetched through node a, a stale guard across nodes, and node a serving alone after node b stops.
 
-Not mapped yet: Git LFS, webhooks, upstream sync and forks, merges and branch and tag writes through REST, notes, blame, grep, archives, ref policies (`--refs`), and the multi-node and S3WAL modes.
+Not mapped yet: Git LFS, webhooks, upstream sync and forks, merges and branch and tag writes through REST, notes, blame, grep, archives, ref policies (`--refs`), and the S3WAL mode.

@@ -169,6 +169,8 @@ type RefStore interface {
 	// must have published newPack's bytes to blob storage BEFORE calling
 	// (publish-before-flip); on won=false they own deleting that blob.
 	// A won swap bumps the repo generation via the InitSchema triggers.
+	// On a purge-fenced repository a fold whose old rows all still exist
+	// fails with ErrRepoPurged and changes nothing.
 	ReplacePacks(ctx context.Context, repo string, old []Pack, newPack Pack) (won bool, err error)
 	// ReservePackBytes atomically admits the given incoming packs against
 	// the per-repo pack-bytes quota (issue #29), inserting one durable
@@ -890,7 +892,9 @@ type casTxHookKey struct{}
 // in the CAS transaction, after the swap statement and before COMMIT, so
 // its writes commit exactly when the swap does. An InTx error rolls the
 // swap back, and the CAS fails with that error, marked as never executed.
-// Committed, when set, runs after COMMIT succeeds, before the CAS returns.
+// Committed, when set, runs once the transaction is known to have
+// committed, before the CAS returns: after COMMIT succeeds, or after
+// txid_status confirms a COMMIT whose reply was lost (see casRef).
 type CASTxHook struct {
 	InTx      func(ctx context.Context, tx pgx.Tx) error
 	Committed func()
@@ -921,10 +925,12 @@ func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 // (the base-ledger lock and the purge-fence read below), so the statement
 // remains the single mutation unit and the IdempotentCAS ambiguity
 // classification (idempotent.go) is unchanged: pre-statement failures are
-// tagged notExecuted, statement failures classify exactly as before, and a
-// lost COMMIT response stays ambiguous (recovered by the recheck). A won
-// swap also bumps the repo generation via the InitSchema-installed
-// deferred constraint trigger at commit.
+// tagged notExecuted, and statement failures classify exactly as before. A
+// COMMIT error of a swap that changed a row is resolved with txid_status
+// (see commitStatus): committed is a win, aborted is definitive, and an
+// outcome PostgreSQL cannot confirm is ambiguous (recovered by the
+// recheck). A won swap also bumps the repo generation via the
+// InitSchema-installed deferred constraint trigger at commit.
 //
 // The transaction takes the base-ledger advisory lock first and rejects
 // purge-fenced repos with ErrRepoPurged (issue #52, PR #105 security
@@ -1038,6 +1044,12 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 	}
 	n := ct.RowsAffected()
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
+	var xid int64 // the transaction's id, to resolve a failed COMMIT
+	if n == 1 {
+		if xerr := tx.QueryRow(ctx, `SELECT txid_current()`).Scan(&xid); xerr != nil {
+			return false, 0, fmt.Errorf("cas %s %s/%s: txid: %w", tag, repo, name, notExecuted(xerr))
+		}
+	}
 	hook, hooked := ctx.Value(casTxHookKey{}).(CASTxHook)
 	hooked = hooked && n == 1
 	if hooked {
@@ -1072,16 +1084,65 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 		}
 		gen = g0 + 1
 	}
-	// A commit failure is NOT notExecuted: the response may have been
-	// lost after the backend committed — exactly the ambiguity class the
-	// IdempotentCAS recovery recheck exists for.
+	// A COMMIT error does not say whether the backend committed: the reply
+	// may be lost after the commit. pgx v5.11 even reports that loss as a
+	// request never sent: MultiResultReader.NextResult drops the read error
+	// of peekMessage, which has already closed the connection, so the next
+	// receiveMessage returns connLockError "conn closed", and pgconn's
+	// SafeToRetry is true for it. A swap that changed a row therefore asks
+	// PostgreSQL for the outcome. A swap that changed no row wrote nothing,
+	// so its COMMIT outcome changes nothing, and its error passes through.
 	if err := tx.Commit(ctx); err != nil {
-		return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+		if n == 0 {
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+		}
+		// commitStatus needs a pool slot, and this connection can be the
+		// pool's last one. The transaction is closed, so the deferred
+		// Rollback and Release no longer touch it.
+		conn.Release()
+		switch s.commitStatus(ctx, xid) {
+		case "committed": // a lost reply: the swap and the hook's writes committed
+		case "aborted":
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, notExecuted(err))
+		default:
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, commitUnknown(err))
+		}
 	}
 	if hooked && hook.Committed != nil {
 		hook.Committed()
 	}
 	return n == 1, gen, nil
+}
+
+// commitStatusTimeout bounds commitStatus, which runs on a
+// cancellation-detached context like the IdempotentCAS recheck.
+const commitStatusTimeout = 5 * time.Second
+
+// commitStatus asks PostgreSQL, on a pooled connection, whether
+// transaction xid committed. It returns "committed" or "aborted", or "" when
+// the answer is unknown: the query failed, the id is too old for
+// txid_status, or the transaction was still in progress when
+// commitStatusTimeout ran out. While the transaction is in progress it asks
+// again: a backend that lost its client finishes the COMMIT it received, or
+// aborts when it reads the closed socket.
+func (s *PG) commitStatus(ctx context.Context, xid int64) string {
+	assertf(xid > 0, "commitStatus: no transaction id")
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitStatusTimeout)
+	defer cancel()
+	for {
+		var status *string
+		if err := s.pool.QueryRow(rctx, `SELECT txid_status($1)`, xid).Scan(&status); err != nil || status == nil {
+			return ""
+		}
+		if *status != "in progress" {
+			return *status
+		}
+		select {
+		case <-rctx.Done():
+			return ""
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 // RegisterPacks inserts pack rows in ONE transaction (crash-ordering: this
@@ -1176,6 +1237,11 @@ func validateReplacePacks(repo string, old []Pack, newPack Pack) {
 // The insert tolerates an existing (repo, id) row — pack ids derive from
 // pack content, so a same-id row registered concurrently is byte-identical
 // (RegisterPacks invariant) and keeping it is equivalent to inserting.
+//
+// The fold's row is a registration like RegisterPacks', so the same
+// base-ledger lock orders the purge-fence read against FenceRepoPurge.
+// The fence is read after the delete precondition: a fold whose input
+// rows the purge already retired stays a clean loss.
 func (s *PG) ReplacePacks(ctx context.Context, repo string, old []Pack, newPack Pack) (won bool, err error) {
 	validateReplacePacks(repo, old, newPack)
 	ids := make([]string, len(old))
@@ -1183,12 +1249,20 @@ func (s *PG) ReplacePacks(ctx context.Context, repo string, old []Pack, newPack 
 		ids[i] = p.ID
 	}
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
 		ct, err := tx.Exec(ctx, `DELETE FROM packs WHERE repo = $1 AND id = ANY($2)`, repo, ids)
 		if err != nil {
 			return err
 		}
 		if int(ct.RowsAffected()) != len(old) {
 			return errReplaceLost // another fold got here first: roll back
+		}
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil {
+			return err
+		} else if fenced {
+			return ErrRepoPurged
 		}
 		// Ledger (issue #31): the deleted rows' blobs LINGER under packs/
 		// until a sweep reaps them, so their bytes stay in pack_usage

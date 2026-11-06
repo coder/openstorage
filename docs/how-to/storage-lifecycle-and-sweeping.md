@@ -109,8 +109,8 @@ objects). Only the repository row stays, stamped as a purge tombstone.
 What to expect:
 
 - **In-flight writes fail.** The purge first write-fences the repository in the ref
-  store, so in-flight ref updates and pack/LFS registrations fail. Credential/upstream
-  writes only attach to live repositories.
+  store, so in-flight ref updates, pack/LFS registrations and repack folds fail.
+  Credential/upstream writes only attach to live repositories.
 - **Late blobs are reaped later.** A fenced push may still publish its blob after the
   purge's scan. Later sweeps reap such bytes once aged, whatever the retention and delete
   settings. Re-running `purge-repo` rescans at once.

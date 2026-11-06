@@ -661,3 +661,65 @@ func TestRiverSyncSkipWithPendingSnoozesUntilSteal(t *testing.T) {
 		t.Errorf("row after snoozed steal = %+v, want released claim with consumed marker", up)
 	}
 }
+
+// A lapsed legacy claim with no pending request: the run skips, because
+// stealing an adopted legacy claim needs OPENSTORAGE_SYNC_STEAL_LEGACY, and
+// the gate must not complete the job over the claim, which can hold a
+// consumed request. The job snoozes at legacy pace (legacyClaimSnooze)
+// until the holder finishes or the operator allows the steal.
+func TestRiverSyncLapsedLegacyClaimSnoozesWithoutPending(t *testing.T) {
+	t.Setenv("OPENSTORAGE_SYNC_STEAL_LEGACY", "")
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	const repo = "repo_legacy_held"
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: repo, Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+	if _, _, err := store.BeginSync(ctx, repo, sync.LegacyClaimHolder, time.Millisecond); err != nil {
+		t.Fatalf("legacy claim: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond) // the legacy grace lapses
+
+	var skips atomic.Int32
+	runner := func(ctx context.Context, job sync.Job) error {
+		if _, _, err := store.BeginSync(ctx, job.RepoID, "test-run", time.Minute); !errors.Is(err, sync.ErrSyncInProgress) {
+			return fmt.Errorf("BeginSync over a lapsed legacy claim = %v, want ErrSyncInProgress", err)
+		}
+		skips.Add(1)
+		return nil
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: repo}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	var state string
+	var scheduledAt time.Time
+	waitFor(t, "the gate of the skipped run", func() bool {
+		if err := q.pool.QueryRow(ctx, `SELECT state::text, scheduled_at FROM river_job WHERE kind = 'upstream_sync' AND args->>'repo_id' = $1`,
+			repo).Scan(&state, &scheduledAt); err != nil {
+			t.Fatalf("read the sync job: %v", err)
+		}
+		return skips.Load() >= 1 && state != "available" && state != "running"
+	})
+	if wait := time.Until(scheduledAt); state != "scheduled" || wait < legacyClaimSnooze-time.Minute {
+		t.Fatalf("sync job after a skip over a lapsed legacy claim: state %s, next run in %v; want snoozed for about %v",
+			state, wait.Round(time.Second), legacyClaimSnooze)
+	}
+	up, err := store.GetUpstream(ctx, repo)
+	if err != nil {
+		t.Fatalf("GetUpstream: %v", err)
+	}
+	if !up.Syncing || up.SyncClaimHolder != sync.LegacyClaimHolder || up.SyncPending {
+		t.Fatalf("row after the skip = %+v, want the legacy claim still held and nothing pending", up)
+	}
+}
