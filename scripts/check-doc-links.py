@@ -3,17 +3,20 @@
 
     python3 scripts/check-doc-links.py
 
-Reads the Markdown files in git's index (`git ls-files`), minus vendor/ and
-files deleted from the working tree: every README.md, the root CONTRIBUTING.md
-and CHANGELOG.md, and every .md file under docs/. Prints one line per failure,
-then `broken links: N`. Exits 1 when N > 0. Exits 2, without checking
-anything, when git cannot list the files (for example, outside a checkout).
-Zero dependencies besides git. CI runs it in the required lint job of
-.github/workflows/ci.yml.
+Reads the Markdown files that git tracks or that are untracked and not
+ignored (`git ls-files`), minus vendor/ and files deleted from the working
+tree: every README.md, the root CONTRIBUTING.md and CHANGELOG.md, and every
+.md file under docs/. Prints one line per failure, then `broken links: N`.
+Exits 1 when N > 0. Exits 2, without checking anything, when git cannot list
+the files (for example, outside a checkout). Zero dependencies besides git.
+CI runs it in the required lint job of .github/workflows/ci.yml.
 
-Every relative INLINE link must name an existing file. A #fragment on a .md
-target must name one of that file's anchors, even when the target is not a
-scanned file. Anchors of docs/upstream/ targets are not checked, because those
+Every relative INLINE link must name an existing file that git's index
+tracks, or a directory that holds one. Stage a new target with `git add`
+before you link to it: a clean CI checkout holds only committed files, and an
+untracked or intent-to-add (`git add -N`) target would pass here and fail there. A #fragment on
+a .md target must name one of that file's anchors, even when the target is not
+a scanned file. Anchors of docs/upstream/ targets are not checked, because those
 files are verbatim upstream copies. Anchor
 checking follows GitHub's algorithm (lowercase, strip backticks/asterisks,
 spaces to hyphens, dedupe with -1/-2 suffixes). Explicit <a name="..."> and
@@ -23,7 +26,7 @@ fenced, indented, or inline code do not create destinations.
 In a README.md, [path:symbol] or [path] cites code when path ends in a
 letter-led extension or names a Dockerfile, and no "(" or "[" follows the
 bracket. path is relative to the README's directory and must resolve, after
-symlinks, to a file inside the repository. symbol must be a name that the
+symlinks, to a tracked file inside the repository. symbol must be a name that the
 file's LANGUAGES reader returns. The Go, Terraform, Python, and JavaScript
 readers return declarations only, with comments and string literals blanked
 first. The shell reader accepts any whole-token phrase outside comments. An
@@ -255,18 +258,76 @@ def scan_lines(path):
             yield lineno, raw, visible
 
 
-def doc_files():
+def git_files(*args, command=("ls-files",)):
     try:
-        listed = subprocess.run(["git", "ls-files", "-z", "--", "*.md"], capture_output=True)
+        listed = subprocess.run(["git", *command, "-z", *args], capture_output=True)
         failure = listed.returncode and (listed.stderr.decode(errors="replace").strip()
-                                         or f"git ls-files exited {listed.returncode}")
+                                         or f"git {command[0]} exited {listed.returncode}")
     except OSError as err:
         failure = str(err)
     if failure:
         print(f"check-doc-links.py needs a git checkout: {failure}", file=sys.stderr)
         sys.exit(2)
-    names = {os.fsdecode(name) for name in listed.stdout.split(b"\0") if name}
+    return {os.fsdecode(name) for name in listed.stdout.split(b"\0") if name}
+
+
+def doc_files():
+    # Untracked files that .gitignore does not hide are read too, so a new
+    # README is checked before `git add`. A clean CI checkout has none.
+    names = git_files("--cached", "--others", "--exclude-standard", "--", "*.md")
     return sorted(name for name in names if not name.startswith("vendor/") and os.path.isfile(name))
+
+
+def repo_path(path):
+    """The path relative to the repository root after symlinks resolve, or None outside it."""
+    root, real = os.path.realpath(os.curdir), os.path.realpath(path)
+    return os.path.relpath(real, root) if os.path.commonpath([root, real]) == root else None
+
+
+def indexed(path):
+    """True when git's index holds the file that path names and every symlink that resolving it follows.
+
+    A clean checkout has no untracked symlink, so a path through one breaks there even when it resolves to a
+    tracked file. Each symlink is followed by hand, so a symlink that another symlink points at is checked too.
+    Both callers check that the path exists first, so the OS has already refused a symlink loop.
+    """
+    pending, current = path.split("/")[::-1], "."
+    while pending:
+        name = pending.pop()
+        if name in ("", "."):
+            continue
+        if name == "..":
+            if current == ".":
+                return False
+            current = posixpath.dirname(current) or "."
+            continue
+        entry = posixpath.normpath(posixpath.join(current, name))
+        if not os.path.islink(entry):
+            current = entry
+            continue
+        target = os.readlink(entry)
+        if entry not in tracked() or posixpath.isabs(target):
+            return False
+        pending.extend(reversed(target.split("/")))
+    return current in tracked()
+
+
+def intent_to_add():
+    """The paths that `git add -N` put in the index without content: a commit holds none of them."""
+    return git_files("--name-only", "--diff-filter=A", command=("diff-files",))
+
+
+@functools.cache
+def tracked():
+    """The paths in git's index, minus intent-to-add entries, and every directory that holds one."""
+    files = git_files() - intent_to_add()
+    found = set(files) | {"."}
+    for name in files:
+        parent = posixpath.dirname(name)
+        while parent and parent not in found:
+            found.add(parent)
+            parent = posixpath.dirname(parent)
+    return found
 
 
 def is_readme(path):
@@ -323,6 +384,9 @@ def link_failures(path, lineno, ln):
             failures.append(f"BROKEN FILE (escapes repo) {path}:{lineno} -> {target}")
         elif not os.path.exists(resolved):
             failures.append(f"BROKEN FILE {path}:{lineno} -> {target}")
+        elif target and not indexed(resolved):
+            kind = "escapes repo" if repo_path(resolved) is None else "not tracked by git"
+            failures.append(f"BROKEN FILE ({kind}) {path}:{lineno} -> {target}")
         elif (anchor and anchor != "#" and resolved.endswith(".md")
               and not resolved.startswith("docs/upstream") and anchor[1:] not in anchors(resolved)):
             failures.append(f"BROKEN ANCHOR {path}:{lineno} -> {target}{anchor}")
@@ -332,7 +396,8 @@ def link_failures(path, lineno, ln):
 def masked(text, lexer):
     # Same length and newlines as text, so line, column, and offset survive.
     # Quoted literals keep their quotes, so go_names and tf_names can find a
-    # flag name or block label here and read its value from text.
+    # flag name or block label here and read its value from text, and js_names
+    # can tell a line that ends in a string from one that ends in an operator.
     def blank(m):
         token, keep = m.group(), 1 if m.groupdict().get("quoted") else 0
         return token[:keep] + re.sub(r"[^\n]", " ", token[keep:len(token) - keep]) + token[len(token) - keep:]
@@ -346,8 +411,8 @@ TF_LEXER = re.compile(r"(?P<blank>#[^\n]*|//[^\n]*|/\*.*?\*/"
                       r'|(?P<quoted>"(?:\\.|\$\{(?:"(?:\\.|[^"\\])*"|[^"}])*\}|[^"\\\n])*")', re.S | re.M)
 PY_LEXER = re.compile(r"(?P<blank>#[^\n]*|\"\"\"(?:\\.|[^\\])*?\"\"\"|'''(?:\\.|[^\\])*?'''"
                       r"|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')", re.S)
-JS_LEXER = re.compile(r"(?P<blank>//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'"
-                      r"|`(?:\\.|[^`\\])*`)", re.S)
+JS_LEXER = re.compile(r"(?P<blank>//[^\n]*|/\*.*?\*/)"
+                      r"|(?P<quoted>\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)", re.S)
 
 
 def go_names(text):
@@ -452,8 +517,8 @@ def tf_names(text):
                 if kind == "resource" and len(labels) == 2:
                     top = ".".join(labels)
                     names |= {labels[0], top}
-                elif kind == "data" and len(labels) == 2:
-                    top = "data." + ".".join(labels)
+                elif kind in ("data", "ephemeral") and len(labels) == 2:
+                    top = f"{kind}." + ".".join(labels)
                     names.add(top)
                 elif kind in ("variable", "output") and len(labels) == 1:
                     top = None
@@ -477,12 +542,28 @@ def tf_names(text):
     return names
 
 
+# A line that ends in one of these leaves its expression open, so the next
+# line continues it and a function or class there is not a declaration. A
+# postfix `++` or `--` ends a statement, so it is left out, and so are
+# `return`, `throw` and `yield`, which end at a line break. A trailing `/` is
+# read as division, never as the end of a regex literal: a statement that
+# ends in a regex literal and has no `;` fails closed. A string keeps its
+# quotes in the masked text, so a line that ends in a string never looks like
+# a dangling `=`.
+JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*/%&|^<>!~.]$"
+                          r"|(?<![\w$.])(?:await|case|delete|extends|in|instanceof|new|of|typeof|void)$")
+
+
 def js_names(text):
-    names = set()
+    names, prior = set(), ""
     for line in masked(text, JS_LEXER).split("\n"):
+        code = line.rstrip()
+        if not code:
+            continue
         m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )([\w$]+)", line)
-        if m:
+        if m and not JS_CONTINUES.search(prior):
             names.add(m.group(1))
+        prior = code
     return names
 
 
@@ -537,11 +618,13 @@ def citation_problem(path, symbol):
         return "LINE NUMBER CITATION", " (cite a name; line numbers drift)"
     if symbol is not None and language(path) is None:
         return "UNSUPPORTED CITATION", " (LANGUAGES has no reader for this file kind; cite the file alone)"
-    root, real = os.path.realpath(os.curdir), os.path.realpath(path)
-    if os.path.commonpath([root, real]) != root:
+    real = repo_path(path)
+    if real is None:
         return "MISSING CITED FILE", " (outside the repository)"
-    if not os.path.isfile(real):
+    if not os.path.isfile(path):
         return "MISSING CITED FILE", ""
+    if not indexed(path):
+        return "MISSING CITED FILE", " (not tracked by git)"
     if symbol is not None and symbol not in citable(path):
         return "UNRESOLVED CITATION", f" (no such name in {path})"
     return None
