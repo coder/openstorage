@@ -169,7 +169,7 @@ func TestRiverQueueRoundtrip(t *testing.T) {
 
 	// Insert-only client (the hook-subprocess path) shares the database:
 	// jobs it inserts are worked by the full client's workers.
-	ins, err := NewRiverInsertOnly(ctx, pgURL)
+	ins, err := NewRiverInsertOnly(ctx, pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiverInsertOnly: %v", err)
 	}

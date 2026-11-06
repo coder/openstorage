@@ -51,6 +51,11 @@ func NewHookLogHandler(stderr io.Writer, opts *slog.HandlerOptions) slog.Handler
 	return h
 }
 
+// hookErrorsLogger writes records only to the push's hook-errors file.
+func hookErrorsLogger() *slog.Logger {
+	return slog.New(NewHookLogHandler(io.Discard, nil))
+}
+
 type hookLogHandler struct {
 	pusher   slog.Handler
 	operator slog.Handler // nil without a hook-errors file
@@ -101,6 +106,15 @@ func (h hookLogHandler) WithGroup(name string) slog.Handler {
 // withoutErrors returns a without its error values, and false when nothing
 // is left of it.
 func withoutErrors(a slog.Attr) (slog.Attr, bool) {
+	// An "err" or "error" attribute is an error whatever its kind: some
+	// libraries log err.Error() as a string. An error that is also a
+	// LogValuer can resolve to its text, so it is checked before Resolve.
+	if a.Key == "err" || a.Key == "error" {
+		return slog.Attr{}, false
+	}
+	if _, isErr := a.Value.Any().(error); isErr {
+		return slog.Attr{}, false
+	}
 	a.Value = a.Value.Resolve()
 	switch a.Value.Kind() {
 	case slog.KindAny:

@@ -666,7 +666,11 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 
 // newHookRiver builds the hook's River client. Tests replace it to reach
 // the wiring's River failure.
-var newHookRiver = jobs.NewRiverInsertOnly
+var newHookRiver = func(ctx context.Context, pgURL string) (*jobs.River, error) {
+	// River's lines carry store errors as strings: write them only to
+	// serve's hook-errors file, never to the stdout git relays.
+	return jobs.NewRiverInsertOnly(ctx, pgURL, slog.New(githttp.NewHookLogHandler(io.Discard, nil)))
+}
 
 // errHookIntent is BeforeCAS's refusal when the hook cannot record a push's
 // forward intent. events.RefStore prefixes "refusing the ref update".
@@ -753,4 +757,15 @@ func (h *hookUpstreamRow) GetRepoUpstream(ctx context.Context, repoID string) (m
 // hook-errors file.
 func slogForHook(stderr io.Writer) *slog.Logger {
 	return slog.New(githttp.NewHookLogHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// runHook is the `openstorage hook` command. Its logger (slogForHook) is
+// also the process's default logger, so the store packages' own slog lines
+// and the log package lose their error values on stderr too.
+func runHook(ctx context.Context, args []string, stderr io.Writer) error {
+	logger := slogForHook(stderr)
+	slog.SetDefault(logger)
+	cleanup := wireHookEventing(ctx, logger)
+	defer cleanup()
+	return githttp.RunHook(ctx, args)
 }

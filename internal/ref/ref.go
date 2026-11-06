@@ -396,7 +396,9 @@ func Open(ctx context.Context, dbURL string) (Store, error) {
 	assertf(dbURL != "", "Open: empty ref store URL")
 	u, err := url.Parse(dbURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse ref store URL: %w", err)
+		// Not err: url.Parse's error quotes the URL, password included,
+		// and its reason can quote part of it.
+		return nil, errors.New("parse ref store URL: malformed URL (not shown: it can hold a password)")
 	}
 	switch u.Scheme {
 	case "postgres", "postgresql":

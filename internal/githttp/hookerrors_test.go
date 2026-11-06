@@ -14,10 +14,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/meta"
 )
 
@@ -48,8 +50,13 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	logger.Error("open ref store failed", "err", fmt.Errorf("dial %s", canary), "repo", "r1",
 		slog.Group("g", "err", errors.New("group "+canary), "k", "v"))
 	logger.WithGroup("w").Warn("second", "err", errors.New("nested "+canary), "x", 1)
+	// Some libraries log err.Error() as a string. An error can also be a
+	// LogValuer that resolves to its text, and a LogValuer can resolve to
+	// an error.
+	slog.New(NewHookLogHandler(&pusher, nil)).Error("third", slog.String("err", "string "+canary),
+		"cause", valuerError{canary}, "lazy", lazyError{canary}, "y", 2)
 
-	for _, want := range []string{"open ref store failed", "hook=update", "repo=r1", "g.k=v", "second", "w.x=1"} {
+	for _, want := range []string{"open ref store failed", "hook=update", "repo=r1", "g.k=v", "second", "w.x=1", "third", "y=2"} {
 		if !strings.Contains(pusher.String(), want) {
 			t.Errorf("stderr lacks %q: %s", want, pusher.String())
 		}
@@ -61,19 +68,170 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Five: the With error in both records, and one more error each in
-	// the first (attribute, group) and in the second.
-	if n := strings.Count(string(b), canary); n != 5 {
-		t.Fatalf("the hook-errors file names the canary %d times, want 5: %s", n, b)
+	// Eight: the With error in both records, one more error each in the
+	// first (attribute, group) and in the second, and three in the third.
+	if n := strings.Count(string(b), canary); n != 8 {
+		t.Fatalf("the hook-errors file names the canary %d times, want 8: %s", n, b)
 	}
 
 	logs := captureServeLog(t)
 	logHookErrors("receive-pack r1", path)
-	if got := strings.Count(logs.String(), "receive-pack r1: hook: "); got != 2 {
-		t.Fatalf("serve logged %d hook records, want 2: %s", got, logs)
+	if got := strings.Count(logs.String(), "receive-pack r1: hook: "); got != 3 {
+		t.Fatalf("serve logged %d hook records, want 3: %s", got, logs)
 	}
-	if n := strings.Count(logs.String(), canary); n != 5 {
-		t.Fatalf("serve's log names the canary %d times, want 5: %s", n, logs)
+	if n := strings.Count(logs.String(), canary); n != 8 {
+		t.Fatalf("serve's log names the canary %d times, want 8: %s", n, logs)
+	}
+}
+
+// valuerError is an error that logs as its own text.
+type valuerError struct{ canary string }
+
+func (e valuerError) Error() string        { return "valuer " + e.canary }
+func (e valuerError) LogValue() slog.Value { return slog.StringValue(e.Error()) }
+
+// lazyError is a LogValuer that resolves to an error.
+type lazyError struct{ canary string }
+
+func (e lazyError) LogValue() slog.Value { return slog.AnyValue(errors.New("lazy " + e.canary)) }
+
+// The handler is enabled at its level: a record below it reaches neither
+// stderr nor the hook-errors file.
+func TestHookLogHandlerHonorsItsLevel(t *testing.T) {
+	path, err := createHookErrors(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvHookErrors, path)
+	var pusher bytes.Buffer
+	logger := slog.New(NewHookLogHandler(&pusher, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	logger.Info("below the level", "err", errors.New("info"))
+	logger.Warn("at the level")
+	if strings.Contains(pusher.String(), "below the level") || !strings.Contains(pusher.String(), "at the level") {
+		t.Fatalf("stderr = %q; want only the Warn record", pusher.String())
+	}
+	if b, err := os.ReadFile(path); err != nil || strings.Contains(string(b), "below the level") || !strings.Contains(string(b), "at the level") {
+		t.Fatalf("hook-errors = %q (%v); want only the Warn record", b, err)
+	}
+}
+
+// The limits that docs/how-to/deploy-production.md states, the file's mode,
+// and records longer than bufio.Scanner's default token.
+func TestHookErrorsFileLimitsAndMode(t *testing.T) {
+	if maxLoggedHookErrors != 100 || maxHookErrorsBytes != 1<<20 {
+		t.Fatalf("limits %d records, %d bytes; the deploy guide says 100 and 1 MiB", maxLoggedHookErrors, maxHookErrorsBytes)
+	}
+	path, err := createHookErrors(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("hook-errors mode = %v (%v); want 0600", fi.Mode().Perm(), err)
+	}
+	long := strings.Repeat("x", 200<<10)
+	if err := os.WriteFile(path, []byte(long+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureServeLog(t)
+	logHookErrors("receive-pack r1", path)
+	if !strings.Contains(logs.String(), "receive-pack r1: hook: "+long) {
+		t.Fatalf("serve did not log a %d-byte record whole (%d bytes logged)", len(long), len(logs.String()))
+	}
+}
+
+// A directory or a FIFO in the hook-errors file's place is neither written
+// nor read (a FIFO without a reader would block the hook and serve).
+func TestHookErrorsFileRefusesNonRegularFiles(t *testing.T) {
+	for _, kind := range []string{"directory", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), hookErrorsName)
+			var err error
+			if kind == "directory" {
+				err = os.Mkdir(path, 0o700)
+			} else {
+				err = syscall.Mkfifo(path, 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(EnvHookErrors, path)
+			done := make(chan struct{})
+			logs := captureServeLog(t)
+			go func() {
+				defer close(done)
+				slog.New(NewHookLogHandler(io.Discard, nil)).Error("record", "err", errors.New("x"))
+				logHookErrors("receive-pack r1", path)
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the hook or serve blocked on a non-regular hook-errors file")
+			}
+			if !strings.Contains(logs.String(), "is not a regular file") {
+				t.Fatalf("serve's log = %q; want a refusal", logs)
+			}
+		})
+	}
+}
+
+// retireFails is a pack ledger whose retire fails with err, and a blob store
+// that has no blob.
+type retireFails struct {
+	err     error
+	retired map[string]string
+}
+
+func (r *retireFails) RetirePackAttempts(_ context.Context, _ []string, gens map[string]string) error {
+	r.retired = gens
+	return r.err
+}
+
+func (r *retireFails) Stat(context.Context, string) (int64, error) { return 0, blob.ErrNotFound }
+
+// After a failed upload, a retire that fails with a store error writes it
+// to the hook-errors file only, never to the stderr that git relays.
+func TestRetireUnuploadedKeepsItsErrorOffStderr(t *testing.T) {
+	path, err := createHookErrors(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvHookErrors, path)
+	canary := map[string]string{"user": "canary_user_" + rand.Text()[:8], "database": "canary_db_" + rand.Text()[:8],
+		"host": "canary-host-" + strings.ToLower(rand.Text()[:8]) + ".invalid"}
+	st := &retireFails{err: fmt.Errorf("pg retire: failed to connect to `user=%s database=%s`: lookup %s: no such host",
+		canary["user"], canary["database"], canary["host"])}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := os.Stderr
+	os.Stderr = w
+	retireUnuploaded(t.Context(), st, st, "r1", map[string]string{"packs/a.pack": "1"})
+	os.Stderr = prev
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.retired["packs/a.pack"] != "1" {
+		t.Fatalf("retired %v; want the absent blob's reservation", st.retired)
+	}
+	records, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(records), "pre-receive: retire reservations") {
+		t.Fatalf("the hook-errors records lack the retire failure: %s", records)
+	}
+	for part, v := range canary {
+		if n := strings.Count(string(stderr), v); n != 0 {
+			t.Errorf("stderr names the canary %s %d times", part, n)
+		}
+		if !strings.Contains(string(records), v) {
+			t.Errorf("the hook-errors records lack the canary %s", part)
+		}
 	}
 }
 
