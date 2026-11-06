@@ -970,6 +970,9 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 		newFile := func(path string) string {
 			return "diff --git a/" + path + " b/" + path + "\nnew file mode 100644\n--- /dev/null\n+++ b/" + path + "\n@@ -0,0 +1 @@\n+x\n"
 		}
+		newDir := func(path string) string {
+			return "diff --git a/" + path + " b/" + path + "\nnew file mode 040000\n--- /dev/null\n+++ b/" + path + "\n@@ -0,0 +1 @@\n+x\n"
+		}
 		for _, tc := range []struct {
 			name, patch string
 			wantCode    int
@@ -1026,10 +1029,17 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 			// git 2.55 aborts on an assertion when a header names a new file
 			// twice, after --numstat parsed the patch. It is the patch's own
 			// fault, so a 400 and never a 500 (#613).
+			// The assertion text depends on the libc (glibc, musl, macOS), so
+			// the rows pin the status and the wording in front of it.
 			{"repeated header and a new file", "diff --git a/e b/e\ndiff --git a/e b/e\nnew file mode 100644\nindex 0000000..e69de29\n",
-				http.StatusBadRequest, "diff payload is not a valid patch: git: apply.c"},
+				http.StatusBadRequest, "diff payload is not a valid patch: "},
 			{"/dev/null and a new file mode", "diff --git a/n b/n\n--- /dev/null\nindex 0000000..ce01362\nnew file mode 100644\n+++ b/n\n@@ -0,0 +1 @@\n+x\n",
-				http.StatusBadRequest, "diff payload is not a valid patch: git: apply.c"},
+				http.StatusBadRequest, "diff payload is not a valid patch: "},
+			// git apply --cached takes a directory mode, and write-tree then
+			// leaves the entry out of the tree (see TestDiffCommitNeverDropsAFile).
+			{"new file with a directory mode", newDir("dd"), http.StatusBadRequest, "invalid patch: invalid mode \"040000\" for \"dd\""},
+			{"mode change to a directory mode", "diff --git a/a.txt b/a.txt\nold mode 100644\nnew mode 040000\n", http.StatusBadRequest,
+				"invalid patch: invalid mode \"040000\" for \"a.txt\""},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				before := wmRefsSnapshot(t, e, repo.RepoID)
@@ -1066,6 +1076,11 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 		for name, patch := range map[string]string{
 			".gitmodules file": newFile(".gitmodules"),
 			"mode change":      "diff --git a/b.txt b/b.txt\nold mode 100644\nnew mode 100755\n",
+			// git stores a loose file mode as 100644, a symlink and a
+			// submodule as they are: none is a directory mode.
+			"loose file mode": "diff --git a/loose b/loose\nnew file mode 100664\n--- /dev/null\n+++ b/loose\n@@ -0,0 +1 @@\n+x\n",
+			"symlink":         "diff --git a/ln b/ln\nnew file mode 120000\n--- /dev/null\n+++ b/ln\n@@ -0,0 +1 @@\n+a.txt\n\\ No newline at end of file\n",
+			"submodule":       "diff --git a/sub b/sub\nnew file mode 160000\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit 1111111111111111111111111111111111111111\n",
 		} {
 			resp, body = wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(wctLines(t, wctMeta("main", name, nil, nil), wctDiffChunk([]byte(patch), true))))
 			wctRequireOK(t, resp, body)
@@ -1088,7 +1103,8 @@ func TestDiffCommitGitFaultIs500(t *testing.T) {
 	// The wrapper makes git's own work fail just before `git apply --cached`
 	// runs. Mode "lock" holds the scratch index lock. Mode "objects" makes the
 	// scratch object directory unwritable for that one run. Mode "config"
-	// breaks the config that `git apply --numstat` reads.
+	// breaks the config that `git apply --numstat` reads, and mode
+	// "config-summary" the one that `git apply --summary` reads.
 	bin := t.TempDir()
 	modeFile := filepath.Join(bin, "mode")
 	wrapper := fmt.Sprintf(`#!/bin/sh
@@ -1097,6 +1113,7 @@ if [ "$1" = apply ]; then for a in "$@"; do [ "$a" = --cached ] && cached=1; don
 mode=$(cat %[1]q 2>/dev/null)
 if [ -n "$cached" ] && [ "$mode" = lock ]; then : > "$GIT_INDEX_FILE.lock"; fi
 if [ "$mode" = config ]; then for a in "$@"; do [ "$a" = --numstat ] && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.bare GIT_CONFIG_VALUE_0=maybe exec %[2]q "$@"; done; fi
+if [ "$mode" = config-summary ]; then for a in "$@"; do [ "$a" = --summary ] && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.bare GIT_CONFIG_VALUE_0=maybe exec %[2]q "$@"; done; fi
 if [ -n "$cached" ] && [ "$mode" = objects ]; then
 	chmod 500 "$GIT_OBJECT_DIRECTORY"
 	%[2]q "$@"; rc=$?
@@ -1118,6 +1135,7 @@ exec %[2]q "$@"
 	}{
 		{"held index lock", "lock", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"},
 		{"broken config in the parse step", "config", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"},
+		{"broken config in the mode step", "config-summary", "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"},
 		{"unwritable object directory", "objects", newFile("n.txt")},
 		// git prints a name as it is, so these names put a line of a payload
 		// error and of a clash into the stderr of a server fault.
@@ -1156,6 +1174,89 @@ exec %[2]q "$@"
 					t.Fatalf("refs moved: %v -> %v", before, after)
 				}
 			})
+		})
+	}
+}
+
+// TestDiffCommitNeverDropsAFile: `git apply --cached` takes a patch that
+// gives a file a directory mode (040000) with exit 0, and write-tree leaves
+// that entry out of the tree. Such a commit answered 200 without the file.
+// A patch either lands every file it names or fails with a 400 that moves no
+// ref.
+func TestDiffCommitNeverDropsAFile(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		repo, writeTok, readTok := wctRepo(t, e)
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "base", []map[string]any{{"path": "a.txt", "content_id": "id-a", "operation": "upsert"}}, nil),
+			wctChunk("id-a", []byte("one\n"), true),
+		)))
+		wctRequireOK(t, resp, body)
+
+		file := func(mode, path string) string {
+			return "diff --git a/" + path + " b/" + path + "\nnew file mode " + mode + "\n--- /dev/null\n+++ b/" + path + "\n@@ -0,0 +1 @@\n+x\n"
+		}
+		for _, tc := range []struct {
+			name, patch string
+			paths       []string
+		}{
+			{"a directory mode and a file", file("100644", "ok.txt") + file("040000", "dd"), []string{"ok.txt", "dd"}},
+			{"a directory mode and a file, in the other order", file("040000", "dd") + file("100644", "ok.txt"), []string{"dd", "ok.txt"}},
+			{"a directory mode only", file("040000", "dd"), []string{"dd"}},
+			{"a directory mode under a directory", file("040000", "x/y/dd"), []string{"x/y/dd"}},
+			{"a mode change to a directory mode and a file", file("100644", "ok.txt") + "diff --git a/a.txt b/a.txt\nold mode 100644\nnew mode 040000\n", []string{"ok.txt"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				before := wmRefsSnapshot(t, e, repo.RepoID)
+				resp, body := wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok,
+					bytes.NewReader(wctLines(t, wctMeta("main", "d", nil, nil), wctDiffChunk([]byte(tc.patch), true))))
+				if resp.StatusCode == http.StatusOK {
+					for _, path := range tc.paths {
+						resp, _ := e.doReq(t, http.MethodGet, "/api/v1/repos/file?path="+path+"&ref=main", readTok, nil, "")
+						if resp.StatusCode != http.StatusOK {
+							t.Errorf("commit answered 200 and %s is not in it (file read answered %d): %s", path, resp.StatusCode, body)
+						}
+					}
+					return
+				}
+				wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
+				if after := wmRefsSnapshot(t, e, repo.RepoID); !maps.Equal(before, after) {
+					t.Fatalf("refs moved: %v -> %v", before, after)
+				}
+			})
+		}
+	})
+}
+
+// TestPatchModeError: the modes `git apply --summary` reports that no commit
+// can hold. git canonicalizes every mode, so only 040000 is outside
+// wcValidModes.
+func TestPatchModeError(t *testing.T) {
+	for _, tc := range []struct {
+		name, summary string
+		want          string // the error, or "" for none
+	}{
+		{"nothing", "", ""},
+		{"a file", " create mode 100644 a.txt\n", ""},
+		{"an executable, a symlink and a submodule", " create mode 100755 a\n create mode 120000 b\n create mode 160000 c\n", ""},
+		{"a mode change", " mode change 100644 => 100755 a.txt\n", ""},
+		{"a rename, a delete and a copy", " rename a => b (100%)\n delete mode 040000 c\n copy d => e (90%)\n", ""},
+		{"a directory", " create mode 040000 dd\n", `invalid mode "040000" for "dd"`},
+		{"a directory after a file", " create mode 100644 ok\n create mode 040000 dd\n", `invalid mode "040000" for "dd"`},
+		{"a mode change to a directory", " mode change 100644 => 040000 a.txt\n", `invalid mode "040000" for "a.txt"`},
+		{"a mode change that git printed without a new mode", " mode change 100644\n", `invalid mode "" for ""`},
+		{"a directory name with a space", " create mode 040000 a b\n", `invalid mode "040000" for "a b"`},
+		{"no final newline", " create mode 040000 dd", `invalid mode "040000" for "dd"`},
+		// The summary does not quote a newline in a name, so a name can write
+		// the line itself. That makes its own patch a 400.
+		{"a name that forges a line", " create mode 100644 x\n create mode 040000 y\n", `invalid mode "040000" for "y"`},
+		{"a line that does not start the line", "x create mode 040000 y\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := wcPatchModeError(tc.summary)
+			if got := fmt.Sprint(err); (err == nil) != (tc.want == "") || (err != nil && got != tc.want) {
+				t.Fatalf("wcPatchModeError(%q) = %v, want %q", tc.summary, err, tc.want)
+			}
 		})
 	}
 }
@@ -1217,6 +1318,7 @@ func TestApplyPatchServerFailure(t *testing.T) {
 		// git's own prefix is "fatal: ": a name that starts a line with
 		// "fatal:" and no space is the client's text.
 		{"fatal without a space", "error: patch failed: f:1\nfatal:x", "1", http.StatusConflict, false},
+		{"fatal inside a line", "error: patch failed: fatal: x:1", "1", http.StatusConflict, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			set(t, tc.exit, tc.stderr)
@@ -1452,6 +1554,9 @@ func TestApplyRejectionStatus(t *testing.T) {
 		{"submodule without a commit", 128, "error: corrupt patch for submodule sub", http.StatusBadRequest},
 		{"submodule with a null commit", 128, "error: cache entry has null sha1: sub\nerror: Unable to write new index file", http.StatusBadRequest},
 		{"after another line", 128, "warning: noise\nerror: invalid path 'git~1/x'", http.StatusBadRequest},
+		// A name can put a clash line in front of git's own payload line:
+		// the payload line decides, whatever comes first.
+		{"clash line before a payload line", 128, "error: unable to add cache entry for x\nerror: invalid path 'y'", http.StatusBadRequest},
 		{"file and directory", 128, "error: 'd' appears as both a file and as a directory\nerror: unable to add cache entry for d", http.StatusConflict},
 		{"file and directory under a long path", 128, "error: '" + strings.Repeat("a", 3*wcMaxApplyMsgBytes) + "' appears as both a file and as a directory\nerror: unable to add cache entry for x", http.StatusConflict},
 		{"does not apply", 1, "error: patch failed: f:1\nerror: f: patch does not apply", http.StatusConflict},

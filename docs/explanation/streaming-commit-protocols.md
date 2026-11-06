@@ -108,6 +108,10 @@ When the patch cannot be used, the answer depends on why:
   without its data): 400 `invalid`.
 - The patch names a path no tree may hold (empty, absolute, a `.` or `..` segment, a `.git`
   component): 400 `invalid`, with the same wording as `commit-pack`.
+- The patch gives a file a mode that no commit can hold, a directory mode (`new file mode
+  040000`): 400 `invalid`, with the wording of `commit-pack`'s `invalid mode`. Git
+  applies such a patch to the index without an error but writes no tree entry for it, so the
+  server refuses the whole patch instead of committing without the file.
 - Git refuses the patch on every base tree, although it parses: 400 `invalid` with git's
   own error. That covers a name that git's path rules reject (`.git.`, `git~1`, a
   `.gitmodules` symlink), a mode line that changes nothing git can record (`new mode

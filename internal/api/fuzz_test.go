@@ -2,8 +2,9 @@
 // clientKey derives the rate-limit bucket key pre-auth on every request
 // (RemoteAddr + client-controlled X-Forwarded-For), and coreCursorDecode
 // parses opaque pagination cursors. Both must stay total and fail closed on
-// arbitrary input. FuzzApplyRejection covers git apply's stderr, which holds
-// client-chosen path names (#613).
+// arbitrary input. FuzzApplyRejection covers git apply's stderr and
+// FuzzPatchModeError its summary, which both hold client-chosen path names
+// (#613).
 package api
 
 import (
@@ -208,6 +209,39 @@ func FuzzApplyRejection(f *testing.F) {
 		}
 		if noisy := wcApplyStatus(exit, "noise\n"+msg); noisy != got {
 			t.Fatalf("a line before %q changed the status of exit %d from %d to %d", msg, exit, got, noisy)
+		}
+	})
+}
+
+// FuzzPatchModeError: wcPatchModeError reads `git apply --summary`, which
+// prints file names as they are. It must be total, a line that is not a mode
+// line or that holds a valid mode must not change its answer, and a directory
+// mode on a line of its own must always fail it.
+func FuzzPatchModeError(f *testing.F) {
+	for _, seed := range []string{
+		"",
+		" create mode 100644 a.txt\n",
+		" create mode 040000 dd\n",
+		" mode change 100644 => 040000 a.txt\n",
+		" mode change 100644 => 100755 a.txt\n create mode 160000 sub\n",
+		" rename a => b (100%)\n delete mode 040000 c\n",
+		" create mode 100644 x\n create mode 040000 y\n",
+		" mode change 100644\n",
+		" create mode ",
+		" create mode  \n",
+		"x create mode 040000 y",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, summary string) {
+		err := wcPatchModeError(summary)
+		for _, extra := range []string{"noise\n", " create mode 100644 x\n", " mode change 100644 => 100755 y\n", " delete mode 040000 z\n"} {
+			if got := wcPatchModeError(extra + summary); (got == nil) != (err == nil) {
+				t.Fatalf("the line %q changed the answer for %q from %v to %v", extra, summary, err, got)
+			}
+		}
+		if wcPatchModeError(" create mode 040000 dd\n"+summary) == nil {
+			t.Fatalf("a directory mode in front of %q passed", summary)
 		}
 	})
 }
