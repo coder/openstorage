@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -309,6 +311,8 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 				storeFails         bool
 				panics             bool
 				heldElsewhere      bool
+				noUpstream         bool
+				lostCAS            bool
 				wantIntent, refuse bool
 			}{
 				{name: "forward", forward: true, scopes: rw, wantIntent: true},
@@ -320,6 +324,12 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 				// the write is refused with githttp.ErrRefHeld, which the
 				// API answers with 503 and Retry-After.
 				{name: "held_elsewhere", forward: true, scopes: rw, heldElsewhere: true, refuse: true},
+				// No upstream link: nothing to forward, so a missing row
+				// (meta.ErrNotFound) neither refuses the write nor holds.
+				{name: "no_upstream", forward: true, scopes: rw, noUpstream: true},
+				// A write that loses its CAS (409) has recorded its intent
+				// already, so the lane runs once and finds nothing new.
+				{name: "lost_cas", forward: true, scopes: rw, lostCAS: true},
 				{name: "server_initiated", forward: true, noClaims: true, wantIntent: true},
 				{name: "write_only", forward: true, scopes: []string{auth.ScopeGitWrite}},
 				{name: "pull", scopes: rw},
@@ -374,11 +384,13 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if _, err := ms.SetRepoUpstream(ctx, meta.RepoUpstream{
-						RepoID: repo.RepoID, Provider: "github", Owner: "up", Name: "mirror",
-						UpstreamHost: "https://example.invalid", ForwardOnPush: tc.forward,
-					}); err != nil {
-						t.Fatal(err)
+					if !tc.noUpstream {
+						if _, err := ms.SetRepoUpstream(ctx, meta.RepoUpstream{
+							RepoID: repo.RepoID, Provider: "github", Owner: "up", Name: "mirror",
+							UpstreamHost: "https://example.invalid", ForwardOnPush: tc.forward,
+						}); err != nil {
+							t.Fatal(err)
+						}
 					}
 					cacheDir := filepath.Join(dir, "cache")
 					_, decorate, cleanup, err := buildServeEventing(ctx, ms, "sqlite://"+filepath.Join(dir, "meta.sqlite"), org,
@@ -406,7 +418,7 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 					}
 					store := decorate(observeAtCAS{RefStore: inner, observe: func() {
 						intentAtCAS = 0
-						if !tc.storeFails {
+						if !tc.storeFails && !tc.noUpstream {
 							up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
 							if err != nil {
 								t.Errorf("read the row at the CAS: %v", err)
@@ -441,7 +453,18 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 							_, _ = store.CASRef(writeCtx, repo.RepoID, refName, ref.ZeroSHA, sha)
 						}()
 					}
-					won, err := store.CASRef(writeCtx, repo.RepoID, refName, ref.ZeroSHA, sha)
+					old := ref.ZeroSHA
+					if tc.lostCAS {
+						old = strings.Repeat("a", 40) // the ref does not exist: the CAS loses
+					}
+					won, err := store.CASRef(writeCtx, repo.RepoID, refName, old, sha)
+					if tc.lostCAS {
+						up, uerr := ms.GetRepoUpstream(ctx, repo.RepoID)
+						if err != nil || won || uerr != nil || up.PushPending != upsync.PushPendingPush || held(5*time.Second) {
+							t.Fatalf("lost CAS = (won %v, err %v), push_pending = %d (%v), or the ref still held; want a lost CAS whose plain intent stays and whose hold ended", won, err, up.PushPending, uerr)
+						}
+						return
+					}
 					if tc.refuse {
 						got, gerr := rs.GetRef(ctx, repo.RepoID, refName)
 						if err == nil || won || !errors.Is(gerr, ref.ErrNotFound) {
@@ -455,8 +478,8 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 					if err != nil || !won {
 						t.Fatalf("accepted CAS: %v %v", won, err)
 					}
-					if tc.wantIntent && (intentAtCAS <= 0 || !heldAtCAS) {
-						t.Fatalf("at the authority CAS push_pending = %d, ref held = %v; want the intent recorded and the ref held: serve dying there loses the forward, and a run that claims the intent can snapshot the ref before the CAS", intentAtCAS, heldAtCAS)
+					if tc.wantIntent && (intentAtCAS != upsync.PushPendingPush || !heldAtCAS) {
+						t.Fatalf("at the authority CAS push_pending = %d, ref held = %v; want a plain intent (%d: a REST write never forces) and the ref held: serve dying there loses the forward, and a run that claims the intent can snapshot the ref before the CAS", intentAtCAS, heldAtCAS, upsync.PushPendingPush)
 					}
 					if !tc.wantIntent && (intentAtCAS != 0 || heldAtCAS) {
 						t.Fatalf("at the authority CAS push_pending = %d, ref held = %v; want neither for a write that records no intent", intentAtCAS, heldAtCAS)
@@ -465,6 +488,86 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 						t.Fatal("the ref is still held after the write returned")
 					}
 				})
+			}
+		})
+	}
+}
+
+// restIntentMeta is the slice of meta.EventingStore that
+// restIntentBeforeCAS reads and writes, with scripted answers.
+type restIntentMeta struct {
+	meta.EventingStore
+	up      meta.RepoUpstream
+	upErr   error
+	pushErr error
+	pushes  []bool // the force flag of each RequestPush
+}
+
+func (m *restIntentMeta) GetRepoUpstream(context.Context, string) (meta.RepoUpstream, error) {
+	return m.up, m.upErr
+}
+
+func (m *restIntentMeta) RequestPush(_ context.Context, _ string, force bool) error {
+	m.pushes = append(m.pushes, force)
+	return m.pushErr
+}
+
+// TestRestIntentBeforeCASPaths drives restIntentBeforeCAS through each
+// answer of the metadata store and the cache: whether it refuses, whether
+// the ref is held when it returns, and the intent it records. A recorded
+// intent is always a plain request, never a forced one, and a refusal
+// never leaves the ref held.
+func TestRestIntentBeforeCASPaths(t *testing.T) {
+	forward := meta.RepoUpstream{ForwardOnPush: true}
+	for _, tc := range []struct {
+		name       string
+		m          restIntentMeta
+		cacheFile  bool // the cache path is a file: the hold fails
+		wantErr    bool
+		wantHeld   bool
+		wantPushes int
+	}{
+		{name: "no_upstream_link", m: restIntentMeta{upErr: meta.ErrNotFound}},
+		{name: "row_read_fails", m: restIntentMeta{upErr: errors.New("row read failed")}, wantErr: true},
+		{name: "not_forward_on_push", m: restIntentMeta{}},
+		{name: "hold_fails", m: restIntentMeta{up: forward}, cacheFile: true, wantErr: true},
+		{name: "intent_write_fails", m: restIntentMeta{up: forward, pushErr: errors.New("intent write failed")}, wantErr: true, wantPushes: 1},
+		// The link went away between the read and the intent write:
+		// nothing to forward, so the write goes on, still holding.
+		{name: "intent_link_gone", m: restIntentMeta{up: forward, pushErr: meta.ErrNotFound}, wantHeld: true, wantPushes: 1},
+		{name: "forward", m: restIntentMeta{up: forward}, wantHeld: true, wantPushes: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const repoID = "repo_x"
+			cacheDir := filepath.Join(t.TempDir(), "cache")
+			if tc.cacheFile {
+				if err := os.WriteFile(cacheDir, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			held := func(wait time.Duration) bool {
+				waitCtx, cancel := context.WithTimeout(t.Context(), wait)
+				defer cancel()
+				return githttp.WaitForPushPublication(waitCtx, cacheDir, repoID) != nil
+			}
+			m := tc.m
+			release, err := restIntentBeforeCAS(&m, cacheDir, func(context.Context) bool { return false })(t.Context(), repoID, "refs/heads/main")
+			if (err != nil) != tc.wantErr || (err == nil) != (release != nil) {
+				t.Fatalf("restIntentBeforeCAS = (release %v, err %v), want an error = %v", release != nil, err, tc.wantErr)
+			}
+			if len(m.pushes) != tc.wantPushes || slices.Contains(m.pushes, true) {
+				t.Fatalf("RequestPush calls (force flags) = %v, want %d plain ones", m.pushes, tc.wantPushes)
+			}
+			if !tc.cacheFile {
+				if got := held(time.Second); got != tc.wantHeld {
+					t.Fatalf("ref held after the call = %v, want %v", got, tc.wantHeld)
+				}
+			}
+			if release != nil {
+				release()
+				if held(5 * time.Second) {
+					t.Fatal("the ref is still held after release")
+				}
 			}
 		})
 	}
