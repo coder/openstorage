@@ -7,8 +7,9 @@
 // A FACT is one guard the model depends on, checked in the AST (call
 // order, SQL text, assignments) on both local-schedule backends, SQLite and
 // S3-WAL; check.sh writes it into the TLC config, so breaking the guard in
-// the code flips the model. An FP fingerprints one covered function's
-// tokens (comments and formatting ignored); check.sh compares it with
+// the code flips the model. An FP fingerprints the tokens of one
+// declaration (an import, function, method, const, var or type) of a
+// covered file (comments and formatting ignored); check.sh compares it with
 // model/fingerprints.txt to tell when covered code changed.
 //
 // Run from the repository root:
@@ -447,110 +448,46 @@ func main() {
 		fmt.Printf("FACT %s %s %s\n", f.name, strings.ToUpper(strconv.FormatBool(f.ok)), ev)
 	}
 
-	// Fingerprints of every covered function.
-	type cover struct {
-		src   *source
-		recv  string
-		names []string
-	}
-	for _, c := range []cover{
-		{sqlSched, "SQLite", []string{"RequestPushNow", "ClaimDuePush", "FinishPushOutcome", "finishLane", "ListLocalWork"}},
-		{sqlSched, "PushOutcome", []string{"validate"}},
-		{sqlEvt, "SQLite", []string{"RequestPush", "beginPush"}},
-		{walSched, "s3walLocalSchedule", []string{"RequestPushNow", "ClaimDuePush", "FinishPushOutcome", "ListLocalWork"}},
-		{walSched, "", []string{"laneHeld"}},
-		{walEvt, "S3WAL", []string{"RequestPush", "beginPush"}},
-		{push, "Worker", []string{"RunPush", "transferPush"}},
-		{push, "", []string{"localPushOutcome", "TransientPushFailure", "PushRetryDelay"}},
-		{worker, "Worker", []string{"waitPublication", "restoreLocal", "claimLocal", "restoreForShutdown", "retryFinish", "retryFinishWithin"}},
-		{worker, "", []string{"claimContext", "claimLease"}},
-		{sched, "LocalScheduler", []string{"offer", "SweepOnce", "Start", "Drain"}},
-		{sched, "", []string{"shutdownAborted"}},
-		{refstore, "RefStore", []string{"CASRef", "emitPush"}},
-		{wireEvt, "", []string{"enqueueSyncOrForward"}},
-		{wireLocal, "", []string{"buildLocalSyncQueue"}},
-		{pub, "", []string{"WaitForPushPublication"}},
-		{pub, "publicationWait", []string{"wait"}},
-		{hydrate, "", []string{"Hydrate", "reservePushHolds", "removePushHolds", "appendPushReleased", "pushHoldLive", "readPushHolds"}},
-		{hydrate, "refCmdBatch", []string{"flush"}},
-		{hook, "", []string{"referenceTransactionHook", "updateHook"}},
-	} {
-		for _, n := range c.names {
-			f := c.src.fn(c.recv, n)
-			label := c.src.path + ":" + n
-			if c.recv != "" {
-				label = c.src.path + ":" + c.recv + "." + n
-			}
-			fmt.Printf("FP %s %s\n", label, c.src.fingerprint(f.Pos(), f.End()))
+	// Fingerprints: every declaration of every covered file. A change
+	// anywhere in these files reports STALE, so no helper a covered path
+	// calls can drift unseen. The coverage record in SKILL.md lists them.
+	seen := map[string]int{}
+	emit := func(label, hash string) {
+		seen[label]++
+		if n := seen[label]; n > 1 {
+			label = fmt.Sprintf("%s#%d", label, n) // e.g. several var _ = ... checks
 		}
+		fmt.Printf("FP %s %s\n", label, hash)
 	}
-	for _, k := range []string{"MaxPushTransientRetries"} {
-		v := constSpec(push, k)
-		fmt.Printf("FP %s:const_%s %s\n", push.path, k, push.fingerprint(v.Pos(), v.End()))
-	}
-	// transferPush names these refspecs; their values decide what a plain
-	// and a forced forward may do upstream.
-	for _, v := range []struct {
-		src  *source
-		name string
-	}{{push, "pushRefspecs"}, {worker, "mirrorRefspecs"}} {
-		n := varSpec(v.src, v.name)
-		fmt.Printf("FP %s:var_%s %s\n", v.src.path, v.name, v.src.fingerprint(n.Pos(), n.End()))
-	}
-	// preReceive is long: fingerprint only the closure that reserves the
-	// push's holds (reserveHoldsAndProbe = func() ...).
-	pr := hook.fn("", "preReceive")
-	var reserve ast.Node
-	ast.Inspect(pr.Body, func(m ast.Node) bool {
-		if as, ok := m.(*ast.AssignStmt); ok && len(as.Lhs) == 1 && hook.text(as.Lhs[0]) == "reserveHoldsAndProbe" {
-			if _, ok := as.Rhs[0].(*ast.FuncLit); ok {
-				reserve = as
-			}
-		}
-		return true
-	})
-	if reserve == nil {
-		fail("%s: preReceive's reserveHoldsAndProbe = func() ... not found", hook.path)
-	}
-	fmt.Printf("FP %s:preReceive[reserveHoldsAndProbe] %s\n", hook.path, hook.fingerprint(reserve.Pos(), reserve.End()))
-}
-
-func varSpec(s *source, name string) ast.Node {
-	for _, d := range s.file.Decls {
-		g, ok := d.(*ast.GenDecl)
-		if !ok || g.Tok != token.VAR {
-			continue
-		}
-		for _, sp := range g.Specs {
-			v := sp.(*ast.ValueSpec)
-			for _, n := range v.Names {
-				if n.Name == name {
-					return v
+	for _, src := range []*source{sqlSched, sqlEvt, walSched, walEvt, push, worker, sched,
+		refstore, wireEvt, wireLocal, pub, hydrate, hook, load("internal/api/handlers_sync.go"),
+		load("internal/sync/metastore.go"), load("internal/sync/pushstatus.go")} {
+		for _, d := range src.file.Decls {
+			switch d := d.(type) {
+			case *ast.FuncDecl:
+				label := d.Name.Name
+				if r := recvName(d); r != "" {
+					label = r + "." + label
+				}
+				emit(src.path+":"+label, src.fingerprint(d.Pos(), d.End()))
+			case *ast.GenDecl:
+				for _, sp := range d.Specs {
+					var names []string
+					switch sp := sp.(type) {
+					case *ast.ImportSpec:
+						names = append(names, sp.Path.Value)
+					case *ast.ValueSpec:
+						for _, n := range sp.Names {
+							names = append(names, n.Name)
+						}
+					case *ast.TypeSpec:
+						names = append(names, sp.Name.Name)
+					}
+					emit(fmt.Sprintf("%s:%s_%s", src.path, d.Tok, strings.Join(names, ",")), src.fingerprint(sp.Pos(), sp.End()))
 				}
 			}
 		}
 	}
-	fail("%s: var %s not found", s.path, name)
-	return nil
-}
-
-func constSpec(s *source, name string) ast.Node {
-	for _, d := range s.file.Decls {
-		g, ok := d.(*ast.GenDecl)
-		if !ok || g.Tok != token.CONST {
-			continue
-		}
-		for _, sp := range g.Specs {
-			v := sp.(*ast.ValueSpec)
-			for _, n := range v.Names {
-				if n.Name == name {
-					return v
-				}
-			}
-		}
-	}
-	fail("%s: const %s not found", s.path, name)
-	return nil
 }
 
 // fingerprint hashes the token stream in [pos, end): comments and layout
