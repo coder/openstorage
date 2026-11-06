@@ -91,8 +91,8 @@ repository, first takes the ref's push hold in serve's cache, then records
 write or hold refuses the ref update. So does a failed read of the
 repository's upstream link, or a metadata store the hook cannot open, for
 every update outside the ephemeral namespace, also one whose caller may
-neither forward nor pull and so would record no intent: the step does not
-check the caller's gates first, so it fails closed. A sync run's own
+not forward and so would record no intent: the step does not check the
+caller's gates first, so it fails closed. A sync run's own
 loopback push is not refused by this step. The intent after the CAS stays,
 and still does the pull marking. A local push run's loopback fetch fails
 with HTTP 423 when its hydrate would skip a push-held ref whose cached
