@@ -18,6 +18,9 @@ import (
 // but a directory that an older binary wrote can hold them.
 const fileblobAttrsExt = ".attrs"
 
+// fileblobSlashEscape is how fileblob spells a slash that ends a key.
+const fileblobSlashEscape = "__0x2f__"
+
 // walkFileKeys visits the files under dir in key order, the order BlobStore
 // documents for ListPages. A key sorts by its bytes, so a directory sorts as
 // its name plus "/". fileblob's own listing walks in file-name order instead.
@@ -107,12 +110,18 @@ func listFilePages(ctx context.Context, dir, prefix, after string, pageSize int,
 	// that a listing of one repository does not read the directory of all of
 	// them. A prefix whose directories fileblob would escape starts at the root.
 	keyPrefix := ""
+	var exact string
 	if i := strings.LastIndex(prefix, "/"); i > 0 && plainDirPath(prefix[:i]) {
+		if i == len(prefix)-1 {
+			// An object whose key is the prefix itself ends in "/", and fileblob
+			// stores it as a file next to the directory, not in it.
+			exact = filepath.Join(dir, filepath.FromSlash(prefix[:i])+fileblobSlashEscape)
+		}
 		dir = filepath.Join(dir, filepath.FromSlash(prefix[:i]))
 		keyPrefix = prefix[:i+1]
 	}
 	page := make([]ListedObject, 0, pageSize)
-	err := walkFileKeys(ctx, dir, keyPrefix, prefix, after, func(key string, de fs.DirEntry) error {
+	visit := func(key string, de fs.DirEntry) error {
 		info, err := de.Info()
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
@@ -127,8 +136,19 @@ func listFilePages(ctx context.Context, dir, prefix, after string, pageSize int,
 		err = fn(page)
 		page = page[:0]
 		return err
-	})
-	if err != nil {
+	}
+	if exact != "" && prefix > after {
+		info, err := os.Lstat(exact)
+		switch {
+		case err == nil && !info.IsDir():
+			if err := visit(prefix, fs.FileInfoToDirEntry(info)); err != nil {
+				return err
+			}
+		case err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR):
+			return fmt.Errorf("stat %s: %w", prefix, err)
+		}
+	}
+	if err := walkFileKeys(ctx, dir, keyPrefix, prefix, after, visit); err != nil {
 		return err
 	}
 	if len(page) > 0 {
@@ -140,10 +160,11 @@ func listFilePages(ctx context.Context, dir, prefix, after string, pageSize int,
 // plainDirPath reports that every directory of path is stored under its own
 // name: fileblob escapes control characters, a slash after ".." or "/", and
 // anything that looks like its own "__0x<hex>__" escape, and this package does
-// not reproduce the escaped spelling of a directory.
+// not reproduce the escaped spelling of a directory. A slash after ".." is
+// escaped in any name that ends in "..", such as "repo..".
 func plainDirPath(path string) bool {
 	for _, part := range strings.Split(path, "/") {
-		if part == "" || part == "." || part == ".." || strings.Contains(part, "__") {
+		if part == "" || part == "." || strings.HasSuffix(part, "..") || strings.Contains(part, "__") {
 			return false
 		}
 		for i := 0; i < len(part); i++ {

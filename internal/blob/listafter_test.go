@@ -298,6 +298,144 @@ func TestFile_ListKeepsAttrsDirectoriesAndOrdersATrailingSlashKeyFirst(t *testin
 	}
 }
 
+// A prefix lists every key that fileblob stores under it, whichever way
+// fileblob spells the key on disk: a slash after ".." and a trailing slash
+// make it store the key outside the directory that the prefix names.
+func TestFile_ListFindsKeysFileblobStoresOutsideThePrefixDirectory(t *testing.T) {
+	ctx := context.Background()
+	b, _ := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{"packs/r/", "packs/r/x", "packs/repo../pack-a.pack", "packs/repo.../pack-b.pack"}
+	for _, k := range keys {
+		if err := b.UploadFile(ctx, k, src); err != nil {
+			t.Fatalf("UploadFile(%q): %v", k, err)
+		}
+	}
+	for prefix, want := range map[string][]string{
+		"packs/r/":        {"packs/r/", "packs/r/x"},
+		"packs/repo../":   {"packs/repo../pack-a.pack"},
+		"packs/repo.../":  {"packs/repo.../pack-b.pack"},
+		"packs/repo../p":  {"packs/repo../pack-a.pack"},
+		"packs/repo.../p": {"packs/repo.../pack-b.pack"},
+	} {
+		got, err := b.List(ctx, prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gotKeys []string
+		for _, o := range got {
+			gotKeys = append(gotKeys, o.Key)
+		}
+		if !reflect.DeepEqual(gotKeys, want) {
+			t.Errorf("List(%q) = %q, want %q", prefix, gotKeys, want)
+		}
+	}
+}
+
+// Every prefix of every key that fileblob keeps as written lists the keys that
+// start with it and sort after the cursor, in key order. The keys are every
+// string over a small alphabet of the bytes that fileblob escapes or treats as
+// a path, so a spelling of a key that the listing misses shows up as a
+// mismatch. fileblob cleans leading slashes and dot components out of a path,
+// and the filter leaves those keys out.
+func TestFile_ListPagesAfterListsEveryKeyShapeFileblobKeeps(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		alpha []string
+		depth int
+	}{
+		{"bytes", []string{"a", ".", "/", "_"}, 5},
+		{"escapes", []string{"a", "/", "__0x2f__", "__", "\x01"}, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			b, _ := openFile(t)
+			src := filepath.Join(t.TempDir(), "src")
+			if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var candidates []string
+			var gen func(cur string, depth int)
+			gen = func(cur string, depth int) {
+				if cur != "" {
+					candidates = append(candidates, cur)
+				}
+				if depth == 0 {
+					return
+				}
+				for _, c := range tc.alpha {
+					gen(cur+c, depth-1)
+				}
+			}
+			gen("", tc.depth)
+			var keys []string
+			for _, k := range candidates {
+				if !isCleanKey(k) {
+					continue
+				}
+				if err := b.UploadFile(ctx, k, src); err == nil {
+					keys = append(keys, k)
+				}
+			}
+			sort.Strings(keys)
+			listed, err := bucketList(ctx, b.bucket, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(listed) != len(keys) {
+				t.Fatalf("fileblob lists %d of the %d keys that it stored: a key overwrote another", len(listed), len(keys))
+			}
+			prefixes := map[string]bool{"": true}
+			for _, k := range keys {
+				for i := range len(k) + 1 {
+					prefixes[k[:i]] = true
+				}
+			}
+			mismatches := 0
+			for prefix := range prefixes {
+				for _, after := range []string{"", "a", "a/", "a/a"} {
+					var got []string
+					err := b.ListPagesAfter(ctx, prefix, after, 3, func(page []ListedObject) error {
+						for _, o := range page {
+							got = append(got, o.Key)
+						}
+						return nil
+					})
+					if err != nil {
+						t.Fatalf("prefix %q after %q: %v", prefix, after, err)
+					}
+					if want := wantAfter(keys, prefix, after); !slices.Equal(got, want) {
+						if mismatches++; mismatches <= 5 {
+							t.Errorf("prefix %q after %q:\n got  %q\n want %q", prefix, after, got, want)
+						}
+					}
+				}
+			}
+			if mismatches > 0 {
+				t.Errorf("%d of %d (prefix, cursor) pairs list the wrong keys", mismatches, 4*len(prefixes))
+			}
+		})
+	}
+}
+
+// isCleanKey reports that fileblob keeps key as written: it joins a key to its
+// directory as a path, which drops a leading slash and merges "//", "." and
+// ".." components into their neighbors.
+func isCleanKey(key string) bool {
+	if strings.HasPrefix(key, "/") || strings.Contains(key, "//") {
+		return false
+	}
+	for _, part := range strings.Split(strings.TrimSuffix(key, "/"), "/") {
+		if part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 func firstDifference(a, b []string) int {
 	for i := range min(len(a), len(b)) {
 		if a[i] != b[i] {
