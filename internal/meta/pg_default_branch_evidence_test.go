@@ -75,4 +75,8 @@ func TestPGDefaultBranchCheckedSuccessUpgrade(t *testing.T) {
 	if err := s.pool.QueryRow(ctx, `SELECT default_branch_checked_success FROM repo_upstreams WHERE repo_id = $1`, repo.RepoID).Scan(&evidence); err != nil || evidence != 0 {
 		t.Fatalf("upgraded row evidence = %d (%v), want 0", evidence, err)
 	}
+	var indexes int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE indexname = 'repo_upstreams_default_branch_omitted_idx'`).Scan(&indexes); err != nil || indexes != 1 {
+		t.Fatalf("flagged-row index count = %d (%v), want 1", indexes, err)
+	}
 }
