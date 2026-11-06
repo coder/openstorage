@@ -53,11 +53,18 @@ func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Wor
 // cannot leave an accepted write that no run forwards, and a run that
 // claims the intent waits in its publication wait until the CAS returned
 // and the hold ended. A failed read, hold or intent write refuses the
-// write. The pull poke stays after the CAS (enqueueSyncOrForward).
+// write of a caller that may forward. The pull poke stays after the CAS
+// (enqueueSyncOrForward).
 func restIntentBeforeCAS(ms meta.EventingStore, cacheDir string, forwardDenied func(ctx context.Context) bool) func(ctx context.Context, repoID, refName string) (func(), error) {
 	assertf(ms != nil && cacheDir != "" && forwardDenied != nil, "restIntentBeforeCAS: missing deps")
 	noop := func() {}
 	return func(ctx context.Context, repoID, refName string) (func(), error) {
+		if forwardDenied(ctx) {
+			// The forward poke's gate, before any read: a caller that may
+			// not forward records no intent, so a failed read never
+			// refuses its write.
+			return noop, nil
+		}
 		up, err := ms.GetRepoUpstream(ctx, repoID)
 		if errors.Is(err, meta.ErrNotFound) {
 			return noop, nil // no upstream link: nothing to forward
@@ -65,8 +72,8 @@ func restIntentBeforeCAS(ms meta.EventingStore, cacheDir string, forwardDenied f
 		if err != nil {
 			return nil, err
 		}
-		if !up.ForwardOnPush || forwardDenied(ctx) {
-			return noop, nil // the same gates as the forward poke
+		if !up.ForwardOnPush {
+			return noop, nil
 		}
 		release, err := githttp.HoldRef(ctx, cacheDir, repoID, refName)
 		if err != nil {

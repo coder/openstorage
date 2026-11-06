@@ -287,8 +287,11 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 				{name: "write_only", forward: true, scopes: []string{auth.ScopeGitWrite}},
 				{name: "pull", scopes: rw},
 				{name: "ephemeral", forward: true, scopes: rw, refName: auth.EphemeralNamespacePrefix + "refs/heads/main"},
-				// Closing the store fails its reads on SQLite only.
+				// Closing the store fails its reads on SQLite only. A caller
+				// that may not forward records no intent, so a failed read
+				// does not refuse its write.
 				{name: "metadata_unavailable", forward: true, scopes: rw, storeFails: true, refuse: true},
+				{name: "metadata_unavailable_write_only", forward: true, scopes: []string{auth.ScopeGitWrite}, storeFails: true},
 			} {
 				if tc.storeFails && backend != "sqlite" {
 					continue
@@ -361,11 +364,14 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 					}
 					intentAtCAS, heldAtCAS := -1, false
 					store := decorate(observeAtCAS{RefStore: rs, observe: func() {
-						up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
-						if err != nil {
-							t.Errorf("read the row at the CAS: %v", err)
+						intentAtCAS = 0
+						if !tc.storeFails {
+							up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
+							if err != nil {
+								t.Errorf("read the row at the CAS: %v", err)
+							}
+							intentAtCAS = up.PushPending
 						}
-						intentAtCAS = up.PushPending
 						heldAtCAS = held(200 * time.Millisecond)
 					}})
 					writeCtx := ctx
