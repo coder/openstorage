@@ -148,11 +148,24 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    summary records the index digest. The `verify-published` jobs then pull that digest on
    both platforms and repeat the checks and the smoke.
 
-   The staged digests are kept for 35 days, and an approval can wait up to 30 days. If the
-   `publish` job fails because they are gone, or for any reason before it creates the tag,
-   dispatch the run again. If it fails after the tag exists, the tag is spent: do not
-   announce the version, and fix forward with a new release (see the last paragraph of
-   this section).
+   The `digest-*` artifacts hold the two staged digests. They are kept for 35 days, and an
+   approval can wait up to 30 days. If the `publish` job fails because they are gone, or
+   for any reason before it creates the tag, dispatch the run again. If it fails after the
+   tag exists, the tag is spent: do not update the quickstart pin (step 3), and fix forward
+   with a new release (see "If a published image is bad" below).
+
+   To tell which case you are in, start from the failed step. The step "Check that the
+   index holds exactly the checked digests" runs only after the tag exists. The step "Give
+   the checked digests the version tag" can fail on either side of the push, so look at
+   the tag itself (after `docker login ghcr.io`):
+
+   ```sh
+   docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z
+   ```
+
+   It prints the index when the tag exists and fails with `not found` when it does not.
+   Another dispatch is safe in both cases, because the `publish` job stops at its check
+   for an existing tag. It can only get past that check when no tag exists.
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
