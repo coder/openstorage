@@ -43,7 +43,7 @@ Standalone maintenance scripts for docs, releases, the Compose quickstart, and t
 - `[check-doc-links.py:gh_anchor]` Converts heading text to a GitHub-style anchor slug.
 - `[check-doc-links.py:ExplicitAnchors]` `HTMLParser` subclass. Collects `<a name>` and `<a id>` values into `.anchors`.
 - `[check-doc-links.py:scan_blocks]` Yields the non-code Markdown blocks of one file as numbered lines.
-- `[check-doc-links.py:markdown_blocks]` Splits numbered lines into blocks. Tracks fences, HTML comments, block quotes, and list items.
+- `[check-doc-links.py:markdown_blocks]` Splits numbered lines into blocks. Tracks fences, HTML comments, block quotes, and list items. A list item that starts with a blank line has its content one column past its marker, however many spaces follow it.
 - `[check-doc-links.py:scan_lines]` Yields `(lineno, raw, visible)` tuples, where `visible` has inline code masked. Both are split at a line feed only, so a form feed or another separator inside a line cannot move the links of the lines below it. `[check-doc-links.py:markdown_blocks]` calls a line blank, and a fence closed, only when nothing but spaces and tabs are left, as CommonMark does.
 - `[check-doc-links.py:without_inline_code]` Masks code spans in one block and keeps line and column positions.
 - `[check-doc-links.py:drop_columns]` Removes container indentation columns from a line (tabs use four-column stops).

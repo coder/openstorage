@@ -210,6 +210,10 @@ def markdown_blocks(lines):
             prefix = quote.end() if quote else item.end()
             if item and len(item.group(2)) > 4:
                 prefix -= len(item.group(2)) - 1
+            if item and not expanded[item.end():].strip(" \t\n"):
+                # An item that starts with a blank line has its content one column past the marker,
+                # however many spaces follow it.
+                prefix = item.end(1) + 1
             body = [(lineno, drop_columns(ln, prefix))]
             while index < len(lines):
                 number, continuation = lines[index]

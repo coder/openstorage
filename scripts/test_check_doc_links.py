@@ -507,6 +507,16 @@ class CitationTests(CheckerTestCase):
                 result = self.run_checker(readme)
                 self.assertEqual(result.stdout, f"BROKEN FILE {where} -> gone.md\nbroken links: 1\n")
 
+    def test_a_list_item_that_starts_with_a_blank_line_has_its_content_one_column_past_the_marker(self):
+        # CommonMark starts the content of such an item one column past its marker, however many spaces or tabs follow.
+        for name, readme in {"bullet": "-\n     [Gone](gone.md)\n", "ordered": "1.   \n\t[Gone](gone.md)\n", "tab": "-\t\n     [Gone](gone.md)\n"}.items():
+            with self.subTest(case=name):
+                result = self.run_checker(readme)
+                self.assertEqual(result.stdout, "BROKEN FILE README.md:2 -> gone.md\nbroken links: 1\n")
+        for name, readme in {"code": "-\n      [Gone](gone.md)\n", "ordered": "1.\n        [Gone](gone.md)\n", "blank": "-\n\n      [Gone](gone.md)\n"}.items():
+            with self.subTest(case=f"{name} code"):
+                self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
+
     def test_only_spaces_and_tabs_separate_a_link_destination_from_its_title(self):
         # CommonMark takes a form feed or NEL after a destination as part of the text, so the link below renders.
         for name, sep in [("ff", "\x0c"), ("nel", "\x85"), ("ls", "\u2028")]:
