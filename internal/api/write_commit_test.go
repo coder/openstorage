@@ -1232,6 +1232,50 @@ func TestDiffCommitNeverDropsAFile(t *testing.T) {
 	})
 }
 
+// TestDiffCommitAcceptsSummaryModesAsWritten: an older git prints the mode
+// of a new file as the patch wrote it (100664), and git apply --cached takes
+// that patch. A stand-in git rewrites the summary like that, and the commit
+// must still land.
+func TestDiffCommitAcceptsSummaryModesAsWritten(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	wrapper := fmt.Sprintf(`#!/bin/sh
+for a in "$@"; do
+	if [ "$a" = --summary ]; then
+		%[1]q "$@" | sed 's/ create mode 100644 / create mode 100664 /; s/ create mode 100755 / create mode 100775 /'
+		exit 0
+	fi
+done
+exec %[1]q "$@"
+`, realGit)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "base", []map[string]any{{"path": "a.txt", "content_id": "id-a", "operation": "upsert"}}, nil),
+			wctChunk("id-a", []byte("one\n"), true),
+		)))
+		wctRequireOK(t, resp, body)
+		patch := "diff --git a/loose.txt b/loose.txt\nnew file mode 100644\n--- /dev/null\n+++ b/loose.txt\n@@ -0,0 +1 @@\n+x\n" +
+			"diff --git a/run.sh b/run.sh\nnew file mode 100755\n--- /dev/null\n+++ b/run.sh\n@@ -0,0 +1 @@\n+x\n"
+		resp, body = wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok,
+			bytes.NewReader(wctLines(t, wctMeta("main", "d", nil, nil), wctDiffChunk([]byte(patch), true))))
+		wctRequireOK(t, resp, body)
+		for _, path := range []string{"loose.txt", "run.sh"} {
+			if resp, _ := e.doReq(t, http.MethodGet, "/api/v1/repos/file?path="+path+"&ref=main", readTok, nil, ""); resp.StatusCode != http.StatusOK {
+				t.Errorf("%s is not in the commit (file read answered %d)", path, resp.StatusCode)
+			}
+		}
+	})
+}
+
 // TestPatchModeError: the modes `git apply --summary` reports that no commit
 // can hold. git canonicalizes every mode, so only 040000 is outside
 // wcValidModes.
@@ -1243,12 +1287,20 @@ func TestPatchModeError(t *testing.T) {
 		{"nothing", "", ""},
 		{"a file", " create mode 100644 a.txt\n", ""},
 		{"an executable, a symlink and a submodule", " create mode 100755 a\n create mode 120000 b\n create mode 160000 c\n", ""},
+		// An older git prints the mode as the patch wrote it.
+		{"a loose file mode", " create mode 100664 a\n create mode 100777 b\n mode change 100644 => 100666 c\n", ""},
+		{"a mode with a leading zero", " create mode 0100644 a\n", ""},
 		{"a mode change", " mode change 100644 => 100755 a.txt\n", ""},
 		{"a rename, a delete and a copy", " rename a => b (100%)\n delete mode 040000 c\n copy d => e (90%)\n", ""},
 		{"a directory", " create mode 040000 dd\n", `invalid mode "040000" for "dd"`},
 		{"a directory after a file", " create mode 100644 ok\n create mode 040000 dd\n", `invalid mode "040000" for "dd"`},
 		{"a mode change to a directory", " mode change 100644 => 040000 a.txt\n", `invalid mode "040000" for "a.txt"`},
 		{"a mode change that git printed without a new mode", " mode change 100644\n", `invalid mode "" for ""`},
+		{"a directory with permission bits", " create mode 040755 dd\n", `invalid mode "040755" for "dd"`},
+		{"a fifo", " create mode 010644 a\n", `invalid mode "010644" for "a"`},
+		{"a socket", " mode change 100644 => 140755 a\n", `invalid mode "140755" for "a"`},
+		{"a mode that is not octal", " create mode 10x644 a\n", `invalid mode "10x644" for "a"`},
+		{"a mode of zero", " create mode 0 a\n", `invalid mode "0" for "a"`},
 		{"a directory name with a space", " create mode 040000 a b\n", `invalid mode "040000" for "a b"`},
 		{"no final newline", " create mode 040000 dd", `invalid mode "040000" for "dd"`},
 		// The summary does not quote a newline in a name, so a name can write

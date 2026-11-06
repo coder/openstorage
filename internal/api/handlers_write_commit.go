@@ -48,6 +48,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -928,11 +929,13 @@ func (s *server) wcParsePatch(w http.ResponseWriter, r *http.Request, sc *wcScra
 
 // wcPatchModeError reads `git apply --summary` for the modes a patch gives a
 // file: " create mode <mode> <path>" and " mode change <old> => <new>
-// <path>". git canonicalizes a mode to a regular file, a symlink, a
-// submodule or a directory, and only a directory (040000) is outside
-// wcValidModes. A name that holds a newline can put such a line into the
-// summary, which turns that patch into a 400: it fails closed, for the
-// client's own request.
+// <path>". git 2.55 prints a canonical mode (100644, 100755, 120000, 160000,
+// or 040000 for a directory), and an older git prints the mode as the patch
+// wrote it (100664). Either way git commits a regular file, a symlink or a
+// submodule, so wcSummaryModeOK reads the type bits and not the permission
+// bits. A name that holds a newline can put such a line into the summary,
+// which turns that patch into a 400: it fails closed, for the client's own
+// request.
 func wcPatchModeError(summary string) error {
 	for line := range strings.Lines(summary) {
 		line = strings.TrimSuffix(line, "\n")
@@ -945,11 +948,27 @@ func wcPatchModeError(summary string) error {
 			continue
 		}
 		mode, name, _ := strings.Cut(rest, " ")
-		if !wcValidModes[mode] {
+		if !wcSummaryModeOK(mode) {
 			return fmt.Errorf("invalid mode %q for %q", mode, name)
 		}
 	}
 	return nil
+}
+
+// wcSummaryModeOK reports whether an octal mode from `git apply --summary` has
+// the type of a file a commit can hold: a regular file, a symlink or a
+// submodule. A directory (040000) is the type that git applies to the index
+// and that write-tree then leaves out.
+func wcSummaryModeOK(mode string) bool {
+	m, err := strconv.ParseUint(mode, 8, 32)
+	if err != nil {
+		return false
+	}
+	switch m & 0o170000 {
+	case 0o100000, 0o120000, 0o160000:
+		return true
+	}
+	return false
 }
 
 // resolveTree resolves a commit sha to its tree sha.
