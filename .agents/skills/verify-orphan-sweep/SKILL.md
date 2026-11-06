@@ -56,9 +56,9 @@ A clean run ends like this:
    WriterVerifies             TRUE
    ... (23 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/orphan-sweep-check.Ab12Cd)
-   PackSweep.cfg               PASS (3950676 distinct states)
+   PackSweep.cfg               PASS (3966792 distinct states)
    NoTiming.cfg                PASS (6636617 distinct states)
-   Liveness.cfg                PASS (1138212 distinct states)
+   Liveness.cfg                PASS (1144068 distinct states)
    PurgeControl.cfg            PASS (29362 distinct states)
    PurgeSafety.cfg             PASS (2019265 distinct states)
    PurgeLiveness.cfg           PASS (305681 distinct states)
@@ -300,7 +300,7 @@ A worked example of a moved guard: moving `safeDelete`'s `s.registered(rctx, rep
 
 ## Coverage record
 
-Sync commit: `d7896ef4488ced6c2238f100f4ecea38cfb0a687` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
+Sync commit: `570f2ae5a42925894b8f01720b8136b4fb89652c` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
 | File | Covered code |
 |---|---|
