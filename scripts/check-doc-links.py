@@ -553,7 +553,7 @@ def tf_names(text):
 # masked text, so a line that ends in a string never looks like a dangling
 # `=`.
 JS_CONTINUES = re.compile(r"[=(\[,?:*/%&|^<>!~.]$"
-                          r"|(?<![\w$])(?:(?<!\.)|(?<=\.\.\.))(?:await|case|delete|extends|in|instanceof|new|of|typeof|void)$")
+                          r"|(?<![\w$])(?:(?<!\.)|(?<=\.\.\.))(?:as|await|case|delete|extends|in|instanceof|new|of|typeof|void)$")
 
 
 # JavaScript is lexed, not pattern-matched. A `/` divides after a value and

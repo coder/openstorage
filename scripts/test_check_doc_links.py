@@ -424,7 +424,7 @@ class CitationTests(CheckerTestCase):
     def test_every_javascript_continuation_ending_keeps_the_next_line_in_its_expression(self):
         endings = ["=", "(", "[", ",", "?", ":", "+", "-", "*", "/", "%", "&", "|", "^", "<", ">", "!", "~", ".",
                    "&&", "||", "??", "=>", "+-", "-+", "+++", "---", "+ ++", "- --", "= ++", "( ++", "typeof ++", "...typeof",
-                   "...new", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof", "void"]
+                   "...new", "as", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof", "void"]
         ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new", "obj.of", "a[0]++",
                             "a?.new"]
         closer = lambda op: ")" * op.count("(") + "]" * op.count("[")
@@ -522,10 +522,14 @@ class CitationTests(CheckerTestCase):
             "pkg/break_after.js": "import {\n  class as\n  k\n} from 'm';\n",
             "pkg/break_comment.js": "export {\n  let as // note\n  k\n} from 'm';\n",
             "pkg/extends_name.js": "export {\n  class as extends\n} from 'm';\n",
+            "pkg/star_var.js": "export * as\nvar from\n'm';\n",
+            "pkg/star_function.js": "export * as // note\nfunction from\n() {}\n",
+            "pkg/star_class.js": "export * as\nclass from\n'm';\n",
         }
         files = {name: source + "function after() {}\n" for name, source in files.items()}
         stale = ["[for_test.js:viaTest]", "[for_update.js:viaUpdate]", "[for_class.js:ViaClass]", "[import.js:as]",
-                 "[export.js:as]", "[var.js:as]", "[break_after.js:as]", "[break_comment.js:as]", "[extends_name.js:as]"]
+                 "[export.js:as]", "[var.js:as]", "[break_after.js:as]", "[break_comment.js:as]", "[extends_name.js:as]",
+                 "[star_var.js:from]", "[star_function.js:from]", "[star_class.js:from]"]
         result = self.check_readme(" ".join(stale + [f"[{name[4:]}:after]" for name in files]) + "\n", **files)
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in stale])
 
