@@ -213,8 +213,12 @@ A PR merges when all of these hold:
 
 1. **CI is green** — every job in `ci.yml`: `lint` (golangci-lint + docs
    checks), `terraform` (offline Terraform checks), `test` (default lane),
-   `test-local`, `test-s3wal` (S3-only storage lane), and `image` (Docker build +
-   runtime-dependency smoke test), plus the `pr-title` check. Release PRs need
+   `test-local`, `test-s3wal` (S3-only storage lane), `image` (Docker build +
+   runtime-dependency smoke test), and `orphan-sweep-fingerprints` and
+   `lane-schedule-fingerprints` (the code covered by the
+   [verify-orphan-sweep](.agents/skills/verify-orphan-sweep/SKILL.md) and
+   [verify-lane-schedule](.agents/skills/verify-lane-schedule/SKILL.md) models
+   is unchanged), plus the `pr-title` check. Release PRs need
    their held `ci` and `pr-title` runs approved; see the
    [release runbook](docs/how-to/release.md).
 2. **A clean automated review round** — comment `@codex review`. Fix genuine
