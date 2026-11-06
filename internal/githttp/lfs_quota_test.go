@@ -4486,13 +4486,27 @@ func TestLFSVerify_RepoCoalitionCannotExhaustPool(t *testing.T) {
 	}
 }
 
-// wedgedStatBlob blocks Stat until the caller's context expires — the
-// wedged-backend scenario. When after > 0, only the Nth and later Stat
-// calls wedge (earlier ones pass through).
+// wedgedStatBlob models a backend whose Stat never answers. From the
+// after-th call on (every call when after is 0) Stat records the deadline
+// of the context it got and fails with context.DeadlineExceeded at once,
+// the error that deadline would produce. A request that put no deadline on
+// that call would hang on a real wedged backend, so the tests assert the
+// recorded deadline instead of timing a wait: a wall-clock bound fails when
+// the test process stalls, and it cannot tell which context the call ran
+// under (issue #524: after a stall the lease expired before the upload, a
+// different Stat was the third call, and it waited out its own
+// 1-minute cleanup deadline).
 type wedgedStatBlob struct {
 	blob.BlobStore
-	after int
-	calls int
+	after  int
+	calls  int
+	wedged []wedgedStat
+}
+
+type wedgedStat struct {
+	at          time.Time // when Stat was called
+	deadline    time.Time
+	hasDeadline bool
 }
 
 func (b *wedgedStatBlob) Stat(ctx context.Context, key string) (int64, error) {
@@ -4500,8 +4514,29 @@ func (b *wedgedStatBlob) Stat(ctx context.Context, key string) (int64, error) {
 	if b.after > 0 && b.calls < b.after {
 		return b.BlobStore.Stat(ctx, key)
 	}
-	<-ctx.Done()
-	return 0, ctx.Err()
+	w := wedgedStat{at: time.Now()}
+	w.deadline, w.hasDeadline = ctx.Deadline()
+	b.wedged = append(b.wedged, w)
+	return 0, context.DeadlineExceeded
+}
+
+// requireBounded fails unless every wedged Stat ran under a deadline at
+// most bound after the call. A deadline made before the call, from a
+// timeout of at most bound, always satisfies that, however long the
+// process stalled in between.
+func (b *wedgedStatBlob) requireBounded(t *testing.T, bound time.Duration) {
+	t.Helper()
+	if len(b.wedged) == 0 {
+		t.Fatalf("no Stat call reached the wedged backend (%d Stat calls in all)", b.calls)
+	}
+	for i, w := range b.wedged {
+		if !w.hasDeadline {
+			t.Fatalf("wedged Stat %d ran without a deadline: a wedged backend would pin the request", i)
+		}
+		if got := w.deadline.Sub(w.at); got > bound {
+			t.Fatalf("wedged Stat %d deadline is %v after the call, want at most %v", i, got, bound)
+		}
+	}
 }
 
 // TestLFSAdoption_PostRegistrationRecheckIsBounded (Codex round 29): the
@@ -4528,17 +4563,15 @@ func TestLFSAdoption_PostRegistrationRecheckIsBounded(t *testing.T) {
 	// post-registration recheck, which wedges. (Verification and the
 	// publish sandwich go through StatFingerprint — round 77 — which
 	// this wrapper passes through.)
-	srv.Blob = &wedgedStatBlob{BlobStore: srv.Blob, after: 3}
+	wedged := &wedgedStatBlob{BlobStore: srv.Blob, after: 3}
+	srv.Blob = wedged
 
-	start := time.Now()
 	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
 		batchBody("upload", oid, int64(len(legacy)))))
 	if resp.Objects[0].Error == nil {
 		t.Fatalf("wedged-recheck adoption reported success: %+v", resp.Objects[0])
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("wedged recheck took %v — deadline not applied", elapsed)
-	}
+	wedged.requireBounded(t, lfsProbeTimeout)
 	srv.lfsStagingMu.Lock()
 	ops := srv.lfsStagingOps
 	srv.lfsStagingMu.Unlock()
@@ -4558,18 +4591,16 @@ func TestLFSPut_ProbeIsDeadlineBound(t *testing.T) {
 
 	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
 	tok := mint(auth.ScopeGitWrite)
-	srv.Blob = &wedgedStatBlob{BlobStore: srv.Blob}
+	wedged := &wedgedStatBlob{BlobStore: srv.Blob}
+	srv.Blob = wedged
 
 	content := []byte("wedged backend probe")
-	start := time.Now()
 	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
 		"basic:"+tok, string(content))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("wedged-probe PUT status = %d, want 500", w.Code)
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("wedged probe took %v — deadline not applied", elapsed)
-	}
+	wedged.requireBounded(t, lfsProbeTimeout)
 	// The op slot must be back.
 	srv.lfsStagingMu.Lock()
 	ops := srv.lfsStagingOps
@@ -4699,26 +4730,31 @@ func TestLFSPut_AmbiguousUploadFailurePreservesReservation(t *testing.T) {
 // blob.EnsurePublished's own size-scaled detached allowance (~175 minutes
 // at 10 GiB) would hold the op slot, temp file, and full staging
 // reservation far past it, letting one wedged repair monopolize the node
-// budget. A wedged verify Stat now fails the request within the lease
-// with every slot reclaimed.
+// budget. The verify Stat must carry the lease deadline, and a wedged one
+// fails the request with every slot reclaimed. The TTL is production-valid
+// (lease 54 minutes), so no stall of the test process can expire the lease
+// before the verify (issue #524).
 func TestLFSPut_WriterVerifyBoundedByLease(t *testing.T) {
-	srv, _, mint := newLFSQuotaServer(t, 1<<20, 2*time.Second) // lease ≈ 1.8s
+	srv, _, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
 	tok := mint(auth.ScopeGitWrite)
 	content := []byte("verify-wedge object")
 	oid := sha256Hex(content)
 	// Calls: 1–2 = the dedup probes of both spellings (round 78 —
 	// NotFound passes through); 3 = the post-registration writer-verify,
 	// which wedges.
-	srv.Blob = &wedgedStatBlob{BlobStore: srv.Blob, after: 3}
+	wedged := &wedgedStatBlob{BlobStore: srv.Blob, after: 3}
+	srv.Blob = wedged
 
-	start := time.Now()
 	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
 		"basic:"+tok, string(content))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("wedged-verify PUT status = %d, body %s (want 500)", w.Code, w.Body)
 	}
-	if elapsed := time.Since(start); elapsed > 30*time.Second {
-		t.Fatalf("wedged writer-verify took %v — lease not applied", elapsed)
+	wedged.requireBounded(t, srv.lfsPublicationLease())
+	// The bound alone passes a verify under any shorter context, such as
+	// the 1-minute cleanup context: require that the lease itself applies.
+	if d := wedged.wedged[0].deadline.Sub(wedged.wedged[0].at); d < srv.lfsPublicationLease()/2 {
+		t.Fatalf("wedged verify deadline is %v after the call, want the lease %v", d, srv.lfsPublicationLease())
 	}
 	srv.lfsStagingMu.Lock()
 	ops, inflight := srv.lfsStagingOps, srv.lfsStagingInFlight

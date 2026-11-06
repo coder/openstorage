@@ -9,6 +9,8 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"log"
+	"log/slog"
 	"math"
 	"path/filepath"
 	"slices"
@@ -188,6 +190,68 @@ func (f *refuseFixture) armPut(fault s3wal.PutFault, interleave func()) {
 
 func isType[E error](err error) bool { var e E; return errors.As(err, &e) }
 
+// syncBuffer is a log sink that a store's background goroutines can write
+// while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// logRecords returns the JSON log records written so far whose message
+// starts with msgPrefix.
+func (b *syncBuffer) logRecords(t *testing.T, msgPrefix string) []map[string]any {
+	t.Helper()
+	b.mu.Lock()
+	lines := bytes.Split(bytes.TrimSpace(b.buf.Bytes()), []byte("\n"))
+	b.mu.Unlock()
+	var out []map[string]any
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if msg, _ := rec["msg"].(string); strings.HasPrefix(msg, msgPrefix) {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// captureSlog replaces slog's default logger until the test ends. No test
+// that calls it may run in parallel.
+func captureSlog(t *testing.T) *syncBuffer {
+	t.Helper()
+	b := &syncBuffer{}
+	prev := slog.Default()
+	// slog.SetDefault also redirects the log package, and restoring slog's
+	// own default handler does not undo that.
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(b, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	return b
+}
+
+func TestCaptureSlogRestoresLogOutput(t *testing.T) {
+	out, flags := log.Writer(), log.Flags()
+	t.Run("capture", func(t *testing.T) { captureSlog(t) })
+	if log.Writer() != out || log.Flags() != flags {
+		t.Fatalf("log output after captureSlog = %T flags %d, want %T flags %d", log.Writer(), log.Flags(), out, flags)
+	}
+}
+
 // TestS3WALMetaRefusalMatrix is the issue #516 test matrix: every
 // before-adoption refusal class and three controls, each checked for its
 // error, the state it keeps, auth, the refresher, the metric, a later
@@ -342,6 +406,7 @@ func TestS3WALMetaQuarantineMatrix(t *testing.T) {
 				t.Fatalf("TryBeginSync = %v, %v", ok, err)
 			}
 			f.snap()
+			logs := captureSlog(t)
 			var cd *CorruptDocumentError
 			err := row.arm(f)
 			if !isType[*QuarantinedError](err) || !errors.As(err, &cd) {
@@ -354,6 +419,16 @@ func TestS3WALMetaQuarantineMatrix(t *testing.T) {
 			}
 			if got := f.state(); !got.quarantine || got.body != nil || got.etag != "" || got.view != nil {
 				t.Fatalf("quarantine kept state: %+v", got)
+			}
+			// The log line carries the cause alone: its message already says
+			// what happened, and restore_first holds the hint.
+			recs := logs.logRecords(t, "s3walmeta: quarantined")
+			if len(recs) != 1 {
+				t.Fatalf("quarantine logged %d times, want once: %v", len(recs), recs)
+			}
+			cause, _ := recs[0]["err"].(string)
+			if !strings.Contains(cause, cd.Err.Error()) || strings.Contains(cause, "s3walmeta:") || strings.Contains(cause, "restore") {
+				t.Fatalf("quarantine log err = %q, want the cause %q alone", cause, cd.Err.Error())
 			}
 			// Key lookups fail from memory: they do not wait for mu.
 			f.st.mu.Lock()
