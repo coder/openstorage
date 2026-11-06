@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
     push_run_count        integer NOT NULL DEFAULT 0,
     push_success_count    integer NOT NULL DEFAULT 0,
     default_branch_omitted boolean NOT NULL DEFAULT false,
+    default_branch_checked_success integer NOT NULL DEFAULT 0,
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 -- Upgrade path for deployments whose repo_upstreams predates the
@@ -171,6 +172,10 @@ ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_success_count integer N
 -- GitHub sync create without a default branch (issue #599): rows that
 -- predate the column keep their branch.
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS default_branch_omitted boolean NOT NULL DEFAULT false;
+-- The reconcile job (issue #609) re-requests a sync for flagged rows whose
+-- success_count passed this evidence: the success count at which a worker
+-- with the adoption rule last handled the row. Rows that predate it read 0.
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS default_branch_checked_success integer NOT NULL DEFAULT 0;
 -- Upgrade path for repos predating the purge tombstone column (issue #52).
 ALTER TABLE repos ADD COLUMN IF NOT EXISTS purged_at timestamptz;
 -- Create state (issue #388): 0 legacy, 1 pending, 2 complete. Rows that

@@ -19,6 +19,29 @@ type DefaultBranchAdopter interface {
 	AdoptDefaultBranch(ctx context.Context, repoID, branch string) (adopted bool, err error)
 }
 
+// DefaultBranchEvidence is an UpstreamStore that keeps, per flagged repo,
+// the success count at which a worker with the adoption rule last handled
+// it (issue #609). The reconcile job re-requests a sync only for a repo
+// whose success count passed that evidence, which only a worker without the
+// rule can cause. The meta adapter implements it, and only PostgreSQL
+// stores the evidence: SQLite and S3WAL run one process, so no older worker
+// can sync beside it. MemStore does not implement it.
+type DefaultBranchEvidence interface {
+	RecordDefaultBranchChecked(ctx context.Context, repoID string, successCount int) error
+}
+
+// headCheck carries one run's adoption outcome back to Worker.Run. retry is
+// set when the adoption write failed: the failure is ours, so the run
+// leaves no evidence and the reconcile job asks for another attempt.
+//
+// Only that failure retries. A lookup that fails or names no usable branch,
+// and a run that fails after the lookup, record the evidence, because the
+// upstream's host decides those outcomes. A host that could keep a
+// repository in the reconcile set would make every pass sync it again.
+type headCheck struct {
+	retry bool
+}
+
 // lsRemoteOutputCap bounds the captured `ls-remote --symref <url> HEAD`
 // output. The HEAD pattern also matches every upstream ref ending in
 // /HEAD, so the upstream controls the line count. git prints the HEAD
@@ -107,10 +130,12 @@ func parseHeadSymref(out string) (branch, reason string) {
 
 // adoptHead records branch (non-empty) as the repo's default branch. It
 // runs before the run is finished, so a repo.sync.succeeded consumer reads
-// the adopted branch. A failed write keeps the flag for a later sync.
-func (w *Worker) adoptHead(ctx context.Context, job Job, branch string) {
+// the adopted branch. A failed write keeps the flag for a later sync and
+// reports retry, so the run leaves no evidence that suppresses the
+// reconcile job's request for that sync.
+func (w *Worker) adoptHead(ctx context.Context, job Job, branch string) (retry bool) {
 	if branch == "" {
-		return
+		return false
 	}
 	a, ok := w.Upstreams.(DefaultBranchAdopter)
 	assertf(ok, "Worker.Upstreams %T returned a DefaultBranchOmitted row but cannot adopt", w.Upstreams)
@@ -120,8 +145,29 @@ func (w *Worker) adoptHead(ctx context.Context, job Job, branch string) {
 	case err != nil:
 		w.Logger.Warn("record upstream default branch failed; a later sync retries",
 			"org", job.Org, "repo", job.RepoID, "branch", branch, "err", err)
+		return true
 	case adopted:
 		w.Logger.Info("adopted the upstream default branch", "org", job.Org, "repo", job.RepoID, "branch", branch)
+	}
+	return false
+}
+
+// recordHeadChecked notes that this worker handled a flagged repo at the
+// given success count, whether or not the run succeeded, so the reconcile
+// job asks for one more sync only after a worker without the rule runs one.
+// A repo that this worker could not resolve keeps the documented rule: the
+// next successful sync tries again. A failed write is logged, and the cost
+// is one extra sync.
+func (w *Worker) recordHeadChecked(ctx context.Context, job Job, successCount int) {
+	e, ok := w.Upstreams.(DefaultBranchEvidence)
+	if !ok {
+		return
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+	defer cancel()
+	if err := e.RecordDefaultBranchChecked(rctx, job.RepoID, successCount); err != nil && !errors.Is(err, ErrNotFound) {
+		w.Logger.Warn("record default branch check failed; the reconcile job may request one more sync",
+			"org", job.Org, "repo", job.RepoID, "err", err)
 	}
 }
 

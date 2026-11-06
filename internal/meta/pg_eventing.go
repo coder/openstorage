@@ -407,6 +407,22 @@ func (s *PG) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch stri
 	return adopted, nil
 }
 
+// RecordDefaultBranchChecked notes that a worker with the adoption rule
+// handled the flagged upstream when its success count was successCount, so
+// the reconcile job skips the row until a later success raises the count
+// (issue #609). It never lowers the evidence and ignores a row that is no
+// longer flagged or no longer exists.
+func (s *PG) RecordDefaultBranchChecked(ctx context.Context, repoID string, successCount int) error {
+	assertf(repoID != "" && successCount >= 0, "RecordDefaultBranchChecked: empty repo id %q or negative count %d", repoID, successCount)
+	_, err := s.pool.Exec(ctx,
+		`UPDATE repo_upstreams SET default_branch_checked_success = GREATEST(default_branch_checked_success, $2)
+		 WHERE repo_id = $1 AND default_branch_omitted`, repoID, successCount)
+	if err != nil {
+		return fmt.Errorf("record default branch check for repo %q: %w", repoID, err)
+	}
+	return nil
+}
+
 func pgSetRepoUpstream(ctx context.Context, q pgQueryRower, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
