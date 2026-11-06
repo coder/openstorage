@@ -269,6 +269,25 @@ The `FoldsFenced` trace (17 steps) is the race the fence check closes. A repack 
 
 Two guards were broken in the model alone, and no property failed, so they have no fact. Each run used `PurgeSafety.cfg` and `PurgeLiveness.cfg`. Moving `RetireRepoPacks` after the reap loop passed both (2788323 and 449627 distinct states): the reap spares the still-registered K, the purge defers once, and the next pass completes. Letting `ReplacePacks` commit without its old rows passed both (2040748 and 304745 distinct states): a fold after `FenceRepoPurge` fails on the fence anyway, and `RetireRepoPacks` tombstones one from before it.
 
+These breaks cover the stricter fact checks, the base-key fingerprints, the reachability probe, and the eligibility and guard invariants in `PurgeSafety.cfg`. Each ran in a scratch checkout with every fact TRUE. Each Go break compiled (`go build ./internal/jobs/ ./internal/ref/ ./internal/blob/`). A break with a config ran `check.sh --only` on it, and a fingerprint break ran `--fingerprints-only` against a `model/fingerprints.txt` that held the hashes of the unbroken code:
+
+| Scratch break | Fact or check | Failed |
+|---|---|---|
+| `lockBaseLedger(ctx, tx, repo)` in place of `baseRepoOf(repo)` in PG `RegisterPacks` | `RegistrationsFenced` | `StampedClean` (`PurgeSafety.cfg`) |
+| the same, with `StampedClean` dropped from `PurgeSafety.cfg` | `RegistrationsFenced` | `NoDanglingRow` |
+| PG `casRef` reads the fence on a second transaction (`s.pool.Begin`), not on `tx` | `RefWritesFenced` | `NoDanglingRow` |
+| `lockBaseLedger(ctx, tx, repo)` in PG `ReplacePacks` | `FoldsFenced` | `NoDanglingRow` |
+| `purgeRepo` goes on after a `FenceRepoPurge` error (`_ = err` in place of the return) | `FenceFirst` | `NoDanglingRow` |
+| `purgeRepo` goes on after a `DropRepoRefs` error (`err = nil` in place of the return) | `RefsDieFirst` | `NoDanglingRow` |
+| `age < 0` in place of `age < MinRepoPurgeAge` in `purgeRepo` | `RefusesYoung` | `PurgeEligible` in `PurgeSafety.cfg` |
+| remove the `DeleteGuard` block from `PurgeRepo` | `PurgeGuarded` | `GuardRespected` in `PurgeSafety.cfg` |
+| `WriterRegister` without `RegisterPacks`, in the model | `PurgeReach.cfg` | the probe passes, and check.sh exits 2 |
+| `strings.Cut(repo, "/")` in `baseRepoOf` | fingerprint | STALE on `ledger.go:baseRepoOf` alone |
+| `QuotaRepoGroup` returns the base repository alone | fingerprint | STALE on `blob.go:QuotaRepoGroup` alone |
+| `packNamespaceSuffixes` without `"+import"` | fingerprint | STALE on `blob.go:var packNamespaceSuffixes` alone |
+| `strings.Cut(repo, "/")` in `baseOf` | fingerprint | STALE on `sweep.go:baseOf` alone |
+| `if false` in place of the `if !purgeAll` around `healQuarantineEntry`'s `PurgedRepoProbe` read | none: every fact stays TRUE | `TestSweep_ListOnlyRollbackPreservesOrphanBackups` ("list-only rollback destroyed an ordinary orphan's backup"), and the `healQuarantineEntry` fingerprint changes |
+
 A worked example of a moved guard: moving `safeDelete`'s `s.registered(rctx, repo, key)` above the delete turns `RecheckAfterDelete` FALSE, and `NoTiming.cfg` fails. Its first trace (the write registers before the sweeper's copy) does not replay, because the moved read still sees that registration. With the read modeled before the delete, TLC finds the real path: the read sees "unregistered", the write registers and verifies, and then the delete removes the bytes of a committed pack.
 
 ## Coverage record
