@@ -1,7 +1,7 @@
 package api
 
-// #587 guard: a JSON field that carries a repository path or a path glob has
-// a _base64 sibling (rawpath.go). The scan reads every struct type in the
+// #587 guard: a JSON field that carries a repository path has a _base64
+// sibling (rawpath.go). The scan reads every struct type in the
 // package's own sources, so a new such field without a sibling fails here, in
 // the PR that adds it. It does not check that a handler fills the sibling:
 // the route tests do.

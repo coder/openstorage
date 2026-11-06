@@ -115,8 +115,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   UTF-8 name holds a real U+FFFD (`a\ufffdb`, which has no sibling). A list field
   gets a list sibling of the same length and order, present when any element is not
   valid UTF-8, and it holds the base64 of every element. It repeats the whole list, so
-  an unpaged `files` listing with one invalid path grows by about the size of its
-  `paths`. The siblings are:
+  an unpaged `files` listing with one invalid path grows by about 1.33 times the size
+  of its `paths`. During a rolling upgrade a replica without the siblings sends none,
+  so a missing sibling proves nothing until every replica has them. The siblings are:
   - `files`: `entries[].path_base64`, and `paths_base64` next to `paths`. Both
     `paths` and `paths_base64` hold only the blob entries.
   - `files/metadata`: `files[].path_base64`.
