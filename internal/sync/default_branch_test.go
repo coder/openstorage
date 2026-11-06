@@ -65,8 +65,8 @@ func TestUpstreamHeadNeedsFetchedBranch(t *testing.T) {
 	testGit(t, root, "init", "--bare", mirror)
 	job := Job{Org: "o", RepoID: "repo_0123456789ab"}
 
-	if got, retry := w.upstreamHead(t.Context(), job, mirror, env, "file://"+bare); got != "" || retry {
-		t.Fatalf("HEAD with an unfetched branch = %q (retry %v), want none and no retry: the upstream answered", got, retry)
+	if got, retry := w.upstreamHead(t.Context(), job, mirror, env, "file://"+bare); got != "" || !retry {
+		t.Fatalf("HEAD with an unfetched branch = %q (retry %v), want none and a retry: the next fetch has the branch", got, retry)
 	}
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "which the fetch did not return") {
 		t.Fatalf("logs = %q, want a WARN line naming the unfetched branch", logs.String())
@@ -74,6 +74,24 @@ func TestUpstreamHeadNeedsFetchedBranch(t *testing.T) {
 	testGit(t, mirror, append([]string{"fetch", "file://" + bare}, mirrorRefspecs...)...)
 	if got, retry := w.upstreamHead(t.Context(), job, mirror, env, "file://"+bare); got != "trunk" || retry {
 		t.Fatalf("HEAD after the fetch = %q (retry %v), want trunk", got, retry)
+	}
+}
+
+// TestUpstreamHeadFinalAnswerIsNoRetry: an upstream whose HEAD names no
+// branch gave a final answer, so the run settles the repo and records its
+// evidence instead of leaving a retry for the reconcile job.
+func TestUpstreamHeadFinalAnswerIsNoRetry(t *testing.T) {
+	root := t.TempDir()
+	seedUpstream(t, root, "o", "n")
+	bare := filepath.Join(root, "o", "n.git")
+	testGit(t, bare, "symbolic-ref", "HEAD", "refs/heads/nowhere")
+	w := &Worker{AllowProtocol: "file", Logger: discardTestLogger()}
+	mirror := filepath.Join(t.TempDir(), "mirror.git")
+	testGit(t, root, "init", "--bare", mirror)
+	testGit(t, mirror, append([]string{"fetch", "file://" + bare}, mirrorRefspecs...)...)
+	job := Job{Org: "o", RepoID: "repo_0123456789ab"}
+	if got, retry := w.upstreamHead(t.Context(), job, mirror, hermeticGitEnv(w.allowProtocol()), "file://"+bare); got != "" || retry {
+		t.Fatalf("HEAD naming no branch = %q (retry %v), want none and no retry", got, retry)
 	}
 }
 

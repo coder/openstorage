@@ -32,9 +32,11 @@ type DefaultBranchEvidence interface {
 
 // headCheck carries the outcome of one run's HEAD lookup and adoption back
 // to Worker.Run. retry is set when a failure that a later attempt can cure
-// kept the run from adopting: the lookup itself failed, or the adoption
-// write did. The run then leaves no evidence, so the reconcile job asks for
-// that attempt.
+// kept the run from settling the repo's HEAD: the lookup failed, the fetch
+// lacks the branch that HEAD names, a resolved HEAD never reached the
+// adoption (a later step of the run failed), or the adoption write failed.
+// The run then leaves no evidence, so the reconcile job asks for another
+// attempt.
 type headCheck struct {
 	retry bool
 }
@@ -66,9 +68,10 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 // upstreamHead resolves the upstream HEAD branch for a repo whose create
 // named no default branch. It returns "" and logs a WARN line when the
 // HEAD cannot be used: the repo keeps its branch, the flag stays set, and
-// a later sync retries. retry is true when the lookup itself failed, which
-// a later attempt can cure, and false when the upstream gave an answer that
-// names no usable branch.
+// a later sync retries. retry is true when a later attempt can cure the
+// failure: the lookup itself failed, or the upstream named a branch that the
+// fetch did not return. It is false when the upstream gave a final answer
+// that names no usable branch.
 func (w *Worker) upstreamHead(ctx context.Context, job Job, mirror string, env []string, url string) (branch string, retry bool) {
 	// The lookup is optional: its own deadline keeps a stalled upstream
 	// from spending the run budget that the push still needs.
@@ -92,6 +95,9 @@ func (w *Worker) upstreamHead(ctx context.Context, job Job, mirror string, env [
 		// fetched head, so a fetched branch is a local branch.
 		if _, err := runGit(ctx, mirror, hermeticGitEnv(w.allowProtocol()),
 			"rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}"); err != nil {
+			// The fetch takes every branch, so the upstream moved HEAD to
+			// a new branch after it.
+			retry = true
 			reason = "the upstream HEAD names branch " + strconv.Quote(branch) + ", which the fetch did not return"
 		}
 	}

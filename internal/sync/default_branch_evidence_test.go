@@ -65,12 +65,14 @@ func (s *evidenceStore) RecordDefaultBranchChecked(_ context.Context, _ string, 
 // stays flagged, whether the run resolved no HEAD or failed, so the
 // reconcile job asks for another sync only after a worker without the rule
 // runs one. An adopted or unflagged repo needs none. A failed adoption
-// write leaves none either: the reconcile job must ask for the retry.
+// write, or a failure after the HEAD resolved and before the adoption,
+// leaves none: the reconcile job must ask for the retry.
 func TestWorkerRecordsDefaultBranchEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		flagged     bool
 		adoptErr    error
+		tokenErr    bool   // the loopback token fails after the HEAD resolved
 		head        string // upstream HEAD branch; "" leaves main
 		host        string // "" uses the seeded upstream; else a missing one
 		wantAdopted []string
@@ -80,6 +82,7 @@ func TestWorkerRecordsDefaultBranchEvidence(t *testing.T) {
 		{name: "an unresolvable HEAD", flagged: true, head: "missing", wantChecked: []int{1}},
 		{name: "a failed run", flagged: true, host: "file:///nonexistent-upstream", wantChecked: []int{0}},
 		{name: "no flag", flagged: false, head: "trunk"},
+		{name: "a failure after the HEAD resolved", flagged: true, head: "trunk", tokenErr: true},
 		{name: "a failed adoption write", flagged: true, head: "trunk", adoptErr: errors.New("transient write failure")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -92,6 +95,11 @@ func TestWorkerRecordsDefaultBranchEvidence(t *testing.T) {
 			if tc.head != "" {
 				testGit(t, bare, "symbolic-ref", "HEAD", "refs/heads/"+tc.head)
 			}
+			if tc.tokenErr {
+				f.worker.Loopback.Token = func(context.Context, string, RepoInfo, time.Duration, string) (string, error) {
+					return "", errors.New("token service down")
+				}
+			}
 			f.addLoopbackRepo(t, "repo_aa")
 			host := "file://" + f.upstreamDir
 			if tc.host != "" {
@@ -99,7 +107,7 @@ func TestWorkerRecordsDefaultBranchEvidence(t *testing.T) {
 			}
 			f.putUpstream(t, "repo_aa", "own", "proj", host)
 
-			if err := f.worker.Run(t.Context(), Job{Org: "acme", RepoID: "repo_aa"}); err != nil && tc.host == "" {
+			if err := f.worker.Run(t.Context(), Job{Org: "acme", RepoID: "repo_aa"}); err != nil && tc.host == "" && !tc.tokenErr {
 				t.Fatalf("Run: %v", err)
 			}
 			store.mu.Lock()
