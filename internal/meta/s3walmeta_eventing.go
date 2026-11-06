@@ -614,7 +614,7 @@ func (s *S3WAL) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch s
 		},
 		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
 			r, u := doc.Repos[repoID], doc.Upstreams[repoID]
-			if r == nil || r.DeletedAt != 0 || u == nil || u.Detaching || u.DefaultBranchOmitted || u.CreatedAt != linkCreatedAt {
+			if r == nil || r.DeletedAt != 0 || u == nil || u.Detaching || u.DefaultBranchOmitted {
 				return s3walMetaRerun
 			}
 			adopted = r.DefaultBranch == branch
