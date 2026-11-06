@@ -227,6 +227,10 @@ Extensions that upstream's spec does not list:
   ([HTTP API](../reference/http-api.md));
 - `GET /api/repo-urls/{repo_id}`, which upstream removed from its spec on 2026-10-05.
   It resolves a repository ID only inside the token's organization (`org:read`);
+- the `<field>_base64` sibling of each response path field (`path_base64`,
+  `paths_base64`, `old_path_base64`, `original_path_base64`, `conflict_paths_base64`),
+  present only for a path that is not valid UTF-8
+  ([path encoding](../reference/http-api.md#conventions));
 - the unauthenticated `/healthz` liveness probe.
 
 ## How drift is tracked

@@ -192,6 +192,29 @@ func rpRawSet(t *testing.T, where string, objs []map[string]any, field string) [
 	return out
 }
 
+// rpCheckPathsBase64 checks that paths and paths_base64 list the blob
+// entries, and only those, in the order of entries, with the same length.
+func rpCheckPathsBase64(t *testing.T, where string, doc map[string]any) {
+	t.Helper()
+	var blobs []string
+	for _, o := range rpObjects(t, doc, "entries") {
+		if o["type"] == "blob" {
+			blobs = append(blobs, rpRaw(t, where, o, "path"))
+		}
+	}
+	paths, _ := doc["paths"].([]any)
+	enc, ok := doc["paths_base64"].([]any)
+	if !ok || len(paths) != len(blobs) || len(enc) != len(blobs) {
+		t.Fatalf("%s: %d blob entries, %d paths, paths_base64 %v", where, len(blobs), len(paths), doc["paths_base64"])
+	}
+	for i, want := range blobs {
+		raw, err := base64.StdEncoding.DecodeString(enc[i].(string))
+		if err != nil || string(raw) != want || paths[i] != string([]rune(want)) {
+			t.Errorf("%s: paths[%d] = %q and paths_base64[%d] = %q, want the blob %q", where, i, paths[i], i, enc[i], want)
+		}
+	}
+}
+
 func TestRawPathSiblings(t *testing.T) { runBackends(t, testRawPathSiblings) }
 
 func testRawPathSiblings(t *testing.T, e *testEnv) {
@@ -217,17 +240,7 @@ func testRawPathSiblings(t *testing.T, e *testEnv) {
 			collide[0]["path_base64"] == nil || collide[0]["path_base64"] == collide[1]["path_base64"] {
 			t.Errorf("colliding entries = %v", collide)
 		}
-		paths := doc["paths"].([]any)
-		pathsB64, ok := doc["paths_base64"].([]any)
-		if !ok || len(pathsB64) != len(paths) {
-			t.Fatalf("paths_base64 = %v for %d paths", doc["paths_base64"], len(paths))
-		}
-		for i, enc := range pathsB64 {
-			raw, err := base64.StdEncoding.DecodeString(enc.(string))
-			if err != nil || string(raw) != rpRaw(t, "entries", entries[i], "path") {
-				t.Errorf("paths_base64[%d] = %q, want the base64 of entries[%d]", i, enc, i)
-			}
-		}
+		rpCheckPathsBase64(t, "files", doc)
 	})
 
 	t.Run("files paged and flat", func(t *testing.T) {
@@ -260,6 +273,8 @@ func testRawPathSiblings(t *testing.T, e *testEnv) {
 		if !slices.Contains(got, "d\xfe") {
 			t.Errorf("flat entries = %q, want the tree d<0xfe>", got)
 		}
+		// The tree d<0xfe> is in entries and in neither paths nor paths_base64.
+		rpCheckPathsBase64(t, "flat files", flat)
 	})
 
 	t.Run("files metadata", func(t *testing.T) {
