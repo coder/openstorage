@@ -381,10 +381,14 @@ func TestSweepWorkerNeverLosesTheErrorOfAPassThatEndsAsTheGraceEnds(t *testing.T
 			time.Sleep(time.Until(cancelAt))
 			cancel()
 			err := <-returned
-			time.Sleep(500 * time.Millisecond) // a late log line
+			// The pass's goroutine logs after it hands over its outcome, and a
+			// loaded host can delay it by seconds: wait for the line, and give up
+			// only when it is plainly not coming.
 			inRiver := err != nil && strings.Contains(err.Error(), msg)
-			inLog := strings.Contains(logs.String(), msg)
-			lost[i] = !inRiver && !inLog
+			for end := time.Now().Add(30 * time.Second); !inRiver && !strings.Contains(logs.String(), msg) && time.Now().Before(end); {
+				time.Sleep(25 * time.Millisecond)
+			}
+			lost[i] = !inRiver && !strings.Contains(logs.String(), msg)
 		}()
 	}
 	wg.Wait()
