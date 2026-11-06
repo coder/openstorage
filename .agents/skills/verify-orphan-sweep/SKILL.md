@@ -44,7 +44,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX")
 ```
 
 - Needs Go (the `go.mod` version), Java 11 or newer, and `curl`. The first run downloads `tla2tools.jar` 1.7.4 (sha256-pinned) into `${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla`. Set `JAVA`, `GO`, or `OPENSTORAGE_TLA_CACHE` to override.
-- It takes about 8 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), measured at a load average near 80 on a 32-CPU quota. The four `Purge*.cfg` configs take about half of that.
+- It takes 6 to 17 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), measured in three full runs on a shared host with a 32-CPU quota. The spread comes from other load on the host: each run explored the same states. No single config took more than 4 minutes. The four `Purge*.cfg` configs take a third to a half of the total.
 - `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path. With `--fingerprints-only` and no `--out`, check.sh deletes that directory on exit.
 - `--only <cfg>` runs one config, for example `--only NoTiming.cfg` or `--only PurgeSafety.cfg`. It is for quick iteration. Finish with a full run.
 - `--fingerprints-only` checks the code facts and the fingerprints without TLC or Java, in about a second. CI runs it in the `orphan-sweep-fingerprints` job of `.github/workflows/ci.yml`, so a change to covered code fails CI until someone brings the model in line and runs `check.sh --record`. CI does not run TLC: a pass says that the covered code is the code the model was checked against, not that the properties hold.
@@ -52,7 +52,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX")
 A clean run ends like this:
 
 ```text
-== Code facts (HEAD {{SHORT}})
+== Code facts (HEAD 26dfc199)
    WriterVerifies             TRUE
    ... (22 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/orphan-sweep-check.Ab12Cd)
@@ -65,7 +65,7 @@ A clean run ends like this:
    PurgeQuarantine.cfg         PASS (305681 distinct states)
    NoThresholdAssumption.cfg   fails as expected (trace: ...)
    SlowHealEntry.cfg           fails as expected (trace: ...)
-== Coverage (sync commit {{SHORT}}...)
+== Coverage (sync commit 26dfc199...)
    every covered function matches model/fingerprints.txt
 RESULT: PASS
 ```
@@ -270,7 +270,7 @@ A worked example of a moved guard: moving `safeDelete`'s `s.registered(rctx, rep
 
 ## Coverage record
 
-Sync commit: `5620494ca88650825618a0bbb731000ee586bb8f` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
+Sync commit: `26dfc1999ecd1e3b421565be35e7412669428317` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
 | File | Covered code |
 |---|---|
