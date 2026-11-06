@@ -172,6 +172,29 @@ update that would record intent instead of accepting it without the
 intent ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
 amendment).
 
+**Amendment: PostgreSQL requeues lanes that lost their job.** River's job
+rescue (above) covers a crashed job only until its third attempt. Then
+River discards the job. An operator can also delete job rows, and a
+process can die or a job insert can fail after a request's mark
+(pull-upstream, push-upstream and the forward poke mark first). The
+upstream row can keep `push_pending`, `sync_pending` or an expired claim
+with no job to run it. Each PostgreSQL serve replica therefore scans the
+served organization's live repositories every five minutes, the first time
+15 seconds after boot, for lanes whose claim guard holds: a pending request
+with no claim, or an expired claim, which holds the request it consumed.
+A lapsed legacy claim counts only with the steal opt-in. For each lane it
+inserts the job that `EnqueuePush` or `EnqueueSync` inserts. River turns
+that insert into a no-op while a live job covers the lane, so every replica
+can scan. A new job is kept only if the lane still has work after the
+insert, in the same transaction, so a run that consumed the work in between
+gets no second run. A pass reads up to 1,000 lanes per query in
+repository-ID order and ends within 30 seconds. A lane whose insert waits
+more than five seconds on a locked job row is skipped until the next
+traversal. No index covers the lane
+guards, so each query costs time in proportion to the number of linked
+repositories, whatever the page size. The scan inserts only the existing
+job kinds, so older replicas run its jobs during a rolling upgrade.
+
 **Egress.** The push targets exactly the `CloneURL` the inbound fetch
 already dials — a host validated at link time (`validUpstreamHost`,
 provider defaults) — under the same hermetic git environment and

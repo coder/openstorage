@@ -592,6 +592,16 @@ the elected leader, so set those intervals the same on every replica. What the j
 how to read their reports, and delete-mode prerequisites: see the
 [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 
+An upstream sync or push request can lose its River job while the repository's upstream
+row still holds it: River discards a job after its third crashed attempt, an operator can
+delete job rows, and a replica can die or fail to insert the job right after it recorded
+the request. Every replica scans for such requests every five minutes, the first time 15
+seconds after boot, and enqueues the job again. Each requeue logs
+`lane scan: requeued a lane whose work had no job` with the `org`, `repo` and `lane`
+(`push` or `pull`) fields. The first scan after an upgrade to a release with the scan also
+runs requests that were stranded before it, and each of those runs emits its usual
+webhook events.
+
 ## What to monitor
 
 | Signal | Why |
@@ -602,6 +612,7 @@ how to read their reports, and delete-mode prerequisites: see the
 | `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
 | `commit-graph refresh outcome=…` log lines | A `repo=` that repeats `lock_held`, `timed_out`, or `failed` needs a look ([outcomes and stale-lock runbook](#commit-graph-refresh)) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
+| `lane scan: requeued a lane whose work had no job` log line | A sync or push request lost its job and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
 the mapping below says which ones remain log-only.
@@ -625,6 +636,7 @@ text appended after it is not part of the contract.
 | `repack: folded packs` / `repack trigger: scheduled fold` (What to monitor) | `openstorage_job_runs_total{job="repack"}` | Fold outcomes only; trigger lines stay **log only** |
 | Pack quota exceeded (What to monitor) | **log only** | Client-visible hook error plus the `quota: receive-pack … at/over quota` server line |
 | Postgres availability and advisory-lock waits (What to monitor) | **log only** | Observe PostgreSQL itself (`pg_locks`) |
+| `lane scan: requeued a lane whose work had no job` (What to monitor) | **log only** | Fields `org`, `repo` and `lane` |
 | S3WAL `… conditional-write contention retries exhausted` (S3WAL signals) | `openstorage_s3wal_cas_contention_exhausted_total` by `scope` | Serve-process mutations only; push-side failures reach the client and hook stderr |
 | `WARN s3wal manifest approaching size cap` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="warn"}` | Counts when the once-per-repository warning is logged |
 | S3WAL `manifest would grow to … refusing new registrations` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="refuse"}` | Serve-process refusals only |
