@@ -31,6 +31,12 @@ const hookErrorsName = "hook-errors"
 // per update hook.
 const maxLoggedHookErrors = 100
 
+// maxHookErrorsBytes bounds the hook-errors file on disk for the same
+// reason. A hook drops each record once the file has reached it (git runs
+// a push's hooks one after another, so the file overshoots by at most one
+// record), and serve logs that it dropped some.
+const maxHookErrorsBytes = 1 << 20
+
 // NewHookLogHandler returns the slog handler of a hook process. stderr
 // (which reaches the pusher) gets each record without its error-valued
 // attributes. The hook-errors file (EnvHookErrors) gets the whole record.
@@ -117,14 +123,15 @@ func withoutErrors(a slog.Attr) (slog.Attr, bool) {
 }
 
 // hookErrorsWriter appends each write to the hook-errors file at its path.
-// It writes only to an existing regular file: it never creates one, and it
-// does not follow a symlink. The file lives in serve's private 0700 state
-// directory, so no other user can swap it between the check and the open.
-// A write that cannot reach the file is dropped.
+// It writes only to an existing regular file below maxHookErrorsBytes: it
+// never creates one, and it does not follow a symlink. The file lives in
+// serve's private 0700 state directory, so no other user can swap it
+// between the check and the open. A write that cannot reach the file is
+// dropped.
 type hookErrorsWriter string
 
 func (w hookErrorsWriter) Write(b []byte) (int, error) {
-	if fi, err := os.Lstat(string(w)); err != nil || !fi.Mode().IsRegular() {
+	if fi, err := os.Lstat(string(w)); err != nil || !fi.Mode().IsRegular() || fi.Size() >= maxHookErrorsBytes {
 		return len(b), nil
 	}
 	f, err := os.OpenFile(string(w), os.O_WRONLY|os.O_APPEND, 0)
@@ -180,5 +187,8 @@ func logHookErrors(prefix, path string) {
 	}
 	if dropped > 0 {
 		log.Printf("%s: hook: %d more records not logged", prefix, dropped)
+	}
+	if fi.Size() >= maxHookErrorsBytes {
+		log.Printf("%s: hook: the hooks dropped the records past %d bytes", prefix, maxHookErrorsBytes)
 	}
 }

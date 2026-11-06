@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http/httptest"
@@ -140,6 +141,36 @@ func TestLogHookErrorsBoundsOnePush(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "receive-pack r1: hook: 5 more records not logged") {
 		t.Fatalf("serve's log lacks the count of the rest: %s", logs)
+	}
+	if strings.Contains(logs.String(), "dropped the records past") {
+		t.Fatalf("serve reports dropped records for a small file: %s", logs)
+	}
+}
+
+// The hooks stop writing records once the hook-errors file holds
+// maxHookErrorsBytes, and serve logs that they dropped some.
+func TestHookErrorsFileBoundsItsSize(t *testing.T) {
+	path, err := createHookErrors(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvHookErrors, path)
+	logger := slog.New(NewHookLogHandler(io.Discard, nil))
+	detail := strings.Repeat("x", 1000)
+	for range 2 * maxHookErrorsBytes / len(detail) {
+		logger.Error("hook eventing unavailable: open meta store", "err", errors.New(detail))
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() < maxHookErrorsBytes || fi.Size() > maxHookErrorsBytes+2*int64(len(detail)) {
+		t.Fatalf("the hook-errors file holds %d bytes; want %d plus at most one record", fi.Size(), maxHookErrorsBytes)
+	}
+	logs := captureServeLog(t)
+	logHookErrors("receive-pack r1", path)
+	if !strings.Contains(logs.String(), fmt.Sprintf("receive-pack r1: hook: the hooks dropped the records past %d bytes", maxHookErrorsBytes)) {
+		t.Fatalf("serve's log does not say that records were dropped: %s", logs)
 	}
 }
 
