@@ -35,5 +35,6 @@ the local schedule the hook records it before the CAS
 with no intent and no events, and a failed step does not prove that the CAS would fail
 too. So when the hook cannot build the secrets codec, open the meta store, or build
 the River insert-only client, it refuses every update that would record forward
-intent before its CAS, and the client can push again. Ephemeral updates and a sync
-run's own loopback push record no intent, and they keep the fail-open stance.
+intent before its CAS, and the client can push again. Ephemeral updates, a sync
+run's own loopback push, and a caller whose token may not forward record no intent,
+and they keep the fail-open stance.

@@ -485,20 +485,24 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	// disabled ends a wiring that failed. The eventless default would
 	// accept a push with no forward intent and no events: on PostgreSQL the
 	// CAS records the intent (newPGEventsStore), and on the local schedule
-	// BeforeCAS does, and neither runs without eventing. A failed step does
-	// not prove the CAS fails too (the database can be back by then). So
-	// the hook refuses every update that would record intent before its
-	// CAS, and the client can push again. Ephemeral updates and a sync
-	// run's own loopback push record no intent, and they keep failing open,
-	// as when the local schedule's metadata store does not open (below).
+	// BeforeCAS does (ADR-50 amendment), and neither runs without eventing.
+	// A failed step does not prove the CAS fails too (the database can be
+	// back by then). So the hook refuses every update that would record
+	// intent before its CAS, and the client can push again. Updates that
+	// record no intent even with eventing keep failing open (eventless):
+	// ephemeral updates, a sync run's own loopback push (its claim fence
+	// refuses it when the store is down), and a caller whose token may not
+	// forward.
 	disabled := func(stage string, err error) func() {
-		logger.Error("hook eventing disabled: "+stage, "err", err)
 		cleanup()
-		if envconfig.Getenv(githttp.EnvSyncClaim) == "" {
-			refusal := fmt.Errorf("refusing the ref update: hook eventing unavailable (%s): %w", stage, err)
-			githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
-				return intentlessRefStore{RefStore: st, refusal: refusal}, nil
-			}
+		if envconfig.Getenv(githttp.EnvSyncClaim) != "" || hookCallerDeniedForward() {
+			logger.Error("hook eventing disabled: "+stage, "err", err)
+			return func() {}
+		}
+		logger.Error("hook refuses ref updates: "+stage, "err", err)
+		refusal := fmt.Errorf("refusing the ref update: hook eventing unavailable (%s): %w", stage, err)
+		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
+			return intentlessRefStore{RefStore: ref.IdempotentCAS{RefStore: st}, refusal: refusal}, nil
 		}
 		return func() {}
 	}
@@ -517,20 +521,6 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 
 	// Hooks never run DDL: meta.Open without InitSchema (serve owns it).
 	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))
-	if err != nil && !isPGURL(dbURL) && envconfig.Getenv(githttp.EnvSyncClaim) == "" {
-		// The local schedule records the push's forward intent before
-		// the CAS (ADR-50 amendment): without the store it cannot, so an
-		// update that would record intent is refused rather than accepted
-		// with none. Ephemeral updates and a sync run's own loopback push
-		// record no intent, so they keep failing open, as on a failed
-		// read (the loopback push's claim fence refuses it anyway).
-		logger.Error("hook refuses ref updates: open meta store", "err", err)
-		refusal := fmt.Errorf("refusing the ref update: open metadata store: %w", err)
-		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
-			return intentlessRefStore{RefStore: st, refusal: refusal}, nil
-		}
-		return func() {}
-	}
 	if err != nil {
 		return disabled("open meta store", err)
 	}
@@ -650,10 +640,11 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	return cleanup
 }
 
-// intentlessRefStore is the hook's ref store when the hook cannot record
-// forward intent: the local schedule's metadata store does not open, or the
-// hook's eventing could not be wired. It refuses every update that would
-// record forward intent, and passes ephemeral updates through.
+// intentlessRefStore is the hook's ref store when its eventing could not be
+// wired, so it cannot record forward intent. It refuses every update that
+// would record intent, and passes ephemeral updates through to its inner
+// store (ref.IdempotentCAS over the hook's store, as on the eventless
+// default).
 type intentlessRefStore struct {
 	ref.RefStore
 	refusal error

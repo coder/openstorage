@@ -66,6 +66,10 @@ func hookEventingEnv(t *testing.T, metaURL string) *bytes.Buffer {
 	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
 	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	// A caller whose token may forward: the hook records intent for it.
+	t.Setenv(githttp.EnvScopes, `["git:read","git:write"]`)
+	t.Setenv(githttp.EnvRefsPolicy, "")
+	t.Setenv(githttp.EnvOps, "")
 	original := githttp.WrapHookRefStore
 	t.Cleanup(func() { githttp.WrapHookRefStore = original })
 	return new(bytes.Buffer)
@@ -200,7 +204,7 @@ func TestHookEventingRefusesUnopenableLocalSchedule(t *testing.T) {
 			won, _, err := wrapped.CASRefGen(t.Context(), tc.repo, tc.ref, ref.ZeroSHA, sha)
 			got, gerr := rs.GetRef(t.Context(), tc.repo, tc.ref)
 			if tc.refused {
-				if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update: open metadata store") || !errors.Is(gerr, ref.ErrNotFound) {
+				if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update: hook eventing unavailable (open meta store)") || !errors.Is(gerr, ref.ErrNotFound) {
 					t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update refused before its CAS", won, err, got, gerr)
 				}
 				if !strings.Contains(logs.String(), "hook refuses ref updates: open meta store") {
@@ -220,19 +224,22 @@ func TestHookEventingRefusesUnopenableLocalSchedule(t *testing.T) {
 // eventless default would accept the push with no intent and no events,
 // and a failed step does not prove that the CAS fails too (the database
 // can be back by then). Updates that record no intent keep failing open:
-// ephemeral updates, and a sync run's own loopback push.
+// ephemeral updates, a sync run's own loopback push, and a caller whose
+// token may not forward. Every store the hook gets keeps ref.IdempotentCAS.
 func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	for _, tc := range []struct {
-		name, backend, mode, repo, ref, claim, wantLog string
-		refused                                        bool
+		name, backend, mode, scopes, repo, ref, claim, stage string
+		refusing                                             bool // the hook installs the refusing store
 	}{
-		{name: "pg open fails", backend: "pg", repo: "repo-1", ref: "refs/heads/main", wantLog: "hook eventing disabled: open meta store", refused: true},
-		{name: "pg secrets config invalid", backend: "pg", mode: "bogus", repo: "repo-1", ref: "refs/heads/main", wantLog: "hook eventing disabled: secrets key", refused: true},
-		{name: "local secrets config invalid", backend: "sqlite", mode: "bogus", repo: "repo-1", ref: "refs/heads/main", wantLog: "hook eventing disabled: secrets key", refused: true},
-		{name: "pg ephemeral namespace", backend: "pg", repo: "repo-1", ref: "refs/namespaces/ephemeral/refs/heads/main", wantLog: "hook eventing disabled: open meta store"},
-		{name: "pg sync loopback", backend: "pg", repo: "repo-1", ref: "refs/heads/main", claim: "holder", wantLog: "hook eventing disabled: open meta store"},
-		{name: "local secrets sync loopback", backend: "sqlite", mode: "bogus", repo: "repo-1", ref: "refs/heads/main", claim: "holder", wantLog: "hook eventing disabled: secrets key"},
+		{name: "pg open fails", backend: "pg", repo: "repo-1", ref: "refs/heads/main", stage: "open meta store", refusing: true},
+		{name: "pg secrets config invalid", backend: "pg", mode: "bogus", repo: "repo-1", ref: "refs/heads/main", stage: "secrets key", refusing: true},
+		{name: "local secrets config invalid", backend: "sqlite", mode: "bogus", repo: "repo-1", ref: "refs/heads/main", stage: "secrets key", refusing: true},
+		{name: "pg ephemeral namespace", backend: "pg", repo: "repo-1", ref: "refs/namespaces/ephemeral/refs/heads/main", stage: "open meta store", refusing: true},
+		{name: "pg sync loopback", backend: "pg", repo: "repo-1", ref: "refs/heads/main", claim: "holder", stage: "open meta store"},
+		{name: "local secrets sync loopback", backend: "sqlite", mode: "bogus", repo: "repo-1", ref: "refs/heads/main", claim: "holder", stage: "secrets key"},
+		{name: "pg write-only token", backend: "pg", scopes: `["git:write"]`, repo: "repo-1", ref: "refs/heads/main", stage: "open meta store"},
+		{name: "local write-only token", backend: "sqlite", mode: "bogus", scopes: `["git:write"]`, repo: "repo-1", ref: "refs/heads/main", stage: "secrets key"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			metaURL := "sqlite://" + filepath.Join(t.TempDir(), "meta.db")
@@ -248,6 +255,9 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 			logs := hookEventingEnv(t, metaURL)
 			t.Setenv(envSecretsMode, tc.mode)
 			t.Setenv(githttp.EnvSyncClaim, tc.claim)
+			if tc.scopes != "" {
+				t.Setenv(githttp.EnvScopes, tc.scopes)
+			}
 			cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
 			defer cleanup()
 			rs := hookRefStore(t)
@@ -255,13 +265,24 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 			if err != nil {
 				t.Fatalf("WrapHookRefStore: %v", err)
 			}
+			if _, ok := wrapped.(ref.IdempotentCAS); !ok {
+				if is, ok := wrapped.(intentlessRefStore); !ok || is.RefStore != (ref.IdempotentCAS{RefStore: rs}) {
+					t.Fatalf("hook store = %T, want ref.IdempotentCAS over the hook's store, or intentlessRefStore over that", wrapped)
+				}
+			}
+			// The refusing store still accepts an ephemeral update.
+			intentful := !strings.HasPrefix(tc.ref, "refs/namespaces/ephemeral/")
 			won, _, err := wrapped.CASRefGen(t.Context(), tc.repo, tc.ref, ref.ZeroSHA, sha)
 			got, gerr := rs.GetRef(t.Context(), tc.repo, tc.ref)
-			if !strings.Contains(logs.String(), tc.wantLog) {
-				t.Fatalf("missing %q log: %s", tc.wantLog, logs)
+			wantLog := "hook eventing disabled: " + tc.stage
+			if tc.refusing {
+				wantLog = "hook refuses ref updates: " + tc.stage
 			}
-			if tc.refused {
-				if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update: hook eventing unavailable") || !errors.Is(gerr, ref.ErrNotFound) {
+			if !strings.Contains(logs.String(), wantLog) {
+				t.Fatalf("missing %q log: %s", wantLog, logs)
+			}
+			if tc.refusing && intentful {
+				if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update: hook eventing unavailable ("+tc.stage+")") || !errors.Is(gerr, ref.ErrNotFound) {
 					t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update refused before its CAS", won, err, got, gerr)
 				}
 				return
