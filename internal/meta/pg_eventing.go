@@ -409,9 +409,9 @@ func (s *PG) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch stri
 
 // RecordDefaultBranchChecked notes that a worker with the adoption rule
 // handled the flagged upstream when its success count was successCount, so
-// the reconcile job skips the row until a later success raises the count
-// (issue #609). It never lowers the evidence and ignores a row that is no
-// longer flagged or no longer exists.
+// DefaultBranchReconcileCandidates skips the row until a later success
+// raises the count (issue #609). It never lowers the evidence and ignores a
+// row that is no longer flagged or no longer exists.
 func (s *PG) RecordDefaultBranchChecked(ctx context.Context, repoID string, successCount int) error {
 	assertf(repoID != "" && successCount >= 0, "RecordDefaultBranchChecked: empty repo id %q or negative count %d", repoID, successCount)
 	_, err := s.pool.Exec(ctx,
@@ -421,6 +421,50 @@ func (s *PG) RecordDefaultBranchChecked(ctx context.Context, repoID string, succ
 		return fmt.Errorf("record default branch check for repo %q: %w", repoID, err)
 	}
 	return nil
+}
+
+// DefaultBranchReconcileRepo names one repository that waits for its
+// default branch and whose last successful sync no upgraded worker handled.
+type DefaultBranchReconcileRepo struct {
+	Org    string
+	RepoID string
+}
+
+// PGDefaultBranchReconcileCandidates returns up to limit flagged, live
+// repositories that an older worker synced successfully (success_count
+// passed the evidence) and that have no run or request in flight. It locks
+// each upstream row in tx, skipping rows another transaction holds, so
+// the caller's request and job insert cannot race a claim: the same rows
+// are re-checked under the lock (issue #609).
+func PGDefaultBranchReconcileCandidates(ctx context.Context, tx pgx.Tx, limit int) ([]DefaultBranchReconcileRepo, error) {
+	assertf(tx != nil && limit > 0, "PGDefaultBranchReconcileCandidates: nil tx or limit %d", limit)
+	rows, err := tx.Query(ctx,
+		`SELECT u.repo_id, o.name
+		   FROM repo_upstreams u
+		   JOIN repos r ON r.repo_id = u.repo_id
+		   JOIN orgs o ON o.id = r.org_id
+		  WHERE u.default_branch_omitted AND r.deleted_at IS NULL
+		    AND u.success_count > u.default_branch_checked_success
+		    AND NOT u.syncing AND NOT u.sync_pending
+		  ORDER BY u.repo_id
+		  LIMIT $1
+		    FOR UPDATE OF u SKIP LOCKED`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list default branch reconcile candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []DefaultBranchReconcileRepo
+	for rows.Next() {
+		var c DefaultBranchReconcileRepo
+		if err := rows.Scan(&c.RepoID, &c.Org); err != nil {
+			return nil, fmt.Errorf("scan default branch reconcile candidate: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list default branch reconcile candidates: %w", err)
+	}
+	return out, nil
 }
 
 func pgSetRepoUpstream(ctx context.Context, q pgQueryRower, up RepoUpstream) (RepoUpstream, error) {

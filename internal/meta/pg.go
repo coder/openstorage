@@ -176,6 +176,8 @@ ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS default_branch_omitted boole
 -- success_count passed this evidence: the success count at which a worker
 -- with the adoption rule last handled the row. Rows that predate it read 0.
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS default_branch_checked_success integer NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS repo_upstreams_default_branch_omitted_idx
+    ON repo_upstreams (repo_id) WHERE default_branch_omitted;
 -- Upgrade path for repos predating the purge tombstone column (issue #52).
 ALTER TABLE repos ADD COLUMN IF NOT EXISTS purged_at timestamptz;
 -- Create state (issue #388): 0 legacy, 1 pending, 2 complete. Rows that

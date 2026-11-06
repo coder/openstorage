@@ -237,6 +237,99 @@ func (w *absenceReconcileWorker) Work(ctx context.Context, _ *river.Job[absenceR
 	return err
 }
 
+// defaultBranchQueue is the reserved single-worker River queue that the
+// default-branch reconcile job runs on (issue #609). Only replicas that run
+// the job work it, so a replica without it never fetches the job and cannot
+// discard the unknown kind, and the job never waits behind tenant-scalable
+// default-queue work.
+const defaultBranchQueue = "default_branch_reconcile"
+
+const (
+	// defaultBranchReconcileInterval is the periodic job's cadence.
+	defaultBranchReconcileInterval = 10 * time.Minute
+	// defaultBranchReconcileBatch bounds the syncs one pass requests.
+	defaultBranchReconcileBatch = 100
+	// defaultBranchReconcileTimeout bounds one pass: one short transaction.
+	defaultBranchReconcileTimeout = 5 * time.Minute
+)
+
+// defaultBranchReconcileArgs is one periodic pass that requests a sync for
+// each flagged repository whose last successful sync an older worker ran
+// (issue #609). It is unique across the active states like the other
+// periodic passes, and MaxAttempts 1 because the next tick is the retry.
+type defaultBranchReconcileArgs struct{}
+
+func (defaultBranchReconcileArgs) Kind() string { return "default_branch_reconcile" }
+
+func (defaultBranchReconcileArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue:       defaultBranchQueue,
+		MaxAttempts: 1,
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+			ByState: []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRetryable,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			},
+		},
+	}
+}
+
+type defaultBranchReconcileWorker struct {
+	river.WorkerDefaults[defaultBranchReconcileArgs]
+	pool   *pgxpool.Pool
+	logger *slog.Logger
+}
+
+func (*defaultBranchReconcileWorker) Timeout(*river.Job[defaultBranchReconcileArgs]) time.Duration {
+	return defaultBranchReconcileTimeout
+}
+
+func (w *defaultBranchReconcileWorker) Work(ctx context.Context, _ *river.Job[defaultBranchReconcileArgs]) error {
+	n, err := reconcileDefaultBranches(ctx, w.pool, river.ClientFromContext[pgx.Tx](ctx))
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		w.logger.Info("requested a sync for repositories that wait for their default branch", "repos", n)
+	}
+	return nil
+}
+
+// reconcileDefaultBranches requests one sync for each of up to
+// defaultBranchReconcileBatch flagged repositories whose success count passed
+// the evidence of a worker with the adoption rule. Each request and its job
+// insert commit together, as CompleteSyncCreate's do. A repo that a worker
+// with the rule syncs next either adopts, which clears the flag, or records
+// the evidence, which ends the requests until a later success: a run by an
+// older worker is the only way back into the set.
+func reconcileDefaultBranches(ctx context.Context, pool *pgxpool.Pool, client *river.Client[pgx.Tx]) (int, error) {
+	n := 0
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		repos, err := meta.PGDefaultBranchReconcileCandidates(ctx, tx, defaultBranchReconcileBatch)
+		if err != nil {
+			return err
+		}
+		for _, r := range repos {
+			if err := meta.PGRequestSync(ctx, tx, r.RepoID); err != nil {
+				return err
+			}
+			if _, err := client.InsertTx(ctx, tx, syncArgs{Org: r.Org, RepoID: r.RepoID}, nil); err != nil {
+				return err
+			}
+		}
+		n = len(repos)
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("jobs: reconcile default branches: %w", err)
+	}
+	return n, nil
+}
+
 // repackArgs is one durable background-repack job, unique per repo across
 // the active states exactly like syncArgs: post-write triggers on every
 // node can fire concurrently, and River coalesces them into one job.
@@ -839,6 +932,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	river.AddWorker(workers, &sweepWorker{schedule: sweep})
 	river.AddWorker(workers, &lfsReclaimWorker{schedule: lfsReclaim})
 	river.AddWorker(workers, &absenceReconcileWorker{schedule: absence})
+	river.AddWorker(workers, &defaultBranchReconcileWorker{pool: pool, logger: logger})
 	var periodic []*river.PeriodicJob
 	if sweep != nil {
 		periodic = append(periodic, river.NewPeriodicJob(
@@ -872,7 +966,23 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 			&river.PeriodicJobOpts{RunOnStart: true},
 		))
 	}
+	// The reconcile job needs the evidence that only an upstream store with
+	// the adoption rule keeps: without it the job would loop on every repo
+	// an older worker synced.
+	_, reconcileDefaultBranch := upstreams.(sync.DefaultBranchEvidence)
+	if reconcileDefaultBranch {
+		periodic = append(periodic, river.NewPeriodicJob(
+			river.PeriodicInterval(defaultBranchReconcileInterval),
+			func() (river.JobArgs, *river.InsertOpts) { return defaultBranchReconcileArgs{}, nil },
+			// RunOnStart like the other passes: unique opts coalesce
+			// concurrent inserts, and a pass only re-requests syncs.
+			&river.PeriodicJobOpts{RunOnStart: true},
+		))
+	}
 	queues := map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 8}}
+	if reconcileDefaultBranch {
+		queues[defaultBranchQueue] = river.QueueConfig{MaxWorkers: 1}
+	}
 	if absence != nil {
 		// Reserved queue — see absenceQueue: cover renewal is TTL-coupled
 		// and must not wait behind tenant-scalable default-queue work.
