@@ -12,9 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"sync"
@@ -739,6 +739,6 @@ func (h *hookUpstreamRow) GetRepoUpstream(ctx context.Context, repoID string) (m
 // client prefixed with "remote:", so it is warn-level and carries no error
 // values: githttp.NewHookLogHandler writes those only to serve's
 // hook-errors file.
-func slogForHook() *slog.Logger {
-	return slog.New(githttp.NewHookLogHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+func slogForHook(stderr io.Writer) *slog.Logger {
+	return slog.New(githttp.NewHookLogHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 }

@@ -15,7 +15,7 @@ func TestPushHookEnvStripsBothPrefixes(t *testing.T) {
 	for _, name := range []string{
 		EnvRepo, EnvOrg, EnvPackQuota, EnvPackReservationTTL,
 		EnvAtomic, EnvUsageFloor, EnvVerifyState, EnvVerifySigBudget,
-		EnvSyncClaim, EnvScopes, EnvRefsPolicy, EnvOps, EnvPushHold,
+		EnvSyncClaim, EnvScopes, EnvRefsPolicy, EnvOps, EnvPushHold, EnvHookErrors,
 	} {
 		legacy := strings.Replace(name, "OPENSTORAGE_", "CODESTORAGE_", 1)
 		// Duplicates too: neither generation of hook may inherit authority.

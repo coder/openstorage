@@ -393,3 +393,18 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 		}
 	}
 }
+
+// The hook's logger keeps error values off stderr, which git relays to the
+// pusher, and writes them to serve's hook-errors file.
+func TestSlogForHookKeepsErrorsOffStderr(t *testing.T) {
+	hookEventingEnv(t, "")
+	canary := "canary-" + rand.Text()
+	var stderr bytes.Buffer
+	slogForHook(&stderr).Error("hook eventing unavailable: open meta store", "err", errors.New("dial "+canary))
+	if !strings.Contains(stderr.String(), "hook eventing unavailable: open meta store") || strings.Contains(stderr.String(), canary) {
+		t.Fatalf("stderr = %q; want the message without the canary", stderr.String())
+	}
+	if n := strings.Count(hookErrorRecords(t), canary); n != 1 {
+		t.Fatalf("the hook-errors file names the canary %d times, want 1", n)
+	}
+}
