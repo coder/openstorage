@@ -881,6 +881,30 @@ func WithSyncClaimFence(ctx context.Context, repo, holder string) context.Contex
 	return context.WithValue(ctx, syncClaimFenceKey{}, syncClaimFence{repo: repo, holder: holder})
 }
 
+// casTxHookKey carries an optional CASTxHook to the PostgreSQL CAS through
+// the context, like the sync-claim fence above, so every decorator passes
+// it on untouched.
+type casTxHookKey struct{}
+
+// CASTxHook adds writes to a PostgreSQL CAS that changes a row. InTx runs
+// in the CAS transaction, after the swap statement and before COMMIT, so
+// its writes commit exactly when the swap does. An InTx error rolls the
+// swap back, and the CAS fails with that error, marked as never executed.
+// Committed, when set, runs once the transaction is known to have
+// committed, before the CAS returns: after COMMIT succeeds, or after
+// txid_status confirms a COMMIT whose reply was lost (see casRef).
+type CASTxHook struct {
+	InTx      func(ctx context.Context, tx pgx.Tx) error
+	Committed func()
+}
+
+// WithCASTxHook makes every PostgreSQL CAS under the returned context run
+// hook. The other backends ignore it.
+func WithCASTxHook(ctx context.Context, hook CASTxHook) context.Context {
+	assertf(hook.InTx != nil, "WithCASTxHook: nil InTx")
+	return context.WithValue(ctx, casTxHookKey{}, hook)
+}
+
 // casFence extracts the sync-claim fence, verifying it targets this repo.
 func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 	f, ok := ctx.Value(syncClaimFenceKey{}).(syncClaimFence)
@@ -899,10 +923,12 @@ func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 // (the base-ledger lock and the purge-fence read below), so the statement
 // remains the single mutation unit and the IdempotentCAS ambiguity
 // classification (idempotent.go) is unchanged: pre-statement failures are
-// tagged notExecuted, statement failures classify exactly as before, and a
-// lost COMMIT response stays ambiguous (recovered by the recheck). A won
-// swap also bumps the repo generation via the InitSchema-installed
-// deferred constraint trigger at commit.
+// tagged notExecuted, and statement failures classify exactly as before. A
+// COMMIT error of a swap that changed a row is resolved with txid_status
+// (see commitStatus): committed is a win, aborted is definitive, and an
+// outcome PostgreSQL cannot confirm is ambiguous (recovered by the
+// recheck). A won swap also bumps the repo generation via the
+// InitSchema-installed deferred constraint trigger at commit.
 //
 // The transaction takes the base-ledger advisory lock first and rejects
 // purge-fenced repos with ErrRepoPurged (issue #52, PR #105 security
@@ -1016,6 +1042,20 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 	}
 	n := ct.RowsAffected()
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
+	var xid int64 // the transaction's id, to resolve a failed COMMIT
+	if n == 1 {
+		if xerr := tx.QueryRow(ctx, `SELECT txid_current()`).Scan(&xid); xerr != nil {
+			return false, 0, fmt.Errorf("cas %s %s/%s: txid: %w", tag, repo, name, notExecuted(xerr))
+		}
+	}
+	hook, hooked := ctx.Value(casTxHookKey{}).(CASTxHook)
+	hooked = hooked && n == 1
+	if hooked {
+		// Before the generation row, which stays the last lock taken.
+		if herr := hook.InTx(ctx, tx); herr != nil {
+			return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, notExecuted(herr))
+		}
+	}
 	if wantGen && n == 1 {
 		// Exact attribution under the deferred bump trigger: the
 		// generation row is locked HERE (created first if virgin, the
@@ -1042,13 +1082,65 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 		}
 		gen = g0 + 1
 	}
-	// A commit failure is NOT notExecuted: the response may have been
-	// lost after the backend committed — exactly the ambiguity class the
-	// IdempotentCAS recovery recheck exists for.
+	// A COMMIT error does not say whether the backend committed: the reply
+	// may be lost after the commit. pgx v5.11 even reports that loss as a
+	// request never sent: MultiResultReader.NextResult drops the read error
+	// of peekMessage, which has already closed the connection, so the next
+	// receiveMessage returns connLockError "conn closed", and pgconn's
+	// SafeToRetry is true for it. A swap that changed a row therefore asks
+	// PostgreSQL for the outcome. A swap that changed no row wrote nothing,
+	// so its COMMIT outcome changes nothing, and its error passes through.
 	if err := tx.Commit(ctx); err != nil {
-		return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+		if n == 0 {
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+		}
+		// commitStatus needs a pool slot, and this connection can be the
+		// pool's last one. The transaction is closed, so the deferred
+		// Rollback and Release no longer touch it.
+		conn.Release()
+		switch s.commitStatus(ctx, xid) {
+		case "committed": // a lost reply: the swap and the hook's writes committed
+		case "aborted":
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, notExecuted(err))
+		default:
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, commitUnknown(err))
+		}
+	}
+	if hooked && hook.Committed != nil {
+		hook.Committed()
 	}
 	return n == 1, gen, nil
+}
+
+// commitStatusTimeout bounds commitStatus, which runs on a
+// cancellation-detached context like the IdempotentCAS recheck.
+const commitStatusTimeout = 5 * time.Second
+
+// commitStatus asks PostgreSQL, on a pooled connection, whether
+// transaction xid committed. It returns "committed" or "aborted", or "" when
+// the answer is unknown: the query failed, the id is too old for
+// txid_status, or the transaction was still in progress when
+// commitStatusTimeout ran out. While the transaction is in progress it asks
+// again: a backend that lost its client finishes the COMMIT it received, or
+// aborts when it reads the closed socket.
+func (s *PG) commitStatus(ctx context.Context, xid int64) string {
+	assertf(xid > 0, "commitStatus: no transaction id")
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitStatusTimeout)
+	defer cancel()
+	for {
+		var status *string
+		if err := s.pool.QueryRow(rctx, `SELECT txid_status($1)`, xid).Scan(&status); err != nil || status == nil {
+			return ""
+		}
+		if *status != "in progress" {
+			return *status
+		}
+		select {
+		case <-rctx.Done():
+			return ""
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 // RegisterPacks inserts pack rows in ONE transaction (crash-ordering: this

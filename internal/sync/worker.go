@@ -198,12 +198,14 @@ type Worker struct {
 	// LocalScheduler sweep turns due rows into runs.
 	Local LocalLanes
 
-	// WaitPublication, when non-nil (local mode, with Local set),
-	// blocks until no in-flight push still holds the repo's cache refs
-	// unpublished (githttp.WaitForPushPublication). A local run calls it
-	// after its claim and before its snapshot and started event: a hook
-	// records intent after the authority CAS but before receive-pack
-	// publishes the cache ref. A failed wait restores the consumed request.
+	// WaitPublication, when non-nil, blocks until no in-flight push
+	// still holds the repo's cache refs unpublished
+	// (githttp.WaitForPushPublication). A local run calls it after its
+	// claim and before its snapshot and started event, and so does a
+	// River push run: a hook records intent at the authority CAS, before
+	// receive-pack publishes the cache ref. A failed wait restores the
+	// consumed request. Without Local, Upstreams must be a
+	// ShutdownRestorer, and only RunPush waits.
 	WaitPublication func(ctx context.Context, repoID string) error
 
 	// DetachPoll is the cadence of the outbound push watchdog that
@@ -296,7 +298,8 @@ func (w *Worker) waitPublication(ctx context.Context, repoID string) error {
 	if w.WaitPublication == nil {
 		return nil
 	}
-	assertf(w.Local != nil, "WaitPublication requires the local schedule")
+	_, restores := w.Upstreams.(ShutdownRestorer)
+	assertf(w.Local != nil || restores, "WaitPublication needs the local schedule or a ShutdownRestorer")
 	wctx, cancel := context.WithTimeout(ctx, localPublicationWaitTimeout)
 	defer cancel()
 	return w.WaitPublication(wctx, repoID)

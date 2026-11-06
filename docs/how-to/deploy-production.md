@@ -32,7 +32,7 @@ clients ──► reverse proxy (TLS) ──► N × openstorage serve ──►
 ### Runtime base and support
 
 The Dockerfile pins both base images by **multi-platform image index digest**: the
-runtime base, **Alpine 3.24.3**, and the Go builder, whose Go version follows
+runtime base, **Alpine 3.24.4**, and the Go builder, whose Go version follows
 `mise.toml`. This does **not** make the full build reproducible or guarantee current
 package fixes:
 
