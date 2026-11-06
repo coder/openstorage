@@ -62,8 +62,9 @@ func TestLocalRESTWriteForwards(t *testing.T) {
 		var got string
 		var up meta.RepoUpstream
 		for time.Now().Before(deadline) {
-			out, err := tryGit("", "--git-dir", bare, "rev-parse", "--verify", "--quiet", ref)
+			out, _ := tryGit("", "--git-dir", bare, "rev-parse", "--verify", "--quiet", ref) // fails while the ref is missing
 			got = strings.TrimSpace(out)
+			var err error
 			if up, err = ms.GetRepoUpstream(t.Context(), id); err != nil {
 				t.Fatal(err)
 			}
