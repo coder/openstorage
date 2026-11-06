@@ -65,8 +65,9 @@ func (s *evidenceStore) RecordDefaultBranchChecked(_ context.Context, _ string, 
 // stays flagged, whether the run resolved no HEAD or failed, so the
 // reconcile job asks for another sync only after a worker without the rule
 // runs one. An adopted or unflagged repo needs none. A failed adoption
-// write, or a failure after the HEAD resolved and before the adoption,
-// leaves none: the reconcile job must ask for the retry.
+// write leaves none: the failure is ours, so the reconcile job must ask for
+// the retry. A failure after the HEAD resolved records the evidence like any
+// other run that the upstream's host can cause to fail.
 func TestWorkerRecordsDefaultBranchEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -82,7 +83,7 @@ func TestWorkerRecordsDefaultBranchEvidence(t *testing.T) {
 		{name: "an unresolvable HEAD", flagged: true, head: "missing", wantChecked: []int{1}},
 		{name: "a failed run", flagged: true, host: "file:///nonexistent-upstream", wantChecked: []int{0}},
 		{name: "no flag", flagged: false, head: "trunk"},
-		{name: "a failure after the HEAD resolved", flagged: true, head: "trunk", tokenErr: true},
+		{name: "a failure after the HEAD resolved", flagged: true, head: "trunk", tokenErr: true, wantChecked: []int{0}},
 		{name: "a failed adoption write", flagged: true, head: "trunk", adoptErr: errors.New("transient write failure")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
