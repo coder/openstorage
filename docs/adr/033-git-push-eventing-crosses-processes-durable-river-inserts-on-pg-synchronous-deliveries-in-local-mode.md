@@ -27,11 +27,13 @@ Failure stance is fail-open: if the hook cannot open the meta store or build the
 eventing is disabled for that push rather than the push denied — same reasoning as
 ADR-28, un-notified is recoverable while un-pushed work is a user-visible outage.
 
-**Amendment: PostgreSQL refuses instead.** On PostgreSQL the ref CAS records a
-`forward_on_push` repository's forward intent itself
-([ADR-44](044-outbound-push-forwarding-rides-a-separate-push-claim-lane.md)), so an
-eventless push there would land with no intent and no events, and a failed open does
-not prove the CAS would fail too. When the hook cannot build the secrets codec, open
-the meta store, or build the River insert-only client, it refuses the ref update
-before its CAS, and the client can push again. SQLite and S3-WAL keep the fail-open
-stance.
+**Amendment: a hook without eventing refuses intent.** The forward intent now
+rides the ref update itself: on PostgreSQL the ref CAS records it
+([ADR-44](044-outbound-push-forwarding-rides-a-separate-push-claim-lane.md)), and on
+the local schedule the hook records it before the CAS
+([ADR-50](050-local-scheduling-state-is-row-owned.md)). An eventless push would land
+with no intent and no events, and a failed step does not prove that the CAS would fail
+too. So when the hook cannot build the secrets codec, open the meta store, or build
+the River insert-only client, it refuses every update that would record forward
+intent before its CAS, and the client can push again. Ephemeral updates and a sync
+run's own loopback push record no intent, and they keep the fail-open stance.
