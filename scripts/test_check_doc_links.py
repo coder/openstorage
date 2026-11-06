@@ -804,6 +804,22 @@ class FileSelectionTests(CheckerTestCase):
                                         "MISSING CITED FILE pkg/README.md:1 -> [run.go:Run] (not tracked by git)\n"
                                         "broken links: 3\n")
 
+    def test_a_modified_tracked_file_and_a_directory_with_a_tracked_file_stay_tracked(self):
+        # Only `git diff-files` status A marks an intent-to-add entry. A staged file that was edited since is status M.
+        result = self.run_checker(
+            "[Edited](docs/mod.txt) [Dir](docs/both/) [Cited](pkg/README.md)\n",
+            files={"docs/both/b.txt": "b\n", "docs/mod.txt": "one\n", "pkg/README.md": "[run.go:Run]\n", "pkg/run.go": "func Run() {}\n"},
+            untracked={"docs/both/a.txt": "a\n", "docs/mod.txt": "two\n", "pkg/run.go": "func Run() {}\n// edited\n"},
+            intent_to_add=["docs/both/a.txt"])
+        self.assertEqual(result.stdout, "broken links: 0\n")
+
+    def test_a_directory_that_holds_only_intent_to_add_files_is_not_tracked(self):
+        result = self.run_checker("[Dir](docs/only/) [File](docs/only/a.txt)\n", untracked={"docs/only/a.txt": "a\n"},
+                                  intent_to_add=["docs/only/a.txt"])
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> docs/only/\n"
+                                        "BROKEN FILE (not tracked by git) README.md:1 -> docs/only/a.txt\n"
+                                        "broken links: 2\n")
+
     def test_an_untracked_readme_can_link_to_itself(self):
         result = self.run_checker("", untracked={"pkg/README.md": "# Top\n[Self](#top) [Missing](#absent)\n"})
         self.assertEqual(result.stdout, "BROKEN ANCHOR pkg/README.md:2 -> #absent\nbroken links: 1\n")
