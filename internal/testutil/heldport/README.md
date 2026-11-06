@@ -9,7 +9,7 @@ Test helper that keeps a test server's TCP port reserved while the server is dow
 
 ## Invariants
 - Both listeners set `SO_REUSEPORT`, and a second socket with `SO_REUSEPORT` stays bound to the port without listening until the test's cleanup [heldport.go:listen] [heldport.go:hold]
-- The held socket is close-on-exec, and `ForkLock` is held from its creation to that mark, so no child process inherits it [heldport.go:hold]
+- The held socket is close-on-exec, and `ForkLock` is held from its creation to that mark, so no child process inherits it [heldport.go:hold] [heldport_test.go:TestHeldSocketIsCloseOnExec]
 - While no listener is open, a dial to the port is refused, and a socket without `SO_REUSEPORT` cannot bind it [heldport_test.go:TestRelistenAfterClose]
 - Every setup error fails the test [heldport.go:hold]
 

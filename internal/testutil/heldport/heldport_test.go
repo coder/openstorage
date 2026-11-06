@@ -46,3 +46,18 @@ func TestRelistenAfterClose(t *testing.T) {
 		t.Fatalf("accept after Relisten: %v", err)
 	}
 }
+
+// TestHeldSocketIsCloseOnExec: the held socket is close-on-exec, so a child
+// process (the git the tests run) never inherits it and keeps the port.
+func TestHeldSocketIsCloseOnExec(t *testing.T) {
+	ln := listen(t, "127.0.0.1:0")
+	defer ln.Close()
+	fd := hold(t, ln.Addr().(*net.TCPAddr))
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("held socket flags = %#x, want FD_CLOEXEC", flags)
+	}
+}

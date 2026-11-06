@@ -51,10 +51,10 @@ func listen(t testing.TB, addr string) net.Listener {
 }
 
 // hold binds a socket to addr with SO_REUSEPORT and never listens on it,
-// until the test ends. The kernel answers a dial to a port with no
-// listener with a reset (connection refused), and gives the port to no
-// socket that lacks SO_REUSEPORT.
-func hold(t testing.TB, addr *net.TCPAddr) {
+// until the test ends, and returns its descriptor. The kernel answers a
+// dial to a port with no listener with a reset (connection refused), and
+// gives the port to no socket that lacks SO_REUSEPORT.
+func hold(t testing.TB, addr *net.TCPAddr) int {
 	t.Helper()
 	ip := addr.IP.To4()
 	if ip == nil {
@@ -81,4 +81,5 @@ func hold(t testing.TB, addr *net.TCPAddr) {
 	if err := unix.Bind(fd, sa); err != nil {
 		t.Fatalf("heldport: bind %v: %v", addr, err)
 	}
+	return fd
 }
