@@ -243,6 +243,20 @@ Blobs with no registry row older than
 [`OPENSTORAGE_SWEEP_AGE_THRESHOLD`](../reference/configuration.md#openstorage_sweep_age_threshold)
 (default 24h) are orphan candidates.
 
+On PostgreSQL the sweep is a River job on its own single-worker queue, `orphan_pack_sweep`.
+A replica works that queue only while its sweep schedule is on, so a replica with
+`OPENSTORAGE_SWEEP_INTERVAL=0` never fetches a sweep that another replica queued. During
+a rolling upgrade, a sweep that an older replica queued on the default queue can still
+reach a replica with the schedule off. That replica fails it and River discards it, and
+the next interval runs the sweep again. During the same roll, a sweep from an older replica
+and one from a newer replica can run at the same time. Sweeps tolerate that. After a
+rollback, a sweep that a newer replica queued stays `available` until a newer replica
+fetches it, and then it runs once.
+
+River queues a scheduled job only from the elected leader. Set `OPENSTORAGE_SWEEP_INTERVAL`
+the same on every replica: a leader with the schedule off queues no sweep, even when
+another replica has it on, until leadership moves.
+
 Independent flags control what a sweep may *do*:
 
 | Mode | Default | Acts on |
@@ -325,7 +339,13 @@ A sweep never hard-deletes directly:
   bytes or provably re-publishes them.
 
 Quarantine backups are purged only while a destructive mode is on, and only once older
-than `max(age threshold, 1h)`; a low age threshold does not shorten the 1h floor. A
+than `max(age threshold, 1h)`; a low age threshold does not shorten the 1h floor. Every
+push must finish within that age minus 30 minutes: a delete handshake takes up to 15
+minutes after it copies a backup, and the heal purges a backup within 15 minutes of its
+last read of the registry or the original.
+An entry whose calls overrun that deadline fails, and the next sweep visits it again. The
+restore of a registered original has no deadline, because copying and hashing a large
+LFS object can take longer than any fixed one. The 24h default leaves hours of room. A
 backup is also kept while its original cannot be verified complete:
 
 - Pack rows registered before the size column existed (`bytes=0`) keep their backups
@@ -408,6 +428,12 @@ namespace group. It runs every
    [`OPENSTORAGE_LFS_GC_GRACE`](../reference/configuration.md#openstorage_lfs_gc_grace).
 5. Refunds the freed object slots and quota bytes on a later run, once a destructive LFS
    sweep that **started after** the retirement completes cleanly.
+
+On PostgreSQL the job runs on its own single-worker River queue, `lfs_reclaim`, which only
+replicas with `OPENSTORAGE_LFS_GC_INTERVAL` set work. A replica with the job off never
+fetches a run that another replica queued. The rolling-upgrade note and the leader note
+under [the orphan sweeper](#the-orphan-sweeper) apply here too, with
+`OPENSTORAGE_LFS_GC_INTERVAL` in place of the sweep interval.
 
 A `507`-wedged repository accepts new objects again once enough junk rows retire and a
 covering sweep settles their refunds.

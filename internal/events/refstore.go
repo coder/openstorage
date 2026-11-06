@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -39,6 +40,12 @@ type RefStoreOptions struct {
 	// progress (which also prevents the sync worker's own loopback pushes
 	// from re-triggering themselves) — and enqueue accordingly.
 	EnqueueSync func(ctx context.Context, repoID string) error
+	// BeforeCAS, when non-nil, runs before every non-ephemeral CASRef and
+	// CASRefGen with the base RepoID. An error refuses the update: the
+	// inner CAS never runs. The git hook on the local schedule records the
+	// push's forward intent here (ADR-50), so no accepted write can lose
+	// it to a crash after the CAS.
+	BeforeCAS func(ctx context.Context, repoID string) error
 	// Now supplies pushed_at; defaults to time.Now.
 	Now func() time.Time
 	// Logger records emission failures; defaults to slog.Default().
@@ -52,6 +59,7 @@ type RefStoreOptions struct {
 // flow their ref flips through CASRef. Emission happens strictly AFTER the
 // CAS commits and never fails the update: enqueue errors are logged and
 // swallowed (docs/reference/webhooks.md "emit after the ref update commits").
+// The optional BeforeCAS step runs before the CAS and can refuse it.
 type RefStore struct {
 	ref.RefStore // inner store; every method except CASRef delegates
 
@@ -60,6 +68,7 @@ type RefStore struct {
 	webhooks        WebhookLister
 	enqueueDelivery func(ctx context.Context, d Delivery) error
 	enqueueSync     func(ctx context.Context, repoID string) error
+	beforeCAS       func(ctx context.Context, repoID string) error
 	now             func() time.Time
 	logger          *slog.Logger
 }
@@ -91,18 +100,22 @@ func NewRefStore(inner ref.RefStore, opts RefStoreOptions) *RefStore {
 		webhooks:        opts.Webhooks,
 		enqueueDelivery: opts.EnqueueDelivery,
 		enqueueSync:     opts.EnqueueSync,
+		beforeCAS:       opts.BeforeCAS,
 		now:             now,
 		logger:          logger,
 	}
 }
 
-// CASRef delegates to the inner store and, on a won update outside the
-// ephemeral namespace, emits the push event + sync poke. Emission uses a
+// CASRef runs BeforeCAS, delegates to the inner store and, on a won update
+// outside the ephemeral namespace, emits the push event + sync poke. Emission uses a
 // cancellation-detached context: the CAS already committed, so a client
 // hanging up mid-response must not lose the event. The inner store is
 // ref.IdempotentCAS-wrapped (see NewRefStore), so a returned error or lost
 // CAS here is already reconciled — skipping emission on it is safe.
 func (s *RefStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	if err := s.runBeforeCAS(ctx, repo, name); err != nil {
+		return false, err
+	}
 	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
 	if err != nil || !won {
 		return won, err
@@ -116,12 +129,26 @@ func (s *RefStore) CASRef(ctx context.Context, repo, name, old, new string) (boo
 // swap emits the push event + sync poke, and the inner store's generation
 // attribution passes through untouched.
 func (s *RefStore) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	if err := s.runBeforeCAS(ctx, repo, name); err != nil {
+		return false, 0, err
+	}
 	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
 	if err != nil || !won {
 		return won, gen, err
 	}
 	s.emitPush(context.WithoutCancel(ctx), repo, name, old, new)
 	return true, gen, nil
+}
+
+// runBeforeCAS runs the BeforeCAS option for a non-ephemeral update.
+func (s *RefStore) runBeforeCAS(ctx context.Context, repoKey, refName string) error {
+	if s.beforeCAS == nil || EphemeralUpdate(repoKey, refName) {
+		return nil
+	}
+	if err := s.beforeCAS(ctx, BaseRepoID(repoKey)); err != nil {
+		return fmt.Errorf("refusing the ref update: %w", err)
+	}
+	return nil
 }
 
 // emitPush fans one push event out to the org's webhooks and pokes the

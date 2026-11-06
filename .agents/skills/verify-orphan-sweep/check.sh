@@ -51,7 +51,7 @@ model="$skill_dir/model"
 
 # Configs in run order: name, module, kind (pass: invariants must hold; live:
 # temporal properties must hold; probe: the named invariant must fail
-# without a timing assumption; reach: the named invariant must fail because
+# without a timing guarantee; reach: the named invariant must fail because
 # it negates a state the model must reach).
 configs="PackSweep.cfg PackSweep pass -
 NoTiming.cfg PackSweep pass -
@@ -65,7 +65,7 @@ PurgeQuarantine.cfg RepoPurge live -
 PurgeReach.cfg RepoPurge reach RaceUnreachable
 PurgeCliReach.cfg RepoPurge reach CliUnreachable"
 # The code facts each module declares as constants.
-facts_PackSweep="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealEverySweep HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeAgeCoversThreshold"
+facts_PackSweep="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealEverySweep HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeAgeCoversThreshold HealEntryBounded"
 facts_RepoPurge="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeGuarded SweepGuardStopsPurgeMode RefusesLive RefusesYoung CutoffCoversRetention CursorWraps FenceFirst RefsDieFirst RegistrationsFenced RefWritesFenced FoldsFenced SweepReapsFenced HealPurgesFenced"
 cfg_names=$(awk '{print $1}' <<<"$configs")
 
@@ -161,7 +161,13 @@ run_tlc() {
   local d="$work/${cfg%.cfg}"
   mkdir -p "$d/tmp"
   cp "$model/$module.tla" "$d/"
-  cat "$model/$cfg" "$work/facts-$module.cfg" >"$d/run.cfg"
+  # A config may pin a fact itself (NoTiming.cfg and SlowHealEntry.cfg set
+  # HealEntryBounded = FALSE); every other fact comes from the code.
+  awk -v cfg="$model/$cfg" '
+    BEGIN { while ((getline l < cfg) > 0) if (l ~ /^[ \t]+[A-Za-z]+ = /) { split(l, a, " "); pinned[a[1]] = 1 } }
+    $2 == "=" && ($1 in pinned) { next }
+    { print }' "$work/facts-$module.cfg" >"$d/facts.cfg"
+  cat "$model/$cfg" "$d/facts.cfg" >"$d/run.cfg"
   cp "$d/run.cfg" "$out/${cfg%.cfg}.run.cfg"
   local rc=0
   (cd "$d" && "$JAVA" -Djava.io.tmpdir="$d/tmp" -Xmx"${TLC_HEAP:-4g}" -XX:+UseParallelGC \
@@ -208,7 +214,7 @@ while read -r cfg module kind _; do
   esac
 done <<<"$configs"
 
-# Probes drop one timing assumption each, and reach probes negate a state
+# Probes drop one timing guarantee each, and reach probes negate a state
 # the model must reach; either way the named invariant must fail. One worker
 # keeps the trace the shortest one.
 stale=0 probe_passed=0
@@ -229,7 +235,7 @@ while read -r cfg module kind expect; do
       if [ "$kind" = reach ]; then
         verdict "$cfg" "PASSES: the model no longer reaches this state, so the other $module configs may check nothing. Review the model"
       else
-        verdict "$cfg" "PASSES: this timing assumption no longer matters. Review the model and SKILL.md"
+        verdict "$cfg" "PASSES: this timing guarantee no longer matters. Review the model and SKILL.md"
       fi
       stale=1; probe_passed=1 ;;
     *) verdict "$cfg" "ERROR: TLC exit $rc"; sed -n '1,40p' "$out/${cfg%.cfg}.out" >&2; exit 3 ;;

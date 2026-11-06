@@ -17,7 +17,7 @@ The repository purger (`RepoPurger`) reclaims a soft-deleted repository, on the 
 | `NoWaitForHeal` | While nothing crashes, a registered pack is missing only while the write or the sweeper handshake that puts it back is still running. | Clones and reads fail for up to one sweep interval (`OPENSTORAGE_SWEEP_INTERVAL`, default 1 h) after a race the code claims to repair on the spot. |
 | `BytesComeBack` | A registered pack with missing bytes gets them back. | Same as `NoLostPack`, through a repair that never happens. |
 
-`NoWaitForHeal` is the claim in the `Sweeper.sweep` doc comment: "the recheck and the writer verify jointly cover every interleaving with no timing assumptions". `NoTiming.cfg` checks it with both timing assumptions off.
+`NoWaitForHeal` is the claim in the `Sweeper.sweep` doc comment: "the recheck and the writer verify jointly cover every interleaving with no timing assumptions". `NoTiming.cfg` checks it with the timing assumption off and `HealEntryBounded` pinned FALSE.
 
 The purge model (`model/RepoPurge.tla`) checks these:
 
@@ -54,7 +54,7 @@ A clean run ends like this:
 ```text
 == Code facts (HEAD b5897891)
    WriterVerifies             TRUE
-   ... (22 facts, all TRUE)
+   ... (23 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/orphan-sweep-check.Ab12Cd)
    PackSweep.cfg               PASS (3950676 distinct states)
    NoTiming.cfg                PASS (6636617 distinct states)
@@ -83,7 +83,7 @@ RESULT: PASS
 
 The models (`model/PackSweep.tla` and `model/RepoPurge.tla`) are hand-written descriptions of the code. Two things tie them to the code:
 
-1. **Code facts.** `facts/facts.go` parses the Go source and checks 22 guards by call order or presence. check.sh writes each one, as a constant, into the TLC configs of each module that declares it (the lists `facts_PackSweep` and `facts_RepoPurge` in check.sh). When you remove or reorder a guard, its fact turns FALSE and the model takes the broken branch, so TLC finds the bug. The PackSweep facts:
+1. **Code facts.** `facts/facts.go` parses the Go source and checks 23 guards by call order or presence. check.sh writes each one, as a constant, into the TLC configs of each module that declares it (the lists `facts_PackSweep` and `facts_RepoPurge` in check.sh). When you remove or reorder a guard, its fact turns FALSE and the model takes the broken branch, so TLC finds the bug. The PackSweep facts:
 
    | Fact | Guard in the code | Property that fails without it |
    |---|---|---|
@@ -95,6 +95,7 @@ The models (`model/PackSweep.tla` and `model/RepoPurge.tla`) are hand-written de
    | `HealRestores` | `healQuarantineEntry` calls `restoreFromQuarantine` before its purge | `NoLostPack`, `BytesComeBack` |
    | `PurgeAgeGated` | `healQuarantineEntry` returns early when the backup is younger than `s.quarantinePurgeAge()` | all three |
    | `PurgeFloorCoversHandshake` | `QuarantinePurgeFloor = N * sweepRecoveryTimeout` with N >= 2, and `safeDelete` bounds two phases with `context.WithTimeout(..., sweepRecoveryTimeout)` | all three |
+   | `HealEntryBounded` | `healQuarantineEntry` starts with `ectx, cancel := context.WithTimeout(ctx, healEntryTimeout)` and reads the registry under `ectx`. A registered key restores or heals its original on `ctx`, then opens `bound, boundCancel := context.WithTimeout(ctx, healEntryTimeout)` and stats the original under it. No other call passes bare `ctx`, `context.Background()` or `context.WithoutCancel`, and the purge checks `ectx.Err()` before its delete. `healEntryTimeout` plus 2 x `sweepRecoveryTimeout` fits in `QuarantinePurgeFloor` | `NoLostPack`, `BytesComeBack` |
    | `PurgeAgeCoversThreshold` | `quarantinePurgeAge` returns `max(s.cfg.Threshold, QuarantinePurgeFloor)` | `NoLostPack`, `BytesComeBack` |
 
    `RepoPurge` also reads `WriterVerifies`, `VerifyOnRegisterError`, `CopyBeforeDelete`, `RecheckAfterDelete`, `HealRestores`, `PurgeAgeGated` and `PurgeFloorCoversHandshake`, which shape its writers, `safeDelete` and the heal; the table lists the PackSweep property each one breaks. The purge facts:
@@ -186,14 +187,13 @@ When check.sh says STALE, or when you change covered code on purpose:
 **Assumptions:**
 
 - Store and registry calls are atomic and linearizable: the store has strong read-after-write consistency, as the deployment docs require. A call that returns an error took effect, or did not, before it returned. The registry implementations of `RegisterPacks`, `ReplacePacks` and `HasPack` (PostgreSQL, SQLite, s3wal) are each one atomic step; the model does not check them.
-- A quarantine backup's ModTime is close to the end of its copy. On AWS S3 a multipart copy (packs over 5 GiB) gets the start time of the upload, and the copy runs on the sweep's context. A copy that takes longer than the purge floor's spare time (about 30 min) can let a backup reach purge age while its handshake still runs. This was not tested against S3.
+- A quarantine backup's ModTime is close to the end of its copy. On AWS S3 a multipart copy (packs over 5 GiB) gets the start time of the upload, and the copy runs on the sweep's context. A copy that takes longer than the purge floor's spare time (about 15 min) can let a backup reach purge age while its handshake still runs. This was not tested against S3.
 - Pack keys are content-addressed, so every writer and every restore puts identical bytes under a key.
 - Live processes keep taking steps, and faults are bounded (for `BytesComeBack`).
-- Two timing assumptions that the code does not enforce. `NoLostPack` and `BytesComeBack` need both. `NoWaitForHeal` needs neither.
-  - `WritesFinishWithinThreshold`: a write that is in flight when a sweeper copies or deletes a blob finishes before that backup reaches purge age (`max(OPENSTORAGE_SWEEP_AGE_THRESHOLD, 1 h)`). The delete runs at most 15 min after the copy, so this holds when every write finishes within the purge age minus 15 min. `SweepConfig.Threshold` documents a stronger rule: the threshold "must comfortably exceed the longest possible push/import duration".
-  - `HealEntryIsQuick`: `healQuarantineEntry` gets from its registry read to its age gate within that same margin. In local mode (`StartSweepTicker`) no deadline bounds the sweep. In PostgreSQL mode the sweep is a River job, and its pass ends after 2 hours (`passJobTimeout` in `internal/jobs/river.go`). That bound keeps a heal entry within the margin only when the purge age is more than 2 h 15 min. The default threshold of 24 h gives a margin of 23 h 45 min. With a threshold of 2 h 15 min or less, the PostgreSQL bound does not enforce the assumption. Between the two steps the entry makes blob calls on the sweep's context, such as `Stat` and a restore copy when the original is missing (read from code, not run).
+- One timing assumption that the code does not enforce: `WritesFinishWithinThreshold`. `NoLostPack` and `BytesComeBack` need it. `NoWaitForHeal` does not. A write that is in flight when a sweeper copies or deletes a blob finishes before that backup reaches purge age (`max(OPENSTORAGE_SWEEP_AGE_THRESHOLD, 1 h)`). The delete runs at most 15 min after the copy, and a heal entry runs at most `healEntryTimeout` (15 min) from its last read to its age gate, so this holds when every write finishes within the purge age minus 30 min. `SweepConfig.Threshold` documents a stronger rule: the threshold "must comfortably exceed the longest possible push/import duration".
+- The heal entry bound is a code fact, not an assumption: `HealEntryBounded`. An unregistered key's entry, in PostgreSQL mode and in local mode, runs from its registry read to its purge under its own `healEntryTimeout`, which is one restore copy and does not depend on the sweep's context or on `passJobTimeout`. A registered key restores or heals its original first, with no bound: that copies and hashes the whole backup, which can outlast any fixed bound for a large LFS object. It then opens a new bound and stats the original again, and the purge relies on that read. The purge checks `ectx.Err()` first, because a store that ignores its context, such as the file store, returns from a stalled read late and without an error. A stat that finds the original missing again spares the backup, except for an LFS backup that failed its digest: that one can never be restored, so its purge needs no read. An entry that hits a bound fails with a deadline error and the next sweep visits it again. The model keeps one step for the registered key's restore and second stat (`heal_stat`), then the bounded visit up to the age gate (`heal_purge`). A stall inside `heal_stat` cannot hurt, because the second stat reads the original after it. A stall after the stat can, and the bound removes it.
 
-**Probes:** `NoThresholdAssumption.cfg` and `SlowHealEntry.cfg` each drop one timing assumption, and `NoLostPack` must then fail. Both fail on the same path: a write finds an old orphan blob present and adopts it, a sweeper quarantines and deletes the blob, the write's `RegisterPacks` commits, the write dies before `EnsurePublished`, and a heal that read the registry before the registration purges the aged backup. The registered pack then has no bytes anywhere. If a probe starts passing, the code or the model changed. Review it before you update this file.
+**Probes:** `NoThresholdAssumption.cfg` drops the timing assumption. `SlowHealEntry.cfg` pins the `HealEntryBounded` fact to FALSE, as if `healQuarantineEntry` had no deadline. Each configuration drops one timing guarantee, and `NoLostPack` must then fail. Both fail on the same path: a write finds an old orphan blob present and adopts it, a sweeper quarantines and deletes the blob, the write's `RegisterPacks` commits, the write dies before `EnsurePublished`, and a heal that read the registry before the registration purges the aged backup. The registered pack then has no bytes anywhere. If a probe starts passing, the code or the model changed. Review it before you update this file.
 
 **Simplifications:** each one gives the model at least the behaviors of the code, or the same outcome:
 
@@ -217,7 +217,8 @@ When check.sh says STALE, or when you change covered code on purpose:
 - Two promises that nothing checks, because they are about code that does not exist: nothing clears `deleted_at` once `SoftDeleteRepo` set it, and nothing removes a fence (a `purged_repos` row, or the S3WAL manifest's `PurgedAt`). A fingerprint of a named function cannot catch a new function that does either. An undelete path would let a purge that already passed `RefusesLive` go on against a live repository: it fences it, drops its refs and retires its pack rows, and check.sh stays green. A removed fence would let a registration succeed after the purge, and its rows and bytes would stay behind a stamped repository. A search of `internal` and `cmd` for either finds none today. A change that adds one needs this model reviewed first.
 - The purger's clock agrees with the clock that stamped `deleted_at` (PG: the database's `now()`; SQLite: the clock of the process that deleted). `purgeRepo` and `PurgeExpired` compare `p.now()` with it. A purger clock that runs d ahead purges up to d early, which a user sees as `PurgeEligible` breaking by d.
 - `PurgeCompletes` and `BackupsCollected` need purge-aware sweeps that keep running (`OPENSTORAGE_SWEEP_INTERVAL` > 0) and a `DeleteGuard` that passes eventually. A writer can upload a blob after the purge's own reap (an upload precedes its fenced registration), and only a sweep, or a `purge-repo` rerun's `rescanPurged`, reaps it; only a sweep purges the quarantine backups.
-- No timing assumption of its own. Once the fence committed, nothing of the repository registers again, so the purge, the purge-aware sweeper and the heal can delete any of its blobs and backups whenever they reach them. A backup made before the fence is PackSweep's case, and the model makes none: a heal that read the registry before a registration landed, and purges the aged backup after the fence, needs PackSweep's two timing assumptions to fail (`NoThresholdAssumption.cfg`, `SlowHealEntry.cfg`). The user then sees a registered row without bytes in a soft-deleted repository until the purge retires that row.
+- A sweep job's time budget (`SweepSchedule.runOnce`'s `jobBudget`, with `purgeFloor` kept for the purge) can end a sweep or a purge pass at any step. The model treats that as the pass's crash, which is one of its bounded faults, so the liveness configs assume that some tick leaves the purge enough time to finish one repository. If every tick cut the purge short, a purged repository's bytes would stay stored. The model does not size the budget. `TestSweepSchedule_PurgeKeepsItsOwnTimeWhenTheSweepRunsLate` and `TestSweepSchedule_PurgeEndsWithTheJobWhenTheSweepReturnsEarly` in `internal/jobs` pin that the purge gets its floor after a late sweep and ends with the job after an early one.
+- No timing assumption of its own. Once the fence committed, nothing of the repository registers again, so the purge, the purge-aware sweeper and the heal can delete any of its blobs and backups whenever they reach them. A backup made before the fence is PackSweep's case, and the model makes none: a heal that read the registry before a registration landed, and purges the aged backup after the fence, fails only when a write outlives the purge age (`NoThresholdAssumption.cfg`) or a heal entry has no deadline (`SlowHealEntry.cfg`, the fact `HealEntryBounded`, TRUE in the code). The user then sees a registered row without bytes in a soft-deleted repository until the purge retires that row.
 
 **Probes:** no timing probe, because no property needs a timing assumption. `PurgeReach.cfg` is a reachability probe: with `PurgeSafety.cfg`'s bounds it must reach `RaceUnreachable`'s state, where a push registered K and a repack folded into K before the fence, the purge retired both rows, and its reap is deleting K while both writers still hold their local files. If a model edit cuts any of those steps off, the probe passes, the safety configs may check nothing, and check.sh stops with STALE. `PurgeCliReach.cfg` does the same for `purge-repo`: with `PurgeControl.cfg`'s bounds it must reach `CliUnreachable`'s state, where a `purge-repo` run stamps a repository that is old but not past the retention, which only `purge-repo` may purge. The CLI start has no fairness (an operator may never run it), so no liveness config can force it, and a CLI that cannot start or ends before its phases would leave `PurgeControl.cfg`, `PurgeSafety.cfg` and `PurgeLiveness.cfg` green.
 
@@ -246,6 +247,7 @@ Every fact was broken in the real code, in a scratch checkout whose covered code
 | drop the age test from the purge gate | `PurgeAgeGated` | `NoLostPack`, `NoWaitForHeal`, `BytesComeBack` |
 | `QuarantinePurgeFloor = 1 * sweepRecoveryTimeout` | `PurgeFloorCoversHandshake` | `NoLostPack`, `NoWaitForHeal`, `BytesComeBack` |
 | `quarantinePurgeAge` returns `QuarantinePurgeFloor` | `PurgeAgeCoversThreshold` | `NoLostPack`, `BytesComeBack` |
+| remove `bound, boundCancel := context.WithTimeout(ctx, healEntryTimeout)` from the registered block of `healQuarantineEntry` (stat the original on `ctx` and leave the later calls on the first `ectx`) | `HealEntryBounded` | `NoLostPack`, `BytesComeBack` |
 | remove the won-path `verifyPublished` after `ReplacePacks` in `Repacker.repack` | `WriterVerifies` | `NoWaitForHeal` |
 | `if regErr != nil { break }` at the top of `preReceive`'s `EnsurePublished` loop | `VerifyOnRegisterError` | `NoWaitForHeal` |
 
@@ -302,7 +304,7 @@ Sync commit: `d7896ef4488ced6c2238f100f4ecea38cfb0a687` (the last commit at whic
 
 | File | Covered code |
 |---|---|
-| `internal/jobs/sweep.go` | `Sweeper.sweep`, `classify`, `revalidateOrphan`, `freshModTime`, `registered`, `safeDelete`, `restoreFromQuarantine`, `healQuarantine`, `healQuarantineEntry`, `healPresentOriginal`, `quarantinePurgeAge`, `quarantineKey`, `const QuarantinePurgeFloor`, `const sweepRecoveryTimeout`, `SweepSchedule.runOnce`, `baseOf` |
+| `internal/jobs/sweep.go` | `Sweeper.sweep`, `classify`, `revalidateOrphan`, `freshModTime`, `registered`, `safeDelete`, `restoreFromQuarantine`, `healQuarantine`, `healQuarantineEntry`, `healPresentOriginal`, `quarantinePurgeAge`, `quarantineKey`, `const QuarantinePurgeFloor`, `const sweepRecoveryTimeout`, `const healEntryTimeout`, `SweepSchedule.runOnce`, `baseOf` |
 | `internal/blob/blob.go` | `EnsurePublished`, `QuotaRepoGroup`, `var packNamespaceSuffixes` |
 | `internal/githttp/hook.go` | `preReceive`, from `published := ...` through the `EnsurePublished` loop |
 | `internal/api/publish.go` | `server.publishPack` |
@@ -322,7 +324,7 @@ Sync commit: `d7896ef4488ced6c2238f100f4ecea38cfb0a687` (the last commit at whic
 | `check.sh` | The one command: facts, TLC runs, fingerprints, `--record`, and the TLC-free `--fingerprints-only` that CI runs. Its `configs` table maps each config to its module. |
 | `facts/facts.go` | Reads the code facts and fingerprints from the Go source (standard library only; the dot directory keeps it out of `./...`). |
 | `model/PackSweep.tla` | The sweeper model. |
-| `model/PackSweep.cfg`, `NoTiming.cfg`, `Liveness.cfg` | Its property configs; each must pass. |
+| `model/PackSweep.cfg`, `NoTiming.cfg`, `Liveness.cfg` | Its property configs; each must pass. A config may pin a fact (`NoTiming.cfg` pins `HealEntryBounded`); check.sh adds the other facts from the code. |
 | `model/NoThresholdAssumption.cfg`, `SlowHealEntry.cfg` | Its probes; each must fail `NoLostPack`. |
 | `model/RepoPurge.tla` | The purge model. |
 | `model/PurgeControl.cfg`, `PurgeSafety.cfg`, `PurgeLiveness.cfg`, `PurgeQuarantine.cfg` | Its property configs; each must pass. |

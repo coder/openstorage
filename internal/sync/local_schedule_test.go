@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cgi"
+	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
 	stdsync "sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/coder/openstorage/internal/envconfig"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/testutil/heldport"
 )
 
 // gateLanes wraps LocalLanes so a test can pause or fail one method for
@@ -137,7 +139,9 @@ func (g *gateLanes) ListLocalWork(ctx context.Context, org, after string, limit 
 
 // httpUpstream is a git smart-HTTP upstream (git http-backend over CGI)
 // that can be taken down and brought back on the same address, so one repo
-// can fail as unreachable and later succeed.
+// can fail as unreachable and later succeed. On Linux heldport keeps the
+// port while it is down: another server can take it only if it also sets
+// SO_REUSEPORT and binds that exact port. Off Linux the port is not held.
 type httpUpstream struct {
 	root string
 	addr string
@@ -151,10 +155,7 @@ func newHTTPUpstream(t *testing.T) *httpUpstream {
 		t.Skip("git not on PATH")
 	}
 	u := &httpUpstream{root: t.TempDir()}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := heldport.Listen(t)
 	u.addr = ln.Addr().String()
 	u.serve(ln, gitPath)
 	t.Cleanup(func() {
@@ -188,18 +189,7 @@ func (u *httpUpstream) down(t *testing.T) {
 func (u *httpUpstream) up(t *testing.T) {
 	t.Helper()
 	gitPath, _ := exec.LookPath("git")
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		ln, err := net.Listen("tcp", u.addr)
-		if err == nil {
-			u.serve(ln, gitPath)
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("relisten %s: %v", u.addr, err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	u.serve(heldport.Relisten(t, u.addr), gitPath)
 }
 
 // addRepo creates root/owner/name.git accepting pushes over HTTP.
@@ -1124,6 +1114,46 @@ func TestLocalSchedulePublicationFence(t *testing.T) {
 		}
 		if got := upstreamHead(t, bare); got != before {
 			t.Fatalf("upstream changed after a failed wait: %q", got)
+		}
+	})
+	t.Run("stale held snapshot restores force and attempt", func(t *testing.T) {
+		f := newLocalSchedFixture(t)
+		up := newHTTPUpstream(t)
+		bare := up.addRepo(t, "own", "p4")
+		repo, head := f.addRepo(t, "p4", up.host())
+		before := upstreamHead(t, bare)
+		up.down(t)
+		if err := f.ms.RequestPush(t.Context(), repo, true); err != nil {
+			t.Fatal(err)
+		}
+		f.sweep(t) // transient failure: attempt 1, force kept
+		f.advance(time.Minute)
+		// The server refuses the loopback fetch: a push holds a ref the
+		// cache has not caught up with (githttp.Server.StrictSyncFetch).
+		locked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "held", http.StatusLocked)
+		}))
+		t.Cleanup(locked.Close)
+		loopback := f.wf.worker.Loopback.BaseURL
+		f.wf.worker.Loopback.BaseURL = locked.URL
+		up.up(t)
+		f.sweep(t) // the retry claims, then its snapshot is refused
+		r := f.row(t, repo)
+		attempt, due := f.readSchedule(t, repo)
+		if r.PushSyncing || r.PushPending != 2 || r.PushRunCount != 1 || attempt != 1 ||
+			due != f.now().Add(localPublicationRetryDelay).UnixNano() {
+			t.Fatalf("after a refused snapshot: row %+v attempt %d due %d; want force kept, attempt 1, due +%v, no new run",
+				r, attempt, due, localPublicationRetryDelay)
+		}
+		assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamFailed, EventPushUpstreamStarted)
+		if got := upstreamHead(t, bare); got != before {
+			t.Fatalf("upstream changed after a refused snapshot: %q", got)
+		}
+		f.wf.worker.Loopback.BaseURL = loopback
+		f.advance(localPublicationRetryDelay)
+		f.sweep(t)
+		if r := f.row(t, repo); r.PushPending != 0 || r.PushSuccessCount != 1 || upstreamHead(t, bare) != head {
+			t.Fatalf("restored run did not forward: row %+v upstream %q want %q", r, upstreamHead(t, bare), head)
 		}
 	})
 	t.Run("failed pull wait restores the request", func(t *testing.T) {
