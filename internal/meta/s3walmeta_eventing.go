@@ -563,7 +563,7 @@ func (s *S3WAL) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstr
 			if got := doc.Upstreams[up.RepoID]; got != nil && got.CreatedAt == nanos &&
 				got.Provider == row.Provider && got.Owner == row.Owner &&
 				got.Name == row.Name && got.UpstreamHost == row.UpstreamHost &&
-				got.ForwardOnPush == row.ForwardOnPush && got.DefaultBranchOmitted == row.DefaultBranchOmitted {
+				got.ForwardOnPush == row.ForwardOnPush {
 				return s3walMetaApplied
 			}
 			return s3walMetaRerun
@@ -577,17 +577,21 @@ func (s *S3WAL) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstr
 
 // AdoptUpstreamDefaultBranch (meta.EventingStore contract) in one CAS: the
 // flag clears and the branch moves together, and only while the flag is
-// set. A row that is detached or mid-detach has nothing to adopt.
-// Recovery class PRED: a clear flag after an ambiguous write means the
-// adoption (or an explicit PATCH, which wins) happened, and adopted is
-// whether the branch is the one asked for, the divergence that
-// UpdateRepoDefaultBranch accepts too.
+// set. A row that is detached or mid-detach has nothing to adopt, and a
+// retry never touches a replacement link: the first run binds the write to
+// the row it saw by its CreatedAt, as the detach paths do. Recovery class
+// PRED: a clear flag after an ambiguous write means the adoption (or an
+// explicit PATCH, which wins) happened, and adopted is whether the branch
+// is the one asked for, the divergence that UpdateRepoDefaultBranch accepts
+// too.
 func (s *S3WAL) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch string) (bool, error) {
 	assertf(repoID != "" && branch != "", "AdoptUpstreamDefaultBranch: empty repo id %q or branch %q", repoID, branch)
 	if err := utf8OK("default branch", branch); err != nil {
 		return false, fmt.Errorf("adopt default branch of repo %q: %w", repoID, err)
 	}
 	adopted := false
+	var linkCreatedAt int64
+	bound := false
 	err := s.mutate(ctx, s3walMetaMutation{
 		op: "adopt default branch",
 		fn: func(doc *s3walMetaDoc) (bool, error) {
@@ -597,9 +601,10 @@ func (s *S3WAL) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch s
 				return false, fmt.Errorf("adopt default branch of repo %q: %w", repoID, ErrNotFound)
 			}
 			u := doc.Upstreams[repoID]
-			if u == nil || u.Detaching || !u.DefaultBranchOmitted {
+			if u == nil || u.Detaching || !u.DefaultBranchOmitted || (bound && u.CreatedAt != linkCreatedAt) {
 				return false, nil
 			}
+			linkCreatedAt, bound = u.CreatedAt, true
 			u.DefaultBranchOmitted = false
 			if r.DefaultBranch == OmittedDefaultBranch {
 				r.DefaultBranch = branch
@@ -609,7 +614,7 @@ func (s *S3WAL) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch s
 		},
 		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
 			r, u := doc.Repos[repoID], doc.Upstreams[repoID]
-			if r == nil || r.DeletedAt != 0 || u == nil || u.Detaching || u.DefaultBranchOmitted {
+			if r == nil || r.DeletedAt != 0 || u == nil || u.Detaching || u.DefaultBranchOmitted || u.CreatedAt != linkCreatedAt {
 				return s3walMetaRerun
 			}
 			adopted = r.DefaultBranch == branch
