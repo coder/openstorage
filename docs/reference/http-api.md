@@ -131,16 +131,6 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
 
   To read a file by the name in a sibling, send its
   raw bytes percent-encoded in the `path` query parameter, for example
-||||||| caa296e6
-- **Path encoding**: path fields in JSON responses (`path`, `paths`, `old_path`,
-  `original_path`, `conflict_paths`, …) are UTF-8 strings. A git tree entry name can
-  hold any byte except NUL and `/`. Each byte of a name that is not valid UTF-8 comes
-  back as U+FFFD, so two names can list as the same path: `a<0xff>b` and `a<0xfe>b`
-  both list as `a\ufffdb`. Paging still visits both, because `next_cursor` keeps the
-  raw bytes. The listed U+FFFD form does not name the original file. It can name a
-  different file whose valid UTF-8 name holds a real U+FFFD (`a\ufffdb`), so a client
-  that sends a listed path back can read the wrong file. To read such a file, send the
-  raw bytes of its name percent-encoded in the `path` query parameter, for example
   `file?path=a%FFb`. `file`, `files`, `files/metadata`, `commits`, `diff`,
   `branches/diff` and `blame` read `path` byte for byte. An `archive` (tar member
   names) or a git clone gives the raw names. A JSON request body cannot hold such a
