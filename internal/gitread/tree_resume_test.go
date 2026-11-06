@@ -359,11 +359,13 @@ func TestTreeWalkListsFoldersThatAreOneTree(t *testing.T) {
 // and a level that takes more than maxWalkPasses is left to the stream. The
 // folders are one tree, as git stores them: the walk reads one of them.
 func TestTreeWalkPassesOverEmptyFolders(t *testing.T) {
-	empty := &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
 	for _, c := range []struct {
 		empties int
 		decline bool
 	}{{1000, false}, {3000, true}} {
+		// One folder object for each case: memEntry caches its id in the
+		// trees of the first case, and a later case would miss it.
+		empty := &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
 		root := map[string]*memEntry{"z": {mode: modeBlob}}
 		for i := range c.empties {
 			root[fmt.Sprintf("e%05d", i)] = empty
@@ -378,8 +380,8 @@ func TestTreeWalkPassesOverEmptyFolders(t *testing.T) {
 		if got, want := paths(w.page), []string{"z"}; !c.decline && !slices.Equal(got, want) {
 			t.Fatalf("%d folders without files: page %v, want %v", c.empties, got, want)
 		}
-		if n := cnt.opens[memRoot]; n > maxWalkPasses {
-			t.Fatalf("%d folders without files: the root was read %d times", c.empties, n)
+		if n := cnt.opens[memRoot]; n > maxWalkPasses || c.decline && n != maxWalkPasses {
+			t.Fatalf("%d folders without files: the root was read %d times, want at most %d and, to decline, exactly %d", c.empties, n, maxWalkPasses, maxWalkPasses)
 		}
 	}
 }

@@ -291,6 +291,28 @@ func TestLsTreePageCursorOnOddTrees(t *testing.T) {
 	}
 }
 
+// The walk reads an entry's mode and name through a buffer of 64 KiB
+// (treeReadBuffer) and leaves a tree with a longer name to the stream. The
+// sizes here are numbers, not the constant, so a buffer that is made larger or
+// smaller turns this red: a name of 60,000 bytes is read, one of 70,000 is not.
+func TestLsTreePageCursorOnNamesAroundTheBuffer(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	ctx := context.Background()
+	for _, c := range []struct {
+		size    int
+		decline bool
+	}{{60_000, false}, {70_000, true}} {
+		name := strings.Repeat("n", c.size)
+		commit := commitOf(t, dir, rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"100644 " + name, "2"}, [2]string{"100644 z", "3"}))
+		_, _, _, err := resumeTreePage(ctx, dir, commit, "", "a", 10)
+		if errors.Is(err, errDeclined) != c.decline || !c.decline && err != nil {
+			t.Errorf("a name of %d bytes: resumeTreePage err = %v, want declined %v", c.size, err, c.decline)
+		}
+		sameAsStream(t, ctx, dir, commit, "", "a", 10)
+	}
+}
+
 // git reads a replaced object through its replacement, the stream and the
 // walk both: the pages and the sizes are the ones ls-tree prints.
 func TestLsTreePageCursorOnReplacedObjects(t *testing.T) {
