@@ -1,0 +1,6 @@
+diff --git a/sub b/sub
+new file mode 160000
+--- /dev/null
++++ b/sub
+@@ -0,0 +1 @@
++Subproject commit zzz

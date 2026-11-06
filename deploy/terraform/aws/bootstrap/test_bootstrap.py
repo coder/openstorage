@@ -345,8 +345,9 @@ class UnitTests(unittest.TestCase):
         # serve's SIGTERM drain stops its own Git children within 10 s
         # (issue #440). KillMode=mixed keeps systemd's SIGTERM away from them,
         # and the stop timeout must cover the drain plus teardown, which can
-        # spend up to 5 s releasing the instance lease (leaseReleaseTimeout),
-        # plus margin.
+        # spend up to 5 s stopping River jobs on PostgreSQL (closeTimeout) and
+        # up to 5 s releasing the instance lease in zero-infra mode
+        # (leaseReleaseTimeout), plus margin.
         service = (Path(__file__).parent / "openstorage.service").read_text()
         settings = [line for line in service.splitlines() if not line.startswith("#")]
         self.assertIn("KillMode=mixed", settings)

@@ -104,22 +104,35 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
 - **Repeated params**: `path` may repeat on diff endpoints; `range` may repeat on blame.
 - **Paths are literal**: a `path` param names a file or directory. Wildcards
   (`*`, `?`, `[`) and git pathspec magic (`:(...)`) match only a path of that name.
-- **Path encoding**: path fields in JSON responses (`path`, `paths`, `old_path`,
-  `original_path`, `conflict_paths`, …) are UTF-8 strings. A git tree entry name can
-  hold any byte except NUL and `/`. Each byte of a name that is not valid UTF-8 comes
-  back as U+FFFD, so two names can list as the same path: `a<0xff>b` and `a<0xfe>b`
-  both list as `a\ufffdb`. Paging still visits both, because `next_cursor` keeps the
-  raw bytes. The listed U+FFFD form does not name the original file. It can name a
-  different file whose valid UTF-8 name holds a real U+FFFD (`a\ufffdb`), so a client
-  that sends a listed path back can read the wrong file. To read such a file, send the
-  raw bytes of its name percent-encoded in the `path` query parameter, for example
+- **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
+  JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
+  twice. The path field holds one U+FFFD per invalid byte, and a sibling field
+  `<field>_base64` holds the raw bytes as standard base64 (RFC 4648 section 4, with
+  padding). The sibling is absent when the path is valid UTF-8, so a repository with
+  only valid names gets responses with no new key. Read the sibling, not the listed
+  path: two names can list as the same path (`a<0xff>b` and `a<0xfe>b` both list as
+  `a\ufffdb`), and the listed U+FFFD form can also be a different file whose valid
+  UTF-8 name holds a real U+FFFD (`a\ufffdb`, which has no sibling). A list field
+  gets a list sibling of the same length and order, present when any element is not
+  valid UTF-8, and it holds the base64 of every element. The siblings are:
+  - `files`: `entries[].path_base64`, and `paths_base64` next to `paths`. Both
+    `paths` and `paths_base64` hold only the blob entries.
+  - `files/metadata`: `files[].path_base64`.
+  - `diff` and `branches/diff`: `path_base64` and `old_path_base64` in `files[]` and
+    `filtered_files[]`.
+  - `blame`: `path_base64`, and `original_path_base64` in `lines[]`.
+  - `grep`: `path_base64` in `matches[]`.
+
+  The merge conflict paths (`conflict_paths` in the 409 body and the merge preview
+  fields) still list U+FFFD only. To read a file by the name in a sibling, send its
+  raw bytes percent-encoded in the `path` query parameter, for example
   `file?path=a%FFb`. `file`, `files`, `files/metadata`, `commits`, `diff`,
   `branches/diff` and `blame` read `path` byte for byte. An `archive` (tar member
   names) or a git clone gives the raw names. A JSON request body cannot hold such a
-  name: grep `paths` and commit-pack file paths cannot name the file, and the archive
-  and grep globs match it only through a wildcard (`a?b`, `a*`), which can match
-  other names too. Upstream documents no path encoding
-  ([#587](https://github.com/coder/openstorage/issues/587)).
+  name yet: grep `paths` and commit-pack file paths cannot name the file, and the
+  archive and grep globs match it only through a wildcard (`a?b`, `a*`), which can
+  match other names too. Upstream documents no path encoding, so the siblings are an
+  extension ([#587](https://github.com/coder/openstorage/issues/587)).
 - **No client retries**: no SDK retries; every error surfaces immediately. Python
   client-side timeouts: 30s default, 60s diff/grep, 180s
   branch-create/merge/merge-preview/commit/tag/restore-commit.
@@ -321,11 +334,11 @@ or NUL fails the sync as a configuration error.
 |---|---|---|
 | `GET /repos/file` | `path` (req), `ref`, `ephemeral`, `ephemeral_base`; headers `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` | Raw blob stream. Status 200/206/304/412/416. Headers: `X-Blob-Sha`, `X-Last-Commit-Sha`, `ETag`, `Last-Modified`, `Accept-Ranges`, `Content-Range`, `Content-Type`, `Content-Length` |
 | `HEAD /repos/file` | same | headers only |
-| `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], ref, entries: [{path, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type`. Without `recursive`, with an empty `recursive=`, or with `recursive=true`, it lists the contents of every folder under `path` and no `tree` entries. `recursive=false` lists only the direct children of `path`, folders as `tree` entries. No `cursor` and no `limit` (or `limit=0`): every entry, or 422 when the listing passes the git [output limit](#resource-limits-on-git-reads). Big trees must page: a recursive call with `limit` or `cursor` reads only the entries of its page. With a cursor it reads the folders on the cursor's path and the ones after it, each whole, and none of the folders before it, so a deep cursor costs about what the first page does plus the size of those folders and a request to git for each folder of the page: a cursor inside one folder of a million entries still reads that whole folder, but the folders before it are not read. Because they are not read, a missing, unreadable or out-of-order object there, or a tree nested past git's depth limit, no longer fails a page that is not empty. A page that this does not suit is read from the start of the listing, as for a first page, and gives the same result: trees with unusual entries, trees nested more than 128 folders deep, many folders without files, many small folders, or one very large folder, when the cursor is near the start of the listing (git reads those faster than the walk does), a git that fails on the way, and pages that come out empty. A tree that git stores out of order (one that `git fsck` rejects as `treeNotSorted`) can page in git's order and skip entries; git itself cannot look such entries up by path |
-| `GET /repos/files/metadata` | same | `{files: [{path, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. `message` is the subject line only, as in the commits list ([Commits](#commits)). No `cursor` and no `limit` (or `limit=0`): every file. **429** when the files under `path` have more than 50,000 distinct last commits, also with `limit` or `cursor`: a retry gets the same 429 (no `Retry-After`), so send a narrower `path`. **404 on unborn branch** |
+| `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], paths_base64?: [..], ref, entries: [{path, path_base64?, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type`. Without `recursive`, with an empty `recursive=`, or with `recursive=true`, it lists the contents of every folder under `path` and no `tree` entries. `recursive=false` lists only the direct children of `path`, folders as `tree` entries. No `cursor` and no `limit` (or `limit=0`): every entry, or 422 when the listing passes the git [output limit](#resource-limits-on-git-reads). Big trees must page: a recursive call with `limit` or `cursor` reads only the entries of its page. With a cursor it reads the folders on the cursor's path and the ones after it, each whole, and none of the folders before it, so a deep cursor costs about what the first page does plus the size of those folders and a request to git for each folder of the page: a cursor inside one folder of a million entries still reads that whole folder, but the folders before it are not read. Because they are not read, a missing, unreadable or out-of-order object there, or a tree nested past git's depth limit, no longer fails a page that is not empty. A page that this does not suit is read from the start of the listing, as for a first page, and gives the same result: trees with unusual entries, trees nested more than 128 folders deep, many folders without files, many small folders, or one very large folder, when the cursor is near the start of the listing (git reads those faster than the walk does), a git that fails on the way, and pages that come out empty. A tree that git stores out of order (one that `git fsck` rejects as `treeNotSorted`) can page in git's order and skip entries; git itself cannot look such entries up by path |
+| `GET /repos/files/metadata` | same | `{files: [{path, path_base64?, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. `message` is the subject line only, as in the commits list ([Commits](#commits)). No `cursor` and no `limit` (or `limit=0`): every file. **429** when the files under `path` have more than 50,000 distinct last commits, also with `limit` or `cursor`: a retry gets the same 429 (no `Retry-After`), so send a narrower `path`. **404 on unborn branch** |
 | `POST /repos/archive` | body `{ref?, include_globs?, exclude_globs?, max_blob_size?, archive?: {prefix}}` | tar.gz stream |
-| `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, file_filters?: {include_globs, exclude_globs, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
-| `GET /repos/blame` | `path` (req), `ref`, `ephemeral`, `range` (repeatable, `git blame -L` specs like `1,10`), `detect_moves` | `{ref, path, commit_sha, lines: [{line_number, commit_sha, original_line_number, original_path, previous_commit_sha?, author_name, author_email, author_time, committer_name, committer_email, committer_time, summary}]}` |
+| `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, file_filters?: {include_globs, exclude_globs, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, path_base64?, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
+| `GET /repos/blame` | `path` (req), `ref`, `ephemeral`, `range` (repeatable, `git blame -L` specs like `1,10`), `detect_moves` | `{ref, path, path_base64?, commit_sha, lines: [{line_number, commit_sha, original_line_number, original_path, original_path_base64?, previous_commit_sha?, author_name, author_email, author_time, committer_name, committer_email, committer_time, summary}]}` |
 
 `order` in `files/metadata` is the commit's history-order rank relative to the resolved ref: its 0-based position in `git rev-list --topo-order <resolved commit>`. The ref's own commit is `0`, and larger values are older. A commit always ranks higher than every one of its descendants, whatever its author or committer date. Among a folder's files, the one with the smallest `order` was changed most recently in the ref's history.
 
@@ -430,9 +443,10 @@ old behavior, read `default_branch` from `GET /repo` and send it as `base_ref`.
 This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster behavior
 ([contract audit](../explanation/wire-compatibility.md#server-allocated-branch-contract)).
 
-`FileDiff` = `{path, state (raw letter; SDKs normalize A/M/D/R/C/T/U), old_path?, raw
+`FileDiff` = `{path, path_base64?, state (raw letter; SDKs normalize A/M/D/R/C/T/U), old_path?, old_path_base64?, raw
 (unified diff text), bytes, is_eof, additions, deletions}`. `filtered_files` entries omit
-`raw`/counts; large files are filtered unless requested via `path`.
+`raw`/counts; large files are filtered unless requested via `path`. Every `*_base64?` key
+is present only for a path that is not valid UTF-8 ([Path encoding](#conventions)).
 
 ### Commits
 

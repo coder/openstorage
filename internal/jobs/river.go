@@ -443,9 +443,7 @@ func (w *sweepWorker) Work(ctx context.Context, _ *river.Job[sweepArgs]) error {
 	if w.schedule == nil {
 		return errScheduleOff
 	}
-	ctx, cancel := context.WithTimeout(ctx, passJobTimeout)
-	defer cancel()
-	return w.schedule.runOnce(ctx)
+	return w.schedule.runOnce(ctx, passJobTimeout, sweepPurgeTimeout)
 }
 
 // deliveryWorker performs one signed POST per job attempt; River owns the
@@ -812,8 +810,18 @@ var (
 )
 
 const (
-	passJobTimeout   = 2 * time.Hour
-	sweepRescueAfter = passJobTimeout + 2*sweepRecoveryTimeout
+	passJobTimeout = 2 * time.Hour
+	// A sweep job is the sweep, then the retention purge (SweepSchedule.runOnce).
+	// The purge keeps sweepPurgeTimeout of its own whatever the sweep did, so
+	// a sweep that uses its whole time cannot starve it. The purge's deletes
+	// are durable, and a purge cut short finishes over later passes.
+	//
+	// Worst case, a job ends passJobTimeout - sweepPurgeTimeout after its
+	// start, plus a recovery tail (the sweep's detached safeDelete step), plus
+	// sweepPurgeTimeout, plus a second tail from the purge's own safeDelete:
+	// 2 h 30 min. The rescue horizon adds one more tail of margin.
+	sweepPurgeTimeout = 15 * time.Minute
+	sweepRescueAfter  = passJobTimeout + 3*sweepRecoveryTimeout
 )
 
 // NewRiver opens a dedicated pool on pgURL, applies the river migrations

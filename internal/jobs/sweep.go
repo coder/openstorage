@@ -565,6 +565,25 @@ func (s *Sweeper) quarantinePurgeAge() time.Duration {
 	return max(s.cfg.Threshold, QuarantinePurgeFloor)
 }
 
+// healEntryTimeout bounds one quarantine heal entry from its last read to its
+// purge: the registry read of an unregistered key, or the read of a registered
+// key's original after its restore. A backup is purged once it is older than
+// quarantinePurgeAge, and the purge is safe only when what the entry read
+// still holds. For an unregistered key no write that was in flight at the
+// backup's copy or delete can register after the registry read, because such
+// a write finishes before the backup reaches purge age. For a registered key
+// the original is present, so the backup is not the object's last copy (the
+// model's HealEntryBounded fact). Without a bound, a stalled blob call could
+// let that read go stale for as long as the whole sweep ran. The bound
+// is one restore copy, which sweepRecoveryTimeout already sizes for the
+// largest supported packs, and it must leave QuarantinePurgeFloor room for
+// the two phases of a handshake (2×sweepRecoveryTimeout) besides.
+//
+// The restore of a registered key is not bounded: it copies and hashes the
+// whole backup, which a large LFS object can take longer than any fixed bound
+// to do. It runs before the bound opens.
+const healEntryTimeout = sweepRecoveryTimeout
+
 // registered dispatches the authoritative membership lookup by key class:
 // lfs/ keys consult the LFS registry (issue #51), everything else the pack
 // registry. Keys are self-describing (disjoint prefixes), so no class needs
@@ -1294,6 +1313,8 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge
 // healQuarantineEntry disposes of one quarantine backup per the
 // healQuarantine contract.
 func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, report *SweepReport, purgeAll, purgeFenced bool) error {
+	ectx, cancel := context.WithTimeout(ctx, healEntryTimeout)
+	defer cancel()
 	orig, ok := parseQuarantineKey(q.Key)
 	var repo string
 	if ok {
@@ -1304,11 +1325,16 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		return nil
 	}
 	assertNotWAL(orig)
-	registered, err := s.registered(ctx, repo, orig)
+	registered, err := s.registered(ectx, repo, orig)
 	if err != nil {
 		return fmt.Errorf("sweep: heal %s: has pack: %w", orig, err)
 	}
 	if registered {
+		// Restoring a registered original copies and hashes the whole backup,
+		// which no fixed bound fits, so this block runs on ctx (see
+		// healEntryTimeout). The purge below needs a read of the original
+		// that is at most healEntryTimeout old, so it opens a new bound.
+		junk := false
 		switch size, err := s.blobs.Stat(ctx, orig); {
 		case errors.Is(err, blob.ErrNotFound):
 			switch restored, err := s.restoreFromQuarantine(ctx, orig, q.Key); {
@@ -1327,11 +1353,13 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 				return fmt.Errorf("sweep: heal %s: restore: %w", orig, err)
 			case restored:
 				s.logger.Warn("orphan pack sweep: healed registered pack from quarantine", "key", orig)
+			default:
+				// An LFS backup failing the key's digest (pre-registry
+				// bytes) — never restored over a registered row; the row
+				// stays in the zero-growth repair state and the aged purge
+				// below still collects the backup.
+				junk = true
 			}
-			// !restored: an LFS backup failing the key's digest (pre-registry
-			// bytes) — never restored over a registered row; the row stays in
-			// the zero-growth repair state and the aged purge below still
-			// collects the backup.
 		case err != nil:
 			return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
 		default:
@@ -1351,7 +1379,18 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 				return nil
 			}
 		}
-	} else if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
+		cancel()
+		bound, boundCancel := context.WithTimeout(ctx, healEntryTimeout)
+		defer boundCancel()
+		ectx = bound
+		if !junk {
+			if _, err := s.blobs.Stat(ectx, orig); errors.Is(err, blob.ErrNotFound) {
+				return nil // taken again since the restore: the next sweep heals it
+			} else if err != nil {
+				return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
+			}
+		}
+	} else if _, err := s.blobs.Stat(ectx, orig); errors.Is(err, blob.ErrNotFound) {
 		// Crash self-heal for the reap ledger (issue #31): a safeDelete
 		// that died between its blob delete and its ReclaimRetainedPack
 		// left the retained row (and its quota bytes) behind. The original
@@ -1360,7 +1399,7 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		// reap already removed the row (reclaims 0), and a concurrent
 		// identical re-push that re-registers the key afterwards credits
 		// its bytes freshly, netting zero.
-		bytes, rerr := s.packs.ReclaimRetainedPack(ctx, repo, orig)
+		bytes, rerr := s.packs.ReclaimRetainedPack(ectx, repo, orig)
 		if rerr != nil {
 			return fmt.Errorf("sweep: heal %s: reclaim retained: %w", orig, rerr)
 		}
@@ -1388,7 +1427,7 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		// never register again). An ordinary orphan's backup may be the
 		// last copy of bytes the rollback exists to protect (PR #105
 		// round 12).
-		fenced, err := s.cfg.PurgedRepoProbe(ctx, baseOf(repo))
+		fenced, err := s.cfg.PurgedRepoProbe(ectx, baseOf(repo))
 		if err != nil {
 			return fmt.Errorf("sweep: purge quarantine %s: is repo purged: %w", q.Key, err)
 		}
@@ -1396,7 +1435,12 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 			return nil
 		}
 	}
-	switch err := s.blobs.Delete(ctx, q.Key); {
+	// A store that ignores its context, such as the file store, returns from a
+	// stalled read late and without an error, so the bound is checked here.
+	if err := ectx.Err(); err != nil {
+		return fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err)
+	}
+	switch err := s.blobs.Delete(ectx, q.Key); {
 	case errors.Is(err, blob.ErrNotFound):
 		// A concurrent sweep purged this entry first: it reclaimed the
 		// bytes and credited them; crediting here too would double-count.
@@ -1712,11 +1756,42 @@ type SweepSchedule struct {
 // runOnce executes one scheduled tick: the sweep, then — even when the
 // sweep errored, so a noisy orphan backlog cannot starve reclamation — the
 // retention purge pass. Errors are joined for the caller's reporting.
-func (s *SweepSchedule) runOnce(ctx context.Context) error {
-	_, sweepErr := s.Sweeper.Sweep(ctx)
+//
+// A positive jobBudget bounds the whole tick, counted from its start. With a
+// purger, the sweep ends purgeFloor before that, so a sweep that uses its
+// whole time still leaves the purge purgeFloor, counted from when the purge
+// starts and so also after a sweep that returned late. The purge may use more
+// when the sweep finished early, up to the end of jobBudget. Without a
+// purger the sweep gets all of jobBudget. Zero leaves the tick on ctx alone,
+// as in local mode, which has no deadline.
+func (s *SweepSchedule) runOnce(ctx context.Context, jobBudget, purgeFloor time.Duration) error {
+	assertf(jobBudget >= 0 && purgeFloor >= 0 && (jobBudget == 0 || purgeFloor < jobBudget),
+		"runOnce: job budget %v, purge floor %v", jobBudget, purgeFloor)
+	start := time.Now()
+	sweepCtx := ctx
+	if jobBudget > 0 {
+		sweepBudget := jobBudget
+		if s.Purger != nil {
+			sweepBudget -= purgeFloor
+		}
+		var cancel context.CancelFunc
+		sweepCtx, cancel = context.WithTimeout(ctx, sweepBudget)
+		defer cancel()
+	}
+	_, sweepErr := s.Sweeper.Sweep(sweepCtx)
 	var purgeErr error
 	if s.Purger != nil {
-		_, purgeErr = s.Purger.PurgeExpired(ctx)
+		purgeCtx := ctx
+		if jobBudget > 0 {
+			deadline := start.Add(jobBudget)
+			if floor := time.Now().Add(purgeFloor); deadline.Before(floor) {
+				deadline = floor
+			}
+			var cancel context.CancelFunc
+			purgeCtx, cancel = context.WithDeadline(ctx, deadline)
+			defer cancel()
+		}
+		_, purgeErr = s.Purger.PurgeExpired(purgeCtx)
 	}
 	return errors.Join(sweepErr, purgeErr)
 }
@@ -1735,7 +1810,7 @@ func StartSweepTicker(schedule *SweepSchedule) (stop func()) {
 		ticker := time.NewTicker(schedule.Interval)
 		defer ticker.Stop()
 		for {
-			if err := schedule.runOnce(ctx); err != nil && ctx.Err() == nil {
+			if err := schedule.runOnce(ctx, 0, 0); err != nil && ctx.Err() == nil {
 				schedule.Sweeper.logger.Error("scheduled sweep failed", "err", err)
 			}
 			select {

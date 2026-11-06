@@ -48,6 +48,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -908,6 +909,68 @@ func wcNumstatPaths(out string) ([]string, error) {
 	return paths, nil
 }
 
+// wcParsePatch runs one `git apply` mode that only parses the patch (it
+// leaves the index alone). A rejection that is not the server's means the
+// payload is not a patch (400, spec "the diff payload was invalid"). Any
+// other failure is the server's own (500).
+func (s *server) wcParsePatch(w http.ResponseWriter, r *http.Request, sc *wcScratch, patchPath string, md *wcMetadata, plan *wcPlan, args ...string) (string, bool) {
+	out, err := sc.applyPatch(r.Context(), patchPath, args...)
+	var rej *wcApplyRejection
+	switch {
+	case err == nil:
+		return out, true
+	case errors.As(err, &rej) && !rej.server:
+		wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+rej.msg, md.TargetBranch, plan.oldSHA)
+	default:
+		s.wcInternal(w, r, "parse patch", err)
+	}
+	return "", false
+}
+
+// wcPatchModeError reads `git apply --summary` for the modes a patch gives a
+// file: " create mode <mode> <path>" and " mode change <old> => <new>
+// <path>". git 2.55 prints a canonical mode (100644, 100755, 120000, 160000,
+// or 040000 for a directory), and an older git prints the mode as the patch
+// wrote it (100664). Either way git commits a regular file, a symlink or a
+// submodule, so wcSummaryModeOK reads the type bits and not the permission
+// bits. A name that holds a newline can put such a line into the summary,
+// which turns that patch into a 400: it fails closed, for the client's own
+// request.
+func wcPatchModeError(summary string) error {
+	for line := range strings.Lines(summary) {
+		line = strings.TrimSuffix(line, "\n")
+		var rest string
+		if after, ok := strings.CutPrefix(line, " create mode "); ok {
+			rest = after
+		} else if after, ok := strings.CutPrefix(line, " mode change "); ok {
+			_, rest, _ = strings.Cut(after, " => ")
+		} else {
+			continue
+		}
+		mode, name, _ := strings.Cut(rest, " ")
+		if !wcSummaryModeOK(mode) {
+			return fmt.Errorf("invalid mode %q for %q", mode, name)
+		}
+	}
+	return nil
+}
+
+// wcSummaryModeOK reports whether an octal mode from `git apply --summary` has
+// the type of a file a commit can hold: a regular file, a symlink or a
+// submodule. A directory (040000) is the type that git applies to the index
+// and that write-tree then leaves out.
+func wcSummaryModeOK(mode string) bool {
+	m, err := strconv.ParseUint(mode, 8, 32)
+	if err != nil {
+		return false
+	}
+	switch m & 0o170000 {
+	case 0o100000, 0o120000, 0o160000:
+		return true
+	}
+	return false
+}
+
 // resolveTree resolves a commit sha to its tree sha.
 func (sc *wcScratch) resolveTree(ctx context.Context, commitSHA string) (string, error) {
 	assertf(ref.ValidSHA(commitSHA), "resolveTree: malformed sha %q", commitSHA)
@@ -1459,12 +1522,8 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 		// parse failure means the payload is not a patch (400, spec "the
 		// diff payload was invalid").
 		var rej *wcApplyRejection
-		numstat, err := sc.applyPatch(r.Context(), patchPath, "--numstat", "-z")
-		if errors.As(err, &rej) && !rej.server {
-			wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+rej.msg, md.TargetBranch, plan.oldSHA)
-			return
-		} else if err != nil {
-			s.wcInternal(w, r, "parse patch", err)
+		numstat, ok := s.wcParsePatch(w, r, sc, patchPath, md, plan, "--numstat", "-z")
+		if !ok {
 			return
 		}
 		paths, err := wcNumstatPaths(numstat)
@@ -1479,6 +1538,17 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 				wcFail(w, http.StatusBadRequest, "invalid", "invalid patch: "+err.Error(), md.TargetBranch, plan.oldSHA)
 				return
 			}
+		}
+		// git apply --cached takes a directory mode and write-tree then
+		// leaves the entry out, so the commit would answer 200 without the
+		// file. A mode that no commit can hold is the patch's fault.
+		summary, ok := s.wcParsePatch(w, r, sc, patchPath, md, plan, "--summary")
+		if !ok {
+			return
+		}
+		if err := wcPatchModeError(summary); err != nil {
+			wcFail(w, http.StatusBadRequest, "invalid", "invalid patch: "+err.Error(), md.TargetBranch, plan.oldSHA)
+			return
 		}
 		// git checks names and modes only here, so a patch that only git
 		// refuses is a 400 as well. A patch that does not fit the base tree

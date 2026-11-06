@@ -128,7 +128,10 @@ func testMode() bool { return envconfig.Getenv(EnvTestMode) == "1" }
 // wrapping just the CAS-recovery decorator so ambiguous outcomes still
 // reconcile. An error refuses the ref update before its CAS (issues #445,
 // #466: the metadata document is in a format this binary cannot write
-// events to, or corrupt).
+// events to, or corrupt). When the hook cannot wire its eventing, the cmd
+// wiring returns a store that refuses every update that would record
+// forward intent and passes the rest, still through ref.IdempotentCAS
+// (cmd/openstorage intentlessRefStore, ADR-33's amendment).
 var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
 	return ref.IdempotentCAS{RefStore: st}, nil
 }
