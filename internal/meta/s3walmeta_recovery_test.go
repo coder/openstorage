@@ -153,6 +153,76 @@ func TestS3WALMetaRecoveryTryBeginSync(t *testing.T) {
 	}
 }
 
+// TestS3WALMetaRecoveryAdoptDefaultBranch: an ambiguous adopt PUT, landed or
+// dropped and superseded by a competitor either way, must leave the branch
+// adopted and the flag clear, and report the adoption (issue #603).
+func TestS3WALMetaRecoveryAdoptDefaultBranch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault s3wal.PutFault
+	}{
+		{"applied", s3wal.FaultAmbiguousApplied},
+		{"dropped", s3wal.FaultAmbiguousDropped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			cas, a, b := newS3WALMetaPair(t)
+			if _, err := a.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+				t.Fatalf("seed org: %v", err)
+			}
+			repo, err := a.CreateLinkedRepo(ctx, "org", "https://example.com/adopt.git", "main",
+				RepoUpstream{Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com", DefaultBranchOmitted: true}, nil)
+			if err != nil {
+				t.Fatalf("seed repo: %v", err)
+			}
+			armAmbiguousPut(t, cas, tc.fault, func() {
+				if _, err := b.UpsertOrgWithKeys(ctx, "interloper", []string{"pem"}); err != nil {
+					t.Errorf("interleaved write: %v", err)
+				}
+			})
+			adopted, err := a.AdoptUpstreamDefaultBranch(ctx, repo.RepoID, "trunk")
+			if err != nil || !adopted {
+				t.Fatalf("adopt through ambiguity = %v, %v; want adopted", adopted, err)
+			}
+			got, err := a.GetRepoByURL(ctx, "org", "https://example.com/adopt.git")
+			up, uerr := a.GetRepoUpstream(ctx, repo.RepoID)
+			if err != nil || uerr != nil || got.DefaultBranch != "trunk" || up.DefaultBranchOmitted {
+				t.Fatalf("stored = %+v (%v), upstream %+v (%v); want trunk and a clear flag", got, err, up, uerr)
+			}
+			if again, err := a.AdoptUpstreamDefaultBranch(ctx, repo.RepoID, "next"); err != nil || again {
+				t.Fatalf("second adopt = %v, %v; want false", again, err)
+			}
+		})
+	}
+}
+
+// TestS3WALAdoptSkipsDetachingUpstream: a row that DeleteRepoUpstream has
+// marked for detach has nothing to adopt, and its flag stays as it is.
+func TestS3WALAdoptSkipsDetachingUpstream(t *testing.T) {
+	ctx := context.Background()
+	_, a, _ := newS3WALMetaPair(t)
+	if _, err := a.UpsertOrgWithKeys(ctx, "org", []string{"pem"}); err != nil {
+		t.Fatalf("seed org: %v", err)
+	}
+	repo, err := a.CreateLinkedRepo(ctx, "org", "https://example.com/detaching.git", "main",
+		RepoUpstream{Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com", DefaultBranchOmitted: true}, nil)
+	if err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	if err := a.mutate(ctx, s3walMetaMutation{op: "mark detaching", fn: func(doc *s3walMetaDoc) (bool, error) {
+		doc.Upstreams[repo.RepoID].Detaching = true
+		return true, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if adopted, err := a.AdoptUpstreamDefaultBranch(ctx, repo.RepoID, "trunk"); err != nil || adopted {
+		t.Fatalf("adopt on a detaching row = %v, %v; want false", adopted, err)
+	}
+	if got, err := a.GetRepoByURL(ctx, "org", "https://example.com/detaching.git"); err != nil || got.DefaultBranch != "main" {
+		t.Fatalf("repo = %+v, %v; want main", got, err)
+	}
+}
+
 // TestS3WALMetaRecoveryFinishSync: an ambiguous finish PUT must advance
 // the counters exactly once (the counter-advancement PRED), for both the
 // landed and dropped windows.

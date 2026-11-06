@@ -7,7 +7,10 @@ import (
 	"testing"
 )
 
-func TestAdoptUpstreamDefaultBranch(t *testing.T) { runBackends(t, testAdoptUpstreamDefaultBranch) }
+func TestAdoptUpstreamDefaultBranch(t *testing.T) {
+	runBackends(t, testAdoptUpstreamDefaultBranch)
+	t.Run("s3wal", func(t *testing.T) { testAdoptUpstreamDefaultBranch(t, s3walBackend(t)) })
+}
 
 // testAdoptUpstreamDefaultBranch: a GitHub sync create without a default
 // branch stores DefaultBranchOmitted (issue #599). Adopting the upstream
@@ -74,7 +77,7 @@ func testAdoptUpstreamDefaultBranch(t *testing.T, s Backend) {
 	// An older binary's PATCH (rolling upgrade) changes the branch without
 	// clearing the flag: adopt then only clears the flag.
 	oldPatch := create("old-patch", true)
-	rawExec(t, s, `UPDATE repos SET default_branch = 'dev' WHERE repo_id = '`+oldPatch.RepoID+`'`)
+	oldBinaryPatch(t, s, oldPatch.RepoID, "dev")
 	adopt("adopt after an old-binary PATCH", oldPatch, "trunk", false)
 	expect("adopt after an old-binary PATCH", oldPatch, "dev", false)
 
@@ -93,31 +96,6 @@ func testAdoptUpstreamDefaultBranch(t *testing.T, s Backend) {
 	}
 	if _, err := s.AdoptUpstreamDefaultBranch(ctx, deleted.RepoID, "trunk"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("adopt on a deleted repo err = %v, want ErrNotFound", err)
-	}
-}
-
-// TestS3WALDropsDefaultBranchOmitted: until S3-WAL create writes the v3
-// field, it stores no flag and never adopts (issue #599 deviation, #603).
-func TestS3WALDropsDefaultBranchOmitted(t *testing.T) {
-	s := s3walBackend(t)
-	ctx := t.Context()
-	org := seedOrg(t, s)
-	repo, err := s.CreateLinkedRepo(ctx, org, "omitted", "main",
-		RepoUpstream{Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com", DefaultBranchOmitted: true}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if up, err := s.GetRepoUpstream(ctx, repo.RepoID); err != nil || up.DefaultBranchOmitted {
-		t.Fatalf("upstream = %+v, %v; want no flag", up, err)
-	}
-	if adopted, err := s.AdoptUpstreamDefaultBranch(ctx, repo.RepoID, "trunk"); err != nil || adopted {
-		t.Fatalf("adopt = %v, %v; want false", adopted, err)
-	}
-	if got, err := s.GetRepoByURL(ctx, org, "omitted"); err != nil || got.DefaultBranch != "main" {
-		t.Fatalf("repo = %+v, %v; want main", got, err)
-	}
-	if _, err := s.AdoptUpstreamDefaultBranch(ctx, "repo_0123456789ab", "trunk"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("adopt on an unknown repo err = %v, want ErrNotFound", err)
 	}
 }
 
@@ -184,6 +162,27 @@ func upgradeDefaultBranchOmitted(t *testing.T, s Backend, initSchema func(contex
 	}
 	if adopted, err := s.AdoptUpstreamDefaultBranch(ctx, repo.RepoID, "trunk"); err != nil || adopted {
 		t.Fatalf("adopt on an upgraded row = %v, %v; want false", adopted, err)
+	}
+}
+
+// oldBinaryPatch changes a repo's default branch the way a binary from
+// before the adoption rule does: the branch moves and the flag stays.
+func oldBinaryPatch(t *testing.T, s Backend, repoID, branch string) {
+	t.Helper()
+	w, ok := s.(*S3WAL)
+	if !ok {
+		rawExec(t, s, `UPDATE repos SET default_branch = '`+branch+`' WHERE repo_id = '`+repoID+`'`)
+		return
+	}
+	err := w.mutate(t.Context(), s3walMetaMutation{
+		op: "old-binary PATCH",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			doc.Repos[repoID].DefaultBranch = branch
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("old-binary PATCH: %v", err)
 	}
 }
 

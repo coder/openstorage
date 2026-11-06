@@ -497,7 +497,7 @@ func (s *S3WAL) CreateLinkedRepo(ctx context.Context, org, url, defaultBranch st
 			}
 			doc.Upstreams[repoID] = &s3walMetaUpstream{
 				Provider: up.Provider, Owner: up.Owner, Name: up.Name, UpstreamHost: up.UpstreamHost,
-				ForwardOnPush: up.ForwardOnPush, CreatedAt: nanos,
+				ForwardOnPush: up.ForwardOnPush, DefaultBranchOmitted: up.DefaultBranchOmitted, CreatedAt: nanos,
 			}
 			repo = Repo{RepoID: repoID, OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt,
 				CreateState: CreateStatePending}
@@ -540,7 +540,7 @@ func (s *S3WAL) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstr
 	up.CreatedAt = createdAt
 	row := &s3walMetaUpstream{
 		Provider: up.Provider, Owner: up.Owner, Name: up.Name, UpstreamHost: up.UpstreamHost,
-		ForwardOnPush: up.ForwardOnPush, CreatedAt: nanos,
+		ForwardOnPush: up.ForwardOnPush, DefaultBranchOmitted: up.DefaultBranchOmitted, CreatedAt: nanos,
 	}
 	err := s.mutate(ctx, s3walMetaMutation{
 		op: "set upstream",
@@ -563,7 +563,7 @@ func (s *S3WAL) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstr
 			if got := doc.Upstreams[up.RepoID]; got != nil && got.CreatedAt == nanos &&
 				got.Provider == row.Provider && got.Owner == row.Owner &&
 				got.Name == row.Name && got.UpstreamHost == row.UpstreamHost &&
-				got.ForwardOnPush == row.ForwardOnPush {
+				got.ForwardOnPush == row.ForwardOnPush && got.DefaultBranchOmitted == row.DefaultBranchOmitted {
 				return s3walMetaApplied
 			}
 			return s3walMetaRerun
@@ -575,19 +575,51 @@ func (s *S3WAL) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstr
 	return up, nil
 }
 
-// AdoptUpstreamDefaultBranch never adopts (meta.EventingStore contract):
-// metadata v2 is frozen, so S3-WAL stores no DefaultBranchOmitted flag
-// and its sync repos keep "main" (issue #599, a recorded deviation).
+// AdoptUpstreamDefaultBranch (meta.EventingStore contract) in one CAS: the
+// flag clears and the branch moves together, and only while the flag is
+// set. A row that is detached or mid-detach has nothing to adopt.
+// Recovery class PRED: a clear flag after an ambiguous write means the
+// adoption (or an explicit PATCH, which wins) happened, and adopted is
+// whether the branch is the one asked for, the divergence that
+// UpdateRepoDefaultBranch accepts too.
 func (s *S3WAL) AdoptUpstreamDefaultBranch(ctx context.Context, repoID, branch string) (bool, error) {
 	assertf(repoID != "" && branch != "", "AdoptUpstreamDefaultBranch: empty repo id %q or branch %q", repoID, branch)
-	doc, err := s.viewDoc(ctx)
+	if err := utf8OK("default branch", branch); err != nil {
+		return false, fmt.Errorf("adopt default branch of repo %q: %w", repoID, err)
+	}
+	adopted := false
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "adopt default branch",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			adopted = false
+			r := doc.Repos[repoID]
+			if r == nil || r.DeletedAt != 0 {
+				return false, fmt.Errorf("adopt default branch of repo %q: %w", repoID, ErrNotFound)
+			}
+			u := doc.Upstreams[repoID]
+			if u == nil || u.Detaching || !u.DefaultBranchOmitted {
+				return false, nil
+			}
+			u.DefaultBranchOmitted = false
+			if r.DefaultBranch == OmittedDefaultBranch {
+				r.DefaultBranch = branch
+				adopted = true
+			}
+			return true, nil
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			r, u := doc.Repos[repoID], doc.Upstreams[repoID]
+			if r == nil || r.DeletedAt != 0 || u == nil || u.Detaching || u.DefaultBranchOmitted {
+				return s3walMetaRerun
+			}
+			adopted = r.DefaultBranch == branch
+			return s3walMetaApplied
+		},
+	})
 	if err != nil {
 		return false, err
 	}
-	if r := doc.Repos[repoID]; r == nil || r.DeletedAt != 0 {
-		return false, fmt.Errorf("adopt default branch of repo %q: %w", repoID, ErrNotFound)
-	}
-	return false, nil
+	return adopted, nil
 }
 
 // GetRepoUpstream returns the row; ErrNotFound when detached/never linked.
