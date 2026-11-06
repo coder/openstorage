@@ -164,6 +164,76 @@ func TestRunShutdownRestoreIsBounded(t *testing.T) {
 	}
 }
 
+// stallRestorePushStore is a MemStore whose RestorePush hangs until its
+// context ends, like a stalled database.
+type stallRestorePushStore struct{ *MemStore }
+
+func (s stallRestorePushStore) RestorePush(ctx context.Context, _, _ string, _ bool) (Upstream, error) {
+	<-ctx.Done()
+	return Upstream{}, ctx.Err()
+}
+
+// A River push run whose publication wait the drain cancels restores
+// within shutdownRestoreTimeout, like a cancelled transfer, not within the
+// longer detached finish budget.
+func TestPushRunShutdownDuringPublicationWaitRestoreIsBounded(t *testing.T) {
+	f := newWorkerFixture(t)
+	f.worker.Upstreams = stallRestorePushStore{f.store}
+	seedLocalRepo(t, f, "repo_s5")
+	f.putUpstream(t, "repo_s5", "own", "s5", "file://"+f.upstreamDir)
+	if err := f.store.RequestPush(t.Context(), "repo_s5", false); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	f.worker.WaitPublication = func(wctx context.Context, _ string) error {
+		cancel(ErrShutdown)
+		<-wctx.Done()
+		return wctx.Err()
+	}
+	start := time.Now()
+	err := f.worker.RunPush(ctx, Job{Org: "org", RepoID: "repo_s5"})
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrShutdown) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RunPush = %v, want the restore's timeout, marked ErrShutdown", err)
+	}
+	if elapsed > shutdownRestoreTimeout+5*time.Second {
+		t.Fatalf("RunPush returned after %v, want about shutdownRestoreTimeout (%v)", elapsed, shutdownRestoreTimeout)
+	}
+}
+
+// failRestorePushStore is a MemStore whose RestorePush runs before and
+// then fails, like a database that went away.
+type failRestorePushStore struct {
+	*MemStore
+	before func()
+}
+
+func (s failRestorePushStore) RestorePush(context.Context, string, string, bool) (Upstream, error) {
+	s.before()
+	return Upstream{}, errors.New("database unreachable")
+}
+
+// A drain that cancels a River push run while it restores after a failed
+// publication wait still marks the run's error as shutdown-caused, so
+// River keeps the job (jobs.shutdownSnooze) instead of completing it with
+// the claim held and the request consumed.
+func TestPushRunShutdownDuringFailedWaitRestoreKeepsJob(t *testing.T) {
+	f := newWorkerFixture(t)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	f.worker.Upstreams = failRestorePushStore{MemStore: f.store, before: func() { cancel(ErrShutdown) }}
+	seedLocalRepo(t, f, "repo_s6")
+	f.putUpstream(t, "repo_s6", "own", "s6", "file://"+f.upstreamDir)
+	if err := f.store.RequestPush(t.Context(), "repo_s6", false); err != nil {
+		t.Fatal(err)
+	}
+	f.worker.WaitPublication = func(context.Context, string) error { return errors.New("hold unreadable") }
+	if err := f.worker.RunPush(ctx, Job{Org: "org", RepoID: "repo_s6"}); !errors.Is(err, ErrShutdown) {
+		t.Fatalf("RunPush = %v, want ErrShutdown", err)
+	}
+}
+
 // stallClaimStore is a MemStore whose BeginSync hangs until its context
 // ends, like a stalled database.
 type stallClaimStore struct {

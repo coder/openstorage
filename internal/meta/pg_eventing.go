@@ -726,6 +726,39 @@ func (s *PG) RequestPush(ctx context.Context, repoID string, force bool) error {
 	return nil
 }
 
+// PGForwardsOnPush reports, inside the caller's transaction and without
+// a lock, whether repoID has an upstream link with forward_on_push.
+func PGForwardsOnPush(ctx context.Context, tx pgx.Tx, repoID string) (bool, error) {
+	assertf(tx != nil, "PGForwardsOnPush: nil tx")
+	assertf(repoID != "", "PGForwardsOnPush: empty repo id")
+	var forwards bool
+	err := tx.QueryRow(ctx, `SELECT forward_on_push FROM repo_upstreams WHERE repo_id = $1`, repoID).Scan(&forwards)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read forward_on_push for repo %q: %w", repoID, err)
+	}
+	return forwards, nil
+}
+
+// PGRequestForward is RequestPush(repoID, false) inside the caller's
+// transaction for a repository that forwards on push. It reports whether
+// the repository has an upstream link with forward_on_push; otherwise it
+// writes nothing. The marked row stays locked until the caller commits.
+func PGRequestForward(ctx context.Context, tx pgx.Tx, repoID string) (bool, error) {
+	assertf(tx != nil, "PGRequestForward: nil tx")
+	assertf(repoID != "", "PGRequestForward: empty repo id")
+	tag, err := tx.Exec(ctx,
+		`UPDATE repo_upstreams SET push_pending = GREATEST(push_pending, 1) WHERE repo_id = $1 AND forward_on_push`,
+		repoID)
+	if err != nil {
+		return false, fmt.Errorf("request forward for repo %q: %w", repoID, err)
+	}
+	assertf(tag.RowsAffected() <= 1, "UPDATE by primary key affected %d rows", tag.RowsAffected())
+	return tag.RowsAffected() == 1, nil
+}
+
 // TryBeginPush is TryBeginSync on the push_* lane (issue #90): row-locked
 // read-check-write on the database clock, expired leases stolen atomically.
 // No legacy adoption exists here — push claims only ever come from

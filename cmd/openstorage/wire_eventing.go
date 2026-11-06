@@ -356,16 +356,29 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 	}
 
 	cleanup := func() { queue.Close() }
+	newEvents := newEventsStore
 	if isPGURL(dbURL) {
 		// worker.Requeue/RequeuePush stay nil on pg: river's insert-time
 		// uniqueness would swallow a requeue of a still-running job; the
 		// river sync/push workers schedule successors transactionally
 		// instead (issue #79).
+		//
+		// A push's job exists from its authority CAS on, before
+		// receive-pack publishes the cache ref, so push runs wait for
+		// publication too. Holds live in each node's cache, and the
+		// run's loopback fetch reads this node's cache.
+		assertf(cacheDir != "", "buildServeEventing: the publication wait needs the cache directory")
+		worker.WaitPublication = func(ctx context.Context, repoID string) error {
+			return githttp.WaitForPushPublication(ctx, cacheDir, repoID)
+		}
 		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, worker.RunPush, ups, sweep, lfsReclaim, absence, repack, logger)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		queue = q
+		newEvents = func(inner ref.RefStore, opts events.RefStoreOptions) ref.RefStore {
+			return newPGEventsStore(inner, opts, q, forwardDeniedFromContext)
+		}
 	} else {
 		var err error
 		queue, cleanup, err = buildLocalSyncQueue(ms, org, cacheDir, worker, deliverer, repack, logger)
@@ -403,7 +416,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 	}
 
 	decorate := func(inner ref.RefStore) ref.RefStore {
-		return events.NewRefStore(inner, events.RefStoreOptions{
+		return newEvents(inner, events.RefStoreOptions{
 			Org:             org,
 			Repos:           ms,
 			Webhooks:        whStore,
@@ -495,6 +508,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	var (
 		enqueueDelivery func(ctx context.Context, d events.Delivery) error
 		enqueueSync     func(ctx context.Context, repoID string) error
+		newEvents       = newEventsStore
 	)
 	if isPGURL(dbURL) {
 		q, err := jobs.NewRiverInsertOnly(ctx, dbURL)
@@ -511,6 +525,9 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org,
 			func(context.Context) bool { return denied },
 			func(context.Context) bool { return pullDenied })
+		newEvents = func(st ref.RefStore, opts events.RefStoreOptions) ref.RefStore {
+			return newPGEventsStore(st, opts, q, func(context.Context) bool { return denied })
+		}
 	} else {
 		// Local mode: deliver synchronously (bounded) before hook exit.
 		deliverer := &events.Deliverer{
@@ -553,6 +570,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		// suppressed here or every inbound mirror update would enqueue
 		// an outbound no-op forward. Push webhooks still emit.
 		enqueueSync = nil
+		newEvents = newEventsStore // and no forward intent in the CAS
 	}
 
 	githttp.WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
@@ -576,7 +594,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			}
 			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
 		}
-		return events.NewRefStore(st, events.RefStoreOptions{
+		return newEvents(st, events.RefStoreOptions{
 			Org:             org,
 			Repos:           ms,
 			Webhooks:        whStore,
