@@ -451,9 +451,10 @@ type jsonMember struct {
 // list in lists filled in, but marshals one item at a time, so a body with
 // hundreds of thousands of entries is never buffered whole. v is the
 // response with those lists and objects empty; lists are in the order v
-// encodes them.
+// encodes them. Only a success body streams, and so does the 409
+// MergeConflict body, whose conflict paths are as many as the conflicts.
 func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList) {
-	assertf(status >= 200 && status < 300, "writeJSONLists called with status %d", status)
+	assertf((status >= 200 && status < 300) || status == http.StatusConflict, "writeJSONLists called with status %d", status)
 	tmpl, err := json.Marshal(v)
 	assertf(err == nil, "writeJSONLists: marshal template: %v", err)
 	w.Header().Set("Content-Type", "application/json")

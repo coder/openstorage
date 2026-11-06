@@ -4,9 +4,12 @@ package api
 // conflict_paths_base64 and path_base64 siblings.
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strings"
@@ -153,4 +156,71 @@ func testRawPathMergeConflicts(t *testing.T, e *testEnv) {
 			}
 		}
 	})
+}
+
+// chunkRecorder is a ResponseWriter that keeps the body and the size of the
+// largest single Write.
+type chunkRecorder struct {
+	*httptest.ResponseRecorder
+	maxWrite int
+}
+
+func (c *chunkRecorder) Write(p []byte) (int, error) {
+	c.maxWrite = max(c.maxWrite, len(p))
+	return c.ResponseRecorder.Write(p)
+}
+
+// TestMergeConflictBodyStreams: a push can make the conflict paths as long
+// and as many as it likes, so the 409 body writes them in bounded chunks and
+// never holds the encoded body, or the base64 sibling, whole (#587).
+func TestMergeConflictBodyStreams(t *testing.T) {
+	var paths []string
+	total := 0
+	for i := 0; total < 4<<20; i++ {
+		p := strings.Repeat("d", 200) + "/" + strings.Repeat("f", 40) + strings.Repeat("x", i%7) + string(rune('a'+i%26))
+		paths = append(paths, p)
+		total += len(p)
+	}
+	for name, withInvalid := range map[string]bool{"valid paths": false, "one invalid path": true} {
+		list := slices.Clone(paths)
+		if withInvalid {
+			list[len(list)/2] = "inv\xffalid"
+		}
+		w := &chunkRecorder{ResponseRecorder: httptest.NewRecorder()}
+		wmFailConflict(w, "merge has conflicts", list, strings.Repeat("a", 40))
+		if w.Code != http.StatusConflict || w.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf("%s: %d %q", name, w.Code, w.Header().Get("Content-Type"))
+		}
+		if w.maxWrite > 64<<10 {
+			t.Errorf("%s: one Write of %d bytes, want writes of at most 64 KiB: the body is buffered whole", name, w.maxWrite)
+		}
+		if !bytes.HasSuffix(w.Body.Bytes(), []byte("}\n")) {
+			t.Errorf("%s: the body does not end with a newline", name)
+		}
+		var got struct {
+			Paths  []string `json:"conflict_paths"`
+			Base64 []string `json:"conflict_paths_base64"`
+			Type   string   `json:"conflict_type"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(got.Paths) != len(list) || got.Type != "merge_conflict" {
+			t.Fatalf("%s: %d paths of %d, type %q", name, len(got.Paths), len(list), got.Type)
+		}
+		if !withInvalid {
+			if got.Base64 != nil || bytes.Contains(w.Body.Bytes(), []byte("_base64")) {
+				t.Errorf("%s: a conflict on valid paths has conflict_paths_base64", name)
+			}
+			continue
+		}
+		if len(got.Base64) != len(list) {
+			t.Fatalf("%s: %d base64 entries for %d paths", name, len(got.Base64), len(list))
+		}
+		for i, enc := range got.Base64 {
+			if raw, err := base64.StdEncoding.DecodeString(enc); err != nil || string(raw) != list[i] {
+				t.Fatalf("%s: conflict_paths_base64[%d] = %q, want the base64 of %q", name, i, enc, list[i])
+			}
+		}
+	}
 }
