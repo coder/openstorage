@@ -780,6 +780,26 @@ func TestSweepLFS_HealNeverRestoresMismatchedBackup(t *testing.T) {
 	}
 }
 
+// An aged backup that fails the key's digest is collected although the
+// registered original is missing: it can never be restored, so the purge needs
+// no read of the original.
+func TestSweepLFS_HealPurgesAgedMismatchedBackupOfAMissingOriginal(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.LFSKey("repo_lfs", lfsOID("ee")) // oid ≠ sha256 of the backup bytes
+	f.registerLFS("repo_lfs", key, 10)
+	qKey := quarantineKey(key)
+	f.upload(qKey, "legacy garbage that never hashed to ee...")
+
+	entry := blob.ListedObject{Key: qKey, Size: 40, ModTime: time.Now().Add(-25 * time.Hour)}
+	s := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true})
+	if err := s.healQuarantineEntry(context.Background(), entry, &SweepReport{}, true, false); err != nil {
+		t.Fatalf("healQuarantineEntry: %v", err)
+	}
+	if f.exists(key) || f.exists(qKey) {
+		t.Fatalf("original exists %v, backup exists %v, want the mismatched backup purged and nothing restored", f.exists(key), f.exists(qKey))
+	}
+}
+
 // TestSweepLFS_RegisteredMidSweepSurvives: an LFS object registered between
 // classification and the delete is spared by revalidation, mirroring the
 // pack race test.
