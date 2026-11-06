@@ -1,0 +1,8 @@
+dotgitdot	cached	128	400	error: invalid path '
+newmode	cached	128	400	error: patch with only garbage at 
+submod-nocommit	cached	128	400	error: corrupt patch for submodule 
+submod-null	cached	128	400	error: cache entry has null sha1: 
+file-where-dir	cached	128	409	error: unable to add cache entry for 
+nofit	cached	1	409	error: patch failed: 
+dir-summary	summary	0	-	 create mode 040000 
+modechange-summary	summary	0	-	 mode change 100644 => 040000 

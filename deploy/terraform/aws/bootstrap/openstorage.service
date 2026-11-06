@@ -21,8 +21,8 @@ TimeoutStartSec=120s
 # default control-group mode would also send SIGTERM to those Git processes
 # at once and fail every in-flight push. systemd sends SIGKILL to whatever
 # is left in the unit when serve exits or after TimeoutStopSec. 30 s covers
-# the 10 s drain plus teardown (up to 5 s of instance-lease release in
-# zero-infra mode).
+# the 10 s drain plus teardown: up to 5 s for River jobs on PostgreSQL and up
+# to 5 s of instance-lease release in zero-infra mode.
 KillMode=mixed
 TimeoutStopSec=30s
 UMask=0077
