@@ -677,7 +677,7 @@ func TestLFSReclaim_ARunThatPanicsDoesNotBlockTheNextOne(t *testing.T) {
 
 // A run that is turned away touches nothing of the pass in progress: the
 // guard comes before the writes that reset the pass's advisory verdicts, and
-// the skip is a warning, so a stuck pass shows in the log.
+// the skip logs a warning, so the overlap shows in the log.
 func TestLFSReclaim_ASkippedRunLeavesThePassItsVerdictsAndWarns(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var walks atomic.Int32
