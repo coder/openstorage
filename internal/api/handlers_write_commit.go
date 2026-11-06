@@ -49,6 +49,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/gitlimit"
@@ -678,10 +679,15 @@ func wcNewScratch(repoPath string) (*wcScratch, error) {
 		return nil, err
 	}
 	// Hermetic env: the host's GIT_* (identity overrides, config, index)
-	// must never leak into server-created commits.
+	// must never leak into server-created commits. git names a file it
+	// cannot read in a warning, and a 400 or 409 body shows git's stderr, so
+	// every file git reads outside the repository must lie under the
+	// scratch dir, where wcApplyServerFailure sees it: HOME and
+	// XDG_CONFIG_HOME lead the default attributes file there, and
+	// GIT_ATTR_NOSYSTEM drops the install's own etc/gitattributes.
 	env := make([]string, 0, 32)
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "GIT_") {
+		if strings.HasPrefix(kv, "GIT_") || strings.HasPrefix(kv, "HOME=") || strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
 			continue
 		}
 		env = append(env, kv)
@@ -692,6 +698,9 @@ func wcNewScratch(repoPath string) (*wcScratch, error) {
 		"GIT_INDEX_FILE="+filepath.Join(dir, "index"),
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_ATTR_NOSYSTEM=1",
+		"HOME="+dir,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "xdg"),
 	)
 	return &wcScratch{repoPath: repoPath, dir: dir, baseEnv: env}, nil
 }
@@ -739,8 +748,8 @@ const wcMaxApplyMsgBytes = 4096
 // write). Only git's message tells those apart, so status comes from the
 // whole stderr, which a long path can push far past wcMaxApplyMsgBytes.
 type wcApplyRejection struct {
-	exit   int
-	status int    // wcApplyStatus of git's whole stderr, 500 if server is set
+	exit   int    // git's exit status, -1 when SIGABRT ended it (see wcGitAborted)
+	status int    // wcApplyStatus of git's whole stderr, 400 for an abort, 500 if server is set
 	server bool   // that stderr shows a failure of the server's own git (see wcApplyServerFailure)
 	msg    string // that stderr cut to wcMaxApplyMsgBytes
 }
@@ -838,7 +847,7 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 		return string(o), nil
 	}
 	var exit *exec.ExitError
-	if ctx.Err() != nil || !errors.As(err, &exit) || exit.ExitCode() < 0 {
+	if ctx.Err() != nil || !errors.As(err, &exit) || (exit.ExitCode() < 0 && !wcGitAborted(exit)) {
 		return "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	full := strings.TrimSpace(stderr.String())
@@ -846,22 +855,42 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	if len(msg) > wcMaxApplyMsgBytes {
 		msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
 	}
+	aborted := wcGitAborted(exit)
 	if msg == "" {
 		msg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
+		if aborted {
+			msg = "git apply aborted"
+		}
 	}
 	server := sc.wcApplyServerFailure(full)
 	status := wcApplyStatus(exit.ExitCode(), full)
+	if aborted {
+		status = http.StatusBadRequest
+	}
 	if server {
 		status = http.StatusInternalServerError
 	}
 	return "", &wcApplyRejection{exit: exit.ExitCode(), status: status, server: server, msg: msg}
 }
 
+// wcGitAborted reports whether git died of SIGABRT, which is how it ends on
+// a failed assertion. git 2.55 asserts, after `--numstat` parsed the patch,
+// on a header that names a new file twice (a repeated `diff --git` line or a
+// `--- /dev/null` line before `new file mode`). That is a failure over the
+// patch's own bytes, so applyPatch reads it as a 400. Any other signal
+// (SIGKILL from the OOM killer, SIGTERM at shutdown) stays a server fault.
+func wcGitAborted(exit *exec.ExitError) bool {
+	ws, ok := exit.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGABRT
+}
+
 // wcNumstatPaths parses `git apply --numstat -z`: one record per file,
 // "added<TAB>deleted<TAB>path<NUL>". The path is the file's new name (its
 // old name for a deletion): unlike `git diff`, git apply prints one name
 // for a rename or copy too. A rename's old name must exist in the base
-// tree, and a bad one never does, so that patch does not apply (409).
+// tree, and a bad one never does, so that patch does not apply (409). A
+// header without a name (`diff --git a/ b/`) gives an empty path, which
+// wcPathShapeError refuses (400).
 func wcNumstatPaths(out string) ([]string, error) {
 	var paths []string
 	for rest := out; rest != ""; {
@@ -870,7 +899,7 @@ func wcNumstatPaths(out string) ([]string, error) {
 			return nil, fmt.Errorf("numstat record without NUL: %q", rest)
 		}
 		fields := strings.SplitN(rec, "\t", 3)
-		if len(fields) != 3 || fields[2] == "" {
+		if len(fields) != 3 {
 			return nil, fmt.Errorf("numstat record %q", rec)
 		}
 		paths = append(paths, fields[2])
