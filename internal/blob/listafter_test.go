@@ -151,6 +151,7 @@ type fakeS3List struct {
 
 	mu      sync.Mutex
 	queries []url.Values
+	seen    map[string]int
 }
 
 func (f *fakeS3List) requests() []url.Values {
@@ -163,7 +164,17 @@ func (f *fakeS3List) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f.mu.Lock()
 	f.queries = append(f.queries, q)
+	if f.seen == nil {
+		f.seen = map[string]int{}
+	}
+	f.seen[q.Encode()]++
+	runaway := f.seen[q.Encode()] > 40
 	f.mu.Unlock()
+	if runaway {
+		// A listing that never advances sends the same request forever.
+		http.Error(w, "the same list request, again and again", http.StatusBadRequest)
+		return
+	}
 	v2 := q.Get("list-type") == "2"
 	// A token the server issued starts with "tok:"; anything else in
 	// start-after or marker is the caller's start key.
