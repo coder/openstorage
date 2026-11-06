@@ -26,3 +26,21 @@ URL scheme** (the same dispatch as `meta.Open`/`ref.Open`), with asymmetric sema
 Failure stance is fail-open: if the hook cannot open the meta store or build the queue,
 eventing is disabled for that push rather than the push denied — same reasoning as
 ADR-28, un-notified is recoverable while un-pushed work is a user-visible outage.
+
+**Amendment: a hook without eventing refuses intent.** The forward intent now
+rides the ref update itself: on PostgreSQL the ref CAS records it
+([ADR-44](044-outbound-push-forwarding-rides-a-separate-push-claim-lane.md)), and on
+the local schedule the hook records it before the CAS
+([ADR-50](050-local-scheduling-state-is-row-owned.md)). An eventless push would land
+with no intent and no events, and a failed step does not prove that the CAS would fail
+too. So when the hook cannot build the secrets codec, open the meta store, or build
+the River insert-only client, it refuses every update that would record forward
+intent before its CAS, and the client can push again. Without the store the hook
+cannot tell whether the repository has an upstream link, so this includes an update
+to a repository without one. Ephemeral updates, a sync run's own loopback push, and
+a caller whose token may not forward record no intent, and they keep the fail-open
+stance. The pusher sees a fixed refusal that names only the failed step: git relays
+the hook's output to the pusher, and a store error names the database host, user and
+name, or the S3 endpoint, so the hook logs no store error. serve logs a store error
+only when its own connection fails, so when only the hook's connection fails, neither
+the pusher nor the operator sees the cause.
