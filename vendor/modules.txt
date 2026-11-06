@@ -402,6 +402,9 @@ github.com/opencontainers/go-digest
 ## explicit; go 1.18
 github.com/opencontainers/image-spec/specs-go
 github.com/opencontainers/image-spec/specs-go/v1
+# github.com/pandatix/go-abnf v0.5.5
+## explicit; go 1.26.0
+github.com/pandatix/go-abnf
 # github.com/power-devops/perfstat v0.0.0-20260916203055-22a1a467d9f0
 ## explicit; go 1.14
 github.com/power-devops/perfstat
@@ -416,7 +419,7 @@ github.com/prometheus/client_golang/prometheus/promhttp/internal
 # github.com/prometheus/client_model v0.6.3
 ## explicit; go 1.23
 github.com/prometheus/client_model/go
-# github.com/prometheus/common v0.72.1
+# github.com/prometheus/common v0.73.1
 ## explicit; go 1.26.0
 github.com/prometheus/common/expfmt
 github.com/prometheus/common/model
@@ -511,8 +514,8 @@ github.com/stretchr/testify/assert/yaml
 github.com/stretchr/testify/internal/difflib
 github.com/stretchr/testify/internal/spew
 github.com/stretchr/testify/require
-# github.com/testcontainers/testcontainers-go v0.44.0
-## explicit; go 1.25.0
+# github.com/testcontainers/testcontainers-go v0.45.0
+## explicit; go 1.26.0
 github.com/testcontainers/testcontainers-go
 github.com/testcontainers/testcontainers-go/exec
 github.com/testcontainers/testcontainers-go/internal
@@ -522,11 +525,11 @@ github.com/testcontainers/testcontainers-go/internal/core/bootstrap
 github.com/testcontainers/testcontainers-go/internal/core/network
 github.com/testcontainers/testcontainers-go/log
 github.com/testcontainers/testcontainers-go/wait
-# github.com/testcontainers/testcontainers-go/modules/minio v0.44.0
-## explicit; go 1.25.0
+# github.com/testcontainers/testcontainers-go/modules/minio v0.45.0
+## explicit; go 1.26.0
 github.com/testcontainers/testcontainers-go/modules/minio
-# github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
-## explicit; go 1.25.0
+# github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
+## explicit; go 1.26.0
 github.com/testcontainers/testcontainers-go/modules/postgres
 # github.com/tidwall/gjson v1.20.0
 ## explicit; go 1.23
