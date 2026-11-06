@@ -977,3 +977,46 @@ func FuzzLsTreePageCursor(f *testing.F) {
 		}
 	})
 }
+
+// git refuses a tree nested past core.maxTreeDepth, so the stream fails on
+// the folders it lists. The walk leaves a page that reaches as deep to the
+// stream, which fails as git does, and answers when the limit holds. A limit
+// below 0 refuses even the root, so a page of one flat folder needs the
+// setting too. A value git cannot read is git's to report.
+func TestLsTreePageCursorFollowsMaxTreeDepth(t *testing.T) {
+	deep, deepCommit := fiRepo(t, nestedFiles()) // its deepest folder is deep/1/2/3/4, 5 deep
+	flat, flatCommit := fiRepo(t, []fiFile{{"100644", "a", ""}, {"100644", "b", ""}, {"100644", "c", ""}})
+	ctx := context.Background()
+	for _, c := range []struct {
+		name, value, repo string
+		walks             bool
+	}{
+		{"no setting", "", "deep", true},
+		{"one short of the deepest folder", "4", "deep", false},
+		{"the deepest folder", "5", "deep", true},
+		{"past the deepest folder", "6", "deep", true},
+		{"a suffix git reads", "2k", "deep", true},
+		{"root only", "0", "deep", false},
+		{"not a number", "abc", "deep", false},
+		{"root of a flat tree, at the limit", "0", "flat", true},
+		{"root of a flat tree, refused", "-1", "flat", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir, commit, queries := deep, deepCommit, [][2]string{{"", "a0"}, {"deep/1/2/3/4/", "deep/1/2/3/4/f"}}
+			if c.repo == "flat" {
+				dir, commit, queries = flat, flatCommit, [][2]string{{"", "a"}}
+			}
+			if c.value != "" {
+				gitIn(t, dir, "", "config", "core.maxTreeDepth", c.value)
+				t.Cleanup(func() { gitIn(t, dir, "", "config", "--unset", "core.maxTreeDepth") })
+			}
+			for _, q := range queries {
+				_, _, _, err := resumeTreePage(ctx, dir, commit, q[0], q[1], 100)
+				if walked := err == nil; walked != c.walks {
+					t.Errorf("path %q after %q: the walk answered %v (%v), want %v", q[0], q[1], walked, err, c.walks)
+				}
+				sameAsStream(t, ctx, dir, commit, q[0], q[1], 100)
+			}
+		})
+	}
+}

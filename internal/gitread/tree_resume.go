@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -50,7 +51,7 @@ import (
 //   - an object that is missing, not a tree or cut short, a mode git does
 //     not write, a name with a slash or longer than the read buffer, or
 //     entries out of order
-//   - a tree nested deeper than maxWalkDepth
+//   - a tree nested deeper than maxWalkDepth, or than core.maxTreeDepth
 //   - more reads than openLimit, work that the stream would do for less
 //     (repays), a level that takes more than maxWalkPasses, or more than
 //     maxWalkHeld to keep
@@ -74,10 +75,11 @@ const (
 	treeReadBuffer = 64 << 10
 	// maxWalkDepth bounds the recursion: a tree nested deeper is left to
 	// the stream. It is far below git's default limit (core.maxTreeDepth,
-	// 2048), and a lower limit that an operator sets is not followed. Each
-	// folder on the cursor's path is read twice and costs a round trip to
-	// git, about 50 to 300 microseconds, which the stream does not pay: past
-	// this depth the path alone costs more than a page of the stream.
+	// 2048), and treeDepthLimit leaves a page to the stream when a lower
+	// limit is set. Each folder on the cursor's path is read twice and costs
+	// a round trip to git, about 50 to 300 microseconds, which the stream
+	// does not pay: past this depth the path alone costs more than a page of
+	// the stream.
 	maxWalkDepth = 128
 	// maxWalkPath bounds the path of a folder the walk enters: every level of
 	// the walk holds its own path, so memory grows with depth times path.
@@ -171,6 +173,14 @@ func resumeTreePage(ctx context.Context, repoPath, commit, path, after string, l
 			err = streamError{err}
 		}
 		return page, hasMore, found, err
+	}
+	// git refuses a tree nested past core.maxTreeDepth, and so does the
+	// stream for each folder that the walk read. Without the setting, git's
+	// default limit is far above maxWalkDepth.
+	if depth, set, err := treeDepthLimit(ctx, repoPath); err != nil {
+		return nil, false, false, err
+	} else if set && int64(w.deepest) > depth {
+		return nil, false, false, errDeclined
 	}
 	// The entry past the page needs its size too: ls-tree --long fails on
 	// a blob it cannot read, whether or not the entry is on the page.
@@ -290,6 +300,28 @@ func fillSizes(ctx context.Context, repoPath string, page []TreeEntry) error {
 		page[blobs[i]].Size = n
 	}
 	return nil
+}
+
+// treeDepthLimit returns the core.maxTreeDepth that git runs with in the
+// repository, the deepest folder nesting it reads, and whether one is set.
+// git is the one that knows it: the setting comes from the repository, the
+// user, the system and the environment.
+func treeDepthLimit(ctx context.Context, repoPath string) (depth int64, set bool, err error) {
+	var out bytes.Buffer
+	args := []string{"config", "--type=int", "--get", "core.maxTreeDepth"}
+	_, err = Run(ctx, Cmd{Class: Light, Dir: repoPath, Stdout: &out, Args: args})
+	var exit *exec.ExitError
+	switch {
+	case errors.As(err, &exit) && exit.ExitCode() == 1:
+		return 0, false, nil // not set
+	case err != nil:
+		return 0, false, err
+	}
+	depth, err = strconv.ParseInt(strings.TrimSpace(out.String()), 10, 64)
+	if err != nil {
+		return 0, false, errDeclined
+	}
+	return depth, true, nil
 }
 
 // treeReader opens tree objects by object name.

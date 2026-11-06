@@ -77,6 +77,22 @@ func TestLsTreePageCursorWhenTheWalksGitFails(t *testing.T) {
 	}
 }
 
+// A git config that fails leaves the page to the stream: the walk does not
+// know the depth limit, so it does not answer.
+func TestLsTreePageCursorWhenTheDepthLimitCannotBeRead(t *testing.T) {
+	dir, commit := fiRepo(t, nestedFiles())
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeGit(t, "for a in \"$@\"; do case \"$a\" in config) echo \"fatal: boom\" >&2; exit 3 ;; esac; done\nexec "+real+" \"$@\"")
+	ctx := context.Background()
+	if _, _, _, err := resumeTreePage(ctx, dir, commit, "", "a0", 100); err == nil || errors.Is(err, errDeclined) {
+		t.Fatalf("the walk answered or declined, want git's error: %v", err)
+	}
+	sameAsStream(t, ctx, dir, commit, "", "a0", 100)
+}
+
 // A root folder of more than half the heap cap: the walk asks cat-file for
 // the tree by its id, which costs the tree once, as it costs ls-tree. By the
 // name commit^{tree} git reads the tree to resolve the name and cat-file reads
