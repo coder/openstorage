@@ -154,16 +154,22 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 	for _, tc := range []struct {
 		name, scopes string
+		unresolvable bool // the endpoint's host does not resolve: its error names the host
 		refused      bool
 	}{
 		{name: "may forward", refused: true},
 		{name: "write-only token", scopes: `["git:write"]`},
+		{name: "unresolvable endpoint", unresolvable: true, refused: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeMetaS3{down: true}
 			srv := httptest.NewServer(fake)
 			defer srv.Close()
-			logs := hookEventingEnv(t, "s3wal://b?endpoint="+srv.URL)
+			endpoint := srv.URL
+			if tc.unresolvable {
+				endpoint = "http://canary-s3-" + strings.ToLower(rand.Text()[:8]) + ".invalid"
+			}
+			logs := hookEventingEnv(t, "s3wal://b?endpoint="+endpoint)
 			if tc.scopes != "" {
 				t.Setenv(githttp.EnvScopes, tc.scopes)
 			}
@@ -186,12 +192,11 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 			} else if !won || err != nil || gerr != nil {
 				t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update accepted (it records no intent)", won, err, got, gerr)
 			}
-			endpoint := strings.TrimPrefix(srv.URL, "http://")
 			seen := logs.String()
 			if err != nil {
 				seen += err.Error()
 			}
-			if n := strings.Count(seen, endpoint); n != 0 {
+			if n := strings.Count(seen, strings.TrimPrefix(endpoint, "http://")); n != 0 {
 				t.Fatalf("the pusher's output names the bucket endpoint %d times", n)
 			}
 			if n := fake.writes.Load(); n != 0 {
