@@ -24,6 +24,7 @@ Background jobs. The package defines the `Queue` contract and two implementation
 - River sync and push workers snooze instead of completing when a completion step fails, and complete jobs in a transaction that inserts gated successors [river.go:syncWorker.Work]
 - `deliveryWorker` cancels jobs whose webhook is gone [river.go:deliveryWorker.Work]
 - A replica with the sweep or LFS reclaim schedule off never fetches that kind's queue; the worker stays registered for crash rescue [river.go:NewRiver]
+- `LFSReclaimer.Run` admits one run at a time per reclaimer, because its advisory verdicts belong to the pass; a second run during a rolling upgrade does nothing [lfsreclaim.go:LFSReclaimer.Run]
 - `assertNotWAL` panics on any key under `_wal/` before the sweeper acts on it [sweep.go:assertNotWAL]
 - Registered, fresh (younger than `Threshold`), or zero-ModTime blobs are never sweep candidates; deletion needs a passing revalidation [sweep.go:classify]
 - A `DeleteGuard` error downgrades a sweep to list-only; an LFS quarantine backup that fails its OID hash check is never restored [sweep.go:sweep] [sweep.go:restoreFromQuarantine]
