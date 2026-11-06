@@ -18,9 +18,10 @@ Standalone maintenance scripts for docs, releases, the Compose quickstart, and t
 - `[check-doc-links.py:__main__]` CLI: `python3 scripts/check-doc-links.py`. It takes no arguments. It exits 1 when `check()` returns a non-zero count, 2 when `doc_files()` cannot list the files, else 0.
 - `[check-doc-links.py:check]` Checks the links of every `doc_files()` entry that `links_apply` selects, and the citations of every `README.md` among them. Prints one line per failure, then `broken links: N`. Returns N. Link failures: `BROKEN FILE`, `BROKEN FILE (escapes repo)`, `BROKEN FILE (not tracked by git)`, `BROKEN ANCHOR`, `UNSUPPORTED REF-STYLE LINK DEF`, `UNSUPPORTED ANGLE-BRACKET DEST`, `UNSUPPORTED UNPARSED LINK`. Citation failures: `EMPTY CITATION`, `LINE NUMBER CITATION`, `UNSUPPORTED CITATION`, `MISSING CITED FILE`, `UNRESOLVED CITATION`.
 - `[check-doc-links.py:doc_files]` The sorted `.md` paths that git tracks or that are untracked and not ignored, minus `vendor/` and files deleted from the working tree.
-- `[check-doc-links.py:git_files]` The set of paths that `git ls-files -z` (or another git command) prints for the given options. Exits 2 when git fails.
+- `[check-doc-links.py:git_ls_files]` The bytes that `git ls-files -z` prints for the given options. Exits 2 when git fails.
+- `[check-doc-links.py:git_files]` The set of paths that `git_ls_files` prints for the given options.
 - `[check-doc-links.py:tracked]` Every path in git's index, minus intent-to-add entries, and every directory that holds one, plus `.`. Cached.
-- `[check-doc-links.py:intent_to_add]` The paths that `git add -N` put in the index without content (`git diff-files --diff-filter=A`). A commit holds none of them.
+- `[check-doc-links.py:intent_to_add]` The paths that `git add -N` put in the index without content (the intent-to-add flag that `git ls-files --debug` prints, so an entry that is also assume-unchanged or skip-worktree counts too). A commit holds none of them.
 - `[check-doc-links.py:indexed]` True when git's index holds the file that a path names and every symlink that resolving it follows. It follows each symlink by hand, one path component at a time, so a symlink that another symlink points at is checked too. Each symlink must be tracked, because a clean checkout has no untracked symlink. An absolute target and a path that leaves the repository fail.
 - `[check-doc-links.py:repo_path]` A path relative to the repository root after symlinks resolve, or `None` when it resolves outside the repository. Links and citations both use it.
 - `[check-doc-links.py:links_apply]` True for every `README.md`, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and every file under `docs/`.
@@ -164,7 +165,7 @@ No child directories.
 ### `check-doc-links.py`
 
 - `[check-doc-links.py:os.chdir]` Changes the process working directory to the repository root.
-- `[check-doc-links.py:git_files]` Runs `git ls-files` and `git diff-files` (read-only).
+- `[check-doc-links.py:git_ls_files]` Runs `git ls-files` (read-only).
 - `[check-doc-links.py:check]` Reads Markdown files, the files they link to, and the files they cite. Writes nothing to disk. Prints results to stdout.
 
 ### `release-archives.sh`

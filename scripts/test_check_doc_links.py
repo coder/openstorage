@@ -11,7 +11,7 @@ import unittest
 
 class CheckerTestCase(unittest.TestCase):
     def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True,
-                    untracked_symlinks=None, intent_to_add=()):
+                    untracked_symlinks=None, intent_to_add=(), index_flags=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -43,6 +43,8 @@ class CheckerTestCase(unittest.TestCase):
                 (root / name).unlink()
             if intent_to_add:
                 subprocess.run(["git", "add", "-N", "--", *intent_to_add], cwd=root, check=True)
+            for name, flag in (index_flags or {}).items():
+                subprocess.run(["git", "update-index", flag, "--", name], cwd=root, check=True)
             return subprocess.run(
                 [sys.executable, str(checker)], cwd=root, text=True,
                 capture_output=True, timeout=10,
@@ -942,13 +944,22 @@ class FileSelectionTests(CheckerTestCase):
                                         "broken links: 3\n")
 
     def test_a_modified_tracked_file_and_a_directory_with_a_tracked_file_stay_tracked(self):
-        # Only `git diff-files` status A marks an intent-to-add entry. A staged file that was edited since is status M.
+        # Only the intent-to-add flag marks an intent-to-add entry. A staged file that was edited since has none.
         result = self.run_checker(
             "[Edited](docs/mod.txt) [Dir](docs/both/) [Cited](pkg/README.md)\n",
             files={"docs/both/b.txt": "b\n", "docs/mod.txt": "one\n", "pkg/README.md": "[run.go:Run]\n", "pkg/run.go": "func Run() {}\n"},
             untracked={"docs/both/a.txt": "a\n", "docs/mod.txt": "two\n", "pkg/run.go": "func Run() {}\n// edited\n"},
             intent_to_add=["docs/both/a.txt"])
         self.assertEqual(result.stdout, "broken links: 0\n")
+
+    def test_an_intent_to_add_entry_is_not_tracked_whatever_other_flag_it_has(self):
+        # `git diff-files` does not list an entry that is assume-unchanged or skip-worktree (a sparse checkout sets it).
+        names = [f"docs/{name}.txt" for name in ("plain", "unchanged", "sparse")]
+        result = self.run_checker(" ".join(f"[Doc]({name})" for name in names) + "\n",
+                                  untracked={name: "x\n" for name in names}, intent_to_add=names,
+                                  index_flags={names[1]: "--assume-unchanged", names[2]: "--skip-worktree"})
+        self.assertEqual(result.stdout, "".join(f"BROKEN FILE (not tracked by git) README.md:1 -> {name}\n" for name in names)
+                         + "broken links: 3\n", result.stderr)
 
     def test_a_directory_that_holds_only_intent_to_add_files_is_not_tracked(self):
         result = self.run_checker("[Dir](docs/only/) [File](docs/only/a.txt)\n", untracked={"docs/only/a.txt": "a\n"},

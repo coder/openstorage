@@ -261,17 +261,21 @@ def scan_lines(path):
             yield lineno, raw, visible
 
 
-def git_files(*args, command=("ls-files",)):
+def git_ls_files(*args):
     try:
-        listed = subprocess.run(["git", *command, "-z", *args], capture_output=True)
+        listed = subprocess.run(["git", "ls-files", "-z", *args], capture_output=True)
         failure = listed.returncode and (listed.stderr.decode(errors="replace").strip()
-                                         or f"git {command[0]} exited {listed.returncode}")
+                                         or f"git ls-files exited {listed.returncode}")
     except OSError as err:
         failure = str(err)
     if failure:
         print(f"check-doc-links.py needs a git checkout: {failure}", file=sys.stderr)
         sys.exit(2)
-    return {os.fsdecode(name) for name in listed.stdout.split(b"\0") if name}
+    return listed.stdout
+
+
+def git_files(*args):
+    return {os.fsdecode(name) for name in git_ls_files(*args).split(b"\0") if name}
 
 
 def doc_files():
@@ -315,9 +319,28 @@ def indexed(path):
     return current in tracked()
 
 
+# One `git ls-files -z --debug` entry: the path, four lines of stat data, then the size and the index flags.
+INDEX_ENTRY = re.compile(rb"([^\0]*)\0(?:  [^\n]*\n){4}  size: [^\n]*\tflags: ([0-9a-f]+)\n")
+INTENT_TO_ADD_FLAG = 0x20000000
+
+
 def intent_to_add():
-    """The paths that `git add -N` put in the index without content: a commit holds none of them."""
-    return git_files("--name-only", "--diff-filter=A", command=("diff-files",))
+    """The paths that `git add -N` put in the index without content: a commit holds none of them.
+
+    The flag is read from the index. `git diff-files` does not list an entry that also has assume-unchanged or
+    skip-worktree, and a sparse checkout sets the latter, so a local run would pass where a clean clone fails.
+    """
+    listing, found, end = git_ls_files("--debug"), set(), 0
+    for entry in INDEX_ENTRY.finditer(listing):
+        if entry.start() != end:
+            break
+        end = entry.end()
+        if int(entry.group(2), 16) & INTENT_TO_ADD_FLAG:
+            found.add(os.fsdecode(entry.group(1)))
+    if end != len(listing):
+        print("check-doc-links.py cannot read the index flags from `git ls-files --debug`", file=sys.stderr)
+        sys.exit(2)
+    return found
 
 
 @functools.cache
