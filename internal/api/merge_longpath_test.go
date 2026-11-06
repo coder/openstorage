@@ -265,6 +265,11 @@ func TestPathChunk(t *testing.T) {
 	}
 }
 
+// lpLongestLookup is the longest path that one ls-tree argument can hold on
+// Linux: 128 KiB per argument, less the terminating NUL and the ten bytes of
+// ":(literal)". A name of this size is looked up by pathspec on main.
+const lpLongestLookup = 128<<10 - 1 - len(":(literal)")
+
 // lpBudgetCtx returns a context carrying a git read budget of outputBytes of
 // buffered git output, like a merge preview request.
 func lpBudgetCtx(t *testing.T, outputBytes int64) context.Context {
@@ -320,9 +325,9 @@ func TestTreePathEntryOutputBudget(t *testing.T) {
 	})
 
 	t.Run("a name that fits an argument is looked up without a listing", func(t *testing.T) {
-		// The listing is about 600 KB and the allowance 250 KiB: only the
-		// one-entry output of a pathspec lookup (about 100 KB) fits.
-		tree, names := lpSiblings(t, dir, 6, 100000) // over 64 KiB, within wmMaxPathspecBytes
+		// The listing is about 790 KB and the allowance 250 KiB: only the
+		// one-entry output of a pathspec lookup (about 131 KB) fits.
+		tree, names := lpSiblings(t, dir, 6, lpLongestLookup-2)
 		got, err := wmTreePathEntry(lpBudgetCtx(t, 250<<10), sc, wmTreeListings{}, tree, names[0])
 		if err != nil || got.oid == "" {
 			t.Fatalf("lookup of a %d-byte name: %+v, %v", len(names[0]), got, err)

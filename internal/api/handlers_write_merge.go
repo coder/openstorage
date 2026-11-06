@@ -1042,12 +1042,17 @@ func wmBlobMode(mode string) bool {
 	return false
 }
 
+// wmLiteralPathspec makes an ls-tree pathspec match its path byte for byte.
+const wmLiteralPathspec = ":(literal)"
+
 // wmMaxPathspecBytes bounds the path bytes of one ls-tree pathspec argument.
-// Linux refuses to exec a program with any single argument of 128 KiB or
-// more (MAX_ARG_STRLEN, error E2BIG), and git stores and merges paths of that
-// size, so a longer path is resolved one chunk at a time. The 8 KiB below the
-// limit leaves room for the ":(literal)" prefix.
-const wmMaxPathspecBytes = 120 << 10
+// Linux refuses to exec a program with a single argument of 128 KiB or more,
+// counting its terminating NUL (MAX_ARG_STRLEN: 32 pages of at least 4 KiB,
+// error E2BIG). git stores and merges paths of that size, so a longer path is
+// resolved one chunk at a time. The limit is the longest path that still fits
+// behind wmLiteralPathspec, so that every path which one ls-tree can name
+// still takes one ls-tree and lists nothing.
+const wmMaxPathspecBytes = 128<<10 - len(wmLiteralPathspec) - 1
 
 // wmTreeListings holds the parsed listing of each tree that wmTreePathEntry
 // had to list, by tree oid, so that a tree is listed once per request however
@@ -1108,7 +1113,7 @@ func wmPathChunk(path string, limit int) string {
 // wmLsTreePathspec looks up one path (at most wmMaxPathspecBytes) in tree
 // with a literal pathspec. The entry is zero when the path is absent.
 func wmLsTreePathspec(ctx context.Context, sc *wcScratch, tree, path string) (wmStageEntry, error) {
-	out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree, "--", ":(literal)"+path)
+	out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree, "--", wmLiteralPathspec+path)
 	if err != nil {
 		return wmStageEntry{}, err
 	}
