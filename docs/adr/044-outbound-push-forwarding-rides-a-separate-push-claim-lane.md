@@ -169,7 +169,8 @@ rule for a held sync claim, so a mirror-back pull (or a pull-upstream)
 whose `FinishSync` failed runs again after the lease instead of being
 dropped with its claim. A hook that cannot set up its eventing refuses an
 update that would record intent instead of accepting it without the
-intent (ADR-33's amendment).
+intent ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
+amendment).
 
 **Egress.** The push targets exactly the `CloneURL` the inbound fetch
 already dials — a host validated at link time (`validUpstreamHost`,

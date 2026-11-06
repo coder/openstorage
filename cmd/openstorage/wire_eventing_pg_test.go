@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/jobs"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 	"github.com/coder/openstorage/internal/testutil/pgfault"
@@ -457,5 +459,71 @@ func TestServeSkipsPokeAfterLostCommitReply(t *testing.T) {
 	}
 	if up.PushPending != 0 || !up.PushSyncing {
 		t.Fatalf("the poke re-marked a forward the committed CAS recorded: %+v", up)
+	}
+}
+
+// TestHookEventingRiverFailureRefusesAndCleansUp: on PostgreSQL, when the
+// hook's River client cannot be built after its metadata store opened, the
+// hook refuses an update that would record forward intent, and it closes
+// the metadata store's connections.
+func TestHookEventingRiverFailureRefusesAndCleansUp(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs docker")
+	}
+	ctx := t.Context()
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
+		tcpostgres.WithDatabase("postgres"),
+		tcpostgres.WithUsername("postgres"),
+		tcpostgres.WithPassword("postgres"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+	t.Cleanup(func() { _ = pgC.Terminate(context.Background()) })
+	dbURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const app = "hook_river_failure"
+	logs := hookEventingEnv(t, dbURL+"&application_name="+app)
+	original := newHookRiver
+	t.Cleanup(func() { newHookRiver = original })
+	newHookRiver = func(context.Context, string) (*jobs.River, error) {
+		return nil, errors.New("river client unavailable")
+	}
+	cleanup := wireHookEventing(ctx, slog.New(slog.NewTextHandler(logs, nil)))
+	defer cleanup()
+	if !strings.Contains(logs.String(), "hook refuses ref updates: river insert-only client") {
+		t.Fatalf("missing refusal log: %s", logs)
+	}
+	rs := hookRefStore(t)
+	wrapped, err := githttp.WrapHookRefStore(ctx, rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sha = "1111111111111111111111111111111111111111"
+	if won, _, err := wrapped.CASRefGen(ctx, "repo-1", "refs/heads/main", ref.ZeroSHA, sha); won || err == nil ||
+		!strings.Contains(err.Error(), "hook eventing unavailable (river insert-only client)") {
+		t.Fatalf("CAS = (%v, %v); want the update refused before its CAS", won, err)
+	}
+	// The metadata store opened (meta.Open pings, and the pool keeps that
+	// connection); the failed wiring must have closed it.
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var n int
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE application_name = $1`, app).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 || time.Now().After(deadline) {
+			break
+		}
+	}
+	if n != 0 {
+		t.Fatalf("%d metadata store connections still open after the failed wiring", n)
 	}
 }
