@@ -169,6 +169,8 @@ type RefStore interface {
 	// must have published newPack's bytes to blob storage BEFORE calling
 	// (publish-before-flip); on won=false they own deleting that blob.
 	// A won swap bumps the repo generation via the InitSchema triggers.
+	// On a purge-fenced repository a fold whose old rows all still exist
+	// fails with ErrRepoPurged and changes nothing.
 	ReplacePacks(ctx context.Context, repo string, old []Pack, newPack Pack) (won bool, err error)
 	// ReservePackBytes atomically admits the given incoming packs against
 	// the per-repo pack-bytes quota (issue #29), inserting one durable
@@ -1143,6 +1145,11 @@ func validateReplacePacks(repo string, old []Pack, newPack Pack) {
 // The insert tolerates an existing (repo, id) row — pack ids derive from
 // pack content, so a same-id row registered concurrently is byte-identical
 // (RegisterPacks invariant) and keeping it is equivalent to inserting.
+//
+// The fold's row is a registration like RegisterPacks', so the same
+// base-ledger lock orders the purge-fence read against FenceRepoPurge.
+// The fence is read after the delete precondition: a fold whose input
+// rows the purge already retired stays a clean loss.
 func (s *PG) ReplacePacks(ctx context.Context, repo string, old []Pack, newPack Pack) (won bool, err error) {
 	validateReplacePacks(repo, old, newPack)
 	ids := make([]string, len(old))
@@ -1150,12 +1157,20 @@ func (s *PG) ReplacePacks(ctx context.Context, repo string, old []Pack, newPack 
 		ids[i] = p.ID
 	}
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
 		ct, err := tx.Exec(ctx, `DELETE FROM packs WHERE repo = $1 AND id = ANY($2)`, repo, ids)
 		if err != nil {
 			return err
 		}
 		if int(ct.RowsAffected()) != len(old) {
 			return errReplaceLost // another fold got here first: roll back
+		}
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil {
+			return err
+		} else if fenced {
+			return ErrRepoPurged
 		}
 		// Ledger (issue #31): the deleted rows' blobs LINGER under packs/
 		// until a sweep reaps them, so their bytes stay in pack_usage

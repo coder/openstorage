@@ -44,9 +44,10 @@ import (
 // assertions below).
 type RepoPurgeRegistry interface {
 	// FenceRepoPurge durably write-fences the base repo (phase 0, before
-	// any tombstoning): pack/LFS registrations for the group fail with
-	// ref.ErrRepoPurged from then on, so the later verification and
-	// completion cannot be raced by an in-flight pre-delete writer.
+	// any tombstoning): pack/LFS registrations and repack folds for the
+	// group fail with ref.ErrRepoPurged from then on, so the later
+	// verification and completion cannot be raced by an in-flight
+	// pre-delete writer.
 	// Permanent, like the name burn; idempotent.
 	FenceRepoPurge(ctx context.Context, base string) error
 	// IsRepoPurged reports whether the base repo is purge-fenced — the
@@ -294,11 +295,11 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 	group := blob.QuotaRepoGroup(repoID)
 	// Phase 0: durable write fence, BEFORE any tombstoning. Every ref-
 	// store write — CASRef (REST branch/tag creation reaches it with no
-	// pack registration), RegisterPacks, RegisterLFSObject — serializes
-	// against the fence in its own transaction, so a straggler write
-	// either committed before this fence (its rows are tombstoned by
-	// phases 1–3 / the next resume) or fails with ref.ErrRepoPurged: the
-	// phase-5 verification below can never be invalidated by a write
+	// pack registration), RegisterPacks, ReplacePacks, RegisterLFSObject —
+	// serializes against the fence in its own transaction, so a straggler
+	// write either committed before this fence (its rows are tombstoned
+	// by phases 1–3 / the next resume) or fails with ref.ErrRepoPurged:
+	// the phase-5 verification below can never be invalidated by a write
 	// settling after it (PR #105 security rounds 2 and 4).
 	if err := p.registry.FenceRepoPurge(ctx, repoID); err != nil {
 		return rep, fmt.Errorf("fence repo purge: %w", err)

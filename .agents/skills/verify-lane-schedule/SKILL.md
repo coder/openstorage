@@ -22,7 +22,7 @@ On SQLite and S3-WAL, a repository with `forward_on_push` forwards every accepte
 
 ## When to run it
 
-Run it when your change touches any code in the [coverage record](#coverage-record), or any other code that writes `push_pending`, `push_due`, `push_attempt` or the push claim columns (`PushPending`, `PushDue`, `PushAttempt`, `PushClaim*` on S3-WAL). Also run it when `check.sh` prints STALE.
+Run it when your change touches any file in the [coverage record](#coverage-record), or any other code that writes `push_pending`, `push_due`, `push_attempt` or the push claim columns (`PushPending`, `PushDue`, `PushAttempt`, `PushClaim*` on S3-WAL). Also run it when you change what makes a store transition atomic, which the model assumes and the fingerprints do not see: `SQLite.inTx` (`internal/meta/sqlite.go`), and `S3WAL.mutate` with its `recover` handling (`internal/meta/s3walmeta.go`). The same goes for `toRepoUpstream` (`internal/meta/s3walmeta.go`), which is outside coverage too: it copies the S3-WAL push-lane protocol columns (`PushPending`, `PushSyncing`, `PushClaimHolder`, `PushClaimExpiresAt`, `PushClaimForce`) into the `RepoUpstream` that S3-WAL claims and reads return. Also run it when `check.sh` prints STALE.
 
 ## Run
 
@@ -37,12 +37,13 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/lane-schedule-check.XXXXXX")
 - A passing run takes about 2 to 3 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), and about 80 s with `TLC_WORKERS=8`. A failing run usually takes seconds, because TLC stops at the first violation.
 - `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path.
 - `--only <cfg>` runs one config, for example `--only LaneSchedule.cfg`. It is for quick iteration. Finish with a full run.
+- `--fact <Name>=FALSE` sets one code fact FALSE in the model only, whatever the code says. It shows what the model does without that guard, and a run with it never exits 0. `mutate.sh --model` uses it (see [Validation](#validation)).
 - `--fingerprints-only` checks the code facts and the fingerprints without TLC or Java, in about a second. CI runs it in the `lane-schedule-fingerprints` job of `.github/workflows/ci.yml`, so a change to covered code fails CI until someone brings the model in line and runs `check.sh --record`. CI does not run TLC: a pass says that the covered code is the code the model was checked against, not that the properties hold.
 
 A clean run ends like this:
 
 ```text
-== Code facts (HEAD 4e30915c)
+== Code facts (HEAD <head>)
    ClaimConsumesPending       TRUE
    ... (9 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/lane-schedule-check.Ab12Cd)
@@ -52,8 +53,8 @@ A clean run ends like this:
    NoLeaseAssumption.cfg       fails as expected (trace: ...)
    NoCompletionAssumption.cfg  fails as expected (trace: ...)
    NoFreshnessAssumption.cfg   fails as expected (trace: ...)
-== Coverage (sync commit 4e30915c...)
-   every covered function matches model/fingerprints.txt
+== Coverage (sync commit <sync commit>)
+   every covered declaration matches model/fingerprints.txt
 RESULT: PASS
 ```
 
@@ -62,7 +63,7 @@ RESULT: PASS
 | 0 | PASS | Nothing. |
 | 1 | FAIL: a property broke. FAIL outranks STALE: the same run can also print a STALE coverage block, and then `--record` refuses until the failure is gone | [Read the failure](#read-a-failure). |
 | 2 | STALE: covered code changed since the sync commit, a fact is FALSE, or a probe stopped failing. In a full run, the properties hold on the model. With `--fingerprints-only`, TLC did not run, so the result says nothing about the properties | [Bring the model in line](#bring-the-model-in-line). |
-| 3 | The check could not run | Fix the tool problem it prints (Go, Java, download, a TLA+ parse error, or a covered function that facts.go cannot find). |
+| 3 | The check could not run | Fix the tool problem it prints (Go, Java, download, a TLA+ parse error, or a covered file or a declaration a fact reads that facts.go cannot find). |
 
 ## How the check follows the code
 
@@ -82,9 +83,9 @@ The model (`model/LaneSchedule.tla`) is a hand-written description of the code. 
    | `WaitBeforeSnapshot` | `RunPush` calls `w.waitPublication` before `w.transferPush`, and `buildLocalSyncQueue` wires it to `githttp.WaitForPushPublication` | `NoLostForward` |
    | `ShutdownRestores` | `RunPush`'s `if runErr != nil && shutdownAborted(ctx)` branch restores through `w.restoreForShutdown` with `meta.OutcomeRestore`, before `localPushOutcome` | `NoLostForward` |
 
-   The "property that fails" column is measured: each guard was broken once in the real code, and check.sh failed with the first property listed (see [Validation](#validation)). For the two rows that list `NoLostForward` second, a model run with that fact FALSE and only `NoLostForward` checked fails it too.
+   The "property that fails" column is measured: each guard was broken once in the real code, and check.sh failed with the first property listed (see [Validation](#validation)). For the two rows that list `NoLostForward` second, a one-off model run with that fact FALSE and `NoLostForward` as the only invariant of `LaneSchedule.cfg` failed it too. No script reruns that second result.
 
-2. **Fingerprints.** facts.go hashes the tokens of every declaration (function, method, const, var, type) in every covered file. Comments and layout do not count. check.sh compares the hashes with `model/fingerprints.txt`, recorded at the sync commit. A change that the facts do not see, such as a new branch, a new call or a changed helper or constant, still shows as STALE. Whole files are covered on purpose: a covered path calls many helpers, and any of them can change what the model describes. Most STALE results in these files touch nothing the model describes. Confirm that, and run `--record`. A STALE result is never a pass.
+2. **Fingerprints.** facts.go hashes the tokens of every declaration (import, function, method, const, var, type) in every covered file. Comments and layout do not count. check.sh compares the hashes with `model/fingerprints.txt`, recorded at the sync commit. A change that the facts do not see, such as a new branch, a new call, a changed import or a changed helper or constant in a covered file, still shows as STALE. Whole files are covered on purpose: a covered path calls many helpers, and any of them can change what the model describes. Most STALE results in these files touch nothing the model describes. Confirm that, and run `--record`. A STALE result is never a pass.
 
 Each TLA+ action names the Go call it stands for:
 
@@ -137,7 +138,7 @@ Each TLA+ action names the Go call it stands for:
 
 When check.sh says STALE, or when you change covered code on purpose:
 
-1. List what changed: `git diff <sync commit> -- <files in the coverage record>`.
+1. List what changed: `git diff <sync commit> -- <files in the coverage record>`. A PR that changes covered code records its own head, which a squash merge leaves off main. If git does not know the sync commit, fetch more history, as check.sh prints: in a shallow clone, `git fetch --unshallow origin`. A sync commit recorded at a PR head is under `refs/pull/<N>/head`: `git fetch origin '+refs/pull/*/head:refs/remotes/origin/pull/*'`.
 2. For each change, decide: no effect on what the model describes, the model no longer describes the code (a step split in two, a new branch, a moved check, a guard that became conditional, a new writer of the push lane columns), or the promise changed on purpose (cite the doc comment, test, or ADR that says so). The facts check call order and literal text, not conditions, so a guard wrapped in a new `if` can keep its fact TRUE: read every changed branch around a guard.
 3. Update `model/LaneSchedule.tla` from the code, not from the result. Keep one indivisible step (one SQLite transaction, one S3-WAL CAS, one hook step) as one action. If a fact's guard moved or was renamed, update `facts/facts.go` too.
 4. Rerun check.sh. If it passes, break the new code once in a scratch edit (remove the new check, or reorder the new step) and confirm that check.sh fails. Then drop the scratch edit.
@@ -182,11 +183,26 @@ When a fix lands, its probe passes and check.sh reports STALE. The fix must then
 - A run's other failures (a failed loopback fetch, a rejected or misconfigured push) end `done` with a `repo.push_upstream.failed` event, by design (`TransientPushFailure`): they are modeled only as the rejected plain push.
 - `MaxRetries = 2` stands for `MaxPushTransientRetries = 5`, and delays are one abstract "future" due time.
 
-**Left out (a pass says nothing about these):** the pull lane (`ClaimDueSync`, `FinishSyncOutcome`, the mirror-back pull that a successful forward marks, and the hook's pull poke), PostgreSQL (River schedules its push jobs), detach (`DELETE /repos/base`), ref deletions (not forwarded, see above), the event payloads and their run counts, the egress guard, the push-hold details that one `hold` stands for (per-ref holds, sidecars, TTL refresh, epochs, held markers), and the S3-WAL ambiguous-PUT recovery above.
+**Left out.** A pass says nothing about these. Each line says what a user sees when that part goes wrong:
+
+- The pull lane (`ClaimDueSync`, `FinishSyncOutcome`, the mirror-back pull that a successful forward marks, the hook's pull poke): the repository stops picking up upstream changes, or keeps a pre-forward snapshot.
+- PostgreSQL (River schedules its push jobs): the same lost or stale forward, on PostgreSQL deployments.
+- Detach (`DELETE /repos/base`): a forward that runs after the detach answered, or a lane row left behind.
+- Ref deletions (not forwarded, see above): none by design. A deleted branch stays upstream.
+- The event payloads and their run counts: wrong or missing `repo.push_upstream.*` webhooks, with the forward itself correct.
+- The egress guard: a forward that dials a denied destination, or a denied forward to an allowed one.
+- The push-hold details that one `hold` stands for (per-ref holds, sidecars, TTL refresh, epochs, held markers): a push rejected though its CAS won, or a run that waits on or skips the wrong ref.
+- The S3-WAL ambiguous-PUT recovery above: an outcome applied twice or reported wrongly after a timed-out PUT.
 
 ## Validation
 
-Every fact was broken in the real code, one at a time, on a checkout whose covered code equals the sync commit. Each scratch break compiled (`go build` of its package), turned exactly its own fact FALSE, and made `check.sh --only <config>` fail with a property violation, not only STALE. The harness script printed `COUNT: 9/9`:
+Every fact was broken in the real code, one at a time, on a checkout whose covered code equals the sync commit. Each scratch break compiled (`go build` of its package), turned exactly its own fact FALSE, and made `check.sh --only <config>` fail with a property violation, not only STALE. `mutate.sh` runs these breaks and restores each file. To rerun it, commit or discard your changes to the covered files, then run from the repository root:
+
+```sh
+.agents/skills/verify-lane-schedule/mutate.sh
+```
+
+It needs what check.sh needs, plus git, bash 4 or newer, and python3, and takes about 2 to 5 minutes, most of it the unmodified baseline runs. It prints one line per break and ends with `COUNT: 9/9 mutations failed check.sh as expected`. It first runs each config it uses unmodified. When check.sh cannot run at all there (exit 3, such as a missing Java or a TLC error), mutate.sh stops with exit 3 and check.sh's error line, before any break. When you add, move or rename a fact's guard, update its line in `mutate.sh`:
 
 | Scratch break | Fact | Config | Failed |
 |---|---|---|---|
@@ -200,17 +216,18 @@ Every fact was broken in the real code, one at a time, on a checkout whose cover
 | replace `w.waitPublication(ctx, job.RepoID)` in `RunPush` with `error(nil)` | `WaitBeforeSnapshot` | `LaneSchedule.cfg` | `NoLostForward` |
 | `errors.Is(runErr, ErrShutdown)` instead of `shutdownAborted(ctx)` in `RunPush` (a cancelled git child returns `context.Canceled`) | `ShutdownRestores` | `LaneSchedule.cfg` | `NoLostForward` |
 
-With every fact TRUE, each fact flipped in the model alone fails the same property, so no fact is dead weight. All three probes fail on the current code, and the property configs pass with the bounds in [Scope](#scope).
+With every fact TRUE in the code, setting each fact FALSE in the model alone fails the same property, so no fact is dead weight. `mutate.sh --model` reruns this with `check.sh --fact` and edits no code; it needs no python3 and ends with `COUNT: 9/9`. All three probes fail on the current code, and the property configs pass with the bounds in [Scope](#scope).
 
 ## Coverage record
 
-Sync commit: `4e30915ceb0fe663f80cb0730721fdf28152c1a6` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
+Sync commit: `47c67f418e7ac19d937ff81314ecf3ed40245d49` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
 Every declaration in these files is covered:
 
 - `internal/meta/sqlite_schedule.go`, `internal/meta/sqlite_eventing.go` (the SQLite lane transitions)
 - `internal/meta/s3walmeta_schedule.go`, `internal/meta/s3walmeta_eventing.go` (the S3-WAL lane transitions)
 - `internal/sync/worker_push.go`, `internal/sync/worker.go`, `internal/sync/local_schedule.go` (runs, retries, leases, the sweep, the drain, failure classification)
+- `internal/sync/metastore.go`, `internal/sync/pushstatus.go` (the store adapter's error mapping, the upstream rejection parser)
 - `internal/events/refstore.go` (the intent decorator around the ref CAS)
 - `cmd/openstorage/wire_eventing.go`, `cmd/openstorage/wire_eventing_local.go` (hook and serve wiring, forward gates, the sync-claim suppression)
 - `internal/api/handlers_sync.go` (`push-upstream` and its `RequestPushNow`)
@@ -224,6 +241,7 @@ Every declaration in these files is covered:
 |---|---|
 | `check.sh` | The one command: facts, TLC runs, fingerprints, `--record`, and the TLC-free `--fingerprints-only` that CI runs. |
 | `facts/facts.go` | Reads the code facts and fingerprints from the Go source (standard library only; the dot directory keeps it out of `./...`). |
+| `mutate.sh` | Breaks each fact once in the real code and checks that check.sh fails with the expected property (the Validation table). `--model` sets each fact FALSE in the model only. |
 | `model/LaneSchedule.tla` | The model. |
 | `model/LaneSchedule.cfg`, `OtherWriters.cfg`, `Liveness.cfg` | Property configs; each must pass. |
 | `model/NoLeaseAssumption.cfg`, `NoCompletionAssumption.cfg`, `NoFreshnessAssumption.cfg` | Probes; each must fail: `NoRewind`, `NoLostForward`, `NoLostForward`. |
