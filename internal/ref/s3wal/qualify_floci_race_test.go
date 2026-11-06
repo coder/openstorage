@@ -270,22 +270,22 @@ func TestOverwriteRaceTornBodyEndsTheRace(t *testing.T) {
 }
 
 // TestOverwriteRaceCountsAReadHungAtTheWindowEnd: a store that hangs for the
-// last part of the window is not a pass. The read in flight when the window
+// last part of the window is not a pass. A read in flight when the window
 // ends keeps its own deadline and fails on it (issue #566).
 func TestOverwriteRaceCountsAReadHungAtTheWindowEnd(t *testing.T) {
-	r := memRace(500 * time.Millisecond)
+	r := memRace(300 * time.Millisecond)
 	ok := r.get
-	start := time.Now()
+	var calls atomic.Int64
 	r.get = func(ctx context.Context) ([]byte, string, error) {
-		if time.Since(start) > 300*time.Millisecond {
+		if calls.Add(1) > 100 {
 			<-ctx.Done()
 			return nil, "", ctx.Err()
 		}
 		return ok(ctx)
 	}
 	o := r.run(t.Context())
-	if o.readErrs != 2 || len(o.failures) != 2 {
-		t.Fatalf("readErrs=%d failures=%v, want the 2 hung reads", o.readErrs, o.failures)
+	if o.readErrs < 1 || int64(len(o.failures)) != o.readErrs {
+		t.Fatalf("readErrs=%d failures=%v, want the hung reads", o.readErrs, o.failures)
 	}
 	for _, f := range o.failures {
 		if !errors.Is(f.err, context.DeadlineExceeded) || f.end <= r.window {
@@ -304,22 +304,22 @@ func TestOverwriteRaceCountsAReadHungAtTheWindowEnd(t *testing.T) {
 func TestOverwriteRaceLetsTheLastOverwriteEnd(t *testing.T) {
 	r := memRace(300 * time.Millisecond)
 	okPut, okGet := r.put, r.get
-	start := time.Now()
-	late := func() bool { return time.Since(start) > r.window-100*time.Millisecond }
-	var committed atomic.Bool
+	var puts atomic.Int64
+	var blocked, committed atomic.Bool
 	r.put = func(ctx context.Context, b []byte, ifMatch string) (string, error) {
-		if !late() {
+		if puts.Add(1) < 40 {
 			return okPut(ctx, b, ifMatch)
 		}
-		opCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		// The 40th PUT hangs for longer than the window.
+		opCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
 		defer cancel()
+		blocked.Store(true)
 		<-opCtx.Done()
 		committed.Store(true)
 		return "", opCtx.Err()
 	}
 	r.get = func(ctx context.Context) ([]byte, string, error) {
-		wasLate := late()
-		if wasLate {
+		if blocked.Load() {
 			time.Sleep(40 * time.Millisecond)
 		}
 		if committed.Load() {

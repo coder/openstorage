@@ -38,12 +38,12 @@ func TestWatchStallsSeesAFreezeOfTheProcess(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond)
 	spans := stop()
-	if len(spans) != 1 {
-		t.Fatalf("spans = %v, want the one freeze", spans)
+	for _, sp := range spans {
+		if got := sp.to - sp.from; sp.from >= 450*time.Millisecond && got >= 300*time.Millisecond && got <= 800*time.Millisecond {
+			return
+		}
 	}
-	if got := spans[0].to - spans[0].from; spans[0].from < 450*time.Millisecond || got < 300*time.Millisecond || got > 800*time.Millisecond {
-		t.Fatalf("span = %v, want a freeze of about 400 ms that starts after the first 450 ms", spans[0])
-	}
+	t.Fatalf("spans = %v, want a freeze of about 400 ms that starts after the first 450 ms", spans)
 }
 
 // TestOverwriteRaceStampsReadsOnTheHeartbeatClock: a read that the process

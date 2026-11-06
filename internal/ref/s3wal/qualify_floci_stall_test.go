@@ -115,9 +115,10 @@ func (f readFailure) stalledFor(spans []stallSpan) (frozen time.Duration) {
 
 // explainedByStall reports whether a stall of the test process explains the
 // failed read: it hit the op deadline, and the process was awake for under a
-// twentieth of that deadline. A healthy GET answers in 9 to 17 ms and a read
-// that a freeze took keeps 0 to 18 ms awake, so a read that ran awake for
-// 100 ms was waiting for Floci or the network, not for the test process.
+// twentieth of that deadline. A healthy GET answers in milliseconds and a read
+// that a freeze took stays awake for only as long as the freeze took to start
+// and end, so a read that ran awake for 100 ms was waiting for Floci or the
+// network, not for the test process.
 func explainedByStall(f readFailure, spans []stallSpan, opTimeout time.Duration) bool {
 	return errors.Is(f.err, context.DeadlineExceeded) && f.elapsed()-f.stalledFor(spans) < opTimeout/20
 }
