@@ -2,11 +2,12 @@
 
 ## Overview
 
-Standalone maintenance scripts for docs, releases, and the Compose quickstart. None of them is a Go package, and `go test ./...` does not run them.
+Standalone maintenance scripts for docs, releases, the Compose quickstart, and the words of Git's patch refusals. None of them is a Go package, and `go test ./...` does not run them.
 
 - `check-doc-links.py`: an offline, standard-library-only checker for relative inline Markdown links and anchors in every tracked `README.md`, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and `docs/`. It also checks each `[path:symbol]` code citation in a `README.md`. The file must exist, and the symbol must be a name that the file declares, or a whole-token phrase in the code of a shell script. It needs a git checkout. CI runs it in the required `lint` job of `.github/workflows/ci.yml`.
 - `release-archives.sh`: cross-compiles `./cmd/openstorage` for four platforms, packages each binary with `LICENSE`, and writes `checksums.txt`. `.github/workflows/release.yml` runs it.
 - `smoke-compose-quickstart.sh`: an end-to-end smoke test of `compose.quickstart.yml` against a local image. It covers key init, the HTTP API, Git and Git LFS push and clone, restart persistence, and fail-closed init faults. CI runs it in `.github/workflows/ci.yml` and `.github/workflows/image.yml`.
+- `check-apply-messages.sh`: runs the patch cases in `internal/api/testdata/applymsg` through the `git` on PATH and checks the exit status and the message lines that `internal/api` reads to pick an HTTP status. `TestApplyMessageCases` in `internal/api` runs it, and the `image` job in `.github/workflows/ci.yml` runs it inside the built image, whose Git is Alpine's.
 
 `test_check_doc_links.py` holds the regression tests for `check-doc-links.py`. It is a test file, not a script.
 
@@ -79,6 +80,14 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 - `[smoke-compose-quickstart.sh:assert_deleted]` Succeeds only when no container, volume, or network has the label `com.docker.compose.project=$project`.
 - `[smoke-compose-quickstart.sh:cleanup]` `EXIT` trap. Destroys the main and the `-invalid` project, removes `$work`, and exits with the saved code.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:dir]` Required argument: the cases directory. It holds `cases.tsv` and one `<name>.patch` per row.
+- `[check-apply-messages.sh:cases.tsv]` Tab-separated rows: name, command (`cached` or `summary`), expected exit status, the HTTP status that `internal/api` must pick (`TestApplyMessageCases` reads it, the script does not), and a line prefix.
+- `[check-apply-messages.sh:cached]` Runs `git apply --cached --binary --whitespace=nowarn` on a copy of the index of a scratch repository. A line of stderr must start with the prefix.
+- `[check-apply-messages.sh:summary]` Runs `git apply --summary`. A line of stdout must start with the prefix.
+- `[check-apply-messages.sh:failed]` Prints one `ok` or `FAIL` line per case, then a `CHECKED <n> FAILED <m>` line. It exits 0 only when at least one case ran and none failed.
+
 No child directories.
 
 ## Invariants
@@ -134,6 +143,11 @@ No child directories.
 - `[smoke-compose-quickstart.sh:fault]` For each init fault (`private-missing`, `private-corrupt`, `private-permissions`, `pair-mismatch`, `public-empty`, `public-mismatch`, `public-symlink`, `public-directory`, `published-only`), `up` must fail, no server may run, `init` must exit non-zero, and the key volumes must stay unchanged.
 - `[smoke-compose-quickstart.sh:cleanup]` If `destroy` fails for either project, the exit code becomes 1.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:GIT_CONFIG_GLOBAL]` Ignores host Git configuration: unsets every `GIT_*` variable, then sets `HOME` to the work directory, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `LC_ALL=C`.
+- `[check-apply-messages.sh:checked]` A case fails when git exits with another status, or when no line has the prefix. A run that checked no case fails.
+
 ## Side Effects
 
 ### `check-doc-links.py`
@@ -161,10 +175,15 @@ No child directories.
 - `[smoke-compose-quickstart.sh:git]` Commits locally and runs `git push -u origin main` and `git clone` against the local server.
 - `[smoke-compose-quickstart.sh:trap]` Traps: `EXIT` runs `cleanup`, `INT` exits 130, `TERM` exits 143, `ERR` prints the failing line without credentials or raw responses.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:work]` Creates a `mktemp -d` directory with a scratch repository, and removes it on `EXIT`. It only reads `<cases-dir>`.
+
 ## Verification
 
 - Doc links and citations: `python3 scripts/check-doc-links.py` (from the `lint` job in `.github/workflows/ci.yml`).
 - Checker tests: `python3 -B -m unittest discover -s scripts -p 'test_*.py' -v` (from the `lint` job in `.github/workflows/ci.yml`). `-B` keeps `scripts/__pycache__/` out of the checkout.
 - Smoke syntax: `bash -n scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml`).
 - Smoke run (needs Docker and a local image): `OPENSTORAGE_IMAGE=<local-image> bash scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml` and `.github/workflows/image.yml`).
+- Git's patch refusals: `sh scripts/check-apply-messages.sh internal/api/testdata/applymsg` (from `TestApplyMessageCases` in `internal/api`, and from the `image` job in `.github/workflows/ci.yml`, which runs it inside the image).
 - Release archives (needs Go): `./scripts/release-archives.sh <tag> <outdir>` (from `.github/workflows/release.yml`). Use an `<outdir>` outside the checkout. Untracked files in the checkout make Go stamp `vcs.modified=true` (see the comment in `.github/workflows/release.yml`).

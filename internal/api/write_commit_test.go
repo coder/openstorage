@@ -1094,7 +1094,8 @@ func TestDiffCommitApplyFailures(t *testing.T) {
 // line. A failure of the server's git is a 500 with the generic body and no
 // ref moves. The body never shows git's stderr when it names the server's
 // scratch directory, also when the patch's file names forge the lines that
-// the classifier reads for a 400 or a 409.
+// the classifier reads for a 400 or a 409. A patch can forge a fatal line
+// without a fault, and then its own 400 answers 500.
 func TestDiffCommitGitFaultIs500(t *testing.T) {
 	realGit, err := exec.LookPath("git")
 	if err != nil {
@@ -1141,6 +1142,9 @@ exec %[2]q "$@"
 		// error and of a clash into the stderr of a server fault.
 		{"unwritable object directory, name forges an invalid path", "objects", newFile(`n\nerror: invalid path 'z`)},
 		{"unwritable object directory, name forges a clash", "objects", newFile(`m\nerror: unable to add cache entry for q`)},
+		// No fault at all: git repeats the rest of the patch after an invalid
+		// mode, so the patch writes a fatal line into its own 400.
+		{"a patch forges a fatal line after an invalid mode", "none", "diff --git a/a.txt b/a.txt\nold mode 100644\nnew mode 10x644\nfatal: boom\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.mode == "objects" && os.Geteuid() == 0 {
@@ -1200,11 +1204,11 @@ func TestDiffCommitNeverDropsAFile(t *testing.T) {
 			name, patch string
 			paths       []string
 		}{
-			{"a directory mode and a file", file("100644", "ok.txt") + file("040000", "dd"), []string{"ok.txt", "dd"}},
-			{"a directory mode and a file, in the other order", file("040000", "dd") + file("100644", "ok.txt"), []string{"dd", "ok.txt"}},
-			{"a directory mode only", file("040000", "dd"), []string{"dd"}},
-			{"a directory mode under a directory", file("040000", "x/y/dd"), []string{"x/y/dd"}},
-			{"a mode change to a directory mode and a file", file("100644", "ok.txt") + "diff --git a/a.txt b/a.txt\nold mode 100644\nnew mode 040000\n", []string{"ok.txt"}},
+			{"a directory mode and a file", file("100644", "ok1.txt") + file("040000", "dd1"), []string{"ok1.txt", "dd1"}},
+			{"a directory mode and a file, in the other order", file("040000", "dd2") + file("100644", "ok2.txt"), []string{"dd2", "ok2.txt"}},
+			{"a directory mode only", file("040000", "dd3"), []string{"dd3"}},
+			{"a directory mode under a directory", file("040000", "x/y/dd4"), []string{"x/y/dd4"}},
+			{"a mode change to a directory mode and a file", file("100644", "ok5.txt") + "diff --git a/a.txt b/a.txt\nold mode 100644\nnew mode 040000\n", []string{"ok5.txt"}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				before := wmRefsSnapshot(t, e, repo.RepoID)
