@@ -721,10 +721,7 @@ func (s *source) assignsFalse(body *ast.BlockStmt, name string) bool {
 func writesAfter(cs []call, exec, stmt string, pos token.Pos) bool {
 	found := false
 	for _, c := range cs {
-		if c.fun != exec {
-			continue
-		}
-		if !strings.Contains(c.args, "INSERT INTO") && !strings.Contains(c.args, "UPDATE ") && !strings.Contains(c.args, "DELETE FROM") {
+		if c.fun != exec || !isWrite(c) {
 			continue
 		}
 		if c.pos < pos {
@@ -733,6 +730,11 @@ func writesAfter(cs []call, exec, stmt string, pos token.Pos) bool {
 		found = found || strings.Contains(c.args, stmt)
 	}
 	return found
+}
+
+// isWrite reports that c passes an INSERT, UPDATE or DELETE statement.
+func isWrite(c call) bool {
+	return strings.Contains(c.args, "INSERT INTO") || strings.Contains(c.args, "UPDATE ") || strings.Contains(c.args, "DELETE FROM")
 }
 
 // fencedSQL checks a SQL registry write: lock (a call that must come before
@@ -750,7 +752,16 @@ func fencedSQL(s *source, f *ast.FuncDecl, lock, lockArg, fence, exec, stmt stri
 		}
 	}
 	ret := fenceReturn(s, f, fence, fp, lp)
-	return fp.IsValid() && lp.IsValid() && ret.IsValid() && writesAfter(cs, exec, stmt, ret)
+	if !ret.IsValid() {
+		return false
+	}
+	scope := litOf(f.Body, fp)
+	for _, c := range cs {
+		if c.fun == exec && isWrite(c) && litOf(f.Body, c.pos) != scope {
+			return false // a write in another transaction closure
+		}
+	}
+	return writesAfter(cs, exec, stmt, ret)
 }
 
 // fenceReturn returns the position of the if in f that returns
@@ -830,7 +841,8 @@ func mutateFn(s *source, f *ast.FuncDecl) *ast.FuncLit {
 }
 
 // firstGate reports that fn's closure starts with an if on cond that
-// returns (bodyHas in its body), before every other call in the closure.
+// returns (bodyHas in its body), before every other call in the closure and
+// before every write to the manifest (see gateBeforeWrites).
 func firstGate(s *source, fn *ast.FuncLit, cond, bodyHas string) bool {
 	if fn == nil {
 		return false
@@ -844,7 +856,7 @@ func firstGate(s *source, fn *ast.FuncLit, cond, bodyHas string) bool {
 				return false
 			}
 		}
-		return true
+		return gateBeforeWrites(s, fn, cond, bodyHas)
 	}
 	return false
 }
@@ -994,7 +1006,7 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 		if i.cond == "state.Repo.DeletedAt == nil" && i.returns && !live.IsValid() {
 			live = i.stmt.Pos()
 		}
-		if strings.Contains(i.init, "state.Repo.DeletedAt") && strings.Contains(i.cond, "< MinRepoPurgeAge") && i.returns && !young.IsValid() {
+		if i.init == "age := p.now().Sub(*state.Repo.DeletedAt)" && i.cond == "age < MinRepoPurgeAge" && i.returns && !young.IsValid() {
 			young = i.stmt.Pos()
 		}
 	}
@@ -1052,18 +1064,28 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	refGo, ledger, purgePG := src("internal/ref/ref.go"), src("internal/ref/ledger.go"), src("internal/ref/purge.go")
 	sq, ledgerSQ, purgeSQ := src("internal/ref/sqlite.go"), src("internal/ref/ledger_sqlite.go"), src("internal/ref/purge_sqlite.go")
 	wal, walLFS, walPurge := src("internal/ref/s3walstore.go"), src("internal/ref/s3walstore_lfs.go"), src("internal/ref/s3walstore_purge.go")
+	// The database that every SQLite transaction runs on is opened by
+	// OpenSQLite with the DSN of sqliteDSN, and that DSN sets
+	// _txlock=immediate.
 	immediate := false
-	ast.Inspect(sq.file, func(n ast.Node) bool {
+	ast.Inspect(sq.fn("", "sqliteDSN").Body, func(n ast.Node) bool {
 		if bl, ok := n.(*ast.BasicLit); ok && bl.Kind == token.STRING && strings.Contains(bl.Value, "_txlock=immediate") {
 			immediate = true
 		}
 		return true
 	})
+	opens := false
+	for _, c := range sq.calls(sq.fn("", "OpenSQLite").Body) {
+		if c.fun == "sql.Open" && c.args == `"sqlite", sqliteDSN(path)` {
+			opens = true
+		}
+	}
+	immediate = immediate && opens
 	fenceSerialized := func(f *fact) {
 		cs := purgePG.calls(purgePG.fn("PG", "FenceRepoPurge").Body)
 		lp := firstWithArg(cs, "lockBaseLedger", "tx")
 		f.need(lp.IsValid() && writesAfter(cs, "tx.Exec", "INSERT INTO purged_repos", lp), "PG FenceRepoPurge takes lockBaseLedger on tx before its insert")
-		f.need(immediate, "sqlite.go opens the database with _txlock=immediate (BEGIN IMMEDIATE serializes writers)")
+		f.need(immediate, "OpenSQLite opens the database as sql.Open(\"sqlite\", sqliteDSN(path)) and sqliteDSN sets _txlock=immediate (BEGIN IMMEDIATE serializes writers)")
 		f.need(first(purgeSQ.calls(purgeSQ.fn("SQLite", "FenceRepoPurge").Body), "s.db.ExecContext", "INSERT INTO purged_repos", false).IsValid(),
 			"SQLite FenceRepoPurge inserts the purged_repos row (one write, ordered by the database write lock)")
 		fn := mutateFn(walPurge, walPurge.fn("S3WAL", "FenceRepoPurge"))
@@ -1171,6 +1193,7 @@ func purgeCovers() []cover {
 	add("internal/ref/purge.go", "PG", "FenceRepoPurge", "IsRepoPurged", "DropRepoRefs", "RetireRepoPacks", "CountRepoRows")
 	add("internal/ref/purge.go", "", "repoPurgeFencedPG")
 	add("internal/ref/sqlite.go", "SQLite", "casRef", "RegisterPacks", "ReplacePacks")
+	add("internal/ref/sqlite.go", "", "sqliteDSN", "OpenSQLite")
 	add("internal/ref/ledger_sqlite.go", "SQLite", "registerLFSObjectTx")
 	add("internal/ref/purge_sqlite.go", "SQLite", "FenceRepoPurge", "IsRepoPurged", "DropRepoRefs", "RetireRepoPacks", "CountRepoRows")
 	add("internal/ref/purge_sqlite.go", "", "repoPurgeFencedSQLite")
