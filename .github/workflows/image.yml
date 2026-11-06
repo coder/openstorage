@@ -127,10 +127,18 @@ jobs:
       - name: Build and push the platform by digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          # This job holds a write token and uploads nothing but the digest file:
+          # no build summary and no build-record artifact.
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           # The checked-out tree, not the action's default Git context of the
           # dispatching ref (main).
           context: .
+          # The action passes this token to BuildKit as a secret for a Git context.
+          # Empty, it receives no token whatever the context is.
+          github-token: ''
           platforms: linux/${{ matrix.arch }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
