@@ -812,6 +812,11 @@ func TestS3WALRecoveryPurgeFence(t *testing.T) {
 	lfsKey := "lfs/" + base + "/" + strings.Repeat("ef", 32)
 
 	_, a, _ := newRecoveryStores(t)
+	// Pre-fence rows a straggler repack fold could still try to replace.
+	foldInput := []Pack{{ID: "o1", Key: "ko1", Size: 1}, {ID: "o2", Key: "ko2", Size: 1}}
+	if err := a.RegisterPacks(ctx, base, foldInput); err != nil {
+		t.Fatalf("seed RegisterPacks: %v", err)
+	}
 	if err := a.FenceRepoPurge(ctx, base); err != nil {
 		t.Fatalf("FenceRepoPurge: %v", err)
 	}
@@ -843,6 +848,12 @@ func TestS3WALRecoveryPurgeFence(t *testing.T) {
 		{"RegisterPacks", func(t *testing.T) {
 			if err := a.RegisterPacks(ctx, base, []Pack{{ID: "p1", Key: "k1", Size: 1}}); !errors.Is(err, ErrRepoPurged) {
 				t.Fatalf("RegisterPacks = %v, want ErrRepoPurged", err)
+			}
+		}},
+		{"ReplacePacks", func(t *testing.T) {
+			won, err := a.ReplacePacks(ctx, base, foldInput, Pack{ID: "fold", Key: "kfold", Size: 1})
+			if won || !errors.Is(err, ErrRepoPurged) {
+				t.Fatalf("ReplacePacks = (%v, %v), want ErrRepoPurged", won, err)
 			}
 		}},
 		{"RegisterLFSObject", func(t *testing.T) {

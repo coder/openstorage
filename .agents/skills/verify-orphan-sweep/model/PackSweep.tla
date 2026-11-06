@@ -26,7 +26,7 @@
 (*    OPENSTORAGE_SWEEP_AGE_THRESHOLD, so the model checks a strictly more *)
 (*    aggressive sweeper.                                                  *)
 (*  - Time enters only as "a quarantine backup reaches purge age"          *)
-(*    (AgeBackup), gated by the code facts and the timing assumptions.     *)
+(*    (AgeBackup), gated by the code facts and the timing assumption.      *)
 (*  - Delete mode is on: OPENSTORAGE_SWEEP_DELETE_ENABLED, or a retained   *)
 (*    superseded record (OPENSTORAGE_SWEEP_DELETE_SUPERSEDED, default on). *)
 (*    Quota covers, LFS keys and truncated blobs are out of scope.         *)
@@ -72,21 +72,29 @@ CONSTANTS
         \* handshake still runs.
     PurgeAgeCoversThreshold,
         \* quarantinePurgeAge = max(s.cfg.Threshold, QuarantinePurgeFloor).
+    HealEntryBounded,
+        \* healQuarantineEntry starts ectx, cancel :=
+        \* context.WithTimeout(ctx, healEntryTimeout) and reads the registry
+        \* under ectx. A registered key restores or heals its original on
+        \* ctx, with no bound, then opens a new bound and stats the original
+        \* again (a missing original spares the backup). Every call from
+        \* the registry read of an unregistered key, or from that stat, to
+        \* the purge runs under the bound, and healEntryTimeout + 2 x
+        \* sweepRecoveryTimeout <= QuarantinePurgeFloor. So a heal gets
+        \* from its last read to its age gate within healEntryTimeout
+        \* (15 min). In the model: a backup does not reach purge age while
+        \* a heal sits between that read and its purge.
 
-    \* Timing assumptions. The code does not enforce either one.
-    WritesFinishWithinThreshold,
+    \* Timing assumption. The code does not enforce it.
+    WritesFinishWithinThreshold
         \* A write that is in flight when a backup is copied, or when its
         \* handshake deletes K, finishes before that backup reaches purge
         \* age. The delete runs at most sweepRecoveryTimeout (15 min) after
         \* the copy, so this holds when every write finishes within
-        \* quarantinePurgeAge minus 15 min, minus the HealEntryIsQuick
-        \* bound. SweepConfig.Threshold documents the stronger rule that the
+        \* quarantinePurgeAge minus 15 min, minus healEntryTimeout (15
+        \* min). SweepConfig.Threshold documents the stronger rule that the
         \* threshold "must comfortably exceed the longest possible
         \* push/import duration"; no code enforces either.
-    HealEntryIsQuick
-        \* healQuarantineEntry runs from its registry read to its age gate
-        \* within the margin above. No deadline bounds it. In the model: a
-        \* backup does not reach purge age while a heal visits it.
 
 ASSUME NoNonce \notin Nonces
 ASSUME MaxFaults \in Nat /\ MaxFolds \in Nat
@@ -121,7 +129,7 @@ Live == {"fresh", "aged"}   \* backup states that hold K's bytes
 InFlight(w) == wpc[w] \in {"upload", "register", "verify"}
 InFlightWriters == {w \in Writers : InFlight(w)}
 Handshake == {"sd_delete", "sd_recheck", "sd_restore"}
-HealVisit == {"heal_stat", "heal_purge"}
+HealVisit == {"heal_purge"}
 
 TypeOK ==
     /\ present \in BOOLEAN /\ registered \in BOOLEAN
@@ -253,21 +261,26 @@ HealNext(s) ==
     /\ UNCHANGED <<present, registered, backup, witness, faults, folds,
                    writerVars, hs>>
 
-\* healQuarantineEntry: s.registered(ctx, repo, orig). An unregistered
+\* healQuarantineEntry: s.registered(ectx, repo, orig). An unregistered
 \* original goes straight to the age gate (its Stat only feeds the
-\* ReclaimRetainedPack accounting).
+\* ReclaimRetainedPack accounting), under the bound that the registry read
+\* started. A registered one first restores or heals its original, unbounded.
 HealReg(s) ==
     /\ spc[s] = "heal_reg"
     /\ S(s, IF registered THEN "heal_stat" ELSE "heal_purge")
     /\ UNCHANGED <<present, registered, backup, witness, faults, folds,
                    writerVars, todo, cur, hs>>
 
-\* healQuarantineEntry: s.blobs.Stat(ctx, orig), then for a missing original
-\* restoreFromQuarantine(ctx, orig, q.Key), a server-side copy of the backup
-\* over K. Merged: an upload between the two leaves the same bytes. A backup
-\* that a peer purged meanwhile makes the entry return before its purge. A
-\* present, complete original goes to the age gate (healPresentOriginal
-\* returns spare=false).
+\* healQuarantineEntry, registered key: s.blobs.Stat(ctx, orig), then for a
+\* missing original restoreFromQuarantine(ctx, orig, q.Key), a server-side
+\* copy of the backup over K, then a new bound and a second s.blobs.Stat of
+\* the original. Merged into one step: the restore can take long, but the
+\* purge relies on the second stat, which reads K after it. An upload
+\* between the calls leaves the same bytes. When that stat finds K missing
+\* again the code spares the backup. The model purges anyway, which is more
+\* aggressive. A backup that a peer purged meanwhile makes the entry return
+\* before its purge. A present, complete original goes to the age gate
+\* (healPresentOriginal returns spare=false).
 HealStat(s) ==
     /\ spc[s] = "heal_stat"
     /\ IF ~present /\ HealRestores
@@ -388,14 +401,15 @@ Fold ==
 \* Backup n passes quarantinePurgeAge. PurgeFloorCoversHandshake: not while
 \* the handshake that wrote it still runs. The threshold assumption plus
 \* PurgeAgeCoversThreshold: not while a writer that was in flight at its
-\* copy or delete still runs. HealEntryIsQuick: not while a heal visits it.
+\* copy or delete still runs. HealEntryBounded: not while a heal sits between
+\* its last read and its purge.
 AgeBackup(n) ==
     /\ backup[n] = "fresh"
     /\ PurgeFloorCoversHandshake =>
          ~\E s \in Sweepers : hs[s] = n /\ spc[s] \in Handshake
     /\ (WritesFinishWithinThreshold /\ PurgeAgeCoversThreshold) =>
          \A w \in witness[n] : ~InFlight(w)
-    /\ HealEntryIsQuick =>
+    /\ HealEntryBounded =>
          ~\E s \in Sweepers : cur[s] = n /\ spc[s] \in HealVisit
     /\ backup' = [backup EXCEPT ![n] = "aged"]
     /\ UNCHANGED <<present, registered, witness, faults, folds, writerVars,

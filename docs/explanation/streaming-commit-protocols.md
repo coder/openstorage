@@ -106,12 +106,35 @@ When the patch cannot be used, the answer depends on why:
 
 - The payload is not a patch that git can parse (no diff, a corrupt hunk, a binary diff
   without its data): 400 `invalid`.
-- The patch names a path no tree may hold (absolute, a `.` or `..` segment, a `.git`
+- The patch names a path no tree may hold (empty, absolute, a `.` or `..` segment, a `.git`
   component): 400 `invalid`, with the same wording as `commit-pack`.
+- The patch gives a file a mode that no commit can hold, a directory mode (`new file mode
+  040000`): 400 `invalid`, with the wording of `commit-pack`'s `invalid mode`. Git
+  applies such a patch to the index without an error but writes no tree entry for it, so the
+  server refuses the whole patch instead of committing without the file.
+- Git refuses the patch on every base tree, although it parses: 400 `invalid` with git's
+  own error. That covers a name that git's path rules reject (`.git.`, `git~1`, a
+  `.gitmodules` symlink), a mode line that changes nothing git can record (`new mode
+  100664`), a submodule patch without a commit or with a null one, and a patch that makes
+  git abort on a failed assertion (git 2.55 does this when a header names a new file
+  twice).
 - The patch does not apply to the base tree (context that does not match, a file that is
   missing or already exists, a binary preimage that differs, a path beyond a symlink, a
   file where a directory is): 409 `conflict` with the message `patch does not apply: …`
   and git's own error. No ref moves.
+- Git itself fails while it reads or applies a patch (a broken config, a held index lock, a
+  full disk, an unreadable index): 500 with the generic `internal error` body. Git's message
+  can name the server's scratch directory, so the server logs it and the client gets only
+  the generic body. A message that names the scratch directory or the cached repository, or
+  that has a `fatal:` line, answers 500 whatever the patch holds. No ref moves.
+  Git copies parts of the patch into its messages: it prints a file name as it is, and
+  `error: invalid mode` repeats the rest of the patch after the bad mode. So a patch can
+  put a `fatal: …` line into the message of its own failure, with a file name that holds a
+  newline or with text after an invalid mode. Then that 400 or 409 answers 500 instead,
+  because the server cannot tell the forged line from git's. This is deliberate: a wrong
+  status is better than a server path in a response. The server also runs git with its own
+  scratch directory as `HOME` and `XDG_CONFIG_HOME`, so git does not read the server user's
+  files and cannot warn about one.
 
 Before [#608](https://github.com/coder/openstorage/issues/608), all of these answered 422
 `invalid`.

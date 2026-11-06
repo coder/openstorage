@@ -2,7 +2,9 @@
 // clientKey derives the rate-limit bucket key pre-auth on every request
 // (RemoteAddr + client-controlled X-Forwarded-For), and coreCursorDecode
 // parses opaque pagination cursors. Both must stay total and fail closed on
-// arbitrary input.
+// arbitrary input. FuzzApplyRejection covers git apply's stderr and
+// FuzzPatchModeError its summary, which both hold client-chosen path names
+// (#613).
 package api
 
 import (
@@ -192,6 +194,92 @@ func FuzzCoreCursor(f *testing.F) {
 			if err != nil || len(got) != 1 || got[0] != f1 {
 				t.Fatalf("single-field encode/decode lost %q: (%v, %v)", f1, got, err)
 			}
+		}
+	})
+}
+
+// FuzzApplyRejection: wcApplyStatus reads git apply's stderr,
+// which can quote any file name the client sent. It must be total, answer
+// 409 for exit 1, 500 for any status but 1 and 128, and for 128 read only
+// whole lines that start with a known message, ignoring the lines before.
+func FuzzApplyRejection(f *testing.F) {
+	for _, seed := range []struct {
+		exit int
+		msg  string
+	}{
+		{128, "error: invalid path '.git./x'"},
+		{128, "error: invalid path 'git~1/x'"},
+		{128, "error: invalid path '.gitmodules'"},
+		{128, "error: patch with only garbage at <stdin>:4"},
+		{128, "error: patch with only garbage at <stdin>:3"},
+		{128, "error: corrupt patch for submodule sub"},
+		{128, "error: cache entry has null sha1: sub\nerror: Unable to write new index file"},
+		{128, "error: 'd' appears as both a file and as a directory\nerror: unable to add cache entry for d"},
+		{128, "fatal: Unable to create '/tmp/openstorage-write-1/index.lock': File exists."},
+		{128, "error: unable to read index file"},
+		{128, "error: Unable to write new index file"},
+		{128, "error: No valid patches in input (allow with \"--allow-empty\")"},
+		{1, "error: patch failed: f:1\nerror: f: patch does not apply"},
+		{128, "error: invalid path '\nerror: unable to add cache entry for "},
+		{128, ""},
+		{0, "error: invalid path 'a'"},
+		{-1, "error: invalid path 'a'"},
+	} {
+		f.Add(seed.exit, seed.msg)
+	}
+	hasLine := func(msg, prefix string) bool {
+		return strings.HasPrefix(msg, prefix) || strings.Contains(msg, "\n"+prefix)
+	}
+	f.Fuzz(func(t *testing.T, exit int, msg string) {
+		got := wcApplyStatus(exit, msg)
+		want := http.StatusInternalServerError
+		switch {
+		case exit == 1:
+			want = http.StatusConflict
+		case exit != 128:
+		case slices.ContainsFunc(wcApplyPayloadLines, func(p string) bool { return hasLine(msg, p) }):
+			want = http.StatusBadRequest
+		case hasLine(msg, wcApplyClashLine):
+			want = http.StatusConflict
+		}
+		if got != want {
+			t.Fatalf("wcApplyStatus(%d, %q) = %d, want %d", exit, msg, got, want)
+		}
+		if noisy := wcApplyStatus(exit, "noise\n"+msg); noisy != got {
+			t.Fatalf("a line before %q changed the status of exit %d from %d to %d", msg, exit, got, noisy)
+		}
+	})
+}
+
+// FuzzPatchModeError: wcPatchModeError reads `git apply --summary`, which
+// prints file names as they are. It must be total, a line that is not a mode
+// line or that holds a valid mode must not change its answer, and a directory
+// mode on a line of its own must always fail it.
+func FuzzPatchModeError(f *testing.F) {
+	for _, seed := range []string{
+		"",
+		" create mode 100644 a.txt\n",
+		" create mode 040000 dd\n",
+		" mode change 100644 => 040000 a.txt\n",
+		" mode change 100644 => 100755 a.txt\n create mode 160000 sub\n",
+		" rename a => b (100%)\n delete mode 040000 c\n",
+		" create mode 100644 x\n create mode 040000 y\n",
+		" mode change 100644\n",
+		" create mode ",
+		" create mode  \n",
+		"x create mode 040000 y",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, summary string) {
+		err := wcPatchModeError(summary)
+		for _, extra := range []string{"noise\n", " create mode 100644 x\n", " mode change 100644 => 100755 y\n", " delete mode 040000 z\n"} {
+			if got := wcPatchModeError(extra + summary); (got == nil) != (err == nil) {
+				t.Fatalf("the line %q changed the answer for %q from %v to %v", extra, summary, err, got)
+			}
+		}
+		if wcPatchModeError(" create mode 040000 dd\n"+summary) == nil {
+			t.Fatalf("a directory mode in front of %q passed", summary)
 		}
 	})
 }

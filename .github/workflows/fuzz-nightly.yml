@@ -52,6 +52,8 @@ jobs:
             ./internal/jobs:FuzzPackObjectCount
             ./internal/api:FuzzClientKey
             ./internal/api:FuzzCoreCursor
+            ./internal/api:FuzzApplyRejection
+            ./internal/api:FuzzPatchModeError
             ./internal/sync:FuzzParsePushRejections
             ./internal/sync:FuzzS3WALMetaConsumers
             ./internal/meta:FuzzS3WALMetaDocument

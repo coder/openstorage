@@ -118,6 +118,14 @@ jobs:
           grep -F "openstorage v0.0.0-ci (commit $GITHUB_SHA," <<<"$out"
       - name: Check runtime Git and signature tools
         run: docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      # The image's Git is Alpine's. internal/api reads its patch refusals by
+      # their words, so a reworded message must fail here, not answer 500.
+      - name: Check the words of the image's Git patch refusals
+        run: |
+          docker run --rm --entrypoint /bin/sh \
+            -v "$PWD/scripts/check-apply-messages.sh:/check-apply-messages.sh:ro" \
+            -v "$PWD/internal/api/testdata/applymsg:/cases:ro" \
+            "$OPENSTORAGE_IMAGE" /check-apply-messages.sh /cases
       # Use the published-image reference form. The tag exists only in this
       # runner's daemon, and the smoke refuses to start unless the image is local.
       - name: Smoke the exact Compose quickstart
