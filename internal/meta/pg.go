@@ -26,6 +26,17 @@ func assertf(cond bool, format string, args ...any) {
 const (
 	// pgUniqueViolation is SQLSTATE 23505.
 	pgUniqueViolation = "23505"
+	// pgLockNotAvailable is SQLSTATE 55P03, which a lock_timeout raises.
+	pgLockNotAvailable = "55P03"
+	// initSchemaLockWait bounds every lock wait of InitSchema after its
+	// first lock (issue #609). It stays well below deadlock_timeout (1s by
+	// default), so the boot gives up before PostgreSQL picks a deadlock
+	// victim, and the victim is never a request.
+	initSchemaLockWait = 250 * time.Millisecond
+	// initSchemaAttempts and initSchemaRetryDelay bound the retries of a
+	// boot that timed out on a lock: about a minute in all.
+	initSchemaAttempts   = 200
+	initSchemaRetryDelay = 100 * time.Millisecond
 	// repoURLConstraint is the named UNIQUE(org_id, url) constraint; it spans
 	// soft-deleted rows on purpose (docs/explanation/domain-model.md: re-create of a soft-deleted url
 	// must 409).
@@ -63,25 +74,51 @@ func (s *PG) Close() { s.pool.Close() }
 // InitSchema creates the metadata tables (idempotent). The advisory lock
 // serializes concurrent node startups: two racing CREATE TABLE IF NOT EXISTS
 // can fail with a duplicate pg_type key error (same pattern as internal/ref).
+//
+// The DDL takes ACCESS EXCLUSIVE locks, and writers lock tables in more than
+// one order: an older replica's PATCH holds repos and then reaches
+// repo_upstreams through the default-branch trigger (issue #609), adoption
+// and the create completion lock a repos row FOR UPDATE first, and
+// SetRepoUpstream inserts into repo_upstreams before it locks a repos row.
+// No fixed lock order for the boot suits all of them, so the boot never
+// waits for long while it holds a lock: after the first lock it waits at
+// most initSchemaLockWait, and a boot that times out rolls back, which
+// releases everything it held, and starts again.
 func (s *PG) InitSchema(ctx context.Context) error {
+	var err error
+	for attempt := 1; attempt <= initSchemaAttempts; attempt++ {
+		err = s.initSchemaOnce(ctx)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != pgLockNotAvailable {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(initSchemaRetryDelay):
+		}
+	}
+	return fmt.Errorf("init schema: a table lock stayed busy for %d attempts: %w", initSchemaAttempts, err)
+}
+
+func (s *PG) initSchemaOnce(ctx context.Context) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x4D455441)`); err != nil { // "META"
 			return err
 		}
-		// Lock order (issue #609): the default-branch trigger makes a repos
-		// write (an older replica's PATCH) reach repo_upstreams. The DDL below
-		// takes ACCESS EXCLUSIVE on repo_upstreams before it does on repos,
-		// so a boot that held repo_upstreams while it waited for a repos
-		// writer would deadlock against it. Take a repos lock that conflicts
-		// with every writer, first, so the boot waits holding no table. The
-		// mode must not conflict with ROW SHARE: a writer that took
-		// repo_upstreams first and then locks a repos row FOR UPDATE
-		// (SetRepoUpstream) would otherwise wait on this boot while the
-		// boot waits on it. A fresh database has no repos table and no
-		// writer yet.
+		// Take repos first: this wait holds nothing but the advisory lock,
+		// and a writer that holds repos and needs repo_upstreams finishes
+		// before the boot touches repo_upstreams. A fresh database has no
+		// repos table and no writer yet.
 		if _, err := tx.Exec(ctx, `DO $$ BEGIN
-			IF to_regclass('repos') IS NOT NULL THEN LOCK TABLE repos IN SHARE ROW EXCLUSIVE MODE; END IF;
+			IF to_regclass('repos') IS NOT NULL THEN LOCK TABLE repos IN ACCESS EXCLUSIVE MODE; END IF;
 		END $$`); err != nil {
+			return err
+		}
+		// From here on the boot holds repos: bound every wait, so that a
+		// writer that holds repo_upstreams and waits for repos is never in a
+		// cycle with this boot (see InitSchema).
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = '%dms'`, initSchemaLockWait.Milliseconds())); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `

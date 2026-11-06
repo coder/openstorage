@@ -150,18 +150,18 @@ func dropTrigger(ctx context.Context, t *testing.T, s *PG) {
 }
 
 // TestPGInitSchemaLockOrder (issue #609): a boot runs DDL that takes ACCESS
-// EXCLUSIVE on repo_upstreams before it does on repos. It must not deadlock
-// with either order of writer:
-//   - repos first: an open PATCH holds repos and then reaches repo_upstreams
-//     through the default-branch trigger. The boot has to wait for it holding
-//     no table.
-//   - repo_upstreams first: SetRepoUpstream inserts into repo_upstreams and
-//     then locks the repos row FOR UPDATE. The boot's repos lock must let that
-//     lock through.
+// EXCLUSIVE locks, and writers reach repos and repo_upstreams in more than
+// one order. The boot must finish, and so must the writer, whichever lock
+// the writer took first:
+//   - repos then repo_upstreams: an open PATCH holds repos and reaches
+//     repo_upstreams through the default-branch trigger.
+//   - repos FOR UPDATE then repo_upstreams: adoption and the create
+//     completion.
+//   - repo_upstreams then repos FOR UPDATE: SetRepoUpstream.
 //
 // Each case holds the writer's first lock, waits until the boot is blocked
-// behind the writer, lets the writer take its second lock, and expects both
-// to finish.
+// behind the writer or has started its retries, lets the writer take its
+// second lock within a deadline, and expects both to finish.
 func TestPGInitSchemaLockOrder(t *testing.T) {
 	s, ok := pgBackend(t).(*PG)
 	if !ok {
@@ -173,7 +173,10 @@ func TestPGInitSchemaLockOrder(t *testing.T) {
 		{"repos then repo_upstreams",
 			`UPDATE repos SET url = url WHERE repo_id = $1`,
 			`UPDATE repo_upstreams SET default_branch_omitted = false WHERE repo_id = $1`},
-		{"repo_upstreams then repos",
+		{"repos FOR UPDATE then repo_upstreams",
+			`SELECT 1 FROM repos WHERE repo_id = $1 FOR UPDATE`,
+			`UPDATE repo_upstreams SET default_branch_omitted = false WHERE repo_id = $1`},
+		{"repo_upstreams then repos FOR UPDATE",
 			`UPDATE repo_upstreams SET provider = provider WHERE repo_id = $1`,
 			`SELECT 1 FROM repos WHERE repo_id = $1 FOR UPDATE`},
 	} {
@@ -216,11 +219,19 @@ func TestPGInitSchemaLockOrder(t *testing.T) {
 				if time.Now().After(deadline) {
 					t.Fatal("the boot never waited for the writer")
 				}
-				time.Sleep(20 * time.Millisecond)
+				time.Sleep(10 * time.Millisecond)
 			}
 
-			if _, err := tx.Exec(ctx, tc.second, repo.RepoID); err != nil {
-				t.Fatalf("the writer's second lock failed (a deadlock with the boot?): %v", err)
+			// A deadlock would hold the writer here until PostgreSQL's
+			// detector aborts one side, a second or more.
+			wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			start := time.Now()
+			if _, err := tx.Exec(wctx, tc.second, repo.RepoID); err != nil {
+				t.Fatalf("the writer's second lock failed after %v (a deadlock with the boot?): %v", time.Since(start), err)
+			}
+			if waited := time.Since(start); waited > 3*initSchemaLockWait {
+				t.Fatalf("the writer's second lock waited %v for the boot, want about %v at most", waited, initSchemaLockWait)
 			}
 			if err := tx.Commit(ctx); err != nil {
 				t.Fatalf("commit: %v", err)
