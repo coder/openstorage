@@ -208,6 +208,57 @@ func TestFile_ListPagesAfterSkipsDirectoriesBeforeTheCursor(t *testing.T) {
 	}
 }
 
+// A listing of one repository starts in that repository's directory: it does not
+// read the directory of every repository, which a push pays for on each quota
+// check. A packs/ directory that cannot be listed proves it.
+func TestFile_ListOfARepositoryPrefixDoesNotReadItsSiblings(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a directory with no permissions")
+	}
+	ctx := context.Background()
+	b, dir := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	escaped := "packs/a__0x41__b/pack-1.pack"
+	for _, k := range []string{"packs/r1/pack-1.pack", "packs/r1/pack-2.pack", "packs/r2/pack-1.pack", escaped} {
+		if err := b.UploadFile(ctx, k, src); err != nil {
+			t.Fatalf("UploadFile(%s): %v", k, err)
+		}
+	}
+	// A directory that fileblob stores under an escaped name is still found.
+	if got, err := b.List(ctx, "packs/a__0x41__b/"); err != nil || len(got) != 1 || got[0].Key != escaped {
+		t.Fatalf("List of a directory with an escaped name = %v, %v, want %q", got, err, escaped)
+	}
+	packs := filepath.Join(dir, "packs")
+	if err := os.Chmod(packs, 0o111); err != nil { // search only: the directory can be entered, not listed
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(packs, 0o755) })
+
+	got, err := b.List(ctx, PackPrefix("r1"))
+	if err != nil || len(got) != 2 {
+		t.Fatalf("List(%q) = %d keys, %v, want the two packs of r1", PackPrefix("r1"), len(got), err)
+	}
+	var paged int
+	if err := b.ListPagesAfter(ctx, PackPrefix("r1"), "packs/r1/pack-1.pack", 10, func(page []ListedObject) error {
+		paged += len(page)
+		return nil
+	}); err != nil || paged != 1 {
+		t.Fatalf("ListPagesAfter = %d keys, %v, want the one pack after pack-1", paged, err)
+	}
+	if _, err := b.List(ctx, PacksRoot); err == nil {
+		t.Fatal("listing packs/ read a directory that cannot be listed without an error")
+	}
+	// A directory part that names a file, or nothing, lists nothing.
+	for _, prefix := range []string{"packs/r1/pack-1.pack/x/", "packs/none/"} {
+		if got, err := b.List(ctx, prefix); err != nil || len(got) != 0 {
+			t.Fatalf("List(%q) = %d keys, %v, want none", prefix, len(got), err)
+		}
+	}
+}
+
 func firstDifference(a, b []string) int {
 	for i := range min(len(a), len(b)) {
 		if a[i] != b[i] {
