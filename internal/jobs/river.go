@@ -214,7 +214,11 @@ const absenceQueue = "absence_reconcile"
 // The unique key includes the queue (ByQueue). An older binary inserts these
 // jobs on the default queue with a key that has no queue in it. If a rollback
 // strands an unfetched job in the new queue, no older replica fetches it, and
-// without ByQueue it would also block every insert from the older fleet.
+// without ByQueue it would also block every insert from the older fleet. The
+// stranded job stays available until a newer binary fetches it, and it then
+// runs once. The same key split lets an older replica's job and a newer
+// replica's job run together for one tick during a rolling upgrade, which
+// both passes tolerate.
 const (
 	sweepQueue      = "orphan_pack_sweep"
 	lfsReclaimQueue = "lfs_reclaim"

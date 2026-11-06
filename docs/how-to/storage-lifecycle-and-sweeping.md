@@ -248,7 +248,10 @@ A replica works that queue only while its sweep schedule is on, so a replica wit
 `OPENSTORAGE_SWEEP_INTERVAL=0` never fetches a sweep that another replica queued. During
 a rolling upgrade, a sweep that an older replica queued on the default queue can still
 reach a replica with the schedule off. That replica fails it and River discards it, and
-the next interval runs the sweep again.
+the next interval runs the sweep again. During the same roll, a sweep from an older replica
+and one from a newer replica can run at the same time. Sweeps tolerate that. After a
+rollback, a sweep that a newer replica queued stays `available` until a newer replica
+fetches it, and then it runs once.
 
 River queues a scheduled job only from the elected leader. Set `OPENSTORAGE_SWEEP_INTERVAL`
 the same on every replica: a leader with the schedule off queues no sweep, even when
