@@ -200,6 +200,9 @@ func bootFinishes(t *testing.T, boot <-chan error) {
 //     repo_upstreams through the default-branch trigger.
 //   - repos FOR UPDATE then repo_upstreams: adoption.
 //   - repo_upstreams then repos FOR UPDATE: SetRepoUpstream.
+//   - FOR UPDATE on one table, then a stronger lock on the same table, for
+//     repos (adoption) and for repo_upstreams (claims). The boot must never
+//     hold a weaker lock on a table while it waits for a stronger one.
 //   - repos FOR UPDATE, then a stronger lock on repos: the create completion.
 //     A boot that holds the SHARE lock of CREATE INDEX on repos while it waits
 //     for ACCESS EXCLUSIVE makes PostgreSQL abort this writer at once.
@@ -246,6 +249,12 @@ func TestPGInitSchemaLockOrder(t *testing.T) {
 		{"repo_upstreams then repos FOR UPDATE",
 			`UPDATE repo_upstreams SET provider = provider WHERE repo_id = $1`,
 			`SELECT 1 FROM repos WHERE repo_id = $1 FOR UPDATE`},
+		{"repos FOR UPDATE then a stronger lock on repos",
+			`SELECT 1 FROM repos WHERE repo_id = $1 FOR UPDATE`,
+			`UPDATE repos SET default_branch = default_branch WHERE repo_id = $1`},
+		{"repo_upstreams FOR UPDATE then a stronger lock on repo_upstreams",
+			`SELECT 1 FROM repo_upstreams WHERE repo_id = $1 FOR UPDATE`,
+			`UPDATE repo_upstreams SET provider = provider WHERE repo_id = $1`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := newRepo(t, tc.name)
