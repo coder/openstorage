@@ -185,9 +185,22 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	}
 	started := base
 	started.Type = EventPushUpstreamStarted
-	w.emitDetached(ctx, job.Org, EventPushUpstreamStarted, started.marshal())
-
-	rejected, runErr := w.transferPush(ctx, job, repo, up, holder, force)
+	// The started event goes out once the loopback fetch has its snapshot,
+	// or when the run ends before that. A local run whose fetch is refused
+	// for a stale held ref restores its request and emits nothing, like a
+	// failed publication wait: a started event with no terminal event
+	// would show a run that never ends.
+	startedSent := false
+	emitStarted := func() {
+		if !startedSent {
+			startedSent = true
+			w.emitDetached(ctx, job.Org, EventPushUpstreamStarted, started.marshal())
+		}
+	}
+	rejected, runErr := w.transferPush(ctx, job, repo, up, holder, force, emitStarted)
+	if w.Local == nil || !errors.Is(runErr, errHeldRefStale) {
+		emitStarted()
+	}
 	if errors.Is(runErr, errDetached) {
 		return nil // detach raced the run: the row is gone, cancel silently
 	}
@@ -501,11 +514,13 @@ func heldRefStale(stderr string) bool {
 	return strings.Contains(stderr, "HTTP 423") || strings.Contains(stderr, "returned error: 423")
 }
 
-// transferPush performs the loopback fetch + upstream push. A nil error is
-// success; errDetached/errClaimStolen abandon silently; other failures are
+// transferPush performs the loopback fetch + upstream push, and calls
+// fetched once the fetch succeeded. A nil error is success;
+// errDetached/errClaimStolen abandon silently; other failures are
 // *syncFailure values, with rejected non-nil exactly when the failure is
 // FailRejected.
-func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Upstream, holder string, force bool) (rejected []RejectedRef, err error) {
+func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Upstream, holder string, force bool, fetched func()) (rejected []RejectedRef, err error) {
+	assertf(fetched != nil, "transferPush: nil fetched")
 	if up.Owner == "" || up.Name == "" || up.UpstreamHost == "" {
 		return nil, &syncFailure{code: FailConfig, cause: fmt.Errorf(
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
@@ -548,6 +563,7 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 		}
 		return nil, &syncFailure{code: FailInternal, cause: cause}
 	}
+	fetched()
 
 	// Empty local repo: nothing to publish, the run still counts as a
 	// success (converged by definition).
