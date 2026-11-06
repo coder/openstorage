@@ -123,20 +123,22 @@ type wmMergeResponse struct {
 // conflict": a plain problem body, like every other merge failure (#352
 // item 3).
 type wmConflictBody struct {
-	Error         string   `json:"error"`
-	ConflictType  string   `json:"conflict_type"`
-	ConflictPaths []string `json:"conflict_paths,omitempty"`
-	MergeBaseSHA  string   `json:"merge_base_sha,omitempty"`
+	Error               string   `json:"error"`
+	ConflictType        string   `json:"conflict_type"`
+	ConflictPaths       []string `json:"conflict_paths,omitempty"`
+	ConflictPathsBase64 []string `json:"conflict_paths_base64,omitempty"`
+	MergeBaseSHA        string   `json:"merge_base_sha,omitempty"`
 }
 
 // wmFailConflict writes the 409 MergeConflict body for file conflicts.
 func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, mergeBase string) {
 	assertf(msg != "" && len(conflictPaths) > 0, "wmFailConflict: message %q with %d paths", msg, len(conflictPaths))
 	writeJSON(w, http.StatusConflict, wmConflictBody{
-		Error:         msg,
-		ConflictType:  "merge_conflict",
-		ConflictPaths: conflictPaths,
-		MergeBaseSHA:  mergeBase,
+		Error:               msg,
+		ConflictType:        "merge_conflict",
+		ConflictPaths:       conflictPaths,
+		ConflictPathsBase64: rawPathsBase64(conflictPaths),
+		MergeBaseSHA:        mergeBase,
 	})
 }
 
@@ -791,29 +793,32 @@ type wmPreviewBlob struct {
 }
 
 type wmPreviewConflict struct {
-	Path   string        `json:"path"`
-	Result wmPreviewBlob `json:"result"`
-	Base   wmPreviewBlob `json:"base"`
-	Ours   wmPreviewBlob `json:"ours"`
-	Theirs wmPreviewBlob `json:"theirs"`
+	Path       string        `json:"path"`
+	PathBase64 string        `json:"path_base64,omitempty"`
+	Result     wmPreviewBlob `json:"result"`
+	Base       wmPreviewBlob `json:"base"`
+	Ours       wmPreviewBlob `json:"ours"`
+	Theirs     wmPreviewBlob `json:"theirs"`
 }
 
 type wmPreviewFiltered struct {
-	Path   string `json:"path"`
-	Reason string `json:"reason"`
+	Path       string `json:"path"`
+	PathBase64 string `json:"path_base64,omitempty"`
+	Reason     string `json:"reason"`
 }
 
 type wmPreviewResponse struct {
-	Status            string              `json:"status"` // clean|conflicted
-	Result            string              `json:"result"` // merge_commit|fast_forward|no_op
-	SourceBranch      string              `json:"source_branch"`
-	TargetBranch      string              `json:"target_branch"`
-	SourceTipSHA      string              `json:"source_tip_sha"`
-	TargetTipSHA      string              `json:"target_tip_sha"`
-	MergeBaseSHA      string              `json:"merge_base_sha,omitempty"`
-	ConflictPaths     []string            `json:"conflict_paths"`
-	Conflicts         []wmPreviewConflict `json:"conflicts"`
-	FilteredConflicts []wmPreviewFiltered `json:"filtered_conflicts"`
+	Status              string              `json:"status"` // clean|conflicted
+	Result              string              `json:"result"` // merge_commit|fast_forward|no_op
+	SourceBranch        string              `json:"source_branch"`
+	TargetBranch        string              `json:"target_branch"`
+	SourceTipSHA        string              `json:"source_tip_sha"`
+	TargetTipSHA        string              `json:"target_tip_sha"`
+	MergeBaseSHA        string              `json:"merge_base_sha,omitempty"`
+	ConflictPaths       []string            `json:"conflict_paths"`
+	ConflictPathsBase64 []string            `json:"conflict_paths_base64,omitempty"`
+	Conflicts           []wmPreviewConflict `json:"conflicts"`
+	FilteredConflicts   []wmPreviewFiltered `json:"filtered_conflicts"`
 }
 
 // handleMergePreview implements GET /repos/merge/preview (docs/reference/http-api.md,
@@ -945,6 +950,7 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Status = "conflicted"
 	resp.ConflictPaths = mt.paths
+	resp.ConflictPathsBase64 = rawPathsBase64(mt.paths)
 	if includeContent {
 		conflicts, filtered, err := wmRenderConflicts(ctx, sc, mt)
 		if err != nil {
@@ -994,7 +1000,7 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 			}
 		}
 		if tooLarge {
-			filtered = append(filtered, wmPreviewFiltered{Path: path, Reason: wmFilteredReasonTooLarge})
+			filtered = append(filtered, wmPreviewFiltered{Path: path, PathBase64: rawPathBase64(path), Reason: wmFilteredReasonTooLarge})
 			continue
 		}
 		var blobs [4]wmPreviewBlob
@@ -1023,7 +1029,7 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 			}
 		}
 		conflicts = append(conflicts, wmPreviewConflict{
-			Path: path, Result: blobs[0], Base: blobs[1], Ours: blobs[2], Theirs: blobs[3],
+			Path: path, PathBase64: rawPathBase64(path), Result: blobs[0], Base: blobs[1], Ours: blobs[2], Theirs: blobs[3],
 		})
 	}
 	return conflicts, filtered, nil

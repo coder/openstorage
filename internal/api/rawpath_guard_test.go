@@ -14,16 +14,11 @@ import (
 	"testing"
 )
 
-// rpGuardExempt lists path fields without a sibling, as Type.json_name. The
-// first two take a path in a request body, which has no response sibling to
-// fill. The rest are merge responses, which the merge change covers next.
+// rpGuardExempt lists path fields without a sibling, as Type.json_name.
+// Both take a path in a request body, which has no response sibling to fill.
 var rpGuardExempt = map[string]string{
-	"grepRequestBody.paths":            "grep request input",
-	"wcFileOp.path":                    "commit-pack request input",
-	"wmConflictBody.conflict_paths":    "merge 409 body",
-	"wmPreviewConflict.path":           "merge preview",
-	"wmPreviewFiltered.path":           "merge preview",
-	"wmPreviewResponse.conflict_paths": "merge preview",
+	"grepRequestBody.paths": "grep request input",
+	"wcFileOp.path":         "commit-pack request input",
 }
 
 // isPathFieldName reports whether a JSON name carries a repository path.
