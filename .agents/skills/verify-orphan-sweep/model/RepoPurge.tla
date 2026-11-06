@@ -239,11 +239,11 @@ RegisterPacks(w) ==
        THEN W(w, "verify")
        ELSE IF regOk'[w] THEN W(w, "cas") ELSE Finish(w, FALSE)
 
-\* r.store.ReplacePacks(repo, old, K): a repack folds old rows into K. With
-\* FoldsFenced the transaction reads the fence, and a fenced repository
-\* fails it with ErrRepoPurged and no row; Repacker.repack then drops the
-\* fold. It commits only while every old row still exists, and
-\* RetireRepoPacks deletes them all.
+\* r.store.ReplacePacks(repo, old, K): a repack folds old rows into K. It
+\* commits only while every old row still exists, and RetireRepoPacks
+\* deletes them all. With FoldsFenced the transaction also reads the fence,
+\* and a fenced repository fails it with ErrRepoPurged and no row. The
+\* repack may still verify K after a failed swap; the verify step covers it.
 ReplacePacks(w) ==
     /\ IF ~(fenced /\ FoldsFenced) /\ oldRows
        THEN /\ registered' = TRUE /\ oldRows' = FALSE
