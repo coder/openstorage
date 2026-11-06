@@ -170,10 +170,10 @@ def markdown_blocks(lines):
             continue
         m = FENCE.match(expanded)
         if fence:
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not expanded[m.end():].strip():
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not expanded[m.end():].strip(" \t\n"):
                 fence = None
             continue
-        if not ln.strip():
+        if not ln.strip(" \t\n"):
             if block:
                 yield block
                 block = []
@@ -200,7 +200,7 @@ def markdown_blocks(lines):
             continue
         quote, item = QUOTE.match(expanded), ITEM.match(expanded)
         # Empty items and non-1 ordered items cannot interrupt a paragraph.
-        if item and block and (not expanded[item.end():].strip()
+        if item and block and (not expanded[item.end():].strip(" \t\n")
                                or (item.group(1)[0].isdigit() and item.group(1)[:-1] != "1")):
             item = None
         if quote or item:
@@ -217,11 +217,11 @@ def markdown_blocks(lines):
                 marker = QUOTE.match(expanded_next) if quote else None
                 if marker:
                     body.append((number, drop_columns(continuation, marker.end())))
-                elif not quote and not continuation.strip():
+                elif not quote and not continuation.strip(" \t\n"):
                     body.append((number, continuation))
                 elif not quote and expanded_next.startswith(" " * prefix):
                     body.append((number, drop_columns(continuation, prefix)))
-                elif (body[-1][1].strip() and continuation.strip()
+                elif (body[-1][1].strip(" \t\n") and continuation.strip(" \t\n")
                       and not starts_block(expanded_next)
                       and any(part[-1][0] == body[-1][0]
                               for part in markdown_blocks(body))):
@@ -477,7 +477,7 @@ def py_names(text):
     names, scopes, depth = set(), [], 0
     for line, source in zip(masked(text, PY_LEXER).split("\n"), text.split("\n")):
         line = line.rstrip()
-        stripped = line.lstrip()
+        stripped = line.lstrip(" \t")
         continued = depth > 0
         depth += len(re.findall(r"[(\[{]", line)) - len(re.findall(r"[)\]}]", line))
         if continued or not stripped:
@@ -740,7 +740,7 @@ def js_names(text):
 # whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
-        self.code = "\n".join(re.sub(r"(?:^|(?<=[\s;&|()]))#.*", "", line) for line in text.split("\n"))
+        self.code = "\n".join(re.sub(r"(?:^|(?<=[\s;&|()`]))#.*", "", line) for line in text.split("\n"))
 
     def __contains__(self, symbol):
         pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)"
@@ -748,11 +748,12 @@ class ShellMentions:
 
 
 def unit_names(text):
+    # systemd trims only a space and a tab, ends a line at a NUL too, and wants nothing after `]`. A NUL fails closed.
     names, continued = set(), False
-    for line in text.split("\n"):
-        if line.lstrip().startswith(("#", ";")):
+    for line in text.split("\n") if "\0" not in text else []:
+        if line.lstrip(" \t").startswith(("#", ";")):
             continue
-        m = None if continued else re.match(r"\[([\w-]+)\]", line)
+        m = None if continued else re.match(r"\[([\w-]+)\][ \t]*$", line)
         if m:
             names.add(m.group(1))
         continued = line.endswith("\\")
@@ -776,10 +777,10 @@ def language(path):
 
 @functools.cache
 def citable(path):
-    # newline="" keeps a lone carriage return, which only some languages treat as a line break. Readers see
-    # a line feed as the only line separator, so a separator that Python splits on does not end a comment.
-    with open(path, encoding="utf-8", newline="") as source:
-        return language(path)(source.read().replace("\r\n", "\n"))
+    # Bash ends a line at a line feed only, so a shell script keeps its carriage returns. Python, systemd and the
+    # other readers end a line at a lone one too, and text mode turns each carriage return into a line feed.
+    with open(path, encoding="utf-8", newline="" if path.endswith(".sh") else None) as source:
+        return language(path)(source.read())
 
 
 def citation_problem(path, symbol):

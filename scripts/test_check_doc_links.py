@@ -393,11 +393,13 @@ class CitationTests(CheckerTestCase):
         for name, sep in [("vt", "\x0b"), ("ff", "\x0c"), ("fs", "\x1c"), ("gs", "\x1d"), ("rs", "\x1e"), ("nel", "\x85"),
                           ("ls", "\u2028"), ("ps", "\u2029"), ("cr", "\r")]:
             with self.subTest(separator=name):
-                files = {"pkg/run.sh": f"echo ok # note{sep}hidden-word\nreal-word\n",
-                         "pkg/app.service": f"# note{sep}[Hidden]\n[Real]\n"}
-                cited = ["[run.sh:hidden-word]", "[run.sh:real-word]", "[app.service:Hidden]", "[app.service:Real]"]
+                files = {"pkg/run.sh": f"echo ok # note{sep}hidden-word\nreal-word\n"}
+                cited = ["[run.sh:hidden-word]", "[run.sh:real-word]"]
+                if sep != "\r":  # systemd and Python end a line at a lone carriage return
+                    files["pkg/app.service"] = f"# note{sep}[Hidden]\n[Real]\n"
+                    cited += ["[app.service:Hidden]", "[app.service:Real]"]
                 result = self.check_readme(" ".join(cited) + "\n", **files)
-                self.assert_failures(result, ("UNRESOLVED CITATION", cited[0]), ("UNRESOLVED CITATION", cited[2]))
+                self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in cited if "idden" in c])
 
     def test_a_carriage_return_line_feed_still_ends_a_line_in_every_reader(self):
         files = {
@@ -414,11 +416,55 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme(" ".join(ok + bad) + "\n", **files)
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
-    def test_a_lone_carriage_return_does_not_end_a_comment_that_its_language_continues(self):
-        # Go and bash end a comment at a line feed only. Text mode would read the carriage return as a line feed.
-        files = {"pkg/demo.go": "package demo\n\n// note\rfunc Hidden() {}\nfunc Real() {}\n"}
-        result = self.check_readme("[demo.go:Hidden] [demo.go:Real]\n", **files)
-        self.assert_failures(result, ("UNRESOLVED CITATION", "[demo.go:Hidden]"))
+    def test_a_lone_carriage_return_ends_a_line_in_python_and_systemd_but_not_in_bash(self):
+        files = {
+            "pkg/run.sh": "echo ok # note\rhidden-word\nreal-word\n",
+            "pkg/tool.py": 'x = 1  # c\r"""\ndef hidden(): pass\n"""\ndef real(): pass\n',
+            "pkg/app.service": "[Unit]\nDescription=a \\\r# c\n[Hidden]\n[Service]\nExecStart=/bin/true\n",
+        }
+        ok = ["[run.sh:real-word]", "[tool.py:real]", "[tool.py:x]", "[app.service:Service]"]
+        bad = ["[run.sh:hidden-word]", "[tool.py:hidden]", "[app.service:Hidden]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_unit_file_reads_a_section_header_and_a_comment_as_systemd_does(self):
+        # systemd trims only a space and a tab, allows nothing after `]`, and ends a line at a NUL.
+        files = {
+            "pkg/ff_comment.service": "[Unit]\n\x0c# note \\\n[Hidden]\n[Service]\nExecStart=/bin/true\n",
+            "pkg/after.service": "[Unit]\n[Hidden]x\n[Spaced] \t\n",
+            "pkg/feed_after.service": "[Unit]\n[Hidden]\x0c\n",
+            "pkg/nul.service": "[Unit]\nDescription=a \\\x00# c\n[Hidden]\n",
+        }
+        ok = ["[ff_comment.service:Service]", "[after.service:Spaced]", "[after.service:Unit]"]
+        bad = ["[ff_comment.service:Hidden]", "[after.service:Hidden]", "[feed_after.service:Hidden]", "[nul.service:Hidden]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_form_feed_resets_the_python_indent_so_the_reader_reads_nothing_after_it(self):
+        py = "class A:\n    def m(self): pass\n\x0cdef hidden(): pass\ndef real(): pass\n"
+        result = self.check_readme("[tool.py:A.m] [tool.py:A.hidden] [tool.py:real]\n", **{"pkg/tool.py": py})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[tool.py:A.hidden]"))
+
+    def test_a_backtick_starts_a_shell_comment(self):
+        sh = "echo `#hidden-word` shown-after\nreal-word\n"
+        result = self.check_readme("[run.sh:real-word] [run.sh:hidden-word]\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[run.sh:hidden-word]"))
+
+    def test_only_a_space_and_a_tab_make_a_markdown_line_blank_or_close_a_fence(self):
+        # CommonMark counts a form feed or NEL as text, so each link below renders. str.strip() would treat it as blank.
+        cases = {
+            "fence": ("~~~\ncode\n~~~\x0c\n~~~\n[Gone](gone.md)\n", "README.md:5"),
+            "blank": ("para\n\x0c\n    [Gone](gone.md)\n", "README.md:3"),
+            "span": ("a `\n\x0c\nx` [Gone](gone.md) `y`\n", "README.md:3"),
+            "item": ("- a\n\x0c\n      [Gone](gone.md)\n", "README.md:3"),
+            "nel": ("para\n\x85\n    [Gone](gone.md)\n", "README.md:3"),
+            "item-content": ("`[Gone](gone.md)\n- \x1e\n`\n", "README.md:1"),
+            "quote": (">\x1d\n\t[Gone](gone.md)\n", "README.md:2"),
+        }
+        for name, (readme, where) in cases.items():
+            with self.subTest(case=name):
+                result = self.run_checker(readme)
+                self.assertEqual(result.stdout, f"BROKEN FILE {where} -> gone.md\nbroken links: 1\n")
 
     def test_markdown_line_numbers_and_links_survive_a_separator_that_only_python_splits_on(self):
         for name, sep in [("vt", "\x0b"), ("ff", "\x0c"), ("fs", "\x1c"), ("nel", "\x85"), ("ls", "\u2028"), ("ps", "\u2029")]:
