@@ -215,7 +215,10 @@ def markdown_blocks(lines):
                 # however many spaces follow it.
                 prefix = item.end(1) + 1
             body = [(lineno, drop_columns(ln, prefix))]
-            while index < len(lines):
+            # A list item can begin with at most one blank line: a second one makes the item empty.
+            empty = (item and not expanded[item.end():].strip(" \t\n")
+                     and index < len(lines) and not lines[index][1].strip(" \t\n"))
+            while not empty and index < len(lines):
                 number, continuation = lines[index]
                 expanded_next = continuation.expandtabs(4)
                 marker = QUOTE.match(expanded_next) if quote else None
@@ -334,14 +337,16 @@ def intent_to_add():
     The flag is read from the index. `git diff-files` does not list an entry that also has assume-unchanged or
     skip-worktree, and a sparse checkout sets the latter, so a local run would pass where a clean clone fails.
     """
-    listing, found, end = git_ls_files("--debug"), set(), 0
-    for entry in INDEX_ENTRY.finditer(listing):
-        if entry.start() != end:
-            break
+    listing, found, listed, end = git_ls_files("--debug"), set(), set(), 0
+    entry = INDEX_ENTRY.match(listing)
+    while entry:
         end = entry.end()
+        listed.add(os.fsdecode(entry.group(1)))
         if int(entry.group(2), 16) & INTENT_TO_ADD_FLAG:
             found.add(os.fsdecode(entry.group(1)))
-    if end != len(listing):
+        entry = INDEX_ENTRY.match(listing, end)
+    # A listing that ends between two entries, or is empty, has no unread text, so it must also name every path.
+    if end != len(listing) or listed != git_files():
         print("check-doc-links.py cannot read the index flags from `git ls-files --debug`", file=sys.stderr)
         sys.exit(2)
     return found
@@ -768,7 +773,10 @@ def js_names(text):
 # whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
-        self.code = "\n".join(re.sub(r"(?:^|(?<=[ \t;&|()`]))#.*", "", line) for line in text.split("\n"))
+        # Bash drops a NUL, so `echo a <NUL>#word` is a comment that this reader would read as code. A script that
+        # holds a NUL mentions no name.
+        lines = text.split("\n") if "\0" not in text else []
+        self.code = "\n".join(re.sub(r"(?:^|(?<=[ \t;&|()`]))#.*", "", line) for line in lines)
 
     def __contains__(self, symbol):
         # A backslash and a line feed join two lines, or are two literal characters inside single quotes. Without

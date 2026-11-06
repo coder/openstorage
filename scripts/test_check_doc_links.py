@@ -1,17 +1,19 @@
 """Regression tests for the documented check-doc-links.py command."""
 from pathlib import Path
+import os
 import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
 class CheckerTestCase(unittest.TestCase):
     def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True,
-                    untracked_symlinks=None, intent_to_add=(), index_flags=None):
+                    untracked_symlinks=None, intent_to_add=(), index_flags=None, env=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -47,7 +49,7 @@ class CheckerTestCase(unittest.TestCase):
                 subprocess.run(["git", "update-index", flag, "--", name], cwd=root, check=True)
             return subprocess.run(
                 [sys.executable, str(checker)], cwd=root, text=True,
-                capture_output=True, timeout=10,
+                capture_output=True, timeout=10, env=env,
             )
 
 
@@ -448,11 +450,12 @@ class CitationTests(CheckerTestCase):
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
     def test_a_line_feed_and_a_carriage_return_in_either_order_end_one_unit_file_line(self):
-        for name, end in [("lf_cr", "\n\r"), ("cr_lf", "\r\n"), ("cr", "\r"), ("lf", "\n")]:
-            with self.subTest(end=name):
-                unit = f"[Unit]{end}Description=a \\{end}[Hidden]{end}[Service]{end}ExecStart=/bin/true{end}"
-                result = self.check_readme("[app.service:Hidden] [app.service:Service]\n", **{"pkg/app.service": unit})
-                self.assert_failures(result, ("UNRESOLVED CITATION", "[app.service:Hidden]"))
+        for kind, section in [("service", "Service"), ("timer", "Timer")]:
+            for name, end in [("lf_cr", "\n\r"), ("cr_lf", "\r\n"), ("cr", "\r"), ("lf", "\n")]:
+                with self.subTest(kind=kind, end=name):
+                    unit = f"[Unit]{end}Description=a \\{end}[Hidden]{end}[{section}]{end}Key=value{end}"
+                    result = self.check_readme(f"[app.{kind}:Hidden] [app.{kind}:{section}]\n", **{f"pkg/app.{kind}": unit})
+                    self.assert_failures(result, ("UNRESOLVED CITATION", f"[app.{kind}:Hidden]"))
 
     def test_a_unit_file_reads_a_section_header_and_a_comment_as_systemd_does(self):
         # systemd trims only a space and a tab, allows nothing after `]`, and ends a line at a NUL.
@@ -485,6 +488,12 @@ class CitationTests(CheckerTestCase):
         sh = "echo a\x0c# real-word\necho b\t# hidden-word\n"
         result = self.check_readme("[run.sh:real-word] [run.sh:hidden-word]\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, ("UNRESOLVED CITATION", "[run.sh:hidden-word]"))
+
+    def test_a_shell_script_that_holds_a_nul_mentions_no_name(self):
+        # Bash drops a NUL, so `echo a <NUL>#hidden` is a comment, and the reader would read `hidden` as code.
+        files = {"pkg/nul.sh": "echo a \x00#hidden\nreal-word\n", "pkg/plain.sh": "echo a #hidden\nreal-word\n"}
+        result = self.check_readme("[nul.sh:hidden] [nul.sh:real-word] [plain.sh:hidden] [plain.sh:real-word]\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in ("[nul.sh:hidden]", "[nul.sh:real-word]", "[plain.sh:hidden]")])
 
     def test_a_backtick_starts_a_shell_comment(self):
         sh = "echo `#hidden-word` shown-after\nreal-word\n"
@@ -520,6 +529,17 @@ class CitationTests(CheckerTestCase):
                 self.assertEqual(result.stdout, f"BROKEN FILE README.md:{line} -> gone.md\nbroken links: 1\n")
         for name, readme in {"code": "-\n      [Gone](gone.md)\n", "ordered": "1.\n        [Gone](gone.md)\n", "blank": "-\n\n      [Gone](gone.md)\n"}.items():
             with self.subTest(case=f"{name} code"):
+                self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
+
+    def test_a_list_item_that_begins_with_two_blank_lines_is_empty(self):
+        # CommonMark lets an item begin with one blank line. After a second one the item is empty, so the lines below
+        # are a paragraph, and a paragraph line can start with `*` and four spaces. An item with text keeps them.
+        link = "[\n    *     ](gone.md)\n"
+        result = self.run_checker("1)  \n\n   " + link)
+        self.assertEqual(result.stdout, "BROKEN FILE README.md:4 -> gone.md\nbroken links: 1\n")
+        # A line that holds only a form feed is text, so it does not make the item empty either.
+        for readme in ["- a\n\n  " + link, "-\n  b\n\n  " + link, "-\n   \x0c\n    *     ](gone.md)\n"]:
+            with self.subTest(readme=readme):
                 self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
 
     def test_only_spaces_and_tabs_separate_a_link_destination_from_its_title(self):
@@ -975,6 +995,37 @@ class FileSelectionTests(CheckerTestCase):
                                   index_flags={names[1]: "--assume-unchanged", names[2]: "--skip-worktree"})
         self.assertEqual(result.stdout, "".join(f"BROKEN FILE (not tracked by git) README.md:1 -> {name}\n" for name in names)
                          + "broken links: 3\n", result.stderr)
+
+    def test_an_index_listing_that_cannot_be_read_exits_2_without_checking(self):
+        # A `git` on PATH that passes everything through, except that it damages the `--debug` listing of the index.
+        wrapper = textwrap.dedent("""\
+            #!%s
+            import os, re, subprocess, sys
+            done = subprocess.run([os.environ["REAL_GIT"], *sys.argv[1:]], capture_output=True)
+            out, mode = done.stdout, os.environ["DAMAGE"]
+            if "--debug" in sys.argv:
+                entries = re.findall(rb"[^\\0]*\\0(?:  [^\\n]*\\n){4}  size: [^\\n]*\\tflags: [0-9a-f]+\\n", out)
+                assert b"".join(entries) == out and len(entries) > 2
+                out = {"cut": out[:-1], "gap": entries[0] + b"junk\\n" + b"".join(entries[1:]), "tail": out + b"junk\\n",
+                       "last": b"".join(entries[:-1]), "none": b"", "intact": out,
+                       "junk": entries[0] + b"junk\\0\\n" + b"".join(entries[1:])}[mode]
+            sys.stdout.buffer.write(out)
+            sys.stderr.buffer.write(done.stderr)
+            sys.exit(done.returncode)
+            """) % sys.executable
+        with tempfile.TemporaryDirectory() as bin_dir:
+            fake = Path(bin_dir) / "git"
+            fake.write_text(wrapper, encoding="utf-8")
+            fake.chmod(0o755)
+            for mode in ["intact", "cut", "gap", "junk", "tail", "last", "none"]:
+                with self.subTest(damage=mode):
+                    env = {**os.environ, "PATH": bin_dir + os.pathsep + os.environ["PATH"], "REAL_GIT": shutil.which("git"), "DAMAGE": mode}
+                    result = self.run_checker("[Doc](docs/a.md)\n", docs={"a.md": "# A\n", "b.md": "# B\n"}, env=env)
+                    if mode == "intact":
+                        self.assertEqual((result.returncode, result.stdout), (0, "broken links: 0\n"), result.stderr)
+                        continue
+                    self.assertEqual((result.returncode, result.stdout), (2, ""), result.stderr)
+                    self.assertEqual(result.stderr, "check-doc-links.py cannot read the index flags from `git ls-files --debug`\n")
 
     def test_a_directory_that_holds_only_intent_to_add_files_is_not_tracked(self):
         result = self.run_checker("[Dir](docs/only/) [File](docs/only/a.txt)\n", untracked={"docs/only/a.txt": "a\n"},
