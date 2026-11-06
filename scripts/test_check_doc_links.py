@@ -437,6 +437,14 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme(" ".join(ok + bad) + "\n", **files)
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
+    def test_a_carriage_return_in_go_code_is_white_space_that_ends_a_line_for_the_reader(self):
+        # Go reads the carriage return before `}` as white space, so the struct is closed and `println` is a call in init.
+        go = "package demo\n\ntype T struct {\n\tF int\r}\nfunc init() {\n\tprintln(\"x\")\n}\n"
+        ok = ["[demo.go:T]", "[demo.go:T.F]", "[demo.go:init]"]
+        bad = ["[demo.go:T.println]", "[demo.go:println]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/demo.go": go})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
     def test_a_line_feed_and_a_carriage_return_in_either_order_end_one_unit_file_line(self):
         for name, end in [("lf_cr", "\n\r"), ("cr_lf", "\r\n"), ("cr", "\r"), ("lf", "\n")]:
             with self.subTest(end=name):

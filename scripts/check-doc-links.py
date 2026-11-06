@@ -417,7 +417,8 @@ PY_LEXER = re.compile(r"(?P<blank>#[^\n]*|\"\"\"(?:\\.|[^\\])*?\"\"\"|'''(?:\\.|
 
 def go_names(text):
     # Assumes gofmt layout: declarations in column 0, members one tab in.
-    code = masked(text, GO_LEXER)
+    # A carriage return that the lexer left in the code is white space in Go, and a line break to this reader.
+    code = masked(text, GO_LEXER).replace("\r", "\n")
     names = set()
     owner, close, member = None, None, None
     group, group_close = None, None
