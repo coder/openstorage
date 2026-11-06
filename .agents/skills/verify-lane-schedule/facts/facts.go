@@ -589,10 +589,25 @@ func main() {
 	holdAt, markAt := first(ric, "githttp.HoldRef"), first(ric, "ms.RequestPush")
 	rm.need(holdAt.IsValid() && markAt.IsValid() && holdAt < markAt, "restIntentBeforeCAS calls githttp.HoldRef before ms.RequestPush")
 	rm.need(first(pub.calls(pub.fn("", "HoldRef").Body), "reservePushHolds").IsValid(), "githttp.HoldRef reserves the ref's hold (reservePushHolds)")
+	rbc := refstore.fn("RefStore", "runBeforeCAS")
+	rm.need(assigned(refstore.assigns(rbc.Body), "release", "sync.OnceFunc(release)"), "RefStore.runBeforeCAS wraps HeldBeforeCAS's release in sync.OnceFunc")
 	for _, m := range []string{"CASRef", "CASRefGen"} {
-		cs := refstore.calls(refstore.fn("RefStore", m).Body)
-		inner, rel := first(cs, "s.RefStore."+m), first(cs, "release")
-		rm.need(inner.IsValid() && rel.IsValid() && inner < rel, "RefStore.%s calls release() after s.RefStore.%s", m, m)
+		body := refstore.fn("RefStore", m).Body
+		cs := refstore.calls(body)
+		inner, emit := first(cs, "s.RefStore."+m), first(cs, "s.emitPush")
+		deferred, direct := false, false
+		for _, st := range body.List {
+			switch st := st.(type) {
+			case *ast.DeferStmt:
+				deferred = deferred || (refstore.text(st.Call) == "release()" && st.Pos() < inner)
+			case *ast.ExprStmt:
+				direct = direct || (refstore.text(st.X) == "release()" && st.Pos() > inner && st.Pos() < emit)
+			}
+		}
+		// The deferred release ends the hold when the inner CAS panics:
+		// serve's API recovers the panic and keeps running.
+		rm.need(inner.IsValid() && deferred, "RefStore.%s defers release() before s.RefStore.%s", m, m)
+		rm.need(inner.IsValid() && emit.IsValid() && direct, "RefStore.%s calls release() after s.RefStore.%s and before s.emitPush", m, m)
 	}
 	facts = append(facts, rm)
 

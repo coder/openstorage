@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -48,7 +49,8 @@ type RefStoreOptions struct {
 	BeforeCAS func(ctx context.Context, repoID string) error
 	// HeldBeforeCAS is BeforeCAS for a writer that holds the ref until its
 	// CAS returns: it also gets the ref name, and on success returns a
-	// release, which runs right after the inner CAS. Serve's REST writes on
+	// release, which runs once, right after the inner CAS, also when the
+	// inner CAS panics. Serve's REST writes on
 	// the local schedule hold the ref and record the forward intent here
 	// (ADR-50).
 	HeldBeforeCAS func(ctx context.Context, repoID, refName string) (release func(), err error)
@@ -125,6 +127,10 @@ func (s *RefStore) CASRef(ctx context.Context, repo, name, old, new string) (boo
 	if err != nil {
 		return false, err
 	}
+	// A panicking CAS must still end the hold: serve's API recovers the
+	// panic and keeps running, and a live hold blocks every later write to
+	// the ref. release runs once (runBeforeCAS), before emitPush.
+	defer release()
 	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
 	release()
 	if err != nil || !won {
@@ -143,6 +149,7 @@ func (s *RefStore) CASRefGen(ctx context.Context, repo, name, old, new string) (
 	if err != nil {
 		return false, 0, err
 	}
+	defer release() // a panicking CAS still ends the hold, as in CASRef
 	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
 	release()
 	if err != nil || !won {
@@ -153,7 +160,8 @@ func (s *RefStore) CASRefGen(ctx context.Context, repo, name, old, new string) (
 }
 
 // runBeforeCAS runs the BeforeCAS and HeldBeforeCAS options for a
-// non-ephemeral update. On success the returned release is never nil.
+// non-ephemeral update. On success the returned release is never nil, and
+// only its first call runs HeldBeforeCAS's release.
 func (s *RefStore) runBeforeCAS(ctx context.Context, repoKey, refName string) (release func(), err error) {
 	release = func() {}
 	if EphemeralUpdate(repoKey, refName) {
@@ -171,6 +179,7 @@ func (s *RefStore) runBeforeCAS(ctx context.Context, repoKey, refName string) (r
 			return nil, fmt.Errorf("refusing the ref update: %w", err)
 		}
 		assertf(release != nil, "HeldBeforeCAS for %s %s returned a nil release", repoKey, refName)
+		release = sync.OnceFunc(release)
 	}
 	return release, nil
 }
