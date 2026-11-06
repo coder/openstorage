@@ -641,6 +641,13 @@ func (s *source) fingerprint(pos, end token.Pos) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// span is a source range that is not one declaration: a cover can hash a
+// window of a long function, as preReceive's publication block does.
+type span struct{ pos, end token.Pos }
+
+func (s span) Pos() token.Pos { return s.pos }
+func (s span) End() token.Pos { return s.end }
+
 type cover struct {
 	src   *source
 	label string
@@ -721,7 +728,10 @@ func (s *source) assignsFalse(body *ast.BlockStmt, name string) bool {
 func writesAfter(cs []call, exec, stmt string, pos token.Pos) bool {
 	found := false
 	for _, c := range cs {
-		if c.fun != exec || !isWrite(c) {
+		if c.fun != exec {
+			continue
+		}
+		if !strings.Contains(c.args, "INSERT INTO") && !strings.Contains(c.args, "UPDATE ") && !strings.Contains(c.args, "DELETE FROM") {
 			continue
 		}
 		if c.pos < pos {
@@ -730,11 +740,6 @@ func writesAfter(cs []call, exec, stmt string, pos token.Pos) bool {
 		found = found || strings.Contains(c.args, stmt)
 	}
 	return found
-}
-
-// isWrite reports that c passes an INSERT, UPDATE or DELETE statement.
-func isWrite(c call) bool {
-	return strings.Contains(c.args, "INSERT INTO") || strings.Contains(c.args, "UPDATE ") || strings.Contains(c.args, "DELETE FROM")
 }
 
 // fencedSQL checks a SQL registry write: lock (a call that must come before
@@ -751,67 +756,14 @@ func fencedSQL(s *source, f *ast.FuncDecl, lock, lockArg, fence, exec, stmt stri
 			break
 		}
 	}
-	ret := fenceReturn(s, f, fence, fp, lp)
-	if !ret.IsValid() {
-		return false
-	}
-	scope := litOf(f.Body, fp)
-	for _, c := range cs {
-		if c.fun == exec && isWrite(c) && litOf(f.Body, c.pos) != scope {
-			return false // a write in another transaction closure
-		}
-	}
-	return writesAfter(cs, exec, stmt, ret)
-}
-
-// fenceReturn returns the position of the if in f that returns
-// ErrRepoPurged when the first result of the fence call at fp is true, or
-// token.NoPos. The condition must be that result alone: `false && fenced`
-// or `fenced && other` do not count. The lock call at lp, the fence call
-// and the if must sit in the same func literal (the transaction closure),
-// or all outside any.
-func fenceReturn(s *source, f *ast.FuncDecl, fence string, fp, lp token.Pos) token.Pos {
-	if !fp.IsValid() || !lp.IsValid() {
-		return token.NoPos
-	}
-	name := ""
-	ast.Inspect(f.Body, func(n ast.Node) bool {
-		as, ok := n.(*ast.AssignStmt)
-		if !ok || len(as.Rhs) != 1 || len(as.Lhs) == 0 {
-			return true
-		}
-		if c, ok := as.Rhs[0].(*ast.CallExpr); ok && c.Pos() == fp && s.text(c.Fun) == fence {
-			if id, ok := as.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
-				name = id.Name
-			}
-		}
-		return true
-	})
-	if name == "" {
-		return token.NoPos
-	}
-	scope := litOf(f.Body, fp)
-	if litOf(f.Body, lp) != scope {
-		return token.NoPos
-	}
+	ret := token.NoPos
 	for _, i := range s.ifs(f.Body) {
-		if i.cond == name && i.returns && strings.Contains(i.body, "ErrRepoPurged") && i.stmt.Pos() > fp && litOf(f.Body, i.stmt.Pos()) == scope {
-			return i.stmt.Pos()
+		if i.returns && strings.Contains(i.body, "ErrRepoPurged") && i.stmt.Pos() > fp {
+			ret = i.stmt.Pos()
+			break
 		}
 	}
-	return token.NoPos
-}
-
-// litOf returns the innermost func literal in n that contains pos, or nil.
-func litOf(n ast.Node, pos token.Pos) *ast.FuncLit {
-	var out *ast.FuncLit
-	ast.Inspect(n, func(m ast.Node) bool {
-		if l, ok := m.(*ast.FuncLit); ok && l.Pos() <= pos && pos < l.End() {
-			out = l
-		}
-		return true
-	})
-	return out
+	return fp.IsValid() && lp.IsValid() && ret.IsValid() && writesAfter(cs, exec, stmt, ret)
 }
 
 // mutateFn returns the fn closure of the s.mutate call on the base
@@ -841,8 +793,7 @@ func mutateFn(s *source, f *ast.FuncDecl) *ast.FuncLit {
 }
 
 // firstGate reports that fn's closure starts with an if on cond that
-// returns (bodyHas in its body), before every other call in the closure and
-// before every write to the manifest (see gateBeforeWrites).
+// returns (bodyHas in its body), before every other call in the closure.
 func firstGate(s *source, fn *ast.FuncLit, cond, bodyHas string) bool {
 	if fn == nil {
 		return false
@@ -856,7 +807,7 @@ func firstGate(s *source, fn *ast.FuncLit, cond, bodyHas string) bool {
 				return false
 			}
 		}
-		return gateBeforeWrites(s, fn, cond, bodyHas)
+		return true
 	}
 	return false
 }
@@ -879,10 +830,10 @@ func fencedFold(s *source, f *ast.FuncDecl, lock, lockArg, fence string, pg bool
 		return false
 	}
 	fp := cs[fi].pos
-	lp, inTx := token.NoPos, false
+	locked, ret, inTx := false, false, false
 	for _, c := range cs {
-		if !lp.IsValid() && (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp && (lockArg == "" || hasArg(c, lockArg)) {
-			lp = c.pos
+		if (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp && (lockArg == "" || hasArg(c, lockArg)) {
+			locked = true
 		}
 		if !pg && c.fun == "tx.Commit" && c.pos > fp {
 			inTx = true
@@ -891,7 +842,12 @@ func fencedFold(s *source, f *ast.FuncDecl, lock, lockArg, fence string, pg bool
 	if pg {
 		inTx = cs[fi].inClose && first(cs, "pgx.BeginFunc", "", false).IsValid()
 	}
-	return fenceReturn(s, f, fence, fp, lp).IsValid() && inTx
+	for _, i := range s.ifs(f.Body) {
+		if i.returns && strings.Contains(i.body, "ErrRepoPurged") && i.stmt.Pos() > fp {
+			ret = true
+		}
+	}
+	return locked && ret && inTx
 }
 
 // gateBeforeWrites reports that fn's closure has an if on cond that
@@ -1006,7 +962,7 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 		if i.cond == "state.Repo.DeletedAt == nil" && i.returns && !live.IsValid() {
 			live = i.stmt.Pos()
 		}
-		if i.init == "age := p.now().Sub(*state.Repo.DeletedAt)" && i.cond == "age < MinRepoPurgeAge" && i.returns && !young.IsValid() {
+		if strings.Contains(i.init, "state.Repo.DeletedAt") && strings.Contains(i.cond, "< MinRepoPurgeAge") && i.returns && !young.IsValid() {
 			young = i.stmt.Pos()
 		}
 	}
@@ -1200,6 +1156,32 @@ func purgeCovers() []cover {
 	add("internal/ref/s3walstore.go", "S3WAL", "casRef", "RegisterPacks", "ReplacePacks")
 	add("internal/ref/s3walstore_lfs.go", "S3WAL", "registerLFSObject")
 	add("internal/ref/s3walstore_purge.go", "S3WAL", "FenceRepoPurge", "IsRepoPurged", "DropRepoRefs", "RetireRepoPacks", "CountRepoRows")
+	// serve's purge wiring sits in buildAPIHandler, which changes often:
+	// fingerprint only the window from the wirePurge call to the NewSweeper
+	// call (a line in between could clear the probe again) and the branch
+	// that builds the schedule.
+	wire := src("cmd/openstorage/wire.go")
+	build := wire.fn("", "buildAPIHandler")
+	var first, last ast.Stmt
+	var sched *ast.IfStmt
+	for _, st := range build.Body.List {
+		t := wire.text(st)
+		if first == nil && strings.Contains(t, "wirePurge(") {
+			first = st
+		}
+		if first != nil && last == nil && strings.Contains(t, "jobs.NewSweeper(") {
+			last = st
+		}
+		if is, ok := st.(*ast.IfStmt); ok && is.Init == nil && wire.text(is.Cond) == "sweep.interval > 0" {
+			sched = is
+		}
+	}
+	if first == nil || last == nil || sched == nil {
+		fail("%s: buildAPIHandler's wirePurge call, jobs.NewSweeper call or `if sweep.interval > 0` branch not found", wire.path)
+	}
+	out = append(out,
+		cover{wire, "cmd/openstorage/wire.go:buildAPIHandler[purge wiring]", span{first.Pos(), last.End()}},
+		cover{wire, "cmd/openstorage/wire.go:buildAPIHandler[sweep schedule]", sched.Body})
 	for _, b := range []struct{ rel, recv string }{
 		{"internal/meta/purge.go", "PG"}, {"internal/meta/purge_sqlite.go", "SQLite"}, {"internal/meta/s3walmeta_purge.go", "S3WAL"},
 	} {

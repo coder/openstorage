@@ -1,5 +1,7 @@
 # Token fingerprints of the code model/PackSweep.tla and model/RepoPurge.tla describe (facts/facts.go).
 # check.sh --record rewrites this file; SKILL.md holds the sync commit.
+cmd/openstorage/wire.go:buildAPIHandler[purge_wiring] d0b93002182af2448b3fb3a970d8d006cc910bcaaa72a2004dc36888ddf5e279
+cmd/openstorage/wire.go:buildAPIHandler[sweep_schedule] 7345a839048c9c7b6f911e2ec9fd384c5d70f4f2c80098115c2f2c18c094a412
 internal/api/publish.go:server.publishPack b8bef1bc00130715bed70f3ebbd22f71add6e4fb84ba7c0cbe76eb096244fe50
 internal/blob/blob.go:EnsurePublished 96b2fcd9493fd991f9c601be85515bd990810cae884758544544c791eacb4ad9
 internal/blob/blob.go:QuotaRepoGroup 8d3b136dd29593c9d251769fbc79d278628f090a5749fcbf17e2978c2e09eb73

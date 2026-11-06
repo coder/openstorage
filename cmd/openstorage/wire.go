@@ -426,20 +426,6 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	return h, ms, verifier, maybeRepack, drainRuns, cleanup, nil
 }
 
-// bootstrapOrgAuth registers the configured file keys for the served org
-// (idempotent last-writer-wins upsert — correct for file keys, every replica
-// re-inserts the same shared set) and builds the process verifier: database
-// org keys unioned in-memory with this process's loopback public key.
-//
-// The loopback key is deliberately NOT persisted (issue #45): the org key
-// set is one shared slot, so a persisted per-process key would be deleted by
-// the next replica's boot, 403ing this process's own sync pushes. In-memory
-// verification is sound because loopback pushes terminate at this process's
-// own listener (see selfLoopbackURL), never at another replica.
-//
-// It also warns about retained org rows that no longer match the configured
-// org (issue #47): both surfaces reject their tokens, but the rows (and any
-// registered keys) stay in the database — cleanup is operator-driven.
 // wirePurge returns the repository purge seams (issue #52) of the stores and
 // connects the registry to the sweep config. The concrete backends always
 // carry the seams, so the assertions hold on every serve configuration.
@@ -469,6 +455,20 @@ func newSweepSchedule(sweeper *jobs.Sweeper, interval, retention time.Duration, 
 	return schedule
 }
 
+// bootstrapOrgAuth registers the configured file keys for the served org
+// (idempotent last-writer-wins upsert — correct for file keys, every replica
+// re-inserts the same shared set) and builds the process verifier: database
+// org keys unioned in-memory with this process's loopback public key.
+//
+// The loopback key is deliberately NOT persisted (issue #45): the org key
+// set is one shared slot, so a persisted per-process key would be deleted by
+// the next replica's boot, 403ing this process's own sync pushes. In-memory
+// verification is sound because loopback pushes terminate at this process's
+// own listener (see selfLoopbackURL), never at another replica.
+//
+// It also warns about retained org rows that no longer match the configured
+// org (issue #47): both surfaces reject their tokens, but the rows (and any
+// registered keys) stay in the database — cleanup is operator-driven.
 func bootstrapOrgAuth(ctx context.Context, ms meta.Store, org string, orgPEMBlocks []string, logger *slog.Logger) (loopbackKey, auth.Verifier, error) {
 	assertf(ms != nil && org != "" && len(orgPEMBlocks) > 0 && logger != nil, "bootstrapOrgAuth: missing deps")
 	key, loopbackPubPEM, err := newLoopbackKey()
