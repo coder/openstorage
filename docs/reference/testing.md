@@ -476,8 +476,7 @@ fixed it. `nightly-09012026` was the first build with the fix. Stable
 [`2.1.0`](https://github.com/floci-io/floci/releases/tag/2.1.0) contains both
 changes and replaced that dated pin after qualification in #274. `2.2.0`
 descends from it, `2.3.0` descends from `2.2.0`, and `2.4.0` descends from
-`2.3.0`. The `get-under-overwrite`
-surface guards it in require mode.
+`2.3.0`. The `get-under-overwrite` surface guards it in require mode.
 
 **Positives:** Floci passes the full 22-surface s3wal qualification suite
 (`TestQualifyExternalEndpoint` in `internal/ref/s3wal`; 22/22 on the pin via
