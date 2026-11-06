@@ -34,7 +34,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/lane-schedule-check.XXXXXX")
 ```
 
 - Needs Go (the `go.mod` version), Java 11 or newer, and `curl`. The first run downloads `tla2tools.jar` 1.7.4 (sha256-pinned) into `${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla`, the cache `verify-orphan-sweep` uses too. Set `JAVA`, `GO`, or `OPENSTORAGE_TLA_CACHE` to override.
-- A passing run takes about 2 to 3 minutes with the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), and about 2 minutes with `TLC_WORKERS=8`. A failing run usually takes seconds, because TLC stops at the first violation.
+- A passing run took about 8 minutes with `TLC_WORKERS=8` (default 4 workers, `TLC_WORKERS`) and the default 4 GB heap (`TLC_HEAP`). `OtherWriters.cfg` is most of it. Fewer workers take longer. A failing run usually takes seconds, because TLC stops at the first violation.
 - `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path.
 - `--only <cfg>` runs one config, for example `--only LaneSchedule.cfg`. It is for quick iteration. Finish with a full run.
 - `--fact <Name>=FALSE` sets one code fact FALSE in the model only, whatever the code says. It shows what the model does without that guard, and a run with it never exits 0. `mutate.sh --model` uses it (see [Validation](#validation)).
@@ -48,7 +48,7 @@ A clean run ends like this:
    ... (12 facts, all TRUE)
 == TLC 1.7.4 (outputs in /tmp/lane-schedule-check.Ab12Cd)
    LaneSchedule.cfg            PASS (3535660 distinct states)
-   OtherWriters.cfg            PASS (20496186 distinct states)
+   OtherWriters.cfg            PASS (56705945 distinct states)
    Liveness.cfg                PASS (348735 distinct states)
    NoLeaseAssumption.cfg       fails as expected (trace: ...)
 == Coverage (sync commit <sync commit>)
@@ -226,7 +226,7 @@ With every fact TRUE in the code, setting each fact FALSE in the model alone fai
 
 ## Coverage record
 
-Sync commit: `109a482c77d75721301531a9b6c0b2c4e8992b2b` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
+Sync commit: `261a8adcc16154115fed931b31fc0230a1b1fcf3` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
 Every declaration in these files is covered:
 
