@@ -397,7 +397,7 @@ deliberately invalid fixtures; it does not reproduce the flake.
 [`floci-nightly.yml`](../../.github/workflows/floci-nightly.yml) boots
 [Floci](https://hub.docker.com/r/floci/floci), a lightweight AWS wire-protocol
 emulator, with S3 auth enforced. Both Floci workflows and `s3waltest.FlociImage`
-pin stable `2.3.0` by the same OCI index digest. The blob job mints an IAM
+pin stable `2.4.0` by the same OCI index digest. The blob job mints an IAM
 access key through the IAM API and runs `go test ./internal/blob` with
 `OPENSTORAGE_TEST_S3_URL` set. That variable gates the endpoint tests in `internal/blob/s3endpoint_test.go`
 (skipped elsewhere): a CRUD round-trip through the real `blob.S3` surface, and
@@ -427,22 +427,28 @@ and 60-second contention runs at 2, 8, and 32 writers. `2.3.0` also passed the
 IAM blob suite and the full Git/LFS STS suite. The credential and gap probes
 below gave the same result on both releases.
 
+Stable `2.4.0` (upstream revision `9be236e2`, which descends from `2.3.0`)
+replaced `2.3.0` after a comparison on the exact linux/amd64 images. Both
+passed the 22 required surfaces, `get-under-overwrite`, and `delete-if-match`.
+`2.4.0` also passed the IAM blob suite and the full Git/LFS STS suite. The
+credential and gap probes below gave the same result on both releases.
+
 **Known Floci gaps** — do not extend this lane into them. All are verified open
-on the pin `2.3.0` (`s3waltest.FlociImage`) with
+on the pin `2.4.0` (`s3waltest.FlociImage`) with
 `FLOCI_SERVICES_S3_ENFORCE_AUTH=true` and an IAM-minted key:
 
 - No IAM policy evaluation on S3 actions (an explicit `Deny s3:GetObject` still
   allows `GetObject`), and `x-amz-expected-bucket-owner` is ignored (a wrong
   12-digit owner passes `GetObject` and `HeadBucket`; AWS returns 403).
   Unit-test seams cover both. With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`,
-  `2.2.0` and `2.3.0` deny that read (`AccessDenied`), but no lane sets the
+  `2.2.0` through `2.4.0` deny that read (`AccessDenied`), but no lane sets the
   flag: it also makes IAM reject the `root`/`root` bootstrap credentials the
   lanes use.
   The expected-owner header stays ignored with the flag on.
 - A long-lived IAM key sent with an unexpected session token still passes.
 - Besides IAM- and STS-minted keys, the data plane accepts Floci's built-in
   `test` access key (secret `test`; the signature is checked). That key reads
-  buckets and objects that an IAM-minted key created. `2.1.0` and `2.2.0`
+  buckets and objects that an IAM-minted key created. `2.1.0` through `2.4.0`
   behave the same.
 
 **Fixed in `2.2.0`: conditional DELETE.** Through `2.1.0`, `DeleteObject`
@@ -459,7 +465,7 @@ keys. A temporary key with a missing, forged, garbage, or another session's
 token fails with `InvalidAccessKeyId`. Valid IAM and STS reads return the exact
 bytes. Presigned-URL signatures were already validated and still are (tampered
 GET or PUT ⇒ `403 SignatureDoesNotMatch`); that is the SigV4 property this lane
-pins. The same probes give the same results on `2.2.0` and `2.3.0`.
+pins. The same probes give the same results on `2.2.0`, `2.3.0` and `2.4.0`.
 
 **Fixed upstream: torn reads.** Through `2.0.1`, a GET racing a same-key PUT
 could return a body that was neither version, with broken HTTP framing (Go logs
@@ -470,19 +476,19 @@ CAS overwrites. [floci-io/floci#2874](https://github.com/floci-io/floci/pull/287
 fixed it. `nightly-09012026` was the first build with the fix. Stable
 [`2.1.0`](https://github.com/floci-io/floci/releases/tag/2.1.0) contains both
 changes and replaced that dated pin after qualification in #274. `2.2.0`
-descends from it, and `2.3.0` descends from `2.2.0`. The `get-under-overwrite`
-surface guards it in require mode.
+descends from it, `2.3.0` descends from `2.2.0`, and `2.4.0` descends from
+`2.3.0`. The `get-under-overwrite` surface guards it in require mode.
 
 **Positives:** Floci passes the full 22-surface s3wal qualification suite
 (`TestQualifyExternalEndpoint` in `internal/ref/s3wal`; 22/22 on the pin via
 `TestQualifyFloci`), the only emulator besides SeaweedFS to do so. SeaweedFS
-4.46 and Floci `2.2.0` and `2.3.0` enforce conditional DELETE (412; the object
-survives a mismatched `If-Match`). The legacy MinIO pin does not.
+4.46 and Floci `2.2.0` through `2.4.0` enforce conditional DELETE (412; the
+object survives a mismatched `If-Match`). The legacy MinIO pin does not.
 
 **Floci row of the s3wal qualification matrix.** The same workflow runs
 `TestQualifyFloci` (`internal/ref/s3wal/qualify_floci_test.go`) against the
 pinned `s3waltest.FlociImage`: the 22 surfaces plus `get-under-overwrite` in
-**require mode**, and `delete-if-match` in record mode (`2.3.0` honors the
+**require mode**, and `delete-if-match` in record mode (`2.4.0` honors the
 condition, but s3wal never relies on it — ADR-46).
 
 This is regression armor from a second implementation, **not** s3wal promotion
@@ -525,7 +531,7 @@ Run it locally (Docker + the `aws` CLI):
 ```sh
 docker run -d --name floci -p 4566:4566 \
   -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-  floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9
+  floci/floci:2.4.0@sha256:5ee85db604c4aa74ac76e07ea5cc83086f37bb472bf3dbb97e34019e48efae9c
 
 # IAM accepts any credentials; only S3 enforces auth.
 export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1
@@ -574,8 +580,8 @@ It adds over the per-PR `test` job:
 
 Limit: the lane signs only with fresh STS session keys, so the suite provably
 works on temporary keys. Floci also accepts its built-in `test` key (see the
-gap list), which the lane never uses. On `2.1.0` (the #274 probes), `2.2.0` and
-`2.3.0`, header-auth `GetObject` rejects a missing, forged, or mismatched
+gap list), which the lane never uses. On `2.1.0` (the #274 probes) and `2.2.0`
+through `2.4.0`, header-auth `GetObject` rejects a missing, forged, or mismatched
 session token, unlike `nightly-09012026`. A dropped or forged
 `AWS_SESSION_TOKEN` on those reads would now fail the lane. Other operations
 were not probed, and the lane does not establish IAM policy enforcement or full
@@ -595,7 +601,7 @@ Run it locally (Docker + the `aws` CLI; the tag is `s3waltest.FlociImage`):
 ```sh
 docker run -d --name floci -p 4566:4566 \
   -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-  floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9
+  floci/floci:2.4.0@sha256:5ee85db604c4aa74ac76e07ea5cc83086f37bb472bf3dbb97e34019e48efae9c
 
 # IAM/STS accept any credentials; only the S3 data plane enforces auth.
 export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1
