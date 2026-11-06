@@ -3,6 +3,7 @@ package gitlimit
 import (
 	"bytes"
 	"errors"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -39,8 +40,9 @@ type registry struct {
 	signalGroup func(pgid int, sig syscall.Signal) error
 }
 
-// group is a tracked process group whose leader has not been reaped.
+// group is a tracked process group whose leader wait has not removed yet.
 type group struct {
+	leader *os.Process
 	exited bool // the leader exited while stop ran, so wait holds it unreaped
 }
 
@@ -106,7 +108,7 @@ func (g *registry) start(cmd *exec.Cmd) error {
 	if g.groups == nil {
 		g.groups = make(map[int]*group)
 	}
-	g.groups[cmd.Process.Pid] = &group{}
+	g.groups[cmd.Process.Pid] = &group{leader: cmd.Process}
 	return nil
 }
 
@@ -125,10 +127,12 @@ func (g *registry) start(cmd *exec.Cmd) error {
 //
 // Both rest on awaitExit, a wait that leaves the child unreaped. Only Linux
 // has one. Elsewhere wait reaps first and removes the group right after, so
-// stop sends no signal to a group that has left the registry. A leader that
+// stop sends no signal to a group that has left the registry, and signal
+// skips a registered group whose leader os reports reaped. A leader that
 // exits during the grace gets no final SIGKILL there, and a member it left
 // behind lives on. What stays open is the time between the reap and the
-// next lock acquisition of this goroutine.
+// moment os marks the process done (golang/go#13987), which Process.Signal
+// has on macOS as well.
 func (g *registry) wait(cmd *exec.Cmd) error {
 	pid := cmd.Process.Pid
 	hold := g.hold
@@ -161,9 +165,16 @@ func (g *registry) isStopped() bool {
 	return g.stopped
 }
 
-// signal sends sig to the process group pgid. The caller holds g.mu and
-// found pgid in g.groups.
-func (g *registry) signal(pgid int, sig syscall.Signal) {
+// signal sends sig to gr's process group. The caller holds g.mu and found gr
+// in g.groups. Where wait reaps first, a reaped leader stays registered
+// until wait takes the lock, and its group ID may belong to another group
+// by then. os reports a reap as soon as the wait call returns, so a leader
+// it reports done gets no signal.
+func (g *registry) signal(gr *group, sig syscall.Signal) {
+	if gr.leader.Signal(syscall.Signal(0)) != nil {
+		return
+	}
+	pgid := gr.leader.Pid
 	if g.signalGroup != nil {
 		_ = g.signalGroup(pgid, sig)
 		return
@@ -184,17 +195,17 @@ func (g *registry) stop(grace time.Duration) int {
 	}
 	killed := g.killed
 	pgids := make([]int, 0, len(g.groups))
-	for pgid := range g.groups {
+	for pgid, gr := range g.groups {
 		pgids = append(pgids, pgid)
-		g.signal(pgid, syscall.SIGTERM)
+		g.signal(gr, syscall.SIGTERM)
 	}
 	g.mu.Unlock()
 	for deadline := time.Now().Add(grace); g.running(pgids) > 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 	}
 	g.mu.Lock()
 	for _, pgid := range pgids {
-		if _, ok := g.groups[pgid]; ok {
-			g.signal(pgid, syscall.SIGKILL)
+		if gr, ok := g.groups[pgid]; ok {
+			g.signal(gr, syscall.SIGKILL)
 		}
 	}
 	select {
