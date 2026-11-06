@@ -130,9 +130,11 @@ func (sweepArgs) Kind() string { return "orphan_pack_sweep" }
 
 func (sweepArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
+		Queue:       sweepQueue,
 		MaxAttempts: 1,
 		UniqueOpts: river.UniqueOpts{
-			ByArgs: true,
+			ByArgs:  true,
+			ByQueue: true, // see sweepQueue
 			ByState: []rivertype.JobState{
 				rivertype.JobStateAvailable,
 				rivertype.JobStatePending,
@@ -154,9 +156,11 @@ func (lfsReclaimArgs) Kind() string { return "lfs_reclaim" }
 
 func (lfsReclaimArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
+		Queue:       lfsReclaimQueue,
 		MaxAttempts: 1,
 		UniqueOpts: river.UniqueOpts{
-			ByArgs: true,
+			ByArgs:  true,
+			ByQueue: true, // see sweepQueue
 			ByState: []rivertype.JobState{
 				rivertype.JobStateAvailable,
 				rivertype.JobStatePending,
@@ -168,6 +172,11 @@ func (lfsReclaimArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+// errScheduleOff fails a sweep or LFS reclaim job that reached a replica with
+// that schedule off. Only a job an older binary inserted on the default queue
+// can: since the passes got their own queues, a replica fetches such a queue
+// only when its schedule is on (NewRiver). River discards the job because its
+// MaxAttempts is 1, so a rolling upgrade can lose one tick.
 var errScheduleOff = errors.New("jobs: this replica has the pass schedule off")
 
 type lfsReclaimWorker struct {
@@ -192,10 +201,28 @@ func (w *lfsReclaimWorker) Work(ctx context.Context, _ *river.Job[lfsReclaimArgs
 // attacker-controlled endpoints that can hold each attempt for its full
 // timeout, delaying a default-queue renewal past the cover TTL. A
 // reserved queue bounds renewal latency by the job's own runtime (the
-// TTL/4 pass cap), not by tenant traffic. The sweep/reclaim jobs stay on
-// the default queue deliberately: starving them delays convergence, never
-// a safety property.
+// TTL/4 pass cap), not by tenant traffic.
 const absenceQueue = "absence_reconcile"
+
+// sweepQueue and lfsReclaimQueue are the single-worker queues of the sweep
+// and LFS reclaim jobs. A replica registers a queue only when its schedule
+// is on (NewRiver), so a replica with the schedule off never fetches such a
+// job. On the shared default queue it did, returned errScheduleOff, and
+// River discarded the job (MaxAttempts 1): the tick was lost. Each job is
+// unique, so a second worker would stay idle.
+//
+// The unique key includes the queue (ByQueue). An older binary inserts these
+// jobs on the default queue with a key that has no queue in it. If a rollback
+// strands an unfetched job in the new queue, no older replica fetches it, and
+// without ByQueue it would also block every insert from the older fleet. The
+// stranded job stays available until a newer binary fetches it, and it then
+// runs once. The same key split lets an older replica's job and a newer
+// replica's job run together for one tick during a rolling upgrade, which
+// both passes tolerate.
+const (
+	sweepQueue      = "orphan_pack_sweep"
+	lfsReclaimQueue = "lfs_reclaim"
+)
 
 // absenceReconcileArgs is one scheduled registry-vs-storage absence
 // reconciliation pass (issue #101), unique across the active states like
@@ -473,10 +500,12 @@ func syncSnoozeDelay(up sync.Upstream) time.Duration {
 	return delay
 }
 
-// syncWorker executes one sync run. Run's error return is for logging only
-// (documented failure outcomes already emitted repo.sync.failed), so the
-// job always completes — through the gated transactional completion below,
-// which closes the uniqueness window for pull-upstream requests (issue #79).
+// syncWorker executes one sync run. Run's error return is mostly for
+// logging (documented failure outcomes already emitted repo.sync.failed);
+// only ErrShutdown and ErrRepoGone steer the job. Otherwise the job ends
+// through the gated transactional completion below, which closes the
+// uniqueness window for pull-upstream requests (issue #79) and snoozes
+// the job while a request or a held claim has no coverage.
 type syncWorker struct {
 	river.WorkerDefaults[syncArgs]
 	run       SyncRunner
@@ -508,14 +537,17 @@ type syncWorker struct {
 //
 // The RunCount half of the gate keeps successor chains bounded: a job that
 // never claimed (skip on ErrSyncInProgress) leaves the counters untouched
-// and schedules nothing — a skip implies the claim holder was live after
-// this job's pre-read, so the holder's own gated completion covers
-// concurrent requests. A run that FAILED before claiming is different: a
+// and schedules nothing of its own. If the claim it skipped is still held
+// at completion, the job snoozes until the claim can be stolen (see the
+// held-claim case below); a claim released by then had a counted run whose
+// gated completion covered concurrent requests. A run that FAILED before claiming is different: a
 // pending marker with no counted run and no claim holder has no coverage
 // at all, so completing would strand the accepted request — that case
 // SNOOZES the job to retry the whole run (which then claims and consumes
 // the marker), mirroring the transient-failure retry the completion path
-// already uses.
+// already uses. Nor does the gate complete while a sync claim is held: the
+// claim holds a consumed request that no counted run covers yet. Only a
+// deleted repository's job completes then.
 func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 	// Pre-run baseline: RunCount changing across this job proves a claimed
 	// run completed while it was active. A failed read degrades to
@@ -534,6 +566,9 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 	rctx, done := withShutdown(ctx, w.runs)
 	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref})
 	done()
+	if errors.Is(runErr, sync.ErrRepoGone) {
+		return nil // nothing left to pull, whatever claim the row still shows
+	}
 	if runErr != nil {
 		w.logger.Warn("sync run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
@@ -591,6 +626,19 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 		w.logger.Warn("sync: uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.Syncing, "err", runErr)
 		return river.JobSnooze(delay)
+	case up.Syncing:
+		// A sync claim is still held, and it holds the request it
+		// consumed (a pull-upstream, or the mirror-back a forward marked):
+		// completing would lose it. Sync jobs are unique by repo, so the
+		// holder is a run of this job that died, whose claim committed but
+		// reported an error, or whose finish write failed, or a run of an
+		// older job that an older binary completed. The re-run after the
+		// lease steals the claim; a lapsed legacy claim waits at legacy
+		// pace for its holder or the steal opt-in.
+		delay := syncSnoozeDelay(up)
+		w.logger.Warn("sync: claim still held at completion; snoozing until it can be stolen",
+			"repo", job.Args.RepoID, "delay", delay, "err", runErr)
+		return river.JobSnooze(delay)
 	case up.SyncPending && (!preKnown || up.RunCount != preRuns):
 		if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx,
 			syncArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}, nil); err != nil {
@@ -623,8 +671,10 @@ func pushSnoozeDelay(up sync.Upstream) time.Duration {
 // pushWorker executes one outbound push-upstream run (issue #90). It is
 // syncWorker's mirror on the push_* lane: the run owns outcomes and events,
 // and completion is transactional with a gated successor insert — the
-// swallowed-request coverage argument in syncWorker.Work applies verbatim
-// with RequestPush/BeginPush/push_pending substituted. One addition: a run
+// swallowed-request coverage argument in syncWorker.Work applies with
+// RequestPush/BeginPush/push_pending substituted. Additions: the gate
+// never completes while a push claim is held (it holds a consumed
+// request), except for a deleted repository; and a run
 // that failed TRANSIENTLY (upstream unreachable) re-marked its own pending
 // level (sync.Worker.RunPush), so the gate schedules its successor with the
 // worker-defined exponential backoff and an incremented retry counter
@@ -653,6 +703,9 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 	rctx, done := withShutdown(ctx, w.runs)
 	runErr := w.run(rctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Retry: job.Args.Retry})
 	done()
+	if errors.Is(runErr, sync.ErrRepoGone) {
+		return nil // nothing left to push, whatever claim the row still shows
+	}
 	if runErr != nil {
 		w.logger.Warn("push run finished with error",
 			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
@@ -686,6 +739,18 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 		delay := pushSnoozeDelay(up)
 		w.logger.Warn("push: uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.PushSyncing, "err", runErr)
+		return river.JobSnooze(delay)
+	case up.PushSyncing:
+		// A push claim is still held, and it holds the request it
+		// consumed: completing would lose it. Push jobs are unique by
+		// repo, so the holder is a run of this job that died, whose claim
+		// committed but reported an error, or whose finish or restore
+		// write failed, or a run of an older job that an older binary
+		// completed. The re-run after the lease steals the claim and its
+		// force level.
+		delay := pushSnoozeDelay(up)
+		w.logger.Warn("push: claim still held at completion; snoozing until it can be stolen",
+			"repo", job.Args.RepoID, "delay", delay, "err", runErr)
 		return river.JobSnooze(delay)
 	default:
 		if up.PushPending != sync.PushPendingNone && (!preKnown || up.PushRunCount != preRuns) {
@@ -835,7 +900,8 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	// The pass workers register even with their schedule off: the leader
 	// rescues a running job by its worker's Timeout, and it discards a kind
 	// it has no worker for once RescueStuckJobsAfter passes, while another
-	// replica can still be running that pass.
+	// replica can still be running that pass. Registering a worker does not
+	// fetch its jobs: that takes the kind's queue, added below.
 	river.AddWorker(workers, &sweepWorker{schedule: sweep})
 	river.AddWorker(workers, &lfsReclaimWorker{schedule: lfsReclaim})
 	river.AddWorker(workers, &absenceReconcileWorker{schedule: absence})
@@ -873,6 +939,12 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		))
 	}
 	queues := map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 8}}
+	if sweep != nil {
+		queues[sweepQueue] = river.QueueConfig{MaxWorkers: 1}
+	}
+	if lfsReclaim != nil {
+		queues[lfsReclaimQueue] = river.QueueConfig{MaxWorkers: 1}
+	}
 	if absence != nil {
 		// Reserved queue — see absenceQueue: cover renewal is TTL-coupled
 		// and must not wait behind tenant-scalable default-queue work.
@@ -964,6 +1036,34 @@ func (q *River) EnqueuePush(ctx context.Context, job sync.Job) error {
 	return err
 }
 
+// RecordForwardTx records a forward_on_push repository's forward intent in
+// tx, the transaction of the ref CAS that accepted the write: the push job
+// and the pending level commit with the ref, or not at all. It reports
+// whether it marked the pending level of a forward_on_push row. A
+// repository that does not forward gets no write; one whose
+// forward_on_push turns off between the read and the update gets only a
+// job, which forwards once.
+//
+// The job comes first. Its insert is EnqueuePush's, deduplicated by repo,
+// and it waits for a push job whose completion transaction holds the row.
+// That completion then reads the upstream row from the metadata pool. If tx
+// held the upstream row while it waited, writers queued on that row could
+// take every connection of the pool, and neither side could move. Either
+// the completion commits first, and the insert joins its successor or adds
+// a new job, or the insert locks the live job first, and the completion
+// waits for tx, reads the new pending level and schedules a successor.
+func (q *River) RecordForwardTx(ctx context.Context, tx pgx.Tx, job sync.Job) (bool, error) {
+	assertf(job.Org != "" && job.RepoID != "" && job.Retry == 0, "RecordForwardTx: bad job %+v", job)
+	forwards, err := meta.PGForwardsOnPush(ctx, tx, job.RepoID)
+	if err != nil || !forwards {
+		return false, err
+	}
+	if _, err := q.client.InsertTx(ctx, tx, pushArgs{Org: job.Org, RepoID: job.RepoID}, nil); err != nil {
+		return false, err
+	}
+	return meta.PGRequestForward(ctx, tx, job.RepoID)
+}
+
 // EnqueueRepack inserts one unique-by-repo repack job. Refused when this
 // client has no repack worker registered: a durable job nobody works would
 // sit queued forever AND its uniqueness would swallow every later insert.
@@ -1015,10 +1115,9 @@ const shutdownSnoozeFallback = 30 * time.Minute
 // the gate, so it is not rerun. A
 // restored run left its request pending and no claim; the snooze then
 // matches the gate's own uncovered-pending snooze. A failed restore left
-// the claim held and the request consumed; the gate would complete the
-// job (no pending mark), and the request would be lost once the claim
-// expired. The delay therefore waits past any claim on the fresh row, and
-// the next run steals it and does the work. No successor is inserted: this
+// the claim held and the request consumed; the gate snoozes such a job
+// too, and so does this: the delay waits past any claim on the fresh row,
+// and the next run steals it and does the work. No successor is inserted: this
 // job stays the only one for the lane and repo, and its next run's claim
 // covers every request marked before it.
 func shutdownSnooze(ctx context.Context, upstreams sync.UpstreamStore, repoID string,

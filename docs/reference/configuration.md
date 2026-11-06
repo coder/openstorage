@@ -761,7 +761,7 @@ synchronously for one repo.
   The purge rides the sweep schedule.
 - **Fleet prerequisite** (also for `openstorage purge-repo`): enable only when **every**
   node (serve replicas *and* hook-running git nodes) runs a build with the purge write
-  fence (ref updates and pack/LFS registrations reject purged repos). Otherwise an old
+  fence (ref updates, pack/LFS registrations and repack folds reject purged repos). Otherwise an old
   node can accept a write that is stranded behind the purge while reporting success.
   Leaving retention unset is safe on any fleet.
 - **Write fence:** each purge fences the repo before touching anything, so a still

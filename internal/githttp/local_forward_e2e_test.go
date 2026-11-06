@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/openstorage/internal/testutil/heldport"
 )
 
 // skipUnlessLocalSchedule skips a test of git-surface hook scheduling on
@@ -249,7 +250,10 @@ func TestLocalHookForwardBeforeCachePublication(t *testing.T) {
 
 // toggledUpstream is a smart-HTTP upstream on a fixed address that can be
 // taken down (connection refused: a transient push failure) and brought
-// back.
+// back. On Linux heldport keeps the port while it is down, so another
+// server takes the port and answers in its place (a 404 there is a
+// permanent push failure) only if it also sets SO_REUSEPORT and binds that
+// exact port. Off Linux the port is not held.
 type toggledUpstream struct {
 	addr    string
 	handler http.Handler
@@ -262,10 +266,7 @@ func newToggledUpstream(t *testing.T, root string) *toggledUpstream {
 	u := &toggledUpstream{handler: &cgi.Handler{Path: backend, Env: []string{
 		"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
 	}}}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := heldport.Listen(t)
 	u.addr = ln.Addr().String()
 	u.serve(ln)
 	t.Cleanup(func() {
@@ -292,11 +293,7 @@ func (u *toggledUpstream) down(t *testing.T) {
 
 func (u *toggledUpstream) up(t *testing.T) {
 	t.Helper()
-	ln, err := net.Listen("tcp", u.addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.serve(ln)
+	u.serve(heldport.Relisten(t, u.addr))
 }
 
 // readPushSchedule reads repoID's push retry position from the private

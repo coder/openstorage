@@ -32,7 +32,7 @@ clients ──► reverse proxy (TLS) ──► N × openstorage serve ──►
 ### Runtime base and support
 
 The Dockerfile pins both base images by **multi-platform image index digest**: the
-runtime base, **Alpine 3.24.3**, and the Go builder, whose Go version follows
+runtime base, **Alpine 3.24.4**, and the Go builder, whose Go version follows
 `mise.toml`. This does **not** make the full build reproducible or guarantee current
 package fixes:
 
@@ -584,9 +584,12 @@ Also note:
 ## Background maintenance in a fleet
 
 Orphan-pack sweeps, repack folds, webhook deliveries, and upstream syncs run as durable
-River jobs in Postgres. Any replica may pick up any job, jobs survive replica loss, and a
-job triggered through one replica may run (and log) on another. What the jobs do, how to
-read their reports, and delete-mode prerequisites: see the
+River jobs in Postgres. Any replica may pick up a job, jobs survive replica loss, and a
+job triggered through one replica may run (and log) on another. The exceptions are the
+orphan sweep, the LFS reclaim and the absence reconcile: each has its own queue, and only
+replicas with that job's interval set work it. River also queues each of them only from
+the elected leader, so set those intervals the same on every replica. What the jobs do,
+how to read their reports, and delete-mode prerequisites: see the
 [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 
 ## What to monitor

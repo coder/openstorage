@@ -17,7 +17,10 @@ package ref
 //     watermark) never mix application clocks.
 //   - River's unique periodic jobs serialize each job fleet-wide (one
 //     running pass per job kind), so writers of a given row never race;
-//     last-writer-wins is exact, not merely convergent. Rows are
+//     last-writer-wins is exact, not merely convergent. A rolling upgrade
+//     is the exception: an older binary's job on the default queue and a
+//     newer binary's job on its own queue have different unique keys, so two
+//     passes of one kind can run together for one tick. Rows are
 //     bookkeeping, never authority: losing one restarts a scan from the
 //     top, which every consumer tolerates by construction.
 

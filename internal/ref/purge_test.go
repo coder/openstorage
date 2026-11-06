@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // purgeStore is the concrete-backend purge surface under test (the seams
@@ -247,6 +249,157 @@ func TestRepoPurgeSeams(t *testing.T) {
 			t.Fatalf("control gens bump lost: gen=%d err=%v", gen, err)
 		}
 	})
+}
+
+// TestReplacePacksPurgeFence: a repack fold that uploaded its pack before
+// the purge fenced the repository must not register it afterwards — a
+// purge-aware sweep treats a fenced repo's unregistered blobs as permanent
+// garbage and may already have reaped the fold's bytes. The refused fold
+// changes nothing; the unfenced control repo still folds.
+func TestReplacePacksPurgeFence(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ps, ok := s.(purgeStore)
+		if !ok {
+			t.Fatalf("store %T lacks purge seams", s)
+		}
+		ctx := context.Background()
+		base := t.Name()
+		other := base + "-other"
+		packsOf := func(repo string) []Pack {
+			return []Pack{
+				{ID: "a", Key: "packs/" + repo + "/pack-a.pack", Size: 10},
+				{ID: "b", Key: "packs/" + repo + "/pack-b.pack", Size: 20},
+			}
+		}
+		foldOf := func(repo string) Pack {
+			return Pack{ID: "fold", Key: "packs/" + repo + "/pack-fold.pack", Size: 25}
+		}
+		for _, repo := range []string{base, base + "+import", other} {
+			if err := s.RegisterPacks(ctx, repo, packsOf(repo)); err != nil {
+				t.Fatalf("RegisterPacks(%s): %v", repo, err)
+			}
+		}
+		if err := ps.FenceRepoPurge(ctx, base); err != nil {
+			t.Fatalf("FenceRepoPurge: %v", err)
+		}
+
+		for _, repo := range []string{base, base + "+import"} {
+			ledgerBefore := ledgerState(t, s, purgeGroupOf(base))
+			genBefore, err := s.GetGeneration(ctx, repo)
+			if err != nil {
+				t.Fatalf("GetGeneration(%s): %v", repo, err)
+			}
+			won, err := s.ReplacePacks(ctx, repo, packsOf(repo), foldOf(repo))
+			if won || !errors.Is(err, ErrRepoPurged) {
+				t.Fatalf("ReplacePacks(fenced %s) = (%v, %v), want ErrRepoPurged", repo, won, err)
+			}
+			packs, err := s.ListPacks(ctx, repo)
+			if err != nil || len(packs) != 2 || packs[0].ID != "a" || packs[1].ID != "b" {
+				t.Fatalf("packs of %s after refused fold: %v err=%v (want a, b)", repo, packs, err)
+			}
+			if has, err := s.HasPack(ctx, repo, foldOf(repo).Key); err != nil || has {
+				t.Fatalf("fold row of %s registered: has=%v err=%v", repo, has, err)
+			}
+			if retained, err := s.IsRetainedPack(ctx, repo, packsOf(repo)[0].Key); err != nil || retained {
+				t.Fatalf("old row of %s retained by refused fold: %v err=%v", repo, retained, err)
+			}
+			if got := ledgerState(t, s, purgeGroupOf(base)); got != ledgerBefore {
+				t.Fatalf("ledger moved by refused fold of %s: %+v -> %+v", repo, ledgerBefore, got)
+			}
+			if gen, err := s.GetGeneration(ctx, repo); err != nil || gen != genBefore {
+				t.Fatalf("generation of %s moved by refused fold: %d -> %d err=%v", repo, genBefore, gen, err)
+			}
+		}
+
+		// Once the purge retired the old rows, a late fold is a clean loss, not
+		// a fence error: Repacker.repack tells the two apart by its probe row.
+		if n, err := ps.RetireRepoPacks(ctx, purgeGroupOf(base)); err != nil || n == 0 {
+			t.Fatalf("RetireRepoPacks: n=%d err=%v", n, err)
+		}
+		for _, repo := range []string{base, base + "+import"} {
+			if won, err := s.ReplacePacks(ctx, repo, packsOf(repo), foldOf(repo)); won || err != nil {
+				t.Fatalf("ReplacePacks(%s, retired old rows) = (%v, %v), want (false, <nil>)", repo, won, err)
+			}
+			if has, err := s.HasPack(ctx, repo, foldOf(repo).Key); err != nil || has {
+				t.Fatalf("fold row of %s registered after the retire: has=%v err=%v", repo, has, err)
+			}
+		}
+
+		if won, err := s.ReplacePacks(ctx, other, packsOf(other), foldOf(other)); err != nil || !won {
+			t.Fatalf("control ReplacePacks = (%v, %v), want won", won, err)
+		}
+		if packs, err := s.ListPacks(ctx, other); err != nil || len(packs) != 1 || packs[0].ID != "fold" {
+			t.Fatalf("control packs after fold: %v err=%v (want fold)", packs, err)
+		}
+	})
+}
+
+// TestReplacePacksSerializesWithPurgeFence (PG only — SQLite's IMMEDIATE
+// transactions serialize every writer already, and S3-WAL's fold and fence
+// CAS the same manifest): a fold must read the fence under the base-ledger
+// lock, or a fold that reads "not fenced" while FenceRepoPurge is still
+// open would register its pack after the fence commits. A namespace fold
+// takes the BASE repository's lock: a lock keyed by "<base>+import" would
+// not wait for the fence and would register behind it.
+func TestReplacePacksSerializesWithPurgeFence(t *testing.T) {
+	s := pgTestStore(t)
+	for _, tc := range []struct{ name, suffix string }{
+		{"base", ""},
+		{"import", "+import"},
+		{"ephemeral", "+ephemeral"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			base := t.Name()
+			repo := base + tc.suffix
+			old := []Pack{
+				{ID: "a", Key: "packs/" + repo + "/pack-a.pack", Size: 10},
+				{ID: "b", Key: "packs/" + repo + "/pack-b.pack", Size: 20},
+			}
+			if err := s.RegisterPacks(ctx, repo, old); err != nil {
+				t.Fatal(err)
+			}
+
+			conn, err := pgx.Connect(ctx, pgTestURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close(context.Background()) })
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			// FenceRepoPurge's transaction, held open just before its commit.
+			if err := lockBaseLedger(ctx, tx, base); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO purged_repos (repo) VALUES ($1)`, base); err != nil {
+				t.Fatal(err)
+			}
+
+			type result struct {
+				won bool
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				won, err := s.ReplacePacks(ctx, repo, old, Pack{ID: "fold", Key: "packs/" + repo + "/pack-fold.pack", Size: 25})
+				done <- result{won, err}
+			}()
+			select {
+			case r := <-done:
+				t.Fatalf("ReplacePacks(%s) completed while the fence transaction held the base-ledger lock: (%v, %v)", repo, r.won, r.err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if r := <-done; r.won || !errors.Is(r.err, ErrRepoPurged) {
+				t.Fatalf("ReplacePacks(%s) after the fence committed = (%v, %v), want ErrRepoPurged", repo, r.won, r.err)
+			}
+		})
+	}
 }
 
 func ledgerState(t *testing.T, s Store, group []string) PackQuotaLedgerState {
