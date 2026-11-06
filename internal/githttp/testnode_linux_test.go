@@ -962,31 +962,41 @@ func TestTrackNodeSessionReportsGuardFailure(t *testing.T) {
 	}
 }
 
-// processesWithArg lists the live processes that have arg as one of their
-// arguments (a zombie has no arguments).
-func processesWithArg(arg string) []int {
-	cmdlines, err := filepath.Glob("/proc/[0-9]*/cmdline")
+// childrenRunning lists the live children of this test binary that run the
+// program exe. It reads /proc/self/task/*/children (kernel 4.2 and later,
+// CONFIG_PROC_CHILDREN) and the exe link, which are valid from the first
+// moment of a child, so the check runs right after the call under test
+// returns and does not scan all of /proc. ok is false when the kernel has no
+// children files.
+func childrenRunning(exe string) (children map[int]bool, ok bool) {
+	exe, err := filepath.EvalSymlinks(exe)
 	if err != nil {
 		panic(err)
 	}
-	var pids []int
-	for _, path := range cmdlines {
-		data, err := os.ReadFile(path)
+	files, err := filepath.Glob("/proc/self/task/*/children")
+	if err != nil {
+		panic(err)
+	}
+	children = map[int]bool{}
+	for _, file := range files {
+		data, err := os.ReadFile(file)
 		if err != nil {
-			continue // The process exited between the glob and the read.
+			continue // The thread exited.
 		}
-		for _, a := range bytes.Split(data, []byte{0}) {
-			if string(a) == arg {
-				pid, err := strconv.Atoi(filepath.Base(filepath.Dir(path)))
-				if err != nil {
-					panic(err)
+		ok = true
+		for _, field := range strings.Fields(string(data)) {
+			pid, err := strconv.Atoi(field)
+			if err != nil {
+				panic(err)
+			}
+			if target, err := os.Readlink("/proc/" + field + "/exe"); err == nil && target == exe {
+				if state := procState(pid); state != "" && state != "Z" {
+					children[pid] = true
 				}
-				pids = append(pids, pid)
-				break
 			}
 		}
 	}
-	return pids
+	return children, ok
 }
 
 // TestStartNodeStopsNodeWhenGuardFails: when the guard of a node fails (see
@@ -1007,18 +1017,22 @@ func TestStartNodeStopsNodeWhenGuardFails(t *testing.T) {
 			nodeGuardExe = func() (string, error) { return tc.exe, nil }
 			t.Cleanup(func() { nodeGuardExe = old })
 
-			cache := t.TempDir()
-			node, err := startNode(cache)
+			before, ok := childrenRunning(binPath) // the shared nodes of TestMain
+			if !ok {
+				t.Skip("the kernel has no /proc/<pid>/task/<tid>/children (CONFIG_PROC_CHILDREN)")
+			}
+			node, err := startNode(t.TempDir())
 			if err == nil {
 				node.stop()
 				t.Fatal("startNode succeeded although the node has no guard")
 			}
-			if left := processesWithArg(cache); len(left) != 0 {
-				for _, pid := range left {
+			after, _ := childrenRunning(binPath)
+			for pid := range after {
+				if !before[pid] {
 					start, _ := processStart(pid)
 					_, _ = reapNodeSession(pid, start, 10*time.Second)
+					t.Errorf("serve %d still runs after startNode failed: %v", pid, err)
 				}
-				t.Fatalf("serve %v still runs after startNode failed: %v", left, err)
 			}
 		})
 	}
