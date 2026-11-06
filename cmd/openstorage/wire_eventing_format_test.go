@@ -148,6 +148,9 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 					t.Fatalf("refusal %q lacks %q", err, want)
 				}
 			}
+			if !githttp.ShownToPusher(err) {
+				t.Fatalf("the hook would hide the refusal %q from the pusher", err)
+			}
 			if got, err := rs.GetRef(t.Context(), "repo-1", "refs/heads/main"); !errors.Is(err, ref.ErrNotFound) {
 				t.Fatalf("authority ref = %q, %v; want unset", got, err)
 			}
@@ -209,6 +212,9 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 				}
 				if !strings.Contains(logs.String(), "hook refuses ref updates: record forward intent") {
 					t.Fatalf("missing refusal log: %s", logs)
+				}
+				if !githttp.ShownToPusher(err) {
+					t.Fatalf("the hook would hide the refusal %q from the pusher", err)
 				}
 			} else if !won || err != nil || gerr != nil {
 				t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update accepted (it records no intent)", won, err, got, gerr)
@@ -359,7 +365,7 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 							if got == "" && errors.Is(gerr, ref.ErrNotFound) {
 								got = "absent"
 							}
-							if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+"); push again later") || got != before {
+							if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+"); push again later") || got != before || !githttp.ShownToPusher(err) {
 								t.Fatalf("%s %d = (%v, %v), authority = %q; want the update refused before its CAS, authority %s", op.name, i, won, err, got, before)
 							}
 							continue

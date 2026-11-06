@@ -150,11 +150,11 @@ func mustEnv(names ...string) string {
 // stdin come from outside this process, so malformed input must produce an
 // error (stderr message + non-zero exit denies the push), never a panic.
 // git shows the pusher the returned error, so an error that is not a
-// refusal (pusherSafe) becomes a fixed line, and its text goes to the
+// refusal (ShownToPusher) becomes a fixed line, and its text goes to the
 // push's hook-errors file for the operator (hookFailure).
 func RunHook(ctx context.Context, args []string) error {
 	err := runHook(ctx, args)
-	if err == nil || pusherSafe(err) {
+	if err == nil || ShownToPusher(err) {
 		return err
 	}
 	name := ""

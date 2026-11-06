@@ -218,7 +218,7 @@ func TestUpdateHookHidesStoreErrors(t *testing.T) {
 
 // A refusal reaches the pusher whole, through wrappers too. An error that
 // also wraps a non-refusal does not.
-func TestPusherSafe(t *testing.T) {
+func TestShownToPusher(t *testing.T) {
 	store := errors.New("dial tcp canary-host.invalid")
 	deny := refusef("policy no-push denies update to %s", "refs/heads/main")
 	for _, tc := range []struct {
@@ -236,8 +236,8 @@ func TestPusherSafe(t *testing.T) {
 		{"joined with a store error", errors.Join(deny, store), false},
 		{"joined refusals", errors.Join(deny, refusef("quota exceeded")), true},
 	} {
-		if got := pusherSafe(tc.err); got != tc.safe {
-			t.Errorf("%s: pusherSafe = %v, want %v", tc.name, got, tc.safe)
+		if got := ShownToPusher(tc.err); got != tc.safe {
+			t.Errorf("%s: ShownToPusher = %v, want %v", tc.name, got, tc.safe)
 		}
 	}
 	if !errors.Is(Refuse(fmt.Errorf("x: %w", ref.ErrRepoPurged)), ref.ErrRepoPurged) {

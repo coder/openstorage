@@ -39,11 +39,12 @@ func (r refusal) Unwrap() error { return r.err }
 // pusher may read.
 var pusherSafeSentinels = []error{ref.ErrRepoPurged, ref.ErrLFSObjectCapExceeded, ref.ErrRefNameNotUTF8}
 
-// pusherSafe reports whether the pusher may read err's text: err is a
-// refusal or one of pusherSafeSentinels, or it wraps only errors that are.
-// A wrapper adds only its own format text, so a wrapper must not format a
-// store error with %v next to a %w.
-func pusherSafe(err error) bool {
+// ShownToPusher reports whether RunHook returns err to git, which shows it
+// to the pusher, unchanged: err is a refusal or one of
+// pusherSafeSentinels, or it wraps only errors that are. A wrapper adds
+// only its own format text, so a wrapper must not format a store error
+// with %v next to a %w.
+func ShownToPusher(err error) bool {
 	switch e := err.(type) {
 	case refusal:
 		return true
@@ -53,21 +54,21 @@ func pusherSafe(err error) bool {
 			return false
 		}
 		for _, c := range errs {
-			if c == nil || !pusherSafe(c) {
+			if c == nil || !ShownToPusher(c) {
 				return false
 			}
 		}
 		return true
 	case interface{ Unwrap() error }:
 		if c := e.Unwrap(); c != nil {
-			return pusherSafe(c)
+			return ShownToPusher(c)
 		}
 	}
 	return slices.Contains(pusherSafeSentinels, err)
 }
 
 // hookFailure is what the pusher sees for a hook error that is not
-// pusherSafe. It writes the error to the push's hook-errors file only.
+// ShownToPusher. It writes the error to the push's hook-errors file only.
 func hookFailure(hook string, err error) error {
 	assertf(err != nil, "hookFailure: nil error")
 	switch hook {

@@ -806,7 +806,10 @@ also have a metric are listed in the [metrics and log mapping](#metrics-and-log-
 - Returned store errors are not server log entries themselves; the caller decides how
   they appear.
 - Terminal `serve` and `hook` errors print to stderr with `openstorage serve:` /
-  `openstorage hook:` prefixes and exit 1. Hook errors can reach Git clients.
+  `openstorage hook:` prefixes and exit 1. A hook error reaches Git clients whole only
+  when it is a refusal: a policy denial, a conflict, or a quota or retry denial. Any
+  other hook error reaches them as `<hook> failed; push again later (the server log has
+  the cause)`, and `serve` logs its text as a hook line (below).
 - Hook log lines reach Git clients without their error values, because those can name
   the database or S3 endpoint. `serve` logs each whole line after the push as
   `receive-pack <repo>: hook: <line>`, at most 100 lines per push. The hooks keep at most
