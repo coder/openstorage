@@ -86,7 +86,8 @@ func WaitForPushPublication(ctx context.Context, cacheDir, repo string) error {
 // its authority CAS returns. While the hold is live, WaitForPushPublication
 // blocks and a strict sync fetch refuses the ref, so a push run that
 // claims the intent cannot snapshot the ref before the CAS. A conflicting
-// hold is waited out as for a push (pushHoldWaitMax), then HoldRef fails.
+// hold is waited out as for a push (pushHoldWaitMax), then HoldRef fails
+// with an error that matches ErrRefHeld.
 // release stops the refresh and removes the hold; the TTL machinery covers
 // a process that dies first.
 func HoldRef(ctx context.Context, cacheDir, repo, refName string) (release func(), err error) {

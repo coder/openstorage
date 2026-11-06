@@ -271,11 +271,20 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	}
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a/b"}); err == nil {
 		t.Fatal("reservation past a live D/F-conflicting hold accepted")
-	} else if !strings.Contains(err.Error(), "conflicting") {
-		t.Fatalf("denial reason = %v, want a conflict message", err)
+	} else if !strings.Contains(err.Error(), "conflicting") || !errors.Is(err, ErrRefHeld) {
+		t.Fatalf("denial reason = %v, want a conflict message that matches ErrRefHeld (the API's 503)", err)
 	}
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a"}); err == nil {
 		t.Fatal("reservation past a live same-name hold accepted")
+	} else if !errors.Is(err, ErrRefHeld) {
+		t.Fatalf("same-name denial = %v, want it to match ErrRefHeld", err)
+	}
+	// A caller whose own context ended gets no ErrRefHeld: nothing waits
+	// for its answer.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := reservePushHolds(canceled, own, []string{"refs/heads/a"}); err == nil || errors.Is(err, ErrRefHeld) {
+		t.Fatalf("canceled reservation = %v, want an error that does not match ErrRefHeld", err)
 	}
 	// Unrelated refs reserve immediately.
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/z"}); err != nil {
@@ -310,6 +319,8 @@ func TestReservePushHolds_FailsClosedOnUnreadableHolds(t *testing.T) {
 	own := filepath.Join(holdsDir, "push-own")
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/x"}); err == nil {
 		t.Fatal("reservation succeeded over an unreadable hold directory")
+	} else if errors.Is(err, ErrRefHeld) {
+		t.Fatalf("unreadable holds = %v, want a failure that does not match ErrRefHeld: a retry does not fix it", err)
 	}
 }
 
@@ -366,8 +377,8 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	if err == nil {
 		t.Fatal("reservation succeeded while the reserve lock was held elsewhere")
 	}
-	if !strings.Contains(err.Error(), "retry shortly") {
-		t.Fatalf("denial = %v, want a retryable timeout", err)
+	if !strings.Contains(err.Error(), "retry shortly") || !errors.Is(err, ErrRefHeld) {
+		t.Fatalf("denial = %v, want a retryable timeout that matches ErrRefHeld", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("reservation blocked %v, want the ~150ms deadline", elapsed)

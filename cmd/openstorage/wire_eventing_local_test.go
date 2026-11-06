@@ -308,6 +308,7 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 				refName            string
 				storeFails         bool
 				panics             bool
+				heldElsewhere      bool
 				wantIntent, refuse bool
 			}{
 				{name: "forward", forward: true, scopes: rw, wantIntent: true},
@@ -315,6 +316,10 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 				// recovers the panic and keeps running, so the hold must
 				// end anyway: the retried write takes the same hold.
 				{name: "panicking_cas", forward: true, scopes: rw, panics: true, wantIntent: true},
+				// Another writer holds the ref past pushHoldWaitMax (10 s):
+				// the write is refused with githttp.ErrRefHeld, which the
+				// API answers with 503 and Retry-After.
+				{name: "held_elsewhere", forward: true, scopes: rw, heldElsewhere: true, refuse: true},
 				{name: "server_initiated", forward: true, noClaims: true, wantIntent: true},
 				{name: "write_only", forward: true, scopes: []string{auth.ScopeGitWrite}},
 				{name: "pull", scopes: rw},
@@ -325,8 +330,8 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 				{name: "metadata_unavailable", forward: true, scopes: rw, storeFails: true, refuse: true},
 				{name: "metadata_unavailable_write_only", forward: true, scopes: []string{auth.ScopeGitWrite}, storeFails: true},
 			} {
-				if tc.storeFails && backend != "sqlite" {
-					continue
+				if (tc.storeFails || tc.heldElsewhere) && backend != "sqlite" {
+					continue // the hold is a cache file: one backend is enough
 				}
 				t.Run(tc.name, func(t *testing.T) {
 					ctx := t.Context()
@@ -418,6 +423,13 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 					if tc.storeFails {
 						closeMeta()
 					}
+					if tc.heldElsewhere {
+						release, err := githttp.HoldRef(ctx, cacheDir, repo.RepoID, refName)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer release()
+					}
 					sha := strings.Repeat("b", 40)
 					if tc.panics {
 						func() {
@@ -434,6 +446,9 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 						got, gerr := rs.GetRef(ctx, repo.RepoID, refName)
 						if err == nil || won || !errors.Is(gerr, ref.ErrNotFound) {
 							t.Fatalf("CAS = (won %v, err %v), authority = (%q, %v); want the write refused before the CAS: an accepted write without its forward intent is never forwarded", won, err, got, gerr)
+						}
+						if errors.Is(err, githttp.ErrRefHeld) != tc.heldElsewhere {
+							t.Fatalf("refusal %v matches githttp.ErrRefHeld = %v, want %v", err, !tc.heldElsewhere, tc.heldElsewhere)
 						}
 						return
 					}
