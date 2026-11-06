@@ -481,26 +481,40 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			cleanup()
 		}
 	}
+	// disabled ends a wiring that failed. Off PostgreSQL the hook keeps
+	// the eventless default and accepts the push: the ref store would fail
+	// too if the metadata store were truly down. On PostgreSQL the CAS
+	// itself records a forward_on_push repository's forward intent
+	// (newPGEventsStore), and a failed open does not prove the CAS fails:
+	// the database can be back by then, and the eventless default would
+	// accept the push with no intent and no events. So the hook refuses
+	// the ref update before its CAS, and the client can push again.
+	disabled := func(stage string, err error) func() {
+		logger.Error("hook eventing disabled: "+stage, "err", err)
+		cleanup()
+		if isPGURL(dbURL) {
+			githttp.WrapHookRefStore = func(context.Context, ref.RefStore) (ref.RefStore, error) {
+				return nil, fmt.Errorf("refusing the ref update: hook eventing unavailable (%s): %w", stage, err)
+			}
+		}
+		return func() {}
+	}
 
 	// Secrets codec (issue #54): hook subprocesses inherit serve's
 	// environment, so a serve process that booted with a valid
 	// OPENSTORAGE_SECRETS_KEY hands the same value down here. A malformed
 	// value (possible only for direct hook invocation outside serve, which
-	// validates at boot) degrades to eventless — fail closed for secrets:
-	// no delivery ever signs with a wrong or plaintext-passthrough key.
+	// validates at boot) disables eventing — fail closed for secrets: no
+	// delivery ever signs with a wrong or plaintext-passthrough key.
 	secretsCodec, err := resolveSecretsCodec(envconfig.Getenv)
 	if err != nil {
-		logger.Error("hook eventing disabled: secrets key", "err", err)
-		return func() {}
+		return disabled("secrets key", err)
 	}
 
 	// Hooks never run DDL: meta.Open without InitSchema (serve owns it).
 	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))
 	if err != nil {
-		// Fail open (eventless) rather than denying the push: the ref
-		// store open below would fail too if the DB were truly down.
-		logger.Error("hook eventing disabled: open meta store", "err", err)
-		return func() {}
+		return disabled("open meta store", err)
 	}
 	cleanups = append(cleanups, ms.Close)
 
@@ -513,9 +527,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	if isPGURL(dbURL) {
 		q, err := jobs.NewRiverInsertOnly(ctx, dbURL)
 		if err != nil {
-			logger.Error("hook eventing disabled: river insert-only client", "err", err)
-			cleanup()
-			return func() {}
+			return disabled("river insert-only client", err)
 		}
 		cleanups = append(cleanups, q.Close)
 		enqueueDelivery = q.EnqueueWebhookDelivery
@@ -579,8 +591,8 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		// (issue #445: a hook binary replaced under an older serve). Read
 		// the document first: a wrong format or a corrupt document (issue
 		// #466) refuses the update, so no push is accepted without its
-		// events. A failed read keeps failing open, as for the open error
-		// above.
+		// events. A failed read accepts the update with eventing still
+		// wired (on PostgreSQL the CAS still records the forward intent).
 		//
 		// Known limit (issue #466): a format change between this check and
 		// the CAS still commits the push without events. Formats change

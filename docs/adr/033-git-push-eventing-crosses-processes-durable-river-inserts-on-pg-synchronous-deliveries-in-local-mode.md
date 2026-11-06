@@ -26,3 +26,12 @@ URL scheme** (the same dispatch as `meta.Open`/`ref.Open`), with asymmetric sema
 Failure stance is fail-open: if the hook cannot open the meta store or build the queue,
 eventing is disabled for that push rather than the push denied — same reasoning as
 ADR-28, un-notified is recoverable while un-pushed work is a user-visible outage.
+
+**Amendment: PostgreSQL refuses instead.** On PostgreSQL the ref CAS records a
+`forward_on_push` repository's forward intent itself
+([ADR-44](044-outbound-push-forwarding-rides-a-separate-push-claim-lane.md)), so an
+eventless push there would land with no intent and no events, and a failed open does
+not prove the CAS would fail too. When the hook cannot build the secrets codec, open
+the meta store, or build the River insert-only client, it refuses the ref update
+before its CAS, and the client can push again. SQLite and S3-WAL keep the fail-open
+stance.

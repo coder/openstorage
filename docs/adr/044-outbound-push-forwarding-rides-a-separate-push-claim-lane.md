@@ -164,7 +164,9 @@ snoozes it. The gate also never completes the job while a push claim is
 held: a run whose finish or restore write failed leaves its claim holding
 the request it consumed, so the job waits for the lease, and its re-run
 steals the claim with its force level. Only a job whose repository was
-deleted completes over a held claim.
+deleted completes over a held claim. A hook that cannot set up its eventing
+on PostgreSQL refuses the ref update instead of accepting it without the
+intent (ADR-33's amendment).
 
 **Egress.** The push targets exactly the `CloneURL` the inbound fetch
 already dials — a host validated at link time (`validUpstreamHost`,
