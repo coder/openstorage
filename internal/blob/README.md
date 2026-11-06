@@ -7,7 +7,7 @@ The `BlobStore` contract for immutable pack and LFS objects, with an S3 backend 
 - `BlobStore` — UploadFile, DownloadFile, DownloadFileCapped, List, ListPages, Delete, Copy, SignedURL, Stat, StatFingerprint, ReadRange, EnsureBucket, Close [blob.go:BlobStore]
 - `ErrNotFound`, `ErrSignedURLUnsupported`, `ErrCapExceeded`, `ErrCoverContinuityLost` — sentinel errors [blob.go:ErrNotFound]
 - `ListedObject` — Key, Size, ModTime [blob.go:ListedObject]
-- `ListPagesAfter`, `PageListerAfter` — list the keys that sort strictly after a key, so a scan can resume; `S3` and `File` implement it, and any other store gets a filter over `ListPages` [blob.go:ListPagesAfter]
+- `ListPagesAfter`, `PageListerAfter` — list the keys that sort strictly after a key, so a scan can resume; `S3` and `File` implement it, and any other store gets a filter over `ListPages`; on `S3` a key that gocloud stores under an escaped spelling (a control character, `../`, `__0x`) can list out of order, and this system never writes one [blob.go:ListPagesAfter]
 - `File` lists in key order by walking its directory itself: fileblob's listing follows file-name order, and its page tokens drop keys when that differs from key order (`repo+ephemeral` next to `repo`) [filelist.go:walkFileKeys]
 - `PackKey`, `PackPrefix`, `PacksRoot` — `packs/<repo>/pack-<id>.pack` and prefixes [blob.go:PackKey]
 - `LFSKey`, `LFSLegacyKey`, `LFSRoot`, `LFSPrefix` — canonical `lfs/<repo>/o2/<oid>`, legacy `lfs/<repo>/<oid>`, and prefixes [blob.go:LFSKey]

@@ -47,13 +47,29 @@ func walkFileKeys(ctx context.Context, dir, keyPrefix, prefix, after string, vis
 		}
 		return key
 	}
-	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return strings.Compare(keyOf(a), keyOf(b)) })
+	// An object whose key ends in "/" sorts with the directory of the same name
+	// (fileblob stores that key under an escaped file name). The object comes
+	// first, as its key is a prefix of every key under the directory.
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int {
+		if c := strings.Compare(keyOf(a), keyOf(b)); c != 0 {
+			return c
+		}
+		switch {
+		case a.IsDir() && !b.IsDir():
+			return 1
+		case !a.IsDir() && b.IsDir():
+			return -1
+		}
+		return 0
+	})
 	for _, de := range entries {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		name := de.Name()
-		if strings.HasSuffix(name, fileblobAttrsExt) {
+		// A sidecar is a file. A directory may end in the suffix, and fileblob
+		// lists what is under it.
+		if !de.IsDir() && strings.HasSuffix(name, fileblobAttrsExt) {
 			continue
 		}
 		key := keyPrefix + keyOf(de)

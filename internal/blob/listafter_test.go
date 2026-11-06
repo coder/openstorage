@@ -259,6 +259,45 @@ func TestFile_ListOfARepositoryPrefixDoesNotReadItsSiblings(t *testing.T) {
 	}
 }
 
+// A directory whose name ends in ".attrs" is listed: only a sidecar file is not
+// a blob. An object whose key ends in "/" comes before the keys under the
+// directory of the same name, so a scan that saved the key of one resumes
+// without losing the other.
+func TestFile_ListKeepsAttrsDirectoriesAndOrdersATrailingSlashKeyFirst(t *testing.T) {
+	ctx := context.Background()
+	b, _ := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"packs/r/", "packs/r/x", "packs/repo.attrs/pack-a.pack"}
+	for _, k := range want {
+		if err := b.UploadFile(ctx, k, src); err != nil {
+			t.Fatalf("UploadFile(%q): %v", k, err)
+		}
+	}
+	got, err := b.List(ctx, PacksRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, o := range got {
+		keys = append(keys, o.Key)
+	}
+	if !reflect.DeepEqual(keys, want) {
+		t.Fatalf("List = %q, want %q", keys, want)
+	}
+	var rest []string
+	if err := b.ListPagesAfter(ctx, PacksRoot, "packs/r/", 1, func(page []ListedObject) error {
+		for _, o := range page {
+			rest = append(rest, o.Key)
+		}
+		return nil
+	}); err != nil || !reflect.DeepEqual(rest, want[1:]) {
+		t.Fatalf("ListPagesAfter(%q) = %q, %v, want %q", "packs/r/", rest, err, want[1:])
+	}
+}
+
 func firstDifference(a, b []string) int {
 	for i := range min(len(a), len(b)) {
 		if a[i] != b[i] {

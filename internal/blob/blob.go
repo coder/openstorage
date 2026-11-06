@@ -124,6 +124,12 @@ func assertSignedURLArgs(key, method string, expiry time.Duration) {
 // A store that lacks it, a decorator that embeds a BlobStore for example, is
 // still correct through ListPagesAfter: the helper filters its ListPages, so
 // that ListPages must list in key order.
+//
+// The order guarantee covers the keys this system writes: repository IDs, pack
+// IDs, LFS object IDs and quarantine nonces. gocloud's S3 driver stores a key
+// with a control character, "../" or "__0x" under an escaped spelling, and S3
+// orders by that spelling, so a listing can return such a key out of order and a
+// resumed listing can skip it. The sweep treats such a key as foreign.
 type PageListerAfter interface {
 	ListPagesAfter(ctx context.Context, prefix, after string, pageSize int, fn func([]ListedObject) error) error
 }
