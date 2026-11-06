@@ -6,7 +6,7 @@
 # multi-platform index digest: release images must not depend on a mutable tag.
 # The build stage runs on the builder's native platform and cross-compiles
 # (pure Go, CGO off), so a multi-platform build emulates only the runtime stage.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS build
 ARG TARGETOS TARGETARCH
 # Release builds (.github/workflows/image.yml) stamp `openstorage --version`
 # like scripts/release-archives.sh does. .git is not in the build context, so
@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -ldflags "-X github.com/coder/openstorage/internal/version.version=$VERSION -X github.com/coder/openstorage/internal/version.commit=$COMMIT -X github.com/coder/openstorage/internal/version.date=$BUILD_DATE" \
     -o /out/openstorage ./cmd/openstorage
 
-FROM alpine:3.24.3@sha256:b3413572228e34bd1c9245f5565e6cd127005655e8a7899aef33d8e83255c9e6
+FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4
 # gnupg + openssh-keygen: verify-sig ref policies shell out through git to
 # `gpg` (PGP) and `ssh-keygen` (SSH) and fail closed per ref when the binary
 # is absent (ADR-9, #50) — without them every signed push on a protected ref
