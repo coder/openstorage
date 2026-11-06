@@ -365,6 +365,52 @@ func testRawPathSiblings(t *testing.T, e *testEnv) {
 	})
 }
 
+// TestRawPathFilteredRename: a renamed file above the inline diff limit lands
+// in filtered_files, and its old_path_base64 and path_base64 carry the raw
+// names. No other test fills filtered_files[].old_path_base64.
+func TestRawPathFilteredRename(t *testing.T) { runBackends(t, testRawPathFilteredRename) }
+
+func testRawPathFilteredRename(t *testing.T, e *testEnv) {
+	org := e.newOrg(t)
+	repoURL := "https://example.com/" + org + "/rawpath-filtered-" + randomHex(t, 4)
+	repo, err := e.store.CreateRepo(context.Background(), org, repoURL, "main")
+	if err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	const oldName, newName = "big\xf9old.txt", "big\xf8new.txt"
+	big := strings.Repeat("x", maxInlineDiffBytes+64) + "\n"
+	dir := t.TempDir()
+	coreGit(t, dir, "init", "-q", "-b", "main", ".")
+	rpStage(t, dir, oldName, big)
+	coreGit(t, dir, "commit", "-q", "-m", "c1")
+	coreGit(t, dir, "update-index", "--force-remove", "--", oldName)
+	rpStage(t, dir, newName, big)
+	coreGit(t, dir, "commit", "-q", "-m", "c2")
+	head := coreRevParse(t, dir, "HEAD")
+	coreSeedStores(t, e, repo.RepoID, dir, map[string]string{"refs/heads/main": head})
+	token := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+
+	doc := rpJSON(t, rpGet(t, e, token, "/api/v1/repos/diff?sha="+head))
+	if files := rpObjects(t, doc, "files"); len(files) != 0 {
+		t.Fatalf("files = %v, want the renamed large file in filtered_files only", files)
+	}
+	filtered := rpObjects(t, doc, "filtered_files")
+	if len(filtered) != 1 || filtered[0]["state"] != "R" {
+		t.Fatalf("filtered_files = %v, want one rename", filtered)
+	}
+	if got := rpRaw(t, "filtered rename", filtered[0], "path"); got != newName {
+		t.Errorf("path = %q, want %q", got, newName)
+	}
+	if got := rpRaw(t, "filtered rename", filtered[0], "old_path"); got != oldName {
+		t.Errorf("old_path = %q, want %q", got, oldName)
+	}
+	for _, key := range []string{"path_base64", "old_path_base64"} {
+		if _, ok := filtered[0][key]; !ok {
+			t.Errorf("filtered_files[0] has no %s: %v", key, filtered[0])
+		}
+	}
+}
+
 // TestRawPathValidNamesAddNothing: a repo whose names are all valid UTF-8,
 // including one with a real U+FFFD, answers with no _base64 key, and a
 // submodule name that is not valid UTF-8 appears in entries only, because
