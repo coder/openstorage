@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -17,6 +16,13 @@ import (
 	"github.com/coder/openstorage/internal/githttp"
 )
 
+// maxBusyAttempts and busyRetryPause bound TestMaterializeColdConcurrent's
+// retries of a read that found every git-read slot busy.
+const (
+	maxBusyAttempts = 100
+	busyRetryPause  = 50 * time.Millisecond
+)
+
 func TestMaterializeColdConcurrent(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		for _, writes := range []bool{true, false} {
@@ -26,8 +32,7 @@ func TestMaterializeColdConcurrent(t *testing.T) {
 				if _, err := os.Stat(repoPath); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("fixture cache must be cold: %v", err)
 				}
-				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-				defer cancel()
+				ctx := t.Context()
 				start := make(chan struct{})
 				var wg sync.WaitGroup
 				for i := range 12 {
@@ -43,17 +48,32 @@ func TestMaterializeColdConcurrent(t *testing.T) {
 							method, path = http.MethodPost, prefix+"/branches/create"
 							payload = fmt.Sprintf(`{"target_branch":%q,"base_branch":"main"}`, target)
 						}
-						req, err := http.NewRequestWithContext(ctx, method, e.srv.URL+path, strings.NewReader(payload))
-						if err != nil {
-							t.Error(err)
-							return
-						}
-						req.Header.Set("Authorization", "Bearer "+fx.token)
-						req.Header.Set("Content-Type", "application/json")
-						resp, err := e.srv.Client().Do(req)
-						if err != nil {
-							t.Error(err)
-							return
+						var resp *http.Response
+						for attempt := 1; ; attempt++ {
+							req, err := http.NewRequestWithContext(ctx, method, e.srv.URL+path, strings.NewReader(payload))
+							if err != nil {
+								t.Error(err)
+								return
+							}
+							req.Header.Set("Authorization", "Bearer "+fx.token)
+							req.Header.Set("Content-Type", "application/json")
+							resp, err = e.srv.Client().Do(req)
+							if err != nil {
+								t.Error(err)
+								return
+							}
+							// Twelve reads share gitRepoSlots git-read slots. On a
+							// busy host one can wait longer than gitReadSlotWait for
+							// a slot and get 503 with Retry-After, before git
+							// starts (gitread.ErrBusy). That is load shedding, not
+							// a materialization failure: retry, as a client would.
+							// The cap fails a slot that never frees.
+							if writes || resp.StatusCode != http.StatusServiceUnavailable ||
+								resp.Header.Get("Retry-After") == "" || attempt == maxBusyAttempts {
+								break
+							}
+							resp.Body.Close()
+							time.Sleep(busyRetryPause)
 						}
 						defer resp.Body.Close()
 						body, err := io.ReadAll(resp.Body)
