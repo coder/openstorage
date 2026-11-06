@@ -130,9 +130,9 @@ func (g *registry) start(cmd *exec.Cmd) error {
 // stop sends no signal to a group that has left the registry, and signal
 // skips a registered group whose leader os reports reaped. A leader that
 // exits during the grace gets no final SIGKILL there, and a member it left
-// behind lives on. What stays open is the time between the reap and the
-// moment os marks the process done (golang/go#13987), which Process.Signal
-// has on macOS as well.
+// behind lives on. What stays open is the race that os.Process.Signal has
+// on macOS (golang/go#13987): the leader is reaped between the check and
+// the kill.
 func (g *registry) wait(cmd *exec.Cmd) error {
 	pid := cmd.Process.Pid
 	hold := g.hold
