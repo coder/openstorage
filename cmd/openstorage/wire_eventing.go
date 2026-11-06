@@ -593,14 +593,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			// token may not forward records no intent, so it skips the
 			// step and a failed read cannot refuse its update.
 			if !denied {
-				record := enqueueSyncOrForward(row, noop, noop, org, forwardDenied, pullDeniedFn)
-				beforeCAS = func(ctx context.Context, repoID string) error {
-					if record(ctx, repoID) != nil {
-						logger.Error("hook refuses ref updates: record forward intent")
-						return errHookIntent
-					}
-					return nil
-				}
+				beforeCAS = enqueueSyncOrForward(row, noop, noop, org, forwardDenied, pullDeniedFn)
 			}
 			enqueueSync = enqueueSyncOrForward(row,
 				func(ctx context.Context, job upsync.Job) error {
@@ -652,7 +645,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			Webhooks:        whStore,
 			EnqueueDelivery: enqueueDelivery,
 			EnqueueSync:     enqueueSync,
-			BeforeCAS:       beforeCAS,
+			BeforeCAS:       quietBeforeCAS(beforeCAS, logger),
 			Logger:          logger,
 		}), nil
 	}
@@ -666,6 +659,22 @@ var newHookRiver = jobs.NewRiverInsertOnly
 // errHookIntent is BeforeCAS's refusal when the hook cannot record a push's
 // forward intent. events.RefStore prefixes "refusing the ref update".
 var errHookIntent = errors.New("hook could not record the forward intent; push again later")
+
+// quietBeforeCAS refuses with errHookIntent instead of beforeCAS's own
+// error, which can name the store: the pusher sees it (see disabled in
+// wireHookEventing). A nil step stays nil.
+func quietBeforeCAS(beforeCAS func(ctx context.Context, repoID string) error, logger *slog.Logger) func(ctx context.Context, repoID string) error {
+	if beforeCAS == nil {
+		return nil
+	}
+	return func(ctx context.Context, repoID string) error {
+		if beforeCAS(ctx, repoID) != nil {
+			logger.Error("hook refuses ref updates: record forward intent")
+			return errHookIntent
+		}
+		return nil
+	}
+}
 
 // intentlessRefStore is the hook's ref store when its eventing could not be
 // wired, so it cannot record forward intent. It refuses every update that
