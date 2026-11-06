@@ -104,7 +104,10 @@ func TestSignalSkipsAGroupWhoseLeaderWasReaped(t *testing.T) {
 		g.signal(gr, syscall.SIGKILL)
 	}
 	g.mu.Unlock()
-	<-done
+	var exitErr *exec.ExitError
+	if err := <-done; !errors.As(err, &exitErr) {
+		t.Fatalf("leader wait = %v, want death by SIGKILL", err)
+	}
 
 	if !reaped || gr == nil {
 		t.Fatalf("leader reaped = %v, group registered = %v, want both: wait cannot take the lock", reaped, gr != nil)
