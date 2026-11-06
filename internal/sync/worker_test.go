@@ -7,6 +7,7 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -459,6 +460,37 @@ func TestWorkerDetachedBeforeRunIsSilent(t *testing.T) {
 	}
 	assertEventTypes(t, f.rec.list()) // no events at all
 }
+
+// TestWorkerDeletedRepoOnRiverLane: a River sync run for a repository
+// deleted while queued returns ErrRepoGone, so its job completes, and
+// touches nothing.
+func TestWorkerDeletedRepoOnRiverLane(t *testing.T) {
+	f := newWorkerFixture(t)
+	f.putUpstream(t, "repo_gone", "own", "proj", "file://"+f.upstreamDir)
+	if err := f.store.RequestSync(context.Background(), "repo_gone"); err != nil {
+		t.Fatal(err)
+	}
+	f.worker.Repos = func(context.Context, string, string) (RepoInfo, error) { return RepoInfo{}, ErrNotFound }
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_gone"}); !errors.Is(err, ErrRepoGone) {
+		t.Fatalf("Run = %v, want ErrRepoGone", err)
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !up.SyncPending || up.Syncing || len(f.rec.list()) != 0 {
+		t.Fatalf("deleted repo's run touched the lane: %+v, %d events", up, len(f.rec.list()))
+	}
+	// The local schedule keeps its silent return: its sweep has no job to
+	// complete. Run returns before it uses any lane method.
+	f.worker.Local = unusedLocalLanes{}
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_gone"}); err != nil {
+		t.Fatalf("local Run = %v, want nil", err)
+	}
+}
+
+// unusedLocalLanes is a LocalLanes whose methods must not be called.
+type unusedLocalLanes struct{ LocalLanes }
 
 // detachDuringFetch wraps the store so the detach re-check (GetUpstream
 // after the fetch) observes a row deleted mid-run.
