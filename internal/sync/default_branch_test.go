@@ -65,15 +65,15 @@ func TestUpstreamHeadNeedsFetchedBranch(t *testing.T) {
 	testGit(t, root, "init", "--bare", mirror)
 	job := Job{Org: "o", RepoID: "repo_0123456789ab"}
 
-	if got := w.upstreamHead(t.Context(), job, mirror, env, "file://"+bare); got != "" {
-		t.Fatalf("HEAD with an unfetched branch = %q, want none", got)
+	if got, retry := w.upstreamHead(t.Context(), job, mirror, env, "file://"+bare); got != "" || retry {
+		t.Fatalf("HEAD with an unfetched branch = %q (retry %v), want none and no retry: the upstream answered", got, retry)
 	}
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "which the fetch did not return") {
 		t.Fatalf("logs = %q, want a WARN line naming the unfetched branch", logs.String())
 	}
 	testGit(t, mirror, append([]string{"fetch", "file://" + bare}, mirrorRefspecs...)...)
-	if got := w.upstreamHead(t.Context(), job, mirror, env, "file://"+bare); got != "trunk" {
-		t.Fatalf("HEAD after the fetch = %q, want trunk", got)
+	if got, retry := w.upstreamHead(t.Context(), job, mirror, env, "file://"+bare); got != "trunk" || retry {
+		t.Fatalf("HEAD after the fetch = %q (retry %v), want trunk", got, retry)
 	}
 }
 
@@ -90,8 +90,8 @@ func TestUpstreamHeadOwnDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
 	defer cancel()
 	start := time.Now()
-	if got := w.upstreamHead(ctx, Job{Org: "o", RepoID: "repo_0123456789ab"}, mirror, hermeticGitEnv(w.allowProtocol()), stall.URL+"/o/n.git"); got != "" {
-		t.Fatalf("stalled lookup = %q, want none", got)
+	if got, retry := w.upstreamHead(ctx, Job{Org: "o", RepoID: "repo_0123456789ab"}, mirror, hermeticGitEnv(w.allowProtocol()), stall.URL+"/o/n.git"); got != "" || !retry {
+		t.Fatalf("stalled lookup = %q (retry %v), want none and a retry: the lookup failed, not the upstream's answer", got, retry)
 	}
 	if elapsed := time.Since(start); elapsed > 2500*time.Millisecond || ctx.Err() != nil {
 		t.Fatalf("stalled lookup took %v (run context err %v), want about a quarter of the 4s budget and a live run context", elapsed, ctx.Err())
