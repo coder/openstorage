@@ -25,8 +25,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -188,14 +186,12 @@ func surfaceDeleteIfMatch(t *testing.T, e *qualEnv) []verdict {
 // that damage away from the shared fixture pool (and other surfaces).
 func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
-	const name = "get-under-overwrite"
 	const (
 		raceWindow = 15 * time.Second
 		opTimeout  = 2 * time.Second
 		readers    = 2
 		minReads   = 50 // below this a "pass" would be too weak to record
 		minWrites  = 50 // verified A↔B version transitions needed to have exercised the race at all
-		maxLogged  = 3  // read errors quoted in the verdict detail (issue #566)
 	)
 	opts := e.raw.Options()
 	opts.HTTPClient = awshttp.NewBuildableClient()
@@ -258,135 +254,18 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	etagA2, errA2 := put(ctx, bodyA, "")
 	etagB2, errB2 := put(ctx, bodyB, "")
 	if errA != nil || errB != nil || errA2 != nil || errB2 != nil {
-		return []verdict{{name, verdictError, fmt.Sprintf("seed PUTs: %v / %v / %v / %v", errA, errB, errA2, errB2)}}
+		return []verdict{{getUnderOverwrite, verdictError, fmt.Sprintf("seed PUTs: %v / %v / %v / %v", errA, errB, errA2, errB2)}}
 	}
 	metaCheck := etagA != "" && etagB != "" && etagA != etagB && etagA == etagA2 && etagB == etagB2
 	etagOf := map[string]string{string(bodyA): etagA, string(bodyB): etagB}
 
-	raceCtx, stopRace := context.WithCancel(ctx)
-	defer stopRace()
-	var reads, tornBody, tornMeta, readErrs, writeOKs, writeErrs atomic.Int64
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		curETag := etagB2 // the last seed write
-		next := bodyA     // always the version OPPOSITE the last known content
-		for raceCtx.Err() == nil {
-			etag, err := put(raceCtx, next, curETag)
-			if err != nil {
-				if raceCtx.Err() == nil {
-					writeErrs.Add(1)
-				}
-				// Re-resolve the current ETag: an ambiguous outcome (a
-				// timeout after the write landed) would otherwise wedge
-				// every later If-Match on a stale tag. Best effort — on
-				// Head failure the next iteration retries. The target
-				// version is NOT flipped on failure, so a store that
-				// selectively rejects one version keeps being asked for
-				// the version transition instead of racking up
-				// same-body overwrites.
-				if cur, herr := headETag(raceCtx); herr == nil {
-					curETag = cur
-				}
-				continue
-			}
-			// Count only VERIFIED version transitions: on the content-
-			// addressed ETags the seed stability check establishes, a
-			// same-body overwrite (possible when an ambiguous failure
-			// actually landed and the retry re-wrote the same version)
-			// returns the tag it matched against and must not reach the
-			// minWrites floor.
-			if etag != curETag {
-				writeOKs.Add(1)
-			}
-			curETag = etag
-			if bytes.Equal(next, bodyA) {
-				next = bodyB
-			} else {
-				next = bodyA
-			}
-		}
-	}()
-	// The first few read errors go into the verdict detail, so an
-	// inconclusive run shows whether a GET hit the op deadline, a reset
-	// connection, or a framing error (issue #566).
-	var errLogMu sync.Mutex
-	var errLog []string
-	raceStart := time.Now()
-	readersDone := make(chan struct{}, readers)
-	for range readers {
-		go func() {
-			defer func() { readersDone <- struct{}{} }()
-			for raceCtx.Err() == nil {
-				opStart := time.Now()
-				opCtx, cancel := context.WithTimeout(raceCtx, opTimeout)
-				body, etag, err := getWithETag(opCtx, client, e.bucket, key)
-				cancel()
-				if err != nil {
-					if raceCtx.Err() == nil {
-						readErrs.Add(1)
-						errLogMu.Lock()
-						if len(errLog) < maxLogged {
-							errLog = append(errLog, fmt.Sprintf("{at=+%s elapsed=%s opTimeout=%s err=%q}",
-								opStart.Sub(raceStart).Round(time.Millisecond), time.Since(opStart).Round(time.Millisecond), opTimeout, err.Error()))
-						}
-						errLogMu.Unlock()
-					}
-					continue
-				}
-				reads.Add(1)
-				want, whole := etagOf[string(body)]
-				switch {
-				case !whole:
-					tornBody.Add(1)
-					stopRace() // first torn observation settles the verdict
-				case metaCheck && etag != want:
-					tornMeta.Add(1)
-					stopRace()
-				}
-			}
-		}()
+	race := overwriteRace{
+		window: raceWindow, opTimeout: opTimeout, readers: readers, minReads: minReads, minWrites: minWrites,
+		bodyA: bodyA, bodyB: bodyB, etagOf: etagOf, metaCheck: metaCheck, startETag: etagB2,
+		put: put, head: headETag,
+		get: func(ctx context.Context) ([]byte, string, error) { return getWithETag(ctx, client, e.bucket, key) },
 	}
-	select {
-	case <-time.After(raceWindow):
-	case <-raceCtx.Done():
-	}
-	stopRace()
-	<-writerDone
-	for range readers {
-		<-readersDone
-	}
-
-	detail := fmt.Sprintf("reads=%d tornBody=%d tornMeta=%d readErrs=%d writeOKs=%d writeErrs=%d metaCheck=%t window=%s",
-		reads.Load(), tornBody.Load(), tornMeta.Load(), readErrs.Load(), writeOKs.Load(), writeErrs.Load(), metaCheck, raceWindow)
-	// Every reader has exited, so errLog is no longer written.
-	assertf(int64(len(errLog)) == min(readErrs.Load(), maxLogged), "logged %d read errors, counted %d", len(errLog), readErrs.Load())
-	if len(errLog) > 0 {
-		detail += fmt.Sprintf(" firstReadErrs(%d of %d)=%s", len(errLog), readErrs.Load(), strings.Join(errLog, " "))
-	}
-	switch {
-	case tornBody.Load() > 0:
-		return []verdict{{name, verdictMishandles, "torn body: a racing GET returned bytes of neither whole version — " + detail}}
-	case tornMeta.Load() > 0:
-		return []verdict{{name, verdictMishandles, "torn metadata: a racing GET returned one whole version with the other version's ETag — " + detail}}
-	case readErrs.Load() > 0:
-		// Framing corruption can surface as failed reads rather than a
-		// classifiable torn body (a short-for-Content-Length response
-		// blocks until the op deadline; a poisoned keep-alive breaks the
-		// next request). Without a classified tear those failures make the
-		// probe inconclusive — never a clean pass. Reading firstReadErrs
-		// (issue #566): "read body after headers (n of Content-Length m)"
-		// with n < m is the framing shape, and a non-zero StatusCode is
-		// a Floci error reply. A 2.5 s pause of the Floci container gave a
-		// deadline error with elapsed≈opTimeout on both readers plus a
-		// writeErr. A 2.5 s SIGSTOP of the test process gave elapsed above
-		// opTimeout, or no error at all.
-		return []verdict{{name, verdictError, "racing GETs failed without a classifiable torn read — inconclusive (possible framing corruption) — " + detail}}
-	case reads.Load() < minReads || writeOKs.Load() < minWrites:
-		return []verdict{{name, verdictError, "too few successful reads/overwrites to have exercised the race — " + detail}}
-	default:
-		return []verdict{{name, verdictPass, "every racing GET returned one whole version with its own ETag — " + detail}}
-	}
+	return []verdict{race.judge(race.run(ctx))}
 }
 
 // getWithETag fetches key and returns the full body plus the response
@@ -403,7 +282,7 @@ func getWithETag(ctx context.Context, client *s3.Client, bucket, key string) (bo
 	if err != nil {
 		// A short body that stalls until the deadline is the framing
 		// shape; a stall before the headers is not (issue #566).
-		return nil, "", fmt.Errorf("read body after headers (%d of Content-Length %d bytes): %w", len(b), aws.ToInt64(out.ContentLength), err)
+		return nil, "", shortBodyError{fmt.Errorf("read body after headers (%d of Content-Length %d bytes): %w", len(b), aws.ToInt64(out.ContentLength), err)}
 	}
 	return b, aws.ToString(out.ETag), nil
 }

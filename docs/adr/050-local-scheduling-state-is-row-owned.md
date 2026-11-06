@@ -76,27 +76,28 @@ repository's publication (`githttp.WaitForPushPublication`) after its claim
 and before its snapshot and `repo.sync.started` event. A failed wait ends
 the run with `restore`, due again after a few seconds.
 
-**Amendment: forward intent before the CAS.** A model check of this schedule
-(`.agents/skills/verify-lane-schedule`) found two ways to lose a forward
-with the order above. A hook that dies, or whose `RequestPush` fails, after
-its authority CAS leaves an accepted push that no run forwards. And a run
-that passed its publication wait could snapshot a ref that a later push then
-held, while the cache still had a value older than the authority (after a
-REST write, or a push that died after its CAS), and end `done` without
-forwarding the newer value. Now a forwarding push's hook records
-`RequestPush` before its authority CAS, after the ref's push hold is in
-place. A REST write by a caller that may forward, to a `forward_on_push`
-repository, first takes the ref's push hold in serve's cache, then records
-`RequestPush`, and the hold ends when its CAS returns. A failed intent write
-or hold refuses the ref update. So does a failed read of the repository's
-upstream link, or a metadata store the hook cannot open, for every update
-outside the ephemeral namespace, also one whose caller may not forward and
-so would record no intent: the step does not check the caller's gates first,
-so it fails closed. A sync run's own loopback push is not refused by this
-step. The intent after the CAS stays, and still does the pull marking. A
-local push run's loopback fetch fails with HTTP 423 when its hydrate would
-skip a push-held ref whose cached value is older than the authority, and the
-run ends with `restore`, as after a failed publication wait.
+**Amendment: forward intent before the CAS.** A model check of this
+schedule (`.agents/skills/verify-lane-schedule`) found two ways to lose a
+forward with the order above. A hook that dies, or whose `RequestPush`
+fails, after its authority CAS leaves an accepted push that no run
+forwards. And a run that passed its publication wait could snapshot a ref
+that a later push then held, while the cache still had a value older than
+the authority (after a REST write, or a push that died after its CAS), and
+end `done` without forwarding the newer value. Now a forwarding push's hook
+records `RequestPush` before its authority CAS, after the ref's push hold is
+in place. A failed write, a failed read of the repository's upstream link,
+or a metadata store the hook cannot open refuses the ref update, with a
+fixed message that names no store detail ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
+amendment). Ephemeral updates, a sync run's own loopback push, and a caller
+whose token may not forward record no intent, and this step does not
+refuse them. A REST write by a caller that may forward, to a
+`forward_on_push` repository, first takes the ref's push hold in serve's
+cache, then records `RequestPush`, and the hold ends when its CAS returns.
+A failed read, hold or intent write refuses that REST write. The intent
+after the CAS stays, and still does the pull marking. A local push run's
+loopback fetch fails with HTTP 423 when its hydrate would skip a push-held
+ref whose cached value is older than the authority, and the run ends with
+`restore`, as after a failed publication wait.
 
 **Rollout.** The store transitions landed first, with no callers (#336). The
 SQLite worker and its sweep followed (#341), and hook marking came last,

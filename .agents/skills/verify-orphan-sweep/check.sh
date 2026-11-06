@@ -97,7 +97,7 @@ facts_cfg="$work/facts.cfg"
   awk '$1 == "FACT" { printf "    %s = %s\n", $2, $3 }' "$out/facts.txt"
 } >"$facts_cfg"
 nfacts=$(grep -c '^FACT ' "$out/facts.txt")
-[ "$nfacts" -eq 9 ] || die "expected 9 facts from facts.go, got $nfacts"
+[ "$nfacts" -eq 10 ] || die "expected 10 facts from facts.go, got $nfacts"
 echo "== Code facts (HEAD $(git -C "$repo" rev-parse --short HEAD))"
 false_facts=0
 while read -r _ name value evidence; do
@@ -134,7 +134,13 @@ run_tlc() {
   local d="$work/${cfg%.cfg}"
   mkdir -p "$d/tmp"
   cp "$model/PackSweep.tla" "$d/"
-  cat "$model/$cfg" "$facts_cfg" >"$d/run.cfg"
+  # A config may pin a fact itself (NoTiming.cfg and SlowHealEntry.cfg set
+  # HealEntryBounded = FALSE); every other fact comes from the code.
+  awk -v cfg="$model/$cfg" '
+    BEGIN { while ((getline l < cfg) > 0) if (l ~ /^[ \t]+[A-Za-z]+ = /) { split(l, a, " "); pinned[a[1]] = 1 } }
+    $2 == "=" && ($1 in pinned) { next }
+    { print }' "$facts_cfg" >"$d/facts.cfg"
+  cat "$model/$cfg" "$d/facts.cfg" >"$d/run.cfg"
   cp "$d/run.cfg" "$out/${cfg%.cfg}.run.cfg"
   local rc=0
   (cd "$d" && "$JAVA" -Djava.io.tmpdir="$d/tmp" -Xmx"${TLC_HEAP:-4g}" -XX:+UseParallelGC \
@@ -180,7 +186,7 @@ for cfg in PackSweep.cfg NoTiming.cfg Liveness.cfg; do
   esac
 done
 
-# Probes drop one timing assumption each; NoLostPack must then fail. One
+# Probes drop one timing guarantee each; NoLostPack must then fail. One
 # worker keeps the trace the shortest one.
 stale=0 probe_passed=0
 [ "$false_facts" -eq 0 ] || stale=1
@@ -195,7 +201,7 @@ for cfg in NoThresholdAssumption.cfg SlowHealEntry.cfg; do
       else
         verdict "$cfg" "UNEXPECTED: $(grep -m1 'is violated' "$out/${cfg%.cfg}.out")"; status=1
       fi ;;
-    0) verdict "$cfg" "PASSES: this timing assumption no longer matters. Review the model and SKILL.md"; stale=1; probe_passed=1 ;;
+    0) verdict "$cfg" "PASSES: this timing guarantee no longer matters. Review the model and SKILL.md"; stale=1; probe_passed=1 ;;
     *) verdict "$cfg" "ERROR: TLC exit $rc"; sed -n '1,40p' "$out/${cfg%.cfg}.out" >&2; exit 3 ;;
   esac
 done
