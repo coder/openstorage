@@ -683,12 +683,12 @@ class JsNames(set):
 
 
 def js_continues(line):
-    run = re.search(r"[+-]*$", line)
-    signs = JS_SIGN.findall(run.group())
+    end = len(line.rstrip("+-"))
+    signs = JS_SIGN.findall(line, end)
     if not signs:
         return bool(JS_CONTINUES.search(line))
     postfix = len(signs) == 1 and len(signs[0]) == 2 and re.search(
-        r"(?:^|[^\w$])(?!(?:%s)$)[\w$]+$|\]$" % "|".join(JS_BEFORE_REGEX | JS_UNKNOWN), line[:run.start()].rstrip())
+        r"(?:^|[^\w$])(?!(?:%s)$)[\w$]+$|\]$" % "|".join(JS_BEFORE_REGEX | JS_UNKNOWN), line[:end].rstrip())
     return not postfix
 
 
