@@ -99,20 +99,27 @@ func (b *File) DownloadFileCapped(ctx context.Context, key, destPath string, cap
 	return bucketDownloadFile(ctx, b.bucket, key, destPath, capBytes)
 }
 
-// List returns all objects under prefix.
+// List returns all objects under prefix, in key order.
 func (b *File) List(ctx context.Context, prefix string) ([]ListedObject, error) {
-	return bucketList(ctx, b.bucket, prefix)
+	var out []ListedObject
+	err := listFilePages(ctx, b.dir, prefix, "", 1000, func(page []ListedObject) error {
+		out = append(out, page...)
+		return nil
+	})
+	return out, err
 }
 
-// ListPages streams objects under prefix in key order, one page at a time.
+// ListPages streams objects under prefix in key order, one page at a time. It
+// walks the directory itself because fileblob's listing loses keys when the
+// order of file names differs from the order of keys (see walkFileKeys).
 func (b *File) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]ListedObject) error) error {
-	return bucketListPages(ctx, b.bucket, prefix, pageSize, fn)
+	return listFilePages(ctx, b.dir, prefix, "", pageSize, fn)
 }
 
-// ListPagesAfter is ListPages from the first key after after. The directory
-// walk still visits the keys it skips: fileblob has no way to start inside it.
+// ListPagesAfter is ListPages from the first key after after. The walk skips
+// the directories that lie wholly before it.
 func (b *File) ListPagesAfter(ctx context.Context, prefix, after string, pageSize int, fn func([]ListedObject) error) error {
-	return bucketListPagesAfter(ctx, b.bucket, prefix, after, nil, pageSize, fn)
+	return listFilePages(ctx, b.dir, prefix, after, pageSize, fn)
 }
 
 // SignedURL is unsupported on the filesystem backend: it returns

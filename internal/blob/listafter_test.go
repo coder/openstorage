@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,17 +31,24 @@ var listAfterKeys = []string{
 	"packs/r1/pack-a.pack",
 	"packs/r1/pack-b.pack",
 	"packs/r1/pack-c.pack",
+	"packs/r1+ephemeral/pack-a.pack", // a namespace sorts before "r1/" by key, after "r1" by file name
+	"packs/r1-x/pack-a.pack",
+	"packs/r1.y/pack-a.pack",
 	"packs/r2/pack-a.pack",
 	"packs/r2/pack-b.pack",
 	"sweep/quarantine/n1/packs/r1/pack-a.pack",
 }
 
 var listAfterCases = []string{
-	"",                          // no cursor: everything
-	"a",                         // before the prefix
-	"packs/",                    // the prefix itself
-	"packs/r1/pack-a.pack",      // an existing key: excluded
-	"packs/r1/pack-b",           // between two keys
+	"",                               // no cursor: everything
+	"a",                              // before the prefix
+	"packs/",                         // the prefix itself
+	"packs/r1/pack-a.pack",           // an existing key: excluded
+	"packs/r1/pack-b",                // between two keys
+	"packs/r1+",                      // inside the namespace repos
+	"packs/r1+ephemeral/pack-a.pack", // a namespace key
+	"packs/r1-x/pack-a.pack",
+	"packs/r1.y/pack-a.pack",
 	"packs/r1/pack-b.pack",      // an existing key mid-listing
 	"packs/r2/pack-b.pack",      // the last key under the prefix
 	"packs/r2/pack-b.pack\x7e",  // just beyond the last key
@@ -105,6 +113,144 @@ func seedFile(t *testing.T) *File {
 	return b
 }
 
+// A prefix that holds more than a page, with a namespace repo that sorts before
+// it by key but after it by file name, keeps every key. fileblob's own listing
+// loses the namespace key here.
+func TestFile_ListPagesKeepsEveryKeyWhenAPageEndsBeforeAnOutOfOrderDirectory(t *testing.T) {
+	ctx := context.Background()
+	b, _ := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for i := range 1005 {
+		want = append(want, fmt.Sprintf("packs/r1/pack-%04d.pack", i))
+	}
+	want = append(want, "packs/r1+ephemeral/pack-a.pack")
+	for _, k := range want {
+		if err := b.UploadFile(ctx, k, src); err != nil {
+			t.Fatalf("UploadFile(%s): %v", k, err)
+		}
+	}
+	sort.Strings(want)
+	var got []string
+	if err := b.ListPages(ctx, PacksRoot, 1000, func(page []ListedObject) error {
+		for _, o := range page {
+			got = append(got, o.Key)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ListPages: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListPages returned %d keys, want %d in key order (first difference at %d)", len(got), len(want), firstDifference(got, want))
+	}
+	all, err := b.List(ctx, PacksRoot)
+	if err != nil || len(all) != len(want) {
+		t.Fatalf("List = %d keys, %v, want %d", len(all), err, len(want))
+	}
+	// A scan that saved the last key of its first page resumes without a gap.
+	var rest []string
+	if err := b.ListPagesAfter(ctx, PacksRoot, want[999], 1000, func(page []ListedObject) error {
+		for _, o := range page {
+			rest = append(rest, o.Key)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ListPagesAfter: %v", err)
+	}
+	if !reflect.DeepEqual(rest, want[1000:]) {
+		t.Fatalf("ListPagesAfter(%q) = %d keys, want the %d after it", want[999], len(rest), len(want)-1000)
+	}
+}
+
+// A resumed listing does not read the directories that lie wholly before the
+// cursor. A directory that cannot be read proves it: it fails a full listing and
+// not a listing that starts after it.
+func TestFile_ListPagesAfterSkipsDirectoriesBeforeTheCursor(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a directory with no permissions")
+	}
+	ctx := context.Background()
+	b, dir := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"packs/aaa/pack-1.pack", "packs/zzz/pack-1.pack"} {
+		if err := b.UploadFile(ctx, k, src); err != nil {
+			t.Fatalf("UploadFile(%s): %v", k, err)
+		}
+	}
+	blocked := filepath.Join(dir, "packs", "aaa")
+	if err := os.Chmod(blocked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o755) })
+
+	list := func(after string) ([]string, error) {
+		var keys []string
+		err := b.ListPagesAfter(ctx, PacksRoot, after, 10, func(page []ListedObject) error {
+			for _, o := range page {
+				keys = append(keys, o.Key)
+			}
+			return nil
+		})
+		return keys, err
+	}
+	if _, err := list(""); err == nil {
+		t.Fatal("a full listing read a directory that has no permissions without an error")
+	}
+	got, err := list("packs/b")
+	if err != nil || !reflect.DeepEqual(got, []string{"packs/zzz/pack-1.pack"}) {
+		t.Fatalf("listing after packs/b = %q, %v, want the key of zzz and no error", got, err)
+	}
+}
+
+func firstDifference(a, b []string) int {
+	for i := range min(len(a), len(b)) {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return min(len(a), len(b))
+}
+
+// Keys that fileblob writes under an escaped file name come back as keys, and
+// its attribute sidecars do not appear.
+func TestFile_ListUnescapesFileNames(t *testing.T) {
+	ctx := context.Background()
+	b, dir := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{"packs/r1/pack-\x01.pack", "packs/r1/pack-__0x41__.pack", "packs/r1/pack-é.pack", "packs/r1/pack-z.pack"}
+	for _, k := range keys {
+		if err := b.UploadFile(ctx, k, src); err != nil {
+			t.Fatalf("UploadFile(%q): %v", k, err)
+		}
+	}
+	// A sidecar that an older binary wrote is not a blob.
+	if err := os.WriteFile(filepath.Join(dir, "packs", "r1", "pack-z.pack.attrs"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := slices.Clone(keys)
+	sort.Strings(want)
+	got, err := b.List(ctx, PacksRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotKeys []string
+	for _, o := range got {
+		gotKeys = append(gotKeys, o.Key)
+	}
+	if !reflect.DeepEqual(gotKeys, want) {
+		t.Fatalf("List = %q, want %q", gotKeys, want)
+	}
+}
+
 func TestFile_ListPagesAfter(t *testing.T) {
 	b := seedFile(t)
 	checkListPagesAfter(t, func(prefix, after string, pageSize int, fn func([]ListedObject) error) error {
@@ -151,7 +297,8 @@ type fakeS3List struct {
 
 	mu      sync.Mutex
 	queries []url.Values
-	seen    map[string]int
+	last    string
+	repeats int
 }
 
 func (f *fakeS3List) requests() []url.Values {
@@ -164,11 +311,12 @@ func (f *fakeS3List) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f.mu.Lock()
 	f.queries = append(f.queries, q)
-	if f.seen == nil {
-		f.seen = map[string]int{}
+	if q.Encode() == f.last {
+		f.repeats++
+	} else {
+		f.last, f.repeats = q.Encode(), 1
 	}
-	f.seen[q.Encode()]++
-	runaway := f.seen[q.Encode()] > 40
+	runaway := f.repeats > 10
 	f.mu.Unlock()
 	if runaway {
 		// A listing that never advances sends the same request forever.

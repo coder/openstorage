@@ -122,7 +122,8 @@ func assertSignedURLArgs(key, method string, expiry time.Duration) {
 
 // PageListerAfter is the optional BlobStore capability behind ListPagesAfter.
 // A store that lacks it, a decorator that embeds a BlobStore for example, is
-// still correct through ListPagesAfter: the helper filters its ListPages.
+// still correct through ListPagesAfter: the helper filters its ListPages, so
+// that ListPages must list in key order.
 type PageListerAfter interface {
 	ListPagesAfter(ctx context.Context, prefix, after string, pageSize int, fn func([]ListedObject) error) error
 }
