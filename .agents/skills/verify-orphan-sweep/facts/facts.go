@@ -394,8 +394,9 @@ func main() {
 	// registered key restores or heals its original on the caller's context,
 	// which no fixed bound fits, then opens a new bound and stats the original
 	// again: the purge relies on that read. No other call passes the bare
-	// context. The bound leaves the purge floor room for the handshake's two
-	// phases besides.
+	// context or one that cannot end, and the purge checks the bound first,
+	// because a store such as the file store ignores its context. The bound
+	// leaves the purge floor room for the handshake's two phases besides.
 	hb := newFact("HealEntryBounded")
 	first0 := ""
 	if len(healEntry.Body.List) > 0 {
@@ -406,40 +407,58 @@ func main() {
 	hb.need(first(hCalls, "s.registered", "ectx, repo, orig", false).IsValid(),
 		"healQuarantineEntry reads the registry as s.registered(ectx, repo, orig)")
 	var regBlock *ast.BlockStmt
-	rebound := token.NoPos
+	rebound, swapped, stat2 := token.NoPos, token.NoPos, token.NoPos
 	ast.Inspect(healEntry.Body, func(n ast.Node) bool {
-		if is, ok := n.(*ast.IfStmt); ok && sweep.text(is.Cond) == "registered" {
-			regBlock = is.Body
-			for _, st := range is.Body.List {
-				if sweep.text(st) == "bound, boundCancel := context.WithTimeout(ctx, healEntryTimeout)" {
-					rebound = st.Pos()
+		is, ok := n.(*ast.IfStmt)
+		if !ok || sweep.text(is.Cond) != "registered" {
+			return true
+		}
+		regBlock = is.Body
+		for _, st := range is.Body.List {
+			switch sweep.text(st) {
+			case "bound, boundCancel := context.WithTimeout(ctx, healEntryTimeout)":
+				rebound = st.Pos()
+			case "ectx = bound":
+				swapped = st.Pos()
+			}
+			if g, ok := st.(*ast.IfStmt); ok && sweep.text(g.Cond) == "!junk" {
+				for _, c := range sweep.calls(g.Body) {
+					if c.fun == "s.blobs.Stat" && c.args == "ectx, orig" {
+						stat2 = c.pos
+					}
 				}
 			}
 		}
 		return true
 	})
-	hb.need(regBlock != nil && rebound.IsValid() && hreg.IsValid() && hreg < rebound,
+	hb.need(rebound.IsValid() && hreg.IsValid() && hreg < rebound,
 		"after the registry read, `if registered` opens a new bound: bound, boundCancel := context.WithTimeout(ctx, healEntryTimeout)")
-	stat2 := first(hCalls, "s.blobs.Stat", "ectx, orig", false)
-	hb.need(rebound.IsValid() && stat2.IsValid() && rebound < stat2 && regBlock != nil && stat2 < regBlock.End(),
-		"the registered block stats the original again as s.blobs.Stat(ectx, orig) after the new bound")
-	bare := 0
-	bad := 0
+	hb.need(swapped.IsValid() && rebound.IsValid() && rebound < swapped,
+		"the new bound replaces the entry's context right after it opens: ectx = bound")
+	hb.need(stat2.IsValid() && swapped.IsValid() && swapped < stat2,
+		"the registered block stats the original again, under `if !junk`, as s.blobs.Stat(ectx, orig) after ectx = bound")
+	bare, bad := 0, 0
 	ast.Inspect(healEntry.Body, func(n ast.Node) bool {
 		c, ok := n.(*ast.CallExpr)
 		if !ok || len(c.Args) == 0 || sweep.text(c.Fun) == "context.WithTimeout" {
 			return true
 		}
-		if id, ok := c.Args[0].(*ast.Ident); ok && id.Name == "ctx" {
+		switch arg := sweep.text(c.Args[0]); {
+		case arg == "ctx":
 			bare++
 			if regBlock == nil || c.Pos() < regBlock.Pos() || c.Pos() > regBlock.End() || !rebound.IsValid() || c.Pos() > rebound {
 				bad++
 			}
+		case arg == "context.Background()", arg == "context.TODO()", strings.HasPrefix(arg, "context.WithoutCancel("):
+			bad++
 		}
 		return true
 	})
 	hb.need(bare > 0 && bad == 0,
-		"only the registered block, before its new bound, passes bare ctx as a first argument (%d calls do, %d outside it)", bare, bad)
+		"only the registered block, before its new bound, passes bare ctx as a first argument, and no call passes a context that cannot end (%d calls pass ctx, %d are not allowed)", bare, bad)
+	errCheck := first(hCalls, "ectx.Err", "", false)
+	hb.need(errCheck.IsValid() && gate.IsValid() && purge.IsValid() && gate < errCheck && errCheck < purge,
+		"healQuarantineEntry checks ectx.Err() after the age gate and before the purge s.blobs.Delete(ectx, q.Key)")
 	healUnits := constUnits(sweep, "healEntryTimeout", "sweepRecoveryTimeout")
 	floorUnits := constUnits(sweep, "QuarantinePurgeFloor", "sweepRecoveryTimeout")
 	hb.need(healUnits >= 1 && healUnits+2 <= floorUnits,

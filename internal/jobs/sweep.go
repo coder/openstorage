@@ -568,11 +568,12 @@ func (s *Sweeper) quarantinePurgeAge() time.Duration {
 // purge: the registry read of an unregistered key, or the read of a registered
 // key's original after its restore. A backup is purged once it is older than
 // quarantinePurgeAge, and the purge is safe only when what the entry read
-// still holds. For an unregistered key no write that began before the
-// backup's handshake can register after the registry read. For a registered
-// key the original is present, so the backup is not the object's last copy
-// (the model's HealEntryBounded fact). Without a bound, a stalled blob call
-// could let that read go stale for as long as the whole sweep ran. The bound
+// still holds. For an unregistered key no write that was in flight at the
+// backup's copy or delete can register after the registry read, because such
+// a write finishes before the backup reaches purge age. For a registered key
+// the original is present, so the backup is not the object's last copy (the
+// model's HealEntryBounded fact). Without a bound, a stalled blob call could
+// let that read go stale for as long as the whole sweep ran. The bound
 // is one restore copy, which sweepRecoveryTimeout already sizes for the
 // largest supported packs, and it must leave QuarantinePurgeFloor room for
 // the two phases of a handshake (2×sweepRecoveryTimeout) besides.
@@ -1432,6 +1433,11 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		if !fenced {
 			return nil
 		}
+	}
+	// A store that ignores its context, such as the file store, returns from a
+	// stalled read late and without an error, so the bound is checked here.
+	if err := ectx.Err(); err != nil {
+		return fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err)
 	}
 	switch err := s.blobs.Delete(ectx, q.Key); {
 	case errors.Is(err, blob.ErrNotFound):

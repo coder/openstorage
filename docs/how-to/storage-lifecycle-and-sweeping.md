@@ -325,10 +325,10 @@ A sweep never hard-deletes directly:
   bytes or provably re-publishes them.
 
 Quarantine backups are purged only while a destructive mode is on, and only once older
-than `max(age threshold, 1h)`; a low age threshold does not shorten the 1h floor. A push
-that started before a backup was written must finish and register at least 30 minutes
-before the backup reaches that age: a delete handshake takes up to 15 minutes, and the
-heal purges a backup within 15 minutes of its last read of the registry or the original.
+than `max(age threshold, 1h)`; a low age threshold does not shorten the 1h floor. Every
+push must finish within that age minus 30 minutes: a delete handshake takes up to 15
+minutes after it copies a backup, and the heal purges a backup within 15 minutes of its
+last read of the registry or the original.
 An entry whose calls overrun that deadline fails, and the next sweep visits it again. The
 restore of a registered original has no deadline, because copying and hashing a large
 LFS object can take longer than any fixed one. The 24h default leaves hours of room. A

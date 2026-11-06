@@ -1228,6 +1228,41 @@ func TestSweep_HealEntryOfARegisteredPackRestoresWithoutADeadline(t *testing.T) 
 	calls.expect(t, "Delete", true)
 }
 
+// staleStat answers a Stat late and without an error once the caller's context
+// has ended, as a store that ignores its context does, such as the file store.
+type staleStat struct {
+	blob.BlobStore
+	end context.CancelFunc
+}
+
+func (b *staleStat) Stat(ctx context.Context, key string) (int64, error) {
+	size, err := b.BlobStore.Stat(ctx, key)
+	b.end()
+	return size, err
+}
+
+// An entry whose deadline passed during a read that returned without an error
+// must not purge: the read may be stale by then.
+func TestSweep_HealEntryDoesNotPurgeAfterItsDeadline(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "held")
+	f.upload(key, "held-bytes") // present and unregistered: the heal goes straight to the purge
+	qKey := quarantinePrefix + "00112233aabbccdd/" + key
+	f.upload(qKey, "held-bytes")
+
+	ctx, end := context.WithCancel(context.Background())
+	defer end()
+	s := NewSweeper(&staleStat{BlobStore: f.blobs, end: end}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	entry := blob.ListedObject{Key: qKey, Size: int64(len("held-bytes")), ModTime: time.Now().Add(-25 * time.Hour)}
+	if err := s.healQuarantineEntry(ctx, entry, &SweepReport{}, true, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("healQuarantineEntry = %v, want the ended context's error", err)
+	}
+	if !f.exists(qKey) {
+		t.Fatalf("heal purged the backup %q after its context ended", qKey)
+	}
+}
+
 // takenAgain deletes the restored original right after its restore copy, as a
 // sweeper handshake that began meanwhile does.
 type takenAgain struct {
