@@ -34,6 +34,9 @@ empty symbol, a line number ([path:12], [path:3-9]), or a symbol in a file
 kind with no reader fails. Citations count inside code spans, not inside
 fenced or indented code. The Go reader assumes gofmt layout. A reader that
 misses a rare declaration form fails closed: cite another name or the file.
+The JavaScript reader lexes the file and stops reading where it cannot be
+sure of its place, for example at a `/` that may open a regex literal or
+divide. A name below that line fails, and the message gives the reason.
 
 Unsupported-but-valid Markdown fails closed rather than silently passing:
 reference-style links ([text][ref] with a [ref]: destination line) and
@@ -396,8 +399,7 @@ def link_failures(path, lineno, ln):
 def masked(text, lexer):
     # Same length and newlines as text, so line, column, and offset survive.
     # Quoted literals keep their quotes, so go_names and tf_names can find a
-    # flag name or block label here and read its value from text, and js_names
-    # can tell a line that ends in a string from one that ends in an operator.
+    # flag name or block label here and read its value from text.
     def blank(m):
         token, keep = m.group(), 1 if m.groupdict().get("quoted") else 0
         return token[:keep] + re.sub(r"[^\n]", " ", token[keep:len(token) - keep]) + token[len(token) - keep:]
@@ -411,8 +413,6 @@ TF_LEXER = re.compile(r"(?P<blank>#[^\n]*|//[^\n]*|/\*.*?\*/"
                       r'|(?P<quoted>"(?:\\.|\$\{(?:"(?:\\.|[^"\\])*"|[^"}])*\}|[^"\\\n])*")', re.S | re.M)
 PY_LEXER = re.compile(r"(?P<blank>#[^\n]*|\"\"\"(?:\\.|[^\\])*?\"\"\"|'''(?:\\.|[^\\])*?'''"
                       r"|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')", re.S)
-JS_LEXER = re.compile(r"(?P<blank>//[^\n]*|/\*.*?\*/)"
-                      r"|(?P<quoted>\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)", re.S)
 
 
 def go_names(text):
@@ -554,9 +554,134 @@ JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*/%&|^<>!~.]$"
                           r"|(?<![\w$.])(?:await|case|delete|extends|in|instanceof|new|of|typeof|void)$")
 
 
+# JavaScript is lexed, not pattern-matched. A `/` divides after a value and
+# opens a regex literal after an operator, and a regex literal, a string, or a
+# template can hold the quotes, backticks, and braces that end the others, so
+# a reader that guesses reads a declaration inside a template as code.
+# js_mask follows the template and `${}` nesting and decides regex or division
+# from the previous token. Where it cannot be sure, it stops, and js_names
+# reads only the lines above the stop: a name below it fails closed, with the
+# reason in its message.
+JS_TOKEN = re.compile(
+    r"(?P<skip>[\s\ufeff]+|//[^\n\r\u2028\u2029]*|/\*.*?\*/|\A\#![^\n\r\u2028\u2029]*)"
+    r"|(?P<string>\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')"
+    r"|(?P<word>\#?(?:[^\W\d]|\$)[\w$]*|\.?\d[\w$]*(?:\.[\w$]*)?)"
+    r"|(?P<html><!--|-->)|(?P<incr>\+\+|--)|(?P<open>[{(\[])|(?P<close>[})\]])"
+    r"|(?P<op>[!%&*+,.:;<=>?@^|~-])|(?P<tick>`)|(?P<slash>/)", re.S)
+JS_TEMPLATE = re.compile(r"\\.|`|\$\{", re.S)
+JS_REGEX = re.compile(r"/(?:\\[^\n\r\u2028\u2029]|\[(?:\\[^\n\r\u2028\u2029]|[^\]\\\n\r\u2028\u2029])*\]"
+                      r"|[^/\\\[\n\r\u2028\u2029])+(?P<end>/)[\w$]*")
+JS_BEFORE_REGEX = {"case", "default", "delete", "do", "else", "extends", "in", "instanceof", "new", "return", "throw",
+                   "typeof", "void"}
+JS_UNKNOWN = {"await", "of", "yield"}
+JS_LINE_BREAK = re.compile(r"[\n\r\u2028\u2029]")
+
+
+def js_mask(text):
+    """Blank comments, strings, regex literals, and templates, as masked does.
+
+    Returns the masked text and where the lexer stopped being sure of its
+    place, as (offset, what it cannot do), or None. Text from the line of that
+    offset on is not masked and must not be read."""
+    spans, templates, start, i = [], [], 0, 0
+    # templates holds one entry per open template: None while the reader is in
+    # its text, else the count of `{` open in its current `${}`. value says
+    # whether the last token ends an operand, so that `/` divides: True, False
+    # (it opens a regex literal), or None (it cannot be told). A line break
+    # between an operand and `/` can insert a semicolon first, which makes the
+    # `/` a regex literal, so the reader cannot tell then either.
+    value, dot, newline = False, False, False
+
+    def done(why=None, at=None):
+        chars = list(text)
+        for a, b in spans:
+            chars[a:b] = [c if c == "\n" else " " for c in text[a:b]]
+        return "".join(chars), (start if templates else at, why) if why else None
+
+    while i < len(text):
+        if templates and templates[-1] is None:
+            part = JS_TEMPLATE.search(text, i)
+            if part is None:
+                break
+            i = part.end()
+            if part.group() == "${":
+                templates[-1], value, dot = 0, False, False
+            elif part.group() == "`":
+                templates.pop()
+                value = True
+                if not templates:
+                    spans.append((start + 1, part.start()))
+            continue
+        token = JS_TOKEN.match(text, i)
+        kind = token and token.lastgroup
+        if kind is None:
+            return done("find the end of this string" if text[i] in "\"'" else "read this character", i)
+        line_break = newline
+        newline = kind == "skip" and (line_break or JS_LINE_BREAK.search(token.group()) is not None)
+        if kind == "skip":
+            if not templates and not text[i].isspace() and text[i] != "\ufeff":
+                spans.append((i, token.end()))
+        elif kind == "string":
+            if not templates:
+                spans.append((i + 1, token.end() - 1))
+            value, dot = True, False
+        elif kind == "word":
+            word = token.group()
+            value = True if dot else None if word in JS_UNKNOWN else word not in JS_BEFORE_REGEX
+            dot = False
+        elif kind == "html":
+            return done("read an HTML-like comment", i)
+        elif kind == "incr":
+            value, dot = None, False
+        elif kind == "op":
+            value, dot = False, token.group() == "."
+        elif kind == "open":
+            if token.group() == "{" and templates:
+                templates[-1] += 1
+            value, dot = False, False
+        elif kind == "close":
+            if token.group() == "}" and templates:
+                if templates[-1] == 0:
+                    templates[-1], i = None, token.end()
+                    continue
+                templates[-1] -= 1
+            value, dot = (token.group() == "]") or None, False
+        elif kind == "tick":
+            if not templates:
+                start = i
+            templates.append(None)
+        else:
+            if text.startswith("/*", i):
+                return done("find the end of this comment", i)
+            if value is None or value and line_break:
+                return done("tell a regex literal from a division", i)
+            if value:
+                value = False
+            else:
+                regex = JS_REGEX.match(text, i)
+                if regex is None:
+                    return done("find the end of this regex literal", i)
+                if not templates:
+                    spans.append((i + 1, regex.start("end")))
+                i, value, dot = regex.end(), True, False
+                continue
+        i = token.end()
+    return done("find the end of this template") if templates else done()
+
+
+class JsNames(set):
+    note = ""
+
+
 def js_names(text):
-    names, prior = set(), ""
-    for line in masked(text, JS_LEXER).split("\n"):
+    blanked, stop = js_mask(text)
+    names, prior = JsNames(), ""
+    if stop:
+        offset, cannot = stop
+        blanked = blanked[:blanked.rfind("\n", 0, offset) + 1]
+        stopped = text.count("\n", 0, offset) + 1
+        names.note = f"; the JavaScript reader stops at line {stopped}, where it cannot {cannot}"
+    for line in blanked.split("\n"):
         code = line.rstrip()
         if not code:
             continue
@@ -625,8 +750,8 @@ def citation_problem(path, symbol):
         return "MISSING CITED FILE", ""
     if not indexed(path):
         return "MISSING CITED FILE", " (not tracked by git)"
-    if symbol is not None and symbol not in citable(path):
-        return "UNRESOLVED CITATION", f" (no such name in {path})"
+    if symbol is not None and symbol not in (names := citable(path)):
+        return "UNRESOLVED CITATION", f" (no such name in {path}{getattr(names, 'note', '')})"
     return None
 
 

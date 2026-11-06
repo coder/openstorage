@@ -1,5 +1,7 @@
 """Regression tests for the documented check-doc-links.py command."""
 from pathlib import Path
+import random
+import re
 import shutil
 import subprocess
 import sys
@@ -433,15 +435,27 @@ class CitationTests(CheckerTestCase):
 
     def test_javascript_regex_literals_and_nested_templates_cannot_shift_the_reader(self):
         trap = "const trap = `\nfunction stale() {}\n`;\nfunction real() {}\n"
+        regexes_after = [
+            "export default /`/.source;\n", "delete /`/.source;\n", "do /`/.test(x); while (0)\n", "if (a) {} else /`/.test(x);\n",
+            "class A extends /`/.constructor {}\n", "const q = x in /`/;\n", "const q = x instanceof /`/.constructor;\n",
+            "const q = new /`/.constructor();\n", "const q = typeof /`/;\n", "const q = void /`/;\n",
+            "switch (x) {\n  case /`/.source:\n}\n", "function f() {\n  return /`/.test(x);\n}\n", "function g() {\n  throw /`/;\n}\n",
+        ]
         sources = [prefix + trap for prefix in [
-            "const r = /`/;\n", "const r = /[`]/g;\n", "const r = /'`/;\n", "const r = /[/]`/;\n",
-            "const r = /[/*]/;\n", "const t = `a ${ \"`\" } b`;\n", "const t = `a ${ '`' } b`;\n",
-            "const t = `${ /`/.test(x) }`;\n", "const t = `${ /}/.test(x) } ${ {a: \"}\"}.a }`;\n",
-            "const q = a / b + /'`/.test(c);\n", "const g = (x) => /`/.test(x);\n",
-            "function f() {\n  return /`/.test(x);\n}\n",
+            "const r = /`/;\n", "const r = /[`]/g;\n", "const r = /'`/;\n", "const r = /[/]`/;\n", "const r = /[/*]/;\n",
+            "const t = `a ${ \"`\" } b`;\n", "const t = `a ${ '`' } b`;\n", "const t = `${ /`/.test(x) }`;\n",
+            "const t = `${ /}/.test(x) } ${ {a: \"}\"}.a }`;\n", "const q = a / b + /'`/.test(c);\n",
+            "const g = (x) => /`/.test(x);\n", *regexes_after,
         ]]
+        # A `/` after a value divides, so the template below opens a template that the division's right side
+        # starts and its closing brace ends: reading the `/` as a regex literal flips every backtick after it.
+        sources += [f"const q = {operand} / `${{b / c}}` + `\nfunction stale() {{}}\n`;\nfunction real() {{}}\n"
+                    for operand in ["'a'", '"a"', "`a`", "1.", "0x1f", "this", "a[0]", "a.in", "a.return"]]
         sources += [
             "const t = `a ${ `b\nfunction stale() {}\n` } c`;\nfunction real() {}\n",
+            "const t = `${ `a` / 2 } a/b` + `\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const s = 'a\\\nfunction stale() {}\\\n';\nfunction real() {}\n",
+            "const t = `\\`\nfunction stale() {}\n`;\nfunction real() {}\n",
             "// comment\u2028const open = `\nfunction stale() {}\n`;\nfunction real() {}\n",
         ]
         files = {f"pkg/leak{i}.js": source for i, source in enumerate(sources)}
@@ -455,8 +469,11 @@ class CitationTests(CheckerTestCase):
               'const label = `${slug("a b")} and ${ {k: "}"}.k } ${ `nested ${1}` }`;\n'
               'const ratio = total / count / 2; // half\n'
               'const test = x => /a\\/b/.test(x) && y / z;\n'
+              'const first = list[0] / 2;\n'
+              "const quote = '\\'' + \"say \\\"hi\\\"\";\n"
+              'class Counter {\n  #count = 0;\n  get half() { return this.#count / 2; }\n}\n'
               'function afterAll() {}\n')
-        ok = ["slug", "label", "ratio", "test", "afterAll"]
+        ok = ["slug", "label", "ratio", "test", "first", "quote", "afterAll"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result)
         self.assertEqual(result.returncode, 0)
@@ -469,19 +486,65 @@ class CitationTests(CheckerTestCase):
         self.assertEqual(result.returncode, 0)
 
     def test_javascript_reader_stops_where_it_cannot_be_sure_of_the_code(self):
-        triggers = {
-            "paren": "const half = (a + b) / 2;\n", "brace": "const q = {}\n/ 2;\n", "incr": "count++ / 2;\n",
-            "yield": "const y = yield / 2;\n", "html": "x <!-- `\n", "arrow": "while (n --> 0) {}\n",
-            "escape": "function st\\u0061le() {}\n", "unicode": "const x = 1 \u2192 2;\n",
-            "quote": "const s = 'open;\n", "comment": "/* open\n", "template": "const t = `open\n",
-            "inside": "const t = `\nfunction stale() {}\n${ (a) / 2 }`;\n",
+        division = "tell a regex literal from a division"
+        triggers = {  # name: (source after `before`, line of the stop, what the reader cannot do)
+            "paren": ("const half = (a + b) / 2;\n", 2, division), "brace": ("const q = {}\n/ 2;\n", 3, division),
+            "incr": ("count++ / 2;\n", 2, division), "linestart": ("const ratio = total\n  / count;\n", 3, division),
+            "yield": ("const y = yield / 2;\n", 2, division), "inside": ("const t = `\nfunction stale() {}\n${ (a) / 2 }`;\n", 2, division),
+            "html": ("x <!-- `\n", 2, "read an HTML-like comment"), "arrow": ("while (n --> 0) {}\n", 2, "read an HTML-like comment"),
+            "escape": ("function st\\u0061le() {}\n", 2, "read this character"), "unicode": ("const x = 1 \u2192 2;\n", 2, "read this character"),
+            "quote": ("const s = 'open;\n", 2, "find the end of this string"), "comment": ("/* open\n", 2, "find the end of this comment"),
+            "regex": ("const r = /open;\n", 2, "find the end of this regex literal"),
+            "template": ("const t = `open\n", 2, "find the end of this template"),
         }
-        files = {f"pkg/{name}.js": f"function before() {{}}\n{trigger}function after() {{}}\n" for name, trigger in triggers.items()}
-        cited = [f"[{name}.js:{symbol}]" for name in triggers for symbol in ("before", "after")]
+        files = {f"pkg/{name}.js": f"function before() {{}}\n{source}function after() {{}}\n" for name, (source, _, _) in triggers.items()}
+        cited = [f"[{name}.js:{symbol}]" for name in triggers for symbol in ("before", "after")] + ["[escape.js:st]"]
         result = self.check_readme(" ".join(cited) + "\n", **files)
-        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[{name}.js:after]") for name in triggers])
-        line = next(l for l in result.stdout.splitlines() if "[paren.js:after]" in l)
-        self.assertIn("the JavaScript reader stops at line 2, where it cannot tell a regex literal from a division", line)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[{name}.js:after]") for name in triggers],
+                             ("UNRESOLVED CITATION", "[escape.js:st]"))
+        for name, (_, line, cannot) in triggers.items():
+            report = next(l for l in result.stdout.splitlines() if f"[{name}.js:after]" in l)
+            self.assertTrue(report.endswith(f"; the JavaScript reader stops at line {line}, where it cannot {cannot})"), report)
+
+    def test_javascript_slash_that_starts_a_line_after_an_operand_can_open_a_regex_literal(self):
+        # A line break lets a semicolon end `var s`, `break`, or an import, so the `/` below opens a
+        # regex literal that holds a backtick. The reader stops there instead of guessing.
+        trap = "const t = `\nfunction stale() {}\n`;\nfunction real() {}\n"
+        heads = ["var s\n  /`/.test(x);\n", "let s, u\n  /`/.test(x);\n", "var s /* one\n two */ /`/.test(x);\n", "for (;;) {\n  break\n  /`/.test(x);\n}\n",
+                 "debugger\n  /`/.test(x);\n", "import a from 'm'\n  /`/.test(x);\n", "export * from 'm'\n  /`/.test(x);\n"]
+        files = {f"pkg/asi{i}.js": head + trap for i, head in enumerate(heads)}
+        cited = [f"[asi{i}.js:{name}]" for i in range(len(heads)) for name in ("stale", "real")]
+        result = self.check_readme(" ".join(cited) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[asi{i}.js:{name}]") for i in range(len(heads))
+                                       for name in ("stale", "real")])
+
+    def test_javascript_reader_never_reads_a_name_that_a_literal_or_comment_holds(self):
+        rnd = random.Random(640)
+        operands = ["a", "1", "1.", "this", "a.in", "'q'", '"`"', "'/*'", "/`/", "/[`]/", "/'/g", "/}/", "/\\//", "`${x}`", "`a${'`'}`",
+                    "`${/`/.test(y)}`", "`${`n${1}`}`", "`//${'/*'}`"]
+        def statement(kind, name):
+            expr = "".join(rnd.choice(operands) + rnd.choice([" + ", " / ", " - ", ", "]) for _ in range(rnd.randint(0, 2)))
+            expr += rnd.choice(operands)
+            return {
+                "noise": f"x = {expr};", "asi": f"var v\n{rnd.choice(['/`/', '/[`]/', '/\\//'])}.test(x);",
+                "real": f"function {name}() {{}}", "template": f"const v{name} = `x ${{ {expr} }}\nfunction {name}() {{}}\n`;",
+                "comment": f"/*\nfunction {name}() {{}}\n*/", "continued": f"const v{name} = 'a\\\nfunction {name}() {{}}\\\n';",
+                "expression": f"const v{name} =\n  function {name}() {{}};",
+            }[kind]
+        files, real, trap = {}, set(), set()
+        for i in range(120):
+            lines = []
+            for k in range(rnd.randint(2, 6)):
+                kind = rnd.choice(["noise", "noise", "asi", "real", "template", "comment", "continued", "expression"])
+                name = f"{'r' if kind == 'real' else 't'}{i}_{k}"
+                lines.append(statement(kind, name))
+                if kind in ("real", "template", "comment", "continued", "expression"):
+                    (real if kind == "real" else trap).add(f"[g{i}.js:{name}]")
+            files[f"pkg/g{i}.js"] = "\n".join(lines) + "\n"
+        result = self.check_readme(" ".join(sorted(real | trap)) + "\n", **files)
+        failed = set(re.findall(r"-> (\[[^\]]+\])", result.stdout))
+        self.assertEqual(trap - failed, set())
+        self.assertGreater(len(real - failed), len(real) // 4)
 
     def test_python_js_and_unit_citations(self):
         files = {
