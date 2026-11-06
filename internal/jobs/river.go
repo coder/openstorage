@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	stdsync "sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -66,7 +67,8 @@ func (syncArgs) Kind() string { return "upstream_sync" }
 // re-run — whose claim attempt steals the dead holder's expired lease — is
 // that request's only follow-up. With a single attempt the rescuer could
 // only discard the orphan, stranding the accepted 202 until an unrelated
-// later trigger.
+// later trigger. A job discarded after its last attempt leaves its work to
+// the lane scan (StartLaneScan), which inserts the job again minutes later.
 const syncRescueAttempts = 3
 
 func (syncArgs) InsertOpts() river.InsertOpts {
@@ -768,11 +770,12 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 		}
 		// Stranded mirror-back rescue (Codex round 6): RunPush marks the
 		// mirror-back durable (RequestSync) BEFORE its direct enqueue,
-		// but on pg that enqueue is a plain insert with no boot-recovery
-		// scan behind it — if it fails transiently while no pull is in
-		// flight, the sync_pending marker has no job left to consume it,
-		// and a pull that fetched the pre-forward upstream could stand
-		// divergent forever. Covering the marker here makes mirror-back
+		// and on pg that enqueue is a plain insert. If it fails
+		// transiently while no pull is in flight, the sync_pending
+		// marker has no job left to consume it until the lane scan
+		// (StartLaneScan) finds it minutes later, and a pull that fetched
+		// the pre-forward upstream stands divergent until then. Covering
+		// the marker here makes mirror-back
 		// scheduling part of this push job's durable completion: the
 		// insert deduplicates against any live sync job (unique by
 		// repo), whose own completion gate re-checks the marker.
@@ -802,6 +805,15 @@ type River struct {
 	// (DrainSyncRuns, issue #343); the workers derive each run's context
 	// from runs.
 	cancelRuns context.CancelCauseFunc
+	logger     *slog.Logger
+
+	// The lane scan (StartLaneScan): scanStop is set once, by the start or
+	// the first stop. Only scanLanes touches scanCursor, and only the scan
+	// goroutine calls it.
+	scanMu     stdsync.Mutex
+	scanStop   context.CancelFunc
+	scanning   stdsync.WaitGroup
+	scanCursor string
 }
 
 var (
@@ -979,7 +991,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		pool.Close()
 		return nil, fmt.Errorf("jobs: start river client: %w", err)
 	}
-	return &River{client: client, pool: pool, started: true, repackEnabled: repack != nil, cancelRuns: cancelRuns}, nil
+	return &River{client: client, pool: pool, started: true, repackEnabled: repack != nil, cancelRuns: cancelRuns, logger: logger}, nil
 }
 
 // NewRiverInsertOnly connects an insert-only client (no migrations — hooks
@@ -1098,6 +1110,7 @@ func (q *River) DrainSyncRuns(ctx context.Context, wait time.Duration) {
 	if !q.started {
 		return
 	}
+	q.stopLaneScan() // no new jobs from this process while it drains
 	wctx, cancel := context.WithTimeout(ctx, wait)
 	err := q.client.Stop(wctx) // soft: no new fetches, waits for running jobs
 	cancel()
@@ -1185,6 +1198,7 @@ func (q *River) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 	if q.started {
+		q.stopLaneScan()
 		select {
 		case <-q.client.Stopped():
 		default:
