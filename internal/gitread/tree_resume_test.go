@@ -444,7 +444,7 @@ func TestTreeWalkBoundsTheReadsOfEmptyFolders(t *testing.T) {
 		distinct[fmt.Sprintf("t%04d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{"x": {mode: modeTree, sub: map[string]*memEntry{}}}}
 	}
 	c = &countingTrees{memTrees: newMemTrees(distinct), opens: map[string]int{}}
-	w = &treeWalk{src: c, limit: 1, room: math.MaxInt64}
+	w = &treeWalk{src: c, limit: 100, room: math.MaxInt64}
 	if err := w.run(memCommit, "", nil, ""); !errors.Is(err, errDeclined) {
 		t.Fatalf("err = %v, want errDeclined", err)
 	}

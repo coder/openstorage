@@ -362,6 +362,42 @@ func TestLsTreePageCursorCharge(t *testing.T) {
 	}
 }
 
+// The walk holds more than the page it charges, so an allowance can be short
+// for the walk and enough for the page, or enough for both: the answer and
+// the charge are the stream's either way. The names are long: the walk holds
+// less than twice the page, so an allowance between the two has less left
+// after the charge than the page took.
+func TestLsTreePageCursorChargeAroundWhatTheWalkHolds(t *testing.T) {
+	var files []fiFile
+	for i := range 12 {
+		files = append(files, fiFile{"100644", fmt.Sprintf("d/%s%02d", strings.Repeat("n", 40), i), "x"})
+	}
+	dir, commit := fiRepo(t, files)
+	const limit = 5
+	page, _ := windowOf(sortedListing(t, dir, commit, ""), "\x00", limit)
+	var want int64
+	for _, e := range page {
+		want += recordLen(e)
+	}
+	var viaWalk int
+	for allowance := want - 1; allowance <= 2*want+50; allowance += 11 {
+		ctx, b := budgeted(t, allowance)
+		got, more, found, err := LsTreePage(ctx, dir, commit, "", "\x00", limit)
+		octx, ob := budgeted(t, allowance)
+		wp, wm, wf, werr := pageOracle(octx, dir, commit, "", "\x00", limit)
+		if !slices.Equal(got, wp) || more != wm || found != wf || fmt.Sprint(err) != fmt.Sprint(werr) || b.remaining() != ob.remaining() {
+			t.Fatalf("allowance %d: %v, %v, %v, %v, %d left; stream %v, %v, %v, %v, %d left", allowance, paths(got), more, found, err, b.remaining(), paths(wp), wm, wf, werr, ob.remaining())
+		}
+		rctx, _ := budgeted(t, allowance)
+		if _, _, _, err := resumeTreePage(rctx, dir, commit, "", "\x00", limit); err == nil {
+			viaWalk++
+		}
+	}
+	if viaWalk == 0 {
+		t.Fatal("the walk never gave the page")
+	}
+}
+
 // A page past the end is empty and charges nothing. It still says whether
 // the folder held anything.
 func TestLsTreePageCursorPastTheEnd(t *testing.T) {
@@ -472,7 +508,7 @@ func TestLsTreePageCursorOnMissingObjects(t *testing.T) {
 		commit := commitOf(t, dir, c.tree)
 		page, more, found, err := LsTreePage(ctx, dir, commit, "", c.after, c.limit)
 		wp, wm, wf, werr := pageOracle(ctx, dir, commit, "", c.after, c.limit)
-		if (err != nil) != c.wantFailure || (werr != nil) != c.wantFailure || err == nil && (!slices.Equal(page, wp) || more != wm || found != wf) {
+		if (err != nil) != c.wantFailure || (werr != nil) != c.wantFailure || err == nil && (!slices.Equal(page, wp) || more != wm || found != wf) || fmt.Sprint(err) != fmt.Sprint(werr) {
 			t.Errorf("%s: LsTreePage = %v, %v, %v, %v; stream = %v, %v, %v, %v; want failure %v", name, paths(page), more, found, err, paths(wp), wm, wf, werr, c.wantFailure)
 		}
 	}
