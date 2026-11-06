@@ -431,6 +431,58 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme(" ".join(cited) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:open{i}]") for i in range(len(endings))])
 
+    def test_javascript_regex_literals_and_nested_templates_cannot_shift_the_reader(self):
+        trap = "const trap = `\nfunction stale() {}\n`;\nfunction real() {}\n"
+        sources = [prefix + trap for prefix in [
+            "const r = /`/;\n", "const r = /[`]/g;\n", "const r = /'`/;\n", "const r = /[/]`/;\n",
+            "const r = /[/*]/;\n", "const t = `a ${ \"`\" } b`;\n", "const t = `a ${ '`' } b`;\n",
+            "const t = `${ /`/.test(x) }`;\n", "const t = `${ /}/.test(x) } ${ {a: \"}\"}.a }`;\n",
+            "const q = a / b + /'`/.test(c);\n", "const g = (x) => /`/.test(x);\n",
+            "function f() {\n  return /`/.test(x);\n}\n",
+        ]]
+        sources += [
+            "const t = `a ${ `b\nfunction stale() {}\n` } c`;\nfunction real() {}\n",
+            "// comment\u2028const open = `\nfunction stale() {}\n`;\nfunction real() {}\n",
+        ]
+        files = {f"pkg/leak{i}.js": source for i, source in enumerate(sources)}
+        cited = [f"[leak{i}.js:{name}]" for i in range(len(sources)) for name in ("stale", "real")]
+        result = self.check_readme(" ".join(cited) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[leak{i}.js:stale]") for i in range(len(sources))])
+
+    def test_javascript_reader_reads_regex_literals_templates_and_divisions_it_can_lex(self):
+        js = ('function slug(name) {\n'
+              '  return name.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/^-+|-+$/g, "");\n}\n'
+              'const label = `${slug("a b")} and ${ {k: "}"}.k } ${ `nested ${1}` }`;\n'
+              'const ratio = total / count / 2; // half\n'
+              'const test = x => /a\\/b/.test(x) && y / z;\n'
+              'function afterAll() {}\n')
+        ok = ["slug", "label", "ratio", "test", "afterAll"]
+        result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok) + "\n", **{"pkg/flow.js": js})
+        self.assert_failures(result)
+        self.assertEqual(result.returncode, 0)
+
+    def test_javascript_reader_skips_a_hashbang_and_a_byte_order_mark(self):
+        result = self.check_readme("[hashbang.js:afterHashbang] [bom.js:afterBom]\n", **{
+            "pkg/hashbang.js": "#!/usr/bin/env node\nfunction afterHashbang() {}\n",
+            "pkg/bom.js": "\ufeffconst bom = 1;\nfunction afterBom() {}\n"})
+        self.assert_failures(result)
+        self.assertEqual(result.returncode, 0)
+
+    def test_javascript_reader_stops_where_it_cannot_be_sure_of_the_code(self):
+        triggers = {
+            "paren": "const half = (a + b) / 2;\n", "brace": "const q = {}\n/ 2;\n", "incr": "count++ / 2;\n",
+            "yield": "const y = yield / 2;\n", "html": "x <!-- `\n", "arrow": "while (n --> 0) {}\n",
+            "escape": "function st\\u0061le() {}\n", "unicode": "const x = 1 \u2192 2;\n",
+            "quote": "const s = 'open;\n", "comment": "/* open\n", "template": "const t = `open\n",
+            "inside": "const t = `\nfunction stale() {}\n${ (a) / 2 }`;\n",
+        }
+        files = {f"pkg/{name}.js": f"function before() {{}}\n{trigger}function after() {{}}\n" for name, trigger in triggers.items()}
+        cited = [f"[{name}.js:{symbol}]" for name in triggers for symbol in ("before", "after")]
+        result = self.check_readme(" ".join(cited) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[{name}.js:after]") for name in triggers])
+        line = next(l for l in result.stdout.splitlines() if "[paren.js:after]" in l)
+        self.assertIn("the JavaScript reader stops at line 2, where it cannot tell a regex literal from a division", line)
+
     def test_python_js_and_unit_citations(self):
         files = {
             "pkg/tool.py": 'import os\nLIMIT = 3\nos.chdir("/")\n\nclass Box:\n    def open(self):\n'
