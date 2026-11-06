@@ -165,7 +165,7 @@ run_tlc() {
   local rc=0
   (cd "$d" && "$JAVA" -Djava.io.tmpdir="$d/tmp" -Xmx"${TLC_HEAP:-4g}" -XX:+UseParallelGC \
      -cp "$jar" tlc2.TLC -workers "$workers" -cleanup -metadir "$d/meta" "$@" \
-     -config run.cfg "$module.tla") >"$out/${cfg%.cfg}.out" 2>&1 || rc=$?
+     -config run.cfg "$module.tla") </dev/null >"$out/${cfg%.cfg}.out" 2>&1 || rc=$?
   return "$rc"
 }
 
