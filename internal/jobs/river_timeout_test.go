@@ -254,3 +254,94 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 		t.Errorf("repo_crashed's push orphaned 40 minutes ago was not rescued with its sync")
 	}
 }
+
+type sleepsInList struct {
+	blob.BlobStore
+	d time.Duration
+}
+
+func (b *sleepsInList) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	time.Sleep(b.d)
+	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+}
+
+func purgeLeftRecorder(left chan<- time.Duration) func(context.Context) error {
+	return func(ctx context.Context) error {
+		select {
+		case left <- timeLeft(ctx):
+		default:
+		}
+		return nil
+	}
+}
+
+// A sweep that returns early leaves the purge the rest of the job, never a fresh budget:
+// the job ends at its own deadline, which the rescue horizon is sized against.
+func TestSweepSchedule_PurgeEndsWithTheJobWhenTheSweepReturnsEarly(t *testing.T) {
+	f := newPurgeFixture(t)
+	repo := f.seedRepo("https://example.com/early.git")
+	f.softDelete(repo.URL)
+	probe := f.store.(RepoPurgeRegistry).IsRepoPurged
+	sweeper := NewSweeper(&sleepsInList{BlobStore: f.blobs, d: 300 * time.Millisecond}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: probe}, slog.New(slog.DiscardHandler))
+	left := make(chan time.Duration, 4)
+	purgeSweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: probe, DeleteGuard: purgeLeftRecorder(left)})
+	schedule := &SweepSchedule{Sweeper: sweeper, Interval: time.Hour, Purger: f.purger(purgeSweeper, time.Hour)}
+
+	// Two listings take 0.6 s of the sweep's 1 s, so the purge keeps about 2.4 s of the 3 s job.
+	if err := schedule.runOnce(context.Background(), 3*time.Second, 2*time.Second); err != nil {
+		t.Fatalf("runOnce: %v", err)
+	}
+	if got := receiveLeft(t, "the purge's delete guard", left); got < 1500*time.Millisecond || got > 2700*time.Millisecond {
+		t.Errorf("the purge started with %v left, want about 2.4s: the rest of the job, not a fresh budget", got)
+	}
+}
+
+// Local mode keeps no deadline for the sweep or the purge.
+func TestSweepTicker_GivesNeitherTheSweepNorThePurgeADeadline(t *testing.T) {
+	f := newPurgeFixture(t)
+	repo := f.seedRepo("https://example.com/local.git")
+	f.softDelete(repo.URL)
+	probe := f.store.(RepoPurgeRegistry).IsRepoPurged
+	listLeft := make(chan time.Duration, 8)
+	sweeper := NewSweeper(&firstListDeadlineBlobs{BlobStore: f.blobs, left: listLeft}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: probe}, slog.New(slog.DiscardHandler))
+	purgeLeft := make(chan time.Duration, 8)
+	purgeSweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: probe, DeleteGuard: purgeLeftRecorder(purgeLeft)})
+	stop := StartSweepTicker(&SweepSchedule{Sweeper: sweeper, Interval: time.Hour, Purger: f.purger(purgeSweeper, time.Hour)})
+	defer stop()
+
+	if got := receiveLeft(t, "the sweep's first listing", listLeft); got != math.MaxInt64 {
+		t.Errorf("the local sweep context has a deadline: %v left", got)
+	}
+	if got := receiveLeft(t, "the purge's delete guard", purgeLeft); got != math.MaxInt64 {
+		t.Errorf("the local purge context has a deadline: %v left", got)
+	}
+}
+
+// A sweep orphaned 2h50m ago is rescued: the horizon (2h45m) bounds how long a crashed sweep blocks the next one.
+func TestRiverRescuesASweepOrphanedPastItsRescueHorizon(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+	migrateRiver(t, pgURL)
+	ins, err := NewRiverInsertOnly(ctx, pgURL)
+	if err != nil {
+		t.Fatalf("NewRiverInsertOnly: %v", err)
+	}
+	defer ins.Close()
+	orphan := orphanJob(t, ins, sweepArgs{}, 2*time.Hour+50*time.Minute)
+	leader := startTimeoutRiver(t, pgURL, func(context.Context, sync.Job) error { return nil }, nil)
+	defer leader.Close()
+
+	// Rescue runs on the elected leader every 30 s.
+	for deadline := time.Now().Add(90 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
+		var state string
+		if err := ins.pool.QueryRow(ctx, `SELECT state FROM river_job WHERE id = $1`, orphan).Scan(&state); err != nil {
+			t.Fatalf("read job: %v", err)
+		}
+		if state != "running" {
+			return
+		}
+	}
+	t.Fatal("a sweep orphaned 2h50m after its start was never rescued")
+}
