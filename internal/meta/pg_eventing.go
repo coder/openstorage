@@ -759,6 +759,76 @@ func PGRequestForward(ctx context.Context, tx pgx.Tx, repoID string) (bool, erro
 	return tag.RowsAffected() == 1, nil
 }
 
+// pgPushWork and pgPullWork are the claim guards of TryBeginPush and
+// TryBeginSync, evaluated now on the database clock: an unclaimed lane with
+// a pending request, or an expired claim, which holds the request it
+// consumed. A lapsed legacy grace is claimable only with the operator's
+// steal assertion, so without it the lane is not work. They are
+// ListLocalWork's guards without SQLite's due times: on PostgreSQL a
+// backoff is a scheduled River job. $1 is LegacyClaimHolder and $2
+// legacyStealEnabled().
+const (
+	pgPushWork = `((NOT u.push_syncing AND u.push_pending > 0)
+		OR (u.push_syncing AND u.push_claim_expires_at <= now()))`
+	pgPullWork = `((NOT u.syncing AND u.sync_pending)
+		OR (u.syncing AND u.sync_claim_expires_at <= now()
+		    AND (u.sync_claim_holder <> $1 OR $2)))`
+)
+
+// PGListLaneWork returns at most limit lanes of org's live repos whose
+// claim guard holds now (pgPushWork, pgPullWork), ordered by RepoID
+// strictly after after. A page shorter than limit ends a traversal. It
+// takes no locks. River's lane scan checks each lane again with PGLaneWork
+// after it inserts the lane's job.
+func PGListLaneWork(ctx context.Context, tx pgx.Tx, org, after string, limit int) ([]LocalWork, error) {
+	assertf(tx != nil && org != "" && limit > 0, "PGListLaneWork: nil tx, empty org %q or non-positive limit %d", org, limit)
+	rows, err := tx.Query(ctx, `SELECT u.repo_id, `+pgPushWork+`, `+pgPullWork+`
+		FROM repo_upstreams u
+		JOIN repos r ON r.repo_id = u.repo_id AND r.deleted_at IS NULL
+		JOIN orgs o ON o.id = r.org_id AND o.name = $3
+		WHERE u.repo_id > $4 AND (`+pgPushWork+` OR `+pgPullWork+`)
+		ORDER BY u.repo_id LIMIT $5`,
+		LegacyClaimHolder, legacyStealEnabled(), org, after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list lane work: %w", err)
+	}
+	defer rows.Close()
+	var work []LocalWork
+	for rows.Next() {
+		var w LocalWork
+		if err := rows.Scan(&w.RepoID, &w.Push, &w.Pull); err != nil {
+			return nil, fmt.Errorf("list lane work: %w", err)
+		}
+		assertf(w.Push || w.Pull, "listed %q without lane work", w.RepoID)
+		work = append(work, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list lane work: %w", err)
+	}
+	assertf(len(work) <= limit, "PGListLaneWork returned %d > %d rows", len(work), limit)
+	return work, nil
+}
+
+// PGLaneWork evaluates PGListLaneWork's guards for repoID inside the
+// caller's transaction, without locks. A repo that is deleted or has no
+// upstream link has no lane work.
+func PGLaneWork(ctx context.Context, tx pgx.Tx, repoID string) (LocalWork, error) {
+	assertf(tx != nil && repoID != "", "PGLaneWork: nil tx or empty repo id")
+	w := LocalWork{RepoID: repoID}
+	err := tx.QueryRow(ctx, `SELECT `+pgPushWork+`, `+pgPullWork+`
+		FROM repo_upstreams u
+		JOIN repos r ON r.repo_id = u.repo_id AND r.deleted_at IS NULL
+		WHERE u.repo_id = $3`,
+		LegacyClaimHolder, legacyStealEnabled(), repoID).Scan(&w.Push, &w.Pull)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return w, nil
+	}
+	if err != nil {
+		return LocalWork{}, fmt.Errorf("read lane work of repo %q: %w", repoID, err)
+	}
+	return w, nil
+}
+
 // TryBeginPush is TryBeginSync on the push_* lane (issue #90): row-locked
 // read-check-write on the database clock, expired leases stolen atomically.
 // No legacy adoption exists here — push claims only ever come from

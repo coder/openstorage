@@ -139,9 +139,9 @@ func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
 
 // TestRiverPushCompletionRescuesStrandedMirrorBack (Codex round 6 on #90):
 // RunPush marks the mirror-back durable (RequestSync) before its direct
-// enqueue, but pg has no boot scan of pending markers — if that direct
-// insert fails while no pull is in flight, only the push job's
-// transactional completion can give the marker a vehicle. The push runner
+// enqueue. If that direct insert fails while no pull is in flight, the
+// push job's transactional completion gives the marker a vehicle at once
+// (the lane scan would only after minutes). The push runner
 // below mimics exactly that shape: successful forward, marker set, no
 // direct enqueue.
 func TestRiverPushCompletionRescuesStrandedMirrorBack(t *testing.T) {
