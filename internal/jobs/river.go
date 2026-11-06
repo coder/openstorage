@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -435,6 +436,10 @@ func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) err
 type sweepWorker struct {
 	river.WorkerDefaults[sweepArgs]
 	schedule *SweepSchedule
+	// running holds the pass that Work started until that pass really ends,
+	// also after Work gave up on it: a tick that finds it held does nothing,
+	// so abandoned passes never pile up in one process.
+	running atomic.Bool
 }
 
 func (*sweepWorker) Timeout(*river.Job[sweepArgs]) time.Duration { return sweepRescueAfter }
@@ -443,6 +448,14 @@ func (*sweepWorker) Timeout(*river.Job[sweepArgs]) time.Duration { return sweepR
 // the sweep to wind down before it returns anyway.
 const sweepReturnGrace = 2 * time.Second
 
+// sweepOutcome is what the pass's goroutine hands back to Work: its result, or
+// the value it panicked with.
+type sweepOutcome struct {
+	err      error
+	panicked bool
+	panicVal any
+}
+
 // Work returns at most sweepReturnGrace after its job context ends, even when
 // the sweep is still in a safeDelete recovery step. That step runs detached
 // from the job context for up to sweepRecoveryTimeout, and while Work waited
@@ -450,22 +463,47 @@ const sweepReturnGrace = 2 * time.Second
 // exited, and the next process's sweep deduplicated against the orphaned row
 // until River rescued it. The detached step goes on without the row. If the
 // process ends first, that is a sweeper crash, and the next sweep heals.
+//
+// The pass runs in its own goroutine, outside River's recovery boundary, so a
+// panic in it is caught there and raised again in Work's goroutine, where
+// River records it as a failed attempt. A pass that Work abandoned keeps
+// running until it ends, and a tick that arrives meanwhile does nothing.
 func (w *sweepWorker) Work(ctx context.Context, _ *river.Job[sweepArgs]) error {
 	if w.schedule == nil {
 		return errScheduleOff
 	}
-	done := make(chan error, 1)
-	go func() { done <- w.schedule.runOnce(ctx, passJobTimeout, sweepPurgeTimeout) }()
+	if !w.running.CompareAndSwap(false, true) {
+		w.schedule.Sweeper.logger.Warn("orphan pack sweep: a pass from an earlier job is still running on this replica; this job does nothing")
+		return nil
+	}
+	done := make(chan sweepOutcome, 1)
+	go func() {
+		var out sweepOutcome
+		defer func() {
+			if v := recover(); v != nil {
+				out = sweepOutcome{panicked: true, panicVal: v}
+			}
+			w.running.Store(false)
+			done <- out
+		}()
+		out.err = w.schedule.runOnce(ctx, passJobTimeout, sweepPurgeTimeout)
+	}()
+	finish := func(out sweepOutcome) error {
+		if out.panicked {
+			panic(out.panicVal)
+		}
+		return out.err
+	}
 	select {
-	case err := <-done:
-		return err
+	case out := <-done:
+		return finish(out)
 	case <-ctx.Done():
 	}
 	grace := time.NewTimer(sweepReturnGrace)
 	defer grace.Stop()
 	select {
-	case err := <-done:
-		return err
+	case out := <-done:
+		return finish(out)
 	case <-grace.C:
 		return fmt.Errorf("jobs: sweep still recovering %v after its job ended: %w", sweepReturnGrace, context.Cause(ctx))
 	}
