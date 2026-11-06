@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -67,6 +70,10 @@ func hookEventingEnv(t *testing.T, metaURL string) *bytes.Buffer {
 	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
 	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	// A caller whose token may forward: the hook records intent for it.
+	t.Setenv(githttp.EnvScopes, `["git:read","git:write"]`)
+	t.Setenv(githttp.EnvRefsPolicy, "")
+	t.Setenv(githttp.EnvOps, "")
 	original := githttp.WrapHookRefStore
 	t.Cleanup(func() { githttp.WrapHookRefStore = original })
 	return new(bytes.Buffer)
@@ -84,23 +91,6 @@ func hookRefStore(t *testing.T) ref.RefStore {
 		t.Fatal(err)
 	}
 	return rs
-}
-
-// assertHookAccepts proves today's fail-open behavior: the update wins its
-// CAS, and the authority holds the new value.
-func assertHookAccepts(t *testing.T, ctx context.Context, rs ref.RefStore) {
-	t.Helper()
-	wrapped, err := githttp.WrapHookRefStore(ctx, rs)
-	if err != nil {
-		t.Fatalf("hook refused the update: %v", err)
-	}
-	sha := strings.Repeat("a", 40)
-	if won, err := wrapped.CASRef(ctx, "repo-1", "refs/heads/main", ref.ZeroSHA, sha); err != nil || !won {
-		t.Fatalf("CAS = %v, %v; want accepted", won, err)
-	}
-	if got, err := rs.GetRef(ctx, "repo-1", "refs/heads/main"); err != nil || got != sha {
-		t.Fatalf("authority ref = %q, %v; want %s", got, err, sha)
-	}
 }
 
 // Issues #445 and #466: a v2 hook on a v1 bucket (binary replaced under an
@@ -154,104 +144,225 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 }
 
 // On the local schedule a hook that cannot read the metadata document
-// refuses the update before its CAS: the format check fails open (issues
-// #445, #466), but the push's forward intent must be in the row before the
-// CAS (ADR-50 amendment), and without the document the hook cannot tell
-// whether the repository forwards. The bucket sees no write.
+// refuses an update that would record forward intent before its CAS: the
+// format check fails open (issues #445, #466), but the push's forward intent
+// must be in the row before the CAS (ADR-50 amendment), and without the
+// document the hook cannot tell whether the repository forwards. A caller
+// whose token may not forward records no intent, and its update goes
+// through. The bucket sees no write, and neither the hook's log nor the
+// refusal names the bucket's endpoint: both reach the pusher.
 func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
-	fake := &fakeMetaS3{down: true}
-	srv := httptest.NewServer(fake)
-	defer srv.Close()
-	logs := hookEventingEnv(t, "s3wal://b?endpoint="+srv.URL)
-	cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
-	defer cleanup()
-	rs := hookRefStore(t)
-	wrapped, err := githttp.WrapHookRefStore(t.Context(), rs)
-	if err != nil {
-		t.Fatalf("format check did not fail open: %v", err)
-	}
-	if !strings.Contains(logs.String(), "metadata format check failed") {
-		t.Fatalf("missing fail-open log: %s", logs)
-	}
-	won, err := wrapped.CASRef(t.Context(), "repo-1", "refs/heads/main", ref.ZeroSHA, strings.Repeat("a", 40))
-	if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update") {
-		t.Fatalf("CAS = %v, %v; want the update refused before its CAS", won, err)
-	}
-	if got, err := rs.GetRef(t.Context(), "repo-1", "refs/heads/main"); !errors.Is(err, ref.ErrNotFound) {
-		t.Fatalf("authority ref = %q, %v; want unset", got, err)
-	}
-	if n := fake.writes.Load(); n != 0 {
-		t.Fatalf("the hook sent %d write requests to the bucket; want none", n)
-	}
-}
-
-// A local-schedule metadata store the hook cannot open refuses every update
-// that would record forward intent, because the intent before the CAS needs
-// the store. Updates that record no intent keep failing open, as on main:
-// ephemeral updates, and a sync run's own loopback push (its claim fence
-// refuses it when the store is down).
-func TestHookEventingRefusesUnopenableLocalSchedule(t *testing.T) {
-	sha := strings.Repeat("a", 40)
 	for _, tc := range []struct {
-		name, repo, ref, claim string
-		refused                bool
+		name, scopes string
+		unresolvable bool // the endpoint's host does not resolve: its error names the host
+		refused      bool
 	}{
-		{name: "persistent", repo: "repo-1", ref: "refs/heads/main", refused: true},
-		{name: "ephemeral key", repo: "repo-1+ephemeral", ref: "refs/heads/main"},
-		{name: "ephemeral namespace", repo: "repo-1", ref: "refs/namespaces/ephemeral/refs/heads/main"},
-		{name: "sync loopback", repo: "repo-1", ref: "refs/heads/main", claim: "holder"},
+		{name: "may forward", refused: true},
+		{name: "write-only token", scopes: `["git:write"]`},
+		{name: "unresolvable endpoint", unresolvable: true, refused: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			notADir := filepath.Join(t.TempDir(), "file")
-			if err := os.WriteFile(notADir, nil, 0o600); err != nil {
-				t.Fatal(err)
+			fake := &fakeMetaS3{down: true}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+			endpoint := srv.URL
+			if tc.unresolvable {
+				endpoint = "http://canary-s3-" + strings.ToLower(rand.Text()[:8]) + ".invalid"
 			}
-			logs := hookEventingEnv(t, "sqlite://"+filepath.Join(notADir, "meta.db"))
-			t.Setenv(githttp.EnvSyncClaim, tc.claim)
+			logs := hookEventingEnv(t, "s3wal://b?endpoint="+endpoint)
+			if tc.scopes != "" {
+				t.Setenv(githttp.EnvScopes, tc.scopes)
+			}
 			cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
 			defer cleanup()
 			rs := hookRefStore(t)
 			wrapped, err := githttp.WrapHookRefStore(t.Context(), rs)
 			if err != nil {
-				t.Fatalf("WrapHookRefStore: %v", err)
+				t.Fatalf("format check did not fail open: %v", err)
 			}
-			won, _, err := wrapped.CASRefGen(t.Context(), tc.repo, tc.ref, ref.ZeroSHA, sha)
-			got, gerr := rs.GetRef(t.Context(), tc.repo, tc.ref)
+			if !strings.Contains(logs.String(), "metadata format check failed") {
+				t.Fatalf("missing fail-open log: %s", logs)
+			}
+			won, err := wrapped.CASRef(t.Context(), "repo-1", "refs/heads/main", ref.ZeroSHA, strings.Repeat("a", 40))
+			got, gerr := rs.GetRef(t.Context(), "repo-1", "refs/heads/main")
 			if tc.refused {
-				if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update: open metadata store") || !errors.Is(gerr, ref.ErrNotFound) {
+				if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook could not record the forward intent; push again later") || !errors.Is(gerr, ref.ErrNotFound) {
 					t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update refused before its CAS", won, err, got, gerr)
 				}
-				if !strings.Contains(logs.String(), "hook refuses ref updates: open meta store") {
+				if !strings.Contains(logs.String(), "hook refuses ref updates: record forward intent") {
 					t.Fatalf("missing refusal log: %s", logs)
 				}
-				return
-			}
-			if !won || err != nil || got != sha {
+			} else if !won || err != nil || gerr != nil {
 				t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update accepted (it records no intent)", won, err, got, gerr)
+			}
+			seen := logs.String()
+			if err != nil {
+				seen += err.Error()
+			}
+			if n := strings.Count(seen, strings.TrimPrefix(endpoint, "http://")); n != 0 {
+				t.Fatalf("the pusher's output names the bucket endpoint %d times", n)
+			}
+			if n := fake.writes.Load(); n != 0 {
+				t.Fatalf("the hook sent %d write requests to the bucket; want none", n)
 			}
 		})
 	}
 }
 
-// A PostgreSQL metadata store the hook cannot reach keeps today's
-// fail-open behavior (issues #445, #466): the push is accepted without
-// events, because the ref store would fail too if the store were truly
-// down. River schedules PostgreSQL forwards; the intent before the CAS
-// belongs to the local schedule.
-func TestHookEventingFailsOpenOnTransientMetaErrors(t *testing.T) {
-	t.Run("open fails", func(t *testing.T) {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
+// commitThenEOF commits each create or update and then reports an EOF, as a
+// store whose connection drops after the commit does. Deletes pass through:
+// ref.IdempotentCAS never recovers a delete.
+type commitThenEOF struct{ ref.RefStore }
+
+func (s commitThenEOF) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
+	if err != nil || new == ref.ZeroSHA {
+		return won, err
+	}
+	return false, io.ErrUnexpectedEOF
+}
+
+func (s commitThenEOF) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
+	if err != nil || new == ref.ZeroSHA {
+		return won, gen, err
+	}
+	return false, 0, io.ErrUnexpectedEOF
+}
+
+// A hook that cannot wire its eventing refuses every update that would
+// record forward intent, on PostgreSQL and on the local schedule: branch and
+// tag creations, updates and deletes. The eventless default would accept
+// them with no intent and no events, and a failed step does not prove that
+// the CAS fails too (the database can be back by then). Updates that record
+// no intent keep failing open: ephemeral updates, a sync run's own loopback
+// push, and a caller whose token may not forward. Every update that goes
+// through keeps ref.IdempotentCAS, so a create or update that commits and
+// then reports an EOF still wins, through CASRef and CASRefGen. Neither the
+// log nor the refusal names the store: both reach the pusher.
+func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
+	a, b := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	pgCanary := map[string]string{
+		"user": "canary_user_" + rand.Text()[:8], "password": "canary_pass_" + rand.Text()[:8],
+		"host": "canary-host-" + strings.ToLower(rand.Text()[:8]) + ".invalid", "database": "canary_db_" + rand.Text()[:8],
+	}
+	pgURL := "postgres://" + pgCanary["user"] + ":" + pgCanary["password"] + "@" + pgCanary["host"] + ":5432/" + pgCanary["database"] + "?connect_timeout=2"
+	type shape struct {
+		name, mode, scopes, repo, ref, claim string
+		refusing, refused                    bool
+	}
+	shapes := []shape{
+		{name: "branch", repo: "repo-1", ref: "refs/heads/main", refusing: true, refused: true},
+		{name: "tag", repo: "repo-1", ref: "refs/tags/v1", refusing: true, refused: true},
+		{name: "secrets config invalid", mode: "bogus", repo: "repo-1", ref: "refs/heads/main", refusing: true, refused: true},
+		{name: "ephemeral namespace", repo: "repo-1", ref: "refs/namespaces/ephemeral/refs/heads/main", refusing: true},
+		{name: "ephemeral key", repo: "repo-1+ephemeral", ref: "refs/heads/main", refusing: true},
+		{name: "sync loopback", repo: "repo-1", ref: "refs/heads/main", claim: "holder"},
+		{name: "write-only token", scopes: `["git:write"]`, repo: "repo-1", ref: "refs/heads/main"},
+	}
+	ops := []struct {
+		name            string
+		seed, old, new_ string // seed is the ref's value before the CAS ("" for none)
+	}{
+		{name: "create", old: ref.ZeroSHA, new_: a},
+		{name: "update", seed: a, old: a, new_: b},
+		{name: "delete", seed: a, old: a, new_: ref.ZeroSHA},
+	}
+	for _, backend := range []string{"pg", "sqlite"} {
+		for _, tc := range shapes {
+			t.Run(backend+"/"+tc.name, func(t *testing.T) {
+				metaURL, canary := pgURL, pgCanary
+				if backend == "sqlite" {
+					dir := filepath.Join(t.TempDir(), "canary-path-"+strings.ToLower(rand.Text()[:8]))
+					if err := os.WriteFile(dir, nil, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					metaURL, canary = "sqlite://"+filepath.Join(dir, "meta.db"), map[string]string{"path": filepath.Base(dir)}
+				}
+				// Control: the open error names the canary.
+				if _, err := meta.Open(t.Context(), metaURL); err == nil {
+					t.Fatalf("meta.Open(%s) succeeded; want it to fail", backend)
+				} else {
+					for part, v := range canary {
+						if part != "password" && !strings.Contains(err.Error(), v) {
+							t.Fatalf("meta.Open's error does not name the canary %s, so the absence check below proves nothing: %v", part, err)
+						}
+					}
+				}
+				logs := hookEventingEnv(t, metaURL)
+				t.Setenv(envSecretsMode, tc.mode)
+				t.Setenv(githttp.EnvSyncClaim, tc.claim)
+				if tc.scopes != "" {
+					t.Setenv(githttp.EnvScopes, tc.scopes)
+				}
+				cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+				defer cleanup()
+				rs := hookRefStore(t)
+				wrapped, err := githttp.WrapHookRefStore(t.Context(), commitThenEOF{rs})
+				if err != nil {
+					t.Fatalf("WrapHookRefStore: %v", err)
+				}
+				stage := "open meta store"
+				if tc.mode != "" {
+					stage = "secrets key"
+				}
+				wantLog := "hook eventing disabled: " + stage
+				if tc.refusing {
+					wantLog = "hook eventing unavailable: " + stage + "; refusing only updates that would record forward intent"
+				}
+				if !strings.Contains(logs.String(), wantLog) {
+					t.Fatalf("missing %q log: %s", wantLog, logs)
+				}
+				seen := logs.String()
+				for _, op := range ops {
+					for i, cas := range []func(name string) (bool, error){
+						func(name string) (bool, error) { return wrapped.CASRef(t.Context(), tc.repo, name, op.old, op.new_) },
+						func(name string) (bool, error) {
+							won, _, err := wrapped.CASRefGen(t.Context(), tc.repo, name, op.old, op.new_)
+							return won, err
+						},
+					} {
+						name := fmt.Sprintf("%s-%s-%d", tc.ref, op.name, i)
+						if op.seed != "" {
+							if won, err := rs.CASRef(t.Context(), tc.repo, name, ref.ZeroSHA, op.seed); err != nil || !won {
+								t.Fatalf("seed %s: %v, %v", name, won, err)
+							}
+						}
+						won, err := cas(name)
+						got, gerr := rs.GetRef(t.Context(), tc.repo, name)
+						if err != nil {
+							seen += err.Error()
+						}
+						if tc.refused {
+							before := op.seed
+							if before == "" {
+								before = "absent"
+							}
+							if got == "" && errors.Is(gerr, ref.ErrNotFound) {
+								got = "absent"
+							}
+							if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+"); push again later") || got != before {
+								t.Fatalf("%s %d = (%v, %v), authority = %q; want the update refused before its CAS, authority %s", op.name, i, won, err, got, before)
+							}
+							continue
+						}
+						want := op.new_
+						if want == ref.ZeroSHA {
+							if won && err == nil && errors.Is(gerr, ref.ErrNotFound) {
+								continue
+							}
+						} else if won && err == nil && got == want {
+							continue
+						}
+						t.Fatalf("%s %d = (%v, %v), authority = (%q, %v); want the update accepted (it records no intent), a lost commit reply recovered", op.name, i, won, err, got, gerr)
+					}
+				}
+				for part, v := range canary {
+					if n := strings.Count(seen, v); n != 0 {
+						t.Fatalf("the pusher's output names the canary %s %d times", part, n)
+					}
+				}
+			})
 		}
-		addr := l.Addr().String()
-		_ = l.Close() // nothing listens: the open's ping is refused
-		logs := hookEventingEnv(t, "postgres://u:p@"+addr+"/db?connect_timeout=5")
-		cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
-		defer cleanup()
-		assertHookAccepts(t, t.Context(), hookRefStore(t))
-		if !strings.Contains(logs.String(), "hook eventing disabled: open meta store") {
-			t.Fatalf("missing fail-open log: %s", logs)
-		}
-	})
+	}
 }

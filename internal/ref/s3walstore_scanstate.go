@@ -329,6 +329,23 @@ func (s *S3WAL) PutJobScanState(ctx context.Context, job, scope, payload string,
 	return s.scanPut(ctx, job, scope, payload, generation)
 }
 
+// PutJobScanStateIf — see ScanStateStore. The generation check and the write
+// share one read-modify-write on the side object, so the check holds at the
+// write.
+func (s *S3WAL) PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error {
+	assertf(job != "" && scope != "", "PutJobScanStateIf(%q, %q)", job, scope)
+	return s.scanMutate(ctx, "put scan state if", job, scope, func(prev *s3walScanRow, _ time.Time) (*s3walScanRow, error) {
+		current := int64(0)
+		if prev != nil {
+			current = prev.Generation
+		}
+		if current != expectGeneration {
+			return nil, ErrScanStateConflict
+		}
+		return &s3walScanRow{Payload: payload, Generation: generation}, nil
+	})
+}
+
 // DeleteJobScanState — see ScanStateStore.
 func (s *S3WAL) DeleteJobScanState(ctx context.Context, job, scope string) error {
 	assertf(job != "" && scope != "", "DeleteJobScanState(%q, %q)", job, scope)
