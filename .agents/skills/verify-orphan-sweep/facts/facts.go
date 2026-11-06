@@ -657,14 +657,58 @@ func fencedSQL(s *source, f *ast.FuncDecl, lock, lockArg, fence, exec, stmt stri
 			break
 		}
 	}
-	ret := token.NoPos
+	ret := fenceReturn(s, f, fence, fp, lp)
+	return fp.IsValid() && lp.IsValid() && ret.IsValid() && writesAfter(cs, exec, stmt, ret)
+}
+
+// fenceReturn returns the position of the if in f that returns
+// ErrRepoPurged when the first result of the fence call at fp is true, or
+// token.NoPos. The condition must be that result alone: `false && fenced`
+// or `fenced && other` do not count. The lock call at lp, the fence call
+// and the if must sit in the same func literal (the transaction closure),
+// or all outside any.
+func fenceReturn(s *source, f *ast.FuncDecl, fence string, fp, lp token.Pos) token.Pos {
+	if !fp.IsValid() || !lp.IsValid() {
+		return token.NoPos
+	}
+	name := ""
+	ast.Inspect(f.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 || len(as.Lhs) == 0 {
+			return true
+		}
+		if c, ok := as.Rhs[0].(*ast.CallExpr); ok && c.Pos() == fp && s.text(c.Fun) == fence {
+			if id, ok := as.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
+				name = id.Name
+			}
+		}
+		return true
+	})
+	if name == "" {
+		return token.NoPos
+	}
+	scope := litOf(f.Body, fp)
+	if litOf(f.Body, lp) != scope {
+		return token.NoPos
+	}
 	for _, i := range s.ifs(f.Body) {
-		if i.returns && strings.Contains(i.body, "ErrRepoPurged") && i.stmt.Pos() > fp {
-			ret = i.stmt.Pos()
-			break
+		if i.cond == name && i.returns && strings.Contains(i.body, "ErrRepoPurged") && i.stmt.Pos() > fp && litOf(f.Body, i.stmt.Pos()) == scope {
+			return i.stmt.Pos()
 		}
 	}
-	return fp.IsValid() && lp.IsValid() && ret.IsValid() && writesAfter(cs, exec, stmt, ret)
+	return token.NoPos
+}
+
+// litOf returns the innermost func literal in n that contains pos, or nil.
+func litOf(n ast.Node, pos token.Pos) *ast.FuncLit {
+	var out *ast.FuncLit
+	ast.Inspect(n, func(m ast.Node) bool {
+		if l, ok := m.(*ast.FuncLit); ok && l.Pos() <= pos && pos < l.End() {
+			out = l
+		}
+		return true
+	})
+	return out
 }
 
 // mutateFn returns the fn closure of the s.mutate call on the base
@@ -731,10 +775,10 @@ func fencedFold(s *source, f *ast.FuncDecl, lock, lockArg, fence string, pg bool
 		return false
 	}
 	fp := cs[fi].pos
-	locked, ret, inTx := false, false, false
+	lp, inTx := token.NoPos, false
 	for _, c := range cs {
-		if (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp && (lockArg == "" || hasArg(c, lockArg)) {
-			locked = true
+		if !lp.IsValid() && (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp && (lockArg == "" || hasArg(c, lockArg)) {
+			lp = c.pos
 		}
 		if !pg && c.fun == "tx.Commit" && c.pos > fp {
 			inTx = true
@@ -743,12 +787,7 @@ func fencedFold(s *source, f *ast.FuncDecl, lock, lockArg, fence string, pg bool
 	if pg {
 		inTx = cs[fi].inClose && first(cs, "pgx.BeginFunc", "", false).IsValid()
 	}
-	for _, i := range s.ifs(f.Body) {
-		if i.returns && strings.Contains(i.body, "ErrRepoPurged") && i.stmt.Pos() > fp {
-			ret = true
-		}
-	}
-	return locked && ret && inTx
+	return fenceReturn(s, f, fence, fp, lp).IsValid() && inTx
 }
 
 // gateBeforeWrites reports that fn's closure has an if on cond that

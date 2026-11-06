@@ -44,7 +44,7 @@ OUT=$(mktemp -d "${TMPDIR:-/tmp}/orphan-sweep-check.XXXXXX")
 ```
 
 - Needs Go (the `go.mod` version), Java 11 or newer, and `curl`. The first run downloads `tla2tools.jar` 1.7.4 (sha256-pinned) into `${XDG_CACHE_HOME:-$HOME/.cache}/openstorage-tla`. Set `JAVA`, `GO`, or `OPENSTORAGE_TLA_CACHE` to override.
-- With the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), it took 4 to 19 minutes in five full runs on a shared host with a 32-CPU quota. The spread comes from other load on the host: each run explored the same states. No single config took more than 6 minutes. The five `Purge*.cfg` configs took a third to a half of the total.
+- With the default 4 TLC workers (`TLC_WORKERS`) and a 4 GB heap (`TLC_HEAP`), it took 4 to 19 minutes in five full runs on a shared host with a 32-CPU quota. The spread comes from other load on the host: each run explored the same states. No single config took more than 6 minutes. The six `Purge*.cfg` configs took a third to a half of the total.
 - `--out` keeps every TLC output, the generated configs, and trace summaries. It must be a new or empty directory. Without it, check.sh makes a temporary directory and prints its path. With `--fingerprints-only` and no `--out`, check.sh deletes that directory on exit.
 - `--only <cfg>` runs one config, for example `--only NoTiming.cfg` or `--only PurgeSafety.cfg`. It is for quick iteration. Finish with a full run.
 - `--fingerprints-only` checks the code facts and the fingerprints without TLC or Java, in about a second. CI runs it in the `orphan-sweep-fingerprints` job of `.github/workflows/ci.yml`, so a change to covered code fails CI until someone brings the model in line and runs `check.sh --record`. CI does not run TLC: a pass says that the covered code is the code the model was checked against, not that the properties hold.
@@ -66,6 +66,7 @@ A clean run ends like this:
    NoThresholdAssumption.cfg   fails as expected (trace: ...)
    SlowHealEntry.cfg           fails as expected (trace: ...)
    PurgeReach.cfg              fails as expected (trace: ...)
+   PurgeCliReach.cfg           fails as expected (trace: ...)
 == Coverage (sync commit b5897891...)
    every covered function matches model/fingerprints.txt
 RESULT: PASS
@@ -108,9 +109,9 @@ The models (`model/PackSweep.tla` and `model/RepoPurge.tla`) are hand-written de
    | `CursorWraps` | `PurgeExpired` resets `p.cursor` and lists again when the batch is empty and the cursor is not | `PurgeCompletes` |
    | `FenceFirst` | `purgeRepo` calls `FenceRepoPurge` before `DropRepoRefs`, `RetireRepoPacks` and `reapPrefix`, and returns when it fails | `NoDanglingRow` |
    | `RefsDieFirst` | `purgeRepo` calls `DropRepoRefs` before `RetireRepoPacks` and `reapPrefix`, and returns when it fails | `NoDanglingRow` |
-   | `RegistrationsFenced` | `RegisterPacks` and the LFS registration read the fence in their own transaction, before every write, and return `ErrRepoPurged`: PG (`lockBaseLedger(ctx, tx, baseRepoOf(repo))`, then `repoPurgeFencedPG` on `tx`; the LFS registration locks `repo`, see [Scope](#repopurge); `FenceRepoPurge` takes the same lock), SQLite (`repoPurgeFencedSQLite` on `tx`, in a transaction of a database opened with `_txlock=immediate`), S3WAL (`m.PurgedAt != nil` first in the mutation of the base manifest, where `FenceRepoPurge` sets it) | `StampedClean`, `NoDanglingRow` |
-   | `RefWritesFenced` | `casRef` reads the fence the same way on PG, SQLite and S3WAL | `NoDanglingRow` |
-   | `FoldsFenced` | `ReplacePacks` reads the fence in its own transaction and returns `ErrRepoPurged`: PG (`lockBaseLedger(ctx, tx, baseRepoOf(repo))`, then `repoPurgeFencedPG` on `tx` in its `pgx.BeginFunc` closure), SQLite (`repoPurgeFencedSQLite` on `tx` after `BeginTx`, before `tx.Commit`), S3WAL (`m.PurgedAt != nil` in the mutation of the base manifest, before the mutation writes it). The old-row delete may come first: the `ErrRepoPurged` return rolls it back | `NoDanglingRow` |
+   | `RegistrationsFenced` | `RegisterPacks` and the LFS registration read the fence in their own transaction, before every write, and return `ErrRepoPurged`: PG (`lockBaseLedger(ctx, tx, baseRepoOf(repo))`, then `repoPurgeFencedPG` on `tx`; the LFS registration locks `repo`, see [Scope](#repopurge); `FenceRepoPurge` takes the same lock), SQLite (`repoPurgeFencedSQLite` on `tx`, in a transaction of a database opened with `_txlock=immediate`), S3WAL (`m.PurgedAt != nil` first in the mutation of the base manifest, where `FenceRepoPurge` sets it). The `if` that returns must test the fence call's first result alone (not `false && fenced`), in the same transaction closure as the lock. | `StampedClean`, `NoDanglingRow` |
+   | `RefWritesFenced` | `casRef` reads the fence the same way on PG, SQLite and S3WAL. The `if` that returns must test the fence call's first result alone (not `false && fenced`), in the same transaction closure as the lock. | `NoDanglingRow` |
+   | `FoldsFenced` | `ReplacePacks` reads the fence in its own transaction and returns `ErrRepoPurged`: PG (`lockBaseLedger(ctx, tx, baseRepoOf(repo))`, then `repoPurgeFencedPG` on `tx` in its `pgx.BeginFunc` closure), SQLite (`repoPurgeFencedSQLite` on `tx` after `BeginTx`, before `tx.Commit`), S3WAL (`m.PurgedAt != nil` in the mutation of the base manifest, before the mutation writes it). The old-row delete may come first: the `ErrRepoPurged` return rolls it back. The `if` that returns must test the fence call's first result alone (not `false && fenced`), in the same transaction closure as the lock. | `NoDanglingRow` |
    | `SweepReapsFenced` | `classify` sets `canDelete` from `PurgedRepoProbe` under `purgeMode`, before `safeDelete` | `PurgeCompletes` |
    | `HealPurgesFenced` | `sweep` passes `purgeMode` to `healQuarantine` as `purgeFenced`, and `healQuarantineEntry`'s gate lets `purgeFenced` alone through | `BackupsCollected` |
 
@@ -218,7 +219,7 @@ When check.sh says STALE, or when you change covered code on purpose:
 - `PurgeCompletes` and `BackupsCollected` need purge-aware sweeps that keep running (`OPENSTORAGE_SWEEP_INTERVAL` > 0) and a `DeleteGuard` that passes eventually. A writer can upload a blob after the purge's own reap (an upload precedes its fenced registration), and only a sweep, or a `purge-repo` rerun's `rescanPurged`, reaps it; only a sweep purges the quarantine backups.
 - No timing assumption of its own. Once the fence committed, nothing of the repository registers again, so the purge, the purge-aware sweeper and the heal can delete any of its blobs and backups whenever they reach them. A backup made before the fence is PackSweep's case, and the model makes none: a heal that read the registry before a registration landed, and purges the aged backup after the fence, needs PackSweep's two timing assumptions to fail (`NoThresholdAssumption.cfg`, `SlowHealEntry.cfg`). The user then sees a registered row without bytes in a soft-deleted repository until the purge retires that row.
 
-**Probes:** no timing probe, because no property needs a timing assumption. `PurgeReach.cfg` is a reachability probe: with `PurgeSafety.cfg`'s bounds it must reach `RaceUnreachable`'s state, where a push registered K and a repack folded into K before the fence, the purge retired both rows, and its reap is deleting K while both writers still hold their local files. If a model edit cuts any of those steps off, the probe passes, the safety configs may check nothing, and check.sh stops with STALE.
+**Probes:** no timing probe, because no property needs a timing assumption. `PurgeReach.cfg` is a reachability probe: with `PurgeSafety.cfg`'s bounds it must reach `RaceUnreachable`'s state, where a push registered K and a repack folded into K before the fence, the purge retired both rows, and its reap is deleting K while both writers still hold their local files. If a model edit cuts any of those steps off, the probe passes, the safety configs may check nothing, and check.sh stops with STALE. `PurgeCliReach.cfg` does the same for `purge-repo`: with `PurgeControl.cfg`'s bounds it must reach `CliUnreachable`'s state, where a `purge-repo` run stamps a repository that is old but not past the retention, which only `purge-repo` may purge. The CLI start has no fairness (an operator may never run it), so no liveness config can force it, and a CLI that cannot start or ends before its phases would leave `PurgeControl.cfg`, `PurgeSafety.cfg` and `PurgeLiveness.cfg` green.
 
 **Simplifications:** each one gives the model at least the behaviors of the code, or the same outcome:
 
@@ -288,6 +289,10 @@ These breaks cover the stricter fact checks, the base-key fingerprints, the reac
 | `packNamespaceSuffixes` without `"+import"` | fingerprint | STALE on `blob.go:var packNamespaceSuffixes` alone |
 | `strings.Cut(repo, "/")` in `baseOf` | fingerprint | STALE on `sweep.go:baseOf` alone |
 | `if false` in place of the `if !purgeAll` around `healQuarantineEntry`'s `PurgedRepoProbe` read | none: every fact stays TRUE | `TestSweep_ListOnlyRollbackPreservesOrphanBackups` ("list-only rollback destroyed an ordinary orphan's backup"), and the `healQuarantineEntry` fingerprint changes |
+| `P(p, Rest(p))` in place of `P(p, StateRead(p))` in the CLI branch of `PurgerStart`, in the model | `PurgeCliReach.cfg` | the probe passes and check.sh exits 2, while `PurgeControl.cfg` and `PurgeLiveness.cfg` still pass |
+| `else if false && fenced` in PG `RegisterPacks`, and `else if fenced && repo != ""` in SQLite `RegisterPacks` | `RegistrationsFenced` | the fact turns FALSE (`facts.go` alone; the check before the fence-return tightening kept it TRUE) |
+| `else if false && fenced` in PG `ReplacePacks`, and its fence read in a second `pgx.BeginFunc` | `FoldsFenced` | the fact turns FALSE (`facts.go` alone; the earlier check kept it TRUE) |
+| `if purged && name == ""` in PG `casRef`, and `if false && purged` in SQLite `casRef` | `RefWritesFenced` | the fact turns FALSE (`facts.go` alone; the earlier check kept it TRUE) |
 
 A worked example of a moved guard: moving `safeDelete`'s `s.registered(rctx, repo, key)` above the delete turns `RecheckAfterDelete` FALSE, and `NoTiming.cfg` fails. Its first trace (the write registers before the sweeper's copy) does not replay, because the moved read still sees that registration. With the read modeled before the delete, TLC finds the real path: the read sees "unregistered", the write registers and verifies, and then the delete removes the bytes of a committed pack.
 
@@ -321,7 +326,7 @@ Sync commit: `d7896ef4488ced6c2238f100f4ecea38cfb0a687` (the last commit at whic
 | `model/NoThresholdAssumption.cfg`, `SlowHealEntry.cfg` | Its probes; each must fail `NoLostPack`. |
 | `model/RepoPurge.tla` | The purge model. |
 | `model/PurgeControl.cfg`, `PurgeSafety.cfg`, `PurgeLiveness.cfg`, `PurgeQuarantine.cfg` | Its property configs; each must pass. |
-| `model/PurgeReach.cfg` | Its reachability probe; it must fail `RaceUnreachable`. |
+| `model/PurgeReach.cfg`, `PurgeCliReach.cfg` | Its reachability probes; they must fail `RaceUnreachable` and `CliUnreachable`. |
 | `model/view.mjs` | State and step labels for the pstack `/statechart` skill (optional; not part of this repo). |
 | `model/fingerprints.txt` | Fingerprints at the sync commit. |
 

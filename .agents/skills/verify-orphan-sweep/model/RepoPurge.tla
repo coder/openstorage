@@ -689,6 +689,16 @@ RaceUnreachable ==
         /\ fenced /\ ~registered
         /\ pc[p] = "sd_delete"
 
+\* The purge-repo path, which PurgeCliReach.cfg must reach (TLC reports this
+\* invariant violated): a purge-repo run, not the background pass, gets to
+\* the stamp of a repository that is old but not past the retention, which
+\* only purge-repo may purge. A CLI that cannot start, or ends before its
+\* phases, leaves every other config green, because the CLI start has no
+\* fairness (an operator may never run it). The probe then passes and
+\* check.sh stops with STALE.
+CliUnreachable ==
+    ~\E p \in Purgers \ BgPurgers : pc[p] = "stamp" /\ repo = "old"
+
 PurgeSymmetry == Permutations(Writers) \cup Permutations(Nonces)
 
 \* Safety configs fingerprint states through this view. It drops values
