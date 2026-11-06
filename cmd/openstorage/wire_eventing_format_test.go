@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -402,6 +403,28 @@ func TestSlogForHookKeepsErrorsOffStderr(t *testing.T) {
 	var stderr bytes.Buffer
 	slogForHook(&stderr).Error("hook eventing unavailable: open meta store", "err", errors.New("dial "+canary))
 	if !strings.Contains(stderr.String(), "hook eventing unavailable: open meta store") || strings.Contains(stderr.String(), canary) {
+		t.Fatalf("stderr = %q; want the message without the canary", stderr.String())
+	}
+	if n := strings.Count(hookErrorRecords(t), canary); n != 1 {
+		t.Fatalf("the hook-errors file names the canary %d times, want 1", n)
+	}
+}
+
+// The hook process's default logger is the hook's logger, so a store
+// package's own slog line keeps its error value off stderr.
+func TestSetupHookLoggingCoversTheDefaultLogger(t *testing.T) {
+	hookEventingEnv(t, "")
+	prev, prevOut, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	canary := "canary-" + rand.Text()
+	var stderr bytes.Buffer
+	setupHookLogging(&stderr)
+	slog.Warn("s3wal delete lease clear failed; lease will expire on its window", "err", errors.New("dial "+canary))
+	if !strings.Contains(stderr.String(), "s3wal delete lease clear failed") || strings.Contains(stderr.String(), canary) {
 		t.Fatalf("stderr = %q; want the message without the canary", stderr.String())
 	}
 	if n := strings.Count(hookErrorRecords(t), canary); n != 1 {

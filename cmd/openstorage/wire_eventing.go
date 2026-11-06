@@ -520,7 +520,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			return func() {}
 		}
 		logger.Error("hook eventing unavailable: "+stage+"; refusing only updates that could record forward intent", "err", err)
-		refusal := errors.New("refusing the ref update: hook eventing unavailable (" + stage + "); push again later")
+		refusal := githttp.Refuse(errors.New("refusing the ref update: hook eventing unavailable (" + stage + "); push again later"))
 		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
 			return intentlessRefStore{RefStore: ref.IdempotentCAS{RefStore: st}, refusal: refusal}, nil
 		}
@@ -647,7 +647,9 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			var fv *meta.FormatVersionError
 			var cd *meta.CorruptDocumentError
 			if errors.As(err, &fv) || errors.As(err, &cd) {
-				return nil, fmt.Errorf("refusing the ref update: %w", err)
+				// The format errors name the metadata document and the
+				// operator's next step, no store detail.
+				return nil, githttp.Refuse(fmt.Errorf("refusing the ref update: %w", err))
 			}
 			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
 		}
@@ -670,7 +672,7 @@ var newHookRiver = jobs.NewRiverInsertOnly
 
 // errHookIntent is BeforeCAS's refusal when the hook cannot record a push's
 // forward intent. events.RefStore prefixes "refusing the ref update".
-var errHookIntent = errors.New("hook could not record the forward intent; push again later")
+var errHookIntent = githttp.Refuse(errors.New("hook could not record the forward intent; push again later"))
 
 // quietBeforeCAS refuses with errHookIntent instead of beforeCAS's own
 // error, which can name the store: the pusher sees the refusal (see
@@ -753,4 +755,14 @@ func (h *hookUpstreamRow) GetRepoUpstream(ctx context.Context, repoID string) (m
 // hook-errors file.
 func slogForHook(stderr io.Writer) *slog.Logger {
 	return slog.New(githttp.NewHookLogHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// setupHookLogging builds the hook's logger (slogForHook) and makes it the
+// default, so the store packages' own slog lines, whose attributes can
+// carry a store error, and the log package reach the pusher without error
+// values too.
+func setupHookLogging(stderr io.Writer) *slog.Logger {
+	logger := slogForHook(stderr)
+	slog.SetDefault(logger)
+	return logger
 }
