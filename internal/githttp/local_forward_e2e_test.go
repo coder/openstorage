@@ -329,11 +329,12 @@ func holdPort(t *testing.T, addr *net.TCPAddr) {
 	if ip == nil {
 		t.Fatalf("holdPort: %v is not IPv4", addr)
 	}
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = unix.Close(fd) })
+	unix.CloseOnExec(fd) // SOCK_CLOEXEC is Linux-only
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
 		t.Fatal(err)
 	}
