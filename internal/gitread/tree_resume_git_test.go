@@ -578,20 +578,19 @@ func nestedTrees(t testing.TB, dir string, n int) []string {
 	return ids
 }
 
-// A folder without files that the walk met before is skipped, and the folders
-// nested in it still count: a chain of such folders past git's own limit is
-// an error for the stream, so it is for the page. Each of the three chains
-// holds the one before it below its first 1023 folders, so the walk reads
-// none of them deeper than its own limit. With a limit of 1 the stream stops
-// before it reads that far, and so does the page. The limit of 1000 gives the
-// walk enough reads to get there.
+// A chain of folders without files past git's own limit is an error for the
+// stream, so it is for the page. Each of the three chains holds the one before
+// it below its first 700 folders, so no chain is deeper than git's limit
+// alone, and all three are. With a limit of 1 the stream stops before it
+// reads that far, and so does the page.
 func TestLsTreePageCursorOnNestedEmptyFolders(t *testing.T) {
+	const per = 700
 	dir := t.TempDir()
 	mustGit(t, dir, "init", "-q", "--bare", ".")
-	ids := nestedTrees(t, dir, 3*(maxWalkDepth-1)+1)
+	ids := nestedTrees(t, dir, 3*per+1)
 	var entries [][2]string
 	for i := 1; i <= 3; i++ {
-		entries = append(entries, [2]string{fmt.Sprintf("40000 e%d", i), ids[i*(maxWalkDepth-1)]})
+		entries = append(entries, [2]string{fmt.Sprintf("40000 e%d", i), ids[i*per]})
 	}
 	entries = append(entries, [2]string{"100644 z", "1"}, [2]string{"100644 zz", "2"})
 	commit := commitOf(t, dir, rawTree(t, dir, entries...))

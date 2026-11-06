@@ -79,8 +79,8 @@ var ErrUnsortedTree = errors.New("ls-tree listed entries out of order")
 // trees on the cursor's path and the ones after them (resumeTreePage,
 // #615), so a deep cursor costs the folders it reads, each read whole, and
 // not the listing before it. A tree that walk does not handle (see
-// errDeclined) is paged by the stream, which reads the listing from its
-// start up to the page.
+// errDeclined), and a walk whose git fails, are paged by the stream, which
+// reads the listing from its start up to the page.
 //
 // git prints a recursive listing of a well-formed tree in byte order of
 // the full paths. Only the page counts against the request's output
@@ -97,7 +97,11 @@ func LsTreePage(ctx context.Context, repoPath, commit, path, after string, limit
 	assertf(limit > 0, "LsTreePage: limit %d", limit)
 	if after != "" {
 		page, hasMore, found, err = resumeTreePage(ctx, repoPath, commit, path, after, limit)
-		if !errors.Is(err, errDeclined) {
+		if !leftToStream(ctx, err) {
+			var answered streamError
+			if errors.As(err, &answered) {
+				err = answered.error
+			}
 			return page, hasMore, found, err
 		}
 	}

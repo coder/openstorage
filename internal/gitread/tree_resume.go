@@ -11,6 +11,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // Resuming a recursive listing at its cursor (#615).
@@ -18,10 +20,11 @@ import (
 // git prints a recursive listing in byte order of the full paths, so the
 // entries after a cursor are, folder by folder along the cursor's path, the
 // later siblings of each path component, deepest folder first. resumeTreePage
-// reads just those trees through one `git cat-file --batch` child and
-// parses them itself: the trees before the cursor are never opened, and the
-// trees that hold the cursor are read once per pass, not once per entry
-// before it.
+// reads just those trees through one `git cat-file --batch` child, by object
+// id, and parses them itself: the trees before the cursor are never opened,
+// and the trees that hold the cursor are read once per pass, not once per
+// entry before it. A second child, `git cat-file --batch-check`, sizes the
+// files of the page.
 //
 // Within one tree (named n for a folder, relative cursor rest):
 //
@@ -36,7 +39,8 @@ import (
 // missing or unreadable there no longer fails a page that is not empty.
 // Anything else it does not handle returns errDeclined, and LsTreePage then
 // pages by streaming `ls-tree -r`, which reads every entry the walk would
-// skip and gives the same answer. A page past the end is the stream's.
+// skip and gives the same answer. A page past the end is the stream's. So is
+// the page when git fails for the walk (leftToStream), whatever the cause.
 
 // errDeclined: the walk met something it leaves to the streaming listing,
 // which then gives the answer, an error included:
@@ -47,8 +51,9 @@ import (
 //     not write, a name with a slash or longer than the read buffer, or
 //     entries out of order
 //   - a tree nested deeper than maxWalkDepth
-//   - more reads than openLimit, a level that takes more than maxWalkPasses,
-//     or more than maxWalkHeld to keep
+//   - more reads than openLimit, work that the stream would do for less
+//     (repays), a level that takes more than maxWalkPasses, or more than
+//     maxWalkHeld to keep
 //   - a blob that git cannot size
 //   - an output allowance too short for what the walk keeps or for the page
 //     (the stream then says which error comes first)
@@ -68,9 +73,12 @@ const (
 	// them whole with bufio's ReadSlice.
 	treeReadBuffer = 64 << 10
 	// maxWalkDepth bounds the recursion: a tree nested deeper is left to
-	// the stream. It is below git's default limit (core.maxTreeDepth, 2048),
-	// and a lower limit that an operator sets is not followed.
-	maxWalkDepth = 1024
+	// the stream. It is far below git's default limit (core.maxTreeDepth,
+	// 2048), and a lower limit that an operator sets is not followed. Each
+	// folder on the cursor's path is read twice and costs a round trip to
+	// git, about 50 to 300 microseconds, which the stream does not pay: past
+	// this depth the path alone costs more than a page of the stream.
+	maxWalkDepth = 128
 	// maxWalkPath bounds the path of a folder the walk enters: every level of
 	// the walk holds its own path, so memory grows with depth times path.
 	maxWalkPath = 16 << 10
@@ -86,6 +94,24 @@ const (
 	// of the entries buffered for the page and of the page. A level that does
 	// not fit is left to the stream. The output allowance bounds it too.
 	maxWalkHeld = 16 << 20
+	// The walk spends work that the stream would not, and goes on only when
+	// the stream costs more. The unit is an entry that the stream lists. The
+	// stream reads at least the entries before the cursor and the page, and
+	// the walk may spend walkFree (about 25 milliseconds) with no proof that
+	// the stream costs more.
+	//
+	//   - A folder that comes after the cursor costs a round trip to git,
+	//     walkFolderCost entries (33 microseconds against the 2 that git
+	//     needs for a folder of one file inside ls-tree). The walk takes a
+	//     sample of walkSample folders and projects from the entries they gave
+	//     the folders that the page still needs.
+	//   - The rest of a tree that the walk read the start of costs one entry
+	//     for every walkTailBytes bytes (7 nanoseconds a byte). A cursor near
+	//     the start of a folder of a million entries is cheaper for the stream.
+	walkSample     = 32
+	walkFolderCost = 20
+	walkTailBytes  = 250
+	walkFree       = 15_000
 	// maxWalkPasses bounds the reads of one tree: the walk reads a level
 	// again for the entries of folders without files, and each read sends
 	// the whole tree. A level that is still short after them is left to the
@@ -119,7 +145,10 @@ func resumeTreePage(ctx context.Context, repoPath, commit, path, after string, l
 			}
 		}()
 		w = &treeWalk{src: src, limit: limit, room: room}
-		err = w.run(commit, path, comps, rest)
+		var root string
+		if root, err = src.rootTree(commit); err == nil {
+			err = w.run(root, path, comps, rest)
+		}
 		closed = true
 		if cerr := src.close(err != nil); err == nil {
 			err = cerr
@@ -137,7 +166,11 @@ func resumeTreePage(ctx context.Context, repoPath, commit, path, after string, l
 		// the whole listing (a stale cursor: it is not on a page boundary
 		// of a listing that goes on). Its answer includes every error the
 		// listing has after the cursor, so that is the answer.
-		return streamTreePage(ctx, repoPath, commit, path, after, limit, budget)
+		page, hasMore, found, err = streamTreePage(ctx, repoPath, commit, path, after, limit, budget)
+		if err != nil {
+			err = streamError{err}
+		}
+		return page, hasMore, found, err
 	}
 	// The entry past the page needs its size too: ls-tree --long fails on
 	// a blob it cannot read, whether or not the entry is on the page.
@@ -155,6 +188,31 @@ func resumeTreePage(ctx context.Context, repoPath, commit, path, after string, l
 		return nil, false, false, errDeclined // the stream refuses the page
 	}
 	return page, hasMore, true, nil
+}
+
+// streamError is an error of the stream that resumeTreePage ran itself, for a
+// page that came out empty: the stream has answered, and nothing runs it again.
+type streamError struct{ error }
+
+func (e streamError) Unwrap() error { return e.error }
+
+// leftToStream reports whether the stream must answer, given the walk's
+// outcome err: the walk declined, or its own git failed, which includes a
+// heap cap (ErrMemoryLimit). The stream gives the answer that LsTreePage gave
+// before the walk, and it fails the same way when git cannot read the tree.
+// Outcomes of the request itself end it: the caller gave up, the time budget
+// ended, or no admission slot came free. The stream would meet them too.
+func leftToStream(ctx context.Context, err error) bool {
+	var answered streamError
+	switch {
+	case err == nil, errors.As(err, &answered):
+		return false
+	case errors.Is(err, errDeclined):
+		return true
+	case ctx.Err() != nil, errors.Is(err, ErrTimeBudget), errors.Is(err, ErrBusy):
+		return false
+	}
+	return true
 }
 
 // folderComponents splits path, "" or a folder with a trailing slash, into
@@ -236,7 +294,7 @@ func fillSizes(ctx context.Context, repoPath string, page []TreeEntry) error {
 
 // treeReader opens tree objects by object name.
 type treeReader interface {
-	// open returns the tree rev names: an object id, or commit^{tree}.
+	// open returns the tree that rev names, an object id.
 	open(rev string) (*treeBody, error)
 }
 
@@ -256,6 +314,12 @@ type treeWalk struct {
 	// empty holds the folders found to hold no file, by how many folders
 	// nest below each.
 	empty map[[20]byte]int
+	// folders counts the folders after the cursor that the walk read, the
+	// ones it found empty included.
+	folders int
+	// before counts the entries that sort before the cursor in the trees
+	// the walk scanned: the least entries the stream reads before the page.
+	before int
 }
 
 // openLimit bounds the trees a walk reads: the folders on the cursor's path,
@@ -266,12 +330,12 @@ func (w *treeWalk) openLimit() int { return 4*(w.limit+1) + 2*maxWalkDepth }
 
 func (w *treeWalk) full() bool { return len(w.page) > w.limit }
 
-// run lists the folder named by comps under commit's root tree after rest.
-func (w *treeWalk) run(commit, path string, comps []string, rest string) error {
+// run lists the folder named by comps under the tree root after rest.
+func (w *treeWalk) run(root, path string, comps []string, rest string) error {
 	if len(comps) > maxWalkDepth {
 		return errDeclined
 	}
-	rev := commit + "^{tree}"
+	rev := root
 	for _, name := range comps {
 		var err error
 		if rev, err = childTree(w.src, rev, name); err != nil {
@@ -347,6 +411,10 @@ func (w *treeWalk) use(prefix, rest string, sc treeScan, first bool, depth int) 
 			if len(prefix)+len(e.name)+1 > maxWalkPath {
 				return errDeclined
 			}
+			if w.folders == walkSample && !w.repaysTheFolders() {
+				return errDeclined
+			}
+			w.folders++
 			before, outer := len(w.page), w.deepest
 			w.deepest = depth + 1
 			if err := w.walk(hex.EncodeToString(e.oid[:]), prefix+e.name+"/", "", depth+1); err != nil {
@@ -364,6 +432,21 @@ func (w *treeWalk) use(prefix, rest string, sc treeScan, first bool, depth int) 
 		w.add(prefix, e)
 	}
 	return nil
+}
+
+// repays reports whether work of cost stream entries is worth the walk's
+// while: it is free up to walkFree, and then it must cost no more than the
+// stream reads before the cursor and for the page.
+func (w *treeWalk) repays(cost float64) bool {
+	return cost <= max(walkFree, float64(w.before+w.limit+1))
+}
+
+// repaysTheFolders projects, from the folders read so far, the folders the
+// rest of the page needs. A folder with no file counts for a fourth of an
+// entry.
+func (w *treeWalk) repaysTheFolders() bool {
+	perFolder := max(float64(len(w.page))/float64(w.folders), 0.25)
+	return w.repays(float64(w.limit+1-len(w.page)) / perFolder * walkFolderCost)
 }
 
 // add appends a file to the page. The entry past the limit is not charged:
@@ -442,8 +525,14 @@ func (w *treeWalk) scan(rev, prefix, rest string, skip, max int) (sc treeScan, e
 		switch classify(name, mode, rest) {
 		case entryCursor:
 			sc.cand, sc.hasCand = rawEntry{name: string(name), mode: mode, oid: oid}, true
+			if skip == 0 {
+				w.before++
+			}
 			continue
 		case entryBefore:
+			if skip == 0 { // not again in a later pass over the level
+				w.before++
+			}
 			continue
 		}
 		if seen++; seen <= skip {
@@ -464,6 +553,11 @@ func (w *treeWalk) scan(rev, prefix, rest string, skip, max int) (sc treeScan, e
 		w.held += cost
 		sc.held += cost
 		sc.later = append(sc.later, rawEntry{string(name), mode, oid, cost})
+	}
+	// The rest of the tree is read to its end (finish) when the walk goes on.
+	if sc.more && !w.repays(float64(body.remaining())/walkTailBytes) {
+		w.held -= sc.held
+		return sc, errDeclined
 	}
 	if err := body.finish(); err != nil {
 		w.held -= sc.held
@@ -603,14 +697,24 @@ func (b *treeBody) next() (name []byte, mode uint32, oid [20]byte, ok bool, err 
 	return b.prev, mode, oid, true, nil
 }
 
-// finish reads what is left of the object and the line feed after it, so
-// the next reply starts the stream.
+// remaining is the bytes of the object not yet returned by next.
+func (b *treeBody) remaining() int64 { return b.lim.N + int64(b.obj.Buffered()) }
+
+// finish reads what is left of the object, entry by entry, and the line feed
+// after it, so the next reply starts the stream. git reads a whole tree before
+// it prints the first of its records, and a tree that ends inside an entry is
+// an error there before any record of it. A tree that the walk read only as
+// far as the page needs is the same tree: it declines on what it does not
+// handle in the rest of the tree too.
 func (b *treeBody) finish() error {
-	if _, err := io.Copy(io.Discard, b.lim); err != nil {
-		return readErr(err)
-	}
-	if b.lim.N != 0 {
-		return errDeclined // the stream ended inside the object
+	for {
+		_, _, _, ok, err := b.next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
 	}
 	c, err := b.resp.ReadByte()
 	if err != nil {
@@ -691,28 +795,74 @@ func (s *treeSource) close(abort bool) error {
 	return err
 }
 
-// open requests object rev and returns it, which must be a tree.
-func (s *treeSource) open(rev string) (*treeBody, error) {
+// request asks for object rev and reads the header of the reply, which
+// leaves the reader at the object's first byte: its type and size.
+func (s *treeSource) request(rev string) (objType string, size int64, err error) {
 	if _, err := io.WriteString(s.req, rev+"\n"); err != nil {
 		if runErr := s.wait(); runErr != nil {
-			return nil, runErr
+			return "", 0, runErr
 		}
-		return nil, err
+		return "", 0, err
 	}
 	line, err := s.resp.ReadSlice('\n')
 	if err != nil {
-		return nil, readErr(err)
+		return "", 0, readErr(err)
 	}
-	// <object id> SP tree SP <size> LF
+	// <object id> SP <type> SP <size> LF
 	f := bytes.Split(bytes.TrimSuffix(line, []byte("\n")), []byte(" "))
-	if len(f) != 3 || string(f[1]) != "tree" {
-		return nil, errDeclined
+	if len(f) != 3 {
+		return "", 0, errDeclined // "<name> missing"
 	}
-	size, err := strconv.ParseInt(string(f[2]), 10, 64)
+	size, err = strconv.ParseInt(string(f[2]), 10, 64)
 	if err != nil || size < 0 {
+		return "", 0, errDeclined
+	}
+	return string(f[1]), size, nil
+}
+
+// open requests object rev and returns it, which must be a tree.
+func (s *treeSource) open(rev string) (*treeBody, error) {
+	objType, size, err := s.request(rev)
+	if err != nil {
+		return nil, err
+	}
+	if objType != "tree" {
 		return nil, errDeclined
 	}
 	return newTreeBody(s.resp, size, s.obj), nil
+}
+
+// rootTree returns the object id of commit's tree. It reads the commit and
+// takes the id from its first line. Asking cat-file for commit^{tree} would
+// cost twice the tree in heap: git resolves that name by reading the tree
+// into memory, and cat-file then reads it again. A root folder of more than
+// half of HeavyHeapBytes would fail where ls-tree, which reads it once, does
+// not. By id the walk reads each tree once, as ls-tree does.
+func (s *treeSource) rootTree(commit string) (string, error) {
+	if commit == EmptyTreeSHA {
+		return commit, nil
+	}
+	objType, size, err := s.request(commit)
+	if err != nil {
+		return "", err
+	}
+	// The commit starts with its tree: "tree" SP <object id> LF.
+	var head [len("tree ") + 40 + 1]byte
+	if objType != "commit" || size < int64(len(head)) {
+		return "", errDeclined
+	}
+	if _, err := io.ReadFull(s.resp, head[:]); err != nil {
+		return "", readErr(err)
+	}
+	id := string(head[len("tree ") : len(head)-1])
+	if string(head[:len("tree ")]) != "tree " || head[len(head)-1] != '\n' || !ref.ValidSHA(id) {
+		return "", errDeclined
+	}
+	// The rest of the commit and the line feed after it.
+	if _, err := io.CopyN(io.Discard, s.resp, size-int64(len(head))+1); err != nil {
+		return "", readErr(err)
+	}
+	return id, nil
 }
 
 // childTree returns the object id of the folder name in tree rev. A tree

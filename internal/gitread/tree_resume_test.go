@@ -37,7 +37,14 @@ type memTrees struct {
 	next    uint64
 }
 
-const memCommit = "cccccccccccccccccccccccccccccccccccccccc"
+// deepCursor is a count of entries before the cursor so large that the walk
+// is cheaper than the stream whatever the page: the tests of what the walk
+// handles start from it, so that repaysTheFolders does not decide for them.
+const deepCursor = 1 << 30
+
+// memRoot names the root tree in memTrees, where the walk is given a tree name
+// and not a commit.
+const memRoot = "root"
 
 func (m *memTrees) open(rev string) (*treeBody, error) {
 	raw, ok := m.objects[rev]
@@ -108,7 +115,7 @@ func newMemTrees(root map[string]*memEntry) *memTrees {
 	m := &memTrees{objects: map[string][]byte{}}
 	id := m.build(root)
 	m.collect(root, "")
-	m.objects[memCommit+"^{tree}"] = m.objects[hex.EncodeToString(id[:])]
+	m.objects[memRoot] = m.objects[hex.EncodeToString(id[:])]
 	sort.Slice(m.leaves, func(i, j int) bool { return m.leaves[i].Path < m.leaves[j].Path })
 	return m
 }
@@ -249,8 +256,8 @@ func walkMem(m *memTrees, path, after string, limit int, room int64) ([]TreeEntr
 	if !any {
 		return nil, nil
 	}
-	w := &treeWalk{src: m, limit: limit, room: room}
-	if err := w.run(memCommit, path, comps, rest); err != nil {
+	w := &treeWalk{before: deepCursor, src: m, limit: limit, room: room}
+	if err := w.run(memRoot, path, comps, rest); err != nil {
 		return nil, err
 	}
 	if w.held != 0 && len(w.page) == 0 {
@@ -320,8 +327,8 @@ func TestTreeWalkReadsEachTreeOnce(t *testing.T) {
 			c := &countingTrees{memTrees: m, opens: map[string]int{}}
 			after, limit := genCursor(r, m), 1+r.IntN(len(m.leaves)+2)
 			rest, _ := cursorWithin("", after)
-			w := &treeWalk{src: c, limit: limit, room: math.MaxInt64}
-			if err := w.run(memCommit, "", nil, rest); err != nil {
+			w := &treeWalk{before: deepCursor, src: c, limit: limit, room: math.MaxInt64}
+			if err := w.run(memRoot, "", nil, rest); err != nil {
 				t.Fatal(err)
 			}
 			for rev, n := range c.opens {
@@ -349,27 +356,29 @@ func TestTreeWalkListsFoldersThatAreOneTree(t *testing.T) {
 
 // Folders without files in front of the first file are read in a few passes,
 // not one pass each: every pass reads eight times the entries of the last,
-// and a level that takes more than maxWalkPasses is left to the stream.
+// and a level that takes more than maxWalkPasses is left to the stream. The
+// folders are one tree, as git stores them: the walk reads one of them.
 func TestTreeWalkPassesOverEmptyFolders(t *testing.T) {
+	empty := &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
 	for _, c := range []struct {
 		empties int
 		decline bool
 	}{{1000, false}, {3000, true}} {
 		root := map[string]*memEntry{"z": {mode: modeBlob}}
 		for i := range c.empties {
-			root[fmt.Sprintf("e%05d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
+			root[fmt.Sprintf("e%05d", i)] = empty
 		}
 		m := newMemTrees(root)
 		cnt := &countingTrees{memTrees: m, opens: map[string]int{}}
-		w := &treeWalk{src: cnt, limit: 1, room: math.MaxInt64}
-		err := w.run(memCommit, "", nil, "")
+		w := &treeWalk{before: deepCursor, src: cnt, limit: 1, room: math.MaxInt64}
+		err := w.run(memRoot, "", nil, "")
 		if c.decline != errors.Is(err, errDeclined) || !c.decline && err != nil {
 			t.Fatalf("%d folders without files: err = %v, declined wanted %v", c.empties, err, c.decline)
 		}
 		if got, want := paths(w.page), []string{"z"}; !c.decline && !slices.Equal(got, want) {
 			t.Fatalf("%d folders without files: page %v, want %v", c.empties, got, want)
 		}
-		if n := cnt.opens[memCommit+"^{tree}"]; n > maxWalkPasses {
+		if n := cnt.opens[memRoot]; n > maxWalkPasses {
 			t.Fatalf("%d folders without files: the root was read %d times", c.empties, n)
 		}
 	}
@@ -397,8 +406,8 @@ func TestTreeWalkCountsThePathInTheDepth(t *testing.T) {
 	}
 	// A path deeper than the limit is refused before any tree is read.
 	c := &countingTrees{memTrees: chain(maxWalkDepth + 50), opens: map[string]int{}}
-	w := &treeWalk{src: c, limit: 1, room: math.MaxInt64}
-	if err := w.run(memCommit, strings.Repeat("a/", maxWalkDepth+1), slices.Repeat([]string{"a"}, maxWalkDepth+1), "\x00"); !errors.Is(err, errDeclined) || len(c.opens) != 0 {
+	w := &treeWalk{before: deepCursor, src: c, limit: 1, room: math.MaxInt64}
+	if err := w.run(memRoot, strings.Repeat("a/", maxWalkDepth+1), slices.Repeat([]string{"a"}, maxWalkDepth+1), "\x00"); !errors.Is(err, errDeclined) || len(c.opens) != 0 {
 		t.Fatalf("a path of %d folders: err = %v after reading %d trees, want errDeclined after none", maxWalkDepth+1, err, len(c.opens))
 	}
 }
@@ -427,8 +436,8 @@ func TestTreeWalkBoundsTheReadsOfEmptyFolders(t *testing.T) {
 		root[fmt.Sprintf("t%04d", i)] = shared
 	}
 	c := &countingTrees{memTrees: newMemTrees(root), opens: map[string]int{}}
-	w := &treeWalk{src: c, limit: 1, room: math.MaxInt64}
-	if err := w.run(memCommit, "", nil, ""); err != nil || len(w.page) != 1 || w.page[0].Path != "z" {
+	w := &treeWalk{before: deepCursor, src: c, limit: 1, room: math.MaxInt64}
+	if err := w.run(memRoot, "", nil, ""); err != nil || len(w.page) != 1 || w.page[0].Path != "z" {
 		t.Fatalf("page %v, err %v; want [z]", paths(w.page), err)
 	}
 	total := 0
@@ -444,8 +453,8 @@ func TestTreeWalkBoundsTheReadsOfEmptyFolders(t *testing.T) {
 		distinct[fmt.Sprintf("t%04d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{"x": {mode: modeTree, sub: map[string]*memEntry{}}}}
 	}
 	c = &countingTrees{memTrees: newMemTrees(distinct), opens: map[string]int{}}
-	w = &treeWalk{src: c, limit: 100, room: math.MaxInt64}
-	if err := w.run(memCommit, "", nil, ""); !errors.Is(err, errDeclined) {
+	w = &treeWalk{before: deepCursor, src: c, limit: 100, room: math.MaxInt64}
+	if err := w.run(memRoot, "", nil, ""); !errors.Is(err, errDeclined) {
 		t.Fatalf("err = %v, want errDeclined", err)
 	}
 	total = 0
@@ -459,7 +468,7 @@ func TestTreeWalkBoundsTheReadsOfEmptyFolders(t *testing.T) {
 
 // The folders that hold the cursor count in the path bound too.
 func TestTreeWalkDeclinesALongCursorPath(t *testing.T) {
-	name := strings.Repeat("n", 99)
+	name := strings.Repeat("n", 255)
 	chain := func(depth int) (*memTrees, string) {
 		root := map[string]*memEntry{}
 		dir := root
@@ -474,9 +483,9 @@ func TestTreeWalkDeclinesALongCursorPath(t *testing.T) {
 		dir["f"] = &memEntry{mode: modeBlob}
 		return newMemTrees(root), cursor.String()
 	}
-	short, cursor := chain(maxWalkPath/100 - 2)
+	short, cursor := chain(maxWalkPath/256 - 2)
 	checkWalk(t, short, "", cursor+"g", 5, math.MaxInt64)
-	long, cursor := chain(maxWalkPath/100 + 2)
+	long, cursor := chain(maxWalkPath/256 + 2)
 	if _, err := walkMem(long, "", cursor+"g", 5, math.MaxInt64); !errors.Is(err, errDeclined) {
 		t.Fatalf("err = %v, want errDeclined", err)
 	}
@@ -487,7 +496,7 @@ func TestTreeWalkDeclinesALongPath(t *testing.T) {
 	chain := func(depth int) map[string]*memEntry {
 		root := map[string]*memEntry{}
 		dir := root
-		name := strings.Repeat("n", 99)
+		name := strings.Repeat("n", 255)
 		for range depth {
 			next := map[string]*memEntry{}
 			dir[name] = &memEntry{mode: modeTree, sub: next}
@@ -496,9 +505,9 @@ func TestTreeWalkDeclinesALongPath(t *testing.T) {
 		dir["f"] = &memEntry{mode: modeBlob}
 		return root
 	}
-	short := newMemTrees(chain(maxWalkPath/100 - 2))
+	short := newMemTrees(chain(maxWalkPath/256 - 2))
 	checkWalk(t, short, "", "\x00", 5, math.MaxInt64)
-	long := newMemTrees(chain(maxWalkPath/100 + 2))
+	long := newMemTrees(chain(maxWalkPath/256 + 2))
 	if _, err := walkMem(long, "", "\x00", 5, math.MaxInt64); !errors.Is(err, errDeclined) {
 		t.Fatalf("walk of paths past %d bytes: err = %v, want errDeclined", maxWalkPath, err)
 	}
@@ -545,12 +554,151 @@ func TestTreeWalkDeclinesAShortAllowanceOnEmptyFolders(t *testing.T) {
 		root[fmt.Sprintf("e%05d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
 	}
 	c := &countingTrees{memTrees: newMemTrees(root), opens: map[string]int{}}
-	w := &treeWalk{src: c, limit: 1, room: entryFloor + heldOverhead + 10}
-	if err := w.run(memCommit, "", nil, ""); !errors.Is(err, errDeclined) {
+	w := &treeWalk{before: deepCursor, src: c, limit: 1, room: entryFloor + heldOverhead + 10}
+	if err := w.run(memRoot, "", nil, ""); !errors.Is(err, errDeclined) {
 		t.Fatalf("err = %v, want errDeclined", err)
 	}
-	if n := c.opens[memCommit+"^{tree}"]; n != 1 {
+	if n := c.opens[memRoot]; n != 1 {
 		t.Fatalf("the root was read %d times", n)
+	}
+}
+
+// A folder after the cursor costs the walk a round trip to git. After a
+// sample of 32 of them the walk projects the folders the rest of the page
+// needs, from the entries the sample gave. It goes on when that is no more
+// than 750 reads, and otherwise when the reads, priced at 20 entries of the
+// stream each, cost no more than the stream reads before the cursor and for the
+// page. The numbers are literal: they are the policy.
+func TestTreeWalkDeclinesFoldersThatDoNotRepayTheirReads(t *testing.T) {
+	tiny := func(folders int) *memTrees {
+		root := map[string]*memEntry{}
+		for i := range folders {
+			root[fmt.Sprintf("d%05d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{"f": {mode: modeBlob}}}
+		}
+		return newMemTrees(root)
+	}
+	many := func(folders, files int) *memTrees {
+		root := map[string]*memEntry{}
+		for i := range folders {
+			folder := map[string]*memEntry{}
+			for j := range files {
+				folder[fmt.Sprintf("f%d", j)] = &memEntry{mode: modeBlob}
+			}
+			root[fmt.Sprintf("d%05d", i)] = &memEntry{mode: modeTree, sub: folder}
+		}
+		return newMemTrees(root)
+	}
+	// 30,000 files, then 100 folders without a file (each holds a folder of
+	// its own, so that they are 200 trees), then one file.
+	empties := func() *memTrees {
+		root := map[string]*memEntry{"z": {mode: modeBlob}}
+		for i := range 30_000 {
+			root[fmt.Sprintf("a%05d", i)] = &memEntry{mode: modeBlob}
+		}
+		for i := range 100 {
+			inner := map[string]*memEntry{fmt.Sprintf("s%03d", i): {mode: modeTree, sub: map[string]*memEntry{}}}
+			root[fmt.Sprintf("e%03d", i)] = &memEntry{mode: modeTree, sub: inner}
+		}
+		return newMemTrees(root)
+	}
+	for _, c := range []struct {
+		name    string
+		m       *memTrees
+		after   string
+		limit   int
+		decline bool
+	}{
+		// After the sample of 32 (32 entries) a page of 1,001 needs 969
+		// reads, 19,380 entries of the stream. Before the cursor d18376/f are
+		// 18,376 folders, its folder and its file: 18,378 entries, and with
+		// the 1,001 of the page it falls short by one.
+		{"folders of one file, near the start", tiny(1500), "d00010/f", 1000, true},
+		{"folders of one file, at the start", tiny(1500), "\x00", 1000, true},
+		{"folders of one file, 18,378 entries in", tiny(20000), "d18376/f", 1000, true},
+		{"folders of one file, 18,379 entries in", tiny(20000), "d18377/f", 1000, false},
+		{"folders of one file, far in", tiny(30000), "d25000/f", 1000, false},
+		// A page of 3,000 asks for three times the reads: 56,379 entries.
+		{"folders of one file, limit 3000, 56,378 entries in", tiny(60000), "d56376/f", 3000, true},
+		{"folders of one file, limit 3000, 56,379 entries in", tiny(60000), "d56377/f", 3000, false},
+		// The reads that no stream proof is needed for: 750 of them.
+		{"folders of one file, 569 reads", tiny(1500), "d00010/f", 600, false},
+		{"folders of one file, 749 reads", tiny(1500), "d00010/f", 780, false},
+		{"folders of one file, 751 reads", tiny(1500), "d00010/f", 782, true},
+		{"folders of three files, near the start", many(1500, 3), "d00010/f2", 3000, true},
+		{"folders of three files, far in", many(20000, 3), "d17000/f2", 3000, false},
+		// A folder without files counts for a fourth of an entry: 4,004
+		// reads for 1,001 entries, 80,080 entries of the stream against
+		// 31,001; a folder of one file would need 20,020.
+		{"folders without files", empties(), "a29999", 1000, true},
+		// The page fills inside the sample: nothing to project.
+		{"folders of a hundred files", many(400, 100), "d00010/f99", 3000, false},
+	} {
+		cnt := &countingTrees{memTrees: c.m, opens: map[string]int{}}
+		w := &treeWalk{src: cnt, limit: c.limit, room: math.MaxInt64}
+		err := w.run(memRoot, "", nil, c.after)
+		reads := 0
+		for _, n := range cnt.opens {
+			reads += n
+		}
+		if c.decline {
+			if !errors.Is(err, errDeclined) || reads > 1+walkSample+2 {
+				t.Errorf("%s: err = %v after %d reads, want errDeclined after the sample of %d", c.name, err, reads, walkSample)
+			}
+			continue
+		}
+		if want := c.m.windowAfter("", c.after, c.limit); err != nil || !slices.Equal(w.page, want) {
+			t.Errorf("%s: err = %v, page of %d entries, want %d", c.name, err, len(w.page), len(want))
+		}
+	}
+}
+
+// The walk reads each tree it opens to its end. When the cursor is near the
+// start of a large tree, that costs it more than the stream, which stops at the
+// page: the walk gives up the tree before it reads the rest, once the rest
+// costs more than 15,000 entries of the stream (250 bytes each) and more than
+// the stream reads before the cursor and for the page. The numbers are literal:
+// they are the policy.
+func TestTreeWalkDeclinesTheRestOfALargeTree(t *testing.T) {
+	root := map[string]*memEntry{}
+	for i := range 200_000 {
+		root[fmt.Sprintf("f%06d", i)] = &memEntry{mode: modeBlob}
+	}
+	large := newMemTrees(root)
+	small := map[string]*memEntry{}
+	for i := range 10_000 {
+		small[fmt.Sprintf("f%06d", i)] = &memEntry{mode: modeBlob}
+	}
+	for _, c := range []struct {
+		name    string
+		m       *memTrees
+		after   string
+		limit   int
+		decline bool
+	}{
+		// A tree of 35 bytes an entry: the line is about 24,500 entries before
+		// the cursor for a page of 10, and 23,700 for a page of 1,000.
+		{"at the start", large, "\x00", 10, true},
+		{"near the start", large, "f000100", 10, true},
+		{"24,001 entries in", large, "f024000", 10, true},
+		{"25,101 entries in", large, "f025100", 10, false},
+		{"a page of 1,000, 23,001 entries in", large, "f023000", 1000, true},
+		{"a page of 1,000, 24,301 entries in", large, "f024300", 1000, false},
+		{"far in", large, "f150000", 10, false},
+		{"no rest to read", large, "f199990", 20, false},
+		{"a tree of 350 KB", newMemTrees(small), "\x00", 10, false},
+	} {
+		cnt := &countingTrees{memTrees: c.m, opens: map[string]int{}}
+		w := &treeWalk{src: cnt, limit: c.limit, room: math.MaxInt64}
+		err := w.run(memRoot, "", nil, c.after)
+		if c.decline {
+			if !errors.Is(err, errDeclined) || len(w.page) != 0 || w.held != 0 {
+				t.Errorf("%s: err = %v, page of %d entries, %d bytes held, want errDeclined with nothing kept", c.name, err, len(w.page), w.held)
+			}
+			continue
+		}
+		if want := c.m.windowAfter("", c.after, c.limit); err != nil || !slices.Equal(w.page, want) {
+			t.Errorf("%s: err = %v, page of %d entries, want %d", c.name, err, len(w.page), len(want))
+		}
 	}
 }
 
@@ -563,15 +711,20 @@ func TestTreeWalkCountsTheDepthOfSkippedFolders(t *testing.T) {
 	chains := func(n int) *memTrees {
 		chain := &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
 		root := map[string]*memEntry{"z": {mode: modeBlob}, "zz": {mode: modeBlob}}
+		// Files before the folders, so that the page repays the folders read.
+		for i := range 3 * n {
+			root[fmt.Sprintf("a%05d", i)] = &memEntry{mode: modeBlob}
+		}
 		for i := range n {
 			root[fmt.Sprintf("e%04d", i)] = chain
 			chain = &memEntry{mode: modeTree, sub: map[string]*memEntry{"d": chain}}
 		}
 		return newMemTrees(root)
 	}
-	// e1023 holds 1023 folders in a row: its deepest folder is the 1024th.
-	checkWalk(t, chains(maxWalkDepth), "", "\x00", 10, math.MaxInt64)
-	if _, err := walkMem(chains(maxWalkDepth+1), "", "\x00", 10, math.MaxInt64); !errors.Is(err, errDeclined) {
+	// The last folder holds maxWalkDepth-1 folders in a row: its deepest
+	// folder is the maxWalkDepth-th.
+	checkWalk(t, chains(maxWalkDepth), "", "\x00", 10_000, math.MaxInt64)
+	if _, err := walkMem(chains(maxWalkDepth+1), "", "\x00", 10_000, math.MaxInt64); !errors.Is(err, errDeclined) {
 		t.Fatalf("a folder %d deep below an empty folder met before: err = %v, want errDeclined", maxWalkDepth+1, err)
 	}
 }
@@ -584,8 +737,8 @@ func TestTreeWalkBoundsWhatItHolds(t *testing.T) {
 	for i := range 200000 {
 		root[fmt.Sprintf("e%06d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
 	}
-	w := &treeWalk{src: newMemTrees(root), limit: 5000, room: math.MaxInt64}
-	if err := w.run(memCommit, "", nil, ""); !errors.Is(err, errDeclined) {
+	w := &treeWalk{before: deepCursor, src: newMemTrees(root), limit: 5000, room: math.MaxInt64}
+	if err := w.run(memRoot, "", nil, ""); !errors.Is(err, errDeclined) {
 		t.Fatalf("err = %v, want errDeclined", err)
 	}
 	if w.held != 0 {
@@ -595,11 +748,13 @@ func TestTreeWalkBoundsWhatItHolds(t *testing.T) {
 
 // A tree nested deeper than maxWalkDepth is left to the stream.
 func TestTreeWalkDeclinesPastTheDepthLimit(t *testing.T) {
+	// Three files in front of each folder repay the reads of the folders.
 	chain := func(depth int) map[string]*memEntry {
 		root := map[string]*memEntry{}
 		dir := root
 		for range depth {
 			next := map[string]*memEntry{}
+			dir["a"], dir["b"], dir["c"] = &memEntry{mode: modeBlob}, &memEntry{mode: modeBlob}, &memEntry{mode: modeBlob}
 			dir["d"] = &memEntry{mode: modeTree, sub: next}
 			dir["f"] = &memEntry{mode: modeBlob}
 			dir = next
@@ -608,10 +763,10 @@ func TestTreeWalkDeclinesPastTheDepthLimit(t *testing.T) {
 		return root
 	}
 	m := newMemTrees(chain(maxWalkDepth - 1))
-	checkWalk(t, m, "", "d/", 5, math.MaxInt64)
-	checkWalk(t, m, "", "d/d/d/f", 5, math.MaxInt64)
+	checkWalk(t, m, "", "d/", 10_000, math.MaxInt64)
+	checkWalk(t, m, "", "d/d/d/f", 10_000, math.MaxInt64)
 	deep := newMemTrees(chain(maxWalkDepth + 2))
-	if _, err := walkMem(deep, "", "d/", 5, math.MaxInt64); !errors.Is(err, errDeclined) {
+	if _, err := walkMem(deep, "", "d/", 10_000, math.MaxInt64); !errors.Is(err, errDeclined) {
 		t.Fatalf("walk of a tree %d deep: err = %v, want errDeclined", maxWalkDepth+2, err)
 	}
 }
@@ -754,6 +909,34 @@ func TestTreeBodyParsing(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// finish reads the entries the walk did not need as well: a tree git would
+// refuse or list differently ends the walk (git checks a whole tree before it
+// prints the first of its records).
+func TestTreeBodyFinishParsesTheRest(t *testing.T) {
+	good := rawEnt("100644", "a") + rawEnt("100644", "b") + rawEnt("100644", "c")
+	for name, tt := range map[string]struct {
+		raw     string
+		decline bool
+	}{
+		"whole":                {good, false},
+		"truncated last entry": {good + rawEnt("100644", "d")[:12], true},
+		"cut oid":              {good + rawEnt("100644", "d")[:20], true},
+		"bytes after":          {good + "\x00\x00", true},
+		"mode git rejects":     {good + rawEnt("100664", "d"), true},
+		"out of order":         {good + rawEnt("100644", "a"), true},
+		"slash in a name":      {good + rawEnt("100644", "d/e"), true},
+		"empty name":           {good + rawEnt("100644", ""), true},
+	} {
+		b := rawBody(tt.raw)
+		if _, _, _, ok, err := b.next(); err != nil || !ok {
+			t.Fatalf("%s: first entry: ok %v, err %v", name, ok, err)
+		}
+		if err := b.finish(); tt.decline && !errors.Is(err, errDeclined) || !tt.decline && err != nil {
+			t.Errorf("%s: finish = %v, want decline %v", name, err, tt.decline)
+		}
 	}
 }
 
