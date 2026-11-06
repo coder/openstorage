@@ -46,14 +46,19 @@ type QuarantinedError struct {
 	Err error
 }
 
-func (e *QuarantinedError) Error() string {
-	// Name only the corrupt document's cause: its own text carries a
-	// "keep serve stopped" hint that would contradict this one (#525).
-	cause := e.Err.Error()
+// cause names why the process stopped trusting meta.json, without the
+// restore hint that Error and the log line each carry on their own.
+func (e *QuarantinedError) cause() string {
+	// A corrupt document's own text carries a "keep serve stopped" hint that
+	// would contradict the restore hint (#525).
 	if cd, ok := errors.AsType[*CorruptDocumentError](e.Err); ok {
-		cause = s3walMetaKey + " was edited out of band: " + cd.Err.Error()
+		return s3walMetaKey + " was edited out of band: " + cd.Err.Error()
 	}
-	return "s3walmeta: this process stopped trusting " + s3walMetaKey + " (" + cause + "). Restore the bucket from a verified stopped-node backup first, then restart serve: a restart adopts whatever the bucket holds (docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover)"
+	return e.Err.Error()
+}
+
+func (e *QuarantinedError) Error() string {
+	return "s3walmeta: this process stopped trusting " + s3walMetaKey + " (" + e.cause() + "). Restore the bucket from a verified stopped-node backup first, then restart serve: a restart adopts whatever the bucket holds (docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover)"
 }
 
 func (e *QuarantinedError) Unwrap() error { return e.Err }
@@ -73,7 +78,7 @@ func (s *S3WAL) refuse(class refuseClass, err error) error {
 		s.orgKeysMu.Unlock()
 		metrics.S3WALMetaRefused(class)
 		slog.Error("s3walmeta: quarantined _wal/meta.json until restart; every metadata operation and token check fails",
-			"class", class.String(), "err", q, "restore_first", "docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover")
+			"class", class.String(), "err", q.cause(), "restore_first", "docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover")
 		return q
 	}
 	if !s.rolledBack {
