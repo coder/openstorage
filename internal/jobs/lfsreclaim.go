@@ -363,7 +363,9 @@ func gensFence(gens map[string]int64) int64 {
 func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 	report := LFSReclaimReport{DryRun: !r.deleteEnabled}
 	if !r.running.CompareAndSwap(false, true) {
-		r.logger.Info("lfs reclaim: a pass is already running on this replica; this run does nothing")
+		// A warning, not a note: a run that never ends makes every later tick
+		// take this branch, and the log line is the only sign of it.
+		r.logger.Warn("lfs reclaim: a pass is already running on this replica; this run does nothing")
 		return report, nil
 	}
 	defer r.running.Store(false)
