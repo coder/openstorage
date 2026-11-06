@@ -152,13 +152,7 @@ func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, m
 	}}}
 	if anyInvalidUTF8(conflictPaths) {
 		body.ConflictPathsBase64 = []string{}
-		lists = append(lists, jsonList{"conflict_paths_base64", func(yield func(any) bool) {
-			for _, p := range conflictPaths {
-				if !yield(base64JSONString(p)) {
-					return
-				}
-			}
-		}})
+		lists = append(lists, rawPathsBase64List("conflict_paths_base64", conflictPaths))
 	}
 	writeJSONLists(w, http.StatusConflict, body, lists...)
 }
@@ -837,7 +831,7 @@ type wmPreviewResponse struct {
 	TargetTipSHA        string              `json:"target_tip_sha"`
 	MergeBaseSHA        string              `json:"merge_base_sha,omitempty"`
 	ConflictPaths       []string            `json:"conflict_paths"`
-	ConflictPathsBase64 []string            `json:"conflict_paths_base64,omitempty"`
+	ConflictPathsBase64 []string            `json:"conflict_paths_base64,omitzero"`
 	Conflicts           []wmPreviewConflict `json:"conflicts"`
 	FilteredConflicts   []wmPreviewFiltered `json:"filtered_conflicts"`
 }
@@ -971,7 +965,6 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Status = "conflicted"
 	resp.ConflictPaths = mt.paths
-	resp.ConflictPathsBase64 = rawPathsBase64(mt.paths)
 	if includeContent {
 		conflicts, filtered, err := wmRenderConflicts(ctx, sc, mt)
 		if err != nil {
@@ -981,7 +974,45 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		resp.Conflicts = conflicts
 		resp.FilteredConflicts = filtered
 	}
-	writeJSON(w, http.StatusOK, resp)
+	wmWritePreview(w, resp)
+}
+
+// wmWritePreview writes the 200 body. A conflicted body streams its lists, so
+// no copy of the conflict paths or of the conflict content is held whole, and
+// conflict_paths_base64 (empty and present exactly when a conflict path is not
+// valid UTF-8, #587) adds nothing to the request's memory.
+func wmWritePreview(w http.ResponseWriter, resp wmPreviewResponse) {
+	if len(resp.ConflictPaths) == 0 {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	paths, conflicts, filtered := resp.ConflictPaths, resp.Conflicts, resp.FilteredConflicts
+	resp.ConflictPaths, resp.Conflicts, resp.FilteredConflicts = []string{}, []wmPreviewConflict{}, []wmPreviewFiltered{}
+	lists := []jsonList{{"conflict_paths", func(yield func(any) bool) {
+		for _, p := range paths {
+			if !yield(p) {
+				return
+			}
+		}
+	}}}
+	if anyInvalidUTF8(paths) {
+		resp.ConflictPathsBase64 = []string{}
+		lists = append(lists, rawPathsBase64List("conflict_paths_base64", paths))
+	}
+	lists = append(lists, jsonList{"conflicts", func(yield func(any) bool) {
+		for _, c := range conflicts {
+			if !yield(c) {
+				return
+			}
+		}
+	}}, jsonList{"filtered_conflicts", func(yield func(any) bool) {
+		for _, f := range filtered {
+			if !yield(f) {
+				return
+			}
+		}
+	}})
+	writeJSONLists(w, http.StatusOK, resp, lists...)
 }
 
 // wmRenderConflicts renders inline conflict content (include_content=true)

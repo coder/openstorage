@@ -286,3 +286,85 @@ func TestMergeConflictSiblingHoldsNoCopyOfAPath(t *testing.T) {
 		t.Errorf("an invalid %d MiB path allocates %d MiB against %d MiB for a valid one: the sibling holds a copy of the path", size>>20, withSibling>>20, base>>20)
 	}
 }
+
+// TestMergePreviewStreams: a conflicted preview body streams its lists. Its
+// bytes equal what json.Marshal gives, with or without conflict_paths_base64,
+// and the sibling of an invalid path adds no allocation (#587).
+func TestMergePreviewStreams(t *testing.T) {
+	conflict := func(p string) wmPreviewConflict {
+		return wmPreviewConflict{Path: p, PathBase64: rawPathBase64(p), Ours: wmPreviewBlob{OID: strings.Repeat("3", 40), Content: "x\n"}}
+	}
+	for _, paths := range [][]string{{"plain.txt", "caf\u00e9.txt"}, {"a\xffb", "plain.txt", "caf\xe9.txt"}} {
+		resp := wmPreviewResponse{
+			Status: "conflicted", Result: "merge_commit", SourceBranch: "s", TargetBranch: "t",
+			SourceTipSHA: strings.Repeat("1", 40), TargetTipSHA: strings.Repeat("2", 40),
+			ConflictPaths: paths, Conflicts: []wmPreviewConflict{conflict(paths[0]), conflict(paths[1])},
+			FilteredConflicts: []wmPreviewFiltered{{Path: paths[1], PathBase64: rawPathBase64(paths[1]), Reason: "too_large"}},
+		}
+		eager := resp
+		if anyInvalidUTF8(paths) {
+			for _, p := range paths {
+				eager.ConflictPathsBase64 = append(eager.ConflictPathsBase64, encodeRawPath(p))
+			}
+		}
+		rec := httptest.NewRecorder()
+		wmWritePreview(rec, resp)
+		want, err := json.Marshal(eager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := bytes.TrimSuffix(rec.Body.Bytes(), []byte("\n")); !bytes.Equal(got, want) {
+			t.Errorf("paths %q: body\n got %s\nwant %s", paths, got, want)
+		}
+		if has := bytes.Contains(rec.Body.Bytes(), []byte("conflict_paths_base64")); has != anyInvalidUTF8(paths) {
+			t.Errorf("paths %q: conflict_paths_base64 present = %v", paths, has)
+		}
+	}
+
+	// An empty conflict list (clean, fast-forward, no-op) is plain writeJSON.
+	clean := wmPreviewResponse{Status: "clean", Result: "fast_forward", ConflictPaths: []string{}, Conflicts: []wmPreviewConflict{}, FilteredConflicts: []wmPreviewFiltered{}}
+	rec := httptest.NewRecorder()
+	wmWritePreview(rec, clean)
+	if want, _ := json.Marshal(clean); !bytes.Equal(bytes.TrimSuffix(rec.Body.Bytes(), []byte("\n")), want) {
+		t.Errorf("clean body = %s, want %s", rec.Body.Bytes(), want)
+	}
+
+	// Many paths with one invalid: the body is written in bounded chunks,
+	// where a buffered body is one write of the whole.
+	var many []string
+	for total := 0; total < 4<<20; total += 250 {
+		many = append(many, strings.Repeat("d", 200)+"/"+strings.Repeat("f", 40)+string(rune('a'+len(many)%26)))
+	}
+	many[len(many)/2] = "inv\xffalid"
+	mk := func(paths []string) wmPreviewResponse {
+		return wmPreviewResponse{Status: "conflicted", Result: "merge_commit", ConflictPaths: paths, Conflicts: []wmPreviewConflict{}, FilteredConflicts: []wmPreviewFiltered{}}
+	}
+	chunks := &chunkRecorder{ResponseRecorder: httptest.NewRecorder()}
+	wmWritePreview(chunks, mk(many))
+	if chunks.maxWrite > 64<<10 {
+		t.Errorf("one Write of %d bytes, want writes of at most 64 KiB: the preview body is buffered whole", chunks.maxWrite)
+	}
+	var decoded struct {
+		Paths  []string `json:"conflict_paths"`
+		Base64 []string `json:"conflict_paths_base64"`
+	}
+	if err := json.Unmarshal(chunks.Body.Bytes(), &decoded); err != nil || len(decoded.Paths) != len(many) || len(decoded.Base64) != len(many) {
+		t.Fatalf("streamed preview: %d paths, %d base64 entries for %d, %v", len(decoded.Paths), len(decoded.Base64), len(many), err)
+	}
+
+	// One path far above the write chunk: the sibling adds no copy of it.
+	const size = 8 << 20
+	valid := strings.Repeat("a", size)
+	invalid := valid[:size/2] + "\xff" + valid[size/2+1:]
+	one := func(path string) uint64 {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		wmWritePreview(&discardResponse{header: http.Header{}}, mk([]string{path}))
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	if base, withSibling := one(valid), one(invalid); withSibling > base+(1<<20) {
+		t.Errorf("an invalid %d MiB path allocates %d MiB against %d MiB for a valid one: the sibling holds a copy of the path", size>>20, withSibling>>20, base>>20)
+	}
+}
