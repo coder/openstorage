@@ -50,7 +50,9 @@ repo=$(git -C "$skill_dir" rev-parse --show-toplevel 2>/dev/null) || {
 model="$skill_dir/model"
 
 # Configs in run order: name, module, kind (pass: invariants must hold; live:
-# temporal properties must hold; probe: the named invariant must fail).
+# temporal properties must hold; probe: the named invariant must fail
+# without a timing assumption; reach: the named invariant must fail because
+# it negates a state the model must reach).
 configs="PackSweep.cfg PackSweep pass -
 NoTiming.cfg PackSweep pass -
 Liveness.cfg PackSweep live -
@@ -59,7 +61,8 @@ SlowHealEntry.cfg PackSweep probe NoLostPack
 PurgeControl.cfg RepoPurge pass -
 PurgeSafety.cfg RepoPurge pass -
 PurgeLiveness.cfg RepoPurge live -
-PurgeQuarantine.cfg RepoPurge live -"
+PurgeQuarantine.cfg RepoPurge live -
+PurgeReach.cfg RepoPurge reach RaceUnreachable"
 # The code facts each module declares as constants.
 facts_PackSweep="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealEverySweep HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeAgeCoversThreshold"
 facts_RepoPurge="WriterVerifies VerifyOnRegisterError CopyBeforeDelete RecheckAfterDelete HealRestores PurgeAgeGated PurgeFloorCoversHandshake PurgeGuarded SweepGuardStopsPurgeMode RefusesLive RefusesYoung CutoffCoversRetention CursorWraps FenceFirst RefsDieFirst RegistrationsFenced RefWritesFenced FoldsFenced SweepReapsFenced HealPurgesFenced"
@@ -187,7 +190,7 @@ selected() { [ "$fp_only" = 0 ] || return 1; [ "$only" = " " ] || case $only in 
 verdict() { printf '   %-27s %s\n' "$1" "$2"; }
 if [ "$fp_only" = 1 ]; then echo "== TLC skipped (--fingerprints-only)"; else echo "== TLC $TLC_VERSION (outputs in $out)"; fi
 while read -r cfg module kind _; do
-  [ "$kind" != probe ] || continue
+  case $kind in probe|reach) continue ;; esac
   selected "$cfg" || continue
   extra=()
   [ "$kind" = live ] && extra=(-lncheck final)
@@ -204,12 +207,13 @@ while read -r cfg module kind _; do
   esac
 done <<<"$configs"
 
-# Probes drop one timing assumption each; their named invariant must then
-# fail. One worker keeps the trace the shortest one.
+# Probes drop one timing assumption each, and reach probes negate a state
+# the model must reach; either way the named invariant must fail. One worker
+# keeps the trace the shortest one.
 stale=0 probe_passed=0
 [ "$false_facts" -eq 0 ] || stale=1
 while read -r cfg module kind expect; do
-  [ "$kind" = probe ] || continue
+  case $kind in probe|reach) ;; *) continue ;; esac
   selected "$cfg" || continue
   rc=0; run_tlc "$cfg" "$module" 1 || rc=$?
   case $rc in
@@ -220,7 +224,13 @@ while read -r cfg module kind expect; do
       else
         verdict "$cfg" "UNEXPECTED: $(grep -m1 'is violated' "$out/${cfg%.cfg}.out")"; status=1
       fi ;;
-    0) verdict "$cfg" "PASSES: this timing assumption no longer matters. Review the model and SKILL.md"; stale=1; probe_passed=1 ;;
+    0)
+      if [ "$kind" = reach ]; then
+        verdict "$cfg" "PASSES: the model no longer reaches this state, so the other $module configs may check nothing. Review the model"
+      else
+        verdict "$cfg" "PASSES: this timing assumption no longer matters. Review the model and SKILL.md"
+      fi
+      stale=1; probe_passed=1 ;;
     *) verdict "$cfg" "ERROR: TLC exit $rc"; sed -n '1,40p' "$out/${cfg%.cfg}.out" >&2; exit 3 ;;
   esac
 done <<<"$configs"

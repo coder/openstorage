@@ -676,6 +676,19 @@ PurgeCompletes == <>[](repo = "live" \/ (stamped /\ ~present))
 \* delete flag off (SweepConfig.PurgedRepoProbe).
 BackupsCollected == <>[](\A n \in Nonces : backup[n] \notin Live)
 
+\* The state the safety properties are about, which PurgeReach.cfg must
+\* reach (TLC reports this invariant violated): a push registered K and a
+\* repack folded into K before the fence, the purge retired both rows, and
+\* its reap is deleting K while both writers still hold their local files.
+\* If a model edit cuts any of these steps off, the probe passes and
+\* check.sh stops with STALE.
+RaceUnreachable ==
+    ~\E w, f \in Writers, p \in Purgers :
+        /\ wpc[w] = "verify" /\ regOk[w]
+        /\ wpc[f] = "fverify" /\ regOk[f]
+        /\ fenced /\ ~registered
+        /\ pc[p] = "sd_delete"
+
 PurgeSymmetry == Permutations(Writers) \cup Permutations(Nonces)
 
 \* Safety configs fingerprint states through this view. It drops values
