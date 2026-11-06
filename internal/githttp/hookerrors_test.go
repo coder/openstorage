@@ -121,7 +121,10 @@ func TestHookErrorsFileLimitsAndMode(t *testing.T) {
 	if maxLoggedHookErrors != 100 || maxHookErrorsBytes != 1<<20 {
 		t.Fatalf("limits %d records, %d bytes; the deploy guide says 100 and 1 MiB", maxLoggedHookErrors, maxHookErrorsBytes)
 	}
+	// The mode must not depend on the process's umask.
+	prev := syscall.Umask(0)
 	path, err := createHookErrors(t.TempDir())
+	syscall.Umask(prev)
 	if err != nil {
 		t.Fatal(err)
 	}
