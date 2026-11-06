@@ -298,7 +298,7 @@ jobs:
             docker buildx imagetools inspect "$IMAGE@$d" --format '{{json .Manifest}}' | jq -r '.manifests[].digest'
           done | sort)
           planned=$(docker buildx imagetools create --dry-run "${create[@]}" | jq -r '.manifests[].digest' | sort)
-          [ -n "$staged" ] && [ "$staged" = "$planned" ]
+          [[ -n $staged && $staged = "$planned" ]]
           docker buildx imagetools create "${create[@]}"
           # Parse JSON: some Buildx releases ignore a field template like
           # {{.Manifest.Digest}} and print the default table (docker/buildx#4006).
@@ -318,7 +318,7 @@ jobs:
             docker buildx imagetools inspect "$IMAGE@$(cat "digest/$a")" --format '{{json .Manifest}}' | jq -r '.manifests[].digest'
           done | sort)
           published=$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .Manifest}}' | jq -r '.manifests[].digest' | sort)
-          [ -n "$staged" ] && [ "$staged" = "$published" ]
+          [[ -n $staged && $staged = "$published" ]]
           {
             echo "### Published $IMAGE:$VERSION"
             echo

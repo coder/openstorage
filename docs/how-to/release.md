@@ -114,7 +114,7 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 
    The `stage` jobs build the tag natively on linux/amd64 and linux/arm64 runners, one
    build per platform, and push each result to `ghcr.io/coder/openstorage` **by digest**,
-   with no tag. Every run therefore leaves two untagged package versions behind (one
+   with no tag. Every run therefore leaves untagged package versions behind (at least one
    index per platform), and a run with `publish=false` leaves no version tag. The `verify` jobs pull those digests with a
    read-only token. Each job checks the platform, the `openstorage --version` stamp, and
    the runtime tools. It then runs
