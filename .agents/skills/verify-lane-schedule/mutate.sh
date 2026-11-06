@@ -17,8 +17,8 @@
 # (`check.sh --fact <fact>=FALSE`) and expects the same property to fail.
 #
 # Needs what check.sh needs (Go, Java 11+, curl for the first TLC download),
-# plus git, bash 4 or newer, and python3 (not for --model). Takes about 2 to
-# 5 minutes, most of it the unmodified baseline runs.
+# plus git, bash 4 or newer, and python3 (not for --model). Took about 7
+# minutes with TLC_WORKERS=8, most of it the unmodified baseline runs.
 set -uo pipefail
 [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "mutate.sh: needs bash 4 or newer" >&2; exit 3; }
 model=0

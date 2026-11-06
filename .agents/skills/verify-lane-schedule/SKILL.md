@@ -205,7 +205,7 @@ Every fact was broken in the real code, one at a time, on a checkout whose cover
 .agents/skills/verify-lane-schedule/mutate.sh
 ```
 
-It needs what check.sh needs, plus git, bash 4 or newer, and python3, and takes about 2 to 5 minutes, most of it the unmodified baseline runs. It prints one line per break and ends with `COUNT: 12/12 mutations failed check.sh as expected`. It first runs each config it uses unmodified. When check.sh cannot run at all there (exit 3, such as a missing Java or a TLC error), mutate.sh stops with exit 3 and check.sh's error line, before any break. When you add, move or rename a fact's guard, update its line in `mutate.sh`:
+It needs what check.sh needs, plus git, bash 4 or newer, and python3, and took about 7 minutes with `TLC_WORKERS=8`, most of it the unmodified baseline runs. It prints one line per break and ends with `COUNT: 12/12 mutations failed check.sh as expected`. It first runs each config it uses unmodified. When check.sh cannot run at all there (exit 3, such as a missing Java or a TLC error), mutate.sh stops with exit 3 and check.sh's error line, before any break. When you add, move or rename a fact's guard, update its line in `mutate.sh`:
 
 | Scratch break | Fact | Config | Failed |
 |---|---|---|---|
