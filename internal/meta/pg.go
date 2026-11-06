@@ -30,11 +30,15 @@ const (
 	pgLockNotAvailable = "55P03"
 	// initSchemaLockWait bounds every lock wait of InitSchema after its
 	// advisory lock (issue #609). It stays well below deadlock_timeout (1s by
-	// default), so the boot gives up before PostgreSQL picks a deadlock
-	// victim, and the victim is never a request.
+	// default), so a wait cycle that crosses two tables ends with the boot's
+	// timeout before PostgreSQL's detector runs. A cycle inside one table
+	// never reaches the timeout: PostgreSQL aborts the writer as soon as it
+	// joins the queue, which is why the boot takes ACCESS EXCLUSIVE on repos
+	// first.
 	initSchemaLockWait = 250 * time.Millisecond
 	// initSchemaAttempts and initSchemaRetryDelay bound the retries of a
-	// boot that timed out on a lock: about a minute in all.
+	// boot that timed out on a lock: about 70 seconds in all, then
+	// InitSchema returns the lock error.
 	initSchemaAttempts   = 200
 	initSchemaRetryDelay = 100 * time.Millisecond
 	// repoURLConstraint is the named UNIQUE(org_id, url) constraint; it spans
@@ -80,10 +84,16 @@ func (s *PG) Close() { s.pool.Close() }
 // repo_upstreams through the default-branch trigger (issue #609), adoption
 // and the create completion lock a repos row FOR UPDATE first, and
 // SetRepoUpstream inserts into repo_upstreams before it locks a repos row.
-// No fixed lock order for the boot suits all of them, so the boot never
-// waits for long while it holds a lock: after the advisory lock it waits at
-// most initSchemaLockWait for any other, and a boot that times out rolls
-// back, which releases everything it held, and starts again.
+// No fixed lock order for the boot suits all of them. So the boot takes
+// ACCESS EXCLUSIVE on repos before any weaker lock on it: a boot that held
+// the SHARE lock of CREATE INDEX on repos while it waited for the ACCESS
+// EXCLUSIVE lock of ALTER TABLE repos would make a writer that holds a repos
+// row FOR UPDATE and then updates repos the deadlock victim at once. And
+// after the advisory lock the boot waits at most initSchemaLockWait for any
+// lock, so a cycle that crosses two tables ends with the boot's timeout: it
+// rolls back, which releases everything it held, and starts again. Sustained
+// writes can keep a boot waiting; after initSchemaAttempts it fails with the
+// lock error.
 func (s *PG) InitSchema(ctx context.Context) error {
 	var err error
 	for attempt := 1; attempt <= initSchemaAttempts; attempt++ {
@@ -106,11 +116,21 @@ func (s *PG) initSchemaOnce(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x4D455441)`); err != nil { // "META"
 			return err
 		}
-		// Bound every wait from here on (see InitSchema): a writer that holds
-		// one of the tables this DDL locks and waits for another is then
-		// never in a cycle with this boot. The wait on the advisory lock
-		// above holds no table, so it needs no bound.
+		// Bound every wait from here on (see InitSchema). The wait on the
+		// advisory lock above holds no table, so it needs no bound.
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = '%dms'`, initSchemaLockWait.Milliseconds())); err != nil {
+			return err
+		}
+		// Take repos at its strongest mode before any weaker lock on it. The
+		// boot then holds nothing on repos while it waits, so a writer's
+		// request for a stronger lock on repos queues ahead of the boot, and
+		// a boot that waits too long times out instead of deadlocking. A
+		// fresh database has no repos table and no writer yet. The other
+		// tables the DDL locks get their ACCESS EXCLUSIVE lock as their first
+		// lock, or never a stronger one than SHARE.
+		if _, err := tx.Exec(ctx, `DO $lk$ BEGIN
+			IF to_regclass('repos') IS NOT NULL THEN LOCK TABLE repos IN ACCESS EXCLUSIVE MODE; END IF;
+		END $lk$`); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `

@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // TestPGDefaultBranchTrigger (issue #609, case 2): during a rolling upgrade
@@ -149,19 +151,62 @@ func dropTrigger(ctx context.Context, t *testing.T, s *PG) {
 	})
 }
 
+// bootBehind starts InitSchema and returns its result channel once the boot
+// is blocked behind the transaction that runs on backend writerPID.
+func bootBehind(t *testing.T, s *PG, writerPID int) <-chan error {
+	t.Helper()
+	boot := make(chan error, 1)
+	go func() { boot <- s.InitSchema(context.Background()) }()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var blocked int
+		if err := s.pool.QueryRow(t.Context(),
+			`SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`, writerPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked > 0 {
+			return boot
+		}
+		select {
+		case err := <-boot:
+			t.Fatalf("the boot finished (%v) while the writer held its first lock", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the boot never waited for the writer")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// bootFinishes expects the boot to end without an error.
+func bootFinishes(t *testing.T, boot <-chan error) {
+	t.Helper()
+	select {
+	case err := <-boot:
+		if err != nil {
+			t.Fatalf("InitSchema after the writer finished: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the boot did not finish after the writer committed")
+	}
+}
+
 // TestPGInitSchemaLockOrder (issue #609): a boot runs DDL that takes ACCESS
 // EXCLUSIVE locks, and writers reach repos and repo_upstreams in more than
 // one order. The boot must finish, and so must the writer, whichever lock
 // the writer took first:
 //   - repos then repo_upstreams: an open PATCH holds repos and reaches
 //     repo_upstreams through the default-branch trigger.
-//   - repos FOR UPDATE then repo_upstreams: adoption and the create
-//     completion.
+//   - repos FOR UPDATE then repo_upstreams: adoption.
 //   - repo_upstreams then repos FOR UPDATE: SetRepoUpstream.
+//   - repos FOR UPDATE, then a stronger lock on repos: the create completion.
+//     A boot that holds the SHARE lock of CREATE INDEX on repos while it waits
+//     for ACCESS EXCLUSIVE makes PostgreSQL abort this writer at once.
 //
 // Each case holds the writer's first lock, waits until the boot is blocked
 // behind the writer, lets the writer take its second lock, and expects both
-// to finish: a deadlock aborts one of them after a second.
+// to finish: a deadlock aborts one of them.
 func TestPGInitSchemaLockOrder(t *testing.T) {
 	s, ok := pgBackend(t).(*PG)
 	if !ok {
@@ -169,6 +214,28 @@ func TestPGInitSchemaLockOrder(t *testing.T) {
 	}
 	ctx := t.Context()
 	org := seedOrg(t, s)
+	newRepo := func(t *testing.T, name string) Repo {
+		t.Helper()
+		repo, err := s.CreateLinkedRepo(ctx, org, "lock-order-"+name, "main",
+			RepoUpstream{Provider: "github", Owner: "acme", Name: "lock-order", UpstreamHost: "github.com", DefaultBranchOmitted: true}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return repo
+	}
+	writerTx := func(t *testing.T) (pgx.Tx, int) {
+		t.Helper()
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+		var pid int
+		if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			t.Fatal(err)
+		}
+		return tx, pid
+	}
 	for _, tc := range []struct{ name, first, second string }{
 		{"repos then repo_upstreams",
 			`UPDATE repos SET url = url WHERE repo_id = $1`,
@@ -181,49 +248,14 @@ func TestPGInitSchemaLockOrder(t *testing.T) {
 			`SELECT 1 FROM repos WHERE repo_id = $1 FOR UPDATE`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			repo, err := s.CreateLinkedRepo(ctx, org, "lock-order-"+tc.name, "main",
-				RepoUpstream{Provider: "github", Owner: "acme", Name: "lock-order", UpstreamHost: "github.com", DefaultBranchOmitted: true}, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			tx, err := s.pool.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = tx.Rollback(context.Background()) }()
-			var writerPID int
-			if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&writerPID); err != nil {
-				t.Fatal(err)
-			}
+			repo := newRepo(t, tc.name)
+			tx, pid := writerTx(t)
 			if _, err := tx.Exec(ctx, tc.first, repo.RepoID); err != nil {
 				t.Fatal(err)
 			}
-
-			boot := make(chan error, 1)
-			go func() { boot <- s.InitSchema(context.Background()) }()
-			deadline := time.Now().Add(30 * time.Second)
-			for {
-				var blocked int
-				if err := s.pool.QueryRow(ctx,
-					`SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`, writerPID).Scan(&blocked); err != nil {
-					t.Fatal(err)
-				}
-				if blocked > 0 {
-					break
-				}
-				select {
-				case err := <-boot:
-					t.Fatalf("the boot finished (%v) while the writer held its first lock", err)
-				default:
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("the boot never waited for the writer")
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-
+			boot := bootBehind(t, s, pid)
 			// A deadlock would hold the writer here until PostgreSQL's
-			// detector aborts one side, a second or more.
+			// detector aborts one side.
 			wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
 			if _, err := tx.Exec(wctx, tc.second, repo.RepoID); err != nil {
@@ -232,14 +264,26 @@ func TestPGInitSchemaLockOrder(t *testing.T) {
 			if err := tx.Commit(ctx); err != nil {
 				t.Fatalf("commit: %v", err)
 			}
-			select {
-			case err := <-boot:
-				if err != nil {
-					t.Fatalf("InitSchema after the writer finished: %v", err)
-				}
-			case <-time.After(30 * time.Second):
-				t.Fatal("the boot did not finish after the writer committed")
-			}
+			bootFinishes(t, boot)
 		})
 	}
+
+	t.Run("PGCompleteRepoCreate", func(t *testing.T) {
+		repo := newRepo(t, "complete-create")
+		tx, pid := writerTx(t)
+		var boot <-chan error
+		// The schedule callback runs between the FOR UPDATE and the UPDATE
+		// of repos, the window of the one-table cycle.
+		out, err := PGCompleteRepoCreate(ctx, tx, org, repo.RepoID, func(context.Context) error {
+			boot = bootBehind(t, s, pid)
+			return nil
+		})
+		if err != nil || out != CreateCompleted {
+			t.Fatalf("PGCompleteRepoCreate = %v, %v; want completed (a deadlock with the boot?)", out, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		bootFinishes(t, boot)
+	})
 }
