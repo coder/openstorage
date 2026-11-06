@@ -160,7 +160,8 @@ jobs:
           name: digest-${{ matrix.arch }}
           path: digest/${{ matrix.arch }}
           if-no-files-found: error
-          retention-days: 7
+          # An approval can wait 30 days, and publish needs this file after it.
+          retention-days: 35
 
   # Pull the staged digest of each platform and run every check on it, the Compose
   # quickstart smoke included. The token is read-only.
@@ -284,12 +285,21 @@ jobs:
           arm64=$(cat digest/arm64)
           [[ $amd64 =~ ^sha256:[a-f0-9]{64}$ && $arm64 =~ ^sha256:[a-f0-9]{64}$ && $amd64 != "$arm64" ]]
           docker buildx version
-          docker buildx imagetools create --tag "$IMAGE:$VERSION" \
-            --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            --annotation "index:org.opencontainers.image.revision=$COMMIT" \
-            --annotation "index:org.opencontainers.image.version=$VERSION" \
-            --annotation "index:org.opencontainers.image.description=Self-hosted, API-first Git storage" \
-            "$IMAGE@$amd64" "$IMAGE@$arm64"
+          create=(--tag "$IMAGE:$VERSION"
+            --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY"
+            --annotation "index:org.opencontainers.image.revision=$COMMIT"
+            --annotation "index:org.opencontainers.image.version=$VERSION"
+            --annotation "index:org.opencontainers.image.description=Self-hosted, API-first Git storage"
+            "$IMAGE@$amd64" "$IMAGE@$arm64")
+          # Look at the index before it exists. A version tag is never replaced, so the
+          # tag must not be created unless it will hold exactly the manifests of the two
+          # staged indexes (the images and their attestations).
+          staged=$(for d in "$amd64" "$arm64"; do
+            docker buildx imagetools inspect "$IMAGE@$d" --format '{{json .Manifest}}' | jq -r '.manifests[].digest'
+          done | sort)
+          planned=$(docker buildx imagetools create --dry-run "${create[@]}" | jq -r '.manifests[].digest' | sort)
+          [ -n "$staged" ] && [ "$staged" = "$planned" ]
+          docker buildx imagetools create "${create[@]}"
           # Parse JSON: some Buildx releases ignore a field template like
           # {{.Manifest.Digest}} and print the default table (docker/buildx#4006).
           digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
