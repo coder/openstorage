@@ -19,6 +19,17 @@ type DefaultBranchAdopter interface {
 	AdoptDefaultBranch(ctx context.Context, repoID, branch string) (adopted bool, err error)
 }
 
+// DefaultBranchEvidence is an UpstreamStore that keeps, per flagged repo,
+// the success count at which a worker with the adoption rule last handled
+// it (issue #609). The reconcile job re-requests a sync only for a repo
+// whose success count passed that evidence, which only a worker without the
+// rule can cause. The meta adapter implements it, and only PostgreSQL
+// stores the evidence: SQLite and S3WAL run one process, so no older worker
+// can sync beside it. MemStore does not implement it.
+type DefaultBranchEvidence interface {
+	RecordDefaultBranchChecked(ctx context.Context, repoID string, successCount int) error
+}
+
 // lsRemoteOutputCap bounds the captured `ls-remote --symref <url> HEAD`
 // output. The HEAD pattern also matches every upstream ref ending in
 // /HEAD, so the upstream controls the line count. git prints the HEAD
@@ -122,6 +133,25 @@ func (w *Worker) adoptHead(ctx context.Context, job Job, branch string) {
 			"org", job.Org, "repo", job.RepoID, "branch", branch, "err", err)
 	case adopted:
 		w.Logger.Info("adopted the upstream default branch", "org", job.Org, "repo", job.RepoID, "branch", branch)
+	}
+}
+
+// recordHeadChecked notes that this worker handled a flagged repo at the
+// given success count, whether or not the run succeeded, so the reconcile
+// job asks for one more sync only after a worker without the rule runs one.
+// A repo that this worker could not resolve keeps the documented rule: the
+// next successful sync tries again. A failed write is logged, and the cost
+// is one extra sync.
+func (w *Worker) recordHeadChecked(ctx context.Context, job Job, successCount int) {
+	e, ok := w.Upstreams.(DefaultBranchEvidence)
+	if !ok {
+		return
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+	defer cancel()
+	if err := e.RecordDefaultBranchChecked(rctx, job.RepoID, successCount); err != nil && !errors.Is(err, ErrNotFound) {
+		w.Logger.Warn("record default branch check failed; the reconcile job may request one more sync",
+			"org", job.Org, "repo", job.RepoID, "err", err)
 	}
 }
 

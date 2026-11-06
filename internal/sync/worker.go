@@ -488,6 +488,9 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	if w.Local != nil {
 		return runErr // intent that arrived mid-run stays due in the row; the sweep runs it
 	}
+	if up.DefaultBranchOmitted && fin.DefaultBranchOmitted {
+		w.recordHeadChecked(ctx, job, fin.SuccessCount)
+	}
 	if fin.SyncPending && w.Requeue != nil {
 		// Requests marked (RequestSync) after this run claimed are not
 		// covered by its fetch snapshot: schedule the coalesced follow-up

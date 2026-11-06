@@ -116,6 +116,18 @@ func (s metaUpstreams) AdoptDefaultBranch(ctx context.Context, repoID, branch st
 	return adopted, mapMetaErr(err, ErrNotFound, nil)
 }
 
+var _ DefaultBranchEvidence = metaUpstreams{}
+
+func (s metaUpstreams) RecordDefaultBranchChecked(ctx context.Context, repoID string, successCount int) error {
+	r, ok := s.ms.(interface {
+		RecordDefaultBranchChecked(ctx context.Context, repoID string, successCount int) error
+	})
+	if !ok {
+		return nil // only PostgreSQL keeps the evidence
+	}
+	return mapMetaErr(r.RecordDefaultBranchChecked(ctx, repoID, successCount), ErrNotFound, nil)
+}
+
 func (s metaUpstreams) PutUpstream(ctx context.Context, up Upstream) (Upstream, error) {
 	row, err := s.ms.SetRepoUpstream(ctx, meta.RepoUpstream{
 		RepoID: up.RepoID, Provider: up.Provider, Owner: up.Owner, Name: up.Name,
