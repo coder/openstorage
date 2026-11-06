@@ -166,7 +166,7 @@ func RunHook(ctx context.Context, args []string) error {
 
 func runHook(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return errors.New("hook: missing hook name argument")
+		return Refuse(errors.New("hook: missing hook name argument"))
 	}
 	switch args[0] {
 	case "pre-receive":
@@ -178,7 +178,7 @@ func runHook(ctx context.Context, args []string) error {
 	case "reference-transaction":
 		return referenceTransactionHook(args[1:])
 	default:
-		return fmt.Errorf("unknown hook %q", args[0])
+		return refusef("unknown hook %q", args[0])
 	}
 }
 
