@@ -53,10 +53,12 @@ func (q *River) StartLaneScan(org string, delay, interval time.Duration) {
 	assertf(q.started && org != "" && delay >= 0 && interval > 0,
 		"StartLaneScan: started=%v org %q delay %v interval %v", q.started, org, delay, interval)
 	ctx, cancel := context.WithCancel(context.Background())
+	// The lock covers scanning.Go, so a stopLaneScan waits for the pass it
+	// starts, and a failed assertion does not leave the lock held.
 	q.scanMu.Lock()
+	defer q.scanMu.Unlock()
 	assertf(q.scanStop == nil, "StartLaneScan: started twice or after the scan stopped")
 	q.scanStop = cancel
-	q.scanMu.Unlock()
 	q.scanning.Go(func() {
 		wait := delay
 		for {

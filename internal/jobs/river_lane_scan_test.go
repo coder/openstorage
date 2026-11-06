@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	stdsync "sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/riverqueue/river"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/events"
@@ -115,7 +117,8 @@ func TestRiverLaneScanRequeuesLanesWithoutJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer q.Close()
-	q.logger = slog.New(slog.DiscardHandler)
+	logs := &scanLogs{}
+	q.logger = slog.New(logs)
 
 	discardJobs := func(repoID string) {
 		env.exec(t, ctx, `UPDATE river_job SET state = 'discarded', finalized_at = now() WHERE args->>'repo_id' = $1`, repoID)
@@ -210,6 +213,23 @@ func TestRiverLaneScanRequeuesLanesWithoutJob(t *testing.T) {
 			t.Errorf("%s: live jobs %+v, want %+v", tc.name, got, tc.want)
 		}
 	}
+	// Each requeue logs one warning that names the org, the repo and the
+	// lane.
+	var wantLogs []string
+	for i, tc := range cases {
+		switch tc.name {
+		case "push_pending_discarded", "push_claim_expired":
+			wantLogs = append(wantLogs, "WARN org "+repos[i]+" push")
+		case "pull_pending_discarded", "pull_claim_expired":
+			wantLogs = append(wantLogs, "WARN org "+repos[i]+" pull")
+		}
+	}
+	gotLogs := logs.requeues()
+	slices.Sort(wantLogs)
+	slices.Sort(gotLogs)
+	if !slices.Equal(gotLogs, wantLogs) {
+		t.Errorf("requeue logs = %q, want %q", gotLogs, wantLogs)
+	}
 	// The scan's jobs are the ones EnqueuePush and EnqueueSync insert.
 	for i, tc := range cases {
 		if tc.name != "push_pending_discarded" && tc.name != "pull_pending_discarded" {
@@ -227,6 +247,9 @@ func TestRiverLaneScanRequeuesLanesWithoutJob(t *testing.T) {
 	// Every lane with work now has a live job: the next pass adds none.
 	if requeued, err := q.scanLanes(ctx, "org"); err != nil || requeued != 0 {
 		t.Fatalf("second pass requeued %d (err %v), want 0", requeued, err)
+	}
+	if got := logs.requeues(); len(got) != len(wantLogs) {
+		t.Fatalf("requeue logs after the second pass = %q, want no new ones", got)
 	}
 }
 
@@ -306,7 +329,9 @@ func (e laneScanEnv) laneTrio(t *testing.T, ctx context.Context) (a, b, c string
 }
 
 // lockJob holds a row lock on repoID's push job until the returned release
-// runs, so a scan insert that meets the job waits.
+// runs, so a scan insert that meets the job waits. A River with workers
+// must insert the job with schedulePush: a worker can fetch an available
+// job before the lock.
 func (e laneScanEnv) lockJob(t *testing.T, ctx context.Context, repoID string) (release func()) {
 	t.Helper()
 	tx, err := e.conn.Begin(ctx)
@@ -315,10 +340,19 @@ func (e laneScanEnv) lockJob(t *testing.T, ctx context.Context, repoID string) (
 	}
 	var n int
 	if err := tx.QueryRow(ctx, `WITH l AS (SELECT id FROM river_job WHERE kind = 'upstream_push' AND args->>'repo_id' = $1
-		AND state = 'available' FOR UPDATE) SELECT count(*) FROM l`, repoID).Scan(&n); err != nil || n != 1 {
+		AND state IN ('available', 'scheduled') FOR UPDATE) SELECT count(*) FROM l`, repoID).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("lock the push job of %s: %d rows, %v", repoID, n, err)
 	}
 	return func() { _ = tx.Rollback(ctx) }
+}
+
+// schedulePush inserts repoID's push job (the args and uniqueness of
+// EnqueuePush) an hour ahead, so no worker fetches it.
+func schedulePush(t *testing.T, ctx context.Context, q *River, repoID string) {
+	t.Helper()
+	if _, err := q.client.Insert(ctx, pushArgs{Org: "org", RepoID: repoID}, &river.InsertOpts{ScheduledAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestRiverLaneScanResumesAfterTimeout: a pass that handled lanes until
@@ -490,7 +524,7 @@ func TestRiverLaneScanRunsStrandedLanes(t *testing.T) {
 	stops("Close", closed, closed.Close)
 }
 
-// scanLogs records the lane scan's outcome log records in order.
+// scanLogs records the lane scan's log records in order.
 type scanLogs struct {
 	mu   stdsync.Mutex
 	recs []slog.Record
@@ -500,7 +534,8 @@ func (l *scanLogs) Enabled(context.Context, slog.Level) bool { return true }
 func (l *scanLogs) WithAttrs([]slog.Attr) slog.Handler       { return l }
 func (l *scanLogs) WithGroup(string) slog.Handler            { return l }
 func (l *scanLogs) Handle(_ context.Context, r slog.Record) error {
-	if r.Message == "lane scan: pass ran out of time" || r.Message == "lane scan failed" {
+	if r.Message == "lane scan: pass ran out of time" || r.Message == "lane scan failed" ||
+		r.Message == "lane scan: requeued a lane whose work had no job" {
 		l.mu.Lock()
 		l.recs = append(l.recs, r.Clone())
 		l.mu.Unlock()
@@ -508,12 +543,35 @@ func (l *scanLogs) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
+// levels lists the pass outcome records as "LEVEL message".
 func (l *scanLogs) levels() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var out []string
 	for _, r := range l.recs {
-		out = append(out, r.Level.String()+" "+r.Message)
+		if r.Message != "lane scan: requeued a lane whose work had no job" {
+			out = append(out, r.Level.String()+" "+r.Message)
+		}
+	}
+	return out
+}
+
+// requeues lists the requeue records as "LEVEL org repo lane", the line
+// docs/how-to/deploy-production.md tells operators to monitor.
+func (l *scanLogs) requeues() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, r := range l.recs {
+		if r.Message != "lane scan: requeued a lane whose work had no job" {
+			continue
+		}
+		attrs := map[string]string{}
+		r.Attrs(func(a slog.Attr) bool {
+			attrs[a.Key] = a.Value.String()
+			return true
+		})
+		out = append(out, fmt.Sprintf("%s %s %s %s", r.Level, attrs["org"], attrs["repo"], attrs["lane"]))
 	}
 	return out
 }
@@ -537,9 +595,7 @@ func TestRiverLaneScanLogsOutOfTimeAtInfo(t *testing.T) {
 	laneScanTimeout = 2 * time.Second // below laneRequeueTimeout: the blocked lane ends each pass
 	t.Cleanup(func() { laneScanTimeout = prev })
 	_, b, _ := env.laneTrio(t, ctx)
-	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: b}); err != nil {
-		t.Fatal(err)
-	}
+	schedulePush(t, ctx, q, b) // q has workers
 	defer env.lockJob(t, ctx, b)()
 
 	q.StartLaneScan("org", 0, 100*time.Millisecond)
@@ -548,4 +604,89 @@ func TestRiverLaneScanLogsOutOfTimeAtInfo(t *testing.T) {
 	if got[0] != "INFO lane scan: pass ran out of time" || got[1] != "WARN lane scan failed" {
 		t.Fatalf("pass outcome logs = %q; want Info for the pass that handled a, then a warning for the pass stuck at b", got)
 	}
+}
+
+// TestRiverLaneScanPassSchedule: StartLaneScan runs its first pass after
+// delay and each later pass interval after the one before.
+func TestRiverLaneScanPassSchedule(t *testing.T) {
+	ctx := context.Background()
+	env := newLaneScanEnv(t, ctx)
+	prev := laneScanTimeout
+	laneScanTimeout = time.Nanosecond // every pass fails at once and logs a warning
+	t.Cleanup(func() { laneScanTimeout = prev })
+	_, ups := sync.MetaStores(env.ms)
+	noRun := func(context.Context, sync.Job) error { return nil }
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	start := func(delay, interval time.Duration) *scanLogs {
+		t.Helper()
+		logs := &scanLogs{}
+		q, err := NewRiver(ctx, env.pgURL, deliverer, noRun, noRun, ups, nil, nil, nil, nil, slog.New(logs))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(q.Close) // before the laneScanTimeout restore
+		q.StartLaneScan("org", delay, interval)
+		return logs
+	}
+	now := start(0, time.Hour)
+	later := start(time.Hour, time.Millisecond)
+	waitFor(t, "the first pass", func() bool { return len(now.levels()) >= 1 })
+	time.Sleep(time.Second)
+	if got := now.levels(); len(got) != 1 || got[0] != "WARN lane scan failed" {
+		t.Fatalf("passes with no delay and an hour's interval logged %q; want one pass", got)
+	}
+	if got := later.levels(); len(got) != 0 {
+		t.Fatalf("passes with an hour's delay logged %q; want none yet", got)
+	}
+}
+
+// TestRiverLaneScanStopEndsPassQuietly: a stop that cuts a pass short
+// waits for it and logs no failure, the pass keeps its cursor, and the
+// River refuses a later StartLaneScan, even one whose scan never started.
+func TestRiverLaneScanStopEndsPassQuietly(t *testing.T) {
+	ctx := context.Background()
+	env := newLaneScanEnv(t, ctx)
+	_, ups := sync.MetaStores(env.ms)
+	noRun := func(context.Context, sync.Job) error { return nil }
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	logs := &scanLogs{}
+	q, err := NewRiver(ctx, env.pgURL, deliverer, noRun, noRun, ups, nil, nil, nil, nil, slog.New(logs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	a, b, c := env.laneTrio(t, ctx)
+	schedulePush(t, ctx, q, b)     // q has workers
+	defer env.lockJob(t, ctx, b)() // the pass waits at b
+
+	q.StartLaneScan("org", 0, time.Hour)
+	waitFor(t, "a's requeue", func() bool { return len(logs.requeues()) >= 1 })
+	q.DrainSyncRuns(ctx, time.Second)
+	if got := logs.requeues(); len(got) != 1 || got[0] != "WARN org "+a+" push" {
+		t.Fatalf("requeue logs = %q; want only a's: the stop must cut the pass short at b, before c (%s)", got, c)
+	}
+	if got := logs.levels(); len(got) != 0 {
+		t.Fatalf("a pass cut short by the stop logged %q; want nothing", got)
+	}
+	if q.scanCursor != a {
+		t.Fatalf("cursor %q after the stop, want a (%s)", q.scanCursor, a)
+	}
+
+	refused := func(what string, q *River) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Fatalf("StartLaneScan after %s started a scan; want its assertion to fail", what)
+			}
+		}()
+		q.StartLaneScan("org", time.Hour, time.Hour)
+	}
+	refused("DrainSyncRuns", q)
+	unscanned, err := NewRiver(ctx, env.pgURL, deliverer, noRun, noRun, ups, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unscanned.DrainSyncRuns(ctx, time.Second)
+	refused("DrainSyncRuns of a River that never scanned", unscanned)
+	unscanned.Close()
 }
