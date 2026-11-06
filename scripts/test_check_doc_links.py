@@ -457,6 +457,12 @@ class CitationTests(CheckerTestCase):
                     result = self.check_readme(f"[app.{kind}:Hidden] [app.{kind}:{section}]\n", **{f"pkg/app.{kind}": unit})
                     self.assert_failures(result, ("UNRESOLVED CITATION", f"[app.{kind}:Hidden]"))
 
+    def test_a_carriage_return_line_feed_and_a_carriage_return_are_two_unit_file_line_ends(self):
+        # systemd reads the pair, then the lone carriage return: an empty line ends the continuation, so `[Hidden]` is a header.
+        unit = "[Unit]\nDescription=a \\\r\n\r[Hidden]\nKey=value\n"
+        result = self.check_readme("[app.service:Hidden]\n", **{"pkg/app.service": unit})
+        self.assertEqual(result.stdout, "broken links: 0\n")
+
     def test_a_unit_file_reads_a_section_header_and_a_comment_as_systemd_does(self):
         # systemd trims only a space and a tab, allows nothing after `]`, and ends a line at a NUL.
         files = {
@@ -511,6 +517,7 @@ class CitationTests(CheckerTestCase):
             "item-content": ("`[Gone](gone.md)\n- \x1e\n`\n", "README.md:1"),
             "quote": (">\x1d\n\t[Gone](gone.md)\n", "README.md:2"),
             "item-marker": ("-   \x0c\n\n      [Gone](gone.md)\n", "README.md:3"),
+            "item-text": ("-\n\x0c\n   [\n    *     ](gone.md)\n", "README.md:4"),
             "lazy-line": ("- a\n\x0c\n\n    [Gone](gone.md)\n", "README.md:4"),
         }
         for name, (readme, where) in cases.items():
@@ -996,13 +1003,15 @@ class FileSelectionTests(CheckerTestCase):
         self.assertEqual(result.stdout, "".join(f"BROKEN FILE (not tracked by git) README.md:1 -> {name}\n" for name in names)
                          + "broken links: 3\n", result.stderr)
 
-    def test_an_index_listing_that_cannot_be_read_exits_2_without_checking(self):
-        # A `git` on PATH that passes everything through, except that it damages the `--debug` listing of the index.
+    def test_a_git_that_fails_or_lists_the_index_wrongly_exits_2_without_checking(self):
+        # A `git` on PATH that passes everything through, except that it fails or damages the `--debug` listing of the index.
         wrapper = textwrap.dedent("""\
             #!%s
             import os, re, subprocess, sys
             done = subprocess.run([os.environ["REAL_GIT"], *sys.argv[1:]], capture_output=True)
             out, mode = done.stdout, os.environ["DAMAGE"]
+            if mode == "fail":
+                sys.exit(1)
             if "--debug" in sys.argv:
                 entries = re.findall(rb"[^\\0]*\\0(?:  [^\\n]*\\n){4}  size: [^\\n]*\\tflags: [0-9a-f]+\\n", out)
                 assert b"".join(entries) == out and len(entries) > 2
@@ -1017,12 +1026,16 @@ class FileSelectionTests(CheckerTestCase):
             fake = Path(bin_dir) / "git"
             fake.write_text(wrapper, encoding="utf-8")
             fake.chmod(0o755)
-            for mode in ["intact", "cut", "gap", "junk", "tail", "last", "none"]:
+            for mode in ["intact", "cut", "gap", "junk", "tail", "last", "none", "fail"]:
                 with self.subTest(damage=mode):
                     env = {**os.environ, "PATH": bin_dir + os.pathsep + os.environ["PATH"], "REAL_GIT": shutil.which("git"), "DAMAGE": mode}
                     result = self.run_checker("[Doc](docs/a.md)\n", docs={"a.md": "# A\n", "b.md": "# B\n"}, env=env)
                     if mode == "intact":
                         self.assertEqual((result.returncode, result.stdout), (0, "broken links: 0\n"), result.stderr)
+                        continue
+                    if mode == "fail":  # git exits 1 and prints nothing to stderr
+                        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                         (2, "", "check-doc-links.py needs a git checkout: git ls-files exited 1\n"))
                         continue
                     self.assertEqual((result.returncode, result.stdout), (2, ""), result.stderr)
                     self.assertEqual(result.stderr, "check-doc-links.py cannot read the index flags from `git ls-files --debug`\n")
