@@ -423,9 +423,10 @@ class CitationTests(CheckerTestCase):
 
     def test_every_javascript_continuation_ending_keeps_the_next_line_in_its_expression(self):
         endings = ["=", "(", "[", ",", "?", ":", "+", "-", "*", "/", "%", "&", "|", "^", "<", ">", "!", "~", ".",
-                   "&&", "||", "??", "=>", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof",
-                   "void"]
-        ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new", "obj.of"]
+                   "&&", "||", "??", "=>", "+-", "-+", "+++", "---", "+ ++", "- --", "= ++", "( ++", "typeof ++", "...typeof",
+                   "...new", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof", "void"]
+        ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new", "obj.of", "a[0]++",
+                            "a?.new"]
         js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}\n" for i, op in enumerate(endings))
         js += "".join(f"x {op}\nfunction closed{i}() {{}}\n" for i, op in enumerate(ends_a_statement))
         cited = [f"[flow.js:open{i}]" for i in range(len(endings))]
@@ -440,6 +441,7 @@ class CitationTests(CheckerTestCase):
             "class A extends /`/.constructor {}\n", "const q = x in /`/;\n", "const q = x instanceof /`/.constructor;\n",
             "const q = new /`/.constructor();\n", "const q = typeof /`/;\n", "const q = void /`/;\n",
             "switch (x) {\n  case /`/.source:\n}\n", "function f() {\n  return /`/.test(x);\n}\n", "function g() {\n  throw /`/;\n}\n",
+            "const a = [...typeof /`/];\n", "const a = [...void /`/];\n", "const a = {...new /`/.constructor()};\n",
         ]
         sources = [prefix + trap for prefix in [
             "const r = /`/;\n", "const r = /[`]/g;\n", "const r = /'`/;\n", "const r = /[/]`/;\n", "const r = /[/*]/;\n",
@@ -478,12 +480,20 @@ class CitationTests(CheckerTestCase):
         self.assert_failures(result)
         self.assertEqual(result.returncode, 0)
 
-    def test_javascript_reader_skips_a_hashbang_and_a_byte_order_mark(self):
-        result = self.check_readme("[hashbang.js:afterHashbang] [bom.js:afterBom]\n", **{
+    def test_javascript_reserved_words_after_a_declaration_keyword_are_not_names(self):
+        # `let` is an identifier here, and the class has no name: JavaScript declares none of these words.
+        files = {"pkg/let_in.js": "let in obj\nfunction real() {}\n", "pkg/let_instanceof.js": "let instanceof Object\nfunction real() {}\n",
+                 "pkg/anonymous.js": "export default class extends Object {}\nfunction real() {}\n"}
+        cited = ["[let_in.js:in]", "[let_instanceof.js:instanceof]", "[anonymous.js:extends]",
+                 "[let_in.js:real]", "[let_instanceof.js:real]", "[anonymous.js:real]"]
+        result = self.check_readme(" ".join(cited) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in cited[:3]])
+
+    def test_javascript_reader_skips_a_hashbang_and_reads_a_byte_order_mark_as_white_space(self):
+        result = self.check_readme("[hashbang.js:afterHashbang] [bom.js:bom] [bom.js:afterBom] [bom.js:viaBom]\n", **{
             "pkg/hashbang.js": "#!/usr/bin/env node\nfunction afterHashbang() {}\n",
-            "pkg/bom.js": "\ufeffconst bom = 1;\nfunction afterBom() {}\n"})
-        self.assert_failures(result)
-        self.assertEqual(result.returncode, 0)
+            "pkg/bom.js": "\ufeffconst bom = 1;\nconst open = x +\ufeff\n  function viaBom() {}\nfunction afterBom() {}\n"})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[bom.js:viaBom]"))
 
     def test_javascript_reader_stops_where_it_cannot_be_sure_of_the_code(self):
         division = "tell a regex literal from a division"

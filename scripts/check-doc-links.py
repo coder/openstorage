@@ -544,14 +544,16 @@ def tf_names(text):
 
 # A line that ends in one of these leaves its expression open, so the next
 # line continues it and a function or class there is not a declaration. A
-# postfix `++` or `--` ends a statement, so it is left out, and so are
-# `return`, `throw` and `yield`, which end at a line break. A trailing `/` is
-# read as division, never as the end of a regex literal: a statement that
-# ends in a regex literal and has no `;` fails closed. A string keeps its
-# quotes in the masked text, so a line that ends in a string never looks like
-# a dangling `=`.
-JS_CONTINUES = re.compile(r"(?<![+-])[+-]$|[=(\[,?:*/%&|^<>!~.]$"
-                          r"|(?<![\w$.])(?:await|case|delete|extends|in|instanceof|new|of|typeof|void)$")
+# trailing `+` or `-` does too, and so does a `++` or `--` that is not a
+# postfix operator after a name or `]` (js_continues), because a prefix one
+# takes the next line as its operand. `return`, `throw` and `yield` also end
+# at a line break, so they are left out. A trailing `/` is read as division,
+# never as the end of a regex literal: a statement that ends in a regex
+# literal and has no `;` fails closed. A string keeps its quotes in the
+# masked text, so a line that ends in a string never looks like a dangling
+# `=`.
+JS_CONTINUES = re.compile(r"[=(\[,?:*/%&|^<>!~.]$"
+                          r"|(?<![\w$])(?:(?<!\.)|(?<=\.\.\.))(?:await|case|delete|extends|in|instanceof|new|of|typeof|void)$")
 
 
 # JavaScript is lexed, not pattern-matched. A `/` divides after a value and
@@ -567,7 +569,7 @@ JS_TOKEN = re.compile(
     r"|(?P<string>\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')"
     r"|(?P<word>\#?(?:[^\W\d]|\$)[\w$]*|\.?\d[\w$]*(?:\.[\w$]*)?)"
     r"|(?P<html><!--|-->)|(?P<incr>\+\+|--)|(?P<open>[{(\[])|(?P<close>[})\]])"
-    r"|(?P<op>[!%&*+,.:;<=>?@^|~-])|(?P<tick>`)|(?P<slash>/)", re.S)
+    r"|(?P<op>\.\.\.|[!%&*+,.:;<=>?@^|~-])|(?P<tick>`)|(?P<slash>/)", re.S)
 JS_TEMPLATE = re.compile(r"\\.|`|\$\{", re.S)
 JS_REGEX = re.compile(r"/(?:\\[^\n\r\u2028\u2029]|\[(?:\\[^\n\r\u2028\u2029]|[^\]\\\n\r\u2028\u2029])*\]"
                       r"|[^/\\\[\n\r\u2028\u2029])+(?P<end>/)[\w$]*")
@@ -575,6 +577,12 @@ JS_BEFORE_REGEX = {"case", "default", "delete", "do", "else", "extends", "in", "
                    "typeof", "void"}
 JS_UNKNOWN = {"await", "of", "yield"}
 JS_LINE_BREAK = re.compile(r"[\n\r\u2028\u2029]")
+JS_SIGN = re.compile(r"\+\+|--|[+-]")
+# No declaration can name one of these: `let in x` and `let instanceof x` use
+# `let` as a variable, and `class extends X {}` has no name.
+JS_RESERVED = {"break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum",
+               "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "new", "null",
+               "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with"}
 
 
 def js_mask(text):
@@ -673,6 +681,16 @@ class JsNames(set):
     note = ""
 
 
+def js_continues(line):
+    run = re.search(r"[+-]*$", line)
+    signs = JS_SIGN.findall(run.group())
+    if not signs:
+        return bool(JS_CONTINUES.search(line))
+    postfix = len(signs) == 1 and len(signs[0]) == 2 and re.search(
+        r"(?:^|[^\w$])(?!(?:%s)$)[\w$]+$|\]$" % "|".join(JS_BEFORE_REGEX | JS_UNKNOWN), line[:run.start()].rstrip())
+    return not postfix
+
+
 def js_names(text):
     blanked, stop = js_mask(text)
     names, prior = JsNames(), ""
@@ -681,12 +699,12 @@ def js_names(text):
         blanked = blanked[:blanked.rfind("\n", 0, offset) + 1]
         stopped = text.count("\n", 0, offset) + 1
         names.note = f"; the JavaScript reader stops at line {stopped}, where it cannot {cannot}"
-    for line in blanked.split("\n"):
+    for line in blanked.replace("\ufeff", " ").split("\n"):
         code = line.rstrip()
         if not code:
             continue
         m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )([\w$]+)", line)
-        if m and not JS_CONTINUES.search(prior):
+        if m and m.group(1) not in JS_RESERVED and not js_continues(prior):
             names.add(m.group(1))
         prior = code
     return names
