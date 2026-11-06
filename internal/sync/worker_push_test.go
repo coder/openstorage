@@ -905,8 +905,8 @@ func TestHeldRefStaleReadsGit423(t *testing.T) {
 }
 
 // A River push run whose loopback fetch the server refuses with 423 (a push
-// holds a ref the cache has not caught up with, githttp.Server's
-// StrictSyncFetch) hands its request back with RestorePush and fails, so
+// holds a ref the cache has not caught up with, githttp.Server's strict
+// sync fetch) hands its request back with RestorePush and fails, so
 // River snoozes the job and runs it again, as after a failed publication
 // wait. Forwarding the snapshot would publish the held ref at its older
 // value, and a done run would consume the newer write's request. The run

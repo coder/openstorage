@@ -81,7 +81,7 @@ The model (`model/LaneSchedule.tla`) is a hand-written description of the code. 
    | `WaitBeforeSnapshot` | `RunPush` calls `w.waitPublication` before `w.transferPush`, and `buildLocalSyncQueue` wires it to `githttp.WaitForPushPublication` | `NoLostForward` |
    | `ShutdownRestores` | `RunPush`'s `if runErr != nil && shutdownAborted(ctx)` branch restores through `w.restoreForShutdown` with `meta.OutcomeRestore`, before `localPushOutcome` | `NoLostForward` |
    | `MarkBeforeCas` | `events.RefStore.CASRef` and `CASRefGen` return `runBeforeCAS`'s error before the inner CAS, and `runBeforeCAS` calls the `BeforeCAS` option; `wireHookEventing`'s local-schedule branch sets it to `enqueueSyncOrForward(...)` and passes `BeforeCAS: beforeCAS`; `updateHook` reserves the ref's hold (`reservePushHoldsCovering`) before `store.CASRefGen` | `NoLostForward` |
-   | `StrictSnapshot` | `Server.hydrate` hydrates strictly for an upload-pack with a sync claim on a `StrictSyncFetch` server, and serve sets `StrictSyncFetch` from `meta.LocalSchedule`; `hydrateRefs` takes the held-skip short cuts only under `!strictHeld` and returns `ErrHeldRefStale` when a strict sync skipped a held ref; `hydrateFailed` answers it with 423 Locked; `transferPush` wraps `errHeldRefStale` when `heldRefStale(stderr)` sees `HTTP 423`; `RunPush` then restores through `w.restoreLocal` with `meta.OutcomeRestore`, before `localPushOutcome` | `NoLostForward` |
+   | `StrictSnapshot` | `Server.hydrate` hydrates strictly for an upload-pack with a sync claim; `hydrateRefs` takes the held-skip short cuts only under `!strictHeld` and returns `ErrHeldRefStale` when a strict sync skipped a held ref; `hydrateFailed` answers it with 423 Locked; `transferPush` wraps `errHeldRefStale` when `heldRefStale(stderr)` sees `HTTP 423`; `RunPush` then restores through `w.restoreLocal` with `meta.OutcomeRestore`, before `localPushOutcome` | `NoLostForward` |
    | `RestMarkBeforeCas` | `buildServeEventing`'s local branch sets `heldBeforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)` and passes `HeldBeforeCAS: heldBeforeCAS`; `runBeforeCAS` calls it; `restIntentBeforeCAS` calls `githttp.HoldRef` before `ms.RequestPush`; `HoldRef` reserves the hold (`reservePushHolds`); `runBeforeCAS` wraps the release in `sync.OnceFunc`; `RefStore.CASRef` and `CASRefGen` defer `release()` before the inner CAS, so a panicking CAS still ends the hold, and call it after the inner CAS, before `s.emitPush` | `NoLostForward` |
 
    The "property that fails" column is measured: each guard was broken once in the real code, and check.sh failed with the first property listed (see [Validation](#validation)). For the two rows that list `NoLostForward` second, a one-off model run with that fact FALSE and `NoLostForward` as the only invariant of `LaneSchedule.cfg` failed it too. No script reruns that second result.
@@ -239,8 +239,6 @@ Every declaration in these files is covered:
 - `internal/api/handlers_sync.go` (`push-upstream` and its `RequestPushNow`)
 - `internal/githttp/publication.go`, `internal/githttp/hydrate.go`, `internal/githttp/hook.go` (push holds, their release, the publication wait, the held-ref skip and the strict sync fetch)
 - `internal/githttp/server.go` (which fetches hydrate strictly, and the 423 answer)
-
-`cmd/openstorage/main.go` sets `StrictSyncFetch` for the local schedule. Only the `StrictSnapshot` fact checks that line: the file is mostly unrelated serve wiring.
 
 `model/fingerprints.txt` holds one hash per declaration.
 

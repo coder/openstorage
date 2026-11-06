@@ -622,8 +622,8 @@ emits `repo.push_upstream.started` right before its `repo.push_upstream.failed`.
 in-flight runs in both directions. A run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
-a new `repo.sync.started` (outbound: `repo.push_upstream.started`). On SQLite and S3WAL,
-an outbound run emits no event when a write in progress (a git push, or a ref write
+a new `repo.sync.started` (outbound: `repo.push_upstream.started`). An outbound run
+emits no event when a write in progress (a git push, or on SQLite and S3WAL a ref write
 through this API) holds a ref that the run would otherwise forward at an older value:
 the request stays pending, and a new run starts a few seconds later.
 

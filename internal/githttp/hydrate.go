@@ -3729,8 +3729,8 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 // before the caller acts on the stale value.
 var ErrHeldRefStale = errors.New("a push holds a ref whose cached value is older than the authority")
 
-// hydrateRefs is Hydrate. With strictHeld (a local push run's loopback
-// fetch, Server.StrictSyncFetch), a sync that skips a held ref returns
+// hydrateRefs is Hydrate. With strictHeld (a push run's loopback fetch,
+// Server.hydrate), a sync that skips a held ref returns
 // ErrHeldRefStale, and a held-skip verdict never short-cuts the sync.
 // Hold and marker handling is the same in both modes.
 func hydrateRefs(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string, strictHeld bool) (repoPath string, refsErr error, err error) {
