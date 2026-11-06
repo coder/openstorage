@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // A racing GET that fails its op deadline is runner noise when the test
@@ -35,6 +36,7 @@ const (
 	// and a read that Floci holds must not look frozen because of that.
 	stallGap        = 100 * time.Millisecond
 	maxReadFailures = 256 // failed reads kept for classification; the rest count as unexplained
+	maxLogged       = 3   // failed reads quoted in the verdict detail
 )
 
 // Every time here is an offset from the start of the race, taken with
@@ -59,14 +61,15 @@ func (s *stallTracker) tick(at time.Duration) {
 	s.last = at
 }
 
-// watchStalls starts the heartbeat at base. The returned stop ends it and
-// returns the spans. It may be called more than once.
-func watchStalls(base time.Time) (stop func() []stallSpan) {
+// watchStalls starts a heartbeat that ticks every tick, with offsets taken
+// from base. The returned stop ends it with one last tick and returns the
+// spans. It may be called more than once.
+func watchStalls(base time.Time, tick time.Duration) (stop func() []stallSpan) {
 	tr := &stallTracker{minGap: stallGap}
 	quit, done := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(done)
-		t := time.NewTicker(stallTick)
+		t := time.NewTicker(tick)
 		defer t.Stop()
 		for {
 			select {
@@ -112,11 +115,11 @@ func (f readFailure) stalledFor(spans []stallSpan) (frozen time.Duration) {
 
 // explainedByStall reports whether a stall of the test process explains the
 // failed read: it hit the op deadline, and the process was awake for under a
-// quarter of that deadline. A healthy GET answers in milliseconds, so a read
-// that ran awake for longer was waiting for Floci or the network, not for
-// the test process.
+// twentieth of that deadline. A healthy GET answers in 9 to 17 ms and a read
+// that a freeze took keeps 0 to 18 ms awake, so a read that ran awake for
+// 100 ms was waiting for Floci or the network, not for the test process.
 func explainedByStall(f readFailure, spans []stallSpan, opTimeout time.Duration) bool {
-	return errors.Is(f.err, context.DeadlineExceeded) && f.elapsed()-f.stalledFor(spans) < opTimeout/4
+	return errors.Is(f.err, context.DeadlineExceeded) && f.elapsed()-f.stalledFor(spans) < opTimeout/20
 }
 
 // shortBodyError marks a GET whose headers arrived and whose body did not
@@ -162,12 +165,14 @@ func TestExplainedByStall(t *testing.T) {
 		{"freeze started before the read", deadline, 100 * time.Millisecond, 2100 * time.Millisecond, []stallSpan{span(0, 2150*time.Millisecond)}, true},
 		{"freeze ended after the read", deadline, 0, 2200 * time.Millisecond, []stallSpan{span(30*time.Millisecond, 4*time.Second)}, true},
 		{"many short freezes add up", deadline, 0, 2100 * time.Millisecond,
-			[]stallSpan{span(0, 500*time.Millisecond), span(600*time.Millisecond, 1100*time.Millisecond), span(1200*time.Millisecond, 1700*time.Millisecond), span(1800*time.Millisecond, 2080*time.Millisecond)}, true},
+			[]stallSpan{span(0, 520*time.Millisecond), span(540*time.Millisecond, 1060*time.Millisecond), span(1080*time.Millisecond, 1600*time.Millisecond), span(1620*time.Millisecond, 2080*time.Millisecond)}, true},
 		{"no freeze: Floci or the network held the read", deadline, 0, 2000 * time.Millisecond, nil, false},
 		{"a short freeze inside a read held by Floci", deadline, 0, 2000 * time.Millisecond, []stallSpan{span(300*time.Millisecond, 600*time.Millisecond)}, false},
 		{"freeze outside the read", deadline, 0, 2000 * time.Millisecond, []stallSpan{span(3*time.Second, 6*time.Second)}, false},
-		{"awake just under a quarter of the deadline", deadline, 0, 2500 * time.Millisecond, []stallSpan{span(0, 2001*time.Millisecond)}, true},
-		{"awake a quarter of the deadline", deadline, 0, 2500 * time.Millisecond, []stallSpan{span(0, 2000*time.Millisecond)}, false},
+		{"awake just under a twentieth of the deadline", deadline, 0, 2500 * time.Millisecond, []stallSpan{span(0, 2401*time.Millisecond)}, true},
+		{"awake a twentieth of the deadline", deadline, 0, 2500 * time.Millisecond, []stallSpan{span(0, 2400*time.Millisecond)}, false},
+		{"Floci held the read while the process froze for 1.5 s of it", deadline, 0, 2000 * time.Millisecond, []stallSpan{span(0, 1500*time.Millisecond)}, false},
+		{"Floci paused 2.5 s and the process froze 1.6 s of it (awake 410 ms)", deadline, 3207 * time.Millisecond, 5208 * time.Millisecond, []stallSpan{span(3220*time.Millisecond, 4810*time.Millisecond)}, false},
 		{"not a deadline error", io.ErrUnexpectedEOF, 0, 2500 * time.Millisecond, []stallSpan{span(0, 2500*time.Millisecond)}, false},
 		{"connection reset during a freeze", syscall.ECONNRESET, 0, 2500 * time.Millisecond, []stallSpan{span(0, 2500*time.Millisecond)}, false},
 	} {
@@ -276,28 +281,45 @@ func TestReadFailureShapes(t *testing.T) {
 	}
 }
 
-// TestRaceVerdict is the rule of the surface: a failed read that nothing
-// explains never gives a pass, and a stall explains only the reads it covers.
-func TestRaceVerdict(t *testing.T) {
-	clean := raceTally{reads: 20000, writeOKs: 7000}
+// TestReadErrClass names every failure the SDK can hand back, wrapped as it
+// arrives.
+func TestReadErrClass(t *testing.T) {
+	wrap := func(err error) error { return fmt.Errorf("operation error S3: GetObject: %w", err) }
+	status := &awshttp.ResponseError{ResponseError: &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusInternalServerError}},
+		Err:      errors.New("boom"),
+	}}
 	for _, tc := range []struct {
 		name string
-		c    raceTally
+		err  error
 		want string
 	}{
-		{"clean race", clean, verdictPass},
-		{"every failed read explained by a stall", raceTally{reads: 20000, writeOKs: 7000, readErrs: 2, stallErrs: 2}, verdictPass},
-		{"one failed read nothing explains", raceTally{reads: 20000, writeOKs: 7000, readErrs: 1}, verdictError},
-		{"one failed read of two explained", raceTally{reads: 20000, writeOKs: 7000, readErrs: 2, stallErrs: 1}, verdictError},
-		{"torn body", raceTally{reads: 20000, writeOKs: 7000, tornBody: 1}, verdictMishandles},
-		{"torn metadata beside an explained stall", raceTally{reads: 20000, writeOKs: 7000, tornMeta: 1, readErrs: 1, stallErrs: 1}, verdictMishandles},
-		{"too few reads", raceTally{reads: 49, writeOKs: 7000}, verdictError},
-		{"too few overwrites", raceTally{reads: 20000, writeOKs: 49}, verdictError},
+		{"op deadline", wrap(context.DeadlineExceeded), "deadline"},
+		{"body that stopped coming", shortBodyError{wrap(context.DeadlineExceeded)}, "short-body"},
+		{"body that ended early", shortBodyError{wrap(io.ErrUnexpectedEOF)}, "short-body"},
+		{"connection closed before the reply", wrap(io.EOF), "reset"},
+		{"connection reset", wrap(syscall.ECONNRESET), "reset"},
+		{"broken pipe", wrap(syscall.EPIPE), "reset"},
+		{"closed connection", wrap(net.ErrClosed), "reset"},
+		{"error reply from the store", status, "status"},
+		{"anything else", wrap(errors.New("boom")), "other"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := raceVerdict("get-under-overwrite", tc.c, 50, 50, "detail").class; got != tc.want {
-				t.Fatalf("verdict class = %q, want %q", got, tc.want)
+			if got := readErrClass(tc.err); got != tc.want {
+				t.Fatalf("readErrClass = %q, want %q for %v", got, tc.want, tc.err)
 			}
 		})
+	}
+}
+
+// TestWatchStallsClosingTick: a heartbeat that never ticks is a process that
+// ran nothing, and the closing tick of stop reports the whole run as one
+// freeze.
+func TestWatchStallsClosingTick(t *testing.T) {
+	stop := watchStalls(time.Now(), time.Hour)
+	time.Sleep(2 * stallGap)
+	spans := stop()
+	if len(spans) != 1 || spans[0].from != 0 || spans[0].to < 2*stallGap {
+		t.Fatalf("spans = %v, want one from 0 of at least %s", spans, 2*stallGap)
 	}
 }
