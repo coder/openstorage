@@ -1,0 +1,6 @@
+diff --git a/dd b/dd
+new file mode 040000
+--- /dev/null
++++ b/dd
+@@ -0,0 +1 @@
++x

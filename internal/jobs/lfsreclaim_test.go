@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -573,6 +574,54 @@ func TestLFSReclaim_HydrationDeadline(t *testing.T) {
 	rows, err := reg.ListRepoLFSObjects(ctx, base, "", 10)
 	if err != nil || len(rows) != 1 || !rows[0].UnreferencedSince.IsZero() {
 		t.Fatalf("rows = (%+v, %v), want untouched", rows, err)
+	}
+}
+
+// Two runs on one reclaimer would share its advisory verdicts, so a run that
+// starts while another is in its pass does nothing. During a rolling upgrade an
+// older binary's job and a newer binary's job can reach the same replica.
+func TestLFSReclaim_ARunDoesNotOverlapAnotherOnTheSameReclaimer(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "overlap-repo"
+	key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("88", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	instantHydrate := func(context.Context, string, string) (string, error) { return t.TempDir(), nil }
+	entered, release := make(chan struct{}), make(chan struct{})
+	var walks atomic.Int32
+	walk := func(context.Context, string, int64) (map[string]struct{}, int64, error) {
+		if walks.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return map[string]struct{}{}, 0, nil
+	}
+	r := NewLFSReclaimer(reg, instantHydrate, walk, alwaysMain,
+		time.Hour, 1_000, true, true, slog.New(slog.DiscardHandler))
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := r.Run(ctx)
+		first <- err
+	}()
+	<-entered
+	if _, err := r.Run(ctx); err != nil {
+		t.Fatalf("overlapping run: %v", err)
+	}
+	if got := walks.Load(); got != 1 {
+		t.Fatalf("walks = %d while the first run is in its pass, want the overlapping run to do nothing", got)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if _, err := r.Run(ctx); err != nil || walks.Load() != 2 {
+		t.Fatalf("run after the first ended: walks = %d, err = %v, want it to run", walks.Load(), err)
 	}
 }
 
