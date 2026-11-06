@@ -675,6 +675,44 @@ func firstGate(s *source, fn *ast.FuncLit, cond, bodyHas string) bool {
 	return false
 }
 
+// fencedFold checks a SQL ReplacePacks: the fence is read on tx after lock,
+// an if that returns ErrRepoPurged follows, and the read sits in the
+// transaction (PG: the pgx.BeginFunc closure; SQLite: before tx.Commit).
+// A write before the read is rolled back by that return, so it may come
+// first (the fold's old-row delete is its precondition).
+func fencedFold(s *source, f *ast.FuncDecl, lock, fence string, pg bool) bool {
+	cs := s.calls(f.Body)
+	fi := -1
+	for i, c := range cs {
+		if c.fun == fence && strings.Contains(c.args, "tx") {
+			fi = i
+			break
+		}
+	}
+	if fi < 0 {
+		return false
+	}
+	fp := cs[fi].pos
+	locked, ret, inTx := false, false, false
+	for _, c := range cs {
+		if (c.fun == lock || strings.HasSuffix(c.fun, lock)) && c.pos < fp {
+			locked = true
+		}
+		if !pg && c.fun == "tx.Commit" && c.pos > fp {
+			inTx = true
+		}
+	}
+	if pg {
+		inTx = cs[fi].inClose && first(cs, "pgx.BeginFunc", "", false).IsValid()
+	}
+	for _, i := range s.ifs(f.Body) {
+		if i.returns && strings.Contains(i.body, "ErrRepoPurged") && i.stmt.Pos() > fp {
+			ret = true
+		}
+	}
+	return locked && ret && inTx
+}
+
 // gateBeforeWrites reports that fn's closure has an if on cond that
 // returns (bodyHas in its body) before its first write to the manifest: an
 // assignment or increment of an m. or mem. field, or m.EnsureMember.
@@ -888,10 +926,10 @@ func purgeFacts(sweep *source, sweepFn, healEntry *ast.FuncDecl) []*fact {
 	// in its own transaction like RegisterPacks.
 	fo := newFact("FoldsFenced")
 	fenceSerialized(fo)
-	fo.need(fencedSQL(refGo, refGo.fn("PG", "ReplacePacks"), "lockBaseLedger", "repoPurgeFencedPG", "tx.Exec", "INSERT INTO packs"),
-		"PG ReplacePacks: lockBaseLedger, repoPurgeFencedPG, return ErrRepoPurged, then its writes")
-	fo.need(fencedSQL(sq, sq.fn("SQLite", "ReplacePacks"), ".BeginTx", "repoPurgeFencedSQLite", "tx.ExecContext", "INSERT INTO packs"),
-		"SQLite ReplacePacks: BeginTx, repoPurgeFencedSQLite, return ErrRepoPurged, then its writes")
+	fo.need(fencedFold(refGo, refGo.fn("PG", "ReplacePacks"), "lockBaseLedger", "repoPurgeFencedPG", true),
+		"PG ReplacePacks: lockBaseLedger, then repoPurgeFencedPG in its pgx.BeginFunc transaction, then return ErrRepoPurged")
+	fo.need(fencedFold(sq, sq.fn("SQLite", "ReplacePacks"), ".BeginTx", "repoPurgeFencedSQLite", false),
+		"SQLite ReplacePacks: BeginTx, then repoPurgeFencedSQLite, then return ErrRepoPurged, before tx.Commit")
 	fo.need(gateBeforeWrites(wal, mutateFn(wal, wal.fn("S3WAL", "ReplacePacks")), "m.PurgedAt != nil", "ErrRepoPurged"),
 		"S3WAL ReplacePacks returns ErrRepoPurged in its base-manifest mutation before it writes the manifest")
 	facts = append(facts, fo)
