@@ -40,7 +40,8 @@ func validatePurgeGroup(group []string) {
 // first destructive-side step, BEFORE any row is tombstoned. Registrations
 // serialize against the fence through lockBaseLedger (PG) or the database
 // single-writer lock (SQLite): once this commits, every later RegisterPacks
-// / RegisterLFSObject for the group fails with ErrRepoPurged, so the
+// / ReplacePacks / RegisterLFSObject for the group fails with ErrRepoPurged
+// (a ReplacePacks whose input rows are gone still loses cleanly), so the
 // purge's later verification-then-completion cannot be raced by a write
 // that settles in between (PR #105 security round) — any straggler row
 // either landed before the fence (re-tombstoned by the resumed purge) or

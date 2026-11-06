@@ -569,6 +569,12 @@ func (s *SQLite) ReplacePacks(ctx context.Context, repo string, old []Pack, newP
 	if deleted != len(old) {
 		return false, nil // another fold got here first: roll back via defer
 	}
+	// Purge fence after the precondition — see the PG twin.
+	if fenced, err := repoPurgeFencedSQLite(ctx, tx, repo); err != nil {
+		return false, fmt.Errorf("replace packs %s: %w", repo, err)
+	} else if fenced {
+		return false, fmt.Errorf("replace packs %s: %w", repo, ErrRepoPurged)
+	}
 	// Ledger (issue #31): mirror the PG twin — record superseded keys as
 	// retained (their blobs linger; bytes stay counted), then credit the
 	// new pack only when its row is newly inserted and not itself retained.

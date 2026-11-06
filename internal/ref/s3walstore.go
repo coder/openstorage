@@ -1092,6 +1092,10 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 			if !allOldPresent(m) {
 				return false, nil // another fold got here first: clean loss
 			}
+			// Purge fence after the precondition — see the PG twin.
+			if m.PurgedAt != nil {
+				return false, ErrRepoPurged
+			}
 			mem := m.Member(repo)
 			// Delete exactly the old rows (per-row generation bumps).
 			kept := mem.Packs[:0]
