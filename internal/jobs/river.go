@@ -439,11 +439,36 @@ type sweepWorker struct {
 
 func (*sweepWorker) Timeout(*river.Job[sweepArgs]) time.Duration { return sweepRescueAfter }
 
+// sweepReturnGrace is how long Work waits, after its job context ends, for
+// the sweep to wind down before it returns anyway.
+const sweepReturnGrace = 2 * time.Second
+
+// Work returns at most sweepReturnGrace after its job context ends, even when
+// the sweep is still in a safeDelete recovery step. That step runs detached
+// from the job context for up to sweepRecoveryTimeout, and while Work waited
+// for it the row stayed running: River.Close gave up first, the process
+// exited, and the next process's sweep deduplicated against the orphaned row
+// until River rescued it. The detached step goes on without the row. If the
+// process ends first, that is a sweeper crash, and the next sweep heals.
 func (w *sweepWorker) Work(ctx context.Context, _ *river.Job[sweepArgs]) error {
 	if w.schedule == nil {
 		return errScheduleOff
 	}
-	return w.schedule.runOnce(ctx, passJobTimeout, sweepPurgeTimeout)
+	done := make(chan error, 1)
+	go func() { done <- w.schedule.runOnce(ctx, passJobTimeout, sweepPurgeTimeout) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+	}
+	grace := time.NewTimer(sweepReturnGrace)
+	defer grace.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-grace.C:
+		return fmt.Errorf("jobs: sweep still recovering %v after its job ended: %w", sweepReturnGrace, context.Cause(ctx))
+	}
 }
 
 // deliveryWorker performs one signed POST per job attempt; River owns the
