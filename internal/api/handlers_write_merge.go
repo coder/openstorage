@@ -154,7 +154,7 @@ func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, m
 		body.ConflictPathsBase64 = []string{}
 		lists = append(lists, jsonList{"conflict_paths_base64", func(yield func(any) bool) {
 			for _, p := range conflictPaths {
-				if !yield(encodeRawPath(p)) {
+				if !yield(base64JSONString(p)) {
 					return
 				}
 			}

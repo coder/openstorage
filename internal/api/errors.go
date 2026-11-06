@@ -6,6 +6,7 @@ import (
 	"encoding"
 	"encoding/json"
 	"errors"
+	"io"
 	"iter"
 	"net/http"
 	"reflect"
@@ -441,6 +442,12 @@ type jsonList struct {
 	items iter.Seq[any]
 }
 
+// jsonItemWriter is a streamed list item that writes its own JSON text, for
+// an item too large to marshal into a second buffer.
+type jsonItemWriter interface {
+	writeJSONItem(w io.Writer) error
+}
+
 // jsonMember is one name and value of a streamed JSON object.
 type jsonMember struct {
 	name  string
@@ -480,6 +487,17 @@ func writeJSONLists(w http.ResponseWriter, status int, v any, lists ...jsonList)
 		}
 		sep := false
 		for item := range l.items {
+			if iw, ok := item.(jsonItemWriter); ok {
+				assertf(!isObject, "writeJSONLists: %s: a self-writing item in an object", l.key)
+				if sep {
+					_ = bw.WriteByte(',') // a failure sticks: the next Write reports it
+				}
+				if err := iw.writeJSONItem(bw); err != nil {
+					return
+				}
+				sep = true
+				continue
+			}
 			var b []byte
 			m, ok := item.(jsonMember)
 			assertf(ok == isObject, "writeJSONLists: %s: member %v, object %v", l.key, ok, isObject)
