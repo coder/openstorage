@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/events"
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/jobs"
@@ -246,6 +248,156 @@ func TestLocalHookIntentAuthorizationAndFailures(t *testing.T) {
 			}
 			if up.SyncPending != tc.wantPull || (up.PushPending > 0) != tc.wantPush {
 				t.Fatalf("pending pull=%v push=%d; want pull=%v push=%v", up.SyncPending, up.PushPending, tc.wantPull, tc.wantPush)
+			}
+		})
+	}
+}
+
+// CASRef is the REST surface's CAS: the API handlers write through it.
+func (s observeAtCAS) CASRef(ctx context.Context, repo, name, old, next string) (bool, error) {
+	won, err := s.RefStore.CASRef(ctx, repo, name, old, next)
+	if won && err == nil {
+		s.observe()
+	}
+	return won, err
+}
+
+// TestServeRestIntentBeforeCAS: on the local schedule a REST ref write
+// (the API handlers' CASRef through buildServeEventing's decorator) holds
+// the ref and records its forward intent before the authority CAS, as the
+// update hook does (verify-lane-schedule finding 1, REST writes). When the
+// CAS commits, the row has the intent, so serve dying right there loses no
+// forward, and the ref's push hold is live, so a run that claims the
+// intent first waits for the CAS. The hold ends with the write. A failed
+// intent read refuses the write.
+func TestServeRestIntentBeforeCAS(t *testing.T) {
+	rw := []string{auth.ScopeGitRead, auth.ScopeGitWrite}
+	for _, backend := range []string{"sqlite", "s3wal"} {
+		t.Run(backend, func(t *testing.T) {
+			for _, tc := range []struct {
+				name               string
+				forward, noClaims  bool
+				scopes             []string
+				refName            string
+				storeFails         bool
+				wantIntent, refuse bool
+			}{
+				{name: "forward", forward: true, scopes: rw, wantIntent: true},
+				{name: "server_initiated", forward: true, noClaims: true, wantIntent: true},
+				{name: "write_only", forward: true, scopes: []string{auth.ScopeGitWrite}},
+				{name: "pull", scopes: rw},
+				{name: "ephemeral", forward: true, scopes: rw, refName: auth.EphemeralNamespacePrefix + "refs/heads/main"},
+				// Closing the store fails its reads on SQLite only.
+				{name: "metadata_unavailable", forward: true, scopes: rw, storeFails: true, refuse: true},
+			} {
+				if tc.storeFails && backend != "sqlite" {
+					continue
+				}
+				t.Run(tc.name, func(t *testing.T) {
+					ctx := t.Context()
+					dir := t.TempDir()
+					var (
+						ms        meta.Store
+						closeMeta func()
+					)
+					if backend == "sqlite" {
+						sq, err := meta.OpenSQLite(ctx, "sqlite://"+filepath.Join(dir, "meta.sqlite"))
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := sq.InitSchema(ctx); err != nil {
+							t.Fatal(err)
+						}
+						ms, closeMeta = sq, sync.OnceFunc(sq.Close)
+					} else {
+						wal := meta.NewS3WAL(s3wal.NewMemCAS())
+						ms, closeMeta = wal, sync.OnceFunc(wal.Close)
+					}
+					t.Cleanup(closeMeta)
+					rs, err := ref.Open(ctx, "sqlite://"+filepath.Join(dir, "refs.sqlite"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(rs.Close)
+					if err := rs.InitSchema(ctx); err != nil {
+						t.Fatal(err)
+					}
+					key, pub, err := newLoopbackKey()
+					if err != nil {
+						t.Fatal(err)
+					}
+					const org = "org"
+					if _, err := ms.UpsertOrgWithKeys(ctx, org, []string{pub}); err != nil {
+						t.Fatal(err)
+					}
+					repo, err := ms.CreateRepo(ctx, org, "https://example.com/rest.git", "main")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := ms.SetRepoUpstream(ctx, meta.RepoUpstream{
+						RepoID: repo.RepoID, Provider: "github", Owner: "up", Name: "mirror",
+						UpstreamHost: "https://example.invalid", ForwardOnPush: tc.forward,
+					}); err != nil {
+						t.Fatal(err)
+					}
+					cacheDir := filepath.Join(dir, "cache")
+					_, decorate, cleanup, err := buildServeEventing(ctx, ms, "sqlite://"+filepath.Join(dir, "meta.sqlite"), org,
+						"http://127.0.0.1:1", cacheDir, key, nil, nil, nil, nil, false, syncEgressSettings{}, slog.New(slog.DiscardHandler))
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(cleanup)
+
+					// held reports whether a live push hold names an
+					// unreleased ref: a run's publication wait blocks.
+					held := func(wait time.Duration) bool {
+						waitCtx, cancel := context.WithTimeout(ctx, wait)
+						defer cancel()
+						err := githttp.WaitForPushPublication(waitCtx, cacheDir, repo.RepoID)
+						if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+							t.Errorf("publication wait: %v", err)
+						}
+						return err != nil
+					}
+					intentAtCAS, heldAtCAS := -1, false
+					store := decorate(observeAtCAS{RefStore: rs, observe: func() {
+						up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
+						if err != nil {
+							t.Errorf("read the row at the CAS: %v", err)
+						}
+						intentAtCAS = up.PushPending
+						heldAtCAS = held(200 * time.Millisecond)
+					}})
+					writeCtx := ctx
+					if !tc.noClaims {
+						writeCtx = auth.WithClaims(ctx, &auth.Claims{Iss: org, Sub: auth.SubjectLiteral, Repo: repo.URL, Scopes: tc.scopes})
+					}
+					refName := cmp.Or(tc.refName, "refs/heads/main")
+					if tc.storeFails {
+						closeMeta()
+					}
+					sha := strings.Repeat("b", 40)
+					won, err := store.CASRef(writeCtx, repo.RepoID, refName, ref.ZeroSHA, sha)
+					if tc.refuse {
+						got, gerr := rs.GetRef(ctx, repo.RepoID, refName)
+						if err == nil || won || !errors.Is(gerr, ref.ErrNotFound) {
+							t.Fatalf("CAS = (won %v, err %v), authority = (%q, %v); want the write refused before the CAS: an accepted write without its forward intent is never forwarded", won, err, got, gerr)
+						}
+						return
+					}
+					if err != nil || !won {
+						t.Fatalf("accepted CAS: %v %v", won, err)
+					}
+					if tc.wantIntent && (intentAtCAS <= 0 || !heldAtCAS) {
+						t.Fatalf("at the authority CAS push_pending = %d, ref held = %v; want the intent recorded and the ref held: serve dying there loses the forward, and a run that claims the intent can snapshot the ref before the CAS", intentAtCAS, heldAtCAS)
+					}
+					if !tc.wantIntent && (intentAtCAS != 0 || heldAtCAS) {
+						t.Fatalf("at the authority CAS push_pending = %d, ref held = %v; want neither for a write that records no intent", intentAtCAS, heldAtCAS)
+					}
+					if held(5 * time.Second) {
+						t.Fatal("the ref is still held after the write returned")
+					}
+				})
 			}
 		})
 	}
