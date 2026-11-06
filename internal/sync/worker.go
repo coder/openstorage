@@ -305,18 +305,20 @@ func (w *Worker) waitPublication(ctx context.Context, repoID string) error {
 	return w.WaitPublication(wctx, repoID)
 }
 
-// restoreLocal ends a claimed local run whose publication wait failed: no
-// snapshot was taken and no event emitted, so the run hands its request
+// restoreLocal ends a claimed local run that got no fresh snapshot: its
+// publication wait failed (no event emitted yet), or a push run's loopback
+// fetch found a push-held ref stale (after its started event, like a
+// shutdown restore). Nothing was forwarded, so the run hands its request
 // back to the row (restore) instead of counting a run.
 func (w *Worker) restoreLocal(ctx context.Context, job Job, holder, lane string, waitErr error, finish func(ctx context.Context) (Upstream, error)) error {
-	w.Logger.Warn("publication wait failed; request restored for a later run",
+	w.Logger.Warn("no fresh snapshot; request restored for a later run",
 		"org", job.Org, "repo", job.RepoID, "lane", lane, "err", waitErr)
 	_, err := w.retryFinish(ctx, lane, job.RepoID, finish)
 	switch {
 	case errors.Is(err, ErrNotFound):
-		return nil // detached while waiting: nothing to restore
+		return nil // detached meanwhile: nothing to restore
 	case errors.Is(err, ErrClaimLost):
-		w.Logger.Warn("claim lost while waiting for publication; abandoning",
+		w.Logger.Warn("claim lost before the restore; abandoning",
 			"org", job.Org, "repo", job.RepoID, "lane", lane, "holder", holder)
 		return nil
 	case err != nil:
