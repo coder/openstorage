@@ -500,9 +500,9 @@ process was awake for under 100 ms of it, a twentieth of the deadline. A read
 that a freeze explains counts in `stallErrs` and does not fail the row, and the
 pass detail says how many there were.
 
-The race window stops only new reads. A GET in flight when the window ends
-keeps its own 2 s deadline, so a store that hangs during the last seconds of
-the window fails the row like one that hangs earlier.
+The race window stops only new operations. A GET or PUT in flight when the
+window ends keeps its own 2 s deadline, so a store that hangs during the last
+seconds of the window fails the row like one that hangs earlier.
 
 The verdict quotes the first three failures with `class` (`deadline`,
 `short-body`, `reset`, `status` or `other`), `elapsed`, `awake` (the time the
