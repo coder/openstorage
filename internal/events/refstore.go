@@ -41,11 +41,13 @@ type RefStoreOptions struct {
 	// from re-triggering themselves) — and enqueue accordingly.
 	EnqueueSync func(ctx context.Context, repoID string) error
 	// BeforeCAS, when non-nil, runs before every non-ephemeral CASRef and
-	// CASRefGen with the base RepoID. An error refuses the update: the
-	// inner CAS never runs. The git hook on the local schedule records the
-	// push's forward intent here (ADR-50), so no accepted write can lose
-	// it to a crash after the CAS.
-	BeforeCAS func(ctx context.Context, repoID string) error
+	// CASRefGen with the base RepoID and the ref name. An error refuses the
+	// update: the inner CAS never runs. Otherwise release runs right after
+	// the inner CAS returns. On the local schedule the git hook and serve's
+	// REST writes record the forward intent here (ADR-50), so no accepted
+	// write can lose it to a crash after the CAS, and a REST write holds
+	// the ref until its CAS returns.
+	BeforeCAS func(ctx context.Context, repoID, refName string) (release func(), err error)
 	// Now supplies pushed_at; defaults to time.Now.
 	Now func() time.Time
 	// Logger records emission failures; defaults to slog.Default().
@@ -68,7 +70,7 @@ type RefStore struct {
 	webhooks        WebhookLister
 	enqueueDelivery func(ctx context.Context, d Delivery) error
 	enqueueSync     func(ctx context.Context, repoID string) error
-	beforeCAS       func(ctx context.Context, repoID string) error
+	beforeCAS       func(ctx context.Context, repoID, refName string) (release func(), err error)
 	now             func() time.Time
 	logger          *slog.Logger
 }
@@ -113,10 +115,12 @@ func NewRefStore(inner ref.RefStore, opts RefStoreOptions) *RefStore {
 // ref.IdempotentCAS-wrapped (see NewRefStore), so a returned error or lost
 // CAS here is already reconciled — skipping emission on it is safe.
 func (s *RefStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
-	if err := s.runBeforeCAS(ctx, repo, name); err != nil {
+	release, err := s.runBeforeCAS(ctx, repo, name)
+	if err != nil {
 		return false, err
 	}
 	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
+	release()
 	if err != nil || !won {
 		return won, err
 	}
@@ -129,10 +133,12 @@ func (s *RefStore) CASRef(ctx context.Context, repo, name, old, new string) (boo
 // swap emits the push event + sync poke, and the inner store's generation
 // attribution passes through untouched.
 func (s *RefStore) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
-	if err := s.runBeforeCAS(ctx, repo, name); err != nil {
+	release, err := s.runBeforeCAS(ctx, repo, name)
+	if err != nil {
 		return false, 0, err
 	}
 	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
+	release()
 	if err != nil || !won {
 		return won, gen, err
 	}
@@ -140,15 +146,18 @@ func (s *RefStore) CASRefGen(ctx context.Context, repo, name, old, new string) (
 	return true, gen, nil
 }
 
-// runBeforeCAS runs the BeforeCAS option for a non-ephemeral update.
-func (s *RefStore) runBeforeCAS(ctx context.Context, repoKey, refName string) error {
+// runBeforeCAS runs the BeforeCAS option for a non-ephemeral update. On
+// success the returned release is never nil.
+func (s *RefStore) runBeforeCAS(ctx context.Context, repoKey, refName string) (release func(), err error) {
 	if s.beforeCAS == nil || EphemeralUpdate(repoKey, refName) {
-		return nil
+		return func() {}, nil
 	}
-	if err := s.beforeCAS(ctx, BaseRepoID(repoKey)); err != nil {
-		return fmt.Errorf("refusing the ref update: %w", err)
+	release, err = s.beforeCAS(ctx, BaseRepoID(repoKey), refName)
+	if err != nil {
+		return nil, fmt.Errorf("refusing the ref update: %w", err)
 	}
-	return nil
+	assertf(release != nil, "BeforeCAS for %s %s returned a nil release", repoKey, refName)
+	return release, nil
 }
 
 // emitPush fans one push event out to the org's webhooks and pokes the

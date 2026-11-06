@@ -23,11 +23,10 @@ CONSTANTS
     MaxFaults,         \* run crashes, failed finish writes, shutdown cancels, writer crashes
     \* Assumptions the code relies on; each probe config drops one.
     LeaseOutlivesRun,  \* a claim expires only after its run ended
-    WritesComplete,    \* a REST write whose authority CAS won records its intent
     \* Code facts (facts/facts.go); FALSE takes the broken branch.
     ClaimConsumesPending, ClaimMarksDue, DoneKeepsPending, RetryRemarks, FinishKeepsExplicit,
     StealInheritsForce, RunPassesForce, WaitBeforeSnapshot, ShutdownRestores,
-    MarkBeforeCas, StrictSnapshot
+    MarkBeforeCas, StrictSnapshot, RestMarkBeforeCas
 
 ASSUME ApiCalls \subseteq {"plain", "force"}
 ASSUME QuietWriters \subseteq Writers /\ QuietRestWriters \subseteq RestWriters
@@ -44,7 +43,7 @@ Released == [held |-> FALSE, holder |-> NoOne, force |-> FALSE,
 VARIABLES
     authority,     \* the ref store's value (the authority CAS)
     cacheRef,      \* the cache repo's ref, which a loopback fetch serves
-    hold,          \* writer whose live push hold names the ref, or NoOne
+    hold,          \* git push or REST write whose live push hold names the ref, or NoOne
     wState, wVer,  \* writer phase and the version its CAS wrote
     restState,     \* REST writer phase
     restVer,       \* the version each REST write's CAS wrote
@@ -75,9 +74,9 @@ TypeOK ==
     /\ authority \in 0..MaxVersion
     /\ cacheRef \in 0..MaxVersion
     /\ upstream \in 0..MaxVersion
-    /\ hold \in Writers \cup {NoOne}
+    /\ hold \in Writers \cup RestWriters \cup {NoOne}
     /\ wState \in [Writers -> {"idle", "held", "marked", "cas", "poked", "done", "dead"}]
-    /\ restState \in [RestWriters -> {"idle", "cas", "done", "dead"}]
+    /\ restState \in [RestWriters -> {"idle", "held", "marked", "cas", "released", "done", "dead"}]
     /\ pending \in 0..2
     /\ due \in {"zero", "claim", "future", "elapsed"}
     /\ attempt \in 0..MaxRetries
@@ -178,13 +177,34 @@ WCrash(w) ==
                    upstream, apiLeft, outages, ghostVars>>
 
 -----------------------------------------------------------------------------
-(* REST writes: an internal/api handler's CASRef through events.RefStore   *)
-(* changes the authority only (no hold, no cache update), then emitPush    *)
-(* records the intent through the serve queue's EnqueuePush, unless the    *)
-(* caller may not forward (forwardDeniedFromContext).                      *)
+(* REST writes: an internal/api handler's CASRef through events.RefStore.  *)
+(* Its BeforeCAS (restIntentBeforeCAS) holds the ref (githttp.HoldRef) and *)
+(* records the intent (RequestPush), unless the caller may not forward     *)
+(* (forwardDeniedFromContext). The CAS changes the authority only: no      *)
+(* cache update. The hold ends when the CAS returns, then emitPush pokes   *)
+(* through the serve queue behind the same gates.                          *)
+
+\* A REST write that records intent; RestMarkBeforeCas FALSE: none before
+\* its CAS, so it goes straight to RCas, like a quiet one.
+MarksBeforeCas(x) == RestMarkBeforeCas /\ x \notin QuietRestWriters
+
+RReserve(x) ==
+    /\ restState[x] = "idle" /\ MarksBeforeCas(x) /\ hold = NoOne
+    /\ hold' = x
+    /\ restState' = [restState EXCEPT ![x] = "held"]
+    /\ UNCHANGED <<authority, cacheRef, wState, wVer, restVer, rowVars, runVars, envVars, ghostVars>>
+
+RMark(x) ==
+    /\ restState[x] = "held"
+    /\ restState' = [restState EXCEPT ![x] = "marked"]
+    /\ pending' = Max(pending, 1)
+    /\ spent' = FALSE
+    /\ UNCHANGED <<authority, cacheRef, hold, wState, wVer, restVer, due, attempt, claim,
+                   runVars, envVars, forceOwed, explicitOwed, rewound, hammered, owed>>
 
 RCas(x) ==
-    /\ restState[x] = "idle"
+    /\ \/ restState[x] = "marked"
+       \/ restState[x] = "idle" /\ ~MarksBeforeCas(x)
     /\ authority' = authority + 1
     /\ restVer' = [restVer EXCEPT ![x] = authority + 1]
     /\ restState' = [restState EXCEPT ![x] = "cas"]
@@ -192,8 +212,16 @@ RCas(x) ==
     /\ UNCHANGED <<cacheRef, hold, wState, wVer, rowVars, runVars, envVars,
                    forceOwed, explicitOwed, spent, rewound, hammered>>
 
-RMark(x) ==
+\* The CAS returned: release ends the hold. The cache keeps its older value.
+RRelease(x) ==
     /\ restState[x] = "cas"
+    /\ hold' = IF hold = x THEN NoOne ELSE hold
+    /\ restState' = [restState EXCEPT ![x] = "released"]
+    /\ UNCHANGED <<authority, cacheRef, wState, wVer, restVer, rowVars, runVars, envVars, ghostVars>>
+
+\* emitPush's poke after the CAS: the same RequestPush behind the same gates.
+RPoke(x) ==
+    /\ restState[x] = "released"
     /\ restState' = [restState EXCEPT ![x] = "done"]
     /\ IF x \in QuietRestWriters
        THEN UNCHANGED <<pending, spent>>
@@ -202,14 +230,24 @@ RMark(x) ==
     /\ UNCHANGED <<authority, cacheRef, hold, wState, wVer, restVer, due, attempt, claim,
                    runVars, envVars, forceOwed, explicitOwed, rewound, hammered, owed>>
 
-\* Serve dies, or RequestPush fails, between the CAS and the intent write.
-\* WritesComplete rules this out (NoCompletionAssumption.cfg drops it).
+\* The read, the hold, the intent write or the CAS fails, or serve dies
+\* before the CAS: nothing is accepted. A recorded intent stays.
+RAbort(x) ==
+    /\ restState[x] \in {"held", "marked"}
+    /\ hold' = IF hold = x THEN NoOne ELSE hold
+    /\ restState' = [restState EXCEPT ![x] = "dead"]
+    /\ UNCHANGED <<authority, cacheRef, wState, wVer, restVer, rowVars, runVars,
+                   envVars, ghostVars>>
+
+\* Serve dies after the CAS, or the poke's RequestPush fails, which emitPush
+\* only logs as "sync poke lost". The hold goes with it.
 RCrashRest(x) ==
-    /\ ~WritesComplete /\ faults < MaxFaults
-    /\ restState[x] = "cas"
+    /\ faults < MaxFaults
+    /\ restState[x] \in {"cas", "released"}
+    /\ hold' = IF hold = x THEN NoOne ELSE hold
     /\ restState' = [restState EXCEPT ![x] = "dead"]
     /\ faults' = faults + 1
-    /\ UNCHANGED <<authority, cacheRef, hold, wState, wVer, restVer, rowVars, runVars,
+    /\ UNCHANGED <<authority, cacheRef, wState, wVer, restVer, rowVars, runVars,
                    upstream, apiLeft, outages, ghostVars>>
 
 -----------------------------------------------------------------------------
@@ -400,7 +438,8 @@ RCrash(r) ==
 Next ==
     \/ \E w \in Writers : \/ WReserve(w) \/ WMark(w) \/ WAbort(w) \/ WCas(w) \/ WPoke(w)
                           \/ WPublish(w) \/ WCrash(w)
-    \/ \E x \in RestWriters : RCas(x) \/ RMark(x) \/ RCrashRest(x)
+    \/ \E x \in RestWriters : \/ RReserve(x) \/ RMark(x) \/ RCas(x) \/ RRelease(x) \/ RPoke(x)
+                              \/ RAbort(x) \/ RCrashRest(x)
     \/ \E a \in ApiCalls : Api(a)
     \/ Tick \/ Expire
     \/ \E r \in Runners : \/ RClaim(r) \/ RWait(r) \/ RWaitFail(r) \/ RSnap(r) \/ RSnapHeld(r)
@@ -410,7 +449,8 @@ Next ==
 Fairness ==
     /\ \A w \in Writers : /\ WF_vars(WMark(w)) /\ WF_vars(WCas(w)) /\ WF_vars(WPoke(w))
                           /\ WF_vars(WPublish(w))
-    /\ \A x \in RestWriters : WF_vars(RMark(x))
+    /\ \A x \in RestWriters : /\ WF_vars(RMark(x)) /\ WF_vars(restState[x] = "marked" /\ RCas(x))
+                              /\ WF_vars(RRelease(x)) /\ WF_vars(RPoke(x))
     /\ \A r \in Runners : /\ WF_vars(RWait(r)) /\ WF_vars(RSnap(r)) /\ WF_vars(RSnapHeld(r))
                           /\ WF_vars(RBarrier(r))
                           /\ WF_vars(RPush(r)) /\ WF_vars(RFinish(r))
@@ -426,7 +466,7 @@ FairSpec == Spec /\ Fairness
 \* Nothing is outstanding: no write in flight, no request, no run.
 Quiescent ==
     /\ \A w \in Writers : wState[w] \in {"idle", "done", "dead"}
-    /\ \A x \in RestWriters : restState[x] # "cas"
+    /\ \A x \in RestWriters : restState[x] \in {"idle", "done", "dead"}
     /\ pending = 0 /\ ~claim.held
     /\ \A r \in Runners : rState[r] = "idle"
 

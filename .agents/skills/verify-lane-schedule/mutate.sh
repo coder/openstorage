@@ -108,21 +108,21 @@ mut StealInheritsForce internal/meta/s3walmeta_eventing.go 'force = u.PushPendin
 mut RunPassesForce internal/sync/worker_push.go 'meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: shutdownRestoreDelay}' 'meta.PushOutcome{Kind: meta.OutcomeRestore, Delay: shutdownRestoreDelay}' LaneSchedule.cfg 'Invariant ForceKept is violated'
 mut WaitBeforeSnapshot internal/sync/worker_push.go '	if err := w.waitPublication(ctx, job.RepoID); err != nil {' '	if err := error(nil); err != nil {' LaneSchedule.cfg 'Invariant NoLostForward is violated'
 mut ShutdownRestores internal/sync/worker_push.go '	if runErr != nil && shutdownAborted(ctx) {' '	if runErr != nil && errors.Is(runErr, ErrShutdown) {' LaneSchedule.cfg 'Invariant NoLostForward is violated'
-mut MarkBeforeCas internal/events/refstore.go '	if err := s.runBeforeCAS(ctx, repo, name); err != nil {
+mut MarkBeforeCas internal/events/refstore.go '	release, err := s.runBeforeCAS(ctx, repo, name)
+	if err != nil {
 		return false, 0, err
 	}
 	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
-	if err != nil || !won {
-		return won, gen, err
-	}
+	release()
 ' '	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
-	if err != nil || !won {
-		return won, gen, err
+	release, rerr := s.runBeforeCAS(ctx, repo, name)
+	if rerr != nil {
+		return false, 0, rerr
 	}
-	if err := s.runBeforeCAS(ctx, repo, name); err != nil {
-		return false, 0, err
-	}
+	release()
 ' LaneSchedule.cfg 'Invariant NoLostForward is violated'
 mut StrictSnapshot internal/githttp/hydrate.go 'if refsErr == nil && skippedHeld && strictHeld {' 'if refsErr == nil && skippedHeld && strictHeld && false {' OtherWriters.cfg 'Invariant NoLostForward is violated'
+mut RestMarkBeforeCas cmd/openstorage/wire_eventing.go '		beforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)
+' '' OtherWriters.cfg 'Invariant NoLostForward is violated'
 echo "COUNT: $pass/$total mutations failed check.sh as expected (outputs in $work)"
 [ "$pass" = "$total" ]

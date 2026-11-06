@@ -434,24 +434,32 @@ func TestEphemeralUpdatesEmitNothing(t *testing.T) {
 	}
 }
 
-// TestBeforeCASRunsFirstAndRefuses: BeforeCAS sees the base RepoID of
-// every non-ephemeral update before the inner CAS, and its error refuses
-// the update on both CAS methods: no CAS, no event, no sync poke.
+// TestBeforeCASRunsFirstAndRefuses: BeforeCAS sees the base RepoID and
+// ref name of every non-ephemeral update before the inner CAS, and its
+// error refuses the update on both CAS methods: no CAS, no event, no sync
+// poke. An allowed update's release runs once, right after the inner CAS
+// and before the sync poke.
 func TestBeforeCASRunsFirstAndRefuses(t *testing.T) {
 	for _, gen := range []bool{false, true} {
 		for _, fail := range []bool{false, true} {
 			inner := &fakeInner{won: true}
 			env := newEmitEnv(t, inner, twoHooks())
 			var seen []string
-			env.store.beforeCAS = func(_ context.Context, repoID string) error {
-				seen = append(seen, repoID)
+			released := 0
+			env.store.beforeCAS = func(_ context.Context, repoID, refName string) (func(), error) {
+				seen = append(seen, repoID+" "+refName)
 				if inner.cass != 0 {
 					t.Errorf("BeforeCAS ran after the inner CAS")
 				}
 				if fail {
-					return errors.New("intent write failed")
+					return nil, errors.New("intent write failed")
 				}
-				return nil
+				return func() {
+					released++
+					if inner.cass != 1 || len(env.syncPokes) != 0 {
+						t.Errorf("release ran with %d inner CASes and %d sync pokes; want right after the CAS", inner.cass, len(env.syncPokes))
+					}
+				}, nil
 			}
 			cas := func(repoKey, refName string) (bool, error) {
 				if gen {
@@ -466,11 +474,11 @@ func TestBeforeCASRunsFirstAndRefuses(t *testing.T) {
 					t.Errorf("gen=%v: refused update = (won %v, err %v), %d inner CASes, %d deliveries, %d pokes; want refused with nothing written",
 						gen, won, err, inner.cass, len(env.deliveries), len(env.syncPokes))
 				}
-			} else if !won || err != nil || inner.cass != 1 {
-				t.Errorf("gen=%v: allowed update = (won %v, err %v), %d inner CASes", gen, won, err, inner.cass)
+			} else if !won || err != nil || inner.cass != 1 || released != 1 {
+				t.Errorf("gen=%v: allowed update = (won %v, err %v), %d inner CASes, %d releases", gen, won, err, inner.cass, released)
 			}
-			if len(seen) != 1 || seen[0] != "repo_abc123" {
-				t.Errorf("gen=%v fail=%v: BeforeCAS saw %v, want the base RepoID once", gen, fail, seen)
+			if len(seen) != 1 || seen[0] != "repo_abc123 refs/heads/main" {
+				t.Errorf("gen=%v fail=%v: BeforeCAS saw %v, want the base RepoID and the ref once", gen, fail, seen)
 			}
 			// Ephemeral updates never forward, so BeforeCAS never sees them.
 			seen = nil

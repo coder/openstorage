@@ -32,6 +32,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -448,9 +449,11 @@ func main() {
 	mb := newFact("MarkBeforeCas")
 	for _, m := range []string{"CASRef", "CASRefGen"} {
 		body := refstore.fn("RefStore", m).Body
+		cs := refstore.calls(body)
+		rb, inner := first(cs, "s.runBeforeCAS"), first(cs, "s.RefStore."+m)
 		refused := token.NoPos
 		ast.Inspect(body, func(n ast.Node) bool {
-			if is, ok := n.(*ast.IfStmt); ok && is.Init != nil && refstore.text(is.Init) == "err := s.runBeforeCAS(ctx, repo, name)" &&
+			if is, ok := n.(*ast.IfStmt); ok && !refused.IsValid() && rb.IsValid() && is.Pos() > rb && is.Init == nil &&
 				refstore.text(is.Cond) == "err != nil" && len(is.Body.List) == 1 {
 				if _, ok := is.Body.List[0].(*ast.ReturnStmt); ok {
 					refused = is.Pos()
@@ -458,21 +461,25 @@ func main() {
 			}
 			return true
 		})
-		inner := first(refstore.calls(body), "s.RefStore."+m)
-		mb.need(refused.IsValid() && inner.IsValid() && refused < inner, "RefStore.%s returns runBeforeCAS's error before it calls s.RefStore.%s", m, m)
+		mb.need(assigned(refstore.assigns(body), "err", "s.runBeforeCAS(ctx, repo, name)") && refused.IsValid() && inner.IsValid() && refused < inner,
+			"RefStore.%s returns runBeforeCAS's error before it calls s.RefStore.%s", m, m)
 	}
 	mb.need(first(refstore.calls(refstore.fn("RefStore", "runBeforeCAS").Body), "s.beforeCAS").IsValid(), "RefStore.runBeforeCAS calls s.beforeCAS")
 	whe := wireEvt.fn("", "wireHookEventing")
 	localMark := false
 	ast.Inspect(whe.Body, func(n ast.Node) bool {
 		if is, ok := n.(*ast.IfStmt); ok && is.Init != nil && strings.Contains(wireEvt.text(is.Init), "meta.LocalSchedule(ms)") {
-			for _, a := range wireEvt.assigns(is.Body) {
-				localMark = localMark || (a.lhs == "beforeCAS" && strings.HasPrefix(a.rhs, "enqueueSyncOrForward("))
+			as := wireEvt.assigns(is.Body)
+			for _, a := range as {
+				localMark = localMark || (a.lhs == "beforeCAS" && strings.Contains(a.rhs, "mark(ctx, repoID)"))
 			}
+			localMark = localMark && slices.ContainsFunc(as, func(a assign) bool {
+				return a.lhs == "mark" && strings.HasPrefix(a.rhs, "enqueueSyncOrForward(")
+			})
 		}
 		return true
 	})
-	mb.need(localMark, "wireHookEventing's local-schedule branch sets beforeCAS = enqueueSyncOrForward(...)")
+	mb.need(localMark, "wireHookEventing's local-schedule branch sets beforeCAS to call mark := enqueueSyncOrForward(...)")
 	bcWired := 0
 	for _, l := range wireEvt.literals(whe.Body, "events.RefStoreOptions") {
 		if strings.Contains(l, "BeforeCAS:") && strings.Contains(l, "beforeCAS") {
@@ -561,6 +568,37 @@ func main() {
 	})
 	ss.need(strictServe, "serve sets srv.StrictSyncFetch from meta.LocalSchedule(...)")
 	facts = append(facts, ss)
+
+	// RestMarkBeforeCas: serve's REST writes on the local schedule hold the
+	// ref and record the forward intent before their authority CAS, and the
+	// hold ends after the CAS.
+	rm := newFact("RestMarkBeforeCas")
+	bse := wireEvt.fn("", "buildServeEventing")
+	restWired := false
+	ast.Inspect(bse.Body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok && wireEvt.text(is.Cond) == "isPGURL(dbURL)" && is.Else != nil {
+			restWired = assigned(wireEvt.assigns(is.Else), "beforeCAS", "restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)")
+		}
+		return true
+	})
+	rm.need(restWired, "buildServeEventing's local branch sets beforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)")
+	serveWired := 0
+	for _, l := range wireEvt.literals(bse.Body, "events.RefStoreOptions") {
+		if strings.Contains(l, "BeforeCAS:") && strings.Contains(l, "beforeCAS") {
+			serveWired++
+		}
+	}
+	rm.need(serveWired == 1, "buildServeEventing passes BeforeCAS: beforeCAS to the decorator (found %d)", serveWired)
+	ric := wireLocal.calls(wireLocal.fn("", "restIntentBeforeCAS").Body)
+	holdAt, markAt := first(ric, "githttp.HoldRef"), first(ric, "ms.RequestPush")
+	rm.need(holdAt.IsValid() && markAt.IsValid() && holdAt < markAt, "restIntentBeforeCAS calls githttp.HoldRef before ms.RequestPush")
+	rm.need(first(pub.calls(pub.fn("", "HoldRef").Body), "reservePushHolds").IsValid(), "githttp.HoldRef reserves the ref's hold (reservePushHolds)")
+	for _, m := range []string{"CASRef", "CASRefGen"} {
+		cs := refstore.calls(refstore.fn("RefStore", m).Body)
+		inner, rel := first(cs, "s.RefStore."+m), first(cs, "release")
+		rm.need(inner.IsValid() && rel.IsValid() && inner < rel, "RefStore.%s calls release() after s.RefStore.%s", m, m)
+	}
+	facts = append(facts, rm)
 
 	for _, f := range facts {
 		ev := "ok"

@@ -85,11 +85,16 @@ that a later push then held, while the cache still had a value older than
 the authority (after a REST write, or a push that died after its CAS), and
 end `done` without forwarding the newer value. Now a forwarding push's hook
 records `RequestPush` before its authority CAS, after the ref's push hold is
-in place. A failed write, a failed read of the repository's upstream link,
-or a metadata store the hook cannot open refuses the ref update. Ephemeral
-updates and a sync run's own loopback push record no intent, and this step
-does not refuse them. The intent after the
-CAS stays, and still does the pull marking. A local push run's loopback
+in place. A REST write by a caller that may forward, to a `forward_on_push`
+repository, first takes the ref's push hold in serve's cache, then records
+`RequestPush`, and the hold ends when its CAS returns. A failed intent
+write or hold refuses the ref update. So does a failed read of the
+repository's upstream link, or a metadata store the hook cannot open, for
+every update outside the ephemeral namespace, also one whose caller may
+neither forward nor pull and so would record no intent: the step does not
+check the caller's gates first, so it fails closed. A sync run's own
+loopback push is not refused by this step. The intent after the CAS stays,
+and still does the pull marking. A local push run's loopback
 fetch fails with HTTP 423 when its hydrate would skip a push-held ref whose
 cached value is older than the authority, and the run ends with `restore`,
 as after a failed publication wait.
