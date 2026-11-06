@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.51.1] - 2026-11-05
+
+### Fixed
+
+- Fixed a client ignoring queue pause, resume, or metadata changes until it restarted when the queue control notification was lost, as happens if it's sent while the client's notifier is reconnecting. Clients with a notifier now also check their queues' settings once a minute. [Issue #1579](https://github.com/riverqueue/river/issues/1579).
+- Fixed the notifier never reconnecting when its connection went silent without an error, like after a dropped network path, because its health check ping had no timeout. The ping now times out after 10 seconds. [Issue #1579](https://github.com/riverqueue/river/issues/1579).
+- Fixed maintenance services logging errors during normal shutdown or leadership loss, including `PeriodicJobEnqueuer` reporting `Error starting transaction: context canceled` when stopped during staggered startup. Genuine query timeouts and database failures are still logged, and periodic job transactions now roll back even after cancellation. [PR #1577](https://github.com/riverqueue/river/pull/1577).
+
+## [0.51.0] - 2026-10-31
+
+### Added
+
+- Added `JobDeleteManyParams.Where`, an escape hatch for deleting jobs by an arbitrary SQL predicate, like `JobListParams.Where` does for lists. For example, it can select queued jobs whose args name a given customer. A `Where` predicate counts as a filter, so it doesn't need `UnsafeAll`, and each predicate is wrapped in parentheses so that an `OR` in it can't widen the deletion past other filters or to running jobs. The existing batch limit (100 jobs by default) and Postgres behavior of skipping locked jobs still apply. [PR #1570](https://github.com/riverqueue/river/pull/1570).
+
+### Fixed
+
+- Fixed a running job not being cancelled after `Client.JobCancel` when the cancellation notification was lost, as happens if it's sent while the client's notifier is reconnecting. Clients with a notifier now also check their running jobs for cancellation requests once a minute. `Client.JobRetry` now clears an earlier attempt's cancellation request so that the retried job isn't cancelled again. [PR #1564](https://github.com/riverqueue/river/pull/1564).
+- Fixed `Client.InsertManyFast` panicking after its transaction committed on a client configured with queues when the driver doesn't support a listener, such as a `riverdatabasesql` driver created with `New` instead of `NewWithPgxListener`. It now wakes producers for the inserted jobs' queues right away, like `Client.InsertMany`. [PR #1558](https://github.com/riverqueue/river/pull/1558).
+- Fixed `Client.QueueUpdate` without metadata crashing the program when the client works that queue and the driver doesn't support a listener. [PR #1558](https://github.com/riverqueue/river/pull/1558).
+- Fixed the notifier's run loop blocking forever when a topic `LISTEN` or `UNLISTEN` handed to it finished after its caller had stopped waiting (after 5 seconds, with `timed out waiting for interrupt operation`), as can happen on a slow or unresponsive connection. `Client.Stop` then never completed, and neither did a `Client.Start` that failed this way. [PR #1559](https://github.com/riverqueue/river/pull/1559).
+
 ## [0.50.0] - 2026-10-26
 
 ### Changed
