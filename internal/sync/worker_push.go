@@ -70,10 +70,10 @@ var pushRefspecs = []string{"refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/
 // every few seconds only while `git push` is actually running.
 const defaultDetachPoll = 2 * time.Second
 
-// ErrRepoGone is RunPush's error on the River lane when the repo lookup
-// finds no repository (it was deleted). The job has nothing left to do, so
-// the push worker completes it before its completion gate, even if a push
-// claim is still held.
+// ErrRepoGone is the error of Run and RunPush on the River lane when the
+// repo lookup finds no repository (it was deleted). The job has nothing
+// left to do, so the sync or push worker completes it before its
+// completion gate, even if a claim is still held.
 var ErrRepoGone = errors.New("repository deleted")
 
 // RunPush executes one outbound push-upstream run for job. Lifecycle,

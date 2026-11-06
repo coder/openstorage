@@ -49,6 +49,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/gitlimit"
@@ -678,10 +679,15 @@ func wcNewScratch(repoPath string) (*wcScratch, error) {
 		return nil, err
 	}
 	// Hermetic env: the host's GIT_* (identity overrides, config, index)
-	// must never leak into server-created commits.
+	// must never leak into server-created commits. git names a file it
+	// cannot read in a warning, and a 400 or 409 body shows git's stderr, so
+	// every file git reads outside the repository must lie under the
+	// scratch dir, where wcApplyServerFailure sees it: HOME and
+	// XDG_CONFIG_HOME lead the default attributes file there, and
+	// GIT_ATTR_NOSYSTEM drops the install's own etc/gitattributes.
 	env := make([]string, 0, 32)
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "GIT_") {
+		if strings.HasPrefix(kv, "GIT_") || strings.HasPrefix(kv, "HOME=") || strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
 			continue
 		}
 		env = append(env, kv)
@@ -692,6 +698,9 @@ func wcNewScratch(repoPath string) (*wcScratch, error) {
 		"GIT_INDEX_FILE="+filepath.Join(dir, "index"),
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_ATTR_NOSYSTEM=1",
+		"HOME="+dir,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "xdg"),
 	)
 	return &wcScratch{repoPath: repoPath, dir: dir, baseEnv: env}, nil
 }
@@ -732,45 +741,156 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 // wcMaxApplyMsgBytes caps the git apply message a client sees.
 const wcMaxApplyMsgBytes = 4096
 
+// wcApplyRejection is git apply exiting with a status. git exits 1 when the
+// patch does not apply to the tree and 128 for every "bad error": a patch it
+// refuses on sight, a patch that clashes with the tree while it writes the
+// index, and a failure of the index itself (unreadable, locked, no room to
+// write). Only git's message tells those apart, so status comes from the
+// whole stderr, which a long path can push far past wcMaxApplyMsgBytes.
+type wcApplyRejection struct {
+	exit   int    // git's exit status, -1 when SIGABRT ended it (see wcGitAborted)
+	status int    // wcApplyStatus of git's whole stderr, 400 for an abort, 500 if server is set
+	server bool   // that stderr shows a failure of the server's own git (see wcApplyServerFailure)
+	msg    string // that stderr cut to wcMaxApplyMsgBytes
+}
+
+func (r *wcApplyRejection) Error() string {
+	return fmt.Sprintf("git apply exited with status %d: %s", r.exit, r.msg)
+}
+
+// The lines git apply 2.55 writes, in English (see applyPatch), for the
+// exit-128 failures that a patch causes and `--numstat` does not see. Every
+// other 128 is read as the server's. A file name that the client chose can
+// hold a newline, and git prints names unquoted, so a name can put any of
+// these lines into stderr: they say what git was told, not what failed.
+// applyPatch therefore never shows a message that names the server's own
+// paths (see wcApplyServerFailure), whatever these lines say.
+var (
+	// A patch that no base tree can make apply: a name that git's own path
+	// rules reject (`.git.`, `git~1`, a symlinked `.gitmodules`), a patch
+	// whose only change is a mode git reads as the old one, a submodule
+	// patch without a commit or with a null one.
+	wcApplyPayloadLines = []string{"error: invalid path '", "error: patch with only garbage at ", "error: corrupt patch for submodule ", "error: cache entry has null sha1: "}
+	// A file where the tree has a directory, or a directory where it has a
+	// file: the index refuses the entry.
+	wcApplyClashLine = "error: unable to add cache entry for "
+)
+
+// wcApplyStatus is the HTTP status for git apply's exit status and stderr:
+// 409 for a patch that does not fit the base tree, 400 for one that fits no
+// tree, and 500 for the server's own failure, whose stderr names scratch
+// paths and stays in the log.
+func wcApplyStatus(exit int, stderr string) int {
+	switch exit {
+	case 1:
+		return http.StatusConflict
+	case 128:
+	default:
+		return http.StatusInternalServerError
+	}
+	clash := false
+	for line := range strings.Lines(stderr) {
+		for _, p := range wcApplyPayloadLines {
+			if strings.HasPrefix(line, p) {
+				return http.StatusBadRequest
+			}
+		}
+		clash = clash || strings.HasPrefix(line, wcApplyClashLine)
+	}
+	if clash {
+		return http.StatusConflict
+	}
+	return http.StatusInternalServerError
+}
+
+// wcApplyServerFailure reports whether git's stderr shows a failure of the
+// server's own git, whatever the patch holds, so that the client never sees
+// it: it names a path of the server's (the scratch directory or the cached
+// repository), or it has a fatal line. git dies for a broken config, a held
+// lock or a missing object, and reports a bad patch with error lines.
+func (sc *wcScratch) wcApplyServerFailure(stderr string) bool {
+	assertf(sc.dir != "" && sc.repoPath != "", "wcApplyServerFailure: empty scratch path")
+	for line := range strings.Lines(stderr) {
+		if strings.HasPrefix(line, "fatal: ") {
+			return true
+		}
+	}
+	for _, dir := range []string{sc.dir, sc.repoPath} {
+		if strings.Contains(stderr, dir) {
+			return true
+		}
+		if real, err := filepath.EvalSymlinks(dir); err == nil && real != dir && strings.Contains(stderr, real) {
+			return true
+		}
+	}
+	return false
+}
+
 // applyPatch runs `git apply` on the spooled patch. The patch goes on
-// stdin, so git's messages name <stdin>, never the scratch path. When git
-// itself rejects the patch (it exits with a status), gitMsg is git's
-// stderr, cut to wcMaxApplyMsgBytes, and safe to show the client.
-// Any other failure (a canceled request, a git killed by a signal, a
-// server shutdown) leaves gitMsg empty and returns err.
-func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...string) (out, gitMsg string, err error) {
+// stdin, so git's messages name <stdin>, never the scratch path, and
+// LC_ALL=C keeps them in English for status. When git exits with a status
+// the error is a *wcApplyRejection, whose message is safe to show the
+// client only when its status is 400 or 409. Any other failure (a canceled
+// request, a git killed by a signal, a server shutdown) is a plain error.
+func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...string) (out string, err error) {
 	f, err := os.Open(patchPath)
 	if err != nil {
-		return "", "", fmt.Errorf("open patch: %w", err)
+		return "", fmt.Errorf("open patch: %w", err)
 	}
 	defer f.Close()
-	cmd := sc.gitCmd(ctx, nil, append([]string{"apply"}, args...)...)
+	cmd := sc.gitCmd(ctx, []string{"LC_ALL=C"}, append([]string{"apply"}, args...)...)
 	cmd.Stdin = f
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	o, err := gitlimit.Output(cmd)
 	if err == nil {
-		return string(o), "", nil
+		return string(o), nil
 	}
 	var exit *exec.ExitError
-	if ctx.Err() != nil || !errors.As(err, &exit) || exit.ExitCode() < 0 {
-		return "", "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	if ctx.Err() != nil || !errors.As(err, &exit) || (exit.ExitCode() < 0 && !wcGitAborted(exit)) {
+		return "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	gitMsg = strings.TrimSpace(stderr.String())
-	if len(gitMsg) > wcMaxApplyMsgBytes {
-		gitMsg = strings.ToValidUTF8(gitMsg[:wcMaxApplyMsgBytes], "") + " …"
+	full := strings.TrimSpace(stderr.String())
+	msg := full
+	if len(msg) > wcMaxApplyMsgBytes {
+		msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
 	}
-	if gitMsg == "" {
-		gitMsg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
+	aborted := wcGitAborted(exit)
+	if msg == "" {
+		msg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
+		if aborted {
+			msg = "git apply aborted"
+		}
 	}
-	return "", gitMsg, err
+	server := sc.wcApplyServerFailure(full)
+	status := wcApplyStatus(exit.ExitCode(), full)
+	if aborted {
+		status = http.StatusBadRequest
+	}
+	if server {
+		status = http.StatusInternalServerError
+	}
+	return "", &wcApplyRejection{exit: exit.ExitCode(), status: status, server: server, msg: msg}
+}
+
+// wcGitAborted reports whether git died of SIGABRT, which is how it ends on
+// a failed assertion. git 2.55 asserts, after `--numstat` parsed the patch,
+// on a header that names a new file twice (a repeated `diff --git` line or a
+// `--- /dev/null` line before `new file mode`). That is a failure over the
+// patch's own bytes, so applyPatch reads it as a 400. Any other signal
+// (SIGKILL from the OOM killer, SIGTERM at shutdown) stays a server fault.
+func wcGitAborted(exit *exec.ExitError) bool {
+	ws, ok := exit.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGABRT
 }
 
 // wcNumstatPaths parses `git apply --numstat -z`: one record per file,
 // "added<TAB>deleted<TAB>path<NUL>". The path is the file's new name (its
 // old name for a deletion): unlike `git diff`, git apply prints one name
 // for a rename or copy too. A rename's old name must exist in the base
-// tree, and a bad one never does, so that patch does not apply (409).
+// tree, and a bad one never does, so that patch does not apply (409). A
+// header without a name (`diff --git a/ b/`) gives an empty path, which
+// wcPathShapeError refuses (400).
 func wcNumstatPaths(out string) ([]string, error) {
 	var paths []string
 	for rest := out; rest != ""; {
@@ -779,7 +899,7 @@ func wcNumstatPaths(out string) ([]string, error) {
 			return nil, fmt.Errorf("numstat record without NUL: %q", rest)
 		}
 		fields := strings.SplitN(rec, "\t", 3)
-		if len(fields) != 3 || fields[2] == "" {
+		if len(fields) != 3 {
 			return nil, fmt.Errorf("numstat record %q", rec)
 		}
 		paths = append(paths, fields[2])
@@ -1338,9 +1458,10 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 		// a 500 (#608). `git apply --numstat` parses without applying: a
 		// parse failure means the payload is not a patch (400, spec "the
 		// diff payload was invalid").
-		numstat, gitMsg, err := sc.applyPatch(r.Context(), patchPath, "--numstat", "-z")
-		if gitMsg != "" {
-			wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+gitMsg, md.TargetBranch, plan.oldSHA)
+		var rej *wcApplyRejection
+		numstat, err := sc.applyPatch(r.Context(), patchPath, "--numstat", "-z")
+		if errors.As(err, &rej) && !rej.server {
+			wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+rej.msg, md.TargetBranch, plan.oldSHA)
 			return
 		} else if err != nil {
 			s.wcInternal(w, r, "parse patch", err)
@@ -1359,13 +1480,19 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// Any other failure means the patch does not fit the base tree:
-		// 409 conflict, upstream's "the diff does not apply".
-		if _, gitMsg, err := sc.applyPatch(r.Context(), patchPath, "--cached", "--binary", "--whitespace=nowarn"); gitMsg != "" {
-			wcFail(w, http.StatusConflict, "conflict", "patch does not apply: "+gitMsg, md.TargetBranch, plan.oldSHA)
-			return
-		} else if err != nil {
-			s.wcInternal(w, r, "apply patch", err)
+		// git checks names and modes only here, so a patch that only git
+		// refuses is a 400 as well. A patch that does not fit the base tree
+		// is a 409 conflict, upstream's "the diff does not apply". Any other
+		// failure is the server's own git (a locked or full index): a 500.
+		if _, err := sc.applyPatch(r.Context(), patchPath, "--cached", "--binary", "--whitespace=nowarn"); err != nil {
+			switch {
+			case !errors.As(err, &rej), rej.status == http.StatusInternalServerError:
+				s.wcInternal(w, r, "apply patch", err)
+			case rej.status == http.StatusBadRequest:
+				wcFail(w, http.StatusBadRequest, "invalid", "diff payload is not a valid patch: "+rej.msg, md.TargetBranch, plan.oldSHA)
+			default:
+				wcFail(w, http.StatusConflict, "conflict", "patch does not apply: "+rej.msg, md.TargetBranch, plan.oldSHA)
+			}
 			return
 		}
 		// blob_count: the SDK ack schema requires a number on diff-commit

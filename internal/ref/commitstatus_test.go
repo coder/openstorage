@@ -2,6 +2,7 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -20,7 +21,7 @@ import (
 // failure. An outcome PostgreSQL cannot confirm (the transaction still in
 // progress when the wait runs out, or the status query failing) is an
 // ambiguous error, which IdempotentCAS rechecks. A swap that changed no row
-// returns its COMMIT error as it is. pgx reports each of these losses as a
+// returns its COMMIT error as pgx returned it, without a status marker. pgx reports each of these losses as a
 // request never sent, so without the status query every case would read as
 // definitive.
 func TestPGCASResolvesFailedCommit(t *testing.T) {
@@ -34,6 +35,7 @@ func TestPGCASResolvesFailedCommit(t *testing.T) {
 		oneConn       bool // pool_max_conns=1: the CAS holds the pool's only connection
 		cancelAtFault bool // the caller's context ends when the fault fires
 		noRowChanged  bool // the swap's old sha is stale, so it changes no row
+		warmPool      bool // the pool holds a second idle connection, so the first status query answers at once
 		won           bool
 		ambiguous     bool   // for a failed CAS that changed a row: the error IdempotentCAS rechecks
 		want          string // the ref afterwards
@@ -41,7 +43,7 @@ func TestPGCASResolvesFailedCommit(t *testing.T) {
 		{name: "lost-reply", fault: pgfault.DropReply, won: true, want: b},
 		{name: "lost-reply-one-conn", fault: pgfault.DropReply, oneConn: true, won: true, want: b},
 		{name: "lost-reply-canceled", fault: pgfault.DropReply, cancelAtFault: true, won: true, want: b},
-		{name: "delayed-commit", fault: pgfault.DelayCommit, won: true, want: b},
+		{name: "delayed-commit", fault: pgfault.DelayCommit, warmPool: true, won: true, want: b},
 		{name: "dropped-commit", fault: pgfault.DropCommit, want: a},
 		{name: "in-progress", fault: pgfault.HoldCommit, ambiguous: true, want: a},
 		{name: "status-query-fails", fault: pgfault.CutAll, ambiguous: true, want: a},
@@ -61,6 +63,20 @@ func TestPGCASResolvesFailedCommit(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(ps.Close)
+			if tc.warmPool {
+				// Two connections at once, so the pool keeps a second one
+				// idle and the status query needs no new connection.
+				c1, err := ps.pool.Acquire(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c2, err := ps.pool.Acquire(ctx)
+				c1.Release()
+				if err != nil {
+					t.Fatal(err)
+				}
+				c2.Release()
+			}
 			cctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			committed := 0
@@ -94,7 +110,14 @@ func TestPGCASResolvesFailedCommit(t *testing.T) {
 				}
 			case won || err == nil || !strings.Contains(err.Error(), "commit"):
 				t.Fatalf("won=%v err=%v, want a commit error", won, err)
-			case !tc.noRowChanged && ambiguousError(err) != tc.ambiguous:
+			case tc.noRowChanged:
+				// The COMMIT error passes through as pgx returned it.
+				var unknown commitUnknownError
+				var notExec notExecutedError
+				if errors.As(err, &unknown) || errors.As(err, &notExec) {
+					t.Fatalf("err=%v carries a commit-status marker, want the COMMIT error as pgx returned it", err)
+				}
+			case ambiguousError(err) != tc.ambiguous:
 				t.Fatalf("ambiguousError(%v) = %v, want %v", err, !tc.ambiguous, tc.ambiguous)
 			}
 			wantCommitted := 0

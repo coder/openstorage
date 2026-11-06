@@ -12,7 +12,7 @@ Test helper that relays PostgreSQL connections through a local TCP proxy and inj
 
 ## Invariants
 - Only a client read that is exactly pgx's simple-protocol `commit` Query message triggers the fault, and one arm triggers at most one fault [pgfault.go:commitMsg] [pgfault.go:take]
-- Every fault marks itself fired, and runs the callback, before the proxy closes any connection, so `Fired` is true once the client sees the fault. `DropReply` runs the callback after the server's reply arrives [pgfault.go:relay] [pgfault.go:fire]
+- Every fault marks itself fired, then runs the callback, before the proxy closes any connection, so `Fired` is true once the client sees the fault, also when the callback ends the client's context. `DropReply` runs the callback after the server's reply arrives [pgfault.go:relay] [pgfault.go:fire]
 - `Arm` panics on an unknown fault [pgfault.go:Arm]
 
 ## Side Effects

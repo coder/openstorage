@@ -209,6 +209,17 @@ func TestCapWebhookRows(t *testing.T) {
 	}
 }
 
+// TestS3WALMetaConsumersResolveCountsThePath: a URL that equals another
+// repo's repo_id resolves by id, so it must not count as a URL resolve.
+func TestS3WALMetaConsumersResolveCountsThePath(t *testing.T) {
+	body := `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"public_keys":["k"]}},"repos":{` +
+		`"repo_aaaaaaaaaaaa":{"org_id":1,"url":"repo_bbbbbbbbbbbb","default_branch":"main","created_at":1},` +
+		`"repo_bbbbbbbbbbbb":{"org_id":1,"url":"repo_aaaaaaaaaaaa","default_branch":"main","created_at":1}}}`
+	if n := driveMetaConsumers(t, []byte(body), false); n.resolvedByID != 4 || n.resolvedByURL != 0 {
+		t.Fatalf("crossed urls: %+v, want 4 resolves by id and none by url", n)
+	}
+}
+
 // TestS3WALMetaConsumersDanglingWebhook: a webhook whose org_id names no
 // org is never listed, but a queued delivery still reloads and posts it.
 func TestS3WALMetaConsumersDanglingWebhook(t *testing.T) {
@@ -284,12 +295,14 @@ func driveMetaConsumers(t testing.TB, body []byte, encrypted bool) (n consumerCo
 		for _, id := range repoIDs[:min(len(repoIDs), consumerFuzzCap)] {
 			// The git surface resolves the URL path element, then
 			// keys refs and quota by the resolved repo_id.
-			for i, key := range []string{id, doc.Repos[id].URL} {
+			for _, key := range []string{id, doc.Repos[id].URL} {
 				repo, err := meta.ResolveRepoKey(ctx, st, org, key)
 				if err != nil {
 					continue
 				}
-				if i == 0 {
+				// ResolveRepoKey tries the key as a repo_id first, so count the
+				// lookup that answered, not which key it was.
+				if repo.RepoID == key {
 					n.resolvedByID++
 				} else {
 					n.resolvedByURL++
