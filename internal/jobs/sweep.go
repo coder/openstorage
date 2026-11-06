@@ -170,12 +170,13 @@ type SweepConfig struct {
 	// reapable in every class (packs and LFS alike, no per-class opt-in
 	// needed), because an in-flight pre-delete writer publishes its blob
 	// BEFORE its fenced registration fails — the blob can land after a
-	// purge's own prefix scan, and fenced repos never register again, so
-	// such blobs are provably permanent garbage. Wired whenever the ref
-	// store carries the purge seams, independent of the retention window:
-	// `openstorage purge-repo` mints fences on retention-less deployments
-	// too (PR #105 round 8). One extra point read per aged candidate not
-	// already covered by another mode, mirroring IsRetainedPack.
+	// purge's own prefix scan, and fenced repos never register again
+	// (repack folds included), so such blobs are provably permanent
+	// garbage. Wired whenever the ref store carries the purge seams,
+	// independent of the retention window: `openstorage purge-repo` mints
+	// fences on retention-less deployments too (PR #105 round 8). One
+	// extra point read per aged candidate not already covered by another
+	// mode, mirroring IsRetainedPack.
 	//
 	// Probe presence also joins the destructive-mode set for quarantine
 	// aging — purge-minted backups must be collected even with every
