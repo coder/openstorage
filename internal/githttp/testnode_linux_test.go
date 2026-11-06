@@ -989,12 +989,11 @@ func processesWithArg(arg string) []int {
 	return pids
 }
 
-// TestStartBinaryNodeStopsNodeWhenGuardFails: when the guard of a node
-// fails (see TestTrackNodeSessionReportsGuardFailure), startBinaryNode must
-// stop the node it started: serve ends with the test binary through
-// Pdeathsig only, so a node left running would outlive the failed test. The
-// stand-in serve is a shell loop that carries the --cache-dir argument.
-func TestStartBinaryNodeStopsNodeWhenGuardFails(t *testing.T) {
+// TestStartNodeStopsNodeWhenGuardFails: when the guard of a node fails (see
+// TestTrackNodeSessionReportsGuardFailure), startNode must stop the serve it
+// started: serve ends with the test binary through Pdeathsig only, so a node
+// left running would outlive the failed test.
+func TestStartNodeStopsNodeWhenGuardFails(t *testing.T) {
 	trueBin, err := exec.LookPath("true")
 	if err != nil {
 		t.Fatal(err)
@@ -1004,26 +1003,22 @@ func TestStartBinaryNodeStopsNodeWhenGuardFails(t *testing.T) {
 		{"exits at once", trueBin},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			standIn := filepath.Join(t.TempDir(), "serve")
-			if err := os.WriteFile(standIn, []byte("#!/bin/sh\nwhile :; do sleep 1; done\n"), 0o755); err != nil {
-				t.Fatal(err)
-			}
 			old := nodeGuardExe
 			nodeGuardExe = func() (string, error) { return tc.exe, nil }
 			t.Cleanup(func() { nodeGuardExe = old })
 
 			cache := t.TempDir()
-			node, err := startBinaryNode(standIn, cache, io.Discard)
+			node, err := startNode(cache)
 			if err == nil {
 				node.stop()
-				t.Fatal("startBinaryNode succeeded although the node has no guard")
+				t.Fatal("startNode succeeded although the node has no guard")
 			}
 			if left := processesWithArg(cache); len(left) != 0 {
 				for _, pid := range left {
 					start, _ := processStart(pid)
 					_, _ = reapNodeSession(pid, start, 10*time.Second)
 				}
-				t.Fatalf("serve %v still runs after startBinaryNode failed: %v", left, err)
+				t.Fatalf("serve %v still runs after startNode failed: %v", left, err)
 			}
 		})
 	}
