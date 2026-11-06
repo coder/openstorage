@@ -9,7 +9,7 @@ import unittest
 
 class CheckerTestCase(unittest.TestCase):
     def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True,
-                    untracked_symlinks=None):
+                    untracked_symlinks=None, intent_to_add=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -39,6 +39,8 @@ class CheckerTestCase(unittest.TestCase):
                 (root / name).symlink_to(target)
             for name in deleted:
                 (root / name).unlink()
+            if intent_to_add:
+                subprocess.run(["git", "add", "-N", "--", *intent_to_add], cwd=root, check=True)
             return subprocess.run(
                 [sys.executable, str(checker)], cwd=root, text=True,
                 capture_output=True, timeout=10,
@@ -370,25 +372,17 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
-    def test_shell_comments_end_at_a_hash_outside_quotes_on_the_same_line(self):
-        sh = ("echo 'requires # feature-name'\n"
-              'echo "tag # double-quoted" # comment-one\n'
-              "echo it\\'s # comment-two 'x\n"
-              'echo \\" # comment-three "x\n'
-              "echo don't\n# comment-four\n"
-              'echo "it\'s" # comment-five\n'
-              "echo x # 'quoted in a comment' # comment-six\n"
-              "echo it's\" # comment-seven 'x'\n"
-              "echo \"it's\" don't # comment-eight\n"
-              'echo "$(printf "%s # nested-sub" x)"\n'
-              "printf '%s\\n' $'it\\'s # ansi-quote'\n"
-              "printf '%s\\n' $'it\\'s' # stale-name'\n"
-              'echo "${x:-"a # braced-word"}"\n'
-              'echo "`printf "%s # tick-word" x`"\n')
-        ok = ["[run.sh:feature-name]", "[run.sh:double-quoted]"]
-        bad = [f"[run.sh:comment-{n}]" for n in ("one", "two", "three", "four", "five", "six", "seven", "eight")]
-        bad += ["[run.sh:nested-sub]", "[run.sh:ansi-quote]", "[run.sh:stale-name]", "[run.sh:braced-word]",
-                "[run.sh:tick-word]"]
+    def test_shell_comments_start_at_a_hash_even_inside_quotes(self):
+        # Quotes are not read, so a quote that spans lines or a line separator
+        # that bash does not split on can never turn comment words into code.
+        sh = ("echo 'requires # quoted-word'\n"
+              "echo 'first line\nsecond line' # don't forget\n"
+              "echo 'x\x0cy' # feed-word 'z\n"
+              "echo 'x\u2028y' # sep-word 'z\n"
+              'echo "tag # double-word" # comment-one\n')
+        ok = ["[run.sh:requires]", "[run.sh:second line]", "[run.sh:tag]"]
+        bad = ["[run.sh:quoted-word]", "[run.sh:forget]", "[run.sh:feed-word]", "[run.sh:sep-word]",
+               "[run.sh:double-word]", "[run.sh:comment-one]"]
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
@@ -587,6 +581,16 @@ class FileSelectionTests(CheckerTestCase):
         result = self.run_checker("[Guide](alias/guide.md) [Dir](alias/)\n", docs={"guide.md": "# Guide\n"},
                                   symlinks={"alias": "docs"})
         self.assertEqual(result.stdout, "broken links: 0\n", result.stderr)
+
+    def test_an_intent_to_add_target_is_not_tracked(self):
+        result = self.run_checker(
+            "[Target](docs/new.txt) [Cited](pkg/README.md)\n",
+            untracked={"docs/new.txt": "x\n", "pkg/README.md": "[run.go:Run]\n", "pkg/run.go": "func Run() {}\n"},
+            intent_to_add=["docs/new.txt", "pkg/README.md", "pkg/run.go"])
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> docs/new.txt\n"
+                                        "BROKEN FILE (not tracked by git) README.md:1 -> pkg/README.md\n"
+                                        "MISSING CITED FILE pkg/README.md:1 -> [run.go:Run] (not tracked by git)\n"
+                                        "broken links: 3\n")
 
     def test_an_untracked_readme_can_link_to_itself(self):
         result = self.run_checker("", untracked={"pkg/README.md": "# Top\n[Self](#top) [Missing](#absent)\n"})

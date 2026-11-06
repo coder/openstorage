@@ -12,9 +12,9 @@ the files (for example, outside a checkout). Zero dependencies besides git.
 CI runs it in the required lint job of .github/workflows/ci.yml.
 
 Every relative INLINE link must name an existing file that git's index
-tracks, or a directory that holds one. Stage a new target (`git add`, or
-`git add -N`) before you link to it: a clean CI checkout holds only tracked
-files, and an untracked target would pass here and fail there. A #fragment on
+tracks, or a directory that holds one. Stage a new target with `git add`
+before you link to it: a clean CI checkout holds only committed files, and an
+untracked or intent-to-add (`git add -N`) target would pass here and fail there. A #fragment on
 a .md target must name one of that file's anchors, even when the target is not
 a scanned file. Anchors of docs/upstream/ targets are not checked, because those
 files are verbatim upstream copies. Anchor
@@ -258,11 +258,11 @@ def scan_lines(path):
             yield lineno, raw, visible
 
 
-def git_files(*args):
+def git_files(*args, command=("ls-files",)):
     try:
-        listed = subprocess.run(["git", "ls-files", "-z", *args], capture_output=True)
+        listed = subprocess.run(["git", *command, "-z", *args], capture_output=True)
         failure = listed.returncode and (listed.stderr.decode(errors="replace").strip()
-                                         or f"git ls-files exited {listed.returncode}")
+                                         or f"git {command[0]} exited {listed.returncode}")
     except OSError as err:
         failure = str(err)
     if failure:
@@ -312,10 +312,15 @@ def indexed(path):
     return current in tracked()
 
 
+def intent_to_add():
+    """The paths that `git add -N` put in the index without content: a commit holds none of them."""
+    return git_files("--name-only", "--diff-filter=A", command=("diff-files",))
+
+
 @functools.cache
 def tracked():
-    """The paths in git's index and every directory that holds one."""
-    files = git_files()
+    """The paths in git's index, minus intent-to-add entries, and every directory that holds one."""
+    files = git_files() - intent_to_add()
     found = set(files) | {"."}
     for name in files:
         parent = posixpath.dirname(name)
@@ -562,30 +567,11 @@ def js_names(text):
     return names
 
 
-# The reader knows one quoting form: a plain '...' or "..." that opens and
-# closes on one line, paired in the order they appear, and a backslash escape.
-# It does not read `$(...)`, `${...}`, a backtick, `$'...'` or a quote that
-# spans lines. A line that holds one of the first four (`SHELL_UNREAD`), or a
-# quote that does not close (`stray`), ignores quotes and drops its comment,
-# as every line did before quotes were read. That fails closed: a valid
-# citation of a word after such a `#` is rejected, and no comment word is
-# accepted.
-SHELL_COMMENT = re.compile(r"(?:^|(?<=[\s;&|()]))#.*")
-SHELL_UNREAD = re.compile(r"\$['({]|`")
-SHELL_LEXER = re.compile(r"""(?P<text>'[^']*'|"(?:\\.|[^"\\])*"|\\.)|(?P<stray>['"])|""" + SHELL_COMMENT.pattern)
-
-
-def shell_code(line):
-    if SHELL_UNREAD.search(line) or any(m.group("stray") for m in SHELL_LEXER.finditer(line)):
-        return SHELL_COMMENT.sub("", line)
-    return SHELL_LEXER.sub(lambda m: m.group("text") or "", line)
-
-
 # Shell commands, options, and file names have no declaration, so any
 # whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
-        self.code = "\n".join(map(shell_code, text.splitlines()))
+        self.code = "\n".join(re.sub(r"(?:^|(?<=[\s;&|()]))#.*", "", line) for line in text.splitlines())
 
     def __contains__(self, symbol):
         pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)"
