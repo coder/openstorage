@@ -9,14 +9,17 @@ package api
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitread"
 )
 
 // lpGit runs git in dir with the hermetic fixture environment and feeds it
@@ -48,30 +51,41 @@ func lpMktree(t *testing.T, dir string, records ...string) string {
 	return lpGit(t, dir, strings.Join(records, "\x00")+"\x00", "mktree", "-z", "--missing")
 }
 
-// lpTreeAt writes the tree that holds one entry (mode, oid) at path, a
-// slash-separated path whose components may be any bytes but NUL, and returns
-// the root tree oid.
-func lpTreeAt(t *testing.T, dir, path, mode, oid string) string {
+// lpTreeAt writes the tree that holds the entry (mode, oid) at each of paths,
+// slash-separated paths whose components may be any bytes but NUL, and
+// returns the root tree oid. It builds the trees bottom-up with mktree.
+func lpTreeAt(t *testing.T, dir, mode, oid string, paths ...string) string {
 	t.Helper()
 	typ := "blob"
 	if mode == "160000" {
 		typ = "commit"
 	}
-	parts := strings.Split(path, "/")
-	for i := len(parts) - 1; i >= 0; i-- {
-		oid = lpMktree(t, dir, mode+" "+typ+" "+oid+"\t"+parts[i])
-		mode, typ = "040000", "tree"
+	var records, subdirs []string
+	below := map[string][]string{}
+	for _, path := range paths {
+		head, rest, nested := strings.Cut(path, "/")
+		if !nested {
+			records = append(records, mode+" "+typ+" "+oid+"\t"+head)
+			continue
+		}
+		if below[head] == nil {
+			subdirs = append(subdirs, head)
+		}
+		below[head] = append(below[head], rest)
 	}
-	return oid
+	for _, name := range subdirs {
+		records = append(records, "040000 tree "+lpTreeAt(t, dir, mode, oid, below[name]...)+"\t"+name)
+	}
+	return lpMktree(t, dir, records...)
 }
 
 // lpName returns n bytes of the letter c, for a path component of a given size.
 func lpName(n int, c byte) string { return strings.Repeat(string(c), n) }
 
 // lpConflictRepo seeds a repo whose branches main and conflict both change
-// the file at path from the same base, so merging conflict into main
-// conflicts at exactly path. It returns a git token for the repo.
-func lpConflictRepo(t *testing.T, e *testEnv, path string) string {
+// the files at paths from the same base, so merging conflict into main
+// conflicts at exactly paths. It returns a git token for the repo.
+func lpConflictRepo(t *testing.T, e *testEnv, paths ...string) string {
 	t.Helper()
 	org := e.newOrg(t)
 	url := "https://example.com/" + org + "/lp-" + randomHex(t, 4)
@@ -83,7 +97,7 @@ func lpConflictRepo(t *testing.T, e *testEnv, path string) string {
 	lpGit(t, dir, "", "init", "-q", "-b", "main", ".")
 	commit := func(content string, parents ...string) string {
 		blob := lpGit(t, dir, content, "hash-object", "-w", "--stdin")
-		args := []string{"commit-tree", lpTreeAt(t, dir, path, "100644", blob), "-m", "c"}
+		args := []string{"commit-tree", lpTreeAt(t, dir, "100644", blob, paths...), "-m", "c"}
 		for _, p := range parents {
 			args = append(args, "-p", p)
 		}
@@ -173,20 +187,23 @@ func TestTreePathEntry(t *testing.T) {
 	}
 	t.Cleanup(sc.close)
 	manyChunks := strings.TrimSuffix(strings.Repeat(lpName(3999, 'c')+"/", 40), "/")
+	over := wmMaxPathspecBytes + 1 // the shortest component that is listed, not named in argv
 	cases := []struct{ name, path, mode, oid string }{
 		{"short path", "a/b/c", "100644", blob},
 		{"newline and tab in names", "d\ne/f\tg", "100755", blob},
 		{"gitlink whose commit is absent", "vendor/dep", "160000", strings.Repeat("2", 40)},
 		{"many chunks", manyChunks, "100644", blob},
-		{"one component over the limit", lpName(200000, 'f'), "100644", blob},
+		{"component at the limit", lpName(wmMaxPathspecBytes, 'j'), "100644", blob},
+		{"component over the limit", lpName(over, 'k'), "100644", blob},
+		{"component over the argument limit of the system", lpName(200000, 'f'), "100644", blob},
 		{"short directories then an oversized file", "a/b/" + lpName(150000, 'g'), "120000", blob},
-		{"oversized directory then more path", lpName(100000, 'h') + "/x/y", "100644", blob},
-		{"chunks, an oversized component, then a chunk", manyChunks + "/" + lpName(70000, 'i') + "/q/r", "100644", blob},
+		{"oversized directory then more path", lpName(over, 'h') + "/x/y", "100644", blob},
+		{"chunks, an oversized component, then a chunk", manyChunks + "/" + lpName(over+1000, 'i') + "/q/r", "100644", blob},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tree := lpTreeAt(t, dir, tc.path, tc.mode, tc.oid)
-			got, err := wmTreePathEntry(t.Context(), sc, tree, tc.path)
+			tree := lpTreeAt(t, dir, tc.mode, tc.oid, tc.path)
+			got, err := wmTreePathEntry(t.Context(), sc, wmTreeListings{}, tree, tc.path)
 			if want := (wmStageEntry{mode: tc.mode, oid: tc.oid}); err != nil || got != want {
 				t.Fatalf("entry = %+v, %v, want %+v", got, err, want)
 			}
@@ -196,7 +213,7 @@ func TestTreePathEntry(t *testing.T) {
 				"first byte changed": "z" + tc.path[1:],
 				"child of the entry": tc.path + "/child",
 			} {
-				if got, err := wmTreePathEntry(t.Context(), sc, tree, absent); err != nil || got != (wmStageEntry{}) {
+				if got, err := wmTreePathEntry(t.Context(), sc, wmTreeListings{}, tree, absent); err != nil || got != (wmStageEntry{}) {
 					t.Errorf("%s: entry = %+v, %v, want none", name, got, err)
 				}
 			}
@@ -205,7 +222,7 @@ func TestTreePathEntry(t *testing.T) {
 
 	t.Run("an oversized name is matched exactly among its siblings", func(t *testing.T) {
 		other := lpGit(t, dir, "y\n", "hash-object", "-w", "--stdin")
-		name := lpName(100000, 'x')
+		name := lpName(over, 'x')
 		tree := lpMktree(t, dir,
 			"100644 blob "+blob+"\t"+name,
 			"100644 blob "+other+"\t"+name+"y",
@@ -216,10 +233,10 @@ func TestTreePathEntry(t *testing.T) {
 			name[1:]:       {},
 			name + "z":     {},
 			name[:50000]:   {},
-			name[:99999]:   {},
+			name[:over-1]:  {},
 			name + "y/sub": {},
 		} {
-			if got, err := wmTreePathEntry(t.Context(), sc, tree, path); err != nil || got != want {
+			if got, err := wmTreePathEntry(t.Context(), sc, wmTreeListings{}, tree, path); err != nil || got != want {
 				t.Errorf("%d-byte path ending %.5q: entry = %+v, %v, want %+v", len(path), path[len(path)-5:], got, err, want)
 			}
 		}
@@ -246,4 +263,69 @@ func TestPathChunk(t *testing.T) {
 			t.Errorf("wmPathChunk(%q, %d) = %q, want %q", tc.path, tc.limit, got, tc.want)
 		}
 	}
+}
+
+// lpBudgetCtx returns a context carrying a git read budget of outputBytes of
+// buffered git output, like a merge preview request.
+func lpBudgetCtx(t *testing.T, outputBytes int64) context.Context {
+	t.Helper()
+	b := gitread.NewBudget(gitread.NewSlots(1, 1, 0), "lp", time.Minute, outputBytes)
+	t.Cleanup(b.Close)
+	return gitread.WithBudget(t.Context(), b)
+}
+
+// lpScratch returns a scratch odb layered over a fresh repo, and the repo's
+// directory.
+func lpScratch(t *testing.T) (*wcScratch, string) {
+	t.Helper()
+	dir := t.TempDir()
+	lpGit(t, dir, "", "init", "-q", "-b", "main", ".")
+	sc, err := wcNewScratch(filepath.Join(dir, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sc.close)
+	return sc, dir
+}
+
+// lpSiblings writes a tree of n blobs named by lpName(size, a letter) plus a
+// two-digit number, and returns the tree oid and the names.
+func lpSiblings(t *testing.T, dir string, n, size int) (string, []string) {
+	t.Helper()
+	blob := lpGit(t, dir, "x\n", "hash-object", "-w", "--stdin")
+	var records, names []string
+	for i := range n {
+		name := lpName(size, 's') + fmt.Sprintf("%02d", i)
+		names = append(names, name)
+		records = append(records, "100644 blob "+blob+"\t"+name)
+	}
+	return lpMktree(t, dir, records...), names
+}
+
+// TestTreePathEntryOutputBudget holds the output a lookup costs, which the
+// merge preview counts against one buffered-output allowance per request.
+func TestTreePathEntryOutputBudget(t *testing.T) {
+	sc, dir := lpScratch(t)
+
+	t.Run("a directory is listed once for all its oversized names", func(t *testing.T) {
+		// Each listing is about 500 KB. The allowance holds one, not four.
+		tree, names := lpSiblings(t, dir, 4, wmMaxPathspecBytes+1000)
+		ctx := lpBudgetCtx(t, 600<<10)
+		listings := wmTreeListings{}
+		for _, name := range names {
+			if got, err := wmTreePathEntry(ctx, sc, listings, tree, name); err != nil || got.oid == "" {
+				t.Fatalf("lookup of a %d-byte name: %+v, %v", len(name), got, err)
+			}
+		}
+	})
+
+	t.Run("a name that fits an argument is looked up without a listing", func(t *testing.T) {
+		// The listing is about 600 KB and the allowance 250 KiB: only the
+		// one-entry output of a pathspec lookup (about 100 KB) fits.
+		tree, names := lpSiblings(t, dir, 6, 100000) // over 64 KiB, within wmMaxPathspecBytes
+		got, err := wmTreePathEntry(lpBudgetCtx(t, 250<<10), sc, wmTreeListings{}, tree, names[0])
+		if err != nil || got.oid == "" {
+			t.Fatalf("lookup of a %d-byte name: %+v, %v", len(names[0]), got, err)
+		}
+	})
 }

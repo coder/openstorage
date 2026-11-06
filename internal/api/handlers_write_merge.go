@@ -967,9 +967,10 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 	assertf(!mt.clean, "wmRenderConflicts: clean merge result")
 	conflicts := []wmPreviewConflict{}
 	filtered := []wmPreviewFiltered{}
+	listings := wmTreeListings{}
 	for _, path := range mt.paths {
 		stages := mt.stages[path]
-		resultEntry, err := wmTreePathEntry(ctx, sc, mt.tree, path)
+		resultEntry, err := wmTreePathEntry(ctx, sc, listings, mt.tree, path)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1044,8 +1045,15 @@ func wmBlobMode(mode string) bool {
 // wmMaxPathspecBytes bounds the path bytes of one ls-tree pathspec argument.
 // Linux refuses to exec a program with any single argument of 128 KiB or
 // more (MAX_ARG_STRLEN, error E2BIG), and git stores and merges paths of that
-// size, so a longer path is resolved one chunk at a time.
-const wmMaxPathspecBytes = 64 << 10
+// size, so a longer path is resolved one chunk at a time. The 8 KiB below the
+// limit leaves room for the ":(literal)" prefix.
+const wmMaxPathspecBytes = 120 << 10
+
+// wmTreeListings holds the parsed listing of each tree that wmTreePathEntry
+// had to list, by tree oid, so that a tree is listed once per request however
+// many conflicts sit in it. A listing emits the whole tree, and the preview
+// buffers all git output under one budget.
+type wmTreeListings map[string]map[string]wmStageEntry
 
 // wmTreePathEntry resolves the merged tree's entry at path via ls-tree —
 // mode+oid straight from the tree, never dereferencing the object, so
@@ -1056,8 +1064,9 @@ const wmMaxPathspecBytes = 64 << 10
 // A path of at most wmMaxPathspecBytes takes one ls-tree. A longer path is
 // cut at slashes into chunks of that size, and each chunk is looked up in
 // the tree that the previous chunk named. A single component longer than the
-// limit is not named in argv: it is found in the listing of its directory.
-func wmTreePathEntry(ctx context.Context, sc *wcScratch, tree, path string) (wmStageEntry, error) {
+// limit is not named in argv: it is found in the listing of its directory,
+// which listings keeps for the next such component.
+func wmTreePathEntry(ctx context.Context, sc *wcScratch, listings wmTreeListings, tree, path string) (wmStageEntry, error) {
 	assertf(ref.ValidSHA(tree) && path != "", "wmTreePathEntry: bad inputs %q %q", tree, path)
 	dir, rest := tree, path
 	for {
@@ -1068,7 +1077,7 @@ func wmTreePathEntry(ctx context.Context, sc *wcScratch, tree, path string) (wmS
 			entry, err = wmLsTreePathspec(ctx, sc, dir, chunk)
 		} else {
 			chunk, _, _ = strings.Cut(rest, "/")
-			entry, err = wmLsTreeListed(ctx, sc, dir, chunk)
+			entry, err = wmLsTreeListed(ctx, sc, listings, dir, chunk)
 		}
 		if err != nil || entry.oid == "" {
 			return wmStageEntry{}, err // failed, or the path is absent
@@ -1118,24 +1127,27 @@ func wmLsTreePathspec(ctx context.Context, sc *wcScratch, tree, path string) (wm
 
 // wmLsTreeListed finds the entry called name in the listing of the whole of
 // tree, which names no path in argv. The entry is zero when tree has none.
-func wmLsTreeListed(ctx context.Context, sc *wcScratch, tree, name string) (wmStageEntry, error) {
-	out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree)
-	if err != nil {
-		return wmStageEntry{}, err
+func wmLsTreeListed(ctx context.Context, sc *wcScratch, listings wmTreeListings, tree, name string) (wmStageEntry, error) {
+	entries, ok := listings[tree]
+	if !ok {
+		out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree)
+		if err != nil {
+			return wmStageEntry{}, err
+		}
+		entries = map[string]wmStageEntry{}
+		for _, record := range strings.Split(strings.TrimSuffix(out, "\x00"), "\x00") {
+			if record == "" {
+				continue // an empty tree lists nothing
+			}
+			got, entry, valid := wmParseLsTreeRecord(record)
+			if !valid {
+				return wmStageEntry{}, fmt.Errorf("ls-tree %s emitted %.200q", tree, record)
+			}
+			entries[got] = entry
+		}
+		listings[tree] = entries
 	}
-	for _, record := range strings.Split(strings.TrimSuffix(out, "\x00"), "\x00") {
-		if record == "" {
-			continue // an empty tree lists nothing
-		}
-		got, entry, ok := wmParseLsTreeRecord(record)
-		if !ok {
-			return wmStageEntry{}, fmt.Errorf("ls-tree %s emitted %.200q", tree, record)
-		}
-		if got == name {
-			return entry, nil
-		}
-	}
-	return wmStageEntry{}, nil
+	return entries[name], nil
 }
 
 // wmParseLsTreeRecord splits one `ls-tree -z` record,
