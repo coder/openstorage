@@ -250,9 +250,10 @@ func TestLocalHookForwardBeforeCachePublication(t *testing.T) {
 
 // toggledUpstream is a smart-HTTP upstream on a fixed address that can be
 // taken down (connection refused: a transient push failure) and brought
-// back. heldport keeps the port while it is down, so another server takes
-// the port and answers in its place (a 404 there is a permanent push
-// failure) only if it also sets SO_REUSEPORT and binds that exact port.
+// back. On Linux heldport keeps the port while it is down, so another
+// server takes the port and answers in its place (a 404 there is a
+// permanent push failure) only if it also sets SO_REUSEPORT and binds that
+// exact port. Off Linux the port is not held.
 type toggledUpstream struct {
 	addr    string
 	handler http.Handler
