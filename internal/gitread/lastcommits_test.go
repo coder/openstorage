@@ -519,37 +519,13 @@ func TestLastCommitWalkBoundsRequestsInFlight(t *testing.T) {
 	}
 }
 
-// tableDiffer answers walk requests from a table of changed paths per
-// diff-tree input ("" lists nothing), for spools that git would not print
-// but that the walk must handle: any order with children before parents.
-type tableDiffer struct {
-	changed map[string][]int32
-	queue   []diffSection
-	inputs  []string
-}
-
-func (d *tableDiffer) send(input string) error {
-	d.queue = append(d.queue, diffSection{changed: d.changed[input]})
-	d.inputs = append(d.inputs, input)
-	return nil
-}
-
-func (d *tableDiffer) recv() (diffSection, error) {
-	if len(d.queue) == 0 {
-		return diffSection{}, errors.New("recv with no request in flight")
-	}
-	s := d.queue[0]
-	d.queue = d.queue[1:]
-	return s, nil
-}
-
 // TestLastCommitWalkCancelsDeadChains (#588, #593): a diff sent ahead is
 // wasted when no path reaches its commit, and the walk cancels such a chain
-// in two places. Each case builds a real history and reads the order that
-// `git rev-list --topo-order --parents` prints for it, so it is a spool that
-// git prints. A table answers the diff requests. Each case needs one of the
-// calls on its own: removing the other call leaves it green. The inputs the
-// walk sends name which diffs were wasted.
+// in two places. Each case builds a real history, reads the order that
+// `git rev-list --topo-order --parents` prints for it, and gets the answers
+// of a real `git diff-tree`, so the walk sees an input that git can produce.
+// Each case needs one of the calls on its own: removing the other call
+// leaves it green. The inputs the walk sends name which diffs were wasted.
 func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 	// chain lists the commits "<prefix>n" to "<prefix>1", parents first. Each
 	// has the next number as its parent, and the last one has end.
@@ -564,16 +540,19 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 		}
 		return lines
 	}
+	// Every commit holds the files p and q, with the contents "r" unless a
+	// case lists another one. The walk looks for the last commit of p and q.
+	type contents map[string]string
 	for _, tc := range []struct {
 		name string
 		// history lists the commits as "commit parent...", parents first. The
 		// last one is the tip. printedBefore lists pairs of commits that git
 		// must print in that order, so that the case still has its shape if
-		// a git release changes the order. changed maps a diff-tree input to
-		// the paths it lists, and last maps each path to its answer.
+		// a git release changes the order. files lists the commits whose p
+		// or q is not "r", and last maps each path to its answer.
 		history       []string
 		printedBefore [][2]string
-		changed       map[string][]string
+		files         map[string]contents
 		last          map[string]string
 		// dead names the commits that no path reaches; maxDiffed bounds the
 		// diffs sent for them.
@@ -581,19 +560,27 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 		maxDiffed int
 	}{{
 		// The tip T merges chains D and E. p takes D and resolves at D1, so
-		// the rest of D is dead, while q walks all of E. Git prints all of E
-		// before D. D1 resolves every path it holds, so the walk cancels the
-		// chain below it at once. Only the diffs sent before that are wasted:
-		// the window holds D1 and the next lines of D. Without that cancel,
-		// the chain stays marked until D2 pops, and the next pass sends one
-		// more.
+		// the rest of D is dead, while q walks all of E to the root R. Git
+		// prints all of E before D. D1 resolves every path it holds, so the
+		// walk cancels the chain below it at once. Only the diffs sent before
+		// that are wasted: the window holds D1 and the next lines of D.
+		// Without that cancel, the chain stays marked until D2 pops, and the
+		// next pass sends one more.
 		name:          "a line that resolves every path cancels the chain below it",
 		history:       slices.Concat([]string{"R"}, chain("D", 4*lastCommitWindow, "R"), chain("E", 4*lastCommitWindow, "R"), []string{"T D1 E1"}),
 		printedBefore: [][2]string{{fmt.Sprintf("E%d", 4*lastCommitWindow), "D1"}},
-		changed:       map[string][]string{"T D1": {"q"}, "D1 D2": {"p"}, "R": {"p", "q"}},
-		last:          map[string]string{"p": "D1", "q": "R"},
-		dead:          func(c string) bool { return strings.HasPrefix(c, "D") && c != "D1" },
-		maxDiffed:     lastCommitWindow - 1,
+		// T and D1 hold the same p, which D2 and the rest of D change. D1
+		// changes q, which T and all of E keep.
+		files: func() map[string]contents {
+			f := map[string]contents{"T": {"p": "a"}, "D1": {"p": "a", "q": "d"}}
+			for i := 2; i <= 4*lastCommitWindow; i++ {
+				f[fmt.Sprintf("D%d", i)] = contents{"p": "b"}
+			}
+			return f
+		}(),
+		last:      map[string]string{"p": "D1", "q": "R"},
+		dead:      func(c string) bool { return strings.HasPrefix(c, "D") && c != "D1" },
+		maxDiffed: lastCommitWindow - 1,
 	}, {
 		// The tip T merges H and F1. Git prints F1 to F14, which fill the
 		// window up to H, then H, P1, P2 and R. p takes F1 and resolves
@@ -606,10 +593,16 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 		name:          "a line sent ahead with no path forgets the parent that another chain marked",
 		history:       slices.Concat([]string{"R"}, chain("F", lastCommitWindow-2, "R"), []string{"P2 R", "P1 P2", "H P1", "T H F1"}),
 		printedBefore: [][2]string{{fmt.Sprintf("F%d", lastCommitWindow-2), "H"}},
-		changed:       map[string][]string{"F1 F2": {"p", "q"}, "P2 R": {"q"}, "T H": {"p"}, "R": {"p", "q"}},
-		last:          map[string]string{"p": "F1", "q": "P2"},
-		dead:          func(c string) bool { return c == "R" },
-		maxDiffed:     0,
+		// F1 and T hold the same files, which differ from F2 in p and q and
+		// from H in p. P2, P1 and H hold the same files, which differ from R
+		// in q.
+		files: map[string]contents{
+			"F1": {"p": "f", "q": "x"}, "T": {"p": "f", "q": "x"},
+			"P2": {"q": "x"}, "P1": {"q": "x"}, "H": {"q": "x"},
+		},
+		last:      map[string]string{"p": "F1", "q": "P2"},
+		dead:      func(c string) bool { return c == "R" },
+		maxDiffed: 0,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			var in strings.Builder
@@ -628,7 +621,14 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 					}
 					fmt.Fprintf(&in, "%s :%d\n", verb, marks[p])
 				}
-				fmt.Fprintf(&in, "M 100644 inline f\ndata %d\n%s\n\n", len(fields[0])+1, fields[0])
+				for _, path := range []string{"p", "q"} {
+					content := "r"
+					if c, ok := tc.files[fields[0]][path]; ok {
+						content = c
+					}
+					fmt.Fprintf(&in, "M 100644 inline %s\ndata %d\n%s\n", path, len(content)+1, content)
+				}
+				in.WriteString("\n")
 			}
 			dir := lcFastImport(t, in.String())
 			sha := map[string]string{}
@@ -654,18 +654,8 @@ func TestLastCommitWalkCancelsDeadChains(t *testing.T) {
 			}
 
 			paths := []string{"p", "q"}
-			changed := map[string][]int32{}
-			for input, ps := range tc.changed {
-				var key []string
-				for _, c := range strings.Fields(input) {
-					key = append(key, sha[c])
-				}
-				for _, p := range ps {
-					changed[strings.Join(key, " ")] = append(changed[strings.Join(key, " ")], int32(slices.Index(paths, p)))
-				}
-			}
 			w := newLastCommitWalk(sha[tip], paths, 10)
-			d := &tableDiffer{changed: changed}
+			d := &execDiffer{t: t, dir: dir, index: w.index}
 			if err := w.walk(bufio.NewReaderSize(strings.NewReader(spool), maxParentsLine+1), d); err != nil {
 				t.Fatal(err)
 			}
