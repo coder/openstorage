@@ -443,6 +443,10 @@ class CitationTests(CheckerTestCase):
             "const q = new /`/.constructor();\n", "const q = typeof /`/;\n", "const q = void /`/;\n",
             "switch (x) {\n  case /`/.source:\n}\n", "function f() {\n  return /`/.test(x);\n}\n", "function g() {\n  throw /`/;\n}\n",
             "const a = [...typeof /`/];\n", "const a = [...void /`/];\n", "const a = {...new /`/.constructor()};\n",
+            # A word after a member name is a keyword again once the name ends, so its `/` opens a regex literal.
+            "a.b\ntypeof /`/.source;\n", "a.b\nnew /`/.constructor();\n", "const q = a.b in /`/;\n",
+            "const q = a?.b instanceof /`/.constructor;\n", "function h() {\n  x.y\n  return /`/.test(x);\n}\n",
+            "a?.(typeof /`/.source);\n", "a?.[typeof /`/.source];\n",
         ]
         sources = [prefix + trap for prefix in [
             "const r = /`/;\n", "const r = /[`]/g;\n", "const r = /'`/;\n", "const r = /[/]`/;\n", "const r = /[/*]/;\n",
