@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1093,6 +1094,206 @@ func TestSweep_HealToleratesPeerPurgedBackup(t *testing.T) {
 	}
 	if !f.exists(orig) {
 		t.Fatalf("registered pack %q lost during peer-purged heal", orig)
+	}
+}
+
+// deadlineCalls records the time left on the context of each call a heal
+// entry makes, by call name, in call order.
+type deadlineCalls struct {
+	left map[string][]time.Duration
+	// slack is how far below healEntryTimeout a bounded call's time left may
+	// fall: a test that stalls a call sets it below the stall.
+	slack time.Duration
+}
+
+func newDeadlineCalls() *deadlineCalls {
+	return &deadlineCalls{left: map[string][]time.Duration{}, slack: time.Minute}
+}
+
+func (d *deadlineCalls) record(call string, ctx context.Context) {
+	d.left[call] = append(d.left[call], timeLeft(ctx))
+}
+
+// expect fails the test unless call ran once per element of bounded, in order,
+// with about the heal entry deadline left when the element is true and with no
+// deadline when it is false.
+func (d *deadlineCalls) expect(t *testing.T, call string, bounded ...bool) {
+	t.Helper()
+	got := d.left[call]
+	if len(got) != len(bounded) {
+		t.Errorf("heal entry called %s %d times, want %d", call, len(got), len(bounded))
+		return
+	}
+	for i, b := range bounded {
+		switch {
+		case b && (got[i] > healEntryTimeout || got[i] < healEntryTimeout-d.slack):
+			t.Errorf("%s call %d ran with %v left, want about the %v entry deadline", call, i+1, got[i], healEntryTimeout)
+		case !b && got[i] != math.MaxInt64:
+			t.Errorf("%s call %d ran with %v left, want the caller's context with no deadline", call, i+1, got[i])
+		}
+	}
+}
+
+type deadlineBlobs struct {
+	blob.BlobStore
+	calls     *deadlineCalls
+	copyDelay time.Duration
+}
+
+func (b *deadlineBlobs) Stat(ctx context.Context, key string) (int64, error) {
+	b.calls.record("Stat", ctx)
+	return b.BlobStore.Stat(ctx, key)
+}
+
+func (b *deadlineBlobs) Copy(ctx context.Context, dst, src string) error {
+	b.calls.record("Copy", ctx)
+	time.Sleep(b.copyDelay)
+	return b.BlobStore.Copy(ctx, dst, src)
+}
+
+func (b *deadlineBlobs) Delete(ctx context.Context, key string) error {
+	b.calls.record("Delete", ctx)
+	return b.BlobStore.Delete(ctx, key)
+}
+
+type deadlinePacks struct {
+	PackRegistry
+	calls *deadlineCalls
+}
+
+func (p *deadlinePacks) HasPack(ctx context.Context, repo, key string) (bool, error) {
+	p.calls.record("HasPack", ctx)
+	return p.PackRegistry.HasPack(ctx, repo, key)
+}
+
+func (p *deadlinePacks) ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, error) {
+	p.calls.record("ReclaimRetainedPack", ctx)
+	return p.PackRegistry.ReclaimRetainedPack(ctx, repo, key)
+}
+
+// The heal of an orphan's quarantine backup runs from its registry read to its
+// purge under its own deadline, even when the sweep's context has none: the
+// quarantine purge age model needs a stalled entry to end well before the
+// smallest margin.
+func TestSweep_HealEntryOfAnOrphanRunsUnderItsOwnDeadline(t *testing.T) {
+	f := newSweepFixture(t)
+	gone := blob.PackKey("r1", "gone")
+	qKey := quarantinePrefix + "00112233aabbccdd/" + gone
+	f.upload(qKey, "gone-bytes") // unregistered and missing: reclaim its retained row, then purge the aged backup
+
+	calls := newDeadlineCalls()
+	s := NewSweeper(&deadlineBlobs{BlobStore: f.blobs, calls: calls}, &deadlinePacks{PackRegistry: f.store, calls: calls},
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true, PurgedRepoProbe: func(ctx context.Context, _ string) (bool, error) {
+			calls.record("PurgedRepoProbe", ctx)
+			return true, nil
+		}}, slog.New(slog.DiscardHandler))
+	entry := blob.ListedObject{Key: qKey, Size: int64(len("gone-bytes")), ModTime: time.Now().Add(-25 * time.Hour)}
+	if err := s.healQuarantineEntry(context.Background(), entry, &SweepReport{}, false, true); err != nil {
+		t.Fatalf("healQuarantineEntry: %v", err)
+	}
+	if f.exists(qKey) {
+		t.Fatalf("heal did not purge the aged backup %q", qKey)
+	}
+	for _, call := range []string{"HasPack", "Stat", "ReclaimRetainedPack", "PurgedRepoProbe", "Delete"} {
+		calls.expect(t, call, true)
+	}
+}
+
+// A registered key restores its original with no bound: the restore copies and
+// hashes the whole backup, which a large LFS object can take longer than any
+// fixed bound to do. The registry read before it and the original's second
+// read before the purge run under the entry deadline, and the second bound
+// opens after the restore: a restore that stalls leaves it whole.
+func TestSweep_HealEntryOfARegisteredPackRestoresWithoutADeadline(t *testing.T) {
+	f := newSweepFixture(t)
+	lost := blob.PackKey("r1", "lost")
+	qKey := quarantinePrefix + "00112233aabbccdd/" + lost
+	f.upload(qKey, "lost-bytes")
+	f.register("r1", "lost", lost) // registered, original missing: restore, then purge the aged backup
+
+	calls := newDeadlineCalls()
+	calls.slack = time.Second
+	s := NewSweeper(&deadlineBlobs{BlobStore: f.blobs, calls: calls, copyDelay: 2 * time.Second}, &deadlinePacks{PackRegistry: f.store, calls: calls},
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	entry := blob.ListedObject{Key: qKey, Size: int64(len("lost-bytes")), ModTime: time.Now().Add(-25 * time.Hour)}
+	if err := s.healQuarantineEntry(context.Background(), entry, &SweepReport{}, true, false); err != nil {
+		t.Fatalf("healQuarantineEntry: %v", err)
+	}
+	if !f.exists(lost) || f.exists(qKey) {
+		t.Fatalf("heal did not restore %q and purge its aged backup (original exists %v, backup exists %v)", lost, f.exists(lost), f.exists(qKey))
+	}
+	calls.expect(t, "HasPack", true)
+	calls.expect(t, "Stat", false, true) // the first stat, then the read the purge relies on
+	calls.expect(t, "Copy", false)
+	calls.expect(t, "Delete", true)
+}
+
+// staleStat answers a Stat late and without an error once the caller's context
+// has ended, as a store that ignores its context does, such as the file store.
+type staleStat struct {
+	blob.BlobStore
+	end context.CancelFunc
+}
+
+func (b *staleStat) Stat(ctx context.Context, key string) (int64, error) {
+	size, err := b.BlobStore.Stat(ctx, key)
+	b.end()
+	return size, err
+}
+
+// An entry whose deadline passed during a read that returned without an error
+// must not purge: the read may be stale by then.
+func TestSweep_HealEntryDoesNotPurgeAfterItsDeadline(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "held")
+	f.upload(key, "held-bytes") // present and unregistered: the heal goes straight to the purge
+	qKey := quarantinePrefix + "00112233aabbccdd/" + key
+	f.upload(qKey, "held-bytes")
+
+	ctx, end := context.WithCancel(context.Background())
+	defer end()
+	s := NewSweeper(&staleStat{BlobStore: f.blobs, end: end}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	entry := blob.ListedObject{Key: qKey, Size: int64(len("held-bytes")), ModTime: time.Now().Add(-25 * time.Hour)}
+	if err := s.healQuarantineEntry(ctx, entry, &SweepReport{}, true, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("healQuarantineEntry = %v, want the ended context's error", err)
+	}
+	if !f.exists(qKey) {
+		t.Fatalf("heal purged the backup %q after its context ended", qKey)
+	}
+}
+
+// takenAgain deletes the restored original right after its restore copy, as a
+// sweeper handshake that began meanwhile does.
+type takenAgain struct {
+	blob.BlobStore
+}
+
+func (b *takenAgain) Copy(ctx context.Context, dst, src string) error {
+	if err := b.BlobStore.Copy(ctx, dst, src); err != nil {
+		return err
+	}
+	return b.BlobStore.Delete(ctx, dst)
+}
+
+// The purge of a registered key's backup relies on a read of its original
+// after the restore. An original that is missing again keeps the backup for
+// the next sweep to restore.
+func TestSweep_HealEntryKeepsTheBackupWhenTheRestoredOriginalIsGoneAgain(t *testing.T) {
+	f := newSweepFixture(t)
+	lost := blob.PackKey("r1", "lost")
+	qKey := quarantinePrefix + "00112233aabbccdd/" + lost
+	f.upload(qKey, "lost-bytes")
+	f.register("r1", "lost", lost)
+
+	s := NewSweeper(&takenAgain{BlobStore: f.blobs}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	entry := blob.ListedObject{Key: qKey, Size: int64(len("lost-bytes")), ModTime: time.Now().Add(-25 * time.Hour)}
+	if err := s.healQuarantineEntry(context.Background(), entry, &SweepReport{}, true, false); err != nil {
+		t.Fatalf("healQuarantineEntry: %v", err)
+	}
+	if !f.exists(qKey) {
+		t.Fatalf("heal purged the backup %q although the original was missing after the restore", qKey)
 	}
 }
 
