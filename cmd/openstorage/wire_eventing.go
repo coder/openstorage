@@ -31,8 +31,19 @@ import (
 )
 
 // pendingSyncRecoveryDelay defers the local schedule's first sweep until
-// the serve listener is up (the swept runs loopback-push to it).
+// the serve listener is up (the swept runs loopback-push to it). River's
+// first lane scan waits as long.
 const pendingSyncRecoveryDelay = 15 * time.Second
+
+// riverLaneScanInterval is how often each PostgreSQL replica scans for
+// upstream lanes whose durable work has no live River job
+// (jobs.River.StartLaneScan). Such a lane exists after River discarded a
+// job, after a job row was deleted, and after a process died or a job
+// insert failed between a request's mark and its insert (pull-upstream,
+// push-upstream and the forward poke mark first). No index covers the
+// lane guards, so each list query costs time in proportion to the number
+// of linked repositories, and the interval is minutes, not seconds.
+const riverLaneScanInterval = 5 * time.Minute
 
 // loopbackTokenTTL is the CEILING for the internally minted git:write JWT
 // of one sync run's loopback push (sync runs are capped at 10 minutes).
@@ -377,6 +388,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			return nil, nil, nil, err
 		}
 		queue = q
+		q.StartLaneScan(org, pendingSyncRecoveryDelay, riverLaneScanInterval)
 		newEvents = func(inner ref.RefStore, opts events.RefStoreOptions) ref.RefStore {
 			return newPGEventsStore(inner, opts, q, forwardDeniedFromContext)
 		}
