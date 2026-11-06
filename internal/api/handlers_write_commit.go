@@ -364,10 +364,30 @@ type wcAuthor struct {
 }
 
 type wcFileOp struct {
-	Path      string `json:"path"`
-	ContentID string `json:"content_id"`
-	Operation string `json:"operation"`
-	Mode      string `json:"mode"`
+	Path string `json:"path"`
+	// PathBase64 is the base64 of the raw path bytes, for a name that is not
+	// valid UTF-8. A file operation has exactly one of path and path_base64
+	// (#587).
+	PathBase64 *string `json:"path_base64,omitempty"`
+	ContentID  string  `json:"content_id"`
+	Operation  string  `json:"operation"`
+	Mode       string  `json:"mode"`
+}
+
+// resolvePath moves a path_base64 into Path. An empty path counts as absent.
+func (f *wcFileOp) resolvePath(i int) error {
+	if f.PathBase64 == nil {
+		return nil
+	}
+	if f.Path != "" {
+		return fmt.Errorf("files[%d] has both path and path_base64", i)
+	}
+	p, ok := decodeRawPath(*f.PathBase64)
+	if !ok {
+		return fmt.Errorf("files[%d].path_base64 is not canonical base64", i)
+	}
+	f.Path, f.PathBase64 = p, nil
+	return nil
 }
 
 type wcMetadata struct {
@@ -560,6 +580,9 @@ func wcValidateFiles(files []wcFileOp) error {
 	ids := make(map[string]bool, len(files))
 	for i := range files {
 		f := &files[i]
+		if err := f.resolvePath(i); err != nil {
+			return err
+		}
 		if err := wcValidPath(f.Path); err != nil {
 			return err
 		}

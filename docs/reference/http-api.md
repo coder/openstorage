@@ -132,11 +132,25 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   raw bytes percent-encoded in the `path` query parameter, for example
   `file?path=a%FFb`. `file`, `files`, `files/metadata`, `commits`, `diff`,
   `branches/diff` and `blame` read `path` byte for byte. An `archive` (tar member
-  names) or a git clone gives the raw names. A JSON request body cannot hold such a
-  name yet: grep `paths` and commit-pack file paths cannot name the file, and the
-  archive and grep globs match it only through a wildcard (`a?b`, `a*`), which can
-  match other names too. Upstream documents no path encoding, so the siblings are an
-  extension ([#587](https://github.com/coder/openstorage/issues/587)).
+  names) or a git clone gives the raw names.
+
+  A JSON request body names such a path with a base64 form of the field:
+  - `grep`: `paths_base64` adds prefixes to `paths`, and `file_filters` takes
+    `include_globs_base64` and `exclude_globs_base64` next to the plain globs.
+  - `archive`: `include_globs_base64` and `exclude_globs_base64`.
+  - `commit-pack`: a file operation sends `path_base64` instead of `path`. It has exactly
+    one of the two. An empty `path` counts as absent.
+
+  A value must be canonical base64 as in the siblings: standard alphabet, padding, no
+  line breaks. A value that is not, or that decodes to a blank name or one with a NUL
+  byte, is a 400 that names the entry (`paths_base64.1`). A decoded glob matches the
+  raw bytes: an invalid byte matches only itself, `?` matches one byte of such a name,
+  and `*` matches any run. A `[...]` class that holds an invalid byte is malformed and
+  matches nothing. A replica older than v0.20.0 ignores the grep and archive fields and
+  returns a wider result (grep searches every file and archive keeps every file). It
+  answers a commit-pack `path_base64` with 400 `invalid`. Upstream documents no path
+  encoding, so the siblings and these fields are an extension
+  ([#587](https://github.com/coder/openstorage/issues/587)).
 - **No client retries**: no SDK retries; every error surfaces immediately. Python
   client-side timeouts: 30s default, 60s diff/grep, 180s
   branch-create/merge/merge-preview/commit/tag/restore-commit.
@@ -340,8 +354,8 @@ or NUL fails the sync as a configuration error.
 | `HEAD /repos/file` | same | headers only |
 | `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], paths_base64?: [..], ref, entries: [{path, path_base64?, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type`. Without `recursive`, with an empty `recursive=`, or with `recursive=true`, it lists the contents of every folder under `path` and no `tree` entries. `recursive=false` lists only the direct children of `path`, folders as `tree` entries. No `cursor` and no `limit` (or `limit=0`): every entry, or 422 when the listing passes the git [output limit](#resource-limits-on-git-reads). Big trees must page: a recursive call with `limit` or `cursor` reads the tree only up to the end of its page, so a deep cursor takes longer than the first page but needs no more memory. A tree that git stores out of order (one that `git fsck` rejects as `treeNotSorted`) can page in git's order and skip entries; git itself cannot look such entries up by path |
 | `GET /repos/files/metadata` | same | `{files: [{path, path_base64?, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. `message` is the subject line only, as in the commits list ([Commits](#commits)). No `cursor` and no `limit` (or `limit=0`): every file. **429** when the files under `path` have more than 50,000 distinct last commits, also with `limit` or `cursor`: a retry gets the same 429 (no `Retry-After`), so send a narrower `path`. **404 on unborn branch** |
-| `POST /repos/archive` | body `{ref?, include_globs?, exclude_globs?, max_blob_size?, archive?: {prefix}}` | tar.gz stream |
-| `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, file_filters?: {include_globs, exclude_globs, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, path_base64?, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
+| `POST /repos/archive` | body `{ref?, include_globs?, include_globs_base64?, exclude_globs?, exclude_globs_base64?, max_blob_size?, archive?: {prefix}}` | tar.gz stream |
+| `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, paths_base64?, file_filters?: {include_globs, include_globs_base64?, exclude_globs, exclude_globs_base64?, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, path_base64?, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
 | `GET /repos/blame` | `path` (req), `ref`, `ephemeral`, `range` (repeatable, `git blame -L` specs like `1,10`), `detect_moves` | `{ref, path, path_base64?, commit_sha, lines: [{line_number, commit_sha, original_line_number, original_path, original_path_base64?, previous_commit_sha?, author_name, author_email, author_time, committer_name, committer_email, committer_time, summary}]}` |
 
 `order` in `files/metadata` is the commit's history-order rank relative to the resolved ref: its 0-based position in `git rev-list --topo-order <resolved commit>`. The ref's own commit is `0`, and larger values are older. A commit always ranks higher than every one of its descendants, whatever its author or committer date. Among a folder's files, the one with the smallest `order` was changed most recently in the ref's history.

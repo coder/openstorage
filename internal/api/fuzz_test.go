@@ -149,6 +149,91 @@ func FuzzRawPathBase64(f *testing.F) {
 	})
 }
 
+// FuzzDecodeRawPath: a request's path_base64 text decodes only when it is
+// the canonical padded standard base64 of the bytes it yields, so no two
+// texts name one path.
+func FuzzDecodeRawPath(f *testing.F) {
+	for _, seed := range []string{"", "YQ==", "YQ=", "YQ", "YR==", "Yf9i", "!!", "Yf9\ni", "Yf9i\r\n", "-_8=", "+/8=", "AA==", "////", "Y W I=", "YQ==YQ=="} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		p, ok := decodeRawPath(s)
+		if ok != (encodeRawPath(p) == s) || (!ok && p != "") {
+			t.Fatalf("decodeRawPath(%q) = %q, %v", s, p, ok)
+		}
+		// Every byte string has one text, and it decodes back.
+		if q, ok := decodeRawPath(encodeRawPath(s)); !ok || q != s {
+			t.Fatalf("decodeRawPath(encodeRawPath(%q)) = %q, %v", s, q, ok)
+		}
+	})
+}
+
+// FuzzDecodeRawPatterns: a decoded list holds one value per element, each
+// not blank and with no NUL, and a failure names the first bad element.
+func FuzzDecodeRawPatterns(f *testing.F) {
+	for _, seed := range [][2]string{
+		{"YQ==", "Yf9i"}, {"", "YQ=="}, {"YQ==", ""}, {"AA==", "YQ=="}, {"IA==", "YQ=="},
+		{"CQ==", "Yf9i"}, {"!!", "!!"}, {"YR==", "YQ=="}, {"YQ==", "YQ=="},
+	} {
+		f.Add(seed[0], seed[1])
+	}
+	f.Fuzz(func(t *testing.T, a, b string) {
+		list := []string{a, b}
+		decoded, bad := decodeRawPatterns(list)
+		valid := func(enc string) bool {
+			p, ok := decodeRawPath(enc)
+			return ok && strings.TrimSpace(p) != "" && !strings.ContainsRune(p, 0)
+		}
+		if bad < 0 {
+			if len(decoded) != 2 || encodeRawPath(decoded[0]) != a || encodeRawPath(decoded[1]) != b || !valid(a) || !valid(b) {
+				t.Fatalf("decodeRawPatterns(%q) = %q, %d", list, decoded, bad)
+			}
+			return
+		}
+		if decoded != nil || bad > 1 || valid(list[bad]) || (bad == 1 && !valid(a)) {
+			t.Fatalf("decodeRawPatterns(%q) = %q, %d", list, decoded, bad)
+		}
+	})
+}
+
+// FuzzCommitPackFilePath: a file operation names its path with exactly one
+// of path and path_base64, and a path that passes validation is the one it
+// names.
+func FuzzCommitPackFilePath(f *testing.F) {
+	type seed struct {
+		path, enc string
+		hasEnc    bool
+	}
+	for _, s := range []seed{
+		{"a.txt", "", false}, {"", "Yf9i", true}, {"a.txt", "Yf9i", true}, {"", "", true}, {"", "", false},
+		{"", "YR==", true}, {"", "Li4v", true}, {"", "LmdpdC9jb25maWc=", true}, {"", "YQBi", true}, {"", "AA==", true},
+	} {
+		f.Add(s.path, s.enc, s.hasEnc)
+	}
+	f.Fuzz(func(t *testing.T, path, enc string, hasEnc bool) {
+		op := wcFileOp{Path: path, ContentID: "c", Operation: "upsert"}
+		if hasEnc {
+			op.PathBase64 = &enc
+		}
+		err := wcValidateFiles([]wcFileOp{op})
+		decoded, decodedOK := decodeRawPath(enc)
+		want := path
+		if hasEnc {
+			want = decoded
+		}
+		switch {
+		case hasEnc && (path != "" || !decodedOK):
+			if err == nil {
+				t.Fatalf("path %q, path_base64 %q: accepted", path, enc)
+			}
+		case err == nil:
+			if wcValidPath(want) != nil {
+				t.Fatalf("path %q, path_base64 %q (%v): accepted a path that wcValidPath refuses", path, enc, hasEnc)
+			}
+		}
+	})
+}
+
 func FuzzCoreCursor(f *testing.F) {
 	f.Add(coreCursorEncode(cursorKindCommits, "abc123", "2024-01-01T00:00:00Z"), "main", "src/a|b.txt")
 	f.Add("", "", "")
