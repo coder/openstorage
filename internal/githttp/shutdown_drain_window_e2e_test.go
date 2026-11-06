@@ -24,8 +24,8 @@ import (
 // request below finishes right after the listener closes, which is the
 // moment the HTTP drain starts. The drain must complete without `drain
 // incomplete` and without stopping any git process. Both cases wait for the
-// repo's first sync run to settle first, so only the held run can hold the
-// run drain.
+// repo's first sync run to settle first, so that run cannot hold the run
+// drain.
 func TestServeDrainWindowIgnoresRunDrain(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
