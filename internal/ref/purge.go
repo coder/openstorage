@@ -25,7 +25,8 @@ import (
 // purge has begun (fence row present, see FenceRepoPurge): the write
 // pipeline resolved the repository before its soft-delete, and letting the
 // registration commit could strand rows — or worse, re-point storage —
-// behind a completed purge. Surfaces to the writer as a failed push.
+// behind a completed purge. Surfaces to the writer as a failed push, and to
+// a repack as a failed fold.
 var ErrRepoPurged = errors.New("repository is being purged")
 
 // validatePurgeGroup asserts the shared purge-seam argument invariants.
