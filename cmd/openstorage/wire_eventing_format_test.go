@@ -186,8 +186,11 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 			won, err := wrapped.CASRef(t.Context(), "repo-1", "refs/heads/main", ref.ZeroSHA, strings.Repeat("a", 40))
 			got, gerr := rs.GetRef(t.Context(), "repo-1", "refs/heads/main")
 			if tc.refused {
-				if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update: hook could not record the forward intent") || !errors.Is(gerr, ref.ErrNotFound) {
+				if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook could not record the forward intent; push again later") || !errors.Is(gerr, ref.ErrNotFound) {
 					t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update refused before its CAS", won, err, got, gerr)
+				}
+				if !strings.Contains(logs.String(), "hook refuses ref updates: record forward intent") {
+					t.Fatalf("missing refusal log: %s", logs)
 				}
 			} else if !won || err != nil || gerr != nil {
 				t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update accepted (it records no intent)", won, err, got, gerr)
@@ -206,67 +209,85 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 	}
 }
 
-// commitThenEOF commits each CAS and then reports an EOF, as a store whose
-// connection drops after the commit does.
+// commitThenEOF commits each create or update and then reports an EOF, as a
+// store whose connection drops after the commit does. Deletes pass through:
+// ref.IdempotentCAS never recovers a delete.
 type commitThenEOF struct{ ref.RefStore }
 
 func (s commitThenEOF) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
-	if _, err := s.RefStore.CASRef(ctx, repo, name, old, new); err != nil {
-		return false, err
+	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
+	if err != nil || new == ref.ZeroSHA {
+		return won, err
 	}
 	return false, io.ErrUnexpectedEOF
 }
 
 func (s commitThenEOF) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
-	if _, _, err := s.RefStore.CASRefGen(ctx, repo, name, old, new); err != nil {
-		return false, 0, err
+	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
+	if err != nil || new == ref.ZeroSHA {
+		return won, gen, err
 	}
 	return false, 0, io.ErrUnexpectedEOF
 }
 
 // A hook that cannot wire its eventing refuses every update that would
-// record forward intent, on PostgreSQL and on the local schedule: the
-// eventless default would accept the push with no intent and no events,
-// and a failed step does not prove that the CAS fails too (the database
-// can be back by then). Updates that record no intent keep failing open:
-// ephemeral updates, a sync run's own loopback push, and a caller whose
-// token may not forward. Every update that goes through keeps
-// ref.IdempotentCAS, so a CAS that commits and then reports an EOF still
-// wins, through CASRef and CASRefGen. Neither the log nor the refusal names
-// the database: both reach the pusher.
+// record forward intent, on PostgreSQL and on the local schedule: branch and
+// tag creations, updates and deletes. The eventless default would accept
+// them with no intent and no events, and a failed step does not prove that
+// the CAS fails too (the database can be back by then). Updates that record
+// no intent keep failing open: ephemeral updates, a sync run's own loopback
+// push, and a caller whose token may not forward. Every update that goes
+// through keeps ref.IdempotentCAS, so a create or update that commits and
+// then reports an EOF still wins, through CASRef and CASRefGen. Neither the
+// log nor the refusal names the store: both reach the pusher.
 func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
-	canary := map[string]string{
+	a, b := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	pgCanary := map[string]string{
 		"user": "canary_user_" + rand.Text()[:8], "password": "canary_pass_" + rand.Text()[:8],
 		"host": "canary-host-" + strings.ToLower(rand.Text()[:8]) + ".invalid", "database": "canary_db_" + rand.Text()[:8],
 	}
-	pgURL := "postgres://" + canary["user"] + ":" + canary["password"] + "@" + canary["host"] + ":5432/" + canary["database"] + "?connect_timeout=2"
-	// Control: the open error names the host, user and database.
-	if _, err := meta.Open(t.Context(), pgURL); err == nil || !strings.Contains(err.Error(), canary["host"]) || !strings.Contains(err.Error(), canary["user"]) {
-		t.Fatalf("meta.Open of the canary URL = %v; want an error that names its host and user", err)
-	}
-	sha := strings.Repeat("a", 40)
+	pgURL := "postgres://" + pgCanary["user"] + ":" + pgCanary["password"] + "@" + pgCanary["host"] + ":5432/" + pgCanary["database"] + "?connect_timeout=2"
 	type shape struct {
 		name, mode, scopes, repo, ref, claim string
 		refusing, refused                    bool
 	}
 	shapes := []shape{
-		{name: "persistent", repo: "repo-1", ref: "refs/heads/main", refusing: true, refused: true},
+		{name: "branch", repo: "repo-1", ref: "refs/heads/main", refusing: true, refused: true},
+		{name: "tag", repo: "repo-1", ref: "refs/tags/v1", refusing: true, refused: true},
 		{name: "secrets config invalid", mode: "bogus", repo: "repo-1", ref: "refs/heads/main", refusing: true, refused: true},
 		{name: "ephemeral namespace", repo: "repo-1", ref: "refs/namespaces/ephemeral/refs/heads/main", refusing: true},
 		{name: "ephemeral key", repo: "repo-1+ephemeral", ref: "refs/heads/main", refusing: true},
 		{name: "sync loopback", repo: "repo-1", ref: "refs/heads/main", claim: "holder"},
 		{name: "write-only token", scopes: `["git:write"]`, repo: "repo-1", ref: "refs/heads/main"},
 	}
+	ops := []struct {
+		name            string
+		seed, old, new_ string // seed is the ref's value before the CAS ("" for none)
+	}{
+		{name: "create", old: ref.ZeroSHA, new_: a},
+		{name: "update", seed: a, old: a, new_: b},
+		{name: "delete", seed: a, old: a, new_: ref.ZeroSHA},
+	}
 	for _, backend := range []string{"pg", "sqlite"} {
 		for _, tc := range shapes {
 			t.Run(backend+"/"+tc.name, func(t *testing.T) {
-				metaURL := pgURL
+				metaURL, canary := pgURL, pgCanary
 				if backend == "sqlite" {
-					notADir := filepath.Join(t.TempDir(), "file")
-					if err := os.WriteFile(notADir, nil, 0o600); err != nil {
+					dir := filepath.Join(t.TempDir(), "canary-path-"+strings.ToLower(rand.Text()[:8]))
+					if err := os.WriteFile(dir, nil, 0o600); err != nil {
 						t.Fatal(err)
 					}
-					metaURL = "sqlite://" + filepath.Join(notADir, "meta.db")
+					metaURL, canary = "sqlite://"+filepath.Join(dir, "meta.db"), map[string]string{"path": filepath.Base(dir)}
+				}
+				// Control: the open error names the canary.
+				if _, err := meta.Open(t.Context(), metaURL); err == nil {
+					t.Fatalf("meta.Open(%s) succeeded; want it to fail", backend)
+				} else {
+					for part, v := range canary {
+						if part != "password" && !strings.Contains(err.Error(), v) {
+							t.Fatalf("meta.Open's error does not name the canary %s, so the absence check below proves nothing: %v", part, err)
+						}
+					}
 				}
 				logs := hookEventingEnv(t, metaURL)
 				t.Setenv(envSecretsMode, tc.mode)
@@ -287,33 +308,53 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 				}
 				wantLog := "hook eventing disabled: " + stage
 				if tc.refusing {
-					wantLog = "hook refuses ref updates: " + stage
+					wantLog = "hook eventing unavailable: " + stage + "; refusing only updates that would record forward intent"
 				}
 				if !strings.Contains(logs.String(), wantLog) {
 					t.Fatalf("missing %q log: %s", wantLog, logs)
 				}
 				seen := logs.String()
-				for i, cas := range []func(name string) (bool, error){
-					func(name string) (bool, error) { return wrapped.CASRef(t.Context(), tc.repo, name, ref.ZeroSHA, sha) },
-					func(name string) (bool, error) {
-						won, _, err := wrapped.CASRefGen(t.Context(), tc.repo, name, ref.ZeroSHA, sha)
-						return won, err
-					},
-				} {
-					name := tc.ref + fmt.Sprint(i)
-					won, err := cas(name)
-					got, gerr := rs.GetRef(t.Context(), tc.repo, name)
-					if err != nil {
-						seen += err.Error()
-					}
-					if tc.refused {
-						if won || err == nil || !strings.Contains(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+")") || !errors.Is(gerr, ref.ErrNotFound) {
-							t.Fatalf("CAS %d = (%v, %v), authority = (%q, %v); want the update refused before its CAS", i, won, err, got, gerr)
+				for _, op := range ops {
+					for i, cas := range []func(name string) (bool, error){
+						func(name string) (bool, error) { return wrapped.CASRef(t.Context(), tc.repo, name, op.old, op.new_) },
+						func(name string) (bool, error) {
+							won, _, err := wrapped.CASRefGen(t.Context(), tc.repo, name, op.old, op.new_)
+							return won, err
+						},
+					} {
+						name := fmt.Sprintf("%s-%s-%d", tc.ref, op.name, i)
+						if op.seed != "" {
+							if won, err := rs.CASRef(t.Context(), tc.repo, name, ref.ZeroSHA, op.seed); err != nil || !won {
+								t.Fatalf("seed %s: %v, %v", name, won, err)
+							}
 						}
-						continue
-					}
-					if !won || err != nil || got != sha {
-						t.Fatalf("CAS %d = (%v, %v), authority = (%q, %v); want the update accepted and its lost commit reply recovered", i, won, err, got, gerr)
+						won, err := cas(name)
+						got, gerr := rs.GetRef(t.Context(), tc.repo, name)
+						if err != nil {
+							seen += err.Error()
+						}
+						if tc.refused {
+							before := op.seed
+							if before == "" {
+								before = "absent"
+							}
+							if got == "" && errors.Is(gerr, ref.ErrNotFound) {
+								got = "absent"
+							}
+							if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+"); push again later") || got != before {
+								t.Fatalf("%s %d = (%v, %v), authority = %q; want the update refused before its CAS, authority %s", op.name, i, won, err, got, before)
+							}
+							continue
+						}
+						want := op.new_
+						if want == ref.ZeroSHA {
+							if won && err == nil && errors.Is(gerr, ref.ErrNotFound) {
+								continue
+							}
+						} else if won && err == nil && got == want {
+							continue
+						}
+						t.Fatalf("%s %d = (%v, %v), authority = (%q, %v); want the update accepted (it records no intent), a lost commit reply recovered", op.name, i, won, err, got, gerr)
 					}
 				}
 				for part, v := range canary {

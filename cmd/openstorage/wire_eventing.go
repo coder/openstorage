@@ -506,7 +506,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			logger.Error("hook eventing disabled: " + stage)
 			return func() {}
 		}
-		logger.Error("hook refuses ref updates: " + stage)
+		logger.Error("hook eventing unavailable: " + stage + "; refusing only updates that would record forward intent")
 		refusal := errors.New("refusing the ref update: hook eventing unavailable (" + stage + "); push again later")
 		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
 			return intentlessRefStore{RefStore: ref.IdempotentCAS{RefStore: st}, refusal: refusal}, nil

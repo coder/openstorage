@@ -494,7 +494,7 @@ func TestHookEventingRiverFailureRefusesAndCleansUp(t *testing.T) {
 	}
 	cleanup := wireHookEventing(ctx, slog.New(slog.NewTextHandler(logs, nil)))
 	defer cleanup()
-	if !strings.Contains(logs.String(), "hook refuses ref updates: river insert-only client") {
+	if !strings.Contains(logs.String(), "hook eventing unavailable: river insert-only client; refusing only updates that would record forward intent") {
 		t.Fatalf("missing refusal log: %s", logs)
 	}
 	rs := hookRefStore(t)
@@ -504,7 +504,7 @@ func TestHookEventingRiverFailureRefusesAndCleansUp(t *testing.T) {
 	}
 	const sha = "1111111111111111111111111111111111111111"
 	if won, _, err := wrapped.CASRefGen(ctx, "repo-1", "refs/heads/main", ref.ZeroSHA, sha); won || err == nil ||
-		!strings.Contains(err.Error(), "hook eventing unavailable (river insert-only client)") {
+		!strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable (river insert-only client); push again later") {
 		t.Fatalf("CAS = (%v, %v); want the update refused before its CAS", won, err)
 	}
 	// The metadata store opened (meta.Open pings, and the pool keeps that
