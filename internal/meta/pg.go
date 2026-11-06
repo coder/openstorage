@@ -68,6 +68,18 @@ func (s *PG) InitSchema(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x4D455441)`); err != nil { // "META"
 			return err
 		}
+		// Lock order (issue #609): every writer that reaches repo_upstreams
+		// through the default-branch trigger already holds repos. The DDL
+		// below takes ACCESS EXCLUSIVE on repo_upstreams before it does on
+		// repos, so a boot that held repo_upstreams while it waited for a
+		// repos holder would deadlock against such a writer. Take repos
+		// first, here: the boot then waits holding no table, and a fresh
+		// database has no repos table and no writer yet.
+		if _, err := tx.Exec(ctx, `DO $$ BEGIN
+			IF to_regclass('repos') IS NOT NULL THEN LOCK TABLE repos IN ACCESS EXCLUSIVE MODE; END IF;
+		END $$`); err != nil {
+			return err
+		}
 		_, err := tx.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS orgs (
     id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
