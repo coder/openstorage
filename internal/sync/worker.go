@@ -819,7 +819,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	// (issue #599); adoptHead records it before the run is finished.
 	var head string
 	if up.DefaultBranchOmitted {
-		head, hc.retry = w.upstreamHead(ctx, job, mirror, fetchEnv, up.CloneURL())
+		head = w.upstreamHead(ctx, job, mirror, fetchEnv, up.CloneURL())
 	}
 
 	// Empty upstream: nothing to push, the run still counts as a success.
@@ -888,12 +888,12 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		if rejected := parsePushRejections(stdout); up.ForwardOnPush && allLocalWins(rejected) {
 			w.Logger.Info("mirror-back kept newer local refs (forward-on-push: local wins)",
 				"org", job.Org, "repo", job.RepoID, "refused", len(rejected))
-			hc.retry = w.adoptHead(ctx, job, head) || hc.retry
+			hc.retry = w.adoptHead(ctx, job, head)
 			return nil
 		}
 		return &syncFailure{code: FailPush, cause: fmt.Errorf("git push: %w: %s", err, stderr)}
 	}
-	hc.retry = w.adoptHead(ctx, job, head) || hc.retry
+	hc.retry = w.adoptHead(ctx, job, head)
 	return nil
 }
 

@@ -30,11 +30,14 @@ type DefaultBranchEvidence interface {
 	RecordDefaultBranchChecked(ctx context.Context, repoID string, successCount int) error
 }
 
-// headCheck carries the outcome of one run's HEAD lookup and adoption back
-// to Worker.Run. retry is set when a failure that a later attempt can cure
-// kept the run from adopting: the lookup itself failed, or the adoption
-// write did. The run then leaves no evidence, so the reconcile job asks for
-// that attempt.
+// headCheck carries one run's adoption outcome back to Worker.Run. retry is
+// set when the adoption write failed: the failure is ours, so the run
+// leaves no evidence and the reconcile job asks for another attempt.
+//
+// Only that failure retries. A lookup that fails or names no usable branch,
+// and a run that fails after the lookup, record the evidence, because the
+// upstream's host decides those outcomes. A host that could keep a
+// repository in the reconcile set would make every pass sync it again.
 type headCheck struct {
 	retry bool
 }
@@ -66,10 +69,8 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 // upstreamHead resolves the upstream HEAD branch for a repo whose create
 // named no default branch. It returns "" and logs a WARN line when the
 // HEAD cannot be used: the repo keeps its branch, the flag stays set, and
-// a later sync retries. retry is true when the lookup itself failed, which
-// a later attempt can cure, and false when the upstream gave an answer that
-// names no usable branch.
-func (w *Worker) upstreamHead(ctx context.Context, job Job, mirror string, env []string, url string) (branch string, retry bool) {
+// a later sync retries.
+func (w *Worker) upstreamHead(ctx context.Context, job Job, mirror string, env []string, url string) string {
 	// The lookup is optional: its own deadline keeps a stalled upstream
 	// from spending the run budget that the push still needs.
 	budget := headLookupTimeout
@@ -80,9 +81,8 @@ func (w *Worker) upstreamHead(ctx context.Context, job Job, mirror string, env [
 	defer cancel()
 	out := &cappedBuffer{n: lsRemoteOutputCap}
 	stderr, err := runGitTo(lctx, mirror, env, out, "ls-remote", "--symref", url, "HEAD")
-	var reason string
+	var branch, reason string
 	if err != nil {
-		retry = true // the upstream answered the fetch, so a failed lookup is transient
 		reason = fmt.Sprintf("git ls-remote: %v: %s", err, strings.TrimSpace(stderr))
 	} else {
 		branch, reason = parseHeadSymref(string(out.buf))
@@ -98,9 +98,9 @@ func (w *Worker) upstreamHead(ctx context.Context, job Job, mirror string, env [
 	if reason != "" {
 		w.Logger.Warn("upstream default branch not resolved; the repo keeps its default branch until a later sync resolves it",
 			"org", job.Org, "repo", job.RepoID, "reason", reason)
-		return "", retry
+		return ""
 	}
-	return branch, false
+	return branch
 }
 
 // parseHeadSymref reads the HEAD symref line of `git ls-remote --symref`
