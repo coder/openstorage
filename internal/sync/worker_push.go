@@ -70,6 +70,12 @@ var pushRefspecs = []string{"refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/
 // every few seconds only while `git push` is actually running.
 const defaultDetachPoll = 2 * time.Second
 
+// ErrRepoGone is RunPush's error on the River lane when the repo lookup
+// finds no repository (it was deleted). The job has nothing left to do, so
+// the push worker completes it before its completion gate, even if a push
+// claim is still held.
+var ErrRepoGone = errors.New("repository deleted")
+
 // RunPush executes one outbound push-upstream run for job. Lifecycle,
 // abandonment, and event semantics mirror Run: detach cancels silently at
 // every stage, a stolen claim abandons loudly without terminal events, and
@@ -86,7 +92,11 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 
 	repo, err := w.Repos(ctx, job.Org, job.RepoID)
 	if errors.Is(err, ErrNotFound) {
-		return nil // repo deleted while queued: nothing to push or emit
+		// Repo deleted while queued: nothing to push or emit.
+		if w.Local != nil {
+			return nil
+		}
+		return fmt.Errorf("push %s: %w", job.RepoID, ErrRepoGone)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve repo %s: %w", job.RepoID, err)
@@ -137,13 +147,30 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			"org", job.Org, "repo", job.RepoID, "holder", holder, "stolen_from", stolenFrom)
 	}
 
-	if w.Local != nil {
-		if err := w.waitPublication(ctx, job.RepoID); err != nil {
+	if err := w.waitPublication(ctx, job.RepoID); err != nil {
+		if w.Local != nil {
 			return w.restoreLocal(ctx, job, holder, "push", err, func(fctx context.Context) (Upstream, error) {
 				return w.Local.FinishPushOutcome(fctx, job.RepoID, holder,
 					meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: localPublicationRetryDelay})
 			})
 		}
+		// River: hand the request back and fail the run, so the job's
+		// completion gate snoozes it as an uncovered pending request.
+		rs := w.Upstreams.(ShutdownRestorer)
+		restore := func(fctx context.Context) (Upstream, error) {
+			return rs.RestorePush(fctx, job.RepoID, holder, force)
+		}
+		if shutdownAborted(ctx) {
+			if rerr := w.restoreForShutdown(ctx, "push", job, holder, err, restore); rerr != nil {
+				return rerr
+			}
+			return fmt.Errorf("push %s: %w", job.RepoID, ErrShutdown)
+		}
+		// The drain can cancel the run during this restore, too.
+		if rerr := w.restoreLocal(ctx, job, holder, "push", err, restore); rerr != nil {
+			return shutdownErr(ctx, rerr)
+		}
+		return shutdownErr(ctx, fmt.Errorf("push %s: %w", job.RepoID, err))
 	}
 
 	startedAt := eventTime(time.Now())

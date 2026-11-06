@@ -60,7 +60,8 @@ while [ $# -gt 0 ]; do
            out=$2; shift 2 ;;
     --record) record=1; shift ;;
     --fingerprints-only) fp_only=1; shift ;;
-    --fact) case ${2-} in
+    --fact) [ -z "$flip" ] || { echo "check.sh: --fact takes one fact per run" >&2; exit 3; }
+            case ${2-} in
               [A-Za-z]*=FALSE) flip=${2%=FALSE} ;;
               *) echo "check.sh: --fact takes NAME=FALSE" >&2; exit 3 ;;
             esac
