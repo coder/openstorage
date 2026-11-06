@@ -19,7 +19,7 @@ import (
 	"github.com/coder/openstorage/internal/ref/s3wal/s3waltest"
 )
 
-// TestS3WALHookRefusesUnusableMetadata: a v2 hook that meets a v1
+// TestS3WALHookRefusesUnusableMetadata: a v3 hook that meets a v1 or v2
 // metadata document (issue #445: the binary was replaced under an older
 // serve) or a corrupt one (issues #466, #478) refuses the push with a
 // message that names the fix. It neither accepts the push without its
@@ -29,10 +29,10 @@ func TestS3WALHookRefusesUnusableMetadata(t *testing.T) {
 	if testBackend != backendS3WAL {
 		t.Skip("the metadata document is S3WAL-only (ADR-51)")
 	}
-	setField := func(field, value string) func(t *testing.T, v2 []byte) []byte {
-		return func(t *testing.T, v2 []byte) []byte {
+	setField := func(field, value string) func(t *testing.T, current []byte) []byte {
+		return func(t *testing.T, current []byte) []byte {
 			var doc map[string]json.RawMessage
-			if err := json.Unmarshal(v2, &doc); err != nil {
+			if err := json.Unmarshal(current, &doc); err != nil {
 				t.Fatal(err)
 			}
 			doc[field] = json.RawMessage(value)
@@ -45,13 +45,15 @@ func TestS3WALHookRefusesUnusableMetadata(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name   string
-		mutate func(t *testing.T, v2 []byte) []byte
+		mutate func(t *testing.T, current []byte) []byte
 		want   []string
 	}{
 		// Only the version matters here: the hook must stop at it.
 		{"v1", setField("v", "1"),
-			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
-		{"truncated", func(_ *testing.T, v2 []byte) []byte { return v2[:len(v2)/2] },
+			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 3"}},
+		{"v2", setField("v", "2"),
+			[]string{"document version 2 needs conversion", "openstorage s3wal-meta convert --to 3"}},
+		{"truncated", func(_ *testing.T, current []byte) []byte { return current[:len(current)/2] },
 			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
 		// Issue #478: a decodable document with impossible id counters.
 		{"negative counter", setField("next_org_id", "-1"),
@@ -61,7 +63,7 @@ func TestS3WALHookRefusesUnusableMetadata(t *testing.T) {
 	}
 }
 
-func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, v2 []byte) []byte, want []string) {
+func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, current []byte) []byte, want []string) {
 	db, blobs := privateStores(t, t.TempDir())
 	cache := t.TempDir()
 	node, err := startNode(cache, "OPENSTORAGE_PG_URL="+db, "OPENSTORAGE_S3_URL="+blobs, EnvHookDelay+"=3000")
@@ -90,7 +92,7 @@ func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, v2 []byte) []by
 	}()
 	waitForPushHold(t, cache, created.RepoID, "refs/heads/main", done)
 
-	// Replace the stored v2 document, conditionally on the version read.
+	// Replace the stored v3 document, conditionally on the version read.
 	u, err := url.Parse(db)
 	if err != nil {
 		t.Fatal(err)
@@ -110,12 +112,12 @@ func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, v2 []byte) []by
 		}
 		return body, aws.ToString(obj.ETag)
 	}
-	v2, etag := readMeta()
+	current, etag := readMeta()
 	var stored struct{ V int }
-	if err := json.Unmarshal(v2, &stored); err != nil || stored.V != 2 {
-		t.Fatalf("stored document is v%d (%v), want 2", stored.V, err)
+	if err := json.Unmarshal(current, &stored); err != nil || stored.V != 3 {
+		t.Fatalf("stored document is v%d (%v), want 3", stored.V, err)
 	}
-	bad := mutate(t, v2)
+	bad := mutate(t, current)
 	if _, err := client.PutObject(t.Context(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String("_wal/meta.json"), Body: bytes.NewReader(bad), IfMatch: aws.String(etag),
 	}); err != nil {

@@ -257,7 +257,7 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	}
 
 	// ADR-51: the official release writes metadata format v1 and the
-	// candidate format v2. Each refuses the other's bucket without writing
+	// candidate format v3. Each refuses the other's bucket without writing
 	// meta.json, and s3wal-meta convert moves the stopped bucket between
 	// them.
 	metaObject := func() (version int, etag string) {
@@ -425,8 +425,8 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 		t.Fatalf("official release wrote meta.json v%d, want 1", v)
 	}
 	refuse(upgradePair.CandidateBinary, "candidate-on-v1", "document version 1 needs conversion")
-	convert("2")
-	refuse(upgradePair.OldBinary, "official-on-v2", "document version 2 unsupported")
+	convert("3")
+	refuse(upgradePair.OldBinary, "official-on-v3", "document version 3 unsupported")
 	candidate := start(upgradePair.CandidateBinary, "candidate-first")
 	clone := check(candidate, "candidate")
 	content = append(content, []byte("new candidate bytes\n")...)
@@ -440,7 +440,7 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	stop(candidate, "candidate-first")
 	second := start(upgradePair.CandidateBinary, "candidate-second")
 	check(second, "candidate")
-	// A candidate-written create_state (v2) must survive convert --to 1 for
+	// A candidate-written create_state (v2 and later) must survive convert --to 1 for
 	// the official release.
 	const candidateRepo = "upgrade-candidate-fixture"
 	candidateToken := mintTestToken(t, candidateRepo, "repo:write,git:read", "")
@@ -458,15 +458,15 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	}
 	stored, err = io.ReadAll(obj.Body)
 	_ = obj.Body.Close()
-	var v2 struct {
+	var v3 struct {
 		Repos map[string]struct {
 			CreateState int `json:"create_state"`
 		} `json:"repos"`
 	}
-	if err != nil || json.Unmarshal(stored, &v2) != nil || v2.Repos[candidateCreated.RepoID].CreateState != 2 {
-		t.Fatal("stopped v2 document lacks create_state 2 for the candidate-created repository")
+	if err != nil || json.Unmarshal(stored, &v3) != nil || v3.Repos[candidateCreated.RepoID].CreateState != 2 {
+		t.Fatal("stopped v3 document lacks create_state 2 for the candidate-created repository")
 	}
-	phase("candidate-second: stopped v2 document stores create_state 2 for the candidate-created repository")
+	phase("candidate-second: stopped v3 document stores create_state 2 for the candidate-created repository")
 	// A sync create that crashed after its insert (issue #452 item 5): the
 	// repo is pending with its upstream link and still owes its first sync.
 	// convert --to 1 must request that sync, and the official release must
@@ -501,7 +501,7 @@ func TestS3WAL_ReleaseUpgrade(t *testing.T) {
 	if err != nil || pendingSync.CreateState != meta.CreateStatePending {
 		t.Fatalf("seed pending sync create: state=%d err=%v", pendingSync.CreateState, err)
 	}
-	phase("stopped v2 bucket: pending sync create seeded (repo, upstream link, no first sync), as after a crash")
+	phase("stopped v3 bucket: pending sync create seeded (repo, upstream link, no first sync), as after a crash")
 	// The supported downgrade (ADR-51 D8): convert back, then the official
 	// release serves everything the candidate wrote.
 	convert("1")

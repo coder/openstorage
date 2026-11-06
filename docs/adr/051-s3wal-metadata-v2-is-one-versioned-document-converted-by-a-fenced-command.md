@@ -24,6 +24,17 @@
 > writes nothing, while a fork or copy create is unfinished, and names each repo. `--force`
 > converts anyway. The downgrade text below predates that change.
 >
+> **Amended by [#603](https://github.com/coder/openstorage/issues/603):** the document
+> is at version 3. v3 is v2 plus one field, `upstreams[id].default_branch_omitted` (bool,
+> `omitempty`): the repository was created without a default branch and waits for its
+> first sync to adopt the upstream's, as on PostgreSQL and SQLite. It follows the
+> zero-value rule: an absent field means false, which is what every v2 row means, because
+> v2 never adopts. So `convert --to 3` from v1 or v2 changes only the version.
+> `convert --to 2` drops the field, and a repository that still waits keeps its branch.
+> `convert --to 1` drops it together with the v2 fields. `serve` and `hook` read only
+> v3, and a v1 or v2 document is refused with the conversion hint. The text below
+> describes v2 and predates this change.
+>
 > **Known limit (#466):** the hook checks the document before its ref update, not
 > inside it. A conversion that runs between the check and the update lets that push
 > commit without its events. The procedure stops `serve` and its hooks before any

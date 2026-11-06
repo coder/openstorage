@@ -31,7 +31,7 @@ The files split by role:
 | `signing-key add\|list\|remove` | `[signingkey.go:cmdSigningKey]` | `-org` (required), `-data-dir`. `add` takes `-key`, the path to a file that holds an SSH public key line or an ASCII-armored PGP public key block. `[signingkey.go:runSigningKeyAdd]` reads that file. `remove` takes `-id`. |
 | `list-packs` | `[main.go:cmdListPacks]` | `-repo` (required), `-data-dir`. Prints each blob key under `blob.PackPrefix(repo)` with its size, then a `total: <n> pack(s)` count line. |
 | `purge-repo` | `[purgerepo.go:cmdPurgeRepo]` | One positional `<repo-id>`, `-yes` (required confirmation), `-data-dir`. |
-| `s3wal-meta convert` | `[s3walmeta.go:cmdS3WALMeta]`, `[s3walmeta.go:runS3WALMetaConvert]` | `-to` (`2` upgrade, `1` downgrade), `-force` (only with `-to 1`). |
+| `s3wal-meta convert` | `[s3walmeta.go:cmdS3WALMeta]`, `[s3walmeta.go:runS3WALMetaConvert]` | `-to` (`3` upgrade, `2` or `1` downgrade), `-force` (only with `-to 1`). |
 | `version`, `--version` | `[main.go:main]` | Prints `version.String()`. |
 
 ### HTTP surface of `serve`

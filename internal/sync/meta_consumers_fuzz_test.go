@@ -151,8 +151,8 @@ func FuzzS3WALMetaConsumers(f *testing.F) {
 	f.Add(consumerSeed(f, false), false)
 	f.Add(consumerSeed(f, true), true)
 	for _, s := range []string{
-		`{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"public_keys":["k"]}},"repos":{"repo_0123456789ab":{"org_id":1,"url":"u","default_branch":"main","created_at":1}},"upstreams":{"repo_0123456789ab":{"provider":"github","owner":"a","name":"b","upstream_host":"h","sync_pending":true}}}`,
-		`{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"public_keys":["k"]}},"webhooks":{"wh_1":{"org_id":2,"url":"https://h/x","secret":"s","created_at":1}},"credentials":{"cred_1":{"repo_id":"repo_ffffffffffff","password":"p","created_at":1}}}`,
+		`{"v":3,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"public_keys":["k"]}},"repos":{"repo_0123456789ab":{"org_id":1,"url":"u","default_branch":"main","created_at":1}},"upstreams":{"repo_0123456789ab":{"provider":"github","owner":"a","name":"b","upstream_host":"h","sync_pending":true}}}`,
+		`{"v":3,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"public_keys":["k"]}},"webhooks":{"wh_1":{"org_id":2,"url":"https://h/x","secret":"s","created_at":1}},"credentials":{"cred_1":{"repo_id":"repo_ffffffffffff","password":"p","created_at":1}}}`,
 	} {
 		f.Add([]byte(s), false)
 		f.Add([]byte(s), true)
@@ -212,7 +212,7 @@ func TestCapWebhookRows(t *testing.T) {
 // TestS3WALMetaConsumersDanglingWebhook: a webhook whose org_id names no
 // org is never listed, but a queued delivery still reloads and posts it.
 func TestS3WALMetaConsumersDanglingWebhook(t *testing.T) {
-	body := `{"v":2,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"public_keys":["k"]}},"webhooks":{"wh_1":{"org_id":2,"url":"https://h/x","secret":"s","created_at":1}}}`
+	body := `{"v":3,"seq":1,"writer":"w","next_org_id":1,"next_key_id":0,"orgs":{"o":{"id":1,"public_keys":["k"]}},"webhooks":{"wh_1":{"org_id":2,"url":"https://h/x","secret":"s","created_at":1}}}`
 	if n := driveMetaConsumers(t, []byte(body), false); n.queuedDeliveries != 1 || n.pushDeliveries != 0 {
 		t.Fatalf("dangling webhook: %+v, want one queued delivery and no push delivery", n)
 	}

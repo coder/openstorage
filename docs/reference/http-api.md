@@ -184,8 +184,7 @@ the same scopes, query parameters and responses.
   `HEAD` (no HEAD branch is advertised, or the fetch did not return that branch), the
   repository keeps `main`, the server logs a `WARN` line, and the next successful sync
   tries again. Later changes of the GitHub default branch do not move it, and a
-  `PATCH /repo` ends the wait. Other providers use `main`. The S3-WAL backend keeps `main`
-  ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)).
+  `PATCH /repo` ends the wait. Other providers use `main`.
   During a rolling upgrade from a release without this rule, two limits apply. A sync that
   an older worker runs does not adopt the branch, so the repository keeps `main` until the
   next sync by an upgraded worker. An older replica's `PATCH /repo` to `main` before that

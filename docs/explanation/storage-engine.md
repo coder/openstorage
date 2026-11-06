@@ -376,15 +376,18 @@ rewrite. So adding, removing, or reinterpreting a durable field is not safe just
 it is optional, additive, or tagged `omitempty`: an older writer can drop information or
 apply a different meaning. Such changes must not silently extend the frozen v1 format.
 
-**Metadata format v2.** The metadata document is at version 2
+**Metadata format v3.** The metadata document is at version 3
 ([ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md)).
 v2 is v1 plus four fields: `repos[].create_state` and the schedule fields
 `upstreams[].push_attempt`, `push_due` and `sync_due`. A missing field means what v1
-means: a legacy create state, the first attempt, due now. Repository-group manifests stay
-at v1. `serve`, `hook`, `signing-key` and `purge-repo` read only v2. On a v1 document
-they stop with an error that names the conversion command, and they do not write it.
-Only [`openstorage s3wal-meta convert`](../reference/cli.md#openstorage-s3wal-meta)
-reads and writes v1. The operator procedure is in the
+means: a legacy create state, the first attempt, due now. v3 is v2 plus one field,
+`upstreams[].default_branch_omitted`. A missing field means what v2 means: the
+repository does not wait to adopt a default branch from its upstream. Repository-group
+manifests stay at v1. `serve`, `hook`, `signing-key` and `purge-repo` read only v3. On a
+v1 or v2 document they stop with an error that names the conversion command, and they do
+not write it. Only
+[`openstorage s3wal-meta convert`](../reference/cli.md#openstorage-s3wal-meta) reads and
+writes the older versions. The operator procedure is in the
 [deployment guide](../how-to/deploy-production.md#upgrading-the-s3wal-metadata-format).
 
 **Current enforcement.** Both decoders reject unsupported version values; both encoders
@@ -405,9 +408,10 @@ release must:
 These are release requirements, not an upgrade engine supplied today.
 
 > [!WARNING]
-> Downgrade after incompatible-format writes is unsupported, with one exception: a
-> metadata v2 bucket goes back to a v1 release (v0.16.0 or later) through
-> `openstorage s3wal-meta convert --to 1`.
+> Downgrade after incompatible-format writes is unsupported, with one exception: the
+> metadata document. A v3 bucket goes back to a v2 release (v0.19.0) through
+> `openstorage s3wal-meta convert --to 2`, and to a v1 release (v0.16.0 through
+> v0.18.0) through `openstorage s3wal-meta convert --to 1`.
 
 Take a verified [stopped-node backup](../how-to/backup-restore-s3wal.md) before an
 upgrade as a precaution; that same-binary recovery procedure does not qualify

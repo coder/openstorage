@@ -4,7 +4,7 @@ Run the opt-in upgrade smoke: **official v0.18.0 → one exact, unreleased candi
 official v0.18.0** on local SeaweedFS. v0.18.0 is the last release that writes S3WAL
 metadata format v1, so the run also covers the
 [ADR-51](../adr/051-s3wal-metadata-v2-is-one-versioned-document-converted-by-a-fenced-command.md)
-conversion to v2 and the supported `s3wal-meta convert --to 1` downgrade.
+conversion to v3 and the supported `s3wal-meta convert --to 1` downgrade.
 
 > [!IMPORTANT]
 > Not final released-pair certification, all-v1-data compatibility, AWS
@@ -116,8 +116,8 @@ resolve the pinned compiler. Never change global Git or tool-manager settings.
 4. After SIGTERM, clean exit/reap, lease absence, and a two-second all-key
    hash/metadata quiet window:
    - the candidate refuses the v1 bucket (`document version 1 needs conversion`);
-   - `s3wal-meta convert --to 2` verifies its result and releases its lease;
-   - the official release refuses the v2 bucket (`document version 2 unsupported`).
+   - `s3wal-meta convert --to 3` verifies its result and releases its lease;
+   - the official release refuses the v3 bucket (`document version 3 unsupported`).
 
    Neither refusal changes `meta.json` or leaves a lease. The cold candidate then:
    - authenticates the old token and rejects an invalid one;
@@ -127,7 +127,7 @@ resolve the pinned compiler. Never change global Git or tool-manager settings.
 5. A candidate Git/LFS write yields a webhook whose HMAC verifies with the original
    secret and names the new HEAD. A second cold restart serves the new HEAD and
    bytes, creates a repository, stops cleanly, and releases its lease. The stopped
-   v2 `meta.json` stores `create_state: 2` for that repository.
+   v3 `meta.json` stores `create_state: 2` for that repository.
 6. `s3wal-meta convert --to 1` verifies, the candidate refuses the result, and the
    cold official release passes the same checks as step 4 on the candidate's HEAD and
    LFS bytes. It also answers an authenticated `GET /api/v1/repo` for the

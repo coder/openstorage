@@ -195,7 +195,7 @@ func isType[E error](err error) bool { var e E; return errors.As(err, &e) }
 // after-adoption rows.
 func TestS3WALMetaRefusalMatrix(t *testing.T) {
 	ctx := context.Background()
-	garbage := []byte(`{"v":2,"seq":`)
+	garbage := []byte(`{"v":3,"seq":`)
 	for _, row := range []struct {
 		name  string
 		cold  []byte
@@ -206,10 +206,12 @@ func TestS3WALMetaRefusalMatrix(t *testing.T) {
 		heals bool
 	}{
 		{"decode failure, cold", garbage, func(f *refuseFixture) error { return CheckFormat(ctx, f.st) },
-			isType[*CorruptDocumentError], false, func(f *refuseFixture) { f.put([]byte(`{"v":2,"seq":1,"writer":"w"}`)) }, true},
+			isType[*CorruptDocumentError], false, func(f *refuseFixture) { f.put([]byte(`{"v":3,"seq":1,"writer":"w"}`)) }, true},
 		{"decode failure, cached", nil, func(f *refuseFixture) error { f.put(garbage); return CheckFormat(ctx, f.st) },
 			isType[*CorruptDocumentError], true, func(f *refuseFixture) { f.put(f.trusted.Body) }, true},
 		{"version mismatch, cached", nil, func(f *refuseFixture) error { f.put(f.edit(map[string]any{"v": 1})); return CheckFormat(ctx, f.st) },
+			isType[*FormatVersionError], true, func(f *refuseFixture) { f.put(f.trusted.Body) }, true},
+		{"version 2, cached", nil, func(f *refuseFixture) error { f.put(f.edit(map[string]any{"v": 2})); return CheckFormat(ctx, f.st) },
 			isType[*FormatVersionError], true, func(f *refuseFixture) { f.put(f.trusted.Body) }, true},
 		{"older seq", nil, func(f *refuseFixture) error { f.put(f.prev.Body); return CheckFormat(ctx, f.st) },
 			isType[*StaleDocumentError], true, func(f *refuseFixture) { f.put(f.trusted.Body); f.cas.newETag.Store(true) }, true}, // heals on the bytes, not a 304

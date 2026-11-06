@@ -69,15 +69,17 @@ const s3walMetaKey = "_wal/meta.json"
 // s3walMetaVersion is the only document schema version this binary's
 // normal code paths read or write. Only the format conversion
 // (s3walmeta_convert.go, ADR-51) reads and writes the others.
-const s3walMetaVersion = 2
+const s3walMetaVersion = 3
 
-// The document schema versions (ADR-51). v2 is v1 plus four fields whose
-// absent value means exactly what v1 means (the zero-value rule):
-// s3walMetaRepo.CreateState and s3walMetaUpstream.PushAttempt, PushDue,
-// SyncDue.
+// The document schema versions (ADR-51). Each is the one before plus
+// fields whose absent value means exactly what the older version means
+// (the zero-value rule). v2 adds s3walMetaRepo.CreateState and
+// s3walMetaUpstream.PushAttempt, PushDue, SyncDue. v3 adds
+// s3walMetaUpstream.DefaultBranchOmitted.
 const (
 	s3walMetaV1 = 1
 	s3walMetaV2 = 2
+	s3walMetaV3 = 3
 )
 
 // s3walKeyRefreshInterval is the org public-key snapshot's background
@@ -203,6 +205,11 @@ type s3walMetaUpstream struct {
 	PushAttempt int   `json:"push_attempt,omitempty"`
 	PushDue     int64 `json:"push_due,omitempty"`
 	SyncDue     int64 `json:"sync_due,omitempty"`
+	// DefaultBranchOmitted is v3 only (ADR-51, issue #603): the row's repo
+	// was created without a default branch and still waits for the first
+	// sync to adopt the upstream's. Absent (false) is what every v2 row
+	// means: v2 never adopts, so no row waits.
+	DefaultBranchOmitted bool `json:"default_branch_omitted,omitempty"`
 }
 
 // toRepoUpstream renders the stored row as the interface type, converting
@@ -230,6 +237,8 @@ func (u *s3walMetaUpstream) toRepoUpstream(repoID string) RepoUpstream {
 		PushRunCount:       u.PushRunCount,
 		PushSuccessCount:   u.PushSuccessCount,
 		CreatedAt:          time.Unix(0, u.CreatedAt).UTC(),
+
+		DefaultBranchOmitted: u.DefaultBranchOmitted,
 	}
 }
 
@@ -387,9 +396,9 @@ type FormatVersionError struct {
 }
 
 func (e *FormatVersionError) Error() string {
-	if e.Got == s3walMetaV1 {
-		// ADR-51 rollout R1: only the offline conversion reads v1.
-		return "s3walmeta: document version 1 needs conversion: stop serve, then run `openstorage s3wal-meta convert --to 2` (docs/how-to/deploy-production.md#upgrading-the-s3wal-metadata-format)"
+	if e.Got == s3walMetaV1 || e.Got == s3walMetaV2 {
+		// ADR-51 rollout R1: only the offline conversion reads an older version.
+		return fmt.Sprintf("s3walmeta: document version %d needs conversion: stop serve, then run `openstorage s3wal-meta convert --to %d` (docs/how-to/deploy-production.md#upgrading-the-s3wal-metadata-format)", e.Got, s3walMetaVersion)
 	}
 	return fmt.Sprintf("s3walmeta: document version %d unsupported (want %s)", e.Got, wantVersions(e.Want))
 }
@@ -426,13 +435,16 @@ func CheckFormat(ctx context.Context, b Backend) error {
 }
 
 // wantVersions renders the accepted versions for an error message: "2",
-// or "1 or 2".
+// "1 or 2", or "1, 2 or 3".
 func wantVersions(versions []int) string {
 	parts := make([]string, len(versions))
 	for i, v := range versions {
 		parts[i] = strconv.Itoa(v)
 	}
-	return strings.Join(parts, " or ")
+	if len(parts) < 2 {
+		return strings.Join(parts, "")
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " or " + parts[len(parts)-1]
 }
 
 // encodeAdvance encodes the NEXT version of doc: seq+1 and a fresh 128-bit
@@ -449,7 +461,7 @@ func (doc *s3walMetaDoc) encodeAdvance() ([]byte, error) {
 // encodeNext is encodeAdvance for any known version. Only the format
 // conversion calls it directly.
 func (doc *s3walMetaDoc) encodeNext() ([]byte, error) {
-	assertf(doc.V == s3walMetaV1 || doc.V == s3walMetaV2, "encodeNext: version %d", doc.V)
+	assertf(doc.V == s3walMetaV1 || doc.V == s3walMetaV2 || doc.V == s3walMetaV3, "encodeNext: version %d", doc.V)
 	assertf(doc.Seq >= 0, "encodeNext: seq %d", doc.Seq)
 	for name := range doc.Orgs {
 		assertf(utf8.ValidString(name),
@@ -1305,7 +1317,7 @@ func (s *S3WAL) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch
 			if err != nil {
 				return false, err
 			}
-			_, r := doc.liveRepoByURL(orgRow.ID, url)
+			id, r := doc.liveRepoByURL(orgRow.ID, url)
 			if r == nil {
 				return false, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
 			}
@@ -1313,6 +1325,11 @@ func (s *S3WAL) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch
 				return false, nil // changed concurrently: won=false, no error
 			}
 			r.DefaultBranch = newBranch
+			// An explicit change ends the wait for adoption in the same
+			// write, as on PostgreSQL and SQLite (issue #603).
+			if u := doc.Upstreams[id]; u != nil {
+				u.DefaultBranchOmitted = false
+			}
 			won = true
 			return true, nil
 		},
