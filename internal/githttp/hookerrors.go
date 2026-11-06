@@ -101,6 +101,15 @@ func (h hookLogHandler) WithGroup(name string) slog.Handler {
 // withoutErrors returns a without its error values, and false when nothing
 // is left of it.
 func withoutErrors(a slog.Attr) (slog.Attr, bool) {
+	// An "err" or "error" attribute is an error whatever its kind: some
+	// libraries log err.Error() as a string. An error that is also a
+	// LogValuer can resolve to its text, so it is checked before Resolve.
+	if a.Key == "err" || a.Key == "error" {
+		return slog.Attr{}, false
+	}
+	if _, isErr := a.Value.Any().(error); isErr {
+		return slog.Attr{}, false
+	}
 	a.Value = a.Value.Resolve()
 	switch a.Value.Kind() {
 	case slog.KindAny:

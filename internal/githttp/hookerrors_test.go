@@ -48,8 +48,12 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	logger.Error("open ref store failed", "err", fmt.Errorf("dial %s", canary), "repo", "r1",
 		slog.Group("g", "err", errors.New("group "+canary), "k", "v"))
 	logger.WithGroup("w").Warn("second", "err", errors.New("nested "+canary), "x", 1)
+	// Some libraries log err.Error() as a string, and an error can also be a
+	// LogValuer that resolves to its text.
+	slog.New(NewHookLogHandler(&pusher, nil)).Error("third", slog.String("err", "string "+canary),
+		"cause", valuerError{canary}, "y", 2)
 
-	for _, want := range []string{"open ref store failed", "hook=update", "repo=r1", "g.k=v", "second", "w.x=1"} {
+	for _, want := range []string{"open ref store failed", "hook=update", "repo=r1", "g.k=v", "second", "w.x=1", "third", "y=2"} {
 		if !strings.Contains(pusher.String(), want) {
 			t.Errorf("stderr lacks %q: %s", want, pusher.String())
 		}
@@ -61,21 +65,28 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Five: the With error in both records, and one more error each in
-	// the first (attribute, group) and in the second.
-	if n := strings.Count(string(b), canary); n != 5 {
-		t.Fatalf("the hook-errors file names the canary %d times, want 5: %s", n, b)
+	// Seven: the With error in both records, one more error each in the
+	// first (attribute, group) and in the second, and the string and the
+	// LogValuer in the third.
+	if n := strings.Count(string(b), canary); n != 7 {
+		t.Fatalf("the hook-errors file names the canary %d times, want 7: %s", n, b)
 	}
 
 	logs := captureServeLog(t)
 	logHookErrors("receive-pack r1", path)
-	if got := strings.Count(logs.String(), "receive-pack r1: hook: "); got != 2 {
-		t.Fatalf("serve logged %d hook records, want 2: %s", got, logs)
+	if got := strings.Count(logs.String(), "receive-pack r1: hook: "); got != 3 {
+		t.Fatalf("serve logged %d hook records, want 3: %s", got, logs)
 	}
-	if n := strings.Count(logs.String(), canary); n != 5 {
-		t.Fatalf("serve's log names the canary %d times, want 5: %s", n, logs)
+	if n := strings.Count(logs.String(), canary); n != 7 {
+		t.Fatalf("serve's log names the canary %d times, want 7: %s", n, logs)
 	}
 }
+
+// valuerError is an error that logs as its own text.
+type valuerError struct{ canary string }
+
+func (e valuerError) Error() string        { return "valuer " + e.canary }
+func (e valuerError) LogValue() slog.Value { return slog.StringValue(e.Error()) }
 
 // Without a hook-errors file the error values are dropped, never written
 // to stderr. A symlink in its place is not followed, and serve does not

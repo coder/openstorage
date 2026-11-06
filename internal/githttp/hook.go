@@ -1069,19 +1069,7 @@ func preReceive(ctx context.Context) (retErr error) {
 			// earlier iterations are durable orphans whose rows must keep
 			// covering them (round 33). Ambiguity and retire failures
 			// only leave what the TTL always collected.
-			if len(reservedGens) > 0 {
-				proven := make(map[string]string, len(reservedGens))
-				for k, g := range reservedGens {
-					if _, serr := bl.Stat(ctx, k); errors.Is(serr, blob.ErrNotFound) {
-						proven[k] = g
-					}
-				}
-				if len(proven) > 0 {
-					if rerr := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), proven); rerr != nil {
-						hookErrorsLogger().Error("pre-receive: retire reservations", "err", rerr)
-					}
-				}
-			}
+			retireUnuploaded(ctx, st, bl, repo, reservedGens)
 			return fmt.Errorf("pre-receive: upload %s: %w", packs[i].Key, err)
 		}
 	}
@@ -1521,6 +1509,29 @@ func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bo
 		return nil
 	}
 	return fmt.Errorf("pre-receive: the quarantined pack is needed only by policy-denied ref updates, refusing pack publication (push the allowed updates separately): %w", firstErr)
+}
+
+// retireUnuploaded retires the reservations in reservedGens whose blobs
+// are proven absent after a failed upload. A failed retire leaves only
+// what the TTL collects anyway, so it is logged, to the hook-errors file
+// only: its error can name the store.
+func retireUnuploaded(ctx context.Context, st interface {
+	RetirePackAttempts(ctx context.Context, group []string, gens map[string]string) error
+}, bl interface {
+	Stat(ctx context.Context, key string) (int64, error)
+}, repo string, reservedGens map[string]string) {
+	proven := make(map[string]string, len(reservedGens))
+	for k, g := range reservedGens {
+		if _, serr := bl.Stat(ctx, k); errors.Is(serr, blob.ErrNotFound) {
+			proven[k] = g
+		}
+	}
+	if len(proven) == 0 {
+		return
+	}
+	if err := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), proven); err != nil {
+		hookErrorsLogger().Error("pre-receive: retire reservations", "err", err)
+	}
 }
 
 // atomicDenied is the whole-push denial for an atomic push carrying a

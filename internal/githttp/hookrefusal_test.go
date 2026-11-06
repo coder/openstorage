@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -300,4 +302,50 @@ func TestServeHidesHookStoreErrors(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	checkHidden(t, out, logs.String(), c, "host", "user", "database")
+}
+
+// retireFails is a pack ledger whose retire fails with err, and a blob store
+// that has no blob.
+type retireFails struct {
+	err     error
+	retired map[string]string
+}
+
+func (r *retireFails) RetirePackAttempts(_ context.Context, _ []string, gens map[string]string) error {
+	r.retired = gens
+	return r.err
+}
+
+func (r *retireFails) Stat(context.Context, string) (int64, error) { return 0, blob.ErrNotFound }
+
+// A failed retire after a failed upload goes to the hook-errors file only,
+// never to the stderr that git relays.
+func TestRetireUnuploadedKeepsItsErrorOffStderr(t *testing.T) {
+	c := pgCanary()
+	records := hookEnv(t, c.url)
+	st := &retireFails{err: fmt.Errorf("pg retire: failed to connect to `user=%s database=%s`: lookup %s: no such host",
+		c.parts["user"], c.parts["database"], c.parts["host"])}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := os.Stderr
+	os.Stderr = w
+	retireUnuploaded(t.Context(), st, st, "t-refusal", map[string]string{"packs/a.pack": "1"})
+	os.Stderr = prev
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.retired["packs/a.pack"] != "1" {
+		t.Fatalf("retired %v; want the absent blob's reservation", st.retired)
+	}
+	got := readRecords(t, records)
+	if !strings.Contains(got, "pre-receive: retire reservations") {
+		t.Fatalf("the hook-errors records lack the retire failure: %s", got)
+	}
+	checkHidden(t, string(stderr), got, c, "host", "user", "database")
 }

@@ -668,7 +668,11 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 
 // newHookRiver builds the hook's River client. Tests replace it to reach
 // the wiring's River failure.
-var newHookRiver = jobs.NewRiverInsertOnly
+var newHookRiver = func(ctx context.Context, pgURL string) (*jobs.River, error) {
+	// River's lines carry store errors as strings: write them only to
+	// serve's hook-errors file, never to the stdout git relays.
+	return jobs.NewRiverInsertOnly(ctx, pgURL, slog.New(githttp.NewHookLogHandler(io.Discard, nil)))
+}
 
 // errHookIntent is BeforeCAS's refusal when the hook cannot record a push's
 // forward intent. events.RefStore prefixes "refusing the ref update".
