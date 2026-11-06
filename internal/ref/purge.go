@@ -25,7 +25,8 @@ import (
 // purge has begun (fence row present, see FenceRepoPurge): the write
 // pipeline resolved the repository before its soft-delete, and letting the
 // registration commit could strand rows — or worse, re-point storage —
-// behind a completed purge. Surfaces to the writer as a failed push.
+// behind a completed purge. Surfaces to the writer as a failed push, and to
+// a repack as a failed fold.
 var ErrRepoPurged = errors.New("repository is being purged")
 
 // validatePurgeGroup asserts the shared purge-seam argument invariants.
@@ -40,7 +41,8 @@ func validatePurgeGroup(group []string) {
 // first destructive-side step, BEFORE any row is tombstoned. Registrations
 // serialize against the fence through lockBaseLedger (PG) or the database
 // single-writer lock (SQLite): once this commits, every later RegisterPacks
-// / RegisterLFSObject for the group fails with ErrRepoPurged, so the
+// / ReplacePacks / RegisterLFSObject for the group fails with ErrRepoPurged
+// (a ReplacePacks whose input rows are gone still loses cleanly), so the
 // purge's later verification-then-completion cannot be raced by a write
 // that settles in between (PR #105 security round) — any straggler row
 // either landed before the fence (re-tombstoned by the resumed purge) or

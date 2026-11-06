@@ -2,11 +2,12 @@
 
 ## Overview
 
-Standalone maintenance scripts for docs, releases, and the Compose quickstart. None of them is a Go package, and `go test ./...` does not run them.
+Standalone maintenance scripts for docs, releases, the Compose quickstart, and the words of Git's patch refusals. None of them is a Go package, and `go test ./...` does not run them.
 
-- `check-doc-links.py`: an offline, standard-library-only checker for relative inline Markdown links and anchors in every tracked `README.md`, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and `docs/`. It also checks each `[path:symbol]` code citation in a `README.md`. The file must exist, and the symbol must be a name that the file declares, or a whole-token phrase in the code of a shell script. It needs a git checkout. CI runs it in the required `lint` job of `.github/workflows/ci.yml`.
+- `check-doc-links.py`: an offline, standard-library-only checker for relative inline Markdown links and anchors in every `README.md` that git tracks or that is untracked and not ignored, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and `docs/`. It also checks each `[path:symbol]` code citation in a `README.md`. A link target or cited file must be tracked by git, and the symbol must be a name that the file declares, or a whole-token phrase in the code of a shell script. It needs a git checkout. CI runs it in the required `lint` job of `.github/workflows/ci.yml`.
 - `release-archives.sh`: cross-compiles `./cmd/openstorage` for four platforms, packages each binary with `LICENSE`, and writes `checksums.txt`. `.github/workflows/release.yml` runs it.
 - `smoke-compose-quickstart.sh`: an end-to-end smoke test of `compose.quickstart.yml` against a local image. It covers key init, the HTTP API, Git and Git LFS push and clone, restart persistence, and fail-closed init faults. CI runs it in `.github/workflows/ci.yml` and `.github/workflows/image.yml`.
+- `check-apply-messages.sh`: runs the patch cases in `internal/api/testdata/applymsg` through the `git` on PATH and checks the exit status and the message lines that `internal/api` reads to pick an HTTP status. `TestApplyMessageCases` in `internal/api` runs it, and the `image` job in `.github/workflows/ci.yml` runs it inside the built image, whose Git is Alpine's.
 
 `test_check_doc_links.py` holds the regression tests for `check-doc-links.py`. It is a test file, not a script.
 
@@ -15,8 +16,13 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 ### `check-doc-links.py`
 
 - `[check-doc-links.py:__main__]` CLI: `python3 scripts/check-doc-links.py`. It takes no arguments. It exits 1 when `check()` returns a non-zero count, 2 when `doc_files()` cannot list the files, else 0.
-- `[check-doc-links.py:check]` Checks the links of every `doc_files()` entry that `links_apply` selects, and the citations of every `README.md` among them. Prints one line per failure, then `broken links: N`. Returns N. Link failures: `BROKEN FILE`, `BROKEN FILE (escapes repo)`, `BROKEN ANCHOR`, `UNSUPPORTED REF-STYLE LINK DEF`, `UNSUPPORTED ANGLE-BRACKET DEST`, `UNSUPPORTED UNPARSED LINK`. Citation failures: `EMPTY CITATION`, `LINE NUMBER CITATION`, `UNSUPPORTED CITATION`, `MISSING CITED FILE`, `UNRESOLVED CITATION`.
-- `[check-doc-links.py:doc_files]` The sorted `.md` paths in git's index (`git ls-files`), minus `vendor/` and files deleted from the working tree.
+- `[check-doc-links.py:check]` Checks the links of every `doc_files()` entry that `links_apply` selects, and the citations of every `README.md` among them. Prints one line per failure, then `broken links: N`. Returns N. Link failures: `BROKEN FILE`, `BROKEN FILE (escapes repo)`, `BROKEN FILE (not tracked by git)`, `BROKEN ANCHOR`, `UNSUPPORTED REF-STYLE LINK DEF`, `UNSUPPORTED ANGLE-BRACKET DEST`, `UNSUPPORTED UNPARSED LINK`. Citation failures: `EMPTY CITATION`, `LINE NUMBER CITATION`, `UNSUPPORTED CITATION`, `MISSING CITED FILE`, `UNRESOLVED CITATION`.
+- `[check-doc-links.py:doc_files]` The sorted `.md` paths that git tracks or that are untracked and not ignored, minus `vendor/` and files deleted from the working tree.
+- `[check-doc-links.py:git_files]` The set of paths that `git ls-files -z` (or another git command) prints for the given options. Exits 2 when git fails.
+- `[check-doc-links.py:tracked]` Every path in git's index, minus intent-to-add entries, and every directory that holds one, plus `.`. Cached.
+- `[check-doc-links.py:intent_to_add]` The paths that `git add -N` put in the index without content (`git diff-files --diff-filter=A`). A commit holds none of them.
+- `[check-doc-links.py:indexed]` True when git's index holds the file that a path names and every symlink that resolving it follows. It follows each symlink by hand, one path component at a time, so a symlink that another symlink points at is checked too. Each symlink must be tracked, because a clean checkout has no untracked symlink. An absolute target and a path that leaves the repository fail.
+- `[check-doc-links.py:repo_path]` A path relative to the repository root after symlinks resolve, or `None` when it resolves outside the repository. Links and citations both use it.
 - `[check-doc-links.py:links_apply]` True for every `README.md`, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and every file under `docs/`.
 - `[check-doc-links.py:is_readme]` True for a file named `README.md`, the only files whose citations `check` reads.
 - `[check-doc-links.py:link_failures]` Failure lines for the inline links on one line, with inline code masked.
@@ -28,9 +34,9 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 - `[check-doc-links.py:citable]` The names of one cited file, from its reader. Cached per file.
 - `[check-doc-links.py:masked]` Blanks the comments and string literals that a lexer matches. Every line and column stays in place. A quoted literal keeps its delimiters.
 - `[check-doc-links.py:go_names]` Go: functions, methods (`T.M` and `M`), types, struct fields and interface methods (`T.F` and `F`), constants, variables, and flags (`flag -name`) that the `flag` package or a `flag.FlagSet` defines.
-- `[check-doc-links.py:tf_names]` Terraform: `T` and `T.N` for resources, `data.T.N`, `var.N` and `N`, `output.N` and `N`, `provider.N`, `module.N`, `local.K`, `terraform`, and `ADDRESS.B` for a block `B` nested in a resource or data block.
+- `[check-doc-links.py:tf_names]` Terraform: `T` and `T.N` for resources, `data.T.N`, `var.N` and `N`, `output.N` and `N`, `provider.N`, `module.N`, `local.K`, `terraform`, and `ADDRESS.B` for a block `B` nested in a resource, data, or ephemeral block, where `data.T.N` and `ephemeral.T.N` are the data and ephemeral addresses.
 - `[check-doc-links.py:py_names]` Python: `def` and `class` names (`C.m` and `m`), module-level assignments and calls (`os.chdir`), and `__main__` when the file has a main guard.
-- `[check-doc-links.py:js_names]` JavaScript: function, class, `const`, `let`, and `var` names. Object keys are not citable.
+- `[check-doc-links.py:js_names]` JavaScript: function, class, `const`, `let`, and `var` names that start a statement. A line after one that ends in an operator or an opening bracket (`JS_CONTINUES`) continues an expression, so a named function or class expression there is not a declaration. Object keys are not citable.
 - `[check-doc-links.py:ShellMentions]` Shell: any phrase that appears as whole tokens in the script's code, with comments removed (`destroy`, `set -euo pipefail`, `config.json`). Strings and heredoc bodies count, because shell contracts cite the literal values in them.
 - `[check-doc-links.py:unit_names]` systemd units: section names (`Service`). A line that continues the line before it (after a trailing `\`, with comment lines skipped) is not a header.
 - `[check-doc-links.py:gh_anchor]` Converts heading text to a GitHub-style anchor slug.
@@ -45,6 +51,7 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
   - `[check-doc-links.py:CITATION]` One citation: `[`, a path whose last element has a letter-led extension or starts with `Dockerfile`, an optional `:symbol`, then `]` not followed by `(` or `[`.
   - `[check-doc-links.py:LINE_NUMBER]` A symbol that is a line number or a line range (`8`, `4-7`).
   - `[check-doc-links.py:GO_LEXER]` `[check-doc-links.py:TF_LEXER]` `[check-doc-links.py:PY_LEXER]` `[check-doc-links.py:JS_LEXER]` The comments and string literals that `masked` blanks: Go comments, strings, raw strings, and runes. Terraform `#`, `//`, and `/* */` comments, strings (with `${...}` interpolation), and heredocs. Python comments, strings, and docstrings. JavaScript comments, strings, and template literals.
+  - `[check-doc-links.py:JS_CONTINUES]` The end of a line that leaves its expression open: an operator character, an opening bracket, or one of the keywords `await`, `case`, `delete`, `extends`, `in`, `instanceof`, `new`, `of`, `typeof`, `void` (the keywords that take an operand after them). A postfix `++` or `--`, and `return`, `throw`, or `yield` end a statement, so they do not count. A trailing `/` counts as division, so a statement that ends in a regex literal without a `;` fails closed. A string keeps its quotes in the masked text, so a line that ends in a string is not an open expression.
   - `[check-doc-links.py:LINK]` One inline link: `](`, a destination with at most one level of balanced parentheses, an optional `#fragment`, and an optional quoted title, then `)`.
   - `[check-doc-links.py:REFDEF]` A reference-style link definition line (`[label]:` after at most three spaces).
   - `[check-doc-links.py:ANGLE]` An angle-bracket destination (`](` then optional space, then `<`).
@@ -79,13 +86,22 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 - `[smoke-compose-quickstart.sh:assert_deleted]` Succeeds only when no container, volume, or network has the label `com.docker.compose.project=$project`.
 - `[smoke-compose-quickstart.sh:cleanup]` `EXIT` trap. Destroys the main and the `-invalid` project, removes `$work`, and exits with the saved code.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:dir]` Required argument: the cases directory. It holds `cases.tsv` and one `<name>.patch` per row.
+- `[check-apply-messages.sh:cases.tsv]` Tab-separated rows: name, command (`cached` or `summary`), expected exit status, the HTTP status that `internal/api` must pick (`TestApplyMessageCases` reads it, the script does not), and a line prefix.
+- `[check-apply-messages.sh:cached]` Runs `git apply --cached --binary --whitespace=nowarn` on a copy of the index of a scratch repository. A line of stderr must start with the prefix.
+- `[check-apply-messages.sh:summary]` Runs `git apply --summary`. A line of stdout must start with the prefix.
+- `[check-apply-messages.sh:failed]` Prints one `ok` or `FAIL` line per case, then a `CHECKED <n> FAILED <m>` line. It exits 0 only when at least one case ran and none failed.
+
 No child directories.
 
 ## Invariants
 
 ### `check-doc-links.py`
 
-- `[check-doc-links.py:doc_files]` Lists only Markdown that git tracks. Untracked files, git-ignored files, and files under `vendor/` are never listed. A tracked file deleted from the working tree is skipped.
+- `[check-doc-links.py:doc_files]` Lists Markdown that git tracks and Markdown that is untracked and not ignored, so a new README is checked before `git add`. Git-ignored files and files under `vendor/` are never listed. A tracked file deleted from the working tree is skipped. A clean CI checkout has no untracked files, so CI reads the same set as before.
+- `[check-doc-links.py:tracked]` `[check-doc-links.py:link_failures]` A link target must exist and pass `indexed` (the same check as a citation's path): the file it resolves to, or a directory that holds an indexed file, and every symlink on the way, must be in git's index, else `BROKEN FILE (not tracked by git)`. A symlink that leaves the repository fails as `BROKEN FILE (escapes repo)`. A tracked symlink to an untracked file and an untracked symlink to a tracked file both fail as `not tracked by git`. A fragment-only link names its own file and needs no index entry. Stage a new target with `git add` before you link to it, because a clean checkout holds only committed files. An intent-to-add entry (`git add -N`) does not count.
 - `[check-doc-links.py:doc_files]` When `git ls-files` fails (outside a checkout, or without `git`), it prints the reason to stderr and exits 2 without checking anything.
 - `[check-doc-links.py:links_apply]` Checks the links in every `README.md` (this one included), the root `CONTRIBUTING.md` and `CHANGELOG.md`, and every `.md` file under `docs/`. Other Markdown files, such as `.agents/skills/*/SKILL.md`, are not scanned.
 - `[check-doc-links.py:os.chdir]` Resolves all paths from the repository root (the parent of `scripts/`), whatever the caller's working directory is.
@@ -100,8 +116,9 @@ No child directories.
 - `[check-doc-links.py:check]` Reads citations from the raw text of non-code blocks. Citations inside code spans count. Citations inside fenced or indented code do not.
 - `[check-doc-links.py:CITATION]` Recognizes a citation without looking at `LANGUAGES`. So a citation with a symbol in a file kind that has no reader fails as `UNSUPPORTED CITATION`, and a bare `[path]` of any kind needs only the file.
 - `[check-doc-links.py:citation_problem]` Checks the symbol's form before the file. An empty symbol (`[path:]`) fails as `EMPTY CITATION`. A line number or range fails as `LINE NUMBER CITATION`. Cite a name instead.
-- `[check-doc-links.py:citation_problem]` A citation path is relative to the directory of its `README.md`. After symlinks are resolved, it must name a file inside the repository, else `MISSING CITED FILE`.
-- `[check-doc-links.py:go_names]` `[check-doc-links.py:tf_names]` `[check-doc-links.py:py_names]` `[check-doc-links.py:js_names]` A citation of a Go, Terraform, Python, or JavaScript file resolves only to a declaration. `masked` runs first, so a declaration-shaped line inside a comment, a string, a raw string, a heredoc, or a docstring does not count. A call that mentions the name does not count either. `go_names` relies on `gofmt` layout.
+- `[check-doc-links.py:citation_problem]` A citation path is relative to the directory of its `README.md`. After symlinks are resolved, it must name a file inside the repository that passes `indexed`, else `MISSING CITED FILE`.
+- `[check-doc-links.py:go_names]` `[check-doc-links.py:tf_names]` `[check-doc-links.py:py_names]` `[check-doc-links.py:js_names]` A citation of a Go, Terraform, Python, or JavaScript file resolves only to a declaration. `masked` runs first, so a declaration-shaped line inside a comment, a string, a raw string, a heredoc, or a docstring does not count. A call that mentions the name does not count either, except that `py_names` accepts a module-level call such as `os.chdir`. `go_names` relies on `gofmt` layout.
+- `[check-doc-links.py:js_names]` A function or class expression on a line after one that ends in an operator (`=`, `||`, `=>`, `?`, `:`), an opening bracket, or `await`, `case`, `delete`, `extends`, `in`, `instanceof`, `new`, `of`, `typeof`, or `void` is not a declaration. Blank and comment lines between the two do not end the expression. A line that ends in a postfix `++` or `--`, a string, `return`, `throw`, or `yield` ends its statement. A line that ends in `/` or `:` does not, because the reader cannot tell division from the end of a regex literal or a ternary colon from a `case` label, so a declaration directly after a `case` label fails closed.
 - `[check-doc-links.py:ShellMentions]` A citation of a shell script resolves to whole tokens in code. A `#` at the start of a line, after whitespace, or after `;`, `&`, `|`, `(`, or `)` starts a comment, even inside quotes. A name that appears only in a comment does not count, and `config` does not match inside `config.json`.
 
 ### `release-archives.sh`
@@ -134,12 +151,17 @@ No child directories.
 - `[smoke-compose-quickstart.sh:fault]` For each init fault (`private-missing`, `private-corrupt`, `private-permissions`, `pair-mismatch`, `public-empty`, `public-mismatch`, `public-symlink`, `public-directory`, `published-only`), `up` must fail, no server may run, `init` must exit non-zero, and the key volumes must stay unchanged.
 - `[smoke-compose-quickstart.sh:cleanup]` If `destroy` fails for either project, the exit code becomes 1.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:GIT_CONFIG_GLOBAL]` Ignores host Git configuration: unsets every `GIT_*` variable, then sets `HOME` to the work directory, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `LC_ALL=C`.
+- `[check-apply-messages.sh:checked]` A case fails when git exits with another status, or when no line has the prefix. A run that checked no case fails.
+
 ## Side Effects
 
 ### `check-doc-links.py`
 
 - `[check-doc-links.py:os.chdir]` Changes the process working directory to the repository root.
-- `[check-doc-links.py:doc_files]` Runs `git ls-files` (read-only).
+- `[check-doc-links.py:git_files]` Runs `git ls-files` and `git diff-files` (read-only).
 - `[check-doc-links.py:check]` Reads Markdown files, the files they link to, and the files they cite. Writes nothing to disk. Prints results to stdout.
 
 ### `release-archives.sh`
@@ -161,10 +183,15 @@ No child directories.
 - `[smoke-compose-quickstart.sh:git]` Commits locally and runs `git push -u origin main` and `git clone` against the local server.
 - `[smoke-compose-quickstart.sh:trap]` Traps: `EXIT` runs `cleanup`, `INT` exits 130, `TERM` exits 143, `ERR` prints the failing line without credentials or raw responses.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:work]` Creates a `mktemp -d` directory with a scratch repository, and removes it on `EXIT`. It only reads `<cases-dir>`.
+
 ## Verification
 
 - Doc links and citations: `python3 scripts/check-doc-links.py` (from the `lint` job in `.github/workflows/ci.yml`).
 - Checker tests: `python3 -B -m unittest discover -s scripts -p 'test_*.py' -v` (from the `lint` job in `.github/workflows/ci.yml`). `-B` keeps `scripts/__pycache__/` out of the checkout.
 - Smoke syntax: `bash -n scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml`).
 - Smoke run (needs Docker and a local image): `OPENSTORAGE_IMAGE=<local-image> bash scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml` and `.github/workflows/image.yml`).
+- Git's patch refusals: `sh scripts/check-apply-messages.sh internal/api/testdata/applymsg` (from `TestApplyMessageCases` in `internal/api`, and from the `image` job in `.github/workflows/ci.yml`, which runs it inside the image).
 - Release archives (needs Go): `./scripts/release-archives.sh <tag> <outdir>` (from `.github/workflows/release.yml`). Use an `<outdir>` outside the checkout. Untracked files in the checkout make Go stamp `vcs.modified=true` (see the comment in `.github/workflows/release.yml`).

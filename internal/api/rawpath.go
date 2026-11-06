@@ -34,17 +34,17 @@ func rawPathBase64(p string) string {
 	return encodeRawPath(p)
 }
 
-// rawPathsBase64 returns the base64 of every element of paths, in order,
-// when any element is not valid UTF-8, and nil when all are valid UTF-8.
-func rawPathsBase64(paths []string) []string {
-	if !anyInvalidUTF8(paths) {
-		return nil
-	}
-	out := make([]string, len(paths))
-	for i, p := range paths {
-		out[i] = encodeRawPath(p)
-	}
-	return out
+// rawPathsBase64List is the streamed list key, holding the base64 of every
+// element of paths in order. The caller adds it only when anyInvalidUTF8(paths),
+// with an empty list for key in the response template.
+func rawPathsBase64List(key string, paths []string) jsonList {
+	return jsonList{key, func(yield func(any) bool) {
+		for _, p := range paths {
+			if !yield(base64JSONString(p)) {
+				return
+			}
+		}
+	}}
 }
 
 // encodeRawPath is the base64 of p's bytes, whether or not p is valid UTF-8.

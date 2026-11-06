@@ -1504,7 +1504,9 @@ func (c *Client[TTx]) Driver() riverdriver.Driver[TTx] {
 // If the job is currently running, it is not immediately cancelled, but is
 // instead marked for cancellation. The client running the job will also be
 // notified to cancel the running job's context. When running without a notifier,
-// clients poll for cancellation requests every two seconds. Although the job's
+// clients poll for cancellation requests every two seconds. Clients with a
+// notifier also poll once a minute in case a notification was missed, like
+// while the notifier was reconnecting. Although the job's
 // context will be cancelled, since Go does not provide a mechanism to
 // interrupt a running goroutine the job will continue running until it returns.
 // As always, it is important for workers to respect context cancellation and
@@ -1561,7 +1563,9 @@ func (c *Client[TTx]) JobCancel(ctx context.Context, jobID int64) (*rivertype.Jo
 // If the job is currently running, it is not immediately cancelled, but is
 // instead marked for cancellation. The client running the job will also be
 // notified to cancel the running job's context. When running without a notifier,
-// clients poll for cancellation requests every two seconds. Although the job's
+// clients poll for cancellation requests every two seconds. Clients with a
+// notifier also poll once a minute in case a notification was missed, like
+// while the notifier was reconnecting. Although the job's
 // context will be cancelled, since Go does not provide a mechanism to
 // interrupt a running goroutine the job will continue running until it returns.
 // As always, it is important for workers to respect context cancellation and
@@ -2153,6 +2157,17 @@ func (c *Client[TTx]) insertManyParams(params []InsertManyParams) ([]*rivertype.
 // transaction, the producer wouldn't yet be able to access the new jobs that
 // triggered the notification because they're not committed yet.
 func (c *Client[TTx]) notifyProducerWithoutListenerJobFetch(_ context.Context, res []*rivertype.JobInsertResult) {
+	if !c.config.willExecuteJobs() || c.driver.SupportsListener() {
+		return
+	}
+
+	c.notifyProducerWithoutListenerJobFetchForQueues(sliceutil.Map(res, func(insertRes *rivertype.JobInsertResult) string { return insertRes.Job.Queue }))
+}
+
+// Same as notifyProducerWithoutListenerJobFetch, but takes the queues that jobs
+// were inserted into instead of insert results. Used by InsertManyFast, whose
+// insert doesn't return job rows.
+func (c *Client[TTx]) notifyProducerWithoutListenerJobFetchForQueues(queues []string) {
 	if c.driver.SupportsListener() {
 		return
 	}
@@ -2166,8 +2181,8 @@ func (c *Client[TTx]) notifyProducerWithoutListenerJobFetch(_ context.Context, r
 
 	// Special case for when we were handling exactly one job, which is a very
 	// common case. Acts as a minor optimization by avoiding the map allocation.
-	if len(res) == 1 {
-		if producer, ok := c.producersByQueueName[res[0].Job.Queue]; ok {
+	if len(queues) == 1 {
+		if producer, ok := c.producersByQueueName[queues[0]]; ok {
 			producer.TriggerJobFetch()
 		}
 
@@ -2176,13 +2191,13 @@ func (c *Client[TTx]) notifyProducerWithoutListenerJobFetch(_ context.Context, r
 
 	queuesTriggered := make(map[string]struct{})
 
-	for _, insertRes := range res {
-		if _, ok := queuesTriggered[insertRes.Job.Queue]; ok {
+	for _, queue := range queues {
+		if _, ok := queuesTriggered[queue]; ok {
 			continue
 		}
-		queuesTriggered[insertRes.Job.Queue] = struct{}{}
+		queuesTriggered[queue] = struct{}{}
 
-		if producer, ok := c.producersByQueueName[insertRes.Job.Queue]; ok {
+		if producer, ok := c.producersByQueueName[queue]; ok {
 			producer.TriggerJobFetch()
 		}
 	}
@@ -2211,15 +2226,24 @@ func (c *Client[TTx]) InsertManyFast(ctx context.Context, params []InsertManyPar
 		return 0, errNoDriverDBPool
 	}
 
+	insertParams, err := c.insertManyParams(params)
+	if err != nil {
+		return 0, err
+	}
+
 	// Wrap in a transaction in case we need to notify about inserts.
 	res, err := dbutil.WithTxV(ctx, c.driver.GetExecutor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) ([]*rivertype.JobInsertResult, error) {
-		return c.insertManyFast(ctx, execTx, params)
+		return c.insertManyFast(ctx, execTx, insertParams)
 	})
 	if err != nil {
 		return 0, err
 	}
 
-	c.notifyProducerWithoutListenerJobFetch(ctx, res)
+	// Fast inserts don't return job rows, so notify for the queues in insert
+	// params instead.
+	if c.config.willExecuteJobs() && !c.driver.SupportsListener() {
+		c.notifyProducerWithoutListenerJobFetchForQueues(sliceutil.Map(insertParams, func(insertParam *rivertype.JobInsertParams) string { return insertParam.Queue }))
+	}
 
 	return len(res), nil
 }
@@ -2248,19 +2272,19 @@ func (c *Client[TTx]) InsertManyFast(ctx context.Context, params []InsertManyPar
 // a unique constraint is violated, the operation will fail and no jobs will be
 // inserted.
 func (c *Client[TTx]) InsertManyFastTx(ctx context.Context, tx TTx, params []InsertManyParams) (int, error) {
-	res, err := c.insertManyFast(ctx, c.driver.UnwrapExecutor(tx), params)
+	insertParams, err := c.insertManyParams(params)
+	if err != nil {
+		return 0, err
+	}
+
+	res, err := c.insertManyFast(ctx, c.driver.UnwrapExecutor(tx), insertParams)
 	if err != nil {
 		return 0, err
 	}
 	return len(res), nil
 }
 
-func (c *Client[TTx]) insertManyFast(ctx context.Context, execTx riverdriver.ExecutorTx, params []InsertManyParams) ([]*rivertype.JobInsertResult, error) {
-	insertParams, err := c.insertManyParams(params)
-	if err != nil {
-		return nil, err
-	}
-
+func (c *Client[TTx]) insertManyFast(ctx context.Context, execTx riverdriver.ExecutorTx, insertParams []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error) {
 	return c.insertManyShared(ctx, execTx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
 		count, err := execTx.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
 			Jobs:   insertParams,
@@ -2455,7 +2479,13 @@ type JobDeleteManyResult struct {
 // JobDeleteMany deletes many jobs at once based on the conditions defined by
 // JobDeleteManyParams. Running jobs are always ignored.
 //
-//	params := river.NewJobDeleteManyParams().First(10).State(rivertype.JobStateCompleted)
+// Each call deletes at most 100 jobs by default; use JobDeleteManyParams.First
+// to change the batch size. In Postgres, jobs locked by another transaction are
+// skipped, so even an empty result doesn't guarantee that no matching jobs
+// remain. Applications that need to remove every matching job must account for
+// both the batch limit and concurrent transactions.
+//
+//	params := river.NewJobDeleteManyParams().First(10).States(rivertype.JobStateCompleted)
 //	jobRows, err := client.JobDeleteMany(ctx, params)
 //	if err != nil {
 //		// handle error
@@ -2471,7 +2501,10 @@ func (c *Client[TTx]) JobDeleteMany(ctx context.Context, params *JobDeleteManyPa
 // JobDeleteManyTx deletes many jobs at once based on the conditions defined by
 // JobDeleteManyParams. Running jobs are always ignored.
 //
-//	params := river.NewJobDeleteManyParams().First(10).States(river.JobStateCompleted)
+// The batch limit and Postgres locked-row behavior described in JobDeleteMany
+// also apply within a transaction.
+//
+//	params := river.NewJobDeleteManyParams().First(10).States(rivertype.JobStateCompleted)
 //	jobRows, err := client.JobDeleteManyTx(ctx, tx, params)
 //	if err != nil {
 //		// handle error
@@ -2783,8 +2816,9 @@ func (c *Client[TTx]) QueueListTx(ctx context.Context, tx TTx, params *QueueList
 // queues at once, use the special queue name "*".
 //
 // Clients with a configured notifier should receive a notification about the
-// paused queue(s) within a few milliseconds of the transaction commit. Clients
-// in poll-only mode will pause after their next poll for queue configuration.
+// paused queue(s) within a few milliseconds of the transaction commit. Missed
+// notifications are recovered by polling once a minute. Clients in poll-only
+// mode will pause after their next poll for queue configuration.
 //
 // The provided context is used for the underlying Postgres update and can be
 // used to cancel the operation or apply a timeout. The opts are reserved for
@@ -2823,8 +2857,9 @@ func (c *Client[TTx]) QueuePause(ctx context.Context, name string, opts *QueuePa
 // queues at once, use the special queue name "*".
 //
 // Clients with a configured notifier should receive a notification about the
-// paused queue(s) within a few milliseconds of the transaction commit. Clients
-// in poll-only mode will pause after their next poll for queue configuration.
+// paused queue(s) within a few milliseconds of the transaction commit. Missed
+// notifications are recovered by polling once a minute. Clients in poll-only
+// mode will pause after their next poll for queue configuration.
 //
 // The provided context is used for the underlying Postgres update and can be
 // used to cancel the operation or apply a timeout. The opts are reserved for
@@ -2853,8 +2888,9 @@ func (c *Client[TTx]) QueuePauseTx(ctx context.Context, tx TTx, name string, opt
 // name "*".
 //
 // Clients with a configured notifier should receive a notification about the
-// resumed queue(s) within a few milliseconds of the transaction commit. Clients
-// in poll-only mode will resume after their next poll for queue configuration.
+// resumed queue(s) within a few milliseconds of the transaction commit. Missed
+// notifications are recovered by polling once a minute. Clients in poll-only
+// mode will resume after their next poll for queue configuration.
 //
 // The provided context is used for the underlying Postgres update and can be
 // used to cancel the operation or apply a timeout. The opts are reserved for
@@ -2894,8 +2930,9 @@ func (c *Client[TTx]) QueueResume(ctx context.Context, name string, opts *QueueP
 // name "*".
 //
 // Clients with a configured notifier should receive a notification about the
-// resumed queue(s) within a few milliseconds of the transaction commit. Clients
-// in poll-only mode will resume after their next poll for queue configuration.
+// resumed queue(s) within a few milliseconds of the transaction commit. Missed
+// notifications are recovered by polling once a minute. Clients in poll-only
+// mode will resume after their next poll for queue configuration.
 //
 // The provided context is used for the underlying Postgres update and can be
 // used to cancel the operation or apply a timeout. The opts are reserved for
@@ -2943,7 +2980,11 @@ func (c *Client[TTx]) QueueUpdate(ctx context.Context, name string, params *Queu
 		return nil, err
 	}
 
-	c.notifyProducerWithoutListenerQueueControlEvent(name, controlEvent)
+	// No control event is returned when metadata isn't being changed, in which
+	// case there's nothing for the producer to act on.
+	if controlEvent != nil {
+		c.notifyProducerWithoutListenerQueueControlEvent(name, controlEvent)
+	}
 
 	return queue, nil
 }

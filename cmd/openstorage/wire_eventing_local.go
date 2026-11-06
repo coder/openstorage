@@ -30,8 +30,9 @@ func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Wor
 	}
 	assertf(cacheDir != "", "buildLocalSyncQueue: the publication wait needs the cache directory")
 	worker.Local = lanes
-	// Git-surface hooks record intent after the authority CAS, before
-	// receive-pack publishes the cache ref: runs wait for publication.
+	// Git-surface hooks record intent before the authority CAS, and
+	// receive-pack publishes the cache ref after it: runs wait for
+	// publication.
 	worker.WaitPublication = func(ctx context.Context, repoID string) error {
 		return githttp.WaitForPushPublication(ctx, cacheDir, repoID)
 	}

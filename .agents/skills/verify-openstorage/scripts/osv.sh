@@ -190,6 +190,10 @@ start_serve() {
 	# around launch, and a cleanup under the same lock waits for serve forever.
 	# Never redirect the loop's stderr: bash saves fd 2 above 9 for the loop,
 	# the loop closes that copy, and serve then starts with stderr on /dev/null.
+	# Create both logs before serve starts: the wait loop reads $p.out at once,
+	# and under pipefail a sed on a missing file would end launch.
+	: >"$p.out"
+	: >"$p.err"
 	# shellcheck disable=SC2016 # $$, $f, and $1 expand in the inner bash
 	${setsid[@]+"${setsid[@]}"} bash -c 'echo $$ >"$1"; shift
 		for f in /proc/$$/fd/* /dev/fd/*; do
