@@ -125,21 +125,42 @@ type wmMergeResponse struct {
 type wmConflictBody struct {
 	Error               string   `json:"error"`
 	ConflictType        string   `json:"conflict_type"`
-	ConflictPaths       []string `json:"conflict_paths,omitempty"`
-	ConflictPathsBase64 []string `json:"conflict_paths_base64,omitempty"`
+	ConflictPaths       []string `json:"conflict_paths"`
+	ConflictPathsBase64 []string `json:"conflict_paths_base64,omitzero"`
 	MergeBaseSHA        string   `json:"merge_base_sha,omitempty"`
 }
 
-// wmFailConflict writes the 409 MergeConflict body for file conflicts.
+// wmFailConflict writes the 409 MergeConflict body for file conflicts. The
+// body streams its path lists: a push can make the conflict paths as long as
+// it likes, and the sibling must not add a second and third copy of them to
+// the request's memory. conflict_paths_base64 is empty and present exactly
+// when a path is not valid UTF-8 (#587).
 func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, mergeBase string) {
 	assertf(msg != "" && len(conflictPaths) > 0, "wmFailConflict: message %q with %d paths", msg, len(conflictPaths))
-	writeJSON(w, http.StatusConflict, wmConflictBody{
-		Error:               msg,
-		ConflictType:        "merge_conflict",
-		ConflictPaths:       conflictPaths,
-		ConflictPathsBase64: rawPathsBase64(conflictPaths),
-		MergeBaseSHA:        mergeBase,
-	})
+	body := wmConflictBody{
+		Error:         msg,
+		ConflictType:  "merge_conflict",
+		ConflictPaths: []string{},
+		MergeBaseSHA:  mergeBase,
+	}
+	lists := []jsonList{{"conflict_paths", func(yield func(any) bool) {
+		for _, p := range conflictPaths {
+			if !yield(p) {
+				return
+			}
+		}
+	}}}
+	if anyInvalidUTF8(conflictPaths) {
+		body.ConflictPathsBase64 = []string{}
+		lists = append(lists, jsonList{"conflict_paths_base64", func(yield func(any) bool) {
+			for _, p := range conflictPaths {
+				if !yield(encodeRawPath(p)) {
+					return
+				}
+			}
+		}})
+	}
+	writeJSONLists(w, http.StatusConflict, body, lists...)
 }
 
 // wmInternal logs the real error and writes the generic 500 problem body
