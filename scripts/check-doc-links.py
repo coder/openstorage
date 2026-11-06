@@ -577,6 +577,7 @@ JS_BEFORE_REGEX = {"case", "default", "delete", "do", "else", "extends", "in", "
                    "typeof", "void"}
 JS_UNKNOWN = {"await", "of", "yield"}
 JS_LINE_BREAK = re.compile(r"[\n\r\u2028\u2029]")
+JS_NEWLINE = re.compile(r"\r\n?|[\n\u2028\u2029]")
 JS_SIGN = re.compile(r"\+\+|--|[+-]")
 # No declaration can name one of these: `let in x` and `let instanceof x` use
 # `let` as a variable, and `class extends X {}` has no name.
@@ -603,7 +604,7 @@ def js_mask(text):
     def done(why=None, at=None):
         chars = list(text)
         for a, b in spans:
-            chars[a:b] = [c if c == "\n" else " " for c in text[a:b]]
+            chars[a:b] = [c if JS_LINE_BREAK.match(c) else " " for c in text[a:b]]
         return "".join(chars), (start if templates else at, why) if why else None
 
     while i < len(text):
@@ -696,10 +697,10 @@ def js_names(text):
     names, prior = JsNames(), ""
     if stop:
         offset, cannot = stop
-        blanked = blanked[:blanked.rfind("\n", 0, offset) + 1]
-        stopped = text.count("\n", 0, offset) + 1
+        blanked = blanked[:max(blanked.rfind(c, 0, offset) for c in "\n\r\u2028\u2029") + 1]
+        stopped = len(JS_NEWLINE.findall(text, 0, offset)) + 1
         names.note = f"; the JavaScript reader stops at line {stopped}, where it cannot {cannot}"
-    for line in blanked.replace("\ufeff", " ").split("\n"):
+    for line in JS_NEWLINE.sub("\n", blanked.replace("\ufeff", " ")).split("\n"):
         code = line.rstrip()
         if not code:
             continue

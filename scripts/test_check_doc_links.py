@@ -480,6 +480,18 @@ class CitationTests(CheckerTestCase):
         self.assert_failures(result)
         self.assertEqual(result.returncode, 0)
 
+    def test_javascript_every_line_terminator_ends_a_line_and_blocks_a_postfix_operator(self):
+        js = ("const a = x\r++\n  function viaCr() {}.x\n"
+              "const b = x\u2028++\n  function viaLs() {}.x\n"
+              "const c = x /*\u2029*/ ++\n  function viaComment() {}.x\n"
+              "const d = a[0]\r++\n  function viaBracket() {}.x\n"
+              "const e = x // note\r++\n  function viaLineComment() {}.x\n"
+              "const f = x++\r\nfunction afterCrlf() {}\r\nconst g = 1\rfunction afterCr() {}\n")
+        ok = ["afterCrlf", "afterCr"]
+        bad = ["viaCr", "viaLs", "viaComment", "viaBracket", "viaLineComment"]
+        result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n", **{"pkg/flow.js": js})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
+
     def test_javascript_reserved_words_after_a_declaration_keyword_are_not_names(self):
         # `let` is an identifier here, and the class has no name: JavaScript declares none of these words.
         files = {"pkg/let_in.js": "let in obj\nfunction real() {}\n", "pkg/let_instanceof.js": "let instanceof Object\nfunction real() {}\n",
