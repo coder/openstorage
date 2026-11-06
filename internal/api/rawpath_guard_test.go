@@ -1,10 +1,10 @@
 package api
 
-// #587 guard: a JSON field that carries a repository path has a _base64
-// sibling (rawpath.go). The scan reads every struct type in the
-// package's own sources, so a new such field without a sibling fails here, in
-// the PR that adds it. It does not check that a handler fills the sibling:
-// the route tests do.
+// #587 guard: a JSON field that carries a repository path or a path glob, in
+// a response or a request, has a _base64 sibling (rawpath.go). The scan reads
+// every struct type in the package's own sources, so a new such field without
+// a sibling fails here, in the PR that adds it. It does not check that a
+// handler fills the sibling: the route tests do.
 
 import (
 	"go/ast"
@@ -18,23 +18,18 @@ import (
 	"testing"
 )
 
-// rpGuardExempt lists path fields without a sibling, as Type.json_name.
-// Both take a path in a request body, which has no response sibling to fill.
-var rpGuardExempt = map[string]string{
-	"grepRequestBody.paths": "grep request input",
-	"wcFileOp.path":         "commit-pack request input",
-}
-
-// isPathFieldName reports whether a JSON name carries a repository path.
+// isPathFieldName reports whether a JSON name carries a repository path or
+// a glob over paths.
 func isPathFieldName(name string) bool {
-	return name == "path" || name == "paths" || strings.HasSuffix(name, "_path") || strings.HasSuffix(name, "_paths")
+	return name == "path" || name == "paths" || strings.HasSuffix(name, "_path") ||
+		strings.HasSuffix(name, "_paths") || strings.HasSuffix(name, "_globs")
 }
 
 // isPathGoName reports whether the Go name of a field suggests a path.
 // encoding/json names an untagged field by its Go name, which the rule above
 // cannot see.
 func isPathGoName(name string) bool {
-	return strings.HasSuffix(name, "Path") || strings.HasSuffix(name, "Paths")
+	return strings.HasSuffix(name, "Path") || strings.HasSuffix(name, "Paths") || strings.HasSuffix(name, "Globs")
 }
 
 type jsonField struct {
@@ -75,7 +70,7 @@ func structJSONFields(fset *token.FileSet, typeName string, st *ast.StructType) 
 
 // rawPathViolations returns one message per path field in src that has no
 // valid sibling, and how many path fields it checked.
-func rawPathViolations(t *testing.T, filename, src string, exempt map[string]string) (violations []string, checked int) {
+func rawPathViolations(t *testing.T, filename, src string) (violations []string, checked int) {
 	t.Helper()
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, src, 0)
@@ -105,7 +100,7 @@ func rawPathViolations(t *testing.T, filename, src string, exempt map[string]str
 					break nearest
 				}
 			}
-			v, c := structPathViolations(fset, typeName, st, exempt)
+			v, c := structPathViolations(fset, typeName, st)
 			violations, checked = append(violations, v...), checked+c
 		}
 		return true
@@ -113,10 +108,10 @@ func rawPathViolations(t *testing.T, filename, src string, exempt map[string]str
 	return violations, checked
 }
 
-func structPathViolations(fset *token.FileSet, typeName string, st *ast.StructType, exempt map[string]string) (violations []string, checked int) {
+func structPathViolations(fset *token.FileSet, typeName string, st *ast.StructType) (violations []string, checked int) {
 	fields, violations := structJSONFields(fset, typeName, st)
 	for name, f := range fields {
-		if !isPathFieldName(name) || exempt[typeName+"."+name] != "" {
+		if !isPathFieldName(name) {
 			continue
 		}
 		checked++
@@ -134,7 +129,7 @@ func structPathViolations(fset *token.FileSet, typeName string, st *ast.StructTy
 	return violations, checked
 }
 
-func TestEveryResponsePathFieldHasABase64Sibling(t *testing.T) {
+func TestEveryPathFieldHasABase64Sibling(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
@@ -150,14 +145,14 @@ func TestEveryResponsePathFieldHasABase64Sibling(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		v, c := rawPathViolations(t, name, string(src), rpGuardExempt)
+		v, c := rawPathViolations(t, name, string(src))
 		all, checked = append(all, v...), checked+c
 	}
 	for _, v := range all {
 		t.Error(v)
 	}
-	if checked < 10 {
-		t.Errorf("the scan checked %d path fields, want at least 10: it reads too little", checked)
+	if checked < 16 {
+		t.Errorf("the scan checked %d path fields, want at least 16: it reads too little", checked)
 	}
 }
 
@@ -221,8 +216,16 @@ type multi struct {
 type notAPath struct {
 	Name string ` + "`json:\"name\"`" + `
 }
-type exempt struct {
-	Paths []string ` + "`json:\"paths\"`" + `
+type okGlobs struct {
+	Include []string ` + "`json:\"include_globs\"`" + `
+	IncludeBase64 []string ` + "`json:\"include_globs_base64,omitempty\"`" + `
+}
+type missingGlobs struct {
+	Include []string ` + "`json:\"include_globs\"`" + `
+}
+type optionalPath struct {
+	Path string ` + "`json:\"path\"`" + `
+	PathBase64 *string ` + "`json:\"path_base64,omitempty\"`" + `
 }
 var packageVar = struct {
 	P string ` + "`json:\"path\"`" + `
@@ -236,13 +239,14 @@ func f() {
 	}{}
 }
 `
-	got, checked := rawPathViolations(t, "x.go", src, map[string]string{"exempt.paths": "request input"})
+	got, checked := rawPathViolations(t, "x.go", src)
 	for _, want := range []string{
 		"missing.path has no path_base64 sibling",
 		"missingList.paths has no paths_base64 sibling",
 		"wrongType.path: sibling is []string, want string",
 		"alwaysPresent.original_path: sibling is not omitempty or omitzero",
 		"nestedMissing.old_path has no old_path_base64 sibling",
+		"missingGlobs.include_globs has no include_globs_base64 sibling",
 		"namedMissing.path has no path_base64 sibling",
 		"pointerMissing.paths has no paths_base64 sibling",
 		"untagged.OldPath has no json name",
@@ -258,12 +262,13 @@ func f() {
 	if !slicesContainsSuffix(got, "has no paths_base64 sibling") || !strings.Contains(strings.Join(got, "\n"), "struct at x.go:") {
 		t.Errorf("no violation for the unnamed struct in %q", got)
 	}
-	if len(got) != 12 {
-		t.Errorf("violations %d (%q), want 12", len(got), got)
+	if len(got) != 13 {
+		t.Errorf("violations %d (%q), want 13", len(got), got)
 	}
-	// ok holds 5 path fields (one nested), and 11 other types 1 each.
-	if checked != 16 {
-		t.Errorf("checked %d path fields, want 16", checked)
+	// ok holds 5 path fields (one nested), okGlobs and optionalPath 1 each,
+	// and 12 other types 1 each.
+	if checked != 19 {
+		t.Errorf("checked %d path fields, want 19", checked)
 	}
 }
 

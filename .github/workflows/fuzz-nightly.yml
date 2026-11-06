@@ -52,6 +52,9 @@ jobs:
             ./internal/jobs:FuzzPackObjectCount
             ./internal/api:FuzzClientKey
             ./internal/api:FuzzCoreCursor
+            ./internal/api:FuzzDecodeRawPath
+            ./internal/api:FuzzDecodeRawPatterns
+            ./internal/api:FuzzCommitPackFilePath
             ./internal/api:FuzzApplyRejection
             ./internal/api:FuzzPatchModeError
             ./internal/sync:FuzzParsePushRejections

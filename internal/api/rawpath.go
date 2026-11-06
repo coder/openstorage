@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"io"
 	"slices"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -19,6 +20,10 @@ import (
 // Every sibling field is `omitempty` or `omitzero`, so a response for names
 // that are valid UTF-8 stays byte for byte what it was. The path-field guard
 // (rawpath_guard_test.go) fails the build when a path field has no sibling.
+//
+// A request that names a path has the same sibling, which holds the base64 of
+// the raw bytes: paths_base64 and *_globs_base64 in grep and archive bodies,
+// path_base64 in a commit-pack file operation. decodeRawPath reads them.
 
 // rawPathBase64 returns the base64 of p's bytes when p is not valid UTF-8,
 // and "" when p is valid UTF-8 (including the empty path).
@@ -76,4 +81,31 @@ func (s base64JSONString) writeJSONItem(w io.Writer) error {
 
 func anyInvalidUTF8(paths []string) bool {
 	return slices.ContainsFunc(paths, func(p string) bool { return !utf8.ValidString(p) })
+}
+
+// decodeRawPath returns the bytes of s when s is canonical padded standard
+// base64. Go's decoder alone also accepts CR and LF inside the text and
+// non-zero padding bits, so two texts could name one path.
+func decodeRawPath(s string) (string, bool) {
+	raw, err := base64.StdEncoding.Strict().DecodeString(s)
+	if err != nil || base64.StdEncoding.EncodeToString(raw) != s {
+		return "", false
+	}
+	return string(raw), true
+}
+
+// decodeRawPatterns decodes the elements of a request list such as
+// paths_base64. Each decoded value must pass the check that the plain list
+// applies: not blank, and no NUL byte. bad is the index of the first
+// element that fails, or -1.
+func decodeRawPatterns(list []string) (decoded []string, bad int) {
+	decoded = make([]string, 0, len(list))
+	for i, enc := range list {
+		p, ok := decodeRawPath(enc)
+		if !ok || strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
+			return nil, i
+		}
+		decoded = append(decoded, p)
+	}
+	return decoded, -1
 }

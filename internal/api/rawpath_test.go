@@ -37,6 +37,8 @@ const (
 // eight, c2 (main) renames rpOld to rpNew and adds rpBin. Branch base is c1.
 type rpFixture struct {
 	e       *testEnv
+	org     string
+	repoURL string
 	token   string
 	c1, c2  string
 	content map[string]string // name -> file content at c2
@@ -64,7 +66,7 @@ func rpBuild(t *testing.T, e *testEnv) *rpFixture {
 	}
 	dir := t.TempDir()
 	coreGit(t, dir, "init", "-q", "-b", "main", ".")
-	fx := &rpFixture{e: e, content: map[string]string{}}
+	fx := &rpFixture{e: e, org: org, repoURL: repoURL, content: map[string]string{}}
 	stage := func(name, content string) {
 		rpStage(t, dir, name, content)
 		fx.content[name] = content

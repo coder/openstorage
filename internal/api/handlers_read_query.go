@@ -580,11 +580,16 @@ type grepRequestBody struct {
 	Rev       string   `json:"rev"` // legacy alias (openapi); `ref` wins
 	Ephemeral bool     `json:"ephemeral"`
 	Paths     []string `json:"paths"`
+	// PathsBase64 and the *_base64 globs hold the base64 of raw bytes, for
+	// names that are not valid UTF-8. They add to the plain lists (#587).
+	PathsBase64 []string `json:"paths_base64,omitempty"`
 
 	FileFilters struct {
-		IncludeGlobs     []string `json:"include_globs"`
-		ExcludeGlobs     []string `json:"exclude_globs"`
-		ExtensionFilters []string `json:"extension_filters"`
+		IncludeGlobs       []string `json:"include_globs"`
+		IncludeGlobsBase64 []string `json:"include_globs_base64,omitempty"`
+		ExcludeGlobs       []string `json:"exclude_globs"`
+		ExcludeGlobsBase64 []string `json:"exclude_globs_base64,omitempty"`
+		ExtensionFilters   []string `json:"extension_filters"`
 	} `json:"file_filters"`
 	Context struct {
 		Before *int `json:"before"`
@@ -653,6 +658,20 @@ func decodeGrepCursor(cursor string) (commit, path string, line int, err error) 
 		return "", "", 0, fmt.Errorf("invalid cursor")
 	}
 	return parts[0], parts[1], n, nil
+}
+
+// mergeRawPatterns appends the decoded elements of a <field>_base64 request
+// list to the plain list it stands for. A bad element is a 400 that names
+// it, and mergeRawPatterns reports false.
+func mergeRawPatterns(w http.ResponseWriter, field string, encoded []string, into *[]string) bool {
+	decoded, bad := decodeRawPatterns(encoded)
+	if bad >= 0 {
+		name := field + "." + strconv.Itoa(bad)
+		writeInvalidField(w, name, "must be the base64 of a non-empty name", "invalid "+name)
+		return false
+	}
+	*into = append(*into, decoded...)
+	return true
 }
 
 // grepFileWanted applies the request's path prefixes and file filters to
@@ -771,6 +790,19 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	for i, p := range body.Paths {
 		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
 			writeInvalidField(w, "paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p))
+			return
+		}
+	}
+	for _, in := range []struct {
+		field string
+		list  []string
+		into  *[]string
+	}{
+		{"paths_base64", body.PathsBase64, &body.Paths},
+		{"file_filters.include_globs_base64", body.FileFilters.IncludeGlobsBase64, &body.FileFilters.IncludeGlobs},
+		{"file_filters.exclude_globs_base64", body.FileFilters.ExcludeGlobsBase64, &body.FileFilters.ExcludeGlobs},
+	} {
+		if !mergeRawPatterns(w, in.field, in.list, in.into) {
 			return
 		}
 	}
@@ -919,11 +951,13 @@ truncated:
 // --- POST /api/v1/repos/archive (2d) --------------------------------------
 
 type archiveRequestBody struct {
-	Ref          string   `json:"ref"`
-	IncludeGlobs []string `json:"include_globs"`
-	ExcludeGlobs []string `json:"exclude_globs"`
-	MaxBlobSize  *int64   `json:"max_blob_size"`
-	Archive      struct {
+	Ref                string   `json:"ref"`
+	IncludeGlobs       []string `json:"include_globs"`
+	IncludeGlobsBase64 []string `json:"include_globs_base64,omitempty"`
+	ExcludeGlobs       []string `json:"exclude_globs"`
+	ExcludeGlobsBase64 []string `json:"exclude_globs_base64,omitempty"`
+	MaxBlobSize        *int64   `json:"max_blob_size"`
+	Archive            struct {
 		Prefix string `json:"prefix"`
 	} `json:"archive"`
 }
@@ -977,6 +1011,18 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 				writeInvalidField(w, list.name+"."+strconv.Itoa(i), "must be a non-empty glob", fmt.Sprintf("invalid glob %q", glob))
 				return
 			}
+		}
+	}
+	for _, in := range []struct {
+		field string
+		list  []string
+		into  *[]string
+	}{
+		{"include_globs_base64", body.IncludeGlobsBase64, &body.IncludeGlobs},
+		{"exclude_globs_base64", body.ExcludeGlobsBase64, &body.ExcludeGlobs},
+	} {
+		if !mergeRawPatterns(w, in.field, in.list, in.into) {
+			return
 		}
 	}
 	// Reject prefixes that could make extracted entries escape the
