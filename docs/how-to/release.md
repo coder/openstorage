@@ -121,6 +121,10 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    [`scripts/check-apply-messages.sh`](../../scripts/check-apply-messages.sh) inside the
    image, because the image's Git is Alpine's and the server reads its patch refusals by
    their words (a tag cut before that script landed skips this check with a notice).
+   If it fails, Alpine's Git words a refusal differently from the words that `internal/api`
+   reads. A new dispatch builds again and passes only if Alpine has since served a Git whose
+   words match. Otherwise teach `internal/api` the new words, update the cases in
+   `internal/api/testdata/applymsg`, and cut a new release.
    Last, it runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
 
 2. After that run is green, request the push:
@@ -186,10 +190,10 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 release. A package admin can delete the bad version in the package settings.
 
 **Before deleting an untagged package version,** check that no tag needs it. The untagged
-versions that a run leaves are the staged indexes. A tagged multi-platform image points at
-per-platform manifests, and a registry may list those as untagged versions too. Deleting
-one of those breaks the tag. List what a tag needs, and delete only a version whose digest
-is not in that list for any tag you keep:
+versions that a run leaves are the staged indexes, and a registry may list the image and
+attestation manifests under them as untagged versions too. A tagged multi-platform image
+points at those same manifests, so deleting one of them breaks the tag. List what a tag
+needs, and delete only a version whose digest is not in that list for any tag you keep:
 
 ```sh
 docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z --format '{{json .Manifest}}' | jq -r '.manifests[].digest'
