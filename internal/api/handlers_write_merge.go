@@ -1056,8 +1056,7 @@ const wmMaxPathspecBytes = 64 << 10
 // A path of at most wmMaxPathspecBytes takes one ls-tree. A longer path is
 // cut at slashes into chunks of that size, and each chunk is looked up in
 // the tree that the previous chunk named. A single component longer than the
-// limit cannot be named in argv at all, so it is found in the listing of its
-// directory instead.
+// limit is not named in argv: it is found in the listing of its directory.
 func wmTreePathEntry(ctx context.Context, sc *wcScratch, tree, path string) (wmStageEntry, error) {
 	assertf(ref.ValidSHA(tree) && path != "", "wmTreePathEntry: bad inputs %q %q", tree, path)
 	dir, rest := tree, path
