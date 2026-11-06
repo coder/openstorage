@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/base64"
+	"io"
 	"slices"
 	"unicode/utf8"
 )
@@ -44,6 +45,33 @@ func rawPathsBase64(paths []string) []string {
 // encodeRawPath is the base64 of p's bytes, whether or not p is valid UTF-8.
 func encodeRawPath(p string) string {
 	return base64.StdEncoding.EncodeToString([]byte(p))
+}
+
+// base64JSONString is a streamed list item: the base64 of its bytes as a JSON
+// string. It writes through a base64 encoder in fixed chunks, so a path of any
+// length costs no second string and no marshal buffer. Base64 text holds no
+// character that JSON escapes, so the bytes equal json.Marshal of
+// encodeRawPath.
+type base64JSONString string
+
+func (s base64JSONString) writeJSONItem(w io.Writer) error {
+	if _, err := w.Write([]byte{'"'}); err != nil {
+		return err
+	}
+	enc := base64.NewEncoder(base64.StdEncoding, w)
+	var chunk [32 << 10]byte
+	for rest := string(s); rest != ""; {
+		n := copy(chunk[:], rest)
+		rest = rest[n:]
+		if _, err := enc.Write(chunk[:n]); err != nil {
+			return err
+		}
+	}
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	_, err := w.Write([]byte{'"'})
+	return err
 }
 
 func anyInvalidUTF8(paths []string) bool {

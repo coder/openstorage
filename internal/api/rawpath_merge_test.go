@@ -8,9 +8,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -222,5 +224,65 @@ func TestMergeConflictBodyStreams(t *testing.T) {
 				t.Fatalf("%s: conflict_paths_base64[%d] = %q, want the base64 of %q", name, i, enc, list[i])
 			}
 		}
+	}
+}
+
+// TestBase64JSONStringMatchesMarshal: the streamed item writes the bytes that
+// json.Marshal gives for the base64 string, for every length around the
+// 32 KiB chunk and for arbitrary bytes.
+func TestBase64JSONStringMatchesMarshal(t *testing.T) {
+	rng := rand.New(rand.NewPCG(587, 1))
+	var inputs []string
+	for _, n := range []int{0, 1, 2, 3, 4, 5, 1023, 1024, 1025, 32767, 32768, 32769, 65535, 65536, 65537, 100000} {
+		raw := make([]byte, n)
+		for i := range raw {
+			raw[i] = byte(rng.IntN(256))
+		}
+		inputs = append(inputs, string(raw), strings.Repeat("a", n), strings.Repeat("\xff", n))
+	}
+	for _, in := range inputs {
+		var got bytes.Buffer
+		if err := base64JSONString(in).writeJSONItem(&got); err != nil {
+			t.Fatalf("len %d: %v", len(in), err)
+		}
+		want, err := json.Marshal(encodeRawPath(in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.Bytes(), want) {
+			t.Fatalf("len %d: the streamed item differs from json.Marshal of the base64 string", len(in))
+		}
+	}
+}
+
+// discardResponse is a ResponseWriter that keeps nothing.
+type discardResponse struct{ header http.Header }
+
+func (d *discardResponse) Header() http.Header         { return d.header }
+func (d *discardResponse) Write(p []byte) (int, error) { return len(p), nil }
+func (d *discardResponse) WriteHeader(int)             {}
+
+// TestMergeConflictSiblingHoldsNoCopyOfAPath: one conflict path that is far
+// longer than the write chunk costs the same allocation whether or not it is
+// valid UTF-8. The sibling of an invalid path adds no second string and no
+// marshal buffer (#587).
+func TestMergeConflictSiblingHoldsNoCopyOfAPath(t *testing.T) {
+	const size = 8 << 20
+	alloc := func(path string) uint64 {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		wmFailConflict(&discardResponse{header: http.Header{}}, "merge has conflicts", []string{path}, strings.Repeat("a", 40))
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	valid := strings.Repeat("a", size)
+	invalid := valid[:size/2] + "\xff" + valid[size/2+1:]
+	if !strings.Contains(invalid, "\xff") || len(invalid) != size {
+		t.Fatal("bad fixture")
+	}
+	base, withSibling := alloc(valid), alloc(invalid)
+	if withSibling > base+(1<<20) {
+		t.Errorf("an invalid %d MiB path allocates %d MiB against %d MiB for a valid one: the sibling holds a copy of the path", size>>20, withSibling>>20, base>>20)
 	}
 }
