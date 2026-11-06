@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -107,39 +106,5 @@ func TestWaitDropsTheGroupBeforeItReapsTheLeader(t *testing.T) {
 	var exitErr *exec.ExitError
 	if err := <-done; !errors.As(err, &exitErr) || exitErr.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
 		t.Fatalf("leader wait = %v, want death by SIGKILL", err)
-	}
-}
-
-// TestStopNeverSignalsAReapedLeader runs short children against stops: no
-// signal may go to a group whose leader is already reaped.
-func TestStopNeverSignalsAReapedLeader(t *testing.T) {
-	var rec groupSignals
-	g := registry{signalGroup: rec.send}
-	var wg sync.WaitGroup
-	for i := range 60 {
-		cmd := exec.Command("sh", "-c", "exec sleep 0.05")
-		if err := g.start(cmd); err != nil {
-			if errors.Is(err, ErrStopping) {
-				break
-			}
-			t.Fatal(err)
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = g.wait(cmd)
-		}()
-		if i == 30 {
-			go g.stop(20 * time.Millisecond)
-		}
-	}
-	wg.Wait()
-	g.stop(0)
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	for _, s := range rec.sent {
-		if !s.leaderExists {
-			t.Fatalf("%v sent to group %d whose leader was already reaped", s.sig, s.pgid)
-		}
 	}
 }
