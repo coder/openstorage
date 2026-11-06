@@ -32,7 +32,6 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -469,17 +468,13 @@ func main() {
 	localMark := false
 	ast.Inspect(whe.Body, func(n ast.Node) bool {
 		if is, ok := n.(*ast.IfStmt); ok && is.Init != nil && strings.Contains(wireEvt.text(is.Init), "meta.LocalSchedule(ms)") {
-			as := wireEvt.assigns(is.Body)
-			for _, a := range as {
-				localMark = localMark || (a.lhs == "beforeCAS" && strings.Contains(a.rhs, "mark(ctx, repoID)"))
+			for _, a := range wireEvt.assigns(is.Body) {
+				localMark = localMark || (a.lhs == "beforeCAS" && strings.HasPrefix(a.rhs, "enqueueSyncOrForward("))
 			}
-			localMark = localMark && slices.ContainsFunc(as, func(a assign) bool {
-				return a.lhs == "mark" && strings.HasPrefix(a.rhs, "enqueueSyncOrForward(")
-			})
 		}
 		return true
 	})
-	mb.need(localMark, "wireHookEventing's local-schedule branch sets beforeCAS to call mark := enqueueSyncOrForward(...)")
+	mb.need(localMark, "wireHookEventing's local-schedule branch sets beforeCAS = enqueueSyncOrForward(...)")
 	bcWired := 0
 	for _, l := range wireEvt.literals(whe.Body, "events.RefStoreOptions") {
 		if strings.Contains(l, "BeforeCAS:") && strings.Contains(l, "beforeCAS") {
@@ -577,18 +572,19 @@ func main() {
 	restWired := false
 	ast.Inspect(bse.Body, func(n ast.Node) bool {
 		if is, ok := n.(*ast.IfStmt); ok && wireEvt.text(is.Cond) == "isPGURL(dbURL)" && is.Else != nil {
-			restWired = assigned(wireEvt.assigns(is.Else), "beforeCAS", "restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)")
+			restWired = assigned(wireEvt.assigns(is.Else), "heldBeforeCAS", "restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)")
 		}
 		return true
 	})
-	rm.need(restWired, "buildServeEventing's local branch sets beforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)")
+	rm.need(restWired, "buildServeEventing's local branch sets heldBeforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)")
 	serveWired := 0
 	for _, l := range wireEvt.literals(bse.Body, "events.RefStoreOptions") {
-		if strings.Contains(l, "BeforeCAS:") && strings.Contains(l, "beforeCAS") {
+		if strings.Contains(l, "HeldBeforeCAS:") && strings.Contains(l, "heldBeforeCAS") {
 			serveWired++
 		}
 	}
-	rm.need(serveWired == 1, "buildServeEventing passes BeforeCAS: beforeCAS to the decorator (found %d)", serveWired)
+	rm.need(serveWired == 1, "buildServeEventing passes HeldBeforeCAS: heldBeforeCAS to the decorator (found %d)", serveWired)
+	rm.need(first(refstore.calls(refstore.fn("RefStore", "runBeforeCAS").Body), "s.heldBeforeCAS").IsValid(), "RefStore.runBeforeCAS calls s.heldBeforeCAS")
 	ric := wireLocal.calls(wireLocal.fn("", "restIntentBeforeCAS").Body)
 	holdAt, markAt := first(ric, "githttp.HoldRef"), first(ric, "ms.RequestPush")
 	rm.need(holdAt.IsValid() && markAt.IsValid() && holdAt < markAt, "restIntentBeforeCAS calls githttp.HoldRef before ms.RequestPush")

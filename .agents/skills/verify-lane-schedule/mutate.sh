@@ -122,7 +122,7 @@ mut MarkBeforeCas internal/events/refstore.go '	release, err := s.runBeforeCAS(c
 	release()
 ' LaneSchedule.cfg 'Invariant NoLostForward is violated'
 mut StrictSnapshot internal/githttp/hydrate.go 'if refsErr == nil && skippedHeld && strictHeld {' 'if refsErr == nil && skippedHeld && strictHeld && false {' OtherWriters.cfg 'Invariant NoLostForward is violated'
-mut RestMarkBeforeCas cmd/openstorage/wire_eventing.go '		beforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)
+mut RestMarkBeforeCas cmd/openstorage/wire_eventing.go '		heldBeforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)
 ' '' OtherWriters.cfg 'Invariant NoLostForward is violated'
 echo "COUNT: $pass/$total mutations failed check.sh as expected (outputs in $work)"
 [ "$pass" = "$total" ]

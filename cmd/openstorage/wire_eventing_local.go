@@ -45,7 +45,7 @@ func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Wor
 	return queue, queue.Close, nil
 }
 
-// restIntentBeforeCAS is the serve decorator's BeforeCAS on the local
+// restIntentBeforeCAS is the serve decorator's HeldBeforeCAS on the local
 // schedule: a REST write to a forward_on_push repository by a caller that
 // may forward holds the ref in the cache, then records the forward intent
 // (RequestPush), before its authority CAS (ADR-50 amendment), as the update

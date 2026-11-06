@@ -358,7 +358,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 
 	cleanup := func() { queue.Close() }
 	newEvents := newEventsStore
-	var beforeCAS func(ctx context.Context, repoID, refName string) (func(), error)
+	var heldBeforeCAS func(ctx context.Context, repoID, refName string) (func(), error)
 	if isPGURL(dbURL) {
 		// worker.Requeue/RequeuePush stay nil on pg: river's insert-time
 		// uniqueness would swallow a requeue of a still-running job; the
@@ -387,7 +387,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		beforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)
+		heldBeforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep)
 			prev := cleanup
@@ -425,7 +425,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			Webhooks:        whStore,
 			EnqueueDelivery: queue.EnqueueWebhookDelivery,
 			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org, forwardDeniedFromContext, pullDeniedFromContext),
-			BeforeCAS:       beforeCAS,
+			HeldBeforeCAS:   heldBeforeCAS,
 			Logger:          logger,
 		})
 	}
@@ -526,7 +526,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	var (
 		enqueueDelivery func(ctx context.Context, d events.Delivery) error
 		enqueueSync     func(ctx context.Context, repoID string) error
-		beforeCAS       func(ctx context.Context, repoID, refName string) (func(), error)
+		beforeCAS       func(ctx context.Context, repoID string) error
 		newEvents       = newEventsStore
 	)
 	if isPGURL(dbURL) {
@@ -581,10 +581,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			// push hold is already in place, so a run that claims this
 			// intent waits for the push's publication. An error refuses
 			// the update.
-			mark := enqueueSyncOrForward(row, noop, noop, org, forwardDenied, pullDeniedFn)
-			beforeCAS = func(ctx context.Context, repoID, _ string) (func(), error) {
-				return func() {}, mark(ctx, repoID)
-			}
+			beforeCAS = enqueueSyncOrForward(row, noop, noop, org, forwardDenied, pullDeniedFn)
 			enqueueSync = enqueueSyncOrForward(row,
 				func(ctx context.Context, job upsync.Job) error {
 					return ms.RequestSync(ctx, job.RepoID)

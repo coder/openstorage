@@ -434,56 +434,81 @@ func TestEphemeralUpdatesEmitNothing(t *testing.T) {
 	}
 }
 
-// TestBeforeCASRunsFirstAndRefuses: BeforeCAS sees the base RepoID and
-// ref name of every non-ephemeral update before the inner CAS, and its
-// error refuses the update on both CAS methods: no CAS, no event, no sync
-// poke. An allowed update's release runs once, right after the inner CAS
-// and before the sync poke.
+// TestBeforeCASRunsFirstAndRefuses: BeforeCAS sees the base RepoID, and
+// HeldBeforeCAS the base RepoID and the ref name, of every non-ephemeral
+// update before the inner CAS. An error from either refuses the update on
+// both CAS methods: no CAS, no event, no sync poke. HeldBeforeCAS's release
+// runs once, right after the inner CAS and before the sync poke.
 func TestBeforeCASRunsFirstAndRefuses(t *testing.T) {
-	for _, gen := range []bool{false, true} {
-		for _, fail := range []bool{false, true} {
-			inner := &fakeInner{won: true}
-			env := newEmitEnv(t, inner, twoHooks())
-			var seen []string
-			released := 0
-			env.store.beforeCAS = func(_ context.Context, repoID, refName string) (func(), error) {
-				seen = append(seen, repoID+" "+refName)
-				if inner.cass != 0 {
-					t.Errorf("BeforeCAS ran after the inner CAS")
+	for _, held := range []bool{false, true} {
+		for _, gen := range []bool{false, true} {
+			for _, fail := range []bool{false, true} {
+				inner := &fakeInner{won: true}
+				env := newEmitEnv(t, inner, twoHooks())
+				var seen []string
+				released := 0
+				step := func(repoID, refName string) error {
+					seen = append(seen, repoID+" "+refName)
+					if inner.cass != 0 {
+						t.Errorf("held=%v: the step ran after the inner CAS", held)
+					}
+					if fail {
+						return errors.New("intent write failed")
+					}
+					return nil
+				}
+				if held {
+					env.store.heldBeforeCAS = func(_ context.Context, repoID, refName string) (func(), error) {
+						if err := step(repoID, refName); err != nil {
+							return nil, err
+						}
+						return func() {
+							released++
+							if inner.cass != 1 || len(env.syncPokes) != 0 {
+								t.Errorf("release ran with %d inner CASes and %d sync pokes; want right after the CAS", inner.cass, len(env.syncPokes))
+							}
+						}, nil
+					}
+				} else {
+					env.store.beforeCAS = func(_ context.Context, repoID string) error {
+						return step(repoID, "-")
+					}
+				}
+				cas := func(repoKey, refName string) (bool, error) {
+					if gen {
+						won, _, err := env.store.CASRefGen(context.Background(), repoKey, refName, shaA, shaB)
+						return won, err
+					}
+					return env.store.CASRef(context.Background(), repoKey, refName, shaA, shaB)
+				}
+				won, err := cas("repo_abc123+import", "refs/heads/main")
+				wantReleased := 0
+				if held && !fail {
+					wantReleased = 1
 				}
 				if fail {
-					return nil, errors.New("intent write failed")
-				}
-				return func() {
-					released++
-					if inner.cass != 1 || len(env.syncPokes) != 0 {
-						t.Errorf("release ran with %d inner CASes and %d sync pokes; want right after the CAS", inner.cass, len(env.syncPokes))
+					if won || err == nil || inner.cass != 0 || len(env.deliveries) != 0 || len(env.syncPokes) != 0 {
+						t.Errorf("held=%v gen=%v: refused update = (won %v, err %v), %d inner CASes, %d deliveries, %d pokes; want refused with nothing written",
+							held, gen, won, err, inner.cass, len(env.deliveries), len(env.syncPokes))
 					}
-				}, nil
-			}
-			cas := func(repoKey, refName string) (bool, error) {
-				if gen {
-					won, _, err := env.store.CASRefGen(context.Background(), repoKey, refName, shaA, shaB)
-					return won, err
+				} else if !won || err != nil || inner.cass != 1 {
+					t.Errorf("held=%v gen=%v: allowed update = (won %v, err %v), %d inner CASes", held, gen, won, err, inner.cass)
 				}
-				return env.store.CASRef(context.Background(), repoKey, refName, shaA, shaB)
-			}
-			won, err := cas("repo_abc123+import", "refs/heads/main")
-			if fail {
-				if won || err == nil || inner.cass != 0 || len(env.deliveries) != 0 || len(env.syncPokes) != 0 {
-					t.Errorf("gen=%v: refused update = (won %v, err %v), %d inner CASes, %d deliveries, %d pokes; want refused with nothing written",
-						gen, won, err, inner.cass, len(env.deliveries), len(env.syncPokes))
+				if released != wantReleased {
+					t.Errorf("held=%v gen=%v fail=%v: %d releases, want %d", held, gen, fail, released, wantReleased)
 				}
-			} else if !won || err != nil || inner.cass != 1 || released != 1 {
-				t.Errorf("gen=%v: allowed update = (won %v, err %v), %d inner CASes, %d releases", gen, won, err, inner.cass, released)
-			}
-			if len(seen) != 1 || seen[0] != "repo_abc123 refs/heads/main" {
-				t.Errorf("gen=%v fail=%v: BeforeCAS saw %v, want the base RepoID and the ref once", gen, fail, seen)
-			}
-			// Ephemeral updates never forward, so BeforeCAS never sees them.
-			seen = nil
-			if _, err := cas("repo_abc123+ephemeral", "refs/heads/main"); err != nil || len(seen) != 0 {
-				t.Errorf("gen=%v fail=%v: ephemeral update = %v, BeforeCAS saw %v", gen, fail, err, seen)
+				want := "repo_abc123 -"
+				if held {
+					want = "repo_abc123 refs/heads/main"
+				}
+				if len(seen) != 1 || seen[0] != want {
+					t.Errorf("held=%v gen=%v fail=%v: the step saw %v, want [%s]", held, gen, fail, seen, want)
+				}
+				// Ephemeral updates never forward, so neither step sees them.
+				seen = nil
+				if _, err := cas("repo_abc123+ephemeral", "refs/heads/main"); err != nil || len(seen) != 0 {
+					t.Errorf("held=%v gen=%v fail=%v: ephemeral update = %v, the step saw %v", held, gen, fail, err, seen)
+				}
 			}
 		}
 	}

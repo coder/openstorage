@@ -1,6 +1,6 @@
 ---
 name: verify-lane-schedule
-description: Model-check the local push-lane schedule (ADR-50: meta.LocalScheduleStore on SQLite and S3-WAL, sync.Worker.RunPush, LocalScheduler) with TLA+ and TLC, so no interleaving of git pushes, push-upstream calls, claims, steals, retries, restores, crashes and shutdown loses an accepted push's forward, downgrades a force request, or delays an explicit request. Use before you merge any change to RequestPush, RequestPushNow, ClaimDuePush, FinishPushOutcome, beginPush, RunPush, localPushOutcome, waitPublication, the shutdown restore, events.RefStore (BeforeCAS, emitPush), enqueueSyncOrForward, wireHookEventing, restIntentBeforeCAS, or the push-hold code (HoldRef, reservePushHolds, referenceTransactionHook, Hydrate's held-ref skip and its strict sync fetch); and whenever check.sh says STALE.
+description: Model-check the local push-lane schedule (ADR-50: meta.LocalScheduleStore on SQLite and S3-WAL, sync.Worker.RunPush, LocalScheduler) with TLA+ and TLC, so no interleaving of git pushes, push-upstream calls, claims, steals, retries, restores, crashes and shutdown loses an accepted push's forward, downgrades a force request, or delays an explicit request. Use before you merge any change to RequestPush, RequestPushNow, ClaimDuePush, FinishPushOutcome, beginPush, RunPush, localPushOutcome, waitPublication, the shutdown restore, events.RefStore (BeforeCAS, HeldBeforeCAS, emitPush), enqueueSyncOrForward, wireHookEventing, restIntentBeforeCAS, or the push-hold code (HoldRef, reservePushHolds, referenceTransactionHook, Hydrate's held-ref skip and its strict sync fetch); and whenever check.sh says STALE.
 ---
 
 # Verify the local push-lane schedule
@@ -80,9 +80,9 @@ The model (`model/LaneSchedule.tla`) is a hand-written description of the code. 
    | `RunPassesForce` | `RunPush` takes `force` from its claim and passes `Force: force` in every restore outcome (publication wait, stale held snapshot, shutdown); `localPushOutcome` passes it in the retry outcome | `ForceKept` |
    | `WaitBeforeSnapshot` | `RunPush` calls `w.waitPublication` before `w.transferPush`, and `buildLocalSyncQueue` wires it to `githttp.WaitForPushPublication` | `NoLostForward` |
    | `ShutdownRestores` | `RunPush`'s `if runErr != nil && shutdownAborted(ctx)` branch restores through `w.restoreForShutdown` with `meta.OutcomeRestore`, before `localPushOutcome` | `NoLostForward` |
-   | `MarkBeforeCas` | `events.RefStore.CASRef` and `CASRefGen` return `runBeforeCAS`'s error before the inner CAS, and `runBeforeCAS` calls the `BeforeCAS` option; `wireHookEventing`'s local-schedule branch sets it to call `mark := enqueueSyncOrForward(...)` and passes `BeforeCAS: beforeCAS`; `updateHook` reserves the ref's hold (`reservePushHoldsCovering`) before `store.CASRefGen` | `NoLostForward` |
+   | `MarkBeforeCas` | `events.RefStore.CASRef` and `CASRefGen` return `runBeforeCAS`'s error before the inner CAS, and `runBeforeCAS` calls the `BeforeCAS` option; `wireHookEventing`'s local-schedule branch sets it to `enqueueSyncOrForward(...)` and passes `BeforeCAS: beforeCAS`; `updateHook` reserves the ref's hold (`reservePushHoldsCovering`) before `store.CASRefGen` | `NoLostForward` |
    | `StrictSnapshot` | `Server.hydrate` hydrates strictly for an upload-pack with a sync claim on a `StrictSyncFetch` server, and serve sets `StrictSyncFetch` from `meta.LocalSchedule`; `hydrateRefs` takes the held-skip short cuts only under `!strictHeld` and returns `ErrHeldRefStale` when a strict sync skipped a held ref; `hydrateFailed` answers it with 423 Locked; `transferPush` wraps `errHeldRefStale` when `heldRefStale(stderr)` sees `HTTP 423`; `RunPush` then restores through `w.restoreLocal` with `meta.OutcomeRestore`, before `localPushOutcome` | `NoLostForward` |
-   | `RestMarkBeforeCas` | `buildServeEventing`'s local branch sets `beforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)` and passes `BeforeCAS: beforeCAS`; `restIntentBeforeCAS` calls `githttp.HoldRef` before `ms.RequestPush`; `HoldRef` reserves the hold (`reservePushHolds`); `RefStore.CASRef` and `CASRefGen` call `release()` after the inner CAS | `NoLostForward` |
+   | `RestMarkBeforeCas` | `buildServeEventing`'s local branch sets `heldBeforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)` and passes `HeldBeforeCAS: heldBeforeCAS`; `runBeforeCAS` calls it; `restIntentBeforeCAS` calls `githttp.HoldRef` before `ms.RequestPush`; `HoldRef` reserves the hold (`reservePushHolds`); `RefStore.CASRef` and `CASRefGen` call `release()` after the inner CAS | `NoLostForward` |
 
    The "property that fails" column is measured: each guard was broken once in the real code, and check.sh failed with the first property listed (see [Validation](#validation)). For the two rows that list `NoLostForward` second, a one-off model run with that fact FALSE and `NoLostForward` as the only invariant of `LaneSchedule.cfg` failed it too. No script reruns that second result.
 
@@ -99,7 +99,7 @@ Each TLA+ action names the Go call it stands for:
 | `WPoke` | `events.RefStore.emitPush` pokes the sync seam after the CAS: the same `RequestPush` behind the same gates |
 | `WPublish` | receive-pack commits the cache ref; `referenceTransactionHook` releases the hold (`appendPushReleased`) |
 | `WCrash` | after the CAS, the hook or receive-pack dies (serve's shutdown kills git children too), or the poke's `RequestPush` returns an error, which `emitPush` only logs as "sync poke lost" |
-| `RReserve`, `RMark` | a REST write (`internal/api` handlers' `CASRef` through `events.RefStore`) first runs `BeforeCAS`: `restIntentBeforeCAS` holds the ref (`githttp.HoldRef`), then runs `RequestPush(repo, false)`. A write in `QuietRestWriters` (forward denied) takes no hold and records nothing |
+| `RReserve`, `RMark` | a REST write (`internal/api` handlers' `CASRef` through `events.RefStore`) first runs `HeldBeforeCAS`: `restIntentBeforeCAS` holds the ref (`githttp.HoldRef`), then runs `RequestPush(repo, false)`. A write in `QuietRestWriters` (forward denied) takes no hold and records nothing |
 | `RCas`, `RRelease` | the REST write's authority CAS (no cache update), then the hold's `release` when the CAS returns |
 | `RPoke` | `emitPush`'s poke after the CAS, through the serve queue, behind the same gates |
 | `RAbort`, `RCrashRest` | the REST write's read, hold, intent write or CAS fails, or serve dies before the CAS: nothing is accepted. Or, after the CAS, serve dies or the poke's `RequestPush` fails |
@@ -220,7 +220,7 @@ It needs what check.sh needs, plus git, bash 4 or newer, and python3, and took a
 | `errors.Is(runErr, ErrShutdown)` instead of `shutdownAborted(ctx)` in `RunPush` (a cancelled git child returns `context.Canceled`) | `ShutdownRestores` | `LaneSchedule.cfg` | `NoLostForward` |
 | move `RefStore.CASRefGen`'s `runBeforeCAS` call after the inner CAS | `MarkBeforeCas` | `LaneSchedule.cfg` | `NoLostForward` |
 | `&& false` on `hydrateRefs`'s `refsErr == nil && skippedHeld && strictHeld` | `StrictSnapshot` | `OtherWriters.cfg` | `NoLostForward` |
-| drop `beforeCAS = restIntentBeforeCAS(...)` from `buildServeEventing` | `RestMarkBeforeCas` | `OtherWriters.cfg` | `NoLostForward` |
+| drop `heldBeforeCAS = restIntentBeforeCAS(...)` from `buildServeEventing` | `RestMarkBeforeCas` | `OtherWriters.cfg` | `NoLostForward` |
 
 With every fact TRUE in the code, setting each fact FALSE in the model alone fails the same property, so no fact is dead weight. `mutate.sh --model` reruns this with `check.sh --fact` and edits no code; it needs no python3 and ends with `COUNT: 12/12`. `StrictSnapshot` needs `OtherWriters.cfg`: a holding push that records intent before its CAS leaves a pending request, so only a quiet push (forward denied) turns the stale snapshot into a lost forward. The probe fails on the current code, and the property configs pass with the bounds in [Scope](#scope).
 
@@ -234,7 +234,7 @@ Every declaration in these files is covered:
 - `internal/meta/s3walmeta_schedule.go`, `internal/meta/s3walmeta_eventing.go` (the S3-WAL lane transitions)
 - `internal/sync/worker_push.go`, `internal/sync/worker.go`, `internal/sync/local_schedule.go` (runs, retries, leases, the sweep, the drain, failure classification, the stale-held restore)
 - `internal/sync/metastore.go`, `internal/sync/pushstatus.go` (the store adapter's error mapping, the upstream rejection parser)
-- `internal/events/refstore.go` (the intent decorator around the ref CAS, and its `BeforeCAS` step)
+- `internal/events/refstore.go` (the intent decorator around the ref CAS, and its `BeforeCAS` and `HeldBeforeCAS` steps)
 - `cmd/openstorage/wire_eventing.go`, `cmd/openstorage/wire_eventing_local.go` (hook and serve wiring, forward gates, the intent before the CAS, the sync-claim suppression)
 - `internal/api/handlers_sync.go` (`push-upstream` and its `RequestPushNow`)
 - `internal/githttp/publication.go`, `internal/githttp/hydrate.go`, `internal/githttp/hook.go` (push holds, their release, the publication wait, the held-ref skip and the strict sync fetch)

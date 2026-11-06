@@ -178,7 +178,7 @@ WCrash(w) ==
 
 -----------------------------------------------------------------------------
 (* REST writes: an internal/api handler's CASRef through events.RefStore.  *)
-(* Its BeforeCAS (restIntentBeforeCAS) holds the ref (githttp.HoldRef) and *)
+(* HeldBeforeCAS (restIntentBeforeCAS) holds the ref (githttp.HoldRef) and *)
 (* records the intent (RequestPush), unless the caller may not forward     *)
 (* (forwardDeniedFromContext). The CAS changes the authority only: no      *)
 (* cache update. The hold ends when the CAS returns, then emitPush pokes   *)
