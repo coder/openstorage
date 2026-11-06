@@ -498,8 +498,9 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	//
 	// Neither the log line nor the refusal carries err: git relays the
 	// hook's stderr and its error to the pusher, and a store error names
-	// the database host, user and name, or the S3 endpoint. serve logs
-	// the same store errors itself.
+	// the database host, user and name, or the S3 endpoint. serve logs a
+	// store error only when its own connection fails, so when only the
+	// hook's connection fails, no log carries the cause.
 	disabled := func(stage string, _ error) func() {
 		cleanup()
 		if envconfig.Getenv(githttp.EnvSyncClaim) != "" || hookCallerDeniedForward() {
