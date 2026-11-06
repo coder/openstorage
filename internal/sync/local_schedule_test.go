@@ -1156,7 +1156,10 @@ func TestLocalSchedulePublicationFence(t *testing.T) {
 			t.Fatalf("after a refused snapshot: row %+v attempt %d due %d; want force kept, attempt 1, due +%v, no new run",
 				r, attempt, due, localPublicationRetryDelay)
 		}
-		assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamFailed, EventPushUpstreamStarted)
+		// The refused run emits nothing, like a failed publication wait: a
+		// started event with no terminal event would show a run that never
+		// ends.
+		assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamFailed)
 		if got := upstreamHead(t, bare); got != before {
 			t.Fatalf("upstream changed after a refused snapshot: %q", got)
 		}
@@ -1166,6 +1169,8 @@ func TestLocalSchedulePublicationFence(t *testing.T) {
 		if r := f.row(t, repo); r.PushPending != 0 || r.PushSuccessCount != 1 || upstreamHead(t, bare) != head {
 			t.Fatalf("restored run did not forward: row %+v upstream %q want %q", r, upstreamHead(t, bare), head)
 		}
+		assertPushTypes(t, f.pushEvents(repo), EventPushUpstreamStarted, EventPushUpstreamFailed,
+			EventPushUpstreamStarted, EventPushUpstreamSucceeded)
 	})
 	t.Run("failed pull wait restores the request", func(t *testing.T) {
 		f := newLocalSchedFixture(t)
