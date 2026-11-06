@@ -481,16 +481,23 @@ class CitationTests(CheckerTestCase):
         self.assertEqual(result.returncode, 0)
 
     def test_javascript_every_line_terminator_ends_a_line_and_blocks_a_postfix_operator(self):
-        js = ("const a = x\r++\n  function viaCr() {}.x\n"
-              "const b = x\u2028++\n  function viaLs() {}.x\n"
+        # open() reads CR and CRLF as LF, so U+2028 and U+2029 are the line terminators that reach the reader.
+        js = ("const a = x\u2028++\n  function viaLs() {}.x\n"
+              "const b = x\u2029++\n  function viaPs() {}.x\n"
               "const c = x /*\u2029*/ ++\n  function viaComment() {}.x\n"
-              "const d = a[0]\r++\n  function viaBracket() {}.x\n"
-              "const e = x // note\r++\n  function viaLineComment() {}.x\n"
-              "const f = x++\r\nfunction afterCrlf() {}\r\nconst g = 1\rfunction afterCr() {}\n")
-        ok = ["afterCrlf", "afterCr"]
-        bad = ["viaCr", "viaLs", "viaComment", "viaBracket", "viaLineComment"]
+              "const d = a[0]\u2028++\n  function viaBracket() {}.x\n"
+              "const e = x // note\u2028++\n  function viaLineComment() {}.x\n"
+              "const f = x++\u2028function afterLs() {}\u2029const g = 1\nfunction afterPs() {}\n")
+        ok = ["afterLs", "afterPs"]
+        bad = ["viaLs", "viaPs", "viaComment", "viaBracket", "viaLineComment"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
+
+    def test_javascript_stop_line_counts_every_line_terminator(self):
+        js = "function before() {}\u2028const half = (a + b) / 2;\u2029function after() {}\n"
+        result = self.check_readme("[flow.js:before] [flow.js:after]\n", **{"pkg/flow.js": js})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[flow.js:after]"))
+        self.assertIn("the JavaScript reader stops at line 2, where it cannot tell a regex literal from a division", result.stdout)
 
     def test_javascript_reader_stays_linear_on_a_long_run_of_signs(self):
         js = "const v = " + "+-" * 50000 + "a\nfunction afterSigns() {}\n"
