@@ -8,13 +8,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.6
 	github.com/aws/smithy-go v1.28.7
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/lestrrat-go/jwx/v3 v3.3.0
 	github.com/moby/moby/api v1.56.1
 	github.com/prometheus/client_golang v1.25.0
-	github.com/riverqueue/river v0.50.0
-	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.50.0
-	github.com/riverqueue/river/rivertype v0.50.0
+	github.com/riverqueue/river v0.51.1
+	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.51.1
+	github.com/riverqueue/river/rivertype v0.51.1
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
@@ -95,8 +95,8 @@ require (
 	github.com/prometheus/common v0.72.1 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
-	github.com/riverqueue/river/riverdriver v0.50.0 // indirect
-	github.com/riverqueue/river/rivershared v0.50.0 // indirect
+	github.com/riverqueue/river/riverdriver v0.51.1 // indirect
+	github.com/riverqueue/river/rivershared v0.51.1 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.9 // indirect
 	github.com/sirupsen/logrus v1.10.2 // indirect

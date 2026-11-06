@@ -198,12 +198,14 @@ type Worker struct {
 	// LocalScheduler sweep turns due rows into runs.
 	Local LocalLanes
 
-	// WaitPublication, when non-nil (local mode, with Local set),
-	// blocks until no in-flight push still holds the repo's cache refs
-	// unpublished (githttp.WaitForPushPublication). A local run calls it
-	// after its claim and before its snapshot and started event: a hook
-	// records intent after the authority CAS but before receive-pack
-	// publishes the cache ref. A failed wait restores the consumed request.
+	// WaitPublication, when non-nil, blocks until no in-flight push
+	// still holds the repo's cache refs unpublished
+	// (githttp.WaitForPushPublication). A local run calls it after its
+	// claim and before its snapshot and started event, and so does a
+	// River push run: a hook records intent at the authority CAS, before
+	// receive-pack publishes the cache ref. A failed wait restores the
+	// consumed request. Without Local, Upstreams must be a
+	// ShutdownRestorer, and only RunPush waits.
 	WaitPublication func(ctx context.Context, repoID string) error
 
 	// DetachPoll is the cadence of the outbound push watchdog that
@@ -296,24 +298,27 @@ func (w *Worker) waitPublication(ctx context.Context, repoID string) error {
 	if w.WaitPublication == nil {
 		return nil
 	}
-	assertf(w.Local != nil, "WaitPublication requires the local schedule")
+	_, restores := w.Upstreams.(ShutdownRestorer)
+	assertf(w.Local != nil || restores, "WaitPublication needs the local schedule or a ShutdownRestorer")
 	wctx, cancel := context.WithTimeout(ctx, localPublicationWaitTimeout)
 	defer cancel()
 	return w.WaitPublication(wctx, repoID)
 }
 
-// restoreLocal ends a claimed local run whose publication wait failed: no
-// snapshot was taken and no event emitted, so the run hands its request
+// restoreLocal ends a claimed local run that got no fresh snapshot: its
+// publication wait failed (no event emitted yet), or a push run's loopback
+// fetch found a push-held ref stale (after its started event, like a
+// shutdown restore). Nothing was forwarded, so the run hands its request
 // back to the row (restore) instead of counting a run.
 func (w *Worker) restoreLocal(ctx context.Context, job Job, holder, lane string, waitErr error, finish func(ctx context.Context) (Upstream, error)) error {
-	w.Logger.Warn("publication wait failed; request restored for a later run",
+	w.Logger.Warn("no fresh snapshot; request restored for a later run",
 		"org", job.Org, "repo", job.RepoID, "lane", lane, "err", waitErr)
 	_, err := w.retryFinish(ctx, lane, job.RepoID, finish)
 	switch {
 	case errors.Is(err, ErrNotFound):
-		return nil // detached while waiting: nothing to restore
+		return nil // detached meanwhile: nothing to restore
 	case errors.Is(err, ErrClaimLost):
-		w.Logger.Warn("claim lost while waiting for publication; abandoning",
+		w.Logger.Warn("claim lost before the restore; abandoning",
 			"org", job.Org, "repo", job.RepoID, "lane", lane, "holder", holder)
 		return nil
 	case err != nil:
@@ -324,7 +329,9 @@ func (w *Worker) restoreLocal(ctx context.Context, job Job, holder, lane string,
 
 // Run executes one sync run for job. It returns an error for logging by the
 // queue; documented outcomes (detached, overlapping run, failed sync with an
-// emitted event) are not errors to the caller beyond that.
+// emitted event) are not errors to the caller beyond that. Two errors steer
+// River's sync job: ErrShutdown (keep the job) and ErrRepoGone (complete
+// it).
 func (w *Worker) Run(ctx context.Context, job Job) error {
 	w.assertReady()
 	assertf(job.Org != "" && job.RepoID != "", "Run: incomplete job %+v", job)
@@ -337,7 +344,11 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 
 	repo, err := w.Repos(ctx, job.Org, job.RepoID)
 	if errors.Is(err, ErrNotFound) {
-		return nil // repo deleted while queued: nothing to sync or emit
+		// Repo deleted while queued: nothing to sync or emit.
+		if w.Local != nil {
+			return nil
+		}
+		return fmt.Errorf("sync %s: %w", job.RepoID, ErrRepoGone)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve repo %s: %w", job.RepoID, err)

@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
@@ -214,6 +215,11 @@ type LFSReclaimer struct {
 	hydrateTimeout time.Duration    // per-member cap, shrinkable in tests
 	walkTimeout    time.Duration    // per-member walk cap, shrinkable in tests
 	passTimeout    time.Duration    // whole-pass cap, shrinkable in tests
+	// running admits one Run at a time on this reclaimer: the two fields below
+	// belong to the pass, not to the reclaimer. During a rolling upgrade an
+	// older binary's job on the default queue and a newer binary's job on its
+	// own queue can both reach one replica.
+	running atomic.Bool
 	// reapStale is the pass-local advisory demotion (issue #120): set at
 	// pass start when the sweeper's destructive-reap watermark is stale,
 	// so settlement skips retire transactions that would only refuse.
@@ -356,6 +362,11 @@ func gensFence(gens map[string]int64) int64 {
 // so the job backend records them.
 func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 	report := LFSReclaimReport{DryRun: !r.deleteEnabled}
+	if !r.running.CompareAndSwap(false, true) {
+		r.logger.Info("lfs reclaim: a pass is already running on this replica; this run does nothing")
+		return report, nil
+	}
+	defer r.running.Store(false)
 	// Whole-pass wall-clock cap (Codex round 19): per-member deadlines
 	// reset per repository and deadline-expired walks charge almost no
 	// budget, so time — not just work units — must bound the pass.

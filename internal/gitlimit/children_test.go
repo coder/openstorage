@@ -13,10 +13,15 @@ import (
 
 // TestGitChildrenStopKillsAfterGrace: a group that ignores SIGTERM gets
 // SIGKILL once the grace ends, grandchildren included, and stop refuses
-// later children. (The SIGTERM path runs in the e2e
+// later children. It runs the platform's wait and the wait of a platform
+// that cannot hold a leader. (The SIGTERM path runs in the e2e
 // TestServeDrainTimeoutStopsGitChildren.)
 func TestGitChildrenStopKillsAfterGrace(t *testing.T) {
-	var g registry
+	t.Run("platform", func(t *testing.T) { stopKillsAfterGrace(t, &registry{}) })
+	t.Run("leader cannot be held", func(t *testing.T) { stopKillsAfterGrace(t, &registry{hold: cannotHold}) })
+}
+
+func stopKillsAfterGrace(t *testing.T, g *registry) {
 	// The ignored SIGTERM is inherited by sleep across exec.
 	cmd := exec.Command("sh", "-c", "trap '' TERM; sleep 60 & echo $!; wait")
 	out, err := cmd.StdoutPipe()

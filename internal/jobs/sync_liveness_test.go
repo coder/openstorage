@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/coder/openstorage/internal/events"
@@ -258,6 +259,350 @@ func TestRiverSyncPendingSurvivesPreClaimFailure(t *testing.T) {
 	}
 }
 
+// A push run whose publication wait fails restores its claimed request
+// (sync.Worker.RunPush: RestorePush, then an error). The job must snooze,
+// and its re-run must claim the request again.
+func TestRiverPushRestoredRunSnoozesForRetry(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_restored", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test", ForwardOnPush: true,
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+
+	var attempts, finished atomic.Int32
+	pushRunner := func(ctx context.Context, job sync.Job) error {
+		holder := fmt.Sprintf("push-%d", attempts.Add(1))
+		if _, _, _, err := store.BeginPush(ctx, job.RepoID, holder, time.Minute); err != nil {
+			return err
+		}
+		if attempts.Load() == 1 {
+			if _, err := store.RestorePush(ctx, job.RepoID, holder, false); err != nil {
+				return err
+			}
+			return errors.New("publication wait failed")
+		}
+		finished.Add(1)
+		_, err := store.FinishPush(ctx, job.RepoID, holder, true)
+		return err
+	}
+
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, pushRunner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+
+	if err := store.RequestPush(ctx, "repo_restored", false); err != nil {
+		t.Fatalf("RequestPush: %v", err)
+	}
+	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: "repo_restored"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	waitFor(t, "re-run after the restored run", func() bool { return finished.Load() >= 1 })
+	up, err := store.GetUpstream(ctx, "repo_restored")
+	if err != nil {
+		t.Fatalf("GetUpstream: %v", err)
+	}
+	if up.PushPending != sync.PushPendingNone || up.PushRunCount != 1 {
+		t.Errorf("restored request not consumed by one counted run: %+v", up)
+	}
+}
+
+// failingUpstreams fails the failCall-th GetUpstream, counting from 1.
+type failingUpstreams struct {
+	*sync.MemStore
+	calls    atomic.Int32
+	failCall int32
+}
+
+func (s *failingUpstreams) GetUpstream(ctx context.Context, repoID string) (sync.Upstream, error) {
+	if s.calls.Add(1) == s.failCall {
+		return sync.Upstream{}, errors.New("database unreachable")
+	}
+	return s.MemStore.GetUpstream(ctx, repoID)
+}
+
+// A push run whose finish (or restore) write fails leaves its claim held
+// with the request it consumed. The job must snooze until the lease
+// expires, and its re-run must steal the claim and forward, also when the
+// worker's pre-run read or its first completion fails.
+func TestRiverPushFailedFinishKeepsJobUntilClaimExpires(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failCall int32
+		// The job waits for the lease, so the stealing run comes right
+		// after it: the failed run, the skip that a failed completion
+		// causes, then the steal.
+		maxAttempts int32
+	}{
+		{"plain", 0, 2},
+		{"pre_run_read_fails", 1, 2},
+		{"completion_fails_once", 2, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pgURL := livenessPG(t, ctx)
+
+			store := sync.NewMemStore()
+			if _, err := store.PutUpstream(ctx, sync.Upstream{
+				RepoID: "repo_held", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test", ForwardOnPush: true,
+			}); err != nil {
+				t.Fatalf("PutUpstream: %v", err)
+			}
+
+			var attempts, finished atomic.Int32
+			var stolenFrom atomic.Value
+			pushRunner := func(ctx context.Context, job sync.Job) error {
+				holder := fmt.Sprintf("push-%d", attempts.Add(1))
+				// Longer than the completion retry's snooze, so that a
+				// re-run can meet the claim unexpired.
+				_, force, stolen, err := store.BeginPush(ctx, job.RepoID, holder, 8*time.Second)
+				if errors.Is(err, sync.ErrPushInProgress) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				if holder == "push-1" {
+					return errors.New("finish push: database unreachable")
+				}
+				stolenFrom.Store(fmt.Sprintf("%s force=%v", stolen, force))
+				finished.Add(1)
+				_, err = store.FinishPush(ctx, job.RepoID, holder, true)
+				return err
+			}
+
+			upstreams := &failingUpstreams{MemStore: store, failCall: tc.failCall}
+			deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+			q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, pushRunner, upstreams, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("NewRiver: %v", err)
+			}
+			defer q.Close()
+
+			if err := store.RequestPush(ctx, "repo_held", true); err != nil {
+				t.Fatalf("RequestPush: %v", err)
+			}
+			if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: "repo_held"}); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+
+			for deadline := time.Now().Add(60 * time.Second); finished.Load() == 0; time.Sleep(50 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					up, _ := store.GetUpstream(ctx, "repo_held")
+					t.Fatalf("no re-run stole the held claim after %d attempts: %+v", attempts.Load(), up)
+				}
+			}
+			if got := stolenFrom.Load(); got != "push-1 force=true" {
+				t.Errorf("re-run stole %v, want push-1 force=true", got)
+			}
+			if n := attempts.Load(); n > tc.maxAttempts {
+				t.Errorf("%d runs before the steal, want at most %d: the job did not wait for the lease", n, tc.maxAttempts)
+			}
+			up, err := store.GetUpstream(ctx, "repo_held")
+			if err != nil {
+				t.Fatalf("GetUpstream: %v", err)
+			}
+			if up.PushSyncing || up.PushRunCount != 1 {
+				t.Errorf("held request not forwarded by one counted run: %+v", up)
+			}
+		})
+	}
+}
+
+// A push job whose repository was deleted completes, even though an
+// earlier run of it left the claim held: RunPush returns ErrRepoGone
+// before it could steal the claim, and the job has nothing left to do.
+func TestRiverPushDeletedRepoCompletesWithClaimHeld(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_gone", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test", ForwardOnPush: true,
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+	var attempts atomic.Int32
+	pushRunner := func(ctx context.Context, job sync.Job) error {
+		if attempts.Add(1) > 1 {
+			return fmt.Errorf("push %s: %w", job.RepoID, sync.ErrRepoGone)
+		}
+		if _, _, _, err := store.BeginPush(ctx, job.RepoID, "push-1", 2*time.Second); err != nil {
+			return err
+		}
+		return errors.New("finish push: database unreachable")
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, pushRunner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+	if err := store.RequestPush(ctx, "repo_gone", false); err != nil {
+		t.Fatalf("RequestPush: %v", err)
+	}
+	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: "repo_gone"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	conn, err := pgx.Connect(ctx, pgURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	waitFor(t, "the deleted repo's job to complete", func() bool {
+		var state string
+		err := conn.QueryRow(ctx, `SELECT state FROM river_job WHERE kind = 'upstream_push'`).Scan(&state)
+		return err == nil && state == "completed"
+	})
+	if n := attempts.Load(); n != 2 {
+		t.Fatalf("%d runs, want the failed run and one that found the repo gone", n)
+	}
+}
+
+// A sync run whose finish (or restore) write fails leaves its claim held
+// with the request it consumed, for example the mirror-back pull that a
+// forward marked. The job must snooze until the lease expires, and its
+// re-run must steal the claim and pull, also when the worker's pre-run
+// read or its first completion fails.
+func TestRiverSyncFailedFinishKeepsJobUntilClaimExpires(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		failCall    int32
+		maxAttempts int32 // the failed run, a skip after a failed completion, the steal
+	}{
+		{"plain", 0, 2},
+		{"pre_run_read_fails", 1, 2},
+		{"completion_fails_once", 2, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pgURL := livenessPG(t, ctx)
+
+			store := sync.NewMemStore()
+			if _, err := store.PutUpstream(ctx, sync.Upstream{
+				RepoID: "repo_pull_held", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test", ForwardOnPush: true,
+			}); err != nil {
+				t.Fatalf("PutUpstream: %v", err)
+			}
+
+			var attempts, finished atomic.Int32
+			var stolenFrom atomic.Value
+			syncRunner := func(ctx context.Context, job sync.Job) error {
+				holder := fmt.Sprintf("sync-%d", attempts.Add(1))
+				// Longer than the completion retry's snooze, so that a
+				// re-run can meet the claim unexpired.
+				_, stolen, err := store.BeginSync(ctx, job.RepoID, holder, 8*time.Second)
+				if errors.Is(err, sync.ErrSyncInProgress) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				if holder == "sync-1" {
+					return errors.New("finish sync: database unreachable")
+				}
+				stolenFrom.Store(stolen)
+				finished.Add(1)
+				_, err = store.FinishSync(ctx, job.RepoID, holder, true)
+				return err
+			}
+
+			upstreams := &failingUpstreams{MemStore: store, failCall: tc.failCall}
+			deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+			q, err := NewRiver(ctx, pgURL, deliverer, syncRunner, func(context.Context, sync.Job) error { return nil }, upstreams, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("NewRiver: %v", err)
+			}
+			defer q.Close()
+
+			// The mirror-back after a forward: marked, then enqueued.
+			if err := store.RequestSync(ctx, "repo_pull_held"); err != nil {
+				t.Fatalf("RequestSync: %v", err)
+			}
+			if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_pull_held"}); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+
+			for deadline := time.Now().Add(60 * time.Second); finished.Load() == 0; time.Sleep(50 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					up, _ := store.GetUpstream(ctx, "repo_pull_held")
+					t.Fatalf("no re-run stole the held claim after %d attempts: %+v", attempts.Load(), up)
+				}
+			}
+			if got := stolenFrom.Load(); got != "sync-1" {
+				t.Errorf("re-run stole %v, want sync-1", got)
+			}
+			if n := attempts.Load(); n > tc.maxAttempts {
+				t.Errorf("%d runs before the steal, want at most %d: the job did not wait for the lease", n, tc.maxAttempts)
+			}
+			up, err := store.GetUpstream(ctx, "repo_pull_held")
+			if err != nil {
+				t.Fatalf("GetUpstream: %v", err)
+			}
+			if up.Syncing || up.RunCount != 1 {
+				t.Errorf("held request not pulled by one counted run: %+v", up)
+			}
+		})
+	}
+}
+
+// A sync job whose repository was deleted completes, even though an earlier
+// run of it left the claim held: Run returns ErrRepoGone before it could
+// steal the claim, and the job has nothing left to do.
+func TestRiverSyncDeletedRepoCompletesWithClaimHeld(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_pull_gone", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+	var attempts atomic.Int32
+	syncRunner := func(ctx context.Context, job sync.Job) error {
+		if attempts.Add(1) > 1 {
+			return fmt.Errorf("sync %s: %w", job.RepoID, sync.ErrRepoGone)
+		}
+		if _, _, err := store.BeginSync(ctx, job.RepoID, "sync-1", 2*time.Second); err != nil {
+			return err
+		}
+		return errors.New("finish sync: database unreachable")
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, syncRunner, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+	if err := store.RequestSync(ctx, "repo_pull_gone"); err != nil {
+		t.Fatalf("RequestSync: %v", err)
+	}
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_pull_gone"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	conn, err := pgx.Connect(ctx, pgURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	waitFor(t, "the deleted repo's job to complete", func() bool {
+		var state string
+		err := conn.QueryRow(ctx, `SELECT state FROM river_job WHERE kind = 'upstream_sync'`).Scan(&state)
+		return err == nil && state == "completed"
+	})
+	if n := attempts.Load(); n != 2 {
+		t.Fatalf("%d runs, want the failed run and one that found the repo gone", n)
+	}
+}
+
 // A run that SKIPS because a dead holder's unexpired lease refuses the
 // steal must not complete its only job over the pending request: the
 // gated completion snoozes until just past the observed expiry, and the
@@ -314,5 +659,67 @@ func TestRiverSyncSkipWithPendingSnoozesUntilSteal(t *testing.T) {
 	}
 	if up.SyncPending || up.Syncing {
 		t.Errorf("row after snoozed steal = %+v, want released claim with consumed marker", up)
+	}
+}
+
+// A lapsed legacy claim with no pending request: the run skips, because
+// stealing an adopted legacy claim needs OPENSTORAGE_SYNC_STEAL_LEGACY, and
+// the gate must not complete the job over the claim, which can hold a
+// consumed request. The job snoozes at legacy pace (legacyClaimSnooze)
+// until the holder finishes or the operator allows the steal.
+func TestRiverSyncLapsedLegacyClaimSnoozesWithoutPending(t *testing.T) {
+	t.Setenv("OPENSTORAGE_SYNC_STEAL_LEGACY", "")
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	const repo = "repo_legacy_held"
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: repo, Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+	if _, _, err := store.BeginSync(ctx, repo, sync.LegacyClaimHolder, time.Millisecond); err != nil {
+		t.Fatalf("legacy claim: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond) // the legacy grace lapses
+
+	var skips atomic.Int32
+	runner := func(ctx context.Context, job sync.Job) error {
+		if _, _, err := store.BeginSync(ctx, job.RepoID, "test-run", time.Minute); !errors.Is(err, sync.ErrSyncInProgress) {
+			return fmt.Errorf("BeginSync over a lapsed legacy claim = %v, want ErrSyncInProgress", err)
+		}
+		skips.Add(1)
+		return nil
+	}
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: repo}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	var state string
+	var scheduledAt time.Time
+	waitFor(t, "the gate of the skipped run", func() bool {
+		if err := q.pool.QueryRow(ctx, `SELECT state::text, scheduled_at FROM river_job WHERE kind = 'upstream_sync' AND args->>'repo_id' = $1`,
+			repo).Scan(&state, &scheduledAt); err != nil {
+			t.Fatalf("read the sync job: %v", err)
+		}
+		return skips.Load() >= 1 && state != "available" && state != "running"
+	})
+	if wait := time.Until(scheduledAt); state != "scheduled" || wait < legacyClaimSnooze-time.Minute {
+		t.Fatalf("sync job after a skip over a lapsed legacy claim: state %s, next run in %v; want snoozed for about %v",
+			state, wait.Round(time.Second), legacyClaimSnooze)
+	}
+	up, err := store.GetUpstream(ctx, repo)
+	if err != nil {
+		t.Fatalf("GetUpstream: %v", err)
+	}
+	if !up.Syncing || up.SyncClaimHolder != sync.LegacyClaimHolder || up.SyncPending {
+		t.Fatalf("row after the skip = %+v, want the legacy claim still held and nothing pending", up)
 	}
 }

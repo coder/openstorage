@@ -3696,6 +3696,21 @@ func writeGenerationMarker(repoPath string, gen int64, head string) {
 // marker read stays lock-free (temp+rename keeps it atomic): the idle fast
 // path must not serialize on an exclusive lock.
 func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string) (repoPath string, refsErr error, err error) {
+	return hydrateRefs(ctx, st, bl, cacheDir, repo, defaultBranch, false)
+}
+
+// ErrHeldRefStale is the refsErr of a strict hydrate whose ref sync
+// skipped a push-held ref: the cache keeps a value the authority no
+// longer has (a sync only touches refs whose values differ), and the
+// hold may belong to a push whose CAS fails, so nothing would heal it
+// before the caller acts on the stale value.
+var ErrHeldRefStale = errors.New("a push holds a ref whose cached value is older than the authority")
+
+// hydrateRefs is Hydrate. With strictHeld (a local push run's loopback
+// fetch, Server.StrictSyncFetch), a sync that skips a held ref returns
+// ErrHeldRefStale, and a held-skip verdict never short-cuts the sync.
+// Hold and marker handling is the same in both modes.
+func hydrateRefs(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string, strictHeld bool) (repoPath string, refsErr error, err error) {
 	headTarget := HeadTarget(defaultBranch)
 	repoPath, err = EnsureCacheRepoCtx(ctx, cacheDir, repo)
 	if err != nil {
@@ -3729,7 +3744,7 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	if markerGen, markerHead, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen && markerHead == headTarget {
 		return repoPath, nil, nil
 	}
-	if heldMarkerValid(repoPath, gen, headTarget) {
+	if !strictHeld && heldMarkerValid(repoPath, gen, headTarget) {
 		return repoPath, nil, nil
 	}
 	// Full-sync critical section. The lock file is left in place, like the
@@ -3759,7 +3774,7 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	if markerGen, markerHead, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen && markerHead == headTarget {
 		return repoPath, nil, nil
 	}
-	if heldMarkerValid(repoPath, gen, headTarget) {
+	if !strictHeld && heldMarkerValid(repoPath, gen, headTarget) {
 		return repoPath, nil, nil
 	}
 	if snap != nil {
@@ -3855,6 +3870,9 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		if postHoldsKey, ok := livePushHoldsKey(repoPath); ok && postHoldsKey == preHoldsKey {
 			writeHeldGenerationMarker(repoPath, gen, headTarget, postHoldsKey)
 		}
+	}
+	if refsErr == nil && skippedHeld && strictHeld {
+		refsErr = ErrHeldRefStale
 	}
 	return repoPath, refsErr, nil
 }

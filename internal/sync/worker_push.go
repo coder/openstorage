@@ -70,6 +70,12 @@ var pushRefspecs = []string{"refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/
 // every few seconds only while `git push` is actually running.
 const defaultDetachPoll = 2 * time.Second
 
+// ErrRepoGone is the error of Run and RunPush on the River lane when the
+// repo lookup finds no repository (it was deleted). The job has nothing
+// left to do, so the sync or push worker completes it before its
+// completion gate, even if a claim is still held.
+var ErrRepoGone = errors.New("repository deleted")
+
 // RunPush executes one outbound push-upstream run for job. Lifecycle,
 // abandonment, and event semantics mirror Run: detach cancels silently at
 // every stage, a stolen claim abandons loudly without terminal events, and
@@ -86,7 +92,11 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 
 	repo, err := w.Repos(ctx, job.Org, job.RepoID)
 	if errors.Is(err, ErrNotFound) {
-		return nil // repo deleted while queued: nothing to push or emit
+		// Repo deleted while queued: nothing to push or emit.
+		if w.Local != nil {
+			return nil
+		}
+		return fmt.Errorf("push %s: %w", job.RepoID, ErrRepoGone)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve repo %s: %w", job.RepoID, err)
@@ -137,13 +147,30 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			"org", job.Org, "repo", job.RepoID, "holder", holder, "stolen_from", stolenFrom)
 	}
 
-	if w.Local != nil {
-		if err := w.waitPublication(ctx, job.RepoID); err != nil {
+	if err := w.waitPublication(ctx, job.RepoID); err != nil {
+		if w.Local != nil {
 			return w.restoreLocal(ctx, job, holder, "push", err, func(fctx context.Context) (Upstream, error) {
 				return w.Local.FinishPushOutcome(fctx, job.RepoID, holder,
 					meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: localPublicationRetryDelay})
 			})
 		}
+		// River: hand the request back and fail the run, so the job's
+		// completion gate snoozes it as an uncovered pending request.
+		rs := w.Upstreams.(ShutdownRestorer)
+		restore := func(fctx context.Context) (Upstream, error) {
+			return rs.RestorePush(fctx, job.RepoID, holder, force)
+		}
+		if shutdownAborted(ctx) {
+			if rerr := w.restoreForShutdown(ctx, "push", job, holder, err, restore); rerr != nil {
+				return rerr
+			}
+			return fmt.Errorf("push %s: %w", job.RepoID, ErrShutdown)
+		}
+		// The drain can cancel the run during this restore, too.
+		if rerr := w.restoreLocal(ctx, job, holder, "push", err, restore); rerr != nil {
+			return shutdownErr(ctx, rerr)
+		}
+		return shutdownErr(ctx, fmt.Errorf("push %s: %w", job.RepoID, err))
 	}
 
 	startedAt := eventTime(time.Now())
@@ -188,6 +215,16 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			// Retry (the retry position) rides along unchanged.
 			return fmt.Errorf("push %s: %w", job.RepoID, ErrShutdown)
 		}
+	}
+
+	if w.Local != nil && errors.Is(runErr, errHeldRefStale) {
+		// The snapshot would have forwarded a held ref older than the
+		// authority: hand the request back, like a failed publication
+		// wait, and retry once the holding push has published or exited.
+		return w.restoreLocal(ctx, job, holder, "push", runErr, func(fctx context.Context) (Upstream, error) {
+			return w.Local.FinishPushOutcome(fctx, job.RepoID, holder,
+				meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: localPublicationRetryDelay})
+		})
 	}
 
 	var fin Upstream
@@ -451,6 +488,19 @@ func localPushOutcome(runErr error, attempt int, force bool) meta.PushOutcome {
 	}
 }
 
+// errHeldRefStale marks a loopback fetch that the server refused with 423
+// Locked (githttp.Server.StrictSyncFetch): a push holds a ref whose cached
+// value is older than the authority, so the snapshot would forward a
+// stale ref. A local run restores its request instead of ending done.
+var errHeldRefStale = errors.New("loopback fetch refused: a push holds a stale cached ref")
+
+// heldRefStale reports whether git fetch stderr carries the server's 423:
+// "HTTP 423" from a failed RPC, "returned error: 423" from curl on the
+// ref advertisement.
+func heldRefStale(stderr string) bool {
+	return strings.Contains(stderr, "HTTP 423") || strings.Contains(stderr, "returned error: 423")
+}
+
 // transferPush performs the loopback fetch + upstream push. A nil error is
 // success; errDetached/errClaimStolen abandon silently; other failures are
 // *syncFailure values, with rejected non-nil exactly when the failure is
@@ -492,7 +542,11 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	fetchURL := strings.TrimRight(w.Loopback.BaseURL, "/") + "/" + repo.RepoID + ".git"
 	fetchArgs := append([]string{"fetch", "--prune", fetchURL}, mirrorRefspecs...)
 	if stderr, err := runGit(ctx, mirror, fetchEnv, fetchArgs...); err != nil {
-		return nil, &syncFailure{code: FailInternal, cause: fmt.Errorf("loopback fetch: %w: %s", err, stderr)}
+		cause := fmt.Errorf("loopback fetch: %w: %s", err, stderr)
+		if heldRefStale(stderr) {
+			cause = fmt.Errorf("%w: %w", errHeldRefStale, cause)
+		}
+		return nil, &syncFailure{code: FailInternal, cause: cause}
 	}
 
 	// Empty local repo: nothing to publish, the run still counts as a

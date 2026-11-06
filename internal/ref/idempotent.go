@@ -148,7 +148,8 @@ func (s IdempotentCAS) reconcileLoss(ctx context.Context, repo, name, old, new s
 //
 // Everything else — connection drops, unexpected EOFs, context
 // cancellation mid-flight after the request was sent — is ambiguous: the
-// statement may have committed with the result lost on the way back.
+// statement may have committed with the result lost on the way back. So is
+// a COMMIT error marked commitUnknown, whatever pgx's own tag says.
 func ambiguousError(err error) bool {
 	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		// These SQLSTATEs are the backend SAYING the outcome is unknown:
@@ -161,10 +162,12 @@ func ambiguousError(err error) bool {
 	return !pgconn.SafeToRetry(err)
 }
 
-// notExecutedError marks an error raised before the CAS statement was sent
-// to the backend (pool/connection acquisition): the statement provably did
-// not execute. It satisfies the SafeToRetry contract pgconn uses for
-// never-sent requests, so ambiguousError classifies it as definitive.
+// notExecutedError marks an error after which the CAS statement provably
+// did not take effect: it was never sent to the backend (pool/connection
+// acquisition), or its transaction rolled back (a pre-COMMIT failure, or a
+// COMMIT that txid_status reports aborted). It satisfies the SafeToRetry
+// contract pgconn uses for never-sent requests, so ambiguousError
+// classifies it as definitive.
 type notExecutedError struct{ err error }
 
 // notExecuted wraps an acquire-stage error with the not-executed marker.
@@ -176,3 +179,21 @@ func notExecuted(err error) error {
 func (e notExecutedError) Error() string   { return e.err.Error() }
 func (e notExecutedError) Unwrap() error   { return e.err }
 func (notExecutedError) SafeToRetry() bool { return true }
+
+// commitUnknownError marks a COMMIT error whose outcome PostgreSQL could not
+// confirm (see PG.commitStatus). pgx can tag a lost COMMIT reply as never
+// sent (SafeToRetry); this marker overrides that tag, so ambiguousError
+// keeps the outcome ambiguous and IdempotentCAS rechecks the ref. A
+// *pgconn.PgError inside still classifies by its SQLSTATE: the backend
+// answered the COMMIT.
+type commitUnknownError struct{ err error }
+
+// commitUnknown wraps a COMMIT error with the unknown-outcome marker.
+func commitUnknown(err error) error {
+	assertf(err != nil, "commitUnknown: nil error")
+	return commitUnknownError{err: err}
+}
+
+func (e commitUnknownError) Error() string   { return e.err.Error() }
+func (e commitUnknownError) Unwrap() error   { return e.err }
+func (commitUnknownError) SafeToRetry() bool { return false }

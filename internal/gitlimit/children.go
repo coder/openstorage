@@ -3,6 +3,7 @@ package gitlimit
 import (
 	"bytes"
 	"errors"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -23,8 +24,26 @@ var children registry
 
 type registry struct {
 	mu      sync.Mutex
-	pgids   map[int]struct{}
+	groups  map[int]*group // by group ID, which is the leader's PID
 	stopped bool
+	// killed is made by the first stop and closed once a stop has sent its
+	// final SIGKILLs. A leader that exits after the stop began stays
+	// unreaped until then (see wait).
+	killed chan struct{}
+	// hold waits for the leader pid to exit without reaping it and reports
+	// whether it did. Nil means awaitExit. Tests replace it to run the path
+	// of a platform that cannot hold a leader.
+	hold func(pid int) bool
+	// signalGroup sends sig to the process group pgid. Nil means
+	// syscall.Kill(-pgid, sig). Tests replace it to observe the leader at
+	// the moment the signal goes out.
+	signalGroup func(pgid int, sig syscall.Signal) error
+}
+
+// group is a tracked process group whose leader wait has not removed yet.
+type group struct {
+	leader *os.Process
+	exited bool // the leader exited while stop ran, so wait holds it unreaped
 }
 
 // Start starts cmd as the leader of a new process group and tracks it.
@@ -65,7 +84,7 @@ func Stopping() bool { return children.isStopped() }
 // StopChildren ends every tracked git child and refuses new ones: serve
 // calls it when the shutdown drain times out, so no tracked child outlives
 // serve. It sends SIGTERM to each child's process group, waits up to grace
-// for them to be reaped, then sends SIGKILL to those groups. It returns
+// for the leaders to exit, then sends SIGKILL to those groups. It returns
 // the number of groups it signaled.
 func StopChildren(grace time.Duration) int { return children.stop(grace) }
 
@@ -86,19 +105,58 @@ func (g *registry) start(cmd *exec.Cmd) error {
 		_ = cmd.Wait()
 		return ErrStopping
 	}
-	if g.pgids == nil {
-		g.pgids = make(map[int]struct{})
+	if g.groups == nil {
+		g.groups = make(map[int]*group)
 	}
-	g.pgids[cmd.Process.Pid] = struct{}{}
+	g.groups[cmd.Process.Pid] = &group{leader: cmd.Process}
 	return nil
 }
 
+// wait returns once cmd's leader is reaped. A signal sent to a group whose
+// leader was reaped can reach an unrelated group: once the group has no
+// member left, the kernel can hand its ID to a new process (#473). So the
+// registry signals only groups whose leader it has not reaped:
+//
+//   - A leader leaves the registry under the lock before it is reaped, and
+//     stop signals only groups it finds in the registry while holding the
+//     lock. Every signal reaches a group whose leader still owns its ID, as
+//     a running process or as an unreaped zombie.
+//   - A leader that exits after stop began is not reaped until stop has
+//     sent its final SIGKILL. That kill still reaches a member the leader
+//     left behind, such as a hook that ignored SIGTERM.
+//
+// Both rest on awaitExit, a wait that leaves the child unreaped. Only Linux
+// has one. Elsewhere wait reaps first and removes the group right after, so
+// stop sends no signal to a group that has left the registry, and signal
+// skips a registered group whose leader os reports reaped. A leader that
+// exits during the grace gets no final SIGKILL there, and a member it left
+// behind lives on. What stays open is the race that os.Process.Signal has
+// on macOS (golang/go#13987): the leader is reaped between the check and
+// the kill.
 func (g *registry) wait(cmd *exec.Cmd) error {
-	err := cmd.Wait()
+	pid := cmd.Process.Pid
+	hold := g.hold
+	if hold == nil {
+		hold = awaitExit
+	}
+	if !hold(pid) {
+		err := cmd.Wait()
+		g.mu.Lock()
+		delete(g.groups, pid)
+		g.mu.Unlock()
+		return err
+	}
 	g.mu.Lock()
-	delete(g.pgids, cmd.Process.Pid)
+	if gr := g.groups[pid]; gr != nil && g.stopped {
+		gr.exited = true
+		killed := g.killed
+		g.mu.Unlock()
+		<-killed
+		g.mu.Lock()
+	}
+	delete(g.groups, pid)
 	g.mu.Unlock()
-	return err
+	return cmd.Wait()
 }
 
 func (g *registry) isStopped() bool {
@@ -107,32 +165,67 @@ func (g *registry) isStopped() bool {
 	return g.stopped
 }
 
+// signal sends sig to gr's process group. The caller holds g.mu and found gr
+// in g.groups. Where wait reaps first, a reaped leader stays registered
+// until wait takes the lock, and its group ID may belong to another group
+// by then. os reports a reap as soon as the wait call returns, so a leader
+// it reports done gets no signal.
+func (g *registry) signal(gr *group, sig syscall.Signal) {
+	if gr.leader.Signal(syscall.Signal(0)) != nil {
+		return
+	}
+	pgid := gr.leader.Pid
+	if g.signalGroup != nil {
+		_ = g.signalGroup(pgid, sig)
+		return
+	}
+	_ = syscall.Kill(-pgid, sig)
+}
+
 // stop sends SIGTERM first, because git removes its lock files and
 // quarantine on SIGTERM while a SIGKILL inside a ref transaction leaves a
-// stale ref lock in the cache repo. After grace (or once every leader is
-// reaped) each group gets SIGKILL, which also ends a child left in a
-// reaped leader's group. Linux does not reuse a PID while a group with
-// that ID has members, so that SIGKILL can reach another group only if the
-// kernel hands out the same PID again within grace (#473).
+// stale ref lock in the cache repo. After grace (or once every leader has
+// exited) each group still registered gets SIGKILL, which also ends a
+// child left behind by a leader that exited meanwhile.
 func (g *registry) stop(grace time.Duration) int {
 	g.mu.Lock()
-	g.stopped = true
-	pgids := make([]int, 0, len(g.pgids))
-	for pgid := range g.pgids {
+	if !g.stopped {
+		g.stopped = true
+		g.killed = make(chan struct{})
+	}
+	killed := g.killed
+	pgids := make([]int, 0, len(g.groups))
+	for pgid, gr := range g.groups {
 		pgids = append(pgids, pgid)
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		g.signal(gr, syscall.SIGTERM)
 	}
 	g.mu.Unlock()
-	for deadline := time.Now().Add(grace); len(pgids) > 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		g.mu.Lock()
-		left := len(g.pgids)
-		g.mu.Unlock()
-		if left == 0 {
-			break
+	for deadline := time.Now().Add(grace); g.running(pgids) > 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	}
+	g.mu.Lock()
+	for _, pgid := range pgids {
+		if gr, ok := g.groups[pgid]; ok {
+			g.signal(gr, syscall.SIGKILL)
 		}
 	}
-	for _, pgid := range pgids {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	select {
+	case <-killed:
+	default:
+		close(killed)
 	}
+	g.mu.Unlock()
 	return len(pgids)
+}
+
+// running counts the groups among pgids whose leader has not exited.
+func (g *registry) running(pgids []int) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := 0
+	for _, pgid := range pgids {
+		if gr, ok := g.groups[pgid]; ok && !gr.exited {
+			n++
+		}
+	}
+	return n
 }

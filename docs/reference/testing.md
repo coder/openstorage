@@ -497,6 +497,35 @@ are unchanged, and Floci is not a qualified `s3wal://` store. Like the
 SeaweedFS lane, the test is gated only by `-short`, so it also runs in the
 per-PR `test` job. The nightly job also asserts a complete VERDICT transcript.
 
+**Read failures in `get-under-overwrite`.** A torn body or ETag ends the row
+`mishandles`. Any other failed racing GET ends it `error` (inconclusive,
+possible framing corruption), unless a freeze of the test process explains the
+failure. A heartbeat in the test process ticks every 5 ms and records each gap
+of 100 ms or more between two ticks (a paused runner, `SIGSTOP`) as a freeze. A
+freeze explains a failed read when the read hit the 2 s op deadline and the
+process was awake for under 100 ms of it, a twentieth of the deadline. A read
+that a freeze explains counts in `stallErrs` and does not fail the row, and the
+pass detail says how many there were.
+
+The race window stops only new operations. A GET or PUT in flight when the
+window ends keeps its own 2 s deadline, so a store that hangs during the last
+seconds of the window fails the row like one that hangs earlier.
+
+The verdict quotes the first three failures with `class` (`deadline`,
+`short-body`, `reset`, `status` or `other`), `elapsed`, `awake` (the time the
+process ran during the read) and `explainedByStall`. `short-body` is the framing
+shape: the headers arrived and the body did not finish. `deadline` is a read
+that got no headers in time, and `status` is an error reply from Floci. A
+`short-body` or `deadline` read with a long `awake` time is a stall of Floci or
+the network, because the test process kept running. `maxRead` and `maxStall`
+give the slowest successful GET and the longest freeze of the run.
+
+The rule cannot tell one case apart: a fault of Floci or the network during a
+freeze that covers all but 100 ms of the same 2 s read. The test process was not
+running when the store went wrong, so that row passes with `stallErrs` set. The
+heartbeat records only gaps of 100 ms or more. A process that is slowed but
+keeps ticking explains nothing, and its failed reads end `error`.
+
 Run it locally (Docker + the `aws` CLI):
 
 ```sh
