@@ -558,6 +558,10 @@ class CitationTests(CheckerTestCase):
                 self.assertEqual(result.stdout, f"UNSUPPORTED UNPARSED LINK README.md:1 -> {link}\nbroken links: 1\n")
         result = self.run_checker("[a](README.md 'a title') [b](README.md\t\"a title\")\n")
         self.assertEqual(result.stdout, "broken links: 0\n")
+        # A quote right after `](` starts no title, so the `](` inside it is a second link that the line must not hide.
+        link = '[t]("[t](")'
+        result = self.run_checker(link + "\n")
+        self.assertEqual(result.stdout, f"UNSUPPORTED UNPARSED LINK README.md:1 -> {link}\nbroken links: 1\n")
 
     def test_markdown_line_numbers_and_links_survive_a_separator_that_only_python_splits_on(self):
         for name, sep in [("vt", "\x0b"), ("ff", "\x0c"), ("fs", "\x1c"), ("nel", "\x85"), ("ls", "\u2028"), ("ps", "\u2029")]:
