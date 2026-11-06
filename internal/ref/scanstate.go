@@ -23,6 +23,11 @@ package ref
 //     passes of one kind can run together for one tick. Rows are
 //     bookkeeping, never authority: losing one restarts a scan from the
 //     top, which every consumer tolerates by construction.
+//   - A job that resumes from its row cannot rely on that: a run that
+//     outlives its rescue horizon can still be writing when the next run
+//     takes over. Such a job writes with PutJobScanStateIf, keyed on the
+//     generation it read, so the run that lost the row stops at its next
+//     write instead of overwriting the new run's state.
 
 import (
 	"context"
@@ -135,6 +140,11 @@ func DecodeReapWatermark(payload string) ReapWatermark {
 	return wm
 }
 
+// ErrScanStateConflict reports that PutJobScanStateIf found a row whose
+// generation was not the expected one: another run owns the row now.
+// Nothing was written.
+var ErrScanStateConflict = errors.New("scan state row changed: conditional write refused")
+
 // ErrLegacyReapUnarmed reports that a retirement verdict refused to retire
 // a LEGACY-SPELLED registry row because the freshest destructive-reap
 // watermark does not certify legacy reaping (see ReapWatermark). The
@@ -220,6 +230,18 @@ type ScanStateStore interface {
 	// PutJobScanState atomically upserts one row, stamping updated_at
 	// with the database clock.
 	PutJobScanState(ctx context.Context, job, scope, payload string, generation int64) error
+	// PutJobScanStateIf is PutJobScanState that writes only when the row's
+	// generation is expectGeneration (an absent row counts as generation
+	// 0). Otherwise it writes nothing and returns ErrScanStateConflict.
+	// It is how a run that holds a cursor learns that another run took
+	// the row over. The fence holds only if the caller keeps two rules: a
+	// run that takes a row over writes a generation that differs from the
+	// one it read, and a generation never repeats. A job therefore keeps its
+	// row after its work ends and does not delete it, because a row that
+	// comes back at an old generation lets a stale run write again. The
+	// S3-WAL store has one serving process; a second process that loses its
+	// CAS race fails with the store's own error, not ErrScanStateConflict.
+	PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error
 	// DeleteJobScanState removes one row; deleting an absent row is a
 	// no-op.
 	DeleteJobScanState(ctx context.Context, job, scope string) error
@@ -296,6 +318,34 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
                                        updated_at = now()`,
 		job, scope, payload, generation)
 	return err
+}
+
+// PutJobScanStateIf — see ScanStateStore. One statement decides it, so two
+// writers that expect generation 0 on an absent row cannot both miss: an
+// UPDATE guarded by the expected generation, or, for an expected generation
+// 0, an upsert whose update half is guarded the same way (an absent row
+// counts as generation 0, and the insert half creates it).
+func (s *PG) PutJobScanStateIf(ctx context.Context, job, scope, payload string, generation, expectGeneration int64) error {
+	assertf(job != "" && scope != "", "PutJobScanStateIf(%q, %q)", job, scope)
+	query := `
+UPDATE job_scan_state SET payload = $3, generation = $4, updated_at = now()
+WHERE job = $1 AND scope = $2 AND generation = $5`
+	if expectGeneration == 0 {
+		query = `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
+  generation = EXCLUDED.generation, updated_at = now()
+WHERE job_scan_state.generation = $5`
+	}
+	tag, err := s.pool.Exec(ctx, query, job, scope, payload, generation, expectGeneration)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrScanStateConflict
+	}
+	return nil
 }
 
 // ArmAbsenceAdmissionFence upserts the admission-fence marker under the

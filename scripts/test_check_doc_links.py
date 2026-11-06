@@ -1,5 +1,7 @@
 """Regression tests for the documented check-doc-links.py command."""
 from pathlib import Path
+import random
+import re
 import shutil
 import subprocess
 import sys
@@ -421,15 +423,225 @@ class CitationTests(CheckerTestCase):
 
     def test_every_javascript_continuation_ending_keeps_the_next_line_in_its_expression(self):
         endings = ["=", "(", "[", ",", "?", ":", "+", "-", "*", "/", "%", "&", "|", "^", "<", ">", "!", "~", ".",
-                   "&&", "||", "??", "=>", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof",
-                   "void"]
-        ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new", "obj.of"]
-        js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}\n" for i, op in enumerate(endings))
+                   "&&", "||", "??", "=>", "+-", "-+", "+++", "---", "+ ++", "- --", "= ++", "( ++", "typeof ++", "...typeof",
+                   "...new", "as", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof", "void"]
+        ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new", "obj.of", "a[0]++",
+                            "a?.new"]
+        closer = lambda op: ")" * op.count("(") + "]" * op.count("[")
+        js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}{closer(op)}\n" for i, op in enumerate(endings))
         js += "".join(f"x {op}\nfunction closed{i}() {{}}\n" for i, op in enumerate(ends_a_statement))
         cited = [f"[flow.js:open{i}]" for i in range(len(endings))]
         cited += [f"[flow.js:closed{i}]" for i in range(len(ends_a_statement))]
         result = self.check_readme(" ".join(cited) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:open{i}]") for i in range(len(endings))])
+
+    def test_javascript_regex_literals_and_nested_templates_cannot_shift_the_reader(self):
+        trap = "const trap = `\nfunction stale() {}\n`;\nfunction real() {}\n"
+        regexes_after = [
+            "export default /`/.source;\n", "delete /`/.source;\n", "do /`/.test(x); while (0)\n", "if (a) {} else /`/.test(x);\n",
+            "class A extends /`/.constructor {}\n", "const q = x in /`/;\n", "const q = x instanceof /`/.constructor;\n",
+            "const q = new /`/.constructor();\n", "const q = typeof /`/;\n", "const q = void /`/;\n",
+            "switch (x) {\n  case /`/.source:\n}\n", "function f() {\n  return /`/.test(x);\n}\n", "function g() {\n  throw /`/;\n}\n",
+            "const a = [...typeof /`/];\n", "const a = [...void /`/];\n", "const a = {...new /`/.constructor()};\n",
+            # A word after a member name is a keyword again once the name ends, so its `/` opens a regex literal.
+            "a.b\ntypeof /`/.source;\n", "a.b\nnew /`/.constructor();\n", "const q = a.b in /`/;\n",
+            "const q = a?.b instanceof /`/.constructor;\n", "function h() {\n  x.y\n  return /`/.test(x);\n}\n",
+            "a?.(typeof /`/.source);\n", "a?.[typeof /`/.source];\n",
+            # A keyword after a string, `++` or a regex literal that ended the line starts an operand again. A regex
+            # literal can open the file or follow an opening bracket.
+            "'a'\ntypeof /`/.source;\n", "x++\ntypeof /`/.source;\n", "const r = /a/\ntypeof /`/.source;\n",
+            "/`/.test(x);\n", "f(/`/, 1);\n",
+            # A keyword that opens a template substitution is not a member name, so its `/` opens a regex literal.
+            "const q = `${ typeof /`/.source }`;\n", "const q = `${ delete /`/.source }`;\n",
+            "const q = `${ new /`/.constructor() }`;\n",
+        ]
+        sources = [prefix + trap for prefix in [
+            "const r = /`/;\n", "const r = /[`]/g;\n", "const r = /'`/;\n", "const r = /[/]`/;\n", "const r = /[/*]/;\n",
+            "const t = `a ${ \"`\" } b`;\n", "const t = `a ${ '`' } b`;\n", "const t = `${ /`/.test(x) }`;\n",
+            "const t = `${ /}/.test(x) } ${ {a: \"}\"}.a }`;\n", "const q = a / b + /'`/.test(c);\n",
+            "const g = (x) => /`/.test(x);\n", *regexes_after,
+        ]]
+        # A `/` after a value divides, so the template below opens a template that the division's right side
+        # starts and its closing brace ends: reading the `/` as a regex literal flips every backtick after it.
+        sources += [f"const q = {operand} / `${{b / c}}` + `\nfunction stale() {{}}\n`;\nfunction real() {{}}\n"
+                    for operand in ["'a'", '"a"', "`a`", "1.", "0x1f", "this", "a[0]", "a.in", "a.return"]]
+        sources += [
+            "const t = `a ${ `b\nfunction stale() {}\n` } c`;\nfunction real() {}\n",
+            "const t = `${ `a` / 2 } a/b` + `\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const q = /a/ / `b / c\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const t = `\\${ `;\nconst u = `\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "{\n  for (;\n  function stale() {};) { break }\n}\nfunction real() {}\n",
+            "f(/`/, 1);\nconst tt = `a ${\nfunction stale() {}\n}`;\nfunction real() {}\n",
+            # A `{` inside a substitution opens a block or an object, and its `}` does not end the substitution.
+            "const t = `${ `${ {a: () => {}} + /`/ }` }\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const t = `${ `${ {} + {k: /`/} }` }\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const t = `${ {a: 1} + `\nfunction stale() {}\n` }`;\nfunction real() {}\n",
+            "const t = `${ {a: {b: 1}} + `\nfunction stale() {}\n` }`;\nfunction real() {}\n",
+            "const t = `${ (() => { return 1; })() + `\nfunction stale() {}\n` }`;\nfunction real() {}\n",
+            "const t = `${ {a: 1}.a + `\nfunction stale() {}\n` }`;\nfunction real() {}\n",
+            "const s = 'a\\\nfunction stale() {}\\\n';\nfunction real() {}\n",
+            "const t = `\\`\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "// comment\u2028const open = `\nfunction stale() {}\n`;\nfunction real() {}\n",
+        ]
+        files = {f"pkg/leak{i}.js": source for i, source in enumerate(sources)}
+        cited = [f"[leak{i}.js:{name}]" for i in range(len(sources)) for name in ("stale", "real")]
+        result = self.check_readme(" ".join(cited) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[leak{i}.js:stale]") for i in range(len(sources))])
+
+    def test_javascript_reader_reads_regex_literals_templates_and_divisions_it_can_lex(self):
+        js = ('function slug(name) {\n'
+              '  return name.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/^-+|-+$/g, "");\n}\n'
+              'const label = `${slug("a b")} and ${ {k: "}"}.k } ${ `nested ${1}` }`;\n'
+              'const ratio = total / count / 2; // half\n'
+              'const test = x => /a\\/b/.test(x) && y / z;\n'
+              'const first = list[0] / 2;\n'
+              "const quote = '\\'' + \"say \\\"hi\\\"\";\n"
+              'const nested = `${ `${ {a: 1}.a }` + {b: {c: 1}}.b.c }`;\nconst deep = `${ `${ `${ {a: {b: 1}}.a.b }` }` }`;\n'
+              'class Counter {\n  #count = 0;\n  get half() { return this.#count / 2; }\n}\n'
+              'class Wide\n  extends Counter {\n}\nclass Tight{}\nconst pair = 1,\n  other = 2;\nlet late\n  = 3;\n'
+              'function broken\n  (a) {}\n{\n  var bare }\n'
+              'function afterAll() {}\n')
+        ok = ["slug", "label", "ratio", "test", "first", "quote", "nested", "deep", "Counter", "Wide", "Tight", "pair", "late", "broken", "bare",
+              "afterAll"]
+        result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok) + "\n", **{"pkg/flow.js": js})
+        self.assert_failures(result)
+        self.assertEqual(result.returncode, 0)
+
+    def test_javascript_every_line_terminator_ends_a_line_and_blocks_a_postfix_operator(self):
+        # open() reads CR and CRLF as LF, so U+2028 and U+2029 are the line terminators that reach the reader.
+        js = ("const a = x\u2028++\n  function viaLs() {}.x\n"
+              "const b = x\u2029++\n  function viaPs() {}.x\n"
+              "const c = x /*\u2029*/ ++\n  function viaComment() {}.x\n"
+              "const d = a[0]\u2028++\n  function viaBracket() {}.x\n"
+              "const e = x // note\u2028++\n  function viaLineComment() {}.x\n"
+              "const f = x++\u2028function afterLs() {}\u2029const g = 1\nfunction afterPs() {}\n")
+        ok = ["afterLs", "afterPs"]
+        bad = ["viaLs", "viaPs", "viaComment", "viaBracket", "viaLineComment"]
+        result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n", **{"pkg/flow.js": js})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
+
+    def test_javascript_stop_line_counts_every_line_terminator(self):
+        js = "function before() {}\u2028const half = (a + b) / 2;\u2029function after() {}\n"
+        result = self.check_readme("[flow.js:before] [flow.js:after]\n", **{"pkg/flow.js": js})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[flow.js:after]"))
+        self.assertIn("the JavaScript reader stops at line 2, where it cannot tell a regex literal from a division", result.stdout)
+
+    def test_javascript_reader_stays_linear_on_a_long_run_of_signs(self):
+        js = "const v = " + "+-" * 50000 + "a\nfunction afterSigns() {}\n"
+        result = self.check_readme("[flow.js:afterSigns]\n", **{"pkg/flow.js": js})
+        self.assert_failures(result)
+        self.assertEqual(result.returncode, 0)
+
+    def test_javascript_keywords_inside_brackets_or_import_lists_declare_nothing(self):
+        # A `;` inside a `for (...)` header does not end a statement, and `function as x` in an import or export
+        # list names a specifier. Each file ends in a real declaration.
+        files = {
+            "pkg/for_test.js": "for (;\nfunction viaTest() {};) { break }\n",
+            "pkg/for_update.js": "for (;;\nfunction viaUpdate() {}) { break }\n",
+            "pkg/for_class.js": "for (;\nclass ViaClass {};) { break }\n",
+            "pkg/import.js": "import {\n  function as viaImport,\n} from 'm';\n",
+            "pkg/export.js": "export {\n  class as viaExport,\n} from 'm';\n",
+            "pkg/var.js": "import {\n  var as viaVar,\n} from 'm';\n",
+            "pkg/break_after.js": "import {\n  class as\n  k\n} from 'm';\n",
+            "pkg/break_comment.js": "export {\n  let as // note\n  k\n} from 'm';\n",
+            "pkg/extends_name.js": "export {\n  class as extends\n} from 'm';\n",
+            "pkg/star_var.js": "export * as\nvar from\n'm';\n",
+            "pkg/star_function.js": "export * as // note\nfunction from\n() {}\n",
+            "pkg/star_class.js": "export * as\nclass from\n'm';\n",
+        }
+        files = {name: source + "function after() {}\n" for name, source in files.items()}
+        stale = ["[for_test.js:viaTest]", "[for_update.js:viaUpdate]", "[for_class.js:ViaClass]", "[import.js:as]",
+                 "[export.js:as]", "[var.js:as]", "[break_after.js:as]", "[break_comment.js:as]", "[extends_name.js:as]",
+                 "[star_var.js:from]", "[star_function.js:from]", "[star_class.js:from]"]
+        result = self.check_readme(" ".join(stale + [f"[{name[4:]}:after]" for name in files]) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in stale])
+
+    def test_javascript_reserved_words_after_a_declaration_keyword_are_not_names(self):
+        # `let` is an identifier here, and the class has no name: JavaScript declares none of these words.
+        files = {"pkg/let_in.js": "let in obj\nfunction real() {}\n", "pkg/let_instanceof.js": "let instanceof Object\nfunction real() {}\n",
+                 "pkg/anonymous.js": "export default class extends Object {}\nfunction real() {}\n"}
+        cited = ["[let_in.js:in]", "[let_instanceof.js:instanceof]", "[anonymous.js:extends]",
+                 "[let_in.js:real]", "[let_instanceof.js:real]", "[anonymous.js:real]"]
+        result = self.check_readme(" ".join(cited) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in cited[:3]])
+
+    def test_javascript_reader_skips_a_hashbang_and_reads_a_byte_order_mark_as_white_space(self):
+        result = self.check_readme("[hashbang.js:afterHashbang] [bom.js:bom] [bom.js:afterBom] [bom.js:viaBom]\n", **{
+            "pkg/hashbang.js": "#!/usr/bin/env node\nfunction afterHashbang() {}\n",
+            "pkg/bom.js": "\ufeffconst bom = 1;\nconst open = x +\ufeff\n  function viaBom() {}\nfunction afterBom() {}\n"})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[bom.js:viaBom]"))
+
+    def test_javascript_reader_stops_where_it_cannot_be_sure_of_the_code(self):
+        division = "tell a regex literal from a division"
+        triggers = {  # name: (source after `before`, line of the stop, what the reader cannot do)
+            "paren": ("const half = (a + b) / 2;\n", 2, division), "brace": ("const q = {}\n/ 2;\n", 3, division),
+            "incr": ("count++ / 2;\n", 2, division), "linestart": ("const ratio = total\n  / count;\n", 3, division),
+            "yield": ("const y = yield / 2;\n", 2, division), "inside": ("const t = `\nfunction stale() {}\n${ (a) / 2 }`;\n", 2, division),
+            "html": ("x <!-- `\n", 2, "read an HTML-like comment"), "arrow": ("while (n --> 0) {}\n", 2, "read an HTML-like comment"),
+            "escape": ("function st\\u0061le() {}\n", 2, "read this character"), "unicode": ("const x = 1 \u2192 2;\n", 2, "read this character"),
+            "quote": ("const s = 'open;\n", 2, "find the end of this string"), "comment": ("/* open\n", 2, "find the end of this comment"),
+            "regex": ("const r = /open;\n", 2, "find the end of this regex literal"),
+            "template": ("const t = `open\n", 2, "find the end of this template"),
+        }
+        files = {f"pkg/{name}.js": f"function before() {{}}\n{source}function after() {{}}\n" for name, (source, _, _) in triggers.items()}
+        cited = [f"[{name}.js:{symbol}]" for name in triggers for symbol in ("before", "after")] + ["[escape.js:st]"]
+        result = self.check_readme(" ".join(cited) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[{name}.js:after]") for name in triggers],
+                             ("UNRESOLVED CITATION", "[escape.js:st]"))
+        for name, (_, line, cannot) in triggers.items():
+            report = next(l for l in result.stdout.splitlines() if f"[{name}.js:after]" in l)
+            self.assertTrue(report.endswith(f"; the JavaScript reader stops at line {line}, where it cannot {cannot})"), report)
+
+    def test_javascript_reader_that_stops_on_the_first_line_reads_no_name(self):
+        # No line lies above a stop on line 1, so the reader keeps none of the text.
+        sources = {"html": "<!-- x\nfunction stale() {}\n", "regex": "await /x/;\nfunction stale() {}\n",
+                   "template": "`\nfunction stale() {}\n"}
+        files = {f"pkg/{name}.js": source for name, source in sources.items()}
+        result = self.check_readme(" ".join(f"[{name}.js:stale]" for name in sources) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[{name}.js:stale]") for name in sources])
+        for name in sources:
+            report = next(l for l in result.stdout.splitlines() if f"[{name}.js:stale]" in l)
+            self.assertIn("; the JavaScript reader stops at line 1, where it cannot ", report)
+
+    def test_javascript_slash_that_starts_a_line_after_an_operand_can_open_a_regex_literal(self):
+        # A line break lets a semicolon end `var s`, `break`, or an import, so the `/` below opens a
+        # regex literal that holds a backtick. The reader stops there instead of guessing.
+        trap = "const t = `\nfunction stale() {}\n`;\nfunction real() {}\n"
+        heads = ["var s\n  /`/.test(x);\n", "let s, u\n  /`/.test(x);\n", "var s /* one\n two */ /`/.test(x);\n", "for (;;) {\n  break\n  /`/.test(x);\n}\n",
+                 "debugger\n  /`/.test(x);\n", "import a from 'm'\n  /`/.test(x);\n", "export * from 'm'\n  /`/.test(x);\n"]
+        files = {f"pkg/asi{i}.js": head + trap for i, head in enumerate(heads)}
+        cited = [f"[asi{i}.js:{name}]" for i in range(len(heads)) for name in ("stale", "real")]
+        result = self.check_readme(" ".join(cited) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[asi{i}.js:{name}]") for i in range(len(heads))
+                                       for name in ("stale", "real")])
+
+    def test_javascript_reader_never_reads_a_name_that_a_literal_or_comment_holds(self):
+        rnd = random.Random(640)
+        operands = ["a", "1", "1.", "this", "a.in", "'q'", '"`"', "'/*'", "/`/", "/[`]/", "/'/g", "/}/", "/\\//", "`${x}`", "`a${'`'}`",
+                    "`${/`/.test(y)}`", "`${`n${1}`}`", "`//${'/*'}`"]
+        def statement(kind, name):
+            expr = "".join(rnd.choice(operands) + rnd.choice([" + ", " / ", " - ", ", "]) for _ in range(rnd.randint(0, 2)))
+            expr += rnd.choice(operands)
+            return {
+                "noise": f"x = {expr};", "asi": f"var v\n{rnd.choice(['/`/', '/[`]/', '/\\//'])}.test(x);",
+                "real": f"function {name}() {{}}", "template": f"const v{name} = `x ${{ {expr} }}\nfunction {name}() {{}}\n`;",
+                "comment": f"/*\nfunction {name}() {{}}\n*/", "continued": f"const v{name} = 'a\\\nfunction {name}() {{}}\\\n';",
+                "expression": f"const v{name} =\n  function {name}() {{}};",
+            }[kind]
+        files, real, trap = {}, set(), set()
+        for i in range(120):
+            lines = []
+            for k in range(rnd.randint(2, 6)):
+                kind = rnd.choice(["noise", "noise", "asi", "real", "template", "comment", "continued", "expression"])
+                name = f"{'r' if kind == 'real' else 't'}{i}_{k}"
+                lines.append(statement(kind, name))
+                if kind in ("real", "template", "comment", "continued", "expression"):
+                    (real if kind == "real" else trap).add(f"[g{i}.js:{name}]")
+            files[f"pkg/g{i}.js"] = "\n".join(lines) + "\n"
+        result = self.check_readme(" ".join(sorted(real | trap)) + "\n", **files)
+        failed = set(re.findall(r"-> (\[[^\]]+\])", result.stdout))
+        self.assertEqual(trap - failed, set())
+        self.assertGreater(len(real - failed), len(real) // 4)
 
     def test_python_js_and_unit_citations(self):
         files = {

@@ -123,24 +123,28 @@ type diffStatsPayload struct {
 // `git apply`) — byte-exact `git diff` output satisfies both modes, so the
 // gitApplyCompatible flag is validated but does not alter formatting.
 type fileDiffEntry struct {
-	Path      string `json:"path"`
-	State     string `json:"state"`
-	OldPath   string `json:"old_path,omitempty"`
-	Raw       string `json:"raw"`
-	Bytes     int64  `json:"bytes"`
-	IsEOF     bool   `json:"is_eof"`
-	Additions int    `json:"additions"`
-	Deletions int    `json:"deletions"`
+	Path          string `json:"path"`
+	PathBase64    string `json:"path_base64,omitempty"`
+	State         string `json:"state"`
+	OldPath       string `json:"old_path,omitempty"`
+	OldPathBase64 string `json:"old_path_base64,omitempty"`
+	Raw           string `json:"raw"`
+	Bytes         int64  `json:"bytes"`
+	IsEOF         bool   `json:"is_eof"`
+	Additions     int    `json:"additions"`
+	Deletions     int    `json:"deletions"`
 }
 
 // filteredFileEntry is a diff entry excluded from inline output (binary
 // content, or size above maxInlineDiffBytes): no raw, no counts.
 type filteredFileEntry struct {
-	Path    string `json:"path"`
-	State   string `json:"state"`
-	OldPath string `json:"old_path,omitempty"`
-	Bytes   int64  `json:"bytes"`
-	IsEOF   bool   `json:"is_eof"`
+	Path          string `json:"path"`
+	PathBase64    string `json:"path_base64,omitempty"`
+	State         string `json:"state"`
+	OldPath       string `json:"old_path,omitempty"`
+	OldPathBase64 string `json:"old_path_base64,omitempty"`
+	Bytes         int64  `json:"bytes"`
+	IsEOF         bool   `json:"is_eof"`
 }
 
 type diffPayload struct {
@@ -218,23 +222,27 @@ func buildDiffPayload(ctx context.Context, repoPath, base, target string, paths 
 		}
 		if f.Binary || (!bypassSize && size > maxInlineDiffBytes) {
 			payload.Filtered = append(payload.Filtered, filteredFileEntry{
-				Path:    f.Path,
-				State:   f.Status,
-				OldPath: f.OldPath,
-				Bytes:   size,
-				IsEOF:   isEOF,
+				Path:          f.Path,
+				PathBase64:    rawPathBase64(f.Path),
+				State:         f.Status,
+				OldPath:       f.OldPath,
+				OldPathBase64: rawPathBase64(f.OldPath),
+				Bytes:         size,
+				IsEOF:         isEOF,
 			})
 			continue
 		}
 		payload.Files = append(payload.Files, fileDiffEntry{
-			Path:      f.Path,
-			State:     f.Status,
-			OldPath:   f.OldPath,
-			Raw:       f.Patch,
-			Bytes:     size,
-			IsEOF:     isEOF,
-			Additions: f.Additions,
-			Deletions: f.Deletions,
+			Path:          f.Path,
+			PathBase64:    rawPathBase64(f.Path),
+			State:         f.Status,
+			OldPath:       f.OldPath,
+			OldPathBase64: rawPathBase64(f.OldPath),
+			Raw:           f.Patch,
+			Bytes:         size,
+			IsEOF:         isEOF,
+			Additions:     f.Additions,
+			Deletions:     f.Deletions,
 		})
 	}
 	return payload, nil
@@ -449,6 +457,7 @@ type blameLineEntry struct {
 	CommitSHA          string `json:"commit_sha"`
 	OriginalLineNumber int    `json:"original_line_number"`
 	OriginalPath       string `json:"original_path"`
+	OriginalPathBase64 string `json:"original_path_base64,omitempty"`
 	PreviousCommitSHA  string `json:"previous_commit_sha,omitempty"`
 	AuthorName         string `json:"author_name"`
 	AuthorEmail        string `json:"author_email"`
@@ -460,10 +469,11 @@ type blameLineEntry struct {
 }
 
 type blameResponse struct {
-	Ref       string           `json:"ref"`
-	Path      string           `json:"path"`
-	CommitSHA string           `json:"commit_sha"`
-	Lines     []blameLineEntry `json:"lines"`
+	Ref        string           `json:"ref"`
+	Path       string           `json:"path"`
+	PathBase64 string           `json:"path_base64,omitempty"`
+	CommitSHA  string           `json:"commit_sha"`
+	Lines      []blameLineEntry `json:"lines"`
 }
 
 // handleBlame implements GET /api/v1/repos/blame: per-line attribution of
@@ -539,6 +549,7 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 			CommitSHA:          l.CommitSHA,
 			OriginalLineNumber: l.OriginalLineNumber,
 			OriginalPath:       l.OriginalPath,
+			OriginalPathBase64: rawPathBase64(l.OriginalPath),
 			PreviousCommitSHA:  l.PreviousCommitSHA,
 			AuthorName:         l.AuthorName,
 			AuthorEmail:        l.AuthorEmail,
@@ -550,10 +561,11 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, blameResponse{
-		Ref:       refName,
-		Path:      path,
-		CommitSHA: commit,
-		Lines:     entries,
+		Ref:        refName,
+		Path:       path,
+		PathBase64: rawPathBase64(path),
+		CommitSHA:  commit,
+		Lines:      entries,
 	})
 }
 
@@ -595,8 +607,9 @@ type grepLineEntry struct {
 }
 
 type grepFileMatch struct {
-	Path  string          `json:"path"`
-	Lines []grepLineEntry `json:"lines"`
+	Path       string          `json:"path"`
+	PathBase64 string          `json:"path_base64,omitempty"`
+	Lines      []grepLineEntry `json:"lines"`
 }
 
 type grepResponse struct {
@@ -881,7 +894,7 @@ truncated:
 	matches := []grepFileMatch{}
 	for _, pos := range page {
 		if n := len(matches); n == 0 || matches[n-1].Path != pos.path {
-			matches = append(matches, grepFileMatch{Path: pos.path, Lines: []grepLineEntry{}})
+			matches = append(matches, grepFileMatch{Path: pos.path, PathBase64: rawPathBase64(pos.path), Lines: []grepLineEntry{}})
 		}
 		last := &matches[len(matches)-1]
 		last.Lines = append(last.Lines, pos.line)

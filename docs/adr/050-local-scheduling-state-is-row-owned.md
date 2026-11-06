@@ -86,9 +86,11 @@ the authority (after a REST write, or a push that died after its CAS), and
 end `done` without forwarding the newer value. Now a forwarding push's hook
 records `RequestPush` before its authority CAS, after the ref's push hold is
 in place. A failed write, a failed read of the repository's upstream link,
-or a metadata store the hook cannot open refuses the ref update. Ephemeral
-updates and a sync run's own loopback push record no intent, and this step
-does not refuse them. The intent after the
+or a metadata store the hook cannot open refuses the ref update, with a
+fixed message that names no store detail ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
+amendment). Ephemeral updates, a sync run's own loopback push, and a caller
+whose token may not forward record no intent, and this step does not
+refuse them. The intent after the
 CAS stays, and still does the pull marking. A local push run's loopback
 fetch fails with HTTP 423 when its hydrate would skip a push-held ref whose
 cached value is older than the authority, and the run ends with `restore`,

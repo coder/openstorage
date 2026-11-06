@@ -120,6 +120,46 @@ func assertSignedURLArgs(key, method string, expiry time.Duration) {
 	assertf(expiry > 0, "SignedURL(%s %s): non-positive expiry %v", method, key, expiry)
 }
 
+// PageListerAfter is the optional BlobStore capability behind ListPagesAfter.
+// A store that lacks it, a decorator that embeds a BlobStore for example, is
+// still correct through ListPagesAfter: the helper filters its ListPages, so
+// that ListPages must list in key order.
+//
+// The order guarantee covers the keys this system writes: repository IDs, pack
+// IDs, LFS object IDs and quarantine nonces. gocloud's S3 driver stores a key
+// with a control character, "../" or "__0x" under an escaped spelling, and S3
+// orders by that spelling, so a listing can return such a key out of order and a
+// resumed listing can skip it. The sweep treats such a key as foreign.
+type PageListerAfter interface {
+	ListPagesAfter(ctx context.Context, prefix, after string, pageSize int, fn func([]ListedObject) error) error
+}
+
+// ListPagesAfter streams the objects under prefix whose key sorts strictly
+// after after, in lexicographic key order, with the page rules of
+// BlobStore.ListPages. after need not be a key that exists, and an empty after
+// lists everything. It lets a scan that saved its place resume without reading
+// the keys it already finished, on stores that can start there.
+func ListPagesAfter(ctx context.Context, b BlobStore, prefix, after string, pageSize int, fn func([]ListedObject) error) error {
+	assertf(b != nil, "ListPagesAfter(%q): nil store", prefix)
+	assertf(pageSize > 0, "ListPagesAfter(%q): non-positive page size %d", prefix, pageSize)
+	assertf(fn != nil, "ListPagesAfter(%q): nil fn", prefix)
+	if l, ok := b.(PageListerAfter); ok {
+		return l.ListPagesAfter(ctx, prefix, after, pageSize, fn)
+	}
+	return b.ListPages(ctx, prefix, pageSize, func(page []ListedObject) error {
+		kept := page[:0]
+		for _, o := range page {
+			if o.Key > after {
+				kept = append(kept, o)
+			}
+		}
+		if len(kept) == 0 {
+			return nil
+		}
+		return fn(kept)
+	})
+}
+
 // ListedObject is one blob under a prefix.
 type ListedObject struct {
 	Key  string
@@ -680,7 +720,10 @@ type S3 struct {
 	expectedOwner string
 }
 
-var _ BlobStore = (*S3)(nil)
+var (
+	_ BlobStore       = (*S3)(nil)
+	_ PageListerAfter = (*S3)(nil)
+)
 
 // EnvExpectedBucketOwner optionally pins every S3 request to a bucket
 // owner (issue #58): when set to a 12-digit AWS account ID, the client
@@ -928,6 +971,54 @@ func (b *S3) List(ctx context.Context, prefix string) ([]ListedObject, error) {
 // ListPages streams objects under prefix in key order, one page at a time.
 func (b *S3) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]ListedObject) error) error {
 	return bucketListPages(ctx, b.bucket, prefix, pageSize, fn)
+}
+
+// ListPagesAfter is ListPages from the first key after after. It asks S3 to
+// start there (StartAfter on ListObjectsV2, Marker on the legacy ListObjects),
+// and filters the keys it gets either way, so a server that ignores the
+// request still answers correctly.
+func (b *S3) ListPagesAfter(ctx context.Context, prefix, after string, pageSize int, fn func([]ListedObject) error) error {
+	var beforeList func(func(any) bool) error
+	if s3KeyIsPlain(after) {
+		beforeList = s3StartAfter(after)
+	}
+	return bucketListPagesAfter(ctx, b.bucket, prefix, after, beforeList, pageSize, fn)
+}
+
+// s3KeyIsPlain reports whether gocloud's s3blob sends key unchanged. It
+// escapes control characters, the slash of "../", and anything that looks
+// like its own "__0x<hex>__" escape, and the request must carry the escaped
+// spelling of a key. A key that is not plain is not sent as StartAfter.
+func s3KeyIsPlain(key string) bool {
+	if key == "" || strings.Contains(key, "__") || strings.Contains(key, "../") {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] < 0x20 || key[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// s3StartAfter is a gocloud ListOptions.BeforeList hook that starts a listing
+// after key on the first page of either S3 list API. Later pages carry their
+// own continuation token or marker, which the hook leaves alone.
+func s3StartAfter(key string) func(func(any) bool) error {
+	return func(as func(any) bool) error {
+		var v2 *s3.ListObjectsV2Input
+		if as(&v2) {
+			if v2.ContinuationToken == nil {
+				v2.StartAfter = aws.String(key)
+			}
+			return nil
+		}
+		var v1 *s3.ListObjectsInput
+		if as(&v1) && v1.Marker == nil {
+			v1.Marker = aws.String(key)
+		}
+		return nil
+	}
 }
 
 // VersioningEnabled reports whether the backing bucket has ever had S3

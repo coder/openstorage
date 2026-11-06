@@ -2,11 +2,12 @@
 
 ## Overview
 
-Standalone maintenance scripts for docs, releases, and the Compose quickstart. None of them is a Go package, and `go test ./...` does not run them.
+Standalone maintenance scripts for docs, releases, the Compose quickstart, and the words of Git's patch refusals. None of them is a Go package, and `go test ./...` does not run them.
 
 - `check-doc-links.py`: an offline, standard-library-only checker for relative inline Markdown links and anchors in every `README.md` that git tracks or that is untracked and not ignored, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and `docs/`. It also checks each `[path:symbol]` code citation in a `README.md`. A link target or cited file must be tracked by git, and the symbol must be a name that the file declares, or a whole-token phrase in the code of a shell script. It needs a git checkout. CI runs it in the required `lint` job of `.github/workflows/ci.yml`.
 - `release-archives.sh`: cross-compiles `./cmd/openstorage` for four platforms, packages each binary with `LICENSE`, and writes `checksums.txt`. `.github/workflows/release.yml` runs it.
 - `smoke-compose-quickstart.sh`: an end-to-end smoke test of `compose.quickstart.yml` against a local image. It covers key init, the HTTP API, Git and Git LFS push and clone, restart persistence, and fail-closed init faults. CI runs it in `.github/workflows/ci.yml` and `.github/workflows/image.yml`.
+- `check-apply-messages.sh`: runs the patch cases in `internal/api/testdata/applymsg` through the `git` on PATH and checks the exit status and the message lines that `internal/api` reads to pick an HTTP status. `TestApplyMessageCases` in `internal/api` runs it, and the `image` job in `.github/workflows/ci.yml` runs it inside the built image, whose Git is Alpine's.
 
 `test_check_doc_links.py` holds the regression tests for `check-doc-links.py`. It is a test file, not a script.
 
@@ -35,7 +36,7 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 - `[check-doc-links.py:go_names]` Go: functions, methods (`T.M` and `M`), types, struct fields and interface methods (`T.F` and `F`), constants, variables, and flags (`flag -name`) that the `flag` package or a `flag.FlagSet` defines.
 - `[check-doc-links.py:tf_names]` Terraform: `T` and `T.N` for resources, `data.T.N`, `var.N` and `N`, `output.N` and `N`, `provider.N`, `module.N`, `local.K`, `terraform`, and `ADDRESS.B` for a block `B` nested in a resource, data, or ephemeral block, where `data.T.N` and `ephemeral.T.N` are the data and ephemeral addresses.
 - `[check-doc-links.py:py_names]` Python: `def` and `class` names (`C.m` and `m`), module-level assignments and calls (`os.chdir`), and `__main__` when the file has a main guard.
-- `[check-doc-links.py:js_names]` JavaScript: function, class, `const`, `let`, and `var` names that start a statement. A line after one that ends in an operator or an opening bracket (`JS_CONTINUES`) continues an expression, so a named function or class expression there is not a declaration. Object keys are not citable.
+- `[check-doc-links.py:js_names]` JavaScript: function, class, `const`, `let`, and `var` names that start a statement and are followed by what a declaration has there (`JS_DECLARATION`). A line after one that ends in an operator or an opening bracket (`JS_CONTINUES`) continues an expression, so a named function or class expression there is not a declaration. Object keys are not citable. `[check-doc-links.py:js_mask]` lexes the file first and stops where it cannot be sure: a name below the stop fails closed.
 - `[check-doc-links.py:ShellMentions]` Shell: any phrase that appears as whole tokens in the script's code, with comments removed (`destroy`, `set -euo pipefail`, `config.json`). Strings and heredoc bodies count, because shell contracts cite the literal values in them.
 - `[check-doc-links.py:unit_names]` systemd units: section names (`Service`). A line that continues the line before it (after a trailing `\`, with comment lines skipped) is not a header.
 - `[check-doc-links.py:gh_anchor]` Converts heading text to a GitHub-style anchor slug.
@@ -49,8 +50,8 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 - Module-level compiled regular expressions:
   - `[check-doc-links.py:CITATION]` One citation: `[`, a path whose last element has a letter-led extension or starts with `Dockerfile`, an optional `:symbol`, then `]` not followed by `(` or `[`.
   - `[check-doc-links.py:LINE_NUMBER]` A symbol that is a line number or a line range (`8`, `4-7`).
-  - `[check-doc-links.py:GO_LEXER]` `[check-doc-links.py:TF_LEXER]` `[check-doc-links.py:PY_LEXER]` `[check-doc-links.py:JS_LEXER]` The comments and string literals that `masked` blanks: Go comments, strings, raw strings, and runes. Terraform `#`, `//`, and `/* */` comments, strings (with `${...}` interpolation), and heredocs. Python comments, strings, and docstrings. JavaScript comments, strings, and template literals.
-  - `[check-doc-links.py:JS_CONTINUES]` The end of a line that leaves its expression open: an operator character, an opening bracket, or one of the keywords `await`, `case`, `delete`, `extends`, `in`, `instanceof`, `new`, `of`, `typeof`, `void` (the keywords that take an operand after them). A postfix `++` or `--`, and `return`, `throw`, or `yield` end a statement, so they do not count. A trailing `/` counts as division, so a statement that ends in a regex literal without a `;` fails closed. A string keeps its quotes in the masked text, so a line that ends in a string is not an open expression.
+  - `[check-doc-links.py:GO_LEXER]` `[check-doc-links.py:TF_LEXER]` `[check-doc-links.py:PY_LEXER]` The comments and string literals that `masked` blanks: Go comments, strings, raw strings, and runes. Terraform `#`, `//`, and `/* */` comments, strings (with `${...}` interpolation), and heredocs. Python comments, strings, and docstrings.
+  - `[check-doc-links.py:JS_CONTINUES]` `[check-doc-links.py:js_continues]` The end of a line that leaves its expression open: an operator character (`=`, `,`, `?`, `:`, `*`, `/`, `%`, `&`, `|`, `^`, `<`, `>`, `!`, `~`, `.`), an opening `(` or `[`, or one of the words `as`, `await`, `case`, `delete`, `extends`, `in`, `instanceof`, `new`, `of`, `typeof`, `void`, which take an operand or a name after them. A word counts after `...` and not after a member `.`. `js_continues` decides a trailing `+` or `-`: a run of signs leaves the expression open, unless it ends in a postfix `++` or `--` that follows a name or `]`. `return`, `throw`, and `yield` end a statement, so they do not count. A trailing `/` counts as division, so a statement that ends in a regex literal without a `;` fails closed. A string keeps its quotes in the masked text, so a line that ends in a string is not an open expression.
   - `[check-doc-links.py:LINK]` One inline link: `](`, a destination with at most one level of balanced parentheses, an optional `#fragment`, and an optional quoted title, then `)`.
   - `[check-doc-links.py:REFDEF]` A reference-style link definition line (`[label]:` after at most three spaces).
   - `[check-doc-links.py:ANGLE]` An angle-bracket destination (`](` then optional space, then `<`).
@@ -85,6 +86,14 @@ Standalone maintenance scripts for docs, releases, and the Compose quickstart. N
 - `[smoke-compose-quickstart.sh:assert_deleted]` Succeeds only when no container, volume, or network has the label `com.docker.compose.project=$project`.
 - `[smoke-compose-quickstart.sh:cleanup]` `EXIT` trap. Destroys the main and the `-invalid` project, removes `$work`, and exits with the saved code.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:dir]` Required argument: the cases directory. It holds `cases.tsv` and one `<name>.patch` per row.
+- `[check-apply-messages.sh:cases.tsv]` Tab-separated rows: name, command (`cached` or `summary`), expected exit status, the HTTP status that `internal/api` must pick (`TestApplyMessageCases` reads it, the script does not), and a line prefix.
+- `[check-apply-messages.sh:cached]` Runs `git apply --cached --binary --whitespace=nowarn` on a copy of the index of a scratch repository. A line of stderr must start with the prefix.
+- `[check-apply-messages.sh:summary]` Runs `git apply --summary`. A line of stdout must start with the prefix.
+- `[check-apply-messages.sh:failed]` Prints one `ok` or `FAIL` line per case, then a `CHECKED <n> FAILED <m>` line. It exits 0 only when at least one case ran and none failed.
+
 No child directories.
 
 ## Invariants
@@ -108,8 +117,10 @@ No child directories.
 - `[check-doc-links.py:CITATION]` Recognizes a citation without looking at `LANGUAGES`. So a citation with a symbol in a file kind that has no reader fails as `UNSUPPORTED CITATION`, and a bare `[path]` of any kind needs only the file.
 - `[check-doc-links.py:citation_problem]` Checks the symbol's form before the file. An empty symbol (`[path:]`) fails as `EMPTY CITATION`. A line number or range fails as `LINE NUMBER CITATION`. Cite a name instead.
 - `[check-doc-links.py:citation_problem]` A citation path is relative to the directory of its `README.md`. After symlinks are resolved, it must name a file inside the repository that passes `indexed`, else `MISSING CITED FILE`.
-- `[check-doc-links.py:go_names]` `[check-doc-links.py:tf_names]` `[check-doc-links.py:py_names]` `[check-doc-links.py:js_names]` A citation of a Go, Terraform, Python, or JavaScript file resolves only to a declaration. `masked` runs first, so a declaration-shaped line inside a comment, a string, a raw string, a heredoc, or a docstring does not count. A call that mentions the name does not count either, except that `py_names` accepts a module-level call such as `os.chdir`. `go_names` relies on `gofmt` layout.
-- `[check-doc-links.py:js_names]` A function or class expression on a line after one that ends in an operator (`=`, `||`, `=>`, `?`, `:`), an opening bracket, or `await`, `case`, `delete`, `extends`, `in`, `instanceof`, `new`, `of`, `typeof`, or `void` is not a declaration. Blank and comment lines between the two do not end the expression. A line that ends in a postfix `++` or `--`, a string, `return`, `throw`, or `yield` ends its statement. A line that ends in `/` or `:` does not, because the reader cannot tell division from the end of a regex literal or a ternary colon from a `case` label, so a declaration directly after a `case` label fails closed.
+- `[check-doc-links.py:go_names]` `[check-doc-links.py:tf_names]` `[check-doc-links.py:py_names]` A citation of a Go, Terraform, or Python file resolves only to a declaration. `masked` runs first, so a declaration-shaped line inside a comment, a string, a raw string, a heredoc, or a docstring does not count. A call that mentions the name does not count either, except that `py_names` accepts a module-level call such as `os.chdir`. `go_names` relies on `gofmt` layout.
+- `[check-doc-links.py:js_names]` `[check-doc-links.py:js_mask]` A citation of a JavaScript file resolves only to a declaration too, but `js_mask` lexes the file instead of using `masked`. It blanks comments, strings, regex literals, and templates, including every `${}` substitution and each template or regex literal inside one, so a declaration-shaped line in any of them does not count. It decides between a regex literal and a division from the previous token. It stops when it cannot be sure of its place: at a `/` after `)`, `}`, `++`, `--`, `of`, `yield`, or `await`, at a `/` that starts a line after an operand (a semicolon inserted at the line break can make it a regex literal), at `<!--` or `-->`, at a string, comment, regex literal, or template that does not end, and at a character that no token outside a literal can hold (a backslash, a lone `#`, an ASCII control character, a non-ASCII character that is not a letter, a digit, or white space). `js_names` reads no line from the stop line on. A name declared there or below fails as `UNRESOLVED CITATION`, and the message names the stop line and what the reader could not do. Cite a name above the stop, or cite the file alone.
+- `[check-doc-links.py:js_names]` `[check-doc-links.py:JS_DECLARATION]` A declaration keyword counts only when its name is followed by `(` or the end of the line (function), `{`, `extends`, or the end of the line (class), or `=`, `;`, `,`, `}`, or the end of the line (`const`, `let`, `var`). A reserved word is never a name (`let in x`, `class extends X {}`), and neither is `as`, which follows the keyword in an import or export list (`export { class as k }`). A line that starts inside an open `(` or `[` is never a declaration, because `;` in a `for (;;)` header does not end a statement.
+- `[check-doc-links.py:js_names]` `[check-doc-links.py:js_continues]` A function or class expression on a line after one that ends in an operator (`=`, `||`, `=>`, `?`, `:`), an opening bracket, a run of signs whose last token is a single `+` or `-` or a prefix `++` or `--`, or `as`, `await`, `case`, `delete`, `extends`, `in`, `instanceof`, `new`, `of`, `typeof`, or `void` (also after `...`) is not a declaration. Blank and comment lines between the two do not end the expression. A line that ends in a postfix `++` or `--` (after a name or `]` on the same line), a string, `return`, `throw`, or `yield` ends its statement. A line that ends in `/` or `:` does not, because the reader cannot tell division from the end of a regex literal or a ternary colon from a `case` label, so a declaration directly after a `case` label fails closed.
 - `[check-doc-links.py:ShellMentions]` A citation of a shell script resolves to whole tokens in code. A `#` at the start of a line, after whitespace, or after `;`, `&`, `|`, `(`, or `)` starts a comment, even inside quotes. A name that appears only in a comment does not count, and `config` does not match inside `config.json`.
 
 ### `release-archives.sh`
@@ -142,6 +153,11 @@ No child directories.
 - `[smoke-compose-quickstart.sh:fault]` For each init fault (`private-missing`, `private-corrupt`, `private-permissions`, `pair-mismatch`, `public-empty`, `public-mismatch`, `public-symlink`, `public-directory`, `published-only`), `up` must fail, no server may run, `init` must exit non-zero, and the key volumes must stay unchanged.
 - `[smoke-compose-quickstart.sh:cleanup]` If `destroy` fails for either project, the exit code becomes 1.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:GIT_CONFIG_GLOBAL]` Ignores host Git configuration: unsets every `GIT_*` variable, then sets `HOME` to the work directory, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `LC_ALL=C`.
+- `[check-apply-messages.sh:checked]` A case fails when git exits with another status, or when no line has the prefix. A run that checked no case fails.
+
 ## Side Effects
 
 ### `check-doc-links.py`
@@ -169,10 +185,15 @@ No child directories.
 - `[smoke-compose-quickstart.sh:git]` Commits locally and runs `git push -u origin main` and `git clone` against the local server.
 - `[smoke-compose-quickstart.sh:trap]` Traps: `EXIT` runs `cleanup`, `INT` exits 130, `TERM` exits 143, `ERR` prints the failing line without credentials or raw responses.
 
+### `check-apply-messages.sh`
+
+- `[check-apply-messages.sh:work]` Creates a `mktemp -d` directory with a scratch repository, and removes it on `EXIT`. It only reads `<cases-dir>`.
+
 ## Verification
 
 - Doc links and citations: `python3 scripts/check-doc-links.py` (from the `lint` job in `.github/workflows/ci.yml`).
 - Checker tests: `python3 -B -m unittest discover -s scripts -p 'test_*.py' -v` (from the `lint` job in `.github/workflows/ci.yml`). `-B` keeps `scripts/__pycache__/` out of the checkout.
 - Smoke syntax: `bash -n scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml`).
 - Smoke run (needs Docker and a local image): `OPENSTORAGE_IMAGE=<local-image> bash scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml` and `.github/workflows/image.yml`).
+- Git's patch refusals: `sh scripts/check-apply-messages.sh internal/api/testdata/applymsg` (from `TestApplyMessageCases` in `internal/api`, and from the `image` job in `.github/workflows/ci.yml`, which runs it inside the image).
 - Release archives (needs Go): `./scripts/release-archives.sh <tag> <outdir>` (from `.github/workflows/release.yml`). Use an `<outdir>` outside the checkout. Untracked files in the checkout make Go stamp `vcs.modified=true` (see the comment in `.github/workflows/release.yml`).

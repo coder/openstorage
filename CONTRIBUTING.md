@@ -213,8 +213,12 @@ A PR merges when all of these hold:
 
 1. **CI is green** — every job in `ci.yml`: `lint` (golangci-lint + docs
    checks), `terraform` (offline Terraform checks), `test` (default lane),
-   `test-local`, `test-s3wal` (S3-only storage lane), and `image` (Docker build +
-   runtime-dependency smoke test), plus the `pr-title` check. Release PRs need
+   `test-local`, `test-s3wal` (S3-only storage lane), `image` (Docker build +
+   runtime-dependency smoke test), and `orphan-sweep-fingerprints` and
+   `lane-schedule-fingerprints` (the code covered by the
+   [verify-orphan-sweep](.agents/skills/verify-orphan-sweep/SKILL.md) and
+   [verify-lane-schedule](.agents/skills/verify-lane-schedule/SKILL.md) models
+   is unchanged), plus the `pr-title` check. Release PRs need
    their held `ci` and `pr-title` runs approved; see the
    [release runbook](docs/how-to/release.md).
 2. **A clean automated review round** — comment `@codex review`. Fix genuine
@@ -223,8 +227,10 @@ A PR merges when all of these hold:
 3. **A clean automated security round** — same protocol with
    `@codex security review`.
 4. **No unresolved review threads.**
-5. **The branch is up to date with `main`** — branch protection enforces it.
-   Prefer GitHub's *Update branch* over force-pushing.
+5. **The PR merges through the merge queue** — the queue squashes it onto the
+   latest `main` and runs the required checks there, so the branch does not
+   need to be up to date. When `main` conflicts with it, merge `main` into the
+   branch instead of force-pushing.
 
 Fixes land [**red-first**](docs/reference/testing.md#red-first-tests): the PR
 includes a test that fails on the pre-fix code. Verify docs claims against the

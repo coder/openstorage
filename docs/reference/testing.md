@@ -27,7 +27,8 @@ One suite, several storage stacks. `TestMain` picks the stack for the whole run.
 | [Floci githttp E2E](#the-floci-githttp-e2e-lane) | [`floci-nightly-githttp.yml`](../../.github/workflows/floci-nightly-githttp.yml) | 04:53 | git/LFS E2E on STS credentials |
 
 In [`ci.yml`](../../.github/workflows/ci.yml), `test`, `test-local`, and
-`test-s3wal` run the three lanes; `lint` and `image` complete the set. Each
+`test-s3wal` run the three lanes; `lint`, `terraform`, `image`,
+`orphan-sweep-fingerprints`, and `lane-schedule-fingerprints` complete the set. Each
 test job runs `git lfs version` first, so a missing LFS client fails instead of
 silently skipping LFS coverage.
 

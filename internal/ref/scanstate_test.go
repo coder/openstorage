@@ -5,8 +5,11 @@ package ref
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,6 +95,150 @@ func TestJobScanState_RoundTrip(t *testing.T) {
 		}
 		if err := ss.DeleteJobScanState(ctx, job, scope); err != nil {
 			t.Fatalf("re-delete: %v", err)
+		}
+	})
+}
+
+// TestJobScanState_PutIf: a conditional write lands only when the row's
+// generation is the expected one, an absent row counts as generation 0, and
+// among writers that hold the same generation exactly one wins.
+func TestJobScanState_PutIf(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		ctx := context.Background()
+		job, scope := "test-job", "put-if/"+t.Name()
+		want := func(payload string, generation int64) {
+			t.Helper()
+			st, ok, err := ss.GetJobScanState(ctx, job, scope)
+			if err != nil || !ok || st.Payload != payload || st.Generation != generation {
+				t.Fatalf("row = (%+v, %v, %v), want %s at generation %d", st, ok, err, payload, generation)
+			}
+		}
+
+		if err := ss.PutJobScanStateIf(ctx, job, scope, "late", 8, 7); !errors.Is(err, ErrScanStateConflict) {
+			t.Fatalf("write that expects a generation on an absent row = %v, want ErrScanStateConflict", err)
+		}
+		if _, ok, _ := ss.GetJobScanState(ctx, job, scope); ok {
+			t.Fatal("a refused write created the row")
+		}
+		if err := ss.PutJobScanStateIf(ctx, job, scope, "first", 1, 0); err != nil {
+			t.Fatalf("create with expected generation 0: %v", err)
+		}
+		want("first", 1)
+		if err := ss.PutJobScanStateIf(ctx, job, scope, "second", 1, 0); !errors.Is(err, ErrScanStateConflict) {
+			t.Fatalf("create over an existing row = %v, want ErrScanStateConflict", err)
+		}
+		if err := ss.PutJobScanStateIf(ctx, job, scope, "stale", 2, 5); !errors.Is(err, ErrScanStateConflict) {
+			t.Fatalf("write with a stale generation = %v, want ErrScanStateConflict", err)
+		}
+		want("first", 1)
+		if err := ss.PutJobScanStateIf(ctx, job, scope, "next", 1, 1); err != nil {
+			t.Fatalf("write with the current generation: %v", err)
+		}
+		want("next", 1)
+		if err := ss.PutJobScanStateIf(ctx, job, scope, "new pass", 2, 1); err != nil {
+			t.Fatalf("advance the generation: %v", err)
+		}
+		want("new pass", 2)
+		// The run that still holds generation 1 loses the row.
+		if err := ss.PutJobScanStateIf(ctx, job, scope, "old run", 1, 1); !errors.Is(err, ErrScanStateConflict) {
+			t.Fatalf("write by the run that lost the row = %v, want ErrScanStateConflict", err)
+		}
+		want("new pass", 2)
+
+		// A row at generation 0 matches an expected generation 0.
+		zero := scope + "/zero"
+		if err := ss.PutJobScanState(ctx, job, zero, "zero", 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := ss.PutJobScanStateIf(ctx, job, zero, "rewritten", 0, 0); err != nil {
+			t.Fatalf("write over a generation-0 row: %v", err)
+		}
+
+		// Eight writers hold generation 2 and each writes generation 3.
+		const writers = 8
+		var wins atomic.Int32
+		var wg sync.WaitGroup
+		for i := range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := ss.PutJobScanStateIf(ctx, job, scope, fmt.Sprintf("writer %d", i), 3, 2)
+				switch {
+				case err == nil:
+					wins.Add(1)
+				case !errors.Is(err, ErrScanStateConflict):
+					t.Errorf("writer %d: %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+		if wins.Load() != 1 {
+			t.Fatalf("%d writers won, want exactly 1", wins.Load())
+		}
+		if st, _, _ := ss.GetJobScanState(ctx, job, scope); st.Generation != 3 {
+			t.Fatalf("generation = %d, want 3", st.Generation)
+		}
+	})
+}
+
+// TestJobScanState_PutIfCreateWins: writers that expect generation 0 on a row
+// that does not exist yet and write generation 1 — each the start of the next
+// pass — have exactly one winner.
+func TestJobScanState_PutIfCreateWins(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		ctx := context.Background()
+		const writers = 6
+		var wins atomic.Int32
+		var wg sync.WaitGroup
+		for i := range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := ss.PutJobScanStateIf(ctx, "test-job", "put-if-create-wins/"+t.Name(), fmt.Sprintf("writer %d", i), 1, 0)
+				switch {
+				case err == nil:
+					wins.Add(1)
+				case !errors.Is(err, ErrScanStateConflict):
+					t.Errorf("writer %d: %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+		if wins.Load() != 1 {
+			t.Fatalf("%d writers created the row, want exactly 1", wins.Load())
+		}
+	})
+}
+
+// TestJobScanState_PutIfCreateRace: writers that expect generation 0 on a row
+// that does not exist yet, and write generation 0 again, all succeed. The row
+// never leaves generation 0, so none of them may be told that another run took
+// it over.
+func TestJobScanState_PutIfCreateRace(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		ctx := context.Background()
+		const writers = 6
+		for round := range 8 {
+			scope := fmt.Sprintf("put-if-create/%s/%d", t.Name(), round)
+			errs := make(chan error, writers)
+			var wg sync.WaitGroup
+			for i := range writers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					errs <- ss.PutJobScanStateIf(ctx, "test-job", scope, fmt.Sprintf("writer %d", i), 0, 0)
+				}()
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				if err != nil {
+					t.Fatalf("round %d: a writer that expected generation 0 on a row at generation 0 got %v", round, err)
+				}
+			}
 		}
 	})
 }
