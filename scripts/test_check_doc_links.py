@@ -447,6 +447,10 @@ class CitationTests(CheckerTestCase):
             "a.b\ntypeof /`/.source;\n", "a.b\nnew /`/.constructor();\n", "const q = a.b in /`/;\n",
             "const q = a?.b instanceof /`/.constructor;\n", "function h() {\n  x.y\n  return /`/.test(x);\n}\n",
             "a?.(typeof /`/.source);\n", "a?.[typeof /`/.source];\n",
+            # A keyword after a string, `++` or a regex literal that ended the line starts an operand again. A regex
+            # literal can open the file or follow an opening bracket.
+            "'a'\ntypeof /`/.source;\n", "x++\ntypeof /`/.source;\n", "const r = /a/\ntypeof /`/.source;\n",
+            "/`/.test(x);\n", "f(/`/, 1);\n",
         ]
         sources = [prefix + trap for prefix in [
             "const r = /`/;\n", "const r = /[`]/g;\n", "const r = /'`/;\n", "const r = /[/]`/;\n", "const r = /[/*]/;\n",
@@ -461,6 +465,17 @@ class CitationTests(CheckerTestCase):
         sources += [
             "const t = `a ${ `b\nfunction stale() {}\n` } c`;\nfunction real() {}\n",
             "const t = `${ `a` / 2 } a/b` + `\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const q = /a/ / `b / c\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const t = `\\${ `;\nconst u = `\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "{\n  for (;\n  function stale() {};) { break }\n}\nfunction real() {}\n",
+            "f(/`/, 1);\nconst tt = `a ${\nfunction stale() {}\n}`;\nfunction real() {}\n",
+            # A `{` inside a substitution opens a block or an object, and its `}` does not end the substitution.
+            "const t = `${ `${ {a: () => {}} + /`/ }` }\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const t = `${ `${ {} + {k: /`/} }` }\nfunction stale() {}\n`;\nfunction real() {}\n",
+            "const t = `${ {a: 1} + `\nfunction stale() {}\n` }`;\nfunction real() {}\n",
+            "const t = `${ {a: {b: 1}} + `\nfunction stale() {}\n` }`;\nfunction real() {}\n",
+            "const t = `${ (() => { return 1; })() + `\nfunction stale() {}\n` }`;\nfunction real() {}\n",
+            "const t = `${ {a: 1}.a + `\nfunction stale() {}\n` }`;\nfunction real() {}\n",
             "const s = 'a\\\nfunction stale() {}\\\n';\nfunction real() {}\n",
             "const t = `\\`\nfunction stale() {}\n`;\nfunction real() {}\n",
             "// comment\u2028const open = `\nfunction stale() {}\n`;\nfunction real() {}\n",
@@ -478,11 +493,12 @@ class CitationTests(CheckerTestCase):
               'const test = x => /a\\/b/.test(x) && y / z;\n'
               'const first = list[0] / 2;\n'
               "const quote = '\\'' + \"say \\\"hi\\\"\";\n"
+              'const nested = `${ `${ {a: 1}.a }` + {b: {c: 1}}.b.c }`;\nconst deep = `${ `${ `${ {a: {b: 1}}.a.b }` }` }`;\n'
               'class Counter {\n  #count = 0;\n  get half() { return this.#count / 2; }\n}\n'
               'class Wide\n  extends Counter {\n}\nclass Tight{}\nconst pair = 1,\n  other = 2;\nlet late\n  = 3;\n'
               'function broken\n  (a) {}\n{\n  var bare }\n'
               'function afterAll() {}\n')
-        ok = ["slug", "label", "ratio", "test", "first", "quote", "Counter", "Wide", "Tight", "pair", "late", "broken", "bare",
+        ok = ["slug", "label", "ratio", "test", "first", "quote", "nested", "deep", "Counter", "Wide", "Tight", "pair", "late", "broken", "bare",
               "afterAll"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result)
