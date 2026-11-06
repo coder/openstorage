@@ -68,15 +68,19 @@ func (s *PG) InitSchema(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x4D455441)`); err != nil { // "META"
 			return err
 		}
-		// Lock order (issue #609): every writer that reaches repo_upstreams
-		// through the default-branch trigger already holds repos. The DDL
-		// below takes ACCESS EXCLUSIVE on repo_upstreams before it does on
-		// repos, so a boot that held repo_upstreams while it waited for a
-		// repos holder would deadlock against such a writer. Take repos
-		// first, here: the boot then waits holding no table, and a fresh
-		// database has no repos table and no writer yet.
+		// Lock order (issue #609): the default-branch trigger makes a repos
+		// write (an older replica's PATCH) reach repo_upstreams. The DDL below
+		// takes ACCESS EXCLUSIVE on repo_upstreams before it does on repos,
+		// so a boot that held repo_upstreams while it waited for a repos
+		// writer would deadlock against it. Take a repos lock that conflicts
+		// with every writer, first, so the boot waits holding no table. The
+		// mode must not conflict with ROW SHARE: a writer that took
+		// repo_upstreams first and then locks a repos row FOR UPDATE
+		// (SetRepoUpstream) would otherwise wait on this boot while the
+		// boot waits on it. A fresh database has no repos table and no
+		// writer yet.
 		if _, err := tx.Exec(ctx, `DO $$ BEGIN
-			IF to_regclass('repos') IS NOT NULL THEN LOCK TABLE repos IN ACCESS EXCLUSIVE MODE; END IF;
+			IF to_regclass('repos') IS NOT NULL THEN LOCK TABLE repos IN SHARE ROW EXCLUSIVE MODE; END IF;
 		END $$`); err != nil {
 			return err
 		}

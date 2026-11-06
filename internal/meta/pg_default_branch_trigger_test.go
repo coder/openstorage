@@ -149,77 +149,90 @@ func dropTrigger(ctx context.Context, t *testing.T, s *PG) {
 	})
 }
 
-// TestPGInitSchemaTakesReposFirst (issue #609): a PATCH that is still open
-// holds repos and then reaches repo_upstreams through the trigger. A boot
-// that took ACCESS EXCLUSIVE on repo_upstreams before it waited for repos
-// would deadlock against it. The boot takes repos first, so it waits holding
-// nothing, the PATCH finishes, and the boot completes.
-func TestPGInitSchemaTakesReposFirst(t *testing.T) {
+// TestPGInitSchemaLockOrder (issue #609): a boot runs DDL that takes ACCESS
+// EXCLUSIVE on repo_upstreams before it does on repos. It must not deadlock
+// with either order of writer:
+//   - repos first: an open PATCH holds repos and then reaches repo_upstreams
+//     through the default-branch trigger. The boot has to wait for it holding
+//     no table.
+//   - repo_upstreams first: SetRepoUpstream inserts into repo_upstreams and
+//     then locks the repos row FOR UPDATE. The boot's repos lock must let that
+//     lock through.
+//
+// Each case holds the writer's first lock, waits until the boot is blocked
+// behind the writer, lets the writer take its second lock, and expects both
+// to finish.
+func TestPGInitSchemaLockOrder(t *testing.T) {
 	s, ok := pgBackend(t).(*PG)
 	if !ok {
 		t.Fatal("pgBackend is not a *PG")
 	}
 	ctx := t.Context()
 	org := seedOrg(t, s)
-	repo, err := s.CreateLinkedRepo(ctx, org, "boot-vs-patch", "main",
-		RepoUpstream{Provider: "github", Owner: "acme", Name: "boot-vs-patch", UpstreamHost: "github.com", DefaultBranchOmitted: true}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range []struct{ name, first, second string }{
+		{"repos then repo_upstreams",
+			`UPDATE repos SET url = url WHERE repo_id = $1`,
+			`UPDATE repo_upstreams SET default_branch_omitted = false WHERE repo_id = $1`},
+		{"repo_upstreams then repos",
+			`UPDATE repo_upstreams SET provider = provider WHERE repo_id = $1`,
+			`SELECT 1 FROM repos WHERE repo_id = $1 FOR UPDATE`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, err := s.CreateLinkedRepo(ctx, org, "lock-order-"+tc.name, "main",
+				RepoUpstream{Provider: "github", Owner: "acme", Name: "lock-order", UpstreamHost: "github.com", DefaultBranchOmitted: true}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := s.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			var writerPID int
+			if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&writerPID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, tc.first, repo.RepoID); err != nil {
+				t.Fatal(err)
+			}
 
-	// The writer: it holds repos (a row lock, as an in-flight PATCH does) and
-	// has not touched repo_upstreams yet.
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	var writerPID int
-	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&writerPID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `SELECT 1 FROM repos WHERE repo_id = $1 FOR UPDATE`, repo.RepoID); err != nil {
-		t.Fatal(err)
-	}
+			boot := make(chan error, 1)
+			go func() { boot <- s.InitSchema(context.Background()) }()
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				var blocked int
+				if err := s.pool.QueryRow(ctx,
+					`SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`, writerPID).Scan(&blocked); err != nil {
+					t.Fatal(err)
+				}
+				if blocked > 0 {
+					break
+				}
+				select {
+				case err := <-boot:
+					t.Fatalf("the boot finished (%v) while the writer held its first lock", err)
+				default:
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the boot never waited for the writer")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
 
-	boot := make(chan error, 1)
-	go func() { boot <- s.InitSchema(context.Background()) }()
-
-	// Wait until the boot is blocked behind the writer, wherever it is.
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		var blocked int
-		if err := s.pool.QueryRow(ctx,
-			`SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`, writerPID).Scan(&blocked); err != nil {
-			t.Fatal(err)
-		}
-		if blocked > 0 {
-			break
-		}
-		select {
-		case err := <-boot:
-			t.Fatalf("the boot finished (%v) while the writer held repos", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the boot never waited for the writer")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	// The writer now reaches repo_upstreams, as the trigger does.
-	if _, err := tx.Exec(ctx, `UPDATE repo_upstreams SET default_branch_omitted = false WHERE repo_id = $1`, repo.RepoID); err != nil {
-		t.Fatalf("the writer's repo_upstreams write failed (a deadlock with the boot?): %v", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	select {
-	case err := <-boot:
-		if err != nil {
-			t.Fatalf("InitSchema after the writer finished: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("the boot did not finish after the writer committed")
+			if _, err := tx.Exec(ctx, tc.second, repo.RepoID); err != nil {
+				t.Fatalf("the writer's second lock failed (a deadlock with the boot?): %v", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+			select {
+			case err := <-boot:
+				if err != nil {
+					t.Fatalf("InitSchema after the writer finished: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the boot did not finish after the writer committed")
+			}
+		})
 	}
 }
