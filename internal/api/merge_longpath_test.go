@@ -9,7 +9,9 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -222,7 +224,7 @@ func TestTreePathEntry(t *testing.T) {
 
 	t.Run("an oversized name is matched exactly among its siblings", func(t *testing.T) {
 		other := lpGit(t, dir, "y\n", "hash-object", "-w", "--stdin")
-		name := lpName(over, 'x')
+		name := lpName(over+10, 'x')
 		tree := lpMktree(t, dir,
 			"100644 blob "+blob+"\t"+name,
 			"100644 blob "+other+"\t"+name+"y",
@@ -234,6 +236,9 @@ func TestTreePathEntry(t *testing.T) {
 			name + "z":     {},
 			name[:50000]:   {},
 			name[:over-1]:  {},
+			name[:over+5]:  {}, // a prefix of an oversized name, itself oversized
+			" " + name:     {}, // the same name with white space around it
+			name + " ":     {},
 			name + "y/sub": {},
 		} {
 			if got, err := wmTreePathEntry(t.Context(), sc, wmTreeListings{}, tree, path); err != nil || got != want {
@@ -333,4 +338,111 @@ func TestTreePathEntryOutputBudget(t *testing.T) {
 			t.Fatalf("lookup of a %d-byte name: %+v, %v", len(names[0]), got, err)
 		}
 	})
+}
+
+// TestRenderConflictsListsDirectoryOnce renders conflicts whose names are too
+// long for an argument and sit in one directory. Each lookup needs the
+// listing of that directory, which emits all of it, and the preview buffers
+// all git output under one allowance: the allowance here holds one listing
+// and not two.
+func TestRenderConflictsListsDirectoryOnce(t *testing.T) {
+	sc, dir := lpScratch(t)
+	const n = 4
+	_, names := lpSiblings(t, dir, n, wmMaxPathspecBytes+100)
+	blob := func(content string) string { return lpGit(t, dir, content, "hash-object", "-w", "--stdin") }
+	base, ours, theirs, merged := blob("base\n"), blob("main\n"), blob("other\n"), blob("<<<<<<<\n")
+	// The merged tree holds the merged result at each name. The stages hold
+	// the three sides.
+	var records []string
+	mt := &wmMergeTreeResult{stages: map[string]map[int]wmStageEntry{}}
+	for _, name := range names {
+		records = append(records, "100644 blob "+merged+"\t"+name)
+		path := "d/" + name
+		mt.paths = append(mt.paths, path)
+		mt.stages[path] = map[int]wmStageEntry{
+			1: {mode: "100644", oid: base}, 2: {mode: "100644", oid: ours}, 3: {mode: "100644", oid: theirs},
+		}
+	}
+	mt.tree = lpMktree(t, dir, "040000 tree "+lpMktree(t, dir, records...)+"\td")
+
+	listing := n * (wmMaxPathspecBytes + 100)
+	ctx := lpBudgetCtx(t, int64(listing+listing/2)) // one listing and a half
+	conflicts, filtered, err := wmRenderConflicts(ctx, sc, mt)
+	if err != nil {
+		t.Fatalf("wmRenderConflicts: %v", err)
+	}
+	if len(conflicts) != n || len(filtered) != 0 {
+		t.Fatalf("%d conflicts and %d filtered, want %d and 0", len(conflicts), len(filtered), n)
+	}
+	for _, c := range conflicts {
+		if c.Result.OID != merged || c.Ours.Content != "main\n" || c.Theirs.Content != "other\n" {
+			t.Errorf("conflict %.20q: result %+v, ours %q, theirs %q", c.Path, c.Result, c.Ours.Content, c.Theirs.Content)
+		}
+	}
+}
+
+// TestTreePathEntryGitFailures checks that a failing git call reaches the
+// caller, whichever lookup made it, and is not read as an absent path.
+func TestTreePathEntryGitFailures(t *testing.T) {
+	sc, dir := lpScratch(t)
+	missing := strings.Repeat("a", 40) // a valid oid that no object has
+	for name, path := range map[string]string{
+		"a short path":             "a/b/c",
+		"a chunk of a long path":   lpName(100000, 'c') + "/" + lpName(100000, 'd'),
+		"a name over the limit":    lpName(wmMaxPathspecBytes+1, 'e'),
+		"a name after a long path": lpName(100000, 'c') + "/" + lpName(wmMaxPathspecBytes+1, 'e'),
+	} {
+		t.Run(name+" in a missing tree", func(t *testing.T) {
+			got, err := wmTreePathEntry(t.Context(), sc, wmTreeListings{}, missing, path)
+			if err == nil {
+				t.Fatalf("entry = %+v with no error, want git's error", got)
+			}
+		})
+	}
+
+	t.Run("a listing over the output allowance", func(t *testing.T) {
+		tree, names := lpSiblings(t, dir, 4, wmMaxPathspecBytes+100)
+		_, err := wmTreePathEntry(lpBudgetCtx(t, 250<<10), sc, wmTreeListings{}, tree, names[0])
+		if !errors.Is(err, gitread.ErrOutputLimit) {
+			t.Fatalf("error = %v, want %v", err, gitread.ErrOutputLimit)
+		}
+	})
+}
+
+// TestParseListing keeps the entries whose names are too long for an
+// argument, and nothing else.
+func TestParseListing(t *testing.T) {
+	oid := strings.Repeat("1", 40)
+	long := lpName(wmMaxPathspecBytes+1, 'l')
+	record := func(mode, typ, name string) string { return mode + " " + typ + " " + oid + "\t" + name + "\x00" }
+	out := record("100644", "blob", "short") +
+		record("040000", "tree", long+"\tt a b") + // tabs and spaces in a name
+		record("100644", "blob", lpName(wmMaxPathspecBytes, 'k')) + // the longest name that fits an argument
+		record("160000", "commit", long+"2")
+	got, err := wmParseListing(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]wmStageEntry{
+		long + "\tt a b": {mode: "040000", oid: oid},
+		long + "2":       {mode: "160000", oid: oid},
+	}
+	if !maps.Equal(got, want) {
+		names := make([]string, 0, len(got))
+		for name := range got {
+			names = append(names, fmt.Sprintf("%d bytes", len(name)))
+		}
+		t.Fatalf("kept %v, want the two oversized names", names)
+	}
+	for name, bad := range map[string]string{
+		"a record with no tab":                "no tab here\x00",
+		"an oversized name with a bad object": "100644 blob nothex\t" + long + "\x00",
+	} {
+		if _, err := wmParseListing(bad); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	if got, err := wmParseListing(""); err != nil || len(got) != 0 {
+		t.Errorf("an empty listing: %v, %v", got, err)
+	}
 }

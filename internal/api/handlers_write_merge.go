@@ -1054,10 +1054,10 @@ const wmLiteralPathspec = ":(literal)"
 // still takes one ls-tree and lists nothing.
 const wmMaxPathspecBytes = 128<<10 - len(wmLiteralPathspec) - 1
 
-// wmTreeListings holds the parsed listing of each tree that wmTreePathEntry
-// had to list, by tree oid, so that a tree is listed once per request however
-// many conflicts sit in it. A listing emits the whole tree, and the preview
-// buffers all git output under one budget.
+// wmTreeListings holds, for each tree that wmTreePathEntry had to list, its
+// entries with names over wmMaxPathspecBytes, by tree oid. A tree is listed
+// once per request however many conflicts sit in it: a listing emits the
+// whole tree, and the preview buffers all git output under one budget.
 type wmTreeListings map[string]map[string]wmStageEntry
 
 // wmTreePathEntry resolves the merged tree's entry at path via ls-tree —
@@ -1132,27 +1132,50 @@ func wmLsTreePathspec(ctx context.Context, sc *wcScratch, tree, path string) (wm
 
 // wmLsTreeListed finds the entry called name in the listing of the whole of
 // tree, which names no path in argv. The entry is zero when tree has none.
+// name is longer than wmMaxPathspecBytes: shorter names are looked up by
+// pathspec, and wmParseListing keeps only the entries of longer ones.
 func wmLsTreeListed(ctx context.Context, sc *wcScratch, listings wmTreeListings, tree, name string) (wmStageEntry, error) {
+	if len(name) <= wmMaxPathspecBytes {
+		return wmStageEntry{}, fmt.Errorf("ls-tree %s: a %d-byte name fits one argument and is not in a listing", tree, len(name))
+	}
 	entries, ok := listings[tree]
 	if !ok {
 		out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree)
 		if err != nil {
 			return wmStageEntry{}, err
 		}
-		entries = map[string]wmStageEntry{}
-		for _, record := range strings.Split(strings.TrimSuffix(out, "\x00"), "\x00") {
-			if record == "" {
-				continue // an empty tree lists nothing
-			}
-			got, entry, valid := wmParseLsTreeRecord(record)
-			if !valid {
-				return wmStageEntry{}, fmt.Errorf("ls-tree %s emitted %.200q", tree, record)
-			}
-			entries[got] = entry
+		if entries, err = wmParseListing(out); err != nil {
+			return wmStageEntry{}, fmt.Errorf("ls-tree %s: %w", tree, err)
 		}
 		listings[tree] = entries
 	}
 	return entries[name], nil
+}
+
+// wmParseListing scans the output of `ls-tree -z <tree>` and returns the
+// entries whose names are longer than wmMaxPathspecBytes, by name. It keeps
+// no entry with a shorter name, and copies what it keeps, so that a directory
+// of 500,000 ordinary names costs the request its listing and then nothing
+// (parsing every record into a map held about three times the listing).
+func wmParseListing(out string) (map[string]wmStageEntry, error) {
+	entries := map[string]wmStageEntry{}
+	for rest := out; rest != ""; {
+		var record string
+		record, rest, _ = strings.Cut(rest, "\x00")
+		head, name, found := strings.Cut(record, "\t")
+		if !found {
+			return nil, fmt.Errorf("emitted %.200q", record)
+		}
+		if len(name) <= wmMaxPathspecBytes {
+			continue
+		}
+		_, entry, valid := wmParseLsTreeRecord(record)
+		if !valid {
+			return nil, fmt.Errorf("emitted %.200q", head)
+		}
+		entries[strings.Clone(name)] = wmStageEntry{mode: strings.Clone(entry.mode), oid: strings.Clone(entry.oid)}
+	}
+	return entries, nil
 }
 
 // wmParseLsTreeRecord splits one `ls-tree -z` record,
