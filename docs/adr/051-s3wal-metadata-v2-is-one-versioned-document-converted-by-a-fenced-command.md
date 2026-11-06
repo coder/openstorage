@@ -73,6 +73,15 @@ Five facts shape the format decision:
    commits. A hook that cannot decode the document therefore drops the push's
    webhooks and, under #335, its push and pull intent.
 
+   **Amendment: hook eventing no longer fails open for intent.** A hook that reads a
+   document version it cannot write, or a corrupt document, refuses the ref update
+   before its CAS (`meta.CheckFormat`, issues #445 and #466). On the local schedule
+   the hook records the push's intent before the CAS and refuses the update when it
+   cannot ([ADR-50](050-local-scheduling-state-is-row-owned.md)). A hook that cannot
+   wire its eventing refuses every update that could record forward intent
+   ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
+   amendment). Updates that record no intent still go through without events.
+
 ## Fields and features that need v2
 
 Each new field has an absent value that means exactly what v1 means today.

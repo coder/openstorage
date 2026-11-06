@@ -492,9 +492,9 @@ func TestHookEventingRiverFailureRefusesAndCleansUp(t *testing.T) {
 	newHookRiver = func(context.Context, string) (*jobs.River, error) {
 		return nil, errors.New("river client unavailable")
 	}
-	cleanup := wireHookEventing(ctx, slog.New(slog.NewTextHandler(logs, nil)))
+	cleanup := wireHookEventing(ctx, slog.New(githttp.NewHookLogHandler(logs, nil)))
 	defer cleanup()
-	if !strings.Contains(logs.String(), "hook eventing unavailable: river insert-only client; refusing only updates that would record forward intent") {
+	if !strings.Contains(logs.String(), "hook eventing unavailable: river insert-only client; refusing only updates that could record forward intent") {
 		t.Fatalf("missing refusal log: %s", logs)
 	}
 	rs := hookRefStore(t)

@@ -76,7 +76,24 @@ func hookEventingEnv(t *testing.T, metaURL string) *bytes.Buffer {
 	t.Setenv(githttp.EnvOps, "")
 	original := githttp.WrapHookRefStore
 	t.Cleanup(func() { githttp.WrapHookRefStore = original })
+	// serve's hook-errors file: the hook's log handler writes the error
+	// values there, for the operator.
+	records := filepath.Join(t.TempDir(), "hook-errors")
+	if err := os.WriteFile(records, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(githttp.EnvHookErrors, records)
 	return new(bytes.Buffer)
+}
+
+// hookErrorRecords reads the hook-errors file that hookEventingEnv set up.
+func hookErrorRecords(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(os.Getenv(githttp.EnvHookErrors))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 // hookRefStore is the authority the update hook would CAS into.
@@ -117,7 +134,7 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 			srv := httptest.NewServer(fake)
 			defer srv.Close()
 			logs := hookEventingEnv(t, "s3wal://b?endpoint="+srv.URL)
-			cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+			cleanup := wireHookEventing(t.Context(), slog.New(githttp.NewHookLogHandler(logs, nil)))
 			defer cleanup()
 			rs := hookRefStore(t)
 
@@ -173,7 +190,7 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 			if tc.scopes != "" {
 				t.Setenv(githttp.EnvScopes, tc.scopes)
 			}
-			cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+			cleanup := wireHookEventing(t.Context(), slog.New(githttp.NewHookLogHandler(logs, nil)))
 			defer cleanup()
 			rs := hookRefStore(t)
 			wrapped, err := githttp.WrapHookRefStore(t.Context(), rs)
@@ -295,7 +312,7 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 				if tc.scopes != "" {
 					t.Setenv(githttp.EnvScopes, tc.scopes)
 				}
-				cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+				cleanup := wireHookEventing(t.Context(), slog.New(githttp.NewHookLogHandler(logs, nil)))
 				defer cleanup()
 				rs := hookRefStore(t)
 				wrapped, err := githttp.WrapHookRefStore(t.Context(), commitThenEOF{rs})
@@ -308,7 +325,7 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 				}
 				wantLog := "hook eventing disabled: " + stage
 				if tc.refusing {
-					wantLog = "hook eventing unavailable: " + stage + "; refusing only updates that would record forward intent"
+					wantLog = "hook eventing unavailable: " + stage + "; refusing only updates that could record forward intent"
 				}
 				if !strings.Contains(logs.String(), wantLog) {
 					t.Fatalf("missing %q log: %s", wantLog, logs)
@@ -360,6 +377,16 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 				for part, v := range canary {
 					if n := strings.Count(seen, v); n != 0 {
 						t.Fatalf("the pusher's output names the canary %s %d times", part, n)
+					}
+				}
+				// The operator gets the cause, without the password.
+				records := hookErrorRecords(t)
+				for part, v := range canary {
+					switch n := strings.Count(records, v); {
+					case part == "password" && n != 0:
+						t.Fatalf("the hook-errors records name the canary password %d times", n)
+					case part != "password" && stage == "open meta store" && n == 0:
+						t.Fatalf("the hook-errors records do not name the canary %s: %s", part, records)
 					}
 				}
 			})

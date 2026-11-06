@@ -41,6 +41,6 @@ to a repository without one. Ephemeral updates, a sync run's own loopback push, 
 a caller whose token may not forward record no intent, and they keep the fail-open
 stance. The pusher sees a fixed refusal that names only the failed step: git relays
 the hook's output to the pusher, and a store error names the database host, user and
-name, or the S3 endpoint, so the hook logs no store error. serve logs a store error
-only when its own connection fails, so when only the hook's connection fails, neither
-the pusher nor the operator sees the cause.
+name, or the S3 endpoint. The hook's log line keeps the store error for the
+operator: the hook's log handler writes error values only to a file that serve creates
+for each push, and serve logs that file after the push.

@@ -795,6 +795,9 @@ also have a metric are listed in the [metrics and log mapping](#metrics-and-log-
   they appear.
 - Terminal `serve` and `hook` errors print to stderr with `openstorage serve:` /
   `openstorage hook:` prefixes and exit 1. Hook errors can reach Git clients.
+- Hook log lines reach Git clients without their error values, because those can name
+  the database or S3 endpoint. `serve` logs each whole line after the push as
+  `receive-pack <repo>: hook: <line>`, at most 100 lines per push.
 - `WARN` means `slog.Warn`. Ellipses abbreviate variable text, not literal messages.
 
 | Signal/error | Emission conditions and fields | What it establishes | What it does not establish | Safe response |
