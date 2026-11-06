@@ -44,9 +44,10 @@ type raceObservation struct {
 }
 
 // run races the writer against the readers for the window and returns what
-// they saw. The window ends only the loops. A GET in flight at its end keeps
-// its own op deadline: cancelling it would hide a store that hangs for the
-// last seconds of the window (issue #566).
+// they saw. The window stops only the loops. An op in flight at its end keeps
+// its own op deadline. Cancelling a GET would hide a store that hangs for the
+// last seconds of the window (issue #566), and cancelling a PUT would let a
+// store that commits a part of it show its readers a torn body.
 func (r overwriteRace) run(ctx context.Context) raceObservation {
 	raceCtx, stopRace := context.WithCancel(ctx)
 	defer stopRace()
@@ -57,11 +58,9 @@ func (r overwriteRace) run(ctx context.Context) raceObservation {
 		curETag := r.startETag
 		next := r.bodyA // always the version OPPOSITE the last known content
 		for raceCtx.Err() == nil {
-			etag, err := r.put(raceCtx, next, curETag)
+			etag, err := r.put(ctx, next, curETag)
 			if err != nil {
-				if raceCtx.Err() == nil {
-					writeErrs.Add(1)
-				}
+				writeErrs.Add(1)
 				// Re-resolve the current ETag: an ambiguous outcome (a
 				// timeout after the write landed) would otherwise wedge
 				// every later If-Match on a stale tag. Best effort — on
@@ -70,7 +69,7 @@ func (r overwriteRace) run(ctx context.Context) raceObservation {
 				// selectively rejects one version keeps being asked for
 				// the version transition instead of racking up
 				// same-body overwrites.
-				if cur, herr := r.head(raceCtx); herr == nil {
+				if cur, herr := r.head(ctx); herr == nil {
 					curETag = cur
 				}
 				continue
@@ -295,6 +294,42 @@ func TestOverwriteRaceCountsAReadHungAtTheWindowEnd(t *testing.T) {
 	}
 	if v := r.judge(o); v.class != verdictError {
 		t.Fatalf("verdict %q (%s), want error", v.class, v.detail)
+	}
+}
+
+// TestOverwriteRaceLetsTheLastOverwriteEnd: a store that commits an empty
+// body for a PUT that the client aborts must not show it to a reader. The
+// window end does not abort the PUT in flight, so the reads that run on past
+// the end see no torn body.
+func TestOverwriteRaceLetsTheLastOverwriteEnd(t *testing.T) {
+	r := memRace(300 * time.Millisecond)
+	okPut, okGet := r.put, r.get
+	start := time.Now()
+	late := func() bool { return time.Since(start) > r.window-100*time.Millisecond }
+	var committed atomic.Bool
+	r.put = func(ctx context.Context, b []byte, ifMatch string) (string, error) {
+		if !late() {
+			return okPut(ctx, b, ifMatch)
+		}
+		opCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		<-opCtx.Done()
+		committed.Store(true)
+		return "", opCtx.Err()
+	}
+	r.get = func(ctx context.Context) ([]byte, string, error) {
+		wasLate := late()
+		if wasLate {
+			time.Sleep(40 * time.Millisecond)
+		}
+		if committed.Load() {
+			return nil, `"empty"`, nil
+		}
+		return okGet(ctx)
+	}
+	o := r.run(t.Context())
+	if v := r.judge(o); v.class != verdictPass || !committed.Load() {
+		t.Fatalf("verdict %q (%s), committed=%t, want pass after the last PUT ran to its own deadline", v.class, v.detail, committed.Load())
 	}
 }
 
