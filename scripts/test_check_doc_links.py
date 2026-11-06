@@ -501,6 +501,8 @@ class CitationTests(CheckerTestCase):
             "nel": ("para\n\x85\n    [Gone](gone.md)\n", "README.md:3"),
             "item-content": ("`[Gone](gone.md)\n- \x1e\n`\n", "README.md:1"),
             "quote": (">\x1d\n\t[Gone](gone.md)\n", "README.md:2"),
+            "item-marker": ("-   \x0c\n\n      [Gone](gone.md)\n", "README.md:3"),
+            "lazy-line": ("- a\n\x0c\n\n    [Gone](gone.md)\n", "README.md:4"),
         }
         for name, (readme, where) in cases.items():
             with self.subTest(case=name):
