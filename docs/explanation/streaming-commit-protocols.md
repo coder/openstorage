@@ -69,7 +69,8 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
 - Clients normalize paths (leading slashes stripped); the backend should still reject
   `..` traversal and absolute paths defensively.
 - A file whose name is not valid UTF-8 sends `path_base64`, the base64 of the raw
-  bytes, in place of `path`: exactly one of the two. A bad value gets 400 `invalid`
+  bytes, in place of `path`: exactly one of the two, and an empty one counts as absent.
+  A bad value gets 400 `invalid`
   ([path encoding](../reference/http-api.md#conventions)). A replica older than
   v0.20.0 does not read `path_base64` and answers 400 `invalid`.
 - Modes: `100644`, `100755`, `120000` (symlink), `160000` (submodule).

@@ -115,8 +115,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   UTF-8 name holds a real U+FFFD (`a\ufffdb`, which has no sibling). A list field
   gets a list sibling of the same length and order, present when any element is not
   valid UTF-8, and it holds the base64 of every element. It repeats the whole list, so
-  an unpaged `files` listing with one invalid path grows by about the size of its
-  `paths`. The siblings are:
+  an unpaged `files` listing with one invalid path grows by about 1.33 times the size
+  of its `paths`. During a rolling upgrade a replica without the siblings sends none,
+  so a missing sibling proves nothing until every replica has them. The siblings are:
   - `files`: `entries[].path_base64`, and `paths_base64` next to `paths`. Both
     `paths` and `paths_base64` hold only the blob entries.
   - `files/metadata`: `files[].path_base64`.
@@ -139,15 +140,19 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
     `include_globs_base64` and `exclude_globs_base64` next to the plain globs.
   - `archive`: `include_globs_base64` and `exclude_globs_base64`.
   - `commit-pack`: a file operation sends `path_base64` instead of `path`. It has exactly
-    one of the two. An empty `path` counts as absent.
+    one of the two, and an empty one counts as absent.
 
   A value must be canonical base64 as in the siblings: standard alphabet, padding, no
-  line breaks. A value that is not, or that decodes to a blank name or one with a NUL
-  byte, is a 400 that names the entry (`paths_base64.1`). A decoded glob matches the
+  line breaks. In grep and archive, a value that is not, or that decodes to a blank name
+  or one with a NUL byte, is a 400 with an `invalid_params` entry that names it
+  (`paths_base64.1`). In commit-pack, a value that is not canonical base64 is a 400
+  `invalid` with a message, and a decoded path goes through the checks of `path`. A
+  decoded glob matches the
   raw bytes: an invalid byte matches only itself, `?` matches one byte of such a name,
   and `*` matches any run. A `[...]` class that holds an invalid byte is malformed and
-  matches nothing. A replica older than v0.20.0 ignores the grep and archive fields and
-  returns a wider result (grep searches every file and archive keeps every file). It
+  matches nothing. A replica older than v0.20.0 ignores the grep and archive fields, so
+  it applies only the plain `paths` and globs of the request: the result can hold more
+  files (only a base64 field was sent) or fewer (a plain filter was sent next to it). It
   answers a commit-pack `path_base64` with 400 `invalid`. Upstream documents no path
   encoding, so the siblings and these fields are an extension
   ([#587](https://github.com/coder/openstorage/issues/587)).

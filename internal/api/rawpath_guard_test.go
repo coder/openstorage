@@ -1,10 +1,10 @@
 package api
 
-// #587 guard: a JSON field that carries a repository path or a path glob has
-// a _base64 sibling (rawpath.go). The scan reads every struct type in the
-// package's own sources, so a new such field without a sibling fails here, in
-// the PR that adds it. It does not check that a handler fills the sibling:
-// the route tests do.
+// #587 guard: a JSON field that carries a repository path or a path glob, in
+// a response or a request, has a _base64 sibling (rawpath.go). The scan reads
+// every struct type in the package's own sources, so a new such field without
+// a sibling fails here, in the PR that adds it. It does not check that a
+// handler fills the sibling: the route tests do.
 
 import (
 	"go/ast"
@@ -129,7 +129,7 @@ func structPathViolations(fset *token.FileSet, typeName string, st *ast.StructTy
 	return violations, checked
 }
 
-func TestEveryResponsePathFieldHasABase64Sibling(t *testing.T) {
+func TestEveryPathFieldHasABase64Sibling(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
@@ -151,8 +151,8 @@ func TestEveryResponsePathFieldHasABase64Sibling(t *testing.T) {
 	for _, v := range all {
 		t.Error(v)
 	}
-	if checked < 10 {
-		t.Errorf("the scan checked %d path fields, want at least 10: it reads too little", checked)
+	if checked < 16 {
+		t.Errorf("the scan checked %d path fields, want at least 16: it reads too little", checked)
 	}
 }
 

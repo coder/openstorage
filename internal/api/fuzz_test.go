@@ -197,38 +197,35 @@ func FuzzDecodeRawPatterns(f *testing.F) {
 }
 
 // FuzzCommitPackFilePath: a file operation names its path with exactly one
-// of path and path_base64, and a path that passes validation is the one it
-// names.
+// of path and path_base64 (an empty one is absent), and the path it ends with
+// is the one it names.
 func FuzzCommitPackFilePath(f *testing.F) {
-	type seed struct {
-		path, enc string
-		hasEnc    bool
-	}
-	for _, s := range []seed{
-		{"a.txt", "", false}, {"", "Yf9i", true}, {"a.txt", "Yf9i", true}, {"", "", true}, {"", "", false},
-		{"", "YR==", true}, {"", "Li4v", true}, {"", "LmdpdC9jb25maWc=", true}, {"", "YQBi", true}, {"", "AA==", true},
+	for _, seed := range [][2]string{
+		{"a.txt", ""}, {"", "Yf9i"}, {"a.txt", "Yf9i"}, {"", ""}, {"", "YR=="}, {"", "Li4v"},
+		{"", "LmdpdC9jb25maWc="}, {"", "YQBi"}, {"", "AA=="}, {"../a", ""}, {"a\xffb", ""},
 	} {
-		f.Add(s.path, s.enc, s.hasEnc)
+		f.Add(seed[0], seed[1])
 	}
-	f.Fuzz(func(t *testing.T, path, enc string, hasEnc bool) {
-		op := wcFileOp{Path: path, ContentID: "c", Operation: "upsert"}
-		if hasEnc {
-			op.PathBase64 = &enc
-		}
-		err := wcValidateFiles([]wcFileOp{op})
+	f.Fuzz(func(t *testing.T, path, enc string) {
+		files := []wcFileOp{{Path: path, PathBase64: enc, ContentID: "c", Operation: "upsert"}}
+		err := wcValidateFiles(files)
 		decoded, decodedOK := decodeRawPath(enc)
 		want := path
-		if hasEnc {
+		if enc != "" {
 			want = decoded
 		}
 		switch {
-		case hasEnc && (path != "" || !decodedOK):
+		case enc != "" && (path != "" || !decodedOK):
 			if err == nil {
 				t.Fatalf("path %q, path_base64 %q: accepted", path, enc)
 			}
 		case err == nil:
-			if wcValidPath(want) != nil {
-				t.Fatalf("path %q, path_base64 %q (%v): accepted a path that wcValidPath refuses", path, enc, hasEnc)
+			if files[0].Path != want || wcValidPath(want) != nil {
+				t.Fatalf("path %q, path_base64 %q: resolved to %q, want the valid path %q", path, enc, files[0].Path, want)
+			}
+		default:
+			if wcValidPath(want) == nil {
+				t.Fatalf("path %q, path_base64 %q: refused with %v though %q is valid", path, enc, err, want)
 			}
 		}
 	})

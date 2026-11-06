@@ -157,6 +157,13 @@ func testRawPathInputs(t *testing.T, e *testEnv) {
 			t.Errorf("entries = %q, want the added file and no a<0xfe>b", got)
 		}
 
+		// An empty path_base64 counts as absent, as an empty path does.
+		resp, raw = commit(upsert("plain", map[string]any{"path": "plain-with-empty-b64.txt", "path_base64": ""}))
+		wctRequireOK(t, resp, raw)
+		if code, body := read("plain-with-empty-b64.txt"); code != http.StatusOK || body != "rewritten plain\n" {
+			t.Errorf("plain-with-empty-b64.txt = %d %q, want the written file", code, body)
+		}
+
 		// The base64 form and the plain form name one path, so both is a
 		// duplicate, and path plus path_base64 on one operation is refused.
 		for name, files := range map[string][]map[string]any{
