@@ -7,6 +7,7 @@ package gitread
 
 import (
 	"context"
+	"crypto/sha1"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -513,6 +514,92 @@ func TestLsTreePageCursorOnADeepPath(t *testing.T) {
 	}
 }
 
+// nestedTrees stores n trees with one git call: the first is empty, and each
+// holds the one before it as the folder d. It returns their ids.
+func nestedTrees(t testing.TB, dir string, n int) []string {
+	t.Helper()
+	files := t.TempDir()
+	ids := []string{EmptyTreeSHA}
+	var list strings.Builder
+	for i := 1; i < n; i++ {
+		prev, err := hex.DecodeString(ids[i-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := "40000 d\x00" + string(prev)
+		sum := sha1.Sum([]byte("tree " + strconv.Itoa(len(raw)) + "\x00" + raw))
+		ids = append(ids, hex.EncodeToString(sum[:]))
+		file := filepath.Join(files, strconv.Itoa(i))
+		if err := os.WriteFile(file, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		list.WriteString(file + "\n")
+	}
+	stored := strings.Fields(gitIn(t, dir, list.String(), "hash-object", "-t", "tree", "--literally", "-w", "--stdin-paths"))
+	if !slices.Equal(stored, ids[1:]) {
+		t.Fatalf("git stored %d trees, not the ones expected", len(stored))
+	}
+	return ids
+}
+
+// A folder without files that the walk met before is skipped, and the folders
+// nested in it still count: a chain of such folders past git's own limit is
+// an error for the stream, so it is for the page. Each of the three chains
+// holds the one before it below its first 1023 folders, so the walk reads
+// none of them deeper than its own limit. With a limit of 1 the stream stops
+// before it reads that far, and so does the page. The limit of 1000 gives the
+// walk enough reads to get there.
+func TestLsTreePageCursorOnNestedEmptyFolders(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	ids := nestedTrees(t, dir, 3*(maxWalkDepth-1)+1)
+	var entries [][2]string
+	for i := 1; i <= 3; i++ {
+		entries = append(entries, [2]string{fmt.Sprintf("40000 e%d", i), ids[i*(maxWalkDepth-1)]})
+	}
+	entries = append(entries, [2]string{"100644 z", "1"}, [2]string{"100644 zz", "2"})
+	commit := commitOf(t, dir, rawTree(t, dir, entries...))
+	ctx := context.Background()
+	var errs int
+	for _, limit := range []int{1, 2, 1000} {
+		page, more, found, err := LsTreePage(ctx, dir, commit, "", "\x00", limit)
+		wp, wm, wf, werr := pageOracle(ctx, dir, commit, "", "\x00", limit)
+		if !slices.Equal(page, wp) || more != wm || found != wf || fmt.Sprint(err) != fmt.Sprint(werr) {
+			t.Errorf("limit %d: LsTreePage = %v, %v, %v, %v; stream %v, %v, %v, %v", limit, paths(page), more, found, err, paths(wp), wm, wf, werr)
+		}
+		if werr != nil {
+			errs++
+		}
+	}
+	if errs == 0 {
+		t.Fatal("git lists the chain: it is not past its depth limit")
+	}
+}
+
+// Identical folders are one tree object in git, listed at each path.
+func TestLsTreePageCursorOnIdenticalFolders(t *testing.T) {
+	files := []fiFile{
+		{"100644", "a/f", "same"}, {"100644", "a/g/h", "deep"},
+		{"100644", "b/f", "same"}, {"100644", "b/g/h", "deep"},
+		{"100644", "c/f", "same"}, {"100644", "c/g/h", "deep"},
+		{"100644", "d", "x"},
+	}
+	dir, commit := fiRepo(t, files)
+	ctx := context.Background()
+	for _, path := range []string{"", "a/", "b/g/"} {
+		sorted := sortedListing(t, dir, commit, path)
+		for _, after := range []string{"\x00", "a", "a/f", "a/g/h", "b", "b/f", "b/g", "b/g/h", "c/f", "c/g/h", "d"} {
+			for _, limit := range []int{1, 2, 3, 100} {
+				want, wantMore := windowOf(sorted, after, limit)
+				page, more, found, err := LsTreePage(ctx, dir, commit, path, after, limit)
+				if err != nil || (!found && len(want) > 0) || !slices.Equal(page, want) || more != wantMore {
+					t.Fatalf("LsTreePage(%q, after %q, limit %d) = %v, %v, %v, %v; want %v, %v", path, after, limit, paths(page), more, found, err, paths(want), wantMore)
+				}
+			}
+		}
+	}
+}
+
 // A query path longer than the walk's bound is the stream's, and git reads
 // it as before.
 func TestLsTreePageCursorOnALongQueryPath(t *testing.T) {
@@ -624,14 +711,18 @@ func TestLsTreePageCursorOnAFolderAndASubmoduleOfOneName(t *testing.T) {
 func TestLsTreePageCursorOnAFolderThatIsABlob(t *testing.T) {
 	dir := t.TempDir()
 	mustGit(t, dir, "init", "-q", "--bare", ".")
-	// A blob whose bytes read as a tree with one file.
-	blob := gitIn(t, dir, "100644 x\x00"+strings.Repeat("\x02", 20), "hash-object", "-w", "--stdin")
+	// A blob whose bytes read as a tree with one file, which exists.
+	file, err := hex.DecodeString(gitIn(t, dir, "x", "hash-object", "-w", "--stdin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := gitIn(t, dir, "100644 x\x00"+string(file), "hash-object", "-w", "--stdin")
 	commit := commitOf(t, dir, rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"40000 d", blob}, [2]string{"100644 e", "2"}))
 	for _, after := range []string{"\x00", "a", "d"} {
-		_, _, _, err := LsTreePage(context.Background(), dir, commit, "", after, 5)
-		_, _, _, oerr := pageOracle(context.Background(), dir, commit, "", after, 5)
-		if (err == nil) != (oerr == nil) {
-			t.Errorf("after %q: err %v, stream err %v", after, err, oerr)
+		page, more, found, err := LsTreePage(context.Background(), dir, commit, "", after, 5)
+		wp, wm, wf, werr := pageOracle(context.Background(), dir, commit, "", after, 5)
+		if !slices.Equal(page, wp) || more != wm || found != wf || (err == nil) != (werr == nil) {
+			t.Errorf("after %q: %v, %v, %v, %v; stream %v, %v, %v, %v", after, paths(page), more, found, err, paths(wp), wm, wf, werr)
 		}
 	}
 }

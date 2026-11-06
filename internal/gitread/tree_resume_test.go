@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"slices"
@@ -25,7 +26,7 @@ import (
 type memEntry struct {
 	mode  uint32
 	sub   map[string]*memEntry
-	built *[20]byte // the object id once built: an entry under two names is one tree (folders without files only)
+	built *[20]byte // the object id once built: an entry under two names is one object
 }
 
 // memTrees is a tree store in memory: raw tree objects by object name, and
@@ -49,8 +50,9 @@ func (m *memTrees) open(rev string) (*treeBody, error) {
 
 var rawModes = map[uint32]string{modeTree: "40000", modeBlob: "100644", modeExec: "100755", modeSymlink: "120000", modeGitlink: "160000"}
 
-// build stores the tree dir under prefix and returns its object id.
-func (m *memTrees) build(dir map[string]*memEntry, prefix string) [20]byte {
+// build stores the tree dir and returns its object id. A folder that two
+// names share is stored once, as git does, and so are its files' ids.
+func (m *memTrees) build(dir map[string]*memEntry) [20]byte {
 	type item struct {
 		name string
 		e    *memEntry
@@ -58,23 +60,18 @@ func (m *memTrees) build(dir map[string]*memEntry, prefix string) [20]byte {
 	}
 	var items []item
 	for name, e := range dir {
-		it := item{name: name, e: e}
-		if e.mode == modeTree {
-			if e.built == nil {
-				id := m.build(e.sub, prefix+name+"/")
-				e.built = &id
+		if e.built == nil {
+			var id [20]byte
+			if e.mode == modeTree {
+				id = m.build(e.sub)
+			} else {
+				m.next++
+				id[0], id[12] = 0xb0, byte(m.next)
+				id[13], id[14] = byte(m.next>>8), byte(m.next>>16)
 			}
-			it.oid = *e.built
-		} else {
-			m.next++
-			it.oid[0], it.oid[12] = 0xb0, byte(m.next)
-			it.oid[13], it.oid[14] = byte(m.next>>8), byte(m.next>>16)
-			m.leaves = append(m.leaves, TreeEntry{
-				Path: prefix + name, Mode: modeText(e.mode), SHA: hex.EncodeToString(it.oid[:]), Size: -1,
-				Type: map[uint32]string{modeBlob: EntryBlob, modeExec: EntryBlob, modeSymlink: EntrySymlink, modeGitlink: EntrySubmodule}[e.mode],
-			})
+			e.built = &id
 		}
-		items = append(items, it)
+		items = append(items, item{name: name, e: e, oid: *e.built})
 	}
 	slices.SortFunc(items, func(a, b item) int {
 		return entryOrder([]byte(a.name), a.e.mode == modeTree, []byte(b.name), b.e.mode == modeTree)
@@ -93,9 +90,24 @@ func (m *memTrees) build(dir map[string]*memEntry, prefix string) [20]byte {
 	return id
 }
 
+// collect lists the files below dir, a shared folder once for each name.
+func (m *memTrees) collect(dir map[string]*memEntry, prefix string) {
+	for name, e := range dir {
+		if e.mode == modeTree {
+			m.collect(e.sub, prefix+name+"/")
+			continue
+		}
+		m.leaves = append(m.leaves, TreeEntry{
+			Path: prefix + name, Mode: modeText(e.mode), SHA: hex.EncodeToString(e.built[:]), Size: -1,
+			Type: map[uint32]string{modeBlob: EntryBlob, modeExec: EntryBlob, modeSymlink: EntrySymlink, modeGitlink: EntrySubmodule}[e.mode],
+		})
+	}
+}
+
 func newMemTrees(root map[string]*memEntry) *memTrees {
 	m := &memTrees{objects: map[string][]byte{}}
-	id := m.build(root, "")
+	id := m.build(root)
+	m.collect(root, "")
 	m.objects[memCommit+"^{tree}"] = m.objects[hex.EncodeToString(id[:])]
 	sort.Slice(m.leaves, func(i, j int) bool { return m.leaves[i].Path < m.leaves[j].Path })
 	return m
@@ -132,6 +144,44 @@ func genDir(r *rand.Rand, depth int, empties bool) map[string]*memEntry {
 		dir[genName(r)] = &memEntry{mode: modeBlob} // every folder holds a file
 	}
 	return dir
+}
+
+// shareFolders puts a few folders that hold files only under a second name,
+// as git does for identical folders: one object, listed at each path.
+func shareFolders(r *rand.Rand, root map[string]*memEntry) {
+	var sources []*memEntry // folders of files: none holds the folder that gets it
+	targets := []map[string]*memEntry{root}
+	var visit func(d map[string]*memEntry)
+	visit = func(d map[string]*memEntry) {
+		for _, e := range d {
+			if e.mode != modeTree {
+				continue
+			}
+			if folders := slices.ContainsFunc(slices.Collect(maps.Values(e.sub)), func(f *memEntry) bool { return f.mode == modeTree }); folders {
+				targets = append(targets, e.sub)
+			} else if len(e.sub) > 0 {
+				sources = append(sources, e)
+			}
+			visit(e.sub)
+		}
+	}
+	visit(root)
+	if len(sources) == 0 {
+		return
+	}
+	for range 1 + r.IntN(3) {
+		d := targets[r.IntN(len(targets))]
+		if name := genName(r); d[name] == nil && len(d) < 8 {
+			d[name] = sources[r.IntN(len(sources))]
+		}
+	}
+}
+
+// genTree generates a model.
+func genTree(r *rand.Rand, empties bool) map[string]*memEntry {
+	root := genDir(r, 0, empties)
+	shareFolders(r, root)
+	return root
 }
 
 // folders returns the paths of the model's folders, "" first.
@@ -232,7 +282,7 @@ func paths(es []TreeEntry) []string {
 func TestTreeWalkMatchesTheSortedListing(t *testing.T) {
 	for seed := range uint64(400) {
 		r := rand.New(rand.NewPCG(seed, 615))
-		root := genDir(r, 0, true)
+		root := genTree(r, true)
 		m := newMemTrees(root)
 		dirs := folders(root, "", nil)
 		for range 12 {
@@ -264,7 +314,7 @@ func (c *countingTrees) open(rev string) (*treeBody, error) {
 func TestTreeWalkReadsEachTreeOnce(t *testing.T) {
 	for seed := range uint64(300) {
 		r := rand.New(rand.NewPCG(seed, 2615))
-		root := genDir(r, 0, false)
+		root := genDir(r, 0, false) // a shared folder is read at each path
 		m := newMemTrees(root)
 		for range 8 {
 			c := &countingTrees{memTrees: m, opens: map[string]int{}}
@@ -283,24 +333,45 @@ func TestTreeWalkReadsEachTreeOnce(t *testing.T) {
 	}
 }
 
+// Identical folders are one tree object, and a folder with files listed under
+// two names lists them at both paths: only a folder without files is skipped
+// when it comes again.
+func TestTreeWalkListsFoldersThatAreOneTree(t *testing.T) {
+	x := &memEntry{mode: modeTree, sub: map[string]*memEntry{"f": {mode: modeBlob}}}
+	m := newMemTrees(map[string]*memEntry{"a": x, "b": x, "c": {mode: modeBlob}})
+	if got, want := paths(m.leaves), []string{"a/f", "b/f", "c"}; !slices.Equal(got, want) || m.leaves[0].SHA != m.leaves[1].SHA {
+		t.Fatalf("model lists %v, want %v with one id for the shared file", got, want)
+	}
+	for _, after := range []string{"\x00", "a", "a/f", "b/f"} {
+		checkWalk(t, m, "", after, 5, math.MaxInt64)
+	}
+}
+
 // Folders without files in front of the first file are read in a few passes,
-// not one pass each: every pass reads twice the entries of the last.
+// not one pass each: every pass reads eight times the entries of the last,
+// and a level that takes more than maxWalkPasses is left to the stream.
 func TestTreeWalkPassesOverEmptyFolders(t *testing.T) {
-	root := map[string]*memEntry{"z": {mode: modeBlob}}
-	for i := range 3000 {
-		root[fmt.Sprintf("e%05d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
-	}
-	m := newMemTrees(root)
-	c := &countingTrees{memTrees: m, opens: map[string]int{}}
-	w := &treeWalk{src: c, limit: 1, room: math.MaxInt64}
-	if err := w.run(memCommit, "", nil, ""); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := paths(w.page), []string{"z"}; !slices.Equal(got, want) {
-		t.Fatalf("page %v, want %v", got, want)
-	}
-	if n := c.opens[memCommit+"^{tree}"]; n > 16 {
-		t.Fatalf("the root was read %d times", n)
+	for _, c := range []struct {
+		empties int
+		decline bool
+	}{{1000, false}, {3000, true}} {
+		root := map[string]*memEntry{"z": {mode: modeBlob}}
+		for i := range c.empties {
+			root[fmt.Sprintf("e%05d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
+		}
+		m := newMemTrees(root)
+		cnt := &countingTrees{memTrees: m, opens: map[string]int{}}
+		w := &treeWalk{src: cnt, limit: 1, room: math.MaxInt64}
+		err := w.run(memCommit, "", nil, "")
+		if c.decline != errors.Is(err, errDeclined) || !c.decline && err != nil {
+			t.Fatalf("%d folders without files: err = %v, declined wanted %v", c.empties, err, c.decline)
+		}
+		if got, want := paths(w.page), []string{"z"}; !c.decline && !slices.Equal(got, want) {
+			t.Fatalf("%d folders without files: page %v, want %v", c.empties, got, want)
+		}
+		if n := cnt.opens[memCommit+"^{tree}"]; n > maxWalkPasses {
+			t.Fatalf("%d folders without files: the root was read %d times", c.empties, n)
+		}
 	}
 }
 
@@ -323,6 +394,12 @@ func TestTreeWalkCountsThePathInTheDepth(t *testing.T) {
 	}
 	if _, err := walkMem(chain(maxWalkDepth+50), strings.Repeat("a/", maxWalkDepth), "\x00", 1, math.MaxInt64); !errors.Is(err, errDeclined) {
 		t.Fatalf("a path %d folders deep in a tree %d deep: err = %v, want errDeclined", maxWalkDepth, maxWalkDepth+50, err)
+	}
+	// A path deeper than the limit is refused before any tree is read.
+	c := &countingTrees{memTrees: chain(maxWalkDepth + 50), opens: map[string]int{}}
+	w := &treeWalk{src: c, limit: 1, room: math.MaxInt64}
+	if err := w.run(memCommit, strings.Repeat("a/", maxWalkDepth+1), slices.Repeat([]string{"a"}, maxWalkDepth+1), "\x00"); !errors.Is(err, errDeclined) || len(c.opens) != 0 {
+		t.Fatalf("a path of %d folders: err = %v after reading %d trees, want errDeclined after none", maxWalkDepth+1, err, len(c.opens))
 	}
 }
 
@@ -433,12 +510,12 @@ func TestTreeWalkUnderAShortAllowance(t *testing.T) {
 	var walked, declined int
 	for seed := range uint64(300) {
 		r := rand.New(rand.NewPCG(seed, 1615))
-		root := genDir(r, 0, true)
+		root := genTree(r, true)
 		m := newMemTrees(root)
 		for range 10 {
 			after := genCursor(r, m)
 			limit := 1 + r.IntN(len(m.leaves)+2)
-			room := int64(entryFloor+4) * int64(1+r.IntN(3*limit+3))
+			room := int64(entryFloor+heldOverhead+4) * int64(1+r.IntN(3*limit+3))
 			got, err := walkMem(m, "", after, limit, room)
 			switch {
 			case errors.Is(err, errDeclined):
@@ -468,12 +545,51 @@ func TestTreeWalkDeclinesAShortAllowanceOnEmptyFolders(t *testing.T) {
 		root[fmt.Sprintf("e%05d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
 	}
 	c := &countingTrees{memTrees: newMemTrees(root), opens: map[string]int{}}
-	w := &treeWalk{src: c, limit: 1, room: entryFloor + 10}
+	w := &treeWalk{src: c, limit: 1, room: entryFloor + heldOverhead + 10}
 	if err := w.run(memCommit, "", nil, ""); !errors.Is(err, errDeclined) {
 		t.Fatalf("err = %v, want errDeclined", err)
 	}
 	if n := c.opens[memCommit+"^{tree}"]; n != 1 {
 		t.Fatalf("the root was read %d times", n)
+	}
+}
+
+// A folder without files that the walk met before is skipped, and its
+// nesting still counts towards the depth limit: git refuses a tree nested
+// past its own limit, so the stream errors for such a listing and the walk
+// leaves it to the stream. Here e0000 is an empty folder, e0001 holds it,
+// e0002 holds e0001's folder, and so on.
+func TestTreeWalkCountsTheDepthOfSkippedFolders(t *testing.T) {
+	chains := func(n int) *memTrees {
+		chain := &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
+		root := map[string]*memEntry{"z": {mode: modeBlob}, "zz": {mode: modeBlob}}
+		for i := range n {
+			root[fmt.Sprintf("e%04d", i)] = chain
+			chain = &memEntry{mode: modeTree, sub: map[string]*memEntry{"d": chain}}
+		}
+		return newMemTrees(root)
+	}
+	// e1023 holds 1023 folders in a row: its deepest folder is the 1024th.
+	checkWalk(t, chains(maxWalkDepth), "", "\x00", 10, math.MaxInt64)
+	if _, err := walkMem(chains(maxWalkDepth+1), "", "\x00", 10, math.MaxInt64); !errors.Is(err, errDeclined) {
+		t.Fatalf("a folder %d deep below an empty folder met before: err = %v, want errDeclined", maxWalkDepth+1, err)
+	}
+}
+
+// What the walk holds is bounded by maxWalkHeld whatever the allowance is:
+// a page of 5000 entries that must read past 200,000 folders without files
+// is left to the stream.
+func TestTreeWalkBoundsWhatItHolds(t *testing.T) {
+	root := map[string]*memEntry{"z": {mode: modeBlob}}
+	for i := range 200000 {
+		root[fmt.Sprintf("e%06d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
+	}
+	w := &treeWalk{src: newMemTrees(root), limit: 5000, room: math.MaxInt64}
+	if err := w.run(memCommit, "", nil, ""); !errors.Is(err, errDeclined) {
+		t.Fatalf("err = %v, want errDeclined", err)
+	}
+	if w.held != 0 {
+		t.Fatalf("%d bytes still held after the walk", w.held)
 	}
 }
 
@@ -507,7 +623,7 @@ func FuzzTreeWalk(f *testing.F) {
 	f.Add(uint64(11), uint64(5), "a/", uint8(2), uint8(255))
 	f.Fuzz(func(t *testing.T, s1, s2 uint64, cursor string, limit, roomK uint8) {
 		r := rand.New(rand.NewPCG(s1, s2))
-		root := genDir(r, 0, true)
+		root := genTree(r, true)
 		m := newMemTrees(root)
 		dirs := folders(root, "", nil)
 		path := dirs[r.IntN(len(dirs))]

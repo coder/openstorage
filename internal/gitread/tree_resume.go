@@ -38,12 +38,20 @@ import (
 // pages by streaming `ls-tree -r`, which reads every entry the walk would
 // skip and gives the same answer. A page past the end is the stream's.
 
-// errDeclined: the walk met a tree or a path it leaves to the streaming
-// listing: a mode git does not write, an entry name with a slash, an entry
-// out of order, a name longer than the read buffer, a path that is not a
-// plain folder or too long, a tree nested deeper than maxWalkDepth, or an
-// output allowance too short for what the walk keeps or for the page (the
-// stream then says which error comes first).
+// errDeclined: the walk met something it leaves to the streaming listing,
+// which then gives the answer, an error included:
+//
+//   - a path that is not a plain folder or is too long, two entries of one
+//     name on the path, or a submodule with a folder's name
+//   - an object that is missing, not a tree or cut short, a mode git does
+//     not write, a name with a slash or longer than the read buffer, or
+//     entries out of order
+//   - a tree nested deeper than maxWalkDepth
+//   - more reads than openLimit, a level that takes more than maxWalkPasses,
+//     or more than maxWalkHeld to keep
+//   - a blob that git cannot size
+//   - an output allowance too short for what the walk keeps or for the page
+//     (the stream then says which error comes first)
 var errDeclined = errors.New("tree walk declined")
 
 // Tree entry modes git writes. Any other mode declines.
@@ -60,16 +68,29 @@ const (
 	// them whole with bufio's ReadSlice.
 	treeReadBuffer = 64 << 10
 	// maxWalkDepth bounds the recursion: a tree nested deeper is left to
-	// the stream.
+	// the stream. It is below git's default limit (core.maxTreeDepth, 2048),
+	// and a lower limit that an operator sets is not followed.
 	maxWalkDepth = 1024
 	// maxWalkPath bounds the path of a folder the walk enters: every level of
 	// the walk holds its own path, so memory grows with depth times path.
 	maxWalkPath = 16 << 10
 	// entryFloor is the size of an `ls-tree --long` record less its path:
 	// mode, type, object id, a size field of its minimum width and the
-	// separators. The walk bounds what it holds by it, the page is charged
-	// by the exact length (recordLen).
+	// separators. The page is charged by the exact length (recordLen).
 	entryFloor = 6 + 1 + 4 + 1 + 40 + 1 + 7 + 1
+	// heldOverhead is what the walk adds to entryFloor for an entry it holds
+	// while it waits: the Go values (rawEntry, its name) take more than the
+	// record would.
+	heldOverhead = 64
+	// maxWalkHeld bounds what the walk holds: the floor sizes and overheads
+	// of the entries buffered for the page and of the page. A level that does
+	// not fit is left to the stream. The output allowance bounds it too.
+	maxWalkHeld = 16 << 20
+	// maxWalkPasses bounds the reads of one tree: the walk reads a level
+	// again for the entries of folders without files, and each read sends
+	// the whole tree. A level that is still short after them is left to the
+	// stream, which reads each tree once.
+	maxWalkPasses = 4
 )
 
 // resumeTreePage is LsTreePage for a cursor, or errDeclined.
@@ -225,11 +246,16 @@ type treeWalk struct {
 	src   treeReader
 	limit int
 	room  int64 // output allowance left when the walk began
-	held  int64 // floor size of the entries buffered for the page
+	held  int64 // floor size and overhead of the entries buffered for the page
 	bytes int64 // floor size of the page
 	page  []TreeEntry
-	opens int                   // trees read so far
-	empty map[[20]byte]struct{} // folders found to hold no file
+	opens int // trees read so far
+	// deepest is the deepest folder the walk reached, one it skipped
+	// included.
+	deepest int
+	// empty holds the folders found to hold no file, by how many folders
+	// nest below each.
+	empty map[[20]byte]int
 }
 
 // openLimit bounds the trees a walk reads: the folders on the cursor's path,
@@ -253,7 +279,7 @@ func (w *treeWalk) run(commit, path string, comps []string, rest string) error {
 		}
 	}
 	// The folders of path count: git refuses a tree nested past its own
-	// limit (2048), and so does the stream, which a deep path declines to.
+	// limit, and so does the stream, which a deep path declines to.
 	return w.walk(rev, path, rest, len(comps))
 }
 
@@ -263,14 +289,19 @@ func (w *treeWalk) walk(rev, prefix, rest string, depth int) error {
 	if depth > maxWalkDepth {
 		return errDeclined
 	}
+	w.deepest = max(w.deepest, depth)
 	// A scan keeps the entries the page can still take, fewer when the
 	// allowance is short. When the page is short after them (a folder in
 	// them held no file) or the scan stopped early, read the level again
-	// and skip the entries used. Each pass keeps twice as many, so a
-	// level of folders without files takes a few passes, not one for each.
+	// and skip the entries used. Each pass keeps eight times as many, so a
+	// level of folders without files takes a few passes, not one for each,
+	// and one that takes more than maxWalkPasses is left to the stream.
 	for pass, skip := 0, 0; !w.full(); pass++ {
+		if pass == maxWalkPasses {
+			return errDeclined
+		}
 		need := w.limit + 1 - len(w.page)
-		sc, err := w.scan(rev, prefix, rest, skip, int(min(int64(need)<<min(pass, 24), math.MaxInt32)))
+		sc, err := w.scan(rev, prefix, rest, skip, int(min(int64(need)<<(3*pass), math.MaxInt32)))
 		if err != nil {
 			return err
 		}
@@ -306,34 +337,38 @@ func (w *treeWalk) use(prefix, rest string, sc treeScan, first bool, depth int) 
 		w.held -= e.cost
 		left -= e.cost
 		if e.mode == modeTree {
-			if _, none := w.empty[e.oid]; none {
+			if below, none := w.empty[e.oid]; none {
+				// Skipped, but its folders still count towards the depth.
+				if w.deepest = max(w.deepest, depth+1+below); depth+1+below > maxWalkDepth {
+					return errDeclined
+				}
 				continue
 			}
 			if len(prefix)+len(e.name)+1 > maxWalkPath {
 				return errDeclined
 			}
-			before := len(w.page)
+			before, outer := len(w.page), w.deepest
+			w.deepest = depth + 1
 			if err := w.walk(hex.EncodeToString(e.oid[:]), prefix+e.name+"/", "", depth+1); err != nil {
 				return err
 			}
 			if len(w.page) == before && len(w.empty) < 1<<16 {
 				if w.empty == nil {
-					w.empty = map[[20]byte]struct{}{}
+					w.empty = map[[20]byte]int{}
 				}
-				w.empty[e.oid] = struct{}{} // the same folder again lists nothing again
+				w.empty[e.oid] = w.deepest - (depth + 1) // the same folder again lists nothing again
 			}
+			w.deepest = max(outer, w.deepest)
 			continue
 		}
-		if err := w.add(prefix, e); err != nil {
-			return err
-		}
+		w.add(prefix, e)
 	}
 	return nil
 }
 
-// add appends a file to the page. The entry past the limit is not charged
-// or refused: it only tells that the listing goes on.
-func (w *treeWalk) add(prefix string, e rawEntry) error {
+// add appends a file to the page. The entry past the limit is not charged:
+// it only tells that the listing goes on.
+func (w *treeWalk) add(prefix string, e rawEntry) {
 	te := TreeEntry{Path: prefix + e.name, Mode: modeText(e.mode), Type: EntryBlob, SHA: hex.EncodeToString(e.oid[:]), Size: -1}
 	switch e.mode {
 	case modeSymlink:
@@ -342,14 +377,13 @@ func (w *treeWalk) add(prefix string, e rawEntry) error {
 		te.Type = EntrySubmodule
 	}
 	if len(w.page) < w.limit {
+		// scan counted this entry in held, with an overhead on top, and
+		// checked it against the allowance together with bytes.
 		cost := entryFloor + int64(len(te.Path))
-		if w.bytes+cost > w.room {
-			return errDeclined // the stream says which error comes first
-		}
+		assertf(w.bytes+cost <= w.room, "add: %d bytes of page and %d more, allowance %d", w.bytes, cost, w.room)
 		w.bytes += cost
 	}
 	w.page = append(w.page, te)
-	return nil
 }
 
 func modeText(mode uint32) string {
@@ -422,8 +456,8 @@ func (w *treeWalk) scan(rev, prefix, rest string, skip, max int) (sc treeScan, e
 		// What the walk holds stays within the allowance. A level that does
 		// not fit is left to the stream: reading it again for the entries
 		// that do not fit would cost a pass for each of them.
-		cost := entryFloor + int64(len(prefix)+len(name))
-		if w.bytes+w.held+cost > w.room {
+		cost := entryFloor + heldOverhead + int64(len(prefix)+len(name))
+		if w.bytes+w.held+cost > min(w.room, maxWalkHeld) {
 			w.held -= sc.held
 			return sc, errDeclined
 		}
