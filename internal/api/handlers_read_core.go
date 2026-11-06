@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/gitread"
@@ -777,22 +778,29 @@ func pageTreeEntries(entries []gitread.TreeEntry, after string, limit int) (star
 }
 
 type fileEntry struct {
-	Path string `json:"path"`
-	Type string `json:"type"`
-	Mode string `json:"mode"`
+	Path       string `json:"path"`
+	PathBase64 string `json:"path_base64,omitempty"`
+	Type       string `json:"type"`
+	Mode       string `json:"mode"`
 }
 
+// listFilesResponse: PathsBase64 is the empty list (not nil) exactly when
+// some blob path is not valid UTF-8, so omitzero keeps the key out of every
+// other response and the streamed template holds one empty list for it.
 type listFilesResponse struct {
-	Paths      []string    `json:"paths"`
-	Ref        string      `json:"ref"`
-	Entries    []fileEntry `json:"entries"`
-	NextCursor string      `json:"next_cursor,omitempty"`
-	HasMore    bool        `json:"has_more"`
+	Paths       []string    `json:"paths"`
+	PathsBase64 []string    `json:"paths_base64,omitzero"`
+	Ref         string      `json:"ref"`
+	Entries     []fileEntry `json:"entries"`
+	NextCursor  string      `json:"next_cursor,omitempty"`
+	HasMore     bool        `json:"has_more"`
 }
 
 // handleListFiles implements GET /api/v1/repos/files: ls-tree at the
 // resolved ref (recursive unless recursive=false), keyset cursor = last path.
 // `paths` mirrors the page's plain blob entries (openapi list_files).
+// `paths_base64` mirrors `paths` (same length and order) when any of them is
+// not valid UTF-8 (#587).
 func (s *server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -844,29 +852,46 @@ func (s *server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	assertPageCursor(hasMore, next)
 	// Without a limit the page is the whole tree: stream its entries.
-	writeJSONLists(w, http.StatusOK, listFilesResponse{
+	resp := listFilesResponse{
 		Paths:      []string{},
 		Ref:        refLabel,
 		Entries:    []fileEntry{},
 		NextCursor: next,
 		HasMore:    hasMore,
-	}, jsonList{"paths", func(yield func(any) bool) {
+	}
+	blobPaths := func(yield func(any) bool) {
 		for _, e := range page {
 			if e.Type == gitread.EntryBlob && !yield(e.Path) {
 				return
 			}
 		}
-	}}, jsonList{"entries", func(yield func(any) bool) {
+	}
+	lists := []jsonList{{"paths", blobPaths}}
+	if slices.ContainsFunc(page, func(e gitread.TreeEntry) bool {
+		return e.Type == gitread.EntryBlob && !utf8.ValidString(e.Path)
+	}) {
+		resp.PathsBase64 = []string{}
+		lists = append(lists, jsonList{"paths_base64", func(yield func(any) bool) {
+			for p := range blobPaths {
+				if !yield(encodeRawPath(p.(string))) {
+					return
+				}
+			}
+		}})
+	}
+	lists = append(lists, jsonList{"entries", func(yield func(any) bool) {
 		for _, e := range page {
-			if !yield(fileEntry{Path: e.Path, Type: e.Type, Mode: e.Mode}) {
+			if !yield(fileEntry{Path: e.Path, PathBase64: rawPathBase64(e.Path), Type: e.Type, Mode: e.Mode}) {
 				return
 			}
 		}
 	}})
+	writeJSONLists(w, http.StatusOK, resp, lists...)
 }
 
 type fileMetaEntry struct {
 	Path          string `json:"path"`
+	PathBase64    string `json:"path_base64,omitempty"`
 	Mode          string `json:"mode"`
 	Size          int64  `json:"size"`
 	LastCommitSHA string `json:"last_commit_sha"`
@@ -994,8 +1019,9 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 		for i, e := range page {
 			assertf(pageLast[i] != "", "files/metadata: no last commit for %q", e.Path)
 			if !yield(fileMetaEntry{
-				Path: e.Path,
-				Mode: e.Mode,
+				Path:       e.Path,
+				PathBase64: rawPathBase64(e.Path),
+				Mode:       e.Mode,
 				Size: max(e.Size,
 					// submodules: ls-tree reports no blob size
 					0),
