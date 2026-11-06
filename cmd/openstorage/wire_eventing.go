@@ -482,40 +482,55 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			cleanup()
 		}
 	}
+	// disabled ends a wiring that failed. The eventless default would
+	// accept a push with no forward intent and no events: on PostgreSQL the
+	// CAS records the intent (newPGEventsStore), and on the local schedule
+	// BeforeCAS does (ADR-50 amendment), and neither runs without eventing.
+	// A failed step does not prove the CAS fails too (the database can be
+	// back by then). So the hook refuses every update that would record
+	// intent before its CAS, and the client can push again. Without the
+	// store the hook cannot tell whether the repository has an upstream
+	// link, so it refuses such an update to a repository without one too.
+	// Updates that record no intent even with eventing keep failing open
+	// (eventless): ephemeral updates, a sync run's own loopback push (its
+	// claim fence refuses it when the store is down), and a caller whose
+	// token may not forward.
+	//
+	// Neither the log line nor the refusal carries err: git relays the
+	// hook's stderr and its error to the pusher, and a store error names
+	// the database host, user and name, or the S3 endpoint. serve logs a
+	// store error only when its own connection fails, so when only the
+	// hook's connection fails, no log carries the cause.
+	disabled := func(stage string, _ error) func() {
+		cleanup()
+		if envconfig.Getenv(githttp.EnvSyncClaim) != "" || hookCallerDeniedForward() {
+			logger.Error("hook eventing disabled: " + stage)
+			return func() {}
+		}
+		logger.Error("hook eventing unavailable: " + stage + "; refusing only updates that would record forward intent")
+		refusal := errors.New("refusing the ref update: hook eventing unavailable (" + stage + "); push again later")
+		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
+			return intentlessRefStore{RefStore: ref.IdempotentCAS{RefStore: st}, refusal: refusal}, nil
+		}
+		return func() {}
+	}
 
 	// Secrets codec (issue #54): hook subprocesses inherit serve's
 	// environment, so a serve process that booted with a valid
 	// OPENSTORAGE_SECRETS_KEY hands the same value down here. A malformed
 	// value (possible only for direct hook invocation outside serve, which
-	// validates at boot) degrades to eventless — fail closed for secrets:
-	// no delivery ever signs with a wrong or plaintext-passthrough key.
+	// validates at boot) disables eventing — fail closed for secrets: no
+	// delivery ever signs with a wrong or plaintext-passthrough key, and no
+	// update that would record forward intent is accepted.
 	secretsCodec, err := resolveSecretsCodec(envconfig.Getenv)
 	if err != nil {
-		logger.Error("hook eventing disabled: secrets key", "err", err)
-		return func() {}
+		return disabled("secrets key", err)
 	}
 
 	// Hooks never run DDL: meta.Open without InitSchema (serve owns it).
 	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))
-	if err != nil && !isPGURL(dbURL) && envconfig.Getenv(githttp.EnvSyncClaim) == "" {
-		// The local schedule records the push's forward intent before
-		// the CAS (ADR-50 amendment): without the store it cannot, so an
-		// update that would record intent is refused rather than accepted
-		// with none. Ephemeral updates and a sync run's own loopback push
-		// record no intent, so they keep failing open, as on a failed
-		// read (the loopback push's claim fence refuses it anyway).
-		logger.Error("hook refuses ref updates: open meta store", "err", err)
-		refusal := fmt.Errorf("refusing the ref update: open metadata store: %w", err)
-		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
-			return intentlessRefStore{RefStore: st, refusal: refusal}, nil
-		}
-		return func() {}
-	}
 	if err != nil {
-		// Fail open (eventless) rather than denying the push: the ref
-		// store open below would fail too if the DB were truly down.
-		logger.Error("hook eventing disabled: open meta store", "err", err)
-		return func() {}
+		return disabled("open meta store", err)
 	}
 	cleanups = append(cleanups, ms.Close)
 
@@ -527,11 +542,9 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		newEvents       = newEventsStore
 	)
 	if isPGURL(dbURL) {
-		q, err := jobs.NewRiverInsertOnly(ctx, dbURL)
+		q, err := newHookRiver(ctx, dbURL)
 		if err != nil {
-			logger.Error("hook eventing disabled: river insert-only client", "err", err)
-			cleanup()
-			return func() {}
+			return disabled("river insert-only client", err)
 		}
 		cleanups = append(cleanups, q.Close)
 		enqueueDelivery = q.EnqueueWebhookDelivery
@@ -577,8 +590,12 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			// never leave an accepted push that no run forwards. The ref's
 			// push hold is already in place, so a run that claims this
 			// intent waits for the push's publication. An error refuses
-			// the update.
-			beforeCAS = enqueueSyncOrForward(row, noop, noop, org, forwardDenied, pullDeniedFn)
+			// the update, with a fixed cause (see disabled). A caller whose
+			// token may not forward records no intent, so it skips the
+			// step and a failed read cannot refuse its update.
+			if !denied {
+				beforeCAS = enqueueSyncOrForward(row, noop, noop, org, forwardDenied, pullDeniedFn)
+			}
 			enqueueSync = enqueueSyncOrForward(row,
 				func(ctx context.Context, job upsync.Job) error {
 					return ms.RequestSync(ctx, job.RepoID)
@@ -605,9 +622,10 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		// (issue #445: a hook binary replaced under an older serve). Read
 		// the document first: a wrong format or a corrupt document (issue
 		// #466) refuses the update, so no push is accepted without its
-		// events. A failed read keeps failing open, as for the open error
-		// above. On the local schedule BeforeCAS then reads the document
-		// again for the push's intent, and refuses the update if it fails.
+		// events. A failed read accepts the update with eventing still
+		// wired: on PostgreSQL the CAS still records the forward intent, and
+		// on the local schedule BeforeCAS reads the document again for the
+		// push's intent, and refuses the update if it fails.
 		//
 		// Known limit (issue #466): a format change between this check and
 		// the CAS still commits the push without events. Formats change
@@ -619,7 +637,8 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			if errors.As(err, &fv) || errors.As(err, &cd) {
 				return nil, fmt.Errorf("refusing the ref update: %w", err)
 			}
-			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
+			// No err: it reaches the pusher (see disabled).
+			logger.Warn("hook eventing: metadata format check failed; accepting the update")
 		}
 		return newEvents(st, events.RefStoreOptions{
 			Org:             org,
@@ -627,16 +646,42 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			Webhooks:        whStore,
 			EnqueueDelivery: enqueueDelivery,
 			EnqueueSync:     enqueueSync,
-			BeforeCAS:       beforeCAS,
+			BeforeCAS:       quietBeforeCAS(beforeCAS, logger),
 			Logger:          logger,
 		}), nil
 	}
 	return cleanup
 }
 
-// intentlessRefStore is the hook's ref store when the local schedule's
-// metadata store does not open: it refuses every update that would record
-// forward intent, and passes ephemeral updates through.
+// newHookRiver builds the hook's River client. Tests replace it to reach
+// the wiring's River failure.
+var newHookRiver = jobs.NewRiverInsertOnly
+
+// errHookIntent is BeforeCAS's refusal when the hook cannot record a push's
+// forward intent. events.RefStore prefixes "refusing the ref update".
+var errHookIntent = errors.New("hook could not record the forward intent; push again later")
+
+// quietBeforeCAS refuses with errHookIntent instead of beforeCAS's own
+// error, which can name the store: the pusher sees it (see disabled in
+// wireHookEventing). A nil step stays nil.
+func quietBeforeCAS(beforeCAS func(ctx context.Context, repoID string) error, logger *slog.Logger) func(ctx context.Context, repoID string) error {
+	if beforeCAS == nil {
+		return nil
+	}
+	return func(ctx context.Context, repoID string) error {
+		if beforeCAS(ctx, repoID) != nil {
+			logger.Error("hook refuses ref updates: record forward intent")
+			return errHookIntent
+		}
+		return nil
+	}
+}
+
+// intentlessRefStore is the hook's ref store when its eventing could not be
+// wired, so it cannot record forward intent. It refuses every update that
+// would record intent, and passes ephemeral updates through to its inner
+// store (ref.IdempotentCAS over the hook's store, as on the eventless
+// default).
 type intentlessRefStore struct {
 	ref.RefStore
 	refusal error
