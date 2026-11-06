@@ -83,8 +83,8 @@ type Server struct {
 	// hydrate skips a push-held ref that the cache has not caught up
 	// with, instead of serving the stale value for forwarding. The local
 	// schedule (SQLite, S3WAL; ADR-50) sets it: its runs restore their
-	// request on that answer. PostgreSQL runs have no restore and leave it
-	// off.
+	// request on that answer. PostgreSQL leaves it off: a River run does
+	// not restore on a 423, so it would end failed instead.
 	StrictSyncFetch bool
 
 	// repackProbeMu guards the asynchronous post-push repack probe

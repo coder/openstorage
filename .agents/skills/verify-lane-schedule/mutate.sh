@@ -106,7 +106,7 @@ mut RetryRemarks internal/meta/s3walmeta_schedule.go '				u.PushPending = max(u.
 mut FinishKeepsExplicit internal/meta/sqlite_schedule.go 'push_attempt = push_attempt + 1, push_due = CASE WHEN push_due = 0 THEN 0 ELSE ? END' 'push_attempt = push_attempt + 1, push_due = ?' LaneSchedule.cfg 'Invariant ExplicitNotDelayed is violated'
 mut StealInheritsForce internal/meta/s3walmeta_eventing.go 'force = u.PushPending == 2 || (u.PushSyncing && u.PushClaimForce)' 'force = u.PushPending == 2' LaneSchedule.cfg 'Invariant ForceKept is violated'
 mut RunPassesForce internal/sync/worker_push.go 'meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: shutdownRestoreDelay}' 'meta.PushOutcome{Kind: meta.OutcomeRestore, Delay: shutdownRestoreDelay}' LaneSchedule.cfg 'Invariant ForceKept is violated'
-mut WaitBeforeSnapshot internal/sync/worker_push.go '		if err := w.waitPublication(ctx, job.RepoID); err != nil {' '		if err := error(nil); err != nil {' LaneSchedule.cfg 'Invariant NoLostForward is violated'
+mut WaitBeforeSnapshot internal/sync/worker_push.go '	if err := w.waitPublication(ctx, job.RepoID); err != nil {' '	if err := error(nil); err != nil {' LaneSchedule.cfg 'Invariant NoLostForward is violated'
 mut ShutdownRestores internal/sync/worker_push.go '	if runErr != nil && shutdownAborted(ctx) {' '	if runErr != nil && errors.Is(runErr, ErrShutdown) {' LaneSchedule.cfg 'Invariant NoLostForward is violated'
 mut MarkBeforeCas internal/events/refstore.go '	if err := s.runBeforeCAS(ctx, repo, name); err != nil {
 		return false, 0, err

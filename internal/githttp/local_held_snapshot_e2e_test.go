@@ -189,8 +189,8 @@ func TestLocalForwardHeldStaleRefRestores(t *testing.T) {
 // for the local schedule only. With a push holding main while the cache
 // lags the authority, a fetch whose token carries a sync claim (a push
 // run's loopback fetch) gets 423 Locked on SQLite and S3WAL; PostgreSQL
-// runs have no restore, so they keep reading. An ordinary fetch reads the
-// cached value on every backend.
+// leaves strict fetching off, so its sync-claim fetch keeps reading. An
+// ordinary fetch reads the cached value on every backend.
 func TestServeStrictSyncFetchOnLocalSchedule(t *testing.T) {
 	ctx := t.Context()
 	db, blobs := privateStores(t, t.TempDir())
