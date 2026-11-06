@@ -3,15 +3,19 @@
 # ghcr.io/coder/openstorage.
 #
 # Manual only, on purpose. There is no push, tag, release, or workflow_call
-# trigger, so neither a merge nor a release ever publishes an image. A dispatch
-# with the default publish=false builds and checks both platforms natively and
-# pushes nothing. publish=true (dispatched from main) waits for a reviewer to
-# approve the ghcr-publish environment, then pushes exactly one immutable
-# version tag (vX.Y.Z -> :X.Y.Z), refuses a tag that already exists, records
-# the index digest, and re-runs the checks on the pulled digest.
-# Only the publish job can write packages. Every image it pulls (base, Go
-# builder, binfmt, BuildKit, SBOM scanner) is pinned by digest. Runbook:
-# docs/how-to/release.md#4-verify-and-publish-the-container-image.
+# trigger, so neither a merge nor a release ever publishes an image.
+# Each platform is built once, natively, by the stage job, which pushes it by
+# digest with no tag. The verify jobs pull those digests and run every check
+# and the Compose quickstart smoke on them. publish=true (dispatched from main)
+# then waits for a reviewer to approve the ghcr-publish environment and gives
+# the checked digests exactly one immutable version tag (vX.Y.Z -> :X.Y.Z)
+# without building again, so the tag holds the bytes that were checked. It
+# refuses a tag that already exists, records the index digest, and the
+# verify-published jobs re-run the checks on the pulled tag.
+# A dispatch with the default publish=false stages and checks the digests and
+# pushes no tag. Only the stage and publish jobs can write packages. Every image
+# they pull (base, Go builder, BuildKit, SBOM scanner) is pinned by digest.
+# Runbook: docs/how-to/release.md#4-verify-and-publish-the-container-image.
 name: image
 
 on:
@@ -22,7 +26,7 @@ on:
         required: true
         type: string
       publish:
-        description: "Push to ghcr.io/coder/openstorage (false: build and check only)"
+        description: "Tag ghcr.io/coder/openstorage:X.Y.Z (false: stage and check only, no tag)"
         required: true
         type: boolean
         default: false
@@ -84,9 +88,84 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "$TAG -> $commit ($date)"
 
-  # Native build and full Compose quickstart smoke on each platform. Pushes nothing.
-  verify:
+  # Build each platform once, natively, and push it by digest with no tag. Nothing
+  # in this job runs the image. The verify jobs check these digests, and publish
+  # gives exactly these digests the version tag.
+  stage:
     needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    name: stage (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      # The BuildKit image holds the push credential, so pin it by digest. A
+      # native runner needs no QEMU.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push the platform by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # The checked-out tree, not the action's default Git context of the
+          # dispatching ref (main).
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.tag }}
+            COMMIT=${{ needs.resolve.outputs.commit }}
+            BUILD_DATE=${{ needs.resolve.outputs.date }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.created=${{ needs.resolve.outputs.date }}
+            org.opencontainers.image.title=openstorage
+            org.opencontainers.image.description=Self-hosted, API-first Git storage
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: mode=max
+          # The default scanner is a mutable tag (stable-1); pin it like the rest.
+          sbom: generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ $DIGEST =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir digest
+          echo "$DIGEST" > "digest/$ARCH"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digest/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Pull the staged digest of each platform and run every check on it, the Compose
+  # quickstart smoke included. The token is read-only.
+  verify:
+    needs: [resolve, stage]
     strategy:
       fail-fast: false
       matrix:
@@ -100,6 +179,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      packages: read
     env:
       ARCH: ${{ matrix.arch }}
       TAG: ${{ needs.resolve.outputs.tag }}
@@ -110,11 +190,22 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.commit }}
           persist-credentials: false
-      - name: Build without publication
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digest
+      - name: Pull the staged digest
         run: |
-          docker build --iidfile "$RUNNER_TEMP/openstorage-image.id" --build-arg VERSION="$TAG" \
-            --build-arg COMMIT="$COMMIT" --build-arg BUILD_DATE="$BUILD_DATE" .
-          echo "OPENSTORAGE_IMAGE=$(cat "$RUNNER_TEMP/openstorage-image.id")" >> "$GITHUB_ENV"
+          DIGEST=$(cat "digest/$ARCH")
+          [[ $DIGEST =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker pull --platform "linux/$ARCH" "$IMAGE@$DIGEST"
+          [ "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE@$DIGEST")" = "$COMMIT" ]
+          echo "OPENSTORAGE_IMAGE=$(docker image inspect --format '{{.Id}}' "$IMAGE@$DIGEST")" >> "$GITHUB_ENV"
       - name: Check platform, version stamp, and runtime tools
         run: |
           [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$OPENSTORAGE_IMAGE")" = "linux/$ARCH" ]
@@ -138,6 +229,9 @@ jobs:
       - name: Smoke the Compose quickstart
         run: bash scripts/smoke-compose-quickstart.sh
 
+  # Give the checked digests the version tag after a reviewer approves. Nothing is
+  # built here: the tag is an index of the digests that stage pushed and verify
+  # checked, so it holds those bytes.
   publish:
     needs: [resolve, verify]
     # Dispatch input `publish` defaults to false. Requiring main stops a branch
@@ -151,34 +245,23 @@ jobs:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.push.outputs.digest }}
+      digest: ${{ steps.promote.outputs.digest }}
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
       VERSION: ${{ needs.resolve.outputs.version }}
       COMMIT: ${{ needs.resolve.outputs.commit }}
+      DATE: ${{ needs.resolve.outputs.date }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.resolve.outputs.commit }}
-          persist-credentials: false
-      # The build stage cross-compiles natively. QEMU runs only the arm64
-      # runtime stage (apk add); verify-published runs that result natively.
-      # The helper images run privileged (binfmt) or hold the push credential
-      # (BuildKit), so pin them by multi-platform digest like the base images.
-      # No binfmt cache: the pinned image is pulled fresh every run.
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
-          cache-image: false
-          platforms: arm64
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-        with:
-          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digest
+          merge-multiple: true
       - name: Refuse to replace an existing version tag
         env:
           ACTOR: ${{ github.actor }}
@@ -194,52 +277,44 @@ jobs:
           # 404 is the only proof of absence. 200 means published already; any
           # other status is unknown, so stop rather than risk an overwrite.
           [ "$code" = 404 ] || { echo "::error::$IMAGE:$VERSION exists or cannot be checked (HTTP $code). Version tags are immutable."; exit 1; }
-      - name: Build and push both platforms
-        id: push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          # The checked-out tree, not the action's default Git context of the
-          # dispatching ref (main).
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
-          build-args: |
-            VERSION=${{ needs.resolve.outputs.tag }}
-            COMMIT=${{ needs.resolve.outputs.commit }}
-            BUILD_DATE=${{ needs.resolve.outputs.date }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
-            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
-            org.opencontainers.image.created=${{ needs.resolve.outputs.date }}
-            org.opencontainers.image.title=openstorage
-            org.opencontainers.image.description=Self-hosted, API-first Git storage
-            org.opencontainers.image.licenses=Apache-2.0
-          annotations: |
-            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            index:org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
-            index:org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
-            index:org.opencontainers.image.description=Self-hosted, API-first Git storage
-          provenance: mode=max
-          # The default scanner is a mutable tag (stable-1); pin it like the rest.
-          sbom: generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
-      - name: Check the pushed index and record its digest
-        env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+      - name: Give the checked digests the version tag
+        id: promote
         run: |
-          [[ $DIGEST =~ ^sha256:[a-f0-9]{64}$ ]]
+          amd64=$(cat digest/amd64)
+          arm64=$(cat digest/arm64)
+          [[ $amd64 =~ ^sha256:[a-f0-9]{64}$ && $arm64 =~ ^sha256:[a-f0-9]{64}$ && $amd64 != "$arm64" ]]
+          docker buildx version
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.revision=$COMMIT" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            --annotation "index:org.opencontainers.image.description=Self-hosted, API-first Git storage" \
+            "$IMAGE@$amd64" "$IMAGE@$arm64"
           # Parse JSON: some Buildx releases ignore a field template like
           # {{.Manifest.Digest}} and print the default table (docker/buildx#4006).
-          [ "$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)" = "$DIGEST" ]
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ $digest =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Check that the index holds exactly the checked digests
+        env:
+          DIGEST: ${{ steps.promote.outputs.digest }}
+        run: |
           platforms=$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .Manifest}}' |
             jq -r '[.manifests[].platform | select(.os != "unknown") | .os + "/" + .architecture] | sort | join(",")')
           [ "$platforms" = linux/amd64,linux/arm64 ]
+          # Every manifest of the two staged indexes (image and attestations) must be
+          # in the new index, byte for byte, and the index must hold nothing else.
+          staged=$(for a in amd64 arm64; do
+            docker buildx imagetools inspect "$IMAGE@$(cat "digest/$a")" --format '{{json .Manifest}}' | jq -r '.manifests[].digest'
+          done | sort)
+          published=$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .Manifest}}' | jq -r '.manifests[].digest' | sort)
+          [ -n "$staged" ] && [ "$staged" = "$published" ]
           {
             echo "### Published $IMAGE:$VERSION"
             echo
             echo "- Index digest: \`$DIGEST\`"
             echo "- Platforms: $platforms"
+            echo "- Staged digests: \`$(cat digest/amd64)\`, \`$(cat digest/arm64)\`"
             echo "- Source: $TAG ($COMMIT)"
             echo "- Pin: \`$IMAGE:$VERSION@$DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"

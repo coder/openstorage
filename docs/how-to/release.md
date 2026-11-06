@@ -106,18 +106,22 @@ dispatches it for an existing release tag
 Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 (v0.16.0 and earlier).
 
-1. Build and check without pushing (the default, `publish=false`):
+1. Stage and check, without a version tag (the default, `publish=false`):
 
    ```sh
    gh workflow run image -R coder/openstorage --ref main -f tag=vX.Y.Z
    ```
 
-   The `verify` jobs build the tag natively on linux/amd64 and linux/arm64 runners.
-   Each job checks the platform, the `openstorage --version` stamp, and the runtime
-   tools. It then runs [`scripts/check-apply-messages.sh`](../../scripts/check-apply-messages.sh)
-   inside the image, because the image's Git is Alpine's and the server reads its patch
-   refusals by their words (a tag cut before that script landed skips this check with a
-   notice). Last, it runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
+   The `stage` jobs build the tag natively on linux/amd64 and linux/arm64 runners, one
+   build per platform, and push each result to `ghcr.io/coder/openstorage` **by digest**,
+   with no tag. A run with `publish=false` therefore leaves two untagged package
+   versions behind, and no version tag. The `verify` jobs pull those digests with a
+   read-only token. Each job checks the platform, the `openstorage --version` stamp, and
+   the runtime tools. It then runs
+   [`scripts/check-apply-messages.sh`](../../scripts/check-apply-messages.sh) inside the
+   image, because the image's Git is Alpine's and the server reads its patch refusals by
+   their words (a tag cut before that script landed skips this check with a notice).
+   Last, it runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
 
 2. After that run is green, request the push:
 
@@ -125,16 +129,19 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    gh workflow run image -R coder/openstorage --ref main -f tag=vX.Y.Z -f publish=true
    ```
 
-   The `publish` job uses the `ghcr-publish` environment. It waits until a required
-   reviewer approves it in the run's **Review deployments** dialog, and the
-   environment accepts deployments only from `main`. It is the only job with
+   This run stages and checks again, so its digests are the ones that ship. The `publish`
+   job uses the `ghcr-publish` environment. It waits until a required reviewer approves
+   it in the run's **Review deployments** dialog, and the environment accepts deployments
+   only from `main`. With the `stage` jobs, it is one of the two jobs with
    `packages: write`.
 
-   After approval it pushes one multi-platform tag, `ghcr.io/coder/openstorage:X.Y.Z`,
-   with OCI labels (source, revision, version), an SBOM, and provenance. It refuses
-   to run when that tag already exists, so version tags are never replaced. The run
-   summary records the index digest. The `verify-published` jobs then pull that
-   digest on both platforms and repeat the checks and the smoke.
+   After approval it does not build. It gives the two checked digests one multi-platform
+   tag, `ghcr.io/coder/openstorage:X.Y.Z`, with index annotations (source, revision,
+   version, description). The OCI labels, the SBOM and the provenance come with the
+   digests. It refuses to run when that tag already exists, so version tags are never
+   replaced, and it fails unless the new index holds exactly the manifests of the two
+   staged digests. The run summary records the index digest. The `verify-published` jobs
+   then pull that digest on both platforms and repeat the checks and the smoke.
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
