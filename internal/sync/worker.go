@@ -414,7 +414,8 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	started.Type = EventSyncStarted
 	w.emitDetached(ctx, job.Org, EventSyncStarted, started.marshal())
 
-	runErr := w.transfer(ctx, job, repo, up, holder)
+	var hc headCheck
+	runErr := w.transfer(ctx, job, repo, up, holder, &hc)
 	if errors.Is(runErr, errDetached) {
 		return nil // detach raced the run: the row is gone, cancel silently
 	}
@@ -488,7 +489,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	if w.Local != nil {
 		return runErr // intent that arrived mid-run stays due in the row; the sweep runs it
 	}
-	if up.DefaultBranchOmitted && fin.DefaultBranchOmitted {
+	if up.DefaultBranchOmitted && fin.DefaultBranchOmitted && !hc.retry {
 		w.recordHeadChecked(ctx, job, fin.SuccessCount)
 	}
 	if fin.SyncPending && w.Requeue != nil {
@@ -738,7 +739,7 @@ var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/t
 // errDetached means DELETE /repos/base raced the run; errClaimStolen means
 // the claim barrier found the run's lease stolen; every other failure is a
 // *syncFailure carrying the documented error string.
-func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstream, holder string) error {
+func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstream, holder string, hc *headCheck) error {
 	if up.Owner == "" || up.Name == "" || up.UpstreamHost == "" {
 		return &syncFailure{code: FailConfig, cause: fmt.Errorf(
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
@@ -818,7 +819,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	// (issue #599); adoptHead records it before the run is finished.
 	var head string
 	if up.DefaultBranchOmitted {
-		head = w.upstreamHead(ctx, job, mirror, fetchEnv, up.CloneURL())
+		head, hc.retry = w.upstreamHead(ctx, job, mirror, fetchEnv, up.CloneURL())
 	}
 
 	// Empty upstream: nothing to push, the run still counts as a success.
@@ -887,12 +888,12 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		if rejected := parsePushRejections(stdout); up.ForwardOnPush && allLocalWins(rejected) {
 			w.Logger.Info("mirror-back kept newer local refs (forward-on-push: local wins)",
 				"org", job.Org, "repo", job.RepoID, "refused", len(rejected))
-			w.adoptHead(ctx, job, head)
+			hc.retry = w.adoptHead(ctx, job, head) || hc.retry
 			return nil
 		}
 		return &syncFailure{code: FailPush, cause: fmt.Errorf("git push: %w: %s", err, stderr)}
 	}
-	w.adoptHead(ctx, job, head)
+	hc.retry = w.adoptHead(ctx, job, head) || hc.retry
 	return nil
 }
 
