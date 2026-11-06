@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"os"
@@ -21,7 +20,8 @@ import (
 // later siblings of each path component, deepest folder first. resumeTreePage
 // reads just those trees through one `git cat-file --batch` child and
 // parses them itself: the trees before the cursor are never opened, and the
-// tree that holds the cursor is read once, not once per entry before it.
+// trees that hold the cursor are read once per pass, not once per entry
+// before it.
 //
 // Within one tree (named n for a folder, relative cursor rest):
 //
@@ -32,14 +32,18 @@ import (
 //   - any other entry sorts before the cursor
 //
 // This is LsTreePage's contract for any cursor string, an existing path or
-// not. Anything the walk does not handle returns errDeclined, and
-// LsTreePage then pages by streaming `ls-tree -r`, which reads every entry
-// the walk would skip, so the answer is the same.
+// not. The walk opens no tree before the cursor, so an object that is
+// missing or unreadable there no longer fails a page that is not empty.
+// Anything else it does not handle returns errDeclined, and LsTreePage then
+// pages by streaming `ls-tree -r`, which reads every entry the walk would
+// skip and gives the same answer. A page past the end is the stream's.
 
 // errDeclined: the walk met a tree or a path it leaves to the streaming
-// listing: a mode git does not write, an entry name with a slash, an
-// entry out of order, a name longer than the read buffer, a path that is
-// not a plain folder, or a tree nested deeper than maxWalkDepth.
+// listing: a mode git does not write, an entry name with a slash, an entry
+// out of order, a name longer than the read buffer, a path that is not a
+// plain folder or too long, a tree nested deeper than maxWalkDepth, or an
+// output allowance too short for what the walk keeps or for the page (the
+// stream then says which error comes first).
 var errDeclined = errors.New("tree walk declined")
 
 // Tree entry modes git writes. Any other mode declines.
@@ -134,12 +138,12 @@ func resumeTreePage(ctx context.Context, repoPath, commit, path, after string, l
 
 // folderComponents splits path, "" or a folder with a trailing slash, into
 // its names. Any other spelling (a path git's pathspec rules would rewrite
-// or refuse) is not ok.
+// or refuse) and a path past maxWalkPath is not ok.
 func folderComponents(path string) (comps []string, ok bool) {
 	if path == "" {
 		return nil, true
 	}
-	if !strings.HasSuffix(path, "/") || strings.IndexByte(path, 0) >= 0 {
+	if !strings.HasSuffix(path, "/") || strings.IndexByte(path, 0) >= 0 || len(path) > maxWalkPath {
 		return nil, false
 	}
 	comps = strings.Split(path[:len(path)-1], "/")
@@ -176,6 +180,8 @@ func recordLen(e TreeEntry) int64 {
 }
 
 // fillSizes sets the size of the page's blobs, as `ls-tree --long` shows it.
+// A blob it cannot size declines: the stream's error for it depends on the
+// records before it.
 func fillSizes(ctx context.Context, repoPath string, page []TreeEntry) error {
 	var in strings.Builder
 	var blobs []int
@@ -195,12 +201,12 @@ func fillSizes(ctx context.Context, repoPath string, page []TreeEntry) error {
 	}
 	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
 	if len(lines) != len(blobs) {
-		return fmt.Errorf("cat-file --batch-check answered %d lines for %d blobs", len(lines), len(blobs))
+		return errDeclined
 	}
 	for i, line := range lines {
 		n, err := strconv.ParseInt(line, 10, 64)
 		if err != nil || n < 0 {
-			return fmt.Errorf("cat-file --batch-check answered %q for blob %s", line, page[blobs[i]].SHA)
+			return errDeclined // a blob git cannot read: the stream says what that costs
 		}
 		page[blobs[i]].Size = n
 	}
@@ -222,12 +228,23 @@ type treeWalk struct {
 	held  int64 // floor size of the entries buffered for the page
 	bytes int64 // floor size of the page
 	page  []TreeEntry
+	opens int                   // trees read so far
+	empty map[[20]byte]struct{} // folders found to hold no file
 }
+
+// openLimit bounds the trees a walk reads: the folders on the cursor's path,
+// and about one tree for each entry of the page. The rest is folders without
+// files. Past the bound the stream pages, which reads such folders inside
+// git, much faster than a request for each.
+func (w *treeWalk) openLimit() int { return 4*(w.limit+1) + 2*maxWalkDepth }
 
 func (w *treeWalk) full() bool { return len(w.page) > w.limit }
 
 // run lists the folder named by comps under commit's root tree after rest.
 func (w *treeWalk) run(commit, path string, comps []string, rest string) error {
+	if len(comps) > maxWalkDepth {
+		return errDeclined
+	}
 	rev := commit + "^{tree}"
 	for _, name := range comps {
 		var err error
@@ -289,11 +306,21 @@ func (w *treeWalk) use(prefix, rest string, sc treeScan, first bool, depth int) 
 		w.held -= e.cost
 		left -= e.cost
 		if e.mode == modeTree {
+			if _, none := w.empty[e.oid]; none {
+				continue
+			}
 			if len(prefix)+len(e.name)+1 > maxWalkPath {
 				return errDeclined
 			}
+			before := len(w.page)
 			if err := w.walk(hex.EncodeToString(e.oid[:]), prefix+e.name+"/", "", depth+1); err != nil {
 				return err
+			}
+			if len(w.page) == before && len(w.empty) < 1<<16 {
+				if w.empty == nil {
+					w.empty = map[[20]byte]struct{}{}
+				}
+				w.empty[e.oid] = struct{}{} // the same folder again lists nothing again
 			}
 			continue
 		}
@@ -362,6 +389,9 @@ type treeScan struct {
 // less the first skip of them. A scan stops at the first entry past max.
 func (w *treeWalk) scan(rev, prefix, rest string, skip, max int) (sc treeScan, err error) {
 	assertf(max > 0, "scan: max %d", max)
+	if w.opens++; w.opens > w.openLimit() {
+		return sc, errDeclined
+	}
 	body, err := w.src.open(rev)
 	if err != nil {
 		return sc, err
@@ -652,9 +682,10 @@ func (s *treeSource) open(rev string) (*treeBody, error) {
 }
 
 // childTree returns the object id of the folder name in tree rev. A tree
-// without one, or a file of that name only, declines: the stream lists it
-// as git's pathspec rules say. The whole tree is read, so a tree that git
-// would refuse or list twice (two folders of one name) declines too.
+// without one, or with an entry of that name that is not a folder, declines:
+// the stream lists it as git's pathspec rules say. The whole tree is read,
+// so a tree that git would refuse or list twice (two folders of one name)
+// declines too.
 func childTree(src treeReader, rev, name string) (string, error) {
 	body, err := src.open(rev)
 	if err != nil {
@@ -669,9 +700,13 @@ func childTree(src treeReader, rev, name string) (string, error) {
 		if !ok {
 			break
 		}
-		if mode == modeTree && string(n) == name {
-			id = hex.EncodeToString(oid[:])
+		if string(n) != name {
+			continue
 		}
+		if mode != modeTree {
+			return "", errDeclined // git's pathspec reads a submodule of that name too
+		}
+		id = hex.EncodeToString(oid[:])
 	}
 	if id == "" {
 		return "", errDeclined

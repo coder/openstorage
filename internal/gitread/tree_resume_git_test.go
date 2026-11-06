@@ -513,6 +513,129 @@ func TestLsTreePageCursorOnADeepPath(t *testing.T) {
 	}
 }
 
+// A query path longer than the walk's bound is the stream's, and git reads
+// it as before.
+func TestLsTreePageCursorOnALongQueryPath(t *testing.T) {
+	name := strings.Repeat("n", maxWalkPath/2)
+	dir, commit := fiRepo(t, []fiFile{{"100644", name + "/" + name + "/f", "x"}, {"100644", name + "/" + name + "/g", "y"}})
+	ctx := context.Background()
+	path := name + "/" + name + "/"
+	if _, _, _, err := resumeTreePage(ctx, dir, commit, path, path+"f", 5); !errors.Is(err, errDeclined) {
+		t.Fatalf("resumeTreePage err = %v, want errDeclined", err)
+	}
+	page, more, found, err := LsTreePage(ctx, dir, commit, path, path+"f", 5)
+	wp, wm, wf, werr := pageOracle(ctx, dir, commit, path, path+"f", 5)
+	if (err == nil) != (werr == nil) || err == nil && (!slices.Equal(page, wp) || more != wm || found != wf) || err == nil && len(page) != 1 {
+		t.Fatalf("LsTreePage = %d entries, %v, %v, %v; stream = %d entries, %v, %v, %v", len(page), more, found, err, len(wp), wm, wf, werr)
+	}
+}
+
+// Records wider than the minimum (a folder commit's type is longer than a
+// blob's) fill the allowance before a blob that git cannot read.
+func TestLsTreePageCursorOverflowBeforeAMissingBlob(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	var entries [][2]string
+	for i := range 33 {
+		entries = append(entries, [2]string{fmt.Sprintf("160000 f%03d", i), strings.Repeat("1", 40)})
+	}
+	entries = append(entries, [2]string{"100644 zzzz", "id:" + strings.Repeat("ab", 20)})
+	commit := commitOf(t, dir, rawTree(t, dir, entries...))
+	readable := commitOf(t, dir, rawTree(t, dir, entries[:33]...))
+	for _, allowance := range []int64{2210, 2211, 1 << 20} {
+		// The page of submodules alone: its records are wider than the floor,
+		// and a refused page charges nothing.
+		ctx, b := budgeted(t, allowance)
+		_, _, _, err := LsTreePage(ctx, dir, readable, "", "\x00", 100)
+		octx, ob := budgeted(t, allowance)
+		_, _, _, oerr := pageOracle(octx, dir, readable, "", "\x00", 100)
+		if (err == nil) != (oerr == nil) || errors.Is(err, ErrOutputLimit) != errors.Is(oerr, ErrOutputLimit) || b.remaining() != ob.remaining() {
+			t.Errorf("submodules, allowance %d: err %v, %d left; stream: err %v, %d left", allowance, err, b.remaining(), oerr, ob.remaining())
+		}
+		ctx, b = budgeted(t, allowance)
+		_, _, _, err = LsTreePage(ctx, dir, commit, "", "\x00", 100)
+		octx, ob = budgeted(t, allowance)
+		_, _, _, oerr = pageOracle(octx, dir, commit, "", "\x00", 100)
+		if (err == nil) != (oerr == nil) || errors.Is(err, ErrOutputLimit) != errors.Is(oerr, ErrOutputLimit) || b.remaining() != ob.remaining() {
+			t.Errorf("allowance %d: err %v, %d left; stream: err %v, %d left", allowance, err, b.remaining(), oerr, ob.remaining())
+		}
+	}
+}
+
+// A tree of a thousand folders that are one tree of a thousand empty folders
+// is two small objects. Reading each folder in a request would take half a
+// minute; the walk reads each tree once.
+func TestLsTreePageCursorOnFoldersThatAreOneTree(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	empty := gitIn(t, dir, "", "hash-object", "-t", "tree", "-w", "--stdin")
+	var inner, outer [][2]string
+	for i := range 1000 {
+		inner = append(inner, [2]string{fmt.Sprintf("40000 e%04d", i), empty})
+	}
+	x := rawTree(t, dir, inner...)
+	for i := range 1000 {
+		outer = append(outer, [2]string{fmt.Sprintf("40000 t%04d", i), x})
+	}
+	outer = append(outer, [2]string{"100644 z", "1"})
+	commit := commitOf(t, dir, rawTree(t, dir, outer...))
+	b := NewBudget(NewSlots(1, 1, 0), "repo", 30*time.Second, 64<<20)
+	t.Cleanup(b.Close)
+	start := time.Now()
+	page, more, found, err := LsTreePage(WithBudget(context.Background(), b), dir, commit, "", "\x00", 1)
+	if err != nil || !found || more || len(page) != 1 || page[0].Path != "z" {
+		t.Fatalf("page %v, more %v, found %v, err %v; want [z]", paths(page), more, found, err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("took %v", d)
+	}
+}
+
+// A folder and a submodule of one name: git's pathspec for the folder reads
+// both, so the page is the stream's.
+func TestLsTreePageCursorOnAFolderAndASubmoduleOfOneName(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	ctx := context.Background()
+	d := rawTree(t, dir, [2]string{"100644 x", "1"}, [2]string{"100644 y", "2"})
+	p := rawTree(t, dir, [2]string{"160000 d", strings.Repeat("1", 40)}, [2]string{"40000 d", d}, [2]string{"100644 e", "3"})
+	for name, tree := range map[string]string{
+		"at the root": p,
+		"below":       rawTree(t, dir, [2]string{"40000 p", p}),
+	} {
+		commit := commitOf(t, dir, tree)
+		path := "d/"
+		if name == "below" {
+			path = "p/d/"
+		}
+		for _, after := range []string{"\x00", "a", "c", "d", "p", "p/c", "p/d", "d/x", "p/d/x"} {
+			for _, limit := range []int{1, 2, 5} {
+				page, more, found, err := LsTreePage(ctx, dir, commit, path, after, limit)
+				wp, wm, wf, werr := pageOracle(ctx, dir, commit, path, after, limit)
+				if !slices.Equal(page, wp) || more != wm || found != wf || (err == nil) != (werr == nil) {
+					t.Fatalf("%s: LsTreePage(%q, after %q, limit %d) = %v, %v, %v, %v; stream %v, %v, %v, %v", name, path, after, limit, paths(page), more, found, err, paths(wp), wm, wf, werr)
+				}
+			}
+		}
+	}
+}
+
+// A folder entry that names something other than a tree is git's error.
+func TestLsTreePageCursorOnAFolderThatIsABlob(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare", ".")
+	// A blob whose bytes read as a tree with one file.
+	blob := gitIn(t, dir, "100644 x\x00"+strings.Repeat("\x02", 20), "hash-object", "-w", "--stdin")
+	commit := commitOf(t, dir, rawTree(t, dir, [2]string{"100644 a", "1"}, [2]string{"40000 d", blob}, [2]string{"100644 e", "2"}))
+	for _, after := range []string{"\x00", "a", "d"} {
+		_, _, _, err := LsTreePage(context.Background(), dir, commit, "", after, 5)
+		_, _, _, oerr := pageOracle(context.Background(), dir, commit, "", after, 5)
+		if (err == nil) != (oerr == nil) {
+			t.Errorf("after %q: err %v, stream err %v", after, err, oerr)
+		}
+	}
+}
+
 // A page that does not fit the allowance and holds a blob git cannot read
 // has the error the stream reaches first.
 func TestLsTreePageCursorErrorOrder(t *testing.T) {

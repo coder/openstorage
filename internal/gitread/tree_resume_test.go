@@ -23,8 +23,9 @@ import (
 // memEntry is an entry of the model: a folder (sub != nil, perhaps empty)
 // or a file with a mode.
 type memEntry struct {
-	mode uint32
-	sub  map[string]*memEntry
+	mode  uint32
+	sub   map[string]*memEntry
+	built *[20]byte // the object id once built: an entry under two names is one tree (folders without files only)
 }
 
 // memTrees is a tree store in memory: raw tree objects by object name, and
@@ -59,7 +60,11 @@ func (m *memTrees) build(dir map[string]*memEntry, prefix string) [20]byte {
 	for name, e := range dir {
 		it := item{name: name, e: e}
 		if e.mode == modeTree {
-			it.oid = m.build(e.sub, prefix+name+"/")
+			if e.built == nil {
+				id := m.build(e.sub, prefix+name+"/")
+				e.built = &id
+			}
+			it.oid = *e.built
 		} else {
 			m.next++
 			it.oid[0], it.oid[12] = 0xb0, byte(m.next)
@@ -79,9 +84,11 @@ func (m *memTrees) build(dir map[string]*memEntry, prefix string) [20]byte {
 		raw = append(raw, rawModes[it.e.mode]+" "+it.name+"\x00"...)
 		raw = append(raw, it.oid[:]...)
 	}
-	m.next++
 	var id [20]byte
-	id[0], id[12], id[13], id[14] = 0xa0, byte(m.next), byte(m.next>>8), byte(m.next>>16)
+	if len(dir) > 0 {
+		m.next++
+		id[0], id[12], id[13], id[14] = 0xa0, byte(m.next), byte(m.next>>8), byte(m.next>>16)
+	} // else the one empty tree, as in git
 	m.objects[hex.EncodeToString(id[:])] = raw
 	return id
 }
@@ -316,6 +323,85 @@ func TestTreeWalkCountsThePathInTheDepth(t *testing.T) {
 	}
 	if _, err := walkMem(chain(maxWalkDepth+50), strings.Repeat("a/", maxWalkDepth), "\x00", 1, math.MaxInt64); !errors.Is(err, errDeclined) {
 		t.Fatalf("a path %d folders deep in a tree %d deep: err = %v, want errDeclined", maxWalkDepth, maxWalkDepth+50, err)
+	}
+}
+
+func TestFolderComponents(t *testing.T) {
+	for path, want := range map[string]bool{
+		"": true, "a/": true, "a/b/": true, "a": false, "/": false, "a//": false, "./a/": false, "a/../": false, "a\x00/": false,
+		strings.Repeat("n", maxWalkPath-1) + "/": true,
+		strings.Repeat("n", maxWalkPath) + "/":   false,
+	} {
+		if _, ok := folderComponents(path); ok != want {
+			t.Errorf("folderComponents(%.20q, %d bytes) ok = %v, want %v", path, len(path), ok, want)
+		}
+	}
+}
+
+// Folders without files that are one tree, as git stores them, cost one read.
+// Distinct ones past the bound on reads leave the page to the stream.
+func TestTreeWalkBoundsTheReadsOfEmptyFolders(t *testing.T) {
+	shared := &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
+	for i := range 1000 {
+		shared.sub[fmt.Sprintf("e%04d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{}}
+	}
+	root := map[string]*memEntry{"z": {mode: modeBlob}}
+	for i := range 1000 {
+		root[fmt.Sprintf("t%04d", i)] = shared
+	}
+	c := &countingTrees{memTrees: newMemTrees(root), opens: map[string]int{}}
+	w := &treeWalk{src: c, limit: 1, room: math.MaxInt64}
+	if err := w.run(memCommit, "", nil, ""); err != nil || len(w.page) != 1 || w.page[0].Path != "z" {
+		t.Fatalf("page %v, err %v; want [z]", paths(w.page), err)
+	}
+	total := 0
+	for _, n := range c.opens {
+		total += n
+	}
+	if total > 50 {
+		t.Fatalf("%d reads for a million folders that are one tree", total)
+	}
+
+	distinct := map[string]*memEntry{"z": {mode: modeBlob}}
+	for i := range 3000 {
+		distinct[fmt.Sprintf("t%04d", i)] = &memEntry{mode: modeTree, sub: map[string]*memEntry{"x": {mode: modeTree, sub: map[string]*memEntry{}}}}
+	}
+	c = &countingTrees{memTrees: newMemTrees(distinct), opens: map[string]int{}}
+	w = &treeWalk{src: c, limit: 1, room: math.MaxInt64}
+	if err := w.run(memCommit, "", nil, ""); !errors.Is(err, errDeclined) {
+		t.Fatalf("err = %v, want errDeclined", err)
+	}
+	total = 0
+	for _, n := range c.opens {
+		total += n
+	}
+	if total > w.openLimit()+1 {
+		t.Fatalf("%d reads, the bound is %d", total, w.openLimit())
+	}
+}
+
+// The folders that hold the cursor count in the path bound too.
+func TestTreeWalkDeclinesALongCursorPath(t *testing.T) {
+	name := strings.Repeat("n", 99)
+	chain := func(depth int) (*memTrees, string) {
+		root := map[string]*memEntry{}
+		dir := root
+		var cursor strings.Builder
+		for range depth {
+			next := map[string]*memEntry{"g": {mode: modeBlob}}
+			dir[name] = &memEntry{mode: modeTree, sub: next}
+			dir["a"] = &memEntry{mode: modeBlob}
+			cursor.WriteString(name + "/")
+			dir = next
+		}
+		dir["f"] = &memEntry{mode: modeBlob}
+		return newMemTrees(root), cursor.String()
+	}
+	short, cursor := chain(maxWalkPath/100 - 2)
+	checkWalk(t, short, "", cursor+"g", 5, math.MaxInt64)
+	long, cursor := chain(maxWalkPath/100 + 2)
+	if _, err := walkMem(long, "", cursor+"g", 5, math.MaxInt64); !errors.Is(err, errDeclined) {
+		t.Fatalf("err = %v, want errDeclined", err)
 	}
 }
 
