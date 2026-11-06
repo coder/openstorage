@@ -26,6 +26,7 @@ import (
 	"github.com/coder/openstorage/internal/envconfig"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref/s3wal"
+	"github.com/coder/openstorage/internal/testutil/heldport"
 )
 
 // gateLanes wraps LocalLanes so a test can pause or fail one method for
@@ -137,7 +138,9 @@ func (g *gateLanes) ListLocalWork(ctx context.Context, org, after string, limit 
 
 // httpUpstream is a git smart-HTTP upstream (git http-backend over CGI)
 // that can be taken down and brought back on the same address, so one repo
-// can fail as unreachable and later succeed.
+// can fail as unreachable and later succeed. On Linux heldport keeps the
+// port while it is down: another server can take it only if it also sets
+// SO_REUSEPORT and binds that exact port. Off Linux the port is not held.
 type httpUpstream struct {
 	root string
 	addr string
@@ -151,10 +154,7 @@ func newHTTPUpstream(t *testing.T) *httpUpstream {
 		t.Skip("git not on PATH")
 	}
 	u := &httpUpstream{root: t.TempDir()}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := heldport.Listen(t)
 	u.addr = ln.Addr().String()
 	u.serve(ln, gitPath)
 	t.Cleanup(func() {
@@ -188,18 +188,7 @@ func (u *httpUpstream) down(t *testing.T) {
 func (u *httpUpstream) up(t *testing.T) {
 	t.Helper()
 	gitPath, _ := exec.LookPath("git")
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		ln, err := net.Listen("tcp", u.addr)
-		if err == nil {
-			u.serve(ln, gitPath)
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("relisten %s: %v", u.addr, err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	u.serve(heldport.Relisten(t, u.addr), gitPath)
 }
 
 // addRepo creates root/owner/name.git accepting pushes over HTTP.
