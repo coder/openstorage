@@ -7,6 +7,7 @@ package api
 // All helpers carry an lp prefix.
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"os"
@@ -31,9 +32,11 @@ func lpGit(t *testing.T, dir, stdin string, args ...string) string {
 		}
 	}
 	cmd.Env = append(cmd.Env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+		t.Fatalf("git %.200s: %v\n%.500s", strings.Join(args, " "), err, stderr.String())
 	}
 	return strings.TrimSpace(string(out))
 }
