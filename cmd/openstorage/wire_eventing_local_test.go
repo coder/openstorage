@@ -112,6 +112,33 @@ func (s observeAtCAS) CASRefGen(ctx context.Context, repo, name, old, next strin
 	return won, gen, err
 }
 
+// errStoreBug is panicOnceAtCAS's panic value.
+const errStoreBug = "store bug in the CAS"
+
+// panicOnceAtCAS panics in its first CAS, before the inner store runs it,
+// as a bug in a store would.
+type panicOnceAtCAS struct {
+	ref.RefStore
+	done bool
+}
+
+func (s *panicOnceAtCAS) panicOnce() {
+	if !s.done {
+		s.done = true
+		panic(errStoreBug)
+	}
+}
+
+func (s *panicOnceAtCAS) CASRef(ctx context.Context, repo, name, old, next string) (bool, error) {
+	s.panicOnce()
+	return s.RefStore.CASRef(ctx, repo, name, old, next)
+}
+
+func (s *panicOnceAtCAS) CASRefGen(ctx context.Context, repo, name, old, next string) (bool, int64, error) {
+	s.panicOnce()
+	return s.RefStore.CASRefGen(ctx, repo, name, old, next)
+}
+
 // TestLocalHookIntentAuthorizationAndFailures (carried over from #271):
 // on SQLite an accepted git-surface ref write records durable intent for
 // the serve sweep, behind the same gates as the API. Forwarding needs
@@ -280,9 +307,14 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 				scopes             []string
 				refName            string
 				storeFails         bool
+				panics             bool
 				wantIntent, refuse bool
 			}{
 				{name: "forward", forward: true, scopes: rw, wantIntent: true},
+				// The first CAS panics, as a store bug would. Serve's API
+				// recovers the panic and keeps running, so the hold must
+				// end anyway: the retried write takes the same hold.
+				{name: "panicking_cas", forward: true, scopes: rw, panics: true, wantIntent: true},
 				{name: "server_initiated", forward: true, noClaims: true, wantIntent: true},
 				{name: "write_only", forward: true, scopes: []string{auth.ScopeGitWrite}},
 				{name: "pull", scopes: rw},
@@ -363,7 +395,11 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 						return err != nil
 					}
 					intentAtCAS, heldAtCAS := -1, false
-					store := decorate(observeAtCAS{RefStore: rs, observe: func() {
+					var inner ref.RefStore = rs
+					if tc.panics {
+						inner = &panicOnceAtCAS{RefStore: rs}
+					}
+					store := decorate(observeAtCAS{RefStore: inner, observe: func() {
 						intentAtCAS = 0
 						if !tc.storeFails {
 							up, err := ms.GetRepoUpstream(ctx, repo.RepoID)
@@ -383,6 +419,16 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 						closeMeta()
 					}
 					sha := strings.Repeat("b", 40)
+					if tc.panics {
+						func() {
+							defer func() {
+								if r := recover(); r != errStoreBug {
+									t.Fatalf("first CAS recovered %v, want the store's panic", r)
+								}
+							}()
+							_, _ = store.CASRef(writeCtx, repo.RepoID, refName, ref.ZeroSHA, sha)
+						}()
+					}
 					won, err := store.CASRef(writeCtx, repo.RepoID, refName, ref.ZeroSHA, sha)
 					if tc.refuse {
 						got, gerr := rs.GetRef(ctx, repo.RepoID, refName)

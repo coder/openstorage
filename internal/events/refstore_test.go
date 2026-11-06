@@ -25,10 +25,11 @@ const (
 // ref.IdempotentCAS recovery recheck — and defaults to a not-found miss so
 // non-recovery tests keep their plain lost/failed semantics.
 type fakeInner struct {
-	won  bool
-	err  error
-	sha  string
-	cass int // CASRef and CASRefGen calls
+	won   bool
+	err   error
+	sha   string
+	cass  int    // CASRef and CASRefGen calls
+	panic string // when set, CASRef and CASRefGen panic with it
 }
 
 func (f *fakeInner) ListRefs(context.Context, string) (map[string]string, error) {
@@ -51,10 +52,16 @@ func (f *fakeInner) GetRef(context.Context, string, string) (string, error) {
 }
 func (f *fakeInner) CASRef(_ context.Context, _, _, _, _ string) (bool, error) {
 	f.cass++
+	if f.panic != "" {
+		panic(f.panic)
+	}
 	return f.won, f.err
 }
 func (f *fakeInner) CASRefGen(_ context.Context, _, _, _, _ string) (bool, int64, error) {
 	f.cass++
+	if f.panic != "" {
+		panic(f.panic)
+	}
 	gen := int64(0)
 	if f.won {
 		gen = 1
@@ -510,6 +517,38 @@ func TestBeforeCASRunsFirstAndRefuses(t *testing.T) {
 					t.Errorf("held=%v gen=%v fail=%v: ephemeral update = %v, the step saw %v", held, gen, fail, err, seen)
 				}
 			}
+		}
+	}
+}
+
+// TestHeldBeforeCASReleasesOnPanic: a panicking inner CAS still ends the
+// HeldBeforeCAS hold, once. Serve's API recovers the panic and keeps
+// running (api.recoverPanics), and a hold left live would make every later
+// write to the ref wait out the hold and fail.
+func TestHeldBeforeCASReleasesOnPanic(t *testing.T) {
+	const boom = "inner CAS panicked"
+	for _, gen := range []bool{false, true} {
+		inner := &fakeInner{won: true, panic: boom}
+		env := newEmitEnv(t, inner, twoHooks())
+		released := 0
+		env.store.heldBeforeCAS = func(context.Context, string, string) (func(), error) {
+			return func() { released++ }, nil
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != boom {
+					t.Errorf("gen=%v: recovered %v, want the inner CAS's panic", gen, r)
+				}
+			}()
+			if gen {
+				_, _, _ = env.store.CASRefGen(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
+			} else {
+				_, _ = env.store.CASRef(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
+			}
+		}()
+		if released != 1 || len(env.deliveries) != 0 || len(env.syncPokes) != 0 {
+			t.Errorf("gen=%v: after a panicking CAS: %d releases, %d deliveries, %d pokes; want 1 release and nothing emitted",
+				gen, released, len(env.deliveries), len(env.syncPokes))
 		}
 	}
 }
