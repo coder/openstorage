@@ -451,6 +451,9 @@ class CitationTests(CheckerTestCase):
             # literal can open the file or follow an opening bracket.
             "'a'\ntypeof /`/.source;\n", "x++\ntypeof /`/.source;\n", "const r = /a/\ntypeof /`/.source;\n",
             "/`/.test(x);\n", "f(/`/, 1);\n",
+            # A keyword that opens a template substitution is not a member name, so its `/` opens a regex literal.
+            "const q = `${ typeof /`/.source }`;\n", "const q = `${ delete /`/.source }`;\n",
+            "const q = `${ new /`/.constructor() }`;\n",
         ]
         sources = [prefix + trap for prefix in [
             "const r = /`/;\n", "const r = /[`]/g;\n", "const r = /'`/;\n", "const r = /[/]`/;\n", "const r = /[/*]/;\n",
@@ -588,6 +591,17 @@ class CitationTests(CheckerTestCase):
         for name, (_, line, cannot) in triggers.items():
             report = next(l for l in result.stdout.splitlines() if f"[{name}.js:after]" in l)
             self.assertTrue(report.endswith(f"; the JavaScript reader stops at line {line}, where it cannot {cannot})"), report)
+
+    def test_javascript_reader_that_stops_on_the_first_line_reads_no_name(self):
+        # No line lies above a stop on line 1, so the reader keeps none of the text.
+        sources = {"html": "<!-- x\nfunction stale() {}\n", "regex": "await /x/;\nfunction stale() {}\n",
+                   "template": "`\nfunction stale() {}\n"}
+        files = {f"pkg/{name}.js": source for name, source in sources.items()}
+        result = self.check_readme(" ".join(f"[{name}.js:stale]" for name in sources) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", f"[{name}.js:stale]") for name in sources])
+        for name in sources:
+            report = next(l for l in result.stdout.splitlines() if f"[{name}.js:stale]" in l)
+            self.assertIn("; the JavaScript reader stops at line 1, where it cannot ", report)
 
     def test_javascript_slash_that_starts_a_line_after_an_operand_can_open_a_regex_literal(self):
         # A line break lets a semicolon end `var s`, `break`, or an import, so the `/` below opens a
