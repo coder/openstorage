@@ -427,7 +427,8 @@ class CitationTests(CheckerTestCase):
                    "...new", "await", "case", "delete", "extends", "in", "instanceof", "new", "of", "typeof", "void"]
         ends_a_statement = ["++", "--", "return", "throw", "yield", "default", "obj.await", "obj.new", "obj.of", "a[0]++",
                             "a?.new"]
-        js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}\n" for i, op in enumerate(endings))
+        closer = lambda op: ")" * op.count("(") + "]" * op.count("[")
+        js = "".join(f"const v{i} = x {op}\n  function open{i}() {{}}{closer(op)}\n" for i, op in enumerate(endings))
         js += "".join(f"x {op}\nfunction closed{i}() {{}}\n" for i, op in enumerate(ends_a_statement))
         cited = [f"[flow.js:open{i}]" for i in range(len(endings))]
         cited += [f"[flow.js:closed{i}]" for i in range(len(ends_a_statement))]
@@ -474,8 +475,9 @@ class CitationTests(CheckerTestCase):
               'const first = list[0] / 2;\n'
               "const quote = '\\'' + \"say \\\"hi\\\"\";\n"
               'class Counter {\n  #count = 0;\n  get half() { return this.#count / 2; }\n}\n'
+              'class Wide\n  extends Counter {\n}\nclass Tight{}\nconst pair = 1,\n  other = 2;\nlet late\n  = 3;\n'
               'function afterAll() {}\n')
-        ok = ["slug", "label", "ratio", "test", "first", "quote", "afterAll"]
+        ok = ["slug", "label", "ratio", "test", "first", "quote", "Counter", "Wide", "Tight", "pair", "late", "afterAll"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result)
         self.assertEqual(result.returncode, 0)
@@ -504,6 +506,23 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme("[flow.js:afterSigns]\n", **{"pkg/flow.js": js})
         self.assert_failures(result)
         self.assertEqual(result.returncode, 0)
+
+    def test_javascript_keywords_inside_brackets_or_import_lists_declare_nothing(self):
+        # A `;` inside a `for (...)` header does not end a statement, and `function as x` in an import or export
+        # list names a specifier. Each file ends in a real declaration.
+        files = {
+            "pkg/for_test.js": "for (;\nfunction viaTest() {};) { break }\n",
+            "pkg/for_update.js": "for (;;\nfunction viaUpdate() {}) { break }\n",
+            "pkg/for_class.js": "for (;\nclass ViaClass {};) { break }\n",
+            "pkg/import.js": "import {\n  function as viaImport,\n} from 'm';\n",
+            "pkg/export.js": "export {\n  class as viaExport,\n} from 'm';\n",
+            "pkg/var.js": "import {\n  var as viaVar,\n} from 'm';\n",
+        }
+        files = {name: source + "function after() {}\n" for name, source in files.items()}
+        stale = ["[for_test.js:viaTest]", "[for_update.js:viaUpdate]", "[for_class.js:ViaClass]", "[import.js:as]",
+                 "[export.js:as]", "[var.js:as]"]
+        result = self.check_readme(" ".join(stale + [f"[{name[4:]}:after]" for name in files]) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in stale])
 
     def test_javascript_reserved_words_after_a_declaration_keyword_are_not_names(self):
         # `let` is an identifier here, and the class has no name: JavaScript declares none of these words.

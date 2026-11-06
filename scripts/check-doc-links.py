@@ -589,10 +589,11 @@ JS_RESERVED = {"break", "case", "catch", "class", "const", "continue", "debugger
 def js_mask(text):
     """Blank comments, strings, regex literals, and templates, as masked does.
 
-    Returns the masked text and where the lexer stopped being sure of its
-    place, as (offset, what it cannot do), or None. Text from the line of that
-    offset on is not masked and must not be read."""
-    spans, templates, start, i = [], [], 0, 0
+    Returns the masked text, where the lexer stopped being sure of its place,
+    as (offset, what it cannot do) or None, and the offsets of the lines that
+    start inside an open `(` or `[`, where no declaration can start. Text from
+    the line of the stop offset on is not masked and must not be read."""
+    spans, templates, brackets, inside, start, i = [], [], [], set(), 0, 0
     # templates holds one entry per open template: None while the reader is in
     # its text, else the count of `{` open in its current `${}`. value says
     # whether the last token ends an operand, so that `/` divides: True, False
@@ -605,7 +606,7 @@ def js_mask(text):
         chars = list(text)
         for a, b in spans:
             chars[a:b] = [c if JS_LINE_BREAK.match(c) else " " for c in text[a:b]]
-        return "".join(chars), (start if templates else at, why) if why else None
+        return "".join(chars), (start if templates else at, why) if why else None, inside
 
     while i < len(text):
         if templates and templates[-1] is None:
@@ -630,6 +631,8 @@ def js_mask(text):
         if kind == "skip":
             if not templates and not text[i].isspace() and text[i] != "\ufeff":
                 spans.append((i, token.end()))
+            if not templates and brackets and brackets[-1] != "{":
+                inside.update(i + m.end() for m in JS_NEWLINE.finditer(token.group()))
         elif kind == "string":
             if not templates:
                 spans.append((i + 1, token.end() - 1))
@@ -645,15 +648,19 @@ def js_mask(text):
         elif kind == "op":
             value, dot = False, token.group() == "."
         elif kind == "open":
-            if token.group() == "{" and templates:
-                templates[-1] += 1
+            if templates:
+                templates[-1] += token.group() == "{"
+            else:
+                brackets.append(token.group())
             value, dot = False, False
         elif kind == "close":
-            if token.group() == "}" and templates:
-                if templates[-1] == 0:
-                    templates[-1], i = None, token.end()
-                    continue
-                templates[-1] -= 1
+            if templates and token.group() == "}" and templates[-1] == 0:
+                templates[-1], i = None, token.end()
+                continue
+            if templates:
+                templates[-1] -= token.group() == "}"
+            elif brackets:
+                brackets.pop()
             value, dot = (token.group() == "]") or None, False
         elif kind == "tick":
             if not templates:
@@ -678,8 +685,25 @@ def js_mask(text):
     return done("find the end of this template") if templates else done()
 
 
+# A declaration keyword starts a line and its name is followed by what a
+# declaration has there: `(` after a function name, `{`, `extends` or the end
+# of the line after a class name, and `=`, `;`, `,` or the end of the line
+# after a variable name. `function as x` in an import list is not one.
+JS_DECLARATION = re.compile(
+    r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? ([\w$]+)(?=\s*\()"
+    r"|class ([\w$]+)(?=\s*(?:\{|extends\b|$))|(?:const|let|var) ([\w$]+)(?=\s*(?:[=;,]|$)))")
+
+
 class JsNames(set):
     note = ""
+
+
+def js_lines(text):
+    start = 0
+    for m in JS_NEWLINE.finditer(text):
+        yield start, text[start:m.start()]
+        start = m.end()
+    yield start, text[start:]
 
 
 def js_continues(line):
@@ -693,20 +717,20 @@ def js_continues(line):
 
 
 def js_names(text):
-    blanked, stop = js_mask(text)
+    blanked, stop, inside = js_mask(text)
     names, prior = JsNames(), ""
     if stop:
         offset, cannot = stop
         blanked = blanked[:max(blanked.rfind(c, 0, offset) for c in "\n\r\u2028\u2029") + 1]
         stopped = len(JS_NEWLINE.findall(text, 0, offset)) + 1
         names.note = f"; the JavaScript reader stops at line {stopped}, where it cannot {cannot}"
-    for line in JS_NEWLINE.sub("\n", blanked.replace("\ufeff", " ")).split("\n"):
+    for start, line in js_lines(blanked.replace("\ufeff", " ")):
         code = line.rstrip()
         if not code:
             continue
-        m = re.match(r"\s*(?:export (?:default )?)?(?:async )?(?:function\*? |class |(?:const|let|var) )([\w$]+)", line)
-        if m and m.group(1) not in JS_RESERVED and not js_continues(prior):
-            names.add(m.group(1))
+        m = JS_DECLARATION.match(line)
+        if m and start not in inside and m.group(m.lastindex) not in JS_RESERVED and not js_continues(prior):
+            names.add(m.group(m.lastindex))
         prior = code
     return names
 
