@@ -29,7 +29,7 @@ const (
 	// pgLockNotAvailable is SQLSTATE 55P03, which a lock_timeout raises.
 	pgLockNotAvailable = "55P03"
 	// initSchemaLockWait bounds every lock wait of InitSchema after its
-	// first lock (issue #609). It stays well below deadlock_timeout (1s by
+	// advisory lock (issue #609). It stays well below deadlock_timeout (1s by
 	// default), so the boot gives up before PostgreSQL picks a deadlock
 	// victim, and the victim is never a request.
 	initSchemaLockWait = 250 * time.Millisecond
@@ -81,9 +81,9 @@ func (s *PG) Close() { s.pool.Close() }
 // and the create completion lock a repos row FOR UPDATE first, and
 // SetRepoUpstream inserts into repo_upstreams before it locks a repos row.
 // No fixed lock order for the boot suits all of them, so the boot never
-// waits for long while it holds a lock: after the first lock it waits at
-// most initSchemaLockWait, and a boot that times out rolls back, which
-// releases everything it held, and starts again.
+// waits for long while it holds a lock: after the advisory lock it waits at
+// most initSchemaLockWait for any other, and a boot that times out rolls
+// back, which releases everything it held, and starts again.
 func (s *PG) InitSchema(ctx context.Context) error {
 	var err error
 	for attempt := 1; attempt <= initSchemaAttempts; attempt++ {
@@ -106,18 +106,10 @@ func (s *PG) initSchemaOnce(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x4D455441)`); err != nil { // "META"
 			return err
 		}
-		// Take repos first: this wait holds nothing but the advisory lock,
-		// and a writer that holds repos and needs repo_upstreams finishes
-		// before the boot touches repo_upstreams. A fresh database has no
-		// repos table and no writer yet.
-		if _, err := tx.Exec(ctx, `DO $$ BEGIN
-			IF to_regclass('repos') IS NOT NULL THEN LOCK TABLE repos IN ACCESS EXCLUSIVE MODE; END IF;
-		END $$`); err != nil {
-			return err
-		}
-		// From here on the boot holds repos: bound every wait, so that a
-		// writer that holds repo_upstreams and waits for repos is never in a
-		// cycle with this boot (see InitSchema).
+		// Bound every wait from here on (see InitSchema): a writer that holds
+		// one of the tables this DDL locks and waits for another is then
+		// never in a cycle with this boot. The wait on the advisory lock
+		// above holds no table, so it needs no bound.
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = '%dms'`, initSchemaLockWait.Milliseconds())); err != nil {
 			return err
 		}
