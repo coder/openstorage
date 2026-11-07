@@ -47,10 +47,10 @@ const maxHookErrorRecordBytes = 64 << 10
 const hookErrorCut = " [record cut]\n"
 
 // NewHookLogHandler returns the slog handler of a hook process. stderr
-// (which reaches the pusher) gets each record without its error-valued
-// attributes. The hook-errors file (EnvHookErrors) gets the whole record.
-// Without that file, as for a hook that runs outside a push, the error
-// attributes are dropped: they never fall back to stderr.
+// (which reaches the pusher) gets each record with only the attributes
+// that pusherAttr allows. The hook-errors file (EnvHookErrors) gets the
+// whole record. Without that file, as for a hook that runs outside a push,
+// the other attributes are dropped: they never fall back to stderr.
 func NewHookLogHandler(stderr io.Writer, opts *slog.HandlerOptions) slog.Handler {
 	assertf(stderr != nil, "NewHookLogHandler: nil stderr")
 	h := hookLogHandler{pusher: slog.NewTextHandler(stderr, opts)}
@@ -82,7 +82,7 @@ func (h hookLogHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 	pr := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
 	r.Attrs(func(a slog.Attr) bool {
-		if a, ok := withoutErrors(a); ok {
+		if a, ok := pusherAttr(a); ok {
 			pr.AddAttrs(a)
 		}
 		return true
@@ -93,7 +93,7 @@ func (h hookLogHandler) Handle(ctx context.Context, r slog.Record) error {
 func (h hookLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	var kept []slog.Attr
 	for _, a := range attrs {
-		if a, ok := withoutErrors(a); ok {
+		if a, ok := pusherAttr(a); ok {
 			kept = append(kept, a)
 		}
 	}
@@ -112,28 +112,36 @@ func (h hookLogHandler) WithGroup(name string) slog.Handler {
 	return out
 }
 
-// withoutErrors returns a without its error values, and false when nothing
-// is left of it.
-func withoutErrors(a slog.Attr) (slog.Attr, bool) {
-	// An "err" or "error" attribute is an error whatever its kind: some
-	// libraries log err.Error() as a string. An error that is also a
-	// LogValuer can resolve to its text, so it is checked before Resolve.
-	if a.Key == "err" || a.Key == "error" {
-		return slog.Attr{}, false
-	}
-	if _, isErr := a.Value.Any().(error); isErr {
-		return slog.Attr{}, false
-	}
-	a.Value = a.Value.Resolve()
-	switch a.Value.Kind() {
-	case slog.KindAny:
+// pusherStringKeys are the attribute keys whose string values the pusher's
+// copy of a record keeps: identifiers the pusher already knows or that
+// name no store.
+var pusherStringKeys = map[string]bool{
+	"repo": true, "repo_id": true, "ref": true, "org": true, "hook": true,
+	"base": true, "event": true, "queue": true, "queues": true, "lane": true, "stage": true,
+}
+
+// pusherAttr returns a as the pusher may read it, and false when nothing is
+// left of it. It is a default deny: the pusher's copy keeps numbers,
+// booleans, durations and times, strings only under pusherStringKeys, and
+// groups of those. Every other value (an error, a []error, a struct, a map,
+// a Stringer, a string under any other key, an error that is a LogValuer)
+// goes only to the hook-errors file.
+func pusherAttr(a slog.Attr) (slog.Attr, bool) {
+	if a.Value.Kind() == slog.KindLogValuer {
 		if _, isErr := a.Value.Any().(error); isErr {
 			return slog.Attr{}, false
 		}
+		a.Value = a.Value.Resolve()
+	}
+	switch a.Value.Kind() {
+	case slog.KindBool, slog.KindInt64, slog.KindUint64, slog.KindFloat64, slog.KindDuration, slog.KindTime:
+		return a, true
+	case slog.KindString:
+		return a, pusherStringKeys[a.Key]
 	case slog.KindGroup:
 		var kept []slog.Attr
 		for _, g := range a.Value.Group() {
-			if g, ok := withoutErrors(g); ok {
+			if g, ok := pusherAttr(g); ok {
 				kept = append(kept, g)
 			}
 		}
@@ -141,8 +149,10 @@ func withoutErrors(a slog.Attr) (slog.Attr, bool) {
 			return slog.Attr{}, false
 		}
 		a.Value = slog.GroupValue(kept...)
+		return a, true
+	default:
+		return slog.Attr{}, false
 	}
-	return a, true
 }
 
 // hookErrorsWriter appends each write, one record, to the hook-errors file

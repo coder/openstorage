@@ -503,3 +503,19 @@ func TestMalformedStoreURLHidesItsPassword(t *testing.T) {
 		t.Fatalf("the errors and hook records name the canary password %d times: %s", n, seen)
 	}
 }
+
+// The hook logger writes at Warn level: an Info line reaches neither the
+// pusher nor the hook-errors file.
+func TestSlogForHookIsWarnLevel(t *testing.T) {
+	hookEventingEnv(t, "")
+	var stderr bytes.Buffer
+	logger := slogForHook(&stderr)
+	logger.Info("below the level")
+	logger.Warn("at the level")
+	if strings.Contains(stderr.String(), "below the level") || !strings.Contains(stderr.String(), "at the level") {
+		t.Fatalf("stderr = %q; want only the Warn line", stderr.String())
+	}
+	if records := hookErrorRecords(t); strings.Contains(records, "below the level") {
+		t.Fatalf("the hook-errors file has the Info line: %s", records)
+	}
+}

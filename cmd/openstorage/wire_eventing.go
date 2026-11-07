@@ -499,7 +499,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	// CAS records the intent (newPGEventsStore), and on the local schedule
 	// BeforeCAS does (ADR-50 amendment), and neither runs without eventing.
 	// A failed step does not prove the CAS fails too (the database can be
-	// back by then). So the hook refuses every update that would record
+	// back by then). So the hook refuses every update that could record
 	// intent before its CAS, and the client can push again. Without the
 	// store the hook cannot tell whether the repository has an upstream
 	// link, so it refuses such an update to a repository without one too.
@@ -533,7 +533,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	// value (possible only for direct hook invocation outside serve, which
 	// validates at boot) disables eventing — fail closed for secrets: no
 	// delivery ever signs with a wrong or plaintext-passthrough key, and no
-	// update that would record forward intent is accepted.
+	// update that could record forward intent is accepted.
 	secretsCodec, err := resolveSecretsCodec(envconfig.Getenv)
 	if err != nil {
 		return disabled("secrets key", err)
@@ -697,7 +697,7 @@ func quietBeforeCAS(beforeCAS func(ctx context.Context, repoID string) error, lo
 
 // intentlessRefStore is the hook's ref store when its eventing could not be
 // wired, so it cannot record forward intent. It refuses every update that
-// would record intent, and passes ephemeral updates through to its inner
+// could record intent, and passes ephemeral updates through to its inner
 // store (ref.IdempotentCAS over the hook's store, as on the eventless
 // default).
 type intentlessRefStore struct {

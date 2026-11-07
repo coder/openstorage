@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"net/url"
 	"os"
@@ -625,5 +627,61 @@ func TestHookRiverLogsOnlyToHookErrors(t *testing.T) {
 	}
 	if !strings.Contains(hookErrorRecords(t), canary) {
 		t.Fatalf("the hook-errors file lacks River's notify failure: %s", hookErrorRecords(t))
+	}
+}
+
+// runHook makes the hook logger the default before it wires eventing, so a
+// line that the wiring's callees log through the default logger (River,
+// the store packages) keeps its error value off stderr too.
+func TestRunHookSetsTheDefaultLoggerBeforeWiring(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs docker")
+	}
+	ctx := t.Context()
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
+		tcpostgres.WithDatabase("postgres"),
+		tcpostgres.WithUsername("postgres"),
+		tcpostgres.WithPassword("postgres"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+	t.Cleanup(func() { _ = pgC.Terminate(context.Background()) })
+	dbURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := meta.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ms.Close)
+	if err := ms.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	hookEventingEnv(t, dbURL)
+	canary := "canary-host-" + strings.ToLower(rand.Text()[:8]) + ".invalid"
+	original := newHookRiver
+	t.Cleanup(func() { newHookRiver = original })
+	newHookRiver = func(context.Context, string) (*jobs.River, error) {
+		slog.Warn("river client failed through the default logger", "err", errors.New("dial "+canary))
+		return nil, errors.New("river client unavailable")
+	}
+	prev, prevOut, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	var stderr bytes.Buffer
+	if err := runHook(ctx, []string{"no-such-hook"}, &stderr); err == nil {
+		t.Fatal("runHook ran an unknown hook")
+	}
+	if !strings.Contains(stderr.String(), "river client failed through the default logger") || strings.Contains(stderr.String(), canary) {
+		t.Fatalf("stderr = %q; want the default logger's line without the canary", stderr.String())
+	}
+	if !strings.Contains(hookErrorRecords(t), canary) {
+		t.Fatalf("the hook-errors file lacks the default logger's line: %s", hookErrorRecords(t))
 	}
 }

@@ -1,6 +1,7 @@
 package githttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -300,4 +301,34 @@ func TestServeHidesHookStoreErrors(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	checkHidden(t, out, logs.String(), c, "host", "user", "database")
+}
+
+// The real `openstorage hook` command with a store it cannot reach: its
+// stderr, which git relays to the pusher, names no part of the store URL,
+// and the hook-errors file has the cause of both failed steps.
+func TestHookBinaryKeepsStoreErrorsOffStderr(t *testing.T) {
+	c := pgCanary()
+	records, err := createHookErrors(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), binPath, "hook", "update", "refs/heads/main", ref.ZeroSHA, strings.Repeat("a", 40))
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(),
+		"OPENSTORAGE_ORG=" + testOrg, EnvRepo + "=t-hook-binary", "OPENSTORAGE_PG_URL=" + c.url,
+		"OPENSTORAGE_S3_URL=" + blobURL, EnvHookErrors + "=" + records}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("the hook accepted an update with a store it cannot reach")
+	}
+	for _, want := range []string{"open meta store", "openstorage hook: " + hookFailedLine} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr lacks %q: %s", want, stderr.String())
+		}
+	}
+	got := readRecords(t, records)
+	if !strings.Contains(got, "open meta store") || !strings.Contains(got, "update failed") {
+		t.Fatalf("the hook-errors file lacks a failed step: %s", got)
+	}
+	checkHidden(t, stderr.String(), got, c, "host", "user", "database")
 }
