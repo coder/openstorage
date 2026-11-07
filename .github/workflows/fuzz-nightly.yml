@@ -58,6 +58,9 @@ jobs:
             ./internal/sync:FuzzS3WALMetaConsumers
             ./internal/meta:FuzzS3WALMetaDocument
             ./internal/meta:FuzzS3WALMetaSuccessor
+            ./internal/gitread:FuzzTreeBody
+            ./internal/gitread:FuzzTreeWalk
+            ./internal/gitread:FuzzLsTreePageCursor
           "
           failed=0
           for t in $targets; do

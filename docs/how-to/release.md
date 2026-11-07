@@ -148,11 +148,53 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    summary records the index digest. The `verify-published` jobs then pull that digest on
    both platforms and repeat the checks and the smoke.
 
-   The staged digests are kept for 35 days, and an approval can wait up to 30 days. If the
-   `publish` job fails because they are gone, or for any reason before it creates the tag,
-   dispatch the run again. If it fails after the tag exists, the tag is spent: do not
-   announce the version, and fix forward with a new release (see the last paragraph of
-   this section).
+   The `digest-*` artifacts hold the two staged digests. They are kept for 35 days, and an
+   approval can wait up to 30 days. If the `publish` job fails because they are gone, or
+   for any reason before it creates the tag (except the HTTP 200 of "Refuse to replace an
+   existing version tag", see below), dispatch the run again. If it fails after the
+   tag exists, the tag is spent: do not update the quickstart pin (step 3), and fix forward
+   with a new release (see "If a published image is bad" below). If a `verify-published`
+   job fails, the tag exists by then. First re-run the failed jobs of that run on the
+   Actions page ("Re-run failed jobs"). They check the same published digest again, so a
+   runner, registry or smoke flake passes. If the same check fails again, the tag is spent,
+   as above.
+
+   To tell which case you are in, open the failed run on the Actions page and find the
+   failed step in the `publish` job. A failure in any step before "Give the checked
+   digests the version tag" (the login, the download of the digest files, and "Refuse to
+   replace an existing version tag") means that this run created no tag. After a second
+   dispatch of a version, an earlier run may have created it, and "Refuse to replace an
+   existing version tag" fails with HTTP 200 exactly then (see below). The step "Check that
+   the index holds exactly the checked digests" runs only after this run created the tag.
+   The step "Give the checked digests the version tag" can fail on either side of the
+   push. So when you dispatched the version before, or when the failed step is that one,
+   look at the tag itself. After `docker login ghcr.io` with a token that has
+   `read:packages`:
+
+   ```sh
+   docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z
+   ```
+
+   It prints the index when the tag exists and fails with `not found` when it does not.
+   `not found` shows that no tag exists only when the login can read the package, because
+   a token that cannot read it can print the same message for a tag that exists. Any
+   other error, such as `denied`, tells you nothing about the tag: fix the login and run
+   it again. A tag that a package admin deleted also shows `not found`, so never dispatch
+   a version whose tag was ever created with `publish=true`. A dispatch with
+   `publish=false` only stages and checks, and creates no tag.
+
+   Another `publish=true` dispatch cannot replace a tag that exists, because the `publish`
+   job stops at "Refuse to replace an existing version tag" unless the registry answers
+   404 for the tag. So when the tag was never deleted, the worst case of a wrong guess is
+   a wasted dispatch. That step cannot know that an admin deleted the tag, so the rule
+   above stands. If the step fails with HTTP 200, an earlier run created the tag. Open
+   that run and look at its `verify-published` jobs. If they passed, the version is
+   published: check that the quickstart pin (step 3) names it, and update the pin if it
+   does not. If they are still running, wait for them. If they were cancelled, re-run them
+   from the run page (the re-run icon next to each job). If they failed, re-run the
+   failed jobs as above, and if the same check fails again, the version is spent: fix
+   forward with a new release. Any other HTTP status means the step could not tell, so
+   inspect the tag as above.
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),

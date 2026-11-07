@@ -19,7 +19,7 @@ import (
 )
 
 // gitIn runs git in dir with stdin and returns its trimmed stdout.
-func gitIn(t *testing.T, dir, stdin string, args ...string) string {
+func gitIn(t testing.TB, dir, stdin string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
@@ -34,7 +34,7 @@ func gitIn(t *testing.T, dir, stdin string, args ...string) string {
 
 // pageRepo imports a fast-import stream into a new bare repo and returns
 // it with the commit of refs/heads/main.
-func pageRepo(t *testing.T, stream string) (dir, commit string) {
+func pageRepo(t testing.TB, stream string) (dir, commit string) {
 	t.Helper()
 	dir = t.TempDir()
 	mustGit(t, dir, "init", "-q", "--bare", ".")
