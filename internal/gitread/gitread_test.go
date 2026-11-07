@@ -139,14 +139,48 @@ func TestResolveRef(t *testing.T) {
 		})
 	}
 
-	for _, spec := range []string{"", "nope", "refs/heads/nope", "deadbeef", "HEAD~1", "main~1", "--verify", strings.ToUpper(f.c1[:8])} {
+	// A NUL byte cannot reach git (exec refuses the argument): it names
+	// no ref, as any other invalid name.
+	for _, spec := range []string{"", "nope", "refs/heads/nope", "deadbeef", "HEAD~1", "main~1", "--verify", strings.ToUpper(f.c1[:8]), "main\x00", "refs/heads/ma\x00in", "\x00" + f.c1} {
 		if sha, err := ResolveRef(ctx, f.dir, spec, false); !errors.Is(err, ErrNotFound) {
 			t.Errorf("ResolveRef(%q) = (%q, %v), want ErrNotFound", spec, sha, err)
+		}
+	}
+	// No ref is longer than maxRefSpecBytes, and a 200 KiB argument fails
+	// exec with E2BIG. The error would carry the whole spec, so the check
+	// prints neither.
+	for _, n := range []int{maxRefSpecBytes + 1, 200 << 10} {
+		if _, err := ResolveRef(ctx, f.dir, strings.Repeat("a", n), false); !errors.Is(err, ErrNotFound) {
+			t.Errorf("ResolveRef(a %d-byte spec) does not match ErrNotFound; want it to: no ref is that long", n)
 		}
 	}
 	// A persistent branch name must not resolve in the ephemeral namespace.
 	if sha, err := ResolveRef(ctx, f.dir, "feature", true); !errors.Is(err, ErrNotFound) {
 		t.Errorf("ephemeral ResolveRef(feature) = (%q, %v), want ErrNotFound", sha, err)
+	}
+}
+
+// TestResolveRefGitFailureIsNotNotFound: when a git child fails without
+// answering (here exec.ErrWaitDelay: git exited, but its output pipe
+// stayed open past childWaitDelay, as on a long-stalled host), ResolveRef
+// returns that failure. It must never report ErrNotFound for a ref that
+// exists: a client would then believe the ref is gone (404).
+func TestResolveRefGitFailureIsNotNotFound(t *testing.T) {
+	f := newFixture(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sub := range []string{"check-ref-format", "rev-parse"} {
+		t.Run(sub, func(t *testing.T) {
+			// A background child keeps git's stdout open after git exits.
+			fakeGit(t, `if [ "$1" = `+sub+` ]; then (sleep 5) & fi
+exec `+realGit+` "$@"`)
+			sha, err := ResolveRef(context.Background(), f.dir, "main", false)
+			if err == nil || errors.Is(err, ErrNotFound) || !errors.Is(err, exec.ErrWaitDelay) {
+				t.Fatalf("ResolveRef(main) with a stalled %s = (%q, %v), want the exec.ErrWaitDelay failure, not ErrNotFound", sub, sha, err)
+			}
+		})
 	}
 }
 

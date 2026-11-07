@@ -369,6 +369,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 
 	cleanup := func() { queue.Close() }
 	newEvents := newEventsStore
+	var heldBeforeCAS func(ctx context.Context, repoID, refName string) (func(), error)
 	if isPGURL(dbURL) {
 		// worker.Requeue/RequeuePush stay nil on pg: river's insert-time
 		// uniqueness would swallow a requeue of a still-running job; the
@@ -398,6 +399,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		heldBeforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep)
 			prev := cleanup
@@ -435,6 +437,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			Webhooks:        whStore,
 			EnqueueDelivery: queue.EnqueueWebhookDelivery,
 			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org, forwardDeniedFromContext, pullDeniedFromContext),
+			HeldBeforeCAS:   heldBeforeCAS,
 			Logger:          logger,
 		})
 	}

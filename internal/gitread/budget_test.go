@@ -14,7 +14,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 )
 
 // childPIDs lists live (non-zombie) children of this test process. The
@@ -327,43 +326,6 @@ func TestRunErrorKeepsTheStderrTail(t *testing.T) {
 	}
 }
 
-// Run's errors name the git command, and they reach the server's log. An
-// argv can be request-sized (a grep pattern, a list of paths), so past
-// 4096 bytes the error keeps the command's head and its size.
-func TestRunErrorBoundsTheArgv(t *testing.T) {
-	fakeGit(t, "exit 1")
-	run := func(args ...string) error {
-		t.Helper()
-		_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: args})
-		if err == nil {
-			t.Fatal("Run: nil error from a git that exits 1")
-		}
-		return err
-	}
-	if err := run("rev-parse", "main"); !strings.HasPrefix(err.Error(), "git rev-parse main: ") {
-		t.Fatalf("short argv: err = %v, want the whole command", err)
-	}
-	for _, tc := range []struct{ name, arg string }{
-		// git runs and exits 1. The odd "x" puts a 2-byte rune across
-		// the cut.
-		{"64 KiB", "x" + strings.Repeat("é", 32<<10)},
-		// Past 128 KiB, exec fails with E2BIG before git starts (Linux;
-		// elsewhere the fake git exits 1).
-		{"200 KiB", strings.Repeat("a", 200<<10)},
-	} {
-		err := run("grep", "-e", tc.arg).Error()
-		if len(err) > 4096+512 {
-			t.Errorf("%s argument: the error is %d bytes, want at most %d", tc.name, len(err), 4096+512)
-		}
-		if size := fmt.Sprintf("... (%d bytes)", len("git grep -e ")+len(tc.arg)); !strings.Contains(err, size) {
-			t.Errorf("%s argument: the error does not give the command's size %q", tc.name, size)
-		}
-		if !utf8.ValidString(err) {
-			t.Errorf("%s argument: the error is not valid UTF-8 (a rune split at the cut)", tc.name)
-		}
-	}
-}
-
 // Limit outcomes must never be reported as "not found" or "no match".
 func TestLimitErrorsAreNotMaskedAsMissing(t *testing.T) {
 	if !HeapLimitSupported() {
@@ -515,4 +477,45 @@ func TestArchiveStreamStalledReaderKeepsNoGitProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.Close()
+}
+
+// A request can put a value of 100 KB into a git argument, and the error
+// name of Run goes to the log: it must not carry the value.
+func TestRunErrorNamesLongArgumentsBriefly(t *testing.T) {
+	fakeGit(t, "echo boom >&2; exit 3")
+	long := strings.Repeat("a", 100_000)
+	_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"rev-parse", "--verify", long}})
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("err = %v, want git's exit status 3", err)
+	}
+	msg := err.Error()
+	if len(msg) > 1024 {
+		t.Fatalf("the error is %d bytes, want it bounded: %.200s", len(msg), msg)
+	}
+	for _, want := range []string{"git rev-parse --verify aaaa", "...(100000 bytes)", "boom"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %.300q lacks %q", msg, want)
+		}
+	}
+}
+
+// The path of a blob over the size limit is a path of the repository, and it
+// can be 100 KB long. Its name in the error goes to the log.
+func TestCheckBlobSizeNamesLongPathBriefly(t *testing.T) {
+	long := strings.Repeat("d", 100_000)
+	err := CheckBlobSize(context.Background(), long, MaxBlobBytes+1)
+	if !errors.Is(err, ErrBlobTooLarge) {
+		t.Fatalf("err = %v, want ErrBlobTooLarge", err)
+	}
+	msg := err.Error()
+	if len(msg) > 1024 {
+		t.Fatalf("the error is %d bytes, want it bounded: %.200s", len(msg), msg)
+	}
+	if want := "...(100000 bytes)"; !strings.Contains(msg, want) {
+		t.Errorf("error %.300q lacks %q", msg, want)
+	}
+	if err := CheckBlobSize(context.Background(), "a/b.txt", MaxBlobBytes); err != nil {
+		t.Errorf("a blob at the limit: err = %v, want nil", err)
+	}
 }

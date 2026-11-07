@@ -241,7 +241,10 @@ func wcFailRefGuard(w http.ResponseWriter, msg, branch, oldSHA, currentSHA strin
 // body on every route, so merge can share it through wcResolveRepo.
 func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wcInternal: nil error or empty op")
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	if s.writeRefHeldErr(w, r, op, err) {
+		return
+	}
+	s.logger.Error("internal error", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
@@ -734,8 +737,7 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	cmd.Stderr = &stderr
 	out, err := gitlimit.Output(cmd)
 	if err != nil {
-		// The argv can be request-sized (commit-tree -m <message>).
-		return string(out), fmt.Errorf("%s: %w: %s", gitlimit.CommandLine(args), err, strings.TrimSpace(stderr.String()))
+		return string(out), fmt.Errorf("%s: %w: %s", gitlimit.Name(args), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
 }
@@ -854,7 +856,7 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 		// classification below reads all of it.)
 		var tail gitlimit.TailBuffer
 		_, _ = tail.Write(stderr.Bytes())
-		return "", fmt.Errorf("%s: %w: %s", gitlimit.CommandLine(append([]string{"apply"}, args...)), err, tail.String())
+		return "", fmt.Errorf("%s: %w: %s", gitlimit.Name(append([]string{"apply"}, args...)), err, tail.String())
 	}
 	full := strings.TrimSpace(stderr.String())
 	msg := full
