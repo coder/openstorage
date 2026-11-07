@@ -235,6 +235,8 @@ func (s *server) writeGitLimitErr(w http.ResponseWriter, r *http.Request, op str
 			limit = b.Limits().MaxBlob
 		}
 		status, msg = http.StatusUnprocessableEntity, fmt.Sprintf("file exceeds the API read size limit of %d bytes; fetch it with git", limit)
+	case errors.Is(err, gitread.ErrSymlinkTooLong):
+		status, msg = http.StatusUnprocessableEntity, fmt.Sprintf("a symlink target exceeds the API read size limit of %d bytes; fetch it with git", gitread.MaxSymlinkTarget)
 	default:
 		return false
 	}

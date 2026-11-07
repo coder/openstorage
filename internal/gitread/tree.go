@@ -303,14 +303,24 @@ func CatBlobTo(ctx context.Context, repoPath, sha string, w io.Writer) error {
 	return err
 }
 
-// ReadBlob returns the full contents of blob sha. Use only for small blobs
-// (symlink targets); file streaming goes through CatBlobTo. The bytes count
-// against the output allowance.
-func ReadBlob(ctx context.Context, repoPath, sha string) ([]byte, error) {
-	assertf(ref.ValidSHA(sha), "ReadBlob: malformed sha %q", sha)
+// ReadSymlinkTarget returns the target of the symlink whose blob is sha, size
+// bytes long as the tree lists it. A target over MaxSymlinkTarget fails with
+// ErrSymlinkTooLong before git starts, so the buffered read is at most 4 KiB;
+// file streaming goes through CatBlobTo. The bytes count against the output
+// allowance.
+func ReadSymlinkTarget(ctx context.Context, repoPath, sha string, size int64) (string, error) {
+	assertf(ref.ValidSHA(sha), "ReadSymlinkTarget: malformed sha %q", sha)
+	if err := CheckSymlinkTarget(sha, size); err != nil {
+		return "", err
+	}
 	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Args: []string{"cat-file", "blob", sha}})
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	return []byte(out), nil
+	if len(out) > MaxSymlinkTarget {
+		// The tree listed a short blob and git printed a longer one: a
+		// replacement object. The target is not carried either.
+		return "", CheckSymlinkTarget(sha, int64(len(out)))
+	}
+	return out, nil
 }

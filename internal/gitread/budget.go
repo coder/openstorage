@@ -75,6 +75,9 @@ var (
 	// ErrBlobTooLarge: a blob is larger than MaxBlobBytes; git was not
 	// started for it.
 	ErrBlobTooLarge = errors.New("blob exceeds the API read size limit")
+	// ErrSymlinkTooLong: a symlink's target is longer than MaxSymlinkTarget;
+	// git was not started for it.
+	ErrSymlinkTooLong = errors.New("symlink target exceeds the API read size limit")
 	// ErrMemoryLimit: git needed more heap than its class's cap and was
 	// stopped by its own allocation failure (Linux only).
 	ErrMemoryLimit = gitlimit.ErrMemoryLimit
@@ -89,12 +92,13 @@ var (
 var heapLimitAvailable = HeapLimitSupported
 
 // IsBudgetError reports whether err is a resource-limit outcome (ErrBusy,
-// ErrTimeBudget, ErrOutputLimit, ErrBlobTooLarge, ErrMemoryLimit). Callers
+// ErrTimeBudget, ErrOutputLimit, ErrBlobTooLarge, ErrSymlinkTooLong,
+// ErrMemoryLimit). Callers
 // that turn git failures into "not found" or "no match" must check it
 // first so a limit is never reported as missing data.
 func IsBudgetError(err error) bool {
 	return errors.Is(err, ErrBusy) || errors.Is(err, ErrTimeBudget) || errors.Is(err, ErrOutputLimit) ||
-		errors.Is(err, ErrBlobTooLarge) || errors.Is(err, ErrMemoryLimit)
+		errors.Is(err, ErrBlobTooLarge) || errors.Is(err, ErrSymlinkTooLong) || errors.Is(err, ErrMemoryLimit)
 }
 
 // CheckBlobSize fails with ErrBlobTooLarge when a blob of size bytes is
@@ -107,6 +111,22 @@ func CheckBlobSize(ctx context.Context, path string, size int64) error {
 	}
 	if size > limit {
 		return fmt.Errorf("%q is %d bytes: %w (%d bytes)", path, size, ErrBlobTooLarge, limit)
+	}
+	return nil
+}
+
+// MaxSymlinkTarget is the longest symlink target an archive carries: 4095
+// bytes, the longest that symlink(2) accepts on Linux (PATH_MAX is 4096, with
+// the terminating NUL). git sets no limit of its own: its fsck has no check for
+// the length of a target. A longer target cannot be checked out on Linux, and
+// the server reads one in memory to write its tar header.
+const MaxSymlinkTarget = 4095
+
+// CheckSymlinkTarget fails with ErrSymlinkTooLong when the target of the
+// symlink at path, a blob of size bytes, is longer than MaxSymlinkTarget.
+func CheckSymlinkTarget(path string, size int64) error {
+	if size > MaxSymlinkTarget {
+		return fmt.Errorf("%q is a symlink with a target of %d bytes: %w (%d bytes)", path, size, ErrSymlinkTooLong, MaxSymlinkTarget)
 	}
 	return nil
 }
