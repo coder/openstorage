@@ -1893,10 +1893,14 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 	for _, name := range refs {
 		args = append(args, "HEAD:"+name)
 	}
-	done := make(chan error, 1)
+	type pushResult struct {
+		out string
+		err error
+	}
+	done := make(chan pushResult, 1)
 	go func() {
-		_, err := tryGit(work, args...)
-		done <- err
+		out, err := tryGit(work, args...)
+		done <- pushResult{out, err}
 	}()
 
 	// git runs the update hooks strictly sequentially; each parks after
@@ -1904,11 +1908,16 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 	// every window: the first pays the one full scan and publishes the
 	// held marker, every later one must coalesce across the claimed
 	// range instead of rescanning.
+	// Under load a hook phase can take minutes (a -race lane spent 296 s
+	// in this test, most of it in the push), so the wait for the next
+	// parked hook ends early only when the push exits: its output says
+	// why no hook parked.
+	const parkWait = 5 * time.Minute
 	var first int64
 	released := 0
 	for remaining := append([]string(nil), refs...); len(remaining) > 0; {
 		idx := -1
-		deadline := time.Now().Add(30 * time.Second)
+		deadline := time.Now().Add(parkWait)
 		for idx < 0 && time.Now().Before(deadline) {
 			for i, name := range remaining {
 				if _, err := os.Stat(updateBarrierEachPath(barrier, name) + ".ready"); err == nil {
@@ -1917,11 +1926,15 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 				}
 			}
 			if idx < 0 {
-				time.Sleep(10 * time.Millisecond)
+				select {
+				case res := <-done:
+					t.Fatalf("push exited with %d of %d hooks released: %v\n%s", released, len(refs), res.err, res.out)
+				case <-time.After(10 * time.Millisecond):
+				}
 			}
 		}
 		if idx < 0 {
-			t.Fatalf("no update hook parked (released %d of %d)", released, len(refs))
+			t.Fatalf("no update hook parked within %v (released %d of %d)", parkWait, released, len(refs))
 		}
 		adv()
 		if released == 0 {
@@ -1938,8 +1951,8 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 		remaining = append(remaining[:idx], remaining[idx+1:]...)
 		released++
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("push: %v", err)
+	if res := <-done; res.err != nil {
+		t.Fatalf("push: %v\n%s", res.err, res.out)
 	}
 	// Holds released by post-receive: the coalesced verdict is stale and
 	// the next advertisement heals with a fresh scan.
