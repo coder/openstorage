@@ -158,16 +158,18 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 
    - **No tag exists, and none was ever created:** dispatch `publish=true` again. This
      covers a rejected or timed-out approval, a login that fails, a download that finds no
-     files, and files that are gone ("Give the checked digests the version tag" then fails
-     at `cat digest/amd64`, because the download step passes with "Total of 0 artifact(s)
-     downloaded"). Never re-run a failed `publish` job: dispatch again, so that no attempt of
-     a run meets a tag that an earlier attempt made.
-   - **A run has a green `publish` job and its `verify-published` jobs passed:** the
-     version is published. Do step 3 from that run's `Pin` line, if the quickstart does not
-     name the version yet.
-   - **A run has a green `publish` job and a `verify-published` job failed or was
-     cancelled:** re-run the failed jobs of that run ("Re-run failed jobs", or the re-run
-     icon next to a cancelled job). They check the same published digest again, so a
+     files, and files that are gone: the download step then passes with "Total of 0
+     artifact(s) downloaded" and "Give the checked digests the version tag" fails at
+     `cat digest/amd64`, or the download step fails itself, and no tag exists either way.
+     It also covers a `publish` job that was skipped because `verify` failed: fix what
+     `verify` found first, then dispatch. Never re-run a failed `publish` job: dispatch
+     again, so that no attempt of a run meets a tag that an earlier attempt made.
+   - **A run has a green `publish` job, the tag exists and its `verify-published` jobs
+     passed:** the version is published. Do step 3 from that run's `Pin` line, if the
+     quickstart does not name the version yet.
+   - **A run has a green `publish` job, the tag exists and a `verify-published` job failed
+     or was cancelled:** re-run the failed jobs of that run ("Re-run failed jobs", or the
+     re-run icon next to a cancelled job). They check the same published digest again, so a
      runner, registry or smoke flake passes. GitHub offers a re-run only for 30 days after
      the run started, and an approval can wait as long. If a check fails again, whichever it
      is, or no re-run is offered, the version is spent.
@@ -175,14 +177,17 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
      cancelled after it created the tag: the version is spent. Do not update the quickstart
      pin (step 3), and fix forward with a new release (see "If a published image is bad"
      below).
+   - **No tag exists now, but one was created and a package admin deleted it:** the version
+     is spent too. Fix forward with a new release.
 
-   The failed step helps first. A failure in the login, the download of the digest files,
-   or "Refuse to replace an existing version tag" means that this attempt created no tag.
-   The step "Check that the index holds exactly the checked digests" runs only after this
-   attempt created it. The step "Give the checked digests the version tag" can fail on
-   either side of the push. So for that step, and whenever you dispatched the version
-   before, look at the tag itself. After `docker login ghcr.io` with a token that has
-   `read:packages`:
+   The failed step helps first, when there is one: a `publish` job that was cancelled or
+   never started has no failed step, so look at the tag itself. A failure in the login, the
+   download of the digest files, or "Refuse to replace an existing version tag" means that
+   this attempt created no tag. The step "Check that the index holds exactly the checked
+   digests" runs only after this attempt created it. The step "Give the checked digests the
+   version tag" can fail on either side of the push. So for that step, and whenever you
+   dispatched the version before, look at the tag itself. After `docker login ghcr.io` with
+   a token that has `read:packages`:
 
    ```sh
    docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z
@@ -192,9 +197,10 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    the version that the quickstart pins now. If that does not print an index, the login
    cannot be trusted for this check, and no other answer means anything: fix the login. With
    a login that passes, an index means that the tag exists, and `not found` means that no
-   tag exists now. A tag that a package admin deleted also shows `not found`, so never
-   dispatch `publish=true` for a version whose tag was ever created. A dispatch with
-   `publish=false` only stages and checks, and creates no tag.
+   tag exists now. A 429 or 5xx answer is not an answer: run the command again later. A tag
+   that a package admin deleted also shows `not found`. Such a version is spent, so fix
+   forward with a new release, and never dispatch `publish=true` for a version whose tag was
+   ever created. A dispatch with `publish=false` only stages and checks, and creates no tag.
 
    Another `publish=true` dispatch cannot replace a tag that exists. The `publish` job
    stops at "Refuse to replace an existing version tag" unless the registry answers 404 for
