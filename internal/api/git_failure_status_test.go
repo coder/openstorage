@@ -26,6 +26,7 @@ func TestGitFailureStatus(t *testing.T) {
 		coreGit(t, dir, "init", "-q", "-b", "main", ".")
 		coreWriteFile(t, dir, "a.txt", "one\ntwo\nthree\n")
 		coreWriteFile(t, dir, "no such path x", "named like git's message\n")
+		coreWriteFile(t, dir, "d/f.txt", "in a folder\n")
 		coreGit(t, dir, "add", ".")
 		coreGit(t, dir, "commit", "-q", "-m", "c")
 		coreSeedStores(t, e, repo.RepoID, dir, map[string]string{"refs/heads/main": coreRevParse(t, dir, "HEAD")})
@@ -69,6 +70,18 @@ func TestGitFailureStatus(t *testing.T) {
 			{"range with no match", "a.txt", []string{"/zzz/"}, http.StatusBadRequest},
 			// git's message names the path: "file no such path x has only 1 line".
 			{"range past the end of a path named like git's message", "no such path x", []string{"5,6"}, http.StatusBadRequest},
+			// git's messages name the path as git rewrote it: "./x",
+			// "a//b" and a control byte read as "x", "a/b" and "?".
+			{"blame of a missing ./path", "./missing.txt", nil, http.StatusNotFound},
+			{"blame of a missing path with a double slash", "no//such", nil, http.StatusNotFound},
+			{"blame of a missing path with a control byte", "mi\x01ss", nil, http.StatusNotFound},
+			{"blame of ./a.txt", "./a.txt", nil, http.StatusOK},
+			{"range past the end of ./a.txt", "./a.txt", []string{"5,6"}, http.StatusBadRequest},
+			// blame needs a file: a folder, with or without its slash, is
+			// not found (d/ lists d/f.txt, d lists the folder).
+			{"blame of a folder", "d", nil, http.StatusNotFound},
+			{"blame of a folder with its slash", "d/", nil, http.StatusNotFound},
+			{"a NUL in the path", "a\x00.txt", nil, http.StatusBadRequest},
 		} {
 			resp, body := blame(tc.path, tc.ranges...)
 			check(t, tc.name, tc.want, resp, body)
@@ -84,6 +97,17 @@ func TestGitFailureStatus(t *testing.T) {
 			resp, body = blame("no such path x")
 			check(t, "blame of a path named like git's message", http.StatusInternalServerError, resp, body)
 			resp, body = blame("a.txt", "1,2")
+			check(t, "blame with a range", http.StatusInternalServerError, resp, body)
+			resp, body = blame("./a.txt")
+			check(t, "blame of ./a.txt", http.StatusInternalServerError, resp, body)
+			resp, body = blame("d/f.txt")
+			check(t, "blame of a file in a folder", http.StatusInternalServerError, resp, body)
+		})
+		// Only "fatal: file <path> has only N lines" is the range's
+		// fault, not every message that starts like it.
+		t.Run("server failure that names the file", func(t *testing.T) {
+			gitFailsOnArgWith(t, "blame", "128", "fatal: file a.txt has a bad object")
+			resp, body := blame("a.txt", "1,2")
 			check(t, "blame with a range", http.StatusInternalServerError, resp, body)
 		})
 		t.Run("grep read failure", func(t *testing.T) {

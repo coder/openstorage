@@ -458,8 +458,3 @@ func gitStderr(err error, code int) (string, bool) {
 	}
 	return "", false
 }
-
-// endsWithLine reports whether text ends with the whole line want.
-func endsWithLine(text, want string) bool {
-	return text == want || strings.HasSuffix(text, "\n"+want)
-}

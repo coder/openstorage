@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +103,26 @@ func TestBlameMissingPath(t *testing.T) {
 	// (modern git clamps an end past EOF, so "1,999" succeeds).
 	if _, err := Blame(ctx, f.dir, f.c1, "README.md", []string{"999,1000"}, false); err == nil || errors.Is(err, ErrNotFound) {
 		t.Errorf("range past EOF err = %v, want non-NotFound error", err)
+	}
+}
+
+// blame needs a file: a path that names an empty folder (ls-tree lists
+// the folder and nothing in it) is not found, not a git failure.
+func TestBlameOfAnEmptyFolderIsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare")
+	empty := strings.TrimSpace(mustGit(t, dir, "hash-object", "-t", "tree", "-w", "/dev/null"))
+	mk := exec.Command("git", "mktree")
+	mk.Dir = dir
+	mk.Env = append(os.Environ(), gitEnv...)
+	mk.Stdin = strings.NewReader("040000 tree " + empty + "\te\n")
+	tree, err := mk.Output()
+	if err != nil {
+		t.Fatalf("git mktree: %v", err)
+	}
+	commit := strings.TrimSpace(mustGit(t, dir, "commit-tree", strings.TrimSpace(string(tree)), "-m", "empty folder"))
+	if _, err := Blame(context.Background(), dir, commit, "e", nil, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("blame of an empty folder: err = %v, want ErrNotFound", err)
 	}
 }
 
