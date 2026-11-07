@@ -224,7 +224,7 @@ With every fact TRUE in the code, setting each fact FALSE in the model alone fai
 
 ## Coverage record
 
-Sync commit: `a7a00c4092d69257a71b40920ad5faec5b446b32` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
+Sync commit: `4b192fa85e124d918a59f94ae274f06b4099467f` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
 Every declaration in these files is covered:
 
