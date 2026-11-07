@@ -586,9 +586,17 @@ func TestTimedOutReleaseStopsTheRefresher(t *testing.T) {
 		if lerr != nil {
 			t.Fatalf("a refresher still holds the hold's inode lock after its release: %v", lerr)
 		}
+		// The marker is past the TTL now, but it lives as long as its
+		// hold, like every sidecar.
+		marker := holdPath + pushHoldDoneSuffix
+		sweepExpiredPushHolds(filepath.Dir(holdPath))
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("a sweep removed the marker of a hold that is still there: %v", err)
+		}
 		freeLock()
 		// Both observations of the expiry: the hold past the TTL, and
-		// its reap marker newer than the hold and past the grace.
+		// its reap marker newer than the hold and past the grace. A
+		// fresh release marker leaves its removal to the reaper alone.
 		now := time.Now()
 		if err := os.Chtimes(holdPath, now.Add(-3*pushHoldTTL), now.Add(-3*pushHoldTTL)); err != nil {
 			t.Fatal(err)
@@ -597,6 +605,9 @@ func TestTimedOutReleaseStopsTheRefresher(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.Chtimes(holdPath+pushHoldReapSuffix, now.Add(-pushHoldTTL), now.Add(-pushHoldTTL)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(marker, now, now); err != nil {
 			t.Fatal(err)
 		}
 		sweepExpiredPushHolds(filepath.Dir(holdPath))
