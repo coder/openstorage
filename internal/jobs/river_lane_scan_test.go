@@ -112,7 +112,7 @@ func TestRiverLaneScanRequeuesLanesWithoutJob(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv(meta.EnvSyncStealLegacy, "false")
 	env := newLaneScanEnv(t, ctx)
-	q, err := NewRiverInsertOnly(ctx, env.pgURL) // no workers: jobs stay put
+	q, err := NewRiverInsertOnly(ctx, env.pgURL, slog.New(slog.DiscardHandler)) // no workers: jobs stay put
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestRiverLaneScanRequeuesLanesWithoutJob(t *testing.T) {
 func TestRiverLaneScanRechecksAfterInsert(t *testing.T) {
 	ctx := context.Background()
 	env := newLaneScanEnv(t, ctx)
-	q, err := NewRiverInsertOnly(ctx, env.pgURL)
+	q, err := NewRiverInsertOnly(ctx, env.pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func schedulePush(t *testing.T, ctx context.Context, q *River, repoID string) {
 func TestRiverLaneScanResumesAfterTimeout(t *testing.T) {
 	ctx := context.Background()
 	env := newLaneScanEnv(t, ctx)
-	q, err := NewRiverInsertOnly(ctx, env.pgURL)
+	q, err := NewRiverInsertOnly(ctx, env.pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +436,7 @@ func TestRiverLaneScanResumesAfterTimeout(t *testing.T) {
 func TestRiverLaneScanSkipsFailingLane(t *testing.T) {
 	ctx := context.Background()
 	env := newLaneScanEnv(t, ctx)
-	q, err := NewRiverInsertOnly(ctx, env.pgURL)
+	q, err := NewRiverInsertOnly(ctx, env.pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

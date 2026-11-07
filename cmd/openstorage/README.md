@@ -140,7 +140,7 @@ The `hook` subprocess also reads per-push variables that the Git server sets (na
 - `[wire_eventing.go:buildServeEventing]` The sync worker pushes over HTTP to this process's loopback URL with minted tokens.
 - `[wire_eventing.go:webhookSink.Emit]` Enqueues webhook deliveries, which make outbound HTTP calls. The hook path delivers with `hookDeliveryAttempts` (3) on non-Postgres backends.
 - `[wire.go:bootstrapOrgAuth]` Upserts the org and its public keys in the metadata store.
-- `[wire.go:buildAPIHandler]`, `[wire_eventing.go:slogForHook]` Log to stderr. The hook logger writes at Warn level so the Git client shows the lines.
+- `[wire.go:buildAPIHandler]`, `[wire_eventing.go:slogForHook]` Log to stderr. The hook logger writes at Warn level so the Git client shows the lines, without their error values: `githttp.NewHookLogHandler` writes those only to the push's hook-errors file, which serve logs. `[wire_eventing.go:runHook]` makes it the hook process's default logger, so the store packages' own lines lose their error values on stderr too, and the hook's River client writes River's lines only to the hook-errors file.
 - `[main.go:cmdKeygen]` Writes `<out>.pem` (mode `0600`) and `<out>.pub.pem` (mode `0644`). Without `-if-missing` it truncates existing files.
 - `[signingkey.go:cmdSigningKey]`, `[purgerepo.go:cmdPurgeRepo]` Run metadata schema DDL through `[wire.go:openMetaStore]`, which calls `InitSchema`. `purge-repo` also calls `InitSchema` on the ref store.
 - `[signingkey.go:runSigningKeyAdd]`, `[signingkey.go:runSigningKeyRemove]` Insert or delete rows in the org signing-key registry.
