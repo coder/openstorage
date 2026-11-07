@@ -137,13 +137,21 @@ def scan_blocks(path):
         yield from markdown_blocks(list(enumerate(source, 1)))
 
 
-def drop_columns(line, count):
-    """Remove container indentation.
+# The quote and list markers at the start of a line and the white space around them. The columns that these read
+# decide where a block starts. Text that starts like a marker, such as `->`, is read as one too. That does no harm:
+# a tab in the white space after it is expanded, and nothing reads that tab.
+CONTAINER_PREFIX = re.compile(r"(?:[ \t]*(?:>|[-+*]|[0-9]{1,9}[.)]))*[ \t]*")
 
-    A tab stops at a multiple of four columns of the original line. Dropping a prefix shortens the line, so
-    a tab that stays in it would move to a stop of the shorter line. Expand every tab first.
+
+def drop_columns(line, count):
+    """Remove container indentation without changing tabs in the text.
+
+    A tab stops at a multiple of four columns of the original line. Dropping a prefix shortens the line, so a
+    tab that stays after a container marker would stop at a column of the shorter line. The tabs in the markers
+    and the white space around them are expanded first. The text keeps its tabs, because anchors() reads it.
     """
-    line = line.expandtabs(4)
+    prefix = CONTAINER_PREFIX.match(line)
+    line = prefix.group().expandtabs(4) + line[prefix.end():]
     pos = column = 0
     while pos < len(line) and (column < count or line[pos] in " \t"):
         column += 4 - column % 4 if line[pos] == "\t" else 1

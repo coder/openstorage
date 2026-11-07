@@ -557,11 +557,12 @@ class CitationTests(CheckerTestCase):
         shown = {
             "blank-first item": f"-\n    > \t{link}\n", "item with text": f"- x\n    > \t{link}\n",
             "blank-first ordered item": f"1.\n     > \t{link}\n", "one space less": f"-\n   > \t{link}\n",
-            "quote": f">\t{link}\n",
+            "quote": f">\t{link}\n", "ordered marker": f"- 1.  \t{link}\n", "ordered marker with a parenthesis": f"- 1)  \t{link}\n",
         }
         code = {
             "two spaces": f"-\n  > \t{link}\n", "six spaces": f"-\n      > \t{link}\n",
-            "nested quote": f"> > \t{link}\n", "item and quote": f"- > \t{link}\n",
+            "nested quote": f"> > \t{link}\n", "item and quote": f"- > \t{link}\n", "plus marker": f"- + \t{link}\n",
+            "star marker": f"- * \t{link}\n",
         }
         for name, readme in shown.items():
             with self.subTest(case=name):
@@ -569,6 +570,15 @@ class CitationTests(CheckerTestCase):
         for name, readme in code.items():
             with self.subTest(case=name):
                 self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
+
+    def test_a_tab_in_heading_text_inside_a_container_stays_a_tab_for_the_anchor(self):
+        # GitHub drops a tab from the heading slug. Expanding it to spaces would make the slug `a--b`.
+        headings = "- ## A\tB\n\n> ## C\tD\n\n1. ## E\tF\n\n-\t## G\tH\n\n> - ## I\t\tJ\n"
+        good = ["#ab", "#cd", "#ef", "#gh", "#ij"]
+        bad = ["#a--b", "#c--d", "#e-f", "#g----h", "#i--------j"]
+        readme = " ".join(f"[x](docs/a.md{anchor})" for anchor in good + bad) + "\n"
+        result = self.run_checker(readme, docs={"a.md": headings})
+        self.assertEqual(result.stdout, "".join(f"BROKEN ANCHOR README.md:1 -> docs/a.md{anchor}\n" for anchor in bad) + "broken links: 5\n")
 
     def test_only_spaces_and_tabs_separate_a_link_destination_from_its_title(self):
         # CommonMark takes a form feed or NEL after a destination as part of the text, so the link below renders.
@@ -1042,7 +1052,7 @@ class FileSelectionTests(CheckerTestCase):
                 assert b"".join(entries) == out and len(entries) > 2
                 out = {"cut": out[:-1], "gap": entries[0] + b"junk\\n" + b"".join(entries[1:]), "tail": out + b"junk\\n",
                        "last": b"".join(entries[:-1]), "none": b"", "intact": out,
-                       "junk": entries[0] + b"junk\\0\\n" + b"".join(entries[1:])}[mode]
+                       "junk": entries[0] + b"junk\\0\\n" + b"".join(entries[1:]), "first": b"junk\\0\\n" + out}[mode]
             sys.stdout.buffer.write(out)
             sys.stderr.buffer.write(done.stderr)
             sys.exit(done.returncode)
@@ -1051,7 +1061,7 @@ class FileSelectionTests(CheckerTestCase):
             fake = Path(bin_dir) / "git"
             fake.write_text(wrapper, encoding="utf-8")
             fake.chmod(0o755)
-            for mode in ["intact", "cut", "gap", "junk", "tail", "last", "none", "fail"]:
+            for mode in ["intact", "cut", "gap", "junk", "first", "tail", "last", "none", "fail"]:
                 with self.subTest(damage=mode):
                     env = {**os.environ, "PATH": bin_dir + os.pathsep + os.environ["PATH"], "REAL_GIT": shutil.which("git"), "DAMAGE": mode}
                     result = self.run_checker("[Doc](docs/a.md)\n", docs={"a.md": "# A\n", "b.md": "# B\n"}, env=env)
