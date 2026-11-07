@@ -72,3 +72,43 @@ func TestResolveRefLongSpecSkipsGit(t *testing.T) {
 		t.Fatal("git did not run for a 4096-byte spec")
 	}
 }
+
+// rev-parse --verify --quiet <ref>^{commit} exits 1 for a ref that does
+// not exist, and also for one whose commit git cannot read. Only the
+// first is ErrNotFound: an existing branch or tag whose commit object is
+// missing is the repository's failure. A ref or id that names a tree is
+// still no commit.
+func TestResolveRefUnreadableCommitIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "a.txt", "one\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "c1")
+	tree := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD^{tree}"))
+	mustGit(t, dir, "tag", "-a", "-m", "tree", "tree-tag", tree)
+	writeFile(t, dir, "a.txt", "two\n", 0o644)
+	mustGit(t, dir, "commit", "-q", "-am", "c2")
+	c2 := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	mustGit(t, dir, "branch", "gone", c2)
+	mustGit(t, dir, "tag", "-a", "-m", "gone", "gone-tag", c2)
+	mustGit(t, dir, "tag", "-a", "-m", "gone again", "gone-tag-tag", "gone-tag")
+	tagObj := strings.TrimSpace(mustGit(t, dir, "rev-parse", "refs/tags/gone-tag"))
+	mustGit(t, dir, "reset", "-q", "--hard", "HEAD~1")
+	if err := os.Remove(filepath.Join(dir, ".git", "objects", c2[:2], c2[2:])); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, spec := range []string{"gone", "refs/heads/gone", "gone-tag", "gone-tag-tag", tagObj, strings.ToUpper(tagObj)} {
+		if sha, err := ResolveRef(ctx, dir, spec, false); err == nil || errors.Is(err, ErrNotFound) {
+			t.Errorf("ResolveRef(%q) = (%q, %v), want an error that is not ErrNotFound", spec, sha, err)
+		}
+	}
+	for _, spec := range []string{"nope", "refs/heads/nope", "tree-tag", tree, c2, c2[:12], strings.Repeat("1", 40)} {
+		if sha, err := ResolveRef(ctx, dir, spec, false); !errors.Is(err, ErrNotFound) {
+			t.Errorf("ResolveRef(%q) = (%q, %v), want ErrNotFound", spec, sha, err)
+		}
+	}
+	if _, err := ResolveRef(ctx, dir, "main", false); err != nil {
+		t.Errorf("ResolveRef(main): %v", err)
+	}
+}
