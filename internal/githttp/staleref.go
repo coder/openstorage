@@ -119,7 +119,7 @@ func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res sta
 		metrics.StaleRefLockCleanup(res.Outcome)
 		switch {
 		case err != nil:
-			log.Printf("hydrate %s: %d ref lock(s) older than %v kept: %v", repoPath, res.Old, staleRefLockAge, err)
+			log.Printf("hydrate %s: removed %d of %d ref lock(s) older than %v, then stopped: %v", repoPath, res.Removed, res.Old, staleRefLockAge, err)
 		case res.Outcome == metrics.StaleRefLockBusy:
 			log.Printf("hydrate %s: %d ref lock(s) older than %v kept: a git that serve started is still running in the repository", repoPath, res.Old, staleRefLockAge)
 		default:
@@ -193,8 +193,9 @@ const (
 
 // quarantineRefLock moves the lock at path, which was inspected as fi, into
 // the quarantine directory, and deletes it when it is still that file. It
-// returns an error when the quarantine directory cannot be made or a move
-// fails for a reason other than the lock being gone.
+// returns an error when the quarantine directory cannot be made, a move fails
+// for a reason other than the lock being gone, or a replaced file cannot be
+// put back although no new lock took its path.
 func quarantineRefLock(repoPath, path string, fi fs.FileInfo) (quarantineResult, error) {
 	dir := filepath.Join(repoPath, staleLocksDir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -220,8 +221,15 @@ func quarantineRefLock(repoPath, path string, fi fs.FileInfo) (quarantineResult,
 	if got, err := os.Lstat(quarantined); err == nil && os.SameFile(fi, got) {
 		return lockDeleted, os.Remove(quarantined)
 	}
-	if err := os.Link(quarantined, path); err == nil {
+	// Link, unlike rename, fails when a new lock took the path: that lock
+	// stays, and the moved file stays in quarantine. Any other failure left
+	// the path empty and the moved file, which may be a live writer's lock,
+	// only in quarantine: report it.
+	switch err := os.Link(quarantined, path); {
+	case err == nil:
 		_ = os.Remove(quarantined)
+	case !errors.Is(err, fs.ErrExist):
+		return lockReplaced, fmt.Errorf("put back %s: %w", path, err)
 	}
 	return lockReplaced, nil
 }
