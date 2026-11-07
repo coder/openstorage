@@ -806,7 +806,10 @@ also have a metric are listed in the [metrics and log mapping](#metrics-and-log-
 - Returned store errors are not server log entries themselves; the caller decides how
   they appear.
 - Terminal `serve` and `hook` errors print to stderr with `openstorage serve:` /
-  `openstorage hook:` prefixes and exit 1. Hook errors can reach Git clients.
+  `openstorage hook:` prefixes and exit 1. A hook error reaches Git clients whole only
+  when it is a refusal: a policy denial, a conflict, or a quota or retry denial. Any
+  other hook error reaches them as `<hook> failed; push again later (the server log has
+  the cause)`, and `serve` logs its text as a hook line (below).
 - Hook log lines reach Git clients without their error values, because those can name
   the database or S3 endpoint. Each hook writes the whole line to a private file for its
   push, and `serve` logs it after the push as `receive-pack <repo>: hook: <line>`.
@@ -908,8 +911,9 @@ its first sync: the v1 release runs it at boot.
 **Hook refusals.** A v2 hook refuses a ref update when `_wal/meta.json` has the wrong
 format version, does not decode, or holds ids or rows no writer can produce, such as a
 negative id counter, a holderless claim, a null row or an empty required field
-(`_wal/meta.json is corrupt`). `serve` refuses the same documents at every metadata read
-and keeps running. It writes nothing. For a
+(`_wal/meta.json is corrupt`). The pusher's refusal for a corrupt document leaves out
+the detail, because it can name rows of the document: `serve`'s log has it. `serve`
+refuses the same documents at every metadata read and keeps running. It writes nothing. For a
 corrupt document, keep `serve` stopped and
 [restore from a verified stopped-node backup](backup-restore-s3wal.md#restore-and-validate-before-cutover).
 Do not edit the document. If the hook cannot reach the store, it still accepts the push

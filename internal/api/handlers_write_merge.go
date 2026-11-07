@@ -144,7 +144,10 @@ func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, m
 // (docs/reference/http-api.md: raw error strings never leak onto the wire).
 func (s *server) wmInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wmInternal: nil error or empty op")
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	if s.writeRefHeldErr(w, r, op, err) {
+		return
+	}
+	s.logger.Error("internal error", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 

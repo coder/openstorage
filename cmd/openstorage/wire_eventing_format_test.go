@@ -125,12 +125,14 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 	}{
 		{"v1", `{"v":1,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`,
 			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
+		// A corrupt document's detail can name rows of the document: it goes
+		// to the hook-errors file, and the pusher gets a fixed refusal.
 		{"truncated", `{"v":2,"seq":3,"writer":"0123`,
-			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md#restore-and-validate-before-cutover", "!document decode:", "record:document decode:"}},
 		{"no writer", `{"v":2,"seq":3,"next_org_id":1,"next_key_id":0}`,
-			[]string{"_wal/meta.json is corrupt (document seq 3 has no writer nonce)", "backup-restore-s3wal.md"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md", "!no writer nonce", "record:document seq 3 has no writer nonce"}},
 		{"negative counter", `{"v":2,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`,
-			[]string{"_wal/meta.json is corrupt (document seq 3 has negative id counters (-1, 0))", "backup-restore-s3wal.md"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md", "!negative id counters", "record:document seq 3 has negative id counters (-1, 0)"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeMetaS3{body: []byte(tc.body)}
@@ -146,9 +148,21 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 				t.Fatalf("WrapHookRefStore = %v, %v; want a refusal", wrapped, err)
 			}
 			for _, want := range append([]string{"refusing the ref update"}, tc.want...) {
-				if !strings.Contains(err.Error(), want) {
+				switch {
+				case strings.HasPrefix(want, "!"):
+					if strings.Contains(err.Error(), want[1:]) {
+						t.Fatalf("refusal %q shows the pusher %q", err, want[1:])
+					}
+				case strings.HasPrefix(want, "record:"):
+					if !strings.Contains(hookErrorRecords(t), strings.TrimPrefix(want, "record:")) {
+						t.Fatalf("the hook-errors file lacks %q: %s", want, hookErrorRecords(t))
+					}
+				case !strings.Contains(err.Error(), want):
 					t.Fatalf("refusal %q lacks %q", err, want)
 				}
+			}
+			if !githttp.ShownToPusher(err) {
+				t.Fatalf("the hook would hide the refusal %q from the pusher", err)
 			}
 			if got, err := rs.GetRef(t.Context(), "repo-1", "refs/heads/main"); !errors.Is(err, ref.ErrNotFound) {
 				t.Fatalf("authority ref = %q, %v; want unset", got, err)
@@ -211,6 +225,9 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 				}
 				if !strings.Contains(logs.String(), "hook refuses ref updates: record forward intent") {
 					t.Fatalf("missing refusal log: %s", logs)
+				}
+				if !githttp.ShownToPusher(err) {
+					t.Fatalf("the hook would hide the refusal %q from the pusher", err)
 				}
 			} else if !won || err != nil || gerr != nil {
 				t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update accepted (it records no intent)", won, err, got, gerr)
@@ -375,7 +392,7 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 							if got == "" && errors.Is(gerr, ref.ErrNotFound) {
 								got = "absent"
 							}
-							if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+"); push again later") || got != before {
+							if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+"); push again later") || got != before || !githttp.ShownToPusher(err) {
 								t.Fatalf("%s %d = (%v, %v), authority = %q; want the update refused before its CAS, authority %s", op.name, i, won, err, got, before)
 							}
 							continue
@@ -495,5 +512,21 @@ func TestMalformedStoreURLHidesItsPassword(t *testing.T) {
 	}
 	if n := strings.Count(seen, pw); n != 0 {
 		t.Fatalf("the errors and hook records name the canary password %d times: %s", n, seen)
+	}
+}
+
+// The hook logger writes at Warn level: an Info line reaches neither the
+// pusher nor the hook-errors file.
+func TestSlogForHookIsWarnLevel(t *testing.T) {
+	hookEventingEnv(t, "")
+	var stderr bytes.Buffer
+	logger := slogForHook(&stderr)
+	logger.Info("below the level")
+	logger.Warn("at the level")
+	if strings.Contains(stderr.String(), "below the level") || !strings.Contains(stderr.String(), "at the level") {
+		t.Fatalf("stderr = %q; want only the Warn line", stderr.String())
+	}
+	if records := hookErrorRecords(t); strings.Contains(records, "below the level") {
+		t.Fatalf("the hook-errors file has the Info line: %s", records)
 	}
 }

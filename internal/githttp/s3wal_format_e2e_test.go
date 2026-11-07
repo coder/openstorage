@@ -22,8 +22,12 @@ import (
 // TestS3WALHookRefusesUnusableMetadata: a v2 hook that meets a v1
 // metadata document (issue #445: the binary was replaced under an older
 // serve) or a corrupt one (issues #466, #478) refuses the push with a
-// message that names the fix. It neither accepts the push without its
-// events nor writes meta.json, and serve keeps running. The document changes while the update hook waits before its
+// message that names the fix. A corrupt document's detail can name rows
+// of the document, so the pusher's refusal leaves it out ("!" marks text
+// the refusal must lack; cmd/openstorage's
+// TestHookEventingRefusesUnusableMetaDocument checks that the hook-errors
+// file has it). It neither accepts the push without its events nor writes
+// meta.json, and serve keeps running. The document changes while the update hook waits before its
 // CAS, after the serve resolved the repo.
 func TestS3WALHookRefusesUnusableMetadata(t *testing.T) {
 	if testBackend != backendS3WAL {
@@ -52,10 +56,10 @@ func TestS3WALHookRefusesUnusableMetadata(t *testing.T) {
 		{"v1", setField("v", "1"),
 			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
 		{"truncated", func(_ *testing.T, v2 []byte) []byte { return v2[:len(v2)/2] },
-			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md#restore-and-validate-before-cutover", "!document decode:"}},
 		// Issue #478: a decodable document with impossible id counters.
 		{"negative counter", setField("next_org_id", "-1"),
-			[]string{"_wal/meta.json is corrupt (", "negative id counters", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "!negative id counters", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) { hookRefusesMetadata(t, tc.mutate, tc.want) })
 	}
@@ -128,7 +132,11 @@ func hookRefusesMetadata(t *testing.T, mutate func(t *testing.T, v2 []byte) []by
 		t.Fatal("the push was accepted on the replaced document")
 	}
 	for _, w := range want {
-		if !strings.Contains(res.out, w) {
+		if hidden, ok := strings.CutPrefix(w, "!"); ok {
+			if strings.Contains(res.out, hidden) {
+				t.Fatalf("refusal shows the pusher %q:\n%s", hidden, res.out)
+			}
+		} else if !strings.Contains(res.out, w) {
 			t.Fatalf("refusal lacks %q:\n%s", w, res.out)
 		}
 	}
