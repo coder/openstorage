@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,33 @@ func TestBlameOfAnEmptyFolderIsNotFound(t *testing.T) {
 	commit := strings.TrimSpace(mustGit(t, dir, "commit-tree", strings.TrimSpace(string(tree)), "-m", "empty folder"))
 	if _, err := Blame(context.Background(), dir, commit, "e", nil, false); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("blame of an empty folder: err = %v, want ErrNotFound", err)
+	}
+}
+
+// A path that exists but whose blob or folder git cannot read is a
+// failure of the repository, not a missing path: blame returns git's
+// error, not ErrNotFound.
+func TestBlameOfAnUnreadableObjectIsNotNotFound(t *testing.T) {
+	for _, tc := range []struct{ name, path, object string }{
+		{"blob", "d/f.txt", "HEAD:d/f.txt"},
+		{"folder", "d/f.txt", "HEAD:d"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mustGit(t, dir, "init", "-q", "--initial-branch=main")
+			writeFile(t, dir, "d/f.txt", "one\n", 0o644)
+			mustGit(t, dir, "add", "-A")
+			mustGit(t, dir, "commit", "-q", "-m", "c")
+			commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+			oid := strings.TrimSpace(mustGit(t, dir, "rev-parse", tc.object))
+			if err := os.Remove(filepath.Join(dir, ".git", "objects", oid[:2], oid[2:])); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Blame(context.Background(), dir, commit, tc.path, nil, false)
+			if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrBadRange) {
+				t.Fatalf("blame with the %s object gone: err = %v, want git's failure", tc.name, err)
+			}
+		})
 	}
 }
 

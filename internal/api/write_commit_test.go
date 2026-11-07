@@ -1363,13 +1363,9 @@ func gitFailsOnArg(t *testing.T, arg, how string) {
 	gitFailsOnArgWith(t, arg, how, gitFailsOnArgStderr)
 }
 
-// gitFailsOnArgWith is gitFailsOnArg with stderr as git's message. stderr
-// must hold no single quote.
+// gitFailsOnArgWith is gitFailsOnArg with stderr as git's message.
 func gitFailsOnArgWith(t *testing.T, arg, how, stderr string) {
 	t.Helper()
-	if strings.Contains(stderr, "'") {
-		t.Fatalf("gitFailsOnArgWith: stderr %q holds a single quote", stderr)
-	}
 	real, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
@@ -1385,7 +1381,7 @@ func gitFailsOnArgWith(t *testing.T, arg, how, stderr string) {
 	}
 	// read, [ and kill are shell builtins: the server runs some git
 	// children with an environment that has no PATH.
-	fail = "echo '" + stderr + "' >&2; " + fail
+	fail = "echo '" + strings.ReplaceAll(stderr, "'", `'\''`) + "' >&2; " + fail
 	script := fmt.Sprintf("#!/bin/sh\nread -r fail < %q\nfor a in \"$@\"; do [ \"$a\" = \"$fail\" ] && { %s; }; done\nexec %q \"$@\"\n", argFile, fail, real)
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)

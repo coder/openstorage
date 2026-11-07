@@ -491,6 +491,10 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "path must not contain a NUL byte")
 		return
 	}
+	if pathLeavesRepo(path) {
+		writeErr(w, http.StatusBadRequest, "path is outside the repository")
+		return
+	}
 	ephemeral, err := coreBoolParam(q, "ephemeral")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
