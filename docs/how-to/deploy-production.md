@@ -270,20 +270,71 @@ not take openstorage's lock.
 
 **Stale ref locks.** A Git process killed inside a ref transaction (SIGKILL, the OOM
 killer, a crash) can leave `refs/<name>.lock` or `packed-refs.lock` in a cache repository.
-Every later hydration of that repository then fails with Git's `Unable to create
-'<path>.lock': File exists`, so clones and fetches of it fail on that replica. When a ref
-update fails, hydration logs `hydrate <repo>: <n> ref lock(s) older than 1m0s block ref
-updates`. openstorage never removes a ref lock itself, for the same reason as above. To
-recover, rebuild that repository's cache:
+Git then refuses every later update of that ref with `Unable to create '<path>.lock':
+File exists`, so the hydration of that repository fails and clones and fetches of it fail
+on that replica.
 
-1. Take the repository path from that log line (the text after `hydrate`). It is
-   `<cache dir>/<repo ID>.git`, built from the cache directory and the validated repo ID.
-   Use only that path. Never build a path from a ref name: ref names can contain shell
-   syntax such as `$(...)`.
+openstorage removes such a lock itself when it can prove that no Git process that it
+started can own the lock. Every Git process that `serve` starts in a cache repository
+holds a shared lock on `<cache dir>/<repo ID>.git/codestorage.gitlease.lock`, on its
+descriptor 10, for as long as the process and its hooks and children live. The lock
+outlives a crash of `serve`: an orphaned Git process still holds it. When a ref update
+of a hydration fails, the hydration (which holds the repository's hydrate lock and has no
+Git child of its own left) takes that lock exclusively, without waiting. If it succeeds,
+no Git process that `serve` started is alive in the repository, and none can start until
+the cleanup ends. The cleanup then removes each lock that:
+
+- is a regular file older than one minute (a live Git holds a ref lock for the
+  milliseconds of one transaction), and
+- is newer than the lease epoch, the modification time of
+  `<repo>.git/codestorage.gitlease.epoch`, which the first lease-aware start in that cache
+  creates. A lock older than that may belong to a Git that holds no lease, such as one
+  started by an older openstorage binary or by hand, so it stays.
+
+It moves each lock into `<repo>.git/codestorage-stale-locks/` (outside `refs/`), checks
+that the moved file is the one it inspected, and deletes it only then. Then the
+hydration runs its ref sync again. One log line per run tells the result, and
+[`openstorage_stale_ref_lock_cleanup_total`](../reference/metrics.md) counts the runs:
+
+| Log line, after `hydrate <repo path>:` | Metric `outcome` | Meaning |
+|---|---|---|
+| `removed <n> of <m> ref lock(s) older than 1m0s (<k> replaced while moved); the others stay` | `removed` when `<n>` is more than 0, else `kept` | `<n>` locks are gone. A lock that stays is older than the epoch, or another file replaced it while the cleanup moved it (`<k>`). |
+| `<m> ref lock(s) older than 1m0s kept: a git that serve started is still running in the repository` | `busy` | A Git process that `serve` started is alive in the repository, so the cleanup kept every lock. It retries at the next failed hydration. |
+
+If the line repeats for one repository, use the runbook below: a lock older than the
+epoch stays for good, and a `busy` line that never clears means a Git process that does
+not exit (look for it with `ps`).
+
+**Rules for operators.** The cleanup can see only the Git processes that `serve` started
+with a lease. Three rules keep the other ones out of its way:
+
+- Never run Git by hand in a cache repository while `serve` runs: it holds no lease, so a
+  cleanup can remove its lock.
+- Before the first start of a release that has the lease on a cache that an older release
+  used, make sure no Git process of the old release is alive. A hard stop of the old
+  `serve` (SIGKILL, a host crash) can leave a Git child running, and such a child holds no
+  lease. Use the check in step 3 of the
+  [commit-graph stale-lock runbook](#commit-graph-refresh). A lock that such a Git made
+  before that first start is older than the epoch, so the cleanup keeps it. A transaction
+  that it starts after the first start is the case that the cleanup cannot see.
+- Never reassign descriptor 10 in a hook (`exec 10>...`): the reference-transaction hook is
+  installed only if absent, so a custom hook can, and its subtree then drops the lease.
+
+The cache directory must be on a local filesystem: `flock` does not work on a network
+filesystem.
+
+**Stale ref lock runbook.** Use it when the lines above keep appearing for one repository
+and the lock stays. To recover, rebuild that repository's cache:
+
+1. Take the repository path from that log line: the text between `hydrate ` and the
+   colon. Confirm that it is `<cache dir>/<repo ID>.git`, built from the cache directory
+   and the validated repo ID. Use only that path. Never build a path from a ref name: ref
+   names can contain shell syntax such as `$(...)`.
 2. Drain and stop the replica, and make sure no Git process works in the cache, as in
-   steps 2 and 3 above.
+   steps 2 and 3 of the [commit-graph stale-lock runbook](#commit-graph-refresh) above.
 3. Delete that repository's cache directory, for example
-   `rm -rf -- '<cache dir>/<repo ID>.git'`. Losing the cache is safe (see
+   `rm -rf -- '<cache dir>/<repo ID>.git'`, after you confirm that the path is the one from
+   step 1. Losing the cache is safe (see
    [Local disk: the cache directory](#local-disk-the-cache-directory)).
 4. Start the replica. The next clone or fetch hydrates the repository again from the
    ref store and the bucket.
@@ -646,6 +697,7 @@ text appended after it is not part of the contract.
 | Startup `no usable HTTP Date witness` / lease `freshness cannot be judged` / `is corrupt` (S3WAL signals) | **log only** | Startup refusals |
 | `WARN s3wal clock skew guard tripped` (S3WAL signals) | **log only** | |
 | `commit-graph refresh outcome=…` (What to monitor) | `openstorage_commit_graph_refresh_total` by `outcome` | Counts every refresh, including the silent `written`; the repository stays **log only** in the line's `repo=` field |
+| `hydrate <repo path>: removed … ref lock(s)` or `… ref lock(s) older than 1m0s kept: a git that serve started is still running …` (Stale ref locks) | `openstorage_stale_ref_lock_cleanup_total` by `outcome` | One count per cleanup run that found an old lock; the repository stays **log only** in the line |
 
 ## Zero-infrastructure mode (experimental): one bucket, one node
 

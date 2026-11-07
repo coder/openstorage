@@ -32,6 +32,9 @@ The git smart-HTTP and Git LFS server. `Server` authenticates JWTs, resolves rep
 - Hold reservation fails closed on unreadable peer holds and waits at most 10 s for conflicting holds [hydrate.go:reservePushHoldsCovering]
 - `Hydrate` publishes the generation marker only after a full sync and re-reads the generation under the hydrate lock [hydrate.go:Hydrate]
 - `hydratePacksBy` retries a missing pack blob a bounded number of times, then returns `ErrPackMissing` [hydrate.go:hydratePacksBy]
+- A failed `update-ref` batch returns a `refBatchError` that names the batch's refs. `syncRefsWithCleanup` runs `cleanStaleRefLocks` once per hydration, after the failed sync has returned and its git children are reaped, and a cleanup that removed a lock earns one more attempt [hydrate.go:syncRefsWithCleanup] [hydrate.go:refBatchError]
+- `cleanStaleRefLocks` removes a ref lock only when it holds the repository's lease exclusively, and only a regular file older than one minute and newer than the lease epoch: it renames the lock into `codestorage-stale-locks/` and deletes it only when the moved file has the device and inode that it inspected [staleref.go:cleanStaleRefLocks] [staleref.go:quarantineRefLock]
+- One cleanup run writes one log line and counts one `metrics.StaleRefLockCleanup` outcome, and a run that finds no lock older than one minute does neither and takes no lease [staleref.go:cleanStaleRefLocks]
 - Cache repos pin `receive.unpackLimit=0` and `gc.auto=0`; a pinned value that survives repair fails the call [hydrate.go:EnsureCacheRepoCtx]
 - LFS OIDs must match `^[a-f0-9]{64}$`; batches are capped at 4 MiB and 1000 objects; only `basic` transfer and `sha256` [lfs.go:handleLFSBatch]
 - LFS PUT needs a Content-Length (411), must hash to the OID (400), answers 413 when its Content-Length exceeds the per-repo staging allowance and 429 when the staging budget is exhausted, and is limited by `ref.MaxLFSObjectsPerRepo` (507) [lfs.go:lfsProxyUpload]
@@ -49,6 +52,7 @@ The git smart-HTTP and Git LFS server. `Server` authenticates JWTs, resolves rep
 - Spills large receive-pack output to an unlinked temp file [pushcap.go:pushGate.Write]
 - Writes verify-sig state files and imports signing keys with `gpg --import` in a temp dir [verifystate.go:appendTo] [hook.go:newSigVerifier]
 - Increments `metrics.CommitGraphRefresh`; logs through `log.Printf` [commitgraph.go:recordCommitGraphOutcome]
+- Takes the repository's lease exclusively for the moments of a stale ref lock cleanup, which makes new git starts in that repository wait; moves and deletes ref locks under `codestorage-stale-locks/`; increments `metrics.StaleRefLockCleanup` [staleref.go:cleanStaleRefLocks]
 - Test-mode crash knobs call `os.Exit(42)` [hook.go:preReceive]
 
 ## Verification
