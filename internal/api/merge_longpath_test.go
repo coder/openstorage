@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/gitread"
@@ -433,6 +434,19 @@ func TestParseListing(t *testing.T) {
 			names = append(names, fmt.Sprintf("%d bytes", len(name)))
 		}
 		t.Fatalf("kept %v, want the two oversized names", names)
+	}
+	// What is kept is a copy. A name, a mode or an oid that points into the
+	// listing holds all of it (a listing of 500,000 entries is 35 MB) for as
+	// long as the entry lives.
+	lo := uintptr(unsafe.Pointer(unsafe.StringData(out)))
+	inListing := func(s string) bool {
+		p := uintptr(unsafe.Pointer(unsafe.StringData(s)))
+		return s != "" && p >= lo && p < lo+uintptr(len(out))
+	}
+	for name, entry := range got {
+		if inListing(name) || inListing(entry.mode) || inListing(entry.oid) {
+			t.Errorf("a kept entry of %d bytes points into the listing", len(name))
+		}
 	}
 	for name, bad := range map[string]string{
 		"a record with no tab":                "no tab here\x00",
