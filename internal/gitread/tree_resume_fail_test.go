@@ -80,6 +80,35 @@ func TestLsTreePageCursorWhenTheWalksGitFails(t *testing.T) {
 	}
 }
 
+// A request to a cat-file child that has already ended: a child that failed
+// gives git's error, and one that ended cleanly declines, as when its output
+// ends before the answer. A walk sees one or the other, the failed write or
+// the end of the output, depending on how soon the child ends (#764's merge
+// group run saw the write's broken pipe).
+func TestTreeSourceRequestAfterGitEnded(t *testing.T) {
+	dir, commit := fiRepo(t, nestedFiles())
+	for name, c := range map[string]struct {
+		script string
+		want   func(error) bool
+	}{
+		"silent end": {`exit 0`, func(err error) bool { return errors.Is(err, errDeclined) }},
+		"exit":       {`echo "fatal: boom" >&2; exit 3`, func(err error) bool { return err != nil && !errors.Is(err, errDeclined) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fakeGit(t, c.script)
+			src, err := startTreeSource(context.Background(), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = src.close(true) })
+			_ = src.wait() // git is gone, and so is the reader of its request pipe
+			if _, _, err := src.request(commit); !c.want(err) {
+				t.Fatalf("request after git ended = %v", err)
+			}
+		})
+	}
+}
+
 // A git config that fails leaves the page to the stream: the walk does not
 // know the depth limit, so it does not answer.
 func TestLsTreePageCursorWhenTheDepthLimitCannotBeRead(t *testing.T) {
