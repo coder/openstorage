@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -108,6 +109,9 @@ func newPendingSyncStack(t *testing.T, e *testEnv, tracks bool) *pendingSyncStac
 	es := e.store.(meta.EventingStore)
 	creds, ups := upsync.MetaStores(es)
 	verifier := auth.NewVerifier(e.store)
+	// The worker's log names the cause of a repo.sync.failed event, which
+	// carries only the documented error string.
+	logger := testLogger(t)
 	s := &pendingSyncStack{e: e, org: e.newOrg(t), events: make(chan upsync.Event, 64), loopRoot: t.TempDir()}
 	loop := usyncCGIServer(t, s.loopRoot, func(r *http.Request) bool {
 		user, pass, ok := r.BasicAuth()
@@ -128,9 +132,9 @@ func newPendingSyncStack(t *testing.T, e *testEnv, tracks bool) *pendingSyncStac
 				return e.mint(t, tokenSpec{iss: org, repo: repo.RepoID, scopes: []string{auth.ScopeGitWrite}}), nil
 			},
 		},
-		Logger: discardLogger(), Timeout: time.Minute, PushEgressAllowPrivate: true, PullEgressAllowPrivate: true,
+		Logger: logger, Timeout: time.Minute, PushEgressAllowPrivate: true, PullEgressAllowPrivate: true,
 	}
-	inproc := upsync.NewInProcessQueue(worker.Run, worker.RunPush, discardLogger())
+	inproc := upsync.NewInProcessQueue(worker.Run, worker.RunPush, logger)
 	t.Cleanup(inproc.Close)
 	s.q = &pendingSyncScheduler{Queue: inproc, repos: e.store, es: es, tracks: tracks}
 	s.ss = newSyncServer(e.store, creds, ups, s.q, testHTTPBaseURL, events.TargetGuard{AllowPrivate: true}, discardLogger())
@@ -376,4 +380,36 @@ func TestPendingSyncPolicyRestricted(t *testing.T) {
 		}
 		s.expect(t, "unpoliced pull-upstream", name, 2, 1, 1, meta.CreateStateComplete)
 	})
+}
+
+// testLogger is a logger whose records go to t.Log, so a failed test
+// shows them. A record that arrives after the cleanups before it have run
+// is dropped: t.Log panics once the test has completed. Call it before the
+// code that logs registers its own cleanups.
+func testLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	w := &testLogWriter{t: t}
+	t.Cleanup(w.stop)
+	return slog.New(slog.NewTextHandler(w, nil))
+}
+
+type testLogWriter struct {
+	mu   stdsync.Mutex
+	t    *testing.T
+	done bool
+}
+
+func (w *testLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.done {
+		w.t.Log(strings.TrimSuffix(string(p), "\n"))
+	}
+	return len(p), nil
+}
+
+func (w *testLogWriter) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.done = true
 }
