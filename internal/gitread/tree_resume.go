@@ -37,7 +37,8 @@ import (
 //
 // This is LsTreePage's contract for any cursor string, an existing path or
 // not. The walk opens no tree before the cursor, so an object that is
-// missing or unreadable there no longer fails a page that is not empty.
+// missing or unreadable there no longer fails a page that the walk answers.
+// A page left to the stream fails on it as before.
 // Anything else it does not handle returns errDeclined, and LsTreePage then
 // pages by streaming `ls-tree -r`, which reads every entry the walk would
 // skip and gives the same answer. A page past the end is the stream's. So is
