@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1366,10 +1365,8 @@ func syncRefsWithCleanup(ctx context.Context, repoPath, headTarget string, newSt
 		}
 		if failed, ok := errors.AsType[*refBatchError](refsErr); ok && !cleaned {
 			cleaned = true
-			res, err := cleanStaleRefLocks(repoPath, failed.names, time.Now())
-			if err != nil {
-				log.Printf("hydrate %s: %v", repoPath, err)
-			} else if res.Removed > 0 {
+			// The cleanup logs and counts its own result, an error included.
+			if res, err := cleanStaleRefLocks(repoPath, failed.names, time.Now()); err == nil && res.Removed > 0 {
 				attempt--
 				continue
 			}
