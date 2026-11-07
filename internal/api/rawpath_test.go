@@ -192,6 +192,29 @@ func rpRawSet(t *testing.T, where string, objs []map[string]any, field string) [
 	return out
 }
 
+// rpCheckPathsBase64 checks that paths and paths_base64 list the blob
+// entries, and only those, in the order of entries, with the same length.
+func rpCheckPathsBase64(t *testing.T, where string, doc map[string]any) {
+	t.Helper()
+	var blobs []string
+	for _, o := range rpObjects(t, doc, "entries") {
+		if o["type"] == "blob" {
+			blobs = append(blobs, rpRaw(t, where, o, "path"))
+		}
+	}
+	paths, _ := doc["paths"].([]any)
+	enc, ok := doc["paths_base64"].([]any)
+	if !ok || len(paths) != len(blobs) || len(enc) != len(blobs) {
+		t.Fatalf("%s: %d blob entries, %d paths, paths_base64 %v", where, len(blobs), len(paths), doc["paths_base64"])
+	}
+	for i, want := range blobs {
+		raw, err := base64.StdEncoding.DecodeString(enc[i].(string))
+		if err != nil || string(raw) != want || paths[i] != string([]rune(want)) {
+			t.Errorf("%s: paths[%d] = %q and paths_base64[%d] = %q, want the blob %q", where, i, paths[i], i, enc[i], want)
+		}
+	}
+}
+
 func TestRawPathSiblings(t *testing.T) { runBackends(t, testRawPathSiblings) }
 
 func testRawPathSiblings(t *testing.T, e *testEnv) {
@@ -217,17 +240,7 @@ func testRawPathSiblings(t *testing.T, e *testEnv) {
 			collide[0]["path_base64"] == nil || collide[0]["path_base64"] == collide[1]["path_base64"] {
 			t.Errorf("colliding entries = %v", collide)
 		}
-		paths := doc["paths"].([]any)
-		pathsB64, ok := doc["paths_base64"].([]any)
-		if !ok || len(pathsB64) != len(paths) {
-			t.Fatalf("paths_base64 = %v for %d paths", doc["paths_base64"], len(paths))
-		}
-		for i, enc := range pathsB64 {
-			raw, err := base64.StdEncoding.DecodeString(enc.(string))
-			if err != nil || string(raw) != rpRaw(t, "entries", entries[i], "path") {
-				t.Errorf("paths_base64[%d] = %q, want the base64 of entries[%d]", i, enc, i)
-			}
-		}
+		rpCheckPathsBase64(t, "files", doc)
 	})
 
 	t.Run("files paged and flat", func(t *testing.T) {
@@ -260,6 +273,8 @@ func testRawPathSiblings(t *testing.T, e *testEnv) {
 		if !slices.Contains(got, "d\xfe") {
 			t.Errorf("flat entries = %q, want the tree d<0xfe>", got)
 		}
+		// The tree d<0xfe> is in entries and in neither paths nor paths_base64.
+		rpCheckPathsBase64(t, "flat files", flat)
 	})
 
 	t.Run("files metadata", func(t *testing.T) {
@@ -346,6 +361,52 @@ func testRawPathSiblings(t *testing.T, e *testEnv) {
 			}
 		}
 	})
+}
+
+// TestRawPathFilteredRename: a renamed file above the inline diff limit lands
+// in filtered_files, and its old_path_base64 and path_base64 carry the raw
+// names. No other test fills filtered_files[].old_path_base64.
+func TestRawPathFilteredRename(t *testing.T) { runBackends(t, testRawPathFilteredRename) }
+
+func testRawPathFilteredRename(t *testing.T, e *testEnv) {
+	org := e.newOrg(t)
+	repoURL := "https://example.com/" + org + "/rawpath-filtered-" + randomHex(t, 4)
+	repo, err := e.store.CreateRepo(context.Background(), org, repoURL, "main")
+	if err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	const oldName, newName = "big\xf9old.txt", "big\xf8new.txt"
+	big := strings.Repeat("x", maxInlineDiffBytes+64) + "\n"
+	dir := t.TempDir()
+	coreGit(t, dir, "init", "-q", "-b", "main", ".")
+	rpStage(t, dir, oldName, big)
+	coreGit(t, dir, "commit", "-q", "-m", "c1")
+	coreGit(t, dir, "update-index", "--force-remove", "--", oldName)
+	rpStage(t, dir, newName, big)
+	coreGit(t, dir, "commit", "-q", "-m", "c2")
+	head := coreRevParse(t, dir, "HEAD")
+	coreSeedStores(t, e, repo.RepoID, dir, map[string]string{"refs/heads/main": head})
+	token := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+
+	doc := rpJSON(t, rpGet(t, e, token, "/api/v1/repos/diff?sha="+head))
+	if files := rpObjects(t, doc, "files"); len(files) != 0 {
+		t.Fatalf("files = %v, want the renamed large file in filtered_files only", files)
+	}
+	filtered := rpObjects(t, doc, "filtered_files")
+	if len(filtered) != 1 || filtered[0]["state"] != "R" {
+		t.Fatalf("filtered_files = %v, want one rename", filtered)
+	}
+	if got := rpRaw(t, "filtered rename", filtered[0], "path"); got != newName {
+		t.Errorf("path = %q, want %q", got, newName)
+	}
+	if got := rpRaw(t, "filtered rename", filtered[0], "old_path"); got != oldName {
+		t.Errorf("old_path = %q, want %q", got, oldName)
+	}
+	for _, key := range []string{"path_base64", "old_path_base64"} {
+		if _, ok := filtered[0][key]; !ok {
+			t.Errorf("filtered_files[0] has no %s: %v", key, filtered[0])
+		}
+	}
 }
 
 // TestRawPathValidNamesAddNothing: a repo whose names are all valid UTF-8,
