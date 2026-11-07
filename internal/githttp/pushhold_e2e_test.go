@@ -1084,7 +1084,7 @@ func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
 	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
 
-	repo := "t-hold-before-repack"
+	repo := runUnique("t-hold-before-repack")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1338,7 +1338,7 @@ func TestPush_HoldStaysFreshThroughLocalRefTransaction(t *testing.T) {
 	pushHoldTTL = 2 * time.Second // refresher cadence TTL/4 = 500ms
 	t.Cleanup(func() { pushHoldTTL = prevTTL })
 
-	repo := "t-hold-txn-gap"
+	repo := runUnique("t-hold-txn-gap")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1546,7 +1546,7 @@ func (c *countingRefStore) ListRefsAfter(ctx context.Context, repo, after string
 func TestPreReceive_PostReservationDenialReleasesHold(t *testing.T) {
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
 	laneStore, _ := openLaneStores(t)
-	repo := "t-prereceive-denial-release"
+	repo := runUnique("t-prereceive-denial-release")
 	shaA := strings.Repeat("a", 40)
 	shaB := strings.Repeat("b", 40)
 	if _, err := laneStore.CASRef(context.Background(), repo, "refs/heads/main", ref.ZeroSHA, shaA); err != nil {
@@ -1610,7 +1610,7 @@ func TestHydrate_HeldSkipDoesNotRescanPerRequest(t *testing.T) {
 	barrier := filepath.Join(t.TempDir(), "adv-barrier")
 	t.Setenv(EnvUpdateBarrier, barrier)
 
-	repo := "t-held-scan-coalesce"
+	repo := runUnique("t-held-scan-coalesce")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1706,7 +1706,7 @@ func TestHydrate_HeldSkipDoesNotRescanPerRequest(t *testing.T) {
 func TestPush_CommittedNonAtomicRefReleasedBeforeTail(t *testing.T) {
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
 	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
-	repo := "t-tombstone-committed"
+	repo := runUnique("t-tombstone-committed")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1841,7 +1841,7 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 	barrier := filepath.Join(t.TempDir(), "fanout-barrier")
 	t.Setenv(EnvUpdateBarrierEach, barrier)
 
-	repo := "t-fanout-adv-coalesce"
+	repo := runUnique("t-fanout-adv-coalesce")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1961,7 +1961,7 @@ func TestHydrate_ExternalWriteDuringHookPhaseForcesRescan(t *testing.T) {
 	barrier := filepath.Join(t.TempDir(), "gap-barrier")
 	t.Setenv(EnvUpdateBarrier, barrier)
 
-	repo := "t-external-gap-rescan"
+	repo := runUnique("t-external-gap-rescan")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
