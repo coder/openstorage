@@ -147,14 +147,24 @@ func problemError(t *testing.T, body []byte) string {
 	return p.Error
 }
 
-// A path is cut at a rune boundary, and a short one is named whole.
+// A path of up to 256 bytes is named whole, and a longer one is cut at 256
+// bytes, before a rune that the limit would split. The step back is at most
+// 3 bytes, so a name that is not UTF-8 is cut at 253 bytes, not at none.
 func TestNamedEntryCutsAtARuneBoundary(t *testing.T) {
-	long := gitread.CheckSymlinkTarget(strings.Repeat("\u20ac", 100), 5000) // 300 bytes, 3 per rune
-	if got, want := namedEntry("x", long), fmt.Sprintf("x %q... (a path of 300 bytes)", strings.Repeat("\u20ac", 85)); got != want {
-		t.Fatalf("namedEntry = %s, want %s", got, want)
+	cut := func(kept string, total int) string {
+		return fmt.Sprintf("x %q... (a path of %d bytes)", kept, total)
 	}
-	if got := namedEntry("x", gitread.CheckSymlinkTarget("a/b", 5000)); got != `x "a/b"` {
-		t.Fatalf("namedEntry = %s", got)
+	for _, c := range []struct{ name, path, want string }{
+		{"a short path", "a/b", `x "a/b"`},
+		{"256 bytes are named whole", strings.Repeat("a", 256), fmt.Sprintf("x %q", strings.Repeat("a", 256))},
+		{"257 bytes are cut at 256", strings.Repeat("a", 257), cut(strings.Repeat("a", 256), 257)},
+		{"a cut inside a 3-byte rune", strings.Repeat("\u20ac", 100), cut(strings.Repeat("\u20ac", 85), 300)},
+		{"a cut inside a 4-byte rune", "a" + strings.Repeat("\U0001d11e", 100), cut("a"+strings.Repeat("\U0001d11e", 63), 401)},
+		{"bytes that are not UTF-8", strings.Repeat("\x80", 300), cut(strings.Repeat("\x80", 253), 300)},
+	} {
+		if got := namedEntry("x", gitread.CheckSymlinkTarget(c.path, 5000)); got != c.want {
+			t.Errorf("%s: namedEntry = %s, want %s", c.name, got, c.want)
+		}
 	}
 	if got := namedEntry("x", errors.New("other")); got != "x" {
 		t.Fatalf("namedEntry of an error with no path = %s", got)

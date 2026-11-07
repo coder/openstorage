@@ -226,8 +226,11 @@ func namedEntry(noun string, err error) string {
 	}
 	n := len(path)
 	if n > maxNamedPath {
+		// Cut before the rune that byte n belongs to. A rune has at most
+		// utf8.UTFMax bytes, so the cut steps back at most UTFMax-1; bytes
+		// that are not UTF-8 are cut where the limit leaves them.
 		n = maxNamedPath
-		for n > 0 && !utf8.RuneStart(path[n]) {
+		for back := 0; back < utf8.UTFMax-1 && !utf8.RuneStart(path[n]); back++ {
 			n--
 		}
 		return fmt.Sprintf("%s %q... (a path of %d bytes)", noun, path[:n], len(path))
