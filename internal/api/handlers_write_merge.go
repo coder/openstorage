@@ -967,9 +967,10 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 	assertf(!mt.clean, "wmRenderConflicts: clean merge result")
 	conflicts := []wmPreviewConflict{}
 	filtered := []wmPreviewFiltered{}
+	listings := wmTreeListings{}
 	for _, path := range mt.paths {
 		stages := mt.stages[path]
-		resultEntry, err := wmTreePathEntry(ctx, sc, mt.tree, path)
+		resultEntry, err := wmTreePathEntry(ctx, sc, listings, mt.tree, path)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1041,27 +1042,149 @@ func wmBlobMode(mode string) bool {
 	return false
 }
 
+// wmLiteralPathspec makes an ls-tree pathspec match its path byte for byte.
+const wmLiteralPathspec = ":(literal)"
+
+// wmMaxPathspecBytes bounds the path bytes of one ls-tree pathspec argument.
+// Linux refuses to exec a program with a single argument of 128 KiB or more,
+// counting its terminating NUL (MAX_ARG_STRLEN: 32 pages of at least 4 KiB,
+// error E2BIG). git stores and merges paths of that size, so a longer path is
+// resolved one chunk at a time. The limit is the longest path that still fits
+// behind wmLiteralPathspec, so that every path which one ls-tree can name
+// still takes one ls-tree and lists nothing.
+const wmMaxPathspecBytes = 128<<10 - len(wmLiteralPathspec) - 1
+
+// wmTreeListings holds, for each tree that wmTreePathEntry had to list, its
+// entries with names over wmMaxPathspecBytes, by tree oid. A tree is listed
+// once per request however many conflicts sit in it: a listing emits the
+// whole tree, and the preview buffers all git output under one budget.
+type wmTreeListings map[string]map[string]wmStageEntry
+
 // wmTreePathEntry resolves the merged tree's entry at path via ls-tree —
 // mode+oid straight from the tree, never dereferencing the object, so
 // gitlink entries whose commits are absent from the odb resolve fine
 // (previously cat-file'd and 500'd). Zero value when the path is absent
 // (e.g. one side of a delete/modify conflict).
-func wmTreePathEntry(ctx context.Context, sc *wcScratch, tree, path string) (wmStageEntry, error) {
+//
+// A path of at most wmMaxPathspecBytes takes one ls-tree. A longer path is
+// cut at slashes into chunks of that size, and each chunk is looked up in
+// the tree that the previous chunk named. A single component longer than the
+// limit is not named in argv: it is found in the listing of its directory,
+// which listings keeps for the next such component.
+func wmTreePathEntry(ctx context.Context, sc *wcScratch, listings wmTreeListings, tree, path string) (wmStageEntry, error) {
 	assertf(ref.ValidSHA(tree) && path != "", "wmTreePathEntry: bad inputs %q %q", tree, path)
-	out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree, "--", ":(literal)"+path)
+	dir, rest := tree, path
+	for {
+		var chunk string
+		var entry wmStageEntry
+		var err error
+		if chunk = wmPathChunk(rest, wmMaxPathspecBytes); chunk != "" {
+			entry, err = wmLsTreePathspec(ctx, sc, dir, chunk)
+		} else {
+			chunk, _, _ = strings.Cut(rest, "/")
+			entry, err = wmLsTreeListed(ctx, sc, listings, dir, chunk)
+		}
+		if err != nil || entry.oid == "" {
+			return wmStageEntry{}, err // failed, or the path is absent
+		}
+		if len(chunk) == len(rest) {
+			return entry, nil
+		}
+		if entry.mode != "040000" {
+			return wmStageEntry{}, nil // a file or gitlink has no children
+		}
+		dir, rest = entry.oid, rest[len(chunk)+1:]
+	}
+}
+
+// wmPathChunk returns the longest prefix of path that is at most limit bytes
+// and ends at a component boundary, or "" when path starts with a component
+// longer than limit. A path within limit is its own chunk.
+func wmPathChunk(path string, limit int) string {
+	if len(path) <= limit {
+		return path
+	}
+	if i := strings.LastIndexByte(path[:limit+1], '/'); i > 0 {
+		return path[:i]
+	}
+	return ""
+}
+
+// wmLsTreePathspec looks up one path (at most wmMaxPathspecBytes) in tree
+// with a literal pathspec. The entry is zero when the path is absent.
+func wmLsTreePathspec(ctx context.Context, sc *wcScratch, tree, path string) (wmStageEntry, error) {
+	out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree, "--", wmLiteralPathspec+path)
 	if err != nil {
 		return wmStageEntry{}, err
 	}
 	record := strings.TrimSuffix(out, "\x00")
 	if record == "" {
-		return wmStageEntry{}, nil // path absent from the merged tree
+		return wmStageEntry{}, nil // path absent from the tree
 	}
-	// Record shape: `<mode> <type> <oid>\t<path>` (one entry: path is a
-	// full path, not a prefix, and ls-tree is not recursive).
-	head, _, found := strings.Cut(record, "\t")
+	// One entry: path is a full path, not a prefix, and ls-tree is not
+	// recursive.
+	_, entry, ok := wmParseLsTreeRecord(record)
+	if !ok || strings.Contains(record, "\x00") {
+		return wmStageEntry{}, fmt.Errorf("ls-tree %s -- %.200q emitted %.200q", tree, path, out)
+	}
+	return entry, nil
+}
+
+// wmLsTreeListed finds the entry called name in the listing of the whole of
+// tree, which names no path in argv. The entry is zero when tree has none.
+// name is longer than wmMaxPathspecBytes: shorter names are looked up by
+// pathspec, and wmParseListing keeps only the entries of longer ones.
+func wmLsTreeListed(ctx context.Context, sc *wcScratch, listings wmTreeListings, tree, name string) (wmStageEntry, error) {
+	if len(name) <= wmMaxPathspecBytes {
+		return wmStageEntry{}, fmt.Errorf("ls-tree %s: a %d-byte name fits one argument and is not in a listing", tree, len(name))
+	}
+	entries, ok := listings[tree]
+	if !ok {
+		out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree)
+		if err != nil {
+			return wmStageEntry{}, err
+		}
+		if entries, err = wmParseListing(out); err != nil {
+			return wmStageEntry{}, fmt.Errorf("ls-tree %s: %w", tree, err)
+		}
+		listings[tree] = entries
+	}
+	return entries[name], nil
+}
+
+// wmParseListing scans the output of `ls-tree -z <tree>` and returns the
+// entries whose names are longer than wmMaxPathspecBytes, by name. It keeps
+// no entry with a shorter name, and copies what it keeps, so that a directory
+// of 500,000 ordinary names costs the request its listing and then nothing
+// (parsing every record into a map held about three times the listing).
+func wmParseListing(out string) (map[string]wmStageEntry, error) {
+	entries := map[string]wmStageEntry{}
+	for rest := out; rest != ""; {
+		var record string
+		record, rest, _ = strings.Cut(rest, "\x00")
+		head, name, found := strings.Cut(record, "\t")
+		if !found {
+			return nil, fmt.Errorf("emitted %.200q", record)
+		}
+		if len(name) <= wmMaxPathspecBytes {
+			continue
+		}
+		_, entry, valid := wmParseLsTreeRecord(record)
+		if !valid {
+			return nil, fmt.Errorf("emitted %.200q", head)
+		}
+		entries[strings.Clone(name)] = wmStageEntry{mode: strings.Clone(entry.mode), oid: strings.Clone(entry.oid)}
+	}
+	return entries, nil
+}
+
+// wmParseLsTreeRecord splits one `ls-tree -z` record,
+// `<mode> <type> <oid>\t<name>`, into its name and mode+oid.
+func wmParseLsTreeRecord(record string) (string, wmStageEntry, bool) {
+	head, name, found := strings.Cut(record, "\t")
 	fields := strings.Fields(head)
-	if !found || strings.Contains(record, "\x00") || len(fields) != 3 || !ref.ValidSHA(fields[2]) {
-		return wmStageEntry{}, fmt.Errorf("ls-tree %s -- %q emitted %q", tree, path, out)
+	if !found || len(fields) != 3 || !ref.ValidSHA(fields[2]) {
+		return "", wmStageEntry{}, false
 	}
-	return wmStageEntry{mode: fields[0], oid: fields[2]}, nil
+	return name, wmStageEntry{mode: fields[0], oid: fields[2]}, true
 }
