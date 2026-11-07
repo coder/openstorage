@@ -2455,7 +2455,12 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	defer cleanup()
 
 	for _, sha := range pending {
-		reason := v.verifyCommit(ctx, sha)
+		reason, err := v.verifyCommit(ctx, sha)
+		if err != nil {
+			// Not a verdict: nothing is cached, and the pusher gets the
+			// fixed failure line (RunHook).
+			return fmt.Errorf("verify-sig: %w", err)
+		}
 		if reason != "" {
 			if err := state.markCommitDenied(sha, reason); err != nil {
 				return fmt.Errorf("verify-sig: %w", err)
@@ -2675,12 +2680,14 @@ func looksLikeSSHPublicKey(line string) bool {
 
 // verifyCommit returns "" when sha carries a valid signature from the
 // materialized keyring, else a short human-readable reason. Delegates to
-// `git verify-commit`, which picks gpg or ssh-keygen by signature type.
-func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason string) {
+// `git verify-commit`, which picks gpg or ssh-keygen by signature type. An
+// error is a check that did not run to a verdict: git did not start, was
+// killed, or failed with a status other than verify-commit's 1.
+func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason string, err error) {
 	if !ref.ValidSHA(sha) {
 		// Callers feed rev-list output; a malformed sha fails closed as a
 		// denial reason instead of crashing receive-pack.
-		return fmt.Sprintf("malformed commit sha %q", sha)
+		return fmt.Sprintf("malformed commit sha %q", sha), nil
 	}
 	logVerifySpawn(sha)
 	cmd := exec.CommandContext(ctx, "git",
@@ -2692,18 +2699,23 @@ func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason stri
 	}
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		return ""
+		return "", nil
 	}
 	msg := condenseGitReason(out)
+	// verify-commit exits 1 for a missing or bad signature. Any other end
+	// (git did not start, was killed, or died with 128) is no verdict.
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 || ctx.Err() != nil {
+		return "", fmt.Errorf("git verify-commit %s: %w (output: %q)", sha, err, msg)
+	}
 	if msg == "" {
 		// git verify-commit is silent for unsigned commits.
-		return "commit is not signed"
+		return "commit is not signed", nil
 	}
 	// The verifier's output can name server paths (the temporary
 	// allowed-signers file) and key diagnostics: the hook-errors file
 	// gets it, the pusher the documented reason.
 	hookErrorsLogger().Error("verify-sig: signature check failed", "sha", sha, "detail", msg)
-	return "no registered key matches the signature (the server log has the verifier's output)"
+	return "no registered key matches the signature (the server log has the verifier's output)", nil
 }
 
 // condenseGitReason squeezes git/gpg/ssh-keygen diagnostics into one short
