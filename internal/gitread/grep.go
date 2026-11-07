@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -114,7 +115,7 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 	if len(opts.Pathspecs) > 0 {
 		args = append(append(args, "--"), opts.Pathspecs...)
 	}
-	var stderr tailBuffer
+	var stderr gitlimit.TailBuffer
 	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Args: args, Stderr: &stderr})
 	var exitErr *exec.ExitError
 	noMatch := errors.As(err, &exitErr) && exitErr.ExitCode() == 1
