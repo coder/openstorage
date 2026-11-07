@@ -101,7 +101,7 @@ func runGitLeased(ctx context.Context, dir, leaseDir string, args ...string) (st
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	out, err := gitlimit.OutputIn(leaseDir, cmd)
+	out, err := gitlimit.OutputIn(ctx, leaseDir, cmd)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			err = fmt.Errorf("%w: %w", cerr, err)
@@ -1223,7 +1223,7 @@ func startLocalRefSeq(ctx context.Context, repoPath string) (*localRefSeq, error
 	if err != nil {
 		return nil, err
 	}
-	if err := gitlimit.StartIn(repoPath, l.cmd); err != nil {
+	if err := gitlimit.StartIn(ctx, repoPath, l.cmd); err != nil {
 		return nil, fmt.Errorf("git for-each-ref: %w", err)
 	}
 	l.sc = bufio.NewScanner(stdout)
@@ -1521,7 +1521,7 @@ func updateRefStdin(repoPath, commands string) error {
 	cmd := exec.Command("git", "update-ref", "--stdin")
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(commands)
-	if out, err := gitlimit.CombinedOutputIn(repoPath, cmd); err != nil {
+	if out, err := gitlimit.CombinedOutputIn(context.Background(), repoPath, cmd); err != nil {
 		return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil

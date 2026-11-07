@@ -2,6 +2,7 @@ package gitlimit
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -13,9 +14,9 @@ import (
 
 // LeaseFile is the name of a cache repository's lease file, <repo>/LeaseFile
 // (issue #490). Every git child that serve starts in a cache repository
-// holds a shared flock on it, as its inherited file descriptor 3, for as long
-// as the child's process tree lives: git, its hooks and their children all
-// keep the descriptor. So winning the lock exclusively (TryExclusive) proves
+// holds a shared flock on it, as its inherited file descriptor LeaseFD, for as
+// long as the child's process tree lives: git, its hooks and their children
+// all keep the descriptor. So winning the lock exclusively (TryExclusive) proves
 // that no git that serve started for the repository is alive, and none can
 // own one of its ref locks. The kernel arbitrates the lock across users, PID
 // namespaces and containers on the same host, and an orphan of a crashed
@@ -29,8 +30,14 @@ import (
 // built with the openstorage_viewcheck tag panics on a start that runs in a
 // repository without a lease. Git that serve did not start holds no lease;
 // the docs tell operators not to run it in a cache repository while serve
-// runs, and not to reassign descriptor 3 in a hook.
+// runs, and not to reassign descriptor LeaseFD in a hook.
 const LeaseFile = "codestorage.gitlease.lock"
+
+// LeaseFD is the descriptor a git child holds the lease on. Git reads the
+// descriptors 2 to 9 as trace targets (GIT_TRACE=3 writes to descriptor 3),
+// so the lease sits above them, and the descriptors 3 to LeaseFD-1 are closed
+// in the child.
+const LeaseFD = 10
 
 // ErrLeaseBusy: the lease is held exclusively (or, for TryExclusive, shared).
 var ErrLeaseBusy = errors.New("git lease is busy")
@@ -60,9 +67,9 @@ type Lease struct {
 
 // OpenLease takes a shared lease on the repository at repoPath, creating the
 // lease file if it is missing. It waits (bounded) while the lease is held
-// exclusively, and fails with ErrLeaseBusy if that does not end, or with
-// ErrStopping once StopChildren began.
-func OpenLease(repoPath string) (*Lease, error) {
+// exclusively. It fails with ctx's error once ctx ends, with ErrStopping once
+// StopChildren began, and with ErrLeaseBusy if the wait does not end.
+func OpenLease(ctx context.Context, repoPath string) (*Lease, error) {
 	assertf(repoPath != "", "OpenLease: empty repoPath")
 	f, err := os.OpenFile(filepath.Join(repoPath, LeaseFile), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -74,17 +81,26 @@ func OpenLease(repoPath string) (*Lease, error) {
 		if err == nil {
 			return &Lease{f: f, shared: true}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) || Stopping() || time.Now().After(deadline) {
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
 			_ = f.Close()
-			switch {
-			case !errors.Is(err, syscall.EWOULDBLOCK):
-				return nil, fmt.Errorf("lock git lease: %w", err)
-			case Stopping():
-				return nil, ErrStopping
-			}
-			return nil, ErrLeaseBusy
+			return nil, fmt.Errorf("lock git lease: %w", err)
 		}
-		time.Sleep(leasePoll)
+		switch {
+		case ctx.Err() != nil:
+			err = context.Cause(ctx)
+		case Stopping():
+			err = ErrStopping
+		case time.Now().After(deadline):
+			err = ErrLeaseBusy
+		default:
+			select {
+			case <-ctx.Done():
+			case <-time.After(leasePoll):
+			}
+			continue
+		}
+		_ = f.Close()
+		return nil, err
 	}
 }
 
@@ -108,14 +124,16 @@ func TryExclusive(repoPath string) (*Lease, error) {
 	return &Lease{f: f}, nil
 }
 
-// Attach hands the lease to cmd as its descriptor 3. The caller starts cmd
-// itself and closes the Lease after Start: the child keeps its own copy, so
-// the lock lives exactly as long as the child's process tree. A Lease may be
-// attached to several commands.
+// Attach hands the lease to cmd as its descriptor LeaseFD. The caller starts
+// cmd itself and closes the Lease after Start: the child keeps its own copy,
+// so the lock lives exactly as long as the child's process tree. A Lease may
+// be attached to several commands.
 func (l *Lease) Attach(cmd *exec.Cmd) {
 	assertf(l.shared, "Lease.Attach: not a shared lease")
 	assertf(len(cmd.ExtraFiles) == 0, "Lease.Attach: cmd already has ExtraFiles")
-	cmd.ExtraFiles = []*os.File{l.f}
+	// Entry i becomes descriptor 3+i, and a nil entry leaves it closed.
+	cmd.ExtraFiles = make([]*os.File, LeaseFD-3+1)
+	cmd.ExtraFiles[LeaseFD-3] = l.f
 }
 
 // Close closes the parent's copy of the lease file.
@@ -142,12 +160,13 @@ func flock(f *os.File, how int) error {
 }
 
 // StartIn is Start for a git child that runs in the cache repository at
-// repoPath: cmd inherits a shared lease as descriptor 3 (see LeaseFile).
-func StartIn(repoPath string, cmd *exec.Cmd) error {
+// repoPath: cmd inherits a shared lease as descriptor LeaseFD (see LeaseFile).
+// ctx bounds the wait for the lease (see OpenLease), not the child.
+func StartIn(ctx context.Context, repoPath string, cmd *exec.Cmd) error {
 	if checkLeased != nil {
 		checkLeased(repoPath, cmd)
 	}
-	l, err := OpenLease(repoPath)
+	l, err := OpenLease(ctx, repoPath)
 	if err != nil {
 		return err
 	}
@@ -157,8 +176,8 @@ func StartIn(repoPath string, cmd *exec.Cmd) error {
 }
 
 // RunIn is StartIn followed by Wait.
-func RunIn(repoPath string, cmd *exec.Cmd) error {
-	if err := StartIn(repoPath, cmd); err != nil {
+func RunIn(ctx context.Context, repoPath string, cmd *exec.Cmd) error {
+	if err := StartIn(ctx, repoPath, cmd); err != nil {
 		return err
 	}
 	return Wait(cmd)
@@ -166,20 +185,20 @@ func RunIn(repoPath string, cmd *exec.Cmd) error {
 
 // OutputIn is exec.Cmd.Output through the registry and the lease of the
 // repository at repoPath. cmd.Stdout must be nil.
-func OutputIn(repoPath string, cmd *exec.Cmd) ([]byte, error) {
+func OutputIn(ctx context.Context, repoPath string, cmd *exec.Cmd) ([]byte, error) {
 	assertf(cmd.Stdout == nil, "gitlimit.OutputIn: Stdout already set")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	err := RunIn(repoPath, cmd)
+	err := RunIn(ctx, repoPath, cmd)
 	return out.Bytes(), err
 }
 
 // CombinedOutputIn is exec.Cmd.CombinedOutput through the registry and the
 // lease of the repository at repoPath.
-func CombinedOutputIn(repoPath string, cmd *exec.Cmd) ([]byte, error) {
+func CombinedOutputIn(ctx context.Context, repoPath string, cmd *exec.Cmd) ([]byte, error) {
 	assertf(cmd.Stdout == nil && cmd.Stderr == nil, "gitlimit.CombinedOutputIn: Stdout or Stderr already set")
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
-	err := RunIn(repoPath, cmd)
+	err := RunIn(ctx, repoPath, cmd)
 	return out.Bytes(), err
 }

@@ -119,7 +119,7 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 
 	// The three stages are git children in the cache repository: they hold
 	// its lease (gitlimit.LeaseFile) until they exit.
-	lease, err := gitlimit.OpenLease(repoPath)
+	lease, err := gitlimit.OpenLease(ctx, repoPath)
 	if err != nil {
 		return nil, 0, fmt.Errorf("lease: %w", err)
 	}
