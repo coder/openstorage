@@ -149,52 +149,58 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    both platforms and repeat the checks and the smoke.
 
    The `digest-*` artifacts hold the two staged digests. They are kept for 35 days, and an
-   approval can wait up to 30 days. If the `publish` job fails because they are gone, or
-   for any reason before it creates the tag (except the HTTP 200 of "Refuse to replace an
-   existing version tag", see below), dispatch the run again. If it fails after the
-   tag exists, the tag is spent: do not update the quickstart pin (step 3), and fix forward
-   with a new release (see "If a published image is bad" below). If a `verify-published`
-   job fails, the tag exists by then. First re-run the failed jobs of that run on the
-   Actions page ("Re-run failed jobs"). They check the same published digest again, so a
-   runner, registry or smoke flake passes. If the same check fails again, the tag is spent,
-   as above.
+   approval can wait up to 30 days.
 
-   To tell which case you are in, open the failed run on the Actions page and find the
-   failed step in the `publish` job. A failure in any step before "Give the checked
-   digests the version tag" (the login, the download of the digest files, and "Refuse to
-   replace an existing version tag") means that this run created no tag. After a second
-   dispatch of a version, an earlier run may have created it, and "Refuse to replace an
-   existing version tag" fails with HTTP 200 exactly then (see below). The step "Check that
-   the index holds exactly the checked digests" runs only after this run created the tag.
-   The step "Give the checked digests the version tag" can fail on either side of the
-   push. So when you dispatched the version before, or when the failed step is that one,
-   look at the tag itself. After `docker login ghcr.io` with a token that has
+   When a `publish=true` run fails, two facts decide what to do. First, does the tag
+   `ghcr.io/coder/openstorage:X.Y.Z` exist? Second, does any run of this version have a
+   green `publish` job? Its run summary has the `Pin` line. A run with `publish=false`
+   has no such job, because `publish` and `verify-published` are skipped there.
+
+   - **No tag exists, and none was ever created:** dispatch `publish=true` again. This
+     covers a rejected or timed-out approval, a login that fails, a download that finds no
+     files, and files that are gone ("Give the checked digests the version tag" then fails
+     at `cat digest/amd64`, because the download step passes with "Total of 0 artifact(s)
+     downloaded"). Never re-run a failed `publish` job: dispatch again, so that no attempt of
+     a run meets a tag that an earlier attempt made.
+   - **A run has a green `publish` job and its `verify-published` jobs passed:** the
+     version is published. Do step 3 from that run's `Pin` line, if the quickstart does not
+     name the version yet.
+   - **A run has a green `publish` job and a `verify-published` job failed or was
+     cancelled:** re-run the failed jobs of that run ("Re-run failed jobs", or the re-run
+     icon next to a cancelled job). They check the same published digest again, so a
+     runner, registry or smoke flake passes. GitHub offers a re-run only for 30 days after
+     the run started, and an approval can wait as long. If a check fails again, whichever it
+     is, or no re-run is offered, the version is spent.
+   - **The tag exists in any other state,** for example because `publish` failed or was
+     cancelled after it created the tag: the version is spent. Do not update the quickstart
+     pin (step 3), and fix forward with a new release (see "If a published image is bad"
+     below).
+
+   The failed step helps first. A failure in the login, the download of the digest files,
+   or "Refuse to replace an existing version tag" means that this attempt created no tag.
+   The step "Check that the index holds exactly the checked digests" runs only after this
+   attempt created it. The step "Give the checked digests the version tag" can fail on
+   either side of the push. So for that step, and whenever you dispatched the version
+   before, look at the tag itself. After `docker login ghcr.io` with a token that has
    `read:packages`:
 
    ```sh
    docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z
    ```
 
-   It prints the index when the tag exists and fails with `not found` when it does not.
-   `not found` shows that no tag exists only when the login can read the package, because
-   a token that cannot read it can print the same message for a tag that exists. Any
-   other error, such as `denied`, tells you nothing about the tag: fix the login and run
-   it again. A tag that a package admin deleted also shows `not found`, so never dispatch
-   a version whose tag was ever created with `publish=true`. A dispatch with
+   First check the login: run the same command for a tag that is known to exist, such as
+   the version that the quickstart pins now. If that does not print an index, the login
+   cannot be trusted for this check, and no other answer means anything: fix the login. With
+   a login that passes, an index means that the tag exists, and `not found` means that no
+   tag exists now. A tag that a package admin deleted also shows `not found`, so never
+   dispatch `publish=true` for a version whose tag was ever created. A dispatch with
    `publish=false` only stages and checks, and creates no tag.
 
-   Another `publish=true` dispatch cannot replace a tag that exists, because the `publish`
-   job stops at "Refuse to replace an existing version tag" unless the registry answers
-   404 for the tag. So when the tag was never deleted, the worst case of a wrong guess is
-   a wasted dispatch. That step cannot know that an admin deleted the tag, so the rule
-   above stands. If the step fails with HTTP 200, an earlier run created the tag. Open
-   that run and look at its `verify-published` jobs. If they passed, the version is
-   published: check that the quickstart pin (step 3) names it, and update the pin if it
-   does not. If they are still running, wait for them. If they were cancelled, re-run them
-   from the run page (the re-run icon next to each job). If they failed, re-run the
-   failed jobs as above, and if the same check fails again, the version is spent: fix
-   forward with a new release. Any other HTTP status means the step could not tell, so
-   inspect the tag as above.
+   Another `publish=true` dispatch cannot replace a tag that exists. The `publish` job
+   stops at "Refuse to replace an existing version tag" unless the registry answers 404 for
+   the tag, and HTTP 200 there means that a tag exists: apply the list above. That step
+   cannot know that an admin deleted the tag, so the rule above stands. Any other HTTP
+   status means the step could not tell, so look at the tag as above.
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
