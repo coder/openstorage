@@ -14,9 +14,11 @@ import (
 	"path/filepath"
 	"strings"
 	stdsync "sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 )
 
@@ -789,6 +791,9 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	}
 	fetchArgs := append([]string{"fetch", "--prune", up.CloneURL()}, mirrorRefspecs...)
 	if stderr, err := runGit(ctx, mirror, fetchEnv, fetchArgs...); err != nil {
+		if f := argumentFailure("git fetch", err); f != nil {
+			return f
+		}
 		// The proxy's recorded verdicts outrank stderr phrasing — git only
 		// saw an opaque proxy HTTP error (same split as the push lane): a
 		// policy denial is permanent configuration, a non-policy dial
@@ -1127,6 +1132,15 @@ func runGitOut(ctx context.Context, dir string, env []string, args ...string) (s
 // runGitTo runs git with stdout written to out.
 func runGitTo(ctx context.Context, dir string, env []string, out io.Writer, args ...string) (stderr string, err error) {
 	assertf(dir != "" && len(args) > 0 && out != nil, "runGit: missing dir/args/stdout")
+	// exec refuses a NUL byte, and an argument or variable of 128 KiB or
+	// more. The upstream URL (owner, name, host) and the credential reach
+	// git here from a client's request, so the run reports them
+	// (argumentFailure) and does not read them as a clone failure.
+	for _, v := range append(append([]string{}, args...), env...) {
+		if strings.IndexByte(v, 0) >= 0 {
+			return "", gitlimit.ErrArgNUL
+		}
+	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = env
@@ -1142,8 +1156,24 @@ func runGitTo(ctx context.Context, dir string, env []string, out io.Writer, args
 	setProcGroup(cmd)
 	cmd.WaitDelay = 10 * time.Second
 	err = cmd.Run()
+	if errors.Is(err, syscall.E2BIG) {
+		err = fmt.Errorf("%w: %w", gitlimit.ErrArgTooLong, err)
+	}
 	if err != nil && ctx.Err() != nil {
 		err = fmt.Errorf("%w (%v)", ctx.Err(), err)
 	}
 	return errBuf.String(), err
+}
+
+// argumentFailure is the permanent configuration failure of a run whose
+// git command line exec refused: an upstream owner, name or host, or a
+// stored credential, that is too long for one argument (about 128 KiB on
+// Linux) or holds a NUL byte. Retrying cannot help, and neither can a
+// clone or push failure code. It returns nil for any other error. The
+// message never names the value.
+func argumentFailure(op string, err error) *syncFailure {
+	if !errors.Is(err, gitlimit.ErrArgTooLong) && !errors.Is(err, gitlimit.ErrArgNUL) {
+		return nil
+	}
+	return &syncFailure{code: FailConfig, cause: fmt.Errorf("%s: the upstream URL or the stored credential cannot be passed to git: %w", op, err)}
 }
