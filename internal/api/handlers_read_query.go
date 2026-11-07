@@ -807,9 +807,12 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 			writeInvalidField(w, "pagination.cursor", "is not a valid cursor", err.Error())
 			return
 		}
-		// The cursor's anchor commit must still exist in this repo.
+		// The cursor's anchor commit must still exist in this repo. Only a
+		// missing anchor makes the cursor invalid: any other failure (a git
+		// limit, or a git call that failed without answering) is the
+		// server's.
 		if _, resolveErr := gitread.ResolveRef(r.Context(), repoPath, commit, false); resolveErr != nil {
-			if gitread.IsBudgetError(resolveErr) {
+			if !errors.Is(resolveErr, gitread.ErrNotFound) {
 				s.internalErr(w, r, "resolve grep cursor", resolveErr)
 				return
 			}
