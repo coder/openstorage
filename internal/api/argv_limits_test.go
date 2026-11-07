@@ -3,8 +3,8 @@ package api
 // Request values that cannot be passed to git as they are: one argument or
 // environment variable of 128 KiB or more (E2BIG), and a NUL byte. Every
 // client string that reaches a git command line or environment answers with
-// a 4xx, never a 500, and a commit message of any size is kept whole. All
-// helpers carry an al prefix.
+// a 4xx, never a 500, and a commit message that fits the request is kept
+// whole. All helpers carry an al prefix.
 
 import (
 	"bytes"
