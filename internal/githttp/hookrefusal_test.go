@@ -305,16 +305,11 @@ func TestUpdateHookKeepsRefusals(t *testing.T) {
 	}
 }
 
-// A push through serve whose hooks cannot open the store: the pusher sees
-// the fixed line and no part of the store URL, and serve's log has the
-// cause.
-func TestServeHidesHookStoreErrors(t *testing.T) {
-	c := pgCanary()
-	t.Setenv("OPENSTORAGE_PG_URL", c.url)
-	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
-	logs := captureServeLog(t)
-
-	repo := "t-hook-store-errors"
+// hookServe serves repo in process, with the hooks' store URLs taken from
+// the environment, and returns a push of the work repository's HEAD to
+// refs/heads/main that returns the pusher's output.
+func hookServe(t *testing.T, repo string) func(work string) (string, error) {
+	t.Helper()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
 	srv := &Server{
@@ -332,20 +327,110 @@ func TestServeHidesHookStoreErrors(t *testing.T) {
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	work := initWorkRepo(t)
 	token := mintUnitToken(t, key, "ES256", unitClaims(testOrg, repo, auth.ScopeGitRead, auth.ScopeGitWrite))
 	url := strings.Replace(ts.URL, "http://", "http://t:"+token+"@", 1) + "/" + repo + ".git"
-	out, err := tryGit(work, "push", url, "HEAD:refs/heads/main")
-	if err == nil {
-		t.Fatalf("push succeeded with a store the hooks cannot open:\n%s", out)
+	return func(work string) (string, error) { return tryGit(work, "push", url, "HEAD:refs/heads/main") }
+}
+
+// A push through serve whose pre-receive hook cannot use a store, one case
+// per failed step: the pusher sees the fixed line and no part of the store
+// URL, and serve's log has the failed step and the cause.
+func TestServeHidesHookStoreErrors(t *testing.T) {
+	check := func(t *testing.T, out string, err error, logs *syncBuffer, c storeCanary, step string, want ...string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("push succeeded with a store the hooks cannot use:\n%s", out)
+		}
+		if !strings.Contains(out, "pre-receive failed; push again later (the server log has the cause)") {
+			t.Fatalf("the pusher's output lacks the fixed line: %s", out)
+		}
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline) && !strings.Contains(logs.String(), step); {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !strings.Contains(logs.String(), step) {
+			t.Fatalf("serve's log lacks the failed step %q: %s", step, logs.String())
+		}
+		checkHidden(t, out, logs.String(), c, want...)
 	}
-	if !strings.Contains(out, "pre-receive failed; push again later (the server log has the cause)") {
-		t.Fatalf("the pusher's output lacks the fixed line: %s", out)
-	}
-	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline) && !strings.Contains(logs.String(), c.parts["host"]); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	checkHidden(t, out, logs.String(), c, "host", "user", "database")
+	t.Run("reservation probe ref store open", func(t *testing.T) {
+		c := pgCanary()
+		t.Setenv("OPENSTORAGE_PG_URL", c.url)
+		t.Setenv("OPENSTORAGE_S3_URL", blobURL)
+		logs := captureServeLog(t)
+		out, err := hookServe(t, "t-hook-store-probe")(initWorkRepo(t))
+		check(t, out, err, logs, c, "open ref store for reservation probe", "host", "user", "database")
+	})
+	t.Run("ref store open", func(t *testing.T) {
+		// An update creates no ref, so pre-receive skips the reservation
+		// probe and first opens the ref store after the blob stat.
+		t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+		t.Setenv("OPENSTORAGE_S3_URL", blobURL)
+		logs := captureServeLog(t)
+		push := hookServe(t, "t-hook-store-open")
+		work := initWorkRepo(t)
+		if out, err := push(work); err != nil {
+			t.Fatalf("first push: %v\n%s", err, out)
+		}
+		commitFile(t, work, "b.txt", "two\n", "two", nil)
+		c := pgCanary()
+		t.Setenv("OPENSTORAGE_PG_URL", c.url)
+		out, err := push(work)
+		check(t, out, err, logs, c, c.parts["host"], "host", "user", "database")
+		if strings.Contains(logs.String(), "reservation probe") {
+			t.Fatalf("the update failed in the reservation probe: %s", logs.String())
+		}
+	})
+	t.Run("SQLite path", func(t *testing.T) {
+		// A regular file where the database's directory goes: the open
+		// fails and its error names the path.
+		dir, name := t.TempDir(), "canary-file-"+strings.ToLower(rand.Text()[:8])
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c := storeCanary{url: "sqlite://" + filepath.Join(dir, name, "refs.sqlite"), parts: map[string]string{"path": name}}
+		t.Setenv("OPENSTORAGE_PG_URL", c.url)
+		t.Setenv("OPENSTORAGE_S3_URL", blobURL)
+		logs := captureServeLog(t)
+		out, err := hookServe(t, "t-hook-store-sqlite")(initWorkRepo(t))
+		check(t, out, err, logs, c, "sqlite mkdir", "path")
+	})
+	t.Run("S3 blob stat", func(t *testing.T) {
+		p := map[string]string{
+			"bucket":   "canary-bucket-" + strings.ToLower(rand.Text()[:8]),
+			"endpoint": "canary-s3-" + strings.ToLower(rand.Text()[:8]) + ".invalid",
+		}
+		c := storeCanary{url: "s3://" + p["bucket"] + "?endpoint=http://" + p["endpoint"] + "&s3ForcePathStyle=true&region=us-east-1", parts: p}
+		// The S3 lanes set real credentials for the lane's own stores.
+		if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
+			t.Setenv("AWS_ACCESS_KEY_ID", "test")
+			t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+		}
+		t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+		t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+		t.Setenv("OPENSTORAGE_S3_URL", c.url)
+		logs := captureServeLog(t)
+		out, err := hookServe(t, "t-hook-store-stat")(initWorkRepo(t))
+		check(t, out, err, logs, c, "pre-receive: stat", "bucket", "endpoint")
+	})
+	t.Run("blob upload", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root writes into a read-only directory")
+		}
+		// A read-only blob directory: the stat finds no pack, and the
+		// upload fails with an error that names the path.
+		name := "canary-dir-" + strings.ToLower(rand.Text()[:8])
+		dir := filepath.Join(t.TempDir(), name)
+		if err := os.Mkdir(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		c := storeCanary{url: "file://" + dir, parts: map[string]string{"path": name}}
+		t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+		t.Setenv("OPENSTORAGE_S3_URL", c.url)
+		logs := captureServeLog(t)
+		out, err := hookServe(t, "t-hook-store-upload")(initWorkRepo(t))
+		check(t, out, err, logs, c, "pre-receive: upload", "path")
+	})
 }
 
 // The real `openstorage hook` command with a store it cannot reach: its
