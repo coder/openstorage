@@ -150,6 +150,30 @@ func TestResolveRef(t *testing.T) {
 	}
 }
 
+// TestResolveRefGitFailureIsNotNotFound: when a git child fails without
+// answering (here exec.ErrWaitDelay: git exited, but its output pipe
+// stayed open past childWaitDelay, as on a long-stalled host), ResolveRef
+// returns that failure. It must never report ErrNotFound for a ref that
+// exists: a client would then believe the ref is gone (404).
+func TestResolveRefGitFailureIsNotNotFound(t *testing.T) {
+	f := newFixture(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sub := range []string{"check-ref-format", "rev-parse"} {
+		t.Run(sub, func(t *testing.T) {
+			// A background child keeps git's stdout open after git exits.
+			fakeGit(t, `if [ "$1" = `+sub+` ]; then (sleep 5) & fi
+exec `+realGit+` "$@"`)
+			sha, err := ResolveRef(context.Background(), f.dir, "main", false)
+			if err == nil || errors.Is(err, ErrNotFound) || !errors.Is(err, exec.ErrWaitDelay) {
+				t.Fatalf("ResolveRef(main) with a stalled %s = (%q, %v), want the exec.ErrWaitDelay failure, not ErrNotFound", sub, sha, err)
+			}
+		})
+	}
+}
+
 func TestPeeledTags(t *testing.T) {
 	f := newFixture(t)
 	// Tags plain git can push but invariant 10 cannot list: a lightweight
