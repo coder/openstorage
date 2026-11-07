@@ -90,8 +90,10 @@ var ErrUnsortedTree = errors.New("ls-tree listed entries out of order")
 // not read, so a tree stored out of order (fsck's treeNotSorted, which
 // git's own path lookups do not handle either) can page in git's order.
 // The walk reads no folder before the cursor, so nothing there fails a
-// page that is not empty: an inversion, a missing or unreadable object,
-// or a tree nested past git's depth limit.
+// page that the walk answers: an inversion, a missing or unreadable object,
+// or a tree nested past git's depth limit. A page left to the stream is read
+// from the start and fails on them as before: with ErrUnsortedTree for an
+// inversion, which the files handler answers by listing the tree sorted.
 func LsTreePage(ctx context.Context, repoPath, commit, path, after string, limit int) (page []TreeEntry, hasMore, found bool, err error) {
 	assertf(ref.ValidSHA(commit) || commit == EmptyTreeSHA, "LsTreePage: unresolved commit %q", commit)
 	assertf(limit > 0, "LsTreePage: limit %d", limit)
