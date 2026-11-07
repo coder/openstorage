@@ -526,6 +526,11 @@ func wcValidateAuthor(field string, a wcAuthor) error {
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
 		return newFieldError(field, "must not contain newlines", field+" contains newlines")
 	}
+	// Caught here, not by gitlimit.ErrArgNUL at the start of git, so that the
+	// commit routes answer it with their 400 envelope.
+	if strings.ContainsRune(a.Name+a.Email, 0) {
+		return newFieldError(field, "must not contain NUL bytes", field+" contains a NUL byte")
+	}
 	return nil
 }
 

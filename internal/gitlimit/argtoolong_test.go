@@ -2,6 +2,7 @@ package gitlimit
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -9,11 +10,13 @@ import (
 )
 
 // TestStartReportsArgumentsTooLong: an argument or an environment variable
-// of 128 KiB or more cannot be exec'd on Linux. Start answers ErrArgTooLong
-// and starts nothing, and an argument just under the limit still runs.
+// of 32 pages (128 KiB with 4 KiB pages) or more cannot be exec'd on Linux.
+// Start answers ErrArgTooLong and starts nothing, and an argument just under
+// the limit still runs. The total limit of all arguments (a quarter of the
+// stack, 2 MiB) is then far above one argument, as it is with 4 KiB pages.
 func TestStartReportsArgumentsTooLong(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("the limit of one argument is Linux's")
+	if runtime.GOOS != "linux" || os.Getpagesize() != 4096 {
+		t.Skip("one argument is limited to 128 KiB only on Linux with 4 KiB pages")
 	}
 	const limit = 128 << 10 // MAX_ARG_STRLEN, with its terminating NUL
 	for name, build := range map[string]func(n int) *exec.Cmd{

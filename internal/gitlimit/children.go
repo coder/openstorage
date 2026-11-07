@@ -23,7 +23,8 @@ var ErrArgNUL = errors.New("a value holds a NUL byte, which git cannot take")
 
 // ErrArgTooLong: the command line or the environment of a child does not fit
 // what the system lets exec take (E2BIG). On Linux one argument or variable
-// may not reach 128 KiB, and all of them together are limited too. A value
+// may not reach 32 pages (128 KiB with 4 KiB pages), and all of them together
+// are limited too. A value
 // that a client sent can reach it, so callers answer it as a limit on the
 // request, not as an internal error. git was not started.
 var ErrArgTooLong = errors.New("a value is too long to pass to git")

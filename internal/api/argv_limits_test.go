@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -22,6 +23,16 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/gitread"
 )
+
+// alRequireArgLimit skips a test that needs the 128 KiB limit of one argument:
+// Linux allows 32 pages per argument (MAX_ARG_STRLEN), which is 128 KiB with
+// 4 KiB pages. Other systems have another limit, and 200,000 bytes may fit.
+func alRequireArgLimit(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" || os.Getpagesize() != 4096 {
+		t.Skipf("the limit of one argument is 128 KiB only on Linux with 4 KiB pages (page size %d)", os.Getpagesize())
+	}
+}
 
 // alKinds names the hostile values of alValues in the order of alWant.
 var alKinds = [3]string{"long", "long path", "NUL"}
@@ -110,6 +121,7 @@ func alJSON(t *testing.T, e *testEnv, method, path, token string, body any) (int
 // TestRequestValuesGitCannotTake sends each hostile value in each field
 // that reaches git, on the read routes and the ref routes.
 func TestRequestValuesGitCannotTake(t *testing.T) {
+	alRequireArgLimit(t)
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
 		fx := coreSeedFixture(t, e, org)
@@ -210,6 +222,7 @@ func TestRequestValuesGitCannotTake(t *testing.T) {
 // TestMergeValuesGitCannotTake covers the merge route: the commit message
 // and the identities of the merge commit.
 func TestMergeValuesGitCannotTake(t *testing.T) {
+	alRequireArgLimit(t)
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wmServer(t, e)
 		fx := wmSeedFixture(t, e)
@@ -246,6 +259,7 @@ func TestMergeValuesGitCannotTake(t *testing.T) {
 // TestCommitPackValuesGitCannotTake covers the commit-pack route: the commit
 // message, the identities, and a file path.
 func TestCommitPackValuesGitCannotTake(t *testing.T) {
+	alRequireArgLimit(t)
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)
 		_, writeTok, _ := wctRepo(t, e)
@@ -283,6 +297,10 @@ func TestCommitPackValuesGitCannotTake(t *testing.T) {
 					resp, raw := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
 					if want := alWant["commit-pack "+field][i]; resp.StatusCode != want {
 						t.Fatalf("status %d, want %d: %.300s", resp.StatusCode, want, raw)
+					}
+					if resp.StatusCode == http.StatusBadRequest {
+						// A 400 of this route is a result envelope, whichever value caused it.
+						wctRequireFail(t, resp, raw, http.StatusBadRequest, "invalid")
 					}
 				})
 			}
@@ -368,6 +386,7 @@ func TestWriteCommitMessage(t *testing.T) {
 // TestLongCommitMessageRoundTrips merges with a message over the limit of one
 // argument and reads the commit back whole.
 func TestLongCommitMessageRoundTrips(t *testing.T) {
+	alRequireArgLimit(t)
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wmServer(t, e)
 		fx := wmSeedFixture(t, e)
