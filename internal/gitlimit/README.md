@@ -11,9 +11,11 @@ Shared admission and process control for git subprocesses. It provides a slot po
 - `ReadSlots` — process-wide pool shared by JSON git reads and admitted maintenance [gitlimit.go:ReadSlots]
 - `TryAdmitMaintenance` — non-blocking admission of one maintenance job; returns a release func [gitlimit.go:TryAdmitMaintenance]
 - `ErrStopping`, `Start`, `Wait`, `Run`, `Output`, `CombinedOutput`, `Stopping`, `StopChildren` — tracked git child lifecycle [children.go:Start]
+- `CommandLine`, `TailBuffer` — the git command line and the stderr tail that an error quotes, bounded to 4,096 bytes and the last 64 KiB [errtext.go:CommandLine]
 - `HeapLimitSupported`, `Command`, `HeapFailure` — heap cap support (Linux: `/bin/sh` wrapper with `ulimit -d`; other platforms: no cap) and heap-failure classification [heaplimit_linux.go:Command] [heaplimit_other.go:Command]
 
 ## Invariants
+- `CommandLine` quotes a command of up to 4,096 bytes whole and cuts a longer one at a rune boundary, with its size. `TailBuffer` keeps the last 64 KiB [errtext.go:CommandLine]
 - `NewSlots` panics unless n > 0, 0 < perKey <= n, and wait >= 0 [gitlimit.go:NewSlots]
 - `Release` panics unless the key holds a slot; `RepoKey` panics on an empty repo ID [gitlimit.go:Release]
 - `TryAdmitMaintenance` takes the maintenance permit first, releases it if `ReadSlots` is full, and panics on a second release call [gitlimit.go:TryAdmitMaintenance]

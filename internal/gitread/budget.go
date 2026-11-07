@@ -11,7 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/gitlimit"
 )
@@ -44,15 +43,6 @@ const (
 	// hit HeavyHeapBytes part-way; callers check sizes up front instead.
 	MaxBlobBytes int64 = 100 << 20
 
-	// stderrKeepBytes bounds the stderr kept per child (its tail: git
-	// prints its fatal message last).
-	stderrKeepBytes = 64 << 10
-	// maxErrArgvBytes bounds the git command line that errors quote. An
-	// argv can be request-sized (a grep pattern, a list of paths, a commit
-	// message; past 128 KiB, exec fails with E2BIG), and these errors reach
-	// the server's log. 4096 keeps a command with any one path (PATH_MAX on
-	// Linux) whole.
-	maxErrArgvBytes = 4096
 	// childWaitDelay bounds how long Wait may block on git's output pipes
 	// after git is killed (exec.Cmd.WaitDelay).
 	childWaitDelay = 2 * time.Second
@@ -305,22 +295,6 @@ func (s *stopWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// TailBuffer is a stderr sink that keeps only the last stderrKeepBytes (64
-// KiB) written to it: git prints its fatal message last, and the rest must
-// not grow an error (and the log record that quotes it) without bound.
-type TailBuffer struct{ b []byte }
-
-func (t *TailBuffer) Write(p []byte) (int, error) {
-	t.b = append(t.b, p...)
-	if over := len(t.b) - stderrKeepBytes; over > 0 {
-		t.b = append(t.b[:0], t.b[over:]...)
-	}
-	return len(p), nil
-}
-
-// String returns the kept tail without surrounding white space.
-func (t *TailBuffer) String() string { return strings.TrimSpace(string(t.b)) }
-
 // Cmd is one read-side git child for Run.
 type Cmd struct {
 	Class Class
@@ -380,7 +354,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
 	assertf(len(c.Args) > 0, "Run: no git args")
-	name := CommandLine(c.Args)
+	name := gitlimit.CommandLine(c.Args) // bounded: the errors below reach the log
 
 	b := BudgetFrom(ctx)
 	var heap int64 // no Budget (write endpoints): no limits at all
@@ -411,7 +385,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	cmd.Env = childEnv(c.Env)
 	cmd.Stdin = c.Stdin
 	cmd.WaitDelay = childWaitDelay
-	var stderr TailBuffer
+	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
 	var out *limitedBuffer
 	var stream *stopWriter
@@ -441,18 +415,4 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 		return stdout, fmt.Errorf("%s: %w (%d bytes): %s", name, ErrMemoryLimit, heap, msg)
 	}
 	return stdout, fmt.Errorf("%s: %w: %s", name, err, msg)
-}
-
-// CommandLine is the git command line that an error quotes. Past
-// maxErrArgvBytes it keeps the head, cut at a rune boundary, and the size.
-func CommandLine(args []string) string {
-	name := "git " + strings.Join(args, " ")
-	if len(name) <= maxErrArgvBytes {
-		return name
-	}
-	cut := maxErrArgvBytes
-	for cut > maxErrArgvBytes-utf8.UTFMax && !utf8.RuneStart(name[cut]) {
-		cut--
-	}
-	return fmt.Sprintf("%s... (%d bytes)", name[:cut], len(name))
 }

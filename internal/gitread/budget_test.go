@@ -314,7 +314,7 @@ func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 
 // Run's errors name the git command, and they reach the server's log. An
 // argv can be request-sized (a grep pattern, a list of paths), so past
-// maxErrArgvBytes the error keeps the command's head and its size.
+// 4096 bytes the error keeps the command's head and its size.
 func TestRunErrorBoundsTheArgv(t *testing.T) {
 	fakeGit(t, "exit 1")
 	run := func(args ...string) error {
@@ -336,40 +336,14 @@ func TestRunErrorBoundsTheArgv(t *testing.T) {
 		{"200 KiB", strings.Repeat("a", 200<<10)},
 	} {
 		err := run("grep", "-e", tc.arg).Error()
-		if len(err) > maxErrArgvBytes+512 {
-			t.Errorf("%s argument: the error is %d bytes, want at most %d", tc.name, len(err), maxErrArgvBytes+512)
+		if len(err) > 4096+512 {
+			t.Errorf("%s argument: the error is %d bytes, want at most %d", tc.name, len(err), 4096+512)
 		}
 		if size := fmt.Sprintf("... (%d bytes)", len("git grep -e ")+len(tc.arg)); !strings.Contains(err, size) {
 			t.Errorf("%s argument: the error does not give the command's size %q", tc.name, size)
 		}
 		if !utf8.ValidString(err) {
 			t.Errorf("%s argument: the error is not valid UTF-8 (a rune split at the cut)", tc.name)
-		}
-	}
-}
-
-// CommandLine quotes a command of up to 4096 bytes whole, so a command
-// with one PATH_MAX path stays readable, and cuts a longer one at a rune
-// boundary, at most 3 bytes before the cap, with the full size after it.
-func TestCommandLineCut(t *testing.T) {
-	const head = "git grep -e "
-	for _, tc := range []struct {
-		name string
-		arg  string
-		kept int // bytes of the command kept; 0 keeps it whole
-	}{
-		{"4096 bytes", strings.Repeat("a", 4096-len(head)), 0},
-		{"4097 bytes", strings.Repeat("a", 4097-len(head)), 4096},
-		{"3-byte rune across the cut", strings.Repeat("a", 4094-len(head)) + "€€", 4094},
-		{"4-byte rune across the cut", strings.Repeat("a", 4093-len(head)) + "😀😀", 4093},
-	} {
-		name := head + tc.arg
-		want := name
-		if tc.kept > 0 {
-			want = fmt.Sprintf("%s... (%d bytes)", name[:tc.kept], len(name))
-		}
-		if got := CommandLine([]string{"grep", "-e", tc.arg}); got != want {
-			t.Errorf("%s: CommandLine kept %d bytes, want %d (%.40q)", tc.name, strings.Index(got, "... ("), tc.kept, got[max(0, len(got)-40):])
 		}
 	}
 }
