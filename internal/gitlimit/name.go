@@ -33,7 +33,7 @@ func Name(args []string) string {
 	return b.String()
 }
 
-// Clip bounds a value that goes into an error message, and so into a log line.
+// Clip bounds a value that goes into an error message or a log line.
 // A value of at most maxNameArgBytes is returned as it is. A longer one is cut
 // at maxNameArgBytes, at a character boundary, and followed by its length.
 func Clip(s string) string {

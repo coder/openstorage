@@ -33,7 +33,7 @@ func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, 
 	if s.writeGitLimitErr(w, r, op, err) {
 		return
 	}
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Error("internal error", "op", op, "method", r.Method, "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 

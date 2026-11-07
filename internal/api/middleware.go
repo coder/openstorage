@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 )
 
@@ -30,7 +31,7 @@ func recoverPanics(logger *slog.Logger) middleware {
 					panic(rec)
 				}
 				logger.Error("panic in handler",
-					"method", r.Method, "path", r.URL.Path,
+					"method", r.Method, "path", logPath(r),
 					"panic", rec, "stack", string(debug.Stack()))
 				// Best effort: if the handler already started the response,
 				// this is a no-op superfluous WriteHeader.
@@ -67,6 +68,11 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+// logPath is the request path as a log line carries it. A client chooses the
+// path, and a request line can hold 1 MiB, so the log gets at most
+// gitlimit.Clip of it.
+func logPath(r *http.Request) string { return gitlimit.Clip(r.URL.Path) }
+
 // logRequests logs one line per request: method, path, status, duration.
 func logRequests(logger *slog.Logger) middleware {
 	assertf(logger != nil, "logRequests: nil logger")
@@ -80,7 +86,7 @@ func logRequests(logger *slog.Logger) middleware {
 				status = http.StatusOK // handler wrote nothing
 			}
 			logger.Info("http request",
-				"method", r.Method, "path", r.URL.Path,
+				"method", r.Method, "path", logPath(r),
 				"status", status, "duration", time.Since(start))
 		})
 	}

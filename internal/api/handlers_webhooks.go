@@ -63,7 +63,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, verifier auth.Verifier, org strin
 func (h *webhooksAPI) internalErr(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil, "internalErr called with nil error")
 	assertf(op != "", "internalErr called with empty op")
-	h.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	h.logger.Error("internal error", "op", op, "method", r.Method, "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 

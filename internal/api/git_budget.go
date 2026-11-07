@@ -238,7 +238,7 @@ func (s *server) writeGitLimitErr(w http.ResponseWriter, r *http.Request, op str
 	default:
 		return false
 	}
-	s.logger.Warn("git read limit", "op", op, "method", r.Method, "path", r.URL.Path, "status", status, "err", err)
+	s.logger.Warn("git read limit", "op", op, "method", r.Method, "path", logPath(r), "status", status, "err", err)
 	writeErr(w, status, msg)
 	return true
 }

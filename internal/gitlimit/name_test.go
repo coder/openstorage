@@ -24,6 +24,8 @@ func TestName(t *testing.T) {
 		{"empty argument", []string{"cat-file", ""}, "git cat-file "},
 		{"an argument at the limit is printed whole", []string{"x", exact}, "git x " + exact},
 		{"an argument over the limit is cut and counted", []string{"x", over}, "git x " + over[:maxNameArgBytes] + "...(" + strconv.Itoa(maxNameArgBytes+1) + " bytes)"},
+		// The expectation does not use maxNameArgBytes: it pins the 256.
+		{"the limit is 256 bytes", []string{"x", strings.Repeat("a", 1000)}, "git x " + strings.Repeat("a", 256) + "...(1000 bytes)"},
 		{"a huge argument", []string{"grep", huge, "--"}, "git grep " + huge[:maxNameArgBytes] + "...(200000 bytes) --"},
 		{"the arguments at the limit are all printed", many[:maxNameArgs], "git " + strings.Join(many[:maxNameArgs], " ")},
 		{"one more argument is counted", many[:maxNameArgs+1], "git " + strings.Join(many[:maxNameArgs], " ") + " ...(1 more)"},
@@ -55,10 +57,13 @@ func TestNameCutsAtACharacterBoundary(t *testing.T) {
 }
 
 // Whatever the arguments, the name has a size that does not depend on them.
+// The arguments share one string: Name reads only its length and its first
+// maxNameArgBytes bytes.
 func TestNameIsBounded(t *testing.T) {
+	arg := strings.Repeat("z", 200_000)
 	args := make([]string, 5_000)
 	for i := range args {
-		args[i] = strings.Repeat("z", 200_000)
+		args[i] = arg
 	}
 	const bound = (maxNameArgs+1)*(maxNameArgBytes+40) + 4
 	if got := Name(args); len(got) > bound {
