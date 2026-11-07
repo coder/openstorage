@@ -37,13 +37,11 @@ func srRepo(t *testing.T) (repo, commit string) {
 	if out, err := srGit(t, "", "init", "-q", "--bare", repo); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)
 	}
-	lease, err := gitlimit.OpenLease(t.Context(), repo)
-	if err != nil {
+	if err := gitlimit.CreateEpoch(repo); err != nil {
 		t.Fatal(err)
 	}
-	_ = lease.Close()
 	srSetAge(t, filepath.Join(repo, gitlimit.EpochFile), 3*time.Hour)
-	commit, err = srGit(t, repo, "commit-tree", srEmptyTree, "-m", "x")
+	commit, err := srGit(t, repo, "commit-tree", srEmptyTree, "-m", "x")
 	if err != nil {
 		t.Fatalf("commit-tree: %v: %s", err, commit)
 	}
@@ -254,42 +252,68 @@ func TestCleanStaleRefLocksIgnoresYoungLocksWithoutTheLease(t *testing.T) {
 }
 
 // A lock that is not newer than the lease epoch may belong to a git that
-// held no lease: it stays for the manual runbook. The same holds when the
-// repository has no epoch yet, because the cleanup then creates it.
+// held no lease: it stays for the manual runbook.
 func TestCleanStaleRefLocksKeepsLocksOlderThanTheEpoch(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		setup func(t *testing.T, repo string)
-	}{
-		{"lock older than the epoch", func(t *testing.T, repo string) {
-			srSetAge(t, filepath.Join(repo, gitlimit.EpochFile), time.Hour)
-		}},
-		{"no epoch yet", func(t *testing.T, repo string) {
-			if err := os.Remove(filepath.Join(repo, gitlimit.EpochFile)); err != nil {
-				t.Fatal(err)
-			}
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			repo, _ := srRepo(t)
-			lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
-			tc.setup(t, repo)
-			kept := srCount("kept")
+	repo, _ := srRepo(t)
+	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+	srSetAge(t, filepath.Join(repo, gitlimit.EpochFile), time.Hour)
+	kept := srCount("kept")
 
-			res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if res.Old != 1 || res.Removed != 0 || res.Outcome != metrics.StaleRefLockKept {
-				t.Fatalf("result = %+v, want 1 old, 0 removed, outcome kept", res)
-			}
-			if !srExists(t, lock) {
-				t.Fatal("a lock older than the epoch was removed")
-			}
-			if got := srCount("kept") - kept; got != 1 {
-				t.Fatalf("kept outcomes counted = %v, want 1", got)
-			}
-		})
+	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Old != 1 || res.Removed != 0 || res.Outcome != metrics.StaleRefLockKept {
+		t.Fatalf("result = %+v, want 1 old, 0 removed, outcome kept", res)
+	}
+	if !srExists(t, lock) {
+		t.Fatal("a lock older than the epoch was removed")
+	}
+	if got := srCount("kept") - kept; got != 1 {
+		t.Fatalf("kept outcomes counted = %v, want 1", got)
+	}
+}
+
+// A repository without an epoch file was created by an older release, or its
+// creation was interrupted before the epoch was written: a git of the older
+// release can still own its locks, and the lease cannot see it. The run keeps
+// every lock, counts kept, logs one runbook line, and neither takes the lease
+// nor writes an epoch (a late epoch would make the older release's locks
+// look newer than it).
+func TestCleanStaleRefLocksKeepsEveryLockOfARepositoryWithoutAnEpoch(t *testing.T) {
+	repo, _ := srRepo(t)
+	if err := os.Remove(filepath.Join(repo, gitlimit.EpochFile)); err != nil {
+		t.Fatal(err)
+	}
+	locks := []string{
+		srLock(t, repo, "refs/heads/x.lock", 2*time.Hour),
+		srLock(t, repo, "packed-refs.lock", 2*time.Hour),
+	}
+	lines := srLogLines(t, repo)
+	kept := srCount("kept")
+
+	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Old != 2 || res.Removed != 0 || res.Outcome != metrics.StaleRefLockKept || !res.NoEpoch {
+		t.Fatalf("result = %+v, want 2 old, 0 removed, outcome kept, no epoch", res)
+	}
+	for _, lock := range locks {
+		if !srExists(t, lock) {
+			t.Fatalf("%s was removed from a repository without an epoch", lock)
+		}
+	}
+	for _, name := range []string{gitlimit.EpochFile, gitlimit.LeaseFile, staleLocksDir} {
+		if srExists(t, filepath.Join(repo, name)) {
+			t.Fatalf("the run created %s in a repository without an epoch", name)
+		}
+	}
+	if got := srCount("kept") - kept; got != 1 {
+		t.Fatalf("kept outcomes counted = %v, want 1", got)
+	}
+	if l := lines(); len(l) != 1 || !strings.Contains(l[0], "an older release created this repository") || !strings.Contains(l[0], "Stale ref locks") {
+		t.Fatalf("log lines = %q, want one runbook line", l)
 	}
 }
 
@@ -460,11 +484,7 @@ func TestCleanStaleRefLocksCountsAFailedRunAsKept(t *testing.T) {
 			}
 		}, "not a regular file"},
 		{"the lease cannot be opened", func(t *testing.T, repo string) {
-			p := filepath.Join(repo, gitlimit.LeaseFile)
-			if err := os.Remove(p); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Mkdir(p, 0o700); err != nil {
+			if err := os.Mkdir(filepath.Join(repo, gitlimit.LeaseFile), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		}, "take the git lease"},
