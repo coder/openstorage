@@ -18,6 +18,7 @@ import tempfile
 import unittest
 
 WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "image.yml"
+REFUSE = "Refuse to replace an existing version tag"
 PROMOTE = "Give the checked digests the version tag"
 CHECK = "Check that the index holds exactly the checked digests"
 
@@ -213,6 +214,15 @@ class ImageWorkflowStepsTest(unittest.TestCase):
         bound = [line for line in publish if re.match(r"(IMAGE|TAG|VERSION|COMMIT):", line)]
         assert sorted(bound) == ["COMMIT: ${{ needs.resolve.outputs.commit }}", "TAG: ${{ needs.resolve.outputs.tag }}",
                                  "VERSION: ${{ needs.resolve.outputs.version }}"], f"the publish job binds {bound}"
+        # The tag may be created only after the existing-tag check, and the later jobs read the digest that this
+        # job reports.
+        order = [line.strip()[len("- name: "):] for line in job_lines(text, "publish") if line.strip().startswith("- name: ")]
+        assert [n for n in order if n in (REFUSE, PROMOTE, CHECK)] == [REFUSE, PROMOTE, CHECK], f"publish steps run as {order}"
+        assert '[ "$code" = 404 ]' in run_text(text, REFUSE), "the existing-tag check no longer requires a 404"
+        assert [line.strip() for line in job_lines(text, "publish")].count("digest: ${{ steps.promote.outputs.digest }}") == 1, \
+            "the publish job does not report the promote step's digest"
+        assert [line.strip() for line in job_lines(text, "verify-published")].count("DIGEST: ${{ needs.publish.outputs.digest }}") == 1, \
+            "verify-published does not read the publish job's digest"
         assert "id: promote" in [line.strip() for line in step_lines(text, PROMOTE)], "promote step lost its id"
         assert "DIGEST: ${{ steps.promote.outputs.digest }}" in [line.strip() for line in step_lines(text, CHECK)], \
             "check step does not read the promote step's digest output"
