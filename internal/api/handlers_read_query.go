@@ -74,11 +74,15 @@ func (s *server) resolveQueryRepo(w http.ResponseWriter, r *http.Request) (meta.
 // Boolean query params are parsed via coreBoolParam (handlers_read_core.go)
 // — one literal "true"/"false" dialect for the whole read surface.
 
-// cleanPathParams validates repeatable `path` filters: no empties, no NULs.
+// cleanPathParams validates repeatable `path` filters: no empties, no
+// NULs, none outside the repository.
 func cleanPathParams(paths []string) ([]string, error) {
 	for _, p := range paths {
 		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
 			return nil, fmt.Errorf("invalid path filter %q", p)
+		}
+		if pathLeavesRepo(p) {
+			return nil, fmt.Errorf("path filter %q is outside the repository", p)
 		}
 	}
 	return paths, nil
@@ -486,13 +490,7 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	if strings.ContainsRune(path, 0) {
-		// exec refuses a NUL in an argument, and no path holds one.
-		writeErr(w, http.StatusBadRequest, "path must not contain a NUL byte")
-		return
-	}
-	if pathLeavesRepo(path) {
-		writeErr(w, http.StatusBadRequest, "path is outside the repository")
+	if !readPathOK(w, path) {
 		return
 	}
 	ephemeral, err := coreBoolParam(q, "ephemeral")
@@ -776,6 +774,12 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	for i, p := range body.Paths {
 		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
 			writeInvalidField(w, "paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p))
+			return
+		}
+		// git gets the entry without its trailing slash: "/" alone is
+		// no pathspec.
+		if trimmed := strings.TrimSuffix(p, "/"); trimmed != "" && pathLeavesRepo(trimmed) {
+			writeInvalidField(w, "paths."+strconv.Itoa(i), "is outside the repository", fmt.Sprintf("paths entry %q is outside the repository", p))
 			return
 		}
 	}
