@@ -646,7 +646,8 @@ directory/file relative of it (`refs/heads/a` and `refs/heads/a/b`), then fails 
 **503** and `Retry-After: 1`. When the read of the repository's upstream link fails, a ref
 write from a token that passes the gates above fails with a plain **500** on any
 repository, forwarding or not: the write reads the link before it knows whether the
-repository forwards. Any other failure to take the hold, or a failed write of the forward
+repository forwards. A write to the ephemeral namespace is the exception: it takes no
+hold and reads no link. Any other failure to take the hold, or a failed write of the forward
 request, also fails the write with a plain **500**. In each case the ref stays unchanged.
 A write that loses its compare-and-swap (409)
 has recorded its request already, so the repository gets one forward run with nothing new
