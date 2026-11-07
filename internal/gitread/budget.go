@@ -47,10 +47,11 @@ const (
 	// stderrKeepBytes bounds the stderr kept per child (its tail: git
 	// prints its fatal message last).
 	stderrKeepBytes = 64 << 10
-	// maxErrArgvBytes bounds the git command line that errors quote.
-	// An argv can be request-sized (a grep pattern, a list of paths, a
-	// commit message; past 128 KiB, exec fails with E2BIG), and these
-	// errors reach the server's log. 4096 keeps a command with any one path (PATH_MAX on Linux) whole.
+	// maxErrArgvBytes bounds the git command line that errors quote. An
+	// argv can be request-sized (a grep pattern, a list of paths, a commit
+	// message; past 128 KiB, exec fails with E2BIG), and these errors reach
+	// the server's log. 4096 keeps a command with any one path (PATH_MAX on
+	// Linux) whole.
 	maxErrArgvBytes = 4096
 	// childWaitDelay bounds how long Wait may block on git's output pipes
 	// after git is killed (exec.Cmd.WaitDelay).
