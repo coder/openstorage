@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -299,6 +300,30 @@ func TestPreReceiveHidesStepErrors(t *testing.T) {
 		err := preReceiveCase{pack: true}.run(t)
 		checkFailedStep(t, err, readRecords(t, records), "pre-receive", "usage floor for", canary)
 	})
+	t.Run("usage floor after a stale floor", func(t *testing.T) {
+		// serve's minted floor is trusted while the floor generation
+		// still matches, and here the generation counts an expired
+		// reservation row. The reserve prunes that row inside its
+		// transaction, so its recheck sees a moved generation and the
+		// hook lists a second floor. The usage counter fails only while
+		// the row exists: the reserve reads it after the prune, the
+		// second floor after the reserve rolled the prune back.
+		canary := canaryTable()
+		group, base := blob.QuotaRepoGroup("t-refusal")[0], BaseRepo("t-refusal")
+		const stale = "canary-stale-reservation"
+		staleRow := "EXISTS (SELECT 1 FROM pack_reservations WHERE key = '" + stale + "')"
+		records := hookEnv(t, canarySQLite(t,
+			"INSERT INTO pack_reservations (key, repo, bytes, owner, created_at) VALUES ('"+stale+"', '"+group+"', 1, 'another push', 0)",
+			"DROP TABLE lfs_adoption_gens",
+			"CREATE VIEW lfs_adoption_gens AS SELECT '"+base+"' AS repo, "+staleRow+" AS gen",
+			"DROP TABLE pack_usage",
+			"CREATE VIEW pack_usage AS SELECT '"+group+"' AS repo, CASE WHEN "+staleRow+" THEN json_extract('{}', '"+canary+"') ELSE 0 END AS bytes"))
+		blobDir(t)
+		t.Setenv(EnvPackQuota, quota)
+		t.Setenv(EnvUsageFloor, fmt.Sprintf("0:%d:1", time.Now().Unix()))
+		err := preReceiveCase{pack: true}.run(t)
+		checkFailedStep(t, err, readRecords(t, records), "pre-receive", "pre-receive: usage floor for", canary)
+	})
 	t.Run("reserve pack bytes", func(t *testing.T) {
 		canary := canaryTable()
 		records := hookEnv(t, canarySQLite(t, "CREATE TRIGGER "+canary+" BEFORE INSERT ON pack_reservations BEGIN SELECT RAISE(ABORT, '"+canary+"'); END"))
@@ -368,4 +393,51 @@ func TestPreReceiveHidesStepErrors(t *testing.T) {
 		}}.run(t)
 		checkFailedStep(t, err, readRecords(t, records), "pre-receive", "pre-receive: verify", canary)
 	})
+}
+
+// dfFallbackStore is a ref store without the batch D/F probe, so
+// authorityDoomedCreations takes its per-name probes. No store that
+// ref.Open returns lacks the batch probe, so no hook run reaches them.
+type dfFallbackStore struct {
+	ref.RefStore
+	getErr, listErr error
+}
+
+func (s dfFallbackStore) GetRef(context.Context, string, string) (string, error) {
+	if s.getErr != nil {
+		return "", s.getErr
+	}
+	return "", ref.ErrNotFound
+}
+
+func (s dfFallbackStore) ListRefsAfter(context.Context, string, string, int) ([]ref.RefEntry, error) {
+	return nil, s.listErr
+}
+
+// Each per-name D/F probe fails with a canary in its error: pre-receive
+// would show the pusher only the fixed line and record the step and the
+// canary.
+func TestAuthorityDFProbesHideStoreErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		st   func(canary error) dfFallbackStore
+	}{
+		{"ancestor probe", func(c error) dfFallbackStore { return dfFallbackStore{getErr: c} }},
+		{"descendant probe", func(c error) dfFallbackStore { return dfFallbackStore{listErr: c} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			canary := canaryTable()
+			records := hookEnv(t, canarySQLite(t))
+			_, err := authorityDoomedCreations(t.Context(), tc.st(errors.New(canary)), "t-refusal", []string{"refs/heads/x"})
+			if err == nil {
+				t.Fatal("authorityDoomedCreations = nil error; want the probe's failure")
+			}
+			// pre-receive wraps it, and RunHook maps it, like this.
+			err = fmt.Errorf("pre-receive: authority D/F probe: %w", err)
+			if !ShownToPusher(err) {
+				err = hookFailure("pre-receive", err)
+			}
+			checkFailedStep(t, err, readRecords(t, records), "pre-receive", "directory/file probe for refs/heads/x:", canary)
+		})
+	}
 }
