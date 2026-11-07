@@ -259,7 +259,6 @@ func main() {
 	hydrate := load("internal/githttp/hydrate.go")
 	hook := load("internal/githttp/hook.go")
 	server := load("internal/githttp/server.go")
-	serve := load("cmd/openstorage/main.go")
 
 	sqlBegin := sqlEvt.fn("SQLite", "beginPush")
 	walBegin := walEvt.fn("S3WAL", "beginPush")
@@ -487,13 +486,13 @@ func main() {
 	mb.need(rp.IsValid() && cg.IsValid() && rp < cg, "updateHook reserves the ref's hold (reservePushHoldsCovering) before store.CASRefGen")
 	facts = append(facts, mb)
 
-	// StrictSnapshot: a local push run's loopback fetch refuses a held ref
+	// StrictSnapshot: a push run's loopback fetch refuses a held ref
 	// whose cached value is older than the authority (423 Locked), and the
 	// run restores its request instead of forwarding the stale ref.
 	ss := newFact("StrictSnapshot")
 	sh := server.fn("Server", "hydrate")
-	ss.need(assigned(server.assigns(sh.Body), "strict", `s.StrictSyncFetch && service == "upload-pack" && claims.SyncClaim != ""`),
-		`Server.hydrate computes strict := s.StrictSyncFetch && service == "upload-pack" && claims.SyncClaim != ""`)
+	ss.need(assigned(server.assigns(sh.Body), "strict", `service == "upload-pack" && claims.SyncClaim != ""`),
+		`Server.hydrate computes strict := service == "upload-pack" && claims.SyncClaim != ""`)
 	strictCall := false
 	for _, c := range server.calls(sh.Body) {
 		if c.fun == "hydrateRefs" && len(c.node.Args) > 0 && server.text(c.node.Args[len(c.node.Args)-1]) == "strict" {
@@ -543,7 +542,7 @@ func main() {
 	ss.need(wraps, "transferPush wraps errHeldRefStale when heldRefStale(stderr)")
 	heldRestore := token.NoPos
 	ast.Inspect(runPush.Body, func(n ast.Node) bool {
-		if is, ok := n.(*ast.IfStmt); ok && push.text(is.Cond) == "w.Local != nil && errors.Is(runErr, errHeldRefStale)" {
+		if is, ok := n.(*ast.IfStmt); ok && push.text(is.Cond) == "errors.Is(runErr, errHeldRefStale)" {
 			if body := push.text(is.Body); strings.Contains(body, "w.restoreLocal(") && strings.Contains(body, "meta.OutcomeRestore") {
 				heldRestore = is.Pos()
 			}
@@ -552,16 +551,6 @@ func main() {
 	})
 	ss.need(heldRestore.IsValid() && lo.IsValid() && heldRestore < lo,
 		"Worker.RunPush restores through w.restoreLocal with meta.OutcomeRestore on errHeldRefStale, before localPushOutcome")
-	strictServe := false
-	ast.Inspect(serve.file, func(n ast.Node) bool {
-		if as, ok := n.(*ast.AssignStmt); ok {
-			for _, a := range serve.assigns(as) {
-				strictServe = strictServe || (a.lhs == "srv.StrictSyncFetch" && strings.HasPrefix(a.rhs, "meta.LocalSchedule("))
-			}
-		}
-		return true
-	})
-	ss.need(strictServe, "serve sets srv.StrictSyncFetch from meta.LocalSchedule(...)")
 	facts = append(facts, ss)
 
 	// RestMarkBeforeCas: serve's REST writes on the local schedule hold the
