@@ -90,7 +90,10 @@ of upstream's schemas.
 ### `repo.push_upstream.started` / `repo.push_upstream.succeeded` / `repo.push_upstream.failed`
 
 open.storage extension for outbound push-upstream runs (see
-[Upstream sync](http-api.md#upstream-sync)). Upstream has no outbound-run event. The body
+[Upstream sync](http-api.md#upstream-sync)). Upstream has no outbound-run event. A run
+sends `repo.push_upstream.started` once its loopback fetch has the snapshot it forwards,
+before it pushes to the upstream. A run that fails before or at that fetch sends
+`started` right before `failed`. The body
 has the `repo.sync.*` fields, with `type` set to the event name, plus:
 
 | Field | Meaning |
