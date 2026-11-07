@@ -96,7 +96,7 @@ cache, then records `RequestPush`, and the hold ends when its CAS returns.
 A failed read, hold or intent write refuses that REST write, except a
 missing upstream link (`meta.ErrNotFound`, at the read or at the intent
 write), which leaves nothing to forward. The intent after the CAS stays,
-and still does the pull marking. A local push run's
+and still does the pull marking. A push run's
 loopback fetch fails with HTTP 423 when its hydrate would skip a push-held
 ref whose cached value is older than the authority, and the run ends with
 `restore`, as after a failed publication wait.
