@@ -412,10 +412,17 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 // (`git check-ref-format`, no repository needed). validBranchName's
 // conservative charset is necessary but not sufficient — git additionally
 // rejects e.g. trailing dots — and only git's own verdict guarantees the
-// later `symbolic-ref HEAD <target>` succeeds.
-func validRefFormat(ctx context.Context, target string) bool {
+// later `symbolic-ref HEAD <target>` succeeds. Only git's exit 1 means
+// that git rejects the name. Any other failure (a killed git, a failed
+// exec) says nothing about the name and is returned.
+func validRefFormat(ctx context.Context, target string) (bool, error) {
 	assertf(strings.HasPrefix(target, "refs/"), "validRefFormat: unqualified target %q", target)
-	return gitlimit.Run(exec.CommandContext(ctx, "git", "check-ref-format", target)) == nil
+	err := gitlimit.Run(exec.CommandContext(ctx, "git", "check-ref-format", target))
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // policyDeniesDefaultBranchChange reports whether the token's ref policies
@@ -513,7 +520,15 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	// surface until another PATCH repairs the row.
 	target := githttp.HeadTarget(branch)
 	shortName := strings.TrimPrefix(branch, "refs/heads/")
-	if strings.HasPrefix(shortName, "refs/") || !validBranchName(shortName) || !validRefFormat(r.Context(), target) {
+	valid := !strings.HasPrefix(shortName, "refs/") && validBranchName(shortName)
+	if valid {
+		var err error
+		if valid, err = validRefFormat(r.Context(), target); err != nil {
+			s.internalErr(w, r, "check default_branch with git", err)
+			return
+		}
+	}
+	if !valid {
 		writeInvalidField(w, "default_branch", "is not a valid branch name", "invalid default_branch")
 		return
 	}

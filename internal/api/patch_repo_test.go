@@ -154,6 +154,16 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 				requireEnvelope(t, resp, body)
 			})
 		}
+		// Only git's exit 1 says that git rejects the name.
+		for _, how := range []string{"128", "kill"} {
+			t.Run("git "+how+" on check-ref-format is 500, not 400", func(t *testing.T) {
+				gitFailsOnArg(t, "refs/heads/feature", how)
+				resp, body := e.doReq(t, http.MethodPatch, "/api/v1/repo", writeTok, []byte(`{"default_branch":"feature"}`), "")
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("PATCH = %d, want 500: %s", resp.StatusCode, body)
+				}
+			})
+		}
 
 		// Scope gate: git:read+git:write without repo:write -> 403.
 		gitTok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url,
