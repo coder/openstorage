@@ -1060,18 +1060,34 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 
 	// The note target must exist (any object kind, per git notes; a
-	// revision-resolved objectSHA re-verifies trivially).
+	// revision-resolved objectSHA re-verifies trivially). rev-parse
+	// --verify --quiet exits 1 for a missing object. Any other failure (a
+	// fatal exit, a killed git) says nothing about the object.
 	if _, err := wrefGit(ctx, repoPath, nil, nil,
 		"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
-		writeProblem(w, http.StatusNotFound, codeRefNotFound, "object not found: "+objectSHA)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			writeProblem(w, http.StatusNotFound, codeRefNotFound, "object not found: "+objectSHA)
+			return
+		}
+		s.internalErr(w, r, "verify note object", err)
 		return
 	}
 	// Existence check drives add-vs-existing (409) and delete-missing (404).
 	// The cache repo's notes ref was just synced from the ref authority.
 	noteExists := false
 	if old != "" {
-		if _, err := wrefGit(ctx, repoPath, nil, nil, "notes", "--ref", targetRef, "show", objectSHA); err == nil {
+		_, err := wrefGit(ctx, repoPath, nil, nil, "notes", "--ref", targetRef, "show", objectSHA)
+		var exitErr *exec.ExitError
+		switch {
+		case err == nil:
 			noteExists = true
+		case errors.As(err, &exitErr) && exitErr.ExitCode() == 1:
+			// git notes show exits 1 for an object with no note. Any other
+			// failure (a fatal exit, a killed git) says nothing about it.
+		default:
+			s.internalErr(w, r, "look up the note", err)
+			return
 		}
 	}
 	if action == "add" && noteExists {
