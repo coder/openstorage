@@ -62,7 +62,10 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 		// Errors held in other values, and text under any other key.
 		slog.String("error", "string "+canary), "errs", []error{errors.New("list " + canary)},
 		"st", struct{ E string }{"struct " + canary}, "m", map[string]string{"e": "map " + canary},
-		"sv", stringerCanary{canary}, "detail", "detail "+canary)
+		"sv", stringerCanary{canary}, "detail", "detail "+canary,
+		// An error that is a LogValuer, under a key whose strings the
+		// pusher may read.
+		"ref", valuerError{canary})
 
 	for _, want := range []string{"open ref store failed", "hook=update", "repo=r1", "g.n=3", "second", "w.x=1", "third", "y=2"} {
 		if !strings.Contains(pusher.String(), want) {
@@ -76,10 +79,10 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Fourteen: the With error in both records, one more error each in the
-	// first (attribute, group) and in the second, and nine in the third.
-	if n := strings.Count(string(b), canary); n != 14 {
-		t.Fatalf("the hook-errors file names the canary %d times, want 14: %s", n, b)
+	// Fifteen: the With error in both records, one more error each in the
+	// first (attribute, group) and in the second, and ten in the third.
+	if n := strings.Count(string(b), canary); n != 15 {
+		t.Fatalf("the hook-errors file names the canary %d times, want 15: %s", n, b)
 	}
 	for _, want := range []string{"g.err=", "w.err=", "w.x=1"} {
 		if !strings.Contains(string(b), want) {
@@ -92,8 +95,8 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	if got := strings.Count(logs.String(), "receive-pack r1: hook: "); got != 3 {
 		t.Fatalf("serve logged %d hook records, want 3: %s", got, logs)
 	}
-	if n := strings.Count(logs.String(), canary); n != 14 {
-		t.Fatalf("serve's log names the canary %d times, want 14: %s", n, logs)
+	if n := strings.Count(logs.String(), canary); n != 15 {
+		t.Fatalf("serve's log names the canary %d times, want 15: %s", n, logs)
 	}
 }
 
