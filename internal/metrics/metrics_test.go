@@ -78,6 +78,9 @@ func TestExpositionHasEveryFamilyWithInitializedSeries(t *testing.T) {
 		`openstorage_commit_graph_refresh_total{outcome="timed_out"} `,
 		`openstorage_commit_graph_refresh_total{outcome="canceled"} `,
 		`openstorage_commit_graph_refresh_total{outcome="failed"} `,
+		`openstorage_stale_ref_lock_cleanup_total{outcome="removed"} `,
+		`openstorage_stale_ref_lock_cleanup_total{outcome="busy"} `,
+		`openstorage_stale_ref_lock_cleanup_total{outcome="kept"} `,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("exposition missing series %q", want)
@@ -137,6 +140,7 @@ func TestLabelValuesAreFixed(t *testing.T) {
 		"outcome=written": true, "outcome=written_plain": true, "outcome=skipped_tip_cap": true,
 		"outcome=skipped_busy": true, "outcome=lock_held": true, "outcome=memory_limit": true,
 		"outcome=timed_out": true, "outcome=canceled": true, "outcome=failed": true,
+		"outcome=removed": true, "outcome=busy": true, "outcome=kept": true,
 	}
 	for name, labels := range seriesLabels(t, scrape(t, Handler())) {
 		for l := range labels {
@@ -217,6 +221,7 @@ func TestSignalHelpersIncrement(t *testing.T) {
 		{"openstorage_s3wal_meta_refused_total", map[string]string{"class": "stale"}, func() { S3WALMetaRefused(MetaRefusedStale) }},
 		{"openstorage_job_runs_total", map[string]string{"job": "repack", "result": "error"}, func() { JobRun(JobRepack, ResultError) }},
 		{"openstorage_commit_graph_refresh_total", map[string]string{"outcome": "lock_held"}, func() { CommitGraphRefresh(CommitGraphLockHeld) }},
+		{"openstorage_stale_ref_lock_cleanup_total", map[string]string{"outcome": "busy"}, func() { StaleRefLockCleanup(StaleRefLockBusy) }},
 	} {
 		before := Value(p.name, p.labels)
 		p.fire()

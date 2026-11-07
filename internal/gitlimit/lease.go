@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,8 +33,19 @@ import (
 // runs, and not to reassign descriptor 3 in a hook.
 const LeaseFile = "codestorage.gitlease.lock"
 
+// EpochFile is the name of the lease epoch file, <repo>/EpochFile. The first
+// process that opens a repository's lease creates it, empty and with
+// create-exclusive, so its modification time is the moment a lease-aware
+// process first started git there. A ref lock that is older was made by a git
+// that may hold no lease (a binary from before the lease, or git run by hand),
+// and cleanup keeps it (#490). The file is never removed.
+const EpochFile = "codestorage.gitlease.epoch"
+
 // ErrLeaseBusy: the lease is held exclusively (or, for TryExclusive, shared).
 var ErrLeaseBusy = errors.New("git lease is busy")
+
+// ErrNoEpoch: the repository has no lease epoch file.
+var ErrNoEpoch = errors.New("git lease epoch is missing")
 
 const (
 	// leaseWait bounds how long a git start waits for an exclusive holder.
@@ -64,6 +76,9 @@ type Lease struct {
 // ErrStopping once StopChildren began.
 func OpenLease(repoPath string) (*Lease, error) {
 	assertf(repoPath != "", "OpenLease: empty repoPath")
+	if err := ensureEpoch(repoPath); err != nil {
+		return nil, err
+	}
 	f, err := os.OpenFile(filepath.Join(repoPath, LeaseFile), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open git lease: %w", err)
@@ -94,6 +109,9 @@ func OpenLease(repoPath string) (*Lease, error) {
 // wait. It returns ErrLeaseBusy when the lease is held.
 func TryExclusive(repoPath string) (*Lease, error) {
 	assertf(repoPath != "", "TryExclusive: empty repoPath")
+	if err := ensureEpoch(repoPath); err != nil {
+		return nil, err
+	}
 	f, err := os.OpenFile(filepath.Join(repoPath, LeaseFile), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open git lease: %w", err)
@@ -106,6 +124,35 @@ func TryExclusive(repoPath string) (*Lease, error) {
 		return nil, fmt.Errorf("lock git lease: %w", err)
 	}
 	return &Lease{f: f}, nil
+}
+
+// ensureEpoch creates the epoch file when it is missing.
+func ensureEpoch(repoPath string) error {
+	f, err := os.OpenFile(filepath.Join(repoPath, EpochFile), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	switch {
+	case err == nil:
+		return f.Close()
+	case errors.Is(err, fs.ErrExist):
+		return nil
+	}
+	return fmt.Errorf("create git lease epoch: %w", err)
+}
+
+// LeaseEpoch returns the lease epoch of the repository at repoPath: the
+// modification time of its epoch file (see EpochFile). It fails with
+// ErrNoEpoch when the file is missing, and with another error when it is not
+// a regular file.
+func LeaseEpoch(repoPath string) (time.Time, error) {
+	fi, err := os.Lstat(filepath.Join(repoPath, EpochFile))
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return time.Time{}, ErrNoEpoch
+	case err != nil:
+		return time.Time{}, fmt.Errorf("read git lease epoch: %w", err)
+	case !fi.Mode().IsRegular():
+		return time.Time{}, fmt.Errorf("git lease epoch is not a regular file: %s", fi.Mode())
+	}
+	return fi.ModTime(), nil
 }
 
 // Attach hands the lease to cmd as its descriptor 3. The caller starts cmd

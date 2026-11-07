@@ -4,13 +4,13 @@
 Prometheus metrics for the server on a private registry. The package defines typed enum labels, recorder functions, fixed-surface HTTP instrumentation, the bounded `/metrics` listener, and a test helper that reads series values.
 
 ## Interface
-- Label enums: `Surface` (`SurfaceAPI`, `SurfaceGit`, `SurfaceHealth`), `ContentionScope` (`ScopeRefs`, `ScopeScanState`, `ScopeMeta`), `SizeGuardResult` (`SizeGuardWarn`, `SizeGuardRefuse`), `MetaRefusal` (`MetaRefusedDecode`, `MetaRefusedStale`, `MetaRefusedVanished`, `MetaRefusedForeignNonce`, `MetaRefusedVanishedMark`; `MetaRefusal.String` returns its label value), `Job` (`JobOrphanSweep`, `JobRepack`), `Result` (`ResultSuccess`, `ResultNoop`, `ResultError`), `CommitGraphOutcome` (nine `CommitGraph*` values) [metrics.go:Surface]
-- Recorders: `S3WALContentionExhausted`, `S3WALLeaseRenewalFailed`, `SetS3WALLeaseHeld`, `S3WALManifestSizeGuard`, `S3WALMetaRefused`, `CommitGraphRefresh`, `JobRun` [metrics.go:JobRun]
+- Label enums: `Surface` (`SurfaceAPI`, `SurfaceGit`, `SurfaceHealth`), `ContentionScope` (`ScopeRefs`, `ScopeScanState`, `ScopeMeta`), `SizeGuardResult` (`SizeGuardWarn`, `SizeGuardRefuse`), `MetaRefusal` (`MetaRefusedDecode`, `MetaRefusedStale`, `MetaRefusedVanished`, `MetaRefusedForeignNonce`, `MetaRefusedVanishedMark`; `MetaRefusal.String` returns its label value), `Job` (`JobOrphanSweep`, `JobRepack`), `Result` (`ResultSuccess`, `ResultNoop`, `ResultError`), `CommitGraphOutcome` (nine `CommitGraph*` values), `StaleRefLockOutcome` (`StaleRefLockRemoved`, `StaleRefLockBusy`, `StaleRefLockKept`) [metrics.go:Surface]
+- Recorders: `S3WALContentionExhausted`, `S3WALLeaseRenewalFailed`, `SetS3WALLeaseHeld`, `S3WALManifestSizeGuard`, `S3WALMetaRefused`, `CommitGraphRefresh`, `StaleRefLockCleanup`, `JobRun` [metrics.go:JobRun]
 - `InstrumentHTTP`, `InstrumentMux` — count requests by surface and status class and observe duration; `InstrumentMux` also counts mux-generated redirects [metrics.go:InstrumentMux]
 - `Handler`, `NewServer` — promhttp exposition and the metrics `http.Server` with one `GET /metrics` route [metrics.go:NewServer]
 - `IsUnspecifiedBind` — reports whether a listen address binds all interfaces [metrics.go:IsUnspecifiedBind]
 - `Value` — sums current series values that match labels, for tests [metrics.go:Value]
-- Metric names: `openstorage_http_requests_total`, `openstorage_http_request_duration_seconds`, `openstorage_s3wal_cas_contention_exhausted_total`, `openstorage_s3wal_lease_renewal_failures_total`, `openstorage_s3wal_lease_held`, `openstorage_s3wal_manifest_size_guard_total`, `openstorage_s3wal_meta_refused_total`, `openstorage_commit_graph_refresh_total`, `openstorage_job_runs_total` [metrics.go:httpRequests]
+- Metric names: `openstorage_http_requests_total`, `openstorage_http_request_duration_seconds`, `openstorage_s3wal_cas_contention_exhausted_total`, `openstorage_s3wal_lease_renewal_failures_total`, `openstorage_s3wal_lease_held`, `openstorage_s3wal_manifest_size_guard_total`, `openstorage_s3wal_meta_refused_total`, `openstorage_commit_graph_refresh_total`, `openstorage_stale_ref_lock_cleanup_total`, `openstorage_job_runs_total` [metrics.go:httpRequests]
 
 ## Invariants
 - `name` panics on an out-of-range enum value or an empty label [metrics.go:name]

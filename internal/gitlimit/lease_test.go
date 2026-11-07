@@ -186,3 +186,84 @@ func TestFailedStartReleasesTheLease(t *testing.T) {
 		t.Fatalf("TryExclusive after a failed start = %v", err)
 	}
 }
+
+// The first process that opens a repository's lease creates its epoch, and
+// no later open moves it: a ref lock older than the epoch comes from a git
+// that held no lease.
+func TestTheFirstOpenCreatesTheEpochAndNoLaterOpenMovesIt(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first func(repo string) error
+	}{
+		{"OpenLease", func(repo string) error {
+			l, err := OpenLease(repo)
+			if err == nil {
+				_ = l.Close()
+			}
+			return err
+		}},
+		{"TryExclusive", func(repo string) error {
+			l, err := TryExclusive(repo)
+			if err == nil {
+				_ = l.Close()
+			}
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			if _, err := LeaseEpoch(repo); !errors.Is(err, ErrNoEpoch) {
+				t.Fatalf("LeaseEpoch before any open = %v, want ErrNoEpoch", err)
+			}
+			before := time.Now().Add(-2 * time.Second)
+			if err := tc.first(repo); err != nil {
+				t.Fatal(err)
+			}
+			epoch, err := LeaseEpoch(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if epoch.Before(before) || epoch.After(time.Now().Add(2*time.Second)) {
+				t.Fatalf("epoch %v is not the time of the first open", epoch)
+			}
+
+			old := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+			if err := os.Chtimes(filepath.Join(repo, EpochFile), old, old); err != nil {
+				t.Fatal(err)
+			}
+			for _, open := range []func(string) error{
+				func(repo string) error { l, err := OpenLease(repo); closeLease(l); return err },
+				func(repo string) error { l, err := TryExclusive(repo); closeLease(l); return err },
+			} {
+				if err := open(repo); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, err := LeaseEpoch(repo); err != nil || !got.Equal(old) {
+				t.Fatalf("epoch after later opens = %v (%v), want it unchanged at %v", got, err, old)
+			}
+		})
+	}
+}
+
+func closeLease(l *Lease) {
+	if l != nil {
+		_ = l.Close()
+	}
+}
+
+// A lease epoch that is not a regular file is an error, not "no epoch": the
+// repository was tampered with, and cleanup must not read a time from it.
+func TestLeaseEpochRefusesAnythingButARegularFile(t *testing.T) {
+	repo := t.TempDir()
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(repo, EpochFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LeaseEpoch(repo); err == nil || errors.Is(err, ErrNoEpoch) {
+		t.Fatalf("LeaseEpoch of a symlink = %v, want an error that is not ErrNoEpoch", err)
+	}
+}
