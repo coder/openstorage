@@ -400,6 +400,53 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	}
 }
 
+// holdReservationLock makes flock(1) hold the reservation lock of
+// holdPath's directory, as a stopped reserver would, and returns once it
+// does. The returned func frees the lock and returns once it is free;
+// cleanup frees it too.
+func holdReservationLock(t *testing.T, flockBin, holdPath string) (free func()) {
+	t.Helper()
+	lockPath := filepath.Dir(holdPath) + ".reserve.lock"
+	// waitLock polls until a try-lock fails with EWOULDBLOCK (held) or
+	// succeeds (free), as held says.
+	waitLock := func(held bool) {
+		for deadline := time.Now().Add(10 * time.Second); ; {
+			probe, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lerr := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			_ = probe.Close()
+			if errors.Is(lerr, syscall.EWOULDBLOCK) == held && (held || lerr == nil) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the reservation lock never became held=%v (last probe: %v)", held, lerr)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	// Its own process group: flock forks the command, and the fork
+	// inherits the locked descriptor.
+	holder := exec.Command(flockBin, lockPath, "sleep", "60")
+	holder.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	free = func() {
+		once.Do(func() {
+			_ = syscall.Kill(-holder.Process.Pid, syscall.SIGKILL)
+			_ = holder.Wait()
+			// The forked sleep can outlive flock(1) for a moment.
+			waitLock(false)
+		})
+	}
+	t.Cleanup(free)
+	waitLock(true)
+	return free
+}
+
 // TestPushHoldLockWaitsAreBounded: another process holds the reservation
 // lock past pushHoldWaitMax, here flock(1), as a stopped reserver would.
 // The steps that take it after a push's reservation must not wait for it,
@@ -439,30 +486,7 @@ func TestPushHoldLockWaitsAreBounded(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			lockPath := filepath.Dir(holdPath) + ".reserve.lock"
-			// Its own process group: flock forks the command, and the
-			// fork inherits the locked descriptor.
-			holder := exec.Command(flockBin, lockPath, "sleep", "60")
-			holder.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			if err := holder.Start(); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = syscall.Kill(-holder.Process.Pid, syscall.SIGKILL); _ = holder.Wait() })
-			for deadline := time.Now().Add(10 * time.Second); ; {
-				probe, err := os.OpenFile(lockPath, os.O_RDWR, 0)
-				if err != nil {
-					t.Fatal(err)
-				}
-				lerr := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-				_ = probe.Close()
-				if errors.Is(lerr, syscall.EWOULDBLOCK) {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("flock(1) never took the reservation lock (last probe: %v)", lerr)
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
+			holdReservationLock(t, flockBin, holdPath)
 			done := make(chan error, 1)
 			go func() { done <- tc.run(holdPath) }()
 			select {
@@ -480,6 +504,128 @@ func TestPushHoldLockWaitsAreBounded(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTimedOutReleaseStopsTheRefresher: a release whose lock wait timed
+// out can miss its hold, because a reaper inside its window can restore it
+// afterwards. The restored hold must get no more touches and no shared
+// inode lock from its refresher, so it expires like a crash leak: the
+// reaper then takes it with its sidecars, or a later release under the
+// lock removes them, and a release that missed nothing leaves no sidecar
+// past the TTL.
+func TestTimedOutReleaseStopsTheRefresher(t *testing.T) {
+	flockBin, err := exec.LookPath("flock")
+	if err != nil {
+		t.Skip("flock(1) not installed")
+	}
+	prevWait, prevTTL := pushHoldWaitMax, pushHoldTTL
+	pushHoldWaitMax = 150 * time.Millisecond
+	pushHoldTTL = 200 * time.Millisecond // the refresher ticks every 50 ms
+	t.Cleanup(func() { pushHoldWaitMax, pushHoldTTL = prevWait, prevTTL })
+	tick := pushHoldTTL / 4
+	// release runs a refresher on a new hold, as serve's handler does, and
+	// releases the hold while flock(1) holds the reservation lock. With
+	// restore, a reaper's restore then puts the hold's inode back.
+	release := func(t *testing.T, restore bool) (holdPath string, freeLock func()) {
+		holdPath = mintHold(t, t.TempDir(), "refs/heads/x")
+		t.Cleanup(startPushHoldRefresh(holdPath)) // its first touch takes the fd and the shared lock
+		inode := filepath.Join(t.TempDir(), "inode")
+		if err := os.Link(holdPath, inode); err != nil {
+			t.Fatal(err)
+		}
+		freeLock = holdReservationLock(t, flockBin, holdPath)
+		removePushHoldFiles(holdPath)
+		if _, err := os.Stat(holdPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the release left the hold: %v", err)
+		}
+		if restore {
+			if err := os.Rename(inode, holdPath); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return holdPath, freeLock
+	}
+	// leftovers lists the entries of the hold's directory that belong to it.
+	leftovers := func(t *testing.T, holdPath string) []string {
+		t.Helper()
+		entries, err := os.ReadDir(filepath.Dir(holdPath))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), filepath.Base(holdPath)) {
+				names = append(names, e.Name())
+			}
+		}
+		return names
+	}
+	t.Run("the reaper takes a restored hold", func(t *testing.T) {
+		holdPath, freeLock := release(t, true)
+		// Four ticks for a touch that was already running at the release,
+		// then five more in which no touch may land.
+		time.Sleep(4 * tick)
+		before, err := os.Stat(holdPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * tick)
+		after, err := os.Stat(holdPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !after.ModTime().Equal(before.ModTime()) {
+			t.Fatalf("a refresher touched the hold after its release: mtime %v, then %v", before.ModTime(), after.ModTime())
+		}
+		q, err := os.OpenFile(holdPath, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lerr := syscall.Flock(int(q.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		_ = q.Close()
+		if lerr != nil {
+			t.Fatalf("a refresher still holds the hold's inode lock after its release: %v", lerr)
+		}
+		freeLock()
+		// Both observations of the expiry: the hold past the TTL, and
+		// its reap marker newer than the hold and past the grace.
+		now := time.Now()
+		if err := os.Chtimes(holdPath, now.Add(-3*pushHoldTTL), now.Add(-3*pushHoldTTL)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(holdPath+pushHoldReapSuffix, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(holdPath+pushHoldReapSuffix, now.Add(-pushHoldTTL), now.Add(-pushHoldTTL)); err != nil {
+			t.Fatal(err)
+		}
+		sweepExpiredPushHolds(filepath.Dir(holdPath))
+		if left := leftovers(t, holdPath); len(left) != 0 {
+			t.Fatalf("the reaper left %v", left)
+		}
+	})
+	t.Run("a release under the lock removes the rest", func(t *testing.T) {
+		holdPath, freeLock := release(t, true)
+		freeLock()
+		removePushHoldFiles(holdPath)
+		if left := leftovers(t, holdPath); len(left) != 0 {
+			t.Fatalf("the release under the lock left %v", left)
+		}
+	})
+	t.Run("nothing is left past the TTL", func(t *testing.T) {
+		holdPath, freeLock := release(t, false)
+		freeLock()
+		past := time.Now().Add(-2 * pushHoldTTL)
+		for _, name := range leftovers(t, holdPath) {
+			if err := os.Chtimes(filepath.Join(filepath.Dir(holdPath), name), past, past); err != nil {
+				t.Fatal(err)
+			}
+		}
+		sweepExpiredPushHolds(filepath.Dir(holdPath))
+		if left := leftovers(t, holdPath); len(left) != 0 {
+			t.Fatalf("the sweep left %v past the TTL", left)
+		}
+	})
 }
 
 // TestPushRefUpdatable pins the committable-name rules: namespaced refs of
