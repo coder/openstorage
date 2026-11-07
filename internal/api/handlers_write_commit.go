@@ -733,7 +733,7 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	}
 	cmd := sc.gitCmd(ctx, extraEnv, args...)
 	cmd.Stdin = stdin
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
 	out, err := gitlimit.Output(cmd)
 	if err != nil {
@@ -852,7 +852,11 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	}
 	var exit *exec.ExitError
 	if ctx.Err() != nil || !errors.As(err, &exit) || (exit.ExitCode() < 0 && !wcGitAborted(exit)) {
-		return "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		// The error is logged: keep the last 64 KiB of git's stderr. (The
+		// classification below reads all of it.)
+		var tail gitlimit.TailBuffer
+		_, _ = tail.Write(stderr.Bytes())
+		return "", fmt.Errorf("%s: %w: %s", gitlimit.Name(append([]string{"apply"}, args...)), err, tail.String())
 	}
 	full := strings.TrimSpace(stderr.String())
 	msg := full

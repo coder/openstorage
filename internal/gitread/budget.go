@@ -42,9 +42,6 @@ const (
 	// hit HeavyHeapBytes part-way; callers check sizes up front instead.
 	MaxBlobBytes int64 = 100 << 20
 
-	// stderrKeepBytes bounds the stderr kept per child (its tail: git
-	// prints its fatal message last).
-	stderrKeepBytes = 64 << 10
 	// childWaitDelay bounds how long Wait may block on git's output pipes
 	// after git is killed (exec.Cmd.WaitDelay).
 	childWaitDelay = 2 * time.Second
@@ -378,19 +375,6 @@ func (s *stopWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// tailBuffer keeps the last stderrKeepBytes written to it.
-type tailBuffer struct{ b []byte }
-
-func (t *tailBuffer) Write(p []byte) (int, error) {
-	t.b = append(t.b, p...)
-	if over := len(t.b) - stderrKeepBytes; over > 0 {
-		t.b = append(t.b[:0], t.b[over:]...)
-	}
-	return len(p), nil
-}
-
-func (t *tailBuffer) String() string { return strings.TrimSpace(string(t.b)) }
-
 // Cmd is one read-side git child for Run.
 type Cmd struct {
 	Class Class
@@ -481,7 +465,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	cmd.Env = childEnv(c.Env)
 	cmd.Stdin = c.Stdin
 	cmd.WaitDelay = childWaitDelay
-	var stderr tailBuffer
+	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
 	var out *limitedBuffer
 	var stream *stopWriter

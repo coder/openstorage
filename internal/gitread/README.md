@@ -24,6 +24,7 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 - `IsBudgetError` errors must not be reported as not-found [budget.go:IsBudgetError]
 - `(*Budget).start` asserts the budget is open and returns `ErrTimeBudget` past the deadline; `limitedBuffer.Write` kills git once output is exhausted [budget.go:Budget.start]
 - `Run` never wraps `ExitError` for limit outcomes [budget.go:Run]
+- `Run`'s errors name the command with `gitlimit.Name` and quote the last 64 KiB of git's stderr (`gitlimit.TailBuffer`) [budget.go:Run]
 - `childEnv` forces `LC_MESSAGES=C` and keeps `LC_CTYPE`/`LC_COLLATE` [budget.go:childEnv]
 - `LsTree` passes paths as `:(literal)` pathspecs; `parseLsTreeRecord` rejects malformed records; `LsTreePage` returns `ErrUnsortedTree` on out-of-order output [tree.go:LsTreePage]
 - `PrepareArchive` fails before any byte is written when a kept blob exceeds the size limit [archive.go:PrepareArchive]
