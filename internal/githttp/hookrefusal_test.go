@@ -332,11 +332,13 @@ func TestUpdateHookKeepsRefusals(t *testing.T) {
 	}
 }
 
-// hookServe serves repo in process, with the hooks' store URLs taken from
-// the environment, and returns a push of the work repository's HEAD to
-// refs/heads/main that returns the pusher's output.
-func hookServe(t *testing.T, repo string) func(work string) (string, error) {
+// hookServe serves a repository named runUnique(name) in process, with the
+// hooks' store URLs taken from the environment, and returns a push of the
+// work repository's HEAD to refs/heads/main that returns the pusher's
+// output.
+func hookServe(t *testing.T, name string) func(work string) (string, error) {
 	t.Helper()
+	repo := runUnique(name)
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
 	srv := &Server{
