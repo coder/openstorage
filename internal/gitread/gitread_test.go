@@ -146,6 +146,14 @@ func TestResolveRef(t *testing.T) {
 			t.Errorf("ResolveRef(%q) = (%q, %v), want ErrNotFound", spec, sha, err)
 		}
 	}
+	// No ref is longer than maxRefSpecBytes, and a 200 KiB argument fails
+	// exec with E2BIG. The error would carry the whole spec, so the check
+	// prints neither.
+	for _, n := range []int{maxRefSpecBytes + 1, 200 << 10} {
+		if _, err := ResolveRef(ctx, f.dir, strings.Repeat("a", n), false); !errors.Is(err, ErrNotFound) {
+			t.Errorf("ResolveRef(a %d-byte spec) does not match ErrNotFound; want it to: no ref is that long", n)
+		}
+	}
 	// A persistent branch name must not resolve in the ephemeral namespace.
 	if sha, err := ResolveRef(ctx, f.dir, "feature", true); !errors.Is(err, ErrNotFound) {
 		t.Errorf("ephemeral ResolveRef(feature) = (%q, %v), want ErrNotFound", sha, err)

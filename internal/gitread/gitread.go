@@ -99,6 +99,10 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 	if spec == "" {
 		return "", fmt.Errorf("resolve empty ref: %w", ErrNotFound)
 	}
+	if len(spec) > maxRefSpecBytes {
+		// The spec stays out of the error: it can be request-sized.
+		return "", fmt.Errorf("resolve a %d-byte ref spec: %w", len(spec), ErrNotFound)
+	}
 	if strings.IndexByte(spec, 0) >= 0 {
 		// exec refuses an argument with a NUL byte before git starts, so
 		// git cannot answer: such a spec names no ref, like any other
@@ -162,6 +166,14 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 	}
 	return "", fmt.Errorf("resolve ref %q: %w", spec, ErrNotFound)
 }
+
+// maxRefSpecBytes bounds the spec that ResolveRef hands to git. No ref is
+// longer: githttp refuses a pushed ref name past 900 bytes
+// (maxPushRefNameBytes), the API refuses a branch name past 255, and git
+// keeps every ref in the cache as a loose file, which PATH_MAX (4096 on
+// Linux) bounds. A spec past 128 KiB would fail exec with E2BIG, and that
+// error would carry the whole spec into the server's log.
+const maxRefSpecBytes = 4096
 
 // gitSaidNo reports whether err is git's own negative answer: the child
 // ran to the end and exited 1. check-ref-format exits 1 for a name that is
