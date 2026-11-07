@@ -90,11 +90,16 @@ or a metadata store the hook cannot open refuses the ref update, with a
 fixed message that names no store detail ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
 amendment). Ephemeral updates, a sync run's own loopback push, and a caller
 whose token may not forward record no intent, and this step does not
-refuse them. The intent after the
-CAS stays, and still does the pull marking. A local push run's loopback
-fetch fails with HTTP 423 when its hydrate would skip a push-held ref whose
-cached value is older than the authority, and the run ends with `restore`,
-as after a failed publication wait.
+refuse them. A REST write by a caller that may forward, to a
+`forward_on_push` repository, first takes the ref's push hold in serve's
+cache, then records `RequestPush`, and the hold ends when its CAS returns.
+A failed read, hold or intent write refuses that REST write, except a
+missing upstream link (`meta.ErrNotFound`, at the read or at the intent
+write), which leaves nothing to forward. The intent after the CAS stays,
+and still does the pull marking. A local push run's
+loopback fetch fails with HTTP 423 when its hydrate would skip a push-held
+ref whose cached value is older than the authority, and the run ends with
+`restore`, as after a failed publication wait.
 
 **Rollout.** The store transitions landed first, with no callers (#336). The
 SQLite worker and its sweep followed (#341), and hook marking came last,

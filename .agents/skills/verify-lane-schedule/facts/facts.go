@@ -448,9 +448,11 @@ func main() {
 	mb := newFact("MarkBeforeCas")
 	for _, m := range []string{"CASRef", "CASRefGen"} {
 		body := refstore.fn("RefStore", m).Body
+		cs := refstore.calls(body)
+		rb, inner := first(cs, "s.runBeforeCAS"), first(cs, "s.RefStore."+m)
 		refused := token.NoPos
 		ast.Inspect(body, func(n ast.Node) bool {
-			if is, ok := n.(*ast.IfStmt); ok && is.Init != nil && refstore.text(is.Init) == "err := s.runBeforeCAS(ctx, repo, name)" &&
+			if is, ok := n.(*ast.IfStmt); ok && !refused.IsValid() && rb.IsValid() && is.Pos() > rb && is.Init == nil &&
 				refstore.text(is.Cond) == "err != nil" && len(is.Body.List) == 1 {
 				if _, ok := is.Body.List[0].(*ast.ReturnStmt); ok {
 					refused = is.Pos()
@@ -458,8 +460,8 @@ func main() {
 			}
 			return true
 		})
-		inner := first(refstore.calls(body), "s.RefStore."+m)
-		mb.need(refused.IsValid() && inner.IsValid() && refused < inner, "RefStore.%s returns runBeforeCAS's error before it calls s.RefStore.%s", m, m)
+		mb.need(assigned(refstore.assigns(body), "err", "s.runBeforeCAS(ctx, repo, name)") && refused.IsValid() && inner.IsValid() && refused < inner,
+			"RefStore.%s returns runBeforeCAS's error before it calls s.RefStore.%s", m, m)
 	}
 	mb.need(first(refstore.calls(refstore.fn("RefStore", "runBeforeCAS").Body), "s.beforeCAS").IsValid(), "RefStore.runBeforeCAS calls s.beforeCAS")
 	whe := wireEvt.fn("", "wireHookEventing")
@@ -561,6 +563,53 @@ func main() {
 	})
 	ss.need(strictServe, "serve sets srv.StrictSyncFetch from meta.LocalSchedule(...)")
 	facts = append(facts, ss)
+
+	// RestMarkBeforeCas: serve's REST writes on the local schedule hold the
+	// ref and record the forward intent before their authority CAS, and the
+	// hold ends after the CAS.
+	rm := newFact("RestMarkBeforeCas")
+	bse := wireEvt.fn("", "buildServeEventing")
+	restWired := false
+	ast.Inspect(bse.Body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok && wireEvt.text(is.Cond) == "isPGURL(dbURL)" && is.Else != nil {
+			restWired = assigned(wireEvt.assigns(is.Else), "heldBeforeCAS", "restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)")
+		}
+		return true
+	})
+	rm.need(restWired, "buildServeEventing's local branch sets heldBeforeCAS = restIntentBeforeCAS(ms, cacheDir, forwardDeniedFromContext)")
+	serveWired := 0
+	for _, l := range wireEvt.literals(bse.Body, "events.RefStoreOptions") {
+		if strings.Contains(l, "HeldBeforeCAS:") && strings.Contains(l, "heldBeforeCAS") {
+			serveWired++
+		}
+	}
+	rm.need(serveWired == 1, "buildServeEventing passes HeldBeforeCAS: heldBeforeCAS to the decorator (found %d)", serveWired)
+	rm.need(first(refstore.calls(refstore.fn("RefStore", "runBeforeCAS").Body), "s.heldBeforeCAS").IsValid(), "RefStore.runBeforeCAS calls s.heldBeforeCAS")
+	ric := wireLocal.calls(wireLocal.fn("", "restIntentBeforeCAS").Body)
+	holdAt, markAt := first(ric, "githttp.HoldRef"), first(ric, "ms.RequestPush")
+	rm.need(holdAt.IsValid() && markAt.IsValid() && holdAt < markAt, "restIntentBeforeCAS calls githttp.HoldRef before ms.RequestPush")
+	rm.need(first(pub.calls(pub.fn("", "HoldRef").Body), "reservePushHolds").IsValid(), "githttp.HoldRef reserves the ref's hold (reservePushHolds)")
+	rbc := refstore.fn("RefStore", "runBeforeCAS")
+	rm.need(assigned(refstore.assigns(rbc.Body), "release", "sync.OnceFunc(release)"), "RefStore.runBeforeCAS wraps HeldBeforeCAS's release in sync.OnceFunc")
+	for _, m := range []string{"CASRef", "CASRefGen"} {
+		body := refstore.fn("RefStore", m).Body
+		cs := refstore.calls(body)
+		inner, emit := first(cs, "s.RefStore."+m), first(cs, "s.emitPush")
+		deferred, direct := false, false
+		for _, st := range body.List {
+			switch st := st.(type) {
+			case *ast.DeferStmt:
+				deferred = deferred || (refstore.text(st.Call) == "release()" && st.Pos() < inner)
+			case *ast.ExprStmt:
+				direct = direct || (refstore.text(st.X) == "release()" && st.Pos() > inner && st.Pos() < emit)
+			}
+		}
+		// The deferred release ends the hold when the inner CAS panics:
+		// serve's API recovers the panic and keeps running.
+		rm.need(inner.IsValid() && deferred, "RefStore.%s defers release() before s.RefStore.%s", m, m)
+		rm.need(inner.IsValid() && emit.IsValid() && direct, "RefStore.%s calls release() after s.RefStore.%s and before s.emitPush", m, m)
+	}
+	facts = append(facts, rm)
 
 	for _, f := range facts {
 		ev := "ok"

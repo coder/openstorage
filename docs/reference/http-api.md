@@ -614,14 +614,18 @@ Upstream documents no value and no `Link` or `Sunset` header, so open.storage se
   opts internal forges in.
 
 **Events and cancellation:** outbound runs emit `repo.push_upstream.*` events
-([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. `DELETE /repos/base` silently cancels
+([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. An outbound run emits
+`repo.push_upstream.started` once its loopback fetch of this server has the snapshot it
+forwards, before it pushes to the upstream. A run that fails before or at that fetch
+emits `repo.push_upstream.started` right before its `repo.push_upstream.failed`.
+`DELETE /repos/base` silently cancels
 in-flight runs in both directions. A run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
 a new `repo.sync.started` (outbound: `repo.push_upstream.started`). On SQLite and S3WAL,
-an outbound run also ends without a terminal event when a git push in progress holds a
-ref that the run would otherwise forward at an older value: the request stays pending,
-and the run starts again a few seconds later.
+an outbound run emits no event when a write in progress (a git push, or a ref write
+through this API) holds a ref that the run would otherwise forward at an older value:
+the request stays pending, and a new run starts a few seconds later.
 
 **Ref policies fail closed:** any policy op denies pull-upstream, push-upstream, and a
 sync create at `POST /repos` (403).
@@ -633,6 +637,20 @@ git:read, does not trigger the forward, since the forward publishes every head a
 The write stays local. Nothing polls the upstream, so the repository converges only on
 the next authorized trigger: a write, pull-upstream, or push-upstream that passes these
 gates.
+
+**Ref writes that forward:** on SQLite and S3WAL, a ref write through this API that
+triggers the forward (a `forward_pushes` repo and a token that passes the gates above)
+holds the ref and records the forward request before it changes the ref. It waits up to
+10 seconds for a git push or another such write that holds the same ref or a
+directory/file relative of it (`refs/heads/a` and `refs/heads/a/b`), then fails with
+**503** and `Retry-After: 1`. When the read of the repository's upstream link fails, a ref
+write from a token that passes the gates above fails with a plain **500** on any
+repository, forwarding or not: the write reads the link before it knows whether the
+repository forwards. Any other failure to take the hold, or a failed write of the forward
+request, also fails the write with a plain **500**. In each case the ref stays unchanged.
+A write that loses its compare-and-swap (409)
+has recorded its request already, so the repository gets one forward run with nothing new
+to push.
 
 #### Egress policy
 
@@ -713,4 +731,4 @@ Other limits and gaps:
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit, busy or backpressure (plain problem body) |
-| 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |
+| 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)), and, on SQLite and S3WAL, for a ref write that forwards and waited 10 seconds for a concurrent git push or ref write that holds the same ref or a directory/file relative of it (with `Retry-After`; [ref writes that forward](#upstream-sync)) |
