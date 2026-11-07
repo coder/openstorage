@@ -114,6 +114,20 @@ func (s observeAtCAS) CASRefGen(ctx context.Context, repo, name, old, next strin
 	return won, gen, err
 }
 
+// holdCheckBound is how long a test's publication wait runs to decide
+// whether a ref is held. The wait checks its context before its first
+// poll, so a host that stalls the test past the bound reads a ref that
+// nothing holds as held. A check that expects a hold may stay short: the
+// wait then times out by design. A check that expects none waits as long
+// as the tests' other "not held" checks (5 s), and returns at the first
+// poll.
+func holdCheckBound(wantHeld bool) time.Duration {
+	if wantHeld {
+		return 200 * time.Millisecond
+	}
+	return 5 * time.Second
+}
+
 // errStoreBug is panicOnceAtCAS's panic value.
 const errStoreBug = "store bug in the CAS"
 
@@ -425,7 +439,7 @@ func TestServeRestIntentBeforeCAS(t *testing.T) {
 							}
 							intentAtCAS = up.PushPending
 						}
-						heldAtCAS = held(200 * time.Millisecond)
+						heldAtCAS = held(holdCheckBound(tc.wantIntent))
 					}})
 					writeCtx := ctx
 					if !tc.noClaims {
@@ -559,7 +573,7 @@ func TestRestIntentBeforeCASPaths(t *testing.T) {
 				t.Fatalf("RequestPush calls (force flags) = %v, want %d plain ones", m.pushes, tc.wantPushes)
 			}
 			if !tc.cacheFile {
-				if got := held(time.Second); got != tc.wantHeld {
+				if got := held(holdCheckBound(tc.wantHeld)); got != tc.wantHeld {
 					t.Fatalf("ref held after the call = %v, want %v", got, tc.wantHeld)
 				}
 			}
