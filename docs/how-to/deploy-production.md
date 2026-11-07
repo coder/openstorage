@@ -911,8 +911,9 @@ its first sync: the v1 release runs it at boot.
 **Hook refusals.** A v2 hook refuses a ref update when `_wal/meta.json` has the wrong
 format version, does not decode, or holds ids or rows no writer can produce, such as a
 negative id counter, a holderless claim, a null row or an empty required field
-(`_wal/meta.json is corrupt`). `serve` refuses the same documents at every metadata read
-and keeps running. It writes nothing. For a
+(`_wal/meta.json is corrupt`). The pusher's refusal for a corrupt document leaves out
+the detail, because it can name rows of the document: `serve`'s log has it. `serve`
+refuses the same documents at every metadata read and keeps running. It writes nothing. For a
 corrupt document, keep `serve` stopped and
 [restore from a verified stopped-node backup](backup-restore-s3wal.md#restore-and-validate-before-cutover).
 Do not edit the document. If the hook cannot reach the store, it still accepts the push
