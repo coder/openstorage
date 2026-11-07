@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -30,11 +31,30 @@ func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, 
 	// Read-side git limits (#313) are not internal errors: every handler
 	// reports its git failures through here, so this is the one place that
 	// maps them to their documented 422/503 answers.
-	if s.writeGitLimitErr(w, r, op, err) {
+	if s.writeGitLimitErr(w, r, op, err) || s.writeRefHeldErr(w, r, op, err) {
 		return
 	}
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Error("internal error", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
+}
+
+// refBusyMsg is the 503 body of a ref write that gave up waiting for a
+// concurrent push's or ref write's hold on its ref.
+const refBusyMsg = "ref is busy: a concurrent push or ref write holds it; retry shortly"
+
+// writeRefHeldErr answers a ref write that gave up waiting for a hold on
+// its ref (githttp.ErrRefHeld, after pushHoldWaitMax) with 503 and
+// Retry-After, and reports whether err was one. Holds normally last
+// milliseconds, so a retry is expected to succeed. internalErr,
+// wcInternal and wmInternal all ask it first.
+func (s *server) writeRefHeldErr(w http.ResponseWriter, r *http.Request, op string, err error) bool {
+	if !errors.Is(err, githttp.ErrRefHeld) {
+		return false
+	}
+	s.logger.Warn("ref write gave up waiting for a held ref", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
+	w.Header().Set("Retry-After", "1")
+	writeErr(w, http.StatusServiceUnavailable, refBusyMsg)
+	return true
 }
 
 // errorEnvelope is the plain wire error shape (docs/reference/http-api.md):

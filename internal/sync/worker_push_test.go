@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -91,6 +92,49 @@ func TestPushRunCleanPushSucceeds(t *testing.T) {
 	}
 	if up.RunCount != 0 || up.SuccessCount != 0 {
 		t.Fatalf("push run leaked into pull counters: %+v", up)
+	}
+}
+
+// startedProbe records, when repo.push_upstream.started goes out,
+// whether the upstream already has main.
+type startedProbe struct {
+	*eventRec
+	upstreamHasMain func() bool
+	sawMain         *bool
+}
+
+func (p startedProbe) Emit(ctx context.Context, org, eventType string, payload []byte) {
+	if eventType == EventPushUpstreamStarted {
+		*p.sawMain = p.upstreamHasMain()
+	}
+	p.eventRec.Emit(ctx, org, eventType, payload)
+}
+
+// TestPushRunStartedPrecedesUpstreamPush: repo.push_upstream.started goes
+// out once the loopback fetch has its snapshot, before the upstream push,
+// on a River run (this fixture, PostgreSQL's path) as on the local
+// schedule. A receiver sees the run start before the upstream changes.
+func TestPushRunStartedPrecedesUpstreamPush(t *testing.T) {
+	f := newWorkerFixture(t)
+	headSHA := seedLocalRepo(t, f, "repo_ps")
+	bare := addEmptyUpstream(t, f.upstreamDir, "own", "ps")
+	f.putUpstream(t, "repo_ps", "own", "ps", "file://"+f.upstreamDir)
+	if err := f.store.RequestPush(t.Context(), "repo_ps", false); err != nil {
+		t.Fatal(err)
+	}
+	sawMain := true
+	f.worker.Events = startedProbe{eventRec: f.rec, sawMain: &sawMain, upstreamHasMain: func() bool {
+		return exec.Command("git", "--git-dir", bare, "rev-parse", "--verify", "--quiet", "refs/heads/main").Run() == nil
+	}}
+	if err := f.worker.RunPush(t.Context(), Job{Org: "acme", RepoID: "repo_ps"}); err != nil {
+		t.Fatalf("RunPush: %v", err)
+	}
+	assertEventTypes(t, f.rec.list(), EventPushUpstreamStarted, EventPushUpstreamSucceeded)
+	if sawMain {
+		t.Fatal("repo.push_upstream.started went out after the upstream push; want it once the loopback fetch has its snapshot")
+	}
+	if got := testGit(t, f.upstreamDir, "-C", bare, "rev-parse", "refs/heads/main"); got != headSHA {
+		t.Fatalf("upstream main = %s, want %s", got, headSHA)
 	}
 }
 

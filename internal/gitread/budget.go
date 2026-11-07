@@ -1,7 +1,6 @@
 package gitread
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -106,7 +105,7 @@ func CheckBlobSize(ctx context.Context, path string, size int64) error {
 		limit = b.limits.MaxBlob
 	}
 	if size > limit {
-		return fmt.Errorf("%q is %d bytes: %w (%d bytes)", path, size, ErrBlobTooLarge, limit)
+		return fmt.Errorf("%q is %d bytes: %w (%d bytes)", gitlimit.Clip(path), size, ErrBlobTooLarge, limit)
 	}
 	return nil
 }
@@ -263,12 +262,25 @@ func (b *Budget) take(n int64) bool {
 // limitedBuffer buffers stdout against a Budget's allowance (nil: no
 // limit). On overflow it kills git at once (instead of letting it block on
 // a full pipe) and refuses the write.
+//
+// The output is kept in chunks that never move, and String joins them once
+// into a string of exactly the output's size. A bytes.Buffer doubles by
+// copying, and its String copied the output again, so a call peaked at 3 to
+// 4 times its output. Here the peak is the chunks plus the string: 2 times
+// the output, plus what the last chunk leaves unused (a quarter of the
+// output, 8 MiB at most).
 type limitedBuffer struct {
-	buf      bytes.Buffer
+	chunks   [][]byte
+	n        int // bytes held
 	allow    *Budget
 	kill     context.CancelFunc
 	overflow bool
 }
+
+const (
+	minChunk = 64      // as bytes.Buffer's first allocation: a small output costs one chunk of this size
+	maxChunk = 8 << 20 // bounds the unused part of the last chunk
+)
 
 var errOutputOverflow = errors.New("output allowance exhausted")
 
@@ -278,7 +290,30 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 		l.kill()
 		return 0, errOutputOverflow
 	}
-	return l.buf.Write(p)
+	written := len(p)
+	for len(p) > 0 {
+		if k := len(l.chunks) - 1; k < 0 || len(l.chunks[k]) == cap(l.chunks[k]) {
+			// A quarter of what is held: few chunks, and the unused part of
+			// the last one stays within a quarter of the output.
+			l.chunks = append(l.chunks, make([]byte, 0, max(len(p), min(max(l.n/4, minChunk), maxChunk))))
+		}
+		last := &l.chunks[len(l.chunks)-1]
+		m := min(cap(*last)-len(*last), len(p))
+		*last = append(*last, p[:m]...)
+		l.n += m
+		p = p[m:]
+	}
+	return written, nil
+}
+
+// String returns the output. It is the only copy of it.
+func (l *limitedBuffer) String() string {
+	var sb strings.Builder
+	sb.Grow(l.n)
+	for _, c := range l.chunks {
+		sb.Write(c)
+	}
+	return sb.String()
 }
 
 // stopWriter forwards git's streamed output; when the consumer returns
@@ -370,7 +405,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
 	assertf(len(c.Args) > 0, "Run: no git args")
-	name := "git " + strings.Join(c.Args, " ")
+	name := gitlimit.Name(c.Args)
 
 	b := BudgetFrom(ctx)
 	var heap int64 // no Budget (write endpoints): no limits at all
@@ -415,7 +450,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	err := gitlimit.Run(cmd)
 	stdout := ""
 	if out != nil {
-		stdout = out.buf.String()
+		stdout = out.String()
 	}
 	if err == nil || (stream != nil && stream.stopped.Load()) {
 		// A stopped stream: git was killed on the consumer's request.

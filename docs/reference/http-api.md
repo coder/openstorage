@@ -334,7 +334,7 @@ or NUL fails the sync as a configuration error.
 |---|---|---|
 | `GET /repos/file` | `path` (req), `ref`, `ephemeral`, `ephemeral_base`; headers `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` | Raw blob stream. Status 200/206/304/412/416. Headers: `X-Blob-Sha`, `X-Last-Commit-Sha`, `ETag`, `Last-Modified`, `Accept-Ranges`, `Content-Range`, `Content-Type`, `Content-Length` |
 | `HEAD /repos/file` | same | headers only |
-| `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], paths_base64?: [..], ref, entries: [{path, path_base64?, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type`. Without `recursive`, with an empty `recursive=`, or with `recursive=true`, it lists the contents of every folder under `path` and no `tree` entries. `recursive=false` lists only the direct children of `path`, folders as `tree` entries. No `cursor` and no `limit` (or `limit=0`): every entry, or 422 when the listing passes the git [output limit](#resource-limits-on-git-reads). Big trees must page: a recursive call with `limit` or `cursor` reads only the entries of its page. With a cursor it reads the folders on the cursor's path and the ones after it, each whole, and none of the folders before it, so a deep cursor costs about what the first page does plus the size of those folders and a request to git for each folder of the page: a cursor inside one folder of a million entries still reads that whole folder, but the folders before it are not read. Because they are not read, a missing, unreadable or out-of-order object there, or a tree nested past git's depth limit, no longer fails a page that is not empty. A page that this does not suit is read from the start of the listing, as for a first page, and gives the same result: trees with unusual entries, trees nested more than 128 folders deep or past a lower `core.maxTreeDepth` that git is set to, many folders without files, many small folders, or one very large folder, when the cursor is near the start of the listing (git reads those faster than the walk does), a git that fails on the way, and pages that come out empty. A tree that git stores out of order (one that `git fsck` rejects as `treeNotSorted`) can page in git's order and skip entries; git itself cannot look such entries up by path |
+| `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], paths_base64?: [..], ref, entries: [{path, path_base64?, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type`. Without `recursive`, with an empty `recursive=`, or with `recursive=true`, it lists the contents of every folder under `path` and no `tree` entries. `recursive=false` lists only the direct children of `path`, folders as `tree` entries. No `cursor` and no `limit` (or `limit=0`): every entry, or 422 when the listing passes the git [output limit](#resource-limits-on-git-reads). Big trees must page: a recursive call with `limit` or `cursor` reads only the entries of its page. With a cursor it reads the folders on the cursor's path and the ones after it, each whole, and none of the folders before it, so a deep cursor costs about what the first page does plus the size of those folders and a request to git for each folder of the page: a cursor inside one folder of a million entries still reads that whole folder, but the folders before it are not read. Because they are not read, a missing or unreadable object there, or a tree nested past git's depth limit, no longer fails a page that the walk answers. A page that this does not suit is read from the start of the listing, as for a first page, and gives the same result, a failure on such an object included: trees with unusual entries, trees nested more than 128 folders deep or past a lower `core.maxTreeDepth` that git is set to, many folders without files, many small folders, or one very large folder, when the cursor is near the start of the listing (git reads those faster than the walk does), a git that fails on the way, and pages that come out empty. A tree that git stores out of order (one that `git fsck` rejects as `treeNotSorted`) can page in git's order and skip entries; git itself cannot look such entries up by path |
 | `GET /repos/files/metadata` | same | `{files: [{path, path_base64?, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message, order}}, ref, next_cursor, has_more}`. `order` is described below the table. `message` is the subject line only, as in the commits list ([Commits](#commits)). No `cursor` and no `limit` (or `limit=0`): every file. **429** when the files under `path` have more than 50,000 distinct last commits, also with `limit` or `cursor`: a retry gets the same 429 (no `Retry-After`), so send a narrower `path`. **404 on unborn branch** |
 | `POST /repos/archive` | body `{ref?, include_globs?, exclude_globs?, max_blob_size?, archive?: {prefix}}` | tar.gz stream |
 | `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, file_filters?: {include_globs, exclude_globs, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, path_base64?, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
@@ -614,14 +614,18 @@ Upstream documents no value and no `Link` or `Sunset` header, so open.storage se
   opts internal forges in.
 
 **Events and cancellation:** outbound runs emit `repo.push_upstream.*` events
-([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. `DELETE /repos/base` silently cancels
+([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. An outbound run emits
+`repo.push_upstream.started` once its loopback fetch of this server has the snapshot it
+forwards, before it pushes to the upstream. A run that fails before or at that fetch
+emits `repo.push_upstream.started` right before its `repo.push_upstream.failed`.
+`DELETE /repos/base` silently cancels
 in-flight runs in both directions. A run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
 a new `repo.sync.started` (outbound: `repo.push_upstream.started`). On SQLite and S3WAL,
-an outbound run also ends without a terminal event when a git push in progress holds a
-ref that the run would otherwise forward at an older value: the request stays pending,
-and the run starts again a few seconds later.
+an outbound run emits no event when a write in progress (a git push, or a ref write
+through this API) holds a ref that the run would otherwise forward at an older value:
+the request stays pending, and a new run starts a few seconds later.
 
 **Ref policies fail closed:** any policy op denies pull-upstream, push-upstream, and a
 sync create at `POST /repos` (403).
@@ -633,6 +637,20 @@ git:read, does not trigger the forward, since the forward publishes every head a
 The write stays local. Nothing polls the upstream, so the repository converges only on
 the next authorized trigger: a write, pull-upstream, or push-upstream that passes these
 gates.
+
+**Ref writes that forward:** on SQLite and S3WAL, a ref write through this API that
+triggers the forward (a `forward_pushes` repo and a token that passes the gates above)
+holds the ref and records the forward request before it changes the ref. It waits up to
+10 seconds for a git push or another such write that holds the same ref or a
+directory/file relative of it (`refs/heads/a` and `refs/heads/a/b`), then fails with
+**503** and `Retry-After: 1`. When the read of the repository's upstream link fails, a ref
+write from a token that passes the gates above fails with a plain **500** on any
+repository, forwarding or not: the write reads the link before it knows whether the
+repository forwards. Any other failure to take the hold, or a failed write of the forward
+request, also fails the write with a plain **500**. In each case the ref stays unchanged.
+A write that loses its compare-and-swap (409)
+has recorded its request already, so the repository gets one forward run with nothing new
+to push.
 
 #### Egress policy
 
@@ -713,4 +731,4 @@ Other limits and gaps:
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output or file-size limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit, busy or backpressure (plain problem body) |
-| 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, and for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)) |
+| 5xx | internal/unavailable; 503 documented for a sync create whose first sync could not be scheduled (`POST /repos`, with `Retry-After`), for cold-storage warmup on grep/archive, for git reads when the server's git concurrency is exhausted (with `Retry-After`) or a request exceeds its git time budget (without `Retry-After`) ([resource limits on git reads](#resource-limits-on-git-reads)), and, on SQLite and S3WAL, for a ref write that forwards and waited 10 seconds for a concurrent git push or ref write that holds the same ref or a directory/file relative of it (with `Retry-After`; [ref writes that forward](#upstream-sync)) |
