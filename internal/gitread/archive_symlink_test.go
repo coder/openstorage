@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // gitCalls puts a git on PATH that logs each call's arguments and runs the
@@ -142,5 +144,76 @@ func TestReadSymlinkTargetRefusesALongTarget(t *testing.T) {
 	// is longer, as with a replacement object.
 	if _, err := ReadSymlinkTarget(ctx, dir, sha["long"].SHA, 5); !errors.Is(err, ErrSymlinkTooLong) {
 		t.Fatalf("a blob longer than its listed size: err = %v, want ErrSymlinkTooLong", err)
+	}
+}
+
+// A replacement object that appears after the tree was listed makes git print
+// a longer blob than the listed size. The read stops at one byte over the
+// limit: git is ended, and the process does not hold the replacement (8 MiB
+// here; up to the output allowance in a request).
+func TestReadSymlinkTargetBoundsAReplacementBlob(t *testing.T) {
+	ctx := context.Background()
+	big := strings.Repeat("t", 8<<20)
+	dir, commit := fiRepo(t, []fiFile{{"120000", "link", "a.txt"}, {"100644", "big", big}})
+	entries, err := LsTree(ctx, dir, commit, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := map[string]TreeEntry{}
+	for _, e := range entries {
+		sha[e.Path] = e
+	}
+	if sha["link"].Size != 5 {
+		t.Fatalf("link is listed as %d bytes, want 5", sha["link"].Size)
+	}
+	gitIn(t, dir, "", "replace", sha["link"].SHA, sha["big"].SHA) // after the listing
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err = ReadSymlinkTarget(ctx, dir, sha["link"].SHA, sha["link"].Size)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, ErrSymlinkTooLong) {
+		t.Fatalf("a replacement of 8 MiB: err = %v, want ErrSymlinkTooLong", err)
+	}
+	if n := after.TotalAlloc - before.TotalAlloc; n > 1<<20 {
+		t.Fatalf("the read allocated %d KiB for a replacement of 8 MiB, want under 1 MiB", n>>10)
+	}
+	assertNoChildren(t)
+}
+
+// The read ends git once it has more than the limit: a git that prints without
+// end (what a huge replacement blob looks like to the reader) fails the read
+// at once, and no git is left running.
+func TestReadSymlinkTargetEndsGitAtTheLimit(t *testing.T) {
+	dir, commit := fiRepo(t, []fiFile{{"120000", "link", "a.txt"}})
+	entries, err := LsTree(context.Background(), dir, commit, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeGit(t, "for a in \"$@\"; do case \"$a\" in cat-file) exec yes t ;; esac; done\nexit 1")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = ReadSymlinkTarget(ctx, dir, entries[0].SHA, entries[0].Size)
+	if !errors.Is(err, ErrSymlinkTooLong) || time.Since(start) > 3*time.Second {
+		t.Fatalf("a git that never stops: err = %v after %v, want ErrSymlinkTooLong at once", err, time.Since(start))
+	}
+	assertNoChildren(t)
+}
+
+// The writer keeps 4096 bytes at most (one over the limit of 4095, which is
+// what tells a long target from one at the limit) and ends git with ErrStop on
+// the 4096th. The sizes are numbers, not the constant.
+func TestTargetWriterKeepsOneByteOverTheLimit(t *testing.T) {
+	var w targetWriter
+	if n, err := w.Write(make([]byte, 4000)); n != 4000 || err != nil {
+		t.Fatalf("Write(4000) = %d, %v", n, err)
+	}
+	if n, err := w.Write(make([]byte, 95)); n != 95 || err != nil || len(w.buf) != 4095 {
+		t.Fatalf("Write(95) = %d, %v with %d bytes held; a target of 4095 bytes is whole", n, err, len(w.buf))
+	}
+	if n, err := w.Write(make([]byte, 10<<10)); n != 10<<10 || !errors.Is(err, ErrStop) || len(w.buf) != 4096 {
+		t.Fatalf("Write(10 KiB) = %d, %v with %d bytes held; want ErrStop and 4096 bytes", n, err, len(w.buf))
 	}
 }
