@@ -406,3 +406,42 @@ func TestLsTreePageCursorChoosesTheEngineByTheSizeOfAFolder(t *testing.T) {
 		})
 	}
 }
+
+// A folder that is missing before the cursor fails a page that the stream
+// answers, as it does for a first page, and not a page that the walk answers
+// (the files row of docs/reference/http-api.md): 1,500 folders of one file,
+// the tree of d00005 missing, and the cursor d00010/f0. A page of 1000 entries
+// is the stream's (TestLsTreePageCursorChoosesTheEngineByTheFoldersItReads), a
+// page of 200 is the walk's.
+func TestLsTreePageCursorOnAMissingFolderBeforeTheCursor(t *testing.T) {
+	var files []fiFile
+	for i := range 1500 {
+		files = append(files, fiFile{"100644", fmt.Sprintf("d%05d/f0", i), "x"})
+	}
+	dir, intact := fiRepo(t, files)
+	var listing strings.Builder
+	for _, line := range strings.Split(gitIn(t, dir, "", "ls-tree", intact), "\n") {
+		if fields := strings.Fields(line); strings.HasSuffix(line, "\td00005") {
+			line = strings.Replace(line, fields[2], strings.Repeat("a", 40), 1)
+		}
+		listing.WriteString(line + "\n")
+	}
+	broken := commitOf(t, dir, gitIn(t, dir, listing.String(), "mktree", "--missing"))
+	ctx := context.Background()
+	for _, c := range []struct {
+		limit  int
+		answer bool
+	}{{1000, false}, {200, true}} {
+		page, _, _, err := LsTreePage(ctx, dir, broken, "", "d00010/f0", c.limit)
+		if (err == nil) != c.answer {
+			t.Fatalf("limit %d: %d entries, err %v; want an answer %v", c.limit, len(page), err, c.answer)
+		}
+		if _, _, _, err := pageOracle(ctx, dir, broken, "", "d00010/f0", c.limit); err == nil {
+			t.Fatalf("limit %d: the stream answers, so the tree is not broken before the cursor", c.limit)
+		}
+		want, _, _, _ := LsTreePage(ctx, dir, intact, "", "d00010/f0", c.limit)
+		if c.answer && !slices.Equal(page, want) {
+			t.Fatalf("limit %d: the page differs from the page of the intact tree", c.limit)
+		}
+	}
+}
