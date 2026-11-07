@@ -3,7 +3,9 @@ package gitread
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -180,6 +182,29 @@ func TestGrepKeepsServerCharacterLocale(t *testing.T) {
 		}
 		if len(files) != 1 || len(files[0].Lines) != 1 {
 			t.Errorf("grep %+v under LC_ALL=C.UTF-8 = %+v, want one match", opts, files)
+		}
+	}
+}
+
+// git grep that cannot read a blob prints "error: ... unable to read" and
+// still exits 0 with the other files' matches, or 1 with none. That is a
+// broken repository, not a result: Grep returns an error.
+func TestGrepUnreadableBlobIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "a.txt", "hello one\n", 0o644)
+	writeFile(t, dir, "b.txt", "hello two\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "c")
+	commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	oid := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD:b.txt"))
+	if err := os.Remove(filepath.Join(dir, ".git", "objects", oid[:2], oid[2:])); err != nil {
+		t.Fatal(err)
+	}
+	for _, pattern := range []string{"hello", "zzz"} {
+		files, err := Grep(context.Background(), dir, commit, GrepOptions{Pattern: pattern})
+		if err == nil || errors.Is(err, ErrBadPattern) {
+			t.Errorf("grep %q with b.txt's blob gone: files = %+v, err = %v, want git's read error", pattern, files, err)
 		}
 	}
 }

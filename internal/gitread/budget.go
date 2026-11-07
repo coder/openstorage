@@ -387,6 +387,9 @@ type Cmd struct {
 	// `rev-list` walk read incrementally). Its Write may return ErrStop to
 	// end git early. When nil, output is buffered, counted, and returned.
 	Stdout io.Writer
+	// Stderr, when set, also receives git's stderr, for a caller that must
+	// read git's messages when git exits 0.
+	Stderr io.Writer
 	Args   []string
 }
 
@@ -468,6 +471,9 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	cmd.WaitDelay = childWaitDelay
 	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
+	if c.Stderr != nil {
+		cmd.Stderr = io.MultiWriter(&stderr, c.Stderr)
+	}
 	var out *limitedBuffer
 	var stream *stopWriter
 	if c.Stdout != nil {

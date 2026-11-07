@@ -114,11 +114,19 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 	if len(opts.Pathspecs) > 0 {
 		args = append(append(args, "--"), opts.Pathspecs...)
 	}
-	out, err := runGit(ctx, Heavy, repoPath, args...)
+	var stderr tailBuffer
+	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Args: args, Stderr: &stderr})
+	var exitErr *exec.ExitError
+	noMatch := errors.As(err, &exitErr) && exitErr.ExitCode() == 1
+	// git grep that cannot read a blob prints "error: ..." and goes on: it
+	// exits 0 with the other files' matches, or 1 with none. That is a
+	// broken repository, not a result.
+	if msg := "\n" + stderr.String(); (err == nil || noMatch) && strings.Contains(msg, "\nerror: ") {
+		return nil, fmt.Errorf("git grep at %s could not read the repository: %s", commit, msg[1:])
+	}
 	if err != nil {
 		// Exit status 1 with empty output is git grep's "no matches".
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.TrimSpace(out) == "" {
+		if noMatch && strings.TrimSpace(out) == "" {
 			return []GrepFile{}, nil
 		}
 		// git dies with "-e option, '<pattern>': <reason>" for a pattern it
