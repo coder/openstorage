@@ -681,6 +681,28 @@ func TestHoldRefHoldsItsRefUntilRelease(t *testing.T) {
 	}
 }
 
+// TestHoldRefRefreshesPastItsTTL: a REST write can hold its ref longer
+// than pushHoldTTL (a slow intent write or CAS), so HoldRef's refresher
+// must keep the hold live. Without it the hold lapses after about one and
+// a half TTLs, and a push run could snapshot the ref before the CAS.
+func TestHoldRefRefreshesPastItsTTL(t *testing.T) {
+	prev := pushHoldTTL
+	pushHoldTTL = 2 * time.Second // the refresher touches it every 500 ms
+	t.Cleanup(func() { pushHoldTTL = prev })
+	cacheDir, repo := t.TempDir(), "repo_ttl"
+	release, err := HoldRef(context.Background(), cacheDir, repo, "refs/heads/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	time.Sleep(4500 * time.Millisecond) // past the lapse of an unrefreshed hold
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := WaitForPushPublication(ctx, cacheDir, repo); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("publication wait 4.5 s into a hold with a 2 s TTL = %v, want it still blocked: the hold lapsed", err)
+	}
+}
+
 // TestHoldRefReleasesWhenItCannotReserve: a HoldRef that gives up on a
 // conflicting hold leaves no hold file and no refresher behind.
 func TestHoldRefReleasesWhenItCannotReserve(t *testing.T) {

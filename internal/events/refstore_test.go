@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -549,6 +550,35 @@ func TestHeldBeforeCASReleasesOnPanic(t *testing.T) {
 		if released != 1 || len(env.deliveries) != 0 || len(env.syncPokes) != 0 {
 			t.Errorf("gen=%v: after a panicking CAS: %d releases, %d deliveries, %d pokes; want 1 release and nothing emitted",
 				gen, released, len(env.deliveries), len(env.syncPokes))
+		}
+	}
+}
+
+// TestHeldBeforeCASNilReleaseAsserts: a HeldBeforeCAS that succeeds
+// without a release is a bug in serve's wiring, and RefStore stops on it
+// before the inner CAS instead of writing without a hold to end.
+func TestHeldBeforeCASNilReleaseAsserts(t *testing.T) {
+	for _, gen := range []bool{false, true} {
+		inner := &fakeInner{won: true}
+		env := newEmitEnv(t, inner, twoHooks())
+		env.store.heldBeforeCAS = func(context.Context, string, string) (func(), error) {
+			return nil, nil
+		}
+		func() {
+			defer func() {
+				r, _ := recover().(string)
+				if !strings.Contains(r, "returned a nil release") {
+					t.Errorf("gen=%v: recovered %q, want the nil-release assertion", gen, r)
+				}
+			}()
+			if gen {
+				_, _, _ = env.store.CASRefGen(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
+			} else {
+				_, _ = env.store.CASRef(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
+			}
+		}()
+		if inner.cass != 0 {
+			t.Errorf("gen=%v: %d inner CASes after the assertion, want none", gen, inner.cass)
 		}
 	}
 }

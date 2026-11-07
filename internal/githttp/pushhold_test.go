@@ -301,6 +301,21 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	}
 }
 
+// TestReservePushHolds_LockOpenFailureIsNotRefHeld: a reservation lock
+// that cannot be opened (here a directory sits at its path) is a failure
+// a retry does not fix, so it must not match ErrRefHeld (the API's 503).
+func TestReservePushHolds_LockOpenFailureIsNotRefHeld(t *testing.T) {
+	dir := t.TempDir()
+	holdsDir := filepath.Join(dir, pushHoldDir)
+	if err := os.MkdirAll(holdsDir+".reserve.lock", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := reservePushHolds(context.Background(), filepath.Join(holdsDir, "push-own"), []string{"refs/heads/x"})
+	if err == nil || errors.Is(err, ErrRefHeld) {
+		t.Fatalf("reservation with an unopenable lock = %v, want a plain error that does not match ErrRefHeld", err)
+	}
+}
+
 // TestReservePushHolds_FailsClosedOnUnreadableHolds: an unreadable peer
 // hold is not proof of no conflict — the reservation must deny, never
 // proceed on a partial peer set.
