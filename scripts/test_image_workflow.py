@@ -141,7 +141,8 @@ def run_text(text, name):
     starts = [i for i, line in enumerate(lines) if line.strip() == "run: |"]
     assert len(starts) == 1, f"step {name!r} has {len(starts)} run blocks"
     run_indent = indent(lines[starts[0]])
-    body = lines[starts[0] + 1:]
+    rest = lines[starts[0] + 1:]
+    body = rest[:next((j for j, line in enumerate(rest) if line.strip() and indent(line) <= run_indent), len(rest))]
     assert any(line.strip() for line in body), f"step {name!r} has an empty run block"
     margin = run_indent + 2
     assert all(indent(line) >= margin for line in body if line.strip()), f"step {name!r}: uneven indent"
@@ -156,6 +157,7 @@ def sha(n):
     return "sha256:" + f"{n:x}".rjust(64, "0")
 
 
+VERSION = "9.9.9"
 AMD, ARM = sha(1), sha(2)
 A_IMG, A_ATT, B_IMG, B_ATT = sha(0x11), sha(0x12), sha(0x21), sha(0x22)
 PUBLISHED = sha(0x99)
@@ -201,14 +203,16 @@ class ImageWorkflowStepsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         text = WORKFLOW.read_text(encoding="utf-8")
-        # The steps run as `bash -e` only while nothing in the file sets a shell.
-        assert not re.search(r"^\s*(shell|defaults):", text, re.M), "image.yml sets a shell: run the steps with it"
+        # The steps run as `bash -e` only while no default shell is set and neither step sets one.
+        assert not re.search(r"^\s*defaults:", text, re.M), "image.yml sets a default shell: run the steps with it"
+        for name in (PROMOTE, CHECK):
+            assert not re.search(r"^\s*shell:", "\n".join(step_lines(text, name)), re.M), f"step {name!r} sets a shell"
         assert "${{" not in run_text(text, PROMOTE) + run_text(text, CHECK), "a run block holds an expression"
-        # This test sets the variables that the two steps read. The file must bind them to the same things.
+        # This test sets the variables that the two steps read. The file must bind each of them once, to the same things.
         publish = [line.strip() for line in job_lines(text, "publish")]
-        for binding in ("TAG: ${{ needs.resolve.outputs.tag }}", "VERSION: ${{ needs.resolve.outputs.version }}",
-                        "COMMIT: ${{ needs.resolve.outputs.commit }}"):
-            assert binding in publish, f"the publish job does not bind {binding}"
+        bound = [line for line in publish if re.match(r"(IMAGE|TAG|VERSION|COMMIT):", line)]
+        assert sorted(bound) == ["COMMIT: ${{ needs.resolve.outputs.commit }}", "TAG: ${{ needs.resolve.outputs.tag }}",
+                                 "VERSION: ${{ needs.resolve.outputs.version }}"], f"the publish job binds {bound}"
         assert "id: promote" in [line.strip() for line in step_lines(text, PROMOTE)], "promote step lost its id"
         assert "DIGEST: ${{ steps.promote.outputs.digest }}" in [line.strip() for line in step_lines(text, CHECK)], \
             "check step does not read the promote step's digest output"
@@ -240,7 +244,7 @@ class ImageWorkflowStepsTest(unittest.TestCase):
         env = {
             "PATH": f"{self.root / 'bin'}{os.pathsep}{os.environ['PATH']}",
             "WORLD": str(work / "world"),
-            "IMAGE": self.image, "VERSION": "9.9.9", "TAG": "v9.9.9",
+            "IMAGE": self.image, "VERSION": VERSION, "TAG": "v9.9.9",
             "COMMIT": "0" * 40, "GITHUB_REPOSITORY": "coder/openstorage",
             "GITHUB_OUTPUT": str(work / "output"), "GITHUB_STEP_SUMMARY": str(work / "summary"),
         }
@@ -269,6 +273,9 @@ class ImageWorkflowStepsTest(unittest.TestCase):
             dry = [c for c in calls if "--dry-run" in c]
             self.assertEqual(len(dry), 1, detail)
             self.assertEqual(creates[0], [a for a in dry[0] if a != "--dry-run"], detail)
+            # It gets the one tag that the "Refuse to replace" step checked.
+            tags = [creates[0][i + 1] for i, a in enumerate(creates[0]) if a == "--tag"]
+            self.assertEqual(tags, [f"{self.image}:{VERSION}"], detail)
         else:
             self.assertNotEqual(done.returncode, 0, detail)
             self.assertEqual(creates, [], detail)
@@ -404,6 +411,10 @@ class RunTextTest(unittest.TestCase):
 
     def test_reads_a_block_up_to_the_next_step(self):
         self.assertEqual(run_text(self.TEXT, "one"), "echo 1\n\necho 2\n")
+
+    def test_stops_at_a_key_after_the_block(self):
+        text = "      - name: one\n        run: |\n          echo 1\n        env:\n          A: b\n"
+        self.assertEqual(run_text(text, "one"), "echo 1\n")
 
     def test_reads_the_last_block(self):
         self.assertEqual(run_text(self.TEXT, "two"), "echo 3\n")
