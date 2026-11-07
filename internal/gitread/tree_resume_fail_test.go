@@ -407,41 +407,85 @@ func TestLsTreePageCursorChoosesTheEngineByTheSizeOfAFolder(t *testing.T) {
 	}
 }
 
-// A folder that is missing before the cursor fails a page that the stream
+// A folder before the cursor that git cannot read fails a page that the stream
 // answers, as it does for a first page, and not a page that the walk answers
-// (the files row of docs/reference/http-api.md): 1,500 folders of one file,
-// the tree of d00005 missing, and the cursor d00010/f0. A page of 1000 entries
-// is the stream's (TestLsTreePageCursorChoosesTheEngineByTheFoldersItReads), a
-// page of 200 is the walk's.
-func TestLsTreePageCursorOnAMissingFolderBeforeTheCursor(t *testing.T) {
-	var files []fiFile
-	for i := range 1500 {
-		files = append(files, fiFile{"100644", fmt.Sprintf("d%05d/f0", i), "x"})
-	}
-	dir, intact := fiRepo(t, files)
-	var listing strings.Builder
-	for _, line := range strings.Split(gitIn(t, dir, "", "ls-tree", intact), "\n") {
-		if fields := strings.Fields(line); strings.HasSuffix(line, "\td00005") {
-			line = strings.Replace(line, fields[2], strings.Repeat("a", 40), 1)
-		}
-		listing.WriteString(line + "\n")
-	}
-	broken := commitOf(t, dir, gitIn(t, dir, listing.String(), "mktree", "--missing"))
+// (the files row of docs/reference/http-api.md). The tree has 1,500 folders of
+// one file and the cursor is d00010/f0. A page of 1000 entries is the stream's
+// and a page of 200 is the walk's
+// (TestLsTreePageCursorChoosesTheEngineByTheFoldersItReads). The folder d00005
+// is missing, or an object that does not inflate, or the top of a chain of 10
+// folders under a core.maxTreeDepth of 3.
+func TestLsTreePageCursorOnABrokenFolderBeforeTheCursor(t *testing.T) {
+	const cursor = "d00010/f0"
 	ctx := context.Background()
+	oneFile := func(chain int) []fiFile {
+		var files []fiFile
+		for i := range 1500 {
+			path := fmt.Sprintf("d%05d/f0", i)
+			if i == 5 && chain > 0 {
+				path = fmt.Sprintf("d%05d/%sf0", i, strings.Repeat("c/", chain))
+			}
+			files = append(files, fiFile{"100644", path, "x"})
+		}
+		return files
+	}
+	// folder5 returns a commit of commit's tree with d00005 set to id, which
+	// need not exist.
+	folder5 := func(t *testing.T, dir, commit, id string) string {
+		var listing strings.Builder
+		for _, line := range strings.Split(gitIn(t, dir, "", "ls-tree", commit), "\n") {
+			if fields := strings.Fields(line); strings.HasSuffix(line, "\td00005") {
+				line = strings.Replace(line, fields[2], id, 1)
+			}
+			listing.WriteString(line + "\n")
+		}
+		return commitOf(t, dir, gitIn(t, dir, listing.String(), "mktree", "--missing"))
+	}
 	for _, c := range []struct {
-		limit  int
-		answer bool
-	}{{1000, false}, {200, true}} {
-		page, _, _, err := LsTreePage(ctx, dir, broken, "", "d00010/f0", c.limit)
-		if (err == nil) != c.answer {
-			t.Fatalf("limit %d: %d entries, err %v; want an answer %v", c.limit, len(page), err, c.answer)
-		}
-		if _, _, _, err := pageOracle(ctx, dir, broken, "", "d00010/f0", c.limit); err == nil {
-			t.Fatalf("limit %d: the stream answers, so the tree is not broken before the cursor", c.limit)
-		}
-		want, _, _, _ := LsTreePage(ctx, dir, intact, "", "d00010/f0", c.limit)
-		if c.answer && !slices.Equal(page, want) {
-			t.Fatalf("limit %d: the page differs from the page of the intact tree", c.limit)
-		}
+		name   string
+		files  []fiFile
+		break_ func(t *testing.T, dir, intact string) string
+	}{
+		{"missing", oneFile(0), func(t *testing.T, dir, intact string) string {
+			return folder5(t, dir, intact, strings.Repeat("a", 40))
+		}},
+		{"unreadable", oneFile(0), func(t *testing.T, dir, intact string) string {
+			id := strings.Repeat("b", 40)
+			file := filepath.Join(dir, "objects", id[:2], id[2:])
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte("not a zlib stream"), 0o444); err != nil {
+				t.Fatal(err)
+			}
+			return folder5(t, dir, intact, id)
+		}},
+		{"too deep", oneFile(10), func(t *testing.T, dir, intact string) string {
+			gitIn(t, dir, "", "config", "core.maxTreeDepth", "3")
+			return intact
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir, intact := fiRepo(t, c.files)
+			want, _, _, err := LsTreePage(ctx, dir, intact, "", cursor, 200)
+			if err != nil || len(want) != 200 {
+				t.Fatalf("the intact tree: %d entries, %v", len(want), err)
+			}
+			broken := c.break_(t, dir, intact)
+
+			_, _, _, err = LsTreePage(ctx, dir, broken, "", cursor, 1000)
+			_, _, _, streamErr := pageOracle(ctx, dir, broken, "", cursor, 1000)
+			if err == nil || streamErr == nil || err.Error() != streamErr.Error() {
+				t.Fatalf("limit 1000: err %v, the stream's %v; want the same error", err, streamErr)
+			}
+
+			page, _, _, err := LsTreePage(ctx, dir, broken, "", cursor, 200)
+			if err != nil || !slices.Equal(page, want) {
+				t.Fatalf("limit 200: %d entries, err %v; want the %d entries of the intact tree", len(page), err, len(want))
+			}
+			if _, _, _, err := pageOracle(ctx, dir, broken, "", cursor, 200); err == nil {
+				t.Fatal("limit 200: the stream answers, so the tree is not broken before the cursor")
+			}
+		})
 	}
 }

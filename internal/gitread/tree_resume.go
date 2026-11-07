@@ -41,7 +41,8 @@ import (
 // A page left to the stream fails on it as before.
 // Anything else it does not handle returns errDeclined, and LsTreePage then
 // pages by streaming `ls-tree -r`, which reads every entry the walk would
-// skip and gives the same answer. A page past the end is the stream's. So is
+// skip and gives the same page for a tree without such an object. A page
+// past the end is the stream's. So is
 // the page when git fails for the walk (leftToStream), whatever the cause.
 
 // errDeclined: the walk met something it leaves to the streaming listing,
