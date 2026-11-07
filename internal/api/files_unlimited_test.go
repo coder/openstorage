@@ -166,13 +166,13 @@ func TestFilesMetadataOverDistinctLastCommitsAnswers429(t *testing.T) {
 
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		// The 50,000-file listing below is slow under -race, and a busy
-		// host slows it more. Its 6.8 MB body is marshaled while it is
-		// written, so the delivery limits, counted from the first byte,
-		// cover that work too: with testGitReadPolicy's 1 minute, a stalled
-		// run got a truncated body. This test is about the 50,000 limit,
-		// not the git time budget or the delivery limits.
+		// host slows it more. Its body is marshaled while it is written,
+		// so the delivery limit, counted from the first byte, covers that
+		// work too: with testGitReadPolicy's 1 minute, a stalled run got a
+		// truncated body. This test is about the 50,000 limit, not the git
+		// time budget or the delivery limit.
 		policy := testGitReadPolicy(2, 10*time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits())
-		policy.writeIdle, policy.delivery, policy.streamDelivery = 10*time.Minute, 10*time.Minute, 10*time.Minute
+		policy.writeIdle, policy.delivery = 10*time.Minute, 10*time.Minute
 		withGitReadPolicy(t, policy)
 		token, dir := filesFastImportRepo(t, e, in.String())
 		parent := coreRevParse(t, dir, "main^")
