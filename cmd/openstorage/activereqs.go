@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/coder/openstorage/internal/api"
 )
 
 // activeRequests tracks in-flight HTTP requests, so a shutdown drain that
@@ -55,7 +57,7 @@ func (a *activeRequests) describe(now time.Time) []string {
 	sort.Slice(reqs, func(i, j int) bool { return reqs[i].start.Before(reqs[j].start) })
 	lines := make([]string, len(reqs))
 	for i, r := range reqs {
-		lines[i] = fmt.Sprintf("%s %q running for %v", r.method, r.path, now.Sub(r.start).Round(time.Millisecond))
+		lines[i] = fmt.Sprintf("%s %q running for %v", api.LogValue(r.method), api.LogValue(r.path), now.Sub(r.start).Round(time.Millisecond))
 	}
 	return lines
 }

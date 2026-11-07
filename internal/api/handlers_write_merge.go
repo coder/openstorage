@@ -147,7 +147,7 @@ func (s *server) wmInternal(w http.ResponseWriter, r *http.Request, op string, e
 	if s.writeRefHeldErr(w, r, op, err) {
 		return
 	}
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Error("internal error", "op", op, "method", LogValue(r.Method), "path", LogValue(r.URL.Path), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 

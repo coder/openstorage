@@ -34,7 +34,7 @@ func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, 
 	if s.writeGitLimitErr(w, r, op, err) || s.writeRefHeldErr(w, r, op, err) {
 		return
 	}
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Error("internal error", "op", op, "method", LogValue(r.Method), "path", LogValue(r.URL.Path), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
@@ -51,7 +51,7 @@ func (s *server) writeRefHeldErr(w http.ResponseWriter, r *http.Request, op stri
 	if !errors.Is(err, githttp.ErrRefHeld) {
 		return false
 	}
-	s.logger.Warn("ref write gave up waiting for a held ref", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Warn("ref write gave up waiting for a held ref", "op", op, "method", LogValue(r.Method), "path", LogValue(r.URL.Path), "err", err)
 	w.Header().Set("Retry-After", "1")
 	writeErr(w, http.StatusServiceUnavailable, refBusyMsg)
 	return true

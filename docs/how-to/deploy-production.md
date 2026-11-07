@@ -629,6 +629,11 @@ signal. For those rows the stable parts are the event text or prefix shown, its 
 fields, when it is emitted, and its channel (structured log or stderr). Free-form error
 text appended after it is not part of the contract.
 
+The `method` and `path` fields of the API's log lines (`http request`, `internal error`,
+`git read limit`, `panic in handler` and the others), and the in-flight requests that a
+timed-out shutdown drain lists, hold at most 1,024 bytes of the request's value, followed
+by `... (<n> bytes)` with its full size. A request line can be up to 1 MiB.
+
 | Signal (table) | Metric | Notes |
 |---|---|---|
 | API/git `5xx` rates per replica (What to monitor) | `openstorage_http_requests_total{code_class="5xx"}` by `surface` | Also `openstorage_http_request_duration_seconds` |

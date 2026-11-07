@@ -2,11 +2,13 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/meta"
@@ -30,7 +32,7 @@ func recoverPanics(logger *slog.Logger) middleware {
 					panic(rec)
 				}
 				logger.Error("panic in handler",
-					"method", r.Method, "path", r.URL.Path,
+					"method", LogValue(r.Method), "path", LogValue(r.URL.Path),
 					"panic", rec, "stack", string(debug.Stack()))
 				// Best effort: if the handler already started the response,
 				// this is a no-op superfluous WriteHeader.
@@ -67,6 +69,26 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+// maxLogValueBytes bounds a request value (the path, the method) in a log
+// record. Go's server reads a request line of up to MaxHeaderBytes (1 MiB
+// by default), and logRequests logs every request, unauthenticated ones
+// too.
+const maxLogValueBytes = 1024
+
+// LogValue is a request value for a log record: past maxLogValueBytes it
+// keeps the head, cut at a rune boundary, and the full size. serve's list
+// of in-flight requests at shutdown uses it too.
+func LogValue(v string) string {
+	if len(v) <= maxLogValueBytes {
+		return v
+	}
+	cut := maxLogValueBytes
+	for cut > maxLogValueBytes-utf8.UTFMax && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s... (%d bytes)", v[:cut], len(v))
+}
+
 // logRequests logs one line per request: method, path, status, duration.
 func logRequests(logger *slog.Logger) middleware {
 	assertf(logger != nil, "logRequests: nil logger")
@@ -80,7 +102,7 @@ func logRequests(logger *slog.Logger) middleware {
 				status = http.StatusOK // handler wrote nothing
 			}
 			logger.Info("http request",
-				"method", r.Method, "path", r.URL.Path,
+				"method", LogValue(r.Method), "path", LogValue(r.URL.Path),
 				"status", status, "duration", time.Since(start))
 		})
 	}

@@ -82,7 +82,7 @@ func newSyncServer(store meta.Store, creds upsync.CredentialStore, ups upsync.Up
 func (s *syncServer) internalErr(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil, "internalErr called with nil error")
 	assertf(op != "", "internalErr called with empty op")
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Error("internal error", "op", op, "method", LogValue(r.Method), "path", LogValue(r.URL.Path), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
