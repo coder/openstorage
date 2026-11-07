@@ -8,19 +8,20 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 - `Materialize` — hydrates the cache bare repo through `githttp.Hydrate` and returns its path [gitread.go:Materialize]
 - `ResolveRef` — resolves a branch, tag, full ref, or hex spec to a commit SHA. With `ephemeral` true it tries only the ephemeral-namespace name `auth.EphemeralRefName(spec)` and the hex spec, and skips the `refs/heads/`, `refs/tags/`, and full-ref candidates [gitread.go:ResolveRef]
 - Budgets: `Budget`, `NewBudget`, `WithLimits`, `WithBudget`, `BudgetFrom`, `Close`, `Limits`, `DefaultLimits`, `Slots`, `NewSlots`, `Class` (`Light`, `Heavy`), `Cmd`, `Run`, `CheckBlobSize`, `IsBudgetError` [budget.go:NewBudget]
+- `GitError` — `Run`'s error for git's own failure: it wraps the run's error and keeps git's stderr [budget.go:GitError]
 - Limit errors: `ErrBusy`, `ErrTimeBudget`, `ErrOutputLimit`, `ErrBlobTooLarge`, `ErrSymlinkTooLong`, `LimitPath`, `ErrMemoryLimit`, `ErrStop`; caps `HeavyHeapBytes`, `LightHeapBytes`, `DefaultOutputBytes`, `MaxBlobBytes` [budget.go:ErrBusy]
 - `HeapLimitSupported` [heaplimit.go:HeapLimitSupported]
 - Trees and blobs: `TreeEntry`, `EntryBlob`, `EntryTree`, `EntrySymlink`, `EntrySubmodule`, `LsTree`, `LsTreePage`, `ErrUnsortedTree`, `BlobInfo`, `StatBlob`, `CatBlobTo`, `ReadSymlinkTarget` [tree.go:LsTree]
 - History: `Commit`, `LogOptions`, `Log`, `CommitsBySHA`, `CommitDetail`, `GetCommit`, `LastCommits`, `ErrTooManyLastCommits` [log.go:Log] [lastcommits.go:LastCommits]
-- `BlameLine`, `Blame` [blame.go:Blame]
+- `BlameLine`, `Blame`, `ErrBadRange` [blame.go:Blame]
 - `FileDiff`, `DiffStats`, `DiffOptions`, `Diff` [diff.go:Diff]
-- `GrepLine`, `GrepFile`, `GrepOptions`, `GrepLineMatch`, `GrepLineContext`, `Grep` [grep.go:Grep]
+- `GrepLine`, `GrepFile`, `GrepOptions`, `GrepLineMatch`, `GrepLineContext`, `Grep`, `ErrBadPattern` [grep.go:Grep]
 - `ArchiveOptions`, `PreparedArchive`, `PrepareArchive`, `(*PreparedArchive).Stream`, `Archive`, `ValidArchivePrefix`, `MatchGlob` [archive.go:PrepareArchive]
 - `Tag`, `PeeledTags`, `Note` [refs.go:PeeledTags] [notes.go:Note]
 
 ## Invariants
 - `assertf` panics on programming errors such as an empty repo path or a non-SHA commit argument [gitread.go:assertf]
-- `ResolveRef` builds candidates only from `check-ref-format`-valid names, admits raw revisions only if they match `hexRevRe`, and returns budget errors unwrapped [gitread.go:ResolveRef]
+- `ResolveRef` builds candidates only from `check-ref-format`-valid names and admits raw revisions only if they match `hexRevRe`. Only git's exit 1 makes it answer `ErrNotFound`: every other git failure (a budget error, a kill, a fatal exit) is returned as is. An empty spec, a spec with a NUL byte, and one longer than `maxRefSpecBytes` (4096 bytes) are `ErrNotFound` before git runs [gitread.go:ResolveRef]
 - `IsBudgetError` errors must not be reported as not-found [budget.go:IsBudgetError]
 - `(*Budget).start` asserts the budget is open and returns `ErrTimeBudget` past the deadline; `limitedBuffer.Write` kills git once output is exhausted [budget.go:Budget.start]
 - `Run` never wraps `ExitError` for limit outcomes [budget.go:Run]
@@ -32,6 +33,8 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 - `mergeNumstat` and `mergePatches` error on any mismatch between the three diff passes [diff.go:mergeNumstat]
 - `LastCommits` fails with `ErrTooManyLastCommits` past `maxDistinct`; spool lines over 1 MiB or spool over 256 MiB fail with `ErrOutputLimit` [lastcommits.go:spoolWriter]
 - `Note` maps git exit 1 to `ErrNotFound`; `PeeledTags` skips non-commit tags [notes.go:Note]
+- A failed `Blame` reads only the exit status and fixed parts of git's stderr, never the path, which git rewrites in its messages. With ranges, exit 129, a line that starts `fatal: -L `, or a last line `fatal: file <path> has only N line(s)` is `ErrBadRange`. Otherwise `ls-tree` decides: a path that names no file (not one blob or symlink, or entries under `<path>/`) is `ErrNotFound`, and any other failure is returned [blame.go:Blame]
+- `Grep` answers exit 1 with no output as no match, and exit 128 with a last line that starts `fatal: -e option, '` as `ErrBadPattern`; every other failure is returned [grep.go:runGrep]
 
 ## Side Effects
 - `Materialize` writes the cache repo under `cacheDir`, reading packs from the blob store and refs from the ref store [gitread.go:Materialize]

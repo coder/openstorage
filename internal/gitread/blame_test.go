@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +104,53 @@ func TestBlameMissingPath(t *testing.T) {
 	// (modern git clamps an end past EOF, so "1,999" succeeds).
 	if _, err := Blame(ctx, f.dir, f.c1, "README.md", []string{"999,1000"}, false); err == nil || errors.Is(err, ErrNotFound) {
 		t.Errorf("range past EOF err = %v, want non-NotFound error", err)
+	}
+}
+
+// blame needs a file: a path that names an empty folder (ls-tree lists
+// the folder and nothing in it) is not found, not a git failure.
+func TestBlameOfAnEmptyFolderIsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare")
+	empty := strings.TrimSpace(mustGit(t, dir, "hash-object", "-t", "tree", "-w", "/dev/null"))
+	mk := exec.Command("git", "mktree")
+	mk.Dir = dir
+	mk.Env = append(os.Environ(), gitEnv...)
+	mk.Stdin = strings.NewReader("040000 tree " + empty + "\te\n")
+	tree, err := mk.Output()
+	if err != nil {
+		t.Fatalf("git mktree: %v", err)
+	}
+	commit := strings.TrimSpace(mustGit(t, dir, "commit-tree", strings.TrimSpace(string(tree)), "-m", "empty folder"))
+	if _, err := Blame(context.Background(), dir, commit, "e", nil, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("blame of an empty folder: err = %v, want ErrNotFound", err)
+	}
+}
+
+// A path that exists but whose blob or folder git cannot read is a
+// failure of the repository, not a missing path: blame returns git's
+// error, not ErrNotFound.
+func TestBlameOfAnUnreadableObjectIsNotNotFound(t *testing.T) {
+	for _, tc := range []struct{ name, path, object string }{
+		{"blob", "d/f.txt", "HEAD:d/f.txt"},
+		{"folder", "d/f.txt", "HEAD:d"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mustGit(t, dir, "init", "-q", "--initial-branch=main")
+			writeFile(t, dir, "d/f.txt", "one\n", 0o644)
+			mustGit(t, dir, "add", "-A")
+			mustGit(t, dir, "commit", "-q", "-m", "c")
+			commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+			oid := strings.TrimSpace(mustGit(t, dir, "rev-parse", tc.object))
+			if err := os.Remove(filepath.Join(dir, ".git", "objects", oid[:2], oid[2:])); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Blame(context.Background(), dir, commit, tc.path, nil, false)
+			if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrBadRange) {
+				t.Fatalf("blame with the %s object gone: err = %v, want git's failure", tc.name, err)
+			}
+		})
 	}
 }
 

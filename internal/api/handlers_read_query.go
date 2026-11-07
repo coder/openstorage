@@ -486,6 +486,15 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
 	}
+	if strings.ContainsRune(path, 0) {
+		// exec refuses a NUL in an argument, and no path holds one.
+		writeErr(w, http.StatusBadRequest, "path must not contain a NUL byte")
+		return
+	}
+	if pathLeavesRepo(path) {
+		writeErr(w, http.StatusBadRequest, "path is outside the repository")
+		return
+	}
 	ephemeral, err := coreBoolParam(q, "ephemeral")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -526,15 +535,11 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lines, err := gitread.Blame(r.Context(), repoPath, commit, path, ranges, detectMoves)
-	var exitErr *exec.ExitError
 	switch {
 	case errors.Is(err, gitread.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "path not found")
 		return
-	case errors.As(err, &exitErr):
-		// Ref and path shape were validated above; a git failure here means
-		// the -L range specs did not fit the file (bad syntax, out of
-		// bounds, unmatched /regex/) — client input, not a server fault.
+	case errors.Is(err, gitread.ErrBadRange):
 		writeErr(w, http.StatusBadRequest, "invalid range")
 		return
 	case err != nil:
@@ -837,12 +842,8 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		BeforeContext:   before,
 		AfterContext:    after,
 	})
-	var grepExitErr *exec.ExitError
 	switch {
-	case errors.As(err, &grepExitErr) && grepExitErr.ExitCode() == 128:
-		// The commit is a resolved SHA and pathspecs carry only :(literal)
-		// magic, so a git usage failure (exit 128) means the request's
-		// pattern is not a valid regex — client input, not a server fault.
+	case errors.Is(err, gitread.ErrBadPattern):
 		writeInvalidField(w, "query.pattern", "must be a valid pattern", "invalid query.pattern")
 		return
 	case err != nil:

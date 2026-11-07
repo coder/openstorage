@@ -78,15 +78,6 @@ type Server struct {
 	// (a pack-count read plus at most one job enqueue) and must never
 	// block on the fold itself. Nil disables triggering.
 	MaybeRepack func(ctx context.Context, repo string)
-	// StrictSyncFetch makes a push run's loopback fetch (an upload-pack
-	// whose token carries a sync claim) fail with 423 Locked when its
-	// hydrate skips a push-held ref that the cache has not caught up
-	// with, instead of serving the stale value for forwarding. The local
-	// schedule (SQLite, S3WAL; ADR-50) sets it: its runs restore their
-	// request on that answer. PostgreSQL leaves it off: a River run does
-	// not restore on a 423, so it would end failed instead.
-	StrictSyncFetch bool
-
 	// repackProbeMu guards the asynchronous post-push repack probe
 	// machinery (see dispatchRepackProbe): repackProbeQueued marks repos
 	// queued or running (per-repo coalescing), repackProbeRunning the
@@ -607,11 +598,13 @@ func serviceScope(service string) string {
 // ref locks and git re-validates client old-SHAs itself.
 //
 // A push run's loopback fetch (an upload-pack whose token carries a sync
-// claim) hydrates strictly under StrictSyncFetch: a held ref the cache
-// has not caught up with fails it with ErrHeldRefStale.
+// claim) hydrates strictly: a held ref the cache has not caught up with
+// fails it with ErrHeldRefStale, which hydrateFailed answers with 423
+// Locked, so the run restores its request instead of forwarding the stale
+// value (ADR-50).
 func (s *Server) hydrate(ctx context.Context, repo, service, defaultBranch string, claims *auth.Claims) (string, error) {
 	assertf(claims != nil, "hydrate: nil claims")
-	strict := s.StrictSyncFetch && service == "upload-pack" && claims.SyncClaim != ""
+	strict := service == "upload-pack" && claims.SyncClaim != ""
 	repoPath, refsErr, err := hydrateRefs(ctx, s.Store, s.Blob, s.CacheDir, repo, defaultBranch, strict)
 	if err != nil {
 		return "", err
