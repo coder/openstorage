@@ -93,7 +93,14 @@ func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) 
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	out, err := gitlimit.Output(cmd)
+	var out []byte
+	var err error
+	if dir == "" {
+		// Only `git init --bare <path>`: the repository does not exist yet.
+		out, err = gitlimit.Output(cmd)
+	} else {
+		out, err = gitlimit.OutputIn(dir, cmd)
+	}
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			err = fmt.Errorf("%w: %w", cerr, err)
@@ -1215,7 +1222,7 @@ func startLocalRefSeq(ctx context.Context, repoPath string) (*localRefSeq, error
 	if err != nil {
 		return nil, err
 	}
-	if err := gitlimit.Start(l.cmd); err != nil {
+	if err := gitlimit.StartIn(repoPath, l.cmd); err != nil {
 		return nil, fmt.Errorf("git for-each-ref: %w", err)
 	}
 	l.sc = bufio.NewScanner(stdout)
@@ -1513,7 +1520,7 @@ func updateRefStdin(repoPath, commands string) error {
 	cmd := exec.Command("git", "update-ref", "--stdin")
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(commands)
-	if out, err := gitlimit.CombinedOutput(cmd); err != nil {
+	if out, err := gitlimit.CombinedOutputIn(repoPath, cmd); err != nil {
 		return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil

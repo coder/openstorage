@@ -38,7 +38,7 @@ Background jobs. The package defines the `Queue` contract and two implementation
 - `Local` runs deliveries, sync, push, and repack on goroutines [local.go:EnqueueWebhookDelivery]
 - Sweeper lists `packs/` and `lfs/` blobs, quarantines under `sweep/quarantine/`, deletes, restores, and writes the LFS reap watermark [sweep.go:sweep]
 - Purge drops registry rows, reaps blob prefixes, and stamps the repo row purged [purge.go:purgeRepo]
-- Repack runs `git pack-objects` and `git show-index`, uploads the fold, and calls `ReplacePacks` [repack.go:runGitStdin]
+- Repack runs `git pack-objects` and `git show-index` under the repository's `gitlimit` lease, uploads the fold, and calls `ReplacePacks` [repack.go:runGitStdin]
 - LFS reclaim hydrates repos, walks reachable OIDs, marks, clears, and retires rows, and settles refunds [lfsreclaim.go:settleRepoRows]
 - The absence reconciler stats blobs, renews and rotates cover reservations, and writes scan-state cursors and the admission fence [absence.go:renewCovers]
 - Records `metrics.JobRun` for sweep and repack; logs through slog; tickers run on goroutines [sweep.go:Sweep]

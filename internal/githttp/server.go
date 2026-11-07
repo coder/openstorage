@@ -676,7 +676,7 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", "--advertise-refs", repoPath)
 	cmd.Stdout = w
 	cmd.Stderr = os.Stderr
-	if err := gitlimit.Run(cmd); err != nil {
+	if err := gitlimit.RunIn(repoPath, cmd); err != nil {
 		log.Printf("advertise %s %s: %v", service, repo, err)
 		abortIfStopped(err)
 	}
@@ -1052,7 +1052,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
-		if err := gitlimit.Start(cmd); err != nil {
+		if err := gitlimit.StartIn(repoPath, cmd); err != nil {
 			log.Printf("%s %s: start: %v", service, repo, err)
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
@@ -1194,7 +1194,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	} else {
 		cmd.Stdin = body
 		cmd.Stdout = w
-		runErr := gitlimit.Run(cmd)
+		runErr := gitlimit.RunIn(repoPath, cmd)
 		if runErr != nil {
 			// Headers are already sent; the pkt-line stream carries per-ref
 			// errors to the client. Just log.

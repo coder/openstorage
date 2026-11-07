@@ -735,7 +735,7 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	cmd.Stdin = stdin
 	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
-	out, err := gitlimit.Output(cmd)
+	out, err := gitlimit.OutputIn(sc.repoPath, cmd)
 	if err != nil {
 		return string(out), fmt.Errorf("%s: %w: %s", gitlimit.Name(args), err, strings.TrimSpace(stderr.String()))
 	}
@@ -846,7 +846,7 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	cmd.Stdin = f
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	o, err := gitlimit.Output(cmd)
+	o, err := gitlimit.OutputIn(sc.repoPath, cmd)
 	if err == nil {
 		return string(o), nil
 	}
@@ -1010,7 +1010,7 @@ func (sc *wcScratch) startBlobSink(ctx context.Context) (*wcBlobSink, error) {
 		return nil, err
 	}
 	sink.stdin = stdin
-	if err := gitlimit.Start(sink.cmd); err != nil {
+	if err := gitlimit.StartIn(sc.repoPath, sink.cmd); err != nil {
 		return nil, err
 	}
 	return sink, nil

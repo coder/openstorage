@@ -46,8 +46,14 @@ type group struct {
 	exited bool // the leader exited while stop ran, so wait holds it unreaped
 }
 
-// Start starts cmd as the leader of a new process group and tracks it.
-func Start(cmd *exec.Cmd) error { return children.start(cmd) }
+// Start starts cmd as the leader of a new process group and tracks it. A git
+// that runs in a cache repository starts through StartIn instead (lease.go).
+func Start(cmd *exec.Cmd) error {
+	if checkUnleased != nil {
+		checkUnleased(cmd)
+	}
+	return children.start(cmd)
+}
 
 // Wait waits for a child that Start started and stops tracking its group.
 func Wait(cmd *exec.Cmd) error { return children.wait(cmd) }
