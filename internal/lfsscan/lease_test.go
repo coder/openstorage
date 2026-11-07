@@ -1,9 +1,11 @@
 package lfsscan
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -75,11 +77,16 @@ func busy(t *testing.T, repo string) bool {
 }
 
 // All three stages of the scan are git children in the cache repository, and
-// each holds the lease on its own. After the scan returned, the lease stays
-// busy until the child of the last stage is gone, and then the scan's own
-// copy is gone too: a stage that missed the lease, or a lease that the scan
-// kept, shows here.
+// each holds the lease on its own. The fake git of every stage leaves a
+// sleeper, and each sleeper must hold descriptor LeaseFD on the lease file:
+// a stage that missed the lease shows here whatever the other stages hold.
+// After the scan returned, the lease stays busy until the last sleeper is
+// gone, and then the scan's own copy is gone too: a lease that the scan kept
+// shows there.
 func TestReachableLFSOIDsLeaseFollowsEveryStage(t *testing.T) {
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		t.Skip("no /proc/self/fd")
+	}
 	repo := t.TempDir()
 	pids := fakeGitPath(t)
 	if _, _, err := ReachableLFSOIDs(t.Context(), repo, 1<<20); err != nil {
@@ -89,9 +96,19 @@ func TestReachableLFSOIDsLeaseFollowsEveryStage(t *testing.T) {
 	if len(stages) != 3 {
 		t.Fatalf("the fake git ran %d times, want 3 (rev-list and two cat-file)", len(stages))
 	}
+	leaseFile, err := os.Stat(filepath.Join(repo, gitlimit.LeaseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range stages {
+		fd, err := os.Stat("/proc/" + strconv.Itoa(pid) + "/fd/" + strconv.Itoa(gitlimit.LeaseFD))
+		if err != nil || !os.SameFile(fd, leaseFile) {
+			t.Fatalf("the child %d of a stage does not hold the lease file as descriptor %d: %v", pid, gitlimit.LeaseFD, err)
+		}
+	}
 	for i, pid := range stages {
 		if !busy(t, repo) {
-			t.Fatalf("the lease is free with the children of %d stage(s) still alive: a stage did not get the lease", len(stages)-i)
+			t.Fatalf("the lease is free with the children of %d stage(s) still alive", len(stages)-i)
 		}
 		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
 			t.Fatal(err)
@@ -106,5 +123,38 @@ func TestReachableLFSOIDsLeaseFollowsEveryStage(t *testing.T) {
 			t.Fatal("the lease is still busy after the last stage's child exited: the scan kept its copy")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A scan that cannot take the lease leaves no pipe open. The stages' pipes
+// are made after the lease, because exec.Cmd closes them only in a Start that
+// runs, and a refused scan would otherwise leak ten descriptors until a
+// garbage collection.
+func TestReachableLFSOIDsLeavesNoPipeOpenWhenTheLeaseFails(t *testing.T) {
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		t.Skip("no /proc/self/fd")
+	}
+	openFDs := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(entries)
+	}
+	repo := t.TempDir()
+	held, err := gitlimit.TryExclusive(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // a collection would close leaked pipes
+	before := openFDs()
+	if _, _, err := ReachableLFSOIDs(ctx, repo, 1<<20); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReachableLFSOIDs while the lease is held = %v, want the deadline error", err)
+	}
+	if after := openFDs(); after != before {
+		t.Fatalf("open descriptors: %d before, %d after a scan that failed on the lease", before, after)
 	}
 }
