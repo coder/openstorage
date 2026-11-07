@@ -154,13 +154,15 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 				requireEnvelope(t, resp, body)
 			})
 		}
-		// Only git's exit 1 says that git rejects the name.
-		for _, how := range []string{"128", "kill"} {
-			t.Run("git "+how+" on check-ref-format is 500, not 400", func(t *testing.T) {
+		// Only git's exit 1 says that git rejects the name. validBranchName
+		// refuses every name above before git runs, so a fake git gives
+		// the exit 1 too.
+		for how, want := range map[string]int{"1": http.StatusBadRequest, "128": http.StatusInternalServerError, "kill": http.StatusInternalServerError} {
+			t.Run("git "+how+" on check-ref-format", func(t *testing.T) {
 				gitFailsOnArg(t, "refs/heads/feature", how)
 				resp, body := e.doReq(t, http.MethodPatch, "/api/v1/repo", writeTok, []byte(`{"default_branch":"feature"}`), "")
-				if resp.StatusCode != http.StatusInternalServerError {
-					t.Fatalf("PATCH = %d, want 500: %s", resp.StatusCode, body)
+				if resp.StatusCode != want {
+					t.Fatalf("PATCH = %d, want %d: %s", resp.StatusCode, want, body)
 				}
 			})
 		}

@@ -20,7 +20,7 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 
 ## Invariants
 - `assertf` panics on programming errors such as an empty repo path or a non-SHA commit argument [gitread.go:assertf]
-- `ResolveRef` builds candidates only from `check-ref-format`-valid names and admits raw revisions only if they match `hexRevRe`. Only git's exit 1 makes it answer `ErrNotFound`: every other git failure (a budget error, a kill, a fatal exit) is returned as is. A spec with a NUL byte or longer than `maxRefSpecBytes` (4096 bytes) is `ErrNotFound` before git runs [gitread.go:ResolveRef]
+- `ResolveRef` builds candidates only from `check-ref-format`-valid names and admits raw revisions only if they match `hexRevRe`. Only git's exit 1 makes it answer `ErrNotFound`: every other git failure (a budget error, a kill, a fatal exit) is returned as is. An empty spec, a spec with a NUL byte, and one longer than `maxRefSpecBytes` (4096 bytes) are `ErrNotFound` before git runs [gitread.go:ResolveRef]
 - `IsBudgetError` errors must not be reported as not-found [budget.go:IsBudgetError]
 - `(*Budget).start` asserts the budget is open and returns `ErrTimeBudget` past the deadline; `limitedBuffer.Write` kills git once output is exhausted [budget.go:Budget.start]
 - `Run` never wraps `ExitError` for limit outcomes [budget.go:Run]

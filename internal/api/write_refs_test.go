@@ -731,6 +731,13 @@ func TestWriteRefsNotes(t *testing.T) {
 				if resp.StatusCode != http.StatusInternalServerError {
 					t.Fatalf("delete: status = %d body %v, want 500", resp.StatusCode, body)
 				}
+				// An add cannot tell whether a note exists either: 500, not
+				// 409 and not an add over it.
+				resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+					map[string]any{"sha": fx.c1, "note": "again", "ref": ref})
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("add: status = %d body %v, want 500", resp.StatusCode, body)
+				}
 			})
 		}
 
