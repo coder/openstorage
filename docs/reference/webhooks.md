@@ -90,7 +90,14 @@ of upstream's schemas.
 ### `repo.push_upstream.started` / `repo.push_upstream.succeeded` / `repo.push_upstream.failed`
 
 open.storage extension for outbound push-upstream runs (see
-[Upstream sync](http-api.md#upstream-sync)). Upstream has no outbound-run event. The body
+[Upstream sync](http-api.md#upstream-sync)). Upstream has no outbound-run event. A run
+sends `repo.push_upstream.started` once its loopback fetch has the snapshot it forwards,
+before it pushes to the upstream. A run that fails before or at that fetch sends
+`started` right before `failed`, with these exceptions. On SQLite and S3WAL, a run that
+a write in progress holds back sends no event. A run that `DELETE /repos/base` or a
+server shutdown cancels, or whose claim another worker took over, ends with no
+`succeeded` or `failed`, even when it sent `started`. "Events and cancellation" under
+[Upstream sync](http-api.md#upstream-sync) has more on held-back and cancelled runs. The body
 has the `repo.sync.*` fields, with `type` set to the event name, plus:
 
 | Field | Meaning |

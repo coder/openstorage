@@ -241,6 +241,9 @@ func wcFailRefGuard(w http.ResponseWriter, msg, branch, oldSHA, currentSHA strin
 // body on every route, so merge can share it through wcResolveRepo.
 func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wcInternal: nil error or empty op")
+	if s.writeRefHeldErr(w, r, op, err) {
+		return
+	}
 	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
