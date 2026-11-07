@@ -47,10 +47,10 @@ const (
 	// stderrKeepBytes bounds the stderr kept per child (its tail: git
 	// prints its fatal message last).
 	stderrKeepBytes = 64 << 10
-	// maxErrArgvBytes bounds the git command line that Run's errors quote.
-	// An argv can be request-sized (a grep pattern or a list of paths; past
-	// 128 KiB, exec fails with E2BIG), and these errors reach the server's
-	// log. 4096 keeps a command with any one path (PATH_MAX on Linux) whole.
+	// maxErrArgvBytes bounds the git command line that errors quote.
+	// An argv can be request-sized (a grep pattern, a list of paths, a
+	// commit message; past 128 KiB, exec fails with E2BIG), and these
+	// errors reach the server's log. 4096 keeps a command with any one path (PATH_MAX on Linux) whole.
 	maxErrArgvBytes = 4096
 	// childWaitDelay bounds how long Wait may block on git's output pipes
 	// after git is killed (exec.Cmd.WaitDelay).
@@ -376,7 +376,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
 	assertf(len(c.Args) > 0, "Run: no git args")
-	name := commandName(c.Args)
+	name := CommandLine(c.Args)
 
 	b := BudgetFrom(ctx)
 	var heap int64 // no Budget (write endpoints): no limits at all
@@ -439,9 +439,9 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	return stdout, fmt.Errorf("%s: %w: %s", name, err, msg)
 }
 
-// commandName is the git command line that Run's errors quote. Past
+// CommandLine is the git command line that an error quotes. Past
 // maxErrArgvBytes it keeps the head, cut at a rune boundary, and the size.
-func commandName(args []string) string {
+func CommandLine(args []string) string {
 	name := "git " + strings.Join(args, " ")
 	if len(name) <= maxErrArgvBytes {
 		return name

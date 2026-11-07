@@ -734,7 +734,8 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	cmd.Stderr = &stderr
 	out, err := gitlimit.Output(cmd)
 	if err != nil {
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		// The argv can be request-sized (commit-tree -m <message>).
+		return string(out), fmt.Errorf("%s: %w: %s", gitread.CommandLine(args), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
 }
