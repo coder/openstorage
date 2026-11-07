@@ -2440,14 +2440,17 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 		// registered-but-unimportable PGP key would re-spawn gpg once per
 		// ref at the same tip without charging any budget (Codex round
 		// 15).
-		// The cached reason reaches the pusher through later refs'
-		// denials, so it names no cause: the cause (a gpg diagnostic, a
-		// file error) goes to the hook-errors file with this error.
+		// The reason reaches the pusher, so it names no cause: the cause
+		// (a gpg diagnostic, a file error) goes to the hook-errors file
+		// now, because later refs, and a non-atomic pre-receive that
+		// passes this push for its other refs, see only the cached
+		// denial.
+		hookErrorsLogger().Error("verify-sig: signing keyring unusable", "err", err)
 		reason := "signing keyring unusable (the server log has the cause)"
 		if cacheErr := state.markCommitDenied(pending[0], reason); cacheErr != nil {
 			return fmt.Errorf("verify-sig: %w", cacheErr)
 		}
-		return fmt.Errorf("verify-sig: %w", err)
+		return verifySigDenied(refName, pending[0], reason)
 	}
 	defer cleanup()
 
@@ -2694,13 +2697,17 @@ func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason stri
 	msg := condenseGitReason(out)
 	if msg == "" {
 		// git verify-commit is silent for unsigned commits.
-		msg = "commit is not signed"
+		return "commit is not signed"
 	}
-	return msg
+	// The verifier's output can name server paths (the temporary
+	// allowed-signers file) and key diagnostics: the hook-errors file
+	// gets it, the pusher the documented reason.
+	hookErrorsLogger().Error("verify-sig: signature check failed", "sha", sha, "detail", msg)
+	return "no registered key matches the signature (the server log has the verifier's output)"
 }
 
 // condenseGitReason squeezes git/gpg/ssh-keygen diagnostics into one short
-// line for the per-ref rejection message.
+// line for the hook-errors record of a rejected commit.
 func condenseGitReason(out []byte) string {
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	var kept []string

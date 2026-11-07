@@ -199,12 +199,13 @@ func TestUpdateHookHidesStoreErrors(t *testing.T) {
 
 // unverifiedCommit makes a commit that no ref reaches, so verify-sig must
 // check it, and points the hook at its repository and at an empty verify
-// state for one push.
-func unverifiedCommit(t *testing.T) string {
+// state for one push. gitFlags go before git's subcommand, such as
+// sshSigningArgs.
+func unverifiedCommit(t *testing.T, gitFlags ...string) string {
 	t.Helper()
 	repo := t.TempDir()
-	for _, args := range [][]string{{"init", "-q"}, {"commit", "-q", "--allow-empty", "-m", "unsigned"}} {
-		if out, err := exec.Command("git", append(append([]string{"-C", repo}, gitIdentity...), args...)...).CombinedOutput(); err != nil {
+	for _, args := range [][]string{{"init", "-q"}, {"commit", "-q", "--allow-empty", "-m", "unverified"}} {
+		if out, err := exec.Command("git", append(append(append([]string{"-C", repo}, gitIdentity...), gitFlags...), args...)...).CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
 		}
 	}
@@ -225,10 +226,11 @@ func unverifiedCommit(t *testing.T) string {
 	return commit
 }
 
-// A registered signing key that the hook cannot use: the first ref's
-// update fails with the fixed line, the hook-errors file has the cause, and
-// a later ref at the same tip gets the cached denial, which names no cause.
-func TestVerifySigKeepsTheKeyringCauseOffThePusher(t *testing.T) {
+// signingKeyEnv sets up a SQLite metadata store whose org "t-org" has one
+// registered signing key with keyText, and the hook env for it. It returns
+// the hook-errors file's path.
+func signingKeyEnv(t *testing.T, keyText string) string {
+	t.Helper()
 	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "meta.db")
 	ms, err := meta.Open(t.Context(), dbURL)
 	if err != nil {
@@ -241,24 +243,49 @@ func TestVerifySigKeepsTheKeyringCauseOffThePusher(t *testing.T) {
 	if _, err := ms.UpsertOrgWithKeys(t.Context(), "t-org", []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ms.AddSigningKey(t.Context(), "t-org", "not a signing key"); err != nil {
+	if _, err := ms.AddSigningKey(t.Context(), "t-org", keyText); err != nil {
 		t.Fatal(err)
 	}
 	records := hookEnv(t, dbURL)
-	commit := unverifiedCommit(t)
 	t.Setenv(EnvRefsPolicy, `[["*",["verify-sig"]]]`)
-	err = RunHook(t.Context(), []string{"update", "refs/heads/main", ref.ZeroSHA, commit})
-	if err == nil || err.Error() != hookFailedLine {
-		t.Fatalf("first ref = %v; want %q", err, hookFailedLine)
+	return records
+}
+
+// A registered signing key that the hook cannot use: every ref at the tip
+// gets a denial that names no cause, and the hook-errors file has the
+// cause from the first evaluation, which is the only one that sees it.
+func TestVerifySigKeepsTheKeyringCauseOffThePusher(t *testing.T) {
+	records := signingKeyEnv(t, "not a signing key")
+	commit := unverifiedCommit(t)
+	for _, name := range []string{"refs/heads/main", "refs/heads/other"} {
+		err := RunHook(t.Context(), []string{"update", name, ref.ZeroSHA, commit})
+		want := "verify-sig denied " + name + " at " + commit + ": signing keyring unusable (the server log has the cause)"
+		if err == nil || err.Error() != want {
+			t.Fatalf("%s = %v; want %q", name, err, want)
+		}
 	}
 	const cause = "neither an SSH public key line nor an armored PGP block"
-	if got := readRecords(t, records); !strings.Contains(got, cause) {
-		t.Fatalf("the hook-errors file lacks the keyring cause: %s", got)
+	if got := readRecords(t, records); strings.Count(got, cause) != 1 {
+		t.Fatalf("the hook-errors file does not have the keyring cause once: %s", got)
 	}
-	err = RunHook(t.Context(), []string{"update", "refs/heads/other", ref.ZeroSHA, commit})
-	want := "verify-sig denied refs/heads/other at " + commit + ": signing keyring unusable (the server log has the cause)"
+}
+
+// A signed commit that the verifier rejects: the denial gives the
+// documented reason, not the verifier's output, which names the temporary
+// allowed-signers file. The hook-errors file has the output.
+func TestVerifySigKeepsVerifierOutputOffThePusher(t *testing.T) {
+	// An SSH key line whose key does not decode: the keyring builds, and
+	// ssh-keygen rejects the allowed-signers file during the check.
+	records := signingKeyEnv(t, "ssh-ed25519 AAAAnotakey")
+	priv, _ := genSSHKey(t)
+	commit := unverifiedCommit(t, sshSigningArgs(priv)...)
+	err := RunHook(t.Context(), []string{"update", "refs/heads/main", ref.ZeroSHA, commit})
+	want := "verify-sig denied refs/heads/main at " + commit + ": no registered key matches the signature (the server log has the verifier's output)"
 	if err == nil || err.Error() != want {
-		t.Fatalf("later ref = %v; want %q", err, want)
+		t.Fatalf("update = %v; want %q", err, want)
+	}
+	if got := readRecords(t, records); !strings.Contains(got, "allowed_signers") || !strings.Contains(got, commit) {
+		t.Fatalf("the hook-errors file lacks the verifier's output for the commit: %s", got)
 	}
 }
 
