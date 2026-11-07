@@ -1,17 +1,19 @@
 """Regression tests for the documented check-doc-links.py command."""
 from pathlib import Path
+import os
 import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
 class CheckerTestCase(unittest.TestCase):
     def run_checker(self, readme, docs=None, files=None, untracked=None, deleted=(), symlinks=None, git=True,
-                    untracked_symlinks=None, intent_to_add=()):
+                    untracked_symlinks=None, intent_to_add=(), index_flags=None, env=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -43,9 +45,11 @@ class CheckerTestCase(unittest.TestCase):
                 (root / name).unlink()
             if intent_to_add:
                 subprocess.run(["git", "add", "-N", "--", *intent_to_add], cwd=root, check=True)
+            for name, flag in (index_flags or {}).items():
+                subprocess.run(["git", "update-index", flag, "--", name], cwd=root, check=True)
             return subprocess.run(
                 [sys.executable, str(checker)], cwd=root, text=True,
-                capture_output=True, timeout=10,
+                capture_output=True, timeout=10, env=env,
             )
 
 
@@ -388,6 +392,183 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
         self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
 
+    def test_only_a_line_feed_ends_a_line_of_a_shell_script_or_a_unit_file(self):
+        # str.splitlines also splits on these, and neither bash nor systemd does: the rest of a comment stays a comment.
+        for name, sep in [("vt", "\x0b"), ("ff", "\x0c"), ("fs", "\x1c"), ("gs", "\x1d"), ("rs", "\x1e"), ("nel", "\x85"),
+                          ("ls", "\u2028"), ("ps", "\u2029"), ("cr", "\r")]:
+            with self.subTest(separator=name):
+                files = {"pkg/run.sh": f"echo ok # note{sep}hidden-word\nreal-word\n"}
+                cited = ["[run.sh:hidden-word]", "[run.sh:real-word]"]
+                if sep != "\r":  # systemd and Python end a line at a lone carriage return
+                    files["pkg/app.service"] = f"# note{sep}[Hidden]\n[Real]\n"
+                    cited += ["[app.service:Hidden]", "[app.service:Real]"]
+                result = self.check_readme(" ".join(cited) + "\n", **files)
+                self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in cited if "idden" in c])
+
+    def test_a_carriage_return_line_feed_still_ends_a_line_in_every_reader(self):
+        files = {
+            "pkg/run.sh": "echo ok # note\r\nreal-word\r\n",
+            "pkg/app.service": "# note\r\n[Real]\r\n",
+            "pkg/demo.go": "package demo\r\n\r\n// func Hidden() {}\r\nfunc Real() {}\r\n",
+            "pkg/tool.py": "# def hidden(): pass\r\ndef real():\r\n    pass\r\n",
+            "pkg/main.tf": 'resource "aws_s3_bucket" "b" {\r\n  policy = <<EOT\r\n  hidden_block {\r\n  }\r\nEOT\r\n  lifecycle {\r\n  }\r\n}\r\n',
+            "pkg/flow.js": "// function hidden() {}\r\nfunction real() {}\r\n",
+        }
+        ok = ["[run.sh:real-word]", "[app.service:Real]", "[demo.go:Real]", "[tool.py:real]", "[main.tf:aws_s3_bucket.b]",
+              "[main.tf:aws_s3_bucket.b.lifecycle]", "[flow.js:real]"]
+        bad = ["[demo.go:Hidden]", "[tool.py:hidden]", "[main.tf:aws_s3_bucket.b.hidden_block]", "[flow.js:hidden]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_lone_carriage_return_ends_a_line_in_python_and_systemd_but_not_in_bash(self):
+        files = {
+            "pkg/run.sh": "echo ok # note\rhidden-word\nreal-word\n",
+            "pkg/tool.py": 'x = 1  # c\r"""\ndef hidden(): pass\n"""\ndef real(): pass\n',
+            "pkg/app.service": "[Unit]\nDescription=a \\\r# c\n[Hidden]\n[Service]\nExecStart=/bin/true\n",
+        }
+        ok = ["[run.sh:real-word]", "[tool.py:real]", "[tool.py:x]", "[app.service:Service]"]
+        bad = ["[run.sh:hidden-word]", "[tool.py:hidden]", "[app.service:Hidden]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_lone_carriage_return_does_not_end_a_go_or_terraform_comment(self):
+        files = {
+            "pkg/demo.go": "package demo\n\n// note\rfunc Hidden() {}\nfunc Real() {}\n",
+            "pkg/main.tf": '# c\rresource "a" "hidden" {}\nlocals {\n  a = 1 # c\rb = 2\n  c = 3\n}\n',
+        }
+        ok = ["[demo.go:Real]", "[main.tf:local.a]", "[main.tf:local.c]"]
+        bad = ["[demo.go:Hidden]", "[main.tf:a.hidden]", "[main.tf:local.b]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_carriage_return_in_go_code_is_white_space_that_ends_a_line_for_the_reader(self):
+        # Go reads the carriage return before `}` as white space, so the struct is closed and `println` is a call in init.
+        go = "package demo\n\ntype T struct {\n\tF int\r}\nfunc init() {\n\tprintln(\"x\")\n}\n"
+        ok = ["[demo.go:T]", "[demo.go:T.F]", "[demo.go:init]"]
+        bad = ["[demo.go:T.println]", "[demo.go:println]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/demo.go": go})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_line_feed_and_a_carriage_return_in_either_order_end_one_unit_file_line(self):
+        for kind, section in [("service", "Service"), ("timer", "Timer")]:
+            for name, end in [("lf_cr", "\n\r"), ("cr_lf", "\r\n"), ("cr", "\r"), ("lf", "\n")]:
+                with self.subTest(kind=kind, end=name):
+                    unit = f"[Unit]{end}Description=a \\{end}[Hidden]{end}[{section}]{end}Key=value{end}"
+                    result = self.check_readme(f"[app.{kind}:Hidden] [app.{kind}:{section}]\n", **{f"pkg/app.{kind}": unit})
+                    self.assert_failures(result, ("UNRESOLVED CITATION", f"[app.{kind}:Hidden]"))
+
+    def test_a_carriage_return_line_feed_and_a_carriage_return_are_two_unit_file_line_ends(self):
+        # systemd reads the pair, then the lone carriage return: an empty line ends the continuation, so `[Hidden]` is a header.
+        unit = "[Unit]\nDescription=a \\\r\n\r[Hidden]\nKey=value\n"
+        result = self.check_readme("[app.service:Hidden]\n", **{"pkg/app.service": unit})
+        self.assertEqual(result.stdout, "broken links: 0\n")
+
+    def test_a_unit_file_reads_a_section_header_and_a_comment_as_systemd_does(self):
+        # systemd trims only a space and a tab, allows nothing after `]`, and ends a line at a NUL.
+        files = {
+            "pkg/ff_comment.service": "[Unit]\n\x0c# note \\\n[Hidden]\n[Service]\nExecStart=/bin/true\n",
+            "pkg/after.service": "[Unit]\n[Hidden]x\n[Spaced] \t\n",
+            "pkg/feed_after.service": "[Unit]\n[Hidden]\x0c\n",
+            "pkg/nul.service": "[Unit]\nDescription=a \\\x00# c\n[Hidden]\n",
+        }
+        ok = ["[ff_comment.service:Service]", "[after.service:Spaced]", "[after.service:Unit]"]
+        bad = ["[ff_comment.service:Hidden]", "[after.service:Hidden]", "[feed_after.service:Hidden]", "[nul.service:Hidden]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_a_form_feed_resets_the_python_indent_so_the_reader_reads_nothing_after_it(self):
+        py = "class A:\n    def m(self): pass\n\x0cdef hidden(): pass\ndef real(): pass\n"
+        result = self.check_readme("[tool.py:A.m] [tool.py:A.hidden] [tool.py:real]\n", **{"pkg/tool.py": py})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[tool.py:A.hidden]"))
+
+    def test_a_name_next_to_a_backslash_and_a_line_feed_is_not_mentioned_in_a_shell_script(self):
+        # `foo\\<LF>bar` is the word foobar in bash, and two literal lines inside single quotes. Neither reads as foo or bar.
+        sh = "echo foo\\\nbar\necho 'baz\\\nqux'\necho spaced \\\n  after\nreal-word\n"
+        ok = ["[run.sh:real-word]", "[run.sh:spaced]", "[run.sh:after]"]
+        bad = ["[run.sh:foo]", "[run.sh:bar]", "[run.sh:baz]", "[run.sh:qux]"]
+        result = self.check_readme(" ".join(ok + bad) + "\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in bad])
+
+    def test_only_a_space_or_a_tab_puts_a_hash_at_the_start_of_a_shell_word(self):
+        # In bash `a<FF>#` is one word, so the `#` starts no comment and the next word is code.
+        sh = "echo a\x0c# real-word\necho b\t# hidden-word\n"
+        result = self.check_readme("[run.sh:real-word] [run.sh:hidden-word]\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[run.sh:hidden-word]"))
+
+    def test_a_shell_script_that_holds_a_nul_mentions_no_name(self):
+        # Bash drops a NUL, so `echo a <NUL>#hidden` is a comment, and the reader would read `hidden` as code.
+        files = {"pkg/nul.sh": "echo a \x00#hidden\nreal-word\n", "pkg/plain.sh": "echo a #hidden\nreal-word\n"}
+        result = self.check_readme("[nul.sh:hidden] [nul.sh:real-word] [plain.sh:hidden] [plain.sh:real-word]\n", **files)
+        self.assert_failures(result, *[("UNRESOLVED CITATION", c) for c in ("[nul.sh:hidden]", "[nul.sh:real-word]", "[plain.sh:hidden]")])
+
+    def test_a_backtick_starts_a_shell_comment(self):
+        sh = "echo `#hidden-word` shown-after\nreal-word\n"
+        result = self.check_readme("[run.sh:real-word] [run.sh:hidden-word]\n", **{"pkg/run.sh": sh})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[run.sh:hidden-word]"))
+
+    def test_only_a_space_and_a_tab_make_a_markdown_line_blank_or_close_a_fence(self):
+        # CommonMark counts a form feed or NEL as text, so each link below renders. str.strip() would treat it as blank.
+        cases = {
+            "fence": ("~~~\ncode\n~~~\x0c\n~~~\n[Gone](gone.md)\n", "README.md:5"),
+            "blank": ("para\n\x0c\n    [Gone](gone.md)\n", "README.md:3"),
+            "span": ("a `\n\x0c\nx` [Gone](gone.md) `y`\n", "README.md:3"),
+            "item": ("- a\n\x0c\n      [Gone](gone.md)\n", "README.md:3"),
+            "nel": ("para\n\x85\n    [Gone](gone.md)\n", "README.md:3"),
+            "item-content": ("`[Gone](gone.md)\n- \x1e\n`\n", "README.md:1"),
+            "quote": (">\x1d\n\t[Gone](gone.md)\n", "README.md:2"),
+            "item-marker": ("-   \x0c\n\n      [Gone](gone.md)\n", "README.md:3"),
+            "item-text": ("-\n\x0c\n   [\n    *     ](gone.md)\n", "README.md:4"),
+            "lazy-line": ("- a\n\x0c\n\n    [Gone](gone.md)\n", "README.md:4"),
+        }
+        for name, (readme, where) in cases.items():
+            with self.subTest(case=name):
+                result = self.run_checker(readme)
+                self.assertEqual(result.stdout, f"BROKEN FILE {where} -> gone.md\nbroken links: 1\n")
+
+    def test_a_list_item_that_starts_with_a_blank_line_has_its_content_one_column_past_the_marker(self):
+        # CommonMark starts the content of such an item one column past its marker, however many spaces or tabs follow.
+        # An item that starts with text keeps the spaces after its marker: four of them make the content column.
+        cases = {"bullet": ("-\n     [Gone](gone.md)\n", 2), "ordered": ("1.   \n\t[Gone](gone.md)\n", 2), "tab": ("-\t\n     [Gone](gone.md)\n", 2),
+                 "text": ("-   a\n\n      [Gone](gone.md)\n", 3)}
+        for name, (readme, line) in cases.items():
+            with self.subTest(case=name):
+                result = self.run_checker(readme)
+                self.assertEqual(result.stdout, f"BROKEN FILE README.md:{line} -> gone.md\nbroken links: 1\n")
+        for name, readme in {"code": "-\n      [Gone](gone.md)\n", "ordered": "1.\n        [Gone](gone.md)\n", "blank": "-\n\n      [Gone](gone.md)\n"}.items():
+            with self.subTest(case=f"{name} code"):
+                self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
+
+    def test_a_list_item_that_begins_with_two_blank_lines_is_empty(self):
+        # CommonMark lets an item begin with one blank line. After a second one the item is empty, so the lines below
+        # are a paragraph, and a paragraph line can start with `*` and four spaces. An item with text keeps them.
+        link = "[\n    *     ](gone.md)\n"
+        result = self.run_checker("1)  \n\n   " + link)
+        self.assertEqual(result.stdout, "BROKEN FILE README.md:4 -> gone.md\nbroken links: 1\n")
+        # A line that holds only a form feed is text, so it does not make the item empty either.
+        for readme in ["- a\n\n  " + link, "-\n  b\n\n  " + link, "-\n   \x0c\n    *     ](gone.md)\n"]:
+            with self.subTest(readme=readme):
+                self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
+
+    def test_only_spaces_and_tabs_separate_a_link_destination_from_its_title(self):
+        # CommonMark takes a form feed or NEL after a destination as part of the text, so the link below renders.
+        for name, sep in [("ff", "\x0c"), ("nel", "\x85"), ("ls", "\u2028")]:
+            with self.subTest(separator=name):
+                link = f"[a](README.md{sep}'[Gone](gone.md')"
+                result = self.run_checker(link + "\n")
+                self.assertEqual(result.stdout, f"UNSUPPORTED UNPARSED LINK README.md:1 -> {link}\nbroken links: 1\n")
+        result = self.run_checker("[a](README.md 'a title') [b](README.md\t\"a title\")\n")
+        self.assertEqual(result.stdout, "broken links: 0\n")
+        # A quote right after `](` starts no title, so the `](` inside it is a second link that the line must not hide.
+        link = '[t]("[t](")'
+        result = self.run_checker(link + "\n")
+        self.assertEqual(result.stdout, f"UNSUPPORTED UNPARSED LINK README.md:1 -> {link}\nbroken links: 1\n")
+
+    def test_markdown_line_numbers_and_links_survive_a_separator_that_only_python_splits_on(self):
+        for name, sep in [("vt", "\x0b"), ("ff", "\x0c"), ("fs", "\x1c"), ("nel", "\x85"), ("ls", "\u2028"), ("ps", "\u2029")]:
+            with self.subTest(separator=name):
+                result = self.run_checker(f"first{sep}half\n[Gone](gone.md)\n[Also](gone-too.md)\n")
+                self.assertEqual(result.stdout, "BROKEN FILE README.md:2 -> gone.md\nBROKEN FILE README.md:3 -> gone-too.md\nbroken links: 2\n")
+
     def test_javascript_expressions_after_a_dangling_operator_are_not_declarations(self):
         js = ("const viaEquals =\n  function equalsNamed() {};\nconst viaClass =\n  class ClassNamed {};\n"
               "register(\n  function argNamed() {},\n  function listNamed() {},\n);\n"
@@ -508,15 +689,15 @@ class CitationTests(CheckerTestCase):
         self.assertEqual(result.returncode, 0)
 
     def test_javascript_every_line_terminator_ends_a_line_and_blocks_a_postfix_operator(self):
-        # open() reads CR and CRLF as LF, so U+2028 and U+2029 are the line terminators that reach the reader.
-        js = ("const a = x\u2028++\n  function viaLs() {}.x\n"
+        js = ("const r = x\r++\n  function viaCr() {}.x\n"
+              "const a = x\u2028++\n  function viaLs() {}.x\n"
               "const b = x\u2029++\n  function viaPs() {}.x\n"
               "const c = x /*\u2029*/ ++\n  function viaComment() {}.x\n"
               "const d = a[0]\u2028++\n  function viaBracket() {}.x\n"
               "const e = x // note\u2028++\n  function viaLineComment() {}.x\n"
-              "const f = x++\u2028function afterLs() {}\u2029const g = 1\nfunction afterPs() {}\n")
-        ok = ["afterLs", "afterPs"]
-        bad = ["viaLs", "viaPs", "viaComment", "viaBracket", "viaLineComment"]
+              "const f = x++\u2028function afterLs() {}\u2029const g = 1\nfunction afterPs() {}\rconst h = 1\r\nfunction afterCr() {}\n")
+        ok = ["afterLs", "afterPs", "afterCr"]
+        bad = ["viaCr", "viaLs", "viaPs", "viaComment", "viaBracket", "viaLineComment"]
         result = self.check_readme(" ".join(f"[flow.js:{name}]" for name in ok + bad) + "\n", **{"pkg/flow.js": js})
         self.assert_failures(result, *[("UNRESOLVED CITATION", f"[flow.js:{name}]") for name in bad])
 
@@ -525,6 +706,10 @@ class CitationTests(CheckerTestCase):
         result = self.check_readme("[flow.js:before] [flow.js:after]\n", **{"pkg/flow.js": js})
         self.assert_failures(result, ("UNRESOLVED CITATION", "[flow.js:after]"))
         self.assertIn("the JavaScript reader stops at line 2, where it cannot tell a regex literal from a division", result.stdout)
+        js = "function before() {}\rfunction mid() {}\r\nconst half = (a + b) / 2;\nfunction after() {}\n"
+        result = self.check_readme("[flow.js:mid] [flow.js:after]\n", **{"pkg/flow.js": js})
+        self.assert_failures(result, ("UNRESOLVED CITATION", "[flow.js:after]"))
+        self.assertIn("the JavaScript reader stops at line 3, where it cannot tell a regex literal from a division", result.stdout)
 
     def test_javascript_reader_stays_linear_on_a_long_run_of_signs(self):
         js = "const v = " + "+-" * 50000 + "a\nfunction afterSigns() {}\n"
@@ -803,6 +988,68 @@ class FileSelectionTests(CheckerTestCase):
                                         "BROKEN FILE (not tracked by git) README.md:1 -> pkg/README.md\n"
                                         "MISSING CITED FILE pkg/README.md:1 -> [run.go:Run] (not tracked by git)\n"
                                         "broken links: 3\n")
+
+    def test_a_modified_tracked_file_and_a_directory_with_a_tracked_file_stay_tracked(self):
+        # Only the intent-to-add flag marks an intent-to-add entry. A staged file that was edited since has none.
+        result = self.run_checker(
+            "[Edited](docs/mod.txt) [Dir](docs/both/) [Cited](pkg/README.md)\n",
+            files={"docs/both/b.txt": "b\n", "docs/mod.txt": "one\n", "pkg/README.md": "[run.go:Run]\n", "pkg/run.go": "func Run() {}\n"},
+            untracked={"docs/both/a.txt": "a\n", "docs/mod.txt": "two\n", "pkg/run.go": "func Run() {}\n// edited\n"},
+            intent_to_add=["docs/both/a.txt"])
+        self.assertEqual(result.stdout, "broken links: 0\n")
+
+    def test_an_intent_to_add_entry_is_not_tracked_whatever_other_flag_it_has(self):
+        # `git diff-files` does not list an entry that is assume-unchanged or skip-worktree (a sparse checkout sets it).
+        names = [f"docs/{name}.txt" for name in ("plain", "unchanged", "sparse")]
+        result = self.run_checker(" ".join(f"[Doc]({name})" for name in names) + "\n",
+                                  untracked={name: "x\n" for name in names}, intent_to_add=names,
+                                  index_flags={names[1]: "--assume-unchanged", names[2]: "--skip-worktree"})
+        self.assertEqual(result.stdout, "".join(f"BROKEN FILE (not tracked by git) README.md:1 -> {name}\n" for name in names)
+                         + "broken links: 3\n", result.stderr)
+
+    def test_a_git_that_fails_or_lists_the_index_wrongly_exits_2_without_checking(self):
+        # A `git` on PATH that passes everything through, except that it fails or damages the `--debug` listing of the index.
+        wrapper = textwrap.dedent("""\
+            #!%s
+            import os, re, subprocess, sys
+            done = subprocess.run([os.environ["REAL_GIT"], *sys.argv[1:]], capture_output=True)
+            out, mode = done.stdout, os.environ["DAMAGE"]
+            if mode == "fail":
+                sys.exit(1)
+            if "--debug" in sys.argv:
+                entries = re.findall(rb"[^\\0]*\\0(?:  [^\\n]*\\n){4}  size: [^\\n]*\\tflags: [0-9a-f]+\\n", out)
+                assert b"".join(entries) == out and len(entries) > 2
+                out = {"cut": out[:-1], "gap": entries[0] + b"junk\\n" + b"".join(entries[1:]), "tail": out + b"junk\\n",
+                       "last": b"".join(entries[:-1]), "none": b"", "intact": out,
+                       "junk": entries[0] + b"junk\\0\\n" + b"".join(entries[1:])}[mode]
+            sys.stdout.buffer.write(out)
+            sys.stderr.buffer.write(done.stderr)
+            sys.exit(done.returncode)
+            """) % sys.executable
+        with tempfile.TemporaryDirectory() as bin_dir:
+            fake = Path(bin_dir) / "git"
+            fake.write_text(wrapper, encoding="utf-8")
+            fake.chmod(0o755)
+            for mode in ["intact", "cut", "gap", "junk", "tail", "last", "none", "fail"]:
+                with self.subTest(damage=mode):
+                    env = {**os.environ, "PATH": bin_dir + os.pathsep + os.environ["PATH"], "REAL_GIT": shutil.which("git"), "DAMAGE": mode}
+                    result = self.run_checker("[Doc](docs/a.md)\n", docs={"a.md": "# A\n", "b.md": "# B\n"}, env=env)
+                    if mode == "intact":
+                        self.assertEqual((result.returncode, result.stdout), (0, "broken links: 0\n"), result.stderr)
+                        continue
+                    if mode == "fail":  # git exits 1 and prints nothing to stderr
+                        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                         (2, "", "check-doc-links.py needs a git checkout: git ls-files exited 1\n"))
+                        continue
+                    self.assertEqual((result.returncode, result.stdout), (2, ""), result.stderr)
+                    self.assertEqual(result.stderr, "check-doc-links.py cannot read the index flags from `git ls-files --debug`\n")
+
+    def test_a_directory_that_holds_only_intent_to_add_files_is_not_tracked(self):
+        result = self.run_checker("[Dir](docs/only/) [File](docs/only/a.txt)\n", untracked={"docs/only/a.txt": "a\n"},
+                                  intent_to_add=["docs/only/a.txt"])
+        self.assertEqual(result.stdout, "BROKEN FILE (not tracked by git) README.md:1 -> docs/only/\n"
+                                        "BROKEN FILE (not tracked by git) README.md:1 -> docs/only/a.txt\n"
+                                        "broken links: 2\n")
 
     def test_an_untracked_readme_can_link_to_itself(self):
         result = self.run_checker("", untracked={"pkg/README.md": "# Top\n[Self](#top) [Missing](#absent)\n"})

@@ -56,7 +56,7 @@ os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 # Destination: runs of non-space/non-paren/non-# chars, allowing one level of
 # balanced parens; then an optional #fragment and an optional quoted title.
 LINK = re.compile(
-    r"\]\(((?:[^()\s#]|\([^()\s]*\))*)(#[^)\s]*)?(?:\s+[\"\x27][^)]*[\"\x27])?\)")
+    r"\]\(((?:[^()\s#]|\([^()\s]*\))*)(#[^)\s]*)?(?:[ \t]+[\"\x27][^)]*[\"\x27])?\)")
 REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:")
 ANGLE = re.compile(r"\]\(\s*<")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -170,10 +170,10 @@ def markdown_blocks(lines):
             continue
         m = FENCE.match(expanded)
         if fence:
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not expanded[m.end():].strip():
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not expanded[m.end():].strip(" \t\n"):
                 fence = None
             continue
-        if not ln.strip():
+        if not ln.strip(" \t\n"):
             if block:
                 yield block
                 block = []
@@ -200,7 +200,7 @@ def markdown_blocks(lines):
             continue
         quote, item = QUOTE.match(expanded), ITEM.match(expanded)
         # Empty items and non-1 ordered items cannot interrupt a paragraph.
-        if item and block and (not expanded[item.end():].strip()
+        if item and block and (not expanded[item.end():].strip(" \t\n")
                                or (item.group(1)[0].isdigit() and item.group(1)[:-1] != "1")):
             item = None
         if quote or item:
@@ -210,18 +210,25 @@ def markdown_blocks(lines):
             prefix = quote.end() if quote else item.end()
             if item and len(item.group(2)) > 4:
                 prefix -= len(item.group(2)) - 1
+            if item and not expanded[item.end():].strip(" \t\n"):
+                # An item that starts with a blank line has its content one column past the marker,
+                # however many spaces follow it.
+                prefix = item.end(1) + 1
             body = [(lineno, drop_columns(ln, prefix))]
-            while index < len(lines):
+            # A list item can begin with at most one blank line: a second one makes the item empty.
+            empty = (item and not expanded[item.end():].strip(" \t\n")
+                     and index < len(lines) and not lines[index][1].strip(" \t\n"))
+            while not empty and index < len(lines):
                 number, continuation = lines[index]
                 expanded_next = continuation.expandtabs(4)
                 marker = QUOTE.match(expanded_next) if quote else None
                 if marker:
                     body.append((number, drop_columns(continuation, marker.end())))
-                elif not quote and not continuation.strip():
+                elif not quote and not continuation.strip(" \t\n"):
                     body.append((number, continuation))
                 elif not quote and expanded_next.startswith(" " * prefix):
                     body.append((number, drop_columns(continuation, prefix)))
-                elif (body[-1][1].strip() and continuation.strip()
+                elif (body[-1][1].strip(" \t\n") and continuation.strip(" \t\n")
                       and not starts_block(expanded_next)
                       and any(part[-1][0] == body[-1][0]
                               for part in markdown_blocks(body))):
@@ -256,22 +263,26 @@ def markdown_blocks(lines):
 
 def scan_lines(path):
     for block in scan_blocks(path):
-        masked = without_inline_code("".join(ln for _, ln in block)).splitlines(keepends=True)
+        masked = re.findall(r"[^\n]*\n|[^\n]+", without_inline_code("".join(ln for _, ln in block)))
         for (lineno, raw), visible in zip(block, masked):
             yield lineno, raw, visible
 
 
-def git_files(*args, command=("ls-files",)):
+def git_ls_files(*args):
     try:
-        listed = subprocess.run(["git", *command, "-z", *args], capture_output=True)
+        listed = subprocess.run(["git", "ls-files", "-z", *args], capture_output=True)
         failure = listed.returncode and (listed.stderr.decode(errors="replace").strip()
-                                         or f"git {command[0]} exited {listed.returncode}")
+                                         or f"git ls-files exited {listed.returncode}")
     except OSError as err:
         failure = str(err)
     if failure:
         print(f"check-doc-links.py needs a git checkout: {failure}", file=sys.stderr)
         sys.exit(2)
-    return {os.fsdecode(name) for name in listed.stdout.split(b"\0") if name}
+    return listed.stdout
+
+
+def git_files(*args):
+    return {os.fsdecode(name) for name in git_ls_files(*args).split(b"\0") if name}
 
 
 def doc_files():
@@ -315,9 +326,30 @@ def indexed(path):
     return current in tracked()
 
 
+# One `git ls-files -z --debug` entry: the path, four lines of stat data, then the size and the index flags.
+INDEX_ENTRY = re.compile(rb"([^\0]*)\0(?:  [^\n]*\n){4}  size: [^\n]*\tflags: ([0-9a-f]+)\n")
+INTENT_TO_ADD_FLAG = 0x20000000
+
+
 def intent_to_add():
-    """The paths that `git add -N` put in the index without content: a commit holds none of them."""
-    return git_files("--name-only", "--diff-filter=A", command=("diff-files",))
+    """The paths that `git add -N` put in the index without content: a commit holds none of them.
+
+    The flag is read from the index. `git diff-files` does not list an entry that also has assume-unchanged or
+    skip-worktree, and a sparse checkout sets the latter, so a local run would pass where a clean clone fails.
+    """
+    listing, found, listed, end = git_ls_files("--debug"), set(), set(), 0
+    entry = INDEX_ENTRY.match(listing)
+    while entry:
+        end = entry.end()
+        listed.add(os.fsdecode(entry.group(1)))
+        if int(entry.group(2), 16) & INTENT_TO_ADD_FLAG:
+            found.add(os.fsdecode(entry.group(1)))
+        entry = INDEX_ENTRY.match(listing, end)
+    # A listing that ends between two entries, or is empty, has no unread text, so it must also name every path.
+    if end != len(listing) or listed != git_files():
+        print("check-doc-links.py cannot read the index flags from `git ls-files --debug`", file=sys.stderr)
+        sys.exit(2)
+    return found
 
 
 @functools.cache
@@ -417,7 +449,8 @@ PY_LEXER = re.compile(r"(?P<blank>#[^\n]*|\"\"\"(?:\\.|[^\\])*?\"\"\"|'''(?:\\.|
 
 def go_names(text):
     # Assumes gofmt layout: declarations in column 0, members one tab in.
-    code = masked(text, GO_LEXER)
+    # A carriage return that the lexer left in the code is white space in Go, and a line break to this reader.
+    code = masked(text, GO_LEXER).replace("\r", "\n")
     names = set()
     owner, close, member = None, None, None
     group, group_close = None, None
@@ -477,7 +510,7 @@ def py_names(text):
     names, scopes, depth = set(), [], 0
     for line, source in zip(masked(text, PY_LEXER).split("\n"), text.split("\n")):
         line = line.rstrip()
-        stripped = line.lstrip()
+        stripped = line.lstrip(" \t")
         continued = depth > 0
         depth += len(re.findall(r"[(\[{]", line)) - len(re.findall(r"[)\]}]", line))
         if continued or not stripped:
@@ -740,19 +773,25 @@ def js_names(text):
 # whole-token phrase in code counts.
 class ShellMentions:
     def __init__(self, text):
-        self.code = "\n".join(re.sub(r"(?:^|(?<=[\s;&|()]))#.*", "", line) for line in text.splitlines())
+        # Bash drops a NUL, so `echo a <NUL>#word` is a comment that this reader would read as code. A script that
+        # holds a NUL mentions no name.
+        lines = text.split("\n") if "\0" not in text else []
+        self.code = "\n".join(re.sub(r"(?:^|(?<=[ \t;&|()`]))#.*", "", line) for line in lines)
 
     def __contains__(self, symbol):
-        pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)"
+        # A backslash and a line feed join two lines, or are two literal characters inside single quotes. Without
+        # reading quotes the reader cannot tell which, so a name next to the pair is not mentioned.
+        pattern = r"(?<![\w-])(?<!\w\.)(?<!\\\n)" + re.escape(symbol) + r"(?![\w-])(?!\.\w)(?!\\\n)"
         return re.search(pattern, self.code) is not None
 
 
 def unit_names(text):
+    # systemd trims only a space and a tab, ends a line at a NUL too, and wants nothing after `]`. A NUL fails closed.
     names, continued = set(), False
-    for line in text.splitlines():
-        if line.lstrip().startswith(("#", ";")):
+    for line in re.split(r"\r\n|\n\r|\r|\n", text) if "\0" not in text else []:
+        if line.lstrip(" \t").startswith(("#", ";")):
             continue
-        m = None if continued else re.match(r"\[([\w-]+)\]", line)
+        m = None if continued else re.match(r"\[([\w-]+)\][ \t]*$", line)
         if m:
             names.add(m.group(1))
         continued = line.endswith("\\")
@@ -774,10 +813,18 @@ def language(path):
     return LANGUAGES.get(posixpath.splitext(path)[1])
 
 
+UNIT_KINDS = (".service", ".timer")
+KEEPS_CR = (".sh", ".go", ".tf", *UNIT_KINDS)
+
+
 @functools.cache
 def citable(path):
-    with open(path, encoding="utf-8") as source:
-        return language(path)(source.read())
+    # Bash, Go and HCL end a line at a line feed only, and systemd also at a carriage return in any pair with a line
+    # feed, so those files keep their carriage returns. Python and JavaScript end a line at a lone one too, and
+    # text mode turns each carriage return into a line feed.
+    with open(path, encoding="utf-8", newline="" if path.endswith(KEEPS_CR) else None) as source:
+        text = source.read()
+    return language(path)(text if path.endswith(UNIT_KINDS) else text.replace("\r\n", "\n"))
 
 
 def citation_problem(path, symbol):
