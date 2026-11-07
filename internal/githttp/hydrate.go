@@ -1652,38 +1652,23 @@ func removePushHoldFiles(holdPath string) {
 	// all: it removes the files without it. Leaving them would let
 	// serve's handler refresher, which runs until the request ends, keep
 	// a released hold live for as long as a non-reading client stalls the
-	// response. Without the lock, only a reaper stalled inside its window
-	// on this very hold can restore it, and the reaper takes only holds
-	// that look expired.
-	if lock, err := lockPushHoldReservations(holdPath); err == nil {
+	// response. Without the lock, a reaper can be inside its window on
+	// this very hold: its quarantine rename moves the hold to its
+	// ".reaping" name, and its restore moves it back. So the release
+	// removes whichever name has the hold until neither does. Every
+	// reaper step needs one of the two names, so nothing can bring the
+	// hold back after that.
+	lock, err := lockPushHoldReservations(holdPath)
+	names := []string{holdPath}
+	if err == nil {
 		defer lock()
+	} else {
+		names = append(names, holdPath+".reaping", holdPath)
 	}
-	if _, err := os.Lstat(holdPath); err == nil {
-		// Bump only when a hold FILE is actually being removed (Codex
-		// round-33 security P2): every receive-pack mints a hold PATH,
-		// but rejected or malformed RPCs may never create the file, and
-		// this release still runs for them — an unconditional bump would
-		// let each tiny denied push invalidate the held-generation fast
-		// path and re-buy the full pack listing and ref paging under the
-		// hydrate lock for a live hold set that never changed. A
-		// never-created hold was never in any fingerprint listing, and
-		// sidecars are excluded from it.
-		//
-		// And bump BEFORE removing (Codex round-34 P2): a hold whose
-		// fail-closed create bump failed is visible with an UNCHANGED
-		// epoch, so letting this cleanup remove it with its own bump
-		// failing for the same cause would complete a transient lifecycle
-		// both fingerprint components are blind to — a hydration spanning
-		// it could publish a held marker for a set that changed mid-scan.
-		// A hold file therefore never transitions visible→absent without
-		// a successful epoch bump: on failure everything stays (the file
-		// keeps marking the fingerprint), and the TTL reap — which
-		// enforces the same bump-first rule — retires it once the epoch
-		// is writable again.
-		if bumpPushHoldEpoch(filepath.Dir(holdPath)) != nil {
+	for _, name := range names {
+		if !removeHoldFile(name) {
 			return
 		}
-		_ = os.Remove(holdPath)
 	}
 	_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
 	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
@@ -1691,6 +1676,41 @@ func removePushHoldFiles(holdPath string) {
 	_ = os.Remove(holdPath + pushHoldReapSuffix)
 	_ = os.Remove(holdPath + pushHoldReleasedSuffix)
 	_ = os.Remove(holdPath + pushHoldGensSuffix)
+}
+
+// removeHoldFile removes the hold file at name, if there is one, after it
+// bumps the hold directory's epoch. It reports false when the bump failed
+// and the file stays.
+func removeHoldFile(name string) bool {
+	if _, err := os.Lstat(name); err != nil {
+		return true
+	}
+	// Bump only when a hold FILE is actually being removed (Codex
+	// round-33 security P2): every receive-pack mints a hold PATH,
+	// but rejected or malformed RPCs may never create the file, and
+	// this release still runs for them — an unconditional bump would
+	// let each tiny denied push invalidate the held-generation fast
+	// path and re-buy the full pack listing and ref paging under the
+	// hydrate lock for a live hold set that never changed. A
+	// never-created hold was never in any fingerprint listing, and
+	// sidecars are excluded from it.
+	//
+	// And bump BEFORE removing (Codex round-34 P2): a hold whose
+	// fail-closed create bump failed is visible with an UNCHANGED
+	// epoch, so letting this cleanup remove it with its own bump
+	// failing for the same cause would complete a transient lifecycle
+	// both fingerprint components are blind to — a hydration spanning
+	// it could publish a held marker for a set that changed mid-scan.
+	// A hold file therefore never transitions visible→absent without
+	// a successful epoch bump: on failure everything stays (the file
+	// keeps marking the fingerprint), and the TTL reap — which
+	// enforces the same bump-first rule — retires it once the epoch
+	// is writable again.
+	if bumpPushHoldEpoch(filepath.Dir(name)) != nil {
+		return false
+	}
+	_ = os.Remove(name)
+	return true
 }
 
 // pushHoldLive reports whether one hold-file observation counts as live,

@@ -404,9 +404,10 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 // lock past pushHoldWaitMax, here flock(1), as a stopped reserver would.
 // The steps that take it after a push's reservation must not wait for it,
 // or a push or ref write that is done hangs: the release removes the hold
-// files without the lock, and the tombstone append and the doomed-name
-// drop return an error (the names stay held until post-receive's release
-// or the TTL).
+// files without the lock, also at the quarantine name a reaper inside its
+// window gives the hold, and the tombstone append and the doomed-name drop
+// return an error (the names stay held until post-receive's release or the
+// TTL).
 func TestPushHoldLockWaitsAreBounded(t *testing.T) {
 	flockBin, err := exec.LookPath("flock")
 	if err != nil {
@@ -415,18 +416,29 @@ func TestPushHoldLockWaitsAreBounded(t *testing.T) {
 	prev := pushHoldWaitMax
 	pushHoldWaitMax = 150 * time.Millisecond
 	t.Cleanup(func() { pushHoldWaitMax = prev })
+	release := func(h string) error { removePushHoldFiles(h); return nil }
 	for _, tc := range []struct {
 		name string
 		run  func(holdPath string) error
-		// removed is whether the hold file must be gone afterwards.
+		// quarantined moves the hold to its quarantine name first, as
+		// a reaper inside its window has.
+		quarantined bool
+		// removed is whether the hold must be gone afterwards, at both
+		// names.
 		removed bool
 	}{
-		{"release", func(h string) error { removePushHoldFiles(h); return nil }, true},
-		{"tombstone append", func(h string) error { return appendPushReleased(h, []string{"refs/heads/x"}) }, false},
-		{"doomed-name drop", func(h string) error { return removePushHolds(h, []string{"refs/heads/x"}) }, false},
+		{"release", release, false, true},
+		{"release of a quarantined hold", release, true, true},
+		{"tombstone append", func(h string) error { return appendPushReleased(h, []string{"refs/heads/x"}) }, false, false},
+		{"doomed-name drop", func(h string) error { return removePushHolds(h, []string{"refs/heads/x"}) }, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			holdPath := mintHold(t, t.TempDir(), "refs/heads/x")
+			if tc.quarantined {
+				if err := os.Rename(holdPath, holdPath+".reaping"); err != nil {
+					t.Fatal(err)
+				}
+			}
 			lockPath := filepath.Dir(holdPath) + ".reserve.lock"
 			// Its own process group: flock forks the command, and the
 			// fork inherits the locked descriptor.
@@ -461,8 +473,10 @@ func TestPushHoldLockWaitsAreBounded(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("the step waited for another process's reservation lock")
 			}
-			if _, err := os.Stat(holdPath); tc.removed != errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("hold file after the step: %v; want removed %v", err, tc.removed)
+			_, err := os.Stat(holdPath)
+			_, qerr := os.Stat(holdPath + ".reaping")
+			if gone := errors.Is(err, os.ErrNotExist) && errors.Is(qerr, os.ErrNotExist); gone != tc.removed {
+				t.Fatalf("hold after the step: %v, quarantine name: %v; want removed %v", err, qerr, tc.removed)
 			}
 		})
 	}
