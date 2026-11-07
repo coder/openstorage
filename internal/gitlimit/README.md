@@ -12,9 +12,11 @@ Shared admission and process control for git subprocesses. It provides a slot po
 - `TryAdmitMaintenance` — non-blocking admission of one maintenance job; returns a release func [gitlimit.go:TryAdmitMaintenance]
 - `ErrStopping`, `Start`, `Wait`, `Run`, `Output`, `CombinedOutput`, `Stopping`, `StopChildren` — tracked git child lifecycle [children.go:Start]
 - `Name`, `Clip` — a git command line, and one value, for an error message or a log line: a value is cut at 256 bytes and its length is named, and at most 32 arguments are printed [name.go:Name] [name.go:Clip]
+- `TailBuffer` — the stderr tail that an error quotes: the last 64 KiB, where git prints its fatal message [errtext.go:TailBuffer]
 - `HeapLimitSupported`, `Command`, `HeapFailure` — heap cap support (Linux: `/bin/sh` wrapper with `ulimit -d`; other platforms: no cap) and heap-failure classification [heaplimit_linux.go:Command] [heaplimit_other.go:Command]
 
 ## Invariants
+- `TailBuffer` keeps the last 64 KiB written to it [errtext.go:TailBuffer]
 - `NewSlots` panics unless n > 0, 0 < perKey <= n, and wait >= 0 [gitlimit.go:NewSlots]
 - `Release` panics unless the key holds a slot; `RepoKey` panics on an empty repo ID [gitlimit.go:Release]
 - `TryAdmitMaintenance` takes the maintenance permit first, releases it if `ReadSlots` is full, and panics on a second release call [gitlimit.go:TryAdmitMaintenance]

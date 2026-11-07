@@ -311,6 +311,21 @@ func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	}
 }
 
+// Run's error quotes git's stderr, and it reaches the server's log: it
+// keeps exactly the last 64 KiB, where git prints its fatal message.
+func TestRunErrorKeepsTheStderrTail(t *testing.T) {
+	fakeGit(t, "head -c 1048576 /dev/zero | tr '\\0' e >&2; echo 'fatal: the end' >&2; exit 1")
+	_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"status"}})
+	if err == nil {
+		t.Fatal("Run: nil error from a git that exits 1")
+	}
+	// The last 64 KiB of stderr, less the trimmed line feed.
+	tail := strings.Repeat("e", 64<<10-len("fatal: the end\n")) + "fatal: the end"
+	if msg := err.Error(); !strings.HasSuffix(msg, ": exit status 1: "+tail) {
+		t.Fatalf("Run's error is %d bytes, want the command, the exit status and the last 64 KiB of stderr (%d bytes)", len(msg), len(tail))
+	}
+}
+
 // Limit outcomes must never be reported as "not found" or "no match".
 func TestLimitErrorsAreNotMaskedAsMissing(t *testing.T) {
 	if !HeapLimitSupported() {
@@ -502,5 +517,37 @@ func TestCheckBlobSizeNamesLongPathBriefly(t *testing.T) {
 	}
 	if err := CheckBlobSize(context.Background(), "a/b.txt", MaxBlobBytes); err != nil {
 		t.Errorf("a blob at the limit: err = %v, want nil", err)
+	}
+}
+
+// The path of a symlink over the target limit goes into the error too, and
+// into the log, as the path of a blob does: the message clips it, and
+// LimitPath keeps the whole path for the response that names it.
+func TestLimitErrorsClipThePathInTheMessageAndKeepItWhole(t *testing.T) {
+	long := strings.Repeat("d", 100_000)
+	for _, c := range []struct {
+		name string
+		err  error
+		is   error
+	}{
+		{"symlink", CheckSymlinkTarget(long, MaxSymlinkTarget+1), ErrSymlinkTooLong},
+		{"blob", CheckBlobSize(context.Background(), long, MaxBlobBytes+1), ErrBlobTooLarge},
+	} {
+		if !errors.Is(c.err, c.is) {
+			t.Fatalf("%s: err = %v, want %v", c.name, c.err, c.is)
+		}
+		msg := c.err.Error()
+		if len(msg) > 1024 {
+			t.Fatalf("%s: the error is %d bytes, want it bounded: %.200s", c.name, len(msg), msg)
+		}
+		if want := "...(100000 bytes)"; !strings.Contains(msg, want) {
+			t.Errorf("%s: error %.300q lacks %q", c.name, msg, want)
+		}
+		if path, ok := LimitPath(c.err); !ok || path != long {
+			t.Errorf("%s: LimitPath keeps %d bytes (%v), want the whole path of %d", c.name, len(path), ok, len(long))
+		}
+	}
+	if err := CheckSymlinkTarget("a/link", MaxSymlinkTarget); err != nil {
+		t.Errorf("a target at the limit: err = %v, want nil", err)
 	}
 }

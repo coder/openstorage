@@ -229,7 +229,7 @@ func wrefGit(ctx context.Context, repoPath string, extraEnv []string, stdin io.R
 	cmd.Env = append(cmd.Env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdin = stdin
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
 	out, err := gitlimit.Output(cmd)
 	if err != nil {

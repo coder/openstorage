@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
@@ -211,6 +212,33 @@ func (w *gitReadWriter) finish() {
 // Unwrap exposes the wrapped writer to http.ResponseController.
 func (w *gitReadWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
+// maxNamedPath is the most bytes of a path that an error message names.
+const maxNamedPath = 256
+
+// namedEntry is what a size-limit error is about: noun, followed by the path
+// of the entry when err names one. The path is quoted with %q, so a name
+// with bytes that are not UTF-8 stays valid JSON text and keeps every byte,
+// and cut at maxNamedPath bytes (at a rune boundary), with its full length.
+func namedEntry(noun string, err error) string {
+	path, ok := gitread.LimitPath(err)
+	if !ok || path == "" {
+		return noun
+	}
+	n := len(path)
+	if n > maxNamedPath {
+		// Cut before the rune that byte n belongs to. A rune has at most
+		// utf8.UTFMax bytes, so the cut steps back at most UTFMax-1. A byte
+		// that starts a rune, valid or not (0xff), is cut at the limit, and
+		// a run of stray continuation bytes (0x80) steps back all 3.
+		n = maxNamedPath
+		for back := 0; back < utf8.UTFMax-1 && !utf8.RuneStart(path[n]); back++ {
+			n--
+		}
+		return fmt.Sprintf("%s %q... (a path of %d bytes)", noun, path[:n], len(path))
+	}
+	return fmt.Sprintf("%s %q", noun, path)
+}
+
 // writeGitLimitErr answers a read-side git resource-limit error and
 // reports whether err was one. Capacity is transient (503 + Retry-After);
 // the time budget is 503 without Retry-After, because a page that needs
@@ -234,7 +262,9 @@ func (s *server) writeGitLimitErr(w http.ResponseWriter, r *http.Request, op str
 		if b := gitread.BudgetFrom(r.Context()); b != nil {
 			limit = b.Limits().MaxBlob
 		}
-		status, msg = http.StatusUnprocessableEntity, fmt.Sprintf("file exceeds the API read size limit of %d bytes; fetch it with git", limit)
+		status, msg = http.StatusUnprocessableEntity, fmt.Sprintf("%s exceeds the API read size limit of %d bytes; fetch it with git", namedEntry("file", err), limit)
+	case errors.Is(err, gitread.ErrSymlinkTooLong):
+		status, msg = http.StatusUnprocessableEntity, fmt.Sprintf("%s exceeds the API read size limit of %d bytes; fetch it with git, or skip the link with exclude_globs", namedEntry("the target of symlink", err), gitread.MaxSymlinkTarget)
 	default:
 		return false
 	}
