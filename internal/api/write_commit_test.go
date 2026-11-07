@@ -1865,8 +1865,10 @@ func TestRestoreCommit(t *testing.T) {
 			wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
 		})
 
-		// Only git's exit 1 says that the target names no commit.
-		for _, how := range []string{"128", "kill"} {
+		// Only git's exit 1 says that the target names no commit, and
+		// only when the target is no commit: for c1, which exists, a
+		// failed peel is the repository's failure.
+		for _, how := range []string{"1", "128", "kill"} {
 			t.Run("git "+how+" on the target is 500, not 404", func(t *testing.T) {
 				gitFailsOnArg(t, c1.Commit.CommitSHA+"^{commit}^{tree}", how)
 				resp, body := restore(map[string]any{

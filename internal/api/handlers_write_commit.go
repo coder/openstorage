@@ -995,6 +995,82 @@ func (sc *wcScratch) resolveTree(ctx context.Context, commitSHA string) (string,
 	return sha, nil
 }
 
+// restoreTargetTree resolves restore-commit's target to its tree. found
+// is false when the target names no commit: no object, a tree, a blob,
+// or a tag of one. rev-parse --verify --quiet exits 1 for those, and also
+// for a commit whose tree, or a tag whose commit, git cannot read: that is
+// the repository's failure, an error. Any other git failure (a fatal
+// exit, a killed git) is an error too.
+func (sc *wcScratch) restoreTargetTree(ctx context.Context, target string) (tree string, found bool, err error) {
+	tree, peelErr := sc.resolveTree(ctx, target)
+	if !wcGitExit(peelErr, 1) {
+		return tree, peelErr == nil, peelErr
+	}
+	// Follow the target's tag chain by the tags' own headers, which name
+	// the type of an object that may be missing.
+	id, typ := target, ""
+	for range wcMaxTagChain {
+		if typ != "" && typ != "commit" && typ != "tag" {
+			return "", false, nil // a tag of a tree or a blob
+		}
+		if _, err := sc.git(ctx, nil, nil, "cat-file", "-e", id); wcGitExit(err, 1) {
+			if id == target {
+				return "", false, nil // no such object
+			}
+			return "", false, fmt.Errorf("restore target %s: tagged %s %s is missing: %w", target, typ, id, peelErr)
+		} else if err != nil {
+			return "", false, err
+		}
+		if typ == "" {
+			out, err := sc.git(ctx, nil, nil, "cat-file", "-t", id)
+			if err != nil {
+				return "", false, err
+			}
+			typ = strings.TrimSpace(out)
+		}
+		switch typ {
+		case "commit":
+			return "", false, fmt.Errorf("restore target %s: commit %s has no readable tree: %w", target, id, peelErr)
+		case "tag":
+			out, err := sc.git(ctx, nil, nil, "cat-file", "tag", id)
+			if err != nil {
+				return "", false, err
+			}
+			if id, typ, err = wcTagTarget(out); err != nil {
+				return "", false, fmt.Errorf("restore target %s: %w", target, err)
+			}
+		default:
+			return "", false, nil // a tree or a blob
+		}
+	}
+	return "", false, fmt.Errorf("restore target %s: more than %d tags deep", target, wcMaxTagChain)
+}
+
+// wcMaxTagChain bounds the tags that restoreTargetTree follows.
+const wcMaxTagChain = 64
+
+// wcGitExit reports whether err is a git run that exited with code.
+func wcGitExit(err error, code int) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == code
+}
+
+// wcTagTarget reads the object and type headers of a tag object.
+func wcTagTarget(tag string) (id, typ string, err error) {
+	head, _, _ := strings.Cut(tag, "\n\n")
+	for line := range strings.SplitSeq(head, "\n") {
+		if v, ok := strings.CutPrefix(line, "object "); ok && id == "" {
+			id = v
+		} else if v, ok := strings.CutPrefix(line, "type "); ok && typ == "" {
+			typ = v
+		}
+	}
+	if !ref.ValidSHA(id) || typ == "" {
+		return "", "", fmt.Errorf("malformed tag headers %q", head)
+	}
+	return id, typ, nil
+}
+
 // wcBlobSink streams one file's decoded bytes into `git hash-object -w
 // --stdin` (blob created in the scratch odb) without buffering the content.
 type wcBlobSink struct {
@@ -1759,16 +1835,13 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	// The restore target must exist and be a commit; its tree becomes the
 	// new commit's tree verbatim.
-	// rev-parse --verify --quiet exits 1 for a target that names no commit.
-	// Any other failure (a fatal exit, a killed git) says nothing about the
-	// target.
-	tree, err := sc.resolveTree(r.Context(), target)
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		writeProblem(w, http.StatusNotFound, codeRefNotFound, "restore target "+target+" not found")
-		return
-	} else if err != nil {
+	tree, found, err := sc.restoreTargetTree(r.Context(), target)
+	if err != nil {
 		s.wcInternal(w, r, "resolve restore target", err)
+		return
+	}
+	if !found {
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "restore target "+target+" not found")
 		return
 	}
 	if revision && !s.wcRestoreMoves(w, r, sc, md, plan, target, tree) {
