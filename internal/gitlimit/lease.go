@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,9 +29,11 @@ import (
 // CombinedOutputIn, or attaches a Lease itself (Lease.Attach). The audit test
 // in this package fails on a new git start that does neither, and a binary
 // built with the openstorage_viewcheck tag panics on a start that runs in a
-// repository without a lease. Git that serve did not start holds no lease;
-// the docs tell operators not to run it in a cache repository while serve
-// runs, and not to reassign descriptor LeaseFD in a hook.
+// repository without a lease. Git that serve did not start holds no lease,
+// so operators must not run it in a cache repository while serve runs, and
+// must not reassign descriptor LeaseFD in a hook. The release that first
+// takes the lease exclusively (the stale ref lock cleanup of #490) writes
+// those rules into docs/how-to/deploy-production.md.
 const LeaseFile = "codestorage.gitlease.lock"
 
 // LeaseFD is the descriptor a git child holds the lease on. Git reads the
@@ -42,13 +45,13 @@ const LeaseFD = 10
 // ErrLeaseBusy: the lease is held exclusively (or, for TryExclusive, shared).
 var ErrLeaseBusy = errors.New("git lease is busy")
 
-const (
-	// leaseWait bounds how long a git start waits for an exclusive holder.
-	// An exclusive holder runs for the milliseconds of one file move, so a
-	// start that waits this long is stuck behind a hung one and fails.
-	leaseWait = 30 * time.Second
-	leasePoll = 5 * time.Millisecond
-)
+// leaseWait bounds how long a git start waits for an exclusive holder. An
+// exclusive holder runs for the milliseconds of one file move, so a start
+// that waits this long is stuck behind a hung one and fails. A variable so
+// that a test can shorten it.
+var leaseWait = 30 * time.Second
+
+const leasePoll = 5 * time.Millisecond
 
 // checkUnleased and checkLeased are set only by the openstorage_viewcheck
 // build tag (leasecheck_viewcheck.go): checkUnleased sees every Start that
@@ -61,17 +64,29 @@ var (
 // Lease is an open lease file with a flock on it. Close releases the lock
 // unless a child that inherited the descriptor still holds it.
 type Lease struct {
-	f      *os.File
+	f      *os.File // nil: the repository directory is read-only and has no lease file
 	shared bool
 }
 
 // OpenLease takes a shared lease on the repository at repoPath, creating the
-// lease file if it is missing. It waits (bounded) while the lease is held
+// lease file if it is missing. A repository directory that serve cannot
+// write, and that has no lease file, gets a lease that holds nothing: no git
+// of serve can take a ref lock there, and a refusal would only break the
+// reads that work there. It waits (bounded) while the lease is held
 // exclusively. It fails with ctx's error once ctx ends, with ErrStopping once
 // StopChildren began, and with ErrLeaseBusy if the wait does not end.
 func OpenLease(ctx context.Context, repoPath string) (*Lease, error) {
 	assertf(repoPath != "", "OpenLease: empty repoPath")
-	f, err := os.OpenFile(filepath.Join(repoPath, LeaseFile), os.O_RDWR|os.O_CREATE, 0o600)
+	path := filepath.Join(repoPath, LeaseFile)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil && (errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS)) {
+		var openErr error
+		if f, openErr = os.OpenFile(path, os.O_RDWR, 0); errors.Is(openErr, fs.ErrNotExist) {
+			return &Lease{shared: true}, nil
+		} else if openErr == nil {
+			err = nil
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open git lease: %w", err)
 	}
@@ -131,13 +146,21 @@ func TryExclusive(repoPath string) (*Lease, error) {
 func (l *Lease) Attach(cmd *exec.Cmd) {
 	assertf(l.shared, "Lease.Attach: not a shared lease")
 	assertf(len(cmd.ExtraFiles) == 0, "Lease.Attach: cmd already has ExtraFiles")
+	if l.f == nil {
+		return
+	}
 	// Entry i becomes descriptor 3+i, and a nil entry leaves it closed.
 	cmd.ExtraFiles = make([]*os.File, LeaseFD-3+1)
 	cmd.ExtraFiles[LeaseFD-3] = l.f
 }
 
 // Close closes the parent's copy of the lease file.
-func (l *Lease) Close() error { return l.f.Close() }
+func (l *Lease) Close() error {
+	if l.f == nil {
+		return nil
+	}
+	return l.f.Close()
+}
 
 // flock tries one flock operation without blocking.
 func flock(f *os.File, how int) error {

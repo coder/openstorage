@@ -49,9 +49,9 @@ func tryExclusive(t *testing.T, repo string) error {
 // serve closed its own copy, and the lease ends with the tree. The tree is
 // the real shape of #464: update-ref takes a ref lock, runs its
 // reference-transaction hook in the "prepared" state, and the hook sleeps.
-// The test runs on every git that CI runs: git must not close descriptor 3
-// before it runs a hook. It runs git directly and behind the heap-cap shell
-// wrapper, which must pass the descriptor on.
+// The test runs on every git that CI runs: git must not close the lease
+// descriptor before it runs a hook. It runs git directly and behind the
+// heap-cap shell wrapper, which must pass the descriptor on.
 func TestLeaseLivesWithTheGitProcessTree(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
 		leaseLivesWithTheTree(t, func(args ...string) *exec.Cmd { return exec.Command("git", args...) })
@@ -291,5 +291,175 @@ func TestGitTraceToADescriptorBelowTenNeverReachesTheLease(t *testing.T) {
 	}
 	if got := leaseSize(); got != 0 {
 		t.Fatalf("git wrote %d bytes of trace into the lease file", got)
+	}
+}
+
+// Two starts hold the lease at once: a lease is shared, and only an exclusive
+// try sees it busy.
+func TestSharedLeasesCoexist(t *testing.T) {
+	repo := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	first, err := OpenLease(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenLease(ctx, repo)
+	if err != nil {
+		t.Fatalf("a second shared lease while the first is held: %v", err)
+	}
+	if err := tryExclusive(t, repo); !errors.Is(err, ErrLeaseBusy) {
+		t.Fatalf("TryExclusive under two shared leases = %v, want ErrLeaseBusy", err)
+	}
+	_ = first.Close()
+	if err := tryExclusive(t, repo); !errors.Is(err, ErrLeaseBusy) {
+		t.Fatalf("TryExclusive under one shared lease = %v, want ErrLeaseBusy", err)
+	}
+	_ = second.Close()
+	if err := tryExclusive(t, repo); err != nil {
+		t.Fatalf("TryExclusive with no lease held: %v", err)
+	}
+}
+
+// The lease file belongs to the serve user alone.
+func TestLeaseFileIsPrivate(t *testing.T) {
+	repo := t.TempDir()
+	// With a strict umask the test would pass for a looser mode too.
+	defer syscall.Umask(syscall.Umask(0))
+	l, err := OpenLease(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	fi, err := os.Stat(filepath.Join(repo, LeaseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("lease file mode = %v, want 0600", fi.Mode().Perm())
+	}
+}
+
+// Once StopChildren began, a start that waits for an exclusive holder gives up
+// with ErrStopping at once, and does not wait out the lease bound.
+func TestOpenLeaseStopsWaitingWhenChildrenAreStopping(t *testing.T) {
+	repo := t.TempDir()
+	held, err := TryExclusive(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	children.mu.Lock()
+	children.stopped = true
+	children.mu.Unlock()
+	t.Cleanup(func() {
+		children.mu.Lock()
+		children.stopped = false
+		children.mu.Unlock()
+	})
+	done := make(chan error, 1)
+	go func() {
+		l, err := OpenLease(t.Context(), repo)
+		if err == nil {
+			_ = l.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrStopping) {
+			t.Fatalf("OpenLease while stopping = %v, want ErrStopping", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenLease kept waiting although StopChildren began")
+	}
+}
+
+// A start does not wait for an exclusive holder for ever.
+func TestOpenLeaseGivesUpAfterTheLeaseWait(t *testing.T) {
+	repo := t.TempDir()
+	held, err := TryExclusive(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	old := leaseWait
+	leaseWait = 100 * time.Millisecond
+	t.Cleanup(func() { leaseWait = old })
+	done := make(chan error, 1)
+	go func() {
+		l, err := OpenLease(t.Context(), repo)
+		if err == nil {
+			_ = l.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrLeaseBusy) {
+			t.Fatalf("OpenLease behind a hung holder = %v, want ErrLeaseBusy", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenLease waited far past the lease bound")
+	}
+}
+
+// Only a shared lease can go to a child: an exclusive one would lock every
+// later start out for the life of the child.
+func TestAttachRefusesAnExclusiveLease(t *testing.T) {
+	l, err := TryExclusive(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Attach of an exclusive lease did not panic")
+		}
+	}()
+	l.Attach(exec.Command("true"))
+}
+
+// A repository directory that serve cannot write has no ref lock that a git
+// of serve could take or leave behind, and reads from it worked before the
+// lease existed. A start there with no lease file runs without a lease and
+// makes no file. With a lease file, the lease works as everywhere else.
+func TestReadOnlyRepositoryWithoutALeaseFileStillRuns(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	repo := t.TempDir()
+	if err := os.Chmod(repo, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(repo, 0o700) })
+
+	if out, err := OutputIn(t.Context(), repo, exec.Command("sh", "-c", "echo out")); err != nil || string(out) != "out\n" {
+		t.Fatalf("OutputIn in a read-only repository = %q, %v", out, err)
+	}
+	if _, err := os.Lstat(filepath.Join(repo, LeaseFile)); err == nil {
+		t.Fatal("a lease file appeared in a read-only directory")
+	}
+	if l, err := TryExclusive(repo); err == nil {
+		_ = l.Close()
+		t.Fatal("TryExclusive succeeded without a lease file to lock")
+	}
+
+	if err := os.Chmod(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := tryExclusive(t, repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(repo, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	l, err := OpenLease(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := tryExclusive(t, repo); !errors.Is(err, ErrLeaseBusy) {
+		t.Fatalf("TryExclusive under a lease in a read-only repository = %v, want ErrLeaseBusy", err)
 	}
 }
