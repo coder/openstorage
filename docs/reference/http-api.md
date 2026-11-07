@@ -106,8 +106,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   (`*`, `?`, `[`) and git pathspec magic (`:(...)`) match only a path of that name.
 - **Paths stay in the repository**: on every read endpoint, a `path` param or grep
   `paths` entry that starts with `/`, or whose `..` climbs above the root, is `400`,
-  and so is a path with a NUL byte. A trailing `/` is dropped first, so `/` alone
-  names the root of a files listing and matches no file in grep.
+  and so is a path with a NUL byte. The files listings and grep check the path
+  without its trailing `/`: there `/` alone names the root of the listing, and
+  matches no file in grep.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field
