@@ -117,8 +117,8 @@ func CheckBlobSize(ctx context.Context, path string, size int64) error {
 
 // MaxSymlinkTarget is the longest symlink target an archive carries: 4095
 // bytes, the longest that symlink(2) accepts on Linux (PATH_MAX is 4096, with
-// the terminating NUL). git sets no limit of its own: its fsck has no check for
-// the length of a target. A longer target cannot be checked out on Linux, and
+// the terminating NUL). git's fsck has no check for the length of a target. A
+// longer symlink cannot exist on a Linux file system, and
 // the server reads one in memory to write its tar header.
 const MaxSymlinkTarget = 4095
 
