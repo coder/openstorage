@@ -159,11 +159,12 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    - **No tag exists, and none was ever created:** dispatch `publish=true` again. This
      covers a rejected or timed-out approval, a login that fails, a download that finds no
      files, and files that are gone: the download step then passes with "Total of 0
-     artifact(s) downloaded" and "Give the checked digests the version tag" fails at
-     `cat digest/amd64`, or the download step fails itself, and no tag exists either way.
-     It also covers a `publish` job that was skipped because `verify` failed: fix what
-     `verify` found first, then dispatch. Never re-run a failed `publish` job: dispatch
-     again, so that no attempt of a run meets a tag that an earlier attempt made.
+     artifact(s) downloaded" and "Give the checked digests the version tag" fails at the
+     `cat` of the missing digest file (`digest/amd64` or `digest/arm64`), or the download
+     step fails itself, and no tag exists either way. It also covers a `publish` job that
+     was skipped because `resolve`, `stage` or `verify` failed: fix the job that failed
+     first, then dispatch. Never re-run a failed `publish` job: dispatch again, so that no
+     attempt of a run meets a tag that an earlier attempt made.
    - **A run has a green `publish` job, the tag exists and its `verify-published` jobs
      passed:** the version is published. Do step 3 from that run's `Pin` line, if the
      quickstart does not name the version yet.
@@ -193,12 +194,12 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z
    ```
 
-   First check the login: run the same command for a tag that is known to exist, such as
-   the version that the quickstart pins now. If that does not print an index, the login
-   cannot be trusted for this check, and no other answer means anything: fix the login. With
-   a login that passes, an index means that the tag exists, and `not found` means that no
-   tag exists now. A 429 or 5xx answer is not an answer: run the command again later. A tag
-   that a package admin deleted also shows `not found`. Such a version is spent, so fix
+   A 429 or 5xx answer is not an answer, for any tag: run the command again later. Then
+   check the login: run the same command for a tag that is known to exist, such as the
+   version that the quickstart pins now. If that does not print an index, the login cannot
+   be trusted for this check, and no other answer means anything: fix the login. With a
+   login that passes, an index means that the tag exists, and `not found` means that no tag
+   exists now. A tag that a package admin deleted also shows `not found`. Such a version is spent, so fix
    forward with a new release, and never dispatch `publish=true` for a version whose tag was
    ever created. A dispatch with `publish=false` only stages and checks, and creates no tag.
 
