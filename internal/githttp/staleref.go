@@ -104,60 +104,82 @@ type staleRefCleanup struct {
 // lock (outcome busy). It also keeps a lock that is not newer than the lease
 // epoch (gitlimit.EpochFile), because a git without a lease can own it.
 //
+// What the proof leaves open is a git that holds no lease and has a lock
+// newer than the epoch: a git run by hand in the cache, or a git of an older
+// binary that outlived its server and started a new transaction after the
+// first lease-aware start. The age gate (staleRefLockAge) and the identity
+// check below narrow it, and the operator rules in
+// docs/how-to/deploy-production.md close it: stop the old binary and its git
+// children before the first start of a binary with the lease.
+//
 // A lock is moved into the quarantine directory with a rename, and the moved
 // file's device and inode are compared with the lock that was inspected.
 // Only a match is deleted. A path that was inspected and then deleted by name
 // can be a different file by then. A moved file that does not match is linked
 // back to its path, which fails when a new lock appeared there, and is kept.
 //
-// A run logs one line and counts one outcome, never one per lock: a failed
-// batch can leave thousands of locks.
+// A run that finds an old lock logs one line and counts one outcome, never
+// one per lock (a failed batch can leave thousands of locks), also when it
+// fails: an error counts as kept.
 func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res staleRefCleanup, err error) {
 	paths := refLockPaths(repoPath, names)
 	old := oldRefLocks(paths, now)
 	if len(old) == 0 {
 		return res, nil
 	}
+	res = staleRefCleanup{Old: len(old), Outcome: metrics.StaleRefLockKept}
+	replaced := 0
+	defer func() {
+		if res.Old == 0 {
+			return
+		}
+		if res.Removed > 0 {
+			res.Outcome = metrics.StaleRefLockRemoved
+		}
+		metrics.StaleRefLockCleanup(res.Outcome)
+		switch {
+		case err != nil:
+			log.Printf("hydrate %s: %d ref lock(s) older than %v kept: %v", repoPath, res.Old, staleRefLockAge, err)
+		case res.Outcome == metrics.StaleRefLockBusy:
+			log.Printf("hydrate %s: %d ref lock(s) older than %v kept: a git that serve started is still running in the repository", repoPath, res.Old, staleRefLockAge)
+		default:
+			log.Printf("hydrate %s: removed %d of %d ref lock(s) older than %v (%d replaced while moved); the others stay: see \"Stale ref locks\" in docs/how-to/deploy-production.md", repoPath, res.Removed, res.Old, staleRefLockAge, replaced)
+		}
+	}()
+
 	lease, err := gitlimit.TryExclusive(repoPath)
 	if errors.Is(err, gitlimit.ErrLeaseBusy) {
-		res = staleRefCleanup{Old: len(old), Outcome: metrics.StaleRefLockBusy}
-		metrics.StaleRefLockCleanup(res.Outcome)
-		log.Printf("hydrate %s: %d ref lock(s) older than %v kept: a git that serve started is still running in the repository", repoPath, res.Old, staleRefLockAge)
+		res.Outcome = metrics.StaleRefLockBusy
 		return res, nil
 	}
 	if err != nil {
-		return res, fmt.Errorf("stale ref locks: %w", err)
+		return res, fmt.Errorf("take the git lease: %w", err)
 	}
 	defer lease.Close()
 
 	// A lock can change between the first look and the lease: inspect again.
 	old = oldRefLocks(paths, now)
 	if len(old) == 0 {
+		res = staleRefCleanup{}
 		return res, nil
 	}
-	res = staleRefCleanup{Old: len(old), Outcome: metrics.StaleRefLockKept}
+	res.Old = len(old)
 	epoch, err := gitlimit.LeaseEpoch(repoPath)
 	if err != nil {
-		return res, fmt.Errorf("stale ref locks: %w", err)
+		return res, err
 	}
-	replaced := 0
-	defer func() {
-		if res.Removed > 0 {
-			res.Outcome = metrics.StaleRefLockRemoved
-		}
-		metrics.StaleRefLockCleanup(res.Outcome)
-		log.Printf("hydrate %s: removed %d of %d ref lock(s) older than %v (%d replaced while moved); the others stay: see \"Stale ref locks\" in docs/how-to/deploy-production.md", repoPath, res.Removed, res.Old, staleRefLockAge, replaced)
-	}()
 	for _, lock := range old {
 		if !lock.fi.ModTime().After(epoch) {
 			continue
 		}
-		switch moved, err := quarantineRefLock(repoPath, lock.path, lock.fi); {
-		case err != nil:
-			return res, fmt.Errorf("stale ref locks: %w", err)
-		case moved == lockDeleted:
+		moved, err := quarantineRefLock(repoPath, lock.path, lock.fi)
+		if err != nil {
+			return res, fmt.Errorf("move a ref lock: %w", err)
+		}
+		switch moved {
+		case lockDeleted:
 			res.Removed++
-		case moved == lockReplaced:
+		case lockReplaced:
 			replaced++
 		}
 	}

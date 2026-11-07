@@ -436,3 +436,62 @@ func TestCleanStaleRefLocksNeverReplacesANewLockWhenPuttingBack(t *testing.T) {
 		t.Fatalf("for-each-ref = %q, %v, want no refs", out, err)
 	}
 }
+
+// A run that fails still counts one outcome and logs one line, so that
+// monitoring sees an attempt that left the repository blocked.
+func TestCleanStaleRefLocksCountsAFailedRunAsKept(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(t *testing.T, repo string)
+		want   string
+	}{
+		{"the quarantine directory cannot be made", func(t *testing.T, repo string) {
+			if err := os.WriteFile(filepath.Join(repo, staleLocksDir), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, "move a ref lock"},
+		{"the epoch is not a regular file", func(t *testing.T, repo string) {
+			p := filepath.Join(repo, gitlimit.EpochFile)
+			if err := os.Remove(p); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("/nonexistent", p); err != nil {
+				t.Fatal(err)
+			}
+		}, "not a regular file"},
+		{"the lease cannot be opened", func(t *testing.T, repo string) {
+			p := filepath.Join(repo, gitlimit.LeaseFile)
+			if err := os.Remove(p); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, "take the git lease"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _ := srRepo(t)
+			lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+			tc.break_(t, repo)
+			lines := srLogLines(t, repo)
+			kept := srCount("kept")
+
+			res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("cleanup = %+v, %v, want an error that names %q", res, err, tc.want)
+			}
+			if res.Old != 1 || res.Removed != 0 || res.Outcome != metrics.StaleRefLockKept {
+				t.Fatalf("result = %+v, want 1 old, 0 removed, outcome kept", res)
+			}
+			if !srExists(t, lock) {
+				t.Fatal("a failed run removed the lock")
+			}
+			if got := srCount("kept") - kept; got != 1 {
+				t.Fatalf("kept outcomes counted = %v, want 1", got)
+			}
+			if l := lines(); len(l) != 1 || !strings.Contains(l[0], tc.want) {
+				t.Fatalf("log lines = %q, want one that names %q", l, tc.want)
+			}
+		})
+	}
+}
