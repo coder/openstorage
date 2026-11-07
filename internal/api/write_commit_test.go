@@ -1351,9 +1351,13 @@ func wctFakeGit(t *testing.T, repoPath string) (sc *wcScratch, patch string, set
 	}
 }
 
+// gitFailsOnArgStderr is what gitFailsOnArg's git prints: a server-side
+// read error, which no response may echo.
+const gitFailsOnArgStderr = "fatal: unable to read 1111111111111111111111111111111111111111"
+
 // gitFailsOnArg puts a git first on PATH that runs the real git, except
-// that a call with the argument arg fails: how is an exit status, or
-// "kill" for a git that dies of SIGKILL.
+// that a call with the argument arg prints gitFailsOnArgStderr and fails:
+// how is an exit status, or "kill" for a git that dies of SIGKILL.
 func gitFailsOnArg(t *testing.T, arg, how string) {
 	t.Helper()
 	real, err := exec.LookPath("git")
@@ -1371,6 +1375,7 @@ func gitFailsOnArg(t *testing.T, arg, how string) {
 	}
 	// read, [ and kill are shell builtins: the server runs some git
 	// children with an environment that has no PATH.
+	fail = "echo '" + gitFailsOnArgStderr + "' >&2; " + fail
 	script := fmt.Sprintf("#!/bin/sh\nread -r fail < %q\nfor a in \"$@\"; do [ \"$a\" = \"$fail\" ] && { %s; }; done\nexec %q \"$@\"\n", argFile, fail, real)
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)

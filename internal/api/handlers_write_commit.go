@@ -1405,9 +1405,12 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 					return fail(http.StatusBadRequest, "gitlink payload for "+st.op.Path+" exceeds a commit sha")
 				}
 			} else if err := st.sink.write(data); err != nil {
+				// Any bytes make a blob: a failed write is the server's
+				// git, never the request.
 				st.sink.abort()
 				open = nil
-				return fail(http.StatusBadRequest, "write blob: "+err.Error())
+				s.wcInternal(w, r, "write blob", err)
+				return nil, false
 			}
 			if ch.EOF {
 				if st.op.Mode == "160000" {
@@ -1421,7 +1424,8 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 					st.sink = nil
 					if err != nil {
 						open = nil
-						return fail(http.StatusBadRequest, "hash blob: "+err.Error())
+						s.wcInternal(w, r, "hash blob", err)
+						return nil, false
 					}
 					st.sha = sha
 				}

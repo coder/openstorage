@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -364,8 +365,8 @@ func childEnv(env []string) []string {
 // it (git is always reaped before Run returns). Limit outcomes are
 // returned as ErrBusy, ErrTimeBudget, ErrOutputLimit, or ErrMemoryLimit,
 // and never wrap *exec.ExitError, so exit-status checks cannot mistake them
-// for git's own "no match" or "not found" statuses. Other failures wrap
-// git's *exec.ExitError.
+// for git's own "no match" or "not found" statuses. Other failures are a
+// *GitError that wraps git's *exec.ExitError.
 func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
@@ -430,5 +431,35 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	case heap > 0 && heapLimitFailure(err, msg):
 		return stdout, fmt.Errorf("%s: %w (%d bytes): %s", name, ErrMemoryLimit, heap, msg)
 	}
-	return stdout, fmt.Errorf("%s: %w: %s", name, err, msg)
+	return stdout, &GitError{msg: fmt.Sprintf("%s: %v: %s", name, err, msg), err: err, Stderr: msg}
+}
+
+// GitError is Run's error for a git child that failed on its own (not a
+// limit outcome). It wraps git's error, an *exec.ExitError for an exit
+// status, and keeps git's stderr. A caller that classifies a failure
+// reads Stderr, never the error text: that quotes the request's
+// arguments.
+type GitError struct {
+	msg    string
+	err    error
+	Stderr string // git's stderr, trimmed
+}
+
+func (e *GitError) Error() string { return e.msg }
+func (e *GitError) Unwrap() error { return e.err }
+
+// gitStderr returns git's stderr when err is git's own failure with exit
+// status code.
+func gitStderr(err error, code int) (string, bool) {
+	var ge *GitError
+	var exit *exec.ExitError
+	if errors.As(err, &ge) && errors.As(err, &exit) && exit.ExitCode() == code {
+		return ge.Stderr, true
+	}
+	return "", false
+}
+
+// endsWithLine reports whether text ends with the whole line want.
+func endsWithLine(text, want string) bool {
+	return text == want || strings.HasSuffix(text, "\n"+want)
 }

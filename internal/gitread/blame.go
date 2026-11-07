@@ -2,6 +2,7 @@ package gitread
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -45,12 +46,45 @@ func Blame(ctx context.Context, repoPath, commit, path string, ranges []string, 
 	args = append(args, commit, "--", path)
 	out, err := runGit(ctx, Heavy, repoPath, args...)
 	if err != nil {
-		if !IsBudgetError(err) && strings.Contains(err.Error(), "no such path") {
+		// git's whole message is compared, never a part of it: the path
+		// is request input and can hold any text.
+		if stderr, ok := gitStderr(err, 128); ok && endsWithLine(stderr, "fatal: no such path "+path+" in "+commit) {
 			return nil, fmt.Errorf("blame %q at %s: %w", path, commit, ErrNotFound)
+		}
+		if len(ranges) > 0 && blameRangeFailed(err, path) {
+			return nil, fmt.Errorf("blame %q at %s: %w: %w", path, commit, ErrBadRange, err)
 		}
 		return nil, err
 	}
 	return parseBlamePorcelain(out)
+}
+
+// ErrBadRange: git blame refused a -L range of the request (bad syntax,
+// past the end of the file, no match).
+var ErrBadRange = errors.New("blame range does not fit the file")
+
+// blameRangeFailed reports whether git blame failed on its -L ranges:
+// git prints its usage (exit 129) for a range it cannot parse, and dies
+// (exit 128) with a "-L ..." line or with "file <path> has only N lines".
+func blameRangeFailed(err error, path string) bool {
+	if _, ok := gitStderr(err, 129); ok {
+		return true
+	}
+	stderr, ok := gitStderr(err, 128)
+	if !ok {
+		return false
+	}
+	if strings.HasPrefix(stderr[strings.LastIndexByte(stderr, '\n')+1:], "fatal: -L ") {
+		return true
+	}
+	head := "fatal: file " + path + " has only "
+	i := strings.LastIndex(stderr, head)
+	if i < 0 || (i > 0 && stderr[i-1] != '\n') {
+		return false
+	}
+	n, unit, _ := strings.Cut(stderr[i+len(head):], " ")
+	_, numErr := strconv.ParseUint(n, 10, 64)
+	return numErr == nil && (unit == "line" || unit == "lines")
 }
 
 // blameMeta is the per-commit metadata block of the porcelain stream, which
