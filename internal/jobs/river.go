@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	stdsync "sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -437,15 +439,113 @@ func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) err
 type sweepWorker struct {
 	river.WorkerDefaults[sweepArgs]
 	schedule *SweepSchedule
+	// running holds the pass that Work started until that pass really ends,
+	// also after Work gave up on it: a tick that finds it held does nothing,
+	// so abandoned passes never pile up in one process.
+	running atomic.Bool
 }
 
 func (*sweepWorker) Timeout(*river.Job[sweepArgs]) time.Duration { return sweepRescueAfter }
 
+// sweepReturnGrace is how long Work waits, after its job context ends, for
+// the sweep to wind down before it returns anyway.
+const sweepReturnGrace = 2 * time.Second
+
+// sweepOutcome is what the pass's goroutine hands back to Work: its result, or
+// the panic it ended with.
+type sweepOutcome struct {
+	err   error
+	panic *sweepPanic
+}
+
+// sweepPanic is a panic of the pass, with the stack of the goroutine that it
+// came from. Work raises it again, and River records the value's text with the
+// attempt, so the text carries the frames of the pass that a bare re-panic in
+// Work's goroutine would lose.
+type sweepPanic struct {
+	val   any
+	stack []byte
+}
+
+func (p *sweepPanic) Error() string {
+	return fmt.Sprintf("orphan pack sweep pass panicked: %v\n\n%s", p.val, p.stack)
+}
+
+// Unwrap exposes the value that the pass panicked with when it is an error.
+func (p *sweepPanic) Unwrap() error {
+	err, _ := p.val.(error)
+	return err
+}
+
+// Work returns at most sweepReturnGrace after its job context ends, even when
+// the sweep is still in a safeDelete recovery step. That step runs detached
+// from the job context for up to sweepRecoveryTimeout, and while Work waited
+// for it the row stayed running: River.Close gave up first, the process
+// exited, and the next process's sweep deduplicated against the orphaned row
+// until River rescued it. The detached step goes on without the row. If the
+// process ends first, that is a sweeper crash, and the next sweep heals.
+//
+// The pass runs in its own goroutine, outside River's recovery boundary. A
+// panic in it is caught there, logged with the pass's stack, and raised again
+// in Work's goroutine as a sweepPanic, where River records it as a failed
+// attempt with the stack in its text. A pass that Work abandoned keeps running
+// until it ends, and its panic or error is logged because nobody else sees it.
+// A tick that arrives meanwhile does nothing. That is one pass at a time per
+// process: another replica's sweep can start during the recovery of an
+// abandoned pass, which the sweep tolerates by design.
 func (w *sweepWorker) Work(ctx context.Context, _ *river.Job[sweepArgs]) error {
 	if w.schedule == nil {
 		return errScheduleOff
 	}
-	return w.schedule.runOnce(ctx, passJobTimeout, sweepPurgeTimeout)
+	logger := w.schedule.Sweeper.logger
+	if !w.running.CompareAndSwap(false, true) {
+		logger.Warn("orphan pack sweep: a pass from an earlier job is still running on this replica; this job does nothing")
+		return nil
+	}
+	var abandoned atomic.Bool
+	done := make(chan sweepOutcome, 1)
+	go func() {
+		var out sweepOutcome
+		defer func() {
+			if v := recover(); v != nil {
+				out.panic = &sweepPanic{val: v, stack: debug.Stack()}
+				logger.Error("orphan pack sweep: the pass panicked", "panic", fmt.Sprint(v), "stack", string(out.panic.stack))
+			}
+			w.running.Store(false)
+			done <- out
+			// Work either takes the outcome from done or marks the pass
+			// abandoned before it looks: an error that nobody takes is logged.
+			if out.err != nil && abandoned.Load() {
+				logger.Error("orphan pack sweep: a pass that its job gave up on ended with an error", "err", out.err)
+			}
+		}()
+		out.err = w.schedule.runOnce(ctx, passJobTimeout, sweepPurgeTimeout)
+	}()
+	finish := func(out sweepOutcome) error {
+		if out.panic != nil {
+			panic(out.panic)
+		}
+		return out.err
+	}
+	select {
+	case out := <-done:
+		return finish(out)
+	case <-ctx.Done():
+	}
+	grace := time.NewTimer(sweepReturnGrace)
+	defer grace.Stop()
+	select {
+	case out := <-done:
+		return finish(out)
+	case <-grace.C:
+		abandoned.Store(true)
+		select {
+		case out := <-done: // it ended as the grace did
+			return finish(out)
+		default:
+		}
+		return fmt.Errorf("jobs: sweep still recovering %v after its job ended: %w", sweepReturnGrace, context.Cause(ctx))
+	}
 }
 
 // deliveryWorker performs one signed POST per job attempt; River owns the
