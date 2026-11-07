@@ -559,12 +559,13 @@ class CitationTests(CheckerTestCase):
             "blank-first ordered item": f"1.\n     > \t{link}\n", "one space less": f"-\n   > \t{link}\n",
             "quote": f">\t{link}\n", "ordered marker": f"- 1.  \t{link}\n", "ordered marker with a parenthesis": f"- 1)  \t{link}\n",
             "tab between quote markers": f">\t> \t{link}\n", "tab before a quote marker": f"-\n\t> \t{link}\n",
-            "two-digit ordered marker": f"- 10.  \t{link}\n",
+            "two-digit ordered marker": f"- 10.  \t{link}\n", "nine-digit ordered marker": f"- 123456789.  \t{link}\n",
+            "three quote markers": f"> > > \t{link}\n",
         }
         code = {
             "two spaces": f"-\n  > \t{link}\n", "six spaces": f"-\n      > \t{link}\n",
             "nested quote": f"> > \t{link}\n", "item and quote": f"- > \t{link}\n", "plus marker": f"- + \t{link}\n",
-            "star marker": f"- * \t{link}\n",
+            "star marker": f"- * \t{link}\n", "three-digit ordered marker": f"- 100.  \t{link}\n",
         }
         for name, readme in shown.items():
             with self.subTest(case=name):
@@ -574,13 +575,21 @@ class CitationTests(CheckerTestCase):
                 self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
 
     def test_a_tab_in_heading_text_inside_a_container_stays_a_tab_for_the_anchor(self):
-        # GitHub drops a tab from the heading slug. Expanding it to spaces would make the slug `a--b`.
-        headings = "- ## A\tB\n\n> ## C\tD\n\n1. ## E\tF\n\n-\t## G\tH\n\n> - ## I\t\tJ\n"
-        good = ["#ab", "#cd", "#ef", "#gh", "#ij"]
-        bad = ["#a--b", "#c--d", "#e-f", "#g----h", "#i--------j"]
+        # GitHub drops a tab from the heading slug. Expanding it to spaces would make the slug `a--b`. The last heading
+        # starts with `>` and a tab: a `#` is not a container marker, so the tab belongs to the heading text.
+        headings = "- ## A\tB\n\n> ## C\tD\n\n1. ## E\tF\n\n-\t## G\tH\n\n> - ## I\t\tJ\n\n- # >\tK\n"
+        good = ["#ab", "#cd", "#ef", "#gh", "#ij", "#k"]
+        bad = ["#a--b", "#c--d", "#e-f", "#g----h", "#i--------j", "#---k"]
         readme = " ".join(f"[x](docs/a.md{anchor})" for anchor in good + bad) + "\n"
         result = self.run_checker(readme, docs={"a.md": headings})
-        self.assertEqual(result.stdout, "".join(f"BROKEN ANCHOR README.md:1 -> docs/a.md{anchor}\n" for anchor in bad) + "broken links: 5\n")
+        self.assertEqual(result.stdout, "".join(f"BROKEN ANCHOR README.md:1 -> docs/a.md{anchor}\n" for anchor in bad) + "broken links: 6\n")
+
+    def test_a_tab_after_the_hashes_starts_a_heading(self):
+        # CommonMark takes a space or a tab after the opening hashes, and `#NoSpace` is text. GitHub's slug of `#<TAB>Z` is `z`.
+        headings = "#\tZ\n\n> #\tY\n\n- ##\tW  V\n\n#NoSpace\n"
+        readme = " ".join(f"[x](docs/a.md{anchor})" for anchor in ["#z", "#y", "#w--v", "#missing", "#nospace"]) + "\n"
+        result = self.run_checker(readme, docs={"a.md": headings})
+        self.assertEqual(result.stdout, "BROKEN ANCHOR README.md:1 -> docs/a.md#missing\nBROKEN ANCHOR README.md:1 -> docs/a.md#nospace\nbroken links: 2\n")
 
     def test_only_spaces_and_tabs_separate_a_link_destination_from_its_title(self):
         # CommonMark takes a form feed or NEL after a destination as part of the text, so the link below renders.

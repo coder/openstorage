@@ -57,7 +57,7 @@ Standalone maintenance scripts for docs, releases, the Compose quickstart, and t
   - `[check-doc-links.py:REFDEF]` A reference-style link definition line (`[label]:` after at most three spaces).
   - `[check-doc-links.py:ANGLE]` An angle-bracket destination (`](` then optional space, then `<`).
   - `[check-doc-links.py:FENCE]` A code fence opener of three or more backticks or tildes after at most three spaces.
-  - `[check-doc-links.py:HEADING]` An ATX heading: one to six `#`, at least one space, then the heading text.
+  - `[check-doc-links.py:HEADING]` An ATX heading: one to six `#`, at least one space or tab, then the heading text.
   - `[check-doc-links.py:BACKTICKS]` One run of backticks (a code span delimiter).
   - `[check-doc-links.py:HTML]` An HTML comment, or an HTML start or end tag with optional attributes.
   - `[check-doc-links.py:THEMATIC]` A thematic break of three or more `*`, `-`, or `_`.
