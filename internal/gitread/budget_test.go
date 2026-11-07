@@ -504,3 +504,35 @@ func TestCheckBlobSizeNamesLongPathBriefly(t *testing.T) {
 		t.Errorf("a blob at the limit: err = %v, want nil", err)
 	}
 }
+
+// The path of a symlink over the target limit goes into the error too, and
+// into the log, as the path of a blob does: the message clips it, and
+// LimitPath keeps the whole path for the response that names it.
+func TestLimitErrorsClipThePathInTheMessageAndKeepItWhole(t *testing.T) {
+	long := strings.Repeat("d", 100_000)
+	for _, c := range []struct {
+		name string
+		err  error
+		is   error
+	}{
+		{"symlink", CheckSymlinkTarget(long, MaxSymlinkTarget+1), ErrSymlinkTooLong},
+		{"blob", CheckBlobSize(context.Background(), long, MaxBlobBytes+1), ErrBlobTooLarge},
+	} {
+		if !errors.Is(c.err, c.is) {
+			t.Fatalf("%s: err = %v, want %v", c.name, c.err, c.is)
+		}
+		msg := c.err.Error()
+		if len(msg) > 1024 {
+			t.Fatalf("%s: the error is %d bytes, want it bounded: %.200s", c.name, len(msg), msg)
+		}
+		if want := "...(100000 bytes)"; !strings.Contains(msg, want) {
+			t.Errorf("%s: error %.300q lacks %q", c.name, msg, want)
+		}
+		if path, ok := LimitPath(c.err); !ok || path != long {
+			t.Errorf("%s: LimitPath keeps %d bytes (%v), want the whole path of %d", c.name, len(path), ok, len(long))
+		}
+	}
+	if err := CheckSymlinkTarget("a/link", MaxSymlinkTarget); err != nil {
+		t.Errorf("a target at the limit: err = %v, want nil", err)
+	}
+}

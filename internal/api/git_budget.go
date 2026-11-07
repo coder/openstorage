@@ -227,8 +227,9 @@ func namedEntry(noun string, err error) string {
 	n := len(path)
 	if n > maxNamedPath {
 		// Cut before the rune that byte n belongs to. A rune has at most
-		// utf8.UTFMax bytes, so the cut steps back at most UTFMax-1; bytes
-		// that are not UTF-8 are cut where the limit leaves them.
+		// utf8.UTFMax bytes, so the cut steps back at most UTFMax-1. A byte
+		// that starts a rune, valid or not (0xff), is cut at the limit, and
+		// a run of stray continuation bytes (0x80) steps back all 3.
 		n = maxNamedPath
 		for back := 0; back < utf8.UTFMax-1 && !utf8.RuneStart(path[n]); back++ {
 			n--
