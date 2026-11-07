@@ -646,9 +646,11 @@ freshness pokes) and push-upstream forwards.
   Transitional default: pulls allow private upstreams, pushes deny.
 - A denied pull destination fails the run as `repository configuration error`; a denied
   push destination as `invalid sync configuration`.
-- An upstream `owner`, `name` or `host`, or a stored credential, that git cannot take (one
-  argument or variable of 128 KiB or more on Linux, or a NUL byte) fails a pull or a push as
-  `repository configuration error`. The failure is permanent, and the run is not retried.
+- An upstream URL (`https://{host}/{owner}/{name}.git`, one argument of the git command) or a
+  stored credential (one environment variable) that git cannot take fails a pull or a push as
+  `repository configuration error`. That is 128 KiB or more on Linux, counted over the whole URL
+  and not over each of its parts, or a NUL byte in any part. The failure is permanent, and the
+  run is not retried.
 - `POST /repos` with `upstream` or a `base_repo` sync also rejects, with 400, an
   `upstream.host` or `upstream_host` the pull policy denies. This registration check is a courtesy; dial time is authoritative.
 

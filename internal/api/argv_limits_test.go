@@ -92,6 +92,7 @@ var alWant = map[string][3]int{
 	"notes notes_ref":             {400, 400, 400},
 	"notes object_ref":            {404, 404, 404},
 	"notes write notes_ref":       {400, 400, 400},
+	"restore-commit base_ref":     {404, 404, 404},
 	"tag name":                    {404, 404, 404},
 	"tags create message":         {400, 400, 400},
 	"tags create name":            {400, 400, 400},
@@ -301,6 +302,41 @@ func TestCommitPackValuesGitCannotTake(t *testing.T) {
 					if resp.StatusCode == http.StatusBadRequest {
 						// A 400 of this route is a result envelope, whichever value caused it.
 						wctRequireFail(t, resp, raw, http.StatusBadRequest, "invalid")
+					}
+				})
+			}
+		}
+	})
+}
+
+// TestRestoreCommitBaseRefGitCannotTake sends a base_ref that git cannot take
+// to restore-commit, with and without a commit message. The default message
+// is built from base_ref, so a NUL in base_ref must not be reported as a NUL
+// in commit_message: base_ref names no ref, and that is a 404 on every route.
+func TestRestoreCommitBaseRefGitCannotTake(t *testing.T) {
+	alRequireArgLimit(t)
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, _ := wctRepo(t, e)
+		seed := wctLines(t, wctMeta("main", "c", []map[string]any{{"path": "f.txt", "content_id": "id1", "operation": "upsert", "mode": "100644"}}, nil),
+			wctChunk("id1", []byte("x\n"), true))
+		resp, raw := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(seed))
+		wctRequireOK(t, resp, raw)
+
+		for i, kind := range alKinds {
+			for _, message := range []string{"", "restore"} {
+				t.Run(kind+"/message="+message, func(t *testing.T) {
+					md := map[string]any{"target_branch": "main", "base_ref": alValues()[kind], "author": wctAuthor}
+					if message != "" {
+						md["commit_message"] = message
+					}
+					body, err := json.Marshal(map[string]any{"metadata": md})
+					if err != nil {
+						t.Fatal(err)
+					}
+					resp, raw := wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(body))
+					if want := alWant["restore-commit base_ref"][i]; resp.StatusCode != want {
+						t.Fatalf("status %d, want %d: %.300s", resp.StatusCode, want, raw)
 					}
 				})
 			}

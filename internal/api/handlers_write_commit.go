@@ -1734,7 +1734,9 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	revision := md.BaseRef != nil
 	md.applyCurrentNames()
 	if md.CommitMessage == "" {
-		md.CommitMessage = "Restore to " + md.TargetCommitSHA
+		// A NUL in base_ref names no ref and is answered as such (404) below. It
+		// must not be reported as a NUL in a commit_message the client did not send.
+		md.CommitMessage = "Restore to " + strings.ReplaceAll(md.TargetCommitSHA, "\x00", "")
 	}
 	if err := wcValidateMetadata(md); err != nil {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
