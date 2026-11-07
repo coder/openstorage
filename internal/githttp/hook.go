@@ -2457,9 +2457,13 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	for _, sha := range pending {
 		reason, err := v.verifyCommit(ctx, sha)
 		if err != nil {
-			// Not a verdict: nothing is cached, and the pusher gets the
-			// fixed failure line (RunHook).
-			return fmt.Errorf("verify-sig: %w", err)
+			// Not a verdict, so the reason names no signature fault and
+			// no cause: the cause goes to the hook-errors file now. It is
+			// still cached and charged like a denial for the rest of the
+			// push, or a commit whose check cannot finish (git dies on a
+			// malformed signature header) costs one git spawn per ref.
+			hookErrorsLogger().Error("verify-sig: signature check did not finish", "sha", sha, "err", err)
+			reason = "signature check failed (the server log has the cause)"
 		}
 		if reason != "" {
 			if err := state.markCommitDenied(sha, reason); err != nil {
