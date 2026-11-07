@@ -112,9 +112,12 @@ mut MarkBeforeCas internal/events/refstore.go '	release, err := s.runBeforeCAS(c
 	if err != nil {
 		return false, 0, err
 	}
+	defer release() // a panicking CAS still ends the hold, as in CASRef
 	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
 	release()
-' '	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
+' '	release := func() {}
+	defer release()
+	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
 	release, rerr := s.runBeforeCAS(ctx, repo, name)
 	if rerr != nil {
 		return false, 0, rerr
