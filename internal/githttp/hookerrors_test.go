@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	stdsync "sync"
 	"syscall"
 	"testing"
 	"time"
@@ -389,5 +390,63 @@ func TestServeLogsHookErrors(t *testing.T) {
 	}
 	if _, err := os.Lstat(m[1]); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the hook-errors file %s outlived the request: %v", m[1], err)
+	}
+}
+
+// A record longer than maxHookErrorRecordBytes is cut, so serve reads it and
+// every record after it.
+func TestHookErrorsFileCutsLongRecords(t *testing.T) {
+	path, err := createHookErrors(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvHookErrors, path)
+	logger := slog.New(NewHookLogHandler(io.Discard, nil))
+	logger.Error("huge", "err", errors.New(strings.Repeat("x", 4*maxHookErrorRecordBytes)))
+	logger.Error("after the huge one")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, _ := strings.Cut(string(b), "\n")
+	if len(first)+1 != maxHookErrorRecordBytes || !strings.HasSuffix(first, strings.TrimSuffix(hookErrorCut, "\n")) {
+		t.Fatalf("the huge record is %d bytes ending %q; want %d bytes ending %q", len(first)+1, first[max(0, len(first)-20):], maxHookErrorRecordBytes, hookErrorCut)
+	}
+	logs := captureServeLog(t)
+	logHookErrors("receive-pack r1", path)
+	if !strings.Contains(logs.String(), "after the huge one") || strings.Contains(logs.String(), "hook errors:") {
+		t.Fatalf("serve did not log the record after the cut one: %.300s", logs)
+	}
+}
+
+// Concurrent writers of one hook overshoot the file's cap by at most one
+// record.
+func TestHookErrorsFileCapHoldsAcrossGoroutines(t *testing.T) {
+	path, err := createHookErrors(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", maxHookErrorsBytes-1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvHookErrors, path)
+	logger := slog.New(NewHookLogHandler(io.Discard, nil))
+	record := strings.Repeat("y", 1000)
+	start := make(chan struct{})
+	var wg stdsync.WaitGroup
+	for range 200 {
+		wg.Go(func() {
+			<-start
+			logger.Error("delivery failed", "err", errors.New(record))
+		})
+	}
+	close(start)
+	wg.Wait()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if over := fi.Size() - maxHookErrorsBytes; over > 2*int64(len(record)) {
+		t.Fatalf("the file holds %d bytes past its cap; want at most one record (about %d)", over, len(record))
 	}
 }
