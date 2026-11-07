@@ -60,6 +60,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -87,12 +88,12 @@ func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...strin
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Stdin = stdin
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the log
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
 		return string(out), fmt.Errorf("git %s: %w: %s",
-			strings.Join(args, " "), normalizeCtxErr(ctx, err), strings.TrimSpace(stderr.String()))
+			strings.Join(args, " "), normalizeCtxErr(ctx, err), stderr.String())
 	}
 	return string(out), nil
 }

@@ -91,14 +91,14 @@ func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) 
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the log
 	cmd.Stderr = &stderr
 	out, err := gitlimit.Output(cmd)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			err = fmt.Errorf("%w: %w", cerr, err)
 		}
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr.String())
 	}
 	return string(out), nil
 }
@@ -1199,7 +1199,7 @@ func (s *sliceRefSeq) next() (string, string, bool, error) {
 type localRefSeq struct {
 	cmd    *exec.Cmd
 	sc     *bufio.Scanner
-	stderr bytes.Buffer
+	stderr gitlimit.TailBuffer
 	prev   string
 	waited bool
 }
@@ -1513,8 +1513,10 @@ func updateRefStdin(repoPath, commands string) error {
 	cmd := exec.Command("git", "update-ref", "--stdin")
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(commands)
-	if out, err := gitlimit.CombinedOutput(cmd); err != nil {
-		return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
+	var stderr gitlimit.TailBuffer // update-ref --stdin prints nothing else
+	cmd.Stderr = &stderr
+	if err := gitlimit.Run(cmd); err != nil {
+		return fmt.Errorf("update-ref --stdin: %w: %s", err, stderr.String())
 	}
 	return nil
 }
