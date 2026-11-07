@@ -33,6 +33,16 @@ func allocated(f func()) uint64 {
 	return after.TotalAlloc - before.TotalAlloc
 }
 
+// maxChunks bounds the chunks of an output of up to 48 MiB. A chunk is a
+// quarter of what is held and at least 64 bytes: 4 chunks of 64 bytes, then
+// growth by 1.25 times from 256 bytes to 32 MiB (about 53 chunks), then chunks
+// of 8 MiB. The tests below hold 56 chunks (one byte at a time, 25 MiB), 59
+// (64 bytes at a time, 48 MiB) and 31 (32 KiB at a time, 48 MiB). A buffer
+// that starts a chunk for every write, or one that does not count what it
+// holds, or one that grows by an eighth, is far over 80 at once, and the
+// checks fail on the write that crosses it, not at the test's timeout.
+const maxChunks = 80
+
 // The chunks join into what was written, whatever the sizes of the writes
 // and of the chunks: empty writes, writes that end on a chunk's end, and
 // writes of several chunks.
@@ -50,6 +60,7 @@ func TestLimitedBufferKeepsWhatIsWritten(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var l limitedBuffer
 			rest := data
+			written := 0
 			for i := 0; len(rest) > 0; i++ {
 				n := 0
 				if sizes == nil {
@@ -62,6 +73,10 @@ func TestLimitedBufferKeepsWhatIsWritten(t *testing.T) {
 					t.Fatalf("Write(%d bytes) = %d, %v", n, w, err)
 				}
 				rest = rest[n:]
+				written += n
+				if l.n != written || len(l.chunks) > maxChunks {
+					t.Fatalf("after %d bytes written the buffer holds %d bytes in %d chunks, want the same bytes in at most %d", written, l.n, len(l.chunks), maxChunks)
+				}
 			}
 			if got := l.String(); got != string(data) {
 				t.Fatalf("held %d bytes, want %d, or the bytes differ", len(got), len(data))
@@ -99,9 +114,12 @@ func TestLimitedBufferRefusesWhatPassesTheAllowance(t *testing.T) {
 func TestLimitedBufferChunksStayWithinAQuarter(t *testing.T) {
 	piece := make([]byte, 32<<10)
 	var l limitedBuffer
-	for l.n < 48<<20 {
+	for written := len(piece); written <= 48<<20; written += len(piece) {
 		if _, err := l.Write(piece); err != nil {
 			t.Fatal(err)
+		}
+		if l.n != written || len(l.chunks) > maxChunks {
+			t.Fatalf("after %d bytes written the buffer holds %d bytes in %d chunks, want the same bytes in at most %d", written, l.n, len(l.chunks), maxChunks)
 		}
 		last := l.chunks[len(l.chunks)-1]
 		if unused := cap(last) - len(last); unused > l.n/4 {
