@@ -79,9 +79,12 @@ var blameShortFile = regexp.MustCompile(` has only [0-9]+ lines?\z`)
 
 // blameRangeFailed reports whether git blame failed on its -L ranges:
 // git prints its usage (exit 129) for a range it cannot parse, and dies
-// (exit 128) with a line that starts "fatal: -L " or with "fatal: file
-// <path> has only N lines". Only the text before and after the path is
-// read.
+// (exit 128) with "fatal: -L ..." or "fatal: file <path> has only N
+// lines". That message is all git prints, and its fixed head comes
+// before the path, so only a head at the start of stderr counts: a path
+// that holds a newline and a forged head cannot make a missing or
+// unreadable file ("fatal: no such path <path> in <commit>") read as a
+// bad range.
 func blameRangeFailed(err error) bool {
 	if _, ok := gitStderr(err, 129); ok {
 		return true
@@ -90,12 +93,10 @@ func blameRangeFailed(err error) bool {
 	if !ok {
 		return false
 	}
-	text := "\n" + stderr
-	if strings.Contains(text, "\nfatal: -L ") {
+	if strings.HasPrefix(stderr, "fatal: -L ") {
 		return true
 	}
-	i := strings.LastIndex(text, "\nfatal: file ")
-	return i >= 0 && blameShortFile.MatchString(text[i:])
+	return strings.HasPrefix(stderr, "fatal: file ") && blameShortFile.MatchString(stderr)
 }
 
 // blamePathMissing reports whether path names no file at commit, read

@@ -33,7 +33,7 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 - `mergeNumstat` and `mergePatches` error on any mismatch between the three diff passes [diff.go:mergeNumstat]
 - `LastCommits` fails with `ErrTooManyLastCommits` past `maxDistinct`; spool lines over 1 MiB or spool over 256 MiB fail with `ErrOutputLimit` [lastcommits.go:spoolWriter]
 - `Note` maps git exit 1 to `ErrNotFound`; `PeeledTags` skips non-commit tags [notes.go:Note]
-- A failed `Blame` reads only the exit status and fixed parts of git's stderr, never the path, which git rewrites in its messages. With ranges, exit 129, a line that starts `fatal: -L `, or a last line `fatal: file <path> has only N line(s)` is `ErrBadRange`. Otherwise `ls-tree` decides: a path that names no file (not one blob or symlink, or entries under `<path>/`) is `ErrNotFound`, and any other failure is returned [blame.go:Blame]
+- A failed `Blame` reads only the exit status and fixed parts of git's stderr, never the path, which git rewrites in its messages. With ranges, exit 129, or exit 128 with stderr that starts `fatal: -L `, or that starts `fatal: file ` and ends `has only N line(s)`, is `ErrBadRange`: git prints only that message, and a path in it comes after the fixed head. Otherwise `ls-tree` decides: a path that names no file (not one blob or symlink, or entries under `<path>/`) is `ErrNotFound`, and any other failure is returned [blame.go:Blame]
 - `Grep` answers exit 1 with no output as no match, and exit 128 with a last line that starts `fatal: -e option, '` as `ErrBadPattern`; every other failure is returned [grep.go:runGrep]
 
 ## Side Effects
