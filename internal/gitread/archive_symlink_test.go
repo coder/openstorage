@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -48,7 +49,8 @@ func catFileCalls(t *testing.T, log string) int {
 // Linux, is carried by the archive. One of 4096 bytes fails PrepareArchive
 // with ErrSymlinkTooLong, a limit error, before git reads the target and
 // before any archive byte exists. The sizes are numbers, not MaxSymlinkTarget,
-// so a changed constant turns this red.
+// so a changed constant turns this red. The regular file is longer than a
+// target may be, and the archive keeps it: only symlinks have this limit.
 func TestPrepareArchiveCapsASymlinkTarget(t *testing.T) {
 	ctx := context.Background()
 	for _, c := range []struct {
@@ -58,7 +60,7 @@ func TestPrepareArchiveCapsASymlinkTarget(t *testing.T) {
 	}{{"4095 bytes", 4095, true}, {"4096 bytes", 4096, false}, {"1 MiB", 1 << 20, false}} {
 		t.Run(c.name, func(t *testing.T) {
 			target := strings.Repeat("t", c.size)
-			dir, commit := fiRepo(t, []fiFile{{"100644", "a.txt", "a"}, {"120000", "link", target}})
+			dir, commit := fiRepo(t, []fiFile{{"100644", "a.txt", strings.Repeat("a", 5000)}, {"120000", "link", target}})
 			log := gitCalls(t)
 			prepared, err := PrepareArchive(ctx, dir, commit, ArchiveOptions{})
 			if !c.ok {
@@ -67,6 +69,9 @@ func TestPrepareArchiveCapsASymlinkTarget(t *testing.T) {
 				}
 				if msg := err.Error(); !strings.Contains(msg, `"link"`) || !strings.Contains(msg, "4095") {
 					t.Fatalf("the error does not name the path and the limit: %v", err)
+				}
+				if path, ok := LimitPath(err); !ok || path != "link" {
+					t.Fatalf("LimitPath(%v) = %q, %v; want \"link\"", err, path, ok)
 				}
 				if n := catFileCalls(t, log); n != 0 {
 					t.Fatalf("git cat-file ran %d times for a target over the limit", n)
@@ -215,5 +220,33 @@ func TestTargetWriterKeepsOneByteOverTheLimit(t *testing.T) {
 	}
 	if n, err := w.Write(make([]byte, 10<<10)); n != 10<<10 || !errors.Is(err, ErrStop) || len(w.buf) != 4096 {
 		t.Fatalf("Write(10 KiB) = %d, %v with %d bytes held; want ErrStop and 4096 bytes", n, err, len(w.buf))
+	}
+}
+
+// A limit error keeps the path it was given, through the wrapping that
+// callers add, so that a response can name the entry. An error that came
+// from neither check names none.
+func TestLimitErrorsNameTheirPath(t *testing.T) {
+	big := CheckBlobSize(context.Background(), "dir/big.bin", MaxBlobBytes+1)
+	long := CheckSymlinkTarget("dir/link", MaxSymlinkTarget+1)
+	for _, c := range []struct {
+		name string
+		err  error
+		is   error
+		path string
+	}{
+		{"blob", big, ErrBlobTooLarge, "dir/big.bin"},
+		{"symlink", long, ErrSymlinkTooLong, "dir/link"},
+		{"wrapped", fmt.Errorf("archive: %w", long), ErrSymlinkTooLong, "dir/link"},
+	} {
+		if !errors.Is(c.err, c.is) || !IsBudgetError(c.err) {
+			t.Fatalf("%s: %v is not a budget error %v", c.name, c.err, c.is)
+		}
+		if path, ok := LimitPath(c.err); !ok || path != c.path {
+			t.Fatalf("%s: LimitPath = %q, %v; want %q", c.name, path, ok, c.path)
+		}
+	}
+	if path, ok := LimitPath(ErrBlobTooLarge); ok {
+		t.Fatalf("the bare error names %q", path)
 	}
 }

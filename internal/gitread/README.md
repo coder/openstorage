@@ -8,7 +8,7 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 - `Materialize` — hydrates the cache bare repo through `githttp.Hydrate` and returns its path [gitread.go:Materialize]
 - `ResolveRef` — resolves a branch, tag, full ref, or hex spec to a commit SHA. With `ephemeral` true it tries only the ephemeral-namespace name `auth.EphemeralRefName(spec)` and the hex spec, and skips the `refs/heads/`, `refs/tags/`, and full-ref candidates [gitread.go:ResolveRef]
 - Budgets: `Budget`, `NewBudget`, `WithLimits`, `WithBudget`, `BudgetFrom`, `Close`, `Limits`, `DefaultLimits`, `Slots`, `NewSlots`, `Class` (`Light`, `Heavy`), `Cmd`, `Run`, `CheckBlobSize`, `IsBudgetError` [budget.go:NewBudget]
-- Limit errors: `ErrBusy`, `ErrTimeBudget`, `ErrOutputLimit`, `ErrBlobTooLarge`, `ErrSymlinkTooLong`, `ErrMemoryLimit`, `ErrStop`; caps `HeavyHeapBytes`, `LightHeapBytes`, `DefaultOutputBytes`, `MaxBlobBytes` [budget.go:ErrBusy]
+- Limit errors: `ErrBusy`, `ErrTimeBudget`, `ErrOutputLimit`, `ErrBlobTooLarge`, `ErrSymlinkTooLong`, `LimitPath`, `ErrMemoryLimit`, `ErrStop`; caps `HeavyHeapBytes`, `LightHeapBytes`, `DefaultOutputBytes`, `MaxBlobBytes` [budget.go:ErrBusy]
 - `HeapLimitSupported` [heaplimit.go:HeapLimitSupported]
 - Trees and blobs: `TreeEntry`, `EntryBlob`, `EntryTree`, `EntrySymlink`, `EntrySubmodule`, `LsTree`, `LsTreePage`, `ErrUnsortedTree`, `BlobInfo`, `StatBlob`, `CatBlobTo`, `ReadSymlinkTarget` [tree.go:LsTree]
 - History: `Commit`, `LogOptions`, `Log`, `CommitsBySHA`, `CommitDetail`, `GetCommit`, `LastCommits`, `ErrTooManyLastCommits` [log.go:Log] [lastcommits.go:LastCommits]

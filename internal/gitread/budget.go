@@ -75,8 +75,10 @@ var (
 	// ErrBlobTooLarge: a blob is larger than MaxBlobBytes; git was not
 	// started for it.
 	ErrBlobTooLarge = errors.New("blob exceeds the API read size limit")
-	// ErrSymlinkTooLong: a symlink's target is longer than MaxSymlinkTarget;
-	// git was not started for it.
+	// ErrSymlinkTooLong: a symlink's target is longer than MaxSymlinkTarget.
+	// The size that the tree lists is checked before git starts. A blob
+	// that git prints longer than listed (a replacement object that
+	// appeared since) ends git at the first byte over the limit.
 	ErrSymlinkTooLong = errors.New("symlink target exceeds the API read size limit")
 	// ErrMemoryLimit: git needed more heap than its class's cap and was
 	// stopped by its own allocation failure (Linux only).
@@ -110,23 +112,46 @@ func CheckBlobSize(ctx context.Context, path string, size int64) error {
 		limit = b.limits.MaxBlob
 	}
 	if size > limit {
-		return fmt.Errorf("%q is %d bytes: %w (%d bytes)", path, size, ErrBlobTooLarge, limit)
+		return &limitError{path: path, err: ErrBlobTooLarge,
+			msg: fmt.Sprintf("%q is %d bytes: %v (%d bytes)", path, size, ErrBlobTooLarge, limit)}
 	}
 	return nil
 }
 
+// limitError is an ErrBlobTooLarge or ErrSymlinkTooLong error that keeps the
+// path it was given, so that a response can name the entry over the limit.
+type limitError struct {
+	path string
+	err  error
+	msg  string
+}
+
+func (e *limitError) Error() string { return e.msg }
+func (e *limitError) Unwrap() error { return e.err }
+
+// LimitPath returns the path that the CheckBlobSize or CheckSymlinkTarget
+// call behind err was given. ok is false when err came from neither.
+func LimitPath(err error) (path string, ok bool) {
+	var le *limitError
+	if errors.As(err, &le) {
+		return le.path, true
+	}
+	return "", false
+}
+
 // MaxSymlinkTarget is the longest symlink target an archive carries: 4095
 // bytes, the longest that symlink(2) accepts on Linux (PATH_MAX is 4096, with
-// the terminating NUL). git's fsck has no check for the length of a target. A
-// longer symlink cannot exist on a Linux file system, and
-// the server reads one in memory to write its tar header.
+// the terminating NUL). XFS and macOS accept at most 1023. git 2.55's fsck has
+// no check for the length of a target, so a repository can hold a longer one.
+// The server reads a target in memory to write its tar header.
 const MaxSymlinkTarget = 4095
 
 // CheckSymlinkTarget fails with ErrSymlinkTooLong when the target of the
 // symlink at path, a blob of size bytes, is longer than MaxSymlinkTarget.
 func CheckSymlinkTarget(path string, size int64) error {
 	if size > MaxSymlinkTarget {
-		return fmt.Errorf("%q is a symlink with a target of %d bytes: %w (%d bytes)", path, size, ErrSymlinkTooLong, MaxSymlinkTarget)
+		return &limitError{path: path, err: ErrSymlinkTooLong,
+			msg: fmt.Sprintf("%q is a symlink with a target of %d bytes: %v (%d bytes)", path, size, ErrSymlinkTooLong, MaxSymlinkTarget)}
 	}
 	return nil
 }
