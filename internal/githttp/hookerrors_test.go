@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	stdsync "sync"
 	"syscall"
@@ -37,8 +38,10 @@ func captureServeLog(t *testing.T) *syncBuffer {
 }
 
 // The hook's log handler keeps error values, in attributes, in With
-// attributes and in groups, off stderr (the pusher), and writes the whole
-// record to the hook-errors file, which serve logs.
+// attributes and in groups, off stderr (the pusher), and every other value
+// that is not a number, a boolean or an allowed identifier string. It
+// writes the whole record, group prefixes included, to the hook-errors
+// file, which serve logs.
 func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	canary := "canary-" + rand.Text()
 	path, err := createHookErrors(t.TempDir())
@@ -49,15 +52,22 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	var pusher bytes.Buffer
 	logger := slog.New(NewHookLogHandler(&pusher, nil)).With("err", errors.New("with "+canary), "hook", "update")
 	logger.Error("open ref store failed", "err", fmt.Errorf("dial %s", canary), "repo", "r1",
-		slog.Group("g", "err", errors.New("group "+canary), "k", "v"))
+		slog.Group("g", "err", errors.New("group "+canary), "n", 3))
 	logger.WithGroup("w").Warn("second", "err", errors.New("nested "+canary), "x", 1)
 	// Some libraries log err.Error() as a string. An error can also be a
 	// LogValuer that resolves to its text, and a LogValuer can resolve to
 	// an error.
 	slog.New(NewHookLogHandler(&pusher, nil)).Error("third", slog.String("err", "string "+canary),
-		"cause", valuerError{canary}, "lazy", lazyError{canary}, "y", 2)
+		"cause", valuerError{canary}, "lazy", lazyError{canary}, "y", 2,
+		// Errors held in other values, and text under any other key.
+		slog.String("error", "string "+canary), "errs", []error{errors.New("list " + canary)},
+		"st", struct{ E string }{"struct " + canary}, "m", map[string]string{"e": "map " + canary},
+		"sv", stringerCanary{canary}, "detail", "detail "+canary,
+		// An error that is a LogValuer, under a key whose strings the
+		// pusher may read.
+		"ref", valuerError{canary})
 
-	for _, want := range []string{"open ref store failed", "hook=update", "repo=r1", "g.k=v", "second", "w.x=1", "third", "y=2"} {
+	for _, want := range []string{"open ref store failed", "hook=update", "repo=r1", "g.n=3", "second", "w.x=1", "third", "y=2"} {
 		if !strings.Contains(pusher.String(), want) {
 			t.Errorf("stderr lacks %q: %s", want, pusher.String())
 		}
@@ -69,10 +79,15 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Eight: the With error in both records, one more error each in the
-	// first (attribute, group) and in the second, and three in the third.
-	if n := strings.Count(string(b), canary); n != 8 {
-		t.Fatalf("the hook-errors file names the canary %d times, want 8: %s", n, b)
+	// Fifteen: the With error in both records, one more error each in the
+	// first (attribute, group) and in the second, and ten in the third.
+	if n := strings.Count(string(b), canary); n != 15 {
+		t.Fatalf("the hook-errors file names the canary %d times, want 15: %s", n, b)
+	}
+	for _, want := range []string{"g.err=", "w.err=", "w.x=1"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("the hook-errors file lacks the group prefix in %q: %s", want, b)
+		}
 	}
 
 	logs := captureServeLog(t)
@@ -80,10 +95,15 @@ func TestHookLogHandlerKeepsErrorsFromThePusher(t *testing.T) {
 	if got := strings.Count(logs.String(), "receive-pack r1: hook: "); got != 3 {
 		t.Fatalf("serve logged %d hook records, want 3: %s", got, logs)
 	}
-	if n := strings.Count(logs.String(), canary); n != 8 {
-		t.Fatalf("serve's log names the canary %d times, want 8: %s", n, logs)
+	if n := strings.Count(logs.String(), canary); n != 15 {
+		t.Fatalf("serve's log names the canary %d times, want 15: %s", n, logs)
 	}
 }
+
+// stringerCanary is a Stringer that prints its canary.
+type stringerCanary struct{ canary string }
+
+func (s stringerCanary) String() string { return "stringer " + s.canary }
 
 // valuerError is an error that logs as its own text.
 type valuerError struct{ canary string }
@@ -371,7 +391,7 @@ func TestServeLogsHookErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("push through the in-process server: %v\n%s", err, out)
 	}
-	m := regexp.MustCompile(`msg="test hook record" path=(\S+)`).FindStringSubmatch(out)
+	m := regexp.MustCompile(`msg="test hook record path=([^"\s]+)"`).FindStringSubmatch(out)
 	if m == nil {
 		t.Fatalf("the pusher's output lacks the hook's line: %s", out)
 	}
@@ -457,5 +477,40 @@ func TestHookErrorsFileCapHoldsAcrossGoroutines(t *testing.T) {
 	}
 	if over := fi.Size() - maxHookErrorsBytes; over > 2*int64(len(record)) {
 		t.Fatalf("the file holds %d bytes past its cap; want at most one record (about %d)", over, len(record))
+	}
+}
+
+// retireLedger records each retire, and its blob store answers Stat from
+// stats (a missing key exists).
+type retireLedger struct {
+	stats   map[string]error
+	calls   int
+	group   []string
+	retired map[string]string
+}
+
+func (r *retireLedger) RetirePackAttempts(_ context.Context, group []string, gens map[string]string) error {
+	r.calls++
+	r.group, r.retired = group, gens
+	return nil
+}
+
+func (r *retireLedger) Stat(_ context.Context, key string) (int64, error) { return 0, r.stats[key] }
+
+// retireUnuploaded retires only the reservations whose blobs are proven
+// absent, for the repository's quota group, and skips the retire when none
+// is.
+func TestRetireUnuploadedRetiresOnlyAbsentBlobs(t *testing.T) {
+	l := &retireLedger{stats: map[string]error{"packs/a.pack": blob.ErrNotFound, "packs/c.pack": errors.New("stat timed out")}}
+	retireUnuploaded(t.Context(), l, l, "r1", map[string]string{"packs/a.pack": "1", "packs/b.pack": "2", "packs/c.pack": "3"})
+	if l.calls != 1 || len(l.retired) != 1 || l.retired["packs/a.pack"] != "1" || !slices.Equal(l.group, blob.QuotaRepoGroup("r1")) {
+		t.Fatalf("retire calls %d, group %v, retired %v; want one retire of packs/a.pack for r1's group", l.calls, l.group, l.retired)
+	}
+	for _, gens := range []map[string]string{nil, {"packs/b.pack": "2"}, {"packs/c.pack": "3"}} {
+		l := &retireLedger{stats: map[string]error{"packs/c.pack": errors.New("stat timed out")}}
+		retireUnuploaded(t.Context(), l, l, "r1", gens)
+		if l.calls != 0 {
+			t.Fatalf("retireUnuploaded(%v) retired %v; want no retire without a proven-absent blob", gens, l.retired)
+		}
 	}
 }

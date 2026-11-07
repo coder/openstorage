@@ -2315,7 +2315,7 @@ func holdSidecarOwner(path string) string {
 // growth, so the budget is enforced against each file's CURRENT size
 // immediately before its bytes are read — zero overshoot by construction,
 // independent of when the growth lands.
-var errPushScanBudget = errors.New("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+var errPushScanBudget = Refuse(errors.New("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push"))
 
 // readFileLimit reads at most limit bytes of path — os.ReadFile with a
 // hard cap for files that can grow under the reader (PR #195 round-11
@@ -2911,7 +2911,10 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 		unlock, err := flockExclusiveCtx(ctx, lockPath)
 		if err != nil {
 			if ctx.Err() != nil {
-				return heldUnlessCanceled(parent, fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", err))
+				// The refusal is outermost: the pusher sees the retry
+				// guidance, and errors.Is still finds ErrRefHeld for the
+				// REST 503.
+				return Refuse(heldUnlessCanceled(parent, fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", ctx.Err())))
 			}
 			return err
 		}
@@ -2938,7 +2941,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 			}
 			if used+pending > maxPushPeerScanBytes {
 				unlock()
-				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+				return refusef("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
 			covered, n, err := peerHoldCovers(dir, holdPath, names[0], maxPushPeerScanBytes-used)
 			if err != nil {
@@ -2983,7 +2986,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 			}
 			if used+pending > maxPushPeerScanBytes {
 				unlock()
-				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+				return refusef("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
 			before := cache.parsedBytes
 			// The in-load budget (round-12 P2): allowance still unspent
@@ -3022,7 +3025,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 		}
 		unlock()
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return heldUnlessCanceled(parent, fmt.Errorf("a concurrent push holds a ref conflicting with %s (same ref or directory/file relative); retry shortly", conflict))
+			return Refuse(heldUnlessCanceled(parent, fmt.Errorf("a concurrent push holds a ref conflicting with %s (same ref or directory/file relative); retry shortly", conflict)))
 		}
 		select {
 		case <-ctx.Done():

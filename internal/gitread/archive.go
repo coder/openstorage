@@ -44,8 +44,9 @@ type PreparedArchive struct {
 
 // PrepareArchive resolves the tree at commit (a resolved full SHA) and
 // applies the include/exclude globs and MaxBlobSize filters up front. A
-// kept blob over the blob limit (CheckBlobSize) fails it with ErrBlobTooLarge, before any
-// archive byte is written.
+// kept blob over the blob limit (CheckBlobSize) fails it with ErrBlobTooLarge,
+// and a symlink whose target is over MaxSymlinkTarget fails it with
+// ErrSymlinkTooLong, before any archive byte is written.
 func PrepareArchive(ctx context.Context, repoPath, commit string, opts ArchiveOptions) (*PreparedArchive, error) {
 	assertf(ref.ValidSHA(commit), "PrepareArchive: unresolved commit %q", commit)
 	assertf(ValidArchivePrefix(opts.Prefix), "PrepareArchive: unsafe prefix %q", opts.Prefix)
@@ -79,7 +80,13 @@ func PrepareArchive(ctx context.Context, repoPath, commit string, opts ArchiveOp
 			continue
 		}
 		// Before any header is sent: a blob too large to stream within
-		// the heap cap fails the whole request cleanly (#313).
+		// the heap cap, or a symlink target too long to carry, fails the
+		// whole request cleanly (#313).
+		if e.Type == EntrySymlink {
+			if err := CheckSymlinkTarget(e.Path, e.Size); err != nil {
+				return nil, err
+			}
+		}
 		if err := CheckBlobSize(ctx, e.Path, e.Size); err != nil {
 			return nil, err
 		}
@@ -123,12 +130,12 @@ func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
 		}
 		switch e.Type {
 		case EntrySymlink:
-			target, err := ReadBlob(ctx, p.repoPath, e.SHA)
+			target, err := ReadSymlinkTarget(ctx, p.repoPath, e.SHA, e.Size)
 			if err != nil {
 				return err
 			}
 			hdr.Typeflag = tar.TypeSymlink
-			hdr.Linkname = string(target)
+			hdr.Linkname = target
 			hdr.Mode = 0o777
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err

@@ -244,7 +244,7 @@ func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, e
 	if s.writeRefHeldErr(w, r, op, err) {
 		return
 	}
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Error("internal error", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
@@ -733,11 +733,11 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	}
 	cmd := sc.gitCmd(ctx, extraEnv, args...)
 	cmd.Stdin = stdin
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
 	out, err := gitlimit.Output(cmd)
 	if err != nil {
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return string(out), fmt.Errorf("%s: %w: %s", gitlimit.Name(args), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
 }
@@ -852,7 +852,11 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	}
 	var exit *exec.ExitError
 	if ctx.Err() != nil || !errors.As(err, &exit) || (exit.ExitCode() < 0 && !wcGitAborted(exit)) {
-		return "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		// The error is logged: keep the last 64 KiB of git's stderr. (The
+		// classification below reads all of it.)
+		var tail gitlimit.TailBuffer
+		_, _ = tail.Write(stderr.Bytes())
+		return "", fmt.Errorf("%s: %w: %s", gitlimit.Name(append([]string{"apply"}, args...)), err, tail.String())
 	}
 	full := strings.TrimSpace(stderr.String())
 	msg := full

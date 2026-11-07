@@ -21,7 +21,7 @@ Standalone maintenance scripts for docs, releases, the Compose quickstart, and t
 - `[check-doc-links.py:git_ls_files]` The bytes that `git ls-files -z` prints for the given options. Exits 2 when git fails.
 - `[check-doc-links.py:git_files]` The set of paths that `git_ls_files` prints for the given options.
 - `[check-doc-links.py:tracked]` Every path in git's index, minus intent-to-add entries, and every directory that holds one, plus `.`. Cached.
-- `[check-doc-links.py:intent_to_add]` The paths that `git add -N` put in the index without content (the intent-to-add flag that `git ls-files --debug` prints, so an entry that is also assume-unchanged or skip-worktree counts too). A commit holds none of them. Exits 2, without checking anything, when the listing cannot be read: text between two entries or after the last one, or a path that `git ls-files` names and the listing lacks.
+- `[check-doc-links.py:intent_to_add]` The paths that `git add -N` put in the index without content (the intent-to-add flag that `git ls-files --debug` prints, so an entry that is also assume-unchanged or skip-worktree counts too). A commit holds none of them. Exits 2, without checking anything, when the listing cannot be read: text before the first entry, between two entries or after the last one, or a path that `git ls-files` names and the listing lacks.
 - `[check-doc-links.py:indexed]` True when git's index holds the file that a path names and every symlink that resolving it follows. It follows each symlink by hand, one path component at a time, so a symlink that another symlink points at is checked too. Each symlink must be tracked, because a clean checkout has no untracked symlink. An absolute target and a path that leaves the repository fail.
 - `[check-doc-links.py:repo_path]` A path relative to the repository root after symlinks resolve, or `None` when it resolves outside the repository. Links and citations both use it.
 - `[check-doc-links.py:links_apply]` True for every `README.md`, the root `CONTRIBUTING.md` and `CHANGELOG.md`, and every file under `docs/`.
@@ -46,7 +46,7 @@ Standalone maintenance scripts for docs, releases, the Compose quickstart, and t
 - `[check-doc-links.py:markdown_blocks]` Splits numbered lines into blocks. Tracks fences, HTML comments, block quotes, and list items. A list item that starts with a blank line has its content one column past its marker, however many spaces follow it. An item that begins with two blank lines is empty, as in CommonMark, so the lines below it belong to no item.
 - `[check-doc-links.py:scan_lines]` Yields `(lineno, raw, visible)` tuples, where `visible` has inline code masked. Both are split at a line feed only, so a form feed or another separator inside a line cannot move the links of the lines below it. `[check-doc-links.py:markdown_blocks]` calls a line blank, and a fence closed, only when nothing but spaces and tabs are left, as CommonMark does.
 - `[check-doc-links.py:without_inline_code]` Masks code spans in one block and keeps line and column positions.
-- `[check-doc-links.py:drop_columns]` Removes container indentation columns from a line (tabs use four-column stops).
+- `[check-doc-links.py:drop_columns]` Removes container indentation columns from a line. It first expands the tabs in the container markers at the start of the line and in the white space around them (`CONTAINER_PREFIX`) to the four-column stops of the original line, so a tab after a quote or list marker keeps the stop it had before the prefix was dropped. A tab in the text stays a tab, because `anchors` reads the text: GitHub drops a tab from a heading slug.
 - `[check-doc-links.py:starts_block]` True when a line starts a fence, heading, quote, list item, thematic break, or HTML comment.
 - Module-level compiled regular expressions:
   - `[check-doc-links.py:CITATION]` One citation: `[`, a path whose last element has a letter-led extension or starts with `Dockerfile`, an optional `:symbol`, then `]` not followed by `(` or `[`.
@@ -57,7 +57,7 @@ Standalone maintenance scripts for docs, releases, the Compose quickstart, and t
   - `[check-doc-links.py:REFDEF]` A reference-style link definition line (`[label]:` after at most three spaces).
   - `[check-doc-links.py:ANGLE]` An angle-bracket destination (`](` then optional space, then `<`).
   - `[check-doc-links.py:FENCE]` A code fence opener of three or more backticks or tildes after at most three spaces.
-  - `[check-doc-links.py:HEADING]` An ATX heading: one to six `#`, at least one space, then the heading text.
+  - `[check-doc-links.py:HEADING]` An ATX heading: one to six `#`, at least one space or tab, then the heading text.
   - `[check-doc-links.py:BACKTICKS]` One run of backticks (a code span delimiter).
   - `[check-doc-links.py:HTML]` An HTML comment, or an HTML start or end tag with optional attributes.
   - `[check-doc-links.py:THEMATIC]` A thematic break of three or more `*`, `-`, or `_`.

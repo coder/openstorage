@@ -502,7 +502,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	// CAS records the intent (newPGEventsStore), and on the local schedule
 	// BeforeCAS does (ADR-50 amendment), and neither runs without eventing.
 	// A failed step does not prove the CAS fails too (the database can be
-	// back by then). So the hook refuses every update that would record
+	// back by then). So the hook refuses every update that could record
 	// intent before its CAS, and the client can push again. Without the
 	// store the hook cannot tell whether the repository has an upstream
 	// link, so it refuses such an update to a repository without one too.
@@ -523,7 +523,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			return func() {}
 		}
 		logger.Error("hook eventing unavailable: "+stage+"; refusing only updates that could record forward intent", "err", err)
-		refusal := errors.New("refusing the ref update: hook eventing unavailable (" + stage + "); push again later")
+		refusal := githttp.Refuse(errors.New("refusing the ref update: hook eventing unavailable (" + stage + "); push again later"))
 		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
 			return intentlessRefStore{RefStore: ref.IdempotentCAS{RefStore: st}, refusal: refusal}, nil
 		}
@@ -536,7 +536,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	// value (possible only for direct hook invocation outside serve, which
 	// validates at boot) disables eventing — fail closed for secrets: no
 	// delivery ever signs with a wrong or plaintext-passthrough key, and no
-	// update that would record forward intent is accepted.
+	// update that could record forward intent is accepted.
 	secretsCodec, err := resolveSecretsCodec(envconfig.Getenv)
 	if err != nil {
 		return disabled("secrets key", err)
@@ -649,8 +649,17 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		if err := meta.CheckFormat(ctx, ms); err != nil {
 			var fv *meta.FormatVersionError
 			var cd *meta.CorruptDocumentError
-			if errors.As(err, &fv) || errors.As(err, &cd) {
-				return nil, fmt.Errorf("refusing the ref update: %w", err)
+			switch {
+			case errors.As(err, &fv):
+				// The version error names the document's version and the
+				// conversion command, no store detail.
+				return nil, githttp.Refuse(fmt.Errorf("refusing the ref update: %w", err))
+			case errors.As(err, &cd):
+				// The corruption detail can name organizations, repositories
+				// and credential IDs from any row of the document: the
+				// operator gets it, the pusher a fixed refusal.
+				logger.Error("hook eventing: the metadata document is corrupt", "err", err)
+				return nil, errHookCorruptMeta
 			}
 			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
 		}
@@ -677,7 +686,11 @@ var newHookRiver = func(ctx context.Context, pgURL string) (*jobs.River, error) 
 
 // errHookIntent is BeforeCAS's refusal when the hook cannot record a push's
 // forward intent. events.RefStore prefixes "refusing the ref update".
-var errHookIntent = errors.New("hook could not record the forward intent; push again later")
+var errHookIntent = githttp.Refuse(errors.New("hook could not record the forward intent; push again later"))
+
+// errHookCorruptMeta is the refusal for a corrupt metadata document. The
+// hook-errors file has the detail.
+var errHookCorruptMeta = githttp.Refuse(errors.New("refusing the ref update: s3walmeta: _wal/meta.json is corrupt (the server log has the detail): do not edit it; keep serve stopped and restore the bucket from a verified stopped-node backup (docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover)"))
 
 // quietBeforeCAS refuses with errHookIntent instead of beforeCAS's own
 // error, which can name the store: the pusher sees the refusal (see
@@ -698,7 +711,7 @@ func quietBeforeCAS(beforeCAS func(ctx context.Context, repoID string) error, lo
 
 // intentlessRefStore is the hook's ref store when its eventing could not be
 // wired, so it cannot record forward intent. It refuses every update that
-// would record intent, and passes ephemeral updates through to its inner
+// could record intent, and passes ephemeral updates through to its inner
 // store (ref.IdempotentCAS over the hook's store, as on the eventless
 // default).
 type intentlessRefStore struct {
