@@ -188,11 +188,13 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    404 for the tag. So when the tag was never deleted, the worst case of a wrong guess is
    a wasted dispatch. That step cannot know that an admin deleted the tag, so the rule
    above stands. If the step fails with HTTP 200, an earlier run created the tag. Open
-   that run. If its `verify-published` jobs passed, the version is published: check that
-   the quickstart pin (step 3) names it, and update the pin if it does not. If they
-   failed and a re-run of the failed jobs did not fix it, the version is spent: fix
-   forward with a new release. Any other status means the step could not tell, so inspect
-   the tag as above.
+   that run and look at its `verify-published` jobs. If they passed, the version is
+   published: check that the quickstart pin (step 3) names it, and update the pin if it
+   does not. If they are still running, wait for them. If they were cancelled, re-run them
+   from the run page (the re-run icon next to each job). If they failed, re-run the
+   failed jobs as above, and if the same check fails again, the version is spent: fix
+   forward with a new release. Any other HTTP status means the step could not tell, so
+   inspect the tag as above.
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
