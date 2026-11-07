@@ -349,13 +349,13 @@ func TestVerifyState_ExhaustionMarkerShortCircuits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.chargeWalk(5, 3, "refs/heads/x"); err == nil || !strings.Contains(err.Error(), "history-walk allowance") {
+	if err := st.chargeWalk(5, 3, "refs/heads/x"); err == nil || !strings.Contains(err.Error(), "history-walk allowance") || !ShownToPusher(err) {
 		t.Fatalf("over-allowance charge = %v, want allowance rejection", err)
 	}
 	// Every later evaluation of the push fails closed in constant time —
 	// openVerifyState returns the persisted rejection without loading any
 	// sidecar (Codex round 16).
-	if _, err := openVerifyState(); err == nil || !strings.Contains(err.Error(), "history-walk allowance") {
+	if _, err := openVerifyState(); err == nil || !strings.Contains(err.Error(), "history-walk allowance") || !ShownToPusher(err) {
 		t.Fatalf("post-exhaustion open = %v, want the persisted rejection", err)
 	}
 }
