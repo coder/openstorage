@@ -463,3 +463,44 @@ func TestArchiveStreamStalledReaderKeepsNoGitProcess(t *testing.T) {
 	}
 	b.Close()
 }
+
+// A request can put a value of 100 KB into a git argument, and the error
+// name of Run goes to the log: it must not carry the value.
+func TestRunErrorNamesLongArgumentsBriefly(t *testing.T) {
+	fakeGit(t, "echo boom >&2; exit 3")
+	long := strings.Repeat("a", 100_000)
+	_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"rev-parse", "--verify", long}})
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("err = %v, want git's exit status 3", err)
+	}
+	msg := err.Error()
+	if len(msg) > 1024 {
+		t.Fatalf("the error is %d bytes, want it bounded: %.200s", len(msg), msg)
+	}
+	for _, want := range []string{"git rev-parse --verify aaaa", "...(100000 bytes)", "boom"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %.300q lacks %q", msg, want)
+		}
+	}
+}
+
+// The path of a blob over the size limit is a path of the repository, and it
+// can be 100 KB long. Its name in the error goes to the log.
+func TestCheckBlobSizeNamesLongPathBriefly(t *testing.T) {
+	long := strings.Repeat("d", 100_000)
+	err := CheckBlobSize(context.Background(), long, MaxBlobBytes+1)
+	if !errors.Is(err, ErrBlobTooLarge) {
+		t.Fatalf("err = %v, want ErrBlobTooLarge", err)
+	}
+	msg := err.Error()
+	if len(msg) > 1024 {
+		t.Fatalf("the error is %d bytes, want it bounded: %.200s", len(msg), msg)
+	}
+	if want := "...(100000 bytes)"; !strings.Contains(msg, want) {
+		t.Errorf("error %.300q lacks %q", msg, want)
+	}
+	if err := CheckBlobSize(context.Background(), "a/b.txt", MaxBlobBytes); err != nil {
+		t.Errorf("a blob at the limit: err = %v, want nil", err)
+	}
+}
