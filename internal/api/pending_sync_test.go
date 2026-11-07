@@ -383,9 +383,11 @@ func TestPendingSyncPolicyRestricted(t *testing.T) {
 }
 
 // testLogger is a logger whose records go to t.Log, so a failed test
-// shows them. A record that arrives after the cleanups before it have run
-// is dropped: t.Log panics once the test has completed. Call it before the
-// code that logs registers its own cleanups.
+// shows them. A record that arrives after this logger's cleanup has run is
+// dropped. A t.Log after the test has completed goes to a parent test's
+// output, races under -race, and panics once every parent has completed.
+// Call it before the code that logs registers its own cleanups, so that
+// this logger's cleanup runs after theirs.
 func testLogger(t *testing.T) *slog.Logger {
 	t.Helper()
 	w := &testLogWriter{t: t}
