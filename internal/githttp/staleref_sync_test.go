@@ -228,3 +228,33 @@ func TestSyncRefsWithCleanupRetriesAfterACleanupOnTheLastAttempt(t *testing.T) {
 		t.Fatal("the stale lock is still there")
 	}
 }
+
+// One killed transaction can leave locks in several batches. Each failed
+// batch is cleaned in turn, in one hydration, and the sync ends in the
+// store's state.
+func TestSyncRefsWithCleanupCleansEveryFailedBatch(t *testing.T) {
+	repo, commit := srRepo(t)
+	want := map[string]string{"refs/heads/main": commit}
+	var locks []string
+	for _, name := range []string{"a", "b", "c", "d"} {
+		want["refs/heads/"+name] = commit
+		locks = append(locks, srLock(t, repo, "refs/heads/"+name+".lock", 2*time.Hour))
+	}
+	lines := srLogLines(t, repo)
+	removed := srCount("removed")
+
+	if skipped, err := srSync(t, repo, want, 1); err != nil || skipped {
+		t.Fatalf("sync = skipped %v, %v, want a clean sync after four cleanups", skipped, err)
+	}
+	for _, l := range locks {
+		if srExists(t, l) {
+			t.Errorf("%s is still there", l)
+		}
+	}
+	if got := srCount("removed") - removed; got != 4 {
+		t.Fatalf("removed outcomes counted = %v, want 4 (one per failed batch)", got)
+	}
+	if l := lines(); len(l) != 4 {
+		t.Fatalf("%d log lines, want 4: %q", len(l), l)
+	}
+}

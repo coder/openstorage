@@ -1349,13 +1349,17 @@ func (e *refBatchError) Unwrap() error { return e.err }
 // once (no marker, no retries: the store is down, not the cache racing).
 //
 // A ref lock that a killed git left fails every batch for its ref (issue
-// #490). When a pass fails on a batch, both of its sync passes have returned
-// and their children are reaped, and the caller holds the repository's
-// hydrate lock, so a cleanup that wins the lease exclusively can remove the
-// lock. It runs once per call, and the retry that a removal earns is not one
-// of the three attempts.
+// #490), and one killed transaction can leave locks in several batches. When
+// a pass fails on a batch, both of its sync passes have returned and their
+// children are reaped, and the caller holds the repository's hydrate lock, so
+// a cleanup that wins the lease exclusively can remove the locks of that
+// batch. A cleanup that removed a lock earns a retry that is not one of the
+// three attempts, and the retry can fail on the next batch and clean that
+// one. The loop ends because each cleanup removes a lock file. A cleanup that
+// removed nothing (busy, kept, an error) is not repeated: it would find the
+// same.
 func syncRefsWithCleanup(ctx context.Context, repoPath, headTarget string, newStore func() refSeq, batch int) (skipped bool, refsErr, scanErr error) {
-	cleaned := false
+	mayClean := true
 	for attempt := 0; attempt < 3; attempt++ {
 		if skipped, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, batch); refsErr == nil {
 			return skipped, nil, nil
@@ -1363,10 +1367,11 @@ func syncRefsWithCleanup(ctx context.Context, repoPath, headTarget string, newSt
 		if scan, ok := errors.AsType[*refScanError](refsErr); ok {
 			return skipped, refsErr, scan.Unwrap()
 		}
-		if failed, ok := errors.AsType[*refBatchError](refsErr); ok && !cleaned {
-			cleaned = true
+		if failed, ok := errors.AsType[*refBatchError](refsErr); ok && mayClean {
 			// The cleanup logs and counts its own result, an error included.
-			if res, err := cleanStaleRefLocks(repoPath, failed.names, time.Now()); err == nil && res.Removed > 0 {
+			res, err := cleanStaleRefLocks(repoPath, failed.names, time.Now())
+			mayClean = err == nil && res.Removed > 0
+			if mayClean {
 				attempt--
 				continue
 			}

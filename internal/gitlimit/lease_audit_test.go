@@ -39,7 +39,7 @@ const (
 // need a lease-aware starter.
 var leaseExempt = map[string]string{
 	"internal/gitlimit/*":                                       "the package that implements the lease and the plain starters",
-	"internal/githttp/hook.go:*":                                "runs inside a hook of a git that serve started with the lease: the hook and its git children inherit descriptor 3",
+	"internal/githttp/hook.go:*":                                "runs inside a hook of a git that serve started with the lease: the hook and its git children inherit the lease descriptor",
 	"internal/api/handlers.go:validRefFormat":                   "git check-ref-format reads no repository",
 	"internal/api/handlers_write_merge.go:wmEnsureMergeTreeGit": "git version reads no repository",
 	"internal/sync/worker.go:runGitTo":                          "runs in a temporary mirror under os.TempDir, never in a cache repository",

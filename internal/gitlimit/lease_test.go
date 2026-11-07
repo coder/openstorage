@@ -49,7 +49,7 @@ func tryExclusive(t *testing.T, repo string) error {
 // serve closed its own copy, and the lease ends with the tree. The tree is
 // the real shape of #464: update-ref takes a ref lock, runs its
 // reference-transaction hook in the "prepared" state, and the hook sleeps.
-// The test runs on every git that CI runs: git must not close descriptor 3
+// The test runs on every git that CI runs: git must not close the lease descriptor
 // before it runs a hook. It runs git directly and behind the heap-cap shell
 // wrapper, which must pass the descriptor on.
 func TestLeaseLivesWithTheGitProcessTree(t *testing.T) {
