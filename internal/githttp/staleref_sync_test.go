@@ -258,3 +258,40 @@ func TestSyncRefsWithCleanupCleansEveryFailedBatch(t *testing.T) {
 		t.Fatalf("%d log lines, want 4: %q", len(l), l)
 	}
 }
+
+// A lock that blocks one batch for a moment (here a young lock that goes
+// before the next attempt) must not switch the cleanup off for the batches
+// after it: the next failed batch has a stale lock, and the hydration
+// cleans it.
+func TestSyncRefsWithCleanupCleansADifferentBatchAfterAFruitlessOne(t *testing.T) {
+	repo, commit := srRepo(t)
+	young := srLock(t, repo, "refs/heads/a.lock", 10*time.Second)
+	stale := srLock(t, repo, "refs/heads/b.lock", 2*time.Hour)
+	want := map[string]string{"refs/heads/main": commit, "refs/heads/a": commit, "refs/heads/b": commit}
+	names := []string{"refs/heads/a", "refs/heads/b", "refs/heads/main"}
+	stores := 0
+	newStore := func() refSeq {
+		stores++
+		// An attempt reads the store once for each of its two passes (the
+		// updates overflow the batch), so the second attempt starts at the
+		// third read.
+		if stores == 3 {
+			if err := os.Remove(young); err != nil {
+				t.Error(err)
+			}
+		}
+		return &sliceRefSeq{names: names, shas: want}
+	}
+	lines := srLogLines(t, repo)
+
+	skipped, refsErr, scanErr := syncRefsWithCleanup(t.Context(), repo, "refs/heads/main", newStore, 1)
+	if scanErr != nil || refsErr != nil || skipped {
+		t.Fatalf("sync = skipped %v, %v, %v, want a clean sync", skipped, refsErr, scanErr)
+	}
+	if srExists(t, stale) {
+		t.Fatal("the stale lock of the later batch is still there")
+	}
+	if l := lines(); len(l) != 1 {
+		t.Fatalf("log lines = %q, want one: the young lock is no cleanup run", l)
+	}
+}

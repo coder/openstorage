@@ -1340,6 +1340,11 @@ type refBatchError struct {
 	err   error
 }
 
+// key identifies the batch by its first ref and its size: the store streams
+// the same refs in the same order, so a batch that fails again has the same
+// key, and the key costs no memory in a repository with many refs.
+func (e *refBatchError) key() string { return e.names[0] + "\x00" + strconv.Itoa(len(e.names)) }
+
 func (e *refBatchError) Error() string { return e.err.Error() }
 func (e *refBatchError) Unwrap() error { return e.err }
 
@@ -1356,10 +1361,11 @@ func (e *refBatchError) Unwrap() error { return e.err }
 // batch. A cleanup that removed a lock earns a retry that is not one of the
 // three attempts, and the retry can fail on the next batch and clean that
 // one. The loop ends because each cleanup removes a lock file. A cleanup that
-// removed nothing (busy, kept, an error) is not repeated: it would find the
-// same.
+// removed nothing (busy, kept, an error, or a lock that was young) is not
+// repeated for the same batch, because it would find the same, but it is for
+// a different one.
 func syncRefsWithCleanup(ctx context.Context, repoPath, headTarget string, newStore func() refSeq, batch int) (skipped bool, refsErr, scanErr error) {
-	mayClean := true
+	fruitless := ""
 	for attempt := 0; attempt < 3; attempt++ {
 		if skipped, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, batch); refsErr == nil {
 			return skipped, nil, nil
@@ -1367,14 +1373,15 @@ func syncRefsWithCleanup(ctx context.Context, repoPath, headTarget string, newSt
 		if scan, ok := errors.AsType[*refScanError](refsErr); ok {
 			return skipped, refsErr, scan.Unwrap()
 		}
-		if failed, ok := errors.AsType[*refBatchError](refsErr); ok && mayClean {
+		if failed, ok := errors.AsType[*refBatchError](refsErr); ok && failed.key() != fruitless {
 			// The cleanup logs and counts its own result, an error included.
 			res, err := cleanStaleRefLocks(repoPath, failed.names, time.Now())
-			mayClean = err == nil && res.Removed > 0
-			if mayClean {
+			if err == nil && res.Removed > 0 {
+				fruitless = ""
 				attempt--
 				continue
 			}
+			fruitless = failed.key()
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
