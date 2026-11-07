@@ -1632,8 +1632,23 @@ func removePushHoldFiles(holdPath string) {
 	// (removing the restored hold, or a no-op if the reaper unlinked).
 	// Best-effort like the removals below: without the lock the TTL
 	// machinery remains the bound.
-	if lock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock"); err == nil {
+	//
+	// The wait is bounded like a reservation's (pushHoldWaitMax): a
+	// process that holds the lock longer, such as a stopped reserver, must
+	// not hang a push or ref write that is done. On that timeout the files
+	// stay. Removing them without the lock could race the reaper's
+	// restore, and every reservation waits on the same lock anyway. A
+	// later release of the same hold retries (serve's handler releases
+	// after post-receive), and once no refresher touches the hold the TTL
+	// reap retires it.
+	ctx, cancel := context.WithTimeout(context.Background(), pushHoldWaitMax)
+	lock, err := flockExclusiveCtx(ctx, filepath.Dir(holdPath)+".reserve.lock")
+	cancel()
+	switch {
+	case err == nil:
 		defer lock()
+	case errors.Is(err, context.DeadlineExceeded):
+		return
 	}
 	if _, err := os.Lstat(holdPath); err == nil {
 		// Bump only when a hold FILE is actually being removed (Codex
