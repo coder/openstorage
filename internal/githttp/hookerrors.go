@@ -155,9 +155,10 @@ func withoutErrors(a slog.Attr) (slog.Attr, bool) {
 type hookErrorsWriter string
 
 // hookErrorsMu serializes the size check and the append across a hook's
-// goroutines (a local-mode hook delivers webhooks concurrently), so the
-// file overshoots maxHookErrorsBytes by at most one record. git runs a
-// push's hooks one after another.
+// loggers (a slog handler serializes only its own writes, and a hook has
+// several: its own, River's, hookErrorsLogger's), so the file overshoots
+// maxHookErrorsBytes by at most one record. git runs a push's hooks one
+// after another.
 var hookErrorsMu sync.Mutex
 
 // hookErrorsChecked runs between the size check and the append (a var for

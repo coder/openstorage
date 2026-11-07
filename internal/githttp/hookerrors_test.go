@@ -419,8 +419,8 @@ func TestHookErrorsFileCutsLongRecords(t *testing.T) {
 	}
 }
 
-// Concurrent writers of one hook overshoot the file's cap by at most one
-// record.
+// Concurrent writers of one hook, through different loggers, overshoot the
+// file's cap by at most one record.
 func TestHookErrorsFileCapHoldsAcrossGoroutines(t *testing.T) {
 	path, err := createHookErrors(t.TempDir())
 	if err != nil {
@@ -436,11 +436,14 @@ func TestHookErrorsFileCapHoldsAcrossGoroutines(t *testing.T) {
 	prev := hookErrorsChecked
 	hookErrorsChecked = func() { time.Sleep(20 * time.Millisecond) }
 	t.Cleanup(func() { hookErrorsChecked = prev })
-	logger := slog.New(NewHookLogHandler(io.Discard, nil))
 	record := strings.Repeat("y", 1000)
 	start := make(chan struct{})
 	var wg stdsync.WaitGroup
 	for range 50 {
+		// One logger each: a slog handler already serializes its own
+		// writes, but the hook has several loggers (its own, River's,
+		// hookErrorsLogger's).
+		logger := slog.New(NewHookLogHandler(io.Discard, nil))
 		wg.Go(func() {
 			<-start
 			logger.Error("delivery failed", "err", errors.New(record))
