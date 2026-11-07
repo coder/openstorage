@@ -129,7 +129,7 @@ func testMode() bool { return envconfig.Getenv(EnvTestMode) == "1" }
 // reconcile. An error refuses the ref update before its CAS (issues #445,
 // #466: the metadata document is in a format this binary cannot write
 // events to, or corrupt). When the hook cannot wire its eventing, the cmd
-// wiring returns a store that refuses every update that would record
+// wiring returns a store that refuses every update that could record
 // forward intent and passes the rest, still through ref.IdempotentCAS
 // (cmd/openstorage intentlessRefStore, ADR-33's amendment).
 var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
@@ -926,7 +926,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	// better than failing after.
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
-		return err
+		return fmt.Errorf("pre-receive: open ref store: %w", err)
 	}
 	defer st.Close()
 
@@ -1758,7 +1758,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
-		return err
+		return fmt.Errorf("update: open ref store: %w", err)
 	}
 	defer st.Close()
 	// Authority-side directory/file guard (Codex round-4 P1 on #173, and

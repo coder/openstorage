@@ -303,6 +303,14 @@ func TestShownToPusher(t *testing.T) {
 		{"wrapped refusal", atomicDenied(deny), true},
 		{"wrapped twice", fmt.Errorf("update: %w", atomicDenied(deny)), true},
 		{"sentinel", fmt.Errorf("pg cas: %w", ref.ErrRepoPurged), true},
+		{"LFS cap sentinel", fmt.Errorf("lfs: %w", ref.ErrLFSObjectCapExceeded), true},
+		{"ref name sentinel", fmt.Errorf("cas: %w", ref.ErrRefNameNotUTF8), true},
+		// The refusal mark is checked before any wrapper: a refusal shows
+		// its whole text even when it wraps an error that is not one,
+		// such as a hold give-up's ErrRefHeld mark. The mark inside such a
+		// wrapper does not.
+		{"refusal around a non-refusal", Refuse(heldUnlessCanceled(context.Background(), errors.New("a concurrent push holds refs/heads/main"))), true},
+		{"refusal inside a non-refusal", heldUnlessCanceled(context.Background(), deny), false},
 		{"store error", store, false},
 		{"wrapped store error", fmt.Errorf("update: directory/file probe for x: %w", store), false},
 		{"store error formatted with %v", fmt.Errorf("pre-receive: %v", deny), false},
