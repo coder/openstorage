@@ -20,20 +20,23 @@ CHECK = "Check that the index holds exactly the checked digests"
 
 STAND_IN_DOCKER = """#!/bin/bash
 w=$WORLD
+echo "$*" >> "$w/log"
 if [ "$1 $2" = "buildx version" ]; then echo "github.com/docker/buildx v0.0.0 stand-in"; exit 0; fi
 [ "$1 $2" = "buildx imagetools" ] || { echo "unexpected docker call: $*" >&2; exit 97; }
 case $3 in
 inspect)
   ref=$4
+  [ "$5 $6" = "--format {{json .Manifest}}" ] || { echo "inspect without --format {{json .Manifest}}: $*" >&2; exit 98; }
   if [[ $ref == *@* ]]; then key=${ref##*@}; else key=tag-${ref##*:}; fi
   [ -f "$w/inspect/$key" ] || { echo "ERROR: $ref: not found" >&2; exit 1; }
   cat "$w/inspect/$key" ;;
 create)
   if [[ " $* " == *" --dry-run "* ]]; then
+    echo "$*" > "$w/dry"
     [ -f "$w/plan" ] || { echo "ERROR: dry run failed" >&2; exit 1; }
     cat "$w/plan"
   else
-    echo create >> "$w/calls"
+    echo "$*" >> "$w/calls"
   fi ;;
 *) echo "unexpected docker call: $*" >&2; exit 97 ;;
 esac
@@ -91,7 +94,13 @@ def child(digest, arch):
 
 
 def index(digest, *children):
-    return {"mediaType": OCI_INDEX, "digest": digest, "size": 1, "manifests": list(children)}
+    """What `inspect --format '{{json .Manifest}}'` prints for an index."""
+    return {"schemaVersion": 2, "mediaType": OCI_INDEX, "digest": digest, "size": 1, "manifests": list(children)}
+
+
+def plan_index(*children):
+    """What `create --dry-run` prints: the index that would be pushed, with no digest yet."""
+    return {"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": list(children)}
 
 
 def plain_manifest(digest):
@@ -106,7 +115,7 @@ def world():
         "digests": [AMD, ARM],
         "inspect": {AMD: index(AMD, *a), ARM: index(ARM, *b), "tag-9.9.9": index(PUBLISHED),
                     PUBLISHED: index(PUBLISHED, *a, *b)},
-        "plan": index(PUBLISHED, *a, *b),
+        "plan": plan_index(*a, *b),
     }
 
 
@@ -130,14 +139,16 @@ class ImageWorkflowStepsTest(unittest.TestCase):
         cls.root = root
 
     def run_step(self, step, scenario, digest=None):
-        """Run `step` in a fresh directory. Returns (returncode, create calls, output file, summary file)."""
+        """Run `step` in a fresh directory. Returns the process, the docker calls, the real `create` calls,
+        the dry-run call, and the contents of GITHUB_OUTPUT and GITHUB_STEP_SUMMARY."""
         work = Path(tempfile.mkdtemp(dir=self.root))
         (work / "digest").mkdir()
         (work / "digest" / "amd64").write_text(scenario["digests"][0] + "\n", encoding="utf-8")
         (work / "digest" / "arm64").write_text(scenario["digests"][1] + "\n", encoding="utf-8")
         (work / "world" / "inspect").mkdir(parents=True)
         for key, doc in scenario["inspect"].items():
-            (work / "world" / "inspect" / key).write_text(json.dumps(doc), encoding="utf-8")
+            text = doc if isinstance(doc, str) else json.dumps(doc)
+            (work / "world" / "inspect" / key).write_text(text, encoding="utf-8")
         if scenario["plan"] is not None:
             (work / "world" / "plan").write_text(json.dumps(scenario["plan"]), encoding="utf-8")
         env = {
@@ -150,26 +161,32 @@ class ImageWorkflowStepsTest(unittest.TestCase):
         }
         done = subprocess.run(["bash", "-e", str(self.root / f"{step}.sh")], cwd=work, env=env,
                               capture_output=True, text=True, timeout=60, check=False)
-        calls = work / "world" / "calls"
-        creates = len(calls.read_text().splitlines()) if calls.exists() else 0
-        return done, creates, read_if_any(work / "output"), read_if_any(work / "summary")
+        world_dir = work / "world"
+        return (done, read_if_any(world_dir / "log").splitlines(), read_if_any(world_dir / "calls").splitlines(),
+                read_if_any(world_dir / "dry").strip(), read_if_any(work / "output"), read_if_any(work / "summary"))
 
-    def promote(self, name, edit=lambda w: None, created=False):
+    def promote(self, name, edit=lambda w: None, created=False, calls_docker=True):
         scenario = world()
         edit(scenario)
-        done, creates, output, _ = self.run_step("promote", scenario)
-        detail = f"{name}: rc={done.returncode} creates={creates}\n{done.stderr}"
+        done, log, creates, dry, output, _ = self.run_step("promote", scenario)
+        detail = f"{name}: rc={done.returncode} creates={len(creates)}\n{done.stderr}"
         if created:
-            self.assertEqual((done.returncode, creates), (0, 1), detail)
+            self.assertEqual((done.returncode, len(creates)), (0, 1), detail)
             self.assertIn(f"digest={PUBLISHED}", output, detail)
+            # The index that is pushed is the one the dry run showed.
+            self.assertEqual(creates[0], dry.replace(" --dry-run", "", 1), detail)
         else:
             self.assertNotEqual(done.returncode, 0, detail)
-            self.assertEqual(creates, 0, detail)
+            self.assertEqual(creates, [], detail)
+            self.assertNotIn("digest=", output, detail)
+        if not calls_docker:
+            self.assertEqual(log, [], detail)
+        return done, creates
 
     def check(self, name, edit=lambda w: None, passes=False):
         scenario = world()
         edit(scenario)
-        done, _, _, summary = self.run_step("check", scenario)
+        done, _, _, _, _, summary = self.run_step("check", scenario)
         detail = f"{name}: rc={done.returncode}\n{done.stderr}"
         if passes:
             self.assertEqual(done.returncode, 0, detail)
@@ -188,7 +205,7 @@ class ImageWorkflowStepsTest(unittest.TestCase):
 
     def test_promote_refuses_when_the_staged_list_and_the_plan_are_both_empty(self):
         def edit(w):
-            w["inspect"][AMD], w["inspect"][ARM], w["plan"] = index(AMD), index(ARM), index(PUBLISHED)
+            w["inspect"][AMD], w["inspect"][ARM], w["plan"] = index(AMD), index(ARM), plan_index()
         self.promote("both empty", edit)
 
     def test_promote_refuses_when_the_plan_drops_a_manifest(self):
@@ -203,7 +220,7 @@ class ImageWorkflowStepsTest(unittest.TestCase):
 
     def test_promote_refuses_when_the_plan_is_empty(self):
         def edit(w):
-            w["plan"] = index(PUBLISHED)
+            w["plan"] = plan_index()
         self.promote("plan empty", edit)
 
     def test_promote_refuses_when_the_dry_run_fails(self):
@@ -215,14 +232,14 @@ class ImageWorkflowStepsTest(unittest.TestCase):
         def edit(w):
             w["digests"][1] = B_IMG
             w["inspect"][B_IMG] = plain_manifest(B_IMG)
-            w["plan"] = index(PUBLISHED, child(A_IMG, "amd64"), child(A_ATT, None), child(B_IMG, "arm64"))
+            w["plan"] = plan_index(child(A_IMG, "amd64"), child(A_ATT, None), child(B_IMG, "arm64"))
         self.promote("one platform manifest", edit)
 
     def test_promote_refuses_when_both_digests_are_platform_manifests(self):
         def edit(w):
             w["digests"] = [A_IMG, B_IMG]
             w["inspect"] = {A_IMG: plain_manifest(A_IMG), B_IMG: plain_manifest(B_IMG), "tag-9.9.9": index(PUBLISHED)}
-            w["plan"] = index(PUBLISHED, child(A_IMG, "amd64"), child(B_IMG, "arm64"))
+            w["plan"] = plan_index(child(A_IMG, "amd64"), child(B_IMG, "arm64"))
         self.promote("both platform manifests", edit)
 
     def test_promote_refuses_a_digest_that_the_registry_lacks(self):
@@ -234,12 +251,32 @@ class ImageWorkflowStepsTest(unittest.TestCase):
     def test_promote_refuses_equal_digests(self):
         def edit(w):
             w["digests"][1] = AMD
-        self.promote("equal digests", edit)
+        self.promote("equal digests", edit, calls_docker=False)
 
     def test_promote_refuses_a_malformed_digest(self):
         def edit(w):
             w["digests"][0] = "latest"
-        self.promote("malformed digest", edit)
+        self.promote("malformed digest", edit, calls_docker=False)
+
+    def test_promote_fails_after_the_push_when_the_new_tag_cannot_be_read_back(self):
+        def edit(w):
+            del w["inspect"]["tag-9.9.9"]
+        # `create` has run by then, so the tag exists and the step must not report a digest.
+        self.run_readback_failure("tag missing", edit)
+
+    def test_promote_fails_after_the_push_when_the_tag_read_back_has_no_digest(self):
+        def edit(w):
+            w["inspect"]["tag-9.9.9"] = {"schemaVersion": 2, "mediaType": OCI_INDEX}
+        self.run_readback_failure("no digest", edit)
+
+    def run_readback_failure(self, name, edit):
+        scenario = world()
+        edit(scenario)
+        done, _, creates, _, output, _ = self.run_step("promote", scenario)
+        detail = f"{name}: rc={done.returncode} creates={len(creates)}\n{done.stderr}"
+        self.assertNotEqual(done.returncode, 0, detail)
+        self.assertEqual(len(creates), 1, detail)
+        self.assertNotIn("digest=", output, detail)
 
     def test_check_passes_when_the_index_holds_exactly_the_staged_manifests(self):
         self.check("happy path", passes=True)
