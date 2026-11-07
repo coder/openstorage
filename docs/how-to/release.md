@@ -164,8 +164,15 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    ```
 
    It prints the index when the tag exists and fails with `not found` when it does not.
-   Another dispatch is safe in both cases, because the `publish` job stops at its check
-   for an existing tag. It can only get past that check when no tag exists.
+   Any other error, such as `denied`, tells you nothing about the tag: fix the login and
+   run it again. A tag that a package admin deleted also shows `not found`, so never
+   dispatch a version whose tag was ever created.
+
+   Another dispatch is safe in every case, because the `publish` job stops at "Refuse to
+   replace an existing version tag" unless the registry answers 404 for the tag. If that
+   step fails with HTTP 200, the tag exists and the version is spent: fix forward with a
+   new release. Any other status means the step could not tell, so inspect the tag as
+   above.
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
