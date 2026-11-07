@@ -2888,7 +2888,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 		unlock, err := flockExclusiveCtx(ctx, lockPath)
 		if err != nil {
 			if ctx.Err() != nil {
-				return fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", err)
+				return Refuse(fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", ctx.Err()))
 			}
 			return err
 		}

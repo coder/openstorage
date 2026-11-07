@@ -2440,7 +2440,10 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 		// registered-but-unimportable PGP key would re-spawn gpg once per
 		// ref at the same tip without charging any budget (Codex round
 		// 15).
-		reason := fmt.Sprintf("signing keyring unusable: %v", err)
+		// The cached reason reaches the pusher through later refs'
+		// denials, so it names no cause: the cause (a gpg diagnostic, a
+		// file error) goes to the hook-errors file with this error.
+		reason := "signing keyring unusable (the server log has the cause)"
 		if cacheErr := state.markCommitDenied(pending[0], reason); cacheErr != nil {
 			return fmt.Errorf("verify-sig: %w", cacheErr)
 		}

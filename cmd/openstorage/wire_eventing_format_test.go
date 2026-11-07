@@ -125,12 +125,14 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 	}{
 		{"v1", `{"v":1,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`,
 			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
+		// A corrupt document's detail can name rows of the document: it goes
+		// to the hook-errors file, and the pusher gets a fixed refusal.
 		{"truncated", `{"v":2,"seq":3,"writer":"0123`,
-			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md#restore-and-validate-before-cutover", "!document decode:", "record:document decode:"}},
 		{"no writer", `{"v":2,"seq":3,"next_org_id":1,"next_key_id":0}`,
-			[]string{"_wal/meta.json is corrupt (document seq 3 has no writer nonce)", "backup-restore-s3wal.md"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md", "!no writer nonce", "record:document seq 3 has no writer nonce"}},
 		{"negative counter", `{"v":2,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`,
-			[]string{"_wal/meta.json is corrupt (document seq 3 has negative id counters (-1, 0))", "backup-restore-s3wal.md"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md", "!negative id counters", "record:document seq 3 has negative id counters (-1, 0)"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeMetaS3{body: []byte(tc.body)}
@@ -146,7 +148,16 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 				t.Fatalf("WrapHookRefStore = %v, %v; want a refusal", wrapped, err)
 			}
 			for _, want := range append([]string{"refusing the ref update"}, tc.want...) {
-				if !strings.Contains(err.Error(), want) {
+				switch {
+				case strings.HasPrefix(want, "!"):
+					if strings.Contains(err.Error(), want[1:]) {
+						t.Fatalf("refusal %q shows the pusher %q", err, want[1:])
+					}
+				case strings.HasPrefix(want, "record:"):
+					if !strings.Contains(hookErrorRecords(t), strings.TrimPrefix(want, "record:")) {
+						t.Fatalf("the hook-errors file lacks %q: %s", want, hookErrorRecords(t))
+					}
+				case !strings.Contains(err.Error(), want):
 					t.Fatalf("refusal %q lacks %q", err, want)
 				}
 			}

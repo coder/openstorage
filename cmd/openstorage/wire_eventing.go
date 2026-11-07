@@ -646,10 +646,17 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		if err := meta.CheckFormat(ctx, ms); err != nil {
 			var fv *meta.FormatVersionError
 			var cd *meta.CorruptDocumentError
-			if errors.As(err, &fv) || errors.As(err, &cd) {
-				// The format errors name the metadata document and the
-				// operator's next step, no store detail.
+			switch {
+			case errors.As(err, &fv):
+				// The version error names the document's version and the
+				// conversion command, no store detail.
 				return nil, githttp.Refuse(fmt.Errorf("refusing the ref update: %w", err))
+			case errors.As(err, &cd):
+				// The corruption detail can name organizations, repositories
+				// and credential IDs from any row of the document: the
+				// operator gets it, the pusher a fixed refusal.
+				logger.Error("hook eventing: the metadata document is corrupt", "err", err)
+				return nil, errHookCorruptMeta
 			}
 			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
 		}
@@ -677,6 +684,10 @@ var newHookRiver = func(ctx context.Context, pgURL string) (*jobs.River, error) 
 // errHookIntent is BeforeCAS's refusal when the hook cannot record a push's
 // forward intent. events.RefStore prefixes "refusing the ref update".
 var errHookIntent = githttp.Refuse(errors.New("hook could not record the forward intent; push again later"))
+
+// errHookCorruptMeta is the refusal for a corrupt metadata document. The
+// hook-errors file has the detail.
+var errHookCorruptMeta = githttp.Refuse(errors.New("refusing the ref update: s3walmeta: _wal/meta.json is corrupt (the server log has the detail): do not edit it; keep serve stopped and restore the bucket from a verified stopped-node backup (docs/how-to/backup-restore-s3wal.md#restore-and-validate-before-cutover)"))
 
 // quietBeforeCAS refuses with errHookIntent instead of beforeCAS's own
 // error, which can name the store: the pusher sees the refusal (see

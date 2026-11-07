@@ -366,8 +366,8 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	if err == nil {
 		t.Fatal("reservation succeeded while the reserve lock was held elsewhere")
 	}
-	if !strings.Contains(err.Error(), "retry shortly") {
-		t.Fatalf("denial = %v, want a retryable timeout", err)
+	if !strings.Contains(err.Error(), "retry shortly") || !ShownToPusher(err) {
+		t.Fatalf("denial = %v, want a retryable timeout that the pusher sees", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("reservation blocked %v, want the ~150ms deadline", elapsed)
