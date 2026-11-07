@@ -646,6 +646,11 @@ freshness pokes) and push-upstream forwards.
   Transitional default: pulls allow private upstreams, pushes deny.
 - A denied pull destination fails the run as `repository configuration error`; a denied
   push destination as `invalid sync configuration`.
+- An upstream URL (`https://{host}/{owner}/{name}.git`, one argument of the git command) or a
+  stored credential (one environment variable) that git cannot take fails a pull or a push as
+  `repository configuration error`. That is 128 KiB or more on Linux, counted over the whole URL
+  and not over each of its parts, or a NUL byte in any part. The failure is permanent, and the
+  run is not retried.
 - `POST /repos` with `upstream` or a `base_repo` sync also rejects, with 400, an
   `upstream.host` or `upstream_host` the pull policy denies. This registration check is a courtesy; dial time is authoritative.
 
@@ -669,6 +674,7 @@ The `git:read` endpoints answer from git subprocesses over a cache repository. A
 | Time | Every git subprocess of a request must finish within 30 seconds of the request's first one. This is wall-clock time, so the server's own work between subprocesses counts too. `archive` gets 10 minutes, because it streams at the client's pace between subprocesses. | 503 without `Retry-After`. The running git subprocess is stopped. |
 | Memory (Linux) | 256 MiB of git heap per subprocess (`RLIMIT_DATA`, set before git starts); 32 MiB for single-object reads. Read-only pack mappings are shared page cache and are not counted. | 422. A git crash by `SIGSEGV`, `SIGBUS` or `SIGABRT` while running under the cap is also reported as this limit. |
 | Output | 64 MiB of buffered git output per request, shared by all its subprocesses. File contents that `file`, `archive` and `diff` stream instead of buffering are not counted. A recursive `files` call with `limit` or `cursor` counts only the entries of its page. | 422. git is stopped as soon as the limit is passed. |
+| Request values | A value that git takes as one command-line argument or one environment variable (a `path`, a grep `pattern` or an entry of grep `paths`, a name or an email of an author, a committer or a note) must be shorter than the system limit of one argument (Linux: 32 pages, which is 128 KiB or 131,072 bytes with the terminating NUL on 4 KiB pages), and the arguments of one command together must fit the system limit (typically 2 MiB). No value can hold a NUL byte. A commit message is not a value of this kind: it goes to git on standard input, so git takes it at any size. The request limits still apply to it: the body of `merge` and `restore-commit` is at most 1 MiB, and one metadata line of `commit-pack` and `diff-commit` is at most 8 MiB. | 422 for a value that is too long and 400 for a NUL byte, before git starts. This also holds for the write routes (`commit-pack`, `diff-commit`, `restore-commit`, `merge`, `notes`). A ref that long is a 404 or 400 as before, because no repository holds one. |
 | File size | 100 MiB per file, checked from the tree before the file is read. | 422 for `file` (GET and HEAD) and `archive`, before any response byte. |
 | Delivery | Each 64 KiB of a response must reach the client within 30 seconds, and the whole response within 2 minutes of its first byte (`file` and `archive`: 10 minutes). | The connection is closed. The request's slot, memory and temporary files are released. |
 

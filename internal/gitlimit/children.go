@@ -3,8 +3,10 @@ package gitlimit
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -12,6 +14,20 @@ import (
 
 // ErrStopping refuses a git child started after StopChildren began.
 var ErrStopping = errors.New("server is shutting down")
+
+// ErrArgNUL: an argument or an environment variable of a child holds a NUL
+// byte, which a command line cannot carry (exec refuses it). A value that a
+// client sent can hold one, so callers answer it as a bad request. git was
+// not started.
+var ErrArgNUL = errors.New("a value holds a NUL byte, which git cannot take")
+
+// ErrArgTooLong: the command line or the environment of a child does not fit
+// what the system lets exec take (E2BIG). On Linux one argument or variable
+// may not reach 32 pages (128 KiB with 4 KiB pages), and all of them together
+// are limited too. A value
+// that a client sent can reach it, so callers answer it as a limit on the
+// request, not as an internal error. git was not started.
+var ErrArgTooLong = errors.New("a value is too long to pass to git")
 
 // children tracks the git children serve starts for requests and for cache
 // hydration: upload-pack, receive-pack and its hooks, REST reads and
@@ -94,7 +110,15 @@ func (g *registry) start(cmd *exec.Cmd) error {
 	if g.isStopped() {
 		return ErrStopping
 	}
+	for _, v := range append(append([]string{}, cmd.Args...), cmd.Env...) {
+		if strings.IndexByte(v, 0) >= 0 {
+			return ErrArgNUL
+		}
+	}
 	if err := cmd.Start(); err != nil {
+		if errors.Is(err, syscall.E2BIG) {
+			return fmt.Errorf("%w: %w", ErrArgTooLong, err)
+		}
 		return err
 	}
 	g.mu.Lock()

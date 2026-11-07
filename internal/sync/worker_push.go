@@ -666,6 +666,9 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	default:
 	}
 	if err != nil {
+		if f := argumentFailure("git push", err); f != nil {
+			return nil, f
+		}
 		// A recorded policy denial dominates every other classification:
 		// the destination is refused by configuration, so retrying (or
 		// reading rejection porcelain) would be noise.

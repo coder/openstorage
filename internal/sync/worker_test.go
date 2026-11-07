@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	stdsync "sync"
 	"sync/atomic"
@@ -822,5 +823,60 @@ func TestEventMarshalShape(t *testing.T) {
 	}
 	if _, ok := sm["error"]; ok {
 		t.Fatalf("started payload carries error: %v", sm)
+	}
+}
+
+// TestWorkerUpstreamArgumentsGitCannotTake: an upstream owner, name or host,
+// or a stored credential, that exec cannot pass to git (128 KiB or more in
+// one argument or variable, or a NUL byte) fails the run as a configuration
+// error. Before, it failed as a clone or a push failure with exec's error.
+func TestWorkerUpstreamArgumentsGitCannotTake(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Getpagesize() != 4096 {
+		t.Skipf("one argument is limited to 128 KiB only on Linux with 4 KiB pages (page size %d)", os.Getpagesize())
+	}
+	long := strings.Repeat("o", 200_000)
+	for name, tc := range map[string]struct{ owner, name, password string }{
+		"owner too long":      {owner: long, name: "proj"},
+		"name too long":       {owner: "own", name: long},
+		"owner with NUL":      {owner: "o\x00wn", name: "proj"},
+		"credential too long": {owner: "own", name: "proj", password: long},
+	} {
+		t.Run("pull/"+name, func(t *testing.T) {
+			f := newWorkerFixture(t)
+			f.putUpstream(t, "repo_arg", tc.owner, tc.name, "file://"+f.upstreamDir)
+			if tc.password != "" {
+				if _, err := f.store.CreateCredential(context.Background(), Credential{RepoID: "repo_arg", Username: "u", Password: tc.password}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_ = f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_arg"})
+			events := f.rec.list()
+			assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+			if events[1].Error != FailConfig {
+				t.Fatalf("error = %q, want %q", events[1].Error, FailConfig)
+			}
+		})
+		t.Run("push/"+name, func(t *testing.T) {
+			f := newWorkerFixture(t)
+			seedLocalRepo(t, f, "repo_arg")
+			f.putUpstream(t, "repo_arg", tc.owner, tc.name, "file://"+f.upstreamDir)
+			if tc.password != "" {
+				if _, err := f.store.CreateCredential(context.Background(), Credential{RepoID: "repo_arg", Username: "u", Password: tc.password}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_arg"})
+			if err == nil || TransientPushFailure(err) {
+				t.Fatalf("RunPush = %v, want a permanent failure", err)
+			}
+			events := f.rec.list()
+			assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamFailed)
+			if events[1].Error != FailConfig {
+				t.Fatalf("error = %q, want %q", events[1].Error, FailConfig)
+			}
+			if strings.Contains(err.Error(), "ooooooooo") {
+				t.Fatalf("the failure names the value: %.200s", err)
+			}
+		})
 	}
 }

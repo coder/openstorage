@@ -241,6 +241,10 @@ func wcFailRefGuard(w http.ResponseWriter, msg, branch, oldSHA, currentSHA strin
 // body on every route, so merge can share it through wcResolveRepo.
 func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wcInternal: nil error or empty op")
+	// A value too long for git (or with a NUL byte) is the client's, not ours.
+	if s.writeGitLimitErr(w, r, op, err) {
+		return
+	}
 	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
@@ -522,6 +526,21 @@ func wcValidateAuthor(field string, a wcAuthor) error {
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
 		return newFieldError(field, "must not contain newlines", field+" contains newlines")
 	}
+	// Caught here, not by gitlimit.ErrArgNUL at the start of git, so that the
+	// commit routes answer it with their 400 envelope.
+	if strings.ContainsRune(a.Name+a.Email, 0) {
+		return newFieldError(field, "must not contain NUL bytes", field+" contains a NUL byte")
+	}
+	return nil
+}
+
+// wcValidateCommitMessage refuses a message with a NUL byte, which a commit
+// object cannot hold (git commit-tree: "a NUL byte in commit log message not
+// allowed").
+func wcValidateCommitMessage(message string) error {
+	if strings.ContainsRune(message, 0) {
+		return newFieldError("commit_message", "must not contain NUL bytes", "commit_message contains a NUL byte")
+	}
 	return nil
 }
 
@@ -535,6 +554,9 @@ func wcValidateMetadata(md *wcMetadata) error {
 	}
 	if md.CommitMessage == "" {
 		return errors.New("missing commit_message")
+	}
+	if err := wcValidateCommitMessage(md.CommitMessage); err != nil {
+		return err
 	}
 	if err := wcValidateAuthor("author", md.Author); err != nil {
 		return err
@@ -1088,24 +1110,42 @@ func (sc *wcScratch) buildTree(ctx context.Context, baseTree string, entries []w
 // commitTree creates the commit object in the scratch odb. parent "" makes
 // a root commit. Committer defaults to the author (docs/explanation/streaming-commit-protocols.md).
 func (sc *wcScratch) commitTree(ctx context.Context, tree, parent string, md *wcMetadata) (string, error) {
-	assertf(ref.ValidSHA(tree), "commitTree: malformed tree %q", tree)
 	committer := md.Author
 	if md.Committer != nil {
 		committer = *md.Committer
 	}
+	var parents []string
+	if parent != "" {
+		parents = []string{parent}
+	}
+	return sc.writeCommit(ctx, tree, parents, md.CommitMessage, md.Author, committer)
+}
+
+// writeCommit runs `git commit-tree` in the scratch odb and returns the new
+// commit's sha. The message goes on stdin (-F -): -m would put it in argv,
+// where a message of 128 KiB or more fails exec. -m ends a message with a
+// newline when it lacks one and -F - does not, so the newline is added here
+// to keep the bytes of the commit the same. The identities go in the
+// environment, which has the same limit per variable (gitlimit.ErrArgTooLong
+// when a name or an email reaches it).
+func (sc *wcScratch) writeCommit(ctx context.Context, tree string, parents []string, message string, author, committer wcAuthor) (string, error) {
+	assertf(ref.ValidSHA(tree), "writeCommit: malformed tree %q", tree)
 	env := []string{
-		"GIT_AUTHOR_NAME=" + md.Author.Name,
-		"GIT_AUTHOR_EMAIL=" + md.Author.Email,
+		"GIT_AUTHOR_NAME=" + author.Name,
+		"GIT_AUTHOR_EMAIL=" + author.Email,
 		"GIT_COMMITTER_NAME=" + committer.Name,
 		"GIT_COMMITTER_EMAIL=" + committer.Email,
 	}
-	args := []string{"commit-tree", "-m", md.CommitMessage}
-	if parent != "" {
-		assertf(ref.ValidSHA(parent), "commitTree: malformed parent %q", parent)
-		args = append(args, "-p", parent)
+	args := []string{"commit-tree", "-F", "-"}
+	for _, p := range parents {
+		assertf(ref.ValidSHA(p), "writeCommit: malformed parent %q", p)
+		args = append(args, "-p", p)
 	}
 	args = append(args, tree)
-	out, err := sc.git(ctx, nil, env, args...)
+	if message != "" && !strings.HasSuffix(message, "\n") {
+		message += "\n"
+	}
+	out, err := sc.git(ctx, strings.NewReader(message), env, args...)
 	if err != nil {
 		return "", err
 	}
@@ -1694,7 +1734,9 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	revision := md.BaseRef != nil
 	md.applyCurrentNames()
 	if md.CommitMessage == "" {
-		md.CommitMessage = "Restore to " + md.TargetCommitSHA
+		// A NUL in base_ref names no ref and is answered as such (404) below. It
+		// must not be reported as a NUL in a commit_message the client did not send.
+		md.CommitMessage = "Restore to " + strings.ReplaceAll(md.TargetCommitSHA, "\x00", "")
 	}
 	if err := wcValidateMetadata(md); err != nil {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
