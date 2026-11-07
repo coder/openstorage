@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -95,6 +96,10 @@ var (
 	viewCheckLog string // view-check failures of tagged serve and hook processes ("" in benchmark runs)
 )
 
+// envTestHookErrorRecord makes the test binary's pre-receive hook log one
+// error value through the hook's log handler (TestServeLogsHookErrors).
+const envTestHookErrorRecord = "OPENSTORAGE_TEST_HOOK_ERROR_RECORD"
+
 func TestMain(m *testing.M) {
 	// Hook re-exec dispatch: an in-process httptest server (see
 	// TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger) hydrates cache
@@ -102,6 +107,10 @@ func TestMain(m *testing.M) {
 	// those invocations to the real hook entrypoint instead of the test
 	// runner (mirrors cmd/openstorage's "hook" dispatch).
 	if len(os.Args) > 1 && os.Args[1] == "hook" {
+		if rec := os.Getenv(envTestHookErrorRecord); rec != "" && len(os.Args) > 2 && os.Args[2] == "pre-receive" {
+			slog.New(NewHookLogHandler(os.Stderr, nil)).Error("test hook record",
+				"path", os.Getenv(EnvHookErrors), "err", errors.New(rec))
+		}
 		if err := RunHook(context.Background(), os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)

@@ -1003,8 +1003,8 @@ Not part of the operator surface; listed for completeness. Never set these manua
 - `OPENSTORAGE_GIT_REPO`, `OPENSTORAGE_GIT_REFS_POLICY`, `OPENSTORAGE_GIT_OPS`,
   `OPENSTORAGE_GIT_ATOMIC`, `OPENSTORAGE_GIT_PACK_QUOTA`,
   `OPENSTORAGE_GIT_PACK_RESERVATION_TTL`, `OPENSTORAGE_GIT_VERIFY_STATE`,
-  `OPENSTORAGE_GIT_VERIFY_SIG_BUDGET`: per-request plumbing the server sets for the
-  `openstorage hook` subprocess that git re-execs.
+  `OPENSTORAGE_GIT_VERIFY_SIG_BUDGET`, `OPENSTORAGE_GIT_HOOK_ERRORS`: per-request plumbing
+  the server sets for the `openstorage hook` subprocess that git re-execs.
 - `OPENSTORAGE_ASKPASS_USERNAME`, `OPENSTORAGE_ASKPASS_PASSWORD`: set by the upstream-sync
   worker for its own git credential helper.
 - `OPENSTORAGE_TEST_MODE`, `OPENSTORAGE_TEST_CRASH`, `OPENSTORAGE_TEST_CAS_DROP`,

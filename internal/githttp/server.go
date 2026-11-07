@@ -978,6 +978,17 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			return
 		}
 		cmd.Env = envconfig.Set(cmd.Env, EnvVerifyState, statePath)
+		// Hook errors (hookerrors.go): the store errors that the hooks
+		// must not show the pusher. serve logs them after receive-pack
+		// ends, before the state directory goes (defers run last first).
+		hookErrors, err := createHookErrors(stateDir)
+		if err != nil {
+			log.Printf("%s %s: hook errors: %v", service, repo, err)
+			httpError(w, http.StatusInternalServerError, "push setup failed")
+			return
+		}
+		defer logHookErrors(service+" "+repo, hookErrors)
+		cmd.Env = envconfig.Set(cmd.Env, EnvHookErrors, hookErrors)
 		if s.VerifySigBudget > 0 {
 			cmd.Env = envconfig.Set(cmd.Env, EnvVerifySigBudget, strconv.Itoa(s.VerifySigBudget))
 		}

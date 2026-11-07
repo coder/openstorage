@@ -1096,18 +1096,20 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 
 // NewRiverInsertOnly connects an insert-only client (no migrations — hooks
 // never run DDL — and no workers): the hook subprocess enqueues into the
-// serve process's durable queue.
-func NewRiverInsertOnly(ctx context.Context, pgURL string) (*River, error) {
+// serve process's durable queue. River and this client log to logger;
+// without one, River logs to stdout, which git relays to a pusher.
+func NewRiverInsertOnly(ctx context.Context, pgURL string, logger *slog.Logger) (*River, error) {
+	assertf(logger != nil, "NewRiverInsertOnly: nil logger")
 	pool, err := pgxpool.New(ctx, pgURL)
 	if err != nil {
 		return nil, fmt.Errorf("jobs: open pgx pool: %w", err)
 	}
-	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{})
+	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{Logger: logger})
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("jobs: river insert-only client: %w", err)
 	}
-	return &River{client: client, pool: pool}, nil
+	return &River{client: client, pool: pool, logger: logger}, nil
 }
 
 // TracksCreateState: River runs only on PostgreSQL.
