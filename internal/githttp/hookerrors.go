@@ -160,6 +160,10 @@ type hookErrorsWriter string
 // push's hooks one after another.
 var hookErrorsMu sync.Mutex
 
+// hookErrorsChecked runs between the size check and the append (a var for
+// tests: it widens the window that hookErrorsMu closes).
+var hookErrorsChecked = func() {}
+
 func (w hookErrorsWriter) Write(b []byte) (int, error) {
 	n := len(b)
 	if len(b) > maxHookErrorRecordBytes {
@@ -172,6 +176,7 @@ func (w hookErrorsWriter) Write(b []byte) (int, error) {
 	if fi, err := os.Lstat(string(w)); err != nil || !fi.Mode().IsRegular() || fi.Size() >= maxHookErrorsBytes {
 		return n, nil
 	}
+	hookErrorsChecked()
 	f, err := os.OpenFile(string(w), os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		return n, nil

@@ -430,11 +430,17 @@ func TestHookErrorsFileCapHoldsAcrossGoroutines(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(EnvHookErrors, path)
+	// Every writer that passed the size check sits in the window long
+	// enough for the others to pass it too, unless the check and the
+	// append are one step.
+	prev := hookErrorsChecked
+	hookErrorsChecked = func() { time.Sleep(20 * time.Millisecond) }
+	t.Cleanup(func() { hookErrorsChecked = prev })
 	logger := slog.New(NewHookLogHandler(io.Discard, nil))
 	record := strings.Repeat("y", 1000)
 	start := make(chan struct{})
 	var wg stdsync.WaitGroup
-	for range 200 {
+	for range 50 {
 		wg.Go(func() {
 			<-start
 			logger.Error("delivery failed", "err", errors.New(record))
