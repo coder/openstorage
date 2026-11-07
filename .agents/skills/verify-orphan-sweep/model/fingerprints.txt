@@ -2,7 +2,7 @@
 # check.sh --record rewrites this file; SKILL.md holds the sync commit.
 internal/api/publish.go:server.publishPack b8bef1bc00130715bed70f3ebbd22f71add6e4fb84ba7c0cbe76eb096244fe50
 internal/blob/blob.go:EnsurePublished 96b2fcd9493fd991f9c601be85515bd990810cae884758544544c791eacb4ad9
-internal/githttp/hook.go:preReceive[publication] 55656792897c846689f1a57839c6108548d80b51e5a2ee5c42cf584c6d94f517
+internal/githttp/hook.go:preReceive[publication] b080c4b9f686648da6caccca446105a8c98cce110c72e1582b87d86cfd1e495b
 internal/jobs/repack.go:Repacker.repack 5a19a49b0e3ee4e7cc09dfea0afbe6456b7d094679375f1e352c9c2d966184a0
 internal/jobs/repack.go:verifyPublished 9af495a8ad61bc973eecad348257f4cecc898203515f529b0ff6e3d6b0aedcaf
 internal/jobs/sweep.go:Sweeper.classify 2d35d28308be10ea6a290837af94393b73eead6948ff89a998485f522c0b5112
