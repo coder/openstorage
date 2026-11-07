@@ -346,7 +346,7 @@ func TestServeLogsHookErrors(t *testing.T) {
 	t.Setenv(envTestHookErrorRecord, "dial tcp: lookup "+canary)
 	logs := captureServeLog(t)
 
-	repo := "t-hook-errors"
+	repo := "t-hook-errors-" + strings.ToLower(rand.Text()[:8]) // the lane store outlives one run
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
 	srv := &Server{
