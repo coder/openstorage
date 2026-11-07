@@ -716,6 +716,24 @@ func TestWriteRefsNotes(t *testing.T) {
 			wrefProblem(t, resp, body)
 		})
 
+		// Only git's exit 1 says that the object has no note.
+		for _, how := range []string{"128", "kill"} {
+			t.Run("git "+how+" on the note lookup is 500, not 404", func(t *testing.T) {
+				ref := "showfail-" + how
+				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+					map[string]any{"sha": fx.c1, "note": "kept", "ref": ref})
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("add: status = %d body %v", resp.StatusCode, body)
+				}
+				gitFailsOnArg(t, "show", how)
+				resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
+					map[string]any{"sha": fx.c1, "ref": ref})
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("delete: status = %d body %v, want 500", resp.StatusCode, body)
+				}
+			})
+		}
+
 		t.Run("invalid input", func(t *testing.T) {
 			// Each body failure names the member the request sent in
 			// invalid_params ("name reason").

@@ -1077,8 +1077,17 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	// The cache repo's notes ref was just synced from the ref authority.
 	noteExists := false
 	if old != "" {
-		if _, err := wrefGit(ctx, repoPath, nil, nil, "notes", "--ref", targetRef, "show", objectSHA); err == nil {
+		_, err := wrefGit(ctx, repoPath, nil, nil, "notes", "--ref", targetRef, "show", objectSHA)
+		var exitErr *exec.ExitError
+		switch {
+		case err == nil:
 			noteExists = true
+		case errors.As(err, &exitErr) && exitErr.ExitCode() == 1:
+			// git notes show exits 1 for an object with no note. Any other
+			// failure (a fatal exit, a killed git) says nothing about it.
+		default:
+			s.internalErr(w, r, "look up the note", err)
+			return
 		}
 	}
 	if action == "add" && noteExists {
