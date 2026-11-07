@@ -96,6 +96,9 @@ func Grep(ctx context.Context, repoPath, commit string, opts GrepOptions) ([]Gre
 	return files, nil
 }
 
+// ErrBadPattern: git grep could not compile the request's pattern.
+var ErrBadPattern = errors.New("grep pattern is not a valid regex")
+
 // runGrep executes one git grep pass and parses it; every line is typed as
 // a match (the caller downgrades context lines).
 func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, extraArgs []string) ([]GrepFile, error) {
@@ -117,6 +120,13 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.TrimSpace(out) == "" {
 			return []GrepFile{}, nil
+		}
+		// git dies with "-e option, '<pattern>': <reason>" for a pattern it
+		// cannot compile. Only that fixed head counts, which comes before
+		// any request text: a read error (a missing or corrupt object)
+		// also exits 128.
+		if stderr, ok := gitStderr(err, 128); ok && strings.HasPrefix(stderr[strings.LastIndexByte(stderr, '\n')+1:], "fatal: -e option, '") {
+			return nil, fmt.Errorf("%w: %w", ErrBadPattern, err)
 		}
 		return nil, err
 	}
