@@ -1035,12 +1035,13 @@ func wmBlobMode(mode string) bool {
 const wmLiteralPathspec = ":(literal)"
 
 // wmMaxPathspecBytes bounds the path bytes of one ls-tree pathspec argument.
-// Linux refuses to exec a program with a single argument of 128 KiB or more,
-// counting its terminating NUL (MAX_ARG_STRLEN: 32 pages of at least 4 KiB,
-// error E2BIG). git stores and merges paths of that size, so a longer path is
-// resolved one chunk at a time. The limit is the longest path that still fits
-// behind wmLiteralPathspec, so that every path which one ls-tree can name
-// still takes one ls-tree and lists nothing.
+// Linux refuses to exec a program with a single argument of more than 128 KiB
+// (MAX_ARG_STRLEN: 32 pages of at least 4 KiB, error E2BIG), and the limit
+// counts the terminating NUL. An argument of 131,071 characters is accepted
+// and one of 131,072 characters is not. git stores and merges paths of that
+// size, so a longer path is resolved one chunk at a time. The limit is the
+// longest path that still fits behind wmLiteralPathspec, so that every path
+// which one ls-tree can name still takes one ls-tree and lists nothing.
 const wmMaxPathspecBytes = 128<<10 - len(wmLiteralPathspec) - 1
 
 // wmTreeListings holds, for each tree that wmTreePathEntry had to list, its
