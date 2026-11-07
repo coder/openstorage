@@ -2,8 +2,6 @@ package githttp
 
 import (
 	"fmt"
-	"io"
-	"log/slog"
 	"slices"
 
 	"github.com/coder/openstorage/internal/ref"
@@ -78,9 +76,4 @@ func hookFailure(hook string, err error) error {
 	}
 	hookErrorsLogger().Error(hook+" failed", "err", err)
 	return fmt.Errorf("%s failed; push again later (the server log has the cause)", hook)
-}
-
-// hookErrorsLogger writes records only to the push's hook-errors file.
-func hookErrorsLogger() *slog.Logger {
-	return slog.New(NewHookLogHandler(io.Discard, nil))
 }

@@ -17,9 +17,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // fakeMetaS3 is a read-only S3 endpoint holding one fixed _wal/meta.json in
@@ -226,6 +228,20 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 			if n := strings.Count(seen, strings.TrimPrefix(endpoint, "http://")); n != 0 {
 				t.Fatalf("the pusher's output names the bucket endpoint %d times", n)
 			}
+			// The operator gets the cause of both lines.
+			if tc.unresolvable {
+				for _, msg := range []string{"metadata format check failed", "hook refuses ref updates: record forward intent"} {
+					var line string
+					for l := range strings.Lines(hookErrorRecords(t)) {
+						if strings.Contains(l, msg) {
+							line = l
+						}
+					}
+					if !strings.Contains(line, strings.TrimPrefix(endpoint, "http://")) {
+						t.Fatalf("the hook-errors record %q lacks the endpoint: %q", msg, line)
+					}
+				}
+			}
 			if n := fake.writes.Load(); n != 0 {
 				t.Fatalf("the hook sent %d write requests to the bucket; want none", n)
 			}
@@ -416,24 +432,74 @@ func TestSlogForHookKeepsErrorsOffStderr(t *testing.T) {
 	}
 }
 
-// The hook process's default logger is the hook's logger, so a store
-// package's own slog line keeps its error value off stderr.
-func TestSetupHookLoggingCoversTheDefaultLogger(t *testing.T) {
-	hookEventingEnv(t, "")
+// runHook, the hook command, logs with the hook's logger and makes it the
+// default logger: stderr gets no error value, the hook-errors file does.
+func TestRunHookLogsWithTheHookLogger(t *testing.T) {
+	host := "canary-host-" + strings.ToLower(rand.Text()[:8]) + ".invalid"
+	hookEventingEnv(t, "postgres://u:p@"+host+":5432/db?connect_timeout=2")
 	prev, prevOut, prevFlags := slog.Default(), log.Writer(), log.Flags()
 	t.Cleanup(func() {
 		slog.SetDefault(prev)
 		log.SetOutput(prevOut)
 		log.SetFlags(prevFlags)
 	})
-	canary := "canary-" + rand.Text()
 	var stderr bytes.Buffer
-	setupHookLogging(&stderr)
-	slog.Warn("s3wal delete lease clear failed; lease will expire on its window", "err", errors.New("dial "+canary))
-	if !strings.Contains(stderr.String(), "s3wal delete lease clear failed") || strings.Contains(stderr.String(), canary) {
-		t.Fatalf("stderr = %q; want the message without the canary", stderr.String())
+	if err := runHook(t.Context(), []string{"no-such-hook"}, &stderr); err == nil || !strings.Contains(err.Error(), "unknown hook") {
+		t.Fatalf("runHook = %v; want the unknown-hook error", err)
 	}
-	if n := strings.Count(hookErrorRecords(t), canary); n != 1 {
-		t.Fatalf("the hook-errors file names the canary %d times, want 1", n)
+	slog.Warn("s3wal delete lease clear failed; lease will expire on its window", "err", errors.New("dial "+host))
+	for _, msg := range []string{"hook eventing unavailable: open meta store", "s3wal delete lease clear failed"} {
+		if !strings.Contains(stderr.String(), msg) {
+			t.Fatalf("stderr lacks %q: %s", msg, stderr.String())
+		}
+	}
+	if n := strings.Count(stderr.String(), host); n != 0 {
+		t.Fatalf("stderr names the canary host %d times: %s", n, stderr.String())
+	}
+	if n := strings.Count(hookErrorRecords(t), host); n < 2 {
+		t.Fatalf("the hook-errors file names the canary host %d times, want both records", n)
+	}
+}
+
+// A store URL that does not parse keeps its password out of every error,
+// so out of the hook-errors file and serve's log too.
+func TestMalformedStoreURLHidesItsPassword(t *testing.T) {
+	pw := "canary_pass_" + rand.Text()[:8]
+	// The "/" ends the authority early, so url.Parse reads part of the
+	// password as a port and quotes the whole URL in its error.
+	pgURL := "postgres://user:" + pw + "/x@host:5432/db"
+	logs := hookEventingEnv(t, pgURL)
+	cleanup := wireHookEventing(t.Context(), slog.New(githttp.NewHookLogHandler(logs, nil)))
+	defer cleanup()
+	records := hookErrorRecords(t)
+	if !strings.Contains(records, "malformed URL") {
+		t.Fatalf("the hook-errors file lacks the parse failure: %s", records)
+	}
+	seen := logs.String() + records
+	for _, open := range []func() error{
+		func() error { _, err := meta.Open(t.Context(), pgURL); return err },
+		func() error { _, err := ref.Open(t.Context(), pgURL); return err },
+		func() error {
+			_, err := ref.Open(t.Context(), "s3wal://user:"+pw+"/x@bucket?endpoint=http://h")
+			return err
+		},
+		func() error { _, err := blob.Open(t.Context(), "s3://user:"+pw+"/x@bucket"); return err },
+		func() error { _, err := blob.Open(t.Context(), "file://user:"+pw+"/x@host/dir"); return err },
+		// The schemes' own opens parse again.
+		func() error { _, err := blob.OpenS3(t.Context(), "s3://user:"+pw+"/x@bucket"); return err },
+		func() error { _, err := blob.OpenFile("file://user:" + pw + "/x@host/dir"); return err },
+		func() error {
+			_, err := s3wal.Dial(t.Context(), "s3wal://user:"+pw+"/x@bucket?endpoint=http://h")
+			return err
+		},
+	} {
+		err := open()
+		if err == nil {
+			t.Fatal("a malformed URL opened")
+		}
+		seen += err.Error()
+	}
+	if n := strings.Count(seen, pw); n != 0 {
+		t.Fatalf("the errors and hook records name the canary password %d times: %s", n, seen)
 	}
 }

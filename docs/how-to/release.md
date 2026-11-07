@@ -106,15 +106,26 @@ dispatches it for an existing release tag
 Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 (v0.16.0 and earlier).
 
-1. Build and check without pushing (the default, `publish=false`):
+1. Stage and check, without a version tag (the default, `publish=false`):
 
    ```sh
    gh workflow run image -R coder/openstorage --ref main -f tag=vX.Y.Z
    ```
 
-   The `verify` jobs build the tag natively on linux/amd64 and linux/arm64 runners.
-   Each job checks the platform, the `openstorage --version` stamp, and the runtime
-   tools, then runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
+   The `stage` jobs build the tag natively on linux/amd64 and linux/arm64 runners, one
+   build per platform, and push each result to `ghcr.io/coder/openstorage` **by digest**,
+   with no tag. Every run therefore leaves untagged package versions behind (at least one
+   index per platform), and a run with `publish=false` leaves no version tag. The `verify` jobs pull those digests with a
+   read-only token. Each job checks the platform, the `openstorage --version` stamp, and
+   the runtime tools. It then runs
+   [`scripts/check-apply-messages.sh`](../../scripts/check-apply-messages.sh) inside the
+   image, because the image's Git is Alpine's and the server reads its patch refusals by
+   their words (a tag cut before that script landed skips this check with a notice).
+   If it fails, Alpine's Git words a refusal differently from the words that `internal/api`
+   reads. A new dispatch builds again and passes only if Alpine has since served a Git whose
+   words match. Otherwise teach `internal/api` the new words, update the cases in
+   `internal/api/testdata/applymsg`, and cut a new release.
+   Last, it runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
 
 2. After that run is green, request the push:
 
@@ -122,16 +133,26 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    gh workflow run image -R coder/openstorage --ref main -f tag=vX.Y.Z -f publish=true
    ```
 
-   The `publish` job uses the `ghcr-publish` environment. It waits until a required
-   reviewer approves it in the run's **Review deployments** dialog, and the
-   environment accepts deployments only from `main`. It is the only job with
+   This run stages and checks again, so its digests are the ones that ship. The `publish`
+   job uses the `ghcr-publish` environment. It waits until a required reviewer approves
+   it in the run's **Review deployments** dialog, and the environment accepts deployments
+   only from `main`. With the `stage` jobs, it is one of the two jobs with
    `packages: write`.
 
-   After approval it pushes one multi-platform tag, `ghcr.io/coder/openstorage:X.Y.Z`,
-   with OCI labels (source, revision, version), an SBOM, and provenance. It refuses
-   to run when that tag already exists, so version tags are never replaced. The run
-   summary records the index digest. The `verify-published` jobs then pull that
-   digest on both platforms and repeat the checks and the smoke.
+   After approval it does not build. It gives the two checked digests one multi-platform
+   tag, `ghcr.io/coder/openstorage:X.Y.Z`, with index annotations (source, revision,
+   version, description). The OCI labels, the SBOM and the provenance come with the
+   digests. It refuses to run when that tag already exists, so version tags are never
+   replaced. It also refuses to create the tag unless the new index would hold exactly the
+   manifests of the two staged digests, and it checks the pushed index once more. The run
+   summary records the index digest. The `verify-published` jobs then pull that digest on
+   both platforms and repeat the checks and the smoke.
+
+   The staged digests are kept for 35 days, and an approval can wait up to 30 days. If the
+   `publish` job fails because they are gone, or for any reason before it creates the tag,
+   dispatch the run again. If it fails after the tag exists, the tag is spent: do not
+   announce the version, and fix forward with a new release (see the last paragraph of
+   this section).
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
@@ -167,6 +188,16 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
 
 **If a published image is bad,** do not move or reuse its tag. Fix forward with a new
 release. A package admin can delete the bad version in the package settings.
+
+**Before deleting an untagged package version,** check that no tag needs it. The untagged
+versions that a run leaves are the staged indexes, and a registry may list the image and
+attestation manifests under them as untagged versions too. A tagged multi-platform image
+points at those same manifests, so deleting one of them breaks the tag. List what a tag
+needs, and delete only a version whose digest is not in that list for any tag you keep:
+
+```sh
+docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z --format '{{json .Manifest}}' | jq -r '.manifests[].digest'
+```
 
 ## Notes
 

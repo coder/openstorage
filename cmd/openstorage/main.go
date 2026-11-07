@@ -60,9 +60,7 @@ func main() {
 		// Eventing wiring for the git surface (docs/reference/webhooks.md): decorate the
 		// update hook's ref store so won pushes emit push events. No-op
 		// (identity default) when the serve env is absent.
-		hookCleanup := wireHookEventing(ctx, setupHookLogging(os.Stderr))
-		err = githttp.RunHook(ctx, os.Args[2:])
-		hookCleanup()
+		err = runHook(ctx, os.Args[2:], os.Stderr)
 	case "keygen":
 		err = cmdKeygen(os.Args[2:])
 	case "mint":

@@ -1514,7 +1514,7 @@ func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bo
 // retireUnuploaded retires the reservations in reservedGens whose blobs
 // are proven absent after a failed upload. A failed retire leaves only
 // what the TTL collects anyway, so it is logged, to the hook-errors file
-// only: its error can name the store.
+// only: its error can name the store, and git relays stderr to the pusher.
 func retireUnuploaded(ctx context.Context, st interface {
 	RetirePackAttempts(ctx context.Context, group []string, gens map[string]string) error
 }, bl interface {

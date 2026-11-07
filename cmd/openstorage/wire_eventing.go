@@ -761,12 +761,13 @@ func slogForHook(stderr io.Writer) *slog.Logger {
 	return slog.New(githttp.NewHookLogHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 }
 
-// setupHookLogging builds the hook's logger (slogForHook) and makes it the
-// default, so the store packages' own slog lines, whose attributes can
-// carry a store error, and the log package reach the pusher without error
-// values too.
-func setupHookLogging(stderr io.Writer) *slog.Logger {
+// runHook is the `openstorage hook` command. Its logger (slogForHook) is
+// also the process's default logger, so the store packages' own slog lines
+// and the log package lose their error values on stderr too.
+func runHook(ctx context.Context, args []string, stderr io.Writer) error {
 	logger := slogForHook(stderr)
 	slog.SetDefault(logger)
-	return logger
+	cleanup := wireHookEventing(ctx, logger)
+	defer cleanup()
+	return githttp.RunHook(ctx, args)
 }

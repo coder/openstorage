@@ -7,6 +7,7 @@ package s3wal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -160,7 +161,9 @@ func Dial(ctx context.Context, rawURL string) (*Client, error) {
 	assertf(rawURL != "", "Dial: empty s3wal URL")
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse s3wal URL: %w", err)
+		// Not err: url.Parse's error quotes the URL, password included,
+		// and its reason can quote part of it.
+		return nil, errors.New("parse s3wal URL: malformed URL (not shown: it can hold a password)")
 	}
 	if u.Scheme != "s3wal" {
 		return nil, fmt.Errorf("s3wal URL scheme %q unsupported (want s3wal)", u.Scheme)

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/coder/openstorage/internal/envconfig"
 )
@@ -37,6 +38,14 @@ const maxLoggedHookErrors = 100
 // record), and serve logs that it dropped some.
 const maxHookErrorsBytes = 1 << 20
 
+// maxHookErrorRecordBytes bounds one record (an S3 error can carry a whole
+// response body). A longer record ends in hookErrorCut. serve's reader
+// takes lines up to maxHookErrorsBytes, well above it.
+const maxHookErrorRecordBytes = 64 << 10
+
+// hookErrorCut ends a record cut at maxHookErrorRecordBytes.
+const hookErrorCut = " [record cut]\n"
+
 // NewHookLogHandler returns the slog handler of a hook process. stderr
 // (which reaches the pusher) gets each record without its error-valued
 // attributes. The hook-errors file (EnvHookErrors) gets the whole record.
@@ -49,6 +58,11 @@ func NewHookLogHandler(stderr io.Writer, opts *slog.HandlerOptions) slog.Handler
 		h.operator = slog.NewTextHandler(hookErrorsWriter(path), opts)
 	}
 	return h
+}
+
+// hookErrorsLogger writes records only to the push's hook-errors file.
+func hookErrorsLogger() *slog.Logger {
+	return slog.New(NewHookLogHandler(io.Discard, nil))
 }
 
 type hookLogHandler struct {
@@ -131,24 +145,48 @@ func withoutErrors(a slog.Attr) (slog.Attr, bool) {
 	return a, true
 }
 
-// hookErrorsWriter appends each write to the hook-errors file at its path.
-// It writes only to an existing regular file below maxHookErrorsBytes: it
-// never creates one, and it does not follow a symlink. The file lives in
-// serve's private 0700 state directory, so no other user can swap it
-// between the check and the open. A write that cannot reach the file is
-// dropped.
+// hookErrorsWriter appends each write, one record, to the hook-errors file
+// at its path. It writes only to an existing regular file below
+// maxHookErrorsBytes: it never creates one, and it does not follow a
+// symlink. The file lives in serve's private 0700 state directory, so no
+// other user can swap it between the check and the open. A record longer
+// than maxHookErrorRecordBytes is cut there, so serve can read every line.
+// A write that cannot reach the file is dropped.
 type hookErrorsWriter string
 
+// hookErrorsMu serializes the size check and the append across a hook's
+// loggers (a slog handler serializes only its own writes, and a hook has
+// several: its own, River's, hookErrorsLogger's), so the file overshoots
+// maxHookErrorsBytes by at most one record. git runs a push's hooks one
+// after another.
+var hookErrorsMu sync.Mutex
+
+// hookErrorsChecked runs between the size check and the append (a var for
+// tests: it widens the window that hookErrorsMu closes).
+var hookErrorsChecked = func() {}
+
 func (w hookErrorsWriter) Write(b []byte) (int, error) {
-	if fi, err := os.Lstat(string(w)); err != nil || !fi.Mode().IsRegular() || fi.Size() >= maxHookErrorsBytes {
-		return len(b), nil
+	n := len(b)
+	if len(b) > maxHookErrorRecordBytes {
+		cut := make([]byte, 0, maxHookErrorRecordBytes)
+		cut = append(cut, b[:maxHookErrorRecordBytes-len(hookErrorCut)]...)
+		b = append(cut, hookErrorCut...)
 	}
+	hookErrorsMu.Lock()
+	defer hookErrorsMu.Unlock()
+	if fi, err := os.Lstat(string(w)); err != nil || !fi.Mode().IsRegular() || fi.Size() >= maxHookErrorsBytes {
+		return n, nil
+	}
+	hookErrorsChecked()
 	f, err := os.OpenFile(string(w), os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
-		return len(b), nil
+		return n, nil
 	}
 	defer f.Close()
-	return f.Write(b)
+	if _, err := f.Write(b); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // createHookErrors creates the empty hook-errors file (mode 0600) in dir,
@@ -181,7 +219,7 @@ func logHookErrors(prefix, path string) {
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
-	sc.Buffer(nil, 1<<20) // one record is one slog line
+	sc.Buffer(nil, maxHookErrorsBytes) // one record is one line, cut at maxHookErrorRecordBytes
 	logged, dropped := 0, 0
 	for sc.Scan() {
 		if logged == maxLoggedHookErrors {

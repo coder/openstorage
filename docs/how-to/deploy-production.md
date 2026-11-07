@@ -811,9 +811,19 @@ also have a metric are listed in the [metrics and log mapping](#metrics-and-log-
   other hook error reaches them as `<hook> failed; push again later (the server log has
   the cause)`, and `serve` logs its text as a hook line (below).
 - Hook log lines reach Git clients without their error values, because those can name
-  the database or S3 endpoint. `serve` logs each whole line after the push as
-  `receive-pack <repo>: hook: <line>`, at most 100 lines per push. The hooks keep at most
-  1 MiB of these lines per push, and `serve` logs when they dropped some.
+  the database or S3 endpoint. Each hook writes the whole line to a private file for its
+  push, and `serve` logs it after the push as `receive-pack <repo>: hook: <line>`.
+  - `serve` logs at most 100 of these lines per push, then
+    `receive-pack <repo>: hook: <n> more records not logged`.
+  - The hooks stop writing once the file holds 1 MiB, so it holds 1 MiB plus at most one
+    line. `serve` then logs `receive-pack <repo>: hook: the hooks dropped the records past
+    1048576 bytes`.
+  - The file lives in a mode 0700 `openstorage-verify-sig-*` directory in the temporary
+    directory (`TMPDIR`), mode 0600. `serve` deletes the directory when the push ends. A
+    `serve` that crashes mid-push leaves it behind, and `serve` does not remove such
+    directories when it starts: delete them while no `serve` runs on the host.
+  - A store URL that does not parse shows in these lines as `malformed URL`, without the
+    URL, because it can hold a password.
 - `WARN` means `slog.Warn`. Ellipses abbreviate variable text, not literal messages.
 
 | Signal/error | Emission conditions and fields | What it establishes | What it does not establish | Safe response |

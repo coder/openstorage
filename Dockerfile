@@ -27,6 +27,10 @@ FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c
 # `gpg` (PGP) and `ssh-keygen` (SSH) and fail closed per ref when the binary
 # is absent (ADR-9, #50) — without them every signed push on a protected ref
 # is rejected. CI smoke-tests their presence in the built image.
+# git is not pinned to a version. An Alpine branch serves only the current build
+# of a package, so an exact pin would make a release tag unbuildable after the
+# next update, and image.yml rebuilds a tag from its own Dockerfile. The image
+# jobs run scripts/check-apply-messages.sh against the git that the build got.
 RUN apk add --no-cache git ca-certificates gnupg openssh-keygen \
     && adduser -D -H openstorage
 COPY --from=build /out/openstorage /usr/local/bin/openstorage
