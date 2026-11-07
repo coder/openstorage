@@ -64,27 +64,37 @@ var (
 // Lease is an open lease file with a flock on it. Close releases the lock
 // unless a child that inherited the descriptor still holds it.
 type Lease struct {
-	f      *os.File // nil: the repository directory is read-only and has no lease file
+	f      *os.File // nil: the filesystem is read-only and has no lease file
 	shared bool
 }
 
+// openLeaseFile is os.OpenFile behind a seam, so that a test can report a
+// read-only filesystem without mounting one.
+var openLeaseFile = os.OpenFile
+
 // OpenLease takes a shared lease on the repository at repoPath, creating the
-// lease file if it is missing. A repository directory that serve cannot
-// write, and that has no lease file, gets a lease that holds nothing: no git
-// of serve can take a ref lock there, and a refusal would only break the
-// reads that work there. It waits (bounded) while the lease is held
+// lease file if it is missing. It waits (bounded) while the lease is held
 // exclusively. It fails with ctx's error once ctx ends, with ErrStopping once
 // StopChildren began, and with ErrLeaseBusy if the wait does not end.
+//
+// On a read-only filesystem (EROFS) nothing can write a ref lock, so a read
+// there must still run. An existing lease file is opened read-only and
+// locked, because flock needs no write access. With no lease file, the lease
+// holds nothing and Attach adds no descriptor. Any other failure, a
+// permission error included, is an error: a directory that serve cannot
+// write can still have a writable refs/, where a git without the lease could
+// take ref locks.
 func OpenLease(ctx context.Context, repoPath string) (*Lease, error) {
 	assertf(repoPath != "", "OpenLease: empty repoPath")
 	path := filepath.Join(repoPath, LeaseFile)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil && (errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS)) {
-		var openErr error
-		if f, openErr = os.OpenFile(path, os.O_RDWR, 0); errors.Is(openErr, fs.ErrNotExist) {
-			return &Lease{shared: true}, nil
-		} else if openErr == nil {
+	f, err := openLeaseFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if errors.Is(err, syscall.EROFS) {
+		var roErr error
+		switch f, roErr = openLeaseFile(path, os.O_RDONLY, 0); {
+		case roErr == nil:
 			err = nil
+		case errors.Is(roErr, fs.ErrNotExist):
+			return &Lease{shared: true}, nil
 		}
 	}
 	if err != nil {
@@ -191,7 +201,7 @@ func StartIn(ctx context.Context, repoPath string, cmd *exec.Cmd) error {
 	}
 	l, err := OpenLease(ctx, repoPath)
 	if err != nil {
-		return err
+		return failStart(cmd, err)
 	}
 	defer l.Close()
 	l.Attach(cmd)

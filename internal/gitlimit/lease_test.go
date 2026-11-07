@@ -420,46 +420,213 @@ func TestAttachRefusesAnExclusiveLease(t *testing.T) {
 	l.Attach(exec.Command("true"))
 }
 
-// A repository directory that serve cannot write has no ref lock that a git
-// of serve could take or leave behind, and reads from it worked before the
-// lease existed. A start there with no lease file runs without a lease and
-// makes no file. With a lease file, the lease works as everywhere else.
-func TestReadOnlyRepositoryWithoutALeaseFileStillRuns(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory permissions")
+// A start that fails before the child runs, because the lease wait ended or
+// StopChildren began, closes the pipes that the caller made with StdinPipe and
+// StdoutPipe: exec.Cmd closes them only in a Start that fails, and a
+// descriptor leak per refused request would otherwise last until a garbage
+// collection.
+func TestStartInClosesThePipesOfAStartThatFails(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, repo string) context.Context
+		want  error
+	}{
+		{"the lease wait ends", func(t *testing.T, repo string) context.Context {
+			held, err := TryExclusive(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = held.Close() })
+			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			t.Cleanup(cancel)
+			return ctx
+		}, context.DeadlineExceeded},
+		{"the children are stopping", func(t *testing.T, repo string) context.Context {
+			children.mu.Lock()
+			children.stopped = true
+			children.mu.Unlock()
+			t.Cleanup(func() {
+				children.mu.Lock()
+				children.stopped = false
+				children.mu.Unlock()
+			})
+			return t.Context()
+		}, ErrStopping},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			ctx := tc.setup(t, repo)
+			cmd := exec.Command("cat")
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := StartIn(ctx, repo, cmd); !errors.Is(err, tc.want) {
+				t.Fatalf("StartIn = %v, want %v", err, tc.want)
+			}
+			if _, err := stdin.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+				t.Errorf("write to the stdin pipe of a start that failed = %v, want a closed file", err)
+			}
+			read := make(chan error, 1)
+			go func() { _, err := stdout.Read(make([]byte, 1)); read <- err }()
+			select {
+			case err := <-read:
+				if !errors.Is(err, os.ErrClosed) {
+					t.Errorf("read from the stdout pipe of a start that failed = %v, want a closed file", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Error("read from the stdout pipe of a start that failed blocks: the pipe is still open")
+			}
+		})
 	}
+}
+
+// readOnlyFilesystem makes OpenLease see a read-only filesystem: every open
+// that could write or create fails with EROFS, as on a read-only mount, and
+// a read-only open works.
+func readOnlyFilesystem(t *testing.T) {
+	t.Helper()
+	prev := openLeaseFile
+	openLeaseFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
+			return nil, &os.PathError{Op: "open", Path: name, Err: syscall.EROFS}
+		}
+		return prev(name, flag, perm)
+	}
+	t.Cleanup(func() { openLeaseFile = prev })
+}
+
+// On a read-only filesystem nothing can write a ref lock, and reads there
+// worked before the lease existed. With a lease file, the lease is a real
+// one: the file is opened read-only, which flock allows.
+func TestReadOnlyFilesystemWithALeaseFileHoldsARealLease(t *testing.T) {
 	repo := t.TempDir()
-	if err := os.Chmod(repo, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(repo, 0o700) })
-
-	if out, err := OutputIn(t.Context(), repo, exec.Command("sh", "-c", "echo out")); err != nil || string(out) != "out\n" {
-		t.Fatalf("OutputIn in a read-only repository = %q, %v", out, err)
-	}
-	if _, err := os.Lstat(filepath.Join(repo, LeaseFile)); err == nil {
-		t.Fatal("a lease file appeared in a read-only directory")
-	}
-	if l, err := TryExclusive(repo); err == nil {
-		_ = l.Close()
-		t.Fatal("TryExclusive succeeded without a lease file to lock")
-	}
-
-	if err := os.Chmod(repo, 0o700); err != nil {
-		t.Fatal(err)
-	}
 	if err := tryExclusive(t, repo); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(repo, 0o500); err != nil {
+	readOnlyFilesystem(t)
+	l, err := OpenLease(t.Context(), repo)
+	if err != nil {
+		t.Fatalf("OpenLease on a read-only filesystem with a lease file = %v", err)
+	}
+	defer l.Close()
+	if l.f == nil {
+		t.Fatal("the lease holds nothing although the lease file exists")
+	}
+	probe, err := os.Open(filepath.Join(repo, LeaseFile))
+	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := OpenLease(t.Context(), repo)
+	defer probe.Close()
+	if err := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("exclusive flock under the lease = %v, want EWOULDBLOCK", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("exclusive flock after the lease closed = %v", err)
+	}
+}
+
+// With no lease file the lease holds nothing, and a start there runs without
+// a descriptor LeaseFD and makes no file.
+func TestReadOnlyFilesystemWithoutALeaseFileStillRuns(t *testing.T) {
+	repo := t.TempDir()
+	readOnlyFilesystem(t)
+	out, err := OutputIn(t.Context(), repo, exec.Command("sh", "-c", "echo out; test ! -e /proc/self/fd/10 || echo leased"))
+	if err != nil || string(out) != "out\n" {
+		t.Fatalf("OutputIn on a read-only filesystem = %q, %v, want out and no descriptor %d", out, err, LeaseFD)
+	}
+	if _, err := os.Lstat(filepath.Join(repo, LeaseFile)); err == nil {
+		t.Fatal("a lease file appeared on a read-only filesystem")
+	}
+}
+
+// Only EROFS selects the fallback. A lease file that exists but cannot be
+// opened is an error, and so is any other failure: there a git can take ref
+// locks, so a lease that holds nothing would hide it from TryExclusive.
+func TestOpenLeaseFailsClosedOutsideAReadOnlyFilesystem(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file and directory permissions")
+	}
+	missing := filepath.Join(t.TempDir(), "gone")
+	if l, err := OpenLease(t.Context(), missing); err == nil {
+		_ = l.Close()
+		t.Fatal("OpenLease of a missing directory succeeded")
+	}
+
+	// A directory that serve cannot write has no lease file to create, and
+	// its refs/ can still be writable: a git there needs a real lease.
+	nowrite := t.TempDir()
+	if err := os.Mkdir(filepath.Join(nowrite, "refs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(nowrite, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(nowrite, 0o700) })
+	marker := filepath.Join(nowrite, "refs", "ran")
+	if err := StartIn(t.Context(), nowrite, exec.Command("sh", "-c", ": >"+marker)); err == nil {
+		t.Fatal("StartIn in a directory without a lease file that serve cannot create succeeded")
+	}
+	if _, err := os.Lstat(marker); err == nil {
+		t.Fatal("the child ran without a lease")
+	}
+
+	// A lease file that nobody may open.
+	locked := t.TempDir()
+	if err := tryExclusive(t, locked); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(locked, LeaseFile), 0); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := OpenLease(t.Context(), locked); err == nil {
+		_ = l.Close()
+		t.Fatal("OpenLease of a lease file with mode 0 succeeded")
+	}
+}
+
+// On a read-only filesystem, a lease file that cannot even be read is an
+// error, not a lease that holds nothing: only a missing file means that no
+// git of serve can hold the lease.
+func TestReadOnlyFilesystemWithAnUnreadableLeaseFileFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	repo := t.TempDir()
+	if err := tryExclusive(t, repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(repo, LeaseFile), 0); err != nil {
+		t.Fatal(err)
+	}
+	readOnlyFilesystem(t)
+	if l, err := OpenLease(t.Context(), repo); err == nil {
+		_ = l.Close()
+		t.Fatal("OpenLease succeeded with a lease file that cannot be read")
+	}
+}
+
+// Attach panics on a command that already has ExtraFiles: the lease must be
+// the only extra descriptor, or LeaseFD would not hold it.
+func TestAttachRefusesACommandWithExtraFiles(t *testing.T) {
+	l, err := OpenLease(t.Context(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	if err := tryExclusive(t, repo); !errors.Is(err, ErrLeaseBusy) {
-		t.Fatalf("TryExclusive under a lease in a read-only repository = %v, want ErrLeaseBusy", err)
-	}
+	cmd := exec.Command("true")
+	cmd.ExtraFiles = []*os.File{os.Stdin}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Attach on a command with ExtraFiles did not panic")
+		}
+	}()
+	l.Attach(cmd)
 }

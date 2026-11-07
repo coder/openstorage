@@ -94,11 +94,21 @@ func Stopping() bool { return children.isStopped() }
 // the number of groups it signaled.
 func StopChildren(grace time.Duration) int { return children.stop(grace) }
 
+// failStart ends a start that fails before cmd.Start runs. With cmd.Err set,
+// Start fails at once and closes the pipes that the caller made with
+// StdinPipe, StdoutPipe and StderrPipe, which otherwise stay open until a
+// garbage collection. It returns err.
+func failStart(cmd *exec.Cmd, err error) error {
+	cmd.Err = err
+	_ = cmd.Start()
+	return err
+}
+
 func (g *registry) start(cmd *exec.Cmd) error {
 	assertf(cmd.SysProcAttr == nil, "gitlimit.Start: cmd already has SysProcAttr")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if g.isStopped() {
-		return ErrStopping
+		return failStart(cmd, ErrStopping)
 	}
 	if err := cmd.Start(); err != nil {
 		return err
