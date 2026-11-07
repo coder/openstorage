@@ -18,6 +18,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1867,7 +1868,7 @@ func TestRestoreCommit(t *testing.T) {
 		// Only git's exit 1 says that the target names no commit.
 		for _, how := range []string{"128", "kill"} {
 			t.Run("git "+how+" on the target is 500, not 404", func(t *testing.T) {
-				gitFailsOnArg(t, c1.Commit.CommitSHA+"^{tree}", how)
+				gitFailsOnArg(t, c1.Commit.CommitSHA+"^{commit}^{tree}", how)
 				resp, body := restore(map[string]any{
 					"target_branch":     "main",
 					"target_commit_sha": c1.Commit.CommitSHA,
@@ -1878,6 +1879,23 @@ func TestRestoreCommit(t *testing.T) {
 				}
 			})
 		}
+
+		// target_commit_sha names a commit: a tree or blob id that git
+		// can peel to a tree must not be restored.
+		t.Run("a tree or blob as target is 404", func(t *testing.T) {
+			tip := wctBranchTip(t, e, readTok, "main", false)
+			for _, id := range []string{c1.Commit.TreeSHA, fmt.Sprintf("%x", sha1.Sum([]byte("blob 4\x00one\n")))} {
+				resp, body := restore(map[string]any{
+					"target_branch":     "main",
+					"target_commit_sha": id,
+					"author":            wctAuthor,
+				})
+				wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
+			}
+			if got := wctBranchTip(t, e, readTok, "main", false); got != tip {
+				t.Fatalf("main moved to %q, want %q", got, tip)
+			}
+		})
 
 		t.Run("unborn branch is 404", func(t *testing.T) {
 			resp, body := restore(map[string]any{

@@ -978,10 +978,13 @@ func wcSummaryModeOK(mode string) bool {
 	return false
 }
 
-// resolveTree resolves a commit sha to its tree sha.
+// resolveTree resolves a commit sha to its tree sha. It peels ^{commit}
+// first: <tree>^{tree} is the tree itself, and restore-commit's
+// target_commit_sha must name a commit (rev-parse exits 1 for any other
+// object).
 func (sc *wcScratch) resolveTree(ctx context.Context, commitSHA string) (string, error) {
 	assertf(ref.ValidSHA(commitSHA), "resolveTree: malformed sha %q", commitSHA)
-	out, err := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", commitSHA+"^{tree}")
+	out, err := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", commitSHA+"^{commit}^{tree}")
 	if err != nil {
 		return "", err
 	}
