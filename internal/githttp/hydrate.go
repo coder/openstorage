@@ -1615,6 +1615,20 @@ func isPushHoldSidecar(name string) bool {
 		strings.HasSuffix(name, pushHoldGensSuffix)
 }
 
+// lockPushHoldReservations takes the reservation lock of holdPath's
+// directory, waiting at most pushHoldWaitMax like a reservation does: a
+// process that holds the lock longer, such as a stopped reserver, must not
+// hang a push or ref write that is done with its hold.
+func lockPushHoldReservations(holdPath string) (unlock func(), err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pushHoldWaitMax)
+	defer cancel()
+	unlock, err = flockExclusiveCtx(ctx, filepath.Dir(holdPath)+".reserve.lock")
+	if err != nil {
+		return nil, fmt.Errorf("push hold: reservation lock: %w", err)
+	}
+	return unlock, nil
+}
+
 // removePushHoldFiles releases a push's hold file together with every
 // sidecar artifact — the ONE list every release site shares (post-receive,
 // the handler fallback, the mint sweep's expired branch, and an atomic
@@ -1633,22 +1647,16 @@ func removePushHoldFiles(holdPath string) {
 	// Best-effort like the removals below: without the lock the TTL
 	// machinery remains the bound.
 	//
-	// The wait is bounded like a reservation's (pushHoldWaitMax): a
-	// process that holds the lock longer, such as a stopped reserver, must
-	// not hang a push or ref write that is done. On that timeout the files
-	// stay. Removing them without the lock could race the reaper's
-	// restore, and every reservation waits on the same lock anyway. A
-	// later release of the same hold retries (serve's handler releases
-	// after post-receive), and once no refresher touches the hold the TTL
-	// reap retires it.
-	ctx, cancel := context.WithTimeout(context.Background(), pushHoldWaitMax)
-	lock, err := flockExclusiveCtx(ctx, filepath.Dir(holdPath)+".reserve.lock")
-	cancel()
-	switch {
-	case err == nil:
+	// The wait is bounded (lockPushHoldReservations), and a lock this
+	// release could not take in time is like one it could not take at
+	// all: it removes the files without it. Leaving them would let
+	// serve's handler refresher, which runs until the request ends, keep
+	// a released hold live for as long as a non-reading client stalls the
+	// response. Without the lock, only a reaper stalled inside its window
+	// on this very hold can restore it, and the reaper takes only holds
+	// that look expired.
+	if lock, err := lockPushHoldReservations(holdPath); err == nil {
 		defer lock()
-	case errors.Is(err, context.DeadlineExceeded):
-		return
 	}
 	if _, err := os.Lstat(holdPath); err == nil {
 		// Bump only when a hold FILE is actually being removed (Codex
@@ -3070,7 +3078,7 @@ func removePushHolds(holdPath string, names []string) error {
 	for _, name := range names {
 		drop[name] = true
 	}
-	unlock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock")
+	unlock, err := lockPushHoldReservations(holdPath)
 	if err != nil {
 		return err
 	}
@@ -3158,7 +3166,7 @@ func appendPushReleased(holdPath string, names []string) error {
 	// strictly before the window or strictly after its outcome; a
 	// crash-stranded quarantine (its flock died with its process) still
 	// satisfies the second stat.
-	unlock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock")
+	unlock, err := lockPushHoldReservations(holdPath)
 	if err != nil {
 		return err
 	}

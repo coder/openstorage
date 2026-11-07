@@ -400,56 +400,71 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	}
 }
 
-// TestRemovePushHoldFiles_LockWaitBounded: another process holds the
-// reserve lock past pushHoldWaitMax, here flock(1), as a stopped reserver
-// would. Releasing a hold must not wait for it: a push or ref write that
-// is done would hang. Without the lock the hold files stay, and the TTL
-// reap retires them once no refresher touches them.
-func TestRemovePushHoldFiles_LockWaitBounded(t *testing.T) {
+// TestPushHoldLockWaitsAreBounded: another process holds the reservation
+// lock past pushHoldWaitMax, here flock(1), as a stopped reserver would.
+// The steps that take it after a push's reservation must not wait for it,
+// or a push or ref write that is done hangs: the release removes the hold
+// files without the lock, and the tombstone append and the doomed-name
+// drop return an error (the names stay held until post-receive's release
+// or the TTL).
+func TestPushHoldLockWaitsAreBounded(t *testing.T) {
 	flockBin, err := exec.LookPath("flock")
 	if err != nil {
 		t.Skip("flock(1) not installed")
 	}
-	repoPath := t.TempDir()
-	holdPath := mintHold(t, repoPath, "refs/heads/x")
-	lockPath := filepath.Dir(holdPath) + ".reserve.lock"
-	holder := exec.Command(flockBin, lockPath, "sleep", "60")
-	if err := holder.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = holder.Process.Kill(); _ = holder.Wait() })
-	// Wait until the other process has the lock.
-	for deadline := time.Now().Add(10 * time.Second); ; {
-		probe, err := os.OpenFile(lockPath, os.O_RDWR, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		lerr := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		_ = probe.Close()
-		if errors.Is(lerr, syscall.EWOULDBLOCK) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("flock(1) never took the reserve lock (last probe: %v)", lerr)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
 	prev := pushHoldWaitMax
 	pushHoldWaitMax = 150 * time.Millisecond
-	defer func() { pushHoldWaitMax = prev }()
-	done := make(chan struct{})
-	go func() {
-		removePushHoldFiles(holdPath)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("releasing a hold waited for another process's reserve lock")
-	}
-	if _, err := os.Stat(holdPath); err != nil {
-		t.Fatalf("a release without the reserve lock removed the hold: %v", err)
+	t.Cleanup(func() { pushHoldWaitMax = prev })
+	for _, tc := range []struct {
+		name string
+		run  func(holdPath string) error
+		// removed is whether the hold file must be gone afterwards.
+		removed bool
+	}{
+		{"release", func(h string) error { removePushHoldFiles(h); return nil }, true},
+		{"tombstone append", func(h string) error { return appendPushReleased(h, []string{"refs/heads/x"}) }, false},
+		{"doomed-name drop", func(h string) error { return removePushHolds(h, []string{"refs/heads/x"}) }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			holdPath := mintHold(t, t.TempDir(), "refs/heads/x")
+			lockPath := filepath.Dir(holdPath) + ".reserve.lock"
+			// Its own process group: flock forks the command, and the
+			// fork inherits the locked descriptor.
+			holder := exec.Command(flockBin, lockPath, "sleep", "60")
+			holder.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := holder.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = syscall.Kill(-holder.Process.Pid, syscall.SIGKILL); _ = holder.Wait() })
+			for deadline := time.Now().Add(10 * time.Second); ; {
+				probe, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lerr := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+				_ = probe.Close()
+				if errors.Is(lerr, syscall.EWOULDBLOCK) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("flock(1) never took the reservation lock (last probe: %v)", lerr)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			done := make(chan error, 1)
+			go func() { done <- tc.run(holdPath) }()
+			select {
+			case err := <-done:
+				if !tc.removed && err == nil {
+					t.Fatal("a step without the reservation lock reported success")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the step waited for another process's reservation lock")
+			}
+			if _, err := os.Stat(holdPath); tc.removed != errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("hold file after the step: %v; want removed %v", err, tc.removed)
+			}
+		})
 	}
 }
 
