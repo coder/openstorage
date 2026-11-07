@@ -183,29 +183,9 @@ func TestUpdateHookHidesStoreErrors(t *testing.T) {
 	t.Run("verify-sig metadata open", func(t *testing.T) {
 		c := pgCanary()
 		records := hookEnv(t, c.url)
-		// A commit that no ref reaches: verify-sig must check it.
-		repo := t.TempDir()
-		for _, args := range [][]string{{"init", "-q"}, {"commit", "-q", "--allow-empty", "-m", "unsigned"}} {
-			if out, err := exec.Command("git", append(append([]string{"-C", repo}, gitIdentity...), args...)...).CombinedOutput(); err != nil {
-				t.Fatalf("git %v: %v: %s", args, err, out)
-			}
-		}
-		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		commit := strings.TrimSpace(string(out))
-		if out, err := exec.Command("git", "-C", repo, "update-ref", "-d", "HEAD").CombinedOutput(); err != nil {
-			t.Fatalf("drop the ref: %v: %s", err, out)
-		}
-		t.Setenv("GIT_DIR", filepath.Join(repo, ".git"))
-		state := filepath.Join(t.TempDir(), "state")
-		if err := os.WriteFile(state, nil, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv(EnvVerifyState, state)
+		commit := unverifiedCommit(t)
 		t.Setenv(EnvRefsPolicy, `[["refs/heads/main",["verify-sig"]]]`)
-		err = RunHook(t.Context(), []string{"update", "refs/heads/main", ref.ZeroSHA, commit})
+		err := RunHook(t.Context(), []string{"update", "refs/heads/main", ref.ZeroSHA, commit})
 		if err == nil || err.Error() != hookFailedLine {
 			t.Fatalf("update = %v; want %q", err, hookFailedLine)
 		}
@@ -215,6 +195,71 @@ func TestUpdateHookHidesStoreErrors(t *testing.T) {
 		}
 		checkHidden(t, err.Error(), got, c, "host", "user", "database")
 	})
+}
+
+// unverifiedCommit makes a commit that no ref reaches, so verify-sig must
+// check it, and points the hook at its repository and at an empty verify
+// state for one push.
+func unverifiedCommit(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"commit", "-q", "--allow-empty", "-m", "unsigned"}} {
+		if out, err := exec.Command("git", append(append([]string{"-C", repo}, gitIdentity...), args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.TrimSpace(string(out))
+	if out, err := exec.Command("git", "-C", repo, "update-ref", "-d", "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("drop the ref: %v: %s", err, out)
+	}
+	t.Setenv("GIT_DIR", filepath.Join(repo, ".git"))
+	state := filepath.Join(t.TempDir(), "state")
+	if err := os.WriteFile(state, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvVerifyState, state)
+	return commit
+}
+
+// A registered signing key that the hook cannot use: the first ref's
+// update fails with the fixed line, the hook-errors file has the cause, and
+// a later ref at the same tip gets the cached denial, which names no cause.
+func TestVerifySigKeepsTheKeyringCauseOffThePusher(t *testing.T) {
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "meta.db")
+	ms, err := meta.Open(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ms.Close()
+	if err := ms.InitSchema(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.UpsertOrgWithKeys(t.Context(), "t-org", []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.AddSigningKey(t.Context(), "t-org", "not a signing key"); err != nil {
+		t.Fatal(err)
+	}
+	records := hookEnv(t, dbURL)
+	commit := unverifiedCommit(t)
+	t.Setenv(EnvRefsPolicy, `[["*",["verify-sig"]]]`)
+	err = RunHook(t.Context(), []string{"update", "refs/heads/main", ref.ZeroSHA, commit})
+	if err == nil || err.Error() != hookFailedLine {
+		t.Fatalf("first ref = %v; want %q", err, hookFailedLine)
+	}
+	const cause = "neither an SSH public key line nor an armored PGP block"
+	if got := readRecords(t, records); !strings.Contains(got, cause) {
+		t.Fatalf("the hook-errors file lacks the keyring cause: %s", got)
+	}
+	err = RunHook(t.Context(), []string{"update", "refs/heads/other", ref.ZeroSHA, commit})
+	want := "verify-sig denied refs/heads/other at " + commit + ": signing keyring unusable (the server log has the cause)"
+	if err == nil || err.Error() != want {
+		t.Fatalf("later ref = %v; want %q", err, want)
+	}
 }
 
 // A refusal reaches the pusher whole, through wrappers too. An error that
