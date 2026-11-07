@@ -4546,38 +4546,45 @@ func (b *wedgedStatBlob) requireBounded(t *testing.T, bound time.Duration) {
 // runs under lfsProbeTimeout and fails closed (the committed registration
 // is idempotent; the retry lands on the adopted path), returning the slots
 // within a bounded window.
+//
+// Every step of the adoption runs under lfsProbeTimeout, so the test runs
+// in a synctest bubble: its fake clock does not move while the process is
+// descheduled, and a busy host cannot expire an earlier step's 50 ms
+// deadline before the recheck runs.
 func TestLFSAdoption_PostRegistrationRecheckIsBounded(t *testing.T) {
 	oldTimeout := lfsProbeTimeout
 	lfsProbeTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { lfsProbeTimeout = oldTimeout })
 
-	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
-	tok := mint(auth.ScopeGitWrite)
-	legacy := []byte("legacy blob with a wedged recheck")
-	oid := sha256Hex(legacy)
-	if err := srv.Blob.UploadFile(context.Background(), blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
-		t.Fatal(err)
-	}
-	// Stat calls on the adoption path (rounds 78+80): 1 = batch legacy
-	// probe, 2 = the verify-target canonical probe; 3 = the
-	// post-registration recheck, which wedges. (Verification and the
-	// publish sandwich go through StatFingerprint — round 77 — which
-	// this wrapper passes through.)
-	wedged := &wedgedStatBlob{BlobStore: srv.Blob, after: 3}
-	srv.Blob = wedged
+	synctest.Test(t, func(t *testing.T) {
+		srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		legacy := []byte("legacy blob with a wedged recheck")
+		oid := sha256Hex(legacy)
+		if err := srv.Blob.UploadFile(context.Background(), blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
+			t.Fatal(err)
+		}
+		// Stat calls on the adoption path (rounds 78+80): 1 = batch legacy
+		// probe, 2 = the verify-target canonical probe; 3 = the
+		// post-registration recheck, which wedges. (Verification and the
+		// publish sandwich go through StatFingerprint — round 77 — which
+		// this wrapper passes through.)
+		wedged := &wedgedStatBlob{BlobStore: srv.Blob, after: 3}
+		srv.Blob = wedged
 
-	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
-		batchBody("upload", oid, int64(len(legacy)))))
-	if resp.Objects[0].Error == nil {
-		t.Fatalf("wedged-recheck adoption reported success: %+v", resp.Objects[0])
-	}
-	wedged.requireBounded(t, lfsProbeTimeout)
-	srv.lfsStagingMu.Lock()
-	ops := srv.lfsStagingOps
-	srv.lfsStagingMu.Unlock()
-	if ops != 0 {
-		t.Fatalf("op slots after wedged recheck = %d, want 0 (slot leaked)", ops)
-	}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, int64(len(legacy)))))
+		if resp.Objects[0].Error == nil {
+			t.Fatalf("wedged-recheck adoption reported success: %+v", resp.Objects[0])
+		}
+		wedged.requireBounded(t, lfsProbeTimeout)
+		srv.lfsStagingMu.Lock()
+		ops := srv.lfsStagingOps
+		srv.lfsStagingMu.Unlock()
+		if ops != 0 {
+			t.Fatalf("op slots after wedged recheck = %d, want 0 (slot leaked)", ops)
+		}
+	})
 }
 
 // TestLFSPut_ProbeIsDeadlineBound (Codex round 25): the dedup probe holds
