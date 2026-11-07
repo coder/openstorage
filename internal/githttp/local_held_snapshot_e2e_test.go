@@ -81,7 +81,6 @@ func TestLocalForwardHeldStaleRefRestores(t *testing.T) {
 		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
 			return repo, base == id
 		},
-		StrictSyncFetch: true, // as serve sets it on the local schedule
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
@@ -185,13 +184,11 @@ func TestLocalForwardHeldStaleRefRestores(t *testing.T) {
 	}
 }
 
-// TestServeStrictSyncFetchOnLocalSchedule: serve turns on StrictSyncFetch
-// for the local schedule only. With a push holding main while the cache
-// lags the authority, a fetch whose token carries a sync claim (a push
-// run's loopback fetch) gets 423 Locked on SQLite and S3WAL; PostgreSQL
-// leaves strict fetching off, so its sync-claim fetch keeps reading. An
-// ordinary fetch reads the cached value on every backend.
-func TestServeStrictSyncFetchOnLocalSchedule(t *testing.T) {
+// TestServeStrictSyncFetch: with a push holding main while the cache lags
+// the authority, a served fetch whose token carries a sync claim (a push
+// run's loopback fetch) gets 423 Locked on every backend. An ordinary
+// fetch reads the cached value.
+func TestServeStrictSyncFetch(t *testing.T) {
 	ctx := t.Context()
 	db, blobs := privateStores(t, t.TempDir())
 	cache := t.TempDir()
@@ -229,11 +226,7 @@ func TestServeStrictSyncFetchOnLocalSchedule(t *testing.T) {
 	syncClaims := testClaims(id, "git:read,git:write")
 	syncClaims.SyncClaim = "holder"
 	out, err := tryGit("", "ls-remote", remoteURL(node, id, mintWith(t, orgES256Key, "ES256", syncClaims)), "refs/heads/main")
-	if testBackend == backendPG {
-		if err != nil {
-			t.Fatalf("PostgreSQL sync-claim fetch failed: %v\n%s", err, out)
-		}
-	} else if err == nil || !strings.Contains(out, "423") {
+	if err == nil || !strings.Contains(out, "423") {
 		t.Fatalf("sync-claim fetch of a stale held ref = (%v)\n%s\nwant 423 Locked", err, out)
 	}
 	if got := lsRemoteSHA(t, "", remoteURL(node, id, token), "refs/heads/main"); got != a {

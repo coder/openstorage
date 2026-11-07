@@ -716,6 +716,31 @@ func TestWriteRefsNotes(t *testing.T) {
 			wrefProblem(t, resp, body)
 		})
 
+		// Only git's exit 1 says that the object has no note.
+		for _, how := range []string{"128", "kill"} {
+			t.Run("git "+how+" on the note lookup is 500, not 404", func(t *testing.T) {
+				ref := "showfail-" + how
+				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+					map[string]any{"sha": fx.c1, "note": "kept", "ref": ref})
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("add: status = %d body %v", resp.StatusCode, body)
+				}
+				gitFailsOnArg(t, "show", how)
+				resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
+					map[string]any{"sha": fx.c1, "ref": ref})
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("delete: status = %d body %v, want 500", resp.StatusCode, body)
+				}
+				// An add cannot tell whether a note exists either: 500, not
+				// 409 and not an add over it.
+				resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+					map[string]any{"sha": fx.c1, "note": "again", "ref": ref})
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("add: status = %d body %v, want 500", resp.StatusCode, body)
+				}
+			})
+		}
+
 		t.Run("invalid input", func(t *testing.T) {
 			// Each body failure names the member the request sent in
 			// invalid_params ("name reason").
@@ -759,6 +784,18 @@ func TestWriteRefsNotes(t *testing.T) {
 				t.Fatalf("unknown object: code = %v, want ref_not_found", body["code"])
 			}
 		})
+
+		// Only git's exit 1 says that the target object is missing.
+		for _, how := range []string{"128", "kill"} {
+			t.Run("git "+how+" on the target object is 500, not 404", func(t *testing.T) {
+				gitFailsOnArg(t, fx.c2+"^{object}", how)
+				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+					map[string]any{"sha": fx.c2, "note": "x", "ref": "gitfail"})
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("status = %d body %v, want 500", resp.StatusCode, body)
+				}
+			})
+		}
 
 		t.Run("author is recorded", func(t *testing.T) {
 			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,

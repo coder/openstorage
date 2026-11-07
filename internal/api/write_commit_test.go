@@ -1351,6 +1351,44 @@ func wctFakeGit(t *testing.T, repoPath string) (sc *wcScratch, patch string, set
 	}
 }
 
+// gitFailsOnArgStderr is what gitFailsOnArg's git prints: a server-side
+// read error, which no response may echo.
+const gitFailsOnArgStderr = "fatal: unable to read 1111111111111111111111111111111111111111"
+
+// gitFailsOnArg puts a git first on PATH that runs the real git, except
+// that a call with the argument arg prints gitFailsOnArgStderr and fails:
+// how is an exit status, or "kill" for a git that dies of SIGKILL.
+func gitFailsOnArg(t *testing.T, arg, how string) {
+	t.Helper()
+	gitFailsOnArgWith(t, arg, how, gitFailsOnArgStderr)
+}
+
+// gitFailsOnArgWith is gitFailsOnArg with stderr as git's message.
+func gitFailsOnArgWith(t *testing.T, arg, how, stderr string) {
+	t.Helper()
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	argFile := filepath.Join(bin, "arg")
+	if err := os.WriteFile(argFile, []byte(arg+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fail := "exit " + how
+	if how == "kill" {
+		fail = "kill -KILL $$"
+	}
+	// read, [ and kill are shell builtins: the server runs some git
+	// children with an environment that has no PATH.
+	fail = "echo '" + strings.ReplaceAll(stderr, "'", `'\''`) + "' >&2; " + fail
+	script := fmt.Sprintf("#!/bin/sh\nread -r fail < %q\nfor a in \"$@\"; do [ \"$a\" = \"$fail\" ] && { %s; }; done\nexec %q \"$@\"\n", argFile, fail, real)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // TestApplyPatchServerFailure: git's stderr that names the server's scratch
 // directory or the cached repository, or that has a fatal line, is a failure
 // of the server's git whatever other lines it holds, and the same lines
@@ -1825,6 +1863,21 @@ func TestRestoreCommit(t *testing.T) {
 			})
 			wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
 		})
+
+		// Only git's exit 1 says that the target names no commit.
+		for _, how := range []string{"128", "kill"} {
+			t.Run("git "+how+" on the target is 500, not 404", func(t *testing.T) {
+				gitFailsOnArg(t, c1.Commit.CommitSHA+"^{tree}", how)
+				resp, body := restore(map[string]any{
+					"target_branch":     "main",
+					"target_commit_sha": c1.Commit.CommitSHA,
+					"author":            wctAuthor,
+				})
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("status = %d, want 500 (body %s)", resp.StatusCode, body)
+				}
+			})
+		}
 
 		t.Run("unborn branch is 404", func(t *testing.T) {
 			resp, body := restore(map[string]any{
