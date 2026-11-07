@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"regexp"
 	"strings"
 
@@ -91,23 +92,25 @@ var fullHexRe = regexp.MustCompile(`\A[0-9a-fA-F]{40}\z`)
 //
 // Everything unresolvable wraps ErrNotFound — including the empty spec and
 // the unborn-branch case, where the DB knows no such ref yet (invariant 3:
-// handlers map it to 404).
+// handlers map it to 404). Only git's own negative answer counts as
+// unresolvable (gitSaidNo); any other git failure is returned as is.
 func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (string, error) {
 	assertf(repoPath != "", "ResolveRef: empty repoPath")
 	if spec == "" {
 		return "", fmt.Errorf("resolve empty ref: %w", ErrNotFound)
 	}
-	// limitErr records a resource-limit or cancellation outcome: those must
+	// failErr records a git failure that is not git's answer (a resource
+	// limit, a cancellation, a kill, an exec.ErrWaitDelay): those must
 	// surface as errors, never as "not found".
-	var limitErr error
+	var failErr error
 	// Ref candidates are built only from well-formed ref names
 	// (check-ref-format): git forbids the rev-expression metacharacters
 	// (~ ^ : @{ ...) in refnames, so a validated candidate cannot smuggle
 	// an expression like "main~1" through the rev-parse below.
 	validRefName := func(name string) bool {
 		_, err := runGit(ctx, Light, repoPath, "check-ref-format", name)
-		if err != nil && limitErr == nil && (IsBudgetError(err) || ctx.Err() != nil) {
-			limitErr = err
+		if err != nil && failErr == nil && !gitSaidNo(err) {
+			failErr = err
 		}
 		return err == nil
 	}
@@ -132,15 +135,15 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 	if hexRevRe.MatchString(hex) {
 		candidates = append(candidates, hex)
 	}
-	if limitErr != nil {
-		return "", limitErr
+	if failErr != nil {
+		return "", failErr
 	}
 	for _, cand := range candidates {
 		// --end-of-options stops a hostile spec from being parsed as an
 		// option; ^{commit} peels annotated tags and rejects non-commits.
 		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand+"^{commit}")
 		if err != nil {
-			if IsBudgetError(err) || ctx.Err() != nil {
+			if !gitSaidNo(err) {
 				return "", err
 			}
 			continue
@@ -152,4 +155,16 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 		return sha, nil
 	}
 	return "", fmt.Errorf("resolve ref %q: %w", spec, ErrNotFound)
+}
+
+// gitSaidNo reports whether err is git's own negative answer: the child
+// ran to the end and exited 1. check-ref-format exits 1 for a name that is
+// not a valid ref name, and rev-parse --verify --quiet for one that names
+// no commit (missing, ambiguous, or not a commit). Any other failure says
+// nothing about the ref: a resource limit or cancellation (gitread limit
+// errors never wrap *exec.ExitError), a kill, exec.ErrWaitDelay after a
+// long stall, or a fatal exit 128.
+func gitSaidNo(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
