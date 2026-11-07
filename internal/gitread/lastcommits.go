@@ -142,7 +142,9 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 	// lastCommitWindow requests ahead, plus the one it waits for.
 	d := &diffReader{index: w.index, sections: make(chan diffSection, lastCommitWindow+1)}
 	args := []string{"diff-tree", "--stdin", "--root", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none"}
-	if spec := commonPathspec(paths); spec != "" {
+	// The pathspec only narrows the work, so a directory too long for one
+	// argument is left out: the walk matches paths exactly either way.
+	if spec := commonPathspec(paths); spec != "" && len(spec) <= maxPathspecBytes {
 		args = append(args, "--", ":(literal)"+spec)
 	}
 	ran := make(chan error, 1)
@@ -175,6 +177,11 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 	assertf(w.left == 0, "LastCommits: %d paths unresolved after the walk", w.left)
 	return w.last, w.order, nil
 }
+
+// maxPathspecBytes is the longest path that fits one git argument behind
+// ":(literal)": Linux takes 128 KiB per argument, counting the terminating
+// NUL (gitlimit.ErrArgTooLong).
+const maxPathspecBytes = 128<<10 - 1 - len(":(literal)")
 
 // commonPathspec returns the deepest directory that contains every path
 // (the path itself when there is one), or "" for the whole tree. It only

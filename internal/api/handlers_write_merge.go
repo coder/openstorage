@@ -144,6 +144,10 @@ func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, m
 // (docs/reference/http-api.md: raw error strings never leak onto the wire).
 func (s *server) wmInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wmInternal: nil error or empty op")
+	// A value too long for git (or with a NUL byte) is the client's, not ours.
+	if s.writeGitLimitErr(w, r, op, err) {
+		return
+	}
 	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
@@ -317,30 +321,9 @@ func wmSourceContains(ctx context.Context, sc *wcScratch, pin, sourceTip string)
 // Committer defaults are the caller's concern; parents order is
 // [target, source] for merge commits and [target] for squash.
 func wmCommitTree(ctx context.Context, sc *wcScratch, tree string, parents []string, message string, author, committer wcAuthor) (string, error) {
-	assertf(ref.ValidSHA(tree), "wmCommitTree: malformed tree %q", tree)
 	assertf(len(parents) >= 1, "wmCommitTree: no parents")
 	assertf(message != "", "wmCommitTree: empty message")
-	env := []string{
-		"GIT_AUTHOR_NAME=" + author.Name,
-		"GIT_AUTHOR_EMAIL=" + author.Email,
-		"GIT_COMMITTER_NAME=" + committer.Name,
-		"GIT_COMMITTER_EMAIL=" + committer.Email,
-	}
-	args := []string{"commit-tree", "-m", message}
-	for _, p := range parents {
-		assertf(ref.ValidSHA(p), "wmCommitTree: malformed parent %q", p)
-		args = append(args, "-p", p)
-	}
-	args = append(args, tree)
-	out, err := sc.git(ctx, nil, env, args...)
-	if err != nil {
-		return "", err
-	}
-	sha := strings.TrimSpace(out)
-	if !ref.ValidSHA(sha) {
-		return "", fmt.Errorf("commit-tree emitted %q", sha)
-	}
-	return sha, nil
+	return sc.writeCommit(ctx, tree, parents, message, author, committer)
 }
 
 // wmPromotedCommits counts the commits newly reachable from the persistent
@@ -353,7 +336,10 @@ func wmPromotedCommits(ctx context.Context, sc *wcScratch, tips map[string]strin
 		return 0, nil
 	}
 	assertf(ref.ValidSHA(newSHA), "wmPromotedCommits: malformed sha %q", newSHA)
-	args := []string{"rev-list", "--count", newSHA, "--not"}
+	// The tips go on stdin: a repository can hold more branches than one
+	// command line takes.
+	var revs strings.Builder
+	revs.WriteString(newSHA + "\n")
 	seen := map[string]bool{}
 	for name, tip := range tips {
 		if strings.HasPrefix(name, auth.EphemeralNamespacePrefix) {
@@ -361,10 +347,10 @@ func wmPromotedCommits(ctx context.Context, sc *wcScratch, tips map[string]strin
 		}
 		if !seen[tip] {
 			seen[tip] = true
-			args = append(args, tip)
+			revs.WriteString("^" + tip + "\n")
 		}
 	}
-	out, err := sc.git(ctx, nil, nil, args...)
+	out, err := sc.git(ctx, strings.NewReader(revs.String()), nil, "rev-list", "--count", "--stdin")
 	if err != nil {
 		return 0, err
 	}
@@ -497,6 +483,9 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 			return newFieldError("expected_source_sha", "must be a 40-hex sha", "expected_source_sha must be a 40-hex sha")
 		}
 		req.sourcePin = lowerFullSHA(pin)
+	}
+	if err := wcValidateCommitMessage(req.CommitMessage); err != nil {
+		return err
 	}
 	if req.Author != nil {
 		if err := wcValidateAuthor("author", *req.Author); err != nil {

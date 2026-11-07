@@ -215,7 +215,9 @@ func (w *gitReadWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 // reports whether err was one. Capacity is transient (503 + Retry-After);
 // the time budget is 503 without Retry-After, because a page that needs
 // more git time fails the same way on retry; memory, output and blob-size
-// limits are properties of the requested data (422).
+// limits are properties of the requested data (422), and so is a request
+// value too long for one git argument (gitlimit.ErrArgTooLong). A value with
+// a NUL byte is a bad request (400, gitlimit.ErrArgNUL).
 func (s *server) writeGitLimitErr(w http.ResponseWriter, r *http.Request, op string, err error) bool {
 	var status int
 	var msg string
@@ -229,6 +231,10 @@ func (s *server) writeGitLimitErr(w http.ResponseWriter, r *http.Request, op str
 		status, msg = http.StatusUnprocessableEntity, "history or object too large for the server's git memory limit"
 	case errors.Is(err, gitread.ErrOutputLimit):
 		status, msg = http.StatusUnprocessableEntity, "result too large for the server's git output limit; narrow the request"
+	case errors.Is(err, gitlimit.ErrArgNUL):
+		status, msg = http.StatusBadRequest, "a value in the request holds a NUL byte, which git cannot take"
+	case errors.Is(err, gitlimit.ErrArgTooLong):
+		status, msg = http.StatusUnprocessableEntity, "a value in the request is too long for the server's git (about 128 KiB); shorten it"
 	case errors.Is(err, gitread.ErrBlobTooLarge):
 		limit := gitread.MaxBlobBytes
 		if b := gitread.BudgetFrom(r.Context()); b != nil {
