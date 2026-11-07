@@ -1043,6 +1043,15 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // 2b: GET+HEAD /repos/file
 
+// pathLeavesRepo reports whether a request path names a place outside the
+// repository: it starts with "/", or a ".." climbs above the root after
+// path.Clean. git refuses such a path with a fatal exit (128), which is
+// the client's input, not a failure of the server's git.
+func pathLeavesRepo(p string) bool {
+	c := path.Clean(p)
+	return strings.HasPrefix(p, "/") || c == ".." || strings.HasPrefix(c, "../")
+}
+
 // handleGetFile implements GET+HEAD /api/v1/repos/file: conditional and
 // range blob streaming. The blob is staged to a request-scoped temp file
 // and served via http.ServeContent, which owns the RFC 9110 precondition
@@ -1058,6 +1067,10 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 	filePath := q.Get("path")
 	if filePath == "" {
 		writeErr(w, http.StatusBadRequest, "missing path")
+		return
+	}
+	if pathLeavesRepo(filePath) {
+		writeErr(w, http.StatusBadRequest, "path is outside the repository")
 		return
 	}
 	// docs/reference/http-api.md lists ephemeral_base on this endpoint; with a single ref to
