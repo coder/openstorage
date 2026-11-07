@@ -17,7 +17,7 @@ Lenient Git LFS pointer decoder plus a bounded walk that runs three `git` subpro
 - Every git call uses `--no-replace-objects`, and rev-list runs unfiltered so every object is charged [scan.go:ReachableLFSOIDs]
 
 ## Side Effects
-- Runs `git rev-list --objects --no-object-names --all`, `git cat-file --batch-check`, and `git cat-file --batch` in repoPath, each holding the repository's `gitlimit` lease until it exits [scan.go:ReachableLFSOIDs]
+- Runs `git rev-list --objects --no-object-names --all`, `git cat-file --batch-check`, and `git cat-file --batch` in repoPath, each holding the repository's `gitlimit` lease until it exits [scan.go:ReachableLFSOIDs] [lease_test.go:TestReachableLFSOIDsLeaseFollowsEveryStage]
 - Starts three goroutines through errgroup connected by pipes, kills started subprocesses on a later start failure, and reaps all with deferred Wait [scan.go:ReachableLFSOIDs]
 - Calls `unix.Prlimit` on each subprocess PID on Linux; no-op elsewhere [memlimit_linux.go:limitGitHeap] [memlimit_other.go:limitGitHeap]
 
