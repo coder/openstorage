@@ -221,6 +221,18 @@ func TestPreReceiveHidesStepErrors(t *testing.T) {
 		err := preReceiveCase{}.run(t)
 		checkFailedStep(t, err, readRecords(t, records), "pre-receive", "pre-receive: authority D/F probe", canary)
 	})
+	t.Run("post-reservation authority D/F probe", func(t *testing.T) {
+		// A refs view with one row per pack, whose name is a bad JSON
+		// path error that names the canary: the first probe runs before
+		// the pack is registered and reads no row, the probe after the
+		// reservation reads the registered pack's row and fails.
+		canary := canaryTable()
+		records := hookEnv(t, canarySQLite(t, "DROP TABLE refs",
+			"CREATE VIEW refs AS SELECT repo, json_extract('{}', '"+canary+"' || substr(id, 1, 0)) AS name, s3_key AS sha, created_at FROM packs"))
+		blobDir(t)
+		err := preReceiveCase{pack: true}.run(t)
+		checkFailedStep(t, err, readRecords(t, records), "pre-receive", "pre-receive: post-reservation authority D/F probe", canary)
+	})
 	t.Run("verdict record", func(t *testing.T) {
 		canary := canaryTable()
 		records := hookEnv(t, canarySQLite(t))
@@ -250,6 +262,27 @@ func TestPreReceiveHidesStepErrors(t *testing.T) {
 		t.Setenv("OPENSTORAGE_S3_URL", "file://"+filepath.Join(dir, canary, "blobs"))
 		err := preReceiveCase{pack: true}.run(t)
 		checkFailedStep(t, err, readRecords(t, records), "pre-receive", "create blob dir", canary)
+	})
+	t.Run("blob stat", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads a directory without permissions")
+		}
+		// A blob directory with a canary name and no permissions: the
+		// Stat of the pack's key fails with a permission error that names
+		// the path, not with ErrNotFound.
+		records := hookEnv(t, canarySQLite(t))
+		canary := canaryTable()
+		dir := filepath.Join(t.TempDir(), canary)
+		if err := os.Mkdir(dir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		t.Setenv("OPENSTORAGE_S3_URL", "file://"+dir)
+		var key string
+		err := preReceiveCase{pack: true, beforeHook: func(_ *testing.T, packID string) {
+			key = blob.PackKey("t-refusal", packID)
+		}}.run(t)
+		checkFailedStep(t, err, readRecords(t, records), "pre-receive", "pre-receive: stat "+key+":", canary)
 	})
 	t.Run("registry probe", func(t *testing.T) {
 		canary := canaryTable()
