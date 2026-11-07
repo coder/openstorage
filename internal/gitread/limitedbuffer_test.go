@@ -33,14 +33,15 @@ func allocated(f func()) uint64 {
 	return after.TotalAlloc - before.TotalAlloc
 }
 
-// maxChunks bounds the chunks of an output of up to 48 MiB. A chunk is a
-// quarter of what is held and at least 64 bytes: 4 chunks of 64 bytes, then
-// growth by 1.25 times from 256 bytes to 32 MiB (about 53 chunks), then chunks
-// of 8 MiB. The tests below hold 56 chunks (one byte at a time, 25 MiB), 59
-// (64 bytes at a time, 48 MiB) and 31 (32 KiB at a time, 48 MiB). A buffer
-// that starts a chunk for every write, or one that does not count what it
-// holds, or one that grows by an eighth, is far over 80 at once, and the
-// checks fail on the write that crosses it, not at the test's timeout.
+// maxChunks bounds the chunks of an output of up to 64 MiB, the default
+// output allowance. A chunk is a quarter of what is held and at least 64
+// bytes: 4 chunks of 64 bytes, then growth by 1.25 times from 256 bytes to
+// 32 MiB (about 53 chunks), then chunks of 8 MiB. The most is 61 chunks, for
+// writes of 1 or 64 bytes up to 64 MiB. The tests below reach 56 (one byte at
+// a time, 24 MiB) and 31 (32 KiB at a time, 48 MiB). A buffer that starts a
+// chunk for every write, or one that does not count what it holds, or one
+// that grows by an eighth, is far over 80 at once, and the checks fail on the
+// write that crosses it, not at the test's timeout.
 const maxChunks = 80
 
 // The chunks join into what was written, whatever the sizes of the writes
@@ -157,7 +158,8 @@ func TestLimitedBufferAllocatesTwiceItsOutput(t *testing.T) {
 }
 
 // A small output, as most git calls print, costs a few allocations: the
-// chunk, the list of chunks and the string.
+// chunk, the list of chunks and the string. It costs the same when it comes in
+// pieces, because the first chunk holds 64 bytes.
 func TestLimitedBufferSmallOutputAllocations(t *testing.T) {
 	line := []byte("0123456789012345678901234567890123456789\n")
 	var s string
@@ -169,6 +171,16 @@ func TestLimitedBufferSmallOutputAllocations(t *testing.T) {
 	if n := testing.AllocsPerRun(100, call); n > 3 {
 		t.Fatalf("%v allocations for a 41-byte output, want at most 3", n)
 	}
+	inPieces := func() {
+		var l limitedBuffer
+		for i := range line {
+			_, _ = l.Write(line[i : i+1])
+		}
+		s = l.String()
+	}
+	if n := testing.AllocsPerRun(100, inPieces); n > 3 {
+		t.Fatalf("%v allocations for a 41-byte output written a byte at a time, want at most 3", n)
+	}
 	if n := allocated(func() {
 		for range 100 {
 			call()
@@ -178,6 +190,35 @@ func TestLimitedBufferSmallOutputAllocations(t *testing.T) {
 	}
 	if s != string(line) {
 		t.Fatalf("held %q", s)
+	}
+}
+
+// A large output costs one chunk per quarter of what is held, and the list of
+// them: 20 allocations for 1 MiB and 33 for 16 MiB, written in 32 KiB pieces
+// as the pipe delivers it. A chunk smaller than its write splits the write,
+// and the same outputs then cost 50 and 62.
+func TestLimitedBufferAllocationsAtSize(t *testing.T) {
+	for _, c := range []struct {
+		size  int
+		limit float64
+	}{{1 << 20, 30}, {16 << 20, 45}} {
+		t.Run(strconv.Itoa(c.size), func(t *testing.T) {
+			data := output(c.size)
+			var s string
+			n := testing.AllocsPerRun(3, func() {
+				var l limitedBuffer
+				for rest := data; len(rest) > 0; rest = rest[min(32<<10, len(rest)):] {
+					_, _ = l.Write(rest[:min(32<<10, len(rest))])
+				}
+				s = l.String()
+			})
+			if n > c.limit {
+				t.Fatalf("%v allocations for %d bytes written in 32 KiB pieces, want at most %v", n, c.size, c.limit)
+			}
+			if len(s) != c.size {
+				t.Fatalf("held %d bytes, want %d", len(s), c.size)
+			}
+		})
 	}
 }
 
