@@ -199,7 +199,7 @@ func TestRiverRescuesOnlyOrphansPastTheirKindsDeadline(t *testing.T) {
 	pgURL := livenessPG(t, ctx)
 	migrateRiver(t, pgURL)
 
-	ins, err := NewRiverInsertOnly(ctx, pgURL)
+	ins, err := NewRiverInsertOnly(ctx, pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiverInsertOnly: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestRiverRescuesASweepOrphanedPastItsRescueHorizon(t *testing.T) {
 	ctx := context.Background()
 	pgURL := livenessPG(t, ctx)
 	migrateRiver(t, pgURL)
-	ins, err := NewRiverInsertOnly(ctx, pgURL)
+	ins, err := NewRiverInsertOnly(ctx, pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiverInsertOnly: %v", err)
 	}

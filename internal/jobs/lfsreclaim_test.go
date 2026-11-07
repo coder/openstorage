@@ -1,9 +1,11 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -622,6 +624,94 @@ func TestLFSReclaim_ARunDoesNotOverlapAnotherOnTheSameReclaimer(t *testing.T) {
 	}
 	if _, err := r.Run(ctx); err != nil || walks.Load() != 2 {
 		t.Fatalf("run after the first ended: walks = %d, err = %v, want it to run", walks.Load(), err)
+	}
+}
+
+// reclaimOverlapWorld is a registered LFS object on a reclaimer whose walk the
+// test controls. The reap watermark is deleted, so a pass with deletes on
+// starts report-only (reapStale).
+func reclaimOverlapWorld(t *testing.T, walk LFSWalkFunc, logs io.Writer) *LFSReclaimer {
+	t.Helper()
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "overlap-repo"
+	key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("88", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	if err := reg.DeleteJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap); err != nil {
+		t.Fatal(err)
+	}
+	instantHydrate := func(context.Context, string, string) (string, error) { return t.TempDir(), nil }
+	return NewLFSReclaimer(reg, instantHydrate, walk, alwaysMain,
+		time.Hour, 1_000, true, true, slog.New(slog.NewTextHandler(logs, nil)))
+}
+
+// A run that ends by a panic leaves the reclaimer free: the guard is released
+// by a defer, so the next run is not turned away for the life of the process.
+func TestLFSReclaim_ARunThatPanicsDoesNotBlockTheNextOne(t *testing.T) {
+	var walks atomic.Int32
+	walk := func(context.Context, string, int64) (map[string]struct{}, int64, error) {
+		if walks.Add(1) == 1 {
+			panic("simulated walk crash")
+		}
+		return map[string]struct{}{}, 0, nil
+	}
+	r := reclaimOverlapWorld(t, walk, io.Discard)
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("the walk's panic did not reach the caller")
+			}
+		}()
+		_, _ = r.Run(context.Background())
+	}()
+	if _, err := r.Run(context.Background()); err != nil || walks.Load() != 2 {
+		t.Fatalf("run after the panic: walks = %d, err = %v, want it to run", walks.Load(), err)
+	}
+}
+
+// A run that is turned away touches nothing of the pass in progress: the
+// guard comes before the writes that reset the pass's advisory verdicts, and
+// the skip logs a warning, so the overlap shows in the log.
+func TestLFSReclaim_ASkippedRunLeavesThePassItsVerdictsAndWarns(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var walks atomic.Int32
+	walk := func(context.Context, string, int64) (map[string]struct{}, int64, error) {
+		if walks.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return map[string]struct{}{}, 0, nil
+	}
+	var logs bytes.Buffer
+	r := reclaimOverlapWorld(t, walk, &logs)
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := r.Run(context.Background())
+		first <- err
+	}()
+	<-entered
+	if !r.reapStale {
+		t.Fatal("the first run did not demote itself for the missing watermark: the test has no verdict to protect")
+	}
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("overlapping run: %v", err)
+	}
+	if !r.reapStale {
+		t.Error("the skipped run reset the pass's reapStale verdict")
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if !strings.Contains(logs.String(), `level=WARN msg="lfs reclaim: a pass is already running`) {
+		t.Errorf("the skipped run did not warn:\n%s", logs.String())
 	}
 }
 

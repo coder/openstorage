@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/coder/openstorage/internal/meta"
 )
 
 // TestServeDrainWindowIgnoresRunDrain (issue #473 item 2): a request in
@@ -19,19 +21,23 @@ import (
 // not a scheduled sync run holds the run drain for its full 5+2 seconds.
 // The window ends at a fixed deadline (8 of the 10 seconds), so the run
 // drain, which serves requests while it waits, takes nothing from it. The
-// request below finishes right after the listener closes, which is the
-// moment the HTTP drain starts. The drain must complete without `drain
-// incomplete` and without stopping any git process.
+// request below finishes after the listener closes, which is the moment the
+// HTTP drain starts, and no sooner than finishAt after SIGTERM. The drain
+// must complete without `drain incomplete` and without stopping any git
+// process. Both cases wait for the repo's first sync run to settle first, so
+// that run does not hold the run drain.
 func TestServeDrainWindowIgnoresRunDrain(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		heldRun    bool
 		wantListen time.Duration // the listener closes no sooner than this after SIGTERM
-		afterClose time.Duration // the request finishes this long after the listener closes
+		finishAt   time.Duration // the request finishes no sooner than this after SIGTERM
 	}{
 		// No run drain: the HTTP drain starts at once and its window
-		// lasts until 8 seconds, far past afterClose.
-		{name: "idle", afterClose: 4 * time.Second},
+		// lasts until 8 seconds, far past finishAt. finishAt counts from
+		// SIGTERM, so a late listener close or a late poll does not move
+		// the request toward the deadline.
+		{name: "idle", finishAt: 4 * time.Second},
 		// The run drain takes 5 seconds and the run another 2 to restore:
 		// the HTTP drain starts at 7 seconds, with 1 second left.
 		{name: "run drain holds its whole wait", heldRun: true, wantListen: 5 * time.Second},
@@ -48,7 +54,21 @@ func TestServeDrainWindowIgnoresRunDrain(t *testing.T) {
 				t.Fatalf("start node: %v", err)
 			}
 			t.Cleanup(node.stop)
+			ms, err := meta.Open(t.Context(), dbURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ms.Close)
 			repo := createSyncedRepo(t, node, up, "drain-window")
+			for deadline := time.Now().Add(60 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+				row, err := ms.GetRepoUpstream(t.Context(), repo)
+				if err == nil && row.RunCount >= 1 && !row.Syncing && !row.SyncPending {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the first sync run never settled: row %+v, err %v", row, err)
+				}
+			}
 			token := mintTestToken(t, repo, "git:write", "")
 			if tc.heldRun {
 				up.commitAndPublish(t, "two")
@@ -81,7 +101,7 @@ func TestServeDrainWindowIgnoresRunDrain(t *testing.T) {
 			if closedAfter < tc.wantListen {
 				t.Fatalf("listener closed %v after SIGTERM, want at least %v (the run drain ended early)", closedAfter, tc.wantListen)
 			}
-			time.Sleep(tc.afterClose)
+			time.Sleep(time.Until(sigterm.Add(tc.finishAt)))
 			fmt.Fprint(conn, "}")
 			line, err := bufio.NewReader(conn).ReadString('\n')
 			if err != nil || !strings.Contains(line, " 202 ") {

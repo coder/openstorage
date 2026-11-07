@@ -12,9 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"sync"
@@ -511,18 +511,18 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 	// claim fence refuses it when the store is down), and a caller whose
 	// token may not forward.
 	//
-	// Neither the log line nor the refusal carries err: git relays the
-	// hook's stderr and its error to the pusher, and a store error names
-	// the database host, user and name, or the S3 endpoint. serve logs a
-	// store error only when its own connection fails, so when only the
-	// hook's connection fails, no log carries the cause.
-	disabled := func(stage string, _ error) func() {
+	// The refusal carries no err: git relays the hook's stderr and its
+	// error to the pusher, and a store error names the database host,
+	// user and name, or the S3 endpoint. The log line carries err, and the
+	// hook's log handler writes it only to serve's hook-errors file
+	// (slogForHook), so the operator sees the cause.
+	disabled := func(stage string, err error) func() {
 		cleanup()
 		if envconfig.Getenv(githttp.EnvSyncClaim) != "" || hookCallerDeniedForward() {
-			logger.Error("hook eventing disabled: " + stage)
+			logger.Error("hook eventing disabled: "+stage, "err", err)
 			return func() {}
 		}
-		logger.Error("hook eventing unavailable: " + stage + "; refusing only updates that would record forward intent")
+		logger.Error("hook eventing unavailable: "+stage+"; refusing only updates that could record forward intent", "err", err)
 		refusal := errors.New("refusing the ref update: hook eventing unavailable (" + stage + "); push again later")
 		githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
 			return intentlessRefStore{RefStore: ref.IdempotentCAS{RefStore: st}, refusal: refusal}, nil
@@ -652,8 +652,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			if errors.As(err, &fv) || errors.As(err, &cd) {
 				return nil, fmt.Errorf("refusing the ref update: %w", err)
 			}
-			// No err: it reaches the pusher (see disabled).
-			logger.Warn("hook eventing: metadata format check failed; accepting the update")
+			logger.Warn("hook eventing: metadata format check failed; accepting the update", "err", err)
 		}
 		return newEvents(st, events.RefStoreOptions{
 			Org:             org,
@@ -670,22 +669,27 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 
 // newHookRiver builds the hook's River client. Tests replace it to reach
 // the wiring's River failure.
-var newHookRiver = jobs.NewRiverInsertOnly
+var newHookRiver = func(ctx context.Context, pgURL string) (*jobs.River, error) {
+	// River's lines carry store errors as strings: write them only to
+	// serve's hook-errors file, never to the stdout git relays.
+	return jobs.NewRiverInsertOnly(ctx, pgURL, slog.New(githttp.NewHookLogHandler(io.Discard, nil)))
+}
 
 // errHookIntent is BeforeCAS's refusal when the hook cannot record a push's
 // forward intent. events.RefStore prefixes "refusing the ref update".
 var errHookIntent = errors.New("hook could not record the forward intent; push again later")
 
 // quietBeforeCAS refuses with errHookIntent instead of beforeCAS's own
-// error, which can name the store: the pusher sees it (see disabled in
-// wireHookEventing). A nil step stays nil.
+// error, which can name the store: the pusher sees the refusal (see
+// disabled in wireHookEventing). It logs the error for the operator. A nil
+// step stays nil.
 func quietBeforeCAS(beforeCAS func(ctx context.Context, repoID string) error, logger *slog.Logger) func(ctx context.Context, repoID string) error {
 	if beforeCAS == nil {
 		return nil
 	}
 	return func(ctx context.Context, repoID string) error {
-		if beforeCAS(ctx, repoID) != nil {
-			logger.Error("hook refuses ref updates: record forward intent")
+		if err := beforeCAS(ctx, repoID); err != nil {
+			logger.Error("hook refuses ref updates: record forward intent", "err", err)
 			return errHookIntent
 		}
 		return nil
@@ -750,8 +754,21 @@ func (h *hookUpstreamRow) GetRepoUpstream(ctx context.Context, repoID string) (m
 	return h.up, h.err
 }
 
-// slogForHook builds the hook subprocess logger (stderr reaches the git
-// client prefixed with "remote:", so keep it warn-level).
-func slogForHook() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+// slogForHook builds the hook subprocess logger. Its stderr reaches the git
+// client prefixed with "remote:", so it is warn-level and carries no error
+// values: githttp.NewHookLogHandler writes those only to serve's
+// hook-errors file.
+func slogForHook(stderr io.Writer) *slog.Logger {
+	return slog.New(githttp.NewHookLogHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// runHook is the `openstorage hook` command. Its logger (slogForHook) is
+// also the process's default logger, so the store packages' own slog lines
+// and the log package lose their error values on stderr too.
+func runHook(ctx context.Context, args []string, stderr io.Writer) error {
+	logger := slogForHook(stderr)
+	slog.SetDefault(logger)
+	cleanup := wireHookEventing(ctx, logger)
+	defer cleanup()
+	return githttp.RunHook(ctx, args)
 }
