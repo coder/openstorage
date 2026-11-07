@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // childPIDs lists live (non-zombie) children of this test process. The
@@ -308,6 +309,42 @@ func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	other.Close()
 	if slots.InUse() != 0 {
 		t.Fatalf("slots in use after Close = %d", slots.InUse())
+	}
+}
+
+// Run's errors name the git command, and they reach the server's log. An
+// argv can be request-sized (a grep pattern, a list of paths), so past
+// maxErrArgvBytes the error keeps the command's head and its size.
+func TestRunErrorBoundsTheArgv(t *testing.T) {
+	fakeGit(t, "exit 1")
+	run := func(args ...string) error {
+		t.Helper()
+		_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: args})
+		if err == nil {
+			t.Fatal("Run: nil error from a git that exits 1")
+		}
+		return err
+	}
+	if err := run("rev-parse", "main"); !strings.HasPrefix(err.Error(), "git rev-parse main: ") {
+		t.Fatalf("short argv: err = %v, want the whole command", err)
+	}
+	for _, tc := range []struct{ name, arg string }{
+		// git runs and exits 1. The odd "x" puts a 2-byte rune across
+		// the cut.
+		{"64 KiB", "x" + strings.Repeat("é", 32<<10)},
+		// Past 128 KiB, exec fails with E2BIG before git starts.
+		{"200 KiB", strings.Repeat("a", 200<<10)},
+	} {
+		err := run("grep", "-e", tc.arg).Error()
+		if len(err) > maxErrArgvBytes+512 {
+			t.Errorf("%s argument: the error is %d bytes, want at most %d", tc.name, len(err), maxErrArgvBytes+512)
+		}
+		if size := fmt.Sprintf("... (%d bytes)", len("git grep -e ")+len(tc.arg)); !strings.Contains(err, size) {
+			t.Errorf("%s argument: the error does not give the command's size %q", tc.name, size)
+		}
+		if !utf8.ValidString(err) {
+			t.Errorf("%s argument: the error is not valid UTF-8 (a rune split at the cut)", tc.name)
+		}
 	}
 }
 

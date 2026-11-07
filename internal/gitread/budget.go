@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/gitlimit"
 )
@@ -46,6 +47,11 @@ const (
 	// stderrKeepBytes bounds the stderr kept per child (its tail: git
 	// prints its fatal message last).
 	stderrKeepBytes = 64 << 10
+	// maxErrArgvBytes bounds the git command line that Run's errors quote.
+	// An argv can be request-sized (a grep pattern or a list of paths; past
+	// 128 KiB, exec fails with E2BIG), and these errors reach the server's
+	// log. 4096 keeps a command with any one path (PATH_MAX on Linux) whole.
+	maxErrArgvBytes = 4096
 	// childWaitDelay bounds how long Wait may block on git's output pipes
 	// after git is killed (exec.Cmd.WaitDelay).
 	childWaitDelay = 2 * time.Second
@@ -370,7 +376,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
 	assertf(len(c.Args) > 0, "Run: no git args")
-	name := "git " + strings.Join(c.Args, " ")
+	name := commandName(c.Args)
 
 	b := BudgetFrom(ctx)
 	var heap int64 // no Budget (write endpoints): no limits at all
@@ -431,4 +437,18 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 		return stdout, fmt.Errorf("%s: %w (%d bytes): %s", name, ErrMemoryLimit, heap, msg)
 	}
 	return stdout, fmt.Errorf("%s: %w: %s", name, err, msg)
+}
+
+// commandName is the git command line that Run's errors quote. Past
+// maxErrArgvBytes it keeps the head, cut at a rune boundary, and the size.
+func commandName(args []string) string {
+	name := "git " + strings.Join(args, " ")
+	if len(name) <= maxErrArgvBytes {
+		return name
+	}
+	cut := maxErrArgvBytes
+	for cut > maxErrArgvBytes-utf8.UTFMax && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s... (%d bytes)", name[:cut], len(name))
 }
