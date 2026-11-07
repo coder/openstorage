@@ -558,6 +558,8 @@ class CitationTests(CheckerTestCase):
             "blank-first item": f"-\n    > \t{link}\n", "item with text": f"- x\n    > \t{link}\n",
             "blank-first ordered item": f"1.\n     > \t{link}\n", "one space less": f"-\n   > \t{link}\n",
             "quote": f">\t{link}\n", "ordered marker": f"- 1.  \t{link}\n", "ordered marker with a parenthesis": f"- 1)  \t{link}\n",
+            "tab between quote markers": f">\t> \t{link}\n", "tab before a quote marker": f"-\n\t> \t{link}\n",
+            "two-digit ordered marker": f"- 10.  \t{link}\n",
         }
         code = {
             "two spaces": f"-\n  > \t{link}\n", "six spaces": f"-\n      > \t{link}\n",
@@ -1052,7 +1054,8 @@ class FileSelectionTests(CheckerTestCase):
                 assert b"".join(entries) == out and len(entries) > 2
                 out = {"cut": out[:-1], "gap": entries[0] + b"junk\\n" + b"".join(entries[1:]), "tail": out + b"junk\\n",
                        "last": b"".join(entries[:-1]), "none": b"", "intact": out,
-                       "junk": entries[0] + b"junk\\0\\n" + b"".join(entries[1:]), "first": b"junk\\0\\n" + out}[mode]
+                       "junk": entries[0] + b"junk\\0\\n" + b"".join(entries[1:]), "first": b"junk\\0\\n" + out,
+                       "first2": b"junk\\0" + out}[mode]
             sys.stdout.buffer.write(out)
             sys.stderr.buffer.write(done.stderr)
             sys.exit(done.returncode)
@@ -1061,7 +1064,7 @@ class FileSelectionTests(CheckerTestCase):
             fake = Path(bin_dir) / "git"
             fake.write_text(wrapper, encoding="utf-8")
             fake.chmod(0o755)
-            for mode in ["intact", "cut", "gap", "junk", "first", "tail", "last", "none", "fail"]:
+            for mode in ["intact", "cut", "gap", "junk", "first", "first2", "tail", "last", "none", "fail"]:
                 with self.subTest(damage=mode):
                     env = {**os.environ, "PATH": bin_dir + os.pathsep + os.environ["PATH"], "REAL_GIT": shutil.which("git"), "DAMAGE": mode}
                     result = self.run_checker("[Doc](docs/a.md)\n", docs={"a.md": "# A\n", "b.md": "# B\n"}, env=env)
