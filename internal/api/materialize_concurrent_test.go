@@ -15,18 +15,32 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/gitread"
 )
 
+// TestMaterializeColdConcurrent (issue #235): twelve requests start together
+// at one repository whose cache is cold, and every one of them is answered
+// from the same correctly initialized cache.
+//
+// The test is about cache initialization, not admission control. The
+// production read pool admits two git reads per repository and answers a
+// third with 503 and Retry-After after one second (ADR-049), so a read that
+// finds git slow, or a host busy, is shed by design: TestGitReadBudget* pins
+// that. The burst gets a pool that admits all twelve for as long as the
+// context lives, so no answer depends on how fast git runs.
 func TestMaterializeColdConcurrent(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		for _, writes := range []bool{true, false} {
 			t.Run(fmt.Sprintf("writes=%t", writes), func(t *testing.T) {
+				burst := gitReads
+				burst.slots = gitread.NewSlots(12, 12, time.Minute)
+				withGitReadPolicy(t, burst)
 				fx := wrefSeedFixture(t, e)
 				repoPath := githttp.RepoPath(e.cacheDir, fx.repoID)
 				if _, err := os.Stat(repoPath); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("fixture cache must be cold: %v", err)
 				}
-				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute) // bounds a hang, not git's speed
 				defer cancel()
 				start := make(chan struct{})
 				var wg sync.WaitGroup
