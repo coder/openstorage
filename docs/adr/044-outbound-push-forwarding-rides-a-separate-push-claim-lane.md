@@ -163,7 +163,8 @@ restores the request (`RestorePush`), and the job's completion gate
 snoozes it. So does a loopback fetch that the server refuses with HTTP 423
 because a push on that node holds a ref whose cached value is older than
 the authority (ADR-50 amendment): forwarding it would publish the older
-value and end the run done. The gate also never completes the job while a push claim is
+value and end the run done.
+The gate also never completes the job while a push claim is
 held: a run whose finish or restore write failed leaves its claim holding
 the request it consumed, so the job waits for the lease, and its re-run
 steals the claim with its force level. Only a job whose repository was
