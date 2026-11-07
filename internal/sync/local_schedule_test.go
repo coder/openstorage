@@ -272,6 +272,11 @@ func newLocalSchedFixture(t *testing.T) *localSchedFixture {
 	creds, ups := MetaStores(f.ms)
 	w := f.wf.worker
 	w.Upstreams, w.Credentials, w.Local = ups, creds, f.gate
+	// These tests check which run succeeds and what intent survives, not
+	// timeouts: give each run the production budget, so that a host that
+	// makes git slow (a run past newWorkerFixture's minute) does not fail
+	// a run the test expects to succeed.
+	w.Timeout = defaultRunTimeout
 	w.Repos = func(_ context.Context, _, repoID string) (RepoInfo, error) {
 		if err, ok := f.lookupErr.Load(repoID); ok {
 			return RepoInfo{}, err.(error)
@@ -364,10 +369,13 @@ func (f *localSchedFixture) sweep(t *testing.T) {
 	f.idle(t)
 }
 
-// idle waits until no scheduler job is queued or running.
+// idle waits until no scheduler job is queued or running. A run ends
+// within its claim lease, so idle waits that long before it calls a job
+// stuck: a shorter wait fails a run that is slow but inside its budget.
 func (f *localSchedFixture) idle(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(60 * time.Second)
+	bound := claimLease(f.wf.worker.Timeout)
+	deadline := time.Now().Add(bound)
 	for {
 		f.sched.mu.Lock()
 		n := len(f.sched.inflight)
@@ -376,7 +384,7 @@ func (f *localSchedFixture) idle(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("scheduler still has %d jobs in flight", n)
+			t.Fatalf("scheduler still has %d jobs in flight after %v, a run's lease", n, bound)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -830,7 +838,7 @@ func TestLocalScheduleClaimRecovery(t *testing.T) {
 			f.advance(time.Minute)
 			switch mode {
 			case "crash":
-				c, err := f.ls.ClaimDuePush(t.Context(), repo, "dead-process", claimLease(time.Minute))
+				c, err := f.ls.ClaimDuePush(t.Context(), repo, "dead-process", claimLease(f.wf.worker.Timeout))
 				if err != nil || !c.Claimed {
 					t.Fatalf("simulated claim: %+v %v", c, err)
 				}
@@ -847,7 +855,7 @@ func TestLocalScheduleClaimRecovery(t *testing.T) {
 			if len(f.pushEvents(repo)) != before {
 				t.Fatal("claim taken over before its lease expired")
 			}
-			f.advance(claimLease(time.Minute))
+			f.advance(claimLease(f.wf.worker.Timeout))
 			f.sweep(t)
 			ev := f.pushEvents(repo)
 			if len(ev) != before+2 || !ev[before].Forced {
