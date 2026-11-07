@@ -13,6 +13,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -619,4 +621,121 @@ func FuzzPushPublicationScan(f *testing.F) {
 			t.Fatalf("held = %v, reference %v", held, want)
 		}
 	})
+}
+
+// holdRefreshers counts the running push-hold refresher goroutines
+// (startPushHoldRefresh's ticker loop).
+func holdRefreshers(t *testing.T) int {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	count := 0
+	for _, g := range bytes.Split(buf, []byte("\n\n")) {
+		if bytes.Contains(g, []byte("githttp.startPushHoldRefresh.func")) {
+			count++
+		}
+	}
+	return count
+}
+
+// TestHoldRefHoldsItsRefUntilRelease: HoldRef holds exactly the ref it
+// names, so a push or write to that ref waits and one to another ref does
+// not, and release removes the hold and stops its refresher.
+func TestHoldRefHoldsItsRefUntilRelease(t *testing.T) {
+	prev := pushHoldWaitMax
+	pushHoldWaitMax = 100 * time.Millisecond
+	t.Cleanup(func() { pushHoldWaitMax = prev })
+	cacheDir, repo := t.TempDir(), "repo_hold"
+	before := holdRefreshers(t)
+	release, err := HoldRef(context.Background(), cacheDir, repo, "refs/heads/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoPath := RepoPath(cacheDir, repo)
+	other, err := mintPushHold(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reservePushHolds(context.Background(), other, []string{"refs/heads/a"}); !errors.Is(err, ErrRefHeld) {
+		t.Fatalf("reserving the held ref = %v, want a denial that matches ErrRefHeld", err)
+	}
+	if err := reservePushHolds(context.Background(), other, []string{"refs/heads/b"}); err != nil {
+		t.Fatalf("reserving another ref = %v, want it reserved", err)
+	}
+	removePushHoldFiles(other)
+	release()
+	if n := holdRefreshers(t); n != before {
+		t.Fatalf("%d hold refreshers after release, want %d: release must stop the refresher", n, before)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := WaitForPushPublication(waitCtx, cacheDir, repo); err != nil {
+		t.Fatalf("publication wait after release: %v", err)
+	}
+}
+
+// TestHoldRefRefreshesPastItsTTL: a REST write can hold its ref longer
+// than pushHoldTTL (a slow intent write or CAS), so HoldRef's refresher
+// must keep the hold live. Without it the hold lapses after about one and
+// a half TTLs, and a push run could snapshot the ref before the CAS.
+func TestHoldRefRefreshesPastItsTTL(t *testing.T) {
+	prev := pushHoldTTL
+	pushHoldTTL = 2 * time.Second // the refresher touches it every 500 ms
+	t.Cleanup(func() { pushHoldTTL = prev })
+	cacheDir, repo := t.TempDir(), "repo_ttl"
+	release, err := HoldRef(context.Background(), cacheDir, repo, "refs/heads/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	time.Sleep(4500 * time.Millisecond) // past the lapse of an unrefreshed hold
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := WaitForPushPublication(ctx, cacheDir, repo); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("publication wait 4.5 s into a hold with a 2 s TTL = %v, want it still blocked: the hold lapsed", err)
+	}
+}
+
+// TestHoldRefReleasesWhenItCannotReserve: a HoldRef that gives up on a
+// conflicting hold leaves no hold file and no refresher behind.
+func TestHoldRefReleasesWhenItCannotReserve(t *testing.T) {
+	prev := pushHoldWaitMax
+	pushHoldWaitMax = 100 * time.Millisecond
+	t.Cleanup(func() { pushHoldWaitMax = prev })
+	cacheDir, repo := t.TempDir(), "repo_hold"
+	repoPath, err := EnsureCacheRepoCtx(context.Background(), cacheDir, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker := mintHold(t, repoPath, "refs/heads/a")
+	holds := func() []string {
+		entries, err := os.ReadDir(filepath.Join(repoPath, pushHoldDir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return names
+	}
+	want := holds()
+	before := holdRefreshers(t)
+	if release, err := HoldRef(context.Background(), cacheDir, repo, "refs/heads/a"); !errors.Is(err, ErrRefHeld) || release != nil {
+		t.Fatalf("HoldRef past a conflicting hold = (release %v, err %v), want no release and an error that matches ErrRefHeld", release != nil, err)
+	}
+	if got := holds(); !slices.Equal(got, want) {
+		t.Fatalf("hold files after the refused HoldRef = %v, want only the blocker's %v", got, want)
+	}
+	if n := holdRefreshers(t); n != before {
+		t.Fatalf("%d hold refreshers after the refused HoldRef, want %d", n, before)
+	}
+	removePushHoldFiles(blocker)
 }

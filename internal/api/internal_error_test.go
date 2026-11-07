@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 )
 
@@ -195,5 +197,43 @@ func TestInternalErrorsAreSanitized(t *testing.T) {
 				t.Fatalf("raw store error missing from server log: %s", logBuf.String())
 			}
 		})
+	}
+}
+
+// TestRefHeldIsServiceUnavailable: a ref write that gave up waiting for a
+// concurrent push's or ref write's hold on its ref (githttp.ErrRefHeld) is
+// transient. Every 500 writer of the write routes answers it with 503,
+// Retry-After and a body that says the ref is busy, and logs no internal
+// error. Other errors stay a plain 500.
+func TestRefHeldIsServiceUnavailable(t *testing.T) {
+	held := fmt.Errorf("cas refs/heads/main: refusing the ref update: hold refs/heads/main: %w", githttp.ErrRefHeld)
+	for _, writer := range []string{"internalErr", "wcInternal", "wmInternal"} {
+		for _, err := range []error{held, errors.New("disk on fire")} {
+			var logBuf bytes.Buffer
+			s := &server{logger: slog.New(slog.NewTextHandler(&logBuf, nil))}
+			rr := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/repos/branches/create", nil)
+			switch writer {
+			case "internalErr":
+				s.internalErr(rr, r, "create branch ref", err)
+			case "wcInternal":
+				s.wcInternal(rr, r, "publish commit", err)
+			case "wmInternal":
+				s.wmInternal(rr, r, "publish merge", err)
+			}
+			msg := decodeEnvelope(t, rr)
+			if err == held {
+				if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") != "1" || msg != refBusyMsg {
+					t.Errorf("%s(held ref) = %d, Retry-After %q, %q; want 503, 1, %q", writer, rr.Code, rr.Header().Get("Retry-After"), msg, refBusyMsg)
+				}
+				if strings.Contains(logBuf.String(), "internal error") {
+					t.Errorf("%s(held ref) logged an internal error: %s", writer, logBuf.String())
+				}
+				continue
+			}
+			if rr.Code != http.StatusInternalServerError || rr.Header().Get("Retry-After") != "" || msg != internalErrorMsg {
+				t.Errorf("%s(other error) = %d, Retry-After %q, %q; want a plain 500", writer, rr.Code, rr.Header().Get("Retry-After"), msg)
+			}
+		}
 	}
 }

@@ -2813,6 +2813,28 @@ func pushHoldPendingBytes(dir, exceptPath string, cached map[string]holdFilePars
 // Hold windows are server-controlled and normally millisecond-scale.
 var pushHoldWaitMax = 10 * time.Second
 
+// ErrRefHeld marks a push-hold reservation that gave up after
+// pushHoldWaitMax because a concurrent push or ref write still holds a
+// conflicting ref, or the reservation lock. It is transient: the API
+// answers a ref write that fails with it with 503 and Retry-After.
+var ErrRefHeld = errors.New("a concurrent push or ref write holds the ref")
+
+// refHeldError is such a give-up. It keeps the reservation's own message,
+// which a pushing git client shows, and matches ErrRefHeld.
+type refHeldError struct{ err error }
+
+func (e refHeldError) Error() string   { return e.err.Error() }
+func (e refHeldError) Unwrap() []error { return []error{e.err, ErrRefHeld} }
+
+// heldUnlessCanceled marks a give-up err as ErrRefHeld, unless the
+// caller's own context ended: then nothing waits for an answer.
+func heldUnlessCanceled(parent context.Context, err error) error {
+	if parent.Err() != nil {
+		return err
+	}
+	return refHeldError{err}
+}
+
 // reservePushHolds atomically verifies that no OTHER live push holds any
 // of names or a strict D/F relative of one (covers semantics — see
 // conflicts for why equality is a conflict here), then appends all of
@@ -2877,6 +2899,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 	// the pushes queued behind it, not an unbounded hang.
 	lockPath := dir + ".reserve.lock"
 	deadline := time.Now().Add(pushHoldWaitMax)
+	parent := ctx
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	// One parse cache across the poll iterations (Codex round-10 P2): a
@@ -2888,7 +2911,10 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 		unlock, err := flockExclusiveCtx(ctx, lockPath)
 		if err != nil {
 			if ctx.Err() != nil {
-				return Refuse(fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", ctx.Err()))
+				// The refusal is outermost: the pusher sees the retry
+				// guidance, and errors.Is still finds ErrRefHeld for the
+				// REST 503.
+				return Refuse(heldUnlessCanceled(parent, fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", ctx.Err())))
 			}
 			return err
 		}
@@ -2999,7 +3025,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 		}
 		unlock()
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return refusef("a concurrent push holds a ref conflicting with %s (same ref or directory/file relative); retry shortly", conflict)
+			return Refuse(heldUnlessCanceled(parent, fmt.Errorf("a concurrent push holds a ref conflicting with %s (same ref or directory/file relative); retry shortly", conflict)))
 		}
 		select {
 		case <-ctx.Done():
