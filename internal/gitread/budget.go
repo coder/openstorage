@@ -106,7 +106,7 @@ func CheckBlobSize(ctx context.Context, path string, size int64) error {
 		limit = b.limits.MaxBlob
 	}
 	if size > limit {
-		return fmt.Errorf("%q is %d bytes: %w (%d bytes)", path, size, ErrBlobTooLarge, limit)
+		return fmt.Errorf("%q is %d bytes: %w (%d bytes)", gitlimit.Clip(path), size, ErrBlobTooLarge, limit)
 	}
 	return nil
 }

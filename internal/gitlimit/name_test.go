@@ -26,7 +26,8 @@ func TestName(t *testing.T) {
 		{"an argument over the limit is cut and counted", []string{"x", over}, "git x " + over[:maxNameArgBytes] + "...(" + strconv.Itoa(maxNameArgBytes+1) + " bytes)"},
 		{"a huge argument", []string{"grep", huge, "--"}, "git grep " + huge[:maxNameArgBytes] + "...(200000 bytes) --"},
 		{"the arguments at the limit are all printed", many[:maxNameArgs], "git " + strings.Join(many[:maxNameArgs], " ")},
-		{"more arguments are counted", many, "git " + strings.Join(many[:maxNameArgs], " ") + " ...(68 more arguments)"},
+		{"one more argument is counted", many[:maxNameArgs+1], "git " + strings.Join(many[:maxNameArgs], " ") + " ...(1 more)"},
+		{"more arguments are counted", many, "git " + strings.Join(many[:maxNameArgs], " ") + " ...(68 more)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := Name(tc.args); got != tc.want {

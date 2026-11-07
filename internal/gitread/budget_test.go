@@ -484,3 +484,23 @@ func TestRunErrorNamesLongArgumentsBriefly(t *testing.T) {
 		}
 	}
 }
+
+// The path of a blob over the size limit is a path of the repository, and it
+// can be 100 KB long. Its name in the error goes to the log.
+func TestCheckBlobSizeNamesLongPathBriefly(t *testing.T) {
+	long := strings.Repeat("d", 100_000)
+	err := CheckBlobSize(context.Background(), long, MaxBlobBytes+1)
+	if !errors.Is(err, ErrBlobTooLarge) {
+		t.Fatalf("err = %v, want ErrBlobTooLarge", err)
+	}
+	msg := err.Error()
+	if len(msg) > 1024 {
+		t.Fatalf("the error is %d bytes, want it bounded: %.200s", len(msg), msg)
+	}
+	if want := "...(100000 bytes)"; !strings.Contains(msg, want) {
+		t.Errorf("error %.300q lacks %q", msg, want)
+	}
+	if err := CheckBlobSize(context.Background(), "a/b.txt", MaxBlobBytes); err != nil {
+		t.Errorf("a blob at the limit: err = %v, want nil", err)
+	}
+}

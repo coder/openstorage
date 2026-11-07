@@ -11,7 +11,7 @@ Shared admission and process control for git subprocesses. It provides a slot po
 - `ReadSlots` — process-wide pool shared by JSON git reads and admitted maintenance [gitlimit.go:ReadSlots]
 - `TryAdmitMaintenance` — non-blocking admission of one maintenance job; returns a release func [gitlimit.go:TryAdmitMaintenance]
 - `ErrStopping`, `Start`, `Wait`, `Run`, `Output`, `CombinedOutput`, `Stopping`, `StopChildren` — tracked git child lifecycle [children.go:Start]
-- `Name` — a git command line for an error message or a log line: each argument is cut at 256 bytes and its length is named, and at most 32 arguments are printed [name.go:Name]
+- `Name`, `Clip` — a git command line, and one value, for an error message or a log line: a value is cut at 256 bytes and its length is named, and at most 32 arguments are printed [name.go:Name] [name.go:Clip]
 - `HeapLimitSupported`, `Command`, `HeapFailure` — heap cap support (Linux: `/bin/sh` wrapper with `ulimit -d`; other platforms: no cap) and heap-failure classification [heaplimit_linux.go:Command] [heaplimit_other.go:Command]
 
 ## Invariants
