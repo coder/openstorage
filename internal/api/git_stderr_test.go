@@ -9,8 +9,8 @@ import (
 )
 
 // The write path's git errors quote git's stderr, and the API logs them.
-// Like gitread.Run, wcScratch.git, wrefGit and applyPatch's plain error
-// keep only its last 64 KiB: git prints its fatal message last.
+// Like gitread.Run, wcScratch.git, wrefGit, applyPatch's plain error and
+// wcBlobSink keep only its last 64 KiB: git prints its fatal message last.
 func TestWriteGitErrorsKeepStderrTail(t *testing.T) {
 	bin := t.TempDir()
 	// sc.git runs git with only the scratch environment, so the fake sets
@@ -29,7 +29,13 @@ func TestWriteGitErrorsKeepStderrTail(t *testing.T) {
 	_, scErr := sc.git(context.Background(), nil, nil, "status")
 	_, applyErr := sc.applyPatch(context.Background(), patch, "--cached")
 	_, wrefErr := wrefGit(context.Background(), t.TempDir(), nil, nil, "status")
-	for name, err := range map[string]error{"wcScratch.git": scErr, "applyPatch": applyErr, "wrefGit": wrefErr} {
+	sink, err := sc.startBlobSink(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = sink.write([]byte("x")) // git may exit before it reads stdin
+	_, sinkErr := sink.finish()
+	for name, err := range map[string]error{"wcScratch.git": scErr, "applyPatch": applyErr, "wrefGit": wrefErr, "wcBlobSink": sinkErr} {
 		if err == nil {
 			t.Fatalf("%s: nil error from a git that exits 1", name)
 		}
