@@ -1745,9 +1745,16 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	// The restore target must exist and be a commit; its tree becomes the
 	// new commit's tree verbatim.
+	// rev-parse --verify --quiet exits 1 for a target that names no commit.
+	// Any other failure (a fatal exit, a killed git) says nothing about the
+	// target.
 	tree, err := sc.resolveTree(r.Context(), target)
-	if err != nil {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 		writeProblem(w, http.StatusNotFound, codeRefNotFound, "restore target "+target+" not found")
+		return
+	} else if err != nil {
+		s.wcInternal(w, r, "resolve restore target", err)
 		return
 	}
 	if revision && !s.wcRestoreMoves(w, r, sc, md, plan, target, tree) {

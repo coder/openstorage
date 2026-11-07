@@ -1060,10 +1060,17 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 
 	// The note target must exist (any object kind, per git notes; a
-	// revision-resolved objectSHA re-verifies trivially).
+	// revision-resolved objectSHA re-verifies trivially). rev-parse
+	// --verify --quiet exits 1 for a missing object. Any other failure (a
+	// fatal exit, a killed git) says nothing about the object.
 	if _, err := wrefGit(ctx, repoPath, nil, nil,
 		"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
-		writeProblem(w, http.StatusNotFound, codeRefNotFound, "object not found: "+objectSHA)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			writeProblem(w, http.StatusNotFound, codeRefNotFound, "object not found: "+objectSHA)
+			return
+		}
+		s.internalErr(w, r, "verify note object", err)
 		return
 	}
 	// Existence check drives add-vs-existing (409) and delete-missing (404).
