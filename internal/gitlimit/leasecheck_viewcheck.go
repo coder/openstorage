@@ -20,10 +20,10 @@ import (
 func init() {
 	checkUnleased = func(cmd *exec.Cmd) {
 		if cmd.Dir != "" {
-			panic(fmt.Sprintf("gitlimit: git %s starts in %q without a lease; use gitlimit.StartIn", Name(cmd.Args[1:]), cmd.Dir))
+			panic(fmt.Sprintf("gitlimit: %s starts in %q without a lease; use gitlimit.StartIn", Clip(cmd.String()), cmd.Dir))
 		}
 		for _, p := range repoArgs(cmd) {
-			panic(fmt.Sprintf("gitlimit: git %s starts in the repository %q without a lease; use gitlimit.StartIn", Name(cmd.Args[1:]), p))
+			panic(fmt.Sprintf("gitlimit: %s starts in the repository %q without a lease; use gitlimit.StartIn", Clip(cmd.String()), p))
 		}
 	}
 	checkLeased = func(repoPath string, cmd *exec.Cmd) {
@@ -33,7 +33,7 @@ func init() {
 		}
 		for _, p := range dirs {
 			if !sameDir(p, repoPath) {
-				panic(fmt.Sprintf("gitlimit: git %s runs in %q under the lease of %q", Name(cmd.Args[1:]), p, repoPath))
+				panic(fmt.Sprintf("gitlimit: %s runs in %q under the lease of %q", Clip(cmd.String()), p, repoPath))
 			}
 		}
 	}

@@ -42,7 +42,6 @@ var leaseExempt = map[string]string{
 	"internal/githttp/hook.go:*":                                "runs inside a hook of a git that serve started with the lease: the hook and its git children inherit descriptor 3",
 	"internal/api/handlers.go:validRefFormat":                   "git check-ref-format reads no repository",
 	"internal/api/handlers_write_merge.go:wmEnsureMergeTreeGit": "git version reads no repository",
-	"internal/githttp/hydrate.go:runGitCtx":                     "plain only for git init --bare of a repository that does not exist yet (Dir is empty); every other call takes OutputIn",
 	"internal/sync/worker.go:runGitTo":                          "runs in a temporary mirror under os.TempDir, never in a cache repository",
 	"internal/simtest/gitenv.go:simGit":                         "test support: runs in the scratch repositories of simulations",
 	"internal/gitread/heaplimit.go:heapLimitedGit":              "builder: gitread.Run starts the command through RunIn",

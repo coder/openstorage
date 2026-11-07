@@ -86,6 +86,14 @@ func runGit(dir string, args ...string) (string, error) {
 // not match errors.Is(err, context.DeadlineExceeded), and the repack
 // worker classifies deterministic budget exhaustion by that identity.
 func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) {
+	return runGitLeased(ctx, dir, dir, args...)
+}
+
+// runGitLeased is runGitCtx for a child that holds the lease of the cache
+// repository at leaseDir (gitlimit.LeaseFile). dir is the child's working
+// directory. It is empty for `git init --bare <leaseDir>`, which runs where
+// serve runs.
+func runGitLeased(ctx context.Context, dir, leaseDir string, args ...string) (string, error) {
 	observeGitSpawn(dir, args)
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
@@ -93,14 +101,7 @@ func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) 
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	var out []byte
-	var err error
-	if dir == "" {
-		// Only `git init --bare <path>`: the repository does not exist yet.
-		out, err = gitlimit.Output(cmd)
-	} else {
-		out, err = gitlimit.OutputIn(dir, cmd)
-	}
+	out, err := gitlimit.OutputIn(leaseDir, cmd)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			err = fmt.Errorf("%w: %w", cerr, err)
@@ -406,7 +407,7 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 		}
 	}()
 	if needsInit {
-		if _, err := runGitCtx(ctx, "", "init", "--bare", "--initial-branch=main", path); err != nil {
+		if _, err := runGitLeased(ctx, "", path, "init", "--bare", "--initial-branch=main", path); err != nil {
 			return "", err
 		}
 	}

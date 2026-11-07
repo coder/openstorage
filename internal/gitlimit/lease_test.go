@@ -47,8 +47,21 @@ func tryExclusive(t *testing.T, repo string) error {
 // the real shape of #464: update-ref takes a ref lock, runs its
 // reference-transaction hook in the "prepared" state, and the hook sleeps.
 // The test runs on every git that CI runs: git must not close descriptor 3
-// before it runs a hook.
+// before it runs a hook. It runs git directly and behind the heap-cap shell
+// wrapper, which must pass the descriptor on.
 func TestLeaseLivesWithTheGitProcessTree(t *testing.T) {
+	t.Run("direct", func(t *testing.T) {
+		leaseLivesWithTheTree(t, func(args ...string) *exec.Cmd { return exec.Command("git", args...) })
+	})
+	t.Run("heap cap", func(t *testing.T) {
+		if !HeapLimitSupported() {
+			t.Skip("no heap cap on this platform")
+		}
+		leaseLivesWithTheTree(t, func(args ...string) *exec.Cmd { return Command(t.Context(), HeavyHeapBytes, args...) })
+	})
+}
+
+func leaseLivesWithTheTree(t *testing.T, gitCmd func(args ...string) *exec.Cmd) {
 	repo := bareRepo(t)
 	ready := filepath.Join(t.TempDir(), "ready")
 	hook := "#!/bin/sh\ncat >/dev/null\nif [ \"$1\" = prepared ]; then : >\"$READY\"; exec sleep 60; fi\n"
@@ -63,7 +76,7 @@ func TestLeaseLivesWithTheGitProcessTree(t *testing.T) {
 		t.Fatalf("commit-tree: %v", err)
 	}
 
-	cmd := exec.Command("git", "update-ref", "refs/heads/x", string(sha[:40]))
+	cmd := gitCmd("update-ref", "refs/heads/x", string(sha[:40]))
 	cmd.Dir = repo
 	cmd.Env = env
 	if err := StartIn(repo, cmd); err != nil {
