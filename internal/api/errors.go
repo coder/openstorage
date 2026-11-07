@@ -51,7 +51,7 @@ func (s *server) writeRefHeldErr(w http.ResponseWriter, r *http.Request, op stri
 	if !errors.Is(err, githttp.ErrRefHeld) {
 		return false
 	}
-	s.logger.Warn("ref write gave up waiting for a held ref", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Warn("ref write gave up waiting for a held ref", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
 	w.Header().Set("Retry-After", "1")
 	writeErr(w, http.StatusServiceUnavailable, refBusyMsg)
 	return true

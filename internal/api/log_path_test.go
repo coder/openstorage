@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/gitread"
 )
 
@@ -32,6 +33,7 @@ func TestLogLinesClipTheRequestPath(t *testing.T) {
 		},
 		"internal error": func(w http.ResponseWriter, r *http.Request) { srv.internalErr(w, r, "op", fail) },
 		"git read limit": func(w http.ResponseWriter, r *http.Request) { srv.internalErr(w, r, "op", gitread.ErrOutputLimit) },
+		"ref held":       func(w http.ResponseWriter, r *http.Request) { srv.internalErr(w, r, "op", githttp.ErrRefHeld) },
 		"commit-pack":    func(w http.ResponseWriter, r *http.Request) { srv.wcInternal(w, r, "op", fail) },
 		"merge":          func(w http.ResponseWriter, r *http.Request) { srv.wmInternal(w, r, "op", fail) },
 		"sync": func(w http.ResponseWriter, r *http.Request) {
