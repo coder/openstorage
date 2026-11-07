@@ -1,10 +1,13 @@
 package gitlimit
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -79,7 +82,7 @@ func leaseLivesWithTheTree(t *testing.T, gitCmd func(args ...string) *exec.Cmd) 
 	cmd := gitCmd("update-ref", "refs/heads/x", string(sha[:40]))
 	cmd.Dir = repo
 	cmd.Env = env
-	if err := StartIn(repo, cmd); err != nil {
+	if err := StartIn(t.Context(), repo, cmd); err != nil {
 		t.Fatal(err)
 	}
 	pgid := cmd.Process.Pid
@@ -128,7 +131,7 @@ func TestStartInWaitsForAnExclusiveHolder(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		cmd := exec.Command("sh", "-c", ": >"+marker)
-		done <- RunIn(repo, cmd)
+		done <- RunIn(t.Context(), repo, cmd)
 	}()
 	select {
 	case err := <-done:
@@ -158,10 +161,10 @@ func TestStartInWaitsForAnExclusiveHolder(t *testing.T) {
 // and the file stays, readable by the owner only.
 func TestLeaseEndsWithTheChildAndTheFileStays(t *testing.T) {
 	repo := t.TempDir()
-	if out, err := OutputIn(repo, exec.Command("sh", "-c", "echo out")); err != nil || string(out) != "out\n" {
+	if out, err := OutputIn(t.Context(), repo, exec.Command("sh", "-c", "echo out")); err != nil || string(out) != "out\n" {
 		t.Fatalf("OutputIn = %q, %v", out, err)
 	}
-	if out, err := CombinedOutputIn(repo, exec.Command("sh", "-c", "echo out; echo err >&2")); err != nil || len(out) != len("out\nerr\n") {
+	if out, err := CombinedOutputIn(t.Context(), repo, exec.Command("sh", "-c", "echo out; echo err >&2")); err != nil || len(out) != len("out\nerr\n") {
 		t.Fatalf("CombinedOutputIn = %q, %v", out, err)
 	}
 	if err := tryExclusive(t, repo); err != nil {
@@ -179,7 +182,7 @@ func TestLeaseEndsWithTheChildAndTheFileStays(t *testing.T) {
 // A start that fails leaves no lease behind.
 func TestFailedStartReleasesTheLease(t *testing.T) {
 	repo := t.TempDir()
-	if err := RunIn(repo, exec.Command("/nonexistent/git")); err == nil {
+	if err := RunIn(t.Context(), repo, exec.Command("/nonexistent/git")); err == nil {
 		t.Fatal("RunIn of a missing program succeeded")
 	}
 	if err := tryExclusive(t, repo); err != nil {
@@ -196,7 +199,7 @@ func TestTheFirstOpenCreatesTheEpochAndNoLaterOpenMovesIt(t *testing.T) {
 		first func(repo string) error
 	}{
 		{"OpenLease", func(repo string) error {
-			l, err := OpenLease(repo)
+			l, err := OpenLease(t.Context(), repo)
 			if err == nil {
 				_ = l.Close()
 			}
@@ -232,7 +235,7 @@ func TestTheFirstOpenCreatesTheEpochAndNoLaterOpenMovesIt(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, open := range []func(string) error{
-				func(repo string) error { l, err := OpenLease(repo); closeLease(l); return err },
+				func(repo string) error { l, err := OpenLease(t.Context(), repo); closeLease(l); return err },
 				func(repo string) error { l, err := TryExclusive(repo); closeLease(l); return err },
 			} {
 				if err := open(repo); err != nil {
@@ -265,5 +268,109 @@ func TestLeaseEpochRefusesAnythingButARegularFile(t *testing.T) {
 	}
 	if _, err := LeaseEpoch(repo); err == nil || errors.Is(err, ErrNoEpoch) {
 		t.Fatalf("LeaseEpoch of a symlink = %v, want an error that is not ErrNoEpoch", err)
+	}
+}
+
+// A start that waits for an exclusive holder honors its context: a canceled
+// request or an expired budget ends the wait, and the child never starts.
+func TestStartInStopsWaitingWhenItsContextEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func(t *testing.T) (context.Context, func())
+		want error
+	}{
+		{"canceled", func(t *testing.T) (context.Context, func()) {
+			ctx, cancel := context.WithCancel(t.Context())
+			return ctx, func() { time.Sleep(50 * time.Millisecond); cancel() }
+		}, context.Canceled},
+		{"deadline", func(t *testing.T) (context.Context, func()) {
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			t.Cleanup(cancel)
+			return ctx, func() {}
+		}, context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			held, err := TryExclusive(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			marker := filepath.Join(t.TempDir(), "ran")
+			ctx, end := tc.ctx(t)
+			done := make(chan error, 1)
+			go func() { done <- RunIn(ctx, repo, exec.Command("sh", "-c", ": >"+marker)) }()
+			end()
+			select {
+			case err := <-done:
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("RunIn = %v, want %v", err, tc.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("RunIn kept waiting for the lease after its context ended")
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("the child ran")
+			}
+		})
+	}
+}
+
+// The lease sits on LeaseFD and the descriptors below it stay closed, because
+// Git reads GIT_TRACE=3 to 9 as open trace descriptors and would write its
+// trace into the lease file.
+func TestTheLeaseIsOnlyOnLeaseFD(t *testing.T) {
+	repo := t.TempDir()
+	// A redirection to a closed descriptor ends the shell that runs it, so
+	// each probe runs in a subshell. A shell redirects only the descriptors 0
+	// to 9, so /proc shows the lease's.
+	script := `for n in 3 4 5 6 7 8 9; do if ( true >&$n ) 2>/dev/null; then exit $n; fi; done`
+	if runtime.GOOS == "linux" {
+		script += "\ntest -e /proc/$$/fd/" + strconv.Itoa(LeaseFD) + " || exit 20"
+	}
+	if err := RunIn(t.Context(), repo, exec.Command("sh", "-c", script)); err != nil {
+		t.Fatalf("descriptors in the child: %v", err)
+	}
+}
+
+func TestGitTraceToADescriptorBelowTenNeverReachesTheLease(t *testing.T) {
+	repo := bareRepo(t)
+	leaseSize := func() int64 {
+		fi, err := os.Stat(filepath.Join(repo, LeaseFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Size()
+	}
+	traced := func() *exec.Cmd {
+		cmd := exec.Command("git", "-C", repo, "rev-parse", "--git-dir")
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_TRACE=3")
+		return cmd
+	}
+
+	// Control: the lease on descriptor 3 receives git's trace. Without it the
+	// test would pass if this git wrote no trace at all.
+	l, err := OpenLease(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := traced()
+	control.ExtraFiles = []*os.File{l.f}
+	if err := control.Run(); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	_ = l.Close()
+	if leaseSize() == 0 {
+		t.Fatal("control: git wrote no trace into a lease on descriptor 3")
+	}
+	if err := os.Truncate(filepath.Join(repo, LeaseFile), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RunIn(t.Context(), repo, traced()); err != nil {
+		t.Fatalf("git with GIT_TRACE=3: %v", err)
+	}
+	if got := leaseSize(); got != 0 {
+		t.Fatalf("git wrote %d bytes of trace into the lease file", got)
 	}
 }

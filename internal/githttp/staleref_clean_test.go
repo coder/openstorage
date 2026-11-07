@@ -37,7 +37,7 @@ func srRepo(t *testing.T) (repo, commit string) {
 	if out, err := srGit(t, "", "init", "-q", "--bare", repo); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)
 	}
-	lease, err := gitlimit.OpenLease(repo)
+	lease, err := gitlimit.OpenLease(t.Context(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestCleanStaleRefLocksKeepsEveryLockWhileAGitIsAlive(t *testing.T) {
 	repo, _ := srRepo(t)
 	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
 	live := exec.Command("sleep", "60")
-	if err := gitlimit.StartIn(repo, live); err != nil {
+	if err := gitlimit.StartIn(t.Context(), repo, live); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = live.Process.Kill(); _ = gitlimit.Wait(live) })
@@ -227,7 +227,7 @@ func TestCleanStaleRefLocksKeepsEveryLockWhileAGitIsAlive(t *testing.T) {
 func TestCleanStaleRefLocksIgnoresYoungLocksWithoutTheLease(t *testing.T) {
 	repo, _ := srRepo(t)
 	lock := srLock(t, repo, "refs/heads/x.lock", 10*time.Second)
-	held, err := gitlimit.OpenLease(repo)
+	held, err := gitlimit.OpenLease(t.Context(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -90,7 +90,7 @@ func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...strin
 	cmd.Stdin = stdin
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	lease, err := gitlimit.OpenLease(dir)
+	lease, err := gitlimit.OpenLease(ctx, dir)
 	if err != nil {
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
@@ -793,7 +793,7 @@ func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn fun
 	cmd.Stdin = idx
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	lease, err := gitlimit.OpenLease(repoPath)
+	lease, err := gitlimit.OpenLease(ctx, repoPath)
 	if err != nil {
 		return fmt.Errorf("git show-index: %w", err)
 	}

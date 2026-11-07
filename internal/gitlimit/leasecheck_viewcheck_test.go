@@ -48,9 +48,9 @@ func TestViewCheckRefusesAnUnleasedStartInARepository(t *testing.T) {
 func TestViewCheckRefusesALeaseOfAnotherRepository(t *testing.T) {
 	repo, other := bareRepo(t), bareRepo(t)
 
-	mustPanic(t, "under the lease of", func() { _ = StartIn(repo, gitIn(other, "for-each-ref")) })
+	mustPanic(t, "under the lease of", func() { _ = StartIn(t.Context(), repo, gitIn(other, "for-each-ref")) })
 
-	if err := RunIn(repo, gitIn(repo, "for-each-ref")); err != nil {
+	if err := RunIn(t.Context(), repo, gitIn(repo, "for-each-ref")); err != nil {
 		t.Fatalf("RunIn in its own repository: %v", err)
 	}
 }
