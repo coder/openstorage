@@ -151,29 +151,38 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    The `digest-*` artifacts hold the two staged digests. They are kept for 35 days, and an
    approval can wait up to 30 days. If the `publish` job fails because they are gone, or
    for any reason before it creates the tag, dispatch the run again. If it fails after the
-   tag exists, the tag is spent: do not update the quickstart pin (step 3), and fix forward
-   with a new release (see "If a published image is bad" below).
+   tag exists, or if a `verify-published` job fails (the tag exists by then), the tag is
+   spent: do not update the quickstart pin (step 3), and fix forward with a new release
+   (see "If a published image is bad" below).
 
-   To tell which case you are in, start from the failed step. The step "Check that the
+   To tell which case you are in, open the failed run on the Actions page and find the
+   failed step in the `publish` job. A failure in any step before "Give the checked
+   digests the version tag" happened before the tag: the login, the download of the
+   digest files, and "Refuse to replace an existing version tag". The step "Check that the
    index holds exactly the checked digests" runs only after the tag exists. The step "Give
    the checked digests the version tag" can fail on either side of the push, so look at
-   the tag itself (after `docker login ghcr.io`):
+   the tag itself. After `docker login ghcr.io` with a token that has `read:packages`:
 
    ```sh
    docker buildx imagetools inspect ghcr.io/coder/openstorage:X.Y.Z
    ```
 
    It prints the index when the tag exists and fails with `not found` when it does not.
-   Any other error, such as `denied`, tells you nothing about the tag: fix the login and
-   run it again. A tag that a package admin deleted also shows `not found`, so never
-   dispatch a version whose tag was ever created.
+   `not found` shows that no tag exists only when the login can read the package, because
+   a token that cannot read it can print the same message for a tag that exists. Any
+   other error, such as `denied`, tells you nothing about the tag: fix the login and run
+   it again. A tag that a package admin deleted also shows `not found`, so never dispatch
+   a version whose tag was ever created with `publish=true`. A dispatch with
+   `publish=false` only stages and checks, and creates no tag.
 
-   Another dispatch cannot replace a tag that exists, because the `publish` job stops at
-   "Refuse to replace an existing version tag" unless the registry answers 404 for the
-   tag. That step cannot know that an admin deleted the tag, so the rule above stands: do
-   not dispatch a version whose tag was ever created. If the step fails with HTTP 200, the
-   tag exists and the version is spent: fix forward with a new release. Any other status
-   means the step could not tell, so inspect the tag as above.
+   Another `publish=true` dispatch cannot replace a tag that exists, because the `publish`
+   job stops at "Refuse to replace an existing version tag" unless the registry answers
+   404 for the tag. So when the tag was never deleted, the worst case of a wrong guess is
+   a wasted dispatch. That step cannot know that an admin deleted the tag, so the rule
+   above stands. If the step fails with HTTP 200, an earlier run created the tag. Open
+   that run. If its `verify-published` jobs passed, the version is published and nothing
+   is left to do. If not, the version is spent: fix forward with a new release. Any other
+   status means the step could not tell, so inspect the tag as above.
 
 3. After the `verify-published` jobs pass, update the quickstart pin. In
    [Option A of the Docker quickstart](quickstart-docker.md#option-a-use-a-published-image),
