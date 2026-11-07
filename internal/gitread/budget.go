@@ -370,7 +370,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
 	assertf(len(c.Args) > 0, "Run: no git args")
-	name := "git " + strings.Join(c.Args, " ")
+	name := gitlimit.Name(c.Args)
 
 	b := BudgetFrom(ctx)
 	var heap int64 // no Budget (write endpoints): no limits at all

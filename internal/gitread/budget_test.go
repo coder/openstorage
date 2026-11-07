@@ -463,3 +463,24 @@ func TestArchiveStreamStalledReaderKeepsNoGitProcess(t *testing.T) {
 	}
 	b.Close()
 }
+
+// A request can put a value of 100 KB into a git argument, and the error
+// name of Run goes to the log: it must not carry the value.
+func TestRunErrorNamesLongArgumentsBriefly(t *testing.T) {
+	fakeGit(t, "echo boom >&2; exit 3")
+	long := strings.Repeat("a", 100_000)
+	_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"rev-parse", "--verify", long}})
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("err = %v, want git's exit status 3", err)
+	}
+	msg := err.Error()
+	if len(msg) > 1024 {
+		t.Fatalf("the error is %d bytes, want it bounded: %.200s", len(msg), msg)
+	}
+	for _, want := range []string{"git rev-parse --verify aaaa", "...(100000 bytes)", "boom"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %.300q lacks %q", msg, want)
+		}
+	}
+}
