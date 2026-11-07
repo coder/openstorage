@@ -21,7 +21,7 @@ Prometheus metrics for the server on a private registry. The package defines typ
 - `IsUnspecifiedBind` returns false for a malformed address [metrics.go:IsUnspecifiedBind]
 
 ## Side Effects
-- `init` registers nine collectors on the private registry and pre-creates label series, so a clean process exposes zero values [metrics.go:init]
+- `init` registers ten collectors on the private registry and pre-creates label series, so a clean process exposes zero values [metrics.go:init]
 - Recorders mutate process-wide counters and gauges [metrics.go:S3WALContentionExhausted]
 - `statusWriter.Unwrap` exposes the wrapped writer for `http.ResponseController` [metrics.go:statusWriter.Unwrap]
 - `NewServer` sets 5 s header, 10 s read, 20 s write, and 60 s idle timeouts [metrics.go:NewServer]

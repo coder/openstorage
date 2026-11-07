@@ -495,3 +495,98 @@ func TestCleanStaleRefLocksCountsAFailedRunAsKept(t *testing.T) {
 		})
 	}
 }
+
+// A replaced file that cannot go back to its path for a reason other than a
+// new lock is an error, not a successful put-back: the file may be a live
+// writer's lock, and now it is only in quarantine. The run still counts one
+// outcome, and its log line says how far it got.
+func TestCleanStaleRefLocksReportsAReplacedLockThatCannotBePutBack(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	repo, _ := srRepo(t)
+	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+	other := srLock(t, repo, "refs/heads/x/y.lock", 2*time.Hour)
+	dir := filepath.Dir(lock)
+	swap := func(path string) {
+		if path != lock {
+			return
+		}
+		fresh := lock + ".new"
+		if err := os.WriteFile(fresh, []byte("live writer\n"), 0o600); err != nil {
+			t.Error(err)
+		}
+		if err := os.Rename(fresh, lock); err != nil {
+			t.Error(err)
+		}
+	}
+	lockDown := func(path string) {
+		if path != lock {
+			return
+		}
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Error(err)
+		}
+	}
+	staleLockBeforeMove.Store(&swap)
+	staleLockAfterMove.Store(&lockDown)
+	t.Cleanup(func() {
+		staleLockBeforeMove.Store(nil)
+		staleLockAfterMove.Store(nil)
+		_ = os.Chmod(dir, 0o700)
+	})
+	lines := srLogLines(t, repo)
+	kept := srCount("kept")
+
+	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "put back") {
+		t.Fatalf("cleanup = %+v, %v, want an error that names the put-back", res, err)
+	}
+	if res.Outcome != metrics.StaleRefLockKept {
+		t.Fatalf("result = %+v, want outcome kept", res)
+	}
+	if got := srCount("kept") - kept; got != 1 {
+		t.Fatalf("kept outcomes counted = %v, want 1", got)
+	}
+	if left := srQuarantine(t, repo); len(left) != 1 {
+		t.Fatalf("quarantine holds %v, want the replaced file", left)
+	}
+	if l := lines(); len(l) != 1 || !strings.Contains(l[0], "then stopped") || !strings.Contains(l[0], "put back") {
+		t.Fatalf("log lines = %q, want one that says the run stopped at the put-back", l)
+	}
+	_ = other
+}
+
+// A run that removed some locks before it failed says so in its log line and
+// counts removed, so the line and the count agree.
+func TestCleanStaleRefLocksLogsPartialRemovalWhenALaterMoveFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	repo, _ := srRepo(t)
+	srLock(t, repo, "refs/heads/a.lock", 2*time.Hour)
+	srLock(t, repo, "refs/heads/m/b.lock", 2*time.Hour)
+	dir := filepath.Join(repo, "refs", "heads", "m")
+	// refLockPaths lists a.lock first, then the locks below m: m's
+	// directory is read-only, so moving its lock out fails.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	lines := srLogLines(t, repo)
+	removed := srCount("removed")
+
+	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/a", "refs/heads/m"}, time.Now())
+	if err == nil {
+		t.Fatalf("cleanup = %+v, want the move out of the read-only directory to fail", res)
+	}
+	if res.Removed != 1 || res.Outcome != metrics.StaleRefLockRemoved {
+		t.Fatalf("result = %+v, want 1 removed and outcome removed", res)
+	}
+	if got := srCount("removed") - removed; got != 1 {
+		t.Fatalf("removed outcomes counted = %v, want 1", got)
+	}
+	if l := lines(); len(l) != 1 || !strings.Contains(l[0], "removed 1 of 2 ref lock(s)") {
+		t.Fatalf("log lines = %q, want one that says removed 1 of 2", l)
+	}
+}
