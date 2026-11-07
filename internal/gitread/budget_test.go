@@ -312,6 +312,21 @@ func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	}
 }
 
+// Run's error quotes git's stderr, and it reaches the server's log: it
+// keeps exactly the last 64 KiB, where git prints its fatal message.
+func TestRunErrorKeepsTheStderrTail(t *testing.T) {
+	fakeGit(t, "head -c 1048576 /dev/zero | tr '\\0' e >&2; echo 'fatal: the end' >&2; exit 1")
+	_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"status"}})
+	if err == nil {
+		t.Fatal("Run: nil error from a git that exits 1")
+	}
+	// The last 64 KiB of stderr, less the trimmed line feed.
+	tail := strings.Repeat("e", 64<<10-len("fatal: the end\n")) + "fatal: the end"
+	if msg := err.Error(); !strings.HasSuffix(msg, ": exit status 1: "+tail) {
+		t.Fatalf("Run's error is %d bytes, want the command, the exit status and the last 64 KiB of stderr (%d bytes)", len(msg), len(tail))
+	}
+}
+
 // Run's errors name the git command, and they reach the server's log. An
 // argv can be request-sized (a grep pattern, a list of paths), so past
 // 4096 bytes the error keeps the command's head and its size.
@@ -332,7 +347,8 @@ func TestRunErrorBoundsTheArgv(t *testing.T) {
 		// git runs and exits 1. The odd "x" puts a 2-byte rune across
 		// the cut.
 		{"64 KiB", "x" + strings.Repeat("é", 32<<10)},
-		// Past 128 KiB, exec fails with E2BIG before git starts.
+		// Past 128 KiB, exec fails with E2BIG before git starts (Linux;
+		// elsewhere the fake git exits 1).
 		{"200 KiB", strings.Repeat("a", 200<<10)},
 	} {
 		err := run("grep", "-e", tc.arg).Error()
