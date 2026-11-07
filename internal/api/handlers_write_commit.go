@@ -850,7 +850,11 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	}
 	var exit *exec.ExitError
 	if ctx.Err() != nil || !errors.As(err, &exit) || (exit.ExitCode() < 0 && !wcGitAborted(exit)) {
-		return "", fmt.Errorf("%s: %w: %s", gitread.CommandLine(append([]string{"apply"}, args...)), err, strings.TrimSpace(stderr.String()))
+		// The error is logged: keep the last 64 KiB of git's stderr. (The
+		// classification below reads all of it.)
+		var tail gitread.TailBuffer
+		_, _ = tail.Write(stderr.Bytes())
+		return "", fmt.Errorf("%s: %w: %s", gitread.CommandLine(append([]string{"apply"}, args...)), err, tail.String())
 	}
 	full := strings.TrimSpace(stderr.String())
 	msg := full
