@@ -12,11 +12,12 @@ import (
 	"github.com/coder/openstorage/internal/gitread"
 )
 
-// A client chooses the URL path, and a request line can hold 1 MiB. Every
-// log line that names the path must clip it: one request would otherwise
-// write a line of the size of the path, with or without a token.
+// A client chooses the method and the URL path, and a request line can hold
+// 1 MiB. Every log line that names them must clip them: one request would
+// otherwise write a line of the size of the path, with or without a token.
 func TestLogLinesClipTheRequestPath(t *testing.T) {
 	path := "/" + strings.Repeat("p", 100_000)
+	method := strings.Repeat("M", 100_000)
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	srv := &server{logger: logger}
@@ -42,7 +43,7 @@ func TestLogLinesClipTheRequestPath(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			logs.Reset()
-			run(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+			run(httptest.NewRecorder(), httptest.NewRequest(method, path, nil))
 			line := logs.String()
 			if line == "" {
 				t.Fatal("nothing was logged")
@@ -50,8 +51,10 @@ func TestLogLinesClipTheRequestPath(t *testing.T) {
 			if len(line) > 8<<10 { // the panic line holds a stack trace
 				t.Fatalf("the log line is %d bytes, want it bounded: %.200s", len(line), line)
 			}
-			if want := "...(100001 bytes)"; !strings.Contains(line, want) {
-				t.Errorf("log line %.300q lacks %q", line, want)
+			for _, want := range []string{"...(100001 bytes)", "...(100000 bytes)"} { // the path, the method
+				if !strings.Contains(line, want) {
+					t.Errorf("log line %.300q lacks %q", line, want)
+				}
 			}
 		})
 	}

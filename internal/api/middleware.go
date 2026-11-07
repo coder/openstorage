@@ -31,7 +31,7 @@ func recoverPanics(logger *slog.Logger) middleware {
 					panic(rec)
 				}
 				logger.Error("panic in handler",
-					"method", r.Method, "path", logPath(r),
+					"method", logMethod(r), "path", logPath(r),
 					"panic", rec, "stack", string(debug.Stack()))
 				// Best effort: if the handler already started the response,
 				// this is a no-op superfluous WriteHeader.
@@ -73,6 +73,10 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 // gitlimit.Clip of it.
 func logPath(r *http.Request) string { return gitlimit.Clip(r.URL.Path) }
 
+// logMethod is the request method as a log line carries it. A method is any
+// token, and it too has only the request line's 1 MiB as its limit.
+func logMethod(r *http.Request) string { return gitlimit.Clip(r.Method) }
+
 // logRequests logs one line per request: method, path, status, duration.
 func logRequests(logger *slog.Logger) middleware {
 	assertf(logger != nil, "logRequests: nil logger")
@@ -86,7 +90,7 @@ func logRequests(logger *slog.Logger) middleware {
 				status = http.StatusOK // handler wrote nothing
 			}
 			logger.Info("http request",
-				"method", r.Method, "path", logPath(r),
+				"method", logMethod(r), "path", logPath(r),
 				"status", status, "duration", time.Since(start))
 		})
 	}
