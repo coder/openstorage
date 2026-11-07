@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/coder/openstorage/internal/gitlimit"
 )
 
 // activeRequests tracks in-flight HTTP requests, so a shutdown drain that
@@ -44,7 +46,8 @@ func (a *activeRequests) wrap(h http.Handler) http.Handler {
 }
 
 // describe returns one line per in-flight request, oldest first, with the
-// path quoted (it can hold any byte, newlines included).
+// path quoted (it can hold any byte, newlines included). A client chooses the
+// method and the path, and a request line can hold 1 MiB, so each is clipped.
 func (a *activeRequests) describe(now time.Time) []string {
 	a.mu.Lock()
 	reqs := make([]activeRequest, 0, len(a.reqs))
@@ -55,7 +58,7 @@ func (a *activeRequests) describe(now time.Time) []string {
 	sort.Slice(reqs, func(i, j int) bool { return reqs[i].start.Before(reqs[j].start) })
 	lines := make([]string, len(reqs))
 	for i, r := range reqs {
-		lines[i] = fmt.Sprintf("%s %q running for %v", r.method, r.path, now.Sub(r.start).Round(time.Millisecond))
+		lines[i] = fmt.Sprintf("%s %q running for %v", gitlimit.Clip(r.method), gitlimit.Clip(r.path), now.Sub(r.start).Round(time.Millisecond))
 	}
 	return lines
 }

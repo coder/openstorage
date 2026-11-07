@@ -244,7 +244,7 @@ func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, e
 	if s.writeRefHeldErr(w, r, op, err) {
 		return
 	}
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Error("internal error", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
@@ -737,7 +737,7 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	cmd.Stderr = &stderr
 	out, err := gitlimit.Output(cmd)
 	if err != nil {
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return string(out), fmt.Errorf("%s: %w: %s", gitlimit.Name(args), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
 }
