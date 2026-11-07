@@ -271,8 +271,8 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	}
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a/b"}); err == nil {
 		t.Fatal("reservation past a live D/F-conflicting hold accepted")
-	} else if !strings.Contains(err.Error(), "conflicting") || !errors.Is(err, ErrRefHeld) {
-		t.Fatalf("denial reason = %v, want a conflict message that matches ErrRefHeld (the API's 503)", err)
+	} else if !strings.Contains(err.Error(), "conflicting") || !errors.Is(err, ErrRefHeld) || !ShownToPusher(err) {
+		t.Fatalf("denial reason = %v, want a conflict message that matches ErrRefHeld (the API's 503) and that the pusher sees", err)
 	}
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a"}); err == nil {
 		t.Fatal("reservation past a live same-name hold accepted")
@@ -392,8 +392,8 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	if err == nil {
 		t.Fatal("reservation succeeded while the reserve lock was held elsewhere")
 	}
-	if !strings.Contains(err.Error(), "retry shortly") || !errors.Is(err, ErrRefHeld) {
-		t.Fatalf("denial = %v, want a retryable timeout that matches ErrRefHeld", err)
+	if !strings.Contains(err.Error(), "retry shortly") || !ShownToPusher(err) || !errors.Is(err, ErrRefHeld) {
+		t.Fatalf("denial = %v, want a retryable timeout that the pusher sees and that matches ErrRefHeld", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("reservation blocked %v, want the ~150ms deadline", elapsed)

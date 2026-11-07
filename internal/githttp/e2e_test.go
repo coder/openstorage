@@ -108,8 +108,8 @@ func TestMain(m *testing.M) {
 	// runner (mirrors cmd/openstorage's "hook" dispatch).
 	if len(os.Args) > 1 && os.Args[1] == "hook" {
 		if rec := os.Getenv(envTestHookErrorRecord); rec != "" && len(os.Args) > 2 && os.Args[2] == "pre-receive" {
-			slog.New(NewHookLogHandler(os.Stderr, nil)).Error("test hook record",
-				"path", os.Getenv(EnvHookErrors), "err", errors.New(rec))
+			slog.New(NewHookLogHandler(os.Stderr, nil)).Error("test hook record path="+os.Getenv(EnvHookErrors),
+				"err", errors.New(rec))
 		}
 		if err := RunHook(context.Background(), os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
