@@ -41,7 +41,10 @@ def fail(code, message):
 
 
 def registry_key(ref):
-    return ref.rsplit("@", 1)[1] if "@" in ref else "tag-" + ref.rsplit(":", 1)[1]
+    """The registry holds one repository, $IMAGE. A reference to another repository never matches."""
+    repository, key = ref.rsplit("@", 1) if "@" in ref else ref.rsplit(":", 1)
+    key = key if "@" in ref else "tag-" + key
+    return key if repository == os.environ["IMAGE"] else f"{repository}|{key}"
 
 
 def lookup(ref):
@@ -109,16 +112,23 @@ if mode != "no read-back":
 '''
 
 
-def step_lines(text, name):
-    """The lines of the one step called `name`, up to the next step."""
+def block_lines(text, matches, what):
+    """The lines from the one line that `matches` to the next line that is not indented deeper."""
     lines = text.splitlines()
-    heads = [i for i, line in enumerate(lines) if line.strip() == f"- name: {name}"]
-    assert len(heads) == 1, f"step {name!r} found {len(heads)} times"
-    head = lines[heads[0]]
-    margin = len(head) - len(head.lstrip())
+    heads = [i for i, line in enumerate(lines) if matches(line)]
+    assert len(heads) == 1, f"{what} found {len(heads)} times"
+    margin = indent(lines[heads[0]])
     end = next((j for j in range(heads[0] + 1, len(lines)) if lines[j].strip() and indent(lines[j]) <= margin),
                len(lines))
     return lines[heads[0]:end]
+
+
+def step_lines(text, name):
+    return block_lines(text, lambda line: line.strip() == f"- name: {name}", f"step {name!r}")
+
+
+def job_lines(text, name):
+    return block_lines(text, lambda line: line == f"  {name}:", f"job {name!r}")
 
 
 def indent(line):
@@ -194,10 +204,17 @@ class ImageWorkflowStepsTest(unittest.TestCase):
         # The steps run as `bash -e` only while nothing in the file sets a shell.
         assert not re.search(r"^\s*(shell|defaults):", text, re.M), "image.yml sets a shell: run the steps with it"
         assert "${{" not in run_text(text, PROMOTE) + run_text(text, CHECK), "a run block holds an expression"
-        # The check step reads the new index from the promote step's output, not from a variable of this test.
+        # This test sets the variables that the two steps read. The file must bind them to the same things.
+        publish = [line.strip() for line in job_lines(text, "publish")]
+        for binding in ("TAG: ${{ needs.resolve.outputs.tag }}", "VERSION: ${{ needs.resolve.outputs.version }}",
+                        "COMMIT: ${{ needs.resolve.outputs.commit }}"):
+            assert binding in publish, f"the publish job does not bind {binding}"
         assert "id: promote" in [line.strip() for line in step_lines(text, PROMOTE)], "promote step lost its id"
         assert "DIGEST: ${{ steps.promote.outputs.digest }}" in [line.strip() for line in step_lines(text, CHECK)], \
             "check step does not read the promote step's digest output"
+        image = re.findall(r"^env:\n  IMAGE: (\S+)$", text, re.M)
+        assert len(image) == 1, "image.yml has no single top-level IMAGE"
+        cls.image = image[0]
         assert shutil.which("jq"), "jq is required"
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
@@ -223,7 +240,7 @@ class ImageWorkflowStepsTest(unittest.TestCase):
         env = {
             "PATH": f"{self.root / 'bin'}{os.pathsep}{os.environ['PATH']}",
             "WORLD": str(work / "world"),
-            "IMAGE": "ghcr.io/coder/openstorage", "VERSION": "9.9.9", "TAG": "v9.9.9",
+            "IMAGE": self.image, "VERSION": "9.9.9", "TAG": "v9.9.9",
             "COMMIT": "0" * 40, "GITHUB_REPOSITORY": "coder/openstorage",
             "GITHUB_OUTPUT": str(work / "output"), "GITHUB_STEP_SUMMARY": str(work / "summary"),
         }
