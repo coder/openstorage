@@ -1,12 +1,14 @@
 package githttp
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -36,5 +38,21 @@ func TestVerifySigReportsAFailedCheckAsAFailure(t *testing.T) {
 	}
 	if got := readRecords(t, records); strings.Count(got, "git verify-commit "+commit) != 2 {
 		t.Fatalf("the hook-errors file does not have the failed check once per ref: %s", got)
+	}
+}
+
+// A verify-commit that never started (here its context ended first) is no
+// verdict either.
+func TestVerifyCommitThatNeverRanIsAnError(t *testing.T) {
+	_, pub := genSSHKey(t)
+	v, cleanup, err := newSigVerifier([]meta.SigningKey{{ID: 1, KeyText: pub}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if reason, err := v.verifyCommit(ctx, strings.Repeat("a", 40)); err == nil || reason != "" {
+		t.Fatalf("verifyCommit = %q, %v; want no reason and an error", reason, err)
 	}
 }

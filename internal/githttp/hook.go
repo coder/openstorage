@@ -2704,7 +2704,7 @@ func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason stri
 	msg := condenseGitReason(out)
 	// verify-commit exits 1 for a missing or bad signature. Any other end
 	// (git did not start, was killed, or died with 128) is no verdict.
-	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 || ctx.Err() != nil {
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 {
 		return "", fmt.Errorf("git verify-commit %s: %w (output: %q)", sha, err, msg)
 	}
 	if msg == "" {
