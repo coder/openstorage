@@ -99,6 +99,12 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 	if spec == "" {
 		return "", fmt.Errorf("resolve empty ref: %w", ErrNotFound)
 	}
+	if strings.IndexByte(spec, 0) >= 0 {
+		// exec refuses an argument with a NUL byte before git starts, so
+		// git cannot answer: such a spec names no ref, like any other
+		// invalid name.
+		return "", fmt.Errorf("resolve ref %q: %w", spec, ErrNotFound)
+	}
 	// failErr records a git failure that is not git's answer (a resource
 	// limit, a cancellation, a kill, an exec.ErrWaitDelay): those must
 	// surface as errors, never as "not found".

@@ -139,7 +139,9 @@ func TestResolveRef(t *testing.T) {
 		})
 	}
 
-	for _, spec := range []string{"", "nope", "refs/heads/nope", "deadbeef", "HEAD~1", "main~1", "--verify", strings.ToUpper(f.c1[:8])} {
+	// A NUL byte cannot reach git (exec refuses the argument): it names
+	// no ref, as any other invalid name.
+	for _, spec := range []string{"", "nope", "refs/heads/nope", "deadbeef", "HEAD~1", "main~1", "--verify", strings.ToUpper(f.c1[:8]), "main\x00", "refs/heads/ma\x00in", "\x00" + f.c1} {
 		if sha, err := ResolveRef(ctx, f.dir, spec, false); !errors.Is(err, ErrNotFound) {
 			t.Errorf("ResolveRef(%q) = (%q, %v), want ErrNotFound", spec, sha, err)
 		}
