@@ -730,7 +730,7 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	}
 	cmd := sc.gitCmd(ctx, extraEnv, args...)
 	cmd.Stdin = stdin
-	var stderr bytes.Buffer
+	var stderr gitread.TailBuffer
 	cmd.Stderr = &stderr
 	out, err := gitlimit.Output(cmd)
 	if err != nil {
@@ -850,7 +850,7 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	}
 	var exit *exec.ExitError
 	if ctx.Err() != nil || !errors.As(err, &exit) || (exit.ExitCode() < 0 && !wcGitAborted(exit)) {
-		return "", fmt.Errorf("git apply %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("%s: %w: %s", gitread.CommandLine(append([]string{"apply"}, args...)), err, strings.TrimSpace(stderr.String()))
 	}
 	full := strings.TrimSpace(stderr.String())
 	msg := full
