@@ -549,6 +549,27 @@ class CitationTests(CheckerTestCase):
             with self.subTest(readme=readme):
                 self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
 
+    def test_a_tab_after_a_container_marker_keeps_its_stop_when_the_container_prefix_is_dropped(self):
+        # A tab stops at a multiple of four columns of the original line. The line below `-` loses two columns to the
+        # item, so a tab that stays in the shorter line must still stop where it stopped before. After the quote
+        # marker, the tab reaches column 8 of the original line, which makes the link text, or the start of a code block.
+        link = "[Gone](gone.md)"
+        shown = {
+            "blank-first item": f"-\n    > \t{link}\n", "item with text": f"- x\n    > \t{link}\n",
+            "blank-first ordered item": f"1.\n     > \t{link}\n", "one space less": f"-\n   > \t{link}\n",
+            "quote": f">\t{link}\n",
+        }
+        code = {
+            "two spaces": f"-\n  > \t{link}\n", "six spaces": f"-\n      > \t{link}\n",
+            "nested quote": f"> > \t{link}\n", "item and quote": f"- > \t{link}\n",
+        }
+        for name, readme in shown.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.run_checker(readme).stdout, "BROKEN FILE README.md:" + str(readme.count("\n")) + " -> gone.md\nbroken links: 1\n")
+        for name, readme in code.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.run_checker(readme).stdout, "broken links: 0\n")
+
     def test_only_spaces_and_tabs_separate_a_link_destination_from_its_title(self):
         # CommonMark takes a form feed or NEL after a destination as part of the text, so the link below renders.
         for name, sep in [("ff", "\x0c"), ("nel", "\x85"), ("ls", "\u2028")]:

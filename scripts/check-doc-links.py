@@ -138,7 +138,12 @@ def scan_blocks(path):
 
 
 def drop_columns(line, count):
-    """Remove container indentation without changing tabs inside HTML values."""
+    """Remove container indentation.
+
+    A tab stops at a multiple of four columns of the original line. Dropping a prefix shortens the line, so
+    a tab that stays in it would move to a stop of the shorter line. Expand every tab first.
+    """
+    line = line.expandtabs(4)
     pos = column = 0
     while pos < len(line) and (column < count or line[pos] in " \t"):
         column += 4 - column % 4 if line[pos] == "\t" else 1
