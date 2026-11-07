@@ -3,7 +3,10 @@ package gitread
 // What the walk's git can do that the stream's cannot (#615): fail on its
 // own, need more heap, or read a tree that the stream reads in full. In
 // every case the answer is the stream's, which is the one LsTreePage gave
-// before the walk.
+// before the walk. The exception is
+// TestLsTreePageCursorOnABrokenFolderBeforeTheCursor: a broken folder before
+// the cursor fails a page that the stream answers, and not one that the walk
+// answers.
 
 import (
 	"context"
