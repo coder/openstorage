@@ -622,8 +622,8 @@ emits `repo.push_upstream.started` right before its `repo.push_upstream.failed`.
 in-flight runs in both directions. A run that
 server shutdown cancels also ends without a terminal event: its request stays pending,
 and a later run (the next server process, or on PostgreSQL another replica) runs it with
-a new `repo.sync.started` (outbound: `repo.push_upstream.started`). On SQLite and S3WAL,
-an outbound run emits no event when a write in progress (a git push, or a ref write
+a new `repo.sync.started` (outbound: `repo.push_upstream.started`). An outbound run
+emits no event when a write in progress (a git push, or on SQLite and S3WAL a ref write
 through this API) holds a ref that the run would otherwise forward at an older value:
 the request stays pending, and a new run starts a few seconds later.
 
@@ -646,7 +646,8 @@ directory/file relative of it (`refs/heads/a` and `refs/heads/a/b`), then fails 
 **503** and `Retry-After: 1`. When the read of the repository's upstream link fails, a ref
 write from a token that passes the gates above fails with a plain **500** on any
 repository, forwarding or not: the write reads the link before it knows whether the
-repository forwards. Any other failure to take the hold, or a failed write of the forward
+repository forwards. A write to the ephemeral namespace is the exception: it takes no
+hold and reads no link. Any other failure to take the hold, or a failed write of the forward
 request, also fails the write with a plain **500**. In each case the ref stays unchanged.
 A write that loses its compare-and-swap (409)
 has recorded its request already, so the repository gets one forward run with nothing new
