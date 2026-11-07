@@ -305,14 +305,36 @@ func CatBlobTo(ctx context.Context, repoPath, sha string, w io.Writer) error {
 	return err
 }
 
-// ReadBlob returns the full contents of blob sha. Use only for small blobs
-// (symlink targets); file streaming goes through CatBlobTo. The bytes count
-// against the output allowance.
-func ReadBlob(ctx context.Context, repoPath, sha string) ([]byte, error) {
-	assertf(ref.ValidSHA(sha), "ReadBlob: malformed sha %q", sha)
-	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Args: []string{"cat-file", "blob", sha}})
-	if err != nil {
-		return nil, err
+// ReadSymlinkTarget returns the target of the symlink whose blob is sha, size
+// bytes long as the tree lists it. A target over MaxSymlinkTarget fails with
+// ErrSymlinkTooLong. A listed size over the limit fails before git starts. A
+// blob that git prints longer than it was listed (a replacement object that
+// appeared since) ends git after MaxSymlinkTarget+1 bytes, so the read holds at
+// most 4 KiB whatever the blob is; file streaming goes through CatBlobTo. The
+// target does not count against the output allowance, which the bound replaces.
+func ReadSymlinkTarget(ctx context.Context, repoPath, sha string, size int64) (string, error) {
+	assertf(ref.ValidSHA(sha), "ReadSymlinkTarget: malformed sha %q", sha)
+	if err := CheckSymlinkTarget(sha, size); err != nil {
+		return "", err
 	}
-	return []byte(out), nil
+	var target targetWriter
+	if _, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Stdout: &target, Args: []string{"cat-file", "blob", sha}}); err != nil {
+		return "", err
+	}
+	if len(target.buf) > MaxSymlinkTarget {
+		return "", fmt.Errorf("%q is a symlink with a target of more than %d bytes: %w", sha, MaxSymlinkTarget, ErrSymlinkTooLong)
+	}
+	return string(target.buf), nil
+}
+
+// targetWriter keeps the first MaxSymlinkTarget+1 bytes of git's output and
+// ends git once it has them: a longer output is not a target.
+type targetWriter struct{ buf []byte }
+
+func (w *targetWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p[:min(len(p), MaxSymlinkTarget+1-len(w.buf))]...)
+	if len(w.buf) > MaxSymlinkTarget {
+		return len(p), ErrStop
+	}
+	return len(p), nil
 }
