@@ -1129,7 +1129,7 @@ func TestLocalSchedulePublicationFence(t *testing.T) {
 		f.sweep(t) // transient failure: attempt 1, force kept
 		f.advance(time.Minute)
 		// The server refuses the loopback fetch: a push holds a ref the
-		// cache has not caught up with (githttp.Server.StrictSyncFetch).
+		// cache has not caught up with (githttp.Server's strict sync fetch).
 		locked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "held", http.StatusLocked)
 		}))
