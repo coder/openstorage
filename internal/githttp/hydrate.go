@@ -1368,6 +1368,11 @@ func (e *refBatchError) key() string {
 func (e *refBatchError) Error() string { return e.err.Error() }
 func (e *refBatchError) Unwrap() error { return e.err }
 
+// cleanupRetryLimit bounds the retries that cleanups earn in one hydration
+// (see syncRefsWithCleanup). With three ordinary attempts, one hydration
+// cleans at most cleanupRetryLimit+3 failed batches of syncRefsBatch refs.
+const cleanupRetryLimit = 16
+
 // syncRefsWithCleanup runs syncRefsStreamed up to three times, because a
 // racing writer can fail a pass. A store-side scan failure is an
 // infrastructure error, not local ref staleness: it is returned as scanErr at
@@ -1380,14 +1385,19 @@ func (e *refBatchError) Unwrap() error { return e.err }
 // a cleanup that wins the lease exclusively can remove the locks of that
 // batch. A cleanup that removed a lock earns a retry that is not one of the
 // three attempts, and the retry can fail on the next batch and clean that
-// one. The loop ends because each cleanup removes a lock file. A cleanup that
-// removed some locks and then failed on another counts as progress. A cleanup
-// that removed nothing (busy, kept, an error, or a lock that was young) is not
-// repeated for the same batch, because it would find the same, but it is for
-// a different one: the hydration remembers every such batch by its complete
-// name list.
+// one. A cleanup that removed some locks and then failed on another counts as
+// progress. A hydration earns at most cleanupRetryLimit such retries, because
+// each one streams the whole repository again, and a caller that can leave
+// stale locks in many batches must not make one request do work that grows
+// with their number. The batches that are left heal on the next request.
+//
+// A cleanup that removed nothing (busy, kept, an error, or a lock that was
+// young) is not repeated for the same batch, because it would find the same,
+// but it is for a different one: the hydration remembers every such batch by
+// its complete name list.
 func syncRefsWithCleanup(ctx context.Context, repoPath, headTarget string, newStore func() refSeq, batch int) (skipped bool, refsErr, scanErr error) {
 	fruitless := map[string]bool{}
+	earned := 0
 	for attempt := 0; attempt < 3; attempt++ {
 		if skipped, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, batch); refsErr == nil {
 			return skipped, nil, nil
@@ -1400,7 +1410,8 @@ func syncRefsWithCleanup(ctx context.Context, repoPath, headTarget string, newSt
 			// A cleanup that removed a lock made progress even when it then
 			// failed on another one.
 			res, _ := cleanStaleRefLocks(repoPath, failed.names, time.Now())
-			if res.Removed > 0 {
+			if res.Removed > 0 && earned < cleanupRetryLimit {
+				earned++
 				attempt--
 				continue
 			}

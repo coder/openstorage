@@ -2,6 +2,7 @@ package githttp
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -341,5 +342,44 @@ func TestSyncRefsWithCleanupCountsPartialRemovalAsProgress(t *testing.T) {
 	got := lines()
 	if len(got) != 2 || !strings.Contains(got[0], "removed 1 of 2 ref lock(s)") || !strings.Contains(got[1], "removed 0 of 1 ref lock(s)") {
 		t.Fatalf("log lines = %q, want a partial removal and then a second run on the lock that is left", got)
+	}
+}
+
+// One hydration cleans a bounded number of failed batches: the three attempts
+// and the retries that cleanups earn. A repository with stale locks in more
+// batches heals over several requests, and no request streams the repository
+// again for each of an unbounded number of batches.
+func TestSyncRefsWithCleanupBoundsTheRetriesItEarns(t *testing.T) {
+	repo, commit := srRepo(t)
+	const batches = cleanupRetryLimit + 3 + 5
+	want := map[string]string{}
+	locks := make([]string, 0, batches)
+	for i := range batches {
+		name := fmt.Sprintf("refs/heads/b%02d", i)
+		want[name] = commit
+		locks = append(locks, srLock(t, repo, name+".lock", 2*time.Hour))
+	}
+	remaining := func() int {
+		n := 0
+		for _, l := range locks {
+			if srExists(t, l) {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Batch size 1: every ref is a batch of its own, and every lock fails one.
+	if _, err := srSync(t, repo, want, 1); err == nil {
+		t.Fatal("sync succeeded although more batches are locked than one hydration cleans")
+	}
+	if got := batches - remaining(); got != cleanupRetryLimit+3 {
+		t.Fatalf("one hydration cleaned %d locks, want %d (the three attempts and %d earned retries)", got, cleanupRetryLimit+3, cleanupRetryLimit)
+	}
+	if _, err := srSync(t, repo, want, 1); err != nil {
+		t.Fatalf("the next hydration did not finish the cleanup: %v", err)
+	}
+	if remaining() != 0 {
+		t.Fatalf("%d locks are left after the second hydration", remaining())
 	}
 }
