@@ -3,6 +3,7 @@ package gitread
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,8 +21,9 @@ func TestResolveRefOnlyExitOneIsNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// rev-parse peels an abbreviation of c1 (no ref has its name), and
+	// rev-parse peels an abbreviation that no object and no ref has, and
 	// for-each-ref reads main.
+	const noObject = "0000000000ab"
 	for _, tc := range []struct {
 		sub, spec, name, sh string
 		notFound            bool
@@ -29,9 +31,9 @@ func TestResolveRefOnlyExitOneIsNotFound(t *testing.T) {
 		{"for-each-ref", "main", "exit 1", "exit 1", false},
 		{"for-each-ref", "main", "exit 128", "echo 'fatal: bad' >&2; exit 128", false},
 		{"for-each-ref", "main", "SIGKILL", "kill -KILL $$", false},
-		{"rev-parse", f.c1[:12], "exit 1", "exit 1", true},
-		{"rev-parse", f.c1[:12], "exit 128", "echo 'fatal: bad' >&2; exit 128", false},
-		{"rev-parse", f.c1[:12], "SIGKILL", "kill -KILL $$", false},
+		{"rev-parse", noObject, "exit 1", "exit 1", true},
+		{"rev-parse", noObject, "exit 128", "echo 'fatal: bad' >&2; exit 128", false},
+		{"rev-parse", noObject, "SIGKILL", "kill -KILL $$", false},
 	} {
 		t.Run(tc.sub+"/"+tc.name, func(t *testing.T) {
 			fakeGit(t, "if [ \"$1\" = "+tc.sub+" ]; then "+tc.sh+"; fi\nexec '"+realGit+"' \"$@\"")
@@ -144,13 +146,15 @@ func TestCommitUnreadableGitFailures(t *testing.T) {
 	}
 	// rev-parse peels the object id that for-each-ref read for main.
 	noCommit := "[ \"$1\" = rev-parse ] && [ \"$a\" = '" + c1 + "^{commit}' ] && exit 1\n"
+	const batchCheck = "[ \"$1\" = cat-file ] && [ \"$a\" = '--batch-check=%(objectname) %(objecttype)' ] && "
 	for _, tc := range []struct {
 		name, spec, rules string
 	}{
-		{"object of an abbreviation exits 128", tagObj[:12], "[ \"$1\" = rev-parse ] && [ \"$a\" = " + tagObj[:12] + " ] && exit 128\n"},
-		{"cat-file -e exits 128", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && exit 128\n"},
-		{"cat-file -e is killed", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && kill -KILL $$\n"},
-		{"cat-file -e of a full id exits 128", tagObj, "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && exit 128\n"},
+		{"batch-check exits 128", "tree-tag", batchCheck + "exit 128\n"},
+		{"batch-check is killed", "tree-tag", batchCheck + "kill -KILL $$\n"},
+		{"batch-check of a full id exits 128", tagObj, batchCheck + "exit 128\n"},
+		{"batch-check of an abbreviation exits 128", tagObj[:12], batchCheck + "exit 128\n"},
+		{"batch-check answers for another object", "tree-tag", batchCheck + "{ echo \"" + tree + " tree\"; exit 0; }\n"},
 		{"peel to the end exits 128", "tree-tag", "[ \"$1\" = rev-parse ] && [ \"$a\" = '" + tagObj + "^{}' ] && exit 128\n"},
 		{"cat-file -t exits 128", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -t ] && exit 128\n"},
 		{"a commit at the end of the chain", "main", noCommit},
@@ -173,36 +177,44 @@ func TestCommitUnreadableGitFailures(t *testing.T) {
 	}
 }
 
-// ResolveRef reads every ref candidate with one for-each-ref, and peels
-// only what exists: a branch, a tag and a full id each take two git runs.
-// main took 2, 3 and 4: one check-ref-format, then one rev-parse per
-// candidate (refs/heads/<spec>, refs/tags/<spec>, the id).
+// ResolveRef reads every ref candidate with one for-each-ref, peels only
+// what exists, and reads an object that is no commit with one
+// batch-check. Each read below takes at most the git runs that main took
+// (one check-ref-format, then one rev-parse per candidate:
+// refs/heads/<spec>, refs/tags/<spec>, the id).
 func TestResolveRefGitRuns(t *testing.T) {
 	f := newFixture(t)
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
+	tree := strings.TrimSpace(mustGit(t, f.dir, "rev-parse", f.c1+"^{tree}"))
+	blob := strings.TrimSpace(mustGit(t, f.dir, "rev-parse", f.c1+":README.md"))
 	for _, tc := range []struct {
 		name, spec string
-		runs       int
+		runs, main int
+		found      bool
 	}{
-		{"branch", "main", 2},
-		{"tag", "v1", 2},
-		{"full id", f.c1, 2},
+		{"branch", "main", 2, 2, true},
+		{"tag", "v1", 2, 3, true},
+		{"full id", f.c1, 2, 4, true},
+		{"unknown name", "nope", 1, 3, false},
+		{"abbreviation of a commit", f.c1[:12], 2, 4, true},
+		{"tree id", tree, 3, 4, false},
+		{"abbreviation of a blob", blob[:12], 3, 4, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			log := filepath.Join(t.TempDir(), "runs")
 			fakeGit(t, "echo \"$1\" >> '"+log+"'\nexec '"+realGit+"' \"$@\"")
-			if _, err := ResolveRef(context.Background(), f.dir, tc.spec, false); err != nil {
-				t.Fatalf("ResolveRef(%s): %v", tc.spec, err)
+			if _, err := ResolveRef(context.Background(), f.dir, tc.spec, false); (err == nil) != tc.found || (err != nil && !errors.Is(err, ErrNotFound)) {
+				t.Fatalf("ResolveRef(%s): %v, want found %v", tc.spec, err, tc.found)
 			}
 			got, err := os.ReadFile(log)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n := strings.Count(string(got), "\n"); n != tc.runs {
-				t.Fatalf("ResolveRef(%s) ran git %d times (%q), want %d", tc.spec, n, got, tc.runs)
+			if n := strings.Count(string(got), "\n"); n != tc.runs || n > tc.main {
+				t.Fatalf("ResolveRef(%s) ran git %d times (%q), want %d (main ran %d)", tc.spec, n, got, tc.runs, tc.main)
 			}
 		})
 	}
@@ -253,5 +265,37 @@ func TestResolveRefRefusesOtherForEachRefLines(t *testing.T) {
 		if sha, err := ResolveRef(context.Background(), f.dir, "main", false); err == nil || errors.Is(err, ErrNotFound) {
 			t.Errorf("for-each-ref printing %q: ResolveRef(main) = (%q, %v), want an error that is not ErrNotFound", line, sha, err)
 		}
+	}
+}
+
+// An abbreviation that more than one object has names no one object:
+// ErrNotFound, as an unknown one.
+func TestResolveRefAmbiguousAbbreviationIsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	// 400 blobs: two of them share a 4-character prefix.
+	var paths []string
+	for i := range 400 {
+		p := filepath.Join(dir, fmt.Sprintf("b%d", i))
+		if err := os.WriteFile(p, []byte(fmt.Sprintf("blob %d\n", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	ids := strings.Fields(mustGit(t, dir, append([]string{"hash-object", "-w"}, paths...)...))
+	seen := map[string]bool{}
+	prefix := ""
+	for _, id := range ids {
+		if seen[id[:4]] {
+			prefix = id[:4]
+			break
+		}
+		seen[id[:4]] = true
+	}
+	if prefix == "" {
+		t.Fatal("no two of 400 blobs share a 4-character prefix")
+	}
+	if sha, err := ResolveRef(context.Background(), dir, prefix, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ResolveRef(%s) = (%q, %v), want ErrNotFound", prefix, sha, err)
 	}
 }

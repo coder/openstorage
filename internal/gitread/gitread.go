@@ -205,8 +205,7 @@ const maxRefSpecBytes = 4096
 
 // gitSaidNo reports whether err is git's own negative answer: the child
 // ran to the end and exited 1. rev-parse --verify --quiet exits 1 for a
-// name that names no commit (missing, ambiguous, or not a commit), and
-// cat-file -e for an id that names no object. Any other failure says
+// name that names no commit (missing, ambiguous, or not a commit). Any other failure says
 // nothing about the ref: a resource limit or cancellation (gitread limit
 // errors never wrap *exec.ExitError), a kill, exec.ErrWaitDelay after a
 // long stall, or a fatal exit 128.
@@ -224,38 +223,46 @@ func gitSaidNo(err error) bool {
 // for the first two, and an error for the third: a ref whose object is
 // missing, or an object whose tag chain or commit git cannot read.
 func commitUnreadable(ctx context.Context, repoPath, name, id string) error {
-	if !ref.ValidSHA(id) {
-		// An abbreviated id. Without a peel, rev-parse reads the one
-		// object that has the abbreviation: it exits 1 only when no
-		// object or more than one has it.
-		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", id)
-		if gitSaidNo(err) {
-			return nil
-		} else if err != nil {
-			return err
-		}
-		if id = strings.TrimSpace(out); !ref.ValidSHA(id) {
-			return fmt.Errorf("rev-parse %q emitted %q", name, id)
-		}
-	}
-	if _, err := runGit(ctx, Light, repoPath, "cat-file", "-e", id); gitSaidNo(err) {
-		if id == name {
-			return nil // a full id that names no object
-		}
-		return fmt.Errorf("%s names object %s, which is missing", name, id)
-	} else if err != nil {
+	// One batch-check answers whether id names one object, and its type.
+	// For no object it prints "<id> missing", and for an abbreviation that
+	// more than one object has, "<id> ambiguous" (git's batch output,
+	// fixed words after the id it was given).
+	out, err := Run(ctx, Cmd{Class: Light, Dir: repoPath, Stdin: strings.NewReader(id + "\n"),
+		Args: []string{"cat-file", "--batch-check=%(objectname) %(objecttype)"}})
+	if err != nil {
 		return err
 	}
-	// The object exists. git peels its tag chain to the end (<id>^{}) and
-	// fails only when an object on the way is missing or a tag cannot be
-	// parsed. Nothing here reads a tag's message.
-	out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", id+"^{}")
+	line := strings.TrimSuffix(out, "\n")
+	switch line {
+	case id + " missing", id + " ambiguous":
+		if name == id {
+			return nil // an id that names no one object
+		}
+		return fmt.Errorf("%s names object %s, which is missing", name, id)
+	}
+	oid, typ, _ := strings.Cut(line, " ")
+	if !ref.ValidSHA(oid) || !strings.HasPrefix(oid, id) {
+		return fmt.Errorf("cat-file --batch-check for %s emitted %q", id, line)
+	}
+	switch typ {
+	case "tree", "blob":
+		return nil
+	case "commit":
+		return fmt.Errorf("git cannot read commit %s", oid)
+	case "tag":
+	default:
+		return fmt.Errorf("cat-file --batch-check for %s emitted %q", id, line)
+	}
+	// A tag. git peels its tag chain to the end (<id>^{}) and fails only
+	// when an object on the way is missing or a tag cannot be parsed.
+	// Nothing here reads a tag's message.
+	out, err = runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", oid+"^{}")
 	if err != nil {
-		return fmt.Errorf("git cannot peel %s: %w", id, err)
+		return fmt.Errorf("git cannot peel %s: %w", oid, err)
 	}
 	end := strings.TrimSpace(out)
 	if !ref.ValidSHA(end) {
-		return fmt.Errorf("rev-parse %s^{} emitted %q", id, end)
+		return fmt.Errorf("rev-parse %s^{} emitted %q", oid, end)
 	}
 	out, err = runGit(ctx, Light, repoPath, "cat-file", "-t", end)
 	if err != nil {
@@ -264,5 +271,5 @@ func commitUnreadable(ctx context.Context, repoPath, name, id string) error {
 	if strings.TrimSpace(out) == "commit" {
 		return fmt.Errorf("git cannot read commit %s", end)
 	}
-	return nil // a tree or a blob, or a tag of one
+	return nil // a tag of a tree or a blob
 }
