@@ -9,27 +9,25 @@ import (
 )
 
 // The fixture's runs get the production budget, and its run-bound waits
-// last until the frozen store clock refuses a run's token, cut by the test
-// binary's -timeout and never shorter than idleMinWait.
+// last one run's claim lease from their start, cut by the test binary's
+// -timeout and never shorter than idleMinWait.
 func TestLocalSchedFixtureRunBounds(t *testing.T) {
 	f := newLocalSchedFixture(t)
 	if got := f.wf.worker.Timeout; got != defaultRunTimeout {
 		t.Errorf("fixture run Timeout = %v, want defaultRunTimeout %v", got, defaultRunTimeout)
 	}
 	start := time.Unix(1_000_000_000, 0)
-	tokenLife := claimLease(defaultRunTimeout) - claimFenceMargin // 14 min
+	lease := claimLease(defaultRunTimeout) // 16 min
 	for _, tc := range []struct {
-		name          string
-		created, want time.Time
-		testDeadline  time.Time
+		name               string
+		want, testDeadline time.Time
 	}{
-		{"the store clock's token life", start.Add(-time.Minute), start.Add(tokenLife - time.Minute), time.Time{}},
-		{"a sooner -timeout", start, start.Add(2 * time.Minute), start.Add(3 * time.Minute)},
-		{"a later -timeout", start, start.Add(tokenLife), start.Add(time.Hour)},
-		{"token life already over", start.Add(-time.Hour), start.Add(idleMinWait), time.Time{}},
-		{"-timeout less than the margin away", start, start.Add(idleMinWait), start.Add(30 * time.Second)},
+		{"one claim lease", start.Add(lease), time.Time{}},
+		{"a sooner -timeout", start.Add(2 * time.Minute), start.Add(3 * time.Minute)},
+		{"a later -timeout", start.Add(lease), start.Add(time.Hour)},
+		{"-timeout less than the margin away", start.Add(idleMinWait), start.Add(30 * time.Second)},
 	} {
-		if got := runWaitDeadline(start, tc.created, defaultRunTimeout, tc.testDeadline, !tc.testDeadline.IsZero()); !got.Equal(tc.want) {
+		if got := runWaitDeadline(start, defaultRunTimeout, tc.testDeadline, !tc.testDeadline.IsZero()); !got.Equal(tc.want) {
 			t.Errorf("%s: wait ends %v after its start, want %v", tc.name, got.Sub(start), tc.want.Sub(start))
 		}
 	}

@@ -213,7 +213,6 @@ type localSchedFixture struct {
 	gate      *gateLanes
 	sched     *LocalScheduler
 	clock     atomic.Int64
-	created   time.Time // wall time at creation, where the store clock starts
 	stderr    io.Writer // where a failed run-bound wait writes its message first
 	org       string
 	lookupErr stdsync.Map // repoID -> error returned by the worker's repo lookup
@@ -229,10 +228,10 @@ type localSchedStore interface {
 // OPENSTORAGE_TEST_BACKEND selects: unset for SQLite, s3wal for S3WAL.
 func newLocalSchedFixture(t *testing.T) *localSchedFixture {
 	t.Helper()
-	f := &localSchedFixture{wf: newWorkerFixture(t), org: "sched-org", created: time.Now(), stderr: os.Stderr}
+	f := &localSchedFixture{wf: newWorkerFixture(t), org: "sched-org", stderr: os.Stderr}
 	// Store time starts at wall time: the worker derives its loopback
 	// token TTL from claim expiries with the real clock.
-	f.clock.Store(f.created.UnixNano())
+	f.clock.Store(time.Now().UnixNano())
 	now := meta.WithNowFunc(func() time.Time { return time.Unix(0, f.clock.Load()) })
 	switch backend := envconfig.Getenv("OPENSTORAGE_TEST_BACKEND"); backend {
 	case "", "local", "pg":
@@ -391,16 +390,19 @@ type waitT interface {
 }
 
 // runWaitDeadline is when a wait for the fixture's runs that starts at
-// start gives up. The fixture's store clock stands still, and a run's
-// loopback token lives until claimLease(timeout) - claimFenceMargin after
-// the store time of its claim, which is never before created (the
-// fixture's creation): until then each run can still succeed, so the wait
-// lasts that long. A shorter wait fails a run that is slow but inside its
-// budget. A test binary's -timeout that comes sooner (CI's S3-WAL lane
-// gives TestLocalSchedule 10 minutes) ends the wait idleDeadlineMargin
-// before it. The wait is never shorter than idleMinWait.
-func runWaitDeadline(start, created time.Time, timeout time.Duration, testDeadline time.Time, hasDeadline bool) time.Time {
-	deadline := created.Add(claimLease(timeout) - claimFenceMargin)
+// start gives up. Each run in flight started before the wait and ends
+// within its claim lease (claimLease(timeout)), so the wait lasts that
+// long: a shorter wait fails a run that is slow but inside its budget. A
+// test binary's -timeout that comes sooner (CI's S3-WAL lane gives
+// TestLocalSchedule 10 minutes) ends the wait idleDeadlineMargin before
+// it. The wait is never shorter than idleMinWait.
+//
+// The fixture's store clock stands still, so a run that claims later than
+// claimLease(timeout) - claimFenceMargin after the fixture's creation
+// gets no loopback token, and its fetch is refused at once. That fails the
+// run, not a wait.
+func runWaitDeadline(start time.Time, timeout time.Duration, testDeadline time.Time, hasDeadline bool) time.Time {
+	deadline := start.Add(claimLease(timeout))
 	if hasDeadline && testDeadline.Add(-idleDeadlineMargin).Before(deadline) {
 		deadline = testDeadline.Add(-idleDeadlineMargin)
 	}
@@ -416,7 +418,7 @@ func (f *localSchedFixture) waitRuns(t waitT, what func(waited time.Duration) st
 	t.Helper()
 	start := time.Now()
 	td, ok := t.Deadline()
-	deadline := runWaitDeadline(start, f.created, f.wf.worker.Timeout, td, ok)
+	deadline := runWaitDeadline(start, f.wf.worker.Timeout, td, ok)
 	for !done() {
 		if time.Now().After(deadline) {
 			msg := what(time.Since(start).Round(time.Second))
