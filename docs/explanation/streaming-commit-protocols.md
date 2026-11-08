@@ -27,8 +27,8 @@ Line 1 — metadata frame:
 ```json
 {"metadata": {
   "target_branch": "main",              // required; no "refs/" prefix allowed
-  "commit_message": "msg",              // required
-  "author": {"name": "A", "email": "a@x"},       // required
+  "commit_message": "msg",              // required; no NUL byte
+  "author": {"name": "A", "email": "a@x"},       // required; name and email: no NUL byte, at most 131,051 bytes each
   "committer": {"name": "...", "email": "..."},  // optional
   "expected_head_sha": "<40-hex>",      // optional CAS guard
   "base_branch": "main",                // optional: start new branch from here

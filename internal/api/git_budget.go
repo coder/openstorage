@@ -255,6 +255,8 @@ func (s *server) writeGitLimitErr(w http.ResponseWriter, r *http.Request, op str
 		status, msg = http.StatusServiceUnavailable, "request exceeded the server's git time budget"
 	case errors.Is(err, gitread.ErrMemoryLimit):
 		status, msg = http.StatusUnprocessableEntity, "history or object too large for the server's git memory limit"
+	case errors.Is(err, gitread.ErrArgument):
+		status, msg = http.StatusBadRequest, "a request value is too long for git (over 128 KiB, or too many values in all) or holds a NUL byte"
 	case errors.Is(err, gitread.ErrOutputLimit):
 		status, msg = http.StatusUnprocessableEntity, "result too large for the server's git output limit; narrow the request"
 	case errors.Is(err, gitread.ErrBlobTooLarge):

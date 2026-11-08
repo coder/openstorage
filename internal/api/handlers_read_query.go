@@ -157,11 +157,15 @@ type diffPayload struct {
 	Filtered []filteredFileEntry
 }
 
-// lastByteWriter tracks the final byte of a stream (trailing-newline probe
-// for is_eof) without buffering blob contents.
-type lastByteWriter struct{ last byte }
+// lastByteWriter tracks the size and the final byte of a stream
+// (trailing-newline probe for is_eof) without buffering blob contents.
+type lastByteWriter struct {
+	n    int64
+	last byte
+}
 
 func (w *lastByteWriter) Write(p []byte) (int, error) {
+	w.n += int64(len(p))
 	if len(p) > 0 {
 		w.last = p[len(p)-1]
 	}
@@ -169,30 +173,18 @@ func (w *lastByteWriter) Write(p []byte) (int, error) {
 }
 
 // statDiffBlob resolves size and trailing-newline state (`bytes`/`is_eof`)
-// of commit:path. Submodule entries have no blob content: size 0, no eof.
-func statDiffBlob(ctx context.Context, repoPath, commit, path string) (int64, bool, error) {
-	entries, err := gitread.LsTree(ctx, repoPath, commit, path, false)
-	if err != nil {
+// of f's object, which it reads by id: a path that git printed can be
+// longer than exec takes as one argument. Submodule entries have no blob
+// content: size 0, no eof.
+func statDiffBlob(ctx context.Context, repoPath string, f gitread.FileDiff) (int64, bool, error) {
+	if f.Mode == "160000" {
+		return 0, false, nil // submodule pointer: no blob
+	}
+	var w lastByteWriter
+	if err := gitread.CatBlobTo(ctx, repoPath, f.OID, &w); err != nil {
 		return 0, false, err
 	}
-	var entry *gitread.TreeEntry
-	for i := range entries {
-		if entries[i].Path == path {
-			entry = &entries[i]
-			break
-		}
-	}
-	if entry == nil {
-		return 0, false, fmt.Errorf("diff path %q missing at %s", path, commit)
-	}
-	if entry.Size <= 0 {
-		return 0, false, nil // empty blob or submodule pointer: no newline
-	}
-	var last lastByteWriter
-	if err := gitread.CatBlobTo(ctx, repoPath, entry.SHA, &last); err != nil {
-		return 0, false, err
-	}
-	return entry.Size, last.last == '\n', nil
+	return w.n, w.n > 0 && w.last == '\n', nil
 }
 
 // buildDiffPayload computes the base..target tree diff and splits it into
@@ -213,14 +205,8 @@ func buildDiffPayload(ctx context.Context, repoPath, base, target string, paths 
 		Filtered: []filteredFileEntry{},
 	}
 	for _, f := range fileDiffs {
-		statCommit := target
-		if f.Status == "D" {
-			// Deletions stat the pre-image side. A root diff (base ==
-			// EmptyTreeSHA) has no pre-image; statDiffBlob then reports the
-			// missing path as an error (500), never a process-killing panic.
-			statCommit = base
-		}
-		size, isEOF, err := statDiffBlob(ctx, repoPath, statCommit, f.Path)
+		// f's object is the post-image, or the pre-image for a deletion.
+		size, isEOF, err := statDiffBlob(ctx, repoPath, f)
 		if err != nil {
 			return diffPayload{}, err
 		}

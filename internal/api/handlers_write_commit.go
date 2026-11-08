@@ -530,7 +530,45 @@ func wcValidateAuthor(field string, a wcAuthor) error {
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
 		return newFieldError(field, "must not contain newlines", field+" contains newlines")
 	}
+	return wcValidateIdentityEnv(field, a.Name, a.Email)
+}
+
+// wcMaxIdentityBytes bounds an author or committer name or email. git gets
+// each through an environment entry such as GIT_COMMITTER_EMAIL=<email>,
+// and exec on Linux refuses an entry over 128 KiB (E2BIG).
+const wcMaxIdentityBytes = 128<<10 - len("GIT_COMMITTER_EMAIL=") - 1
+
+// wcValidateIdentityEnv refuses an identity that exec cannot pass in git's
+// environment: a NUL byte, or a name or email over wcMaxIdentityBytes.
+func wcValidateIdentityEnv(field, name, email string) error {
+	if strings.IndexByte(name+email, 0) >= 0 {
+		return newFieldError(field, "must not contain a NUL byte", field+" contains a NUL byte")
+	}
+	if max(len(name), len(email)) > wcMaxIdentityBytes {
+		msg := fmt.Sprintf("name and email must be at most %d bytes each", wcMaxIdentityBytes)
+		return newFieldError(field, msg, field+" "+msg)
+	}
 	return nil
+}
+
+// wcValidateCommitMessage refuses a message that git cannot store: git
+// commit-tree refuses a message with a NUL byte.
+func wcValidateCommitMessage(msg string) error {
+	if strings.IndexByte(msg, 0) >= 0 {
+		return newFieldError("commit_message", "must not contain a NUL byte", "commit_message contains a NUL byte")
+	}
+	return nil
+}
+
+// wcMessageInput is the stdin for `git commit-tree -F -`. The message goes
+// through stdin because exec refuses an argument past 128 KiB (E2BIG).
+// -F takes the message as is, so this adds the line feed that -m adds to
+// a message without one: the commit is the one that -m made.
+func wcMessageInput(msg string) io.Reader {
+	if msg != "" && !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
+	}
+	return strings.NewReader(msg)
 }
 
 // wcValidateMetadata checks the fields shared by commit-pack and
@@ -543,6 +581,9 @@ func wcValidateMetadata(md *wcMetadata) error {
 	}
 	if md.CommitMessage == "" {
 		return errors.New("missing commit_message")
+	}
+	if err := wcValidateCommitMessage(md.CommitMessage); err != nil {
+		return err
 	}
 	if err := wcValidateAuthor("author", md.Author); err != nil {
 		return err
@@ -1199,13 +1240,13 @@ func (sc *wcScratch) commitTree(ctx context.Context, tree, parent string, md *wc
 		"GIT_COMMITTER_NAME=" + committer.Name,
 		"GIT_COMMITTER_EMAIL=" + committer.Email,
 	}
-	args := []string{"commit-tree", "-m", md.CommitMessage}
+	args := []string{"commit-tree", "-F", "-"}
 	if parent != "" {
 		assertf(ref.ValidSHA(parent), "commitTree: malformed parent %q", parent)
 		args = append(args, "-p", parent)
 	}
 	args = append(args, tree)
-	out, err := sc.git(ctx, nil, env, args...)
+	out, err := sc.git(ctx, wcMessageInput(md.CommitMessage), env, args...)
 	if err != nil {
 		return "", err
 	}
