@@ -79,5 +79,22 @@ func TestReadEndpointsAnswer500ForARefGitCannotRead(t *testing.T) {
 				t.Errorf("GET %s = %d, want %d: %.200s", tc.path, resp.StatusCode, tc.want, body)
 			}
 		}
+		// create-branch falls back to preferred_base only for a base that
+		// names no ref: a base git cannot read is a 500.
+		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitWrite}})
+		srv := newWrefServer(t, e)
+		for _, tc := range []struct {
+			base string
+			want int
+		}{
+			{"gone-tag", http.StatusInternalServerError},
+			{"nope", http.StatusOK},
+		} {
+			resp, body := wrefDo(t, srv, http.MethodPost, "/api/v1/repos/branches/create", writeTok,
+				map[string]any{"target_branch": "from-" + tc.base, "base_ref": tc.base, "preferred_base": "main"})
+			if resp.StatusCode != tc.want {
+				t.Errorf("create-branch from %s with preferred_base main = %d, want %d: %v", tc.base, resp.StatusCode, tc.want, body)
+			}
+		}
 	})
 }
