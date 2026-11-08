@@ -843,3 +843,24 @@ func TestHermeticGitEnvReadsObjectsWithoutReplacements(t *testing.T) {
 		t.Fatalf("cat-file -p c1 = %q, want c1's own message", out)
 	}
 }
+
+// The envs that the worker's fetch, push and ls-remote run with carry the
+// variable exactly once, with and without credentials.
+func TestGitEnvsCarryNoReplaceObjectsOnce(t *testing.T) {
+	for name, env := range map[string][]string{
+		"authGitEnv":                 authGitEnv("u", "p", "https"),
+		"authGitEnv without a user":  authGitEnv("", "", "https"),
+		"loopbackGitEnv":             loopbackGitEnv("token", "http"),
+		"loopbackGitEnv without one": loopbackGitEnv("", "http"),
+	} {
+		var got []string
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "GIT_NO_REPLACE_OBJECTS=") {
+				got = append(got, kv)
+			}
+		}
+		if len(got) != 1 || got[0] != "GIT_NO_REPLACE_OBJECTS=1" {
+			t.Errorf("%s: GIT_NO_REPLACE_OBJECTS entries %q, want exactly one GIT_NO_REPLACE_OBJECTS=1", name, got)
+		}
+	}
+}
