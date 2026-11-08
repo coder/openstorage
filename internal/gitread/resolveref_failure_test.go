@@ -98,7 +98,7 @@ func TestResolveRefUnreadableCommitIsAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	for _, spec := range []string{"gone", "refs/heads/gone", "gone-tag", "gone-tag-tag", tagObj, strings.ToUpper(tagObj)} {
+	for _, spec := range []string{"gone", "refs/heads/gone", "gone-tag", "gone-tag-tag", tagObj, strings.ToUpper(tagObj), tagObj[:12], tagObj[:7]} {
 		if sha, err := ResolveRef(ctx, dir, spec, false); err == nil || errors.Is(err, ErrNotFound) {
 			t.Errorf("ResolveRef(%q) = (%q, %v), want an error that is not ErrNotFound", spec, sha, err)
 		}
@@ -136,6 +136,7 @@ func TestCommitUnreadableGitFailures(t *testing.T) {
 	}{
 		{"value of the ref exits 128", "main", noCommit + "[ \"$1\" = rev-parse ] && [ \"$a\" = refs/heads/main ] && exit 128\n"},
 		{"value of the ref is killed", "main", noCommit + "[ \"$1\" = rev-parse ] && [ \"$a\" = refs/heads/main ] && kill -KILL $$\n"},
+		{"object of an abbreviation exits 128", tagObj[:12], "[ \"$1\" = rev-parse ] && [ \"$a\" = " + tagObj[:12] + " ] && exit 128\n"},
 		{"cat-file -e exits 128", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && exit 128\n"},
 		{"cat-file -e is killed", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && kill -KILL $$\n"},
 		{"cat-file -e of a full id exits 128", tagObj, "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && exit 128\n"},

@@ -204,9 +204,11 @@ func gitSaidNo(err error) bool {
 // read.
 func commitUnreadable(ctx context.Context, repoPath, cand string) error {
 	id := cand
-	if strings.HasPrefix(cand, "refs/") {
-		// Without a peel, rev-parse reads the ref's value: it exits 1
-		// only when the ref does not exist.
+	if !ref.ValidSHA(cand) {
+		// A ref, or an abbreviated id. Without a peel, rev-parse reads the
+		// ref's value, or the one object that has the abbreviation: it
+		// exits 1 only when the ref does not exist, or when no object or
+		// more than one has the abbreviation.
 		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand)
 		if gitSaidNo(err) {
 			return nil
@@ -216,8 +218,6 @@ func commitUnreadable(ctx context.Context, repoPath, cand string) error {
 		if id = strings.TrimSpace(out); !ref.ValidSHA(id) {
 			return fmt.Errorf("rev-parse %q emitted %q", cand, id)
 		}
-	} else if !ref.ValidSHA(cand) {
-		return nil // git resolves an abbreviation only to an object it has
 	}
 	if _, err := runGit(ctx, Light, repoPath, "cat-file", "-e", id); gitSaidNo(err) {
 		if id == cand {

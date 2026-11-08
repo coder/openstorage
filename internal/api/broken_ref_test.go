@@ -65,6 +65,7 @@ func TestReadEndpointsAnswer500ForARefGitCannotRead(t *testing.T) {
 		}{
 			{"/api/v1/repos/commits?ref=gone-tag", http.StatusInternalServerError},
 			{"/api/v1/repos/commits?ref=" + tagObj, http.StatusInternalServerError},
+			{"/api/v1/repos/commits?ref=" + tagObj[:12], http.StatusInternalServerError},
 			{"/api/v1/repos/commit?ref=gone-tag", http.StatusInternalServerError},
 			{"/api/v1/repos/files?ref=gone-tag", http.StatusInternalServerError},
 			{"/api/v1/repos/file?ref=gone-tag&path=a.txt", http.StatusInternalServerError},
