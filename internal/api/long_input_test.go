@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -155,11 +156,37 @@ func gitValuesRepo(t *testing.T, e *testEnv) string {
 	return e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
 }
 
+// capStack lowers the soft stack limit to max for the rest of t when it
+// is higher. Linux sets ARG_MAX, the total size of exec's arguments, to a
+// quarter of it (at most 6 MiB), so a host with a larger stack limit
+// takes arguments that the usual 8 MiB limit refuses. A grep body (at most
+// 1 MiB) cannot reach 6 MiB of arguments.
+func capStack(t *testing.T, max uint64) {
+	t.Helper()
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_STACK, &lim); err != nil {
+		t.Fatal(err)
+	}
+	if lim.Cur <= max {
+		return
+	}
+	old := lim
+	lim.Cur = max
+	if err := syscall.Setrlimit(syscall.RLIMIT_STACK, &lim); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := syscall.Setrlimit(syscall.RLIMIT_STACK, &old); err != nil {
+			t.Errorf("restore the stack limit: %v", err)
+		}
+	})
+}
+
 // A request value that exec refuses as an argument is the client's
 // error: 400, not 500.
 func TestGitValuesExecRefusesAre400(t *testing.T) {
 	long := strings.Repeat("p", 200<<10) // past 128 KiB
-	many := make([]string, 200000)       // together past ARG_MAX (2 MiB here)
+	many := make([]string, 200000)       // about 4 MB of arguments: past ARG_MAX at an 8 MiB stack limit
 	for i := range many {
 		many[i] = "a"
 	}
@@ -194,6 +221,7 @@ func TestGitValuesExecRefusesAre400(t *testing.T) {
 			check(t, "200 KiB path", resp, body)
 			resp, body = grep(map[string]any{"pattern": "needle"}, []string{"a\x00b"})
 			check(t, "path with a NUL byte", resp, body)
+			capStack(t, 8<<20)
 			resp, body = grep(map[string]any{"pattern": "needle"}, many)
 			check(t, "200,000 paths", resp, body)
 		})
