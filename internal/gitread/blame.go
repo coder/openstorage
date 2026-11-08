@@ -80,12 +80,13 @@ var blameShortFile = regexp.MustCompile(` has only [0-9]+ lines?\z`)
 // blameRangeFailed reports whether git blame failed on its -L ranges:
 // git prints its usage (exit 129) for a range it cannot parse, and dies
 // (exit 128) with "fatal: -L ..." or "fatal: file <path> has only N
-// lines". That message is all git prints after its warnings (such as
-// "warning: unable to access '<HOME>/.config/git/attributes'"), and its
-// fixed head comes before the path, so only a head at the start of
-// stderr, after any leading "warning: " lines, counts: a path that holds
-// a newline and a forged head cannot make a missing or unreadable file
-// ("fatal: no such path <path> in <commit>") read as a bad range.
+// lines". Before it, git can print warnings and errors about its config
+// and attributes (such as "warning: unable to access
+// '<HOME>/.config/git/attributes'", some over more than one line), but no
+// other fatal line. Its fixed head comes before the path, so only the
+// first line that starts "fatal: " counts: a path that holds a newline
+// and a forged head cannot make a missing or unreadable file ("fatal: no
+// such path <path> in <commit>") read as a bad range.
 func blameRangeFailed(err error) bool {
 	if _, ok := gitStderr(err, 129); ok {
 		return true
@@ -94,9 +95,11 @@ func blameRangeFailed(err error) bool {
 	if !ok {
 		return false
 	}
-	for strings.HasPrefix(stderr, "warning: ") {
-		_, stderr, _ = strings.Cut(stderr, "\n")
+	i := strings.Index("\n"+stderr, "\nfatal: ")
+	if i < 0 {
+		return false
 	}
+	stderr = stderr[i:]
 	if strings.HasPrefix(stderr, "fatal: -L ") {
 		return true
 	}

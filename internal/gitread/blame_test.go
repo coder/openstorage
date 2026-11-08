@@ -327,6 +327,8 @@ func TestBlameRangeFailureReadsOnlyGitsHead(t *testing.T) {
 		{"short file after two warnings", "warning: a\nwarning: b\nfatal: file README.md has only 1 line", 128, true},
 		{"-L line after a warning and another head", "warning: a\nfatal: no such path x\nfatal: -L y in 1111", 128, false},
 		{"warnings only", "warning: a\nwarning: fatal: -L y", 128, false},
+		{"short file after a two-line warning and an error", "warning: Negative patterns are ignored in git attributes\nUse '\\!' for literal leading exclamation.\nerror: is not a valid attribute name: .gitattributes:2\nfatal: file README.md has only 1 line", 128, true},
+		{"-L line after an error and another head", "error: a\nfatal: no such path x\nfatal: -L y in 1111", 128, false},
 		{"-L head with exit 130", "fatal: -L invalid line number: 0", 130, false},
 		{"short file with exit 130", "fatal: file README.md has only 1 line", 130, false},
 		{"short file without a number", "fatal: file README.md has only  line", 128, false},
@@ -376,4 +378,20 @@ func TestBlameNotFoundIsDecidedByLsTree(t *testing.T) {
 			t.Errorf("failed blame and ls-tree of a.txt/: err = %v, want git's failure", err)
 		}
 	})
+}
+
+// A repository whose .gitattributes git warns about (a negative pattern,
+// over two lines, and a bad attribute name) still answers a range past the
+// end of the file as a bad range.
+func TestBlameRangeErrorAfterAttributeWarnings(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, ".gitattributes", "!neg diff\nfoo error:\n", 0o644)
+	writeFile(t, dir, "a.txt", "one\ntwo\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "c")
+	commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	if _, err := Blame(context.Background(), dir, commit, "a.txt", []string{"9,10"}, false); !errors.Is(err, ErrBadRange) {
+		t.Fatalf("range past the end: err = %v, want ErrBadRange", err)
+	}
 }

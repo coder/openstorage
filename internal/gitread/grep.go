@@ -1,10 +1,13 @@
 package gitread
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -116,14 +119,15 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 		args = append(append(args, "--"), opts.Pathspecs...)
 	}
 	var stderr gitlimit.TailBuffer
-	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Args: args, Stderr: &stderr})
+	var unreadable grepUnreadableWatch
+	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Args: args, Stderr: io.MultiWriter(&stderr, &unreadable)})
 	var exitErr *exec.ExitError
 	noMatch := errors.As(err, &exitErr) && exitErr.ExitCode() == 1
-	// git grep that cannot read a blob prints "error: ..." and goes on: it
-	// exits 0 with the other files' matches, or 1 with none. That is a
-	// broken repository, not a result.
-	if msg := "\n" + stderr.String(); (err == nil || noMatch) && strings.Contains(msg, "\nerror: ") {
-		return nil, fmt.Errorf("git grep at %s could not read the repository: %s", commit, msg[1:])
+	// git grep that cannot read a blob prints "error: '<name>': unable to
+	// read <oid>" and goes on: it exits 0 with the other files' matches, or
+	// 1 with none. That is a broken repository, not a result.
+	if (err == nil || noMatch) && unreadable.seen() {
+		return nil, fmt.Errorf("git grep at %s could not read the repository: %s", commit, stderr.String())
 	}
 	if err != nil {
 		// Exit status 1 with empty output is git grep's "no matches".
@@ -192,4 +196,53 @@ func parseGrepOutput(out, commit string) ([]GrepFile, error) {
 		files[idx].Lines = append(files[idx].Lines, GrepLine{LineNumber: n, Text: text, Type: GrepLineMatch})
 	}
 	return files, nil
+}
+
+// grepUnreadableTail is the end of git grep's diagnostic for a blob it
+// cannot read, "error: '<name>': unable to read <oid>". Only the end is
+// read: <name> holds the path, which can hold a newline.
+var grepUnreadableTail = regexp.MustCompile(`': unable to read [0-9a-f]{40}([0-9a-f]{24})?\z`)
+
+// grepUnreadableWatch watches git grep's stderr, as git writes it, for a
+// line that ends as grepUnreadableTail. It keeps only the end of the
+// current line, so no amount of other stderr can hide that line.
+type grepUnreadableWatch struct {
+	line  []byte // the last bytes of the current line
+	found bool
+}
+
+// grepLineKeepBytes is the end of a line that grepUnreadableWatch keeps:
+// more than the tail with a 64-hex object id.
+const grepLineKeepBytes = 128
+
+func (w *grepUnreadableWatch) Write(p []byte) (int, error) {
+	n := len(p)
+	for {
+		i := bytes.IndexByte(p, '\n')
+		part := p
+		if i >= 0 {
+			part = p[:i]
+		}
+		w.line = append(w.line, part...)
+		if over := len(w.line) - grepLineKeepBytes; over > 0 {
+			w.line = append(w.line[:0], w.line[over:]...)
+		}
+		if i < 0 {
+			return n, nil
+		}
+		w.endLine()
+		p = p[i+1:]
+	}
+}
+
+func (w *grepUnreadableWatch) endLine() {
+	w.found = w.found || grepUnreadableTail.Match(w.line)
+	w.line = w.line[:0]
+}
+
+// seen reports whether a line, the last one included, ended as
+// grepUnreadableTail.
+func (w *grepUnreadableWatch) seen() bool {
+	w.endLine()
+	return w.found
 }
