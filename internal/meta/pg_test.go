@@ -625,6 +625,10 @@ func testListReposQFilter(t *testing.T, s Backend) {
 	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/Alpha", "github.com/acme/beta-ALPHA"}) {
 		t.Errorf("q=alpha -> %v", got)
 	}
+	all, _ = listAll(t, s, org, "GAMMA", 10) // q in another case than the url
+	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/gamma"}) {
+		t.Errorf("q=GAMMA -> %v, want the gamma url", got)
+	}
 
 	// LIKE metacharacters in q are literals, not wildcards.
 	all, _ = listAll(t, s, org, "%", 10)
