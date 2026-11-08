@@ -10,18 +10,20 @@ Shared admission and process control for git subprocesses. It provides a slot po
 - `RepoKey` — per-repository slot key from a canonical repo ID [gitlimit.go:RepoKey]
 - `ReadSlots` — process-wide pool shared by JSON git reads and admitted maintenance [gitlimit.go:ReadSlots]
 - `TryAdmitMaintenance` — non-blocking admission of one maintenance job; returns a release func [gitlimit.go:TryAdmitMaintenance]
-- `ErrStopping`, `Start`, `Wait`, `Run`, `Output`, `CombinedOutput`, `Stopping`, `StopChildren` — tracked git child lifecycle [children.go:Start]
+- `ErrStopping`, `Start`, `Wait`, `Run`, `Output`, `Stopping`, `StopChildren` — tracked git child lifecycle [children.go:Start]
 - `Name`, `Clip` — a git command line, and one value, for an error message or a log line: a value is cut at 256 bytes and its length is named, and at most 32 arguments are printed [name.go:Name] [name.go:Clip]
 - `TailBuffer` — the stderr tail that an error quotes: the last 64 KiB, where git prints its fatal message [errtext.go:TailBuffer]
+- `HeadBuffer` — the output head that a reason quotes: the first 64 KiB, for a command that prints its reason first, with the count of dropped bytes [errtext.go:HeadBuffer]
 - `HeapLimitSupported`, `Command`, `HeapFailure` — heap cap support (Linux: `/bin/sh` wrapper with `ulimit -d`; other platforms: no cap) and heap-failure classification [heaplimit_linux.go:Command] [heaplimit_other.go:Command]
 
 ## Invariants
 - `TailBuffer` keeps the last 64 KiB written to it [errtext.go:TailBuffer]
+- `HeadBuffer` keeps the first 64 KiB written to it and counts the rest in `Dropped` [errtext.go:HeadBuffer]
 - `NewSlots` panics unless n > 0, 0 < perKey <= n, and wait >= 0 [gitlimit.go:NewSlots]
 - `Release` panics unless the key holds a slot; `RepoKey` panics on an empty repo ID [gitlimit.go:Release]
 - `TryAdmitMaintenance` takes the maintenance permit first, releases it if `ReadSlots` is full, and panics on a second release call [gitlimit.go:TryAdmitMaintenance]
 - `Acquire` with wait 0 returns `ErrBusy` at once when no slot is free [gitlimit.go:Acquire]
-- `Output` panics if the caller already set Stdout; `CombinedOutput` panics if the caller already set Stdout or Stderr [children.go:Output] [children.go:CombinedOutput]
+- `Output` panics if the caller already set Stdout [children.go:Output]
 - `registry.start` panics if `SysProcAttr` is already set, forces `Setpgid`, and refuses new children with `ErrStopping` after stop began [children.go:start]
 - `registry.stop` sends SIGTERM before SIGKILL so git can clean its lock files [children.go:stop]
 - `stop` signals only groups it finds registered while it holds the registry lock, and on Linux `wait` removes a group from the registry before it reaps the leader, so a signal reaches a group whose leader still owns its ID and never one whose ID the kernel recycled (#473) [children.go:wait] [children.go:stop]
@@ -36,7 +38,7 @@ Shared admission and process control for git subprocesses. It provides a slot po
 - Sends SIGTERM then SIGKILL to tracked groups in `StopChildren`, polling every 10 ms until every leader has exited or the grace deadline [children.go:stop]
 - Blocks one goroutine per child until its leader exits: in `waitid(WNOWAIT)` before it reaps on Linux, in `Wait` elsewhere [exit_linux.go:awaitExit] [exit_other.go:awaitExit]
 - Holds mutexes on slot state and on the child registry; release closes and replaces the `freed` channel to wake waiters [gitlimit.go:Release]
-- `Output` and `CombinedOutput` buffer child output in memory [children.go:Output]
+- `Output` buffers child output in memory [children.go:Output]
 
 ## Verification
 - Run: `go test ./internal/gitlimit/... -tags=openstorage_viewcheck -count=1 -race -timeout=30m`

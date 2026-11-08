@@ -58,3 +58,28 @@ func TestCommitGraphErrorKeepsStderrTail(t *testing.T) {
 	err := runCommitGraphAttempt(context.Background(), t.TempDir(), 0, []string{"commit-graph", "write"}, "")
 	requireStderrTail(t, "runCommitGraphAttempt", err)
 }
+
+// git verify-commit prints the verifier's reason first. A verifier that
+// goes on for 64 MiB leaves the head of its output in the error, with the
+// count of the bytes past the kept 64 KiB.
+func TestVerifyCommitKeepsTheHeadOfItsOutput(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\nPATH=/usr/bin:/bin\necho 'gpg: the reason' >&2\nhead -c 67108864 /dev/zero | tr '\\0' e >&2\nexit 128\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	v := &sigVerifier{allowedSigners: filepath.Join(t.TempDir(), "allowed_signers")}
+	_, err := v.verifyCommit(context.Background(), strings.Repeat("a", 40))
+	if err == nil {
+		t.Fatal("verifyCommit: nil error from a git that exits 128")
+	}
+	msg := err.Error()
+	if len(msg) > 4096 {
+		t.Errorf("the error is %d bytes, want the verifier's output cut", len(msg))
+	}
+	// 16 bytes of "gpg: the reason\n" and the first 65520 of the 64 MiB.
+	if !strings.Contains(msg, "gpg: the reason") || !strings.Contains(msg, "(67043344 more bytes dropped)") {
+		t.Errorf("the error lost the head of the output or the dropped count: %.400s", msg)
+	}
+}

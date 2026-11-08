@@ -785,7 +785,7 @@ func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn fun
 	cmd := exec.CommandContext(ctx, "git", "show-index")
 	cmd.Dir = repoPath
 	cmd.Stdin = idx
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the repack log
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -815,7 +815,7 @@ func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn fun
 	// early scan abort, then surface the first failure.
 	_, _ = io.Copy(io.Discard, stdout)
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("git show-index: %w: %s", normalizeCtxErr(ctx, err), strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("git show-index: %w: %s", normalizeCtxErr(ctx, err), stderr.String())
 	}
 	return scanErr
 }

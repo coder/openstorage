@@ -41,3 +41,9 @@ func TestRunGitStdinErrorKeepsStderrTail(t *testing.T) {
 	_, err := runGitStdin(context.Background(), dir, nil, "status")
 	requireStderrTail(t, "runGitStdin", err)
 }
+
+func TestStreamShowIndexErrorKeepsStderrTail(t *testing.T) {
+	noisyGit(t)
+	err := streamShowIndex(context.Background(), t.TempDir(), strings.NewReader(""), func(string) {})
+	requireStderrTail(t, "streamShowIndex", err)
+}
