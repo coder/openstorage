@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -96,7 +95,7 @@ var fullHexRe = regexp.MustCompile(`\A[0-9a-fA-F]{40}\z`)
 // handlers map it to 404). Only git's own negative answer counts as
 // unresolvable (gitSaidNo); any other git failure is returned as is. An
 // existing ref, or an object, whose way to a commit git cannot read (a
-// missing object, a broken tag) is an error too (commitUnreadable).
+// missing object, a broken tag) is an error too (resolveCommitObject).
 func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (string, error) {
 	assertf(repoPath != "", "ResolveRef: empty repoPath")
 	if spec == "" {
@@ -112,85 +111,56 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 		// invalid name.
 		return "", fmt.Errorf("resolve ref %q: %w", spec, ErrNotFound)
 	}
-	var names []string // ref candidates, in order
+	// rev-parse reads each candidate as a ref name, including its DWIM
+	// rules ("refs/r" can name refs/heads/refs/r). It rejects malformed
+	// names itself, but also accepts revision expressions: refuse every
+	// revision operator and control byte before any spec reaches it.
+	// Those bytes cannot be in a ref's name either. Only the hex fallback
+	// below is an object revision.
+	if strings.ContainsAny(spec, "~^:?*[\\") || strings.Contains(spec, "..") || strings.Contains(spec, "@{") {
+		return "", fmt.Errorf("resolve ref %q: %w", spec, ErrNotFound)
+	}
+	for _, c := range []byte(spec) {
+		if c <= ' ' || c == 0x7f {
+			return "", fmt.Errorf("resolve ref %q: %w", spec, ErrNotFound)
+		}
+	}
+	var candidates []string
 	if ephemeral {
-		// Branch names resolve inside the ephemeral namespace only; SHAs
-		// (below) address objects, which namespaces share anyway.
-		names = append(names, auth.EphemeralRefName(spec))
-	} else if !strings.HasPrefix(spec, "refs/") {
-		names = append(names, "refs/heads/"+spec, "refs/tags/"+spec)
+		candidates = append(candidates, auth.EphemeralRefName(spec))
+	} else if strings.HasPrefix(spec, "refs/") {
+		candidates = append(candidates, spec)
 	} else {
-		names = append(names, spec)
-	}
-	// One for-each-ref reads every ref candidate that exists, with its
-	// value. A name reaches git only as for-each-ref's pattern, never as a
-	// rev expression: rev-parse below gets the ref's object id. A plain
-	// pattern also matches every ref under it ("refs/heads/a" lists
-	// "refs/heads/a/b"), and a glob pattern only whole names, so each
-	// name goes as a glob with its last byte escaped. A glob character
-	// cannot be in a ref's name, so a name with one is no candidate.
-	var exact, patterns []string
-	for _, n := range names {
-		if !strings.ContainsAny(n, "*?[\\") {
-			exact = append(exact, n)
-			patterns = append(patterns, n[:len(n)-1]+"\\"+n[len(n)-1:])
-		}
-	}
-	refs := map[string]string{}
-	if len(patterns) > 0 {
-		out, err := runGit(ctx, Light, repoPath, append([]string{"for-each-ref", "--format=%(refname) %(objectname)", "--"}, patterns...)...)
-		if err != nil {
-			return "", err
-		}
-		for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
-			if line == "" {
-				continue // no ref
-			}
-			// A ref's name holds no space or newline, and every pattern
-			// matches one whole name.
-			name, oid, ok := strings.Cut(line, " ")
-			if !ok || !slices.Contains(exact, name) || !ref.ValidSHA(oid) {
-				return "", fmt.Errorf("for-each-ref emitted %q", line)
-			}
-			refs[name] = oid
-		}
-	}
-	type candidate struct{ name, id string } // id: what rev-parse peels
-	var candidates []candidate
-	for _, n := range names {
-		if oid, ok := refs[n]; ok {
-			candidates = append(candidates, candidate{n, oid})
-		}
+		candidates = append(candidates, "refs/heads/"+spec, "refs/tags/"+spec)
 	}
 	hex := spec
 	if fullHexRe.MatchString(spec) {
 		hex = strings.ToLower(spec)
 	}
 	if hexRevRe.MatchString(hex) {
-		candidates = append(candidates, candidate{hex, hex})
+		candidates = append(candidates, hex)
 	}
-	for _, c := range candidates {
-		// --end-of-options stops a hostile spec from being parsed as an
-		// option; ^{commit} peels annotated tags and rejects non-commits.
-		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", c.id+"^{commit}")
-		if err != nil {
-			if !gitSaidNo(err) {
-				return "", err
-			}
-			// rev-parse also exits 1 for a ref or object that exists
-			// when git cannot read the commit it leads to: that is the
-			// repository's failure, not an unknown ref. A broken branch
-			// is an error even when a tag or an id of its name resolves.
-			if berr := commitUnreadable(ctx, repoPath, c.name, c.id); berr != nil {
-				return "", fmt.Errorf("resolve ref %q: %w", spec, berr)
-			}
+	for _, cand := range candidates {
+		// No peel: rev-parse reads a ref's value even when its object is
+		// missing, and exits 1 only for a name that does not resolve.
+		// Each lookup reads one name, never a ref directory listing.
+		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand)
+		if gitSaidNo(err) {
 			continue
+		} else if err != nil {
+			return "", err
 		}
-		sha := strings.TrimSpace(out)
-		if !ref.ValidSHA(sha) {
-			return "", fmt.Errorf("rev-parse %q emitted %q", c.name, sha)
+		id := strings.TrimSpace(out)
+		if !ref.ValidSHA(id) {
+			return "", fmt.Errorf("rev-parse %q emitted %q", cand, out)
 		}
-		return sha, nil
+		sha, err := resolveCommitObject(ctx, repoPath, cand, id)
+		if err != nil {
+			return "", fmt.Errorf("resolve ref %q: %w", spec, err)
+		}
+		if sha != "" {
+			return sha, nil
+		}
 	}
 	return "", fmt.Errorf("resolve ref %q: %w", spec, ErrNotFound)
 }
@@ -214,62 +184,48 @@ func gitSaidNo(err error) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
 
-// commitUnreadable checks a ResolveRef candidate whose ^{commit} peel git
-// answered with exit 1. name is the candidate (a ref, a full id or an
-// abbreviated id) and id what rev-parse peeled: the ref's object id, or
-// the candidate itself. git gives that exit for an object that does not
-// exist, for one that leads to no commit (a tree, a blob, or a tag of
-// one), and for one whose way to a commit git cannot read. It returns nil
-// for the first two, and an error for the third: a ref whose object is
-// missing, or an object whose tag chain or commit git cannot read.
-func commitUnreadable(ctx context.Context, repoPath, name, id string) error {
-	// One batch-check answers whether id names one object, and its type.
-	// For no object it prints "<id> missing", and for an abbreviation that
-	// more than one object has, "<id> ambiguous" (git's batch output,
-	// fixed words after the id it was given).
-	out, err := Run(ctx, Cmd{Class: Light, Dir: repoPath, Stdin: strings.NewReader(id + "\n"),
-		Args: []string{"cat-file", "--batch-check=%(objectname) %(objecttype)"}})
+// resolveCommitObject resolves a candidate's full object id to a commit.
+// One batch-check reads the object's type and its peel to a commit. git
+// answers a ref whose object is missing as "<id> missing", and a tag
+// whose commit is missing as "<id>^{commit} missing". An id with no
+// object, and an object that is not a commit (or a tag of one), answer
+// with no sha and no error. A ref whose object is missing, a broken tag
+// chain, and a commit git cannot read are errors.
+func resolveCommitObject(ctx context.Context, repoPath, cand, id string) (string, error) {
+	out, err := Run(ctx, Cmd{Class: Light, Dir: repoPath,
+		Stdin: strings.NewReader(id + "\n" + id + "^{commit}\n" + id + "^{}\n"),
+		Args:  []string{"cat-file", "--batch-check=%(objectname) %(objecttype)"}})
 	if err != nil {
-		return err
+		return "", err
 	}
-	line := strings.TrimSuffix(out, "\n")
-	switch line {
-	case id + " missing", id + " ambiguous":
-		if name == id {
-			return nil // an id that names no one object
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 3 {
+		return "", fmt.Errorf("cat-file --batch-check for %s emitted %q", id, out)
+	}
+	if lines[0] == id+" missing" {
+		if cand == id {
+			return "", nil // an unknown full id
 		}
-		return fmt.Errorf("%s names object %s, which is missing", name, id)
+		return "", fmt.Errorf("%s names object %s, which is missing", cand, id)
 	}
-	oid, typ, _ := strings.Cut(line, " ")
-	if !ref.ValidSHA(oid) || !strings.HasPrefix(oid, id) {
-		return fmt.Errorf("cat-file --batch-check for %s emitted %q", id, line)
+	oid, typ, _ := strings.Cut(lines[0], " ")
+	if oid != id || (typ != "commit" && typ != "tag" && typ != "tree" && typ != "blob") {
+		return "", fmt.Errorf("cat-file --batch-check for %s emitted %q", id, out)
 	}
-	switch typ {
-	case "tree", "blob":
-		return nil
-	case "commit":
-		return fmt.Errorf("git cannot read commit %s", oid)
-	case "tag":
-	default:
-		return fmt.Errorf("cat-file --batch-check for %s emitted %q", id, line)
+	if sha, kind, ok := strings.Cut(lines[1], " "); ok && ref.ValidSHA(sha) && kind == "commit" {
+		return sha, nil
 	}
-	// A tag. git peels its tag chain to the end (<id>^{}) and fails only
-	// when an object on the way is missing or a tag cannot be parsed.
-	// Nothing here reads a tag's message.
-	out, err = runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", oid+"^{}")
-	if err != nil {
-		return fmt.Errorf("git cannot peel %s: %w", oid, err)
+	if lines[1] != id+"^{commit} missing" {
+		return "", fmt.Errorf("cat-file --batch-check for %s emitted %q", id, out)
 	}
-	end := strings.TrimSpace(out)
-	if !ref.ValidSHA(end) {
-		return fmt.Errorf("rev-parse %s^{} emitted %q", oid, end)
+	if typ == "tree" || typ == "blob" {
+		return "", nil
 	}
-	out, err = runGit(ctx, Light, repoPath, "cat-file", "-t", end)
-	if err != nil {
-		return err
+	// A tag of a tree or a blob is not a commit. A failed ^{commit}
+	// peel, and anything else at the chain's end, is git's failure to
+	// read a commit or to peel the tag chain, not an unknown candidate.
+	if end, kind, ok := strings.Cut(lines[2], " "); ok && ref.ValidSHA(end) && (kind == "tree" || kind == "blob") {
+		return "", nil
 	}
-	if strings.TrimSpace(out) == "commit" {
-		return fmt.Errorf("git cannot read commit %s", end)
-	}
-	return nil // a tag of a tree or a blob
+	return "", fmt.Errorf("git cannot read commit or tag chain %s", id)
 }
