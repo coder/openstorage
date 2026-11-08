@@ -86,8 +86,9 @@ func staleLockSeam(seam *atomic.Pointer[func(string)], lock string) {
 // staleRefCleanup is the result of one cleanStaleRefLocks run.
 type staleRefCleanup struct {
 	// Old is the number of ref locks older than staleRefLockAge that the run
-	// found. A run that found none did nothing: it took no lease, logged no
-	// line and counted no outcome, and Outcome means nothing.
+	// found when it decided (see cleanStaleRefLocks). A run that found none
+	// did nothing: it logged no line and counted no outcome, and Outcome
+	// means nothing.
 	Old     int
 	Removed int
 	Outcome metrics.StaleRefLockOutcome
@@ -131,6 +132,16 @@ type staleRefCleanup struct {
 // A run that finds an old lock logs one line and counts one outcome, never
 // one per lock (a failed batch can leave thousands of locks), also when it
 // fails: an error counts as kept.
+//
+// The run is counted at the point where it decides. A busy lease and a
+// repository without an epoch decide before the lease is held, and an error
+// decides where it happens. Otherwise the look under the exclusive lease
+// decides. The first look runs without the lease, so the git that held a
+// lock can finish its transaction before the run holds the lease, and then
+// the lock is gone or no longer old. That lock was a live git's and not a
+// stale one, so a run whose old locks are gone at the second look found no
+// stale lock: it logs nothing, counts nothing and takes the lease only for
+// that look.
 func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res staleRefCleanup, err error) {
 	paths := refLockPaths(repoPath, names)
 	old := oldRefLocks(paths, now)
