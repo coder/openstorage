@@ -88,7 +88,7 @@ func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...strin
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Stdin = stdin
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the log
 	cmd.Stderr = &stderr
 	lease, err := gitlimit.OpenLease(ctx, dir)
 	if err != nil {
@@ -99,7 +99,7 @@ func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...strin
 	out, err := cmd.Output()
 	if err != nil {
 		return string(out), fmt.Errorf("git %s: %w: %s",
-			strings.Join(args, " "), normalizeCtxErr(ctx, err), strings.TrimSpace(stderr.String()))
+			strings.Join(args, " "), normalizeCtxErr(ctx, err), stderr.String())
 	}
 	return string(out), nil
 }
@@ -791,7 +791,7 @@ func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn fun
 	cmd := exec.CommandContext(ctx, "git", "show-index")
 	cmd.Dir = repoPath
 	cmd.Stdin = idx
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the repack log
 	cmd.Stderr = &stderr
 	lease, err := gitlimit.OpenLease(ctx, repoPath)
 	if err != nil {
@@ -827,7 +827,7 @@ func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn fun
 	// early scan abort, then surface the first failure.
 	_, _ = io.Copy(io.Discard, stdout)
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("git show-index: %w: %s", normalizeCtxErr(ctx, err), strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("git show-index: %w: %s", normalizeCtxErr(ctx, err), stderr.String())
 	}
 	return scanErr
 }
