@@ -369,13 +369,23 @@ func (f *localSchedFixture) sweep(t *testing.T) {
 	f.idle(t)
 }
 
+// idleDeadlineMargin is how long before the test binary's -timeout idle
+// gives up, so that its failure, and not the timeout's panic, names the
+// stuck job.
+const idleDeadlineMargin = time.Minute
+
 // idle waits until no scheduler job is queued or running. A run ends
 // within its claim lease, so idle waits that long before it calls a job
 // stuck: a shorter wait fails a run that is slow but inside its budget.
+// A lane whose -timeout ends sooner (CI's S3-WAL lane gives the suite 10
+// minutes) ends the wait idleDeadlineMargin before it.
 func (f *localSchedFixture) idle(t *testing.T) {
 	t.Helper()
-	bound := claimLease(f.wf.worker.Timeout)
-	deadline := time.Now().Add(bound)
+	start := time.Now()
+	deadline := start.Add(claimLease(f.wf.worker.Timeout))
+	if d, ok := t.Deadline(); ok && d.Add(-idleDeadlineMargin).Before(deadline) {
+		deadline = d.Add(-idleDeadlineMargin)
+	}
 	for {
 		f.sched.mu.Lock()
 		n := len(f.sched.inflight)
@@ -384,7 +394,7 @@ func (f *localSchedFixture) idle(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("scheduler still has %d jobs in flight after %v, a run's lease", n, bound)
+			t.Fatalf("scheduler still has %d jobs in flight after %v", n, time.Since(start).Round(time.Second))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
