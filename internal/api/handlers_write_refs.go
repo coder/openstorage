@@ -231,7 +231,7 @@ func wrefGit(ctx context.Context, repoPath string, extraEnv []string, stdin io.R
 	cmd.Stdin = stdin
 	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
-	out, err := gitlimit.Output(cmd)
+	out, err := gitlimit.OutputIn(ctx, repoPath, cmd)
 	if err != nil {
 		return string(out), fmt.Errorf("%s: %w: %s", gitlimit.Name(args), err, strings.TrimSpace(stderr.String()))
 	}
