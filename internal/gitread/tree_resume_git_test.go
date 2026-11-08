@@ -313,8 +313,9 @@ func TestLsTreePageCursorOnNamesAroundTheBuffer(t *testing.T) {
 	}
 }
 
-// git reads a replaced object through its replacement, the stream and the
-// walk both: the pages and the sizes are the ones ls-tree prints.
+// git reads every object as itself (gitlimit sets GIT_NO_REPLACE_OBJECTS),
+// the stream and the walk both: a refs/replace/* ref, which any pusher can
+// write, changes no page and no size.
 func TestLsTreePageCursorOnReplacedObjects(t *testing.T) {
 	dir, commit := fiRepo(t, nestedFiles())
 	ctx := context.Background()
@@ -325,8 +326,14 @@ func TestLsTreePageCursorOnReplacedObjects(t *testing.T) {
 	subRepl := rawTree(t, dir, [2]string{"100644 c", "zz"}, [2]string{"100644 d", "yy"})
 	gitIn(t, dir, "", "update-ref", "refs/replace/"+sub, subRepl)
 	sorted := sortedListing(t, dir, commit, "")
-	if !slices.ContainsFunc(sorted, func(e TreeEntry) bool { return e.Path == "dir/a/d" }) {
-		t.Fatalf("control: git does not read the replaced folder: %v", paths(sorted))
+	if slices.ContainsFunc(sorted, func(e TreeEntry) bool { return e.Path == "dir/a/d" }) {
+		t.Fatalf("the listing reads the replaced folder: %v", paths(sorted))
+	}
+	if i := slices.IndexFunc(sorted, func(e TreeEntry) bool { return e.Path == "dir/b0" }); i < 0 || sorted[i].SHA != blob {
+		t.Fatalf("dir/b0 is not listed as its own blob %s: %v", blob, sorted)
+	}
+	if out := gitIn(t, dir, "", "cat-file", "-p", blob); !strings.Contains(out, "a much longer replacement") {
+		t.Fatalf("control: plain git does not read the replacement: %q", out)
 	}
 	for _, e := range sorted {
 		want, wantMore := windowOf(sorted, e.Path, 4)

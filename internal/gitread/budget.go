@@ -74,8 +74,8 @@ var (
 	ErrBlobTooLarge = errors.New("blob exceeds the API read size limit")
 	// ErrSymlinkTooLong: a symlink's target is longer than MaxSymlinkTarget.
 	// The size that the tree lists is checked before git starts. A blob
-	// that git prints longer than listed (a replacement object that
-	// appeared since) ends git at the first byte over the limit.
+	// that git prints longer than listed (a broken object store: git reads
+	// no replacement objects) ends git at the first byte over the limit.
 	ErrSymlinkTooLong = errors.New("symlink target exceeds the API read size limit")
 	// ErrMemoryLimit: git needed more heap than its class's cap and was
 	// stopped by its own allocation failure (Linux only).
