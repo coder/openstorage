@@ -132,8 +132,8 @@ func TestGrepBadPattern(t *testing.T) {
 	f := newFixture(t)
 	_, err := Grep(context.Background(), f.dir, f.c2, GrepOptions{Pattern: "["})
 	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 128 {
-		t.Fatalf("bad-pattern grep err = %v, want exit status 128", err)
+	if !errors.Is(err, ErrBadPattern) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 128 {
+		t.Fatalf("bad-pattern grep err = %v, want ErrBadPattern with exit status 128", err)
 	}
 }
 
@@ -226,6 +226,9 @@ func TestGrepReadErrorIsGitsUnreadableObjectLine(t *testing.T) {
 			{"unreadable blob", "error: 'HEAD:b.txt': unable to read " + oid, true},
 			{"unreadable blob, then 70 KiB", "error: 'HEAD:b.txt': unable to read " + oid + "\n" + noise, true},
 			{"unreadable blob with a newline in its path", "warning: a\nerror: 'HEAD:x\ny.txt': unable to read " + oid + "\n", true},
+			{"unreadable blob with a 64-hex (SHA-256) id", "error: 'HEAD:b.txt': unable to read " + strings.Repeat("ce", 32) + "\n", true},
+			{"unreadable blob with a 300-byte path, in one write", "error: 'HEAD:" + strings.Repeat("d/", 150) + "b.txt': unable to read " + oid + "\n", true},
+			{"unable to read without the quoted name", "error: unable to read " + oid + "\n", false},
 			{"attribute name", "error: is not a valid attribute name: .gitattributes:2\n", false},
 			{"diagnostic text inside a line", "warning: ': unable to read " + oid + " and more\n", false},
 		} {
