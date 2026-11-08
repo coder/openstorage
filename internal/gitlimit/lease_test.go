@@ -3,6 +3,7 @@ package gitlimit
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -187,6 +188,87 @@ func TestFailedStartReleasesTheLease(t *testing.T) {
 	}
 	if err := tryExclusive(t, repo); err != nil {
 		t.Fatalf("TryExclusive after a failed start = %v", err)
+	}
+}
+
+// Only CreateEpoch writes the epoch, for a repository that the caller just
+// created. No open of the lease writes it: a late epoch in a directory that
+// an older release used would make a lock of that release's git look newer
+// than the epoch (#490). CreateEpoch fails when the file exists, and the
+// epoch is a time that later opens never move.
+func TestOnlyCreateEpochWritesTheEpoch(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := LeaseEpoch(repo); !errors.Is(err, ErrNoEpoch) {
+		t.Fatalf("LeaseEpoch before any open = %v, want ErrNoEpoch", err)
+	}
+	for _, open := range []struct {
+		name string
+		fn   func(repo string) error
+	}{
+		{"OpenLease", func(repo string) error { l, err := OpenLease(t.Context(), repo); closeLease(l); return err }},
+		{"TryExclusive", func(repo string) error { l, err := TryExclusive(repo); closeLease(l); return err }},
+	} {
+		if err := open.fn(repo); err != nil {
+			t.Fatalf("%s: %v", open.name, err)
+		}
+		if _, err := LeaseEpoch(repo); !errors.Is(err, ErrNoEpoch) {
+			t.Fatalf("LeaseEpoch after %s = %v, want ErrNoEpoch: an open wrote the epoch", open.name, err)
+		}
+	}
+
+	before := time.Now().Add(-2 * time.Second)
+	if err := CreateEpoch(repo); err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := LeaseEpoch(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch.Before(before) || epoch.After(time.Now().Add(2*time.Second)) {
+		t.Fatalf("epoch %v is not the time of CreateEpoch", epoch)
+	}
+	if err := CreateEpoch(repo); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("second CreateEpoch = %v, want a file exists error", err)
+	}
+
+	old := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(filepath.Join(repo, EpochFile), old, old); err != nil {
+		t.Fatal(err)
+	}
+	l, err := OpenLease(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeLease(l)
+	l, err = TryExclusive(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeLease(l)
+	if got, err := LeaseEpoch(repo); err != nil || !got.Equal(old) {
+		t.Fatalf("epoch after later opens = %v (%v), want it unchanged at %v", got, err, old)
+	}
+}
+
+func closeLease(l *Lease) {
+	if l != nil {
+		_ = l.Close()
+	}
+}
+
+// A lease epoch that is not a regular file is an error, not "no epoch": the
+// repository was tampered with, and cleanup must not read a time from it.
+func TestLeaseEpochRefusesAnythingButARegularFile(t *testing.T) {
+	repo := t.TempDir()
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(repo, EpochFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LeaseEpoch(repo); err == nil || errors.Is(err, ErrNoEpoch) {
+		t.Fatalf("LeaseEpoch of a symlink = %v, want an error that is not ErrNoEpoch", err)
 	}
 }
 
@@ -547,6 +629,46 @@ func TestReadOnlyFilesystemWithoutALeaseFileStillRuns(t *testing.T) {
 	}
 }
 
+// TryExclusive proves that no git is alive, and on a read-only filesystem it
+// cannot also write what cleanup writes next: it fails, with and without a
+// lease file, and takes no lock. (OpenLease is the only caller that falls
+// back to a read-only open.)
+func TestTryExclusiveFailsOnAReadOnlyFilesystem(t *testing.T) {
+	for _, withFile := range []bool{true, false} {
+		name := "without a lease file"
+		if withFile {
+			name = "with a lease file"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo := t.TempDir()
+			if withFile {
+				if err := tryExclusive(t, repo); err != nil {
+					t.Fatal(err)
+				}
+			}
+			readOnlyFilesystem(t)
+			l, err := TryExclusive(repo)
+			if err == nil {
+				_ = l.Close()
+				t.Fatal("TryExclusive on a read-only filesystem succeeded")
+			}
+			if !errors.Is(err, syscall.EROFS) {
+				t.Fatalf("TryExclusive on a read-only filesystem = %v, want an EROFS error", err)
+			}
+			if withFile {
+				probe, err := os.Open(filepath.Join(repo, LeaseFile))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer probe.Close()
+				if err := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+					t.Fatalf("the failed TryExclusive left the lease file locked: %v", err)
+				}
+			}
+		})
+	}
+}
+
 // Only EROFS selects the fallback. A lease file that exists but cannot be
 // opened is an error, and so is any other failure: there a git can take ref
 // locks, so a lease that holds nothing would hide it from TryExclusive.
@@ -589,6 +711,45 @@ func TestOpenLeaseFailsClosedOutsideAReadOnlyFilesystem(t *testing.T) {
 	if l, err := OpenLease(t.Context(), locked); err == nil {
 		_ = l.Close()
 		t.Fatal("OpenLease of a lease file with mode 0 succeeded")
+	}
+}
+
+// A lease file that exists but that serve cannot write (mode 0400, or a file
+// of another user) still gives a real lease: flock needs no write access, so
+// OpenLease and TryExclusive open it read-only. Without that, every git start
+// in the repository would fail.
+func TestAnUnwritableLeaseFileStillGivesARealLease(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	repo := t.TempDir()
+	if err := tryExclusive(t, repo); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(repo, LeaseFile)
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := OpenLease(t.Context(), repo)
+	if err != nil {
+		t.Fatalf("OpenLease of a lease file that serve cannot write = %v", err)
+	}
+	defer l.Close()
+	if l.f == nil {
+		t.Fatal("the lease holds nothing although the lease file exists")
+	}
+	if err := tryExclusive(t, repo); !errors.Is(err, ErrLeaseBusy) {
+		t.Fatalf("TryExclusive under a shared lease on a read-only descriptor = %v, want ErrLeaseBusy", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tryExclusive(t, repo); err != nil {
+		t.Fatalf("TryExclusive of a lease file that serve cannot write, with no lease held = %v", err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o400 {
+		t.Fatalf("lease file after the opens = %v, %v, want mode 0400 unchanged", fi, err)
 	}
 }
 

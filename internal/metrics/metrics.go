@@ -119,6 +119,24 @@ var commitGraphOutcomeNames = [...]string{
 	CommitGraphFailed:        "failed",
 }
 
+// StaleRefLockOutcome is how one stale ref lock cleanup of a cache
+// repository ended (issue #490): the run removed at least one lock, was
+// refused because a git that serve started is still alive in the
+// repository, or kept every lock it found.
+type StaleRefLockOutcome int
+
+const (
+	StaleRefLockRemoved StaleRefLockOutcome = iota
+	StaleRefLockBusy
+	StaleRefLockKept
+)
+
+var staleRefLockOutcomeNames = [...]string{
+	StaleRefLockRemoved: "removed",
+	StaleRefLockBusy:    "busy",
+	StaleRefLockKept:    "kept",
+}
+
 var codeClasses = [...]string{"1xx", "2xx", "3xx", "4xx", "5xx"}
 
 var (
@@ -157,6 +175,10 @@ var (
 		Name: "openstorage_commit_graph_refresh_total",
 		Help: "Commit-graph refreshes of cache repositories after full hydrates in this process, by fixed outcome (no repository label).",
 	}, []string{"outcome"})
+	staleRefLockCleanup = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "openstorage_stale_ref_lock_cleanup_total",
+		Help: "Stale ref lock cleanups of cache repositories in this process, one per run that found a ref lock older than one minute, by fixed outcome: removed = at least one lock removed, busy = a git that serve started is alive in the repository, kept = every lock kept (no repository label).",
+	}, []string{"outcome"})
 	jobRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "openstorage_job_runs_total",
 		Help: "Executions of background job operations in this process, by fixed job and outcome.",
@@ -165,12 +187,15 @@ var (
 
 func init() {
 	registry.MustRegister(httpRequests, httpDuration, s3walContention, s3walLeaseRenewalFailures,
-		s3walLeaseHeld, s3walSizeGuard, s3walMetaRefused, jobRuns, commitGraphRefresh)
+		s3walLeaseHeld, s3walSizeGuard, s3walMetaRefused, jobRuns, commitGraphRefresh, staleRefLockCleanup)
 	for _, c := range metaRefusalNames {
 		s3walMetaRefused.WithLabelValues(c)
 	}
 	for _, o := range commitGraphOutcomeNames {
 		commitGraphRefresh.WithLabelValues(o)
+	}
+	for _, o := range staleRefLockOutcomeNames {
+		staleRefLockCleanup.WithLabelValues(o)
 	}
 	// Initialize every finite series so a clean process exposes zeros
 	// instead of missing series.
@@ -232,6 +257,11 @@ func S3WALMetaRefused(c MetaRefusal) {
 // CommitGraphRefresh counts one cache commit-graph refresh outcome.
 func CommitGraphRefresh(o CommitGraphOutcome) {
 	commitGraphRefresh.WithLabelValues(name(commitGraphOutcomeNames[:], o)).Inc()
+}
+
+// StaleRefLockCleanup counts one stale ref lock cleanup run.
+func StaleRefLockCleanup(o StaleRefLockOutcome) {
+	staleRefLockCleanup.WithLabelValues(name(staleRefLockOutcomeNames[:], o)).Inc()
 }
 
 // JobRun counts one background job execution outcome.

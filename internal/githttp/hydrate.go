@@ -311,6 +311,10 @@ func cacheRepoUnchanged(repoPath string, m cacheRepoMemo) bool {
 	return true
 }
 
+// createEpoch is gitlimit.CreateEpoch behind a test seam: fault injection for
+// a creation that stops after the directory was made.
+var createEpoch = gitlimit.CreateEpoch
+
 // EnsureCacheRepoCtx is EnsureCacheRepo honoring ctx in its lock wait and
 // git subprocesses (init, config): the repack fold's materialization runs the
 // setup under the fold's wall-clock budget, and a stalled subprocess or
@@ -327,7 +331,10 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 	if m, ok := cacheRepoMemos.Load(path); ok && cacheRepoUnchanged(path, m.(cacheRepoMemo)) {
 		return path, nil
 	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
 	// Cold initialization and repairs write config.lock. Serialize the full
@@ -363,6 +370,25 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 		}
 		if err != nil || (name != "HEAD" && !fi.IsDir()) {
 			needsInit = true
+		}
+	}
+	// A directory without HEAD is no repository: no git has held a ref lock
+	// there, and none can before the git init below. It gets the lease epoch
+	// (gitlimit.EpochFile) now, whether this call made it or an earlier
+	// creation stopped before git init. A racing call can have written it
+	// first. A repository that has HEAD gets none: an older release can have
+	// a git alive in it that holds no lease, so the stale ref lock cleanup
+	// keeps every lock there (staleref.go). Any entry named HEAD counts, so
+	// the test is Lstat: with core.preferSymlinkRefs an older release writes
+	// HEAD as a symlink to a branch that has no ref yet, which Stat reports
+	// as missing.
+	_, headErr := os.Lstat(filepath.Join(path, "HEAD"))
+	if headErr != nil && !errors.Is(headErr, os.ErrNotExist) {
+		return "", headErr
+	}
+	if errors.Is(headErr, os.ErrNotExist) {
+		if err := createEpoch(path); err != nil && !errors.Is(err, os.ErrExist) {
+			return "", err
 		}
 	}
 	// A canceled Git child can leave HEAD before init finishes, or leave
