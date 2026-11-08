@@ -723,7 +723,7 @@ Other limits and gaps:
 | 200/201 | success (201 accepted by SDKs on create endpoints) |
 | 202 | pull-upstream / push-upstream accepted |
 | 206/304/412/416 | file conditional/range results (passed through) |
-| 400 | invalid input; also "custom notes refs not enabled" |
+| 400 | invalid input, a `diff-commit` patch over 262144000 bytes among them ([streaming protocols](../explanation/streaming-commit-protocols.md)); also "custom notes refs not enabled" |
 | 401 | no `Authorization` header, or a scheme other than `Bearer` (`Authentication required`) |
 | 403 | a token that fails verification (`Invalid or expired token`); permission or ref-policy denied; `authentication_unavailable` when the key store fails (retry) ([failure mapping](authentication.md#failure-mapping)) |
 | 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`) |
