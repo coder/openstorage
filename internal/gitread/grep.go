@@ -120,7 +120,7 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 	}
 	var stderr gitlimit.TailBuffer
 	var unreadable grepUnreadableWatch
-	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Args: args, Stderr: io.MultiWriter(&stderr, &unreadable)})
+	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Env: noTreeAttrsEnv(), Args: args, Stderr: io.MultiWriter(&stderr, &unreadable)})
 	var exitErr *exec.ExitError
 	noMatch := errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 	// git grep that cannot read a blob prints "error: '<name>': unable to

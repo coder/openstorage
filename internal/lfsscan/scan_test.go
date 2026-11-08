@@ -300,6 +300,40 @@ func TestReachableLFSOIDs_IgnoresReplacementRefs(t *testing.T) {
 	}
 }
 
+// A refs/replace/<pointer blob> can also swap the pointer file's content
+// for a blob that is no pointer, which cat-file --batch would read, or for
+// an empty blob, which cat-file --batch-check would report as size 0, so
+// that the walk never reads it. Every stage reads the true blob.
+func TestReachableLFSOIDs_IgnoresReplacedBlobs(t *testing.T) {
+	for _, tc := range []struct{ name, content string }{
+		{"by text", "not a pointer\n"},
+		{"by an empty blob", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mustGit(t, dir, "init", "-q", "--initial-branch=main")
+			writeFile(t, dir, "a.bin", lfsPointer(oidA, 100), 0o644)
+			writeFile(t, dir, "other.txt", tc.content, 0o644)
+			mustGit(t, dir, "add", "-A")
+			mustGit(t, dir, "commit", "-q", "-m", "pointer commit")
+			pointerBlob := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD:a.bin"))
+			other := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD:other.txt"))
+			mustGit(t, dir, "replace", pointerBlob, other)
+			// Sanity: a replacement-honoring read gets the other content.
+			if got := mustGit(t, dir, "cat-file", "-p", pointerBlob); got != tc.content {
+				t.Fatalf("fixture broken: replacement did not swap the pointer blob (%d bytes)", len(got))
+			}
+			oids, _, err := ReachableLFSOIDs(context.Background(), dir, 1_000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := oids[oidA]; !ok {
+				t.Fatalf("a replaced pointer blob hid its OID: %v", oids)
+			}
+		})
+	}
+}
+
 func TestReachableLFSOIDs_EmptyRepo(t *testing.T) {
 	dir := t.TempDir()
 	mustGit(t, dir, "init", "-q", "--initial-branch=main")
