@@ -47,8 +47,9 @@ func TestTailBufferHoldsAbout64KiB(t *testing.T) {
 }
 
 // A cut inside a UTF-8 sequence drops its continuation bytes, so the tail
-// starts at a character. A tail that was not cut keeps git's bytes as
-// they are.
+// starts at a character, whether one Write or many smaller ones (exec
+// writes 32 KiB at a time) bring the cut. A tail that was not cut keeps
+// git's bytes as they are.
 func TestTailBufferStartsAtACharacter(t *testing.T) {
 	for _, c := range []struct{ in, want string }{
 		// 90000 bytes of 3-byte runes: the cut keeps 65536 bytes, the
@@ -59,16 +60,56 @@ func TestTailBufferStartsAtACharacter(t *testing.T) {
 		// is the most a cut can leave.
 		{strings.Repeat("𝄞", 20000) + "a", strings.Repeat("𝄞", (64<<10)/4-1) + "a"},
 	} {
-		var tail TailBuffer
-		_, _ = tail.Write([]byte(c.in))
-		got := tail.String()
-		if !utf8.ValidString(got) || got != c.want {
-			t.Fatalf("tail starts %q and holds %d bytes, want %d bytes of whole runes", got[:min(4, len(got))], len(got), len(c.want))
+		for _, size := range []int{len(c.in), 32 << 10, 1000} {
+			var tail TailBuffer
+			for p := []byte(c.in); len(p) > 0; {
+				n := min(size, len(p))
+				_, _ = tail.Write(p[:n])
+				p = p[n:]
+			}
+			got := tail.String()
+			if !utf8.ValidString(got) || got != c.want {
+				t.Fatalf("writes of %d bytes: tail starts %q and holds %d bytes, want %d bytes of whole runes", size, got[:min(4, len(got))], len(got), len(c.want))
+			}
 		}
 	}
 	var uncut TailBuffer
 	_, _ = uncut.Write([]byte("\xa9git"))
 	if got := uncut.String(); got != "\xa9git" {
 		t.Fatalf("uncut tail = %q, want git's bytes", got)
+	}
+}
+
+// One Write of exactly 64 KiB into an empty buffer drops nothing, so its
+// bytes stay as git wrote them. After earlier bytes, the same Write drops
+// them: that is a cut, and the tail starts at the next character.
+func TestTailBufferExactFit(t *testing.T) {
+	fit := "\x82\xac" + strings.Repeat("a", 64<<10-2)
+	var only TailBuffer
+	_, _ = only.Write([]byte(fit))
+	if got := only.String(); got != fit {
+		t.Errorf("one Write of 64 KiB: kept %q... (%d bytes), want git's bytes", got[:min(4, len(got))], len(got))
+	}
+	var after TailBuffer
+	_, _ = after.Write([]byte("\xe2"))
+	_, _ = after.Write([]byte(fit))
+	if got := after.String(); got != fit[2:] {
+		t.Errorf("64 KiB after one byte: kept %q... (%d bytes), want the tail from its first character", got[:min(4, len(got))], len(got))
+	}
+}
+
+// Write keeps no reference to p (the io.Writer contract): exec reuses its
+// buffer for the next read, and a caller can reuse its own.
+func TestTailBufferCopiesWhatItKeeps(t *testing.T) {
+	for _, size := range []int{70000, 1000} {
+		p := bytes.Repeat([]byte("a"), size)
+		var tail TailBuffer
+		_, _ = tail.Write(p)
+		for i := range p {
+			p[i] = 'z'
+		}
+		if got := tail.String(); got != strings.Repeat("a", min(size, 64<<10)) {
+			t.Errorf("a Write of %d bytes: the tail changed with the caller's array to %.8q...", size, got)
+		}
 	}
 }
