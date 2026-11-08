@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -75,6 +76,20 @@ func Output(cmd *exec.Cmd) ([]byte, error) {
 	return out.Bytes(), err
 }
 
+// NoReplaceObjects returns env (nil: the server's environment) with
+// GIT_NO_REPLACE_OBJECTS set, so that git reads every object as itself.
+// Any token with git:write can push refs/replace/<id>, which would
+// otherwise make git read one object as another: a commit with other
+// parents in a no-force-push check, a signed commit in a verify-sig
+// check, another tree under a server-written commit. Every child that
+// Start runs gets it, and receive-pack passes it to its hooks.
+func NoReplaceObjects(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	return append(slices.Clip(env), "GIT_NO_REPLACE_OBJECTS=1")
+}
+
 // Stopping reports whether StopChildren began.
 func Stopping() bool { return children.isStopped() }
 
@@ -98,6 +113,7 @@ func failStart(cmd *exec.Cmd, err error) error {
 func (g *registry) start(cmd *exec.Cmd) error {
 	assertf(cmd.SysProcAttr == nil, "gitlimit.Start: cmd already has SysProcAttr")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = NoReplaceObjects(cmd.Env)
 	if g.isStopped() {
 		return failStart(cmd, ErrStopping)
 	}
