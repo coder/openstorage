@@ -32,6 +32,7 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 - `PrepareArchive` fails before any byte is written when a kept blob exceeds the size limit [archive.go:PrepareArchive]
 - `ValidArchivePrefix` rejects NUL, backslash, a leading slash, and `.`/`..` segments [archive.go:ValidArchivePrefix]
 - `mergeNumstat` and `mergePatches` error on any mismatch between the three diff passes [diff.go:mergeNumstat]
+- A type change (`T`) is one `--raw` and one `--numstat` record, and two `--patch` sections (its deletion, then its addition): its `Patch` holds both [diff.go:mergePatches]
 - `LastCommits` fails with `ErrTooManyLastCommits` past `maxDistinct`; spool lines over 1 MiB or spool over 256 MiB fail with `ErrOutputLimit` [lastcommits.go:spoolWriter]
 - `Note` maps git exit 1 to `ErrNotFound`; `PeeledTags` skips non-commit tags [notes.go:Note]
 - A failed `Blame` reads only the exit status and fixed parts of git's stderr, never the path, which git rewrites in its messages. With ranges, exit 129, or exit 128 with stderr that starts `fatal: -L `, or that starts `fatal: file ` and ends `has only N line(s)`, read from the first line that starts `fatal: `, is `ErrBadRange`: git prints no other fatal line before that message, and a path in it comes after the fixed head. Otherwise `ls-tree` decides: a path that names no file (not one blob or symlink, or entries under `<path>/`) is `ErrNotFound`, and any other failure is returned [blame.go:Blame]

@@ -181,7 +181,9 @@ func mergeNumstat(files []FileDiff, out string) error {
 // lines and assigns the slices to files in order (git emits --patch,
 // --numstat, and --name-status in the same file order). Content lines can
 // never start with "diff --git " at column 0: they carry a ' ', '+', or '-'
-// prefix.
+// prefix. The other two give a type change (T: a file that becomes a
+// symlink or a submodule, or back) one record, and --patch gives it two
+// sections, its deletion and its addition: that file's patch is both.
 func mergePatches(files []FileDiff, patch string) error {
 	if len(files) == 0 {
 		if strings.TrimSpace(patch) != "" {
@@ -201,15 +203,28 @@ func mergePatches(files []FileDiff, patch string) error {
 		}
 		pos += next + 1
 	}
-	if len(starts) != len(files) {
-		return fmt.Errorf("diff --patch has %d file headers, want %d", len(starts), len(files))
-	}
-	for i := range files {
-		end := len(patch)
-		if i+1 < len(starts) {
-			end = starts[i+1]
+	sections := func(f FileDiff) int {
+		if f.Status == "T" {
+			return 2
 		}
-		files[i].Patch = patch[starts[i]:end]
+		return 1
+	}
+	want := 0
+	for _, f := range files {
+		want += sections(f)
+	}
+	if len(starts) != want {
+		return fmt.Errorf("diff --patch has %d file headers, want %d", len(starts), want)
+	}
+	k := 0
+	for i := range files {
+		first := k
+		k += sections(files[i])
+		end := len(patch)
+		if k < len(starts) {
+			end = starts[k]
+		}
+		files[i].Patch = patch[starts[first]:end]
 	}
 	return nil
 }
