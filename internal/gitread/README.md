@@ -26,6 +26,7 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 - `(*Budget).start` asserts the budget is open and returns `ErrTimeBudget` past the deadline; `limitedBuffer.Write` kills git once output is exhausted [budget.go:Budget.start]
 - `Run` never wraps `ExitError` for limit outcomes [budget.go:Run]
 - `Run`'s errors name the command with `gitlimit.Name` and quote the last 64 KiB of git's stderr (`gitlimit.TailBuffer`) [budget.go:Run]
+- `Cmd.Stderr`, when set, also receives git's stderr, for a caller that reads git's messages when git exits 0 [budget.go:Cmd]
 - `childEnv` forces `LC_MESSAGES=C` and keeps `LC_CTYPE`/`LC_COLLATE` [budget.go:childEnv]
 - `LsTree` passes paths as `:(literal)` pathspecs; `parseLsTreeRecord` rejects malformed records; `LsTreePage` returns `ErrUnsortedTree` on out-of-order output [tree.go:LsTreePage]
 - `PrepareArchive` fails before any byte is written when a kept blob exceeds the size limit [archive.go:PrepareArchive]
@@ -33,8 +34,8 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 - `mergeNumstat` and `mergePatches` error on any mismatch between the three diff passes [diff.go:mergeNumstat]
 - `LastCommits` fails with `ErrTooManyLastCommits` past `maxDistinct`; spool lines over 1 MiB or spool over 256 MiB fail with `ErrOutputLimit` [lastcommits.go:spoolWriter]
 - `Note` maps git exit 1 to `ErrNotFound`; `PeeledTags` skips non-commit tags [notes.go:Note]
-- A failed `Blame` reads only the exit status and fixed parts of git's stderr, never the path, which git rewrites in its messages. With ranges, exit 129, or exit 128 with stderr that starts `fatal: -L `, or that starts `fatal: file ` and ends `has only N line(s)`, is `ErrBadRange`: git prints only that message, and a path in it comes after the fixed head. Otherwise `ls-tree` decides: a path that names no file (not one blob or symlink, or entries under `<path>/`) is `ErrNotFound`, and any other failure is returned [blame.go:Blame]
-- `Grep` answers exit 1 with no output as no match, and exit 128 with a last line that starts `fatal: -e option, '` as `ErrBadPattern`; every other failure is returned [grep.go:runGrep]
+- A failed `Blame` reads only the exit status and fixed parts of git's stderr, never the path, which git rewrites in its messages. With ranges, exit 129, or exit 128 with stderr that starts `fatal: -L `, or that starts `fatal: file ` and ends `has only N line(s)`, after any leading `warning: ` lines, is `ErrBadRange`: git prints only that message after its warnings, and a path in it comes after the fixed head. Otherwise `ls-tree` decides: a path that names no file (not one blob or symlink, or entries under `<path>/`) is `ErrNotFound`, and any other failure is returned [blame.go:Blame]
+- `Grep` answers exit 0 or 1 with a stderr line that starts `error: ` (git could not read a blob, and went on) as a read error, exit 1 with no output as no match, and exit 128 with a last line that starts `fatal: -e option, '` as `ErrBadPattern`; every other failure is returned [grep.go:runGrep]
 
 ## Side Effects
 - `Materialize` writes the cache repo under `cacheDir`, reading packs from the blob store and refs from the ref store [gitread.go:Materialize]

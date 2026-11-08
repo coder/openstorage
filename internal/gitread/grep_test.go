@@ -208,3 +208,26 @@ func TestGrepUnreadableBlobIsAnError(t *testing.T) {
 		}
 	}
 }
+
+// Only a stderr line that starts "error: " makes a grep that exited 0 or
+// 1 a read error: it may come after another line, and "error: " inside a
+// line is not one.
+func TestGrepReadErrorIsALineThatStartsError(t *testing.T) {
+	f := newFixture(t)
+	for _, code := range []int{0, 1} {
+		for _, tc := range []struct {
+			stderr  string
+			readErr bool
+		}{
+			{"error: unable to read 1111", true},
+			{"warning: a\nerror: unable to read 1111", true},
+			{"warning: an error: inside a line", false},
+		} {
+			failingBlameGit(t, code, tc.stderr, "grep")
+			files, err := Grep(context.Background(), f.dir, f.c1, GrepOptions{Pattern: "zzz"})
+			if (err != nil) != tc.readErr || errors.Is(err, ErrBadPattern) {
+				t.Errorf("exit %d, stderr %q: files = %+v, err = %v, want a read error: %v", code, tc.stderr, files, err, tc.readErr)
+			}
+		}
+	}
+}

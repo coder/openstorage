@@ -74,6 +74,18 @@ func TestReadPathsOutsideTheRepository(t *testing.T) {
 			}
 		}
 
+		// Each paths entry is checked, not only the first.
+		resp, body := e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token,
+			rqGrepBody(t, map[string]any{"query": map[string]any{"pattern": "one"}, "paths": []string{"d", "../nope"}}), "")
+		check("grep d, ../nope", http.StatusBadRequest, resp, body)
+		if !bytes.Contains(body, []byte(`"paths.1"`)) {
+			t.Errorf("grep d, ../nope: the problem does not name paths.1: %.300s", body)
+		}
+		// "/" names the root for a listing, and no file: the file
+		// endpoint refuses it as outside the repository.
+		resp, body = get("/api/v1/repos/file?path=", "/")
+		check("file /", http.StatusBadRequest, resp, body)
+
 		// Paths inside the repository.
 		for _, tc := range []struct {
 			ep, path string
