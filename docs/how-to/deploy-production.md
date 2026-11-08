@@ -287,9 +287,10 @@ the cleanup ends. The cleanup then removes each lock that:
 - is a regular file older than one minute (a live Git holds a ref lock for the
   milliseconds of one transaction), and
 - is newer than the lease epoch, the modification time of
-  `<repo>.git/codestorage.gitlease.epoch`. `serve` writes that file when it creates the
-  repository directory, before Git runs there. A lock older than the epoch stays: it can
-  belong to a Git that holds no lease.
+  `<repo>.git/codestorage.gitlease.epoch`. `serve` writes that file for a repository
+  directory that has no `HEAD` yet (a new directory, or one that an interrupted creation
+  left), before Git runs there. A lock older than the epoch stays: it can belong to a Git
+  that holds no lease.
 
 Only a repository that this release created repairs itself. An older release can leave a
 Git child running after its server stopped: a kill does it, and so does a graceful stop of
@@ -324,9 +325,30 @@ with a lease. Two rules keep the other ones out of its way:
   cleanup can remove its lock.
 - Never reassign descriptor 10 in a hook (`exec 10>...`): the reference-transaction hook is
   installed only if absent, so a custom hook can, and its subtree then drops the lease.
+- Never delete `codestorage.gitlease.lock` while `serve` or one of its Git children runs.
+  A new file has a new inode, and the cleanup's exclusive lock on it succeeds although a
+  Git process still holds the lease on the old file.
+- Never remount a read-only cache directory read-write while a Git process runs in it. A
+  Git process that started on the read-only mount, where no lease file exists, holds no
+  lease, and after the remount it can hold a ref lock that the cleanup can then remove.
 
 The cache directory must be on a local filesystem: `flock` does not work on a network
 filesystem.
+
+**A Git start that fails on the lease file.** A Git start needs the lease file
+`<repo>.git/codestorage.gitlease.lock`. It fails, with an error that names that file
+(`open git lease: ...`), and nothing runs, in three cases:
+
+- The file exists and `serve` cannot open it, not even for reading. This happens after a
+  manual `chmod` or `chown`. A file that `serve` can read but not write works, because the
+  lease needs no write access.
+- The repository directory is not writable and has no lease file.
+- The disk is full and the repository has no lease file yet. Only a repository that has had
+  no Git start since the upgrade can be in this state.
+
+Fix the permission, the directory or the disk, and the next request runs. On a read-only
+mount, reads still work as before: with a lease file `serve` locks it read-only, and with no
+file nothing can write a ref lock, so the lease holds nothing.
 
 **Stale ref lock runbook.** Use it when the lines above keep appearing for one repository
 and the lock stays. To recover, rebuild that repository's cache:
