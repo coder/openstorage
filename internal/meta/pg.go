@@ -615,8 +615,7 @@ func escapeLike(s string) string {
 // prefix at the start, which consumes exactly the prefix's characters, so q
 // can only match the rest of the url after it.
 func listURLPattern(p ListParams) string {
-	assertf(p.Q == strings.TrimSpace(p.Q) && p.Prefix == strings.TrimSpace(p.Prefix),
-		"ListRepos: untrimmed filters q=%q prefix=%q", p.Q, p.Prefix)
+	assertListFilters(p)
 	if p.Q == "" && p.Prefix == "" {
 		return ""
 	}
