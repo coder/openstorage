@@ -112,3 +112,51 @@ func TestResolveRefUnreadableCommitIsAnError(t *testing.T) {
 		t.Errorf("ResolveRef(main): %v", err)
 	}
 }
+
+// commitUnreadable reads each of its git runs by its exit: only git's own
+// "no" (exit 1) leaves a candidate unknown. Any other failure of a git
+// run, and a commit at the end of the chain that rev-parse ^{commit}
+// could not read, is an error, never ErrNotFound.
+func TestCommitUnreadableGitFailures(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "a.txt", "one\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "c1")
+	tree := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD^{tree}"))
+	mustGit(t, dir, "tag", "-a", "-m", "tree", "tree-tag", tree)
+	tagObj := strings.TrimSpace(mustGit(t, dir, "rev-parse", "refs/tags/tree-tag"))
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const noCommit = "[ \"$1\" = rev-parse ] && [ \"$a\" = 'refs/heads/main^{commit}' ] && exit 1\n"
+	for _, tc := range []struct {
+		name, spec, rules string
+	}{
+		{"value of the ref exits 128", "main", noCommit + "[ \"$1\" = rev-parse ] && [ \"$a\" = refs/heads/main ] && exit 128\n"},
+		{"value of the ref is killed", "main", noCommit + "[ \"$1\" = rev-parse ] && [ \"$a\" = refs/heads/main ] && kill -KILL $$\n"},
+		{"cat-file -e exits 128", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && exit 128\n"},
+		{"cat-file -e is killed", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && kill -KILL $$\n"},
+		{"cat-file -e of a full id exits 128", tagObj, "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && exit 128\n"},
+		{"peel to the end exits 128", "tree-tag", "[ \"$1\" = rev-parse ] && [ \"$a\" = '" + tagObj + "^{}' ] && exit 128\n"},
+		{"cat-file -t exits 128", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -t ] && exit 128\n"},
+		{"a commit at the end of the chain", "main", noCommit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeGit(t, "for a in \"$@\"; do\n"+tc.rules+"done\nexec '"+realGit+"' \"$@\"")
+			if sha, err := ResolveRef(context.Background(), dir, tc.spec, false); err == nil || errors.Is(err, ErrNotFound) {
+				t.Fatalf("ResolveRef(%q) = (%q, %v), want an error that is not ErrNotFound", tc.spec, sha, err)
+			}
+		})
+	}
+	// The same fake git with no rule that fires: main resolves, and the
+	// tag of a tree is no commit.
+	fakeGit(t, "for a in \"$@\"; do\n[ \"$a\" = never-an-argument ] && exit 128\ndone\nexec '"+realGit+"' \"$@\"")
+	if _, err := ResolveRef(context.Background(), dir, "main", false); err != nil {
+		t.Fatalf("ResolveRef(main) through the fake git: %v", err)
+	}
+	if sha, err := ResolveRef(context.Background(), dir, "tree-tag", false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ResolveRef(tree-tag) = (%q, %v), want ErrNotFound", sha, err)
+	}
+}
