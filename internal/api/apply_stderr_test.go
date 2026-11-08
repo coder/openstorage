@@ -115,6 +115,52 @@ func TestApplyStderrKeepsABoundedPart(t *testing.T) {
 	}
 }
 
+// A stderr line without a newline, however long, keeps only its start
+// for the line checks (wcApplyLineKeep bytes), and its status is read at
+// the end.
+func TestApplyStderrLongLineKeepsItsStart(t *testing.T) {
+	c := &wcApplyStderr{needles: []string{"/srv/scratch"}}
+	line := append([]byte("error: invalid path '"), bytes.Repeat([]byte("x"), 64<<20)...)
+	for p := line; len(p) > 0; {
+		n := min(len(p), 32<<10)
+		_, _ = c.Write(p[:n])
+		p = p[n:]
+	}
+	if cap(c.line) > 2*wcApplyLineKeep || len(c.carry) >= len("/srv/scratch") {
+		t.Fatalf("a %d-byte line: the line buffer holds %d bytes and the carry %d, want at most %d and %d", len(line), cap(c.line), len(c.carry), 2*wcApplyLineKeep, len("/srv/scratch")-1)
+	}
+	if got := c.status(128); got != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a payload line that ends without a newline", got)
+	}
+	if c.serverFailure() {
+		t.Error("serverFailure = true for a line that names no server path")
+	}
+}
+
+// A server path that the writes split at any byte still counts, also the
+// longest of the paths, and in one-byte writes.
+func TestApplyStderrFindsASplitServerPath(t *testing.T) {
+	dirs := []string{"/srv/scratch", "/srv/cache/repositories/0f/0f3c"}
+	long := dirs[1]
+	text := "error: unable to read '" + long + "/objects/x': denied\n"
+	at := strings.Index(text, long)
+	for i := at + 1; i < at+len(long); i++ {
+		c := &wcApplyStderr{needles: dirs}
+		_, _ = c.Write([]byte(text[:i]))
+		_, _ = c.Write([]byte(text[i:]))
+		if !c.serverFailure() {
+			t.Errorf("a split after %d bytes of %q: serverFailure = false", i-at, long)
+		}
+	}
+	c := &wcApplyStderr{needles: dirs}
+	for i := range len(text) {
+		_, _ = c.Write([]byte{text[i]})
+	}
+	if !c.serverFailure() {
+		t.Error("one-byte writes: serverFailure = false")
+	}
+}
+
 // A patch of 20,000 files that the base does not have: git apply prints
 // about 850 KB of stderr. The answer is the 409 it was before, with the
 // message cut to wcMaxApplyMsgBytes.
