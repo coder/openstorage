@@ -33,6 +33,23 @@ func (discardSyncEvents) Emit(context.Context, string, string, []byte) {}
 // held A: the lane keeps the request until a run can forward B.
 func TestLocalForwardHeldStaleRefRestores(t *testing.T) {
 	skipUnlessLocalSchedule(t)
+	forwardHeldStaleRefRestores(t, false)
+}
+
+// TestRiverForwardHeldStaleRefRestores is the same replay on PostgreSQL,
+// where a run is a River job: the refused run hands its request back
+// with RestorePush and fails, so River runs the job again.
+func TestRiverForwardHeldStaleRefRestores(t *testing.T) {
+	if testBackend != backendPG {
+		t.Skip("River runs push jobs on PostgreSQL only")
+	}
+	forwardHeldStaleRefRestores(t, true)
+}
+
+// forwardHeldStaleRefRestores runs the replay with the local schedule
+// (river false) or River's wiring (no local lanes).
+func forwardHeldStaleRefRestores(t *testing.T, river bool) {
+	t.Helper()
 	ctx := t.Context()
 	metaURL, blobsURL := privateStores(t, t.TempDir())
 	// The in-process server plays the serve node, so the seed pushes'
@@ -113,9 +130,12 @@ func TestLocalForwardHeldStaleRefRestores(t *testing.T) {
 	}
 
 	creds, ups := upsync.MetaStores(ms)
-	lanes, ok := upsync.MetaLocalLanes(ms)
-	if !ok {
-		t.Fatalf("%T has no local schedule", ms)
+	var lanes upsync.LocalLanes
+	if !river {
+		var ok bool
+		if lanes, ok = upsync.MetaLocalLanes(ms); !ok {
+			t.Fatalf("%T has no local schedule", ms)
+		}
 	}
 	var holdPath string
 	w := &upsync.Worker{
@@ -154,11 +174,24 @@ func TestLocalForwardHeldStaleRefRestores(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := upsync.Job{Org: testOrg, RepoID: id}
-	if err := w.RunPush(ctx, job); err != nil {
-		t.Logf("run with the held ref: %v", err)
-	}
+	err = w.RunPush(ctx, job)
 	if holdPath == "" {
 		t.Fatal("the run never reached its publication wait")
+	}
+	if river {
+		// An error, so River's completion gate snoozes the job.
+		if err == nil {
+			t.Fatal("refused River run returned nil; want an error, so River runs the job again")
+		}
+		up, gerr := ms.GetRepoUpstream(ctx, id)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if up.PushSyncing || up.PushPending == 0 || up.PushRunCount != 0 {
+			t.Fatalf("after the refused run: %+v; want the request handed back and no counted run", up)
+		}
+	} else if err != nil {
+		t.Logf("run with the held ref: %v", err)
 	}
 	// The push's CAS fails on its stale base: it exits and its hold goes.
 	removePushHoldFiles(holdPath)
