@@ -105,6 +105,12 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 			t.Errorf("%s: tree %q found %v err %v, want tree %q found %v broken %v", tc.name, tree, found, err, tc.tree, tc.found, tc.broken)
 		}
 	}
+	// resolveTree, which commit-pack, diff-commit and merge read a parent's
+	// tree with, does not peel ^{commit}: a tip that a replacement makes
+	// read as a tree still resolves, as on main.
+	if _, err := sc.resolveTree(context.Background(), c4); err != nil {
+		t.Errorf("resolveTree(commit that a replacement makes a tree): %v", err)
+	}
 	// git peels the tags: nothing reads a tag object's message, which
 	// can be as large as the repository allows.
 	t.Run("no tag body read", func(t *testing.T) {
