@@ -93,7 +93,9 @@ var fullHexRe = regexp.MustCompile(`\A[0-9a-fA-F]{40}\z`)
 // Everything unresolvable wraps ErrNotFound — including the empty spec and
 // the unborn-branch case, where the DB knows no such ref yet (invariant 3:
 // handlers map it to 404). Only git's own negative answer counts as
-// unresolvable (gitSaidNo); any other git failure is returned as is.
+// unresolvable (gitSaidNo); any other git failure is returned as is. An
+// existing ref, or an object, whose way to a commit git cannot read (a
+// missing object, a broken tag) is an error too (commitUnreadable).
 func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (string, error) {
 	assertf(repoPath != "", "ResolveRef: empty repoPath")
 	if spec == "" {
