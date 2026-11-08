@@ -34,7 +34,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   token, or a fork's `base_repo.auth.token`, lacks a required scope),
   `repo_name_mismatch` (400: the create body's `repo_name` differs from the token's
   `repo` claim), `branch_not_found` (404), `ref_not_found` (404: a ref, tag, or
-  revision does not resolve), `credential_not_found` (404), `credential_exists` (409),
+  revision does not resolve; an existing ref or object whose commit git cannot
+  read is a 500), `credential_not_found` (404), `credential_exists` (409),
   `repository_deleted` (409: `DELETE /api/v1/repos/delete` on a deleted repository;
   `DELETE /api/repos/{repo_name}` answers that case with 404 `repository_not_found`,
   because its name lookup skips deleted repositories), `ref_guard_failed` (409: a
