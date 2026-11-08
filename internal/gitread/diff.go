@@ -19,6 +19,12 @@ type FileDiff struct {
 	Additions int    // added lines; -1 for binary files (numstat "-")
 	Deletions int    // deleted lines; -1 for binary files
 	Binary    bool
+	// Mode and OID name Path's object on its side of the diff: the
+	// post-image, or the pre-image for a deletion. A caller reads the
+	// object by OID, never by path: a path that git prints back can be
+	// longer than exec takes as one argument.
+	Mode string
+	OID  string
 	// Patch is this file's slice of `git diff --patch` output, starting at
 	// its `diff --git` header line. Endpoint slices own the final `raw`
 	// formatting (hunks-only vs git-apply-compatible, docs/explanation/domain-model.md:93-95).
@@ -55,11 +61,11 @@ func Diff(ctx context.Context, repoPath, base, target string, opts DiffOptions) 
 		}
 	}
 
-	nameStatus, err := runGit(ctx, Heavy, repoPath, append([]string{"diff", "--no-color", "--name-status", "-z"}, common...)...)
+	raw, err := runGit(ctx, Heavy, repoPath, append([]string{"diff", "--no-color", "--raw", "--no-abbrev", "-z"}, common...)...)
 	if err != nil {
 		return nil, DiffStats{}, err
 	}
-	files, err := parseNameStatus(nameStatus)
+	files, err := parseRaw(raw)
 	if err != nil {
 		return nil, DiffStats{}, err
 	}
@@ -91,9 +97,10 @@ func Diff(ctx context.Context, repoPath, base, target string, opts DiffOptions) 
 	return files, stats, nil
 }
 
-// parseNameStatus parses `diff --name-status -z` records:
-// STATUS \0 path \0 — or STATUS \0 old \0 new \0 for R/C (score stripped).
-func parseNameStatus(out string) ([]FileDiff, error) {
+// parseRaw parses `diff --raw --no-abbrev -z` records:
+// ":<old mode> <new mode> <old oid> <new oid> STATUS" \0 path \0 — or
+// ... \0 old \0 new \0 for R/C (score stripped).
+func parseRaw(out string) ([]FileDiff, error) {
 	fields := strings.Split(out, "\x00")
 	// Trailing NUL yields one empty tail field.
 	if n := len(fields); n > 0 && fields[n-1] == "" {
@@ -101,34 +108,38 @@ func parseNameStatus(out string) ([]FileDiff, error) {
 	}
 	files := []FileDiff{}
 	for i := 0; i < len(fields); {
-		status := fields[i]
-		if status == "" {
-			return nil, fmt.Errorf("diff --name-status emitted empty status at %d", i)
+		head := strings.Fields(strings.TrimPrefix(fields[i], ":"))
+		if !strings.HasPrefix(fields[i], ":") || len(head) != 5 || head[4] == "" || !ref.ValidSHA(head[2]) || !ref.ValidSHA(head[3]) {
+			return nil, fmt.Errorf("diff --raw emitted record %q at %d", fields[i], i)
 		}
-		letter := status[:1]
-		switch letter {
+		f := FileDiff{Status: head[4][:1], Mode: head[1], OID: head[3]}
+		if f.Status == "D" {
+			f.Mode, f.OID = head[0], head[2]
+		}
+		switch f.Status {
 		case "R", "C":
 			if i+2 >= len(fields) {
-				return nil, fmt.Errorf("diff --name-status truncated %q record", status)
+				return nil, fmt.Errorf("diff --raw truncated %q record", fields[i])
 			}
-			files = append(files, FileDiff{Status: letter, OldPath: fields[i+1], Path: fields[i+2]})
+			f.OldPath, f.Path = fields[i+1], fields[i+2]
 			i += 3
 		case "A", "M", "D", "T":
 			if i+1 >= len(fields) {
-				return nil, fmt.Errorf("diff --name-status truncated %q record", status)
+				return nil, fmt.Errorf("diff --raw truncated %q record", fields[i])
 			}
-			files = append(files, FileDiff{Status: letter, Path: fields[i+1]})
+			f.Path = fields[i+1]
 			i += 2
 		default:
 			// U (unmerged) and X cannot appear in a two-tree diff.
-			return nil, fmt.Errorf("diff --name-status emitted status %q", status)
+			return nil, fmt.Errorf("diff --raw emitted status %q", head[4])
 		}
+		files = append(files, f)
 	}
 	return files, nil
 }
 
 // mergeNumstat fills Additions/Deletions/Binary from `diff --numstat -z`,
-// which emits records in the same file order as --name-status:
+// which emits records in the same file order as --raw:
 // added TAB deleted TAB path \0 — or added TAB deleted TAB \0 old \0 new \0
 // for renames/copies. Binary files carry "-" counters.
 func mergeNumstat(files []FileDiff, out string) error {
@@ -153,11 +164,11 @@ func mergeNumstat(files []FileDiff, out string) error {
 			i += 2
 		}
 		if idx >= len(files) {
-			return fmt.Errorf("diff --numstat has more records than --name-status (at %q)", path)
+			return fmt.Errorf("diff --numstat has more records than --raw (at %q)", path)
 		}
 		f := &files[idx]
 		if f.Path != path {
-			return fmt.Errorf("diff order mismatch: numstat %q vs name-status %q", path, f.Path)
+			return fmt.Errorf("diff order mismatch: numstat %q vs raw %q", path, f.Path)
 		}
 		if added == "-" || deleted == "-" {
 			f.Binary, f.Additions, f.Deletions = true, -1, -1
@@ -179,7 +190,7 @@ func mergeNumstat(files []FileDiff, out string) error {
 
 // mergePatches splits one `diff --patch` stream on its `diff --git` header
 // lines and assigns the slices to files in order (git emits --patch,
-// --numstat, and --name-status in the same file order). Content lines can
+// --numstat, and --raw in the same file order). Content lines can
 // never start with "diff --git " at column 0: they carry a ' ', '+', or '-'
 // prefix.
 func mergePatches(files []FileDiff, patch string) error {

@@ -142,7 +142,10 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 	// lastCommitWindow requests ahead, plus the one it waits for.
 	d := &diffReader{index: w.index, sections: make(chan diffSection, lastCommitWindow+1)}
 	args := []string{"diff-tree", "--stdin", "--root", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none"}
-	if spec := commonPathspec(paths); spec != "" {
+	// The pathspec only narrows the diffs: paths outside it are no
+	// answers. A spec that exec would refuse (paths come from the tree, and
+	// a path can be longer than 128 KiB) is dropped, and the walk is the same.
+	if spec := commonPathspec(paths); spec != "" && len(spec) <= maxCommonPathspecBytes {
 		args = append(args, "--", ":(literal)"+spec)
 	}
 	ran := make(chan error, 1)
@@ -175,6 +178,10 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 	assertf(w.left == 0, "LastCommits: %d paths unresolved after the walk", w.left)
 	return w.last, w.order, nil
 }
+
+// maxCommonPathspecBytes keeps diff-tree's ":(literal)<spec>" argument
+// within exec's 128 KiB limit for one argument on Linux.
+const maxCommonPathspecBytes = 128<<10 - len(":(literal)") - 1
 
 // commonPathspec returns the deepest directory that contains every path
 // (the path itself when there is one), or "" for the whole tree. It only

@@ -7,6 +7,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/url"
@@ -269,6 +271,81 @@ func TestNoteAuthorExecRefusesAre400(t *testing.T) {
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Errorf("%s: status = %d, want 400 (body %.300v)", name, resp.StatusCode, body)
 			}
+		}
+	})
+}
+
+// A repository path can be longer than exec takes as one argument: fsck
+// limits each tree entry name to 4096 bytes, not the path. Here 40 nested
+// directories make a 160,125-byte path. The diff and files/metadata read
+// it from git and must not hand it back to git as an argument, which would
+// fail as a client error (400) on a good repository.
+func TestRepositoryPathOverExecLimit(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		repoURL := "https://example.com/" + org + "/deep-path-" + randomHex(t, 4)
+		repo, err := e.store.CreateRepo(context.Background(), org, repoURL, "main")
+		if err != nil {
+			t.Fatalf("create repo: %v", err)
+		}
+		dir := t.TempDir()
+		coreGit(t, dir, "init", "-q", "-b", "main", ".")
+		coreWriteFile(t, dir, "a.txt", "one\n")
+		coreGit(t, dir, "add", ".")
+		coreGit(t, dir, "commit", "-q", "-m", "c1")
+		root := coreRevParse(t, dir, "HEAD")
+		stdinGit := func(stdin string, args ...string) string {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir, cmd.Stdin = dir, strings.NewReader(stdin)
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("git %s: %v", args[0], err)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		blob := stdinGit("x\n", "hash-object", "-w", "--stdin")
+		tree := stdinGit("100644 blob "+blob+"\tf.txt\n", "mktree")
+		segment := strings.Repeat("d", 4000)
+		path := "f.txt"
+		for i := range 40 {
+			name := fmt.Sprintf("%s%02d", segment, 40-i)
+			tree = stdinGit("040000 tree "+tree+"\t"+name+"\n", "mktree")
+			path = name + "/" + path
+		}
+		tip := strings.TrimSpace(coreGit(t, dir, "commit-tree", "-p", root, "-m", "deep", tree))
+		coreGit(t, dir, "update-ref", "refs/heads/main", tip)
+		if len(path) <= 128<<10 {
+			t.Fatalf("path is %d bytes, want more than 128 KiB", len(path))
+		}
+		coreSeedStores(t, e, repo.RepoID, dir, map[string]string{"refs/heads/main": tip})
+		token := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+tip+"&base_ref="+root, token, nil, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("diff: status = %d, want 200 (body %.300s)", resp.StatusCode, body)
+		}
+		var diff struct {
+			Files []struct {
+				Path  string `json:"path"`
+				State string `json:"state"`
+				Bytes int64  `json:"bytes"`
+				IsEOF bool   `json:"is_eof"`
+			} `json:"files"`
+		}
+		if err := json.Unmarshal(body, &diff); err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]string{}
+		for _, f := range diff.Files {
+			got[f.Path] = fmt.Sprintf("%s %d %v", f.State, f.Bytes, f.IsEOF)
+		}
+		if want := map[string]string{"a.txt": "D 4 true", path: "A 2 true"}; !maps.Equal(got, want) {
+			t.Errorf("diff files: %d entries, a.txt %q, the deep path %q; want D 4 true and A 2 true", len(got), got["a.txt"], got[path])
+		}
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/files/metadata?ref=main&recursive=true", token, nil, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("files/metadata: status = %d, want 200 (body %.300s)", resp.StatusCode, body)
 		}
 	})
 }
