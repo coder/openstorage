@@ -54,6 +54,7 @@ func FuzzApplyStderrChunks(f *testing.F) {
 		{128, "noise\nerror: unable to add cache entry for d\n", []byte{7, 20, 33}},
 		{128, "fatal: Unable to create '/srv/scratch/index.lock': File exists.\n", []byte{30, 1}},
 		{128, "error: x /srv/scr", []byte{12}},
+		{128, "error: open '/srv/scratch/x': denied\n", []byte{17}},
 		{1, "error: patch failed: f:1\nerror: f: patch does not apply\n", nil},
 		{128, "error: patch with only garbage at ", []byte{5}},
 		{128, "", nil},

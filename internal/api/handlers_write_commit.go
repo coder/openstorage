@@ -51,7 +51,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"unicode"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/gitlimit"
@@ -870,18 +869,14 @@ func (c *wcApplyStderr) done() {
 }
 
 // message is git's stderr cut to wcMaxApplyMsgBytes, without white space
-// around it. When stderr is longer than the kept head, the head stands for
-// it: git prints no run of white space that long.
+// around it. The kept head stands for a longer stderr: git prints no run of
+// white space that fills it.
 func (c *wcApplyStderr) message() string {
-	if c.total <= int64(len(c.head)) {
-		msg := strings.TrimSpace(string(c.head))
-		if len(msg) > wcMaxApplyMsgBytes {
-			msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
-		}
-		return msg
+	msg := strings.TrimSpace(string(c.head))
+	if len(msg) > wcMaxApplyMsgBytes {
+		msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
 	}
-	msg := strings.TrimLeftFunc(string(c.head), unicode.IsSpace)
-	return strings.ToValidUTF8(msg[:min(len(msg), wcMaxApplyMsgBytes)], "") + " …"
+	return msg
 }
 
 // status is the HTTP status for git apply's exit status and the stderr
