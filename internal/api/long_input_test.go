@@ -106,6 +106,17 @@ func TestLongCommitMessage(t *testing.T) {
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("author name with a NUL byte: status = %d, want 400 (body %s)", resp.StatusCode, raw)
 			}
+			for name, committer := range map[string]map[string]any{
+				"committer name with a NUL byte": {"name": "C\x00M", "email": "c@test.invalid"},
+				"committer email over the limit": {"name": "C", "email": strings.Repeat("e", wcMaxIdentityBytes+1)},
+				"committer name over the limit":  {"name": strings.Repeat("n", wcMaxIdentityBytes+1), "email": "c@test.invalid"},
+			} {
+				resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+					wmMergeBody("feature", "t-clean", "merge", map[string]any{"author": wmTestAuthor, "committer": committer}))
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Errorf("%s: status = %d, want 400 (body %.300s)", name, resp.StatusCode, raw)
+				}
+			}
 			resp, raw = merge(long)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200 (body %.300s)", resp.StatusCode, raw)
@@ -318,32 +329,39 @@ func TestRepositoryPathOverExecLimit(t *testing.T) {
 		if len(path) <= 128<<10 {
 			t.Fatalf("path is %d bytes, want more than 128 KiB", len(path))
 		}
-		coreSeedStores(t, e, repo.RepoID, dir, map[string]string{"refs/heads/main": tip})
+		coreSeedStores(t, e, repo.RepoID, dir, map[string]string{"refs/heads/main": tip, "refs/heads/base": root})
 		token := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
 
-		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+tip+"&base_ref="+root, token, nil, "")
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("diff: status = %d, want 200 (body %.300s)", resp.StatusCode, body)
+		for _, route := range []string{
+			"/api/v1/repos/diff?ref=" + tip + "&base_ref=" + root,
+			"/api/v1/repos/diff?ref=main&base_ref=base",
+			"/api/v1/repos/branches/diff?branch=main&base=base",
+		} {
+			resp, body := e.doReq(t, http.MethodGet, route, token, nil, "")
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("%s: status = %d, want 200 (body %.300s)", route, resp.StatusCode, body)
+				continue
+			}
+			var diff struct {
+				Files []struct {
+					Path  string `json:"path"`
+					State string `json:"state"`
+					Bytes int64  `json:"bytes"`
+					IsEOF bool   `json:"is_eof"`
+				} `json:"files"`
+			}
+			if err := json.Unmarshal(body, &diff); err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]string{}
+			for _, f := range diff.Files {
+				got[f.Path] = fmt.Sprintf("%s %d %v", f.State, f.Bytes, f.IsEOF)
+			}
+			if want := map[string]string{"a.txt": "D 4 true", path: "A 2 true"}; !maps.Equal(got, want) {
+				t.Errorf("%s files: %d entries, a.txt %q, the deep path %q; want D 4 true and A 2 true", route, len(got), got["a.txt"], got[path])
+			}
 		}
-		var diff struct {
-			Files []struct {
-				Path  string `json:"path"`
-				State string `json:"state"`
-				Bytes int64  `json:"bytes"`
-				IsEOF bool   `json:"is_eof"`
-			} `json:"files"`
-		}
-		if err := json.Unmarshal(body, &diff); err != nil {
-			t.Fatal(err)
-		}
-		got := map[string]string{}
-		for _, f := range diff.Files {
-			got[f.Path] = fmt.Sprintf("%s %d %v", f.State, f.Bytes, f.IsEOF)
-		}
-		if want := map[string]string{"a.txt": "D 4 true", path: "A 2 true"}; !maps.Equal(got, want) {
-			t.Errorf("diff files: %d entries, a.txt %q, the deep path %q; want D 4 true and A 2 true", len(got), got["a.txt"], got[path])
-		}
-		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/files/metadata?ref=main&recursive=true", token, nil, "")
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/files/metadata?ref=main&recursive=true", token, nil, "")
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("files/metadata: status = %d, want 200 (body %.300s)", resp.StatusCode, body)
 		}
