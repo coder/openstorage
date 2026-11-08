@@ -101,6 +101,9 @@ The patch is a standard git unified diff (binary patches per official docs: outp
 changes nothing, such as an empty diff (one `{"data": "", "eof": true}` frame), gets 412
 `precondition_failed` with the message `no changes to commit`. A stream that ends before
 the `eof` chunk gets 412 too, and a stream without any `diff_chunk` frame gets 400.
+The decoded patch, summed over its chunks, may hold at most 262144000 bytes (250 MiB, the
+`commit-pack` limit). Past that, the server stops reading and answers 400 `invalid` with
+the message `diff exceeds 262144000 bytes`, as for a chunk over 4 MiB. No ref moves.
 
 When the patch cannot be used, the answer depends on why:
 

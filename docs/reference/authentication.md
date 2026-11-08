@@ -142,6 +142,11 @@ Encoding: a JSON array of `[pattern, ops]` 2-element tuples. Evaluation:
 Ops apply to git receive-pack **and** every HTTP write endpoint. They are the only
 branch-protection mechanism; there is no server-side protection config.
 
+Policy checks read each object as itself: they run git with
+`GIT_NO_REPLACE_OBJECTS=1`, so a `refs/replace/*` ref, which any token with
+`git:write` can push, changes neither the ancestry that `no-force-push` reads nor the
+commits and signatures that `verify-sig` reads.
+
 ## Failure mapping
 
 | Condition | Status |

@@ -11,11 +11,14 @@ const stderrKeepBytes = 64 << 10
 
 // TailBuffer is a stderr sink that keeps only the last 64 KiB written to
 // it: git prints its fatal message last, and the rest must not grow an
-// error (and the log record that quotes it) without bound. It holds about
-// that much memory, however much is written, also in one Write.
+// error (and the log record that quotes it) without bound. It holds at
+// most twice that much memory, however much is written, also in one
+// Write, and it copies each written byte a bounded number of times: git
+// writes stderr a message at a time, and a slow git gives one pipe read
+// per line.
 type TailBuffer struct {
-	b   []byte
-	cut bool // bytes before b were dropped
+	b   []byte // the last bytes written, at most 2 × stderrKeepBytes; the tail is its last stderrKeepBytes
+	cut bool   // bytes before b were dropped
 }
 
 func (t *TailBuffer) Write(p []byte) (int, error) {
@@ -25,9 +28,15 @@ func (t *TailBuffer) Write(p []byte) (int, error) {
 		t.b = append(t.b[:0], p[n-stderrKeepBytes:]...)
 		return n, nil
 	}
-	if over := len(t.b) + n - stderrKeepBytes; over > 0 {
+	switch {
+	case len(t.b)+n > 2*stderrKeepBytes:
+		// Move the bytes that p leaves in the tail to the front. The
+		// buffer takes stderrKeepBytes more before the next move.
 		t.cut = true
-		t.b = append(t.b[:0], t.b[over:]...)
+		t.b = append(t.b[:0], t.b[len(t.b)-(stderrKeepBytes-n):]...)
+	case len(t.b)+n > cap(t.b):
+		// Grow, at most to 2 × stderrKeepBytes.
+		t.b = append(make([]byte, 0, min(2*stderrKeepBytes, max(2*cap(t.b), len(t.b)+n))), t.b...)
 	}
 	t.b = append(t.b, p...)
 	return n, nil
@@ -37,11 +46,20 @@ func (t *TailBuffer) Write(p []byte) (int, error) {
 // that was cut starts at a character: the cut can land inside a UTF-8
 // sequence, and its continuation bytes are dropped.
 func (t *TailBuffer) String() string {
-	b := t.b
-	for i := 0; t.cut && i < utf8.UTFMax-1 && len(b) > 0 && !utf8.RuneStart(b[0]); i++ {
+	return strings.TrimSpace(string(t.kept()))
+}
+
+// kept is the kept tail as written, from its first character if it was
+// cut.
+func (t *TailBuffer) kept() []byte {
+	b, cut := t.b, t.cut
+	if len(b) > stderrKeepBytes {
+		b, cut = b[len(b)-stderrKeepBytes:], true
+	}
+	for i := 0; cut && i < utf8.UTFMax-1 && len(b) > 0 && !utf8.RuneStart(b[0]); i++ {
 		b = b[1:]
 	}
-	return strings.TrimSpace(string(b))
+	return b
 }
 
 // HeadBuffer is an output sink that keeps only the first 64 KiB written to

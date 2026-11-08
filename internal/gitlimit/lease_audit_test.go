@@ -66,7 +66,7 @@ var execImporters = map[string]string{
 	"internal/api/handlers_write_merge.go":  "git version reads no repository (leaseExempt); the rest reads exit statuses",
 	"internal/api/handlers_write_refs.go":   "the ref commands start through OutputIn",
 	"internal/githttp/hook.go":              "runs inside a hook and inherits the lease (leaseExempt)",
-	"internal/githttp/hydrate.go":           "every start goes through OutputIn, StartIn or CombinedOutputIn",
+	"internal/githttp/hydrate.go":           "every start goes through OutputIn, StartIn or RunIn",
 	"internal/githttp/server.go":            "upload-pack and receive-pack start through RunIn and StartIn",
 	"internal/gitread/budget.go":            "only *exec.ExitError, to read an exit status",
 	"internal/gitread/gitread.go":           "only *exec.ExitError, to read an exit status",
