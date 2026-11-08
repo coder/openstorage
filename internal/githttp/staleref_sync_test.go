@@ -2,7 +2,6 @@ package githttp
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,8 +108,9 @@ func TestSyncRefsWithCleanupRepairsAStaleLockInEveryPass(t *testing.T) {
 }
 
 // While a git that serve started is alive in the repository, the sync keeps
-// the lock, fails as it did before the cleanup existed, and runs the cleanup
-// once, not once per attempt. When that git has gone, the next sync heals.
+// the lock and fails as it did before the cleanup existed. The cleanup runs
+// after each of the three failed attempts, and each run counts busy. When
+// that git has gone, the next sync heals.
 func TestSyncRefsWithCleanupKeepsALockWhileAGitIsAlive(t *testing.T) {
 	repo, commit := srRepo(t)
 	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
@@ -129,11 +129,11 @@ func TestSyncRefsWithCleanupKeepsALockWhileAGitIsAlive(t *testing.T) {
 	if !srExists(t, lock) {
 		t.Fatal("the lock was removed under a live git")
 	}
-	if got := srCount("busy") - busy; got != 1 {
-		t.Fatalf("busy outcomes counted = %v, want 1 for the three attempts", got)
+	if got := srCount("busy") - busy; got != 3 {
+		t.Fatalf("busy outcomes counted = %v, want 3, one per failed attempt", got)
 	}
-	if l := lines(); len(l) != 1 || !strings.Contains(l[0], "still running") {
-		t.Fatalf("log lines = %q, want one saying a git is still running", l)
+	if l := lines(); len(l) != 3 || !strings.Contains(l[0], "still running") {
+		t.Fatalf("log lines = %q, want three saying a git is still running", l)
 	}
 
 	_ = live.Process.Kill()
@@ -156,7 +156,7 @@ func TestSyncRefsWithCleanupLeavesLocksItMustNotRemove(t *testing.T) {
 		wantLines int
 	}{
 		{"young lock", 10 * time.Second, 3 * time.Hour, 0},
-		{"lock older than the epoch", 2 * time.Hour, time.Hour, 1},
+		{"lock older than the epoch", 2 * time.Hour, time.Hour, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo, commit := srRepo(t)
@@ -174,10 +174,7 @@ func TestSyncRefsWithCleanupLeavesLocksItMustNotRemove(t *testing.T) {
 			if l := lines(); len(l) != tc.wantLines {
 				t.Fatalf("log lines = %q, want %d", l, tc.wantLines)
 			}
-			wantCount := before
-			if tc.wantLines > 0 {
-				wantCount++
-			}
+			wantCount := before + float64(tc.wantLines)
 			if after := srCount("busy") + srCount("kept") + srCount("removed"); after != wantCount {
 				t.Fatalf("outcomes counted: %v -> %v, want %v", before, after, wantCount)
 			}
@@ -201,39 +198,10 @@ func TestSyncRefsWithCleanupLeavesTheLockOfAnotherRef(t *testing.T) {
 	}
 }
 
-type failingRefSeq struct{}
-
-func (failingRefSeq) next() (string, string, bool, error) {
-	return "", "", false, errors.New("store hiccup")
-}
-
-// The retry that a cleanup earns is not one of the three attempts: a cleanup
-// on the last attempt still gets its retry.
-func TestSyncRefsWithCleanupRetriesAfterACleanupOnTheLastAttempt(t *testing.T) {
-	repo, commit := srRepo(t)
-	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
-	want := map[string]string{"refs/heads/x": commit}
-	stores := 0
-	newStore := func() refSeq {
-		stores++
-		if stores <= 2 {
-			return failingRefSeq{}
-		}
-		return &sliceRefSeq{names: []string{"refs/heads/x"}, shas: want}
-	}
-	skipped, refsErr, scanErr := syncRefsWithCleanup(t.Context(), repo, "refs/heads/main", newStore, 10)
-	if scanErr != nil || refsErr != nil || skipped {
-		t.Fatalf("sync = skipped %v, %v, %v, want a clean sync after the cleanup on the third attempt", skipped, refsErr, scanErr)
-	}
-	if srExists(t, lock) {
-		t.Fatal("the stale lock is still there")
-	}
-}
-
-// One killed transaction can leave locks in several batches. Each failed
-// batch is cleaned in turn, in one hydration, and the sync ends in the
-// store's state.
-func TestSyncRefsWithCleanupCleansEveryFailedBatch(t *testing.T) {
+// One killed transaction can leave locks in several batches. The cleanup runs
+// after each failed attempt, so one hydration cleans the failed batch of each
+// of its three attempts and then fails, and the next hydration finishes.
+func TestSyncRefsWithCleanupCleansTheFailedBatchOfEveryAttempt(t *testing.T) {
 	repo, commit := srRepo(t)
 	want := map[string]string{"refs/heads/main": commit}
 	var locks []string
@@ -244,26 +212,38 @@ func TestSyncRefsWithCleanupCleansEveryFailedBatch(t *testing.T) {
 	lines := srLogLines(t, repo)
 	removed := srCount("removed")
 
+	if _, err := srSync(t, repo, want, 1); err == nil {
+		t.Fatal("sync succeeded although a fourth batch is locked and a hydration has three attempts")
+	}
+	left := 0
+	for _, l := range locks {
+		if srExists(t, l) {
+			left++
+		}
+	}
+	if left != 1 {
+		t.Fatalf("%d locks are left after one hydration, want 1: three attempts clean three batches", left)
+	}
+	if got := srCount("removed") - removed; got != 3 {
+		t.Fatalf("removed outcomes counted = %v, want 3 (one per failed attempt)", got)
+	}
+	if l := lines(); len(l) != 3 {
+		t.Fatalf("%d log lines, want 3: %q", len(l), l)
+	}
+
 	if skipped, err := srSync(t, repo, want, 1); err != nil || skipped {
-		t.Fatalf("sync = skipped %v, %v, want a clean sync after four cleanups", skipped, err)
+		t.Fatalf("the next sync = skipped %v, %v, want a clean sync", skipped, err)
 	}
 	for _, l := range locks {
 		if srExists(t, l) {
-			t.Errorf("%s is still there", l)
+			t.Errorf("%s is still there after the second hydration", l)
 		}
-	}
-	if got := srCount("removed") - removed; got != 4 {
-		t.Fatalf("removed outcomes counted = %v, want 4 (one per failed batch)", got)
-	}
-	if l := lines(); len(l) != 4 {
-		t.Fatalf("%d log lines, want 4: %q", len(l), l)
 	}
 }
 
 // A lock that blocks one batch for a moment (here a young lock that goes
-// before the next attempt) must not switch the cleanup off for the batches
-// after it: the next failed batch has a stale lock, and the hydration
-// cleans it.
+// before the next attempt) does not stop the cleanup of the batches after it:
+// the next failed batch has a stale lock, and the hydration cleans it.
 func TestSyncRefsWithCleanupCleansADifferentBatchAfterAFruitlessOne(t *testing.T) {
 	repo, commit := srRepo(t)
 	young := srLock(t, repo, "refs/heads/a.lock", 10*time.Second)
@@ -294,92 +274,5 @@ func TestSyncRefsWithCleanupCleansADifferentBatchAfterAFruitlessOne(t *testing.T
 	}
 	if l := lines(); len(l) != 1 {
 		t.Fatalf("log lines = %q, want one: the young lock is no cleanup run", l)
-	}
-}
-
-// A batch is identified by its complete name list: two failures can share the
-// first ref and the size and still be different batches, because the push-hold
-// filter changes which refs remain.
-func TestRefBatchErrorKeyCoversEveryName(t *testing.T) {
-	key := func(names ...string) string { return (&refBatchError{names: names}).key() }
-	if key("a", "c") == key("a", "b") {
-		t.Fatal("batches [a c] and [a b] have the same key")
-	}
-	if key("a", "b") != key("a", "b") {
-		t.Fatal("the same batch has two keys")
-	}
-	if key("ab") == key("a", "b") {
-		t.Fatal("batches [ab] and [a b] have the same key")
-	}
-}
-
-// A cleanup that removed a lock and then failed on another one made progress:
-// the sync retries without using one of its three attempts, and a later
-// failure of the same batch is cleaned again, because the lock that is left
-// can be one that the first cleanup could not move.
-func TestSyncRefsWithCleanupCountsPartialRemovalAsProgress(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory permissions")
-	}
-	repo, commit := srRepo(t)
-	srLock(t, repo, "refs/heads/a.lock", 2*time.Hour)
-	srLock(t, repo, "refs/heads/m/b.lock", 2*time.Hour)
-	// The lock below m cannot be moved out of its read-only directory.
-	dir := filepath.Join(repo, "refs", "heads", "m")
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	lines := srLogLines(t, repo)
-
-	_, refsErr := srSync(t, repo, map[string]string{"refs/heads/a": commit, "refs/heads/m/b": commit}, 10)
-	if refsErr == nil {
-		t.Fatal("sync succeeded with a lock that cannot be moved")
-	}
-	// First run: removed 1 of 2, then stopped. The partial removal is
-	// progress, so the batch fails again, and the second run sees the one lock
-	// that is left and fails on it.
-	got := lines()
-	if len(got) != 2 || !strings.Contains(got[0], "removed 1 of 2 ref lock(s)") || !strings.Contains(got[1], "removed 0 of 1 ref lock(s)") {
-		t.Fatalf("log lines = %q, want a partial removal and then a second run on the lock that is left", got)
-	}
-}
-
-// One hydration cleans a bounded number of failed batches: the three attempts
-// and the retries that cleanups earn. A repository with stale locks in more
-// batches heals over several requests, and no request streams the repository
-// again for each of an unbounded number of batches.
-func TestSyncRefsWithCleanupBoundsTheRetriesItEarns(t *testing.T) {
-	repo, commit := srRepo(t)
-	const batches = cleanupRetryLimit + 3 + 5
-	want := map[string]string{}
-	locks := make([]string, 0, batches)
-	for i := range batches {
-		name := fmt.Sprintf("refs/heads/b%02d", i)
-		want[name] = commit
-		locks = append(locks, srLock(t, repo, name+".lock", 2*time.Hour))
-	}
-	remaining := func() int {
-		n := 0
-		for _, l := range locks {
-			if srExists(t, l) {
-				n++
-			}
-		}
-		return n
-	}
-
-	// Batch size 1: every ref is a batch of its own, and every lock fails one.
-	if _, err := srSync(t, repo, want, 1); err == nil {
-		t.Fatal("sync succeeded although more batches are locked than one hydration cleans")
-	}
-	if got := batches - remaining(); got != cleanupRetryLimit+3 {
-		t.Fatalf("one hydration cleaned %d locks, want %d (the three attempts and %d earned retries)", got, cleanupRetryLimit+3, cleanupRetryLimit)
-	}
-	if _, err := srSync(t, repo, want, 1); err != nil {
-		t.Fatalf("the next hydration did not finish the cleanup: %v", err)
-	}
-	if remaining() != 0 {
-		t.Fatalf("%d locks are left after the second hydration", remaining())
 	}
 }

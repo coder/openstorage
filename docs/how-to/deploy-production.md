@@ -301,9 +301,9 @@ with the runbook below, is created with an epoch and repairs itself from then on
 
 It moves each lock into `<repo>.git/codestorage-stale-locks/` (outside `refs/`), checks
 that the moved file is the one it inspected, and deletes it only then. Then the
-hydration runs its ref sync again. One hydration cleans at most 19 failed batches of 10,000
-refs each, so that one request does bounded work. A repository with locks in more batches
-heals over the next fetches. One log line per run tells the result, and
+hydration runs its ref sync again. The hydration has three attempts and runs a cleanup after
+each failed one, so one request cleans up to three failed batches of 10,000 refs each. A
+repository with locks in more batches heals over the next fetches. One log line per run tells the result, and
 [`openstorage_stale_ref_lock_cleanup_total`](../reference/metrics.md) counts the runs:
 
 | Log line, after `hydrate <repo path>:` | Metric `outcome` | Meaning |
