@@ -15,12 +15,14 @@ import (
 )
 
 // The lease epoch (gitlimit.EpochFile) marks a repository that a lease-aware
-// serve created. EnsureCacheRepoCtx writes it when its own os.Mkdir makes the
-// directory, before git runs there, and never in a directory that already
-// existed: an older release can have a git alive in such a directory that
-// holds no lease, and a late epoch would make its locks look newer than the
-// epoch (#490).
-func TestEnsureCacheRepoWritesTheLeaseEpochOnlyWhenItCreatesTheDirectory(t *testing.T) {
+// serve created. EnsureCacheRepoCtx writes it for a directory that has no HEAD
+// (no git has held a ref lock there), before git init, and never in a
+// repository that already has HEAD: an older release can have a git alive in
+// such a repository that holds no lease, and a late epoch would make its locks
+// look newer than the epoch (#490). The test for a directory that an
+// interrupted creation left is
+// TestEnsureCacheRepoWritesTheEpochForADirectoryWithoutHEAD.
+func TestEnsureCacheRepoWritesTheLeaseEpochOnlyBeforeHEADExists(t *testing.T) {
 	t.Run("a new repository", func(t *testing.T) {
 		cacheDir := t.TempDir()
 		before := time.Now().Add(-time.Second)
@@ -65,8 +67,11 @@ func TestEnsureCacheRepoWritesTheLeaseEpochOnlyWhenItCreatesTheDirectory(t *test
 				t.Fatalf("git init: %v: %s", err, out)
 			}
 		}},
-		{"a directory that an interrupted creation left", func(t *testing.T, repo string) {
+		{"an older release's repository with HEAD but without objects", func(t *testing.T, repo string) {
 			if err := os.MkdirAll(repo, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -145,29 +150,108 @@ func TestEnsureCacheRepoMakesAMissingCacheDirectory(t *testing.T) {
 	}
 }
 
-// A creation that fails after the directory was made, here because the epoch
-// cannot be written, fails the call. The directory stays without an epoch, so
-// the next call finishes the repository and the cleanup keeps its locks.
+// A creation that stopped right after the os.Mkdir, or before git init, leaves
+// a directory with no HEAD. No git has held a ref lock in a directory that is
+// no repository, so the next call writes the epoch (under the hydrate lock)
+// before git init, and the cleanup then treats the repository like one that
+// serve created.
+func TestEnsureCacheRepoWritesTheEpochForADirectoryWithoutHEAD(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, repo string)
+	}{
+		{"an empty directory", func(t *testing.T, repo string) {
+			if err := os.MkdirAll(repo, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a directory with objects and refs but no HEAD", func(t *testing.T, repo string) {
+			for _, d := range []string{"objects", "refs"} {
+				if err := os.MkdirAll(filepath.Join(repo, d), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			repo := RepoPath(cacheDir, "t-epoch-nohead")
+			tc.setup(t, repo)
+			before := time.Now().Add(-time.Second)
+			if _, err := EnsureCacheRepoCtx(t.Context(), cacheDir, "t-epoch-nohead"); err != nil {
+				t.Fatal(err)
+			}
+			epoch, err := gitlimit.LeaseEpoch(repo)
+			if err != nil {
+				t.Fatalf("LeaseEpoch of a directory without HEAD that serve finished = %v", err)
+			}
+			if epoch.Before(before) || epoch.After(time.Now().Add(time.Second)) {
+				t.Fatalf("epoch = %v, want the moment of this call", epoch)
+			}
+
+			srSetAge(t, filepath.Join(repo, gitlimit.EpochFile), 3*time.Hour)
+			lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+			res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+			if err != nil || res.Removed != 1 || srExists(t, lock) {
+				t.Fatalf("cleanup = %+v, %v (lock left: %v), want the lock newer than the epoch removed", res, err, srExists(t, lock))
+			}
+		})
+	}
+}
+
+// A racing call can have written the epoch first (CreateEpoch opens the file
+// with O_EXCL), so ErrExist from the epoch write is no failure.
+func TestEnsureCacheRepoToleratesAnEpochThatAnotherCallWrote(t *testing.T) {
+	cacheDir := t.TempDir()
+	calls := 0
+	createEpoch = func(dir string) error {
+		calls++
+		if err := gitlimit.CreateEpoch(dir); err != nil {
+			return err
+		}
+		return gitlimit.CreateEpoch(dir) // fails with ErrExist, as when a second call wrote first
+	}
+	t.Cleanup(func() { createEpoch = gitlimit.CreateEpoch })
+
+	repo, err := EnsureCacheRepoCtx(t.Context(), cacheDir, "t-epoch-exist")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepoCtx = %v, want the ErrExist of the epoch write tolerated", err)
+	}
+	if calls != 1 {
+		t.Fatalf("the epoch was written %d times, want 1", calls)
+	}
+	if _, err := gitlimit.LeaseEpoch(repo); err != nil {
+		t.Fatalf("LeaseEpoch = %v", err)
+	}
+}
+
+// A call that cannot write the epoch fails, and so does the next call while
+// the write still fails. The directory stays without HEAD, so once the write
+// works, it gets its epoch and finishes, and the cleanup removes a lock that
+// is newer than the epoch.
 func TestEnsureCacheRepoFailsWhenTheEpochCannotBeWritten(t *testing.T) {
 	cacheDir := t.TempDir()
 	boom := errors.New("disk full")
 	createEpoch = func(string) error { return boom }
 	t.Cleanup(func() { createEpoch = gitlimit.CreateEpoch })
 
-	if _, err := EnsureCacheRepoCtx(t.Context(), cacheDir, "t-epoch-fails"); !errors.Is(err, boom) {
-		t.Fatalf("EnsureCacheRepoCtx = %v, want the epoch error", err)
+	for i := range 2 {
+		if _, err := EnsureCacheRepoCtx(t.Context(), cacheDir, "t-epoch-fails"); !errors.Is(err, boom) {
+			t.Fatalf("EnsureCacheRepoCtx call %d = %v, want the epoch error", i+1, err)
+		}
 	}
 	createEpoch = gitlimit.CreateEpoch
 	repo, err := EnsureCacheRepoCtx(t.Context(), cacheDir, "t-epoch-fails")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gitlimit.LeaseEpoch(repo); !errors.Is(err, gitlimit.ErrNoEpoch) {
-		t.Fatalf("LeaseEpoch of a repository whose creation stopped = %v, want ErrNoEpoch", err)
+	if _, err := gitlimit.LeaseEpoch(repo); err != nil {
+		t.Fatalf("LeaseEpoch of a repository whose creation was finished = %v", err)
 	}
+	srSetAge(t, filepath.Join(repo, gitlimit.EpochFile), 3*time.Hour)
 	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
 	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
-	if err != nil || !res.NoEpoch || !srExists(t, lock) {
-		t.Fatalf("cleanup = %+v, %v (lock kept: %v), want the lock kept for want of an epoch", res, err, srExists(t, lock))
+	if err != nil || res.Removed != 1 || srExists(t, lock) {
+		t.Fatalf("cleanup = %+v, %v (lock left: %v), want the lock removed", res, err, srExists(t, lock))
 	}
 }

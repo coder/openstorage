@@ -277,12 +277,11 @@ func TestCleanStaleRefLocksKeepsLocksOlderThanTheEpoch(t *testing.T) {
 	}
 }
 
-// A repository without an epoch file was created by an older release, or its
-// creation was interrupted before the epoch was written: a git of the older
-// release can still own its locks, and the lease cannot see it. The run keeps
-// every lock, counts kept, logs one runbook line, and neither takes the lease
-// nor writes an epoch (a late epoch would make the older release's locks
-// look newer than it).
+// A repository without an epoch file was created by an older release: a git
+// of the older release can still own its locks, and the lease cannot see it.
+// The run keeps every lock, counts kept, logs one runbook line, and neither
+// takes the lease nor writes an epoch (a late epoch would make the older
+// release's locks look newer than it).
 func TestCleanStaleRefLocksKeepsEveryLockOfARepositoryWithoutAnEpoch(t *testing.T) {
 	repo, _ := srRepo(t)
 	if err := os.Remove(filepath.Join(repo, gitlimit.EpochFile)); err != nil {

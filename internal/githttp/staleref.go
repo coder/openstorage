@@ -116,10 +116,11 @@ type staleRefCleanup struct {
 // running, and a kill leaves them too. Such a git can run only in a
 // repository that already existed when the lease-aware serve started. So the
 // run acts only on a repository that has an epoch file (gitlimit.EpochFile),
-// which EnsureCacheRepoCtx writes when it creates the directory. In a
-// repository without one, an older release created the directory (or its
-// creation was interrupted): the run keeps every lock, counts kept and logs
-// the runbook line. It also keeps a lock that is not newer than the epoch.
+// which EnsureCacheRepoCtx writes for a directory that has no HEAD yet (so no
+// git has held a ref lock there). In a repository without one, an older
+// release created the repository: the run keeps every lock, counts kept and
+// logs the runbook line. It also keeps a lock that is not newer than the
+// epoch.
 //
 // What stays open is a git that an operator runs by hand in the cache, which
 // holds no lease whatever created the repository. The age gate

@@ -674,6 +674,45 @@ func TestOpenLeaseFailsClosedOutsideAReadOnlyFilesystem(t *testing.T) {
 	}
 }
 
+// A lease file that exists but that serve cannot write (mode 0400, or a file
+// of another user) still gives a real lease: flock needs no write access, so
+// OpenLease and TryExclusive open it read-only. Without that, every git start
+// in the repository would fail.
+func TestAnUnwritableLeaseFileStillGivesARealLease(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	repo := t.TempDir()
+	if err := tryExclusive(t, repo); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(repo, LeaseFile)
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := OpenLease(t.Context(), repo)
+	if err != nil {
+		t.Fatalf("OpenLease of a lease file that serve cannot write = %v", err)
+	}
+	defer l.Close()
+	if l.f == nil {
+		t.Fatal("the lease holds nothing although the lease file exists")
+	}
+	if err := tryExclusive(t, repo); !errors.Is(err, ErrLeaseBusy) {
+		t.Fatalf("TryExclusive under a shared lease on a read-only descriptor = %v, want ErrLeaseBusy", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tryExclusive(t, repo); err != nil {
+		t.Fatalf("TryExclusive of a lease file that serve cannot write, with no lease held = %v", err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o400 {
+		t.Fatalf("lease file after the opens = %v, %v, want mode 0400 unchanged", fi, err)
+	}
+}
+
 // On a read-only filesystem, a lease file that cannot even be read is an
 // error, not a lease that holds nothing: only a missing file means that no
 // git of serve can hold the lease.

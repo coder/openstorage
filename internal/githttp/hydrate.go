@@ -331,19 +331,10 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 	if m, ok := cacheRepoMemos.Load(path); ok && cacheRepoUnchanged(path, m.(cacheRepoMemo)) {
 		return path, nil
 	}
-	// A repository that this call creates gets the lease epoch
-	// (gitlimit.EpochFile) before git runs in it. In a directory that already
-	// existed, an older release can have a git alive that holds no lease, so
-	// the stale ref lock cleanup keeps every lock there (staleref.go).
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	switch err := os.Mkdir(path, 0o755); {
-	case err == nil:
-		if err := createEpoch(path); err != nil {
-			return "", err
-		}
-	case !errors.Is(err, os.ErrExist):
+	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
 	// Cold initialization and repairs write config.lock. Serialize the full
@@ -372,6 +363,7 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 	// A prior interrupted init may have left HEAD but not the directories
 	// Git requires. Re-init that partial tree without discarding its contents.
 	needsInit := false
+	noHead := false
 	for _, name := range []string{"HEAD", "objects", "refs"} {
 		fi, err := os.Stat(filepath.Join(path, name))
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -379,6 +371,19 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 		}
 		if err != nil || (name != "HEAD" && !fi.IsDir()) {
 			needsInit = true
+		}
+		noHead = noHead || (name == "HEAD" && err != nil)
+	}
+	// A directory without HEAD is no repository: no git has held a ref lock
+	// there, and none can before the git init below. It gets the lease epoch
+	// (gitlimit.EpochFile) now, whether this call made it or an earlier
+	// creation stopped before git init. A racing call can have written it
+	// first. A repository that has HEAD gets none: an older release can have
+	// a git alive in it that holds no lease, so the stale ref lock cleanup
+	// keeps every lock there (staleref.go).
+	if noHead {
+		if err := createEpoch(path); err != nil && !errors.Is(err, os.ErrExist) {
+			return "", err
 		}
 	}
 	// A canceled Git child can leave HEAD before init finishes, or leave
