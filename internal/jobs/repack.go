@@ -60,6 +60,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -86,6 +87,7 @@ func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...strin
 	assertf(len(args) > 0, "runGitStdin: no args")
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	cmd.Env = gitlimit.NoReplaceObjects(nil)
 	cmd.Stdin = stdin
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -783,6 +785,7 @@ func packObjectUnion(ctx context.Context, repoPath string, packs []ref.Pack) ([]
 func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn func(sha string)) error {
 	cmd := exec.CommandContext(ctx, "git", "show-index")
 	cmd.Dir = repoPath
+	cmd.Env = gitlimit.NoReplaceObjects(nil)
 	cmd.Stdin = idx
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
