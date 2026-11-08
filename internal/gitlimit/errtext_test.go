@@ -25,23 +25,78 @@ func TestTailBufferKeepsTheLast64KiB(t *testing.T) {
 	}
 }
 
-// TailBuffer holds about 64 KiB however much git writes: 64 MiB in one
-// Write, or in 4 KiB writes.
+// TailBuffer holds at most 2 × 64 KiB however much git writes: 64 MiB in
+// one Write, or in 4 KiB writes.
 func TestTailBufferHoldsAbout64KiB(t *testing.T) {
 	big := bytes.Repeat([]byte("e"), 64<<20)
 	copy(big[len(big)-len("the end"):], "the end")
-	for _, size := range []int{len(big), 4 << 10} {
+	for _, size := range []int{len(big), 4 << 10, 50, 3000, 30000} {
 		var tail TailBuffer
+		held := 0
 		for p := big; len(p) > 0; {
 			n := min(size, len(p))
 			_, _ = tail.Write(p[:n])
 			p = p[n:]
+			held = max(held, cap(tail.b))
 		}
-		if c := cap(tail.b); c > 2*stderrKeepBytes {
-			t.Errorf("writes of %d bytes: the buffer holds %d bytes, want at most %d", size, c, 2*stderrKeepBytes)
+		if held > 2*stderrKeepBytes {
+			t.Errorf("writes of %d bytes: the buffer held %d bytes, want at most %d", size, held, 2*stderrKeepBytes)
 		}
 		if got := tail.String(); len(got) != stderrKeepBytes || !strings.HasSuffix(got, "the end") {
 			t.Errorf("writes of %d bytes: kept %d bytes ending %q", size, len(got), got[max(len(got)-8, 0):])
+		}
+	}
+}
+
+// TailBuffer copies each written byte a bounded number of times: git
+// writes stderr a message at a time, and a slow git gives one pipe read
+// per line, so a copy of the kept tail on each Write would be quadratic.
+func TestTailBufferSmallWritesCopyLittle(t *testing.T) {
+	var tail TailBuffer
+	p := bytes.Repeat([]byte("e"), 50)
+	written, copied := 0, 0
+	for written < 4<<20 {
+		before := len(tail.b)
+		var first *byte
+		if before > 0 {
+			first = &tail.b[0]
+		}
+		_, _ = tail.Write(p)
+		written += len(p)
+		switch {
+		case before > 0 && &tail.b[0] != first:
+			copied += before // grown into a new array
+		case len(tail.b) != before+len(p):
+			copied += len(tail.b) - len(p) // moved to the front
+		}
+	}
+	if copied > 2*written {
+		t.Fatalf("%d writes of %d bytes copied %d bytes, want at most %d", written/len(p), len(p), copied, 2*written)
+	}
+}
+
+// After every Write, the tail is the last 64 KiB written, from its first
+// character when more was written, also right after the buffer moved
+// its tail to the front. The stream mixes 4-, 3-, 2- and 1-byte runes, so
+// the cuts land at every position in a rune.
+func TestTailBufferFollowsEveryWrite(t *testing.T) {
+	stream := []byte(strings.Repeat("𝄞€éa", 24000))
+	for _, size := range []int{1001, 4093, 32 << 10} {
+		var tail TailBuffer
+		for end := 0; end < len(stream); {
+			next := min(end+size, len(stream))
+			_, _ = tail.Write(stream[end:next])
+			end = next
+			want := stream[:end]
+			if len(want) > 64<<10 {
+				want = want[len(want)-64<<10:]
+				for i := 0; i < 3 && !utf8.RuneStart(want[0]); i++ {
+					want = want[1:]
+				}
+			}
+			if got := tail.String(); got != string(want) {
+				t.Fatalf("writes of %d bytes, after %d bytes: kept %d bytes starting %q, want %d bytes starting %q", size, end, len(got), got[:min(4, len(got))], len(want), want[:min(4, len(want))])
+			}
 		}
 	}
 }
@@ -95,6 +150,13 @@ func TestTailBufferExactFit(t *testing.T) {
 	_, _ = after.Write([]byte(fit))
 	if got := after.String(); got != fit[2:] {
 		t.Errorf("64 KiB after one byte: kept %q... (%d bytes), want the tail from its first character", got[:min(4, len(got))], len(got))
+	}
+	// The same bytes in two small writes: the tail is the last 64 KiB.
+	var small TailBuffer
+	_, _ = small.Write([]byte("\xe2" + fit[:40000]))
+	_, _ = small.Write([]byte(fit[40000:]))
+	if got := small.String(); got != fit[2:] {
+		t.Errorf("64 KiB and one byte in two writes: kept %q... (%d bytes), want the tail from its first character", got[:min(4, len(got))], len(got))
 	}
 }
 
