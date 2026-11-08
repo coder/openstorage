@@ -46,8 +46,14 @@ type group struct {
 	exited bool // the leader exited while stop ran, so wait holds it unreaped
 }
 
-// Start starts cmd as the leader of a new process group and tracks it.
-func Start(cmd *exec.Cmd) error { return children.start(cmd) }
+// Start starts cmd as the leader of a new process group and tracks it. A git
+// that runs in a cache repository starts through StartIn instead (lease.go).
+func Start(cmd *exec.Cmd) error {
+	if checkUnleased != nil {
+		checkUnleased(cmd)
+	}
+	return children.start(cmd)
+}
 
 // Wait waits for a child that Start started and stops tracking its group.
 func Wait(cmd *exec.Cmd) error { return children.wait(cmd) }
@@ -69,15 +75,6 @@ func Output(cmd *exec.Cmd) ([]byte, error) {
 	return out.Bytes(), err
 }
 
-// CombinedOutput is exec.Cmd.CombinedOutput through the registry.
-func CombinedOutput(cmd *exec.Cmd) ([]byte, error) {
-	assertf(cmd.Stdout == nil && cmd.Stderr == nil, "gitlimit.CombinedOutput: Stdout or Stderr already set")
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err := Run(cmd)
-	return out.Bytes(), err
-}
-
 // Stopping reports whether StopChildren began.
 func Stopping() bool { return children.isStopped() }
 
@@ -88,11 +85,21 @@ func Stopping() bool { return children.isStopped() }
 // the number of groups it signaled.
 func StopChildren(grace time.Duration) int { return children.stop(grace) }
 
+// failStart ends a start that fails before cmd.Start runs. With cmd.Err set,
+// Start fails at once and closes the pipes that the caller made with
+// StdinPipe, StdoutPipe and StderrPipe, which otherwise stay open until a
+// garbage collection. It returns err.
+func failStart(cmd *exec.Cmd, err error) error {
+	cmd.Err = err
+	_ = cmd.Start()
+	return err
+}
+
 func (g *registry) start(cmd *exec.Cmd) error {
 	assertf(cmd.SysProcAttr == nil, "gitlimit.Start: cmd already has SysProcAttr")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if g.isStopped() {
-		return ErrStopping
+		return failStart(cmd, ErrStopping)
 	}
 	if err := cmd.Start(); err != nil {
 		return err

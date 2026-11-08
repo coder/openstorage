@@ -86,3 +86,35 @@ func TestServerHydrate_StrictOnlyForPushRunFetch(t *testing.T) {
 		}
 	}
 }
+
+// TestServerHydrate_ReceivePackWithClaimIsLenient: a receive-pack whose
+// token carries a sync claim hydrates like any other receive-pack. It
+// reuses the held-skip verdict and does not scan the authority's refs
+// again: only a push run's loopback fetch (upload-pack) is strict.
+func TestServerHydrate_ReceivePackWithClaimIsLenient(t *testing.T) {
+	st, bl, cacheDir := hydrateEnv(t)
+	repoPath := mustHydrate(t, st, bl, cacheDir, "r")
+	mintHold(t, repoPath, "refs/heads/held")
+	st.mu.Lock()
+	st.refs["refs/heads/held"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	st.mu.Unlock()
+	st.setGen(8)
+	mustHydrate(t, st, bl, cacheDir, "r")
+	if !heldMarkerValid(repoPath, 8, HeadTarget("main")) {
+		t.Fatal("lenient held skip left no held-skip verdict: the check below tests nothing")
+	}
+	s := &Server{Store: st, Blob: bl, CacheDir: cacheDir}
+	for _, tc := range []struct {
+		service string
+		scans   bool
+	}{
+		{"receive-pack", false},
+		{"upload-pack", true},
+	} {
+		_, before, _ := st.counts()
+		_, _ = s.hydrate(context.Background(), "r", tc.service, "main", &auth.Claims{SyncClaim: "holder"})
+		if _, after, _ := st.counts(); (after > before) != tc.scans {
+			t.Errorf("%s with a sync claim: %d ref scans, want scans=%v", tc.service, after-before, tc.scans)
+		}
+	}
+}

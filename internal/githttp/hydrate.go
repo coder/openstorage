@@ -86,19 +86,27 @@ func runGit(dir string, args ...string) (string, error) {
 // not match errors.Is(err, context.DeadlineExceeded), and the repack
 // worker classifies deterministic budget exhaustion by that identity.
 func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) {
+	return runGitLeased(ctx, dir, dir, args...)
+}
+
+// runGitLeased is runGitCtx for a child that holds the lease of the cache
+// repository at leaseDir (gitlimit.LeaseFile). dir is the child's working
+// directory. It is empty for `git init --bare <leaseDir>`, which runs where
+// serve runs.
+func runGitLeased(ctx context.Context, dir, leaseDir string, args ...string) (string, error) {
 	observeGitSpawn(dir, args)
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the log
 	cmd.Stderr = &stderr
-	out, err := gitlimit.Output(cmd)
+	out, err := gitlimit.OutputIn(ctx, leaseDir, cmd)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			err = fmt.Errorf("%w: %w", cerr, err)
 		}
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr.String())
 	}
 	return string(out), nil
 }
@@ -399,7 +407,7 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 		}
 	}()
 	if needsInit {
-		if _, err := runGitCtx(ctx, "", "init", "--bare", "--initial-branch=main", path); err != nil {
+		if _, err := runGitLeased(ctx, "", path, "init", "--bare", "--initial-branch=main", path); err != nil {
 			return "", err
 		}
 	}
@@ -1199,7 +1207,7 @@ func (s *sliceRefSeq) next() (string, string, bool, error) {
 type localRefSeq struct {
 	cmd    *exec.Cmd
 	sc     *bufio.Scanner
-	stderr bytes.Buffer
+	stderr gitlimit.TailBuffer
 	prev   string
 	waited bool
 }
@@ -1215,7 +1223,7 @@ func startLocalRefSeq(ctx context.Context, repoPath string) (*localRefSeq, error
 	if err != nil {
 		return nil, err
 	}
-	if err := gitlimit.Start(l.cmd); err != nil {
+	if err := gitlimit.StartIn(ctx, repoPath, l.cmd); err != nil {
 		return nil, fmt.Errorf("git for-each-ref: %w", err)
 	}
 	l.sc = bufio.NewScanner(stdout)
@@ -1513,8 +1521,10 @@ func updateRefStdin(repoPath, commands string) error {
 	cmd := exec.Command("git", "update-ref", "--stdin")
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(commands)
-	if out, err := gitlimit.CombinedOutput(cmd); err != nil {
-		return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
+	var stderr gitlimit.TailBuffer // update-ref --stdin prints nothing else
+	cmd.Stderr = &stderr
+	if err := gitlimit.RunIn(context.Background(), repoPath, cmd); err != nil {
+		return fmt.Errorf("update-ref --stdin: %w: %s", err, stderr.String())
 	}
 	return nil
 }
