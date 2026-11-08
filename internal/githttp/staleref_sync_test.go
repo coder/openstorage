@@ -295,3 +295,51 @@ func TestSyncRefsWithCleanupCleansADifferentBatchAfterAFruitlessOne(t *testing.T
 		t.Fatalf("log lines = %q, want one: the young lock is no cleanup run", l)
 	}
 }
+
+// A batch is identified by its complete name list: two failures can share the
+// first ref and the size and still be different batches, because the push-hold
+// filter changes which refs remain.
+func TestRefBatchErrorKeyCoversEveryName(t *testing.T) {
+	key := func(names ...string) string { return (&refBatchError{names: names}).key() }
+	if key("a", "c") == key("a", "b") {
+		t.Fatal("batches [a c] and [a b] have the same key")
+	}
+	if key("a", "b") != key("a", "b") {
+		t.Fatal("the same batch has two keys")
+	}
+	if key("ab") == key("a", "b") {
+		t.Fatal("batches [ab] and [a b] have the same key")
+	}
+}
+
+// A cleanup that removed a lock and then failed on another one made progress:
+// the sync retries without using one of its three attempts, and a later
+// failure of the same batch is cleaned again, because the lock that is left
+// can be one that the first cleanup could not move.
+func TestSyncRefsWithCleanupCountsPartialRemovalAsProgress(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	repo, commit := srRepo(t)
+	srLock(t, repo, "refs/heads/a.lock", 2*time.Hour)
+	srLock(t, repo, "refs/heads/m/b.lock", 2*time.Hour)
+	// The lock below m cannot be moved out of its read-only directory.
+	dir := filepath.Join(repo, "refs", "heads", "m")
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	lines := srLogLines(t, repo)
+
+	_, refsErr := srSync(t, repo, map[string]string{"refs/heads/a": commit, "refs/heads/m/b": commit}, 10)
+	if refsErr == nil {
+		t.Fatal("sync succeeded with a lock that cannot be moved")
+	}
+	// First run: removed 1 of 2, then stopped. The partial removal is
+	// progress, so the batch fails again, and the second run sees the one lock
+	// that is left and fails on it.
+	got := lines()
+	if len(got) != 2 || !strings.Contains(got[0], "removed 1 of 2 ref lock(s)") || !strings.Contains(got[1], "removed 0 of 1 ref lock(s)") {
+		t.Fatalf("log lines = %q, want a partial removal and then a second run on the lock that is left", got)
+	}
+}
