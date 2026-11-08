@@ -66,11 +66,11 @@ func runGit(ctx context.Context, class Class, repoPath string, args ...string) (
 //
 // The repository's attributes also stop steering grep's -I binary
 // detection and blame's textconv. Where git read them (a work tree,
-// attr.tree, a bare repository on git 2.43.0 to 2.45.2), a text file
-// marked binary or -diff is now searched, and a file with a NUL byte and
-// the diff attribute is skipped. A bare repository, as the server runs,
-// on git before 2.43.0 or from 2.45.3 on read no tree attributes before
-// either.
+// attr.tree or GIT_ATTR_SOURCE=HEAD in the server's environment, a bare
+// repository on git 2.43.0 to 2.45.2), a text file marked binary or
+// -diff is now searched, and a file with a NUL byte and the diff
+// attribute is skipped. A bare repository, as the server runs, on git
+// before 2.43.0 or from 2.45.3 on read no tree attributes before either.
 func noTreeAttrsEnv() []string {
 	return append(os.Environ(), "GIT_ATTR_SOURCE="+EmptyTreeSHA)
 }
