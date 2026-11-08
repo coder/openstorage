@@ -20,6 +20,7 @@ Shared admission and process control for git subprocesses. It provides a slot po
 ## Invariants
 - `TailBuffer` keeps the last 64 KiB written to it and holds about that much memory, also after one large Write; a tail that was cut starts at a UTF-8 character [errtext.go:TailBuffer]
 - `HeadBuffer` keeps the first 64 KiB written to it and counts the rest in `Dropped` [errtext.go:HeadBuffer]
+- `CombinedOutputIn` returns only the last 64 KiB of the child's combined output, kept by a `TailBuffer` [lease.go:CombinedOutputIn] [lease_test.go:TestCombinedOutputInKeepsTheLast64KiB]
 - `NewSlots` panics unless n > 0, 0 < perKey <= n, and wait >= 0 [gitlimit.go:NewSlots]
 - `Release` panics unless the key holds a slot; `RepoKey` panics on an empty repo ID [gitlimit.go:Release]
 - `TryAdmitMaintenance` takes the maintenance permit first, releases it if `ReadSlots` is full, and panics on a second release call [gitlimit.go:TryAdmitMaintenance]

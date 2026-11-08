@@ -37,11 +37,17 @@ func (t *TailBuffer) Write(p []byte) (int, error) {
 // that was cut starts at a character: the cut can land inside a UTF-8
 // sequence, and its continuation bytes are dropped.
 func (t *TailBuffer) String() string {
+	return strings.TrimSpace(string(t.kept()))
+}
+
+// kept is the kept tail as written, from its first character if it was
+// cut.
+func (t *TailBuffer) kept() []byte {
 	b := t.b
 	for i := 0; t.cut && i < utf8.UTFMax-1 && len(b) > 0 && !utf8.RuneStart(b[0]); i++ {
 		b = b[1:]
 	}
-	return strings.TrimSpace(string(b))
+	return b
 }
 
 // HeadBuffer is an output sink that keeps only the first 64 KiB written to

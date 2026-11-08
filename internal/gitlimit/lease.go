@@ -227,11 +227,14 @@ func OutputIn(ctx context.Context, repoPath string, cmd *exec.Cmd) ([]byte, erro
 }
 
 // CombinedOutputIn is exec.Cmd.CombinedOutput through the registry and the
-// lease of the repository at repoPath.
+// lease of the repository at repoPath, but it returns only the last 64 KiB
+// of the output (TailBuffer), so that an error or a log line that quotes it
+// stays bounded however much git prints. Stdout and Stderr are one writer,
+// so exec calls its Write from one goroutine at a time.
 func CombinedOutputIn(ctx context.Context, repoPath string, cmd *exec.Cmd) ([]byte, error) {
 	assertf(cmd.Stdout == nil && cmd.Stderr == nil, "gitlimit.CombinedOutputIn: Stdout or Stderr already set")
-	var out bytes.Buffer
+	var out TailBuffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := RunIn(ctx, repoPath, cmd)
-	return out.Bytes(), err
+	return out.kept(), err
 }
