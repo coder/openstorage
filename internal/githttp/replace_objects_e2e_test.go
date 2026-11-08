@@ -53,3 +53,30 @@ func TestVerifySig_IgnoresReplacements(t *testing.T) {
 		t.Fatalf("main = %s, want %s", got, base)
 	}
 }
+
+// A replacement that makes a signed tip read as a child of main's tip
+// would hide the tip's unsigned parent from the walk. The walk reads each
+// commit as itself, so the push is denied at that parent.
+func TestVerifySig_WalkIgnoresReplacements(t *testing.T) {
+	repo := registerRepo(t, "replace-vs-walk")
+	work := initWorkRepo(t)
+	vs := mintTestToken(t, repo, "git:read,git:write", verifySigMainRefs)
+	privPath, pubLine := genSSHKey(t)
+	key := registerSigningKey(t, pubLine)
+	t.Cleanup(func() { removeSigningKey(t, key.ID) })
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, plain), "HEAD:refs/heads/main")
+	base := revParse(t, work, "HEAD")
+	stand := commitFile(t, work, "r.txt", "stand-in\n", "stand-in", nil, sshSigningArgs(privPath)...)
+	mustGit(t, work, "reset", "-q", "--hard", base)
+	unsigned := commitFile(t, work, "u.txt", "unsigned\n", "unsigned", nil)
+	tip := commitFile(t, work, "s.txt", "signed\n", "signed", nil, sshSigningArgs(privPath)...)
+	mustGit(t, work, "push", remoteURL(nodeA, repo, vs), stand+":refs/heads/carrier", stand+":refs/replace/"+tip)
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, vs), tip+":refs/heads/main")
+	if err == nil || !strings.Contains(out, "verify-sig denied refs/heads/main at "+unsigned) {
+		t.Fatalf("push of a signed tip over an unsigned parent was not denied at the parent (err %v):\n%s", err, out)
+	}
+	if got := pgRefs(t, repo)["refs/heads/main"]; got != base {
+		t.Fatalf("main = %s, want %s", got, base)
+	}
+}
