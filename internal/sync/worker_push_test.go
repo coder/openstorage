@@ -943,3 +943,81 @@ func TestPushRunStaleHeldSnapshotRestoresRiverRequest(t *testing.T) {
 		t.Fatalf("upstream changed after a refused snapshot: %q", out)
 	}
 }
+
+// restorePushHook is a MemStore whose RestorePush first runs hook, then
+// fails with fail when it is set.
+type restorePushHook struct {
+	*MemStore
+	hook func()
+	fail error
+}
+
+func (s *restorePushHook) RestorePush(ctx context.Context, repoID, holder string, force bool) (Upstream, error) {
+	if s.hook != nil {
+		s.hook()
+	}
+	if s.fail != nil {
+		return Upstream{}, s.fail
+	}
+	return s.MemStore.RestorePush(ctx, repoID, holder, force)
+}
+
+// A River push run whose loopback fetch is refused for a stale held ref
+// fails whatever its restore does, so River never completes the job: a
+// failed RestorePush is the run's error, and a shutdown during the
+// restore makes the error ErrShutdown, which keeps the job for the next
+// process.
+func TestPushRunStaleHeldSnapshotRiverRestoreFailures(t *testing.T) {
+	restoreErr := errors.New("restore write failed")
+	for _, tc := range []struct {
+		name     string
+		fail     error
+		shutdown bool
+	}{
+		{"restore fails", restoreErr, false},
+		{"shutdown during a failing restore", restoreErr, true},
+		{"shutdown during the restore", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWorkerFixture(t)
+			seedLocalRepo(t, f, "repo_h2")
+			addEmptyUpstream(t, f.upstreamDir, "own", "h2")
+			f.putUpstream(t, "repo_h2", "own", "h2", "file://"+f.upstreamDir)
+			if err := f.store.RequestPush(t.Context(), "repo_h2", true); err != nil {
+				t.Fatal(err)
+			}
+			locked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "held", http.StatusLocked)
+			}))
+			t.Cleanup(locked.Close)
+			f.worker.Loopback.BaseURL = locked.URL
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			st := &restorePushHook{MemStore: f.store, fail: tc.fail}
+			if tc.shutdown {
+				st.hook = func() { cancel(ErrShutdown) }
+			}
+			f.worker.Upstreams = st
+
+			err := f.worker.RunPush(ctx, Job{Org: "org", RepoID: "repo_h2"})
+			if err == nil {
+				t.Fatal("RunPush = nil, want an error, so River does not complete the job")
+			}
+			if tc.fail != nil && !errors.Is(err, tc.fail) {
+				t.Errorf("RunPush = %v, want the restore's error", err)
+			}
+			if got := errors.Is(err, ErrShutdown); got != tc.shutdown {
+				t.Errorf("RunPush = %v: ErrShutdown = %v, want %v", err, got, tc.shutdown)
+			}
+			if tc.fail == nil {
+				up, gerr := f.store.GetUpstream(t.Context(), "repo_h2")
+				if gerr != nil {
+					t.Fatal(gerr)
+				}
+				if up.PushSyncing || up.PushPending != PushPendingForce || up.PushRunCount != 0 {
+					t.Errorf("after the restore: %+v; want the force request handed back and no counted run", up)
+				}
+			}
+		})
+	}
+}

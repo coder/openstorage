@@ -76,15 +76,6 @@ func Output(cmd *exec.Cmd) ([]byte, error) {
 	return out.Bytes(), err
 }
 
-// CombinedOutput is exec.Cmd.CombinedOutput through the registry.
-func CombinedOutput(cmd *exec.Cmd) ([]byte, error) {
-	assertf(cmd.Stdout == nil && cmd.Stderr == nil, "gitlimit.CombinedOutput: Stdout or Stderr already set")
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err := Run(cmd)
-	return out.Bytes(), err
-}
-
 // NoReplaceObjects returns env (nil: the server's environment) with
 // GIT_NO_REPLACE_OBJECTS set, so that git reads every object as itself.
 // Any token with git:write can push refs/replace/<id>, which would

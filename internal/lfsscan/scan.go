@@ -7,7 +7,6 @@ package lfsscan
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -93,7 +92,7 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 	// is read.
 	revList := exec.CommandContext(gctx, "git", "--no-replace-objects", "rev-list", "--objects", "--no-object-names", "--all")
 	revList.Dir = repoPath
-	var revErr bytes.Buffer
+	var revErr gitlimit.TailBuffer // the errors below reach the log
 	revList.Stderr = &revErr
 	revOut, err := revList.StdoutPipe()
 	if err != nil {
@@ -102,7 +101,7 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 
 	check := exec.CommandContext(gctx, "git", "--no-replace-objects", "cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)", "--buffer")
 	check.Dir = repoPath
-	var checkErr bytes.Buffer
+	var checkErr gitlimit.TailBuffer
 	check.Stderr = &checkErr
 	checkIn, err := check.StdinPipe()
 	if err != nil {
@@ -115,7 +114,7 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 
 	read := exec.CommandContext(gctx, "git", "--no-replace-objects", "cat-file", "--batch", "--buffer")
 	read.Dir = repoPath
-	var readErr bytes.Buffer
+	var readErr gitlimit.TailBuffer
 	read.Stderr = &readErr
 	readIn, err := read.StdinPipe()
 	if err != nil {
