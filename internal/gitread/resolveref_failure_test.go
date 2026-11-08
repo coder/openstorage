@@ -231,4 +231,27 @@ func TestResolveRefListsNoRefsUnderTheName(t *testing.T) {
 	if sha, err := ResolveRef(context.Background(), f.dir, "pfx/a", false); err != nil || sha != f.c1 {
 		t.Fatalf("ResolveRef(pfx/a) = (%q, %v), want c1", sha, err)
 	}
+	// A glob character cannot be in a ref's name: a spec with one names
+	// no ref, though as a pattern it would match main.
+	for _, spec := range []string{"ma?n", "m*", "[m]ain", "mai\\n"} {
+		if sha, err := ResolveRef(context.Background(), f.dir, spec, false); !errors.Is(err, ErrNotFound) {
+			t.Errorf("ResolveRef(%q) = (%q, %v), want ErrNotFound", spec, sha, err)
+		}
+	}
+}
+
+// for-each-ref's patterns each match one whole name: a line for any other
+// ref, or one that is no "<name> <id>", is git's failure, not an answer.
+func TestResolveRefRefusesOtherForEachRefLines(t *testing.T) {
+	f := newFixture(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []string{"refs/heads/other " + f.c1, "refs/heads/main", "refs/heads/main zz"} {
+		fakeGit(t, "if [ \"$1\" = for-each-ref ]; then echo '"+line+"'; exit 0; fi\nexec '"+realGit+"' \"$@\"")
+		if sha, err := ResolveRef(context.Background(), f.dir, "main", false); err == nil || errors.Is(err, ErrNotFound) {
+			t.Errorf("for-each-ref printing %q: ResolveRef(main) = (%q, %v), want an error that is not ErrNotFound", line, sha, err)
+		}
+	}
 }

@@ -143,14 +143,16 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 			return "", err
 		}
 		for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
-			// A ref's name holds no space or newline.
-			name, oid, ok := strings.Cut(line, " ")
-			if ok && slices.Contains(exact, name) {
-				if !ref.ValidSHA(oid) {
-					return "", fmt.Errorf("for-each-ref emitted %q", line)
-				}
-				refs[name] = oid
+			if line == "" {
+				continue // no ref
 			}
+			// A ref's name holds no space or newline, and every pattern
+			// matches one whole name.
+			name, oid, ok := strings.Cut(line, " ")
+			if !ok || !slices.Contains(exact, name) || !ref.ValidSHA(oid) {
+				return "", fmt.Errorf("for-each-ref emitted %q", line)
+			}
+			refs[name] = oid
 		}
 	}
 	type candidate struct{ name, id string } // id: what rev-parse peels
