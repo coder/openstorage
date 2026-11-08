@@ -3,6 +3,8 @@ package gitread
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -55,5 +57,32 @@ func TestBlameAndGrepReadNoTreeAttributes(t *testing.T) {
 				t.Errorf("blame past the end = %v, want ErrBadRange", err)
 			}
 		})
+	}
+}
+
+// Blame and Grep each give git GIT_ATTR_SOURCE set to the empty tree. The
+// test above shows it in grep's answer only, because blame reads no
+// attributes for the failures it classifies; this pins both.
+func TestBlameAndGrepSetTheAttributeSource(t *testing.T) {
+	f := newFixture(t)
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(t.TempDir(), "attr-source")
+	fakeGit(t, "printf '%s\\n' \"${GIT_ATTR_SOURCE-unset}\" >> '"+log+"'\nexec '"+real+"' \"$@\"")
+	ctx := context.Background()
+	if _, err := Blame(ctx, f.dir, f.c1, "README.md", nil, false); err != nil {
+		t.Fatalf("blame README.md: %v", err)
+	}
+	if _, err := Grep(ctx, f.dir, f.c1, GrepOptions{Pattern: "line"}); err != nil {
+		t.Fatalf("grep line: %v", err)
+	}
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := EmptyTreeSHA + "\n" + EmptyTreeSHA + "\n"; string(got) != want {
+		t.Fatalf("GIT_ATTR_SOURCE of blame's and grep's git = %q, want the empty tree for both", got)
 	}
 }
