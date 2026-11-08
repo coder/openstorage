@@ -55,6 +55,17 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 	c3 := coreRevParse(t, dir, "HEAD")
 	tagC3 := tag("c3", c3)
 	tagTagC3 := tag("c3-again", tagC3)
+	// A tree that no commit has, which a replacement (any pusher can write
+	// refs/replace/*) makes read as c1: it is still no commit.
+	mk := exec.Command("git", "mktree")
+	mk.Dir = dir
+	mk.Stdin = strings.NewReader("100644 blob " + blob + "\tother.txt\n")
+	out, err := mk.Output()
+	if err != nil {
+		t.Fatalf("mktree: %v", err)
+	}
+	replacedTree := strings.TrimSpace(string(out))
+	coreGit(t, dir, "update-ref", "refs/replace/"+replacedTree, c1)
 	for _, oid := range []string{tree2, c3} {
 		if err := os.Remove(filepath.Join(dir, ".git", "objects", oid[:2], oid[2:])); err != nil {
 			t.Fatal(err)
@@ -79,6 +90,7 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 		{"tag of a tree", tagTree, "", false, false},
 		{"tag of a tree by an uppercase id", upperTag, "", false, false},
 		{"tag that git cannot parse", badTag, "", false, true},
+		{"tree that a replacement makes a commit", replacedTree, "", false, false},
 		{"commit whose tree is missing", c2, "", false, true},
 		{"tag of a missing commit", tagC3, "", false, true},
 		{"tag of a tag of a missing commit", tagTagC3, "", false, true},

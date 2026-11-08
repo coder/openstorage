@@ -997,16 +997,30 @@ func (sc *wcScratch) resolveTree(ctx context.Context, commitSHA string) (string,
 
 // restoreTargetTree resolves restore-commit's target to its tree. found
 // is false when the target names no commit: no object, a tree, a blob,
-// or a tag of one. rev-parse --verify --quiet exits 1 for those, and also
-// for a commit whose tree, or a tag whose commit, git cannot read: that is
-// the repository's failure, an error. Any other git failure (a fatal
-// exit, a killed git) is an error too.
+// or a tag of one. A commit whose tree, or a tag whose commit, git cannot
+// read is the repository's failure, an error, and so is any other git
+// failure (a fatal exit, a killed git).
+//
+// The target's type is its own object's: git reads it with
+// --no-replace-objects, because a replacement (refs/replace/<id>, which
+// any pusher can write) could make a tree read as a commit. The tree of a
+// commit is then read as the rest of the write path reads trees.
 func (sc *wcScratch) restoreTargetTree(ctx context.Context, target string) (tree string, found bool, err error) {
-	tree, peelErr := sc.resolveTree(ctx, target)
-	if !wcGitExit(peelErr, 1) {
-		return tree, peelErr == nil, peelErr
+	_, kindErr := sc.git(ctx, nil, nil, "--no-replace-objects", "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{commit}")
+	if kindErr == nil {
+		tree, err := sc.resolveTree(ctx, target)
+		if wcGitExit(err, 1) {
+			return "", false, fmt.Errorf("restore target %s: commit has no readable tree: %w", target, err)
+		}
+		return tree, err == nil, err
 	}
-	if _, err := sc.git(ctx, nil, nil, "cat-file", "-e", target); wcGitExit(err, 1) {
+	if !wcGitExit(kindErr, 1) {
+		return "", false, kindErr
+	}
+	// rev-parse exits 1 for no object, for no commit at the end of the
+	// target's tag chain, and for an object on the way that git cannot
+	// read.
+	if _, err := sc.git(ctx, nil, nil, "--no-replace-objects", "cat-file", "-e", target); wcGitExit(err, 1) {
 		return "", false, nil // no such object
 	} else if err != nil {
 		return "", false, err
@@ -1014,20 +1028,20 @@ func (sc *wcScratch) restoreTargetTree(ctx context.Context, target string) (tree
 	// The object exists. git peels its tag chain to the end (<target>^{})
 	// and fails only when an object on the way is missing, or a tag
 	// cannot be parsed. Nothing here reads a tag's message.
-	out, err := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{}")
+	out, err := sc.git(ctx, nil, nil, "--no-replace-objects", "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{}")
 	if err != nil {
-		return "", false, fmt.Errorf("restore target %s: git cannot peel it: %w (and %w)", target, err, peelErr)
+		return "", false, fmt.Errorf("restore target %s: git cannot peel it: %w (and %w)", target, err, kindErr)
 	}
 	end := strings.TrimSpace(out)
 	if !ref.ValidSHA(end) {
 		return "", false, fmt.Errorf("rev-parse %s^{} emitted %q", target, end)
 	}
-	out, err = sc.git(ctx, nil, nil, "cat-file", "-t", end)
+	out, err = sc.git(ctx, nil, nil, "--no-replace-objects", "cat-file", "-t", end)
 	if err != nil {
 		return "", false, err
 	}
 	if strings.TrimSpace(out) == "commit" {
-		return "", false, fmt.Errorf("restore target %s: commit %s has no readable tree: %w", target, end, peelErr)
+		return "", false, fmt.Errorf("restore target %s: git cannot read commit %s: %w", target, end, kindErr)
 	}
 	return "", false, nil // a tree or a blob, or a tag of one
 }
