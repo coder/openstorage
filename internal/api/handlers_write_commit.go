@@ -1006,69 +1006,36 @@ func (sc *wcScratch) restoreTargetTree(ctx context.Context, target string) (tree
 	if !wcGitExit(peelErr, 1) {
 		return tree, peelErr == nil, peelErr
 	}
-	// Follow the target's tag chain by the tags' own headers, which name
-	// the type of an object that may be missing.
-	id, typ := target, ""
-	for range wcMaxTagChain {
-		if typ != "" && typ != "commit" && typ != "tag" {
-			return "", false, nil // a tag of a tree or a blob
-		}
-		if _, err := sc.git(ctx, nil, nil, "cat-file", "-e", id); wcGitExit(err, 1) {
-			if id == target {
-				return "", false, nil // no such object
-			}
-			return "", false, fmt.Errorf("restore target %s: tagged %s %s is missing: %w", target, typ, id, peelErr)
-		} else if err != nil {
-			return "", false, err
-		}
-		if typ == "" {
-			out, err := sc.git(ctx, nil, nil, "cat-file", "-t", id)
-			if err != nil {
-				return "", false, err
-			}
-			typ = strings.TrimSpace(out)
-		}
-		switch typ {
-		case "commit":
-			return "", false, fmt.Errorf("restore target %s: commit %s has no readable tree: %w", target, id, peelErr)
-		case "tag":
-			out, err := sc.git(ctx, nil, nil, "cat-file", "tag", id)
-			if err != nil {
-				return "", false, err
-			}
-			if id, typ, err = wcTagTarget(out); err != nil {
-				return "", false, fmt.Errorf("restore target %s: %w", target, err)
-			}
-		default:
-			return "", false, nil // a tree or a blob
-		}
+	if _, err := sc.git(ctx, nil, nil, "cat-file", "-e", target); wcGitExit(err, 1) {
+		return "", false, nil // no such object
+	} else if err != nil {
+		return "", false, err
 	}
-	return "", false, fmt.Errorf("restore target %s: more than %d tags deep", target, wcMaxTagChain)
+	// The object exists. git peels its tag chain to the end (<target>^{})
+	// and fails only when an object on the way is missing, or a tag
+	// cannot be parsed. Nothing here reads a tag's message.
+	out, err := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{}")
+	if err != nil {
+		return "", false, fmt.Errorf("restore target %s: git cannot peel it: %w (and %w)", target, err, peelErr)
+	}
+	end := strings.TrimSpace(out)
+	if !ref.ValidSHA(end) {
+		return "", false, fmt.Errorf("rev-parse %s^{} emitted %q", target, end)
+	}
+	out, err = sc.git(ctx, nil, nil, "cat-file", "-t", end)
+	if err != nil {
+		return "", false, err
+	}
+	if strings.TrimSpace(out) == "commit" {
+		return "", false, fmt.Errorf("restore target %s: commit %s has no readable tree: %w", target, end, peelErr)
+	}
+	return "", false, nil // a tree or a blob, or a tag of one
 }
-
-// wcMaxTagChain bounds the tags that restoreTargetTree follows.
-const wcMaxTagChain = 64
 
 // wcGitExit reports whether err is a git run that exited with code.
 func wcGitExit(err error, code int) bool {
 	var exitErr *exec.ExitError
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == code
-}
-
-// wcTagTarget reads the object and type headers of a tag object.
-func wcTagTarget(tag string) (id, typ string, err error) {
-	head, _, _ := strings.Cut(tag, "\n\n")
-	for line := range strings.SplitSeq(head, "\n") {
-		if v, ok := strings.CutPrefix(line, "object "); ok && id == "" {
-			id = v
-		} else if v, ok := strings.CutPrefix(line, "type "); ok && typ == "" {
-			typ = v
-		}
-	}
-	if !ref.ValidSHA(id) || typ == "" {
-		return "", "", fmt.Errorf("malformed tag headers %q", head)
-	}
-	return id, typ, nil
 }
 
 // wcBlobSink streams one file's decoded bytes into `git hash-object -w

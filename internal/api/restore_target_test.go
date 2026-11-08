@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,7 +11,8 @@ import (
 
 // restoreTargetTree answers "not found" only for a target that names no
 // commit. A commit whose tree, or a tag whose commit, git cannot read
-// gives rev-parse the same exit 1, and is the repository's failure.
+// gives rev-parse the same exit 1, and is the repository's failure, and
+// so is a tag git cannot parse.
 func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 	dir := t.TempDir()
 	coreGit(t, dir, "init", "-q", "-b", "main", ".")
@@ -27,6 +29,21 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 	tagC1 := tag("c1", c1)
 	tagTag := tag("c1-again", tagC1)
 	tagTree := tag("tree", tree1)
+	// Tag objects git writes only with --literally: headers out of order,
+	// which git cannot parse, and an uppercase object id, which it can.
+	rawTag := func(body string) string {
+		t.Helper()
+		cmd := exec.Command("git", "hash-object", "-t", "tag", "-w", "--stdin", "--literally")
+		cmd.Dir = dir
+		cmd.Stdin = strings.NewReader(body)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("hash-object: %v", err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	badTag := rawTag("type tree\nobject " + tree1 + "\ntag bad\ntagger a <a@b> 0 +0000\n\nm\n")
+	upperTag := rawTag("object " + strings.ToUpper(tree1) + "\ntype tree\ntag up\ntagger a <a@b> 0 +0000\n\nm\n")
 
 	// c2's tree and c3 are unique objects, removed below.
 	coreWriteFile(t, dir, "b.txt", "two\n")
@@ -60,6 +77,8 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 		{"tree", tree1, "", false, false},
 		{"blob", blob, "", false, false},
 		{"tag of a tree", tagTree, "", false, false},
+		{"tag of a tree by an uppercase id", upperTag, "", false, false},
+		{"tag that git cannot parse", badTag, "", false, true},
 		{"commit whose tree is missing", c2, "", false, true},
 		{"tag of a missing commit", tagC3, "", false, true},
 		{"tag of a tag of a missing commit", tagTagC3, "", false, true},
@@ -69,4 +88,12 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 			t.Errorf("%s: tree %q found %v err %v, want tree %q found %v broken %v", tc.name, tree, found, err, tc.tree, tc.found, tc.broken)
 		}
 	}
+	// git peels the tags: nothing reads a tag object's message, which
+	// can be as large as the repository allows.
+	t.Run("no tag body read", func(t *testing.T) {
+		gitFailsOnArg(t, "tag", "kill")
+		if tree, found, err := sc.restoreTargetTree(context.Background(), tagTree); tree != "" || found || err != nil {
+			t.Fatalf("tag of a tree: tree %q found %v err %v, want not found", tree, found, err)
+		}
+	})
 }
