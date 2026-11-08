@@ -178,7 +178,7 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 }
 
 // On the local schedule a hook that cannot read the metadata document
-// refuses an update that would record forward intent before its CAS: the
+// refuses an update that could record forward intent before its CAS: the
 // format check fails open (issues #445, #466), but the push's forward intent
 // must be in the row before the CAS (ADR-50 amendment), and without the
 // document the hook cannot tell whether the repository forwards. A caller

@@ -327,7 +327,19 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 	if m, ok := cacheRepoMemos.Load(path); ok && cacheRepoUnchanged(path, m.(cacheRepoMemo)) {
 		return path, nil
 	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
+	// A repository that this call creates gets the lease epoch
+	// (gitlimit.EpochFile) before git runs in it. In a directory that already
+	// existed, an older release can have a git alive that holds no lease, so
+	// the stale ref lock cleanup keeps every lock there (staleref.go).
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	switch err := os.Mkdir(path, 0o755); {
+	case err == nil:
+		if err := gitlimit.CreateEpoch(path); err != nil {
+			return "", err
+		}
+	case !errors.Is(err, os.ErrExist):
 		return "", err
 	}
 	// Cold initialization and repairs write config.lock. Serialize the full

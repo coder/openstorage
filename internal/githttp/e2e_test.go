@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"crypto"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -719,7 +720,23 @@ func remoteURL(n *testNode, repo, token string) string {
 // git surface, and pg/blob state is keyed by RepoID only). Tests push via
 // the returned RepoID so their storage assertions read the same key;
 // name-style URL resolution is pinned by TestRepoKeySplit_CrossSurface.
-func registerRepo(t *testing.T, url string) string {
+// The stored URL is runUnique(name): a test that needs the URL itself
+// calls registerRepoURL.
+func registerRepo(t *testing.T, name string) string {
+	t.Helper()
+	return registerRepoURL(t, runUnique(name))
+}
+
+// runUnique returns name with a random suffix. The lane stores outlive one
+// test run (go test -count=N reuses them), so a repository name or URL that
+// a test writes to them must differ per run: a fixed one already exists,
+// with the refs of the run before.
+func runUnique(name string) string {
+	return name + "-" + strings.ToLower(rand.Text()[:8])
+}
+
+// registerRepoURL is registerRepo with exactly url as the stored URL.
+func registerRepoURL(t *testing.T, url string) string {
 	t.Helper()
 	repo, err := testMeta.CreateRepo(context.Background(), testOrg, url, "main")
 	if err != nil {
@@ -1534,7 +1551,7 @@ func TestRepack_PushesFoldToOnePack(t *testing.T) {
 		}
 		t.Cleanup(metadata.Close)
 	}
-	record, err := metadata.CreateRepo(t.Context(), testOrg, "t-repack", "main")
+	record, err := metadata.CreateRepo(t.Context(), testOrg, runUnique("t-repack"), "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1606,8 +1623,8 @@ func TestRepack_PushesFoldToOnePack(t *testing.T) {
 // API; the repo_id-style URL addresses the same repo; unregistered names
 // are 404 on the git surface even for authenticated callers.
 func TestRepoKeySplit_CrossSurface(t *testing.T) {
-	const url = "t-keysplit"
-	repoID := registerRepo(t, url)
+	url := runUnique("t-keysplit")
+	repoID := registerRepoURL(t, url)
 	work := initWorkRepo(t)
 	token := mintTestToken(t, url, "git:read,git:write", "") // claim carries the url
 
@@ -1719,8 +1736,8 @@ func apiJSON(t *testing.T, n *testNode, method, token, path, body string, out an
 // ref-store generation — so it also proves the default-branch change
 // defeats the issue-#4 hydrate short-circuit.
 func TestPatchDefaultBranch_CloneHEADFollows(t *testing.T) {
-	const repoURL = "t18-patch-default"
-	repoID := registerRepo(t, repoURL)
+	repoURL := runUnique("t18-patch-default")
+	repoID := registerRepoURL(t, repoURL)
 	// One URL-claim token works on both surfaces (docs/reference/authentication.md): the git path
 	// resolves the claim against the repo record, and the API accepts
 	// url-style claims directly.

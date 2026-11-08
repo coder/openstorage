@@ -71,6 +71,9 @@ type staleRefCleanup struct {
 	Old     int
 	Removed int
 	Outcome metrics.StaleRefLockOutcome
+	// NoEpoch: the repository has no epoch file, so the run kept every lock
+	// without taking the lease.
+	NoEpoch bool
 }
 
 // cleanStaleRefLocks removes the ref locks that can block an update-ref batch
@@ -81,16 +84,23 @@ type staleRefCleanup struct {
 // The proof is the lease (gitlimit.LeaseFile). Winning it exclusively means
 // that no git that serve started is alive in the repository, and none starts
 // until the lease is released. When the lease is busy the run keeps every
-// lock (outcome busy). It also keeps a lock that is not newer than the lease
-// epoch (gitlimit.EpochFile), because a git without a lease can own it.
+// lock (outcome busy).
 //
-// What the proof leaves open is a git that holds no lease and has a lock
-// newer than the epoch: a git run by hand in the cache, or a git of an older
-// binary that outlived its server and started a new transaction after the
-// first lease-aware start. The age gate (staleRefLockAge) and the identity
-// check below narrow it, and the operator rules in
-// docs/how-to/deploy-production.md close it: stop the old binary and its git
-// children before the first start of a binary with the lease.
+// The lease sees only git that serve started with it. A git of an older
+// release holds none, and it can outlive its server: a graceful stop of
+// v0.18.0 ends with drain incomplete and exits 0 with its git children
+// running, and a kill leaves them too. Such a git can run only in a
+// repository that already existed when the lease-aware serve started. So the
+// run acts only on a repository that has an epoch file (gitlimit.EpochFile),
+// which EnsureCacheRepoCtx writes when it creates the directory. In a
+// repository without one, an older release created the directory (or its
+// creation was interrupted): the run keeps every lock, counts kept and logs
+// the runbook line. It also keeps a lock that is not newer than the epoch.
+//
+// What stays open is a git that an operator runs by hand in the cache, which
+// holds no lease whatever created the repository. The age gate
+// (staleRefLockAge) and the identity check below narrow it, and
+// docs/how-to/deploy-production.md tells operators not to do it.
 //
 // A lock is moved into the quarantine directory with a rename, and the moved
 // file's device and inode are compared with the lock that was inspected.
@@ -120,6 +130,8 @@ func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res sta
 		switch {
 		case err != nil:
 			log.Printf("hydrate %s: removed %d of %d ref lock(s) older than %v, then stopped: %v", repoPath, res.Removed, res.Old, staleRefLockAge, err)
+		case res.NoEpoch:
+			log.Printf("hydrate %s: %d ref lock(s) older than %v kept: an older release created this repository, so a git of that release can still own them; see \"Stale ref locks\" in docs/how-to/deploy-production.md", repoPath, res.Old, staleRefLockAge)
 		case res.Outcome == metrics.StaleRefLockBusy:
 			log.Printf("hydrate %s: %d ref lock(s) older than %v kept: a git that serve started is still running in the repository", repoPath, res.Old, staleRefLockAge)
 		default:
@@ -127,6 +139,14 @@ func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res sta
 		}
 	}()
 
+	epoch, err := gitlimit.LeaseEpoch(repoPath)
+	if errors.Is(err, gitlimit.ErrNoEpoch) {
+		res.NoEpoch = true
+		return res, nil
+	}
+	if err != nil {
+		return res, err
+	}
 	lease, err := gitlimit.TryExclusive(repoPath)
 	if errors.Is(err, gitlimit.ErrLeaseBusy) {
 		res.Outcome = metrics.StaleRefLockBusy
@@ -144,10 +164,6 @@ func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res sta
 		return res, nil
 	}
 	res.Old = len(old)
-	epoch, err := gitlimit.LeaseEpoch(repoPath)
-	if err != nil {
-		return res, err
-	}
 	for _, lock := range old {
 		if !lock.fi.ModTime().After(epoch) {
 			continue

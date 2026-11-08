@@ -29,17 +29,25 @@ import (
 // CombinedOutputIn, or attaches a Lease itself (Lease.Attach). The audit test
 // in this package fails on a new git start that does neither, and a binary
 // built with the openstorage_viewcheck tag panics on a start that runs in a
-// repository without a lease. Git that serve did not start holds no lease;
-// the docs tell operators not to run it in a cache repository while serve
-// runs, and not to reassign descriptor LeaseFD in a hook.
+// repository without a lease. Git that serve did not start holds no lease,
+// so operators must not run it in a cache repository while serve runs, and
+// must not reassign descriptor LeaseFD in a hook. The release that first
+// takes the lease exclusively (the stale ref lock cleanup of #490) writes
+// those rules into docs/how-to/deploy-production.md.
 const LeaseFile = "codestorage.gitlease.lock"
 
-// EpochFile is the name of the lease epoch file, <repo>/EpochFile. The first
-// process that opens a repository's lease creates it, empty and with
-// create-exclusive, so its modification time is the moment a lease-aware
-// process first started git there. A ref lock that is older was made by a git
-// that may hold no lease (a binary from before the lease, or git run by hand),
-// and cleanup keeps it (#490). The file is never removed.
+// EpochFile is the name of the lease epoch file, <repo>/EpochFile. The code
+// that creates a cache repository's directory writes it, empty, right after
+// it made the directory and before git runs there (CreateEpoch), so the file
+// marks a repository that a lease-aware serve created: no git of an older
+// release ran in it before, and every git that serve starts in it takes the
+// lease. A repository without the file was created by an older release, or
+// its creation was interrupted, and an older release's git, which holds no
+// lease, can still run there: cleanup keeps every lock in it (#490). The
+// file's modification time is the moment of creation, and cleanup also keeps
+// a ref lock that is not newer. OpenLease and TryExclusive never write it:
+// a late epoch in an existing directory would make a lock of an older
+// release's git look newer than the epoch. The file is never removed.
 const EpochFile = "codestorage.gitlease.epoch"
 
 // LeaseFD is the descriptor a git child holds the lease on. Git reads the
@@ -54,13 +62,13 @@ var ErrLeaseBusy = errors.New("git lease is busy")
 // ErrNoEpoch: the repository has no lease epoch file.
 var ErrNoEpoch = errors.New("git lease epoch is missing")
 
-const (
-	// leaseWait bounds how long a git start waits for an exclusive holder.
-	// An exclusive holder runs for the milliseconds of one file move, so a
-	// start that waits this long is stuck behind a hung one and fails.
-	leaseWait = 30 * time.Second
-	leasePoll = 5 * time.Millisecond
-)
+// leaseWait bounds how long a git start waits for an exclusive holder. An
+// exclusive holder runs for the milliseconds of one file move, so a start
+// that waits this long is stuck behind a hung one and fails. A variable so
+// that a test can shorten it.
+var leaseWait = 30 * time.Second
+
+const leasePoll = 5 * time.Millisecond
 
 // checkUnleased and checkLeased are set only by the openstorage_viewcheck
 // build tag (leasecheck_viewcheck.go): checkUnleased sees every Start that
@@ -73,20 +81,39 @@ var (
 // Lease is an open lease file with a flock on it. Close releases the lock
 // unless a child that inherited the descriptor still holds it.
 type Lease struct {
-	f      *os.File
+	f      *os.File // nil: the filesystem is read-only and has no lease file
 	shared bool
 }
+
+// openLeaseFile is os.OpenFile behind a seam, so that a test can report a
+// read-only filesystem without mounting one.
+var openLeaseFile = os.OpenFile
 
 // OpenLease takes a shared lease on the repository at repoPath, creating the
 // lease file if it is missing. It waits (bounded) while the lease is held
 // exclusively. It fails with ctx's error once ctx ends, with ErrStopping once
 // StopChildren began, and with ErrLeaseBusy if the wait does not end.
+//
+// On a read-only filesystem (EROFS) nothing can write a ref lock, so a read
+// there must still run. An existing lease file is opened read-only and
+// locked, because flock needs no write access. With no lease file, the lease
+// holds nothing and Attach adds no descriptor. Any other failure, a
+// permission error included, is an error: a directory that serve cannot
+// write can still have a writable refs/, where a git without the lease could
+// take ref locks.
 func OpenLease(ctx context.Context, repoPath string) (*Lease, error) {
 	assertf(repoPath != "", "OpenLease: empty repoPath")
-	if err := ensureEpoch(repoPath); err != nil {
-		return nil, err
+	path := filepath.Join(repoPath, LeaseFile)
+	f, err := openLeaseFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if errors.Is(err, syscall.EROFS) {
+		var roErr error
+		switch f, roErr = openLeaseFile(path, os.O_RDONLY, 0); {
+		case roErr == nil:
+			err = nil
+		case errors.Is(roErr, fs.ErrNotExist):
+			return &Lease{shared: true}, nil
+		}
 	}
-	f, err := os.OpenFile(filepath.Join(repoPath, LeaseFile), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open git lease: %w", err)
 	}
@@ -125,9 +152,6 @@ func OpenLease(ctx context.Context, repoPath string) (*Lease, error) {
 // wait. It returns ErrLeaseBusy when the lease is held.
 func TryExclusive(repoPath string) (*Lease, error) {
 	assertf(repoPath != "", "TryExclusive: empty repoPath")
-	if err := ensureEpoch(repoPath); err != nil {
-		return nil, err
-	}
 	f, err := os.OpenFile(filepath.Join(repoPath, LeaseFile), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open git lease: %w", err)
@@ -142,16 +166,15 @@ func TryExclusive(repoPath string) (*Lease, error) {
 	return &Lease{f: f}, nil
 }
 
-// ensureEpoch creates the epoch file when it is missing.
-func ensureEpoch(repoPath string) error {
+// CreateEpoch writes the epoch file of the cache repository at repoPath, which
+// the caller has just created (see EpochFile). It fails when the file exists.
+func CreateEpoch(repoPath string) error {
+	assertf(repoPath != "", "CreateEpoch: empty repoPath")
 	f, err := os.OpenFile(filepath.Join(repoPath, EpochFile), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	switch {
-	case err == nil:
-		return f.Close()
-	case errors.Is(err, fs.ErrExist):
-		return nil
+	if err != nil {
+		return fmt.Errorf("create git lease epoch: %w", err)
 	}
-	return fmt.Errorf("create git lease epoch: %w", err)
+	return f.Close()
 }
 
 // LeaseEpoch returns the lease epoch of the repository at repoPath: the
@@ -178,13 +201,21 @@ func LeaseEpoch(repoPath string) (time.Time, error) {
 func (l *Lease) Attach(cmd *exec.Cmd) {
 	assertf(l.shared, "Lease.Attach: not a shared lease")
 	assertf(len(cmd.ExtraFiles) == 0, "Lease.Attach: cmd already has ExtraFiles")
+	if l.f == nil {
+		return
+	}
 	// Entry i becomes descriptor 3+i, and a nil entry leaves it closed.
 	cmd.ExtraFiles = make([]*os.File, LeaseFD-3+1)
 	cmd.ExtraFiles[LeaseFD-3] = l.f
 }
 
 // Close closes the parent's copy of the lease file.
-func (l *Lease) Close() error { return l.f.Close() }
+func (l *Lease) Close() error {
+	if l.f == nil {
+		return nil
+	}
+	return l.f.Close()
+}
 
 // flock tries one flock operation without blocking.
 func flock(f *os.File, how int) error {
@@ -215,7 +246,7 @@ func StartIn(ctx context.Context, repoPath string, cmd *exec.Cmd) error {
 	}
 	l, err := OpenLease(ctx, repoPath)
 	if err != nil {
-		return err
+		return failStart(cmd, err)
 	}
 	defer l.Close()
 	l.Attach(cmd)

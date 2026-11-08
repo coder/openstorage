@@ -194,6 +194,50 @@ func TestHydrateKeepsAStaleRefLockOlderThanTheEpoch(t *testing.T) {
 	}
 }
 
+// A repository without an epoch file was created by an older release, and a
+// git of that release holds no lease, so hydration keeps every lock of it
+// and logs the runbook line. The cleanup neither takes the lease nor writes
+// an epoch. The runbook (stop the node, delete the repository's cache
+// directory, start it) heals the node, and serve creates the new directory
+// with an epoch.
+func TestHydrateKeepsAStaleRefLockOfARepositoryAnOlderReleaseCreated(t *testing.T) {
+	p := parkPush(t)
+	p.killReceivePack(t)
+	p.ageLock(t, time.Hour) // the lock is newer than the epoch, so only the missing epoch keeps it
+	if err := os.Remove(filepath.Join(p.repoPath, gitlimit.EpochFile)); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := tryGit("", "ls-remote", p.url()); err == nil {
+		t.Fatalf("ls-remote succeeded with a lock that cleanup must keep:\n%s", out)
+	}
+	if _, err := os.Lstat(p.lock); err != nil {
+		t.Fatalf("hydration removed a lock of a repository without an epoch: %v", err)
+	}
+	if _, err := gitlimit.LeaseEpoch(p.repoPath); err == nil {
+		t.Fatal("serve wrote an epoch into an existing repository")
+	}
+	if !strings.Contains(p.stderr.String(), p.repoPath+": 1 ref lock(s) older than") || !strings.Contains(p.stderr.String(), "an older release created this repository") {
+		t.Errorf("serve did not log the runbook line:\n%s", p.stderr.String())
+	}
+
+	p.node.stop()
+	if err := os.RemoveAll(p.repoPath); err != nil {
+		t.Fatal(err)
+	}
+	node, err := startBinaryNode(binPath, p.cache, os.Stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(node.stop)
+	refs := mustGit(t, "", "ls-remote", remoteURL(node, p.repo, p.token))
+	if !strings.Contains(refs, p.head+"\trefs/heads/feat") {
+		t.Fatalf("ls-remote after the runbook = %q, want feat at %s", refs, p.head)
+	}
+	if _, err := gitlimit.LeaseEpoch(p.repoPath); err != nil {
+		t.Fatalf("the rebuilt repository has no epoch: %v", err)
+	}
+}
+
 // An orphan keeps the lease. serve is SIGKILLed while receive-pack is parked
 // in its ref transaction, so receive-pack and its hook live on as orphans
 // that hold the lock and the lease, and the descriptors of a real serve and a
