@@ -50,13 +50,21 @@ func TestTailBufferHoldsAbout64KiB(t *testing.T) {
 // starts at a character. A tail that was not cut keeps git's bytes as
 // they are.
 func TestTailBufferStartsAtACharacter(t *testing.T) {
-	var tail TailBuffer
-	// 90000 bytes of 3-byte runes: the cut keeps 65536 bytes, the first
-	// two of them the end of a rune.
-	_, _ = tail.Write([]byte(strings.Repeat("€", 30000)))
-	got := tail.String()
-	if !utf8.ValidString(got) || got != strings.Repeat("€", (64<<10)/3) {
-		t.Fatalf("tail starts %q and holds %d bytes, want whole runes", got[:3], len(got))
+	for _, c := range []struct{ in, want string }{
+		// 90000 bytes of 3-byte runes: the cut keeps 65536 bytes, the
+		// first of them the last byte of a rune.
+		{strings.Repeat("€", 30000), strings.Repeat("€", (64<<10)/3)},
+		// 80000 bytes of 4-byte runes, then one ASCII byte: the cut keeps
+		// 65536 bytes, the first three of them the end of a rune, which
+		// is the most a cut can leave.
+		{strings.Repeat("𝄞", 20000) + "a", strings.Repeat("𝄞", (64<<10)/4-1) + "a"},
+	} {
+		var tail TailBuffer
+		_, _ = tail.Write([]byte(c.in))
+		got := tail.String()
+		if !utf8.ValidString(got) || got != c.want {
+			t.Fatalf("tail starts %q and holds %d bytes, want %d bytes of whole runes", got[:min(4, len(got))], len(got), len(c.want))
+		}
 	}
 	var uncut TailBuffer
 	_, _ = uncut.Write([]byte("\xa9git"))
