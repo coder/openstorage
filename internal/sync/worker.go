@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 )
 
@@ -1130,7 +1131,7 @@ func runGitTo(ctx context.Context, dir string, env []string, out io.Writer, args
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = env
-	var errBuf bytes.Buffer
+	var errBuf gitlimit.TailBuffer // callers quote it in errors and logs
 	cmd.Stdout = out
 	cmd.Stderr = &errBuf
 	cmd.Stdin = bytes.NewReader(nil)

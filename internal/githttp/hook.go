@@ -24,6 +24,7 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -2701,11 +2702,17 @@ func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason stri
 	if v.gnupgHome != "" {
 		cmd.Env = append(cmd.Env, "GNUPGHOME="+v.gnupgHome)
 	}
-	out, err := cmd.CombinedOutput()
-	if err == nil {
+	// The verifier's reason comes first: keep the head of its output, and
+	// count what a long output drops past it.
+	var out gitlimit.HeadBuffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err = cmd.Run(); err == nil {
 		return "", nil
 	}
-	msg := condenseGitReason(out)
+	msg := condenseGitReason(out.Bytes())
+	if n := out.Dropped(); n > 0 {
+		msg += fmt.Sprintf(" (%d more bytes dropped)", n)
+	}
 	// verify-commit exits 1 for a missing or bad signature. Any other end
 	// (git did not start, was killed, or died with 128) is no verdict.
 	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 {

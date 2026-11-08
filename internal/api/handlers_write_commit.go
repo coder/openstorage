@@ -1091,7 +1091,7 @@ type wcBlobSink struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout bytes.Buffer
-	stderr bytes.Buffer
+	stderr gitlimit.TailBuffer // finish's error reaches the log
 }
 
 func (sc *wcScratch) startBlobSink(ctx context.Context) (*wcBlobSink, error) {

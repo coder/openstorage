@@ -2,7 +2,9 @@ package gitlimit
 
 import (
 	"bytes"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TailBuffer keeps exactly the last 64 KiB written to it, however the
@@ -20,5 +22,45 @@ func TestTailBufferKeepsTheLast64KiB(t *testing.T) {
 	want := all.Bytes()[all.Len()-64<<10:]
 	if got := tail.String(); got != string(want) {
 		t.Fatalf("kept %d bytes, want the last %d of %d", len(got), len(want), all.Len())
+	}
+}
+
+// TailBuffer holds about 64 KiB however much git writes: 64 MiB in one
+// Write, or in 4 KiB writes.
+func TestTailBufferHoldsAbout64KiB(t *testing.T) {
+	big := bytes.Repeat([]byte("e"), 64<<20)
+	copy(big[len(big)-len("the end"):], "the end")
+	for _, size := range []int{len(big), 4 << 10} {
+		var tail TailBuffer
+		for p := big; len(p) > 0; {
+			n := min(size, len(p))
+			_, _ = tail.Write(p[:n])
+			p = p[n:]
+		}
+		if c := cap(tail.b); c > 2*stderrKeepBytes {
+			t.Errorf("writes of %d bytes: the buffer holds %d bytes, want at most %d", size, c, 2*stderrKeepBytes)
+		}
+		if got := tail.String(); len(got) != stderrKeepBytes || !strings.HasSuffix(got, "the end") {
+			t.Errorf("writes of %d bytes: kept %d bytes ending %q", size, len(got), got[max(len(got)-8, 0):])
+		}
+	}
+}
+
+// A cut inside a UTF-8 sequence drops its continuation bytes, so the tail
+// starts at a character. A tail that was not cut keeps git's bytes as
+// they are.
+func TestTailBufferStartsAtACharacter(t *testing.T) {
+	var tail TailBuffer
+	// 90000 bytes of 3-byte runes: the cut keeps 65536 bytes, the first
+	// two of them the end of a rune.
+	_, _ = tail.Write([]byte(strings.Repeat("€", 30000)))
+	got := tail.String()
+	if !utf8.ValidString(got) || got != strings.Repeat("€", (64<<10)/3) {
+		t.Fatalf("tail starts %q and holds %d bytes, want whole runes", got[:3], len(got))
+	}
+	var uncut TailBuffer
+	_, _ = uncut.Write([]byte("\xa9git"))
+	if got := uncut.String(); got != "\xa9git" {
+		t.Fatalf("uncut tail = %q, want git's bytes", got)
 	}
 }

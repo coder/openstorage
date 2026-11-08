@@ -75,15 +75,6 @@ func Output(cmd *exec.Cmd) ([]byte, error) {
 	return out.Bytes(), err
 }
 
-// CombinedOutput is exec.Cmd.CombinedOutput through the registry.
-func CombinedOutput(cmd *exec.Cmd) ([]byte, error) {
-	assertf(cmd.Stdout == nil && cmd.Stderr == nil, "gitlimit.CombinedOutput: Stdout or Stderr already set")
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err := Run(cmd)
-	return out.Bytes(), err
-}
-
 // Stopping reports whether StopChildren began.
 func Stopping() bool { return children.isStopped() }
 
