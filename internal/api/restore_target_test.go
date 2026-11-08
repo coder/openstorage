@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +79,46 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Commits whose object file is there but whose header git cannot
+	// read: cat-file -e finds them, and rev-parse exits 128 for them.
+	badHeader := strings.TrimSpace(coreGit(t, dir, "commit-tree", tree1, "-p", c1, "-m", "bad header"))
+	tagBadHeader := tag("bad-header", badHeader)
+	notZlib := strings.TrimSpace(coreGit(t, dir, "commit-tree", tree1, "-p", c1, "-m", "not zlib"))
+	rewriteLoose := func(oid string, data func(body []byte) []byte) {
+		t.Helper()
+		p := filepath.Join(dir, ".git", "objects", oid[:2], oid[2:])
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		zr, err := zlib.NewReader(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(zr)
+		_ = f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, body, ok := bytes.Cut(raw, []byte{0})
+		if !ok {
+			t.Fatalf("loose object %s has no header", oid)
+		}
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data(body), 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rewriteLoose(badHeader, func(body []byte) []byte {
+		var z bytes.Buffer
+		zw := zlib.NewWriter(&z)
+		_, _ = zw.Write(append([]byte("commit 12x\x00"), body...))
+		_ = zw.Close()
+		return z.Bytes()
+	})
+	rewriteLoose(notZlib, func([]byte) []byte { return []byte("not zlib data\n") })
 
 	sc, err := wcNewScratch(filepath.Join(dir, ".git"))
 	if err != nil {
@@ -100,6 +143,9 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 		{"commit whose tree is missing", c2, "", false, true},
 		{"tag of a missing commit", tagC3, "", false, true},
 		{"tag of a tag of a missing commit", tagTagC3, "", false, true},
+		{"commit with a header git cannot parse", badHeader, "", false, true},
+		{"tag of a commit with a header git cannot parse", tagBadHeader, "", false, true},
+		{"commit whose object file is not zlib data", notZlib, "", false, true},
 	} {
 		tree, found, err := sc.restoreTargetTree(context.Background(), tc.target)
 		if tree != tc.tree || found != tc.found || (err != nil) != tc.broken {
@@ -112,6 +158,16 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 	if _, err := sc.resolveTree(context.Background(), c4); err != nil {
 		t.Errorf("resolveTree(commit that a replacement makes a tree): %v", err)
 	}
+	// Only a full object id reaches restoreTargetTree: for an abbreviated
+	// one, cat-file -e exit 1 can also mean an ambiguous name.
+	t.Run("abbreviated target", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("restoreTargetTree(abbreviated id) did not panic")
+			}
+		}()
+		_, _, _ = sc.restoreTargetTree(context.Background(), c1[:12])
+	})
 	// git peels the tags: nothing reads a tag object's message, which
 	// can be as large as the repository allows.
 	t.Run("no tag body read", func(t *testing.T) {

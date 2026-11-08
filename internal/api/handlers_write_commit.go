@@ -1089,8 +1089,10 @@ func (sc *wcScratch) resolveTree(ctx context.Context, commitSHA string) (string,
 // is false when the target names no commit: no object, a tree, a blob,
 // or a tag of one. A commit whose tree, or a tag whose commit, git cannot
 // read is the repository's failure, an error, and so is any other git
-// failure (a fatal exit, a killed git).
+// failure (a fatal exit, a killed git). target is a full object id, so
+// that cat-file -e exit 1 below means only that no such object exists.
 func (sc *wcScratch) restoreTargetTree(ctx context.Context, target string) (tree string, found bool, err error) {
+	assertf(ref.ValidSHA(target), "restoreTargetTree: malformed sha %q", target)
 	_, kindErr := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{commit}")
 	if kindErr == nil {
 		out, err := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{commit}^{tree}")
