@@ -164,7 +164,7 @@ A worked example of a moved guard: moving `safeDelete`'s `s.registered(rctx, rep
 
 ## Coverage record
 
-Sync commit: `536ab6a16caf3fe85ab327f425f48d2b0e695bc6` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
+Sync commit: `50df23a2d2020b2e66e2a662938a1ade75572716` (the last commit at which someone confirmed that the model describes this code; only `check.sh --record` moves it).
 
 | File | Covered code |
 |---|---|
