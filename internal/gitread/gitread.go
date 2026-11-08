@@ -55,10 +55,11 @@ func runGit(ctx context.Context, class Class, repoPath string, args ...string) (
 
 // noTreeAttrsEnv is the server's environment with GIT_ATTR_SOURCE set to
 // the empty tree, so that git reads no .gitattributes from a tree or a
-// work tree: only $GIT_DIR/info/attributes, which the server writes. A
-// repository's own attribute files make git print warnings that quote
-// their paths unescaped, and a path can hold a newline, so blame and grep,
-// which read git's stderr, run with it. git 2.41 and later honor the
+// work tree: only $GIT_DIR/info/attributes and the global and system
+// attribute files, which a push cannot write. A repository's own
+// attribute files make git print warnings that quote their paths
+// unescaped, and a path can hold a newline, so blame and grep, which read
+// git's stderr, run with it. git 2.41 and later honor the
 // variable (git 2.43 to 2.45 read HEAD's attributes in a bare repository
 // without it). An older git ignores it and reads no tree attributes in a
 // bare repository.
