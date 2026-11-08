@@ -1084,7 +1084,7 @@ func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
 	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
 
-	repo := "t-hold-before-repack"
+	repo := runUnique("t-hold-before-repack")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1338,7 +1338,7 @@ func TestPush_HoldStaysFreshThroughLocalRefTransaction(t *testing.T) {
 	pushHoldTTL = 2 * time.Second // refresher cadence TTL/4 = 500ms
 	t.Cleanup(func() { pushHoldTTL = prevTTL })
 
-	repo := "t-hold-txn-gap"
+	repo := runUnique("t-hold-txn-gap")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1546,7 +1546,7 @@ func (c *countingRefStore) ListRefsAfter(ctx context.Context, repo, after string
 func TestPreReceive_PostReservationDenialReleasesHold(t *testing.T) {
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
 	laneStore, _ := openLaneStores(t)
-	repo := "t-prereceive-denial-release"
+	repo := runUnique("t-prereceive-denial-release")
 	shaA := strings.Repeat("a", 40)
 	shaB := strings.Repeat("b", 40)
 	if _, err := laneStore.CASRef(context.Background(), repo, "refs/heads/main", ref.ZeroSHA, shaA); err != nil {
@@ -1610,7 +1610,7 @@ func TestHydrate_HeldSkipDoesNotRescanPerRequest(t *testing.T) {
 	barrier := filepath.Join(t.TempDir(), "adv-barrier")
 	t.Setenv(EnvUpdateBarrier, barrier)
 
-	repo := "t-held-scan-coalesce"
+	repo := runUnique("t-held-scan-coalesce")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1706,7 +1706,7 @@ func TestHydrate_HeldSkipDoesNotRescanPerRequest(t *testing.T) {
 func TestPush_CommittedNonAtomicRefReleasedBeforeTail(t *testing.T) {
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
 	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
-	repo := "t-tombstone-committed"
+	repo := runUnique("t-tombstone-committed")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1841,7 +1841,7 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 	barrier := filepath.Join(t.TempDir(), "fanout-barrier")
 	t.Setenv(EnvUpdateBarrierEach, barrier)
 
-	repo := "t-fanout-adv-coalesce"
+	repo := runUnique("t-fanout-adv-coalesce")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)
@@ -1893,10 +1893,14 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 	for _, name := range refs {
 		args = append(args, "HEAD:"+name)
 	}
-	done := make(chan error, 1)
+	type pushResult struct {
+		out string
+		err error
+	}
+	done := make(chan pushResult, 1)
 	go func() {
-		_, err := tryGit(work, args...)
-		done <- err
+		out, err := tryGit(work, args...)
+		done <- pushResult{out, err}
 	}()
 
 	// git runs the update hooks strictly sequentially; each parks after
@@ -1904,11 +1908,16 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 	// every window: the first pays the one full scan and publishes the
 	// held marker, every later one must coalesce across the claimed
 	// range instead of rescanning.
+	// Under load a hook phase can take minutes (a -race lane spent 296 s
+	// in this test, most of it in the push), so the wait for the next
+	// parked hook ends early only when the push exits: its output says
+	// why no hook parked.
+	const parkWait = 5 * time.Minute
 	var first int64
 	released := 0
 	for remaining := append([]string(nil), refs...); len(remaining) > 0; {
 		idx := -1
-		deadline := time.Now().Add(30 * time.Second)
+		deadline := time.Now().Add(parkWait)
 		for idx < 0 && time.Now().Before(deadline) {
 			for i, name := range remaining {
 				if _, err := os.Stat(updateBarrierEachPath(barrier, name) + ".ready"); err == nil {
@@ -1917,11 +1926,15 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 				}
 			}
 			if idx < 0 {
-				time.Sleep(10 * time.Millisecond)
+				select {
+				case res := <-done:
+					t.Fatalf("push exited with %d of %d hooks released: %v\n%s", released, len(refs), res.err, res.out)
+				case <-time.After(10 * time.Millisecond):
+				}
 			}
 		}
 		if idx < 0 {
-			t.Fatalf("no update hook parked (released %d of %d)", released, len(refs))
+			t.Fatalf("no update hook parked within %v (released %d of %d)", parkWait, released, len(refs))
 		}
 		adv()
 		if released == 0 {
@@ -1938,8 +1951,8 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 		remaining = append(remaining[:idx], remaining[idx+1:]...)
 		released++
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("push: %v", err)
+	if res := <-done; res.err != nil {
+		t.Fatalf("push: %v\n%s", res.err, res.out)
 	}
 	// Holds released by post-receive: the coalesced verdict is stale and
 	// the next advertisement heals with a fresh scan.
@@ -1961,7 +1974,7 @@ func TestHydrate_ExternalWriteDuringHookPhaseForcesRescan(t *testing.T) {
 	barrier := filepath.Join(t.TempDir(), "gap-barrier")
 	t.Setenv(EnvUpdateBarrier, barrier)
 
-	repo := "t-external-gap-rescan"
+	repo := runUnique("t-external-gap-rescan")
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
 	laneStore, laneBlob := openLaneStores(t)

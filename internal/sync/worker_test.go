@@ -824,3 +824,43 @@ func TestEventMarshalShape(t *testing.T) {
 		t.Fatalf("started payload carries error: %v", sm)
 	}
 }
+
+// Any token with git:write can push refs/replace/<id>. The worker's git
+// reads each object of a mirror as itself.
+func TestHermeticGitEnvReadsObjectsWithoutReplacements(t *testing.T) {
+	dir := t.TempDir()
+	testGit(t, dir, "init", "-q", "-b", "main")
+	testGit(t, dir, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "--allow-empty", "-m", "c1")
+	testGit(t, dir, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "--allow-empty", "-m", "c2")
+	c1 := strings.TrimSpace(testGit(t, dir, "rev-parse", "HEAD~1"))
+	c2 := strings.TrimSpace(testGit(t, dir, "rev-parse", "HEAD"))
+	testGit(t, dir, "update-ref", "refs/replace/"+c1, c2)
+	out, _, err := runGitOut(context.Background(), dir, hermeticGitEnv("file"), "cat-file", "-p", c1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "\n\nc1") {
+		t.Fatalf("cat-file -p c1 = %q, want c1's own message", out)
+	}
+}
+
+// The envs that the worker's fetch, push and ls-remote run with carry the
+// variable exactly once, with and without credentials.
+func TestGitEnvsCarryNoReplaceObjectsOnce(t *testing.T) {
+	for name, env := range map[string][]string{
+		"authGitEnv":                 authGitEnv("u", "p", "https"),
+		"authGitEnv without a user":  authGitEnv("", "", "https"),
+		"loopbackGitEnv":             loopbackGitEnv("token", "http"),
+		"loopbackGitEnv without one": loopbackGitEnv("", "http"),
+	} {
+		var got []string
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "GIT_NO_REPLACE_OBJECTS=") {
+				got = append(got, kv)
+			}
+		}
+		if len(got) != 1 || got[0] != "GIT_NO_REPLACE_OBJECTS=1" {
+			t.Errorf("%s: GIT_NO_REPLACE_OBJECTS entries %q, want exactly one GIT_NO_REPLACE_OBJECTS=1", name, got)
+		}
+	}
+}

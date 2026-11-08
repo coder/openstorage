@@ -13,10 +13,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	stdsync "sync"
@@ -211,6 +213,7 @@ type localSchedFixture struct {
 	gate      *gateLanes
 	sched     *LocalScheduler
 	clock     atomic.Int64
+	stderr    io.Writer // where a failed run-bound wait writes its message first
 	org       string
 	lookupErr stdsync.Map // repoID -> error returned by the worker's repo lookup
 }
@@ -225,7 +228,7 @@ type localSchedStore interface {
 // OPENSTORAGE_TEST_BACKEND selects: unset for SQLite, s3wal for S3WAL.
 func newLocalSchedFixture(t *testing.T) *localSchedFixture {
 	t.Helper()
-	f := &localSchedFixture{wf: newWorkerFixture(t), org: "sched-org"}
+	f := &localSchedFixture{wf: newWorkerFixture(t), org: "sched-org", stderr: os.Stderr}
 	// Store time starts at wall time: the worker derives its loopback
 	// token TTL from claim expiries with the real clock.
 	f.clock.Store(time.Now().UnixNano())
@@ -272,6 +275,11 @@ func newLocalSchedFixture(t *testing.T) *localSchedFixture {
 	creds, ups := MetaStores(f.ms)
 	w := f.wf.worker
 	w.Upstreams, w.Credentials, w.Local = ups, creds, f.gate
+	// These tests check which run succeeds and what intent survives, not
+	// timeouts: give each run the production budget, so that a host that
+	// makes git slow (a run past newWorkerFixture's minute) does not fail
+	// a run the test expects to succeed.
+	w.Timeout = defaultRunTimeout
 	w.Repos = func(_ context.Context, _, repoID string) (RepoInfo, error) {
 		if err, ok := f.lookupErr.Load(repoID); ok {
 			return RepoInfo{}, err.(error)
@@ -364,22 +372,84 @@ func (f *localSchedFixture) sweep(t *testing.T) {
 	f.idle(t)
 }
 
-// idle waits until no scheduler job is queued or running.
-func (f *localSchedFixture) idle(t *testing.T) {
+// idleDeadlineMargin is how long before the test binary's -timeout a
+// run-bound wait gives up, so that the test fails with the wait's message,
+// and not with the timeout's panic.
+const idleDeadlineMargin = time.Minute
+
+// idleMinWait is the shortest run-bound wait, also when less than
+// idleDeadlineMargin is left before the -timeout.
+const idleMinWait = 5 * time.Second
+
+// waitT is the part of *testing.T that the fixture's run-bound waits use.
+type waitT interface {
+	Helper()
+	Name() string
+	Deadline() (time.Time, bool)
+	Fatal(args ...any)
+}
+
+// runWaitDeadline is when a wait for the fixture's runs that starts at
+// start gives up. Each run in flight started before the wait and ends
+// within its claim lease (claimLease(timeout)), so the wait lasts that
+// long: a shorter wait fails a run that is slow but inside its budget. A
+// test binary's -timeout that comes sooner (CI's S3-WAL lane gives
+// TestLocalSchedule 10 minutes) ends the wait idleDeadlineMargin before
+// it. The wait is never shorter than idleMinWait.
+//
+// The fixture's store clock stands still, so a run that claims later than
+// claimLease(timeout) - claimFenceMargin after the fixture's creation
+// gets no loopback token, and its fetch is refused at once. That fails the
+// run, not a wait.
+func runWaitDeadline(start time.Time, timeout time.Duration, testDeadline time.Time, hasDeadline bool) time.Time {
+	deadline := start.Add(claimLease(timeout))
+	if hasDeadline && testDeadline.Add(-idleDeadlineMargin).Before(deadline) {
+		deadline = testDeadline.Add(-idleDeadlineMargin)
+	}
+	if floor := start.Add(idleMinWait); deadline.Before(floor) {
+		deadline = floor
+	}
+	return deadline
+}
+
+// waitRuns polls done until it reports true, or fails the test with what
+// when runWaitDeadline passes.
+func (f *localSchedFixture) waitRuns(t waitT, what func(waited time.Duration) string, done func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		f.sched.mu.Lock()
-		n := len(f.sched.inflight)
-		f.sched.mu.Unlock()
-		if n == 0 {
-			return
-		}
+	start := time.Now()
+	td, ok := t.Deadline()
+	deadline := runWaitDeadline(start, f.wf.worker.Timeout, td, ok)
+	for !done() {
 		if time.Now().After(deadline) {
-			t.Fatalf("scheduler still has %d jobs in flight", n)
+			msg := what(time.Since(start).Round(time.Second))
+			// Without -v, go test prints a test's messages when the test
+			// ends, and the fixture's cleanup closes the scheduler, which
+			// waits for the runs in flight. Cancel them, so that the test
+			// ends with this message. A run that ignores the cancel keeps
+			// the test from ending: stderr has the message already.
+			fmt.Fprintf(f.stderr, "%s: %s\n", t.Name(), msg)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			f.sched.Drain(ctx, 0)
+			cancel()
+			t.Fatal(msg)
+			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// idle waits until no scheduler job is queued or running.
+func (f *localSchedFixture) idle(t waitT) {
+	t.Helper()
+	n := 0
+	f.waitRuns(t, func(waited time.Duration) string {
+		return fmt.Sprintf("scheduler still has %d jobs in flight after %v", n, waited)
+	}, func() bool {
+		f.sched.mu.Lock()
+		n = len(f.sched.inflight)
+		f.sched.mu.Unlock()
+		return n == 0
+	})
 }
 
 func upstreamHead(t *testing.T, bare string) string {
@@ -597,13 +667,8 @@ func TestLocalScheduleUnrelatedReposProceed(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			deadline := time.Now().Add(60 * time.Second)
-			for upstreamHead(t, yBare) != yHead {
-				if time.Now().After(deadline) {
-					t.Fatal("repo y did not forward while x's store call was blocked")
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
+			f.waitRuns(t, func(time.Duration) string { return "repo y did not forward while x's store call was blocked" },
+				func() bool { return upstreamHead(t, yBare) == yHead })
 			f.sched.mu.Lock()
 			xJobs := 0
 			for k := range f.sched.inflight {
@@ -631,13 +696,8 @@ func TestLocalScheduleUnrelatedReposProceed(t *testing.T) {
 		if err := f.sched.EnqueuePush(t.Context(), Job{Org: f.org, RepoID: y}); err != nil {
 			t.Fatal(err)
 		}
-		deadline := time.Now().Add(60 * time.Second)
-		for upstreamHead(t, yBare) != yHead {
-			if time.Now().After(deadline) {
-				t.Fatal("explicit request did not run while the sweep's read was blocked")
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
+		f.waitRuns(t, func(time.Duration) string { return "explicit request did not run while the sweep's read was blocked" },
+			func() bool { return upstreamHead(t, yBare) == yHead })
 	})
 }
 
@@ -653,13 +713,8 @@ func TestLocalScheduleShutdownAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.sched.Start(0, 5*time.Millisecond)
-	deadline := time.Now().Add(60 * time.Second)
-	for len(f.pushEvents(repo)) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatal("first run did not finish")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	f.waitRuns(t, func(time.Duration) string { return "first run did not finish" },
+		func() bool { return len(f.pushEvents(repo)) >= 2 })
 	f.idle(t)
 	f.sched.Close()
 	f.gate.closed.Store(true)
@@ -789,30 +844,27 @@ func TestLocalScheduleStaleHintsAndCapacity(t *testing.T) {
 	defer release()
 	// The stuck repo gets a slot on some pass (passes rotate by repo ID and
 	// free slots as runs finish); keep sweeping until it is stuck.
-	deadline := time.Now().Add(60 * time.Second)
-	for stuck := false; !stuck; {
+	f.waitRuns(t, func(time.Duration) string { return "stuck repo was never offered" }, func() bool {
 		if err := f.sched.SweepOnce(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 		select {
 		case <-reached:
-			stuck = true
-		case <-time.After(5 * time.Millisecond):
+			return true
+		default:
+			return false
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("stuck repo was never offered")
-		}
-	}
+	})
 	for _, r := range repos[1:] {
-		for len(f.pushEvents(r)) < 2 {
-			if time.Now().After(deadline) {
-				t.Fatalf("repo %s starved behind a stuck repo", r)
+		f.waitRuns(t, func(time.Duration) string { return "repo " + r + " starved behind a stuck repo" }, func() bool {
+			if len(f.pushEvents(r)) >= 2 {
+				return true
 			}
 			if err := f.sched.SweepOnce(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			time.Sleep(5 * time.Millisecond)
-		}
+			return false
+		})
 	}
 }
 
@@ -830,7 +882,7 @@ func TestLocalScheduleClaimRecovery(t *testing.T) {
 			f.advance(time.Minute)
 			switch mode {
 			case "crash":
-				c, err := f.ls.ClaimDuePush(t.Context(), repo, "dead-process", claimLease(time.Minute))
+				c, err := f.ls.ClaimDuePush(t.Context(), repo, "dead-process", claimLease(f.wf.worker.Timeout))
 				if err != nil || !c.Claimed {
 					t.Fatalf("simulated claim: %+v %v", c, err)
 				}
@@ -847,7 +899,7 @@ func TestLocalScheduleClaimRecovery(t *testing.T) {
 			if len(f.pushEvents(repo)) != before {
 				t.Fatal("claim taken over before its lease expired")
 			}
-			f.advance(claimLease(time.Minute))
+			f.advance(claimLease(f.wf.worker.Timeout))
 			f.sweep(t)
 			ev := f.pushEvents(repo)
 			if len(ev) != before+2 || !ev[before].Forced {
@@ -1129,7 +1181,7 @@ func TestLocalSchedulePublicationFence(t *testing.T) {
 		f.sweep(t) // transient failure: attempt 1, force kept
 		f.advance(time.Minute)
 		// The server refuses the loopback fetch: a push holds a ref the
-		// cache has not caught up with (githttp.Server.StrictSyncFetch).
+		// cache has not caught up with (githttp.Server's strict sync fetch).
 		locked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "held", http.StatusLocked)
 		}))

@@ -60,6 +60,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/metrics"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -86,13 +87,20 @@ func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...strin
 	assertf(len(args) > 0, "runGitStdin: no args")
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	cmd.Env = gitlimit.NoReplaceObjects(nil)
 	cmd.Stdin = stdin
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the log
 	cmd.Stderr = &stderr
+	lease, err := gitlimit.OpenLease(ctx, dir)
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	defer lease.Close()
+	lease.Attach(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return string(out), fmt.Errorf("git %s: %w: %s",
-			strings.Join(args, " "), normalizeCtxErr(ctx, err), strings.TrimSpace(stderr.String()))
+			strings.Join(args, " "), normalizeCtxErr(ctx, err), stderr.String())
 	}
 	return string(out), nil
 }
@@ -783,9 +791,16 @@ func packObjectUnion(ctx context.Context, repoPath string, packs []ref.Pack) ([]
 func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn func(sha string)) error {
 	cmd := exec.CommandContext(ctx, "git", "show-index")
 	cmd.Dir = repoPath
+	cmd.Env = gitlimit.NoReplaceObjects(nil)
 	cmd.Stdin = idx
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the repack log
 	cmd.Stderr = &stderr
+	lease, err := gitlimit.OpenLease(ctx, repoPath)
+	if err != nil {
+		return fmt.Errorf("git show-index: %w", err)
+	}
+	defer lease.Close()
+	lease.Attach(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -814,7 +829,7 @@ func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn fun
 	// early scan abort, then surface the first failure.
 	_, _ = io.Copy(io.Discard, stdout)
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("git show-index: %w: %s", normalizeCtxErr(ctx, err), strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("git show-index: %w: %s", normalizeCtxErr(ctx, err), stderr.String())
 	}
 	return scanErr
 }

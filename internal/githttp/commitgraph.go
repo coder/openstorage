@@ -7,7 +7,6 @@
 package githttp
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -284,9 +283,9 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 	cmd.Env = commitGraphEnv(os.Environ())
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = commitGraphKillDelay
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the log
 	cmd.Stderr = &stderr
-	err := gitlimit.Run(cmd)
+	err := gitlimit.RunIn(actx, repoPath, cmd)
 	if err == nil {
 		return nil
 	}
@@ -303,7 +302,7 @@ func runCommitGraphAttempt(ctx context.Context, repoPath string, budget time.Dur
 		// owner cannot be proven, ADR-47).
 		err = fmt.Errorf("%w: %w", errCommitGraphLockHeld, err)
 	}
-	return fmt.Errorf("git %s: %w: %s", line, err, strings.TrimSpace(stderr.String()))
+	return fmt.Errorf("git %s: %w: %s", line, err, stderr.String())
 }
 
 // commitGraphEnv is the child's environment: environ without any inherited

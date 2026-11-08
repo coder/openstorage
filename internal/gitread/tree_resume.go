@@ -833,10 +833,14 @@ func (s *treeSource) close(abort bool) error {
 // leaves the reader at the object's first byte: its type and size.
 func (s *treeSource) request(rev string) (objType string, size int64, err error) {
 	if _, err := io.WriteString(s.req, rev+"\n"); err != nil {
+		// The write fails only once git is gone. A git that failed says
+		// why. One that ended cleanly without reading the request gave
+		// no answer, as when its output ends first (readErr): which of
+		// the two the walk sees depends on how soon git ends.
 		if runErr := s.wait(); runErr != nil {
 			return "", 0, runErr
 		}
-		return "", 0, err
+		return "", 0, errDeclined
 	}
 	line, err := s.resp.ReadSlice('\n')
 	if err != nil {

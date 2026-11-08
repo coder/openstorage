@@ -24,6 +24,7 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -129,7 +130,7 @@ func testMode() bool { return envconfig.Getenv(EnvTestMode) == "1" }
 // reconcile. An error refuses the ref update before its CAS (issues #445,
 // #466: the metadata document is in a format this binary cannot write
 // events to, or corrupt). When the hook cannot wire its eventing, the cmd
-// wiring returns a store that refuses every update that would record
+// wiring returns a store that refuses every update that could record
 // forward intent and passes the rest, still through ref.IdempotentCAS
 // (cmd/openstorage intentlessRefStore, ADR-33's amendment).
 var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
@@ -926,7 +927,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	// better than failing after.
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
-		return err
+		return fmt.Errorf("pre-receive: open ref store: %w", err)
 	}
 	defer st.Close()
 
@@ -1758,7 +1759,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
-		return err
+		return fmt.Errorf("update: open ref store: %w", err)
 	}
 	defer st.Close()
 	// Authority-side directory/file guard (Codex round-4 P1 on #173, and
@@ -2455,7 +2456,16 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	defer cleanup()
 
 	for _, sha := range pending {
-		reason := v.verifyCommit(ctx, sha)
+		reason, err := v.verifyCommit(ctx, sha)
+		if err != nil {
+			// Not a verdict, so the reason names no signature fault and
+			// no cause: the cause goes to the hook-errors file now. It is
+			// still cached and charged like a denial for the rest of the
+			// push, or a commit whose check cannot finish (git dies on a
+			// malformed signature header) costs one git spawn per ref.
+			hookErrorsLogger().Error("verify-sig: signature check did not finish", "sha", sha, "err", err)
+			reason = "signature check failed (the server log has the cause)"
+		}
 		if reason != "" {
 			if err := state.markCommitDenied(sha, reason); err != nil {
 				return fmt.Errorf("verify-sig: %w", err)
@@ -2675,12 +2685,14 @@ func looksLikeSSHPublicKey(line string) bool {
 
 // verifyCommit returns "" when sha carries a valid signature from the
 // materialized keyring, else a short human-readable reason. Delegates to
-// `git verify-commit`, which picks gpg or ssh-keygen by signature type.
-func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason string) {
+// `git verify-commit`, which picks gpg or ssh-keygen by signature type. An
+// error is a check that did not run to a verdict: git did not start, was
+// killed, or failed with a status other than verify-commit's 1.
+func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason string, err error) {
 	if !ref.ValidSHA(sha) {
 		// Callers feed rev-list output; a malformed sha fails closed as a
 		// denial reason instead of crashing receive-pack.
-		return fmt.Sprintf("malformed commit sha %q", sha)
+		return fmt.Sprintf("malformed commit sha %q", sha), nil
 	}
 	logVerifySpawn(sha)
 	cmd := exec.CommandContext(ctx, "git",
@@ -2690,20 +2702,31 @@ func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason stri
 	if v.gnupgHome != "" {
 		cmd.Env = append(cmd.Env, "GNUPGHOME="+v.gnupgHome)
 	}
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return ""
+	// The verifier's reason comes first: keep the head of its output, and
+	// count what a long output drops past it.
+	var out gitlimit.HeadBuffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err = cmd.Run(); err == nil {
+		return "", nil
 	}
-	msg := condenseGitReason(out)
+	msg := condenseGitReason(out.Bytes())
+	if n := out.Dropped(); n > 0 {
+		msg += fmt.Sprintf(" (%d more bytes dropped)", n)
+	}
+	// verify-commit exits 1 for a missing or bad signature. Any other end
+	// (git did not start, was killed, or died with 128) is no verdict.
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 {
+		return "", fmt.Errorf("git verify-commit %s: %w (output: %q)", sha, err, msg)
+	}
 	if msg == "" {
 		// git verify-commit is silent for unsigned commits.
-		return "commit is not signed"
+		return "commit is not signed", nil
 	}
 	// The verifier's output can name server paths (the temporary
 	// allowed-signers file) and key diagnostics: the hook-errors file
 	// gets it, the pusher the documented reason.
 	hookErrorsLogger().Error("verify-sig: signature check failed", "sha", sha, "detail", msg)
-	return "no registered key matches the signature (the server log has the verifier's output)"
+	return "no registered key matches the signature (the server log has the verifier's output)", nil
 }
 
 // condenseGitReason squeezes git/gpg/ssh-keygen diagnostics into one short

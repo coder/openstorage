@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 )
 
@@ -305,11 +306,11 @@ func (w *Worker) waitPublication(ctx context.Context, repoID string) error {
 	return w.WaitPublication(wctx, repoID)
 }
 
-// restoreLocal ends a claimed local run that got no fresh snapshot: its
-// publication wait failed (no event emitted yet), or a push run's loopback
-// fetch found a push-held ref stale (after its started event, like a
-// shutdown restore). Nothing was forwarded, so the run hands its request
-// back to the row (restore) instead of counting a run.
+// restoreLocal ends a claimed run that got no fresh snapshot: its
+// publication wait failed, or a push run's loopback fetch found a
+// push-held ref stale. Neither emits an event: RunPush sends no started
+// event for a stale held ref either. Nothing was forwarded, so the run
+// hands its request back to the row (restore) instead of counting a run.
 func (w *Worker) restoreLocal(ctx context.Context, job Job, holder, lane string, waitErr error, finish func(ctx context.Context) (Upstream, error)) error {
 	w.Logger.Warn("no fresh snapshot; request restored for a later run",
 		"org", job.Org, "repo", job.RepoID, "lane", lane, "err", waitErr)
@@ -1019,6 +1020,7 @@ func hermeticGitEnv(allowProtocol string) []string {
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
 		"GIT_ALLOW_PROTOCOL="+allowProtocol,
+		"GIT_NO_REPLACE_OBJECTS=1", // every object reads as itself (gitlimit.NoReplaceObjects)
 	)
 }
 
@@ -1130,7 +1132,7 @@ func runGitTo(ctx context.Context, dir string, env []string, out io.Writer, args
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = env
-	var errBuf bytes.Buffer
+	var errBuf gitlimit.TailBuffer // callers quote it in errors and logs
 	cmd.Stdout = out
 	cmd.Stderr = &errBuf
 	cmd.Stdin = bytes.NewReader(nil)

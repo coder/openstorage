@@ -74,6 +74,11 @@ const (
 	wcMaxGitlinkBytes = 64
 )
 
+// wcMaxDiffBytes caps the decoded patch of one diff-commit, summed over
+// its chunks: the commit-pack cap, so that both streaming commit
+// endpoints take at most 250 MiB of content. A var so tests can lower it.
+var wcMaxDiffBytes int64 = 262144000
+
 // wcMaxCommitBlobBytes caps the decoded file contents of one commit-pack
 // request, summed over every chunk of every file (spec 2026-10-28, #597:
 // 413 above 262144000 bytes). A var so tests can cross it cheaply.
@@ -686,7 +691,7 @@ func wcNewScratch(repoPath string) (*wcScratch, error) {
 	// must never leak into server-created commits. git names a file it
 	// cannot read in a warning, and a 400 or 409 body shows git's stderr, so
 	// every file git reads outside the repository must lie under the
-	// scratch dir, where wcApplyServerFailure sees it: HOME and
+	// scratch dir, where applyPatch sees it (wcApplyStderr): HOME and
 	// XDG_CONFIG_HOME lead the default attributes file there, and
 	// GIT_ATTR_NOSYSTEM drops the install's own etc/gitattributes.
 	env := make([]string, 0, 32)
@@ -735,7 +740,7 @@ func (sc *wcScratch) git(ctx context.Context, stdin io.Reader, extraEnv []string
 	cmd.Stdin = stdin
 	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
-	out, err := gitlimit.Output(cmd)
+	out, err := gitlimit.OutputIn(ctx, sc.repoPath, cmd)
 	if err != nil {
 		return string(out), fmt.Errorf("%s: %w: %s", gitlimit.Name(args), err, strings.TrimSpace(stderr.String()))
 	}
@@ -749,12 +754,13 @@ const wcMaxApplyMsgBytes = 4096
 // patch does not apply to the tree and 128 for every "bad error": a patch it
 // refuses on sight, a patch that clashes with the tree while it writes the
 // index, and a failure of the index itself (unreadable, locked, no room to
-// write). Only git's message tells those apart, so status comes from the
-// whole stderr, which a long path can push far past wcMaxApplyMsgBytes.
+// write). Only git's message tells those apart, so status comes from every
+// line of stderr (wcApplyStderr), which a long path can push far past
+// wcMaxApplyMsgBytes.
 type wcApplyRejection struct {
 	exit   int    // git's exit status, -1 when SIGABRT ended it (see wcGitAborted)
-	status int    // wcApplyStatus of git's whole stderr, 400 for an abort, 500 if server is set
-	server bool   // that stderr shows a failure of the server's own git (see wcApplyServerFailure)
+	status int    // the status of git's whole stderr (wcApplyStderr), 400 for an abort, 500 if server is set
+	server bool   // that stderr shows a failure of the server's own git (see (*wcApplyStderr).serverFailure)
 	msg    string // that stderr cut to wcMaxApplyMsgBytes
 }
 
@@ -768,7 +774,7 @@ func (r *wcApplyRejection) Error() string {
 // hold a newline, and git prints names unquoted, so a name can put any of
 // these lines into stderr: they say what git was told, not what failed.
 // applyPatch therefore never shows a message that names the server's own
-// paths (see wcApplyServerFailure), whatever these lines say.
+// paths (see (*wcApplyStderr).serverFailure), whatever these lines say.
 var (
 	// A patch that no base tree can make apply: a name that git's own path
 	// rules reject (`.git.`, `git~1`, a symlinked `.gitmodules`), a patch
@@ -780,11 +786,103 @@ var (
 	wcApplyClashLine = "error: unable to add cache entry for "
 )
 
-// wcApplyStatus is the HTTP status for git apply's exit status and stderr:
-// 409 for a patch that does not fit the base tree, 400 for one that fits no
-// tree, and 500 for the server's own failure, whose stderr names scratch
-// paths and stays in the log.
-func wcApplyStatus(exit int, stderr string) int {
+// wcApplyStderr reads git apply's stderr as git writes it, and keeps only
+// what applyPatch needs: the facts that its status and
+// serverFailure read, the head that the client sees, and the tail
+// that the log sees. It keeps about 128 KiB, whatever git prints: git apply
+// prints a line per file that fails, so its stderr grows with the patch.
+type wcApplyStderr struct {
+	needles  []string            // the server's own paths (serverFailure)
+	carry    []byte              // the last bytes, for a needle that two writes split
+	line     []byte              // the start of the current line, up to wcApplyLineKeep bytes
+	head     []byte              // the first wcApplyHeadBytes of stderr
+	tail     gitlimit.TailBuffer // the last 64 KiB, for the log
+	payload  bool                // a line starts with one of wcApplyPayloadLines
+	clash    bool                // a line starts with wcApplyClashLine
+	fatal    bool                // a line starts with "fatal: "
+	pathSeen bool                // stderr holds one of needles
+}
+
+// wcApplyHeadBytes is the head of stderr that wcApplyStderr keeps for the
+// client's message: far more than wcMaxApplyMsgBytes, so that white space
+// before git's first line does not shorten it.
+const wcApplyHeadBytes = 64 << 10
+
+// wcApplyLineKeep is the start of a line that wcApplyStderr reads: the
+// longest line head it looks for.
+var wcApplyLineKeep = func() int {
+	n := len("fatal: ")
+	for _, p := range append([]string{wcApplyClashLine}, wcApplyPayloadLines...) {
+		n = max(n, len(p))
+	}
+	return n
+}()
+
+func (c *wcApplyStderr) Write(p []byte) (int, error) {
+	n := len(p)
+	c.head = append(c.head, p[:min(n, wcApplyHeadBytes-len(c.head))]...)
+	_, _ = c.tail.Write(p)
+	if len(c.needles) > 0 {
+		keep := 0
+		for _, s := range c.needles {
+			keep = max(keep, len(s)-1)
+		}
+		buf := append(c.carry, p...)
+		for _, s := range c.needles {
+			c.pathSeen = c.pathSeen || bytes.Contains(buf, []byte(s))
+		}
+		c.carry = append(c.carry[:0], buf[max(len(buf)-keep, 0):]...)
+	}
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		part := p
+		if i >= 0 {
+			part = p[:i]
+		}
+		c.line = append(c.line, part[:min(len(part), max(wcApplyLineKeep-len(c.line), 0))]...)
+		if i < 0 {
+			break
+		}
+		c.endLine()
+		p = p[i+1:]
+	}
+	return n, nil
+}
+
+// endLine reads the start of the line that ended.
+func (c *wcApplyStderr) endLine() {
+	for _, p := range wcApplyPayloadLines {
+		c.payload = c.payload || bytes.HasPrefix(c.line, []byte(p))
+	}
+	c.clash = c.clash || bytes.HasPrefix(c.line, []byte(wcApplyClashLine))
+	c.fatal = c.fatal || bytes.HasPrefix(c.line, []byte("fatal: "))
+	c.line = c.line[:0]
+}
+
+// done reads the last line, which ends without a newline.
+func (c *wcApplyStderr) done() {
+	if len(c.line) > 0 {
+		c.endLine()
+	}
+}
+
+// message is git's stderr cut to wcMaxApplyMsgBytes, without white space
+// around it. The kept head stands for a longer stderr: git prints no run of
+// white space that fills it.
+func (c *wcApplyStderr) message() string {
+	msg := strings.TrimSpace(string(c.head))
+	if len(msg) > wcMaxApplyMsgBytes {
+		msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
+	}
+	return msg
+}
+
+// status is the HTTP status for git apply's exit status and the stderr
+// that c read: 409 for a patch that does not fit the base tree, 400 for one
+// that fits no tree, and 500 for the server's own failure, whose stderr
+// names scratch paths and stays in the log.
+func (c *wcApplyStderr) status(exit int) int {
+	c.done()
 	switch exit {
 	case 1:
 		return http.StatusConflict
@@ -792,42 +890,44 @@ func wcApplyStatus(exit int, stderr string) int {
 	default:
 		return http.StatusInternalServerError
 	}
-	clash := false
-	for line := range strings.Lines(stderr) {
-		for _, p := range wcApplyPayloadLines {
-			if strings.HasPrefix(line, p) {
-				return http.StatusBadRequest
-			}
-		}
-		clash = clash || strings.HasPrefix(line, wcApplyClashLine)
-	}
-	if clash {
+	switch {
+	case c.payload:
+		return http.StatusBadRequest
+	case c.clash:
 		return http.StatusConflict
 	}
 	return http.StatusInternalServerError
 }
 
-// wcApplyServerFailure reports whether git's stderr shows a failure of the
-// server's own git, whatever the patch holds, so that the client never sees
-// it: it names a path of the server's (the scratch directory or the cached
-// repository), or it has a fatal line. git dies for a broken config, a held
-// lock or a missing object, and reports a bad patch with error lines.
-func (sc *wcScratch) wcApplyServerFailure(stderr string) bool {
-	assertf(sc.dir != "" && sc.repoPath != "", "wcApplyServerFailure: empty scratch path")
-	for line := range strings.Lines(stderr) {
-		if strings.HasPrefix(line, "fatal: ") {
-			return true
-		}
-	}
+// serverFailure reports whether the stderr that c read shows a failure of
+// the server's own git, whatever the patch holds, so that the client never
+// sees it: it names a path of the server's (c.needles), or it has a fatal
+// line. git dies for a broken config, a held lock or a missing object, and
+// reports a bad patch with error lines.
+func (c *wcApplyStderr) serverFailure() bool {
+	c.done()
+	return c.fatal || c.pathSeen
+}
+
+// newApplyStderr is a wcApplyStderr that looks for the scratch directory
+// and the cached repository, as given and with symlinks resolved.
+func (sc *wcScratch) newApplyStderr() *wcApplyStderr {
+	assertf(sc.dir != "" && sc.repoPath != "", "newApplyStderr: empty scratch path")
+	c := &wcApplyStderr{}
 	for _, dir := range []string{sc.dir, sc.repoPath} {
-		if strings.Contains(stderr, dir) {
-			return true
-		}
-		if real, err := filepath.EvalSymlinks(dir); err == nil && real != dir && strings.Contains(stderr, real) {
-			return true
+		c.needles = append(c.needles, dir)
+		if real, err := filepath.EvalSymlinks(dir); err == nil && real != dir {
+			c.needles = append(c.needles, real)
 		}
 	}
-	return false
+	return c
+}
+
+// wcApplyStatus is (*wcApplyStderr).status for a whole stderr.
+func wcApplyStatus(exit int, stderr string) int {
+	var c wcApplyStderr
+	_, _ = c.Write([]byte(stderr))
+	return c.status(exit)
 }
 
 // applyPatch runs `git apply` on the spooled patch. The patch goes on
@@ -844,25 +944,18 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	defer f.Close()
 	cmd := sc.gitCmd(ctx, []string{"LC_ALL=C"}, append([]string{"apply"}, args...)...)
 	cmd.Stdin = f
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	o, err := gitlimit.Output(cmd)
+	stderr := sc.newApplyStderr()
+	cmd.Stderr = stderr
+	o, err := gitlimit.OutputIn(ctx, sc.repoPath, cmd)
 	if err == nil {
 		return string(o), nil
 	}
 	var exit *exec.ExitError
 	if ctx.Err() != nil || !errors.As(err, &exit) || (exit.ExitCode() < 0 && !wcGitAborted(exit)) {
-		// The error is logged: keep the last 64 KiB of git's stderr. (The
-		// classification below reads all of it.)
-		var tail gitlimit.TailBuffer
-		_, _ = tail.Write(stderr.Bytes())
-		return "", fmt.Errorf("%s: %w: %s", gitlimit.Name(append([]string{"apply"}, args...)), err, tail.String())
+		// The error is logged: it quotes the last 64 KiB of git's stderr.
+		return "", fmt.Errorf("%s: %w: %s", gitlimit.Name(append([]string{"apply"}, args...)), err, stderr.tail.String())
 	}
-	full := strings.TrimSpace(stderr.String())
-	msg := full
-	if len(msg) > wcMaxApplyMsgBytes {
-		msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
-	}
+	msg := stderr.message()
 	aborted := wcGitAborted(exit)
 	if msg == "" {
 		msg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
@@ -870,8 +963,8 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 			msg = "git apply aborted"
 		}
 	}
-	server := sc.wcApplyServerFailure(full)
-	status := wcApplyStatus(exit.ExitCode(), full)
+	server := stderr.serverFailure()
+	status := stderr.status(exit.ExitCode())
 	if aborted {
 		status = http.StatusBadRequest
 	}
@@ -1060,7 +1153,7 @@ type wcBlobSink struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout bytes.Buffer
-	stderr bytes.Buffer
+	stderr gitlimit.TailBuffer // finish's error reaches the log
 }
 
 func (sc *wcScratch) startBlobSink(ctx context.Context) (*wcBlobSink, error) {
@@ -1072,7 +1165,7 @@ func (sc *wcScratch) startBlobSink(ctx context.Context) (*wcBlobSink, error) {
 		return nil, err
 	}
 	sink.stdin = stdin
-	if err := gitlimit.Start(sink.cmd); err != nil {
+	if err := gitlimit.StartIn(ctx, sc.repoPath, sink.cmd); err != nil {
 		return nil, err
 	}
 	return sink, nil
@@ -1709,11 +1802,14 @@ func (s *server) wcSpoolDiff(w http.ResponseWriter, lr *wcLineReader, sc *wcScra
 			wcFail(w, http.StatusBadRequest, "invalid", fmt.Sprintf("diff chunk exceeds %d bytes", wcMaxChunkBytes), "", "")
 			return "", 0, false
 		}
+		if total += int64(len(data)); total > wcMaxDiffBytes {
+			wcFail(w, http.StatusBadRequest, "invalid", fmt.Sprintf("diff exceeds %d bytes", wcMaxDiffBytes), "", "")
+			return "", 0, false
+		}
 		if _, err := f.Write(data); err != nil {
 			wcFail(w, http.StatusInternalServerError, "internal", internalErrorMsg, "", "")
 			return "", 0, false
 		}
-		total += int64(len(data))
 		chunks++
 		sawEOF = frame.DiffChunk.EOF
 	}

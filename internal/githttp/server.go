@@ -78,15 +78,6 @@ type Server struct {
 	// (a pack-count read plus at most one job enqueue) and must never
 	// block on the fold itself. Nil disables triggering.
 	MaybeRepack func(ctx context.Context, repo string)
-	// StrictSyncFetch makes a push run's loopback fetch (an upload-pack
-	// whose token carries a sync claim) fail with 423 Locked when its
-	// hydrate skips a push-held ref that the cache has not caught up
-	// with, instead of serving the stale value for forwarding. The local
-	// schedule (SQLite, S3WAL; ADR-50) sets it: its runs restore their
-	// request on that answer. PostgreSQL leaves it off: a River run does
-	// not restore on a 423, so it would end failed instead.
-	StrictSyncFetch bool
-
 	// repackProbeMu guards the asynchronous post-push repack probe
 	// machinery (see dispatchRepackProbe): repackProbeQueued marks repos
 	// queued or running (per-repo coalescing), repackProbeRunning the
@@ -607,11 +598,13 @@ func serviceScope(service string) string {
 // ref locks and git re-validates client old-SHAs itself.
 //
 // A push run's loopback fetch (an upload-pack whose token carries a sync
-// claim) hydrates strictly under StrictSyncFetch: a held ref the cache
-// has not caught up with fails it with ErrHeldRefStale.
+// claim) hydrates strictly: a held ref the cache has not caught up with
+// fails it with ErrHeldRefStale, which hydrateFailed answers with 423
+// Locked, so the run restores its request instead of forwarding the stale
+// value (ADR-50).
 func (s *Server) hydrate(ctx context.Context, repo, service, defaultBranch string, claims *auth.Claims) (string, error) {
 	assertf(claims != nil, "hydrate: nil claims")
-	strict := s.StrictSyncFetch && service == "upload-pack" && claims.SyncClaim != ""
+	strict := service == "upload-pack" && claims.SyncClaim != ""
 	repoPath, refsErr, err := hydrateRefs(ctx, s.Store, s.Blob, s.CacheDir, repo, defaultBranch, strict)
 	if err != nil {
 		return "", err
@@ -676,7 +669,7 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", "--advertise-refs", repoPath)
 	cmd.Stdout = w
 	cmd.Stderr = os.Stderr
-	if err := gitlimit.Run(cmd); err != nil {
+	if err := gitlimit.RunIn(r.Context(), repoPath, cmd); err != nil {
 		log.Printf("advertise %s %s: %v", service, repo, err)
 		abortIfStopped(err)
 	}
@@ -1052,7 +1045,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
-		if err := gitlimit.Start(cmd); err != nil {
+		if err := gitlimit.StartIn(r.Context(), repoPath, cmd); err != nil {
 			log.Printf("%s %s: start: %v", service, repo, err)
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
@@ -1194,7 +1187,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	} else {
 		cmd.Stdin = body
 		cmd.Stdout = w
-		runErr := gitlimit.Run(cmd)
+		runErr := gitlimit.RunIn(r.Context(), repoPath, cmd)
 		if runErr != nil {
 			// Headers are already sent; the pkt-line stream carries per-ref
 			// errors to the client. Just log.
