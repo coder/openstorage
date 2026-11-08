@@ -796,7 +796,6 @@ type wcApplyStderr struct {
 	carry    []byte              // the last bytes, for a needle that two writes split
 	line     []byte              // the start of the current line, up to wcApplyLineKeep bytes
 	head     []byte              // the first wcApplyHeadBytes of stderr
-	total    int64               // bytes written
 	tail     gitlimit.TailBuffer // the last 64 KiB, for the log
 	payload  bool                // a line starts with one of wcApplyPayloadLines
 	clash    bool                // a line starts with wcApplyClashLine
@@ -821,7 +820,6 @@ var wcApplyLineKeep = func() int {
 
 func (c *wcApplyStderr) Write(p []byte) (int, error) {
 	n := len(p)
-	c.total += int64(n)
 	c.head = append(c.head, p[:min(n, wcApplyHeadBytes-len(c.head))]...)
 	_, _ = c.tail.Write(p)
 	if len(c.needles) > 0 {
