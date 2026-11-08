@@ -75,6 +75,25 @@ func TestEnsureCacheRepoWritesTheLeaseEpochOnlyBeforeHEADExists(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
+		// With core.preferSymlinkRefs an older release writes HEAD as a
+		// symlink, and while its branch has no ref yet, Stat reports the
+		// symlink as missing. A git of that release can be alive in it.
+		{"an older release's repository whose HEAD is a symlink to a branch without a ref", func(t *testing.T, repo string) {
+			if out, err := srGit(t, "", "-c", "core.preferSymlinkRefs=true", "init", "-q", "--bare", repo); err != nil {
+				t.Fatalf("git init: %v: %s", err, out)
+			}
+			if fi, err := os.Lstat(filepath.Join(repo, "HEAD")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("HEAD after init with core.preferSymlinkRefs = %v, %v, want a symlink", fi, err)
+			}
+		}},
+		{"a directory whose HEAD is a dangling symlink", func(t *testing.T, repo string) {
+			if err := os.MkdirAll(repo, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("refs/heads/main", filepath.Join(repo, "HEAD")); err != nil {
+				t.Fatal(err)
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cacheDir := t.TempDir()
