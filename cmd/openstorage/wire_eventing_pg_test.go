@@ -470,7 +470,7 @@ func TestServeSkipsPokeAfterLostCommitReply(t *testing.T) {
 
 // TestHookEventingRiverFailureRefusesAndCleansUp: on PostgreSQL, when the
 // hook's River client cannot be built after its metadata store opened, the
-// hook refuses an update that would record forward intent, and it closes
+// hook refuses an update that could record forward intent, and it closes
 // the metadata store's connections.
 func TestHookEventingRiverFailureRefusesAndCleansUp(t *testing.T) {
 	if testing.Short() {

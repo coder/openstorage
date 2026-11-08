@@ -172,7 +172,7 @@ deleted completes over a held claim. The sync job's gate follows the same
 rule for a held sync claim, so a mirror-back pull (or a pull-upstream)
 whose `FinishSync` failed runs again after the lease instead of being
 dropped with its claim. A hook that cannot set up its eventing refuses an
-update that would record intent instead of accepting it without the
+update that could record intent instead of accepting it without the
 intent ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
 amendment).
 
