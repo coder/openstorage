@@ -63,6 +63,15 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 
 	g, gctx := errgroup.WithContext(ctx)
 
+	// The three stages are git children in the cache repository: they hold
+	// its lease (gitlimit.LeaseFile) until they exit. The lease comes before
+	// the pipes, so a failure here leaves none open.
+	lease, err := gitlimit.OpenLease(ctx, repoPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("lease: %w", err)
+	}
+	defer lease.Close()
+
 	// Every subprocess runs with object replacement disabled (Codex
 	// security round 1): refs/replace/* substitutions are writable by any
 	// git:write pusher WITHOUT moving the protected refs they shadow — an
@@ -118,6 +127,7 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 
 	started := make([]*exec.Cmd, 0, 3)
 	for _, cmd := range []*exec.Cmd{revList, check, read} {
+		lease.Attach(cmd)
 		if err := cmd.Start(); err != nil {
 			// Kill the stages already running (Codex round 6): left
 			// alive, a producer fills its unread stdout pipe — or blocks

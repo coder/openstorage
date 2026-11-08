@@ -90,6 +90,12 @@ func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...strin
 	cmd.Stdin = stdin
 	var stderr gitlimit.TailBuffer // the error below reaches the log
 	cmd.Stderr = &stderr
+	lease, err := gitlimit.OpenLease(ctx, dir)
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	defer lease.Close()
+	lease.Attach(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return string(out), fmt.Errorf("git %s: %w: %s",
@@ -787,6 +793,12 @@ func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn fun
 	cmd.Stdin = idx
 	var stderr gitlimit.TailBuffer // the error below reaches the repack log
 	cmd.Stderr = &stderr
+	lease, err := gitlimit.OpenLease(ctx, repoPath)
+	if err != nil {
+		return fmt.Errorf("git show-index: %w", err)
+	}
+	defer lease.Close()
+	lease.Attach(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
