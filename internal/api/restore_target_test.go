@@ -177,3 +177,38 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 		}
 	})
 }
+
+// A git run in restoreTargetTree that fails other than with its "no such
+// object" exit is the server's failure, an error, never "not found". So
+// is a commit at the end of the chain that rev-parse ^{commit} cannot
+// read.
+func TestRestoreTargetTreeGitFailures(t *testing.T) {
+	dir := t.TempDir()
+	coreGit(t, dir, "init", "-q", "-b", "main", ".")
+	coreWriteFile(t, dir, "a.txt", "one\n")
+	coreGit(t, dir, "add", ".")
+	coreGit(t, dir, "commit", "-q", "-m", "c1")
+	c1 := coreRevParse(t, dir, "HEAD")
+	tree1 := coreRevParse(t, dir, "HEAD^{tree}")
+	sc, err := wcNewScratch(filepath.Join(dir, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sc.close)
+	for _, tc := range []struct{ name, target, arg, how string }{
+		{"rev-parse ^{commit} of a tree exits 128", tree1, tree1 + "^{commit}", "128"},
+		{"rev-parse ^{commit} of a tree is killed", tree1, tree1 + "^{commit}", "kill"},
+		{"cat-file -e exits 128", tree1, "-e", "128"},
+		{"cat-file -e is killed", tree1, "-e", "kill"},
+		{"cat-file -t exits 128", tree1, "-t", "128"},
+		{"cat-file -t is killed", tree1, "-t", "kill"},
+		{"rev-parse ^{commit} of a commit exits 1", c1, c1 + "^{commit}", "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gitFailsOnArg(t, tc.arg, tc.how)
+			if tree, found, err := sc.restoreTargetTree(context.Background(), tc.target); tree != "" || found || err == nil {
+				t.Fatalf("tree %q found %v err %v, want an error", tree, found, err)
+			}
+		})
+	}
+}
