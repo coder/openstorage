@@ -692,7 +692,7 @@ func wcNewScratch(repoPath string) (*wcScratch, error) {
 	// must never leak into server-created commits. git names a file it
 	// cannot read in a warning, and a 400 or 409 body shows git's stderr, so
 	// every file git reads outside the repository must lie under the
-	// scratch dir, where wcApplyServerFailure sees it: HOME and
+	// scratch dir, where applyPatch sees it (wcApplyStderr): HOME and
 	// XDG_CONFIG_HOME lead the default attributes file there, and
 	// GIT_ATTR_NOSYSTEM drops the install's own etc/gitattributes.
 	env := make([]string, 0, 32)
@@ -761,7 +761,7 @@ const wcMaxApplyMsgBytes = 4096
 type wcApplyRejection struct {
 	exit   int    // git's exit status, -1 when SIGABRT ended it (see wcGitAborted)
 	status int    // the status of git's whole stderr (wcApplyStderr), 400 for an abort, 500 if server is set
-	server bool   // that stderr shows a failure of the server's own git (see wcApplyServerFailure)
+	server bool   // that stderr shows a failure of the server's own git (see (*wcApplyStderr).serverFailure)
 	msg    string // that stderr cut to wcMaxApplyMsgBytes
 }
 
@@ -775,7 +775,7 @@ func (r *wcApplyRejection) Error() string {
 // hold a newline, and git prints names unquoted, so a name can put any of
 // these lines into stderr: they say what git was told, not what failed.
 // applyPatch therefore never shows a message that names the server's own
-// paths (see wcApplyServerFailure), whatever these lines say.
+// paths (see (*wcApplyStderr).serverFailure), whatever these lines say.
 var (
 	// A patch that no base tree can make apply: a name that git's own path
 	// rules reject (`.git.`, `git~1`, a symlinked `.gitmodules`), a patch
@@ -788,12 +788,12 @@ var (
 )
 
 // wcApplyStderr reads git apply's stderr as git writes it, and keeps only
-// what applyPatch needs: the facts that wcApplyStatus and
-// wcApplyServerFailure read, the head that the client sees, and the tail
+// what applyPatch needs: the facts that its status and
+// serverFailure read, the head that the client sees, and the tail
 // that the log sees. It keeps about 128 KiB, whatever git prints: git apply
 // prints a line per file that fails, so its stderr grows with the patch.
 type wcApplyStderr struct {
-	needles  []string            // the server's own paths (wcApplyServerFailure)
+	needles  []string            // the server's own paths (serverFailure)
 	carry    []byte              // the last bytes, for a needle that two writes split
 	line     []byte              // the start of the current line, up to wcApplyLineKeep bytes
 	head     []byte              // the first wcApplyHeadBytes of stderr
@@ -935,14 +935,6 @@ func wcApplyStatus(exit int, stderr string) int {
 	var c wcApplyStderr
 	_, _ = c.Write([]byte(stderr))
 	return c.status(exit)
-}
-
-// wcApplyServerFailure is (*wcApplyStderr).serverFailure for a whole
-// stderr.
-func (sc *wcScratch) wcApplyServerFailure(stderr string) bool {
-	c := sc.newApplyStderr()
-	_, _ = c.Write([]byte(stderr))
-	return c.serverFailure()
 }
 
 // applyPatch runs `git apply` on the spooled patch. The patch goes on
