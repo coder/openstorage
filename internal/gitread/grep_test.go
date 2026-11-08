@@ -241,8 +241,10 @@ func TestGrepReadErrorIsGitsUnreadableObjectLine(t *testing.T) {
 	}
 }
 
-// A repository whose .gitattributes git complains about ("error: is not a
-// valid attribute name") still greps: those lines are not read errors.
+// A repository's own .gitattributes, even one that git complains about
+// ("error: is not a valid attribute name"), does not stop grep: git 2.41
+// and later read no such file (noTreeAttrsEnv), and an older git's
+// complaint is not a read error.
 func TestGrepAttributeErrorsAreNotReadErrors(t *testing.T) {
 	dir := t.TempDir()
 	mustGit(t, dir, "init", "-q", "--initial-branch=main")
@@ -254,6 +256,28 @@ func TestGrepAttributeErrorsAreNotReadErrors(t *testing.T) {
 	files, err := Grep(context.Background(), dir, commit, GrepOptions{Pattern: "hello"})
 	if err != nil || len(files) != 1 || files[0].Path != "a.txt" {
 		t.Fatalf("grep hello = %+v, %v, want a.txt", files, err)
+	}
+}
+
+// Only a last stderr line that starts with git's "fatal: -e option, '" is
+// ErrBadPattern: the same text later in that line, after a path or other
+// request text, or on an earlier line, is another failure.
+func TestGrepBadPatternIsOnlyGitsHead(t *testing.T) {
+	f := newFixture(t)
+	for _, tc := range []struct {
+		name, stderr string
+		bad          bool
+	}{
+		{"git's head", "fatal: -e option, '[': Unmatched [, [^, [:, [., or [=\n", true},
+		{"git's head after a warning", "warning: x\nfatal: -e option, '[': Unmatched [\n", true},
+		{"the head inside the last line", "fatal: unable to read 'x fatal: -e option, '[': y'\n", false},
+		{"the head on an earlier line", "fatal: -e option, '[': y\nfatal: bad object\n", false},
+	} {
+		failingBlameGit(t, 128, tc.stderr, "grep")
+		_, err := Grep(context.Background(), f.dir, f.c1, GrepOptions{Pattern: "zzz"})
+		if err == nil || errors.Is(err, ErrBadPattern) != tc.bad {
+			t.Errorf("%s: err = %.200v, want ErrBadPattern: %v", tc.name, err, tc.bad)
+		}
 	}
 }
 

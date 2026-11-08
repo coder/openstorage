@@ -3,6 +3,7 @@ package gitread
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,9 @@ func TestBlameAndGrepReadNoTreeAttributes(t *testing.T) {
 		{"bare, attr.tree=HEAD", bare, map[string]string{"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "attr.tree", "GIT_CONFIG_VALUE_0": "HEAD"}},
 	} {
 		t.Run(v.name, func(t *testing.T) {
+			if v.repo == dir && !gitAtLeast(t, 2, 41) {
+				t.Skip("git before 2.41 ignores GIT_ATTR_SOURCE and reads a work tree's attributes")
+			}
 			for k, val := range v.env {
 				t.Setenv(k, val)
 			}
@@ -85,4 +89,15 @@ func TestBlameAndGrepSetTheAttributeSource(t *testing.T) {
 	if want := EmptyTreeSHA + "\n" + EmptyTreeSHA + "\n"; string(got) != want {
 		t.Fatalf("GIT_ATTR_SOURCE of blame's and grep's git = %q, want the empty tree for both", got)
 	}
+}
+
+// gitAtLeast reports whether the git on PATH is major.minor or later.
+func gitAtLeast(t *testing.T, major, minor int) bool {
+	t.Helper()
+	out := strings.TrimSpace(mustGit(t, t.TempDir(), "version"))
+	var maj, min int
+	if _, err := fmt.Sscanf(strings.TrimPrefix(out, "git version "), "%d.%d", &maj, &min); err != nil {
+		t.Fatalf("parse %q: %v", out, err)
+	}
+	return maj > major || (maj == major && min >= minor)
 }
