@@ -49,10 +49,13 @@ func refLockPaths(repoPath string, names []string) []string {
 // #490). It is outside refs/, so `git for-each-ref` never lists a file in it.
 const staleLocksDir = "codestorage-stale-locks"
 
-// Test seams for the window between cleanup's look at a lock and its move
+// Test seams for the window between cleanup's first look at the locks and
+// its second look under the lease (staleLockAfterLease, called with the
+// repository path), between the second look and the move of a lock
 // (staleLockBeforeMove), and between the move and the identity check
 // (staleLockAfterMove). Production never sets them.
 var (
+	staleLockAfterLease atomic.Pointer[func(repo string)]
 	staleLockBeforeMove atomic.Pointer[func(lock string)]
 	staleLockAfterMove  atomic.Pointer[func(lock string)]
 )
@@ -66,8 +69,9 @@ func staleLockSeam(seam *atomic.Pointer[func(string)], lock string) {
 // staleRefCleanup is the result of one cleanStaleRefLocks run.
 type staleRefCleanup struct {
 	// Old is the number of ref locks older than staleRefLockAge that the run
-	// found. A run that found none did nothing: it took no lease, logged no
-	// line and counted no outcome, and Outcome means nothing.
+	// found when it decided (see cleanStaleRefLocks). A run that found none
+	// did nothing: it logged no line and counted no outcome, and Outcome
+	// means nothing.
 	Old     int
 	Removed int
 	Outcome metrics.StaleRefLockOutcome
@@ -92,10 +96,11 @@ type staleRefCleanup struct {
 // running, and a kill leaves them too. Such a git can run only in a
 // repository that already existed when the lease-aware serve started. So the
 // run acts only on a repository that has an epoch file (gitlimit.EpochFile),
-// which EnsureCacheRepoCtx writes when it creates the directory. In a
-// repository without one, an older release created the directory (or its
-// creation was interrupted): the run keeps every lock, counts kept and logs
-// the runbook line. It also keeps a lock that is not newer than the epoch.
+// which EnsureCacheRepoCtx writes for a directory that has no HEAD yet (so no
+// git has held a ref lock there). In a repository without one, an older
+// release created the repository: the run keeps every lock, counts kept and
+// logs the runbook line. It also keeps a lock that is not newer than the
+// epoch.
 //
 // What stays open is a git that an operator runs by hand in the cache, which
 // holds no lease whatever created the repository. The age gate
@@ -103,14 +108,24 @@ type staleRefCleanup struct {
 // docs/how-to/deploy-production.md tells operators not to do it.
 //
 // A lock is moved into the quarantine directory with a rename, and the moved
-// file's device and inode are compared with the lock that was inspected.
-// Only a match is deleted. A path that was inspected and then deleted by name
+// file's device, inode, modification time and size are compared with the lock
+// that was inspected (sameLock). Only a match is deleted. A path that was inspected and then deleted by name
 // can be a different file by then. A moved file that does not match is linked
 // back to its path, which fails when a new lock appeared there, and is kept.
 //
 // A run that finds an old lock logs one line and counts one outcome, never
 // one per lock (a failed batch can leave thousands of locks), also when it
 // fails: an error counts as kept.
+//
+// The run is counted at the point where it decides. A busy lease and a
+// repository without an epoch decide before the lease is held, and an error
+// decides where it happens. Otherwise the look under the exclusive lease
+// decides. The first look runs without the lease, so the git that held a
+// lock can finish its transaction before the run holds the lease, and then
+// the lock is gone or no longer old. That lock was a live git's and not a
+// stale one, so a run whose old locks are gone at the second look found no
+// stale lock: it logs nothing, counts nothing and takes the lease only for
+// that look.
 func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res staleRefCleanup, err error) {
 	paths := refLockPaths(repoPath, names)
 	old := oldRefLocks(paths, now)
@@ -158,6 +173,7 @@ func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res sta
 	defer lease.Close()
 
 	// A lock can change between the first look and the lease: inspect again.
+	staleLockSeam(&staleLockAfterLease, repoPath)
 	old = oldRefLocks(paths, now)
 	if len(old) == 0 {
 		res = staleRefCleanup{}
@@ -234,7 +250,7 @@ func quarantineRefLock(repoPath, path string, fi fs.FileInfo) (quarantineResult,
 		return lockGone, err
 	}
 	staleLockSeam(&staleLockAfterMove, path)
-	if got, err := os.Lstat(quarantined); err == nil && os.SameFile(fi, got) {
+	if got, err := os.Lstat(quarantined); err == nil && sameLock(fi, got) {
 		return lockDeleted, os.Remove(quarantined)
 	}
 	// Link, unlike rename, fails when a new lock took the path: that lock
@@ -248,4 +264,13 @@ func quarantineRefLock(repoPath, path string, fi fs.FileInfo) (quarantineResult,
 		return lockReplaced, fmt.Errorf("put back %s: %w", path, err)
 	}
 	return lockReplaced, nil
+}
+
+// sameLock reports whether got is the file that fi inspected. The device and
+// the inode are not enough: when a lock is removed, the next file that a
+// writer creates in the directory usually gets the freed inode number. A rename
+// keeps the modification time and the size, and a lock that a writer made
+// after the inspected one is at least the age gate (staleRefLockAge) newer.
+func sameLock(fi, got fs.FileInfo) bool {
+	return os.SameFile(fi, got) && got.ModTime().Equal(fi.ModTime()) && got.Size() == fi.Size()
 }
