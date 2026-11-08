@@ -159,7 +159,7 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 			// rev-parse also exits 1 for a ref or object that exists
 			// when git cannot read the commit it leads to: that is the
 			// repository's failure, not an unknown ref.
-			if berr := peelUnreadable(ctx, repoPath, cand); berr != nil {
+			if berr := commitUnreadable(ctx, repoPath, cand); berr != nil {
 				return "", fmt.Errorf("resolve ref %q: %w", spec, berr)
 			}
 			continue
@@ -193,19 +193,16 @@ func gitSaidNo(err error) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
 
-// maxTagChain bounds the tags that PeelUnreadable follows.
-const maxTagChain = 64
-
-// peelUnreadable checks a ResolveRef candidate whose ^{commit} peel git
-// answered with exit 1. It returns nil when the candidate names no
-// commit: no such ref, no such object, or a tree, a blob or a tag of one.
-// It returns an error when the candidate is a ref whose object is
-// missing, or names a commit, or a tag chain to a commit, that git cannot
+// commitUnreadable checks a ResolveRef candidate whose ^{commit} peel git
+// answered with exit 1. git gives that exit for a ref or object that does
+// not exist, for one that leads to no commit (a tree, a blob, or a tag of
+// one), and for one whose way to a commit git cannot read. It returns nil
+// for the first two, and an error for the third: an existing ref whose
+// object is missing, or an object whose tag chain or commit git cannot
 // read.
-func peelUnreadable(ctx context.Context, repoPath, cand string) error {
-	isRef := strings.HasPrefix(cand, "refs/")
+func commitUnreadable(ctx context.Context, repoPath, cand string) error {
 	id := cand
-	if isRef {
+	if strings.HasPrefix(cand, "refs/") {
 		// Without a peel, rev-parse reads the ref's value: it exits 1
 		// only when the ref does not exist.
 		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand)
@@ -218,73 +215,33 @@ func peelUnreadable(ctx context.Context, repoPath, cand string) error {
 			return fmt.Errorf("rev-parse %q emitted %q", cand, id)
 		}
 	} else if !ref.ValidSHA(cand) {
-		return nil // an abbreviation git did not resolve names no object
+		return nil // git resolves an abbreviation only to an object it has
 	}
-	return PeelUnreadable(ctx, repoPath, id, isRef)
-}
-
-// PeelUnreadable reports, as an error, that the object id leads to a
-// commit git cannot read: id names a commit that a ^{commit} peel could
-// not read, or a tag chain to a commit or to a missing object. It
-// follows tags by their own object and type headers, which name the
-// type of an object that may be missing. A missing id is an error only
-// when known is true (a ref names it); a tree, a blob or a tag of one is
-// no commit, and nil.
-func PeelUnreadable(ctx context.Context, repoPath, id string, known bool) error {
-	assertf(ref.ValidSHA(id), "PeelUnreadable: malformed id %q", id)
-	typ := ""
-	for range maxTagChain {
-		if typ != "" && typ != "commit" && typ != "tag" {
-			return nil // a tag of a tree or a blob
+	if _, err := runGit(ctx, Light, repoPath, "cat-file", "-e", id); gitSaidNo(err) {
+		if id == cand {
+			return nil // a full id that names no object
 		}
-		if _, err := runGit(ctx, Light, repoPath, "cat-file", "-e", id); gitSaidNo(err) {
-			if !known {
-				return nil
-			}
-			return fmt.Errorf("object %s is missing", id)
-		} else if err != nil {
-			return err
-		}
-		known = true // a tag's target is named by the tag
-		if typ == "" {
-			out, err := runGit(ctx, Light, repoPath, "cat-file", "-t", id)
-			if err != nil {
-				return err
-			}
-			typ = strings.TrimSpace(out)
-		}
-		switch typ {
-		case "commit":
-			return fmt.Errorf("commit %s cannot be read", id)
-		case "tag":
-			out, err := runGit(ctx, Light, repoPath, "cat-file", "tag", id)
-			if err != nil {
-				return err
-			}
-			next, nextType, err := tagTarget(out)
-			if err != nil {
-				return fmt.Errorf("tag %s: %w", id, err)
-			}
-			id, typ = next, nextType
-		default:
-			return nil // a tree or a blob
-		}
+		return fmt.Errorf("%s names object %s, which is missing", cand, id)
+	} else if err != nil {
+		return err
 	}
-	return fmt.Errorf("object %s: more than %d tags deep", id, maxTagChain)
-}
-
-// tagTarget reads the object and type headers of a tag object.
-func tagTarget(tag string) (id, typ string, err error) {
-	head, _, _ := strings.Cut(tag, "\n\n")
-	for line := range strings.SplitSeq(head, "\n") {
-		if v, ok := strings.CutPrefix(line, "object "); ok && id == "" {
-			id = v
-		} else if v, ok := strings.CutPrefix(line, "type "); ok && typ == "" {
-			typ = v
-		}
+	// The object exists. git peels its tag chain to the end (<id>^{}) and
+	// fails only when an object on the way is missing or a tag cannot be
+	// parsed. Nothing here reads a tag's message.
+	out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", id+"^{}")
+	if err != nil {
+		return fmt.Errorf("git cannot peel %s: %w", id, err)
 	}
-	if !ref.ValidSHA(id) || typ == "" {
-		return "", "", fmt.Errorf("malformed tag headers %q", head)
+	end := strings.TrimSpace(out)
+	if !ref.ValidSHA(end) {
+		return fmt.Errorf("rev-parse %s^{} emitted %q", id, end)
 	}
-	return id, typ, nil
+	out, err = runGit(ctx, Light, repoPath, "cat-file", "-t", end)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(out) == "commit" {
+		return fmt.Errorf("git cannot read commit %s", end)
+	}
+	return nil // a tree or a blob, or a tag of one
 }
