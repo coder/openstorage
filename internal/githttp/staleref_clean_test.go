@@ -407,6 +407,25 @@ func srReplace(t *testing.T, how, lock, content string) (recycled bool) {
 			t.Error(err)
 		}
 		return false
+	case "rename same size and mtime":
+		// The old lock still exists while the new file is made, so the two
+		// have different inodes, and only the inode tells them apart.
+		old, err := os.Lstat(lock)
+		if err != nil {
+			t.Error(err)
+			return false
+		}
+		fresh := lock + ".new"
+		if err := os.WriteFile(fresh, []byte(content), 0o600); err != nil {
+			t.Error(err)
+		}
+		if err := os.Chtimes(fresh, old.ModTime(), old.ModTime()); err != nil {
+			t.Error(err)
+		}
+		if err := os.Rename(fresh, lock); err != nil {
+			t.Error(err)
+		}
+		return false
 	case "recreate", "recreate same size", "recreate old mtime":
 		old, err := os.Lstat(lock)
 		if err != nil {
@@ -436,14 +455,15 @@ func srReplace(t *testing.T, how, lock, content string) (recycled bool) {
 }
 
 // srReplacements are the ways to replace a lock between cleanup's look and its
-// move. The last two share one property with the old lock, the size or the
-// modification time, so that each of the checks of sameLock is needed.
-var srReplacements = []string{"rename", "recreate", "recreate same size", "recreate old mtime"}
+// move. The last three share one property with the old lock (the size, the
+// modification time, or both with another inode), so that each of the checks
+// of sameLock is needed.
+var srReplacements = []string{"rename", "recreate", "recreate same size", "recreate old mtime", "rename same size and mtime"}
 
 // srReplacementContent is the content of the new lock: the same number of
 // bytes as the stale one ("stale\n") for "recreate same size".
 func srReplacementContent(how, content string) string {
-	if how == "recreate same size" {
+	if how == "recreate same size" || how == "rename same size and mtime" {
 		return "fresh\n"
 	}
 	return content

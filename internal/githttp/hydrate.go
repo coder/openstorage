@@ -363,7 +363,6 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 	// A prior interrupted init may have left HEAD but not the directories
 	// Git requires. Re-init that partial tree without discarding its contents.
 	needsInit := false
-	noHead := false
 	for _, name := range []string{"HEAD", "objects", "refs"} {
 		fi, err := os.Stat(filepath.Join(path, name))
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -372,7 +371,6 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 		if err != nil || (name != "HEAD" && !fi.IsDir()) {
 			needsInit = true
 		}
-		noHead = noHead || (name == "HEAD" && err != nil)
 	}
 	// A directory without HEAD is no repository: no git has held a ref lock
 	// there, and none can before the git init below. It gets the lease epoch
@@ -380,8 +378,15 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 	// creation stopped before git init. A racing call can have written it
 	// first. A repository that has HEAD gets none: an older release can have
 	// a git alive in it that holds no lease, so the stale ref lock cleanup
-	// keeps every lock there (staleref.go).
-	if noHead {
+	// keeps every lock there (staleref.go). Any entry named HEAD counts, so
+	// the test is Lstat: with core.preferSymlinkRefs an older release writes
+	// HEAD as a symlink to a branch that has no ref yet, which Stat reports
+	// as missing.
+	_, headErr := os.Lstat(filepath.Join(path, "HEAD"))
+	if headErr != nil && !errors.Is(headErr, os.ErrNotExist) {
+		return "", headErr
+	}
+	if errors.Is(headErr, os.ErrNotExist) {
 		if err := createEpoch(path); err != nil && !errors.Is(err, os.ErrExist) {
 			return "", err
 		}

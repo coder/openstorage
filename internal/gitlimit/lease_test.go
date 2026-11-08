@@ -629,6 +629,46 @@ func TestReadOnlyFilesystemWithoutALeaseFileStillRuns(t *testing.T) {
 	}
 }
 
+// TryExclusive proves that no git is alive, and on a read-only filesystem it
+// cannot also write what cleanup writes next: it fails, with and without a
+// lease file, and takes no lock. (OpenLease is the only caller that falls
+// back to a read-only open.)
+func TestTryExclusiveFailsOnAReadOnlyFilesystem(t *testing.T) {
+	for _, withFile := range []bool{true, false} {
+		name := "without a lease file"
+		if withFile {
+			name = "with a lease file"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo := t.TempDir()
+			if withFile {
+				if err := tryExclusive(t, repo); err != nil {
+					t.Fatal(err)
+				}
+			}
+			readOnlyFilesystem(t)
+			l, err := TryExclusive(repo)
+			if err == nil {
+				_ = l.Close()
+				t.Fatal("TryExclusive on a read-only filesystem succeeded")
+			}
+			if !errors.Is(err, syscall.EROFS) {
+				t.Fatalf("TryExclusive on a read-only filesystem = %v, want an EROFS error", err)
+			}
+			if withFile {
+				probe, err := os.Open(filepath.Join(repo, LeaseFile))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer probe.Close()
+				if err := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+					t.Fatalf("the failed TryExclusive left the lease file locked: %v", err)
+				}
+			}
+		})
+	}
+}
+
 // Only EROFS selects the fallback. A lease file that exists but cannot be
 // opened is an error, and so is any other failure: there a git can take ref
 // locks, so a lease that holds nothing would hide it from TryExclusive.
