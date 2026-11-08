@@ -10,32 +10,36 @@ import (
 	"testing"
 )
 
-// Only git's own "no" (exit 1 from check-ref-format or from rev-parse
-// --verify --quiet) makes ResolveRef answer ErrNotFound. A fatal exit, a
-// killed git or a corrupt repository says nothing about the ref.
+// Only git's own "no" (exit 1 from rev-parse --verify --quiet) makes
+// ResolveRef answer ErrNotFound. for-each-ref, which reads the refs, has
+// no such answer: every failure of it is an error. A fatal exit, a killed
+// git or a corrupt repository says nothing about the ref.
 func TestResolveRefOnlyExitOneIsNotFound(t *testing.T) {
 	f := newFixture(t)
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, sub := range []string{"check-ref-format", "rev-parse"} {
-		for _, tc := range []struct {
-			name, sh string
-			notFound bool
-		}{
-			{"exit 1", "exit 1", true},
-			{"exit 128", "echo 'fatal: bad' >&2; exit 128", false},
-			{"SIGKILL", "kill -KILL $$", false},
-		} {
-			t.Run(sub+"/"+tc.name, func(t *testing.T) {
-				fakeGit(t, "if [ \"$1\" = "+sub+" ]; then "+tc.sh+"; fi\nexec '"+realGit+"' \"$@\"")
-				sha, err := ResolveRef(context.Background(), f.dir, "main", false)
-				if err == nil || errors.Is(err, ErrNotFound) != tc.notFound {
-					t.Fatalf("ResolveRef(main) = (%q, %v), want an error that is ErrNotFound: %v", sha, err, tc.notFound)
-				}
-			})
-		}
+	// rev-parse peels an abbreviation of c1 (no ref has its name), and
+	// for-each-ref reads main.
+	for _, tc := range []struct {
+		sub, spec, name, sh string
+		notFound            bool
+	}{
+		{"for-each-ref", "main", "exit 1", "exit 1", false},
+		{"for-each-ref", "main", "exit 128", "echo 'fatal: bad' >&2; exit 128", false},
+		{"for-each-ref", "main", "SIGKILL", "kill -KILL $$", false},
+		{"rev-parse", f.c1[:12], "exit 1", "exit 1", true},
+		{"rev-parse", f.c1[:12], "exit 128", "echo 'fatal: bad' >&2; exit 128", false},
+		{"rev-parse", f.c1[:12], "SIGKILL", "kill -KILL $$", false},
+	} {
+		t.Run(tc.sub+"/"+tc.name, func(t *testing.T) {
+			fakeGit(t, "if [ \"$1\" = "+tc.sub+" ]; then "+tc.sh+"; fi\nexec '"+realGit+"' \"$@\"")
+			sha, err := ResolveRef(context.Background(), f.dir, tc.spec, false)
+			if err == nil || errors.Is(err, ErrNotFound) != tc.notFound {
+				t.Fatalf("ResolveRef(%s) = (%q, %v), want an error that is ErrNotFound: %v", tc.spec, sha, err, tc.notFound)
+			}
+		})
 	}
 	t.Run("corrupt packed-refs", func(t *testing.T) {
 		dir := t.TempDir()
@@ -53,7 +57,8 @@ func TestResolveRefOnlyExitOneIsNotFound(t *testing.T) {
 // git, and leaves the spec out of the error: a spec can be request-sized.
 func TestResolveRefLongSpecSkipsGit(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "ran")
-	fakeGit(t, "echo x >> '"+marker+"'\nexit 1")
+	// A git that lists no ref.
+	fakeGit(t, "echo x >> '"+marker+"'\nexit 0")
 	spec := strings.Repeat("x", 4097)
 	_, err := ResolveRef(context.Background(), t.TempDir(), spec, false)
 	if !errors.Is(err, ErrNotFound) {
@@ -94,11 +99,17 @@ func TestResolveRefUnreadableCommitIsAnError(t *testing.T) {
 	mustGit(t, dir, "tag", "-a", "-m", "gone again", "gone-tag-tag", "gone-tag")
 	tagObj := strings.TrimSpace(mustGit(t, dir, "rev-parse", "refs/tags/gone-tag"))
 	mustGit(t, dir, "reset", "-q", "--hard", "HEAD~1")
+	c1 := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	// A broken branch is not shadowed by a good tag of its name, and a
+	// broken branch named like an id not by that id.
+	mustGit(t, dir, "branch", "dup", c2)
+	mustGit(t, dir, "tag", "dup", c1)
+	mustGit(t, dir, "update-ref", "refs/heads/"+c1, c2)
 	if err := os.Remove(filepath.Join(dir, ".git", "objects", c2[:2], c2[2:])); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	for _, spec := range []string{"gone", "refs/heads/gone", "gone-tag", "gone-tag-tag", tagObj, strings.ToUpper(tagObj), tagObj[:12], tagObj[:7]} {
+	for _, spec := range []string{"gone", "refs/heads/gone", "gone-tag", "gone-tag-tag", tagObj, strings.ToUpper(tagObj), tagObj[:12], tagObj[:7], "dup", c1} {
 		if sha, err := ResolveRef(ctx, dir, spec, false); err == nil || errors.Is(err, ErrNotFound) {
 			t.Errorf("ResolveRef(%q) = (%q, %v), want an error that is not ErrNotFound", spec, sha, err)
 		}
@@ -126,16 +137,16 @@ func TestCommitUnreadableGitFailures(t *testing.T) {
 	tree := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD^{tree}"))
 	mustGit(t, dir, "tag", "-a", "-m", "tree", "tree-tag", tree)
 	tagObj := strings.TrimSpace(mustGit(t, dir, "rev-parse", "refs/tags/tree-tag"))
+	c1 := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
-	const noCommit = "[ \"$1\" = rev-parse ] && [ \"$a\" = 'refs/heads/main^{commit}' ] && exit 1\n"
+	// rev-parse peels the object id that for-each-ref read for main.
+	noCommit := "[ \"$1\" = rev-parse ] && [ \"$a\" = '" + c1 + "^{commit}' ] && exit 1\n"
 	for _, tc := range []struct {
 		name, spec, rules string
 	}{
-		{"value of the ref exits 128", "main", noCommit + "[ \"$1\" = rev-parse ] && [ \"$a\" = refs/heads/main ] && exit 128\n"},
-		{"value of the ref is killed", "main", noCommit + "[ \"$1\" = rev-parse ] && [ \"$a\" = refs/heads/main ] && kill -KILL $$\n"},
 		{"object of an abbreviation exits 128", tagObj[:12], "[ \"$1\" = rev-parse ] && [ \"$a\" = " + tagObj[:12] + " ] && exit 128\n"},
 		{"cat-file -e exits 128", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && exit 128\n"},
 		{"cat-file -e is killed", "tree-tag", "[ \"$1\" = cat-file ] && [ \"$a\" = -e ] && kill -KILL $$\n"},
@@ -159,5 +170,65 @@ func TestCommitUnreadableGitFailures(t *testing.T) {
 	}
 	if sha, err := ResolveRef(context.Background(), dir, "tree-tag", false); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ResolveRef(tree-tag) = (%q, %v), want ErrNotFound", sha, err)
+	}
+}
+
+// ResolveRef reads every ref candidate with one for-each-ref, and peels
+// only what exists: a branch, a tag and a full id each take two git runs.
+// main took 2, 3 and 4: one check-ref-format, then one rev-parse per
+// candidate (refs/heads/<spec>, refs/tags/<spec>, the id).
+func TestResolveRefGitRuns(t *testing.T) {
+	f := newFixture(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, spec string
+		runs       int
+	}{
+		{"branch", "main", 2},
+		{"tag", "v1", 2},
+		{"full id", f.c1, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := filepath.Join(t.TempDir(), "runs")
+			fakeGit(t, "echo \"$1\" >> '"+log+"'\nexec '"+realGit+"' \"$@\"")
+			if _, err := ResolveRef(context.Background(), f.dir, tc.spec, false); err != nil {
+				t.Fatalf("ResolveRef(%s): %v", tc.spec, err)
+			}
+			got, err := os.ReadFile(log)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := strings.Count(string(got), "\n"); n != tc.runs {
+				t.Fatalf("ResolveRef(%s) ran git %d times (%q), want %d", tc.spec, n, got, tc.runs)
+			}
+		})
+	}
+}
+
+// for-each-ref gets each ref candidate as a whole name: refs under a
+// name that is no ref (refs/heads/pfx/a for "pfx") stay out of its output,
+// however many there are.
+func TestResolveRefListsNoRefsUnderTheName(t *testing.T) {
+	f := newFixture(t)
+	for _, r := range []string{"refs/heads/pfx/a", "refs/heads/pfx/b", "refs/tags/pfx/c"} {
+		mustGit(t, f.dir, "update-ref", r, f.c1)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(t.TempDir(), "for-each-ref")
+	fakeGit(t, "if [ \"$1\" = for-each-ref ]; then out=$('"+realGit+"' \"$@\"); rc=$?; printf '%s' \"$out\" >> '"+log+"'; printf '%s\\n' \"$out\"; exit $rc; fi\nexec '"+realGit+"' \"$@\"")
+	if sha, err := ResolveRef(context.Background(), f.dir, "pfx", false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ResolveRef(pfx) = (%q, %v), want ErrNotFound", sha, err)
+	}
+	if got, err := os.ReadFile(log); err != nil || len(got) != 0 {
+		t.Fatalf("for-each-ref printed %q (%v), want nothing", got, err)
+	}
+	if sha, err := ResolveRef(context.Background(), f.dir, "pfx/a", false); err != nil || sha != f.c1 {
+		t.Fatalf("ResolveRef(pfx/a) = (%q, %v), want c1", sha, err)
 	}
 }

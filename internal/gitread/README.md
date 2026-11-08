@@ -21,7 +21,7 @@ Read-side git plumbing for the `git:read` API. It hydrates a cache repo, resolve
 
 ## Invariants
 - `assertf` panics on programming errors such as an empty repo path or a non-SHA commit argument [gitread.go:assertf]
-- `ResolveRef` builds candidates only from `check-ref-format`-valid names and admits raw revisions only if they match `hexRevRe`. Only git's exit 1 makes it answer `ErrNotFound`: every other git failure (a budget error, a kill, a fatal exit) is returned as is. An empty spec, a spec with a NUL byte, and one longer than `maxRefSpecBytes` (4096 bytes) are `ErrNotFound` before git runs [gitread.go:ResolveRef]
+- `ResolveRef` reads every ref candidate that exists with one `for-each-ref` (an exact name only), gives rev-parse the ref's object id, never the name, and admits raw revisions only if they match `hexRevRe`. Only git's exit 1 makes it answer `ErrNotFound`: every other git failure (a budget error, a kill, a fatal exit) is returned as is. An empty spec, a spec with a NUL byte, and one longer than `maxRefSpecBytes` (4096 bytes) are `ErrNotFound` before git runs [gitread.go:ResolveRef]
 - `ResolveRef` reads rev-parse's exit 1 for `<candidate>^{commit}` by object state: a candidate that does not exist, or that leads to no commit (a tree, a blob, or a tag of one), is `ErrNotFound`. An existing ref whose object is missing, and an object (by ref, full id or abbreviation) whose tag chain or commit git cannot read, is an error [gitread.go:commitUnreadable]
 - `IsBudgetError` errors must not be reported as not-found [budget.go:IsBudgetError]
 - `(*Budget).start` asserts the budget is open and returns `ErrTimeBudget` past the deadline; `limitedBuffer.Write` kills git once output is exhausted [budget.go:Budget.start]

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -111,64 +112,81 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 		// invalid name.
 		return "", fmt.Errorf("resolve ref %q: %w", spec, ErrNotFound)
 	}
-	// failErr records a git failure that is not git's answer (a resource
-	// limit, a cancellation, a kill, an exec.ErrWaitDelay): those must
-	// surface as errors, never as "not found".
-	var failErr error
-	// Ref candidates are built only from well-formed ref names
-	// (check-ref-format): git forbids the rev-expression metacharacters
-	// (~ ^ : @{ ...) in refnames, so a validated candidate cannot smuggle
-	// an expression like "main~1" through the rev-parse below.
-	validRefName := func(name string) bool {
-		_, err := runGit(ctx, Light, repoPath, "check-ref-format", name)
-		if err != nil && failErr == nil && !gitSaidNo(err) {
-			failErr = err
-		}
-		return err == nil
-	}
-	var candidates []string
+	var names []string // ref candidates, in order
 	if ephemeral {
 		// Branch names resolve inside the ephemeral namespace only; SHAs
 		// (below) address objects, which namespaces share anyway.
-		if name := auth.EphemeralRefName(spec); validRefName(name) {
-			candidates = append(candidates, name)
-		}
+		names = append(names, auth.EphemeralRefName(spec))
 	} else if !strings.HasPrefix(spec, "refs/") {
-		if validRefName("refs/heads/" + spec) {
-			candidates = append(candidates, "refs/heads/"+spec, "refs/tags/"+spec)
+		names = append(names, "refs/heads/"+spec, "refs/tags/"+spec)
+	} else {
+		names = append(names, spec)
+	}
+	// One for-each-ref reads every ref candidate that exists, with its
+	// value. A name reaches git only as for-each-ref's pattern, never as a
+	// rev expression: rev-parse below gets the ref's object id. A plain
+	// pattern also matches every ref under it ("refs/heads/a" lists
+	// "refs/heads/a/b"), and a glob pattern only whole names, so each
+	// name goes as a glob with its last byte escaped. A glob character
+	// cannot be in a ref's name, so a name with one is no candidate.
+	var exact, patterns []string
+	for _, n := range names {
+		if !strings.ContainsAny(n, "*?[\\") {
+			exact = append(exact, n)
+			patterns = append(patterns, n[:len(n)-1]+"\\"+n[len(n)-1:])
 		}
-	} else if validRefName(spec) {
-		candidates = append(candidates, spec)
+	}
+	refs := map[string]string{}
+	if len(patterns) > 0 {
+		out, err := runGit(ctx, Light, repoPath, append([]string{"for-each-ref", "--format=%(refname) %(objectname)", "--"}, patterns...)...)
+		if err != nil {
+			return "", err
+		}
+		for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+			// A ref's name holds no space or newline.
+			name, oid, ok := strings.Cut(line, " ")
+			if ok && slices.Contains(exact, name) {
+				if !ref.ValidSHA(oid) {
+					return "", fmt.Errorf("for-each-ref emitted %q", line)
+				}
+				refs[name] = oid
+			}
+		}
+	}
+	type candidate struct{ name, id string } // id: what rev-parse peels
+	var candidates []candidate
+	for _, n := range names {
+		if oid, ok := refs[n]; ok {
+			candidates = append(candidates, candidate{n, oid})
+		}
 	}
 	hex := spec
 	if fullHexRe.MatchString(spec) {
 		hex = strings.ToLower(spec)
 	}
 	if hexRevRe.MatchString(hex) {
-		candidates = append(candidates, hex)
+		candidates = append(candidates, candidate{hex, hex})
 	}
-	if failErr != nil {
-		return "", failErr
-	}
-	for _, cand := range candidates {
+	for _, c := range candidates {
 		// --end-of-options stops a hostile spec from being parsed as an
 		// option; ^{commit} peels annotated tags and rejects non-commits.
-		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand+"^{commit}")
+		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", c.id+"^{commit}")
 		if err != nil {
 			if !gitSaidNo(err) {
 				return "", err
 			}
 			// rev-parse also exits 1 for a ref or object that exists
 			// when git cannot read the commit it leads to: that is the
-			// repository's failure, not an unknown ref.
-			if berr := commitUnreadable(ctx, repoPath, cand); berr != nil {
+			// repository's failure, not an unknown ref. A broken branch
+			// is an error even when a tag or an id of its name resolves.
+			if berr := commitUnreadable(ctx, repoPath, c.name, c.id); berr != nil {
 				return "", fmt.Errorf("resolve ref %q: %w", spec, berr)
 			}
 			continue
 		}
 		sha := strings.TrimSpace(out)
 		if !ref.ValidSHA(sha) {
-			return "", fmt.Errorf("rev-parse %q emitted %q", cand, sha)
+			return "", fmt.Errorf("rev-parse %q emitted %q", c.name, sha)
 		}
 		return sha, nil
 	}
@@ -184,9 +202,9 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 const maxRefSpecBytes = 4096
 
 // gitSaidNo reports whether err is git's own negative answer: the child
-// ran to the end and exited 1. check-ref-format exits 1 for a name that is
-// not a valid ref name, and rev-parse --verify --quiet for one that names
-// no commit (missing, ambiguous, or not a commit). Any other failure says
+// ran to the end and exited 1. rev-parse --verify --quiet exits 1 for a
+// name that names no commit (missing, ambiguous, or not a commit), and
+// cat-file -e for an id that names no object. Any other failure says
 // nothing about the ref: a resource limit or cancellation (gitread limit
 // errors never wrap *exec.ExitError), a kill, exec.ErrWaitDelay after a
 // long stall, or a fatal exit 128.
@@ -196,34 +214,33 @@ func gitSaidNo(err error) bool {
 }
 
 // commitUnreadable checks a ResolveRef candidate whose ^{commit} peel git
-// answered with exit 1. git gives that exit for a ref or object that does
-// not exist, for one that leads to no commit (a tree, a blob, or a tag of
+// answered with exit 1. name is the candidate (a ref, a full id or an
+// abbreviated id) and id what rev-parse peeled: the ref's object id, or
+// the candidate itself. git gives that exit for an object that does not
+// exist, for one that leads to no commit (a tree, a blob, or a tag of
 // one), and for one whose way to a commit git cannot read. It returns nil
-// for the first two, and an error for the third: an existing ref whose
-// object is missing, or an object whose tag chain or commit git cannot
-// read.
-func commitUnreadable(ctx context.Context, repoPath, cand string) error {
-	id := cand
-	if !ref.ValidSHA(cand) {
-		// A ref, or an abbreviated id. Without a peel, rev-parse reads the
-		// ref's value, or the one object that has the abbreviation: it
-		// exits 1 only when the ref does not exist, or when no object or
-		// more than one has the abbreviation.
-		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand)
+// for the first two, and an error for the third: a ref whose object is
+// missing, or an object whose tag chain or commit git cannot read.
+func commitUnreadable(ctx context.Context, repoPath, name, id string) error {
+	if !ref.ValidSHA(id) {
+		// An abbreviated id. Without a peel, rev-parse reads the one
+		// object that has the abbreviation: it exits 1 only when no
+		// object or more than one has it.
+		out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", id)
 		if gitSaidNo(err) {
 			return nil
 		} else if err != nil {
 			return err
 		}
 		if id = strings.TrimSpace(out); !ref.ValidSHA(id) {
-			return fmt.Errorf("rev-parse %q emitted %q", cand, id)
+			return fmt.Errorf("rev-parse %q emitted %q", name, id)
 		}
 	}
 	if _, err := runGit(ctx, Light, repoPath, "cat-file", "-e", id); gitSaidNo(err) {
-		if id == cand {
+		if id == name {
 			return nil // a full id that names no object
 		}
-		return fmt.Errorf("%s names object %s, which is missing", cand, id)
+		return fmt.Errorf("%s names object %s, which is missing", name, id)
 	} else if err != nil {
 		return err
 	}

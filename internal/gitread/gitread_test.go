@@ -171,7 +171,7 @@ func TestResolveRefGitFailureIsNotNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, sub := range []string{"check-ref-format", "rev-parse"} {
+	for _, sub := range []string{"for-each-ref", "rev-parse"} {
 		t.Run(sub, func(t *testing.T) {
 			// A background child keeps git's stdout open after git exits.
 			fakeGit(t, `if [ "$1" = `+sub+` ]; then (sleep 5) & fi
