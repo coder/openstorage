@@ -63,12 +63,8 @@ func runGit(ctx context.Context, class Class, repoPath string, args ...string) (
 // without it). An older git ignores it and reads no tree attributes in a
 // bare repository.
 func noTreeAttrsEnv() []string {
-	return append(os.Environ(), "GIT_ATTR_SOURCE="+emptyTreeID)
+	return append(os.Environ(), "GIT_ATTR_SOURCE="+EmptyTreeSHA)
 }
-
-// emptyTreeID is the id of the empty tree, which git knows in every
-// repository without storing it.
-const emptyTreeID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 // Materialize rebuilds the cache repo for repo from the ref/blob stores
 // (githttp.Hydrate: ensure repo, hydrate packs, sync refs from the DB
