@@ -319,7 +319,7 @@ A `busy` line that never clears means a Git process that does not exit (look for
 `ps`).
 
 **Rules for operators.** The cleanup can see only the Git processes that `serve` started
-with a lease. Two rules keep the other ones out of its way:
+with a lease. These rules keep the other ones out of its way:
 
 - Never run Git by hand in a cache repository while `serve` runs: it holds no lease, so a
   cleanup can remove its lock.
@@ -331,6 +331,12 @@ with a lease. Two rules keep the other ones out of its way:
 - Never remount a read-only cache directory read-write while a Git process runs in it. A
   Git process that started on the read-only mount, where no lease file exists, holds no
   lease, and after the remount it can hold a ref lock that the cleanup can then remove.
+- Before you roll back to a release that has no lease, delete the epoch files of the cache
+  with `find '<cache dir>' -maxdepth 2 -name codestorage.gitlease.epoch -type f -delete`.
+  The older release's Git processes hold no lease and can outlive its server. If an epoch
+  survived the rollback, the cleanup could remove the lock of such a Git after you upgrade
+  again. A repository without an epoch file keeps every lock until you rebuild it with the
+  runbook below.
 
 The cache directory must be on a local filesystem: `flock` does not work on a network
 filesystem.
