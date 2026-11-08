@@ -824,3 +824,22 @@ func TestEventMarshalShape(t *testing.T) {
 		t.Fatalf("started payload carries error: %v", sm)
 	}
 }
+
+// Any token with git:write can push refs/replace/<id>. The worker's git
+// reads each object of a mirror as itself.
+func TestHermeticGitEnvReadsObjectsWithoutReplacements(t *testing.T) {
+	dir := t.TempDir()
+	testGit(t, dir, "init", "-q", "-b", "main")
+	testGit(t, dir, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "--allow-empty", "-m", "c1")
+	testGit(t, dir, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "--allow-empty", "-m", "c2")
+	c1 := strings.TrimSpace(testGit(t, dir, "rev-parse", "HEAD~1"))
+	c2 := strings.TrimSpace(testGit(t, dir, "rev-parse", "HEAD"))
+	testGit(t, dir, "update-ref", "refs/replace/"+c1, c2)
+	out, _, err := runGitOut(context.Background(), dir, hermeticGitEnv("file"), "cat-file", "-p", c1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "\n\nc1") {
+		t.Fatalf("cat-file -p c1 = %q, want c1's own message", out)
+	}
+}

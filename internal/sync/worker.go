@@ -1020,6 +1020,7 @@ func hermeticGitEnv(allowProtocol string) []string {
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
 		"GIT_ALLOW_PROTOCOL="+allowProtocol,
+		"GIT_NO_REPLACE_OBJECTS=1", // every object reads as itself (gitlimit.NoReplaceObjects)
 	)
 }
 
