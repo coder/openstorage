@@ -15,8 +15,8 @@ import (
 // their paths unescaped, and a directory name can hold a newline and the
 // text of git's diagnostics. blame and grep read no tree attributes, so a
 // good repository answers as one: in a work tree, and in a bare repository
-// told to read HEAD's attributes (GIT_ATTR_SOURCE, attr.tree), as git 2.43
-// to 2.45 did by default.
+// told to read HEAD's attributes (GIT_ATTR_SOURCE, attr.tree), as git
+// 2.43.0 to 2.45.2 did by default.
 func TestBlameAndGrepReadNoTreeAttributes(t *testing.T) {
 	oid := strings.Repeat("c", 40)
 	dir := t.TempDir()

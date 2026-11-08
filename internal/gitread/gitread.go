@@ -59,17 +59,18 @@ func runGit(ctx context.Context, class Class, repoPath string, args ...string) (
 // attribute files, which a push cannot write. A repository's own
 // attribute files make git print warnings that quote their paths
 // unescaped, and a path can hold a newline, so blame and grep, which read
-// git's stderr, run with it. git 2.41 and later honor the
-// variable (git 2.43 to 2.45 read HEAD's attributes in a bare repository
-// without it). An older git ignores it and reads no tree attributes in a
-// bare repository.
+// git's stderr, run with it. git 2.41 and later honor the variable (git
+// 2.43.0 to 2.45.2 read HEAD's attributes in a bare repository without
+// it). An older git ignores it and reads no tree attributes in a bare
+// repository.
 //
 // The repository's attributes also stop steering grep's -I binary
 // detection and blame's textconv. Where git read them (a work tree,
-// attr.tree, a bare repository on git 2.43 to 2.45), a text file marked
-// binary or -diff is now searched, and a file with a NUL byte and the
-// diff attribute is skipped. A bare repository on git 2.46 or later, as
-// the server runs, read no tree attributes before either.
+// attr.tree, a bare repository on git 2.43.0 to 2.45.2), a text file
+// marked binary or -diff is now searched, and a file with a NUL byte and
+// the diff attribute is skipped. A bare repository, as the server runs,
+// on git before 2.43.0 or from 2.45.3 on read no tree attributes before
+// either.
 func noTreeAttrsEnv() []string {
 	return append(os.Environ(), "GIT_ATTR_SOURCE="+EmptyTreeSHA)
 }
