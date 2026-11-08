@@ -329,13 +329,13 @@ func wmCommitTree(ctx context.Context, sc *wcScratch, tree string, parents []str
 		"GIT_COMMITTER_NAME=" + committer.Name,
 		"GIT_COMMITTER_EMAIL=" + committer.Email,
 	}
-	args := []string{"commit-tree", "-m", message}
+	args := []string{"commit-tree", "-F", "-"}
 	for _, p := range parents {
 		assertf(ref.ValidSHA(p), "wmCommitTree: malformed parent %q", p)
 		args = append(args, "-p", p)
 	}
 	args = append(args, tree)
-	out, err := sc.git(ctx, nil, env, args...)
+	out, err := sc.git(ctx, wcMessageInput(message), env, args...)
 	if err != nil {
 		return "", err
 	}
@@ -500,6 +500,9 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 			return newFieldError("expected_source_sha", "must be a 40-hex sha", "expected_source_sha must be a 40-hex sha")
 		}
 		req.sourcePin = lowerFullSHA(pin)
+	}
+	if err := wcValidateCommitMessage(req.CommitMessage); err != nil {
+		return err
 	}
 	if req.Author != nil {
 		if err := wcValidateAuthor("author", *req.Author); err != nil {
