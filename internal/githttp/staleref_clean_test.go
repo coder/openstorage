@@ -2,6 +2,7 @@ package githttp
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"os"
 	"os/exec"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/metrics"
@@ -336,7 +339,17 @@ func TestCleanStaleRefLocksLeavesWhatIsNotARegularFile(t *testing.T) {
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// The symlink and the directory are old themselves, so only the regular
+	// file rule keeps them: an age gate alone would pass them.
 	srSetAge(t, target, 2*time.Hour)
+	srSetAge(t, dir, 2*time.Hour)
+	at := unix.NsecToTimespec(time.Now().Add(-2 * time.Hour).UnixNano())
+	if err := unix.UtimesNanoAt(unix.AT_FDCWD, link, []unix.Timespec{at, at}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(link); err != nil || time.Since(fi.ModTime()) < time.Hour {
+		t.Fatalf("the symlink is not old itself: %v, %v", fi, err)
+	}
 
 	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x", "refs/heads/y"}, time.Now())
 	if err != nil {
@@ -377,87 +390,150 @@ func TestCleanStaleRefLocksLogsOneLinePerRun(t *testing.T) {
 	}
 }
 
-// The identity check. A writer that is out of contract (a git without a
-// lease) replaces the lock between cleanup's look and its move. The moved
-// file is not the one that was inspected, so cleanup puts it back and keeps
-// it. Skipping the check deletes a live writer's lock.
-func TestCleanStaleRefLocksPutsBackALockThatWasReplaced(t *testing.T) {
-	repo, _ := srRepo(t)
-	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
-	replace := func(string) {
+// srReplace puts a new file with content at the lock's path. "rename" renames
+// a new file over the old one, so the old inode is alive until the rename and
+// the new file cannot take its number. "recreate" removes the old file and
+// then creates the new one, as a git does that rolls back and takes the lock
+// again: the freed inode number usually comes back to the new file, which
+// srReplace reports.
+func srReplace(t *testing.T, how, lock, content string) (recycled bool) {
+	t.Helper()
+	switch how {
+	case "rename":
 		fresh := lock + ".new"
-		if err := os.WriteFile(fresh, []byte("live writer\n"), 0o600); err != nil {
+		if err := os.WriteFile(fresh, []byte(content), 0o600); err != nil {
 			t.Error(err)
 		}
 		if err := os.Rename(fresh, lock); err != nil {
 			t.Error(err)
 		}
+		return false
+	case "recreate", "recreate same size", "recreate old mtime":
+		old, err := os.Lstat(lock)
+		if err != nil {
+			t.Error(err)
+			return false
+		}
+		if err := os.Remove(lock); err != nil {
+			t.Error(err)
+		}
+		if err := os.WriteFile(lock, []byte(content), 0o600); err != nil {
+			t.Error(err)
+		}
+		if how == "recreate old mtime" {
+			if err := os.Chtimes(lock, old.ModTime(), old.ModTime()); err != nil {
+				t.Error(err)
+			}
+		}
+		now, err := os.Lstat(lock)
+		if err != nil {
+			t.Error(err)
+			return false
+		}
+		return os.SameFile(old, now)
 	}
-	staleLockBeforeMove.Store(&replace)
-	t.Cleanup(func() { staleLockBeforeMove.Store(nil) })
-	lines := srLogLines(t, repo)
+	t.Fatalf("unknown replacement %q", how)
+	return false
+}
 
-	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
-	if err != nil {
-		t.Fatal(err)
+// srReplacements are the ways to replace a lock between cleanup's look and its
+// move. The last two share one property with the old lock, the size or the
+// modification time, so that each of the checks of sameLock is needed.
+var srReplacements = []string{"rename", "recreate", "recreate same size", "recreate old mtime"}
+
+// srReplacementContent is the content of the new lock: the same number of
+// bytes as the stale one ("stale\n") for "recreate same size".
+func srReplacementContent(how, content string) string {
+	if how == "recreate same size" {
+		return "fresh\n"
 	}
-	if res.Removed != 0 || res.Outcome != metrics.StaleRefLockKept {
-		t.Fatalf("result = %+v, want 0 removed, outcome kept", res)
-	}
-	if got, err := os.ReadFile(lock); err != nil || string(got) != "live writer\n" {
-		t.Fatalf("lock after the run = %q, %v, want the live writer's file back in place", got, err)
-	}
-	if left := srQuarantine(t, repo); len(left) != 0 {
-		t.Fatalf("quarantine holds %v after the put-back", left)
-	}
-	if l := lines(); len(l) != 1 || !strings.Contains(l[0], "1 replaced while moved") {
-		t.Fatalf("log lines = %q, want one naming the replaced lock", l)
+	return content
+}
+
+// The identity check. A writer that is out of contract (a git without a
+// lease) replaces the lock between cleanup's look and its move. The moved
+// file is not the one that was inspected, so cleanup puts it back and keeps
+// it. Skipping the check deletes a live writer's lock.
+func TestCleanStaleRefLocksPutsBackALockThatWasReplaced(t *testing.T) {
+	for _, how := range srReplacements {
+		t.Run(how, func(t *testing.T) {
+			repo, _ := srRepo(t)
+			lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+			recycled := false
+			content := srReplacementContent(how, "live writer\n")
+			replace := func(string) { recycled = srReplace(t, how, lock, content) }
+			staleLockBeforeMove.Store(&replace)
+			t.Cleanup(func() { staleLockBeforeMove.Store(nil) })
+			lines := srLogLines(t, repo)
+
+			res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("inode number recycled by the new lock: %v", recycled)
+			if res.Removed != 0 || res.Outcome != metrics.StaleRefLockKept {
+				t.Fatalf("result = %+v, want 0 removed, outcome kept", res)
+			}
+			if got, err := os.ReadFile(lock); err != nil || string(got) != content {
+				t.Fatalf("lock after the run = %q, %v, want the live writer's file back in place", got, err)
+			}
+			if left := srQuarantine(t, repo); len(left) != 0 {
+				t.Fatalf("quarantine holds %v after the put-back", left)
+			}
+			if l := lines(); len(l) != 1 || !strings.Contains(l[0], "1 replaced while moved") {
+				t.Fatalf("log lines = %q, want one naming the replaced lock", l)
+			}
+			if strings.HasPrefix(how, "recreate") && !recycled {
+				t.Skip("the filesystem gave the new lock another inode number, so this run cannot tell sameLock from an inode compare")
+			}
+		})
 	}
 }
 
 // When the replaced file cannot go back because a new lock took its path,
 // that new lock stays untouched and the moved file stays in quarantine.
 func TestCleanStaleRefLocksNeverReplacesANewLockWhenPuttingBack(t *testing.T) {
-	repo, _ := srRepo(t)
-	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
-	swap := func(string) {
-		fresh := lock + ".new"
-		if err := os.WriteFile(fresh, []byte("first writer\n"), 0o600); err != nil {
-			t.Error(err)
-		}
-		if err := os.Rename(fresh, lock); err != nil {
-			t.Error(err)
-		}
-	}
-	newer := func(string) {
-		if err := os.WriteFile(lock, []byte("second writer\n"), 0o600); err != nil {
-			t.Error(err)
-		}
-	}
-	staleLockBeforeMove.Store(&swap)
-	staleLockAfterMove.Store(&newer)
-	t.Cleanup(func() { staleLockBeforeMove.Store(nil); staleLockAfterMove.Store(nil) })
+	for _, how := range srReplacements {
+		t.Run(how, func(t *testing.T) {
+			repo, _ := srRepo(t)
+			lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+			first := srReplacementContent(how, "first writer\n")
+			recycled := false
+			swap := func(string) { recycled = srReplace(t, how, lock, first) }
+			newer := func(string) {
+				if err := os.WriteFile(lock, []byte("second writer\n"), 0o600); err != nil {
+					t.Error(err)
+				}
+			}
+			staleLockBeforeMove.Store(&swap)
+			staleLockAfterMove.Store(&newer)
+			t.Cleanup(func() { staleLockBeforeMove.Store(nil); staleLockAfterMove.Store(nil) })
 
-	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Removed != 0 {
-		t.Fatalf("result = %+v, want 0 removed", res)
-	}
-	if got, _ := os.ReadFile(lock); string(got) != "second writer\n" {
-		t.Fatalf("lock = %q, want the second writer's file untouched", got)
-	}
-	left := srQuarantine(t, repo)
-	if len(left) != 1 {
-		t.Fatalf("quarantine holds %v, want the first writer's moved file", left)
-	}
-	if got, _ := os.ReadFile(filepath.Join(repo, staleLocksDir, left[0])); string(got) != "first writer\n" {
-		t.Fatalf("quarantined file = %q, want the first writer's", got)
-	}
-	// A file in the quarantine directory is not a ref.
-	if out, err := srGit(t, repo, "for-each-ref", "--format=%(refname)"); err != nil || out != "" {
-		t.Fatalf("for-each-ref = %q, %v, want no refs", out, err)
+			res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Removed != 0 {
+				t.Fatalf("result = %+v, want 0 removed", res)
+			}
+			if got, _ := os.ReadFile(lock); string(got) != "second writer\n" {
+				t.Fatalf("lock = %q, want the second writer's file untouched", got)
+			}
+			left := srQuarantine(t, repo)
+			if len(left) != 1 {
+				t.Fatalf("quarantine holds %v, want the first writer's moved file", left)
+			}
+			if got, _ := os.ReadFile(filepath.Join(repo, staleLocksDir, left[0])); string(got) != first {
+				t.Fatalf("quarantined file = %q, want the first writer's", got)
+			}
+			// A file in the quarantine directory is not a ref.
+			if out, err := srGit(t, repo, "for-each-ref", "--format=%(refname)"); err != nil || out != "" {
+				t.Fatalf("for-each-ref = %q, %v, want no refs", out, err)
+			}
+			if strings.HasPrefix(how, "recreate") && !recycled {
+				t.Skip("the filesystem gave the new lock another inode number, so this run cannot tell sameLock from an inode compare")
+			}
+		})
 	}
 }
 
@@ -608,5 +684,106 @@ func TestCleanStaleRefLocksLogsPartialRemovalWhenALaterMoveFails(t *testing.T) {
 	}
 	if l := lines(); len(l) != 1 || !strings.Contains(l[0], "removed 1 of 2 ref lock(s)") {
 		t.Fatalf("log lines = %q, want one that says removed 1 of 2", l)
+	}
+}
+
+// The run gives its lease back: a git start right after it must not wait for
+// the garbage collector to close the file.
+func TestCleanStaleRefLocksReleasesTheLease(t *testing.T) {
+	repo, _ := srRepo(t)
+	srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+	if res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now()); err != nil || res.Removed != 1 {
+		t.Fatalf("cleanup = %+v, %v, want one lock removed", res, err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	l, err := gitlimit.OpenLease(ctx, repo)
+	if err != nil {
+		t.Fatalf("OpenLease right after a cleanup = %v: the run kept its lease", err)
+	}
+	_ = l.Close()
+}
+
+// A lock that is gone when the run moves it was a live git's: the run counts
+// no removal, reports no error and leaves no file in quarantine. The outcome
+// is kept, because the run found an old lock and removed none.
+func TestCleanStaleRefLocksCountsNoRemovalWhenTheLockVanishesBeforeTheMove(t *testing.T) {
+	repo, _ := srRepo(t)
+	lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+	gone := func(string) {
+		if err := os.Remove(lock); err != nil {
+			t.Error(err)
+		}
+	}
+	staleLockBeforeMove.Store(&gone)
+	t.Cleanup(func() { staleLockBeforeMove.Store(nil) })
+	removed, kept := srCount("removed"), srCount("kept")
+	lines := srLogLines(t, repo)
+
+	res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+	if err != nil {
+		t.Fatalf("a lock that vanished before the move is no error: %v", err)
+	}
+	if res.Old != 1 || res.Removed != 0 || res.Outcome != metrics.StaleRefLockKept {
+		t.Fatalf("result = %+v, want 1 old, 0 removed, outcome kept", res)
+	}
+	if srCount("removed") != removed || srCount("kept")-kept != 1 {
+		t.Fatalf("outcomes counted: removed %v -> %v, kept %v -> %v", removed, srCount("removed"), kept, srCount("kept"))
+	}
+	if left := srQuarantine(t, repo); len(left) != 0 {
+		t.Fatalf("quarantine holds %v after a lock that was never moved", left)
+	}
+	if l := lines(); len(l) != 1 || !strings.Contains(l[0], "removed 0 of 1") {
+		t.Fatalf("log lines = %q, want one saying removed 0 of 1", l)
+	}
+}
+
+// The look under the lease decides. When every old lock is gone, or no longer
+// old, by then, its git finished its transaction before the run held the
+// lease: the run found no stale lock, so it counts nothing, logs nothing and
+// moves nothing (a lock that is young again is a live git's).
+func TestCleanStaleRefLocksCountsNothingWhenTheLocksAreGoneUnderTheLease(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		act  func(t *testing.T, lock string)
+	}{
+		{"gone", func(t *testing.T, lock string) {
+			if err := os.Remove(lock); err != nil {
+				t.Error(err)
+			}
+		}},
+		{"young again", func(t *testing.T, lock string) {
+			now := time.Now()
+			if err := os.Chtimes(lock, now, now); err != nil {
+				t.Error(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _ := srRepo(t)
+			lock := srLock(t, repo, "refs/heads/x.lock", 2*time.Hour)
+			act := func(string) { tc.act(t, lock) }
+			staleLockAfterLease.Store(&act)
+			t.Cleanup(func() { staleLockAfterLease.Store(nil) })
+			before := srCount("removed") + srCount("busy") + srCount("kept")
+			lines := srLogLines(t, repo)
+
+			res, err := cleanStaleRefLocks(repo, []string{"refs/heads/x"}, time.Now())
+			if err != nil || res != (staleRefCleanup{}) {
+				t.Fatalf("result = %+v, %v, want nothing done", res, err)
+			}
+			if after := srCount("removed") + srCount("busy") + srCount("kept"); after != before {
+				t.Fatalf("outcomes counted: %v -> %v, want none", before, after)
+			}
+			if l := lines(); len(l) != 0 {
+				t.Fatalf("log lines = %q, want none", l)
+			}
+			if tc.name == "young again" && !srExists(t, lock) {
+				t.Fatal("the run removed a lock that is no longer old")
+			}
+			if left := srQuarantine(t, repo); len(left) != 0 {
+				t.Fatalf("quarantine holds %v", left)
+			}
+		})
 	}
 }

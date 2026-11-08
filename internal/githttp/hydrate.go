@@ -311,6 +311,10 @@ func cacheRepoUnchanged(repoPath string, m cacheRepoMemo) bool {
 	return true
 }
 
+// createEpoch is gitlimit.CreateEpoch behind a test seam: fault injection for
+// a creation that stops after the directory was made.
+var createEpoch = gitlimit.CreateEpoch
+
 // EnsureCacheRepoCtx is EnsureCacheRepo honoring ctx in its lock wait and
 // git subprocesses (init, config): the repack fold's materialization runs the
 // setup under the fold's wall-clock budget, and a stalled subprocess or
@@ -336,7 +340,7 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 	}
 	switch err := os.Mkdir(path, 0o755); {
 	case err == nil:
-		if err := gitlimit.CreateEpoch(path); err != nil {
+		if err := createEpoch(path); err != nil {
 			return "", err
 		}
 	case !errors.Is(err, os.ErrExist):

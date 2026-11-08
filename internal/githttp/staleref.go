@@ -69,10 +69,13 @@ func refLockPaths(repoPath string, names []string) []string {
 // #490). It is outside refs/, so `git for-each-ref` never lists a file in it.
 const staleLocksDir = "codestorage-stale-locks"
 
-// Test seams for the window between cleanup's look at a lock and its move
+// Test seams for the window between cleanup's first look at the locks and
+// its second look under the lease (staleLockAfterLease, called with the
+// repository path), between the second look and the move of a lock
 // (staleLockBeforeMove), and between the move and the identity check
 // (staleLockAfterMove). Production never sets them.
 var (
+	staleLockAfterLease atomic.Pointer[func(repo string)]
 	staleLockBeforeMove atomic.Pointer[func(lock string)]
 	staleLockAfterMove  atomic.Pointer[func(lock string)]
 )
@@ -124,8 +127,8 @@ type staleRefCleanup struct {
 // docs/how-to/deploy-production.md tells operators not to do it.
 //
 // A lock is moved into the quarantine directory with a rename, and the moved
-// file's device and inode are compared with the lock that was inspected.
-// Only a match is deleted. A path that was inspected and then deleted by name
+// file's device, inode, modification time and size are compared with the lock
+// that was inspected (sameLock). Only a match is deleted. A path that was inspected and then deleted by name
 // can be a different file by then. A moved file that does not match is linked
 // back to its path, which fails when a new lock appeared there, and is kept.
 //
@@ -189,6 +192,7 @@ func cleanStaleRefLocks(repoPath string, names []string, now time.Time) (res sta
 	defer lease.Close()
 
 	// A lock can change between the first look and the lease: inspect again.
+	staleLockSeam(&staleLockAfterLease, repoPath)
 	old = oldRefLocks(paths, now)
 	if len(old) == 0 {
 		res = staleRefCleanup{}
@@ -265,7 +269,7 @@ func quarantineRefLock(repoPath, path string, fi fs.FileInfo) (quarantineResult,
 		return lockGone, err
 	}
 	staleLockSeam(&staleLockAfterMove, path)
-	if got, err := os.Lstat(quarantined); err == nil && os.SameFile(fi, got) {
+	if got, err := os.Lstat(quarantined); err == nil && sameLock(fi, got) {
 		return lockDeleted, os.Remove(quarantined)
 	}
 	// Link, unlike rename, fails when a new lock took the path: that lock
@@ -279,4 +283,13 @@ func quarantineRefLock(repoPath, path string, fi fs.FileInfo) (quarantineResult,
 		return lockReplaced, fmt.Errorf("put back %s: %w", path, err)
 	}
 	return lockReplaced, nil
+}
+
+// sameLock reports whether got is the file that fi inspected. The device and
+// the inode are not enough: when a lock is removed, the next file that a
+// writer creates in the directory usually gets the freed inode number. A rename
+// keeps the modification time and the size, and a lock that a writer made
+// after the inspected one is at least the age gate (staleRefLockAge) newer.
+func sameLock(fi, got fs.FileInfo) bool {
+	return os.SameFile(fi, got) && got.ModTime().Equal(fi.ModTime()) && got.Size() == fi.Size()
 }
