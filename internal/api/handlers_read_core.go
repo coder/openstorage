@@ -504,6 +504,9 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if p := q.Get("path"); p != "" && !readPathOK(w, p) {
+		return
+	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
@@ -671,6 +674,10 @@ func (s *server) resolveFilesRequest(w http.ResponseWriter, r *http.Request, rep
 	ephemeral, err := coreBoolParam(q, "ephemeral")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return "", "", "", false
+	}
+	// The listings send git the subtree: "/" alone names the root.
+	if subtree, _ := filesListPath(r); subtree != "" && !readPathOK(w, subtree) {
 		return "", "", "", false
 	}
 	refLabel = q.Get("ref")
@@ -1052,6 +1059,21 @@ func pathLeavesRepo(p string) bool {
 	return strings.HasPrefix(p, "/") || c == ".." || strings.HasPrefix(c, "../")
 }
 
+// readPathOK answers 400 and returns false when a request path holds a
+// NUL byte (exec refuses it, and no path holds one) or names a place
+// outside the repository (pathLeavesRepo).
+func readPathOK(w http.ResponseWriter, p string) bool {
+	switch {
+	case strings.ContainsRune(p, 0):
+		writeErr(w, http.StatusBadRequest, "path must not contain a NUL byte")
+	case pathLeavesRepo(p):
+		writeErr(w, http.StatusBadRequest, "path is outside the repository")
+	default:
+		return true
+	}
+	return false
+}
+
 // handleGetFile implements GET+HEAD /api/v1/repos/file: conditional and
 // range blob streaming. The blob is staged to a request-scoped temp file
 // and served via http.ServeContent, which owns the RFC 9110 precondition
@@ -1069,8 +1091,7 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing path")
 		return
 	}
-	if pathLeavesRepo(filePath) {
-		writeErr(w, http.StatusBadRequest, "path is outside the repository")
+	if !readPathOK(w, filePath) {
 		return
 	}
 	// docs/reference/http-api.md lists ephemeral_base on this endpoint; with a single ref to

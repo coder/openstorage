@@ -413,9 +413,9 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 // validBranchName, which already refuses every name we know git refuses
 // (a trailing dot, "..", ".lock"); git's own verdict guards against a rule
 // validBranchName misses, because hydration later runs `symbolic-ref HEAD
-// <target>` with the stored name. Only git's exit 1 means
-// that git rejects the name. Any other failure (a killed git, a failed
-// exec) says nothing about the name and is returned.
+// <target>` with the stored name. Only git's exit 1 means that git
+// rejects the name. Any other failure (a killed git, a failed exec) says
+// nothing about the name and is returned.
 func validRefFormat(ctx context.Context, target string) (bool, error) {
 	assertf(strings.HasPrefix(target, "refs/"), "validRefFormat: unqualified target %q", target)
 	err := gitlimit.Run(exec.CommandContext(ctx, "git", "check-ref-format", target))
@@ -516,9 +516,10 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	// upstream's field is, by name and description, a branch. The derived
 	// HEAD target must also satisfy git's own ref-format rules, which git
 	// checks after validBranchName (that check already refuses the rules
-	// we know of, such as a trailing dot): hydration runs `symbolic-ref HEAD <target>` on every node, and a
-	// persisted target git rejects would break the repo's git/read
-	// surface until another PATCH repairs the row.
+	// we know of, such as a trailing dot): hydration runs `symbolic-ref
+	// HEAD <target>` on every node, and a persisted target git rejects
+	// would break the repo's git/read surface until another PATCH repairs
+	// the row.
 	target := githttp.HeadTarget(branch)
 	shortName := strings.TrimPrefix(branch, "refs/heads/")
 	valid := !strings.HasPrefix(shortName, "refs/") && validBranchName(shortName)
