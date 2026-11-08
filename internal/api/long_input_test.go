@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -67,16 +68,25 @@ func TestLongCommitMessage(t *testing.T) {
 				t.Fatalf("message with a NUL byte: status = %d, want 400 (body %s)", resp.StatusCode, body)
 			}
 			// git gets the identities through its environment, and exec
-			// refuses a NUL byte there.
+			// refuses a NUL byte there, and on Linux an entry over 128 KiB.
+			over := wcMaxIdentityBytes + 1
 			for name, extra := range map[string]map[string]any{
-				"author name":     {"author": map[string]any{"name": "A\x00B", "email": "a@x"}},
-				"committer email": {"committer": map[string]any{"name": "C", "email": "c\x00@x"}},
+				"author name with a NUL byte":     {"author": map[string]any{"name": "A\x00B", "email": "a@x"}},
+				"committer email with a NUL byte": {"committer": map[string]any{"name": "C", "email": "c\x00@x"}},
+				"author name over the limit":      {"author": map[string]any{"name": strings.Repeat("n", over), "email": "a@x"}},
+				"committer email over the limit":  {"committer": map[string]any{"name": "C", "email": strings.Repeat("e", over)}},
 			} {
 				maps.Copy(extra, tip)
 				if resp, body := postAs("m", extra); resp.StatusCode != http.StatusBadRequest {
-					t.Errorf("%s with a NUL byte: status = %d, want 400 (body %s)", name, resp.StatusCode, body)
+					t.Errorf("%s: status = %d, want 400 (body %.300s)", name, resp.StatusCode, body)
 				}
 			}
+			// At the limit, GIT_COMMITTER_EMAIL=<email> is exactly the
+			// 128 KiB that exec takes, and the commit lands.
+			atLimit := map[string]any{"committer": map[string]any{"name": "C", "email": strings.Repeat("e", wcMaxIdentityBytes)}}
+			maps.Copy(atLimit, tip)
+			resp, body = postAs("m", atLimit)
+			wctRequireOK(t, resp, body)
 		})
 		t.Run("merge", func(t *testing.T) {
 			srv := wmServer(t, e)
@@ -186,7 +196,10 @@ func capStack(t *testing.T, max uint64) {
 // error: 400, not 500.
 func TestGitValuesExecRefusesAre400(t *testing.T) {
 	long := strings.Repeat("p", 200<<10) // past 128 KiB
-	many := make([]string, 200000)       // about 4 MB of arguments: past ARG_MAX at an 8 MiB stack limit
+	// exec's 128 KiB limit for one argument is Linux's. macOS limits only
+	// the total, to 1 MiB, which the 200,000 paths pass.
+	linux := runtime.GOOS == "linux"
+	many := make([]string, 200000) // about 4 MB of arguments: past ARG_MAX at an 8 MiB stack limit
 	for i := range many {
 		many[i] = "a"
 	}
@@ -212,13 +225,15 @@ func TestGitValuesExecRefusesAre400(t *testing.T) {
 			}
 			// Each line of a pattern is a regex of its own; git refuses
 			// one regex of 32 KiB with exit 128 (a 400 already).
-			lines := strings.Repeat("needle\n", 200<<10/7)
-			resp, body := grep(map[string]any{"pattern": lines}, nil)
-			check(t, "200 KiB pattern", resp, body)
-			resp, body = grep(map[string]any{"pattern": "nee\x00dle"}, nil)
+			if linux {
+				lines := strings.Repeat("needle\n", 200<<10/7)
+				resp, body := grep(map[string]any{"pattern": lines}, nil)
+				check(t, "200 KiB pattern", resp, body)
+				resp, body = grep(map[string]any{"pattern": "needle"}, []string{long})
+				check(t, "200 KiB path", resp, body)
+			}
+			resp, body := grep(map[string]any{"pattern": "nee\x00dle"}, nil)
 			check(t, "pattern with a NUL byte", resp, body)
-			resp, body = grep(map[string]any{"pattern": "needle"}, []string{long})
-			check(t, "200 KiB path", resp, body)
 			resp, body = grep(map[string]any{"pattern": "needle"}, []string{"a\x00b"})
 			check(t, "path with a NUL byte", resp, body)
 			capStack(t, 8<<20)
@@ -227,14 +242,33 @@ func TestGitValuesExecRefusesAre400(t *testing.T) {
 		})
 		for _, route := range []string{"file", "files", "files/metadata", "commits", "blame"} {
 			t.Run(route, func(t *testing.T) {
-				for _, tc := range []struct{ name, path string }{
-					{"200 KiB path", long},
-					{"path with a NUL byte", "a\x00b"},
-				} {
+				cases := []struct{ name, path string }{{"path with a NUL byte", "a\x00b"}}
+				if linux {
+					cases = append(cases, struct{ name, path string }{"200 KiB path", long})
+				}
+				for _, tc := range cases {
 					resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/"+route+"?ref=main&path="+url.QueryEscape(tc.path), token, nil, "")
 					check(t, tc.name, resp, body)
 				}
 			})
+		}
+	})
+}
+
+// The notes endpoint gives its author to git through the environment too.
+func TestNoteAuthorExecRefusesAre400(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+		srv := newWrefServer(t, e)
+		for name, author := range map[string]map[string]any{
+			"author name with a NUL byte": {"name": "A\x00B", "email": "a@x"},
+			"author email over the limit": {"name": "A", "email": strings.Repeat("e", wcMaxIdentityBytes+1)},
+		} {
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"sha": fx.c1, "action": "add", "note": "n", "author": author})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("%s: status = %d, want 400 (body %.300v)", name, resp.StatusCode, body)
+			}
 		}
 	})
 }

@@ -1013,6 +1013,10 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			writeInvalid(w, msg, err)
 			return
 		}
+		if err := wcValidateIdentityEnv("author", req.Author.Name, req.Author.Email); err != nil {
+			writeInvalid(w, err.Error(), err)
+			return
+		}
 		author = *req.Author
 	}
 

@@ -525,10 +525,23 @@ func wcValidateAuthor(field string, a wcAuthor) error {
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
 		return newFieldError(field, "must not contain newlines", field+" contains newlines")
 	}
-	if strings.IndexByte(a.Name+a.Email, 0) >= 0 {
-		// git gets the identity through its environment, and exec refuses
-		// a NUL byte there.
+	return wcValidateIdentityEnv(field, a.Name, a.Email)
+}
+
+// wcMaxIdentityBytes bounds an author or committer name or email. git gets
+// each through an environment entry such as GIT_COMMITTER_EMAIL=<email>,
+// and exec on Linux refuses an entry over 128 KiB (E2BIG).
+const wcMaxIdentityBytes = 128<<10 - len("GIT_COMMITTER_EMAIL=") - 1
+
+// wcValidateIdentityEnv refuses an identity that exec cannot pass in git's
+// environment: a NUL byte, or a name or email over wcMaxIdentityBytes.
+func wcValidateIdentityEnv(field, name, email string) error {
+	if strings.IndexByte(name+email, 0) >= 0 {
 		return newFieldError(field, "must not contain a NUL byte", field+" contains a NUL byte")
+	}
+	if max(len(name), len(email)) > wcMaxIdentityBytes {
+		msg := fmt.Sprintf("name and email must be at most %d bytes each", wcMaxIdentityBytes)
+		return newFieldError(field, msg, field+" "+msg)
 	}
 	return nil
 }

@@ -10,9 +10,9 @@ import (
 	"testing"
 )
 
-// exec refuses an argument with a NUL byte and, on Linux, one past 128 KiB
-// (E2BIG). Run reports both as ErrArgument, a client error, and starts no
-// git for a NUL byte.
+// exec refuses an argument with a NUL byte, and with E2BIG one past
+// 128 KiB on Linux or past the 1 MiB total on macOS. Run reports both as
+// ErrArgument, a client error, and starts no git for a NUL byte.
 func TestRunRefusedArgumentIsErrArgument(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "ran")
 	fakeGit(t, "echo x >> '"+marker+"'\nexit 1")
@@ -27,8 +27,10 @@ func TestRunRefusedArgumentIsErrArgument(t *testing.T) {
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("git ran for an argument with a NUL byte")
 	}
-	if err := run(strings.Repeat("a", 200<<10)); !errors.Is(err, ErrArgument) {
-		t.Fatalf("200 KiB argument: err = %v, want ErrArgument", err)
+	// 2 MiB passes Linux's 128 KiB for one argument and macOS's 1 MiB for
+	// all of them.
+	if err := run(strings.Repeat("a", 2<<20)); !errors.Is(err, ErrArgument) {
+		t.Fatalf("2 MiB argument: err = %v, want ErrArgument", err)
 	}
 	// An argument exec takes reaches git, and git's own failure is not
 	// ErrArgument.
