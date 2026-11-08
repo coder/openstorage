@@ -1001,18 +1001,23 @@ func (sc *wcScratch) resolveTree(ctx context.Context, commitSHA string) (string,
 // read is the repository's failure, an error, and so is any other git
 // failure (a fatal exit, a killed git).
 //
-// The target's type is its own object's: git reads it with
+// The target's type and tree are its own objects': git reads both with
 // --no-replace-objects, because a replacement (refs/replace/<id>, which
-// any pusher can write) could make a tree read as a commit. The tree of a
-// commit is then read as the rest of the write path reads trees.
+// any pusher can write) could make a tree read as a commit, or a commit
+// as a tree.
 func (sc *wcScratch) restoreTargetTree(ctx context.Context, target string) (tree string, found bool, err error) {
 	_, kindErr := sc.git(ctx, nil, nil, "--no-replace-objects", "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{commit}")
 	if kindErr == nil {
-		tree, err := sc.resolveTree(ctx, target)
+		out, err := sc.git(ctx, nil, nil, "--no-replace-objects", "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{commit}^{tree}")
 		if wcGitExit(err, 1) {
 			return "", false, fmt.Errorf("restore target %s: commit has no readable tree: %w", target, err)
+		} else if err != nil {
+			return "", false, err
 		}
-		return tree, err == nil, err
+		if tree = strings.TrimSpace(out); !ref.ValidSHA(tree) {
+			return "", false, fmt.Errorf("rev-parse %s^{commit}^{tree} emitted %q", target, tree)
+		}
+		return tree, true, nil
 	}
 	if !wcGitExit(kindErr, 1) {
 		return "", false, kindErr

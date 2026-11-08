@@ -66,6 +66,10 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 	}
 	replacedTree := strings.TrimSpace(string(out))
 	coreGit(t, dir, "update-ref", "refs/replace/"+replacedTree, c1)
+	// A commit that a replacement makes read as a tree: it is still a
+	// commit, with its own tree.
+	c4 := strings.TrimSpace(coreGit(t, dir, "commit-tree", tree1, "-p", c1, "-m", "c4"))
+	coreGit(t, dir, "update-ref", "refs/replace/"+c4, tree1)
 	for _, oid := range []string{tree2, c3} {
 		if err := os.Remove(filepath.Join(dir, ".git", "objects", oid[:2], oid[2:])); err != nil {
 			t.Fatal(err)
@@ -91,6 +95,7 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 		{"tag of a tree by an uppercase id", upperTag, "", false, false},
 		{"tag that git cannot parse", badTag, "", false, true},
 		{"tree that a replacement makes a commit", replacedTree, "", false, false},
+		{"commit that a replacement makes a tree", c4, tree1, true, false},
 		{"commit whose tree is missing", c2, "", false, true},
 		{"tag of a missing commit", tagC3, "", false, true},
 		{"tag of a tag of a missing commit", tagTagC3, "", false, true},
