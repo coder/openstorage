@@ -56,7 +56,8 @@ func TestRestoreTargetTreeTellsMissingFromBroken(t *testing.T) {
 	tagC3 := tag("c3", c3)
 	tagTagC3 := tag("c3-again", tagC3)
 	// A tree that no commit has, which a replacement (any pusher can write
-	// refs/replace/*) makes read as c1: it is still no commit.
+	// refs/replace/*) makes read as c1: it is still no commit, because git
+	// reads every object as itself (gitlimit sets GIT_NO_REPLACE_OBJECTS).
 	mk := exec.Command("git", "mktree")
 	mk.Dir = dir
 	mk.Stdin = strings.NewReader("100644 blob " + blob + "\tother.txt\n")
