@@ -18,7 +18,7 @@ Shared admission and process control for git subprocesses. It provides a slot po
 - `HeapLimitSupported`, `Command`, `HeapFailure` — heap cap support (Linux: `/bin/sh` wrapper with `ulimit -d`; other platforms: no cap) and heap-failure classification [heaplimit_linux.go:Command] [heaplimit_other.go:Command]
 
 ## Invariants
-- `TailBuffer` keeps the last 64 KiB written to it [errtext.go:TailBuffer]
+- `TailBuffer` keeps the last 64 KiB written to it and holds about that much memory, also after one large Write; a tail that was cut starts at a UTF-8 character [errtext.go:TailBuffer]
 - `HeadBuffer` keeps the first 64 KiB written to it and counts the rest in `Dropped` [errtext.go:HeadBuffer]
 - `NewSlots` panics unless n > 0, 0 < perKey <= n, and wait >= 0 [gitlimit.go:NewSlots]
 - `Release` panics unless the key holds a slot; `RepoKey` panics on an empty repo ID [gitlimit.go:Release]
