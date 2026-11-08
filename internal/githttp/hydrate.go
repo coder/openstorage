@@ -1348,14 +1348,56 @@ func (b *refCmdBatch) flush() error {
 	if len(kept) == 0 {
 		return nil
 	}
-	err := updateRefStdin(b.repoPath, sb.String())
-	if err != nil {
+	if err := updateRefStdin(b.repoPath, sb.String()); err != nil {
 		// A git killed inside its ref transaction leaves a lock that fails
-		// every later batch for that ref (issue #464). Name it for the
-		// operator; removing it safely needs a stopped replica.
-		reportOldRefLocks(b.repoPath, kept)
+		// every later batch for that ref (issue #464). The for-each-ref
+		// child of this pass is alive and holds the lease, so the lock
+		// cannot be removed here: hydrateRefs removes it once the pass has
+		// returned and its children are reaped.
+		return &refBatchError{names: kept, err: err}
 	}
-	return err
+	return nil
+}
+
+// refBatchError marks a failed update-ref batch. names are the refs of the
+// batch, from which hydrateRefs finds the ref locks that can have failed it.
+type refBatchError struct {
+	names []string
+	err   error
+}
+
+func (e *refBatchError) Error() string { return e.err.Error() }
+func (e *refBatchError) Unwrap() error { return e.err }
+
+// syncRefsWithCleanup runs syncRefsStreamed up to three times, because a
+// racing writer can fail a pass. A store-side scan failure is an
+// infrastructure error, not local ref staleness: it is returned as scanErr at
+// once (no marker, no retries: the store is down, not the cache racing).
+//
+// A ref lock that a killed git left fails every batch for its ref (issue
+// #490), and one killed transaction can leave locks in several batches. When
+// a pass fails on a batch, both of its sync passes have returned and their
+// children are reaped, and the caller holds the repository's hydrate lock, so
+// a cleanup that wins the lease exclusively can remove the locks of that
+// batch. The cleanup runs after every failed attempt, and the three attempts
+// bound the work: a hydration cleans the failed batch of each attempt, and a
+// repository with stale locks in more batches heals over the next requests.
+// Nothing here remembers a batch, and no cleanup earns an attempt.
+func syncRefsWithCleanup(ctx context.Context, repoPath, headTarget string, newStore func() refSeq, batch int) (skipped bool, refsErr, scanErr error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if skipped, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, batch); refsErr == nil {
+			return skipped, nil, nil
+		}
+		if scan, ok := errors.AsType[*refScanError](refsErr); ok {
+			return skipped, refsErr, scan.Unwrap()
+		}
+		if failed, ok := errors.AsType[*refBatchError](refsErr); ok {
+			// The cleanup logs and counts its own result, an error included.
+			_, _ = cleanStaleRefLocks(repoPath, failed.names, time.Now())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return skipped, refsErr, nil
 }
 
 // syncRefsStreamed makes the local ref store match the given stream exactly
@@ -3889,17 +3931,9 @@ func hydrateRefs(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheD
 		tips = newRefTips()
 		return &tipCollectingRefSeq{inner: uncollected(), tips: tips}
 	}
-	for range 3 {
-		if skippedHeld, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, collectingStore, syncRefsBatch); refsErr == nil {
-			break
-		}
-		// A store-side scan failure is an infrastructure error, not local
-		// ref staleness: surface it like the pre-#119 ListRefs error (no
-		// marker, no retries — the store is down, not the cache racing).
-		if scan, ok := errors.AsType[*refScanError](refsErr); ok {
-			return "", nil, scan.Unwrap()
-		}
-		time.Sleep(50 * time.Millisecond)
+	skippedHeld, refsErr, scanErr := syncRefsWithCleanup(ctx, repoPath, headTarget, collectingStore, syncRefsBatch)
+	if scanErr != nil {
+		return "", nil, scanErr
 	}
 	if refsErr == nil && !skippedHeld {
 		// Strictly after full success — a failed hydrate must never advance

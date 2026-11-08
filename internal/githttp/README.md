@@ -32,6 +32,9 @@ The git smart-HTTP and Git LFS server. `Server` authenticates JWTs, resolves rep
 - Hold reservation fails closed on unreadable peer holds and waits at most 10 s for conflicting holds [hydrate.go:reservePushHoldsCovering]
 - `Hydrate` publishes the generation marker only after a full sync and re-reads the generation under the hydrate lock [hydrate.go:Hydrate]
 - `hydratePacksBy` retries a missing pack blob a bounded number of times, then returns `ErrPackMissing` [hydrate.go:hydratePacksBy]
+- A failed `update-ref` batch returns a `refBatchError` that names the batch's refs. `syncRefsWithCleanup` runs `cleanStaleRefLocks` after a failed sync has returned and its git children are reaped, after each of its three attempts, so one hydration cleans up to three failed batches, and nothing remembers a batch or earns an attempt [hydrate.go:syncRefsWithCleanup] [hydrate.go:refBatchError]
+- `cleanStaleRefLocks` removes a ref lock only when it holds the repository's lease exclusively, and only a regular file older than one minute and newer than the lease epoch: it renames the lock into `codestorage-stale-locks/` and deletes it only when the moved file has the device, inode, modification time and size that it inspected [staleref.go:cleanStaleRefLocks] [staleref.go:quarantineRefLock]
+- One cleanup run writes one log line and counts one `metrics.StaleRefLockCleanup` outcome, and a run that finds no lock older than one minute does neither and takes no lease [staleref.go:cleanStaleRefLocks]
 - Cache repos pin `receive.unpackLimit=0` and `gc.auto=0`; a pinned value that survives repair fails the call [hydrate.go:EnsureCacheRepoCtx]
 - `EnsureCacheRepoCtx` writes the lease epoch file for a directory that has no HEAD (a new one, or one that an interrupted creation left), before git init, and never in a repository that has HEAD (any entry named HEAD counts, a dangling symlink included, so the test is `Lstat`). A repository without the file keeps every stale ref lock [hydrate.go:EnsureCacheRepoCtx] [staleref_epoch_test.go:TestEnsureCacheRepoWritesTheLeaseEpochOnlyBeforeHEADExists] [staleref_epoch_test.go:TestEnsureCacheRepoWritesTheEpochForADirectoryWithoutHEAD] [staleref.go:cleanStaleRefLocks]
 - LFS OIDs must match `^[a-f0-9]{64}$`; batches are capped at 4 MiB and 1000 objects; only `basic` transfer and `sha256` [lfs.go:handleLFSBatch]
@@ -50,6 +53,7 @@ The git smart-HTTP and Git LFS server. `Server` authenticates JWTs, resolves rep
 - Spills large receive-pack output to an unlinked temp file [pushcap.go:pushGate.Write]
 - Writes verify-sig state files and imports signing keys with `gpg --import` in a temp dir [verifystate.go:appendTo] [hook.go:newSigVerifier]
 - Increments `metrics.CommitGraphRefresh`; logs through `log.Printf` [commitgraph.go:recordCommitGraphOutcome]
+- Takes the repository's lease exclusively for the moments of a stale ref lock cleanup, which makes new git starts in that repository wait; moves and deletes ref locks under `codestorage-stale-locks/`; increments `metrics.StaleRefLockCleanup` [staleref.go:cleanStaleRefLocks]
 - Test-mode crash knobs call `os.Exit(42)` [hook.go:preReceive]
 
 ## Verification
