@@ -690,6 +690,46 @@ func testListPrefix(t *testing.T, e *testEnv) {
 	}
 }
 
+// TestListFilterValues pins q and prefix values that no repo_name holds:
+// a value of 200 KiB lists no repo (SQLite refuses a LIKE pattern over
+// 50,000 bytes), and a NUL byte or invalid UTF-8, which PostgreSQL refuses
+// in a text parameter, is the client's 400.
+func TestListFilterValues(t *testing.T) { runBackends(t, testListFilterValues) }
+
+func testListFilterValues(t *testing.T, e *testEnv) {
+	org := e.newOrg(t)
+	createRepo(t, e, org, "acme/alpha", nil, http.StatusCreated)
+	orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}})
+	long := strings.Repeat("a", 200<<10)
+	for _, tc := range []struct {
+		name   string
+		params url.Values
+		status int
+	}{
+		{"q of 200 KiB", url.Values{"q": {long}}, http.StatusOK},
+		{"prefix of 200 KiB", url.Values{"prefix": {long}}, http.StatusOK},
+		{"q of 25,001 percent signs", url.Values{"q": {strings.Repeat("%", 25_001)}}, http.StatusOK},
+		{"q with a NUL byte", url.Values{"q": {"a\x00b"}}, http.StatusBadRequest},
+		{"prefix with a NUL byte", url.Values{"prefix": {"acme\x00"}}, http.StatusBadRequest},
+		{"q not UTF-8", url.Values{"q": {"a\xffb"}}, http.StatusBadRequest},
+		{"prefix not UTF-8", url.Values{"prefix": {"\xff"}}, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos?"+tc.params.Encode(), orgTok, nil, "")
+			if resp.StatusCode != tc.status {
+				t.Fatalf("status = %d (body %.300s), want %d", resp.StatusCode, body, tc.status)
+			}
+			if tc.status != http.StatusOK {
+				return
+			}
+			var page listReposResponse
+			if err := json.Unmarshal(body, &page); err != nil || len(page.Repos) != 0 || page.HasMore {
+				t.Fatalf("body %.300s (err %v), want an empty last page", body, err)
+			}
+		})
+	}
+}
+
 // TestAuthMatrix drives the docs/reference/http-api.md 401/403 failure map across the
 // repo lifecycle endpoints (create and list on both path styles), asserting status,
 // envelope shape, and WWW-Authenticate on 401.

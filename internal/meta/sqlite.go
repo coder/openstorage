@@ -724,7 +724,9 @@ func (s *SQLite) RemoveSigningKey(ctx context.Context, org string, id int64) err
 // ListRepos pages live repos for the org, keyset-ordered by
 // (created_at DESC, repo_id DESC).
 //
-// PG's `url ILIKE ?` becomes `lower(url) LIKE lower(?) ESCAPE '\'`. SQLite's
+// PG's `url ILIKE ?` becomes a start and a substring test of lower(url),
+// not LIKE: SQLite refuses a LIKE pattern over 50,000 bytes
+// (SQLITE_MAX_LIKE_PATTERN_LENGTH), and q and prefix can be longer. SQLite's
 // lower() only folds ASCII, so non-ASCII urls match case-sensitively here
 // while PG ILIKE folds per locale — an accepted divergence for local mode.
 func (s *SQLite) ListRepos(ctx context.Context, org string, params ListParams) (ListResult, error) {
@@ -739,9 +741,15 @@ func (s *SQLite) ListRepos(ctx context.Context, org string, params ListParams) (
 
 	query := `SELECT ` + repoCols + ` FROM repos WHERE org_id = ? AND deleted_at IS NULL`
 	args := []any{orgID}
-	if pattern := listURLPattern(params); pattern != "" {
-		args = append(args, pattern)
-		query += ` AND lower(url) LIKE lower(?) ESCAPE '\'`
+	assertListFilters(params)
+	if params.Prefix != "" {
+		args = append(args, params.Prefix, params.Prefix)
+		query += ` AND substr(lower(url), 1, length(?)) = lower(?)`
+	}
+	if params.Q != "" {
+		// With a prefix, q matches only the rest of the url after it.
+		args = append(args, params.Prefix, params.Q)
+		query += ` AND instr(substr(lower(url), length(?) + 1), lower(?)) > 0`
 	}
 	if params.Cursor != "" {
 		createdAt, repoID, err := decodeCursor(params.Cursor)

@@ -625,6 +625,10 @@ func testListReposQFilter(t *testing.T, s Backend) {
 	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/Alpha", "github.com/acme/beta-ALPHA"}) {
 		t.Errorf("q=alpha -> %v", got)
 	}
+	all, _ = listAll(t, s, org, "GAMMA", 10) // q in another case than the url
+	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/gamma"}) {
+		t.Errorf("q=GAMMA -> %v, want the gamma url", got)
+	}
 
 	// LIKE metacharacters in q are literals, not wildcards.
 	all, _ = listAll(t, s, org, "%", 10)
@@ -664,6 +668,7 @@ func testListReposPrefixFilter(t *testing.T, s Backend) {
 		"Pierre/Upper-SDK",
 		"pierre/pierre-mirror",
 		"acme/pierre-tools",
+		"acme/pierre/inner", // holds the prefix 'pierre/', but not at the start
 		"50%/off",
 		"500/decoy", // matches prefix '50%' only if % is unescaped
 		"a_b/one",
@@ -717,6 +722,48 @@ func testListReposPrefixFilter(t *testing.T, s Backend) {
 			}
 			if one := urls(res.Repos); res.HasMore || !slices.Equal(one, tc.want) {
 				t.Errorf("single page prefix=%q q=%q -> %v (HasMore=%v), want %v", tc.prefix, tc.q, one, res.HasMore, tc.want)
+			}
+		})
+	}
+}
+
+func TestListReposLongFilters(t *testing.T) { runBackends(t, testListReposLongFilters) }
+
+// testListReposLongFilters pins q and prefix of any length: SQLite refuses
+// a LIKE pattern over 50,000 bytes (SQLITE_MAX_LIKE_PATTERN_LENGTH), and
+// an escaped `%` takes two of them.
+func testListReposLongFilters(t *testing.T, s Backend) {
+	ctx := t.Context()
+	org := seedOrg(t, s)
+	percents := strings.Repeat("%", 30_000)
+	long := "acme/" + percents + "/end"
+	for _, url := range []string{"acme/alpha", long} {
+		if _, err := s.CreateRepo(ctx, org, url, "main"); err != nil {
+			t.Fatalf("create %.40s: %v", url, err)
+		}
+	}
+	for _, tc := range []struct {
+		name, prefix, q string
+		want            []string
+	}{
+		{"q of 200 KiB", "", strings.Repeat("a", 200<<10), nil},
+		{"prefix of 200 KiB", strings.Repeat("a", 200<<10), "", nil},
+		{"q of 30,000 percent signs", "", percents, []string{long}},
+		{"q one percent sign longer", "", percents + "%", nil},
+		{"prefix of 30,000 percent signs and q", "acme/" + percents, "END", []string{long}},
+		{"q inside a long prefix", "acme/" + percents, "%", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := s.ListRepos(ctx, org, ListParams{Q: tc.q, Prefix: tc.prefix, Limit: 10})
+			if err != nil {
+				t.Fatalf("list: %.300v", err)
+			}
+			got := make([]string, 0, len(res.Repos))
+			for _, r := range res.Repos {
+				got = append(got, r.URL)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("prefix %d bytes, q %d bytes: got %d repos, want %d", len(tc.prefix), len(tc.q), len(got), len(tc.want))
 			}
 		})
 	}
