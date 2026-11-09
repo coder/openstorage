@@ -45,7 +45,7 @@ func Blame(ctx context.Context, repoPath, commit, path string, ranges []string, 
 		args = append(args, "-M")
 	}
 	args = append(args, commit, "--", path)
-	out, err := runGit(ctx, Heavy, repoPath, args...)
+	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Env: noTreeAttrsEnv(), Args: args})
 	if err == nil {
 		return parseBlamePorcelain(out)
 	}
