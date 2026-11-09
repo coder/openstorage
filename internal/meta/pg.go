@@ -615,8 +615,7 @@ func escapeLike(s string) string {
 // prefix at the start, which consumes exactly the prefix's characters, so q
 // can only match the rest of the url after it.
 func listURLPattern(p ListParams) string {
-	assertf(p.Q == strings.TrimSpace(p.Q) && p.Prefix == strings.TrimSpace(p.Prefix),
-		"ListRepos: untrimmed filters q=%q prefix=%q", p.Q, p.Prefix)
+	assertListFilters(p)
 	if p.Q == "" && p.Prefix == "" {
 		return ""
 	}
@@ -638,24 +637,10 @@ func (s *PG) ListRepos(ctx context.Context, org string, params ListParams) (List
 	if err != nil {
 		return ListResult{}, err
 	}
-
-	sql := `SELECT ` + repoCols + ` FROM repos WHERE org_id = $1 AND deleted_at IS NULL`
-	args := []any{orgID}
-	if pattern := listURLPattern(params); pattern != "" {
-		args = append(args, pattern)
-		sql += fmt.Sprintf(` AND url ILIKE $%d`, len(args))
+	sql, args, err := pgListReposQuery(orgID, params)
+	if err != nil {
+		return ListResult{}, err
 	}
-	if params.Cursor != "" {
-		createdAt, repoID, err := decodeCursor(params.Cursor)
-		if err != nil {
-			return ListResult{}, err
-		}
-		args = append(args, createdAt, repoID)
-		sql += fmt.Sprintf(` AND (created_at, repo_id) < ($%d, $%d)`, len(args)-1, len(args))
-	}
-	// Fetch one extra row to compute HasMore without a second query.
-	args = append(args, params.Limit+1)
-	sql += fmt.Sprintf(` ORDER BY created_at DESC, repo_id DESC LIMIT $%d`, len(args))
 
 	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
@@ -683,4 +668,35 @@ func (s *PG) ListRepos(ctx context.Context, org string, params ListParams) (List
 		res.HasMore = true
 	}
 	return res, nil
+}
+
+// pgListReposQuery returns the ListRepos SQL for one page and its
+// arguments.
+//
+// The url filter gives the answers of `url ILIKE p`, which matches
+// lower(url) against lower(p) as LIKE does (like.c, Generic_Text_IC_like).
+// ILIKE itself lowers p again for every row it tests in a multibyte
+// database, so a long q or prefix cost rows × its length. The scalar
+// subquery is an InitPlan: it lowers p once per query, in custom and
+// generic plans alike.
+func pgListReposQuery(orgID int64, params ListParams) (string, []any, error) {
+	assertf(orgID > 0, "pgListReposQuery: non-positive org id %d", orgID)
+	sql := `SELECT ` + repoCols + ` FROM repos WHERE org_id = $1 AND deleted_at IS NULL`
+	args := []any{orgID}
+	if pattern := listURLPattern(params); pattern != "" {
+		args = append(args, pattern)
+		sql += fmt.Sprintf(` AND lower(url) LIKE (SELECT lower($%d::text))`, len(args))
+	}
+	if params.Cursor != "" {
+		createdAt, repoID, err := decodeCursor(params.Cursor)
+		if err != nil {
+			return "", nil, err
+		}
+		args = append(args, createdAt, repoID)
+		sql += fmt.Sprintf(` AND (created_at, repo_id) < ($%d, $%d)`, len(args)-1, len(args))
+	}
+	// Fetch one extra row to compute HasMore without a second query.
+	args = append(args, params.Limit+1)
+	sql += fmt.Sprintf(` ORDER BY created_at DESC, repo_id DESC LIMIT $%d`, len(args))
+	return sql, args, nil
 }
