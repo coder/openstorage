@@ -16,8 +16,10 @@ import (
 // lowers q and prefix once per query, not once per row. `url ILIKE p`
 // lowered p for every row it tested, so a 200 KiB q over 3,100 repos held
 // a PostgreSQL backend for seconds. The generic plan is the one that
-// pgx's statement cache can run: its per-row filter must not read p, and
-// an InitPlan must lower it once.
+// pgx's statement cache can run: its per-row filter must not read p, an
+// InitPlan must lower it once, and the filter must be LIKE (`~~`) on
+// lower(url). ILIKE (`~~*`) lowers its pattern again for each row, even
+// when an InitPlan computes that pattern.
 func TestPGListReposLowersFilterOnce(t *testing.T) {
 	s, ok := pgBackend(t).(*PG)
 	if !ok {
@@ -55,6 +57,11 @@ func TestPGListReposLowersFilterOnce(t *testing.T) {
 	}
 	if !strings.Contains(plan.String(), "InitPlan") || pattern.MatchString(plan.String()) {
 		t.Fatalf("want the pattern ($%d) lowered once in an InitPlan and never read per row:\n%s", i+1, plan.String())
+	}
+	// PostgreSQL 16 prints the InitPlan's result as `$0`, and 17 and later
+	// as `(InitPlan 1).col1`, so match only the operator and its left side.
+	if !strings.Contains(plan.String(), "lower(url) ~~ ") || strings.Contains(plan.String(), "~~*") {
+		t.Fatalf("want the filter `lower(url) ~~ <InitPlan>`, and no ILIKE (~~*), which lowers its pattern per row:\n%s", plan.String())
 	}
 }
 
