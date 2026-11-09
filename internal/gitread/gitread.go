@@ -141,6 +141,23 @@ func ResolveRef(ctx context.Context, repoPath, spec string, ephemeral bool) (str
 		candidates = append(candidates, hex)
 	}
 	for _, cand := range candidates {
+		if hexRevRe.MatchString(cand) && !ref.ValidSHA(cand) {
+			// An abbreviation peels first, as on main: when a commit
+			// shares it with a blob or a tree, only <abbrev>^{commit}
+			// picks the commit, and the plain name is ambiguous. On exit
+			// 1, the plain lookup below still reads a tag whose commit
+			// git cannot read.
+			out, err := runGit(ctx, Light, repoPath, "rev-parse", "--verify", "--quiet", "--end-of-options", cand+"^{commit}")
+			if err == nil {
+				sha := strings.TrimSpace(out)
+				if !ref.ValidSHA(sha) {
+					return "", fmt.Errorf("rev-parse %q emitted %q", cand+"^{commit}", out)
+				}
+				return sha, nil
+			} else if !gitSaidNo(err) {
+				return "", err
+			}
+		}
 		// No peel: rev-parse reads a ref's value even when its object is
 		// missing, and exits 1 only for a name that does not resolve.
 		// Each lookup reads one name, never a ref directory listing.

@@ -2,6 +2,8 @@ package gitread
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -34,6 +36,8 @@ func TestResolveRefOnlyExitOneIsNotFound(t *testing.T) {
 		{"rev-parse", noObject, "exit 1", "exit 1", true},
 		{"rev-parse", noObject, "exit 128", "echo 'fatal: bad' >&2; exit 128", false},
 		{"rev-parse", noObject, "SIGKILL", "kill -KILL $$", false},
+		{"rev-parse", noObject, "peel exits 128", "case \"$*\" in *'^{commit}') exit 128;; esac", false},
+		{"rev-parse", noObject, "peel is killed", "case \"$*\" in *'^{commit}') kill -KILL $$;; esac", false},
 	} {
 		t.Run(tc.sub+"/"+tc.name, func(t *testing.T) {
 			fakeGit(t, "if [ \"$1\" = "+tc.sub+" ]; then "+tc.sh+"; fi\nexec '"+realGit+"' \"$@\"")
@@ -145,7 +149,7 @@ func TestResolveCommitObjectGitFailures(t *testing.T) {
 		{"batch-check exits 128", "main", "exit 128"},
 		{"batch-check is killed", "main", "kill -KILL $$"},
 		{"batch-check for a full id exits 128", f.c1, "exit 128"},
-		{"batch-check for an abbreviation exits 128", f.c1[:12], "exit 128"},
+		{"batch-check for an abbreviation exits 128", tree[:12], "exit 128"}, // a commit's abbreviation peels without it
 		{"batch-check answers for another object", "main", "printf '%s' " + q(tree+" tree\n"+f.c1+" commit\n"+tree+" tree\n")},
 		{"no batch answer", "main", "exit 0"},
 		{"invalid peel answer", "main", "printf '%s' " + q(f.c2+" commit\nzz commit\n"+f.c2+" commit\n")},
@@ -167,7 +171,9 @@ func TestResolveCommitObjectGitFailures(t *testing.T) {
 
 // ResolveRef reads one candidate at a time with rev-parse (no peel, so
 // a ref's missing object still resolves), and the object's type and peel
-// with one batch-check. Each read below takes at most main's git runs.
+// with one batch-check. An abbreviation peels first, as on main. Each
+// read that finds a commit takes at most main's git runs. An
+// abbreviation of a blob takes one run more than on main.
 func TestResolveRefGitRuns(t *testing.T) {
 	f := newFixture(t)
 	realGit, err := exec.LookPath("git")
@@ -185,9 +191,9 @@ func TestResolveRefGitRuns(t *testing.T) {
 		{"tag", "v1", 3, 3, true},
 		{"full id", f.c1, 4, 4, true},
 		{"unknown name", "nope", 2, 3, false},
-		{"abbreviation of a commit", f.c1[:12], 4, 4, true},
+		{"abbreviation of a commit", f.c1[:12], 3, 4, true},
 		{"tree id", tree, 4, 4, false},
-		{"abbreviation of a blob", blob[:12], 4, 4, false},
+		{"abbreviation of a blob", blob[:12], 5, 4, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			log := filepath.Join(t.TempDir(), "runs")
@@ -199,7 +205,7 @@ func TestResolveRefGitRuns(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n := strings.Count(string(got), "\n"); n != tc.runs || n > tc.main {
+			if n := strings.Count(string(got), "\n"); n != tc.runs || (tc.found && n > tc.main) {
 				t.Fatalf("ResolveRef(%s) ran git %d times (%q), want %d (main ran %d)", tc.spec, n, got, tc.runs, tc.main)
 			}
 		})
@@ -266,6 +272,37 @@ func TestResolveRefAmbiguousAbbreviationIsNotFound(t *testing.T) {
 	}
 	if sha, err := ResolveRef(context.Background(), dir, prefix, false); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ResolveRef(%s) = (%q, %v), want ErrNotFound", prefix, sha, err)
+	}
+}
+
+// A commit and a blob share a 4-character prefix. Without a peel git
+// calls the prefix ambiguous, and only <prefix>^{commit} names the
+// commit: the prefix resolves to the commit, as on main. Two blobs that
+// share a prefix stay not found (above).
+func TestResolveRefAbbreviationSharedWithABlob(t *testing.T) {
+	f := newFixture(t)
+	for i := 0; ; i++ {
+		content := fmt.Sprintf("blob %d\n", i)
+		sum := sha1.Sum([]byte(fmt.Sprintf("blob %d\x00%s", len(content), content)))
+		id := hex.EncodeToString(sum[:])
+		if id[:4] != f.c1[:4] {
+			continue
+		}
+		writeFile(t, f.dir, "shared.txt", content, 0o644)
+		if got := strings.TrimSpace(mustGit(t, f.dir, "hash-object", "-w", "shared.txt")); got != id {
+			t.Fatalf("hash-object wrote %s, want %s", got, id)
+		}
+		break
+	}
+	cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", f.c1[:4])
+	cmd.Dir, cmd.Env = f.dir, append(os.Environ(), gitEnv...)
+	if out, err := cmd.Output(); !gitSaidNo(err) {
+		t.Fatalf("git rev-parse %s = (%q, %v), want exit 1 for a shared prefix", f.c1[:4], out, err)
+	}
+	for _, spec := range []string{f.c1[:4], f.c1[:12], f.c1} {
+		if sha, err := ResolveRef(context.Background(), f.dir, spec, false); err != nil || sha != f.c1 {
+			t.Errorf("ResolveRef(%s) = (%q, %v), want c1", spec, sha, err)
+		}
 	}
 }
 
@@ -340,7 +377,7 @@ func TestResolveRefKeepsGitDWIM(t *testing.T) {
 func TestResolveRefRevisionSyntaxSkipsGit(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "ran")
 	fakeGit(t, "echo x >> '"+marker+"'\nexit 1")
-	for _, spec := range []string{"refs/r~1", "refs/r^{}", "refs/r:path", "refs/r@{0}", "refs/r..refs/t", "r?", "r*", "[r]", "r\\x", "refs/r\nmain", "refs/r\x01", "refs/r "} {
+	for _, spec := range []string{"refs/r~1", "refs/r^{}", "refs/r:path", "refs/r@{0}", "refs/r..refs/t", "r?", "r*", "[r]", "r\\x", "refs/r\nmain", "refs/r\x01", "refs/r\x7f", "refs/r "} {
 		if _, err := ResolveRef(context.Background(), t.TempDir(), spec, false); !errors.Is(err, ErrNotFound) {
 			t.Errorf("ResolveRef(%q): %v, want ErrNotFound", spec, err)
 		}
