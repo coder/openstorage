@@ -25,6 +25,7 @@ The metadata store: orgs, public and signing keys, repos, webhooks, git credenti
 - An unknown `create_state` maps to legacy, which is never treated as complete [meta.go:knownCreateState]
 - Repo inserts map an `(org, url)` unique violation to `ErrAlreadyExists`, including soft-deleted rows [pg.go:pgInsertRepo] [sqlite.go:insertRepo]
 - `ListRepos` asserts limit in [1, 100]; `decodeCursor` maps any malformed cursor to `ErrInvalidCursor` [pg.go:ListRepos] [cursor.go:decodeCursor]
+- Postgres `ListRepos` lowers the `q` and `prefix` pattern once per query in an InitPlan, not once per row, and gives the answers of `url ILIKE` [pg.go:pgListReposQuery]
 - `SoftDeleteRepo` returns `ErrAlreadyDeleted` for a deleted row and `ErrNotFound` for an absent one [pg.go:SoftDeleteRepo]
 - Credentials and upstreams attach only to live repos; a second one per repo is `ErrAlreadyExists` [pg_eventing.go:createGitCredential]
 - `TryBeginSync`/`TryBeginPush` refuse unexpired claims; finish and restore match only the caller's holder; a miss returns `ErrClaimLost` when a different holder owns the lane, else `ErrNotFound` (no run in flight, or upstream detached) [pg_eventing.go:FinishSync] [pg_eventing.go:classifyGuardMiss] [sqlite_eventing.go:FinishSync]
