@@ -34,9 +34,22 @@ func TestRepoClaimWithNUL(t *testing.T) {
 			t.Fatalf("POST fork form = %d (%s), want 400", resp.StatusCode, body)
 		}
 		// The claim check runs before the fork dispatch, not only in the
-		// fallback creator: the fork form gets the same detail.
+		// fallback creator: the fork and copy forms get the same detail.
 		if msg := requireEnvelope(t, resp, body); msg != "invalid repo claim (want UTF-8 text without NUL)" {
 			t.Fatalf("POST fork form detail = %q", msg)
+		}
+		resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos", write,
+			[]byte(`{"base_repo": {"name": "x", "auth": {"token": "t"}}}`), "")
+		if msg := requireEnvelope(t, resp, body); resp.StatusCode != http.StatusBadRequest ||
+			msg != "invalid repo claim (want UTF-8 text without NUL)" {
+			t.Fatalf("POST copy form = %d %q, want 400 with the claim detail", resp.StatusCode, msg)
+		}
+
+		// Valid text with control characters and non-ASCII still creates.
+		odd := e.mint(t, tokenSpec{iss: org, repo: "team/c\x01\x7fé\uFFFD", scopes: []string{auth.ScopeRepoWrite}})
+		resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos", odd, nil, "")
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("POST with an unusual valid claim = %d (%s), want 201", resp.StatusCode, body)
 		}
 
 		for _, rq := range []struct{ method, path, tok string }{
