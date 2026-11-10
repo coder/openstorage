@@ -157,9 +157,8 @@ func (s unionKeySource) PublicKeysForOrg(ctx context.Context, name string) ([]st
 
 // Verify authenticates a compact JWT per the Verifier contract: allowed
 // algorithm, valid signature for one of the issuer's registered keys,
-// `exp` in the future, a non-empty `sub`, a `repo` without a NUL. Any
-// failure returns an error. A token without a `repo` claim verifies with
-// Repo == RepoClaimOrg.
+// `exp` in the future, a non-empty `sub`. Any failure returns an error. A
+// token without a `repo` claim verifies with Repo == RepoClaimOrg.
 func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, error) {
 	// Bearer tokens are compact JWS only; rejecting other serializations up
 	// front keeps the single-signature/protected-header assumptions below.
@@ -277,19 +276,12 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 // non-empty value passes and nothing may treat it as an identity. `iat` is
 // carried but intentionally not validated — docs/reference/authentication.md
 // imposes no requirement on it and clock skew would break SDKs.
-//
-// A `repo` with a NUL is refused: PostgreSQL cannot store such text, so a
-// create with one answered 500 there, and no new repository gets such a
-// url on any backend. json.Unmarshal already made it valid UTF-8.
 func validateClaims(c *Claims) error {
 	if c.Exp <= time.Now().Unix() {
 		return errors.New("jwt expired")
 	}
 	if c.Sub == "" {
 		return errors.New("jwt missing sub claim")
-	}
-	if strings.ContainsRune(c.Repo, 0) {
-		return errors.New("jwt repo claim has a NUL character")
 	}
 	return nil
 }

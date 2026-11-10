@@ -6,7 +6,7 @@ import (
 )
 
 // TestPGRepoLookupsRefuseInvalidTextWithoutQuery pins that PostgreSQL's
-// GetRepoByURL and GetRepoByID answer ErrNotFound for a key that ValidText
+// GetRepoByURL, GetRepoByID and SoftDeleteRepo answer ErrNotFound for a key that ValidText
 // refuses before they touch the database: on a closed store any query
 // fails with another error.
 func TestPGRepoLookupsRefuseInvalidTextWithoutQuery(t *testing.T) {
@@ -22,6 +22,9 @@ func TestPGRepoLookupsRefuseInvalidTextWithoutQuery(t *testing.T) {
 		}
 		if _, err := s.GetRepoByID(t.Context(), "org", key); !errors.Is(err, ErrNotFound) {
 			t.Errorf("GetRepoByID(%q) on a closed store: err = %v, want ErrNotFound", key, err)
+		}
+		if _, err := s.SoftDeleteRepo(t.Context(), "org", key); !errors.Is(err, ErrNotFound) {
+			t.Errorf("SoftDeleteRepo(%q) on a closed store: err = %v, want ErrNotFound", key, err)
 		}
 	}
 	if _, err := s.GetRepoByURL(t.Context(), "org", "team/ok"); err == nil || errors.Is(err, ErrNotFound) {

@@ -88,17 +88,15 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
 ```
 
 - `repo` carries the repository **url** value (what `GET /api/repo-urls/{repo_id}` returns).
+- A `repo` that holds a NUL byte names no new repository: `POST /repos` answers `400`
+  (`invalid repo claim (want UTF-8 text without NUL)`). PostgreSQL cannot store such
+  text, so there the repository endpoints answer `404` for such a claim, and the git
+  surface `403`, as for any claim that names no repository. A repository that SQLite
+  or S3-WAL created for such a claim before this check keeps working.
 - A token with no `repo` claim is org-wide and behaves exactly like `repo: "org"`:
   org-scoped endpoints accept it, and repository endpoints and the git surface refuse it
   with `403`. A `repo` that is present but empty (`""` or `null`) is not org-wide: every
   endpoint refuses it with `403`.
-- A `repo` that holds a NUL byte fails verification on every backend
-  ([failure mapping](#failure-mapping)). PostgreSQL cannot store such text. Before
-  this rule, SQLite and S3-WAL created a repository for such a claim. That repository
-  stays listed. A token whose `repo` is its `repo_id` still reaches it on the git
-  surface and on REST routes that resolve the claim by id, such as branches. `GET
-  /repo`, delete, diff, branch diff, blame, grep and archive look the repository up
-  by the claim's url, so they cannot reach it.
 - `sub` is a free-text label that the signer picks ("Agent identity (for logging)" in the
   [upstream guide](../upstream/getting-started/authentication.md)). Any non-empty string
   verifies, and a token with an empty or missing `sub` fails verification. It grants nothing, and open.storage

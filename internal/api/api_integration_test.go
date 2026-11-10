@@ -834,12 +834,6 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 				wantDetail: "Invalid or expired token",
 			},
 			{
-				name:       "repo claim with a NUL",
-				token:      e.mint(t, tokenSpec{iss: org, repo: claim + "\x00x", scopes: goodScopes}),
-				wantStatus: http.StatusForbidden,
-				wantDetail: "Invalid or expired token",
-			},
-			{
 				name:       "missing required scope",
 				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: []string{auth.ScopeGitWrite}}),
 				wantStatus: http.StatusForbidden,

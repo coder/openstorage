@@ -51,6 +51,13 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 	assertf(verifier != nil, "forkAwareCreateRepo: nil verifier")
 	assertf(fallback != nil, "forkAwareCreateRepo: nil fallback")
 	return func(w http.ResponseWriter, r *http.Request) {
+		// The repo claim becomes the new repository's url. PostgreSQL
+		// cannot store a NUL there (SQLSTATE 22021), so no backend may
+		// create one. JSON decoding already made the claim valid UTF-8.
+		if !meta.ValidText(mustClaims(r).Repo) {
+			writeErr(w, http.StatusBadRequest, "invalid repo claim (want UTF-8 text without NUL)")
+			return
+		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 		if err != nil {
 			// The body is consumed and cannot be replayed; answer with the

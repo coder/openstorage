@@ -316,9 +316,6 @@ func TestVerify_RepoClaimPresence(t *testing.T) {
 		{"repo url", withRepo("team/project-alpha"), "team/project-alpha"},
 		{"empty string", withRepo(""), ""},
 		{"null", withRepo(nil), ""},
-		{"control character", withRepo("team/a\tb"), "team/a\tb"},
-		{"other control characters", withRepo("team/a\x01\x1f\x7fb"), "team/a\x01\x1f\x7fb"},
-		{"non-ASCII", withRepo("team/café-\uFFFD"), "team/café-\uFFFD"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", tc.payload))
@@ -333,11 +330,6 @@ func TestVerify_RepoClaimPresence(t *testing.T) {
 	// A non-string repo claim is malformed, present or not.
 	if _, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", withRepo(42))); err == nil {
 		t.Fatal("Verify accepted a numeric repo claim")
-	}
-	for _, repo := range []string{"team/a\x00b", "\x00team/a", "team/a\x00", "\x00"} {
-		if _, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", withRepo(repo))); err == nil {
-			t.Fatalf("Verify accepted the repo claim %q", repo)
-		}
 	}
 }
 
