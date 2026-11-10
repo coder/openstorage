@@ -126,7 +126,9 @@ func validateSyncBaseRepo(spec *usyncBaseRepo) (host string, err error) {
 		[2]string{"base_repo.owner", spec.Owner}, [2]string{"base_repo.name", spec.Name}); err != nil {
 		return "", err
 	}
-	// Owner, name and token are stored (PostgreSQL refuses a NUL byte).
+	// Owner, name and token are stored, and PostgreSQL refuses a NUL in a
+	// text value (the token reaches it encrypted only when a secrets key is
+	// set). Every backend refuses such a value alike.
 	token := ""
 	if spec.Auth != nil {
 		token = spec.Auth.Token
@@ -697,8 +699,9 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	// The ref rides in the sync job's JSON arguments, which PostgreSQL
-	// stores as jsonb: it refuses a NUL byte there.
+	// The ref rides in the sync job's arguments, which PostgreSQL's River
+	// queue stores as jsonb, and jsonb cannot hold a NUL (SQLSTATE 22P05).
+	// Every backend refuses such a ref alike.
 	if writeInvalidText(w, [2]string{"ref", req.Ref}) {
 		return
 	}
