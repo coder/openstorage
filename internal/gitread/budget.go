@@ -432,8 +432,9 @@ func childEnv(env []string) []string {
 // it (git is always reaped before Run returns). Limit outcomes are
 // returned as ErrBusy, ErrTimeBudget, ErrOutputLimit, or ErrMemoryLimit,
 // and never wrap *exec.ExitError, so exit-status checks cannot mistake them
-// for git's own "no match" or "not found" statuses. Other failures are a
-// *GitError (see there).
+// for git's own "no match" or "not found" statuses. A ctx that ends (the
+// caller gave up) returns ctx's error, also when git was killed for it.
+// Other failures are a *GitError (see there).
 func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
@@ -494,6 +495,11 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	}
 	msg := stderr.String()
 	switch {
+	case ctx.Err() != nil:
+		// The request ended. exec kills git for it, and then reports the
+		// kill ("signal: killed"), not the context: that is no failure of
+		// git's own.
+		return stdout, fmt.Errorf("%s: %w", name, ctx.Err())
 	case out != nil && out.overflow:
 		return stdout, fmt.Errorf("%s: %w", name, ErrOutputLimit)
 	case ctx.Err() == nil && errors.Is(limitCtx.Err(), context.DeadlineExceeded):
@@ -505,7 +511,7 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 }
 
 // GitError is Run's error for a git child that failed on its own (not a
-// limit outcome). It wraps the error of the run: an *exec.ExitError when
+// limit outcome or a canceled request). It wraps the error of the run: an *exec.ExitError when
 // git exited with a status or died of a signal, or the error of a start
 // that failed (exec refused the arguments). It keeps git's stderr. A
 // caller that classifies a failure reads the exit status and Stderr,

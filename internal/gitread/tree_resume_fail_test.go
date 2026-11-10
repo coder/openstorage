@@ -99,7 +99,7 @@ func TestTreeSourceRequestAfterGitEnded(t *testing.T) {
 		"exit":       {`echo "fatal: boom" >&2; exit 3`, false, false, func(err error) bool { return err != nil && !errors.Is(err, errDeclined) }},
 		"heap cap":   {`echo "fatal: Out of memory, malloc failed (tried to allocate 1 bytes)" >&2; exit 128`, true, false, func(err error) bool { return errors.Is(err, ErrMemoryLimit) }},
 		"crash":      {`kill -SEGV $$`, false, false, func(err error) bool { return err != nil && !errors.Is(err, errDeclined) }},
-		"canceled":   {`exec sleep 30`, false, true, func(err error) bool { return errors.Is(err, context.Canceled) }},
+		"canceled":   {`echo ready; exec sleep 30`, false, true, func(err error) bool { return errors.Is(err, context.Canceled) }},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if c.budgeted && !HeapLimitSupported() {
@@ -117,6 +117,11 @@ func TestTreeSourceRequestAfterGitEnded(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = src.close(true) })
 			if c.cancel {
+				// Cancel only once git runs: git is then killed for the
+				// canceled request, and that kill is no git failure.
+				if line, err := src.resp.ReadString('\n'); err != nil || line != "ready\n" {
+					t.Fatalf("git's first line = %q, %v", line, err)
+				}
 				cancel()
 			}
 			_ = src.wait() // git is gone, and so is the reader of its request pipe
