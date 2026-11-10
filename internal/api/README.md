@@ -19,6 +19,7 @@ The REST API (`/api/v1/...`) and its `/api/repos/{repo_name}` alias layer. `New`
 ## Invariants
 - `New` panics when a required dependency is missing and returns an error for a bad cache dir or rate-limit config [api.go:New]
 - `requireAuth` returns 401 for a missing or non-Bearer `Authorization` header, 403 `forbidden` for a token that fails verification, 403 `authentication_unavailable` when the key store fails, and 403 for a wrong org, scope, or repo claim [middleware.go:requireAuth]
+- `forkAwareCreateRepo` answers 400 before any create form runs when the `repo` claim is not `meta.ValidText` [handlers_fork.go:forkAwareCreateRepo]
 - `recoverPanics` re-panics `http.ErrAbortHandler` and otherwise answers 500 [middleware.go:recoverPanics]
 - `newProblem` asserts a 4xx/5xx status and a valid code; `internalErr` never returns raw error text [errors.go:newProblem] [errors.go:internalErr]
 - `writeGitLimitErr` maps `ErrBusy`/`ErrTimeBudget` to 503 and memory, output, or blob limits to 422 [git_budget.go:writeGitLimitErr]
