@@ -186,6 +186,16 @@ func TestAliasNotFound(t *testing.T) {
 		}
 		requireEnvelope(t, resp, body)
 
+		// A path name with a NUL or invalid UTF-8 names no repository: 404,
+		// not the 500 that PostgreSQL's refusal of such text would give.
+		for _, name := range []string{"a%00b", "a%FFb"} {
+			resp, body = e.doReq(t, http.MethodGet, "/api/repos/"+name, fx.token, nil, "")
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("path name %s = %d (%s), want 404", name, resp.StatusCode, body)
+			}
+			requireEnvelope(t, resp, body)
+		}
+
 		// Read route, claim repo != path repo -> 404 error envelope.
 		resp, body = e.doReq(t, http.MethodGet, "/api/repos/"+esc, otherRead, nil, "")
 		if resp.StatusCode != http.StatusNotFound {

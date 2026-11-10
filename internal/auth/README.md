@@ -25,7 +25,7 @@ JWT auth contract for the HTTP API and the git surface. It defines claim types, 
 - `MatchPolicy` returns no match for an empty ref [policy.go:MatchPolicy]
 - `Verify` rejects tokens without exactly two dots, non-canonical base64url segments, and JSON-serialized JWS with other than one signature [verifier.go:Verify]
 - `Verify` accepts only algs in `signatureAlgorithms` and checks the key family matches the alg [verifier.go:keySupportsAlg]
-- `validateClaims` requires `exp` > now and `sub` == `SubjectLiteral`; `iat` is not checked [verifier.go:validateClaims]
+- `validateClaims` requires `exp` > now and a non-empty `sub`; `iat` is not checked [verifier.go:validateClaims]
 - `init` panics if `signatureAlgorithms` and `AllowedAlgorithms` disagree [verifier.go:init]
 - `UnionKeySource` panics on a nil inner source, empty org, no PEMs, or unparseable PEM [verifier.go:UnionKeySource]
 - `Verify` fails closed for an issuer with no keys [verifier.go:Verify]

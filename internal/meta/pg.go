@@ -423,6 +423,10 @@ func pgInsertRepo(ctx context.Context, q pgQueryRower, org string, orgID int64, 
 // absent or soft-deleted.
 func (s *PG) GetRepoByURL(ctx context.Context, org, url string) (Repo, error) {
 	assertf(url != "", "GetRepoByURL: empty url for org %q", org)
+	// PostgreSQL holds no such url and refuses the query (SQLSTATE 22021).
+	if !ValidText(url) {
+		return Repo{}, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return Repo{}, err
@@ -444,6 +448,10 @@ func (s *PG) GetRepoByURL(ctx context.Context, org, url string) (Repo, error) {
 // absent or soft-deleted.
 func (s *PG) GetRepoByID(ctx context.Context, org, repoID string) (Repo, error) {
 	assertf(repoID != "", "GetRepoByID: empty repoID for org %q", org)
+	// PostgreSQL holds no such id and refuses the query (SQLSTATE 22021).
+	if !ValidText(repoID) {
+		return Repo{}, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return Repo{}, err
@@ -513,8 +521,9 @@ func (s *PG) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, n
 // when no row exists; ErrAlreadyDeleted when already soft-deleted.
 func (s *PG) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) {
 	assertf(url != "", "SoftDeleteRepo: empty url for org %q", org)
-	if err := pgUnknownText("repo", url); err != nil {
-		return Repo{}, err
+	// PostgreSQL holds no such url and refuses the query (SQLSTATE 22021).
+	if !ValidText(url) {
+		return Repo{}, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
 	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
