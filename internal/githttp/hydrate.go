@@ -1605,6 +1605,14 @@ const (
 	// another replica, a completed push — forces the healing rescan.
 	// Appends are best-effort O(1): a lost claim only costs coalescing.
 	pushHoldGensSuffix = ".gens"
+	// pushHoldDoneSuffix marks a hold that its push released without the
+	// reservation lock, because the bounded wait for it timed out. Such a
+	// release can miss the hold: a reaper inside its window can have it at
+	// its quarantine name and restore it afterwards. Every refresher of the
+	// hold stops at its next tick once the marker exists, so a missed hold
+	// is touched no more and expires like a crash leak. The reaper and the
+	// orphan cleanup remove the marker with the hold's other sidecars.
+	pushHoldDoneSuffix = ".done"
 )
 
 // maxPushHoldGensBytes hard-caps one hold's claimed-generation sidecar
@@ -1622,7 +1630,22 @@ func isPushHoldSidecar(name string) bool {
 		strings.HasSuffix(name, pushHoldScanSuffix) ||
 		strings.HasSuffix(name, pushHoldReapSuffix) ||
 		strings.HasSuffix(name, pushHoldReleasedSuffix) ||
-		strings.HasSuffix(name, pushHoldGensSuffix)
+		strings.HasSuffix(name, pushHoldGensSuffix) ||
+		strings.HasSuffix(name, pushHoldDoneSuffix)
+}
+
+// lockPushHoldReservations takes the reservation lock of holdPath's
+// directory, waiting at most pushHoldWaitMax like a reservation does: a
+// process that holds the lock longer, such as a stopped reserver, must not
+// hang a push or ref write that is done with its hold.
+func lockPushHoldReservations(holdPath string) (unlock func(), err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pushHoldWaitMax)
+	defer cancel()
+	unlock, err = flockExclusiveCtx(ctx, filepath.Dir(holdPath)+".reserve.lock")
+	if err != nil {
+		return nil, fmt.Errorf("push hold: reservation lock: %w", err)
+	}
+	return unlock, nil
 }
 
 // removePushHoldFiles releases a push's hold file together with every
@@ -1642,35 +1665,33 @@ func removePushHoldFiles(holdPath string) {
 	// (removing the restored hold, or a no-op if the reaper unlinked).
 	// Best-effort like the removals below: without the lock the TTL
 	// machinery remains the bound.
-	if lock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock"); err == nil {
+	//
+	// The wait is bounded (lockPushHoldReservations), and a lock this
+	// release could not take in time is like one it could not take at
+	// all: it removes the files without it. Leaving them would let
+	// serve's handler refresher, which runs until the request ends, keep
+	// a released hold live for as long as a non-reading client stalls the
+	// response. Without the lock, a reaper can be inside its window on
+	// this very hold, at its ".reaping" name, and its restore can bring
+	// the hold back after this removal. So the release first leaves the
+	// pushHoldDoneSuffix marker: every refresher of the hold stops at its
+	// next tick, and a restored hold expires like a crash leak however
+	// many reapers interleave.
+	lock, err := lockPushHoldReservations(holdPath)
+	locked := err == nil
+	names := []string{holdPath}
+	if locked {
 		defer lock()
+	} else {
+		if f, err := os.OpenFile(holdPath+pushHoldDoneSuffix, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+			_ = f.Close()
+		}
+		names = append(names, holdPath+".reaping")
 	}
-	if _, err := os.Lstat(holdPath); err == nil {
-		// Bump only when a hold FILE is actually being removed (Codex
-		// round-33 security P2): every receive-pack mints a hold PATH,
-		// but rejected or malformed RPCs may never create the file, and
-		// this release still runs for them — an unconditional bump would
-		// let each tiny denied push invalidate the held-generation fast
-		// path and re-buy the full pack listing and ref paging under the
-		// hydrate lock for a live hold set that never changed. A
-		// never-created hold was never in any fingerprint listing, and
-		// sidecars are excluded from it.
-		//
-		// And bump BEFORE removing (Codex round-34 P2): a hold whose
-		// fail-closed create bump failed is visible with an UNCHANGED
-		// epoch, so letting this cleanup remove it with its own bump
-		// failing for the same cause would complete a transient lifecycle
-		// both fingerprint components are blind to — a hydration spanning
-		// it could publish a held marker for a set that changed mid-scan.
-		// A hold file therefore never transitions visible→absent without
-		// a successful epoch bump: on failure everything stays (the file
-		// keeps marking the fingerprint), and the TTL reap — which
-		// enforces the same bump-first rule — retires it once the epoch
-		// is writable again.
-		if bumpPushHoldEpoch(filepath.Dir(holdPath)) != nil {
+	for _, name := range names {
+		if !removeHoldFile(name) {
 			return
 		}
-		_ = os.Remove(holdPath)
 	}
 	_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
 	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
@@ -1678,6 +1699,47 @@ func removePushHoldFiles(holdPath string) {
 	_ = os.Remove(holdPath + pushHoldReapSuffix)
 	_ = os.Remove(holdPath + pushHoldReleasedSuffix)
 	_ = os.Remove(holdPath + pushHoldGensSuffix)
+	// Under the lock no reaper is inside its window, so the hold is gone
+	// for good and an earlier release's marker can go too. Without it the
+	// marker stays for the reaper or the orphan cleanup.
+	if locked {
+		_ = os.Remove(holdPath + pushHoldDoneSuffix)
+	}
+}
+
+// removeHoldFile removes the hold file at name, if there is one, after it
+// bumps the hold directory's epoch. It reports false when the bump failed
+// and the file stays.
+func removeHoldFile(name string) bool {
+	if _, err := os.Lstat(name); err != nil {
+		return true
+	}
+	// Bump only when a hold FILE is actually being removed (Codex
+	// round-33 security P2): every receive-pack mints a hold PATH,
+	// but rejected or malformed RPCs may never create the file, and
+	// this release still runs for them — an unconditional bump would
+	// let each tiny denied push invalidate the held-generation fast
+	// path and re-buy the full pack listing and ref paging under the
+	// hydrate lock for a live hold set that never changed. A
+	// never-created hold was never in any fingerprint listing, and
+	// sidecars are excluded from it.
+	//
+	// And bump BEFORE removing (Codex round-34 P2): a hold whose
+	// fail-closed create bump failed is visible with an UNCHANGED
+	// epoch, so letting this cleanup remove it with its own bump
+	// failing for the same cause would complete a transient lifecycle
+	// both fingerprint components are blind to — a hydration spanning
+	// it could publish a held marker for a set that changed mid-scan.
+	// A hold file therefore never transitions visible→absent without
+	// a successful epoch bump: on failure everything stays (the file
+	// keeps marking the fingerprint), and the TTL reap — which
+	// enforces the same bump-first rule — retires it once the epoch
+	// is writable again.
+	if bumpPushHoldEpoch(filepath.Dir(name)) != nil {
+		return false
+	}
+	_ = os.Remove(name)
+	return true
 }
 
 // pushHoldLive reports whether one hold-file observation counts as live,
@@ -2075,11 +2137,12 @@ func reapExpiredPushHold(path string, observed time.Time) {
 	_ = os.Remove(path + pushHoldReapSuffix)
 	_ = os.Remove(path + pushHoldReleasedSuffix)
 	_ = os.Remove(path + pushHoldGensSuffix)
+	_ = os.Remove(path + pushHoldDoneSuffix)
 }
 
 // pushHoldSidecarBase maps a sidecar entry name to its hold file's name.
 func pushHoldSidecarBase(name string) (string, bool) {
-	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix, pushHoldReleasedSuffix, pushHoldGensSuffix} {
+	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix, pushHoldReleasedSuffix, pushHoldGensSuffix, pushHoldDoneSuffix} {
 		if base, ok := strings.CutSuffix(name, suffix); ok {
 			return base, true
 		}
@@ -2182,11 +2245,12 @@ func touchPushHold(holdPath string) {
 }
 
 // startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
-// returned stop function runs (or the hook process dies — exactly the
-// condition the TTL is meant to detect). The first touch is synchronous
-// (Codex round-5 P2 on #173): a sequence of hooks each shorter than one
-// ticker period would otherwise never touch the file at all, and a push
-// whose hook phase outlives the TTL would lose its hold mid-flight.
+// returned stop function runs, a release leaves the pushHoldDoneSuffix
+// marker, or the hook process dies (exactly the condition the TTL is meant
+// to detect). The first touch is synchronous (Codex round-5 P2 on #173): a
+// sequence of hooks each shorter than one ticker period would otherwise
+// never touch the file at all, and a push whose hook phase outlives the
+// TTL would lose its hold mid-flight.
 func startPushHoldRefresh(holdPath string) (stop func()) {
 	// Touches land on the INODE, not just the path (Codex round-31 P2 on
 	// #173): the expiry reaper quarantines an expired-verdict hold by
@@ -2199,7 +2263,25 @@ func startPushHoldRefresh(holdPath string) (stop func()) {
 	// unlink and restores the hold. The fd is opened lazily: the server's
 	// refresher starts before the reservation creates the file.
 	var f *os.File
+	released := false
 	touch := func() {
+		if released {
+			return
+		}
+		// A release that could not take the reservation lock left the
+		// pushHoldDoneSuffix marker, and its removal can have missed the
+		// hold. Stop for good: close the fd, which drops the shared lock,
+		// and touch nothing, so the reaper can take the hold once it
+		// expires. Only a marker the stat finds stops it: on a stat
+		// error the refresher goes on, so a live push keeps its hold.
+		if _, err := os.Lstat(holdPath + pushHoldDoneSuffix); err == nil {
+			released = true
+			if f != nil {
+				_ = f.Close()
+				f = nil
+			}
+			return
+		}
 		if f != nil {
 			// A removePushHolds rewrite replaces the inode (temp +
 			// rename): detect the orphan and re-point at the current
@@ -3065,7 +3147,7 @@ func removePushHolds(holdPath string, names []string) error {
 	for _, name := range names {
 		drop[name] = true
 	}
-	unlock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock")
+	unlock, err := lockPushHoldReservations(holdPath)
 	if err != nil {
 		return err
 	}
@@ -3153,7 +3235,7 @@ func appendPushReleased(holdPath string, names []string) error {
 	// strictly before the window or strictly after its outcome; a
 	// crash-stranded quarantine (its flock died with its process) still
 	// satisfies the second stat.
-	unlock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock")
+	unlock, err := lockPushHoldReservations(holdPath)
 	if err != nil {
 		return err
 	}
