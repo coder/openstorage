@@ -33,6 +33,11 @@ func TestRepoClaimWithNUL(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("POST fork form = %d (%s), want 400", resp.StatusCode, body)
 		}
+		// The claim check runs before the fork dispatch, not only in the
+		// fallback creator: the fork form gets the same detail.
+		if msg := requireEnvelope(t, resp, body); msg != "invalid repo claim (want UTF-8 text without NUL)" {
+			t.Fatalf("POST fork form detail = %q", msg)
+		}
 
 		for _, rq := range []struct{ method, path, tok string }{
 			{http.MethodGet, "/api/v1/repo", read},
