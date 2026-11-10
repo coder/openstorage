@@ -548,7 +548,7 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 | `POST /repos/notes` | git:write | `{object_ref (deprecated alias sha), action: "add"\|"append" (deprecated upstream), note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}` → `{sha, notes_ref, target_ref (deprecated mirror), base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
 | `POST /api/repos/{repo_name}/notes/append` | git:write | Path style only (spec 2026-10-05). `{object_ref (deprecated alias sha), note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}`, decoded strictly: `action`, any unknown field, or a `null` → 400. Appends, or creates the note when the object has none → **201** with the same envelope. A stale guard → 409 `ref_guard_failed` and nothing is appended |
 | `DELETE /repos/notes` | git:write | Query `object_ref`, `notes_ref?`, `expected_notes_ref_sha?`. The deprecated body `{object_ref (deprecated alias sha), notes_ref?, expected_notes_ref_sha?, author?}` still works; a query parameter that is present wins over its body field, even when empty → same envelope |
-| `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. 400 if custom notes refs disabled server-side |
+| `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. A bare `prefix` goes under `refs/notes/`. A `prefix` that starts with `refs/` but not with `refs/notes/` is a 400 |
 
 - Default notes ref: `refs/notes/commits`. Bare names resolve to `refs/notes/<name>`.
 - `object_ref`: a full object SHA (commit, tree, blob, or annotated tag), or a branch,
@@ -729,7 +729,7 @@ Other limits and gaps:
 | 200/201 | success (201 accepted by SDKs on create endpoints) |
 | 202 | pull-upstream / push-upstream accepted |
 | 206/304/412/416 | file conditional/range results (passed through) |
-| 400 | invalid input, a `diff-commit` patch over 262144000 bytes among them ([streaming protocols](../explanation/streaming-commit-protocols.md)); also "custom notes refs not enabled" |
+| 400 | invalid input, a `diff-commit` patch over 262144000 bytes among them ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 401 | no `Authorization` header, or a scheme other than `Bearer` (`Authentication required`) |
 | 403 | a token that fails verification (`Invalid or expired token`); permission or ref-policy denied; `authentication_unavailable` when the key store fails (retry) ([failure mapping](authentication.md#failure-mapping)) |
 | 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`) |
