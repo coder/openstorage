@@ -144,6 +144,9 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 		writeInvalidField(w, "password", "is required", "password is required")
 		return
 	}
+	if writeInvalidText(w, [2]string{"username", req.Username}, [2]string{"password", req.Password}) {
+		return
+	}
 	repoKey := req.RepoID
 	if repoKey == "" {
 		repoKey = claims.Repo
@@ -232,6 +235,9 @@ func (s *syncServer) handleUpdateCredential(w http.ResponseWriter, r *http.Reque
 	}
 	if req.Password == "" {
 		writeInvalidField(w, "password", "is required", "password is required")
+		return
+	}
+	if writeInvalidText(w, [2]string{"username", req.Username}, [2]string{"password", req.Password}) {
 		return
 	}
 	if _, ok := s.gcredForOrg(w, r, claims.Iss, req.ID); !ok {
@@ -389,6 +395,9 @@ func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http
 	}
 	if req.Password == "" {
 		writeInvalidField(w, "password", "is required", "password is required")
+		return
+	}
+	if writeInvalidText(w, [2]string{"username", req.Username}, [2]string{"password", req.Password}) {
 		return
 	}
 	updated, err := s.creds.UpdateCredential(r.Context(), cred.ID, req.Username, req.Password)

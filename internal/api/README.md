@@ -32,6 +32,7 @@ The REST API (`/api/v1/...`) and its `/api/repos/{repo_name}` alias layer. `New`
 - Fork and copy check the source token for `git:read` and the pack size against quota before creating any row [handlers_fork.go:handleForkRepo]
 - `publishPack` denies over-quota packs before upload and fails closed on a second stale usage floor [publish.go:publishPack]
 - `validUpstreamHost` rejects userinfo, query, fragment, and non-http(s) schemes [handlers_sync.go:validUpstreamHost]
+- Text the request asks to store answers 400 on every backend when it holds a NUL byte or invalid UTF-8: a webhook `secret`, a credential `username` and `password`, the `owner`, `name` and `auth.token` of a sync link, and a `pull-upstream` `ref`. A webhook or credential ID like that answers the 404 of an unknown ID [errors.go:invalidTextFields] [handlers_webhooks.go:handleCreate] [handlers_credentials.go:handleCreateCredential] [handlers_sync.go:validateSyncBaseRepo] [handlers_sync.go:parseUpstreamConfig] [handlers_sync.go:handlePullUpstream]
 - `handleDeleteBranch` refuses to delete the default branch in the persistent namespace [handlers_write_refs.go:handleDeleteBranch]
 
 ## Side Effects

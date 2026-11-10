@@ -28,6 +28,7 @@ The metadata store: orgs, public and signing keys, repos, webhooks, git credenti
 - Postgres `ListRepos` lowers the `q` and `prefix` pattern once per query in an InitPlan, not once per row, and gives the answers of `url ILIKE` [pg.go:pgListReposQuery]
 - `SoftDeleteRepo` returns `ErrAlreadyDeleted` for a deleted row and `ErrNotFound` for an absent one [pg.go:SoftDeleteRepo]
 - Credentials and upstreams attach only to live repos; a second one per repo is `ErrAlreadyExists` [pg_eventing.go:createGitCredential]
+- A PostgreSQL lookup, update or delete by an org name, a webhook ID or a credential ID with a NUL byte or invalid UTF-8 answers `ErrNotFound` before the query, as SQLite and S3WAL do; PostgreSQL refuses such a parameter (SQLSTATE 22021). `decodeCursor` maps a repo ID like that to `ErrInvalidCursor` [pg.go:lookupOrgID] [pg_eventing.go:DeleteWebhook] [pg_eventing.go:GitCredentialMeta] [cursor.go:decodeCursor]
 - `TryBeginSync`/`TryBeginPush` refuse unexpired claims; finish and restore match only the caller's holder; a miss returns `ErrClaimLost` when a different holder owns the lane, else `ErrNotFound` (no run in flight, or upstream detached) [pg_eventing.go:FinishSync] [pg_eventing.go:classifyGuardMiss] [sqlite_eventing.go:FinishSync]
 - Push pending levels only coalesce upward; a stolen push claim inherits the force mandate [pg_eventing.go:RequestPush]
 - `PurgeRepoMeta` refuses live repos with `ErrRepoNotDeleted` and keeps the repos row as a name tombstone [purge.go:PurgeRepoMeta]

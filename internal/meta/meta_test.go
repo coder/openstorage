@@ -52,3 +52,29 @@ func TestOpenSchemeDispatch(t *testing.T) {
 	}
 	st.Close()
 }
+
+func TestValidTextRejectsNULAndNonUTF8(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, s string
+		want    bool
+	}{
+		{"empty", "", true},
+		{"ASCII", "acme/alpha", true},
+		{"multi-byte UTF-8", "stra\u00dfe \U0001F600", true},
+		{"U+FFFD", "a\ufffdb", true},
+		{"other control bytes", "a\x01\t\n\x7fb", true},
+		{"NUL", "a\x00b", false},
+		{"only a NUL", "\x00", false},
+		{"a trailing NUL", "ab\x00", false},
+		{"a lone continuation byte", "a\x80b", false},
+		{"a truncated sequence", "a\xe2\x82", false},
+		{"0xff", "\xff", false},
+		{"an encoded surrogate", "\xed\xa0\x80", false},
+		{"an overlong NUL", "\xc0\x80", false},
+	} {
+		if got := ValidText(tc.s); got != tc.want {
+			t.Errorf("%s: ValidText(%q) = %v, want %v", tc.name, tc.s, got, tc.want)
+		}
+	}
+}

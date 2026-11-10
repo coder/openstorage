@@ -199,9 +199,24 @@ func newRepoID() string {
 	return "repo_" + hex.EncodeToString(b[:])
 }
 
+// pgUnknownText returns the ErrNotFound a PostgreSQL lookup answers for a
+// key that is not ValidText, before PostgreSQL sees it: such a key names no
+// row, and PostgreSQL would refuse the parameter (SQLSTATE 22021), which
+// SQLite and S3-WAL never do. what names the key kind in the error text.
+// nil when key is ValidText.
+func pgUnknownText(what, key string) error {
+	if ValidText(key) {
+		return nil
+	}
+	return fmt.Errorf("%s %.80q: %w", what, key, ErrNotFound)
+}
+
 // lookupOrgID resolves an org name to its id; ErrNotFound for unknown orgs.
 func (s *PG) lookupOrgID(ctx context.Context, name string) (int64, error) {
 	assertf(name != "", "lookupOrgID: empty org name")
+	if err := pgUnknownText("org", name); err != nil {
+		return 0, err
+	}
 	var id int64
 	err := s.pool.QueryRow(ctx, `SELECT id FROM orgs WHERE name = $1`, name).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -498,6 +513,9 @@ func (s *PG) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, n
 // when no row exists; ErrAlreadyDeleted when already soft-deleted.
 func (s *PG) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) {
 	assertf(url != "", "SoftDeleteRepo: empty url for org %q", org)
+	if err := pgUnknownText("repo", url); err != nil {
+		return Repo{}, err
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return Repo{}, err

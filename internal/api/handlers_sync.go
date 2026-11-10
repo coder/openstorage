@@ -126,6 +126,15 @@ func validateSyncBaseRepo(spec *usyncBaseRepo) (host string, err error) {
 		[2]string{"base_repo.owner", spec.Owner}, [2]string{"base_repo.name", spec.Name}); err != nil {
 		return "", err
 	}
+	// Owner, name and token are stored (PostgreSQL refuses a NUL byte).
+	token := ""
+	if spec.Auth != nil {
+		token = spec.Auth.Token
+	}
+	if err := invalidTextFields([2]string{"base_repo.owner", spec.Owner}, [2]string{"base_repo.name", spec.Name},
+		[2]string{"base_repo.auth.token", token}); err != nil {
+		return "", err
+	}
 	host = spec.UpstreamHost
 	if host != "" && !validUpstreamHost(host) {
 		return "", newFieldError("base_repo.upstream_host", "is not a valid host", "invalid base_repo upstream_host "+strconv.Quote(spec.UpstreamHost))
@@ -172,6 +181,10 @@ func parseUpstreamConfig(raw json.RawMessage) (spec *usyncBaseRepo, host string,
 	}
 	if err := requiredFields("upstream provider, owner, and name are required",
 		[2]string{"upstream.provider", cfg.Provider}, [2]string{"upstream.owner", cfg.Owner}, [2]string{"upstream.name", cfg.Name}); err != nil {
+		return nil, "", err
+	}
+	// Owner and name are stored (PostgreSQL refuses a NUL byte).
+	if err := invalidTextFields([2]string{"upstream.owner", cfg.Owner}, [2]string{"upstream.name", cfg.Name}); err != nil {
 		return nil, "", err
 	}
 	// ProviderHost knows exactly upstream's UpstreamConfig provider enum;
@@ -683,6 +696,11 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 			return
 		}
+	}
+	// The ref rides in the sync job's JSON arguments, which PostgreSQL
+	// stores as jsonb: it refuses a NUL byte there.
+	if writeInvalidText(w, [2]string{"ref", req.Ref}) {
+		return
 	}
 	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
