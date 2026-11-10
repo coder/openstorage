@@ -67,9 +67,9 @@ func (c *Claims) HasScope(scope string) bool {
 
 // Verifier authenticates a compact JWT. Implementations must verify the
 // signature against the issuing org's registered public keys (per
-// AllowedAlgorithms), require `exp` in the future and a non-empty `sub`,
-// resolve the org from the `iss` claim, and return Repo == RepoClaimOrg for
-// a token without a `repo` claim.
+// AllowedAlgorithms), require `exp` in the future, a non-empty `sub` and a
+// `repo` without a NUL, resolve the org from the `iss` claim, and return
+// Repo == RepoClaimOrg for a token without a `repo` claim.
 //
 // Any failure — malformed token, bad signature, disallowed algorithm,
 // expired, unknown issuer — returns a non-nil error. Each transport picks

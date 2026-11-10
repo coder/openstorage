@@ -332,8 +332,10 @@ func TestVerify_RepoClaimPresence(t *testing.T) {
 	if _, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", withRepo(42))); err == nil {
 		t.Fatal("Verify accepted a numeric repo claim")
 	}
-	if _, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", withRepo("team/a\x00b"))); err == nil {
-		t.Fatal("Verify accepted a repo claim with a NUL")
+	for _, repo := range []string{"team/a\x00b", "\x00team/a", "team/a\x00", "\x00"} {
+		if _, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", withRepo(repo))); err == nil {
+			t.Fatalf("Verify accepted the repo claim %q", repo)
+		}
 	}
 }
 

@@ -16,7 +16,7 @@ The metadata store: orgs, public and signing keys, repos, webhooks, git credenti
 - Purge methods on the concrete `PG`, `SQLite`, and `S3WAL` backends, not on `Store`: `PurgeableRepos`, `RepoPurgeState`, `PurgeRepoMeta` [purge.go:PurgeableRepos] [purge_sqlite.go:PurgeableRepos] [s3walmeta_purge.go:PurgeableRepos]
 - `PGCompleteRepoCreate`, `PGRequestSync` — run inside a caller's Postgres transaction [pg.go:PGCompleteRepoCreate] [pg_eventing.go:PGRequestSync]
 - Local schedule: `LocalSchedule`, `LocalClaim`, `LocalWork`, `PushOutcome`, `SyncOutcome`, `LaneOutcome` (`OutcomeDone`, `OutcomeRetry`, `OutcomeRestore`), `RequestPushNow`, `ClaimDuePush`, `ClaimDueSync`, `FinishPushOutcome`, `FinishSyncOutcome`, `ListLocalWork`, `CompleteSyncRepoCreate` [sqlite_schedule.go:LocalSchedule] [s3walmeta_schedule.go:s3walLocalSchedule]
-- `ResolveRepoKey` — resolve a key by repo ID, then by URL, within an org [resolve.go:ResolveRepoKey]
+- `ResolveRepoKey` — resolve a key by repo ID, then by URL, within an org. A key with a NUL or invalid UTF-8 is `ErrNotFound` without a store call [resolve.go:ResolveRepoKey]
 - S3WAL: `S3WAL`, `NewS3WAL`, `OpenS3WAL`, `CheckFormat`, `FormatVersionError`, `CorruptDocumentError`, `StaleDocumentError`, `QuarantinedError`, `ConvertS3WALMeta`, `S3WALMetaConversion`, `S3WALMetaCounts`, `S3WALConvertOptions`, `S3WALPendingCreate`, `S3WALPendingCreatesError`, `ViewCheckLogEnv` (`OPENSTORAGE_TEST_VIEWCHECK_LOG`) [s3walmeta.go:S3WAL] [s3walmeta_convert.go:ConvertS3WALMeta]
 - SQL tables `orgs`, `org_public_keys`, `org_signing_keys`, `repos`, `webhooks`, `git_credentials`, `repo_upstreams` [pg.go:InitSchema] [sqlite.go:InitSchema]
 

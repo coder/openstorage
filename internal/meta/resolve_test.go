@@ -34,7 +34,7 @@ func testResolveRepoKey(t *testing.T, s Backend) {
 		t.Fatalf("resolve by url RepoID = %q, want %q", byURL.RepoID, created.RepoID)
 	}
 
-	for _, key := range []string{"", "no-such-repo", "repo_ffffffffffffffff"} {
+	for _, key := range []string{"", "no-such-repo", "repo_ffffffffffffffff", "team/a\x00b", "team/a\xffb"} {
 		if _, err := ResolveRepoKey(ctx, s, org, key); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("resolve %q: err = %v, want ErrNotFound", key, err)
 		}

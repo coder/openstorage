@@ -157,8 +157,9 @@ func (s unionKeySource) PublicKeysForOrg(ctx context.Context, name string) ([]st
 
 // Verify authenticates a compact JWT per the Verifier contract: allowed
 // algorithm, valid signature for one of the issuer's registered keys,
-// `exp` in the future, a non-empty `sub`. Any failure returns an error. A
-// token without a `repo` claim verifies with Repo == RepoClaimOrg.
+// `exp` in the future, a non-empty `sub`, a `repo` without a NUL. Any
+// failure returns an error. A token without a `repo` claim verifies with
+// Repo == RepoClaimOrg.
 func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, error) {
 	// Bearer tokens are compact JWS only; rejecting other serializations up
 	// front keeps the single-signature/protected-header assumptions below.
