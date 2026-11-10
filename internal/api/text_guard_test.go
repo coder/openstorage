@@ -1,7 +1,8 @@
 package api
 
 // PostgreSQL refuses a NUL byte or invalid UTF-8 in a text parameter
-// (SQLSTATE 22021), and answered 500 for request text that held one.
+// (SQLSTATE 22021), and answered 500 for most request text that held one
+// (a value stored encrypted under a secrets key was the exception).
 // SQLite and S3-WAL stored or ignored it. These tests pin one answer on
 // every backend: a key with such text (a server-made ID, a name) names no
 // row and answers the 404 of an unknown key, and a value the request asks

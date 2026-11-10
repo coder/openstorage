@@ -221,7 +221,8 @@ func requiredFields(msg string, fields ...[2]string) error {
 
 // invalidTextMsg is the 400 message for request text that is not
 // meta.ValidText: a NUL byte, or bytes that are not UTF-8. PostgreSQL
-// refuses such text (SQLSTATE 22021), so no backend stores it.
+// refuses such text in a text value (SQLSTATE 22021) and a NUL in jsonb
+// (22P05), so no backend stores it.
 func invalidTextMsg(name string) string {
 	return "invalid " + name + " (want UTF-8 text without NUL)"
 }
