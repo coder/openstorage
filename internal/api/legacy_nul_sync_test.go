@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -13,12 +12,11 @@ import (
 // TestLegacyNULPendingSyncFinishes: SQLite stored a pending sync create for
 // a repo claim with a NUL before POST /repos refused such claims.
 // pull-upstream with that claim still finishes it, as
-// docs/reference/authentication.md says. PostgreSQL cannot hold the row.
+// docs/reference/authentication.md says. PostgreSQL cannot hold the row,
+// so the test runs on SQLite only.
 func TestLegacyNULPendingSyncFinishes(t *testing.T) {
-	runBackends(t, func(t *testing.T, e *testEnv) {
-		if !strings.HasSuffix(t.Name(), "/sqlite") {
-			return
-		}
+	t.Run("sqlite", func(t *testing.T) {
+		e := testEnvironment(t, "sqlite")
 		s := newPendingSyncStack(t, e, true)
 		name := "team/a\x00b"
 		repo := s.createPending(t, name, pendingSyncBody)
