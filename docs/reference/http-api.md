@@ -120,7 +120,10 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `a\ufffdb`), and the listed U+FFFD form can also be a different file whose valid
   UTF-8 name holds a real U+FFFD (`a\ufffdb`, which has no sibling). A list field
   gets a list sibling of the same length and order, present when any element is not
-  valid UTF-8, and it holds the base64 of every element. The siblings are:
+  valid UTF-8, and it holds the base64 of every element. It repeats the whole list, so
+  an unpaged `files` listing with one invalid path grows by about 1.33 times the size
+  of its `paths`. During a rolling upgrade a replica without the siblings sends none,
+  so a missing sibling proves nothing until every replica has them. The siblings are:
   - `files`: `entries[].path_base64`, and `paths_base64` next to `paths`. Both
     `paths` and `paths_base64` hold only the blob entries.
   - `files/metadata`: `files[].path_base64`.
@@ -128,9 +131,11 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
     `filtered_files[]`.
   - `blame`: `path_base64`, and `original_path_base64` in `lines[]`.
   - `grep`: `path_base64` in `matches[]`.
+  - `POST /repos/merge` 409 body: `conflict_paths_base64` next to `conflict_paths`.
+  - `GET /repos/merge/preview`: `conflict_paths_base64` next to `conflict_paths`, and
+    `path_base64` in `conflicts[]` and `filtered_conflicts[]`.
 
-  The merge conflict paths (`conflict_paths` in the 409 body and the merge preview
-  fields) still list U+FFFD only. To read a file by the name in a sibling, send its
+  To read a file by the name in a sibling, send its
   raw bytes percent-encoded in the `path` query parameter, for example
   `file?path=a%FFb`. `file`, `files`, `files/metadata`, `commits`, `diff`,
   `branches/diff` and `blame` read `path` byte for byte. An `archive` (tar member
@@ -363,8 +368,8 @@ Ties between commits that ancestry does not order follow git's topo-order walk, 
 | `POST /repos/branches/create` | git:write | `{target_branch?, base_ref?\|base_branch?(deprecated), preferred_base?, base_is_ephemeral?, target_is_ephemeral?, force?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
 | `DELETE /repos/branches` | git:write | Query `target_branch`, `ephemeral?`. The deprecated body `{target_branch (deprecated alias name), ephemeral?}` still works; a query parameter that is present wins over its body field, even when empty → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent): 409 for the query form, 403 for the body form |
 | `GET /repos/branches/diff` | git:read | **Deprecated upstream** (both path styles); still implemented. Use `GET /repos/diff` ([migration](#migrating-from-branchesdiff)). `branch` (req), `base?` (defaults to the repo default branch), `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, merge_base_sha, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}`; `merge_base_sha` is empty when the histories are unrelated (direct `base..branch` diff) |
-| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. File conflicts → 409 `MergeConflict` `{error, conflict_type: merge_conflict, conflict_paths, merge_base_sha?}`; a target that moved during the merge → 409 error body, `code: conflict` (upstream's `target_moved` reports a failed automatic retry, and open.storage does not retry); an `ff_only` merge that is not a fast-forward, and unrelated histories without `allow_unrelated_histories` → 412 error body, `code: precondition_failed`, as upstream documents. A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: ref_guard_failed` ([details](#merge-guards)) |
-| `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
+| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. File conflicts → 409 `MergeConflict` `{error, conflict_type: merge_conflict, conflict_paths, conflict_paths_base64?, merge_base_sha?}`; a target that moved during the merge → 409 error body, `code: conflict` (upstream's `target_moved` reports a failed automatic retry, and open.storage does not retry); an `ff_only` merge that is not a fast-forward, and unrelated histories without `allow_unrelated_histories` → 412 error body, `code: precondition_failed`, as upstream documents. A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: ref_guard_failed` ([details](#merge-guards)) |
+| `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflict_paths_base64?, conflicts: [{path, path_base64?, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, path_base64?, reason}]}`. Read-only |
 
 #### Merge guards
 

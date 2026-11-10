@@ -9,6 +9,7 @@ package api
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -133,19 +134,24 @@ func FuzzRawPathBase64(f *testing.F) {
 				t.Fatalf("rawPathBase64(%q) = %q decodes to %q, %v", p, one, raw, err)
 			}
 		}
-		list := rawPathsBase64([]string{p, q})
-		if utf8.ValidString(p) && utf8.ValidString(q) {
-			if list != nil {
-				t.Fatalf("rawPathsBase64(%q, %q) = %q, want nil", p, q, list)
-			}
-			return
+		both := []string{p, q}
+		if anyInvalidUTF8(both) == (utf8.ValidString(p) && utf8.ValidString(q)) {
+			t.Fatalf("anyInvalidUTF8(%q, %q) = %v", p, q, anyInvalidUTF8(both))
 		}
-		if len(list) != 2 {
-			t.Fatalf("rawPathsBase64(%q, %q) = %q, want 2 elements", p, q, list)
+		// The streamed list holds the base64 of every element, in order.
+		rec := httptest.NewRecorder()
+		writeJSONLists(rec, http.StatusOK, struct {
+			L []string `json:"l"`
+		}{L: []string{}}, rawPathsBase64List("l", both))
+		var got struct {
+			L []string `json:"l"`
 		}
-		for i, want := range []string{p, q} {
-			if raw, err := base64.StdEncoding.Strict().DecodeString(list[i]); err != nil || string(raw) != want {
-				t.Fatalf("rawPathsBase64[%d] = %q decodes to %q, %v, want %q", i, list[i], raw, err, want)
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || len(got.L) != 2 {
+			t.Fatalf("streamed list of %q: %q, %v", both, rec.Body.Bytes(), err)
+		}
+		for i, want := range both {
+			if raw, err := base64.StdEncoding.Strict().DecodeString(got.L[i]); err != nil || string(raw) != want {
+				t.Fatalf("streamed list[%d] = %q decodes to %q, %v, want %q", i, got.L[i], raw, err, want)
 			}
 		}
 	})

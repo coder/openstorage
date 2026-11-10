@@ -123,21 +123,38 @@ type wmMergeResponse struct {
 // conflict": a plain problem body, like every other merge failure (#352
 // item 3).
 type wmConflictBody struct {
-	Error         string   `json:"error"`
-	ConflictType  string   `json:"conflict_type"`
-	ConflictPaths []string `json:"conflict_paths,omitempty"`
-	MergeBaseSHA  string   `json:"merge_base_sha,omitempty"`
+	Error               string   `json:"error"`
+	ConflictType        string   `json:"conflict_type"`
+	ConflictPaths       []string `json:"conflict_paths"`
+	ConflictPathsBase64 []string `json:"conflict_paths_base64,omitzero"`
+	MergeBaseSHA        string   `json:"merge_base_sha,omitempty"`
 }
 
-// wmFailConflict writes the 409 MergeConflict body for file conflicts.
+// wmFailConflict writes the 409 MergeConflict body for file conflicts. The
+// body streams its path lists: a push can make the conflict paths as long as
+// it likes, and the sibling must not add a second and third copy of them to
+// the request's memory. conflict_paths_base64 is empty and present exactly
+// when a path is not valid UTF-8 (#587).
 func wmFailConflict(w http.ResponseWriter, msg string, conflictPaths []string, mergeBase string) {
 	assertf(msg != "" && len(conflictPaths) > 0, "wmFailConflict: message %q with %d paths", msg, len(conflictPaths))
-	writeJSON(w, http.StatusConflict, wmConflictBody{
+	body := wmConflictBody{
 		Error:         msg,
 		ConflictType:  "merge_conflict",
-		ConflictPaths: conflictPaths,
+		ConflictPaths: []string{},
 		MergeBaseSHA:  mergeBase,
-	})
+	}
+	lists := []jsonList{{"conflict_paths", func(yield func(any) bool) {
+		for _, p := range conflictPaths {
+			if !yield(p) {
+				return
+			}
+		}
+	}}}
+	if anyInvalidUTF8(conflictPaths) {
+		body.ConflictPathsBase64 = []string{}
+		lists = append(lists, rawPathsBase64List("conflict_paths_base64", conflictPaths))
+	}
+	writeJSONLists(w, http.StatusConflict, body, lists...)
 }
 
 // wmInternal logs the real error and writes the generic 500 problem body
@@ -794,29 +811,32 @@ type wmPreviewBlob struct {
 }
 
 type wmPreviewConflict struct {
-	Path   string        `json:"path"`
-	Result wmPreviewBlob `json:"result"`
-	Base   wmPreviewBlob `json:"base"`
-	Ours   wmPreviewBlob `json:"ours"`
-	Theirs wmPreviewBlob `json:"theirs"`
+	Path       string        `json:"path"`
+	PathBase64 string        `json:"path_base64,omitempty"`
+	Result     wmPreviewBlob `json:"result"`
+	Base       wmPreviewBlob `json:"base"`
+	Ours       wmPreviewBlob `json:"ours"`
+	Theirs     wmPreviewBlob `json:"theirs"`
 }
 
 type wmPreviewFiltered struct {
-	Path   string `json:"path"`
-	Reason string `json:"reason"`
+	Path       string `json:"path"`
+	PathBase64 string `json:"path_base64,omitempty"`
+	Reason     string `json:"reason"`
 }
 
 type wmPreviewResponse struct {
-	Status            string              `json:"status"` // clean|conflicted
-	Result            string              `json:"result"` // merge_commit|fast_forward|no_op
-	SourceBranch      string              `json:"source_branch"`
-	TargetBranch      string              `json:"target_branch"`
-	SourceTipSHA      string              `json:"source_tip_sha"`
-	TargetTipSHA      string              `json:"target_tip_sha"`
-	MergeBaseSHA      string              `json:"merge_base_sha,omitempty"`
-	ConflictPaths     []string            `json:"conflict_paths"`
-	Conflicts         []wmPreviewConflict `json:"conflicts"`
-	FilteredConflicts []wmPreviewFiltered `json:"filtered_conflicts"`
+	Status              string              `json:"status"` // clean|conflicted
+	Result              string              `json:"result"` // merge_commit|fast_forward|no_op
+	SourceBranch        string              `json:"source_branch"`
+	TargetBranch        string              `json:"target_branch"`
+	SourceTipSHA        string              `json:"source_tip_sha"`
+	TargetTipSHA        string              `json:"target_tip_sha"`
+	MergeBaseSHA        string              `json:"merge_base_sha,omitempty"`
+	ConflictPaths       []string            `json:"conflict_paths"`
+	ConflictPathsBase64 []string            `json:"conflict_paths_base64,omitzero"`
+	Conflicts           []wmPreviewConflict `json:"conflicts"`
+	FilteredConflicts   []wmPreviewFiltered `json:"filtered_conflicts"`
 }
 
 // handleMergePreview implements GET /repos/merge/preview (docs/reference/http-api.md,
@@ -957,7 +977,45 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		resp.Conflicts = conflicts
 		resp.FilteredConflicts = filtered
 	}
-	writeJSON(w, http.StatusOK, resp)
+	wmWritePreview(w, resp)
+}
+
+// wmWritePreview writes the 200 body. A conflicted body streams its lists, so
+// no copy of the conflict paths or of the conflict content is held whole, and
+// conflict_paths_base64 (empty and present exactly when a conflict path is not
+// valid UTF-8, #587) adds nothing to the request's memory.
+func wmWritePreview(w http.ResponseWriter, resp wmPreviewResponse) {
+	if len(resp.ConflictPaths) == 0 {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	paths, conflicts, filtered := resp.ConflictPaths, resp.Conflicts, resp.FilteredConflicts
+	resp.ConflictPaths, resp.Conflicts, resp.FilteredConflicts = []string{}, []wmPreviewConflict{}, []wmPreviewFiltered{}
+	lists := []jsonList{{"conflict_paths", func(yield func(any) bool) {
+		for _, p := range paths {
+			if !yield(p) {
+				return
+			}
+		}
+	}}}
+	if anyInvalidUTF8(paths) {
+		resp.ConflictPathsBase64 = []string{}
+		lists = append(lists, rawPathsBase64List("conflict_paths_base64", paths))
+	}
+	lists = append(lists, jsonList{"conflicts", func(yield func(any) bool) {
+		for _, c := range conflicts {
+			if !yield(c) {
+				return
+			}
+		}
+	}}, jsonList{"filtered_conflicts", func(yield func(any) bool) {
+		for _, f := range filtered {
+			if !yield(f) {
+				return
+			}
+		}
+	}})
+	writeJSONLists(w, http.StatusOK, resp, lists...)
 }
 
 // wmRenderConflicts renders inline conflict content (include_content=true)
@@ -998,7 +1056,7 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 			}
 		}
 		if tooLarge {
-			filtered = append(filtered, wmPreviewFiltered{Path: path, Reason: wmFilteredReasonTooLarge})
+			filtered = append(filtered, wmPreviewFiltered{Path: path, PathBase64: rawPathBase64(path), Reason: wmFilteredReasonTooLarge})
 			continue
 		}
 		var blobs [4]wmPreviewBlob
@@ -1027,7 +1085,7 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 			}
 		}
 		conflicts = append(conflicts, wmPreviewConflict{
-			Path: path, Result: blobs[0], Base: blobs[1], Ours: blobs[2], Theirs: blobs[3],
+			Path: path, PathBase64: rawPathBase64(path), Result: blobs[0], Base: blobs[1], Ours: blobs[2], Theirs: blobs[3],
 		})
 	}
 	return conflicts, filtered, nil
