@@ -59,6 +59,7 @@ func testRequestTextKeysAreUnknown(t *testing.T, e *testEnv) {
 		name, method, tok string
 		path              func(key string) string // the escaped request path
 		body              func(key string) string // "" sends no body; JSON text is NUL only
+		keyInBody         bool                    // the key travels in the JSON body
 	}
 	pathKey := func(prefix string) func(string) string {
 		return func(key string) string { return prefix + url.PathEscape(key) }
@@ -74,12 +75,12 @@ func testRequestTextKeysAreUnknown(t *testing.T, e *testEnv) {
 		}
 	}
 	routes := []route{
-		{"DELETE /webhooks/{id}", http.MethodDelete, "org", pathKey("/api/v1/webhooks/"), nil},
-		{"PUT /repos/git-credentials", http.MethodPut, "org", fixed("/api/v1/repos/git-credentials"), jsonID(`,"password":"x"`)},
-		{"DELETE /repos/git-credentials", http.MethodDelete, "org", fixed("/api/v1/repos/git-credentials"), jsonID("")},
+		{"DELETE /webhooks/{id}", http.MethodDelete, "org", pathKey("/api/v1/webhooks/"), nil, false},
+		{"PUT /repos/git-credentials", http.MethodPut, "org", fixed("/api/v1/repos/git-credentials"), jsonID(`,"password":"x"`), true},
+		{"DELETE /repos/git-credentials", http.MethodDelete, "org", fixed("/api/v1/repos/git-credentials"), jsonID(""), true},
 		{"PUT /repos/{repo_name}/git-credentials/{id}", http.MethodPut, "repo", pathKey(alias),
-			func(string) string { return `{"password":"x"}` }},
-		{"DELETE /repos/{repo_name}/git-credentials/{id}", http.MethodDelete, "repo", pathKey(alias), nil},
+			func(string) string { return `{"password":"x"}` }, false},
+		{"DELETE /repos/{repo_name}/git-credentials/{id}", http.MethodDelete, "repo", pathKey(alias), nil, false},
 	}
 	for _, rt := range routes {
 		send := func(key string) (*http.Response, problemBody) {
@@ -96,7 +97,7 @@ func testRequestTextKeysAreUnknown(t *testing.T, e *testEnv) {
 			t.Fatalf("%s: an unknown key answers %d, want 404", rt.name, wantResp.StatusCode)
 		}
 		for _, key := range []string{"a\x00b", "\x00", cred.ID + "\x00", "a\xffb", "\xff"} {
-			if rt.body != nil && !utf8ValidJSONKey(key) {
+			if rt.keyInBody && !utf8ValidJSONKey(key) {
 				continue // a body cannot hold invalid UTF-8
 			}
 			t.Run(rt.name+" "+strings.ToValidUTF8(key, "\ufffd"), func(t *testing.T) {
