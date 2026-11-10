@@ -16,7 +16,8 @@ The metadata store: orgs, public and signing keys, repos, webhooks, git credenti
 - Purge methods on the concrete `PG`, `SQLite`, and `S3WAL` backends, not on `Store`: `PurgeableRepos`, `RepoPurgeState`, `PurgeRepoMeta` [purge.go:PurgeableRepos] [purge_sqlite.go:PurgeableRepos] [s3walmeta_purge.go:PurgeableRepos]
 - `PGCompleteRepoCreate`, `PGRequestSync` — run inside a caller's Postgres transaction [pg.go:PGCompleteRepoCreate] [pg_eventing.go:PGRequestSync]
 - Local schedule: `LocalSchedule`, `LocalClaim`, `LocalWork`, `PushOutcome`, `SyncOutcome`, `LaneOutcome` (`OutcomeDone`, `OutcomeRetry`, `OutcomeRestore`), `RequestPushNow`, `ClaimDuePush`, `ClaimDueSync`, `FinishPushOutcome`, `FinishSyncOutcome`, `ListLocalWork`, `CompleteSyncRepoCreate` [sqlite_schedule.go:LocalSchedule] [s3walmeta_schedule.go:s3walLocalSchedule]
-- `ResolveRepoKey` — resolve a key by repo ID, then by URL, within an org. A key with a NUL or invalid UTF-8 is `ErrNotFound` without a store call [resolve.go:ResolveRepoKey]
+- `ResolveRepoKey` — resolve a key by repo ID, then by URL, within an org [resolve.go:ResolveRepoKey]
+- `ValidText` — whether PostgreSQL can store a string as text (valid UTF-8, no NUL) [text.go:ValidText]
 - S3WAL: `S3WAL`, `NewS3WAL`, `OpenS3WAL`, `CheckFormat`, `FormatVersionError`, `CorruptDocumentError`, `StaleDocumentError`, `QuarantinedError`, `ConvertS3WALMeta`, `S3WALMetaConversion`, `S3WALMetaCounts`, `S3WALConvertOptions`, `S3WALPendingCreate`, `S3WALPendingCreatesError`, `ViewCheckLogEnv` (`OPENSTORAGE_TEST_VIEWCHECK_LOG`) [s3walmeta.go:S3WAL] [s3walmeta_convert.go:ConvertS3WALMeta]
 - SQL tables `orgs`, `org_public_keys`, `org_signing_keys`, `repos`, `webhooks`, `git_credentials`, `repo_upstreams` [pg.go:InitSchema] [sqlite.go:InitSchema]
 
@@ -26,6 +27,7 @@ The metadata store: orgs, public and signing keys, repos, webhooks, git credenti
 - Repo inserts map an `(org, url)` unique violation to `ErrAlreadyExists`, including soft-deleted rows [pg.go:pgInsertRepo] [sqlite.go:insertRepo]
 - `ListRepos` asserts limit in [1, 100]; `decodeCursor` maps any malformed cursor to `ErrInvalidCursor` [pg.go:ListRepos] [cursor.go:decodeCursor]
 - Postgres `ListRepos` lowers the `q` and `prefix` pattern once per query in an InitPlan, not once per row, and gives the answers of `url ILIKE` [pg.go:pgListReposQuery]
+- Postgres `GetRepoByURL` and `GetRepoByID` answer `ErrNotFound` for a key that `ValidText` refuses, without a repos query [pg.go:GetRepoByURL] [pg.go:GetRepoByID]
 - `SoftDeleteRepo` returns `ErrAlreadyDeleted` for a deleted row and `ErrNotFound` for an absent one [pg.go:SoftDeleteRepo]
 - Credentials and upstreams attach only to live repos; a second one per repo is `ErrAlreadyExists` [pg_eventing.go:createGitCredential]
 - `TryBeginSync`/`TryBeginPush` refuse unexpired claims; finish and restore match only the caller's holder; a miss returns `ErrClaimLost` when a different holder owns the lane, else `ErrNotFound` (no run in flight, or upstream detached) [pg_eventing.go:FinishSync] [pg_eventing.go:classifyGuardMiss] [sqlite_eventing.go:FinishSync]

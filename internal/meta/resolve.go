@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
-	"unicode/utf8"
 )
 
 // ResolveRepoKey resolves key — a git URL path element (docs/explanation/git-protocol-and-namespaces.md, after the
@@ -19,13 +17,6 @@ func ResolveRepoKey(ctx context.Context, store Store, org, key string) (Repo, er
 	assertf(org != "", "ResolveRepoKey: empty org")
 	if key == "" {
 		return Repo{}, fmt.Errorf("resolve repo key: empty key: %w", ErrNotFound)
-	}
-	// No repository has such a key: a url comes from a JWT repo claim,
-	// which JSON makes valid UTF-8 and the verifier refuses with a NUL.
-	// PostgreSQL refuses such text (SQLSTATE 22021), so asking it would
-	// turn a path name into a 500.
-	if strings.ContainsRune(key, 0) || !utf8.ValidString(key) {
-		return Repo{}, fmt.Errorf("resolve repo key %q: not UTF-8 text without NUL: %w", key, ErrNotFound)
 	}
 	repo, err := store.GetRepoByID(ctx, org, key)
 	if err == nil {
