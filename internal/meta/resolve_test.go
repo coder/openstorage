@@ -46,6 +46,17 @@ func testResolveRepoKey(t *testing.T, s Backend) {
 		}
 	}
 
+	// SQLite and S3-WAL can hold a url with a NUL (PostgreSQL refuses it):
+	// such a row resolves by url and by id.
+	if legacy, err := s.CreateRepo(ctx, org, "team/legacy\x00x", "main"); err == nil {
+		for _, key := range []string{legacy.URL, legacy.RepoID} {
+			got, err := ResolveRepoKey(ctx, s, org, key)
+			if err != nil || got.RepoID != legacy.RepoID {
+				t.Fatalf("resolve legacy %q = %+v, %v, want %q", key, got, err, legacy.RepoID)
+			}
+		}
+	}
+
 	for _, key := range []string{"", "no-such-repo", "repo_ffffffffffffffff", "team/a\x00b", "team/a\xffb"} {
 		if _, err := ResolveRepoKey(ctx, s, org, key); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("resolve %q: err = %v, want ErrNotFound", key, err)

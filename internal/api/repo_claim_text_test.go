@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -64,13 +66,27 @@ func TestRepoClaimWithNUL(t *testing.T) {
 		}
 
 		// SQLite stores such a url (PostgreSQL refuses it): a repository
-		// created before this check still answers to its claim.
-		if _, err := e.store.CreateRepo(context.Background(), org, claim, "main"); err != nil {
+		// created before this check still answers to its claim, through
+		// direct url lookups and through ResolveRepoKey alike.
+		_, err := e.store.CreateRepo(context.Background(), org, claim, "main")
+		if !strings.HasSuffix(t.Name(), "/sqlite") {
+			if err == nil {
+				t.Fatalf("CreateRepo(%q) succeeded on %s, want PostgreSQL's refusal", claim, t.Name())
+			}
 			return
 		}
-		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repo", read, nil, "")
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("legacy repo GET = %d (%s), want 200", resp.StatusCode, body)
+		if err != nil {
+			t.Fatalf("CreateRepo(%q) on sqlite: %v", claim, err)
+		}
+		for _, path := range []string{"/api/v1/repo", "/api/v1/repos/branches", "/api/repos/" + url.PathEscape(claim)} {
+			resp, body = e.doReq(t, http.MethodGet, path, read, nil, "")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("legacy repo GET %s = %d (%s), want 200", path, resp.StatusCode, body)
+			}
+		}
+		resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos", write, nil, "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("legacy repo repeat create = %d (%s), want 400", resp.StatusCode, body)
 		}
 		resp, body = e.doReq(t, http.MethodDelete, "/api/v1/repos/delete", write, nil, "")
 		if resp.StatusCode != http.StatusOK {
