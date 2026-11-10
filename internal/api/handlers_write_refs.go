@@ -262,7 +262,8 @@ type wrefCreateBranchRequest struct {
 	// stay subject to the no-force-push ref-policy op (real ancestry check).
 	Force bool `json:"force"`
 	// PreferredBase is the fallback base: used when no base_ref/base_branch
-	// is given, or when the primary base does not resolve.
+	// is given, or when the primary base names no ref. A primary base
+	// whose commit git cannot read is a 500, not a reason to fall back.
 	PreferredBase string `json:"preferred_base"`
 }
 
@@ -290,7 +291,8 @@ type wrefCreateBranchResponse struct {
 
 // handleCreateBranch resolves the base to a commit (branch, tag — peeled —
 // or hex sha via gitread.ResolveRef; preferred_base is the fallback when
-// the primary base is absent or unresolvable), policy-checks the new ref,
+// the primary base is absent or names no ref, and a base whose commit git
+// cannot read is a 500, with no fallback), policy-checks the new ref,
 // and CAS creates it. With force, an existing target is CAS-recreated at
 // the base — no-force-push policies still deny non-fast-forward moves via a
 // real ancestry check. No new objects are created, so there is nothing to
@@ -333,7 +335,8 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		sha, err := gitread.ResolveRef(ctx, repoPath, base, req.BaseIsEphemeral)
 		switch {
 		case errors.Is(err, gitread.ErrNotFound):
-			// Fall through to preferred_base below (when given).
+			// Fall through to preferred_base below (when given). An
+			// unreadable base is an error below, never a fallback.
 		case err != nil:
 			s.internalErr(w, r, "resolve base ref", err)
 			return

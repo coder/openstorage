@@ -84,23 +84,41 @@ func TestLsTreePageCursorWhenTheWalksGitFails(t *testing.T) {
 // gives git's error, and one that ended cleanly declines, as when its output
 // ends before the answer. A walk sees one or the other, the failed write or
 // the end of the output, depending on how soon the child ends (#764's merge
-// group run saw the write's broken pipe).
+// group run saw the write's broken pipe). Each case writes after git ended,
+// so the write fails every time: a heap cap, a crash and a canceled request
+// stay errors there too.
 func TestTreeSourceRequestAfterGitEnded(t *testing.T) {
 	dir, commit := fiRepo(t, nestedFiles())
 	for name, c := range map[string]struct {
-		script string
-		want   func(error) bool
+		script   string
+		budgeted bool
+		cancel   bool
+		want     func(error) bool
 	}{
-		"silent end": {`exit 0`, func(err error) bool { return errors.Is(err, errDeclined) }},
-		"exit":       {`echo "fatal: boom" >&2; exit 3`, func(err error) bool { return err != nil && !errors.Is(err, errDeclined) }},
+		"silent end": {`exit 0`, false, false, func(err error) bool { return errors.Is(err, errDeclined) }},
+		"exit":       {`echo "fatal: boom" >&2; exit 3`, false, false, func(err error) bool { return err != nil && !errors.Is(err, errDeclined) }},
+		"heap cap":   {`echo "fatal: Out of memory, malloc failed (tried to allocate 1 bytes)" >&2; exit 128`, true, false, func(err error) bool { return errors.Is(err, ErrMemoryLimit) }},
+		"crash":      {`kill -SEGV $$`, false, false, func(err error) bool { return err != nil && !errors.Is(err, errDeclined) }},
+		"canceled":   {`exec sleep 30`, false, true, func(err error) bool { return errors.Is(err, context.Canceled) }},
 	} {
 		t.Run(name, func(t *testing.T) {
+			if c.budgeted && !HeapLimitSupported() {
+				t.Skip("heap cap is Linux-only")
+			}
 			fakeGit(t, c.script)
-			src, err := startTreeSource(context.Background(), dir)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if c.budgeted {
+				ctx, _ = budgeted(t, 1<<20)
+			}
+			src, err := startTreeSource(ctx, dir)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = src.close(true) })
+			if c.cancel {
+				cancel()
+			}
 			_ = src.wait() // git is gone, and so is the reader of its request pipe
 			if _, _, err := src.request(commit); !c.want(err) {
 				t.Fatalf("request after git ended = %v", err)

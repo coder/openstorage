@@ -236,7 +236,8 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	}
 
 	// Fork point (docs/reference/http-api.md): sha overrides ref; default = the source's
-	// default branch. Everything unresolvable is invalid input (400).
+	// default branch. A fork point that names no ref is invalid input
+	// (400), and one whose commit git cannot read is a 500.
 	point := spec.SHA
 	if point == "" {
 		point = spec.Ref
