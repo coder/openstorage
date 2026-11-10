@@ -93,7 +93,11 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
   with `403`. A `repo` that is present but empty (`""` or `null`) is not org-wide: every
   endpoint refuses it with `403`.
 - A `repo` that holds a NUL byte fails verification on every backend
-  ([failure mapping](#failure-mapping)). PostgreSQL cannot store such text.
+  ([failure mapping](#failure-mapping)). PostgreSQL cannot store such text. Before
+  this rule, SQLite and S3-WAL created a repository for such a claim. That repository
+  stays listed, and its `repo_id` still names it on the git surface and in
+  `/api/repos/{repo_name}` paths, but the REST API cannot delete it: delete looks
+  the repository up by the claim's url.
 - `sub` is a free-text label that the signer picks ("Agent identity (for logging)" in the
   [upstream guide](../upstream/getting-started/authentication.md)). Any non-empty string
   verifies, and a token with an empty or missing `sub` fails verification. It grants nothing, and open.storage

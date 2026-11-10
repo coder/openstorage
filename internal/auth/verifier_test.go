@@ -317,6 +317,8 @@ func TestVerify_RepoClaimPresence(t *testing.T) {
 		{"empty string", withRepo(""), ""},
 		{"null", withRepo(nil), ""},
 		{"control character", withRepo("team/a\tb"), "team/a\tb"},
+		{"other control characters", withRepo("team/a\x01\x1f\x7fb"), "team/a\x01\x1f\x7fb"},
+		{"non-ASCII", withRepo("team/café-\uFFFD"), "team/café-\uFFFD"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := v.Verify(context.Background(), mustMintPayload(t, key, "ES256", tc.payload))
