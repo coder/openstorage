@@ -278,9 +278,9 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 // carried but intentionally not validated — docs/reference/authentication.md
 // imposes no requirement on it and clock skew would break SDKs.
 //
-// A `repo` with a NUL names no repository: PostgreSQL refuses such text, so
-// every lookup by it would answer 500. json.Unmarshal already made it valid
-// UTF-8.
+// A `repo` with a NUL is refused: PostgreSQL cannot store such text, so a
+// create with one answered 500 there, and no new repository gets such a
+// url on any backend. json.Unmarshal already made it valid UTF-8.
 func validateClaims(c *Claims) error {
 	if c.Exp <= time.Now().Unix() {
 		return errors.New("jwt expired")
