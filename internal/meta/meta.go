@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // Sentinel errors implementations must return (possibly wrapped; callers
@@ -128,7 +127,7 @@ type ListParams struct {
 // filters.
 func assertListFilters(p ListParams) {
 	for _, v := range []string{p.Q, p.Prefix} {
-		assertf(v == strings.TrimSpace(v) && utf8.ValidString(v) && !strings.ContainsRune(v, 0),
+		assertf(v == strings.TrimSpace(v) && ValidText(v),
 			"ListRepos: filter %.80q is untrimmed, not UTF-8, or holds a NUL byte", v)
 	}
 }

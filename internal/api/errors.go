@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -216,6 +217,36 @@ func requiredFields(msg string, fields ...[2]string) error {
 		return nil
 	}
 	return newFieldErrors(msg, params...)
+}
+
+// invalidTextMsg is the 400 message for request text that is not
+// meta.ValidText: a NUL byte, or bytes that are not UTF-8. PostgreSQL
+// refuses such text in a text value (SQLSTATE 22021) and a NUL in jsonb
+// (22P05), so no backend stores it.
+func invalidTextMsg(name string) string {
+	return "invalid " + name + " (want UTF-8 text without NUL)"
+}
+
+// invalidTextFields returns a fieldError for the first field (dotted wire
+// path -> value) whose value is not meta.ValidText, or nil when all are.
+// A JSON body decodes to valid UTF-8, so for its fields this finds a NUL.
+func invalidTextFields(fields ...[2]string) error {
+	for _, f := range fields {
+		if !meta.ValidText(f[1]) {
+			return newFieldError(f[0], "must be UTF-8 text without NUL", invalidTextMsg(f[0]))
+		}
+	}
+	return nil
+}
+
+// writeInvalidText writes the 400 for the first field that is not
+// meta.ValidText and reports whether it did.
+func writeInvalidText(w http.ResponseWriter, fields ...[2]string) bool {
+	err := invalidTextFields(fields...)
+	if err != nil {
+		writeInvalid(w, err.Error(), err)
+	}
+	return err != nil
 }
 
 // writeInvalidField writes the 400 for one invalid request-body field.

@@ -135,6 +135,9 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 		// deliveries with a key nobody can plausibly have intended.
 		writeErr(w, http.StatusBadRequest, "invalid secret: must not be blank")
 		return
+	} else if !meta.ValidText(secret) {
+		writeErr(w, http.StatusBadRequest, invalidTextMsg("secret"))
+		return
 	}
 
 	wh, err := h.store.CreateWebhook(r.Context(), claims.Iss, req.URL, secret)

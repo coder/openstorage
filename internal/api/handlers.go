@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
@@ -640,8 +639,8 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 
 	q, prefix := strings.TrimSpace(query.Get("q")), strings.TrimSpace(query.Get("prefix"))
 	for _, f := range []struct{ name, value string }{{"q", q}, {"prefix", prefix}} {
-		if !utf8.ValidString(f.value) || strings.ContainsRune(f.value, 0) {
-			writeErr(w, http.StatusBadRequest, "invalid "+f.name+" (want UTF-8 text without NUL)")
+		if !meta.ValidText(f.value) {
+			writeErr(w, http.StatusBadRequest, invalidTextMsg(f.name))
 			return
 		}
 	}

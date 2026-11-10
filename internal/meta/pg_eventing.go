@@ -163,6 +163,9 @@ func (s *PG) ListWebhooks(ctx context.Context, org string) ([]Webhook, error) {
 // (delivery jobs carry only the ID); ErrNotFound when absent.
 func (s *PG) GetWebhook(ctx context.Context, id string) (Webhook, error) {
 	assertf(id != "", "GetWebhook: empty id")
+	if err := pgUnknownText("webhook", id); err != nil {
+		return Webhook{}, err
+	}
 	w, err := scanWebhook(s.pool.QueryRow(ctx,
 		`SELECT `+webhookCols+` FROM webhooks WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -181,6 +184,9 @@ func (s *PG) GetWebhook(ctx context.Context, id string) (Webhook, error) {
 // unknown or the ID does not belong to it.
 func (s *PG) DeleteWebhook(ctx context.Context, org, id string) error {
 	assertf(id != "", "DeleteWebhook: empty id for org %q", org)
+	if err := pgUnknownText("webhook", id); err != nil {
+		return err
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return err
@@ -241,6 +247,9 @@ func (s *PG) createGitCredential(ctx context.Context, q pgQueryRower, cred GitCr
 // GetGitCredential returns the credential by ID; ErrNotFound when absent.
 func (s *PG) GetGitCredential(ctx context.Context, id string) (GitCredential, error) {
 	assertf(id != "", "GetGitCredential: empty id")
+	if err := pgUnknownText("credential", id); err != nil {
+		return GitCredential{}, err
+	}
 	c, err := scanGitCredential(s.pool.QueryRow(ctx,
 		`SELECT `+gitCredentialCols+` FROM git_credentials WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -260,6 +269,9 @@ func (s *PG) GetGitCredential(ctx context.Context, id string) (GitCredential, er
 // rows). ErrNotFound when absent.
 func (s *PG) GitCredentialMeta(ctx context.Context, id string) (GitCredential, error) {
 	assertf(id != "", "GitCredentialMeta: empty id")
+	if err := pgUnknownText("credential", id); err != nil {
+		return GitCredential{}, err
+	}
 	var c GitCredential
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, repo_id, username, created_at FROM git_credentials WHERE id = $1`, id).
@@ -279,6 +291,9 @@ func (s *PG) GitCredentialMeta(ctx context.Context, id string) (GitCredential, e
 // prefix.
 func (s *PG) UpdateGitCredential(ctx context.Context, id, username, password string) (GitCredential, error) {
 	assertf(id != "", "UpdateGitCredential: empty id")
+	if err := pgUnknownText("credential", id); err != nil {
+		return GitCredential{}, err
+	}
 	stored, err := encodeSecret(s.codec, password)
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("update credential %q: %w", id, err)
@@ -301,6 +316,9 @@ func (s *PG) UpdateGitCredential(ctx context.Context, id, username, password str
 // DeleteGitCredential removes the credential; ErrNotFound when absent.
 func (s *PG) DeleteGitCredential(ctx context.Context, id string) error {
 	assertf(id != "", "DeleteGitCredential: empty id")
+	if err := pgUnknownText("credential", id); err != nil {
+		return err
+	}
 	tag, err := s.pool.Exec(ctx, `DELETE FROM git_credentials WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("delete credential %q: %w", id, err)

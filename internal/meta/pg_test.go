@@ -775,7 +775,10 @@ func testListReposErrors(t *testing.T, s Backend) {
 	ctx := t.Context()
 	org := seedOrg(t, s)
 
-	for _, cursor := range []string{"!!!", "AAAA", "bm9waXBl" /* "nopipe" */} {
+	// A repo id with a NUL byte or invalid UTF-8 would reach PostgreSQL as
+	// the keyset position, which refuses it (SQLSTATE 22021).
+	nul, notUTF8 := encodeCursor(time.Unix(1, 0), "repo_\x00x"), encodeCursor(time.Unix(1, 0), "repo_\xffx")
+	for _, cursor := range []string{"!!!", "AAAA", "bm9waXBl" /* "nopipe" */, nul, notUTF8} {
 		if _, err := s.ListRepos(ctx, org, ListParams{Cursor: cursor, Limit: 10}); !errors.Is(err, ErrInvalidCursor) {
 			t.Errorf("cursor %q err = %v, want ErrInvalidCursor", cursor, err)
 		}
@@ -792,4 +795,63 @@ func testListReposErrors(t *testing.T, s Backend) {
 		}
 	}()
 	_, _ = s.ListRepos(ctx, org, ListParams{Limit: 0})
+}
+
+func TestTextKeysAreUnknown(t *testing.T) { runBackends(t, testTextKeysAreUnknown) }
+
+// testTextKeysAreUnknown pins that a key with a NUL byte or invalid UTF-8
+// names no row, on every backend. PostgreSQL refuses such a parameter
+// (SQLSTATE 22021), so its store answers ErrNotFound itself; a request
+// that carries one in a path or a body must see the 404 of an unknown key,
+// not a 500.
+func testTextKeysAreUnknown(t *testing.T, s Backend) {
+	ctx := t.Context()
+	org := seedOrg(t, s)
+	repo, err := s.CreateRepo(ctx, org, "acme/live", "main")
+	if err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	wh, err := s.CreateWebhook(ctx, org, "https://hooks.example.invalid/x", "secret")
+	if err != nil {
+		t.Fatalf("create webhook: %v", err)
+	}
+	cred, err := s.CreateGitCredential(ctx, GitCredential{RepoID: repo.RepoID, Username: "u", Password: "p"})
+	if err != nil {
+		t.Fatalf("create credential: %v", err)
+	}
+
+	for _, key := range []string{"a\x00b", "\x00", "repo_\x00", "a\xffb", "\xc3", "\xed\xa0\x80"} {
+		lookups := []struct {
+			name string
+			call func() error
+		}{
+			{"SoftDeleteRepo", func() error { _, err := s.SoftDeleteRepo(ctx, org, key); return err }},
+			{"GetWebhook", func() error { _, err := s.GetWebhook(ctx, key); return err }},
+			{"DeleteWebhook", func() error { return s.DeleteWebhook(ctx, org, key) }},
+			{"GetGitCredential", func() error { _, err := s.GetGitCredential(ctx, key); return err }},
+			{"GitCredentialMeta", func() error { _, err := s.GitCredentialMeta(ctx, key); return err }},
+			{"UpdateGitCredential", func() error { _, err := s.UpdateGitCredential(ctx, key, "u2", "p2"); return err }},
+			{"DeleteGitCredential", func() error { return s.DeleteGitCredential(ctx, key) }},
+			{"org name of GetRepoByURL", func() error { _, err := s.GetRepoByURL(ctx, key, "acme/live"); return err }},
+			{"org name of PublicKeysForOrg", func() error { _, err := s.PublicKeysForOrg(ctx, key); return err }},
+		}
+		for _, l := range lookups {
+			t.Run(fmt.Sprintf("%s %q", l.name, key), func(t *testing.T) {
+				if err := l.call(); !errors.Is(err, ErrNotFound) {
+					t.Errorf("err = %.200v, want ErrNotFound", err)
+				}
+			})
+		}
+	}
+
+	// Nothing was deleted or changed on the way.
+	if got, err := s.GetRepoByID(ctx, org, repo.RepoID); err != nil || got.URL != "acme/live" {
+		t.Errorf("repo after the lookups = %+v, %v", got, err)
+	}
+	if _, err := s.GetWebhook(ctx, wh.ID); err != nil {
+		t.Errorf("webhook after the lookups: %v", err)
+	}
+	if got, err := s.GetGitCredential(ctx, cred.ID); err != nil || got.Username != "u" || got.Password != "p" {
+		t.Errorf("credential after the lookups = %+v, %v", got, err)
+	}
 }

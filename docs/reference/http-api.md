@@ -175,7 +175,7 @@ about the endpoint's rollout status on upstream clusters.
 | Method & path | Scope | Notes |
 |---|---|---|
 | `POST /repos` | repo:write (repo=new id) | Optional body `{repo_name?, default_branch?, upstream?, base_repo?}` (details below). → `{repo_id, repo_name, http_url, message}`. **201** = created; 200 = the name holds a finished repo the request matches; 409 = another live repo holds the name; 404 = a deleted repo holds the name; 503 = a create of the name is not finished (below). |
-| `GET /repos` | org:read (repo="org" or no repo) | Query `cursor, limit, q, prefix`. `q` is a case-insensitive substring of repo `url`, and `prefix` a case-insensitive start of it, both trimmed (empty = no filter). With `prefix` set, `q` matches only the rest of `url` after the prefix: `prefix=pierre/&q=sdk` returns `pierre/sdk-documentation`, not `pierre/example`. A `q` or `prefix` with a NUL byte or invalid UTF-8 is a 400. → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
+| `GET /repos` | org:read (repo="org" or no repo) | Query `cursor, limit, q, prefix`. `q` is a case-insensitive substring of repo `url`, and `prefix` a case-insensitive start of it, both trimmed (empty = no filter). With `prefix` set, `q` matches only the rest of `url` after the prefix: `prefix=pierre/&q=sdk` returns `pierre/sdk-documentation`, not `pierre/example`. A `q` or `prefix` with a NUL byte or invalid UTF-8 is a 400. A `cursor` that does not decode, or whose repo ID holds a NUL byte or invalid UTF-8, is a 400 `invalid cursor`. → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, upstream?, base_repo?}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch; body `{default_branch}` (details below). → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec) |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_name, repo_id (deprecated mirror), message}`; 404 not found; 409 already deleted |
@@ -237,6 +237,11 @@ the same scopes, query parameters and responses.
   the source's default branch name, as a fork does. Unknown fields, and the sync-only fields
   `owner`, `upstream_host`, `forward_pushes`, and `auth.auth_type`, → 400.
 - `base_repo` (deprecated sync and fork form): `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
+- A sync create whose `owner`, `name` or `auth.token` holds a NUL byte → 400 `bad_request`
+  with `invalid_params` naming the field (`base_repo.owner`, `base_repo.name`,
+  `base_repo.auth.token`, `upstream.owner`, `upstream.name`), and nothing is stored. The
+  stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
+  decodes to valid UTF-8 already.
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
   generic with `upstream_host`.
 - `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
@@ -306,6 +311,11 @@ the same scopes, query parameters and responses.
 `username` is optional on create and update, on these routes and on the path-style
 `/repos/{repo_name}/git-credentials` routes. Only `password` is required. The server
 stores the username exactly as sent. An update that omits it clears the stored one.
+
+A `username` or `password` that holds a NUL byte → 400 `bad_request` with `invalid_params`
+naming the field, on every credential route, and nothing is stored. A credential `id`
+that holds a NUL byte, in the body or in the path (also invalid UTF-8 in the path), names
+no credential → 404 `credential_not_found`, as an unknown `id` does.
 
 A stored username is always sent as is. Git sends no credentials when the username is
 empty, so for a credential with no username the sync worker sends the upstream's
@@ -574,7 +584,7 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | Optional body `{ref?, after?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header. Both body fields are accepted and ignored: every pull syncs all branches and tags of the upstream. Upstream deprecated the body on 2026-10-08 |
+| `POST /repos/pull-upstream` | git:write | Optional body `{ref?, after?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header. Both body fields are accepted and ignored: every pull syncs all branches and tags of the upstream. A `ref` that holds a NUL byte is still a 400 on every backend, because PostgreSQL's job queue stores it as `jsonb`, which cannot hold a NUL. Upstream deprecated the body on 2026-10-08 |
 | `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional, deprecated body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400. Its fields are ignored |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 

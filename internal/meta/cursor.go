@@ -32,6 +32,11 @@ func decodeCursor(cursor string) (time.Time, string, error) {
 	if !ok || repoID == "" {
 		return time.Time{}, "", fmt.Errorf("%w: missing repo id", ErrInvalidCursor)
 	}
+	// The repo id reaches a PostgreSQL text parameter, which refuses a NUL
+	// byte and invalid UTF-8 (a server-made id holds neither).
+	if !ValidText(repoID) {
+		return time.Time{}, "", fmt.Errorf("%w: repo id is not UTF-8 text without NUL", ErrInvalidCursor)
+	}
 	nanos, err := strconv.ParseInt(ts, 10, 64)
 	if err != nil {
 		return time.Time{}, "", fmt.Errorf("%w: bad timestamp", ErrInvalidCursor)
