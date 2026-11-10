@@ -92,7 +92,9 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
   (`invalid repo claim (want UTF-8 text without NUL)`). PostgreSQL cannot store such
   text, so there the repository endpoints answer `404` for such a claim, and the git
   surface `403`, as for any claim that names no repository. A repository that SQLite
-  or S3-WAL created for such a claim before this check keeps working.
+  or S3-WAL created for such a claim before this check keeps working with that claim,
+  except that a repeat `POST /repos` for it answers `400`. `POST /repos/pull-upstream`
+  still finishes a pending sync create of it.
 - A token with no `repo` claim is org-wide and behaves exactly like `repo: "org"`:
   org-scoped endpoints accept it, and repository endpoints and the git surface refuse it
   with `403`. A `repo` that is present but empty (`""` or `null`) is not org-wide: every
