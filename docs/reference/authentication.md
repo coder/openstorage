@@ -92,6 +92,8 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
   org-scoped endpoints accept it, and repository endpoints and the git surface refuse it
   with `403`. A `repo` that is present but empty (`""` or `null`) is not org-wide: every
   endpoint refuses it with `403`.
+- A `repo` that holds a NUL byte fails verification on every backend
+  ([failure mapping](#failure-mapping)). PostgreSQL cannot store such text.
 - `sub` is a free-text label that the signer picks ("Agent identity (for logging)" in the
   [upstream guide](../upstream/getting-started/authentication.md)). Any non-empty string
   verifies, and a token with an empty or missing `sub` fails verification. It grants nothing, and open.storage

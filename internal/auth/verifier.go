@@ -276,12 +276,19 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 // non-empty value passes and nothing may treat it as an identity. `iat` is
 // carried but intentionally not validated — docs/reference/authentication.md
 // imposes no requirement on it and clock skew would break SDKs.
+//
+// A `repo` with a NUL names no repository: PostgreSQL refuses such text, so
+// every lookup by it would answer 500. json.Unmarshal already made it valid
+// UTF-8.
 func validateClaims(c *Claims) error {
 	if c.Exp <= time.Now().Unix() {
 		return errors.New("jwt expired")
 	}
 	if c.Sub == "" {
 		return errors.New("jwt missing sub claim")
+	}
+	if strings.ContainsRune(c.Repo, 0) {
+		return errors.New("jwt repo claim has a NUL character")
 	}
 	return nil
 }
