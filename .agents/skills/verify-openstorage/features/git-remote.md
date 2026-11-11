@@ -85,7 +85,7 @@ SECOND=$("$OSV" git "$RUN" remote-second-sha -- -C by-id rev-parse HEAD)
 "$OSV" eq "$RUN" remote-rest-tip "$SECOND" "$("$OSV" json "$OSV_EVIDENCE/remote-branch.body" branch.head_sha)"
 ```
 
-- **Keep ephemeral branches off the persistent remote.** Create the ephemeral branch `agent` from `main` over REST. `GET /api/v1/repos/branches?ephemeral=true` lists it at `SECOND`, and `ls-remote` of `demo.git` lists no `refs/namespaces/` ref. A push of `agent`, or of #797's branch named `HEAD`, into that namespace exits `1` with `deny updating a hidden ref`, and the REST list still shows only `agent`. `demo+ephemeral.git` takes a push of `scratch` and lists it.
+- **Keep ephemeral branches off the persistent remote.** Create the ephemeral branch `agent` from `main` over REST. `GET /api/v1/repos/branches?ephemeral=true` lists it at `SECOND`, and `ls-remote` of `demo.git` lists no `refs/namespaces/` ref. A push of `agent` at its own tip from `by-id`, or of #797's branch named `HEAD`, into that namespace exits `1` with `deny updating a hidden ref`, and the REST list still shows only `agent`. `demo+ephemeral.git` takes a push of `scratch` and lists it.
 
 ```sh
 "$OSV" api "$RUN" remote-eph-create --token rw --expect 200 POST /api/v1/repos/branches/create \
@@ -93,7 +93,7 @@ SECOND=$("$OSV" git "$RUN" remote-second-sha -- -C by-id rev-parse HEAD)
 "$OSV" git "$RUN" remote-ls-hidden --token rw -- ls-remote "$OSV_URL/demo.git"
 "$OSV" eq "$RUN" remote-ls-no-namespace 0 "$(grep -c 'refs/namespaces/' "$OSV_EVIDENCE/remote-ls-hidden.git.txt")"
 "$OSV" git "$RUN" remote-push-hidden --token rw --expect 1 -- \
-  -C src push "$OSV_URL/demo.git" HEAD:refs/namespaces/ephemeral/refs/heads/agent
+  -C by-id push "$OSV_URL/demo.git" HEAD:refs/namespaces/ephemeral/refs/heads/agent
 "$OSV" git "$RUN" remote-push-hidden-head --token rw --expect 1 -- \
   -C src push "$OSV_URL/demo.git" HEAD:refs/namespaces/ephemeral/refs/heads/HEAD
 "$OSV" eq "$RUN" remote-push-hidden-ng 2 \

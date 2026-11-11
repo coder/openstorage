@@ -77,6 +77,7 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 		{":" + agent, "deny deleting a hidden ref", agent},
 		{"HEAD:refs/namespaces/other/refs/heads/x", "deny updating a hidden ref", "refs/namespaces/other/refs/heads/x"},
 		{"HEAD:refs/namespaces/ephemeral/refs/heads/HEAD", "deny updating a hidden ref", "refs/namespaces/ephemeral/refs/heads/HEAD"},
+		{"HEAD:refs/namespaces", "deny updating a hidden ref", "refs/namespaces"},
 	} {
 		before := pgRefs(t, repo)[tc.ref]
 		out, err := tryGit(work, "push", persistent, tc.spec)
@@ -101,7 +102,7 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 		t.Fatalf("mixed push: authority mixed=%q, hidden=%q", refs["refs/heads/mixed"], refs["refs/namespaces/ephemeral/refs/heads/mixed"])
 	}
 	out, err = tryGit(work, "push", "--atomic", persistent, "HEAD:refs/heads/side", "HEAD:refs/namespaces/ephemeral/refs/heads/side")
-	if err == nil || !strings.Contains(out, "deny updating a hidden ref") {
+	if err == nil || !strings.Contains(out, "deny updating a hidden ref") || !strings.Contains(out, "is hidden on this remote") {
 		t.Fatalf("atomic push: err=%v\n%s", err, out)
 	}
 	if refs := pgRefs(t, repo); refs["refs/heads/side"] != "" || refs["refs/namespaces/ephemeral/refs/heads/side"] != "" {

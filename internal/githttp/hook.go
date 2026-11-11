@@ -400,7 +400,7 @@ func preReceive(ctx context.Context) (retErr error) {
 		if !verdictDone[i] {
 			c := commands[i]
 			if hiddenOnRemote(repo, c.ref) {
-				verdicts[i] = refusef("ref %s is hidden on this remote (use the HTTP API for ephemeral branches)", c.ref)
+				verdicts[i] = refusef("ref %s is hidden on this remote, which takes no refs under refs/namespaces/ (the HTTP API writes ephemeral branches)", c.ref)
 			} else {
 				verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
 			}
@@ -1318,7 +1318,8 @@ func pushRefDeletable(name string) bool {
 // pre-receive's verdict denies it: an atomic push that names one lands
 // nothing, and a pack that only such commands need is never published.
 func hiddenOnRemote(repo, refName string) bool {
-	return persistentKey(repo) && strings.HasPrefix(refName, persistentHiddenRefs)
+	// git hides the prefix itself too: it drops the trailing slash.
+	return persistentKey(repo) && (strings.HasPrefix(refName, persistentHiddenRefs) || refName+"/" == persistentHiddenRefs)
 }
 
 // pushCommandUpdatable applies the right name gate for one command:
