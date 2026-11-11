@@ -104,14 +104,17 @@ var hexRevRe = regexp.MustCompile(`\A[0-9a-f]{4,40}\z`)
 var fullHexRe = regexp.MustCompile(`\A[0-9a-fA-F]{40}\z`)
 
 // ResolveRef resolves a request ref to a full commit SHA in the repo at
-// repoPath. Resolution order (docs/reference/http-api.md "branch name, short or full SHA"):
+// repoPath (docs/explanation/wire-compatibility.md, the revision row). The
+// name candidates exclude each other:
 //
-//  1. branch:   refs/heads/<spec> — or the ephemeral namespace name
-//     (auth.EphemeralRefName) when ephemeral is true
-//  2. tag:      refs/tags/<spec> (annotated tags peel to their commit)
-//  3. full ref: <spec> verbatim when it already starts with "refs/"
-//  4. hex:      short or full SHA (no rev expressions; a full SHA may be
-//     uppercase, an abbreviation must be lowercase)
+//   - ephemeral: only the ephemeral namespace name (auth.EphemeralRefName)
+//   - full ref:  else <spec> verbatim when it starts with "refs/"
+//   - else:      refs/heads/<spec>, then refs/tags/<spec> (annotated tags
+//     peel to their commit)
+//
+// Every case then tries a hex object name: a short or full SHA (no rev
+// expressions; a full SHA may be uppercase, an abbreviation must be
+// lowercase).
 //
 // Everything unresolvable wraps ErrNotFound — including the empty spec and
 // the unborn-branch case, where the DB knows no such ref yet (invariant 3:

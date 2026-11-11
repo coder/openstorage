@@ -218,6 +218,32 @@ func TestWriteRefsBranches(t *testing.T) {
 			}
 		})
 
+		t.Run("create ephemeral HEAD", func(t *testing.T) {
+			// A branch literally named HEAD is stored under refs/heads/ in the
+			// ephemeral namespace, where the branch list, GET branch and
+			// ResolveRef look for it, never as the namespaced pseudoref.
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "HEAD", "base_branch": "main", "target_is_ephemeral": true})
+			if resp.StatusCode != http.StatusOK || body["target_is_ephemeral"] != true {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+			refs := wrefRefs(t, e, fx.repoID)
+			if got := refs["refs/namespaces/ephemeral/refs/heads/HEAD"]; got != fx.c2 {
+				t.Fatalf("ephemeral HEAD branch = %q, want %s", got, fx.c2)
+			}
+			if got, ok := refs["refs/namespaces/ephemeral/HEAD"]; ok {
+				t.Fatalf("ephemeral pseudoref written: %q", got)
+			}
+			getResp, getBody := coreGet(t, e, "GET", "/api/v1/repos/branch?name=HEAD&ephemeral=true", fx.token, nil)
+			if getResp.StatusCode != http.StatusOK {
+				t.Fatalf("GET ephemeral branch HEAD: status %d body %s", getResp.StatusCode, getBody)
+			}
+			logResp, logBody := coreGet(t, e, "GET", "/api/v1/repos/commits?ref=HEAD&ephemeral=true", fx.token, nil)
+			if logResp.StatusCode != http.StatusOK || !strings.Contains(string(logBody), fx.c2) {
+				t.Fatalf("GET commits ref=HEAD ephemeral: status %d body %s", logResp.StatusCode, logBody)
+			}
+		})
+
 		t.Run("create from ephemeral base", func(t *testing.T) {
 			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
 				map[string]any{"target_branch": "from-eph", "base_branch": "scratch", "base_is_ephemeral": true})

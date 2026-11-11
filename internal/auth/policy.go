@@ -73,9 +73,12 @@ func NormalizeRefName(s string) string {
 	return "refs/heads/" + s
 }
 
-// EphemeralRefName rewrites ref to its ephemeral-namespace storage name,
-// normalizing shorthand first (`main` → `refs/heads/main` →
-// `refs/namespaces/ephemeral/refs/heads/main`). Policies for a push
+// EphemeralRefName rewrites ref to its ephemeral-namespace storage name.
+// A bare name is a branch name (`main` → `refs/heads/main` →
+// `refs/namespaces/ephemeral/refs/heads/main`), `HEAD` and `*` included:
+// unlike NormalizeRefName, which keeps those two for policy patterns, it
+// always yields a full ref name, where the branch list and GET branch
+// look for an ephemeral branch. Policies for a push
 // targeting a `+ephemeral` repo are matched against this rewritten name,
 // so persistent-branch rules don't police ephemeral pushes unless the
 // token uses `*` or an explicit namespaced pattern.
@@ -87,7 +90,10 @@ func EphemeralRefName(ref string) string {
 	if ref == "" {
 		return ""
 	}
-	return EphemeralNamespacePrefix + NormalizeRefName(ref)
+	if !strings.HasPrefix(ref, "refs/") {
+		ref = "refs/heads/" + ref
+	}
+	return EphemeralNamespacePrefix + ref
 }
 
 // ParseRefPolicies parses the `refs` claim JSON (ordered [pattern, ops]
