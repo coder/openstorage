@@ -701,6 +701,17 @@ func TestMergeEphemeral(t *testing.T) {
 			}
 		})
 
+		t.Run("persistent HEAD target passes validation", func(t *testing.T) {
+			// Only an ephemeral target named HEAD is refused (400). A
+			// persistent one reaches the target lookup, which finds no
+			// such branch in this fixture.
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+				wmMergeBody("feature", "HEAD", "ff_prefer", nil))
+			if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(raw), "target branch HEAD not found") {
+				t.Fatalf("status %d body %s, want 404 target branch HEAD not found", resp.StatusCode, raw)
+			}
+		})
+
 		t.Run("ephemeral target stays namespaced", func(t *testing.T) {
 			before := wmRefsSnapshot(t, e, fx.repoID)
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,

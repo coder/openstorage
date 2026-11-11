@@ -607,6 +607,17 @@ func TestCommitPackValidation(t *testing.T) {
 			})
 		}
 
+		t.Run("persistent HEAD target allowed", func(t *testing.T) {
+			// Only an ephemeral target named HEAD is refused.
+			frames := wctLines(t,
+				wctMeta("HEAD", "m", []map[string]any{upsert("a", "id1")}, nil),
+				wctChunk("id1", []byte("x"), true))
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(frames))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d body %s, want 200", resp.StatusCode, body)
+			}
+		})
+
 		t.Run("oversize decoded chunk", func(t *testing.T) {
 			frames := wctLines(t,
 				wctMeta("main", "m", []map[string]any{upsert("a", "id1")}, nil),
