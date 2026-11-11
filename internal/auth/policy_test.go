@@ -240,6 +240,21 @@ func TestEphemeralRefName(t *testing.T) {
 	}
 }
 
+// A rule on the name an ephemeral HEAD branch had before EphemeralRefName
+// mapped bare names under refs/heads/ still polices that branch.
+func TestParseRefPoliciesLegacyEphemeralHEAD(t *testing.T) {
+	policies, err := ParseRefPolicies(`[["refs/namespaces/ephemeral/HEAD", ["no-push"]]]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rule, ok := MatchPolicy(policies, EphemeralRefName("HEAD")); !ok || !reflect.DeepEqual(rule.Ops, []string{OpNoPush}) {
+		t.Fatalf("ephemeral HEAD matched %+v (ok=%v), want the legacy no-push rule", rule, ok)
+	}
+	if rule, ok := MatchPolicy(policies, EphemeralRefName("main")); ok {
+		t.Fatalf("ephemeral main matched %+v, want no match", rule)
+	}
+}
+
 // Ephemeral namespace quirk (branch-protection.md): persistent-branch rules
 // don't police the ephemeral copy; explicit namespaced patterns and the
 // catch-all `*` do.

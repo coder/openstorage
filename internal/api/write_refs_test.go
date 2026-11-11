@@ -1107,6 +1107,15 @@ func TestWriteRefsPolicies(t *testing.T) {
 			}
 		})
 
+		t.Run("legacy ephemeral HEAD rule still denies", func(t *testing.T) {
+			tok := mintWith(`[["refs/namespaces/ephemeral/HEAD", ["no-push"]]]`, nil)
+			resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", tok,
+				map[string]any{"target_branch": "HEAD", "base_branch": "main", "target_is_ephemeral": true})
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("ephemeral HEAD create: status = %d, want 403", resp.StatusCode)
+			}
+		})
+
 		t.Run("verify-sig fails closed on server-created notes", func(t *testing.T) {
 			tok := mintWith(`[["refs/notes/*", ["verify-sig"]]]`, nil)
 			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", tok,

@@ -76,12 +76,12 @@ func NormalizeRefName(s string) string {
 // EphemeralRefName rewrites ref to its ephemeral-namespace storage name.
 // A bare name is a branch name (`main` → `refs/heads/main` →
 // `refs/namespaces/ephemeral/refs/heads/main`), `HEAD` and `*` included:
-// unlike NormalizeRefName, which keeps those two for policy patterns, it
-// always yields a full ref name, where the branch list and GET branch
-// look for an ephemeral branch. Policies for a push
-// targeting a `+ephemeral` repo are matched against this rewritten name,
-// so persistent-branch rules don't police ephemeral pushes unless the
-// token uses `*` or an explicit namespaced pattern.
+// unlike NormalizeRefName, which keeps those two for policy patterns, a
+// bare name always maps under refs/heads/, where the branch list and GET
+// branch look for an ephemeral branch. A `refs/...` name keeps its form.
+// Policies for a push targeting a `+ephemeral` repo are matched against
+// this rewritten name, so persistent-branch rules don't police ephemeral
+// pushes unless the token uses `*` or an explicit namespaced pattern.
 //
 // An empty ref (malformed external input) yields "", which never names a
 // real ref and never matches a policy pattern (MatchPolicy treats "" as
@@ -107,10 +107,20 @@ func ParseRefPolicies(raw string) ([]RefPolicy, error) {
 		return nil, fmt.Errorf("parse refs policy: %w", err)
 	}
 	for i := range policies {
-		policies[i].Pattern = NormalizeRefName(policies[i].Pattern)
+		pattern := NormalizeRefName(policies[i].Pattern)
+		if pattern == legacyEphemeralHEAD {
+			pattern = EphemeralRefName("HEAD")
+		}
+		policies[i].Pattern = pattern
 	}
 	return policies, nil
 }
+
+// legacyEphemeralHEAD is where the API stored an ephemeral branch named
+// HEAD before EphemeralRefName mapped every bare name under refs/heads/.
+// A token issued then can name it in a rule; ParseRefPolicies reads it as
+// that branch's current name, so the rule keeps policing it.
+const legacyEphemeralHEAD = EphemeralNamespacePrefix + "HEAD"
 
 // MatchPolicy scans normalized policies in order and returns the first
 // whose pattern matches ref (normalized with the same shorthand rule);
