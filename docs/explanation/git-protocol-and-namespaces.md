@@ -59,8 +59,10 @@ Before open.storage hid them, a push to the persistent remote could write refs u
 `refs/namespaces/`. Those refs stay after an upgrade, and git can no longer list or delete
 them. Delete the ones you do not want before you upgrade: list them with
 `git ls-remote <url> 'refs/namespaces/*'`, and delete each one with
-`git push <url> --delete <ref>`. After the upgrade, the API still deletes an ephemeral
-branch by its name, except a branch named `HEAD`.
+`git push <url> --delete <ref>`. After the upgrade, the API deletes an ephemeral branch only
+when it accepts the name: each `/`-separated part starts with a letter or digit and holds
+only letters, digits, `.`, `_` and `-`, and the name is not `HEAD`. It cannot delete names
+such as `HEAD`, `a+b` or `user@feat`, nor any other ref under `refs/namespaces/`.
 
 ## Git LFS
 

@@ -109,6 +109,15 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 		t.Fatalf("atomic push landed in part: side=%q, hidden=%q", refs["refs/heads/side"], refs["refs/namespaces/ephemeral/refs/heads/side"])
 	}
 
+	// Only refs/namespaces itself and the refs under it are hidden.
+	// The pushed commit is new to the server, so its pack is published.
+	const near = "refs/namespacesx/refs/heads/n"
+	nearSHA := strings.TrimSpace(mustGit(t, work, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "near"))
+	mustGit(t, work, "push", persistent, nearSHA+":"+near)
+	if got := lsRemoteSHA(t, "", persistent, near); got != nearSHA {
+		t.Fatalf("persistent %s = %q, want %q", near, got, nearSHA)
+	}
+
 	// The API still lists and resolves its ephemeral branch.
 	var branches struct {
 		Branches []struct {
