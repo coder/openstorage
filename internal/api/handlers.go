@@ -166,9 +166,8 @@ func validBranchName(name string) bool {
 
 // validDefaultBranch reports whether branch can be a repository's default
 // branch: a branch name, or its refs/heads/-qualified spelling. Any other
-// refs/ name is refused: the default names a branch, and HEAD must never
-// point into a namespace that the git remote hides, such as refs/tags/ or
-// refs/namespaces/.
+// refs/ name is refused: the default names a branch. (The persistent git
+// remote hides refs/namespaces/, and with it a HEAD that points there.)
 func validDefaultBranch(branch string) bool {
 	short := strings.TrimPrefix(branch, "refs/heads/")
 	return !strings.HasPrefix(short, "refs/") && validBranchName(short)

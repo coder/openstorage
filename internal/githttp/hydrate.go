@@ -3748,6 +3748,15 @@ var ErrHeldRefStale = errors.New("a push holds a ref whose cached value is older
 // Hold and marker handling is the same in both modes.
 func hydrateRefs(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string, strictHeld bool) (repoPath string, refsErr error, err error) {
 	headTarget := HeadTarget(defaultBranch)
+	if hiddenOnRemote(repo, headTarget) {
+		// git advertises HEAD and its symref whatever HEAD points at, so a
+		// HEAD on a ref that the persistent remote hides (an earlier
+		// version, an older replica or a sync could store such a default)
+		// would show that ref's name and commit. Point it at the same name
+		// under refs/heads/ instead, which normally does not exist: the
+		// remote then advertises no HEAD.
+		headTarget = "refs/heads/" + headTarget
+	}
 	repoPath, err = EnsureCacheRepoCtx(ctx, cacheDir, repo)
 	if err != nil {
 		return "", nil, err

@@ -646,13 +646,22 @@ func persistentKey(repo string) bool { return BaseRepo(repo) == repo }
 // smart-HTTP request. On the persistent remote, transfer.hideRefs leaves
 // persistentHiddenRefs out of both advertisements, and receive-pack refuses
 // each update or delete of such a ref with its own ng ("deny updating a
-// hidden ref"). The setting changes no other git command: hydration, REST
+// hidden ref"). The settings change no other git command: hydration, REST
 // reads and LFS reachability read those refs directly.
+//
+// upload-pack also serves no want of a hidden ref's commit, whatever the
+// repository, global or system git config says: with the tip and reachable
+// bits off, git also ignores uploadpack.allowAnySHA1InWant. (HEAD never
+// points at a hidden ref of a persistent key: see hydrateRefs.)
 func serviceCmd(ctx context.Context, target repoTarget, service string, args ...string) *exec.Cmd {
 	assertf(service == "upload-pack" || service == "receive-pack", "serviceCmd: unknown service %q", service)
 	var gitArgs []string
 	if persistentKey(target.key) {
-		gitArgs = []string{"-c", "transfer.hideRefs=" + persistentHiddenRefs}
+		gitArgs = []string{
+			"-c", "transfer.hideRefs=" + persistentHiddenRefs,
+			"-c", "uploadpack.allowTipSHA1InWant=false",
+			"-c", "uploadpack.allowReachableSHA1InWant=false",
+		}
 	}
 	gitArgs = append(gitArgs, service, "--stateless-rpc")
 	return exec.CommandContext(ctx, "git", append(gitArgs, args...)...)

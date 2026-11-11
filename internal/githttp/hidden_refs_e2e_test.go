@@ -1,6 +1,7 @@
 package githttp
 
 import (
+	"context"
 	"encoding/base64"
 	"io"
 	"net/http"
@@ -108,6 +109,16 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 	if refs := pgRefs(t, repo); refs["refs/heads/side"] != "" || refs["refs/namespaces/ephemeral/refs/heads/side"] != "" {
 		t.Fatalf("atomic push landed in part: side=%q, hidden=%q", refs["refs/heads/side"], refs["refs/namespaces/ephemeral/refs/heads/side"])
 	}
+	// A delete-only atomic push carries no pack, so only pre-receive's
+	// atomic gate stops its visible delete. The hidden ref is absent, so
+	// the atomic base check (old values against the authority) passes.
+	out, err = tryGit(work, "push", "--atomic", persistent, ":refs/heads/mixed", ":refs/namespaces/ephemeral/refs/heads/nope")
+	if err == nil || !strings.Contains(out, "deny deleting a hidden ref") {
+		t.Fatalf("atomic delete-only push: err=%v\n%s", err, out)
+	}
+	if got := pgRefs(t, repo)["refs/heads/mixed"]; got != other {
+		t.Fatalf("atomic delete-only push landed in part: mixed=%q, want %q", got, other)
+	}
 
 	// Only refs/namespaces itself and the refs under it are hidden.
 	// The pushed commit is new to the server, so its pack is published.
@@ -158,11 +169,141 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 	}
 }
 
+// A hidden ref never commits (git refuses it before any update hook), so a
+// plain push that names one reserves no push hold for it, with or without
+// a pack: a REST write or a hydration of that ephemeral branch never waits
+// behind the push.
+func TestPersistentRemoteHoldsNoHiddenRef(t *testing.T) {
+	repo := registerRepo(t, "t-hidden-hold")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main", "HEAD:refs/heads/dd")
+	body := `{"base_ref":"main","target_branch":"gone","target_is_ephemeral":true}`
+	if status := apiJSON(t, nodeA, http.MethodPost, token, "/api/v1/repos/branches/create", body, nil); status != http.StatusOK {
+		t.Fatalf("ephemeral branch create: status %d", status)
+	}
+	head := commitFile(t, work, "hh.txt", "hh\n", "held", nil)
+
+	nodeCache := t.TempDir()
+	node, err := startNode(nodeCache, EnvHookDelay+"=3000")
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+	type pushResult struct {
+		out string
+		err error
+	}
+	for _, tc := range []struct {
+		name, visible, hidden string
+		specs                 []string
+	}{
+		{"with a pack", "refs/heads/hh", "refs/namespaces/ephemeral/refs/heads/hh", []string{"HEAD:refs/heads/hh", "HEAD:refs/namespaces/ephemeral/refs/heads/hh"}},
+		{"delete only", "refs/heads/dd", "refs/namespaces/ephemeral/refs/heads/gone", []string{":refs/heads/dd", ":refs/namespaces/ephemeral/refs/heads/gone"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := pgRefs(t, repo)[tc.hidden]
+			done := make(chan pushResult, 1)
+			go func() {
+				out, err := tryGit(work, append([]string{"push", remoteURL(node, repo, token)}, tc.specs...)...)
+				done <- pushResult{out, err}
+			}()
+			waitForPushHold(t, nodeCache, repo, tc.visible, done)
+			holds, err := readPushHolds(filepath.Join(RepoPath(nodeCache, repo), pushHoldDir), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if holds.contains(tc.hidden) {
+				t.Fatalf("the push holds %s, which it can never commit", tc.hidden)
+			}
+			res := <-done
+			if res.err == nil || !strings.Contains(res.out, "a hidden ref") {
+				t.Fatalf("push: err=%v\n%s", res.err, res.out)
+			}
+			if got := pgRefs(t, repo)[tc.hidden]; got != before {
+				t.Fatalf("authority %s moved from %q to %q", tc.hidden, before, got)
+			}
+		})
+	}
+	if refs := pgRefs(t, repo); refs["refs/heads/hh"] != head || refs["refs/heads/dd"] != "" {
+		t.Fatalf("authority hh=%q dd=%q, want hh=%s and dd deleted", refs["refs/heads/hh"], refs["refs/heads/dd"], head)
+	}
+	// The +ephemeral remote hides nothing, so its refs/namespaces/ refs
+	// still take holds.
+	done := make(chan pushResult, 1)
+	const kept = "refs/namespaces/kept/refs/heads/h"
+	go func() {
+		out, err := tryGit(work, "push", remoteURL(node, repo+"+ephemeral", token), "HEAD:"+kept)
+		done <- pushResult{out, err}
+	}()
+	waitForPushHold(t, nodeCache, repo+"+ephemeral", kept, done)
+	if res := <-done; res.err != nil {
+		t.Fatalf("+ephemeral push: %v\n%s", res.err, res.out)
+	}
+}
+
+// The persistent remote serves no commit that only a hidden ref reaches,
+// also when the repository's default branch is that hidden ref (an
+// earlier version, an older replica or a sync could store one, and git
+// advertises HEAD whatever it points at) and when git config would allow
+// a want of an unadvertised commit.
+func TestPersistentRemoteServesNoHiddenCommit(t *testing.T) {
+	const agent = "refs/namespaces/ephemeral/refs/heads/agent"
+	rec, err := testMeta.CreateRepo(context.Background(), testOrg, runUnique("t-hidden-head"), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := rec.RepoID
+	cache := t.TempDir()
+	node, err := startNode(cache)
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	persistent := remoteURL(node, repo, token)
+	mustGit(t, work, "push", persistent, "HEAD:refs/heads/main")
+	solo := commitFile(t, work, "solo.txt", "solo\n", "ephemeral only", nil)
+	mustGit(t, work, "push", persistent, "HEAD:refs/heads/tmp")
+	body := `{"base_ref":"tmp","target_branch":"agent","target_is_ephemeral":true}`
+	if status := apiJSON(t, node, http.MethodPost, token, "/api/v1/repos/branches/create", body, nil); status != http.StatusOK {
+		t.Fatalf("ephemeral branch create: status %d", status)
+	}
+	mustGit(t, work, "push", persistent, ":refs/heads/tmp")
+
+	for _, service := range []string{"git-upload-pack", "git-receive-pack"} {
+		adv := smartHTTPAt(t, node, repo, token, http.MethodGet, "info/refs?service="+service, "")
+		if strings.Contains(adv, solo) || strings.Contains(adv, "refs/namespaces/") || !strings.Contains(adv, "refs/heads/main") {
+			t.Fatalf("the %s advertisement shows the hidden default branch:\n%q", service, adv)
+		}
+	}
+	mirror := filepath.Join(t.TempDir(), "mirror.git")
+	mustGit(t, "", "clone", "--mirror", persistent, mirror)
+	if _, err := tryGit(mirror, "cat-file", "-e", solo); err == nil {
+		t.Fatalf("mirror clone holds %s, which only %s reaches", solo, agent)
+	}
+	want := pktLine("want "+solo+"\n") + "0000" + pktLine("done\n")
+	for _, key := range []string{"uploadpack.allowTipSHA1InWant", "uploadpack.allowReachableSHA1InWant", "uploadpack.allowAnySHA1InWant"} {
+		mustGit(t, "", "-C", RepoPath(cache, repo), "config", key, "true")
+		if rpc := smartHTTPAt(t, node, repo, token, http.MethodPost, "git-upload-pack", want); !strings.Contains(rpc, "not our ref") || strings.Contains(rpc, "PACK") {
+			t.Fatalf("with %s=true, upload-pack answered a want of %s:\n%q", key, solo, rpc)
+		}
+		mustGit(t, "", "-C", RepoPath(cache, repo), "config", "--unset", key)
+	}
+}
+
 // smartHTTP sends one smart-HTTP request for repo to nodeA and returns the
 // 200 response body.
 func smartHTTP(t *testing.T, repo, token, method, rest, body string) string {
 	t.Helper()
-	req, err := http.NewRequest(method, "http://"+nodeA.addr+"/"+repo+".git/"+rest, strings.NewReader(body))
+	return smartHTTPAt(t, nodeA, repo, token, method, rest, body)
+}
+
+// smartHTTPAt is smartHTTP against node n.
+func smartHTTPAt(t *testing.T, n *testNode, repo, token, method, rest, body string) string {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://"+n.addr+"/"+repo+".git/"+rest, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

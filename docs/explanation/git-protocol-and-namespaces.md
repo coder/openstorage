@@ -45,7 +45,11 @@ The receive path must:
   deletes one gets its own `ng` (`deny updating a hidden ref` or
   `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing, and so
   does a push whose new objects only such a ref needs. The `+ephemeral` and `+import`
-  remotes hide nothing. One exception: git still resolves a hidden ref that a fetch names
+  remotes hide nothing. The persistent remote serves no commit that only a hidden ref
+  reaches, whatever the git config says about wants of unadvertised commits. When the
+  repository's default branch is a hidden ref, it points `HEAD` at the same name under
+  `refs/heads/`, which normally does not exist, so it advertises no `HEAD` (`PATCH /repo`
+  sets a visible default). One exception: git still resolves a hidden ref that a fetch names
   in `--shallow-exclude`, and cuts the history at its commit, so a client with `git:read`
   can tell whether such a ref exists. The API's branch list shows the ephemeral branches to
   the same token.
@@ -58,9 +62,12 @@ The receive path must:
 Before open.storage hid them, a push to the persistent remote could write refs under
 `refs/namespaces/`. Those refs stay after an upgrade, and git can no longer list or delete
 them. Delete every one you do not want before you upgrade: list them with
-`git ls-remote <url> 'refs/namespaces/*'`, and delete each one with
+`git ls-remote <url> 'refs/namespaces/*'` (the pattern also lists refs such as
+`refs/heads/refs/namespaces/x` or `refs/tags/refs/namespaces/t`, which stay visible), and
+delete each one with
 `git push <url> --delete <ref>`. Do not count on the API to delete them later: it deletes
-only ephemeral branches whose names it accepts.
+only ephemeral branches whose names it accepts. In a fleet, a node that runs an earlier
+version still takes such pushes until it is upgraded.
 
 ## Git LFS
 

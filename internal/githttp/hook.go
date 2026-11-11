@@ -522,6 +522,14 @@ func preReceive(ctx context.Context) (retErr error) {
 			}
 		}
 		for i, c := range commands {
+			// git refuses a hidden ref before any update hook runs
+			// (serviceCmd): it never commits, so it takes no hold and no
+			// sidecar marker. A hold would block hydration and REST writes
+			// of that ephemeral branch for as long as the client keeps
+			// the push open.
+			if hiddenOnRemote(repo, c.ref) {
+				continue
+			}
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
 			// literal refs/heads to pre-receive yet can never complete

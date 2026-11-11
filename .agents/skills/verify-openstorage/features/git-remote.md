@@ -11,7 +11,7 @@ A user creates a repository through the REST API and then uses it as an ordinary
 - `remote-clone-id` clones through the `http_url` from create (`/<repo_id>.git`).
 - `remote-fetch` fetches a commit that a second clone pushed.
 - `remote-rest-view` shows the pushed tip through `GET /api/v1/repos/branch`.
-- `remote-hidden` keeps an ephemeral branch made over REST off `/<repo>.git`: `ls-remote` does not list it, and a push to `refs/namespaces/` is refused. `/<repo>+ephemeral.git` still lists and updates its own branches.
+- `remote-hidden` keeps an ephemeral branch made over REST off `/<repo>.git`: `ls-remote` does not list it, and a push to `refs/namespaces/` is refused. `/<repo>+ephemeral.git` still takes and lists its own branches.
 - `remote-empty` clones a repository that has no commits.
 
 ## How to get to it (user POV)
