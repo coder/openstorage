@@ -562,7 +562,11 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 
 - Default notes ref: `refs/notes/commits`. Bare names resolve to `refs/notes/<name>`.
 - `object_ref`: a full object SHA (commit, tree, blob, or annotated tag), or a branch,
-  tag, short SHA, or other revision that resolves to a commit. Unresolvable → 404.
+  tag, full ref name (`refs/...`), or short SHA (at least 4 lowercase hex digits) that
+  resolves to a commit. Other revisions, such as `main~1`, `main^` or the symbolic
+  `HEAD`, do not resolve here, though upstream documents them for notes writes
+  ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)).
+  Unresolvable → 404.
 - Responses echo the resolved object id in `sha`.
 - A stale `expected_notes_ref_sha` → 409 on every form: `POST .../notes`, `POST
   .../notes/append`, and `DELETE .../notes` with the guard in the query or in the
