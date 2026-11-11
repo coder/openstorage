@@ -41,7 +41,7 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 		t.Fatalf("persistent ls-remote:\n%s", out)
 	}
 	for _, service := range []string{"git-upload-pack", "git-receive-pack"} {
-		adv := infoRefs(t, repo, token, service)
+		adv := smartHTTP(t, repo, token, http.MethodGet, "info/refs?service="+service, "")
 		if strings.Contains(adv, "refs/namespaces/") || !strings.Contains(adv, "refs/heads/main") {
 			t.Fatalf("%s advertisement:\n%q", service, adv)
 		}
@@ -59,11 +59,19 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 	if out, err := tryGit(mirror, "fetch", persistent, agent); err == nil || !strings.Contains(out, "couldn't find remote ref") {
 		t.Fatalf("fetch of %s by name: err=%v\n%s", agent, err, out)
 	}
+	// git refuses a want of an unadvertised commit on the client side, so
+	// the upload-pack RPC gets that want raw: it must refuse it too.
+	want := pktLine("want "+solo+"\n") + "0000" + pktLine("done\n")
+	if rpc := smartHTTP(t, repo, token, http.MethodPost, "git-upload-pack", want); !strings.Contains(rpc, "not our ref") || strings.Contains(rpc, "PACK") {
+		t.Fatalf("upload-pack RPC answered a want of %s:\n%q", solo, rpc)
+	}
 
 	// Every push to refs/namespaces/ gets its own ng, and the authority
 	// keeps its value: an update, a delete, a creation in another
-	// namespace, and #797's branch named HEAD.
+	// namespace, and #797's branch named HEAD. The pushed commit is new
+	// to the server, and no pack is stored for it: no ref can reach it.
 	other := commitFile(t, work, "other.txt", "other\n", "persistent", nil)
+	packsBefore, blobsBefore := len(pgPacks(t, repo)), len(s3Packs(t, repo))
 	for _, tc := range []struct{ spec, msg, ref string }{
 		{"HEAD:" + agent, "deny updating a hidden ref", agent},
 		{":" + agent, "deny deleting a hidden ref", agent},
@@ -78,6 +86,9 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 		if got := pgRefs(t, repo)[tc.ref]; got != before {
 			t.Fatalf("push %s moved %s from %q to %q", tc.spec, tc.ref, before, got)
 		}
+	}
+	if packs, blobs := len(pgPacks(t, repo)), len(s3Packs(t, repo)); packs != packsBefore || blobs != blobsBefore {
+		t.Fatalf("pushes to hidden refs stored packs: registry %d -> %d, blob store %d -> %d", packsBefore, packs, blobsBefore, blobs)
 	}
 
 	// A plain push with a hidden ref still lands its other refs; an atomic
@@ -129,31 +140,37 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 	// Only the persistent remote hides refs/namespaces/: an atomic push to
 	// `+ephemeral` still lands one, and its advertisement lists it.
 	const kept = "refs/namespaces/kept/refs/heads/n"
-	mustGit(t, work, "push", "--atomic", eph, "HEAD:refs/heads/both", "HEAD:"+kept)
-	if got := lsRemoteSHA(t, "", eph, kept); got != next {
-		t.Fatalf("+ephemeral %s = %q, want %q", kept, got, next)
+	for _, remote := range []string{eph, remoteURL(nodeA, repo+"+import", token)} {
+		mustGit(t, work, "push", "--atomic", remote, "HEAD:refs/heads/both", "HEAD:"+kept)
+		if got := lsRemoteSHA(t, "", remote, kept); got != next {
+			t.Fatalf("%s on a namespaced remote = %q, want %q", kept, got, next)
+		}
 	}
 }
 
-// infoRefs returns the smart-HTTP advertisement body of service for repo.
-func infoRefs(t *testing.T, repo, token, service string) string {
+// smartHTTP sends one smart-HTTP request for repo to nodeA and returns the
+// 200 response body.
+func smartHTTP(t *testing.T, repo, token, method, rest, body string) string {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, "http://"+nodeA.addr+"/"+repo+".git/info/refs?service="+service, nil)
+	req, err := http.NewRequest(method, "http://"+nodeA.addr+"/"+repo+".git/"+rest, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("t:"+token)))
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/x-"+rest+"-request")
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	adv, err := io.ReadAll(resp.Body)
+	out, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET info/refs?service=%s = %d: %s", service, resp.StatusCode, adv)
+		t.Fatalf("%s %s = %d: %s", method, rest, resp.StatusCode, out)
 	}
-	return string(adv)
+	return string(out)
 }

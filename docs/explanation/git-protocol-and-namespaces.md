@@ -43,7 +43,10 @@ The receive path must:
   never list one, a fetch of one by name fails (`couldn't find remote ref`), and a push that
   updates or deletes one gets its own `ng` (`deny updating a hidden ref` or
   `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing. The
-  `+ephemeral` and `+import` remotes hide nothing.
+  `+ephemeral` and `+import` remotes hide nothing. One exception: git still resolves a
+  hidden ref that a fetch names in `--shallow-exclude`, and cuts the history at its
+  commit. That gives no new access: the same `git:read` token lists those branches
+  through the API.
 - On pushes to persistent refs, emit `push` webhooks (before/after SHAs per ref) and
   schedule upstream sync for synced repos.
 - Accept large histories on `+import` pushes. Official docs describe immediate cold
