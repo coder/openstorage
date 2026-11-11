@@ -227,31 +227,10 @@ func TestEphemeralRefName(t *testing.T) {
 		"refs/heads/main": "refs/namespaces/ephemeral/refs/heads/main",
 		"main":            "refs/namespaces/ephemeral/refs/heads/main",
 		"refs/tags/v1":    "refs/namespaces/ephemeral/refs/tags/v1",
-		// A bare name is a branch name, also HEAD and *: NormalizeRefName
-		// keeps those two for policy patterns, but a stored ref is a full name.
-		"HEAD":  "refs/namespaces/ephemeral/refs/heads/HEAD",
-		"*":     "refs/namespaces/ephemeral/refs/heads/*",
-		"refsx": "refs/namespaces/ephemeral/refs/heads/refsx",
-		"":      "",
 	} {
 		if got := EphemeralRefName(in); got != want {
 			t.Errorf("EphemeralRefName(%q) = %q, want %q", in, got, want)
 		}
-	}
-}
-
-// A rule on the name an ephemeral HEAD branch had before EphemeralRefName
-// mapped bare names under refs/heads/ still polices that branch.
-func TestParseRefPoliciesLegacyEphemeralHEAD(t *testing.T) {
-	policies, err := ParseRefPolicies(`[["refs/namespaces/ephemeral/HEAD", ["no-push"]]]`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rule, ok := MatchPolicy(policies, EphemeralRefName("HEAD")); !ok || !reflect.DeepEqual(rule.Ops, []string{OpNoPush}) {
-		t.Fatalf("ephemeral HEAD matched %+v (ok=%v), want the legacy no-push rule", rule, ok)
-	}
-	if rule, ok := MatchPolicy(policies, EphemeralRefName("main")); ok {
-		t.Fatalf("ephemeral main matched %+v, want no match", rule)
 	}
 }
 

@@ -541,6 +541,9 @@ func wcValidateMetadata(md *wcMetadata) error {
 	if err := wcValidateBranchParam("target_branch", md.TargetBranch); err != nil {
 		return err
 	}
+	if wrefEphemeralHEAD(md.TargetBranch, md.Ephemeral) {
+		return newFieldError("target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch")
+	}
 	if md.CommitMessage == "" {
 		return errors.New("missing commit_message")
 	}

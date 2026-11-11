@@ -479,6 +479,9 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	if err := wcValidateBranchParam("target_branch", req.TargetBranch); err != nil {
 		return err
 	}
+	if wrefEphemeralHEAD(req.TargetBranch, req.TargetIsEphemeral) {
+		return newFieldError("target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch")
+	}
 	switch req.Strategy {
 	case "merge", "ff_only", "ff_prefer":
 	case "":

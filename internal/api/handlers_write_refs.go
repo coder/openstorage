@@ -149,6 +149,17 @@ func wrefRefName(branch string, ephemeral bool) string {
 	return "refs/heads/" + branch
 }
 
+// wrefEphemeralHEAD reports a write target named HEAD in the ephemeral
+// namespace. auth.EphemeralRefName keeps a bare HEAD as it is (the policy
+// shorthand rule), so such a write would store
+// refs/namespaces/ephemeral/HEAD, outside the refs/heads/ prefix that the
+// ephemeral branch list and GET branch read: it answered 200, and the
+// branch never showed up. The write paths refuse it instead. Reads and
+// deletes still reach a ref that an older version stored there.
+func wrefEphemeralHEAD(name string, ephemeral bool) bool {
+	return ephemeral && name == "HEAD"
+}
+
 // wrefValidBranchInput validates a request branch/tag name (docs/reference/http-api.md: bare
 // name, never refs/-prefixed) with the same conservative rules as the
 // default-branch validator.
@@ -311,6 +322,10 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	var targetBranch string
 	if !allocate && (json.Unmarshal(req.TargetBranch, &targetBranch) != nil || !wrefValidBranchInput(targetBranch)) {
 		writeInvalidField(w, "target_branch", "must be a valid branch name", "invalid target_branch")
+		return
+	}
+	if !allocate && wrefEphemeralHEAD(targetBranch, req.TargetIsEphemeral) {
+		writeInvalidField(w, "target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch")
 		return
 	}
 	if allocate && req.Force {
