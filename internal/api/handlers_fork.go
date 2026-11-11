@@ -281,7 +281,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		// NAME — forkRef below re-qualifies it.
 		branch = strings.TrimPrefix(srcRepo.DefaultBranch, "refs/heads/")
 	}
-	if !validBranchName(branch) {
+	if !validDefaultBranch(branch) {
 		if branchPath == "" { // the query parameter or the source: no body field
 			writeErr(w, http.StatusBadRequest, "invalid default_branch")
 		} else {

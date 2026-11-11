@@ -164,6 +164,16 @@ func validBranchName(name string) bool {
 	return true
 }
 
+// validDefaultBranch reports whether branch can be a repository's default
+// branch: a branch name, or its refs/heads/-qualified spelling. Any other
+// refs/ name is refused: the default names a branch, and HEAD must never
+// point into a namespace that the git remote hides, such as refs/tags/ or
+// refs/namespaces/.
+func validDefaultBranch(branch string) bool {
+	short := strings.TrimPrefix(branch, "refs/heads/")
+	return !strings.HasPrefix(short, "refs/") && validBranchName(short)
+}
+
 type createRepoRequest struct {
 	// RepoName is the optional upstream `repo_name` (issue #293). It never
 	// names the repo: the JWT repo claim always does, and a present
@@ -343,7 +353,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	if branch == "" {
 		branch = "main"
 	}
-	if !validBranchName(branch) {
+	if !validDefaultBranch(branch) {
 		if req.DefaultBranch == "" { // the query parameter: no body field to name
 			writeErr(w, http.StatusBadRequest, "invalid default_branch")
 		} else {
@@ -521,8 +531,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	// would break the repo's git/read surface until another PATCH repairs
 	// the row.
 	target := githttp.HeadTarget(branch)
-	shortName := strings.TrimPrefix(branch, "refs/heads/")
-	valid := !strings.HasPrefix(shortName, "refs/") && validBranchName(shortName)
+	valid := validDefaultBranch(branch)
 	if valid {
 		var err error
 		if valid, err = validRefFormat(r.Context(), target); err != nil {
