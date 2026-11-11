@@ -264,8 +264,8 @@ type commitDiffResponse struct {
 }
 
 // handleDiff implements GET /api/v1/repos/diff: `ref` and `base_ref` accept
-// what gitread.ResolveRef resolves, no revision expressions (deprecated camelCase aliases `sha`/`baseSha` — the
-// endpoint's historical quirk; note `base_sha` was never a param and stays
+// what gitread.ResolveRef resolves, no revision expressions (deprecated
+// camelCase aliases `sha`/`baseSha` — the endpoint's historical quirk; note `base_sha` was never a param and stays
 // an ignored unknown, though the response now carries a `base_sha` field).
 // `ref_is_ephemeral`/`base_is_ephemeral` resolve either side in the
 // ephemeral namespace. Explicit base_ref selects a three-dot comparison:

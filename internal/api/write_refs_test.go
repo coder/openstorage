@@ -238,6 +238,10 @@ func TestWriteRefsBranches(t *testing.T) {
 			if getResp.StatusCode != http.StatusOK {
 				t.Fatalf("GET ephemeral branch HEAD: status %d body %s", getResp.StatusCode, getBody)
 			}
+			listResp, listBody := coreGet(t, e, "GET", "/api/v1/repos/branches?ephemeral=true", fx.token, nil)
+			if listResp.StatusCode != http.StatusOK || !strings.Contains(string(listBody), `"name":"HEAD"`) {
+				t.Fatalf("GET ephemeral branches: status %d body %s", listResp.StatusCode, listBody)
+			}
 			logResp, logBody := coreGet(t, e, "GET", "/api/v1/repos/commits?ref=HEAD&ephemeral=true", fx.token, nil)
 			if logResp.StatusCode != http.StatusOK || !strings.Contains(string(logBody), fx.c2) {
 				t.Fatalf("GET commits ref=HEAD ephemeral: status %d body %s", logResp.StatusCode, logBody)

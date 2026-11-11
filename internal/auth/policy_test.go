@@ -229,8 +229,10 @@ func TestEphemeralRefName(t *testing.T) {
 		"refs/tags/v1":    "refs/namespaces/ephemeral/refs/tags/v1",
 		// A bare name is a branch name, also HEAD and *: NormalizeRefName
 		// keeps those two for policy patterns, but a stored ref is a full name.
-		"HEAD": "refs/namespaces/ephemeral/refs/heads/HEAD",
-		"*":    "refs/namespaces/ephemeral/refs/heads/*",
+		"HEAD":  "refs/namespaces/ephemeral/refs/heads/HEAD",
+		"*":     "refs/namespaces/ephemeral/refs/heads/*",
+		"refsx": "refs/namespaces/ephemeral/refs/heads/refsx",
+		"":      "",
 	} {
 		if got := EphemeralRefName(in); got != want {
 			t.Errorf("EphemeralRefName(%q) = %q, want %q", in, got, want)
