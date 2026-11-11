@@ -380,6 +380,10 @@ The API refuses an ephemeral branch named `HEAD`: branch create, commit writes a
 `400` (`invalid target_branch`) for `target_branch: "HEAD"` with the ephemeral flag. A
 persistent branch named `HEAD` is allowed.
 
+Ephemeral branches are `refs/namespaces/ephemeral/refs/heads/<name>` in the base
+repository. The persistent git remote `/{repo}.git` hides them: git cannot fetch,
+list or push them there ([namespaces](../explanation/git-protocol-and-namespaces.md)).
+
 #### Merge guards
 
 A failed guard answers `409` with the error body before any merge work, and nothing

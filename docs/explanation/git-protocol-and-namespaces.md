@@ -37,6 +37,13 @@ The receive path must:
   first match wins, reporting per-ref `ng` results with a policy message.
 - Map namespaces: `+ephemeral` remotes see and update only the ephemeral ref space;
   persistent remotes must not see ephemeral refs (git namespaces or separate ref stores).
+  open.storage keeps each namespace in its own ref store. The HTTP API stores its
+  ephemeral branches in the base repository as `refs/namespaces/ephemeral/refs/heads/<name>`,
+  so the persistent remote hides every `refs/namespaces/` ref: fetch, clone and `ls-remote`
+  never list one, a fetch of one by name fails (`couldn't find remote ref`), and a push that
+  updates or deletes one gets its own `ng` (`deny updating a hidden ref` or
+  `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing. The
+  `+ephemeral` and `+import` remotes hide nothing.
 - On pushes to persistent refs, emit `push` webhooks (before/after SHAs per ref) and
   schedule upstream sync for synced repos.
 - Accept large histories on `+import` pushes. Official docs describe immediate cold

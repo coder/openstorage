@@ -426,6 +426,9 @@ func preReceive(ctx context.Context) (retErr error) {
 		// doomed request scale that by its command count. A complete loop
 		// leaves verdicts fully populated (all nil) for the later gates.
 		for i, c := range commands {
+			if hiddenOnRemote(repo, c.ref) {
+				return atomicDenied(refusef("ref %s is hidden on this remote (use the +ephemeral remote or the API for ephemeral branches)", c.ref))
+			}
 			if !pushCommandUpdatable(c.ref, c.old, c.new) {
 				return atomicDenied(refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth))
 			}
@@ -1305,6 +1308,15 @@ func pushRefDeletable(name string) bool {
 	// The whole lock path must fit PATH_MAX against the ACTUAL repository
 	// directory (round-21 P2 established the budget for creations).
 	return !pushRefPathTooLong(pushRepoDirLen(), len(name))
+}
+
+// hiddenOnRemote reports whether receive-pack hides refName on the remote
+// of storage key repo (serviceCmd). git refuses such a command before
+// pre-receive and runs no update hook for it, yet still lists it on
+// pre-receive's stdin and, under --atomic, commits the other commands. So
+// pre-receive denies an atomic push that names one whole.
+func hiddenOnRemote(repo, refName string) bool {
+	return persistentKey(repo) && strings.HasPrefix(refName, persistentHiddenRefs)
 }
 
 // pushCommandUpdatable applies the right name gate for one command:

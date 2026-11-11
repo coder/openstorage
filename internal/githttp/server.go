@@ -632,6 +632,32 @@ func hydrateFailed(w http.ResponseWriter, repo string, err error) {
 
 func pktLine(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
 
+// persistentHiddenRefs is the ref prefix that the persistent remote hides
+// (docs/explanation/git-protocol-and-namespaces.md: persistent remotes must
+// not see ephemeral refs). The API stores its ephemeral branches under the
+// base repository as refs/namespaces/ephemeral/... (auth.EphemeralRefName).
+const persistentHiddenRefs = "refs/namespaces/"
+
+// persistentKey reports whether storage key repo is a persistent remote, a
+// key without a `+ephemeral` or `+import` suffix.
+func persistentKey(repo string) bool { return BaseRepo(repo) == repo }
+
+// serviceCmd builds the upload-pack or receive-pack child of every git
+// smart-HTTP request. On the persistent remote, transfer.hideRefs leaves
+// persistentHiddenRefs out of both advertisements, and receive-pack refuses
+// each update or delete of such a ref with its own ng ("deny updating a
+// hidden ref"). The setting changes no other git command: hydration, REST
+// reads and LFS reachability read those refs directly.
+func serviceCmd(ctx context.Context, target repoTarget, service string, args ...string) *exec.Cmd {
+	assertf(service == "upload-pack" || service == "receive-pack", "serviceCmd: unknown service %q", service)
+	var gitArgs []string
+	if persistentKey(target.key) {
+		gitArgs = []string{"-c", "transfer.hideRefs=" + persistentHiddenRefs}
+	}
+	gitArgs = append(gitArgs, service, "--stateless-rpc")
+	return exec.CommandContext(ctx, "git", append(gitArgs, args...)...)
+}
+
 func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo string) {
 	svcParam := r.URL.Query().Get("service")
 	if svcParam != "git-upload-pack" && svcParam != "git-receive-pack" {
@@ -666,7 +692,7 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 	if _, err := io.WriteString(w, pktLine("# service="+svcParam+"\n")+"0000"); err != nil {
 		return
 	}
-	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", "--advertise-refs", repoPath)
+	cmd := serviceCmd(r.Context(), target, service, "--advertise-refs", repoPath)
 	cmd.Stdout = w
 	cmd.Stderr = os.Stderr
 	if err := gitlimit.RunIn(r.Context(), repoPath, cmd); err != nil {
@@ -877,7 +903,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		return
 	}
 
-	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
+	cmd := serviceCmd(r.Context(), target, service, repoPath)
 	cmd.Env = os.Environ()
 	// No-op for upload-pack; receive-pack assigns the real hold release.
 	releasePushHold := func() {}
