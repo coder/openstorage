@@ -218,6 +218,29 @@ func TestWriteRefsBranches(t *testing.T) {
 			}
 		})
 
+		t.Run("ephemeral HEAD target refused", func(t *testing.T) {
+			// auth.EphemeralRefName keeps a bare HEAD, so this branch would
+			// land at refs/namespaces/ephemeral/HEAD, where the ephemeral
+			// branch list and GET branch never look.
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "HEAD", "base_branch": "main", "target_is_ephemeral": true})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status %d body %v, want 400", resp.StatusCode, body)
+			}
+			refs := wrefRefs(t, e, fx.repoID)
+			for _, name := range []string{"refs/namespaces/ephemeral/HEAD", "refs/namespaces/ephemeral/refs/heads/HEAD"} {
+				if got, ok := refs[name]; ok {
+					t.Fatalf("refused create wrote %s = %q", name, got)
+				}
+			}
+			// A persistent branch named HEAD stays allowed.
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "HEAD", "base_branch": "main"})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("persistent HEAD: status %d body %v, want 200", resp.StatusCode, body)
+			}
+		})
+
 		t.Run("create from ephemeral base", func(t *testing.T) {
 			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
 				map[string]any{"target_branch": "from-eph", "base_branch": "scratch", "base_is_ephemeral": true})
