@@ -13,12 +13,13 @@
 // immutable pack. The preview endpoint never publishes anything — the
 // scratch odb is deleted with the request (docs/explanation/domain-model.md invariant 6).
 //
-// Status mapping (ADR-22, amended by #532 for merge): a stale
+// Status mapping (ADR-22, amended by #532 and #568 for merge): a stale
 // expected_target_sha or expected_source_sha is a 409 problem body with
-// code `conflict`, as upstream documents; merge conflicts, ff_only non-fast-forwards,
-// unrelated histories without allow_unrelated_histories, and CAS races
-// lost at publish time are 409 `conflict` (merge conflicts additionally
-// carry conflict_paths + merge_base_sha, docs/reference/http-api.md).
+// code `ref_guard_failed`; an ff_only merge that is not a fast-forward and
+// unrelated histories without allow_unrelated_histories are 412
+// `precondition_failed`; merge conflicts (a 409 MergeConflict body with
+// conflict_paths + merge_base_sha) and CAS races lost at publish time are
+// 409 (docs/reference/http-api.md).
 //
 // Fast-forwards move the ref without publishing: refs only ever name
 // objects already durable in registered packs (the source tip was a ref),
@@ -579,6 +580,9 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	if err := wmValidateStrategy(req.Strategy, req.Squash); err != nil {
 		return err
 	}
+	if req.Squash && req.CommitMessage == "" {
+		return newFieldError("commit_message", "is required with squash", "commit_message is required with squash")
+	}
 	req.ExpectedTargetSHA = lowerFullSHA(req.ExpectedTargetSHA)
 	if req.ExpectedTargetSHA != "" && !ref.ValidSHA(req.ExpectedTargetSHA) {
 		return newFieldError("expected_target_sha", "must be a 40-hex sha", "expected_target_sha must be a 40-hex sha")
@@ -795,7 +799,8 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	}
 	message := req.CommitMessage
 	if message == "" {
-		message = "Merge " + req.SourceBranch + " into " + req.TargetBranch
+		// Upstream's default (spec 5d8e1801). A squash always has a message.
+		message = "Merge branch '" + req.SourceBranch + "' into " + req.TargetBranch
 	}
 	assertf(outcome == wmResultMergeCommit || outcome == wmResultSquash, "handleMerge: outcome %q", outcome)
 	// Squash: one new commit, parent = current target tip, tree = the
