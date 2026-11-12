@@ -13,11 +13,14 @@ package api
 // (coreGit + coreSeedStores). All helpers carry a wref prefix.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -451,6 +454,309 @@ func TestWriteRefsBranchForcePreferredBase(t *testing.T) {
 				t.Fatalf("status = %d, want 400", resp.StatusCode)
 			}
 		})
+	})
+}
+
+// POST /repos/branches/create with expected_target_sha (spec 5d8e1801,
+// #803): 40 zeros requires a new branch, the current tip guards a move
+// (without force only a fast-forward), and a failed guard answers 409
+// ref_guard_failed and leaves the branch alone, even with force. Each case
+// runs on the persistent and the ephemeral namespace, through the
+// production server.
+func TestWriteRefsBranchTargetGuard(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+		zero := ref.ZeroSHA
+		post := func(t *testing.T, path string, body map[string]any) (*http.Response, []byte) {
+			t.Helper()
+			payload, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return e.doReq(t, http.MethodPost, path, fx.token, payload, "")
+		}
+		const v1 = "/api/v1/repos/branches/create"
+		requireGuard := func(t *testing.T, resp *http.Response, raw []byte, guard, current string) {
+			t.Helper()
+			wmRequireRefGuard(t, resp, raw, "expected_target_sha", current,
+				fmt.Sprintf("expected_target_sha %s does not match current tip %s", guard, current))
+		}
+
+		for _, ns := range []struct {
+			name      string
+			ephemeral bool
+		}{{"persistent", false}, {"ephemeral", true}} {
+			t.Run(ns.name, func(t *testing.T) {
+				stored := func(branch string) string {
+					if ns.ephemeral {
+						return auth.EphemeralRefName(branch)
+					}
+					return "refs/heads/" + branch
+				}
+				body := func(branch string, extra map[string]any) map[string]any {
+					b := map[string]any{"target_branch": branch, "base_ref": "main", "target_is_ephemeral": ns.ephemeral}
+					for k, v := range extra {
+						b[k] = v
+					}
+					return b
+				}
+				tip := func(t *testing.T, branch string) (string, bool) {
+					t.Helper()
+					sha, ok := wrefRefs(t, e, fx.repoID)[stored(branch)]
+					return sha, ok
+				}
+				// seed creates branch at c1 without a guard.
+				seed := func(t *testing.T, branch string) {
+					t.Helper()
+					resp, raw := post(t, v1, map[string]any{"target_branch": branch, "base_ref": fx.c1, "target_is_ephemeral": ns.ephemeral})
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("seed %s: status %d body %s", branch, resp.StatusCode, raw)
+					}
+				}
+				requireTip := func(t *testing.T, branch, want string) {
+					t.Helper()
+					if got, _ := tip(t, branch); got != want {
+						t.Fatalf("%s = %q, want %s", stored(branch), got, want)
+					}
+				}
+
+				t.Run("zeros on a new branch creates it", func(t *testing.T) {
+					branch := "zero-new-" + ns.name
+					resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": zero}))
+					var got wrefCreateBranchResponse
+					if err := json.Unmarshal(raw, &got); err != nil || resp.StatusCode != http.StatusOK ||
+						got.Message != "branch created" || got.CommitSHA != fx.c2 || got.TargetIsEphemeral != ns.ephemeral {
+						t.Fatalf("status %d body %s", resp.StatusCode, raw)
+					}
+					requireTip(t, branch, fx.c2)
+				})
+
+				t.Run("zeros on an existing branch fails, also with force", func(t *testing.T) {
+					branch := "zero-old-" + ns.name
+					seed(t, branch)
+					for _, force := range []bool{false, true} {
+						resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": zero, "force": force}))
+						requireGuard(t, resp, raw, zero, fx.c1)
+						requireTip(t, branch, fx.c1)
+					}
+				})
+
+				t.Run("the current tip with force moves the branch", func(t *testing.T) {
+					branch := "tip-move-" + ns.name
+					seed(t, branch)
+					resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": strings.ToUpper(fx.c1), "force": true}))
+					var got wrefCreateBranchResponse
+					if err := json.Unmarshal(raw, &got); err != nil || resp.StatusCode != http.StatusOK ||
+						got.Message != "branch updated" || got.CommitSHA != fx.c2 {
+						t.Fatalf("status %d body %s", resp.StatusCode, raw)
+					}
+					requireTip(t, branch, fx.c2)
+				})
+
+				t.Run("the current tip without force fast-forwards the branch", func(t *testing.T) {
+					branch := "tip-ff-" + ns.name
+					seed(t, branch)
+					resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": fx.c1}))
+					var got wrefCreateBranchResponse
+					if err := json.Unmarshal(raw, &got); err != nil || resp.StatusCode != http.StatusOK ||
+						got.Message != "branch updated" || got.CommitSHA != fx.c2 {
+						t.Fatalf("status %d body %s", resp.StatusCode, raw)
+					}
+					requireTip(t, branch, fx.c2)
+				})
+
+				t.Run("the current tip without force refuses a non-fast-forward", func(t *testing.T) {
+					branch := "tip-nonff-" + ns.name
+					seed(t, branch)
+					resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": fx.c1, "force": true}))
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("move to c2: status %d body %s", resp.StatusCode, raw)
+					}
+					resp, raw = post(t, v1, body(branch, map[string]any{"base_ref": fx.c1, "expected_target_sha": fx.c2}))
+					if resp.StatusCode != http.StatusPreconditionFailed {
+						t.Fatalf("status %d body %s, want 412", resp.StatusCode, raw)
+					}
+					want := "branch " + branch + " cannot be fast-forwarded to " + fx.c1 + " without force"
+					if msg := requireEnvelope(t, resp, raw); msg != want {
+						t.Fatalf("error = %q, want %q", msg, want)
+					}
+					requireTip(t, branch, fx.c2)
+				})
+
+				t.Run("no guard and no force keeps the existing-branch conflict", func(t *testing.T) {
+					branch := "noguard-" + ns.name
+					seed(t, branch)
+					resp, raw := post(t, v1, body(branch, nil))
+					if resp.StatusCode != http.StatusConflict {
+						t.Fatalf("status %d body %s, want 409", resp.StatusCode, raw)
+					}
+					if msg := requireEnvelope(t, resp, raw); msg != "branch already exists" {
+						t.Fatalf("error = %q, want branch already exists", msg)
+					}
+					requireTip(t, branch, fx.c1)
+				})
+
+				t.Run("a stale tip fails, also with force", func(t *testing.T) {
+					branch := "tip-stale-" + ns.name
+					seed(t, branch)
+					for _, force := range []bool{false, true} {
+						resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": fx.c2, "force": force}))
+						requireGuard(t, resp, raw, fx.c2, fx.c1)
+						requireTip(t, branch, fx.c1)
+					}
+				})
+
+				t.Run("a tip guard on a missing branch fails", func(t *testing.T) {
+					branch := "tip-missing-" + ns.name
+					for _, force := range []bool{false, true} {
+						resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": fx.c1, "force": force}))
+						requireGuard(t, resp, raw, fx.c1, zero)
+						if sha, ok := tip(t, branch); ok {
+							t.Fatalf("failed guard created %s at %s", stored(branch), sha)
+						}
+					}
+				})
+
+				t.Run("an empty guard is no guard", func(t *testing.T) {
+					branch := "empty-guard-" + ns.name
+					resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": ""}))
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("status %d body %s", resp.StatusCode, raw)
+					}
+					requireTip(t, branch, fx.c2)
+				})
+			})
+		}
+
+		t.Run("the repo-path alias checks the guard", func(t *testing.T) {
+			path := "/api/repos/" + url.PathEscape(fx.url) + "/branches/create"
+			resp, raw := post(t, path, map[string]any{"target_branch": "feature", "base_ref": "main", "expected_target_sha": zero, "force": true})
+			requireGuard(t, resp, raw, zero, fx.c1)
+			if got := wrefRefs(t, e, fx.repoID)["refs/heads/feature"]; got != fx.c1 {
+				t.Fatalf("refs/heads/feature = %q, want %s", got, fx.c1)
+			}
+		})
+
+		t.Run("a guard that is not a full sha is 400", func(t *testing.T) {
+			for _, bad := range []any{"abc", strings.Repeat("g", 40), fx.c1 + "0", fx.c1[:39], 7} {
+				resp, raw := post(t, v1, map[string]any{"target_branch": "bad-guard", "base_ref": "main", "expected_target_sha": bad})
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("guard %v: status %d body %s, want 400", bad, resp.StatusCode, raw)
+				}
+				requireEnvelope(t, resp, raw)
+				if !strings.Contains(string(raw), `"name":"expected_target_sha"`) {
+					t.Fatalf("guard %v: invalid_params does not name expected_target_sha: %s", bad, raw)
+				}
+			}
+			if sha, ok := wrefRefs(t, e, fx.repoID)["refs/heads/bad-guard"]; ok {
+				t.Fatalf("a refused guard created refs/heads/bad-guard at %s", sha)
+			}
+		})
+
+		t.Run("an allocated name takes only the zero guard", func(t *testing.T) {
+			resp, raw := post(t, v1, map[string]any{"base_ref": "main", "expected_target_sha": fx.c2})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("non-zero guard without target_branch: status %d body %s, want 400", resp.StatusCode, raw)
+			}
+			requireEnvelope(t, resp, raw)
+			resp, raw = post(t, v1, map[string]any{"base_ref": "main", "expected_target_sha": zero})
+			var got wrefCreateBranchResponse
+			if err := json.Unmarshal(raw, &got); err != nil || resp.StatusCode != http.StatusOK || got.Message != "branch created" {
+				t.Fatalf("zero guard without target_branch: status %d body %s", resp.StatusCode, raw)
+			}
+			if sha := wrefRefs(t, e, fx.repoID)["refs/heads/"+got.TargetBranch]; sha != fx.c2 {
+				t.Fatalf("allocated refs/heads/%s = %q, want %s", got.TargetBranch, sha, fx.c2)
+			}
+		})
+	})
+}
+
+// A branch that moves between the expected_target_sha check and the CAS
+// fails the guard with the new tip (#803). An allocated name with the zero
+// guard still retries a collision.
+func TestWriteRefsBranchTargetGuardRace(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		post := func(t *testing.T, srv *httptest.Server, token string, body map[string]any) (*http.Response, []byte) {
+			t.Helper()
+			payload, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/repos/branches/create", bytes.NewReader(payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			raw, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return resp, raw
+		}
+		// racing moves name to next right before the handler's first CAS.
+		racing := func(t *testing.T, fx wrefFixture, next string) *httptest.Server {
+			t.Helper()
+			raced := false
+			wrapped := *e
+			wrapped.refStore = wrefAllocateStore{Store: e.refStore, cas: func(ctx context.Context, repo, name, old, new string) (bool, error) {
+				if !raced {
+					raced = true
+					cur, ok := wrefRefs(t, e, repo)[name]
+					if !ok {
+						cur = ref.ZeroSHA
+					}
+					if won, err := e.refStore.CASRef(ctx, repo, name, cur, next); err != nil || !won {
+						return false, fmt.Errorf("racing write: won=%t err=%v", won, err)
+					}
+				}
+				return e.refStore.CASRef(ctx, repo, name, old, new)
+			}}
+			return newWrefServer(t, &wrapped)
+		}
+		for _, ephemeral := range []bool{false, true} {
+			stored := "refs/heads/raced"
+			if ephemeral {
+				stored = auth.EphemeralRefName("raced")
+			}
+			t.Run(fmt.Sprintf("zero guard, branch created meanwhile/ephemeral=%t", ephemeral), func(t *testing.T) {
+				fx := wrefSeedFixture(t, e)
+				resp, raw := post(t, racing(t, fx, fx.c1), fx.token, map[string]any{
+					"target_branch": "raced", "base_ref": "main", "target_is_ephemeral": ephemeral, "expected_target_sha": ref.ZeroSHA})
+				wmRequireRefGuard(t, resp, raw, "expected_target_sha", fx.c1,
+					fmt.Sprintf("expected_target_sha %s does not match current tip %s", ref.ZeroSHA, fx.c1))
+				if got := wrefRefs(t, e, fx.repoID)[stored]; got != fx.c1 {
+					t.Fatalf("%s = %q, want the racing write %s", stored, got, fx.c1)
+				}
+			})
+			t.Run(fmt.Sprintf("tip guard with force, branch moved meanwhile/ephemeral=%t", ephemeral), func(t *testing.T) {
+				fx := wrefSeedFixture(t, e)
+				if won, err := e.refStore.CASRef(context.Background(), fx.repoID, stored, ref.ZeroSHA, fx.c1); err != nil || !won {
+					t.Fatalf("seed %s: won=%t err=%v", stored, won, err)
+				}
+				resp, raw := post(t, racing(t, fx, fx.c2), fx.token, map[string]any{
+					"target_branch": "raced", "base_ref": fx.c1, "target_is_ephemeral": ephemeral, "expected_target_sha": fx.c1, "force": true})
+				wmRequireRefGuard(t, resp, raw, "expected_target_sha", fx.c2,
+					fmt.Sprintf("expected_target_sha %s does not match current tip %s", fx.c1, fx.c2))
+				if got := wrefRefs(t, e, fx.repoID)[stored]; got != fx.c2 {
+					t.Fatalf("%s = %q, want the racing write %s", stored, got, fx.c2)
+				}
+			})
+			t.Run(fmt.Sprintf("zero guard on an allocated name retries a collision/ephemeral=%t", ephemeral), func(t *testing.T) {
+				fx := wrefSeedFixture(t, e)
+				resp, raw := post(t, racing(t, fx, fx.c1), fx.token, map[string]any{
+					"base_ref": "main", "target_is_ephemeral": ephemeral, "expected_target_sha": ref.ZeroSHA})
+				var got wrefCreateBranchResponse
+				if err := json.Unmarshal(raw, &got); err != nil || resp.StatusCode != http.StatusOK || got.Message != "branch created" {
+					t.Fatalf("status %d body %s", resp.StatusCode, raw)
+				}
+			})
+		}
 	})
 }
 

@@ -260,6 +260,19 @@ func (s *server) wrefListRefs(w http.ResponseWriter, r *http.Request, repoID str
 	return refs, true
 }
 
+// wrefTip returns the stored tip of refName, or ref.ZeroSHA when the ref
+// does not exist.
+func (s *server) wrefTip(w http.ResponseWriter, r *http.Request, repoID, refName string) (string, bool) {
+	refs, ok := s.wrefListRefs(w, r, repoID)
+	if !ok {
+		return "", false
+	}
+	if tip, exists := refs[refName]; exists {
+		return tip, true
+	}
+	return ref.ZeroSHA, true
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/v1/repos/branches/create (git:write)
 
@@ -276,6 +289,10 @@ type wrefCreateBranchRequest struct {
 	// is given, or when the primary base names no ref. A primary base
 	// whose commit git cannot read is a 500, not a reason to fall back.
 	PreferredBase string `json:"preferred_base"`
+	// ExpectedTargetSHA guards the target tip (spec 5d8e1801, #803): 40
+	// zeros requires a missing branch, a full sha its current tip, and ""
+	// sets no guard. A failed guard changes nothing, even with force.
+	ExpectedTargetSHA string `json:"expected_target_sha"`
 }
 
 func (req *wrefCreateBranchRequest) UnmarshalJSON(data []byte) error {
@@ -293,6 +310,14 @@ func (req *wrefCreateBranchRequest) UnmarshalJSON(data []byte) error {
 	return dec.Decode((*request)(req))
 }
 
+// wrefFailTargetGuard answers a failed branches/create expected_target_sha
+// with 409 ref_guard_failed; current is the target tip, or 40 zeros.
+func wrefFailTargetGuard(w http.ResponseWriter, guard, current string) {
+	assertf(guard != current, "wrefFailTargetGuard: guard %s holds", guard)
+	writeRefGuardFailed(w, "expected_target_sha", current,
+		fmt.Sprintf("expected_target_sha %s does not match current tip %s", guard, current))
+}
+
 type wrefCreateBranchResponse struct {
 	Message           string `json:"message"`
 	TargetBranch      string `json:"target_branch"`
@@ -306,8 +331,11 @@ type wrefCreateBranchResponse struct {
 // cannot read is a 500, with no fallback), policy-checks the new ref,
 // and CAS creates it. With force, an existing target is CAS-recreated at
 // the base — no-force-push policies still deny non-fast-forward moves via a
-// real ancestry check. No new objects are created, so there is nothing to
-// publish.
+// real ancestry check. expected_target_sha set to the current tip moves
+// an existing target too, without force only as a fast-forward (412
+// otherwise). A failed expected_target_sha answers 409 ref_guard_failed and
+// leaves the target alone, with or without force. No new objects are
+// created, so there is nothing to publish.
 func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -330,6 +358,17 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	}
 	if allocate && req.Force {
 		writeErr(w, http.StatusBadRequest, "force requires target_branch")
+		return
+	}
+	guard := lowerFullSHA(req.ExpectedTargetSHA)
+	if guard != "" && !ref.ValidSHA(guard) {
+		writeInvalidField(w, "expected_target_sha", "must be a full commit SHA", "invalid expected_target_sha")
+		return
+	}
+	// An allocated name is always new, so only the zero guard can hold.
+	if allocate && guard != "" && guard != ref.ZeroSHA {
+		writeInvalidField(w, "expected_target_sha", "requires target_branch unless it is 40 zeros",
+			"expected_target_sha requires target_branch")
 		return
 	}
 	base := req.BaseRef
@@ -386,15 +425,33 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		}
 		targetRef := wrefRefName(targetBranch, req.TargetIsEphemeral)
 		// The CAS precondition: zero for plain create, the current tip when
-		// force re-creates an existing branch.
+		// force re-creates an existing branch or a guard on that tip moves
+		// it. An allocated name is new by construction, so the zero CAS is
+		// its guard.
 		oldSHA := ref.ZeroSHA
-		if req.Force {
-			refs, ok := s.wrefListRefs(w, r, repo.RepoID)
+		if req.Force || (guard != "" && !allocate) {
+			current, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
 			if !ok {
 				return
 			}
-			if cur, exists := refs[targetRef]; exists {
-				oldSHA = cur
+			if guard != "" && guard != current {
+				wrefFailTargetGuard(w, guard, current)
+				return
+			}
+			oldSHA = current
+		}
+		// Without force, a guarded move only fast-forwards (upstream's 412
+		// for "a branch creation whose target cannot be fast-forwarded").
+		if !req.Force && oldSHA != ref.ZeroSHA {
+			ff, err := wrefIsAncestor(ctx, repoPath, nil, oldSHA, baseSHA)
+			if err != nil {
+				s.internalErr(w, r, "check fast-forward", err)
+				return
+			}
+			if !ff {
+				writeErr(w, http.StatusPreconditionFailed,
+					"branch "+targetBranch+" cannot be fast-forwarded to "+baseSHA+" without force")
+				return
 			}
 		}
 		deny, err := wrefPolicyCheck(mustClaims(r), targetRef, oldSHA, baseSHA, func(a, b string) (bool, error) {
@@ -417,7 +474,19 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 			if allocate {
 				continue
 			}
-			if req.Force {
+			// The tip moved after the guard check: report the guard when the
+			// new tip fails it.
+			if guard != "" {
+				current, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
+				if !ok {
+					return
+				}
+				if current != guard {
+					wrefFailTargetGuard(w, guard, current)
+					return
+				}
+			}
+			if req.Force || oldSHA != ref.ZeroSHA {
 				writeErr(w, http.StatusConflict, "branch moved concurrently")
 				return
 			}
