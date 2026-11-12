@@ -111,10 +111,11 @@ replica runs the new one:
    Do not copy into a repository that has a sync base: when the link forwards pushes, a
    copied ref reaches the connected upstream. Create a repository without a sync base and
    copy into that one instead.
-4. Upgrade every replica, then send import pushes again. Each replica's cache keeps a
-   `<repo_id>+import.git` directory that no git request uses. LFS reclamation can
-   re-create it while the old key holds refs. The cache is rebuildable, so deleting that
-   directory is safe.
+4. Upgrade every replica, then send import pushes again. A replica's cache can keep a
+   `<repo_id>+import.git` directory that no git request uses: 0.20.0 made it when it
+   served the old key, and repack and LFS reclamation jobs for the old key can make it
+   again, on any replica that runs them. Check every replica. The cache is rebuildable, so
+   deleting that directory is safe.
 
 If a replica already runs the new version and you did not copy the data, the data is
 still in storage. Stop every replica of the new version, start 0.20.0 on the same stores,
