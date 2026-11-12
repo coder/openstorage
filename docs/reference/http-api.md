@@ -489,9 +489,10 @@ target branch. It applies to the persistent and the ephemeral namespace:
   branch was at the base when the server last wrote or read it. It can also answer a
   request that lost the race to another writer that made the same change: the server
   then counts that change as this request's, and for a persistent branch a second
-  push webhook and upstream sync poke follow. So a 40-zero guard is not a create-once
-  lock: two requests that create the same branch at the same base can both answer
-  `200`.
+  push webhook and upstream sync poke follow. A lost create counts as won only when
+  a storage error hid the outcome of the write. So a 40-zero guard is not a
+  create-once lock under storage errors: then two requests that create the same
+  branch at the same base can both answer `200`.
 - A guarded or forced move of a target that already points at the base answers `200`
   ("branch updated") without a ref write, so no webhook or upstream sync follows. Ref
   policies still apply. Without a guard and without `force`, such a target answers
