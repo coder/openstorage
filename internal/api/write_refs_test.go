@@ -735,6 +735,28 @@ func TestWriteRefsBranchTargetGuardRace(t *testing.T) {
 			}}
 			return newWrefServer(t, &wrapped)
 		}
+		// racingIdempotent is racing(before, "") behind production's
+		// ref.IdempotentCAS.
+		racingIdempotent := func(t *testing.T, before string) *httptest.Server {
+			t.Helper()
+			raced := false
+			racer := wrefAllocateStore{Store: e.refStore, cas: func(ctx context.Context, repo, name, old, new string) (bool, error) {
+				if !raced {
+					raced = true
+					cur, ok := wrefRefs(t, e, repo)[name]
+					if !ok {
+						cur = ref.ZeroSHA
+					}
+					if won, err := e.refStore.CASRef(ctx, repo, name, cur, before); err != nil || !won {
+						return false, fmt.Errorf("racing write %s -> %s: won=%t err=%v", cur, before, won, err)
+					}
+				}
+				return e.refStore.CASRef(ctx, repo, name, old, new)
+			}}
+			wrapped := *e
+			wrapped.refStore = wrefAllocateStore{Store: racer, cas: ref.IdempotentCAS{RefStore: racer}.CASRef}
+			return newWrefServer(t, &wrapped)
+		}
 		guardDetail := func(guard, current string) string {
 			return fmt.Sprintf("expected_target_sha %s does not match current tip %s", guard, current)
 		}
@@ -784,6 +806,20 @@ func TestWriteRefsBranchTargetGuardRace(t *testing.T) {
 				resp, raw := post(t, racing(t, ref.ZeroSHA, ""), fx.token, body(map[string]any{"expected_target_sha": fx.c1}))
 				wmRequireRefGuard(t, resp, raw, "expected_target_sha", ref.ZeroSHA, guardDetail(fx.c1, ref.ZeroSHA))
 				requireRef(t, fx, ref.ZeroSHA)
+			})
+			t.Run(fmt.Sprintf("tip guard, branch moved to the base meanwhile/ephemeral=%t", ephemeral), func(t *testing.T) {
+				// Production wraps the ref store in ref.IdempotentCAS, which
+				// counts a lost update whose ref already holds the target as
+				// won: the request answers 200.
+				fx := wrefSeedFixture(t, e)
+				seed(t, fx)
+				resp, raw := post(t, racingIdempotent(t, fx.c2), fx.token, body(map[string]any{"expected_target_sha": fx.c1}))
+				var got wrefCreateBranchResponse
+				if err := json.Unmarshal(raw, &got); err != nil || resp.StatusCode != http.StatusOK ||
+					got.Message != "branch updated" || got.CommitSHA != fx.c2 {
+					t.Fatalf("status %d body %s, want 200 branch updated at %s", resp.StatusCode, raw, fx.c2)
+				}
+				requireRef(t, fx, fx.c2)
 			})
 			t.Run(fmt.Sprintf("tip guard, branch moved away and back/ephemeral=%t", ephemeral), func(t *testing.T) {
 				fx := wrefSeedFixture(t, e)

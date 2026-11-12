@@ -708,6 +708,46 @@ func TestCommitPackTotalSizeLimit(t *testing.T) {
 	})
 }
 
+// TestFirstCommitZeroGuard pins spec 5d8e1801: 40 zeros as
+// expected_target_sha creates the first commit of an empty repository
+// without base_branch, on commit-pack and diff-commit. Once the branch
+// exists, the same guard fails with its tip.
+func TestFirstCommitZeroGuard(t *testing.T) {
+	patch := "diff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+a\n"
+	for _, tc := range []struct {
+		route   string
+		files   []map[string]any
+		content any
+	}{
+		{"commit-pack", []map[string]any{{"path": "a.txt", "content_id": "id-a", "operation": "upsert"}}, wctChunk("id-a", []byte("a\n"), true)},
+		{"diff-commit", nil, wctDiffChunk([]byte(patch), true)},
+	} {
+		t.Run(tc.route, func(t *testing.T) {
+			runBackends(t, func(t *testing.T, e *testEnv) {
+				srv := wctServer(t, e)
+				_, writeTok, readTok := wctRepo(t, e)
+				post := func() (*http.Response, []byte) {
+					t.Helper()
+					body := wctLines(t, wctMeta("main", "first", tc.files, map[string]any{"expected_target_sha": ref.ZeroSHA}), tc.content)
+					return wctPost(t, srv, "/api/v1/repos/"+tc.route, writeTok, bytes.NewReader(body))
+				}
+				resp, raw := post()
+				env := wctRequireOK(t, resp, raw)
+				if env.Result.OldSHA != ref.ZeroSHA {
+					t.Fatalf("old_sha = %q, want 40 zeros", env.Result.OldSHA)
+				}
+				var commits listCommitsResponse
+				wctReadJSON(t, e, "/api/v1/repos/commits?branch=main&limit=10", readTok, &commits)
+				if len(commits.Commits) != 1 || commits.Commits[0].SHA != env.Commit.CommitSHA || len(commits.Commits[0].ParentSHAs) != 0 {
+					t.Fatalf("main history = %+v, want the one root commit %s", commits.Commits, env.Commit.CommitSHA)
+				}
+				resp, raw = post()
+				assertCommitRefGuard(t, resp.StatusCode, raw, "main", env.Commit.CommitSHA, env.Commit.CommitSHA)
+			})
+		})
+	}
+}
+
 // TestCommitPackCASRace loses the publish-time CAS deterministically: the
 // handler snapshots the ref BEFORE materializing the cache (fresh repo -> no
 // cache dir yet), so once the cache dir appears the snapshot is taken and
