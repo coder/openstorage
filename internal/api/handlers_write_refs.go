@@ -478,9 +478,20 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// The branch is already at the base: no ref write, so no
-		// generation bump, webhook or sync poke for an unchanged ref.
+		// generation bump, webhook or sync poke for an unchanged ref. The
+		// tip was read before the base resolved, so read it again, as the
+		// CAS would have checked it.
 		if oldSHA != ref.ZeroSHA && oldSHA == baseSHA {
-			wrefCreateBranchOK(w, "branch updated", targetBranch, req.TargetIsEphemeral, baseSHA)
+			now, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
+			switch {
+			case !ok:
+			case now == oldSHA:
+				wrefCreateBranchOK(w, "branch updated", targetBranch, req.TargetIsEphemeral, baseSHA)
+			case guard != "":
+				wrefFailTargetGuard(w, guard, now)
+			default:
+				writeErr(w, http.StatusConflict, "branch moved concurrently")
+			}
 			return
 		}
 		won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)

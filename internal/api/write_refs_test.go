@@ -947,6 +947,65 @@ func TestWriteRefsBranchCreateNoOpMove(t *testing.T) {
 				}
 			})
 		}
+		post := func(t *testing.T, srv *httptest.Server, token string, body map[string]any) (*http.Response, []byte) {
+			t.Helper()
+			payload, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/repos/branches/create", bytes.NewReader(payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			raw, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return resp, raw
+		}
+		// movedAfterRead moves target to next right after the handler's first
+		// read of it, before the base resolves.
+		movedAfterRead := func(t *testing.T, target, next string) *httptest.Server {
+			t.Helper()
+			moved := false
+			wrapped := *e
+			wrapped.refStore = wrefGetRefStore{Store: e.refStore, get: func(ctx context.Context, repo, name string) (string, error) {
+				tip, err := e.refStore.GetRef(ctx, repo, name)
+				if !moved && name == target && err == nil {
+					moved = true
+					if won, err := e.refStore.CASRef(ctx, repo, name, tip, next); err != nil || !won {
+						return "", fmt.Errorf("move %s: won=%t err=%v", name, won, err)
+					}
+				}
+				return tip, err
+			}}
+			return newWrefServer(t, &wrapped)
+		}
+		t.Run("a target moved after the tip read fails the guard", func(t *testing.T) {
+			fx := wrefSeedFixture(t, e)
+			resp, raw := post(t, movedAfterRead(t, "refs/heads/feature", fx.c2), fx.token,
+				map[string]any{"target_branch": "feature", "base_ref": fx.c1, "expected_target_sha": fx.c1})
+			wmRequireRefGuard(t, resp, raw, "expected_target_sha", fx.c2,
+				fmt.Sprintf("expected_target_sha %s does not match current tip %s", fx.c1, fx.c2))
+		})
+		t.Run("a target moved after the tip read conflicts with force", func(t *testing.T) {
+			fx := wrefSeedFixture(t, e)
+			resp, raw := post(t, movedAfterRead(t, "refs/heads/feature", fx.c2), fx.token,
+				map[string]any{"target_branch": "feature", "base_ref": fx.c1, "force": true})
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("status %d body %s, want 409", resp.StatusCode, raw)
+			}
+			if msg := requireEnvelope(t, resp, raw); msg != "branch moved concurrently" {
+				t.Fatalf("error = %q, want branch moved concurrently", msg)
+			}
+		})
 		t.Run("no-push policy still denies", func(t *testing.T) {
 			tok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url,
 				scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite},
