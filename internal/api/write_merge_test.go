@@ -168,6 +168,17 @@ func wmParents(t *testing.T, e *testEnv, repoID, commitSHA string) []string {
 	return strings.Fields(out)
 }
 
+// wmMessage returns the full message of a commit from the
+// (re-)materialized cache repo, without its final newlines.
+func wmMessage(t *testing.T, e *testEnv, repoID, commitSHA string) string {
+	t.Helper()
+	repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, repoID, "main")
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	return strings.TrimRight(coreGit(t, repoPath, "log", "-1", "--format=%B", commitSHA), "\n")
+}
+
 // wmTargets are the pre-seeded target branches (all at the main tip c2) so
 // mutation tests stay independent of each other.
 var wmTargets = []string{
@@ -176,6 +187,7 @@ var wmTargets = []string{
 	"t-pol-nopush", "t-pol-nff", "t-pol-vs-ff", "t-pol-vs-merge",
 	"t-alias-ref", "t-alias-refsheads", "t-alias-both",
 	"t-pin-ff", "t-pin-merge", "t-pin-alias",
+	"t-squash-nomsg", "t-defmsg", "t-defmsg-ref",
 }
 
 // wmFixture is one seeded repo for the merge tests.
@@ -541,7 +553,7 @@ func TestMergeStrategies(t *testing.T) {
 		t.Run("squash collapses to a single-parent commit", func(t *testing.T) {
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("multi", "t-squash", "merge", map[string]any{
-					"squash": true, "author": wmTestAuthor,
+					"squash": true, "author": wmTestAuthor, "commit_message": "squash msg",
 				}))
 			body := wmDecode(t, raw)
 			if resp.StatusCode != http.StatusOK || body["result"] != "squash" {
@@ -557,6 +569,48 @@ func TestMergeStrategies(t *testing.T) {
 				rresp, rbody := e.doReq(t, http.MethodGet, "/api/v1/repos/file?path="+f+"&ref=t-squash", fx.token, nil, "")
 				if rresp.StatusCode != http.StatusOK {
 					t.Errorf("read %s = %d %q", f, rresp.StatusCode, rbody)
+				}
+			}
+			if msg := wmMessage(t, e, fx.repoID, commit); msg != "squash msg" {
+				t.Errorf("squash message = %q, want %q", msg, "squash msg")
+			}
+		})
+
+		// Spec 5d8e1801 (#807): squash requires commit_message. Without
+		// one the merge answers 400 before it reads any branch.
+		t.Run("squash needs commit_message", func(t *testing.T) {
+			for _, extra := range []map[string]any{
+				{"squash": true, "author": wmTestAuthor},
+				{"squash": true, "author": wmTestAuthor, "commit_message": ""},
+			} {
+				resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, wmMergeBody("multi", "t-squash-nomsg", "ff_prefer", extra))
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, body %s, want 400", resp.StatusCode, raw)
+				}
+				if msg := wmProblem(t, resp, raw); msg != "commit_message is required with squash" {
+					t.Fatalf("error = %q", msg)
+				}
+				if body := wmDecode(t, raw); body["code"] != "bad_request" {
+					t.Fatalf("code = %v, want bad_request", body["code"])
+				}
+			}
+			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/t-squash-nomsg"]; got != fx.c2 {
+				t.Fatalf("t-squash-nomsg moved to %q", got)
+			}
+		})
+
+		// Spec 5d8e1801 (#807): a merge commit without commit_message gets
+		// git's form, with the branch names of the request.
+		t.Run("default merge message", func(t *testing.T) {
+			for source, target := range map[string]string{"feature": "t-defmsg", "refs/heads/ffsrc": "t-defmsg-ref"} {
+				body := map[string]any{"source_ref": source, "target_branch": target, "strategy": "merge", "author": wmTestAuthor}
+				resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, body)
+				if resp.StatusCode != http.StatusOK || wmDecode(t, raw)["result"] != "merge_commit" {
+					t.Fatalf("%s: status %d body %s", source, resp.StatusCode, raw)
+				}
+				want := "Merge branch '" + strings.TrimPrefix(source, "refs/heads/") + "' into " + target
+				if msg := wmMessage(t, e, fx.repoID, wmDecode(t, raw)["commit_sha"].(string)); msg != want {
+					t.Errorf("%s: message = %q, want %q", source, msg, want)
 				}
 			}
 		})

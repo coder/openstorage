@@ -287,14 +287,13 @@ Upstream evolves continuously, so drift is tracked in the open:
     current tip guards a move, and a failed guard answers `409` without changing the
     branch, even with `force`
     ([#803](https://github.com/coder/openstorage/issues/803),
-    [details](../reference/http-api.md#guarded-branch-create-and-move)).
-    These parts are open:
+    [details](../reference/http-api.md#guarded-branch-create-and-move)). A squash
+    merge requires `commit_message`, and a merge commit without one gets the message
+    `Merge branch '<source>' into <target>`
+    ([#807](https://github.com/coder/openstorage/issues/807)). These parts are open:
     - File modes on commit writes: permission bits such as `644` and regular-file
       modes such as `100664` are stored as `100755` or `100644`
       ([#806](https://github.com/coder/openstorage/issues/806)).
-    - A squash merge requires `commit_message`, and a merge commit without one gets
-      the message `Merge branch '<source>' into <target>`
-      ([#807](https://github.com/coder/openstorage/issues/807)).
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled
