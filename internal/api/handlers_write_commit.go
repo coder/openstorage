@@ -505,6 +505,10 @@ func wcPathShapeError(p string) error {
 
 var wcValidModes = map[string]bool{"100644": true, "100755": true, "120000": true, "160000": true}
 
+// wcModeAliases are the permission-style modes that upstream stores as a
+// regular file (spec 5d8e1801, #806).
+var wcModeAliases = map[string]string{"644": "100644", "100664": "100644", "755": "100755", "100775": "100755"}
+
 // wcValidateBranchParam validates one branch-name request field (docs/explanation/streaming-commit-protocols.md:
 // no refs/ prefix; conservative component rule shared with repo creation).
 func wcValidateBranchParam(field, name string) error {
@@ -591,6 +595,9 @@ func wcValidateFiles(files []wcFileOp) error {
 		case "upsert":
 			if f.Mode == "" {
 				f.Mode = "100644" // SDK default when the caller sets none
+			}
+			if mode, ok := wcModeAliases[f.Mode]; ok {
+				f.Mode = mode
 			}
 			if !wcValidModes[f.Mode] {
 				return fmt.Errorf("invalid mode %q for %q", f.Mode, f.Path)

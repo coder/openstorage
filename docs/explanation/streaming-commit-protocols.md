@@ -68,7 +68,9 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
   get 400 `invalid`.
 - Clients normalize paths (leading slashes stripped); the backend should still reject
   `..` traversal and absolute paths defensively.
-- Modes: `100644`, `100755`, `120000` (symlink), `160000` (submodule).
+- Modes: `100644`, `100755`, `120000` (symlink), `160000` (submodule). `644` and
+  `100664` are stored as `100644`, and `755` and `100775` as `100755`, as upstream
+  does. Any other mode gets 400 `invalid`.
 
 ### Server semantics
 

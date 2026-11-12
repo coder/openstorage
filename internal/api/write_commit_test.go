@@ -491,6 +491,48 @@ func TestCommitPack(t *testing.T) {
 	})
 }
 
+// TestCommitPackModeAliases pins #806 (spec 5d8e1801): commit-pack stores
+// the permission-style modes that upstream normalizes as a regular file or
+// an executable, and still refuses every other mode.
+func TestCommitPackModeAliases(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+
+		stored := map[string]string{
+			"644": "100644", "100664": "100644", "100644": "100644",
+			"755": "100755", "100775": "100755", "100755": "100755",
+		}
+		var files []map[string]any
+		var chunks []any
+		for mode := range stored {
+			files = append(files, map[string]any{"path": "m" + mode, "content_id": "id-" + mode, "operation": "upsert", "mode": mode})
+			chunks = append(chunks, wctChunk("id-"+mode, []byte(mode+"\n"), true))
+		}
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok,
+			bytes.NewReader(wctLines(t, append([]any{wctMeta("main", "modes", files, nil)}, chunks...)...)))
+		wctRequireOK(t, resp, body)
+		var listing listFilesResponse
+		wctReadJSON(t, e, "/api/v1/repos/files?ref=main", readTok, &listing)
+		got := map[string]string{}
+		for _, entry := range listing.Entries {
+			got[strings.TrimPrefix(entry.Path, "m")] = entry.Mode
+		}
+		if !maps.Equal(got, stored) {
+			t.Fatalf("stored modes = %v, want %v", got, stored)
+		}
+
+		for _, mode := range []string{"600", "664", "775", "777", "100600", "100700", "0644", "0100644", "1006440", "64", "100", "040000", "abc"} {
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+				wctMeta("main", "bad mode", []map[string]any{{"path": "bad", "content_id": "id1", "operation": "upsert", "mode": mode}}, nil),
+				wctChunk("id1", []byte("x\n"), true))))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `invalid mode \"`+mode+`\" for \"bad\"`) {
+				t.Errorf("mode %q: status %d body %s, want 400 invalid mode", mode, resp.StatusCode, body)
+			}
+		}
+	})
+}
+
 func TestCommitPackValidation(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)
