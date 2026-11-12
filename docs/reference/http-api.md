@@ -483,19 +483,15 @@ target branch. It applies to the persistent and the ephemeral namespace:
 - A failed guard answers `409` `ref_guard_failed` with `guard: "expected_target_sha"` and
   `current_sha`, the branch tip or 40 zeros when the branch does not exist. The branch
   does not change, with or without `force`.
-- When another writer moves the branch while the request runs, the guard still holds:
-  this request changes the branch only from the guarded tip, and only to the base. The
-  answer is one of these:
-  - `200` ("branch updated"): the branch was at the base when the server last wrote
-    or read it. Either this request moved it, or, after a guard on a tip, another
-    writer moved it there first. The server then counts the update as won although this request wrote
-    nothing, and for a persistent branch a second push webhook and upstream sync poke
-    follow.
-  - `409` `ref_guard_failed`: `current_sha` is the tip (or 40 zeros) that the server
-    read last.
-  - `409` `conflict` ("branch moved concurrently", or "branch already exists" after a
-    40-zero guard without `force`): the write failed, and the branch was back at the
-    guarded tip (missing again, after a 40-zero guard) when the server read it again.
+- When another writer changes the branch while the request runs, the guard still
+  holds: this request changes the branch only from the guarded tip, and only to the
+  base. A `409` leaves the branch as the other writer left it. A `200` means that the
+  branch was at the base when the server last wrote or read it. It can also answer a
+  request that lost the race to another writer that made the same change: the server
+  then counts that change as this request's, and for a persistent branch a second
+  push webhook and upstream sync poke follow. So a 40-zero guard is not a create-once
+  lock: two requests that create the same branch at the same base can both answer
+  `200`.
 - A guarded or forced move of a target that already points at the base answers `200`
   ("branch updated") without a ref write, so no webhook or upstream sync follows. Ref
   policies still apply. Without a guard and without `force`, such a target answers
