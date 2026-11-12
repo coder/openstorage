@@ -618,13 +618,15 @@ func TestWriteRefsBranchTargetGuard(t *testing.T) {
 					}
 				})
 
-				t.Run("an empty guard is no guard", func(t *testing.T) {
-					branch := "empty-guard-" + ns.name
-					resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": ""}))
-					if resp.StatusCode != http.StatusOK {
-						t.Fatalf("status %d body %s", resp.StatusCode, raw)
+				t.Run("an empty or null guard is no guard", func(t *testing.T) {
+					for i, empty := range []any{"", nil} {
+						branch := fmt.Sprintf("empty-guard-%d-%s", i, ns.name)
+						resp, raw := post(t, v1, body(branch, map[string]any{"expected_target_sha": empty}))
+						if resp.StatusCode != http.StatusOK {
+							t.Fatalf("guard %#v: status %d body %s", empty, resp.StatusCode, raw)
+						}
+						requireTip(t, branch, fx.c2)
 					}
-					requireTip(t, branch, fx.c2)
 				})
 			})
 		}
@@ -857,27 +859,62 @@ func TestWriteRefsBranchTargetGuardFreshTip(t *testing.T) {
 			map[string]any{"target_branch": "warm", "base_ref": "main"}); resp.StatusCode != http.StatusOK {
 			t.Fatalf("warm: status %d body %v", resp.StatusCode, body)
 		}
-		published := false
-		wrapped := *e
-		wrapped.refStore = wrefGetRefStore{Store: e.refStore, get: func(ctx context.Context, repoID, name string) (string, error) {
-			if !published && name == "refs/heads/racy" {
-				published = true
-				coreSeedStores(t, e, repoID, dir, nil)
-				if won, err := e.refStore.CASRef(ctx, repoID, name, c1, c2); err != nil || !won {
-					return "", fmt.Errorf("publish c2: won=%t err=%v", won, err)
+		// serverPublishing publishes the packs of dir and moves target from
+		// c1 to tip right before the handler's first read of that ref.
+		serverPublishing := func(t *testing.T, target, tip string) (*httptest.Server, *bool) {
+			t.Helper()
+			published := false
+			wrapped := *e
+			wrapped.refStore = wrefGetRefStore{Store: e.refStore, get: func(ctx context.Context, repoID, name string) (string, error) {
+				if !published && name == target {
+					published = true
+					coreSeedStores(t, e, repoID, dir, nil)
+					if won, err := e.refStore.CASRef(ctx, repoID, name, c1, tip); err != nil || !won {
+						return "", fmt.Errorf("publish %s: won=%t err=%v", tip, won, err)
+					}
 				}
+				return e.refStore.GetRef(ctx, repoID, name)
+			}}
+			return newWrefServer(t, &wrapped), &published
+		}
+
+		t.Run("guarded move without force", func(t *testing.T) {
+			// c2 is the tip now and not an ancestor of side: 412, not 500.
+			srv, published := serverPublishing(t, "refs/heads/racy", c2)
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", token,
+				map[string]any{"target_branch": "racy", "base_ref": "side", "expected_target_sha": c2})
+			if resp.StatusCode != http.StatusPreconditionFailed || !*published {
+				t.Fatalf("status %d body %v published %t, want 412", resp.StatusCode, body, *published)
 			}
-			return e.refStore.GetRef(ctx, repoID, name)
-		}}
-		// c2 is the tip now and not an ancestor of side: 412, not 500.
-		resp, body := wrefDo(t, newWrefServer(t, &wrapped), "POST", "/api/v1/repos/branches/create", token,
-			map[string]any{"target_branch": "racy", "base_ref": "side", "expected_target_sha": c2})
-		if resp.StatusCode != http.StatusPreconditionFailed || !published {
-			t.Fatalf("status %d body %v published %t, want 412", resp.StatusCode, body, published)
-		}
-		if got := wrefRefs(t, e, repo.RepoID)["refs/heads/racy"]; got != c2 {
-			t.Fatalf("refs/heads/racy = %q, want %s", got, c2)
-		}
+			if got := wrefRefs(t, e, repo.RepoID)["refs/heads/racy"]; got != c2 {
+				t.Fatalf("refs/heads/racy = %q, want %s", got, c2)
+			}
+		})
+
+		t.Run("forced move under no-force-push", func(t *testing.T) {
+			// The policy's ancestry check needs the new tip c3 too: 403,
+			// not 500. c3 is new, so the read cache cannot hold it yet.
+			coreGit(t, dir, "checkout", "-q", "-b", "forced", c1)
+			coreWriteFile(t, dir, "f.txt", "f\n")
+			coreGit(t, dir, "add", ".")
+			coreGit(t, dir, "commit", "-q", "-m", "c3")
+			c3 := coreRevParse(t, dir, "HEAD")
+			if won, err := e.refStore.CASRef(ctx, repo.RepoID, "refs/heads/forced", ref.ZeroSHA, c1); err != nil || !won {
+				t.Fatalf("seed refs/heads/forced: won=%t err=%v", won, err)
+			}
+			tok := e.mint(t, tokenSpec{iss: org, repo: url,
+				scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite},
+				refs:   `[["refs/heads/forced", ["no-force-push"]]]`})
+			srv, published := serverPublishing(t, "refs/heads/forced", c3)
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", tok,
+				map[string]any{"target_branch": "forced", "base_ref": "side", "force": true})
+			if resp.StatusCode != http.StatusForbidden || !*published {
+				t.Fatalf("status %d body %v published %t, want 403", resp.StatusCode, body, *published)
+			}
+			if got := wrefRefs(t, e, repo.RepoID)["refs/heads/forced"]; got != c3 {
+				t.Fatalf("refs/heads/forced = %q, want %s", got, c3)
+			}
+		})
 	})
 }
 
