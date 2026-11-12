@@ -483,19 +483,19 @@ target branch. It applies to the persistent and the ephemeral namespace:
 - A failed guard answers `409` `ref_guard_failed` with `guard: "expected_target_sha"` and
   `current_sha`, the branch tip or 40 zeros when the branch does not exist. The branch
   does not change, with or without `force`.
-- The server checks the guard when the request starts, and then writes with a
-  compare-and-swap from the guarded tip. When another writer moves the branch in
-  between, the branch state at the write decides the answer:
-  - At another commit, or deleted: `409` `ref_guard_failed`, with the new tip (or 40
-    zeros) as `current_sha`.
-  - Already at the base, after a guard on the tip: `200` ("branch updated"). This
-    request wrote nothing, but the server counts the update as won. For a persistent
-    branch, a second push webhook and upstream sync poke follow. After a 40-zero guard,
-    a branch created at the base fails the guard instead.
-  - Back at the guarded tip: the write succeeds (`200`). The guard cannot see a move
-    away and back that ends before the write.
-  - Away at the write, but back at the guarded tip when the server reads it again
-    after the failed write: `409` `conflict` ("branch moved concurrently").
+- When another writer moves the branch while the request runs, the guard still holds:
+  this request changes the branch only from the guarded tip, and only to the base. The
+  answer is one of these:
+  - `200` ("branch updated"): the branch was at the base when the server last wrote
+    or read it. Either this request moved it, or, after a guard on a tip, another
+    writer moved it there first. The server then counts the update as won although this request wrote
+    nothing, and for a persistent branch a second push webhook and upstream sync poke
+    follow.
+  - `409` `ref_guard_failed`: `current_sha` is the tip (or 40 zeros) that the server
+    read last.
+  - `409` `conflict` ("branch moved concurrently", or "branch already exists" after a
+    40-zero guard without `force`): the write failed, and the branch was back at the
+    guarded tip (missing again, after a 40-zero guard) when the server read it again.
 - A guarded or forced move of a target that already points at the base answers `200`
   ("branch updated") without a ref write, so no webhook or upstream sync follows. Ref
   policies still apply. Without a guard and without `force`, such a target answers
