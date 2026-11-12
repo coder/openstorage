@@ -408,7 +408,11 @@ func preReceive(ctx context.Context) (retErr error) {
 	evalOne := func(i int) error {
 		if !verdictDone[i] {
 			c := commands[i]
-			verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+			if hiddenOnRemote(repo, c.ref) {
+				verdicts[i] = refusef("ref %s is hidden on this remote, which takes no refs under refs/namespaces/ (the HTTP API writes ephemeral branches)", c.ref)
+			} else {
+				verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+			}
 			verdictDone[i] = true
 		}
 		return verdicts[i]
@@ -527,6 +531,14 @@ func preReceive(ctx context.Context) (retErr error) {
 			}
 		}
 		for i, c := range commands {
+			// git refuses a hidden ref before any update hook runs
+			// (serviceCmd): it never commits, so it takes no hold and no
+			// sidecar marker. A hold would block hydration and REST writes
+			// of that ephemeral branch for as long as the client keeps
+			// the push open.
+			if hiddenOnRemote(repo, c.ref) {
+				continue
+			}
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
 			// literal refs/heads to pre-receive yet can never complete
@@ -1314,6 +1326,17 @@ func pushRefDeletable(name string) bool {
 	// The whole lock path must fit PATH_MAX against the ACTUAL repository
 	// directory (round-21 P2 established the budget for creations).
 	return !pushRefPathTooLong(pushRepoDirLen(), len(name))
+}
+
+// hiddenOnRemote reports whether receive-pack hides refName on the remote
+// of storage key repo (serviceCmd). git refuses such a command before
+// pre-receive and runs no update hook for it, yet still lists it on
+// pre-receive's stdin and, under --atomic, commits the other commands. So
+// pre-receive's verdict denies it: an atomic push that names one lands
+// nothing, and a pack that only such commands need is never published.
+func hiddenOnRemote(repo, refName string) bool {
+	// git hides the prefix itself too: it drops the trailing slash.
+	return persistentKey(repo) && (strings.HasPrefix(refName, persistentHiddenRefs) || refName+"/" == persistentHiddenRefs)
 }
 
 // pushCommandUpdatable applies the right name gate for one command:
