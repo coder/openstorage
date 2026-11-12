@@ -437,8 +437,8 @@ func preReceive(ctx context.Context) (retErr error) {
 	// name and aborting the local atomic transaction, so letting one
 	// through recreates the authority-accepted/client-rejected wedge.
 	if atomicPush {
-		// Evaluated one command at a time, name check first, STOPPING at
-		// the first denial (Codex round-10 P2): a denied atomic push's
+		// Evaluated one command at a time (each command's name check
+		// before its policy), STOPPING at the first denial (Codex round-10 P2): a denied atomic push's
 		// outcome is already fixed, and each further evaluation can cost
 		// subprocess work (no-force-push runs git merge-base, verify-sig
 		// walks and verifies) — eager whole-slice evaluation let one

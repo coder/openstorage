@@ -398,10 +398,9 @@ func TestPersistentRemoteIgnoresServeGitProtocol(t *testing.T) {
 	work := initWorkRepo(t)
 	persistent := remoteURL(node, repo, token)
 	mustGit(t, work, "push", persistent, "HEAD:refs/heads/main")
-	for _, service := range []string{"git-upload-pack", "git-receive-pack"} {
-		if adv := smartHTTPAt(t, node, repo, token, http.MethodGet, "info/refs?service="+service, ""); strings.Contains(adv, "version 2") || !strings.Contains(adv, "refs/heads/main") {
-			t.Fatalf("%s advertisement is not protocol v0:\n%q", service, adv)
-		}
+	// Only upload-pack speaks protocol v2: receive-pack never does.
+	if adv := smartHTTPAt(t, node, repo, token, http.MethodGet, "info/refs?service=git-upload-pack", ""); strings.Contains(adv, "version 2") || !strings.Contains(adv, "refs/heads/main") {
+		t.Fatalf("upload-pack advertisement is not protocol v0:\n%q", adv)
 	}
 	// The RPC child speaks v0 too: a v2 fetch request of a commit that only
 	// an ephemeral branch reaches gets no pack, and a v0 want of it gets
