@@ -571,7 +571,8 @@ func wcValidateMetadata(md *wcMetadata) error {
 }
 
 // wcValidateFiles checks the commit-pack file-operation table: unique
-// paths + content ids, safe paths, known modes/operations.
+// paths + content ids, safe paths, known modes/operations. It fills in the
+// default operation and mode in place.
 func wcValidateFiles(files []wcFileOp) error {
 	paths := make(map[string]bool, len(files))
 	ids := make(map[string]bool, len(files))
@@ -584,13 +585,20 @@ func wcValidateFiles(files []wcFileOp) error {
 			return fmt.Errorf("duplicate path %q", f.Path)
 		}
 		paths[f.Path] = true
-		if f.ContentID == "" {
+		// The spec: operation defaults to upsert, and content_id is
+		// required for an upsert only.
+		if f.Operation == "" {
+			f.Operation = "upsert"
+		}
+		if f.ContentID == "" && f.Operation == "upsert" {
 			return fmt.Errorf("missing content_id for %q", f.Path)
 		}
-		if ids[f.ContentID] {
-			return fmt.Errorf("duplicate content_id %q", f.ContentID)
+		if f.ContentID != "" {
+			if ids[f.ContentID] {
+				return fmt.Errorf("duplicate content_id %q", f.ContentID)
+			}
+			ids[f.ContentID] = true
 		}
-		ids[f.ContentID] = true
 		switch f.Operation {
 		case "upsert":
 			if f.Mode == "" {

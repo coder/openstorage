@@ -538,6 +538,66 @@ func TestCommitPackModeAliases(t *testing.T) {
 	})
 }
 
+// TestCommitPackFileDefaults pins two FileOperation rules of the spec: an
+// entry without operation is an upsert, and a delete needs no content_id.
+func TestCommitPackFileDefaults(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+		ls := func(t *testing.T) map[string]string {
+			t.Helper()
+			var listing listFilesResponse
+			wctReadJSON(t, e, "/api/v1/repos/files?ref=main", readTok, &listing)
+			got := map[string]string{}
+			for _, entry := range listing.Entries {
+				got[entry.Path] = entry.Mode
+			}
+			return got
+		}
+
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "no operation", []map[string]any{
+				{"path": "a.txt", "content_id": "id-a"},
+				{"path": "b.txt", "content_id": "id-b", "operation": ""},
+			}, nil),
+			wctChunk("id-a", []byte("a\n"), true),
+			wctChunk("id-b", []byte("b\n"), true))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); !maps.Equal(got, map[string]string{"a.txt": "100644", "b.txt": "100644"}) {
+			t.Fatalf("files = %v, want a.txt and b.txt as 100644", got)
+		}
+
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "delete without content_id", []map[string]any{
+				{"path": "a.txt", "operation": "delete"},
+				{"path": "b.txt", "content_id": "", "operation": "delete"},
+			}, nil))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); len(got) != 0 {
+			t.Fatalf("files = %v, want none after the deletes", got)
+		}
+
+		for name, files := range map[string][]map[string]any{
+			"upsert without content_id":  {{"path": "c.txt"}},
+			"explicit upsert without id": {{"path": "c.txt", "operation": "upsert"}},
+		} {
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, wctMeta("main", "m", files, nil))))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `missing content_id for \"c.txt\"`) {
+				t.Errorf("%s: status %d body %s, want 400 missing content_id", name, resp.StatusCode, body)
+			}
+		}
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{
+				{"path": "d.txt", "content_id": "same", "operation": "upsert"},
+				{"path": "e.txt", "content_id": "same", "operation": "delete"},
+			}, nil),
+			wctChunk("same", []byte("d\n"), true))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `duplicate content_id \"same\"`) {
+			t.Errorf("shared content_id: status %d body %s, want 400 duplicate content_id", resp.StatusCode, body)
+		}
+	})
+}
+
 func TestCommitPackValidation(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)
