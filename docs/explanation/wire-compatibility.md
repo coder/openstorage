@@ -239,14 +239,14 @@ Upstream evolves continuously, so drift is tracked in the open:
 - **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and the doc pages the
   implementation was built against. The current `openapi.yaml` is
-  <https://code.storage/docs/openapi.yaml> as fetched on 2026-11-04 (upstream
-  `Last-Modified` 2026-11-04 02:26:55 GMT), SHA-256
-  `ee8092bfc51e6a94187e1c26574505aa941eb7cd6c2aaa4f8258cd0fd9d5c3ff`.
+  <https://code.storage/docs/openapi.yaml> as fetched on 2026-11-12 (upstream
+  `Last-Modified` 2026-11-10 22:29:59 GMT), SHA-256
+  `5d8e1801037218d54a7224be516dec1fc266e3160489a61ab6fd23d13957f41f`.
   [The cluster OpenAPI](https://api.pierre.code.storage/api/openapi.yaml) served
-  `412b90c3` at 10:07 and 10:11 UTC on 2026-11-04, so the change since `412b90c3` is
+  `ee8092bf` at 12:00 and 13:45 UTC on 2026-11-12, so the change since `ee8092bf` is
   documented drift, not a proven deployment change (a spec that the cluster serves
   would not prove how the cluster behaves either). Against `40e43e00` (2026-10-28),
-  the snapshot adds three things:
+  the snapshot adds four things:
   - A `prefix` query parameter on `GET /repos` (snapshot `34ac6de1`, 2026-11-01): a
     case-insensitive filter on the start of `repo_name`, combined with `q`, which then
     matches only the rest of the name after the prefix. open.storage does both
@@ -265,6 +265,29 @@ Upstream evolves continuously, so drift is tracked in the open:
     `404`, the branch list is empty, and `branches/create` answers `404` because its
     base does not exist. Only descriptions changed, and open.storage already behaves
     this way ([#657](https://github.com/coder/openstorage/issues/657)).
+  - Branch guards, merge previews, merge messages and file modes (snapshot
+    `5d8e1801`, 2026-11-10). open.storage already matches these parts of it: 40 zeros
+    as the `expected_target_sha` of commit-pack and diff-commit creates the first
+    commit of an empty repository without `base_branch`; the merge result is named
+    `merge_commit` (the old example said `merged`); and the merge strategies are
+    described as open.storage runs them (`merge` makes a merge commit also when a
+    fast-forward is possible, `ff_only` answers `412` when it cannot fast-forward,
+    and every strategy answers `no_op` when the target already contains the source).
+    These parts are open:
+    - `expected_target_sha` on `branches/create`: 40 zeros requires a new branch, the
+      current tip guards a move, and a failed guard answers `409` without changing the
+      branch, even with `force`
+      ([#803](https://github.com/coder/openstorage/issues/803)).
+    - `strategy`, `squash` and `allow_unrelated_histories` on `merge/preview`, which
+      then predicts the `POST /merge` result, with the new results `squash` and
+      `rejected` and a `412` for unrelated histories
+      ([#805](https://github.com/coder/openstorage/issues/805)).
+    - File modes on commit writes: permission bits such as `644` and regular-file
+      modes such as `100664` are stored as `100755` or `100644`
+      ([#806](https://github.com/coder/openstorage/issues/806)).
+    - A squash merge requires `commit_message`, and a merge commit without one gets
+      the message `Merge branch '<source>' into <target>`
+      ([#807](https://github.com/coder/openstorage/issues/807)).
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled
