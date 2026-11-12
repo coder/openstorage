@@ -9,7 +9,7 @@
 ```
 https://t:<jwt>@{org}.code.storage/{repo_id}.git              # persistent namespace
 https://t:<jwt>@{org}.code.storage/{repo_id}+ephemeral.git    # ephemeral namespace
-https://t:<jwt>@{org}.code.storage/{repo_id}+import.git       # import namespace
+https://t:<jwt>@{org}.code.storage/{repo_id}+import.git       # import remote (push only)
 ```
 
 - Basic auth: the username is the fixed literal `t`; the password is the JWT.
@@ -39,9 +39,47 @@ The receive path must:
   persistent remotes must not see ephemeral refs (git namespaces or separate ref stores).
 - On pushes to persistent refs, emit `push` webhooks (before/after SHAs per ref) and
   schedule upstream sync for synced repos.
-- Accept large histories on `+import` pushes. Official docs describe immediate cold
-  archival; for an OSS backend, "accept the objects, keep refs" is a functional
-  equivalent (tiering optional).
+- Accept large histories on `+import` pushes (see [Import remote](#import-remote)).
+
+## Import remote
+
+The `+import` remote follows upstream's
+[import page](https://code.storage/docs/repos/imports):
+
+- **Push only.** A clone, fetch or `ls-remote` through `{repo_id}+import.git` gets `403`
+  with a `text/plain` body, and git prints it as
+  `remote: reads are disabled for +import remotes; use the repository remote for clone/fetch`.
+  Upstream names no status code: `403` is open.storage's choice. Use the normal remote to
+  read. LFS batch requests on the import URL keep working in both directions.
+- **An import push writes normal branches and tags.** The push goes to the repository's
+  own refs, exactly like a push to `{repo_id}.git`: the same ref policies, quota, `push`
+  webhooks and LFS object space. A normal clone and the REST branch list show every ref
+  you pushed.
+- **A synced repository refuses an import push.** When the repository has a sync base,
+  the pre-receive hook refuses the whole push before it publishes any pack:
+  `import push refused: the repository has a sync base; ...`. A push to the normal
+  remote still works.
+- Upstream moves an imported repository to cold storage at once. open.storage keeps it on
+  the normal storage path, which is a functional equivalent.
+
+### Upgrading from 0.20.0 or earlier
+
+Versions up to 0.20.0 kept `+import` pushes in a separate ref space, under the storage key
+`<repo_id>+import`, that only the `+import` remote could read. The new version deletes
+nothing there, but no git path reads it any more. Before you upgrade, use the current
+version to copy each branch and tag that you pushed through `+import` to the normal
+remote:
+
+```sh
+git clone --mirror https://t:<jwt>@{org}.code.storage/{repo_id}+import.git import.git
+git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+```
+
+The push refuses a branch that already exists on the normal remote and does not
+fast-forward. Push such a branch under a new name, for example
+`refs/heads/main:refs/heads/imported/main`. The packs under the old key keep counting against the repository's
+[pack quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas) until the
+repository is deleted.
 
 ## Git LFS
 
