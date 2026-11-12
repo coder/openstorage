@@ -37,6 +37,23 @@ The receive path must:
   first match wins, reporting per-ref `ng` results with a policy message.
 - Map namespaces: `+ephemeral` remotes see and update only the ephemeral ref space;
   persistent remotes must not see ephemeral refs (git namespaces or separate ref stores).
+  open.storage gives the `+ephemeral` remote its own storage key. The HTTP API, though, stores its
+  ephemeral branches under the base repository's key as
+  `refs/namespaces/ephemeral/refs/heads/<name>`, so the persistent remote hides
+  `refs/namespaces` and every ref under it: fetch, clone and `ls-remote` never list one, a
+  fetch of one by name fails (`couldn't find remote ref`), and a push that updates or
+  deletes one gets its own `ng` (`deny updating a hidden ref` or
+  `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing, and so
+  does a push whose new objects only such a ref needs. The `+ephemeral` remote
+  hides nothing. An import push writes the repository's own refs, so these push rules apply
+  to it too. The persistent remote serves no commit that only a hidden ref
+  reaches, whatever the git config says about wants of unadvertised commits. When the
+  repository's default branch is a hidden ref, it points `HEAD` at the same name under
+  `refs/heads/`, which normally does not exist, so it advertises no `HEAD` (`PATCH /repo`
+  sets a visible default). One exception: git still resolves a hidden ref that a fetch names
+  in `--shallow-exclude`, and cuts the history at its commit, so a client with `git:read`
+  can tell whether such a ref exists. The API's branch list shows the ephemeral branches to
+  the same token.
 - On pushes to persistent refs, emit `push` webhooks (before/after SHAs per ref) and
   schedule upstream sync for synced repos.
 - Accept large histories on `+import` pushes (see [Import remote](#import-remote)).
@@ -105,6 +122,16 @@ and follow steps 1 to 4. Do this only when no release after 0.20.0, up to and in
 the version you upgraded to, lists a change to the stored formats in its release notes.
 Otherwise do not start 0.20.0 on those stores: keep the new version and leave the old
 data in place.
+
+Before open.storage hid them, a push to the persistent remote could write refs under
+`refs/namespaces/`. Those refs stay after an upgrade, and git can no longer list or delete
+them. Delete every one you do not want before you upgrade: list them with
+`git ls-remote <url> 'refs/namespaces/*'` (the pattern also lists refs such as
+`refs/heads/refs/namespaces/x` or `refs/tags/refs/namespaces/t`, which stay visible), and
+delete each one with
+`git push <url> --delete <ref>`. Do not count on the API to delete them later: it deletes
+only ephemeral branches whose names it accepts. In a fleet, a node that runs an earlier
+version still takes such pushes until it is upgraded.
 
 ## Git LFS
 

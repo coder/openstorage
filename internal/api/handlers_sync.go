@@ -366,7 +366,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	if branch == "" {
 		branch = meta.OmittedDefaultBranch
 	}
-	if !validBranchName(branch) {
+	if !validDefaultBranch(branch) {
 		if branchPath == "" { // the query parameter: no body field to name
 			writeErr(w, http.StatusBadRequest, "invalid default_branch")
 		} else {

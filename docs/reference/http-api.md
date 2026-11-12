@@ -193,6 +193,8 @@ the same scopes, query parameters and responses.
   contain `/`) must equal that claim exactly, with no case folding, trimming, or path
   normalization. A mismatch, including an empty string, returns 400 and creates nothing,
   for forks too. `null` or an omitted `repo_name` changes nothing.
+- `default_branch` is a branch name or its `refs/heads/`-qualified spelling, as for
+  `PATCH /repo`. Any other `refs/` name answers 400.
 - Query `default_branch` (deprecated upstream) is a fallback, used only when the body omits it.
 - Without a `default_branch` in the body, in `base_repo` or in the query, a sync from
   `github` takes the GitHub repository's default branch
@@ -379,6 +381,10 @@ Ties between commits that ancestry does not order follow git's topo-order walk, 
 The API refuses an ephemeral branch named `HEAD`: branch create, commit writes and merges answer
 `400` (`invalid target_branch`) for `target_branch: "HEAD"` with the ephemeral flag. A
 persistent branch named `HEAD` is allowed.
+
+Ephemeral branches are `refs/namespaces/ephemeral/refs/heads/<name>` in the base
+repository. The persistent git remote `/{repo}.git` hides them: git cannot fetch,
+list or push them there ([namespaces](../explanation/git-protocol-and-namespaces.md)).
 
 #### Merge guards
 
