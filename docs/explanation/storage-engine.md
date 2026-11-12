@@ -182,9 +182,10 @@ listing's scan start, clamped at zero: the bytes the counter has never seen.
   the repository's *pack prefixes*, not logical reachability. Bucket-wide usage falls a
   step later still: a reaped blob leaves an equal-sized quarantine backup outside the
   pack prefixes until the purge window passes.
-- **Namespaces roll up.** `+ephemeral` / `+import` pushes store packs under sibling
-  prefixes (`packs/<repo>+ephemeral/…`), but admission lists base and namespace prefixes
-  together and charges them all to the base repository.
+- **Namespaces roll up.** `+ephemeral` pushes store packs under a sibling prefix
+  (`packs/<repo>+ephemeral/…`), as did `+import` pushes in 0.20.0 and earlier
+  (`packs/<repo>+import/…`). Admission lists base and namespace prefixes together and
+  charges them all to the base repository.
 
 Repack is deliberately not admission-gated: it replaces rows rather than growing the
 registered set, and gating it would deadlock the at-quota repositories that most need

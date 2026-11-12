@@ -167,8 +167,11 @@ Tuning:
 Every repository has a storage-bytes quota
 ([`OPENSTORAGE_PACK_QUOTA_BYTES`](../reference/configuration.md#openstorage_pack_quota_bytes),
 default 10 GiB, `0` disables). It covers packs **and LFS objects**. A repository and its
-`+ephemeral` / `+import` namespaces share one quota, charged to the base repository; the
-namespaces also share its LFS object space.
+`+ephemeral` namespace share one quota, charged to the base repository; the
+namespace also shares its LFS object space. An `+import` push writes the repository's own
+refs. Packs that an `+import` push stored under the old `<repo_id>+import` key, in 0.20.0
+and earlier, keep counting against the quota until the repository is deleted
+([upgrade note](../explanation/git-protocol-and-namespaces.md#upgrading-from-0200-or-earlier)).
 
 ### What a denial looks like
 
