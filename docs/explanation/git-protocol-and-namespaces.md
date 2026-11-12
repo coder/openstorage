@@ -53,8 +53,8 @@ The `+import` remote follows upstream's
   read. LFS batch requests on the import URL keep working in both directions.
 - **An import push writes normal branches and tags.** The push goes to the repository's
   own refs, exactly like a push to `{repo_id}.git`: the same ref policies, quota, `push`
-  webhooks and LFS object space. A normal clone and the REST branch list show every ref
-  you pushed.
+  webhooks and LFS object space. A normal clone shows every branch and tag you pushed,
+  and the REST branch list shows every branch.
 - **A synced repository refuses an import push.** When the repository has a sync base,
   the pre-receive hook refuses the whole push before it publishes any pack:
   `import push refused: the repository has a sync base; ...`. A push to the normal
@@ -66,8 +66,9 @@ The `+import` remote follows upstream's
 
 Versions up to 0.20.0 kept `+import` pushes in a separate ref space, under the storage key
 `<repo_id>+import`, that only the `+import` remote could read. The new version deletes
-nothing there, but no git path reads it any more. Copy that data to the normal remote
-with the current version before every replica runs the new one:
+nothing there, but no git path reads it any more, and only a 0.20.0 server can still
+serve it. Copy that data to the normal remote with the current version before every
+replica runs the new one:
 
 1. Stop sending pushes to `+import` remotes. On a fleet, an import push that reaches a
    replica that still runs 0.20.0 lands under the old key again.
@@ -77,18 +78,25 @@ with the current version before every replica runs the new one:
    keep counting until the repository is deleted. When the repository's stored bytes plus
    the import's size pass `OPENSTORAGE_PACK_QUOTA_BYTES`, raise that limit (or set it to
    `0`) for the copy and for the pushes after it.
-3. Copy each branch and tag that you pushed through `+import`:
+3. Copy every ref that you pushed through `+import` (branches, tags, notes and any other
+   ref):
 
    ```sh
    git clone --mirror https://t:<jwt>@{org}.code.storage/{repo_id}+import.git import.git
-   git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+   git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/*:refs/*'
    ```
 
-   The push refuses a branch that already exists on the normal remote and does not
-   fast-forward, and a tag that already exists there with another value. Push such a ref
-   under a new name, for example `refs/heads/main:refs/heads/imported/main` or
+   The push refuses a ref that already exists on the normal remote and does not
+   fast-forward, such as a branch with other history or a tag with another value. Push
+   such a ref under a new name, for example `refs/heads/main:refs/heads/imported/main` or
    `refs/tags/v1:refs/tags/imported/v1`.
-4. Upgrade every replica, then send import pushes again.
+
+   Do not copy into a repository that has a sync base: when the link forwards pushes, a
+   copied ref reaches the connected upstream. Create a repository without a sync base and
+   copy into that one instead.
+4. Upgrade every replica, then send import pushes again. Each replica's cache keeps an
+   unused `<repo_id>+import.git` directory. The cache is rebuildable, so you can delete
+   that directory.
 
 ## Git LFS
 

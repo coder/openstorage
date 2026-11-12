@@ -442,9 +442,9 @@ func (s *Server) releaseLFSStaging(repo string, n int64) {
 // canonical storage key — RepoID, with a `+ephemeral` suffix reattached for
 // the ephemeral remote. The `+import` remote keys the base RepoID: an import
 // push writes normal branches (code.storage docs/repos/imports), and
-// viaImport marks it for the hook. The key is the ONLY value handed to
-// hydrate, the pack/ref stores, and the update hook env; the raw path
-// element must never key storage (ADR-21).
+// viaImport marks it for the read refusal and the hook. The key is the ONLY
+// value handed to hydrate, the pack/ref stores, and the update hook env; the
+// raw path element must never key storage (ADR-21).
 type repoTarget struct {
 	repo      meta.Repo
 	key       string
@@ -457,12 +457,6 @@ const importSuffix = "+import"
 // importReadRefusal is upstream's text for a clone or fetch through the
 // import remote (code.storage docs/repos/imports, "Caveats").
 const importReadRefusal = "reads are disabled for +import remotes; use the repository remote for clone/fetch"
-
-// isImportRemote reports whether a validated path element names the import
-// remote.
-func isImportRemote(pathElem string) bool {
-	return strings.TrimPrefix(pathElem, BaseRepo(pathElem)) == importSuffix
-}
 
 // refuseImportRead answers a clone or fetch through the import remote with
 // 403 text/plain: git prints a text/plain body as "remote:" lines, while it
@@ -677,15 +671,15 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 		httpError(w, status, err.Error())
 		return
 	}
-	if service == "upload-pack" && isImportRemote(repo) {
-		refuseImportRead(w)
-		return
-	}
 	// Auth before existence: only authenticated callers learn whether the
 	// repo is registered (ADR-21: unregistered path elements are 404).
 	target, ok := s.resolveTarget(r.Context(), repo)
 	if !ok {
 		httpError(w, http.StatusNotFound, "repository not found")
+		return
+	}
+	if service == "upload-pack" && target.viaImport {
+		refuseImportRead(w)
 		return
 	}
 	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch, claims)
@@ -717,10 +711,6 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, status, err.Error())
 		return
 	}
-	if service == "upload-pack" && isImportRemote(repo) {
-		refuseImportRead(w)
-		return
-	}
 	// Fault-injection is only ever honored under OPENSTORAGE_TEST_MODE=1;
 	// otherwise the request is refused loudly rather than silently ignored.
 	crash := r.Header.Get(CrashHeader)
@@ -733,6 +723,10 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	target, ok := s.resolveTarget(r.Context(), repo)
 	if !ok {
 		httpError(w, http.StatusNotFound, "repository not found")
+		return
+	}
+	if service == "upload-pack" && target.viaImport {
+		refuseImportRead(w)
 		return
 	}
 	// Decoded-byte ingress cap (issue #55, pushcap.go): bound the bytes a

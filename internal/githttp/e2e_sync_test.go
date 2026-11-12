@@ -185,8 +185,10 @@ func TestNamespace_ImportRefusesSyncedRepo(t *testing.T) {
 	if err == nil {
 		t.Fatalf("import push to a synced repo succeeded:\n%s", out)
 	}
-	if !strings.Contains(out, importSyncedRefusal) {
-		t.Fatalf("import push to a synced repo: want %q, got:\n%s", importSyncedRefusal, out)
+	// pre-receive refuses the whole push, before any pack is published;
+	// an update-hook refusal would say "(hook declined)" per ref instead.
+	if !strings.Contains(out, importSyncedRefusal) || !strings.Contains(out, "(pre-receive hook declined)") {
+		t.Fatalf("import push to a synced repo: want %q from pre-receive, got:\n%s", importSyncedRefusal, out)
 	}
 	refs, err := testStore.ListRefs(context.Background(), repo)
 	if err != nil {

@@ -2032,9 +2032,10 @@ const importSyncedRefusal = "import push refused: the repository has a sync base
 
 // refuseSyncedImport refuses a `+import` push to a repository that has a
 // sync base, so an imported ref never reaches a connected upstream
-// (code.storage docs/repos/imports). The repo writes its upstream link only
-// together with its repo row (meta.EventingStore.CreateLinkedRepo), so one
-// read before any pack is published decides the whole push. It fails
+// (code.storage docs/repos/imports). In serve, a repo writes its upstream
+// link only together with its repo row (meta.EventingStore.CreateLinkedRepo:
+// both serve queues track create state), so one read before any pack is
+// published decides the whole push. It fails
 // closed when the metadata store cannot answer, and the pusher then sees
 // only hookFailure's fixed line.
 func refuseSyncedImport(ctx context.Context, repo string) error {

@@ -1322,8 +1322,9 @@ func TestNamespace_ImportPushWritesNormalBranches(t *testing.T) {
 
 // TestNamespace_ImportRefusesReads pins the push-only rule of the `+import`
 // remote: clone, fetch and ls-remote fail with upstream's text, which git
-// prints because the body is text/plain. The refusal follows auth, so a
-// bad token still gets git's 401 prompt.
+// prints because the body is text/plain. The refusal follows auth and the
+// existence check, so a bad token still gets git's 401 prompt and an
+// unregistered repo still answers 404.
 func TestNamespace_ImportRefusesReads(t *testing.T) {
 	repo := registerRepo(t, "t10-import-read")
 	work := initWorkRepo(t)
@@ -1376,6 +1377,23 @@ func TestNamespace_ImportRefusesReads(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("%s %s with a bad token = %d, want 401", rpc.method, rpc.path, resp.StatusCode)
+		}
+
+		// A token whose claim names the unregistered path verbatim passes
+		// auth; the repo still does not exist.
+		missing := runUnique("t10-import-missing")
+		req, err = http.NewRequest(rpc.method, "http://"+nodeA.addr+"/"+missing+"+import.git"+rpc.path, strings.NewReader("0000"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth("t", mintTestToken(t, missing, "git:read,git:write", ""))
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s %s on an unregistered repo = %d, want 404", rpc.method, rpc.path, resp.StatusCode)
 		}
 	}
 }
