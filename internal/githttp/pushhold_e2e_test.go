@@ -850,12 +850,30 @@ func TestPush_StoresNoPackForUnupdatableName(t *testing.T) {
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
 	commitFile(t, work, "funny.txt", "funny\n", "funny", nil)
 	packs, blobs := len(pgPacks(t, repo)), len(s3Packs(t, repo))
-	out, err := tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/funny")
-	if err == nil || !strings.Contains(out, "[remote rejected]") {
-		t.Fatalf("push to refs/funny: err=%v\n%s", err, out)
+	deep := "refs/heads" + strings.Repeat("/d", maxPushRefDepth)
+	for _, name := range []string{
+		"refs/funny", // git-invalid
+		deep,         // deeper than maxPushRefDepth
+		"refs/heads/" + strings.Repeat("s", maxPushRefSegmentBytes+1), // a segment over the byte cap
+	} {
+		out, err := tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:"+name)
+		if err == nil || !strings.Contains(out, "[remote rejected]") {
+			t.Fatalf("push to %s: err=%v\n%s", name, err, out)
+		}
+		if p, b := len(pgPacks(t, repo)), len(s3Packs(t, repo)); p != packs || b != blobs {
+			t.Fatalf("refused push to %s stored a pack: registry %d -> %d, blob store %d -> %d", name, packs, p, blobs, b)
+		}
+	}
+	// An atomic push with such a name lands nothing, not even its valid ref.
+	out, err := tryGit(work, "push", "--atomic", remoteURL(nodeA, repo, token), "HEAD:refs/heads/newb", "HEAD:"+deep)
+	if err == nil {
+		t.Fatalf("atomic push with %s accepted:\n%s", deep, out)
+	}
+	if got := pgRefs(t, repo)["refs/heads/newb"]; got != "" {
+		t.Fatalf("atomic push with an unstorable name landed refs/heads/newb=%s", got)
 	}
 	if p, b := len(pgPacks(t, repo)), len(s3Packs(t, repo)); p != packs || b != blobs {
-		t.Fatalf("refused push stored a pack: registry %d -> %d, blob store %d -> %d", packs, p, blobs, b)
+		t.Fatalf("refused atomic push stored a pack: registry %d -> %d, blob store %d -> %d", packs, p, blobs, b)
 	}
 }
 

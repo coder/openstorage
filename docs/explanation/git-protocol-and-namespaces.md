@@ -46,7 +46,8 @@ The receive path must:
   `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing. A push
   without `--atomic` still lands its other refs when one of them needs the objects that
   the push sends. When none does (only the hidden refs need them, or the other refs move
-  to commits the server already has), pre-receive declines the whole push. The `+ephemeral` remote
+  to commits the server already has), pre-receive declines the whole push. A push that
+  only deletes refs sends no objects and keeps per-ref results. The `+ephemeral` remote
   hides nothing. An import push writes the repository's own refs, so these push rules apply
   to it too. The persistent remote serves no commit that only a hidden ref
   reaches, whatever the git config says about wants of unadvertised commits. When the

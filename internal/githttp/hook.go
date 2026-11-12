@@ -1483,7 +1483,8 @@ func atomicPushDFCheck(commands []refCommand) error {
 // allowed commands all target already-stored objects is refused whole —
 // its pack could only serve the denied refs (round-7 decoy) — with a
 // message telling the client to push the allowed updates separately. It
-// reuses enforceRefPolicy verbatim — the quarantine is visible to
+// reuses the shared verdicts (enforceRefPolicy, plus the refusals of hidden
+// refs and of names the server cannot store) — the quarantine is visible to
 // pre-receive via git's alternates, so is-ancestor and verify-sig checks
 // work here exactly as in the update hook; verify-sig-policied winners are
 // verified twice, an accepted redundancy for failing closed.
