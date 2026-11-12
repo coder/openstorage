@@ -522,7 +522,7 @@ func TestCommitPackModeAliases(t *testing.T) {
 			t.Fatalf("stored modes = %v, want %v", got, stored)
 		}
 
-		for _, mode := range []string{"600", "664", "775", "777", "100600", "100700", "0644", "0100644", "1006440", "64", "100", "040000", "abc"} {
+		for _, mode := range []string{"600", "664", "775", "777", "100600", "100700", "0644", "0100644", "1006440", "64", "100", "040000", "abc", " 644", "644 "} {
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
 				wctMeta("main", "bad mode", []map[string]any{{"path": "bad", "content_id": "id1", "operation": "upsert", "mode": mode}}, nil),
 				wctChunk("id1", []byte("x\n"), true))))
@@ -530,6 +530,11 @@ func TestCommitPackModeAliases(t *testing.T) {
 				t.Errorf("mode %q: status %d body %s, want 400 invalid mode", mode, resp.StatusCode, body)
 			}
 		}
+
+		// A delete ignores its mode, as before.
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "delete with a mode", []map[string]any{{"path": "m644", "content_id": "id-del", "operation": "delete", "mode": "600"}}, nil))))
+		wctRequireOK(t, resp, body)
 	})
 }
 

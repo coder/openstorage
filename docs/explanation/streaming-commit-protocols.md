@@ -70,7 +70,8 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
   `..` traversal and absolute paths defensively.
 - Modes: `100644`, `100755`, `120000` (symlink), `160000` (submodule). `644` and
   `100664` are stored as `100644`, and `755` and `100775` as `100755`, as upstream
-  does. Any other mode gets 400 `invalid`.
+  does. An omitted or empty mode means `100644`. Any other mode on an `upsert` gets
+  400 `invalid`, and a `delete` ignores its mode.
 
 ### Server semantics
 
