@@ -510,9 +510,10 @@ Per-repository storage quota (packs + LFS), enforced at every external storage w
   - Git LFS uploads: per-object `507` batch errors before any transfer URL is issued. The
     verified upload re-checks the actual `Content-Length`, so under-declared sizes cannot
     bypass it.
-- **Namespaces:** a repo and its `+ephemeral` / `+import` namespaces
+- **Namespaces:** a repo and its `+ephemeral` namespace
   ([git protocol](../explanation/git-protocol-and-namespaces.md)) share the base repo's
-  quota. LFS objects always store under the base repo's prefix.
+  quota. An `+import` push writes the repo's own refs, and packs under the old
+  `<repo_id>+import` key (0.20.0 and earlier) keep counting until the repo is deleted. LFS objects always store under the base repo's prefix.
 - **Admission** uses a durable reservation ledger in the ref store, atomic across pushes
   and replicas: of two pushes that fit alone but not together, exactly one wins. LFS
   charges it too (advisory batch check, then a durable reserve at the verified upload, settled when

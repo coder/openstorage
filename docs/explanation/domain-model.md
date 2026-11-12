@@ -39,7 +39,7 @@ Organization (org)                     ← tenant; from subdomain + JWT `iss`
 |---|---|---|
 | persistent | `{repo_id}.git` | normal branches/tags/notes; triggers webhooks + upstream sync |
 | ephemeral  | `{repo_id}+ephemeral.git` | disposable branches; never mirrored/synced upstream; default-branch protection does not apply; promotable to persistent |
-| import     | `{repo_id}+import.git` | bulk ingestion; pushed objects go (per official docs) to immediate cold archival |
+| import     | `{repo_id}+import.git` | push only; an import push writes normal branches and tags; refused for synced repos ([details](git-protocol-and-namespaces.md#import-remote)) |
 
 The API addresses ephemeral refs with boolean flags, not ref names: `ephemeral`,
 `ephemeral_base`, `base_is_ephemeral`, `target_is_ephemeral`, `source_is_ephemeral`. To

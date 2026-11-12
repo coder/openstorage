@@ -316,6 +316,100 @@ func wmSourceContains(ctx context.Context, sc *wcScratch, pin, sourceTip string)
 	return wmIsAncestor(ctx, sc, pin, sourceTip)
 }
 
+// wmFacts is what the merge decision reads from the two tips.
+type wmFacts struct {
+	base       string // merge base, valid when hasBase
+	hasBase    bool
+	noOp       bool // the target already contains the source
+	ffPossible bool // the target is an ancestor of the source (read only when !noOp)
+}
+
+// wmReadFacts reads the merge facts for POST /merge and its preview. On
+// failure it also returns the step that failed, for the 500 log line.
+func wmReadFacts(ctx context.Context, repoPath string, sc *wcScratch, targetSHA, sourceSHA string) (wmFacts, string, error) {
+	var f wmFacts
+	var err error
+	f.base, f.hasBase, err = mergeBaseSHA(ctx, repoPath, targetSHA, sourceSHA)
+	if err != nil {
+		return f, "compute merge base", err
+	}
+	if f.noOp, err = wmIsAncestor(ctx, sc, sourceSHA, targetSHA); err != nil || f.noOp {
+		return f, "check no-op ancestry", err
+	}
+	if f.hasBase {
+		if f.ffPossible, err = wmIsAncestor(ctx, sc, targetSHA, sourceSHA); err != nil {
+			return f, "check fast-forward ancestry", err
+		}
+	}
+	return f, "", nil
+}
+
+// Merge decisions. The first four are POST /merge results; rejected is the
+// preview's name for the ff_only 412; unrelated is the 412 that both
+// routes answer.
+const (
+	wmResultNoOp        = "no_op"
+	wmResultFastForward = "fast_forward"
+	wmResultMergeCommit = "merge_commit"
+	wmResultSquash      = "squash"
+	wmResultRejected    = "rejected"
+	wmResultUnrelated   = "unrelated"
+)
+
+// wmDecide is the one decision table of POST /merge and GET merge/preview
+// (#805): what the merge does with these options on these tips. A
+// merge_commit or squash result still needs merge-tree, which can conflict.
+func wmDecide(strategy string, squash, allowUnrelated bool, f wmFacts) string {
+	assertf(strategy == "merge" || strategy == "ff_only" || strategy == "ff_prefer", "wmDecide: strategy %q", strategy)
+	assertf(!(squash && strategy == "ff_only"), "wmDecide: squash with ff_only")
+	switch {
+	case f.noOp:
+		return wmResultNoOp
+	// ff_only and ff_prefer fast-forward when they can. squash always
+	// makes a commit, and the merge strategy records a merge commit
+	// (--no-ff semantics).
+	case !squash && f.ffPossible && strategy != "merge":
+		return wmResultFastForward
+	// Upstream's merge 412 names both refusals: "a merge with no common
+	// ancestor" and a target "that moved off a fast-forward under the
+	// ff_only strategy".
+	case strategy == "ff_only":
+		return wmResultRejected
+	case !f.hasBase && !allowUnrelated:
+		return wmResultUnrelated
+	case squash:
+		return wmResultSquash
+	default:
+		return wmResultMergeCommit
+	}
+}
+
+// wmRefusal is the 412 detail for a rejected or unrelated decision.
+func wmRefusal(result, source, target string) string {
+	assertf(result == wmResultRejected || result == wmResultUnrelated, "wmRefusal: result %q is not a refusal", result)
+	if result == wmResultRejected {
+		return "merge of " + source + " into " + target + " is not a fast-forward"
+	}
+	return "refusing to merge unrelated histories (set allow_unrelated_histories)"
+}
+
+// wmValidateStrategy checks the strategy and squash options that POST
+// /merge and its preview share.
+func wmValidateStrategy(strategy string, squash bool) error {
+	switch strategy {
+	case "merge", "ff_only", "ff_prefer":
+	case "":
+		return newFieldError("strategy", "is required", "missing strategy")
+	default:
+		return newFieldError("strategy", "must be merge, ff_only or ff_prefer",
+			fmt.Sprintf("invalid strategy %q (want merge|ff_only|ff_prefer)", strategy))
+	}
+	if squash && strategy == "ff_only" {
+		return errors.New("squash is incompatible with the ff_only strategy")
+	}
+	return nil
+}
+
 // wmCommitTree creates the merge/squash commit in the scratch odb.
 // Committer defaults are the caller's concern; parents order is
 // [target, source] for merge commits and [target] for squash.
@@ -482,16 +576,8 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	if wrefEphemeralHEAD(req.TargetBranch, req.TargetIsEphemeral) {
 		return newFieldError("target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch")
 	}
-	switch req.Strategy {
-	case "merge", "ff_only", "ff_prefer":
-	case "":
-		return newFieldError("strategy", "is required", "missing strategy")
-	default:
-		return newFieldError("strategy", "must be merge, ff_only or ff_prefer",
-			fmt.Sprintf("invalid strategy %q (want merge|ff_only|ff_prefer)", req.Strategy))
-	}
-	if req.Squash && req.Strategy == "ff_only" {
-		return errors.New("squash is incompatible with the ff_only strategy")
+	if err := wmValidateStrategy(req.Strategy, req.Squash); err != nil {
+		return err
 	}
 	req.ExpectedTargetSHA = lowerFullSHA(req.ExpectedTargetSHA)
 	if req.ExpectedTargetSHA != "" && !ref.ValidSHA(req.ExpectedTargetSHA) {
@@ -614,15 +700,16 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		sourceSHA = req.sourcePin
 	}
 
-	base, hasBase, err := mergeBaseSHA(ctx, repoPath, targetSHA, sourceSHA)
+	facts, op, err := wmReadFacts(ctx, repoPath, sc, targetSHA, sourceSHA)
 	if err != nil {
-		s.wmInternal(w, r, "compute merge base", err)
+		s.wmInternal(w, r, op, err)
 		return
 	}
+	hasBase := facts.hasBase
 	respond := func(outcome, commit, tree, newSHA string, promoted int) {
 		mergeBase := ""
 		if hasBase {
-			mergeBase = base
+			mergeBase = facts.base
 		}
 		writeJSON(w, http.StatusOK, wmMergeResponse{
 			Result:    outcome,
@@ -638,36 +725,22 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// no_op: the target already contains the source — no ref update, no
-	// policy question, nothing to publish.
-	noOp, err := wmIsAncestor(ctx, sc, sourceSHA, targetSHA)
-	if err != nil {
-		s.wmInternal(w, r, "check no-op ancestry", err)
-		return
-	}
-	if noOp {
+	outcome := wmDecide(req.Strategy, req.Squash, req.AllowUnrelatedHistories, facts)
+	switch outcome {
+	case wmResultNoOp:
+		// The target already contains the source: no ref update, no
+		// policy question, nothing to publish.
 		tree, err := sc.resolveTree(ctx, targetSHA)
 		if err != nil {
 			s.wmInternal(w, r, "resolve target tree", err)
 			return
 		}
-		respond("no_op", targetSHA, tree, targetSHA, 0)
+		respond(outcome, targetSHA, tree, targetSHA, 0)
 		return
-	}
-
-	ffPossible := false
-	if hasBase {
-		ffPossible, err = wmIsAncestor(ctx, sc, targetSHA, sourceSHA)
-		if err != nil {
-			s.wmInternal(w, r, "check fast-forward ancestry", err)
-			return
-		}
-	}
-
-	// Fast-forward: ff_only and ff_prefer take it when possible (squash
-	// always collapses instead); the plain merge strategy never
-	// fast-forwards — it records a merge commit (--no-ff semantics).
-	if !req.Squash && ffPossible && req.Strategy != "merge" {
+	case wmResultRejected, wmResultUnrelated:
+		writeErr(w, http.StatusPreconditionFailed, wmRefusal(outcome, req.SourceBranch, req.TargetBranch))
+		return
+	case wmResultFastForward:
 		if !s.wmCheckRefPolicy(w, r, sc, targetRef, targetSHA, sourceSHA, false, req.TargetBranch) {
 			return
 		}
@@ -693,18 +766,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusConflict, "ref "+targetRef+" moved concurrently")
 			return
 		}
-		respond("fast_forward", sourceSHA, tree, sourceSHA, promoted)
-		return
-	}
-	// Upstream's merge 412 names both refusals: "a merge with no common
-	// ancestor" and a target "that moved off a fast-forward under the
-	// ff_only strategy".
-	if req.Strategy == "ff_only" {
-		writeErr(w, http.StatusPreconditionFailed, "merge of "+req.SourceBranch+" into "+req.TargetBranch+" is not a fast-forward")
-		return
-	}
-	if !hasBase && !req.AllowUnrelatedHistories {
-		writeErr(w, http.StatusPreconditionFailed, "refusing to merge unrelated histories (set allow_unrelated_histories)")
+		respond(outcome, sourceSHA, tree, sourceSHA, promoted)
 		return
 	}
 
@@ -716,7 +778,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	if !mt.clean {
 		mergeBase := ""
 		if hasBase {
-			mergeBase = base
+			mergeBase = facts.base
 		}
 		wmFailConflict(w,
 			fmt.Sprintf("merge of %s into %s has %d conflicting paths", req.SourceBranch, req.TargetBranch, len(mt.paths)),
@@ -735,13 +797,11 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	if message == "" {
 		message = "Merge " + req.SourceBranch + " into " + req.TargetBranch
 	}
-	outcome := "merge_commit"
+	assertf(outcome == wmResultMergeCommit || outcome == wmResultSquash, "handleMerge: outcome %q", outcome)
+	// Squash: one new commit, parent = current target tip, tree = the
+	// merged tree; the source history stays unreferenced.
 	parents := []string{targetSHA}
-	if req.Squash {
-		// Squash: one new commit, parent = current target tip, tree = the
-		// merged tree; the source history stays unreferenced.
-		outcome = "squash"
-	} else {
+	if outcome == wmResultMergeCommit {
 		parents = append(parents, sourceSHA)
 	}
 	commit, err := wmCommitTree(ctx, sc, mt.tree, parents, message, *req.Author, committer)
@@ -811,7 +871,7 @@ type wmPreviewFiltered struct {
 
 type wmPreviewResponse struct {
 	Status            string              `json:"status"` // clean|conflicted
-	Result            string              `json:"result"` // merge_commit|fast_forward|no_op
+	Result            string              `json:"result"` // merge_commit|fast_forward|no_op|squash|rejected
 	SourceBranch      string              `json:"source_branch"`
 	TargetBranch      string              `json:"target_branch"`
 	SourceTipSHA      string              `json:"source_tip_sha"`
@@ -826,8 +886,9 @@ type wmPreviewResponse struct {
 // invariant 6): a read-only dry run answering 200 for clean AND conflicted
 // outcomes. Everything merge-tree creates lands in the request's scratch
 // odb, which is deleted on return — no ref store, blob store, or cache
-// mutation is possible. The contract has no allow_unrelated_histories
-// parameter, so unrelated histories preview as if it were allowed.
+// mutation is possible. result is what POST /merge would do with the same
+// strategy, squash and allow_unrelated_histories (wmDecide): rejected for
+// its ff_only 412, and the same 412 for unrelated histories.
 func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -860,6 +921,26 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	targetEphemeral, err := coreAliasBoolParam(q, "target_is_ephemeral", "target_ephemeral")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// strategy, squash and allow_unrelated_histories mean what they mean
+	// for POST /merge (spec 5d8e1801); strategy defaults to ff_prefer.
+	strategy := q.Get("strategy")
+	if strategy == "" {
+		strategy = "ff_prefer"
+	}
+	squash, err := coreBoolParam(q, "squash")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := wmValidateStrategy(strategy, squash); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	allowUnrelated, err := coreBoolParam(q, "allow_unrelated_histories")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -897,12 +978,18 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sc.close()
 
-	base, hasBase, err := mergeBaseSHA(ctx, repoPath, targetSHA, sourceSHA)
+	facts, op, err := wmReadFacts(ctx, repoPath, sc, targetSHA, sourceSHA)
 	if err != nil {
-		s.internalErr(w, r, "compute merge base", err)
+		s.internalErr(w, r, op, err)
+		return
+	}
+	result := wmDecide(strategy, squash, allowUnrelated, facts)
+	if result == wmResultUnrelated {
+		writeErr(w, http.StatusPreconditionFailed, wmRefusal(result, source, target))
 		return
 	}
 	resp := wmPreviewResponse{
+		Result:            result,
 		Status:            "clean",
 		SourceBranch:      source,
 		TargetBranch:      target,
@@ -912,39 +999,20 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		Conflicts:         []wmPreviewConflict{},
 		FilteredConflicts: []wmPreviewFiltered{},
 	}
-	if hasBase {
-		resp.MergeBaseSHA = base
+	if facts.hasBase {
+		resp.MergeBaseSHA = facts.base
 	}
-
-	noOp, err := wmIsAncestor(ctx, sc, sourceSHA, targetSHA)
-	if err != nil {
-		s.internalErr(w, r, "check no-op ancestry", err)
-		return
-	}
-	if noOp {
-		resp.Result = "no_op"
+	// no_op, fast_forward and rejected make no commit, so they are clean.
+	if result != wmResultMergeCommit && result != wmResultSquash {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	if hasBase {
-		ff, err := wmIsAncestor(ctx, sc, targetSHA, sourceSHA)
-		if err != nil {
-			s.internalErr(w, r, "check fast-forward ancestry", err)
-			return
-		}
-		if ff {
-			resp.Result = "fast_forward"
-			writeJSON(w, http.StatusOK, resp)
-			return
-		}
-	}
 
-	mt, err := wmRunMergeTree(ctx, sc, targetSHA, sourceSHA, !hasBase)
+	mt, err := wmRunMergeTree(ctx, sc, targetSHA, sourceSHA, !facts.hasBase)
 	if err != nil {
 		s.internalErr(w, r, "run merge-tree", err)
 		return
 	}
-	resp.Result = "merge_commit"
 	if mt.clean {
 		writeJSON(w, http.StatusOK, resp)
 		return
