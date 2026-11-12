@@ -408,9 +408,15 @@ func preReceive(ctx context.Context) (retErr error) {
 	evalOne := func(i int) error {
 		if !verdictDone[i] {
 			c := commands[i]
-			if hiddenOnRemote(repo, c.ref) {
+			switch {
+			case hiddenOnRemote(repo, c.ref):
 				verdicts[i] = refusef("ref %s is hidden on this remote, which takes no refs under refs/namespaces/ (the HTTP API writes ephemeral branches)", c.ref)
-			} else {
+			case !pushCommandUpdatable(c.ref, c.old, c.new):
+				// Never committed: git refuses a funny name before the
+				// update hook, which denies the rest. So the publication
+				// gate stores no pack that only such names need.
+				verdicts[i] = refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth)
+			default:
 				verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
 			}
 			verdictDone[i] = true
@@ -438,10 +444,7 @@ func preReceive(ctx context.Context) (retErr error) {
 		// walks and verifies) — eager whole-slice evaluation let one
 		// doomed request scale that by its command count. A complete loop
 		// leaves verdicts fully populated (all nil) for the later gates.
-		for i, c := range commands {
-			if !pushCommandUpdatable(c.ref, c.old, c.new) {
-				return atomicDenied(refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth))
-			}
+		for i := range commands {
 			if err := evalOne(i); err != nil {
 				return atomicDenied(err)
 			}

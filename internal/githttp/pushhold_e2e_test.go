@@ -829,6 +829,25 @@ func TestPush_LegacyOverDepthRefDeletable(t *testing.T) {
 	}
 }
 
+// A pack that only a name this server can never commit needs is never
+// stored: git refuses the funny name refs/funny after pre-receive, so
+// the pack would be registered, unreachable and counted in the quota.
+func TestPush_StoresNoPackForUnupdatableName(t *testing.T) {
+	repo := registerRepo(t, "t-funny-pack")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	commitFile(t, work, "funny.txt", "funny\n", "funny", nil)
+	packs, blobs := len(pgPacks(t, repo)), len(s3Packs(t, repo))
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/funny")
+	if err == nil || !strings.Contains(out, "[remote rejected]") {
+		t.Fatalf("push to refs/funny: err=%v\n%s", err, out)
+	}
+	if p, b := len(pgPacks(t, repo)), len(s3Packs(t, repo)); p != packs || b != blobs {
+		t.Fatalf("refused push stored a pack: registry %d -> %d, blob store %d -> %d", packs, p, blobs, b)
+	}
+}
+
 // TestAtomicPush_StaleBaseDeniedBeforeAnyCAS (Codex round-14 P1 on #173):
 // while push A pauses between its committed authority CAS and its local
 // ref update, hydration deliberately leaves the held ref at its old cache
