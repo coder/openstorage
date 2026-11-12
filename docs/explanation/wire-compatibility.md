@@ -123,14 +123,17 @@ Beyond the smart-HTTP wire format, the semantics clients depend on match git:
   evaluates the full policy set across every pushed ref *before* anything is stored. One
   policy-denied ref rejects the whole push, as in git. Without the flag, refs succeed and
   fail independently, as in git, unless the server declines the whole push. It does so for
-  its own limits, such as the pack quota, and in one case for refused refs. Refused refs
-  are policy-denied refs, refs hidden on this remote, and names the server cannot store (a
-  name with only one level under `refs/`, such as `refs/funny` or `refs/heads`, another
-  git-invalid name, a name with more than 32 `/`-separated parts, a part over 200 bytes,
-  or a name over 900 bytes). When no other ref of the push needs the objects that the push
-  sends (only refused refs need them, or the other refs move to commits the server already
-  has), the server declines the whole push and stores no pack. A push that only deletes
-  refs sends no objects and keeps per-ref results.
+  its own limits, such as the pack quota or more than 1024 refused commands, and in one
+  case for refused refs. Refused refs are policy-denied refs, refs hidden on this remote,
+  and names that a push cannot create or update (a name with only one level under `refs/`,
+  such as `refs/funny` or `refs/heads`, another git-invalid name, a name with more than 32
+  `/`-separated parts, a part over 200 bytes, or a name over 900 bytes). A push can still
+  delete a ref whose name passes only git's own rules and the file-name limits (255 bytes
+  per part, 250 for the last part), such as a branch that the HTTP API, a sync or an older
+  version created. When no other ref of the push needs the objects that the push sends
+  (only refused refs need them, or the other refs move to commits the server already has),
+  the server declines the whole push and stores no pack. A push that only deletes refs
+  sends no objects and keeps per-ref results.
   - **Documented deviation:** refs advance through per-ref compare-and-swap on the ref
     authority. A non-policy failure midway through the batch (for example, a concurrent
     write landing on a later ref) can leave earlier refs committed even though git
