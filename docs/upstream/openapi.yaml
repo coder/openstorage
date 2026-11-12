@@ -476,7 +476,7 @@ components:
           description: Identifier that blob chunks reference for this file. Required for upsert.
           type: string
         mode:
-          description: File mode such as 100644 or 100755. Defaults to 100644.
+          description: "Octal file mode for an upsert: 100644 for a regular file, 100755 for an executable, or 120000 for a symlink. Permission bits such as 644, and regular-file modes such as 100664, are stored as 100755 when the owner can execute the file and as 100644 otherwise. Defaults to 100644."
           type: string
         operation:
           description: upsert (default) to add or replace content, or delete to remove a file.
@@ -1483,6 +1483,9 @@ components:
           examples:
             - main
           type: string
+        expected_target_sha:
+          description: Optional full commit SHA that must match the target branch tip. Set to 40 zeros to require a new branch. A non-zero guard requires target_branch. Empty means no guard. Applies with or without force.
+          type: string
         force:
           description: Allow non-fast-forward updates when recreating an existing named branch. Requires target_branch.
           type: boolean
@@ -1648,7 +1651,7 @@ components:
           description: "Deprecated: use expected_target_sha. Guard ensuring the branch tip matches before applying the patch."
           type: string
         expected_target_sha:
-          description: Guard ensuring the target branch tip matches before applying the patch.
+          description: Guard ensuring the target branch tip matches before applying the patch. Set to 40 zeros to create the first commit in an empty repository, without base_branch.
           type: string
         target_branch:
           description: Destination branch name.
@@ -1693,7 +1696,7 @@ components:
           description: "Deprecated: use expected_target_sha. Commit SHA that must match the branch tip before writing."
           type: string
         expected_target_sha:
-          description: Commit SHA that must match the target branch tip before writing. Omit to fast-forward unconditionally.
+          description: Commit SHA that must match the target branch tip before writing. Set to 40 zeros to create the first commit in an empty repository, without base_branch. Omit to fast-forward unconditionally.
           type: string
         files:
           description: File operations applied in this commit.
@@ -2185,9 +2188,9 @@ components:
           type: boolean
         author:
           $ref: "#/components/schemas/GitIdentity"
-          description: Author identity used when the backend creates a merge commit. Required for merge-commit strategies.
+          description: "Author identity of the commit that the merge makes. Required when the merge makes a commit: with merge, with ff_prefer when a fast-forward is not possible, and with squash."
         commit_message:
-          description: Commit message used when a merge commit is created.
+          description: Message of the commit that the merge makes. Required with squash. When it is omitted, a merge commit gets a message in the form Merge branch 'feature' into main, with the source and target branch names of the request.
           examples:
             - Merge feature/preview
           type: string
@@ -2221,12 +2224,12 @@ components:
             - feature/preview
           type: string
         squash:
-          description: When true, collapse the source into a single new commit whose only parent is the current target tip. Defaults to false, which preserves the standard merge/fast-forward behavior. Incompatible with the ff_only strategy.
+          description: When true, makes one new commit with the current target tip as its only parent, also when a fast-forward is possible. Defaults to false. Incompatible with the ff_only strategy.
           examples:
             - false
           type: boolean
         strategy:
-          description: Merge strategy. merge creates a merge commit when needed, ff_only rejects non-fast-forward merges, and ff_prefer fast-forwards when possible before falling back to a merge commit.
+          description: Merge strategy. merge makes a merge commit, also when a fast-forward is possible. ff_prefer fast-forwards when it can, and else makes a merge commit. ff_only only fast-forwards and never makes a commit. It fails with 412 when the target has commits that the source does not have. When the target already contains the source, each strategy returns no_op and makes no commit.
           enum:
             - merge
             - ff_only
@@ -2270,7 +2273,7 @@ components:
         result:
           description: "Merge outcome: merge_commit, fast_forward, no_op, squash, or unknown."
           examples:
-            - merged
+            - merge_commit
           type: string
         source:
           $ref: "#/components/schemas/MergeSourceState"
@@ -2509,11 +2512,13 @@ components:
             - a2d127e6a4d54bb7390de828a99e36411f0c84df
           type: string
         result:
-          description: "Operation result if applied: merge_commit, fast_forward, or no_op."
+          description: "The result of POST /merge with the same strategy, squash, and allow_unrelated_histories on the current tips: merge_commit, fast_forward, no_op, squash, or rejected. rejected means that the strategy is ff_only and a fast-forward is not possible: the merge fails with 412."
           enum:
             - merge_commit
             - fast_forward
             - no_op
+            - squash
+            - rejected
           examples:
             - merge_commit
           type: string
@@ -2528,7 +2533,7 @@ components:
             - 9eb378bdb5bf1944f6ba0bd5a2c4df3ce32f4df1
           type: string
         status:
-          description: "Preview status: clean or conflicted."
+          description: "Whether the tree of the commit that the merge makes has conflicts: clean or conflicted. A no_op, fast_forward, or rejected result makes no commit, so its status is clean."
           enum:
             - clean
             - conflicted
@@ -4905,7 +4910,7 @@ paths:
               target_is_ephemeral: false
             schema:
               $ref: "#/components/schemas/ReposBranchesCreateRequest"
-        description: Create a branch from another branch or ref. The source and destination can live in the default namespace or the ephemeral namespace.
+        description: Create or move a branch from another branch or ref. The source and destination can live in the default namespace or the ephemeral namespace. Set expected_target_sha to 40 zeros to require a new branch, or to the current tip to guard a move. A failed guard returns 409 conflict without changing the branch, even with force.
         required: true
       responses:
         "200":
@@ -7649,7 +7654,7 @@ paths:
                 commit_sha: 41f0d5c6cc5f4d0fb4a3af2de27ccf9a80ab3b84
                 merge_base_sha: a2d127e6a4d54bb7390de828a99e36411f0c84df
                 promoted_commits: 3
-                result: merged
+                result: merge_commit
                 source:
                   ephemeral: true
                   ref: feature/preview
@@ -7792,7 +7797,7 @@ paths:
   /api/repos/{repo_name}/merge/preview:
     get:
       description: |-
-        Preview merge conflicts without creating commits, updating refs, or touching a working tree. When requested, conflict content is rendered from Git objects produced in request-local scratch storage.
+        Preview a merge without creating commits, updating refs, or touching a working tree. Send the `strategy`, `squash`, and `allow_unrelated_histories` that you send to `POST /merge`: `result` is the result of that merge on the current tips. When requested, conflict content is rendered from Git objects produced in request-local scratch storage.
 
         Scope: `git:read` on the repository.
       operationId: repos-previewMerge
@@ -7833,6 +7838,29 @@ paths:
           in: query
           name: include_content
           schema:
+            type: boolean
+        - description: Merge strategy to preview, as the `strategy` of `POST /merge`. Defaults to `ff_prefer`.
+          example: merge
+          in: query
+          name: strategy
+          schema:
+            default: ff_prefer
+            enum:
+              - merge
+              - ff_only
+              - ff_prefer
+            type: string
+        - description: Preview a squash merge, as the `squash` of `POST /merge`. Cannot be used with the `ff_only` strategy.
+          in: query
+          name: squash
+          schema:
+            default: false
+            type: boolean
+        - description: Preview a merge of branches with no common ancestor, as the `allow_unrelated_histories` of `POST /merge`.
+          in: query
+          name: allow_unrelated_histories
+          schema:
+            default: false
             type: boolean
       responses:
         "200":
@@ -7915,6 +7943,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Conflict
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: The source and the target have no common ancestor, and `allow_unrelated_histories` is not true. The code is `precondition_failed`.
         "429":
           content:
             application/json:
@@ -11533,7 +11570,7 @@ paths:
               target_is_ephemeral: false
             schema:
               $ref: "#/components/schemas/ReposBranchesCreateRequest"
-        description: Create a branch from another branch or ref. The source and destination can live in the default namespace or the ephemeral namespace.
+        description: Create or move a branch from another branch or ref. The source and destination can live in the default namespace or the ephemeral namespace. Set expected_target_sha to 40 zeros to require a new branch, or to the current tip to guard a move. A failed guard returns 409 conflict without changing the branch, even with force.
         required: true
       responses:
         "200":
@@ -14353,7 +14390,7 @@ paths:
                 commit_sha: 41f0d5c6cc5f4d0fb4a3af2de27ccf9a80ab3b84
                 merge_base_sha: a2d127e6a4d54bb7390de828a99e36411f0c84df
                 promoted_commits: 3
-                result: merged
+                result: merge_commit
                 source:
                   branch: feature/preview
                   ephemeral: true
@@ -14499,7 +14536,7 @@ paths:
     get:
       deprecated: true
       description: |-
-        Preview merge conflicts without creating commits, updating refs, or touching a working tree. When requested, conflict content is rendered from Git objects produced in request-local scratch storage.
+        Preview a merge without creating commits, updating refs, or touching a working tree. Send the `strategy`, `squash`, and `allow_unrelated_histories` that you send to `POST /merge`: `result` is the result of that merge on the current tips. When requested, conflict content is rendered from Git objects produced in request-local scratch storage.
 
         Scope: `git:read` on the repository.
 
@@ -14535,6 +14572,29 @@ paths:
           in: query
           name: include_content
           schema:
+            type: boolean
+        - description: Merge strategy to preview, as the `strategy` of `POST /merge`. Defaults to `ff_prefer`.
+          example: merge
+          in: query
+          name: strategy
+          schema:
+            default: ff_prefer
+            enum:
+              - merge
+              - ff_only
+              - ff_prefer
+            type: string
+        - description: Preview a squash merge, as the `squash` of `POST /merge`. Cannot be used with the `ff_only` strategy.
+          in: query
+          name: squash
+          schema:
+            default: false
+            type: boolean
+        - description: Preview a merge of branches with no common ancestor, as the `allow_unrelated_histories` of `POST /merge`.
+          in: query
+          name: allow_unrelated_histories
+          schema:
+            default: false
             type: boolean
       responses:
         "200":
@@ -14617,6 +14677,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
           description: Conflict
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+          description: The source and the target have no common ancestor, and `allow_unrelated_histories` is not true. The code is `precondition_failed`.
         "429":
           content:
             application/json:
