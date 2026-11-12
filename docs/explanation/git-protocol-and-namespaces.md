@@ -44,7 +44,8 @@ The receive path must:
   fetch of one by name fails (`couldn't find remote ref`), and a push that updates or
   deletes one gets its own `ng` (`deny updating a hidden ref` or
   `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing, and so
-  does a push whose new objects only such a ref needs. The `+ephemeral` remote
+  does a push whose new objects only such a ref needs, also when its other refs need no
+  new objects. The `+ephemeral` remote
   hides nothing. An import push writes the repository's own refs, so these push rules apply
   to it too. The persistent remote serves no commit that only a hidden ref
   reaches, whatever the git config says about wants of unadvertised commits. When the
@@ -100,8 +101,12 @@ replica runs the new one:
 
    ```sh
    git clone --mirror https://t:<jwt>@{org}.code.storage/{repo_id}+import.git import.git
-   git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/*:refs/*'
+   git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/*:refs/*' '^refs/namespaces/*'
    ```
+
+   The `^refs/namespaces/*` pattern leaves out refs under `refs/namespaces/`: after the
+   upgrade the normal remote hides them, and git can no longer list or delete them there
+   (see the end of this section).
 
    The push refuses a ref that already exists on the normal remote and does not
    fast-forward, such as a branch with other history or a tag with another value. Push
@@ -133,7 +138,7 @@ them. Delete every one you do not want before you upgrade: list them with
 delete each one with
 `git push <url> --delete <ref>`. Do not count on the API to delete them later: it deletes
 only ephemeral branches whose names it accepts. In a fleet, a node that runs an earlier
-version still takes such pushes until it is upgraded.
+version still lists, serves and takes such refs until it is upgraded.
 
 ## Git LFS
 

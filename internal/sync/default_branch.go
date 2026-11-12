@@ -97,7 +97,10 @@ func parseHeadSymref(out string) (branch, reason string) {
 		if !ok {
 			return "", "the upstream HEAD names " + strconv.Quote(target) + ", not a branch"
 		}
-		if !ValidBranchName(b) {
+		// A short name under refs/ (refs/heads/refs/namespaces/...) would be
+		// stored as that full ref name: the API refuses it as a default,
+		// and the persistent git remote hides some of those names.
+		if !ValidBranchName(b) || strings.HasPrefix(b, "refs/") {
 			return "", "the upstream HEAD names branch " + strconv.Quote(b) + ", which is not a valid default branch"
 		}
 		return b, ""

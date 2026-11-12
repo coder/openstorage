@@ -194,7 +194,8 @@ the same scopes, query parameters and responses.
   normalization. A mismatch, including an empty string, returns 400 and creates nothing,
   for forks too. `null` or an omitted `repo_name` changes nothing.
 - `default_branch` is a branch name or its `refs/heads/`-qualified spelling, as for
-  `PATCH /repo`. Any other `refs/` name answers 400.
+  `PATCH /repo`. Any other `refs/` name answers 400. A fork stores the name without the
+  `refs/heads/` prefix, so `refs/heads/trunk` becomes `trunk`.
 - Query `default_branch` (deprecated upstream) is a fallback, used only when the body omits it.
 - Without a `default_branch` in the body, in `base_repo` or in the query, a sync from
   `github` takes the GitHub repository's default branch
