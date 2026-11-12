@@ -408,9 +408,15 @@ func preReceive(ctx context.Context) (retErr error) {
 	evalOne := func(i int) error {
 		if !verdictDone[i] {
 			c := commands[i]
-			if hiddenOnRemote(repo, c.ref) {
+			switch {
+			case hiddenOnRemote(repo, c.ref):
 				verdicts[i] = refusef("ref %s is hidden on this remote, which takes no refs under refs/namespaces/ (the HTTP API writes ephemeral branches)", c.ref)
-			} else {
+			case !pushCommandUpdatable(c.ref, c.old, c.new):
+				// Never committed: git refuses a funny name before the
+				// update hook, which denies the rest. So the publication
+				// gate stores no pack that only such names need.
+				verdicts[i] = refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth)
+			default:
 				verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
 			}
 			verdictDone[i] = true
@@ -431,17 +437,14 @@ func preReceive(ctx context.Context) (retErr error) {
 	// name and aborting the local atomic transaction, so letting one
 	// through recreates the authority-accepted/client-rejected wedge.
 	if atomicPush {
-		// Evaluated one command at a time, name check first, STOPPING at
-		// the first denial (Codex round-10 P2): a denied atomic push's
+		// Evaluated one command at a time (each command's name check
+		// before its policy), STOPPING at the first denial (Codex round-10 P2): a denied atomic push's
 		// outcome is already fixed, and each further evaluation can cost
 		// subprocess work (no-force-push runs git merge-base, verify-sig
 		// walks and verifies) — eager whole-slice evaluation let one
 		// doomed request scale that by its command count. A complete loop
 		// leaves verdicts fully populated (all nil) for the later gates.
-		for i, c := range commands {
-			if !pushCommandUpdatable(c.ref, c.old, c.new) {
-				return atomicDenied(refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth))
-			}
+		for i := range commands {
 			if err := evalOne(i); err != nil {
 				return atomicDenied(err)
 			}
@@ -1480,7 +1483,8 @@ func atomicPushDFCheck(commands []refCommand) error {
 // allowed commands all target already-stored objects is refused whole —
 // its pack could only serve the denied refs (round-7 decoy) — with a
 // message telling the client to push the allowed updates separately. It
-// reuses enforceRefPolicy verbatim — the quarantine is visible to
+// reuses the shared verdicts (enforceRefPolicy, plus the refusals of hidden
+// refs and of names the server cannot store) — the quarantine is visible to
 // pre-receive via git's alternates, so is-ancestor and verify-sig checks
 // work here exactly as in the update hook; verify-sig-policied winners are
 // verified twice, an accepted redundancy for failing closed.

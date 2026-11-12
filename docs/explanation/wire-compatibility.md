@@ -122,7 +122,11 @@ Beyond the smart-HTTP wire format, the semantics clients depend on match git:
 - **Atomic pushes** (`git push --atomic`): the server detects the `atomic` capability and
   evaluates the full policy set across every pushed ref *before* anything is stored. One
   policy-denied ref rejects the whole push, as in git. Without the flag, refs succeed and
-  fail independently, as in git.
+  fail independently, as in git, with one exception. Refused refs are policy-denied refs, refs hidden on
+  this remote, and names the server cannot store. When no other ref of the push needs the
+  objects that the push sends (only refused refs need them, or the other refs move to
+  commits the server already has), the server declines the whole push and stores no pack.
+  A push that only deletes refs sends no objects and keeps per-ref results.
   - **Documented deviation:** refs advance through per-ref compare-and-swap on the ref
     authority. A non-policy failure midway through the batch (for example, a concurrent
     write landing on a later ref) can leave earlier refs committed even though git

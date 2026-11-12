@@ -43,9 +43,11 @@ The receive path must:
   `refs/namespaces` and every ref under it: fetch, clone and `ls-remote` never list one, a
   fetch of one by name fails (`couldn't find remote ref`), and a push that updates or
   deletes one gets its own `ng` (`deny updating a hidden ref` or
-  `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing, and so
-  does a push whose new objects only such a ref needs, also when its other refs need no
-  new objects. The `+ephemeral` remote
+  `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing. A push
+  without `--atomic` still lands its other refs when one of them needs the objects that
+  the push sends. When none does (only the hidden refs need them, or the other refs move
+  to commits the server already has), pre-receive declines the whole push. A push that
+  only deletes refs sends no objects and keeps per-ref results. The `+ephemeral` remote
   hides nothing. An import push writes the repository's own refs, so these push rules apply
   to it too. The persistent remote serves no commit that only a hidden ref
   reaches, whatever the git config says about wants of unadvertised commits. When the

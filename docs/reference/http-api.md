@@ -204,7 +204,8 @@ the same scopes, query parameters and responses.
   call, so the repository starts on `main`, and `GET /repo` shows `main`. The first
   successful sync reads the upstream `HEAD` and records its branch before it sends
   `repo.sync.succeeded`, so `GET /repo` then shows that branch. If the sync cannot use
-  `HEAD` (no HEAD branch is advertised, or the fetch did not return that branch), the
+  `HEAD` (the upstream lookup fails, no HEAD branch is advertised, the branch name is not a
+  valid branch name or starts with `refs/`, or the fetch did not return that branch), the
   repository keeps `main`, the server logs a `WARN` line, and the next successful sync
   tries again. Later changes of the GitHub default branch do not move it, and a
   `PATCH /repo` ends the wait. Other providers use `main`. The S3-WAL backend keeps `main`
