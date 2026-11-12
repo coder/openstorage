@@ -13,7 +13,7 @@
 // immutable pack. The preview endpoint never publishes anything — the
 // scratch odb is deleted with the request (docs/explanation/domain-model.md invariant 6).
 //
-// Status mapping (ADR-22, amended for merge by #532, #568 and #670): a
+// Status mapping (ADR-22, amended for merge by #532, #568 and #352): a
 // stale expected_target_sha or expected_source_sha is a 409 problem body
 // with code `ref_guard_failed`; an ff_only merge that is not a
 // fast-forward and unrelated histories without allow_unrelated_histories
