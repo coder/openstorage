@@ -41,8 +41,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   because its name lookup skips deleted repositories), `ref_guard_failed` (409: a
   failed ref guard, with `guard` and `current_sha`: on a merge, [details](#merge-guards),
   on a commit write, [details](#commit-write-guards), on a notes write,
-  [details](#notes), and on a branch create, [details](#guarded-branch-create-and-move)), `authentication_unavailable` (403: the key store failed while
-  verifying the token; retry), and `route_not_found` (404: no API route matches the
+  [details](#notes), and on a branch create,
+  [details](#guarded-branch-create-and-move)), `authentication_unavailable` (403: the
+  key store failed while verifying the token; retry), and `route_not_found` (404: no API route matches the
   path; a path that has routes for other methods answers 405 `method_not_allowed` with
   `Allow`). open.storage emits no other specific codes. It does not send
   `repo_claim_missing`: a token without a `repo` claim is org-wide, so a per-repo route
