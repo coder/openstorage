@@ -616,6 +616,32 @@ func TestCommitPackFileDefaults(t *testing.T) {
 				t.Errorf("%s: status %d body %s, want 400 unknown or non-upsert", name, resp.StatusCode, body)
 			}
 		}
+		// The empty chunk must not cut into an upsert's stream, and a delete
+		// without content_id gets no chunk at all.
+		for name, frames := range map[string][]any{
+			"empty delete chunk mid-upsert": {
+				wctMeta("main", "m", []map[string]any{
+					{"path": "h.txt", "content_id": "up", "operation": "upsert"},
+					{"path": "g.txt", "content_id": "del", "operation": "delete"},
+				}, nil),
+				wctChunk("up", []byte("h"), false), wctChunk("del", nil, true), wctChunk("up", []byte("\n"), true),
+			},
+			"empty chunk for a delete without content_id": {
+				wctMeta("main", "m", []map[string]any{{"path": "g.txt", "operation": "delete"}}, nil),
+				wctChunk("", nil, true),
+			},
+		} {
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, frames...)))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "unknown or non-upsert content_id") {
+				t.Errorf("%s: status %d body %s, want 400 unknown or non-upsert", name, resp.StatusCode, body)
+			}
+		}
+		// An unknown operation is reported as such, also without content_id.
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{{"path": "g.txt", "operation": "remove"}}, nil))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `invalid operation \"remove\" for \"g.txt\"`) {
+			t.Errorf("unknown operation: status %d body %s, want 400 invalid operation", resp.StatusCode, body)
+		}
 
 		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
 			wctMeta("main", "m", []map[string]any{

@@ -611,8 +611,8 @@ func wcValidateFiles(files []wcFileOp) error {
 				return fmt.Errorf("invalid mode %q for %q", f.Mode, f.Path)
 			}
 		case "delete":
-			// Mode ignored; no blob chunks may follow (checked in the
-			// stream loop).
+			// Mode ignored; at most one empty final chunk may follow
+			// (checked in the stream loop).
 		default:
 			return fmt.Errorf("invalid operation %q for %q", f.Operation, f.Path)
 		}
@@ -1494,7 +1494,7 @@ func wcRejectNoChanges(w http.ResponseWriter, md *wcMetadata, plan *wcPlan, base
 
 // wcStreamBlobs drives the blob_chunk state machine (docs/explanation/streaming-commit-protocols.md §1): chunks
 // per file are contiguous and eof-terminated; every upsert must be fed;
-// deletes must not be; decoded chunks are capped at 4 MiB, and their sum
+// a delete gets at most one empty final chunk; decoded chunks are capped at 4 MiB, and their sum
 // over the request at wcMaxCommitBlobBytes (413). Content bytes
 // stream straight into hash-object — except 160000 gitlinks, whose payload
 // is the referenced commit sha in hex (they have no blob). Returns
