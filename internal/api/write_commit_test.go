@@ -538,6 +538,131 @@ func TestCommitPackModeAliases(t *testing.T) {
 	})
 }
 
+// TestCommitPackFileDefaults pins FileOperation rules of the spec: an entry
+// without operation is an upsert, a delete needs no content_id, and a
+// delete may send one empty final chunk, as the spec's request example does.
+func TestCommitPackFileDefaults(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+		ls := func(t *testing.T) map[string]string {
+			t.Helper()
+			var listing listFilesResponse
+			wctReadJSON(t, e, "/api/v1/repos/files?ref=main", readTok, &listing)
+			got := map[string]string{}
+			for _, entry := range listing.Entries {
+				got[entry.Path] = entry.Mode
+			}
+			return got
+		}
+
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "no operation", []map[string]any{
+				{"path": "a.txt", "content_id": "id-a"},
+				{"path": "b.txt", "content_id": "id-b", "operation": ""},
+			}, nil),
+			wctChunk("id-a", []byte("a\n"), true),
+			wctChunk("id-b", []byte("b\n"), true))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); !maps.Equal(got, map[string]string{"a.txt": "100644", "b.txt": "100644"}) {
+			t.Fatalf("files = %v, want a.txt and b.txt as 100644", got)
+		}
+
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "delete without content_id", []map[string]any{
+				{"path": "a.txt", "operation": "delete"},
+				{"path": "b.txt", "content_id": "", "operation": "delete"},
+			}, nil))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); len(got) != 0 {
+			t.Fatalf("files = %v, want none after the deletes", got)
+		}
+
+		for name, files := range map[string][]map[string]any{
+			"upsert without content_id":  {{"path": "c.txt"}},
+			"explicit upsert without id": {{"path": "c.txt", "operation": "upsert"}},
+		} {
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, wctMeta("main", "m", files, nil))))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `missing content_id for \"c.txt\"`) {
+				t.Errorf("%s: status %d body %s, want 400 missing content_id", name, resp.StatusCode, body)
+			}
+		}
+		// The spec's request example: one empty final chunk for a delete.
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "spec example", []map[string]any{
+				{"path": "f.txt", "content_id": "id-f", "operation": "upsert"},
+			}, nil),
+			wctChunk("id-f", []byte("f\n"), true))))
+		wctRequireOK(t, resp, body)
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "spec example", []map[string]any{
+				{"path": "g.txt", "content_id": "blob-1", "operation": "upsert", "mode": "100644"},
+				{"path": "f.txt", "content_id": "blob-2", "operation": "delete"},
+			}, nil),
+			wctChunk("blob-1", []byte("g\n"), true),
+			wctChunk("blob-2", nil, true))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); !maps.Equal(got, map[string]string{"g.txt": "100644"}) {
+			t.Fatalf("files = %v, want only g.txt", got)
+		}
+		for name, chunks := range map[string][]any{
+			"two empty chunks":    {wctChunk("del", nil, true), wctChunk("del", nil, true)},
+			"empty chunk, no eof": {wctChunk("del", nil, false)},
+			"chunk with data":     {wctChunk("del", []byte("x"), true)},
+		} {
+			frames := append([]any{wctMeta("main", "m", []map[string]any{{"path": "g.txt", "content_id": "del", "operation": "delete"}}, nil)}, chunks...)
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, frames...)))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "unknown or non-upsert content_id del") {
+				t.Errorf("%s: status %d body %s, want 400 unknown or non-upsert", name, resp.StatusCode, body)
+			}
+		}
+		// The empty chunk must not cut into an upsert's stream, and a delete
+		// without content_id gets no chunk at all.
+		for name, frames := range map[string][]any{
+			"empty delete chunk mid-upsert": {
+				wctMeta("main", "m", []map[string]any{
+					{"path": "h.txt", "content_id": "up", "operation": "upsert"},
+					{"path": "g.txt", "content_id": "del", "operation": "delete"},
+				}, nil),
+				wctChunk("up", []byte("h"), false), wctChunk("del", nil, true), wctChunk("up", []byte("\n"), true),
+			},
+			"empty chunk for a delete without content_id": {
+				wctMeta("main", "m", []map[string]any{{"path": "g.txt", "operation": "delete"}}, nil),
+				wctChunk("", nil, true),
+			},
+		} {
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, frames...)))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "unknown or non-upsert content_id") {
+				t.Errorf("%s: status %d body %s, want 400 unknown or non-upsert", name, resp.StatusCode, body)
+			}
+		}
+		// An unknown operation is reported as such, also without content_id.
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{{"path": "g.txt", "operation": "remove"}}, nil))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `invalid operation \"remove\" for \"g.txt\"`) {
+			t.Errorf("unknown operation: status %d body %s, want 400 invalid operation", resp.StatusCode, body)
+		}
+
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{
+				{"path": "d.txt", "content_id": "same", "operation": "upsert"},
+				{"path": "e.txt", "content_id": "same", "operation": "delete"},
+			}, nil),
+			wctChunk("same", []byte("d\n"), true))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `duplicate content_id \"same\"`) {
+			t.Errorf("shared content_id: status %d body %s, want 400 duplicate content_id", resp.StatusCode, body)
+		}
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{
+				{"path": "g.txt", "content_id": "twice", "operation": "delete"},
+				{"path": "h.txt", "content_id": "twice", "operation": "delete"},
+			}, nil))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `duplicate content_id \"twice\"`) {
+			t.Errorf("content_id shared by two deletes: status %d body %s, want 400 duplicate content_id", resp.StatusCode, body)
+		}
+	})
+}
+
 func TestCommitPackValidation(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)

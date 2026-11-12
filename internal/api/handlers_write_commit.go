@@ -571,7 +571,8 @@ func wcValidateMetadata(md *wcMetadata) error {
 }
 
 // wcValidateFiles checks the commit-pack file-operation table: unique
-// paths + content ids, safe paths, known modes/operations.
+// paths + content ids, safe paths, known modes/operations. It fills in the
+// default operation and mode in place.
 func wcValidateFiles(files []wcFileOp) error {
 	paths := make(map[string]bool, len(files))
 	ids := make(map[string]bool, len(files))
@@ -584,13 +585,20 @@ func wcValidateFiles(files []wcFileOp) error {
 			return fmt.Errorf("duplicate path %q", f.Path)
 		}
 		paths[f.Path] = true
-		if f.ContentID == "" {
+		// The spec: operation defaults to upsert, and content_id is
+		// required for an upsert only.
+		if f.Operation == "" {
+			f.Operation = "upsert"
+		}
+		if f.ContentID == "" && f.Operation == "upsert" {
 			return fmt.Errorf("missing content_id for %q", f.Path)
 		}
-		if ids[f.ContentID] {
-			return fmt.Errorf("duplicate content_id %q", f.ContentID)
+		if f.ContentID != "" {
+			if ids[f.ContentID] {
+				return fmt.Errorf("duplicate content_id %q", f.ContentID)
+			}
+			ids[f.ContentID] = true
 		}
-		ids[f.ContentID] = true
 		switch f.Operation {
 		case "upsert":
 			if f.Mode == "" {
@@ -603,8 +611,8 @@ func wcValidateFiles(files []wcFileOp) error {
 				return fmt.Errorf("invalid mode %q for %q", f.Mode, f.Path)
 			}
 		case "delete":
-			// Mode ignored; no blob chunks may follow (checked in the
-			// stream loop).
+			// Mode ignored; at most one empty final chunk may follow
+			// (checked in the stream loop).
 		default:
 			return fmt.Errorf("invalid operation %q for %q", f.Operation, f.Path)
 		}
@@ -1486,7 +1494,7 @@ func wcRejectNoChanges(w http.ResponseWriter, md *wcMetadata, plan *wcPlan, base
 
 // wcStreamBlobs drives the blob_chunk state machine (docs/explanation/streaming-commit-protocols.md §1): chunks
 // per file are contiguous and eof-terminated; every upsert must be fed;
-// deletes must not be; decoded chunks are capped at 4 MiB, and their sum
+// a delete gets at most one empty final chunk; decoded chunks are capped at 4 MiB, and their sum
 // over the request at wcMaxCommitBlobBytes (413). Content bytes
 // stream straight into hash-object — except 160000 gitlinks, whose payload
 // is the referenced commit sha in hex (they have no blob). Returns
@@ -1501,9 +1509,15 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		sha     string
 	}
 	states := make(map[string]*blobState)
+	// The spec's request example sends one empty final chunk for a delete.
+	// It carries nothing, so it is accepted once and ignored.
+	deleteIDs := make(map[string]bool)
 	for i := range files {
-		if files[i].Operation == "upsert" {
+		switch {
+		case files[i].Operation == "upsert":
 			states[files[i].ContentID] = &blobState{op: &files[i]}
+		case files[i].ContentID != "":
+			deleteIDs[files[i].ContentID] = true
 		}
 	}
 	var open *blobState // the file currently receiving chunks
@@ -1535,6 +1549,10 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		case frame.BlobChunk != nil:
 			ch := frame.BlobChunk
 			st, ok := states[ch.ContentID]
+			if !ok && deleteIDs[ch.ContentID] && ch.Data == "" && ch.EOF && open == nil {
+				delete(deleteIDs, ch.ContentID)
+				continue
+			}
 			if !ok {
 				return fail(http.StatusBadRequest, "blob_chunk for unknown or non-upsert content_id "+ch.ContentID)
 			}

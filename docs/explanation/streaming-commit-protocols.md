@@ -68,6 +68,11 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
   get 400 `invalid`.
 - Clients normalize paths (leading slashes stripped); the backend should still reject
   `..` traversal and absolute paths defensively.
+- `operation` defaults to `upsert`. `content_id` is required for an `upsert` only: a
+  `delete` needs none, and a `content_id` that is given must be unique.
+- A `delete` sends no chunks, or one empty final chunk with its `content_id`
+  (`{"data": "", "eof": true}`), outside any upsert's run of chunks, as the upstream
+  request example does. Any other chunk for a `delete` gets 400.
 - Modes: `100644`, `100755`, `120000` (symlink), `160000` (submodule). `644` and
   `100664` are stored as `100644`, and `755` and `100775` as `100755`, as upstream
   does. An omitted or empty mode means `100644`. Any other mode on an `upsert` gets
