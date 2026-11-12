@@ -13,13 +13,13 @@
 // immutable pack. The preview endpoint never publishes anything — the
 // scratch odb is deleted with the request (docs/explanation/domain-model.md invariant 6).
 //
-// Status mapping (ADR-22, amended by #532 and #568 for merge): a stale
-// expected_target_sha or expected_source_sha is a 409 problem body with
-// code `ref_guard_failed`; an ff_only merge that is not a fast-forward and
-// unrelated histories without allow_unrelated_histories are 412
-// `precondition_failed`; merge conflicts (a 409 MergeConflict body with
-// conflict_paths + merge_base_sha) and CAS races lost at publish time are
-// 409 (docs/reference/http-api.md).
+// Status mapping (ADR-22, amended for merge by #532, #568 and #670): a
+// stale expected_target_sha or expected_source_sha is a 409 problem body
+// with code `ref_guard_failed`; an ff_only merge that is not a
+// fast-forward and unrelated histories without allow_unrelated_histories
+// are 412 `precondition_failed`; merge conflicts (a 409 MergeConflict body
+// with conflict_paths, plus merge_base_sha when there is one) and CAS races
+// lost at publish time are 409 (docs/reference/http-api.md).
 //
 // Fast-forwards move the ref without publishing: refs only ever name
 // objects already durable in registered packs (the source tip was a ref),
