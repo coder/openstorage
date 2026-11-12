@@ -439,13 +439,38 @@ func (s *Server) releaseLFSStaging(repo string, n int64) {
 }
 
 // repoTarget is a resolved request target: the live repo record plus the
-// canonical storage key — RepoID with the URL element's namespace suffix
-// (`+ephemeral`/`+import`) reattached. The key is the ONLY value handed to
+// canonical storage key — RepoID, with a `+ephemeral` suffix reattached for
+// the ephemeral remote. The `+import` remote keys the base RepoID: an import
+// push writes normal branches (code.storage docs/repos/imports), and
+// viaImport marks it for the hook. The key is the ONLY value handed to
 // hydrate, the pack/ref stores, and the update hook env; the raw path
 // element must never key storage (ADR-21).
 type repoTarget struct {
-	repo meta.Repo
-	key  string
+	repo      meta.Repo
+	key       string
+	viaImport bool
+}
+
+// importSuffix is the URL suffix of the push-only import remote.
+const importSuffix = "+import"
+
+// importReadRefusal is upstream's text for a clone or fetch through the
+// import remote (code.storage docs/repos/imports, "Caveats").
+const importReadRefusal = "reads are disabled for +import remotes; use the repository remote for clone/fetch"
+
+// isImportRemote reports whether a validated path element names the import
+// remote.
+func isImportRemote(pathElem string) bool {
+	return strings.TrimPrefix(pathElem, BaseRepo(pathElem)) == importSuffix
+}
+
+// refuseImportRead answers a clone or fetch through the import remote with
+// 403 text/plain: git prints a text/plain body as "remote:" lines, while it
+// hides a JSON one.
+func refuseImportRead(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = io.WriteString(w, importReadRefusal+"\n")
 }
 
 // resolveTarget canonicalizes a validated path element to its repoTarget.
@@ -462,6 +487,9 @@ func (s *Server) resolveTarget(ctx context.Context, pathElem string) (repoTarget
 	}
 	assertf(repo.RepoID != "", "resolveTarget: resolver returned empty RepoID for %q", base)
 	suffix := strings.TrimPrefix(pathElem, base) // "" | "+ephemeral" | "+import"
+	if suffix == importSuffix {
+		return repoTarget{repo: repo, key: repo.RepoID, viaImport: true}, true
+	}
 	return repoTarget{repo: repo, key: repo.RepoID + suffix}, true
 }
 
@@ -649,6 +677,10 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 		httpError(w, status, err.Error())
 		return
 	}
+	if service == "upload-pack" && isImportRemote(repo) {
+		refuseImportRead(w)
+		return
+	}
 	// Auth before existence: only authenticated callers learn whether the
 	// repo is registered (ADR-21: unregistered path elements are 404).
 	target, ok := s.resolveTarget(r.Context(), repo)
@@ -683,6 +715,10 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			w.Header().Set("WWW-Authenticate", `Basic realm="open.storage"`)
 		}
 		httpError(w, status, err.Error())
+		return
+	}
+	if service == "upload-pack" && isImportRemote(repo) {
+		refuseImportRead(w)
 		return
 	}
 	// Fault-injection is only ever honored under OPENSTORAGE_TEST_MODE=1;
@@ -883,6 +919,9 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	releasePushHold := func() {}
 	if service == "receive-pack" {
 		cmd.Env = pushHookEnv(cmd.Env, target.key, s.Org)
+		if target.viaImport {
+			cmd.Env = envconfig.Set(cmd.Env, EnvImportPush, "1")
+		}
 		// Loopback sync pushes carry the run's claim-holder token
 		// (verified JWT claim, issue #86); the update hook fences the ref
 		// CAS on it. Stripped above so operator env can never poison it.

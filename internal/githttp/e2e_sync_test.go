@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -166,5 +167,62 @@ func TestSync_LoopbackPushesSurviveLaterBoots(t *testing.T) {
 		if !want[pem] {
 			t.Fatalf("unexpected org key row (loopback key persisted?):\n%s", pem)
 		}
+	}
+}
+
+// TestNamespace_ImportRefusesSyncedRepo pins the third `+import` rule of
+// code.storage docs/repos/imports: a repository with a sync base refuses an
+// import push as a whole, so no imported ref reaches its upstream.
+func TestNamespace_ImportRefusesSyncedRepo(t *testing.T) {
+	up := newSyncUpstream(t)
+	head := up.commitAndPublish(t, "one")
+	repo := createSyncedRepo(t, nodeA, up, "import-synced-"+fmt.Sprint(time.Now().UnixNano()))
+	waitForMain(t, repo, head)
+
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo+"+import", token), "HEAD:refs/heads/imported")
+	if err == nil {
+		t.Fatalf("import push to a synced repo succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, importSyncedRefusal) {
+		t.Fatalf("import push to a synced repo: want %q, got:\n%s", importSyncedRefusal, out)
+	}
+	refs, err := testStore.ListRefs(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := refs["refs/heads/imported"]; ok || refs["refs/heads/main"] != head {
+		t.Fatalf("refs after the refused import push = %v, want only main@%s", refs, head)
+	}
+}
+
+// TestRefuseSyncedImportDecision pins pre-receive's import decision against
+// the lane's store: no link passes, a link refuses with text the pusher
+// sees, and a store that cannot answer fails closed with a hidden cause.
+func TestRefuseSyncedImportDecision(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+	if err := refuseSyncedImport(ctx, registerRepo(t, "import-plain")); err != nil {
+		t.Fatalf("repo without a link: %v", err)
+	}
+
+	es, ok := testMeta.(meta.EventingStore)
+	if !ok {
+		t.Fatalf("lane store %T is not a meta.EventingStore", testMeta)
+	}
+	linked, err := es.CreateLinkedRepo(ctx, testOrg, runUnique("import-linked"), "main",
+		meta.RepoUpstream{Provider: "github", Owner: "up", Name: "mirror", UpstreamHost: "https://upstream.invalid"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = refuseSyncedImport(ctx, linked.RepoID)
+	if err == nil || err.Error() != importSyncedRefusal || !ShownToPusher(err) {
+		t.Fatalf("linked repo: err = %v (shown %v), want the shown refusal", err, ShownToPusher(err))
+	}
+
+	t.Setenv("OPENSTORAGE_PG_URL", "unsupported://store")
+	if err := refuseSyncedImport(ctx, linked.RepoID); err == nil || ShownToPusher(err) {
+		t.Fatalf("unreachable store: err = %v (shown %v), want a hidden error", err, err != nil && ShownToPusher(err))
 	}
 }
