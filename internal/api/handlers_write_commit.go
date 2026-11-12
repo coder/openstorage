@@ -1509,9 +1509,15 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		sha     string
 	}
 	states := make(map[string]*blobState)
+	// The spec's request example sends one empty final chunk for a delete.
+	// It carries nothing, so it is accepted once and ignored.
+	deleteIDs := make(map[string]bool)
 	for i := range files {
-		if files[i].Operation == "upsert" {
+		switch {
+		case files[i].Operation == "upsert":
 			states[files[i].ContentID] = &blobState{op: &files[i]}
+		case files[i].ContentID != "":
+			deleteIDs[files[i].ContentID] = true
 		}
 	}
 	var open *blobState // the file currently receiving chunks
@@ -1543,6 +1549,10 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		case frame.BlobChunk != nil:
 			ch := frame.BlobChunk
 			st, ok := states[ch.ContentID]
+			if !ok && deleteIDs[ch.ContentID] && ch.Data == "" && ch.EOF && open == nil {
+				delete(deleteIDs, ch.ContentID)
+				continue
+			}
 			if !ok {
 				return fail(http.StatusBadRequest, "blob_chunk for unknown or non-upsert content_id "+ch.ContentID)
 			}

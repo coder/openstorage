@@ -538,8 +538,9 @@ func TestCommitPackModeAliases(t *testing.T) {
 	})
 }
 
-// TestCommitPackFileDefaults pins two FileOperation rules of the spec: an
-// entry without operation is an upsert, and a delete needs no content_id.
+// TestCommitPackFileDefaults pins FileOperation rules of the spec: an entry
+// without operation is an upsert, a delete needs no content_id, and a
+// delete may send one empty final chunk, as the spec's request example does.
 func TestCommitPackFileDefaults(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)
@@ -586,6 +587,36 @@ func TestCommitPackFileDefaults(t *testing.T) {
 				t.Errorf("%s: status %d body %s, want 400 missing content_id", name, resp.StatusCode, body)
 			}
 		}
+		// The spec's request example: one empty final chunk for a delete.
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "spec example", []map[string]any{
+				{"path": "f.txt", "content_id": "id-f", "operation": "upsert"},
+			}, nil),
+			wctChunk("id-f", []byte("f\n"), true))))
+		wctRequireOK(t, resp, body)
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "spec example", []map[string]any{
+				{"path": "g.txt", "content_id": "blob-1", "operation": "upsert", "mode": "100644"},
+				{"path": "f.txt", "content_id": "blob-2", "operation": "delete"},
+			}, nil),
+			wctChunk("blob-1", []byte("g\n"), true),
+			wctChunk("blob-2", nil, true))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); !maps.Equal(got, map[string]string{"g.txt": "100644"}) {
+			t.Fatalf("files = %v, want only g.txt", got)
+		}
+		for name, chunks := range map[string][]any{
+			"two empty chunks":    {wctChunk("del", nil, true), wctChunk("del", nil, true)},
+			"empty chunk, no eof": {wctChunk("del", nil, false)},
+			"chunk with data":     {wctChunk("del", []byte("x"), true)},
+		} {
+			frames := append([]any{wctMeta("main", "m", []map[string]any{{"path": "g.txt", "content_id": "del", "operation": "delete"}}, nil)}, chunks...)
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, frames...)))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "unknown or non-upsert content_id del") {
+				t.Errorf("%s: status %d body %s, want 400 unknown or non-upsert", name, resp.StatusCode, body)
+			}
+		}
+
 		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
 			wctMeta("main", "m", []map[string]any{
 				{"path": "d.txt", "content_id": "same", "operation": "upsert"},
