@@ -3,6 +3,11 @@
 > Extracted verbatim from [`08-spike-implementation-notes.md`](../archive/phases/08-spike-implementation-notes.md)
 > (“Spike Implementation Notes & ADRs”). Historical decision record — later issues and PRs may have
 > superseded details; the git history of the source file is authoritative.
+>
+> **Amended by [#804](https://github.com/coder/openstorage/issues/804):** the `+import`
+> remote no longer has its own storage key. It is push-only, and an import push writes the
+> base repository's refs ([import remote](../explanation/git-protocol-and-namespaces.md#import-remote)).
+> Data that 0.20.0 and earlier stored under `{repo}+import` stays in storage.
 
 **Context.** docs/05 requires that `+ephemeral` remotes see/update only the ephemeral ref
 space and persistent remotes never see ephemeral refs, and explicitly allows either git

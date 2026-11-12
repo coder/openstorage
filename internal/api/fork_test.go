@@ -439,11 +439,22 @@ func TestForkRepo(t *testing.T) {
 				})
 			}
 
-			t.Run("invalid default_branch", func(t *testing.T) {
+			for _, branch := range []string{"a..b", "refs/namespaces/ephemeral/refs/heads/x"} {
+				t.Run("invalid default_branch "+branch, func(t *testing.T) {
+					caller := newForkCaller(t, e, "")
+					req := forkBody(srcReadTok, nil)
+					req["default_branch"] = branch
+					resp, body := forkDo(t, srv, caller.token, req)
+					if resp.StatusCode != http.StatusBadRequest {
+						t.Fatalf("status = %d body %v, want 400", resp.StatusCode, body)
+					}
+					forkRequireNoRepoRow(t, e, caller.org, caller.url)
+				})
+			}
+			// A plain create on this server runs the frozen handler.
+			t.Run("plain create refuses a non-branch default", func(t *testing.T) {
 				caller := newForkCaller(t, e, "")
-				req := forkBody(srcReadTok, nil)
-				req["default_branch"] = "a..b"
-				resp, body := forkDo(t, srv, caller.token, req)
+				resp, body := forkDo(t, srv, caller.token, map[string]any{"default_branch": "refs/tags/v1"})
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Fatalf("status = %d body %v, want 400", resp.StatusCode, body)
 				}

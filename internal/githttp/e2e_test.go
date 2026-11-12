@@ -1331,6 +1331,9 @@ func TestNamespace_ImportRefusesReads(t *testing.T) {
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
 	importURL := remoteURL(nodeA, repo+"+import", token)
+	// Upstream's text (code.storage docs/repos/imports, "Caveats"), spelled
+	// out here so that a change to importReadRefusal fails the test.
+	const upstreamText = "reads are disabled for +import remotes; use the repository remote for clone/fetch"
 
 	for _, args := range [][]string{
 		{"clone", importURL, filepath.Join(t.TempDir(), "clone")},
@@ -1341,7 +1344,7 @@ func TestNamespace_ImportRefusesReads(t *testing.T) {
 		if err == nil {
 			t.Fatalf("git %s through +import succeeded:\n%s", args[0], out)
 		}
-		if !strings.Contains(out, "remote: "+importReadRefusal) || !strings.Contains(out, "403") {
+		if !strings.Contains(out, "remote: "+upstreamText) || !strings.Contains(out, "403") {
 			t.Fatalf("git %s through +import: want the 403 refusal text, got:\n%s", args[0], out)
 		}
 	}
@@ -1361,7 +1364,7 @@ func TestNamespace_ImportRefusesReads(t *testing.T) {
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || string(body) != importReadRefusal+"\n" {
+		if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || string(body) != upstreamText+"\n" {
 			t.Fatalf("%s %s = %d %q %q, want 403 text/plain refusal", rpc.method, rpc.path, resp.StatusCode, resp.Header.Get("Content-Type"), body)
 		}
 
