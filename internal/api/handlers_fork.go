@@ -289,6 +289,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		}
 		return
 	}
+	branch = strings.TrimPrefix(branch, "refs/heads/") // forkRef re-qualifies it
 
 	// The fork's initial ref is a ref creation by the CALLER: their ref
 	// policies apply (docs/reference/authentication.md, invariant 5). Creation is fast-forward by

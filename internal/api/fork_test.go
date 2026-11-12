@@ -219,21 +219,23 @@ func TestForkRepo(t *testing.T) {
 			}
 		})
 
-		t.Run("explicit default_branch", func(t *testing.T) {
-			caller := newForkCaller(t, e, "")
-			req := forkBody(srcReadTok, nil)
-			req["default_branch"] = "trunk"
-			resp, body := forkDo(t, srv, caller.token, req)
-			forkID := forkRequireCreated(t, resp, body)
-			refs := wrefRefs(t, e, forkID)
-			if len(refs) != 1 || refs["refs/heads/trunk"] != src.c2 {
-				t.Fatalf("fork refs = %v, want exactly refs/heads/trunk=%s", refs, src.c2)
-			}
-			row, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url)
-			if err != nil || row.DefaultBranch != "trunk" {
-				t.Fatalf("repo row = %+v err %v", row, err)
-			}
-		})
+		for _, branch := range []string{"trunk", "refs/heads/trunk"} {
+			t.Run("explicit default_branch "+branch, func(t *testing.T) {
+				caller := newForkCaller(t, e, "")
+				req := forkBody(srcReadTok, nil)
+				req["default_branch"] = branch
+				resp, body := forkDo(t, srv, caller.token, req)
+				forkID := forkRequireCreated(t, resp, body)
+				refs := wrefRefs(t, e, forkID)
+				if len(refs) != 1 || refs["refs/heads/trunk"] != src.c2 {
+					t.Fatalf("fork refs = %v, want exactly refs/heads/trunk=%s", refs, src.c2)
+				}
+				row, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url)
+				if err != nil || row.DefaultBranch != "trunk" {
+					t.Fatalf("repo row = %+v err %v", row, err)
+				}
+			})
+		}
 
 		// Issue #293: the optional body repo_name may only confirm the
 		// destination's JWT repo claim (caller.url contains slashes).

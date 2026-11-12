@@ -194,7 +194,8 @@ the same scopes, query parameters and responses.
   normalization. A mismatch, including an empty string, returns 400 and creates nothing,
   for forks too. `null` or an omitted `repo_name` changes nothing.
 - `default_branch` is a branch name or its `refs/heads/`-qualified spelling, as for
-  `PATCH /repo`. Any other `refs/` name answers 400.
+  `PATCH /repo`. Any other `refs/` name answers 400. A fork stores the name without the
+  `refs/heads/` prefix, so `refs/heads/trunk` becomes `trunk`.
 - Query `default_branch` (deprecated upstream) is a fallback, used only when the body omits it.
 - Without a `default_branch` in the body, in `base_repo` or in the query, a sync from
   `github` takes the GitHub repository's default branch
@@ -372,11 +373,11 @@ Ties between commits that ancestry does not order follow git's topo-order walk, 
 |---|---|---|
 | `GET /repos/branches` | git:read | `cursor, limit, ephemeral` → `{branches: [{cursor, name, head_sha, created_at}], next_cursor, has_more}` |
 | `GET /repos/branch` | git:read | `name` (req), `ephemeral?` → `{branch: {name, head_sha, created_at}}` — one branch by exact short name (no pagination fields); 404 when absent |
-| `POST /repos/branches/create` | git:write | `{target_branch?, base_ref?\|base_branch?(deprecated), preferred_base?, base_is_ephemeral?, target_is_ephemeral?, force?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
+| `POST /repos/branches/create` | git:write | `{target_branch?, base_ref?\|base_branch?(deprecated), preferred_base?, base_is_ephemeral?, target_is_ephemeral?, force?, expected_target_sha?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}`. See [guarded create and move](#guarded-branch-create-and-move) |
 | `DELETE /repos/branches` | git:write | Query `target_branch`, `ephemeral?`. The deprecated body `{target_branch (deprecated alias name), ephemeral?}` still works; a query parameter that is present wins over its body field, even when empty → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent): 409 for the query form, 403 for the body form |
 | `GET /repos/branches/diff` | git:read | **Deprecated upstream** (both path styles); still implemented. Use `GET /repos/diff` ([migration](#migrating-from-branchesdiff)). `branch` (req), `base?` (defaults to the repo default branch), `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, merge_base_sha, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}`; `merge_base_sha` is empty when the histories are unrelated (direct `base..branch` diff) |
-| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. File conflicts → 409 `MergeConflict` `{error, conflict_type: merge_conflict, conflict_paths, merge_base_sha?}`; a target that moved during the merge → 409 error body, `code: conflict` (upstream's `target_moved` reports a failed automatic retry, and open.storage does not retry); an `ff_only` merge that is not a fast-forward, and unrelated histories without `allow_unrelated_histories` → 412 error body, `code: precondition_failed`, as upstream documents. A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: ref_guard_failed` ([details](#merge-guards)) |
-| `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?`, `strategy?: merge\|ff_only\|ff_prefer` (default `ff_prefer`), `squash?`, `allow_unrelated_histories?` → `{status: clean\|conflicted, result: merge_commit\|fast_forward\|no_op\|squash\|rejected, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only. `result` is what `POST /repos/merge` does with the same `strategy`, `squash` and `allow_unrelated_histories` on the current tips: `rejected` is its `412` for an `ff_only` merge that is not a fast-forward, and `status` tells whether the commit that the merge makes has conflicts (`no_op`, `fast_forward` and `rejected` are `clean`). Unrelated histories without `allow_unrelated_histories` → 412 error body, `code: precondition_failed`, as for the merge, except with `ff_only`: the merge checks `ff_only` first, so the preview answers `rejected`. `squash` with `ff_only` → 400 |
+| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, expected_source_sha?, commit_message? (required with squash), author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. File conflicts → 409 `MergeConflict` `{error, conflict_type: merge_conflict, conflict_paths, merge_base_sha?}`; a target that moved during the merge → 409 error body, `code: conflict` (upstream's `target_moved` reports a failed automatic retry, and open.storage does not retry); an `ff_only` merge that is not a fast-forward, and unrelated histories without `allow_unrelated_histories` → 412 error body, `code: precondition_failed`, as upstream documents. A failed `expected_target_sha` or `expected_source_sha` guard → 409 error body, `code: ref_guard_failed` ([details](#merge-guards)). A squash without `commit_message` → 400, `invalid_params` naming `commit_message`. A merge commit without `commit_message` gets the message `Merge branch '<source>' into <target>`, with the branch names of the request (earlier releases wrote `Merge <source> into <target>`) |
+| `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?`, `strategy?: merge\|ff_only\|ff_prefer` (default `ff_prefer`), `squash?`, `allow_unrelated_histories?` → `{status: clean\|conflicted, result: merge_commit\|fast_forward\|no_op\|squash\|rejected, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only. `result` is what `POST /repos/merge` does with the same `strategy`, `squash` and `allow_unrelated_histories` on the current tips: `rejected` is its `412` for an `ff_only` merge that is not a fast-forward, and `status` tells whether the commit that the merge makes has conflicts (`no_op`, `fast_forward` and `rejected` are `clean`). Unrelated histories without `allow_unrelated_histories` → 412 error body, `code: precondition_failed`, as for the merge, except with `ff_only`: the merge checks `ff_only` first, so the preview answers `rejected`. `squash` with `ff_only` → 400. The preview decides only that `result`. It does not check ref policies, `author`, `commit_message` or the merge guards, and the tips can move before the merge runs, so a merge after a clean preview can still fail, for example with 403 for a ref policy, 400 for a missing `author`, or 409 for a failed guard |
 
 The API refuses an ephemeral branch named `HEAD`: branch create, commit writes and merges answer
 `400` (`invalid target_branch`) for `target_branch: "HEAD"` with the ephemeral flag. A
@@ -468,6 +469,35 @@ old behavior, read `default_branch` from `GET /repo` and send it as `base_ref`.
 
 This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster behavior
 ([contract audit](../explanation/wire-compatibility.md#server-allocated-branch-contract)).
+
+#### Guarded branch create and move
+
+`expected_target_sha` on `POST /repos/branches/create` (both path styles) guards the
+target branch. It applies to the persistent and the ephemeral namespace:
+
+| `expected_target_sha` | The request succeeds only when |
+|---|---|
+| 40 zeros | the target branch does not exist. The branch is created at the base. |
+| a full commit SHA (any case) | the target branch exists at that commit. The branch moves to the base. Without `force` the move must be a fast-forward, else `412`. With `force` any move is allowed, subject to the token's ref policies. |
+| omitted, `""` or `null` | always: no guard. An existing target without `force` answers `409` `conflict` ("branch already exists"). |
+
+- A failed guard answers `409` `ref_guard_failed` with `guard: "expected_target_sha"` and
+  `current_sha`, the branch tip or 40 zeros when the branch does not exist. The branch
+  does not change, with or without `force`. When another writer moves the branch away
+  from the guard between the guard check and the write, the answer is the same, with
+  the new tip as `current_sha`. One case differs: when a guard on the tip finds the
+  branch already moved to the base, the answer is `200`.
+- A guarded or forced move of a target that already points at the base answers `200`
+  ("branch updated") without a ref write, so no webhook or upstream sync follows. Ref
+  policies still apply. Without a guard and without `force`, such a target answers
+  `409` like any existing branch.
+- A value that is not 40 hex digits is `400` (`invalid_params` names
+  `expected_target_sha`).
+- Without `target_branch`, only 40 zeros is accepted (the allocated name is new); any
+  other guard is `400`.
+
+This follows the public OpenAPI of 2026-11-10 (`5d8e1801`), which the cluster OpenAPI did
+not serve yet ([snapshot provenance](../explanation/wire-compatibility.md#how-drift-is-tracked)).
 
 `FileDiff` = `{path, path_base64?, state (raw letter; SDKs normalize A/M/D/R/C/T/U), old_path?, old_path_base64?, raw
 (unified diff text), bytes, is_eof, additions, deletions}`. `filtered_files` entries omit

@@ -44,7 +44,8 @@ The receive path must:
   fetch of one by name fails (`couldn't find remote ref`), and a push that updates or
   deletes one gets its own `ng` (`deny updating a hidden ref` or
   `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing, and so
-  does a push whose new objects only such a ref needs. The `+ephemeral` remote
+  does a push whose new objects only such a ref needs, also when its other refs need no
+  new objects. The `+ephemeral` remote
   hides nothing. An import push writes the repository's own refs, so these push rules apply
   to it too. The persistent remote serves no commit that only a hidden ref
   reaches, whatever the git config says about wants of unadvertised commits. When the
@@ -100,8 +101,12 @@ replica runs the new one:
 
    ```sh
    git clone --mirror https://t:<jwt>@{org}.code.storage/{repo_id}+import.git import.git
-   git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/*:refs/*'
+   git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/*:refs/*' '^refs/namespaces/*'
    ```
+
+   The `^refs/namespaces/*` pattern leaves out refs under `refs/namespaces/`: after the
+   upgrade the normal remote hides them, and git can no longer list or delete them there
+   (see the end of this section).
 
    The push refuses a ref that already exists on the normal remote and does not
    fast-forward, such as a branch with other history or a tag with another value. Push
@@ -111,10 +116,12 @@ replica runs the new one:
    Do not copy into a repository that has a sync base: when the link forwards pushes, a
    copied ref reaches the connected upstream. Create a repository without a sync base and
    copy into that one instead.
-4. Upgrade every replica, then send import pushes again. Each replica's cache keeps a
-   `<repo_id>+import.git` directory that no git request uses. LFS reclamation can
-   re-create it while the old key holds refs. The cache is rebuildable, so deleting that
-   directory is safe.
+4. Upgrade every replica, then send import pushes again. A replica's cache can keep a
+   `<repo_id>+import.git` directory that no git request uses: 0.20.0 made it when it
+   served the old key, and repack and LFS reclamation jobs for the old key can make it
+   again, on any replica that runs them. Check every replica. The cache is rebuildable, so
+   you can delete that directory, but only while the replica is drained and stopped, as
+   for any cache cleanup ([cache directory](../how-to/deploy-production.md#local-disk-the-cache-directory)).
 
 If a replica already runs the new version and you did not copy the data, the data is
 still in storage. Stop every replica of the new version, start 0.20.0 on the same stores,
@@ -131,7 +138,7 @@ them. Delete every one you do not want before you upgrade: list them with
 delete each one with
 `git push <url> --delete <ref>`. Do not count on the API to delete them later: it deletes
 only ephemeral branches whose names it accepts. In a fleet, a node that runs an earlier
-version still takes such pushes until it is upgraded.
+version still lists, serves and takes such refs until it is upgraded.
 
 ## Git LFS
 
