@@ -39,7 +39,7 @@ Full endpoint catalogs: [HTTP API](../reference/http-api.md) (REST),
 | Read surface | ✅ | Files (conditional/range streaming), file listings + metadata, branches, tags, commits, diff, branches-diff, blame, grep, archive, notes — cursor pagination throughout. File listings without `limit` and `cursor` return every entry, and `files/metadata` answers `429` past 50,000 distinct last commits (spec 2026-10-27) |
 | Single-item lookups | ✅ | `GET .../branch`, `GET .../tag` — served although the vendored spec omits them (SDK-relied surface) |
 | Write surface | ✅ | NDJSON `commit-pack` and `diff-commit` streaming, `restore-commit`, branch/tag/notes writes — compare-and-swap (`expected_head_sha` etc.) and ref policies everywhere |
-| Merge | ✅ | `POST .../merge` + read-only `GET .../merge/preview` |
+| Merge | ✅ | `POST .../merge` + read-only `GET .../merge/preview`, which answers what the merge does with the same `strategy`, `squash` and `allow_unrelated_histories` (spec `5d8e1801`, [#805](https://github.com/coder/openstorage/issues/805)) |
 | Both path styles | ✅ | `/api/v1/...` (repo from the JWT `repo` claim) and the canonical `/api/repos` routes over the same handlers: `GET`/`POST /api/repos` and the named-repo `/api/repos/{repo_name}/...` aliases, including `DELETE .../tags/{tag_name}` |
 | Deprecated spellings | ✅ | Documented upstream aliases accepted ([below](#deprecated-aliases)) |
 | Git smart-HTTP | ✅ | Clone/fetch/push at `/{repo}.git` (repo ID or URL-encoded name), ref policies, signed-commit verification, atomic pushes ([below](#git-protocol-semantics)) |
@@ -273,15 +273,14 @@ Upstream evolves continuously, so drift is tracked in the open:
     described as open.storage runs them (`merge` makes a merge commit also when a
     fast-forward is possible, `ff_only` answers `412` when it cannot fast-forward,
     and every strategy answers `no_op` when the target already contains the source).
-    These parts are open:
+    `merge/preview` reads `strategy`, `squash` and `allow_unrelated_histories` and
+    answers what `POST /merge` does with them, with the results `squash` and
+    `rejected` and a `412` for unrelated histories
+    ([#805](https://github.com/coder/openstorage/issues/805)). These parts are open:
     - `expected_target_sha` on `branches/create`: 40 zeros requires a new branch, the
       current tip guards a move, and a failed guard answers `409` without changing the
       branch, even with `force`
       ([#803](https://github.com/coder/openstorage/issues/803)).
-    - `strategy`, `squash` and `allow_unrelated_histories` on `merge/preview`, which
-      then predicts the `POST /merge` result, with the new results `squash` and
-      `rejected` and a `412` for unrelated histories
-      ([#805](https://github.com/coder/openstorage/issues/805)).
     - File modes on commit writes: permission bits such as `644` and regular-file
       modes such as `100664` are stored as `100755` or `100644`
       ([#806](https://github.com/coder/openstorage/issues/806)).
