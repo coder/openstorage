@@ -249,7 +249,7 @@ func TestPersistentRemoteHoldsNoHiddenRef(t *testing.T) {
 		{"import with a pack", "+import", "refs/heads/ih", "refs/namespaces/ephemeral/refs/heads/ih", []string{imported + ":refs/heads/ih", imported + ":refs/namespaces/ephemeral/refs/heads/ih"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			before, visibleBefore := pgRefs(t, repo)[tc.hidden], pgRefs(t, repo)[tc.visible]
+			before := pgRefs(t, repo)[tc.hidden]
 			done := make(chan pushResult, 1)
 			go func() {
 				out, err := tryGit(work, append([]string{"push", remoteURL(node, repo+tc.suffix, token)}, tc.specs...)...)
@@ -263,29 +263,30 @@ func TestPersistentRemoteHoldsNoHiddenRef(t *testing.T) {
 			if holds.contains(tc.hidden) {
 				t.Fatalf("the push holds %s, which it can never commit", tc.hidden)
 			}
-			// Pre-receive has finished once the visible ref's update hook
-			// committed (the hook delay then keeps the hold), so every
-			// sidecar marker of the push exists by now.
-			for deadline := time.Now().Add(10 * time.Second); pgRefs(t, repo)[tc.visible] == visibleBefore; {
-				if time.Now().After(deadline) {
-					t.Fatalf("the push never committed %s", tc.visible)
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
+			// Pre-receive writes the sidecar markers right after the hold,
+			// and the server removes them with the hold when the push ends:
+			// check for one until then (the hook delay keeps the push open).
 			dir := filepath.Join(RepoPath(nodeCache, repo), pushHoldDir)
-			entries, err := os.ReadDir(dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, e := range entries {
-				if isPushHoldSidecar(e.Name()) {
-					continue
+			var res pushResult
+			for running := true; running; {
+				select {
+				case res = <-done:
+					running = false
+				case <-time.After(10 * time.Millisecond):
 				}
-				if _, err := os.Stat(pushHoldUnreservedMarker(filepath.Join(dir, e.Name()), tc.hidden)); err == nil {
-					t.Fatalf("the push wrote a sidecar marker for %s, which it can never commit", tc.hidden)
+				entries, err := os.ReadDir(dir)
+				if err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+				for _, e := range entries {
+					if isPushHoldSidecar(e.Name()) {
+						continue
+					}
+					if _, err := os.Stat(pushHoldUnreservedMarker(filepath.Join(dir, e.Name()), tc.hidden)); err == nil {
+						t.Fatalf("the push wrote a sidecar marker for %s, which it can never commit", tc.hidden)
+					}
 				}
 			}
-			res := <-done
 			if res.err == nil || !strings.Contains(res.out, "a hidden ref") {
 				t.Fatalf("push: err=%v\n%s", res.err, res.out)
 			}
@@ -394,11 +395,31 @@ func TestPersistentRemoteIgnoresServeGitProtocol(t *testing.T) {
 	t.Cleanup(node.stop)
 	repo := registerRepo(t, "t-v0-only")
 	token := mintTestToken(t, repo, "git:read,git:write", "")
-	mustGit(t, initWorkRepo(t), "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+	work := initWorkRepo(t)
+	persistent := remoteURL(node, repo, token)
+	mustGit(t, work, "push", persistent, "HEAD:refs/heads/main")
 	for _, service := range []string{"git-upload-pack", "git-receive-pack"} {
 		if adv := smartHTTPAt(t, node, repo, token, http.MethodGet, "info/refs?service="+service, ""); strings.Contains(adv, "version 2") || !strings.Contains(adv, "refs/heads/main") {
 			t.Fatalf("%s advertisement is not protocol v0:\n%q", service, adv)
 		}
+	}
+	// The RPC child speaks v0 too: a v2 fetch request of a commit that only
+	// an ephemeral branch reaches gets no pack, and a v0 want of it gets
+	// "not our ref".
+	solo := commitFile(t, work, "solo.txt", "solo\n", "ephemeral only", nil)
+	mustGit(t, work, "push", persistent, "HEAD:refs/heads/tmp")
+	body := `{"base_ref":"tmp","target_branch":"agent","target_is_ephemeral":true}`
+	if status := apiJSON(t, node, http.MethodPost, token, "/api/v1/repos/branches/create", body, nil); status != http.StatusOK {
+		t.Fatalf("ephemeral branch create: status %d", status)
+	}
+	mustGit(t, work, "push", persistent, ":refs/heads/tmp")
+	v2 := pktLine("command=fetch\n") + pktLine("object-format=sha1\n") + "0001" + pktLine("want "+solo+"\n") + pktLine("done\n") + "0000"
+	if rpc := smartHTTPAt(t, node, repo, token, http.MethodPost, "git-upload-pack", v2); strings.Contains(rpc, "PACK") {
+		t.Fatalf("a v2 fetch got the hidden-only commit %s:\n%q", solo, rpc)
+	}
+	v0 := pktLine("want "+solo+"\n") + "0000" + pktLine("done\n")
+	if rpc := smartHTTPAt(t, node, repo, token, http.MethodPost, "git-upload-pack", v0); !strings.Contains(rpc, "not our ref") || strings.Contains(rpc, "PACK") {
+		t.Fatalf("upload-pack RPC answered a want of %s:\n%q", solo, rpc)
 	}
 }
 
