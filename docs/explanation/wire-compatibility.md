@@ -275,7 +275,7 @@ Upstream evolves continuously, so drift is tracked in the open:
     and every strategy answers `no_op` when the target already contains the source).
     `merge/preview` reads `strategy`, `squash` and `allow_unrelated_histories` and
     answers what `POST /merge` does with them, with the results `squash` and
-    `rejected` and a `412` for unrelated histories
+    `rejected` and a `412` for unrelated histories (`rejected` with `ff_only`)
     ([#805](https://github.com/coder/openstorage/issues/805)). These parts are open:
     - `expected_target_sha` on `branches/create`: 40 zeros requires a new branch, the
       current tip guards a move, and a failed guard answers `409` without changing the

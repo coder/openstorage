@@ -1436,6 +1436,7 @@ func TestMergePreviewMatchesMerge(t *testing.T) {
 			"source_branch=orphan&target_branch=main&allow_unrelated_histories=true":             "200 merge_commit clean",
 			"source_branch=conflict&target_branch=main&squash=true&strategy=ff_prefer":           "200 squash conflicted",
 			"source_branch=main&target_branch=ffsrc&strategy=ff_only":                            "200 no_op clean",
+			"source_branch=ffsrc&target_branch=main&strategy=":                                   "200 fast_forward clean",
 			"source_branch=feature&target_branch=main&strategy=ff_only&squash=true":              "400",
 			"source_branch=feature&target_branch=main&strategy=bogus":                            "400",
 			"source_branch=feature&target_branch=main&squash=bogus":                              "400",
