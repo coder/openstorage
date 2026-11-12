@@ -66,20 +66,29 @@ The `+import` remote follows upstream's
 
 Versions up to 0.20.0 kept `+import` pushes in a separate ref space, under the storage key
 `<repo_id>+import`, that only the `+import` remote could read. The new version deletes
-nothing there, but no git path reads it any more. Before you upgrade, use the current
-version to copy each branch and tag that you pushed through `+import` to the normal
-remote:
+nothing there, but no git path reads it any more. Copy that data to the normal remote
+with the current version before every replica runs the new one:
 
-```sh
-git clone --mirror https://t:<jwt>@{org}.code.storage/{repo_id}+import.git import.git
-git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
-```
+1. Stop sending pushes to `+import` remotes. On a fleet, an import push that reaches a
+   replica that still runs 0.20.0 lands under the old key again.
+2. Check the pack quota. The copy stores the objects a second time under the repository's
+   own key, and both copies count against the
+   [pack quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas): the old packs
+   keep counting until the repository is deleted. When the repository's stored bytes plus
+   the import's size pass `OPENSTORAGE_PACK_QUOTA_BYTES`, raise that limit (or set it to
+   `0`) for the copy and for the pushes after it.
+3. Copy each branch and tag that you pushed through `+import`:
 
-The push refuses a branch that already exists on the normal remote and does not
-fast-forward. Push such a branch under a new name, for example
-`refs/heads/main:refs/heads/imported/main`. The packs under the old key keep counting against the repository's
-[pack quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas) until the
-repository is deleted.
+   ```sh
+   git clone --mirror https://t:<jwt>@{org}.code.storage/{repo_id}+import.git import.git
+   git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+   ```
+
+   The push refuses a branch that already exists on the normal remote and does not
+   fast-forward, and a tag that already exists there with another value. Push such a ref
+   under a new name, for example `refs/heads/main:refs/heads/imported/main` or
+   `refs/tags/v1:refs/tags/imported/v1`.
+4. Upgrade every replica, then send import pushes again.
 
 ## Git LFS
 

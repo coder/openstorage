@@ -199,7 +199,8 @@ func TestNamespace_ImportRefusesSyncedRepo(t *testing.T) {
 
 // TestRefuseSyncedImportDecision pins pre-receive's import decision against
 // the lane's store: no link passes, a link refuses with text the pusher
-// sees, and a store that cannot answer fails closed with a hidden cause.
+// sees, and a store that cannot open or cannot read fails closed with a
+// hidden cause.
 func TestRefuseSyncedImportDecision(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
@@ -221,8 +222,15 @@ func TestRefuseSyncedImportDecision(t *testing.T) {
 		t.Fatalf("linked repo: err = %v (shown %v), want the shown refusal", err, ShownToPusher(err))
 	}
 
+	// An empty SQLite file opens, and then every read fails: the read
+	// branch fails closed too.
+	t.Setenv("OPENSTORAGE_PG_URL", "sqlite://"+filepath.Join(t.TempDir(), "empty.db"))
+	if err := refuseSyncedImport(ctx, linked.RepoID); err == nil || ShownToPusher(err) {
+		t.Fatalf("store whose read fails: err = %v (shown %v), want a hidden error", err, err != nil && ShownToPusher(err))
+	}
+
 	t.Setenv("OPENSTORAGE_PG_URL", "unsupported://store")
 	if err := refuseSyncedImport(ctx, linked.RepoID); err == nil || ShownToPusher(err) {
-		t.Fatalf("unreachable store: err = %v (shown %v), want a hidden error", err, err != nil && ShownToPusher(err))
+		t.Fatalf("store that cannot open: err = %v (shown %v), want a hidden error", err, err != nil && ShownToPusher(err))
 	}
 }
