@@ -101,8 +101,10 @@ replica runs the new one:
 
 If a replica already runs the new version and you did not copy the data, the data is
 still in storage. Stop every replica of the new version, start 0.20.0 on the same stores,
-and follow steps 1 to 4. Do this only when no release between 0.20.0 and the new version
-lists a change to the stored formats in its release notes.
+and follow steps 1 to 4. Do this only when no release after 0.20.0, up to and including
+the version you upgraded to, lists a change to the stored formats in its release notes.
+Otherwise do not start 0.20.0 on those stores: keep the new version and leave the old
+data in place.
 
 ## Git LFS
 
