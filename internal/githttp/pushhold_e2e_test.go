@@ -819,6 +819,17 @@ func TestPush_LegacyOverDepthRefDeletable(t *testing.T) {
 	if _, ok := pgRefs(t, repo)[deep]; ok {
 		t.Fatalf("deletion accepted but the authority still holds %s", deep)
 	}
+	// An atomic push deletes one too, next to another update.
+	deep2 := "refs/heads" + strings.Repeat("/e", maxPushRefDepth)
+	if won, err := testStore.CASRef(context.Background(), repo, deep2, ref.ZeroSHA, head); err != nil || !won {
+		t.Fatalf("seed legacy deep ref: won=%v err=%v", won, err)
+	}
+	if out, err := tryGit(work, "push", "--atomic", remoteURL(nodeA, repo, token), ":"+deep2, "HEAD:refs/heads/side"); err != nil {
+		t.Fatalf("atomic push deleting a legacy over-depth ref: %v\n%s", err, out)
+	}
+	if refs := pgRefs(t, repo); refs["refs/heads/side"] != head || refs[deep2] != "" {
+		t.Fatalf("atomic push: side=%q, %s=%q", refs["refs/heads/side"], deep2, refs[deep2])
+	}
 	// The bounds still deny re-creating it.
 	out, err = tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:"+deep)
 	if err == nil {
