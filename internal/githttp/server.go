@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -660,9 +661,9 @@ func pktLine(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
 // base repository as refs/namespaces/ephemeral/... (auth.EphemeralRefName).
 const persistentHiddenRefs = "refs/namespaces/"
 
-// persistentKey reports whether storage key repo is a persistent remote, a
-// key without the `+ephemeral` suffix. An import push uses the base key
-// (resolveTarget), so these rules cover it too.
+// persistentKey reports whether storage key repo is a persistent remote:
+// the base repository's own key. An import push uses that key too
+// (resolveTarget), so these rules cover it.
 func persistentKey(repo string) bool { return BaseRepo(repo) == repo }
 
 // serviceCmd builds the upload-pack or receive-pack child of every git
@@ -687,7 +688,11 @@ func serviceCmd(ctx context.Context, target repoTarget, service string, args ...
 		}
 	}
 	gitArgs = append(gitArgs, service, "--stateless-rpc")
-	return exec.CommandContext(ctx, "git", append(gitArgs, args...)...)
+	cmd := exec.CommandContext(ctx, "git", append(gitArgs, args...)...)
+	// The server speaks protocol v0 only: v2's fetch serves any want, so a
+	// GIT_PROTOCOL in serve's own environment would undo the want settings.
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "GIT_PROTOCOL=") })
+	return cmd
 }
 
 func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo string) {
@@ -944,7 +949,6 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	}
 
 	cmd := serviceCmd(r.Context(), target, service, repoPath)
-	cmd.Env = os.Environ()
 	// No-op for upload-pack; receive-pack assigns the real hold release.
 	releasePushHold := func() {}
 	if service == "receive-pack" {

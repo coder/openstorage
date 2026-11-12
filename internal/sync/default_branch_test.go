@@ -29,6 +29,9 @@ func TestParseHeadSymref(t *testing.T) {
 		{"ref: refs/heads/-x\tHEAD\n", ""},          // API-invalid
 		{"ref: refs/heads/trunk HEAD\n", ""},        // no tab
 		{"ref: refs/heads/trunk\tHEAD extra\n", ""}, // not exactly HEAD
+
+		// A ref name, not a default: stored, it would name a hidden ref.
+		{"ref: refs/heads/refs/namespaces/ephemeral/refs/heads/x\tHEAD\n", ""},
 	} {
 		branch, reason := parseHeadSymref(tc.out)
 		if branch != tc.branch || (branch == "") == (reason == "") {
