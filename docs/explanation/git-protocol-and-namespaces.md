@@ -115,7 +115,8 @@ replica runs the new one:
    `<repo_id>+import.git` directory that no git request uses: 0.20.0 made it when it
    served the old key, and repack and LFS reclamation jobs for the old key can make it
    again, on any replica that runs them. Check every replica. The cache is rebuildable, so
-   deleting that directory is safe.
+   you can delete that directory, but only while the replica is drained and stopped, as
+   for any cache cleanup ([cache directory](../how-to/deploy-production.md#local-disk-the-cache-directory)).
 
 If a replica already runs the new version and you did not copy the data, the data is
 still in storage. Stop every replica of the new version, start 0.20.0 on the same stores,
