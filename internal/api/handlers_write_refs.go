@@ -260,17 +260,19 @@ func (s *server) wrefListRefs(w http.ResponseWriter, r *http.Request, repoID str
 	return refs, true
 }
 
-// wrefTip returns the stored tip of refName, or ref.ZeroSHA when the ref
-// does not exist.
+// wrefTip point-reads the stored tip of refName, or ref.ZeroSHA when the
+// ref does not exist.
 func (s *server) wrefTip(w http.ResponseWriter, r *http.Request, repoID, refName string) (string, bool) {
-	refs, ok := s.wrefListRefs(w, r, repoID)
-	if !ok {
+	tip, err := s.refStore.GetRef(r.Context(), repoID, refName)
+	switch {
+	case errors.Is(err, ref.ErrNotFound):
+		return ref.ZeroSHA, true
+	case err != nil:
+		s.internalErr(w, r, "read target ref", err)
 		return "", false
 	}
-	if tip, exists := refs[refName]; exists {
-		return tip, true
-	}
-	return ref.ZeroSHA, true
+	assertf(ref.ValidSHA(tip) && tip != ref.ZeroSHA, "wrefTip: stored tip %q of %s", tip, refName)
+	return tip, true
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +325,15 @@ type wrefCreateBranchResponse struct {
 	TargetBranch      string `json:"target_branch"`
 	TargetIsEphemeral bool   `json:"target_is_ephemeral"`
 	CommitSHA         string `json:"commit_sha"`
+}
+
+func wrefCreateBranchOK(w http.ResponseWriter, message, branch string, ephemeral bool, sha string) {
+	writeJSON(w, http.StatusOK, wrefCreateBranchResponse{
+		Message:           message,
+		TargetBranch:      branch,
+		TargetIsEphemeral: ephemeral,
+		CommitSHA:         sha,
+	})
 }
 
 // handleCreateBranch resolves the base to a commit (branch, tag — peeled —
@@ -379,6 +390,20 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "base_ref, base_branch, or preferred_base is required")
 		return
 	}
+	// A named target's tip is read before materializing, so the read repo
+	// holds its objects for the fast-forward and policy checks. An
+	// allocated name is new by construction: the zero CAS is its guard.
+	current := ref.ZeroSHA
+	if !allocate && (req.Force || guard != "") {
+		var ok bool
+		if current, ok = s.wrefTip(w, r, repo.RepoID, wrefRefName(targetBranch, req.TargetIsEphemeral)); !ok {
+			return
+		}
+		if guard != "" && guard != current {
+			wrefFailTargetGuard(w, guard, current)
+			return
+		}
+	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
@@ -424,22 +449,9 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 			assertf(wrefValidBranchInput(targetBranch), "invalid allocated branch name %q", targetBranch)
 		}
 		targetRef := wrefRefName(targetBranch, req.TargetIsEphemeral)
-		// The CAS precondition: zero for plain create, the current tip when
-		// force re-creates an existing branch or a guard on that tip moves
-		// it. An allocated name is new by construction, so the zero CAS is
-		// its guard.
-		oldSHA := ref.ZeroSHA
-		if req.Force || (guard != "" && !allocate) {
-			current, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
-			if !ok {
-				return
-			}
-			if guard != "" && guard != current {
-				wrefFailTargetGuard(w, guard, current)
-				return
-			}
-			oldSHA = current
-		}
+		// The CAS precondition: zero for plain create, the tip read above
+		// when force re-creates an existing branch or a guard moves it.
+		oldSHA := current
 		// Without force, a guarded move only fast-forwards (upstream's 412
 		// for "a branch creation whose target cannot be fast-forwarded").
 		if !req.Force && oldSHA != ref.ZeroSHA {
@@ -463,6 +475,12 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		}
 		if deny != "" {
 			writeErr(w, http.StatusForbidden, deny)
+			return
+		}
+		// The branch is already at the base: no ref write, so no
+		// generation bump, webhook or sync poke for an unchanged ref.
+		if oldSHA != ref.ZeroSHA && oldSHA == baseSHA {
+			wrefCreateBranchOK(w, "branch updated", targetBranch, req.TargetIsEphemeral, baseSHA)
 			return
 		}
 		won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)
@@ -497,12 +515,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		if oldSHA != ref.ZeroSHA {
 			message = "branch updated"
 		}
-		writeJSON(w, http.StatusOK, wrefCreateBranchResponse{
-			Message:           message,
-			TargetBranch:      targetBranch,
-			TargetIsEphemeral: req.TargetIsEphemeral,
-			CommitSHA:         baseSHA,
-		})
+		wrefCreateBranchOK(w, message, targetBranch, req.TargetIsEphemeral, baseSHA)
 		return
 	}
 	writeErr(w, http.StatusConflict, "could not allocate an unused branch name")

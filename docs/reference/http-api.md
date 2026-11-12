@@ -476,9 +476,12 @@ target branch. It applies to the persistent and the ephemeral namespace:
 
 - A failed guard answers `409` `ref_guard_failed` with `guard: "expected_target_sha"` and
   `current_sha`, the branch tip or 40 zeros when the branch does not exist. The branch
-  does not change, with or without `force`. When the branch moves away from the guard
-  between the guard check and the write, the answer is the same, with the new tip as
-  `current_sha`.
+  does not change, with or without `force`. When another writer moves the branch away
+  from the guard between the guard check and the write, the answer is the same, with
+  the new tip as `current_sha`, unless the branch then already points at the base: the
+  answer is then `200`.
+- A target that already points at the base answers `200` ("branch updated") without a
+  ref write, so no webhook or upstream sync follows. Ref policies still apply.
 - A value that is not 40 hex digits is `400` (`invalid_params` names
   `expected_target_sha`).
 - Without `target_branch`, only 40 zeros is accepted (the allocated name is new); any
