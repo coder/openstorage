@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,7 +256,8 @@ func TestAuthenticate_ResolvesRepoIDToURLClaim(t *testing.T) {
 
 // TestAuthenticate_ResolveRepoCanonicalizes pins the repo-key-split fix
 // (ADR-21): resolveTarget maps any accepted path element to the canonical
-// RepoID(+suffix) storage key, and unresolvable elements (including every
+// RepoID(+ephemeral) storage key (the push-only `+import` remote keys the
+// base RepoID), and unresolvable elements (including every
 // element when no resolver is wired) are not targets at all — the handlers
 // answer 404 instead of keying storage by the raw path element.
 func TestAuthenticate_ResolveRepoCanonicalizes(t *testing.T) {
@@ -271,8 +273,8 @@ func TestAuthenticate_ResolveRepoCanonicalizes(t *testing.T) {
 		rec.URL:                   rec.RepoID,
 		rec.RepoID:                rec.RepoID,
 		rec.URL + "+ephemeral":    rec.RepoID + "+ephemeral",
-		rec.RepoID + "+import":    rec.RepoID + "+import",
-		rec.URL + "+import":       rec.RepoID + "+import",
+		rec.RepoID + "+import":    rec.RepoID,
+		rec.URL + "+import":       rec.RepoID,
 		rec.RepoID + "+ephemeral": rec.RepoID + "+ephemeral",
 	} {
 		target, ok := srv.resolveTarget(context.Background(), pathElem)
@@ -284,6 +286,9 @@ func TestAuthenticate_ResolveRepoCanonicalizes(t *testing.T) {
 		}
 		if target.repo.RepoID != rec.RepoID {
 			t.Fatalf("resolveTarget(%q).repo = %+v, want %+v", pathElem, target.repo, rec)
+		}
+		if want := strings.HasSuffix(pathElem, "+import"); target.viaImport != want {
+			t.Fatalf("resolveTarget(%q).viaImport = %v, want %v", pathElem, target.viaImport, want)
 		}
 	}
 

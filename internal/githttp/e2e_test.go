@@ -1267,10 +1267,11 @@ func TestNamespace_EphemeralIsolated(t *testing.T) {
 	}
 }
 
-// docs/explanation/git-protocol-and-namespaces.md `+import` namespace: bulk history round-trips through its own
-// isolated ref space (clone/push/fetch), invisible from the persistent
-// remote.
-func TestNamespace_ImportRoundTrip(t *testing.T) {
+// TestNamespace_ImportPushWritesNormalBranches pins the `+import` remote of
+// code.storage docs/repos/imports: an import push creates normal branches
+// and tags that the persistent remote, a cold clone and the REST branch list
+// all show, and a later import push updates them like any push.
+func TestNamespace_ImportPushWritesNormalBranches(t *testing.T) {
 	repo := registerRepo(t, "t10-import")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
@@ -1279,35 +1280,121 @@ func TestNamespace_ImportRoundTrip(t *testing.T) {
 	mustGit(t, work, "push", remoteURL(nodeA, repo+"+import", token), "HEAD:refs/heads/main", "refs/tags/v1")
 	head := revParse(t, work, "HEAD")
 
-	importOut := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo+"+import", token))
-	if !strings.Contains(importOut, "refs/heads/main") || !strings.Contains(importOut, "refs/tags/v1") {
-		t.Fatalf("import advertisement missing pushed refs:\n%s", importOut)
+	persistent := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
+	if !strings.Contains(persistent, head+"\trefs/heads/main") || !strings.Contains(persistent, "refs/tags/v1") {
+		t.Fatalf("persistent remote missing the imported refs:\n%s", persistent)
 	}
-	if persistent := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token)); strings.Contains(persistent, "refs/heads/main") {
-		t.Fatalf("persistent remote sees import refs:\n%s", persistent)
+	var branches struct {
+		Branches []struct {
+			Name    string `json:"name"`
+			HeadSHA string `json:"head_sha"`
+		} `json:"branches"`
+	}
+	if status := apiGet(t, nodeA, token, "/api/v1/repos/branches", &branches); status != http.StatusOK {
+		t.Fatalf("GET /repos/branches = %d", status)
+	}
+	if len(branches.Branches) != 1 || branches.Branches[0].Name != "main" || branches.Branches[0].HeadSHA != head {
+		t.Fatalf("read API branches = %+v, want main@%s", branches.Branches, head)
 	}
 
-	// Clone the import namespace (fresh replica, cold cache), verify
-	// integrity, extend it, and fetch the extension back in the original
-	// working repo.
+	// A normal clone on a fresh replica (cold cache) gets the import.
 	nodeB := startNodeT(t)
 	cloneDir := filepath.Join(t.TempDir(), "clone")
-	mustGit(t, "", "clone", remoteURL(nodeB, repo+"+import", token), cloneDir)
+	mustGit(t, "", "clone", remoteURL(nodeB, repo, token), cloneDir)
 	if got := revParse(t, cloneDir, "HEAD"); got != head {
-		t.Fatalf("import clone HEAD = %q, want %q", got, head)
+		t.Fatalf("clone HEAD = %q, want %q", got, head)
 	}
 	if out, err := tryGit(cloneDir, "fsck", "--strict"); err != nil {
 		t.Fatalf("git fsck: %v\n%s", err, out)
 	}
+
+	// The import remote advertises the normal refs to a push, so a second
+	// import push fast-forwards main from its real old value.
 	writeFile(t, cloneDir, "bulk.txt", "imported\n")
 	mustGit(t, cloneDir, "add", ".")
 	mustGit(t, cloneDir, "commit", "-m", "bulk")
 	newHead := revParse(t, cloneDir, "HEAD")
 	mustGit(t, cloneDir, "push", remoteURL(nodeB, repo+"+import", token), "HEAD:refs/heads/main")
+	if got := lsRemoteSHA(t, "", remoteURL(nodeA, repo, token), "refs/heads/main"); got != newHead {
+		t.Fatalf("persistent main after the second import push = %q, want %q", got, newHead)
+	}
+}
 
-	mustGit(t, work, "fetch", remoteURL(nodeA, repo+"+import", token), "refs/heads/main")
-	if got := revParse(t, work, "FETCH_HEAD"); got != newHead {
-		t.Fatalf("fetched import main = %q, want %q", got, newHead)
+// TestNamespace_ImportRefusesReads pins the push-only rule of the `+import`
+// remote: clone, fetch and ls-remote fail with upstream's text, which git
+// prints because the body is text/plain. The refusal follows auth and the
+// existence check, so a bad token still gets git's 401 prompt and an
+// unregistered repo still answers 404.
+func TestNamespace_ImportRefusesReads(t *testing.T) {
+	repo := registerRepo(t, "t10-import-read")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	importURL := remoteURL(nodeA, repo+"+import", token)
+
+	for _, args := range [][]string{
+		{"clone", importURL, filepath.Join(t.TempDir(), "clone")},
+		{"ls-remote", importURL},
+		{"-C", work, "fetch", importURL, "refs/heads/main"},
+	} {
+		out, err := tryGit("", args...)
+		if err == nil {
+			t.Fatalf("git %s through +import succeeded:\n%s", args[0], out)
+		}
+		if !strings.Contains(out, "remote: "+importReadRefusal) || !strings.Contains(out, "403") {
+			t.Fatalf("git %s through +import: want the 403 refusal text, got:\n%s", args[0], out)
+		}
+	}
+
+	for _, rpc := range []struct{ method, path string }{
+		{http.MethodGet, "/info/refs?service=git-upload-pack"},
+		{http.MethodPost, "/git-upload-pack"},
+	} {
+		req, err := http.NewRequest(rpc.method, "http://"+nodeA.addr+"/"+repo+"+import.git"+rpc.path, strings.NewReader("0000"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth("t", token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || string(body) != importReadRefusal+"\n" {
+			t.Fatalf("%s %s = %d %q %q, want 403 text/plain refusal", rpc.method, rpc.path, resp.StatusCode, resp.Header.Get("Content-Type"), body)
+		}
+
+		req, err = http.NewRequest(rpc.method, "http://"+nodeA.addr+"/"+repo+"+import.git"+rpc.path, strings.NewReader("0000"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth("t", "not-a-token")
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s %s with a bad token = %d, want 401", rpc.method, rpc.path, resp.StatusCode)
+		}
+
+		// A token whose claim names the unregistered path verbatim passes
+		// auth; the repo still does not exist.
+		missing := runUnique("t10-import-missing")
+		req, err = http.NewRequest(rpc.method, "http://"+nodeA.addr+"/"+missing+"+import.git"+rpc.path, strings.NewReader("0000"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth("t", mintTestToken(t, missing, "git:read,git:write", ""))
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s %s on an unregistered repo = %d, want 404", rpc.method, rpc.path, resp.StatusCode)
+		}
 	}
 }
 

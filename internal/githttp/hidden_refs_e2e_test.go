@@ -158,14 +158,48 @@ func TestPersistentRemoteHidesNamespacedRefs(t *testing.T) {
 	if got := lsRemoteSHA(t, "", eph, "refs/heads/scratch"); got != "" {
 		t.Fatalf("+ephemeral scratch after delete = %q, want absent", got)
 	}
-	// Only the persistent remote hides refs/namespaces/: an atomic push to
-	// `+ephemeral` still lands one, and its advertisement lists it.
+	// `+ephemeral` hides nothing: an atomic push still lands a
+	// refs/namespaces/ ref, and its advertisement lists it.
 	const kept = "refs/namespaces/kept/refs/heads/n"
-	for _, remote := range []string{eph, remoteURL(nodeA, repo+"+import", token)} {
-		mustGit(t, work, "push", "--atomic", remote, "HEAD:refs/heads/both", "HEAD:"+kept)
-		if got := lsRemoteSHA(t, "", remote, kept); got != next {
-			t.Fatalf("%s on a namespaced remote = %q, want %q", kept, got, next)
+	mustGit(t, work, "push", "--atomic", eph, "HEAD:refs/heads/both", "HEAD:"+kept)
+	if got := lsRemoteSHA(t, "", eph, kept); got != next {
+		t.Fatalf("+ephemeral %s = %q, want %q", kept, got, next)
+	}
+
+	// An import push writes the base repository's refs, so it follows the
+	// persistent remote's rules: each hidden ref gets its ng, a plain push
+	// still lands its other refs, and an atomic one lands nothing.
+	imp := remoteURL(nodeA, repo+"+import", token)
+	for _, tc := range []struct{ spec, msg, ref string }{
+		{"HEAD:" + agent, "deny updating a hidden ref", agent},
+		{":" + agent, "deny deleting a hidden ref", agent},
+		{"HEAD:" + kept, "deny updating a hidden ref", kept},
+	} {
+		before := pgRefs(t, repo)[tc.ref]
+		out, err := tryGit(work, "push", imp, tc.spec)
+		if err == nil || !strings.Contains(out, "[remote rejected]") || !strings.Contains(out, tc.msg) {
+			t.Fatalf("import push %s: err=%v, want a %q rejection:\n%s", tc.spec, err, tc.msg, out)
 		}
+		if got := pgRefs(t, repo)[tc.ref]; got != before {
+			t.Fatalf("import push %s moved %s from %q to %q", tc.spec, tc.ref, before, got)
+		}
+	}
+	out, err = tryGit(work, "push", imp, "HEAD:refs/heads/imported", "HEAD:"+kept)
+	if err == nil || !strings.Contains(out, "deny updating a hidden ref") {
+		t.Fatalf("mixed import push: err=%v\n%s", err, out)
+	}
+	if refs := pgRefs(t, repo); refs["refs/heads/imported"] != next || refs[kept] != "" {
+		t.Fatalf("mixed import push: authority imported=%q, hidden=%q", refs["refs/heads/imported"], refs[kept])
+	}
+	out, err = tryGit(work, "push", "--atomic", imp, "HEAD:refs/heads/imported-side", "HEAD:"+kept)
+	if err == nil || !strings.Contains(out, "is hidden on this remote") {
+		t.Fatalf("atomic import push: err=%v\n%s", err, out)
+	}
+	if refs := pgRefs(t, repo); refs["refs/heads/imported-side"] != "" || refs[kept] != "" {
+		t.Fatalf("atomic import push landed in part: side=%q, hidden=%q", refs["refs/heads/imported-side"], refs[kept])
+	}
+	if got := lsRemoteSHA(t, "", persistent, "refs/heads/imported"); got != next {
+		t.Fatalf("persistent refs/heads/imported = %q, want %q", got, next)
 	}
 }
 

@@ -60,6 +60,10 @@ const (
 	// Minted per request by the server and stripped from inherited env
 	// like the other per-push inputs.
 	EnvPushHold = "OPENSTORAGE_GIT_PUSH_HOLD"
+	// EnvImportPush marks a push that came through the `+import` remote
+	// ("1"). The push writes the base repo's refs; pre-receive refuses it
+	// when the repo has a sync base (refuseSyncedImport).
+	EnvImportPush = "OPENSTORAGE_GIT_IMPORT_PUSH"
 	// EnvAtomic marks the push `--atomic` (issue #28). githooks(5) exposes
 	// no atomic indicator, so the HTTP layer sniffs the wire capability
 	// (atomic.go) and sets this; pre-receive then evaluates the policy
@@ -382,6 +386,11 @@ func preReceive(ctx context.Context) (retErr error) {
 	}
 	if len(commands) == 0 {
 		return errors.New("pre-receive: git invoked hook with no commands")
+	}
+	if envconfig.Getenv(EnvImportPush) == "1" {
+		if err := refuseSyncedImport(ctx, repo); err != nil {
+			return err
+		}
 	}
 	atomicPush := envconfig.Getenv(EnvAtomic) == "1"
 
@@ -2038,6 +2047,34 @@ func enforceSyncClaimFence(ctx context.Context, repo, holder string) error {
 		return refusef("sync claim fence: claim now held by %q, refusing the stale sync push", up.SyncClaimHolder)
 	}
 	return nil
+}
+
+// importSyncedRefusal is the pre-receive refusal of an import push to a
+// repository with a sync base.
+const importSyncedRefusal = "import push refused: the repository has a sync base; +import remotes accept pushes only for repositories without one"
+
+// refuseSyncedImport refuses a `+import` push to a repository that has a
+// sync base, so an imported ref never reaches a connected upstream
+// (code.storage docs/repos/imports). In serve, a repo writes its upstream
+// link only together with its repo row (meta.EventingStore.CreateLinkedRepo:
+// both serve queues track create state), so one read before any pack is
+// published decides the whole push. It fails
+// closed when the metadata store cannot answer, and the pusher then sees
+// only hookFailure's fixed line.
+func refuseSyncedImport(ctx context.Context, repo string) error {
+	assertf(repo != "" && BaseRepo(repo) == repo, "refuseSyncedImport: %q is not a base repo key", repo)
+	ms, err := meta.Open(ctx, mustEnv(envHookPGURL...))
+	if err != nil {
+		return fmt.Errorf("import push: open meta store: %w", err)
+	}
+	defer ms.Close()
+	switch _, err := ms.GetRepoUpstream(ctx, repo); {
+	case errors.Is(err, meta.ErrNotFound):
+		return nil
+	case err != nil:
+		return fmt.Errorf("import push: load upstream link: %w", err)
+	}
+	return Refuse(errors.New(importSyncedRefusal))
 }
 
 // errCASDrop is the synthetic post-commit connection-drop error the

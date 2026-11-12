@@ -9,7 +9,7 @@
 ```
 https://t:<jwt>@{org}.code.storage/{repo_id}.git              # persistent namespace
 https://t:<jwt>@{org}.code.storage/{repo_id}+ephemeral.git    # ephemeral namespace
-https://t:<jwt>@{org}.code.storage/{repo_id}+import.git       # import namespace
+https://t:<jwt>@{org}.code.storage/{repo_id}+import.git       # import remote (push only)
 ```
 
 - Basic auth: the username is the fixed literal `t`; the password is the JWT.
@@ -37,15 +37,16 @@ The receive path must:
   first match wins, reporting per-ref `ng` results with a policy message.
 - Map namespaces: `+ephemeral` remotes see and update only the ephemeral ref space;
   persistent remotes must not see ephemeral refs (git namespaces or separate ref stores).
-  open.storage gives each remote its own storage key. The HTTP API, though, stores its
+  open.storage gives the `+ephemeral` remote its own storage key. The HTTP API, though, stores its
   ephemeral branches under the base repository's key as
   `refs/namespaces/ephemeral/refs/heads/<name>`, so the persistent remote hides
   `refs/namespaces` and every ref under it: fetch, clone and `ls-remote` never list one, a
   fetch of one by name fails (`couldn't find remote ref`), and a push that updates or
   deletes one gets its own `ng` (`deny updating a hidden ref` or
   `deny deleting a hidden ref`). An `--atomic` push that names one lands nothing, and so
-  does a push whose new objects only such a ref needs. The `+ephemeral` and `+import`
-  remotes hide nothing. The persistent remote serves no commit that only a hidden ref
+  does a push whose new objects only such a ref needs. The `+ephemeral` remote
+  hides nothing. An import push writes the repository's own refs, so these push rules apply
+  to it too. The persistent remote serves no commit that only a hidden ref
   reaches, whatever the git config says about wants of unadvertised commits. When the
   repository's default branch is a hidden ref, it points `HEAD` at the same name under
   `refs/heads/`, which normally does not exist, so it advertises no `HEAD` (`PATCH /repo`
@@ -55,9 +56,64 @@ The receive path must:
   the same token.
 - On pushes to persistent refs, emit `push` webhooks (before/after SHAs per ref) and
   schedule upstream sync for synced repos.
-- Accept large histories on `+import` pushes. Official docs describe immediate cold
-  archival; for an OSS backend, "accept the objects, keep refs" is a functional
-  equivalent (tiering optional).
+- Accept large histories on `+import` pushes (see [Import remote](#import-remote)).
+
+## Import remote
+
+The `+import` remote follows upstream's
+[import page](https://code.storage/docs/repos/imports):
+
+- **Push only.** A clone, fetch or `ls-remote` through `{repo_id}+import.git` gets `403`
+  with a `text/plain` body, and git prints it as
+  `remote: reads are disabled for +import remotes; use the repository remote for clone/fetch`.
+  Upstream names no status code: `403` is open.storage's choice. Use the normal remote to
+  read. LFS batch requests on the import URL keep working in both directions.
+- **An import push writes normal branches and tags.** The push goes to the repository's
+  own refs, exactly like a push to `{repo_id}.git`: the same ref policies, quota, `push`
+  webhooks and LFS object space. A normal clone shows every branch and tag you pushed,
+  and the REST branch list shows every branch.
+- **A synced repository refuses an import push.** When the repository has a sync base,
+  the pre-receive hook refuses the whole push before it publishes any pack:
+  `import push refused: the repository has a sync base; ...`. A push to the normal
+  remote still works.
+- Upstream moves an imported repository to cold storage at once. open.storage keeps it on
+  the normal storage path, which is a functional equivalent.
+
+### Upgrading from 0.20.0 or earlier
+
+Versions up to 0.20.0 kept `+import` pushes in a separate ref space, under the storage key
+`<repo_id>+import`, that only the `+import` remote could read. The new version deletes
+nothing there, but no git path reads it any more, and only a 0.20.0 server can still
+serve it. Copy that data to the normal remote with the current version before every
+replica runs the new one:
+
+1. Stop sending pushes to `+import` remotes. On a fleet, an import push that reaches a
+   replica that still runs 0.20.0 lands under the old key again.
+2. Check the pack quota. The copy stores the objects a second time under the repository's
+   own key, and both copies count against the
+   [pack quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas): the old packs
+   keep counting until the repository is deleted. When the repository's stored bytes plus
+   the import's size pass `OPENSTORAGE_PACK_QUOTA_BYTES`, raise that limit (or set it to
+   `0`) for the copy and for the pushes after it.
+3. Copy every ref that you pushed through `+import` (branches, tags, notes and any other
+   ref):
+
+   ```sh
+   git clone --mirror https://t:<jwt>@{org}.code.storage/{repo_id}+import.git import.git
+   git -C import.git push https://t:<jwt>@{org}.code.storage/{repo_id}.git 'refs/*:refs/*'
+   ```
+
+   The push refuses a ref that already exists on the normal remote and does not
+   fast-forward, such as a branch with other history or a tag with another value. Push
+   such a ref under a new name, for example `refs/heads/main:refs/heads/imported/main` or
+   `refs/tags/v1:refs/tags/imported/v1`.
+
+   Do not copy into a repository that has a sync base: when the link forwards pushes, a
+   copied ref reaches the connected upstream. Create a repository without a sync base and
+   copy into that one instead.
+4. Upgrade every replica, then send import pushes again. Each replica's cache keeps an
+   unused `<repo_id>+import.git` directory. The cache is rebuildable, so you can delete
+   that directory.
 
 Before open.storage hid them, a push to the persistent remote could write refs under
 `refs/namespaces/`. Those refs stay after an upgrade, and git can no longer list or delete
