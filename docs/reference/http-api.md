@@ -40,8 +40,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `DELETE /api/repos/{repo_name}` answers that case with 404 `repository_not_found`,
   because its name lookup skips deleted repositories), `ref_guard_failed` (409: a
   failed ref guard, with `guard` and `current_sha`: on a merge, [details](#merge-guards),
-  on a commit write, [details](#commit-write-guards), and on a notes write,
-  [details](#notes)), `authentication_unavailable` (403: the key store failed while
+  on a commit write, [details](#commit-write-guards), on a notes write,
+  [details](#notes), and on a branch create, [details](#guarded-branch-create-and-move)), `authentication_unavailable` (403: the key store failed while
   verifying the token; retry), and `route_not_found` (404: no API route matches the
   path; a path that has routes for other methods answers 405 `method_not_allowed` with
   `Allow`). open.storage emits no other specific codes. It does not send
@@ -484,8 +484,10 @@ target branch. It applies to the persistent and the ephemeral namespace:
   `current_sha`, the branch tip or 40 zeros when the branch does not exist. The branch
   does not change, with or without `force`. When another writer moves the branch away
   from the guard between the guard check and the write, the answer is the same, with
-  the new tip as `current_sha`. One case differs: when a guard on the tip finds the
-  branch already moved to the base, the answer is `200`.
+  the new tip as `current_sha`. Two cases differ. When a guard on the tip finds the
+  branch already moved to the base, the answer is `200`. When the branch moves away and
+  back to the guarded tip before the write, the answer is `409` `conflict` ("branch
+  moved concurrently").
 - A guarded or forced move of a target that already points at the base answers `200`
   ("branch updated") without a ref write, so no webhook or upstream sync follows. Ref
   policies still apply. Without a guard and without `force`, such a target answers
@@ -788,7 +790,7 @@ Other limits and gaps:
 | 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`) |
 | 405 | the path has routes, but not for this method (`Allow` lists them) |
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, failed ref guard (`expected_target_sha`, `expected_source_sha`, `expected_notes_ref_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
-| 412 | a failed `restore-commit` `base_ref` precondition; a merge that is not a fast-forward under `ff_only`, or a merge or merge preview of unrelated histories without `allow_unrelated_histories` (a preview with `ff_only` answers `rejected` instead); a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
+| 412 | a failed `restore-commit` `base_ref` precondition; a merge that is not a fast-forward under `ff_only`, or a merge or merge preview of unrelated histories without `allow_unrelated_histories` (a preview with `ff_only` answers `rejected` instead); a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)); a `branches/create` move guarded by `expected_target_sha` without `force` that is not a fast-forward ([details](#guarded-branch-create-and-move)) |
 | 413 | a `commit-pack` whose decoded file contents pass 262144000 bytes ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 422 | a git read exceeded a memory, output, file-size or symlink-target limit ([resource limits on git reads](#resource-limits-on-git-reads)); retrying the same request fails the same way |
 | 429 | rate limit, busy or backpressure (plain problem body) |
