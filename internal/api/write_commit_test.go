@@ -652,6 +652,14 @@ func TestCommitPackFileDefaults(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `duplicate content_id \"same\"`) {
 			t.Errorf("shared content_id: status %d body %s, want 400 duplicate content_id", resp.StatusCode, body)
 		}
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{
+				{"path": "g.txt", "content_id": "twice", "operation": "delete"},
+				{"path": "h.txt", "content_id": "twice", "operation": "delete"},
+			}, nil))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `duplicate content_id \"twice\"`) {
+			t.Errorf("content_id shared by two deletes: status %d body %s, want 400 duplicate content_id", resp.StatusCode, body)
+		}
 	})
 }
 
