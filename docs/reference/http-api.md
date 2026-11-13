@@ -279,9 +279,9 @@ the same scopes, query parameters and responses.
 - A body with several invalid fields, in any create form, gets an `invalid_params` item
   for each, in the order `default_branch`, then the fields of `upstream` or `base_repo`
   as listed above. The create decodes `upstream` and `base_repo` on their own, before it
-  checks any field. When that decode fails (a field of the wrong type, an unknown
-  field), the answer is that failure alone: it names the field of the wrong type, and
-  no other check of the body runs. A body that sets both members is decoded as neither.
+  checks any field other than `repo_name`. When that decode fails (a field of the wrong
+  type, an unknown field), the answer is that failure alone: it names the field of the
+  wrong type, and no other check of the body runs. A body that sets both members is decoded as neither.
   A check that needs another field is skipped when that field is invalid. A missing or
   unsupported `provider` skips the checks that need it: the rules that tie `access` to
   the provider (only `github` takes it, and then it must be `public`) and the default
@@ -294,10 +294,11 @@ the same scopes, query parameters and responses.
 - The checks of state answer after the checks of the body fields: the ref policy (403),
   the egress check of the upstream host (it looks the host up), and for a copy or fork
   the source token (403), the source repository (404) and the fork point (400). A
-  `default_branch` of the body that is the only invalid field keeps its old place: after
-  the ref policy and before the egress check for a sync create, and after the fork
-  point for a copy or fork. The query parameter `default_branch` answers after the
-  egress check, so a denied host answers first.
+  `default_branch` of the body that is the only invalid field answers after the ref
+  policy and before the egress check for a sync create, and after the fork point for a
+  copy or fork. When the host is denied as well, the `default_branch` answers first. The
+  query parameter `default_branch` answers after the egress check, so a denied host
+  answers first.
 - `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
   run after every won local push. It also inverts the sync conflict rule: local wins, and
   inbound syncs never force-rewind local refs. See [Upstream sync](#upstream-sync).
