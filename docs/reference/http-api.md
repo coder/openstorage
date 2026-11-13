@@ -50,10 +50,11 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   per-repo route refuses it with 403 `forbidden`, as it refuses `repo: "org"`
   ([authentication](authentication.md)). As upstream advises, treat an unknown code as
   the generic code for its status. Branch on the status code or `code`, not on the
-  message. When a message (`error` and `detail`) or the `name` of an `invalid_params`
-  item repeats more than 2048 bytes of request text, the server cuts it at a character
-  boundary and ends it with `…`, so that a large value in a request cannot make a
-  larger answer.
+  message. On every status, an `error` or `detail` of more than 2048 bytes, and an
+  `invalid_params` `name` of more than 2048 bytes, is cut at a character boundary and
+  ends with `…`, so that a large value in a request does not make an answer of the same
+  size times the escaping. A text that has up to 2048 bytes is not cut, and the bytes of
+  a message that holds request text count with the rest of the message.
   A `400` for a request body can also carry `invalid_params` (`[{name, reason}]`, as
   upstream's `ValidationProblemDetails`): `name` is the dotted wire path of the invalid
   field, and `reason` is the rule its value breaks. open.storage sends it when a body

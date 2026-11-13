@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -41,14 +42,17 @@ func TestLongValuesAreCutInAnswers(t *testing.T) {
 		long := strings.Repeat("<", 900_000)
 		for _, tc := range []struct {
 			name, path, body string
+			status           int
 		}{
-			{"a bad strategy", "/api/v1/repos/merge", `{"source_ref":"f","target_branch":"main","strategy":"` + long + `"}`},
-			{"an unknown member name", "/api/repos/" + fx.url + "/notes/append", `{"` + long + `":1}`},
+			{"a bad strategy", "/api/v1/repos/merge", `{"source_ref":"f","target_branch":"main","strategy":"` + long + `"}`, http.StatusBadRequest},
+			{"an unknown member name", "/api/repos/" + fx.url + "/notes/append", `{"` + long + `":1}`, http.StatusBadRequest},
+			// The cut is not tied to the 400: a 404 repeats request text too.
+			{"an object_ref that does not resolve", "/api/v1/repos/notes", `{"object_ref":"` + long + `","note":"n","author":{"name":"a","email":"e"}}`, http.StatusNotFound},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				resp, body := e.doReq(t, http.MethodPost, tc.path, fx.gitTok, []byte(tc.body), "")
-				if resp.StatusCode != http.StatusBadRequest {
-					t.Fatalf("status = %d, want 400 (body %.200s)", resp.StatusCode, body)
+				if resp.StatusCode != tc.status {
+					t.Fatalf("status = %d, want %d (body %.200s)", resp.StatusCode, tc.status, body)
 				}
 				requireEnvelope(t, resp, body)
 				// error, detail and the name: three cuts of at most 2 KiB, each
@@ -68,4 +72,19 @@ func TestLongValuesAreCutInAnswers(t *testing.T) {
 			t.Fatalf("a short value: status %d, body %s", resp.StatusCode, body)
 		}
 	})
+}
+
+// TestNewProblemKeepsTheCallersParams: the cut of a name must not write
+// through to the slice that the caller passed in.
+func TestNewProblemKeepsTheCallersParams(t *testing.T) {
+	long := strings.Repeat("n", maxEchoBytes+10)
+	params := []invalidParam{{Name: long, Reason: "is not a known field"}}
+	rec := httptest.NewRecorder()
+	got := newProblem(rec, http.StatusBadRequest, "bad_request", "msg", params, "", "")
+	if params[0].Name != long {
+		t.Fatalf("the caller's name was cut to %d bytes", len(params[0].Name))
+	}
+	if n := got.InvalidParams[0].Name; len(n) != maxEchoBytes+len("…") {
+		t.Fatalf("the answer's name has %d bytes", len(n))
+	}
 }

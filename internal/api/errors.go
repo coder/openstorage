@@ -178,10 +178,10 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 	}
 }
 
-// maxEchoBytes bounds the text of one 400 member that can repeat request
+// maxEchoBytes bounds the members of an error body that can repeat request
 // input: `error`, `detail` and an `invalid_params` name. A 1 MiB body that
 // names one 1 MiB value, or holds bytes that %q escapes to four, would
-// otherwise answer with 3 to 10 MiB.
+// otherwise answer with 3 to 10 MiB. It applies to every status.
 const maxEchoBytes = 2048
 
 // boundEcho cuts s to maxEchoBytes at a rune boundary and ends it with an
