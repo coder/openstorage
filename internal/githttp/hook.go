@@ -156,15 +156,17 @@ func mustEnv(names ...string) string {
 // error (stderr message + non-zero exit denies the push), never a panic.
 // git shows the pusher the returned error, so an error that is not a
 // refusal (ShownToPusher) becomes a fixed line, and its text goes to the
-// push's hook-errors file for the operator (hookFailure).
-func RunHook(ctx context.Context, args []string) error {
-	err := runHook(ctx, args)
-	if err == nil || ShownToPusher(err) {
-		return err
-	}
+// push's hook-errors file for the operator (hookFailure). A panic is such
+// an error too (recoverHook).
+func RunHook(ctx context.Context, args []string) (retErr error) {
 	name := ""
 	if len(args) > 0 {
 		name = args[0]
+	}
+	defer recoverHook(name, &retErr)
+	err := runHook(ctx, args)
+	if err == nil || ShownToPusher(err) {
+		return err
 	}
 	return hookFailure(name, err)
 }
@@ -2642,6 +2644,13 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		return nil, examined, fmt.Errorf("verify-sig: reading rev-list: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {
+		// rev-list exits 128 for an old id that names no commit here. The
+		// pusher chose it (see isAncestorUncached), so that is a refusal,
+		// decided by object state and not by git's message.
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 128 &&
+			old != ref.ZeroSHA && !commitExists(old) {
+			return nil, examined, refusef("verify-sig: the old value of %s names no commit in this repository", refName)
+		}
 		return nil, examined, fmt.Errorf("verify-sig: git %s: %w", strings.Join(args, " "), err)
 	}
 	return pending, examined, nil
@@ -2879,16 +2888,44 @@ func isAncestor(old, new string) bool {
 	return got
 }
 
+// isAncestorUncached asks git whether old is an ancestor of new. Both ids
+// come from the pusher: git hands the hooks each command's old value before
+// it compares it with the stored ref, and a command can name any id. An id
+// that names no commit here (absent, or a tree or blob) makes merge-base
+// exit 128. No commit is an ancestor of such an id, so the answer is false,
+// decided by object state (commitExists), not by git's message. Exit 128
+// with two real commits, or any other failure, means a broken repository
+// or git, which no pusher can cause: fail fast.
 func isAncestorUncached(old, new string) bool {
-	cmd := exec.Command("git", "merge-base", "--is-ancestor", old, new)
-	err := cmd.Run()
+	err := exec.Command("git", "merge-base", "--is-ancestor", old, new).Run()
 	if err == nil {
 		return true
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+		switch exitErr.ExitCode() {
+		case 1:
+			return false
+		case 128:
+			if !commitExists(old) || !commitExists(new) {
+				return false
+			}
+		}
+	}
+	panic(fmt.Sprintf("githttp assertion failed: merge-base --is-ancestor %s %s: %v", old, new, err))
+}
+
+// commitExists reports whether sha names a commit, or a tag that peels to
+// one, in the repo git put us in. rev-parse --verify --quiet exits 1 for an
+// id that is absent or names another kind of object.
+func commitExists(sha string) bool {
+	err := exec.Command("git", "rev-parse", "--verify", "--quiet", sha+"^{commit}").Run()
+	if err == nil {
+		return true
+	}
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 1 {
 		return false
 	}
-	// Anything else (missing objects, bad SHA) is a bug: fail fast.
-	panic(fmt.Sprintf("githttp assertion failed: merge-base --is-ancestor %s %s: %v", old, new, err))
+	// A corrupt object or a spawn failure: a bug or a broken repository,
+	// never the pusher's input.
+	panic(fmt.Sprintf("githttp assertion failed: rev-parse --verify %s^{commit}: %v", sha, err))
 }
