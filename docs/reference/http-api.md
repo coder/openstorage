@@ -65,13 +65,14 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   error, a body that is not an object, an empty member name, unknown fields on the
   other bodies, rules across fields (such as `base_repo` and `upstream` together), and
   query parameters. For a body with one problem, `detail` is the message of that
-  problem. It never holds text of the JSON decoder, which names Go types. It states a
-  field of the wrong JSON type as `name reason`, as upstream's example does
-  (`default_branch must be a string`), and a body that is not valid JSON, or whose
-  top-level value has the wrong type, as `invalid JSON body` (`invalid JSON body: body
-  must be a JSON object` on the two strictly decoded routes). A member that a decoder
-  refuses as unknown stays in `detail` without an `invalid_params` item, as in
-  `invalid upstream: unknown field "branch"`. A frame of a `commit-pack` or `diff-commit`
+  problem. For a request body that does not decode, `detail` never holds text of the
+  JSON decoder, which names Go types. It states a field of the wrong JSON type as `name
+  reason`, as upstream's example does (`default_branch must be a string`), and a body
+  that is not valid JSON, or whose top-level value has the wrong type, as `invalid JSON
+  body` (`invalid JSON body: body must be a JSON object` on the two strictly decoded
+  routes, and `restore-commit` keeps its own message). An unknown member of a body that
+  is not decoded strictly stays in `detail`, as in `invalid upstream: unknown field
+  "branch"`, and has no `invalid_params` item. A frame of a `commit-pack` or `diff-commit`
   stream that has a field of the wrong type answers in the same way, in the `message` of
   its result: `malformed NDJSON frame: metadata.target_branch must be a string`.
   A body with several invalid fields gets one item for each of them, as upstream says
