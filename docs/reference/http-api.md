@@ -70,9 +70,13 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   once. `detail` then holds the message of each problem, joined by `; `. One answer
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
   out. A check that needs the repository's state (for example, that a merge creates a
-  commit and so needs an `author`) runs after the checks of the body. `POST
-  /repos/merge` answers this way. The other routes with a request body still name only
-  the first invalid field.
+  commit and so needs an `author`) runs after the checks of the body. A grep
+  `pagination.cursor` that does not decode, and a credential `password` that starts with
+  `enc:`, are named with the other invalid fields when the body has any. Alone, each
+  keeps its place after the lookup of the repository or credential, so a missing one is
+  `404` first. `POST /repos/merge`, `POST /repos/grep`, `POST /repos/archive`, and `POST`
+  and `PUT` on `/repos/git-credentials` and their path forms answer this way. The other
+  routes with a request body still name only the first invalid field.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
