@@ -1,4 +1,4 @@
-# Nightly vulnerability scan of the production packages (issue #842 follow-up).
+# Nightly vulnerability scan of the shipped command (issue #842 follow-up).
 # Advisories appear against code that has not changed, so a PR-time check
 # would miss them. This workflow is not part of ci.yml: it is never a merge
 # gate, and a red run is a signal for the maintainers, not a blocked PR.
@@ -13,9 +13,15 @@
 # (for example "Loading packages failed") and also fails the run, so a broken
 # scan cannot look like a clean one.
 #
-# The scan has no -test flag, so it covers what ships in the binary. Go and
-# the govulncheck version both come from mise.toml, and GOFLAGS=-mod=vendor
-# scans the committed vendor/ tree.
+# The scan covers what ships. It has no -test flag, and its only root is
+# ./cmd/openstorage, the one command that scripts/release-archives.sh and the
+# Dockerfile build. A ./... root would also make the internal/testutil helper
+# packages roots, which pulls testcontainers and x/crypto into the scan although
+# the binary links neither. A new shipped command needs a new root here. The scan
+# runs once for each platform of scripts/release-archives.sh, because the
+# module graph differs per platform (a darwin build links go-isatty and
+# go-strftime, a linux build links procfs). Go and the govulncheck version both
+# come from mise.toml, and GOFLAGS=-mod=vendor scans the committed vendor/ tree.
 name: govulncheck-nightly
 
 on:
@@ -28,21 +34,33 @@ permissions:
 
 jobs:
   govulncheck:
+    name: govulncheck (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
-      - name: govulncheck ./... (production packages)
+      - name: govulncheck ./cmd/openstorage
         env:
           GOFLAGS: -mod=vendor
           GOTOOLCHAIN: local
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           go version
           govulncheck -version
           rc=0
-          govulncheck -scan symbol -show verbose ./... || rc=$?
+          govulncheck -scan symbol -show verbose ./cmd/openstorage || rc=$?
           if [ "$rc" -eq 3 ]; then
-            echo "::error title=govulncheck::the production code calls a vulnerable symbol (exit 3), see the Symbol Results above"
+            echo "::error title=govulncheck::the production code calls a vulnerable symbol on ${GOOS}/${GOARCH} (exit 3), see the Symbol Results above"
           fi
           exit "$rc"
