@@ -901,8 +901,7 @@ type wrefNoteAppendRequest struct {
 // duplicate, or case-variant member names (encoding/json matches names
 // case-insensitively, even with DisallowUnknownFields, and lets the last
 // duplicate win), JSON null members, and trailing data are errors. dst
-// must point to a struct. A body with several bad members names every one
-// of them (checkStrictObject).
+// must point to a struct.
 func strictJSON(body []byte, dst any) error {
 	t := reflect.TypeOf(dst)
 	assertf(t != nil && t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct, "strictJSON: dst %T is not a struct pointer", dst)
@@ -925,63 +924,13 @@ func strictJSON(body []byte, dst any) error {
 // Slice, array, and map fields are not: a field holding structs there
 // fails the assertion below, so a schema that needs them must add the
 // recursion first (issue #381).
-//
-// It names every offending member (bodyErrors), one problem for each
-// member path. The order is fixed: the members the struct knows come in
-// the struct's field order (a member's own problem, then the problems
-// below it), then the unknown members in the order of the body, and the
-// problems of a nested object stay together at its place. A request
-// that sends the same bad member twice gets one problem for it. The walk
-// keeps the names of the first maxInvalidParams unknown members only and
-// counts every later one without building a problem (a repeat of a member
-// that the answer leaves out counts again), so a body of 1 MiB costs a
-// bounded answer and no long list. A body that is not one complete JSON
-// object (a syntax error, another kind of value, trailing data) names no
-// member: it is the single plain error "body must be a JSON object",
-// whatever members it holds.
 func checkStrictObject(raw []byte, t reflect.Type, path string) error {
-	problems, err := strictObjectProblems(raw, t, path)
-	if err != nil {
-		return err
-	}
-	strictKeepCollisions(&problems)
-	return problems.err()
-}
-
-// strictKeepCollisions makes a problem add its message only when an
-// earlier problem with another message already names the same dotted path.
-// Two members can share one: a member named "author.name" and the "name"
-// member of an "author" object. bodyErrors counts a path once, so the later
-// problem would lose both its item and its message.
-func strictKeepCollisions(b *bodyErrors) {
-	first := make(map[string]string, len(b.errs))
-	for i, err := range b.errs {
-		items := invalidParamsFor(err)
-		if len(items) != 1 {
-			continue
-		}
-		if msg, seen := first[items[0].Name]; !seen {
-			first[items[0].Name] = err.Error()
-		} else if msg != err.Error() {
-			b.errs[i] = errors.New(err.Error())
-		}
-	}
-}
-
-// strictObjectProblems collects the problems checkStrictObject names. Its
-// error is the single answer for a value that is not a JSON object: plain
-// for the body, and the problem of its own member for a nested value
-// (which is a complete JSON value, so only its kind can be wrong).
-func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, error) {
 	var notObject error = errors.New("body must be a JSON object")
 	if path != "" {
 		name := strings.TrimSuffix(path, ".")
 		notObject = newFieldError(name, "must be an object", name+" must be a JSON object")
 	}
-	var (
-		names  = make([]string, 0, t.NumField()) // known member names, in field order
-		fields = make(map[string]reflect.Type, t.NumField())
-	)
+	fields := make(map[string]reflect.Type, t.NumField())
 	for i := range t.NumField() {
 		ft := t.Field(i).Type
 		if k := ft.Kind(); k == reflect.Slice || k == reflect.Array || k == reflect.Map {
@@ -993,7 +942,6 @@ func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, 
 		}
 		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
 		if name != "" && name != "-" {
-			names = append(names, name)
 			fields[name] = ft
 		}
 	}
@@ -1001,99 +949,52 @@ func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, 
 	// map would hide a duplicate name.
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return bodyErrors{}, notObject
+		return notObject
 	}
-	// member is what a known name has so far: its own problem, which is
-	// the first one (a repeat of a bad member adds none), and the problems
-	// below it.
-	type member struct {
-		own    error
-		nested bodyErrors
-	}
-	var (
-		members     = make(map[string]*member, len(fields))
-		unknown     bodyErrors
-		unknownSeen = make(map[string]bool)
-	)
-	var v json.RawMessage // reused for every member: its UnmarshalJSON appends into the old buffer
+	seen := make(map[string]bool, len(fields))
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
-			return bodyErrors{}, notObject
+			return notObject
 		}
 		name, ok := tok.(string)
 		assertf(ok, "checkStrictObject: member name token %T", tok)
+		var v json.RawMessage
 		if err := dec.Decode(&v); err != nil {
-			return bodyErrors{}, notObject
+			return notObject
 		}
 		ft, ok := fields[name]
 		if !ok {
-			if unknownSeen[name] {
-				continue
-			}
-			if len(unknown.errs) >= maxInvalidParams {
-				// A body of 1 MiB holds 100,000 unknown members. Past the
-				// bound the walk keeps no name and builds no problem: it
-				// counts the member, so a repeat of a member that the
-				// answer leaves out counts again.
-				unknown.dropped++
-				continue
-			}
-			unknownSeen[name] = true
 			msg := fmt.Sprintf("unknown field %q", path+name)
 			if name == "" { // an empty member name has no dotted wire path
-				unknown.add(errors.New(msg))
-			} else {
-				unknown.add(newFieldError(path+name, "is not a known field", msg))
+				return errors.New(msg)
 			}
-			continue
+			return newFieldError(path+name, "is not a known field", msg)
 		}
-		m := members[name]
-		if m != nil {
-			if m.own == nil {
-				m.own = newFieldError(path+name, "appears more than once", fmt.Sprintf("duplicate field %q", path+name))
-			}
-			continue
+		if seen[name] {
+			return newFieldError(path+name, "appears more than once", fmt.Sprintf("duplicate field %q", path+name))
 		}
-		m = &member{}
-		members[name] = m
+		seen[name] = true
 		if string(bytes.TrimSpace(v)) == "null" {
-			m.own = newFieldError(path+name, "must not be null", path+name+" must not be null")
-			continue
+			return newFieldError(path+name, "must not be null", path+name+" must not be null")
 		}
 		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
 		}
 		if ft.Kind() == reflect.Struct {
-			nested, err := strictObjectProblems(v, ft, path+name+".")
-			m.own, m.nested = err, nested
+			if err := checkStrictObject(v, ft, path+name+"."); err != nil {
+				return err
+			}
 		}
 	}
 	// The closing brace, then nothing: trailing data is not an object.
 	if _, err := dec.Token(); err != nil {
-		return bodyErrors{}, notObject
+		return notObject
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return bodyErrors{}, notObject
+		return notObject
 	}
-	var problems bodyErrors
-	for _, name := range names {
-		if m := members[name]; m != nil {
-			problems.add(m.own)
-			strictAddAll(&problems, m.nested)
-		}
-	}
-	strictAddAll(&problems, unknown)
-	return problems, nil
-}
-
-// strictAddAll adds each problem of src to dst, in order, and counts the
-// ones that src already left out.
-func strictAddAll(dst *bodyErrors, src bodyErrors) {
-	for _, err := range src.errs {
-		dst.add(err)
-	}
-	dst.dropped += src.dropped
+	return nil
 }
 
 // wrefDecodeStrictBody is wrefDecodeBody with strictJSON.

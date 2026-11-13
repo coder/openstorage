@@ -42,7 +42,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|s3wal-meta|version> ...")
+		fatalf("usage: openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|repair-refs|s3wal-meta|version> ...")
 	}
 	// Refuse old-only CODESTORAGE_* settings before any command reads config.
 	// Hooks inherit the serve environment, which already passed this check.
@@ -71,6 +71,8 @@ func main() {
 		err = cmdListPacks(ctx, os.Args[2:])
 	case "purge-repo":
 		err = cmdPurgeRepo(ctx, os.Args[2:])
+	case "repair-refs":
+		err = cmdRepairRefs(ctx, os.Args[2:])
 	case "s3wal-meta":
 		err = cmdS3WALMeta(ctx, os.Args[2:])
 	case "version", "--version":

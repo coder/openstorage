@@ -1,10 +1,7 @@
 package api
 
 import (
-	"fmt"
 	"net/http"
-	"runtime"
-	"slices"
 	"strings"
 	"testing"
 
@@ -178,236 +175,78 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 	})
 }
 
-// TestNotesAppendNamesEveryBadMember: the strict decoder of POST
-// .../notes/append names each unknown, duplicate or null member, and each
-// member that must be an object. A body that is not one JSON object names
-// none.
-func TestNotesAppendNamesEveryBadMember(t *testing.T) {
+// TestNotesAppendNamesTheFirstBadMember: the strict decoder of POST
+// .../notes/append (not changed by this PR) stops at the first problem: the
+// first unknown, duplicate or null member, or member that must be an
+// object, in the order of the body. The field checks run only when the
+// members are fine.
+func TestNotesAppendNamesTheFirstBadMember(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := ipNewFixture(t, e)
 		path := "/api/repos/" + fx.url + "/notes/append"
 		const prefix = "invalid JSON body: "
-		known := func(name, reason string) ipParam { return ipParam{name, reason} }
+		known := func(name, reason string) []ipParam { return []ipParam{{name, reason}} }
 		ipRun(t, e, []ipCase{
 			{
-				// The body lists the members in the reverse of the struct's
-				// order. The known ones come back in the struct's order
-				// (an object's own problem, then the problems below it),
-				// the unknown ones after them in the order of the body.
-				name: "every kind, known members in struct order", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"zeta":1,"author":{"x":1,"name":null},"expected_ref_sha":null,"ref":null,"note":null,` +
-					`"sha":"a","sha":"b","object_ref":null,"alpha":2,"":3}`,
-				wantError: prefix + `object_ref must not be null; duplicate field "sha"; note must not be null; ref must not be null` +
-					`; expected_ref_sha must not be null; author.name must not be null; unknown field "author.x"` +
-					`; unknown field "zeta"; unknown field "alpha"; unknown field ""`,
-				want: []ipParam{known("object_ref", "must not be null"), known("sha", "appears more than once"), known("note", "must not be null"),
-					known("ref", "must not be null"), known("expected_ref_sha", "must not be null"), known("author.name", "must not be null"),
-					known("author.x", "is not a known field"), known("zeta", "is not a known field"), known("alpha", "is not a known field")},
+				name: "one unknown member", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"sha":"main","note":"n","bogus":1}`, wantError: prefix + `unknown field "bogus"`, want: known("bogus", "is not a known field"),
 			},
-			{
-				name: "an unknown member sent twice counts once", method: http.MethodPost, path: path, token: fx.gitTok,
-				body:      `{"bogus":1,"note":"n","bogus":2}`,
-				wantError: prefix + `unknown field "bogus"`, want: []ipParam{known("bogus", "is not a known field")},
-			},
-			{
-				name: "an empty member name has no path", method: http.MethodPost, path: path, token: fx.gitTok,
-				body:      `{"":1,"bogus":1,"author":{"":1}}`,
-				wantError: prefix + `unknown field "author."; unknown field ""; unknown field "bogus"`, want: []ipParam{known("bogus", "is not a known field")},
-			},
-			{
-				name: "an empty member name sent twice counts once", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"":1,"":2}`, wantError: prefix + `unknown field ""`,
-			},
-			{
-				name: "a member that must be an object", method: http.MethodPost, path: path, token: fx.gitTok,
-				body:      `{"author":3,"bogus":1}`,
-				wantError: prefix + `author must be a JSON object; unknown field "bogus"`,
-				want:      []ipParam{known("author", "must be an object"), known("bogus", "is not a known field")},
-			},
-			{
-				name: "a repeated object names its own problem, then the ones below", method: http.MethodPost, path: path, token: fx.gitTok,
-				body:      `{"author":{"x":1},"author":{}}`,
-				wantError: prefix + `duplicate field "author"; unknown field "author.x"`,
-				want:      []ipParam{known("author", "appears more than once"), known("author.x", "is not a known field")},
-			},
-			{
-				name: "a null object, then a repeat of it", method: http.MethodPost, path: path, token: fx.gitTok,
-				body:      `{"author":null,"author":{"name":null}}`,
-				wantError: prefix + "author must not be null", want: []ipParam{known("author", "must not be null")},
-			},
-			// Two members can have one dotted path: a member named "author.name"
-			// and the "name" of an author object. The later problem keeps its
-			// message and adds no second item for the path.
-			{
-				name: "a dotted unknown member and a repeat below an object", method: http.MethodPost, path: path, token: fx.gitTok,
-				body:      `{"author.name":"v","author":{"name":"n","name":"m"}}`,
-				wantError: prefix + `duplicate field "author.name"; unknown field "author.name"`, want: []ipParam{known("author.name", "appears more than once")},
-			},
-			{
-				name: "a dotted unknown member and a null below an object", method: http.MethodPost, path: path, token: fx.gitTok,
-				body:      `{"author":{"name":null},"author.name":"v"}`,
-				wantError: prefix + `author.name must not be null; unknown field "author.name"`, want: []ipParam{known("author.name", "must not be null")},
-			},
-			{
-				name: "a dotted unknown member and an unknown below an object say the same", method: http.MethodPost, path: path, token: fx.gitTok,
-				body:      `{"author.x":1,"author":{"x":1}}`,
-				wantError: prefix + `unknown field "author.x"`, want: []ipParam{known("author.x", "is not a known field")},
-			},
-			// One problem answers as before.
 			{
 				name: "one dotted unknown member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"author.name":"v"}`, wantError: prefix + `unknown field "author.name"`, want: []ipParam{known("author.name", "is not a known field")},
-			},
-			{
-				name: "one unknown member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"sha":"main","note":"n","bogus":1}`, wantError: prefix + `unknown field "bogus"`, want: []ipParam{known("bogus", "is not a known field")},
+				body: `{"author.name":"v"}`, wantError: prefix + `unknown field "author.name"`, want: known("author.name", "is not a known field"),
 			},
 			{
 				name: "one duplicate member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"sha":"main","note":"n","note":"m"}`, wantError: prefix + `duplicate field "note"`, want: []ipParam{known("note", "appears more than once")},
+				body: `{"sha":"main","note":"n","note":"m"}`, wantError: prefix + `duplicate field "note"`, want: known("note", "appears more than once"),
 			},
 			{
 				name: "one null member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"sha":"main","note":"n","notes_ref":null}`, wantError: prefix + "notes_ref must not be null", want: []ipParam{known("notes_ref", "must not be null")},
+				body: `{"sha":"main","note":"n","notes_ref":null}`, wantError: prefix + "notes_ref must not be null", want: known("notes_ref", "must not be null"),
+			},
+			{
+				name: "one member that must be an object", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":3}`, wantError: prefix + "author must be a JSON object", want: known("author", "must be an object"),
 			},
 			{
 				name: "one empty member name", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"":1}`, wantError: prefix + `unknown field ""`,
 			},
-			// A body that is not one complete JSON object names no member,
-			// whatever members it holds.
-			{
-				name: "a syntax error after bad members", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"bogus":1,"note":null,`, wantError: prefix + "body must be a JSON object",
-			},
-			{
-				name: "a value cut short after bad members", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"bogus":1,"note":`, wantError: prefix + "body must be a JSON object",
-			},
-			{
-				name: "a missing closing brace after bad members", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"bogus":1,"note":null`, wantError: prefix + "body must be a JSON object",
-			},
-			{
-				name: "trailing data after bad members", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"bogus":1,"note":null} {}`, wantError: prefix + "body must be a JSON object",
-			},
 			{
 				name: "not an object", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `[{"bogus":1}]`, wantError: prefix + "body must be a JSON object",
 			},
+			{
+				name: "trailing data", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"note":"n"} {}`, wantError: prefix + "body must be a JSON object",
+			},
+			// Several bad members: the first one in the order of the body.
+			{
+				name: "an unknown member before a null one", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"zeta":1,"note":null}`, wantError: prefix + `unknown field "zeta"`, want: known("zeta", "is not a known field"),
+			},
+			{
+				name: "a null member before an unknown one", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"note":null,"zeta":1}`, wantError: prefix + "note must not be null", want: known("note", "must not be null"),
+			},
+			{
+				name: "a member of an object, then a later member", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":{"x":1,"name":null},"bogus":1}`, wantError: prefix + `unknown field "author.x"`, want: known("author.x", "is not a known field"),
+			},
+			{
+				name: "a bad member before a syntax error", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"bogus":1,"note":`, wantError: prefix + `unknown field "bogus"`, want: known("bogus", "is not a known field"),
+			},
+			// A bad member answers before the field checks.
+			{
+				name: "a bad member and bad fields", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"note":"","notes_ref":"bad..name","bogus":1}`, wantError: prefix + `unknown field "bogus"`, want: known("bogus", "is not a known field"),
+			},
+			{
+				name: "fine members and bad fields", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"note":"","notes_ref":"bad..name"}`,
+				wantError: `object_ref is required; note is required; invalid notes ref name "bad..name"`,
+				want:      []ipParam{{"object_ref", "is required"}, {"note", "is required"}, {"notes_ref", "must be a valid notes ref"}},
+			},
 		})
-	})
-}
-
-// TestStrictJSONOrder pins the order of the problems: the members the
-// struct knows in the struct's field order, then the unknown ones in the
-// order of the body. A reordered body changes only the unknown ones.
-func TestStrictJSONOrder(t *testing.T) {
-	type obj struct {
-		Name string `json:"name"`
-	}
-	type dst struct {
-		Ref    string `json:"ref"`
-		After  string `json:"after"`
-		Inner  *obj   `json:"inner"`
-		Hidden string `json:"-"`
-	}
-	for _, tc := range []struct {
-		name, body string
-		want       []string
-	}{
-		{"known in struct order", `{"inner":null,"after":null,"ref":null}`, []string{"ref", "after", "inner"}},
-		{"known in struct order, reversed body", `{"ref":null,"after":null,"inner":null}`, []string{"ref", "after", "inner"}},
-		{"unknown in body order", `{"b":1,"a":2,"c":3}`, []string{"b", "a", "c"}},
-		{"unknown in body order, reversed", `{"c":3,"a":2,"b":1}`, []string{"c", "a", "b"}},
-		{"unknown after known", `{"z":1,"inner":null,"ref":null,"y":1}`, []string{"ref", "inner", "z", "y"}},
-		{"nested stay at their member", `{"z":1,"inner":{"q":1,"name":null},"ref":null}`, []string{"ref", "inner.name", "inner.q", "z"}},
-		{"a field tagged - is unknown", `{"Hidden":1,"-":2}`, []string{"Hidden", "-"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := strictJSON([]byte(tc.body), new(dst))
-			if err == nil {
-				t.Fatal("strictJSON succeeded")
-			}
-			var got []string
-			for _, p := range invalidParamsFor(err) {
-				got = append(got, p.Name)
-			}
-			if !slices.Equal(got, tc.want) {
-				t.Fatalf("names = %v, want %v (error %q)", got, tc.want, err)
-			}
-		})
-	}
-	// The shared decoder serves POST .../upstream/pull too.
-	err := strictJSON([]byte(`{"after":null,"ref":null,"x":1}`), new(usyncPullUpstreamRequest))
-	if want := `ref must not be null; after must not be null; unknown field "x"`; err == nil || err.Error() != want {
-		t.Fatalf("pull request: err = %v, want %q", err, want)
-	}
-	// A body that decodes still decodes.
-	var ok dst
-	if err := strictJSON([]byte(`{"ref":"r","inner":{"name":"n"}}`), &ok); err != nil || ok.Ref != "r" || ok.Inner == nil || ok.Inner.Name != "n" {
-		t.Fatalf("valid body: err %v, decoded %+v", err, ok)
-	}
-}
-
-// TestStrictJSONBoundsItsAnswer: a body of 1 MiB holds 100,000 unknown
-// members. The answer names at most maxInvalidParams problems and counts
-// the others, however they split between a member's own problem, the ones
-// below it and the unknown ones. The walk keeps no name and builds no
-// problem past the bound.
-func TestStrictJSONBoundsItsAnswer(t *testing.T) {
-	unknown := func(n int, prefix string) string {
-		var b strings.Builder
-		for i := range n {
-			fmt.Fprintf(&b, `"%s%03d":1,`, prefix, i)
-		}
-		return b.String()
-	}
-	type dst struct {
-		Note   string `json:"note"`
-		Author *struct {
-			Name string `json:"name"`
-		} `json:"author"`
-	}
-	for _, tc := range []struct {
-		name, body, first, last, tail string
-	}{
-		{"unknown members", `{` + unknown(150, "u") + `"note":"n"}`, "u000", "u099", "; and 50 more"},
-		{"a repeat of a named member counts once", `{` + unknown(150, "u") + unknown(100, "u") + `"note":"n"}`, "u000", "u099", "; and 50 more"},
-		// The walk keeps the names of the 100 members it names, and no more.
-		{"a repeat of a left-out member counts again", `{` + unknown(150, "u") + unknown(150, "u") + `"note":"n"}`, "u000", "u099", "; and 100 more"},
-		{"known problems share the bound", `{` + unknown(150, "u") + `"note":null,"author":null}`, "note", "u097", "; and 52 more"},
-		{"members below an object share it too", `{"author":{` + unknown(150, "n") + `"name":"x"}}`, "author.n000", "author.n099", "; and 50 more"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := strictJSON([]byte(tc.body), new(dst))
-			if err == nil {
-				t.Fatal("strictJSON succeeded")
-			}
-			got := invalidParamsFor(err)
-			if len(got) != maxInvalidParams || got[0].Name != tc.first || got[len(got)-1].Name != tc.last {
-				t.Fatalf("%d items, first %v, last %v, want %d, %s, %s", len(got), got[0], got[len(got)-1], maxInvalidParams, tc.first, tc.last)
-			}
-			if msg := err.Error(); !strings.HasSuffix(msg, tc.tail) || strings.Count(msg, "; ") != maxInvalidParams {
-				t.Fatalf("message ends %q with %d separators, want %q and %d", msg[len(msg)-20:], strings.Count(msg, "; "), tc.tail, maxInvalidParams)
-			}
-		})
-	}
-	// Past the bound a member costs the walk only: 2 allocations (its name
-	// token). Building its problem, or a new value buffer for it, costs more.
-	t.Run("keeps nothing past the bound", func(t *testing.T) {
-		const n = 20000
-		body := []byte("{" + unknown(n, "m") + `"note":"n"}`)
-		var before, after runtime.MemStats
-		runtime.ReadMemStats(&before)
-		err := strictJSON(body, new(dst))
-		runtime.ReadMemStats(&after)
-		if err == nil {
-			t.Fatal("strictJSON succeeded")
-		}
-		if perMember := float64(after.Mallocs-before.Mallocs) / n; perMember > 2.5 {
-			t.Errorf("%.1f allocations for each unknown member, want about 2", perMember)
-		}
 	})
 }

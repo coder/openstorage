@@ -72,22 +72,18 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   out. A check that needs the repository's state (for example, that a merge creates a
   commit and so needs an `author`) runs after the checks of the body. A strictly decoded
   body (`POST /api/repos/{repo_name}/notes/append` and `POST
-  /api/repos/{repo_name}/upstream/pull`) that is one complete JSON object is checked for
-  its members first: the answer names every unknown, duplicate or `null` member and every
-  member that must be an object, the members of the route in the order of its request
-  body and then the unknown ones in the order of the body, and none of the other
-  problems. A member whose dotted name another problem already names (a member called
-  `author.name` next to an `author` object that repeats `name`) adds no second item, and
-  adds its message to `detail` unless the message is the same. A JSON syntax error,
-  trailing data, or a value that is not an object names no member and wins over the
-  member problems. When the JSON decoder finds a field of the wrong type, the answer
-  names one such field (the first that the decoder finds) and none of the other
-  problems: the other checks run only when every field has its right type. A field that
-  stays raw for a check of its own (the `expected_source_sha` of a merge) is checked with
-  the others. `POST /repos/merge`,
-  `POST /repos/notes`, `POST /api/repos/{repo_name}/notes/append` and `DELETE
-  /repos/notes` answer this way, and so does the member check of `POST
-  /api/repos/{repo_name}/upstream/pull`. A `DELETE /repos/notes` problem with a query
+  /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
+  of the body, and the check stops at the first problem: the answer names the first
+  member that is unknown, repeated or `null`, or that must be an object and is not, and
+  none of the other problems. When the check reaches a JSON syntax error or trailing
+  data before it finds a bad member, the answer names no member. The other checks run
+  only when the members are fine. When the JSON decoder finds a field of the wrong type,
+  the answer names one such field (the first that the decoder finds) and none of the
+  other problems: the other checks run only when every field has its right type. A field
+  that stays raw for a check of its own (the `expected_source_sha` of a merge) is checked
+  with the others. `POST /repos/merge`, `POST /repos/notes`, `POST
+  /api/repos/{repo_name}/notes/append` (when its members and types are fine) and
+  `DELETE /repos/notes` answer this way. A `DELETE /repos/notes` problem with a query
   parameter, or with a missing or empty `object_ref`, adds its message to `detail` and
   names no field. The other routes with a request body do not collect problems yet: a
   check there can hide the checks after it.
@@ -416,7 +412,10 @@ A branch, tag or notes ref name that the API writes (for example in branch creat
 writes, tag writes and `default_branch`) is at most 255 bytes without its `refs/...`
 prefix, and its last `/`-separated part is at most 250 bytes, so that git can create the
 ref's `.lock` file. A longer one answers `400`. Branch and tag deletes still take a stored
-name whose last part is longer, so a ref that an earlier version wrote can be removed.
+name whose last part is longer, so a ref that an earlier version wrote can be removed. A
+notes ref that an earlier version wrote cannot be removed over REST (`DELETE /repos/notes`
+removes one note): the operator runs
+[`openstorage repair-refs`](cli.md#openstorage-repair-refs).
 
 Ephemeral branches are `refs/namespaces/ephemeral/refs/heads/<name>` in the base
 repository. The persistent git remote `/{repo}.git` hides them: git cannot fetch,
