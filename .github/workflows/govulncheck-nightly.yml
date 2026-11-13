@@ -23,8 +23,11 @@
 # module graph differs per platform (a darwin build links go-isatty and
 # go-strftime, a linux build links procfs). Go and the govulncheck version both
 # come from mise.toml, and GOFLAGS=-mod=vendor scans the committed vendor/ tree.
-# The step fails first when mise.toml and go.mod name different Go versions,
-# because release builds take their Go from go.mod.
+# The step fails first when the three Go pins differ: the Go that mise.toml
+# installs for the scan, the Go that go.mod gives the release builds (its
+# toolchain line when it has one, else its go line) and the golang tag of the
+# Dockerfile builder. A scan on another Go would check a standard library that
+# does not ship.
 name: govulncheck-nightly
 
 on:
@@ -61,10 +64,11 @@ jobs:
         run: |
           go version
           govulncheck -version
-          want="go$(go list -m -f '{{.GoVersion}}')"
           have=$(go env GOVERSION)
-          if [ "$have" != "$want" ]; then
-            echo "::error title=govulncheck::the scan runs on ${have} but go.mod says ${want}, so it would not scan the standard library that releases build with"
+          want=$(go mod edit -json | jq -r '.Toolchain // ("go" + .Go)')
+          image=$(sed -n 's/^FROM .*golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile)
+          if [ "$have" != "$want" ] || [ "$image" != "$want" ]; then
+            echo "::error title=govulncheck::the Go versions differ: the scan runs ${have}, go.mod builds the releases with ${want}, the Dockerfile builds the image with ${image:-none}"
             exit 1
           fi
           rc=0
