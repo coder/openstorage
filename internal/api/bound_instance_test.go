@@ -40,12 +40,16 @@ func TestLongPathIsCutInInstance(t *testing.T) {
 			t.Fatalf("the answer has %d bytes for a 900,000-byte path", size)
 		}
 
-		// Each place where the cut meets a %XX escape.
+		// Each place where the cut meets a %XX escape: the cut keeps every
+		// whole escape and drops the part of the one that it would split.
 		for _, lead := range []int{0, 1, 2} {
 			path := prefix + strings.Repeat("a", maxInstanceBytes-len(prefix)-lead) + strings.Repeat("%E2%82%AC", 10)
 			got, _ := instanceOf(t, path)
-			if !strings.HasPrefix(path, got) || len(got) > maxInstanceBytes {
+			if !strings.HasPrefix(path, got) {
 				t.Fatalf("lead %d: instance of %d bytes is not a prefix of the path", lead, len(got))
+			}
+			if want := maxInstanceBytes - lead; len(got) != want {
+				t.Fatalf("lead %d: instance has %d bytes, want %d", lead, len(got), want)
 			}
 			if i := strings.LastIndexByte(got, '%'); i >= 0 && len(got)-i < 3 {
 				t.Fatalf("lead %d: instance ends in a partial escape %q", lead, got[i:])

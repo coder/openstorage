@@ -25,8 +25,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   problem-details fields alongside `error`: `type` (`about:blank`), `title` (the status
   text), `status`, `code`, `detail` (same string as `error`), and `instance` (the
   escaped request path the client sent, without the query string; for a
-  `/api/repos/{repo_name}/...` alias, the alias path; a path of more than 16384 bytes is
-  cut at 16384 bytes, never inside a `%XX` escape, and without `…`). `code` is upstream's
+  `/api/repos/{repo_name}/...` alias, the alias path; an escaped path of more than 16384
+  bytes is cut to at most 16384 bytes, never inside a `%XX` escape, and without `…`). `code` is upstream's
   generic code for the status (`bad_request`, `unauthorized`, `forbidden`, `not_found`,
   `conflict`, `unprocessable_entity`, `rate_limited`, `internal_error`,
   `service_unavailable`, …), except for these specific upstream codes:
