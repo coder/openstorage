@@ -37,6 +37,15 @@ func (b *bodyErrors) add(err error) {
 	}
 }
 
+// full reports whether the collector holds as many problems as it keeps.
+// A loop over a body array checks it before it builds a problem, and calls
+// skip instead when it is true, so that a body full of bad entries does not
+// allocate one problem for each of them.
+func (b *bodyErrors) full() bool { return len(b.errs) >= maxInvalidParams }
+
+// skip counts a problem that the caller did not build because full is true.
+func (b *bodyErrors) skip() { b.dropped++ }
+
 // err returns nil for a body without a problem, and the only problem
 // itself for a body with one. For several problems it returns one error:
 // the message of each problem in order, joined by "; ", and one

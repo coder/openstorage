@@ -720,14 +720,34 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}
+	// Every invalid body field is named, in the order of the docs table
+	// (bodyErrors).
+	var errs bodyErrors
 	pattern := body.Query.Pattern
 	if strings.TrimSpace(pattern) == "" {
-		writeInvalidField(w, "query.pattern", "is required", "query.pattern is required")
-		return
+		errs.add(newFieldError("query.pattern", "is required", "query.pattern is required"))
 	}
 	caseSensitive := true
 	if body.Query.CaseSensitive != nil {
 		caseSensitive = *body.Query.CaseSensitive
+	}
+	for i, p := range body.Paths {
+		// A body of bad entries costs one answer of bounded size: past the
+		// bound, an entry is counted and builds no problem.
+		blank := strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0)
+		// git gets the entry without its trailing slash: "/" alone is
+		// no pathspec.
+		trimmed := strings.TrimSuffix(p, "/")
+		outside := !blank && trimmed != "" && pathLeavesRepo(trimmed)
+		switch {
+		case !blank && !outside:
+		case errs.full():
+			errs.skip()
+		case blank:
+			errs.add(newFieldError("paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p)))
+		default:
+			errs.add(newFieldError("paths."+strconv.Itoa(i), "is outside the repository", fmt.Sprintf("paths entry %q is outside the repository", p)))
+		}
 	}
 	before, after := 0, 0
 	if body.Context.Before != nil {
@@ -744,45 +764,51 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		if after < 0 {
 			params = append(params, invalidParam{Name: "context.after", Reason: "must be at least 0"})
 		}
-		writeInvalid(w, "context lines must be non-negative", newFieldErrors("context lines must be non-negative", params...))
-		return
+		errs.add(newFieldErrors("context lines must be non-negative", params...))
 	}
 	maxLines := grepDefaultMaxLines
 	if body.Limits.MaxLines != nil {
 		maxLines = *body.Limits.MaxLines
 		if maxLines < 1 || maxLines > grepMaxLinesCap {
-			writeInvalidField(w, "limits.max_lines", fmt.Sprintf("must be between 1 and %d", grepMaxLinesCap),
-				fmt.Sprintf("invalid limits.max_lines (want 1..%d)", grepMaxLinesCap))
-			return
+			errs.add(newFieldError("limits.max_lines", fmt.Sprintf("must be between 1 and %d", grepMaxLinesCap),
+				fmt.Sprintf("invalid limits.max_lines (want 1..%d)", grepMaxLinesCap)))
 		}
 	}
 	maxPerFile := grepDefaultMatchesPer
 	if body.Limits.MaxMatchesPerFile != nil {
 		maxPerFile = *body.Limits.MaxMatchesPerFile
 		if maxPerFile < 1 {
-			writeInvalidField(w, "limits.max_matches_per_file", "must be at least 1", "invalid limits.max_matches_per_file (want >= 1)")
-			return
+			errs.add(newFieldError("limits.max_matches_per_file", "must be at least 1", "invalid limits.max_matches_per_file (want >= 1)"))
+		}
+	}
+	// A cursor that does not decode is a problem of the body, but the
+	// route has always answered it after the repository lookup, so a
+	// missing repository is a 404 first. It is named here only together
+	// with other invalid fields; alone it keeps its place below.
+	var commit, cursorPath string
+	var cursorLine int
+	var cursorErr error
+	if body.Pagination.Cursor != "" {
+		var decodeErr error
+		if commit, cursorPath, cursorLine, decodeErr = decodeGrepCursor(body.Pagination.Cursor); decodeErr != nil {
+			cursorErr = newFieldError("pagination.cursor", "is not a valid cursor", decodeErr.Error())
 		}
 	}
 	pageLimit := grepDefaultPageLimit
+	var limitErr error
 	if body.Pagination.Limit != nil {
 		pageLimit = *body.Pagination.Limit
 		if pageLimit < 1 {
-			writeInvalidField(w, "pagination.limit", "must be at least 1", "invalid pagination.limit (want >= 1)")
-			return
+			limitErr = newFieldError("pagination.limit", "must be at least 1", "invalid pagination.limit (want >= 1)")
 		}
 	}
-	for i, p := range body.Paths {
-		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
-			writeInvalidField(w, "paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p))
-			return
-		}
-		// git gets the entry without its trailing slash: "/" alone is
-		// no pathspec.
-		if trimmed := strings.TrimSuffix(p, "/"); trimmed != "" && pathLeavesRepo(trimmed) {
-			writeInvalidField(w, "paths."+strconv.Itoa(i), "is outside the repository", fmt.Sprintf("paths entry %q is outside the repository", p))
-			return
-		}
+	if cursorErr != nil && (limitErr != nil || errs.err() != nil) {
+		errs.add(cursorErr)
+	}
+	errs.add(limitErr)
+	if err := errs.err(); err != nil {
+		writeInvalid(w, err.Error(), err)
+		return
 	}
 	// Narrow the git-side search to the requested path prefixes (openapi:
 	// "path prefixes used to narrow the search before pattern matching").
@@ -808,13 +834,9 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		refName = repo.DefaultBranch
 	}
 
-	var commit string
-	var cursorPath string
-	var cursorLine int
 	if body.Pagination.Cursor != "" {
-		commit, cursorPath, cursorLine, err = decodeGrepCursor(body.Pagination.Cursor)
-		if err != nil {
-			writeInvalidField(w, "pagination.cursor", "is not a valid cursor", err.Error())
+		if cursorErr != nil {
+			writeInvalid(w, cursorErr.Error(), cursorErr)
 			return
 		}
 		// The cursor's anchor commit must still exist in this repo. Only a
@@ -969,30 +991,41 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	maxBlobSize := int64(0)
-	if body.MaxBlobSize != nil {
-		maxBlobSize = *body.MaxBlobSize
-		if maxBlobSize < 0 {
-			writeInvalidField(w, "max_blob_size", "must be at least 0", "invalid max_blob_size (want >= 0)")
-			return
-		}
-	}
+	// Every invalid body field is named, in the order of the docs table
+	// (bodyErrors).
+	var errs bodyErrors
 	for _, list := range []struct {
 		name  string
 		globs []string
 	}{{"include_globs", body.IncludeGlobs}, {"exclude_globs", body.ExcludeGlobs}} {
 		for i, glob := range list.globs {
-			if strings.TrimSpace(glob) == "" || strings.ContainsRune(glob, 0) {
-				writeInvalidField(w, list.name+"."+strconv.Itoa(i), "must be a non-empty glob", fmt.Sprintf("invalid glob %q", glob))
-				return
+			if strings.TrimSpace(glob) != "" && !strings.ContainsRune(glob, 0) {
+				continue
 			}
+			// A body of bad entries costs one answer of bounded size: past the
+			// bound, an entry is counted and builds no problem.
+			if errs.full() {
+				errs.skip()
+				continue
+			}
+			errs.add(newFieldError(list.name+"."+strconv.Itoa(i), "must be a non-empty glob", fmt.Sprintf("invalid glob %q", glob)))
+		}
+	}
+	maxBlobSize := int64(0)
+	if body.MaxBlobSize != nil {
+		maxBlobSize = *body.MaxBlobSize
+		if maxBlobSize < 0 {
+			errs.add(newFieldError("max_blob_size", "must be at least 0", "invalid max_blob_size (want >= 0)"))
 		}
 	}
 	// Reject prefixes that could make extracted entries escape the
 	// destination root (tar slip): absolute paths, "."/".." segments,
 	// NUL bytes, backslashes.
 	if !gitread.ValidArchivePrefix(body.Archive.Prefix) {
-		writeInvalidField(w, "archive.prefix", "must be a relative path inside the archive", fmt.Sprintf("invalid archive.prefix %q", body.Archive.Prefix))
+		errs.add(newFieldError("archive.prefix", "must be a relative path inside the archive", fmt.Sprintf("invalid archive.prefix %q", body.Archive.Prefix)))
+	}
+	if err := errs.err(); err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	// The prefix is a folder name (openapi example "sdk-docs/"); normalize
