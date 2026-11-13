@@ -431,9 +431,8 @@ func TestRepairRefsRefusesLockableRef(t *testing.T) {
 	}
 }
 
-// A repository that has no refs in this ref store (a database URL that is
-// not the one serve uses) is not reported as a clean repository.
-func TestRepairRefsWarnsWhenNoRefsMatchTheID(t *testing.T) {
+// A repository with no refs is reported as such, and nothing is deleted.
+func TestRepairRefsReportsARepoWithNoRefs(t *testing.T) {
 	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -442,10 +441,10 @@ func TestRepairRefsWarnsWhenNoRefsMatchTheID(t *testing.T) {
 	f.plant(t, map[string]string{"refs/heads/main": f.commit, repairLongRef: f.commit})
 	for _, yes := range []bool{false, true} {
 		var out bytes.Buffer
-		if err := repairRefs(t.Context(), rs, repairTarget{repoID: f.repo + ":", defaultBranch: "main"}, yes, &out); err != nil {
+		if err := repairRefs(t.Context(), rs, repairTarget{repoID: f.repo + "-empty", defaultBranch: "main"}, yes, &out); err != nil {
 			t.Fatalf("yes=%v: %v", yes, err)
 		}
-		if !strings.Contains(out.String(), "scanned: 0 refs") || !strings.Contains(out.String(), "no refs in the ref store under this ID") ||
+		if !strings.Contains(out.String(), "scanned: 0 refs") || !strings.Contains(out.String(), "this repository has no refs") ||
 			strings.Contains(out.String(), "no ref that git can never lock") {
 			t.Fatalf("yes=%v: output:\n%s", yes, out.String())
 		}
@@ -562,6 +561,13 @@ func TestCmdRepairRefs(t *testing.T) {
 		if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", id}); err == nil || !strings.Contains(err.Error(), "not found") {
 			t.Fatalf("ID %q = %v, want not found", id, err)
 		}
+	}
+
+	// The output names the repository and its URL from the metadata row.
+	var listed bytes.Buffer
+	if err := runRepairRefs(ctx, []string{"--data-dir", dir, repo}, &listed); err != nil ||
+		!strings.Contains(listed.String(), "repo:    "+repo+"\n") || !strings.Contains(listed.String(), "url:     https://example.com/repair.git\n") {
+		t.Fatalf("list = %v\n%s", err, listed.String())
 	}
 
 	// Without --yes it changes nothing.
@@ -694,5 +700,130 @@ func TestRepairRefsPrintsTheSanitizedURL(t *testing.T) {
 	if err := repairRefs(t.Context(), rs, target, false, &out); err != nil || !strings.Contains(out.String(), "url:     https://x/") ||
 		strings.Contains(out.String(), "\x1b") || strings.Contains(out.String(), "\nforged") {
 		t.Fatalf("url line (err %v):\n%q", err, out.String())
+	}
+}
+
+func isolateStorageEnv(t *testing.T) {
+	t.Helper()
+	for _, env := range []string{
+		"OPENSTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL",
+		"OPENSTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL",
+		envDataDir, envSecretsKey, envPackQuota, envPackReservationTTL,
+	} {
+		t.Setenv(env, "")
+	}
+}
+
+// sqliteTables lists the tables of the SQLite database at path.
+func sqliteTables(t *testing.T, path string) map[string]bool {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(t.Context(), `SELECT name FROM sqlite_master WHERE type = 'table'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	tables := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		tables[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	// Every caller has set up the metadata schema, so a listing without its
+	// repos table is a broken helper, and the absence checks prove nothing.
+	if !tables["repos"] {
+		t.Fatalf("test setup: no repos table in %s: %v", path, tables)
+	}
+	return tables
+}
+
+// The command reads the repository row and sets up no metadata schema, with
+// or without --yes, and it needs no secrets key: a table that the metadata
+// schema setup would create stays absent, and a key that fails to parse does
+// not matter.
+func TestCmdRepairRefsLeavesTheMetadataSchemaAlone(t *testing.T) {
+	isolateStorageEnv(t)
+	t.Setenv(envSecretsKey, "not a key")
+	if _, err := resolveSecretsCodec(os.Getenv); err == nil {
+		t.Fatal("test setup: the secrets key parses")
+	}
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codestorage.db")
+	repo := createMetaRepo(t, "sqlite://"+path, "main")
+	rs, err := ref.OpenSQLite(ctx, "sqlite://"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixtureFor(t, rs, repo)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, repairLongRef: f.commit})
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `DROP TABLE webhooks`); err != nil {
+		t.Fatalf("drop a metadata table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"--data-dir", dir, repo}, {"--data-dir", dir, "--yes", repo}} {
+		var out bytes.Buffer
+		if err := runRepairRefs(ctx, args, &out); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out.String())
+		}
+		if sqliteTables(t, path)["webhooks"] {
+			t.Fatalf("%v: the command ran the metadata schema setup", args)
+		}
+	}
+	if _, ok := f.refs(t)[repairLongRef]; ok {
+		t.Fatal("--yes did not delete the ref")
+	}
+}
+
+// An ID with no repository is refused before the ref store is touched: no
+// ref schema is set up for it, not even with --yes.
+func TestCmdRepairRefsSetsUpNothingForAnUnknownID(t *testing.T) {
+	isolateStorageEnv(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codestorage.db")
+	createMetaRepo(t, "sqlite://"+path, "main")
+	if sqliteTables(t, path)["refs"] {
+		t.Fatal("test setup: the refs table exists")
+	}
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", "repo_000000000000"}); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("--yes with an unknown ID = %v, want not found", err)
+	}
+	if sqliteTables(t, path)["refs"] {
+		t.Fatal("an unknown ID got the ref schema setup")
+	}
+}
+
+// A database without the metadata schema (not the one that serve uses) is an
+// error, not a clean repository.
+func TestCmdRepairRefsFailsWithoutTheMetadataSchema(t *testing.T) {
+	isolateStorageEnv(t)
+	dir := t.TempDir()
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(dir, "codestorage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	f.plant(t, map[string]string{repairLongRef: f.commit})
+	if err := cmdRepairRefs(t.Context(), []string{"--data-dir", dir, "--yes", f.repo}); err == nil || !strings.Contains(err.Error(), "read repo state") {
+		t.Fatalf("a database without the metadata schema = %v, want a read error", err)
+	}
+	if got := f.refs(t); len(got) != 1 {
+		t.Fatalf("refs changed: %v", got)
 	}
 }
