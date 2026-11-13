@@ -70,6 +70,12 @@ func resolveOptions(opts []Option) storeOptions {
 	return o
 }
 
+// ReservedSecret reports whether a secret value starts with the reserved
+// envelope prefix, which the stores refuse with ErrReservedSecret.
+func ReservedSecret(plaintext string) bool {
+	return strings.HasPrefix(plaintext, secrets.ReservedPrefix)
+}
+
 // encodeSecret maps a plaintext secret to its stored column value:
 // the reserved-prefix rejection, then encryption when the codec is set.
 // A decrypt-only codec (OPENSTORAGE_SECRETS_MODE=decrypt-only staging)
@@ -77,7 +83,7 @@ func resolveOptions(opts []Option) storeOptions {
 // replica can decrypt it; staged rows are re-encrypted lazily once the
 // fleet flips to encrypt mode.
 func encodeSecret(c *secrets.Codec, plaintext string) (string, error) {
-	if strings.HasPrefix(plaintext, secrets.ReservedPrefix) {
+	if ReservedSecret(plaintext) {
 		return "", ErrReservedSecret
 	}
 	if c == nil || c.DecryptOnly {
