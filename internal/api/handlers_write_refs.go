@@ -901,7 +901,8 @@ type wrefNoteAppendRequest struct {
 // duplicate, or case-variant member names (encoding/json matches names
 // case-insensitively, even with DisallowUnknownFields, and lets the last
 // duplicate win), JSON null members, and trailing data are errors. dst
-// must point to a struct.
+// must point to a struct. A body with several bad members names every one
+// of them (checkStrictObject).
 func strictJSON(body []byte, dst any) error {
 	t := reflect.TypeOf(dst)
 	assertf(t != nil && t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct, "strictJSON: dst %T is not a struct pointer", dst)
@@ -924,13 +925,38 @@ func strictJSON(body []byte, dst any) error {
 // Slice, array, and map fields are not: a field holding structs there
 // fails the assertion below, so a schema that needs them must add the
 // recursion first (issue #381).
+//
+// It names every offending member (bodyErrors), one problem for each
+// member path. The order is fixed: the members the struct knows come in
+// the struct's field order (a member's own problem, then the problems
+// below it), then the unknown members in the order of the body, and the
+// problems of a nested object stay together at its place. A request
+// that sends the same bad member twice gets one problem for it. A body
+// that is not one complete JSON object (a syntax error, another kind of
+// value, trailing data) names no member: it is the single plain error
+// "body must be a JSON object", whatever members it holds.
 func checkStrictObject(raw []byte, t reflect.Type, path string) error {
+	problems, err := strictObjectProblems(raw, t, path)
+	if err != nil {
+		return err
+	}
+	return problems.err()
+}
+
+// strictObjectProblems collects the problems checkStrictObject names. Its
+// error is the single answer for a value that is not a JSON object: plain
+// for the body, and the problem of its own member for a nested value
+// (which is a complete JSON value, so only its kind can be wrong).
+func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, error) {
 	var notObject error = errors.New("body must be a JSON object")
 	if path != "" {
 		name := strings.TrimSuffix(path, ".")
 		notObject = newFieldError(name, "must be an object", name+" must be a JSON object")
 	}
-	fields := make(map[string]reflect.Type, t.NumField())
+	var (
+		names  = make([]string, 0, t.NumField()) // known member names, in field order
+		fields = make(map[string]reflect.Type, t.NumField())
+	)
 	for i := range t.NumField() {
 		ft := t.Field(i).Type
 		if k := ft.Kind(); k == reflect.Slice || k == reflect.Array || k == reflect.Map {
@@ -942,6 +968,7 @@ func checkStrictObject(raw []byte, t reflect.Type, path string) error {
 		}
 		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
 		if name != "" && name != "-" {
+			names = append(names, name)
 			fields[name] = ft
 		}
 	}
@@ -949,52 +976,81 @@ func checkStrictObject(raw []byte, t reflect.Type, path string) error {
 	// map would hide a duplicate name.
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return notObject
+		return nil, notObject
 	}
-	seen := make(map[string]bool, len(fields))
+	// member is what a known name has so far: its own problem, which is
+	// the first one (a repeat of a bad member adds none), and the problems
+	// below it.
+	type member struct {
+		own    error
+		nested bodyErrors
+	}
+	var (
+		members     = make(map[string]*member, len(fields))
+		unknown     bodyErrors
+		unknownSeen = make(map[string]bool)
+	)
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
-			return notObject
+			return nil, notObject
 		}
 		name, ok := tok.(string)
 		assertf(ok, "checkStrictObject: member name token %T", tok)
 		var v json.RawMessage
 		if err := dec.Decode(&v); err != nil {
-			return notObject
+			return nil, notObject
 		}
 		ft, ok := fields[name]
 		if !ok {
+			if unknownSeen[name] {
+				continue
+			}
+			unknownSeen[name] = true
 			msg := fmt.Sprintf("unknown field %q", path+name)
 			if name == "" { // an empty member name has no dotted wire path
-				return errors.New(msg)
+				unknown.add(errors.New(msg))
+			} else {
+				unknown.add(newFieldError(path+name, "is not a known field", msg))
 			}
-			return newFieldError(path+name, "is not a known field", msg)
+			continue
 		}
-		if seen[name] {
-			return newFieldError(path+name, "appears more than once", fmt.Sprintf("duplicate field %q", path+name))
+		m := members[name]
+		if m != nil {
+			if m.own == nil {
+				m.own = newFieldError(path+name, "appears more than once", fmt.Sprintf("duplicate field %q", path+name))
+			}
+			continue
 		}
-		seen[name] = true
+		m = &member{}
+		members[name] = m
 		if string(bytes.TrimSpace(v)) == "null" {
-			return newFieldError(path+name, "must not be null", path+name+" must not be null")
+			m.own = newFieldError(path+name, "must not be null", path+name+" must not be null")
+			continue
 		}
 		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
 		}
 		if ft.Kind() == reflect.Struct {
-			if err := checkStrictObject(v, ft, path+name+"."); err != nil {
-				return err
-			}
+			nested, err := strictObjectProblems(v, ft, path+name+".")
+			m.own, m.nested = err, nested
 		}
 	}
 	// The closing brace, then nothing: trailing data is not an object.
 	if _, err := dec.Token(); err != nil {
-		return notObject
+		return nil, notObject
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return notObject
+		return nil, notObject
 	}
-	return nil
+	var problems bodyErrors
+	for _, name := range names {
+		if m := members[name]; m != nil {
+			problems.add(m.own)
+			problems = append(problems, m.nested...)
+		}
+	}
+	return append(problems, unknown...), nil
 }
 
 // wrefDecodeStrictBody is wrefDecodeBody with strictJSON.
@@ -1061,22 +1117,22 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	objectSHA := wrefAliasField(req.ObjectRef, req.SHA)
 	notesRefRaw := wrefAliasField(req.NotesRef, req.Ref)
 	expectedRefSHA := wrefAliasField(req.ExpectedNotesRefSHA, req.ExpectedRefSHA)
-	// invalid writes a 400 for one field. A body member is named in
+	// invalid returns the problem of one field. A body member is named in
 	// invalid_params (the member the request sent, alias included); a
 	// DELETE query parameter is not, and neither is a DELETE field that
-	// the body did not carry, because its current form is the query.
+	// the body did not carry, because its current form is the query: that
+	// problem adds its message only.
 	objectField := wrefAliasName("object_ref", req.ObjectRef, "sha", req.SHA)
 	notesRefField := wrefAliasName("notes_ref", req.NotesRef, "ref", req.Ref)
 	guardField := wrefAliasName("expected_notes_ref_sha", req.ExpectedNotesRefSHA, "expected_ref_sha", req.ExpectedRefSHA)
 	if deleteNote && objectSHA == "" {
 		objectField = ""
 	}
-	invalid := func(field, reason, msg string) {
+	invalid := func(field, reason, msg string) error {
 		if field == "" {
-			writeErr(w, http.StatusBadRequest, msg)
-			return
+			return errors.New(msg)
 		}
-		writeInvalidField(w, field, reason, msg)
+		return newFieldError(field, reason, msg)
 	}
 	// The 2026-10-05 spec (issue #378) moves the DELETE fields to query
 	// parameters: a present query parameter wins over the body, even when
@@ -1093,14 +1149,13 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			expectedRefSHA, guardField = q.Get("expected_notes_ref_sha"), ""
 		}
 	}
-	targetRef, err := wrefNotesRefName(notesRefRaw)
-	if err != nil {
-		invalid(notesRefField, "must be a valid notes ref", err.Error())
-		return
-	}
+	// Every field adds its first problem, in the order of the route's
+	// request body in docs/reference/http-api.md, so a body with several
+	// bad fields names them all (bodyErrors). All of these checks are
+	// stateless: the ones that need git run below, after this batch.
+	var errs bodyErrors
 	if objectSHA == "" {
-		invalid(objectField, "is required", "object_ref is required")
-		return
+		errs.add(invalid(objectField, "is required", "object_ref is required"))
 	}
 	action := "remove"
 	if !deleteNote {
@@ -1110,27 +1165,29 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			action = "add"
 		}
 		if action != "add" && action != "append" {
-			writeInvalidField(w, "action", "must be add or append", "action must be add or append")
-			return
+			errs.add(invalid("action", "must be add or append", "action must be add or append"))
 		}
 		if req.Note == "" {
-			writeInvalidField(w, "note", "is required", "note is required")
-			return
+			errs.add(invalid("note", "is required", "note is required"))
 		}
+	}
+	targetRef, err := wrefNotesRefName(notesRefRaw)
+	if err != nil {
+		errs.add(invalid(notesRefField, "must be a valid notes ref", err.Error()))
 	}
 	expectedRefSHA = lowerFullSHA(expectedRefSHA)
 	if expectedRefSHA != "" && !ref.ValidSHA(expectedRefSHA) {
-		invalid(guardField, "must be a full 40-hex object id", "expected_notes_ref_sha must be a full 40-hex object id")
-		return
+		errs.add(invalid(guardField, "must be a full 40-hex object id", "expected_notes_ref_sha must be a full 40-hex object id"))
 	}
 	author := wrefNoteAuthor{Name: "open.storage", Email: "notes@openstorage.invalid"}
 	if req.Author != nil {
-		const msg = "author name and email are required when author is provided"
-		if err := requiredFields(msg, [2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}); err != nil {
-			writeInvalid(w, msg, err)
-			return
-		}
+		errs.add(requiredFields("author name and email are required when author is provided",
+			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}))
 		author = *req.Author
+	}
+	if err := errs.err(); err != nil {
+		writeInvalid(w, err.Error(), err)
+		return
 	}
 
 	repoPath, ok := s.materializeReadRepo(w, r, repo)

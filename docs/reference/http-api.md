@@ -67,12 +67,15 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   A body with several invalid fields gets one item for each of them, as upstream says
   (`invalid_params` "names each invalid field"). The items follow the order of the
   route's request body in this document, array elements by index, and a field appears
-  once. `detail` then holds the message of each problem, joined by `; `. One answer
+  once. A strictly decoded body lists its unknown members last, in the order of the
+  body. `detail` then holds the message of each problem, joined by `; `. One answer
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
   out. A check that needs the repository's state (for example, that a merge creates a
   commit and so needs an `author`) runs after the checks of the body. `POST
-  /repos/merge` answers this way. The other routes with a request body still name only
-  the first invalid field.
+  /repos/merge`, `POST /repos/notes`, `POST /api/repos/{repo_name}/notes/append` and
+  `DELETE /repos/notes` answer this way, and so does the strict decoding of `POST
+  /api/repos/{repo_name}/upstream/pull`. The other routes with a request body still name
+  only the first invalid field.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
