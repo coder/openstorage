@@ -208,21 +208,28 @@ func TestValidBranchName(t *testing.T) {
 	valid := []string{
 		"main", "develop", "release-1.0", "feature/foo", "a/b/c", "v1.2.3_rc1",
 		strings.Repeat("a", 250), "x/" + strings.Repeat("a", 250), strings.Repeat("a", 252) + "/b",
+		"x/" + strings.Repeat("a", 200) + "/" + strings.Repeat("b", 50),
 	}
 	invalid := []string{
 		"", "-x", ".hidden", "a..b", "a b", "feat/", "/lead", "a//b",
 		"branch.lock", "refs/heads/x.lock", "über", strings.Repeat("a", 256),
-		// git cannot create <last part>.lock past NAME_MAX.
-		strings.Repeat("a", 251), "x/" + strings.Repeat("a", 251), strings.Repeat("a", 255),
 	}
+	// git cannot create <last part>.lock past NAME_MAX, so the API writes no
+	// such name, but it can still look up and delete one.
+	tooLongToWrite := []string{strings.Repeat("a", 251), "x/" + strings.Repeat("a", 251), strings.Repeat("a", 255)}
 	for _, name := range valid {
-		if !validBranchName(name) {
-			t.Errorf("validBranchName(%q) = false, want true", name)
+		if !validBranchName(name) || !validNewBranchName(name) {
+			t.Errorf("validBranchName(%q), validNewBranchName = %v, %v, want true, true", name, validBranchName(name), validNewBranchName(name))
 		}
 	}
 	for _, name := range invalid {
-		if validBranchName(name) {
-			t.Errorf("validBranchName(%q) = true, want false", name)
+		if validBranchName(name) || validNewBranchName(name) {
+			t.Errorf("validBranchName(%q), validNewBranchName = %v, %v, want false, false", name, validBranchName(name), validNewBranchName(name))
+		}
+	}
+	for _, name := range tooLongToWrite {
+		if !validBranchName(name) || validNewBranchName(name) {
+			t.Errorf("validBranchName(%q), validNewBranchName = %v, %v, want true, false", name, validBranchName(name), validNewBranchName(name))
 		}
 	}
 }

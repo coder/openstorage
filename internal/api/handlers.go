@@ -155,14 +155,11 @@ const maxBranchLastPartBytes = 255 - len(".lock")
 // check-ref-format rules — every accepted name must survive as a real ref,
 // because stored default branches now drive `symbolic-ref HEAD` on every
 // hydrate (issue #18) and a git-rejected name would poison hydration.
-// The last part also leaves room for git's ".lock" file within the
-// 255-byte file-name limit: a longer one makes every hydration fail
-// ("cannot lock ref"), so the repository's git reads answer 500.
+// A name that the API writes must also pass validNewBranchName. Lookups
+// and deletes take this rule alone, so a ref that an older version wrote
+// can still be deleted.
 func validBranchName(name string) bool {
 	if name == "" || len(name) > 255 || strings.Contains(name, "..") {
-		return false
-	}
-	if len(name[strings.LastIndexByte(name, '/')+1:]) > maxBranchLastPartBytes {
 		return false
 	}
 	for comp := range strings.SplitSeq(name, "/") {
@@ -174,13 +171,22 @@ func validBranchName(name string) bool {
 	return true
 }
 
+// validNewBranchName reports whether the API can write a ref under name:
+// validBranchName, and a last part that leaves room for git's ".lock" file
+// within the 255-byte file-name limit. A longer last part makes every
+// hydration fail ("cannot lock ref"), so the repository's git reads
+// answer 500 until the ref is deleted.
+func validNewBranchName(name string) bool {
+	return validBranchName(name) && len(name[strings.LastIndexByte(name, '/')+1:]) <= maxBranchLastPartBytes
+}
+
 // validDefaultBranch reports whether branch can be a repository's default
 // branch: a branch name, or its refs/heads/-qualified spelling. Any other
 // refs/ name is refused: the default names a branch. (Hydration points a
 // persistent repository's HEAD away from a hidden refs/namespaces/ default.)
 func validDefaultBranch(branch string) bool {
 	short := strings.TrimPrefix(branch, "refs/heads/")
-	return !strings.HasPrefix(short, "refs/") && validBranchName(short)
+	return !strings.HasPrefix(short, "refs/") && validNewBranchName(short)
 }
 
 type createRepoRequest struct {

@@ -167,6 +167,12 @@ func wrefValidBranchInput(name string) bool {
 	return !strings.HasPrefix(name, "refs/") && validBranchName(name)
 }
 
+// wrefValidNewBranchInput is wrefValidBranchInput for a name that the
+// request writes (validNewBranchName). Deletes keep wrefValidBranchInput.
+func wrefValidNewBranchInput(name string) bool {
+	return !strings.HasPrefix(name, "refs/") && validNewBranchName(name)
+}
+
 // wrefPolicyCheck evaluates the token's ref policies (docs/reference/authentication.md, invariant 5)
 // for one CAS update against the STORED ref name, mirroring the git update
 // hook: no-push denies everything; no-force-push denies deletions and
@@ -359,7 +365,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	// Only omission requests allocation; explicit empty/null targets stay invalid.
 	allocate := req.TargetBranch == nil
 	var targetBranch string
-	if !allocate && (json.Unmarshal(req.TargetBranch, &targetBranch) != nil || !wrefValidBranchInput(targetBranch)) {
+	if !allocate && (json.Unmarshal(req.TargetBranch, &targetBranch) != nil || !wrefValidNewBranchInput(targetBranch)) {
 		writeInvalidField(w, "target_branch", "must be a valid branch name", "invalid target_branch")
 		return
 	}
@@ -446,7 +452,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	for range attempts {
 		if allocate {
 			targetBranch = rand.Text()
-			assertf(wrefValidBranchInput(targetBranch), "invalid allocated branch name %q", targetBranch)
+			assertf(wrefValidNewBranchInput(targetBranch), "invalid allocated branch name %q", targetBranch)
 		}
 		targetRef := wrefRefName(targetBranch, req.TargetIsEphemeral)
 		// The CAS precondition: zero for plain create, the tip read above
@@ -658,7 +664,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	if !wrefDecodeBody(w, r, &req) {
 		return
 	}
-	if !wrefValidBranchInput(req.Name) {
+	if !wrefValidNewBranchInput(req.Name) {
 		writeInvalidField(w, "name", "must be a valid tag name", "invalid tag name")
 		return
 	}
@@ -837,12 +843,12 @@ func wrefNotesRefName(raw string) (string, error) {
 	}
 	if strings.HasPrefix(raw, "refs/") {
 		name, found := strings.CutPrefix(raw, "refs/notes/")
-		if !found || !validBranchName(name) {
+		if !found || !validNewBranchName(name) {
 			return "", fmt.Errorf("ref %q is not a valid refs/notes/ ref", raw)
 		}
 		return raw, nil
 	}
-	if !validBranchName(raw) {
+	if !validNewBranchName(raw) {
 		return "", fmt.Errorf("invalid notes ref name %q", raw)
 	}
 	return "refs/notes/" + raw, nil

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,9 +113,10 @@ func TestValidBranchNameMatchesAPI(t *testing.T) {
 		"main", "trunk", "release/1.0", "a", "a.b", "a_b-c", "", ".x", "-x", "x.", "x.lock", "a..b",
 		"a//b", "/a", "a/", "a b", "a~b", "a^b", "a:b", "a\\b", "a@{b", "é", string(make([]byte, 256)),
 		"refs/heads/main", "HEAD",
+		strings.Repeat("a", 250), strings.Repeat("a", 251), "x/" + strings.Repeat("a", 251), strings.Repeat("a", 252) + "/b",
 	} {
-		if got, want := upsync.ValidBranchName(name), validBranchName(name); got != want {
-			t.Errorf("ValidBranchName(%q) = %v, API validBranchName = %v", name, got, want)
+		if got, want := upsync.ValidBranchName(name), validNewBranchName(name); got != want {
+			t.Errorf("ValidBranchName(%q) = %v, API validNewBranchName = %v", name, got, want)
 		}
 	}
 }
