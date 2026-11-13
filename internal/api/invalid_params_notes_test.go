@@ -351,19 +351,60 @@ func TestStrictJSONOrder(t *testing.T) {
 	}
 }
 
+// ipUnknownMembers is n distinct unknown members, each followed by a comma.
+func ipUnknownMembers(n int, prefix string) string {
+	var b strings.Builder
+	for i := range n {
+		fmt.Fprintf(&b, `"%s%03d":1,`, prefix, i)
+	}
+	return b.String()
+}
+
+// TestStrictJSONCollisionTakesOneSlot: a member called "author.name" and
+// the "name" of an "author" object share a dotted path. They take one of
+// the 100 slots, so 100 distinct bad paths are all named.
+func TestStrictJSONCollisionTakesOneSlot(t *testing.T) {
+	type dst struct {
+		Note   string `json:"note"`
+		Author *struct {
+			Name string `json:"name"`
+		} `json:"author"`
+	}
+	const collision = `"author.name":"v","author":{"name":"n","name":"m"},`
+	for _, tc := range []struct {
+		name, body, last, tail string
+		joined                 bool // the message holds both problems of the shared path
+	}{
+		{"100 distinct paths", `{` + collision + ipUnknownMembers(99, "u") + `"note":"n"}`, "u098", "", true},
+		{"101 distinct paths", `{` + collision + ipUnknownMembers(100, "u") + `"note":"n"}`, "u098", "; and 1 more", true},
+		{"the other order", `{` + ipUnknownMembers(99, "u") + `"author":{"name":null},"author.name":"v"}`, "u098", "", true},
+		// The first problem of a path that the bound leaves out cannot take
+		// the problem that shares its path: both are left out.
+		{"a path past the bound", `{"note":null,"author":{` + ipUnknownMembers(100, "n") + `"name":"x"},"author.n099":1}`, "author.n098", "; and 2 more", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := strictJSON([]byte(tc.body), new(dst))
+			if err == nil {
+				t.Fatal("strictJSON succeeded")
+			}
+			got := invalidParamsFor(err)
+			if len(got) != maxInvalidParams || got[len(got)-1].Name != tc.last || !strings.HasSuffix(err.Error(), tc.tail) {
+				t.Fatalf("%d items, last %v, message ends %q, want %d, %s, %q", len(got), got[len(got)-1], err.Error()[len(err.Error())-20:], maxInvalidParams, tc.last, tc.tail)
+			}
+			if tc.joined && !strings.Contains(err.Error(), `"author.name"; unknown field "author.name"`) && !strings.Contains(err.Error(), `must not be null; unknown field "author.name"`) {
+				t.Fatalf("message lost the collision: %q", err.Error()[:200])
+			}
+		})
+	}
+}
+
 // TestStrictJSONBoundsItsAnswer: a body of 1 MiB holds 100,000 unknown
 // members. The answer names at most maxInvalidParams problems and counts
 // the others, however they split between a member's own problem, the ones
 // below it and the unknown ones. The walk keeps no name and builds no
 // problem past the bound.
 func TestStrictJSONBoundsItsAnswer(t *testing.T) {
-	unknown := func(n int, prefix string) string {
-		var b strings.Builder
-		for i := range n {
-			fmt.Fprintf(&b, `"%s%03d":1,`, prefix, i)
-		}
-		return b.String()
-	}
+	unknown := ipUnknownMembers
 	type dst struct {
 		Note   string `json:"note"`
 		Author *struct {

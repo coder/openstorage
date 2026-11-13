@@ -944,28 +944,7 @@ func checkStrictObject(raw []byte, t reflect.Type, path string) error {
 	if err != nil {
 		return err
 	}
-	strictKeepCollisions(&problems)
 	return problems.err()
-}
-
-// strictKeepCollisions makes a problem add its message only when an
-// earlier problem with another message already names the same dotted path.
-// Two members can share one: a member named "author.name" and the "name"
-// member of an "author" object. bodyErrors counts a path once, so the later
-// problem would lose both its item and its message.
-func strictKeepCollisions(b *bodyErrors) {
-	first := make(map[string]string, len(b.errs))
-	for i, err := range b.errs {
-		items := invalidParamsFor(err)
-		if len(items) != 1 {
-			continue
-		}
-		if msg, seen := first[items[0].Name]; !seen {
-			first[items[0].Name] = err.Error()
-		} else if msg != err.Error() {
-			b.errs[i] = errors.New(err.Error())
-		}
-	}
 }
 
 // strictObjectProblems collects the problems checkStrictObject names. Its
@@ -1076,24 +1055,56 @@ func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, 
 	if _, err := dec.Token(); err != io.EOF {
 		return bodyErrors{}, notObject
 	}
-	var problems bodyErrors
+	var out strictProblems
 	for _, name := range names {
 		if m := members[name]; m != nil {
-			problems.add(m.own)
-			strictAddAll(&problems, m.nested)
+			out.add(m.own)
+			out.addAll(m.nested)
 		}
 	}
-	strictAddAll(&problems, unknown)
-	return problems, nil
+	out.addAll(unknown)
+	return out.bodyErrors, nil
 }
 
-// strictAddAll adds each problem of src to dst, in order, and counts the
-// ones that src already left out.
-func strictAddAll(dst *bodyErrors, src bodyErrors) {
-	for _, err := range src.errs {
-		dst.add(err)
+// strictProblems is a bodyErrors that gives the problems with one dotted
+// path a single slot. Two members can share a path: a member called
+// "author.name" and the "name" of an "author" object. bodyErrors counts a
+// path once, so a second problem for it would lose its message, or would
+// take a slot of the 100 that it keeps without naming one more field. The
+// second problem joins the message of the first, or adds nothing when it
+// says the same.
+type strictProblems struct {
+	bodyErrors
+	at map[string]int // dotted path -> index in errs of the problem that names it
+}
+
+// add collects err, as bodyErrors.add does.
+func (p *strictProblems) add(err error) {
+	if items := invalidParamsFor(err); len(items) == 1 {
+		name := items[0].Name
+		if i, seen := p.at[name]; seen {
+			if first := p.errs[i]; first.Error() != err.Error() {
+				p.errs[i] = newFieldErrors(first.Error()+"; "+err.Error(), invalidParamsFor(first)...)
+			}
+			return
+		}
+		if p.at == nil {
+			p.at = make(map[string]int)
+		}
+		if len(p.errs) < maxInvalidParams {
+			p.at[name] = len(p.errs)
+		}
 	}
-	dst.dropped += src.dropped
+	p.bodyErrors.add(err)
+}
+
+// addAll adds each problem of src to p, in order, and counts the ones that
+// src already left out.
+func (p *strictProblems) addAll(src bodyErrors) {
+	for _, err := range src.errs {
+		p.add(err)
+	}
+	p.dropped += src.dropped
 }
 
 // wrefDecodeStrictBody is wrefDecodeBody with strictJSON.
