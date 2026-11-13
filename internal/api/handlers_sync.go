@@ -19,6 +19,7 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -382,6 +383,26 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A bad default_branch of the body that is the only problem answers here:
+	// after the ref policy, and before the egress check, which may look up a
+	// name and so comes after every check of the body. The query parameter is
+	// no body field: it is checked after the egress check, as before.
+	if err := cmp.Or(topBranch, baseBranch); err != nil {
+		writeInvalid(w, err.Error(), err)
+		return
+	}
+	if spec != nil {
+		// Registration-time egress courtesy check (issue #139), mirroring
+		// webhook CheckRegistration: fast feedback for upstream hosts the
+		// pull lane's dial-time vetting proxy would deny anyway, before any
+		// rows exist. Fail-open on resolution errors — acceptance is not a
+		// reachability promise; the worker's guard is authoritative.
+		if err := s.guard.CheckHost(r.Context(), upstreamHostname(upstreamHost)); err != nil {
+			writeInvalidField(w, hostPath, "is denied by the sync egress policy", hostField+" denied by sync egress policy: "+err.Error())
+			return
+		}
+	}
+
 	branch, branchPath := req.DefaultBranch, "default_branch"
 	if branch == "" && spec != nil {
 		// base_repo.default_branch names the upstream branch to track.
@@ -400,23 +421,11 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	if branch == "" {
 		branch = meta.OmittedDefaultBranch
 	}
-	// The body's default branch was checked above, and answers here when
-	// it is the only problem: the ref policy answers before it.
+	// The body's default branch is valid here (checked above), so only the
+	// query parameter can answer.
 	if err := defaultBranchProblem(branch, branchPath); err != nil {
 		writeInvalid(w, err.Error(), err)
 		return
-	}
-	if spec != nil {
-		// Registration-time egress courtesy check (issue #139), mirroring
-		// webhook CheckRegistration: fast feedback for upstream hosts the
-		// pull lane's dial-time vetting proxy would deny anyway, before any
-		// rows exist. Fail-open on resolution errors — acceptance is not a
-		// reachability promise; the worker's guard is authoritative. It may
-		// look up a name, so it runs after every check of the body.
-		if err := s.guard.CheckHost(r.Context(), upstreamHostname(upstreamHost)); err != nil {
-			writeInvalidField(w, hostPath, "is denied by the sync egress policy", hostField+" denied by sync egress policy: "+err.Error())
-			return
-		}
 	}
 
 	var repo meta.Repo

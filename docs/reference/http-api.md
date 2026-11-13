@@ -271,17 +271,22 @@ the same scopes, query parameters and responses.
   checks any field. When that decode fails (a field of the wrong type, an unknown
   field), the answer is that failure alone: it names the field of the wrong type, and
   no other check of the body runs. A body that sets both members is decoded as neither.
-  A field whose check needs another field is checked only when that field
-  is valid: an unsupported `provider` leaves `access` and the default host unchecked,
-  and an invalid `base_repo.operation` is the only `base_repo` problem. One "are
-  required" message names all the empty fields of `upstream` (`provider`, `owner`,
-  `name`) or of `base_repo` (`owner`, `name`), and its items stand where the first of
-  them does. The `default_branch` query parameter is no body field and names none. The
-  egress check of the upstream host looks the host up, so it runs after the checks of
-  the body. A
-  `default_branch` that is the only invalid field answers where it did before: after the
-  ref-policy check (403) and, for a copy or fork, after the checks of the source token
-  (403), the source repository (404) and the fork point (400).
+  A check that needs another field is skipped when that field is invalid. A missing or
+  unsupported `provider` skips the checks that need it: the rules that tie `access` to
+  the provider (only `github` takes it, and then it must be `public`) and the default
+  host. The value of `access` (`app` or `public`) and the shape of the host are still
+  checked. An invalid `base_repo.operation` is the only `base_repo` problem: the
+  operation decides which `base_repo` fields apply. One "are required" message names all
+  the empty fields of `upstream` (`provider`, `owner`, `name`) or of `base_repo`
+  (`owner`, `name`), and its items stand where the first of them does. The
+  `default_branch` query parameter is no body field and names none.
+- The checks of state answer after the checks of the body fields: the ref policy (403),
+  the egress check of the upstream host (it looks the host up), and for a copy or fork
+  the source token (403), the source repository (404) and the fork point (400). A
+  `default_branch` of the body that is the only invalid field keeps its old place: after
+  the ref policy and before the egress check for a sync create, and after the fork
+  point for a copy or fork. The query parameter `default_branch` answers after the
+  egress check, so a denied host answers first.
 - `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
   run after every won local push. It also inverts the sync conflict rule: local wins, and
   inbound syncs never force-rewind local refs. See [Upstream sync](#upstream-sync).

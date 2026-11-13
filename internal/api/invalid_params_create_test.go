@@ -119,6 +119,14 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 				"invalid default_branch; base_repo and upstream cannot both be set", ipcBranchItem),
 			post("both forms leave each form unchecked", `{"base_repo":{"provider":"svn","operation":"bogus"},"upstream":{"provider":"svn"}}`,
 				"base_repo and upstream cannot both be set"),
+			// Neither form is decoded then, so a member that would fail to
+			// decode does not answer.
+			post("both forms leave upstream undecoded", `{"base_repo":{"provider":"github"},"upstream":{"provider":"github","owner":1}}`,
+				"base_repo and upstream cannot both be set"),
+			post("both forms leave upstream's unknown field undecoded", `{"base_repo":{"provider":"github"},"upstream":{"x":1}}`,
+				"base_repo and upstream cannot both be set"),
+			post("both forms leave base_repo undecoded", `{"base_repo":{"provider":"github","auth":3},"upstream":{"provider":"github"}}`,
+				"base_repo and upstream cannot both be set"),
 			// A mismatching repo_name has its own code and answers first.
 			post("repo_name mismatch answers alone", `{"repo_name":"other","default_branch":"bad..name","upstream":{}}`,
 				repoNameMismatchMsg),
@@ -130,6 +138,9 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 				"invalid default_branch", ipcBranchItem),
 			post("a bad field answers before the egress check", `{"upstream":{"provider":"gitea","name":"n","host":"169.254.169.254"}}`,
 				"upstream provider, owner, and name are required", ipParam{"upstream.owner", "is required"}),
+			post("a bad default branch of base_repo answers before the egress check",
+				`{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":"169.254.169.254","default_branch":"bad..name"}}`,
+				"invalid default_branch", ipParam{"base_repo.default_branch", "is not a valid branch name"}),
 			post("egress denial alone answers as before", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"169.254.169.254"}}`,
 				"upstream host denied by sync egress policy: egress target 169.254.169.254 denied: cloud metadata address",
 				ipParam{"upstream.host", "is denied by the sync egress policy"}),
@@ -138,6 +149,20 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 			{
 				name: "query default branch alone names no field", method: http.MethodPost, path: "/api/v1/repos?default_branch=bad..name",
 				token: tok, body: `{}`, wantError: "invalid default_branch",
+			},
+			// The query parameter is no body field: the egress check still
+			// answers before it, as before.
+			{
+				name: "query default branch answers after the egress check", method: http.MethodPost, path: "/api/v1/repos?default_branch=bad..name",
+				token: tok, body: `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"169.254.169.254"}}`,
+				wantError: "upstream host denied by sync egress policy: egress target 169.254.169.254 denied: cloud metadata address",
+				want:      []ipParam{{"upstream.host", "is denied by the sync egress policy"}},
+			},
+			{
+				name: "query default branch answers after the base_repo egress check", method: http.MethodPost, path: "/api/v1/repos?default_branch=bad..name",
+				token: tok, body: `{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":"169.254.169.254"}}`,
+				wantError: "base_repo upstream_host denied by sync egress policy: egress target 169.254.169.254 denied: cloud metadata address",
+				want:      []ipParam{{"base_repo.upstream_host", "is denied by the sync egress policy"}},
 			},
 			{
 				name: "query default branch is not part of the body's problems", method: http.MethodPost, path: "/api/v1/repos?default_branch=bad..name",
