@@ -1088,22 +1088,22 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	objectSHA := wrefAliasField(req.ObjectRef, req.SHA)
 	notesRefRaw := wrefAliasField(req.NotesRef, req.Ref)
 	expectedRefSHA := wrefAliasField(req.ExpectedNotesRefSHA, req.ExpectedRefSHA)
-	// invalid writes a 400 for one field. A body member is named in
+	// invalid returns the problem of one field. A body member is named in
 	// invalid_params (the member the request sent, alias included); a
 	// DELETE query parameter is not, and neither is a DELETE field that
-	// the body did not carry, because its current form is the query.
+	// the body did not carry, because its current form is the query: that
+	// problem adds its message only.
 	objectField := wrefAliasName("object_ref", req.ObjectRef, "sha", req.SHA)
 	notesRefField := wrefAliasName("notes_ref", req.NotesRef, "ref", req.Ref)
 	guardField := wrefAliasName("expected_notes_ref_sha", req.ExpectedNotesRefSHA, "expected_ref_sha", req.ExpectedRefSHA)
 	if deleteNote && objectSHA == "" {
 		objectField = ""
 	}
-	invalid := func(field, reason, msg string) {
+	invalid := func(field, reason, msg string) error {
 		if field == "" {
-			writeErr(w, http.StatusBadRequest, msg)
-			return
+			return errors.New(msg)
 		}
-		writeInvalidField(w, field, reason, msg)
+		return newFieldError(field, reason, msg)
 	}
 	// The 2026-10-05 spec (issue #378) moves the DELETE fields to query
 	// parameters: a present query parameter wins over the body, even when
@@ -1120,14 +1120,13 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			expectedRefSHA, guardField = q.Get("expected_notes_ref_sha"), ""
 		}
 	}
-	targetRef, err := wrefNotesRefName(notesRefRaw)
-	if err != nil {
-		invalid(notesRefField, "must be a valid notes ref", err.Error())
-		return
-	}
+	// Every field adds its first problem, in the order of the route's
+	// request body in docs/reference/http-api.md, so a body with several
+	// bad fields names them all (bodyErrors). All of these checks are
+	// stateless: the ones that need git run below, after this batch.
+	var errs bodyErrors
 	if objectSHA == "" {
-		invalid(objectField, "is required", "object_ref is required")
-		return
+		errs.add(invalid(objectField, "is required", "object_ref is required"))
 	}
 	action := "remove"
 	if !deleteNote {
@@ -1137,27 +1136,29 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			action = "add"
 		}
 		if action != "add" && action != "append" {
-			writeInvalidField(w, "action", "must be add or append", "action must be add or append")
-			return
+			errs.add(invalid("action", "must be add or append", "action must be add or append"))
 		}
 		if req.Note == "" {
-			writeInvalidField(w, "note", "is required", "note is required")
-			return
+			errs.add(invalid("note", "is required", "note is required"))
 		}
+	}
+	targetRef, err := wrefNotesRefName(notesRefRaw)
+	if err != nil {
+		errs.add(invalid(notesRefField, "must be a valid notes ref", err.Error()))
 	}
 	expectedRefSHA = lowerFullSHA(expectedRefSHA)
 	if expectedRefSHA != "" && !ref.ValidSHA(expectedRefSHA) {
-		invalid(guardField, "must be a full 40-hex object id", "expected_notes_ref_sha must be a full 40-hex object id")
-		return
+		errs.add(invalid(guardField, "must be a full 40-hex object id", "expected_notes_ref_sha must be a full 40-hex object id"))
 	}
 	author := wrefNoteAuthor{Name: "open.storage", Email: "notes@openstorage.invalid"}
 	if req.Author != nil {
-		const msg = "author name and email are required when author is provided"
-		if err := requiredFields(msg, [2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}); err != nil {
-			writeInvalid(w, msg, err)
-			return
-		}
+		errs.add(requiredFields("author name and email are required when author is provided",
+			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}))
 		author = *req.Author
+	}
+	if err := errs.err(); err != nil {
+		writeInvalid(w, err.Error(), err)
+		return
 	}
 
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
