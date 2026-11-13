@@ -2644,12 +2644,12 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		return nil, examined, fmt.Errorf("verify-sig: reading rev-list: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {
-		// rev-list exits 128 for an old id that is no readable commit here.
-		// The pusher chose it (see isAncestorUncached), so that is a
-		// refusal, decided by object state and not by git's message.
+		// rev-list exits 128 for an id that is no readable commit here. The
+		// pusher chose it (see isAncestorUncached), so that is a refusal,
+		// decided by object state and not by git's message.
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 128 &&
-			old != ref.ZeroSHA && (!commitExists(old) || !historyIntact(old)) {
-			return nil, examined, refusef("verify-sig: the old value of %s is not a readable commit in this repository", refName)
+			(old != ref.ZeroSHA && !commitExists(old) || !commitExists(new) || !historyIntact(new)) {
+			return nil, examined, refusef("verify-sig: the old or new value of %s is not a readable commit in this repository", refName)
 		}
 		return nil, examined, fmt.Errorf("verify-sig: git %s: %w", strings.Join(args, " "), err)
 	}

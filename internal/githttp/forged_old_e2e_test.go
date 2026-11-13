@@ -8,6 +8,7 @@ package githttp
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -137,7 +138,7 @@ func TestForgedOldIDUnderNoForcePushIsRefused(t *testing.T) {
 	signedOnly := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/main",["verify-sig"]],["*",[]]]`)
 	const main, feature = "refs/heads/main", "refs/heads/feature"
 	const noff = "no-force-push denies non-fast-forward update to " + main
-	const noCommit = "verify-sig: the old value of " + main + " is not a readable commit in this repository"
+	const noCommit = "verify-sig: the old or new value of " + main + " is not a readable commit in this repository"
 	ffPack := packObjects(t, work, c2, "^"+c1)
 
 	// Each push below is refused for main, which stays at c1. A mixed push
@@ -213,10 +214,10 @@ func packObjectList(t *testing.T, dir string, ids ...string) []byte {
 
 // receive-pack checks the tips that a push updates, not every object that
 // its pack carries, so a pusher can leave a commit with a missing parent in
-// the store and name it as an old id. A commit-graph would answer from the
-// commits it holds, so this node reads none: git then cannot read the
-// planted commit.
-func TestPlantedCommitWithoutParentAsOldIDIsRefused(t *testing.T) {
+// the store, and git still hands a command that names one to pre-receive. A
+// commit-graph would answer from the commits it holds, so this node reads
+// none: git then cannot read the planted commit.
+func TestPlantedCommitWithoutParentIsRefused(t *testing.T) {
 	node := startNodeT(t, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.commitGraph", "GIT_CONFIG_VALUE_0=false")
 	repo := registerRepo(t, "t-planted")
 	work := initWorkRepo(t)
@@ -228,39 +229,55 @@ func TestPlantedCommitWithoutParentAsOldIDIsRefused(t *testing.T) {
 	for l := range strings.Lines(mustGit(t, work, "rev-list", "--objects", c2, "^"+c1)) {
 		ids = append(ids, strings.Fields(l)[0])
 	}
+	pack := packObjectList(t, work, ids...)
 
-	token := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/main",["no-force-push"]],["*",[]]]`)
-	report, remote := rawReceivePack(t, node, repo, token, false, packObjectList(t, work, ids...), rawPushCommand{planted, c2, "refs/heads/main"})
-	assertNoCrashText(t, remote)
-	if !strings.HasPrefix(report["refs/heads/main"], "ng") || !strings.Contains(remote, "no-force-push denies non-fast-forward update to refs/heads/main") {
-		t.Fatalf("main was not refused: report %v\nremote:\n%s", report, remote)
-	}
-	if got := pgRefs(t, repo)["refs/heads/main"]; got != c1 {
-		t.Fatalf("main = %s after a refused push, want %s", got, c1)
+	const main = "refs/heads/main"
+	noForce := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/main",["no-force-push"]],["*",[]]]`)
+	signed := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/main",["verify-sig"]],["*",[]]]`)
+	const noff = "no-force-push denies non-fast-forward update to " + main
+	const unreadable = "is not a readable commit in this repository"
+	for _, tc := range []struct {
+		name, token, want string
+		cmd               rawPushCommand
+	}{
+		{"planted old id, no-force-push", noForce, noff, rawPushCommand{planted, c2, main}},
+		{"planted new id, no-force-push", noForce, noff, rawPushCommand{c1, planted, main}},
+		{"planted new id, verify-sig", signed, unreadable, rawPushCommand{c1, planted, main}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report, remote := rawReceivePack(t, node, repo, tc.token, false, pack, tc.cmd)
+			assertNoCrashText(t, remote)
+			if !strings.HasPrefix(report[main], "ng") || !strings.Contains(remote, tc.want) {
+				t.Fatalf("main was not refused with %q: report %v\nremote:\n%s", tc.want, report, remote)
+			}
+			if got := pgRefs(t, repo)[main]; got != c1 {
+				t.Fatalf("main = %s after a refused push, want %s", got, c1)
+			}
+		})
 	}
 }
 
 // A git that fails for two readable commits is a broken git or repository,
 // not a pusher's input: the ancestry check must not turn it into a refusal.
 func TestBrokenGitStillFailsFast(t *testing.T) {
-	sha := strings.Repeat("a", 40)
-	for _, tc := range []struct{ name, failing string }{
-		{"merge-base fails for two readable commits", "merge-base"},
-		{"rev-parse fails with a corrupt object", "merge-base|rev-parse"},
+	for _, tc := range []struct{ name, cases, panics string }{
+		{"merge-base fails for two readable commits", "merge-base) exit 128;;", "merge-base --is-ancestor"},
+		{"rev-parse fails with a corrupt object", "merge-base|rev-parse) exit 128;;", "rev-parse --verify"},
+		{"rev-list fails for another reason", "merge-base) exit 128;; rev-list) exit 1;;", "rev-list --quiet"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := t.TempDir()
-			script := "#!/bin/sh\ncase \"$1\" in " + tc.failing + ") exit 128;; esac\nexit 0\n"
+			script := "#!/bin/sh\ncase \"$1\" in " + tc.cases + " esac\nexit 0\n"
 			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 			defer func() {
-				if r := recover(); r == nil {
-					t.Fatal("isAncestorUncached answered for a broken git instead of failing")
+				if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), tc.panics) {
+					t.Fatalf("isAncestorUncached recovered %v, want a panic naming %q", r, tc.panics)
 				}
 			}()
-			isAncestorUncached(sha, strings.Repeat("b", 40))
+			isAncestorUncached(strings.Repeat("a", 40), strings.Repeat("b", 40))
 		})
 	}
 }
