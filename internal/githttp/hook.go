@@ -2644,12 +2644,12 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		return nil, examined, fmt.Errorf("verify-sig: reading rev-list: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {
-		// rev-list exits 128 for an old id that names no commit here. The
-		// pusher chose it (see isAncestorUncached), so that is a refusal,
-		// decided by object state and not by git's message.
+		// rev-list exits 128 for an old id that is no readable commit here.
+		// The pusher chose it (see isAncestorUncached), so that is a
+		// refusal, decided by object state and not by git's message.
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 128 &&
-			old != ref.ZeroSHA && !commitExists(old) {
-			return nil, examined, refusef("verify-sig: the old value of %s names no commit in this repository", refName)
+			old != ref.ZeroSHA && (!commitExists(old) || !historyIntact(old)) {
+			return nil, examined, refusef("verify-sig: the old value of %s is not a readable commit in this repository", refName)
 		}
 		return nil, examined, fmt.Errorf("verify-sig: git %s: %w", strings.Join(args, " "), err)
 	}
@@ -2890,12 +2890,14 @@ func isAncestor(old, new string) bool {
 
 // isAncestorUncached asks git whether old is an ancestor of new. Both ids
 // come from the pusher: git hands the hooks each command's old value before
-// it compares it with the stored ref, and a command can name any id. An id
-// that names no commit here (absent, or a tree or blob) makes merge-base
-// exit 128. No commit is an ancestor of such an id, so the answer is false,
-// decided by object state (commitExists), not by git's message. Exit 128
-// with two real commits, or any other failure, means a broken repository
-// or git, which no pusher can cause: fail fast.
+// it compares it with the stored ref, and a command can name any id.
+// merge-base exits 128 when it cannot read a commit: an id that names no
+// commit (absent, a tree or a blob), or a commit with a missing parent. The
+// pusher can plant such a commit, because receive-pack checks the tips that
+// a command updates, not every object that its pack carries. No unreadable
+// commit is an ancestor, so the answer is false. Object state decides, not
+// git's message (commitExists, historyIntact). Exit 128 for two commits with
+// intact history, or any other failure, means a broken git: fail fast.
 func isAncestorUncached(old, new string) bool {
 	err := exec.Command("git", "merge-base", "--is-ancestor", old, new).Run()
 	if err == nil {
@@ -2906,7 +2908,7 @@ func isAncestorUncached(old, new string) bool {
 		case 1:
 			return false
 		case 128:
-			if !commitExists(old) || !commitExists(new) {
+			if !commitExists(old) || !commitExists(new) || !historyIntact(old) || !historyIntact(new) {
 				return false
 			}
 		}
@@ -2928,4 +2930,17 @@ func commitExists(sha string) bool {
 	// A corrupt object or a spawn failure: a bug or a broken repository,
 	// never the pusher's input.
 	panic(fmt.Sprintf("githttp assertion failed: rev-parse --verify %s^{commit}: %v", sha, err))
+}
+
+// historyIntact reports whether git can read every commit that sha reaches.
+// sha must name a commit. rev-list exits 128 for a missing parent.
+func historyIntact(sha string) bool {
+	err := exec.Command("git", "rev-list", "--quiet", sha).Run()
+	if err == nil {
+		return true
+	}
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 128 {
+		return false
+	}
+	panic(fmt.Sprintf("githttp assertion failed: rev-list --quiet %s: %v", sha, err))
 }

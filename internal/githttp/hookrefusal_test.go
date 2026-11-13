@@ -522,3 +522,17 @@ func TestRunHookTurnsAPanicIntoTheFixedLine(t *testing.T) {
 		})
 	}
 }
+
+// Without a hook-errors file no pusher reads the hook's stderr, so a panic
+// keeps Go's panic output for the operator.
+func TestRunHookKeepsAPanicWithoutAPushVisible(t *testing.T) {
+	hookEnv(t, canarySQLite(t))
+	t.Setenv(EnvHookErrors, "")
+	t.Setenv(EnvRepo, "") // mustEnv panics on it
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("RunHook swallowed a panic that has no pusher")
+		}
+	}()
+	_ = RunHook(t.Context(), []string{"pre-receive"})
+}
