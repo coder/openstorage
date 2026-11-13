@@ -272,7 +272,9 @@ func (cfg upstreamConfig) validate(errs *bodyErrors) (host string) {
 }
 
 // validUpstreamHost accepts the two documented upstream_host shapes — a
-// bare hostname[:port] or an http(s):// base URL — and nothing else.
+// bare hostname[:port] or an http(s):// base URL — and nothing else. Both
+// need a hostname: upstreamHostname asserts one, so a host such as ":80"
+// must be refused here and not reach it.
 // upsync.CloneURL uses the value verbatim as the base of a git fetch URL,
 // so file://, ssh://, transport helpers (ext::), embedded credentials, and
 // query/fragment noise must be rejected here, where the attacker-controlled
@@ -283,7 +285,7 @@ func validUpstreamHost(host string) bool {
 		// Bare host[:port]: must round-trip as exactly the authority
 		// component (no path, userinfo, or control characters).
 		u, err := neturl.Parse("https://" + host)
-		return err == nil && u.Host == host && u.User == nil &&
+		return err == nil && u.Host == host && u.Hostname() != "" && u.User == nil &&
 			u.Path == "" && u.RawQuery == "" && u.Fragment == ""
 	}
 	u, err := neturl.Parse(host)
@@ -292,7 +294,7 @@ func validUpstreamHost(host string) bool {
 	}
 	// A path is allowed (sub-path-hosted forges); credentials belong in
 	// the credential store, never in the URL.
-	return u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
+	return u.Hostname() != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
 }
 
 // upstreamHostname extracts the hostname the sync fetch will dial from a
