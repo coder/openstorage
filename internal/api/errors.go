@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
@@ -144,6 +145,13 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		assertf(p.Name != "" && p.Reason != "", "writeProblem: incomplete invalid param %+v", p)
 	}
 	assertf(msg != "", "writeProblem called with empty message")
+	msg = boundEcho(msg)
+	if len(params) > 0 {
+		params = slices.Clone(params)
+		for i := range params {
+			params[i].Name = boundEcho(params[i].Name)
+		}
+	}
 	// RFC 9457 `title` is the status text, so only registered statuses are
 	// valid here (499 is never emitted: ADR-26).
 	title := http.StatusText(status)
@@ -168,6 +176,25 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		Guard:         guard,
 		CurrentSHA:    currentSHA,
 	}
+}
+
+// maxEchoBytes bounds the text of one 400 member that can repeat request
+// input: `error`, `detail` and an `invalid_params` name. A 1 MiB body that
+// names one 1 MiB value, or holds bytes that %q escapes to four, would
+// otherwise answer with 3 to 10 MiB.
+const maxEchoBytes = 2048
+
+// boundEcho cuts s to maxEchoBytes at a rune boundary and ends it with an
+// ellipsis. A shorter s comes back unchanged.
+func boundEcho(s string) string {
+	if len(s) <= maxEchoBytes {
+		return s
+	}
+	cut := maxEchoBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
