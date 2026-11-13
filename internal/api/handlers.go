@@ -588,9 +588,12 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	// HEAD <target>` on every node, and a persisted target git rejects
 	// would break the repo's git/read surface until another PATCH repairs
 	// the row.
-	target := githttp.HeadTarget(branch)
 	valid := validDefaultBranch(branch)
+	var target string
 	if valid {
+		// HeadTarget asserts that the name has no whitespace, so it runs
+		// only for a name that validDefaultBranch accepted.
+		target = githttp.HeadTarget(branch)
 		var err error
 		if valid, err = validRefFormat(r.Context(), target); err != nil {
 			s.internalErr(w, r, "check default_branch with git", err)
