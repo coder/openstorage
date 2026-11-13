@@ -71,8 +71,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
   out. A check that needs the repository's state (for example, that a merge creates a
   commit and so needs an `author`) runs after the checks of the body. `POST
-  /repos/merge` answers this way. The other routes with a request body still name only
-  the first invalid field.
+  /repos/merge`, `POST /repos/branches/create` and `POST /repos/tags` answer this way.
+  The other routes with a request body still name only the first invalid field.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
