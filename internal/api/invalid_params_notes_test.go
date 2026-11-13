@@ -106,6 +106,12 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 				want:      []ipParam{{"author.name", ipcNulReason}, {"author.email", ipcNulReason}},
 			},
 			{
+				name: "POST a NUL in the name of an author with an empty email", method: http.MethodPost, path: post, token: fx.gitTok,
+				body:      `{` + ipNoteReq + `,"author":{"name":"a\u0000","email":""}}`,
+				wantError: authorMsg + "; " + invalidTextMsg("author.name"),
+				want:      []ipParam{required("author.email"), {"author.name", ipcNulReason}},
+			},
+			{
 				name: "POST one: a NUL in the author email", method: http.MethodPost, path: post, token: fx.gitTok,
 				body:      `{` + ipNoteReq + `,"author":{"name":"n","email":"e\u0000"}}`,
 				wantError: invalidTextMsg("author.email"),
