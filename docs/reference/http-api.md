@@ -92,14 +92,19 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `pagination.cursor` that does not decode is named with the other invalid fields when
   the body has any. Alone, it keeps its place after the lookup of the repository, so a
   missing repository is `404` first. `POST /repos/merge`, `POST /repos/branches/create`,
-  `POST /repos/tags`, `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`,
-  `DELETE /repos/notes`, `POST /api/repos/{repo_name}/notes/append` (when its members
+  `POST /repos/tags`, `POST /repos`, `POST /repos/grep`, `POST /repos/archive`,
+  `POST /repos/notes`, `DELETE /repos/notes`,
+  `POST /api/repos/{repo_name}/notes/append` (when its members
   and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
   `/repos/{repo_name}/git-credentials`, and `PUT
   /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. A `DELETE
   /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
-  adds its message to `detail` and names no field. The other routes with a request body
-  do not collect problems yet: a check there can hide the checks after it.
+  adds its message to `detail` and names no field. `PATCH /repo` and the pull-upstream
+  routes check one body field each (`default_branch`, `ref`), so they name that field.
+  The other routes with a request body do not collect problems yet: a check there can
+  hide the checks after it. `POST /repos` decodes `upstream` and `base_repo` on their
+  own (see its body below), so a field of the wrong type inside one of them is named
+  alone, as above.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -279,12 +284,35 @@ the same scopes, query parameters and responses.
   `owner`, `upstream_host`, `forward_pushes`, and `auth.auth_type`, → 400.
 - `base_repo` (deprecated sync and fork form): `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
 - A sync create whose `owner`, `name` or `auth.token` holds a NUL byte → 400 `bad_request`
-  with `invalid_params` naming the field (`base_repo.owner`, `base_repo.name`,
+  with `invalid_params` naming each such field (`base_repo.owner`, `base_repo.name`,
   `base_repo.auth.token`, `upstream.owner`, `upstream.name`), and nothing is stored. The
   stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
   decodes to valid UTF-8 already.
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
   generic with `upstream_host`.
+- A body with several invalid fields, in any create form, gets an `invalid_params` item
+  for each, in the order `default_branch`, then the fields of `upstream` or `base_repo`
+  as listed above. The create decodes `upstream` and `base_repo` on their own, before it
+  checks any field other than `repo_name`. When that decode fails (a field of the wrong
+  type, an unknown field), the answer is that failure alone: it names the field of the
+  wrong type, and no other check of the body runs. A body that sets both members is decoded as neither.
+  A check that needs another field is skipped when that field is invalid. A missing or
+  unsupported `provider` skips the checks that need it: the rules that tie `access` to
+  the provider (only `github` takes it, and then it must be `public`) and the default
+  host. The value of `access` (`app` or `public`) and the shape of the host are still
+  checked. An invalid `base_repo.operation` is the only `base_repo` problem: the
+  operation decides which `base_repo` fields apply. One "are required" message names all
+  the empty fields of `upstream` (`provider`, `owner`, `name`) or of `base_repo`
+  (`owner`, `name`). The `default_branch` query parameter is no body field and names
+  none.
+- The checks of state answer after the checks of the body fields: the ref policy (403),
+  the egress check of the upstream host (it looks the host up), and for a copy or fork
+  the source token (403), the source repository (404) and the fork point (400). A
+  `default_branch` of the body that is the only invalid field answers after the ref
+  policy and before the egress check for a sync create, and after the fork point for a
+  copy or fork. When the host is denied as well, the `default_branch` answers first. The
+  query parameter `default_branch` answers after the egress check, so a denied host
+  answers first.
 - `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
   run after every won local push. It also inverts the sync conflict rule: local wins, and
   inbound syncs never force-rewind local refs. See [Upstream sync](#upstream-sync).

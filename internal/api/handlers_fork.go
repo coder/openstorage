@@ -153,27 +153,36 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 
+	// Every problem of the body that needs no state, in the order of the
+	// request body in the docs, so that the 400 names every invalid field
+	// (bodyErrors). The source token is verified below, so it is only
+	// checked to be present here.
+	topBranch, baseBranch := bodyBranchProblem(req, spec)
+	var errs bodyErrors
+	errs.add(topBranch)
 	// The copy form names its source repository (checked below) and
 	// carries none of the deprecated sync form's fields.
 	if spec.isCopy() && spec.Name == "" {
-		writeInvalidField(w, "base_repo.name", "is required for a copy", "base_repo.name is required for a copy")
-		return
+		errs.add(newFieldError("base_repo.name", "is required for a copy", "base_repo.name is required for a copy"))
 	}
 	if spec.isCopy() && (spec.Owner != "" || spec.UpstreamHost != "" || spec.ForwardPushes || (spec.Auth != nil && spec.Auth.AuthType != "")) {
-		writeErr(w, http.StatusBadRequest, copySyncFieldsMsg)
-		return
+		errs.add(errors.New(copySyncFieldsMsg))
 	}
-
 	// The fork-source JWT (docs/explanation/domain-model.md invariant 12) authorizes reading the
 	// source repo. Absent token: malformed request (400). A token that does
 	// not verify, is not repo-scoped, or lacks git:read: authorization
 	// failure on the source (403).
 	if spec.Auth == nil || spec.Auth.Token == "" {
 		if spec.isCopy() {
-			writeInvalidField(w, "base_repo.auth.token", "is required for a copy", "base_repo.auth.token is required for a copy")
-			return
+			errs.add(newFieldError("base_repo.auth.token", "is required for a copy", "base_repo.auth.token is required for a copy"))
+		} else {
+			errs.add(newFieldError("base_repo.auth.token", "is required", "base_repo.auth.token is required for provider "+strconv.Quote(spec.Provider)))
 		}
-		writeInvalidField(w, "base_repo.auth.token", "is required", "base_repo.auth.token is required for provider "+strconv.Quote(spec.Provider))
+	}
+	errs.add(baseBranch)
+	// The default branch is checked below, after the source: it answers
+	// here only next to another problem.
+	if writeBodyErrors(w, &errs, topBranch, baseBranch) {
 		return
 	}
 	// A repeat of a finished copy or fork answers 200 before any source
@@ -281,12 +290,8 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		// NAME — forkRef below re-qualifies it.
 		branch = strings.TrimPrefix(srcRepo.DefaultBranch, "refs/heads/")
 	}
-	if !validDefaultBranch(branch) {
-		if branchPath == "" { // the query parameter or the source: no body field
-			writeErr(w, http.StatusBadRequest, "invalid default_branch")
-		} else {
-			writeInvalidField(w, branchPath, "is not a valid branch name", "invalid default_branch")
-		}
+	if err := defaultBranchProblem(branch, branchPath); err != nil { // path "": the query parameter or the source, no body field
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	branch = strings.TrimPrefix(branch, "refs/heads/") // forkRef re-qualifies it

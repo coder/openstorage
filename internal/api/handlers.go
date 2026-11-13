@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -187,6 +188,48 @@ func validNewBranchName(name string) bool {
 func validDefaultBranch(branch string) bool {
 	short := strings.TrimPrefix(branch, "refs/heads/")
 	return !strings.HasPrefix(short, "refs/") && validNewBranchName(short)
+}
+
+// defaultBranchProblem returns the 400 problem of a default branch that is
+// not valid, or nil. It names the body field at path. The query parameter
+// and the source repository's branch (path "") have no body field to name.
+func defaultBranchProblem(branch, path string) error {
+	if validDefaultBranch(branch) {
+		return nil
+	}
+	if path == "" {
+		return errors.New("invalid default_branch")
+	}
+	return newFieldError(path, "is not a valid branch name", "invalid default_branch")
+}
+
+// bodyBranchProblem returns the problem of the default branch that the body
+// of a create names: top for its default_branch, or base for the
+// base_repo's, which a create uses only when the body has no default_branch
+// of its own. The query parameter is no body field and is not part of it.
+// At most one of the two is not nil.
+func bodyBranchProblem(req *createRepoRequest, spec *usyncBaseRepo) (top, base error) {
+	switch {
+	case req.DefaultBranch != "":
+		return defaultBranchProblem(req.DefaultBranch, "default_branch"), nil
+	case spec != nil && spec.DefaultBranch != "":
+		return nil, defaultBranchProblem(spec.DefaultBranch, "base_repo.default_branch")
+	}
+	return nil, nil
+}
+
+// writeBodyErrors writes the 400 for the problems of a create body (in the
+// order of the docs) and reports whether it did. A held problem that is the
+// only one is not reported here: the default branch check of a create runs
+// after checks of state (a ref policy, a source repository), and a request
+// with that one problem keeps the answer of the first of them.
+func writeBodyErrors(w http.ResponseWriter, errs *bodyErrors, held ...error) bool {
+	err := errs.err()
+	if err == nil || (len(errs.errs) == 1 && errs.dropped == 0 && slices.Contains(held, errs.errs[0])) {
+		return false
+	}
+	writeInvalid(w, err.Error(), err)
+	return true
 }
 
 type createRepoRequest struct {
