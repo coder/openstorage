@@ -22,7 +22,7 @@ Test lanes in depth: [testing reference](docs/reference/testing.md).
 | Docker | default test lane (Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/)) and the compose stack |
 | gpg / ssh-keygen | only `verify-sig` ref-policy tests and manual signature dogfooding |
 
-[`mise.toml`](mise.toml) pins Go, golangci-lint, and the AWS-reference Terraform.
+[`mise.toml`](mise.toml) pins Go, golangci-lint, the AWS-reference Terraform, and govulncheck.
 [mise](https://mise.jdx.dev/)'s `mise install` fetches CI's exact versions;
 installing them by hand also works.
 
