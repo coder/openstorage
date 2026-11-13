@@ -68,7 +68,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   problem. It never holds text of the JSON decoder, which names Go types. It states a
   field of the wrong JSON type as `name reason`, as upstream's example does
   (`default_branch must be a string`), and a body that is not valid JSON, or whose
-  top-level value has the wrong type, as `invalid JSON body`. A member that a decoder
+  top-level value has the wrong type, as `invalid JSON body` (`invalid JSON body: body
+  must be a JSON object` on the two strictly decoded routes). A member that a decoder
   refuses as unknown stays in `detail` without an `invalid_params` item, as in
   `invalid upstream: unknown field "branch"`. A frame of a `commit-pack` or `diff-commit`
   stream that has a field of the wrong type answers in the same way, in the `message` of

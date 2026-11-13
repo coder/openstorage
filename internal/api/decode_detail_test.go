@@ -124,6 +124,8 @@ func ddRoutes(fx ipdFixture) []ddRoute {
 			"force must be a boolean; base_ref must be a string", ipParam{"force", "must be a boolean"}, ipParam{"base_ref", "must be a string"}),
 		route("branch delete", http.MethodDelete, "/api/v1/repos/branches", fx.gitTok, `{"name":1}`, "name must be a string", str("name")...),
 		route("tag create", http.MethodPost, "/api/v1/repos/tags", fx.gitTok, `{"name":1,"ref":2}`, "name must be a string; ref must be a string", str("name", "ref")...),
+		route("tag delete", http.MethodDelete, "/api/v1/repos/tags", fx.gitTok, `{"name":1}`, "name must be a string", str("name")...),
+		route("credential delete", http.MethodDelete, "/api/v1/repos/git-credentials", fx.orgTok, `{"id":1}`, "id must be a string", str("id")...),
 		route("note add", http.MethodPost, "/api/v1/repos/notes", fx.gitTok, `{"note":1,"author":{"email":2}}`,
 			"note must be a string; author.email must be a string", str("note", "author.email")...),
 		route("note delete", http.MethodDelete, "/api/v1/repos/notes", fx.gitTok, `{"note":1}`, "note must be a string", str("note")...),

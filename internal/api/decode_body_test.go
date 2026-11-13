@@ -200,7 +200,7 @@ func TestDecodeError(t *testing.T) {
 		})
 	}
 	// Only the text of the unknown-field error counts: a look-alike does not.
-	for _, text := range []string{"json: unknown field x", `json: unknown field "x`, "unknown field \"x\""} {
+	for _, text := range []string{"json: unknown field x", `json: unknown field "x`, "unknown field \"x\"", "json: unknown field `x`", "json: unknown field 'x'"} {
 		if got := decodeError("", errors.New(text)).Error(); got != "invalid JSON body" {
 			t.Errorf("error %q: message = %q, want the generic one", text, got)
 		}

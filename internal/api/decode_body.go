@@ -122,7 +122,7 @@ func paramsText(params []invalidParam) string {
 // TestDecodeError), and it holds the member name only.
 func unknownFieldText(err error) string {
 	rest, ok := strings.CutPrefix(err.Error(), "json: unknown field ")
-	if !ok {
+	if !ok || !strings.HasPrefix(rest, `"`) {
 		return ""
 	}
 	if _, uerr := strconv.Unquote(rest); uerr != nil {
