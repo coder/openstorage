@@ -97,7 +97,7 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 			dec := json.NewDecoder(bytes.NewReader(req.BaseRepo))
 			dec.DisallowUnknownFields()
 			if err := dec.Decode(&usyncBaseRepo{}); err != nil {
-				fe := fieldErrorUnder("base_repo", "invalid base_repo: "+err.Error(), err)
+				fe := decodeError("base_repo", err)
 				writeInvalid(w, fe.Error(), fe)
 				return
 			}

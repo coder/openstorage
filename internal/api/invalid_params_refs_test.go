@@ -243,8 +243,12 @@ func TestBranchAndTagDecoderErrorHidesTheOtherProblems(t *testing.T) {
 					t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, body)
 				}
 				msg := requireEnvelope(t, resp, body)
-				if !strings.HasPrefix(msg, "invalid JSON body: ") || strings.Count(msg, "cannot unmarshal") != len(tc.want) {
-					t.Fatalf("error = %q, want the decoder's message about each of %v", msg, tc.want)
+				var names []string
+				for _, w := range tc.want {
+					names = append(names, w.Name+" "+w.Reason)
+				}
+				if want := strings.Join(names, "; "); msg != want {
+					t.Fatalf("error = %q, want %q", msg, want)
 				}
 				var p problemBody
 				if err := json.Unmarshal(body, &p); err != nil {

@@ -146,3 +146,69 @@ func TestUnmarshalBodyBounds(t *testing.T) {
 		}
 	}
 }
+
+// TestDecodeError: the message of a decode failure holds no text of
+// encoding/json, whatever the failure (issue #841). A field of the wrong
+// type is `name reason`, as in invalid_params, and a member that
+// DisallowUnknownFields refuses is named; the text of that error is fixed in
+// encoding/json, so this test also fails when a Go release changes it.
+func TestDecodeError(t *testing.T) {
+	type param = invalidParam
+	strictDecode := func(body []byte, dst any) error {
+		dec := json.NewDecoder(strings.NewReader(string(body)))
+		dec.DisallowUnknownFields()
+		return dec.Decode(dst)
+	}
+	for _, tc := range []struct {
+		name, member, body string
+		decode             func([]byte, any) error
+		want               string
+		wantParams         []param
+	}{
+		{name: "one field", body: `{"strategy":5}`, want: "strategy must be a string", wantParams: []param{{"strategy", "must be a string"}}},
+		{name: "a nested field", body: `{"author":{"name":1}}`, want: "author.name must be a string", wantParams: []param{{"author.name", "must be a string"}}},
+		{name: "an array element", body: `{"paths":["a",1]}`, want: "paths.1 must be a string", wantParams: []param{{"paths.1", "must be a string"}}},
+		{name: "several fields", body: `{"count":"x","flag":1}`, decode: unmarshalBody, want: "count must be an integer; flag must be a boolean",
+			wantParams: []param{{"count", "must be an integer"}, {"flag", "must be a boolean"}}},
+		{name: "a syntax error", body: `{"strategy":`, want: "invalid JSON body"},
+		{name: "trailing bytes", body: `{} x`, want: "invalid JSON body"},
+		{name: "a wrong top-level type", body: `[1]`, want: "invalid JSON body"},
+		{name: "an unknown field", body: `{"x":1}`, decode: strictDecode, want: `invalid JSON body: unknown field "x"`},
+		{name: "an unknown field with a name that needs quoting", body: `{"a\"b\n\u00e9\u0000":1}`, decode: strictDecode, want: `invalid JSON body: unknown field "a\"b\né\x00"`},
+		{name: "a wrong type before an unknown field", body: `{"strategy":5,"x":1}`, decode: strictDecode, want: "strategy must be a string", wantParams: []param{{"strategy", "must be a string"}}},
+		{name: "an unknown field before a wrong type", body: `{"x":1,"strategy":5}`, decode: strictDecode, want: `invalid JSON body: unknown field "x"`},
+		{name: "a member", member: "upstream", body: `{"strategy":5}`, want: "upstream.strategy must be a string", wantParams: []param{{"upstream.strategy", "must be a string"}}},
+		{name: "a member that is not an object", member: "base_repo", body: `"x"`, want: "base_repo must be an object", wantParams: []param{{"base_repo", "must be an object"}}},
+		{name: "a member with an unknown field", member: "base_repo", body: `{"reff":1}`, decode: strictDecode, want: `invalid base_repo: unknown field "reff"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decode := tc.decode
+			if decode == nil {
+				decode = func(b []byte, dst any) error { return json.Unmarshal(b, dst) }
+			}
+			err := decode([]byte(tc.body), new(decodeBodyReq))
+			if err == nil {
+				t.Fatal("the body decodes")
+			}
+			got := decodeError(tc.member, err)
+			if got.Error() != tc.want {
+				t.Fatalf("message = %q, want %q (decoder: %q)", got, tc.want, err)
+			}
+			if params := invalidParamsFor(got); fmt.Sprint(params) != fmt.Sprint(tc.wantParams) {
+				t.Fatalf("invalid_params = %+v, want %+v", params, tc.wantParams)
+			}
+		})
+	}
+	// Only the text of the unknown-field error counts: a look-alike does not.
+	for _, text := range []string{"json: unknown field x", `json: unknown field "x`, "unknown field \"x\"", "json: unknown field `x`", "json: unknown field 'x'"} {
+		if got := decodeError("", errors.New(text)).Error(); got != "invalid JSON body" {
+			t.Errorf("error %q: message = %q, want the generic one", text, got)
+		}
+	}
+	if got := frameMsg(json.Unmarshal([]byte(`{"strategy":5}`), new(decodeBodyReq))); got != "malformed NDJSON frame: strategy must be a string" {
+		t.Errorf("frame with a wrong type: %q", got)
+	}
+	if got := frameMsg(json.Unmarshal([]byte(`{`), new(decodeBodyReq))); got != "malformed NDJSON frame" {
+		t.Errorf("frame with a syntax error: %q", got)
+	}
+}

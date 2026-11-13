@@ -228,7 +228,7 @@ func parseUpstreamConfig(raw json.RawMessage) (cfg upstreamConfig, err error) {
 	// a branch) would silently change what the link syncs.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
-		return upstreamConfig{}, fieldErrorUnder("upstream", "invalid upstream: "+err.Error(), err)
+		return upstreamConfig{}, decodeError("upstream", err)
 	}
 	return cfg, nil
 }
@@ -341,7 +341,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	var req createRepoRequest
 	if len(body) > 0 {
 		if err := unmarshalBody(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -372,7 +372,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	case jsonPresent(req.BaseRepo):
 		spec = &usyncBaseRepo{}
 		if err := unmarshalBody(req.BaseRepo, spec); err != nil {
-			fe := fieldErrorUnder("base_repo", "invalid base_repo: "+err.Error(), err)
+			fe := decodeError("base_repo", err)
 			writeInvalid(w, fe.Error(), fe)
 			return
 		}
@@ -776,7 +776,7 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 			decode = strictJSON
 		}
 		if err := decode(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -899,7 +899,7 @@ func (s *syncServer) handlePushUpstream(w http.ResponseWriter, r *http.Request) 
 	}
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
