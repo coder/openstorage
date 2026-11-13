@@ -160,6 +160,12 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 			if msg := requireEnvelope(t, resp, body); msg != `ref policy op "no-push" denies sync repository create` {
 				t.Fatalf("error = %q", msg)
 			}
+			// The same for the default branch of base_repo.
+			resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos", policed,
+				[]byte(`{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":"upstream.invalid","default_branch":"bad..name"}}`), "")
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("base_repo status = %d, want 403 (body %s)", resp.StatusCode, body)
+			}
 			ipRun(t, e, []ipCase{{
 				name: "a field next to the default branch answers before it", method: http.MethodPost, path: "/api/v1/repos", token: policed,
 				body:      `{"default_branch":"bad..name","upstream":{"provider":"gitea","owner":"","name":"n","host":"upstream.invalid"}}`,
@@ -217,6 +223,41 @@ func TestForkNamesEveryInvalidField(t *testing.T) {
 			if msg := requireEnvelope(t, resp, body); msg != "base_repo.auth.token: invalid token" {
 				t.Fatalf("error = %q", msg)
 			}
+			// The same for the default branch of base_repo.
+			resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos", tok,
+				[]byte(`{"base_repo":{"provider":"code","operation":"fork","default_branch":"bad..name","auth":{"token":"not-a-token"}}}`), "")
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("base_repo status = %d, want 403 (body %s)", resp.StatusCode, body)
+			}
+		})
+	})
+}
+
+// TestForkDefaultBranchAnswersAfterTheSource: with a source that exists, a
+// default branch that is the only invalid field still answers after the
+// source's fork point, as before (the fork point is state).
+func TestForkDefaultBranchAnswersAfterTheSource(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		src := wrefSeedFixture(t, e)
+		srcTok := e.mint(t, tokenSpec{iss: src.org, repo: src.url, scopes: []string{auth.ScopeGitRead}})
+		tok := e.mint(t, tokenSpec{iss: e.newOrg(t), repo: "ipc-src-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
+		copyOf := func(extra string) string {
+			return `{"name":"` + src.url + `","auth":{"token":"` + srcTok + `"}` + extra + `}`
+		}
+		post := func(name, path, body, wantError string, want ...ipParam) ipCase {
+			return ipCase{name: name, method: http.MethodPost, path: path, token: tok, body: body, wantError: wantError, want: want}
+		}
+		ipRun(t, e, []ipCase{
+			post("body default branch", "/api/v1/repos", `{"default_branch":"bad..name","base_repo":`+copyOf("")+`}`,
+				"invalid default_branch", ipcBranchItem),
+			post("base_repo default branch", "/api/v1/repos", `{"base_repo":`+copyOf(`,"default_branch":"bad..name"`)+`}`,
+				"invalid default_branch", ipParam{"base_repo.default_branch", "is not a valid branch name"}),
+			post("query default branch", "/api/v1/repos?default_branch=bad..name", `{"base_repo":`+copyOf("")+`}`, "invalid default_branch"),
+			post("fork point answers first", "/api/v1/repos", `{"default_branch":"bad..name","base_repo":`+copyOf(`,"ref":"no-such-ref"`)+`}`,
+				`base_repo fork point "no-such-ref" not found in source repository`),
+			post("a field next to the default branch answers before the source", "/api/v1/repos",
+				`{"default_branch":"bad..name","base_repo":`+copyOf(`,"owner":"o"`)+`}`,
+				"invalid default_branch; "+copySyncFieldsMsg, ipcBranchItem),
 		})
 	})
 }
