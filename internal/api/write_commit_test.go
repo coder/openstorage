@@ -836,6 +836,85 @@ func TestCommitPackValidation(t *testing.T) {
 	})
 }
 
+// TestCommitWriteRefusesANULInTextFields: git takes the commit message as an
+// argument and each ident as an environment value, and neither can hold a
+// NUL. A request with a NUL in one of them passed the validation and
+// answered 500 when git ran, after the files or the patch were applied.
+// Each route that writes a commit answers 400 and moves no ref.
+func TestCommitWriteRefusesANULInTextFields(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+
+		commitFile := func(msg, path, expected string) wcEnvelope {
+			t.Helper()
+			extra := map[string]any{}
+			if expected != "" {
+				extra["expected_head_sha"] = expected
+			}
+			frames := wctLines(t,
+				wctMeta("main", msg, []map[string]any{{"path": path, "content_id": "id-" + path, "operation": "upsert"}}, extra),
+				wctChunk("id-"+path, []byte(path+"\n"), true))
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(frames))
+			return wctRequireOK(t, resp, body)
+		}
+		c1 := commitFile("c1", "f1.txt", "")
+		c2 := commitFile("c2", "f2.txt", c1.Commit.CommitSHA)
+		const patch = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+x\n"
+
+		// metadata builds the metadata object of a request.
+		metadata := func(message string, extra map[string]any) map[string]any {
+			return wctMeta("main", message, nil, extra)["metadata"].(map[string]any)
+		}
+		routes := []struct {
+			name string
+			body func(md map[string]any) []byte
+		}{
+			{"commit-pack", func(md map[string]any) []byte {
+				md["files"] = []map[string]any{{"path": "new.txt", "content_id": "id1", "operation": "upsert"}}
+				return wctLines(t, map[string]any{"metadata": md}, wctChunk("id1", []byte("x\n"), true))
+			}},
+			{"diff-commit", func(md map[string]any) []byte {
+				return wctLines(t, map[string]any{"metadata": md}, wctDiffChunk([]byte(patch), true))
+			}},
+			{"restore-commit", func(md map[string]any) []byte {
+				md["target_commit_sha"] = c1.Commit.CommitSHA
+				raw, err := json.Marshal(map[string]any{"metadata": md})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return raw
+			}},
+		}
+		ident := func(name, email string) map[string]any { return map[string]any{"name": name, "email": email} }
+		fields := []struct {
+			name, message string
+			extra         map[string]any
+		}{
+			{"commit_message", "m\x00x", nil},
+			{"author.name", "m", map[string]any{"author": ident("a\x00b", "a@x.invalid")}},
+			{"author.email", "m", map[string]any{"author": ident("a", "a\x00@x.invalid")}},
+			{"committer.name", "m", map[string]any{"committer": ident("c\x00", "c@x.invalid")}},
+			{"committer.email", "m", map[string]any{"committer": ident("c", "c@x.invalid\x00")}},
+		}
+		for _, rt := range routes {
+			for _, f := range fields {
+				t.Run(rt.name+"/"+f.name, func(t *testing.T) {
+					body := rt.body(metadata(f.message, f.extra))
+					resp, respBody := wctPost(t, srv, "/api/v1/repos/"+rt.name, writeTok, bytes.NewReader(body))
+					wctRequireFail(t, resp, respBody, http.StatusBadRequest, "invalid")
+					if want := invalidTextMsg(f.name); !bytes.Contains(respBody, []byte(want)) {
+						t.Errorf("body %s does not say %q", respBody, want)
+					}
+					if tip := wctBranchTip(t, e, readTok, "main", false); tip != c2.Commit.CommitSHA {
+						t.Errorf("tip = %q after a refused request, want %q", tip, c2.Commit.CommitSHA)
+					}
+				})
+			}
+		}
+	})
+}
+
 // TestCommitPackTotalSizeLimit (#597, spec 2026-10-28): commit-pack answers
 // 413 payload_too_large once the decoded file contents of one commit pass
 // 262144000 bytes, summed over every chunk of every file, and moves no ref.

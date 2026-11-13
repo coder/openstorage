@@ -98,6 +98,19 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 				name: "POST one: author", method: http.MethodPost, path: post, token: fx.gitTok,
 				body: `{` + ipNoteReq + `,"author":{"name":"n"}}`, wantError: authorMsg, want: []ipParam{required("author.email")},
 			},
+			// git takes each ident as an environment value, which cannot hold a NUL.
+			{
+				name: "POST a NUL in the author name and email", method: http.MethodPost, path: post, token: fx.gitTok,
+				body:      `{` + ipNoteReq + `,"author":{"name":"a\u0000","email":"e\u0000"}}`,
+				wantError: invalidTextMsg("author.name") + "; " + invalidTextMsg("author.email"),
+				want:      []ipParam{{"author.name", ipcNulReason}, {"author.email", ipcNulReason}},
+			},
+			{
+				name: "POST one: a NUL in the author email", method: http.MethodPost, path: post, token: fx.gitTok,
+				body:      `{` + ipNoteReq + `,"author":{"name":"n","email":"e\u0000"}}`,
+				wantError: invalidTextMsg("author.email"),
+				want:      []ipParam{{"author.email", ipcNulReason}},
+			},
 
 			{
 				name: "POST an uppercase guard is not a problem", method: http.MethodPost, path: post, token: fx.gitTok,

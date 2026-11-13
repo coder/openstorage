@@ -259,6 +259,18 @@ func invalidTextFields(fields ...[2]string) error {
 	return nil
 }
 
+// invalidTextEach returns a fieldError for each field (dotted wire path ->
+// value) whose value is not meta.ValidText, in the order given.
+func invalidTextEach(fields ...[2]string) []error {
+	var problems []error
+	for _, f := range fields {
+		if err := invalidTextFields(f); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return problems
+}
+
 // writeInvalidText writes the 400 for the first field that is not
 // meta.ValidText and reports whether it did.
 func writeInvalidText(w http.ResponseWriter, fields ...[2]string) bool {

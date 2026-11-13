@@ -656,6 +656,14 @@ space after their trailing whitespace is removed, and an empty message gives `""
 continuation line keeps its leading whitespace, so `"subj\n  next"` gives `subj   next`.
 Before that spec, both carried the full message.
 
+A NUL byte in a `commit_message`, or in the `name` or `email` of an `author` or `committer`,
+answers 400 on `commit-pack`, `diff-commit`, `restore-commit` and `POST /repos/merge`. A NUL
+in the `author` of `POST /repos/notes` answers 400 too. git takes a message as an argument
+and an ident as an environment value, and neither can hold a NUL. `merge` and `notes` name
+each such field in `invalid_params`. The other three answer the result envelope with
+`status` `invalid`, as for the other invalid metadata. See [wire
+compatibility](../explanation/wire-compatibility.md).
+
 #### Commit write guards
 
 `commit-pack`, `diff-commit` and `restore-commit` take `expected_target_sha` (deprecated

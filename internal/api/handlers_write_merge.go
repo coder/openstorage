@@ -592,6 +592,8 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	if req.Squash && req.CommitMessage == "" {
 		errs.add(newFieldError("commit_message", "is required with squash", "commit_message is required with squash"))
 	}
+	// git takes the message as an argument, which cannot hold a NUL.
+	errs.add(invalidTextFields([2]string{"commit_message", req.CommitMessage}))
 	if req.Author != nil {
 		for _, err := range wcAuthorProblems("author", *req.Author) {
 			errs.add(err)
