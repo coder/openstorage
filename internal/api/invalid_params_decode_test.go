@@ -238,59 +238,79 @@ func (f ipdFamily) wrapBody(object string) string {
 	return `{"` + f.wrap + `":` + object + `}`
 }
 
-// TestDecodeNamesEveryWrongTypeField generates bodies for each route family
-// and compares the answer with an oracle that does not use unmarshalBody:
-// for each wrong-type field in body order, the message that encoding/json
-// gives for a body with that field alone (the answer of the route before
-// this change), joined by "; ". A body with one wrong-type field must
+// ipdCase is a generated body and the answer that the oracle expects.
+type ipdCase struct {
+	body, msg string
+	want      []ipParam
+}
+
+// ipdCases generates each bodies with one wrong-type field and each with
+// several for family f. The oracle names each wrong-type field in body
+// order, and its message is the message that encoding/json gives for a
+// body with that field alone (the answer of the route before this change),
+// joined by "; ". It does not use unmarshalBody.
+func ipdCases(t *testing.T, f ipdFamily, each int) (one, many []ipdCase) {
+	t.Helper()
+	rng := rand.New(rand.NewPCG(1, uint64(len(f.name))))
+	all := func(string) bool { return true }
+	for try := 0; (len(one) < each || len(many) < each) && try < 20*each; try++ {
+		root, p := ipdMember{open: '{'}, []float64{0.1, 0.3, 0.6}[rng.IntN(3)]
+		for _, i := range rng.Perm(len(f.schema))[:1+rng.IntN(len(f.schema))] {
+			root.kids = append(root.kids, ipdGen(rng, f.schema[i], f.schema[i].name, p))
+		}
+		fails := root.fails("")
+		if len(fails) == 0 || (len(fails) == 1 && len(one) == each) || (len(fails) > 1 && len(many) == each) {
+			continue
+		}
+		var msgs []string
+		c := ipdCase{body: f.wrapBody(root.render("", all))}
+		for _, fail := range fails {
+			alone := root.render("", func(path string) bool { return path == fail.path })
+			err := json.Unmarshal([]byte(alone), f.newReq())
+			if te, ok := errors.AsType[*json.UnmarshalTypeError](err); !ok || te.Field != fail.path {
+				t.Fatalf("generator: %s alone gives %v, want a type error at %s", alone, err, fail.path)
+			}
+			msgs = append(msgs, err.Error())
+			c.want = append(c.want, ipParam{ipdJoin(f.wrap, fail.path), fail.reason})
+		}
+		c.msg = f.msgPrefix + strings.Join(msgs, "; ")
+		if len(fails) == 1 {
+			one = append(one, c)
+		} else {
+			many = append(many, c)
+		}
+	}
+	if len(one) < each || len(many) < each {
+		t.Fatalf("generated %d bodies with one and %d with several wrong-type fields, want %d of each", len(one), len(many), each)
+	}
+	return one, many
+}
+
+// TestDecodeNamesEveryWrongTypeField compares the answer for generated
+// bodies with the oracle of ipdCases. A body with one wrong-type field must
 // answer as it did before, and a body with several must name each of them.
 func TestDecodeNamesEveryWrongTypeField(t *testing.T) {
-	const each = 1000 // bodies with one, and bodies with several, wrong-type fields
+	const each = 1000
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := ipdNewFixture(t, e)
 		for _, f := range ipdFamilies(fx) {
 			t.Run(f.name, func(t *testing.T) {
-				rng := rand.New(rand.NewPCG(1, uint64(len(f.name))))
-				var one, many int
-				wrong := map[bool]int{}
-				all := func(string) bool { return true }
-				for try := 0; (one < each || many < each) && try < 20*each; try++ {
-					root, p := ipdMember{open: '{'}, []float64{0.1, 0.3, 0.6}[rng.IntN(3)]
-					for _, i := range rng.Perm(len(f.schema))[:1+rng.IntN(len(f.schema))] {
-						root.kids = append(root.kids, ipdGen(rng, f.schema[i], f.schema[i].name, p))
+				one, many := ipdCases(t, f, each)
+				for _, group := range []struct {
+					name  string
+					cases []ipdCase
+				}{{"one wrong-type field", one}, {"several wrong-type fields", many}} {
+					for i, chunk := range slices.Collect(slices.Chunk(group.cases, 250)) {
+						t.Run(group.name+" "+strconv.Itoa(i), func(t *testing.T) {
+							t.Parallel()
+							for _, c := range chunk {
+								a := ipdAsk(t, e, f, c.body)
+								if a.status != http.StatusBadRequest || a.msg != c.msg || !slices.Equal(a.params, c.want) || strings.Contains(string(a.raw), ipdSecret) {
+									t.Fatalf("body %s\n answer %d %q %+v\n want   400 %q %+v", c.body, a.status, a.msg, a.params, c.msg, c.want)
+								}
+							}
+						})
 					}
-					fails := root.fails("")
-					if len(fails) == 0 || (len(fails) == 1 && one == each) || (len(fails) > 1 && many == each) {
-						continue
-					}
-					var msgs []string
-					var want []ipParam
-					for _, fail := range fails {
-						alone := root.render("", func(path string) bool { return path == fail.path })
-						err := json.Unmarshal([]byte(alone), f.newReq())
-						if te, ok := errors.AsType[*json.UnmarshalTypeError](err); !ok || te.Field != fail.path {
-							t.Fatalf("generator: %s alone gives %v, want a type error at %s", alone, err, fail.path)
-						}
-						msgs = append(msgs, err.Error())
-						want = append(want, ipParam{ipdJoin(f.wrap, fail.path), fail.reason})
-					}
-					if len(fails) == 1 {
-						one++
-					} else {
-						many++
-					}
-					body := f.wrapBody(root.render("", all))
-					a := ipdAsk(t, e, f, body)
-					if wantMsg := f.msgPrefix + strings.Join(msgs, "; "); a.status != http.StatusBadRequest || a.msg != wantMsg ||
-						!slices.Equal(a.params, want) || strings.Contains(string(a.raw), ipdSecret) {
-						if wrong[len(fails) > 1]++; wrong[len(fails) > 1] <= 2 {
-							t.Errorf("%d wrong-type fields, body %s\n answer %d %q %+v\n want   400 %q %+v", len(fails), body, a.status, a.msg, a.params, wantMsg, want)
-						}
-					}
-				}
-				t.Logf("differ from the oracle: %d of %d bodies with one wrong-type field, %d of %d with several", wrong[false], one, wrong[true], many)
-				if one < each || many < each {
-					t.Fatalf("generated %d bodies with one and %d with several wrong-type fields, want %d of each", one, many, each)
 				}
 			})
 		}
