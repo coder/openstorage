@@ -196,8 +196,8 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	// Peek at the UNVERIFIED iss claim solely to select the org's keys;
 	// nothing else is trusted until the signature verifies. The signature
 	// cannot be checked first: no key is known until iss names the org, and
-	// a token that another registered org signed must stay an answer that
-	// differs from a bad signature (403 against 401). The error carries no
+	// a token that another registered org signed must keep its own answer,
+	// which differs from the answer to a bad signature. The error carries no
 	// log line: the client chose these bytes.
 	var unverified struct {
 		Iss string `json:"iss"`
