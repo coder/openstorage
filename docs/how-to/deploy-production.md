@@ -38,7 +38,10 @@ package fixes:
 
 - `apk add --no-cache` resolves packages from the Alpine v3.24 repositories at build
   time, so an uncached rebuild re-resolves them. It does not upgrade every package
-  inherited from the base.
+  inherited from the base. The Dockerfile upgrades one of them, `zlib`, by name
+  (`apk upgrade --no-cache zlib`), because the pinned base holds a version that
+  Alpine's security database lists as vulnerable. That line goes away once the
+  pinned base ships the fixed version.
 - Base-image and package upgrades still need qualification.
 
 Alpine v3.24 upstream support ([release inventory](https://alpinelinux.org/releases.json),
