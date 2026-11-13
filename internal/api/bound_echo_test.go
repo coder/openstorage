@@ -9,8 +9,8 @@ import (
 )
 
 func TestBoundEcho(t *testing.T) {
-	if maxEchoBytes != 2048 {
-		t.Fatalf("maxEchoBytes = %d, the docs say 2048", maxEchoBytes)
+	if maxEchoBytes != 16384 {
+		t.Fatalf("maxEchoBytes = %d, the docs say 16384", maxEchoBytes)
 	}
 	exact := strings.Repeat("a", maxEchoBytes)
 	if got := boundEcho(exact); got != exact {
@@ -25,8 +25,8 @@ func TestBoundEcho(t *testing.T) {
 	if !utf8.ValidString(got) || got != strings.Repeat("é", maxEchoBytes/2)+"…" {
 		t.Fatalf("rune cut: %d bytes, valid %v", len(got), utf8.ValidString(got))
 	}
-	// Three-byte runes: 2048 is not a multiple of 3.
-	three := strings.Repeat("€", 1000)
+	// Three-byte runes: 16384 is not a multiple of 3.
+	three := strings.Repeat("€", maxEchoBytes/3+10)
 	got = boundEcho(three)
 	if !utf8.ValidString(got) || len(got) > maxEchoBytes+len("…") || !strings.HasSuffix(got, "…") {
 		t.Fatalf("three-byte runes: %d bytes, valid %v", len(got), utf8.ValidString(got))
@@ -55,9 +55,9 @@ func TestLongValuesAreCutInAnswers(t *testing.T) {
 					t.Fatalf("status = %d, want %d (body %.200s)", resp.StatusCode, tc.status, body)
 				}
 				requireEnvelope(t, resp, body)
-				// error, detail and the name: three cuts of at most 2 KiB, each
+				// error, detail and the name: three cuts of at most 16 KiB, each
 				// with up to six bytes for every escaped `<`.
-				if len(body) > 40_000 {
+				if len(body) > 320_000 {
 					t.Fatalf("the answer has %d bytes for a 900,000-byte value", len(body))
 				}
 				if !strings.Contains(string(body), "…") {
