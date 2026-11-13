@@ -21,6 +21,7 @@ import (
 
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 	"github.com/coder/openstorage/internal/ref/s3wal"
 	"github.com/coder/openstorage/internal/testutil/testimages"
@@ -61,6 +62,7 @@ func repairGit(t *testing.T, dir, stdin string, args ...string) string {
 // repairFixture is one repository in a ref store: a commit, its pack in a
 // file blob store, and the refs that a test plants.
 type repairFixture struct {
+	repo   string
 	rs     ref.RefStore
 	blobs  blob.BlobStore
 	commit string
@@ -68,6 +70,39 @@ type repairFixture struct {
 }
 
 func newRepairFixture(t *testing.T, rs ref.Store) *repairFixture {
+	t.Helper()
+	return newRepairFixtureFor(t, rs, repairRepo)
+}
+
+// createMetaRepo makes a repository row in the metadata store at dbURL, as
+// the API does, and returns its server-generated ID.
+func createMetaRepo(t *testing.T, dbURL, defaultBranch string) string {
+	t.Helper()
+	ctx := t.Context()
+	ms, err := meta.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("open meta store: %v", err)
+	}
+	defer ms.Close()
+	if err := ms.InitSchema(ctx); err != nil {
+		t.Fatalf("meta InitSchema: %v", err)
+	}
+	if _, err := ms.UpsertOrgWithKeys(ctx, "repair-org", []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {
+		t.Fatalf("seed org: %v", err)
+	}
+	repo, err := ms.CreateRepo(ctx, "repair-org", "https://example.com/repair.git", defaultBranch)
+	if err != nil {
+		t.Fatalf("CreateRepo: %v", err)
+	}
+	return repo.RepoID
+}
+
+// target is the repository as repairRefs takes it, with default branch main.
+func (f *repairFixture) target() repairTarget {
+	return repairTarget{repoID: f.repo, defaultBranch: "main"}
+}
+
+func newRepairFixtureFor(t *testing.T, rs ref.Store, repo string) *repairFixture {
 	t.Helper()
 	ctx := t.Context()
 	t.Cleanup(rs.Close)
@@ -94,7 +129,7 @@ func newRepairFixture(t *testing.T, rs ref.Store) *repairFixture {
 	objs := strings.Join([]string{blobSHA, treeSHA, commit, other}, "\n") + "\n"
 	id := repairGit(t, scratch, objs, "pack-objects", "--threads=1", "-q", filepath.Join(packDir, "p"))
 	packPath := filepath.Join(packDir, "p-"+id+".pack")
-	key := blob.PackKey(repairRepo, id)
+	key := blob.PackKey(repo, id)
 	if err := bl.UploadFile(ctx, key, packPath); err != nil {
 		t.Fatal(err)
 	}
@@ -102,10 +137,10 @@ func newRepairFixture(t *testing.T, rs ref.Store) *repairFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rs.RegisterPacks(ctx, repairRepo, []ref.Pack{{ID: id, Key: key, Size: fi.Size()}}); err != nil {
+	if err := rs.RegisterPacks(ctx, repo, []ref.Pack{{ID: id, Key: key, Size: fi.Size()}}); err != nil {
 		t.Fatalf("RegisterPacks: %v", err)
 	}
-	return &repairFixture{rs: rs, blobs: bl, commit: commit, other: other}
+	return &repairFixture{repo: repo, rs: rs, blobs: bl, commit: commit, other: other}
 }
 
 // plant writes refs into the store the way an old API node did: the raw
@@ -113,7 +148,7 @@ func newRepairFixture(t *testing.T, rs ref.Store) *repairFixture {
 func (f *repairFixture) plant(t *testing.T, refs map[string]string) {
 	t.Helper()
 	for name, sha := range refs {
-		won, err := f.rs.CASRef(t.Context(), repairRepo, name, ref.ZeroSHA, sha)
+		won, err := f.rs.CASRef(t.Context(), f.repo, name, ref.ZeroSHA, sha)
 		if err != nil || !won {
 			t.Fatalf("plant %.40s: won=%v err=%v", name, won, err)
 		}
@@ -124,13 +159,13 @@ func (f *repairFixture) plant(t *testing.T, refs map[string]string) {
 // models another replica, and reuse models the same replica.
 func (f *repairFixture) hydrateInto(t *testing.T, cacheDir string) (repoPath string, hydrateErr error) {
 	t.Helper()
-	repoPath, refsErr, err := githttp.Hydrate(t.Context(), f.rs, f.blobs, cacheDir, repairRepo, "main")
+	repoPath, refsErr, err := githttp.Hydrate(t.Context(), f.rs, f.blobs, cacheDir, f.repo, "main")
 	return repoPath, errors.Join(refsErr, err)
 }
 
 func (f *repairFixture) refs(t *testing.T) map[string]string {
 	t.Helper()
-	got, err := f.rs.ListRefs(t.Context(), repairRepo)
+	got, err := f.rs.ListRefs(t.Context(), f.repo)
 	if err != nil {
 		t.Fatalf("ListRefs: %v", err)
 	}
@@ -211,7 +246,11 @@ func TestRepairRefs(t *testing.T) {
 	for _, b := range repairBackends() {
 		t.Run(b.name, func(t *testing.T) {
 			rs, dbURL := b.open(t)
-			testRepairRefs(t, newRepairFixture(t, rs), dbURL)
+			repo := repairRepo
+			if dbURL != "" {
+				repo = createMetaRepo(t, dbURL, "main")
+			}
+			testRepairRefs(t, newRepairFixtureFor(t, rs, repo), dbURL)
 		})
 	}
 }
@@ -233,7 +272,7 @@ func testRepairRefs(t *testing.T, f *repairFixture, dbURL string) {
 
 	// The dry run lists only that ref and changes nothing.
 	var out bytes.Buffer
-	if err := repairRefs(ctx, f.rs, repairRepo, false, &out); err != nil {
+	if err := repairRefs(ctx, f.rs, f.target(), false, &out); err != nil {
 		t.Fatalf("dry run: %v", err)
 	}
 	if !strings.Contains(out.String(), f.commit+" "+repairLongRef+"\n") ||
@@ -249,7 +288,7 @@ func testRepairRefs(t *testing.T, f *repairFixture, dbURL string) {
 	// is reported, kept, and not retried.
 	out.Reset()
 	moving := &movingStore{RefStore: f.rs, t: t, name: repairLongRef, from: f.commit, to: f.other}
-	err := repairRefs(ctx, moving, repairRepo, true, &out)
+	err := repairRefs(ctx, moving, f.target(), true, &out)
 	if err == nil || !strings.Contains(err.Error(), "changed since they were listed") ||
 		!strings.Contains(out.String(), "lost CAS") || !strings.Contains(out.String(), "deleted 0 of 1 refs") {
 		t.Fatalf("lost CAS = %v\n%s", err, out.String())
@@ -260,7 +299,7 @@ func testRepairRefs(t *testing.T, f *repairFixture, dbURL string) {
 
 	// --yes deletes only the ref that git cannot lock.
 	out.Reset()
-	if err := repairRefs(ctx, f.rs, repairRepo, true, &out); err != nil {
+	if err := repairRefs(ctx, f.rs, f.target(), true, &out); err != nil {
 		t.Fatalf("--yes: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "deleted: "+repairLongRef+"\n") || !strings.Contains(out.String(), "deleted 1 of 1 refs") {
@@ -289,7 +328,7 @@ func testRepairRefs(t *testing.T, f *repairFixture, dbURL string) {
 
 	// A second run finds nothing.
 	out.Reset()
-	if err := repairRefs(ctx, f.rs, repairRepo, true, &out); err != nil || !strings.Contains(out.String(), "no ref that git can never lock") {
+	if err := repairRefs(ctx, f.rs, f.target(), true, &out); err != nil || !strings.Contains(out.String(), "no ref that git can never lock") {
 		t.Fatalf("second run = %v\n%s", err, out.String())
 	}
 
@@ -299,14 +338,14 @@ func testRepairRefs(t *testing.T, f *repairFixture, dbURL string) {
 	f.plant(t, map[string]string{repairLongRef: f.commit, secondLong: f.commit})
 	out.Reset()
 	moving = &movingStore{RefStore: f.rs, t: t, name: repairLongRef, from: f.commit, to: f.other}
-	err = repairRefs(ctx, moving, repairRepo, true, &out)
+	err = repairRefs(ctx, moving, f.target(), true, &out)
 	if err == nil || !strings.Contains(out.String(), "deleted 1 of 2 refs") || !strings.Contains(out.String(), "deleted: "+secondLong+"\n") {
 		t.Fatalf("lost CAS with two refs = %v\n%s", err, out.String())
 	}
 	if got := f.refs(t); got[repairLongRef] != f.other || got[secondLong] != "" || len(got) != len(want)+1 {
 		t.Fatalf("refs after a lost CAS with two refs = %v", got)
 	}
-	if err := repairRefs(ctx, f.rs, repairRepo, true, &out); err != nil {
+	if err := repairRefs(ctx, f.rs, f.target(), true, &out); err != nil {
 		t.Fatalf("clean up: %v", err)
 	}
 	if got := f.refs(t); !mapsEqual(got, want) {
@@ -319,15 +358,18 @@ func testRepairRefs(t *testing.T, f *repairFixture, dbURL string) {
 		return
 	}
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+	if err := cmdRepairRefs(ctx, []string{"--yes", "repo_000000000000"}); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("command with an ID that has no repository = %v, want not found", err)
+	}
 	f.plant(t, map[string]string{repairLongRef: f.commit})
 	want[repairLongRef] = f.commit
-	if err := cmdRepairRefs(ctx, []string{repairRepo}); err != nil {
+	if err := cmdRepairRefs(ctx, []string{f.repo}); err != nil {
 		t.Fatalf("command dry run: %v", err)
 	}
 	if got := f.refs(t); !mapsEqual(got, want) {
 		t.Fatalf("command dry run changed the refs: %v", got)
 	}
-	if err := cmdRepairRefs(ctx, []string{"--yes", repairRepo}); err != nil {
+	if err := cmdRepairRefs(ctx, []string{"--yes", f.repo}); err != nil {
 		t.Fatalf("command --yes: %v", err)
 	}
 	delete(want, repairLongRef)
@@ -363,7 +405,7 @@ func TestScanUnlockableRefsPages(t *testing.T) {
 		"refs/tags/t": f.commit, longLast: f.commit, "refs/m2/" + strings.Repeat("m", 255) + "/x": f.commit,
 	})
 	for _, page := range []int{1, 2, 3, 7, 8, 100} {
-		found, scanned, err := scanUnlockableRefs(t.Context(), rs, repairRepo, page)
+		found, scanned, err := scanUnlockableRefs(t.Context(), rs, f.repo, page)
 		if err != nil || scanned != 7 || len(found) != 3 || found[0].name != longMiddle || found[1].name != repairLongRef || found[2].name != longLast {
 			t.Errorf("page %d: found %d, scanned %d, err %v", page, len(found), scanned, err)
 		}
@@ -379,7 +421,7 @@ func TestRepairRefsRefusesLockableRef(t *testing.T) {
 	f := newRepairFixture(t, rs)
 	f.plant(t, map[string]string{"refs/heads/main": f.commit, repairOKRef: f.commit})
 	for _, name := range []string{"refs/heads/main", repairOKRef} {
-		won, err := deleteUnlockableRef(t.Context(), rs, repairRepo, repairRef{name: name, sha: f.commit})
+		won, err := deleteUnlockableRef(t.Context(), rs, f.repo, repairRef{name: name, sha: f.commit})
 		if won || err == nil || !strings.Contains(err.Error(), "refusing") {
 			t.Errorf("delete %.40s: won=%v err=%v, want a refusal", name, won, err)
 		}
@@ -389,8 +431,8 @@ func TestRepairRefsRefusesLockableRef(t *testing.T) {
 	}
 }
 
-// An ID that matches no refs (a typo, or the colon that follows the ID in
-// the serve log) is not reported as a clean repository.
+// A repository that has no refs in this ref store (a database URL that is
+// not the one serve uses) is not reported as a clean repository.
 func TestRepairRefsWarnsWhenNoRefsMatchTheID(t *testing.T) {
 	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
 	if err != nil {
@@ -400,10 +442,10 @@ func TestRepairRefsWarnsWhenNoRefsMatchTheID(t *testing.T) {
 	f.plant(t, map[string]string{"refs/heads/main": f.commit, repairLongRef: f.commit})
 	for _, yes := range []bool{false, true} {
 		var out bytes.Buffer
-		if err := repairRefs(t.Context(), rs, repairRepo+":", yes, &out); err != nil {
+		if err := repairRefs(t.Context(), rs, repairTarget{repoID: f.repo + ":", defaultBranch: "main"}, yes, &out); err != nil {
 			t.Fatalf("yes=%v: %v", yes, err)
 		}
-		if !strings.Contains(out.String(), "scanned: 0 refs") || !strings.Contains(out.String(), "no refs under this ID") ||
+		if !strings.Contains(out.String(), "scanned: 0 refs") || !strings.Contains(out.String(), "no refs in the ref store under this ID") ||
 			strings.Contains(out.String(), "no ref that git can never lock") {
 			t.Fatalf("yes=%v: output:\n%s", yes, out.String())
 		}
@@ -427,7 +469,7 @@ func TestRepairRefsSanitizesNames(t *testing.T) {
 		return strings.Contains(out, "\x1b") || strings.Contains(out, "\n  deleted: forged") || strings.Contains(out, "\ndeleted: forged")
 	}
 	var out bytes.Buffer
-	if err := repairRefs(t.Context(), rs, repairRepo, false, &out); err != nil {
+	if err := repairRefs(t.Context(), rs, f.target(), false, &out); err != nil {
 		t.Fatal(err)
 	}
 	if forged(out.String()) || !strings.Contains(out.String(), "refs that git can never lock (1)") {
@@ -435,15 +477,15 @@ func TestRepairRefsSanitizesNames(t *testing.T) {
 	}
 	out.Reset()
 	moving := &movingStore{RefStore: rs, t: t, name: hostile, from: f.commit, to: f.other}
-	if err := repairRefs(t.Context(), moving, repairRepo, true, &out); err == nil || forged(out.String()) || !strings.Contains(out.String(), "lost CAS") {
+	if err := repairRefs(t.Context(), moving, f.target(), true, &out); err == nil || forged(out.String()) || !strings.Contains(out.String(), "lost CAS") {
 		t.Fatalf("the lost-CAS line forged output (err %v):\n%q", err, out.String())
 	}
 	out.Reset()
-	if err := repairRefs(t.Context(), rs, repairRepo, true, &out); err != nil || forged(out.String()) || !strings.Contains(out.String(), "deleted 1 of 1 refs") {
+	if err := repairRefs(t.Context(), rs, f.target(), true, &out); err != nil || forged(out.String()) || !strings.Contains(out.String(), "deleted 1 of 1 refs") {
 		t.Fatalf("the deleted line forged output (err %v):\n%q", err, out.String())
 	}
 	out.Reset()
-	if err := repairRefs(t.Context(), rs, "repo\x1b[2J\nforged", false, &out); err != nil || strings.Contains(out.String(), "\x1b") || strings.Contains(out.String(), "\nforged") {
+	if err := repairRefs(t.Context(), rs, repairTarget{repoID: "repo\x1b[2J\nforged", defaultBranch: "main"}, false, &out); err != nil || strings.Contains(out.String(), "\x1b") || strings.Contains(out.String(), "\nforged") {
 		t.Fatalf("the repo line forged output (err %v):\n%q", err, out.String())
 	}
 }
@@ -471,7 +513,7 @@ func TestRepairRefsStopsOnStoreError(t *testing.T) {
 	f.plant(t, map[string]string{"refs/notes/x\x1b[2J/" + strings.Repeat("n", 251): f.commit, "refs/notes/y/" + strings.Repeat("n", 251): f.commit})
 	failing := &failingCASStore{RefStore: rs}
 	var out bytes.Buffer
-	err = repairRefs(t.Context(), failing, repairRepo, true, &out)
+	err = repairRefs(t.Context(), failing, f.target(), true, &out)
 	if err == nil || !strings.Contains(err.Error(), "store is down") || !strings.Contains(err.Error(), "0 deleted before the error") ||
 		strings.Contains(err.Error(), "\x1b") || failing.calls != 1 {
 		t.Fatalf("store error = %v after %d swaps\n%s", err, failing.calls, out.String())
@@ -491,35 +533,45 @@ func TestCmdRepairRefs(t *testing.T) {
 	}
 	ctx := t.Context()
 	dir := t.TempDir()
-	rs, err := ref.OpenSQLite(ctx, "sqlite://"+filepath.Join(dir, "codestorage.db"))
+	dbURL := "sqlite://" + filepath.Join(dir, "codestorage.db")
+	repo := createMetaRepo(t, dbURL, "main")
+	rs, err := ref.OpenSQLite(ctx, dbURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := newRepairFixture(t, rs)
+	f := newRepairFixtureFor(t, rs, repo)
 	f.plant(t, map[string]string{"refs/heads/main": f.commit, repairOKRef: f.commit, repairLongRef: f.commit})
 	want := f.refs(t)
 
 	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir}); err == nil || !strings.Contains(err.Error(), "exactly one <repo-id>") {
 		t.Fatalf("no arg = %v, want usage error", err)
 	}
-	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, repairRepo, "extra"}); err == nil || !strings.Contains(err.Error(), "exactly one <repo-id>") || !strings.Contains(err.Error(), "flags go before it") {
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, repo, "extra"}); err == nil || !strings.Contains(err.Error(), "exactly one <repo-id>") || !strings.Contains(err.Error(), "flags go before it") {
 		t.Fatalf("two args = %v, want usage error", err)
 	}
 	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, ""}); err == nil || !strings.Contains(err.Error(), "must not be empty") {
 		t.Fatalf("empty ID = %v, want a refusal", err)
 	}
-	if err := cmdRepairRefs(ctx, []string{repairRepo}); err == nil || !strings.Contains(err.Error(), "database URL required") {
+	if err := cmdRepairRefs(ctx, []string{repo}); err == nil || !strings.Contains(err.Error(), "database URL required") {
 		t.Fatalf("no database = %v, want the missing URL error", err)
 	}
 
+	// An ID with no repository (a typo, or the colon that follows the ID in
+	// the serve log) is an error, not a clean repository.
+	for _, id := range []string{"repo_000000000000", repo + ":"} {
+		if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", id}); err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("ID %q = %v, want not found", id, err)
+		}
+	}
+
 	// Without --yes it changes nothing.
-	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, repairRepo}); err != nil {
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, repo}); err != nil {
 		t.Fatalf("dry run = %v", err)
 	}
 	if got := f.refs(t); !mapsEqual(got, want) {
 		t.Fatalf("dry run changed the refs: %v", got)
 	}
-	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", repairRepo}); err != nil {
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", repo}); err != nil {
 		t.Fatalf("--yes = %v", err)
 	}
 	delete(want, repairLongRef)
@@ -541,11 +593,7 @@ func TestCmdRepairRefsRunsSchemaSetupOnlyWithYes(t *testing.T) {
 	}
 	ctx := t.Context()
 	dir := t.TempDir()
-	rs, err := ref.OpenSQLite(ctx, "sqlite://"+filepath.Join(dir, "codestorage.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rs.Close()
+	repo := createMetaRepo(t, "sqlite://"+filepath.Join(dir, "codestorage.db"), "main")
 	db, err := sql.Open("sqlite", filepath.Join(dir, "codestorage.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -560,16 +608,91 @@ func TestCmdRepairRefsRunsSchemaSetupOnlyWithYes(t *testing.T) {
 		return n == 1
 	}
 	if hasRefsTable() {
-		t.Fatal("a new database already has the refs table")
+		t.Fatal("a database with only the metadata schema already has the refs table")
 	}
-	_ = cmdRepairRefs(ctx, []string{"--data-dir", dir, repairRepo})
+	_ = cmdRepairRefs(ctx, []string{"--data-dir", dir, repo})
 	if hasRefsTable() {
 		t.Fatal("the list ran the schema setup")
 	}
-	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", repairRepo}); err != nil {
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", repo}); err != nil {
 		t.Fatalf("--yes on a new database = %v", err)
 	}
 	if !hasRefsTable() {
 		t.Fatal("--yes did not run the schema setup")
+	}
+}
+
+// The default branch is never deleted, as DELETE /repos/branches refuses it:
+// the list marks it, --yes keeps it and deletes the other refs, and the
+// command exits with an error.
+func TestRepairRefsKeepsTheDefaultBranch(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	longBranch := "x/" + strings.Repeat("b", 251)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/heads/" + longBranch: f.commit, repairLongRef: f.commit})
+	for _, def := range []string{longBranch, "refs/heads/" + longBranch} {
+		target := repairTarget{repoID: f.repo, defaultBranch: def}
+		var out bytes.Buffer
+		if err := repairRefs(t.Context(), rs, target, false, &out); err != nil || !strings.Contains(out.String(), "(the default branch: not deleted)") {
+			t.Fatalf("default %.12q: dry run = %v\n%s", def, err, out.String())
+		}
+		out.Reset()
+		err := repairRefs(t.Context(), rs, target, true, &out)
+		if err == nil || !strings.Contains(err.Error(), "1 are the default branch") || !strings.Contains(out.String(), "kept: refs/heads/"+longBranch) ||
+			!strings.Contains(out.String(), "deleted: "+repairLongRef) || !strings.Contains(out.String(), "deleted 1 of 2 refs") {
+			t.Fatalf("default %.12q: --yes = %v\n%s", def, err, out.String())
+		}
+		if got := f.refs(t); got["refs/heads/"+longBranch] != f.commit || got[repairLongRef] != "" || len(got) != 2 {
+			t.Fatalf("default %.12q: refs after --yes = %v", def, got)
+		}
+		f.plant(t, map[string]string{repairLongRef: f.commit})
+	}
+}
+
+// The command reads the default branch from the metadata store.
+func TestCmdRepairRefsKeepsTheDefaultBranchOfTheRepo(t *testing.T) {
+	for _, env := range []string{
+		"OPENSTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL",
+		"OPENSTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL",
+		envDataDir, envSecretsKey, envPackQuota, envPackReservationTTL,
+	} {
+		t.Setenv(env, "")
+	}
+	ctx := t.Context()
+	dir := t.TempDir()
+	dbURL := "sqlite://" + filepath.Join(dir, "codestorage.db")
+	longBranch := strings.Repeat("d", 251)
+	repo := createMetaRepo(t, dbURL, longBranch)
+	rs, err := ref.OpenSQLite(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixtureFor(t, rs, repo)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/heads/" + longBranch: f.commit, repairLongRef: f.commit})
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", repo}); err == nil || !strings.Contains(err.Error(), "default branch") {
+		t.Fatalf("--yes = %v, want the default-branch error", err)
+	}
+	if got := f.refs(t); got["refs/heads/"+longBranch] != f.commit || got[repairLongRef] != "" || len(got) != 2 {
+		t.Fatalf("refs after --yes = %v", got)
+	}
+}
+
+// The repository's URL comes from the metadata store, and a URL with control
+// bytes cannot forge a line either.
+func TestRepairRefsPrintsTheSanitizedURL(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit})
+	target := repairTarget{repoID: f.repo, url: "https://x/\x1b[2J\nforged", defaultBranch: "main"}
+	var out bytes.Buffer
+	if err := repairRefs(t.Context(), rs, target, false, &out); err != nil || !strings.Contains(out.String(), "url:     https://x/") ||
+		strings.Contains(out.String(), "\x1b") || strings.Contains(out.String(), "\nforged") {
+		t.Fatalf("url line (err %v):\n%q", err, out.String())
 	}
 }

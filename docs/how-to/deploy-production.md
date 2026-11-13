@@ -308,17 +308,20 @@ ref. Remove the ref from the ref store with
    so a REST request's `materialize repository` line shows it. To get the `hydrate`
    line, run `git ls-remote` on the repository with a token that has `git:read`.
 2. List the refs, with the same database URL (or `--data-dir`) as `serve`:
-   `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints each ref
-   that git can never lock, with its SHA, and the number of refs that it scanned. A ref
+   `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints the
+   repository's URL, the number of refs that it scanned, and each ref that git can never
+   lock, with its SHA. A ref
    is on the list when any part of its name is over 255 bytes, or its last part is over
    250 bytes. A ref that git can lock is never on the list.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
-   and exits with an error. Run it again to list what is left.
-4. Run the dry run once more. It must scan refs and list none. A scan of 0 refs means
-   that no refs have that ID, or that the database URL or `--data-dir` is not the one
-   that `serve` uses: check both. The next clone or fetch hydrates the repository
+   and exits with an error. Run it again to list what is left. The command keeps a ref
+   that is the repository's default branch, as `DELETE /repos/branches` does: the list
+   marks it. Set another default branch with `PATCH /repo`, then run the command again.
+4. Run the dry run once more. It must scan refs and list none. An ID with no repository
+   is an error. A scan of 0 refs means that the database URL or `--data-dir` is not the
+   one that `serve` uses: check both. The next clone or fetch hydrates the repository
    again, on every replica.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the

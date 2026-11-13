@@ -15,8 +15,8 @@ explicit env URLs win, then `--data-dir` / `$OPENSTORAGE_DATA_DIR` (local mode) 
 missing slots. Every backend scheme works, including the experimental
 [`s3wal://`](configuration.md#openstorage_pg_url) zero-infra pair. `signing-key` and
 `purge-repo` open its metadata/ref stores from the database URL, and `repair-refs` opens
-the ref store from it; `list-packs` reads blobs through the `s3://` URL and never opens
-the database URL.
+both stores from it, the metadata store only to read the repository row; `list-packs`
+reads blobs through the `s3://` URL and never opens the database URL.
 
 ## `openstorage serve`
 
@@ -278,23 +278,30 @@ openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
 openstorage repair-refs --data-dir ~/cs-data --yes repo_761aac427fd3  # delete
 ```
 
-The list prints `repo:` and `scanned: <n> refs`. Then, when refs match, it prints
+The command first reads the repository row. An ID with no repository is an error. The
+list prints `repo:`, `url:` and `scanned: <n> refs`. Then, when refs match, it prints
 `refs that git can never lock (<n>):` with one `<sha> <ref>` line for each match, and
 ends with `nothing changed`. When none match, it prints `no ref that git can never lock`.
-A scan of 0 refs prints a warning instead: no refs have that ID, or the database URL or
-`--data-dir` is not the one that `serve` uses. A wrong `--data-dir` can create an empty
-local database there, so check the path.
+A scan of 0 refs prints a warning instead: the database URL or `--data-dir` is not the
+one that `serve` uses. A wrong `--data-dir` can create an empty local database there, so
+check the path.
+
 With `--yes`, the command swaps each ref's listed SHA for the zero SHA, one compare-and-swap
 for each ref, and prints `deleted: <ref>`. When a ref no longer holds the listed SHA, it
 prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with an error
 after the other refs. Run the command again to list what is left. Put the flags before
 `<repo-id>`: a flag after it is an error.
 
+The command keeps a ref that is the repository's default branch, as
+`DELETE /repos/branches` does, and the list marks it. `--yes` deletes the other refs,
+prints `kept: <ref> is the default branch`, and exits with an error. Set another default
+branch with `PATCH /repo`, then run the command again.
+
 The command changes the ref store only. It sends no push webhook and no sync poke. It can
 run while `serve` runs. `--yes` lists the refs again and deletes what it finds, so a ref
-that appeared after an earlier list goes too. With `--yes` it first runs the
-ref-store schema setup that `serve` runs at boot, as `purge-repo` does, so that the delete
-bumps the repository generation. The list runs no schema setup. A replica on v0.20.0 or earlier
+that appeared after an earlier list goes too. With `--yes` it first runs the ref-store
+schema setup that `serve` runs at boot, as `purge-repo` does, so that the delete bumps
+the repository generation. The list runs no schema setup. A replica on v0.20.0 or earlier
 accepts such names, so run the command after the last replica is upgraded.
 
 ## `openstorage s3wal-meta`

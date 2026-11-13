@@ -15,6 +15,9 @@ import (
 	"os"
 
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/jobs"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -25,6 +28,19 @@ const repairRefsPage = 10_000
 
 // repairRef is one listed ref.
 type repairRef struct{ name, sha string }
+
+// repairTarget is the repository that the command works on, as its row in the
+// metadata store describes it. url may be empty, defaultBranch may not.
+type repairTarget struct {
+	repoID, url, defaultBranch string
+}
+
+// isDefaultBranch reports whether the ref is the branch that the repository
+// records as its default, the one that DELETE /repos/branches refuses to
+// remove.
+func (t repairTarget) isDefaultBranch(name string) bool {
+	return name == githttp.HeadTarget(t.defaultBranch)
+}
 
 func cmdRepairRefs(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("repair-refs", flag.ExitOnError)
@@ -39,7 +55,9 @@ deletes each listed ref from the ref store, but only if the ref still holds
 the SHA that it listed. A ref that changed in between is reported and kept.
 
 The command changes the ref store only. It sends no push webhook and no sync
-poke. With --yes it lists the refs again and deletes what it finds.
+poke. With --yes it lists the refs again and deletes what it finds. It keeps a
+ref that is the repository's default branch: set another default branch first
+(PATCH /repo), then run the command again.
 
 Flags:
 `)
@@ -66,6 +84,21 @@ Flags:
 	if urls.dbURL == "" {
 		return errDBURLRequired()
 	}
+	// Only the metadata row is read, so no schema setup and no secrets key.
+	ms, err := meta.Open(ctx, urls.dbURL)
+	if err != nil {
+		return fmt.Errorf("open metadata store: %w", err)
+	}
+	defer ms.Close()
+	purgeMeta, ok := ms.(jobs.RepoPurgeMeta)
+	assertf(ok, "meta store %T lacks the repo state seam", ms)
+	state, found, err := purgeMeta.RepoPurgeState(ctx, repoID)
+	if err != nil {
+		return fmt.Errorf("read repo state: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("repo %s not found: check the repo ID (repo_ and 12 hex digits, no other text) and that the database URL or --data-dir is the one that serve uses", sanitizeTerm(repoID))
+	}
 	rs, err := ref.Open(ctx, urls.dbURL)
 	if err != nil {
 		return fmt.Errorf("open ref store: %w", err)
@@ -80,24 +113,29 @@ Flags:
 			return fmt.Errorf("init ref schema: %w", err)
 		}
 	}
-	return repairRefs(ctx, rs, repoID, *yes, os.Stdout)
+	target := repairTarget{repoID: repoID, url: state.Repo.URL, defaultBranch: state.Repo.DefaultBranch}
+	return repairRefs(ctx, rs, target, *yes, os.Stdout)
 }
 
 // repairRefs lists the refs of repoID that git can never lock and, when yes
 // is set, deletes them. It returns an error when a delete fails or a ref
 // moved since it was listed.
-func repairRefs(ctx context.Context, rs ref.RefStore, repoID string, yes bool, out io.Writer) error {
+func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes bool, out io.Writer) error {
+	repoID := target.repoID
 	assertf(repoID != "", "repairRefs: empty repo ID")
 	found, scanned, err := scanUnlockableRefs(ctx, rs, repoID, repairRefsPage)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "repo:    %s\n", sanitizeTerm(repoID))
+	if target.url != "" {
+		fmt.Fprintf(out, "url:     %s\n", sanitizeTerm(target.url))
+	}
 	fmt.Fprintf(out, "scanned: %d refs\n", scanned)
 	if scanned == 0 {
-		// The command reads the ref store only, so it cannot tell a typo
-		// from an empty repository.
-		fmt.Fprintln(out, "no refs under this ID: check the repo ID (repo_ and 12 hex digits, no other text) and that the database URL or --data-dir is the one that serve uses")
+		// The metadata row exists, so the repository has no refs in this
+		// ref store.
+		fmt.Fprintln(out, "no refs in the ref store under this ID: check that the database URL or --data-dir is the one that serve uses")
 		return nil
 	}
 	if len(found) == 0 {
@@ -106,14 +144,26 @@ func repairRefs(ctx context.Context, rs ref.RefStore, repoID string, yes bool, o
 	}
 	fmt.Fprintf(out, "refs that git can never lock (%d):\n", len(found))
 	for _, r := range found {
-		fmt.Fprintf(out, "  %s %s\n", r.sha, sanitizeTerm(r.name))
+		note := ""
+		if target.isDefaultBranch(r.name) {
+			note = "  (the default branch: not deleted)"
+		}
+		fmt.Fprintf(out, "  %s %s%s\n", r.sha, sanitizeTerm(r.name), note)
 	}
 	if !yes {
 		fmt.Fprintln(out, "nothing changed: run the command again with --yes to delete these refs")
 		return nil
 	}
-	var deleted, lost int
+	var deleted, lost, kept int
 	for _, r := range found {
+		if target.isDefaultBranch(r.name) {
+			// DELETE /repos/branches refuses the default branch, and so does
+			// this command: the repository would be left with a default
+			// branch that does not exist.
+			kept++
+			fmt.Fprintf(out, "kept: %s is the default branch: set another default branch (PATCH /repo), then run the command again\n", sanitizeTerm(r.name))
+			continue
+		}
 		won, err := deleteUnlockableRef(ctx, rs, repoID, r)
 		if err != nil {
 			// The store's error text can quote the ref name.
@@ -128,8 +178,8 @@ func repairRefs(ctx context.Context, rs ref.RefStore, repoID string, yes bool, o
 		fmt.Fprintf(out, "deleted: %s\n", sanitizeTerm(r.name))
 	}
 	fmt.Fprintf(out, "deleted %d of %d refs\n", deleted, len(found))
-	if lost > 0 {
-		return fmt.Errorf("%d of %d refs changed since they were listed and were kept: run the command again", lost, len(found))
+	if lost > 0 || kept > 0 {
+		return fmt.Errorf("%d of %d refs were kept (%d changed since they were listed, %d are the default branch): see above, then run the command again", lost+kept, len(found), lost, kept)
 	}
 	return nil
 }
