@@ -518,7 +518,7 @@ func wcValidateBranchParam(field, name string) error {
 	if strings.HasPrefix(name, "refs/") {
 		return newFieldError(field, "must not include the refs/ prefix", field+" must not include the refs/ prefix")
 	}
-	if !validBranchName(name) {
+	if !validNewBranchName(name) {
 		return newFieldError(field, "must be a valid branch name", "invalid "+field)
 	}
 	return nil

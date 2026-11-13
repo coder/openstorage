@@ -196,6 +196,7 @@ func TestWriteRefsBranches(t *testing.T) {
 			for name, req := range map[string]map[string]any{
 				"refs prefix":  {"target_branch": "refs/heads/x", "base_branch": "main"},
 				"dotdot":       {"target_branch": "a..b", "base_branch": "main"},
+				"long last":    {"target_branch": "x/" + strings.Repeat("a", 251), "base_branch": "main"},
 				"empty target": {"target_branch": "", "base_branch": "main"},
 				"missing base": {"target_branch": "ok"},
 			} {
@@ -291,6 +292,23 @@ func TestWriteRefsBranches(t *testing.T) {
 				map[string]any{"name": "feature"})
 			if resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("second delete: status = %d, want 404", resp.StatusCode)
+			}
+		})
+
+		// A branch whose last part is too long for git's .lock file (an
+		// older version accepted it) is refused on create but can still be
+		// deleted, which is how a repository with one recovers.
+		t.Run("delete legacy branch with a long last part", func(t *testing.T) {
+			name := "x/" + strings.Repeat("a", 251)
+			if won, err := e.refStore.CASRef(context.Background(), fx.repoID, "refs/heads/"+name, ref.ZeroSHA, fx.c2); err != nil || !won {
+				t.Fatalf("seed refs/heads/%s: won=%v err=%v", name, won, err)
+			}
+			resp, body := wrefDo(t, srv, "DELETE", "/api/v1/repos/branches?target_branch="+url.QueryEscape(name), fx.token, nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d body %v, want 200", resp.StatusCode, body)
+			}
+			if _, exists := wrefRefs(t, e, fx.repoID)["refs/heads/"+name]; exists {
+				t.Fatal("legacy branch still present after delete")
 			}
 		})
 
@@ -1127,6 +1145,24 @@ func TestWriteRefsTags(t *testing.T) {
 				map[string]any{"name": "annot"})
 			if resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("second delete: status = %d, want 404", resp.StatusCode)
+			}
+		})
+
+		t.Run("delete legacy tag with a long last part", func(t *testing.T) {
+			name := strings.Repeat("t", 251)
+			if won, err := e.refStore.CASRef(context.Background(), fx.repoID, "refs/tags/"+name, ref.ZeroSHA, fx.c1); err != nil || !won {
+				t.Fatalf("seed refs/tags/%s: won=%v err=%v", name, won, err)
+			}
+			resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/tags", fx.token, map[string]any{"name": name + "x", "target": fx.c1})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("create of a long tag: status = %d, want 400", resp.StatusCode)
+			}
+			resp, body := wrefDo(t, srv, "DELETE", "/api/v1/repos/tags", fx.token, map[string]any{"name": name})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d body %v, want 200", resp.StatusCode, body)
+			}
+			if _, exists := wrefRefs(t, e, fx.repoID)["refs/tags/"+name]; exists {
+				t.Fatal("legacy tag still present after delete")
 			}
 		})
 

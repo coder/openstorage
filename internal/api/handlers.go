@@ -145,12 +145,19 @@ func policyDeniesRepoDelete(policies []auth.RefPolicy) (string, bool) {
 // alphanumeric, then alphanumerics plus . _ - (docs/reference/http-api.md: invalid input -> 400).
 var branchComponentRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
 
+// maxBranchLastPartBytes is NAME_MAX (255) minus len(".lock"): git locks a
+// ref at <last part>.lock.
+const maxBranchLastPartBytes = 255 - len(".lock")
+
 // validBranchName reports whether name is an acceptable branch/tag name:
 // slash-separated conservative ref components, no "..", no ".lock" suffix,
 // no trailing dot. Within this charset those are exactly git's own
 // check-ref-format rules — every accepted name must survive as a real ref,
 // because stored default branches now drive `symbolic-ref HEAD` on every
 // hydrate (issue #18) and a git-rejected name would poison hydration.
+// A name that the API writes must also pass validNewBranchName. Lookups
+// and deletes take this rule alone, so a ref that an older version wrote
+// can still be deleted.
 func validBranchName(name string) bool {
 	if name == "" || len(name) > 255 || strings.Contains(name, "..") {
 		return false
@@ -164,13 +171,22 @@ func validBranchName(name string) bool {
 	return true
 }
 
+// validNewBranchName reports whether the API can write a ref under name:
+// validBranchName, and a last part that leaves room for git's ".lock" file
+// within the 255-byte file-name limit. A longer last part makes every
+// hydration fail ("cannot lock ref"), so the repository's git reads
+// answer 500 until the ref is deleted.
+func validNewBranchName(name string) bool {
+	return validBranchName(name) && len(name[strings.LastIndexByte(name, '/')+1:]) <= maxBranchLastPartBytes
+}
+
 // validDefaultBranch reports whether branch can be a repository's default
 // branch: a branch name, or its refs/heads/-qualified spelling. Any other
 // refs/ name is refused: the default names a branch. (Hydration points a
 // persistent repository's HEAD away from a hidden refs/namespaces/ default.)
 func validDefaultBranch(branch string) bool {
 	short := strings.TrimPrefix(branch, "refs/heads/")
-	return !strings.HasPrefix(short, "refs/") && validBranchName(short)
+	return !strings.HasPrefix(short, "refs/") && validNewBranchName(short)
 }
 
 type createRepoRequest struct {
