@@ -19,6 +19,7 @@ func TestLFSBatchDecodeAnswersHoldNoGoTypeNames(t *testing.T) {
 		{"a nested field", `{"objects":[{"oid":"a","size":"x"}]}`, "bad batch request: objects.0.size has the wrong JSON type"},
 		{"a syntax error", `{"operation":`, "bad batch request"},
 		{"a wrong top-level type", `[1]`, "bad batch request"},
+		{"a body over the limit", `{"operation":"` + strings.Repeat("a", lfsMaxBatchBody) + `"}`, "bad batch request: request body too large"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/repo.git/info/lfs/objects/batch", strings.NewReader(tc.body))

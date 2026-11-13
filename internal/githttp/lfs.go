@@ -227,8 +227,12 @@ func (s *Server) handleLFS(w http.ResponseWriter, r *http.Request, repo, rest st
 // lfsBatchDecodeMsg is the 400 message for a batch body that does not
 // decode. The text of encoding/json names Go types and structs, and any
 // client can read this answer (the body is decoded before the request is
-// authenticated), so the message names only the field of the wrong JSON type.
+// authenticated), so the message names only the field of the wrong JSON type,
+// or says that the body is too large.
 func lfsBatchDecodeMsg(err error) string {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		return "bad batch request: request body too large"
+	}
 	if te, ok := errors.AsType[*json.UnmarshalTypeError](err); ok && te.Field != "" {
 		return "bad batch request: " + te.Field + " has the wrong JSON type"
 	}
