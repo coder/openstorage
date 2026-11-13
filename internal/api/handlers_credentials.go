@@ -119,6 +119,42 @@ func gcredDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
+// gcredReservedPassword is the problem of a password that the store
+// refuses with meta.ErrReservedSecret.
+func gcredReservedPassword() error {
+	return newFieldError("password", "is a reserved value", "invalid password: "+meta.ErrReservedSecret.Error())
+}
+
+// gcredValidate names every invalid field of a credential body, in the
+// order of the docs table: id (only for the body that carries one),
+// password, username. A message never holds a request value, because
+// password and username are credentials.
+//
+// A reserved password (meta.ErrReservedSecret) is a check of the store,
+// which answers it after the lookups of the route, so a missing repository
+// or credential is a 404 first. It is named here only together with
+// another invalid field; alone it keeps its place at the store.
+func gcredValidate(withID bool, id, username, password string) error {
+	var idErr, passwordErr error
+	if withID && id == "" {
+		idErr = newFieldError("id", "is required", "id is required")
+	}
+	if password == "" {
+		passwordErr = newFieldError("password", "is required", "password is required")
+	} else {
+		passwordErr = invalidTextFields([2]string{"password", password})
+	}
+	usernameErr := invalidTextFields([2]string{"username", username})
+	if passwordErr == nil && (idErr != nil || usernameErr != nil) && meta.ReservedSecret(password) {
+		passwordErr = gcredReservedPassword()
+	}
+	var errs bodyErrors
+	errs.add(idErr)
+	errs.add(passwordErr)
+	errs.add(usernameErr)
+	return errs.err()
+}
+
 type gcredCreateRequest struct {
 	RepoID   string `json:"repo_id"`
 	Username string `json:"username"`
@@ -140,11 +176,8 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 	if !gcredDecodeBody(w, r, &req) {
 		return
 	}
-	if req.Password == "" {
-		writeInvalidField(w, "password", "is required", "password is required")
-		return
-	}
-	if writeInvalidText(w, [2]string{"username", req.Username}, [2]string{"password", req.Password}) {
+	if err := gcredValidate(false, "", req.Username, req.Password); err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	repoKey := req.RepoID
@@ -177,7 +210,8 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 		writeProblem(w, http.StatusConflict, codeCredentialExists, "credential already exists")
 		return
 	case errors.Is(err, meta.ErrReservedSecret):
-		writeInvalidField(w, "password", "is a reserved value", "invalid password: "+meta.ErrReservedSecret.Error())
+		perr := gcredReservedPassword()
+		writeInvalid(w, perr.Error(), perr)
 		return
 	case err != nil:
 		s.internalErr(w, r, "create credential", err)
@@ -229,15 +263,8 @@ func (s *syncServer) handleUpdateCredential(w http.ResponseWriter, r *http.Reque
 	if !gcredDecodeBody(w, r, &req) {
 		return
 	}
-	if req.ID == "" {
-		writeInvalidField(w, "id", "is required", "id is required")
-		return
-	}
-	if req.Password == "" {
-		writeInvalidField(w, "password", "is required", "password is required")
-		return
-	}
-	if writeInvalidText(w, [2]string{"username", req.Username}, [2]string{"password", req.Password}) {
+	if err := gcredValidate(true, req.ID, req.Username, req.Password); err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	if _, ok := s.gcredForOrg(w, r, claims.Iss, req.ID); !ok {
@@ -250,7 +277,8 @@ func (s *syncServer) handleUpdateCredential(w http.ResponseWriter, r *http.Reque
 		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return
 	case errors.Is(err, meta.ErrReservedSecret):
-		writeInvalidField(w, "password", "is a reserved value", "invalid password: "+meta.ErrReservedSecret.Error())
+		perr := gcredReservedPassword()
+		writeInvalid(w, perr.Error(), perr)
 		return
 	case err != nil:
 		s.internalErr(w, r, "update credential", err)
@@ -393,11 +421,8 @@ func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http
 		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}
-	if req.Password == "" {
-		writeInvalidField(w, "password", "is required", "password is required")
-		return
-	}
-	if writeInvalidText(w, [2]string{"username", req.Username}, [2]string{"password", req.Password}) {
+	if err := gcredValidate(false, "", req.Username, req.Password); err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	updated, err := s.creds.UpdateCredential(r.Context(), cred.ID, req.Username, req.Password)
@@ -407,7 +432,8 @@ func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http
 		writeProblem(w, http.StatusNotFound, codeCredentialNotFound, "credential not found")
 		return
 	case errors.Is(err, meta.ErrReservedSecret):
-		writeInvalidField(w, "password", "is a reserved value", "invalid password: "+meta.ErrReservedSecret.Error())
+		perr := gcredReservedPassword()
+		writeInvalid(w, perr.Error(), perr)
 		return
 	case err != nil:
 		s.internalErr(w, r, "update credential", err)
