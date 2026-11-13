@@ -31,7 +31,9 @@ func (b *bodyErrors) add(err error) {
 	switch {
 	case err == nil:
 	case len(b.errs) >= maxInvalidParams:
-		b.dropped++
+		// The answer counts the items it leaves out: a problem that
+		// names two fields counts two.
+		b.dropped += max(1, len(invalidParamsFor(err)))
 	default:
 		b.errs = append(b.errs, err)
 	}

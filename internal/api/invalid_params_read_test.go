@@ -31,6 +31,15 @@ func TestGrepNamesEveryInvalidField(t *testing.T) {
 			manyPaths = append(manyPaths, ipParam{fmt.Sprintf("paths.%d", i), "must be a non-empty path"})
 			manyMsgs = append(manyMsgs, `invalid paths entry ""`)
 		}
+		// 100 empty paths fill the collector: the context pair that comes
+		// after is dropped, and the answer counts both of its fields.
+		fullPaths := `["` + strings.Repeat(`","`, maxInvalidParams-1) + `"]`
+		var fullParams []ipParam
+		var fullMsgs []string
+		for i := range maxInvalidParams {
+			fullParams = append(fullParams, ipParam{fmt.Sprintf("paths.%d", i), "must be a non-empty path"})
+			fullMsgs = append(fullMsgs, `invalid paths entry ""`)
+		}
 		// A well-formed cursor whose commit is in no repository.
 		goneCursor := encodeGrepCursor(strings.Repeat("a", 40), "f.txt", 1)
 
@@ -109,11 +118,23 @@ func TestGrepNamesEveryInvalidField(t *testing.T) {
 				want:      manyPaths,
 			},
 
+			{
+				name: "a dropped problem counts each field that it names", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"query":{"pattern":"x"},"paths":` + fullPaths + `,"context":{"before":-1,"after":-1}}`,
+				wantError: strings.Join(fullMsgs, "; ") + "; and 2 more",
+				want:      fullParams,
+			},
+
 			// One problem answers as before.
 			{
 				name: "one problem: pattern", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"query":{"pattern":""}}`, wantError: "query.pattern is required",
 				want: []ipParam{{"query.pattern", "is required"}},
+			},
+			{
+				name: "one problem: paths entry of white space", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"query":{"pattern":"x"},"paths":["d"," "]}`, wantError: `invalid paths entry " "`,
+				want: []ipParam{{"paths.1", "must be a non-empty path"}},
 			},
 			{
 				name: "one problem: paths entry outside", method: http.MethodPost, path: path, token: fx.gitTok,
@@ -167,6 +188,38 @@ func TestGrepNamesEveryInvalidField(t *testing.T) {
 			requireProblemCode(t, resp, body, codeRepositoryNotFound)
 		})
 	})
+}
+
+// TestBadEntriesPastTheBoundBuildNoProblem pins the guard of the loops over
+// the arrays of a body: once the collector is full, a bad entry is counted
+// and builds no problem. The collector keeps 100 problems whether the loop
+// builds the others or not, so only the allocations of a body of 1 MiB of
+// empty entries show a missing guard (the answer is the same).
+func TestBadEntriesPastTheBoundBuildNoProblem(t *testing.T) {
+	const n = 349000 // 1 MiB of `"",`, the most that a body can hold
+	entries := make([]string, n)
+	for _, tc := range []struct {
+		name string
+		fill func(*bodyErrors)
+	}{
+		{"grep paths", func(e *bodyErrors) { grepPathProblems(e, entries) }},
+		{"archive include_globs", func(e *bodyErrors) { archiveGlobProblems(e, "include_globs", entries) }},
+		{"archive exclude_globs", func(e *bodyErrors) { archiveGlobProblems(e, "exclude_globs", entries) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var errs bodyErrors
+			tc.fill(&errs)
+			if len(errs.errs) != maxInvalidParams || errs.dropped != n-maxInvalidParams {
+				t.Fatalf("collector kept %d problems and counted %d, want %d and %d", len(errs.errs), errs.dropped, maxInvalidParams, n-maxInvalidParams)
+			}
+			// The first 100 entries build a problem each, a few allocations
+			// apiece. Without the guard, every one of the n entries does.
+			const bound = 20 * maxInvalidParams
+			if allocs := testing.AllocsPerRun(3, func() { tc.fill(new(bodyErrors)) }); allocs > bound {
+				t.Fatalf("a body of %d empty entries made %.0f allocations, want at most %d: past the bound an entry must only be counted", n, allocs, bound)
+			}
+		})
+	}
 }
 
 // TestArchiveNamesEveryInvalidField: POST /repos/archive names each invalid

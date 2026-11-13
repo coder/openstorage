@@ -204,6 +204,26 @@ func TestBodyErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("a dropped problem counts each field that it names", func(t *testing.T) {
+		var b bodyErrors
+		for i := range maxInvalidParams {
+			b.add(field(fmt.Sprintf("paths.%d", i)))
+		}
+		b.add(newFieldErrors("context lines must be non-negative",
+			invalidParam{Name: "context.before", Reason: "must be at least 0"},
+			invalidParam{Name: "context.after", Reason: "must be at least 0"}))
+		b.add(fmt.Errorf("a rule across fields"))
+		b.add(field("limits.max_lines"))
+		err := b.err()
+		if got := invalidParamsFor(err); len(got) != maxInvalidParams {
+			t.Fatalf("got %d params, want %d", len(got), maxInvalidParams)
+		}
+		// Two fields, a rule that names none (one), and one field.
+		if !strings.HasSuffix(err.Error(), "; and 4 more") {
+			t.Fatalf("message tail = %q", err.Error()[len(err.Error())-30:])
+		}
+	})
+
 	t.Run("a problem with two fields can cross the bound", func(t *testing.T) {
 		var b bodyErrors
 		for i := range maxInvalidParams - 1 {

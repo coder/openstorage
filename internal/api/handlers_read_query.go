@@ -704,6 +704,30 @@ type grepPosition struct {
 	line grepLineEntry
 }
 
+// grepPathProblems adds the problem of each entry of the `paths` of a grep
+// body that is not a path inside the repository: one problem for each
+// entry, named paths.N. A body of bad entries costs one answer of bounded
+// size: once the collector is full, an entry is counted and builds no
+// problem.
+func grepPathProblems(errs *bodyErrors, paths []string) {
+	for i, p := range paths {
+		blank := strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0)
+		// git gets the entry without its trailing slash: "/" alone is
+		// no pathspec.
+		trimmed := strings.TrimSuffix(p, "/")
+		outside := !blank && trimmed != "" && pathLeavesRepo(trimmed)
+		switch {
+		case !blank && !outside:
+		case errs.full():
+			errs.skip()
+		case blank:
+			errs.add(newFieldError("paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p)))
+		default:
+			errs.add(newFieldError("paths."+strconv.Itoa(i), "is outside the repository", fmt.Sprintf("paths entry %q is outside the repository", p)))
+		}
+	}
+}
+
 // handleGrep implements POST /api/v1/repos/grep: synchronous git grep at
 // the resolved ref (docs/explanation/domain-model.md allows strictly-fresher-than-index synchronous
 // results). Limits truncate the collected result (incomplete_results);
@@ -731,24 +755,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	if body.Query.CaseSensitive != nil {
 		caseSensitive = *body.Query.CaseSensitive
 	}
-	for i, p := range body.Paths {
-		// A body of bad entries costs one answer of bounded size: past the
-		// bound, an entry is counted and builds no problem.
-		blank := strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0)
-		// git gets the entry without its trailing slash: "/" alone is
-		// no pathspec.
-		trimmed := strings.TrimSuffix(p, "/")
-		outside := !blank && trimmed != "" && pathLeavesRepo(trimmed)
-		switch {
-		case !blank && !outside:
-		case errs.full():
-			errs.skip()
-		case blank:
-			errs.add(newFieldError("paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p)))
-		default:
-			errs.add(newFieldError("paths."+strconv.Itoa(i), "is outside the repository", fmt.Sprintf("paths entry %q is outside the repository", p)))
-		}
-	}
+	grepPathProblems(&errs, body.Paths)
 	before, after := 0, 0
 	if body.Context.Before != nil {
 		before = *body.Context.Before
@@ -974,6 +981,22 @@ func archiveFilenamePart(s string) string {
 	return b.String()
 }
 
+// archiveGlobProblems adds the problem of each blank entry of a glob list of
+// an archive body, named name.N. Like grepPathProblems, it builds no
+// problem once the collector is full.
+func archiveGlobProblems(errs *bodyErrors, name string, globs []string) {
+	for i, glob := range globs {
+		if strings.TrimSpace(glob) != "" && !strings.ContainsRune(glob, 0) {
+			continue
+		}
+		if errs.full() {
+			errs.skip()
+			continue
+		}
+		errs.add(newFieldError(name+"."+strconv.Itoa(i), "must be a non-empty glob", fmt.Sprintf("invalid glob %q", glob)))
+	}
+}
+
 // handleArchive implements POST /api/v1/repos/archive: a gz-compressed
 // tarball of the tree at `ref` (default branch when omitted), shaped by
 // include/exclude globs, max_blob_size, and an optional entry-name prefix.
@@ -994,23 +1017,8 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	// Every invalid body field is named, in the order of the docs table
 	// (bodyErrors).
 	var errs bodyErrors
-	for _, list := range []struct {
-		name  string
-		globs []string
-	}{{"include_globs", body.IncludeGlobs}, {"exclude_globs", body.ExcludeGlobs}} {
-		for i, glob := range list.globs {
-			if strings.TrimSpace(glob) != "" && !strings.ContainsRune(glob, 0) {
-				continue
-			}
-			// A body of bad entries costs one answer of bounded size: past the
-			// bound, an entry is counted and builds no problem.
-			if errs.full() {
-				errs.skip()
-				continue
-			}
-			errs.add(newFieldError(list.name+"."+strconv.Itoa(i), "must be a non-empty glob", fmt.Sprintf("invalid glob %q", glob)))
-		}
-	}
+	archiveGlobProblems(&errs, "include_globs", body.IncludeGlobs)
+	archiveGlobProblems(&errs, "exclude_globs", body.ExcludeGlobs)
 	maxBlobSize := int64(0)
 	if body.MaxBlobSize != nil {
 		maxBlobSize = *body.MaxBlobSize
