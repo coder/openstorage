@@ -21,9 +21,11 @@ import (
 // failure. An outcome PostgreSQL cannot confirm (the transaction still in
 // progress when the wait runs out, or the status query failing) is an
 // ambiguous error, which IdempotentCAS rechecks. A swap that changed no row
-// returns its COMMIT error as pgx returned it, without a status marker. pgx reports each of these losses as a
-// request never sent, so without the status query every case would read as
-// definitive.
+// returns its COMMIT error as pgx returned it, without a status marker. Up to
+// pgx v5.12 each of these losses read as a request never sent, so without the
+// status query every case would read as definitive. Since v5.13 each reads as
+// ambiguous, and the status query still tells a commit that landed from one
+// that did not.
 func TestPGCASResolvesFailedCommit(t *testing.T) {
 	s := pgTestStore(t)
 	ctx := context.Background()

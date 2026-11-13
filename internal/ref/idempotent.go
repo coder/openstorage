@@ -181,11 +181,11 @@ func (e notExecutedError) Unwrap() error   { return e.err }
 func (notExecutedError) SafeToRetry() bool { return true }
 
 // commitUnknownError marks a COMMIT error whose outcome PostgreSQL could not
-// confirm (see PG.commitStatus). pgx can tag a lost COMMIT reply as never
-// sent (SafeToRetry); this marker overrides that tag, so ambiguousError
-// keeps the outcome ambiguous and IdempotentCAS rechecks the ref. A
-// *pgconn.PgError inside still classifies by its SQLSTATE: the backend
-// answered the COMMIT.
+// confirm (see PG.commitStatus). pgx up to v5.12 tagged a lost COMMIT reply
+// as never sent (SafeToRetry); this marker overrides whatever tag pgx puts,
+// so ambiguousError keeps the outcome ambiguous and IdempotentCAS rechecks
+// the ref. A *pgconn.PgError inside still classifies by its SQLSTATE: the
+// backend answered the COMMIT.
 type commitUnknownError struct{ err error }
 
 // commitUnknown wraps a COMMIT error with the unknown-outcome marker.

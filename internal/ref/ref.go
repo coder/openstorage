@@ -1087,13 +1087,16 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 		gen = g0 + 1
 	}
 	// A COMMIT error does not say whether the backend committed: the reply
-	// may be lost after the commit. pgx v5.11 even reports that loss as a
-	// request never sent: MultiResultReader.NextResult drops the read error
-	// of peekMessage, which has already closed the connection, so the next
-	// receiveMessage returns connLockError "conn closed", and pgconn's
-	// SafeToRetry is true for it. A swap that changed a row therefore asks
-	// PostgreSQL for the outcome. A swap that changed no row wrote nothing,
-	// so its COMMIT outcome changes nothing, and its error passes through.
+	// may be lost after the commit. Up to pgx v5.12 even that loss was
+	// reported as a request never sent: MultiResultReader.NextResult drops
+	// the read error of peekMessage, which has already closed the
+	// connection, so the next receiveMessage returned connLockError "conn
+	// closed", and pgconn's SafeToRetry was true for it. Since v5.13 pgx
+	// marks it not safe to retry, but only the outcome query tells a commit
+	// that landed from one that did not. A swap that changed a row therefore
+	// asks PostgreSQL for the outcome. A swap that changed no row wrote
+	// nothing, so its COMMIT outcome changes nothing, and its error passes
+	// through.
 	if err := tx.Commit(ctx); err != nil {
 		if n == 0 {
 			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
