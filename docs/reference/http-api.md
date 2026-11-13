@@ -422,7 +422,10 @@ A branch, tag or notes ref name that the API writes (for example in branch creat
 writes, tag writes and `default_branch`) is at most 255 bytes without its `refs/...`
 prefix, and its last `/`-separated part is at most 250 bytes, so that git can create the
 ref's `.lock` file. A longer one answers `400`. Branch and tag deletes still take a stored
-name whose last part is longer, so a ref that an earlier version wrote can be removed.
+name whose last part is longer, so a ref that an earlier version wrote can be removed. A
+notes ref that an earlier version wrote cannot be removed over REST (`DELETE /repos/notes`
+removes one note): the operator runs
+[`openstorage repair-refs`](cli.md#openstorage-repair-refs).
 
 Ephemeral branches are `refs/namespaces/ephemeral/refs/heads/<name>` in the base
 repository. The persistent git remote `/{repo}.git` hides them: git cannot fetch,
