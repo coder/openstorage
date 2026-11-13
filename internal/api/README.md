@@ -27,6 +27,7 @@ The REST API (`/api/v1/...`) and its `/api/repos/{repo_name}` alias layer. `New`
 - `clientKey` trusts `X-Forwarded-For` only from trusted proxies; a limited bucket latches until the reserve refills [ratelimit.go:clientKey]
 - `handleCreateRepo` rejects a body `repo_name` that differs from the JWT repo claim [handlers.go:handleCreateRepo]
 - `validBranchName` rejects names over 255 bytes, `..`, `.lock` components, and characters outside a conservative set [handlers.go:validBranchName]
+- `validNewBranchName` also rejects a last part over 250 bytes, which leaves room for git's `.lock` file; every ref write uses it, and branch and tag deletes keep `validBranchName` [handlers.go:validNewBranchName]
 - Ref policies deny `no-push`, non-fast-forward under `no-force-push`, server-created commits under `verify-sig`, and unknown ops (fail closed) [handlers_write_refs.go:wrefPolicyCheck] [handlers_write_commit.go:wcCheckRefPolicy]
 - Write-commit paths reject `.git` components, absolute or dot paths, and control bytes; a stale `expected_head_sha` is 412 [handlers_write_commit.go:wcValidPath] [handlers_write_commit.go:wcPlanCommit]
 - Merges need git >= 2.38 and refuse unrelated histories unless allowed; a stale target SHA is 409 [handlers_write_merge.go:wmCheckGitVersion] [handlers_write_merge.go:handleMerge]
