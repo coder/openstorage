@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -212,25 +213,29 @@ func TestTagCreateNamesEveryInvalidField(t *testing.T) {
 }
 
 // TestBranchAndTagDecoderErrorHidesTheOtherProblems: a field of the wrong
-// JSON type is a decoder error, which names the first such field in the
-// body and none of the other problems. The checks of the fields run only
-// when every field has its right type. The docs promise this.
+// JSON type is a decoder error, which names every such field in the body,
+// in body order, and none of the other problems. The checks of the fields
+// run only when every field has its right type. The docs promise this.
 func TestBranchAndTagDecoderErrorHidesTheOtherProblems(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := ipNewFixture(t, e)
-		for _, tc := range []struct{ name, path, body, field, reason string }{
-			{"branch: the first wrong type in the body wins", "/api/v1/repos/branches/create",
-				`{"target_branch":"bad..name","expected_target_sha":7,"force":"yes"}`, "expected_target_sha", "must be a string"},
+		str, boolean := "must be a string", "must be a boolean"
+		for _, tc := range []struct {
+			name, path, body string
+			want             []invalidParam
+		}{
+			{"branch: every wrong type in the body", "/api/v1/repos/branches/create",
+				`{"target_branch":"bad..name","expected_target_sha":7,"force":"yes"}`, []invalidParam{{"expected_target_sha", str}, {"force", boolean}}},
 			{"branch: the same fields in another order", "/api/v1/repos/branches/create",
-				`{"force":"yes","target_branch":"bad..name","expected_target_sha":7}`, "force", "must be a boolean"},
+				`{"force":"yes","target_branch":"bad..name","expected_target_sha":7}`, []invalidParam{{"force", boolean}, {"expected_target_sha", str}}},
 			{"branch: a wrong type hides a missing base", "/api/repos/" + fx.url + "/branches/create",
-				`{"target_branch":"ok","base_is_ephemeral":"no"}`, "base_is_ephemeral", "must be a boolean"},
-			{"tag: the first wrong type in the body wins", "/api/v1/repos/tags",
-				`{"name":5,"ref":6}`, "name", "must be a string"},
+				`{"target_branch":"ok","base_is_ephemeral":"no"}`, []invalidParam{{"base_is_ephemeral", boolean}}},
+			{"tag: every wrong type in the body", "/api/v1/repos/tags",
+				`{"name":5,"ref":6}`, []invalidParam{{"name", str}, {"ref", str}}},
 			{"tag: the same fields in another order", "/api/v1/repos/tags",
-				`{"ref":6,"name":5}`, "ref", "must be a string"},
+				`{"ref":6,"name":5}`, []invalidParam{{"ref", str}, {"name", str}}},
 			{"tag: a wrong type hides an invalid name", "/api/repos/" + fx.url + "/tags",
-				`{"name":"bad..name","target":false}`, "target", "must be a string"},
+				`{"name":"bad..name","target":false}`, []invalidParam{{"target", str}}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				resp, body := e.doReq(t, http.MethodPost, tc.path, fx.gitTok, []byte(tc.body), "")
@@ -238,15 +243,19 @@ func TestBranchAndTagDecoderErrorHidesTheOtherProblems(t *testing.T) {
 					t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, body)
 				}
 				msg := requireEnvelope(t, resp, body)
-				if !strings.HasPrefix(msg, "invalid JSON body: ") || !strings.Contains(msg, tc.field) {
-					t.Fatalf("error = %q, want the decoder's message about %s", msg, tc.field)
+				if !strings.HasPrefix(msg, "invalid JSON body: ") || strings.Count(msg, "cannot unmarshal") != len(tc.want) {
+					t.Fatalf("error = %q, want the decoder's message about each of %v", msg, tc.want)
 				}
 				var p problemBody
 				if err := json.Unmarshal(body, &p); err != nil {
 					t.Fatal(err)
 				}
-				if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != tc.field || p.InvalidParams[0].Reason != tc.reason {
-					t.Fatalf("invalid_params = %+v, want only %s %q", p.InvalidParams, tc.field, tc.reason)
+				var got []invalidParam
+				for _, ip := range p.InvalidParams {
+					got = append(got, invalidParam{ip.Name, ip.Reason})
+				}
+				if !slices.Equal(got, tc.want) {
+					t.Fatalf("invalid_params = %+v, want %+v", got, tc.want)
 				}
 			})
 		}

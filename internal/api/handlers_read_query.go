@@ -11,7 +11,6 @@ package api
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -740,7 +739,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body grepRequestBody
-	if err := json.Unmarshal(raw, &body); err != nil {
+	if err := unmarshalBody(raw, &body); err != nil {
 		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}
@@ -1009,7 +1008,7 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	var body archiveRequestBody
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &body); err != nil {
+		if err := unmarshalBody(raw, &body); err != nil {
 			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 			return
 		}

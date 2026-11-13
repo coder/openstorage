@@ -31,8 +31,8 @@ func unmarshalBody(body []byte, dst any) error {
 	}
 	var errs bodyErrors
 	errs.add(te)
-	work, budget := body, maxDecodeWork
-	for len(errs.errs) < maxInvalidParams && budget >= len(work) {
+	work, budget := body, maxDecodeWork-len(body) // the first decode counts
+	for !errs.full() && budget >= len(work) {
 		next, ok := nullMembers(work, te.Field)
 		if !ok {
 			break

@@ -124,4 +124,12 @@ func TestUnmarshalBodyBounds(t *testing.T) {
 			t.Fatalf("%d entries (%d bytes) named %d items, want about %d", tc.entries, len(body), got, tc.want)
 		}
 	}
+	// The first decode counts too: a body of more than 128 KiB names only
+	// its first wrong-type field, and one of 126 KiB names two.
+	for _, tc := range []struct{ entries, want int }{{70_000, 1}, {63_000, 2}} {
+		body := `{"paths":[` + strings.Repeat("7,", tc.entries) + `7]}`
+		if got := len(invalidParamsFor(unmarshalBody([]byte(body), new(decodeBodyReq)))); got != tc.want {
+			t.Fatalf("%d bytes named %d items, want %d", len(body), got, tc.want)
+		}
+	}
 }

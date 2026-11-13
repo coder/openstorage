@@ -338,7 +338,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createRepoRequest
 	if len(body) > 0 {
-		if err := json.Unmarshal(body, &req); err != nil {
+		if err := unmarshalBody(body, &req); err != nil {
 			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 			return
 		}
@@ -369,7 +369,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		hostField, hostPath = "upstream host", "upstream.host"
 	case jsonPresent(req.BaseRepo):
 		spec = &usyncBaseRepo{}
-		if err := json.Unmarshal(req.BaseRepo, spec); err != nil {
+		if err := unmarshalBody(req.BaseRepo, spec); err != nil {
 			fe := fieldErrorUnder("base_repo", "invalid base_repo: "+err.Error(), err)
 			writeInvalid(w, fe.Error(), fe)
 			return

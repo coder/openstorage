@@ -78,7 +78,7 @@ func wrefDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		writeErr(w, http.StatusBadRequest, "missing request body")
 		return false
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
+	if err := unmarshalBody(body, dst); err != nil {
 		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return false
 	}
@@ -98,7 +98,7 @@ func wrefDecodeOptionalBody(w http.ResponseWriter, r *http.Request, dst any) boo
 	if len(body) == 0 {
 		return true
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
+	if err := unmarshalBody(body, dst); err != nil {
 		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return false
 	}
