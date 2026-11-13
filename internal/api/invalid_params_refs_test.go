@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -76,6 +77,18 @@ func TestBranchCreateNamesEveryInvalidField(t *testing.T) {
 				want:      []ipParam{{"target_branch", "must be a valid branch name"}},
 			},
 			{
+				name: "an uppercase guard is a full sha", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"target_branch":"bad..name","base_ref":"main","expected_target_sha":"` + strings.ToUpper(sha) + `"}`,
+				wantError: "invalid target_branch",
+				want:      []ipParam{{"target_branch", "must be a valid branch name"}},
+			},
+			{
+				name: "a persistent HEAD target is a valid name", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"target_branch":"HEAD","base_ref":"main","expected_target_sha":"x"}`,
+				wantError: "invalid expected_target_sha",
+				want:      []ipParam{{"expected_target_sha", "must be a full commit SHA"}},
+			},
+			{
 				name: "a null target is named, not allocated", method: http.MethodPost, path: path, token: fx.gitTok,
 				body:      `{"target_branch":null,"base_ref":"main","force":true}`,
 				wantError: "invalid target_branch",
@@ -114,6 +127,12 @@ func TestBranchCreateNamesEveryInvalidField(t *testing.T) {
 			{
 				name: "one problem: guard", method: http.MethodPost, path: path, token: fx.gitTok,
 				body:      `{"target_branch":"ok","base_ref":"main","expected_target_sha":"` + sha[:39] + `"}`,
+				wantError: "invalid expected_target_sha",
+				want:      []ipParam{{"expected_target_sha", "must be a full commit SHA"}},
+			},
+			{
+				name: "one problem: guard of 40 characters that are not hex", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"target_branch":"ok","base_ref":"main","expected_target_sha":"` + strings.Repeat("g", 40) + `"}`,
 				wantError: "invalid expected_target_sha",
 				want:      []ipParam{{"expected_target_sha", "must be a full commit SHA"}},
 			},
@@ -189,6 +208,48 @@ func TestTagCreateNamesEveryInvalidField(t *testing.T) {
 				},
 			},
 		})
+	})
+}
+
+// TestBranchAndTagDecoderErrorHidesTheOtherProblems: a field of the wrong
+// JSON type is a decoder error, which names the first such field in the
+// body and none of the other problems. The checks of the fields run only
+// when every field has its right type. The docs promise this.
+func TestBranchAndTagDecoderErrorHidesTheOtherProblems(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := ipNewFixture(t, e)
+		for _, tc := range []struct{ name, path, body, field, reason string }{
+			{"branch: the first wrong type in the body wins", "/api/v1/repos/branches/create",
+				`{"target_branch":"bad..name","expected_target_sha":7,"force":"yes"}`, "expected_target_sha", "must be a string"},
+			{"branch: the same fields in another order", "/api/v1/repos/branches/create",
+				`{"force":"yes","target_branch":"bad..name","expected_target_sha":7}`, "force", "must be a boolean"},
+			{"branch: a wrong type hides a missing base", "/api/repos/" + fx.url + "/branches/create",
+				`{"target_branch":"ok","base_is_ephemeral":"no"}`, "base_is_ephemeral", "must be a boolean"},
+			{"tag: the first wrong type in the body wins", "/api/v1/repos/tags",
+				`{"name":5,"ref":6}`, "name", "must be a string"},
+			{"tag: the same fields in another order", "/api/v1/repos/tags",
+				`{"ref":6,"name":5}`, "ref", "must be a string"},
+			{"tag: a wrong type hides an invalid name", "/api/repos/" + fx.url + "/tags",
+				`{"name":"bad..name","target":false}`, "target", "must be a string"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				resp, body := e.doReq(t, http.MethodPost, tc.path, fx.gitTok, []byte(tc.body), "")
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, body)
+				}
+				msg := requireEnvelope(t, resp, body)
+				if !strings.HasPrefix(msg, "invalid JSON body: ") || !strings.Contains(msg, tc.field) {
+					t.Fatalf("error = %q, want the decoder's message about %s", msg, tc.field)
+				}
+				var p problemBody
+				if err := json.Unmarshal(body, &p); err != nil {
+					t.Fatal(err)
+				}
+				if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != tc.field || p.InvalidParams[0].Reason != tc.reason {
+					t.Fatalf("invalid_params = %+v, want only %s %q", p.InvalidParams, tc.field, tc.reason)
+				}
+			})
+		}
 	})
 }
 
