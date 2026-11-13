@@ -34,7 +34,8 @@ func unmarshalBody(body []byte, dst any) error {
 	work, budget := body, maxDecodeWork-len(body) // the first decode counts
 	for !errs.full() && budget >= len(work) {
 		next, ok := nullMembers(work, te.Field)
-		if !ok {
+		// null is longer than a value of 1 to 3 bytes, so the body can grow.
+		if !ok || len(next) > budget {
 			break
 		}
 		work, budget = next, budget-len(next)

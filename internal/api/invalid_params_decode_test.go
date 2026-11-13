@@ -427,6 +427,13 @@ func TestDecodeRows(t *testing.T) {
 	})
 }
 
+// ipdShape is a hostile body and the names of the answer; want is nil when
+// the answer is not pinned.
+type ipdShape struct {
+	name, body string
+	want       []string
+}
+
 // TestDecodeHostileBodies: bodies near the 1 MiB limit with many wrong-type
 // members, deep nesting, repeated and case-folded member names, invalid
 // UTF-8 and escaped NUL answer 400 within a bounded time and size, name at
@@ -470,10 +477,7 @@ func TestDecodeHostileBodies(t *testing.T) {
 			upper := `"` + strings.ToUpper(leaves[1]) + `":[]`
 			repeat := func(member string, size int) string { return strings.Repeat(","+member, size/(len(member)+1)) }
 			bigObject := func(size int) string { return obj(g + repeat(`"u":0`, size-300) + "," + ff) }
-			shapes := []struct {
-				name, body string
-				want       []string // the names of the answer; nil when it is not pinned
-			}{
+			shapes := []ipdShape{
 				{"1 MiB of one repeated member", "{" + g + repeat(ff, 1_040_000) + "}", names(leaves[0])},
 				{"100 KiB of one repeated member", "{" + g + repeat(ff, 100<<10) + "}", names(leaves[0], leaves[1])},
 				{"126 KiB of one repeated member", "{" + g + repeat(ff, 126<<10) + "}", names(leaves[0], leaves[1])},
@@ -489,14 +493,8 @@ func TestDecodeHostileBodies(t *testing.T) {
 			}
 			if array != "" {
 				shapes = append(shapes,
-					struct {
-						name, body string
-						want       []string
-					}{"1 MiB of wrong-type elements", `{"` + array + `":[7` + repeat("7", 1_040_000) + `]}`, names(array + ".0")},
-					struct {
-						name, body string
-						want       []string
-					}{"100 KiB of wrong-type elements", `{"` + array + `":[7` + repeat("7", 100<<10) + `]}`, names(array+".0", array+".1")})
+					ipdShape{"1 MiB of wrong-type elements", `{"` + array + `":[7` + repeat("7", 1_040_000) + `]}`, names(array + ".0")},
+					ipdShape{"100 KiB of wrong-type elements", `{"` + array + `":[7` + repeat("7", 100<<10) + `]}`, names(array+".0", array+".1")})
 			}
 			for _, sh := range shapes {
 				a := ipdAsk(t, e, f, f.wrapBody(sh.body))

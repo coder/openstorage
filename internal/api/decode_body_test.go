@@ -128,6 +128,15 @@ func TestUnmarshalBodyBounds(t *testing.T) {
 			t.Fatalf("%d entries (%d bytes) named %d items, want about %d", tc.entries, len(body), got, tc.want)
 		}
 	}
+	// The bound is hard: nulling many short values makes the body longer
+	// (7 becomes null), and a decode that the budget cannot pay for does not run.
+	// The count field comes after the repeated members: a decode of the longer
+	// body would name it.
+	grown := `{"strategy":5,` + strings.Repeat(`"flag":7,`, 9500) + `"count":"x"}`
+	got := invalidParamsFor(unmarshalBody([]byte(grown), new(decodeBodyReq)))
+	if len(got) != 2 || got[0].Name != "strategy" || got[1].Name != "flag" {
+		t.Fatalf("a body that grows past the work bound named %+v, want strategy and flag", got)
+	}
 	// The first decode counts too: a body of more than 128 KiB names only
 	// its first wrong-type field, and one of 126 KiB names two.
 	for _, tc := range []struct{ entries, want int }{{70_000, 1}, {63_000, 2}} {
