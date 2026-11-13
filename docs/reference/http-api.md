@@ -74,8 +74,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   decoder finds a field of the wrong type, the answer names one such field (the first
   that the decoder finds) and none of the other problems: the other checks run only when
   every field has its right type. A field that stays raw for a check of its own (the
-  `expected_source_sha` of a merge) is checked with the others. `POST /repos/merge`
-  answers this way. The other routes with a request
+  `expected_source_sha` of a merge, the `target_branch` of a branch create) is checked
+  with the others. `POST /repos/merge`, `POST /repos/branches/create` and `POST
+  /repos/tags` answer this way. The other routes with a request
   body do not collect problems yet: a check there can hide the checks after it.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
