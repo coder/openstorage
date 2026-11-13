@@ -2,7 +2,7 @@
 
 ## Overview
 
-`cmd/openstorage` is the `openstorage` binary (`package main`). It is the composition root of the service. It parses flags and `OPENSTORAGE_*` environment variables into one validated config, opens the ref, metadata, and blob stores, wires the API, Git, eventing, sync, and background-job packages from `internal/`, and serves them on one HTTP listener. It also ships operator subcommands for keys, tokens, signing keys, pack listing, repo purge, and s3wal metadata conversion.
+`cmd/openstorage` is the `openstorage` binary (`package main`). It is the composition root of the service. It parses flags and `OPENSTORAGE_*` environment variables into one validated config, opens the ref, metadata, and blob stores, wires the API, Git, eventing, sync, and background-job packages from `internal/`, and serves them on one HTTP listener. It also ships operator subcommands for keys, tokens, signing keys, pack listing, repo purge, ref repair, and s3wal metadata conversion.
 
 The files split by role:
 
@@ -14,7 +14,7 @@ The files split by role:
 | `wire_eventing.go` | Serve-side and hook-side eventing: job queue, ref-store decorator, webhook sink, loopback sync key. |
 | `wire_eventing_local.go` | `buildLocalSyncQueue`: the non-Postgres job queue. |
 | `activereqs.go` | In-flight request tracker, printed when the shutdown drain times out. |
-| `signingkey.go`, `purgerepo.go`, `s3walmeta.go` | The `signing-key`, `purge-repo`, and `s3wal-meta` subcommands. |
+| `signingkey.go`, `purgerepo.go`, `repairrefs.go`, `s3walmeta.go` | The `signing-key`, `purge-repo`, `repair-refs`, and `s3wal-meta` subcommands. |
 
 ## Interface
 
@@ -31,6 +31,7 @@ The files split by role:
 | `signing-key add\|list\|remove` | `[signingkey.go:cmdSigningKey]` | `-org` (required), `-data-dir`. `add` takes `-key`, the path to a file that holds an SSH public key line or an ASCII-armored PGP public key block. `[signingkey.go:runSigningKeyAdd]` reads that file. `remove` takes `-id`. |
 | `list-packs` | `[main.go:cmdListPacks]` | `-repo` (required), `-data-dir`. Prints each blob key under `blob.PackPrefix(repo)` with its size, then a `total: <n> pack(s)` count line. |
 | `purge-repo` | `[purgerepo.go:cmdPurgeRepo]` | One positional `<repo-id>`, `-yes` (required confirmation), `-data-dir`. |
+| `repair-refs` | `[repairrefs.go:cmdRepairRefs]`, `[repairrefs.go:repairRefs]` | One positional `<repo-id>`, `-yes` (delete; without it the command only lists), `-data-dir`. Lists the refs of the repo that `ref.Unlockable` picks, and with `-yes` swaps each listed SHA for the zero SHA, except the default branch. |
 | `s3wal-meta convert` | `[s3walmeta.go:cmdS3WALMeta]`, `[s3walmeta.go:runS3WALMetaConvert]` | `-to` (`2` upgrade, `1` downgrade), `-force` (only with `-to 1`). |
 | `version`, `--version` | `[main.go:main]` | Prints `version.String()`. |
 
@@ -62,7 +63,7 @@ The files split by role:
 
 With `-data-dir` and no explicit URLs, `[config.go:resolveStorageURLs]` derives `sqlite://<dir>/codestorage.db`, `file://<dir>/blobs`, and `<dir>/cache`.
 
-Operator subcommands read some of these variables too. `[purgerepo.go:cmdPurgeRepo]` resolves the storage URLs, `OPENSTORAGE_SECRETS_KEY`, `OPENSTORAGE_SECRETS_MODE`, `OPENSTORAGE_PACK_QUOTA_BYTES`, and `OPENSTORAGE_PACK_RESERVATION_TTL`. `[signingkey.go:cmdSigningKey]` resolves the storage URLs and the two secrets variables.
+Operator subcommands read some of these variables too. `[purgerepo.go:cmdPurgeRepo]` resolves the storage URLs, `OPENSTORAGE_SECRETS_KEY`, `OPENSTORAGE_SECRETS_MODE`, `OPENSTORAGE_PACK_QUOTA_BYTES`, and `OPENSTORAGE_PACK_RESERVATION_TTL`. `[signingkey.go:cmdSigningKey]` resolves the storage URLs and the two secrets variables. `[repairrefs.go:cmdRepairRefs]` resolves the storage URLs only, and no secrets key.
 
 The `hook` subprocess also reads per-push variables that the Git server sets (names defined in `[../../internal/githttp/hook.go:EnvSyncClaim]`). `[wire_eventing.go:hookCallerDeniedForward]` reads `OPENSTORAGE_GIT_SCOPES`. `[wire_eventing.go:hookCallerDeniedPull]` reads `OPENSTORAGE_GIT_REFS_POLICY` and `OPENSTORAGE_GIT_OPS`. `[wire_eventing.go:wireHookEventing]` reads `OPENSTORAGE_SYNC_CLAIM`, which marks a sync run's own loopback push.
 
@@ -83,7 +84,7 @@ The `hook` subprocess also reads per-push variables that the Git server sets (na
 
 - `[main.go:main]` `envconfig.CheckLegacy` runs before every subcommand except `hook`, `version`, and `--version`. Old-only `CODESTORAGE_*` settings refuse startup.
 - `[main.go:fatalf]` Every error that a subcommand returns prints `openstorage <cmd>: <err>` to stderr and exits `1`. An orderly signal shutdown of `serve` returns nil and exits `0`.
-- `[main.go:cmdServe]`, `[main.go:cmdKeygen]`, `[main.go:cmdMint]`, `[main.go:cmdListPacks]`, `[signingkey.go:cmdSigningKey]`, `[purgerepo.go:cmdPurgeRepo]`, `[s3walmeta.go:cmdS3WALMeta]` Each subcommand parses flags with `flag.ExitOnError`. An unknown or malformed flag prints the `flag` package usage message and exits `2`, and `-h` exits `0`. `fatalf` does not run on those paths.
+- `[main.go:cmdServe]`, `[main.go:cmdKeygen]`, `[main.go:cmdMint]`, `[main.go:cmdListPacks]`, `[signingkey.go:cmdSigningKey]`, `[purgerepo.go:cmdPurgeRepo]`, `[repairrefs.go:cmdRepairRefs]`, `[s3walmeta.go:cmdS3WALMeta]` Each subcommand parses flags with `flag.ExitOnError`. An unknown or malformed flag prints the `flag` package usage message and exits `2`, and `-h` exits `0`. `fatalf` does not run on those paths.
 - `[config.go:resolveServeConfig]` A DB URL and a blob URL are required (`errDBURLRequired`, `errBlobURLRequired`). `OPENSTORAGE_ORG` and `OPENSTORAGE_ORG_PUBKEYS` must both be set.
 - `[config.go:validateZeroInfraPairing]` An `s3wal://` DB URL requires an `s3://` blob URL.
 - `[config.go:envFirst]` The first alias that is present wins, even when its value is empty.
@@ -144,6 +145,7 @@ The `hook` subprocess also reads per-push variables that the Git server sets (na
 - `[main.go:cmdKeygen]` Writes `<out>.pem` (mode `0600`) and `<out>.pub.pem` (mode `0644`). Without `-if-missing` it truncates existing files.
 - `[signingkey.go:cmdSigningKey]`, `[purgerepo.go:cmdPurgeRepo]` Run metadata schema DDL through `[wire.go:openMetaStore]`, which calls `InitSchema`. `purge-repo` also calls `InitSchema` on the ref store.
 - `[signingkey.go:runSigningKeyAdd]`, `[signingkey.go:runSigningKeyRemove]` Insert or delete rows in the org signing-key registry.
+- `[repairrefs.go:cmdRepairRefs]` Reads the repo row through `jobs.RepoPurgeMeta` without schema setup or a secrets key, and fails when the repo is not found. It calls `InitSchema` on the ref store only with `-yes`. `[repairrefs.go:deleteUnlockableRef]` deletes with one `CASRef` per ref, never retries a lost swap, and refuses a ref that git can lock. `[repairrefs.go:repairTarget.isDefaultBranch]` keeps the default branch. It writes the raw ref store, so it sends no webhook and no sync poke.
 - `[purgerepo.go:cmdPurgeRepo]` CAUTION: this is irreversible. It drops the repo's registry rows and quarantines its blobs through `jobs.RepoPurger`.
 - `[s3walmeta.go:runS3WALMetaConvert]` Acquires the s3wal instance lease and rewrites the metadata document through `meta.ConvertS3WALMeta`.
 
