@@ -976,7 +976,7 @@ func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, 
 	// map would hide a duplicate name.
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil, notObject
+		return bodyErrors{}, notObject
 	}
 	// member is what a known name has so far: its own problem, which is
 	// the first one (a repeat of a bad member adds none), and the problems
@@ -993,13 +993,13 @@ func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, 
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
-			return nil, notObject
+			return bodyErrors{}, notObject
 		}
 		name, ok := tok.(string)
 		assertf(ok, "checkStrictObject: member name token %T", tok)
 		var v json.RawMessage
 		if err := dec.Decode(&v); err != nil {
-			return nil, notObject
+			return bodyErrors{}, notObject
 		}
 		ft, ok := fields[name]
 		if !ok {
@@ -1007,6 +1007,12 @@ func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, 
 				continue
 			}
 			unknownSeen[name] = true
+			if len(unknown.errs) >= maxInvalidParams {
+				// A body of 1 MiB holds 100,000 unknown members: count the
+				// ones that the answer leaves out, and build no problem.
+				unknown.dropped++
+				continue
+			}
 			msg := fmt.Sprintf("unknown field %q", path+name)
 			if name == "" { // an empty member name has no dotted wire path
 				unknown.add(errors.New(msg))
@@ -1038,19 +1044,29 @@ func strictObjectProblems(raw []byte, t reflect.Type, path string) (bodyErrors, 
 	}
 	// The closing brace, then nothing: trailing data is not an object.
 	if _, err := dec.Token(); err != nil {
-		return nil, notObject
+		return bodyErrors{}, notObject
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return nil, notObject
+		return bodyErrors{}, notObject
 	}
 	var problems bodyErrors
 	for _, name := range names {
 		if m := members[name]; m != nil {
 			problems.add(m.own)
-			problems = append(problems, m.nested...)
+			strictAddAll(&problems, m.nested)
 		}
 	}
-	return append(problems, unknown...), nil
+	strictAddAll(&problems, unknown)
+	return problems, nil
+}
+
+// strictAddAll adds each problem of src to dst, in order, and counts the
+// ones that src already left out.
+func strictAddAll(dst *bodyErrors, src bodyErrors) {
+	for _, err := range src.errs {
+		dst.add(err)
+	}
+	dst.dropped += src.dropped
 }
 
 // wrefDecodeStrictBody is wrefDecodeBody with strictJSON.

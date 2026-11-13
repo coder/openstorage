@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -98,6 +99,11 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 			{
 				name: "POST one: author", method: http.MethodPost, path: post, token: fx.gitTok,
 				body: `{` + ipNoteReq + `,"author":{"name":"n"}}`, wantError: authorMsg, want: []ipParam{required("author.email")},
+			},
+
+			{
+				name: "POST an uppercase guard is not a problem", method: http.MethodPost, path: post, token: fx.gitTok,
+				body: `{"note":"x","expected_notes_ref_sha":"` + strings.Repeat("A", 40) + `"}`, wantError: "object_ref is required", want: []ipParam{required("object_ref")},
 			},
 
 			// POST .../notes/append: object_ref, note, notes_ref,
@@ -320,4 +326,60 @@ func TestStrictJSONOrder(t *testing.T) {
 	if err := strictJSON([]byte(`{"ref":"r","inner":{"name":"n"}}`), &ok); err != nil || ok.Ref != "r" || ok.Inner == nil || ok.Inner.Name != "n" {
 		t.Fatalf("valid body: err %v, decoded %+v", err, ok)
 	}
+}
+
+// TestStrictJSONBoundsItsAnswer: a body of 1 MiB holds 100,000 unknown
+// members. The answer names at most maxInvalidParams problems and counts
+// the others (each member once), however they split between a member's own
+// problem, the ones below it and the unknown ones.
+func TestStrictJSONBoundsItsAnswer(t *testing.T) {
+	unknown := func(n int, prefix string) string {
+		var b strings.Builder
+		for i := range n {
+			fmt.Fprintf(&b, `"%s%03d":1,`, prefix, i)
+		}
+		return b.String()
+	}
+	type dst struct {
+		Note   string `json:"note"`
+		Author *struct {
+			Name string `json:"name"`
+		} `json:"author"`
+	}
+	for _, tc := range []struct {
+		name, body, first, last, tail string
+	}{
+		{"unknown members", `{` + unknown(150, "u") + `"note":"n"}`, "u000", "u099", "; and 50 more"},
+		{"a repeat counts once", `{` + unknown(120, "u") + unknown(120, "u") + `"note":"n"}`, "u000", "u099", "; and 20 more"},
+		{"known problems share the bound", `{` + unknown(150, "u") + `"note":null,"author":null}`, "note", "u097", "; and 52 more"},
+		{"members below an object share it too", `{"author":{` + unknown(150, "n") + `"name":"x"}}`, "author.n000", "author.n099", "; and 50 more"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := strictJSON([]byte(tc.body), new(dst))
+			if err == nil {
+				t.Fatal("strictJSON succeeded")
+			}
+			got := invalidParamsFor(err)
+			if len(got) != maxInvalidParams || got[0].Name != tc.first || got[len(got)-1].Name != tc.last {
+				t.Fatalf("%d items, first %v, last %v, want %d, %s, %s", len(got), got[0], got[len(got)-1], maxInvalidParams, tc.first, tc.last)
+			}
+			if msg := err.Error(); !strings.HasSuffix(msg, tc.tail) || strings.Count(msg, "; ") != maxInvalidParams {
+				t.Fatalf("message ends %q with %d separators, want %q and %d", msg[len(msg)-20:], strings.Count(msg, "; "), tc.tail, maxInvalidParams)
+			}
+		})
+	}
+	// Past the bound a member costs the walk only: reading it takes about 4
+	// allocations, and building its problem would add about 6 more.
+	t.Run("builds no problem past the bound", func(t *testing.T) {
+		const n = 20000
+		body := []byte("{" + unknown(n, "m") + `"note":"n"}`)
+		allocs := testing.AllocsPerRun(2, func() {
+			if strictJSON(body, new(dst)) == nil {
+				t.Fatal("strictJSON succeeded")
+			}
+		})
+		if perMember := allocs / n; perMember > 7 {
+			t.Fatalf("%.1f allocations for each unknown member, want at most 7", perMember)
+		}
+	})
 }

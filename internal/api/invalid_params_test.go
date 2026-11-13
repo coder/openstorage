@@ -78,6 +78,10 @@ func ipNewFixture(t *testing.T, e *testEnv) ipFixture {
 }
 
 func TestBodyErrors(t *testing.T) {
+	// The docs and the answer say 100: pin the number, not the constant.
+	if maxInvalidParams != 100 {
+		t.Fatalf("maxInvalidParams = %d, the docs say 100", maxInvalidParams)
+	}
 	field := func(name string) error {
 		return newFieldError(name, "is required", name+" is required")
 	}
@@ -163,8 +167,62 @@ func TestBodyErrors(t *testing.T) {
 		if len(got) != maxInvalidParams || got[0].Name != "paths.0" || got[maxInvalidParams-1].Name != fmt.Sprintf("paths.%d", maxInvalidParams-1) {
 			t.Fatalf("got %d params, first %v, last %v", len(got), got[0], got[len(got)-1])
 		}
-		if !strings.HasSuffix(err.Error(), "; and 25 more") {
+		if !strings.HasSuffix(err.Error(), "; and 25 more") || strings.Count(err.Error(), "; ") != maxInvalidParams {
+			t.Fatalf("message tail = %q, separators %d", err.Error()[len(err.Error())-30:], strings.Count(err.Error(), "; "))
+		}
+		if len(b.errs) != maxInvalidParams {
+			t.Fatalf("collector kept %d problems, want %d", len(b.errs), maxInvalidParams)
+		}
+	})
+
+	t.Run("a problem with two fields can cross the bound", func(t *testing.T) {
+		var b bodyErrors
+		for i := range maxInvalidParams - 1 {
+			b.add(field(fmt.Sprintf("paths.%d", i)))
+		}
+		b.add(newFieldErrors("author name and email are required",
+			invalidParam{Name: "author.name", Reason: "is required"},
+			invalidParam{Name: "author.email", Reason: "is required"}))
+		err := b.err()
+		got := invalidParamsFor(err)
+		if len(got) != maxInvalidParams || got[len(got)-1].Name != "author.name" {
+			t.Fatalf("got %d params, last %v", len(got), got[len(got)-1])
+		}
+		if !strings.HasSuffix(err.Error(), "; and 1 more") {
 			t.Fatalf("message tail = %q", err.Error()[len(err.Error())-30:])
+		}
+	})
+
+	t.Run("one problem that names too many fields is bounded", func(t *testing.T) {
+		items := make([]invalidParam, maxInvalidParams+7)
+		for i := range items {
+			items[i] = invalidParam{Name: fmt.Sprintf("paths.%d", i), Reason: "is required"}
+		}
+		var b bodyErrors
+		b.add(newFieldErrors("paths are required", items...))
+		err := b.err()
+		if got := invalidParamsFor(err); len(got) != maxInvalidParams {
+			t.Fatalf("got %d params, want %d", len(got), maxInvalidParams)
+		}
+		if want := "paths are required; and 7 more"; err.Error() != want {
+			t.Fatalf("message = %q, want %q", err.Error(), want)
+		}
+		var small bodyErrors
+		only := newFieldErrors("paths are required", items[:maxInvalidParams]...)
+		small.add(only)
+		if got := small.err(); got != only {
+			t.Fatalf("a problem within the bound must come back unchanged")
+		}
+	})
+
+	t.Run("problems without a field are bounded too", func(t *testing.T) {
+		var b bodyErrors
+		for i := range maxInvalidParams + 50 {
+			b.add(fmt.Errorf("rule %d", i))
+		}
+		err := b.err()
+		if invalidParamsFor(err) != nil || !strings.HasSuffix(err.Error(), "; and 50 more") || strings.Count(err.Error(), "; ") != maxInvalidParams {
+			t.Fatalf("message = %q", err.Error())
 		}
 	})
 }
@@ -223,11 +281,44 @@ func TestMergeNamesEveryInvalidField(t *testing.T) {
 				wantError: "squash is incompatible with the ff_only strategy",
 			},
 			{
+				name: "an ident with an empty name and a newline", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"merge","author":{"name":"","email":"x\n"},"committer":{"name":"c\r","email":""}}`,
+				wantError: "author name and email are required; author contains newlines; committer name and email are required; committer contains newlines",
+				want: []ipParam{
+					{"author.name", "is required"}, {"author", "must not contain newlines"},
+					{"committer.email", "is required"}, {"committer", "must not contain newlines"},
+				},
+			},
+			{
+				name: "a raw expected_source_sha is checked with the others", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"target_branch":"main","strategy":"merge","expected_source_sha":5}`,
+				wantError: "missing source_ref; expected_source_sha must be a 40-hex sha",
+				want:      []ipParam{{"source_ref", "is required"}, {"expected_source_sha", "must be a 40-hex sha"}},
+			},
+			{
 				name: "squash with ff_only also lacks its message", method: http.MethodPost, path: path, token: fx.gitTok,
 				body:      `{"source_ref":"f","target_branch":"main","strategy":"ff_only","squash":true}`,
 				wantError: "squash is incompatible with the ff_only strategy; commit_message is required with squash",
 				want:      []ipParam{{"commit_message", "is required with squash"}},
 			},
+		})
+
+		// A wrong-type field stops the decode: only that field is named, and
+		// the checks of the other fields run once every type is right.
+		t.Run("a wrong-type field is named alone", func(t *testing.T) {
+			resp, body := e.doReq(t, http.MethodPost, path, fx.gitTok,
+				[]byte(`{"target_branch":"refs/heads/main","strategy":5,"author":{"email":"e"}}`), "")
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, body)
+			}
+			requireEnvelope(t, resp, body)
+			var p problemBody
+			if err := json.Unmarshal(body, &p); err != nil {
+				t.Fatal(err)
+			}
+			if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != "strategy" || p.InvalidParams[0].Reason != "must be a string" {
+				t.Fatalf("invalid_params = %+v, want only strategy (body %s)", p.InvalidParams, body)
+			}
 		})
 	})
 }
