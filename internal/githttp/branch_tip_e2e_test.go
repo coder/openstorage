@@ -146,14 +146,23 @@ func TestBranchTipThatIsNoCommitIsRefused(t *testing.T) {
 			}
 			refs := pgRefs(t, repo)
 			for _, c := range tc.cmds {
-				if c.new != blob && c.new != tree && c.new != annotated {
+				switch {
+				case c.new == blob || c.new == tree || c.new == annotated:
+					if !strings.HasPrefix(report[c.ref], "ng") {
+						t.Fatalf("%s was not refused: report %v\nremote:\n%s", c.ref, report, remote)
+					}
+				case c.ref == tc.landed:
+					if report[c.ref] != "ok" || refs[c.ref] != c2 {
+						t.Fatalf("%s did not land at %s: report %v, ref %s", c.ref, c2, report, refs[c.ref])
+					}
 					continue
+				default:
+					// An atomic push lands nothing when one command is refused.
 				}
-				if !strings.HasPrefix(report[c.ref], "ng") {
-					t.Fatalf("%s was not refused: report %v\nremote:\n%s", c.ref, report, remote)
-				}
-				if _, ok := refs[c.ref]; ok && c.ref != "refs/heads/main" {
-					t.Fatalf("the ref store holds %s after the refusal", c.ref)
+				if c.ref != "refs/heads/main" {
+					if got, ok := refs[c.ref]; ok {
+						t.Fatalf("the ref store holds %s = %s after the push", c.ref, got)
+					}
 				}
 			}
 			if !strings.Contains(remote, tc.want) {
@@ -161,9 +170,6 @@ func TestBranchTipThatIsNoCommitIsRefused(t *testing.T) {
 			}
 			if refs["refs/heads/main"] != c1 {
 				t.Fatalf("main = %s after a refused push, want %s", refs["refs/heads/main"], c1)
-			}
-			if tc.landed != "" && (report[tc.landed] != "ok" || refs[tc.landed] != c2) {
-				t.Fatalf("%s did not land at %s: report %v, ref %s", tc.landed, c2, report, refs[tc.landed])
 			}
 		})
 	}
