@@ -78,6 +78,10 @@ func ipNewFixture(t *testing.T, e *testEnv) ipFixture {
 }
 
 func TestBodyErrors(t *testing.T) {
+	// The docs and the answer say 100: pin the number, not the constant.
+	if maxInvalidParams != 100 {
+		t.Fatalf("maxInvalidParams = %d, the docs say 100", maxInvalidParams)
+	}
 	field := func(name string) error {
 		return newFieldError(name, "is required", name+" is required")
 	}
@@ -189,6 +193,28 @@ func TestBodyErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("one problem that names too many fields is bounded", func(t *testing.T) {
+		items := make([]invalidParam, maxInvalidParams+7)
+		for i := range items {
+			items[i] = invalidParam{Name: fmt.Sprintf("paths.%d", i), Reason: "is required"}
+		}
+		var b bodyErrors
+		b.add(newFieldErrors("paths are required", items...))
+		err := b.err()
+		if got := invalidParamsFor(err); len(got) != maxInvalidParams {
+			t.Fatalf("got %d params, want %d", len(got), maxInvalidParams)
+		}
+		if want := "paths are required; and 7 more"; err.Error() != want {
+			t.Fatalf("message = %q, want %q", err.Error(), want)
+		}
+		var small bodyErrors
+		only := newFieldErrors("paths are required", items[:maxInvalidParams]...)
+		small.add(only)
+		if got := small.err(); got != only {
+			t.Fatalf("a problem within the bound must come back unchanged")
+		}
+	})
+
 	t.Run("problems without a field are bounded too", func(t *testing.T) {
 		var b bodyErrors
 		for i := range maxInvalidParams + 50 {
@@ -253,6 +279,21 @@ func TestMergeNamesEveryInvalidField(t *testing.T) {
 				name: "one rule across fields answers as before", method: http.MethodPost, path: path, token: fx.gitTok,
 				body:      `{"source_ref":"f","target_branch":"main","strategy":"ff_only","squash":true,"commit_message":"m"}`,
 				wantError: "squash is incompatible with the ff_only strategy",
+			},
+			{
+				name: "an ident with an empty name and a newline", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"merge","author":{"name":"","email":"x\n"},"committer":{"name":"c\r","email":""}}`,
+				wantError: "author name and email are required; author contains newlines; committer name and email are required; committer contains newlines",
+				want: []ipParam{
+					{"author.name", "is required"}, {"author", "must not contain newlines"},
+					{"committer.email", "is required"}, {"committer", "must not contain newlines"},
+				},
+			},
+			{
+				name: "a raw expected_source_sha is checked with the others", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"target_branch":"main","strategy":"merge","expected_source_sha":5}`,
+				wantError: "missing source_ref; expected_source_sha must be a 40-hex sha",
+				want:      []ipParam{{"source_ref", "is required"}, {"expected_source_sha", "must be a 40-hex sha"}},
 			},
 			{
 				name: "squash with ff_only also lacks its message", method: http.MethodPost, path: path, token: fx.gitTok,
