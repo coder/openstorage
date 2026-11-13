@@ -499,3 +499,40 @@ func TestHookBinaryKeepsStoreErrorsOffStderr(t *testing.T) {
 	}
 	checkHidden(t, stderr.String(), got, c, "host", "user", "database")
 }
+
+// A panic in a hook reaches the pusher as Go's panic output, which names
+// server paths. RunHook turns it into the fixed line and writes the panic
+// and its stack to the hook-errors file.
+func TestRunHookTurnsAPanicIntoTheFixedLine(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	for _, args := range [][]string{{"update", "refs/heads/main", ref.ZeroSHA, sha}, {"pre-receive"}} {
+		t.Run(args[0], func(t *testing.T) {
+			records := hookEnv(t, canarySQLite(t))
+			t.Setenv(EnvRepo, "") // mustEnv panics on it
+			err := RunHook(t.Context(), args)
+			if want := args[0] + " failed; push again later (the server log has the cause)"; err == nil || err.Error() != want {
+				t.Fatalf("RunHook = %v, want %q", err, want)
+			}
+			got := readRecords(t, records)
+			for _, want := range []string{"required env " + EnvRepo + " is empty", "goroutine"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("the hook-errors records lack %q: %.600s", want, got)
+				}
+			}
+		})
+	}
+}
+
+// Without a hook-errors file no pusher reads the hook's stderr, so a panic
+// keeps Go's panic output for the operator.
+func TestRunHookKeepsAPanicWithoutAPushVisible(t *testing.T) {
+	hookEnv(t, canarySQLite(t))
+	t.Setenv(EnvHookErrors, "")
+	t.Setenv(EnvRepo, "") // mustEnv panics on it
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("RunHook swallowed a panic that has no pusher")
+		}
+	}()
+	_ = RunHook(t.Context(), []string{"pre-receive"})
+}
