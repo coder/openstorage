@@ -447,7 +447,7 @@ func TestDecodeHostileBodies(t *testing.T) {
 				switch {
 				case s.kind == 'a' && array == "":
 					array = s.name
-				case s.kind == 'o' && s.kids[len(s.kids)-1].secret || s.kind == 'o' && s.kids[0].secret:
+				case s.kind == 'o' && s.kids[0].secret:
 					secret = `"` + s.name + `":{"` + s.kids[0].name + `":"` + ipdSecret + `"}`
 				case s.secret && secret == "":
 					secret = `"` + s.name + `":"` + ipdSecret + `"`
