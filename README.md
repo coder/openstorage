@@ -129,8 +129,8 @@ Two stateless replicas (`node-a`, `node-b`), built from the repo `Dockerfile`, s
 Postgres and SeaweedFS. A push through one node is visible through the other.
 
 > [!WARNING]
-> This is a development stack: default credentials, published backing-service ports,
-> and plain HTTP. For real deployments, follow the [production guide](docs/how-to/deploy-production.md).
+> This is a development stack: default credentials, published backing-service ports
+> (on `127.0.0.1` only), and plain HTTP. For real deployments, follow the [production guide](docs/how-to/deploy-production.md).
 
 ```sh
 # 1. Generate keys on the host from this checkout (requires openstorage; see Install).

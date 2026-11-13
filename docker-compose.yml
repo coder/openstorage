@@ -6,6 +6,12 @@
 # Host ports are env-overridable because sibling checkouts/agents may share
 # the docker daemon; pick a unique compose project name too:
 #   PGPORT=15499 S3PORT=18499 docker compose -p openstorage-$(whoami) up -d --wait
+#
+# Postgres and the S3 gateway publish on 127.0.0.1 only: the Postgres
+# password and the gateway's static Admin identity are public development
+# defaults. To publish one on every interface on purpose, drop the
+# `127.0.0.1:` prefix from its `ports:` entry and change those credentials
+# first. Reach both as 127.0.0.1, not `localhost`, which can resolve to ::1.
 services:
   postgres:
     # postgres:17-alpine (PostgreSQL 17.11 when pinned) by OCI index digest.
@@ -14,7 +20,7 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
     ports:
-      - "${PGPORT:-15432}:5432"
+      - "127.0.0.1:${PGPORT:-15432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 2s
@@ -35,7 +41,7 @@ services:
       - source: seaweedfs-s3
         target: /etc/seaweedfs/s3.json
     ports:
-      - "${S3PORT:-18333}:8333"
+      - "127.0.0.1:${S3PORT:-18333}:8333"
     healthcheck:
       # The gateway's unauthenticated /healthz: it 200s only once the S3
       # gateway is actually serving (the port accepts TCP before that),
