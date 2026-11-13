@@ -50,31 +50,42 @@ silently skipping LFS coverage.
 ### SeaweedFS fixture image
 
 The fixtures and reference Compose file pin SeaweedFS
-[4.51](https://github.com/seaweedfs/seaweedfs/releases/tag/4.51), published
-2026-10-25. [Changes since 4.48](https://github.com/seaweedfs/seaweedfs/compare/4.48...4.51)
-touch S3 authorization (POST policy uploads, wildcard policy targets, POST
-Object ACL fields), GET/HEAD tag and attribute echoing, delete-marker reads,
-filer and master startup, and the `-ip.bind` listeners. With `-ip.bind` set,
-each port now binds only that address, so `-ip.bind=0.0.0.0` still answers
-on loopback.
+[4.53](https://github.com/seaweedfs/seaweedfs/releases/tag/4.53), published
+2026-11-08. [Changes since 4.51](https://github.com/seaweedfs/seaweedfs/compare/4.51...4.53)
+touch S3 authorization (lifecycle, CORS and versioning changes need their own
+actions, POST Object header fields, per-bucket Block Public Access), the write
+path (conditional write headers and multipart completion conditions are
+evaluated under the object lock), the shortened first-write wait below, and the
+S3 Vectors gateway. The image now also carries the `weed-vector` binary and
+unpacks 256 MB larger than 4.51 (792 MB against 536 MB). As of 4.51, each
+`-ip.bind` port binds only that address, so `-ip.bind=0.0.0.0` still answers on
+loopback.
 
-On a fresh `weed server`, 4.50 and 4.51 hold the first object write for about
-12 to 15 s: the master defers volume allocation and the filer waits up to
-10 s before it joins the S3 lock ring
-([seaweedfs#12145](https://github.com/seaweedfs/seaweedfs/issues/12145), fixed
-upstream after 4.51). While the lock ring is empty, a PUT waits for its
-object-write lock and fails after 15 s. In local runs the ring formed 2 to
-12 s after the first lock attempt, so the first PUT waited and succeeded. The
-write-readiness check retries a failed write for 60 s.
+On a fresh `weed server`, 4.50 and 4.51 held the first object write for about
+12 to 15 s ([seaweedfs#12145](https://github.com/seaweedfs/seaweedfs/issues/12145)).
+4.52 shortened that wait ([seaweedfs#12149](https://github.com/seaweedfs/seaweedfs/pull/12149))
+but did not remove it. With the fixture's flags (`server -s3 -dir=/data
+-ip.bind=0.0.0.0`), the first PUT took 8.8 s on 4.53 in three runs, against
+12.6 to 12.8 s on 4.51 in three runs (2026-11-13). In a logged 4.53 run the
+master deferred volume allocation for 4.7 s, and the S3 lock ring formed about
+10 s after the container started. While the lock ring is empty, a PUT waits for
+its object-write lock and fails after 15 s. In the three 4.53 runs the first PUT
+waited and succeeded. The write-readiness check retries a failed write for
+60 s.
 
-SHA-256 digests of the Docker Hub image metadata (retrieved 2026-10-29; a
+SHA-256 digests of the Docker Hub image metadata (retrieved 2026-11-13; a
 published manifest does not prove runtime qualification):
 
-| Image metadata | 4.48 | 4.51 |
+| Image metadata | 4.51 | 4.53 |
 |---|---|---|
-| Multi-platform index | `4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d` | `f7a49e3f3972ebed5be2ed4befa4a0c68eb7bdddba6e692d42729ceb545134b8` |
-| Linux/amd64 manifest | `aba492e2a4e4c90bff795745e8e660affa1f09e7650f5981bd7bccd1a06cd931` | `3a522c379599e163433a636e75022630848b63a74f08ea37bf06f8d776e9a707` |
-| Linux/arm64 manifest | `f1f303474940e9e088edbd2c1658f7ac38cb0dd90f91a2b0a51916d74b8575a1` | `7e68a388de0806ed8d96f30cb7e927182a3d80d42920cb87d97d23311a7a1a77` |
+| Multi-platform index | `f7a49e3f3972ebed5be2ed4befa4a0c68eb7bdddba6e692d42729ceb545134b8` | `ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0` |
+| Linux/amd64 manifest | `3a522c379599e163433a636e75022630848b63a74f08ea37bf06f8d776e9a707` | `972ba30c529dfc72a6a12ed427e94d99c7b6a6e59d97bfa52be0a849f43e2cc9` |
+| Linux/arm64 manifest | `7e68a388de0806ed8d96f30cb7e927182a3d80d42920cb87d97d23311a7a1a77` | `210d0f5999432219ca23f61bf467965869520202d4a820d717a6a6c008b77a41` |
+| Linux/amd64 config (image ID) | `e9535759e270021cc18782c39e1dcc7977ad801edc4e3676a3d2f6c29bf598b6` | `438dbbd3f87a4db35b82d4a9646b70d54dda6df32d434df44b6445a3a5e608de` |
+
+The linux/amd64 image of the 4.53 pin runs `weed version` 4.53 (revision
+`4ab66fb76`, the 4.53 tag commit). The linux/arm64 manifest is published and
+hashed, but no run covers arm64.
 
 On every pin change:
 
