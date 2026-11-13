@@ -43,6 +43,10 @@ func (t repairTarget) isDefaultBranch(name string) bool {
 }
 
 func cmdRepairRefs(ctx context.Context, args []string) error {
+	return runRepairRefs(ctx, args, os.Stdout)
+}
+
+func runRepairRefs(ctx context.Context, args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("repair-refs", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `usage: openstorage repair-refs [flags] <repo-id>
@@ -114,7 +118,7 @@ Flags:
 		}
 	}
 	target := repairTarget{repoID: repoID, url: state.Repo.URL, defaultBranch: state.Repo.DefaultBranch}
-	return repairRefs(ctx, rs, target, *yes, os.Stdout)
+	return repairRefs(ctx, rs, target, *yes, out)
 }
 
 // repairRefs lists the refs of repoID that git can never lock and, when yes
@@ -133,9 +137,9 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 	}
 	fmt.Fprintf(out, "scanned: %d refs\n", scanned)
 	if scanned == 0 {
-		// The metadata row exists, so the repository has no refs in this
-		// ref store.
-		fmt.Fprintln(out, "no refs in the ref store under this ID: check that the database URL or --data-dir is the one that serve uses")
+		// The metadata row exists, and the row and the refs share one
+		// database URL, so the repository has no refs.
+		fmt.Fprintln(out, "this repository has no refs: it is empty, it was purged, or its last refs were just deleted")
 		return nil
 	}
 	if len(found) == 0 {
