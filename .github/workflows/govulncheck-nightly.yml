@@ -6,8 +6,9 @@
 # `govulncheck -scan symbol` (the default level, spelled out here) exits 3
 # only when a vulnerable function is reachable from this module's own code.
 # A vulnerability that sits only in a required module, or in an imported
-# package that the code never calls, is listed in the log and does not fail
-# the run: the scanner's text handler returns its "vulnerabilities found" error
+# package whose vulnerable function the code never calls, is listed in the log
+# and does not fail the run: the scanner's text handler returns its
+# "vulnerabilities found" error
 # only for a call-level finding at the scan level (golang.org/x/vuln
 # internal/scan/text.go, Flush). Any other non-zero exit is a scan failure
 # (for example "Loading packages failed") and also fails the run, so a broken
@@ -22,6 +23,8 @@
 # module graph differs per platform (a darwin build links go-isatty and
 # go-strftime, a linux build links procfs). Go and the govulncheck version both
 # come from mise.toml, and GOFLAGS=-mod=vendor scans the committed vendor/ tree.
+# The step fails first when mise.toml and go.mod name different Go versions,
+# because release builds take their Go from go.mod.
 name: govulncheck-nightly
 
 on:
@@ -58,6 +61,12 @@ jobs:
         run: |
           go version
           govulncheck -version
+          want="go$(go list -m -f '{{.GoVersion}}')"
+          have=$(go env GOVERSION)
+          if [ "$have" != "$want" ]; then
+            echo "::error title=govulncheck::the scan runs on ${have} but go.mod says ${want}, so it would not scan the standard library that releases build with"
+            exit 1
+          fi
           rc=0
           govulncheck -scan symbol -show verbose ./cmd/openstorage || rc=$?
           if [ "$rc" -eq 3 ]; then
