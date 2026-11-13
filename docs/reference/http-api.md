@@ -70,7 +70,7 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   route's request body in this document, array elements by index, and a field appears
   once. `detail` then holds the message of each problem, joined by `; `. One answer
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
-  out. A check that needs the repository's state (for example, that a merge creates a
+  out (not for fields of the wrong type, see below). A check that needs the repository's state (for example, that a merge creates a
   commit and so needs an `author`) runs after the checks of the body. A strictly decoded
   body (`POST /api/repos/{repo_name}/notes/append` and `POST
   /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
@@ -78,10 +78,17 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   member that is unknown, repeated or `null`, or that must be an object and is not, and
   none of the other problems. When the check reaches a JSON syntax error or trailing
   data before it finds a bad member, the answer names no member. The other checks run
-  only when the members are fine. When the JSON decoder finds a field of the wrong type,
-  the answer names one such field (the first that the decoder finds) and none of the
-  other problems: the other checks run only when every field has its right type. A field
-  that stays raw for a check of its own (the `expected_source_sha` of a merge, the
+  only when the members are fine. When the JSON decoder finds fields of the wrong type,
+  the answer names each of them, in the order of the body (array elements by index,
+  nested fields by their dotted path), and none of the other problems: the other checks
+  run only when every field has its right type. A body with fields of the wrong type and
+  fields that fail a check of their own names the wrong-type fields only. The answer
+  names up to 100 wrong-type fields, within a work bound: the server decodes the body
+  once more for each field it names, and stops when the decodes add up to 256 KiB. So a
+  body of 2 KiB can name 100 fields, a body of 10 KiB about 26, and a body of more than
+  128 KiB only the first. The server neither names nor counts the other wrong-type
+  fields, so `detail` does not end with `and N more` for them. A body with one wrong-type
+  field gets the answer it always got. A field that stays raw for a check of its own (the `expected_source_sha` of a merge, the
   `target_branch` of a branch create) is checked with the others. A check of the store
   (a credential `password` that starts with `enc:`) runs after the lookups of the route,
   so a missing repository or credential is `404` first. When another field of the body
@@ -103,9 +110,12 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   adds its message to `detail` and names no field. `PATCH /repo` and the pull-upstream
   routes check one body field each (`default_branch`, `ref`), so they name that field.
   The other routes with a request body do not collect problems yet: a check there can
-  hide the checks after it. `POST /repos` decodes `upstream` and `base_repo` on their
-  own (see its body below), so a field of the wrong type inside one of them is named
-  alone, as above.
+  hide the checks after it. Every route that decodes its body as one JSON object names
+  each field of the wrong type, as above, with these exceptions, which name the first
+  or follow their own rules: the strictly decoded bodies, the `upstream` member of
+  `POST /repos`, and `commit-pack`, `diff-commit` and `restore-commit`. `POST /repos`
+  decodes `upstream` and `base_repo` on their own (see its body below): a body with
+  several fields of the wrong type inside `base_repo` names each of them.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -295,8 +305,9 @@ the same scopes, query parameters and responses.
   for each, in the order `default_branch`, then the fields of `upstream` or `base_repo`
   as listed above. The create decodes `upstream` and `base_repo` on their own, before it
   checks any field other than `repo_name`. When that decode fails (a field of the wrong
-  type, an unknown field), the answer is that failure alone: it names the field of the
-  wrong type, and no other check of the body runs. A body that sets both members is decoded as neither.
+  type, an unknown field), the answer is that failure alone: it names each field of the
+  wrong type in `base_repo`, the first problem of `upstream` (decoded strictly), and no
+  other check of the body runs. A body that sets both members is decoded as neither.
   A check that needs another field is skipped when that field is invalid. A missing or
   unsupported `provider` skips the checks that need it: the rules that tie `access` to
   the provider (only `github` takes it, and then it must be `public`) and the default
