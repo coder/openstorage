@@ -81,8 +81,11 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   the password with the other fields. The credential routes that name the repository or
   credential in the path (`/repos/{repo_name}/git-credentials` and
   `/repos/{repo_name}/git-credentials/{git_credential_id}`) look that one up before they
-  read the body, so on them a missing one is `404` even when the body is invalid. `POST
-  /repos/merge`, `POST /repos/branches/create`, `POST /repos/tags`, `POST` and `PUT` on
+  read the body, so on them a missing one is `404` even when the body is invalid. A grep
+  `pagination.cursor` that does not decode is named with the other invalid fields when
+  the body has any. Alone, it keeps its place after the lookup of the repository, so a
+  missing repository is `404` first. `POST /repos/merge`, `POST /repos/branches/create`,
+  `POST /repos/tags`, `POST /repos/grep`, `POST /repos/archive`, `POST` and `PUT` on
   `/repos/git-credentials` and on `/repos/{repo_name}/git-credentials`, and `PUT
   /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. The other
   routes with a request body do not collect problems yet: a check there can hide the
