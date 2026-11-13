@@ -98,6 +98,25 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 				name: "POST one: author", method: http.MethodPost, path: post, token: fx.gitTok,
 				body: `{` + ipNoteReq + `,"author":{"name":"n"}}`, wantError: authorMsg, want: []ipParam{required("author.email")},
 			},
+			// git takes each ident as an environment value, which cannot hold a NUL.
+			{
+				name: "POST a NUL in the author name and email", method: http.MethodPost, path: post, token: fx.gitTok,
+				body:      `{` + ipNoteReq + `,"author":{"name":"a\u0000","email":"e\u0000"}}`,
+				wantError: invalidTextMsg("author.name") + "; " + invalidTextMsg("author.email"),
+				want:      []ipParam{{"author.name", ipcNulReason}, {"author.email", ipcNulReason}},
+			},
+			{
+				name: "POST a NUL in the name of an author with an empty email", method: http.MethodPost, path: post, token: fx.gitTok,
+				body:      `{` + ipNoteReq + `,"author":{"name":"a\u0000","email":""}}`,
+				wantError: authorMsg + "; " + invalidTextMsg("author.name"),
+				want:      []ipParam{required("author.email"), {"author.name", ipcNulReason}},
+			},
+			{
+				name: "POST one: a NUL in the author email", method: http.MethodPost, path: post, token: fx.gitTok,
+				body:      `{` + ipNoteReq + `,"author":{"name":"n","email":"e\u0000"}}`,
+				wantError: invalidTextMsg("author.email"),
+				want:      []ipParam{{"author.email", ipcNulReason}},
+			},
 
 			{
 				name: "POST an uppercase guard is not a problem", method: http.MethodPost, path: post, token: fx.gitTok,
@@ -156,6 +175,11 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 			{
 				name: "DELETE one: body guard", method: http.MethodDelete, path: del, token: fx.gitTok,
 				body: `{"object_ref":"main","expected_notes_ref_sha":"x"}`, wantError: guardMsg, want: []ipParam{validSHA("expected_notes_ref_sha")},
+			},
+			{
+				name: "DELETE one: a NUL in the body author", method: http.MethodDelete, path: del, token: fx.gitTok,
+				body:      `{"object_ref":"main","author":{"name":"a\u0000","email":"e"}}`,
+				wantError: invalidTextMsg("author.name"), want: []ipParam{{"author.name", ipcNulReason}},
 			},
 		})
 

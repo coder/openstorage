@@ -525,14 +525,17 @@ func wcValidateBranchParam(field, name string) error {
 }
 
 // wcAuthorProblems returns each problem of one ident: the empty name and
-// email (one problem), and newlines, which would corrupt the
-// GIT_AUTHOR_*/GIT_COMMITTER_* env-based ident encoding.
+// email (one problem), a NUL in the name or the email (one problem each),
+// and newlines, which would corrupt the GIT_AUTHOR_*/GIT_COMMITTER_*
+// env-based ident encoding. An environment value cannot hold a NUL.
 func wcAuthorProblems(field string, a wcAuthor) []error {
 	var problems []error
 	if err := requiredFields(field+" name and email are required",
 		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email}); err != nil {
 		problems = append(problems, err)
 	}
+	problems = append(problems, invalidTextEach(
+		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email})...)
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
 		problems = append(problems, newFieldError(field, "must not contain newlines", field+" contains newlines"))
 	}
@@ -560,6 +563,10 @@ func wcValidateMetadata(md *wcMetadata) error {
 	}
 	if md.CommitMessage == "" {
 		return errors.New("missing commit_message")
+	}
+	// git takes the message as an argument, which cannot hold a NUL.
+	if err := invalidTextFields([2]string{"commit_message", md.CommitMessage}); err != nil {
+		return err
 	}
 	if err := wcValidateAuthor("author", md.Author); err != nil {
 		return err
@@ -1897,8 +1904,12 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	// commit; the deprecated target_commit_sha stays a 40-hex sha.
 	revision := md.BaseRef != nil
 	md.applyCurrentNames()
-	if md.CommitMessage == "" {
-		md.CommitMessage = "Restore to " + md.TargetCommitSHA
+	// The default message names the target, which is checked below. A
+	// placeholder stands in until then, so that a NUL in the target is a
+	// problem of the target and not of commit_message.
+	defaultMessage := md.CommitMessage == ""
+	if defaultMessage {
+		md.CommitMessage = "Restore"
 	}
 	if err := wcValidateMetadata(md); err != nil {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
@@ -1911,6 +1922,9 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	if !revision && !ref.ValidSHA(md.TargetCommitSHA) {
 		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is required (or the deprecated 40-hex target_commit_sha)", "", "")
 		return
+	}
+	if defaultMessage {
+		md.CommitMessage = "Restore to " + md.TargetCommitSHA
 	}
 	plan, ok := s.wcPlanCommit(w, r, repo.RepoID, md)
 	if !ok {

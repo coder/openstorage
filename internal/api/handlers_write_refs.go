@@ -1154,6 +1154,10 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	if req.Author != nil {
 		errs.add(requiredFields("author name and email are required when author is provided",
 			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}))
+		for _, err := range invalidTextEach(
+			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}) {
+			errs.add(err)
+		}
 		author = *req.Author
 	}
 	if err := errs.err(); err != nil {

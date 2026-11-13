@@ -338,6 +338,31 @@ func TestMergeNamesEveryInvalidField(t *testing.T) {
 					{"committer.email", "is required"}, {"committer", "must not contain newlines"},
 				},
 			},
+			// git takes the message as an argument and each ident as an
+			// environment value, and neither can hold a NUL.
+			{
+				name: "a NUL in the message and in each ident", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"source_ref":"f","target_branch":"main","strategy":"merge","commit_message":"m\u0000x",` +
+					`"author":{"name":"a\u0000","email":"e\u0000"},"committer":{"name":"c","email":"e\u0000"}}`,
+				wantError: invalidTextMsg("commit_message") + "; " + invalidTextMsg("author.name") + "; " + invalidTextMsg("author.email") +
+					"; " + invalidTextMsg("committer.email"),
+				want: []ipParam{
+					{"commit_message", ipcNulReason}, {"author.name", ipcNulReason}, {"author.email", ipcNulReason},
+					{"committer.email", ipcNulReason},
+				},
+			},
+			{
+				name: "a NUL in the name of an ident with an empty email", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"merge","author":{"name":"a\u0000","email":""}}`,
+				wantError: "author name and email are required; " + invalidTextMsg("author.name"),
+				want:      []ipParam{{"author.email", "is required"}, {"author.name", ipcNulReason}},
+			},
+			{
+				name: "one problem: a NUL in the message", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"merge","squash":true,"commit_message":"m\u0000"}`,
+				wantError: invalidTextMsg("commit_message"),
+				want:      []ipParam{{"commit_message", ipcNulReason}},
+			},
 			{
 				name: "a raw expected_source_sha is checked with the others", method: http.MethodPost, path: path, token: fx.gitTok,
 				body:      `{"target_branch":"main","strategy":"merge","expected_source_sha":5}`,
