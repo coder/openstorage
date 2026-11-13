@@ -316,8 +316,8 @@ ref. Remove the ref from the ref store with
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
    and exits with an error. Run it again to list what is left.
 4. Run the dry run once more. It must scan refs and list none. A scan of 0 refs means
-   that the ID matches no repository. The next clone or fetch hydrates the repository
-   again, on every replica.
+   that no refs have that ID: check the ID. The next clone or fetch hydrates the
+   repository again, on every replica.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and
