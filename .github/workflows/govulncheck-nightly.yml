@@ -1,0 +1,48 @@
+# Nightly vulnerability scan of the production packages (issue #842 follow-up).
+# Advisories appear against code that has not changed, so a PR-time check
+# would miss them. This workflow is not part of ci.yml: it is never a merge
+# gate, and a red run is a signal for the maintainers, not a blocked PR.
+#
+# `govulncheck -scan symbol` (the default level, spelled out here) exits 3
+# only when a vulnerable function is reachable from this module's own code.
+# A vulnerability that sits only in a required module, or in an imported
+# package that the code never calls, is listed in the log and does not fail
+# the run: the scanner's text handler returns its "vulnerabilities found" error
+# only for a call-level finding at the scan level (golang.org/x/vuln
+# internal/scan/text.go, Flush). Any other non-zero exit is a scan failure
+# (for example "Loading packages failed") and also fails the run, so a broken
+# scan cannot look like a clean one.
+#
+# The scan has no -test flag, so it covers what ships in the binary. Go and
+# the govulncheck version both come from mise.toml, and GOFLAGS=-mod=vendor
+# scans the committed vendor/ tree.
+name: govulncheck-nightly
+
+on:
+  schedule:
+    - cron: "11 5 * * *" # daily, 05:11 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+      - name: govulncheck ./... (production packages)
+        env:
+          GOFLAGS: -mod=vendor
+          GOTOOLCHAIN: local
+        run: |
+          go version
+          govulncheck -version
+          rc=0
+          govulncheck -scan symbol -show verbose ./... || rc=$?
+          if [ "$rc" -eq 3 ]; then
+            echo "::error title=govulncheck::the production code calls a vulnerable symbol (exit 3), see the Symbol Results above"
+          fi
+          exit "$rc"

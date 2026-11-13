@@ -2,3 +2,6 @@
 go = "1.27.4"
 golangci-lint = "2.15.0"
 terraform = "1.17.2"
+# .github/workflows/govulncheck-nightly.yml scans with this version. The go: backend
+# builds it with the Go above, which a scan of this module needs.
+"go:golang.org/x/vuln/cmd/govulncheck" = "1.9.0"
