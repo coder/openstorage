@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -234,7 +235,29 @@ func TestNotesAppendNamesEveryBadMember(t *testing.T) {
 				body:      `{"author":null,"author":{"name":null}}`,
 				wantError: prefix + "author must not be null", want: []ipParam{known("author", "must not be null")},
 			},
+			// Two members can have one dotted path: a member named "author.name"
+			// and the "name" of an author object. The later problem keeps its
+			// message and adds no second item for the path.
+			{
+				name: "a dotted unknown member and a repeat below an object", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"author.name":"v","author":{"name":"n","name":"m"}}`,
+				wantError: prefix + `duplicate field "author.name"; unknown field "author.name"`, want: []ipParam{known("author.name", "appears more than once")},
+			},
+			{
+				name: "a dotted unknown member and a null below an object", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"author":{"name":null},"author.name":"v"}`,
+				wantError: prefix + `author.name must not be null; unknown field "author.name"`, want: []ipParam{known("author.name", "must not be null")},
+			},
+			{
+				name: "a dotted unknown member and an unknown below an object say the same", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"author.x":1,"author":{"x":1}}`,
+				wantError: prefix + `unknown field "author.x"`, want: []ipParam{known("author.x", "is not a known field")},
+			},
 			// One problem answers as before.
+			{
+				name: "one dotted unknown member", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author.name":"v"}`, wantError: prefix + `unknown field "author.name"`, want: []ipParam{known("author.name", "is not a known field")},
+			},
 			{
 				name: "one unknown member", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"sha":"main","note":"n","bogus":1}`, wantError: prefix + `unknown field "bogus"`, want: []ipParam{known("bogus", "is not a known field")},
@@ -330,8 +353,9 @@ func TestStrictJSONOrder(t *testing.T) {
 
 // TestStrictJSONBoundsItsAnswer: a body of 1 MiB holds 100,000 unknown
 // members. The answer names at most maxInvalidParams problems and counts
-// the others (each member once), however they split between a member's own
-// problem, the ones below it and the unknown ones.
+// the others, however they split between a member's own problem, the ones
+// below it and the unknown ones. The walk keeps no name and builds no
+// problem past the bound.
 func TestStrictJSONBoundsItsAnswer(t *testing.T) {
 	unknown := func(n int, prefix string) string {
 		var b strings.Builder
@@ -350,7 +374,9 @@ func TestStrictJSONBoundsItsAnswer(t *testing.T) {
 		name, body, first, last, tail string
 	}{
 		{"unknown members", `{` + unknown(150, "u") + `"note":"n"}`, "u000", "u099", "; and 50 more"},
-		{"a repeat counts once", `{` + unknown(120, "u") + unknown(120, "u") + `"note":"n"}`, "u000", "u099", "; and 20 more"},
+		{"a repeat of a named member counts once", `{` + unknown(150, "u") + unknown(100, "u") + `"note":"n"}`, "u000", "u099", "; and 50 more"},
+		// The walk keeps the names of the 100 members it names, and no more.
+		{"a repeat of a left-out member counts again", `{` + unknown(150, "u") + unknown(150, "u") + `"note":"n"}`, "u000", "u099", "; and 100 more"},
 		{"known problems share the bound", `{` + unknown(150, "u") + `"note":null,"author":null}`, "note", "u097", "; and 52 more"},
 		{"members below an object share it too", `{"author":{` + unknown(150, "n") + `"name":"x"}}`, "author.n000", "author.n099", "; and 50 more"},
 	} {
@@ -368,18 +394,20 @@ func TestStrictJSONBoundsItsAnswer(t *testing.T) {
 			}
 		})
 	}
-	// Past the bound a member costs the walk only: reading it takes about 4
-	// allocations, and building its problem would add about 6 more.
-	t.Run("builds no problem past the bound", func(t *testing.T) {
+	// Past the bound a member costs the walk only: 2 allocations (its name
+	// token). Building its problem, or a new value buffer for it, costs more.
+	t.Run("keeps nothing past the bound", func(t *testing.T) {
 		const n = 20000
 		body := []byte("{" + unknown(n, "m") + `"note":"n"}`)
-		allocs := testing.AllocsPerRun(2, func() {
-			if strictJSON(body, new(dst)) == nil {
-				t.Fatal("strictJSON succeeded")
-			}
-		})
-		if perMember := allocs / n; perMember > 7 {
-			t.Fatalf("%.1f allocations for each unknown member, want at most 7", perMember)
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		err := strictJSON(body, new(dst))
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			t.Fatal("strictJSON succeeded")
+		}
+		if perMember := float64(after.Mallocs-before.Mallocs) / n; perMember > 2.5 {
+			t.Errorf("%.1f allocations for each unknown member, want about 2", perMember)
 		}
 	})
 }

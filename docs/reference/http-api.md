@@ -72,18 +72,25 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   out. A check that needs the repository's state (for example, that a merge creates a
   commit and so needs an `author`) runs after the checks of the body. A strictly decoded
   body (`POST /api/repos/{repo_name}/notes/append` and `POST
-  /api/repos/{repo_name}/upstream/pull`) is checked for its members first: the answer
-  names every unknown, duplicate or `null` member and every member that must be an
-  object, the members of the route in the order of its request body and then the unknown
-  ones in the order of the body, and none of the other problems. When the JSON decoder
-  finds a field of the wrong type, the answer names one such field (the first that the
-  decoder finds) and none of the other problems: the other checks run only when every
-  field has its right type. A field that stays raw for a check of its own (the
-  `expected_source_sha` of a merge) is checked with the others. `POST /repos/merge`,
+  /api/repos/{repo_name}/upstream/pull`) that is one complete JSON object is checked for
+  its members first: the answer names every unknown, duplicate or `null` member and every
+  member that must be an object, the members of the route in the order of its request
+  body and then the unknown ones in the order of the body, and none of the other
+  problems. A member whose dotted name another problem already names (a member called
+  `author.name` next to an `author` object that repeats `name`) adds no second item, and
+  adds its message to `detail` unless the message is the same. A JSON syntax error,
+  trailing data, or a value that is not an object names no member and wins over the
+  member problems. When the JSON decoder finds a field of the wrong type, the answer
+  names one such field (the first that the decoder finds) and none of the other
+  problems: the other checks run only when every field has its right type. A field that
+  stays raw for a check of its own (the `expected_source_sha` of a merge) is checked with
+  the others. `POST /repos/merge`,
   `POST /repos/notes`, `POST /api/repos/{repo_name}/notes/append` and `DELETE
   /repos/notes` answer this way, and so does the member check of `POST
-  /api/repos/{repo_name}/upstream/pull`. The other routes with a request body do not
-  collect problems yet: a check there can hide the checks after it.
+  /api/repos/{repo_name}/upstream/pull`. A `DELETE /repos/notes` problem with a query
+  parameter, or with a missing or empty `object_ref`, adds its message to `detail` and
+  names no field. The other routes with a request body do not collect problems yet: a
+  check there can hide the checks after it.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
