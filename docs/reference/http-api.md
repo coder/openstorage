@@ -70,11 +70,11 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   route's request body in this document, array elements by index, and a field appears
   once. `detail` then holds the message of each problem, joined by `; ` (a problem whose
   fields all appear in earlier problems adds no message). One answer holds at most 100
-  items, and `detail` ends with `; and N more` when it leaves some out: N counts the
-  items that it leaves out. A check that needs the repository's state (for example,
-  that a merge creates a commit and so needs an `author`) runs after the checks of the
-  body, except for the one case that the notes on `POST /repos` below describe. A
-  strictly decoded body (`POST /api/repos/{repo_name}/notes/append` and `POST
+  items, and `detail` ends with `; and N more` when it leaves some out: N counts what it
+  leaves out, one for each item and one for each problem that names no field. A check
+  that needs the repository's state (for example, that a merge creates a commit and so
+  needs an `author`) runs after the checks of the body, except where this paragraph or
+  the notes on `POST /repos` below say otherwise. A strictly decoded body (`POST /api/repos/{repo_name}/notes/append` and `POST
   /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
   of the body, and the check stops at the first problem: the answer names the first
   member that is unknown, repeated or `null`, or that must be an object and is not (an
@@ -98,21 +98,23 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   when git runs the search, after the checks of the body and the lookups of the
   repository and the ref, so it is named alone and a missing repository or ref is `404`
   first. `POST /repos/merge`, `POST /repos/branches/create`, `DELETE /repos/branches`
-  (for a name that comes from the body), `POST /repos/tags`, `POST /repos`,
+  (for a name that comes from the body: an `ephemeral` query parameter that is not valid
+  answers first and names no field), `POST /repos/tags`, `POST /repos`,
   `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`, `DELETE /repos/notes`,
   `POST /api/repos/{repo_name}/notes/append` (when its members
   and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
   `/repos/{repo_name}/git-credentials`, and `PUT
   /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. A `DELETE
   /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
-  adds its message to `detail` and names no field. `PATCH /repo` and the pull-upstream
-  routes check one body field each (`default_branch`, `ref`), so they name that field.
-  The commit write routes (`commit-pack`, `diff-commit`, `restore-commit`,
-  `reset-commits`) answer with upstream's `CommitWriteResponse` or `ProblemDetails`,
-  which have no `invalid_params`, and the webhook routes are not part of upstream's API.
-  A check on these routes can hide the checks after it. `POST /repos` decodes `upstream` and `base_repo` on their
-  own (see its body below), so a field of the wrong type inside one of them is named
-  alone, as above.
+  adds its message to `detail` and names no field. `PATCH /repo`, the pull-upstream
+  routes, `DELETE /repos/tags` and `DELETE /repos/git-credentials` check one body field
+  each (`default_branch`, `ref`, `name`, `id`), so they name that field. The commit
+  write routes (`commit-pack`, `diff-commit`, `restore-commit`) answer with upstream's
+  `CommitWriteResponse` or `ProblemDetails`, which have no `invalid_params`, and the
+  webhook routes and `push-upstream` are not part of upstream's API. A check on these
+  routes can hide the checks after it. `POST /repos` decodes `upstream` and `base_repo`
+  on their own (see its body below), so a field of the wrong type inside one of them is
+  named alone, as above.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -314,9 +316,10 @@ the same scopes, query parameters and responses.
   (`owner`, `name`). A `base_repo.default_branch` is checked only when the body has no
   `default_branch` of its own, because a create uses the first of the two. The
   `default_branch` query parameter is no body field and names none.
-- A token whose `refs` claim does not parse is refused with 403 before the body is
-  checked. The checks of state answer after the checks of the body fields: the ref
-  policy (403),
+- A token whose `refs` claim does not parse is refused with 403 before the fields of
+  the body are checked, after the body has been read (an unreadable body, and a copy or
+  fork body that does not decode, answer `400` first). The checks of state answer after
+  the checks of the body fields: the ref policy (403),
   the egress check of the upstream host (it looks the host up), and for a copy or fork
   the source token (403), the source repository (404) and the fork point (400). A
   `default_branch` of the body that is the only invalid field answers after the ref
