@@ -524,15 +524,25 @@ func wcValidateBranchParam(field, name string) error {
 	return nil
 }
 
-// wcValidateAuthor validates one ident. Newlines would corrupt the
+// wcAuthorProblems returns each problem of one ident: the empty name and
+// email (one problem), and newlines, which would corrupt the
 // GIT_AUTHOR_*/GIT_COMMITTER_* env-based ident encoding.
-func wcValidateAuthor(field string, a wcAuthor) error {
+func wcAuthorProblems(field string, a wcAuthor) []error {
+	var problems []error
 	if err := requiredFields(field+" name and email are required",
 		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email}); err != nil {
-		return err
+		problems = append(problems, err)
 	}
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
-		return newFieldError(field, "must not contain newlines", field+" contains newlines")
+		problems = append(problems, newFieldError(field, "must not contain newlines", field+" contains newlines"))
+	}
+	return problems
+}
+
+// wcValidateAuthor validates one ident and returns its first problem.
+func wcValidateAuthor(field string, a wcAuthor) error {
+	if problems := wcAuthorProblems(field, a); len(problems) > 0 {
+		return problems[0]
 	}
 	return nil
 }

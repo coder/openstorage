@@ -18,13 +18,22 @@ const maxInvalidParams = 100
 // of a field that already failed. A route adds its fields in the order of
 // its request body in docs/reference/http-api.md, and array entries by
 // index, so the answer to one request never changes order. A body with one
-// problem answers with that problem unchanged.
-type bodyErrors []error
+// problem answers with that problem unchanged. The collector keeps at most
+// maxInvalidParams problems and counts the rest, so a body full of bad
+// array entries costs one answer of bounded size.
+type bodyErrors struct {
+	errs    []error
+	dropped int
+}
 
 // add collects err. A nil err is no problem.
 func (b *bodyErrors) add(err error) {
-	if err != nil {
-		*b = append(*b, err)
+	switch {
+	case err == nil:
+	case len(b.errs) >= maxInvalidParams:
+		b.dropped++
+	default:
+		b.errs = append(b.errs, err)
 	}
 }
 
@@ -33,26 +42,22 @@ func (b *bodyErrors) add(err error) {
 // the message of each problem in order, joined by "; ", and one
 // invalid_params item for each field they name. A problem that names no
 // field adds its message only. A field that two problems name counts once.
-// After maxInvalidParams items, the message says how many problems it
-// left out.
-func (b bodyErrors) err() error {
-	switch len(b) {
+// When the answer leaves problems out, the message ends with `and N more`.
+func (b *bodyErrors) err() error {
+	switch len(b.errs) + b.dropped {
 	case 0:
 		return nil
 	case 1:
-		return b[0]
+		if len(invalidParamsFor(b.errs[0])) <= maxInvalidParams {
+			return b.errs[0]
+		}
 	}
 	var (
 		params []invalidParam
 		msgs   []string
 		named  = make(map[string]bool)
-		more   int
 	)
-	for i, e := range b {
-		if len(params) >= maxInvalidParams || len(msgs) >= maxInvalidParams {
-			more = len(b) - i
-			break
-		}
+	for _, e := range b.errs {
 		items := invalidParamsFor(e)
 		fresh := len(items) == 0
 		for _, p := range items {
@@ -66,7 +71,11 @@ func (b bodyErrors) err() error {
 			msgs = append(msgs, e.Error())
 		}
 	}
-	params = params[:min(len(params), maxInvalidParams)]
+	more := b.dropped
+	if len(params) > maxInvalidParams {
+		more += len(params) - maxInvalidParams
+		params = params[:maxInvalidParams]
+	}
 	if more > 0 {
 		msgs = append(msgs, fmt.Sprintf("and %d more", more))
 	}
