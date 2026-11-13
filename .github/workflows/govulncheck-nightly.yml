@@ -23,11 +23,12 @@
 # module graph differs per platform (a darwin build links go-isatty and
 # go-strftime, a linux build links procfs). Go and the govulncheck version both
 # come from mise.toml, and GOFLAGS=-mod=vendor scans the committed vendor/ tree.
-# The step fails first when the three Go pins differ: the Go that mise.toml
-# installs for the scan, the Go that go.mod gives the release builds (its
-# toolchain line when it has one, else its go line) and the golang tag of the
-# Dockerfile builder. A scan on another Go would check a standard library that
-# does not ship.
+# The step fails first when the Go that mise.toml installs for the scan differs
+# from the Go that go.mod gives the release builds: its toolchain line when it
+# has one (not the value "default"), else its go line. A scan on another Go
+# would check a standard library that does not ship. The Dockerfile builder is
+# not read here. The image job of ci.yml builds it and fails when its Go is
+# older than go.mod.
 name: govulncheck-nightly
 
 on:
@@ -65,10 +66,9 @@ jobs:
           go version
           govulncheck -version
           have=$(go env GOVERSION)
-          want=$(go mod edit -json | jq -r '.Toolchain // ("go" + .Go)')
-          image=$(sed -n 's/^FROM .*golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile)
-          if [ "$have" != "$want" ] || [ "$image" != "$want" ]; then
-            echo "::error title=govulncheck::the Go versions differ: the scan runs ${have}, go.mod builds the releases with ${want}, the Dockerfile builds the image with ${image:-none}"
+          want=$(go mod edit -json | jq -r '(.Toolchain | select(. != "default")) // ("go" + .Go)')
+          if [ "$have" != "$want" ]; then
+            echo "::error title=govulncheck::the scan runs ${have} but go.mod builds the releases with ${want:-none}, so the scan would not check the standard library that ships"
             exit 1
           fi
           rc=0
