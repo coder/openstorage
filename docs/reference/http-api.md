@@ -63,17 +63,23 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   member out when it cannot name the fields: an unreadable or empty body, a JSON syntax
   error, a body that is not an object, an empty member name, unknown fields on the
   other bodies, rules across fields (such as `base_repo` and `upstream` together), and
-  query parameters. The message in `detail` does not change.
+  query parameters. For a body with one problem, the message in `detail` does not change.
   A body with several invalid fields gets one item for each of them, as upstream says
   (`invalid_params` "names each invalid field"). The items follow the order of the
   route's request body in this document, array elements by index, and a field appears
   once. `detail` then holds the message of each problem, joined by `; `. One answer
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
   out. A check that needs the repository's state (for example, that a merge creates a
-  commit and so needs an `author`) runs after the checks of the body. `POST
-  /repos/merge` and `POST /repos` answer this way. `PATCH /repo` and the pull-upstream
-  routes check one body field each (`default_branch`, `ref`), so they name that field.
-  The other routes with a request body still name only the first invalid field.
+  commit and so needs an `author`) runs after the checks of the body. When the JSON
+  decoder finds a field of the wrong type, the answer names one such field (the first
+  that the decoder finds) and none of the other problems: the other checks run only when
+  every field has its right type. A field that stays raw for a check of its own (the
+  `expected_source_sha` of a merge) is checked with the others. `POST /repos/merge` and
+  `POST /repos` answer this way. `PATCH /repo` and the pull-upstream routes check one
+  body field each (`default_branch`, `ref`), so they name that field. The other routes
+  with a request body do not collect problems yet: a check there can hide the checks
+  after it. `POST /repos` decodes `upstream` and `base_repo` on their own (see its body
+  below), so a field of the wrong type inside one of them is named alone, as above.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -261,11 +267,18 @@ the same scopes, query parameters and responses.
   generic with `upstream_host`.
 - A body with several invalid fields, in any create form, gets an `invalid_params` item
   for each, in the order `default_branch`, then the fields of `upstream` or `base_repo`
-  as listed above. A field whose check needs another field is checked only when that
-  field is valid: an unsupported `provider` leaves `access` and the default host
-  unchecked, and an invalid `base_repo.operation` is the only `base_repo` problem. The
-  `default_branch` query parameter is no body field and names none. The egress check of
-  the upstream host looks the host up, so it runs after the checks of the body. A
+  as listed above. The create decodes `upstream` and `base_repo` on their own, before it
+  checks any field. When that decode fails (a field of the wrong type, an unknown
+  field), the answer is that failure alone: it names the field of the wrong type, and
+  no other check of the body runs. A body that sets both members is decoded as neither.
+  A field whose check needs another field is checked only when that field
+  is valid: an unsupported `provider` leaves `access` and the default host unchecked,
+  and an invalid `base_repo.operation` is the only `base_repo` problem. One "are
+  required" message names all the empty fields of `upstream` (`provider`, `owner`,
+  `name`) or of `base_repo` (`owner`, `name`), and its items stand where the first of
+  them does. The `default_branch` query parameter is no body field and names none. The
+  egress check of the upstream host looks the host up, so it runs after the checks of
+  the body. A
   `default_branch` that is the only invalid field answers where it did before: after the
   ref-policy check (403) and, for a copy or fork, after the checks of the source token
   (403), the source repository (404) and the fork point (400).

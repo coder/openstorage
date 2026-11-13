@@ -593,10 +593,14 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 		errs.add(newFieldError("commit_message", "is required with squash", "commit_message is required with squash"))
 	}
 	if req.Author != nil {
-		errs.add(wcValidateAuthor("author", *req.Author))
+		for _, err := range wcAuthorProblems("author", *req.Author) {
+			errs.add(err)
+		}
 	}
 	if req.Committer != nil {
-		errs.add(wcValidateAuthor("committer", *req.Committer))
+		for _, err := range wcAuthorProblems("committer", *req.Committer) {
+			errs.add(err)
+		}
 	}
 	return errs.err()
 }

@@ -223,11 +223,11 @@ func bodyBranchProblem(req *createRepoRequest, spec *usyncBaseRepo) (top, base e
 // only one is not reported here: the default branch check of a create runs
 // after checks of state (a ref policy, a source repository), and a request
 // with that one problem keeps the answer of the first of them.
-func writeBodyErrors(w http.ResponseWriter, errs bodyErrors, held ...error) bool {
-	if len(errs) == 0 || (len(errs) == 1 && slices.Contains(held, errs[0])) {
+func writeBodyErrors(w http.ResponseWriter, errs *bodyErrors, held ...error) bool {
+	err := errs.err()
+	if err == nil || (len(errs.errs) == 1 && errs.dropped == 0 && slices.Contains(held, errs.errs[0])) {
 		return false
 	}
-	err := errs.err()
 	writeInvalid(w, err.Error(), err)
 	return true
 }

@@ -182,7 +182,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	errs.add(baseBranch)
 	// The default branch is checked below, after the source: it answers
 	// here only next to another problem.
-	if writeBodyErrors(w, errs, topBranch, baseBranch) {
+	if writeBodyErrors(w, &errs, topBranch, baseBranch) {
 		return
 	}
 	// A repeat of a finished copy or fork answers 200 before any source

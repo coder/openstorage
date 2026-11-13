@@ -51,6 +51,11 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 			post("upstream missing provider leaves the host unchecked", `{"upstream":{"owner":"o","name":"n","access":"x"}}`,
 				`upstream provider, owner, and name are required; invalid upstream access "x"`,
 				ipParam{"upstream.provider", "is required"}, ipParam{"upstream.access", "must be app or public"}),
+			// One required message names all the empty fields of its group,
+			// at the place of the first of them.
+			post("upstream required group stands at its first empty field", `{"upstream":{"owner":"o\u0000"}}`,
+				"upstream provider, owner, and name are required; invalid upstream.owner (want UTF-8 text without NUL)",
+				ipParam{"upstream.provider", "is required"}, ipParam{"upstream.name", "is required"}, ipParam{"upstream.owner", ipcNulReason}),
 			post("upstream one problem answers as before", `{"upstream":{"provider":"github","access":"public","owner":"o"}}`,
 				"upstream provider, owner, and name are required", ipParam{"upstream.name", "is required"}),
 
@@ -94,6 +99,20 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 				`unsupported base_repo provider "svn"`, ipParam{"base_repo.provider", "is not supported"}),
 			post("base_repo one problem answers as before", `{"base_repo":{"provider":"github","owner":"o"}}`,
 				"base_repo owner and name are required", ipParam{"base_repo.name", "is required"}),
+
+			// A member that fails to decode answers alone, as any decode
+			// failure does: no other check of the body runs.
+			post("upstream wrong type hides the other problems", `{"default_branch":"bad..name","upstream":{"provider":"svn","owner":1}}`,
+				"invalid upstream: json: cannot unmarshal number into Go struct field upstreamConfig.owner of type string",
+				ipParam{"upstream.owner", "must be a string"}),
+			post("upstream unknown field hides the other problems", `{"default_branch":"bad..name","upstream":{"provider":"svn","x":1}}`,
+				`invalid upstream: json: unknown field "x"`),
+			post("base_repo wrong type hides the other problems", `{"default_branch":"bad..name","base_repo":{"provider":"svn","auth":3}}`,
+				"invalid base_repo: json: cannot unmarshal number into Go struct field usyncBaseRepo.auth of type api.usyncBaseRepoAuth",
+				ipParam{"base_repo.auth", "must be an object"}),
+			post("body wrong type hides the other problems", `{"default_branch":5,"upstream":{"provider":"svn"}}`,
+				"invalid JSON body: json: cannot unmarshal number into Go struct field createRepoRequest.default_branch of type string",
+				ipParam{"default_branch", "must be a string"}),
 
 			// Rules across fields add their message and no item.
 			post("both forms and a bad default branch", `{"default_branch":"bad..name","base_repo":{"provider":"github"},"upstream":{"provider":"github"}}`,
