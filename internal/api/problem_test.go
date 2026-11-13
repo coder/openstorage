@@ -1345,7 +1345,7 @@ func testInvalidParamsOnValidators(t *testing.T, e *testEnv) {
 			[]param{req("expected_target_sha", "must be a 40-hex sha")}},
 		{"merge author", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"main","strategy":"merge","author":{"email":"e"}}`,
 			[]param{req("author.name", "is required")}},
-		{"merge squash ff_only", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"main","strategy":"ff_only","squash":true}`, nil},
+		{"merge squash ff_only", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"main","strategy":"ff_only","squash":true,"commit_message":"m"}`, nil},
 		{"merge squash message", http.MethodPost, "/api/v1/repos/merge", gitTok, `{"source_ref":"f","target_branch":"main","strategy":"ff_prefer","squash":true}`,
 			[]param{req("commit_message", "is required with squash")}},
 		{"note delete body", http.MethodDelete, "/api/v1/repos/notes", gitTok, `{"object_ref":"main","expected_notes_ref_sha":"x"}`,
