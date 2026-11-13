@@ -951,8 +951,16 @@ func TestMergeValidationAndAuth(t *testing.T) {
 		})
 
 		t.Run("unknown branches and repos are 404", func(t *testing.T) {
+			// A merge moves a branch to the source's commit, so a source
+			// that is no commit (a blob here) names nothing to merge.
+			repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			blobSHA := strings.TrimSpace(coreGit(t, repoPath, "rev-parse", fx.c2+":a.txt"))
 			for name, body := range map[string]map[string]any{
 				"unknown source":                wmMergeBody("ghost", "main", "merge", nil),
+				"source is a blob":              wmMergeBody(blobSHA, "main", "merge", nil),
 				"unknown target":                wmMergeBody("feature", "ghost", "merge", nil),
 				"ephemeral source without flag": wmMergeBody("scratch", "main", "merge", nil),
 			} {

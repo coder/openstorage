@@ -35,6 +35,10 @@ The receive path must:
 
 - Enforce JWT ref policies per ref update (`no-push`, `no-force-push`, `verify-sig`),
   first match wins, reporting per-ref `ng` results with a policy message.
+- Refuse a ref update under `refs/heads/` whose new value is not a commit (a blob, a tree
+  or an annotated tag), with a per-ref `ng`, as git does. Git checks only after the hooks
+  have run, and the server's ref store has taken the value by then, so the hooks refuse it
+  first. Other namespaces, such as tags, take any object.
 - Map namespaces: `+ephemeral` remotes see and update only the ephemeral ref space;
   persistent remotes must not see ephemeral refs (git namespaces or separate ref stores).
   open.storage gives the `+ephemeral` remote its own storage key. The HTTP API, though, stores its
