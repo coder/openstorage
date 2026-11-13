@@ -2894,10 +2894,11 @@ func isAncestor(old, new string) bool {
 // merge-base exits 128 when it cannot read a commit: an id that names no
 // commit (absent, a tree or a blob), or a commit with a missing parent. The
 // pusher can plant such a commit, because receive-pack checks the tips that
-// a command updates, not every object that its pack carries. No unreadable
-// commit is an ancestor, so the answer is false. Object state decides, not
-// git's message (commitExists, historyIntact). Exit 128 for two commits with
-// intact history, or any other failure, means a broken git: fail fast.
+// a command updates, not every object that its pack carries. A walk that
+// needs the unreadable part proves no ancestry, so the answer is false; a
+// walk that never reaches it ends in 0 or 1 as usual. Object state decides,
+// not git's message (commitExists, historyIntact). Exit 128 for two commits
+// with intact history, or any other failure, means a broken git: fail fast.
 func isAncestorUncached(old, new string) bool {
 	err := exec.Command("git", "merge-base", "--is-ancestor", old, new).Run()
 	if err == nil {
