@@ -1221,23 +1221,24 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 	for _, tc := range []struct {
 		name, method, path, token string
 		body                      string
+		msg                       string // the whole message: a decode failure holds no text of encoding/json
 		want                      *param // nil: no invalid_params
 	}{
 		// Upstream's own example (PATCH /repos, ValidationProblemDetails).
-		{"patch type error", http.MethodPatch, "/api/v1/repo", repoTok, `{"default_branch":5}`, &param{"default_branch", "must be a string"}},
-		{"alias patch type error", http.MethodPatch, "/api/repos/" + url, repoTok, `{"default_branch":5}`, &param{"default_branch", "must be a string"}},
-		{"create type error", http.MethodPost, "/api/v1/repos", freshTok, `{"default_branch":true}`, &param{"default_branch", "must be a string"}},
-		{"create branch type error", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":"x","force":"yes"}`, &param{"force", "must be a boolean"}},
-		{"strict unknown field", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"sha":"main","note":"n","bogus":1}`, &param{"bogus", "is not a known field"}},
+		{"patch type error", http.MethodPatch, "/api/v1/repo", repoTok, `{"default_branch":5}`, "default_branch must be a string", &param{"default_branch", "must be a string"}},
+		{"alias patch type error", http.MethodPatch, "/api/repos/" + url, repoTok, `{"default_branch":5}`, "default_branch must be a string", &param{"default_branch", "must be a string"}},
+		{"create type error", http.MethodPost, "/api/v1/repos", freshTok, `{"default_branch":true}`, "default_branch must be a string", &param{"default_branch", "must be a string"}},
+		{"create branch type error", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":"x","force":"yes"}`, "force must be a boolean", &param{"force", "must be a boolean"}},
+		{"strict unknown field", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"sha":"main","note":"n","bogus":1}`, `invalid JSON body: unknown field "bogus"`, &param{"bogus", "is not a known field"}},
 		{"nested base_repo type", http.MethodPost, "/api/v1/repos", freshTok, `{"base_repo":{"provider":"github","owner":"o","name":"n","auth":{"token":1}}}`,
-			&param{"base_repo.auth.token", "must be a string"}},
+			"base_repo.auth.token must be a string", &param{"base_repo.auth.token", "must be a string"}},
 		{"nested upstream type", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":1,"name":"n"}}`,
-			&param{"upstream.owner", "must be a string"}},
-		{"upstream not an object", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":3}`, &param{"upstream", "must be an object"}},
-		{"upstream unknown field", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":"o","name":"n","x":1}}`, nil},
-		{"strict empty member name", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"":1}`, nil},
-		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, nil},
-		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, nil},
+			"upstream.owner must be a string", &param{"upstream.owner", "must be a string"}},
+		{"upstream not an object", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":3}`, "upstream must be an object", &param{"upstream", "must be an object"}},
+		{"upstream unknown field", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":"o","name":"n","x":1}}`, `invalid upstream: unknown field "x"`, nil},
+		{"strict empty member name", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"":1}`, `invalid JSON body: unknown field ""`, nil},
+		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, "invalid JSON body", nil},
+		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, "invalid JSON body", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(tc.body), "")
@@ -1249,6 +1250,9 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			if err := json.Unmarshal(body, &p); err != nil {
 				t.Fatal(err)
 			}
+			if p.Error != tc.msg {
+				t.Fatalf("error = %q, want %q", p.Error, tc.msg)
+			}
 			if tc.want == nil {
 				if strings.Contains(string(body), `"invalid_params"`) {
 					t.Fatalf("body %s has invalid_params, want none", body)
@@ -1257,9 +1261,6 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			}
 			if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != tc.want.name || p.InvalidParams[0].Reason != tc.want.reason {
 				t.Fatalf("invalid_params = %+v, want [{%s %s}] (body %s)", p.InvalidParams, tc.want.name, tc.want.reason, body)
-			}
-			if !strings.HasPrefix(p.Error, "invalid ") {
-				t.Fatalf("error = %q, want the unchanged decode message", p.Error)
 			}
 		})
 	}

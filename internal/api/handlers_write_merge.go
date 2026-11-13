@@ -629,7 +629,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := unmarshalBody(body, &req); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return
 	}
 	if err := wmValidateMergeRequest(&req); err != nil {

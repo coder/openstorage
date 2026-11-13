@@ -36,26 +36,26 @@ func ipdF(name string, kind byte, kids ...ipdField) ipdField {
 func ipdSecretF(name string) ipdField { return ipdField{name: name, kind: 's', secret: true} }
 
 // ipdFamily is the decode of one route family. A wrap family decodes an
-// object that sits in the body member wrap, with its own message prefix.
+// object that sits in the body member wrap.
 type ipdFamily struct {
 	name, method, path, tok string
 	newReq                  func() any
 	schema                  []ipdField
-	wrap, msgPrefix         string
+	wrap                    string
 }
 
 func ipdFamilies(fx ipdFixture) []ipdFamily {
 	pair := func(n string) ipdField { return ipdF(n, 'o', ipdF("name", 's'), ipdF("email", 's')) }
 	obj := func(n string, kids ...ipdField) ipdField { return ipdF(n, 'o', kids...) }
 	f := func(name, method, path, tok string, newReq func() any, schema ...ipdField) ipdFamily {
-		return ipdFamily{name: name, method: method, path: path, tok: tok, newReq: newReq, schema: schema, msgPrefix: "invalid JSON body: "}
+		return ipdFamily{name: name, method: method, path: path, tok: tok, newReq: newReq, schema: schema}
 	}
 	note := []ipdField{ipdF("object_ref", 's'), ipdF("sha", 's'), ipdF("action", 's'), ipdF("note", 's'), ipdF("notes_ref", 's'),
 		ipdF("ref", 's'), ipdF("expected_notes_ref_sha", 's'), ipdF("expected_ref_sha", 's'), pair("author")}
 	baseRepo := f("create base_repo", http.MethodPost, "/api/v1/repos", fx.repoTok, func() any { return new(usyncBaseRepo) },
 		ipdF("provider", 's'), ipdF("owner", 's'), ipdF("name", 's'), ipdF("operation", 's'), ipdF("ref", 's'), ipdF("sha", 's'),
 		ipdF("default_branch", 's'), ipdF("upstream_host", 's'), obj("auth", ipdSecretF("token"), ipdF("auth_type", 's')), ipdF("forward_pushes", 'b'))
-	baseRepo.wrap, baseRepo.msgPrefix = "base_repo", "invalid base_repo: "
+	baseRepo.wrap = "base_repo"
 	return []ipdFamily{
 		f("create", http.MethodPost, "/api/v1/repos", fx.repoTok, func() any { return new(createRepoRequest) },
 			ipdF("repo_name", 's'), ipdF("default_branch", 's')),
@@ -250,9 +250,9 @@ type ipdCase struct {
 
 // ipdCases generates each bodies with one wrong-type field and each with
 // several for family f. The oracle names each wrong-type field in body
-// order, and its message is the message that encoding/json gives for a
-// body with that field alone (the answer of the route before this change),
-// joined by "; ". It does not use unmarshalBody.
+// order, and its message is `name reason` for each of them (upstream's
+// `default_branch must be a string`), joined by "; ". It does not use
+// unmarshalBody.
 func ipdCases(t *testing.T, f ipdFamily, each int) (one, many []ipdCase) {
 	t.Helper()
 	rng := rand.New(rand.NewPCG(1, uint64(len(f.name))))
@@ -274,10 +274,11 @@ func ipdCases(t *testing.T, f ipdFamily, each int) (one, many []ipdCase) {
 			if te, ok := errors.AsType[*json.UnmarshalTypeError](err); !ok || te.Field != fail.path {
 				t.Fatalf("generator: %s alone gives %v, want a type error at %s", alone, err, fail.path)
 			}
-			msgs = append(msgs, err.Error())
-			c.want = append(c.want, ipParam{ipdJoin(f.wrap, fail.path), fail.reason})
+			name := ipdJoin(f.wrap, fail.path)
+			msgs = append(msgs, name+" "+fail.reason)
+			c.want = append(c.want, ipParam{name, fail.reason})
 		}
-		c.msg = f.msgPrefix + strings.Join(msgs, "; ")
+		c.msg = strings.Join(msgs, "; ")
 		if len(fails) == 1 {
 			one = append(one, c)
 		} else {
@@ -291,8 +292,9 @@ func ipdCases(t *testing.T, f ipdFamily, each int) (one, many []ipdCase) {
 }
 
 // TestDecodeNamesEveryWrongTypeField compares the answer for generated
-// bodies with the oracle of ipdCases. A body with one wrong-type field must
-// answer as it did before, and a body with several must name each of them.
+// bodies with the oracle of ipdCases. A body with one wrong-type field and a
+// body with several must name each of them, and no answer holds text of
+// encoding/json.
 func TestDecodeNamesEveryWrongTypeField(t *testing.T) {
 	const each = 1000
 	runBackends(t, func(t *testing.T, e *testEnv) {
@@ -332,21 +334,22 @@ func TestDecodeRows(t *testing.T) {
 		for _, f := range ipdFamilies(fx) {
 			fams[f.name] = f
 		}
-		// msg is the message of encoding/json for one field.
-		msg := func(st, field, kind, typ string) string {
-			return "json: cannot unmarshal " + kind + " into Go struct field " + st + "." + field + " of type " + typ
+		// The message is `name reason` for each field, joined by "; ".
+		message := func(want []ipParam) string {
+			var items []string
+			for _, w := range want {
+				items = append(items, w.name+" "+w.reason)
+			}
+			return strings.Join(items, "; ")
 		}
-		str := func(st, field, kind string) string { return msg(st, field, kind, "string") }
-		// An array element has no "Go struct field" in encoding/json's message.
-		elem := func(st, field, kind string) string {
-			return "json: cannot unmarshal " + kind + " into " + st + "." + field + " of type string"
-		}
-		row := func(family, name, body, prefix string, msgs []string, want ...ipParam) ipCase {
+		row := func(family, name, body string, want ...ipParam) ipCase {
 			f := fams[family]
-			return ipCase{name: family + " " + name, method: f.method, path: f.path, token: f.tok, body: body,
-				wantError: prefix + strings.Join(msgs, "; "), want: want}
+			return ipCase{name: family + " " + name, method: f.method, path: f.path, token: f.tok, body: body, wantError: message(want), want: want}
 		}
-		const body, base = "invalid JSON body: ", "invalid base_repo: "
+		// A strictly decoded body names its first problem only.
+		strict := func(name, path, body string, want ipParam) ipCase {
+			return ipCase{name: name, method: http.MethodPost, path: path, token: fx.gitTok, body: body, wantError: message([]ipParam{want}), want: []ipParam{want}}
+		}
 		s := func(names ...string) (out []ipParam) {
 			for _, n := range names {
 				out = append(out, ipParam{n, "must be a string"})
@@ -354,95 +357,58 @@ func TestDecodeRows(t *testing.T) {
 			return out
 		}
 		paths := make([]string, 150)
-		var capMsgs []string
 		var capWant []ipParam
 		for i := range paths {
 			paths[i] = "7"
 		}
 		for i := range maxInvalidParams {
-			capMsgs = append(capMsgs, elem("grepRequestBody", "paths."+strconv.Itoa(i), "number"))
 			capWant = append(capWant, ipParam{"paths." + strconv.Itoa(i), "must be a string"})
 		}
 		ipRun(t, e, []ipCase{
-			row("create", "every field", `{"default_branch":7,"repo_name":true}`, body,
-				[]string{str("createRepoRequest", "default_branch", "number"), str("createRepoRequest", "repo_name", "bool")}, s("default_branch", "repo_name")...),
-			row("create base_repo", "nested fields", `{"base_repo":{"owner":1,"auth":{"token":2,"auth_type":3},"name":4}}`, base,
-				[]string{str("usyncBaseRepo", "owner", "number"), str("usyncBaseRepo", "auth.token", "number"), str("usyncBaseRepo", "auth.auth_type", "number"),
-					str("usyncBaseRepo", "name", "number")}, s("base_repo.owner", "base_repo.auth.token", "base_repo.auth.auth_type", "base_repo.name")...),
-			row("create base_repo", "a fork", `{"base_repo":{"operation":"fork","provider":"code","name":1,"ref":2}}`, base,
-				[]string{str("usyncBaseRepo", "name", "number"), str("usyncBaseRepo", "ref", "number")}, s("base_repo.name", "base_repo.ref")...),
-			row("credential POST", "no value in the answer", `{"password":{"`+ipdSecret+`":1},"username":["`+ipdSecret+`"],"repo_id":1}`, body,
-				[]string{str("gcredCreateRequest", "password", "object"), str("gcredCreateRequest", "username", "array"), str("gcredCreateRequest", "repo_id", "number")},
+			row("create", "every field", `{"default_branch":7,"repo_name":true}`, s("default_branch", "repo_name")...),
+			row("create base_repo", "nested fields", `{"base_repo":{"owner":1,"auth":{"token":2,"auth_type":3},"name":4}}`,
+				s("base_repo.owner", "base_repo.auth.token", "base_repo.auth.auth_type", "base_repo.name")...),
+			row("create base_repo", "a fork", `{"base_repo":{"operation":"fork","provider":"code","name":1,"ref":2}}`, s("base_repo.name", "base_repo.ref")...),
+			row("credential POST", "no value in the answer", `{"password":{"`+ipdSecret+`":1},"username":["`+ipdSecret+`"],"repo_id":1}`,
 				s("password", "username", "repo_id")...),
-			row("credential PUT", "every field", `{"password":1,"id":2,"username":3}`, body,
-				[]string{str("gcredUpdateRequest", "password", "number"), str("gcredUpdateRequest", "id", "number"), str("gcredUpdateRequest", "username", "number")},
-				s("password", "id", "username")...),
-			row("credential PUT by path", "every field", `{"username":1,"password":2}`, body,
-				[]string{str("gcredPathUpdateRequest", "username", "number"), str("gcredPathUpdateRequest", "password", "number")}, s("username", "password")...),
-			row("grep", "array elements, nested fields", `{"paths":["a",1,"b",true],"query":{"pattern":5},"limits":{"max_lines":"x"}}`, body,
-				[]string{elem("grepRequestBody", "paths.1", "number"), elem("grepRequestBody", "paths.3", "bool"), str("grepRequestBody", "query.pattern", "number"),
-					msg("grepRequestBody", "limits.max_lines", "string", "int")},
+			row("credential PUT", "every field", `{"password":1,"id":2,"username":3}`, s("password", "id", "username")...),
+			row("credential PUT by path", "every field", `{"username":1,"password":2}`, s("username", "password")...),
+			row("grep", "array elements, nested fields", `{"paths":["a",1,"b",true],"query":{"pattern":5},"limits":{"max_lines":"x"}}`,
 				ipParam{"paths.1", "must be a string"}, ipParam{"paths.3", "must be a string"}, ipParam{"query.pattern", "must be a string"},
 				ipParam{"limits.max_lines", "must be an integer"}),
 			{
 				name: "grep the answer holds 100 items and does not say that it left some out", method: http.MethodPost, path: "/api/v1/repos/grep", token: fx.gitTok,
-				body: `{"paths":[` + strings.Join(paths, ",") + `]}`, wantError: body + strings.Join(capMsgs, "; "), want: capWant,
+				body: `{"paths":[` + strings.Join(paths, ",") + `]}`, wantError: message(capWant), want: capWant,
 			},
-			row("archive", "every field", `{"max_blob_size":"1","include_globs":["a",2],"archive":{"prefix":3}}`, body,
-				[]string{msg("archiveRequestBody", "max_blob_size", "string", "int64"), elem("archiveRequestBody", "include_globs.1", "number"),
-					str("archiveRequestBody", "archive.prefix", "number")},
+			row("archive", "every field", `{"max_blob_size":"1","include_globs":["a",2],"archive":{"prefix":3}}`,
 				ipParam{"max_blob_size", "must be an integer"}, ipParam{"include_globs.1", "must be a string"}, ipParam{"archive.prefix", "must be a string"}),
-			row("pull-upstream", "every field", `{"after":1,"ref":2}`, body,
-				[]string{str("usyncPullUpstreamRequest", "after", "number"), str("usyncPullUpstreamRequest", "ref", "number")}, s("after", "ref")...),
-			row("pull-upstream deprecated path", "every field", `{"ref":1,"after":2}`, body,
-				[]string{str("usyncPullUpstreamRequest", "ref", "number"), str("usyncPullUpstreamRequest", "after", "number")}, s("ref", "after")...),
-			// The two strictly decoded bodies keep the first-problem rule.
-			{
-				name: "upstream/pull (strict) names the first wrong-type field only", method: http.MethodPost, path: fx.alias + "/upstream/pull", token: fx.gitTok,
-				body: `{"after":1,"ref":2}`, wantError: body + str("usyncPullUpstreamRequest", "after", "number"), want: s("after"),
-			},
-			{
-				name: "notes/append (strict) names the first wrong-type field only", method: http.MethodPost, path: fx.alias + "/notes/append", token: fx.gitTok,
-				body: `{"note":1,"object_ref":2}`, wantError: body + str("wrefNoteAppendRequest", "note", "number"), want: s("note"),
-			},
-			row("webhook", "every field", `{"secret":5,"url":{}}`, body,
-				[]string{str("createWebhookRequest", "secret", "number"), str("createWebhookRequest", "url", "object")}, s("secret", "url")...),
+			row("pull-upstream", "every field", `{"after":1,"ref":2}`, s("after", "ref")...),
+			row("pull-upstream deprecated path", "every field", `{"ref":1,"after":2}`, s("ref", "after")...),
+			strict("upstream/pull (strict) names the first wrong-type field only", fx.alias+"/upstream/pull", `{"after":1,"ref":2}`, ipParam{"after", "must be a string"}),
+			strict("notes/append (strict) names the first wrong-type field only", fx.alias+"/notes/append", `{"note":1,"object_ref":2}`, ipParam{"note", "must be a string"}),
+			row("webhook", "every field", `{"secret":5,"url":{}}`, s("secret", "url")...),
 			// A semantic problem of another field (an empty source_ref, a
 			// target_branch with refs/) is not named next to a type error.
-			row("merge", "only the wrong-type fields", `{"strategy":5,"source_ref":"","squash":"yes","author":{"name":1,"email":[]},"target_branch":"refs/heads/x"}`, body,
-				[]string{str("wmMergeRequest", "strategy", "number"), msg("wmMergeRequest", "squash", "string", "bool"), str("wmMergeRequest", "author.name", "number"),
-					str("wmMergeRequest", "author.email", "array")},
+			row("merge", "only the wrong-type fields", `{"strategy":5,"source_ref":"","squash":"yes","author":{"name":1,"email":[]},"target_branch":"refs/heads/x"}`,
 				ipParam{"strategy", "must be a string"}, ipParam{"squash", "must be a boolean"}, ipParam{"author.name", "must be a string"}, ipParam{"author.email", "must be a string"}),
-			row("branch create", "an unknown field is not named", `{"force":"y","base_ref":5,"typo":1}`, body,
-				[]string{msg("request", "force", "string", "bool"), str("request", "base_ref", "number")}, ipParam{"force", "must be a boolean"}, ipParam{"base_ref", "must be a string"}),
-			row("branch delete", "every field", `{"ephemeral":"x","name":1}`, body,
-				[]string{msg("wrefDeleteBranchRequest", "ephemeral", "string", "bool"), str("wrefDeleteBranchRequest", "name", "number")},
-				ipParam{"ephemeral", "must be a boolean"}, ipParam{"name", "must be a string"}),
-			row("tag create", "every field", `{"ref":1,"name":2}`, body,
-				[]string{str("wrefCreateTagRequest", "ref", "number"), str("wrefCreateTagRequest", "name", "number")}, s("ref", "name")...),
-			row("note add", "nested field", `{"note":1,"author":{"email":2},"object_ref":3}`, body,
-				[]string{str("wrefNoteRequest", "note", "number"), str("wrefNoteRequest", "author.email", "number"), str("wrefNoteRequest", "object_ref", "number")},
-				s("note", "author.email", "object_ref")...),
-			row("note delete", "every field", `{"note":1,"author":{"email":2},"object_ref":3}`, body,
-				[]string{str("wrefNoteRequest", "note", "number"), str("wrefNoteRequest", "author.email", "number"), str("wrefNoteRequest", "object_ref", "number")},
-				s("note", "author.email", "object_ref")...),
+			row("branch create", "an unknown field is not named", `{"force":"y","base_ref":5,"typo":1}`, ipParam{"force", "must be a boolean"}, ipParam{"base_ref", "must be a string"}),
+			row("branch delete", "every field", `{"ephemeral":"x","name":1}`, ipParam{"ephemeral", "must be a boolean"}, ipParam{"name", "must be a string"}),
+			row("tag create", "every field", `{"ref":1,"name":2}`, s("ref", "name")...),
+			row("note add", "nested field", `{"note":1,"author":{"email":2},"object_ref":3}`, s("note", "author.email", "object_ref")...),
+			row("note delete", "every field", `{"note":1,"author":{"email":2},"object_ref":3}`, s("note", "author.email", "object_ref")...),
 
-			// One wrong-type field answers exactly as before, ahead of
-			// every other check and with no second name.
-			row("create", "one field: ahead of the name check", `{"repo_name":"other","default_branch":7}`, body,
-				[]string{str("createRepoRequest", "default_branch", "number")}, s("default_branch")...),
+			// One wrong-type field answers ahead of every other check and
+			// with no second name.
+			row("create", "one field: ahead of the name check", `{"repo_name":"other","default_branch":7}`, s("default_branch")...),
 			// A member that repeats with another spelling counts once.
-			row("webhook", "case-folded and repeated members", `{"URL":1,"Secret":2,"url":3,"SECRET":{}}`, body,
-				[]string{str("createWebhookRequest", "URL", "number"), str("createWebhookRequest", "Secret", "number")}, s("URL", "Secret")...),
+			row("webhook", "case-folded and repeated members", `{"URL":1,"Secret":2,"url":3,"SECRET":{}}`, s("URL", "Secret")...),
 			// The members that are decoded on their own wait for the body's own fields.
-			row("create", "one field: base_repo is not decoded yet", `{"default_branch":7,"base_repo":{"owner":1}}`, body,
-				[]string{str("createRepoRequest", "default_branch", "number")}, s("default_branch")...),
-			row("webhook", "one field: ahead of the url check", `{"url":"not a url","secret":5}`, body,
-				[]string{str("createWebhookRequest", "secret", "number")}, s("secret")...),
-			row("grep", "one field", `{"paths":["a",1]}`, body, []string{elem("grepRequestBody", "paths.1", "number")}, s("paths.1")...),
-			// Every other decode error answers as before, with no item.
-			row("webhook", "a body that is not an object", `[1]`, body, []string{"json: cannot unmarshal array into Go value of type api.createWebhookRequest"}),
-			row("grep", "a syntax error", `{"paths":[1,`, body, []string{"unexpected end of JSON input"}),
+			row("create", "one field: base_repo is not decoded yet", `{"default_branch":7,"base_repo":{"owner":1}}`, s("default_branch")...),
+			row("webhook", "one field: ahead of the url check", `{"url":"not a url","secret":5}`, s("secret")...),
+			row("grep", "one field", `{"paths":["a",1]}`, s("paths.1")...),
+			// Every other decode error answers with no item and no text of the decoder.
+			{name: "webhook a body that is not an object", method: http.MethodPost, path: "/api/v1/webhooks", token: fx.orgTok, body: `[1]`, wantError: "invalid JSON body"},
+			{name: "grep a syntax error", method: http.MethodPost, path: "/api/v1/repos/grep", token: fx.gitTok, body: `{"paths":[1,`, wantError: "invalid JSON body"},
 		})
 	})
 }
