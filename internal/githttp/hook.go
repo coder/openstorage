@@ -1191,13 +1191,6 @@ const (
 	maxPushRefNameBytes    = 900
 )
 
-// pushRefSegmentNameMax is the HARD per-component limit (Linux NAME_MAX):
-// the boundary at which the git files backend cannot represent the path
-// at all, as opposed to the conservative policy caps above. Deletions are
-// held only to this (see pushRefDeletable) so legacy refs between the
-// policy caps and the hard limit stay deletable.
-const pushRefSegmentNameMax = 255
-
 // pushRefPathMax is the TARGET OS's PATH_MAX budget for the deepest path
 // git materializes for a pushed ref: the loose lock file
 // `<repository dir>/<ref>.lock`. git resolves its git dir to an ABSOLUTE
@@ -1311,20 +1304,18 @@ func pushRefDeletable(name string) bool {
 	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
 		return false
 	}
-	segs := strings.Split(name, "/")
-	for i, seg := range segs {
+	for _, seg := range strings.Split(name, "/") {
 		if !gitRefSegmentValid(seg) {
 			return false
 		}
-		// Filesystem NAME_MAX (255): intermediate segments are directory
-		// names; the final segment must also carry the ".lock" suffix.
-		limit := pushRefSegmentNameMax
-		if i == len(segs)-1 {
-			limit -= len(".lock")
-		}
-		if len(seg) > limit {
-			return false
-		}
+	}
+	// The HARD per-component limits (filesystem NAME_MAX, and the ".lock"
+	// suffix on the final part), as opposed to the conservative policy
+	// caps above. Deletions are held only to these so legacy refs between
+	// the policy caps and the hard limits stay deletable. The same rule
+	// picks the refs that `openstorage repair-refs` removes.
+	if ref.Unlockable(name) {
+		return false
 	}
 	// The whole lock path must fit PATH_MAX against the ACTUAL repository
 	// directory (round-21 P2 established the budget for creations).

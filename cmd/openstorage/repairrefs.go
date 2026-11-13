@@ -1,0 +1,159 @@
+// repair-refs removes the refs of one repository that git can never lock.
+// Before the API refused such names, a git:write token could create a notes
+// ref whose last part is 251 to 255 bytes. git locks a ref at <last
+// part>.lock, so hydration of that repository fails and every git read of it
+// answers 500. No API route, push or sync can delete a notes ref, so an
+// operator removes it here, in the ref store.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/ref"
+)
+
+// repairRefsPage is how many refs one ListRefsAfter call reads. The scan
+// keeps only the refs that match, so memory does not grow with the repo.
+const repairRefsPage = 1000
+
+// repairRef is one listed ref.
+type repairRef struct{ name, sha string }
+
+func cmdRepairRefs(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("repair-refs", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprint(fs.Output(), `usage: openstorage repair-refs [flags] <repo-id>
+
+Lists the refs of one repository that git can never lock: a ref name with a
+part over 255 bytes, or a last part over 250 bytes (git locks a ref at
+<last part>.lock). Every hydration of such a repository fails, so git reads of
+it answer 500. Without --yes the command changes nothing. With --yes it
+deletes each listed ref from the ref store, but only if the ref still holds
+the SHA that it listed. A ref that changed in between is reported and kept.
+
+The command changes the ref store only. It sends no webhook and does not
+forward the deletion to an upstream.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+	yes := fs.Bool("yes", false, "delete the listed refs (without it the command only lists them)")
+	dataDir := fs.String("data-dir", "", "local-mode data directory (falls back to $"+envDataDir+"); derives the database location when no URL is set")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return errors.New("exactly one <repo-id> argument is required")
+	}
+	repoID := fs.Arg(0)
+
+	urls, err := resolveStorageURLs(envconfig.LookupEnv, *dataDir)
+	if err != nil {
+		return err
+	}
+	if urls.dbURL == "" {
+		return errDBURLRequired()
+	}
+	rs, err := ref.Open(ctx, urls.dbURL)
+	if err != nil {
+		return fmt.Errorf("open ref store: %w", err)
+	}
+	defer rs.Close()
+	if *yes {
+		// Like serve and purge-repo, the operator command owns schema init.
+		// A delete must bump the repository generation (a trigger that
+		// InitSchema installs), or replicas keep a fresh hydrate marker. A
+		// dry run only reads, so it leaves the schema alone.
+		if err := rs.InitSchema(ctx); err != nil {
+			return fmt.Errorf("init ref schema: %w", err)
+		}
+	}
+	return repairRefs(ctx, rs, repoID, *yes, os.Stdout)
+}
+
+// repairRefs lists the refs of repoID that git can never lock and, when yes
+// is set, deletes them. It returns an error when a delete fails or a ref
+// moved since it was listed.
+func repairRefs(ctx context.Context, rs ref.RefStore, repoID string, yes bool, out io.Writer) error {
+	assertf(repoID != "", "repairRefs: empty repo ID")
+	found, scanned, err := scanUnlockableRefs(ctx, rs, repoID, repairRefsPage)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "repo:    %s\n", sanitizeTerm(repoID))
+	fmt.Fprintf(out, "scanned: %d refs\n", scanned)
+	if len(found) == 0 {
+		fmt.Fprintln(out, "no ref that git can never lock")
+		return nil
+	}
+	fmt.Fprintf(out, "refs that git can never lock (%d):\n", len(found))
+	for _, r := range found {
+		fmt.Fprintf(out, "  %s %s\n", r.sha, sanitizeTerm(r.name))
+	}
+	if !yes {
+		fmt.Fprintln(out, "nothing changed: run the command again with --yes to delete these refs")
+		return nil
+	}
+	var deleted, lost int
+	for _, r := range found {
+		won, err := deleteUnlockableRef(ctx, rs, repoID, r)
+		if err != nil {
+			return fmt.Errorf("delete %s: %w (%d deleted before the error)", sanitizeTerm(r.name), err, deleted)
+		}
+		if !won {
+			lost++
+			fmt.Fprintf(out, "lost CAS, not deleted: %s changed or was removed since it was listed\n", sanitizeTerm(r.name))
+			continue
+		}
+		deleted++
+		fmt.Fprintf(out, "deleted: %s\n", sanitizeTerm(r.name))
+	}
+	fmt.Fprintf(out, "deleted %d of %d refs\n", deleted, len(found))
+	if lost > 0 {
+		return fmt.Errorf("%d of %d refs changed since they were listed and were kept: run the command again", lost, len(found))
+	}
+	return nil
+}
+
+// scanUnlockableRefs reads every ref of repoID, pageSize at a time, and
+// returns the ones that git can never lock, and how many refs it read.
+func scanUnlockableRefs(ctx context.Context, rs ref.RefStore, repoID string, pageSize int) (found []repairRef, scanned int, err error) {
+	assertf(pageSize > 0, "scanUnlockableRefs: page size %d", pageSize)
+	after := ""
+	for {
+		page, err := rs.ListRefsAfter(ctx, repoID, after, pageSize)
+		if err != nil {
+			return nil, 0, fmt.Errorf("list refs of %s: %w", sanitizeTerm(repoID), err)
+		}
+		for _, e := range page {
+			assertf(e.Name > after, "ListRefsAfter yielded %q not above cursor %q", e.Name, after)
+			after = e.Name
+			scanned++
+			if ref.Unlockable(e.Name) {
+				found = append(found, repairRef{name: e.Name, sha: e.SHA})
+			}
+		}
+		if len(page) < pageSize {
+			return found, scanned, nil
+		}
+	}
+}
+
+// deleteUnlockableRef swaps r's listed SHA for the zero SHA. It refuses a
+// ref that git can lock: such a ref is a healthy ref, whatever listed it.
+// won is false when the ref no longer holds the listed SHA. The swap is not
+// retried.
+func deleteUnlockableRef(ctx context.Context, rs ref.RefStore, repoID string, r repairRef) (won bool, err error) {
+	if !ref.Unlockable(r.name) {
+		return false, errors.New("git can lock this ref: refusing to delete it")
+	}
+	return rs.CASRef(ctx, repoID, r.name, r.sha, ref.ZeroSHA)
+}

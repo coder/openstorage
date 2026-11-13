@@ -14,7 +14,7 @@ The files split by role:
 | `wire_eventing.go` | Serve-side and hook-side eventing: job queue, ref-store decorator, webhook sink, loopback sync key. |
 | `wire_eventing_local.go` | `buildLocalSyncQueue`: the non-Postgres job queue. |
 | `activereqs.go` | In-flight request tracker, printed when the shutdown drain times out. |
-| `signingkey.go`, `purgerepo.go`, `s3walmeta.go` | The `signing-key`, `purge-repo`, and `s3wal-meta` subcommands. |
+| `signingkey.go`, `purgerepo.go`, `repairrefs.go`, `s3walmeta.go` | The `signing-key`, `purge-repo`, `repair-refs`, and `s3wal-meta` subcommands. |
 
 ## Interface
 
@@ -31,6 +31,7 @@ The files split by role:
 | `signing-key add\|list\|remove` | `[signingkey.go:cmdSigningKey]` | `-org` (required), `-data-dir`. `add` takes `-key`, the path to a file that holds an SSH public key line or an ASCII-armored PGP public key block. `[signingkey.go:runSigningKeyAdd]` reads that file. `remove` takes `-id`. |
 | `list-packs` | `[main.go:cmdListPacks]` | `-repo` (required), `-data-dir`. Prints each blob key under `blob.PackPrefix(repo)` with its size, then a `total: <n> pack(s)` count line. |
 | `purge-repo` | `[purgerepo.go:cmdPurgeRepo]` | One positional `<repo-id>`, `-yes` (required confirmation), `-data-dir`. |
+| `repair-refs` | `[repairrefs.go:cmdRepairRefs]`, `[repairrefs.go:repairRefs]` | One positional `<repo-id>`, `-yes` (delete; without it the command only lists), `-data-dir`. Lists the refs of the repo that `ref.Unlockable` picks, and with `-yes` swaps each listed SHA for the zero SHA. |
 | `s3wal-meta convert` | `[s3walmeta.go:cmdS3WALMeta]`, `[s3walmeta.go:runS3WALMetaConvert]` | `-to` (`2` upgrade, `1` downgrade), `-force` (only with `-to 1`). |
 | `version`, `--version` | `[main.go:main]` | Prints `version.String()`. |
 
@@ -144,6 +145,7 @@ The `hook` subprocess also reads per-push variables that the Git server sets (na
 - `[main.go:cmdKeygen]` Writes `<out>.pem` (mode `0600`) and `<out>.pub.pem` (mode `0644`). Without `-if-missing` it truncates existing files.
 - `[signingkey.go:cmdSigningKey]`, `[purgerepo.go:cmdPurgeRepo]` Run metadata schema DDL through `[wire.go:openMetaStore]`, which calls `InitSchema`. `purge-repo` also calls `InitSchema` on the ref store.
 - `[signingkey.go:runSigningKeyAdd]`, `[signingkey.go:runSigningKeyRemove]` Insert or delete rows in the org signing-key registry.
+- `[repairrefs.go:cmdRepairRefs]` Opens only the ref store, and calls `InitSchema` only with `-yes`. `[repairrefs.go:deleteUnlockableRef]` deletes with one `CASRef` per ref, never retries a lost swap, and refuses a ref that git can lock. It writes the raw ref store, so it sends no webhook and no sync poke.
 - `[purgerepo.go:cmdPurgeRepo]` CAUTION: this is irreversible. It drops the repo's registry rows and quarantines its blobs through `jobs.RepoPurger`.
 - `[s3walmeta.go:runS3WALMetaConvert]` Acquires the s3wal instance lease and rewrites the metadata document through `meta.ConvertS3WALMeta`.
 

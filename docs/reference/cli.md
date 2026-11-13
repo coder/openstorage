@@ -3,19 +3,20 @@
 The `openstorage` binary contains the server and its operational helpers:
 
 ```
-openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|s3wal-meta|version> [flags]
+openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|repair-refs|s3wal-meta|version> [flags]
 ```
 
 Sources: [`cmd/openstorage/main.go`](../../cmd/openstorage/main.go) and
 [`cmd/openstorage/signingkey.go`](../../cmd/openstorage/signingkey.go). Environment
 variables: [configuration reference](configuration.md).
 
-**Storage resolution** (`serve`, `signing-key`, `list-packs`, `purge-repo`): explicit env
-URLs win, then `--data-dir` / `$OPENSTORAGE_DATA_DIR` (local mode) fills missing slots.
-Every backend scheme works, including the experimental
+**Storage resolution** (`serve`, `signing-key`, `list-packs`, `purge-repo`, `repair-refs`):
+explicit env URLs win, then `--data-dir` / `$OPENSTORAGE_DATA_DIR` (local mode) fills
+missing slots. Every backend scheme works, including the experimental
 [`s3wal://`](configuration.md#openstorage_pg_url) zero-infra pair. `signing-key` and
-`purge-repo` open its metadata/ref stores from the database URL; `list-packs` reads blobs
-through the `s3://` URL and never opens the database URL.
+`purge-repo` open its metadata/ref stores from the database URL, and `repair-refs` opens
+the ref store from it; `list-packs` reads blobs through the `s3://` URL and never opens
+the database URL.
 
 ## `openstorage serve`
 
@@ -246,6 +247,48 @@ runs.
 Re-running on an already-purged repository rescans its blob prefixes for stragglers (bytes
 an in-flight pre-delete push published after the first pass) and reaps them through the
 same quarantine handshake.
+
+## `openstorage repair-refs`
+
+Removes the refs of one repository that git can never lock. git creates `<ref>.lock`
+before it writes a ref, so a name with a part over 255 bytes, or a last part over 250
+bytes, cannot be written into a cache repository. Every hydration of a repository that
+holds such a ref fails, and git reads of it answer `500`. Before the API limited ref
+names ([Branches](http-api.md#branches)), a token with `git:write` could create a notes
+ref with a 251 to 255 byte last part. No API route, push or sync can delete a notes
+ref, so an operator removes it here. The runbook, with the log line to look for, is
+[Refs that git can never lock](../how-to/deploy-production.md#local-disk-the-cache-directory).
+
+```
+openstorage repair-refs [flags] <repo-id>
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `<repo-id>` | required | The server-generated repository ID (`repo_...`), the key of the repository in the ref store |
+| `--yes` | `false` | Delete the listed refs. Without it the command only lists them and changes nothing |
+| `--data-dir` | `$OPENSTORAGE_DATA_DIR` | Local mode; otherwise the database env URL is used |
+
+The command reads every ref of the repository and picks the ones that git can never lock.
+It leaves out the limit on the length of the whole lock path, which depends on where a
+node keeps its cache directory. It never touches a ref that git can lock.
+
+```sh
+openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
+openstorage repair-refs --data-dir ~/cs-data --yes repo_761aac427fd3  # delete
+```
+
+The list shows the number of refs scanned, then one `<sha> <ref>` line for each match.
+With `--yes`, the command swaps each ref's listed SHA for the zero SHA, one compare-and-swap
+for each ref, and prints `deleted: <ref>`. When a ref no longer holds the listed SHA, it
+prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with an error
+after the other refs. Run the command again to list what is left.
+
+The command changes the ref store only. It sends no webhook and does not forward the
+deletion to an upstream. It can run while `serve` runs. With `--yes` it first runs the
+ref-store schema setup that `serve` runs at boot, as `purge-repo` does, so that the delete
+bumps the repository generation. The list only reads. A replica from v0.20.0 or earlier
+accepts such names, so run the command after the last replica is upgraded.
 
 ## `openstorage s3wal-meta`
 

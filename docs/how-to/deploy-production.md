@@ -288,6 +288,36 @@ recover, rebuild that repository's cache:
 4. Start the replica. The next clone or fetch hydrates the repository again from the
    ref store and the bucket.
 
+**Refs that git can never lock.** Before the HTTP API limited ref names, a token with
+`git:write` could create a notes ref whose last `/`-separated part is 251 to 255 bytes.
+git locks a ref at `<last part>.lock`, and that file name is then over the 255-byte
+file-name limit, so git can never write the ref into a cache repository. Every hydration
+of that repository fails, and git reads of it (`ls-remote`, clone, fetch) answer `500`.
+Hydration logs `hydrate <repo ID>: update-ref --stdin: exit status 128: fatal: cannot
+lock ref '<ref>': Unable to create '<path>.lock': File name too long`. Rebuilding the
+cache does not help, because the ref is in the ref store. No API route, push or sync
+deletes a notes ref: `DELETE /repos/notes` removes one note, not the ref. Remove the ref
+from the ref store with [`openstorage repair-refs`](../reference/cli.md#openstorage-repair-refs):
+
+1. Take the repo ID from the log line (the word after `hydrate`).
+2. List the refs, with the same database URL (or `--data-dir`) as `serve`:
+   `openstorage repair-refs <repo ID>`. This dry run changes nothing. It prints each ref
+   that git can never lock, with its SHA, and the number of refs that it scanned. A ref
+   is on the list when any part of its name is over 255 bytes, or its last part is over
+   250 bytes. A ref that git can lock is never on the list.
+3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
+   command deletes a ref only if it still holds the SHA that it listed. When a ref
+   changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
+   and exits with an error. Run it again to list what is left.
+4. Run the dry run once more. It must list no ref. The next clone or fetch hydrates the
+   repository again, on every replica.
+
+The command writes to the ref store with the same compare-and-swap as a push, so the
+replicas can keep running. It changes the ref store only: it sends no webhook and does
+not forward the deletion to an upstream. It also lists a branch or tag with such a name.
+Delete a branch or tag over REST (`DELETE /repos/branches`, `DELETE /repos/tags`)
+when its webhook or upstream forward matters.
+
 ## Concurrent boot: schema setup and migrations
 
 Replicas race at boot by design: deploy tooling starts them all at once against the same
@@ -547,6 +577,14 @@ under a grace period but steal them only after
 [`OPENSTORAGE_SYNC_STEAL_LEGACY`](../reference/configuration.md#openstorage_sync_steal_legacy)
 asserts no pre-lease builds remain. A live old-version run always finishes undisturbed;
 pre-upgrade wedges heal once the opt-in is set.
+
+**A replica from v0.20.0 or earlier still accepts a ref name with a last part of 251 to
+255 bytes.** Later builds answer `400` for such a name. Until the last replica runs a
+later build, a token with `git:write` can create a ref that git can never lock, and that
+ref fails every hydration of its repository. Repair after the roll, not during it: when
+the last replica runs the new build, follow "Refs that git can never lock" under
+[Local disk: the cache directory](#local-disk-the-cache-directory) for each repository
+whose hydration logs `File name too long`.
 
 ## JWT keys across the fleet
 
