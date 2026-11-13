@@ -257,7 +257,7 @@ holds such a ref fails, and git reads of it answer `500`. Before the API limited
 names ([Branches](http-api.md#branches)), a token with `git:write` could create a notes
 ref with a 251 to 255 byte last part. No API route, push or sync can delete a notes
 ref, so an operator removes it here. The runbook, with the log line to look for, is
-[Refs that git can never lock](../how-to/deploy-production.md#local-disk-the-cache-directory).
+[Refs that git can never lock](../how-to/deploy-production.md#refs-that-git-can-never-lock).
 
 ```
 openstorage repair-refs [flags] <repo-id>
@@ -278,16 +278,19 @@ openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
 openstorage repair-refs --data-dir ~/cs-data --yes repo_761aac427fd3  # delete
 ```
 
-The list shows the number of refs scanned, then one `<sha> <ref>` line for each match.
+The list prints `repo:` and `scanned: <n> refs`, then `refs that git can never lock (<n>):`
+with one `<sha> <ref>` line for each match, and ends with `nothing changed`. A scan of 0
+refs means that no repository has that ID (or that it has no refs): check the ID.
 With `--yes`, the command swaps each ref's listed SHA for the zero SHA, one compare-and-swap
 for each ref, and prints `deleted: <ref>`. When a ref no longer holds the listed SHA, it
 prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with an error
-after the other refs. Run the command again to list what is left.
+after the other refs. Run the command again to list what is left. Put the flags before
+`<repo-id>`: a flag after it is an error.
 
 The command changes the ref store only. It sends no webhook and does not forward the
 deletion to an upstream. It can run while `serve` runs. With `--yes` it first runs the
 ref-store schema setup that `serve` runs at boot, as `purge-repo` does, so that the delete
-bumps the repository generation. The list only reads. A replica from v0.20.0 or earlier
+bumps the repository generation. The list only reads. A replica on v0.20.0 or earlier
 accepts such names, so run the command after the last replica is upgraded.
 
 ## `openstorage s3wal-meta`

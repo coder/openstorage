@@ -367,6 +367,30 @@ func TestRepairRefsRefusesLockableRef(t *testing.T) {
 	}
 }
 
+// An ID that matches no refs (a typo, or the colon that follows the ID in
+// the serve log) is not reported as a clean repository.
+func TestRepairRefsWarnsWhenNoRefsMatchTheID(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, repairLongRef: f.commit})
+	for _, yes := range []bool{false, true} {
+		var out bytes.Buffer
+		if err := repairRefs(t.Context(), rs, repairRepo+":", yes, &out); err != nil {
+			t.Fatalf("yes=%v: %v", yes, err)
+		}
+		if !strings.Contains(out.String(), "scanned: 0 refs") || !strings.Contains(out.String(), "no refs under this ID") ||
+			strings.Contains(out.String(), "no ref that git can never lock") {
+			t.Fatalf("yes=%v: output:\n%s", yes, out.String())
+		}
+	}
+	if got := f.refs(t); len(got) != 2 {
+		t.Fatalf("refs changed: %v", got)
+	}
+}
+
 // A ref name with control bytes cannot forge a line of the listing.
 func TestRepairRefsSanitizesNames(t *testing.T) {
 	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))

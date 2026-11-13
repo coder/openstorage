@@ -51,7 +51,7 @@ Flags:
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
-		return errors.New("exactly one <repo-id> argument is required")
+		return errors.New("exactly one <repo-id> argument is required (flags go before it)")
 	}
 	repoID := fs.Arg(0)
 
@@ -90,6 +90,12 @@ func repairRefs(ctx context.Context, rs ref.RefStore, repoID string, yes bool, o
 	}
 	fmt.Fprintf(out, "repo:    %s\n", sanitizeTerm(repoID))
 	fmt.Fprintf(out, "scanned: %d refs\n", scanned)
+	if scanned == 0 {
+		// The command reads the ref store only, so it cannot tell a typo
+		// from an empty repository.
+		fmt.Fprintln(out, "no refs under this ID: check that it is the repo ID (repo_ and 12 hex digits), with no other text")
+		return nil
+	}
 	if len(found) == 0 {
 		fmt.Fprintln(out, "no ref that git can never lock")
 		return nil
