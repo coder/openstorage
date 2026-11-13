@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"os/exec"
@@ -425,5 +426,51 @@ func TestCmdRepairRefs(t *testing.T) {
 	delete(want, repairLongRef)
 	if got := f.refs(t); !mapsEqual(got, want) {
 		t.Fatalf("refs after --yes = %v, want %v", got, want)
+	}
+}
+
+// Only --yes runs the schema setup: the delete bumps the repository
+// generation through a trigger that InitSchema installs, and the list only
+// reads.
+func TestCmdRepairRefsRunsSchemaSetupOnlyWithYes(t *testing.T) {
+	for _, env := range []string{
+		"OPENSTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL",
+		"OPENSTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL",
+		envDataDir, envSecretsKey, envPackQuota, envPackReservationTTL,
+	} {
+		t.Setenv(env, "")
+	}
+	ctx := t.Context()
+	dir := t.TempDir()
+	rs, err := ref.OpenSQLite(ctx, "sqlite://"+filepath.Join(dir, "codestorage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs.Close()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "codestorage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	hasRefsTable := func() bool {
+		t.Helper()
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'refs'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 1
+	}
+	if hasRefsTable() {
+		t.Fatal("a new database already has the refs table")
+	}
+	_ = cmdRepairRefs(ctx, []string{"--data-dir", dir, repairRepo})
+	if hasRefsTable() {
+		t.Fatal("the list ran the schema setup")
+	}
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, "--yes", repairRepo}); err != nil {
+		t.Fatalf("--yes on a new database = %v", err)
+	}
+	if !hasRefsTable() {
+		t.Fatal("--yes did not run the schema setup")
 	}
 }
