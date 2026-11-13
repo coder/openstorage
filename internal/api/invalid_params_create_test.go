@@ -121,15 +121,15 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 			// A member that fails to decode answers alone, as any decode
 			// failure does: no other check of the body runs.
 			post("upstream wrong type hides the other problems", `{"default_branch":"bad..name","upstream":{"provider":"svn","owner":1}}`,
-				"invalid upstream: json: cannot unmarshal number into Go struct field upstreamConfig.owner of type string",
+				"upstream.owner must be a string",
 				ipParam{"upstream.owner", "must be a string"}),
 			post("upstream unknown field hides the other problems", `{"default_branch":"bad..name","upstream":{"provider":"svn","x":1}}`,
-				`invalid upstream: json: unknown field "x"`),
+				`invalid upstream: unknown field "x"`),
 			post("base_repo wrong type hides the other problems", `{"default_branch":"bad..name","base_repo":{"provider":"svn","auth":3}}`,
-				"invalid base_repo: json: cannot unmarshal number into Go struct field usyncBaseRepo.auth of type api.usyncBaseRepoAuth",
+				"base_repo.auth must be an object",
 				ipParam{"base_repo.auth", "must be an object"}),
 			post("body wrong type hides the other problems", `{"default_branch":5,"upstream":{"provider":"svn"}}`,
-				"invalid JSON body: json: cannot unmarshal number into Go struct field createRepoRequest.default_branch of type string",
+				"default_branch must be a string",
 				ipParam{"default_branch", "must be a string"}),
 
 			// Rules across fields add their message and no item.

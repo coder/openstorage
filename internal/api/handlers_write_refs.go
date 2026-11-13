@@ -79,7 +79,7 @@ func wrefDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	if err := unmarshalBody(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -99,7 +99,7 @@ func wrefDecodeOptionalBody(w http.ResponseWriter, r *http.Request, dst any) boo
 		return true
 	}
 	if err := unmarshalBody(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -933,14 +933,14 @@ func strictJSON(body []byte, dst any) error {
 	t := reflect.TypeOf(dst)
 	assertf(t != nil && t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct, "strictJSON: dst %T is not a struct pointer", dst)
 	if err := checkStrictObject(body, t.Elem(), ""); err != nil {
-		return err
+		return strictError{err}
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return errors.New("trailing data")
+		return strictError{errors.New("trailing data")}
 	}
 	return nil
 }
@@ -1036,7 +1036,7 @@ func wrefDecodeStrictBody(w http.ResponseWriter, r *http.Request, dst any) bool 
 		return false
 	}
 	if err := strictJSON(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
