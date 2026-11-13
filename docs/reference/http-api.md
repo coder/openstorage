@@ -70,15 +70,17 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   once. `detail` then holds the message of each problem, joined by `; `. One answer
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
   out. A check that needs the repository's state (for example, that a merge creates a
-  commit and so needs an `author`) runs after the checks of the body. A body with a
-  field of the wrong JSON type names one wrong-type field (the first that the decoder
-  finds) and none of the other problems: the other checks run only when every field has
-  its right type. A credential `password` that starts with `enc:` is named with the
-  other invalid fields when the body has any. Alone, it keeps its place after the lookup
-  of the repository or credential, so a missing one is `404` first. `POST /repos/merge`,
-  `POST` and `PUT` on `/repos/git-credentials` and their path forms answer this way. The
-  other routes with a request body do not collect problems yet: a check there can hide
-  the checks after it.
+  commit and so needs an `author`) runs after the checks of the body. When the JSON
+  decoder finds a field of the wrong type, the answer names one such field (the first
+  that the decoder finds) and none of the other problems: the other checks run only when
+  every field has its right type. A field that stays raw for a check of its own (the
+  `expected_source_sha` of a merge) is checked with the others. A check of the store (a
+  credential `password` that starts with `enc:`) runs after the lookup of the repository
+  or credential, so a missing one is `404` first, unless another field of the body is
+  invalid: then the answer names the password with the other fields. `POST
+  /repos/merge`, and `POST`, `PUT` and `DELETE` on `/repos/git-credentials` and their
+  path forms, answer this way. The other routes with a request body do not collect
+  problems yet: a check there can hide the checks after it.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were

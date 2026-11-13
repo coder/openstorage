@@ -48,7 +48,9 @@ func (b *bodyErrors) err() error {
 	case 0:
 		return nil
 	case 1:
-		return b.errs[0]
+		if len(invalidParamsFor(b.errs[0])) <= maxInvalidParams {
+			return b.errs[0]
+		}
 	}
 	var (
 		params []invalidParam
