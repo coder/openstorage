@@ -1,0 +1,233 @@
+package api
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/coder/openstorage/internal/auth"
+)
+
+// ipParam is one expected invalid_params item.
+type ipParam struct{ name, reason string }
+
+// ipCase is one request whose 400 must name every listed field, in order.
+type ipCase struct {
+	name, method, path, token, body string
+	// wantError is the whole `error` member: the message of each problem,
+	// joined by "; ".
+	wantError string
+	// want is the invalid_params list; nil means the member is absent.
+	want []ipParam
+}
+
+// ipRun sends each case through the full server and checks the 400: the
+// exact message, and the exact invalid_params list (a spec-shaped body,
+// so requireEnvelope also runs the problem-body oracle).
+func ipRun(t *testing.T, e *testEnv, cases []ipCase) {
+	t.Helper()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(tc.body), "")
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, body)
+			}
+			if msg := requireEnvelope(t, resp, body); msg != tc.wantError {
+				t.Fatalf("error = %q, want %q", msg, tc.wantError)
+			}
+			var p problemBody
+			if err := json.Unmarshal(body, &p); err != nil {
+				t.Fatal(err)
+			}
+			if p.Detail != tc.wantError {
+				t.Fatalf("detail = %q, want %q", p.Detail, tc.wantError)
+			}
+			var got []ipParam
+			for _, ip := range p.InvalidParams {
+				got = append(got, ipParam{ip.Name, ip.Reason})
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("invalid_params = %+v, want %+v (body %s)", got, tc.want, body)
+			}
+		})
+	}
+}
+
+// ipFixture is a repo with the tokens the route tests of this file need.
+type ipFixture struct {
+	url, repoID string
+	gitTok      string
+	repoTok     string
+}
+
+func ipNewFixture(t *testing.T, e *testEnv) ipFixture {
+	t.Helper()
+	org := e.newOrg(t)
+	url := "ip-" + randomHex(t, 4)
+	created := createRepo(t, e, org, url, []byte(`{"default_branch":"main"}`), http.StatusCreated)
+	return ipFixture{
+		url:     url,
+		repoID:  created.RepoID,
+		gitTok:  e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite}}),
+		repoTok: e.mint(t, tokenSpec{iss: org, repo: url, scopes: []string{auth.ScopeRepoWrite}}),
+	}
+}
+
+func TestBodyErrors(t *testing.T) {
+	field := func(name string) error {
+		return newFieldError(name, "is required", name+" is required")
+	}
+	plain := errors.New("squash is incompatible with the ff_only strategy")
+
+	t.Run("none is nil", func(t *testing.T) {
+		var b bodyErrors
+		b.add(nil)
+		if err := b.err(); err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+	})
+
+	t.Run("one problem comes back unchanged", func(t *testing.T) {
+		only := field("a")
+		var b bodyErrors
+		b.add(only)
+		b.add(nil)
+		if got := b.err(); got != only {
+			t.Fatalf("err = %v (%p), want the same error %p", got, got, only)
+		}
+	})
+
+	t.Run("several fields keep their order and each message", func(t *testing.T) {
+		var b bodyErrors
+		b.add(field("b"))
+		b.add(newFieldErrors("author name and email are required",
+			invalidParam{Name: "author.name", Reason: "is required"},
+			invalidParam{Name: "author.email", Reason: "is required"}))
+		b.add(field("a"))
+		err := b.err()
+		if want := "b is required; author name and email are required; a is required"; err.Error() != want {
+			t.Fatalf("message = %q, want %q", err.Error(), want)
+		}
+		want := []invalidParam{
+			{"b", "is required"}, {"author.name", "is required"}, {"author.email", "is required"}, {"a", "is required"},
+		}
+		if got := invalidParamsFor(err); !slices.Equal(got, want) {
+			t.Fatalf("params = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("a problem without a field adds its message only", func(t *testing.T) {
+		var b bodyErrors
+		b.add(field("a"))
+		b.add(plain)
+		err := b.err()
+		if want := "a is required; " + plain.Error(); err.Error() != want {
+			t.Fatalf("message = %q, want %q", err.Error(), want)
+		}
+		if got := invalidParamsFor(err); !slices.Equal(got, []invalidParam{{"a", "is required"}}) {
+			t.Fatalf("params = %+v", got)
+		}
+		var onlyPlain bodyErrors
+		onlyPlain.add(plain)
+		onlyPlain.add(errors.New("second"))
+		if err := onlyPlain.err(); invalidParamsFor(err) != nil || err.Error() != plain.Error()+"; second" {
+			t.Fatalf("err = %v, params %+v", err, invalidParamsFor(err))
+		}
+	})
+
+	t.Run("a field named twice counts once", func(t *testing.T) {
+		var b bodyErrors
+		b.add(field("a"))
+		b.add(newFieldError("a", "must be x", "a must be x"))
+		b.add(field("c"))
+		err := b.err()
+		if want := "a is required; c is required"; err.Error() != want {
+			t.Fatalf("message = %q, want %q", err.Error(), want)
+		}
+		if got := invalidParamsFor(err); !slices.Equal(got, []invalidParam{{"a", "is required"}, {"c", "is required"}}) {
+			t.Fatalf("params = %+v", got)
+		}
+	})
+
+	t.Run("the answer is bounded", func(t *testing.T) {
+		var b bodyErrors
+		for i := range maxInvalidParams + 25 {
+			b.add(field(fmt.Sprintf("paths.%d", i)))
+		}
+		err := b.err()
+		got := invalidParamsFor(err)
+		if len(got) != maxInvalidParams || got[0].Name != "paths.0" || got[maxInvalidParams-1].Name != fmt.Sprintf("paths.%d", maxInvalidParams-1) {
+			t.Fatalf("got %d params, first %v, last %v", len(got), got[0], got[len(got)-1])
+		}
+		if !strings.HasSuffix(err.Error(), "; and 25 more") {
+			t.Fatalf("message tail = %q", err.Error()[len(err.Error())-30:])
+		}
+	})
+}
+
+// TestMergeNamesEveryInvalidField: POST /merge names each invalid body
+// field (upstream: `invalid_params` "names each invalid field"), in the
+// order of the docs table, and a body with one problem answers as before.
+func TestMergeNamesEveryInvalidField(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := ipNewFixture(t, e)
+		const path = "/api/v1/repos/merge"
+		ipRun(t, e, []ipCase{
+			{
+				name: "every field", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"target_branch":"refs/heads/main","strategy":"rebase","expected_target_sha":"x","expected_source_sha":5,` +
+					`"squash":true,"author":{"email":"e"},"committer":{"name":"c","email":"e\n"}}`,
+				wantError: "missing source_ref; target_branch must not include the refs/ prefix" +
+					`; invalid strategy "rebase" (want merge|ff_only|ff_prefer)` +
+					"; expected_target_sha must be a 40-hex sha; expected_source_sha must be a 40-hex sha" +
+					"; commit_message is required with squash; author name and email are required; committer contains newlines",
+				want: []ipParam{
+					{"source_ref", "is required"},
+					{"target_branch", "must not include the refs/ prefix"},
+					{"strategy", "must be merge, ff_only or ff_prefer"},
+					{"expected_target_sha", "must be a 40-hex sha"},
+					{"expected_source_sha", "must be a 40-hex sha"},
+					{"commit_message", "is required with squash"},
+					{"author.name", "is required"},
+					{"committer", "must not contain newlines"},
+				},
+			},
+			{
+				name: "ephemeral HEAD target and a source", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_branch":"bad..name","target_branch":"HEAD","target_is_ephemeral":true,"strategy":"merge"}`,
+				wantError: "invalid source_branch; invalid target_branch",
+				want: []ipParam{
+					{"source_branch", "must be a valid branch name"},
+					{"target_branch", "must not be HEAD for an ephemeral branch"},
+				},
+			},
+			{
+				name: "a rule across fields adds its message only", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"refs/heads/main","strategy":"ff_only","squash":true,"commit_message":"m"}`,
+				wantError: "target_branch must not include the refs/ prefix; squash is incompatible with the ff_only strategy",
+				want:      []ipParam{{"target_branch", "must not include the refs/ prefix"}},
+			},
+			{
+				name: "one problem answers as before", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"rebase"}`,
+				wantError: `invalid strategy "rebase" (want merge|ff_only|ff_prefer)`,
+				want:      []ipParam{{"strategy", "must be merge, ff_only or ff_prefer"}},
+			},
+			{
+				name: "one rule across fields answers as before", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"ff_only","squash":true,"commit_message":"m"}`,
+				wantError: "squash is incompatible with the ff_only strategy",
+			},
+			{
+				name: "squash with ff_only also lacks its message", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"ff_only","squash":true}`,
+				wantError: "squash is incompatible with the ff_only strategy; commit_message is required with squash",
+				want:      []ipParam{{"commit_message", "is required with squash"}},
+			},
+		})
+	})
+}

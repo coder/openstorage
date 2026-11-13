@@ -552,11 +552,13 @@ type wmMergeRequest struct {
 }
 
 // wmValidateMergeRequest checks the request fields shared by every merge
-// outcome; author presence is checked later, only when the outcome
+// outcome and names every invalid one, in the order of the docs table
+// (bodyErrors); author presence is checked later, only when the outcome
 // actually creates a commit (openapi: required for merge-commit
 // strategies).
 func wmValidateMergeRequest(req *wmMergeRequest) error {
 	assertf(req != nil, "wmValidateMergeRequest: nil request")
+	var errs bodyErrors
 	// openapi (issue #17): source_ref — a branch name or its fully
 	// qualified refs/heads form — is the current field; source_branch
 	// stays as the deprecated bare-name alias, the current name winning
@@ -568,43 +570,35 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	} else if req.SourceBranch != "" {
 		sourceField = "source_branch"
 	}
-	if err := wcValidateBranchParam(sourceField, req.SourceBranch); err != nil {
-		return err
-	}
+	errs.add(wcValidateBranchParam(sourceField, req.SourceBranch))
 	if err := wcValidateBranchParam("target_branch", req.TargetBranch); err != nil {
-		return err
+		errs.add(err)
+	} else if wrefEphemeralHEAD(req.TargetBranch, req.TargetIsEphemeral) {
+		errs.add(newFieldError("target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch"))
 	}
-	if wrefEphemeralHEAD(req.TargetBranch, req.TargetIsEphemeral) {
-		return newFieldError("target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch")
-	}
-	if err := wmValidateStrategy(req.Strategy, req.Squash); err != nil {
-		return err
-	}
-	if req.Squash && req.CommitMessage == "" {
-		return newFieldError("commit_message", "is required with squash", "commit_message is required with squash")
-	}
+	errs.add(wmValidateStrategy(req.Strategy, req.Squash))
 	req.ExpectedTargetSHA = lowerFullSHA(req.ExpectedTargetSHA)
 	if req.ExpectedTargetSHA != "" && !ref.ValidSHA(req.ExpectedTargetSHA) {
-		return newFieldError("expected_target_sha", "must be a 40-hex sha", "expected_target_sha must be a 40-hex sha")
+		errs.add(newFieldError("expected_target_sha", "must be a 40-hex sha", "expected_target_sha must be a 40-hex sha"))
 	}
 	if req.ExpectedSourceSHA != nil {
 		var pin string
 		if err := json.Unmarshal(req.ExpectedSourceSHA, &pin); err != nil || !ref.ValidSHA(lowerFullSHA(pin)) {
-			return newFieldError("expected_source_sha", "must be a 40-hex sha", "expected_source_sha must be a 40-hex sha")
+			errs.add(newFieldError("expected_source_sha", "must be a 40-hex sha", "expected_source_sha must be a 40-hex sha"))
+		} else {
+			req.sourcePin = lowerFullSHA(pin)
 		}
-		req.sourcePin = lowerFullSHA(pin)
+	}
+	if req.Squash && req.CommitMessage == "" {
+		errs.add(newFieldError("commit_message", "is required with squash", "commit_message is required with squash"))
 	}
 	if req.Author != nil {
-		if err := wcValidateAuthor("author", *req.Author); err != nil {
-			return err
-		}
+		errs.add(wcValidateAuthor("author", *req.Author))
 	}
 	if req.Committer != nil {
-		if err := wcValidateAuthor("committer", *req.Committer); err != nil {
-			return err
-		}
+		errs.add(wcValidateAuthor("committer", *req.Committer))
 	}
-	return nil
+	return errs.err()
 }
 
 // handleMerge implements POST /repos/merge (docs/reference/http-api.md): resolve both branch

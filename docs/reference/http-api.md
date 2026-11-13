@@ -64,6 +64,15 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   error, a body that is not an object, an empty member name, unknown fields on the
   other bodies, rules across fields (such as `base_repo` and `upstream` together), and
   query parameters. The message in `detail` does not change.
+  A body with several invalid fields gets one item for each of them, as upstream says
+  (`invalid_params` "names each invalid field"). The items follow the order of the
+  route's request body in this document, array elements by index, and a field appears
+  once. `detail` then holds the message of each problem, joined by `; `. One answer
+  holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
+  out. A check that needs the repository's state (for example, that a merge creates a
+  commit and so needs an `author`) runs after the checks of the body. `POST
+  /repos/merge` answers this way. The other routes with a request body still name only
+  the first invalid field.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
