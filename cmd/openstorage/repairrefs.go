@@ -18,9 +18,10 @@ import (
 	"github.com/coder/openstorage/internal/ref"
 )
 
-// repairRefsPage is how many refs one ListRefsAfter call reads. The scan
-// keeps only the refs that match, so memory does not grow with the repo.
-const repairRefsPage = 1000
+// repairRefsPage is how many refs one ListRefsAfter call reads, as many as a
+// hydration page. The scan keeps only the refs that match, so memory does not
+// grow with the repo, and a large S3-WAL repository costs few manifest reads.
+const repairRefsPage = 10_000
 
 // repairRef is one listed ref.
 type repairRef struct{ name, sha string }
@@ -37,8 +38,8 @@ it answer 500. Without --yes the command changes nothing. With --yes it
 deletes each listed ref from the ref store, but only if the ref still holds
 the SHA that it listed. A ref that changed in between is reported and kept.
 
-The command changes the ref store only. It sends no webhook and does not
-forward the deletion to an upstream.
+The command changes the ref store only. It sends no push webhook and no sync
+poke. With --yes it lists the refs again and deletes what it finds.
 
 Flags:
 `)
@@ -54,6 +55,9 @@ Flags:
 		return errors.New("exactly one <repo-id> argument is required (flags go before it)")
 	}
 	repoID := fs.Arg(0)
+	if repoID == "" {
+		return errors.New("<repo-id> must not be empty")
+	}
 
 	urls, err := resolveStorageURLs(envconfig.LookupEnv, *dataDir)
 	if err != nil {

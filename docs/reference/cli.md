@@ -267,7 +267,7 @@ openstorage repair-refs [flags] <repo-id>
 |---|---|---|
 | `<repo-id>` | required | The server-generated repository ID (`repo_...`), the key of the repository in the ref store |
 | `--yes` | `false` | Delete the listed refs. Without it the command only lists them and changes nothing |
-| `--data-dir` | `$OPENSTORAGE_DATA_DIR` | Local mode; otherwise the database env URL is used |
+| `--data-dir` | `$OPENSTORAGE_DATA_DIR` | Local mode: derives the database location when no database env URL is set |
 
 The command reads every ref of the repository and picks the ones that git can never lock.
 It leaves out the limit on the length of the whole lock path, which depends on where a
@@ -287,8 +287,9 @@ prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with a
 after the other refs. Run the command again to list what is left. Put the flags before
 `<repo-id>`: a flag after it is an error.
 
-The command changes the ref store only. It sends no webhook and does not forward the
-deletion to an upstream. It can run while `serve` runs. With `--yes` it first runs the
+The command changes the ref store only. It sends no push webhook and no sync poke. It can
+run while `serve` runs. `--yes` lists the refs again and deletes what it finds, so a ref
+that appeared after an earlier list goes too. With `--yes` it first runs the
 ref-store schema setup that `serve` runs at boot, as `purge-repo` does, so that the delete
 bumps the repository generation. The list only reads. A replica on v0.20.0 or earlier
 accepts such names, so run the command after the last replica is upgraded.

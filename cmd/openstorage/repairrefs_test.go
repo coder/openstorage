@@ -292,6 +292,26 @@ func testRepairRefs(t *testing.T, f *repairFixture, dbURL string) {
 		t.Fatalf("second run = %v\n%s", err, out.String())
 	}
 
+	// A lost CAS on one ref does not stop the command: it still deletes
+	// the others, then exits with an error.
+	secondLong := "refs/notes/y/" + strings.Repeat("n", 251)
+	f.plant(t, map[string]string{repairLongRef: f.commit, secondLong: f.commit})
+	out.Reset()
+	moving = &movingStore{RefStore: f.rs, t: t, name: repairLongRef, from: f.commit, to: f.other}
+	err = repairRefs(ctx, moving, repairRepo, true, &out)
+	if err == nil || !strings.Contains(out.String(), "deleted 1 of 2 refs") || !strings.Contains(out.String(), "deleted: "+secondLong+"\n") {
+		t.Fatalf("lost CAS with two refs = %v\n%s", err, out.String())
+	}
+	if got := f.refs(t); got[repairLongRef] != f.other || got[secondLong] != "" || len(got) != len(want)+1 {
+		t.Fatalf("refs after a lost CAS with two refs = %v", got)
+	}
+	if err := repairRefs(ctx, f.rs, repairRepo, true, &out); err != nil {
+		t.Fatalf("clean up: %v", err)
+	}
+	if got := f.refs(t); !mapsEqual(got, want) {
+		t.Fatalf("refs after the clean up = %v, want %v", got, want)
+	}
+
 	// The command line opens the store from the database URL, as an
 	// operator runs it, and repairs the same way.
 	if dbURL == "" {
@@ -335,14 +355,15 @@ func TestScanUnlockableRefsPages(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := newRepairFixture(t, rs)
-	long2 := "refs/z/" + strings.Repeat("z", 251)
+	longMiddle := "refs/m/" + strings.Repeat("m", 256) + "/x"
+	longLast := "refs/z/" + strings.Repeat("z", 251)
 	f.plant(t, map[string]string{
-		"refs/heads/a": f.commit, "refs/heads/b": f.commit, repairLongRef: f.commit,
-		"refs/tags/t": f.commit, long2: f.commit,
+		"refs/heads/a": f.commit, "refs/heads/b": f.commit, longMiddle: f.commit, repairLongRef: f.commit,
+		"refs/tags/t": f.commit, longLast: f.commit, "refs/m2/" + strings.Repeat("m", 255) + "/x": f.commit,
 	})
-	for _, page := range []int{1, 2, 3, 5, 6, 100} {
+	for _, page := range []int{1, 2, 3, 7, 8, 100} {
 		found, scanned, err := scanUnlockableRefs(t.Context(), rs, repairRepo, page)
-		if err != nil || scanned != 5 || len(found) != 2 || found[0].name != repairLongRef || found[1].name != long2 {
+		if err != nil || scanned != 7 || len(found) != 3 || found[0].name != longMiddle || found[1].name != repairLongRef || found[2].name != longLast {
 			t.Errorf("page %d: found %d, scanned %d, err %v", page, len(found), scanned, err)
 		}
 	}
@@ -391,21 +412,69 @@ func TestRepairRefsWarnsWhenNoRefsMatchTheID(t *testing.T) {
 	}
 }
 
-// A ref name with control bytes cannot forge a line of the listing.
+// A ref name or repo ID with control bytes cannot forge a line of the
+// output: not in the list, not in the deleted lines, not in the lost-CAS line.
 func TestRepairRefsSanitizesNames(t *testing.T) {
 	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	f := newRepairFixture(t, rs)
-	name := "refs/notes/x\n  deleted: forged\x1b[2J/" + strings.Repeat("n", 251)
-	f.plant(t, map[string]string{name: f.commit})
+	hostile := "refs/notes/x\n  deleted: forged\x1b[2J/" + strings.Repeat("n", 251)
+	f.plant(t, map[string]string{hostile: f.commit})
+	forged := func(out string) bool {
+		return strings.Contains(out, "\x1b") || strings.Contains(out, "\n  deleted: forged") || strings.Contains(out, "\ndeleted: forged")
+	}
 	var out bytes.Buffer
 	if err := repairRefs(t.Context(), rs, repairRepo, false, &out); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out.String(), "\x1b") || strings.Contains(out.String(), "\n  deleted: forged") {
-		t.Fatalf("a ref name forged output:\n%q", out.String())
+	if forged(out.String()) || !strings.Contains(out.String(), "refs that git can never lock (1)") {
+		t.Fatalf("the list forged output:\n%q", out.String())
+	}
+	out.Reset()
+	moving := &movingStore{RefStore: rs, t: t, name: hostile, from: f.commit, to: f.other}
+	if err := repairRefs(t.Context(), moving, repairRepo, true, &out); err == nil || forged(out.String()) || !strings.Contains(out.String(), "lost CAS") {
+		t.Fatalf("the lost-CAS line forged output (err %v):\n%q", err, out.String())
+	}
+	out.Reset()
+	if err := repairRefs(t.Context(), rs, repairRepo, true, &out); err != nil || forged(out.String()) || !strings.Contains(out.String(), "deleted 1 of 1 refs") {
+		t.Fatalf("the deleted line forged output (err %v):\n%q", err, out.String())
+	}
+	out.Reset()
+	if err := repairRefs(t.Context(), rs, "repo\x1b[2J\nforged", false, &out); err != nil || strings.Contains(out.String(), "\x1b") || strings.Contains(out.String(), "\nforged") {
+		t.Fatalf("the repo line forged output (err %v):\n%q", err, out.String())
+	}
+}
+
+// failingCASStore fails every swap.
+type failingCASStore struct {
+	ref.RefStore
+	calls int
+}
+
+func (s *failingCASStore) CASRef(context.Context, string, string, string, string) (bool, error) {
+	s.calls++
+	return false, errors.New("store is down")
+}
+
+// A store error stops the command at the first ref and is reported with the
+// ref and the count of refs deleted so far.
+func TestRepairRefsStopsOnStoreError(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	f.plant(t, map[string]string{repairLongRef: f.commit, "refs/notes/y/" + strings.Repeat("n", 251): f.commit})
+	failing := &failingCASStore{RefStore: rs}
+	var out bytes.Buffer
+	err = repairRefs(t.Context(), failing, repairRepo, true, &out)
+	if err == nil || !strings.Contains(err.Error(), "store is down") || !strings.Contains(err.Error(), "0 deleted before the error") || failing.calls != 1 {
+		t.Fatalf("store error = %v after %d swaps\n%s", err, failing.calls, out.String())
+	}
+	if got := f.refs(t); len(got) != 2 {
+		t.Fatalf("refs changed: %v", got)
 	}
 }
 
@@ -432,6 +501,9 @@ func TestCmdRepairRefs(t *testing.T) {
 	}
 	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, repairRepo, "extra"}); err == nil || !strings.Contains(err.Error(), "exactly one <repo-id>") {
 		t.Fatalf("two args = %v, want usage error", err)
+	}
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, ""}); err == nil || !strings.Contains(err.Error(), "must not be empty") {
+		t.Fatalf("empty ID = %v, want a refusal", err)
 	}
 	if err := cmdRepairRefs(ctx, []string{repairRepo}); err == nil || !strings.Contains(err.Error(), "database URL required") {
 		t.Fatalf("no database = %v, want the missing URL error", err)

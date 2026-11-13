@@ -320,10 +320,11 @@ ref. Remove the ref from the ref store with
    again, on every replica.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
-replicas can keep running. It changes the ref store only: it sends no webhook and does
-not forward the deletion to an upstream. It also lists a branch or tag with such a name.
-Delete a branch or tag over REST (`DELETE /repos/branches`, `DELETE /repos/tags`)
-when its webhook or upstream forward matters.
+replicas can keep running. It changes the ref store only: it sends no push webhook and
+no sync poke. It also lists a branch or tag with such a name. Delete a branch or tag
+over REST (`DELETE /repos/branches`, `DELETE /repos/tags`) when you want its push
+webhook. With `--yes` the command lists the refs again and deletes what it finds, so a
+ref that appeared after your dry run goes too.
 
 ## Concurrent boot: schema setup and migrations
 
