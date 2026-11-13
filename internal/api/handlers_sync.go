@@ -100,55 +100,76 @@ type usyncBaseRepoAuth struct {
 	AuthType string `json:"auth_type"`
 }
 
-// validateSyncBaseRepo checks a base_repo object for the sync operation and
-// resolves the effective upstream host. A non-nil err means 400 with its
-// message; it names the invalid base_repo fields where it can.
-func validateSyncBaseRepo(spec *usyncBaseRepo) (host string, err error) {
+// validateSyncBaseRepo checks a base_repo object for the sync operation,
+// resolves the effective upstream host, and names every invalid base_repo
+// field in the order of the docs (bodyErrors). base_repo.operation decides
+// which of the other fields apply: when it is not sync, it is the only
+// problem. A field that another field's check needs (the provider for a
+// default host) is not checked when that field has a problem. branchErr is
+// the problem of base_repo.default_branch, or nil; it stands where the
+// field does. The host is meaningful when errs names no problem of its own.
+func validateSyncBaseRepo(spec *usyncBaseRepo, branchErr error) (host string, errs bodyErrors) {
 	assertf(spec != nil, "validateSyncBaseRepo: nil spec")
 	switch spec.Operation {
 	case "", "sync":
 		// mirror sync — handled here
 	case "fork":
 		// Workstream E (separate slice) owns forking.
-		return "", newFieldError("base_repo.operation", "is not supported", `base_repo operation "fork" not supported`)
+		return "", bodyErrors{newFieldError("base_repo.operation", "is not supported", `base_repo operation "fork" not supported`)}
 	default:
-		return "", newFieldError("base_repo.operation", "must be sync or fork", "invalid base_repo operation "+strconv.Quote(spec.Operation))
+		return "", bodyErrors{newFieldError("base_repo.operation", "must be sync or fork", "invalid base_repo operation "+strconv.Quote(spec.Operation))}
 	}
 	if spec.Provider == "code" || spec.Provider == "code.storage" {
-		return "", newFieldError("base_repo.operation", "must be fork for this provider",
-			"base_repo provider "+strconv.Quote(spec.Provider)+` requires operation "fork"`)
+		return "", bodyErrors{newFieldError("base_repo.operation", "must be fork for this provider",
+			"base_repo provider "+strconv.Quote(spec.Provider)+` requires operation "fork"`)}
 	}
 	defaultHost, known := upsync.ProviderHost(spec.Provider)
 	if !known {
-		return "", newFieldError("base_repo.provider", "is not supported", "unsupported base_repo provider "+strconv.Quote(spec.Provider))
-	}
-	if err := requiredFields("base_repo owner and name are required",
-		[2]string{"base_repo.owner", spec.Owner}, [2]string{"base_repo.name", spec.Name}); err != nil {
-		return "", err
+		errs.add(newFieldError("base_repo.provider", "is not supported", "unsupported base_repo provider "+strconv.Quote(spec.Provider)))
 	}
 	// Owner, name and token are stored, and PostgreSQL refuses a NUL in a
 	// text value (the token reaches it encrypted only when a secrets key is
 	// set). Every backend refuses such a value alike.
+	addFields(&errs, "base_repo owner and name are required",
+		[][2]string{{"base_repo.owner", spec.Owner}, {"base_repo.name", spec.Name}}, textField)
 	token := ""
 	if spec.Auth != nil {
 		token = spec.Auth.Token
 	}
-	if err := invalidTextFields([2]string{"base_repo.owner", spec.Owner}, [2]string{"base_repo.name", spec.Name},
-		[2]string{"base_repo.auth.token", token}); err != nil {
-		return "", err
-	}
+	errs.add(invalidTextFields([2]string{"base_repo.auth.token", token}))
+	errs.add(branchErr)
 	host = spec.UpstreamHost
-	if host != "" && !validUpstreamHost(host) {
-		return "", newFieldError("base_repo.upstream_host", "is not a valid host", "invalid base_repo upstream_host "+strconv.Quote(spec.UpstreamHost))
+	switch {
+	case host != "" && !validUpstreamHost(host):
+		errs.add(newFieldError("base_repo.upstream_host", "is not a valid host", "invalid base_repo upstream_host "+strconv.Quote(spec.UpstreamHost)))
+	case host == "" && known:
+		if host = defaultHost; host == "" {
+			errs.add(newFieldError("base_repo.upstream_host", "is required for this provider",
+				"base_repo upstream_host is required for provider "+strconv.Quote(spec.Provider)))
+		}
 	}
-	if host == "" {
-		host = defaultHost
+	return host, errs
+}
+
+// addFields adds the problem of each of fields (dotted wire path -> value),
+// in order. The empty fields are named by one error that holds msg
+// (requiredFields), at the place of the first of them. Each other field
+// gets the problem that check returns for it, or none.
+func addFields(errs *bodyErrors, msg string, fields [][2]string, check func(name, value string) error) {
+	missing := requiredFields(msg, fields...)
+	for _, f := range fields {
+		if f[1] == "" {
+			errs.add(missing)
+			missing = nil
+			continue
+		}
+		errs.add(check(f[0], f[1]))
 	}
-	if host == "" {
-		return "", newFieldError("base_repo.upstream_host", "is required for this provider",
-			"base_repo upstream_host is required for provider "+strconv.Quote(spec.Provider))
-	}
-	return host, nil
+}
+
+// textField is the check of a field that holds stored text.
+func textField(name, value string) error {
+	return invalidTextFields([2]string{name, value})
 }
 
 // upstreamConfig is upstream's UpstreamConfig (POST /repos `upstream`,
@@ -167,56 +188,56 @@ type upstreamConfig struct {
 // silently syncing without it would change what the link reads.
 const upstreamAppAccessMsg = `upstream access "app" (the default for github) is not supported: open.storage has no GitHub App integration; set access "public"`
 
-// parseUpstreamConfig decodes and validates an UpstreamConfig and maps it
-// onto the sync machinery's spec (no credential, no push forwarding).
-// A non-nil err means 400 with its message, naming the invalid upstream
-// fields where it can; nothing is stored.
-func parseUpstreamConfig(raw json.RawMessage) (spec *usyncBaseRepo, host string, err error) {
+// parseUpstreamConfig decodes an UpstreamConfig strictly. A non-nil err
+// means 400 with its message, naming the invalid upstream field where it
+// can.
+func parseUpstreamConfig(raw json.RawMessage) (cfg upstreamConfig, err error) {
 	assertf(jsonPresent(raw), "parseUpstreamConfig: absent upstream")
-	var cfg upstreamConfig
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	// additionalProperties: false upstream; an ignored field (for example
 	// a branch) would silently change what the link syncs.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, "", fieldErrorUnder("upstream", "invalid upstream: "+err.Error(), err)
+		return upstreamConfig{}, fieldErrorUnder("upstream", "invalid upstream: "+err.Error(), err)
 	}
-	if err := requiredFields("upstream provider, owner, and name are required",
-		[2]string{"upstream.provider", cfg.Provider}, [2]string{"upstream.owner", cfg.Owner}, [2]string{"upstream.name", cfg.Name}); err != nil {
-		return nil, "", err
-	}
-	// Owner and name are stored (PostgreSQL refuses a NUL byte).
-	if err := invalidTextFields([2]string{"upstream.owner", cfg.Owner}, [2]string{"upstream.name", cfg.Name}); err != nil {
-		return nil, "", err
-	}
+	return cfg, nil
+}
+
+// validate names every invalid field of cfg in the order of the docs
+// (bodyErrors) and resolves the upstream host: the host is meaningful when
+// errs holds no problem. The provider decides what the access and host
+// fields mean, so a problem with the provider leaves them unchecked.
+func (cfg upstreamConfig) validate() (host string, errs bodyErrors) {
 	// ProviderHost knows exactly upstream's UpstreamConfig provider enum;
 	// code/code.storage are not in it (a copy uses base_repo).
 	defaultHost, known := upsync.ProviderHost(cfg.Provider)
-	if !known {
-		return nil, "", newFieldError("upstream.provider", "is not supported", "unsupported upstream provider "+strconv.Quote(cfg.Provider))
-	}
-	switch cfg.Access {
-	case "", "app", "public":
-	default:
-		return nil, "", newFieldError("upstream.access", "must be app or public", "invalid upstream access "+strconv.Quote(cfg.Access))
-	}
-	if cfg.Provider != "github" && cfg.Access != "" {
-		return nil, "", newFieldError("upstream.access", "applies to provider github only", "upstream access applies to provider github only")
-	}
-	if cfg.Provider == "github" && cfg.Access != "public" {
-		return nil, "", newFieldError("upstream.access", "must be public", upstreamAppAccessMsg)
+	// Owner and name are stored (PostgreSQL refuses a NUL byte).
+	addFields(&errs, "upstream provider, owner, and name are required",
+		[][2]string{{"upstream.provider", cfg.Provider}, {"upstream.owner", cfg.Owner}, {"upstream.name", cfg.Name}},
+		func(name, value string) error {
+			if name == "upstream.provider" && !known {
+				return newFieldError(name, "is not supported", "unsupported upstream provider "+strconv.Quote(cfg.Provider))
+			}
+			return textField(name, value)
+		})
+	switch {
+	case cfg.Access != "" && cfg.Access != "app" && cfg.Access != "public":
+		errs.add(newFieldError("upstream.access", "must be app or public", "invalid upstream access "+strconv.Quote(cfg.Access)))
+	case known && cfg.Provider != "github" && cfg.Access != "":
+		errs.add(newFieldError("upstream.access", "applies to provider github only", "upstream access applies to provider github only"))
+	case known && cfg.Provider == "github" && cfg.Access != "public":
+		errs.add(newFieldError("upstream.access", "must be public", upstreamAppAccessMsg))
 	}
 	host = cfg.Host
-	if host != "" && !validUpstreamHost(host) {
-		return nil, "", newFieldError("upstream.host", "is not a valid host", "invalid upstream host "+strconv.Quote(cfg.Host))
+	switch {
+	case host != "" && !validUpstreamHost(host):
+		errs.add(newFieldError("upstream.host", "is not a valid host", "invalid upstream host "+strconv.Quote(cfg.Host)))
+	case host == "" && known:
+		if host = defaultHost; host == "" {
+			errs.add(newFieldError("upstream.host", "is required for this provider", "upstream host is required for provider "+strconv.Quote(cfg.Provider)))
+		}
 	}
-	if host == "" {
-		host = defaultHost
-	}
-	if host == "" {
-		return nil, "", newFieldError("upstream.host", "is required for this provider", "upstream host is required for provider "+strconv.Quote(cfg.Provider))
-	}
-	return &usyncBaseRepo{Provider: cfg.Provider, Owner: cfg.Owner, Name: cfg.Name}, host, nil
+	return host, errs
 }
 
 // validUpstreamHost accepts the two documented upstream_host shapes — a
@@ -297,21 +318,23 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Upstream documents no error for both forms; setting both is
-	// ambiguous, so it is a 400 (issue #359).
-	if jsonPresent(req.BaseRepo) && jsonPresent(req.Upstream) {
-		writeErr(w, http.StatusBadRequest, "base_repo and upstream cannot both be set")
-		return
-	}
-	var spec *usyncBaseRepo
-	// hostField names the host in messages; hostPath is its wire path.
-	upstreamHost, hostField, hostPath := "", "", ""
+	// ambiguous, so it is a 400 (issue #359). Neither form is checked
+	// then, as it is unknown which one applies.
+	both := jsonPresent(req.BaseRepo) && jsonPresent(req.Upstream)
+	var (
+		spec *usyncBaseRepo
+		cfg  upstreamConfig
+		// hostField names the host in messages; hostPath is its wire path.
+		hostField, hostPath string
+	)
 	switch {
+	case both:
 	case jsonPresent(req.Upstream):
-		var err error
-		if spec, upstreamHost, err = parseUpstreamConfig(req.Upstream); err != nil {
+		if cfg, err = parseUpstreamConfig(req.Upstream); err != nil {
 			writeInvalid(w, err.Error(), err)
 			return
 		}
+		spec = &usyncBaseRepo{Provider: cfg.Provider, Owner: cfg.Owner, Name: cfg.Name}
 		hostField, hostPath = "upstream host", "upstream.host"
 	case jsonPresent(req.BaseRepo):
 		spec = &usyncBaseRepo{}
@@ -320,12 +343,30 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			writeInvalid(w, fe.Error(), fe)
 			return
 		}
-		var err error
-		if upstreamHost, err = validateSyncBaseRepo(spec); err != nil {
-			writeInvalid(w, err.Error(), err)
-			return
-		}
 		hostField, hostPath = "base_repo upstream_host", "base_repo.upstream_host"
+	}
+
+	// Every problem of the body that needs no state, in the order of the
+	// request body in the docs, so that the 400 names every invalid field
+	// (bodyErrors). The default branch of the body is the first field.
+	topBranch, baseBranch := bodyBranchProblem(&req, spec)
+	var (
+		errs         bodyErrors
+		upstreamHost string
+		problems     bodyErrors
+	)
+	errs.add(topBranch)
+	switch {
+	case both:
+		errs.add(errors.New("base_repo and upstream cannot both be set"))
+	case jsonPresent(req.Upstream):
+		upstreamHost, problems = cfg.validate()
+	case jsonPresent(req.BaseRepo):
+		upstreamHost, problems = validateSyncBaseRepo(spec, baseBranch)
+	}
+	errs = append(errs, problems...)
+	if writeBodyErrors(w, errs, topBranch, baseBranch) {
+		return
 	}
 	if spec != nil {
 		assertf(upstreamHost != "" && hostField != "", "create: validated sync spec without host")
@@ -335,15 +376,6 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		// sync exist.
 		if op, denied := policyDeniesPullUpstream(policies); denied {
 			writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies sync repository create")
-			return
-		}
-		// Registration-time egress courtesy check (issue #139), mirroring
-		// webhook CheckRegistration: fast feedback for upstream hosts the
-		// pull lane's dial-time vetting proxy would deny anyway, before any
-		// rows exist. Fail-open on resolution errors — acceptance is not a
-		// reachability promise; the worker's guard is authoritative.
-		if err := s.guard.CheckHost(r.Context(), upstreamHostname(upstreamHost)); err != nil {
-			writeInvalidField(w, hostPath, "is denied by the sync egress policy", hostField+" denied by sync egress policy: "+err.Error())
 			return
 		}
 	}
@@ -366,13 +398,23 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	if branch == "" {
 		branch = meta.OmittedDefaultBranch
 	}
-	if !validDefaultBranch(branch) {
-		if branchPath == "" { // the query parameter: no body field to name
-			writeErr(w, http.StatusBadRequest, "invalid default_branch")
-		} else {
-			writeInvalidField(w, branchPath, "is not a valid branch name", "invalid default_branch")
-		}
+	// The body's default branch was checked above, and answers here when
+	// it is the only problem: the ref policy answers before it.
+	if err := defaultBranchProblem(branch, branchPath); err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
+	}
+	if spec != nil {
+		// Registration-time egress courtesy check (issue #139), mirroring
+		// webhook CheckRegistration: fast feedback for upstream hosts the
+		// pull lane's dial-time vetting proxy would deny anyway, before any
+		// rows exist. Fail-open on resolution errors — acceptance is not a
+		// reachability promise; the worker's guard is authoritative. It may
+		// look up a name, so it runs after every check of the body.
+		if err := s.guard.CheckHost(r.Context(), upstreamHostname(upstreamHost)); err != nil {
+			writeInvalidField(w, hostPath, "is denied by the sync egress policy", hostField+" denied by sync egress policy: "+err.Error())
+			return
+		}
 	}
 
 	var repo meta.Repo

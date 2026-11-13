@@ -1293,7 +1293,7 @@ func testInvalidParamsOnValidators(t *testing.T, e *testEnv) {
 		{"patch invalid", http.MethodPatch, "/api/v1/repo", repoTok, `{"default_branch":"bad..name"}`, []param{req("default_branch", "is not a valid branch name")}},
 		{"create invalid", http.MethodPost, "/api/v1/repos", fresh(), `{"default_branch":"bad..name"}`, []param{req("default_branch", "is not a valid branch name")}},
 		{"create query param", http.MethodPost, "/api/v1/repos?default_branch=bad..name", fresh(), `{}`, nil},
-		{"upstream required", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"github"}}`,
+		{"upstream required", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"github","access":"public"}}`,
 			[]param{req("upstream.owner", "is required"), req("upstream.name", "is required")}},
 		{"upstream provider", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"nope","owner":"o","name":"n"}}`,
 			[]param{req("upstream.provider", "is not supported")}},

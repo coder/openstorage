@@ -71,8 +71,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
   out. A check that needs the repository's state (for example, that a merge creates a
   commit and so needs an `author`) runs after the checks of the body. `POST
-  /repos/merge` answers this way. The other routes with a request body still name only
-  the first invalid field.
+  /repos/merge` and `POST /repos` answer this way. `PATCH /repo` and the pull-upstream
+  routes check one body field each (`default_branch`, `ref`), so they name that field.
+  The other routes with a request body still name only the first invalid field.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -252,12 +253,22 @@ the same scopes, query parameters and responses.
   `owner`, `upstream_host`, `forward_pushes`, and `auth.auth_type`, → 400.
 - `base_repo` (deprecated sync and fork form): `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
 - A sync create whose `owner`, `name` or `auth.token` holds a NUL byte → 400 `bad_request`
-  with `invalid_params` naming the field (`base_repo.owner`, `base_repo.name`,
+  with `invalid_params` naming each such field (`base_repo.owner`, `base_repo.name`,
   `base_repo.auth.token`, `upstream.owner`, `upstream.name`), and nothing is stored. The
   stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
   decodes to valid UTF-8 already.
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
   generic with `upstream_host`.
+- A body with several invalid fields, in any create form, gets an `invalid_params` item
+  for each, in the order `default_branch`, then the fields of `upstream` or `base_repo`
+  as listed above. A field whose check needs another field is checked only when that
+  field is valid: an unsupported `provider` leaves `access` and the default host
+  unchecked, and an invalid `base_repo.operation` is the only `base_repo` problem. The
+  `default_branch` query parameter is no body field and names none. The egress check of
+  the upstream host looks the host up, so it runs after the checks of the body. A
+  `default_branch` that is the only invalid field answers where it did before: after the
+  ref-policy check (403) and, for a copy or fork, after the checks of the source token
+  (403), the source repository (404) and the fork point (400).
 - `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
   run after every won local push. It also inverts the sync conflict rule: local wins, and
   inbound syncs never force-rewind local refs. See [Upstream sync](#upstream-sync).
