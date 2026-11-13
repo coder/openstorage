@@ -385,6 +385,10 @@ The API refuses an ephemeral branch named `HEAD`: branch create, commit writes a
 `400` (`invalid target_branch`) for `target_branch: "HEAD"` with the ephemeral flag. A
 persistent branch named `HEAD` is allowed.
 
+A branch, tag or notes ref name that the API writes (for example in branch create, commit
+writes, tag writes and `default_branch`) is at most 255 bytes, and its last `/`-separated part is at most 250
+bytes, so that git can create the ref's `.lock` file. A longer one answers `400`.
+
 Ephemeral branches are `refs/namespaces/ephemeral/refs/heads/<name>` in the base
 repository. The persistent git remote `/{repo}.git` hides them: git cannot fetch,
 list or push them there ([namespaces](../explanation/git-protocol-and-namespaces.md)).

@@ -205,10 +205,15 @@ func TestBearerToken(t *testing.T) {
 }
 
 func TestValidBranchName(t *testing.T) {
-	valid := []string{"main", "develop", "release-1.0", "feature/foo", "a/b/c", "v1.2.3_rc1"}
+	valid := []string{
+		"main", "develop", "release-1.0", "feature/foo", "a/b/c", "v1.2.3_rc1",
+		strings.Repeat("a", 250), "x/" + strings.Repeat("a", 250), strings.Repeat("a", 252) + "/b",
+	}
 	invalid := []string{
 		"", "-x", ".hidden", "a..b", "a b", "feat/", "/lead", "a//b",
 		"branch.lock", "refs/heads/x.lock", "über", strings.Repeat("a", 256),
+		// git cannot create <last part>.lock past NAME_MAX.
+		strings.Repeat("a", 251), "x/" + strings.Repeat("a", 251), strings.Repeat("a", 255),
 	}
 	for _, name := range valid {
 		if !validBranchName(name) {

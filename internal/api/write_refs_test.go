@@ -196,6 +196,7 @@ func TestWriteRefsBranches(t *testing.T) {
 			for name, req := range map[string]map[string]any{
 				"refs prefix":  {"target_branch": "refs/heads/x", "base_branch": "main"},
 				"dotdot":       {"target_branch": "a..b", "base_branch": "main"},
+				"long last":    {"target_branch": "x/" + strings.Repeat("a", 251), "base_branch": "main"},
 				"empty target": {"target_branch": "", "base_branch": "main"},
 				"missing base": {"target_branch": "ok"},
 			} {
