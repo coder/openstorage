@@ -16,7 +16,7 @@ Test lanes in depth: [testing reference](docs/reference/testing.md).
 
 | Tool | Why |
 |---|---|
-| Go ≥ 1.27.3 | `go.mod` toolchain; CI resolves the version from `go.mod` |
+| Go ≥ 1.27.4 | `go.mod` toolchain; CI resolves the version from `go.mod` |
 | git | the server shells out to it; every test uses it |
 | git-lfs | LFS e2e tests drive a real `git lfs` client; CI fails fast without it |
 | Docker | default test lane (Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/)) and the compose stack |
