@@ -28,7 +28,7 @@
 # has one (not the value "default"), else its go line. A scan on another Go
 # would check a standard library that does not ship. The Dockerfile builder is
 # not read here. The image job of ci.yml builds it and fails when its Go is
-# older than go.mod.
+# older than the go line of go.mod.
 name: govulncheck-nightly
 
 on:
