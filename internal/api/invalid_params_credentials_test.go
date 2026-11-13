@@ -156,12 +156,43 @@ func TestCredentialsNameEveryInvalidField(t *testing.T) {
 				body: `{"password":"enc:ippass"}`, wantError: reserved, want: []ipParam{pwReserved},
 			},
 
+			// The org-level PUT of the path form checks the body before the
+			// credential that the body names.
+			{
+				name: "PUT on the path of the repository checks the body before the credential lookup", method: http.MethodPut, path: byName, token: orgTok,
+				body:      `{"id":"ggc_missing","username":"ipuser\u0000","password":"ippass\u0000"}`,
+				wantError: "invalid password" + text + "; invalid username" + text,
+				want:      []ipParam{pwText, userText},
+			},
+
 			// DELETE names the one field it has.
 			{
 				name: "DELETE one problem: id", method: http.MethodDelete, path: v1, token: orgTok,
 				body: `{}`, wantError: "id is required", want: []ipParam{{"id", "is required"}},
 			},
 		})
+
+		// A route that names the repository or credential in its path looks
+		// it up before it reads the body: a missing one is 404 even when the
+		// body is invalid.
+		const badBody = `{"username":"ipuser\u0000","password":"enc:ippass"}`
+		gone := "/api/repos/" + url.PathEscape("https://example.com/"+org+"/ipc-missing") + "/git-credentials"
+		for _, tc := range []struct {
+			name, method, path, token, code string
+		}{
+			{"POST on the path of a missing repository", http.MethodPost, gone, repoTok, codeRepositoryNotFound},
+			{"PUT on the path of a missing repository", http.MethodPut, gone, orgTok, codeRepositoryNotFound},
+			{"PUT by path on a missing repository", http.MethodPut, gone + "/" + cred.ID, repoTok, codeRepositoryNotFound},
+			{"PUT by path on a missing credential", http.MethodPut, byName + "/ggc_missing", repoTok, codeCredentialNotFound},
+		} {
+			t.Run(tc.name+" is 404 before the body", func(t *testing.T) {
+				resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(badBody), "")
+				if resp.StatusCode != http.StatusNotFound {
+					t.Fatalf("status = %d, want 404 (body %s)", resp.StatusCode, body)
+				}
+				requireProblemCode(t, resp, body, tc.code)
+			})
+		}
 
 		// A reserved password that is the only problem of the body answers
 		// at the store, after the lookups: 404 for a missing repository or

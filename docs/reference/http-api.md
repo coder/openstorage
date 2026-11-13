@@ -75,12 +75,16 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   that the decoder finds) and none of the other problems: the other checks run only when
   every field has its right type. A field that stays raw for a check of its own (the
   `expected_source_sha` of a merge) is checked with the others. A check of the store (a
-  credential `password` that starts with `enc:`) runs after the lookup of the repository
-  or credential, so a missing one is `404` first, unless another field of the body is
-  invalid: then the answer names the password with the other fields. `POST
-  /repos/merge`, and `POST`, `PUT` and `DELETE` on `/repos/git-credentials` and their
-  path forms, answer this way. The other routes with a request body do not collect
-  problems yet: a check there can hide the checks after it.
+  credential `password` that starts with `enc:`) runs after the lookups of the route, so
+  a missing repository or credential is `404` first. When another field of the body is
+  invalid, the answer is `400` and names the password with the other fields. The
+  credential routes that name the repository or credential in the path
+  (`/repos/{repo_name}/git-credentials` and
+  `/repos/{repo_name}/git-credentials/{git_credential_id}`) look that one up before they
+  read the body, so on them a missing one is `404` even when the body is invalid. `POST
+  /repos/merge`, and `POST` and `PUT` on `/repos/git-credentials` and on those path
+  forms, answer this way. The other routes with a request body do not collect problems
+  yet: a check there can hide the checks after it.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
