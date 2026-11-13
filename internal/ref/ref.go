@@ -1095,11 +1095,12 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 	// marks it not safe to retry, but only the outcome query tells a commit
 	// that landed from one that did not. A swap that changed a row therefore
 	// asks PostgreSQL for the outcome. A swap that changed no row wrote
-	// nothing, so its COMMIT outcome changes nothing, and its error passes
-	// through.
+	// nothing, so its COMMIT outcome changes nothing: the error is marked
+	// not executed, whatever tag pgx puts, so that IdempotentCAS never
+	// recovers a duplicate create into a win and a push event.
 	if err := tx.Commit(ctx); err != nil {
 		if n == 0 {
-			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, notExecuted(err))
 		}
 		// commitStatus needs a pool slot, and this connection can be the
 		// pool's last one. The transaction is closed, so the deferred
