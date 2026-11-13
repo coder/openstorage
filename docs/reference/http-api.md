@@ -278,8 +278,9 @@ the same scopes, query parameters and responses.
   checked. An invalid `base_repo.operation` is the only `base_repo` problem: the
   operation decides which `base_repo` fields apply. One "are required" message names all
   the empty fields of `upstream` (`provider`, `owner`, `name`) or of `base_repo`
-  (`owner`, `name`), and its items stand where the first of them does. The
-  `default_branch` query parameter is no body field and names none.
+  (`owner`, `name`), and stands where the first of them does. The items still follow the
+  order of the fields. The `default_branch` query parameter is no body field and names
+  none.
 - The checks of state answer after the checks of the body fields: the ref policy (403),
   the egress check of the upstream host (it looks the host up), and for a copy or fork
   the source token (403), the source repository (404) and the fork point (400). A

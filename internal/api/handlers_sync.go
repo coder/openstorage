@@ -156,17 +156,43 @@ func validateSyncBaseRepo(spec *usyncBaseRepo, branchErr error, errs *bodyErrors
 }
 
 // addFields adds the problem of each of fields (dotted wire path -> value),
-// in order. The empty fields are named by one error that holds msg
-// (requiredFields), at the place of the first of them. Each other field
-// gets the problem that check returns for it, or none.
+// in order. The empty fields are named by one error that holds msg, as
+// requiredFields does. When another field with a problem of its own lies
+// between two empty ones, that error also holds this problem, so that its
+// items keep the order of the fields. Each other field gets the problem that
+// check returns for it, or none.
 func addFields(errs *bodyErrors, msg string, fields [][2]string, check func(name, value string) error) {
-	missing := requiredFields(msg, fields...)
-	for _, f := range fields {
+	first, last := -1, -1
+	for i, f := range fields {
 		if f[1] == "" {
-			errs.add(missing)
-			missing = nil
-			continue
+			if first < 0 {
+				first = i
+			}
+			last = i
 		}
+	}
+	if first < 0 {
+		first, last = len(fields), len(fields)-1
+	}
+	for _, f := range fields[:first] {
+		errs.add(check(f[0], f[1]))
+	}
+	if first <= last {
+		var (
+			params []invalidParam
+			msgs   = []string{msg}
+		)
+		for _, f := range fields[first : last+1] {
+			if f[1] == "" {
+				params = append(params, invalidParam{Name: f[0], Reason: "is required"})
+			} else if problem := check(f[0], f[1]); problem != nil {
+				params = append(params, invalidParamsFor(problem)...)
+				msgs = append(msgs, problem.Error())
+			}
+		}
+		errs.add(newFieldErrors(strings.Join(msgs, "; "), params...))
+	}
+	for _, f := range fields[last+1:] {
 		errs.add(check(f[0], f[1]))
 	}
 }

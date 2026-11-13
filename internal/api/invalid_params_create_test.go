@@ -51,11 +51,15 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 			post("upstream missing provider leaves the host unchecked", `{"upstream":{"owner":"o","name":"n","access":"x"}}`,
 				`upstream provider, owner, and name are required; invalid upstream access "x"`,
 				ipParam{"upstream.provider", "is required"}, ipParam{"upstream.access", "must be app or public"}),
-			// One required message names all the empty fields of its group,
-			// at the place of the first of them.
-			post("upstream required group stands at its first empty field", `{"upstream":{"owner":"o\u0000"}}`,
+			// One required message names all the empty fields of its group.
+			// The items keep the order of the fields: a field between two
+			// empty ones has its own problem named between them.
+			post("upstream required group keeps the order of the fields", `{"upstream":{"owner":"o\u0000"}}`,
 				"upstream provider, owner, and name are required; invalid upstream.owner (want UTF-8 text without NUL)",
-				ipParam{"upstream.provider", "is required"}, ipParam{"upstream.name", "is required"}, ipParam{"upstream.owner", ipcNulReason}),
+				ipParam{"upstream.provider", "is required"}, ipParam{"upstream.owner", ipcNulReason}, ipParam{"upstream.name", "is required"}),
+			post("upstream required group with a problem before and after", `{"upstream":{"provider":"svn","name":"n\u0000"}}`,
+				`unsupported upstream provider "svn"; upstream provider, owner, and name are required; invalid upstream.name (want UTF-8 text without NUL)`,
+				ipParam{"upstream.provider", "is not supported"}, ipParam{"upstream.owner", "is required"}, ipParam{"upstream.name", ipcNulReason}),
 			post("upstream one problem answers as before", `{"upstream":{"provider":"github","access":"public","owner":"o"}}`,
 				"upstream provider, owner, and name are required", ipParam{"upstream.name", "is required"}),
 
