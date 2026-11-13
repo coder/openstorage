@@ -253,20 +253,50 @@ func TestBranchAndTagDecoderErrorHidesTheOtherProblems(t *testing.T) {
 	})
 }
 
-// TestBranchAndTagDeleteKeepTheirAnswers: the deletes have one body field
-// at most, so they have nothing to collect. DELETE branches names no
-// field today, and its query parameters are not part of this batch.
-func TestBranchAndTagDeleteKeepTheirAnswers(t *testing.T) {
+// TestBranchAndTagDeleteNameTheirField: the deletes have one body field at
+// most, so they have nothing to collect. DELETE branches names the member
+// that the body sent. A query parameter and an absent name name no field.
+func TestBranchAndTagDeleteNameTheirField(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := ipNewFixture(t, e)
+		const branches = "/api/v1/repos/branches"
 		ipRun(t, e, []ipCase{
 			{
-				name: "delete branch: invalid name", method: http.MethodDelete, path: "/api/v1/repos/branches?target_branch=bad..name", token: fx.gitTok,
+				name: "delete branch: invalid name in the query", method: http.MethodDelete, path: branches + "?target_branch=bad..name", token: fx.gitTok,
 				wantError: "invalid branch name",
 			},
 			{
-				name: "delete branch: invalid name in the deprecated body", method: http.MethodDelete, path: "/api/v1/repos/branches", token: fx.gitTok,
+				name: "delete branch: an invalid name in the query wins over the body", method: http.MethodDelete, path: branches + "?target_branch=bad..name", token: fx.gitTok,
+				body:      `{"target_branch":"main"}`,
+				wantError: "invalid branch name",
+			},
+			{
+				name: "delete branch: invalid name in the deprecated body", method: http.MethodDelete, path: branches, token: fx.gitTok,
 				body:      `{"name":"refs/heads/x"}`,
+				wantError: "invalid branch name",
+				want:      []ipParam{{"name", "must be a valid branch name"}},
+			},
+			{
+				name: "delete branch: invalid target_branch in the body", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{"target_branch":"bad..name"}`,
+				wantError: "invalid branch name",
+				want:      []ipParam{{"target_branch", "must be a valid branch name"}},
+			},
+			{
+				name: "delete branch: the current member names the problem when both are sent", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{"target_branch":"bad..name","name":"main"}`,
+				wantError: "invalid branch name",
+				want:      []ipParam{{"target_branch", "must be a valid branch name"}},
+			},
+			{
+				name: "delete branch: the alias names the problem when only it is sent", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{"name":"bad..name"}`,
+				wantError: "invalid branch name",
+				want:      []ipParam{{"name", "must be a valid branch name"}},
+			},
+			{
+				name: "delete branch: no name names no field", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{}`,
 				wantError: "invalid branch name",
 			},
 			{

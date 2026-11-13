@@ -586,13 +586,19 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 	// query parameters and the body is deprecated: a query parameter that
 	// is present wins over its body field, even when empty.
 	name := wrefAliasField(req.TargetBranch, req.Name)
+	// A name from the body is named in invalid_params, with the member that
+	// the request sent; a query parameter or an absent name is not.
+	nameField := wrefAliasName("target_branch", req.TargetBranch, "name", req.Name)
+	if name == "" {
+		nameField = ""
+	}
 	ephemeral := req.Ephemeral
 	q := r.URL.Query()
 	// Refusing the default branch is a 403 on the legacy body form, which
 	// the SDKs send; the query form answers the spec's 409.
 	protectedStatus := http.StatusForbidden
 	if q.Has("target_branch") {
-		name = q.Get("target_branch")
+		name, nameField = q.Get("target_branch"), ""
 		protectedStatus = http.StatusConflict
 	}
 	if q.Has("ephemeral") {
@@ -604,7 +610,11 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 		ephemeral = v
 	}
 	if !wrefValidBranchInput(name) {
-		writeErr(w, http.StatusBadRequest, "invalid branch name")
+		if nameField == "" {
+			writeErr(w, http.StatusBadRequest, "invalid branch name")
+		} else {
+			writeInvalidField(w, nameField, "must be a valid branch name", "invalid branch name")
+		}
 		return
 	}
 	assertf(repo.DefaultBranch != "", "repo %s has empty default branch", repo.RepoID)

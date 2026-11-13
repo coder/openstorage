@@ -195,6 +195,9 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 			if resp.StatusCode != http.StatusForbidden {
 				t.Fatalf("base_repo status = %d, want 403 (body %s)", resp.StatusCode, body)
 			}
+			if msg := requireEnvelope(t, resp, body); msg != `ref policy op "no-push" denies sync repository create` {
+				t.Fatalf("base_repo error = %q", msg)
+			}
 			ipRun(t, e, []ipCase{{
 				name: "a field next to the default branch answers before it", method: http.MethodPost, path: "/api/v1/repos", token: policed,
 				body:      `{"default_branch":"bad..name","upstream":{"provider":"gitea","owner":"","name":"n","host":"upstream.invalid"}}`,
@@ -257,6 +260,9 @@ func TestForkNamesEveryInvalidField(t *testing.T) {
 				[]byte(`{"base_repo":{"provider":"code","operation":"fork","default_branch":"bad..name","auth":{"token":"not-a-token"}}}`), "")
 			if resp.StatusCode != http.StatusForbidden {
 				t.Fatalf("base_repo status = %d, want 403 (body %s)", resp.StatusCode, body)
+			}
+			if msg := requireEnvelope(t, resp, body); msg != "base_repo.auth.token: invalid token" {
+				t.Fatalf("base_repo error = %q", msg)
 			}
 		})
 	})

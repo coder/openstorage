@@ -67,15 +67,17 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   A body with several invalid fields gets one item for each of them, as upstream says
   (`invalid_params` "names each invalid field"). The items follow the order of the
   route's request body in this document, array elements by index, and a field appears
-  once. `detail` then holds the message of each problem, joined by `; `. One answer
-  holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
-  out. A check that needs the repository's state (for example, that a merge creates a
-  commit and so needs an `author`) runs after the checks of the body. A strictly decoded
-  body (`POST /api/repos/{repo_name}/notes/append` and `POST
+  once. `detail` then holds the message of each problem, joined by `; ` (a problem whose
+  fields all appear in earlier problems adds no message). One answer holds at most 100
+  items, and `detail` ends with `; and N more` when it leaves some out: N counts the
+  items that it leaves out. A check that needs the repository's state (for example,
+  that a merge creates a commit and so needs an `author`) runs after the checks of the
+  body, except for the one case that the notes on `POST /repos` below describe. A
+  strictly decoded body (`POST /api/repos/{repo_name}/notes/append` and `POST
   /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
   of the body, and the check stops at the first problem: the answer names the first
-  member that is unknown, repeated or `null`, or that must be an object and is not, and
-  none of the other problems. When the check reaches a JSON syntax error or trailing
+  member that is unknown, repeated or `null`, or that must be an object and is not (an
+  empty member name names no field), and none of the other problems. When the check reaches a JSON syntax error or trailing
   data before it finds a bad member, the answer names no member. The other checks run
   only when the members are fine. When the JSON decoder finds a field of the wrong type,
   the answer names one such field (the first that the decoder finds) and none of the
@@ -91,9 +93,12 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   read the body, so on them a missing one is `404` even when the body is invalid. A grep
   `pagination.cursor` that does not decode is named with the other invalid fields when
   the body has any. Alone, it keeps its place after the lookup of the repository, so a
-  missing repository is `404` first. `POST /repos/merge`, `POST /repos/branches/create`,
-  `POST /repos/tags`, `POST /repos`, `POST /repos/grep`, `POST /repos/archive`,
-  `POST /repos/notes`, `DELETE /repos/notes`,
+  missing repository is `404` first. A grep `query.pattern` that git refuses is found
+  when git runs the search, after the checks of the body and the lookups of the
+  repository and the ref, so it is named alone and a missing repository or ref is `404`
+  first. `POST /repos/merge`, `POST /repos/branches/create`, `DELETE /repos/branches`
+  (for a name that comes from the body), `POST /repos/tags`, `POST /repos`,
+  `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`, `DELETE /repos/notes`,
   `POST /api/repos/{repo_name}/notes/append` (when its members
   and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
   `/repos/{repo_name}/git-credentials`, and `PUT
@@ -101,8 +106,10 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
   adds its message to `detail` and names no field. `PATCH /repo` and the pull-upstream
   routes check one body field each (`default_branch`, `ref`), so they name that field.
-  The other routes with a request body do not collect problems yet: a check there can
-  hide the checks after it. `POST /repos` decodes `upstream` and `base_repo` on their
+  The commit write routes (`commit-pack`, `diff-commit`, `restore-commit`,
+  `reset-commits`) answer with upstream's `CommitWriteResponse` or `ProblemDetails`,
+  which have no `invalid_params`, and the webhook routes are not part of upstream's API.
+  A check on these routes can hide the checks after it. `POST /repos` decodes `upstream` and `base_repo` on their
   own (see its body below), so a field of the wrong type inside one of them is named
   alone, as above.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
@@ -303,9 +310,12 @@ the same scopes, query parameters and responses.
   checked. An invalid `base_repo.operation` is the only `base_repo` problem: the
   operation decides which `base_repo` fields apply. One "are required" message names all
   the empty fields of `upstream` (`provider`, `owner`, `name`) or of `base_repo`
-  (`owner`, `name`). The `default_branch` query parameter is no body field and names
-  none.
-- The checks of state answer after the checks of the body fields: the ref policy (403),
+  (`owner`, `name`). A `base_repo.default_branch` is checked only when the body has no
+  `default_branch` of its own, because a create uses the first of the two. The
+  `default_branch` query parameter is no body field and names none.
+- A token whose `refs` claim does not parse is refused with 403 before the body is
+  checked. The checks of state answer after the checks of the body fields: the ref
+  policy (403),
   the egress check of the upstream host (it looks the host up), and for a copy or fork
   the source token (403), the source repository (404) and the fork point (400). A
   `default_branch` of the body that is the only invalid field answers after the ref

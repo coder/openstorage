@@ -371,3 +371,29 @@ func TestMergeNamesEveryInvalidField(t *testing.T) {
 		})
 	})
 }
+
+// TestWcValidateAuthorReturnsTheFirstProblem: commit-pack, diff-commit and
+// restore-commit answer with the first problem of an ident, as before the
+// merge route began to collect them all (wcAuthorProblems).
+func TestWcValidateAuthorReturnsTheFirstProblem(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		author wcAuthor
+		want   string // "" is no problem
+	}{
+		{"valid", wcAuthor{Name: "n", Email: "e"}, ""},
+		{"empty name and a newline", wcAuthor{Name: "", Email: "x\n"}, "author name and email are required"},
+		{"empty email and a carriage return", wcAuthor{Name: "n\r", Email: ""}, "author name and email are required"},
+		{"only a newline", wcAuthor{Name: "n", Email: "x\n"}, "author contains newlines"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := wcValidateAuthor("author", tc.author)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("err = %v, want none", err)
+			case tc.want != "" && (err == nil || err.Error() != tc.want):
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
