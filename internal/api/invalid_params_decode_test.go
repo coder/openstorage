@@ -73,6 +73,10 @@ func ipdFamilies(fx ipdFixture) []ipdFamily {
 			obj("pagination", ipdF("cursor", 's'), ipdF("limit", 'i'))),
 		f("archive", http.MethodPost, "/api/v1/repos/archive", fx.gitTok, func() any { return new(archiveRequestBody) },
 			ipdF("ref", 's'), ipdF("include_globs", 'a'), ipdF("exclude_globs", 'a'), ipdF("max_blob_size", 'i'), obj("archive", ipdF("prefix", 's'))),
+		f("pull-upstream", http.MethodPost, "/api/v1/repos/pull-upstream", fx.gitTok, func() any { return new(usyncPullUpstreamRequest) },
+			ipdF("ref", 's'), ipdF("after", 's')),
+		f("pull-upstream deprecated path", http.MethodPost, fx.alias+"/pull-upstream", fx.gitTok, func() any { return new(usyncPullUpstreamRequest) },
+			ipdF("ref", 's'), ipdF("after", 's')),
 		f("webhook", http.MethodPost, "/api/v1/webhooks", fx.orgTok, func() any { return new(createWebhookRequest) },
 			ipdF("url", 's'), ipdSecretF("secret")),
 		f("merge", http.MethodPost, "/api/v1/repos/merge", fx.gitTok, func() any { return new(wmMergeRequest) },
@@ -94,7 +98,7 @@ func ipdFamilies(fx ipdFixture) []ipdFamily {
 // ipdFixture is a repository, a credential and the tokens of every family.
 type ipdFixture struct {
 	ipFixture
-	orgTok, credPath string
+	orgTok, alias, credPath string // alias is the path-style prefix of the repository
 }
 
 func ipdNewFixture(t *testing.T, e *testEnv) ipdFixture {
@@ -106,7 +110,7 @@ func ipdNewFixture(t *testing.T, e *testEnv) ipdFixture {
 	}
 	org := e.newOrg(t)
 	return ipdFixture{ipFixture: fx, orgTok: e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeRepoWrite}}),
-		credPath: "/api/repos/" + url.PathEscape(fx.url) + "/git-credentials/" + cred.ID}
+		alias: "/api/repos/" + url.PathEscape(fx.url), credPath: "/api/repos/" + url.PathEscape(fx.url) + "/git-credentials/" + cred.ID}
 }
 
 // ipdWrong lists values of the wrong JSON type for each kind of field.
@@ -388,6 +392,19 @@ func TestDecodeRows(t *testing.T) {
 				[]string{msg("archiveRequestBody", "max_blob_size", "string", "int64"), elem("archiveRequestBody", "include_globs.1", "number"),
 					str("archiveRequestBody", "archive.prefix", "number")},
 				ipParam{"max_blob_size", "must be an integer"}, ipParam{"include_globs.1", "must be a string"}, ipParam{"archive.prefix", "must be a string"}),
+			row("pull-upstream", "every field", `{"after":1,"ref":2}`, body,
+				[]string{str("usyncPullUpstreamRequest", "after", "number"), str("usyncPullUpstreamRequest", "ref", "number")}, s("after", "ref")...),
+			row("pull-upstream deprecated path", "every field", `{"ref":1,"after":2}`, body,
+				[]string{str("usyncPullUpstreamRequest", "ref", "number"), str("usyncPullUpstreamRequest", "after", "number")}, s("ref", "after")...),
+			// The two strictly decoded bodies keep the first-problem rule.
+			{
+				name: "upstream/pull (strict) names the first wrong-type field only", method: http.MethodPost, path: fx.alias + "/upstream/pull", token: fx.gitTok,
+				body: `{"after":1,"ref":2}`, wantError: body + str("usyncPullUpstreamRequest", "after", "number"), want: s("after"),
+			},
+			{
+				name: "notes/append (strict) names the first wrong-type field only", method: http.MethodPost, path: fx.alias + "/notes/append", token: fx.gitTok,
+				body: `{"note":1,"object_ref":2}`, wantError: body + str("wrefNoteAppendRequest", "note", "number"), want: s("note"),
+			},
 			row("webhook", "every field", `{"secret":5,"url":{}}`, body,
 				[]string{str("createWebhookRequest", "secret", "number"), str("createWebhookRequest", "url", "object")}, s("secret", "url")...),
 			// A semantic problem of another field (an empty source_ref, a
@@ -417,6 +434,9 @@ func TestDecodeRows(t *testing.T) {
 			// A member that repeats with another spelling counts once.
 			row("webhook", "case-folded and repeated members", `{"URL":1,"Secret":2,"url":3,"SECRET":{}}`, body,
 				[]string{str("createWebhookRequest", "URL", "number"), str("createWebhookRequest", "Secret", "number")}, s("URL", "Secret")...),
+			// The members that are decoded on their own wait for the body's own fields.
+			row("create", "one field: base_repo is not decoded yet", `{"default_branch":7,"base_repo":{"owner":1}}`, body,
+				[]string{str("createRepoRequest", "default_branch", "number")}, s("default_branch")...),
 			row("webhook", "one field: ahead of the url check", `{"url":"not a url","secret":5}`, body,
 				[]string{str("createWebhookRequest", "secret", "number")}, s("secret")...),
 			row("grep", "one field", `{"paths":["a",1]}`, body, []string{elem("grepRequestBody", "paths.1", "number")}, s("paths.1")...),
@@ -439,8 +459,8 @@ type ipdShape struct {
 // UTF-8 and escaped NUL answer 400 within a bounded time and size, name at
 // most 100 fields, and never hold a request value that is a credential.
 // The shapes with a known answer pin the work bound: a body names
-// floor(256 KiB / its size) fields, and a body of more than 256 KiB only
-// the first.
+// floor(256 KiB / its size) fields, so a body of more than 128 KiB names
+// only the first.
 func TestDecodeHostileBodies(t *testing.T) {
 	const slowLimit, sizeLimit = 10 * time.Second, 64 << 10
 	runBackends(t, func(t *testing.T, e *testEnv) {

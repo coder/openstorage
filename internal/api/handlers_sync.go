@@ -765,7 +765,7 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if len(body) > 0 {
-		decode := json.Unmarshal
+		decode := unmarshalBody
 		if isStrictPullBody(r.Context()) {
 			// POST .../upstream/pull (issue #378): ReposUpstreamPullRequest
 			// is additionalProperties false, so a typo such as "refs" must

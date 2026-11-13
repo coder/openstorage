@@ -70,26 +70,34 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   route's request body in this document, array elements by index, and a field appears
   once. `detail` then holds the message of each problem, joined by `; `. One answer
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
-  out (not for fields of the wrong type, see below). A check that needs the repository's state (for example, that a merge creates a
-  commit and so needs an `author`) runs after the checks of the body. A strictly decoded
+  out (not for fields of the wrong type, see below). A check that needs the repository's
+  state (for example, that a merge creates a commit and so needs an `author`) runs after
+  the checks of the body. A strictly decoded
   body (`POST /api/repos/{repo_name}/notes/append` and `POST
   /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
   of the body, and the check stops at the first problem: the answer names the first
   member that is unknown, repeated or `null`, or that must be an object and is not, and
   none of the other problems. When the check reaches a JSON syntax error or trailing
   data before it finds a bad member, the answer names no member. The other checks run
-  only when the members are fine. When the JSON decoder finds fields of the wrong type,
+  only when the members are fine, and then the decoder of a strictly decoded body names
+  only the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
+  `POST /api/repos/{repo_name}/upstream/pull` takes `{ref?, after?}` and works the same
+  way. The pull-upstream routes that are not strict, `POST /repos/pull-upstream` and its
+  deprecated path form, name both `ref` and `after` when both have the wrong type. On
+  every other route that decodes its body as one JSON object, when the JSON decoder
+  finds fields of the wrong type,
   the answer names each of them, in the order of the body (array elements by index,
   nested fields by their dotted path), and none of the other problems: the other checks
   run only when every field has its right type. A body with fields of the wrong type and
   fields that fail a check of their own names the wrong-type fields only. The answer
   names up to 100 wrong-type fields, within a work bound: the server decodes the body
   once more for each field it names, and stops when the decodes add up to 256 KiB. So a
-  body of 2 KiB can name 100 fields, a body of 10 KiB about 26, and a body of more than
+  body of 2 KiB can name 100 fields, a body of 10 KiB about 25, and a body of more than
   128 KiB only the first. The server neither names nor counts the other wrong-type
   fields, so `detail` does not end with `and N more` for them. A body with one wrong-type
-  field gets the answer it always got. A field that stays raw for a check of its own (the `expected_source_sha` of a merge, the
-  `target_branch` of a branch create) is checked with the others. A check of the store
+  field gets the answer it always got. A field that stays raw for a check of its own
+  (the `expected_source_sha` of a merge, the `target_branch` of a branch create) is
+  checked with the others. A check of the store
   (a credential `password` that starts with `enc:`) runs after the lookups of the route,
   so a missing repository or credential is `404` first. When another field of the body
   is invalid, the answer is `400` and names the password with the other fields. The
@@ -111,11 +119,15 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   routes check one body field each (`default_branch`, `ref`), so they name that field.
   The other routes with a request body do not collect problems yet: a check there can
   hide the checks after it. Every route that decodes its body as one JSON object names
-  each field of the wrong type, as above, with these exceptions, which name the first
-  or follow their own rules: the strictly decoded bodies, the `upstream` member of
-  `POST /repos`, and `commit-pack`, `diff-commit` and `restore-commit`. `POST /repos`
-  decodes `upstream` and `base_repo` on their own (see its body below): a body with
-  several fields of the wrong type inside `base_repo` names each of them.
+  each field of the wrong type, as above, with these exceptions: the two strictly
+  decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name the first
+  bad member or the first field of the wrong type, the `upstream` member of `POST /repos`
+  does the same, and `commit-pack`, `diff-commit` and `restore-commit` follow their own
+  rules. `POST /repos` decodes `upstream` and `base_repo` on their own (see its body
+  below), and only when the fields of the body itself (`repo_name`, `default_branch`)
+  have the right types: `{"default_branch":7,"base_repo":{"owner":1}}` names only
+  `default_branch`. When those fields are fine, a body with several fields of the wrong
+  type inside `base_repo` names each of them.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were

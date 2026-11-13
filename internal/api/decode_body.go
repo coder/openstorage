@@ -12,7 +12,7 @@ import (
 // (the sum over its decodes). Each decode and each search for the member
 // to replace cost about 0.2 ms for each KiB of body, so the bound keeps one
 // request under about 100 ms. A body of 2 KiB or less can name 100 wrong-type
-// fields, a body of 10 KiB 26, and a body of more than 128 KiB only the
+// fields, a body of 10 KiB about 25, and a body of more than 128 KiB only the
 // first. The answer does not say that it stopped early.
 const maxDecodeWork = 256 << 10
 

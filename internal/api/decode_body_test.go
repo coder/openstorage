@@ -43,7 +43,7 @@ func TestUnmarshalBody(t *testing.T) {
 			wantParams: []param{{"paths.1", "must be a string"}, {"paths.3", "must be a string"}, {"paths.5", "must be a string"}}},
 		{name: "objects inside an array", body: `{"items":[{"name":1},{"name":"ok"},{"email":2,"name":3}]}`,
 			wantParams: []param{{"items.0.name", "must be a string"}, {"items.2.email", "must be a string"}, {"items.2.name", "must be a string"}}},
-		{name: "member names match without regard to case", body: `{"STRATEGY":5,"Count":"x"}`,
+		{name: "member names match without regard to case", body: `{"STRATEGY":5,"Count":"x","strategy":6}`,
 			wantParams: []param{{"STRATEGY", "must be a string"}, {"Count", "must be an integer"}}},
 		{name: "white space around the members", body: "{ \"strategy\" :\n\t5 ,\r\n \"count\" : \"x\" , \"paths\" : [ 1 ,\n \"a\", 2 ] }",
 			wantParams: []param{{"strategy", "must be a string"}, {"count", "must be an integer"}, {"paths.0", "must be a string"}, {"paths.2", "must be a string"}}},
@@ -83,14 +83,6 @@ func TestUnmarshalBody(t *testing.T) {
 				t.Fatalf("err %T: a lone json error is expected exactly when wantSame (%v)", err, tc.wantSame)
 			}
 		})
-	}
-}
-
-func TestUnmarshalBodyJoinsMessages(t *testing.T) {
-	err := unmarshalBody([]byte(`{"strategy":5,"count":"x"}`), new(decodeBodyReq))
-	parts := strings.Split(err.Error(), "; ")
-	if len(parts) != 2 || !strings.Contains(parts[0], "strategy") || !strings.Contains(parts[1], "count") {
-		t.Fatalf("message = %q", err)
 	}
 }
 
@@ -136,6 +128,14 @@ func TestUnmarshalBodyBounds(t *testing.T) {
 	got := invalidParamsFor(unmarshalBody([]byte(grown), new(decodeBodyReq)))
 	if len(got) != 2 || got[0].Name != "strategy" || got[1].Name != "flag" {
 		t.Fatalf("a body that grows past the work bound named %+v, want strategy and flag", got)
+	}
+	// The search for the member to replace is as long as the body, so the
+	// budget must cover it before the search starts, even when the member is
+	// long and the body gets short once it is null: this body names only
+	// its first wrong-type member.
+	long := `{"paths":"` + strings.Repeat("x", 135_000) + `","strategy":1}`
+	if got := invalidParamsFor(unmarshalBody([]byte(long), new(decodeBodyReq))); len(got) != 1 || got[0].Name != "paths" {
+		t.Fatalf("a body of %d bytes with a long first member named %+v, want paths only", len(long), got)
 	}
 	// The first decode counts too: a body of more than 128 KiB names only
 	// its first wrong-type field, and one of 126 KiB names two.
