@@ -278,9 +278,12 @@ openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
 openstorage repair-refs --data-dir ~/cs-data --yes repo_761aac427fd3  # delete
 ```
 
-The list prints `repo:` and `scanned: <n> refs`, then `refs that git can never lock (<n>):`
-with one `<sha> <ref>` line for each match, and ends with `nothing changed`. A scan of 0
-refs means that no repository has that ID (or that it has no refs): check the ID.
+The list prints `repo:` and `scanned: <n> refs`. Then, when refs match, it prints
+`refs that git can never lock (<n>):` with one `<sha> <ref>` line for each match, and
+ends with `nothing changed`. When none match, it prints `no ref that git can never lock`.
+A scan of 0 refs prints a warning instead: no refs have that ID, or the database URL or
+`--data-dir` is not the one that `serve` uses. A wrong `--data-dir` can create an empty
+local database there, so check the path.
 With `--yes`, the command swaps each ref's listed SHA for the zero SHA, one compare-and-swap
 for each ref, and prints `deleted: <ref>`. When a ref no longer holds the listed SHA, it
 prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with an error
@@ -291,7 +294,7 @@ The command changes the ref store only. It sends no push webhook and no sync pok
 run while `serve` runs. `--yes` lists the refs again and deletes what it finds, so a ref
 that appeared after an earlier list goes too. With `--yes` it first runs the
 ref-store schema setup that `serve` runs at boot, as `purge-repo` does, so that the delete
-bumps the repository generation. The list only reads. A replica on v0.20.0 or earlier
+bumps the repository generation. The list runs no schema setup. A replica on v0.20.0 or earlier
 accepts such names, so run the command after the last replica is upgraded.
 
 ## `openstorage s3wal-meta`

@@ -2,7 +2,7 @@
 
 ## Overview
 
-`cmd/openstorage` is the `openstorage` binary (`package main`). It is the composition root of the service. It parses flags and `OPENSTORAGE_*` environment variables into one validated config, opens the ref, metadata, and blob stores, wires the API, Git, eventing, sync, and background-job packages from `internal/`, and serves them on one HTTP listener. It also ships operator subcommands for keys, tokens, signing keys, pack listing, repo purge, and s3wal metadata conversion.
+`cmd/openstorage` is the `openstorage` binary (`package main`). It is the composition root of the service. It parses flags and `OPENSTORAGE_*` environment variables into one validated config, opens the ref, metadata, and blob stores, wires the API, Git, eventing, sync, and background-job packages from `internal/`, and serves them on one HTTP listener. It also ships operator subcommands for keys, tokens, signing keys, pack listing, repo purge, ref repair, and s3wal metadata conversion.
 
 The files split by role:
 
@@ -63,7 +63,7 @@ The files split by role:
 
 With `-data-dir` and no explicit URLs, `[config.go:resolveStorageURLs]` derives `sqlite://<dir>/codestorage.db`, `file://<dir>/blobs`, and `<dir>/cache`.
 
-Operator subcommands read some of these variables too. `[purgerepo.go:cmdPurgeRepo]` resolves the storage URLs, `OPENSTORAGE_SECRETS_KEY`, `OPENSTORAGE_SECRETS_MODE`, `OPENSTORAGE_PACK_QUOTA_BYTES`, and `OPENSTORAGE_PACK_RESERVATION_TTL`. `[signingkey.go:cmdSigningKey]` resolves the storage URLs and the two secrets variables.
+Operator subcommands read some of these variables too. `[purgerepo.go:cmdPurgeRepo]` resolves the storage URLs, `OPENSTORAGE_SECRETS_KEY`, `OPENSTORAGE_SECRETS_MODE`, `OPENSTORAGE_PACK_QUOTA_BYTES`, and `OPENSTORAGE_PACK_RESERVATION_TTL`. `[signingkey.go:cmdSigningKey]` resolves the storage URLs and the two secrets variables. `[repairrefs.go:cmdRepairRefs]` resolves the storage URLs only.
 
 The `hook` subprocess also reads per-push variables that the Git server sets (names defined in `[../../internal/githttp/hook.go:EnvSyncClaim]`). `[wire_eventing.go:hookCallerDeniedForward]` reads `OPENSTORAGE_GIT_SCOPES`. `[wire_eventing.go:hookCallerDeniedPull]` reads `OPENSTORAGE_GIT_REFS_POLICY` and `OPENSTORAGE_GIT_OPS`. `[wire_eventing.go:wireHookEventing]` reads `OPENSTORAGE_SYNC_CLAIM`, which marks a sync run's own loopback push.
 
@@ -84,7 +84,7 @@ The `hook` subprocess also reads per-push variables that the Git server sets (na
 
 - `[main.go:main]` `envconfig.CheckLegacy` runs before every subcommand except `hook`, `version`, and `--version`. Old-only `CODESTORAGE_*` settings refuse startup.
 - `[main.go:fatalf]` Every error that a subcommand returns prints `openstorage <cmd>: <err>` to stderr and exits `1`. An orderly signal shutdown of `serve` returns nil and exits `0`.
-- `[main.go:cmdServe]`, `[main.go:cmdKeygen]`, `[main.go:cmdMint]`, `[main.go:cmdListPacks]`, `[signingkey.go:cmdSigningKey]`, `[purgerepo.go:cmdPurgeRepo]`, `[s3walmeta.go:cmdS3WALMeta]` Each subcommand parses flags with `flag.ExitOnError`. An unknown or malformed flag prints the `flag` package usage message and exits `2`, and `-h` exits `0`. `fatalf` does not run on those paths.
+- `[main.go:cmdServe]`, `[main.go:cmdKeygen]`, `[main.go:cmdMint]`, `[main.go:cmdListPacks]`, `[signingkey.go:cmdSigningKey]`, `[purgerepo.go:cmdPurgeRepo]`, `[repairrefs.go:cmdRepairRefs]`, `[s3walmeta.go:cmdS3WALMeta]` Each subcommand parses flags with `flag.ExitOnError`. An unknown or malformed flag prints the `flag` package usage message and exits `2`, and `-h` exits `0`. `fatalf` does not run on those paths.
 - `[config.go:resolveServeConfig]` A DB URL and a blob URL are required (`errDBURLRequired`, `errBlobURLRequired`). `OPENSTORAGE_ORG` and `OPENSTORAGE_ORG_PUBKEYS` must both be set.
 - `[config.go:validateZeroInfraPairing]` An `s3wal://` DB URL requires an `s3://` blob URL.
 - `[config.go:envFirst]` The first alias that is present wins, even when its value is empty.

@@ -97,7 +97,7 @@ func repairRefs(ctx context.Context, rs ref.RefStore, repoID string, yes bool, o
 	if scanned == 0 {
 		// The command reads the ref store only, so it cannot tell a typo
 		// from an empty repository.
-		fmt.Fprintln(out, "no refs under this ID: check that it is the repo ID (repo_ and 12 hex digits), with no other text")
+		fmt.Fprintln(out, "no refs under this ID: check the repo ID (repo_ and 12 hex digits, no other text) and that the database URL or --data-dir is the one that serve uses")
 		return nil
 	}
 	if len(found) == 0 {
@@ -116,7 +116,8 @@ func repairRefs(ctx context.Context, rs ref.RefStore, repoID string, yes bool, o
 	for _, r := range found {
 		won, err := deleteUnlockableRef(ctx, rs, repoID, r)
 		if err != nil {
-			return fmt.Errorf("delete %s: %w (%d deleted before the error)", sanitizeTerm(r.name), err, deleted)
+			// The store's error text can quote the ref name.
+			return fmt.Errorf("delete %s: %s (%d deleted before the error)", sanitizeTerm(r.name), sanitizeTerm(err.Error()), deleted)
 		}
 		if !won {
 			lost++

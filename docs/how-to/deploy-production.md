@@ -304,10 +304,11 @@ ref. Remove the ref from the ref store with
 [`openstorage repair-refs`](../reference/cli.md#openstorage-repair-refs):
 
 1. Find the repo ID in the log: it is the text after `hydrate`, without the colon that
-   follows it. When only a REST request failed, run `git ls-remote` on the repository
-   once: that git read writes the `hydrate` line.
+   follows it. The ID is also in the cache path of the error, `<cache dir>/<repo ID>.git`,
+   so a REST request's `materialize repository` line shows it. To get the `hydrate`
+   line, run `git ls-remote` on the repository with a token that has `git:read`.
 2. List the refs, with the same database URL (or `--data-dir`) as `serve`:
-   `openstorage repair-refs <repo ID>`. This dry run changes nothing. It prints each ref
+   `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints each ref
    that git can never lock, with its SHA, and the number of refs that it scanned. A ref
    is on the list when any part of its name is over 255 bytes, or its last part is over
    250 bytes. A ref that git can lock is never on the list.
@@ -316,8 +317,9 @@ ref. Remove the ref from the ref store with
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
    and exits with an error. Run it again to list what is left.
 4. Run the dry run once more. It must scan refs and list none. A scan of 0 refs means
-   that no refs have that ID: check the ID. The next clone or fetch hydrates the
-   repository again, on every replica.
+   that no refs have that ID, or that the database URL or `--data-dir` is not the one
+   that `serve` uses: check both. The next clone or fetch hydrates the repository
+   again, on every replica.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and

@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -453,24 +454,26 @@ type failingCASStore struct {
 	calls int
 }
 
-func (s *failingCASStore) CASRef(context.Context, string, string, string, string) (bool, error) {
+func (s *failingCASStore) CASRef(_ context.Context, repo, name, _, _ string) (bool, error) {
 	s.calls++
-	return false, errors.New("store is down")
+	return false, fmt.Errorf("cas %s/%s: store is down", repo, name)
 }
 
 // A store error stops the command at the first ref and is reported with the
-// ref and the count of refs deleted so far.
+// ref and the count of refs deleted so far. The error text of the store can
+// quote the ref name, so it cannot forge output either.
 func TestRepairRefsStopsOnStoreError(t *testing.T) {
 	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	f := newRepairFixture(t, rs)
-	f.plant(t, map[string]string{repairLongRef: f.commit, "refs/notes/y/" + strings.Repeat("n", 251): f.commit})
+	f.plant(t, map[string]string{"refs/notes/x\x1b[2J/" + strings.Repeat("n", 251): f.commit, "refs/notes/y/" + strings.Repeat("n", 251): f.commit})
 	failing := &failingCASStore{RefStore: rs}
 	var out bytes.Buffer
 	err = repairRefs(t.Context(), failing, repairRepo, true, &out)
-	if err == nil || !strings.Contains(err.Error(), "store is down") || !strings.Contains(err.Error(), "0 deleted before the error") || failing.calls != 1 {
+	if err == nil || !strings.Contains(err.Error(), "store is down") || !strings.Contains(err.Error(), "0 deleted before the error") ||
+		strings.Contains(err.Error(), "\x1b") || failing.calls != 1 {
 		t.Fatalf("store error = %v after %d swaps\n%s", err, failing.calls, out.String())
 	}
 	if got := f.refs(t); len(got) != 2 {
@@ -499,7 +502,7 @@ func TestCmdRepairRefs(t *testing.T) {
 	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir}); err == nil || !strings.Contains(err.Error(), "exactly one <repo-id>") {
 		t.Fatalf("no arg = %v, want usage error", err)
 	}
-	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, repairRepo, "extra"}); err == nil || !strings.Contains(err.Error(), "exactly one <repo-id>") {
+	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, repairRepo, "extra"}); err == nil || !strings.Contains(err.Error(), "exactly one <repo-id>") || !strings.Contains(err.Error(), "flags go before it") {
 		t.Fatalf("two args = %v, want usage error", err)
 	}
 	if err := cmdRepairRefs(ctx, []string{"--data-dir", dir, ""}); err == nil || !strings.Contains(err.Error(), "must not be empty") {
