@@ -75,7 +75,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   route's request body in this document, array elements by index, and a field appears
   once. `detail` then holds the message of each problem, joined by `; `. One answer
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
-  out. A check that needs the repository's state (for example, that a merge creates a
+  out, unless the cut of a long `detail` above removes that ending: then `detail` ends
+  with `…` and gives no count. A check that needs the repository's state (for example, that a merge creates a
   commit and so needs an `author`) runs after the checks of the body. When the JSON
   decoder finds a field of the wrong type, the answer names one such field (the first
   that the decoder finds) and none of the other problems: the other checks run only when

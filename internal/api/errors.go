@@ -183,7 +183,9 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 // names one 1 MiB value, or holds bytes that %q escapes to four, would
 // otherwise answer with more than 10 MiB. It applies to every status. The
 // limit is far above the message that joins the 100 problems of a body
-// (bodyErrors), so an ordinary answer is never cut.
+// (bodyErrors), so an ordinary answer is not cut: a message of 100 problems
+// that each repeat 125 bytes or more of request text is, and then loses its
+// `and N more` ending.
 const maxEchoBytes = 16384
 
 // boundEcho cuts s to maxEchoBytes at a rune boundary and ends it with an
