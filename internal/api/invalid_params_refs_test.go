@@ -295,8 +295,37 @@ func TestBranchAndTagDeleteNameTheirField(t *testing.T) {
 				want:      []ipParam{{"name", "must be a valid branch name"}},
 			},
 			{
+				name: "delete branch: an empty target_branch is named", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{"target_branch":""}`,
+				wantError: "invalid branch name",
+				want:      []ipParam{{"target_branch", "must be a valid branch name"}},
+			},
+			{
+				name: "delete branch: an empty deprecated name is named", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{"name":""}`,
+				wantError: "invalid branch name",
+				want:      []ipParam{{"name", "must be a valid branch name"}},
+			},
+			{
+				name: "delete branch: two empty members name target_branch", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{"target_branch":"","name":""}`,
+				wantError: "invalid branch name",
+				want:      []ipParam{{"target_branch", "must be a valid branch name"}},
+			},
+			{
+				name: "delete branch: an empty target_branch gives way to the deprecated name", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{"target_branch":"","name":"bad..name"}`,
+				wantError: "invalid branch name",
+				want:      []ipParam{{"name", "must be a valid branch name"}},
+			},
+			{
 				name: "delete branch: no name names no field", method: http.MethodDelete, path: branches, token: fx.gitTok,
 				body:      `{}`,
+				wantError: "invalid branch name",
+			},
+			{
+				name: "delete branch: a null name is no name", method: http.MethodDelete, path: branches, token: fx.gitTok,
+				body:      `{"target_branch":null,"name":null}`,
 				wantError: "invalid branch name",
 			},
 			{

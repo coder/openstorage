@@ -91,7 +91,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   credential routes that name the repository or credential in the path
   (`/repos/{repo_name}/git-credentials` and
   `/repos/{repo_name}/git-credentials/{git_credential_id}`) look that one up before they
-  read the body, so on them a missing one is `404` even when the body is invalid. A grep
+  read the body, so on them a missing one is `404` even when the body is invalid. The
+  merge, branch, tag and note routes look up the repository before they read the body in
+  the same way. A grep
   `pagination.cursor` that does not decode is named with the other invalid fields when
   the body has any. Alone, it keeps its place after the lookup of the repository, so a
   missing repository is `404` first. A grep `query.pattern` that git refuses is found
@@ -317,8 +319,8 @@ the same scopes, query parameters and responses.
   `default_branch` of its own, because a create uses the first of the two. The
   `default_branch` query parameter is no body field and names none.
 - A token whose `refs` claim does not parse is refused with 403 before the fields of
-  the body are checked, after the body has been read (an unreadable body, and a copy or
-  fork body that does not decode, answer `400` first). The checks of state answer after
+  the body are checked, after the body has been read (an unreadable body, and a copy body
+  with an unknown member, answer `400` first). The checks of state answer after
   the checks of the body fields: the ref policy (403),
   the egress check of the upstream host (it looks the host up), and for a copy or fork
   the source token (403), the source repository (404) and the fork point (400). A
