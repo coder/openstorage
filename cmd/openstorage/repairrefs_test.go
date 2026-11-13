@@ -738,6 +738,11 @@ func sqliteTables(t *testing.T, path string) map[string]bool {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
+	// Every caller has set up the metadata schema, so a listing without its
+	// repos table is a broken helper, and the absence checks prove nothing.
+	if !tables["repos"] {
+		t.Fatalf("test setup: no repos table in %s: %v", path, tables)
+	}
 	return tables
 }
 

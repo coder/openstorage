@@ -284,7 +284,8 @@ list prints `repo:`, `url:` and `scanned: <n> refs`. Then, when refs match, it p
 ends with `nothing changed`. When none match, it prints `no ref that git can never lock`.
 A scan of 0 refs prints `this repository has no refs` instead: it is empty, it was
 purged, or its last refs were just deleted. A database URL or `--data-dir` that is not the
-one `serve` uses is an error (`not found`, or `no such table`). A wrong local `--data-dir`
+one `serve` uses is an error (`not found`, or an error that names the missing `repos`
+table). A wrong local `--data-dir`
 can also leave an empty database file there, so check the path.
 
 With `--yes`, the command swaps each ref's listed SHA for the zero SHA, one compare-and-swap
