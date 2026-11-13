@@ -155,6 +155,14 @@ plus object upload/download (e.g. via S3-presigned or local
 storage) covers the documented behavior ("no separate LFS server, no extra
 configuration").
 
+A batch body that does not decode answers `400` with the LFS error body
+`{"message":"bad batch request: operation has the wrong JSON type"}`, which names the
+field of the wrong JSON type (`objects.0.size` for a nested one), with
+`bad batch request: request body too large` for a body over 4 MiB, or with
+`bad batch request` for any other body that does not decode (invalid JSON, or a value of
+the wrong top-level type). The body is decoded before the request is authenticated, so
+the message never holds the text of Go's JSON decoder, which names Go types and structs.
+
 ## Interop invariant
 
 Objects and refs written through the HTTP API (commit-pack, merge, tags, notes) and
