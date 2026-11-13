@@ -74,17 +74,19 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   decoder finds a field of the wrong type, the answer names one such field (the first
   that the decoder finds) and none of the other problems: the other checks run only when
   every field has its right type. A field that stays raw for a check of its own (the
-  `expected_source_sha` of a merge) is checked with the others. A check of the store (a
-  credential `password` that starts with `enc:`) runs after the lookups of the route, so
-  a missing repository or credential is `404` first. When another field of the body is
-  invalid, the answer is `400` and names the password with the other fields. The
-  credential routes that name the repository or credential in the path
-  (`/repos/{repo_name}/git-credentials` and
+  `expected_source_sha` of a merge, the `target_branch` of a branch create) is checked
+  with the others. A check of the store (a credential `password` that starts with
+  `enc:`) runs after the lookups of the route, so a missing repository or credential is
+  `404` first. When another field of the body is invalid, the answer is `400` and names
+  the password with the other fields. The credential routes that name the repository or
+  credential in the path (`/repos/{repo_name}/git-credentials` and
   `/repos/{repo_name}/git-credentials/{git_credential_id}`) look that one up before they
   read the body, so on them a missing one is `404` even when the body is invalid. `POST
-  /repos/merge`, and `POST` and `PUT` on `/repos/git-credentials` and on those path
-  forms, answer this way. The other routes with a request body do not collect problems
-  yet: a check there can hide the checks after it.
+  /repos/merge`, `POST /repos/branches/create`, `POST /repos/tags`, `POST` and `PUT` on
+  `/repos/git-credentials` and on `/repos/{repo_name}/git-credentials`, and `PUT
+  /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. The other
+  routes with a request body do not collect problems yet: a check there can hide the
+  checks after it.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -410,7 +412,10 @@ A branch, tag or notes ref name that the API writes (for example in branch creat
 writes, tag writes and `default_branch`) is at most 255 bytes without its `refs/...`
 prefix, and its last `/`-separated part is at most 250 bytes, so that git can create the
 ref's `.lock` file. A longer one answers `400`. Branch and tag deletes still take a stored
-name whose last part is longer, so a ref that an earlier version wrote can be removed.
+name whose last part is longer, so a ref that an earlier version wrote can be removed. A
+notes ref that an earlier version wrote cannot be removed over REST (`DELETE /repos/notes`
+removes one note): the operator runs
+[`openstorage repair-refs`](cli.md#openstorage-repair-refs).
 
 Ephemeral branches are `refs/namespaces/ephemeral/refs/heads/<name>` in the base
 repository. The persistent git remote `/{repo}.git` hides them: git cannot fetch,

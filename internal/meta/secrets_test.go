@@ -33,8 +33,8 @@ func TestReservedSecret(t *testing.T) {
 		if got := ReservedSecret(tc.value); got != tc.want {
 			t.Errorf("ReservedSecret(%q) = %v, want %v", tc.value, got, tc.want)
 		}
-		// The stores refuse exactly what ReservedSecret names, with or
-		// without a codec.
+		// encodeSecret refuses exactly what ReservedSecret names. It makes
+		// that check before it looks at a codec, and this call passes none.
 		_, err := encodeSecret(nil, tc.value)
 		if got := errors.Is(err, ErrReservedSecret); got != tc.want {
 			t.Errorf("encodeSecret(nil, %q) refused = %v, want %v (err %v)", tc.value, got, tc.want, err)

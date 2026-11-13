@@ -5,6 +5,7 @@ The ref authority. `RefStore` holds a repo's refs and registered packs; refs cha
 
 ## Interface
 - `ZeroSHA`, `ValidSHA`, `ErrNotFound`, `ErrRepoPurged`, `ErrRefNameNotUTF8` [ref.go:ZeroSHA] [purge.go:ErrRepoPurged]
+- `Unlockable` — whether git can never lock a ref name (a part over 255 bytes, or a last part over 250), shared by the push-delete gate and `openstorage repair-refs` [unlockable.go:Unlockable]
 - Types: `Pack`, `RefInfo`, `RefEntry`, `HydrateSnapshot` [ref.go:Pack]
 - Contracts: `RefStore`, `Store` (adds `InitSchema`, `Close`), `HydrateSnapshotter`, `ScanStateStore`, `RestoreCoverStore` [ref.go:RefStore] [scanstate.go:ScanStateStore]
 - `Open` — dispatch `postgres`/`postgresql`, `sqlite`, or `s3wal` URLs; never runs `InitSchema` [ref.go:Open]
