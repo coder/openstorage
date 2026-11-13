@@ -64,7 +64,22 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   member out when it cannot name the fields: an unreadable or empty body, a JSON syntax
   error, a body that is not an object, an empty member name, unknown fields on the
   other bodies, rules across fields (such as `base_repo` and `upstream` together), and
-  query parameters. For a body with one problem, the message in `detail` does not change.
+  query parameters. For a body with one problem, `detail` is the message of that
+  problem. For a request body that does not decode, `detail` never holds text of the
+  JSON decoder, which names Go types. It states a field of the wrong JSON type as `name
+  reason`, as upstream's example does (`default_branch must be a string`), and a body
+  that is not valid JSON, or whose top-level value has the wrong type, as `invalid JSON
+  body`. Three cases keep their own message. The two strictly decoded routes answer with
+  `invalid JSON body: ` and the problem that their member check found: `body must be a
+  JSON object`, `unknown field "x"`, `duplicate field "x"`, `x must not be null` or `x
+  must be a JSON object`. `restore-commit` answers every body that does not decode with
+  `body must be {"metadata": {...}}`. The `upstream` member, the copy form of
+  `base_repo` and a branch create without `target_branch` refuse an unknown member, put
+  it in `detail` (`invalid upstream: unknown field "branch"`) and name no
+  `invalid_params` item. A
+  frame of a `commit-pack` or `diff-commit` stream that has a field of the wrong type
+  answers in the same way, in the `message` of its result:
+  `malformed NDJSON frame: metadata.target_branch must be a string`.
   A body with several invalid fields gets one item for each of them, as upstream says
   (`invalid_params` "names each invalid field"). The items follow the order of the
   route's request body in this document, array elements by index, and a field appears
@@ -94,10 +109,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   once more for each field it names, and stops when the decodes add up to 256 KiB. So a
   body of 2 KiB can name 100 fields, a body of 10 KiB about 25, and a body of more than
   128 KiB only the first. The server neither names nor counts the other wrong-type
-  fields, so `detail` does not end with `and N more` for them. A body with one wrong-type
-  field gets the answer it always got. A field that stays raw for a check of its own
-  (the `expected_source_sha` of a merge, the `target_branch` of a branch create) is
-  checked with the others. A check of the store
+  fields, so `detail` does not end with `and N more` for them. A field that stays raw
+  for a check of its own (the `expected_source_sha` of a merge, the `target_branch` of a
+  branch create) is checked with the others. A check of the store
   (a credential `password` that starts with `enc:`) runs after the lookups of the route,
   so a missing repository or credential is `404` first. When another field of the body
   is invalid, the answer is `400` and names the password with the other fields. The

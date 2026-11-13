@@ -25,6 +25,7 @@ One suite, several storage stacks. `TestMain` picks the stack for the whole run.
 | [Benchmarks](#benchmarks) | [`bench-nightly.yml`](../../.github/workflows/bench-nightly.yml) | 04:23 | full sweep |
 | [Floci S3](#the-floci-s3-lane) | [`floci-nightly.yml`](../../.github/workflows/floci-nightly.yml) | 03:53 | blob endpoint + s3wal qualification |
 | [Floci githttp E2E](#the-floci-githttp-e2e-lane) | [`floci-nightly-githttp.yml`](../../.github/workflows/floci-nightly-githttp.yml) | 04:53 | git/LFS E2E on STS credentials |
+| govulncheck | [`govulncheck-nightly.yml`](../../.github/workflows/govulncheck-nightly.yml) | 05:11 | fails when `cmd/openstorage` calls a vulnerable symbol on any of the four release platforms; a finding in a module, or in an imported package whose vulnerable function the command never calls, does not fail it |
 
 In [`ci.yml`](../../.github/workflows/ci.yml), `test`, `test-local`, and
 `test-s3wal` run the three lanes; `lint`, `terraform`, `image`,
