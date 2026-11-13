@@ -11,7 +11,7 @@ import (
 // The hook's git calls take GIT_NO_REPLACE_OBJECTS=1 from the hook's
 // environment: gitlimit.Start sets it for receive-pack, which passes it
 // to its hooks. The object checks, which build their own environment,
-// keep it. The object type read of a branch tip is one of them.
+// keep it. The object type read of a branch tip builds none and inherits it.
 func TestHookObjectChecksKeepNoReplaceObjects(t *testing.T) {
 	bin := t.TempDir()
 	log := filepath.Join(bin, "env")

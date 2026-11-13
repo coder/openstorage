@@ -135,7 +135,9 @@ func TestBranchTipThatIsNoCommitIsRefused(t *testing.T) {
 		{"update at a blob", token, false, tipObjects(t, work, blob, "^"+c1), []tipCommand{{c1, blob, "refs/heads/main"}}, "must point at a commit, not a blob", ""},
 		{"update at a blob under no-force-push", noForce, false, tipObjects(t, work, blob, "^"+c1), []tipCommand{{c1, blob, "refs/heads/main"}}, "must point at a commit, not a blob", ""},
 		{"atomic push", token, true, tipObjects(t, work, c2, blob, "^"+c1), []tipCommand{{zero, c2, "refs/heads/ok"}, {zero, blob, "refs/heads/blobby"}}, "must point at a commit, not a blob", ""},
-		{"mixed push", token, false, tipObjects(t, work, c2, blob, "^"+c1), []tipCommand{{zero, c2, "refs/heads/ok"}, {zero, blob, "refs/heads/blobby"}}, "must point at a commit, not a blob", "refs/heads/ok"},
+		// The update of main is refused by its type, before the no-force-push policy
+		// would ask whether a blob descends from c1.
+		{"mixed push under no-force-push", noForce, false, tipObjects(t, work, c2, blob, "^"+c1), []tipCommand{{zero, c2, "refs/heads/ok"}, {zero, blob, "refs/heads/blobby"}, {c1, blob, "refs/heads/main"}}, "must point at a commit, not a blob", "refs/heads/ok"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			report, remote := tipPush(t, nodeA, repo, tc.token, tc.atomic, tc.pack, tc.cmds...)
