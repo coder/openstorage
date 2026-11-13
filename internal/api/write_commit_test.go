@@ -912,6 +912,33 @@ func TestCommitWriteRefusesANULInTextFields(t *testing.T) {
 				})
 			}
 		}
+
+		// The default message of a restore names the target. A NUL in the
+		// target is a problem of the target, which is checked after the
+		// metadata, and not of a commit_message the request never sent.
+		restoreTarget := func(t *testing.T, target map[string]any) (*http.Response, []byte) {
+			t.Helper()
+			md := map[string]any{"target_branch": "main", "author": wctAuthor}
+			maps.Copy(md, target)
+			raw, err := json.Marshal(map[string]any{"metadata": md})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(raw))
+		}
+		t.Run("restore-commit/a NUL in base_ref without a message", func(t *testing.T) {
+			resp, body := restoreTarget(t, map[string]any{"base_ref": "x\x00"})
+			if resp.StatusCode != http.StatusNotFound || !bytes.Contains(body, []byte(`"code":"ref_not_found"`)) {
+				t.Errorf("status = %d, body %s, want 404 ref_not_found", resp.StatusCode, body)
+			}
+		})
+		t.Run("restore-commit/a NUL in target_commit_sha without a message", func(t *testing.T) {
+			resp, body := restoreTarget(t, map[string]any{"target_commit_sha": c1.Commit.CommitSHA[:39] + "\x00"})
+			wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
+			if want := "base_ref is required (or the deprecated 40-hex target_commit_sha)"; !bytes.Contains(body, []byte(want)) {
+				t.Errorf("body %s does not say %q", body, want)
+			}
+		})
 	})
 }
 

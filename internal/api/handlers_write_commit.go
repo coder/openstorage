@@ -1904,8 +1904,12 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	// commit; the deprecated target_commit_sha stays a 40-hex sha.
 	revision := md.BaseRef != nil
 	md.applyCurrentNames()
-	if md.CommitMessage == "" {
-		md.CommitMessage = "Restore to " + md.TargetCommitSHA
+	// The default message names the target, which is checked below. A
+	// placeholder stands in until then, so that a NUL in the target is a
+	// problem of the target and not of commit_message.
+	defaultMessage := md.CommitMessage == ""
+	if defaultMessage {
+		md.CommitMessage = "Restore"
 	}
 	if err := wcValidateMetadata(md); err != nil {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
@@ -1918,6 +1922,9 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	if !revision && !ref.ValidSHA(md.TargetCommitSHA) {
 		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is required (or the deprecated 40-hex target_commit_sha)", "", "")
 		return
+	}
+	if defaultMessage {
+		md.CommitMessage = "Restore to " + md.TargetCommitSHA
 	}
 	plan, ok := s.wcPlanCommit(w, r, repo.RepoID, md)
 	if !ok {

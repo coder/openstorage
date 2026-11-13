@@ -170,6 +170,11 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 				name: "DELETE one: body guard", method: http.MethodDelete, path: del, token: fx.gitTok,
 				body: `{"object_ref":"main","expected_notes_ref_sha":"x"}`, wantError: guardMsg, want: []ipParam{validSHA("expected_notes_ref_sha")},
 			},
+			{
+				name: "DELETE one: a NUL in the body author", method: http.MethodDelete, path: del, token: fx.gitTok,
+				body:      `{"object_ref":"main","author":{"name":"a\u0000","email":"e"}}`,
+				wantError: invalidTextMsg("author.name"), want: []ipParam{{"author.name", ipcNulReason}},
+			},
 		})
 
 		t.Run("a clean batch reaches the state checks", func(t *testing.T) {
