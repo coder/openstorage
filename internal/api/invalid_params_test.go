@@ -352,8 +352,8 @@ func TestMergeNamesEveryInvalidField(t *testing.T) {
 			},
 		})
 
-		// A wrong-type field stops the decode: only that field is named, and
-		// the checks of the other fields run once every type is right.
+		// A wrong-type field hides the problems of the other fields: the
+		// checks of those run once every type is right.
 		t.Run("a wrong-type field is named alone", func(t *testing.T) {
 			resp, body := e.doReq(t, http.MethodPost, path, fx.gitTok,
 				[]byte(`{"target_branch":"refs/heads/main","strategy":5,"author":{"email":"e"}}`), "")
