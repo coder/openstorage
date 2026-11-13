@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -46,6 +47,88 @@ func unmarshalBody(body []byte, dst any) error {
 		errs.add(te)
 	}
 	return errs.err()
+}
+
+// writeInvalidBody writes the 400 for a request body that did not decode.
+// err is what encoding/json, unmarshalBody or strictJSON returned. The
+// message of encoding/json names Go types and structs, so it never reaches
+// the answer (decodeError): the answer names each field of the wrong type as
+// invalid_params does, as upstream's example `default_branch must be a
+// string`. strictJSON's own errors hold no such text and keep their message.
+func writeInvalidBody(w http.ResponseWriter, err error) {
+	if _, ok := errors.AsType[strictError](err); ok {
+		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		return
+	}
+	derr := decodeError("", err)
+	writeInvalid(w, derr.Error(), derr)
+}
+
+// strictError is an error that strictJSON wrote itself (an unknown, repeated
+// or null member, trailing data) as opposed to one of encoding/json.
+type strictError struct{ error }
+
+func (e strictError) Unwrap() error { return e.error }
+
+// decodeError returns the error that answers a request body, or the member of
+// it that is decoded on its own (member is its name, "" for the whole body),
+// when decoding it returned err. Its message holds no text of encoding/json:
+//
+//   - for a field of the wrong type it is `name reason`, as in
+//     invalid_params, one for each field, joined by "; ",
+//   - for an unknown field it is `invalid JSON body: unknown field "x"`,
+//   - for anything else (a syntax error, a wrong top-level type) it is
+//     `invalid JSON body`.
+//
+// For a member, "invalid JSON body" is "invalid <member>".
+func decodeError(member string, err error) error {
+	assertf(err != nil, "decodeError: nil error")
+	what := "invalid JSON body"
+	params := invalidParamsFor(err)
+	if member != "" {
+		what = "invalid " + member
+		params = invalidParamsFor(fieldErrorUnder(member, what, err))
+	}
+	if len(params) > 0 {
+		return newFieldErrors(paramsText(params), params...)
+	}
+	if field := unknownFieldText(err); field != "" {
+		return errors.New(what + ": " + field)
+	}
+	return errors.New(what)
+}
+
+// frameMsg is the message for an NDJSON frame that did not decode. Like
+// decodeError, it holds no text of encoding/json.
+func frameMsg(err error) string {
+	if params := invalidParamsFor(err); len(params) > 0 {
+		return "malformed NDJSON frame: " + paramsText(params)
+	}
+	return "malformed NDJSON frame"
+}
+
+// paramsText returns `name reason` for each of params, joined by "; ".
+func paramsText(params []invalidParam) string {
+	items := make([]string, len(params))
+	for i, p := range params {
+		items[i] = p.Name + " " + p.Reason
+	}
+	return strings.Join(items, "; ")
+}
+
+// unknownFieldText returns `unknown field "x"` for the error that
+// encoding/json gives a member that DisallowUnknownFields refuses, and ""
+// for any other error. That error has no type: its text is fixed (pinned by
+// TestDecodeError), and it holds the member name only.
+func unknownFieldText(err error) string {
+	rest, ok := strings.CutPrefix(err.Error(), "json: unknown field ")
+	if !ok {
+		return ""
+	}
+	if _, uerr := strconv.Unquote(rest); uerr != nil {
+		return ""
+	}
+	return "unknown field " + rest
 }
 
 // nullMembers returns body with every value at the dotted path field

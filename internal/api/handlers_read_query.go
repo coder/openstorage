@@ -740,7 +740,7 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	}
 	var body grepRequestBody
 	if err := unmarshalBody(raw, &body); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return
 	}
 	// Every invalid body field is named, in the order of the docs table
@@ -1012,7 +1012,7 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	var body archiveRequestBody
 	if len(raw) > 0 {
 		if err := unmarshalBody(raw, &body); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}

@@ -454,7 +454,7 @@ func wcReadMetadata(w http.ResponseWriter, lr *wcLineReader) (*wcMetadata, bool)
 	}
 	var frame wcFrame
 	if err := json.Unmarshal(line, &frame); err != nil {
-		wcFail(w, http.StatusBadRequest, "invalid", "malformed NDJSON frame: "+err.Error(), "", "")
+		wcFail(w, http.StatusBadRequest, "invalid", frameMsg(err), "", "")
 		return nil, false
 	}
 	if frame.Metadata == nil || frame.BlobChunk != nil || frame.DiffChunk != nil {
@@ -1560,7 +1560,7 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		}
 		var frame wcFrame
 		if err := json.Unmarshal(line, &frame); err != nil {
-			return fail(http.StatusBadRequest, "malformed NDJSON frame: "+err.Error())
+			return fail(http.StatusBadRequest, frameMsg(err))
 		}
 		switch {
 		case frame.BlobChunk != nil:
@@ -1828,7 +1828,7 @@ func (s *server) wcSpoolDiff(w http.ResponseWriter, lr *wcLineReader, sc *wcScra
 		}
 		var frame wcFrame
 		if err := json.Unmarshal(line, &frame); err != nil {
-			wcFail(w, http.StatusBadRequest, "invalid", "malformed NDJSON frame: "+err.Error(), "", "")
+			wcFail(w, http.StatusBadRequest, "invalid", frameMsg(err), "", "")
 			return "", 0, false
 		}
 		if frame.DiffChunk == nil || frame.Metadata != nil || frame.BlobChunk != nil {

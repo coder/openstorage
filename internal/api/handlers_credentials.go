@@ -112,7 +112,7 @@ func gcredDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	if err := unmarshalBody(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -417,7 +417,7 @@ func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http
 	}
 	var req gcredPathUpdateRequest
 	if err := unmarshalBody(body, &req); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return
 	}
 	if err := gcredValidate(false, "", req.Username, req.Password); err != nil {
