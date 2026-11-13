@@ -3,7 +3,6 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -110,7 +109,7 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req createWebhookRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := unmarshalBody(body, &req); err != nil {
 		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}

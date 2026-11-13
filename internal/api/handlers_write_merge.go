@@ -626,7 +626,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing request body")
 		return
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := unmarshalBody(body, &req); err != nil {
 		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
 		return
 	}
