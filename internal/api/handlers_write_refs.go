@@ -342,6 +342,46 @@ func wrefCreateBranchOK(w http.ResponseWriter, message, branch string, ephemeral
 	})
 }
 
+// wrefValidateCreateBranch checks the body of branches/create and names
+// every invalid field, in the order of the docs table (bodyErrors): the
+// target, the base, force, and the guard. It returns the target name (""
+// for an allocated one), whether the server allocates the name, and the
+// guard in lower case. Only an omitted target_branch asks for an
+// allocated name, so force and a guard other than 40 zeros are wrong
+// only then: a target that is named but invalid leaves them alone.
+// Whatever needs the repository (the tip, the base ref) runs after this.
+func wrefValidateCreateBranch(req *wrefCreateBranchRequest) (target string, allocate bool, guard string, err error) {
+	assertf(req != nil, "wrefValidateCreateBranch: nil request")
+	var errs bodyErrors
+	// Only omission requests allocation; explicit empty/null targets stay invalid.
+	allocate = req.TargetBranch == nil
+	if !allocate {
+		switch {
+		case json.Unmarshal(req.TargetBranch, &target) != nil || !wrefValidNewBranchInput(target):
+			errs.add(newFieldError("target_branch", "must be a valid branch name", "invalid target_branch"))
+		case wrefEphemeralHEAD(target, req.TargetIsEphemeral):
+			errs.add(newFieldError("target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch"))
+		}
+	}
+	// These two rules name no field: each adds its message only.
+	if wrefAliasField(req.BaseRef, req.BaseBranch) == "" && req.PreferredBase == "" {
+		errs.add(errors.New("base_ref, base_branch, or preferred_base is required"))
+	}
+	if allocate && req.Force {
+		errs.add(errors.New("force requires target_branch"))
+	}
+	guard = lowerFullSHA(req.ExpectedTargetSHA)
+	switch {
+	case guard != "" && !ref.ValidSHA(guard):
+		errs.add(newFieldError("expected_target_sha", "must be a full commit SHA", "invalid expected_target_sha"))
+	// An allocated name is always new, so only the zero guard can hold.
+	case allocate && guard != "" && guard != ref.ZeroSHA:
+		errs.add(newFieldError("expected_target_sha", "requires target_branch unless it is 40 zeros",
+			"expected_target_sha requires target_branch"))
+	}
+	return target, allocate, guard, errs.err()
+}
+
 // handleCreateBranch resolves the base to a commit (branch, tag — peeled —
 // or hex sha via gitread.ResolveRef; preferred_base is the fallback when
 // the primary base is absent or names no ref, and a base whose commit git
@@ -362,39 +402,14 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	if !wrefDecodeBody(w, r, &req) {
 		return
 	}
-	// Only omission requests allocation; explicit empty/null targets stay invalid.
-	allocate := req.TargetBranch == nil
-	var targetBranch string
-	if !allocate && (json.Unmarshal(req.TargetBranch, &targetBranch) != nil || !wrefValidNewBranchInput(targetBranch)) {
-		writeInvalidField(w, "target_branch", "must be a valid branch name", "invalid target_branch")
-		return
-	}
-	if !allocate && wrefEphemeralHEAD(targetBranch, req.TargetIsEphemeral) {
-		writeInvalidField(w, "target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch")
-		return
-	}
-	if allocate && req.Force {
-		writeErr(w, http.StatusBadRequest, "force requires target_branch")
-		return
-	}
-	guard := lowerFullSHA(req.ExpectedTargetSHA)
-	if guard != "" && !ref.ValidSHA(guard) {
-		writeInvalidField(w, "expected_target_sha", "must be a full commit SHA", "invalid expected_target_sha")
-		return
-	}
-	// An allocated name is always new, so only the zero guard can hold.
-	if allocate && guard != "" && guard != ref.ZeroSHA {
-		writeInvalidField(w, "expected_target_sha", "requires target_branch unless it is 40 zeros",
-			"expected_target_sha requires target_branch")
+	targetBranch, allocate, guard, err := wrefValidateCreateBranch(&req)
+	if err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	base := req.BaseRef
 	if base == "" {
 		base = req.BaseBranch
-	}
-	if base == "" && req.PreferredBase == "" {
-		writeErr(w, http.StatusBadRequest, "base_ref, base_branch, or preferred_base is required")
-		return
 	}
 	// A named target's tip is read before materializing, so the read repo
 	// holds its objects for the fast-forward and policy checks. An
@@ -651,6 +666,25 @@ type wrefCreateTagResponse struct {
 	Message string `json:"message"`
 }
 
+// wrefValidateCreateTag checks the body of POST tags and names every
+// invalid field, in the order of the docs table (bodyErrors): name, then
+// ref. It returns the revision to tag.
+func wrefValidateCreateTag(req *wrefCreateTagRequest) (target string, err error) {
+	assertf(req != nil, "wrefValidateCreateTag: nil request")
+	var errs bodyErrors
+	if !wrefValidNewBranchInput(req.Name) {
+		errs.add(newFieldError("name", "must be a valid tag name", "invalid tag name"))
+	}
+	// openapi (issue #17): ref is the current field, target the deprecated
+	// alias; both have always accepted any revision (branch, tag, or
+	// commit) — ResolveRef peels to a commit either way.
+	target = wrefAliasField(req.Ref, req.Target)
+	if target == "" {
+		errs.add(newFieldError("ref", "is required", "ref is required"))
+	}
+	return target, errs.err()
+}
+
 // handleCreateTag creates a lightweight tag (invariant 10): target must
 // resolve — and peel, for annotated-tag or branch targets — to a commit
 // (gitread.ResolveRef applies ^{commit}); the stored ref value is that
@@ -664,16 +698,9 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	if !wrefDecodeBody(w, r, &req) {
 		return
 	}
-	if !wrefValidNewBranchInput(req.Name) {
-		writeInvalidField(w, "name", "must be a valid tag name", "invalid tag name")
-		return
-	}
-	// openapi (issue #17): ref is the current field, target the deprecated
-	// alias; both have always accepted any revision (branch, tag, or
-	// commit) — ResolveRef peels to a commit either way.
-	target := wrefAliasField(req.Ref, req.Target)
-	if target == "" {
-		writeInvalidField(w, "ref", "is required", "ref is required")
+	target, err := wrefValidateCreateTag(&req)
+	if err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo)

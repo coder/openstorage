@@ -117,6 +117,14 @@ func TestGrepNamesEveryInvalidField(t *testing.T) {
 				wantError: strings.Join(manyMsgs, "; ") + "; and 30 more",
 				want:      manyPaths,
 			},
+			{
+				// Past the bound only a bad entry is counted: the five valid
+				// entries and the problems that the answer names are not.
+				name: "past the bound only the bad entries are counted", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"query":{"pattern":"x"},"paths":[` + strings.Repeat(`"",`, 100) + strings.Repeat(`"src",`, 5) + `"/a","/a","/a"]}`,
+				wantError: strings.Join(manyMsgs, "; ") + "; and 3 more",
+				want:      manyPaths,
+			},
 
 			{
 				name: "a dropped problem counts each field that it names", method: http.MethodPost, path: path, token: fx.gitTok,
@@ -268,6 +276,12 @@ func TestArchiveNamesEveryInvalidField(t *testing.T) {
 				name: "the answer holds at most 100 items", method: http.MethodPost, path: path, token: fx.gitTok,
 				body:      `{"include_globs":` + manyGlobs + `}`,
 				wantError: strings.Join(manyMsgs, "; ") + "; and 30 more",
+				want:      manyParams,
+			},
+			{
+				name: "past the bound only the bad entries are counted", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"include_globs":[` + strings.Repeat(`"",`, 100) + strings.Repeat(`"*.md",`, 5) + `"",""]}`,
+				wantError: strings.Join(manyMsgs, "; ") + "; and 2 more",
 				want:      manyParams,
 			},
 
