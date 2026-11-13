@@ -44,6 +44,20 @@ func TestGrepNamesEveryInvalidField(t *testing.T) {
 		goneCursor := encodeGrepCursor(strings.Repeat("a", 40), "f.txt", 1)
 
 		ipRun(t, e, []ipCase{
+			// git takes the pattern as an argument, which cannot hold a NUL: it
+			// once reached git and answered 500.
+			{
+				name: "a NUL in the pattern", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"query":{"pattern":"a\u0000b"}}`,
+				wantError: invalidTextMsg("query.pattern"),
+				want:      []ipParam{{"query.pattern", ipcNulReason}},
+			},
+			{
+				name: "a NUL in the pattern next to another field", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"query":{"pattern":"a\u0000b"},"context":{"before":-1}}`,
+				wantError: invalidTextMsg("query.pattern") + "; context lines must be non-negative",
+				want:      []ipParam{{"query.pattern", ipcNulReason}, {"context.before", "must be at least 0"}},
+			},
 			{
 				name: "every field", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"query":{"pattern":" "},"paths":["","../x","ok","a\u0000b"],"context":{"before":-1,"after":-2},` +

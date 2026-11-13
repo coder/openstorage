@@ -749,6 +749,9 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	pattern := body.Query.Pattern
 	if strings.TrimSpace(pattern) == "" {
 		errs.add(newFieldError("query.pattern", "is required", "query.pattern is required"))
+	} else {
+		// git takes the pattern as an argument, which cannot hold a NUL.
+		errs.add(invalidTextFields([2]string{"query.pattern", pattern}))
 	}
 	caseSensitive := true
 	if body.Query.CaseSensitive != nil {
