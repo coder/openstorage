@@ -309,6 +309,18 @@ func TestRepoUpdateAndPullNameTheirOneField(t *testing.T) {
 				wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
 			},
 			{
+				name: "patch a name with a space", method: http.MethodPatch, path: "/api/v1/repo", token: fx.repoTok, body: `{"default_branch":"a b"}`,
+				wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
+			},
+			{
+				name: "patch a name that is only a space", method: http.MethodPatch, path: "/api/v1/repo", token: fx.repoTok, body: `{"default_branch":" "}`,
+				wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
+			},
+			{
+				name: "patch a name with a tab and a newline", method: http.MethodPatch, path: "/api/v1/repo", token: fx.repoTok, body: `{"default_branch":"a\tb\nc"}`,
+				wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
+			},
+			{
 				name: "patch invalid with a field that it ignores", method: http.MethodPatch, path: "/api/repos/" + fx.url, token: fx.repoTok,
 				body: `{"default_branch":"refs/tags/v1","other":1}`, wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
 			},
