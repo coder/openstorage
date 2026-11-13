@@ -1685,6 +1685,13 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		}
 	}
 
+	// A branch tip that is no commit would reach the CAS below, and git
+	// refuses it only afterwards (branchTipVerdicts). Checked before the
+	// policy: the object type decides it, whatever the policy says.
+	if err := branchTipVerdicts([]refCommand{{old: old, new: new, ref: refName}})[0]; err != nil {
+		return err
+	}
+
 	// Verified verdict (Codex round-16 P2): pre-receive already ran the
 	// FULL policy evaluation for this exact (ref, old, new) — same push,
 	// same policy env — and it passed; re-evaluating here could only
@@ -1692,9 +1699,6 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// another per-evaluation fee, failing large compliant same-tip
 	// fanouts under small budgets. Any lookup trouble falls back closed
 	// to a real evaluation.
-	if err := branchTipVerdicts([]refCommand{{old: old, new: new, ref: refName}})[0]; err != nil {
-		return err
-	}
 	sigVerified := false
 	if holdPath != "" {
 		sigVerified = pushVerifiedVerdict(holdPath, refName, old, new)
@@ -2813,14 +2817,14 @@ func condenseGitReason(out []byte) string {
 }
 
 // branchTipVerdicts refuses each command that sets a branch (a ref under
-// refs/heads/) to an object that is not a commit: a blob, a tree, an
-// annotated tag, or an object the repository lacks. git refuses to store
-// such a value too, but only after the update hook's compare-and-swap has
-// committed it to the ref store. The store then holds a value that no cache
-// can materialize, every read of the repository fails, and later updates of
-// the branch lose their CAS. Other namespaces take any object, as in git.
-// The kinds of all the new values come from one git child, decided by
-// object type. A failed child fails every candidate closed.
+// refs/heads/) to an object that is not a commit: a blob, a tree or an
+// annotated tag. git refuses to store such a value too, but only after the
+// update hook's compare-and-swap has committed it to the ref store. The
+// store then holds a value that no cache can materialize, every read of the
+// repository fails, and later updates of the branch lose their CAS. Other
+// namespaces take any object, as in git. The kinds of all the new values
+// come from one git child, decided by object type. A failed child fails
+// every candidate closed.
 func branchTipVerdicts(commands []refCommand) []error {
 	verdicts := make([]error, len(commands))
 	var ids []string
@@ -2840,7 +2844,7 @@ func branchTipVerdicts(commands []refCommand) []error {
 		case !isBranchTip(c.ref, c.new):
 		case err != nil:
 			verdicts[i] = fmt.Errorf("update: read the object type of %s: %w", c.new, err)
-		case kinds[c.new] != "commit":
+		case kindNames[kinds[c.new]] != "":
 			verdicts[i] = refusef("update: %s must point at a commit, not %s", c.ref, kindNames[kinds[c.new]])
 		}
 	}
@@ -2851,10 +2855,10 @@ func isBranchTip(refName, new string) bool {
 	return strings.HasPrefix(refName, "refs/heads/") && new != ref.ZeroSHA
 }
 
-// kindNames is how a refusal names an object kind that objectKinds reports.
-var kindNames = map[string]string{
-	"blob": "a blob", "tree": "a tree", "tag": "an annotated tag", "missing": "an object that this repository lacks",
-}
+// kindNames is how a refusal names the kinds of object that a branch cannot
+// point at. An object that is missing has no kind to refuse: receive-pack
+// refuses a command whose new value it lacks, before the update hook runs.
+var kindNames = map[string]string{"blob": "a blob", "tree": "a tree", "tag": "an annotated tag"}
 
 // objectKinds returns the type of each id, one of commit, tree, blob, tag or
 // missing, from one git child.
