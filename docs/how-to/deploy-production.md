@@ -396,6 +396,7 @@ The server bounds request bodies natively:
 |---|---|---|
 | Push | Decoded body ≤ [`OPENSTORAGE_MAX_PUSH_BYTES`](../reference/configuration.md#openstorage_max_push_bytes) (default 2 × the pack quota, 2 MiB minimum). Git is fed at most the cap's worth of bytes. | `413`. Git discards the truncated quarantine; a declared oversize is rejected without reading. |
 | Gzip-encoded `git-upload-pack` (fetch negotiation) | Fixed 4 MiB decoded, plus a small compressed-stream allowance so decode-to-nothing gzip streams cannot hold a connection open. Must finish within 30 seconds. | `413` before Git runs |
+| Git LFS batch request body | 4 MiB. A gzip-encoded body counts against it twice: its compressed bytes and its decoded bytes. The server reads at most that much of either before it authenticates the request. | `400` with `bad batch request: request body too large` |
 
 - Size temporary disk for up to one push cap per concurrent push.
 - A proxy request-body cap is optional defense in depth. If you set one, size it at or
