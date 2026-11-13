@@ -56,6 +56,8 @@ const (
 	lfsURLExpiry = 15 * time.Minute
 	// lfsMaxBatchBody bounds the JSON batch request (defensive: a batch of
 	// 100 objects is ~10KB; 4MiB is far beyond any legitimate request).
+	// A gzip body is bounded twice: its compressed bytes and its decoded
+	// bytes each count against it.
 	lfsMaxBatchBody = 4 << 20
 	// lfsMaxBatchObjects bounds one batch's object count (defensive:
 	// git-lfs sends at most 100 per batch; each entry costs a blob Stat
@@ -251,7 +253,11 @@ func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repo str
 			return
 		}
 		defer gz.Close()
-		body = gz
+		// The cap above counts the compressed bytes. The decoded stream
+		// gets the same bound, so a small body cannot make the server
+		// decode far more than the limit before it authenticates the
+		// request.
+		body = http.MaxBytesReader(w, gz, lfsMaxBatchBody)
 	}
 	var req lfsBatchRequest
 	if err := json.NewDecoder(body).Decode(&req); err != nil {
