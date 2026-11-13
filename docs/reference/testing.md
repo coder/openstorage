@@ -52,12 +52,13 @@ silently skipping LFS coverage.
 The fixtures and reference Compose file pin SeaweedFS
 [4.53](https://github.com/seaweedfs/seaweedfs/releases/tag/4.53), published
 2026-11-08. [Changes since 4.51](https://github.com/seaweedfs/seaweedfs/compare/4.51...4.53)
-touch S3 authorization (lifecycle, CORS and versioning changes need their own
-actions, POST Object header fields, per-bucket Block Public Access), the write
-path (conditional write headers and multipart completion conditions are
-evaluated under the object lock), the shortened first-write wait below, and the
-S3 Vectors gateway. The image now also carries the `weed-vector` binary and
-unpacks 256 MB larger than 4.51 (792 MB against 536 MB). As of 4.51, each
+touch S3 authorization (lifecycle changes need Admin, CORS and versioning
+changes need their own actions, POST Object header fields with control
+characters are rejected, per-bucket Block Public Access), the write path
+(conditional write headers and multipart completion conditions are evaluated
+under the object lock), the shortened first-write wait below, and the S3 Vectors
+gateway. The image now also carries the `weed-vector` binary and unpacks 256 MB
+larger than 4.51 (792 MB against 536 MB). As of 4.51, each
 `-ip.bind` port binds only that address, so `-ip.bind=0.0.0.0` still answers on
 loopback.
 
