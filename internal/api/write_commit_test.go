@@ -932,6 +932,15 @@ func TestCommitWriteRefusesANULInTextFields(t *testing.T) {
 				t.Errorf("status = %d, body %s, want 404 ref_not_found", resp.StatusCode, body)
 			}
 		})
+		t.Run("restore-commit/a valid base_ref without a message names the target", func(t *testing.T) {
+			resp, body := restoreTarget(t, map[string]any{"base_ref": c1.Commit.CommitSHA})
+			wctRequireOK(t, resp, body)
+			var commits listCommitsResponse
+			wctReadJSON(t, e, "/api/v1/repos/commits?branch=main&limit=1", readTok, &commits)
+			if got, want := commits.Commits[0].Message, "Restore to "+c1.Commit.CommitSHA; got != want {
+				t.Errorf("restore message = %q, want %q", got, want)
+			}
+		})
 		t.Run("restore-commit/a NUL in target_commit_sha without a message", func(t *testing.T) {
 			resp, body := restoreTarget(t, map[string]any{"target_commit_sha": c1.Commit.CommitSHA[:39] + "\x00"})
 			wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
@@ -2174,6 +2183,10 @@ func TestRestoreCommit(t *testing.T) {
 			}
 			if commits.Commits[0].ParentSHAs[0] != c3.Commit.CommitSHA {
 				t.Errorf("restore parent = %v, want c3", commits.Commits[0].ParentSHAs)
+			}
+			// No commit_message: the message names the target.
+			if got, want := commits.Commits[0].Message, "Restore to "+c1.Commit.CommitSHA; got != want {
+				t.Errorf("restore message = %q, want %q", got, want)
 			}
 		})
 
