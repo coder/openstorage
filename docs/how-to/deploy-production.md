@@ -348,8 +348,9 @@ Remove either kind of ref from the ref store with
 4. Run the dry run once more. It must list no ref, apart from a branch that the command
    keeps because its tip object is missing. An ID with no repository, and a
    database URL or `--data-dir` that is not the one `serve` uses, are errors. A scan of
-   0 refs means that the repository has no refs. The next clone or fetch hydrates the
-   repository again, on every replica.
+   0 refs means that the repository has no refs. When the list holds no ref, the next
+   clone or fetch hydrates the repository again, on every replica. A kept branch with a
+   missing tip object still wedges it.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and
