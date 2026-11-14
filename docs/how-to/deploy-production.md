@@ -328,9 +328,9 @@ Remove either kind of ref from the ref store with
    250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
    The command reads that type from the repository's packs: it downloads them into a
    temporary directory under `$TMPDIR` and removes the directory as soon as it has read the
-   tips (also after an error, `SIGINT`, `SIGTERM` or `SIGHUP`, and a run that `nohup` started
-   ignores `SIGHUP`: after `SIGKILL` or `SIGQUIT`, delete the `openstorage-repair-refs-*`
-   directory by hand), so run it where `$TMPDIR` has room for the packs. A ref that git can
+   tips, and also after an error, `SIGINT`, `SIGTERM` or `SIGHUP`. A run that `nohup` started
+   ignores `SIGHUP`. After `SIGKILL` or `SIGQUIT`, delete the `openstorage-repair-refs-*`
+   directory by hand. Run it where `$TMPDIR` has room for the packs. A ref that git can
    lock is on the list only as a branch whose tip is not a commit, or whose tip object the
    packs do not hold. A branch at a commit and a tag at a blob stay off it.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
@@ -340,9 +340,9 @@ Remove either kind of ref from the ref store with
    that is the repository's default branch, as `DELETE /repos/branches` does: the list
    marks it. Set another default branch with `PATCH /repo`, then run the command again. The
    command never deletes a branch whose tip object the packs do not hold, unless git can
-   never lock its name (the name rule comes first, and it needs no object): the list shows
-   it as missing, and the command exits with an error after it deleted the rest. That branch
-   still wedges the repository, so find the pack first (`openstorage list-packs --repo <repo ID>`,
+   never lock its name (the name rule comes first, and it needs no object). The list shows
+   the kept branch as missing, and the command exits with an error after it deleted the rest.
+   That branch still wedges the repository, so find the pack first (`openstorage list-packs --repo <repo ID>`,
    with the same `--data-dir` or URLs as `serve`).
 4. Run the dry run once more. It must list no ref. An ID with no repository, and a
    database URL or `--data-dir` that is not the one `serve` uses, are errors. A scan of

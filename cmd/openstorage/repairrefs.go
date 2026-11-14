@@ -186,6 +186,8 @@ Flags:
 		}
 	}
 	tips := &packTipKinds{rs: rs, repoID: repoID, blobURL: urls.blobURL}
+	// repairRefs calls release when the scan returns. A panic in the scan
+	// skips that call, and this defer still removes the packs.
 	defer tips.close()
 	target := repairTarget{repoID: repoID, url: state.Repo.URL, defaultBranch: state.Repo.DefaultBranch, kinds: tips.kinds, release: tips.close}
 	return repairRefs(ctx, rs, target, *yes, out)
