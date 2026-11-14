@@ -2,7 +2,11 @@
 
 package githttp
 
-import "syscall"
+import (
+	"syscall"
+	"testing"
+	"time"
+)
 
 // nodeSysProcAttr starts serve as a session leader, so testNode.stop can
 // kill serve together with its git children (issue #439). Only Linux has
@@ -16,6 +20,14 @@ func nodeSysProcAttr() *syscall.SysProcAttr {
 // own process group only.
 func sessionMembers(int) []int { return nil }
 
-// Node tracking for a signal handler needs sessionMembers: a no-op here.
-func trackNodeSession(int)   {}
-func untrackNodeSession(int) {}
+// Node tracking (the node guard in testnode_linux_test.go) needs /proc: a no-op here.
+func trackNodeSession(int) error { return nil }
+func untrackNodeSession(int)     {}
+
+func killSessionMembers(int, uint64) ([]int, error) { return nil, nil }
+
+func reapNodeSession(int, uint64, time.Duration) ([]int, error) { return nil, nil }
+
+func nodeStart(int) uint64 { return 0 }
+
+func nodeHelperMain(*testing.M) (int, bool) { return 0, false }
