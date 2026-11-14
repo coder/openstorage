@@ -86,6 +86,8 @@ queued commit, then squash-merges it. The next `release-please.yml` run then:
    - verifies archive contents and the bundled license against the root
      [`LICENSE`](../../LICENSE);
    - verifies checksums and runs the native binary on ubuntu and macOS runners;
+   - on the macOS runner, serves a repository from the native binary on the
+     SQLite local store: creates a repository, pushes to it, and clones it;
    - uploads `openstorage_<version>_<os>_<arch>.tar.gz` and `checksums.txt`.
 
 Each archive has `openstorage` and `LICENSE` at its root, so recipients get the
