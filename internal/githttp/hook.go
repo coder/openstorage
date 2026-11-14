@@ -405,6 +405,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	// beyond its signature-gated commands.
 	verdicts := make([]error, len(commands))
 	verdictDone := make([]bool, len(commands))
+	tipVerdicts := sync.OnceValue(func() []error { return branchTipVerdicts(commands) })
 	evalOne := func(i int) error {
 		if !verdictDone[i] {
 			c := commands[i]
@@ -416,6 +417,10 @@ func preReceive(ctx context.Context) (retErr error) {
 				// update hook, which denies the rest. So the publication
 				// gate stores no pack that only such names need.
 				verdicts[i] = refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth)
+			case tipVerdicts()[i] != nil:
+				// git refuses it after the hooks, but the update hook's
+				// CAS has stored it by then (branchTipVerdicts).
+				verdicts[i] = tipVerdicts()[i]
 			default:
 				verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
 			}
@@ -1680,6 +1685,13 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		}
 	}
 
+	// A branch tip that is no commit would reach the CAS below, and git
+	// refuses it only afterwards (branchTipVerdicts). Checked before the
+	// policy: the object type decides it, whatever the policy says.
+	if err := branchTipVerdicts([]refCommand{{old: old, new: new, ref: refName}})[0]; err != nil {
+		return err
+	}
+
 	// Verified verdict (Codex round-16 P2): pre-receive already ran the
 	// FULL policy evaluation for this exact (ref, old, new) — same push,
 	// same policy env — and it passed; re-evaluating here could only
@@ -2808,6 +2820,78 @@ func condenseGitReason(out []byte) string {
 		msg = msg[:max] + "..."
 	}
 	return msg
+}
+
+// branchTipVerdicts refuses each command that sets a branch (a ref under
+// refs/heads/) to an object that is not a commit: a blob, a tree or an
+// annotated tag. git refuses to store such a value too, but only after the
+// update hook's compare-and-swap has committed it to the ref store. The
+// store then holds a value that no cache can materialize, every read of the
+// repository fails, and later updates of the branch lose their CAS. Other
+// namespaces take any object, as in git. The kinds of all the new values
+// come from one git child, decided by object type. A failed child fails
+// every candidate closed.
+func branchTipVerdicts(commands []refCommand) []error {
+	verdicts := make([]error, len(commands))
+	var ids []string
+	seen := map[string]bool{}
+	for _, c := range commands {
+		if isBranchTip(c.ref, c.new) && !seen[c.new] {
+			seen[c.new] = true
+			ids = append(ids, c.new)
+		}
+	}
+	if len(ids) == 0 {
+		return verdicts
+	}
+	kinds, err := objectKinds(ids)
+	for i, c := range commands {
+		switch {
+		case !isBranchTip(c.ref, c.new):
+		case err != nil:
+			verdicts[i] = fmt.Errorf("update: read the object type of %s: %w", c.new, err)
+		case kindNames[kinds[c.new]] != "":
+			verdicts[i] = refusef("update: %s must point at a commit, not %s", c.ref, kindNames[kinds[c.new]])
+		}
+	}
+	return verdicts
+}
+
+func isBranchTip(refName, new string) bool {
+	return strings.HasPrefix(refName, "refs/heads/") && new != ref.ZeroSHA
+}
+
+// kindNames is how a refusal names the kinds of object that a branch cannot
+// point at. An object that is missing has no kind to refuse: receive-pack
+// refuses a command whose new value it lacks, before the update hook runs.
+var kindNames = map[string]string{"blob": "a blob", "tree": "a tree", "tag": "an annotated tag"}
+
+// objectKinds returns the type of each id, one of commit, tree, blob, tag or
+// missing, from one git child.
+func objectKinds(ids []string) (map[string]string, error) {
+	var out strings.Builder
+	cmd := exec.Command("git", "cat-file", "--batch-check=%(objecttype)")
+	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != len(ids) {
+		return nil, fmt.Errorf("cat-file --batch-check answered %d lines for %d ids", len(lines), len(ids))
+	}
+	kinds := make(map[string]string, len(ids))
+	for i, l := range lines {
+		switch l {
+		case "commit", "tree", "blob", "tag":
+			kinds[ids[i]] = l
+		case ids[i] + " missing":
+			kinds[ids[i]] = "missing"
+		default:
+			return nil, fmt.Errorf("cat-file --batch-check answered %q for %s", l, ids[i])
+		}
+	}
+	return kinds, nil
 }
 
 // objectExists reports whether sha names an object in the repo git put us
