@@ -1,5 +1,5 @@
 // repair-refs removes the refs of one repository that wedge its hydration.
-// There are two kinds, and each stops the hydration of the repository, so
+// There are three kinds, and each stops the hydration of the repository, so
 // every git read of it answers 500.
 //
 // A ref that git can never lock: before the API refused such names, a
@@ -10,10 +10,13 @@
 // A branch whose tip is not a commit: before the update hook refused such a
 // push, a git:write token could set a branch to a blob, a tree or an
 // annotated tag. The ref store took the value, and git refuses to write it
-// into the cache repository. The command reads the object type of each branch
-// tip from the repository's packs in the blob store, and it never deletes a
-// branch whose tip object it cannot find, unless git can never lock the name
-// of that branch.
+// into the cache repository. The command reads the object type of each tip
+// from the repository's packs in the blob store.
+//
+// A ref whose tip object no pack holds: git refuses to write a ref at an
+// object that the cache repository lacks, whatever the namespace of the ref
+// (a branch, a tag, a note), and the cache holds only what the registered
+// packs hold. The command deletes such a ref only with --yes.
 package main
 
 import (
@@ -24,6 +27,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -48,8 +52,8 @@ const repairBranchPrefix = "refs/heads/"
 
 // repairRef is one listed ref. kind is the object type of the tip (blob, tree
 // or tag) of a branch that is listed because its tip is not a commit, or
-// missing for a branch whose tip object was not found. It is empty for a ref
-// that is listed for its name.
+// missing for a ref of any namespace whose tip object no pack holds. It is
+// empty for a ref that is listed for its name.
 type repairRef struct{ name, sha, kind string }
 
 // repairKindNames is how the list names the object types that a branch
@@ -62,14 +66,17 @@ type objectKinds func(ctx context.Context, ids []string) (map[string]string, err
 
 // repairTarget is the repository that the command works on, as its row in the
 // metadata store describes it. url may be empty, defaultBranch may not. kinds
-// reads the object types of the branch tips, and a repository with a branch
-// needs it. release, when set, frees what kinds holds: repairRefs calls it
-// once the scan ends, so that nothing outlives the scan, not even a run that
-// a closed pipe on stdout kills.
+// reads the object types of the ref tips, and a repository with a ref that
+// git can lock needs it. release, when set, frees what kinds holds:
+// repairRefs calls it once the scan ends, so that nothing outlives the scan,
+// not even a run that a closed pipe on stdout kills. packsUnchanged, when
+// set, reports whether the repository's registered packs are still the ones
+// that kinds read.
 type repairTarget struct {
 	repoID, url, defaultBranch string
 	kinds                      objectKinds
 	release                    func()
+	packsUnchanged             func(ctx context.Context) (bool, error)
 }
 
 // isDefaultBranch reports whether the ref is the branch that the repository
@@ -108,14 +115,17 @@ it answer 500:
   - a ref that git can never lock: a ref name with a part over 255 bytes, or a
     last part over 250 bytes (git locks a ref at <last part>.lock);
   - a branch (a ref under refs/heads/) whose tip is not a commit but a blob, a
-    tree or an annotated tag. git refuses to write such a branch. The command
-    reads the object type of each branch tip from the repository's packs in
-    the blob store, so it downloads those packs into a temporary directory
-    under $TMPDIR and removes it as soon as it has read the tips, and also
-    after an error, SIGINT, SIGTERM or SIGHUP (a run that nohup started
-    ignores SIGHUP). After SIGKILL or SIGQUIT, delete the
-    openstorage-repair-refs-* directory by hand. It needs the blob store URL
-    ($OPENSTORAGE_S3_URL, or --data-dir).
+    tree or an annotated tag. git refuses to write such a branch;
+  - a ref of any namespace (a branch, a tag, a note) whose tip object no
+    registered pack holds. git refuses to write such a ref.
+
+The command reads the object type of each tip from the repository's packs in
+the blob store, so a repository with a ref that git can lock needs the blob
+store URL ($OPENSTORAGE_S3_URL, or --data-dir). It downloads the packs into a
+temporary directory under $TMPDIR and removes it as soon as it has read the
+tips, and also after an error, SIGINT, SIGTERM or SIGHUP (a run that nohup
+started ignores SIGHUP). After SIGKILL or SIGQUIT, delete the
+openstorage-repair-refs-* directory by hand.
 
 Without --yes the command changes nothing. With --yes it deletes each listed
 ref from the ref store, but only if the ref still holds the SHA that it
@@ -125,11 +135,11 @@ packs stay.
 The command changes the ref store only. It sends no push webhook and no sync
 poke. With --yes it lists the refs again and deletes what it finds. It keeps a
 ref that is the repository's default branch: set another default branch first
-(PATCH /repo), then run the command again. It keeps a branch whose name git can
-lock and whose tip object it cannot find: it lists that branch, and with --yes it
-exits with an error after it has deleted the rest. With --yes, a branch whose
-name git can never lock is deleted even when its tip object is missing: the name
-rule comes first.
+(PATCH /repo), then run the command again. A ref whose tip object no pack holds
+is listed with the other refs, and with --yes it is deleted too. Check the packs
+first (openstorage list-packs), and keep the list: it shows the SHA of each ref,
+and only the ref goes. If the registered packs change while the command reads
+them, it stops with an error and deletes nothing: run it again.
 
 Flags:
 `)
@@ -189,14 +199,13 @@ Flags:
 	// repairRefs calls release when the scan returns. A panic in the scan
 	// skips that call, and this defer still removes the packs.
 	defer tips.close()
-	target := repairTarget{repoID: repoID, url: state.Repo.URL, defaultBranch: state.Repo.DefaultBranch, kinds: tips.kinds, release: tips.close}
+	target := repairTarget{repoID: repoID, url: state.Repo.URL, defaultBranch: state.Repo.DefaultBranch, kinds: tips.kinds, release: tips.close, packsUnchanged: tips.unchanged}
 	return repairRefs(ctx, rs, target, *yes, out)
 }
 
 // repairRefs lists the refs of repoID that wedge its hydration and, when yes
 // is set, deletes them. It returns an error when a delete fails, a ref moved
-// since it was listed, or a branch is kept (the default branch, or a tip
-// whose object is missing).
+// since it was listed, or the default branch is kept.
 func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes bool, out io.Writer) error {
 	repoID := target.repoID
 	assertf(repoID != "", "repairRefs: empty repo ID")
@@ -206,6 +215,20 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 	}
 	if err != nil {
 		return err
+	}
+	if len(scan.missing) > 0 && target.packsUnchanged != nil {
+		// A pack that a push registered during the scan can hold an object
+		// that the scan read as missing. A push registers its pack before it
+		// moves a ref, so the packs of the scan's start are every pack that
+		// a ref listed by the scan's end can need, when the set has not
+		// changed since.
+		unchanged, err := target.packsUnchanged(ctx)
+		if err != nil {
+			return fmt.Errorf("list the packs of %s again: %w", sanitizeTerm(repoID), err)
+		}
+		if !unchanged {
+			return fmt.Errorf("the registered packs of %s changed while the command read them: no ref is listed or deleted, run the command again", sanitizeTerm(repoID))
+		}
 	}
 	fmt.Fprintf(out, "repo:    %s\n", sanitizeTerm(repoID))
 	if target.url != "" {
@@ -218,9 +241,9 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 		fmt.Fprintln(out, "this repository has no refs: it is empty, it was purged, or its last refs were just deleted")
 		return nil
 	}
-	found := append(append([]repairRef(nil), scan.unlockable...), scan.nonCommit...)
-	if len(found) == 0 && len(scan.missing) == 0 {
-		fmt.Fprintln(out, "no ref that git can never lock and no branch whose tip is not a commit")
+	found := append(append(append([]repairRef(nil), scan.unlockable...), scan.nonCommit...), scan.missing...)
+	if len(found) == 0 {
+		fmt.Fprintln(out, "no ref that git can never lock, no branch whose tip is not a commit, and no ref whose tip object is missing")
 		return nil
 	}
 	if len(scan.unlockable) > 0 {
@@ -232,14 +255,10 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 		printRepairRefs(out, target, scan.nonCommit)
 	}
 	if len(scan.missing) > 0 {
-		fmt.Fprintf(out, "branches whose tip object is missing (%d), never deleted:\n", len(scan.missing))
+		fmt.Fprintf(out, "refs whose tip object is missing (%d):\n", len(scan.missing))
 		printRepairRefs(out, target, scan.missing)
 	}
 	if !yes {
-		if len(found) == 0 {
-			fmt.Fprintln(out, "nothing changed: the command deletes no branch whose tip object is missing")
-			return nil
-		}
 		fmt.Fprintln(out, "nothing changed: run the command again with --yes to delete these refs")
 		return nil
 	}
@@ -275,15 +294,8 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 	if len(found) > 0 {
 		fmt.Fprintf(out, "deleted %d of %d refs\n", deleted, len(found))
 	}
-	var left []string
 	if lost > 0 || kept > 0 {
-		left = append(left, fmt.Sprintf("%d of %d refs were kept (%d changed since they were listed, %d are the default branch): see above, then run the command again", lost+kept, len(found), lost, kept))
-	}
-	if len(scan.missing) > 0 {
-		left = append(left, fmt.Sprintf("branches with a missing tip object are kept: %d, see above", len(scan.missing)))
-	}
-	if len(left) > 0 {
-		return errors.New(strings.Join(left, "; "))
+		return fmt.Errorf("%d of %d refs were kept (%d changed since they were listed, %d are the default branch): see above, then run the command again", lost+kept, len(found), lost, kept)
 	}
 	return nil
 }
@@ -311,14 +323,14 @@ func printRepairRefs(out io.Writer, target repairTarget, refs []repairRef) {
 type repairScan struct {
 	unlockable []repairRef // names that git can never lock
 	nonCommit  []repairRef // branches at a blob, a tree or an annotated tag
-	missing    []repairRef // branches whose tip object the packs do not hold
+	missing    []repairRef // refs of any namespace whose tip object the packs do not hold
 	scanned    int
 }
 
 // scanRepairRefs reads every ref of the repository, pageSize at a time. It
 // keeps the refs that wedge hydration and counts the rest, so memory does not
-// grow with the repository. A branch is read for its tip's object type once
-// for each page.
+// grow with the repository. The tips of the refs that git can lock are read
+// for their object types once for each page.
 func scanRepairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, pageSize int) (repairScan, error) {
 	assertf(pageSize > 0, "scanRepairRefs: page size %d", pageSize)
 	var scan repairScan
@@ -328,19 +340,19 @@ func scanRepairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, p
 		if err != nil {
 			return repairScan{}, fmt.Errorf("list refs of %s: %w", sanitizeTerm(target.repoID), err)
 		}
-		var branches []repairRef
+		var lockable []repairRef
 		for _, e := range page {
 			assertf(e.Name > after, "ListRefsAfter yielded %q not above cursor %q", e.Name, after)
 			after = e.Name
 			scan.scanned++
-			switch {
-			case ref.Unlockable(e.Name):
+			if ref.Unlockable(e.Name) {
+				// The name rule comes first and needs no object.
 				scan.unlockable = append(scan.unlockable, repairRef{name: e.Name, sha: e.SHA})
-			case strings.HasPrefix(e.Name, repairBranchPrefix):
-				branches = append(branches, repairRef{name: e.Name, sha: e.SHA})
+				continue
 			}
+			lockable = append(lockable, repairRef{name: e.Name, sha: e.SHA})
 		}
-		if err := scan.classify(ctx, target, branches); err != nil {
+		if err := scan.classify(ctx, target, lockable); err != nil {
 			return repairScan{}, err
 		}
 		if len(page) < pageSize {
@@ -349,63 +361,68 @@ func scanRepairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, p
 	}
 }
 
-// classify reads the object type of each branch tip and sorts the branches
-// whose tip is not a commit. A type that it does not know is an error: the
-// command deletes nothing on a guess.
-func (s *repairScan) classify(ctx context.Context, target repairTarget, branches []repairRef) error {
-	if len(branches) == 0 {
+// classify reads the object type of each ref tip, lists a ref whose tip no
+// pack holds, whatever its namespace, and lists a branch whose tip is not a
+// commit. git accepts a blob, a tree or an annotated tag under any other
+// name. A type that it does not know is an error: the command deletes
+// nothing on a guess.
+func (s *repairScan) classify(ctx context.Context, target repairTarget, refs []repairRef) error {
+	if len(refs) == 0 {
 		return nil
 	}
-	assertf(target.kinds != nil, "repairRefs: %d branches and no reader of object types", len(branches))
+	assertf(target.kinds != nil, "repairRefs: %d refs and no reader of object types", len(refs))
 	var ids []string
 	seen := map[string]bool{}
-	for _, b := range branches {
-		if !seen[b.sha] {
-			seen[b.sha] = true
-			ids = append(ids, b.sha)
+	for _, r := range refs {
+		if !seen[r.sha] {
+			seen[r.sha] = true
+			ids = append(ids, r.sha)
 		}
 	}
 	kinds, err := target.kinds(ctx, ids)
 	if err != nil {
-		return fmt.Errorf("read the object types of the branch tips of %s: %w", sanitizeTerm(target.repoID), err)
+		return fmt.Errorf("read the object types of the ref tips of %s: %w", sanitizeTerm(target.repoID), err)
 	}
-	for _, b := range branches {
-		kind, ok := kinds[b.sha]
+	for _, r := range refs {
+		kind, ok := kinds[r.sha]
 		if !ok {
-			return fmt.Errorf("no object type for the tip %s of %s", sanitizeTerm(b.sha), sanitizeTerm(b.name))
+			return fmt.Errorf("no object type for the tip %s of %s", sanitizeTerm(r.sha), sanitizeTerm(r.name))
 		}
-		b.kind = kind
+		r.kind = kind
 		switch kind {
 		case "commit":
 		case "blob", "tree", "tag":
-			s.nonCommit = append(s.nonCommit, b)
+			if strings.HasPrefix(r.name, repairBranchPrefix) {
+				s.nonCommit = append(s.nonCommit, r)
+			}
 		case "missing":
-			s.missing = append(s.missing, b)
+			s.missing = append(s.missing, r)
 		default:
-			return fmt.Errorf("unknown object type %q for the tip %s of %s", sanitizeTerm(kind), sanitizeTerm(b.sha), sanitizeTerm(b.name))
+			return fmt.Errorf("unknown object type %q for the tip %s of %s", sanitizeTerm(kind), sanitizeTerm(r.sha), sanitizeTerm(r.name))
 		}
 	}
 	return nil
 }
 
 // deleteRepairRef swaps r's listed SHA for the zero SHA. It refuses a ref
-// that is healthy: one that git can lock, and that is no branch at a blob, a
-// tree or an annotated tag, whatever listed it. won is false when the ref no
-// longer holds the listed SHA. The swap is not retried.
+// that is healthy: one that git can lock, whose tip object a pack holds, and
+// that is no branch at a blob, a tree or an annotated tag, whatever listed
+// it. won is false when the ref no longer holds the listed SHA. The swap is
+// not retried.
 func deleteRepairRef(ctx context.Context, rs ref.RefStore, repoID string, r repairRef) (won bool, err error) {
 	_, nonCommit := repairKindNames[r.kind]
-	if !ref.Unlockable(r.name) && !(nonCommit && strings.HasPrefix(r.name, repairBranchPrefix)) {
-		return false, errors.New("git can lock this ref and its tip is a commit: refusing to delete it")
+	if !ref.Unlockable(r.name) && !(nonCommit && strings.HasPrefix(r.name, repairBranchPrefix)) && r.kind != "missing" {
+		return false, errors.New("git can lock this ref, and its tip is a commit or an object that git accepts under this name: refusing to delete it")
 	}
 	return rs.CASRef(ctx, repoID, r.name, r.sha, ref.ZeroSHA)
 }
 
-// packTipKinds reads the object types of branch tips from the packs that the
+// packTipKinds reads the object types of ref tips from the packs that the
 // repository has in the blob store, without a ref sync: a repository with a
-// branch at a blob, a tree or an annotated tag cannot sync its refs. The
-// first read downloads the registered packs into a temporary cache repository
-// (a snapshot: an object that a later push adds reads as missing), and close
-// removes it.
+// wedging ref cannot sync its refs. The first read downloads the registered
+// packs into a temporary cache repository (a snapshot: an object that a later
+// push adds reads as missing, and unchanged tells whether that can have
+// happened), and close removes it.
 type packTipKinds struct {
 	rs      ref.RefStore
 	repoID  string
@@ -414,6 +431,7 @@ type packTipKinds struct {
 	blobs    blob.BlobStore
 	dir      string
 	repoPath string
+	packIDs  []string // the registered packs when the first read began
 }
 
 func (p *packTipKinds) kinds(ctx context.Context, ids []string) (map[string]string, error) {
@@ -453,11 +471,43 @@ func (p *packTipKinds) stage(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("create the temporary cache repository: %w", err)
 	}
+	// Listed before the download: a pack that registers after this list is
+	// not in packIDs, and unchanged then answers false.
+	if p.packIDs, err = p.registeredPacks(ctx); err != nil {
+		return err
+	}
 	if err := githttp.HydratePacks(ctx, p.rs, p.blobs, repoPath, p.repoID); err != nil {
 		return fmt.Errorf("download the packs of %s: %w", sanitizeTerm(p.repoID), err)
 	}
 	p.repoPath = repoPath
 	return nil
+}
+
+// registeredPacks lists the IDs of the packs that the repository has now.
+func (p *packTipKinds) registeredPacks(ctx context.Context) ([]string, error) {
+	packs, err := p.rs.ListPacks(ctx, p.repoID)
+	if err != nil {
+		return nil, fmt.Errorf("list the packs of %s: %w", sanitizeTerm(p.repoID), err)
+	}
+	ids := make([]string, 0, len(packs))
+	for _, pk := range packs {
+		ids = append(ids, pk.ID)
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+// unchanged reports whether the repository has the same registered packs as
+// when the first read began. It is true without a first read.
+func (p *packTipKinds) unchanged(ctx context.Context) (bool, error) {
+	if p.packIDs == nil && p.repoPath == "" {
+		return true, nil
+	}
+	now, err := p.registeredPacks(ctx)
+	if err != nil {
+		return false, err
+	}
+	return slices.Equal(now, p.packIDs), nil
 }
 
 func (p *packTipKinds) close() {

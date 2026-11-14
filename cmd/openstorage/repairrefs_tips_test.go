@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -149,7 +150,7 @@ func testRepairNonCommitTips(t *testing.T, f *repairFixture, dbURL string) {
 
 	// A second run finds nothing.
 	out.Reset()
-	if err := repairRefs(ctx, f.rs, f.target(), true, &out); err != nil || !strings.Contains(out.String(), "no ref that git can never lock and no branch whose tip is not a commit") {
+	if err := repairRefs(ctx, f.rs, f.target(), true, &out); err != nil || !strings.Contains(out.String(), "no ref whose tip object is missing") {
 		t.Fatalf("second run = %v\n%s", err, out.String())
 	}
 
@@ -169,28 +170,27 @@ func testRepairNonCommitTips(t *testing.T, f *repairFixture, dbURL string) {
 		t.Fatalf("refs after a lost CAS = %v, want %v", got, want)
 	}
 
-	// A branch whose tip object the packs do not hold is reported and kept,
-	// and git still cannot hydrate it.
+	// A branch whose tip object the packs do not hold wedges git too. The
+	// dry run lists it and changes nothing, and --yes deletes it.
 	ghost := strings.Repeat("ab", 20)
 	f.plant(t, map[string]string{"refs/heads/ghost": ghost})
-	out.Reset()
-	if err := repairRefs(ctx, f.rs, f.target(), false, &out); err != nil || !strings.Contains(out.String(), "never deleted:\n  "+ghost+" refs/heads/ghost\n") {
-		t.Fatalf("dry run with a missing tip = %v\n%s", err, out.String())
-	}
-	out.Reset()
-	err = repairRefs(ctx, f.rs, f.target(), true, &out)
-	if err == nil || !strings.Contains(err.Error(), "branches with a missing tip object are kept: 1") ||
-		!strings.Contains(out.String(), "branches whose tip object is missing (1), never deleted:\n  "+ghost+" refs/heads/ghost\n") {
-		t.Fatalf("a missing tip = %v\n%s", err, out.String())
-	}
-	if got := f.refs(t)["refs/heads/ghost"]; got != ghost {
-		t.Fatalf("the missing tip was changed to %q", got)
-	}
 	if _, err := f.hydrateInto(t, filepath.Join(t.TempDir(), "cache")); err == nil {
 		t.Fatal("hydration works with a branch at a missing object: the report is not needed")
 	}
-	if won, err := f.rs.CASRef(ctx, f.repo, "refs/heads/ghost", ghost, ref.ZeroSHA); err != nil || !won {
-		t.Fatalf("remove the missing tip: won=%v err=%v", won, err)
+	out.Reset()
+	if err := repairRefs(ctx, f.rs, f.target(), false, &out); err != nil || !strings.Contains(out.String(), "refs whose tip object is missing (1):\n  "+ghost+" refs/heads/ghost\n") ||
+		!strings.Contains(out.String(), "nothing changed: run the command again with --yes") {
+		t.Fatalf("dry run with a missing tip = %v\n%s", err, out.String())
+	}
+	if got := f.refs(t)["refs/heads/ghost"]; got != ghost {
+		t.Fatalf("the dry run changed the missing tip to %q", got)
+	}
+	out.Reset()
+	if err := repairRefs(ctx, f.rs, f.target(), true, &out); err != nil || !strings.Contains(out.String(), "deleted: refs/heads/ghost\n") || !strings.Contains(out.String(), "deleted 1 of 1 refs") {
+		t.Fatalf("a missing tip with --yes = %v\n%s", err, out.String())
+	}
+	if _, err := f.hydrateInto(t, filepath.Join(t.TempDir(), "cache")); err != nil {
+		t.Fatalf("hydrate after the missing tip is gone: %v", err)
 	}
 
 	// The command line opens both stores from the environment, as an
@@ -281,10 +281,10 @@ func TestRepairRefsFailsClosedOnObjectTypes(t *testing.T) {
 	}
 }
 
-// A repository with branches needs the blob store to read their tips, and one
-// with no branch does not: the command still repairs it from the database URL
-// alone.
-func TestCmdRepairRefsNeedsTheBlobStoreOnlyForBranches(t *testing.T) {
+// A repository with a ref that git can lock needs the blob store to read its
+// tip, and one with only refs that git can never lock does not: the command
+// still repairs it from the database URL alone.
+func TestCmdRepairRefsNeedsTheBlobStoreOnlyForLockableRefs(t *testing.T) {
 	isolateStorageEnv(t)
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -296,18 +296,18 @@ func TestCmdRepairRefsNeedsTheBlobStoreOnlyForBranches(t *testing.T) {
 	}
 	f := newRepairFixtureFor(t, rs, repo)
 	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
-	f.plant(t, map[string]string{repairLongRef: f.commit, "refs/heads/main": f.commit})
+	f.plant(t, map[string]string{repairLongRef: f.commit, "refs/tags/v1": f.commit})
 	if err := cmdRepairRefs(ctx, []string{"--yes", repo}); err == nil || !strings.Contains(err.Error(), "blob URL required") {
-		t.Fatalf("a branch and no blob URL = %v, want the missing URL error", err)
+		t.Fatalf("a tag and no blob URL = %v, want the missing URL error", err)
 	}
 	if got := f.refs(t); len(got) != 2 {
 		t.Fatalf("refs changed: %v", got)
 	}
-	if won, err := rs.CASRef(ctx, repo, "refs/heads/main", f.commit, ref.ZeroSHA); err != nil || !won {
-		t.Fatalf("remove the branch: won=%v err=%v", won, err)
+	if won, err := rs.CASRef(ctx, repo, "refs/tags/v1", f.commit, ref.ZeroSHA); err != nil || !won {
+		t.Fatalf("remove the tag: won=%v err=%v", won, err)
 	}
 	if err := cmdRepairRefs(ctx, []string{"--yes", repo}); err != nil {
-		t.Fatalf("no branch and no blob URL = %v", err)
+		t.Fatalf("no ref that git can lock and no blob URL = %v", err)
 	}
 	if got := f.refs(t); len(got) != 0 {
 		t.Fatalf("refs after --yes = %v", got)
@@ -554,4 +554,90 @@ type cancelingCAS struct {
 func (c cancelingCAS) CASRef(context.Context, string, string, string, string) (bool, error) {
 	c.cancel()
 	return false, errors.New("commit: sql: transaction has already been committed or rolled back")
+}
+
+// A ref of any namespace whose tip object no pack holds is listed, and --yes
+// deletes it: git refuses to write such a ref wherever it sits. A tag at a
+// blob, which git accepts, and refs at a commit stay. The default branch at a
+// missing object is kept.
+func TestRepairRefsMissingTipsInEveryNamespace(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	ghost := strings.Repeat("ab", 20)
+	gone := []string{"refs/heads/ghost", "refs/tags/ghost", "refs/notes/ghost", "refs/other/ghost", "refs/namespaces/ephemeral/refs/heads/ghost"}
+	want := map[string]string{"refs/heads/main": f.commit, "refs/tags/blobtag": f.blob, "refs/tags/v1": f.commit}
+	refs := map[string]string{}
+	for k, v := range want {
+		refs[k] = v
+	}
+	for _, name := range gone {
+		refs[name] = ghost
+	}
+	f.plant(t, refs)
+	if _, err := f.hydrateInto(t, filepath.Join(t.TempDir(), "cache")); err == nil {
+		t.Fatal("hydration works with refs at a missing object: the report is not needed")
+	}
+	var out bytes.Buffer
+	if err := repairRefs(t.Context(), f.rs, f.target(), false, &out); err != nil || !strings.Contains(out.String(), "refs whose tip object is missing (5):\n") ||
+		strings.Contains(out.String(), "blobtag") || strings.Contains(out.String(), "refs/tags/v1") {
+		t.Fatalf("dry run = %v\n%s", err, out.String())
+	}
+	if got := f.refs(t); len(got) != len(refs) {
+		t.Fatalf("the dry run changed the refs: %v", got)
+	}
+	out.Reset()
+	if err := repairRefs(t.Context(), f.rs, f.target(), true, &out); err != nil || !strings.Contains(out.String(), "deleted 5 of 5 refs") {
+		t.Fatalf("--yes = %v\n%s", err, out.String())
+	}
+	if got := f.refs(t); !mapsEqual(got, want) {
+		t.Fatalf("refs after --yes = %v, want %v", got, want)
+	}
+	if _, err := f.hydrateInto(t, filepath.Join(t.TempDir(), "cache")); err != nil {
+		t.Fatalf("hydrate after the repair: %v", err)
+	}
+
+	if won, err := f.rs.CASRef(t.Context(), f.repo, "refs/heads/main", f.commit, ghost); err != nil || !won {
+		t.Fatalf("move the default branch: won=%v err=%v", won, err)
+	}
+	out.Reset()
+	err = repairRefs(t.Context(), f.rs, f.target(), true, &out)
+	if err == nil || !strings.Contains(err.Error(), "1 are the default branch") || !strings.Contains(out.String(), "kept: refs/heads/main is the default branch") {
+		t.Fatalf("the default branch at a missing tip = %v\n%s", err, out.String())
+	}
+}
+
+// A pack that registers while the command reads the packs can hold an object
+// that the read found missing, so a run that sees the pack set change lists
+// and deletes nothing.
+func TestRepairRefsStopsWhenThePacksChange(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	ghost := strings.Repeat("ab", 20)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/heads/ghost": ghost})
+	if unchanged, err := f.tips.unchanged(t.Context()); err != nil || !unchanged {
+		t.Fatalf("unchanged before any read = %v, %v", unchanged, err)
+	}
+	target := f.target()
+	target.kinds = func(ctx context.Context, ids []string) (map[string]string, error) {
+		kinds, err := f.tips.kinds(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		pack := ref.Pack{ID: strings.Repeat("f", 40), Key: blob.PackKey(f.repo, strings.Repeat("f", 40)), Size: 1}
+		return kinds, f.rs.RegisterPacks(ctx, f.repo, []ref.Pack{pack})
+	}
+	var out bytes.Buffer
+	err = repairRefs(t.Context(), f.rs, target, true, &out)
+	if err == nil || !strings.Contains(err.Error(), "changed while the command read them") || out.Len() != 0 {
+		t.Fatalf("a pack that registers during the read = %v\n%s", err, out.String())
+	}
+	if got := f.refs(t); got["refs/heads/ghost"] != ghost {
+		t.Fatalf("the run changed the refs: %v", got)
+	}
 }

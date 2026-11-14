@@ -112,7 +112,7 @@ func createMetaRepo(t *testing.T, dbURL, defaultBranch string) string {
 
 // target is the repository as repairRefs takes it, with default branch main.
 func (f *repairFixture) target() repairTarget {
-	return repairTarget{repoID: f.repo, defaultBranch: "main", kinds: f.tips.kinds}
+	return repairTarget{repoID: f.repo, defaultBranch: "main", kinds: f.tips.kinds, packsUnchanged: f.tips.unchanged}
 }
 
 func newRepairFixtureFor(t *testing.T, rs ref.Store, repo string) *repairFixture {
@@ -436,7 +436,8 @@ func TestScanUnlockableRefsPages(t *testing.T) {
 
 // A ref that git can lock and that holds a commit is never deleted, whatever
 // listed it. A branch at a blob, a tree or an annotated tag is deletable only
-// when the scan found its type, and a tag ref never is.
+// when the scan found its type, and a tag ref at a blob never is. A ref whose
+// tip object is missing is deletable in any namespace.
 func TestRepairRefsRefusesLockableRef(t *testing.T) {
 	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
 	if err != nil {
@@ -458,7 +459,6 @@ func TestRepairRefsRefusesLockableRef(t *testing.T) {
 		{name: "refs/tags/blobtag", sha: f.blob, kind: "blob"}, // a tag may hold a blob
 		{name: "refs/heads/ghost", sha: f.blob},                // no type was read
 		{name: "refs/heads/ghost", sha: f.blob, kind: "commit"},
-		{name: "refs/heads/ghost", sha: f.blob, kind: "missing"},
 	} {
 		if won, err := deleteRepairRef(t.Context(), rs, f.repo, r); won || err == nil || !strings.Contains(err.Error(), "refusing") {
 			t.Errorf("delete %s as %q: won=%v err=%v, want a refusal", r.name, r.kind, won, err)
