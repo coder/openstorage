@@ -77,9 +77,9 @@ func requireMalformed(t *testing.T, err error, want string) {
 
 // TestVerify_MalformedTokenAnswersFixedText: a token or a claim that does not
 // decode gets a fixed text, whatever the decoder said. The git and LFS
-// transports show that text to the client (issue #841). Bytes that are read
-// before the signature check are not logged (the client chose them). Claims
-// of a token whose signature verifies are, with the decoder's text.
+// transports show that text to the client (issue #841). A failure before the
+// signature check is not logged (the client chose those bytes). A failure
+// after it is, with the decoder's text.
 func TestVerify_MalformedTokenAnswersFixedText(t *testing.T) {
 	key := mustGenerateKey(t, "ES256")
 	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
@@ -99,7 +99,7 @@ func TestVerify_MalformedTokenAnswersFixedText(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, token, want string
-		logged            bool // a registered key signed the token
+		logged            bool // Verify fails after the signature check and logs the failure
 	}{
 		{"a header that is not JSON", unsigned("x", `{"iss":"acme"}`), "malformed jwt", false},
 		{"a header member of the wrong type", unsigned(`{"alg":5}`, `{"iss":"acme"}`), "malformed jwt", false},
@@ -123,10 +123,10 @@ func TestVerify_MalformedTokenAnswersFixedText(t *testing.T) {
 			requireMalformed(t, err, tc.want)
 			if tc.logged {
 				if got := logs.String(); !strings.Contains(got, "do not decode") || !strings.Contains(got, "cannot unmarshal") {
-					t.Fatalf("a signed claim that does not decode left this log: %q", got)
+					t.Fatalf("a failure after the signature check left this log: %q", got)
 				}
 			} else if got := logs.String(); got != "" {
-				t.Fatalf("a token that no key signed left this log: %q", got)
+				t.Fatalf("a failure before the signature check left this log: %q", got)
 			}
 		})
 	}

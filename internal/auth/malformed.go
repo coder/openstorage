@@ -1,7 +1,7 @@
 package auth
 
 // MalformedError is a token, or a claim in it, that does not decode. A
-// client reads Error, and it is fixed text: the text of a decoder names Go
+// client reads Error, and it is fixed text: the text of a decoder can name Go
 // structs and types ("cannot unmarshal number into Go struct field
 // Claims.exp of type int64"), so it stays in Err for the server's log.
 type MalformedError struct {

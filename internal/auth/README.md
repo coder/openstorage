@@ -37,7 +37,7 @@ JWT auth contract for the HTTP API and the git surface. It defines claim types, 
 - `OrgKeyVerifier.Verify` calls the injected `KeySource.PublicKeysForOrg` with the unverified `iss` claim [verifier.go:Verify]
 - `FoldOps` and `UnionKeySource.PublicKeysForOrg` do not mutate their inputs. `FoldOps` returns the caller's `refs` slice itself when `ops` is empty and a fresh slice otherwise [policy.go:FoldOps]
 - `UnionKeySource.PublicKeysForOrg` copies only for the union org. For every other org it returns the inner source's slice unchanged [verifier.go:PublicKeysForOrg]
-- `OrgKeyVerifier.Verify` logs one `slog` warning (the default logger) when the signature of a token verifies and its claims do not decode into the claim set, for example a claim of the wrong JSON type. It logs nothing for a token that no key signed, and nothing for a payload that is not a JSON object, because the unverified `iss` is read first [verifier.go:Verify]
+- `OrgKeyVerifier.Verify` logs one `slog` warning (the default logger) with the decoder's error when the claims of a token fail to decode after its signature has verified. It logs nothing for a failure before the signature check, because the client chose those bytes [verifier.go:Verify]
 - No database, network, filesystem, or subprocess use [auth.go:Claims]
 
 ## Verification

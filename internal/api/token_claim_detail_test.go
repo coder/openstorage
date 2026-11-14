@@ -80,8 +80,8 @@ func tcdCaptureSlog(t *testing.T) *tcdLog {
 }
 
 // TestMalformedRefsClaimAnswersFixedText covers issue #841: a token whose
-// `refs` claim does not parse fails closed with 403 on every write route, and
-// the answer holds no text of the decoder, which names Go structs and types.
+// `refs` claim does not parse fails closed with 403 on each route below, and
+// the answer holds no text of the decoder, which can name Go structs and types.
 // The decoder's text goes to the log.
 func TestMalformedRefsClaimAnswersFixedText(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
@@ -129,7 +129,7 @@ func TestRefPoliciesErrorIsFixedText(t *testing.T) {
 
 // TestMalformedClaimsAnswerGenericText covers issue #841 on the REST surface:
 // a token whose signed claims do not decode (a claim of the wrong JSON type)
-// gets the generic 403, on every route that verifies a token, the embedded
+// gets 403 without decoder text, on each route below, the embedded
 // fork-source token included.
 func TestMalformedClaimsAnswerGenericText(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {

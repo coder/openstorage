@@ -165,9 +165,7 @@ commits and signatures that `verify-sig` reads.
 | the key store fails while the server verifies the token | REST API, fork source tokens included: 403 `authentication_unavailable` (retry). Git and LFS transports: 401, as for an invalid token |
 | valid token, insufficient scope or ref policy denies | 403 |
 | `repo` claim mismatch with target | 403 (do not leak existence: 404 acceptable per vendor error-string instability) |
-| a `refs` claim that does not parse | 403 on the endpoints that check ref policies, and the push hook refuses a push. The text is `malformed refs claim` |
-
-The Git and LFS transports show the text of the verifier's error in the `401` body. A token whose header or claims are not JSON of the expected shape answers `malformed jwt` or `malformed jwt claims`. Neither holds the text of Go's decoders, which names Go types.
+| a `refs` claim that does not parse | 403 on the endpoints that check ref policies, and the push hook refuses a push |
 
 Error body: `{"error": "<message>"}` plus the problem-details fields described under
 [HTTP API conventions](http-api.md#conventions) (`type`, `title`, `status`, a generic
