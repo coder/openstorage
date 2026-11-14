@@ -330,7 +330,7 @@ Remove either kind of ref from the ref store with
    temporary directory under `$TMPDIR` and removes the directory as soon as it has read the
    tips, and also after an error, `SIGINT`, `SIGTERM` or `SIGHUP`. A run that `nohup` started
    ignores `SIGHUP`. After `SIGKILL` or `SIGQUIT`, delete the `openstorage-repair-refs-*`
-   directory by hand. Run it where `$TMPDIR` has room for the packs. A ref that git can
+   directory by hand. Run the command where `$TMPDIR` has room for the packs. A ref that git can
    lock is on the list only as a branch whose tip is not a commit, or whose tip object the
    packs do not hold. A branch at a commit and a tag at a blob stay off it.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
