@@ -334,7 +334,12 @@ type tokenSpec struct {
 	expIn  time.Duration  // default 1h; negative mints an expired token
 	key    any            // signing key override (default: env key for alg)
 	claims map[string]any // set last over the claims above; a nil value omits the claim
+	header map[string]any // extra protected header members
 }
+
+// critHeader is a `crit` header that lists an extension no verifier here
+// understands (RFC 7515 §4.1.11).
+var critHeader = map[string]any{"crit": []string{"x-ext"}, "x-ext": true}
 
 // signingKey returns the environment's private key for alg.
 func (e *testEnv) signingKey(alg string) any {
@@ -411,6 +416,11 @@ func (e *testEnv) mint(t *testing.T, spec tokenSpec) string {
 	hdrs := jws.NewHeaders()
 	if err := hdrs.Set("typ", "JWT"); err != nil {
 		t.Fatal(err)
+	}
+	for name, v := range spec.header {
+		if err := hdrs.Set(name, v); err != nil {
+			t.Fatal(err)
+		}
 	}
 	signed, err := jws.Sign(payload, jws.WithKey(alg, spec.key, jws.WithProtectedHeaders(hdrs)))
 	if err != nil {

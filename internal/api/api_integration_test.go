@@ -822,6 +822,12 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 				wantDetail: "Invalid or expired token",
 			},
 			{
+				name:       "crit header",
+				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, header: critHeader}),
+				wantStatus: http.StatusForbidden,
+				wantDetail: "Invalid or expired token",
+			},
+			{
 				name:       "empty sub",
 				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, claims: map[string]any{"sub": ""}}),
 				wantStatus: http.StatusForbidden,

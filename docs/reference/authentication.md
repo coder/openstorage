@@ -161,6 +161,7 @@ commits and signatures that `verify-sig` reads.
 | REST API: no `Authorization` header, or a scheme other than `Bearer` | 401 `unauthorized` (`Authentication required`) |
 | Git transport: no Basic auth with the user `t`. LFS transport: neither that nor an `Authorization: Bearer` token | 401 |
 | the token fails verification (malformed, bad signature, expired, unknown issuer) | REST API: 403 `forbidden` (`Invalid or expired token`), as upstream answers. Git and LFS transports: 401, so that git asks for credentials ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)) |
+| the token's header has a `crit` member of any value, even when the signature is valid (RFC 7515 §4.1.11: a recipient refuses an extension that it does not understand, and the server understands none) | the same as a token that fails verification, in the row above |
 | a verified token issued for another organization | 403 `forbidden`; the REST detail is `Credential is not valid for this tenant` |
 | the key store fails while the server verifies the token | REST API, fork source tokens included: 403 `authentication_unavailable` (retry). Git and LFS transports: 401, as for an invalid token |
 | valid token, insufficient scope or ref policy denies | 403 |

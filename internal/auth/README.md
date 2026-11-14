@@ -27,6 +27,7 @@ JWT auth contract for the HTTP API and the git surface. It defines claim types, 
 - `ParseRefPolicies` returns only a `*MalformedError` as its error [policy.go:ParseRefPolicies]
 - `MatchPolicy` returns no match for an empty ref [policy.go:MatchPolicy]
 - `Verify` rejects tokens without exactly two dots, non-canonical base64url segments, and JSON-serialized JWS with other than one signature [verifier.go:Verify]
+- `Verify` rejects a token whose protected header has a `crit` member of any value, before any key lookup and with the fixed text `jwt crit header is not supported`: no extension is understood (RFC 7515 §4.1.11) [verifier.go:Verify]
 - `Verify` accepts only algs in `signatureAlgorithms` and checks the key family matches the alg [verifier.go:keySupportsAlg]
 - `validateClaims` requires `exp` > now and a non-empty `sub`; `iat` is not checked [verifier.go:validateClaims]
 - `init` panics if `signatureAlgorithms` and `AllowedAlgorithms` disagree [verifier.go:init]
