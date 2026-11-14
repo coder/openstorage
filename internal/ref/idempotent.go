@@ -169,10 +169,11 @@ func ambiguousError(err error) bool {
 
 // notExecutedError marks an error after which the CAS statement provably
 // did not take effect: it was never sent to the backend (pool/connection
-// acquisition), or its transaction rolled back (a pre-COMMIT failure, or a
-// COMMIT that txid_status reports aborted). It satisfies the SafeToRetry
-// contract pgconn uses for never-sent requests, so ambiguousError
-// classifies it as definitive.
+// acquisition), or its transaction rolled back (a pre-COMMIT failure, a
+// COMMIT that txid_status reports aborted, or any SQLite COMMIT error: SQLite
+// runs in this process, so a COMMIT has no reply that can be lost). It
+// satisfies the SafeToRetry contract pgconn uses for never-sent requests, so
+// ambiguousError classifies it as definitive.
 type notExecutedError struct{ err error }
 
 // notExecuted wraps an acquire-stage error with the not-executed marker.
