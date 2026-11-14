@@ -1,6 +1,7 @@
 // Package pgfault relays PostgreSQL connections through a local TCP proxy
-// and injects one fault into the next COMMIT, for tests of a COMMIT whose
-// outcome the client does not learn.
+// and injects one fault into the next COMMIT, or into the reply to one
+// named statement, for tests of a request whose outcome the client does not
+// learn.
 package pgfault
 
 import (
@@ -34,6 +35,10 @@ const (
 	// CommitDelay: the transaction stays in progress for CommitDelay, then
 	// commits, and the client never learns it.
 	DelayCommit
+	// DropStatementReply, armed with ArmStatement, swallows the server's
+	// reply to a statement and closes both sides: the server ran the
+	// statement, and the client never learns it.
+	DropStatementReply
 )
 
 // CommitDelay is how long DelayCommit holds the COMMIT.
@@ -51,6 +56,7 @@ type Proxy struct {
 	mu      sync.Mutex
 	fault   Fault
 	onFault func()
+	marker  []byte // DropStatementReply: the statement text to wait for
 	conns   []net.Conn
 }
 
@@ -97,6 +103,22 @@ func (p *Proxy) Arm(f Fault, onFault func()) {
 	p.fault, p.onFault = f, onFault
 }
 
+// ArmStatement makes the proxy swallow the server's reply to the next
+// statement whose text contains marker (DropStatementReply). pgx sends a
+// statement it has not prepared yet as a Parse chunk that holds the text,
+// then a Bind and Execute chunk: the proxy waits for the first chunk and
+// swallows the reply to the second, so use a connection that has not run
+// the statement before. onFault runs once, after Fired turns true and before
+// the proxy closes any connection.
+func (p *Proxy) ArmStatement(marker string, onFault func()) {
+	if marker == "" {
+		panic("pgfault: empty statement marker")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fault, p.onFault, p.marker = DropStatementReply, onFault, []byte(marker)
+}
+
 // Fired reports whether the armed fault took effect.
 func (p *Proxy) Fired() bool { return p.fired.Load() }
 
@@ -107,6 +129,14 @@ func (p *Proxy) take() (Fault, func()) {
 	f, fn := p.fault, p.onFault
 	p.fault, p.onFault = 0, nil
 	return f, fn
+}
+
+// waitsForStatement reports whether DropStatementReply is armed and chunk
+// holds its statement text.
+func (p *Proxy) waitsForStatement(chunk []byte) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fault == DropStatementReply && bytes.Contains(chunk, p.marker)
 }
 
 func (p *Proxy) track(c ...net.Conn) {
@@ -146,8 +176,19 @@ func (p *Proxy) relay(client net.Conn) {
 	var onReply func()
 	go func() {
 		buf := make([]byte, 64<<10)
+		var stmtSeen bool // the chunk with the armed statement's text went by
 		for {
 			n, err := client.Read(buf)
+			if n > 0 && stmtSeen {
+				// This chunk runs the statement; its reply is the one to lose.
+				stmtSeen = false
+				if f, fn := p.take(); f == DropStatementReply {
+					onReply = fn
+					swallow.Store(true)
+				}
+			} else if n > 0 && p.waitsForStatement(buf[:n]) {
+				stmtSeen = true
+			}
 			if n > 0 && bytes.Equal(buf[:n], commitMsg) {
 				switch f, fn := p.take(); f {
 				case DropReply:

@@ -185,6 +185,9 @@ func TestAmbiguousErrorClassification(t *testing.T) {
 		// backend itself reporting post-commit ambiguity.
 		"pg statement completion unknown":   {fmt.Errorf("cas: %w", &pgconn.PgError{Code: "40003"}), true},
 		"pg transaction resolution unknown": {fmt.Errorf("cas: %w", &pgconn.PgError{Code: "08007"}), true},
+		// notExecuted proves the statement took no effect, so it wins over those SQLSTATEs.
+		"not executed wraps statement completion unknown":   {fmt.Errorf("cas: %w", notExecuted(&pgconn.PgError{Code: "40003"})), false},
+		"not executed wraps transaction resolution unknown": {fmt.Errorf("cas: %w", notExecuted(&pgconn.PgError{Code: "08007"})), false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := ambiguousError(tc.err); got != tc.want {

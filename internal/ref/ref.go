@@ -1042,7 +1042,11 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 		ct, err, tag = c, cerr, "fenced update"
 	}
 	if err != nil {
-		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+		// The statement ran inside the transaction and no COMMIT was sent,
+		// so it cannot have committed, whatever the error says: a reply lost
+		// here closes the connection and PostgreSQL rolls the transaction
+		// back. Marked so that IdempotentCAS never recovers it into a win.
+		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, notExecuted(err))
 	}
 	n := ct.RowsAffected()
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
