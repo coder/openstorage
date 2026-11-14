@@ -136,6 +136,7 @@ jobs:
           }
           trap cleanup EXIT
           mkdir -p "$work/keys" "$work/data" "$work/home"
+          : >"$work/serve.out"
           "$bin" keygen --out "$work/keys/org" >/dev/null
           OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS="$work/keys/org.pub.pem" \
             "$bin" serve --listen 127.0.0.1:0 --data-dir "$work/data" \
@@ -153,10 +154,11 @@ jobs:
           mint() { "$bin" mint --key "$work/keys/org.pem" --iss selfhost --repo demo --scopes "$1"; }
           create="$(mint repo:write)"
           rw="$(mint git:read,git:write)"
-          code="$(curl -sS -o "$work/create.body" -w '%{http_code}' -X POST "http://$addr/api/v1/repos" \
+          code="$(curl -sS --max-time 30 -o "$work/create.body" -w '%{http_code}' -X POST "http://$addr/api/v1/repos" \
             -H "Authorization: Bearer $create" -H 'Content-Type: application/json' \
             --data '{"default_branch":"main"}')"
-          [ "$code" = 201 ] || { echo "create repo: HTTP $code" >&2; cat "$work/create.body" >&2; exit 1; }
+          # v0.15.0 answers 200 where later tags answer 201.
+          [ "$code" = 201 ] || [ "$code" = 200 ] || { echo "create repo: HTTP $code" >&2; cat "$work/create.body" >&2; exit 1; }
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 HOME="$work/home"
           export GIT_AUTHOR_NAME=smoke GIT_AUTHOR_EMAIL=smoke@example.invalid
           export GIT_COMMITTER_NAME=smoke GIT_COMMITTER_EMAIL=smoke@example.invalid
