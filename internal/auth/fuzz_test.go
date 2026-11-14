@@ -249,6 +249,8 @@ func FuzzParseRefPolicies(f *testing.F) {
 			if policies != nil {
 				t.Fatalf("ParseRefPolicies returned policies alongside error %v", err)
 			}
+			// A client reads the error's text: it is fixed (issue #841).
+			requireMalformed(t, err, "malformed refs claim")
 			return
 		}
 		for _, p := range policies {

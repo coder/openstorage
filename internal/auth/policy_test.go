@@ -79,10 +79,15 @@ func TestParseRefPolicies(t *testing.T) {
 		t.Errorf("policies = %+v, want %+v", policies, want)
 	}
 
-	for _, bad := range []string{"", "not json", `{"pattern":"main"}`, `[["main"]]`} {
-		if _, err := ParseRefPolicies(bad); err == nil {
+	// A claim that does not parse answers a fixed text, never the
+	// decoder's: a client reads it (issue #841).
+	for _, bad := range []string{"", "not json", `{"pattern":"main"}`, `[["main"]]`, `[[5,[]]]`, `[["main",[1]]]`, `[["a","b","c"]]`} {
+		_, err := ParseRefPolicies(bad)
+		if err == nil {
 			t.Errorf("ParseRefPolicies(%q) succeeded, want error", bad)
+			continue
 		}
+		requireMalformed(t, err, "malformed refs claim")
 	}
 }
 
