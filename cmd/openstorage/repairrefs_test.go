@@ -70,18 +70,19 @@ func repairGit(t *testing.T, dir, stdin string, args ...string) string {
 // and an annotated tag, their pack in a file blob store, and the refs that a
 // test plants.
 type repairFixture struct {
-	repo    string
-	rs      ref.RefStore
-	blobs   blob.BlobStore
-	blobURL string
-	tips    *packTipKinds
-	scratch string
-	commit  string
-	other   string // another valid SHA to move a ref to
-	late    string // a commit that no registered pack holds until registerLatePack
-	blob    string
-	tree    string
-	tag     string
+	repo     string
+	rs       ref.RefStore
+	blobs    blob.BlobStore
+	blobURL  string
+	tips     *packTipKinds
+	scratch  string
+	commit   string
+	other    string // another valid SHA to move a ref to
+	late     string // a commit that no registered pack holds until registerLatePack
+	lateBlob string // a blob that no registered pack holds until registerLatePack
+	blob     string
+	tree     string
+	tag      string
 }
 
 func newRepairFixture(t *testing.T, rs ref.Store) *repairFixture {
@@ -144,6 +145,7 @@ func newRepairFixtureFor(t *testing.T, rs ref.Store, repo string) *repairFixture
 	repairGit(t, scratch, "", "tag", "-a", "-m", "annotated", "v1", commit)
 	tagSHA := repairGit(t, scratch, "", "rev-parse", "refs/tags/v1")
 	late := repairGit(t, scratch, "", "commit-tree", treeSHA, "-p", other, "-m", "c3")
+	lateBlob := repairGit(t, scratch, "late\n", "hash-object", "-w", "--stdin")
 	packDir := t.TempDir()
 	objs := strings.Join([]string{blobSHA, treeSHA, commit, other, tagSHA}, "\n") + "\n"
 	id := repairGit(t, scratch, objs, "pack-objects", "--threads=1", "-q", filepath.Join(packDir, "p"))
@@ -162,15 +164,16 @@ func newRepairFixtureFor(t *testing.T, rs ref.Store, repo string) *repairFixture
 	tips := &packTipKinds{rs: rs, repoID: repo, blobURL: blobURL}
 	t.Cleanup(tips.close)
 	return &repairFixture{repo: repo, rs: rs, blobs: bl, blobURL: blobURL, tips: tips, scratch: scratch,
-		commit: commit, other: other, late: late, blob: blobSHA, tree: treeSHA, tag: tagSHA}
+		commit: commit, other: other, late: late, lateBlob: lateBlob, blob: blobSHA, tree: treeSHA, tag: tagSHA}
 }
 
-// registerLatePack uploads and registers a pack that holds the late commit,
+// registerLatePack uploads and registers a pack that holds the late commit
+// and the late blob,
 // as a push that lands while the command runs.
 func (f *repairFixture) registerLatePack(t *testing.T) {
 	t.Helper()
 	packDir := t.TempDir()
-	id := repairGit(t, f.scratch, f.late+"\n", "pack-objects", "--threads=1", "-q", filepath.Join(packDir, "p"))
+	id := repairGit(t, f.scratch, f.late+"\n"+f.lateBlob+"\n", "pack-objects", "--threads=1", "-q", filepath.Join(packDir, "p"))
 	packPath := filepath.Join(packDir, "p-"+id+".pack")
 	key := blob.PackKey(f.repo, id)
 	if err := f.blobs.UploadFile(t.Context(), key, packPath); err != nil {

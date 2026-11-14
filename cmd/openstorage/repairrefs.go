@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -104,20 +105,40 @@ func cmdRepairRefs(ctx context.Context, args []string) error {
 	return runRepairRefs(ctx, args, os.Stdout)
 }
 
-// repairGitLocationEnv are the variables that point git at a repository or an
-// object store. An operator's shell can export them, and git then reads that
-// repository instead of the temporary copy of the packs, so every object reads
-// as missing, or git init writes into the repository that the variable names.
-var repairGitLocationEnv = []string{
-	"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
-	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH",
+// scrubGitEnv removes every GIT_ variable from the environment and pins git's
+// own config files to /dev/null, so that every git child of the command works
+// on its temporary repository and nothing else. An operator's shell can export
+// GIT_DIR, GIT_OBJECT_DIRECTORY, GIT_DEFAULT_HASH or GIT_CONFIG_COUNT, and git
+// then reads another repository, or reads the packs in another format, and
+// every tip reads as missing. The returned function puts the variables back,
+// for a caller that lives on after the command.
+func scrubGitEnv() (restore func()) {
+	pinned := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1"}
+	var saved []string
+	for _, kv := range os.Environ() {
+		if name, _, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(name, "GIT_") {
+			saved = append(saved, kv)
+			_ = os.Unsetenv(name)
+		}
+	}
+	for _, kv := range pinned {
+		name, value, _ := strings.Cut(kv, "=")
+		_ = os.Setenv(name, value)
+	}
+	return func() {
+		for _, kv := range pinned {
+			name, _, _ := strings.Cut(kv, "=")
+			_ = os.Unsetenv(name)
+		}
+		for _, kv := range saved {
+			name, value, _ := strings.Cut(kv, "=")
+			_ = os.Setenv(name, value)
+		}
+	}
 }
 
 func runRepairRefs(ctx context.Context, args []string, out io.Writer) error {
-	// Every git child of this command works on its own temporary repository.
-	for _, name := range repairGitLocationEnv {
-		_ = os.Unsetenv(name)
-	}
+	defer scrubGitEnv()()
 	fs := flag.NewFlagSet("repair-refs", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `usage: openstorage repair-refs [flags] <repo-id>
@@ -153,9 +174,10 @@ is listed with the other refs, and with --yes it is deleted too. Check the packs
 first (openstorage list-packs), and keep the list: it shows the SHA of each ref,
 and only the ref goes. If it finds such a ref and the registered packs changed
 since it began to read them, it stops with an error and deletes nothing: run it
-again. If a pack
-registers while it deletes, it creates again each deleted ref whose object that
-pack holds, and prints restored: <ref>.
+again. If a pack registers while it deletes, it creates again each deleted ref
+whose object a registered pack holds, and prints restored: <ref>. If a signal or
+an error stops it after a delete, it prints each ref that it deleted as missing,
+with its SHA.
 
 Flags:
 `)
@@ -275,6 +297,16 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 		printRepairRefs(out, target, scan.missing)
 	}
 	if !yes {
+		deletable := 0
+		for _, r := range found {
+			if !target.isDefaultBranch(r.name) {
+				deletable++
+			}
+		}
+		if deletable == 0 {
+			fmt.Fprintln(out, "nothing changed: --yes would delete nothing, because the only listed ref is the default branch: set another default branch (PATCH /repo) first")
+			return nil
+		}
 		fmt.Fprintln(out, "nothing changed: run the command again with --yes to delete these refs")
 		return nil
 	}
@@ -295,9 +327,11 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 				// A signal ended the swap: say that, not the text of the
 				// store's transaction. With PostgreSQL the swap can have
 				// committed, and the next run lists what is left.
+				warnDeletedMissing(out, deletedMissing)
 				return fmt.Errorf("delete %s: %w (%d deleted before the error)", sanitizeTerm(r.name), ctxErr, deleted)
 			}
 			// The store's error text can quote the ref name.
+			warnDeletedMissing(out, deletedMissing)
 			return fmt.Errorf("delete %s: %s (%d deleted before the error)", sanitizeTerm(r.name), sanitizeTerm(err.Error()), deleted)
 		}
 		if !won {
@@ -315,7 +349,8 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 		fmt.Fprintf(out, "deleted %d of %d refs\n", deleted, len(found))
 	}
 	if len(deletedMissing) > 0 && target.packsUnchanged != nil {
-		if err := restoreHealed(ctx, rs, target, deletedMissing, out); err != nil {
+		if pending, err := restoreHealed(ctx, rs, target, deletedMissing, out); err != nil {
+			warnDeletedMissing(out, pending)
 			return err
 		}
 	}
@@ -328,6 +363,19 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 // repairHealRounds bounds how often restoreHealed reads the packs again.
 const repairHealRounds = 3
 
+// warnDeletedMissing tells the operator which refs a run that stopped deleted
+// as missing without a last check of the packs. A pack that registered since
+// can hold the object of one of them.
+func warnDeletedMissing(out io.Writer, refs []repairRef) {
+	if len(refs) == 0 {
+		return
+	}
+	fmt.Fprintf(out, "the run stopped before it checked the packs again: a pack that registered since can hold the object of one of these %d deleted refs. Check them with openstorage list-packs, and create a ref again where a pack holds its object:\n", len(refs))
+	for _, r := range refs {
+		fmt.Fprintf(out, "  %s %s\n", r.sha, sanitizeTerm(r.name))
+	}
+}
+
 // restoreHealed undoes the deletes that a pack made wrong. A pack that
 // registered after the scan began can hold the object of a ref that the scan
 // read as missing, and the ref is healthy from then on. A ref that this run
@@ -335,17 +383,19 @@ const repairHealRounds = 3
 // read of the packs and the end of the deletes, so the command checks that
 // last. When the packs changed, it reads the types of the deleted tips again
 // and creates each ref whose object a pack holds now, and it checks again.
-func restoreHealed(ctx context.Context, rs ref.RefStore, target repairTarget, deleted []repairRef, out io.Writer) error {
+//
+// It returns the deleted refs that it has not settled when it returns an error.
+func restoreHealed(ctx context.Context, rs ref.RefStore, target repairTarget, deleted []repairRef, out io.Writer) (pending []repairRef, err error) {
 	for round := 0; ; round++ {
 		unchanged, err := target.packsUnchanged(ctx)
 		if err != nil {
-			return fmt.Errorf("list the packs of %s again: %w", sanitizeTerm(target.repoID), err)
+			return deleted, fmt.Errorf("list the packs of %s again: %w", sanitizeTerm(target.repoID), err)
 		}
 		if unchanged || len(deleted) == 0 {
-			return nil
+			return nil, nil
 		}
 		if round == repairHealRounds {
-			return fmt.Errorf("the registered packs of %s kept changing while the command deleted refs: a deleted ref can be healthy now, run the command without --yes to see which refs are missing", sanitizeTerm(target.repoID))
+			return deleted, fmt.Errorf("the registered packs of %s kept changing while the command deleted refs: a deleted ref can be healthy now", sanitizeTerm(target.repoID))
 		}
 		ids := make([]string, 0, len(deleted))
 		seen := map[string]bool{}
@@ -360,21 +410,26 @@ func restoreHealed(ctx context.Context, rs ref.RefStore, target repairTarget, de
 			target.release()
 		}
 		if err != nil {
-			return fmt.Errorf("read the object types of the deleted tips of %s again: %w", sanitizeTerm(target.repoID), err)
+			return deleted, fmt.Errorf("read the object types of the deleted tips of %s again: %w", sanitizeTerm(target.repoID), err)
 		}
 		var stillMissing []repairRef
-		for _, r := range deleted {
+		for i, r := range deleted {
 			kind, ok := kinds[r.sha]
 			if !ok {
-				return fmt.Errorf("no object type for the tip %s of %s", sanitizeTerm(r.sha), sanitizeTerm(r.name))
+				return deleted[i:], fmt.Errorf("no object type for the tip %s of %s", sanitizeTerm(r.sha), sanitizeTerm(r.name))
 			}
 			if kind == "missing" {
 				stillMissing = append(stillMissing, r)
 				continue
 			}
+			if branchAtNonCommit(r.name, kind) {
+				// The pack holds an object that git still refuses here.
+				fmt.Fprintf(out, "not restored: %s would be a branch at %s\n", sanitizeTerm(r.name), repairKindNames[kind])
+				continue
+			}
 			won, err := rs.CASRef(ctx, target.repoID, r.name, ref.ZeroSHA, r.sha)
 			if err != nil {
-				return fmt.Errorf("restore %s: %s", sanitizeTerm(r.name), sanitizeTerm(err.Error()))
+				return deleted[i:], fmt.Errorf("restore %s: %s", sanitizeTerm(r.name), sanitizeTerm(err.Error()))
 			}
 			if !won {
 				fmt.Fprintf(out, "not restored: %s exists again\n", sanitizeTerm(r.name))
@@ -447,6 +502,12 @@ func scanRepairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, p
 	}
 }
 
+// branchAtNonCommit reports whether git refuses a ref of this name at an
+// object of this type: a branch (a ref under refs/heads/) needs a commit.
+func branchAtNonCommit(name, kind string) bool {
+	return strings.HasPrefix(name, repairBranchPrefix) && kind != "commit"
+}
+
 // classify reads the object type of each ref tip, lists a ref whose tip no
 // pack holds, whatever its namespace, and lists a branch whose tip is not a
 // commit. git accepts a blob, a tree or an annotated tag under any other
@@ -478,7 +539,7 @@ func (s *repairScan) classify(ctx context.Context, target repairTarget, refs []r
 		switch kind {
 		case "commit":
 		case "blob", "tree", "tag":
-			if strings.HasPrefix(r.name, repairBranchPrefix) {
+			if branchAtNonCommit(r.name, kind) {
 				s.nonCommit = append(s.nonCommit, r)
 			}
 		case "missing":
@@ -565,7 +626,36 @@ func (p *packTipKinds) stage(ctx context.Context) (err error) {
 	if err := githttp.HydratePacks(ctx, p.rs, p.blobs, repoPath, p.repoID); err != nil {
 		return fmt.Errorf("download the packs of %s: %w", sanitizeTerm(p.repoID), err)
 	}
+	if err := requireObjects(ctx, repoPath, len(p.packIDs)); err != nil {
+		return err
+	}
 	p.repoPath = repoPath
+	return nil
+}
+
+// requireObjects checks by object state that git reads the downloaded packs.
+// A git that reads none of the objects of a repository with packs (another
+// hash format, a setting that this command did not foresee) would make every
+// tip read as missing, and --yes would delete healthy refs.
+func requireObjects(ctx context.Context, repoPath string, packs int) error {
+	out, err := gitread.Run(ctx, gitread.Cmd{Class: gitread.Light, Dir: repoPath, Args: []string{"count-objects", "-v"}})
+	if err != nil {
+		return fmt.Errorf("count the objects of the downloaded packs: %w", err)
+	}
+	inPack := -1
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "in-pack: "); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				inPack = n
+			}
+		}
+	}
+	if inPack < 0 {
+		return errors.New("count the objects of the downloaded packs: git printed no in-pack count")
+	}
+	if packs > 0 && inPack == 0 {
+		return fmt.Errorf("git reads no object from the %d registered packs that the command downloaded: refusing to read any tip as missing", packs)
+	}
 	return nil
 }
 

@@ -16,7 +16,7 @@ missing slots. Every backend scheme works, including the experimental
 [`s3wal://`](configuration.md#openstorage_pg_url) zero-infra pair. `signing-key` and
 `purge-repo` open its metadata/ref stores from the database URL, and `repair-refs` opens
 both stores from it, the metadata store only to read the repository row, and the blob
-store from the `s3://` URL (or `--data-dir`) when the repository has a branch; `list-packs`
+store from the `s3://` URL (or `--data-dir`) when the repository has a ref that git can lock; `list-packs`
 reads blobs through the `s3://` URL and never opens the database URL.
 
 ## `openstorage serve`
@@ -297,13 +297,19 @@ A run that `nohup` started ignores SIGHUP. After SIGKILL or SIGQUIT, delete the
 that git can lock needs no blob store. A branch is on the list when its tip is a blob, a
 tree or an annotated tag, even a tag of a commit: git refuses all three. A ref of any
 namespace is on the list when no registered pack holds its tip object. The objects and
-packs stay, and a later push can use them. The command reads the packs once, as of the
+packs stay, and a later push can use them. The command downloads the packs once, as of the
 start of the run. When the scan found a ref at a missing object and the set of registered
 packs has changed since the run began, the command prints an error and lists and deletes
 nothing, because a new pack can hold an object that the run read as missing: run it
-again. A pack can also register while `--yes` deletes. After the deletes, the command checks the registered packs once more. When they
-changed, it reads the deleted tips again, creates each deleted ref whose object a pack
-holds now, and prints `restored: <ref>`.
+again.
+
+A pack can also register while `--yes` deletes. After the deletes, the command checks the
+registered packs once more. When they changed, it downloads the packs again, reads the
+deleted tips again, and creates each deleted ref whose object a pack holds now, except a
+branch at a blob, a tree or an annotated tag, which git still refuses. It prints
+`restored: <ref>` for each. When a signal or an error stops the run after it deleted a ref
+at a missing object, the command prints each such ref with its SHA: check the packs with
+`openstorage list-packs`, and create a ref again where a pack holds its object.
 
 ```sh
 openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
@@ -348,7 +354,7 @@ the list shows its SHA. Only the ref goes. Check the packs with
 object can be in a pack that the registry lost, and keep the list. The command downloads
 every registered pack, so a pack that the blob store lost stops the run before it lists
 anything. A blob URL that the command cannot open, a type that it does not know, and a
-read that fails are errors, and the command deletes nothing on any of them.
+read that fails before the deletes are errors, and the command deletes nothing on any of them.
 
 The command keeps a ref that is the repository's default branch, as
 `DELETE /repos/branches` does, and the list marks it. `--yes` deletes the other refs,

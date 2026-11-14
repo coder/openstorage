@@ -604,6 +604,10 @@ func TestRepairRefsMissingTipsInEveryNamespace(t *testing.T) {
 		t.Fatalf("move the default branch: won=%v err=%v", won, err)
 	}
 	out.Reset()
+	if err := repairRefs(t.Context(), f.rs, f.target(), false, &out); err != nil || !strings.Contains(out.String(), "--yes would delete nothing") {
+		t.Fatalf("dry run with only the default branch = %v\n%s", err, out.String())
+	}
+	out.Reset()
 	err = repairRefs(t.Context(), f.rs, f.target(), true, &out)
 	if err == nil || !strings.Contains(err.Error(), "1 are the default branch") || !strings.Contains(out.String(), "kept: refs/heads/main is the default branch") {
 		t.Fatalf("the default branch at a missing tip = %v\n%s", err, out.String())
@@ -693,17 +697,23 @@ func TestRepairRefsRestoresARefThatAPackHealedDuringTheDeletes(t *testing.T) {
 	}
 	f := newRepairFixture(t, rs)
 	ghost := strings.Repeat("ab", 20)
-	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late, "refs/tags/ghost": ghost})
+	f.plant(t, map[string]string{
+		"refs/heads/main": f.commit, "refs/tags/late": f.late, "refs/tags/ghost": ghost,
+		"refs/tags/lateblob": f.lateBlob, "refs/heads/lateblob": f.lateBlob,
+	})
 	store := &registeringStore{RefStore: f.rs, do: func() { f.registerLatePack(t) }}
 	var out bytes.Buffer
 	if err := repairRefs(t.Context(), store, f.target(), true, &out); err != nil {
 		t.Fatalf("--yes = %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "deleted: refs/tags/late\n") || !strings.Contains(out.String(), "restored: refs/tags/late") ||
-		strings.Contains(out.String(), "restored: refs/tags/ghost") {
+		strings.Contains(out.String(), "restored: refs/tags/ghost") || !strings.Contains(out.String(), "restored: refs/tags/lateblob") ||
+		!strings.Contains(out.String(), "not restored: refs/heads/lateblob would be a branch at a blob") {
 		t.Fatalf("--yes output:\n%s", out.String())
 	}
-	want := map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late}
+	// A tag at a blob is healthy, and a branch at a blob is a ref that git
+	// still refuses, so the command keeps it deleted.
+	want := map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late, "refs/tags/lateblob": f.lateBlob}
 	if got := f.refs(t); !mapsEqual(got, want) {
 		t.Fatalf("refs after --yes = %v, want %v", got, want)
 	}
@@ -712,9 +722,11 @@ func TestRepairRefsRestoresARefThatAPackHealedDuringTheDeletes(t *testing.T) {
 	}
 }
 
-// An operator's shell can export GIT_DIR or GIT_OBJECT_DIRECTORY. git would
-// then read that repository and not the temporary copy of the packs, every
-// tip would read as missing, and --yes would delete healthy refs.
+// An operator's shell can export GIT_DIR, GIT_OBJECT_DIRECTORY or
+// GIT_DEFAULT_HASH. git would then read another repository, or read the packs
+// in another hash format, every tip would read as missing, and --yes would
+// delete healthy refs. The command works on its own repository whatever the
+// shell exports, and the variables are back when it returns.
 func TestRepairRefsIgnoresTheGitLocationOfTheOperator(t *testing.T) {
 	isolateStorageEnv(t)
 	dir := t.TempDir()
@@ -730,6 +742,23 @@ func TestRepairRefsIgnoresTheGitLocationOfTheOperator(t *testing.T) {
 	elsewhere := t.TempDir()
 	t.Setenv("GIT_DIR", elsewhere)
 	t.Setenv("GIT_OBJECT_DIRECTORY", t.TempDir())
+	t.Setenv("GIT_DEFAULT_HASH", "sha256")
+	// A template that already holds the index of each registered pack: git
+	// init copies it, and the download skips a pack that has an index.
+	template := t.TempDir()
+	packs, err := rs.ListPacks(t.Context(), repo)
+	if err != nil || len(packs) == 0 {
+		t.Fatalf("ListPacks = %v, %v", packs, err)
+	}
+	if err := os.MkdirAll(filepath.Join(template, "objects", "pack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range packs {
+		if err := os.WriteFile(filepath.Join(template, "objects", "pack", "pack-"+p.ID+".idx"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GIT_TEMPLATE_DIR", template)
 	var out bytes.Buffer
 	if err := runRepairRefs(t.Context(), []string{"--yes", "--data-dir", dir, repo}, &out); err != nil || !strings.Contains(out.String(), "no ref whose tip object is missing") {
 		t.Fatalf("--yes = %v\n%s", err, out.String())
@@ -739,5 +768,62 @@ func TestRepairRefsIgnoresTheGitLocationOfTheOperator(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(elsewhere); err != nil || len(entries) != 0 {
 		t.Fatalf("git wrote into GIT_DIR: %v, %v", entries, err)
+	}
+	if got := os.Getenv("GIT_DIR"); got != elsewhere || os.Getenv("GIT_DEFAULT_HASH") != "sha256" {
+		t.Fatalf("the command did not put the git variables back: GIT_DIR=%q", got)
+	}
+}
+
+// git that reads none of the objects of the downloaded packs, for a reason
+// that the command did not foresee, would make every tip read as missing. The
+// command checks that git reads objects from the packs before it trusts a
+// "missing", so that it deletes nothing then.
+func TestPackTipKindsRefusesWhenGitReadsNoObject(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = count-objects ]; then echo 'in-pack: 0'; exit 0; fi\nexec '" + realGit + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	tips := &packTipKinds{rs: rs, repoID: f.repo, blobURL: f.blobURL}
+	t.Cleanup(tips.close)
+	if _, err := tips.kinds(t.Context(), []string{f.commit}); err == nil || !strings.Contains(err.Error(), "reads no object") {
+		t.Fatalf("kinds with a git that reads no object = %v, want a refusal", err)
+	}
+}
+
+// A run that stops after it deleted a ref at a missing object, and before it
+// checked the packs again, prints each such ref with its SHA, because a pack
+// that registered since can hold its object.
+func TestRepairRefsListsTheDeletedMissingRefsWhenTheRestoreFails(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late})
+	store := &registeringStore{RefStore: f.rs, do: func() { f.registerLatePack(t) }}
+	target := f.target()
+	reads := 0
+	target.kinds = func(ctx context.Context, ids []string) (map[string]string, error) {
+		if reads++; reads > 1 {
+			return nil, errors.New("the blob store is down")
+		}
+		return f.tips.kinds(ctx, ids)
+	}
+	var out bytes.Buffer
+	err = repairRefs(t.Context(), store, target, true, &out)
+	if err == nil || !strings.Contains(err.Error(), "the blob store is down") ||
+		!strings.Contains(out.String(), "the run stopped before it checked the packs again") || !strings.Contains(out.String(), "  "+f.late+" refs/tags/late\n") {
+		t.Fatalf("--yes with a failing restore = %v\n%s", err, out.String())
 	}
 }
