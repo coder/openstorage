@@ -290,23 +290,35 @@ func TestIdempotentCASStatementCancelNeverRecovers(t *testing.T) {
 	}
 }
 
+// medianCallSpan returns twice the median duration of n calls of call: the
+// delay range for timers that cancel a call at a random point inside it. The
+// median keeps one stalled call from stretching the range.
+func medianCallSpan(n int, call func(i int)) time.Duration {
+	took := make([]time.Duration, n)
+	for i := range took {
+		start := time.Now()
+		call(i)
+		took[i] = time.Since(start)
+	}
+	slices.Sort(took)
+	return max(took[n/2]*2, time.Microsecond)
+}
+
 // TestIdempotentCASRandomCancelNeverFabricatesCreateWin: a create of the sha
 // that the ref already holds changes no row, so no cancellation, at any point
 // of the swap (acquire, begin, purge fence, statement or commit), may turn it
-// into a win. The cancellations come from timers at random delays around one
-// call's duration, so the run reaches every stage; the loop is not a
-// flake risk, because a correct store never reports a win here.
+// into a win. The cancellations come from timers at random delays up to
+// twice one call's typical duration, so they land across the stages of the
+// call; the loop is not a flake risk, because a correct store never reports
+// a win here.
 func TestIdempotentCASRandomCancelNeverFabricatesCreateWin(t *testing.T) {
 	raw, _ := openTestSQLite(t)
 	seedRef(t, raw, "r1", "refs/heads/main", idemSHA2)
-	start := time.Now()
-	const calibration = 100
-	for range calibration {
+	span := medianCallSpan(100, func(int) {
 		if won, err := raw.CASRef(context.Background(), "r1", "refs/heads/main", ZeroSHA, idemSHA2); won || err != nil {
 			t.Fatalf("calibration CASRef = (%v, %v), want (false, nil)", won, err)
 		}
-	}
-	span := max(time.Since(start)/calibration*2, time.Microsecond)
+	})
 	st := IdempotentCAS{RefStore: raw}
 	for i := range 1000 {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -332,17 +344,11 @@ func TestIdempotentCASRandomCancelNeverFabricatesCreateWin(t *testing.T) {
 // committed) instead of racing one.
 func TestSQLiteCASErrorIsDefinitiveAndTrue(t *testing.T) {
 	raw, _ := openTestSQLite(t)
-	const calibration = 100
-	took := make([]time.Duration, calibration)
-	for i := range took {
-		start := time.Now()
+	span := medianCallSpan(100, func(i int) {
 		if won, err := raw.CASRef(context.Background(), "cal", fmt.Sprintf("refs/heads/c%d", i), ZeroSHA, idemSHA1); !won || err != nil {
 			t.Fatalf("calibration CASRef = (%v, %v), want (true, nil)", won, err)
 		}
-		took[i] = time.Since(start)
-	}
-	slices.Sort(took)
-	span := max(took[calibration/2]*2, time.Microsecond)
+	})
 	errs := 0
 	for i := range 1500 {
 		name := fmt.Sprintf("refs/heads/b%d", i)

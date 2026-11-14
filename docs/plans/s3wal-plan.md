@@ -360,7 +360,7 @@ members from each group's object in memory. This reproduces the exact SQL order 
 one lemma: **a base's member keys are contiguous in byte order** — i.e. no *other* base
 ID sorts between `<base>` and its members `<base>+<suffix>`. Proof sketch: member keys
 extend the base ID with `+` (0x2B), which sorts **below** every character in the
-asserted repo-ID alphabet (`[0-9a-z-]`, all ≥ 0x2D); therefore any distinct base ID
+asserted repo-ID alphabet (`repo_<12 hex>`, all ≥ 0x30); therefore any distinct base ID
 sharing the prefix `<base>` continues with a character > `+` and sorts after all
 members, and any not sharing the prefix sorts entirely before/after the whole family.
 The driver *asserts* the alphabet at key-build time (§2.1), making the lemma checked,

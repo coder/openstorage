@@ -434,7 +434,7 @@ func DateOK(localNow, date time.Time, ttl time.Duration) bool {
 // every byte must sort ABOVE '+' (0x2B) so a base's `+`-suffixed member
 // keys stay contiguous in bucket listing order, and no base may itself
 // contain '+' or non-ASCII/control bytes. Production repo IDs are
-// server-generated [0-9a-z-]; the validator deliberately enforces only the
+// server-generated `repo_<12 hex>`; the validator deliberately enforces only the
 // weaker ordering invariant so conformance tests can exercise raw
 // test-derived names (slashes, underscores, uppercase — all > 0x2B).
 func ManifestKey(base string) string {

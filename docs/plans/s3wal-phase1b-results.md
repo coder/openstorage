@@ -87,7 +87,7 @@ header.
 - **Alphabet relaxation.** §2.9's member-contiguity lemma needs every base
   key byte to sort above `'+'` (0x2B) with no `'+'` or non-ASCII bytes.
   `s3wal.ManifestKey`/`ValidBaseRepoKey` enforce exactly that ordering
-  invariant, NOT the production `[0-9a-z-]` server-generated alphabet —
+  invariant, NOT the production `repo_<12 hex>` server-generated shape —
   deliberately, so the conformance corpus can run raw `t.Name()`-derived
   repo IDs (slashes, underscores, uppercase — all > 0x2B). Production IDs
   remain a strict subset; the lemma is checked at key-build time either way.
