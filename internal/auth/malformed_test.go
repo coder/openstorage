@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/lestrrat-go/jwx/v3/jws"
 )
 
 // goDecoderText is what encoding/json and jwx say about input that does not
@@ -75,14 +77,21 @@ func requireMalformed(t *testing.T, err error, want string) {
 
 // TestVerify_MalformedTokenAnswersFixedText: a token or a claim that does not
 // decode gets a fixed text, whatever the decoder said. The git and LFS
-// transports show that text to the client (issue #841). Claims decoded
-// before the signature check are not logged (the client chose them), and
-// claims that a registered key signed are, with the decoder's text.
+// transports show that text to the client (issue #841). Bytes that are read
+// before the signature check are not logged (the client chose them). Claims
+// of a token whose signature verifies are, with the decoder's text.
 func TestVerify_MalformedTokenAnswersFixedText(t *testing.T) {
 	key := mustGenerateKey(t, "ES256")
 	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
 	exp := time.Now().Add(time.Hour).Unix()
 	signed := func(payload map[string]any) string { return mustMintPayload(t, key, "ES256", payload) }
+	signedRaw := func(payload string) string {
+		tok, err := jws.Sign([]byte(payload), jws.WithKey(signatureAlgorithms["ES256"], key))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(tok)
+	}
 	unsigned := func(header, payload string) string {
 		return b64seg([]byte(header)) + "." + b64seg([]byte(payload)) + "." + b64seg([]byte("sig"))
 	}
@@ -98,6 +107,10 @@ func TestVerify_MalformedTokenAnswersFixedText(t *testing.T) {
 		{"a payload that is not JSON", unsigned(es256, `{`), "malformed jwt claims", false},
 		{"a payload that is not an object", unsigned(es256, `[1]`), "malformed jwt claims", false},
 		{"an iss of the wrong type", unsigned(es256, `{"iss":5}`), "malformed jwt claims", false},
+		// The unverified iss is read first, so a payload that is not a JSON
+		// object fails there, signed or not, and is not logged.
+		{"a signed payload that is not an object", signedRaw(`[1]`), "malformed jwt claims", false},
+		{"a signed payload that is cut short", signedRaw(`{"iss":"acme"`), "malformed jwt claims", false},
 		{"a signed exp of the wrong type", signed(map[string]any{"iss": "acme", "sub": "s", "exp": "x"}), "malformed jwt claims", true},
 		{"a signed sub of the wrong type", signed(map[string]any{"iss": "acme", "sub": 5, "exp": exp}), "malformed jwt claims", true},
 		{"signed scopes of the wrong type", signed(map[string]any{"iss": "acme", "sub": "s", "exp": exp, "scopes": 5}), "malformed jwt claims", true},
