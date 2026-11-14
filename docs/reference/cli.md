@@ -287,7 +287,9 @@ For each branch (a ref under `refs/heads/`), the command also reads the object t
 the tip. It reads the type from the repository's packs in the blob store, and never from
 git's error text. The first read downloads the registered packs into a temporary
 directory under `$TMPDIR`, so `$TMPDIR` needs room for them, and the command removes the
-directory when it ends. A repository with no branch needs no blob store. A branch is on
+directory when it ends, also after SIGINT, SIGTERM or SIGHUP. After SIGKILL or SIGQUIT,
+delete the `openstorage-repair-refs-*` directory under `$TMPDIR` by hand. A repository with
+no branch needs no blob store. A branch is on
 the list when its tip is a blob, a tree or an annotated tag, even a tag of a commit: git
 refuses all three. The objects and packs stay, and a later push can use them. The command
 reads the packs once, as of the start of the run: a push that lands during the run adds
@@ -329,7 +331,8 @@ prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with a
 after the other refs. Run the command again to list what is left. Put the flags before
 `<repo-id>`: a flag after it is an error.
 
-A branch whose tip object the packs do not hold is never deleted. The list shows it under
+A branch whose tip object the packs do not hold is never deleted, unless git can never
+lock its name: the name rule comes first, and it needs no object. The list shows it under
 `branches whose tip object is missing (<n>), never deleted:`, and with `--yes` the command
 deletes the other refs and then exits with an error. Git cannot write that branch either,
 so the repository stays wedged. The object can be in a pack that the registry lost or that

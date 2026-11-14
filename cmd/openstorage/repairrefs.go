@@ -76,9 +76,9 @@ func (t repairTarget) isDefaultBranch(name string) bool {
 }
 
 func cmdRepairRefs(ctx context.Context, args []string) error {
-	// SIGINT and SIGTERM cancel the run, so the temporary directory of packs
-	// goes away on the normal path.
-	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	// SIGINT, SIGTERM and SIGHUP (a closed terminal) cancel the run, so the
+	// temporary directory of packs goes away on the normal path.
+	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stopSignals()
 	return runRepairRefs(ctx, args, os.Stdout)
 }
@@ -97,8 +97,10 @@ it answer 500:
     tree or an annotated tag. git refuses to write such a branch. The command
     reads the object type of each branch tip from the repository's packs in
     the blob store, so it downloads those packs into a temporary directory
-    under $TMPDIR and removes it when it ends. It needs the blob store URL
-    ($OPENSTORAGE_S3_URL, or --data-dir).
+    under $TMPDIR and removes it when it ends, also after SIGINT, SIGTERM or
+    SIGHUP. After SIGKILL or SIGQUIT, delete the openstorage-repair-refs-*
+    directory by hand. It needs the blob store URL ($OPENSTORAGE_S3_URL, or
+    --data-dir).
 
 Without --yes the command changes nothing. With --yes it deletes each listed
 ref from the ref store, but only if the ref still holds the SHA that it
@@ -108,9 +110,9 @@ packs stay.
 The command changes the ref store only. It sends no push webhook and no sync
 poke. With --yes it lists the refs again and deletes what it finds. It keeps a
 ref that is the repository's default branch: set another default branch first
-(PATCH /repo), then run the command again. It never deletes a branch whose tip
-object it cannot find: it lists that branch, and with --yes it exits with an error
-after it has deleted the rest.
+(PATCH /repo), then run the command again. It keeps a branch whose name git can
+lock and whose tip object it cannot find: it lists that branch, and with --yes it
+exits with an error after it has deleted the rest.
 
 Flags:
 `)

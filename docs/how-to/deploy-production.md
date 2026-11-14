@@ -327,9 +327,11 @@ Remove either kind of ref from the ref store with
    is on the list when any part of its name is over 255 bytes, or its last part is over
    250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
    The command reads that type from the repository's packs: it downloads them into a
-   temporary directory under `$TMPDIR` and removes the directory when it ends, so run it
-   where `$TMPDIR` has room for the packs. A ref that git can lock is on the list only as a
-   branch whose tip is not a commit. A branch at a commit and a tag at a blob stay off it.
+   temporary directory under `$TMPDIR` and removes the directory when it ends (also after
+   `SIGINT`, `SIGTERM` or `SIGHUP`: after `SIGKILL`, delete the `openstorage-repair-refs-*`
+   directory by hand), so run it where `$TMPDIR` has room for the packs. A ref that git can
+   lock is on the list only as a branch whose tip is not a commit, or whose tip object the
+   packs do not hold. A branch at a commit and a tag at a blob stay off it.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
@@ -622,7 +624,7 @@ repository. Repair after the roll, not during it: when the last replica runs the
 build, follow [Refs that git can never lock](#refs-that-git-can-never-lock) for each
 repository whose hydration logs `File name too long`.
 
-**A replica on v0.20.0, or on a build of `main` from before the update hook refused a
+**A replica on v0.20.0 or earlier, or on a build of `main` from before the update hook refused a
 branch at a blob, a tree or an annotated tag, still stores the value of such a push.** The
 pusher reads `ng`, but the ref store has taken the value by then. Later builds refuse it
 per ref before the ref store takes it. Until the last replica runs a later build, a token

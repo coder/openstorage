@@ -448,6 +448,7 @@ func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 		"canceled context": {func() error { return runRepairRefs(ctx, args, &bytes.Buffer{}) }, cancel},
 		"SIGINT":           {func() error { return cmdRepairRefs(t.Context(), args) }, func() { _ = syscall.Kill(os.Getpid(), syscall.SIGINT) }},
 		"SIGTERM":          {func() error { return cmdRepairRefs(t.Context(), args) }, func() { _ = syscall.Kill(os.Getpid(), syscall.SIGTERM) }},
+		"SIGHUP":           {func() error { return cmdRepairRefs(t.Context(), args) }, func() { _ = syscall.Kill(os.Getpid(), syscall.SIGHUP) }},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_ = os.Remove(parked)
@@ -469,8 +470,8 @@ func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 			run.end()
 			select {
 			case err := <-done:
-				if !errors.Is(err, context.Canceled) {
-					t.Fatalf("the interrupted command returned %v, want the canceled context", err)
+				if !errors.Is(err, context.Canceled) || !strings.HasSuffix(err.Error(), "context canceled") {
+					t.Fatalf("the interrupted command returned %v, want the canceled context and not the text of a killed git", err)
 				}
 			case <-time.After(10 * time.Second):
 				t.Fatal("the interrupted command did not stop")
