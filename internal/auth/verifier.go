@@ -93,16 +93,36 @@ type KeySource interface {
 
 // KeySourceError is a Verify failure from the KeySource: the org is not
 // registered, or the key store failed. The caller tells them apart with
-// errors.Is on the store's not-found error.
+// errors.Is on the store's not-found error. Error names only the issuer: the
+// store's error can name its database host, user and name or its S3
+// endpoint and bucket, and the git and LFS transports can show Error to a
+// client. The store's error stays behind Unwrap, for a log.
 type KeySourceError struct {
 	Org string
 	Err error
 }
 
-func (e *KeySourceError) Error() string { return fmt.Sprintf("issuer %q: %v", e.Org, e.Err) }
+func (e *KeySourceError) Error() string { return fmt.Sprintf("issuer %q: keys unavailable", e.Org) }
 
 // Unwrap exposes the KeySource error.
 func (e *KeySourceError) Unwrap() error { return e.Err }
+
+// StoredKeyError is a Verify failure because ParsePublicKeysPEM refuses a
+// public key that the org has registered. The token is not at fault. Error
+// names only the issuer, because the parser's text is for a log, and the git
+// and LFS transports can show Error to a client. Unwrap has the parser's
+// error.
+type StoredKeyError struct {
+	Org string
+	Err error
+}
+
+func (e *StoredKeyError) Error() string {
+	return fmt.Sprintf("issuer %q: a registered key cannot be used", e.Org)
+}
+
+// Unwrap exposes the parser's error.
+func (e *StoredKeyError) Unwrap() error { return e.Err }
 
 // OrgKeyVerifier implements Verifier: it resolves the issuing org's public
 // keys through a KeySource and verifies the token signature against them,
@@ -224,7 +244,7 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	for i, p := range pems {
 		keys, err := ParsePublicKeysPEM([]byte(p))
 		if err != nil {
-			return nil, fmt.Errorf("org %q registered key %d: %w", unverified.Iss, i+1, err)
+			return nil, &StoredKeyError{Org: unverified.Iss, Err: fmt.Errorf("registered key %d: %w", i+1, err)}
 		}
 		pubs = append(pubs, keys...)
 	}
