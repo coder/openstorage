@@ -33,6 +33,40 @@ func (k tcdKeys) PublicKeysForOrg(_ context.Context, name string) ([]string, err
 	return pems, nil
 }
 
+const tcdOID = "0000000000000000000000000000000000000000000000000000000000000000"
+
+// tcdRoute is a route that verifies a token, with a request that reaches the
+// verification.
+type tcdRoute struct {
+	name, method, path, body string
+	bearer                   bool
+}
+
+// tcdRoutes lists every git and LFS route that verifies a token.
+var tcdRoutes = []tcdRoute{
+	{"info/refs, fetch", http.MethodGet, "/r.git/info/refs?service=git-upload-pack", "", false},
+	{"info/refs, push", http.MethodGet, "/r.git/info/refs?service=git-receive-pack", "", false},
+	{"upload-pack", http.MethodPost, "/r.git/git-upload-pack", "", false},
+	{"receive-pack", http.MethodPost, "/r.git/git-receive-pack", "", false},
+	{"LFS batch, basic", http.MethodPost, "/r.git/info/lfs/objects/batch", `{"operation":"download"}`, false},
+	{"LFS batch, bearer", http.MethodPost, "/r.git/info/lfs/objects/batch", `{"operation":"upload"}`, true},
+	{"LFS object download", http.MethodGet, "/r.git/info/lfs/objects/" + tcdOID, "", true},
+	{"LFS object upload", http.MethodPut, "/r.git/info/lfs/objects/" + tcdOID, "x", false},
+}
+
+// tcdServe sends rt with token as its credential to srv.
+func tcdServe(srv *Server, rt tcdRoute, token string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
+	if rt.bearer {
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		req.SetBasicAuth("t", token)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
 // TestTokenClaimDecodeAnswersHoldNoGoTypeNames covers issue #841 on the git
 // and LFS transports: they answer 401 with the text of the verifier's error,
 // so a token or a claim that does not decode must answer a fixed text. It
@@ -70,31 +104,10 @@ func TestTokenClaimDecodeAnswersHoldNoGoTypeNames(t *testing.T) {
 		{"signed scopes of the wrong type", signed(`{"iss":"acme","sub":"s","repo":"r","exp":` + strconv.FormatInt(exp, 10) + `,"scopes":5}`), "malformed jwt claims"},
 		{"a signed repo of the wrong type", signed(`{"iss":"acme","sub":"s","repo":5,"exp":` + strconv.FormatInt(exp, 10) + `}`), "malformed jwt claims"},
 	}
-	const oid = "0000000000000000000000000000000000000000000000000000000000000000"
-	routes := []struct {
-		name, method, path, body string
-		bearer                   bool
-	}{
-		{"info/refs, fetch", http.MethodGet, "/r.git/info/refs?service=git-upload-pack", "", false},
-		{"info/refs, push", http.MethodGet, "/r.git/info/refs?service=git-receive-pack", "", false},
-		{"upload-pack", http.MethodPost, "/r.git/git-upload-pack", "", false},
-		{"receive-pack", http.MethodPost, "/r.git/git-receive-pack", "", false},
-		{"LFS batch, basic", http.MethodPost, "/r.git/info/lfs/objects/batch", `{"operation":"download"}`, false},
-		{"LFS batch, bearer", http.MethodPost, "/r.git/info/lfs/objects/batch", `{"operation":"upload"}`, true},
-		{"LFS object download", http.MethodGet, "/r.git/info/lfs/objects/" + oid, "", true},
-		{"LFS object upload", http.MethodPut, "/r.git/info/lfs/objects/" + oid, "x", false},
-	}
 	for _, tok := range tokens {
-		for _, rt := range routes {
+		for _, rt := range tcdRoutes {
 			t.Run(tok.name+", "+rt.name, func(t *testing.T) {
-				req := httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
-				if rt.bearer {
-					req.Header.Set("Authorization", "Bearer "+tok.token)
-				} else {
-					req.SetBasicAuth("t", tok.token)
-				}
-				rec := httptest.NewRecorder()
-				srv.Handler().ServeHTTP(rec, req)
+				rec := tcdServe(srv, rt, tok.token)
 				if rec.Code != http.StatusUnauthorized {
 					t.Fatalf("status %d, want 401 (body %s)", rec.Code, rec.Body)
 				}

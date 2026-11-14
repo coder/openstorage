@@ -236,10 +236,20 @@ func TestUnmatchedAPIRoutes(t *testing.T) {
 type (
 	failingKeys    struct{}
 	unknownOrgKeys struct{}
+	// corruptKeys has a registered key that does not parse.
+	corruptKeys struct{}
 )
 
+// failingKeysText is what the failing store says. It names its host, so no
+// answer may hold it.
+const failingKeysText = "dial tcp canary-db.internal:5432: connection refused"
+
 func (failingKeys) PublicKeysForOrg(context.Context, string) ([]string, error) {
-	return nil, errors.New("connection refused")
+	return nil, errors.New(failingKeysText)
+}
+
+func (corruptKeys) PublicKeysForOrg(context.Context, string) ([]string, error) {
+	return []string{"-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"}, nil
 }
 
 func (unknownOrgKeys) PublicKeysForOrg(_ context.Context, name string) ([]string, error) {
@@ -266,6 +276,7 @@ func TestAuthenticationUnavailable(t *testing.T) {
 	}{
 		{failingKeys{}, http.StatusForbidden, "authentication_unavailable"},
 		{unknownOrgKeys{}, http.StatusForbidden, "forbidden"},
+		{corruptKeys{}, http.StatusForbidden, "forbidden"},
 	} {
 		h := requireAuth(auth.NewVerifier(tc.keys), "", false, auth.ScopeGitRead)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 			t.Error("handler ran")
@@ -283,6 +294,12 @@ func TestAuthenticationUnavailable(t *testing.T) {
 			t.Errorf("%T: body %s, want code %s", tc.keys, rr.Body, tc.code)
 		}
 		assertProblemFields(t, rr.Code, rr.Body.Bytes())
+		// The answer holds no text of the store or of the key parser.
+		for _, leak := range []string{"canary-db", "dial tcp", "asn1", "x509", "PEM", "parse public key"} {
+			if strings.Contains(rr.Body.String(), leak) {
+				t.Errorf("%T: the answer holds %q: %s", tc.keys, leak, rr.Body)
+			}
+		}
 	}
 }
 
