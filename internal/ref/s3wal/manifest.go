@@ -436,7 +436,7 @@ func DateOK(localNow, date time.Time, ttl time.Duration) bool {
 // contain '+' or non-ASCII/control bytes. Production repo IDs are
 // server-generated `repo_<12 hex>`; the validator deliberately enforces only the
 // weaker ordering invariant so conformance tests can exercise raw
-// test-derived names (slashes, underscores, uppercase — all > 0x2B).
+// test-derived names (slashes, uppercase — all > 0x2B).
 func ManifestKey(base string) string {
 	assertf(ValidBaseRepoKey(base), "ManifestKey: base repo %q violates the s3wal key alphabet (empty, '+', or byte <= 0x2B / >= 0x7F)", base)
 	return RepoPrefix + base
