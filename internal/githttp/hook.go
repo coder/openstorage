@@ -2277,6 +2277,12 @@ func loadRefPolicies(policyJSON, opsJSON string) ([]auth.RefPolicy, error) {
 	if policyJSON != "" {
 		m.policies, m.err = auth.ParseRefPolicies(policyJSON)
 		if m.err != nil {
+			// The pusher reads the error's text (a *auth.MalformedError says
+			// only that the claim is malformed). The decoder's text goes to
+			// the operator's hook-errors file.
+			var bad *auth.MalformedError
+			assertf(errors.As(m.err, &bad), "ParseRefPolicies returned %T, not *auth.MalformedError", m.err)
+			hookErrorsLogger().Error("update: refs claim does not parse", "err", bad.Err)
 			m.err = Refuse(fmt.Errorf("update: %w", m.err)) // the pusher's own token
 		}
 	}
