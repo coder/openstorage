@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
 
@@ -322,21 +323,26 @@ func TestIdempotentCASRandomCancelNeverFabricatesCreateWin(t *testing.T) {
 // TestSQLiteCASErrorIsDefinitiveAndTrue: a SQLite CAS that fails, at any
 // stage, committed nothing, and its error is definitive, so IdempotentCAS
 // never recovers it into a win. Creates of new refs are cancelled by timers
-// at random delays around one call's duration, so the run reaches every
-// stage, the COMMIT included (a swap that changed a row). When the store
-// returns an error, the ref must be absent and the error must not be
-// ambiguous. A recovered win would need a second writer of the same sha, so
-// the loop checks the premise (nothing committed) instead of racing one.
+// at random delays up to twice one call's typical duration (the median of a
+// calibration run, so one stall does not stretch it), which lands the
+// cancellations across the stages of the call, the COMMIT of a swap that
+// changed a row among them. When the store returns an error, the ref must be
+// absent and the error must not be ambiguous. A recovered win would need a
+// second writer of the same sha, so the loop checks the premise (nothing
+// committed) instead of racing one.
 func TestSQLiteCASErrorIsDefinitiveAndTrue(t *testing.T) {
 	raw, _ := openTestSQLite(t)
-	start := time.Now()
 	const calibration = 100
-	for i := range calibration {
+	took := make([]time.Duration, calibration)
+	for i := range took {
+		start := time.Now()
 		if won, err := raw.CASRef(context.Background(), "cal", fmt.Sprintf("refs/heads/c%d", i), ZeroSHA, idemSHA1); !won || err != nil {
 			t.Fatalf("calibration CASRef = (%v, %v), want (true, nil)", won, err)
 		}
+		took[i] = time.Since(start)
 	}
-	span := max(time.Since(start)/calibration*2, time.Microsecond)
+	slices.Sort(took)
+	span := max(took[calibration/2]*2, time.Microsecond)
 	errs := 0
 	for i := range 1500 {
 		name := fmt.Sprintf("refs/heads/b%d", i)
