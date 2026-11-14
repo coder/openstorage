@@ -177,3 +177,35 @@ func TestMalformedClaimsAnswerGenericText(t *testing.T) {
 		}
 	})
 }
+
+// TestForkSourceTokenWithCritIsRefused: a source token for a copy goes through
+// the verifier like the caller's token. A token that a registered key signed
+// is refused when its header has `crit` (RFC 7515 §4.1.11), and the same token
+// without `crit` passes, so the copy fails on the missing source instead.
+func TestForkSourceTokenWithCritIsRefused(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		dst := e.mint(t, tokenSpec{iss: org, repo: "crit-dst-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
+		for _, tc := range []struct {
+			name       string
+			header     map[string]any
+			wantStatus int
+			wantError  string
+		}{
+			{"without crit", nil, http.StatusNotFound, "fork source repository not found"},
+			{"with crit", critHeader, http.StatusForbidden, "base_repo.auth.token: invalid token"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				src := e.mint(t, tokenSpec{iss: org, repo: "crit-src", scopes: []string{auth.ScopeGitRead}, header: tc.header})
+				body := `{"base_repo":{"name":"crit-src","auth":{"token":"` + src + `"}}}`
+				resp, raw := e.doReq(t, http.MethodPost, "/api/v1/repos", dst, []byte(body), "")
+				if resp.StatusCode != tc.wantStatus {
+					t.Fatalf("status %d, want %d (body %.300s)", resp.StatusCode, tc.wantStatus, raw)
+				}
+				if msg := requireEnvelope(t, resp, raw); msg != tc.wantError {
+					t.Fatalf("error %q, want %q", msg, tc.wantError)
+				}
+			})
+		}
+	})
+}

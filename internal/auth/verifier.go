@@ -84,6 +84,11 @@ func checkCanonicalSegments(token string) error {
 	return nil
 }
 
+// errCritNotSupported marks a token refused because its protected header has
+// a `crit` member (RFC 7515 §4.1.11). A client reads this text: the git and
+// LFS transports answer with the text of the verifier's error.
+var errCritNotSupported = errors.New("jwt crit header is not supported")
+
 // KeySource resolves an org's registered PEM public key blocks by org name
 // (the JWT `iss` claim). meta.Store satisfies this. Implementations return
 // an error for unknown orgs.
@@ -177,9 +182,10 @@ func (s unionKeySource) PublicKeysForOrg(ctx context.Context, name string) ([]st
 }
 
 // Verify authenticates a compact JWT per the Verifier contract: allowed
-// algorithm, valid signature for one of the issuer's registered keys,
-// `exp` in the future, a non-empty `sub`. Any failure returns an error. A
-// token without a `repo` claim verifies with Repo == RepoClaimOrg.
+// algorithm, no `crit` header, valid signature for one of the issuer's
+// registered keys, `exp` in the future, a non-empty `sub`. Any failure
+// returns an error. A token without a `repo` claim verifies with Repo ==
+// RepoClaimOrg.
 func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, error) {
 	// Bearer tokens are compact JWS only; rejecting other serializations up
 	// front keeps the single-signature/protected-header assumptions below.
@@ -211,6 +217,15 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	algObj, allowed := signatureAlgorithms[alg.String()]
 	if !allowed {
 		return nil, fmt.Errorf("jwt algorithm %q not allowed", alg.String())
+	}
+	// RFC 7515 §4.1.11: refuse a token whose `crit` header names an extension
+	// that this server does not understand. It understands none, so any
+	// `crit` is refused, as jws.WithCritValidation(true) would do. The check
+	// runs here and not in jws.Verify: the key loop below drops that error,
+	// so a token that a registered key signed would read "signature
+	// verification failed".
+	if sigs[0].ProtectedHeaders().Has(jws.CriticalKey) {
+		return nil, errCritNotSupported
 	}
 
 	// Peek at the UNVERIFIED iss claim solely to select the org's keys;
