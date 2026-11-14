@@ -251,6 +251,42 @@ func TestIdempotentCASPostAcquireCancelNeverRecovers(t *testing.T) {
 	}
 }
 
+// cancelAtFence ends its own context when casFence reads the sync-claim
+// fence, which both stores do after the purge-fence read and right before
+// the swap statement: Err() was still nil at the pre-dispatch guard, and the
+// statement sees a done context.
+type cancelAtFence struct {
+	context.Context
+	cancel func()
+}
+
+func (c cancelAtFence) Value(k any) any {
+	if _, ok := k.(syncClaimFenceKey); ok {
+		c.cancel()
+	}
+	return c.Context.Value(k)
+}
+
+// TestIdempotentCASStatementCancelNeverRecovers: a cancellation that lands
+// right before the swap statement ends the statement with a plain context
+// error. No COMMIT was sent, so nothing committed: even with the ref already
+// at the target (someone else's write), the error propagates instead of
+// fabricating a win and a push event.
+func TestIdempotentCASStatementCancelNeverRecovers(t *testing.T) {
+	for name, old := range map[string]string{"duplicate-create": ZeroSHA, "stale-update": idemSHA1} {
+		t.Run(name, func(t *testing.T) {
+			raw, _ := openTestSQLite(t)
+			seedRef(t, raw, "r1", "refs/heads/main", idemSHA2)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			won, err := IdempotentCAS{RefStore: raw}.CASRef(cancelAtFence{ctx, cancel}, "r1", "refs/heads/main", old, idemSHA2)
+			if won || !errors.Is(err, context.Canceled) || ambiguousError(err) {
+				t.Fatalf("CASRef = (%v, %v), want (false, a definitive context.Canceled)", won, err)
+			}
+		})
+	}
+}
+
 // TestIdempotentCASCleanCreateLossIsAuthoritative pins the create decision:
 // a clean create loss (won=false, err=nil) affirmatively wrote nothing, so
 // it stays a conflict even when the existing ref holds the target sha —

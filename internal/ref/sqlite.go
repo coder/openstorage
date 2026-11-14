@@ -371,9 +371,9 @@ func (s *SQLite) casRef(ctx context.Context, repo, name, old, new string, wantGe
 	defer func() { _ = conn.Close() }()
 	// Pre-dispatch guard: a context canceled after acquire but before
 	// ExecContext dispatches the statement is definitive non-execution too.
-	// (The residual race — cancellation landing during driver execution —
-	// surfaces as a *sqlite.Error interrupt, which the ambiguity classifier
-	// already treats as a definitive backend rejection.)
+	// (The residual race — cancellation landing before the statement runs —
+	// ends the statement with a plain context error, which the statement
+	// error below marks notExecuted like every other error of the statement.)
 	if cerr := ctx.Err(); cerr != nil {
 		return false, 0, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
@@ -437,7 +437,12 @@ func (s *SQLite) casRef(ctx context.Context, repo, name, old, new string, wantGe
 		tag = "fenced update"
 	}
 	if err != nil {
-		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+		// The statement ran inside the transaction and no COMMIT was sent,
+		// so it cannot have committed, whatever the error says (the
+		// deferred Rollback ends the transaction). Marked so that
+		// IdempotentCAS never recovers it into a win: a context error is not
+		// a *sqlite.Error, so it would otherwise read as ambiguous.
+		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, notExecuted(err))
 	}
 	n, err := res.RowsAffected()
 	if err != nil {

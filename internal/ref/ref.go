@@ -926,8 +926,8 @@ func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 // explicit transaction whose only other work happens strictly BEFORE it
 // (the base-ledger lock and the purge-fence read below), so the statement
 // remains the single mutation unit and the IdempotentCAS ambiguity
-// classification (idempotent.go) is unchanged: pre-statement failures are
-// tagged notExecuted, and statement failures classify exactly as before. A
+// classification (idempotent.go) is unchanged: pre-statement failures and
+// statement failures are tagged notExecuted (no COMMIT was sent). A
 // COMMIT error of a swap that changed a row is resolved with txid_status
 // (see commitStatus): committed is a win, aborted is definitive, and an
 // outcome PostgreSQL cannot confirm is ambiguous (recovered by the
