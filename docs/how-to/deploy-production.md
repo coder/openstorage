@@ -312,7 +312,12 @@ store holds a value that no cache can take. The git read logs the `hydrate <repo
 update-ref --stdin: exit status 128` line, and the git error in it holds `trying to write
 non-commit object <sha> to branch '<ref>'`. Rebuilding the cache does not help here either.
 
-Remove either kind of ref from the ref store with
+A ref whose tip object no registered pack holds wedges a repository too, whatever its
+namespace (a branch, a tag, a note). git refuses to write a ref at an object that the
+cache lacks. The git error in the `hydrate <repo ID>: update-ref --stdin` line holds
+`trying to write ref '<ref>' with nonexistent object <sha>`.
+
+Remove any of these refs from the ref store with
 [`openstorage repair-refs`](../reference/cli.md#openstorage-repair-refs):
 
 1. Find the repo ID in the log: it is the text after `hydrate`, without the colon that
@@ -322,8 +327,8 @@ Remove either kind of ref from the ref store with
 2. List the refs, with the same database URL and blob store URL (or `--data-dir`) as
    `serve`: `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints the
    repository's URL, the number of refs that it scanned, each ref that git can never
-   lock, each branch whose tip is not a commit, and each lockable branch whose tip object
-   the packs do not hold, with its SHA and, for a branch whose tip is not a commit, the
+   lock, each branch whose tip is not a commit, and each ref whose tip object no
+   registered pack holds, with its SHA and, for a branch whose tip is not a commit, the
    object type. A ref
    is on the list when any part of its name is over 255 bytes, or its last part is over
    250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
@@ -332,25 +337,30 @@ Remove either kind of ref from the ref store with
    tips, and also after an error, `SIGINT`, `SIGTERM` or `SIGHUP`. A run that `nohup` started
    ignores `SIGHUP`. After `SIGKILL` or `SIGQUIT`, delete the `openstorage-repair-refs-*`
    directory by hand. Run the command where `$TMPDIR` has room for the packs. A ref that git can
-   lock is on the list only as a branch whose tip is not a commit, or whose tip object the
-   packs do not hold. A branch at a commit and a tag at a blob stay off it.
+   lock is on the list only as a branch whose tip is not a commit, or as a ref whose tip
+   object no registered pack holds. A branch at a commit and a tag at a blob stay off it.
+   When it finds a ref at a missing object and the registered packs changed since it began
+   to read them, it stops with an error and lists nothing: run it again. When a pack
+   registers while `--yes` deletes, the command creates again each deleted ref whose
+   object a registered pack holds, and prints `restored: <ref>`. When a signal or an
+   error stops it after it deleted a ref at a missing object, it prints that ref with its
+   SHA: check the packs with `openstorage list-packs`, and create a ref again where a
+   pack holds its object.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
    and exits with an error. Run it again to list what is left. The command keeps a ref
    that is the repository's default branch, as `DELETE /repos/branches` does: the list
-   marks it. Set another default branch with `PATCH /repo`, then run the command again. The
-   command never deletes a branch whose tip object the packs do not hold, unless git can
-   never lock its name (the name rule comes first, and it needs no object). The list shows
-   the kept branch as missing, and the command exits with an error after it deleted the rest.
-   That branch still wedges the repository, so find the pack first (`openstorage list-packs --repo <repo ID>`,
-   with the same `--data-dir` or URLs as `serve`).
-4. Run the dry run once more. It must list no ref, apart from a branch that the command
-   keeps because its tip object is missing. An ID with no repository, and a
+   marks it. Set another default branch with `PATCH /repo`, then run the command again.
+   A ref whose tip object no registered pack holds is deleted too, and only the ref goes.
+   Check the packs first (`openstorage list-packs --repo <repo ID>`, with the same
+   `--data-dir` or URLs as `serve`), because the object can be in a pack that the registry
+   lost, and keep the list: it holds the SHA of each ref.
+4. Run the dry run once more. It must list no ref. An ID with no repository, and a
    database URL or `--data-dir` that is not the one `serve` uses, are errors. A scan of
    0 refs means that the repository has no refs. When the list holds no ref, the next
-   clone or fetch hydrates the repository again, on every replica. A kept branch with a
-   missing tip object still wedges it.
+   clone or fetch hydrates the repository again, on every replica. If it still answers
+   `500`, read the log line of step 1 again: the repository can have another cause.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and

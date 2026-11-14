@@ -16,7 +16,7 @@ missing slots. Every backend scheme works, including the experimental
 [`s3wal://`](configuration.md#openstorage_pg_url) zero-infra pair. `signing-key` and
 `purge-repo` open its metadata/ref stores from the database URL, and `repair-refs` opens
 both stores from it, the metadata store only to read the repository row, and the blob
-store from the `s3://` URL (or `--data-dir`) when the repository has a branch; `list-packs`
+store from the `s3://` URL (or `--data-dir`) when the repository has a ref that git can lock; `list-packs`
 reads blobs through the `s3://` URL and never opens the database URL.
 
 ## `openstorage serve`
@@ -252,8 +252,8 @@ same quarantine handshake.
 ## `openstorage repair-refs`
 
 Removes the refs of one repository that stop its hydration. Every hydration of a
-repository that holds such a ref fails, and git reads of it answer `500`. Two kinds of ref
-do that:
+repository that holds such a ref fails, and git reads of it answer `500`. Three kinds of
+ref do that:
 
 - **A ref that git can never lock.** git creates `<ref>.lock` before it writes a ref, so a
   name with a part over 255 bytes, or a last part over 250 bytes, cannot be written into a
@@ -264,6 +264,9 @@ do that:
   annotated tag under `refs/heads/`. Before the update hook refused such a push
   ([git protocol](../explanation/git-protocol-and-namespaces.md)), a token with
   `git:write` could push a branch at one of them, and the ref store took the value.
+- **A ref whose tip object no pack holds.** git refuses to write a ref at an object that the
+  cache repository lacks, and the cache holds only what the registered packs hold. The ref
+  can be a branch, a tag, a note or an ephemeral branch.
 
 The runbook, with the log lines to look for, is
 [Refs that git can never lock](../how-to/deploy-production.md#refs-that-git-can-never-lock).
@@ -280,21 +283,33 @@ openstorage repair-refs [flags] <repo-id>
 
 The command reads every ref of the repository and picks the ones that git can never lock.
 It leaves out the limit on the length of the whole lock path, which depends on where a
-node keeps its cache directory. It never touches a ref that git can lock and that holds
-a commit or lives outside `refs/heads/`: a tag at a blob is healthy.
+node keeps its cache directory. It never touches a ref that git can lock and whose tip
+object a pack holds, unless the ref is a branch at a blob, a tree or an annotated tag:
+a tag at a blob is healthy.
 
-For each branch (a ref under `refs/heads/`), the command also reads the object type of
-the tip. It reads the type from the repository's packs in the blob store, and never from
-git's error text. The first read downloads the registered packs into a temporary
-directory under `$TMPDIR`, so `$TMPDIR` needs room for them. The command removes the
-directory as soon as it has read the tips, before it prints the list, and also after an
-error, SIGINT, SIGTERM or SIGHUP. A run that `nohup` started ignores SIGHUP. After SIGKILL
-or SIGQUIT, delete the `openstorage-repair-refs-*` directory under `$TMPDIR` by hand. A
-repository with no branch needs no blob store. A branch is on the list when its tip is a
-blob, a tree or an annotated tag, even a tag of a commit: git refuses all three. The
-objects and packs stay, and a later push can use them. The command reads the packs once,
-as of the start of the run: a push that lands during the run adds objects that the run does
-not see.
+For each other ref, the command also reads the object type of the tip. It reads the type
+from the repository's packs in the blob store, and never from git's error text. The first
+read downloads the registered packs into a temporary directory under `$TMPDIR`, so
+`$TMPDIR` needs room for them. The command removes the directory as soon as it has read
+the tips, before it prints the list, and also after an error, SIGINT, SIGTERM or SIGHUP.
+A run that `nohup` started ignores SIGHUP. After SIGKILL or SIGQUIT, delete the
+`openstorage-repair-refs-*` directory under `$TMPDIR` by hand. A repository with no ref
+that git can lock needs no blob store. A branch is on the list when its tip is a blob, a
+tree or an annotated tag, even a tag of a commit: git refuses all three. A ref of any
+namespace is on the list when no registered pack holds its tip object. The objects and
+packs stay, and a later push can use them. The command downloads the packs once, as of the
+start of the run. When the scan found a ref at a missing object and the set of registered
+packs has changed since the run began, the command prints an error and lists and deletes
+nothing, because a new pack can hold an object that the run read as missing: run it
+again.
+
+A pack can also register while `--yes` deletes. After the deletes, the command checks the
+registered packs once more. When they changed, it downloads the packs again, reads the
+deleted tips again, and creates each deleted ref whose object a pack holds now, except a
+branch at a blob, a tree or an annotated tag, which git still refuses. It prints
+`restored: <ref>` for each. When a signal or an error stops the run after it deleted a ref
+at a missing object, the command prints each such ref with its SHA: check the packs with
+`openstorage list-packs`, and create a ref again where a pack holds its object.
 
 ```sh
 openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
@@ -317,11 +332,10 @@ The command first reads the repository row. An ID with no repository is an error
 list prints `repo:`, `url:` and `scanned: <n> refs`. Then, when refs match, it prints
 `refs that git can never lock (<n>):` with one `<sha> <ref>` line for each match, and
 `branches whose tip is not a commit (<n>):` with one `<sha> <ref>  (<type>)` line for each
-match, where the type is `a blob`, `a tree` or `an annotated tag`. A lockable branch whose
-tip object the packs do not hold has its own list, described below. The output ends with
-`nothing changed`, and when only such branches are listed, that line says that the command
-deletes no branch whose tip object is missing. When no ref and no branch matches at all, it
-prints `no ref that git can never lock and no branch whose tip is not a commit`.
+match, where the type is `a blob`, `a tree` or `an annotated tag`, and
+`refs whose tip object is missing (<n>):` with one `<sha> <ref>` line for each match. It
+ends with `nothing changed`. When none match, it prints
+`no ref that git can never lock, no branch whose tip is not a commit, and no ref whose tip object is missing`.
 A scan of 0 refs prints `this repository has no refs` instead: it is empty, it was
 purged, or its last refs were just deleted. A database URL or `--data-dir` that is not the
 one `serve` uses is an error (`not found`, or an error that names the missing `repos`
@@ -334,14 +348,13 @@ prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with a
 after the other refs. Run the command again to list what is left. Put the flags before
 `<repo-id>`: a flag after it is an error.
 
-A branch whose tip object the packs do not hold is never deleted, unless git can never
-lock its name: the name rule comes first, and it needs no object. The list shows a kept
-branch under `branches whose tip object is missing (<n>), never deleted:`, and with `--yes`
-the command deletes the other refs and then exits with an error. Git cannot write a kept
-branch either, so the repository stays wedged. The object can be in a pack that the registry lost or that
-a repack replaced: check the packs with [`openstorage list-packs`](#openstorage-list-packs)
-before you do anything else. A blob URL that the command cannot open, a type that it does
-not know, and a read that fails are errors, and the command deletes nothing on any of them.
+A ref whose tip object no pack holds is deleted with `--yes` like the other kinds, and
+the list shows its SHA. Only the ref goes. Check the packs with
+[`openstorage list-packs`](#openstorage-list-packs) before you delete it, because the
+object can be in a pack that the registry lost, and keep the list. The command downloads
+every registered pack, so a pack that the blob store lost stops the run before it lists
+anything. A blob URL that the command cannot open, a type that it does not know, and a
+read that fails before the deletes are errors, and the command deletes nothing on any of them.
 
 The command keeps a ref that is the repository's default branch, as
 `DELETE /repos/branches` does, and the list marks it. `--yes` deletes the other refs,
