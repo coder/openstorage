@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -187,12 +188,26 @@ func TestCritHeaderIsRefusedOnEveryRoute(t *testing.T) {
 // other values, bytes that start no value, and a NUL.
 var tcdHeaderTails = []string{"x", "}", "]", "{}", "\x00", " x", `"`, "0", `{"crit":null}`}
 
-// TestHeaderTailIsRefusedOnEveryRoute: a token that a registered key signed
-// is refused when its header segment holds bytes after the header object,
-// with or without `crit`, on every git and LFS route that verifies a token.
-// The signature still covers the object alone, and jwx verifies it against
-// the object alone. The answer is the fixed `malformed jwt`.
-func TestHeaderTailIsRefusedOnEveryRoute(t *testing.T) {
+// tcdHeaderPads are the bytes that the tests put before and after a header
+// object: every tail, and each JSON whitespace byte before, after and on both
+// sides of it.
+func tcdHeaderPads() [][2]string {
+	var pads [][2]string
+	for _, tail := range tcdHeaderTails {
+		pads = append(pads, [2]string{"", tail})
+	}
+	for _, ws := range []string{" ", "\t", "\r", "\n"} {
+		pads = append(pads, [2]string{ws, ""}, [2]string{"", ws}, [2]string{ws, ws})
+	}
+	return pads
+}
+
+// TestHeaderPadIsRefusedOnEveryRoute: a token that a registered key signed is
+// refused when its header segment holds any byte outside the header object,
+// whitespace included, with or without `crit`, on every git and LFS route that
+// verifies a token. The signature still covers the object alone, and jwx
+// verifies it against the object alone. The answer is the fixed `malformed jwt`.
+func TestHeaderPadIsRefusedOnEveryRoute(t *testing.T) {
 	srv, key := tcdServer(t)
 	for name, header := range map[string]map[string]any{
 		"without crit": nil,
@@ -204,11 +219,11 @@ func TestHeaderTailIsRefusedOnEveryRoute(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, tail := range tcdHeaderTails {
-			withTail := base64.RawURLEncoding.EncodeToString(append(obj, tail...)) + "." + rest
+		for _, pad := range tcdHeaderPads() {
+			padded := base64.RawURLEncoding.EncodeToString([]byte(pad[0]+string(obj)+pad[1])) + "." + rest
 			for _, rt := range tcdRoutes {
-				t.Run(name+" "+tail+", "+rt.name, func(t *testing.T) {
-					rec := tcdServe(srv, rt, withTail)
+				t.Run(fmt.Sprintf("%s %q %q, %s", name, pad[0], pad[1], rt.name), func(t *testing.T) {
+					rec := tcdServe(srv, rt, padded)
 					if rec.Code != http.StatusUnauthorized {
 						t.Fatalf("status %d, want 401 (body %s)", rec.Code, rec.Body)
 					}

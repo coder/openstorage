@@ -94,28 +94,28 @@ var errCritNotSupported = errors.New("jwt crit header is not supported")
 var errHeaderNotOneObject = errors.New("protected header is not one JSON object")
 
 // checkHeader requires the decoded protected header of a compact token to be
-// exactly one JSON object, with at most whitespace around it, and refuses a
-// `crit` member (RFC 7515 §4.1.11). It does so on the text of the whole
-// header. jwx decodes only the first JSON value of the header, ignores any
-// bytes after it, and drops a null `crit` member and all but the last of two
-// members with one name, so a check on its parsed header misses a `crit` that
-// this check sees. A client reads the answer, so both texts are fixed. The
-// check is not jws.WithCritValidation(true): the key loop in Verify drops
-// that error, and a token that a registered key signed would read "signature
-// verification failed". The caller has checked that the segments are
-// canonical base64url.
+// exactly one JSON object, and refuses a `crit` member (RFC 7515 §4.1.11). No
+// byte may stand outside the object, whitespace included. jwx decodes only
+// the first JSON value of the header, ignores any bytes after it, and signs
+// and verifies over the object alone, so the header segment that the client
+// sent must be those bytes. It then has one spelling, and the check and jwx
+// read the same object. `crit` is read from the header text, because jwx
+// drops a null member and keeps only the last of two. The check is not
+// jws.WithCritValidation(true): the key loop in Verify drops that error, and a
+// token that a registered key signed would read "signature verification
+// failed". The caller has checked that the segments are canonical base64url.
 func checkHeader(token string) error {
 	seg, _, _ := strings.Cut(token, ".")
 	raw, err := strictRawURL.DecodeString(seg)
 	if err != nil {
 		return &MalformedError{What: "jwt", Err: err}
 	}
-	if !json.Valid(raw) {
+	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' || !json.Valid(raw) {
 		return &MalformedError{What: "jwt", Err: errHeaderNotOneObject}
 	}
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
-		return &MalformedError{What: "jwt", Err: errHeaderNotOneObject}
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return &MalformedError{What: "jwt", Err: err}
 	}
 	if _, has := members[jws.CriticalKey]; has {
 		return errCritNotSupported

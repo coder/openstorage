@@ -33,22 +33,36 @@ func signRawSegments(t *testing.T, key crypto.Signer, header string, payload []b
 	return input + "." + b64seg(sig)
 }
 
-// withHeaderTail returns token with tail after the object in its header
-// segment. The signature still covers the object alone, and jwx verifies it
-// against the object alone.
-func withHeaderTail(t *testing.T, token, tail string) string {
+// withHeaderPad returns token with the bytes before and after the object in
+// its header segment. The signature still covers the object alone, and jwx
+// verifies it against the object alone.
+func withHeaderPad(t *testing.T, token, before, after string) string {
 	t.Helper()
 	seg, rest, _ := strings.Cut(token, ".")
 	obj, err := base64.RawURLEncoding.DecodeString(seg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b64seg(append(obj, tail...)) + "." + rest
+	return b64seg([]byte(before+string(obj)+after)) + "." + rest
 }
 
 // tailsAfterJSON are bytes that can follow a JSON object: other values, bytes
 // that start no value, and a NUL.
 var tailsAfterJSON = []string{"x", "}", "]", "{}", "\x00", " x", `"`, "0", `{"crit":null}`}
+
+// headerPads are the bytes that the tests put before and after a header
+// object: every tail, and each JSON whitespace byte before, after and on both
+// sides of it.
+func headerPads() [][2]string {
+	var pads [][2]string
+	for _, tail := range tailsAfterJSON {
+		pads = append(pads, [2]string{"", tail})
+	}
+	for _, ws := range []string{" ", "\t", "\r", "\n"} {
+		pads = append(pads, [2]string{ws, ""}, [2]string{"", ws}, [2]string{ws, ws})
+	}
+	return pads
+}
 
 // TestVerify_RefusesCritHeader: RFC 7515 §4.1.11 says a recipient must refuse
 // a token whose `crit` header lists an extension that it does not understand.
@@ -88,13 +102,14 @@ func TestVerify_RefusesCritHeader(t *testing.T) {
 	}
 }
 
-// TestVerify_RefusesBytesAfterTheHeaderObject: jwx decodes only the first JSON
-// value of a protected header and signs and verifies over that object alone.
-// A token whose header segment holds anything else after the object, such as
-// a `crit` that a decode of the whole segment does not see, would verify. The
-// header must be exactly one JSON object, and every other header is refused
-// with the fixed `malformed jwt`, with or without `crit`.
-func TestVerify_RefusesBytesAfterTheHeaderObject(t *testing.T) {
+// TestVerify_RefusesBytesOutsideTheHeaderObject: jwx decodes only the first
+// JSON value of a protected header and signs and verifies over that object
+// alone. A token whose header segment holds any other byte, whitespace
+// included, would verify, so the signed header segment would not be the only
+// accepted spelling, and a `crit` that a decode of the whole segment does not
+// see would pass. The header must be exactly one JSON object, and every other
+// header is refused with the fixed `malformed jwt`, with or without `crit`.
+func TestVerify_RefusesBytesOutsideTheHeaderObject(t *testing.T) {
 	key := mustGenerateKey(t, "EdDSA")
 	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
 	ctx := context.Background()
@@ -107,11 +122,11 @@ func TestVerify_RefusesBytesAfterTheHeaderObject(t *testing.T) {
 			token := signRawHeader(t, key, header, validClaims("acme"))
 			_, err := v.Verify(ctx, token)
 			if (name == "without crit") != (err == nil) {
-				t.Fatalf("a token without a tail: error %v", err)
+				t.Fatalf("a token without a pad: error %v", err)
 			}
-			for _, tail := range tailsAfterJSON {
-				if _, err := v.Verify(ctx, withHeaderTail(t, token, tail)); err == nil || err.Error() != "malformed jwt" {
-					t.Errorf("tail %q: error %v, want malformed jwt", tail, err)
+			for _, pad := range headerPads() {
+				if _, err := v.Verify(ctx, withHeaderPad(t, token, pad[0], pad[1])); err == nil || err.Error() != "malformed jwt" {
+					t.Errorf("pad %q and %q: error %v, want malformed jwt", pad[0], pad[1], err)
 				}
 			}
 		})
