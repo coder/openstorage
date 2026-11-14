@@ -124,6 +124,11 @@ func countKeyFailureLines(out string) int {
 // client that names an unknown issuer, or hangs up while the keys are read,
 // logs nothing.
 func TestKeyFailureLogIsRateLimited(t *testing.T) {
+	// deploy-production.md says one line a minute: pin the number, not the
+	// constant.
+	if keyFailureLogEvery != time.Minute {
+		t.Fatalf("keyFailureLogEvery = %v, the docs say one line a minute", keyFailureLogEvery)
+	}
 	out := captureLog(t)
 	srv, tok := kfServer(t, kfKeys{err: errors.New(kfStoreDown)})
 	clock := time.Unix(1_000_000, 0)
@@ -133,7 +138,8 @@ func TestKeyFailureLogIsRateLimited(t *testing.T) {
 	for range 5 {
 		tcdServe(srv, rt, tok)
 	}
-	if n := countKeyFailureLines(out.String()); n != 1 || !strings.Contains(out.String(), "canary-db.internal") {
+	// The docs name the start of the line: operators alert on it.
+	if n := countKeyFailureLines(out.String()); n != 1 || !strings.Contains(out.String(), "verify token: key store lookup failed") || !strings.Contains(out.String(), "canary-db.internal") {
 		t.Fatalf("5 failures in one second logged %d lines: %q", n, out)
 	}
 	clock = clock.Add(keyFailureLogEvery - time.Second)
@@ -191,7 +197,7 @@ func TestKeyFailureLogIsRateLimited(t *testing.T) {
 		for range 3 {
 			tcdServe(srv, rt, tok)
 		}
-		if n := countKeyFailureLines(out.String()); n != 1 || !strings.Contains(out.String(), "asn1") {
+		if n := countKeyFailureLines(out.String()); n != 1 || !strings.Contains(out.String(), "verify token: a registered key cannot be used") || !strings.Contains(out.String(), "asn1") {
 			t.Fatalf("3 failures logged %d lines, want 1 with the parser's error: %q", n, out)
 		}
 	})
