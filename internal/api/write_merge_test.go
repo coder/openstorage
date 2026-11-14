@@ -825,6 +825,17 @@ func TestMergeRefPolicies(t *testing.T) {
 			}
 		})
 
+		// Issue #841: the answer is the fixed text, never the decoder's.
+		t.Run("malformed refs claim answers fixed text", func(t *testing.T) {
+			tok := mintWith(`[[5,[]]]`)
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", tok,
+				wmMergeBody("feature", "t-pol-nopush", "merge", map[string]any{"author": wmTestAuthor}))
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
+			}
+			tcdRequireFixed(t, "merge", raw, "malformed refs claim")
+		})
+
 		t.Run("no-force-push allows merge commits", func(t *testing.T) {
 			// Merge outcomes are fast-forward by construction: the old tip
 			// is a parent of the new commit.

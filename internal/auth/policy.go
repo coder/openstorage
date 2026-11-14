@@ -93,12 +93,12 @@ func EphemeralRefName(ref string) string {
 // ParseRefPolicies parses the `refs` claim JSON (ordered [pattern, ops]
 // tuples) and normalizes each pattern per the docs/reference/authentication.md shorthand rule:
 // anything not starting with `refs/` (and not exactly `*` or `HEAD`)
-// becomes `refs/heads/<value>`. Returns an error for malformed JSON or
-// tuples.
+// becomes `refs/heads/<value>`. Returns a *MalformedError for malformed JSON
+// or tuples: its text is for a client, and Unwrap has the decoder's text.
 func ParseRefPolicies(raw string) ([]RefPolicy, error) {
 	var policies []RefPolicy
 	if err := json.Unmarshal([]byte(raw), &policies); err != nil {
-		return nil, fmt.Errorf("parse refs policy: %w", err)
+		return nil, &MalformedError{What: "refs claim", Err: err}
 	}
 	for i := range policies {
 		policies[i].Pattern = NormalizeRefName(policies[i].Pattern)

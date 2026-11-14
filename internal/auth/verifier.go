@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -171,7 +172,9 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	}
 	msg, err := jws.Parse([]byte(token))
 	if err != nil {
-		return nil, fmt.Errorf("malformed jwt: %w", err)
+		// The parser's text can hold the text of a JSON decoder (see
+		// MalformedError). It is not logged: the client chose these bytes.
+		return nil, &MalformedError{What: "jwt", Err: err}
 	}
 	// jws.Parse auto-detects JSON serializations, and a JSON-serialized JWS
 	// can contain exactly two '.' characters (e.g. in an unprotected header),
@@ -191,12 +194,16 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	}
 
 	// Peek at the UNVERIFIED iss claim solely to select the org's keys;
-	// nothing else is trusted until the signature verifies.
+	// nothing else is trusted until the signature verifies. The signature
+	// cannot be checked first: no key is known until iss names the org, and
+	// a token that another registered org signed must keep its own answer,
+	// which differs from the answer to a bad signature. The error carries no
+	// log line: the client chose these bytes.
 	var unverified struct {
 		Iss string `json:"iss"`
 	}
 	if err := json.Unmarshal(msg.Payload(), &unverified); err != nil {
-		return nil, fmt.Errorf("jwt claims: %w", err)
+		return nil, &MalformedError{What: "jwt claims", Err: err}
 	}
 	if unverified.Iss == "" {
 		return nil, errors.New("jwt missing iss claim")
@@ -247,7 +254,11 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 
 	var c Claims
 	if err := json.Unmarshal(payload, &c); err != nil {
-		return nil, fmt.Errorf("jwt claims: %w", err)
+		// A registered key signed these claims, so the operator who minted
+		// the token can fix them and needs the decoder's text. The client
+		// does not get it (see MalformedError).
+		slog.Warn("token claims signed by a registered key do not decode", "iss", unverified.Iss, "err", err)
+		return nil, &MalformedError{What: "jwt claims", Err: err}
 	}
 	// A token without a `repo` claim is org-wide ("omit for org-wide
 	// tokens", docs/upstream/getting-started/authentication.md), so it gets
