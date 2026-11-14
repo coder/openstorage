@@ -3,8 +3,10 @@ package auth
 import (
 	"context"
 	"crypto"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -17,6 +19,12 @@ func signRawHeader(t *testing.T, key crypto.Signer, header string, c Claims) str
 	if err != nil {
 		t.Fatal(err)
 	}
+	return signRawSegments(t, key, header, payload)
+}
+
+// signRawSegments signs the exact header and payload bytes.
+func signRawSegments(t *testing.T, key crypto.Signer, header string, payload []byte) string {
+	t.Helper()
 	input := b64seg([]byte(header)) + "." + b64seg(payload)
 	sig, err := key.Sign(nil, []byte(input), crypto.Hash(0))
 	if err != nil {
@@ -24,6 +32,23 @@ func signRawHeader(t *testing.T, key crypto.Signer, header string, c Claims) str
 	}
 	return input + "." + b64seg(sig)
 }
+
+// withHeaderTail returns token with tail after the object in its header
+// segment. The signature still covers the object alone, and jwx verifies it
+// against the object alone.
+func withHeaderTail(t *testing.T, token, tail string) string {
+	t.Helper()
+	seg, rest, _ := strings.Cut(token, ".")
+	obj, err := base64.RawURLEncoding.DecodeString(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b64seg(append(obj, tail...)) + "." + rest
+}
+
+// tailsAfterJSON are bytes that can follow a JSON object: other values, bytes
+// that start no value, and a NUL.
+var tailsAfterJSON = []string{"x", "}", "]", "{}", "\x00", " x", `"`, "0", `{"crit":null}`}
 
 // TestVerify_RefusesCritHeader: RFC 7515 §4.1.11 says a recipient must refuse
 // a token whose `crit` header lists an extension that it does not understand.
@@ -60,5 +85,62 @@ func TestVerify_RefusesCritHeader(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestVerify_RefusesBytesAfterTheHeaderObject: jwx decodes only the first JSON
+// value of a protected header and signs and verifies over that object alone.
+// A token whose header segment holds anything else after the object, such as
+// a `crit` that a decode of the whole segment does not see, would verify. The
+// header must be exactly one JSON object, and every other header is refused
+// with the fixed `malformed jwt`, with or without `crit`.
+func TestVerify_RefusesBytesAfterTheHeaderObject(t *testing.T) {
+	key := mustGenerateKey(t, "EdDSA")
+	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
+	ctx := context.Background()
+
+	for name, header := range map[string]string{
+		"without crit": `{"alg":"EdDSA","typ":"JWT"}`,
+		"with crit":    `{"alg":"EdDSA","typ":"JWT","crit":["x-ext"],"x-ext":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			token := signRawHeader(t, key, header, validClaims("acme"))
+			_, err := v.Verify(ctx, token)
+			if (name == "without crit") != (err == nil) {
+				t.Fatalf("a token without a tail: error %v", err)
+			}
+			for _, tail := range tailsAfterJSON {
+				if _, err := v.Verify(ctx, withHeaderTail(t, token, tail)); err == nil || err.Error() != "malformed jwt" {
+					t.Errorf("tail %q: error %v, want malformed jwt", tail, err)
+				}
+			}
+		})
+	}
+	t.Run("a null header", func(t *testing.T) {
+		if _, err := v.Verify(ctx, signRawHeader(t, key, "null", validClaims("acme"))); err == nil || err.Error() != "malformed jwt" {
+			t.Fatalf("error %v, want malformed jwt", err)
+		}
+	})
+}
+
+// TestVerify_RefusesBytesAfterTheClaims: jwx does not decode the payload, and
+// Verify decodes the whole payload, so bytes after the claims object other
+// than whitespace are refused. This pins that behavior.
+func TestVerify_RefusesBytesAfterTheClaims(t *testing.T) {
+	key := mustGenerateKey(t, "EdDSA")
+	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
+	claims, err := json.Marshal(validClaims("acme"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const header = `{"alg":"EdDSA","typ":"JWT"}`
+	if _, err := v.Verify(context.Background(), signRawSegments(t, key, header, claims)); err != nil {
+		t.Fatalf("claims without a tail: %v", err)
+	}
+	for _, tail := range tailsAfterJSON {
+		token := signRawSegments(t, key, header, append(claims, tail...))
+		if _, err := v.Verify(context.Background(), token); err == nil || err.Error() != "malformed jwt claims" {
+			t.Errorf("tail %q: error %v, want malformed jwt claims", tail, err)
+		}
 	}
 }

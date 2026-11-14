@@ -136,12 +136,10 @@ func TestTokenClaimDecodeAnswersHoldNoGoTypeNames(t *testing.T) {
 	}
 }
 
-// TestCritHeaderIsRefusedOnEveryRoute: a token that a registered key signed
-// is refused when its header has `crit` (RFC 7515 §4.1.11), on every git and
-// LFS route that verifies a token, with the fixed text. The same claims
-// without `crit` verify.
-func TestCritHeaderIsRefusedOnEveryRoute(t *testing.T) {
-	srv, key := tcdServer(t)
+// tcdSign returns a token for tcdOrg that key signed, with extra protected
+// header members.
+func tcdSign(t *testing.T, key crypto.Signer, header map[string]any) string {
+	t.Helper()
 	payload, err := json.Marshal(auth.Claims{
 		Iss: tcdOrg, Sub: auth.SubjectLiteral, Repo: "r", Scopes: []string{auth.ScopeGitRead},
 		Exp: time.Now().Add(time.Hour).Unix(),
@@ -149,23 +147,29 @@ func TestCritHeaderIsRefusedOnEveryRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sign := func(header map[string]any) string {
-		hdrs := jws.NewHeaders()
-		for name, v := range header {
-			if err := hdrs.Set(name, v); err != nil {
-				t.Fatal(err)
-			}
-		}
-		tok, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), key, jws.WithProtectedHeaders(hdrs)))
-		if err != nil {
+	hdrs := jws.NewHeaders()
+	for name, v := range header {
+		if err := hdrs.Set(name, v); err != nil {
 			t.Fatal(err)
 		}
-		return string(tok)
 	}
-	if _, err := srv.Verifier.Verify(context.Background(), sign(nil)); err != nil {
+	tok, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), key, jws.WithProtectedHeaders(hdrs)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(tok)
+}
+
+// TestCritHeaderIsRefusedOnEveryRoute: a token that a registered key signed
+// is refused when its header has `crit` (RFC 7515 §4.1.11), on every git and
+// LFS route that verifies a token, with the fixed text. The same claims
+// without `crit` verify.
+func TestCritHeaderIsRefusedOnEveryRoute(t *testing.T) {
+	srv, key := tcdServer(t)
+	if _, err := srv.Verifier.Verify(context.Background(), tcdSign(t, key, nil)); err != nil {
 		t.Fatalf("a token without crit: %v", err)
 	}
-	withCrit := sign(map[string]any{"crit": []string{"x-ext"}, "x-ext": true})
+	withCrit := tcdSign(t, key, map[string]any{"crit": []string{"x-ext"}, "x-ext": true})
 	for _, rt := range tcdRoutes {
 		t.Run(rt.name, func(t *testing.T) {
 			rec := tcdServe(srv, rt, withCrit)
@@ -176,6 +180,49 @@ func TestCritHeaderIsRefusedOnEveryRoute(t *testing.T) {
 				t.Fatalf("the answer does not hold %q: %s", want, rec.Body)
 			}
 		})
+	}
+}
+
+// tcdHeaderTails are bytes that can follow the object of a protected header:
+// other values, bytes that start no value, and a NUL.
+var tcdHeaderTails = []string{"x", "}", "]", "{}", "\x00", " x", `"`, "0", `{"crit":null}`}
+
+// TestHeaderTailIsRefusedOnEveryRoute: a token that a registered key signed
+// is refused when its header segment holds bytes after the header object,
+// with or without `crit`, on every git and LFS route that verifies a token.
+// The signature still covers the object alone, and jwx verifies it against
+// the object alone. The answer is the fixed `malformed jwt`.
+func TestHeaderTailIsRefusedOnEveryRoute(t *testing.T) {
+	srv, key := tcdServer(t)
+	for name, header := range map[string]map[string]any{
+		"without crit": nil,
+		"with crit":    {"crit": []string{"x-ext"}, "x-ext": true},
+	} {
+		token := tcdSign(t, key, header)
+		seg, rest, _ := strings.Cut(token, ".")
+		obj, err := base64.RawURLEncoding.DecodeString(seg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tail := range tcdHeaderTails {
+			withTail := base64.RawURLEncoding.EncodeToString(append(obj, tail...)) + "." + rest
+			for _, rt := range tcdRoutes {
+				t.Run(name+" "+tail+", "+rt.name, func(t *testing.T) {
+					rec := tcdServe(srv, rt, withTail)
+					if rec.Code != http.StatusUnauthorized {
+						t.Fatalf("status %d, want 401 (body %s)", rec.Code, rec.Body)
+					}
+					if want := "malformed jwt"; !strings.Contains(rec.Body.String(), want) {
+						t.Fatalf("the answer does not hold %q: %s", want, rec.Body)
+					}
+					for _, bad := range tcdDecoderText {
+						if strings.Contains(rec.Body.String(), bad) {
+							t.Fatalf("the answer holds %q: %s", bad, rec.Body)
+						}
+					}
+				})
+			}
+		}
 	}
 }
 

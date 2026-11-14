@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"log"
 	"log/slog"
@@ -206,6 +207,67 @@ func TestForkSourceTokenWithCritIsRefused(t *testing.T) {
 					t.Fatalf("error %q, want %q", msg, tc.wantError)
 				}
 			})
+		}
+	})
+}
+
+// headerTails are bytes that can follow the object of a protected header: other
+// values, bytes that start no value, and a NUL.
+var headerTails = []string{"x", "}", "]", "{}", "\x00", " x", `"`, "0", `{"crit":null}`}
+
+// withHeaderTail returns token with tail after the object in its header
+// segment. The signature still covers the object alone, and jwx verifies it
+// against the object alone.
+func withHeaderTail(t *testing.T, token, tail string) string {
+	t.Helper()
+	seg, rest, _ := strings.Cut(token, ".")
+	obj, err := base64.RawURLEncoding.DecodeString(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(append(obj, tail...)) + "." + rest
+}
+
+// TestHeaderTailIsRefused: a token that a registered key signed is refused when
+// its header segment holds bytes after the header object, with or without
+// `crit`, on a REST route and for the source token of a copy. The same tokens
+// without the tail pass.
+func TestHeaderTailIsRefused(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		dst := e.mint(t, tokenSpec{iss: org, repo: "tail-dst-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
+		for name, header := range map[string]map[string]any{"without crit": nil, "with crit": critHeader} {
+			list := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}, header: header})
+			src := e.mint(t, tokenSpec{iss: org, repo: "tail-src", scopes: []string{auth.ScopeGitRead}, header: header})
+			copyBody := func(src string) []byte {
+				return []byte(`{"base_repo":{"name":"tail-src","auth":{"token":"` + src + `"}}}`)
+			}
+			if header == nil {
+				if resp, raw := e.doReq(t, http.MethodGet, "/api/v1/repos", list, nil, ""); resp.StatusCode != http.StatusOK {
+					t.Fatalf("list without a tail: status %d (body %.300s)", resp.StatusCode, raw)
+				}
+				if resp, raw := e.doReq(t, http.MethodPost, "/api/v1/repos", dst, copyBody(src), ""); resp.StatusCode != http.StatusNotFound {
+					t.Fatalf("copy without a tail: status %d, want 404 for the missing source (body %.300s)", resp.StatusCode, raw)
+				}
+			}
+			for _, tail := range headerTails {
+				t.Run(name+" "+tail, func(t *testing.T) {
+					resp, raw := e.doReq(t, http.MethodGet, "/api/v1/repos", withHeaderTail(t, list, tail), nil, "")
+					if resp.StatusCode != http.StatusForbidden {
+						t.Fatalf("list: status %d, want 403 (body %.300s)", resp.StatusCode, raw)
+					}
+					if msg := requireEnvelope(t, resp, raw); msg != "Invalid or expired token" {
+						t.Fatalf("list: error %q", msg)
+					}
+					resp, raw = e.doReq(t, http.MethodPost, "/api/v1/repos", dst, copyBody(withHeaderTail(t, src, tail)), "")
+					if resp.StatusCode != http.StatusForbidden {
+						t.Fatalf("copy: status %d, want 403 (body %.300s)", resp.StatusCode, raw)
+					}
+					if msg := requireEnvelope(t, resp, raw); msg != "base_repo.auth.token: invalid token" {
+						t.Fatalf("copy: error %q", msg)
+					}
+				})
+			}
 		}
 	})
 }
