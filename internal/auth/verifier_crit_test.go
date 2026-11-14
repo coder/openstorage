@@ -27,11 +27,13 @@ func signRawHeader(t *testing.T, key crypto.Signer, header string, c Claims) str
 
 // TestVerify_RefusesCritHeader: RFC 7515 §4.1.11 says a recipient must refuse
 // a token whose `crit` header lists an extension that it does not understand.
-// Verify understands none, so a signed token with any `crit` is refused, and
-// with the one fixed text that the git and LFS transports show a client.
+// Verify understands none, so a signed token with a `crit` member of any value
+// is refused, with the one fixed text that the git and LFS transports show a
+// client, and before the key store is asked.
 func TestVerify_RefusesCritHeader(t *testing.T) {
 	key := mustGenerateKey(t, "EdDSA")
 	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
+	storeDown := NewVerifier(failingKeySource{err: errors.New("store down")})
 	ctx := context.Background()
 
 	const plain = `{"alg":"EdDSA","typ":"JWT"}`
@@ -44,11 +46,16 @@ func TestVerify_RefusesCritHeader(t *testing.T) {
 		"empty list":                    `{"alg":"EdDSA","typ":"JWT","crit":[]}`,
 		"b64, which is not processed":   `{"alg":"EdDSA","typ":"JWT","crit":["b64"],"b64":true}`,
 		"a standard header name":        `{"alg":"EdDSA","typ":"JWT","crit":["alg"]}`,
+		"null":                          `{"alg":"EdDSA","typ":"JWT","crit":null}`,
+		"a later null hides the list":   `{"alg":"EdDSA","typ":"JWT","crit":["x-ext"],"x-ext":true,"crit":null}`,
+		"an escaped name":               `{"alg":"EdDSA","typ":"JWT","cr\u0069t":["x-ext"],"x-ext":true}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := v.Verify(ctx, signRawHeader(t, key, header, validClaims("acme")))
-			if !errors.Is(err, errCritNotSupported) || err.Error() != "jwt crit header is not supported" {
-				t.Fatalf("error %v, want the fixed crit text", err)
+			token := signRawHeader(t, key, header, validClaims("acme"))
+			for _, vv := range []*OrgKeyVerifier{v, storeDown} {
+				if _, err := vv.Verify(ctx, token); err == nil || err.Error() != "jwt crit header is not supported" {
+					t.Fatalf("error %v, want the fixed crit text", err)
+				}
 			}
 		})
 	}

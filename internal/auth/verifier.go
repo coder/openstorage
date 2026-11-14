@@ -89,6 +89,25 @@ func checkCanonicalSegments(token string) error {
 // LFS transports answer with the text of the verifier's error.
 var errCritNotSupported = errors.New("jwt crit header is not supported")
 
+// hasCritMember reports whether the protected header of a compact token has
+// a `crit` member of any value. It reads the header text, because jwx drops a
+// null member and keeps only the last of two members with one name. A header
+// that does not decode counts as having one: the checks before this call make
+// that case impossible.
+func hasCritMember(token string) bool {
+	seg, _, _ := strings.Cut(token, ".")
+	raw, err := strictRawURL.DecodeString(seg)
+	if err != nil {
+		return true
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return true
+	}
+	_, has := members[jws.CriticalKey]
+	return has
+}
+
 // KeySource resolves an org's registered PEM public key blocks by org name
 // (the JWT `iss` claim). meta.Store satisfies this. Implementations return
 // an error for unknown orgs.
@@ -219,12 +238,11 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 		return nil, fmt.Errorf("jwt algorithm %q not allowed", alg.String())
 	}
 	// RFC 7515 §4.1.11: refuse a token whose `crit` header names an extension
-	// that this server does not understand. It understands none, so any
-	// `crit` is refused, as jws.WithCritValidation(true) would do. The check
-	// runs here and not in jws.Verify: the key loop below drops that error,
-	// so a token that a registered key signed would read "signature
-	// verification failed".
-	if sigs[0].ProtectedHeaders().Has(jws.CriticalKey) {
+	// that this server does not understand. It understands none, so any `crit`
+	// member is refused, whatever its value. jws.WithCritValidation(true) does
+	// not fit: the key loop below drops its error, so a token that a
+	// registered key signed would read "signature verification failed".
+	if hasCritMember(token) {
 		return nil, errCritNotSupported
 	}
 
