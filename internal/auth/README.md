@@ -16,7 +16,7 @@ JWT auth contract for the HTTP API and the git surface. It defines claim types, 
 - `EphemeralNamespacePrefix` (`refs/namespaces/ephemeral/`), `NormalizeRefName`, `EphemeralRefName` [policy.go:EphemeralNamespacePrefix]
 - `ParseRefPolicies`, `MatchPolicy`, `FoldOps` — parse the refs claim, first-match lookup over exact, `*`, or trailing `/*` patterns, fold the deprecated ops claim into refs [policy.go:MatchPolicy]
 - `MalformedError` — a token or claim that does not decode: its text is fixed (`malformed jwt`, `malformed jwt claims`, `malformed refs claim`) so a client can read it, and `Unwrap` has the decoder's error for a log [malformed.go:MalformedError]
-- `KeySourceError`, `StoredKeyError` — a `Verify` failure of the key lookup (the store failed, or the org is unknown), and a registered key that `ParsePublicKeysPEM` refuses: their `Error` text is fixed, and `Unwrap` has the cause for a log [verifier.go:KeySourceError]
+- `KeySourceError`, `StoredKeyError` — a `Verify` failure of the key lookup (the store failed, or the org is unknown), and a registered key that `ParsePublicKeysPEM` refuses: their `Error` text names only the issuer, and `Unwrap` has the cause for a log [verifier.go:KeySourceError]
 - `KeySource`, `OrgKeyVerifier`, `NewVerifier`, `UnionKeySource` — `Verifier` backed by per-org keys, and an overlay of in-memory PEM keys for one org [verifier.go:OrgKeyVerifier]
 
 ## Invariants

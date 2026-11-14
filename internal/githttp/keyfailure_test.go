@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -206,20 +207,69 @@ func TestKeyFailureLogKindsAreIndependent(t *testing.T) {
 	l.report("one", "acme", errors.New("a"))
 	l.report("two", "acme", errors.New("b"))
 	l.report("one", "acme", errors.New("c"))
-	if got := out.String(); strings.Count(got, "verify token: ") != 2 || strings.Contains(got, ": c") {
+	got := out.String()
+	if strings.Count(got, "verify token: ") != 2 || !strings.Contains(got, `"a"`) || !strings.Contains(got, `"b"`) || strings.Contains(got, `"c"`) {
 		t.Fatalf("log: %q", got)
 	}
 }
 
-// TestKeyFailureLogLineIsBounded: a store repeats the issuer in its own
-// error, so a line holds a bounded part of the cause, and one line.
+// kfStore is the key source of a real SQLite store.
+type kfStore struct{ ms meta.Backend }
+
+func (k kfStore) PublicKeysForOrg(ctx context.Context, name string) ([]string, error) {
+	return k.ms.PublicKeysForOrg(ctx, name)
+}
+
+// TestKeyFailureLogHoldsTheCause: a store repeats the issuer, which a client
+// chose, in its own error text, so a long issuer must not push the cause out
+// of the line. A real store that failed names its cause after the issuer.
+func TestKeyFailureLogHoldsTheCause(t *testing.T) {
+	ms, err := meta.Open(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "keys.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.InitSchema(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ms.Close()
+	const cause = "sql: database is closed"
+	for _, tc := range []struct{ name, iss string }{
+		{"a short issuer", "acme"},
+		{"a long issuer", strings.Repeat("a", 400)},
+		{"an issuer that the store escapes", strings.Repeat("\U000e0001", 40)},
+		{"an issuer with a newline and an escape", "ac\nme\x1b[31m" + strings.Repeat("a", 400)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureLog(t)
+			srv := &Server{Verifier: auth.NewVerifier(kfStore{ms}), Org: tc.iss}
+			rec := tcdServe(srv, tcdRoutes[0], kfToken(t, tc.iss))
+			if rec.Code != http.StatusUnauthorized || strings.Contains(rec.Body.String(), cause) {
+				t.Fatalf("status %d, body %.200s", rec.Code, rec.Body)
+			}
+			line := out.String()
+			if strings.Count(line, "\n") != 1 || !strings.Contains(line, cause) || !strings.Contains(line, "key store lookup failed") {
+				t.Fatalf("the log is not one line with the cause: %.600q", line)
+			}
+			if !strings.Contains(line, `lookup org \"<issuer>\": `+cause) {
+				t.Fatalf("the store's own context is not in the line: %q", line)
+			}
+			if strings.ContainsAny(strings.TrimSuffix(line, "\n"), "\n\x1b") {
+				t.Fatalf("a control character reached the log: %q", line)
+			}
+		})
+	}
+}
+
+// TestKeyFailureLogLineIsBounded: whatever the issuer and the store's text,
+// a line is one line and keeps both ends of a long cause.
 func TestKeyFailureLogLineIsBounded(t *testing.T) {
 	out := captureLog(t)
 	var l keyFailureLog
 	huge := strings.Repeat("a", 100_000)
-	l.report("kind", huge, fmt.Errorf("lookup org %q: connection refused\nsecond line", huge))
+	// The store repeats the issuer without quotes: only the clip can bound it.
+	l.report("kind", huge, fmt.Errorf("lookup org %s: head\nsecond line", huge+" tail marker"))
 	line := out.String()
-	if len(line) > 1000 || strings.Count(line, "\n") != 1 {
-		t.Fatalf("the line is %d bytes with %d newlines: %.200q", len(line), strings.Count(line, "\n"), line)
+	if len(line) > 700 || strings.Count(line, "\n") != 1 || !strings.Contains(line, "tail marker") || !strings.Contains(line, "lookup org") {
+		t.Fatalf("the line is %d bytes with %d newlines, want at most 700 bytes, one newline and both ends of the cause: %.300q", len(line), strings.Count(line, "\n"), line)
 	}
 }

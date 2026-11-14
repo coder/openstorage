@@ -93,7 +93,7 @@ type KeySource interface {
 
 // KeySourceError is a Verify failure from the KeySource: the org is not
 // registered, or the key store failed. The caller tells them apart with
-// errors.Is on the store's not-found error. Error is fixed text: the
+// errors.Is on the store's not-found error. Error names only the issuer: the
 // store's error can name its database host, user and name or its S3
 // endpoint and bucket, and the git and LFS transports can show Error to a
 // client. The store's error stays behind Unwrap, for a log.
@@ -109,8 +109,9 @@ func (e *KeySourceError) Unwrap() error { return e.Err }
 
 // StoredKeyError is a Verify failure because ParsePublicKeysPEM refuses a
 // public key that the org has registered. The token is not at fault. Error
-// is fixed text, because the parser's text is for a log, and the git and LFS
-// transports can show Error to a client. Unwrap has the parser's error.
+// names only the issuer, because the parser's text is for a log, and the git
+// and LFS transports can show Error to a client. Unwrap has the parser's
+// error.
 type StoredKeyError struct {
 	Org string
 	Err error

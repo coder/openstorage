@@ -667,7 +667,7 @@ webhook events.
 | `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
 | `commit-graph refresh outcome=…` log lines | A `repo=` that repeats `lock_held`, `timed_out`, or `failed` needs a look ([outcomes and stale-lock runbook](#commit-graph-refresh)) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
-| `verify token: key store lookup failed` / `verify token: a registered key cannot be used` log lines | A git or LFS request reached the key store or a registered key, and it failed. The client reads a fixed text and the line has the cause. One line for each kind and process per minute, with the count of the lines held back |
+| `verify token: key store lookup failed` / `verify token: a registered key cannot be used` log lines | A git or LFS request reached the key store or a registered key, and it failed. The client reads a text that does not hold the cause, and the line holds the cause (a cause of more than 300 runes loses its middle). At most one line for each kind in each `serve` process per minute, with the count of the lines held back |
 | `lane scan: requeued a lane whose work had no job` log line | A sync or push request lost its job and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;

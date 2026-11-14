@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,17 +19,22 @@ import (
 const keyFailureLogEvery = time.Minute
 
 // keyFailureLogCause is the most runes of a failure's text that a log line
-// holds. A store repeats the issuer, which a client chose, in its own error
-// text.
+// holds.
 const keyFailureLogCause = 300
 
-// clipText returns s, or its first n runes and "..." when it has more.
-func clipText(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
+// causeText returns the text of err for a log line. A store repeats the
+// issuer in its own error text, and a client chose the issuer, so a long one
+// would fill the line and push the cause out. The quoted issuer in the text
+// becomes "<issuer>". A text over keyFailureLogCause runes keeps its first
+// third and its last two thirds, so both the context and the root cause stay.
+func causeText(org string, err error) string {
+	text := strings.ReplaceAll(err.Error(), strconv.Quote(org), `"<issuer>"`)
+	r := []rune(text)
+	if len(r) <= keyFailureLogCause {
+		return text
 	}
-	return string(r[:n]) + "..."
+	head := keyFailureLogCause / 3
+	return string(r[:head]) + "..." + string(r[len(r)-(keyFailureLogCause-head):])
 }
 
 // keyFailureLog logs a failure of the key store, or of a key that an org
@@ -62,7 +69,7 @@ func (l *keyFailureLog) report(kind, org string, err error) {
 	held := l.held[kind]
 	l.held[kind] = 0
 	l.mu.Unlock()
-	line := fmt.Sprintf("verify token: %s, issuer %.80q: %q", kind, org, clipText(err.Error(), keyFailureLogCause))
+	line := fmt.Sprintf("verify token: %s, issuer %.80q: %q", kind, org, causeText(org, err))
 	if held > 0 {
 		line += fmt.Sprintf(" (%d earlier failures of this kind not logged)", held)
 	}
@@ -71,10 +78,10 @@ func (l *keyFailureLog) report(kind, org string, err error) {
 
 // verifyFailure returns the error that a client of a git or LFS route reads
 // for a failed Verify, and logs the failures that the server must fix. The
-// text of the two key failures that Verify returns is fixed: a store's error
-// and a key parser's error stay behind Unwrap, and this logs them. An
-// unknown issuer and a request that ended while the keys were read are not
-// logged, because a client causes both.
+// text of the two key failures that Verify returns does not hold the cause: a
+// store's error and a key parser's error stay behind Unwrap, and this logs
+// them. An unknown issuer and a request that ended while the keys were read
+// are not logged, because a client causes both.
 func (s *Server) verifyFailure(ctx context.Context, err error) error {
 	var keys *auth.KeySourceError
 	if errors.As(err, &keys) {
