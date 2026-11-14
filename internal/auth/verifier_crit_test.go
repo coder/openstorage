@@ -106,8 +106,8 @@ func TestVerify_RefusesBytesAfterTheHeaderObject(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			token := signRawHeader(t, key, header, validClaims("acme"))
 			_, err := v.Verify(ctx, token)
-			if name == "without crit" && err != nil {
-				t.Fatalf("a token without a tail: %v", err)
+			if (name == "without crit") != (err == nil) {
+				t.Fatalf("a token without a tail: error %v", err)
 			}
 			for _, tail := range tailsAfterJSON {
 				if _, err := v.Verify(ctx, withHeaderTail(t, token, tail)); err == nil || err.Error() != "malformed jwt" {
@@ -123,9 +123,9 @@ func TestVerify_RefusesBytesAfterTheHeaderObject(t *testing.T) {
 	})
 }
 
-// TestVerify_RefusesBytesAfterTheClaims: the claims of a signed token must be
-// exactly one JSON object too. jwx does not decode the payload, and Verify
-// decodes the whole payload, so no tail passes.
+// TestVerify_RefusesBytesAfterTheClaims: jwx does not decode the payload, and
+// Verify decodes the whole payload, so bytes after the claims object other
+// than whitespace are refused. This pins that behavior.
 func TestVerify_RefusesBytesAfterTheClaims(t *testing.T) {
 	key := mustGenerateKey(t, "EdDSA")
 	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
