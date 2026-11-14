@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -185,6 +187,9 @@ func TestAmbiguousErrorClassification(t *testing.T) {
 		// backend itself reporting post-commit ambiguity.
 		"pg statement completion unknown":   {fmt.Errorf("cas: %w", &pgconn.PgError{Code: "40003"}), true},
 		"pg transaction resolution unknown": {fmt.Errorf("cas: %w", &pgconn.PgError{Code: "08007"}), true},
+		// notExecuted proves the statement took no effect, so it wins over those SQLSTATEs.
+		"not executed wraps statement completion unknown":   {fmt.Errorf("cas: %w", notExecuted(&pgconn.PgError{Code: "40003"})), false},
+		"not executed wraps transaction resolution unknown": {fmt.Errorf("cas: %w", notExecuted(&pgconn.PgError{Code: "08007"})), false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := ambiguousError(tc.err); got != tc.want {
@@ -245,6 +250,72 @@ func TestIdempotentCASPostAcquireCancelNeverRecovers(t *testing.T) {
 	// The guard fired before dispatch: the ref must be untouched.
 	if cur, gerr := raw.GetRef(context.Background(), "r1", "refs/heads/main"); gerr != nil || cur != idemSHA2 {
 		t.Fatalf("ref = (%q, %v), want untouched %q", cur, gerr, idemSHA2)
+	}
+}
+
+// cancelAtFence ends its own context when casFence reads the sync-claim
+// fence, which both stores do after the purge-fence read and right before
+// the swap statement: Err() was still nil at the pre-dispatch guard, and the
+// statement sees a done context.
+type cancelAtFence struct {
+	context.Context
+	cancel func()
+}
+
+func (c cancelAtFence) Value(k any) any {
+	if _, ok := k.(syncClaimFenceKey); ok {
+		c.cancel()
+	}
+	return c.Context.Value(k)
+}
+
+// TestIdempotentCASStatementCancelNeverRecovers: a cancellation that lands
+// right before the swap statement ends the statement with a plain context
+// error. No COMMIT was sent, so nothing committed: even with the ref already
+// at the target (someone else's write), the error propagates instead of
+// fabricating a win and a push event.
+func TestIdempotentCASStatementCancelNeverRecovers(t *testing.T) {
+	for name, old := range map[string]string{"duplicate-create": ZeroSHA, "stale-update": idemSHA1} {
+		t.Run(name, func(t *testing.T) {
+			raw, _ := openTestSQLite(t)
+			seedRef(t, raw, "r1", "refs/heads/main", idemSHA2)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			won, err := IdempotentCAS{RefStore: raw}.CASRef(cancelAtFence{ctx, cancel}, "r1", "refs/heads/main", old, idemSHA2)
+			if won || !errors.Is(err, context.Canceled) || ambiguousError(err) {
+				t.Fatalf("CASRef = (%v, %v), want (false, a definitive context.Canceled)", won, err)
+			}
+		})
+	}
+}
+
+// TestIdempotentCASRandomCancelNeverFabricatesCreateWin: a create of the sha
+// that the ref already holds changes no row, so no cancellation, at any point
+// of the swap (acquire, begin, purge fence, statement or commit), may turn it
+// into a win. The cancellations come from timers at random delays around one
+// call's duration, so the run reaches every stage; the loop is not a
+// flake risk, because a correct store never reports a win here.
+func TestIdempotentCASRandomCancelNeverFabricatesCreateWin(t *testing.T) {
+	raw, _ := openTestSQLite(t)
+	seedRef(t, raw, "r1", "refs/heads/main", idemSHA2)
+	start := time.Now()
+	const calibration = 100
+	for range calibration {
+		if won, err := raw.CASRef(context.Background(), "r1", "refs/heads/main", ZeroSHA, idemSHA2); won || err != nil {
+			t.Fatalf("calibration CASRef = (%v, %v), want (false, nil)", won, err)
+		}
+	}
+	span := max(time.Since(start)/calibration*2, time.Microsecond)
+	st := IdempotentCAS{RefStore: raw}
+	for i := range 1000 {
+		ctx, cancel := context.WithCancel(context.Background())
+		timer := time.AfterFunc(rand.N(span), cancel)
+		won, err := st.CASRef(ctx, "r1", "refs/heads/main", ZeroSHA, idemSHA2)
+		timer.Stop()
+		cancel()
+		if won {
+			t.Fatalf("iteration %d: duplicate create reported a win (err %v)", i, err)
+		}
 	}
 }
 
