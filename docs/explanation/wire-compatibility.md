@@ -124,7 +124,8 @@ Beyond the smart-HTTP wire format, the semantics clients depend on match git:
   policy-denied ref rejects the whole push, as in git. Without the flag, refs succeed and
   fail independently, as in git, unless the server declines the whole push. It does so for
   its own limits, such as the pack quota, and in one case for refused refs. Refused refs
-  are policy-denied refs, refs hidden on this remote, and names that a push cannot create
+  are policy-denied refs, refs hidden on this remote, branches that the push sets to an
+  object that is not a commit, and names that a push cannot create
   or update (for example, a name with only one level under `refs/`, such as `refs/funny`
   or `refs/heads`, another git-invalid name, a name with more than 32 `/`-separated parts,
   a part over 200 bytes, or a name over 900 bytes). When no other ref of the push needs

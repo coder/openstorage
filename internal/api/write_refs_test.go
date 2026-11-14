@@ -184,6 +184,28 @@ func TestWriteRefsBranches(t *testing.T) {
 			}
 		})
 
+		t.Run("create from a base that is no commit stores no branch", func(t *testing.T) {
+			// A branch must point at a commit, as git itself requires:
+			// a blob or a tree never peels to one.
+			repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, base := range map[string]string{
+				"blob": strings.TrimSpace(coreGit(t, repoPath, "rev-parse", fx.c2+":a.txt")),
+				"tree": strings.TrimSpace(coreGit(t, repoPath, "rev-parse", fx.c2+"^{tree}")),
+			} {
+				resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+					map[string]any{"target_branch": "from-" + name, "base_ref": base})
+				if resp.StatusCode != http.StatusNotFound {
+					t.Errorf("%s base: status = %d, want 404", name, resp.StatusCode)
+				}
+				if got, ok := wrefRefs(t, e, fx.repoID)["refs/heads/from-"+name]; ok {
+					t.Errorf("%s base stored refs/heads/from-%s = %s", name, name, got)
+				}
+			}
+		})
+
 		t.Run("create existing branch conflicts", func(t *testing.T) {
 			resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
 				map[string]any{"target_branch": "feature", "base_branch": "main"})
