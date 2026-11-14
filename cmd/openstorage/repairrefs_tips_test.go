@@ -13,7 +13,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -381,7 +383,7 @@ func TestReadObjectKindsFailsClosed(t *testing.T) {
 }
 
 // A run leaves no temporary directory: not when it ends well, not on an
-// error, not when the context ends (SIGINT and SIGTERM end it through
+// error, not when the context ends (SIGINT, SIGTERM and SIGHUP end it through
 // signal.NotifyContext), with the packs half downloaded or not.
 func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 	isolateStorageEnv(t)
@@ -398,9 +400,21 @@ func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp)
 
-	// A run that ends well.
+	// A run that ends well. The packs go before the first line of output: a
+	// closed pipe on stdout (| head) kills the process with SIGPIPE, and
+	// nothing runs after that.
 	var out bytes.Buffer
-	if err := runRepairRefs(t.Context(), []string{"--data-dir", dir, repo}, &out); err != nil || !strings.Contains(out.String(), "no ref that git can never lock") {
+	var firstLine bool
+	stdout := writerFunc(func(p []byte) (int, error) {
+		if !firstLine {
+			firstLine = true
+			if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+				t.Errorf("temporary directory at the first line of output: %v, %v", entries, err)
+			}
+		}
+		return out.Write(p)
+	})
+	if err := runRepairRefs(t.Context(), []string{"--data-dir", dir, repo}, stdout); err != nil || !strings.Contains(out.String(), "no ref that git can never lock") {
 		t.Fatalf("run = %v\n%s", err, out.String())
 	}
 	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
@@ -451,6 +465,9 @@ func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 		"SIGHUP":           {func() error { return cmdRepairRefs(t.Context(), args) }, func() { _ = syscall.Kill(os.Getpid(), syscall.SIGHUP) }},
 	} {
 		t.Run(name, func(t *testing.T) {
+			if name == "SIGHUP" && signal.Ignored(syscall.SIGHUP) {
+				t.Skip("this test process runs with SIGHUP ignored (nohup), and so does the command")
+			}
 			_ = os.Remove(parked)
 			done := make(chan error, 1)
 			go func() { done <- run.start() }()
@@ -481,4 +498,60 @@ func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 			}
 		})
 	}
+}
+
+// writerFunc is an io.Writer.
+type writerFunc func([]byte) (int, error)
+
+func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
+
+// A command that the parent started with SIGHUP ignored, as nohup does,
+// ignores it too: a long run lives on after the operator logs out.
+func TestRepairSignalsLeavesAnIgnoredSIGHUPAlone(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ignored bool
+		want    []os.Signal
+	}{
+		"SIGHUP not ignored": {false, []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}},
+		"SIGHUP ignored":     {true, []os.Signal{os.Interrupt, syscall.SIGTERM}},
+	} {
+		got := repairSignals(func(sig os.Signal) bool { return tc.ignored && sig == syscall.SIGHUP })
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("%s: repairSignals = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// A signal that rolls a delete back is reported as the signal, not as the
+// text of the transaction that the store gives up with.
+func TestRepairRefsNamesTheSignalThatEndsADelete(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/heads/blobby": f.blob})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	store := cancelingCAS{RefStore: rs, cancel: cancel}
+	var out bytes.Buffer
+	err = repairRefs(ctx, store, f.target(), true, &out)
+	if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "transaction") || !strings.Contains(err.Error(), "(0 deleted before the error)") {
+		t.Fatalf("a delete ended by a signal = %v, want the canceled context", err)
+	}
+	if got := f.refs(t); len(got) != 2 {
+		t.Fatalf("refs changed: %v", got)
+	}
+}
+
+// cancelingCAS cancels the run inside the first compare-and-swap and fails it
+// the way a rolled back transaction does.
+type cancelingCAS struct {
+	ref.RefStore
+	cancel func()
+}
+
+func (c cancelingCAS) CASRef(context.Context, string, string, string, string) (bool, error) {
+	c.cancel()
+	return false, errors.New("commit: sql: transaction has already been committed or rolled back")
 }

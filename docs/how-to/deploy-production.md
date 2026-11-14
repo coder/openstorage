@@ -327,8 +327,9 @@ Remove either kind of ref from the ref store with
    is on the list when any part of its name is over 255 bytes, or its last part is over
    250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
    The command reads that type from the repository's packs: it downloads them into a
-   temporary directory under `$TMPDIR` and removes the directory when it ends (also after
-   `SIGINT`, `SIGTERM` or `SIGHUP`: after `SIGKILL`, delete the `openstorage-repair-refs-*`
+   temporary directory under `$TMPDIR` and removes the directory as soon as it has read the
+   tips (also after an error, `SIGINT`, `SIGTERM` or `SIGHUP`, and a run that `nohup` started
+   ignores `SIGHUP`: after `SIGKILL` or `SIGQUIT`, delete the `openstorage-repair-refs-*`
    directory by hand), so run it where `$TMPDIR` has room for the packs. A ref that git can
    lock is on the list only as a branch whose tip is not a commit, or whose tip object the
    packs do not hold. A branch at a commit and a tag at a blob stay off it.
@@ -338,8 +339,9 @@ Remove either kind of ref from the ref store with
    and exits with an error. Run it again to list what is left. The command keeps a ref
    that is the repository's default branch, as `DELETE /repos/branches` does: the list
    marks it. Set another default branch with `PATCH /repo`, then run the command again. The
-   command never deletes a branch whose tip object the packs do not hold: the list shows it
-   as missing, and the command exits with an error after it deleted the rest. That branch
+   command never deletes a branch whose tip object the packs do not hold, unless git can
+   never lock its name (the name rule comes first, and it needs no object): the list shows
+   it as missing, and the command exits with an error after it deleted the rest. That branch
    still wedges the repository, so find the pack first (`openstorage list-packs --repo <repo ID>`,
    with the same `--data-dir` or URLs as `serve`).
 4. Run the dry run once more. It must list no ref. An ID with no repository, and a

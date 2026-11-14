@@ -12,7 +12,8 @@
 // annotated tag. The ref store took the value, and git refuses to write it
 // into the cache repository. The command reads the object type of each branch
 // tip from the repository's packs in the blob store, and it never deletes a
-// branch whose tip object it cannot find.
+// branch whose tip object it cannot find, unless git can never lock the name
+// of that branch.
 package main
 
 import (
@@ -62,10 +63,13 @@ type objectKinds func(ctx context.Context, ids []string) (map[string]string, err
 // repairTarget is the repository that the command works on, as its row in the
 // metadata store describes it. url may be empty, defaultBranch may not. kinds
 // reads the object types of the branch tips, and a repository with a branch
-// needs it.
+// needs it. release, when set, frees what kinds holds: repairRefs calls it
+// once the scan ends, so that nothing outlives the scan, not even a run that
+// a closed pipe on stdout kills.
 type repairTarget struct {
 	repoID, url, defaultBranch string
 	kinds                      objectKinds
+	release                    func()
 }
 
 // isDefaultBranch reports whether the ref is the branch that the repository
@@ -75,10 +79,20 @@ func (t repairTarget) isDefaultBranch(name string) bool {
 	return name == githttp.HeadTarget(t.defaultBranch)
 }
 
+// repairSignals lists the signals that cancel the run, so that the temporary
+// directory of packs goes away on the normal path. SIGHUP (a closed terminal)
+// is left out when the parent started the command with it ignored, as nohup
+// does: Notify would replace that, and a long run would end at the logout.
+func repairSignals(ignored func(os.Signal) bool) []os.Signal {
+	sigs := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if !ignored(syscall.SIGHUP) {
+		sigs = append(sigs, syscall.SIGHUP)
+	}
+	return sigs
+}
+
 func cmdRepairRefs(ctx context.Context, args []string) error {
-	// SIGINT, SIGTERM and SIGHUP (a closed terminal) cancel the run, so the
-	// temporary directory of packs goes away on the normal path.
-	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	ctx, stopSignals := signal.NotifyContext(ctx, repairSignals(signal.Ignored)...)
 	defer stopSignals()
 	return runRepairRefs(ctx, args, os.Stdout)
 }
@@ -97,10 +111,11 @@ it answer 500:
     tree or an annotated tag. git refuses to write such a branch. The command
     reads the object type of each branch tip from the repository's packs in
     the blob store, so it downloads those packs into a temporary directory
-    under $TMPDIR and removes it when it ends, also after SIGINT, SIGTERM or
-    SIGHUP. After SIGKILL or SIGQUIT, delete the openstorage-repair-refs-*
-    directory by hand. It needs the blob store URL ($OPENSTORAGE_S3_URL, or
-    --data-dir).
+    under $TMPDIR and removes it as soon as it has read the tips, and also
+    after an error, SIGINT, SIGTERM or SIGHUP (a run that nohup started
+    ignores SIGHUP). After SIGKILL or SIGQUIT, delete the
+    openstorage-repair-refs-* directory by hand. It needs the blob store URL
+    ($OPENSTORAGE_S3_URL, or --data-dir).
 
 Without --yes the command changes nothing. With --yes it deletes each listed
 ref from the ref store, but only if the ref still holds the SHA that it
@@ -112,7 +127,9 @@ poke. With --yes it lists the refs again and deletes what it finds. It keeps a
 ref that is the repository's default branch: set another default branch first
 (PATCH /repo), then run the command again. It keeps a branch whose name git can
 lock and whose tip object it cannot find: it lists that branch, and with --yes it
-exits with an error after it has deleted the rest.
+exits with an error after it has deleted the rest. A branch whose name git can
+never lock is deleted even when its tip object is missing: the name rule comes
+first.
 
 Flags:
 `)
@@ -170,7 +187,7 @@ Flags:
 	}
 	tips := &packTipKinds{rs: rs, repoID: repoID, blobURL: urls.blobURL}
 	defer tips.close()
-	target := repairTarget{repoID: repoID, url: state.Repo.URL, defaultBranch: state.Repo.DefaultBranch, kinds: tips.kinds}
+	target := repairTarget{repoID: repoID, url: state.Repo.URL, defaultBranch: state.Repo.DefaultBranch, kinds: tips.kinds, release: tips.close}
 	return repairRefs(ctx, rs, target, *yes, out)
 }
 
@@ -182,6 +199,9 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 	repoID := target.repoID
 	assertf(repoID != "", "repairRefs: empty repo ID")
 	scan, err := scanRepairRefs(ctx, rs, target, repairRefsPage)
+	if target.release != nil {
+		target.release()
+	}
 	if err != nil {
 		return err
 	}
@@ -233,6 +253,11 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 		}
 		won, err := deleteRepairRef(ctx, rs, repoID, r)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				// A signal rolled the swap back: say that, not the text of
+				// the store's transaction.
+				return fmt.Errorf("delete %s: %w (%d deleted before the error)", sanitizeTerm(r.name), ctxErr, deleted)
+			}
 			// The store's error text can quote the ref name.
 			return fmt.Errorf("delete %s: %s (%d deleted before the error)", sanitizeTerm(r.name), sanitizeTerm(err.Error()), deleted)
 		}

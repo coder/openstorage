@@ -286,12 +286,12 @@ a commit or lives outside `refs/heads/`: a tag at a blob is healthy.
 For each branch (a ref under `refs/heads/`), the command also reads the object type of
 the tip. It reads the type from the repository's packs in the blob store, and never from
 git's error text. The first read downloads the registered packs into a temporary
-directory under `$TMPDIR`, so `$TMPDIR` needs room for them, and the command removes the
-directory when it ends, also after SIGINT, SIGTERM or SIGHUP. After SIGKILL or SIGQUIT,
-delete the `openstorage-repair-refs-*` directory under `$TMPDIR` by hand. A repository with
-no branch needs no blob store. A branch is on
-the list when its tip is a blob, a tree or an annotated tag, even a tag of a commit: git
-refuses all three. The objects and packs stay, and a later push can use them. The command
+directory under `$TMPDIR`, so `$TMPDIR` needs room for them. The command removes the
+directory as soon as it has read the tips, before it prints the list, and also after an
+error, SIGINT, SIGTERM or SIGHUP. A run that `nohup` started ignores SIGHUP. After SIGKILL
+or SIGQUIT, delete the `openstorage-repair-refs-*` directory under `$TMPDIR` by hand. A
+repository with no branch needs no blob store. A branch is on the list when its tip is a
+blob, a tree or an annotated tag, even a tag of a commit: git refuses all three. The objects and packs stay, and a later push can use them. The command
 reads the packs once, as of the start of the run: a push that lands during the run adds
 objects that the run does not see.
 
