@@ -317,9 +317,11 @@ The command first reads the repository row. An ID with no repository is an error
 list prints `repo:`, `url:` and `scanned: <n> refs`. Then, when refs match, it prints
 `refs that git can never lock (<n>):` with one `<sha> <ref>` line for each match, and
 `branches whose tip is not a commit (<n>):` with one `<sha> <ref>  (<type>)` line for each
-match, where the type is `a blob`, `a tree` or `an annotated tag`. It ends with
-`nothing changed`. When none match, it prints
-`no ref that git can never lock and no branch whose tip is not a commit`.
+match, where the type is `a blob`, `a tree` or `an annotated tag`. A lockable branch whose
+tip object the packs do not hold has its own list, described below. The output ends with
+`nothing changed`, and when only such branches are listed, that line says that the command
+deletes no branch whose tip object is missing. When no ref and no branch matches at all, it
+prints `no ref that git can never lock and no branch whose tip is not a commit`.
 A scan of 0 refs prints `this repository has no refs` instead: it is empty, it was
 purged, or its last refs were just deleted. A database URL or `--data-dir` that is not the
 one `serve` uses is an error (`not found`, or an error that names the missing `repos`

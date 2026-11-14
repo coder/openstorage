@@ -322,7 +322,8 @@ Remove either kind of ref from the ref store with
 2. List the refs, with the same database URL and blob store URL (or `--data-dir`) as
    `serve`: `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints the
    repository's URL, the number of refs that it scanned, each ref that git can never
-   lock, and each branch whose tip is not a commit, with its SHA and, for a branch, the
+   lock, each branch whose tip is not a commit, and each lockable branch whose tip object
+   the packs do not hold, with its SHA and, for a branch whose tip is not a commit, the
    object type. A ref
    is on the list when any part of its name is over 255 bytes, or its last part is over
    250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
@@ -330,7 +331,7 @@ Remove either kind of ref from the ref store with
    temporary directory under `$TMPDIR` and removes the directory as soon as it has read the
    tips, and also after an error, `SIGINT`, `SIGTERM` or `SIGHUP`. A run that `nohup` started
    ignores `SIGHUP`. After `SIGKILL` or `SIGQUIT`, delete the `openstorage-repair-refs-*`
-   directory by hand. Run it where `$TMPDIR` has room for the packs. A ref that git can
+   directory by hand. Run the command where `$TMPDIR` has room for the packs. A ref that git can
    lock is on the list only as a branch whose tip is not a commit, or whose tip object the
    packs do not hold. A branch at a commit and a tag at a blob stay off it.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
@@ -344,10 +345,12 @@ Remove either kind of ref from the ref store with
    the kept branch as missing, and the command exits with an error after it deleted the rest.
    That branch still wedges the repository, so find the pack first (`openstorage list-packs --repo <repo ID>`,
    with the same `--data-dir` or URLs as `serve`).
-4. Run the dry run once more. It must list no ref. An ID with no repository, and a
+4. Run the dry run once more. It must list no ref, apart from a branch that the command
+   keeps because its tip object is missing. An ID with no repository, and a
    database URL or `--data-dir` that is not the one `serve` uses, are errors. A scan of
-   0 refs means that the repository has no refs. The next clone or fetch hydrates the
-   repository again, on every replica.
+   0 refs means that the repository has no refs. When the list holds no ref, the next
+   clone or fetch hydrates the repository again, on every replica. A kept branch with a
+   missing tip object still wedges it.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and

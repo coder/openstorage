@@ -127,9 +127,9 @@ poke. With --yes it lists the refs again and deletes what it finds. It keeps a
 ref that is the repository's default branch: set another default branch first
 (PATCH /repo), then run the command again. It keeps a branch whose name git can
 lock and whose tip object it cannot find: it lists that branch, and with --yes it
-exits with an error after it has deleted the rest. A branch whose name git can
-never lock is deleted even when its tip object is missing: the name rule comes
-first.
+exits with an error after it has deleted the rest. With --yes, a branch whose
+name git can never lock is deleted even when its tip object is missing: the name
+rule comes first.
 
 Flags:
 `)
@@ -256,8 +256,9 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 		won, err := deleteRepairRef(ctx, rs, repoID, r)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				// A signal rolled the swap back: say that, not the text of
-				// the store's transaction.
+				// A signal ended the swap: say that, not the text of the
+				// store's transaction. With PostgreSQL the swap can have
+				// committed, and the next run lists what is left.
 				return fmt.Errorf("delete %s: %w (%d deleted before the error)", sanitizeTerm(r.name), ctxErr, deleted)
 			}
 			// The store's error text can quote the ref name.
