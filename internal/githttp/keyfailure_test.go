@@ -132,7 +132,7 @@ func TestKeyFailureLogIsRateLimited(t *testing.T) {
 	out := captureLog(t)
 	srv, tok := kfServer(t, kfKeys{err: errors.New(kfStoreDown)})
 	clock := time.Unix(1_000_000, 0)
-	srv.keyFailures.now = func() time.Time { return clock }
+	srv.keyFailures.Now = func() time.Time { return clock }
 	rt := tcdRoutes[0]
 
 	for range 5 {
@@ -207,9 +207,9 @@ func TestKeyFailureLogIsRateLimited(t *testing.T) {
 // the log line of a key that does not parse, nor the reverse.
 func TestKeyFailureLogKindsAreIndependent(t *testing.T) {
 	out := captureLog(t)
-	var l keyFailureLog
+	var l KeyFailureLog
 	clock := time.Unix(1_000_000, 0)
-	l.now = func() time.Time { return clock }
+	l.Now = func() time.Time { return clock }
 	l.report("one", "acme", errors.New("a"))
 	l.report("two", "acme", errors.New("b"))
 	l.report("one", "acme", errors.New("c"))
@@ -270,7 +270,7 @@ func TestKeyFailureLogHoldsTheCause(t *testing.T) {
 // a line is one line and keeps both ends of a long cause.
 func TestKeyFailureLogLineIsBounded(t *testing.T) {
 	out := captureLog(t)
-	var l keyFailureLog
+	var l KeyFailureLog
 	huge := strings.Repeat("a", 100_000)
 	// The store repeats the issuer without quotes: only the clip can bound it.
 	l.report("kind", huge, fmt.Errorf("lookup org %s: head\nsecond line", huge+" tail marker"))

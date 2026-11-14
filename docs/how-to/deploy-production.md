@@ -667,7 +667,7 @@ webhook events.
 | `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
 | `commit-graph refresh outcome=…` log lines | A `repo=` that repeats `lock_held`, `timed_out`, or `failed` needs a look ([outcomes and stale-lock runbook](#commit-graph-refresh)) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
-| `verify token: key store lookup failed` / `verify token: a registered key cannot be used` log lines | A git or LFS request reached the key store or a registered key, and it failed. The client reads a text that does not hold the cause, and the line holds the cause (a cause of more than 300 runes loses its middle). At most one line for each kind in each `serve` process per minute, with the count of the lines held back |
+| `verify token: key store lookup failed` / `verify token: a registered key cannot be used` log lines | A git, LFS or REST request reached the key store or a registered key, and it failed. The line holds the cause (a cause of more than 300 runes loses its middle). A git or LFS client reads a text that does not hold the cause. For each kind, the git and LFS routes together write at most one line per minute in each `serve` process, the REST routes write at most one more, and a line has the count of the lines held back |
 | `lane scan: requeued a lane whose work had no job` log line | A sync or push request lost its job and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
@@ -698,7 +698,7 @@ line can be up to 1 MiB.
 | `repack: folded packs` / `repack trigger: scheduled fold` (What to monitor) | `openstorage_job_runs_total{job="repack"}` | Fold outcomes only; trigger lines stay **log only** |
 | Pack quota exceeded (What to monitor) | **log only** | Client-visible hook error plus the `quota: receive-pack … at/over quota` server line |
 | Postgres availability and advisory-lock waits (What to monitor) | **log only** | Observe PostgreSQL itself (`pg_locks`) |
-| `verify token: …` lines (What to monitor) | **log only** | The two texts shown, at most one line for each kind per minute in each `serve` process |
+| `verify token: …` lines (What to monitor) | **log only** | The two texts shown, at most one line for each kind per minute for the git and LFS routes together, and one more for the REST routes, in each `serve` process |
 | `lane scan: requeued a lane whose work had no job` (What to monitor) | **log only** | Fields `org`, `repo` and `lane` |
 | S3WAL `… conditional-write contention retries exhausted` (S3WAL signals) | `openstorage_s3wal_cas_contention_exhausted_total` by `scope` | Serve-process mutations only; push-side failures reach the client and hook stderr |
 | `WARN s3wal manifest approaching size cap` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="warn"}` | Counts when the once-per-repository warning is logged |

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 )
@@ -111,6 +112,12 @@ func bearerToken(r *http.Request) (string, bool) {
 	return token, true
 }
 
+// keyFailures logs the key store failures and the unusable registered keys
+// that token verification meets on the REST routes, at most one line for each
+// kind per minute (see githttp.KeyFailureLog). The git and LFS routes have
+// their own.
+var keyFailures githttp.KeyFailureLog
+
 // keyStoreFailed reports whether a Verify error is a key store failure:
 // the token may be valid, so the REST surface answers upstream's 403
 // authentication_unavailable and the client retries. An unknown issuer
@@ -144,6 +151,9 @@ func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScop
 				return
 			}
 			claims, err := verifier.Verify(r.Context(), token)
+			if err != nil {
+				keyFailures.Report(r.Context(), err)
+			}
 			if keyStoreFailed(err) {
 				writeProblem(w, http.StatusForbidden, codeAuthenticationUnavailable, "cannot verify the token now, retry")
 				return

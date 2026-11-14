@@ -6,6 +6,7 @@ package api
 // changes upstream's table fails here until the map is updated.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -13,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -256,6 +259,23 @@ func (unknownOrgKeys) PublicKeysForOrg(_ context.Context, name string) ([]string
 	return nil, fmt.Errorf("org %q: %w", name, meta.ErrNotFound)
 }
 
+// captureKeyFailureLog gives the REST routes a fresh key failure limiter, and
+// returns what they log through the log package until the test ends.
+func captureKeyFailureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var out bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&out)
+	log.SetFlags(0)
+	keyFailures = githttp.KeyFailureLog{}
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		keyFailures = githttp.KeyFailureLog{}
+	})
+	return &out
+}
+
 // TestAuthenticationUnavailable: a key store failure is upstream's 403
 // authentication_unavailable, not the 403 forbidden of a token that
 // fails verification. An unknown issuer is such a token.
@@ -273,11 +293,15 @@ func TestAuthenticationUnavailable(t *testing.T) {
 		keys   auth.KeySource
 		status int
 		code   string
+		// logged is the start of the log line that the failure writes, and
+		// cause the part of the failure that the line holds.
+		logged, cause string
 	}{
-		{failingKeys{}, http.StatusForbidden, "authentication_unavailable"},
-		{unknownOrgKeys{}, http.StatusForbidden, "forbidden"},
-		{corruptKeys{}, http.StatusForbidden, "forbidden"},
+		{failingKeys{}, http.StatusForbidden, "authentication_unavailable", "verify token: key store lookup failed", "canary-db.internal"},
+		{unknownOrgKeys{}, http.StatusForbidden, "forbidden", "", ""},
+		{corruptKeys{}, http.StatusForbidden, "forbidden", "verify token: a registered key cannot be used", "asn1"},
 	} {
+		out := captureKeyFailureLog(t)
 		h := requireAuth(auth.NewVerifier(tc.keys), "", false, auth.ScopeGitRead)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 			t.Error("handler ran")
 		}))
@@ -299,6 +323,10 @@ func TestAuthenticationUnavailable(t *testing.T) {
 			if strings.Contains(rr.Body.String(), leak) {
 				t.Errorf("%T: the answer holds %q: %s", tc.keys, leak, rr.Body)
 			}
+		}
+		// The server logs the cause, and logs nothing for an unknown issuer.
+		if got := out.String(); (tc.logged == "") != (got == "") || !strings.Contains(got, tc.logged) || !strings.Contains(got, tc.cause) {
+			t.Errorf("%T: the log is %q, want a line with %q and %q", tc.keys, got, tc.logged, tc.cause)
 		}
 	}
 }
