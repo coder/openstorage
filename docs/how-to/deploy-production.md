@@ -339,8 +339,10 @@ Remove any of these refs from the ref store with
    directory by hand. Run the command where `$TMPDIR` has room for the packs. A ref that git can
    lock is on the list only as a branch whose tip is not a commit, or as a ref whose tip
    object no registered pack holds. A branch at a commit and a tag at a blob stay off it.
-   When the registered packs change while the command reads them, it stops with an error
-   and lists nothing: run it again.
+   When it finds a ref at a missing object and the registered packs changed since it began
+   to read them, it stops with an error and lists nothing: run it again. When a pack registers while `--yes` deletes, the
+   command creates again each deleted ref whose object that pack holds, and prints
+   `restored: <ref>`.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,

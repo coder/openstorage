@@ -104,7 +104,20 @@ func cmdRepairRefs(ctx context.Context, args []string) error {
 	return runRepairRefs(ctx, args, os.Stdout)
 }
 
+// repairGitLocationEnv are the variables that point git at a repository or an
+// object store. An operator's shell can export them, and git then reads that
+// repository instead of the temporary copy of the packs, so every object reads
+// as missing, or git init writes into the repository that the variable names.
+var repairGitLocationEnv = []string{
+	"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH",
+}
+
 func runRepairRefs(ctx context.Context, args []string, out io.Writer) error {
+	// Every git child of this command works on its own temporary repository.
+	for _, name := range repairGitLocationEnv {
+		_ = os.Unsetenv(name)
+	}
 	fs := flag.NewFlagSet("repair-refs", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `usage: openstorage repair-refs [flags] <repo-id>
@@ -138,8 +151,11 @@ ref that is the repository's default branch: set another default branch first
 (PATCH /repo), then run the command again. A ref whose tip object no pack holds
 is listed with the other refs, and with --yes it is deleted too. Check the packs
 first (openstorage list-packs), and keep the list: it shows the SHA of each ref,
-and only the ref goes. If the registered packs change while the command reads
-them, it stops with an error and deletes nothing: run it again.
+and only the ref goes. If it finds such a ref and the registered packs changed
+since it began to read them, it stops with an error and deletes nothing: run it
+again. If a pack
+registers while it deletes, it creates again each deleted ref whose object that
+pack holds, and prints restored: <ref>.
 
 Flags:
 `)
@@ -263,6 +279,7 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 		return nil
 	}
 	var deleted, lost, kept int
+	var deletedMissing []repairRef
 	for _, r := range found {
 		if target.isDefaultBranch(r.name) {
 			// DELETE /repos/branches refuses the default branch, and so does
@@ -289,15 +306,84 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 			continue
 		}
 		deleted++
+		if r.kind == "missing" {
+			deletedMissing = append(deletedMissing, r)
+		}
 		fmt.Fprintf(out, "deleted: %s\n", sanitizeTerm(r.name))
 	}
 	if len(found) > 0 {
 		fmt.Fprintf(out, "deleted %d of %d refs\n", deleted, len(found))
 	}
+	if len(deletedMissing) > 0 && target.packsUnchanged != nil {
+		if err := restoreHealed(ctx, rs, target, deletedMissing, out); err != nil {
+			return err
+		}
+	}
 	if lost > 0 || kept > 0 {
 		return fmt.Errorf("%d of %d refs were kept (%d changed since they were listed, %d are the default branch): see above, then run the command again", lost+kept, len(found), lost, kept)
 	}
 	return nil
+}
+
+// repairHealRounds bounds how often restoreHealed reads the packs again.
+const repairHealRounds = 3
+
+// restoreHealed undoes the deletes that a pack made wrong. A pack that
+// registered after the scan began can hold the object of a ref that the scan
+// read as missing, and the ref is healthy from then on. A ref that this run
+// deleted as missing was deleted rightly when no pack registered between the
+// read of the packs and the end of the deletes, so the command checks that
+// last. When the packs changed, it reads the types of the deleted tips again
+// and creates each ref whose object a pack holds now, and it checks again.
+func restoreHealed(ctx context.Context, rs ref.RefStore, target repairTarget, deleted []repairRef, out io.Writer) error {
+	for round := 0; ; round++ {
+		unchanged, err := target.packsUnchanged(ctx)
+		if err != nil {
+			return fmt.Errorf("list the packs of %s again: %w", sanitizeTerm(target.repoID), err)
+		}
+		if unchanged || len(deleted) == 0 {
+			return nil
+		}
+		if round == repairHealRounds {
+			return fmt.Errorf("the registered packs of %s kept changing while the command deleted refs: a deleted ref can be healthy now, run the command without --yes to see which refs are missing", sanitizeTerm(target.repoID))
+		}
+		ids := make([]string, 0, len(deleted))
+		seen := map[string]bool{}
+		for _, r := range deleted {
+			if !seen[r.sha] {
+				seen[r.sha] = true
+				ids = append(ids, r.sha)
+			}
+		}
+		kinds, err := target.kinds(ctx, ids)
+		if target.release != nil {
+			target.release()
+		}
+		if err != nil {
+			return fmt.Errorf("read the object types of the deleted tips of %s again: %w", sanitizeTerm(target.repoID), err)
+		}
+		var stillMissing []repairRef
+		for _, r := range deleted {
+			kind, ok := kinds[r.sha]
+			if !ok {
+				return fmt.Errorf("no object type for the tip %s of %s", sanitizeTerm(r.sha), sanitizeTerm(r.name))
+			}
+			if kind == "missing" {
+				stillMissing = append(stillMissing, r)
+				continue
+			}
+			won, err := rs.CASRef(ctx, target.repoID, r.name, ref.ZeroSHA, r.sha)
+			if err != nil {
+				return fmt.Errorf("restore %s: %s", sanitizeTerm(r.name), sanitizeTerm(err.Error()))
+			}
+			if !won {
+				fmt.Fprintf(out, "not restored: %s exists again\n", sanitizeTerm(r.name))
+				continue
+			}
+			fmt.Fprintf(out, "restored: %s: a pack that registered during the run holds its object\n", sanitizeTerm(r.name))
+		}
+		deleted = stillMissing
+	}
 }
 
 // printRepairRefs prints one line for each ref: its SHA, its name, and what

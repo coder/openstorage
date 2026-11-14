@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -609,9 +610,27 @@ func TestRepairRefsMissingTipsInEveryNamespace(t *testing.T) {
 	}
 }
 
+// registersAPack wraps a fixture's reader of object types so that a pack
+// registers right after each read, as a push that lands during the run. The
+// row has no bytes, so a later download of the packs would fail.
+func registersAPack(f *repairFixture) objectKinds {
+	registered := 0
+	return func(ctx context.Context, ids []string) (map[string]string, error) {
+		kinds, err := f.tips.kinds(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		id := strings.Repeat(string(rune('a'+registered)), 40)
+		registered++
+		pack := ref.Pack{ID: id, Key: blob.PackKey(f.repo, id), Size: 1}
+		return kinds, f.rs.RegisterPacks(ctx, f.repo, []ref.Pack{pack})
+	}
+}
+
 // A pack that registers while the command reads the packs can hold an object
-// that the read found missing, so a run that sees the pack set change lists
-// and deletes nothing.
+// that the read found missing, so a run that sees the pack set change after
+// it found such a ref lists and deletes nothing. A run that found no such ref
+// goes on, because the new pack changes nothing that it lists.
 func TestRepairRefsStopsWhenThePacksChange(t *testing.T) {
 	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
 	if err != nil {
@@ -624,14 +643,7 @@ func TestRepairRefsStopsWhenThePacksChange(t *testing.T) {
 		t.Fatalf("unchanged before any read = %v, %v", unchanged, err)
 	}
 	target := f.target()
-	target.kinds = func(ctx context.Context, ids []string) (map[string]string, error) {
-		kinds, err := f.tips.kinds(ctx, ids)
-		if err != nil {
-			return nil, err
-		}
-		pack := ref.Pack{ID: strings.Repeat("f", 40), Key: blob.PackKey(f.repo, strings.Repeat("f", 40)), Size: 1}
-		return kinds, f.rs.RegisterPacks(ctx, f.repo, []ref.Pack{pack})
-	}
+	target.kinds = registersAPack(f)
 	var out bytes.Buffer
 	err = repairRefs(t.Context(), f.rs, target, true, &out)
 	if err == nil || !strings.Contains(err.Error(), "changed while the command read them") || out.Len() != 0 {
@@ -639,5 +651,93 @@ func TestRepairRefsStopsWhenThePacksChange(t *testing.T) {
 	}
 	if got := f.refs(t); got["refs/heads/ghost"] != ghost {
 		t.Fatalf("the run changed the refs: %v", got)
+	}
+
+	rs2, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := newRepairFixture(t, rs2)
+	g.plant(t, map[string]string{"refs/heads/main": g.commit})
+	target = g.target()
+	target.kinds = registersAPack(g)
+	out.Reset()
+	if err := repairRefs(t.Context(), g.rs, target, true, &out); err != nil || !strings.Contains(out.String(), "no ref whose tip object is missing") {
+		t.Fatalf("a pack that registers during a clean read = %v\n%s", err, out.String())
+	}
+}
+
+// registeringStore runs one function right before the first compare-and-swap
+// that deletes a ref, as a push that registers a pack in that window.
+type registeringStore struct {
+	ref.RefStore
+	once sync.Once
+	do   func()
+}
+
+func (s *registeringStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	if new == ref.ZeroSHA {
+		s.once.Do(s.do)
+	}
+	return s.RefStore.CASRef(ctx, repo, name, old, new)
+}
+
+// A pack that registers after the scan and before a delete can hold the
+// object of a ref that the scan read as missing. The command checks the packs
+// after the deletes and creates such a ref again, so that --yes never leaves a
+// healthy ref deleted. A ref whose object is still missing stays deleted.
+func TestRepairRefsRestoresARefThatAPackHealedDuringTheDeletes(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	ghost := strings.Repeat("ab", 20)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late, "refs/tags/ghost": ghost})
+	store := &registeringStore{RefStore: f.rs, do: func() { f.registerLatePack(t) }}
+	var out bytes.Buffer
+	if err := repairRefs(t.Context(), store, f.target(), true, &out); err != nil {
+		t.Fatalf("--yes = %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "deleted: refs/tags/late\n") || !strings.Contains(out.String(), "restored: refs/tags/late") ||
+		strings.Contains(out.String(), "restored: refs/tags/ghost") {
+		t.Fatalf("--yes output:\n%s", out.String())
+	}
+	want := map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late}
+	if got := f.refs(t); !mapsEqual(got, want) {
+		t.Fatalf("refs after --yes = %v, want %v", got, want)
+	}
+	if _, err := f.hydrateInto(t, filepath.Join(t.TempDir(), "cache")); err != nil {
+		t.Fatalf("hydrate after the repair: %v", err)
+	}
+}
+
+// An operator's shell can export GIT_DIR or GIT_OBJECT_DIRECTORY. git would
+// then read that repository and not the temporary copy of the packs, every
+// tip would read as missing, and --yes would delete healthy refs.
+func TestRepairRefsIgnoresTheGitLocationOfTheOperator(t *testing.T) {
+	isolateStorageEnv(t)
+	dir := t.TempDir()
+	dbURL := "sqlite://" + filepath.Join(dir, "codestorage.db")
+	repo := createMetaRepo(t, dbURL, "main")
+	rs, err := ref.OpenSQLite(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixtureFor(t, rs, repo)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/v1": f.tag})
+	t.Setenv("OPENSTORAGE_S3_URL", f.blobURL)
+	elsewhere := t.TempDir()
+	t.Setenv("GIT_DIR", elsewhere)
+	t.Setenv("GIT_OBJECT_DIRECTORY", t.TempDir())
+	var out bytes.Buffer
+	if err := runRepairRefs(t.Context(), []string{"--yes", "--data-dir", dir, repo}, &out); err != nil || !strings.Contains(out.String(), "no ref whose tip object is missing") {
+		t.Fatalf("--yes = %v\n%s", err, out.String())
+	}
+	if got := f.refs(t); len(got) != 2 {
+		t.Fatalf("refs after --yes = %v", got)
+	}
+	if entries, err := os.ReadDir(elsewhere); err != nil || len(entries) != 0 {
+		t.Fatalf("git wrote into GIT_DIR: %v, %v", entries, err)
 	}
 }

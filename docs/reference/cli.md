@@ -298,9 +298,12 @@ that git can lock needs no blob store. A branch is on the list when its tip is a
 tree or an annotated tag, even a tag of a commit: git refuses all three. A ref of any
 namespace is on the list when no registered pack holds its tip object. The objects and
 packs stay, and a later push can use them. The command reads the packs once, as of the
-start of the run. When the set of registered packs has changed by the end of the run, the
-command prints an error and lists and deletes nothing, because a new pack can hold an
-object that the run read as missing: run it again.
+start of the run. When the scan found a ref at a missing object and the set of registered
+packs has changed since the run began, the command prints an error and lists and deletes
+nothing, because a new pack can hold an object that the run read as missing: run it
+again. A pack can also register while `--yes` deletes. After the deletes, the command checks the registered packs once more. When they
+changed, it reads the deleted tips again, creates each deleted ref whose object a pack
+holds now, and prints `restored: <ref>`.
 
 ```sh
 openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
