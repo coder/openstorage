@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -686,6 +687,11 @@ func (s *registeringStore) CASRef(ctx context.Context, repo, name, old, new stri
 	return s.RefStore.CASRef(ctx, repo, name, old, new)
 }
 
+// DFConflicts forwards the probe that the restore step asks for.
+func (s *registeringStore) DFConflicts(ctx context.Context, repo string, names []string) (map[string]string, error) {
+	return s.RefStore.(repairDFProber).DFConflicts(ctx, repo, names)
+}
+
 // A pack that registers after the scan and before a delete can hold the
 // object of a ref that the scan read as missing. The command checks the packs
 // after the deletes and creates such a ref again, so that --yes never leaves a
@@ -728,6 +734,30 @@ func TestRepairRefsRestoresARefThatAPackHealedDuringTheDeletes(t *testing.T) {
 // delete healthy refs. The command works on its own repository whatever the
 // shell exports, and the variables are back when it returns.
 func TestRepairRefsIgnoresTheGitLocationOfTheOperator(t *testing.T) {
+	runRepairRefsWithGitEnv(t, func(t *testing.T, template string) {
+		t.Setenv("GIT_TEMPLATE_DIR", template)
+	}, true)
+}
+
+// The same, with the template named in the operator's global git config: the
+// command pins the global and system config to /dev/null.
+func TestRepairRefsIgnoresTheGlobalGitConfigOfTheOperator(t *testing.T) {
+	runRepairRefsWithGitEnv(t, func(t *testing.T, template string) {
+		home := t.TempDir()
+		if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[init]\n\ttemplateDir = "+template+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("HOME", home)
+		t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+		if _, ok := os.LookupEnv("GIT_CONFIG_GLOBAL"); ok {
+			t.Setenv("GIT_CONFIG_GLOBAL", "")
+			_ = os.Unsetenv("GIT_CONFIG_GLOBAL")
+		}
+	}, false)
+}
+
+func runRepairRefsWithGitEnv(t *testing.T, exportTemplate func(t *testing.T, template string), locationVars bool) {
+	t.Helper()
 	isolateStorageEnv(t)
 	dir := t.TempDir()
 	dbURL := "sqlite://" + filepath.Join(dir, "codestorage.db")
@@ -740,9 +770,11 @@ func TestRepairRefsIgnoresTheGitLocationOfTheOperator(t *testing.T) {
 	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/v1": f.tag})
 	t.Setenv("OPENSTORAGE_S3_URL", f.blobURL)
 	elsewhere := t.TempDir()
-	t.Setenv("GIT_DIR", elsewhere)
-	t.Setenv("GIT_OBJECT_DIRECTORY", t.TempDir())
-	t.Setenv("GIT_DEFAULT_HASH", "sha256")
+	if locationVars {
+		t.Setenv("GIT_DIR", elsewhere)
+		t.Setenv("GIT_OBJECT_DIRECTORY", t.TempDir())
+		t.Setenv("GIT_DEFAULT_HASH", "sha256")
+	}
 	// A template that already holds the index of each registered pack: git
 	// init copies it, and the download skips a pack that has an index.
 	template := t.TempDir()
@@ -758,7 +790,7 @@ func TestRepairRefsIgnoresTheGitLocationOfTheOperator(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	t.Setenv("GIT_TEMPLATE_DIR", template)
+	exportTemplate(t, template)
 	var out bytes.Buffer
 	if err := runRepairRefs(t.Context(), []string{"--yes", "--data-dir", dir, repo}, &out); err != nil || !strings.Contains(out.String(), "no ref whose tip object is missing") {
 		t.Fatalf("--yes = %v\n%s", err, out.String())
@@ -769,8 +801,10 @@ func TestRepairRefsIgnoresTheGitLocationOfTheOperator(t *testing.T) {
 	if entries, err := os.ReadDir(elsewhere); err != nil || len(entries) != 0 {
 		t.Fatalf("git wrote into GIT_DIR: %v, %v", entries, err)
 	}
-	if got := os.Getenv("GIT_DIR"); got != elsewhere || os.Getenv("GIT_DEFAULT_HASH") != "sha256" {
-		t.Fatalf("the command did not put the git variables back: GIT_DIR=%q", got)
+	if locationVars {
+		if got := os.Getenv("GIT_DIR"); got != elsewhere || os.Getenv("GIT_DEFAULT_HASH") != "sha256" {
+			t.Fatalf("the command did not put the git variables back: GIT_DIR=%q", got)
+		}
 	}
 }
 
@@ -822,8 +856,158 @@ func TestRepairRefsListsTheDeletedMissingRefsWhenTheRestoreFails(t *testing.T) {
 	}
 	var out bytes.Buffer
 	err = repairRefs(t.Context(), store, target, true, &out)
+	warning := afterStopWarning(out.String())
 	if err == nil || !strings.Contains(err.Error(), "the blob store is down") ||
-		!strings.Contains(out.String(), "the run stopped before it checked the packs again") || !strings.Contains(out.String(), "  "+f.late+" refs/tags/late\n") {
+		warning == "" || !strings.Contains(warning, "  "+f.late+" refs/tags/late\n") {
 		t.Fatalf("--yes with a failing restore = %v\n%s", err, out.String())
+	}
+}
+
+// afterStopWarning returns the part of a run's output that follows the line
+// that says the run stopped before it checked the packs again, or "" when the
+// output has no such line. The refs that the scan listed come before it.
+func afterStopWarning(out string) string {
+	_, after, ok := strings.Cut(out, "the run stopped before it checked the packs again")
+	if !ok {
+		return ""
+	}
+	return after
+}
+
+// failingRestoreStore fails each compare-and-swap that creates a ref.
+type failingRestoreStore struct{ ref.RefStore }
+
+func (s failingRestoreStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	if old == ref.ZeroSHA {
+		return false, errors.New("the ref store is down")
+	}
+	return s.RefStore.CASRef(ctx, repo, name, old, new)
+}
+
+// A restore that fails part way keeps the deleted refs that an earlier step of
+// the same round read as missing again, with the refs that it did not reach:
+// a pack that registers later can hold the object of any of them.
+func TestRepairRefsListsEveryUnsettledRefWhenARestoreFails(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	ghost := strings.Repeat("ab", 20)
+	// "ghost" sorts before "late": the command reads it as missing again, then
+	// fails to create "late".
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/ghost": ghost, "refs/tags/late": f.late})
+	store := failingRestoreStore{&registeringStore{RefStore: f.rs, do: func() { f.registerLatePack(t) }}}
+	var out bytes.Buffer
+	err = repairRefs(t.Context(), store, f.target(), true, &out)
+	warning := afterStopWarning(out.String())
+	if err == nil || !strings.Contains(err.Error(), "the ref store is down") ||
+		!strings.Contains(warning, "  "+ghost+" refs/tags/ghost\n") || !strings.Contains(warning, "  "+f.late+" refs/tags/late\n") {
+		t.Fatalf("--yes with a failing restore = %v\n%s", err, out.String())
+	}
+}
+
+// A git that the operator's PATH names can work on another repository, which
+// has objects and packs of its own. Its count of objects then passes, and every
+// tip would read as missing. The command checks which repository git works on.
+func TestPackTipKindsRefusesAGitThatWorksOnAnotherRepository(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	// The other repository holds the same objects in a pack.
+	repairGit(t, f.scratch, "", "repack", "-adq")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\nexec '" + realGit + "' --git-dir='" + f.scratch + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	tips := &packTipKinds{rs: rs, repoID: f.repo, blobURL: f.blobURL}
+	t.Cleanup(tips.close)
+	if _, err := tips.kinds(t.Context(), []string{f.commit}); err == nil || !strings.Contains(err.Error(), "not on the temporary repository") {
+		t.Fatalf("kinds with a git that works on another repository = %v, want a refusal", err)
+	}
+}
+
+// A push can create refs/tags/late/x while the command has deleted
+// refs/tags/late. git refuses the pair, so the command keeps the ref deleted.
+func TestRepairRefsDoesNotRestoreARefThatWouldConflictWithANewRef(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late})
+	store := &registeringStore{RefStore: f.rs, do: func() {
+		f.registerLatePack(t)
+		if won, err := f.rs.CASRef(t.Context(), f.repo, "refs/tags/late/x", ref.ZeroSHA, f.commit); err != nil || !won {
+			t.Errorf("create refs/tags/late/x = %v, %v", won, err)
+		}
+	}}
+	var out bytes.Buffer
+	if err := repairRefs(t.Context(), store, f.target(), true, &out); err != nil {
+		t.Fatalf("--yes = %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "not restored: refs/tags/late conflicts with the existing ref refs/tags/late/x (directory/file)") || strings.Contains(out.String(), "restored: refs/tags/late:") {
+		t.Fatalf("--yes output:\n%s", out.String())
+	}
+	want := map[string]string{"refs/heads/main": f.commit, "refs/tags/late/x": f.commit}
+	if got := f.refs(t); !mapsEqual(got, want) {
+		t.Fatalf("refs after --yes = %v, want %v", got, want)
+	}
+	if _, err := f.hydrateInto(t, filepath.Join(t.TempDir(), "cache")); err != nil {
+		t.Fatalf("hydrate after the repair: %v", err)
+	}
+}
+
+// failingDeleteStore fails the delete of one ref. With cancel set, it cancels
+// the run first, as a signal does.
+type failingDeleteStore struct {
+	ref.RefStore
+	name   string
+	cancel context.CancelFunc
+}
+
+func (s failingDeleteStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	if new == ref.ZeroSHA && name == s.name {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		return false, errors.New("the ref store is down")
+	}
+	return s.RefStore.CASRef(ctx, repo, name, old, new)
+}
+
+// A run that a store error or a signal stops during the deletes prints the
+// refs that it already deleted as missing, with their SHAs.
+func TestRepairRefsListsTheDeletedMissingRefsWhenADeleteFails(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run("cancel="+strconv.FormatBool(cancel), func(t *testing.T) {
+			rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := newRepairFixture(t, rs)
+			ghost := strings.Repeat("ab", 20)
+			// "ghost" sorts before "zzz": the command deletes it, then fails on "zzz".
+			f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/ghost": ghost, "refs/tags/zzz": strings.Repeat("cd", 20)})
+			ctx, stop := context.WithCancel(t.Context())
+			defer stop()
+			store := failingDeleteStore{RefStore: f.rs, name: "refs/tags/zzz"}
+			if cancel {
+				store.cancel = stop
+			}
+			var out bytes.Buffer
+			err = repairRefs(ctx, store, f.target(), true, &out)
+			if err == nil || !strings.Contains(afterStopWarning(out.String()), "  "+ghost+" refs/tags/ghost\n") {
+				t.Fatalf("--yes with a failing delete = %v\n%s", err, out.String())
+			}
+		})
 	}
 }

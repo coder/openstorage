@@ -27,6 +27,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -175,9 +176,15 @@ first (openstorage list-packs), and keep the list: it shows the SHA of each ref,
 and only the ref goes. If it finds such a ref and the registered packs changed
 since it began to read them, it stops with an error and deletes nothing: run it
 again. If a pack registers while it deletes, it creates again each deleted ref
-whose object a registered pack holds, and prints restored: <ref>. If a signal or
-an error stops it after a delete, it prints each ref that it deleted as missing,
-with its SHA.
+whose object a registered pack holds, and prints restored: <ref>. It keeps
+deleted a branch at a blob, a tree or an annotated tag, and a ref that would
+conflict with an existing ref (directory/file), and prints not restored: <ref>.
+If a signal or an error stops it after a delete, it prints each ref that it
+deleted as missing, with its SHA.
+
+The command ignores every GIT_ variable of the shell and every git config file.
+It stops with an error, and deletes nothing, when git does not work on its
+temporary repository or reads no object from the downloaded packs.
 
 Flags:
 `)
@@ -363,6 +370,18 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 // repairHealRounds bounds how often restoreHealed reads the packs again.
 const repairHealRounds = 3
 
+// repairDFProber is the directory/file probe that the push path uses before it
+// creates a ref. Every ref store that ships implements it.
+type repairDFProber interface {
+	DFConflicts(ctx context.Context, repo string, names []string) (map[string]string, error)
+}
+
+var (
+	_ repairDFProber = (*ref.PG)(nil)
+	_ repairDFProber = (*ref.SQLite)(nil)
+	_ repairDFProber = (*ref.S3WAL)(nil)
+)
+
 // warnDeletedMissing tells the operator which refs a run that stopped deleted
 // as missing without a last check of the packs. A pack that registered since
 // can hold the object of one of them.
@@ -413,10 +432,13 @@ func restoreHealed(ctx context.Context, rs ref.RefStore, target repairTarget, de
 			return deleted, fmt.Errorf("read the object types of the deleted tips of %s again: %w", sanitizeTerm(target.repoID), err)
 		}
 		var stillMissing []repairRef
+		// unsettled is every deleted ref that this round has not put right: the
+		// refs that it read as missing again, and the refs from i on.
+		unsettled := func(i int) []repairRef { return append(slices.Clone(stillMissing), deleted[i:]...) }
 		for i, r := range deleted {
 			kind, ok := kinds[r.sha]
 			if !ok {
-				return deleted[i:], fmt.Errorf("no object type for the tip %s of %s", sanitizeTerm(r.sha), sanitizeTerm(r.name))
+				return unsettled(i), fmt.Errorf("no object type for the tip %s of %s", sanitizeTerm(r.sha), sanitizeTerm(r.name))
 			}
 			if kind == "missing" {
 				stillMissing = append(stillMissing, r)
@@ -427,9 +449,21 @@ func restoreHealed(ctx context.Context, rs ref.RefStore, target repairTarget, de
 				fmt.Fprintf(out, "not restored: %s would be a branch at %s\n", sanitizeTerm(r.name), repairKindNames[kind])
 				continue
 			}
+			// A push can create refs/tags/a/b while refs/tags/a is deleted. git
+			// refuses the pair (directory/file), so the ref stays deleted.
+			if prober, ok := rs.(repairDFProber); ok {
+				conflicts, err := prober.DFConflicts(ctx, target.repoID, []string{r.name})
+				if err != nil {
+					return unsettled(i), fmt.Errorf("check %s against the existing refs: %s", sanitizeTerm(r.name), sanitizeTerm(err.Error()))
+				}
+				if existing, bad := conflicts[r.name]; bad {
+					fmt.Fprintf(out, "not restored: %s conflicts with the existing ref %s (directory/file)\n", sanitizeTerm(r.name), sanitizeTerm(existing))
+					continue
+				}
+			}
 			won, err := rs.CASRef(ctx, target.repoID, r.name, ref.ZeroSHA, r.sha)
 			if err != nil {
-				return deleted[i:], fmt.Errorf("restore %s: %s", sanitizeTerm(r.name), sanitizeTerm(err.Error()))
+				return unsettled(i), fmt.Errorf("restore %s: %s", sanitizeTerm(r.name), sanitizeTerm(err.Error()))
 			}
 			if !won {
 				fmt.Fprintf(out, "not restored: %s exists again\n", sanitizeTerm(r.name))
@@ -633,11 +667,24 @@ func (p *packTipKinds) stage(ctx context.Context) (err error) {
 	return nil
 }
 
-// requireObjects checks by object state that git reads the downloaded packs.
-// A git that reads none of the objects of a repository with packs (another
-// hash format, a setting that this command did not foresee) would make every
-// tip read as missing, and --yes would delete healthy refs.
+// requireObjects checks that git works on the temporary repository and reads
+// the downloaded packs. A git that reads none of the objects of a repository
+// with packs (another hash format, a setting that this command did not
+// foresee) would make every tip read as missing, and --yes would delete
+// healthy refs.
 func requireObjects(ctx context.Context, repoPath string, packs int) error {
+	// git must work on the temporary repository itself. A git that the
+	// operator's PATH names can work on another repository, which has objects
+	// of its own, and then the count below passes and every tip reads as missing.
+	gitDir, err := gitread.Run(ctx, gitread.Cmd{Class: gitread.Light, Dir: repoPath, Args: []string{"rev-parse", "--absolute-git-dir"}})
+	if err != nil {
+		return fmt.Errorf("find the repository that git works on: %w", err)
+	}
+	want, wantErr := filepath.EvalSymlinks(repoPath)
+	got, gotErr := filepath.EvalSymlinks(strings.TrimSpace(gitDir))
+	if wantErr != nil || gotErr != nil || got != want {
+		return fmt.Errorf("git works on %s, not on the temporary repository %s: refusing to read any tip as missing", sanitizeTerm(strings.TrimSpace(gitDir)), sanitizeTerm(repoPath))
+	}
 	out, err := gitread.Run(ctx, gitread.Cmd{Class: gitread.Light, Dir: repoPath, Args: []string{"count-objects", "-v"}})
 	if err != nil {
 		return fmt.Errorf("count the objects of the downloaded packs: %w", err)

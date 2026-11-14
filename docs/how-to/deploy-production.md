@@ -342,7 +342,9 @@ Remove any of these refs from the ref store with
    When it finds a ref at a missing object and the registered packs changed since it began
    to read them, it stops with an error and lists nothing: run it again. When a pack
    registers while `--yes` deletes, the command creates again each deleted ref whose
-   object a registered pack holds, and prints `restored: <ref>`. When a signal or an
+   object a registered pack holds, and prints `restored: <ref>`. It keeps deleted a
+   branch at a blob, a tree or an annotated tag, and a ref that would conflict with an
+   existing ref (directory/file), and prints `not restored: <ref>`. When a signal or an
    error stops it after it deleted a ref at a missing object, it prints that ref with its
    SHA: check the packs with `openstorage list-packs`, and create a ref again where a
    pack holds its object.
