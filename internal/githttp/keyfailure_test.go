@@ -29,6 +29,23 @@ const (
 	kfStoredKey   = `issuer "acme": a registered key cannot be used`
 )
 
+// kfToken returns a token for the issuer iss. The key store of kfServer fails
+// before any signature is checked, so any key signs it.
+func kfToken(t *testing.T, iss string) string {
+	t.Helper()
+	key, err := auth.GenerateKey("ES256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := testClaims("r", "git:read,git:write")
+	claims.Iss = iss
+	tok, err := auth.MintToken(key, "ES256", claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
 // kfServer returns a server whose only org, "acme", has the key source keys,
 // and a token that the org's key signed.
 func kfServer(t *testing.T, keys kfKeys) (*Server, string) {
@@ -128,6 +145,21 @@ func TestKeyFailureLogIsRateLimited(t *testing.T) {
 	if n := countKeyFailureLines(out.String()); n != 2 || !strings.Contains(out.String(), "(5 earlier failures of this kind not logged)") {
 		t.Fatalf("the failure after the interval did not log the held count: %q", out)
 	}
+	// The count starts again after a line, and a failure of the same kind
+	// for another issuer is held back like any other: a client names the
+	// issuer.
+	for _, iss := range []string{"acme2", "acme3"} {
+		tcdServe(srv, rt, kfToken(t, iss))
+	}
+	if n := countKeyFailureLines(out.String()); n != 2 {
+		t.Fatalf("a failure for another issuer logged inside the interval: %q", out)
+	}
+	clock = clock.Add(keyFailureLogEvery)
+	tcdServe(srv, rt, tok)
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if last := lines[len(lines)-1]; len(lines) != 3 || !strings.Contains(last, "(2 earlier failures of this kind not logged)") {
+		t.Fatalf("the third line does not hold the count of its own interval: %q", out)
+	}
 
 	t.Run("an unknown issuer", func(t *testing.T) {
 		out := captureLog(t)
@@ -176,5 +208,18 @@ func TestKeyFailureLogKindsAreIndependent(t *testing.T) {
 	l.report("one", "acme", errors.New("c"))
 	if got := out.String(); strings.Count(got, "verify token: ") != 2 || strings.Contains(got, ": c") {
 		t.Fatalf("log: %q", got)
+	}
+}
+
+// TestKeyFailureLogLineIsBounded: a store repeats the issuer in its own
+// error, so a line holds a bounded part of the cause, and one line.
+func TestKeyFailureLogLineIsBounded(t *testing.T) {
+	out := captureLog(t)
+	var l keyFailureLog
+	huge := strings.Repeat("a", 100_000)
+	l.report("kind", huge, fmt.Errorf("lookup org %q: connection refused\nsecond line", huge))
+	line := out.String()
+	if len(line) > 1000 || strings.Count(line, "\n") != 1 {
+		t.Fatalf("the line is %d bytes with %d newlines: %.200q", len(line), strings.Count(line, "\n"), line)
 	}
 }

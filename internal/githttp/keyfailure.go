@@ -16,6 +16,20 @@ import (
 // of key failure.
 const keyFailureLogEvery = time.Minute
 
+// keyFailureLogCause is the most runes of a failure's text that a log line
+// holds. A store repeats the issuer, which a client chose, in its own error
+// text.
+const keyFailureLogCause = 300
+
+// clipText returns s, or its first n runes and "..." when it has more.
+func clipText(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
+}
+
 // keyFailureLog logs a failure of the key store, or of a key that an org
 // registered, at most once for each kind in keyFailureLogEvery. A line says
 // how many failures of its kind came before it and were not logged. Any
@@ -48,7 +62,7 @@ func (l *keyFailureLog) report(kind, org string, err error) {
 	held := l.held[kind]
 	l.held[kind] = 0
 	l.mu.Unlock()
-	line := fmt.Sprintf("verify token: %s, issuer %.80q: %v", kind, org, err)
+	line := fmt.Sprintf("verify token: %s, issuer %.80q: %q", kind, org, clipText(err.Error(), keyFailureLogCause))
 	if held > 0 {
 		line += fmt.Sprintf(" (%d earlier failures of this kind not logged)", held)
 	}
@@ -57,10 +71,10 @@ func (l *keyFailureLog) report(kind, org string, err error) {
 
 // verifyFailure returns the error that a client of a git or LFS route reads
 // for a failed Verify, and logs the failures that the server must fix. The
-// text of the errors that Verify returns is fixed: a store's error and a
-// key parser's error stay behind Unwrap, and this logs them. An unknown
-// issuer and a request that ended while the keys were read are not logged,
-// because a client causes both.
+// text of the two key failures that Verify returns is fixed: a store's error
+// and a key parser's error stay behind Unwrap, and this logs them. An
+// unknown issuer and a request that ended while the keys were read are not
+// logged, because a client causes both.
 func (s *Server) verifyFailure(ctx context.Context, err error) error {
 	var keys *auth.KeySourceError
 	if errors.As(err, &keys) {

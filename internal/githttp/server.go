@@ -119,7 +119,7 @@ type Server struct {
 	// (issue #59, verifystate.go); <= 0 disables the budget. Set by the
 	// serve wiring.
 	VerifySigBudget int
-	// keyFailures rate-limits the log lines of key store failures (see
+	// keyFailures rate-limits the log lines of key failures (see
 	// verifyFailure).
 	keyFailures keyFailureLog
 	// usage memoizes per-repo pack usage for the quota-pressure log so
