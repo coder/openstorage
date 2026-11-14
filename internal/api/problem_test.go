@@ -6,6 +6,7 @@ package api
 // changes upstream's table fails here until the map is updated.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -13,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -256,6 +259,42 @@ func (unknownOrgKeys) PublicKeysForOrg(_ context.Context, name string) ([]string
 	return nil, fmt.Errorf("org %q: %w", name, meta.ErrNotFound)
 }
 
+// lockedLog is what the log package writes to in a test. Other goroutines of
+// the process can write to the log while the test reads it.
+type lockedLog struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// captureKeyFailureLog gives the REST routes a fresh key failure limiter, and
+// returns what they log through the log package until the test ends.
+func captureKeyFailureLog(t *testing.T) *lockedLog {
+	t.Helper()
+	out := &lockedLog{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(out)
+	log.SetFlags(0)
+	keyFailures = githttp.KeyFailureLog{}
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		keyFailures = githttp.KeyFailureLog{}
+	})
+	return out
+}
+
 // TestAuthenticationUnavailable: a key store failure is upstream's 403
 // authentication_unavailable, not the 403 forbidden of a token that
 // fails verification. An unknown issuer is such a token.
@@ -273,17 +312,29 @@ func TestAuthenticationUnavailable(t *testing.T) {
 		keys   auth.KeySource
 		status int
 		code   string
+		// logged is the start of the log line that the failure writes, and
+		// cause the part of the failure that the line holds. ended means
+		// that the client's request has ended: no line.
+		logged, cause string
+		ended         bool
 	}{
-		{failingKeys{}, http.StatusForbidden, "authentication_unavailable"},
-		{unknownOrgKeys{}, http.StatusForbidden, "forbidden"},
-		{corruptKeys{}, http.StatusForbidden, "forbidden"},
+		{failingKeys{}, http.StatusForbidden, "authentication_unavailable", "verify token: key store lookup failed", "canary-db.internal", false},
+		{unknownOrgKeys{}, http.StatusForbidden, "forbidden", "", "", false},
+		{corruptKeys{}, http.StatusForbidden, "forbidden", "verify token: a registered key cannot be used", "asn1", false},
+		{failingKeys{}, http.StatusForbidden, "authentication_unavailable", "", "", true},
 	} {
+		out := captureKeyFailureLog(t)
 		h := requireAuth(auth.NewVerifier(tc.keys), "", false, auth.ScopeGitRead)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 			t.Error("handler ran")
 		}))
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/repo", nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
+		if tc.ended {
+			ctx, cancel := context.WithCancel(req.Context())
+			cancel()
+			req = req.WithContext(ctx)
+		}
 		h.ServeHTTP(rr, req)
 		if rr.Code != tc.status {
 			t.Errorf("%T: status %d (%s), want %d", tc.keys, rr.Code, rr.Body, tc.status)
@@ -299,6 +350,17 @@ func TestAuthenticationUnavailable(t *testing.T) {
 			if strings.Contains(rr.Body.String(), leak) {
 				t.Errorf("%T: the answer holds %q: %s", tc.keys, leak, rr.Body)
 			}
+		}
+		// The server logs the cause, and logs nothing for an unknown issuer.
+		if got := out.String(); (tc.logged == "") != (got == "") || !strings.Contains(got, tc.logged) || !strings.Contains(got, tc.cause) {
+			t.Errorf("%T: the log is %q, want a line with %q and %q", tc.keys, got, tc.logged, tc.cause)
+		}
+		// More requests inside the minute write no more lines.
+		for range 4 {
+			h.ServeHTTP(httptest.NewRecorder(), req.Clone(req.Context()))
+		}
+		if n := strings.Count(out.String(), "verify token: "); n != min(1, strings.Count(tc.logged, "verify token: ")) {
+			t.Errorf("%T: 5 requests wrote %d lines: %q", tc.keys, n, out)
 		}
 	}
 }

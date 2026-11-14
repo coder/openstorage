@@ -515,7 +515,15 @@ func TestForkSourceKeyStoreFailure(t *testing.T) {
 		srv := httptest.NewServer(recoverPanics(s.logger)(mux))
 		t.Cleanup(srv.Close)
 
+		out := captureKeyFailureLog(t)
 		resp, body := forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
+		for range 2 {
+			forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
+		}
+		// Three failed checks in one minute write one line.
+		if got := out.String(); strings.Count(got, "verify token: ") != 1 || !strings.Contains(got, "verify token: key store lookup failed") || !strings.Contains(got, "canary-db.internal") {
+			t.Fatalf("the log of the failed source token checks is %q", got)
+		}
 		if resp.StatusCode != http.StatusForbidden || body["code"] != "authentication_unavailable" {
 			t.Fatalf("status %d body %v, want 403 authentication_unavailable", resp.StatusCode, body)
 		}

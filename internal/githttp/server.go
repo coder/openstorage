@@ -121,7 +121,7 @@ type Server struct {
 	VerifySigBudget int
 	// keyFailures rate-limits the log lines of key failures (see
 	// verifyFailure).
-	keyFailures keyFailureLog
+	keyFailures KeyFailureLog
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
