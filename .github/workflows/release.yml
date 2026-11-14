@@ -1,8 +1,10 @@
 # Release binaries (issue #66): cross-compiles ./cmd/openstorage for
 # linux/darwin × amd64/arm64 (pure Go, CGO off), packages
 # openstorage_<version>_<os>_<arch>.tar.gz + checksums.txt, verifies the
-# native binary and bundled LICENSE on both a linux and a macOS runner, then uploads
-# everything as assets on the GitHub release for the tag.
+# native binary and bundled LICENSE on both a linux and a macOS runner, serves
+# a repository from the native darwin binary on the local store (create repo,
+# push, clone), then uploads everything as assets on the GitHub release for
+# the tag.
 #
 # Not tag/release-triggered on purpose: release-please creates tags with the
 # default GITHUB_TOKEN, and GITHUB_TOKEN-created events never trigger
@@ -86,10 +88,11 @@ jobs:
           if-no-files-found: error
 
   # The darwin binaries come from a linux cross-compile; prove the one
-  # matching this runner's architecture actually runs on macOS before
-  # anything lands on the release. (macos-latest is Apple Silicon today, so
-  # this exercises darwin/arm64, but resolve the arch at runtime instead of
-  # hard-asserting a mutable runner label.)
+  # matching this runner's architecture actually runs on macOS, and serves a
+  # repository from the SQLite local store, before anything lands on the
+  # release. (macos-latest is Apple Silicon today, so this exercises
+  # darwin/arm64, but resolve the arch at runtime instead of hard-asserting a
+  # mutable runner label.)
   verify-macos:
     needs: build
     runs-on: macos-latest
@@ -116,6 +119,58 @@ jobs:
           tar -xzf "openstorage_${TAG#v}_darwin_${arch}.tar.gz"
           cmp LICENSE ../LICENSE
           ./openstorage --version | grep -F "$TAG"
+      # The smoke lives in this workflow file, not in the tag's checkout, so a
+      # workflow_dispatch rebuild of an older tag runs the same smoke.
+      - name: Smoke the native darwin binary on the local store (create repo, push, clone)
+        run: |
+          set -euo pipefail
+          bin="$PWD/dist/openstorage"
+          work="$(mktemp -d "${RUNNER_TEMP}/os-smoke.XXXXXX")"
+          pid=""
+          cleanup() {
+            if [ -n "$pid" ]; then
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            fi
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          mkdir -p "$work/keys" "$work/data" "$work/home"
+          "$bin" keygen --out "$work/keys/org" >/dev/null
+          OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS="$work/keys/org.pub.pem" \
+            "$bin" serve --listen 127.0.0.1:0 --data-dir "$work/data" \
+            >"$work/serve.out" 2>"$work/serve.err" &
+          pid=$!
+          addr=""
+          for _ in $(seq 1 60); do
+            addr="$(sed -n 's/^listening on //p' "$work/serve.out" | head -n 1)"
+            [ -n "$addr" ] && break
+            kill -0 "$pid" 2>/dev/null || { echo "serve exited early" >&2; cat "$work/serve.err" >&2; exit 1; }
+            sleep 1
+          done
+          [ -n "$addr" ] || { echo "serve did not announce an address within 60 s" >&2; cat "$work/serve.err" >&2; exit 1; }
+          echo "serve listens on $addr"
+          mint() { "$bin" mint --key "$work/keys/org.pem" --iss selfhost --repo demo --scopes "$1"; }
+          create="$(mint repo:write)"
+          rw="$(mint git:read,git:write)"
+          code="$(curl -sS -o "$work/create.body" -w '%{http_code}' -X POST "http://$addr/api/v1/repos" \
+            -H "Authorization: Bearer $create" -H 'Content-Type: application/json' \
+            --data '{"default_branch":"main"}')"
+          [ "$code" = 201 ] || { echo "create repo: HTTP $code" >&2; cat "$work/create.body" >&2; exit 1; }
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 HOME="$work/home"
+          export GIT_AUTHOR_NAME=smoke GIT_AUTHOR_EMAIL=smoke@example.invalid
+          export GIT_COMMITTER_NAME=smoke GIT_COMMITTER_EMAIL=smoke@example.invalid
+          url="http://t:$rw@$addr/demo.git"
+          git -c advice.defaultBranchName=false clone -q "$url" "$work/one"
+          head -c 1000000 /dev/urandom >"$work/one/blob.bin"
+          echo hello >"$work/one/hello.txt"
+          git -C "$work/one" add hello.txt blob.bin
+          git -C "$work/one" commit -q -m smoke
+          git -C "$work/one" push -q origin HEAD:refs/heads/main
+          git clone -q "$url" "$work/two"
+          [ "$(git -C "$work/one" rev-parse HEAD)" = "$(git -C "$work/two" rev-parse HEAD)" ]
+          cmp "$work/one/blob.bin" "$work/two/blob.bin"
+          echo "local-store smoke passed: create repo, push, clone"
 
   publish:
     needs: [build, verify-macos]
