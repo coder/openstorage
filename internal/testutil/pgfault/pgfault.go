@@ -14,7 +14,8 @@ import (
 	"time"
 )
 
-// Fault is what the proxy does to the next COMMIT.
+// Fault is what the proxy does to the next COMMIT, or to the reply to one
+// named statement (DropStatementReply).
 type Fault int
 
 const (

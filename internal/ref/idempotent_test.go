@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -284,6 +286,36 @@ func TestIdempotentCASStatementCancelNeverRecovers(t *testing.T) {
 				t.Fatalf("CASRef = (%v, %v), want (false, a definitive context.Canceled)", won, err)
 			}
 		})
+	}
+}
+
+// TestIdempotentCASRandomCancelNeverFabricatesCreateWin: a create of the sha
+// that the ref already holds changes no row, so no cancellation, at any point
+// of the swap (acquire, begin, purge fence, statement or commit), may turn it
+// into a win. The cancellations come from timers at random delays around one
+// call's duration, so the run reaches every stage; the loop is not a
+// flake risk, because a correct store never reports a win here.
+func TestIdempotentCASRandomCancelNeverFabricatesCreateWin(t *testing.T) {
+	raw, _ := openTestSQLite(t)
+	seedRef(t, raw, "r1", "refs/heads/main", idemSHA2)
+	start := time.Now()
+	const calibration = 100
+	for range calibration {
+		if won, err := raw.CASRef(context.Background(), "r1", "refs/heads/main", ZeroSHA, idemSHA2); won || err != nil {
+			t.Fatalf("calibration CASRef = (%v, %v), want (false, nil)", won, err)
+		}
+	}
+	span := max(time.Since(start)/calibration*2, time.Microsecond)
+	st := IdempotentCAS{RefStore: raw}
+	for i := range 1000 {
+		ctx, cancel := context.WithCancel(context.Background())
+		timer := time.AfterFunc(rand.N(span), cancel)
+		won, err := st.CASRef(ctx, "r1", "refs/heads/main", ZeroSHA, idemSHA2)
+		timer.Stop()
+		cancel()
+		if won {
+			t.Fatalf("iteration %d: duplicate create reported a win (err %v)", i, err)
+		}
 	}
 }
 
