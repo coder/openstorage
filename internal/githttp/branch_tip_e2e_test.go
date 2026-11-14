@@ -153,6 +153,9 @@ func TestBranchTipThatIsNoCommitIsRefused(t *testing.T) {
 					if !strings.HasPrefix(report[c.ref], "ng") {
 						t.Fatalf("%s was not refused: report %v\nremote:\n%s", c.ref, report, remote)
 					}
+					if !strings.Contains(remote, c.ref+" must point at a commit") {
+						t.Fatalf("the pusher is not told why %s was refused:\n%s", c.ref, remote)
+					}
 				case c.ref == tc.landed:
 					if report[c.ref] != "ok" || refs[c.ref] != c2 {
 						t.Fatalf("%s did not land at %s: report %v, ref %s", c.ref, c2, report, refs[c.ref])
@@ -201,8 +204,8 @@ func TestBranchTipThatIsNoCommitIsRefused(t *testing.T) {
 
 	// The repository still answers reads: no refused tip reached the ref
 	// store, so hydration has nothing that git cannot write.
-	if got := lsRemoteSHA(t, work, remoteURL(nodeA, repo, token), "refs/heads/main"); got != c2 {
-		t.Fatalf("main = %q, want %q", got, c2)
+	if got, want := lsRemoteSHA(t, work, remoteURL(nodeA, repo, token), "refs/heads/main"), pgRefs(t, repo)["refs/heads/main"]; got != want {
+		t.Fatalf("main = %q, want %q", got, want)
 	}
 }
 
