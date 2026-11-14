@@ -519,6 +519,9 @@ func TestForkSourceKeyStoreFailure(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden || body["code"] != "authentication_unavailable" {
 			t.Fatalf("status %d body %v, want 403 authentication_unavailable", resp.StatusCode, body)
 		}
+		if raw, err := json.Marshal(body); err != nil || strings.Contains(string(raw), "canary-db") {
+			t.Fatalf("the answer holds the store's text (%v): %s", err, raw)
+		}
 		if _, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url); !errors.Is(err, meta.ErrNotFound) {
 			t.Fatalf("repo lookup after refused fork: err = %v, want ErrNotFound", err)
 		}

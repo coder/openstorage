@@ -119,6 +119,9 @@ type Server struct {
 	// (issue #59, verifystate.go); <= 0 disables the budget. Set by the
 	// serve wiring.
 	VerifySigBudget int
+	// keyFailures rate-limits the log lines of key store failures (see
+	// verifyFailure).
+	keyFailures keyFailureLog
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
@@ -567,7 +570,7 @@ func (s *Server) verifyClaims(ctx context.Context, token, repo, scope string) (*
 	assertf(s.Verifier != nil && s.Org != "", "Server used without Verifier/Org")
 	claims, err := s.Verifier.Verify(ctx, token)
 	if err != nil {
-		return nil, http.StatusUnauthorized, err
+		return nil, http.StatusUnauthorized, s.verifyFailure(ctx, err)
 	}
 	// A signature valid for some *other* registered org must not grant
 	// access to this org's repos.
