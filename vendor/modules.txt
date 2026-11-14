@@ -1,4 +1,4 @@
-# cloud.google.com/go/auth v0.24.3
+# cloud.google.com/go/auth v0.24.4
 ## explicit; go 1.26.0
 # dario.cat/mergo v1.0.2
 ## explicit; go 1.13
@@ -228,8 +228,8 @@ github.com/go-logr/stdr
 ## explicit; go 1.12
 github.com/go-ole/go-ole
 github.com/go-ole/go-ole/oleutil
-# github.com/goccy/go-json v0.10.6
-## explicit; go 1.19
+# github.com/goccy/go-json v0.11.2
+## explicit; go 1.23
 github.com/goccy/go-json
 github.com/goccy/go-json/internal/decoder
 github.com/goccy/go-json/internal/encoder
@@ -276,13 +276,14 @@ github.com/jackc/pgx/v5/pgxpool
 ## explicit; go 1.19
 github.com/jackc/puddle/v2
 github.com/jackc/puddle/v2/internal/genstack
-# github.com/klauspost/compress v1.20.2
+# github.com/klauspost/compress v1.20.3
 ## explicit; go 1.25
 github.com/klauspost/compress
 github.com/klauspost/compress/fse
 github.com/klauspost/compress/huff0
 github.com/klauspost/compress/internal/cpuinfo
 github.com/klauspost/compress/internal/le
+github.com/klauspost/compress/internal/regmask
 github.com/klauspost/compress/internal/snapref
 github.com/klauspost/compress/zstd
 github.com/klauspost/compress/zstd/internal/xxhash
@@ -509,8 +510,6 @@ github.com/shirou/gopsutil/v4/process
 ## explicit; go 1.23
 github.com/sirupsen/logrus
 github.com/sirupsen/logrus/hooks/slog
-# github.com/spiffe/go-spiffe/v2 v2.9.0
-## explicit; go 1.24.0
 # github.com/stretchr/testify v1.12.1
 ## explicit; go 1.17
 github.com/stretchr/testify/assert
@@ -623,7 +622,7 @@ go.opentelemetry.io/otel/trace/noop
 # go.yaml.in/yaml/v3 v3.0.5
 ## explicit; go 1.16
 go.yaml.in/yaml/v3
-# gocloud.dev v0.47.0
+# gocloud.dev v0.49.0
 ## explicit; go 1.26.0
 gocloud.dev/aws
 gocloud.dev/blob
@@ -687,7 +686,7 @@ golang.org/x/text/width
 ## explicit; go 1.18
 golang.org/x/xerrors
 golang.org/x/xerrors/internal
-# google.golang.org/api v0.311.0
+# google.golang.org/api v0.315.0
 ## explicit; go 1.26.0
 google.golang.org/api/googleapi
 google.golang.org/api/internal/third_party/uritemplates
