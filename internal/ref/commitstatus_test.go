@@ -140,3 +140,49 @@ func TestPGCASResolvesFailedCommit(t *testing.T) {
 		})
 	}
 }
+
+// TestPGCASLostStatementReply: the reply to the swap statement is lost. The
+// statement ran inside the CAS transaction and no COMMIT was sent, so it
+// cannot have committed: PostgreSQL rolls the transaction back when the
+// connection closes. The error is not executed, so IdempotentCAS never
+// reports a win for a swap whose target the ref already holds. A recovered
+// win would emit a push event for a transition this call never committed.
+func TestPGCASLostStatementReply(t *testing.T) {
+	s := pgTestStore(t)
+	ctx := context.Background()
+	const name = "refs/heads/main"
+	a := testSHA(1)
+	for _, tc := range []struct {
+		name   string
+		marker string // the swap statement's text
+		old    string
+	}{
+		{"duplicate-create", "INSERT INTO refs", ZeroSHA},
+		{"stale-update-to-current", "UPDATE refs SET sha", testSHA(3)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := fmt.Sprintf("stmtloss-%s-%d", tc.name, time.Now().UnixNano())
+			if won, err := s.CASRef(ctx, repo, name, ZeroSHA, a); err != nil || !won {
+				t.Fatalf("seed: won=%v err=%v", won, err)
+			}
+			proxy, url := pgfault.Start(t, pgTestURL)
+			ps, err := OpenPG(ctx, url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ps.Close)
+			proxy.ArmStatement(tc.marker, nil)
+			won, err := IdempotentCAS{RefStore: ps}.CASRef(ctx, repo, name, tc.old, a)
+			if !proxy.Fired() {
+				t.Fatal("the statement fault never fired")
+			}
+			var notExec notExecutedError
+			if won || err == nil || !errors.As(err, &notExec) || ambiguousError(err) {
+				t.Fatalf("won=%v err=%v, want no win and a not-executed error", won, err)
+			}
+			if got, err := s.GetRef(ctx, repo, name); err != nil || got != a {
+				t.Fatalf("ref = %q (err %v), want %s", got, err, a)
+			}
+		})
+	}
+}

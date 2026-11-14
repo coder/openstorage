@@ -149,8 +149,13 @@ func (s IdempotentCAS) reconcileLoss(ctx context.Context, repo, name, old, new s
 // Everything else — connection drops, unexpected EOFs, context
 // cancellation mid-flight after the request was sent — is ambiguous: the
 // statement may have committed with the result lost on the way back. So is
-// a COMMIT error marked commitUnknown, whatever pgx's own tag says.
+// a COMMIT error marked commitUnknown, whatever pgx's own tag says. An error
+// marked notExecuted (see below) is definitive before anything else: it
+// wins over a wrapped SQLSTATE 40003 or 08007.
 func ambiguousError(err error) bool {
+	if _, ok := errors.AsType[notExecutedError](err); ok {
+		return false // provably took no effect, whatever SQLSTATE it wraps
+	}
 	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		// These SQLSTATEs are the backend SAYING the outcome is unknown:
 		// the statement/transaction may have committed.

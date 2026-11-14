@@ -327,9 +327,10 @@ func (s *SQLite) GetRef(ctx context.Context, repo, name string) (string, error) 
 // explicit BEGIN IMMEDIATE transaction whose only other work — the purge-
 // fence read below — happens strictly BEFORE it, so the statement remains
 // the single mutation unit and the IdempotentCAS ambiguity classification
-// (idempotent.go) is unchanged: pre-statement failures are tagged
-// notExecuted, and a lost COMMIT stays ambiguous (recovered by the
-// recheck). A won swap also bumps the repo generation via the
+// (idempotent.go) is unchanged: pre-statement and statement failures are
+// tagged notExecuted, and so is a failed COMMIT of a swap that changed no
+// row, while a failed COMMIT of a swap that changed a row stays ambiguous
+// (recovered by the recheck). A won swap also bumps the repo generation via the
 // InitSchema-installed triggers inside the same transaction.
 //
 // The transaction rejects purge-fenced repos with ErrRepoPurged (issue
@@ -371,9 +372,9 @@ func (s *SQLite) casRef(ctx context.Context, repo, name, old, new string, wantGe
 	defer func() { _ = conn.Close() }()
 	// Pre-dispatch guard: a context canceled after acquire but before
 	// ExecContext dispatches the statement is definitive non-execution too.
-	// (The residual race — cancellation landing during driver execution —
-	// surfaces as a *sqlite.Error interrupt, which the ambiguity classifier
-	// already treats as a definitive backend rejection.)
+	// (The residual race — cancellation landing before the statement runs —
+	// ends the statement with a plain context error, which the statement
+	// error below marks notExecuted like every other error of the statement.)
 	if cerr := ctx.Err(); cerr != nil {
 		return false, 0, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
@@ -437,7 +438,12 @@ func (s *SQLite) casRef(ctx context.Context, repo, name, old, new string, wantGe
 		tag = "fenced update"
 	}
 	if err != nil {
-		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+		// The statement ran inside the transaction and no COMMIT was sent,
+		// so it cannot have committed, whatever the error says (the
+		// deferred Rollback ends the transaction). Marked so that
+		// IdempotentCAS never recovers it into a win: a context error is not
+		// a *sqlite.Error, so it would otherwise read as ambiguous.
+		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, notExecuted(err))
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
@@ -456,10 +462,17 @@ func (s *SQLite) casRef(ctx context.Context, repo, name, old, new string, wantGe
 			return false, 0, fmt.Errorf("cas %s %s/%s: generation read: %w", tag, repo, name, notExecuted(gerr))
 		}
 	}
-	// A commit failure is NOT notExecuted: the response may have been
-	// lost after the backend committed — exactly the ambiguity class the
-	// IdempotentCAS recovery recheck exists for.
+	// A commit failure of a swap that changed a row is NOT notExecuted: the
+	// commit may have landed with its result lost — exactly the ambiguity
+	// class the IdempotentCAS recovery recheck exists for. A swap that
+	// changed no row wrote nothing, so its commit failure (a context that
+	// ended after the statement fails Commit with a plain context error, or
+	// ErrTxDone) is definitive: recovering it would report a win for a
+	// create of the sha that the ref already holds.
 	if err := tx.Commit(); err != nil {
+		if n == 0 {
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, notExecuted(err))
+		}
 		return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
 	}
 	return n == 1, gen, nil

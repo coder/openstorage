@@ -926,8 +926,8 @@ func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 // explicit transaction whose only other work happens strictly BEFORE it
 // (the base-ledger lock and the purge-fence read below), so the statement
 // remains the single mutation unit and the IdempotentCAS ambiguity
-// classification (idempotent.go) is unchanged: pre-statement failures are
-// tagged notExecuted, and statement failures classify exactly as before. A
+// classification (idempotent.go) is unchanged: pre-statement failures and
+// statement failures are tagged notExecuted (no COMMIT was sent). A
 // COMMIT error of a swap that changed a row is resolved with txid_status
 // (see commitStatus): committed is a win, aborted is definitive, and an
 // outcome PostgreSQL cannot confirm is ambiguous (recovered by the
@@ -1042,7 +1042,11 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 		ct, err, tag = c, cerr, "fenced update"
 	}
 	if err != nil {
-		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+		// The statement ran inside the transaction and no COMMIT was sent,
+		// so it cannot have committed, whatever the error says: a reply lost
+		// here closes the connection and PostgreSQL rolls the transaction
+		// back. Marked so that IdempotentCAS never recovers it into a win.
+		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, notExecuted(err))
 	}
 	n := ct.RowsAffected()
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
