@@ -26,6 +26,21 @@ func assertf(cond bool, format string, args ...any) {
 const (
 	// pgUniqueViolation is SQLSTATE 23505.
 	pgUniqueViolation = "23505"
+	// pgLockNotAvailable is SQLSTATE 55P03, which a lock_timeout raises.
+	pgLockNotAvailable = "55P03"
+	// initSchemaLockWait bounds every lock wait of InitSchema after its
+	// advisory lock (issue #609). It stays well below deadlock_timeout (1s by
+	// default), so a wait cycle that crosses two tables ends with the boot's
+	// timeout before PostgreSQL's detector runs. A cycle inside one table
+	// never reaches the timeout: PostgreSQL aborts the writer as soon as it
+	// joins the queue, which is why the boot takes ACCESS EXCLUSIVE on repos
+	// first.
+	initSchemaLockWait = 250 * time.Millisecond
+	// initSchemaAttempts and initSchemaRetryDelay bound the retries of a
+	// boot that timed out on a lock: about 70 seconds in all, then
+	// InitSchema returns the lock error.
+	initSchemaAttempts   = 200
+	initSchemaRetryDelay = 100 * time.Millisecond
 	// repoURLConstraint is the named UNIQUE(org_id, url) constraint; it spans
 	// soft-deleted rows on purpose (docs/explanation/domain-model.md: re-create of a soft-deleted url
 	// must 409).
@@ -63,9 +78,59 @@ func (s *PG) Close() { s.pool.Close() }
 // InitSchema creates the metadata tables (idempotent). The advisory lock
 // serializes concurrent node startups: two racing CREATE TABLE IF NOT EXISTS
 // can fail with a duplicate pg_type key error (same pattern as internal/ref).
+//
+// The DDL takes ACCESS EXCLUSIVE locks, and writers lock tables in more than
+// one order: an older replica's PATCH holds repos and then reaches
+// repo_upstreams through the default-branch trigger (issue #609), adoption
+// and the create completion lock a repos row FOR UPDATE first, and
+// SetRepoUpstream inserts into repo_upstreams before it locks a repos row.
+// No fixed lock order for the boot suits all of them. So the boot takes
+// ACCESS EXCLUSIVE on repos before any weaker lock on it: a boot that held
+// the SHARE lock of CREATE INDEX on repos while it waited for the ACCESS
+// EXCLUSIVE lock of ALTER TABLE repos would make a writer that holds a repos
+// row FOR UPDATE and then updates repos the deadlock victim at once. And
+// after the advisory lock the boot waits at most initSchemaLockWait for any
+// lock, so a cycle that crosses two tables ends with the boot's timeout: it
+// rolls back, which releases everything it held, and starts again. Sustained
+// writes can keep a boot waiting; after initSchemaAttempts it fails with the
+// lock error.
 func (s *PG) InitSchema(ctx context.Context) error {
+	var err error
+	for attempt := 1; attempt <= initSchemaAttempts; attempt++ {
+		err = s.initSchemaOnce(ctx)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != pgLockNotAvailable {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(initSchemaRetryDelay):
+		}
+	}
+	return fmt.Errorf("init schema: a table lock stayed busy for %d attempts: %w", initSchemaAttempts, err)
+}
+
+func (s *PG) initSchemaOnce(ctx context.Context) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x4D455441)`); err != nil { // "META"
+			return err
+		}
+		// Bound every wait from here on (see InitSchema). The wait on the
+		// advisory lock above holds no table, so it needs no bound.
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = '%dms'`, initSchemaLockWait.Milliseconds())); err != nil {
+			return err
+		}
+		// Take repos at its strongest mode before any weaker lock on it. The
+		// boot then holds nothing on repos while it waits, so a writer's
+		// request for a stronger lock on repos queues ahead of the boot, and
+		// a boot that waits too long times out instead of deadlocking. A
+		// fresh database has no repos table and no writer yet. The other
+		// tables the DDL locks get their ACCESS EXCLUSIVE lock as their first
+		// lock, or never a stronger one than SHARE.
+		if _, err := tx.Exec(ctx, `DO $lk$ BEGIN
+			IF to_regclass('repos') IS NOT NULL THEN LOCK TABLE repos IN ACCESS EXCLUSIVE MODE; END IF;
+		END $lk$`); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `
@@ -186,6 +251,29 @@ ALTER TABLE repos ADD COLUMN IF NOT EXISTS create_state integer NOT NULL DEFAULT
 DROP INDEX IF EXISTS repos_deleted_idx;
 CREATE INDEX IF NOT EXISTS repos_purgeable_idx
     ON repos (deleted_at, repo_id) WHERE deleted_at IS NOT NULL AND purged_at IS NULL;
+-- Any write to repos.default_branch ends the wait for adoption (issue
+-- #609). The clear lives in a trigger, not only in Go: during a rolling
+-- upgrade a replica from before this rule still commits a plain UPDATE, and
+-- its PATCH to "main" changes nothing the adopt write could see (adoption
+-- requires default_branch = 'main'). An UPDATE OF trigger fires when the SET
+-- list names the column, even for an unchanged value. The catalog check
+-- installs it once, so a steady-state boot takes no lock on repos for it
+-- (DROP TRIGGER would take ACCESS EXCLUSIVE on every boot).
+CREATE OR REPLACE FUNCTION clear_default_branch_omitted() RETURNS trigger LANGUAGE plpgsql AS $clear$
+BEGIN
+    UPDATE repo_upstreams SET default_branch_omitted = false
+    WHERE repo_id = NEW.repo_id AND default_branch_omitted;
+    RETURN NULL;
+END $clear$;
+DO $install$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger
+                   WHERE tgname = 'repos_clear_default_branch_omitted' AND tgrelid = 'repos'::regclass) THEN
+        CREATE TRIGGER repos_clear_default_branch_omitted
+            AFTER UPDATE OF default_branch ON repos
+            FOR EACH ROW EXECUTE FUNCTION clear_default_branch_omitted();
+    END IF;
+END $install$;
 `)
 		return err
 	})
