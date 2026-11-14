@@ -319,6 +319,50 @@ func TestIdempotentCASRandomCancelNeverFabricatesCreateWin(t *testing.T) {
 	}
 }
 
+// TestSQLiteCASErrorIsDefinitiveAndTrue: a SQLite CAS that fails, at any
+// stage, committed nothing, and its error is definitive, so IdempotentCAS
+// never recovers it into a win. Creates of new refs are cancelled by timers
+// at random delays around one call's duration, so the run reaches every
+// stage, the COMMIT included (a swap that changed a row). When the store
+// returns an error, the ref must be absent and the error must not be
+// ambiguous. A recovered win would need a second writer of the same sha, so
+// the loop checks the premise (nothing committed) instead of racing one.
+func TestSQLiteCASErrorIsDefinitiveAndTrue(t *testing.T) {
+	raw, _ := openTestSQLite(t)
+	start := time.Now()
+	const calibration = 100
+	for i := range calibration {
+		if won, err := raw.CASRef(context.Background(), "cal", fmt.Sprintf("refs/heads/c%d", i), ZeroSHA, idemSHA1); !won || err != nil {
+			t.Fatalf("calibration CASRef = (%v, %v), want (true, nil)", won, err)
+		}
+	}
+	span := max(time.Since(start)/calibration*2, time.Microsecond)
+	errs := 0
+	for i := range 1500 {
+		name := fmt.Sprintf("refs/heads/b%d", i)
+		ctx, cancel := context.WithCancel(context.Background())
+		timer := time.AfterFunc(rand.N(span), cancel)
+		won, err := raw.CASRef(ctx, "r1", name, ZeroSHA, idemSHA1)
+		timer.Stop()
+		cancel()
+		cur, gerr := raw.GetRef(context.Background(), "r1", name)
+		switch {
+		case errors.Is(gerr, ErrNotFound):
+			cur = ZeroSHA
+		case gerr != nil:
+			t.Fatalf("iteration %d: GetRef: %v", i, gerr)
+		}
+		switch {
+		case err == nil && won && cur == idemSHA1:
+		case err != nil && !won && cur == ZeroSHA && !ambiguousError(err):
+			errs++
+		default:
+			t.Fatalf("iteration %d: CASRef = (%v, %v) with the ref at %q, want a win with the ref created, or a definitive error with no ref", i, won, err, cur)
+		}
+	}
+	t.Logf("%d of 1500 creates were cancelled into a definitive error", errs)
+}
+
 // TestIdempotentCASCleanCreateLossIsAuthoritative pins the create decision:
 // a clean create loss (won=false, err=nil) affirmatively wrote nothing, so
 // it stays a conflict even when the existing ref holds the target sha —
