@@ -719,8 +719,9 @@ func first(keys []string) string {
 
 // surfaceMemberContiguity pins the §2.9 contiguity lemma on real listings:
 // extension-free member keys `<base>` and `<base>+<suffix>` stay contiguous
-// because '+' (0x2B) sorts below '-' (0x2D) and the whole repo-ID alphabet
-// [0-9a-z-].
+// because '+' (0x2B) sorts below every byte a base ID can hold. The test keys
+// put '-' (0x2D) and '0' (0x30) next to the boundary. Production IDs are
+// `repo_<12 hex>`.
 func surfaceMemberContiguity(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
 	ctx := context.Background()
