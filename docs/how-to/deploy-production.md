@@ -303,25 +303,43 @@ Unable to create '<path>.lock': File name too long`. A REST request that hydrate
 repository logs the same git error under `materialize repository`, without the repo
 ID. Rebuilding the cache does not help, because the ref is in the ref store. No API
 route, push or sync deletes a notes ref: `DELETE /repos/notes` removes one note, not the
-ref. Remove the ref from the ref store with
+ref.
+
+A branch whose tip is not a commit wedges a repository the same way. Before the update
+hook refused such a push, a token with `git:write` could push a branch at a blob, a tree
+or an annotated tag. git refuses to write a non-commit under `refs/heads/`, so the ref
+store holds a value that no cache can take. The git read logs the `hydrate <repo ID>:
+update-ref --stdin: exit status 128` line, and the git error in it holds `trying to write
+non-commit object <sha> to branch '<ref>'`. Rebuilding the cache does not help here either.
+
+Remove either kind of ref from the ref store with
 [`openstorage repair-refs`](../reference/cli.md#openstorage-repair-refs):
 
 1. Find the repo ID in the log: it is the text after `hydrate`, without the colon that
    follows it. The ID is also in the cache path of the error, `<cache dir>/<repo ID>.git`,
    so a REST request's `materialize repository` line shows it. To get the `hydrate`
    line, run `git ls-remote` on the repository with a token that has `git:read`.
-2. List the refs, with the same database URL (or `--data-dir`) as `serve`:
-   `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints the
-   repository's URL, the number of refs that it scanned, and each ref that git can never
-   lock, with its SHA. A ref
+2. List the refs, with the same database URL and blob store URL (or `--data-dir`) as
+   `serve`: `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints the
+   repository's URL, the number of refs that it scanned, each ref that git can never
+   lock, and each branch whose tip is not a commit, with its SHA and, for a branch, the
+   object type. A ref
    is on the list when any part of its name is over 255 bytes, or its last part is over
-   250 bytes. A ref that git can lock is never on the list.
+   250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
+   The command reads that type from the repository's packs: it downloads them into a
+   temporary directory under `$TMPDIR` and removes the directory when it ends, so run it
+   where `$TMPDIR` has room for the packs. A ref that git can lock is on the list only as a
+   branch whose tip is not a commit. A branch at a commit and a tag at a blob stay off it.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
    and exits with an error. Run it again to list what is left. The command keeps a ref
    that is the repository's default branch, as `DELETE /repos/branches` does: the list
-   marks it. Set another default branch with `PATCH /repo`, then run the command again.
+   marks it. Set another default branch with `PATCH /repo`, then run the command again. The
+   command never deletes a branch whose tip object the packs do not hold: the list shows it
+   as missing, and the command exits with an error after it deleted the rest. That branch
+   still wedges the repository, so find the pack first (`openstorage list-packs --repo <repo ID>`,
+   with the same `--data-dir` or URLs as `serve`).
 4. Run the dry run once more. It must list no ref. An ID with no repository, and a
    database URL or `--data-dir` that is not the one `serve` uses, are errors. A scan of
    0 refs means that the repository has no refs. The next clone or fetch hydrates the
@@ -332,7 +350,8 @@ replicas can keep running. It changes the ref store only: it sends no push webho
 no sync poke. It also lists a branch or tag with such a name. Delete a branch or tag
 over REST (`DELETE /repos/branches`, `DELETE /repos/tags`) when you want its push
 webhook. With `--yes` the command lists the refs again and deletes what it finds, so a
-ref that appeared after your dry run goes too.
+ref that appeared after your dry run goes too. It deletes refs only: the objects and
+packs of a deleted branch stay.
 
 ## Concurrent boot: schema setup and migrations
 
@@ -602,6 +621,13 @@ create a ref that git can never lock, and that ref fails every hydration of its
 repository. Repair after the roll, not during it: when the last replica runs the new
 build, follow [Refs that git can never lock](#refs-that-git-can-never-lock) for each
 repository whose hydration logs `File name too long`.
+
+**A replica on v0.20.0, or on a build of `main` from before the update hook refused a
+branch at a blob, a tree or an annotated tag, still stores the value of such a push.** The
+pusher reads `ng`, but the ref store has taken the value by then. Later builds refuse it
+per ref before the ref store takes it. Until the last replica runs a later build, a token
+with `git:write` can wedge a repository this way. Repair after the roll: follow the same section for each
+repository whose hydration logs `trying to write non-commit object`.
 
 ## JWT keys across the fleet
 
