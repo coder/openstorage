@@ -328,8 +328,8 @@ Remove either kind of ref from the ref store with
    250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
    The command reads that type from the repository's packs: it downloads them into a
    temporary directory under `$TMPDIR` and removes the directory when it ends, so run it
-   where `$TMPDIR` has room for the packs. A ref that git can lock and whose tip is a commit
-   is never on the list, and neither is a ref outside `refs/heads/`, a tag at a blob for example.
+   where `$TMPDIR` has room for the packs. A ref that git can lock is on the list only as a
+   branch whose tip is not a commit. A branch at a commit and a tag at a blob stay off it.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
@@ -623,9 +623,10 @@ build, follow [Refs that git can never lock](#refs-that-git-can-never-lock) for 
 repository whose hydration logs `File name too long`.
 
 **A replica on v0.20.0, or on a build of `main` from before the update hook refused a
-branch at a blob, a tree or an annotated tag, still accepts such a push.** Later builds
-refuse it per ref. Until the last replica runs a later build, a token with `git:write` can
-wedge a repository this way. Repair after the roll: follow the same section for each
+branch at a blob, a tree or an annotated tag, still stores the value of such a push.** The
+pusher reads `ng`, but the ref store has taken the value by then. Later builds refuse it
+per ref before the ref store takes it. Until the last replica runs a later build, a token
+with `git:write` can wedge a repository this way. Repair after the roll: follow the same section for each
 repository whose hydration logs `trying to write non-commit object`.
 
 ## JWT keys across the fleet

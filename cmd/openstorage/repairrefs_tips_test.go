@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -406,6 +407,15 @@ func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 		t.Fatalf("temporary directory after a run: %v, %v", entries, err)
 	}
 
+	// A blob URL that cannot be opened is an error, not a panic.
+	for _, url := range []string{"s3://", "file:///nonexistent/dir/of/no/store"} {
+		bad := &packTipKinds{rs: rs, repoID: repo, blobURL: url}
+		if _, err := bad.kinds(t.Context(), []string{f.commit}); err == nil || !strings.Contains(err.Error(), "open blob store") {
+			t.Fatalf("blob URL %q: kinds = %v, want an open error", url, err)
+		}
+		bad.close()
+	}
+
 	// An error while the packs are staged.
 	tips := &packTipKinds{rs: rs, repoID: repo, blobURL: "file://" + filepath.Join(t.TempDir(), "no", "such", "store") + ""}
 	if _, err := tips.kinds(t.Context(), []string{f.commit}); err == nil {
@@ -415,8 +425,9 @@ func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 		t.Fatalf("temporary directory after an error: %v, %v", entries, err)
 	}
 
-	// The context ends while git initializes the temporary repository. The
-	// fake git parks there, and passes every other call to the real one.
+	// The run ends while git initializes the temporary repository, by a
+	// canceled context or by a signal. The fake git parks there, and passes
+	// every other call to the real one.
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
@@ -427,28 +438,46 @@ func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	args := []string{"--data-dir", dir, repo}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- runRepairRefs(ctx, []string{"--data-dir", dir, repo}, &bytes.Buffer{}) }()
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if _, err := os.Stat(parked); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the command never reached git init")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 1 {
-		t.Fatalf("temporary directory while git runs: %v, %v", entries, err)
-	}
-	cancel()
-	if err := <-done; err == nil {
-		t.Fatal("the interrupted command returned no error")
-	}
-	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
-		t.Fatalf("temporary directory after the interrupt: %v, %v", entries, err)
+	for name, run := range map[string]struct {
+		start func() error
+		end   func()
+	}{
+		"canceled context": {func() error { return runRepairRefs(ctx, args, &bytes.Buffer{}) }, cancel},
+		"SIGINT":           {func() error { return cmdRepairRefs(t.Context(), args) }, func() { _ = syscall.Kill(os.Getpid(), syscall.SIGINT) }},
+		"SIGTERM":          {func() error { return cmdRepairRefs(t.Context(), args) }, func() { _ = syscall.Kill(os.Getpid(), syscall.SIGTERM) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_ = os.Remove(parked)
+			done := make(chan error, 1)
+			go func() { done <- run.start() }()
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				if _, err := os.Stat(parked); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the command never reached git init")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 1 {
+				t.Fatalf("temporary directory while git runs: %v, %v", entries, err)
+			}
+			run.end()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("the interrupted command returned %v, want the canceled context", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the interrupted command did not stop")
+			}
+			if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+				t.Fatalf("temporary directory after the interrupt: %v, %v", entries, err)
+			}
+		})
 	}
 }

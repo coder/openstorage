@@ -390,6 +390,9 @@ func (p *packTipKinds) kinds(ctx context.Context, ids []string) (map[string]stri
 	assertf(len(ids) > 0, "packTipKinds: no ids")
 	if p.repoPath == "" {
 		if err := p.stage(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr // not the text of a git that was killed
+			}
 			return nil, err
 		}
 	}
@@ -406,9 +409,13 @@ func (p *packTipKinds) stage(ctx context.Context) (err error) {
 			p.close()
 		}
 	}()
-	if p.blobs, err = blob.Open(ctx, p.blobURL); err != nil {
+	// Not p.blobs = blob.Open(...): on an error Open returns a typed nil
+	// inside the interface, and close would call Close on it.
+	blobs, err := blob.Open(ctx, p.blobURL)
+	if err != nil {
 		return fmt.Errorf("open blob store: %w", err)
 	}
+	p.blobs = blobs
 	if p.dir, err = os.MkdirTemp("", "openstorage-repair-refs-"); err != nil {
 		return err
 	}
@@ -451,7 +458,10 @@ func readObjectKinds(ctx context.Context, repoPath string, ids []string) (map[st
 	if err != nil {
 		return nil, err
 	}
-	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	var lines []string
+	if out != "" {
+		lines = strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	}
 	if len(lines) != len(ids) {
 		return nil, fmt.Errorf("cat-file --batch-check answered %d lines for %d ids", len(lines), len(ids))
 	}
