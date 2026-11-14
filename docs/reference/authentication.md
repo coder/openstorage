@@ -35,6 +35,10 @@ A token is a compact JWS: three segments (header, payload, signature) separated 
   or `/`, no spaces or line breaks, and unused trailing bits set to zero. Any other
   spelling fails verification (see [Failure mapping](#failure-mapping)), even when it
   decodes to the same bytes.
+- The decoded header must be exactly one JSON object. Anything after the object except
+  JSON whitespace, such as a second JSON value or stray characters, fails verification
+  (`malformed jwt`), even when the signature covers the object alone. Standard JWT
+  libraries emit one object.
 - The rule applies to the token itself. The HTTP API trims spaces around the
   `Authorization` value; the Git Basic-auth password is checked as sent.
 - Standard JWT libraries emit this form, including the ones the SDKs use (`jose`, PyJWT,

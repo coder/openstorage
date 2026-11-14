@@ -89,23 +89,38 @@ func checkCanonicalSegments(token string) error {
 // LFS transports answer with the text of the verifier's error.
 var errCritNotSupported = errors.New("jwt crit header is not supported")
 
-// hasCritMember reports whether the protected header of a compact token has
-// a `crit` member of any value. It reads the header text, because jwx drops a
-// null member and keeps only the last of two members with one name. A header
-// that does not decode as a JSON object has none here: jws.Parse refuses it,
-// and it uses encoding/json too (its goccy decoder needs a build tag).
-func hasCritMember(token string) bool {
+// errHeaderNotOneObject is the cause of a MalformedError for a protected
+// header that is not exactly one JSON object.
+var errHeaderNotOneObject = errors.New("protected header is not one JSON object")
+
+// checkHeader requires the decoded protected header of a compact token to be
+// exactly one JSON object, with at most whitespace around it, and refuses a
+// `crit` member (RFC 7515 §4.1.11). It does so on the text of the whole
+// header. jwx decodes only the first JSON value of the header, ignores any
+// bytes after it, and drops a null `crit` member and all but the last of two
+// members with one name, so a check on its parsed header misses a `crit` that
+// this check sees. A client reads the answer, so both texts are fixed. The
+// check is not jws.WithCritValidation(true): the key loop in Verify drops
+// that error, and a token that a registered key signed would read "signature
+// verification failed". The caller has checked that the segments are
+// canonical base64url.
+func checkHeader(token string) error {
 	seg, _, _ := strings.Cut(token, ".")
 	raw, err := strictRawURL.DecodeString(seg)
 	if err != nil {
-		return false
+		return &MalformedError{What: "jwt", Err: err}
+	}
+	if !json.Valid(raw) {
+		return &MalformedError{What: "jwt", Err: errHeaderNotOneObject}
 	}
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &members); err != nil {
-		return false
+	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+		return &MalformedError{What: "jwt", Err: errHeaderNotOneObject}
 	}
-	_, has := members[jws.CriticalKey]
-	return has
+	if _, has := members[jws.CriticalKey]; has {
+		return errCritNotSupported
+	}
+	return nil
 }
 
 // KeySource resolves an org's registered PEM public key blocks by org name
@@ -215,14 +230,10 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	if err := checkCanonicalSegments(token); err != nil {
 		return nil, err
 	}
-	// RFC 7515 §4.1.11: refuse a token whose `crit` header names an extension
-	// that this server does not understand. It understands none, so any `crit`
-	// member is refused, whatever its value, and before jws.Parse, which
-	// rejects some values. jws.WithCritValidation(true) does not fit: the key
-	// loop below drops its error, so a token that a registered key signed
-	// would read "signature verification failed".
-	if hasCritMember(token) {
-		return nil, errCritNotSupported
+	// Before jws.Parse: jwx reads only the first JSON value of the header,
+	// and rejects some `crit` values with its own text.
+	if err := checkHeader(token); err != nil {
+		return nil, err
 	}
 	msg, err := jws.Parse([]byte(token))
 	if err != nil {
