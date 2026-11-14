@@ -286,12 +286,15 @@ a commit or lives outside `refs/heads/`: a tag at a blob is healthy.
 For each branch (a ref under `refs/heads/`), the command also reads the object type of
 the tip. It reads the type from the repository's packs in the blob store, and never from
 git's error text. The first read downloads the registered packs into a temporary
-directory under `$TMPDIR`, so `$TMPDIR` needs room for them, and the command removes the
-directory when it ends. A repository with no branch needs no blob store. A branch is on
-the list when its tip is a blob, a tree or an annotated tag, even a tag of a commit: git
-refuses all three. The objects and packs stay, and a later push can use them. The command
-reads the packs once, as of the start of the run: a push that lands during the run adds
-objects that the run does not see.
+directory under `$TMPDIR`, so `$TMPDIR` needs room for them. The command removes the
+directory as soon as it has read the tips, before it prints the list, and also after an
+error, SIGINT, SIGTERM or SIGHUP. A run that `nohup` started ignores SIGHUP. After SIGKILL
+or SIGQUIT, delete the `openstorage-repair-refs-*` directory under `$TMPDIR` by hand. A
+repository with no branch needs no blob store. A branch is on the list when its tip is a
+blob, a tree or an annotated tag, even a tag of a commit: git refuses all three. The
+objects and packs stay, and a later push can use them. The command reads the packs once,
+as of the start of the run: a push that lands during the run adds objects that the run does
+not see.
 
 ```sh
 openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
@@ -329,10 +332,11 @@ prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with a
 after the other refs. Run the command again to list what is left. Put the flags before
 `<repo-id>`: a flag after it is an error.
 
-A branch whose tip object the packs do not hold is never deleted. The list shows it under
-`branches whose tip object is missing (<n>), never deleted:`, and with `--yes` the command
-deletes the other refs and then exits with an error. Git cannot write that branch either,
-so the repository stays wedged. The object can be in a pack that the registry lost or that
+A branch whose tip object the packs do not hold is never deleted, unless git can never
+lock its name: the name rule comes first, and it needs no object. The list shows a kept
+branch under `branches whose tip object is missing (<n>), never deleted:`, and with `--yes`
+the command deletes the other refs and then exits with an error. Git cannot write a kept
+branch either, so the repository stays wedged. The object can be in a pack that the registry lost or that
 a repack replaced: check the packs with [`openstorage list-packs`](#openstorage-list-packs)
 before you do anything else. A blob URL that the command cannot open, a type that it does
 not know, and a read that fails are errors, and the command deletes nothing on any of them.
