@@ -49,6 +49,8 @@ func TestVerify_RefusesCritHeader(t *testing.T) {
 		"null":                          `{"alg":"EdDSA","typ":"JWT","crit":null}`,
 		"a later null hides the list":   `{"alg":"EdDSA","typ":"JWT","crit":["x-ext"],"x-ext":true,"crit":null}`,
 		"an escaped name":               `{"alg":"EdDSA","typ":"JWT","cr\u0069t":["x-ext"],"x-ext":true}`,
+		"a number":                      `{"alg":"EdDSA","typ":"JWT","crit":1}`,
+		"an object":                     `{"alg":"EdDSA","typ":"JWT","crit":{}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			token := signRawHeader(t, key, header, validClaims("acme"))

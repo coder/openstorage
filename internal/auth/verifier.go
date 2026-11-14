@@ -92,17 +92,17 @@ var errCritNotSupported = errors.New("jwt crit header is not supported")
 // hasCritMember reports whether the protected header of a compact token has
 // a `crit` member of any value. It reads the header text, because jwx drops a
 // null member and keeps only the last of two members with one name. A header
-// that does not decode counts as having one: the checks before this call make
-// that case impossible.
+// that does not decode as a JSON object has none here: jws.Parse refuses it,
+// and it uses encoding/json too (its goccy decoder needs a build tag).
 func hasCritMember(token string) bool {
 	seg, _, _ := strings.Cut(token, ".")
 	raw, err := strictRawURL.DecodeString(seg)
 	if err != nil {
-		return true
+		return false
 	}
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {
-		return true
+		return false
 	}
 	_, has := members[jws.CriticalKey]
 	return has
@@ -215,6 +215,15 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	if err := checkCanonicalSegments(token); err != nil {
 		return nil, err
 	}
+	// RFC 7515 §4.1.11: refuse a token whose `crit` header names an extension
+	// that this server does not understand. It understands none, so any `crit`
+	// member is refused, whatever its value, and before jws.Parse, which
+	// rejects some values. jws.WithCritValidation(true) does not fit: the key
+	// loop below drops its error, so a token that a registered key signed
+	// would read "signature verification failed".
+	if hasCritMember(token) {
+		return nil, errCritNotSupported
+	}
 	msg, err := jws.Parse([]byte(token))
 	if err != nil {
 		// The parser's text can hold the text of a JSON decoder (see
@@ -236,14 +245,6 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	algObj, allowed := signatureAlgorithms[alg.String()]
 	if !allowed {
 		return nil, fmt.Errorf("jwt algorithm %q not allowed", alg.String())
-	}
-	// RFC 7515 §4.1.11: refuse a token whose `crit` header names an extension
-	// that this server does not understand. It understands none, so any `crit`
-	// member is refused, whatever its value. jws.WithCritValidation(true) does
-	// not fit: the key loop below drops its error, so a token that a
-	// registered key signed would read "signature verification failed".
-	if hasCritMember(token) {
-		return nil, errCritNotSupported
 	}
 
 	// Peek at the UNVERIFIED iss claim solely to select the org's keys;
