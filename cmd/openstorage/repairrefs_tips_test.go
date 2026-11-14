@@ -12,9 +12,11 @@ import (
 	"errors"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/githttp"
@@ -169,8 +171,12 @@ func testRepairNonCommitTips(t *testing.T, f *repairFixture, dbURL string) {
 	ghost := strings.Repeat("ab", 20)
 	f.plant(t, map[string]string{"refs/heads/ghost": ghost})
 	out.Reset()
+	if err := repairRefs(ctx, f.rs, f.target(), false, &out); err != nil || !strings.Contains(out.String(), "never deleted:\n  "+ghost+" refs/heads/ghost\n") {
+		t.Fatalf("dry run with a missing tip = %v\n%s", err, out.String())
+	}
+	out.Reset()
 	err = repairRefs(ctx, f.rs, f.target(), true, &out)
-	if err == nil || !strings.Contains(err.Error(), "1 branches name an object") ||
+	if err == nil || !strings.Contains(err.Error(), "branches with a missing tip object are kept: 1") ||
 		!strings.Contains(out.String(), "branches whose tip object is missing (1), never deleted:\n  "+ghost+" refs/heads/ghost\n") {
 		t.Fatalf("a missing tip = %v\n%s", err, out.String())
 	}
@@ -320,8 +326,11 @@ func TestPackTipKindsRemovesItsTemporaryDirectory(t *testing.T) {
 	if err != nil || got[f.commit] != "commit" || got[f.blob] != "blob" || got[f.tree] != "tree" || got[f.tag] != "tag" || got[strings.Repeat("cd", 20)] != "missing" {
 		t.Fatalf("kinds = %v, %v", got, err)
 	}
+	if _, err := tips.kinds(t.Context(), []string{f.commit}); err != nil {
+		t.Fatal(err)
+	}
 	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 1 {
-		t.Fatalf("temporary directory while the reader is open: %v, %v", entries, err)
+		t.Fatalf("temporary directory while the reader is open and read twice: %v, %v", entries, err)
 	}
 	tips.close()
 	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
@@ -367,5 +376,79 @@ func TestReadObjectKindsFailsClosed(t *testing.T) {
 	}
 	if _, err := readObjectKinds(t.Context(), t.TempDir(), []string{"HEAD"}); err == nil || !strings.Contains(err.Error(), "not a full SHA") {
 		t.Fatalf("a revision instead of a SHA = %v, want a refusal", err)
+	}
+}
+
+// A run leaves no temporary directory: not when it ends well, not on an
+// error, not when the context ends (SIGINT and SIGTERM end it through
+// signal.NotifyContext), with the packs half downloaded or not.
+func TestRepairRefsRemovesTheTemporaryDirectoryWhenItEnds(t *testing.T) {
+	isolateStorageEnv(t)
+	dir := t.TempDir()
+	dbURL := "sqlite://" + filepath.Join(dir, "codestorage.db")
+	repo := createMetaRepo(t, dbURL, "main")
+	rs, err := ref.OpenSQLite(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixtureFor(t, rs, repo)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit})
+	t.Setenv("OPENSTORAGE_S3_URL", f.blobURL)
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	// A run that ends well.
+	var out bytes.Buffer
+	if err := runRepairRefs(t.Context(), []string{"--data-dir", dir, repo}, &out); err != nil || !strings.Contains(out.String(), "no ref that git can never lock") {
+		t.Fatalf("run = %v\n%s", err, out.String())
+	}
+	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+		t.Fatalf("temporary directory after a run: %v, %v", entries, err)
+	}
+
+	// An error while the packs are staged.
+	tips := &packTipKinds{rs: rs, repoID: repo, blobURL: "file://" + filepath.Join(t.TempDir(), "no", "such", "store") + ""}
+	if _, err := tips.kinds(t.Context(), []string{f.commit}); err == nil {
+		t.Fatal("the packs of a store that does not exist were read")
+	}
+	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+		t.Fatalf("temporary directory after an error: %v, %v", entries, err)
+	}
+
+	// The context ends while git initializes the temporary repository. The
+	// fake git parks there, and passes every other call to the real one.
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, parked := t.TempDir(), filepath.Join(t.TempDir(), "parked")
+	script := "#!/bin/sh\nif [ \"$1\" = init ]; then touch '" + parked + "'; exec sleep 60; fi\nexec '" + realGit + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runRepairRefs(ctx, []string{"--data-dir", dir, repo}, &bytes.Buffer{}) }()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(parked); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never reached git init")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 1 {
+		t.Fatalf("temporary directory while git runs: %v, %v", entries, err)
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("the interrupted command returned no error")
+	}
+	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+		t.Fatalf("temporary directory after the interrupt: %v, %v", entries, err)
 	}
 }

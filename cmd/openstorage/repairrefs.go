@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
@@ -74,6 +76,10 @@ func (t repairTarget) isDefaultBranch(name string) bool {
 }
 
 func cmdRepairRefs(ctx context.Context, args []string) error {
+	// SIGINT and SIGTERM cancel the run, so the temporary directory of packs
+	// goes away on the normal path.
+	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	return runRepairRefs(ctx, args, os.Stdout)
 }
 
@@ -103,7 +109,8 @@ The command changes the ref store only. It sends no push webhook and no sync
 poke. With --yes it lists the refs again and deletes what it finds. It keeps a
 ref that is the repository's default branch: set another default branch first
 (PATCH /repo), then run the command again. It never deletes a branch whose tip
-object it cannot find: it reports that branch and exits with an error.
+object it cannot find: it lists that branch, and with --yes it exits with an error
+after it has deleted the rest.
 
 Flags:
 `)
@@ -243,7 +250,7 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 		left = append(left, fmt.Sprintf("%d of %d refs were kept (%d changed since they were listed, %d are the default branch): see above, then run the command again", lost+kept, len(found), lost, kept))
 	}
 	if len(scan.missing) > 0 {
-		left = append(left, fmt.Sprintf("%d branches name an object that the repository's packs do not hold, and the command keeps them: see above", len(scan.missing)))
+		left = append(left, fmt.Sprintf("branches with a missing tip object are kept: %d, see above", len(scan.missing)))
 	}
 	if len(left) > 0 {
 		return errors.New(strings.Join(left, "; "))
@@ -259,7 +266,7 @@ func printRepairRefs(out io.Writer, target repairTarget, refs []repairRef) {
 		if name, ok := repairKindNames[r.kind]; ok {
 			notes = append(notes, name)
 		}
-		if target.isDefaultBranch(r.name) && r.kind != "missing" {
+		if target.isDefaultBranch(r.name) {
 			notes = append(notes, "the default branch: not deleted")
 		}
 		line := fmt.Sprintf("  %s %s", r.sha, sanitizeTerm(r.name))

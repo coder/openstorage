@@ -309,8 +309,8 @@ A branch whose tip is not a commit wedges a repository the same way. Before the 
 hook refused such a push, a token with `git:write` could push a branch at a blob, a tree
 or an annotated tag. git refuses to write a non-commit under `refs/heads/`, so the ref
 store holds a value that no cache can take. The git read logs the `hydrate <repo ID>:
-update-ref --stdin: exit status 128` line with `fatal: trying to write non-commit object
-<sha> to branch '<ref>'`. Rebuilding the cache does not help here either.
+update-ref --stdin: exit status 128` line, and the git error in it holds `trying to write
+non-commit object <sha> to branch '<ref>'`. Rebuilding the cache does not help here either.
 
 Remove either kind of ref from the ref store with
 [`openstorage repair-refs`](../reference/cli.md#openstorage-repair-refs):
@@ -328,8 +328,8 @@ Remove either kind of ref from the ref store with
    250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
    The command reads that type from the repository's packs: it downloads them into a
    temporary directory under `$TMPDIR` and removes the directory when it ends, so run it
-   where `$TMPDIR` has room for the packs. A ref that git can lock and a tag at a blob are
-   never on the list.
+   where `$TMPDIR` has room for the packs. A ref that git can lock and whose tip is a commit
+   is never on the list, and neither is a ref outside `refs/heads/`, a tag at a blob for example.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
@@ -338,7 +338,8 @@ Remove either kind of ref from the ref store with
    marks it. Set another default branch with `PATCH /repo`, then run the command again. The
    command never deletes a branch whose tip object the packs do not hold: the list shows it
    as missing, and the command exits with an error after it deleted the rest. That branch
-   still wedges the repository, so find the pack first (`openstorage list-packs <repo>`).
+   still wedges the repository, so find the pack first (`openstorage list-packs --repo <repo ID>`,
+   with the same `--data-dir` or URLs as `serve`).
 4. Run the dry run once more. It must list no ref. An ID with no repository, and a
    database URL or `--data-dir` that is not the one `serve` uses, are errors. A scan of
    0 refs means that the repository has no refs. The next clone or fetch hydrates the
