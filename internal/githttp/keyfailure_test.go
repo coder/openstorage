@@ -114,6 +114,29 @@ func TestKeyFailureAnswersHoldNoStoreText(t *testing.T) {
 	}
 }
 
+// TestLongIssuerIsCutInAnswers: the 401 of an issuer that is not registered
+// names the issuer, which the client chose. On every git and LFS route a long
+// one is cut as an API error is.
+func TestLongIssuerIsCutInAnswers(t *testing.T) {
+	srv, _ := kfServer(t, kfKeys{err: fmt.Errorf("org %q: %w", "x", meta.ErrNotFound)})
+	tok := kfToken(t, strings.Repeat("<", 100_000))
+	for _, rt := range tcdRoutes {
+		t.Run(rt.name, func(t *testing.T) {
+			rec := tcdServe(srv, rt, tok)
+			var answer map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &answer); err != nil || len(answer) != 1 {
+				t.Fatalf("status %d, body %.200s is not one JSON text: %v", rec.Code, rec.Body, err)
+			}
+			for _, text := range answer {
+				// A cut of 16 KiB, with six bytes for every escaped `<`.
+				if rec.Code != http.StatusUnauthorized || rec.Body.Len() > 120_000 || !strings.HasPrefix(text, `issuer "<<<`) || !strings.HasSuffix(text, "…") {
+					t.Fatalf("status %d, an answer of %d bytes for a 100,000-byte issuer: %.80q", rec.Code, rec.Body.Len(), text)
+				}
+			}
+		})
+	}
+}
+
 // countKeyFailureLines returns how many lines of out report a key failure.
 func countKeyFailureLines(out string) int {
 	return strings.Count(out, "verify token: ")

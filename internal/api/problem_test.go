@@ -1297,6 +1297,10 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 	freshTok := e.mint(t, tokenSpec{iss: org, repo: "ip-fresh-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
 
 	type param struct{ name, reason string }
+	// The answer cuts an unknown member name of more than 256 bytes to at
+	// most 256, at a character, and states its length, so it stays small
+	// whatever escapes the name needs.
+	long := func(n int, s string) string { return strings.Repeat(s, n) }
 	for _, tc := range []struct {
 		name, method, path, token string
 		body                      string
@@ -1315,14 +1319,23 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			"upstream.owner must be a string", &param{"upstream.owner", "must be a string"}},
 		{"upstream not an object", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":3}`, "upstream must be an object", &param{"upstream", "must be an object"}},
 		{"upstream unknown field", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":"o","name":"n","x":1}}`, `invalid upstream: unknown field "x"`, nil},
+		{"upstream unknown field of 256 bytes", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"` + long(256, "y") + `":1}}`, `invalid upstream: unknown field "` + long(256, "y") + `"`, nil},
+		{"upstream unknown field of 1000000 bytes", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"` + long(1_000_000, "y") + `":1}}`,
+			`invalid upstream: unknown field "` + long(256, "y") + `…" (1000000 bytes)`, nil},
+		{"base_repo copy unknown field cut at a character", http.MethodPost, "/api/v1/repos", freshTok, `{"base_repo":{"name":"n","a` + long(400_000, "é") + `":1}}`,
+			`invalid base_repo: unknown field "a` + long(127, "é") + `…" (800001 bytes)`, nil},
+		{"branch create unknown field of escaped bytes", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"` + long(1_000_000, "<") + `":1}`,
+			`invalid JSON body: unknown field "` + long(256, "<") + `…" (1000000 bytes)`, nil},
+		{"upstream unknown field cut with a quote and a control character", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"\"\u0001` + long(300, "y") + `":1}}`,
+			`invalid upstream: unknown field "\"\x01` + long(254, "y") + `…" (302 bytes)`, nil},
 		{"strict empty member name", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"":1}`, `invalid JSON body: unknown field ""`, nil},
 		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, "invalid JSON body", nil},
 		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, "invalid JSON body", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(tc.body), "")
-			if resp.StatusCode != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, body)
+			if resp.StatusCode != http.StatusBadRequest || len(body) > 4<<10 {
+				t.Fatalf("status = %d, want 400 of at most 4 KiB (body of %d bytes %.300s)", resp.StatusCode, len(body), body)
 			}
 			requireEnvelope(t, resp, body)
 			var p problemBody
@@ -1330,7 +1343,7 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 				t.Fatal(err)
 			}
 			if p.Error != tc.msg {
-				t.Fatalf("error = %q, want %q", p.Error, tc.msg)
+				t.Fatalf("error = %.400q, want %.400q", p.Error, tc.msg)
 			}
 			if tc.want == nil {
 				if strings.Contains(string(body), `"invalid_params"`) {

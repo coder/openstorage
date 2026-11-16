@@ -35,6 +35,13 @@ const (
 	// (commit-graph refreshes) may hold at once, so it can never take the
 	// whole pool from reads.
 	MaintenanceShare = 2
+
+	// MaxArgBytes is the longest argument or environment entry that a git
+	// child gets. Linux refuses to exec one of 128 KiB or more, counting its
+	// terminating NUL (MAX_ARG_STRLEN: 32 pages of 4 KiB). Request values
+	// that git takes as an argument or an entry are refused past it before
+	// git starts, so the answer is the same on every platform.
+	MaxArgBytes = 128<<10 - 1
 )
 
 var (

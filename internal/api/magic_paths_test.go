@@ -81,7 +81,7 @@ func TestPathsNamedLikePathspecMagic(t *testing.T) {
 			t.Errorf("commits?path=%s = %v, want %v", file, shas, want)
 		}
 
-		// No path filter: the diff stats each changed file with ls-tree.
+		// No path filter: the diff stats each changed file by its object id.
 		var diff struct {
 			Files []struct {
 				Path string `json:"path"`

@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -74,9 +75,12 @@ func (s *server) resolveQueryRepo(w http.ResponseWriter, r *http.Request) (meta.
 // — one literal "true"/"false" dialect for the whole read surface.
 
 // cleanPathParams validates repeatable `path` filters: no empties, no
-// NULs, none outside the repository.
+// NULs, none over maxGitPathBytes, none outside the repository.
 func cleanPathParams(paths []string) ([]string, error) {
 	for _, p := range paths {
+		if len(p) > maxGitPathBytes {
+			return nil, errors.New(tooLongMsg("path", maxGitPathBytes))
+		}
 		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
 			return nil, fmt.Errorf("invalid path filter %q", p)
 		}
@@ -156,11 +160,15 @@ type diffPayload struct {
 	Filtered []filteredFileEntry
 }
 
-// lastByteWriter tracks the final byte of a stream (trailing-newline probe
-// for is_eof) without buffering blob contents.
-type lastByteWriter struct{ last byte }
+// lastByteWriter tracks the size and the final byte of a stream
+// (trailing-newline probe for is_eof) without buffering blob contents.
+type lastByteWriter struct {
+	n    int64
+	last byte
+}
 
 func (w *lastByteWriter) Write(p []byte) (int, error) {
+	w.n += int64(len(p))
 	if len(p) > 0 {
 		w.last = p[len(p)-1]
 	}
@@ -168,30 +176,18 @@ func (w *lastByteWriter) Write(p []byte) (int, error) {
 }
 
 // statDiffBlob resolves size and trailing-newline state (`bytes`/`is_eof`)
-// of commit:path. Submodule entries have no blob content: size 0, no eof.
-func statDiffBlob(ctx context.Context, repoPath, commit, path string) (int64, bool, error) {
-	entries, err := gitread.LsTree(ctx, repoPath, commit, path, false)
-	if err != nil {
+// of f's object, which it reads by id: a path that git printed can be
+// longer than exec takes as one argument. Submodule entries have no blob
+// content: size 0, no eof.
+func statDiffBlob(ctx context.Context, repoPath string, f gitread.FileDiff) (int64, bool, error) {
+	if f.Mode == "160000" {
+		return 0, false, nil // submodule pointer: no blob
+	}
+	var w lastByteWriter
+	if err := gitread.CatBlobTo(ctx, repoPath, f.OID, &w); err != nil {
 		return 0, false, err
 	}
-	var entry *gitread.TreeEntry
-	for i := range entries {
-		if entries[i].Path == path {
-			entry = &entries[i]
-			break
-		}
-	}
-	if entry == nil {
-		return 0, false, fmt.Errorf("diff path %q missing at %s", path, commit)
-	}
-	if entry.Size <= 0 {
-		return 0, false, nil // empty blob or submodule pointer: no newline
-	}
-	var last lastByteWriter
-	if err := gitread.CatBlobTo(ctx, repoPath, entry.SHA, &last); err != nil {
-		return 0, false, err
-	}
-	return entry.Size, last.last == '\n', nil
+	return w.n, w.n > 0 && w.last == '\n', nil
 }
 
 // buildDiffPayload computes the base..target tree diff and splits it into
@@ -212,14 +208,8 @@ func buildDiffPayload(ctx context.Context, repoPath, base, target string, paths 
 		Filtered: []filteredFileEntry{},
 	}
 	for _, f := range fileDiffs {
-		statCommit := target
-		if f.Status == "D" {
-			// Deletions stat the pre-image side. A root diff (base ==
-			// EmptyTreeSHA) has no pre-image; statDiffBlob then reports the
-			// missing path as an error (500), never a process-killing panic.
-			statCommit = base
-		}
-		size, isEOF, err := statDiffBlob(ctx, repoPath, statCommit, f.Path)
+		// f's object is the post-image, or the pre-image for a deletion.
+		size, isEOF, err := statDiffBlob(ctx, repoPath, f)
 		if err != nil {
 			return diffPayload{}, err
 		}
@@ -509,6 +499,11 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, spec := range ranges {
+		// git gets each range as an argument of its own.
+		if len(spec) > gitlimit.MaxArgBytes {
+			writeErr(w, http.StatusBadRequest, tooLongMsg("range", gitlimit.MaxArgBytes))
+			return
+		}
 		if strings.TrimSpace(spec) == "" || strings.ContainsRune(spec, 0) {
 			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid range %q", spec))
 			return
@@ -710,15 +705,18 @@ type grepPosition struct {
 // problem.
 func grepPathProblems(errs *bodyErrors, paths []string) {
 	for i, p := range paths {
-		blank := strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0)
+		long := len(p) > maxGitPathBytes
+		blank := !long && (strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0))
 		// git gets the entry without its trailing slash: "/" alone is
 		// no pathspec.
 		trimmed := strings.TrimSuffix(p, "/")
-		outside := !blank && trimmed != "" && pathLeavesRepo(trimmed)
+		outside := !long && !blank && trimmed != "" && pathLeavesRepo(trimmed)
 		switch {
-		case !blank && !outside:
+		case !long && !blank && !outside:
 		case errs.full():
 			errs.skip()
+		case long:
+			errs.add(tooLongField("paths."+strconv.Itoa(i), p, maxGitPathBytes))
 		case blank:
 			errs.add(newFieldError("paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p)))
 		default:
@@ -750,8 +748,13 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(pattern) == "" {
 		errs.add(newFieldError("query.pattern", "is required", "query.pattern is required"))
 	} else {
-		// git takes the pattern as an argument, which cannot hold a NUL.
-		errs.add(invalidTextFields([2]string{"query.pattern", pattern}))
+		// git takes the pattern as an argument of its own, which cannot hold
+		// a NUL and must fit gitlimit.MaxArgBytes.
+		if err := invalidTextFields([2]string{"query.pattern", pattern}); err != nil {
+			errs.add(err)
+		} else {
+			errs.add(tooLongField("query.pattern", pattern, gitlimit.MaxArgBytes))
+		}
 	}
 	caseSensitive := true
 	if body.Query.CaseSensitive != nil {

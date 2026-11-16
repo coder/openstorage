@@ -37,6 +37,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -53,6 +54,7 @@ import (
 	"syscall"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/meta"
@@ -174,11 +176,13 @@ type wcResult struct {
 }
 
 // wcRefUpdate builds every wcResult, so target_branch and branch always
-// name the same branch and success is true only for status "ok".
+// name the same branch and success is true only for status "ok". It cuts
+// msg as newProblem cuts `error`: a failure message can repeat a value of
+// the request, such as a 1 MiB content_id.
 func wcRefUpdate(branch, oldSHA, newSHA, status, msg string) wcResult {
 	return wcResult{
 		TargetBranch: branch, Branch: branch, OldSHA: oldSHA, NewSHA: newSHA,
-		Success: status == "ok", Status: status, Message: msg,
+		Success: status == "ok", Status: status, Message: errtext.Bound(msg),
 	}
 }
 
@@ -525,22 +529,40 @@ func wcValidateBranchParam(field, name string) error {
 }
 
 // wcAuthorProblems returns each problem of one ident: the empty name and
-// email (one problem), a NUL in the name or the email (one problem each),
-// and newlines, which would corrupt the GIT_AUTHOR_*/GIT_COMMITTER_*
-// env-based ident encoding. An environment value cannot hold a NUL.
+// email (one problem), a NUL in the name or the email or else one over
+// maxGitIdentBytes (one problem each), and newlines, which would corrupt
+// the GIT_AUTHOR_*/GIT_COMMITTER_* env-based ident encoding. An environment
+// value cannot hold a NUL.
 func wcAuthorProblems(field string, a wcAuthor) []error {
 	var problems []error
 	if err := requiredFields(field+" name and email are required",
 		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email}); err != nil {
 		problems = append(problems, err)
 	}
-	problems = append(problems, invalidTextEach(
+	problems = append(problems, identValueProblems(
 		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email})...)
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
 		problems = append(problems, newFieldError(field, "must not contain newlines", field+" contains newlines"))
 	}
 	return problems
 }
+
+// identValueProblems returns, field by field in the order given, the NUL
+// problem of an ident value, or else its problem over maxGitIdentBytes.
+func identValueProblems(fields ...[2]string) []error {
+	var problems []error
+	for _, f := range fields {
+		if err := cmp.Or(invalidTextFields(f), tooLongField(f[0], f[1], maxGitIdentBytes)); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return problems
+}
+
+// maxGitIdentBytes bounds a name or an email of an author or a committer.
+// git gets each one as an environment entry such as
+// GIT_COMMITTER_EMAIL=<email>, which must fit gitlimit.MaxArgBytes.
+const maxGitIdentBytes = gitlimit.MaxArgBytes - len("GIT_COMMITTER_EMAIL=")
 
 // wcValidateAuthor validates one ident and returns its first problem.
 func wcValidateAuthor(field string, a wcAuthor) error {
@@ -564,7 +586,7 @@ func wcValidateMetadata(md *wcMetadata) error {
 	if md.CommitMessage == "" {
 		return errors.New("missing commit_message")
 	}
-	// git takes the message as an argument, which cannot hold a NUL.
+	// git refuses a NUL in a commit message.
 	if err := invalidTextFields([2]string{"commit_message", md.CommitMessage}); err != nil {
 		return err
 	}
@@ -1282,24 +1304,41 @@ func (sc *wcScratch) buildTree(ctx context.Context, baseTree string, entries []w
 // commitTree creates the commit object in the scratch odb. parent "" makes
 // a root commit. Committer defaults to the author (docs/explanation/streaming-commit-protocols.md).
 func (sc *wcScratch) commitTree(ctx context.Context, tree, parent string, md *wcMetadata) (string, error) {
-	assertf(ref.ValidSHA(tree), "commitTree: malformed tree %q", tree)
 	committer := md.Author
 	if md.Committer != nil {
 		committer = *md.Committer
 	}
+	var parents []string
+	if parent != "" {
+		parents = []string{parent}
+	}
+	return sc.writeCommit(ctx, tree, parents, md.CommitMessage, md.Author, committer)
+}
+
+// writeCommit runs `git commit-tree` in the scratch odb and returns the new
+// commit's sha. The message goes on stdin (-F -), so git takes a message of
+// any length: as an argument (-m) it would have to fit
+// gitlimit.MaxArgBytes. -m ends a message with a line feed when it lacks
+// one and -F - does not, so the line feed is added here: the commit is the
+// one that -m made. The idents go in the environment (maxGitIdentBytes).
+func (sc *wcScratch) writeCommit(ctx context.Context, tree string, parents []string, message string, author, committer wcAuthor) (string, error) {
+	assertf(ref.ValidSHA(tree), "writeCommit: malformed tree %q", tree)
 	env := []string{
-		"GIT_AUTHOR_NAME=" + md.Author.Name,
-		"GIT_AUTHOR_EMAIL=" + md.Author.Email,
+		"GIT_AUTHOR_NAME=" + author.Name,
+		"GIT_AUTHOR_EMAIL=" + author.Email,
 		"GIT_COMMITTER_NAME=" + committer.Name,
 		"GIT_COMMITTER_EMAIL=" + committer.Email,
 	}
-	args := []string{"commit-tree", "-m", md.CommitMessage}
-	if parent != "" {
-		assertf(ref.ValidSHA(parent), "commitTree: malformed parent %q", parent)
-		args = append(args, "-p", parent)
+	args := []string{"commit-tree", "-F", "-"}
+	for _, p := range parents {
+		assertf(ref.ValidSHA(p), "writeCommit: malformed parent %q", p)
+		args = append(args, "-p", p)
 	}
 	args = append(args, tree)
-	out, err := sc.git(ctx, nil, env, args...)
+	if message != "" && !strings.HasSuffix(message, "\n") {
+		message += "\n"
+	}
+	out, err := sc.git(ctx, strings.NewReader(message), env, args...)
 	if err != nil {
 		return "", err
 	}

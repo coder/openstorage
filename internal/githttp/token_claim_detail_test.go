@@ -2,8 +2,11 @@ package githttp
 
 import (
 	"context"
+	"crypto"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -54,6 +57,25 @@ var tcdRoutes = []tcdRoute{
 	{"LFS object upload", http.MethodPut, "/r.git/info/lfs/objects/" + tcdOID, "x", false},
 }
 
+// tcdOrg is the org that tcdServer's verifier knows.
+const tcdOrg = "acme"
+
+// tcdServer returns a server with a real verifier and the ES256 key that
+// signs for tcdOrg. It has no stores: a request that passes authentication
+// would fail later.
+func tcdServer(t *testing.T) (*Server, crypto.Signer) {
+	t.Helper()
+	key, err := auth.GenerateKey("ES256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemBytes, err := auth.MarshalPublicKeyPEM(key.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Server{Verifier: auth.NewVerifier(tcdKeys{tcdOrg: {string(pemBytes)}}), Org: tcdOrg}, key
+}
+
 // tcdServe sends rt with token as its credential to srv.
 func tcdServe(srv *Server, rt tcdRoute, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
@@ -73,16 +95,7 @@ func tcdServe(srv *Server, rt tcdRoute, token string) *httptest.ResponseRecorder
 // holds for every route that verifies a token.
 func TestTokenClaimDecodeAnswersHoldNoGoTypeNames(t *testing.T) {
 	captureLog(t) // the verifier logs a signed claim that does not decode
-	key, err := auth.GenerateKey("ES256")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemBytes, err := auth.MarshalPublicKeyPEM(key.Public())
-	if err != nil {
-		t.Fatal(err)
-	}
-	const org = "acme"
-	srv := &Server{Verifier: auth.NewVerifier(tcdKeys{org: {string(pemBytes)}}), Org: org}
+	srv, key := tcdServer(t)
 
 	seg := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
 	unsigned := func(header, payload string) string { return seg(header) + "." + seg(payload) + "." + seg("sig") }
@@ -120,6 +133,110 @@ func TestTokenClaimDecodeAnswersHoldNoGoTypeNames(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// tcdSign returns a token for tcdOrg that key signed, with extra protected
+// header members.
+func tcdSign(t *testing.T, key crypto.Signer, header map[string]any) string {
+	t.Helper()
+	payload, err := json.Marshal(auth.Claims{
+		Iss: tcdOrg, Sub: auth.SubjectLiteral, Repo: "r", Scopes: []string{auth.ScopeGitRead},
+		Exp: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdrs := jws.NewHeaders()
+	for name, v := range header {
+		if err := hdrs.Set(name, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tok, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), key, jws.WithProtectedHeaders(hdrs)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(tok)
+}
+
+// TestCritHeaderIsRefusedOnEveryRoute: a token that a registered key signed
+// is refused when its header has `crit` (RFC 7515 §4.1.11), on every git and
+// LFS route that verifies a token, with the fixed text. The same claims
+// without `crit` verify.
+func TestCritHeaderIsRefusedOnEveryRoute(t *testing.T) {
+	srv, key := tcdServer(t)
+	if _, err := srv.Verifier.Verify(context.Background(), tcdSign(t, key, nil)); err != nil {
+		t.Fatalf("a token without crit: %v", err)
+	}
+	withCrit := tcdSign(t, key, map[string]any{"crit": []string{"x-ext"}, "x-ext": true})
+	for _, rt := range tcdRoutes {
+		t.Run(rt.name, func(t *testing.T) {
+			rec := tcdServe(srv, rt, withCrit)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status %d, want 401 (body %s)", rec.Code, rec.Body)
+			}
+			if want := "jwt crit header is not supported"; !strings.Contains(rec.Body.String(), want) {
+				t.Fatalf("the answer does not hold %q: %s", want, rec.Body)
+			}
+		})
+	}
+}
+
+// tcdHeaderTails are bytes that can follow the object of a protected header:
+// other values, bytes that start no value, and a NUL.
+var tcdHeaderTails = []string{"x", "}", "]", "{}", "\x00", " x", `"`, "0", `{"crit":null}`}
+
+// tcdHeaderPads are the bytes that the tests put before and after a header
+// object: every tail, and each JSON whitespace byte before, after and on both
+// sides of it.
+func tcdHeaderPads() [][2]string {
+	var pads [][2]string
+	for _, tail := range tcdHeaderTails {
+		pads = append(pads, [2]string{"", tail})
+	}
+	for _, ws := range []string{" ", "\t", "\r", "\n"} {
+		pads = append(pads, [2]string{ws, ""}, [2]string{"", ws}, [2]string{ws, ws})
+	}
+	return pads
+}
+
+// TestHeaderPadIsRefusedOnEveryRoute: a token that a registered key signed is
+// refused when its header segment holds any byte outside the header object,
+// whitespace included, with or without `crit`, on every git and LFS route that
+// verifies a token. The signature still covers the object alone, and jwx
+// verifies it against the object alone. The answer is the fixed `malformed jwt`.
+func TestHeaderPadIsRefusedOnEveryRoute(t *testing.T) {
+	srv, key := tcdServer(t)
+	for name, header := range map[string]map[string]any{
+		"without crit": nil,
+		"with crit":    {"crit": []string{"x-ext"}, "x-ext": true},
+	} {
+		token := tcdSign(t, key, header)
+		seg, rest, _ := strings.Cut(token, ".")
+		obj, err := base64.RawURLEncoding.DecodeString(seg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, pad := range tcdHeaderPads() {
+			padded := base64.RawURLEncoding.EncodeToString([]byte(pad[0]+string(obj)+pad[1])) + "." + rest
+			for _, rt := range tcdRoutes {
+				t.Run(fmt.Sprintf("%s %q %q, %s", name, pad[0], pad[1], rt.name), func(t *testing.T) {
+					rec := tcdServe(srv, rt, padded)
+					if rec.Code != http.StatusUnauthorized {
+						t.Fatalf("status %d, want 401 (body %s)", rec.Code, rec.Body)
+					}
+					if want := "malformed jwt"; !strings.Contains(rec.Body.String(), want) {
+						t.Fatalf("the answer does not hold %q: %s", want, rec.Body)
+					}
+					for _, bad := range tcdDecoderText {
+						if strings.Contains(rec.Body.String(), bad) {
+							t.Fatalf("the answer holds %q: %s", bad, rec.Body)
+						}
+					}
+				})
+			}
 		}
 	}
 }
