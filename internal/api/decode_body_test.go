@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -210,5 +211,85 @@ func TestDecodeError(t *testing.T) {
 	}
 	if got := frameMsg(json.Unmarshal([]byte(`{`), new(decodeBodyReq))); got != "malformed NDJSON frame" {
 		t.Errorf("frame with a syntax error: %q", got)
+	}
+}
+
+// decodeCount decodes into V and counts the decodes of its body, as passes
+// of unmarshalBody (calls is set by the test).
+type decodeCount[T any] struct {
+	V     T
+	calls *int
+}
+
+func (c *decodeCount[T]) UnmarshalJSON(b []byte) error {
+	*c.calls++
+	return json.Unmarshal(b, &c.V)
+}
+
+// decodeRefuses is the type of the member x: it refuses every value, null
+// too, with a type error that names x.
+type decodeRefuses struct{}
+
+func (*decodeRefuses) UnmarshalJSON([]byte) error {
+	return &json.UnmarshalTypeError{Value: "string", Type: reflect.TypeFor[int](), Field: "x"}
+}
+
+// TestUnmarshalBodyStopsWithoutProgress: unmarshalBody stops at the first
+// pass that cannot clear the error. In each case the search finds another
+// member than the one that failed, or the failed member itself, and nulling
+// it leaves the same error, so main decoded the body 100 times. The answer
+// is the one error, json's own.
+func TestUnmarshalBodyStopsWithoutProgress(t *testing.T) {
+	type keyed struct {
+		M map[string]struct{ B int } `json:"m"`
+	}
+	type ints struct {
+		M map[int]int `json:"m"`
+	}
+	type slashed struct {
+		M map[string]int `json:"m"`
+	}
+	type refuses struct {
+		X decodeRefuses `json:"x"`
+		Y int           `json:"y"`
+	}
+	for _, tc := range []struct {
+		name, body string
+		decode     func(body []byte, calls *int) error
+		wantParam  string
+		wantCalls  int
+	}{
+		{name: "a map key with a dot and the members it spells", body: `{"m":{"a.b":{"B":"x"},"a":{"b":{"B":2}}}}`,
+			decode:    func(b []byte, n *int) error { return unmarshalBody(b, &decodeCount[keyed]{calls: n}) },
+			wantParam: "m.a.b.B", wantCalls: 2},
+		{name: "a map key that is a path escape and the key it spells", body: `{"m":{"a/b":"x","a~1b":"y"}}`,
+			decode:    func(b []byte, n *int) error { return unmarshalBody(b, &decodeCount[slashed]{calls: n}) },
+			wantParam: "m.a~1b", wantCalls: 2},
+		{name: "a map key that does not decode", body: `{"m":{"x":1}}`,
+			decode:    func(b []byte, n *int) error { return unmarshalBody(b, &decodeCount[ints]{calls: n}) },
+			wantParam: "m.x", wantCalls: 2},
+		{name: "a type that refuses null", body: `{"x":5,"y":6}`,
+			decode:    func(b []byte, n *int) error { return unmarshalBody(b, &decodeCount[refuses]{calls: n}) },
+			wantParam: "x", wantCalls: 2},
+		// The member is null already: there is nothing to replace, so no
+		// second decode runs.
+		{name: "a type that refuses null, sent null", body: `{"x":null,"y":6}`,
+			decode:    func(b []byte, n *int) error { return unmarshalBody(b, &decodeCount[refuses]{calls: n}) },
+			wantParam: "x", wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			err := tc.decode([]byte(tc.body), &calls)
+			items := invalidParamsFor(err)
+			if len(items) != 1 || items[0].Name != tc.wantParam {
+				t.Fatalf("items = %+v, want the one field %q (err %v)", items, tc.wantParam, err)
+			}
+			if _, ok := errors.AsType[*json.UnmarshalTypeError](err); !ok {
+				t.Fatalf("err %T: a field that two decodes name is one problem, and the answer is json's own error", err)
+			}
+			if calls != tc.wantCalls {
+				t.Fatalf("%d decodes, want %d", calls, tc.wantCalls)
+			}
+		})
 	}
 }
