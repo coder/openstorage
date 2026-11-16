@@ -136,7 +136,12 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   or that has the dotted path of a member named or counted already, adds nothing. Past
   the 100 names of an object the count compares 64-bit hashes of the names, so two of
   them count as one in about one body of 1 MiB in a billion. An answer that names one
-  member keeps its name up to the cut of 16384 bytes above. The other checks run only
+  unknown member cuts a name of more than 256 bytes as the other bodies above do, to its
+  first 256 bytes or fewer at a character, and ends it with `…`: `error` and `detail`
+  add the length in bytes of the member name, without `author.`
+  (`unknown field "author.xx…" (1000000 bytes)`), and the `invalid_params` `name` ends
+  with `…` only, as at 32 bytes. Such an answer has at most 4,923 bytes and the request
+  path in `instance`. The other checks run only
   when the members are fine, and then the decoder of a strictly decoded body names only
   the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
   `POST /api/repos/{repo_name}/upstream/pull` takes `{ref?, after?}` and works the same
@@ -421,6 +426,15 @@ the same scopes, query parameters and responses.
   `base_repo.auth.token`, `upstream.owner`, `upstream.name`), and nothing is stored. The
   stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
   decodes to valid UTF-8 already.
+- A sync create whose values git cannot take → 400 `bad_request`, and nothing is
+  stored. An upstream URL over 131,070 bytes (`https://{host}/{owner}/{name}.git`; a
+  host given with `http://` or `https://` is used as is, without trailing `/`s)
+  names the `owner`, the `name`, and the host field when the body sent one
+  (`upstream.host`, `base_repo.upstream_host`), each with the reason `must keep the
+  upstream URL at most 131070 bytes` (message `invalid upstream URL (want at most
+  131070 bytes)`). A `base_repo.auth.token` over 131,042 bytes names that field (`must
+  be at most 131042 bytes`). The limits are those of the sync run
+  ([Upstream sync](#upstream-sync), [Git credentials](#git-credentials-generic-https-upstreams)).
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
   generic with `upstream_host`.
 - A body with several invalid fields, in any create form, gets an `invalid_params` item
@@ -522,9 +536,10 @@ the same scopes, query parameters and responses.
 stores the username exactly as sent. An update that omits it clears the stored one.
 
 A `username` or `password` that holds a NUL byte → 400 `bad_request` with `invalid_params`
-naming the field, on every credential route, and nothing is stored. A credential `id`
-that holds a NUL byte, in the body or in the path (also invalid UTF-8 in the path), names
-no credential → 404 `credential_not_found`, as an unknown `id` does.
+naming the field, on every credential route, and nothing is stored. So does one over
+131,042 bytes (`must be at most 131042 bytes`), which the sync run could not hand to git.
+A credential `id` that holds a NUL byte, in the body or in the path (also invalid UTF-8 in
+the path), names no credential → 404 `credential_not_found`, as an unknown `id` does.
 
 A stored username is always sent as is. Git sends no credentials when the username is
 empty, so for a credential with no username the sync worker sends the upstream's
@@ -554,6 +569,9 @@ environment. A stored username or password that contains a carriage return, line
 or NUL fails the sync as a configuration error. So does one over 131,042 bytes, before
 git gets it: git takes it as one environment entry, such as
 `OPENSTORAGE_ASKPASS_PASSWORD=<password>`, which must fit 128 KiB with its terminating NUL.
+The credential routes and `POST /repos` refuse such a long value, so only a value
+stored without that check (before it, or by an older server during an upgrade) reaches
+this one.
 
 ### Files & trees (`git:read`)
 
@@ -883,14 +901,18 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 | `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional, deprecated body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400. Its fields are ignored |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 
-A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`) is over
-131,070 bytes fails as `repository configuration error` before git starts. git gets the URL
-as one argument, and its HTTP transport hands it on with a `/` added, which must fit
-128 KiB with its terminating NUL. A stored credential that git cannot take fails the same
-way ([Git credentials](#git-credentials-generic-https-upstreams)). Values that each fit
-can still pass the total limit together: one git start can carry the URL twice and both
-credential entries, about 512 KiB at the limits, so a server with a stack limit of 2 MiB
-or less can fail such a run as a failed fetch or push.
+A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`, or the host
+as given when it has a scheme, without trailing `/`s) is over 131,070 bytes fails as
+`repository configuration error` before git starts. git gets the URL as one argument,
+and its HTTP transport hands it on with a `/` added, which must fit 128 KiB with its
+terminating NUL. `POST /repos` refuses such a link with `400` ([Repository
+lifecycle](#repository-lifecycle-repowrite--orgread)), so only a link stored without
+that check (before it, or by an older server during an upgrade) reaches this one. A
+stored credential that git cannot take fails the same way ([Git
+credentials](#git-credentials-generic-https-upstreams)). Values that each fit can still
+pass the total limit together: one git start can carry the URL twice and both credential
+entries, about 512 KiB at the limits, so a server with a stack limit of 2 MiB or less
+can fail such a run as a failed fetch or push.
 
 #### Deprecation header
 
@@ -928,10 +950,17 @@ Upstream documents no value and no `Link` or `Sunset` header, so open.storage se
   Auth, config, and rejection failures do not retry.
 - A successful run schedules one follow-up inbound sync, so a pull that raced the forward
   cannot strand a stale local snapshot.
-- Private/special destinations are denied (permanent `repository configuration error`
-  failure) unless
+- Private and special-purpose destinations are denied, a permanent
+  `repository configuration error` failure. Setting
+  [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#openstorage_sync_allow_private) to
+  `true` admits loopback, RFC 1918, RFC 6598 shared, link-local and ULA addresses. Only
+  two cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`) and the other IANA
+  special-purpose ranges stay denied; a metadata endpoint inside an admitted range, such
+  as `100.100.100.200`, is admitted. The deprecated push-only
   [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](configuration.md#openstorage_sync_push_allow_private)
-  opts internal forges in.
+  counts only while `OPENSTORAGE_SYNC_ALLOW_PRIVATE` is unset or empty; when
+  `OPENSTORAGE_SYNC_ALLOW_PRIVATE` has a non-empty value, the value of the deprecated
+  variable is ignored (a malformed one still stops `serve` at startup).
 
 **Events and cancellation:** outbound runs emit `repo.push_upstream.*` events
 ([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. An outbound run emits
@@ -982,7 +1011,11 @@ freshness pokes) and push-upstream forwards.
 
 - Governed by
   [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#openstorage_sync_allow_private).
-  Transitional default: pulls allow private upstreams, pushes deny.
+  Transitional default: pulls allow private upstreams, pushes deny. While
+  `OPENSTORAGE_SYNC_ALLOW_PRIVATE` is unset or empty, the deprecated push-only
+  `OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE` can relax pushes; when
+  `OPENSTORAGE_SYNC_ALLOW_PRIVATE` has a non-empty value, the value of the deprecated
+  variable is ignored.
 - A denied pull destination fails the run as `repository configuration error`; a denied
   push destination fails the same way.
 - `POST /repos` with `upstream` or a `base_repo` sync also rejects, with 400, an

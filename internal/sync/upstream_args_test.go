@@ -39,8 +39,8 @@ func longPathUpstream(t *testing.T, root string) string {
 // TestSyncArgLimitsAreTheDocumentedNumbers pins the limits that
 // docs/reference/http-api.md states.
 func TestSyncArgLimitsAreTheDocumentedNumbers(t *testing.T) {
-	if maxUpstreamURLBytes != 131070 || maxCredentialBytes != 131042 {
-		t.Fatalf("maxUpstreamURLBytes = %d, maxCredentialBytes = %d; the docs say 131070 and 131042", maxUpstreamURLBytes, maxCredentialBytes)
+	if MaxUpstreamURLBytes != 131070 || MaxCredentialBytes != 131042 {
+		t.Fatalf("MaxUpstreamURLBytes = %d, MaxCredentialBytes = %d; the docs say 131070 and 131042", MaxUpstreamURLBytes, MaxCredentialBytes)
 	}
 }
 
@@ -57,15 +57,15 @@ func TestUpstreamValuesPastGitArgLimit(t *testing.T) {
 		v      values
 		config bool
 	}{
-		{"URL at the limit", values{urlBytes: maxUpstreamURLBytes}, false},
-		{"URL one byte over", values{urlBytes: maxUpstreamURLBytes + 1}, true},
+		{"URL at the limit", values{urlBytes: MaxUpstreamURLBytes}, false},
+		{"URL one byte over", values{urlBytes: MaxUpstreamURLBytes + 1}, true},
 		{"URL of 200,000 bytes", values{urlBytes: 200_000}, true},
-		{"password at the limit", values{password: maxCredentialBytes}, false},
-		{"password one byte over", values{password: maxCredentialBytes + 1}, true},
+		{"password at the limit", values{password: MaxCredentialBytes}, false},
+		{"password one byte over", values{password: MaxCredentialBytes + 1}, true},
 		{"password of 200,000 bytes", values{password: 200_000}, true},
-		{"username at the limit", values{username: maxCredentialBytes}, false},
-		{"password at the limit next to a username", values{username: 1, password: maxCredentialBytes}, false},
-		{"username one byte over", values{username: maxCredentialBytes + 1}, true},
+		{"username at the limit", values{username: MaxCredentialBytes}, false},
+		{"password at the limit next to a username", values{username: 1, password: MaxCredentialBytes}, false},
+		{"username one byte over", values{username: MaxCredentialBytes + 1}, true},
 	} {
 		for _, lane := range []string{"pull", "push"} {
 			t.Run(lane+"/"+tc.name, func(t *testing.T) {

@@ -96,7 +96,7 @@ The `hook` subprocess also reads per-push variables that the Git server sets (na
 - `[config.go:resolveSweepSettings]` `OPENSTORAGE_REPO_RETENTION`, when non-zero, must be `>= jobs.MinRepoPurgeAge` and needs an active sweep.
 - `[config.go:resolveLFSGCSettings]` Grace and object budget must be `> 0`. Delete mode needs a non-zero interval.
 - `[config.go:resolveRepackThreshold]` The threshold must be `0` or `>= 2`.
-- `[config.go:resolveSyncEgress]` `OPENSTORAGE_SYNC_ALLOW_PRIVATE`, when set, governs both push and pull. A malformed value in either spelling is an error.
+- `[config.go:resolveSyncEgress]` `OPENSTORAGE_SYNC_ALLOW_PRIVATE`, when set to a non-empty value, governs both push and pull. A malformed value in either spelling is an error.
 - `[config.go:resolveSecretsCodec]` `decrypt-only` requires a configured key.
 - `[config.go:normalizeBaseURL]` The base URL must be `http` or `https` with a host and no query or fragment.
 - `[config.go:assertf]` Impossible states panic with `openstorage assertion failed:`. Input errors return errors.

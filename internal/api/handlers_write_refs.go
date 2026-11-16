@@ -1023,7 +1023,8 @@ func strictJSON(body []byte, dst any) error {
 // that JSON escapes to at most 192: at most 105,203 bytes and the request
 // path in `instance` (TestStrictBodiesBoundTheNamesTheyRepeat). No field
 // name in upstream's spec has more than 25 bytes. An answer that names
-// one member keeps its whole name, as before (errtext.MaxBytes cuts it).
+// one unknown member cuts its name at maxUnknownNameBytes, as the other
+// decoders do (unknownNameText).
 const maxListedNameBytes = 32
 
 // checkStrictObject verifies raw is a JSON object whose member names are
@@ -1073,9 +1074,11 @@ type strictProblem struct {
 	kind       strictKind
 }
 
-// err returns the problem as an error. cut cuts an unknown member name at
-// maxListedNameBytes: the other kinds name a field of the struct.
-func (p strictProblem) err(cut bool) error {
+// err returns the problem as an error. An unknown member name, which is
+// request text, is cut: at maxListedNameBytes when listed (the answer
+// names several problems), else as unknownNameText cuts it. The other
+// kinds name a field of the struct.
+func (p strictProblem) err(listed bool) error {
 	path := p.path + p.name
 	switch p.kind {
 	case strictRepeated:
@@ -1085,10 +1088,12 @@ func (p strictProblem) err(cut bool) error {
 	case strictNotObject:
 		return newFieldError(path, "must be an object", path+" must be a JSON object")
 	}
-	if cut {
+	path = p.path + errtext.Cut(p.name, maxUnknownNameBytes)
+	msg := unknownNameText(p.path, p.name)
+	if listed {
 		path = p.path + errtext.Cut(p.name, maxListedNameBytes)
+		msg = fmt.Sprintf("unknown field %q", path)
 	}
-	msg := fmt.Sprintf("unknown field %q", path)
 	if p.name == "" { // an empty member name has no dotted wire path
 		return errors.New(msg)
 	}
