@@ -740,6 +740,19 @@ old behavior, read `default_branch` from `GET /repo` and send it as `base_ref`.
 This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster behavior
 ([contract audit](../explanation/wire-compatibility.md#server-allocated-branch-contract)).
 
+#### Which commit the base and the tag target can name
+
+The commit that `base_ref`, `base_branch` or `preferred_base` of `POST /repos/branches/create`, or
+`ref` of `POST /repos/tags`, names must be in a pack that the repository's pack registry lists.
+The server checks the registered packs, not the node's cache repository, because every other node
+(and this node after it loses its cache) hydrates from the registered packs alone and cannot hold a
+ref at any other object. A commit that only a cache holds answers `404`, like a commit that does
+not exist, and a `base_ref` that names no usable commit still falls back to `preferred_base`. The
+server reads the registry only for a request that is about to write: after the ref policy, and not
+for a tag that exists or for a create that leaves the branch at its tip (with `force` or
+`expected_target_sha`). So a request that the policy denies
+answers `403` even when its commit is only in the cache.
+
 #### Guarded branch create and move
 
 `expected_target_sha` on `POST /repos/branches/create` (both path styles) guards the
@@ -979,10 +992,10 @@ Upstream documents no value and no `Link` or `Sunset` header, so open.storage se
 - Private and special-purpose destinations are denied, a permanent
   `repository configuration error` failure. Setting
   [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#openstorage_sync_allow_private) to
-  `true` admits loopback, RFC 1918, RFC 6598 shared, link-local and ULA addresses. Only
-  two cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`) and the other IANA
-  special-purpose ranges stay denied; a metadata endpoint inside an admitted range, such
-  as `100.100.100.200`, is admitted. The deprecated push-only
+  `true` admits loopback, RFC 1918, RFC 6598 shared, link-local and ULA addresses. The
+  [cloud metadata endpoints](configuration.md#cloud-metadata-endpoints), such as
+  `169.254.169.254` and `100.100.100.200`, and the other IANA special-purpose ranges
+  stay denied under every setting. The deprecated push-only
   [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](configuration.md#openstorage_sync_push_allow_private)
   counts only while `OPENSTORAGE_SYNC_ALLOW_PRIVATE` is unset or empty; when
   `OPENSTORAGE_SYNC_ALLOW_PRIVATE` has a non-empty value, the value of the deprecated
@@ -1003,7 +1016,11 @@ through this API) holds a ref that the run would otherwise forward at an older v
 the request stays pending, and a new run starts a few seconds later.
 
 **Ref policies fail closed:** any policy op denies pull-upstream, push-upstream, and a
-sync create at `POST /repos` (403).
+sync create at `POST /repos` (403). The 403 quotes the op (`ref policy op "no-push"
+denies pull-upstream`); an op of more than 256 bytes is cut there, as an unknown member
+name is (`"xx…" (100000 bytes)`). The 403s of `PATCH /repo` and `DELETE /repos/delete`
+quote it the same way, and so does the 403 of a ref, commit or merge write for an op
+that the server does not know (`unknown policy op "x" for refs/heads/main`).
 The same gate covers the sync that a ref write schedules. A REST write or git push from
 a token that carries any ref-policy op does not trigger the inbound sync, since the sync
 force-updates every head and tag from the upstream, not just the refs that token may

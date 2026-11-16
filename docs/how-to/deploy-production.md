@@ -499,7 +499,7 @@ Webhook deliveries use a native SSRF guard. By default, every attempt resolves t
 registered hostname at dial time and fails closed unless **every** answer is a public,
 global-unicast address outside the IANA special-purpose registries. The
 [reference](../reference/configuration.md#openstorage_webhook_allow_private) lists the
-denied ranges, including loopback, private, link-local, and cloud-metadata targets.
+denied ranges, including loopback, private, link-local, and cloud metadata targets.
 
 - **Dial time is authoritative.** Registration checks IP literals and current DNS answers
   only for fast feedback, so acceptance does not imply reachability. At dial time,
@@ -511,7 +511,8 @@ denied ranges, including loopback, private, link-local, and cloud-metadata targe
 
 To deliver to internal receivers, set `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE=true`. It admits
 loopback, RFC 1918, RFC 6598 shared, link-local, and ULA targets, and logs a startup
-warning. Cloud metadata (`169.254.169.254` and `fd00:ec2::254`), other IANA
+warning. The [cloud metadata endpoints](../reference/configuration.md#cloud-metadata-endpoints)
+(such as `169.254.169.254`, `fd00:ec2::254` and `100.100.100.200`), other IANA
 special-purpose ranges, malformed/non-routable targets, and redirects stay blocked. Keep
 network egress controls as defense in depth, especially where other workloads share the
 replica identity or network policy.

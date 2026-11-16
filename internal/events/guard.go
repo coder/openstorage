@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/coder/openstorage/internal/errtext"
 )
 
 // ErrTargetDenied marks dial-time policy denials (as opposed to ordinary
@@ -37,10 +39,12 @@ var ErrTargetDenied = errors.New("target denied by egress policy")
 //     vetted literals, closing the DNS-rebinding TOCTOU window that
 //     URL-time validation leaves open.
 type TargetGuard struct {
-	// AllowPrivate admits loopback/private/link-local/ULA delivery targets
-	// (OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE) for genuinely internal
-	// deployments. Cloud metadata and addresses that can never be a
-	// legitimate receiver (unspecified, multicast, broadcast) stay denied,
+	// AllowPrivate admits loopback, RFC 1918, RFC 6598 shared, link-local
+	// and ULA targets (OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE, and
+	// OPENSTORAGE_SYNC_ALLOW_PRIVATE for sync) for genuinely internal
+	// deployments. The cloud metadata endpoints (metadataAddrs), the other
+	// special-purpose ranges, and addresses that can never be a legitimate
+	// receiver (unspecified, multicast, broadcast, zone-scoped) stay denied,
 	// and redirects stay refused: the escape hatch relaxes only the private
 	// receiver classes, not the rest of the policy.
 	AllowPrivate bool
@@ -63,13 +67,88 @@ const registrationLookupTimeout = 2 * time.Second
 // client's overall 30s timeout bounds the whole delivery attempt.
 const dialTimeout = 10 * time.Second
 
+// metadataAddrs are the instance-metadata and credential endpoints that the
+// major clouds document. Each stays denied under every policy, AllowPrivate
+// too: the escape hatch admits internal receivers, not instance
+// credentials. Most of them lie inside a class that AllowPrivate admits
+// (link-local, RFC 6598 shared, ULA), so they are listed one by one; the
+// classes stay admitted around them. Sources, checked 2026-11-16:
+//
+//   - 169.254.169.254: AWS EC2, Google Cloud, Azure, Oracle Cloud,
+//     DigitalOcean, Akamai, Hetzner, Huawei Cloud and OpenStack instance
+//     metadata (for AWS:
+//     docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html).
+//   - fd00:ec2::254: AWS EC2 instance metadata over IPv6
+//     (docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html).
+//   - 169.254.170.2: AWS ECS task metadata and task role credentials
+//     (docs.aws.amazon.com/AmazonECS/latest/developerguide/security-iam-roles.html).
+//   - 169.254.170.23 and fd00:ec2::23: the AWS EKS Pod Identity Agent
+//     (docs.aws.amazon.com/eks/latest/userguide/pod-identities.html).
+//   - fd20:ce::254: Google Cloud metadata on IPv6-only instances
+//     (docs.cloud.google.com/compute/docs/metadata/querying-metadata).
+//   - 169.254.169.252: the GKE metadata server that Pods reach for
+//     Workload Identity
+//     (cloud.google.com/kubernetes-engine/docs/how-to/network-policy).
+//   - 100.100.100.200: Alibaba Cloud ECS metadata and RAM role credentials
+//     (alibabacloud.com/help/en/ecs/user-guide/view-instance-metadata).
+//   - 169.254.10.10: Tencent Cloud metadata.tencentyun.com
+//     (intl.cloud.tencent.com/document/product/248/36208), and
+//     169.254.0.23, its Cloudbase-Init metadata URL
+//     (intl.cloud.tencent.com/ind/document/product/1103/81285).
+//   - 169.254.42.42 and fd00:42::42: Scaleway instance metadata
+//     (scaleway.com/en/docs/instances/how-to/use-cloud-init).
+//   - fd00:a9fe:a9fe::1: Akamai (Linode) metadata over IPv6
+//     (techdocs.akamai.com/cloud-computing/docs/metadata-service-api).
+//   - fe80::a9fe:a9fe: OpenStack, Hetzner and Akamai metadata over IPv6
+//     (docs.openstack.org/nova/latest/user/metadata.html,
+//     docs.hetzner.com/cloud/technical-details/hcnet/).
+//   - fd00:c1::a9fe:a9fe: Oracle Cloud metadata and instance-principal
+//     credentials over IPv6, which Oracle's own SDK uses
+//     (github.com/oracle/oci-python-sdk,
+//     src/oci/auth/signers/instance_principals_security_token_signer.py:
+//     IMDS_IPV6_HOST), as does cloud-init (DataSourceOracle.py).
+//   - 168.63.129.16: Azure's WireServer, which Microsoft lists with the
+//     Instance Metadata Service as serving metadata and bootstrapping VM
+//     credentials
+//     (learn.microsoft.com/azure/virtual-machines/metadata-security-protocol/overview).
+//     It is a public address, so the guard denied it under no policy.
+//   - 192.0.0.192: Oracle Cloud Infrastructure Classic metadata
+//     (docs.oracle.com/en/cloud/iaas-classic/compute-iaas-cloud/stcsg/retrieving-instance-metadata.html),
+//     inside 192.0.0.0/24, which specialUsePrefixes denies too.
+var metadataAddrs = []netip.Addr{
+	netip.MustParseAddr("169.254.169.254"),
+	netip.MustParseAddr("fd00:ec2::254"),
+	netip.MustParseAddr("169.254.170.2"),
+	netip.MustParseAddr("169.254.170.23"),
+	netip.MustParseAddr("fd00:ec2::23"),
+	netip.MustParseAddr("fd20:ce::254"),
+	netip.MustParseAddr("169.254.169.252"),
+	netip.MustParseAddr("100.100.100.200"),
+	netip.MustParseAddr("169.254.10.10"),
+	netip.MustParseAddr("169.254.0.23"),
+	netip.MustParseAddr("169.254.42.42"),
+	netip.MustParseAddr("fd00:42::42"),
+	netip.MustParseAddr("fd00:a9fe:a9fe::1"),
+	netip.MustParseAddr("fe80::a9fe:a9fe"),
+	netip.MustParseAddr("fd00:c1::a9fe:a9fe"),
+	netip.MustParseAddr("168.63.129.16"),
+	netip.MustParseAddr("192.0.0.192"),
+}
+
+// isMetadata reports whether ip, unmapped and without a zone, is one of
+// metadataAddrs.
+func isMetadata(ip netip.Addr) bool {
+	for _, addr := range metadataAddrs {
+		if ip == addr {
+			return true
+		}
+	}
+	return false
+}
+
 var (
 	// broadcastV4 is the IPv4 limited-broadcast address, never a dial target.
 	broadcastV4 = netip.AddrFrom4([4]byte{255, 255, 255, 255})
-	// Cloud metadata remains denied even with AllowPrivate: the escape
-	// hatch enables internal webhook receivers, not instance credentials.
-	metadataV4 = netip.MustParseAddr("169.254.169.254")
-	metadataV6 = netip.MustParseAddr("fd00:ec2::254")
 	// RFC 6598 shared address space is non-public even though Go's
 	// IsGlobalUnicast reports true. Internal deployments may opt into it
 	// through AllowPrivate alongside RFC 1918.
@@ -136,7 +215,7 @@ func (g TargetGuard) deniedReason(ip netip.Addr) string {
 	switch {
 	case !ip.IsValid():
 		return "invalid address"
-	case ip == metadataV4 || ip == metadataV6:
+	case isMetadata(ip):
 		return "cloud metadata address"
 	case ip.IsUnspecified():
 		return "unspecified address"
@@ -159,7 +238,7 @@ func (g TargetGuard) deniedReason(ip netip.Addr) string {
 			return "shared address"
 		}
 	case ip.IsLinkLocalUnicast():
-		// 169.254/16 and fe80::/10 (except metadata above).
+		// 169.254/16 and fe80::/10 (except the metadata addresses above).
 		if !g.AllowPrivate {
 			return "link-local address"
 		}
@@ -221,18 +300,28 @@ func (g TargetGuard) vetHost(ctx context.Context, host string) ([]netip.Addr, er
 // is NOT a delivery-reachability promise (the resolver may be partitioned,
 // or the record may change later either way). Dial-time enforcement in
 // NewClient is authoritative.
+//
+// The error quotes the URL or its host with errtext.Quote: the URL is
+// request text of any length, and its host can hold an IPv6 zone of any
+// length.
 func (g TargetGuard) CheckRegistration(ctx context.Context, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("parse webhook url: %w", err)
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err // url.Error repeats the whole URL
+		}
+		// The parse error can repeat a part of the URL too, such as an
+		// invalid port.
+		return fmt.Errorf("parse webhook url %s: %s", errtext.Quote("", rawURL), errtext.Cut(err.Error(), errtext.MaxQuotedBytes))
 	}
 	host := u.Hostname()
 	if host == "" {
-		return fmt.Errorf("webhook url %s has no host", rawURL)
+		return fmt.Errorf("webhook url %s has no host", errtext.Quote("", rawURL))
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if reason := g.deniedReason(ip); reason != "" {
-			return fmt.Errorf("webhook target %s denied: %s", host, reason)
+			return fmt.Errorf("webhook target %s denied: %s", errtext.Quote("", host), reason)
 		}
 		return nil
 	}
@@ -244,7 +333,7 @@ func (g TargetGuard) CheckRegistration(ctx context.Context, rawURL string) error
 	}
 	for _, ip := range addrs {
 		if reason := g.deniedReason(ip); reason != "" {
-			return fmt.Errorf("webhook target %s resolves to denied address %s: %s", host, ip, reason)
+			return fmt.Errorf("webhook target %s resolves to denied address %s: %s", errtext.Quote("", host), ip, reason)
 		}
 	}
 	return nil

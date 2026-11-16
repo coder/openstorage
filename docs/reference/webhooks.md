@@ -21,6 +21,13 @@ the body omits it. `GET` never echoes secrets. A `secret` that holds a NUL byte 
 (`invalid secret (want UTF-8 text without NUL)`), and nothing is stored. A `DELETE` `{id}`
 that holds a NUL byte or invalid UTF-8 names no webhook → 404, as an unknown `id` does.
 
+A `url` that the egress guard refuses at registration → 400 (`invalid webhook url: …`),
+and nothing is stored. The answer quotes the refused host, or the whole URL when it has
+no host (`https://:80/hook`). A host or URL of more than 256 bytes is cut there to its
+first 256 bytes or fewer, at a character, and ends with `…` and its length in bytes. For
+a URL whose IPv6 zone has 100,000 bytes: `invalid webhook url: webhook target
+"fe80::1%xx…" (100008 bytes) denied: zone-scoped address`.
+
 ## Delivery headers
 
 ```
