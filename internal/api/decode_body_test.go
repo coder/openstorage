@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"reflect"
@@ -231,7 +232,10 @@ func TestDecodeError(t *testing.T) {
 // Pointer with each "/" written as ".": map keys that hold "." (kept as
 // is), "/" (written ~1) or "~" (written ~0), and members that null does
 // not fix. It has fields of embedded structs, and a field X in two of them,
-// which encoding/json drops, so that a member "X" is the field x.
+// which encoding/json drops, so that a member "X" is the field x. Each
+// map from Dp on is the field that encoding/json decodes a member into by
+// one of its field rules, beside a field of another type that the member
+// does not reach: the walk stops when it takes that one.
 type decodePathReq struct {
 	Decodes decodeCount               `json:"n"`
 	M       map[string]int            `json:"m"`
@@ -243,17 +247,78 @@ type decodePathReq struct {
 	Lower   int                       `json:"x"`
 	decodeEmbedded
 	*DecodePtrEmbedded
+	Dp          map[string]int `json:"dp"`
+	Skip        int            `json:"-"`
+	Dash        map[string]int `json:"-,"` //nolint:staticcheck // the name "-"
+	Ex0         int            `json:"Ex"`
+	Ex          map[string]int `json:"ex"`
+	Fo          map[string]int `json:"fo"`
+	Fo1         int            `json:"Fo"`
+	Op          map[string]int `json:"op,omitempty"`
+	Tilde       map[string]int `json:"t~1"`
+	decodeNamed `json:"named"`
+	decodeLevel                 //nolint:unused // encoding/json skips it
+	decodelevel struct{ Q int } //nolint:unused // encoding/json skips it
+	Level       map[string]int  `json:"DecodeLevel"`
+	Lf          map[string]int  `json:"LF"`
+	Backslash   map[string]int  `json:"bs\\x"` //nolint:staticcheck // the name "bs"
+	Nine        map[string]int  `json:"9\\x"`  //nolint:staticcheck // no name
+	Quote       int             `json:"'q'"`
+	QuoteK      map[string]int  `json:"Quote"`
+	Utf0        int             `json:"U\ufffdV"`
+	Utf         map[string]int  `json:"u\xffv"` //nolint:staticcheck // the name "u\ufffdv"
+	Cs          int             `json:"cs,case:strict"`
+	Ce          map[string]int  `json:"ce,case:strict"`
+	CsK         map[string]int  `json:"Cs"`
+	Ci          map[string]int  `json:"ci,case:strict,case:ignore"` //nolint:staticcheck // not strict
+	Inline      struct {
+		In map[string]int `json:"in"`
+	} `json:",embed"`
+	Rest struct {
+		K    int            `json:"k"`
+		More map[string]int `json:",embed"` // not the deeper Less
+		DecodeDeeper
+	} `json:"rest"`
+	Raw  jsontext.Value    `json:",embed"`
+	RawK map[string]int    `json:"raw"`
+	KM   map[decodeKey]int `json:",embed"` // plain fields: no string keys
+	IK   map[int]int       `json:",embed"` // or keys that unmarshal
 }
 
+type decodeKey string
+
+func (k *decodeKey) UnmarshalText(b []byte) error { *k = decodeKey(b); return nil }
+
 type decodeEmbedded struct {
-	E int `json:"e"`
-	X int
+	E  int `json:"e"`
+	X  int
+	Dp int            `json:"dp"`
+	Tg map[string]int `json:"Tg"`
+	DecodeLeaf
 }
 
 type DecodePtrEmbedded struct {
-	P int `json:"p"`
-	X int
+	P  int `json:"p"`
+	X  int
+	Tg int
+	DecodeLeaf
 }
+
+// DecodeLeaf is embedded twice at one depth, so encoding/json drops lf.
+type DecodeLeaf struct {
+	Lf int `json:"lf"`
+	*DecodeLeaf
+}
+
+type DecodeDeeper struct {
+	Less map[string]bool `json:",embed"`
+}
+
+type decodeNamed struct {
+	K int `json:"k"`
+}
+
+type decodeLevel int //nolint:unused // embedded in decodePathReq
 
 // decodeCount counts the decodes of the body that holds it.
 type decodeCount int
@@ -304,6 +369,14 @@ func TestUnmarshalBodyPaths(t *testing.T) {
 		{"fields of embedded structs", `{"e":"x","p":"y","count":"z"}`, []string{"e", "p", "count"}, 4},
 		{"a field that two embedded structs hide", `{"X":"a","x":"b"}`, []string{"X"}, 2},
 		{"a field name with a dot and a slash", `{"a.b/c":"x","A.B/C":"y","count":"z"}`, []string{"a.b~1c", "count"}, 3},
+		{"the shallower or only tagged field of a name, a dash", `{"dp":{"k":"x"},"Tg":{"k":"y"},"-":{"k":"w"},"count":"z"}`, []string{"dp.k", "Tg.k", "-.k", "count"}, 5},
+		{"the exact name, then the first in another case", `{"ex":{"k":"x"},"FO":{"k":"y"},"count":"z"}`, []string{"ex.k", "FO.k", "count"}, 4},
+		{"options, a named embedded struct, a name with ~1", `{"op":{"k":"x"},"named":{"k":"y"},"t~1":{"k":"w"},"count":"z"}`, []string{"op.k", "named.k", "t~01.k", "count"}, 5},
+		{"an embedded int that is not exported, a dropped name", `{"DECODELEVEL":{"k":"x"},"lf":{"k":"y"},"count":"z"}`, []string{"DECODELEVEL.k", "lf.k", "count"}, 4},
+		{"a tag name with a backslash, a quote, bad UTF-8", `{"bs":{"k":"x"},"Nine":{"k":"v"},"Quote":{"k":"y"},"u\ufffdv":{"k":"w"},"count":"z"}`, []string{"bs.k", "Nine.k", "Quote.k", "u\ufffdv.k", "count"}, 6},
+		{"case:strict", `{"CS":{"k":"x"},"ce":{"k":"v"},"CI":{"k":"y"},"count":"z"}`, []string{"CS.k", "ce.k", "CI.k", "count"}, 5},
+		{",embed", `{"in":{"k":"x"},"rest":{"zz":"y","k":"w"},"count":"z"}`, []string{"in.k", "rest.zz", "rest.k", "count"}, 5},
+		{",embed jsontext.Value, maps without string keys", `{"Raw":{"k":"x"},"KM":{"k":"y"},"IK":{"7":"w"},"count":"z"}`, []string{"Raw.k", "KM.k", "IK.7", "count"}, 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var dst decodePathReq

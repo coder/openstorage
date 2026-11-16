@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -197,8 +198,9 @@ type valueSpan struct {
 // a member is its name with "~" as "~0" and "/" as "~1", and an array
 // element is its index. A name takes one segment more than it holds ".". A
 // member of a struct is the field that encoding/json decodes it into (see
-// fieldFor): a member that is no field is never on the path, and members
-// that differ in case can be one field. A member of a map is its exact key.
+// fieldFor), and members that differ in case can be one field; a member
+// that is no field is on the path only as a key of the struct's `,embed`
+// map (see bodyFields). A member of a map is its exact key.
 // A type with its own UnmarshalJSON is walked as its fields, which is right
 // for a method that decodes into them (wrefCreateBranchRequest).
 type spanWalk struct {
@@ -233,9 +235,9 @@ func (w *spanWalk) value(t reflect.Type, path []string) error {
 
 // members reads an object that decodes into the struct or map t.
 func (w *spanWalk) members(t reflect.Type, path []string) error {
-	var fields []bodyField
+	st := structFields{rest: t} // a map takes every member
 	if t.Kind() == reflect.Struct {
-		fields = bodyFields(t)
+		st = bodyFields(t)
 	}
 	if _, err := w.dec.Token(); err != nil {
 		return err
@@ -250,12 +252,12 @@ func (w *spanWalk) members(t reflect.Type, path []string) error {
 		var next reflect.Type // nil: the member is not on the path
 		if n <= len(path) {
 			seg := strings.Join(path[:n], ".")
-			if t.Kind() == reflect.Map {
-				if strings.ReplaceAll(strings.ReplaceAll(name, "~", "~0"), "/", "~1") == seg {
-					next = t.Elem()
+			if i := fieldFor(st.fields, name); i >= 0 {
+				if i == fieldFor(st.fields, strings.ReplaceAll(strings.ReplaceAll(seg, "~1", "/"), "~0", "~")) {
+					next = st.fields[i].typ
 				}
-			} else if i := fieldFor(fields, name); i >= 0 && i == fieldFor(fields, strings.ReplaceAll(strings.ReplaceAll(seg, "~1", "/"), "~0", "~")) {
-				next = fields[i].typ
+			} else if st.rest != nil && st.rest.Kind() == reflect.Map && strings.ReplaceAll(strings.ReplaceAll(name, "~", "~0"), "/", "~1") == seg {
+				next = st.rest.Elem()
 			}
 		}
 		if next == nil {
@@ -299,22 +301,32 @@ func (w *spanWalk) skip() error {
 
 // bodyField is a field of a struct type that encoding/json decodes: its
 // JSON name, its type, its depth (more than 0 for a field of an embedded
-// struct) and whether its json tag gives the name.
+// struct), whether its json tag gives the name, and whether the name
+// matches in its own case only (the tag option case:strict).
 type bodyField struct {
-	name   string
-	typ    reflect.Type
-	depth  int
-	tagged bool
+	name           string
+	typ            reflect.Type
+	depth          int
+	tagged, strict bool
+}
+
+// structFields is what bodyFields returns for a struct type.
+type structFields struct {
+	fields []bodyField
+	rest   reflect.Type // the `,embed` map or jsontext.Value that takes the members that no field takes, or nil
 }
 
 // bodyFields returns the fields of the struct type t that encoding/json
-// decodes, in breadth-first order, by the rules of encoding/json: a struct
-// or a pointer to one that is embedded without a JSON name adds its fields
-// one level deeper, and of the fields with one name only the shallowest
-// one counts, or at one depth the only one whose json tag gives the name.
-func bodyFields(t reflect.Type) []bodyField {
+// decodes, in breadth-first order, by the rules of encoding/json (on
+// json/v2, as Go 1.27 builds it): a struct or a pointer to one that is
+// embedded without a JSON name, or has the option embed and no name, adds
+// its fields one level deeper, and of the fields with one name only the
+// shallowest one counts, or at one depth the only one whose json tag gives
+// the name. Of the fields that take the members that no field takes (see
+// takesRest), the shallowest one does, unless two share its depth.
+func bodyFields(t reflect.Type) structFields {
 	if fields, ok := bodyFieldsCache.Load(t); ok {
-		return fields.([]bodyField)
+		return fields.(structFields)
 	}
 	type embedded struct {
 		t      reflect.Type
@@ -323,7 +335,7 @@ func bodyFields(t reflect.Type) []bodyField {
 	}
 	queue := []embedded{{t, 0, true}}
 	seen := map[reflect.Type]bool{t: true}
-	var all []bodyField
+	var all, rests []bodyField
 	for i := 0; i < len(queue); i++ {
 		q := queue[i]
 		for j := range q.t.NumField() {
@@ -332,23 +344,26 @@ func bodyFields(t reflect.Type) []bodyField {
 			if tag == "-" || !sf.IsExported() && !sf.Anonymous {
 				continue
 			}
-			name, _, _ := strings.Cut(tag, ",")
+			name, embed, strict := jsonTag(tag)
 			ft := sf.Type
 			if ft.Kind() == reflect.Pointer && ft.Name() == "" {
 				ft = ft.Elem()
 			}
+			embed = name == "" && (embed || sf.Anonymous && ft.Kind() == reflect.Struct)
 			switch {
-			case sf.Anonymous && name == "" && ft.Kind() == reflect.Struct:
+			case embed && ft.Kind() == reflect.Struct:
 				if q.follow {
 					queue = append(queue, embedded{ft, q.depth + 1, !seen[ft]})
 				}
 				seen[ft] = true
+			case embed && sf.IsExported() && takesRest(ft):
+				rests = append(rests, bodyField{typ: ft, depth: q.depth})
 			case sf.IsExported() || ft.Kind() == reflect.Struct:
-				all = append(all, bodyField{cmp.Or(name, sf.Name), sf.Type, q.depth, name != ""})
+				all = append(all, bodyField{cmp.Or(name, sf.Name), sf.Type, q.depth, name != "", strict})
 			}
 		}
 	}
-	var fields []bodyField
+	var fields structFields
 	for i, f := range all {
 		counts := true
 		for j, g := range all {
@@ -358,8 +373,11 @@ func bodyFields(t reflect.Type) []bodyField {
 			}
 		}
 		if counts {
-			fields = append(fields, f)
+			fields.fields = append(fields.fields, f)
 		}
+	}
+	if len(rests) == 1 || len(rests) > 1 && rests[0].depth < rests[1].depth {
+		fields.rest = rests[0].typ
 	}
 	bodyFieldsCache.Store(t, fields)
 	return fields
@@ -368,13 +386,58 @@ func bodyFields(t reflect.Type) []bodyField {
 // bodyFieldsCache holds the bodyFields of each struct type.
 var bodyFieldsCache sync.Map
 
+// takesRest reports whether encoding/json gives the members that no field
+// takes to an exported field of type t (without pointers) that has the
+// option embed and no name: a jsontext.Value takes them as they are, and so
+// does a map whose key type is a string kind without marshal methods. Any
+// other such field is a plain field.
+func takesRest(t reflect.Type) bool {
+	if t.PkgPath() == "encoding/json/jsontext" && t.Name() == "Value" {
+		return true
+	}
+	return t.Kind() == reflect.Map && t.Key().Kind() == reflect.String && !slices.ContainsFunc(marshalMethods, func(m string) bool {
+		_, ok := reflect.PointerTo(t.Key()).MethodByName(m)
+		return ok
+	})
+}
+
+// marshalMethods are the methods by which a type marshals or unmarshals
+// itself in encoding/json.
+var marshalMethods = []string{"MarshalJSON", "MarshalJSONTo", "AppendText", "MarshalText", "UnmarshalJSON", "UnmarshalJSONFrom", "UnmarshalText"}
+
+// jsonTag returns the JSON name that a json struct tag gives, "" for none,
+// and whether its options hold embed, and case:strict without case:ignore,
+// as encoding/json reads the tag (parseFieldOptions of json/v2). The name
+// ends at the first ",". When a backslash, a quote or a backtick comes
+// first, the name is the run of letters, digits and "_" that starts the
+// tag, and none when that run is empty or starts with a digit. Invalid
+// UTF-8 in the name reads as U+FFFD, as in a member name.
+func jsonTag(tag string) (name string, embed, strict bool) {
+	name, opts, _ := strings.Cut(tag, ",")
+	if strings.ContainsAny(name, "\\'\"`") {
+		name = name[:len(name)-len(strings.TrimLeftFunc(name, func(r rune) bool {
+			return r == '_' || unicode.IsLetter(r) || unicode.IsNumber(r)
+		}))]
+		if r, _ := utf8.DecodeRuneInString(name); unicode.IsNumber(r) {
+			name = ""
+		}
+	}
+	ignore := false
+	for opt := range strings.SplitSeq(opts, ",") {
+		embed = embed || opt == "embed"
+		strict = strict || opt == "case:strict"
+		ignore = ignore || opt == "case:ignore"
+	}
+	return string([]rune(name)), embed, strict && !ignore
+}
+
 // fieldFor returns the index in fields of the field that encoding/json
 // decodes a member name into: the field of that name, else the first one
-// whose name matches it without regard to case. It returns -1 when no field
-// takes the name.
+// whose name matches it without regard to case and has no case:strict. It
+// returns -1 when no field takes the name.
 func fieldFor(fields []bodyField, name string) int {
 	if i := slices.IndexFunc(fields, func(f bodyField) bool { return f.name == name }); i >= 0 {
 		return i
 	}
-	return slices.IndexFunc(fields, func(f bodyField) bool { return strings.EqualFold(f.name, name) })
+	return slices.IndexFunc(fields, func(f bodyField) bool { return !f.strict && strings.EqualFold(f.name, name) })
 }
