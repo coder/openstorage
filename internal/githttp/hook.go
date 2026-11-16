@@ -443,6 +443,9 @@ func preReceive(ctx context.Context) (retErr error) {
 	// hooks — whose authority CASes commit — before rejecting the funny
 	// name and aborting the local atomic transaction, so letting one
 	// through recreates the authority-accepted/client-rejected wedge.
+	if err := denyUnregisteredTargets(ctx, repo, commands); err != nil {
+		return err
+	}
 	if atomicPush {
 		// Evaluated one command at a time (each command's name check
 		// before its policy), STOPPING at the first denial (Codex round-10 P2): a denied atomic push's
@@ -1840,21 +1843,6 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 			return err
 		}
 	}
-	// The new value must be in a pack that the registry lists. git has already
-	// checked that the object is readable, but it reads the node's cache, which
-	// can hold objects that no registered pack holds (a cache that was copied or
-	// edited out of band, or a registry that was rolled back). A ref at such an
-	// object wedges every node that hydrates from the registered packs. A push
-	// that carries its objects is safe: pre-receive registered its pack before
-	// this hook runs, and git moved the pack into the cache. The case that this
-	// closes is an update to an object that no pack of this push carries.
-	// Checked on the raw store, before the CAS, and denied per ref like a policy
-	// denial. Deletions have no new value.
-	if new != ref.ZeroSHA {
-		if err := unregisteredTargetCheck(ctx, st, repo, refName, new); err != nil {
-			return err
-		}
-	}
 	var inner ref.RefStore = st
 	if testMode() {
 		inner = injectCASDrop(inner)
@@ -2932,21 +2920,77 @@ func objectExists(sha string) bool {
 	panic(fmt.Sprintf("githttp assertion failed: cat-file -e %s: %v", sha, err))
 }
 
-// unregisteredTargetCheck is denyUnregisteredTarget. Tests that run the update
-// hook on an object id that they invented, to reach a later step, replace it.
-var unregisteredTargetCheck = denyUnregisteredTarget
+// mainStoreKinds returns the type of each id in the node's main object store
+// alone: the quarantine of the push in flight stays invisible, as in
+// objectInMainStore. An id that the main store lacks reads as "missing".
+func mainStoreKinds(ctx context.Context, ids []string) (map[string]string, error) {
+	var out strings.Builder
+	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check=%(objecttype)")
+	for _, kv := range os.Environ() {
+		switch {
+		case strings.HasPrefix(kv, "GIT_QUARANTINE_PATH="),
+			strings.HasPrefix(kv, "GIT_OBJECT_DIRECTORY="),
+			strings.HasPrefix(kv, "GIT_ALTERNATE_OBJECT_DIRECTORIES="):
+			// dropped: the quarantine must stay invisible to this check
+		default:
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = gitlimit.NoReplaceObjects(cmd.Env)
+	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	return ParseObjectKinds(ids, out.String())
+}
 
-// denyUnregisteredTarget refuses the update of refName to new when no pack that
-// the registry lists for repo holds the object. It reads the cache repository
-// through a RegisteredPackView, so only the registered packs answer. A registered
-// pack that the cache lacks (a fold replaced the packs after the cache was
-// hydrated) is downloaded first. An object that is no commit is left to the
-// other checks: only "missing" is refused here.
-func denyUnregisteredTarget(ctx context.Context, st ref.RefStore, repo, refName, new string) error {
+// denyUnregisteredTargets refuses a push, whole, when a command's new value is
+// an object that the node's cache holds and no registered pack holds. git
+// accepts such a command with an empty pack, because it reads the cache. Every
+// other node hydrates from the registered packs alone and cannot write a ref at
+// that object, so the ref would wedge the repository. A command that names an
+// object that the push's own pack carries is safe: the pack is registered
+// before any ref moves. So the check asks the registered packs, plus the
+// quarantine of this push, only for new values that the main store already
+// holds. A push that adds objects, the usual push, has none, and pays one
+// batch of git (the check of what the main store holds). The whole push is
+// refused, before any hold or upload: under --atomic an earlier update hook's
+// compare-and-swap would otherwise commit before a later command is refused.
+func denyUnregisteredTargets(ctx context.Context, repo string, commands []refCommand) error {
+	var ids []string
+	seen := map[string]bool{}
+	for _, c := range commands {
+		if c.new != ref.ZeroSHA && !seen[c.new] {
+			seen[c.new] = true
+			ids = append(ids, c.new)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	inMain, err := mainStoreKinds(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("pre-receive: read the object types of the new values in the main store: %w", err)
+	}
+	var stored []string
+	for _, id := range ids {
+		if inMain[id] != "missing" {
+			stored = append(stored, id)
+		}
+	}
+	if len(stored) == 0 {
+		return nil
+	}
 	repoPath, err := os.Getwd() // git runs hooks in the repository
 	if err != nil {
-		return fmt.Errorf("update: find the repository: %w", err)
+		return fmt.Errorf("pre-receive: find the repository: %w", err)
 	}
+	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
+	if err != nil {
+		return fmt.Errorf("pre-receive: open ref store: %w", err)
+	}
+	defer st.Close()
 	view, err := NewRegisteredPackView(ctx, st, repoPath, repo, func(ctx context.Context) error {
 		bl, err := blob.Open(ctx, mustEnv(envHookBlobURL...))
 		if err != nil {
@@ -2956,23 +3000,25 @@ func denyUnregisteredTarget(ctx context.Context, st ref.RefStore, repo, refName,
 		return HydratePacks(ctx, st, bl, repoPath, repo)
 	})
 	if err != nil {
-		return fmt.Errorf("update: read the registered packs: %w", err)
+		return fmt.Errorf("pre-receive: read the registered packs: %w", err)
 	}
 	defer view.Close()
 	var out strings.Builder
 	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check=%(objecttype)")
-	cmd.Env = gitlimit.NoReplaceObjects(view.Env(os.Environ()))
-	cmd.Stdin = strings.NewReader(new + "\n")
+	cmd.Env = gitlimit.NoReplaceObjects(view.EnvForPush(os.Environ(), envconfig.Getenv("GIT_QUARANTINE_PATH")))
+	cmd.Stdin = strings.NewReader(strings.Join(stored, "\n") + "\n")
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("update: read the object type of %s in the registered packs: %w", new, err)
+		return fmt.Errorf("pre-receive: read the object types of the new values in the registered packs: %w", err)
 	}
-	kinds, err := ParseObjectKinds([]string{new}, out.String())
+	kinds, err := ParseObjectKinds(stored, out.String())
 	if err != nil {
-		return fmt.Errorf("update: %w", err)
+		return fmt.Errorf("pre-receive: %w", err)
 	}
-	if kinds[new] == "missing" {
-		return refusef("update: %s is at %s, which no pack of this repository's registry holds", refName, new)
+	for _, c := range commands {
+		if c.new != ref.ZeroSHA && kinds[c.new] == "missing" {
+			return refusef("pre-receive: %s is at %s, which no pack of this repository's registry holds: only this node's cache has the object. Push the object again with its pack", c.ref, c.new)
+		}
 	}
 	return nil
 }

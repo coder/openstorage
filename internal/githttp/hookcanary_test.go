@@ -65,16 +65,6 @@ func canarySQLExec(t *testing.T, dbURL string, stmts ...string) {
 	}
 }
 
-// skipRegisteredTargetCheck lets a test run the update hook on an object id
-// that it invented: the check that a registered pack holds the new value would
-// refuse it before the step that the test wants to reach.
-func skipRegisteredTargetCheck(t *testing.T) {
-	t.Helper()
-	prev := unregisteredTargetCheck
-	unregisteredTargetCheck = func(context.Context, ref.RefStore, string, string, string) error { return nil }
-	t.Cleanup(func() { unregisteredTargetCheck = prev })
-}
-
 // canaryTable is a unique name for a table that does not exist.
 func canaryTable() string { return "canary_" + strings.ToLower(rand.Text()[:8]) }
 
@@ -128,7 +118,6 @@ func TestUpdateHookHidesStepErrors(t *testing.T) {
 	t.Run("WrapHookRefStore error", func(t *testing.T) {
 		canary := canaryTable()
 		records := hookEnv(t, canarySQLite(t))
-		skipRegisteredTargetCheck(t)
 		prev := WrapHookRefStore
 		t.Cleanup(func() { WrapHookRefStore = prev })
 		WrapHookRefStore = func(context.Context, ref.RefStore) (ref.RefStore, error) {

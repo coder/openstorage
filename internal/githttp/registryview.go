@@ -23,6 +23,10 @@ import (
 // that runs with GIT_OBJECT_DIRECTORY set to it, and with no alternates, reads
 // an object only when a registered pack holds it.
 
+// registryViewHealRounds bounds how often NewRegisteredPackView lists the packs
+// again after it fetched the ones that the cache lacked.
+const registryViewHealRounds = 3
+
 // RegisteredPackView is a temporary object directory that links the pack files
 // of the repository's cache that the registry lists, and nothing else.
 type RegisteredPackView struct {
@@ -40,6 +44,9 @@ type RegisteredPackView struct {
 func NewRegisteredPackView(ctx context.Context, st ref.RefStore, repoPath, repo string, heal func(context.Context) error) (*RegisteredPackView, error) {
 	packDir := filepath.Join(repoPath, "objects", "pack")
 	var packs []ref.Pack
+	// Another node can register a pack between the listing and the heal, so a
+	// listing that still names a missing pack heals again, within a bound, like
+	// HydratePacks.
 	for attempt := 0; ; attempt++ {
 		var err error
 		if packs, err = st.ListPacks(ctx, repo); err != nil {
@@ -55,7 +62,7 @@ func NewRegisteredPackView(ctx context.Context, st ref.RefStore, repoPath, repo 
 		if missing == "" {
 			break
 		}
-		if heal == nil || attempt > 0 {
+		if heal == nil || attempt >= registryViewHealRounds {
 			return nil, fmt.Errorf("%w: the cache of %s lacks the registered pack %s", ErrPackMissing, repo, missing)
 		}
 		if err := heal(ctx); err != nil {
@@ -113,6 +120,26 @@ func (v *RegisteredPackView) Env(base []string) []string {
 		}
 	}
 	return append(out, "GIT_DIR="+v.repoPath, "GIT_OBJECT_DIRECTORY="+v.dir)
+}
+
+// EnvForPush returns base for a git child that reads the registered packs and
+// the quarantine of a push in flight, and nothing else of the node's cache. With
+// a quarantine path, git keeps the quarantine as its object directory and the
+// view replaces the main store as the alternate. Without one, the view is the
+// object directory.
+func (v *RegisteredPackView) EnvForPush(base []string, quarantine string) []string {
+	if quarantine == "" {
+		return v.Env(base)
+	}
+	out := make([]string, 0, len(base)+2)
+	for _, kv := range base {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == "GIT_ALTERNATE_OBJECT_DIRECTORIES" {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "GIT_ALTERNATE_OBJECT_DIRECTORIES="+v.dir)
 }
 
 // ParseObjectKinds reads the output of `git cat-file

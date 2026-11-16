@@ -209,10 +209,7 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// update hook's format check before its CAS (issue #445): one GET of
 	// _wal/meta.json, so a wrong metadata format refuses the update instead
 	// of dropping its events. The post-CAS reads then revalidate with 304s.
-	// 22 = the update hook's check that a registered pack holds the new value
-	// (denyUnregisteredTarget): one listing of the registered packs, a manifest
-	// read. A delete has no new value, so the delete-only budget is unchanged.
-	const steadyBudget = 22
+	const steadyBudget = 21
 	if len(steady) > steadyBudget {
 		t.Errorf("steady-state push cost %d S3 round trips, budget is %d:\n%s",
 			len(steady), steadyBudget, censusTable(steady))
