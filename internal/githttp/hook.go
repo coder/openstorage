@@ -1474,11 +1474,13 @@ func atomicPushDFCheck(commands []refCommand) error {
 }
 
 // preReceivePolicyGate refuses pack publication unless it is justified:
-// either the push is wholly policy-allowed (vestigial packs from creates at
-// existing SHAs stay accepted, matching the no-pack path), or at least one
-// policy-ALLOWED command needs quarantined objects (its target is not in
-// the main object store yet). A push containing any denied command whose
-// allowed commands all target already-stored objects is refused whole —
+// either no command is refused (vestigial packs from creates at existing
+// SHAs stay accepted, matching the no-pack path), or at least one command
+// that policy allows and git lets reach the update hook needs quarantined
+// objects (its target is not in the main object store yet). A push
+// containing any denied command, or any command that git refuses before the
+// update hook (reachesUpdateHook), whose other commands all target
+// already-stored objects is refused whole —
 // its pack could only serve the denied refs (round-7 decoy) — with a
 // message telling the client to push the allowed updates separately. It
 // reuses the shared verdicts (enforceRefPolicy, plus the refusals of hidden
@@ -2929,15 +2931,16 @@ func objectExists(sha string) bool {
 	panic(fmt.Sprintf("githttp assertion failed: cat-file -e %s: %v", sha, err))
 }
 
-// reachesUpdateHook reports whether git's own connectivity check passes for sha,
-// the check that receive-pack runs for each command before it runs the update
-// hook (connected.c: rev-list --objects --stdin --not --all, with the hidden
-// refs excluded, over the quarantine and the main store). git still runs
-// pre-receive for a command that fails it ("missing necessary objects", or
-// "shallow update not allowed"), but the update hook never runs for that
-// command, so no ref can ever point into a pack that only it needs. A
-// exit of 128 is the answer "no": git cannot read the objects that the command
-// needs. Any other status says nothing about the command (a git without
+// reachesUpdateHook reports whether git's own connectivity check passes for sha.
+// receive-pack runs one such check over all commands before it runs any hook
+// (rev-list --objects --stdin --not --all, with the hidden refs excluded, over
+// the quarantine and the main store), and when it fails, it checks the commands
+// one by one and refuses the ones that fail ("missing necessary objects"). A
+// shallow update that git does not allow is skipped, and the pack that carries
+// it lacks the parents of its commits, so this check fails for it as well. git
+// still runs pre-receive for such a command, but the update hook never runs for
+// it, so no ref can ever point into a pack that only it needs. An exit of 128
+// is the answer "no": git cannot read the objects that the command needs. Any other status says nothing about the command (a git without
 // --exclude-hidden, before 2.39, answers 129; a signal or an out-of-memory kill
 // ends it too), so the answer is "yes" and the gate publishes as it did before:
 // a wrong refusal of a push that git accepts is worse than one junk pack. A git
