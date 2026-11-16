@@ -47,7 +47,7 @@ Each setting takes its value from the first source that is set:
 | [`OPENSTORAGE_RATE_BURST`](#openstorage_rate_rps--openstorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
 | [`OPENSTORAGE_TRUSTED_PROXIES`](#openstorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
 | [`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`](#openstorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
-| [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) | unset (transitional) | Unified sync egress policy: permit private-network upstreams for pull and push (metadata stays blocked) |
+| [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) | unset (transitional) | Unified sync egress policy: permit private-network upstreams for pull and push (two metadata addresses stay blocked) |
 | [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) | `false` | **Deprecated** push-only spelling of the sync egress policy |
 | [`OPENSTORAGE_SECRETS_KEY`](#openstorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
 | [`OPENSTORAGE_SECRETS_MODE`](#openstorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
@@ -337,12 +337,15 @@ limiters may trust. Bare IPs count as single-address entries.
 
 Unified egress policy for upstream sync in **both** directions (ADR-45).
 
-- **Default:** unset (transitional; see below).
+- **Default:** unset (transitional; see below). An empty value counts as unset.
+  `OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE` is a separate variable, not a legacy alias of
+  this one, so an empty value here lets it decide pushes.
 - **Values:**
   - `true`: both directions may target internal forges: loopback, RFC 1918, RFC 6598
-    shared, link-local and ULA addresses. The cloud-metadata addresses
+    shared, link-local and ULA addresses. Only two cloud-metadata addresses
     (`169.254.169.254`, `fd00:ec2::254`) and the other IANA special-purpose ranges stay
-    denied.
+    denied; a metadata endpoint inside an admitted range, such as `100.100.100.200`, is
+    admitted.
   - `false`: strict both ways; only public upstreams are dialable.
   - **Unset or empty:** pushes stay strict (the deprecated
     [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) may relax
@@ -350,8 +353,8 @@ Unified egress policy for upstream sync in **both** directions (ADR-45).
   - Malformed booleans are startup errors.
 - **Enforcement:** every http(s) sync transfer (`upstream_host` is caller-linked data)
   dials through a vetting proxy with the webhook destination policy: private, loopback,
-  link-local, metadata, and special-purpose targets are denied, with every DNS answer
-  re-vetted at connect time.
+  RFC 6598 shared, link-local, metadata, and special-purpose targets are denied, with
+  every DNS answer re-vetted at connect time.
 - **Covered:** pulls (`POST /repos/pull-upstream`, the first sync at `POST /repos`,
   freshness pokes) and push forwards (`POST /repos/push-upstream`, `forward_pushes`).
 - **Denied destination:** the upstream is never contacted. Pulls and pushes fail as
@@ -377,9 +380,10 @@ through an external proxy.
 - **Default:** `false`.
 - If [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) is unset or
   empty, `true` relaxes the private receiver classes for push forwards only.
-- If the unified variable has a value, the value of this one is ignored. A malformed
-  value still stops `serve` at startup.
-- Either way, setting it logs a boot deprecation notice naming the replacement.
+- If the unified variable has a non-empty value, the value of this one is ignored. A
+  malformed value still stops `serve` at startup.
+- Either way, setting it to a non-empty value logs a boot deprecation notice naming the
+  replacement.
 
 ### `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`
 
