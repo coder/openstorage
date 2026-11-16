@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -276,6 +277,77 @@ func TestIdentsPastGitArgLimit(t *testing.T) {
 					}
 				}
 			})
+		}
+	})
+}
+
+// TestValuesPastGitArgLimitAreNotEchoed sends values over their limit that
+// also hold a NUL. For a path, a range or a paths entry the size answers
+// first, so the 400 never quotes the value. For an ident the NUL answers
+// (neither problem quotes it), each field is named once, and the items of
+// invalid_params keep the order of the body's fields.
+func TestValuesPastGitArgLimitAreNotEchoed(t *testing.T) {
+	long := strings.Repeat("v", 200_000) + "\x00"
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		_, token := gitValuesRepo(t, e)
+		grepBody, err := json.Marshal(map[string]any{"query": map[string]any{"pattern": "needle"}, "paths": []string{long}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			name, method, path, field string
+			max                       int
+			body                      []byte
+		}{
+			{"diff path", http.MethodGet, "/api/v1/repos/diff?ref=main&path=" + url.QueryEscape(long), "path", maxGitPathBytes, nil},
+			{"blame range", http.MethodGet, "/api/v1/repos/blame?ref=main&path=a.txt&range=" + url.QueryEscape(long), "range", gitlimit.MaxArgBytes, nil},
+			{"grep paths", http.MethodPost, "/api/v1/repos/grep", "paths.0", maxGitPathBytes, grepBody},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				resp, body := e.doReq(t, tc.method, tc.path, token, tc.body, "")
+				requireTooLong(t, resp, body, tc.field, tc.max, tc.body != nil)
+				if len(body) > 1024 {
+					t.Fatalf("the 400 is %d bytes: it quotes the value", len(body))
+				}
+			})
+		}
+
+		fx := wrefSeedFixture(t, e)
+		raw, err := json.Marshal(wmMergeBody("feature", "main", "merge", map[string]any{
+			"author": map[string]any{"name": strings.Repeat("n", maxGitIdentBytes+1), "email": "a\x00b"}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, body := e.doReq(t, http.MethodPost, "/api/v1/repos/merge", fx.token, raw, "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("merge: status = %d, want 400 (body %.300s)", resp.StatusCode, body)
+		}
+		var p problemBody
+		if err := json.Unmarshal(body, &p); err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, ip := range p.InvalidParams {
+			names = append(names, ip.Name)
+		}
+		if want := []string{"author.name", "author.email"}; !slices.Equal(names, want) {
+			t.Fatalf("invalid_params names %v, want %v (body %.300s)", names, want, body)
+		}
+
+		// A name over the limit that also holds a NUL is one problem.
+		raw, err = json.Marshal(wmMergeBody("feature", "main", "merge", map[string]any{
+			"author": map[string]any{"name": strings.Repeat("n", maxGitIdentBytes+1) + "\x00", "email": "a@b"}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos/merge", fx.token, raw, "")
+		p = problemBody{}
+		if err := json.Unmarshal(body, &p); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 ||
+			p.InvalidParams[0].Name != "author.name" || p.InvalidParams[0].Reason != ipcNulReason {
+			t.Fatalf("merge: status %d, invalid_params %+v; want 400 naming author.name once, for its NUL", resp.StatusCode, p.InvalidParams)
 		}
 	})
 }

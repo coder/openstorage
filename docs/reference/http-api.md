@@ -222,13 +222,15 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   as one argument: 128 KiB (131,072 bytes) with its terminating NUL, so at most
   131,071 bytes with what the server puts around the value. A longer value answers
   `400` before git starts, on every platform: a `path` param or grep `paths` entry
-  over 131,060 bytes (git gets it at most as `:(literal)<path>/`), and a blame `range`
-  or grep `query.pattern` over 131,071 bytes. The message names the field and its
-  limit, and grep names the field in `invalid_params`. The limits on idents are with
-  the [commit writes](#commit-messages-and-idents). Linux also limits all arguments
-  and environment entries of one program together, to a quarter of the server's stack
-  limit (2 MiB with the usual 8 MiB). A server started with a stack limit of 2 MiB or
-  less can fail a request whose values each fit, and that answer is a 500.
+  over 131,060 bytes (git gets it at most as `:(literal)<path>/`; the files listings
+  check it without its trailing `/`), and a blame `range` or grep `query.pattern` over
+  131,071 bytes. The message names the field and its limit, and grep names the field
+  in `invalid_params`. The limits on idents are with the
+  [commit writes](#commit-messages-and-idents). Linux also limits all arguments and
+  environment entries of one program together: a quarter of the server's stack limit,
+  at most 6 MiB (2 MiB with the usual 8 MiB stack limit). A request with many values
+  whose sizes each fit, such as a grep with many short `paths`, or a server with a low
+  stack limit, can pass that total, and that answer is a `500`.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field
@@ -502,7 +504,9 @@ an sr.ht upstream still gets the `git` default.
 
 The worker hands the pair to git through a credential helper that reads it from the
 environment. A stored username or password that contains a carriage return, line feed
-or NUL fails the sync as a configuration error.
+or NUL fails the sync as a configuration error. So does one over 131,042 bytes, before
+git gets it: git takes it as one environment entry, such as
+`OPENSTORAGE_ASKPASS_PASSWORD=<password>`, which must fit 128 KiB with its terminating NUL.
 
 ### Files & trees (`git:read`)
 
@@ -822,6 +826,15 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 | `POST /repos/pull-upstream` | git:write | Optional body `{ref?, after?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header. Both body fields are accepted and ignored: every pull syncs all branches and tags of the upstream. A `ref` that holds a NUL byte is still a 400 on every backend, because PostgreSQL's job queue stores it as `jsonb`, which cannot hold a NUL. Upstream deprecated the body on 2026-10-08 |
 | `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional, deprecated body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400. Its fields are ignored |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
+
+A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`) is over
+131,070 bytes fails as `repository configuration error` before git starts. git gets the URL
+as one argument, and its HTTP transport hands it on with a `/` added, which must fit
+128 KiB with its terminating NUL. A stored credential that git cannot take fails the same
+way ([Git credentials](#git-credentials-generic-https-upstreams)). Values that each fit
+can still pass the total limit together: one git start can carry the URL twice and both
+credential entries, about 512 KiB at the limits, so a server with a stack limit of 2 MiB
+or less can fail such a run as a failed fetch or push.
 
 #### Deprecation header
 

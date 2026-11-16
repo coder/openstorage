@@ -537,6 +537,9 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 		return nil, &syncFailure{code: FailConfig, cause: fmt.Errorf(
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
 	}
+	if fail := upstreamURLFailure(up); fail != nil {
+		return nil, fail
+	}
 
 	tmp, err := os.MkdirTemp("", "openstorage-push-*")
 	if err != nil {

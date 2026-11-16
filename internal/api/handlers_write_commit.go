@@ -37,6 +37,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -528,23 +529,33 @@ func wcValidateBranchParam(field, name string) error {
 }
 
 // wcAuthorProblems returns each problem of one ident: the empty name and
-// email (one problem), a NUL in the name or the email (one problem each),
-// newlines, which would corrupt the GIT_AUTHOR_*/GIT_COMMITTER_*
-// env-based ident encoding, and a name or an email over maxGitIdentBytes
-// (one problem each). An environment value cannot hold a NUL.
+// email (one problem), a NUL in the name or the email or else one over
+// maxGitIdentBytes (one problem each), and newlines, which would corrupt
+// the GIT_AUTHOR_*/GIT_COMMITTER_* env-based ident encoding. An environment
+// value cannot hold a NUL.
 func wcAuthorProblems(field string, a wcAuthor) []error {
 	var problems []error
 	if err := requiredFields(field+" name and email are required",
 		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email}); err != nil {
 		problems = append(problems, err)
 	}
-	problems = append(problems, invalidTextEach(
+	problems = append(problems, identValueProblems(
 		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email})...)
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
 		problems = append(problems, newFieldError(field, "must not contain newlines", field+" contains newlines"))
 	}
-	problems = append(problems, tooLongEach(maxGitIdentBytes,
-		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email})...)
+	return problems
+}
+
+// identValueProblems returns, field by field in the order given, the NUL
+// problem of an ident value, or else its problem over maxGitIdentBytes.
+func identValueProblems(fields ...[2]string) []error {
+	var problems []error
+	for _, f := range fields {
+		if err := cmp.Or(invalidTextFields(f), tooLongField(f[0], f[1], maxGitIdentBytes)); err != nil {
+			problems = append(problems, err)
+		}
+	}
 	return problems
 }
 

@@ -424,13 +424,16 @@ func wmCommitTree(ctx context.Context, sc *wcScratch, tree string, parents []str
 // namespace after the update: `git rev-list --count <new> --not <every
 // pre-update persistent tip>`, minus the server-created commit when the
 // outcome created one. Only ephemeral sources promote; persistent sources
-// were already reachable and report 0.
+// were already reachable and report 0. The tips go on stdin: all the
+// arguments of one command must fit the system's total limit (about 2 MiB),
+// and a repository can hold more branches than that.
 func wmPromotedCommits(ctx context.Context, sc *wcScratch, tips map[string]string, newSHA string, createdCommit, sourceEphemeral bool) (int, error) {
 	if !sourceEphemeral {
 		return 0, nil
 	}
 	assertf(ref.ValidSHA(newSHA), "wmPromotedCommits: malformed sha %q", newSHA)
-	args := []string{"rev-list", "--count", newSHA, "--not"}
+	var revs strings.Builder
+	revs.WriteString(newSHA + "\n")
 	seen := map[string]bool{}
 	for name, tip := range tips {
 		if strings.HasPrefix(name, auth.EphemeralNamespacePrefix) {
@@ -438,10 +441,10 @@ func wmPromotedCommits(ctx context.Context, sc *wcScratch, tips map[string]strin
 		}
 		if !seen[tip] {
 			seen[tip] = true
-			args = append(args, tip)
+			revs.WriteString("^" + tip + "\n")
 		}
 	}
-	out, err := sc.git(ctx, nil, nil, args...)
+	out, err := sc.git(ctx, strings.NewReader(revs.String()), nil, "rev-list", "--count", "--stdin")
 	if err != nil {
 		return 0, err
 	}

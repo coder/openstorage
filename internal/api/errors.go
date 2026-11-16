@@ -272,18 +272,6 @@ func invalidTextFields(fields ...[2]string) error {
 	return nil
 }
 
-// invalidTextEach returns a fieldError for each field (dotted wire path ->
-// value) whose value is not meta.ValidText, in the order given.
-func invalidTextEach(fields ...[2]string) []error {
-	var problems []error
-	for _, f := range fields {
-		if err := invalidTextFields(f); err != nil {
-			problems = append(problems, err)
-		}
-	}
-	return problems
-}
-
 // tooLongMsg is the 400 message for a request value longer than max bytes.
 // git would take the value as one argument or one environment entry, which
 // must fit gitlimit.MaxArgBytes with what the server puts around it.
@@ -298,18 +286,6 @@ func tooLongField(name, value string, max int) error {
 		return nil
 	}
 	return newFieldError(name, fmt.Sprintf("must be at most %d bytes", max), tooLongMsg(name, max))
-}
-
-// tooLongEach returns tooLongField's problem of each field (dotted wire
-// path -> value), in the order given.
-func tooLongEach(max int, fields ...[2]string) []error {
-	var problems []error
-	for _, f := range fields {
-		if err := tooLongField(f[0], f[1], max); err != nil {
-			problems = append(problems, err)
-		}
-	}
-	return problems
 }
 
 // writeInvalidText writes the 400 for the first field that is not
