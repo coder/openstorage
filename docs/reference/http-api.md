@@ -426,6 +426,19 @@ the same scopes, query parameters and responses.
   `base_repo.auth.token`, `upstream.owner`, `upstream.name`), and nothing is stored. The
   stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
   decodes to valid UTF-8 already.
+- A `base_repo.auth.token` with a carriage return or line feed → 400 `bad_request`
+  naming it (`must not contain a carriage return or line feed`), and nothing is stored:
+  the sync worker hands the token to git through a credential helper that reads one
+  value per line, and every run would fail such a link as a configuration error. A
+  token that starts with `enc:` → 400 naming it (`is a reserved value`), the answer of
+  the [credential routes](#git-credentials-generic-https-upstreams), because the
+  credential store refuses that prefix. Here it is a check of the body, named with the
+  other invalid fields. A token gets one problem: a NUL first, then a line break, then
+  its length, then the prefix.
+- A sync create quotes a `provider`, `operation`, `access` or host that it refuses in
+  `detail`. A value of more than 256 bytes is cut there to its first 256 bytes or fewer,
+  at a character, and ends with `…` and its length in bytes, as an unknown member name
+  is: `invalid upstream host " xx…" (900000 bytes)`.
 - A sync create whose values git cannot take → 400 `bad_request`, and nothing is
   stored. An upstream URL over 131,070 bytes (`https://{host}/{owner}/{name}.git`; a
   host given with `http://` or `https://` is used as is, without trailing `/`s)
@@ -537,9 +550,12 @@ stores the username exactly as sent. An update that omits it clears the stored o
 
 A `username` or `password` that holds a NUL byte → 400 `bad_request` with `invalid_params`
 naming the field, on every credential route, and nothing is stored. So does one over
-131,042 bytes (`must be at most 131042 bytes`), which the sync run could not hand to git.
-A credential `id` that holds a NUL byte, in the body or in the path (also invalid UTF-8 in
-the path), names no credential → 404 `credential_not_found`, as an unknown `id` does.
+131,042 bytes (`must be at most 131042 bytes`), which the sync run could not hand to git,
+and one with a carriage return or line feed (`must not contain a carriage return or line
+feed`), which git's credential helper protocol cannot carry: every sync run would fail
+such a credential as a configuration error. A credential `id` that holds a NUL byte, in
+the body or in the path (also invalid UTF-8 in the path), names no credential → 404
+`credential_not_found`, as an unknown `id` does.
 
 A stored username is always sent as is. Git sends no credentials when the username is
 empty, so for a credential with no username the sync worker sends the upstream's
@@ -569,9 +585,9 @@ environment. A stored username or password that contains a carriage return, line
 or NUL fails the sync as a configuration error. So does one over 131,042 bytes, before
 git gets it: git takes it as one environment entry, such as
 `OPENSTORAGE_ASKPASS_PASSWORD=<password>`, which must fit 128 KiB with its terminating NUL.
-The credential routes and `POST /repos` refuse such a long value, so only a value
-stored without that check (before it, or by an older server during an upgrade) reaches
-this one.
+The credential routes and `POST /repos` refuse such a value, so only a value stored
+without those checks (before them, or by an older server during an upgrade) reaches this
+one.
 
 ### Files & trees (`git:read`)
 

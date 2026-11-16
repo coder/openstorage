@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/meta"
 	upsync "github.com/coder/openstorage/internal/sync"
 )
@@ -120,17 +121,17 @@ func validateSyncBaseRepo(spec *usyncBaseRepo, branchErr error, errs *bodyErrors
 		errs.add(newFieldError("base_repo.operation", "is not supported", `base_repo operation "fork" not supported`))
 		return ""
 	default:
-		errs.add(newFieldError("base_repo.operation", "must be sync or fork", "invalid base_repo operation "+strconv.Quote(spec.Operation)))
+		errs.add(newFieldError("base_repo.operation", "must be sync or fork", "invalid base_repo operation "+quoteValue(spec.Operation)))
 		return ""
 	}
 	if spec.Provider == "code" || spec.Provider == "code.storage" {
 		errs.add(newFieldError("base_repo.operation", "must be fork for this provider",
-			"base_repo provider "+strconv.Quote(spec.Provider)+` requires operation "fork"`))
+			"base_repo provider "+quoteValue(spec.Provider)+` requires operation "fork"`))
 		return ""
 	}
 	defaultHost, known := upsync.ProviderHost(spec.Provider)
 	if !known {
-		errs.add(newFieldError("base_repo.provider", "is not supported", "unsupported base_repo provider "+strconv.Quote(spec.Provider)))
+		errs.add(newFieldError("base_repo.provider", "is not supported", "unsupported base_repo provider "+quoteValue(spec.Provider)))
 	}
 	// Owner, name and token are stored, and PostgreSQL refuses a NUL in a
 	// text value (the token reaches it encrypted only when a secrets key is
@@ -141,20 +142,21 @@ func validateSyncBaseRepo(spec *usyncBaseRepo, branchErr error, errs *bodyErrors
 	if spec.Auth != nil {
 		token = spec.Auth.Token
 	}
-	// The token is stored as the link's git credential.
-	tokenErr := invalidTextFields([2]string{"base_repo.auth.token", token})
-	if tokenErr == nil {
-		tokenErr = tooLongField("base_repo.auth.token", token, upsync.MaxCredentialBytes)
+	// The token is stored as the link's git credential, which the store
+	// refuses when it starts with the reserved prefix.
+	tokenErr := credentialValueProblem("base_repo.auth.token", token)
+	if tokenErr == nil && meta.ReservedSecret(token) {
+		tokenErr = reservedSecretField("base_repo.auth.token")
 	}
 	var hostErr error
 	host = spec.UpstreamHost
 	switch {
 	case host != "" && !validUpstreamHost(host):
-		hostErr = newFieldError("base_repo.upstream_host", "is not a valid host", "invalid base_repo upstream_host "+strconv.Quote(spec.UpstreamHost))
+		hostErr = newFieldError("base_repo.upstream_host", "is not a valid host", "invalid base_repo upstream_host "+quoteValue(spec.UpstreamHost))
 	case host == "" && known:
 		if host = defaultHost; host == "" {
 			hostErr = newFieldError("base_repo.upstream_host", "is required for this provider",
-				"base_repo upstream_host is required for provider "+strconv.Quote(spec.Provider))
+				"base_repo upstream_host is required for provider "+quoteValue(spec.Provider))
 		}
 	}
 	urlErr := upstreamURLProblem("base_repo", spec.Owner, spec.Name, host, hostErr, sentHost(spec.UpstreamHost, "base_repo.upstream_host"), tokenErr, branchErr)
@@ -201,6 +203,24 @@ func upstreamURLProblem(prefix, owner, name, host string, hostErr error, hostPat
 		params = append(params, invalidParam{Name: hostPath, Reason: reason})
 	}
 	return newFieldErrors(strings.Join(msgs, "; "), params...)
+}
+
+// maxQuotedValueBytes bounds a value of a sync link that an answer quotes
+// (a provider, an operation, an access or a host), as maxUnknownNameBytes
+// bounds an unknown member name. A valid value is far shorter, and the body
+// limit lets a value reach 1 MiB, which JSON escapes can make six times
+// longer.
+const maxQuotedValueBytes = 256
+
+// quoteValue quotes v for an answer. A value of more than
+// maxQuotedValueBytes is cut at a character to at most that many bytes,
+// and ends with an ellipsis and its length in bytes: "xx…" (1000000 bytes).
+func quoteValue(v string) string {
+	q := strconv.Quote(errtext.Cut(v, maxQuotedValueBytes))
+	if len(v) > maxQuotedValueBytes {
+		q += " (" + strconv.Itoa(len(v)) + " bytes)"
+	}
+	return q
 }
 
 // sentHost is path, the wire path of a host field, when the body sent the
@@ -304,14 +324,14 @@ func (cfg upstreamConfig) validate(errs *bodyErrors) (host string) {
 		[][2]string{{"upstream.provider", cfg.Provider}, {"upstream.owner", cfg.Owner}, {"upstream.name", cfg.Name}},
 		func(name, value string) error {
 			if name == "upstream.provider" && !known {
-				return newFieldError(name, "is not supported", "unsupported upstream provider "+strconv.Quote(cfg.Provider))
+				return newFieldError(name, "is not supported", "unsupported upstream provider "+quoteValue(cfg.Provider))
 			}
 			return textField(name, value)
 		})
 	var accessErr, hostErr error
 	switch {
 	case cfg.Access != "" && cfg.Access != "app" && cfg.Access != "public":
-		accessErr = newFieldError("upstream.access", "must be app or public", "invalid upstream access "+strconv.Quote(cfg.Access))
+		accessErr = newFieldError("upstream.access", "must be app or public", "invalid upstream access "+quoteValue(cfg.Access))
 	case known && cfg.Provider != "github" && cfg.Access != "":
 		accessErr = newFieldError("upstream.access", "applies to provider github only", "upstream access applies to provider github only")
 	case known && cfg.Provider == "github" && cfg.Access != "public":
@@ -320,10 +340,10 @@ func (cfg upstreamConfig) validate(errs *bodyErrors) (host string) {
 	host = cfg.Host
 	switch {
 	case host != "" && !validUpstreamHost(host):
-		hostErr = newFieldError("upstream.host", "is not a valid host", "invalid upstream host "+strconv.Quote(cfg.Host))
+		hostErr = newFieldError("upstream.host", "is not a valid host", "invalid upstream host "+quoteValue(cfg.Host))
 	case host == "" && known:
 		if host = defaultHost; host == "" {
-			hostErr = newFieldError("upstream.host", "is required for this provider", "upstream host is required for provider "+strconv.Quote(cfg.Provider))
+			hostErr = newFieldError("upstream.host", "is required for this provider", "upstream host is required for provider "+quoteValue(cfg.Provider))
 		}
 	}
 	if urlErr := upstreamURLProblem("upstream", cfg.Owner, cfg.Name, host, hostErr, sentHost(cfg.Host, "upstream.host"), accessErr); urlErr != nil {
