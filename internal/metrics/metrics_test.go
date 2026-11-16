@@ -308,7 +308,7 @@ func TestInstrumentMuxCountsMuxGeneratedResponses(t *testing.T) {
 			return SurfaceGit
 		}
 	}
-	h := InstrumentMux(mux, mux, classify)
+	h := InstrumentMux(mux, classify)
 	for _, tc := range []struct {
 		target, surface, class string
 	}{

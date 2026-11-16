@@ -170,19 +170,20 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   missing repository is `404` first. A grep `query.pattern` that git refuses is found
   when git runs the search, after the checks of the body and the lookups of the
   repository and the ref, so it is named alone and a missing repository or ref is `404`
-  first. `POST /repos/merge`, `POST /repos/branches/create`, `DELETE /repos/branches`
-  (for a name that comes from the body: an `ephemeral` query parameter that is not valid
-  answers first and names no field), `POST /repos/tags`, `POST /repos`,
-  `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`, `DELETE /repos/notes`,
-  `POST /api/repos/{repo_name}/notes/append` (when its members
+  first. `POST /repos/merge`, `POST /repos/branches/create`, `POST /repos/tags`,
+  `POST /repos`, `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`,
+  `DELETE /repos/notes`, `POST /api/repos/{repo_name}/notes/append` (when its members
   and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
   `/repos/{repo_name}/git-credentials`, and `PUT
   /repos/{repo_name}/git-credentials/{git_credential_id}` give a body with several
   invalid fields one item for each of them. A `DELETE
   /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
   adds its message to `detail` and names no field. `PATCH /repo`, the pull-upstream
-  routes, `DELETE /repos/tags` and `DELETE /repos/git-credentials` check one body field
-  each (`default_branch`, `ref`, `name`, `id`), so they name that field. The commit
+  routes, `DELETE /repos/branches`, `DELETE /repos/tags` and `DELETE
+  /repos/git-credentials` check one body field each (`default_branch`, `ref`,
+  `target_branch` or its alias `name`, `name`, `id`), so they name that field
+  (`DELETE /repos/branches` for a name that comes from the body: an `ephemeral` query
+  parameter that is not valid answers first and names no field). The commit
   write routes (`commit-pack`, `diff-commit`, `restore-commit`) answer with upstream's
   `CommitWriteResponse` or `ProblemDetails`, which have no `invalid_params`, and the
   webhook routes and `push-upstream` are not part of upstream's API. A check on these
@@ -303,13 +304,16 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   archive and grep globs match it only through a wildcard (`a?b`, `a*`), which can
   match other names too. Upstream documents no path encoding, so the siblings are an
   extension ([#587](https://github.com/coder/openstorage/issues/587)).
-- **Paths that are not clean**: a path that holds `//`, `/./` or `/../` gets a `307` to
-  the clean path, and `/api` gets a `307` to `/api/`. `Location` keeps the query string,
+- **Paths that are not clean**: except on a `CONNECT` request, a path that holds `//`,
+  `/./` or `/../`, or ends in `/.` or `/..`, gets a `307` to the clean path, and an
+  absolute request target with no path (`http://host?q`) gets a `307` to `/`. `/api`
+  gets a `307` to `/api/`. `Location` keeps the query string,
   and a `GET` also gets a short HTML body that links to it. When that `Location` would
-  be longer than 16384 bytes, the server answers `404` instead of the redirect: the
+  be longer than 16384 bytes (also for `/api` with a long query), the server answers
+  `404` instead of the redirect: the
   `route_not_found` problem body (with `instance` cut as above) when the `Location`
-  starts with `/api/`, else the git surface's `{"error":"not a smart-http path"}`.
-  Send clean paths.
+  starts with `/api/`, else the git surface's `{"error":"not a smart-http path"}` (a
+  `Location` of `/healthz` too). Send clean paths.
 - **No client retries**: no SDK retries; every error surfaces immediately. Python
   client-side timeouts: 30s default, 60s diff/grep, 180s
   branch-create/merge/merge-preview/commit/tag/restore-commit.
@@ -1042,7 +1046,7 @@ Other limits and gaps:
 | 400 | invalid input, a `diff-commit` patch over 262144000 bytes among them ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 401 | no `Authorization` header, or a scheme other than `Bearer` (`Authentication required`) |
 | 403 | a token that fails verification (`Invalid or expired token`); permission or ref-policy denied; `authentication_unavailable` when the key store fails (retry) ([failure mapping](authentication.md#failure-mapping)) |
-| 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`); a path that is not clean, when its redirect `Location` would be longer than 16384 bytes |
+| 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`); a path that is not clean, or `/api`, when its redirect `Location` would be longer than 16384 bytes ([paths that are not clean](#conventions)) |
 | 405 | the path has routes, but not for this method (`Allow` lists them) |
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, failed ref guard (`expected_target_sha`, `expected_source_sha`, `expected_notes_ref_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 412 | a failed `restore-commit` `base_ref` precondition; a merge that is not a fast-forward under `ff_only`, or a merge or merge preview of unrelated histories without `allow_unrelated_histories` (a preview with `ff_only` answers `rejected` instead); a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)); a `branches/create` move guarded by `expected_target_sha` without `force` that is not a fast-forward ([details](#guarded-branch-create-and-move)) |

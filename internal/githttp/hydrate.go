@@ -886,6 +886,18 @@ func ensureHook(path, script string) (os.FileInfo, error) {
 // genuinely gone, not racing.
 const maxHydrateRaces = 8
 
+// hydrateMissingWait is the first wait between two listings that both find the
+// same pack missing (it doubles each time, to hydrateMissingWaitMax). A fold
+// that replaced the pack lists the replacement, so a pack that is listed and
+// missing twice in a row is no fold race. The orphan sweep can delete the bytes
+// of a pack that a writer registered just before, and restores them within one
+// pass: a reader that starts inside that window waits for the restore instead
+// of failing within milliseconds. Tests shorten it.
+var (
+	hydrateMissingWait    = 50 * time.Millisecond
+	hydrateMissingWaitMax = time.Second
+)
+
 // ErrPackMissing is returned (wrapped, match with errors.Is) when a
 // registered pack's blob stays missing after maxHydrateRaces listing passes:
 // the ref store references bytes that do not exist, which is corruption
@@ -925,12 +937,15 @@ func hydratePacksBy(ctx context.Context, bl blob.BlobStore, repoPath, repo strin
 		return err
 	}
 	var lastMissing error
-	for range maxHydrateRaces {
+	var prevMissingID string
+	wait := hydrateMissingWait
+	for attempt := range maxHydrateRaces {
 		packs, err := list(ctx)
 		if err != nil {
 			return err
 		}
 		lastMissing = nil
+		missingID := ""
 		for _, p := range packs {
 			base := filepath.Join(packDir, "pack-"+p.ID)
 			if _, err := os.Stat(base + ".idx"); err == nil {
@@ -941,12 +956,22 @@ func hydratePacksBy(ctx context.Context, bl blob.BlobStore, repoPath, repo strin
 					return err
 				}
 				lastMissing = fmt.Errorf("pack %s: %w", p.ID, err)
+				missingID = p.ID
 				break
 			}
 		}
 		if lastMissing == nil {
 			return nil
 		}
+		if missingID == prevMissingID && attempt < maxHydrateRaces-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+			wait = min(wait*2, hydrateMissingWaitMax)
+		}
+		prevMissingID = missingID
 	}
 	return fmt.Errorf("hydrate %s: %w after %d attempts: %v", repo, ErrPackMissing, maxHydrateRaces, lastMissing)
 }

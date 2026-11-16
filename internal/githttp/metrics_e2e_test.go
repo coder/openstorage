@@ -234,10 +234,10 @@ func TestMetricsListenerSeparateFromAPI(t *testing.T) {
 	}
 	// Mux-generated responses count too (Codex P2 on PR #327): /api is
 	// redirected by http.ServeMux itself, never reaching a handler.
-	apiCount := func(class string) float64 {
+	count := func(surface, class string) float64 {
 		_, body := httpGet(t, "http://"+n.metricsAddr+"/metrics", "")
 		for line := range strings.SplitSeq(body, "\n") {
-			if v, ok := strings.CutPrefix(line, `openstorage_http_requests_total{code_class="`+class+`",surface="api"} `); ok {
+			if v, ok := strings.CutPrefix(line, `openstorage_http_requests_total{code_class="`+class+`",surface="`+surface+`"} `); ok {
 				f, err := strconv.ParseFloat(v, 64)
 				if err != nil {
 					t.Fatalf("parse %q: %v", line, err)
@@ -245,10 +245,10 @@ func TestMetricsListenerSeparateFromAPI(t *testing.T) {
 				return f
 			}
 		}
-		t.Fatalf("api %s series missing", class)
+		t.Fatalf("%s %s series missing", surface, class)
 		return 0
 	}
-	redirBefore := apiCount("3xx")
+	redirBefore := count("api", "3xx")
 	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := noRedirect.Get("http://" + n.addr + "/api")
 	if err != nil {
@@ -258,18 +258,29 @@ func TestMetricsListenerSeparateFromAPI(t *testing.T) {
 	if resp.StatusCode/100 != 3 {
 		t.Fatalf("GET /api = %d, want a mux redirect", resp.StatusCode)
 	}
-	if d := apiCount("3xx") - redirBefore; d != 1 {
+	if d := count("api", "3xx") - redirBefore; d != 1 {
 		t.Fatalf("mux-generated /api redirect moved api 3xx by %v, want 1", d)
 	}
-	// So does the 404 that replaces a redirect whose Location is too long.
-	notFoundBefore := apiCount("4xx")
-	resp, err = noRedirect.Get("http://" + n.addr + "/api?" + strings.Repeat("a", 16384))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if d := apiCount("4xx") - notFoundBefore; resp.StatusCode != http.StatusNotFound || d != 1 {
-		t.Fatalf("GET /api with a long query = %d and moved api 4xx by %v, want 404 and 1", resp.StatusCode, d)
+	// So does the 404 that replaces a redirect whose Location is too long,
+	// under the surface whose 404 body it is: /healthz has no 404 of its
+	// own, so a redirect to it gets the git one.
+	for _, tc := range []struct{ target, surface, body string }{
+		{"/api?", "api", `"code":"route_not_found"`},
+		{"//healthz?", "git", `{"error":"not a smart-http path"}`},
+	} {
+		notFoundBefore := count(tc.surface, "4xx")
+		resp, err = noRedirect.Get("http://" + n.addr + tc.target + strings.Repeat("a", 16384))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d := count(tc.surface, "4xx") - notFoundBefore; resp.StatusCode != http.StatusNotFound || !strings.Contains(string(body), tc.body) || d != 1 {
+			t.Fatalf("GET %s with a long query = %d %.100s and moved %s 4xx by %v, want 404 %s and 1", tc.target, resp.StatusCode, body, tc.surface, d, tc.body)
+		}
 	}
 
 	before := gitCount()
