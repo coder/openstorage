@@ -172,6 +172,15 @@ against that limit twice: its compressed bytes and its decoded bytes), or with
 the wrong top-level type). The body is decoded before the request is authenticated, so
 the message never holds the text of Go's JSON decoder, which names Go types and structs.
 
+A batch that is not rejected as a whole answers `200` with one entry per requested
+object, in request order, and each entry repeats the object's `oid` and `size`. An
+entry whose `oid` is not 64 lowercase hex digits carries the per-object error `422`
+`oid must be 64 lowercase hex digits (sha256)`. It repeats an invalid `oid` of up to 64
+bytes unchanged, and a longer one cut to its first 64 bytes at a character boundary and
+ended with `…`, so the answer stays small whatever the `oid` holds. The 64 bytes count
+the text before JSON escapes it. git-lfs sends only valid oids, and it reports the error
+of an entry without matching its `oid` to the request.
+
 ## Interop invariant
 
 Objects and refs written through the HTTP API (commit-pack, merge, tags, notes) and

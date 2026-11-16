@@ -166,6 +166,13 @@ unchanged. The transfer hrefs are asymmetric by design:
 Upstream may presign uploads. The wire shape is identical either way (the `href` is
 opaque to clients), so this is a hardening choice, not a compatibility deviation.
 
+Each entry of a batch answer repeats the `oid` of its object, and the LFS batch spec sets
+no length for an `oid`. The entry of an invalid `oid` longer than 64 bytes repeats only
+its first 64 bytes, ended with `…`, with its per-object `422`
+([Git LFS](git-protocol-and-namespaces.md#git-lfs)). git-lfs never sends such an `oid`
+(its pointer parser accepts only 64 lowercase hex digits), and it reports the error of an
+entry without matching its `oid` to the request.
+
 ## The architectural difference: single-org
 
 Upstream code.storage is multi-tenant; open.storage deliberately is not. One deployment
