@@ -234,10 +234,10 @@ func TestMetricsListenerSeparateFromAPI(t *testing.T) {
 	}
 	// Mux-generated responses count too (Codex P2 on PR #327): /api is
 	// redirected by http.ServeMux itself, never reaching a handler.
-	apiRedirects := func() float64 {
+	apiCount := func(class string) float64 {
 		_, body := httpGet(t, "http://"+n.metricsAddr+"/metrics", "")
 		for line := range strings.SplitSeq(body, "\n") {
-			if v, ok := strings.CutPrefix(line, `openstorage_http_requests_total{code_class="3xx",surface="api"} `); ok {
+			if v, ok := strings.CutPrefix(line, `openstorage_http_requests_total{code_class="`+class+`",surface="api"} `); ok {
 				f, err := strconv.ParseFloat(v, 64)
 				if err != nil {
 					t.Fatalf("parse %q: %v", line, err)
@@ -245,10 +245,10 @@ func TestMetricsListenerSeparateFromAPI(t *testing.T) {
 				return f
 			}
 		}
-		t.Fatal("api 3xx series missing")
+		t.Fatalf("api %s series missing", class)
 		return 0
 	}
-	redirBefore := apiRedirects()
+	redirBefore := apiCount("3xx")
 	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := noRedirect.Get("http://" + n.addr + "/api")
 	if err != nil {
@@ -258,8 +258,18 @@ func TestMetricsListenerSeparateFromAPI(t *testing.T) {
 	if resp.StatusCode/100 != 3 {
 		t.Fatalf("GET /api = %d, want a mux redirect", resp.StatusCode)
 	}
-	if d := apiRedirects() - redirBefore; d != 1 {
+	if d := apiCount("3xx") - redirBefore; d != 1 {
 		t.Fatalf("mux-generated /api redirect moved api 3xx by %v, want 1", d)
+	}
+	// So does the 404 that replaces a redirect whose Location is too long.
+	notFoundBefore := apiCount("4xx")
+	resp, err = noRedirect.Get("http://" + n.addr + "/api?" + strings.Repeat("a", 16384))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if d := apiCount("4xx") - notFoundBefore; resp.StatusCode != http.StatusNotFound || d != 1 {
+		t.Fatalf("GET /api with a long query = %d and moved api 4xx by %v, want 404 and 1", resp.StatusCode, d)
 	}
 
 	before := gitCount()

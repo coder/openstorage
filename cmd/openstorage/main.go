@@ -372,9 +372,19 @@ func cmdServe(ctx context.Context, args []string) error {
 	// their own request contexts (and the stores hold no long-lived
 	// context), so work admitted before the signal completes normally
 	// within the bounded drain.
-	// Instrument the whole mux (ADR-48) so its own redirects count too.
+	// A mux redirect repeats the path and the query: a Location past the
+	// bound gets the 404 of the surface it leads to instead (the API's own
+	// BoundRedirects answers route_not_found). Instrument the whole mux
+	// (ADR-48) so its own redirects and those 404s count too.
+	tooLong := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := mux.Handler(r); pattern == "/api/" {
+			apiHandler.ServeHTTP(w, r)
+			return
+		}
+		githttp.NotFound(w, r)
+	})
 	active := newActiveRequests()
-	httpSrv := &http.Server{Handler: active.wrap(metrics.InstrumentMux(mux, metricsSurface))}
+	httpSrv := &http.Server{Handler: active.wrap(metrics.InstrumentMux(mux, api.BoundRedirects(mux, tooLong), metricsSurface))}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpSrv.Serve(ln) }()
 	select {
