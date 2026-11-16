@@ -338,8 +338,8 @@ limiters may trust. Bare IPs count as single-address entries.
 Both egress guards, for webhook deliveries and for sync transfers, deny these
 instance-metadata and credential endpoints under every policy, also with
 `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE=true` or `OPENSTORAGE_SYNC_ALLOW_PRIVATE=true`. Each
-entry is one address: the private class around it (link-local, RFC 6598 shared, ULA)
-stays admitted when the policy admits that class. An IPv4 address is denied in its
+entry is one address. Most lie inside a private class (link-local, RFC 6598 shared,
+ULA), and the rest of that class stays admitted when the policy admits it. An IPv4 address is denied in its
 IPv4-mapped IPv6 form too, and a DNS name is denied when it resolves to one of them, as
 `metadata.google.internal` does.
 
@@ -355,9 +355,12 @@ IPv4-mapped IPv6 form too, and a DNS name is denied when it resolves to one of t
 | `169.254.42.42`, `fd00:42::42` | Scaleway |
 | `fd00:a9fe:a9fe::1` | Akamai (Linode) (IPv6) |
 | `fe80::a9fe:a9fe` | OpenStack, Hetzner, Akamai (Linode) (IPv6) |
+| `fd00:c1::a9fe:a9fe` | Oracle Cloud (IPv6) |
 | `192.0.0.192` | Oracle Cloud Infrastructure Classic |
 
-`internal/events/guard.go` (`metadataAddrs`) cites the provider documentation of each.
+`internal/events/guard.go` (`metadataAddrs`) cites a source of each: the provider's
+documentation, or for `fd00:c1::a9fe:a9fe` Oracle's own SDK, whose documentation names
+only `169.254.169.254`.
 
 ### `OPENSTORAGE_SYNC_ALLOW_PRIVATE`
 
@@ -371,7 +374,7 @@ Unified egress policy for upstream sync in **both** directions (ADR-45).
     shared, link-local and ULA addresses. The
     [cloud metadata endpoints](#cloud-metadata-endpoints), the other IANA
     special-purpose ranges, multicast, broadcast, unspecified and zone-scoped
-    addresses, and IPv6 outside `2000::/3` stay denied.
+    addresses, and the rest of IPv6 outside `2000::/3` stay denied.
   - `false`: strict both ways; only public upstreams are dialable.
   - **Unset or empty:** pushes stay strict (the deprecated
     [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) may relax
@@ -420,8 +423,7 @@ Controls the native webhook SSRF guard.
   RFC 1918, RFC 6598 shared, IPv4/IPv6 link-local, IPv6 ULA, translation/protocol
   anycast, documentation, benchmarking, reserved, unspecified, multicast, broadcast, and
   the [cloud metadata endpoints](#cloud-metadata-endpoints). IPv4-mapped IPv6 is
-  normalized first, so `::ffff:10.0.0.1` is
-  private.
+  normalized first, so `::ffff:10.0.0.1` is private.
 - **`true`** (Go boolean; logs a startup warning): admits loopback, RFC 1918, RFC 6598
   shared, link-local, and ULA receivers. Use it only for intentionally internal webhooks.
   It **still blocks** the [cloud metadata endpoints](#cloud-metadata-endpoints) (such

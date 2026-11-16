@@ -10,24 +10,24 @@ import (
 	"testing"
 )
 
-// cloudMetadataAddrs spells out metadataAddrs (guard.go cites the
-// provider documentation of each), so a test fails when one leaves the
-// guard.
+// cloudMetadataAddrs spells out metadataAddrs (guard.go cites a source of
+// each), so a test fails when one leaves the guard.
 var cloudMetadataAddrs = []string{
-	"169.254.169.254",   // AWS, Google Cloud, Azure, Oracle Cloud and others
-	"fd00:ec2::254",     // AWS IPv6
-	"169.254.170.2",     // AWS ECS task metadata and credentials
-	"169.254.170.23",    // AWS EKS Pod Identity Agent
-	"fd00:ec2::23",      // AWS EKS Pod Identity Agent IPv6
-	"fd20:ce::254",      // Google Cloud IPv6-only instances
-	"100.100.100.200",   // Alibaba Cloud
-	"169.254.10.10",     // Tencent Cloud metadata.tencentyun.com
-	"169.254.0.23",      // Tencent Cloud Cloudbase-Init
-	"169.254.42.42",     // Scaleway
-	"fd00:42::42",       // Scaleway IPv6
-	"fd00:a9fe:a9fe::1", // Akamai (Linode) IPv6
-	"fe80::a9fe:a9fe",   // OpenStack, Hetzner and Akamai IPv6
-	"192.0.0.192",       // Oracle Cloud Infrastructure Classic
+	"169.254.169.254",    // AWS, Google Cloud, Azure, Oracle Cloud and others
+	"fd00:ec2::254",      // AWS IPv6
+	"169.254.170.2",      // AWS ECS task metadata and credentials
+	"169.254.170.23",     // AWS EKS Pod Identity Agent
+	"fd00:ec2::23",       // AWS EKS Pod Identity Agent IPv6
+	"fd20:ce::254",       // Google Cloud IPv6-only instances
+	"100.100.100.200",    // Alibaba Cloud
+	"169.254.10.10",      // Tencent Cloud metadata.tencentyun.com
+	"169.254.0.23",       // Tencent Cloud Cloudbase-Init
+	"169.254.42.42",      // Scaleway
+	"fd00:42::42",        // Scaleway IPv6
+	"fd00:a9fe:a9fe::1",  // Akamai (Linode) IPv6
+	"fe80::a9fe:a9fe",    // OpenStack, Hetzner and Akamai IPv6
+	"fd00:c1::a9fe:a9fe", // Oracle Cloud IPv6
+	"192.0.0.192",        // Oracle Cloud Infrastructure Classic
 }
 
 // TestTargetGuardDeniesCloudMetadataUnderEveryPolicy: every cloud metadata
@@ -109,6 +109,7 @@ func TestTargetGuardMetadataNeighborsKeepTheirClass(t *testing.T) {
 		"fd20:ce::255",
 		"fd00:ec2::22",
 		"fe80::a9fe:a9ff",
+		"fd00:c1::a9fe:a9ff",
 	} {
 		t.Run(strings.ReplaceAll(raw, ":", "_"), func(t *testing.T) {
 			t.Parallel()

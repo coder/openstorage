@@ -74,7 +74,8 @@ const dialTimeout = 10 * time.Second
 //
 //   - 169.254.169.254: AWS EC2, Google Cloud, Azure, Oracle Cloud,
 //     DigitalOcean, Akamai, Hetzner, Huawei Cloud and OpenStack instance
-//     metadata.
+//     metadata (for AWS:
+//     docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html).
 //   - fd00:ec2::254: AWS EC2 instance metadata over IPv6
 //     (docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html).
 //   - 169.254.170.2: AWS ECS task metadata and task role credentials
@@ -95,6 +96,11 @@ const dialTimeout = 10 * time.Second
 //     (techdocs.akamai.com/cloud-computing/docs/metadata-service-api).
 //   - fe80::a9fe:a9fe: OpenStack, Hetzner and Akamai metadata over IPv6
 //     (docs.openstack.org/nova/latest/user/metadata.html).
+//   - fd00:c1::a9fe:a9fe: Oracle Cloud metadata and instance-principal
+//     credentials over IPv6, which Oracle's own SDK uses
+//     (github.com/oracle/oci-python-sdk,
+//     src/oci/auth/signers/instance_principals_security_token_signer.py:
+//     IMDS_IPV6_HOST), as does cloud-init (DataSourceOracle.py).
 //   - 192.0.0.192: Oracle Cloud Infrastructure Classic metadata
 //     (docs.oracle.com/en/cloud/iaas-classic/compute-iaas-cloud/stcsg/retrieving-instance-metadata.html),
 //     inside 192.0.0.0/24, which specialUsePrefixes denies too.
@@ -112,6 +118,7 @@ var metadataAddrs = []netip.Addr{
 	netip.MustParseAddr("fd00:42::42"),
 	netip.MustParseAddr("fd00:a9fe:a9fe::1"),
 	netip.MustParseAddr("fe80::a9fe:a9fe"),
+	netip.MustParseAddr("fd00:c1::a9fe:a9fe"),
 	netip.MustParseAddr("192.0.0.192"),
 }
 
