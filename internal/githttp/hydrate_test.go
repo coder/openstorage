@@ -679,6 +679,7 @@ func TestHydratePacks_MissingPackExhaustsBound(t *testing.T) {
 	defer bl.Close()
 	gone := ref.Pack{ID: "gone", Key: blob.PackKey(repo, "gone")}
 	st := &scriptedPacks{lists: [][]ref.Pack{{gone}}}
+	shortenHydrateWait(t)
 
 	repoPath, err := EnsureCacheRepo(t.TempDir(), repo)
 	if err != nil {
@@ -693,6 +694,61 @@ func TestHydratePacks_MissingPackExhaustsBound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), gone.ID) {
 		t.Fatalf("error must name the missing pack %q: %v", gone.ID, err)
+	}
+}
+
+// shortenHydrateWait makes the wait between two listings that find the same
+// pack missing 1 ms for the test. The test must not run in parallel.
+func shortenHydrateWait(t *testing.T) {
+	t.Helper()
+	oldWait, oldMax := hydrateMissingWait, hydrateMissingWaitMax
+	hydrateMissingWait, hydrateMissingWaitMax = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { hydrateMissingWait, hydrateMissingWaitMax = oldWait, oldMax })
+}
+
+// A pack that is listed and missing on consecutive listings is no fold race:
+// the sweeper can have deleted the bytes of a pack that a writer registered, and
+// restores them within one pass. The hydration waits between the listings for
+// the restore. A pack that a fold replaced needs no wait.
+func TestHydratePacks_WaitsForAPackThatStaysMissing(t *testing.T) {
+	ctx := context.Background()
+	const repo = "t-hydrate-wait"
+	bl, err := blob.OpenFile("file://" + t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer bl.Close()
+	back := ref.Pack{ID: "back", Key: blob.PackKey(repo, "back")}
+	oldWait, oldMax := hydrateMissingWait, hydrateMissingWaitMax
+	hydrateMissingWait, hydrateMissingWaitMax = 100*time.Millisecond, 100*time.Millisecond
+	defer func() { hydrateMissingWait, hydrateMissingWaitMax = oldWait, oldMax }()
+	// The blob comes back 250 ms after the first listing.
+	packFile := buildTestPack(t)
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		_ = bl.UploadFile(ctx, back.Key, packFile)
+	}()
+	st := &scriptedPacks{lists: [][]ref.Pack{{back}}}
+	repoPath, err := EnsureCacheRepo(t.TempDir(), repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
+		t.Fatalf("hydrate of a pack that comes back within the wait: %v", err)
+	}
+	if st.calls < 3 {
+		t.Fatalf("ListPacks called %d times, want at least 3 (the wait covers the first two misses)", st.calls)
+	}
+
+	// The wait ends with the context.
+	gone := ref.Pack{ID: "gone", Key: blob.PackKey(repo, "gone")}
+	hydrateMissingWait, hydrateMissingWaitMax = time.Hour, time.Hour
+	cctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = HydratePacks(cctx, &scriptedPacks{lists: [][]ref.Pack{{gone}}}, bl, repoPath, repo)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+		t.Fatalf("hydrate with a context that ends = %v after %v, want the context error soon", err, time.Since(start))
 	}
 }
 
