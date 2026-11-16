@@ -1371,6 +1371,10 @@ func TestResolveSyncEgress(t *testing.T) {
 			env:  map[string]string{envSyncAllowPrivate: "false"},
 			want: syncEgressSettings{},
 		},
+		"empty unified counts as unset": {
+			env:  map[string]string{envSyncAllowPrivate: "", envSyncPushAllowPrivate: "true"},
+			want: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true, pullTransitional: true, legacyPushFlagSet: true},
+		},
 		"unified wins over legacy": {
 			env:  map[string]string{envSyncAllowPrivate: "false", envSyncPushAllowPrivate: "true"},
 			want: syncEgressSettings{legacyPushFlagSet: true},

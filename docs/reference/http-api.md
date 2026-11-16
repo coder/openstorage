@@ -941,10 +941,17 @@ Upstream documents no value and no `Link` or `Sunset` header, so open.storage se
   Auth, config, and rejection failures do not retry.
 - A successful run schedules one follow-up inbound sync, so a pull that raced the forward
   cannot strand a stale local snapshot.
-- Private/special destinations are denied (permanent `repository configuration error`
-  failure) unless
+- Private and special-purpose destinations are denied, a permanent
+  `repository configuration error` failure. Setting
+  [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#openstorage_sync_allow_private) to
+  `true` admits loopback, RFC 1918, RFC 6598 shared, link-local and ULA addresses. Only
+  two cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`) and the other IANA
+  special-purpose ranges stay denied; a metadata endpoint inside an admitted range, such
+  as `100.100.100.200`, is admitted. The deprecated push-only
   [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](configuration.md#openstorage_sync_push_allow_private)
-  opts internal forges in.
+  counts only while `OPENSTORAGE_SYNC_ALLOW_PRIVATE` is unset or empty; when
+  `OPENSTORAGE_SYNC_ALLOW_PRIVATE` has a non-empty value, the value of the deprecated
+  variable is ignored (a malformed one still stops `serve` at startup).
 
 **Events and cancellation:** outbound runs emit `repo.push_upstream.*` events
 ([webhooks](webhooks.md)); inbound runs emit `repo.sync.*`. An outbound run emits
@@ -995,7 +1002,11 @@ freshness pokes) and push-upstream forwards.
 
 - Governed by
   [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#openstorage_sync_allow_private).
-  Transitional default: pulls allow private upstreams, pushes deny.
+  Transitional default: pulls allow private upstreams, pushes deny. While
+  `OPENSTORAGE_SYNC_ALLOW_PRIVATE` is unset or empty, the deprecated push-only
+  `OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE` can relax pushes; when
+  `OPENSTORAGE_SYNC_ALLOW_PRIVATE` has a non-empty value, the value of the deprecated
+  variable is ignored.
 - A denied pull destination fails the run as `repository configuration error`; a denied
   push destination fails the same way.
 - `POST /repos` with `upstream` or a `base_repo` sync also rejects, with 400, an

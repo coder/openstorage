@@ -20,8 +20,10 @@ package sync
 // GIT_ALLOW_PROTOCOL pin, PLUS a dial-time destination guard (egress.go):
 // writes into private networks are a stronger SSRF primitive than the
 // pull lane's reads, so every http(s) push dials through a vetting proxy
-// that denies private/special destinations unless the operator opts in
-// (OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE); see docs/adr/044.
+// that denies private and special-purpose destinations.
+// OPENSTORAGE_SYNC_ALLOW_PRIVATE=true admits only the private classes. The
+// deprecated push-only OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE counts only
+// while that one is unset or empty; see docs/adr/044 and docs/adr/045.
 
 import (
 	"context"
