@@ -127,3 +127,20 @@ func TestTryAdmitMaintenanceDoubleReleasePanics(t *testing.T) {
 	}()
 	r()
 }
+
+// ArgListBytes counts each value's length plus ArgListEntryBytes, so an
+// empty value still costs its argument.
+func TestArgListBytes(t *testing.T) {
+	for _, c := range []struct {
+		values []string
+		want   int
+	}{
+		{nil, 0},
+		{[]string{""}, ArgListEntryBytes},
+		{[]string{"a", "bcd"}, 4 + 2*ArgListEntryBytes},
+	} {
+		if got := ArgListBytes(c.values); got != c.want {
+			t.Errorf("ArgListBytes(%q) = %d, want %d", c.values, got, c.want)
+		}
+	}
+}
