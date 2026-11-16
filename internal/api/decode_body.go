@@ -130,14 +130,6 @@ func paramsText(params []invalidParam) string {
 	return strings.Join(items, "; ")
 }
 
-// maxUnknownNameBytes bounds the member name that an answer naming one
-// unknown member repeats (unknownNameText). The longest field name of a
-// request body has 25 bytes, so a misspelled name is repeated whole. A
-// longer name is no field name, and the body limit lets it reach 1 MiB:
-// `error` and `detail` repeat it with escapes of up to 6 bytes for each
-// byte, which made answers of 12 MB.
-const maxUnknownNameBytes = 256
-
 // unknownFieldText returns `unknown field "x"` for the error that
 // encoding/json gives a member that DisallowUnknownFields refuses, and ""
 // for any other error. That error has no type: its text is fixed (pinned by
@@ -152,7 +144,7 @@ func unknownFieldText(err error) string {
 	if uerr != nil {
 		return ""
 	}
-	if len(name) <= maxUnknownNameBytes {
+	if len(name) <= errtext.MaxQuotedBytes {
 		return "unknown field " + rest
 	}
 	return unknownNameText("", name)
@@ -160,15 +152,12 @@ func unknownFieldText(err error) string {
 
 // unknownNameText returns `unknown field "x"` for an unknown member name
 // of the object at the dotted path path ("" for the body), x being
-// path+name. A name of more than maxUnknownNameBytes is cut at a
-// character to at most that many bytes, and the text ends with an
-// ellipsis and the length of the name: `unknown field "xx…" (1000000 bytes)`.
+// path+name. The name is quoted with errtext.Quote: one of more than
+// errtext.MaxQuotedBytes is cut, and the text ends with the length of the
+// name: `unknown field "xx…" (1000000 bytes)`. No field name of a request
+// body has more than 25 bytes, so a misspelled one is quoted whole.
 func unknownNameText(path, name string) string {
-	text := "unknown field " + strconv.Quote(path+errtext.Cut(name, maxUnknownNameBytes))
-	if len(name) > maxUnknownNameBytes {
-		text += " (" + strconv.Itoa(len(name)) + " bytes)"
-	}
-	return text
+	return "unknown field " + errtext.Quote(path, name)
 }
 
 // nullMembers returns body with every value at the dotted path field

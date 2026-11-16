@@ -60,6 +60,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/ref"
@@ -503,7 +504,7 @@ func (s *server) wmCheckRefPolicy(w http.ResponseWriter, r *http.Request, sc *wc
 			// promoted commits already passed hook verification at push
 			// time, so verify-sig lets them through (hook parity).
 		default:
-			return deny("unknown policy op " + op + " for " + refName)
+			return deny("unknown policy op " + errtext.Quote("", op) + " for " + refName)
 		}
 	}
 	return true

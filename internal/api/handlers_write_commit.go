@@ -324,7 +324,7 @@ func wcCheckRefPolicy(w http.ResponseWriter, claims *auth.Claims, refName string
 			wcFail(w, http.StatusForbidden, "forbidden", "policy verify-sig denies unsigned server-created commits on "+refName, "", "")
 			return false
 		default:
-			wcFail(w, http.StatusForbidden, "forbidden", "unknown policy op "+op+" for "+refName, "", "")
+			wcFail(w, http.StatusForbidden, "forbidden", "unknown policy op "+errtext.Quote("", op)+" for "+refName, "", "")
 			return false
 		}
 	}
