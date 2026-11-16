@@ -185,9 +185,23 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 	}
 	started := base
 	started.Type = EventPushUpstreamStarted
-	w.emitDetached(ctx, job.Org, EventPushUpstreamStarted, started.marshal())
-
-	rejected, runErr := w.transferPush(ctx, job, repo, up, holder, force)
+	// On every backend, the started event goes out once the loopback fetch
+	// has its snapshot, before the upstream push, or when the run ends
+	// before that (TestPushRunStartedPrecedesUpstreamPush). A run whose
+	// fetch is refused for a stale held ref restores its request and emits
+	// nothing, like a failed publication wait: a started event with no
+	// terminal event would show a run that never ends.
+	startedSent := false
+	emitStarted := func() {
+		if !startedSent {
+			startedSent = true
+			w.emitDetached(ctx, job.Org, EventPushUpstreamStarted, started.marshal())
+		}
+	}
+	rejected, runErr := w.transferPush(ctx, job, repo, up, holder, force, emitStarted)
+	if !errors.Is(runErr, errHeldRefStale) {
+		emitStarted()
+	}
 	if errors.Is(runErr, errDetached) {
 		return nil // detach raced the run: the row is gone, cancel silently
 	}
@@ -217,14 +231,25 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 		}
 	}
 
-	if w.Local != nil && errors.Is(runErr, errHeldRefStale) {
+	if errors.Is(runErr, errHeldRefStale) {
 		// The snapshot would have forwarded a held ref older than the
 		// authority: hand the request back, like a failed publication
 		// wait, and retry once the holding push has published or exited.
-		return w.restoreLocal(ctx, job, holder, "push", runErr, func(fctx context.Context) (Upstream, error) {
-			return w.Local.FinishPushOutcome(fctx, job.RepoID, holder,
-				meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: localPublicationRetryDelay})
-		})
+		if w.Local != nil {
+			return w.restoreLocal(ctx, job, holder, "push", runErr, func(fctx context.Context) (Upstream, error) {
+				return w.Local.FinishPushOutcome(fctx, job.RepoID, holder,
+					meta.PushOutcome{Kind: meta.OutcomeRestore, Force: force, Delay: localPublicationRetryDelay})
+			})
+		}
+		// River: fail the run after the restore, so the job's completion
+		// gate snoozes it as an uncovered pending request.
+		rs := w.Upstreams.(ShutdownRestorer)
+		if rerr := w.restoreLocal(ctx, job, holder, "push", runErr, func(fctx context.Context) (Upstream, error) {
+			return rs.RestorePush(fctx, job.RepoID, holder, force)
+		}); rerr != nil {
+			return shutdownErr(ctx, rerr)
+		}
+		return shutdownErr(ctx, fmt.Errorf("push %s: %w", job.RepoID, runErr))
 	}
 
 	var fin Upstream
@@ -489,9 +514,9 @@ func localPushOutcome(runErr error, attempt int, force bool) meta.PushOutcome {
 }
 
 // errHeldRefStale marks a loopback fetch that the server refused with 423
-// Locked (githttp.Server.StrictSyncFetch): a push holds a ref whose cached
-// value is older than the authority, so the snapshot would forward a
-// stale ref. A local run restores its request instead of ending done.
+// Locked (githttp.Server's strict sync fetch): a push holds a ref whose
+// cached value is older than the authority, so the snapshot would forward
+// a stale ref. The run restores its request instead of ending done.
 var errHeldRefStale = errors.New("loopback fetch refused: a push holds a stale cached ref")
 
 // heldRefStale reports whether git fetch stderr carries the server's 423:
@@ -501,11 +526,13 @@ func heldRefStale(stderr string) bool {
 	return strings.Contains(stderr, "HTTP 423") || strings.Contains(stderr, "returned error: 423")
 }
 
-// transferPush performs the loopback fetch + upstream push. A nil error is
-// success; errDetached/errClaimStolen abandon silently; other failures are
+// transferPush performs the loopback fetch + upstream push, and calls
+// fetched once the fetch succeeded. A nil error is success;
+// errDetached/errClaimStolen abandon silently; other failures are
 // *syncFailure values, with rejected non-nil exactly when the failure is
 // FailRejected.
-func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Upstream, holder string, force bool) (rejected []RejectedRef, err error) {
+func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Upstream, holder string, force bool, fetched func()) (rejected []RejectedRef, err error) {
+	assertf(fetched != nil, "transferPush: nil fetched")
 	if up.Owner == "" || up.Name == "" || up.UpstreamHost == "" {
 		return nil, &syncFailure{code: FailConfig, cause: fmt.Errorf(
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
@@ -548,6 +575,7 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 		}
 		return nil, &syncFailure{code: FailInternal, cause: cause}
 	}
+	fetched()
 
 	// Empty local repo: nothing to publish, the run still counts as a
 	// success (converged by definition).
@@ -585,7 +613,7 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	// credential-less file:// upstreams in tests just work). An omitted
 	// username gets the per-provider default (credentialAuth), like the
 	// pull fetch.
-	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up.Provider)
+	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up)
 	if fail != nil {
 		return nil, fail
 	}
@@ -666,9 +694,6 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	default:
 	}
 	if err != nil {
-		if f := argumentFailure("git push", err); f != nil {
-			return nil, f
-		}
 		// A recorded policy denial dominates every other classification:
 		// the destination is refused by configuration, so retrying (or
 		// reading rejection porcelain) would be noise.

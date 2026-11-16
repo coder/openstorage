@@ -28,8 +28,8 @@ Line 1 — metadata frame:
 {"metadata": {
   "target_branch": "main",              // required; no "refs/" prefix allowed
   "commit_message": "msg",              // required
-  "author": {"name": "A", "email": "a@x"},       // required
-  "committer": {"name": "...", "email": "..."},  // optional
+  "author": {"name": "A", "email": "a@x"},       // required; name and email: at most 131,051 bytes each
+  "committer": {"name": "...", "email": "..."},  // optional; the same limit as author
   "expected_head_sha": "<40-hex>",      // optional CAS guard
   "base_branch": "main",                // optional: start new branch from here
   "ephemeral": false,                   // target in ephemeral namespace
@@ -68,7 +68,15 @@ Lines 2..N — one or more blob chunk frames per `upsert` file, in order:
   get 400 `invalid`.
 - Clients normalize paths (leading slashes stripped); the backend should still reject
   `..` traversal and absolute paths defensively.
-- Modes: `100644`, `100755`, `120000` (symlink), `160000` (submodule).
+- `operation` defaults to `upsert`. `content_id` is required for an `upsert` only: a
+  `delete` needs none, and a `content_id` that is given must be unique.
+- A `delete` sends no chunks, or one empty final chunk with its `content_id`
+  (`{"data": "", "eof": true}`), outside any upsert's run of chunks, as the upstream
+  request example does. Any other chunk for a `delete` gets 400.
+- Modes: `100644`, `100755`, `120000` (symlink), `160000` (submodule). `644` and
+  `100664` are stored as `100644`, and `755` and `100775` as `100755`, as upstream
+  does. An omitted or empty mode means `100644`. Any other mode on an `upsert` gets
+  400 `invalid`, and a `delete` ignores its mode.
 
 ### Server semantics
 
@@ -101,6 +109,9 @@ The patch is a standard git unified diff (binary patches per official docs: outp
 changes nothing, such as an empty diff (one `{"data": "", "eof": true}` frame), gets 412
 `precondition_failed` with the message `no changes to commit`. A stream that ends before
 the `eof` chunk gets 412 too, and a stream without any `diff_chunk` frame gets 400.
+The decoded patch, summed over its chunks, may hold at most 262144000 bytes (250 MiB, the
+`commit-pack` limit). Past that, the server stops reading and answers 400 `invalid` with
+the message `diff exceeds 262144000 bytes`, as for a chunk over 4 MiB. No ref moves.
 
 When the patch cannot be used, the answer depends on why:
 

@@ -32,7 +32,7 @@ func TestSyncPokeRefPolicyGate(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			up := newSyncUpstream(t)
-			url := "sync-poke-" + tc.name
+			url := runUnique("sync-poke-" + tc.name)
 			id := createSyncedRepo(t, nodeA, up, url)
 			waitForMain(t, id, revParse(t, up.work, "HEAD"))
 			base := waitSyncSettled(t, id, 1)

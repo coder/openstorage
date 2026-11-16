@@ -3,7 +3,9 @@ package gitread
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -130,8 +132,8 @@ func TestGrepBadPattern(t *testing.T) {
 	f := newFixture(t)
 	_, err := Grep(context.Background(), f.dir, f.c2, GrepOptions{Pattern: "["})
 	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 128 {
-		t.Fatalf("bad-pattern grep err = %v, want exit status 128", err)
+	if !errors.Is(err, ErrBadPattern) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 128 {
+		t.Fatalf("bad-pattern grep err = %v, want ErrBadPattern with exit status 128", err)
 	}
 }
 
@@ -181,5 +183,111 @@ func TestGrepKeepsServerCharacterLocale(t *testing.T) {
 		if len(files) != 1 || len(files[0].Lines) != 1 {
 			t.Errorf("grep %+v under LC_ALL=C.UTF-8 = %+v, want one match", opts, files)
 		}
+	}
+}
+
+// git grep that cannot read a blob prints "error: ... unable to read" and
+// still exits 0 with the other files' matches, or 1 with none. That is a
+// broken repository, not a result: Grep returns an error.
+func TestGrepUnreadableBlobIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "a.txt", "hello one\n", 0o644)
+	writeFile(t, dir, "b.txt", "hello two\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "c")
+	commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	oid := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD:b.txt"))
+	if err := os.Remove(filepath.Join(dir, ".git", "objects", oid[:2], oid[2:])); err != nil {
+		t.Fatal(err)
+	}
+	for _, pattern := range []string{"hello", "zzz"} {
+		files, err := Grep(context.Background(), dir, commit, GrepOptions{Pattern: pattern})
+		if err == nil || errors.Is(err, ErrBadPattern) {
+			t.Errorf("grep %q with b.txt's blob gone: files = %+v, err = %v, want git's read error", pattern, files, err)
+		}
+	}
+}
+
+// Only git's diagnostic for a blob it cannot read, a stderr line that ends
+// "': unable to read <oid>", makes a grep that exited 0 or 1 a read error.
+// It counts wherever it is in stderr, after 70 KiB of other lines too, and
+// for a path that holds a newline. Other "error: " lines, such as git's
+// complaint about an attribute name, are not read errors.
+func TestGrepReadErrorIsGitsUnreadableObjectLine(t *testing.T) {
+	f := newFixture(t)
+	oid := strings.Repeat("ce", 20)
+	noise := strings.Repeat("warning: Negative patterns are ignored in git attributes\nUse '\\!' for literal leading exclamation.\n", 700)
+	for _, code := range []int{0, 1} {
+		for _, tc := range []struct {
+			name, stderr string
+			readErr      bool
+		}{
+			{"unreadable blob", "error: 'HEAD:b.txt': unable to read " + oid, true},
+			{"unreadable blob, then 70 KiB", "error: 'HEAD:b.txt': unable to read " + oid + "\n" + noise, true},
+			{"unreadable blob with a newline in its path", "warning: a\nerror: 'HEAD:x\ny.txt': unable to read " + oid + "\n", true},
+			{"unreadable blob with a 64-hex (SHA-256) id", "error: 'HEAD:b.txt': unable to read " + strings.Repeat("ce", 32) + "\n", true},
+			{"unreadable blob with a 300-byte path, in one write", "error: 'HEAD:" + strings.Repeat("d/", 150) + "b.txt': unable to read " + oid + "\n", true},
+			{"unable to read without the quoted name", "error: unable to read " + oid + "\n", false},
+			{"attribute name", "error: is not a valid attribute name: .gitattributes:2\n", false},
+			{"diagnostic text inside a line", "warning: ': unable to read " + oid + " and more\n", false},
+		} {
+			failingBlameGit(t, code, tc.stderr, "grep")
+			files, err := Grep(context.Background(), f.dir, f.c1, GrepOptions{Pattern: "zzz"})
+			if (err != nil) != tc.readErr || errors.Is(err, ErrBadPattern) {
+				t.Errorf("exit %d, %s: files = %+v, err = %.200v, want a read error: %v", code, tc.name, files, err, tc.readErr)
+			}
+		}
+	}
+}
+
+// A repository's own .gitattributes, even one that git complains about
+// ("error: is not a valid attribute name"), does not stop grep: git 2.41
+// and later read no such file (noTreeAttrsEnv), and an older git's
+// complaint is not a read error.
+func TestGrepAttributeErrorsAreNotReadErrors(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, ".gitattributes", "!neg diff\nfoo error:\n", 0o644)
+	writeFile(t, dir, "a.txt", "hello one\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "c")
+	commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	files, err := Grep(context.Background(), dir, commit, GrepOptions{Pattern: "hello"})
+	if err != nil || len(files) != 1 || files[0].Path != "a.txt" {
+		t.Fatalf("grep hello = %+v, %v, want a.txt", files, err)
+	}
+}
+
+// Only a last stderr line that starts with git's "fatal: -e option, '" is
+// ErrBadPattern: the same text later in that line, after a path or other
+// request text, or on an earlier line, is another failure.
+func TestGrepBadPatternIsOnlyGitsHead(t *testing.T) {
+	f := newFixture(t)
+	for _, tc := range []struct {
+		name, stderr string
+		bad          bool
+	}{
+		{"git's head", "fatal: -e option, '[': Unmatched [, [^, [:, [., or [=\n", true},
+		{"git's head after a warning", "warning: x\nfatal: -e option, '[': Unmatched [\n", true},
+		{"the head inside the last line", "fatal: unable to read 'x fatal: -e option, '[': y'\n", false},
+		{"the head on an earlier line", "fatal: -e option, '[': y\nfatal: bad object\n", false},
+	} {
+		failingBlameGit(t, 128, tc.stderr, "grep")
+		_, err := Grep(context.Background(), f.dir, f.c1, GrepOptions{Pattern: "zzz"})
+		if err == nil || errors.Is(err, ErrBadPattern) != tc.bad {
+			t.Errorf("%s: err = %.200v, want ErrBadPattern: %v", tc.name, err, tc.bad)
+		}
+	}
+}
+
+// grepUnreadableWatch reads a line that git writes in pieces.
+func TestGrepUnreadableWatchJoinsWrites(t *testing.T) {
+	var w grepUnreadableWatch
+	for _, s := range []string{"error: 'HEAD:", strings.Repeat("d/", 200), "b.txt': unable to read ", strings.Repeat("ce", 20), "\nwarning: x\n"} {
+		_, _ = w.Write([]byte(s))
+	}
+	if !w.seen() {
+		t.Fatal("the diagnostic, written in pieces, was not seen")
 	}
 }

@@ -52,10 +52,10 @@ func TestHydrateStrictHeld_RefusesStaleHeldRef(t *testing.T) {
 	}
 }
 
-// TestServerHydrate_StrictOnlyForLocalPushRunFetch: only an upload-pack
-// with a sync claim on a StrictSyncFetch server hydrates strictly, and it
+// TestServerHydrate_StrictOnlyForPushRunFetch: only an upload-pack with a
+// sync claim (a push run's loopback fetch) hydrates strictly, and it
 // answers 423 Locked, which the worker reads as "restore".
-func TestServerHydrate_StrictOnlyForLocalPushRunFetch(t *testing.T) {
+func TestServerHydrate_StrictOnlyForPushRunFetch(t *testing.T) {
 	st, bl, cacheDir := hydrateEnv(t)
 	repoPath := mustHydrate(t, st, bl, cacheDir, "r")
 	mintHold(t, repoPath, "refs/heads/held")
@@ -64,20 +64,18 @@ func TestServerHydrate_StrictOnlyForLocalPushRunFetch(t *testing.T) {
 	st.mu.Unlock()
 	st.setGen(8)
 	for _, tc := range []struct {
-		strict  bool
 		service string
 		claim   string
 		want    bool
 	}{
-		{true, "upload-pack", "holder", true},
-		{true, "upload-pack", "", false},
-		{true, "receive-pack", "holder", false},
-		{false, "upload-pack", "holder", false},
+		{"upload-pack", "holder", true},
+		{"upload-pack", "", false},
+		{"receive-pack", "holder", false},
 	} {
-		s := &Server{Store: st, Blob: bl, CacheDir: cacheDir, StrictSyncFetch: tc.strict}
+		s := &Server{Store: st, Blob: bl, CacheDir: cacheDir}
 		_, err := s.hydrate(context.Background(), "r", tc.service, "main", &auth.Claims{SyncClaim: tc.claim})
 		if got := errors.Is(err, ErrHeldRefStale); got != tc.want || (!tc.want && err != nil) {
-			t.Errorf("strict=%v %s claim=%q: hydrate err = %v, want stale=%v", tc.strict, tc.service, tc.claim, err, tc.want)
+			t.Errorf("%s claim=%q: hydrate err = %v, want stale=%v", tc.service, tc.claim, err, tc.want)
 		}
 		if tc.want {
 			rec := httptest.NewRecorder()
@@ -85,6 +83,38 @@ func TestServerHydrate_StrictOnlyForLocalPushRunFetch(t *testing.T) {
 			if rec.Code != http.StatusLocked {
 				t.Errorf("stale held ref answered %d, want 423", rec.Code)
 			}
+		}
+	}
+}
+
+// TestServerHydrate_ReceivePackWithClaimIsLenient: a receive-pack whose
+// token carries a sync claim hydrates like any other receive-pack. It
+// reuses the held-skip verdict and does not scan the authority's refs
+// again: only a push run's loopback fetch (upload-pack) is strict.
+func TestServerHydrate_ReceivePackWithClaimIsLenient(t *testing.T) {
+	st, bl, cacheDir := hydrateEnv(t)
+	repoPath := mustHydrate(t, st, bl, cacheDir, "r")
+	mintHold(t, repoPath, "refs/heads/held")
+	st.mu.Lock()
+	st.refs["refs/heads/held"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	st.mu.Unlock()
+	st.setGen(8)
+	mustHydrate(t, st, bl, cacheDir, "r")
+	if !heldMarkerValid(repoPath, 8, HeadTarget("main")) {
+		t.Fatal("lenient held skip left no held-skip verdict: the check below tests nothing")
+	}
+	s := &Server{Store: st, Blob: bl, CacheDir: cacheDir}
+	for _, tc := range []struct {
+		service string
+		scans   bool
+	}{
+		{"receive-pack", false},
+		{"upload-pack", true},
+	} {
+		_, before, _ := st.counts()
+		_, _ = s.hydrate(context.Background(), "r", tc.service, "main", &auth.Claims{SyncClaim: "holder"})
+		if _, after, _ := st.counts(); (after > before) != tc.scans {
+			t.Errorf("%s with a sync claim: %d ref scans, want scans=%v", tc.service, after-before, tc.scans)
 		}
 	}
 }

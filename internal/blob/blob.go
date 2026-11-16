@@ -691,7 +691,9 @@ func Open(ctx context.Context, blobURL string) (BlobStore, error) {
 	assertf(blobURL != "", "Open: empty blob URL")
 	u, err := url.Parse(blobURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse blob URL: %w", err)
+		// Not err: url.Parse's error quotes the URL, password included,
+		// and its reason can quote part of it.
+		return nil, errors.New("parse blob URL: malformed URL (not shown: it can hold a password)")
 	}
 	switch u.Scheme {
 	case "s3":
@@ -817,7 +819,9 @@ func OpenS3(ctx context.Context, blobURL string) (*S3, error) {
 	assertf(blobURL != "", "OpenS3: empty blob URL")
 	u, err := url.Parse(blobURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse blob URL: %w", err)
+		// Not err: url.Parse's error quotes the URL, password included,
+		// and its reason can quote part of it.
+		return nil, errors.New("parse blob URL: malformed URL (not shown: it can hold a password)")
 	}
 	if u.Scheme != s3blob.Scheme {
 		return nil, fmt.Errorf("blob URL scheme %q unsupported (want s3)", u.Scheme)

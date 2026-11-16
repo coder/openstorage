@@ -171,7 +171,7 @@ func openVerifyState() (*verifyState, error) {
 		if len(msg) == 0 {
 			return nil, fmt.Errorf("empty verify exhaustion marker")
 		}
-		return nil, errors.New(string(msg))
+		return nil, Refuse(errors.New(string(msg))) // only exhaust writes the marker
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read verify exhaustion marker: %w", err)
 	}
@@ -364,7 +364,7 @@ func (st *verifyState) exhaust(msg string) error {
 	if st.path != "" {
 		_ = os.WriteFile(st.exhaustedPath(), []byte(msg), 0o600)
 	}
-	return errors.New(msg)
+	return Refuse(errors.New(msg))
 }
 
 // rangesPath is the sidecar carrying okrange lines. Separate from the

@@ -160,7 +160,11 @@ publishes the cache ref, so a River push run waits for the repository's
 publication on its own node (holds are per node, and its loopback fetch
 reads that node's cache) after its claim, as local runs do. A failed wait
 restores the request (`RestorePush`), and the job's completion gate
-snoozes it. The gate also never completes the job while a push claim is
+snoozes it. So does a loopback fetch that the server refuses with HTTP 423
+because a push on that node holds a ref whose cached value is older than
+the authority (ADR-50 amendment): forwarding it would publish the older
+value and end the run done.
+The gate also never completes the job while a push claim is
 held: a run whose finish or restore write failed leaves its claim holding
 the request it consumed, so the job waits for the lease, and its re-run
 steals the claim with its force level. Only a job whose repository was
@@ -168,7 +172,7 @@ deleted completes over a held claim. The sync job's gate follows the same
 rule for a held sync claim, so a mirror-back pull (or a pull-upstream)
 whose `FinishSync` failed runs again after the lease instead of being
 dropped with its claim. A hook that cannot set up its eventing refuses an
-update that would record intent instead of accepting it without the
+update that could record intent instead of accepting it without the
 intent ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
 amendment).
 

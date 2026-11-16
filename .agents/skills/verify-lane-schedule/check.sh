@@ -11,7 +11,7 @@
 # 3. Compares the fingerprints with model/fingerprints.txt.
 #
 # Exit codes:
-#   0  every property holds, both probes fail as expected, no covered code
+#   0  every property holds, the probe fails as expected, no covered code
 #      changed since the sync commit
 #   1  a property failed in LaneSchedule.cfg, OtherWriters.cfg or
 #      Liveness.cfg. Read the trace in --out.
@@ -33,7 +33,7 @@
 #
 # --record rewrites model/fingerprints.txt and the sync commit in SKILL.md
 # to the current code. Use it only after you confirmed that the model
-# describes the code at HEAD. It refuses unless the properties hold, every
+# describes the code at HEAD. It refuses unless the properties hold, the
 # probe fails, and the covered files have no uncommitted changes. The
 # sync commit is the merge base with origin/main (OPENSTORAGE_MAIN_REF)
 # when the covered files match it, so a squash merge does not orphan it.
@@ -68,8 +68,8 @@ while [ $# -gt 0 ]; do
             shift 2 ;;
     --only) [ $# -ge 2 ] || { echo "check.sh: --only needs a config name" >&2; exit 3; }
             case $2 in
-              LaneSchedule.cfg|OtherWriters.cfg|Liveness.cfg|NoLeaseAssumption.cfg|NoCompletionAssumption.cfg) ;;
-              *) echo "check.sh: --only takes LaneSchedule.cfg, OtherWriters.cfg, Liveness.cfg, NoLeaseAssumption.cfg or NoCompletionAssumption.cfg" >&2; exit 3 ;;
+              LaneSchedule.cfg|OtherWriters.cfg|Liveness.cfg|NoLeaseAssumption.cfg) ;;
+              *) echo "check.sh: --only takes LaneSchedule.cfg, OtherWriters.cfg, Liveness.cfg or NoLeaseAssumption.cfg" >&2; exit 3 ;;
             esac
             only="$only$2 "; shift 2 ;;
     -h|--help) awk 'NR > 1 && /^set -uo pipefail/ { exit } NR > 1' "$0"; exit 0 ;;
@@ -116,7 +116,7 @@ facts_cfg="$work/facts.cfg"
   awk '$1 == "FACT" { printf "    %s = %s\n", $2, $3 }' "$out/facts.txt"
 } >"$facts_cfg"
 nfacts=$(grep -c '^FACT ' "$out/facts.txt")
-[ "$nfacts" -eq 11 ] || die "expected 11 facts from facts.go, got $nfacts"
+[ "$nfacts" -eq 12 ] || die "expected 12 facts from facts.go, got $nfacts"
 echo "== Code facts (HEAD $(git -C "$repo" rev-parse --short HEAD))"
 false_facts=0
 while read -r _ name value evidence; do
@@ -199,13 +199,12 @@ for cfg in LaneSchedule.cfg OtherWriters.cfg Liveness.cfg; do
   esac
 done
 
-# Each probe drops one assumption the code relies on, and one property must
-# then fail: NoRewind without the lease assumption, NoLostForward without the
-# REST write-completion assumption. One worker keeps the trace the shortest
-# one.
+# The probe drops an assumption the code relies on, and one property must
+# then fail: NoRewind without the lease assumption. One worker keeps the
+# trace the shortest one.
 stale=0 probe_passed=0
 [ "$false_facts" -eq 0 ] || stale=1
-for probe in NoLeaseAssumption.cfg:NoRewind NoCompletionAssumption.cfg:NoLostForward; do
+for probe in NoLeaseAssumption.cfg:NoRewind; do
   cfg=${probe%%:*} want=${probe#*:}
   selected "$cfg" || continue
   rc=0; run_tlc "$cfg" 1 || rc=$?

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -16,9 +17,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
+	"github.com/coder/openstorage/internal/ref/s3wal"
 )
 
 // fakeMetaS3 is a read-only S3 endpoint holding one fixed _wal/meta.json in
@@ -76,7 +79,24 @@ func hookEventingEnv(t *testing.T, metaURL string) *bytes.Buffer {
 	t.Setenv(githttp.EnvOps, "")
 	original := githttp.WrapHookRefStore
 	t.Cleanup(func() { githttp.WrapHookRefStore = original })
+	// serve's hook-errors file: the hook's log handler writes the error
+	// values there, for the operator.
+	records := filepath.Join(t.TempDir(), "hook-errors")
+	if err := os.WriteFile(records, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(githttp.EnvHookErrors, records)
 	return new(bytes.Buffer)
+}
+
+// hookErrorRecords reads the hook-errors file that hookEventingEnv set up.
+func hookErrorRecords(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(os.Getenv(githttp.EnvHookErrors))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 // hookRefStore is the authority the update hook would CAS into.
@@ -105,19 +125,21 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 	}{
 		{"v1", `{"v":1,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":1,"next_key_id":0}`,
 			[]string{"document version 1 needs conversion", "openstorage s3wal-meta convert --to 2"}},
+		// A corrupt document's detail can name rows of the document: it goes
+		// to the hook-errors file, and the pusher gets a fixed refusal.
 		{"truncated", `{"v":2,"seq":3,"writer":"0123`,
-			[]string{"_wal/meta.json is corrupt (document decode:", "backup-restore-s3wal.md#restore-and-validate-before-cutover"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md#restore-and-validate-before-cutover", "!document decode:", "record:document decode:"}},
 		{"no writer", `{"v":2,"seq":3,"next_org_id":1,"next_key_id":0}`,
-			[]string{"_wal/meta.json is corrupt (document seq 3 has no writer nonce)", "backup-restore-s3wal.md"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md", "!no writer nonce", "record:document seq 3 has no writer nonce"}},
 		{"negative counter", `{"v":2,"seq":3,"writer":"0123456789abcdef0123456789abcdef","next_org_id":-1,"next_key_id":0}`,
-			[]string{"_wal/meta.json is corrupt (document seq 3 has negative id counters (-1, 0))", "backup-restore-s3wal.md"}},
+			[]string{"_wal/meta.json is corrupt (the server log has the detail)", "backup-restore-s3wal.md", "!negative id counters", "record:document seq 3 has negative id counters (-1, 0)"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeMetaS3{body: []byte(tc.body)}
 			srv := httptest.NewServer(fake)
 			defer srv.Close()
 			logs := hookEventingEnv(t, "s3wal://b?endpoint="+srv.URL)
-			cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+			cleanup := wireHookEventing(t.Context(), slog.New(githttp.NewHookLogHandler(logs, nil)))
 			defer cleanup()
 			rs := hookRefStore(t)
 
@@ -126,9 +148,21 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 				t.Fatalf("WrapHookRefStore = %v, %v; want a refusal", wrapped, err)
 			}
 			for _, want := range append([]string{"refusing the ref update"}, tc.want...) {
-				if !strings.Contains(err.Error(), want) {
+				switch {
+				case strings.HasPrefix(want, "!"):
+					if strings.Contains(err.Error(), want[1:]) {
+						t.Fatalf("refusal %q shows the pusher %q", err, want[1:])
+					}
+				case strings.HasPrefix(want, "record:"):
+					if !strings.Contains(hookErrorRecords(t), strings.TrimPrefix(want, "record:")) {
+						t.Fatalf("the hook-errors file lacks %q: %s", want, hookErrorRecords(t))
+					}
+				case !strings.Contains(err.Error(), want):
 					t.Fatalf("refusal %q lacks %q", err, want)
 				}
+			}
+			if !githttp.ShownToPusher(err) {
+				t.Fatalf("the hook would hide the refusal %q from the pusher", err)
 			}
 			if got, err := rs.GetRef(t.Context(), "repo-1", "refs/heads/main"); !errors.Is(err, ref.ErrNotFound) {
 				t.Fatalf("authority ref = %q, %v; want unset", got, err)
@@ -144,7 +178,7 @@ func TestHookEventingRefusesUnusableMetaDocument(t *testing.T) {
 }
 
 // On the local schedule a hook that cannot read the metadata document
-// refuses an update that would record forward intent before its CAS: the
+// refuses an update that could record forward intent before its CAS: the
 // format check fails open (issues #445, #466), but the push's forward intent
 // must be in the row before the CAS (ADR-50 amendment), and without the
 // document the hook cannot tell whether the repository forwards. A caller
@@ -173,7 +207,7 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 			if tc.scopes != "" {
 				t.Setenv(githttp.EnvScopes, tc.scopes)
 			}
-			cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+			cleanup := wireHookEventing(t.Context(), slog.New(githttp.NewHookLogHandler(logs, nil)))
 			defer cleanup()
 			rs := hookRefStore(t)
 			wrapped, err := githttp.WrapHookRefStore(t.Context(), rs)
@@ -192,6 +226,9 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 				if !strings.Contains(logs.String(), "hook refuses ref updates: record forward intent") {
 					t.Fatalf("missing refusal log: %s", logs)
 				}
+				if !githttp.ShownToPusher(err) {
+					t.Fatalf("the hook would hide the refusal %q from the pusher", err)
+				}
 			} else if !won || err != nil || gerr != nil {
 				t.Fatalf("CAS = (%v, %v), authority = (%q, %v); want the update accepted (it records no intent)", won, err, got, gerr)
 			}
@@ -201,6 +238,20 @@ func TestHookEventingRefusesUnreadableLocalSchedule(t *testing.T) {
 			}
 			if n := strings.Count(seen, strings.TrimPrefix(endpoint, "http://")); n != 0 {
 				t.Fatalf("the pusher's output names the bucket endpoint %d times", n)
+			}
+			// The operator gets the cause of both lines.
+			if tc.unresolvable {
+				for _, msg := range []string{"metadata format check failed", "hook refuses ref updates: record forward intent"} {
+					var line string
+					for l := range strings.Lines(hookErrorRecords(t)) {
+						if strings.Contains(l, msg) {
+							line = l
+						}
+					}
+					if !strings.Contains(line, strings.TrimPrefix(endpoint, "http://")) {
+						t.Fatalf("the hook-errors record %q lacks the endpoint: %q", msg, line)
+					}
+				}
 			}
 			if n := fake.writes.Load(); n != 0 {
 				t.Fatalf("the hook sent %d write requests to the bucket; want none", n)
@@ -295,7 +346,7 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 				if tc.scopes != "" {
 					t.Setenv(githttp.EnvScopes, tc.scopes)
 				}
-				cleanup := wireHookEventing(t.Context(), slog.New(slog.NewTextHandler(logs, nil)))
+				cleanup := wireHookEventing(t.Context(), slog.New(githttp.NewHookLogHandler(logs, nil)))
 				defer cleanup()
 				rs := hookRefStore(t)
 				wrapped, err := githttp.WrapHookRefStore(t.Context(), commitThenEOF{rs})
@@ -308,7 +359,7 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 				}
 				wantLog := "hook eventing disabled: " + stage
 				if tc.refusing {
-					wantLog = "hook eventing unavailable: " + stage + "; refusing only updates that would record forward intent"
+					wantLog = "hook eventing unavailable: " + stage + "; refusing only updates that could record forward intent"
 				}
 				if !strings.Contains(logs.String(), wantLog) {
 					t.Fatalf("missing %q log: %s", wantLog, logs)
@@ -341,7 +392,7 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 							if got == "" && errors.Is(gerr, ref.ErrNotFound) {
 								got = "absent"
 							}
-							if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+"); push again later") || got != before {
+							if won || err == nil || !strings.HasSuffix(err.Error(), "refusing the ref update: hook eventing unavailable ("+stage+"); push again later") || got != before || !githttp.ShownToPusher(err) {
 								t.Fatalf("%s %d = (%v, %v), authority = %q; want the update refused before its CAS, authority %s", op.name, i, won, err, got, before)
 							}
 							continue
@@ -362,7 +413,120 @@ func TestHookEventingRefusesIntentWithoutEventing(t *testing.T) {
 						t.Fatalf("the pusher's output names the canary %s %d times", part, n)
 					}
 				}
+				// The operator gets the cause, without the password.
+				records := hookErrorRecords(t)
+				for part, v := range canary {
+					switch n := strings.Count(records, v); {
+					case part == "password" && n != 0:
+						t.Fatalf("the hook-errors records name the canary password %d times", n)
+					case part != "password" && stage == "open meta store" && n == 0:
+						t.Fatalf("the hook-errors records do not name the canary %s: %s", part, records)
+					}
+				}
 			})
 		}
+	}
+}
+
+// The hook's logger keeps error values off stderr, which git relays to the
+// pusher, and writes them to serve's hook-errors file.
+func TestSlogForHookKeepsErrorsOffStderr(t *testing.T) {
+	hookEventingEnv(t, "")
+	canary := "canary-" + rand.Text()
+	var stderr bytes.Buffer
+	slogForHook(&stderr).Error("hook eventing unavailable: open meta store", "err", errors.New("dial "+canary))
+	if !strings.Contains(stderr.String(), "hook eventing unavailable: open meta store") || strings.Contains(stderr.String(), canary) {
+		t.Fatalf("stderr = %q; want the message without the canary", stderr.String())
+	}
+	if n := strings.Count(hookErrorRecords(t), canary); n != 1 {
+		t.Fatalf("the hook-errors file names the canary %d times, want 1", n)
+	}
+}
+
+// runHook, the hook command, logs with the hook's logger and makes it the
+// default logger: stderr gets no error value, the hook-errors file does.
+func TestRunHookLogsWithTheHookLogger(t *testing.T) {
+	host := "canary-host-" + strings.ToLower(rand.Text()[:8]) + ".invalid"
+	hookEventingEnv(t, "postgres://u:p@"+host+":5432/db?connect_timeout=2")
+	prev, prevOut, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	var stderr bytes.Buffer
+	if err := runHook(t.Context(), []string{"no-such-hook"}, &stderr); err == nil || !strings.Contains(err.Error(), "unknown hook") {
+		t.Fatalf("runHook = %v; want the unknown-hook error", err)
+	}
+	slog.Warn("s3wal delete lease clear failed; lease will expire on its window", "err", errors.New("dial "+host))
+	for _, msg := range []string{"hook eventing unavailable: open meta store", "s3wal delete lease clear failed"} {
+		if !strings.Contains(stderr.String(), msg) {
+			t.Fatalf("stderr lacks %q: %s", msg, stderr.String())
+		}
+	}
+	if n := strings.Count(stderr.String(), host); n != 0 {
+		t.Fatalf("stderr names the canary host %d times: %s", n, stderr.String())
+	}
+	if n := strings.Count(hookErrorRecords(t), host); n < 2 {
+		t.Fatalf("the hook-errors file names the canary host %d times, want both records", n)
+	}
+}
+
+// A store URL that does not parse keeps its password out of every error,
+// so out of the hook-errors file and serve's log too.
+func TestMalformedStoreURLHidesItsPassword(t *testing.T) {
+	pw := "canary_pass_" + rand.Text()[:8]
+	// The "/" ends the authority early, so url.Parse reads part of the
+	// password as a port and quotes the whole URL in its error.
+	pgURL := "postgres://user:" + pw + "/x@host:5432/db"
+	logs := hookEventingEnv(t, pgURL)
+	cleanup := wireHookEventing(t.Context(), slog.New(githttp.NewHookLogHandler(logs, nil)))
+	defer cleanup()
+	records := hookErrorRecords(t)
+	if !strings.Contains(records, "malformed URL") {
+		t.Fatalf("the hook-errors file lacks the parse failure: %s", records)
+	}
+	seen := logs.String() + records
+	for _, open := range []func() error{
+		func() error { _, err := meta.Open(t.Context(), pgURL); return err },
+		func() error { _, err := ref.Open(t.Context(), pgURL); return err },
+		func() error {
+			_, err := ref.Open(t.Context(), "s3wal://user:"+pw+"/x@bucket?endpoint=http://h")
+			return err
+		},
+		func() error { _, err := blob.Open(t.Context(), "s3://user:"+pw+"/x@bucket"); return err },
+		func() error { _, err := blob.Open(t.Context(), "file://user:"+pw+"/x@host/dir"); return err },
+		// The schemes' own opens parse again.
+		func() error { _, err := blob.OpenS3(t.Context(), "s3://user:"+pw+"/x@bucket"); return err },
+		func() error { _, err := blob.OpenFile("file://user:" + pw + "/x@host/dir"); return err },
+		func() error {
+			_, err := s3wal.Dial(t.Context(), "s3wal://user:"+pw+"/x@bucket?endpoint=http://h")
+			return err
+		},
+	} {
+		err := open()
+		if err == nil {
+			t.Fatal("a malformed URL opened")
+		}
+		seen += err.Error()
+	}
+	if n := strings.Count(seen, pw); n != 0 {
+		t.Fatalf("the errors and hook records name the canary password %d times: %s", n, seen)
+	}
+}
+
+// The hook logger writes at Warn level: an Info line reaches neither the
+// pusher nor the hook-errors file.
+func TestSlogForHookIsWarnLevel(t *testing.T) {
+	hookEventingEnv(t, "")
+	var stderr bytes.Buffer
+	logger := slogForHook(&stderr)
+	logger.Info("below the level")
+	logger.Warn("at the level")
+	if strings.Contains(stderr.String(), "below the level") || !strings.Contains(stderr.String(), "at the level") {
+		t.Fatalf("stderr = %q; want only the Warn line", stderr.String())
+	}
+	if records := hookErrorRecords(t); strings.Contains(records, "below the level") {
+		t.Fatalf("the hook-errors file has the Info line: %s", records)
 	}
 }

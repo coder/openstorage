@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,10 +26,11 @@ const (
 // ref.IdempotentCAS recovery recheck — and defaults to a not-found miss so
 // non-recovery tests keep their plain lost/failed semantics.
 type fakeInner struct {
-	won  bool
-	err  error
-	sha  string
-	cass int // CASRef and CASRefGen calls
+	won   bool
+	err   error
+	sha   string
+	cass  int    // CASRef and CASRefGen calls
+	panic string // when set, CASRef and CASRefGen panic with it
 }
 
 func (f *fakeInner) ListRefs(context.Context, string) (map[string]string, error) {
@@ -51,10 +53,16 @@ func (f *fakeInner) GetRef(context.Context, string, string) (string, error) {
 }
 func (f *fakeInner) CASRef(_ context.Context, _, _, _, _ string) (bool, error) {
 	f.cass++
+	if f.panic != "" {
+		panic(f.panic)
+	}
 	return f.won, f.err
 }
 func (f *fakeInner) CASRefGen(_ context.Context, _, _, _, _ string) (bool, int64, error) {
 	f.cass++
+	if f.panic != "" {
+		panic(f.panic)
+	}
 	gen := int64(0)
 	if f.won {
 		gen = 1
@@ -434,49 +442,143 @@ func TestEphemeralUpdatesEmitNothing(t *testing.T) {
 	}
 }
 
-// TestBeforeCASRunsFirstAndRefuses: BeforeCAS sees the base RepoID of
-// every non-ephemeral update before the inner CAS, and its error refuses
-// the update on both CAS methods: no CAS, no event, no sync poke.
+// TestBeforeCASRunsFirstAndRefuses: BeforeCAS sees the base RepoID, and
+// HeldBeforeCAS the base RepoID and the ref name, of every non-ephemeral
+// update before the inner CAS. An error from either refuses the update on
+// both CAS methods: no CAS, no event, no sync poke. HeldBeforeCAS's release
+// runs once, right after the inner CAS and before the sync poke.
 func TestBeforeCASRunsFirstAndRefuses(t *testing.T) {
-	for _, gen := range []bool{false, true} {
-		for _, fail := range []bool{false, true} {
-			inner := &fakeInner{won: true}
-			env := newEmitEnv(t, inner, twoHooks())
-			var seen []string
-			env.store.beforeCAS = func(_ context.Context, repoID string) error {
-				seen = append(seen, repoID)
-				if inner.cass != 0 {
-					t.Errorf("BeforeCAS ran after the inner CAS")
+	for _, held := range []bool{false, true} {
+		for _, gen := range []bool{false, true} {
+			for _, fail := range []bool{false, true} {
+				inner := &fakeInner{won: true}
+				env := newEmitEnv(t, inner, twoHooks())
+				var seen []string
+				released := 0
+				step := func(repoID, refName string) error {
+					seen = append(seen, repoID+" "+refName)
+					if inner.cass != 0 {
+						t.Errorf("held=%v: the step ran after the inner CAS", held)
+					}
+					if fail {
+						return errors.New("intent write failed")
+					}
+					return nil
+				}
+				if held {
+					env.store.heldBeforeCAS = func(_ context.Context, repoID, refName string) (func(), error) {
+						if err := step(repoID, refName); err != nil {
+							return nil, err
+						}
+						return func() {
+							released++
+							if inner.cass != 1 || len(env.syncPokes) != 0 {
+								t.Errorf("release ran with %d inner CASes and %d sync pokes; want right after the CAS", inner.cass, len(env.syncPokes))
+							}
+						}, nil
+					}
+				} else {
+					env.store.beforeCAS = func(_ context.Context, repoID string) error {
+						return step(repoID, "-")
+					}
+				}
+				cas := func(repoKey, refName string) (bool, error) {
+					if gen {
+						won, _, err := env.store.CASRefGen(context.Background(), repoKey, refName, shaA, shaB)
+						return won, err
+					}
+					return env.store.CASRef(context.Background(), repoKey, refName, shaA, shaB)
+				}
+				won, err := cas("repo_abc123+import", "refs/heads/main")
+				wantReleased := 0
+				if held && !fail {
+					wantReleased = 1
 				}
 				if fail {
-					return errors.New("intent write failed")
+					if won || err == nil || inner.cass != 0 || len(env.deliveries) != 0 || len(env.syncPokes) != 0 {
+						t.Errorf("held=%v gen=%v: refused update = (won %v, err %v), %d inner CASes, %d deliveries, %d pokes; want refused with nothing written",
+							held, gen, won, err, inner.cass, len(env.deliveries), len(env.syncPokes))
+					}
+				} else if !won || err != nil || inner.cass != 1 {
+					t.Errorf("held=%v gen=%v: allowed update = (won %v, err %v), %d inner CASes", held, gen, won, err, inner.cass)
 				}
-				return nil
-			}
-			cas := func(repoKey, refName string) (bool, error) {
-				if gen {
-					won, _, err := env.store.CASRefGen(context.Background(), repoKey, refName, shaA, shaB)
-					return won, err
+				if released != wantReleased {
+					t.Errorf("held=%v gen=%v fail=%v: %d releases, want %d", held, gen, fail, released, wantReleased)
 				}
-				return env.store.CASRef(context.Background(), repoKey, refName, shaA, shaB)
-			}
-			won, err := cas("repo_abc123+import", "refs/heads/main")
-			if fail {
-				if won || err == nil || inner.cass != 0 || len(env.deliveries) != 0 || len(env.syncPokes) != 0 {
-					t.Errorf("gen=%v: refused update = (won %v, err %v), %d inner CASes, %d deliveries, %d pokes; want refused with nothing written",
-						gen, won, err, inner.cass, len(env.deliveries), len(env.syncPokes))
+				want := "repo_abc123 -"
+				if held {
+					want = "repo_abc123 refs/heads/main"
 				}
-			} else if !won || err != nil || inner.cass != 1 {
-				t.Errorf("gen=%v: allowed update = (won %v, err %v), %d inner CASes", gen, won, err, inner.cass)
+				if len(seen) != 1 || seen[0] != want {
+					t.Errorf("held=%v gen=%v fail=%v: the step saw %v, want [%s]", held, gen, fail, seen, want)
+				}
+				// Ephemeral updates never forward, so neither step sees them.
+				seen = nil
+				if _, err := cas("repo_abc123+ephemeral", "refs/heads/main"); err != nil || len(seen) != 0 {
+					t.Errorf("held=%v gen=%v fail=%v: ephemeral update = %v, the step saw %v", held, gen, fail, err, seen)
+				}
 			}
-			if len(seen) != 1 || seen[0] != "repo_abc123" {
-				t.Errorf("gen=%v fail=%v: BeforeCAS saw %v, want the base RepoID once", gen, fail, seen)
+		}
+	}
+}
+
+// TestHeldBeforeCASReleasesOnPanic: a panicking inner CAS still ends the
+// HeldBeforeCAS hold, once. Serve's API recovers the panic and keeps
+// running (api.recoverPanics), and a hold left live would make every later
+// write to the ref wait out the hold and fail.
+func TestHeldBeforeCASReleasesOnPanic(t *testing.T) {
+	const boom = "inner CAS panicked"
+	for _, gen := range []bool{false, true} {
+		inner := &fakeInner{won: true, panic: boom}
+		env := newEmitEnv(t, inner, twoHooks())
+		released := 0
+		env.store.heldBeforeCAS = func(context.Context, string, string) (func(), error) {
+			return func() { released++ }, nil
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != boom {
+					t.Errorf("gen=%v: recovered %v, want the inner CAS's panic", gen, r)
+				}
+			}()
+			if gen {
+				_, _, _ = env.store.CASRefGen(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
+			} else {
+				_, _ = env.store.CASRef(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
 			}
-			// Ephemeral updates never forward, so BeforeCAS never sees them.
-			seen = nil
-			if _, err := cas("repo_abc123+ephemeral", "refs/heads/main"); err != nil || len(seen) != 0 {
-				t.Errorf("gen=%v fail=%v: ephemeral update = %v, BeforeCAS saw %v", gen, fail, err, seen)
+		}()
+		if released != 1 || len(env.deliveries) != 0 || len(env.syncPokes) != 0 {
+			t.Errorf("gen=%v: after a panicking CAS: %d releases, %d deliveries, %d pokes; want 1 release and nothing emitted",
+				gen, released, len(env.deliveries), len(env.syncPokes))
+		}
+	}
+}
+
+// TestHeldBeforeCASNilReleaseAsserts: a HeldBeforeCAS that succeeds
+// without a release is a bug in serve's wiring, and RefStore stops on it
+// before the inner CAS instead of writing without a hold to end.
+func TestHeldBeforeCASNilReleaseAsserts(t *testing.T) {
+	for _, gen := range []bool{false, true} {
+		inner := &fakeInner{won: true}
+		env := newEmitEnv(t, inner, twoHooks())
+		env.store.heldBeforeCAS = func(context.Context, string, string) (func(), error) {
+			return nil, nil
+		}
+		func() {
+			defer func() {
+				r, _ := recover().(string)
+				if !strings.Contains(r, "returned a nil release") {
+					t.Errorf("gen=%v: recovered %q, want the nil-release assertion", gen, r)
+				}
+			}()
+			if gen {
+				_, _, _ = env.store.CASRefGen(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
+			} else {
+				_, _ = env.store.CASRef(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
 			}
+		}()
+		if inner.cass != 0 {
+			t.Errorf("gen=%v: %d inner CASes after the assertion, want none", gen, inner.cass)
 		}
 	}
 }

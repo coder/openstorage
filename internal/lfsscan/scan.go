@@ -7,7 +7,6 @@ package lfsscan
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -19,6 +18,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -63,8 +63,18 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 
 	g, gctx := errgroup.WithContext(ctx)
 
+	// The three stages are git children in the cache repository: they hold
+	// its lease (gitlimit.LeaseFile) until they exit. The lease comes before
+	// the pipes, so a failure here leaves none open.
+	lease, err := gitlimit.OpenLease(ctx, repoPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("lease: %w", err)
+	}
+	defer lease.Close()
+
 	// Every subprocess runs with object replacement disabled (Codex
-	// security round 1): refs/replace/* substitutions are writable by any
+	// security round 1), through GIT_NO_REPLACE_OBJECTS, which the start
+	// loop below sets: refs/replace/* substitutions are writable by any
 	// git:write pusher WITHOUT moving the protected refs they shadow — an
 	// attacker could replace a commit on main with a doctored twin whose
 	// tree omits the pointer files, hiding their OIDs from the walk and
@@ -81,18 +91,18 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 	// budget cancels gctx and kills the pipeline mid-walk — and the
 	// batch-check stage below discards oversized blobs before any content
 	// is read.
-	revList := exec.CommandContext(gctx, "git", "--no-replace-objects", "rev-list", "--objects", "--no-object-names", "--all")
+	revList := exec.CommandContext(gctx, "git", "rev-list", "--objects", "--no-object-names", "--all")
 	revList.Dir = repoPath
-	var revErr bytes.Buffer
+	var revErr gitlimit.TailBuffer // the errors below reach the log
 	revList.Stderr = &revErr
 	revOut, err := revList.StdoutPipe()
 	if err != nil {
 		return nil, 0, fmt.Errorf("rev-list stdout: %w", err)
 	}
 
-	check := exec.CommandContext(gctx, "git", "--no-replace-objects", "cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)", "--buffer")
+	check := exec.CommandContext(gctx, "git", "cat-file", "--batch-check=%(objecttype) %(objectsize) %(objectname)", "--buffer")
 	check.Dir = repoPath
-	var checkErr bytes.Buffer
+	var checkErr gitlimit.TailBuffer
 	check.Stderr = &checkErr
 	checkIn, err := check.StdinPipe()
 	if err != nil {
@@ -103,9 +113,9 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 		return nil, 0, fmt.Errorf("batch-check stdout: %w", err)
 	}
 
-	read := exec.CommandContext(gctx, "git", "--no-replace-objects", "cat-file", "--batch", "--buffer")
+	read := exec.CommandContext(gctx, "git", "cat-file", "--batch", "--buffer")
 	read.Dir = repoPath
-	var readErr bytes.Buffer
+	var readErr gitlimit.TailBuffer
 	read.Stderr = &readErr
 	readIn, err := read.StdinPipe()
 	if err != nil {
@@ -118,6 +128,8 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 
 	started := make([]*exec.Cmd, 0, 3)
 	for _, cmd := range []*exec.Cmd{revList, check, read} {
+		cmd.Env = gitlimit.NoReplaceObjects(cmd.Env)
+		lease.Attach(cmd)
 		if err := cmd.Start(); err != nil {
 			// Kill the stages already running (Codex round 6): left
 			// alive, a producer fills its unread stdout pipe — or blocks

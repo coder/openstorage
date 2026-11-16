@@ -11,7 +11,8 @@ func pushHookEnv(env []string, repo, org string) []string {
 	env = envconfig.Strip(env,
 		EnvRepo, EnvOrg, EnvPackQuota, EnvPackReservationTTL,
 		EnvAtomic, EnvUsageFloor, EnvVerifyState, EnvVerifySigBudget,
-		EnvSyncClaim, EnvScopes, EnvRefsPolicy, EnvOps, EnvPushHold,
+		EnvSyncClaim, EnvScopes, EnvRefsPolicy, EnvOps, EnvPushHold, EnvHookErrors,
+		EnvImportPush,
 	)
 	env = envconfig.Set(env, EnvRepo, repo)
 	return envconfig.Set(env, EnvOrg, org)

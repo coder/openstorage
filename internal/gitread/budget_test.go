@@ -271,6 +271,46 @@ func TestRunTimeBudgetKillsAndReapsGit(t *testing.T) {
 	b.Close()
 }
 
+// A request canceled while its git runs is a cancellation: Run kills git
+// for it and reports the context's error, never the kill as git's own
+// failure (a *GitError for "signal: killed"). The test cancels only after
+// git printed, so git is running then. git's stderr reads like a heap
+// failure, so the cancellation also comes before a limit outcome. A
+// request canceled before git starts is a cancellation too.
+func TestRunCanceledRequestIsACancellation(t *testing.T) {
+	fakeGit(t, `echo "fatal: Out of memory, malloc failed (tried to allocate 1 bytes)" >&2; echo ready; exec sleep 30`)
+	released := make(chan struct{})
+	close(released)
+	for _, budgeted := range []bool{false, true} {
+		for _, early := range []bool{false, true} {
+			t.Run(fmt.Sprintf("budget=%v/before start=%v", budgeted, early), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if budgeted {
+					b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes)
+					t.Cleanup(b.Close)
+					ctx = WithBudget(ctx, b)
+				}
+				out := &blockingWriter{entered: make(chan struct{}), release: released}
+				if early {
+					cancel()
+				} else {
+					go func() {
+						<-out.entered // git printed: it runs
+						cancel()
+					}()
+				}
+				_, err := Run(ctx, Cmd{Class: Heavy, Dir: t.TempDir(), Stdout: out, Args: []string{"cat-file", "--batch"}})
+				var gitErr *GitError
+				if !errors.Is(err, context.Canceled) || errors.As(err, &gitErr) || IsBudgetError(err) {
+					t.Fatalf("err = %v, want the cancellation, not a git failure or a limit", err)
+				}
+				assertNoChildren(t)
+			})
+		}
+	}
+}
+
 func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "ran")
 	fakeGit(t, "echo x >> "+marker)
@@ -308,6 +348,21 @@ func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	other.Close()
 	if slots.InUse() != 0 {
 		t.Fatalf("slots in use after Close = %d", slots.InUse())
+	}
+}
+
+// Run's error quotes git's stderr, and it reaches the server's log: it
+// keeps exactly the last 64 KiB, where git prints its fatal message.
+func TestRunErrorKeepsTheStderrTail(t *testing.T) {
+	fakeGit(t, "head -c 1048576 /dev/zero | tr '\\0' e >&2; echo 'fatal: the end' >&2; exit 1")
+	_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"status"}})
+	if err == nil {
+		t.Fatal("Run: nil error from a git that exits 1")
+	}
+	// The last 64 KiB of stderr, less the trimmed line feed.
+	tail := strings.Repeat("e", 64<<10-len("fatal: the end\n")) + "fatal: the end"
+	if msg := err.Error(); !strings.HasSuffix(msg, ": exit status 1: "+tail) {
+		t.Fatalf("Run's error is %d bytes, want the command, the exit status and the last 64 KiB of stderr (%d bytes)", len(msg), len(tail))
 	}
 }
 
@@ -462,4 +517,77 @@ func TestArchiveStreamStalledReaderKeepsNoGitProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.Close()
+}
+
+// A request can put a value of 100 KB into a git argument, and the error
+// name of Run goes to the log: it must not carry the value.
+func TestRunErrorNamesLongArgumentsBriefly(t *testing.T) {
+	fakeGit(t, "echo boom >&2; exit 3")
+	long := strings.Repeat("a", 100_000)
+	_, err := Run(context.Background(), Cmd{Class: Light, Dir: t.TempDir(), Args: []string{"rev-parse", "--verify", long}})
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("err = %v, want git's exit status 3", err)
+	}
+	msg := err.Error()
+	if len(msg) > 1024 {
+		t.Fatalf("the error is %d bytes, want it bounded: %.200s", len(msg), msg)
+	}
+	for _, want := range []string{"git rev-parse --verify aaaa", "...(100000 bytes)", "boom"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %.300q lacks %q", msg, want)
+		}
+	}
+}
+
+// The path of a blob over the size limit is a path of the repository, and it
+// can be 100 KB long. Its name in the error goes to the log.
+func TestCheckBlobSizeNamesLongPathBriefly(t *testing.T) {
+	long := strings.Repeat("d", 100_000)
+	err := CheckBlobSize(context.Background(), long, MaxBlobBytes+1)
+	if !errors.Is(err, ErrBlobTooLarge) {
+		t.Fatalf("err = %v, want ErrBlobTooLarge", err)
+	}
+	msg := err.Error()
+	if len(msg) > 1024 {
+		t.Fatalf("the error is %d bytes, want it bounded: %.200s", len(msg), msg)
+	}
+	if want := "...(100000 bytes)"; !strings.Contains(msg, want) {
+		t.Errorf("error %.300q lacks %q", msg, want)
+	}
+	if err := CheckBlobSize(context.Background(), "a/b.txt", MaxBlobBytes); err != nil {
+		t.Errorf("a blob at the limit: err = %v, want nil", err)
+	}
+}
+
+// The path of a symlink over the target limit goes into the error too, and
+// into the log, as the path of a blob does: the message clips it, and
+// LimitPath keeps the whole path for the response that names it.
+func TestLimitErrorsClipThePathInTheMessageAndKeepItWhole(t *testing.T) {
+	long := strings.Repeat("d", 100_000)
+	for _, c := range []struct {
+		name string
+		err  error
+		is   error
+	}{
+		{"symlink", CheckSymlinkTarget(long, MaxSymlinkTarget+1), ErrSymlinkTooLong},
+		{"blob", CheckBlobSize(context.Background(), long, MaxBlobBytes+1), ErrBlobTooLarge},
+	} {
+		if !errors.Is(c.err, c.is) {
+			t.Fatalf("%s: err = %v, want %v", c.name, c.err, c.is)
+		}
+		msg := c.err.Error()
+		if len(msg) > 1024 {
+			t.Fatalf("%s: the error is %d bytes, want it bounded: %.200s", c.name, len(msg), msg)
+		}
+		if want := "...(100000 bytes)"; !strings.Contains(msg, want) {
+			t.Errorf("%s: error %.300q lacks %q", c.name, msg, want)
+		}
+		if path, ok := LimitPath(c.err); !ok || path != long {
+			t.Errorf("%s: LimitPath keeps %d bytes (%v), want the whole path of %d", c.name, len(path), ok, len(long))
+		}
+	}
+	if err := CheckSymlinkTarget("a/link", MaxSymlinkTarget); err != nil {
+		t.Errorf("a target at the limit: err = %v, want nil", err)
+	}
 }

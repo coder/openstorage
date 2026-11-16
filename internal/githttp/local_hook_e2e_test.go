@@ -17,8 +17,8 @@ import (
 func TestLocalHookAcceptedPushRecordsIntent(t *testing.T) {
 	skipUnlessLocalSchedule(t)
 	ctx := t.Context()
-	repo := "https://example.com/local-hook-intent.git"
-	id := registerRepo(t, repo)
+	repo := runUnique("https://example.com/local-hook-intent") + ".git"
+	id := registerRepoURL(t, repo)
 	if _, err := testMeta.SetRepoUpstream(ctx, meta.RepoUpstream{
 		RepoID: id, Provider: "github", Owner: "acme", Name: "demo",
 		UpstreamHost: "http://127.0.0.1:1", ForwardOnPush: true,
@@ -52,7 +52,7 @@ func TestLocalHookLivePullClaimSuppressesPullIntent(t *testing.T) {
 	skipUnlessLocalSchedule(t)
 	ctx := t.Context()
 	url := fmt.Sprintf("https://example.com/local-hook-c10-%d.git", time.Now().UnixNano())
-	id := registerRepo(t, url)
+	id := registerRepoURL(t, url)
 	if _, err := testMeta.SetRepoUpstream(ctx, meta.RepoUpstream{
 		RepoID: id, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "http://127.0.0.1:1",
 	}); err != nil {
@@ -109,8 +109,8 @@ func TestLocalHookIntentTracksAcceptedCommands(t *testing.T) {
 		{name: "partial_cannot_forward_or_pull", partial: true, denied: true, forward: true, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			url := "https://example.com/local-intent-" + tc.name + ".git"
-			id := registerRepo(t, url)
+			url := runUnique("https://example.com/local-intent-"+tc.name) + ".git"
+			id := registerRepoURL(t, url)
 			work := initWorkRepo(t)
 			head := revParse(t, work, "HEAD")
 			rw := mintTestToken(t, url, "git:read,git:write", "")
@@ -175,8 +175,8 @@ func TestLocalHookIntentTracksAcceptedCommands(t *testing.T) {
 func TestLocalHookCommittedDeleteThen413KeepsIntent(t *testing.T) {
 	skipUnlessLocalSchedule(t)
 	node := startNodeT(t, fmt.Sprintf("OPENSTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
-	url := "https://example.com/local-hook-413.git"
-	id := registerRepo(t, url)
+	url := runUnique("https://example.com/local-hook-413") + ".git"
+	id := registerRepoURL(t, url)
 	token := mintTestToken(t, url, "git:read,git:write", "")
 	work := initWorkRepo(t)
 	head := revParse(t, work, "HEAD")

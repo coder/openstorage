@@ -11,6 +11,7 @@ A user creates a repository through the REST API and then uses it as an ordinary
 - `remote-clone-id` clones through the `http_url` from create (`/<repo_id>.git`).
 - `remote-fetch` fetches a commit that a second clone pushed.
 - `remote-rest-view` shows the pushed tip through `GET /api/v1/repos/branch`.
+- `remote-hidden` keeps an ephemeral branch made over REST off `/<repo>.git`: `ls-remote` does not list it, and a push to `refs/namespaces/` is refused. `/<repo>+ephemeral.git` still takes and lists its own branches.
 - `remote-empty` clones a repository that has no commits.
 
 ## How to get to it (user POV)
@@ -84,6 +85,27 @@ SECOND=$("$OSV" git "$RUN" remote-second-sha -- -C by-id rev-parse HEAD)
 "$OSV" eq "$RUN" remote-rest-tip "$SECOND" "$("$OSV" json "$OSV_EVIDENCE/remote-branch.body" branch.head_sha)"
 ```
 
+- **Keep ephemeral branches off the persistent remote.** Create the ephemeral branch `agent` from `main` over REST. `GET /api/v1/repos/branches?ephemeral=true` lists it at `SECOND`, and `ls-remote` of `demo.git` lists no `refs/namespaces/` ref. A push of `agent` at its own tip from `by-id`, or of #797's branch named `HEAD`, into that namespace exits `1` with `deny updating a hidden ref`, and the REST list still shows only `agent`. `demo+ephemeral.git` takes a push of `scratch` and lists it.
+
+```sh
+"$OSV" api "$RUN" remote-eph-create --token rw --expect 200 POST /api/v1/repos/branches/create \
+  -H 'Content-Type: application/json' -d '{"base_ref":"main","target_branch":"agent","target_is_ephemeral":true}'
+"$OSV" git "$RUN" remote-ls-hidden --token rw -- ls-remote "$OSV_URL/demo.git"
+"$OSV" eq "$RUN" remote-ls-no-namespace 0 "$(grep -c 'refs/namespaces/' "$OSV_EVIDENCE/remote-ls-hidden.git.txt")"
+"$OSV" git "$RUN" remote-push-hidden --token rw --expect 1 -- \
+  -C by-id push "$OSV_URL/demo.git" HEAD:refs/namespaces/ephemeral/refs/heads/agent
+"$OSV" git "$RUN" remote-push-hidden-head --token rw --expect 1 -- \
+  -C src push "$OSV_URL/demo.git" HEAD:refs/namespaces/ephemeral/refs/heads/HEAD
+"$OSV" eq "$RUN" remote-push-hidden-ng 2 \
+  "$(cat "$OSV_EVIDENCE"/remote-push-hidden*.git.txt | grep -c 'deny updating a hidden ref')"
+"$OSV" api "$RUN" remote-eph-list --token rw --expect 200 GET '/api/v1/repos/branches?ephemeral=true'
+"$OSV" eq "$RUN" remote-eph-names '["agent"]' "$("$OSV" json "$OSV_EVIDENCE/remote-eph-list.body" 'branches.*.name')"
+"$OSV" eq "$RUN" remote-eph-tip "$SECOND" "$("$OSV" json "$OSV_EVIDENCE/remote-eph-list.body" branches.0.head_sha)"
+"$OSV" git "$RUN" remote-eph-push --token rw -- -C src push "$OSV_URL/demo+ephemeral.git" HEAD:refs/heads/scratch
+"$OSV" git "$RUN" remote-eph-ls --token rw -- ls-remote "$OSV_URL/demo+ephemeral.git"
+"$OSV" eq "$RUN" remote-eph-scratch "$SRC" "$(awk '$2 == "refs/heads/scratch" { print $1 }' "$OSV_EVIDENCE/remote-eph-ls.git.txt")"
+```
+
 - **Clone an empty repo.** Create `emptyrepo` and clone it. git exits `0` and prints `warning: You appear to have cloned an empty repository.`
 
 ```sh
@@ -103,4 +125,5 @@ SECOND=$("$OSV" git "$RUN" remote-second-sha -- -C by-id rev-parse HEAD)
 - serve does not log Git requests. The proof is git's exit code and output, plus a second view.
 - git 2.54 and later can start a detached `git maintenance run --auto` after a commit. `osv.sh git` turns `maintenance.auto` off. Plain `git` outside the helper can leave a background process that cleanup then reports.
 - `git -C src fetch origin` fails here because `src` has no `origin` remote. The recipe fetches by URL.
+- REST ephemeral branches and `demo+ephemeral.git` are two separate ref spaces: `scratch` never shows in `GET /api/v1/repos/branches?ephemeral=true`, and `agent` never shows in `ls-remote` of `demo+ephemeral.git`.
 - Pushing to a repo that was never created, or that was deleted, fails with `fatal: repository '<url>/' not found`.

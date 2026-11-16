@@ -1,6 +1,7 @@
 package gitread
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -81,7 +82,7 @@ func TestLsTreeRecursiveAndPath(t *testing.T) {
 	}
 }
 
-func TestStatBlobAndReadBlob(t *testing.T) {
+func TestStatBlobAndReadSymlinkTarget(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 
@@ -96,12 +97,12 @@ func TestStatBlobAndReadBlob(t *testing.T) {
 	if info.LastCommit.SHA != f.c2 {
 		t.Errorf("last commit = %s, want %s", info.LastCommit.SHA, f.c2)
 	}
-	content, err := ReadBlob(ctx, f.dir, info.SHA)
-	if err != nil {
+	var content bytes.Buffer
+	if err := CatBlobTo(ctx, f.dir, info.SHA, &content); err != nil {
 		t.Fatal(err)
 	}
-	if string(content) != "# Title\nline two\nline three\nline four\n" {
-		t.Errorf("blob content %q", content)
+	if content.String() != "# Title\nline two\nline three\nline four\n" {
+		t.Errorf("blob content %q", content.String())
 	}
 
 	// extra.txt was untouched after c2; script.sh untouched after c1.
@@ -121,11 +122,11 @@ func TestStatBlobAndReadBlob(t *testing.T) {
 	if !info.Symlink {
 		t.Errorf("link info = %+v, want symlink", info)
 	}
-	target, err := ReadBlob(ctx, f.dir, info.SHA)
+	target, err := ReadSymlinkTarget(ctx, f.dir, info.SHA, info.Size)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(target) != "README.md" {
+	if target != "README.md" {
 		t.Errorf("symlink target %q", target)
 	}
 

@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +22,7 @@ import (
 	"github.com/coder/openstorage/internal/jobs"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
+	upsync "github.com/coder/openstorage/internal/sync"
 	"github.com/coder/openstorage/internal/testutil/pgfault"
 	"github.com/coder/openstorage/internal/testutil/testimages"
 )
@@ -464,7 +470,7 @@ func TestServeSkipsPokeAfterLostCommitReply(t *testing.T) {
 
 // TestHookEventingRiverFailureRefusesAndCleansUp: on PostgreSQL, when the
 // hook's River client cannot be built after its metadata store opened, the
-// hook refuses an update that would record forward intent, and it closes
+// hook refuses an update that could record forward intent, and it closes
 // the metadata store's connections.
 func TestHookEventingRiverFailureRefusesAndCleansUp(t *testing.T) {
 	if testing.Short() {
@@ -492,9 +498,9 @@ func TestHookEventingRiverFailureRefusesAndCleansUp(t *testing.T) {
 	newHookRiver = func(context.Context, string) (*jobs.River, error) {
 		return nil, errors.New("river client unavailable")
 	}
-	cleanup := wireHookEventing(ctx, slog.New(slog.NewTextHandler(logs, nil)))
+	cleanup := wireHookEventing(ctx, slog.New(githttp.NewHookLogHandler(logs, nil)))
 	defer cleanup()
-	if !strings.Contains(logs.String(), "hook eventing unavailable: river insert-only client; refusing only updates that would record forward intent") {
+	if !strings.Contains(logs.String(), "hook eventing unavailable: river insert-only client; refusing only updates that could record forward intent") {
 		t.Fatalf("missing refusal log: %s", logs)
 	}
 	rs := hookRefStore(t)
@@ -525,5 +531,157 @@ func TestHookEventingRiverFailureRefusesAndCleansUp(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("%d metadata store connections still open after the failed wiring", n)
+	}
+}
+
+// The hook's River client writes River's lines only to serve's hook-errors
+// file: git relays the hook's stdout and stderr to the pusher, and River's
+// insert-notification failure carries the database error as a string.
+func TestHookRiverLogsOnlyToHookErrors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs docker")
+	}
+	ctx := t.Context()
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
+		tcpostgres.WithDatabase("postgres"),
+		tcpostgres.WithUsername("postgres"),
+		tcpostgres.WithPassword("postgres"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+	t.Cleanup(func() { _ = pgC.Terminate(context.Background()) })
+	dbURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := meta.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ms.Close)
+	if err := ms.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key, _, err := newLoopbackKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// serve's wiring migrates River.
+	_, _, cleanup, err := buildServeEventing(ctx, ms, dbURL, "org", "http://127.0.0.1:1", t.TempDir(), key,
+		nil, nil, nil, nil, false, syncEgressSettings{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+
+	// A pg_notify that fails with a canary, ahead of pg_catalog's on the
+	// search path, as a database whose notify fails would.
+	schema := "canary_" + strings.ToLower(rand.Text()[:8])
+	canary := "canary-host-" + strings.ToLower(rand.Text()[:8]) + ".invalid"
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	for _, sql := range []string{
+		`CREATE SCHEMA ` + schema,
+		`CREATE FUNCTION ` + schema + `.pg_notify(text, text) RETURNS void LANGUAGE plpgsql AS
+			$$ BEGIN RAISE EXCEPTION 'could not reach ` + canary + `'; END $$`,
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	q.Set("search_path", schema+",pg_catalog,public")
+	u.RawQuery = q.Encode()
+
+	hookEventingEnv(t, dbURL)
+	out, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevOut, prevErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = out, out
+	river, err := newHookRiver(ctx, u.String())
+	if err == nil {
+		err = river.EnqueueSync(ctx, upsync.Job{Org: "org", RepoID: "repo-1"})
+		river.Close()
+	}
+	os.Stdout, os.Stderr = prevOut, prevErr
+	if err == nil {
+		t.Fatal("EnqueueSync succeeded with a failing pg_notify; want the canary error")
+	}
+	b, rerr := os.ReadFile(out.Name())
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if n := strings.Count(string(b), canary); n != 0 {
+		t.Fatalf("stdout and stderr name the canary %d times: %s", n, b)
+	}
+	if !strings.Contains(hookErrorRecords(t), canary) {
+		t.Fatalf("the hook-errors file lacks River's notify failure: %s", hookErrorRecords(t))
+	}
+}
+
+// runHook makes the hook logger the default before it wires eventing, so a
+// line that the wiring's callees log through the default logger (River,
+// the store packages) keeps its error value off stderr too.
+func TestRunHookSetsTheDefaultLoggerBeforeWiring(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs docker")
+	}
+	ctx := t.Context()
+	pgC, err := tcpostgres.Run(ctx, testimages.Postgres,
+		tcpostgres.WithDatabase("postgres"),
+		tcpostgres.WithUsername("postgres"),
+		tcpostgres.WithPassword("postgres"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+	t.Cleanup(func() { _ = pgC.Terminate(context.Background()) })
+	dbURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := meta.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ms.Close)
+	if err := ms.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	hookEventingEnv(t, dbURL)
+	canary := "canary-host-" + strings.ToLower(rand.Text()[:8]) + ".invalid"
+	original := newHookRiver
+	t.Cleanup(func() { newHookRiver = original })
+	newHookRiver = func(context.Context, string) (*jobs.River, error) {
+		slog.Warn("river client failed through the default logger", "err", errors.New("dial "+canary))
+		return nil, errors.New("river client unavailable")
+	}
+	prev, prevOut, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	var stderr bytes.Buffer
+	if err := runHook(ctx, []string{"no-such-hook"}, &stderr); err == nil {
+		t.Fatal("runHook ran an unknown hook")
+	}
+	if !strings.Contains(stderr.String(), "river client failed through the default logger") || strings.Contains(stderr.String(), canary) {
+		t.Fatalf("stderr = %q; want the default logger's line without the canary", stderr.String())
+	}
+	if !strings.Contains(hookErrorRecords(t), canary) {
+		t.Fatalf("the hook-errors file lacks the default logger's line: %s", hookErrorRecords(t))
 	}
 }

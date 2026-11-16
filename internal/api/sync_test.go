@@ -170,6 +170,7 @@ type usyncStack struct {
 
 func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 	t.Helper()
+	logger := testLogger(t) // the worker's log names a failed run's cause
 	s := &usyncStack{
 		e:        e,
 		org:      e.newOrg(t),
@@ -210,14 +211,14 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 				return e.mint(t, tokenSpec{iss: org, repo: repo.RepoID, scopes: []string{auth.ScopeGitWrite}}), nil
 			},
 		},
-		Logger:  discardLogger(),
+		Logger:  logger,
 		Timeout: time.Minute,
 		// Fixture upstreams are 127.0.0.1 CGI servers, denied by the
 		// egress guard's strict policy in both directions.
 		PushEgressAllowPrivate: true,
 		PullEgressAllowPrivate: true,
 	}
-	queue := upsync.NewInProcessQueue(worker.Run, worker.RunPush, discardLogger())
+	queue := upsync.NewInProcessQueue(worker.Run, worker.RunPush, logger)
 	t.Cleanup(queue.Close)
 
 	ss := newSyncServer(e.store, s.mem, s.mem, queue, testHTTPBaseURL, events.TargetGuard{AllowPrivate: true}, discardLogger())

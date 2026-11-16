@@ -3,7 +3,10 @@ package gitread
 // What the walk's git can do that the stream's cannot (#615): fail on its
 // own, need more heap, or read a tree that the stream reads in full. In
 // every case the answer is the stream's, which is the one LsTreePage gave
-// before the walk.
+// before the walk. The exception is
+// TestLsTreePageCursorOnABrokenFolderBeforeTheCursor: a broken folder before
+// the cursor fails a page that the stream answers, and not one that the walk
+// answers.
 
 import (
 	"context"
@@ -77,6 +80,58 @@ func TestLsTreePageCursorWhenTheWalksGitFails(t *testing.T) {
 	}
 }
 
+// A request to a cat-file child that has already ended: a child that failed
+// gives git's error, and one that ended cleanly declines, as when its output
+// ends before the answer. A walk sees one or the other, the failed write or
+// the end of the output, depending on how soon the child ends (#764's merge
+// group run saw the write's broken pipe). Each case writes after git ended,
+// so the write fails every time: a heap cap, a crash and a canceled request
+// stay errors there too.
+func TestTreeSourceRequestAfterGitEnded(t *testing.T) {
+	dir, commit := fiRepo(t, nestedFiles())
+	for name, c := range map[string]struct {
+		script   string
+		budgeted bool
+		cancel   bool
+		want     func(error) bool
+	}{
+		"silent end": {`exit 0`, false, false, func(err error) bool { return errors.Is(err, errDeclined) }},
+		"exit":       {`echo "fatal: boom" >&2; exit 3`, false, false, func(err error) bool { return err != nil && !errors.Is(err, errDeclined) }},
+		"heap cap":   {`echo "fatal: Out of memory, malloc failed (tried to allocate 1 bytes)" >&2; exit 128`, true, false, func(err error) bool { return errors.Is(err, ErrMemoryLimit) }},
+		"crash":      {`kill -SEGV $$`, false, false, func(err error) bool { return err != nil && !errors.Is(err, errDeclined) }},
+		"canceled":   {`echo ready; exec sleep 30`, false, true, func(err error) bool { return errors.Is(err, context.Canceled) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if c.budgeted && !HeapLimitSupported() {
+				t.Skip("heap cap is Linux-only")
+			}
+			fakeGit(t, c.script)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if c.budgeted {
+				ctx, _ = budgeted(t, 1<<20)
+			}
+			src, err := startTreeSource(ctx, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = src.close(true) })
+			if c.cancel {
+				// Cancel only once git runs: git is then killed for the
+				// canceled request, and that kill is no git failure.
+				if line, err := src.resp.ReadString('\n'); err != nil || line != "ready\n" {
+					t.Fatalf("git's first line = %q, %v", line, err)
+				}
+				cancel()
+			}
+			_ = src.wait() // git is gone, and so is the reader of its request pipe
+			if _, _, err := src.request(commit); !c.want(err) {
+				t.Fatalf("request after git ended = %v", err)
+			}
+		})
+	}
+}
+
 // A git config that fails leaves the page to the stream: the walk does not
 // know the depth limit, so it does not answer.
 func TestLsTreePageCursorWhenTheDepthLimitCannotBeRead(t *testing.T) {
@@ -104,6 +159,11 @@ func TestLsTreePageCursorOnARootFolderOverHalfTheHeapCap(t *testing.T) {
 	dir := t.TempDir()
 	mustGit(t, dir, "init", "-q", "--bare", ".")
 	blob := gitIn(t, dir, "x", "hash-object", "-w", "--stdin")
+	// ls-tree --long reads the size of each of the 200,000 entries. From a
+	// loose blob that is 200,000 file reads, 10 s and more on a loaded
+	// host. From a pack it is an index lookup.
+	gitIn(t, dir, blob+"\n", "pack-objects", "-q", "objects/pack/pack")
+	gitIn(t, dir, "", "prune-packed")
 	names := make([]string, 200_000) // a tree object of 7.2 MB
 	for i := range names {
 		names[i] = fmt.Sprintf("f%07d", i)
@@ -112,32 +172,48 @@ func TestLsTreePageCursorOnARootFolderOverHalfTheHeapCap(t *testing.T) {
 	commit := commitOf(t, dir, tree)
 
 	const heapCap = 12 << 20
-	b := NewBudget(NewSlots(1, 1, 0), "repo", time.Minute, DefaultOutputBytes).
-		WithLimits(Limits{HeavyHeap: heapCap, LightHeap: LightHeapBytes, MaxBlob: MaxBlobBytes})
-	t.Cleanup(b.Close)
-	ctx := WithBudget(context.Background(), b)
-
-	catFile := func(req string) error {
-		_, err := Run(ctx, Cmd{Class: Heavy, Dir: dir, Stdin: strings.NewReader(req + "\n"), Stdout: io.Discard, Args: []string{"cat-file", "--batch"}})
+	// The heap cap is what this test checks. Each capped read gets a budget
+	// of its own, as each request does, and the stream that the pages are
+	// compared with runs with no budget: it only gives the answer. With one
+	// budget for all six reads, two of them streams that parse 100,000
+	// entries, a loaded host used up the shared time budget.
+	// TestLsTreePageCursorTimeBudget checks the time budget.
+	capped := func() context.Context {
+		b := NewBudget(NewSlots(1, 1, 0), "repo", time.Minute, DefaultOutputBytes).
+			WithLimits(Limits{HeavyHeap: heapCap, LightHeap: LightHeapBytes, MaxBlob: MaxBlobBytes})
+		t.Cleanup(b.Close)
+		return WithBudget(context.Background(), b)
+	}
+	git := func(stdin string, args ...string) error {
+		_, err := Run(capped(), Cmd{Class: Heavy, Dir: dir, Stdin: strings.NewReader(stdin), Stdout: io.Discard, Args: args})
 		return err
 	}
-	if err := catFile(commit + "^{tree}"); !errors.Is(err, ErrMemoryLimit) {
+	if err := git(commit+"^{tree}\n", "cat-file", "--batch"); !errors.Is(err, ErrMemoryLimit) {
 		t.Fatalf("control: cat-file --batch of %s^{tree} under %d bytes = %v, want ErrMemoryLimit", commit, heapCap, err)
 	}
-	if err := catFile(tree); err != nil {
+	if err := git(tree+"\n", "cat-file", "--batch"); err != nil {
 		t.Fatalf("control: cat-file --batch of the tree id under %d bytes: %v", heapCap, err)
+	}
+	// The stream's git, listing the whole tree.
+	if err := git("", "ls-tree", "--long", "-z", "-r", commit); err != nil {
+		t.Fatalf("control: ls-tree under %d bytes: %v", heapCap, err)
 	}
 	const limit = 3
 	after := names[100_000]
-	wp, wm, wf, werr := pageOracle(ctx, dir, commit, "", after, limit)
-	if werr != nil || len(wp) != limit || !wm || !wf {
-		t.Fatalf("control: the stream under the cap = %v, %v, %v, %v", paths(wp), wm, wf, werr)
+	want := names[100_001 : 100_001+limit]
+	wp, wm, wf, werr := pageOracle(context.Background(), dir, commit, "", after, limit)
+	if werr != nil || !slices.Equal(paths(wp), want) || !wm || !wf {
+		t.Fatalf("control: the stream = %v, %v, %v, %v; want %v", paths(wp), wm, wf, werr, want)
 	}
-	page, more, found, err := resumeTreePage(ctx, dir, commit, "", after, limit)
-	if err != nil || !slices.Equal(page, wp) || more != wm || found != wf {
-		t.Fatalf("resumeTreePage = %v, %v, %v, %v; want %v, %v", paths(page), more, found, err, paths(wp), wm)
+	for name, read := range map[string]func(context.Context, string, string, string, string, int) ([]TreeEntry, bool, bool, error){
+		"resumeTreePage": resumeTreePage,
+		"LsTreePage":     LsTreePage,
+	} {
+		page, more, found, err := read(capped(), dir, commit, "", after, limit)
+		if err != nil || !slices.Equal(page, wp) || more != wm || found != wf {
+			t.Fatalf("%s under %d bytes = %v, %v, %v, %v; want the stream's %v, %v, %v", name, heapCap, paths(page), more, found, err, paths(wp), wm, wf)
+		}
 	}
-	sameAsStream(t, ctx, dir, commit, "", after, limit)
 }
 
 // The walk takes the root tree from the first line of the commit, and leaves
@@ -402,6 +478,89 @@ func TestLsTreePageCursorChoosesTheEngineByTheSizeOfAFolder(t *testing.T) {
 			wp, wm, wf, werr := pageOracle(context.Background(), dir, commit, "", c.after, 1000)
 			if err != nil || werr != nil || !slices.Equal(page, wp) || more != wm || found != wf || len(page) != 1000 {
 				t.Fatalf("LsTreePage = %d entries, %v, %v, %v; stream %d entries, %v, %v, %v", len(page), more, found, err, len(wp), wm, wf, werr)
+			}
+		})
+	}
+}
+
+// A folder before the cursor that git cannot read fails a page that the stream
+// answers, as it does for a first page, and not a page that the walk answers
+// (the files row of docs/reference/http-api.md). The tree has 1,500 folders of
+// one file and the cursor is d00010/f0. A page of 1000 entries is the stream's
+// and a page of 200 is the walk's
+// (TestLsTreePageCursorChoosesTheEngineByTheFoldersItReads). The folder d00005
+// is missing, or an object that does not inflate, or the top of a chain of 10
+// folders under a core.maxTreeDepth of 3.
+func TestLsTreePageCursorOnABrokenFolderBeforeTheCursor(t *testing.T) {
+	const cursor = "d00010/f0"
+	ctx := context.Background()
+	oneFile := func(chain int) []fiFile {
+		var files []fiFile
+		for i := range 1500 {
+			path := fmt.Sprintf("d%05d/f0", i)
+			if i == 5 && chain > 0 {
+				path = fmt.Sprintf("d%05d/%sf0", i, strings.Repeat("c/", chain))
+			}
+			files = append(files, fiFile{"100644", path, "x"})
+		}
+		return files
+	}
+	// folder5 returns a commit of commit's tree with d00005 set to id, which
+	// need not exist.
+	folder5 := func(t *testing.T, dir, commit, id string) string {
+		var listing strings.Builder
+		for _, line := range strings.Split(gitIn(t, dir, "", "ls-tree", commit), "\n") {
+			if fields := strings.Fields(line); strings.HasSuffix(line, "\td00005") {
+				line = strings.Replace(line, fields[2], id, 1)
+			}
+			listing.WriteString(line + "\n")
+		}
+		return commitOf(t, dir, gitIn(t, dir, listing.String(), "mktree", "--missing"))
+	}
+	for _, c := range []struct {
+		name   string
+		files  []fiFile
+		break_ func(t *testing.T, dir, intact string) string
+	}{
+		{"missing", oneFile(0), func(t *testing.T, dir, intact string) string {
+			return folder5(t, dir, intact, strings.Repeat("a", 40))
+		}},
+		{"unreadable", oneFile(0), func(t *testing.T, dir, intact string) string {
+			id := strings.Repeat("b", 40)
+			file := filepath.Join(dir, "objects", id[:2], id[2:])
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte("not a zlib stream"), 0o444); err != nil {
+				t.Fatal(err)
+			}
+			return folder5(t, dir, intact, id)
+		}},
+		{"too deep", oneFile(10), func(t *testing.T, dir, intact string) string {
+			gitIn(t, dir, "", "config", "core.maxTreeDepth", "3")
+			return intact
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir, intact := fiRepo(t, c.files)
+			want, _, _, err := LsTreePage(ctx, dir, intact, "", cursor, 200)
+			if err != nil || len(want) != 200 {
+				t.Fatalf("the intact tree: %d entries, %v", len(want), err)
+			}
+			broken := c.break_(t, dir, intact)
+
+			_, _, _, err = LsTreePage(ctx, dir, broken, "", cursor, 1000)
+			_, _, _, streamErr := pageOracle(ctx, dir, broken, "", cursor, 1000)
+			if err == nil || streamErr == nil || err.Error() != streamErr.Error() {
+				t.Fatalf("limit 1000: err %v, the stream's %v; want the same error", err, streamErr)
+			}
+
+			page, _, _, err := LsTreePage(ctx, dir, broken, "", cursor, 200)
+			if err != nil || !slices.Equal(page, want) {
+				t.Fatalf("limit 200: %d entries, err %v; want the %d entries of the intact tree", len(page), err, len(want))
+			}
+			if _, _, _, err := pageOracle(ctx, dir, broken, "", cursor, 200); err == nil {
+				t.Fatal("limit 200: the stream answers, so the tree is not broken before the cursor")
 			}
 		})
 	}

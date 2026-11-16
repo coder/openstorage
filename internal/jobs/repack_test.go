@@ -1717,7 +1717,7 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	// Insert-only clients (hook subprocesses) must refuse repack inserts:
 	// they register no worker, and a uniquely-queued job nobody works
 	// would swallow every later trigger.
-	ins, err := NewRiverInsertOnly(ctx, pgURL)
+	ins, err := NewRiverInsertOnly(ctx, pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiverInsertOnly: %v", err)
 	}

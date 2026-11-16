@@ -3,10 +3,9 @@ package gitlimit
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
-	"strings"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -14,20 +13,6 @@ import (
 
 // ErrStopping refuses a git child started after StopChildren began.
 var ErrStopping = errors.New("server is shutting down")
-
-// ErrArgNUL: an argument or an environment variable of a child holds a NUL
-// byte, which a command line cannot carry (exec refuses it). A value that a
-// client sent can hold one, so callers answer it as a bad request. git was
-// not started.
-var ErrArgNUL = errors.New("a value holds a NUL byte, which git cannot take")
-
-// ErrArgTooLong: the command line or the environment of a child does not fit
-// what the system lets exec take (E2BIG). On Linux one argument or variable
-// may not reach 32 pages (128 KiB with 4 KiB pages), and all of them together
-// are limited too. A value
-// that a client sent can reach it, so callers answer it as a limit on the
-// request, not as an internal error. git was not started.
-var ErrArgTooLong = errors.New("a value is too long to pass to git")
 
 // children tracks the git children serve starts for requests and for cache
 // hydration: upload-pack, receive-pack and its hooks, REST reads and
@@ -62,8 +47,14 @@ type group struct {
 	exited bool // the leader exited while stop ran, so wait holds it unreaped
 }
 
-// Start starts cmd as the leader of a new process group and tracks it.
-func Start(cmd *exec.Cmd) error { return children.start(cmd) }
+// Start starts cmd as the leader of a new process group and tracks it. A git
+// that runs in a cache repository starts through StartIn instead (lease.go).
+func Start(cmd *exec.Cmd) error {
+	if checkUnleased != nil {
+		checkUnleased(cmd)
+	}
+	return children.start(cmd)
+}
 
 // Wait waits for a child that Start started and stops tracking its group.
 func Wait(cmd *exec.Cmd) error { return children.wait(cmd) }
@@ -85,13 +76,18 @@ func Output(cmd *exec.Cmd) ([]byte, error) {
 	return out.Bytes(), err
 }
 
-// CombinedOutput is exec.Cmd.CombinedOutput through the registry.
-func CombinedOutput(cmd *exec.Cmd) ([]byte, error) {
-	assertf(cmd.Stdout == nil && cmd.Stderr == nil, "gitlimit.CombinedOutput: Stdout or Stderr already set")
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err := Run(cmd)
-	return out.Bytes(), err
+// NoReplaceObjects returns env (nil: the server's environment) with
+// GIT_NO_REPLACE_OBJECTS set, so that git reads every object as itself.
+// Any token with git:write can push refs/replace/<id>, which would
+// otherwise make git read one object as another: a commit with other
+// parents in a no-force-push check, a signed commit in a verify-sig
+// check, another tree under a server-written commit. Every child that
+// Start runs gets it, and receive-pack passes it to its hooks.
+func NoReplaceObjects(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	return append(slices.Clip(env), "GIT_NO_REPLACE_OBJECTS=1")
 }
 
 // Stopping reports whether StopChildren began.
@@ -104,21 +100,24 @@ func Stopping() bool { return children.isStopped() }
 // the number of groups it signaled.
 func StopChildren(grace time.Duration) int { return children.stop(grace) }
 
+// failStart ends a start that fails before cmd.Start runs. With cmd.Err set,
+// Start fails at once and closes the pipes that the caller made with
+// StdinPipe, StdoutPipe and StderrPipe, which otherwise stay open until a
+// garbage collection. It returns err.
+func failStart(cmd *exec.Cmd, err error) error {
+	cmd.Err = err
+	_ = cmd.Start()
+	return err
+}
+
 func (g *registry) start(cmd *exec.Cmd) error {
 	assertf(cmd.SysProcAttr == nil, "gitlimit.Start: cmd already has SysProcAttr")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = NoReplaceObjects(cmd.Env)
 	if g.isStopped() {
-		return ErrStopping
-	}
-	for _, v := range append(append([]string{}, cmd.Args...), cmd.Env...) {
-		if strings.IndexByte(v, 0) >= 0 {
-			return ErrArgNUL
-		}
+		return failStart(cmd, ErrStopping)
 	}
 	if err := cmd.Start(); err != nil {
-		if errors.Is(err, syscall.E2BIG) {
-			return fmt.Errorf("%w: %w", ErrArgTooLong, err)
-		}
 		return err
 	}
 	g.mu.Lock()

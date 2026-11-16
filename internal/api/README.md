@@ -19,6 +19,7 @@ The REST API (`/api/v1/...`) and its `/api/repos/{repo_name}` alias layer. `New`
 ## Invariants
 - `New` panics when a required dependency is missing and returns an error for a bad cache dir or rate-limit config [api.go:New]
 - `requireAuth` returns 401 for a missing or non-Bearer `Authorization` header, 403 `forbidden` for a token that fails verification, 403 `authentication_unavailable` when the key store fails, and 403 for a wrong org, scope, or repo claim [middleware.go:requireAuth]
+- `forkAwareCreateRepo` answers 400 before any create form runs when the `repo` claim is not `meta.ValidText` [handlers_fork.go:forkAwareCreateRepo]
 - `recoverPanics` re-panics `http.ErrAbortHandler` and otherwise answers 500 [middleware.go:recoverPanics]
 - `newProblem` asserts a 4xx/5xx status and a valid code; `internalErr` never returns raw error text [errors.go:newProblem] [errors.go:internalErr]
 - `writeGitLimitErr` maps `ErrBusy`/`ErrTimeBudget` to 503 and memory, output, or blob limits to 422 [git_budget.go:writeGitLimitErr]
@@ -26,12 +27,15 @@ The REST API (`/api/v1/...`) and its `/api/repos/{repo_name}` alias layer. `New`
 - `clientKey` trusts `X-Forwarded-For` only from trusted proxies; a limited bucket latches until the reserve refills [ratelimit.go:clientKey]
 - `handleCreateRepo` rejects a body `repo_name` that differs from the JWT repo claim [handlers.go:handleCreateRepo]
 - `validBranchName` rejects names over 255 bytes, `..`, `.lock` components, and characters outside a conservative set [handlers.go:validBranchName]
+- `validNewBranchName` also rejects a last part over 250 bytes, which leaves room for git's `.lock` file; every ref write uses it, and branch and tag deletes keep `validBranchName` [handlers.go:validNewBranchName]
 - Ref policies deny `no-push`, non-fast-forward under `no-force-push`, server-created commits under `verify-sig`, and unknown ops (fail closed) [handlers_write_refs.go:wrefPolicyCheck] [handlers_write_commit.go:wcCheckRefPolicy]
 - Write-commit paths reject `.git` components, absolute or dot paths, and control bytes; a stale `expected_head_sha` is 412 [handlers_write_commit.go:wcValidPath] [handlers_write_commit.go:wcPlanCommit]
 - Merges need git >= 2.38 and refuse unrelated histories unless allowed; a stale target SHA is 409 [handlers_write_merge.go:wmCheckGitVersion] [handlers_write_merge.go:handleMerge]
 - Fork and copy check the source token for `git:read` and the pack size against quota before creating any row [handlers_fork.go:handleForkRepo]
 - `publishPack` denies over-quota packs before upload and fails closed on a second stale usage floor [publish.go:publishPack]
 - `validUpstreamHost` rejects userinfo, query, fragment, and non-http(s) schemes [handlers_sync.go:validUpstreamHost]
+- Text the request asks to store answers 400 on every backend when it holds a NUL byte (a JSON body decodes invalid UTF-8 to U+FFFD, so only a NUL reaches the check): a webhook `secret`, a credential `username` and `password`, the `owner`, `name` and `auth.token` of a sync link, and a `pull-upstream` `ref`. A webhook or credential ID with a NUL byte or invalid UTF-8 answers the 404 of an unknown ID [errors.go:invalidTextFields] [handlers_webhooks.go:handleCreate] [handlers_credentials.go:handleCreateCredential] [handlers_sync.go:validateSyncBaseRepo] [handlers_sync.go:parseUpstreamConfig] [handlers_sync.go:handlePullUpstream]
+- A request value that git takes as one argument or one environment entry answers 400 before git starts when it does not fit `gitlimit.MaxArgBytes` with what the server puts around it: a read `path` or grep `paths` entry (`maxGitPathBytes`), a blame `range` and a grep `query.pattern`, and the `name` and `email` of an author, a committer or a note author (`maxGitIdentBytes`). A commit message goes to `commit-tree` on stdin [handlers_read_core.go:readPathOK] [handlers_read_query.go:cleanPathParams] [handlers_read_query.go:handleBlame] [handlers_read_query.go:handleGrep] [handlers_read_query.go:grepPathProblems] [handlers_write_commit.go:wcAuthorProblems] [handlers_write_refs.go:wrefHandleNote] [handlers_write_commit.go:wcScratch.writeCommit]
 - `handleDeleteBranch` refuses to delete the default branch in the persistent namespace [handlers_write_refs.go:handleDeleteBranch]
 
 ## Side Effects

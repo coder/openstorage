@@ -47,6 +47,8 @@ func TestDecodeCursorInvalid(t *testing.T) {
 		"non-numeric time":   enc("12x3|repo_x"),
 		"empty time":         enc("|repo_x"),
 		"overflow timestamp": enc("99999999999999999999999999|repo_x"),
+		"repo id with a NUL": enc("123|repo_\x00x"),
+		"repo id not UTF-8":  enc("123|repo_\xffx"),
 	}
 	for name, cursor := range cases {
 		t.Run(name, func(t *testing.T) {

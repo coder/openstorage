@@ -3,7 +3,6 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -63,7 +62,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, verifier auth.Verifier, org strin
 func (h *webhooksAPI) internalErr(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil, "internalErr called with nil error")
 	assertf(op != "", "internalErr called with empty op")
-	h.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	h.logger.Error("internal error", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
 }
 
@@ -110,8 +109,8 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req createWebhookRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(body, &req); err != nil {
+		writeInvalidBody(w, err)
 		return
 	}
 	if !validWebhookURL(req.URL) {
@@ -134,6 +133,9 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 		// A whitespace-only secret is always a caller bug: it would sign
 		// deliveries with a key nobody can plausibly have intended.
 		writeErr(w, http.StatusBadRequest, "invalid secret: must not be blank")
+		return
+	} else if !meta.ValidText(secret) {
+		writeErr(w, http.StatusBadRequest, invalidTextMsg("secret"))
 		return
 	}
 

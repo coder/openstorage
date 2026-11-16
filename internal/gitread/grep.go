@@ -1,13 +1,17 @@
 package gitread
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -96,6 +100,9 @@ func Grep(ctx context.Context, repoPath, commit string, opts GrepOptions) ([]Gre
 	return files, nil
 }
 
+// ErrBadPattern: git grep could not compile the request's pattern.
+var ErrBadPattern = errors.New("grep pattern is not a valid regex")
+
 // runGrep executes one git grep pass and parses it; every line is typed as
 // a match (the caller downgrades context lines).
 func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, extraArgs []string) ([]GrepFile, error) {
@@ -111,12 +118,28 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 	if len(opts.Pathspecs) > 0 {
 		args = append(append(args, "--"), opts.Pathspecs...)
 	}
-	out, err := runGit(ctx, Heavy, repoPath, args...)
+	var stderr gitlimit.TailBuffer
+	var unreadable grepUnreadableWatch
+	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Env: noTreeAttrsEnv(), Args: args, Stderr: io.MultiWriter(&stderr, &unreadable)})
+	var exitErr *exec.ExitError
+	noMatch := errors.As(err, &exitErr) && exitErr.ExitCode() == 1
+	// git grep that cannot read a blob prints "error: '<name>': unable to
+	// read <oid>" and goes on: it exits 0 with the other files' matches, or
+	// 1 with none. That is a broken repository, not a result.
+	if (err == nil || noMatch) && unreadable.seen() {
+		return nil, fmt.Errorf("git grep at %s could not read the repository: %s", commit, stderr.String())
+	}
 	if err != nil {
 		// Exit status 1 with empty output is git grep's "no matches".
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.TrimSpace(out) == "" {
+		if noMatch && strings.TrimSpace(out) == "" {
 			return []GrepFile{}, nil
+		}
+		// git dies with "-e option, '<pattern>': <reason>" for a pattern it
+		// cannot compile. Only that fixed head counts, which comes before
+		// any request text: a read error (a missing or corrupt object)
+		// also exits 128.
+		if stderr, ok := gitStderr(err, 128); ok && strings.HasPrefix(stderr[strings.LastIndexByte(stderr, '\n')+1:], "fatal: -e option, '") {
+			return nil, fmt.Errorf("%w: %w", ErrBadPattern, err)
 		}
 		return nil, err
 	}
@@ -173,4 +196,53 @@ func parseGrepOutput(out, commit string) ([]GrepFile, error) {
 		files[idx].Lines = append(files[idx].Lines, GrepLine{LineNumber: n, Text: text, Type: GrepLineMatch})
 	}
 	return files, nil
+}
+
+// grepUnreadableTail is the end of git grep's diagnostic for a blob it
+// cannot read, "error: '<name>': unable to read <oid>". Only the end is
+// read: <name> holds the path, which can hold a newline.
+var grepUnreadableTail = regexp.MustCompile(`': unable to read [0-9a-f]{40}([0-9a-f]{24})?\z`)
+
+// grepUnreadableWatch watches git grep's stderr, as git writes it, for a
+// line that ends as grepUnreadableTail. It keeps only the end of the
+// current line, so no amount of other stderr can hide that line.
+type grepUnreadableWatch struct {
+	line  []byte // the last bytes of the current line
+	found bool
+}
+
+// grepLineKeepBytes is the end of a line that grepUnreadableWatch keeps:
+// more than the tail with a 64-hex object id.
+const grepLineKeepBytes = 128
+
+func (w *grepUnreadableWatch) Write(p []byte) (int, error) {
+	n := len(p)
+	for {
+		i := bytes.IndexByte(p, '\n')
+		part := p
+		if i >= 0 {
+			part = p[:i]
+		}
+		w.line = append(w.line, part...)
+		if over := len(w.line) - grepLineKeepBytes; over > 0 {
+			w.line = append(w.line[:0], w.line[over:]...)
+		}
+		if i < 0 {
+			return n, nil
+		}
+		w.endLine()
+		p = p[i+1:]
+	}
+}
+
+func (w *grepUnreadableWatch) endLine() {
+	w.found = w.found || grepUnreadableTail.Match(w.line)
+	w.line = w.line[:0]
+}
+
+// seen reports whether a line, the last one included, ended as
+// grepUnreadableTail.
+func (w *grepUnreadableWatch) seen() bool {
+	w.endLine()
+	return w.found
 }

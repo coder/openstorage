@@ -1135,6 +1135,23 @@ func testQueryGrep(t *testing.T, e *testEnv) {
 				rqExpectErr(t, resp, body, http.StatusBadRequest)
 			})
 		}
+		// A cursor whose anchor commit git cannot check (here its
+		// rev-parse fails with exec.ErrWaitDelay, as on a long-stalled
+		// host) is a server failure, not an invalid cursor.
+		t.Run("unresolvable anchor is a 500", func(t *testing.T) {
+			realGit, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
+			bin := t.TempDir()
+			wrapper := "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then for a in \"$@\"; do [ \"$a\" = '" + fx.c4 + "' ] && { (sleep 5) & }; done; fi\nexec " + realGit + " \"$@\"\n"
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			resp, body := post(encodeGrepCursor(fx.c4, "docs/intro.md", 3))
+			rqExpectErr(t, resp, body, http.StatusInternalServerError)
+		})
 	})
 }
 

@@ -510,9 +510,10 @@ Per-repository storage quota (packs + LFS), enforced at every external storage w
   - Git LFS uploads: per-object `507` batch errors before any transfer URL is issued. The
     verified upload re-checks the actual `Content-Length`, so under-declared sizes cannot
     bypass it.
-- **Namespaces:** a repo and its `+ephemeral` / `+import` namespaces
+- **Namespaces:** a repo and its `+ephemeral` namespace
   ([git protocol](../explanation/git-protocol-and-namespaces.md)) share the base repo's
-  quota. LFS objects always store under the base repo's prefix.
+  quota. An `+import` push writes the repo's own refs, and packs under the old
+  `<repo_id>+import` key (0.20.0 and earlier) keep counting until the repo is deleted. LFS objects always store under the base repo's prefix.
 - **Admission** uses a durable reservation ledger in the ref store, atomic across pushes
   and replicas: of two pushes that fit alone but not together, exactly one wins. LFS
   charges it too (advisory batch check, then a durable reserve at the verified upload, settled when
@@ -1003,8 +1004,8 @@ Not part of the operator surface; listed for completeness. Never set these manua
 - `OPENSTORAGE_GIT_REPO`, `OPENSTORAGE_GIT_REFS_POLICY`, `OPENSTORAGE_GIT_OPS`,
   `OPENSTORAGE_GIT_ATOMIC`, `OPENSTORAGE_GIT_PACK_QUOTA`,
   `OPENSTORAGE_GIT_PACK_RESERVATION_TTL`, `OPENSTORAGE_GIT_VERIFY_STATE`,
-  `OPENSTORAGE_GIT_VERIFY_SIG_BUDGET`: per-request plumbing the server sets for the
-  `openstorage hook` subprocess that git re-execs.
+  `OPENSTORAGE_GIT_VERIFY_SIG_BUDGET`, `OPENSTORAGE_GIT_HOOK_ERRORS`: per-request plumbing
+  the server sets for the `openstorage hook` subprocess that git re-execs.
 - `OPENSTORAGE_ASKPASS_USERNAME`, `OPENSTORAGE_ASKPASS_PASSWORD`: set by the upstream-sync
   worker for its own git credential helper.
 - `OPENSTORAGE_TEST_MODE`, `OPENSTORAGE_TEST_CRASH`, `OPENSTORAGE_TEST_CAS_DROP`,
@@ -1017,4 +1018,5 @@ Not part of the operator surface; listed for completeness. Never set these manua
 
 The Docker Compose file has its own host-port overrides (`PGPORT`, `S3PORT`,
 `NODEA_PORT`, `NODEB_PORT`, `CS_KEYS_DIR`); see the
-[`docker-compose.yml`](../../docker-compose.yml) header.
+[`docker-compose.yml`](../../docker-compose.yml) header. Postgres and the S3
+gateway publish on `127.0.0.1` only.

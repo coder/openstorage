@@ -154,6 +154,18 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 				requireEnvelope(t, resp, body)
 			})
 		}
+		// Only git's exit 1 says that git rejects the name. validBranchName
+		// refuses every name above before git runs, so a fake git gives
+		// the exit 1 too.
+		for how, want := range map[string]int{"1": http.StatusBadRequest, "128": http.StatusInternalServerError, "kill": http.StatusInternalServerError} {
+			t.Run("git "+how+" on check-ref-format", func(t *testing.T) {
+				gitFailsOnArg(t, "refs/heads/feature", how)
+				resp, body := e.doReq(t, http.MethodPatch, "/api/v1/repo", writeTok, []byte(`{"default_branch":"feature"}`), "")
+				if resp.StatusCode != want {
+					t.Fatalf("PATCH = %d, want %d: %s", resp.StatusCode, want, body)
+				}
+			})
+		}
 
 		// Scope gate: git:read+git:write without repo:write -> 403.
 		gitTok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url,
@@ -198,18 +210,32 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 	})
 }
 
-// Create-time defaults get the same git-safe validation as PATCH (Codex
-// round 5, P1): a stored default git rejects (trailing dot) would poison
-// every hydration of the new repo, so POST /repos must refuse it up front.
+// Create-time defaults get the same validation as PATCH (Codex round 5,
+// P1): a stored default git rejects (trailing dot) would poison every
+// hydration of the new repo, and a default outside refs/heads/ (issue
+// #799: refs/namespaces/ is hidden on the git remote) would point HEAD at
+// a ref the remote does not show. So POST /repos refuses both up front.
 func TestCreateRepoRejectsGitInvalidDefault(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
-		repoURL := "https://example.com/" + org + "/create-dot-" + randomHex(t, 4)
-		tok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
-		resp, body := e.doReq(t, http.MethodPost, "/api/v1/repos", tok,
-			[]byte(`{"default_branch":"main."}`), "")
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("POST /repos default_branch=main. = %d, want 400: %s", resp.StatusCode, body)
+		for _, tc := range []struct {
+			branch string
+			want   int
+		}{
+			{"main.", http.StatusBadRequest},
+			{"refs/namespaces/ephemeral/refs/heads/agent", http.StatusBadRequest},
+			{"refs/tags/v1", http.StatusBadRequest},
+			{"refs/heads/refs/tags/v1", http.StatusBadRequest},
+			{"refs/heads/trunk", http.StatusCreated},
+			{"trunk", http.StatusCreated},
+		} {
+			repoURL := "https://example.com/" + org + "/create-default-" + randomHex(t, 4)
+			tok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+			resp, body := e.doReq(t, http.MethodPost, "/api/v1/repos", tok,
+				[]byte(`{"default_branch":"`+tc.branch+`"}`), "")
+			if resp.StatusCode != tc.want {
+				t.Fatalf("POST /repos default_branch=%s = %d, want %d: %s", tc.branch, resp.StatusCode, tc.want, body)
+			}
 		}
 	})
 }

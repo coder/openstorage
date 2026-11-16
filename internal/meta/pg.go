@@ -199,9 +199,24 @@ func newRepoID() string {
 	return "repo_" + hex.EncodeToString(b[:])
 }
 
+// pgUnknownText returns the ErrNotFound a PostgreSQL lookup answers for a
+// key that is not ValidText, before PostgreSQL sees it: such a key names no
+// row, and PostgreSQL would refuse the parameter (SQLSTATE 22021), which
+// SQLite and S3-WAL never do. what names the key kind in the error text.
+// nil when key is ValidText.
+func pgUnknownText(what, key string) error {
+	if ValidText(key) {
+		return nil
+	}
+	return fmt.Errorf("%s %.80q: %w", what, key, ErrNotFound)
+}
+
 // lookupOrgID resolves an org name to its id; ErrNotFound for unknown orgs.
 func (s *PG) lookupOrgID(ctx context.Context, name string) (int64, error) {
 	assertf(name != "", "lookupOrgID: empty org name")
+	if err := pgUnknownText("org", name); err != nil {
+		return 0, err
+	}
 	var id int64
 	err := s.pool.QueryRow(ctx, `SELECT id FROM orgs WHERE name = $1`, name).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -408,6 +423,10 @@ func pgInsertRepo(ctx context.Context, q pgQueryRower, org string, orgID int64, 
 // absent or soft-deleted.
 func (s *PG) GetRepoByURL(ctx context.Context, org, url string) (Repo, error) {
 	assertf(url != "", "GetRepoByURL: empty url for org %q", org)
+	// PostgreSQL holds no such url and refuses the query (SQLSTATE 22021).
+	if !ValidText(url) {
+		return Repo{}, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return Repo{}, err
@@ -429,6 +448,10 @@ func (s *PG) GetRepoByURL(ctx context.Context, org, url string) (Repo, error) {
 // absent or soft-deleted.
 func (s *PG) GetRepoByID(ctx context.Context, org, repoID string) (Repo, error) {
 	assertf(repoID != "", "GetRepoByID: empty repoID for org %q", org)
+	// PostgreSQL holds no such id and refuses the query (SQLSTATE 22021).
+	if !ValidText(repoID) {
+		return Repo{}, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return Repo{}, err
@@ -498,6 +521,10 @@ func (s *PG) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, n
 // when no row exists; ErrAlreadyDeleted when already soft-deleted.
 func (s *PG) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) {
 	assertf(url != "", "SoftDeleteRepo: empty url for org %q", org)
+	// PostgreSQL holds no such url and refuses the query (SQLSTATE 22021).
+	if !ValidText(url) {
+		return Repo{}, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return Repo{}, err
@@ -615,8 +642,7 @@ func escapeLike(s string) string {
 // prefix at the start, which consumes exactly the prefix's characters, so q
 // can only match the rest of the url after it.
 func listURLPattern(p ListParams) string {
-	assertf(p.Q == strings.TrimSpace(p.Q) && p.Prefix == strings.TrimSpace(p.Prefix),
-		"ListRepos: untrimmed filters q=%q prefix=%q", p.Q, p.Prefix)
+	assertListFilters(p)
 	if p.Q == "" && p.Prefix == "" {
 		return ""
 	}
@@ -638,24 +664,10 @@ func (s *PG) ListRepos(ctx context.Context, org string, params ListParams) (List
 	if err != nil {
 		return ListResult{}, err
 	}
-
-	sql := `SELECT ` + repoCols + ` FROM repos WHERE org_id = $1 AND deleted_at IS NULL`
-	args := []any{orgID}
-	if pattern := listURLPattern(params); pattern != "" {
-		args = append(args, pattern)
-		sql += fmt.Sprintf(` AND url ILIKE $%d`, len(args))
+	sql, args, err := pgListReposQuery(orgID, params)
+	if err != nil {
+		return ListResult{}, err
 	}
-	if params.Cursor != "" {
-		createdAt, repoID, err := decodeCursor(params.Cursor)
-		if err != nil {
-			return ListResult{}, err
-		}
-		args = append(args, createdAt, repoID)
-		sql += fmt.Sprintf(` AND (created_at, repo_id) < ($%d, $%d)`, len(args)-1, len(args))
-	}
-	// Fetch one extra row to compute HasMore without a second query.
-	args = append(args, params.Limit+1)
-	sql += fmt.Sprintf(` ORDER BY created_at DESC, repo_id DESC LIMIT $%d`, len(args))
 
 	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
@@ -683,4 +695,35 @@ func (s *PG) ListRepos(ctx context.Context, org string, params ListParams) (List
 		res.HasMore = true
 	}
 	return res, nil
+}
+
+// pgListReposQuery returns the ListRepos SQL for one page and its
+// arguments.
+//
+// The url filter gives the answers of `url ILIKE p`, which matches
+// lower(url) against lower(p) as LIKE does (like.c, Generic_Text_IC_like).
+// ILIKE itself lowers p again for every row it tests in a multibyte
+// database, so a long q or prefix cost rows × its length. The scalar
+// subquery is an InitPlan: it lowers p once per query, in custom and
+// generic plans alike.
+func pgListReposQuery(orgID int64, params ListParams) (string, []any, error) {
+	assertf(orgID > 0, "pgListReposQuery: non-positive org id %d", orgID)
+	sql := `SELECT ` + repoCols + ` FROM repos WHERE org_id = $1 AND deleted_at IS NULL`
+	args := []any{orgID}
+	if pattern := listURLPattern(params); pattern != "" {
+		args = append(args, pattern)
+		sql += fmt.Sprintf(` AND lower(url) LIKE (SELECT lower($%d::text))`, len(args))
+	}
+	if params.Cursor != "" {
+		createdAt, repoID, err := decodeCursor(params.Cursor)
+		if err != nil {
+			return "", nil, err
+		}
+		args = append(args, createdAt, repoID)
+		sql += fmt.Sprintf(` AND (created_at, repo_id) < ($%d, $%d)`, len(args)-1, len(args))
+	}
+	// Fetch one extra row to compute HasMore without a second query.
+	args = append(args, params.Limit+1)
+	sql += fmt.Sprintf(` ORDER BY created_at DESC, repo_id DESC LIMIT $%d`, len(args))
+	return sql, args, nil
 }

@@ -55,6 +55,20 @@ func newStallUpstream(t *testing.T) *stallUpstream {
 	return u
 }
 
+// held waits, as long as a run can take, until a run's request is being
+// held.
+func (f *localSchedFixture) held(t *testing.T, u *stallUpstream) {
+	t.Helper()
+	f.waitRuns(t, func(time.Duration) string { return "no run reached the upstream" }, func() bool {
+		select {
+		case <-u.hit:
+			return true
+		default:
+			return false
+		}
+	})
+}
+
 // held waits until a run's request is being held.
 func (u *stallUpstream) held(t *testing.T) {
 	t.Helper()
@@ -110,7 +124,7 @@ func TestLocalScheduleDrainKeepsInFlightRequests(t *testing.T) {
 		if err := f.sched.EnqueueSync(t.Context(), Job{Org: f.org, RepoID: repo}); err != nil {
 			t.Fatal(err)
 		}
-		up.held(t)
+		f.held(t, up)
 
 		// Drain returns only after the cancelled run recorded its restore.
 		f.sched.Drain(t.Context(), 50*time.Millisecond)
@@ -145,7 +159,7 @@ func TestLocalScheduleDrainKeepsInFlightRequests(t *testing.T) {
 		}
 		up.hold.Store(true)
 		f.sched.Start(0, time.Hour) // one sweep pass starts the run
-		up.held(t)
+		f.held(t, up)
 
 		f.sched.Drain(t.Context(), 50*time.Millisecond)
 		r := f.row(t, repo)
@@ -178,7 +192,7 @@ func TestLocalScheduleDrainKeepsInFlightRequests(t *testing.T) {
 		if err := f.sched.EnqueueSync(t.Context(), Job{Org: f.org, RepoID: repo}); err != nil {
 			t.Fatal(err)
 		}
-		up.held(t)
+		f.held(t, up)
 		drained := make(chan struct{})
 		go func() {
 			f.sched.Drain(t.Context(), time.Hour) // waits for the run

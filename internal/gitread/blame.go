@@ -2,7 +2,9 @@ package gitread
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -43,14 +45,84 @@ func Blame(ctx context.Context, repoPath, commit, path string, ranges []string, 
 		args = append(args, "-M")
 	}
 	args = append(args, commit, "--", path)
-	out, err := runGit(ctx, Heavy, repoPath, args...)
-	if err != nil {
-		if !IsBudgetError(err) && strings.Contains(err.Error(), "no such path") {
-			return nil, fmt.Errorf("blame %q at %s: %w", path, commit, ErrNotFound)
-		}
-		return nil, err
+	out, err := Run(ctx, Cmd{Class: Heavy, Dir: repoPath, Env: noTreeAttrsEnv(), Args: args})
+	if err == nil {
+		return parseBlamePorcelain(out)
 	}
-	return parseBlamePorcelain(out)
+	if !errors.As(err, new(*GitError)) {
+		return nil, err // a read limit or a cancelled request
+	}
+	// git's text names the path as git rewrote it (./x, a//b, control
+	// bytes), so it never decides "not found": the range check reads only
+	// the fixed parts of git's line, and ls-tree, which reads the path the
+	// way blame does, decides the rest.
+	if len(ranges) > 0 && blameRangeFailed(err) {
+		return nil, fmt.Errorf("blame %q at %s: %w: %w", path, commit, ErrBadRange, err)
+	}
+	missing, lerr := blamePathMissing(ctx, repoPath, commit, path)
+	if lerr != nil {
+		return nil, fmt.Errorf("%w (and the path check failed: %w)", err, lerr)
+	}
+	if missing {
+		return nil, fmt.Errorf("blame %q at %s: %w", path, commit, ErrNotFound)
+	}
+	return nil, err
+}
+
+// ErrBadRange: git blame refused a -L range of the request (bad syntax,
+// past the end of the file, no match).
+var ErrBadRange = errors.New("blame range does not fit the file")
+
+// blameShortFile is the tail of git's "fatal: file <path> has only N
+// lines" (or "1 line"), after the path.
+var blameShortFile = regexp.MustCompile(` has only [0-9]+ lines?\z`)
+
+// blameRangeFailed reports whether git blame failed on its -L ranges:
+// git prints its usage (exit 129) for a range it cannot parse, and dies
+// (exit 128) with "fatal: -L ..." or "fatal: file <path> has only N
+// lines". Before it, git can print warnings and errors about its config
+// and attributes (such as "warning: unable to access
+// '<HOME>/.config/git/attributes'", some over more than one line), but no
+// other fatal line. Its fixed head comes before the path, so only the
+// first line that starts "fatal: " counts: a path that holds a newline
+// and a forged head cannot make a missing or unreadable file ("fatal: no
+// such path <path> in <commit>") read as a bad range.
+func blameRangeFailed(err error) bool {
+	if _, ok := gitStderr(err, 129); ok {
+		return true
+	}
+	stderr, ok := gitStderr(err, 128)
+	if !ok {
+		return false
+	}
+	i := strings.Index("\n"+stderr, "\nfatal: ")
+	if i < 0 {
+		return false
+	}
+	stderr = stderr[i:]
+	if strings.HasPrefix(stderr, "fatal: -L ") {
+		return true
+	}
+	return strings.HasPrefix(stderr, "fatal: file ") && blameShortFile.MatchString(stderr)
+}
+
+// blamePathMissing reports whether path names no file at commit, read
+// the way git blame reads it: ls-tree lists exactly one blob or symlink
+// for a file, and nothing under path + "/" (a "dir/" query lists the
+// folder's entries instead).
+func blamePathMissing(ctx context.Context, repoPath, commit, path string) (bool, error) {
+	entries, err := LsTree(ctx, repoPath, commit, path, false)
+	if err != nil {
+		return false, err
+	}
+	if len(entries) != 1 || (entries[0].Type != EntryBlob && entries[0].Type != EntrySymlink) {
+		return true, nil
+	}
+	below, err := LsTree(ctx, repoPath, commit, path+"/", false)
+	if err != nil {
+		return false, err
+	}
+	return len(below) > 0, nil
 }
 
 // blameMeta is the per-commit metadata block of the porcelain stream, which

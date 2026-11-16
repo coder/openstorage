@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	stdsync "sync"
 	"sync/atomic"
@@ -826,57 +825,42 @@ func TestEventMarshalShape(t *testing.T) {
 	}
 }
 
-// TestWorkerUpstreamArgumentsGitCannotTake: an upstream owner, name or host,
-// or a stored credential, that exec cannot pass to git (128 KiB or more in
-// one argument or variable, or a NUL byte) fails the run as a configuration
-// error. Before, it failed as a clone or a push failure with exec's error.
-func TestWorkerUpstreamArgumentsGitCannotTake(t *testing.T) {
-	if runtime.GOOS != "linux" || os.Getpagesize() != 4096 {
-		t.Skipf("one argument is limited to 128 KiB only on Linux with 4 KiB pages (page size %d)", os.Getpagesize())
+// Any token with git:write can push refs/replace/<id>. The worker's git
+// reads each object of a mirror as itself.
+func TestHermeticGitEnvReadsObjectsWithoutReplacements(t *testing.T) {
+	dir := t.TempDir()
+	testGit(t, dir, "init", "-q", "-b", "main")
+	testGit(t, dir, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "--allow-empty", "-m", "c1")
+	testGit(t, dir, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q", "--allow-empty", "-m", "c2")
+	c1 := strings.TrimSpace(testGit(t, dir, "rev-parse", "HEAD~1"))
+	c2 := strings.TrimSpace(testGit(t, dir, "rev-parse", "HEAD"))
+	testGit(t, dir, "update-ref", "refs/replace/"+c1, c2)
+	out, _, err := runGitOut(context.Background(), dir, hermeticGitEnv("file"), "cat-file", "-p", c1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	long := strings.Repeat("o", 200_000)
-	for name, tc := range map[string]struct{ owner, name, password string }{
-		"owner too long":      {owner: long, name: "proj"},
-		"name too long":       {owner: "own", name: long},
-		"owner with NUL":      {owner: "o\x00wn", name: "proj"},
-		"credential too long": {owner: "own", name: "proj", password: long},
+	if !strings.Contains(out, "\n\nc1") {
+		t.Fatalf("cat-file -p c1 = %q, want c1's own message", out)
+	}
+}
+
+// The envs that the worker's fetch, push and ls-remote run with carry the
+// variable exactly once, with and without credentials.
+func TestGitEnvsCarryNoReplaceObjectsOnce(t *testing.T) {
+	for name, env := range map[string][]string{
+		"authGitEnv":                 authGitEnv("u", "p", "https"),
+		"authGitEnv without a user":  authGitEnv("", "", "https"),
+		"loopbackGitEnv":             loopbackGitEnv("token", "http"),
+		"loopbackGitEnv without one": loopbackGitEnv("", "http"),
 	} {
-		t.Run("pull/"+name, func(t *testing.T) {
-			f := newWorkerFixture(t)
-			f.putUpstream(t, "repo_arg", tc.owner, tc.name, "file://"+f.upstreamDir)
-			if tc.password != "" {
-				if _, err := f.store.CreateCredential(context.Background(), Credential{RepoID: "repo_arg", Username: "u", Password: tc.password}); err != nil {
-					t.Fatal(err)
-				}
+		var got []string
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "GIT_NO_REPLACE_OBJECTS=") {
+				got = append(got, kv)
 			}
-			_ = f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_arg"})
-			events := f.rec.list()
-			assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
-			if events[1].Error != FailConfig {
-				t.Fatalf("error = %q, want %q", events[1].Error, FailConfig)
-			}
-		})
-		t.Run("push/"+name, func(t *testing.T) {
-			f := newWorkerFixture(t)
-			seedLocalRepo(t, f, "repo_arg")
-			f.putUpstream(t, "repo_arg", tc.owner, tc.name, "file://"+f.upstreamDir)
-			if tc.password != "" {
-				if _, err := f.store.CreateCredential(context.Background(), Credential{RepoID: "repo_arg", Username: "u", Password: tc.password}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_arg"})
-			if err == nil || TransientPushFailure(err) {
-				t.Fatalf("RunPush = %v, want a permanent failure", err)
-			}
-			events := f.rec.list()
-			assertEventTypes(t, events, EventPushUpstreamStarted, EventPushUpstreamFailed)
-			if events[1].Error != FailConfig {
-				t.Fatalf("error = %q, want %q", events[1].Error, FailConfig)
-			}
-			if strings.Contains(err.Error(), "ooooooooo") {
-				t.Fatalf("the failure names the value: %.200s", err)
-			}
-		})
+		}
+		if len(got) != 1 || got[0] != "GIT_NO_REPLACE_OBJECTS=1" {
+			t.Errorf("%s: GIT_NO_REPLACE_OBJECTS entries %q, want exactly one GIT_NO_REPLACE_OBJECTS=1", name, got)
+		}
 	}
 }

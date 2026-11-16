@@ -1,12 +1,12 @@
 package gitread
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,9 +43,6 @@ const (
 	// hit HeavyHeapBytes part-way; callers check sizes up front instead.
 	MaxBlobBytes int64 = 100 << 20
 
-	// stderrKeepBytes bounds the stderr kept per child (its tail: git
-	// prints its fatal message last).
-	stderrKeepBytes = 64 << 10
 	// childWaitDelay bounds how long Wait may block on git's output pipes
 	// after git is killed (exec.Cmd.WaitDelay).
 	childWaitDelay = 2 * time.Second
@@ -75,6 +72,11 @@ var (
 	// ErrBlobTooLarge: a blob is larger than MaxBlobBytes; git was not
 	// started for it.
 	ErrBlobTooLarge = errors.New("blob exceeds the API read size limit")
+	// ErrSymlinkTooLong: a symlink's target is longer than MaxSymlinkTarget.
+	// The size that the tree lists is checked before git starts. A blob
+	// that git prints longer than listed (a broken object store: git reads
+	// no replacement objects) ends git at the first byte over the limit.
+	ErrSymlinkTooLong = errors.New("symlink target exceeds the API read size limit")
 	// ErrMemoryLimit: git needed more heap than its class's cap and was
 	// stopped by its own allocation failure (Linux only).
 	ErrMemoryLimit = gitlimit.ErrMemoryLimit
@@ -89,12 +91,13 @@ var (
 var heapLimitAvailable = HeapLimitSupported
 
 // IsBudgetError reports whether err is a resource-limit outcome (ErrBusy,
-// ErrTimeBudget, ErrOutputLimit, ErrBlobTooLarge, ErrMemoryLimit). Callers
+// ErrTimeBudget, ErrOutputLimit, ErrBlobTooLarge, ErrSymlinkTooLong,
+// ErrMemoryLimit). Callers
 // that turn git failures into "not found" or "no match" must check it
 // first so a limit is never reported as missing data.
 func IsBudgetError(err error) bool {
 	return errors.Is(err, ErrBusy) || errors.Is(err, ErrTimeBudget) || errors.Is(err, ErrOutputLimit) ||
-		errors.Is(err, ErrBlobTooLarge) || errors.Is(err, ErrMemoryLimit)
+		errors.Is(err, ErrBlobTooLarge) || errors.Is(err, ErrSymlinkTooLong) || errors.Is(err, ErrMemoryLimit)
 }
 
 // CheckBlobSize fails with ErrBlobTooLarge when a blob of size bytes is
@@ -106,7 +109,46 @@ func CheckBlobSize(ctx context.Context, path string, size int64) error {
 		limit = b.limits.MaxBlob
 	}
 	if size > limit {
-		return fmt.Errorf("%q is %d bytes: %w (%d bytes)", path, size, ErrBlobTooLarge, limit)
+		return &limitError{path: path, err: ErrBlobTooLarge,
+			msg: fmt.Sprintf("%q is %d bytes: %v (%d bytes)", gitlimit.Clip(path), size, ErrBlobTooLarge, limit)}
+	}
+	return nil
+}
+
+// limitError is an ErrBlobTooLarge or ErrSymlinkTooLong error that keeps the
+// path it was given, so that a response can name the entry over the limit.
+type limitError struct {
+	path string
+	err  error
+	msg  string
+}
+
+func (e *limitError) Error() string { return e.msg }
+func (e *limitError) Unwrap() error { return e.err }
+
+// LimitPath returns the path that the CheckBlobSize or CheckSymlinkTarget
+// call behind err was given. ok is false when err came from neither.
+func LimitPath(err error) (path string, ok bool) {
+	var le *limitError
+	if errors.As(err, &le) {
+		return le.path, true
+	}
+	return "", false
+}
+
+// MaxSymlinkTarget is the longest symlink target an archive carries: 4095
+// bytes, the longest that symlink(2) accepts on Linux (PATH_MAX is 4096, with
+// the terminating NUL). XFS and macOS accept at most 1023. git 2.55's fsck has
+// no check for the length of a target, so a repository can hold a longer one.
+// The server reads a target in memory to write its tar header.
+const MaxSymlinkTarget = 4095
+
+// CheckSymlinkTarget fails with ErrSymlinkTooLong when the target of the
+// symlink at path, a blob of size bytes, is longer than MaxSymlinkTarget.
+func CheckSymlinkTarget(path string, size int64) error {
+	if size > MaxSymlinkTarget {
+		return &limitError{path: path, err: ErrSymlinkTooLong,
+			msg: fmt.Sprintf("%q is a symlink with a target of %d bytes: %v (%d bytes)", gitlimit.Clip(path), size, ErrSymlinkTooLong, MaxSymlinkTarget)}
 	}
 	return nil
 }
@@ -263,12 +305,25 @@ func (b *Budget) take(n int64) bool {
 // limitedBuffer buffers stdout against a Budget's allowance (nil: no
 // limit). On overflow it kills git at once (instead of letting it block on
 // a full pipe) and refuses the write.
+//
+// The output is kept in chunks that never move, and String joins them once
+// into a string of exactly the output's size. A bytes.Buffer doubles by
+// copying, and its String copied the output again, so a call peaked at 3 to
+// 4 times its output. Here the peak is the chunks plus the string: 2 times
+// the output, plus what the last chunk leaves unused (a quarter of the
+// output, 8 MiB at most).
 type limitedBuffer struct {
-	buf      bytes.Buffer
+	chunks   [][]byte
+	n        int // bytes held
 	allow    *Budget
 	kill     context.CancelFunc
 	overflow bool
 }
+
+const (
+	minChunk = 64      // as bytes.Buffer's first allocation: a small output costs one chunk of this size
+	maxChunk = 8 << 20 // bounds the unused part of the last chunk
+)
 
 var errOutputOverflow = errors.New("output allowance exhausted")
 
@@ -278,7 +333,30 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 		l.kill()
 		return 0, errOutputOverflow
 	}
-	return l.buf.Write(p)
+	written := len(p)
+	for len(p) > 0 {
+		if k := len(l.chunks) - 1; k < 0 || len(l.chunks[k]) == cap(l.chunks[k]) {
+			// A quarter of what is held: few chunks, and the unused part of
+			// the last one stays within a quarter of the output.
+			l.chunks = append(l.chunks, make([]byte, 0, max(len(p), min(max(l.n/4, minChunk), maxChunk))))
+		}
+		last := &l.chunks[len(l.chunks)-1]
+		m := min(cap(*last)-len(*last), len(p))
+		*last = append(*last, p[:m]...)
+		l.n += m
+		p = p[m:]
+	}
+	return written, nil
+}
+
+// String returns the output. It is the only copy of it.
+func (l *limitedBuffer) String() string {
+	var sb strings.Builder
+	sb.Grow(l.n)
+	for _, c := range l.chunks {
+		sb.Write(c)
+	}
+	return sb.String()
 }
 
 // stopWriter forwards git's streamed output; when the consumer returns
@@ -298,19 +376,6 @@ func (s *stopWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// tailBuffer keeps the last stderrKeepBytes written to it.
-type tailBuffer struct{ b []byte }
-
-func (t *tailBuffer) Write(p []byte) (int, error) {
-	t.b = append(t.b, p...)
-	if over := len(t.b) - stderrKeepBytes; over > 0 {
-		t.b = append(t.b[:0], t.b[over:]...)
-	}
-	return len(p), nil
-}
-
-func (t *tailBuffer) String() string { return strings.TrimSpace(string(t.b)) }
-
 // Cmd is one read-side git child for Run.
 type Cmd struct {
 	Class Class
@@ -322,6 +387,9 @@ type Cmd struct {
 	// `rev-list` walk read incrementally). Its Write may return ErrStop to
 	// end git early. When nil, output is buffered, counted, and returned.
 	Stdout io.Writer
+	// Stderr, when set, also receives git's stderr, for a caller that must
+	// read git's messages when git exits 0.
+	Stderr io.Writer
 	Args   []string
 }
 
@@ -364,13 +432,14 @@ func childEnv(env []string) []string {
 // it (git is always reaped before Run returns). Limit outcomes are
 // returned as ErrBusy, ErrTimeBudget, ErrOutputLimit, or ErrMemoryLimit,
 // and never wrap *exec.ExitError, so exit-status checks cannot mistake them
-// for git's own "no match" or "not found" statuses. Other failures wrap
-// git's *exec.ExitError.
+// for git's own "no match" or "not found" statuses. A ctx that ends (the
+// caller gave up) returns ctx's error, also when git was killed for it.
+// Other failures are a *GitError (see there).
 func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
 	assertf(len(c.Args) > 0, "Run: no git args")
-	name := "git " + strings.Join(c.Args, " ")
+	name := gitlimit.Name(c.Args)
 
 	b := BudgetFrom(ctx)
 	var heap int64 // no Budget (write endpoints): no limits at all
@@ -401,8 +470,11 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	cmd.Env = childEnv(c.Env)
 	cmd.Stdin = c.Stdin
 	cmd.WaitDelay = childWaitDelay
-	var stderr tailBuffer
+	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
+	if c.Stderr != nil {
+		cmd.Stderr = io.MultiWriter(&stderr, c.Stderr)
+	}
 	var out *limitedBuffer
 	var stream *stopWriter
 	if c.Stdout != nil {
@@ -412,10 +484,10 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 		out = &limitedBuffer{allow: b, kill: kill}
 		cmd.Stdout = out
 	}
-	err := gitlimit.Run(cmd)
+	err := gitlimit.RunIn(runCtx, c.Dir, cmd)
 	stdout := ""
 	if out != nil {
-		stdout = out.buf.String()
+		stdout = out.String()
 	}
 	if err == nil || (stream != nil && stream.stopped.Load()) {
 		// A stopped stream: git was killed on the consumer's request.
@@ -423,6 +495,11 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	}
 	msg := stderr.String()
 	switch {
+	case ctx.Err() != nil:
+		// The request ended. exec kills git for it, and then reports the
+		// kill ("signal: killed"), not the context: that is no failure of
+		// git's own.
+		return stdout, fmt.Errorf("%s: %w", name, ctx.Err())
 	case out != nil && out.overflow:
 		return stdout, fmt.Errorf("%s: %w", name, ErrOutputLimit)
 	case ctx.Err() == nil && errors.Is(limitCtx.Err(), context.DeadlineExceeded):
@@ -430,5 +507,31 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	case heap > 0 && heapLimitFailure(err, msg):
 		return stdout, fmt.Errorf("%s: %w (%d bytes): %s", name, ErrMemoryLimit, heap, msg)
 	}
-	return stdout, fmt.Errorf("%s: %w: %s", name, err, msg)
+	return stdout, &GitError{msg: fmt.Sprintf("%s: %v: %s", name, err, msg), err: err, Stderr: msg}
+}
+
+// GitError is Run's error for a git child that failed on its own (not a
+// limit outcome or a canceled request). It wraps the error of the run: an *exec.ExitError when
+// git exited with a status or died of a signal, or the error of a start
+// that failed (exec refused the arguments). It keeps git's stderr. A
+// caller that classifies a failure reads the exit status and Stderr,
+// never the error text: that quotes the request's arguments.
+type GitError struct {
+	msg    string
+	err    error
+	Stderr string // git's stderr, trimmed
+}
+
+func (e *GitError) Error() string { return e.msg }
+func (e *GitError) Unwrap() error { return e.err }
+
+// gitStderr returns git's stderr when err is git's own failure with exit
+// status code.
+func gitStderr(err error, code int) (string, bool) {
+	var ge *GitError
+	var exit *exec.ExitError
+	if errors.As(err, &ge) && errors.As(err, &exit) && exit.ExitCode() == code {
+		return ge.Stderr, true
+	}
+	return "", false
 }

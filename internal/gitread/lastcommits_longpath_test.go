@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/coder/openstorage/internal/gitlimit"
 )
 
 // lcGitStdin runs git in dir with stdin and the hermetic fixture identity,
@@ -23,14 +25,15 @@ func lcGitStdin(t *testing.T, dir, stdin string, args ...string) string {
 }
 
 // TestLastCommitsOfPathsTooLongForAnArgument asks for the last commit of a
-// file whose directory name is longer than one argument can hold. The
-// pathspec that narrows diff-tree to the directory is left out, and the
-// answer is the same.
+// file whose path is as long as one pathspec argument takes, one byte
+// longer, and much longer. The pathspec that narrows diff-tree to it is
+// left out when it does not fit, and the answer is the same.
 func TestLastCommitsOfPathsTooLongForAnArgument(t *testing.T) {
 	dir := t.TempDir()
 	lcGitStdin(t, dir, "", "init", "-q", "-b", "main", ".")
 	blob := lcGitStdin(t, dir, "x\n", "hash-object", "-w", "--stdin")
-	for _, size := range []int{maxPathspecBytes, maxPathspecBytes + 1, 200_000} {
+	longest := gitlimit.MaxArgBytes - len(":(literal)")
+	for _, size := range []int{longest, longest + 1, 200_000} {
 		name := strings.Repeat("d", size-len("/f.txt")) // the file's whole path is size bytes
 		inner := lcGitStdin(t, dir, "100644 blob "+blob+"\tf.txt\x00", "mktree", "-z")
 		tree := lcGitStdin(t, dir, "040000 tree "+inner+"\t"+name+"\x00", "mktree", "-z")

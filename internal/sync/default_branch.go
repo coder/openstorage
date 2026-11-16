@@ -97,7 +97,10 @@ func parseHeadSymref(out string) (branch, reason string) {
 		if !ok {
 			return "", "the upstream HEAD names " + strconv.Quote(target) + ", not a branch"
 		}
-		if !ValidBranchName(b) {
+		// A short name under refs/ (refs/heads/refs/namespaces/...) would be
+		// stored as that full ref name: the API refuses it as a default,
+		// and the persistent git remote hides some of those names.
+		if !ValidBranchName(b) || strings.HasPrefix(b, "refs/") {
 			return "", "the upstream HEAD names branch " + strconv.Quote(b) + ", which is not a valid default branch"
 		}
 		return b, ""
@@ -125,7 +128,7 @@ func (w *Worker) adoptHead(ctx context.Context, job Job, branch string) {
 	}
 }
 
-// branchComponentRe and ValidBranchName mirror the API's validBranchName
+// branchComponentRe and ValidBranchName mirror the API's validNewBranchName
 // (internal/api/handlers.go, which this package cannot import): a stored
 // default branch drives `symbolic-ref HEAD` on every hydrate, so the
 // adopted branch must pass the same check as a requested one.
@@ -133,8 +136,13 @@ func (w *Worker) adoptHead(ctx context.Context, job Job, branch string) {
 var branchComponentRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
 
 // ValidBranchName reports whether name is an acceptable default branch.
+// It mirrors validNewBranchName: the last part leaves room for git's
+// ".lock" file (255 - 5 bytes).
 func ValidBranchName(name string) bool {
 	if name == "" || len(name) > 255 || strings.Contains(name, "..") {
+		return false
+	}
+	if len(name[strings.LastIndexByte(name, '/')+1:]) > 250 {
 		return false
 	}
 	for comp := range strings.SplitSeq(name, "/") {

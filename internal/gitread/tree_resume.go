@@ -36,12 +36,14 @@ import (
 //   - any other entry sorts before the cursor
 //
 // This is LsTreePage's contract for any cursor string, an existing path or
-// not. The walk opens no tree before the cursor, so an object that is
-// missing or unreadable there no longer fails a page that is not empty.
-// Anything else it does not handle returns errDeclined, and LsTreePage then
-// pages by streaming `ls-tree -r`, which reads every entry the walk would
-// skip and gives the same answer. A page past the end is the stream's. So is
-// the page when git fails for the walk (leftToStream), whatever the cause.
+// not. The walk opens no tree before the cursor, so a folder there that is
+// missing, unreadable or out of order, or nested past git's depth limit,
+// does not fail a page that the walk answers. Anything else the walk does
+// not handle returns errDeclined, and LsTreePage then pages by streaming
+// `ls-tree -r`. The stream reads every entry the walk would skip, so it
+// fails on such a folder just as a first page that reaches it does. A page
+// past the end is the stream's. So is the page when git fails for the walk
+// (leftToStream), whatever the cause.
 
 // errDeclined: the walk met something it leaves to the streaming listing,
 // which then gives the answer, an error included:
@@ -831,10 +833,15 @@ func (s *treeSource) close(abort bool) error {
 // leaves the reader at the object's first byte: its type and size.
 func (s *treeSource) request(rev string) (objType string, size int64, err error) {
 	if _, err := io.WriteString(s.req, rev+"\n"); err != nil {
+		// The write fails once git is gone, or after close, which ends
+		// git too. A git that failed says why. One that ended cleanly
+		// without reading the request gave no answer, as when its output
+		// ends first (readErr): which of the two the walk sees depends on
+		// how soon git ends.
 		if runErr := s.wait(); runErr != nil {
 			return "", 0, runErr
 		}
-		return "", 0, err
+		return "", 0, errDeclined
 	}
 	line, err := s.resp.ReadSlice('\n')
 	if err != nil {

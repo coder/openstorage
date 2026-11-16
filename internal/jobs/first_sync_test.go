@@ -53,7 +53,7 @@ func TestRiverCompleteSyncCreate(t *testing.T) {
 		t.Fatalf("NewRiver: %v", err)
 	}
 	full.Close()
-	q, err := NewRiverInsertOnly(ctx, pgURL)
+	q, err := NewRiverInsertOnly(ctx, pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

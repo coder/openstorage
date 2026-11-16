@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -114,10 +115,21 @@ const (
 // value here (default 20, max 100); the opaque cursor is validated by the
 // store (ErrInvalidCursor).
 type ListParams struct {
-	Q      string // case-insensitive substring filter on URL, pre-trimmed; "" = no filter; with Prefix set, only the URL after the prefix
-	Prefix string // case-insensitive filter on the start of URL, pre-trimmed; "" = no filter
+	Q      string // case-insensitive substring filter on URL, pre-trimmed UTF-8 without NUL; "" = no filter; with Prefix set, only the URL after the prefix
+	Prefix string // case-insensitive filter on the start of URL, pre-trimmed UTF-8 without NUL; "" = no filter
 	Cursor string // opaque cursor from a previous ListResult; "" = first page
 	Limit  int    // page size, already clamped/validated by the caller
+}
+
+// assertListFilters checks the ListParams filter contract. PostgreSQL
+// refuses a NUL byte and invalid UTF-8 in a text parameter (SQLSTATE
+// 22021), so the API refuses them first, and every backend gets the same
+// filters.
+func assertListFilters(p ListParams) {
+	for _, v := range []string{p.Q, p.Prefix} {
+		assertf(v == strings.TrimSpace(v) && ValidText(v),
+			"ListRepos: filter %.80q is untrimmed, not UTF-8, or holds a NUL byte", v)
+	}
 }
 
 // ListResult is one page of repos ordered by (created_at DESC, repo_id DESC).
@@ -243,7 +255,9 @@ func Open(ctx context.Context, dbURL string, opts ...Option) (Backend, error) {
 	assertf(dbURL != "", "Open: empty metadata store URL")
 	u, err := url.Parse(dbURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse metadata store URL: %w", err)
+		// Not err: url.Parse's error quotes the URL, password included,
+		// and its reason can quote part of it.
+		return nil, errors.New("parse metadata store URL: malformed URL (not shown: it can hold a password)")
 	}
 	switch u.Scheme {
 	case "postgres", "postgresql":

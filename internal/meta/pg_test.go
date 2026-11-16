@@ -625,6 +625,10 @@ func testListReposQFilter(t *testing.T, s Backend) {
 	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/Alpha", "github.com/acme/beta-ALPHA"}) {
 		t.Errorf("q=alpha -> %v", got)
 	}
+	all, _ = listAll(t, s, org, "GAMMA", 10) // q in another case than the url
+	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/gamma"}) {
+		t.Errorf("q=GAMMA -> %v, want the gamma url", got)
+	}
 
 	// LIKE metacharacters in q are literals, not wildcards.
 	all, _ = listAll(t, s, org, "%", 10)
@@ -664,6 +668,7 @@ func testListReposPrefixFilter(t *testing.T, s Backend) {
 		"Pierre/Upper-SDK",
 		"pierre/pierre-mirror",
 		"acme/pierre-tools",
+		"acme/pierre/inner", // holds the prefix 'pierre/', but not at the start
 		"50%/off",
 		"500/decoy", // matches prefix '50%' only if % is unescaped
 		"a_b/one",
@@ -722,13 +727,58 @@ func testListReposPrefixFilter(t *testing.T, s Backend) {
 	}
 }
 
+func TestListReposLongFilters(t *testing.T) { runBackends(t, testListReposLongFilters) }
+
+// testListReposLongFilters pins q and prefix of any length: SQLite refuses
+// a LIKE pattern over 50,000 bytes (SQLITE_MAX_LIKE_PATTERN_LENGTH), and
+// an escaped `%` takes two of them.
+func testListReposLongFilters(t *testing.T, s Backend) {
+	ctx := t.Context()
+	org := seedOrg(t, s)
+	percents := strings.Repeat("%", 30_000)
+	long := "acme/" + percents + "/end"
+	for _, url := range []string{"acme/alpha", long} {
+		if _, err := s.CreateRepo(ctx, org, url, "main"); err != nil {
+			t.Fatalf("create %.40s: %v", url, err)
+		}
+	}
+	for _, tc := range []struct {
+		name, prefix, q string
+		want            []string
+	}{
+		{"q of 200 KiB", "", strings.Repeat("a", 200<<10), nil},
+		{"prefix of 200 KiB", strings.Repeat("a", 200<<10), "", nil},
+		{"q of 30,000 percent signs", "", percents, []string{long}},
+		{"q one percent sign longer", "", percents + "%", nil},
+		{"prefix of 30,000 percent signs and q", "acme/" + percents, "END", []string{long}},
+		{"q inside a long prefix", "acme/" + percents, "%", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := s.ListRepos(ctx, org, ListParams{Q: tc.q, Prefix: tc.prefix, Limit: 10})
+			if err != nil {
+				t.Fatalf("list: %.300v", err)
+			}
+			got := make([]string, 0, len(res.Repos))
+			for _, r := range res.Repos {
+				got = append(got, r.URL)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("prefix %d bytes, q %d bytes: got %d repos, want %d", len(tc.prefix), len(tc.q), len(got), len(tc.want))
+			}
+		})
+	}
+}
+
 func TestListReposErrors(t *testing.T) { runBackends(t, testListReposErrors) }
 
 func testListReposErrors(t *testing.T, s Backend) {
 	ctx := t.Context()
 	org := seedOrg(t, s)
 
-	for _, cursor := range []string{"!!!", "AAAA", "bm9waXBl" /* "nopipe" */} {
+	// A repo id with a NUL byte or invalid UTF-8 would reach PostgreSQL as
+	// the keyset position, which refuses it (SQLSTATE 22021).
+	nul, notUTF8 := encodeCursor(time.Unix(1, 0), "repo_\x00x"), encodeCursor(time.Unix(1, 0), "repo_\xffx")
+	for _, cursor := range []string{"!!!", "AAAA", "bm9waXBl" /* "nopipe" */, nul, notUTF8} {
 		if _, err := s.ListRepos(ctx, org, ListParams{Cursor: cursor, Limit: 10}); !errors.Is(err, ErrInvalidCursor) {
 			t.Errorf("cursor %q err = %v, want ErrInvalidCursor", cursor, err)
 		}
@@ -745,4 +795,63 @@ func testListReposErrors(t *testing.T, s Backend) {
 		}
 	}()
 	_, _ = s.ListRepos(ctx, org, ListParams{Limit: 0})
+}
+
+func TestTextKeysAreUnknown(t *testing.T) { runBackends(t, testTextKeysAreUnknown) }
+
+// testTextKeysAreUnknown pins that a key with a NUL byte or invalid UTF-8
+// names no row, on every backend. PostgreSQL refuses such a parameter
+// (SQLSTATE 22021), so its store answers ErrNotFound itself; a request
+// that carries one in a path or a body must see the 404 of an unknown key,
+// not a 500.
+func testTextKeysAreUnknown(t *testing.T, s Backend) {
+	ctx := t.Context()
+	org := seedOrg(t, s)
+	repo, err := s.CreateRepo(ctx, org, "acme/live", "main")
+	if err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	wh, err := s.CreateWebhook(ctx, org, "https://hooks.example.invalid/x", "secret")
+	if err != nil {
+		t.Fatalf("create webhook: %v", err)
+	}
+	cred, err := s.CreateGitCredential(ctx, GitCredential{RepoID: repo.RepoID, Username: "u", Password: "p"})
+	if err != nil {
+		t.Fatalf("create credential: %v", err)
+	}
+
+	for _, key := range []string{"a\x00b", "\x00", "repo_\x00", "a\xffb", "\xc3", "\xed\xa0\x80"} {
+		lookups := []struct {
+			name string
+			call func() error
+		}{
+			{"SoftDeleteRepo", func() error { _, err := s.SoftDeleteRepo(ctx, org, key); return err }},
+			{"GetWebhook", func() error { _, err := s.GetWebhook(ctx, key); return err }},
+			{"DeleteWebhook", func() error { return s.DeleteWebhook(ctx, org, key) }},
+			{"GetGitCredential", func() error { _, err := s.GetGitCredential(ctx, key); return err }},
+			{"GitCredentialMeta", func() error { _, err := s.GitCredentialMeta(ctx, key); return err }},
+			{"UpdateGitCredential", func() error { _, err := s.UpdateGitCredential(ctx, key, "u2", "p2"); return err }},
+			{"DeleteGitCredential", func() error { return s.DeleteGitCredential(ctx, key) }},
+			{"org name of GetRepoByURL", func() error { _, err := s.GetRepoByURL(ctx, key, "acme/live"); return err }},
+			{"org name of PublicKeysForOrg", func() error { _, err := s.PublicKeysForOrg(ctx, key); return err }},
+		}
+		for _, l := range lookups {
+			t.Run(fmt.Sprintf("%s %q", l.name, key), func(t *testing.T) {
+				if err := l.call(); !errors.Is(err, ErrNotFound) {
+					t.Errorf("err = %.200v, want ErrNotFound", err)
+				}
+			})
+		}
+	}
+
+	// Nothing was deleted or changed on the way.
+	if got, err := s.GetRepoByID(ctx, org, repo.RepoID); err != nil || got.URL != "acme/live" {
+		t.Errorf("repo after the lookups = %+v, %v", got, err)
+	}
+	if _, err := s.GetWebhook(ctx, wh.ID); err != nil {
+		t.Errorf("webhook after the lookups: %v", err)
+	}
+	if got, err := s.GetGitCredential(ctx, cred.ID); err != nil || got.Username != "u" || got.Password != "p" {
+		t.Errorf("credential after the lookups = %+v, %v", got, err)
+	}
 }

@@ -60,7 +60,7 @@ func TestRiverRecordForwardTxWaitsForJobBeforeUpstreamRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	full.Close()
-	q, err := NewRiverInsertOnly(ctx, pgURL)
+	q, err := NewRiverInsertOnly(ctx, pgURL, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestRiverRecordForwardTxSkipsReposThatDoNotForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	full.Close()
-	q, err := NewRiverInsertOnly(ctx, pgURL) // no workers: jobs stay put
+	q, err := NewRiverInsertOnly(ctx, pgURL, slog.New(slog.DiscardHandler)) // no workers: jobs stay put
 	if err != nil {
 		t.Fatal(err)
 	}

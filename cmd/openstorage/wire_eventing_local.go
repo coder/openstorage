@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -42,4 +43,46 @@ func buildLocalSyncQueue(ms meta.Store, org, cacheDir string, worker *upsync.Wor
 	// dead process become due when their lease expires.
 	sched.Start(pendingSyncRecoveryDelay, localSweepInterval)
 	return queue, queue.Close, nil
+}
+
+// restIntentBeforeCAS is the serve decorator's HeldBeforeCAS on the local
+// schedule: a REST write to a forward_on_push repository by a caller that
+// may forward holds the ref in the cache, then records the forward intent
+// (RequestPush), before its authority CAS (ADR-50 amendment), as the update
+// hook does. Serve dying after the CAS, or a failed poke after it, then
+// cannot leave an accepted write that no run forwards, and a run that
+// claims the intent waits in its publication wait until the CAS returned
+// and the hold ended. A failed read, hold or intent write refuses the
+// write of a caller that may forward. The pull poke stays after the CAS
+// (enqueueSyncOrForward).
+func restIntentBeforeCAS(ms meta.EventingStore, cacheDir string, forwardDenied func(ctx context.Context) bool) func(ctx context.Context, repoID, refName string) (func(), error) {
+	assertf(ms != nil && cacheDir != "" && forwardDenied != nil, "restIntentBeforeCAS: missing deps")
+	noop := func() {}
+	return func(ctx context.Context, repoID, refName string) (func(), error) {
+		if forwardDenied(ctx) {
+			// The forward poke's gate, before any read: a caller that may
+			// not forward records no intent, so a failed read never
+			// refuses its write.
+			return noop, nil
+		}
+		up, err := ms.GetRepoUpstream(ctx, repoID)
+		if errors.Is(err, meta.ErrNotFound) {
+			return noop, nil // no upstream link: nothing to forward
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !up.ForwardOnPush {
+			return noop, nil
+		}
+		release, err := githttp.HoldRef(ctx, cacheDir, repoID, refName)
+		if err != nil {
+			return nil, fmt.Errorf("hold %s: %w", refName, err)
+		}
+		if err := ms.RequestPush(ctx, repoID, false); err != nil && !errors.Is(err, meta.ErrNotFound) {
+			release()
+			return nil, err
+		}
+		return release, nil
+	}
 }

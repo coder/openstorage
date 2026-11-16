@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	stdsync "sync"
-	"syscall"
 	"time"
 
 	"github.com/coder/openstorage/internal/envconfig"
@@ -307,11 +306,11 @@ func (w *Worker) waitPublication(ctx context.Context, repoID string) error {
 	return w.WaitPublication(wctx, repoID)
 }
 
-// restoreLocal ends a claimed local run that got no fresh snapshot: its
-// publication wait failed (no event emitted yet), or a push run's loopback
-// fetch found a push-held ref stale (after its started event, like a
-// shutdown restore). Nothing was forwarded, so the run hands its request
-// back to the row (restore) instead of counting a run.
+// restoreLocal ends a claimed run that got no fresh snapshot: its
+// publication wait failed, or a push run's loopback fetch found a
+// push-held ref stale. Neither emits an event: RunPush sends no started
+// event for a stale held ref either. Nothing was forwarded, so the run
+// hands its request back to the row (restore) instead of counting a run.
 func (w *Worker) restoreLocal(ctx context.Context, job Job, holder, lane string, waitErr error, finish func(ctx context.Context) (Upstream, error)) error {
 	w.Logger.Warn("no fresh snapshot; request restored for a later run",
 		"org", job.Org, "repo", job.RepoID, "lane", lane, "err", waitErr)
@@ -767,7 +766,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 
 	// Upstream credential: absent = public upstream. An omitted username
 	// gets the per-provider default (credentialAuth).
-	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up.Provider)
+	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up)
 	if fail != nil {
 		return fail
 	}
@@ -791,9 +790,6 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	}
 	fetchArgs := append([]string{"fetch", "--prune", up.CloneURL()}, mirrorRefspecs...)
 	if stderr, err := runGit(ctx, mirror, fetchEnv, fetchArgs...); err != nil {
-		if f := argumentFailure("git fetch", err); f != nil {
-			return f
-		}
 		// The proxy's recorded verdicts outrank stderr phrasing — git only
 		// saw an opaque proxy HTTP error (same split as the push lane): a
 		// policy denial is permanent configuration, a non-policy dial
@@ -1024,17 +1020,28 @@ func hermeticGitEnv(allowProtocol string) []string {
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
 		"GIT_ALLOW_PROTOCOL="+allowProtocol,
+		"GIT_NO_REPLACE_OBJECTS=1", // every object reads as itself (gitlimit.NoReplaceObjects)
 	)
 }
+
+// maxCredentialBytes bounds a stored username or password: git gets it as
+// one environment entry, OPENSTORAGE_ASKPASS_PASSWORD=<password> (or the
+// username entry, as long), which must fit gitlimit.MaxArgBytes.
+const maxCredentialBytes = gitlimit.MaxArgBytes - len("OPENSTORAGE_ASKPASS_PASSWORD=")
 
 // upstreamAuth loads the repo's stored upstream credential and returns
 // the Basic-auth pair the worker sends. ("", "") means none: no stored
 // credential, or one with an empty password (sent nothing before #400
 // either). The pair travels through git's line-based credential-helper
 // protocol, so a stored value with CR, LF or NUL fails the run as
-// configuration instead of injecting helper attributes; the error never
-// names the value.
-func (w *Worker) upstreamAuth(ctx context.Context, repoID, provider string) (username, password string, fail *syncFailure) {
+// configuration instead of injecting helper attributes. So do an upstream
+// URL that git cannot take as one argument and a credential over
+// maxCredentialBytes: the run would fail the same way every time. The
+// error never names the value.
+func (w *Worker) upstreamAuth(ctx context.Context, repoID string, up Upstream) (username, password string, fail *syncFailure) {
+	if len(up.CloneURL()) > gitlimit.MaxArgBytes {
+		return "", "", &syncFailure{code: FailConfig, cause: errors.New("upstream URL is longer than git takes as one argument")}
+	}
 	cred, err := w.Credentials.CredentialForRepo(ctx, repoID)
 	switch {
 	case errors.Is(err, ErrNotFound):
@@ -1045,8 +1052,10 @@ func (w *Worker) upstreamAuth(ctx context.Context, repoID, provider string) (use
 		return "", "", nil
 	case strings.ContainsAny(cred.Username+cred.Password, "\r\n\x00"):
 		return "", "", &syncFailure{code: FailConfig, cause: errors.New("stored git credential contains CR, LF or NUL")}
+	case max(len(cred.Username), len(cred.Password)) > maxCredentialBytes:
+		return "", "", &syncFailure{code: FailConfig, cause: errors.New("stored git credential is longer than git takes in its environment")}
 	}
-	username, password = credentialAuth(provider, cred.Username, cred.Password)
+	username, password = credentialAuth(up.Provider, cred.Username, cred.Password)
 	return username, password, nil
 }
 
@@ -1132,19 +1141,10 @@ func runGitOut(ctx context.Context, dir string, env []string, args ...string) (s
 // runGitTo runs git with stdout written to out.
 func runGitTo(ctx context.Context, dir string, env []string, out io.Writer, args ...string) (stderr string, err error) {
 	assertf(dir != "" && len(args) > 0 && out != nil, "runGit: missing dir/args/stdout")
-	// exec refuses a NUL byte, and an argument or variable of 128 KiB or
-	// more. The upstream URL (owner, name, host) and the credential reach
-	// git here from a client's request, so the run reports them
-	// (argumentFailure) and does not read them as a clone failure.
-	for _, v := range append(append([]string{}, args...), env...) {
-		if strings.IndexByte(v, 0) >= 0 {
-			return "", gitlimit.ErrArgNUL
-		}
-	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = env
-	var errBuf bytes.Buffer
+	var errBuf gitlimit.TailBuffer // callers quote it in errors and logs
 	cmd.Stdout = out
 	cmd.Stderr = &errBuf
 	cmd.Stdin = bytes.NewReader(nil)
@@ -1156,24 +1156,8 @@ func runGitTo(ctx context.Context, dir string, env []string, out io.Writer, args
 	setProcGroup(cmd)
 	cmd.WaitDelay = 10 * time.Second
 	err = cmd.Run()
-	if errors.Is(err, syscall.E2BIG) {
-		err = fmt.Errorf("%w: %w", gitlimit.ErrArgTooLong, err)
-	}
 	if err != nil && ctx.Err() != nil {
 		err = fmt.Errorf("%w (%v)", ctx.Err(), err)
 	}
 	return errBuf.String(), err
-}
-
-// argumentFailure is the permanent configuration failure of a run whose
-// git command line exec refused: an upstream owner, name or host, or a
-// stored credential, that is too long for one argument (about 128 KiB on
-// Linux) or holds a NUL byte. Retrying cannot help, and neither can a
-// clone or push failure code. It returns nil for any other error. The
-// message never names the value.
-func argumentFailure(op string, err error) *syncFailure {
-	if !errors.Is(err, gitlimit.ErrArgTooLong) && !errors.Is(err, gitlimit.ErrArgNUL) {
-		return nil
-	}
-	return &syncFailure{code: FailConfig, cause: fmt.Errorf("%s: the upstream URL or the stored credential cannot be passed to git: %w", op, err)}
 }

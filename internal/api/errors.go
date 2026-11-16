@@ -6,12 +6,16 @@ import (
 	"encoding"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"net/http"
 	"reflect"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -30,11 +34,30 @@ func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, 
 	// Read-side git limits (#313) are not internal errors: every handler
 	// reports its git failures through here, so this is the one place that
 	// maps them to their documented 422/503 answers.
-	if s.writeGitLimitErr(w, r, op, err) {
+	if s.writeGitLimitErr(w, r, op, err) || s.writeRefHeldErr(w, r, op, err) {
 		return
 	}
-	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	s.logger.Error("internal error", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
 	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
+}
+
+// refBusyMsg is the 503 body of a ref write that gave up waiting for a
+// concurrent push's or ref write's hold on its ref.
+const refBusyMsg = "ref is busy: a concurrent push or ref write holds it; retry shortly"
+
+// writeRefHeldErr answers a ref write that gave up waiting for a hold on
+// its ref (githttp.ErrRefHeld, after pushHoldWaitMax) with 503 and
+// Retry-After, and reports whether err was one. Holds normally last
+// milliseconds, so a retry is expected to succeed. internalErr,
+// wcInternal and wmInternal all ask it first.
+func (s *server) writeRefHeldErr(w http.ResponseWriter, r *http.Request, op string, err error) bool {
+	if !errors.Is(err, githttp.ErrRefHeld) {
+		return false
+	}
+	s.logger.Warn("ref write gave up waiting for a held ref", "op", op, "method", logMethod(r), "path", logPath(r), "err", err)
+	w.Header().Set("Retry-After", "1")
+	writeErr(w, http.StatusServiceUnavailable, refBusyMsg)
+	return true
 }
 
 // errorEnvelope is the plain wire error shape (docs/reference/http-api.md):
@@ -123,6 +146,13 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		assertf(p.Name != "" && p.Reason != "", "writeProblem: incomplete invalid param %+v", p)
 	}
 	assertf(msg != "", "writeProblem called with empty message")
+	msg = boundEcho(msg)
+	if len(params) > 0 {
+		params = slices.Clone(params)
+		for i := range params {
+			params[i].Name = boundEcho(params[i].Name)
+		}
+	}
 	// RFC 9457 `title` is the status text, so only registered statuses are
 	// valid here (499 is never emitted: ADR-26).
 	title := http.StatusText(status)
@@ -142,11 +172,54 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		Status:        status,
 		Code:          code,
 		Detail:        msg,
-		Instance:      problemInstance(w),
+		Instance:      boundInstance(problemInstance(w)),
 		InvalidParams: params,
 		Guard:         guard,
 		CurrentSHA:    currentSHA,
 	}
+}
+
+// maxEchoBytes bounds the members of an error body that can repeat request
+// input: `error`, `detail` and an `invalid_params` name. A 1 MiB body that
+// names one 1 MiB value, or holds bytes that %q escapes to four, would
+// otherwise answer with more than 10 MiB. It applies to every status. The
+// limit is far above the message that joins the 100 problems of a body
+// (bodyErrors), so an ordinary answer is not cut: a message of 100 problems
+// that each repeat 125 bytes or more of request text is, and then loses its
+// `and N more` ending.
+const maxEchoBytes = 16384
+
+// boundEcho cuts s to maxEchoBytes at a rune boundary and ends it with an
+// ellipsis. A shorter s comes back unchanged.
+func boundEcho(s string) string {
+	if len(s) <= maxEchoBytes {
+		return s
+	}
+	cut := maxEchoBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// maxInstanceBytes bounds `instance`, the escaped request path that an error
+// answer repeats. No route validates the length of a path, and a path of
+// `&` bytes (six bytes each in JSON) of the 1 MiB header limit answers with 6 MB.
+const maxInstanceBytes = 16384
+
+// boundInstance cuts an `instance` to maxInstanceBytes. EscapedPath
+// percent-encodes every byte that is not ASCII, so the cut cannot split a
+// character. It backs off from a partial `%XX` escape and adds no ellipsis, so
+// the value stays a URI reference.
+func boundInstance(s string) string {
+	if len(s) <= maxInstanceBytes {
+		return s
+	}
+	cut := maxInstanceBytes
+	if i := strings.LastIndexByte(s[cut-2:cut], '%'); i >= 0 {
+		cut += i - 2
+	}
+	return s[:cut]
 }
 
 var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
@@ -196,6 +269,52 @@ func requiredFields(msg string, fields ...[2]string) error {
 		return nil
 	}
 	return newFieldErrors(msg, params...)
+}
+
+// invalidTextMsg is the 400 message for request text that is not
+// meta.ValidText: a NUL byte, or bytes that are not UTF-8. PostgreSQL
+// refuses such text in a text value (SQLSTATE 22021) and a NUL in jsonb
+// (22P05), so no backend stores it.
+func invalidTextMsg(name string) string {
+	return "invalid " + name + " (want UTF-8 text without NUL)"
+}
+
+// invalidTextFields returns a fieldError for the first field (dotted wire
+// path -> value) whose value is not meta.ValidText, or nil when all are.
+// A JSON body decodes to valid UTF-8, so for its fields this finds a NUL.
+func invalidTextFields(fields ...[2]string) error {
+	for _, f := range fields {
+		if !meta.ValidText(f[1]) {
+			return newFieldError(f[0], "must be UTF-8 text without NUL", invalidTextMsg(f[0]))
+		}
+	}
+	return nil
+}
+
+// tooLongMsg is the 400 message for a request value longer than max bytes.
+// git would take the value as one argument or one environment entry, which
+// must fit gitlimit.MaxArgBytes with what the server puts around it.
+func tooLongMsg(name string, max int) string {
+	return fmt.Sprintf("invalid %s (want at most %d bytes)", name, max)
+}
+
+// tooLongField returns a fieldError when value, the request field name (a
+// dotted wire path), is longer than max bytes (tooLongMsg), or nil.
+func tooLongField(name, value string, max int) error {
+	if len(value) <= max {
+		return nil
+	}
+	return newFieldError(name, fmt.Sprintf("must be at most %d bytes", max), tooLongMsg(name, max))
+}
+
+// writeInvalidText writes the 400 for the first field that is not
+// meta.ValidText and reports whether it did.
+func writeInvalidText(w http.ResponseWriter, fields ...[2]string) bool {
+	err := invalidTextFields(fields...)
+	if err != nil {
+		writeInvalid(w, err.Error(), err)
+	}
+	return err != nil
 }
 
 // writeInvalidField writes the 400 for one invalid request-body field.

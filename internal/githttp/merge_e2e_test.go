@@ -17,7 +17,7 @@ import (
 // ref_guard_failed (#568) that leaves the target unchanged.
 func TestMerge_ExpectedSourceSHA(t *testing.T) {
 	repoURL := fmt.Sprintf("t531-merge-pin-%d", time.Now().UnixNano())
-	repoID := registerRepo(t, repoURL)
+	repoID := registerRepoURL(t, repoURL)
 	token := mintTestToken(t, repoURL, "git:read,git:write", "")
 	remote := remoteURL(nodeA, repoID, token)
 

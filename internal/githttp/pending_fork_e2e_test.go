@@ -20,6 +20,8 @@ import (
 // repeat sync create is 200 (S3-WAL tracks sync creates since #451).
 func TestFork_PendingNameAnswers503(t *testing.T) {
 	src := registerRepo(t, "pending-fork-src")
+	// The names this test creates through the API, unique per run (see runUnique).
+	done, legacyName, syncName, stuck := runUnique("pending-fork-done"), runUnique("pending-fork-legacy"), runUnique("pending-fork-sync"), runUnique("pending-fork-stuck")
 	work := initWorkRepo(t)
 	mustGit(t, work, "push", remoteURL(nodeA, src, mintTestToken(t, src, "git:read,git:write", "")), "HEAD:refs/heads/main")
 	srcTok := mintTestToken(t, src, "git:read", "")
@@ -45,24 +47,24 @@ func TestFork_PendingNameAnswers503(t *testing.T) {
 		return resp.StatusCode, resp.Header.Get("Retry-After")
 	}
 
-	if code, _ := post("pending-fork-done", fork); code != http.StatusCreated {
+	if code, _ := post(done, fork); code != http.StatusCreated {
 		t.Fatalf("fork = %d, want 201", code)
 	}
-	if r, err := testMeta.GetRepoByURL(context.Background(), testOrg, "pending-fork-done"); err != nil || r.CreateState != meta.CreateStateComplete {
+	if r, err := testMeta.GetRepoByURL(context.Background(), testOrg, done); err != nil || r.CreateState != meta.CreateStateComplete {
 		t.Fatalf("forked repo = %+v, %v; want complete", r, err)
 	}
-	legacy := registerRepo(t, "pending-fork-legacy") // CreateRepo: a legacy row
-	if code, _ := post("pending-fork-sync", syncBody); code != http.StatusCreated {
+	legacy := registerRepoURL(t, legacyName) // CreateRepo: a legacy row
+	if code, _ := post(syncName, syncBody); code != http.StatusCreated {
 		t.Fatalf("sync create = %d, want 201", code)
 	}
 	for _, c := range []struct {
 		name, form, body string
 		want             int
 	}{
-		{"pending-fork-done", "plain", "", http.StatusOK}, {"pending-fork-done", "copy", copyBody, http.StatusOK},
-		{"pending-fork-done", "fork", fork, http.StatusOK}, {"pending-fork-done", "sync", syncBody, http.StatusConflict},
-		{"pending-fork-legacy", "plain", "", http.StatusConflict}, {"pending-fork-legacy", "copy", copyBody, http.StatusConflict},
-		{"pending-fork-sync", "sync", syncBody, http.StatusOK}, {"pending-fork-sync", "plain", "", http.StatusConflict},
+		{done, "plain", "", http.StatusOK}, {done, "copy", copyBody, http.StatusOK},
+		{done, "fork", fork, http.StatusOK}, {done, "sync", syncBody, http.StatusConflict},
+		{legacyName, "plain", "", http.StatusConflict}, {legacyName, "copy", copyBody, http.StatusConflict},
+		{syncName, "sync", syncBody, http.StatusOK}, {syncName, "plain", "", http.StatusConflict},
 	} {
 		if code, _ := post(c.name, c.body); code != c.want {
 			t.Fatalf("repeat %s create of %s = %d, want %d", c.form, c.name, code, c.want)
@@ -73,7 +75,7 @@ func TestFork_PendingNameAnswers503(t *testing.T) {
 	}
 
 	// The row a crash before the fork's last step leaves behind.
-	pending, err := testMeta.CreateRepoWithState(context.Background(), testOrg, "pending-fork-stuck", "main", meta.CreateStatePending)
+	pending, err := testMeta.CreateRepoWithState(context.Background(), testOrg, stuck, "main", meta.CreateStatePending)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +84,7 @@ func TestFork_PendingNameAnswers503(t *testing.T) {
 		want       int
 	}{{"plain", "", http.StatusServiceUnavailable}, {"copy", copyBody, http.StatusServiceUnavailable},
 		{"fork", fork, http.StatusServiceUnavailable}, {"sync", syncBody, http.StatusConflict}} {
-		code, ra := post("pending-fork-stuck", c.body)
+		code, ra := post(stuck, c.body)
 		if code != c.want || (code == http.StatusServiceUnavailable && ra == "") {
 			t.Fatalf("%s create of a pending fork name = %d (Retry-After %q), want %d", c.form, code, ra, c.want)
 		}

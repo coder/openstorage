@@ -3,11 +3,11 @@
 package githttp
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -62,7 +62,9 @@ func TestHydrateReportsStaleRefLock(t *testing.T) {
 	}
 	killed := false
 	for _, pid := range serveChildren(node) {
-		if cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); bytes.HasPrefix(cmdline, []byte("git\x00receive-pack")) {
+		// serve starts it as `git [-c <setting>]... receive-pack ...`.
+		cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if argv := strings.Split(string(cmdline), "\x00"); argv[0] == "git" && slices.Contains(argv, "receive-pack") {
 			pgid, err := syscall.Getpgid(pid)
 			if err != nil || pgid == node.cmd.Process.Pid {
 				t.Fatalf("receive-pack %d group %d: %v", pid, pgid, err)

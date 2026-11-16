@@ -219,21 +219,23 @@ func TestForkRepo(t *testing.T) {
 			}
 		})
 
-		t.Run("explicit default_branch", func(t *testing.T) {
-			caller := newForkCaller(t, e, "")
-			req := forkBody(srcReadTok, nil)
-			req["default_branch"] = "trunk"
-			resp, body := forkDo(t, srv, caller.token, req)
-			forkID := forkRequireCreated(t, resp, body)
-			refs := wrefRefs(t, e, forkID)
-			if len(refs) != 1 || refs["refs/heads/trunk"] != src.c2 {
-				t.Fatalf("fork refs = %v, want exactly refs/heads/trunk=%s", refs, src.c2)
-			}
-			row, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url)
-			if err != nil || row.DefaultBranch != "trunk" {
-				t.Fatalf("repo row = %+v err %v", row, err)
-			}
-		})
+		for _, branch := range []string{"trunk", "refs/heads/trunk"} {
+			t.Run("explicit default_branch "+branch, func(t *testing.T) {
+				caller := newForkCaller(t, e, "")
+				req := forkBody(srcReadTok, nil)
+				req["default_branch"] = branch
+				resp, body := forkDo(t, srv, caller.token, req)
+				forkID := forkRequireCreated(t, resp, body)
+				refs := wrefRefs(t, e, forkID)
+				if len(refs) != 1 || refs["refs/heads/trunk"] != src.c2 {
+					t.Fatalf("fork refs = %v, want exactly refs/heads/trunk=%s", refs, src.c2)
+				}
+				row, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url)
+				if err != nil || row.DefaultBranch != "trunk" {
+					t.Fatalf("repo row = %+v err %v", row, err)
+				}
+			})
+		}
 
 		// Issue #293: the optional body repo_name may only confirm the
 		// destination's JWT repo claim (caller.url contains slashes).
@@ -439,11 +441,22 @@ func TestForkRepo(t *testing.T) {
 				})
 			}
 
-			t.Run("invalid default_branch", func(t *testing.T) {
+			for _, branch := range []string{"a..b", "refs/namespaces/ephemeral/refs/heads/x"} {
+				t.Run("invalid default_branch "+branch, func(t *testing.T) {
+					caller := newForkCaller(t, e, "")
+					req := forkBody(srcReadTok, nil)
+					req["default_branch"] = branch
+					resp, body := forkDo(t, srv, caller.token, req)
+					if resp.StatusCode != http.StatusBadRequest {
+						t.Fatalf("status = %d body %v, want 400", resp.StatusCode, body)
+					}
+					forkRequireNoRepoRow(t, e, caller.org, caller.url)
+				})
+			}
+			// A plain create on this server runs the frozen handler.
+			t.Run("plain create refuses a non-branch default", func(t *testing.T) {
 				caller := newForkCaller(t, e, "")
-				req := forkBody(srcReadTok, nil)
-				req["default_branch"] = "a..b"
-				resp, body := forkDo(t, srv, caller.token, req)
+				resp, body := forkDo(t, srv, caller.token, map[string]any{"default_branch": "refs/tags/v1"})
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Fatalf("status = %d body %v, want 400", resp.StatusCode, body)
 				}
@@ -502,9 +515,20 @@ func TestForkSourceKeyStoreFailure(t *testing.T) {
 		srv := httptest.NewServer(recoverPanics(s.logger)(mux))
 		t.Cleanup(srv.Close)
 
+		out := captureKeyFailureLog(t)
 		resp, body := forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
+		for range 2 {
+			forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
+		}
+		// Three failed checks in one minute write one line.
+		if got := out.String(); strings.Count(got, "verify token: ") != 1 || !strings.Contains(got, "verify token: key store lookup failed") || !strings.Contains(got, "canary-db.internal") {
+			t.Fatalf("the log of the failed source token checks is %q", got)
+		}
 		if resp.StatusCode != http.StatusForbidden || body["code"] != "authentication_unavailable" {
 			t.Fatalf("status %d body %v, want 403 authentication_unavailable", resp.StatusCode, body)
+		}
+		if raw, err := json.Marshal(body); err != nil || strings.Contains(string(raw), "canary-db") {
+			t.Fatalf("the answer holds the store's text (%v): %s", err, raw)
 		}
 		if _, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url); !errors.Is(err, meta.ErrNotFound) {
 			t.Fatalf("repo lookup after refused fork: err = %v, want ErrNotFound", err)

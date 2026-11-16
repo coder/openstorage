@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -504,6 +505,9 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if p := q.Get("path"); p != "" && !readPathOK(w, p) {
+		return
+	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
@@ -671,6 +675,10 @@ func (s *server) resolveFilesRequest(w http.ResponseWriter, r *http.Request, rep
 	ephemeral, err := coreBoolParam(q, "ephemeral")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return "", "", "", false
+	}
+	// The listings send git the subtree: "/" alone names the root.
+	if subtree, _ := filesListPath(r); subtree != "" && !readPathOK(w, subtree) {
 		return "", "", "", false
 	}
 	refLabel = q.Get("ref")
@@ -1043,6 +1051,38 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // 2b: GET+HEAD /repos/file
 
+// pathLeavesRepo reports whether a request path names a place outside the
+// repository: it starts with "/", or a ".." climbs above the root after
+// path.Clean. git refuses such a path with a fatal exit (128), which is
+// the client's input, not a failure of the server's git.
+func pathLeavesRepo(p string) bool {
+	c := path.Clean(p)
+	return strings.HasPrefix(p, "/") || c == ".." || strings.HasPrefix(c, "../")
+}
+
+// maxGitPathBytes bounds a path of a read request. git gets it as one
+// argument, at most as ":(literal)<path>/" (a files listing), which must
+// fit gitlimit.MaxArgBytes.
+const maxGitPathBytes = gitlimit.MaxArgBytes - len(":(literal)") - len("/")
+
+// readPathOK answers 400 and returns false when a request path holds a
+// NUL byte (exec refuses it, and no path holds one), is longer than
+// maxGitPathBytes, or names a place outside the repository
+// (pathLeavesRepo).
+func readPathOK(w http.ResponseWriter, p string) bool {
+	switch {
+	case strings.ContainsRune(p, 0):
+		writeErr(w, http.StatusBadRequest, "path must not contain a NUL byte")
+	case len(p) > maxGitPathBytes:
+		writeErr(w, http.StatusBadRequest, tooLongMsg("path", maxGitPathBytes))
+	case pathLeavesRepo(p):
+		writeErr(w, http.StatusBadRequest, "path is outside the repository")
+	default:
+		return true
+	}
+	return false
+}
+
 // handleGetFile implements GET+HEAD /api/v1/repos/file: conditional and
 // range blob streaming. The blob is staged to a request-scoped temp file
 // and served via http.ServeContent, which owns the RFC 9110 precondition
@@ -1058,6 +1098,9 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 	filePath := q.Get("path")
 	if filePath == "" {
 		writeErr(w, http.StatusBadRequest, "missing path")
+		return
+	}
+	if !readPathOK(w, filePath) {
 		return
 	}
 	// docs/reference/http-api.md lists ephemeral_base on this endpoint; with a single ref to

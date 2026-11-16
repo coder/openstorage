@@ -80,6 +80,38 @@ func WaitForPushPublication(ctx context.Context, cacheDir, repo string) error {
 	return newPublicationWait(filepath.Join(RepoPath(cacheDir, repo), pushHoldDir), defaultPublicationLimits).wait(ctx)
 }
 
+// HoldRef takes a push hold on one ref of repo's cache for a write that
+// changes the ref outside receive-pack: a REST write on the local schedule
+// (ADR-50) holds the ref from before it records its forward intent until
+// its authority CAS returns. While the hold is live, WaitForPushPublication
+// blocks and a strict sync fetch refuses the ref, so a push run that
+// claims the intent cannot snapshot the ref before the CAS. A conflicting
+// hold is waited out as for a push (pushHoldWaitMax), then HoldRef fails
+// with an error that matches ErrRefHeld.
+// release stops the refresh and removes the hold; the TTL machinery covers
+// a process that dies first.
+func HoldRef(ctx context.Context, cacheDir, repo, refName string) (release func(), err error) {
+	assertf(ctx != nil && cacheDir != "" && repo != "" && refName != "", "HoldRef: missing ctx/cache/repo/ref")
+	repoPath, err := EnsureCacheRepoCtx(ctx, cacheDir, repo)
+	if err != nil {
+		return nil, err
+	}
+	holdPath, err := mintPushHold(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	stop := startPushHoldRefresh(holdPath)
+	release = func() {
+		stop()
+		removePushHoldFiles(holdPath)
+	}
+	if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+
 // publicationWait is one WaitForPushPublication's state. Not
 // goroutine-safe; one wait owns it.
 type publicationWait struct {

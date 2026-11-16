@@ -778,3 +778,27 @@ func TestHydrate_CommitGraphWithRelativeCacheDir(t *testing.T) {
 		t.Fatal("no commit-graph written through a relative repo path")
 	}
 }
+
+// The wait for the repository's lease counts against the attempt's budget:
+// a write that queues behind an exclusive holder ends with its budget, not
+// after the 30 s that a lease start may wait.
+func TestCommitGraphAttemptBudgetBoundsTheLeaseWait(t *testing.T) {
+	repoPath := t.TempDir()
+	held, err := gitlimit.TryExclusive(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- runCommitGraphAttempt(t.Context(), repoPath, 200*time.Millisecond, []string{"commit-graph", "verify"}, "")
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errCommitGraphBudget) {
+			t.Fatalf("attempt = %v, want the attempt budget error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the attempt kept waiting for the lease after its budget ended")
+	}
+}

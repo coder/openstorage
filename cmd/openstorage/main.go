@@ -42,7 +42,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|s3wal-meta|version> ...")
+		fatalf("usage: openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|repair-refs|s3wal-meta|version> ...")
 	}
 	// Refuse old-only CODESTORAGE_* settings before any command reads config.
 	// Hooks inherit the serve environment, which already passed this check.
@@ -60,9 +60,7 @@ func main() {
 		// Eventing wiring for the git surface (docs/reference/webhooks.md): decorate the
 		// update hook's ref store so won pushes emit push events. No-op
 		// (identity default) when the serve env is absent.
-		hookCleanup := wireHookEventing(ctx, slogForHook())
-		err = githttp.RunHook(ctx, os.Args[2:])
-		hookCleanup()
+		err = runHook(ctx, os.Args[2:], os.Stderr)
 	case "keygen":
 		err = cmdKeygen(os.Args[2:])
 	case "mint":
@@ -73,6 +71,8 @@ func main() {
 		err = cmdListPacks(ctx, os.Args[2:])
 	case "purge-repo":
 		err = cmdPurgeRepo(ctx, os.Args[2:])
+	case "repair-refs":
+		err = cmdRepairRefs(ctx, os.Args[2:])
 	case "s3wal-meta":
 		err = cmdS3WALMeta(ctx, os.Args[2:])
 	case "version", "--version":
@@ -324,9 +324,6 @@ func cmdServe(ctx context.Context, args []string) error {
 	srv.LFSV020WriteCompat = cfg.lfsV020WriteCompat
 	srv.MaxPushBytes = cfg.maxPushBytes
 	srv.VerifySigBudget = cfg.verifySigBudget
-	// Local push runs restore their request when their loopback fetch
-	// finds a push-held ref stale (ADR-50).
-	_, srv.StrictSyncFetch = meta.LocalSchedule(metaStore)
 	// docs/explanation/git-protocol-and-namespaces.md git URLs address repos by repo_id (name-style urls accepted
 	// too, ADR-21); the resolved RepoID is the only storage key, and the
 	// record backs claim matching for url- or id-carrying tokens (docs/reference/authentication.md).

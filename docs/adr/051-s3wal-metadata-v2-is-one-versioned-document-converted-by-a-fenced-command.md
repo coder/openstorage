@@ -15,8 +15,9 @@
 > now refuses the ref update with the conversion hint and writes nothing. A document that
 > does not decode is refused the same way, with a pointer to the stopped-node restore.
 > The hook no longer accepts such a push without its events. A metadata store the hook
-> cannot reach still fails open. Fact 5, the missed-step note, the `hook` row of the
-> mixed-version table, and test-plan item 1 below predate that change.
+> cannot reach no longer fails open for intent either: the hook refuses every update that
+> could record forward intent (fact 5's amendment). Fact 5 and test-plan item 1 below
+> predate these changes.
 >
 > **Amended by [#452](https://github.com/coder/openstorage/issues/452) item 5:**
 > `--to 1` now also sets `sync_pending` on every unfinished sync create (pending, with a
@@ -72,6 +73,15 @@ Five facts shape the format decision:
    (`cmd/openstorage/wire_eventing.go`). These hooks run after the ref update
    commits. A hook that cannot decode the document therefore drops the push's
    webhooks and, under #335, its push and pull intent.
+
+   **Amendment: hook eventing no longer fails open for intent.** A hook that reads a
+   document version it cannot write, or a corrupt document, refuses the ref update
+   before its CAS (`meta.CheckFormat`, issues #445 and #466). On the local schedule
+   the hook records the push's intent before the CAS and refuses the update when it
+   cannot ([ADR-50](050-local-scheduling-state-is-row-owned.md)). A hook that cannot
+   wire its eventing refuses every update that could record forward intent
+   ([ADR-33](033-git-push-eventing-crosses-processes-durable-river-inserts-on-pg-synchronous-deliveries-in-local-mode.md)'s
+   amendment). Updates that record no intent still go through without events.
 
 ## Fields and features that need v2
 
@@ -343,7 +353,8 @@ metadata read with `document version 2 unsupported (want 1)`. A v2 binary on
 a v1 bucket stops with an error that names the conversion command. Neither
 writes `meta.json`. A `serve` can still write its lease and probe objects
 before its first metadata read. A binary replaced under a running `serve`
-is the exception: its hooks accept pushes and drop their events (fact 5).
+is the exception: its hooks refuse every update with the conversion hint and write
+nothing (the #445 and #466 amendment above).
 
 ## Mixed-version behavior (R1)
 
@@ -351,7 +362,7 @@ is the exception: its hooks accept pushes and drop their events (fact 5).
 |---|---|---|
 | v1 `serve`, `hook`, `signing-key`, `purge-repo` | works (today) | fails closed at the first metadata read. A process started before the conversion fails its next foreground metadata operation, because the conditional GET returns the v2 body. Its org-key refresher keeps the last snapshot, so the procedure stops it first. |
 | v2 `serve`, `signing-key`, `purge-repo` | fails closed with the conversion hint, no write to `meta.json` | works |
-| v2 `hook` (binary replaced under a running v1 `serve`) | Enforcement reads (sync fence, signature keys), where a push needs them, refuse the ref update. Eventing fails open: the push is accepted, and its webhooks and intent are dropped with a log line (fact 5). | works |
+| v2 `hook` (binary replaced under a running v1 `serve`) | Enforcement reads (sync fence, signature keys), where a push needs them, refuse the ref update. Eventing refuses the ref update too, with the conversion hint, and writes nothing (the #445 and #466 amendment above). | works |
 | v2 `s3wal-meta convert --to 2` | converts (under the lease) | no change, exit 0 |
 | v2 `s3wal-meta convert --to 1` | no change, exit 0 | converts (under the lease) |
 

@@ -24,6 +24,7 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -59,6 +60,10 @@ const (
 	// Minted per request by the server and stripped from inherited env
 	// like the other per-push inputs.
 	EnvPushHold = "OPENSTORAGE_GIT_PUSH_HOLD"
+	// EnvImportPush marks a push that came through the `+import` remote
+	// ("1"). The push writes the base repo's refs; pre-receive refuses it
+	// when the repo has a sync base (refuseSyncedImport).
+	EnvImportPush = "OPENSTORAGE_GIT_IMPORT_PUSH"
 	// EnvAtomic marks the push `--atomic` (issue #28). githooks(5) exposes
 	// no atomic indicator, so the HTTP layer sniffs the wire capability
 	// (atomic.go) and sets this; pre-receive then evaluates the policy
@@ -129,7 +134,7 @@ func testMode() bool { return envconfig.Getenv(EnvTestMode) == "1" }
 // reconcile. An error refuses the ref update before its CAS (issues #445,
 // #466: the metadata document is in a format this binary cannot write
 // events to, or corrupt). When the hook cannot wire its eventing, the cmd
-// wiring returns a store that refuses every update that would record
+// wiring returns a store that refuses every update that could record
 // forward intent and passes the rest, still through ref.IdempotentCAS
 // (cmd/openstorage intentlessRefStore, ADR-33's amendment).
 var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) (ref.RefStore, error) {
@@ -149,9 +154,24 @@ func mustEnv(names ...string) string {
 // invoked by git via the scripts EnsureCacheRepo installs. Arguments and
 // stdin come from outside this process, so malformed input must produce an
 // error (stderr message + non-zero exit denies the push), never a panic.
+// git shows the pusher the returned error, so an error that is not a
+// refusal (ShownToPusher) becomes a fixed line, and its text goes to the
+// push's hook-errors file for the operator (hookFailure).
 func RunHook(ctx context.Context, args []string) error {
+	err := runHook(ctx, args)
+	if err == nil || ShownToPusher(err) {
+		return err
+	}
+	name := ""
+	if len(args) > 0 {
+		name = args[0]
+	}
+	return hookFailure(name, err)
+}
+
+func runHook(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return errors.New("hook: missing hook name argument")
+		return Refuse(errors.New("hook: missing hook name argument"))
 	}
 	switch args[0] {
 	case "pre-receive":
@@ -163,7 +183,7 @@ func RunHook(ctx context.Context, args []string) error {
 	case "reference-transaction":
 		return referenceTransactionHook(args[1:])
 	default:
-		return fmt.Errorf("unknown hook %q", args[0])
+		return refusef("unknown hook %q", args[0])
 	}
 }
 
@@ -367,6 +387,11 @@ func preReceive(ctx context.Context) (retErr error) {
 	if len(commands) == 0 {
 		return errors.New("pre-receive: git invoked hook with no commands")
 	}
+	if envconfig.Getenv(EnvImportPush) == "1" {
+		if err := refuseSyncedImport(ctx, repo); err != nil {
+			return err
+		}
+	}
 	atomicPush := envconfig.Getenv(EnvAtomic) == "1"
 
 	// Full-policy verdicts are evaluated AT MOST once per command per push
@@ -380,10 +405,25 @@ func preReceive(ctx context.Context) (retErr error) {
 	// beyond its signature-gated commands.
 	verdicts := make([]error, len(commands))
 	verdictDone := make([]bool, len(commands))
+	tipVerdicts := sync.OnceValue(func() []error { return branchTipVerdicts(commands) })
 	evalOne := func(i int) error {
 		if !verdictDone[i] {
 			c := commands[i]
-			verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+			switch {
+			case hiddenOnRemote(repo, c.ref):
+				verdicts[i] = refusef("ref %s is hidden on this remote, which takes no refs under refs/namespaces/ (the HTTP API writes ephemeral branches)", c.ref)
+			case !pushCommandUpdatable(c.ref, c.old, c.new):
+				// Never committed: git refuses a funny name before the
+				// update hook, which denies the rest. So the publication
+				// gate stores no pack that only such names need.
+				verdicts[i] = refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth)
+			case tipVerdicts()[i] != nil:
+				// git refuses it after the hooks, but the update hook's
+				// CAS has stored it by then (branchTipVerdicts).
+				verdicts[i] = tipVerdicts()[i]
+			default:
+				verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+			}
 			verdictDone[i] = true
 		}
 		return verdicts[i]
@@ -402,17 +442,14 @@ func preReceive(ctx context.Context) (retErr error) {
 	// name and aborting the local atomic transaction, so letting one
 	// through recreates the authority-accepted/client-rejected wedge.
 	if atomicPush {
-		// Evaluated one command at a time, name check first, STOPPING at
-		// the first denial (Codex round-10 P2): a denied atomic push's
+		// Evaluated one command at a time (each command's name check
+		// before its policy), STOPPING at the first denial (Codex round-10 P2): a denied atomic push's
 		// outcome is already fixed, and each further evaluation can cost
 		// subprocess work (no-force-push runs git merge-base, verify-sig
 		// walks and verifies) — eager whole-slice evaluation let one
 		// doomed request scale that by its command count. A complete loop
 		// leaves verdicts fully populated (all nil) for the later gates.
-		for i, c := range commands {
-			if !pushCommandUpdatable(c.ref, c.old, c.new) {
-				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth))
-			}
+		for i := range commands {
 			if err := evalOne(i); err != nil {
 				return atomicDenied(err)
 			}
@@ -478,7 +515,7 @@ func preReceive(ctx context.Context) (retErr error) {
 			}
 		}
 		if preUnreserved > maxPushUnreserved {
-			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", preUnreserved, maxPushUnreserved)
+			return refusef("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", preUnreserved, maxPushUnreserved)
 		}
 		// Non-atomic pushes resolve reservations budget-free, with only
 		// signature-gated commands paying a real per-command evaluation
@@ -502,6 +539,14 @@ func preReceive(ctx context.Context) (retErr error) {
 			}
 		}
 		for i, c := range commands {
+			// git refuses a hidden ref before any update hook runs
+			// (serviceCmd): it never commits, so it takes no hold and no
+			// sidecar marker. A hold would block hydration and REST writes
+			// of that ephemeral branch for as long as the client keeps
+			// the push open.
+			if hiddenOnRemote(repo, c.ref) {
+				continue
+			}
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
 			// literal refs/heads to pre-receive yet can never complete
@@ -608,7 +653,7 @@ func preReceive(ctx context.Context) (retErr error) {
 		// Early sidecar-cap check — see the full rationale at the second
 		// check below.
 		if len(unreserved) > maxPushUnreserved {
-			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
+			return refusef("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
 		}
 		reserveHoldsAndProbe = func() error {
 			if err := reservePushHolds(ctx, holdPath, names); err != nil {
@@ -705,11 +750,11 @@ func preReceive(ctx context.Context) (retErr error) {
 				for _, c := range commands {
 					switch got, exists := values[c.ref]; {
 					case c.old == ref.ZeroSHA && exists:
-						return atomicDenied(fmt.Errorf("%s already exists (created concurrently); fetch first", c.ref))
+						return atomicDenied(refusef("%s already exists (created concurrently); fetch first", c.ref))
 					case c.old != ref.ZeroSHA && !exists:
-						return atomicDenied(fmt.Errorf("%s no longer exists (deleted concurrently); fetch first", c.ref))
+						return atomicDenied(refusef("%s no longer exists (deleted concurrently); fetch first", c.ref))
 					case c.old != ref.ZeroSHA && got != c.old:
-						return atomicDenied(fmt.Errorf("%s moved concurrently (expected %.8s); fetch first", c.ref, c.old))
+						return atomicDenied(refusef("%s moved concurrently (expected %.8s); fetch first", c.ref, c.old))
 					}
 				}
 			}
@@ -773,7 +818,7 @@ func preReceive(ctx context.Context) (retErr error) {
 			// intra-push D/F) never reserves or probes at all (Codex round-12
 			// security P2), and once here for the probe's late additions.
 			if len(unreserved) > maxPushUnreserved {
-				return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
+				return refusef("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
 			}
 			// The (typically empty) remainder becomes one marker file per
 			// name in the sidecar directory, so an update hook's membership
@@ -815,7 +860,7 @@ func preReceive(ctx context.Context) (retErr error) {
 		// an error instead of crashing receive-pack.
 		for _, c := range commands {
 			if c.new != ref.ZeroSHA && !objectExists(c.new) {
-				return fmt.Errorf("pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
+				return refusef("pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
 			}
 		}
 		// No pack means nothing can leak. The atomic whole-push policy
@@ -911,7 +956,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	// better than failing after.
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
-		return err
+		return fmt.Errorf("pre-receive: open ref store: %w", err)
 	}
 	defer st.Close()
 
@@ -1004,7 +1049,7 @@ func preReceive(ctx context.Context) (retErr error) {
 				// its generation) and retry once; a second rejection
 				// fails the push closed — the client retries.
 				if attempt >= 1 {
-					return fmt.Errorf("pre-receive: usage floor went stale during admission twice, retry")
+					return refusef("pre-receive: usage floor went stale during admission twice, retry")
 				}
 				floor, floorGen, err = hookSelfListFloor(ctx, bl, st, repo)
 				if err != nil {
@@ -1016,15 +1061,15 @@ func preReceive(ctx context.Context) (retErr error) {
 				// round 43): rows expire with the TTL, so tell the
 				// client to RETRY instead of reporting a quota failure
 				// whose arithmetic may even show the push fits.
-				return fmt.Errorf("pre-receive: too many in-flight uploads reserved for this repository, retry later")
+				return refusef("pre-receive: too many in-flight uploads reserved for this repository, retry later")
 			}
 			if dec.RenewalDegraded {
 				// Fail-closed while quota accounting is degraded (Codex
 				// round 26 on PR #132, security): transient, retry.
-				return fmt.Errorf("pre-receive: storage quota accounting temporarily degraded, retry later")
+				return refusef("pre-receive: storage quota accounting temporarily degraded, retry later")
 			}
 			if !dec.OK {
-				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
+				return refusef("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
 					ref.IncomingBytes(unpublished), dec.UsedBytes, dec.ReservedBytes, quota)
 			}
 			reservedGens = dec.Gens
@@ -1054,19 +1099,7 @@ func preReceive(ctx context.Context) (retErr error) {
 			// earlier iterations are durable orphans whose rows must keep
 			// covering them (round 33). Ambiguity and retire failures
 			// only leave what the TTL always collected.
-			if len(reservedGens) > 0 {
-				proven := make(map[string]string, len(reservedGens))
-				for k, g := range reservedGens {
-					if _, serr := bl.Stat(ctx, k); errors.Is(serr, blob.ErrNotFound) {
-						proven[k] = g
-					}
-				}
-				if len(proven) > 0 {
-					if rerr := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), proven); rerr != nil {
-						fmt.Fprintf(os.Stderr, "openstorage: retire reservations: %v\n", rerr)
-					}
-				}
-			}
+			retireUnuploaded(ctx, st, bl, repo, reservedGens)
 			return fmt.Errorf("pre-receive: upload %s: %w", packs[i].Key, err)
 		}
 	}
@@ -1162,13 +1195,6 @@ const (
 	maxPushRefSegmentBytes = 200
 	maxPushRefNameBytes    = 900
 )
-
-// pushRefSegmentNameMax is the HARD per-component limit (Linux NAME_MAX):
-// the boundary at which the git files backend cannot represent the path
-// at all, as opposed to the conservative policy caps above. Deletions are
-// held only to this (see pushRefDeletable) so legacy refs between the
-// policy caps and the hard limit stay deletable.
-const pushRefSegmentNameMax = 255
 
 // pushRefPathMax is the TARGET OS's PATH_MAX budget for the deepest path
 // git materializes for a pushed ref: the loose lock file
@@ -1283,24 +1309,33 @@ func pushRefDeletable(name string) bool {
 	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
 		return false
 	}
-	segs := strings.Split(name, "/")
-	for i, seg := range segs {
+	for _, seg := range strings.Split(name, "/") {
 		if !gitRefSegmentValid(seg) {
 			return false
 		}
-		// Filesystem NAME_MAX (255): intermediate segments are directory
-		// names; the final segment must also carry the ".lock" suffix.
-		limit := pushRefSegmentNameMax
-		if i == len(segs)-1 {
-			limit -= len(".lock")
-		}
-		if len(seg) > limit {
-			return false
-		}
+	}
+	// The HARD per-component limits (filesystem NAME_MAX, and the ".lock"
+	// suffix on the final part), as opposed to the conservative policy
+	// caps above. Deletions are held only to these so legacy refs between
+	// the policy caps and the hard limits stay deletable. The same rule
+	// picks the refs that `openstorage repair-refs` removes.
+	if ref.Unlockable(name) {
+		return false
 	}
 	// The whole lock path must fit PATH_MAX against the ACTUAL repository
 	// directory (round-21 P2 established the budget for creations).
 	return !pushRefPathTooLong(pushRepoDirLen(), len(name))
+}
+
+// hiddenOnRemote reports whether receive-pack hides refName on the remote
+// of storage key repo (serviceCmd). git refuses such a command before
+// pre-receive and runs no update hook for it, yet still lists it on
+// pre-receive's stdin and, under --atomic, commits the other commands. So
+// pre-receive's verdict denies it: an atomic push that names one lands
+// nothing, and a pack that only such commands need is never published.
+func hiddenOnRemote(repo, refName string) bool {
+	// git hides the prefix itself too: it drops the trailing slash.
+	return persistentKey(repo) && (strings.HasPrefix(refName, persistentHiddenRefs) || refName+"/" == persistentHiddenRefs)
 }
 
 // pushCommandUpdatable applies the right name gate for one command:
@@ -1430,7 +1465,7 @@ func atomicPushDFCheck(commands []refCommand) error {
 			if isDelete[ancName] && isDelete[c.ref] {
 				continue
 			}
-			return fmt.Errorf("refs %s and %s conflict (directory/file) in one atomic transaction; drop --atomic or split the push", ancName, c.ref)
+			return refusef("refs %s and %s conflict (directory/file) in one atomic transaction; drop --atomic or split the push", ancName, c.ref)
 		}
 	}
 	return nil
@@ -1444,7 +1479,8 @@ func atomicPushDFCheck(commands []refCommand) error {
 // allowed commands all target already-stored objects is refused whole —
 // its pack could only serve the denied refs (round-7 decoy) — with a
 // message telling the client to push the allowed updates separately. It
-// reuses enforceRefPolicy verbatim — the quarantine is visible to
+// reuses the shared verdicts (enforceRefPolicy, plus the refusals of hidden
+// refs and of names the server cannot store) — the quarantine is visible to
 // pre-receive via git's alternates, so is-ancestor and verify-sig checks
 // work here exactly as in the update hook; verify-sig-policied winners are
 // verified twice, an accepted redundancy for failing closed.
@@ -1508,6 +1544,29 @@ func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bo
 	return fmt.Errorf("pre-receive: the quarantined pack is needed only by policy-denied ref updates, refusing pack publication (push the allowed updates separately): %w", firstErr)
 }
 
+// retireUnuploaded retires the reservations in reservedGens whose blobs
+// are proven absent after a failed upload. A failed retire leaves only
+// what the TTL collects anyway, so it is logged, to the hook-errors file
+// only: its error can name the store, and git relays stderr to the pusher.
+func retireUnuploaded(ctx context.Context, st interface {
+	RetirePackAttempts(ctx context.Context, group []string, gens map[string]string) error
+}, bl interface {
+	Stat(ctx context.Context, key string) (int64, error)
+}, repo string, reservedGens map[string]string) {
+	proven := make(map[string]string, len(reservedGens))
+	for k, g := range reservedGens {
+		if _, serr := bl.Stat(ctx, k); errors.Is(serr, blob.ErrNotFound) {
+			proven[k] = g
+		}
+	}
+	if len(proven) == 0 {
+		return
+	}
+	if err := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), proven); err != nil {
+		hookErrorsLogger().Error("pre-receive: retire reservations", "err", err)
+	}
+}
+
 // atomicDenied is the whole-push denial for an atomic push carrying a
 // policy-denied command. The message reaches the client over the sideband;
 // it names the remedy because the same refspecs may be fine without
@@ -1541,7 +1600,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// Deletions skip the materialization bounds (round-18 P2): legacy
 	// over-bound refs must stay deletable.
 	if !pushCommandUpdatable(refName, old, new) {
-		return fmt.Errorf("update: ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", refName, maxPushRefDepth)
+		return refusef("update: ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", refName, maxPushRefDepth)
 	}
 	repo := mustEnv(EnvRepo)
 
@@ -1624,6 +1683,13 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		if _, err := os.Stat(pushHoldUnreservedMarker(holdPath, refName)); errors.Is(err, os.ErrNotExist) && !jit {
 			refHeld = true
 		}
+	}
+
+	// A branch tip that is no commit would reach the CAS below, and git
+	// refuses it only afterwards (branchTipVerdicts). Checked before the
+	// policy: the object type decides it, whatever the policy says.
+	if err := branchTipVerdicts([]refCommand{{old: old, new: new, ref: refName}})[0]; err != nil {
+		return err
 	}
 
 	// Verified verdict (Codex round-16 P2): pre-receive already ran the
@@ -1732,7 +1798,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
-		return err
+		return fmt.Errorf("update: open ref store: %w", err)
 	}
 	defer st.Close()
 	// Authority-side directory/file guard (Codex round-4 P1 on #173, and
@@ -1786,7 +1852,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		return err
 	}
 	if !won {
-		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", refName, old)
+		return refusef("CAS conflict: %s moved concurrently (expected %.8s)", refName, old)
 	}
 	// Claim the attribution under this push's hold (issue #186 finding 5):
 	// best-effort — a lost claim only narrows what a held marker can
@@ -1860,7 +1926,7 @@ func authorityDoomedCreations(ctx context.Context, st ref.RefStore, repo string,
 	}
 	deny := func(created, existing string) {
 		if _, dup := doomed[created]; !dup {
-			doomed[created] = fmt.Errorf("%s conflicts with existing ref %s (directory/file); delete %s first", created, existing, existing)
+			doomed[created] = refusef("%s conflicts with existing ref %s (directory/file); delete %s first", created, existing, existing)
 		}
 	}
 	if prober, ok := st.(dfConflictProber); ok {
@@ -1949,7 +2015,7 @@ func denyAuthorityDFConflict(ctx context.Context, st ref.RefStore, repo, name st
 		anc := name[:i]
 		switch _, err := st.GetRef(ctx, repo, anc); {
 		case err == nil:
-			return fmt.Errorf("update: %s conflicts with existing ref %s (directory/file); delete %s first", name, anc, anc)
+			return refusef("update: %s conflicts with existing ref %s (directory/file); delete %s first", name, anc, anc)
 		case !errors.Is(err, ref.ErrNotFound):
 			return fmt.Errorf("update: directory/file probe for %s: %w", name, err)
 		}
@@ -1959,7 +2025,7 @@ func denyAuthorityDFConflict(ctx context.Context, st ref.RefStore, repo, name st
 		return fmt.Errorf("update: directory/file probe for %s: %w", name, err)
 	}
 	if len(page) > 0 && strings.HasPrefix(page[0].Name, name+"/") {
-		return fmt.Errorf("update: %s conflicts with existing ref %s (directory/file); delete %s first", name, page[0].Name, page[0].Name)
+		return refusef("update: %s conflicts with existing ref %s (directory/file); delete %s first", name, page[0].Name, page[0].Name)
 	}
 	return nil
 }
@@ -1985,9 +2051,37 @@ func enforceSyncClaimFence(ctx context.Context, repo, holder string) error {
 		return fmt.Errorf("sync claim fence: load upstream: %w", err)
 	}
 	if up.SyncClaimHolder != holder {
-		return fmt.Errorf("sync claim fence: claim now held by %q, refusing the stale sync push", up.SyncClaimHolder)
+		return refusef("sync claim fence: claim now held by %q, refusing the stale sync push", up.SyncClaimHolder)
 	}
 	return nil
+}
+
+// importSyncedRefusal is the pre-receive refusal of an import push to a
+// repository with a sync base.
+const importSyncedRefusal = "import push refused: the repository has a sync base; +import remotes accept pushes only for repositories without one"
+
+// refuseSyncedImport refuses a `+import` push to a repository that has a
+// sync base, so an imported ref never reaches a connected upstream
+// (code.storage docs/repos/imports). In serve, a repo writes its upstream
+// link only together with its repo row (meta.EventingStore.CreateLinkedRepo:
+// both serve queues track create state), so one read before any pack is
+// published decides the whole push. It fails
+// closed when the metadata store cannot answer, and the pusher then sees
+// only hookFailure's fixed line.
+func refuseSyncedImport(ctx context.Context, repo string) error {
+	assertf(repo != "" && BaseRepo(repo) == repo, "refuseSyncedImport: %q is not a base repo key", repo)
+	ms, err := meta.Open(ctx, mustEnv(envHookPGURL...))
+	if err != nil {
+		return fmt.Errorf("import push: open meta store: %w", err)
+	}
+	defer ms.Close()
+	switch _, err := ms.GetRepoUpstream(ctx, repo); {
+	case errors.Is(err, meta.ErrNotFound):
+		return nil
+	case err != nil:
+		return fmt.Errorf("import push: load upstream link: %w", err)
+	}
+	return Refuse(errors.New(importSyncedRefusal))
 }
 
 // errCASDrop is the synthetic post-commit connection-drop error the
@@ -2183,13 +2277,19 @@ func loadRefPolicies(policyJSON, opsJSON string) ([]auth.RefPolicy, error) {
 	if policyJSON != "" {
 		m.policies, m.err = auth.ParseRefPolicies(policyJSON)
 		if m.err != nil {
-			m.err = fmt.Errorf("update: %w", m.err)
+			// The pusher reads the error's text (a *auth.MalformedError says
+			// only that the claim is malformed). The decoder's text goes to
+			// the operator's hook-errors file.
+			var bad *auth.MalformedError
+			assertf(errors.As(m.err, &bad), "ParseRefPolicies returned %T, not *auth.MalformedError", m.err)
+			hookErrorsLogger().Error("update: refs claim does not parse", "err", bad.Err)
+			m.err = Refuse(fmt.Errorf("update: %w", m.err)) // the pusher's own token
 		}
 	}
 	if m.err == nil && opsJSON != "" {
 		var ops []string
 		if err := json.Unmarshal([]byte(opsJSON), &ops); err != nil {
-			m.err = fmt.Errorf("update: parse ops claim %q: %w", opsJSON, err)
+			m.err = Refuse(fmt.Errorf("update: parse ops claim %q: %w", opsJSON, err)) // the pusher's own token
 		} else {
 			m.policies = auth.FoldOps(m.policies, ops)
 		}
@@ -2250,7 +2350,7 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 	for _, op := range rule.Ops {
 		switch op {
 		case auth.OpNoPush:
-			return fmt.Errorf("policy no-push denies update to %s", refName)
+			return refusef("policy no-push denies update to %s", refName)
 		case auth.OpNoForcePush:
 			// Rejects any rewind of an existing ref: non-fast-forward
 			// updates AND deletions. docs/reference/authentication.md: ref policies are the
@@ -2261,7 +2361,7 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 			// after pre-receive, before update hooks run.
 			if old != ref.ZeroSHA {
 				if new == ref.ZeroSHA {
-					return fmt.Errorf("policy no-force-push denies deletion of %s", refName)
+					return refusef("policy no-force-push denies deletion of %s", refName)
 				}
 				// Budget-free callers (the reservation classifier) skip
 				// the ancestry subprocess (Codex round-14 security P2: a
@@ -2283,7 +2383,7 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 					continue
 				}
 				if !isAncestor(old, new) {
-					return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", refName)
+					return refusef("policy no-force-push denies non-fast-forward update to %s", refName)
 				}
 			}
 		case auth.OpVerifySig:
@@ -2304,7 +2404,7 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 			}
 		default:
 			// Unknown policy ops fail closed.
-			return fmt.Errorf("unknown policy op %q for %s", op, refName)
+			return refusef("unknown policy op %q for %s", op, refName)
 		}
 	}
 	if needsAncestry {
@@ -2414,16 +2514,31 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 		// registered-but-unimportable PGP key would re-spawn gpg once per
 		// ref at the same tip without charging any budget (Codex round
 		// 15).
-		reason := fmt.Sprintf("signing keyring unusable: %v", err)
+		// The reason reaches the pusher, so it names no cause: the cause
+		// (a gpg diagnostic, a file error) goes to the hook-errors file
+		// now, because later refs, and a non-atomic pre-receive that
+		// passes this push for its other refs, see only the cached
+		// denial.
+		hookErrorsLogger().Error("verify-sig: signing keyring unusable", "err", err)
+		reason := "signing keyring unusable (the server log has the cause)"
 		if cacheErr := state.markCommitDenied(pending[0], reason); cacheErr != nil {
 			return fmt.Errorf("verify-sig: %w", cacheErr)
 		}
-		return fmt.Errorf("verify-sig: %w", err)
+		return verifySigDenied(refName, pending[0], reason)
 	}
 	defer cleanup()
 
 	for _, sha := range pending {
-		reason := v.verifyCommit(ctx, sha)
+		reason, err := v.verifyCommit(ctx, sha)
+		if err != nil {
+			// Not a verdict, so the reason names no signature fault and
+			// no cause: the cause goes to the hook-errors file now. It is
+			// still cached and charged like a denial for the rest of the
+			// push, or a commit whose check cannot finish (git dies on a
+			// malformed signature header) costs one git spawn per ref.
+			hookErrorsLogger().Error("verify-sig: signature check did not finish", "sha", sha, "err", err)
+			reason = "signature check failed (the server log has the cause)"
+		}
 		if reason != "" {
 			if err := state.markCommitDenied(sha, reason); err != nil {
 				return fmt.Errorf("verify-sig: %w", err)
@@ -2444,7 +2559,7 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 // documented log line; the hook runner prints it to stderr, which
 // receive-pack relays to both the client and the server log.
 func verifySigDenied(refName, sha, reason string) error {
-	return fmt.Errorf("verify-sig denied %s at %s: %s", refName, sha, reason)
+	return refusef("verify-sig denied %s at %s: %s", refName, sha, reason)
 }
 
 // introducedPending walks the commits reachable from new but not from old
@@ -2536,7 +2651,7 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		pending = append(pending, line)
 		if budget > 0 && state.spent+len(pending) > budget {
 			abort()
-			return nil, examined, fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces more than %d unverified commits with %d of %d verifications already used (raise OPENSTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
+			return nil, examined, refusef("verify-sig: push exceeds the per-push verification budget: %s introduces more than %d unverified commits with %d of %d verifications already used (raise OPENSTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
 				refName, budget-state.spent, state.spent, budget)
 		}
 	}
@@ -2643,12 +2758,14 @@ func looksLikeSSHPublicKey(line string) bool {
 
 // verifyCommit returns "" when sha carries a valid signature from the
 // materialized keyring, else a short human-readable reason. Delegates to
-// `git verify-commit`, which picks gpg or ssh-keygen by signature type.
-func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason string) {
+// `git verify-commit`, which picks gpg or ssh-keygen by signature type. An
+// error is a check that did not run to a verdict: git did not start, was
+// killed, or failed with a status other than verify-commit's 1.
+func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason string, err error) {
 	if !ref.ValidSHA(sha) {
 		// Callers feed rev-list output; a malformed sha fails closed as a
 		// denial reason instead of crashing receive-pack.
-		return fmt.Sprintf("malformed commit sha %q", sha)
+		return fmt.Sprintf("malformed commit sha %q", sha), nil
 	}
 	logVerifySpawn(sha)
 	cmd := exec.CommandContext(ctx, "git",
@@ -2658,20 +2775,35 @@ func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason stri
 	if v.gnupgHome != "" {
 		cmd.Env = append(cmd.Env, "GNUPGHOME="+v.gnupgHome)
 	}
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return ""
+	// The verifier's reason comes first: keep the head of its output, and
+	// count what a long output drops past it.
+	var out gitlimit.HeadBuffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err = cmd.Run(); err == nil {
+		return "", nil
 	}
-	msg := condenseGitReason(out)
+	msg := condenseGitReason(out.Bytes())
+	if n := out.Dropped(); n > 0 {
+		msg += fmt.Sprintf(" (%d more bytes dropped)", n)
+	}
+	// verify-commit exits 1 for a missing or bad signature. Any other end
+	// (git did not start, was killed, or died with 128) is no verdict.
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 {
+		return "", fmt.Errorf("git verify-commit %s: %w (output: %q)", sha, err, msg)
+	}
 	if msg == "" {
 		// git verify-commit is silent for unsigned commits.
-		msg = "commit is not signed"
+		return "commit is not signed", nil
 	}
-	return msg
+	// The verifier's output can name server paths (the temporary
+	// allowed-signers file) and key diagnostics: the hook-errors file
+	// gets it, the pusher the documented reason.
+	hookErrorsLogger().Error("verify-sig: signature check failed", "sha", sha, "detail", msg)
+	return "no registered key matches the signature (the server log has the verifier's output)", nil
 }
 
 // condenseGitReason squeezes git/gpg/ssh-keygen diagnostics into one short
-// line for the per-ref rejection message.
+// line for the hook-errors record of a rejected commit.
 func condenseGitReason(out []byte) string {
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	var kept []string
@@ -2688,6 +2820,78 @@ func condenseGitReason(out []byte) string {
 		msg = msg[:max] + "..."
 	}
 	return msg
+}
+
+// branchTipVerdicts refuses each command that sets a branch (a ref under
+// refs/heads/) to an object that is not a commit: a blob, a tree or an
+// annotated tag. git refuses to store such a value too, but only after the
+// update hook's compare-and-swap has committed it to the ref store. The
+// store then holds a value that no cache can materialize, every read of the
+// repository fails, and later updates of the branch lose their CAS. Other
+// namespaces take any object, as in git. The kinds of all the new values
+// come from one git child, decided by object type. A failed child fails
+// every candidate closed.
+func branchTipVerdicts(commands []refCommand) []error {
+	verdicts := make([]error, len(commands))
+	var ids []string
+	seen := map[string]bool{}
+	for _, c := range commands {
+		if isBranchTip(c.ref, c.new) && !seen[c.new] {
+			seen[c.new] = true
+			ids = append(ids, c.new)
+		}
+	}
+	if len(ids) == 0 {
+		return verdicts
+	}
+	kinds, err := objectKinds(ids)
+	for i, c := range commands {
+		switch {
+		case !isBranchTip(c.ref, c.new):
+		case err != nil:
+			verdicts[i] = fmt.Errorf("update: read the object type of %s: %w", c.new, err)
+		case kindNames[kinds[c.new]] != "":
+			verdicts[i] = refusef("update: %s must point at a commit, not %s", c.ref, kindNames[kinds[c.new]])
+		}
+	}
+	return verdicts
+}
+
+func isBranchTip(refName, new string) bool {
+	return strings.HasPrefix(refName, "refs/heads/") && new != ref.ZeroSHA
+}
+
+// kindNames is how a refusal names the kinds of object that a branch cannot
+// point at. An object that is missing has no kind to refuse: receive-pack
+// refuses a command whose new value it lacks, before the update hook runs.
+var kindNames = map[string]string{"blob": "a blob", "tree": "a tree", "tag": "an annotated tag"}
+
+// objectKinds returns the type of each id, one of commit, tree, blob, tag or
+// missing, from one git child.
+func objectKinds(ids []string) (map[string]string, error) {
+	var out strings.Builder
+	cmd := exec.Command("git", "cat-file", "--batch-check=%(objecttype)")
+	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != len(ids) {
+		return nil, fmt.Errorf("cat-file --batch-check answered %d lines for %d ids", len(lines), len(ids))
+	}
+	kinds := make(map[string]string, len(ids))
+	for i, l := range lines {
+		switch l {
+		case "commit", "tree", "blob", "tag":
+			kinds[ids[i]] = l
+		case ids[i] + " missing":
+			kinds[ids[i]] = "missing"
+		default:
+			return nil, fmt.Errorf("cat-file --batch-check answered %q for %s", l, ids[i])
+		}
+	}
+	return kinds, nil
 }
 
 // objectExists reports whether sha names an object in the repo git put us

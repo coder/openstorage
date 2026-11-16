@@ -20,7 +20,9 @@ import (
 	"bufio"
 	"context"
 	"crypto"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -95,6 +97,10 @@ var (
 	viewCheckLog string // view-check failures of tagged serve and hook processes ("" in benchmark runs)
 )
 
+// envTestHookErrorRecord makes the test binary's pre-receive hook log one
+// error value through the hook's log handler (TestServeLogsHookErrors).
+const envTestHookErrorRecord = "OPENSTORAGE_TEST_HOOK_ERROR_RECORD"
+
 func TestMain(m *testing.M) {
 	// Hook re-exec dispatch: an in-process httptest server (see
 	// TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger) hydrates cache
@@ -102,6 +108,10 @@ func TestMain(m *testing.M) {
 	// those invocations to the real hook entrypoint instead of the test
 	// runner (mirrors cmd/openstorage's "hook" dispatch).
 	if len(os.Args) > 1 && os.Args[1] == "hook" {
+		if rec := os.Getenv(envTestHookErrorRecord); rec != "" && len(os.Args) > 2 && os.Args[2] == "pre-receive" {
+			slog.New(NewHookLogHandler(os.Stderr, nil)).Error("test hook record path="+os.Getenv(EnvHookErrors),
+				"err", errors.New(rec))
+		}
 		if err := RunHook(context.Background(), os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -710,7 +720,23 @@ func remoteURL(n *testNode, repo, token string) string {
 // git surface, and pg/blob state is keyed by RepoID only). Tests push via
 // the returned RepoID so their storage assertions read the same key;
 // name-style URL resolution is pinned by TestRepoKeySplit_CrossSurface.
-func registerRepo(t *testing.T, url string) string {
+// The stored URL is runUnique(name): a test that needs the URL itself
+// calls registerRepoURL.
+func registerRepo(t *testing.T, name string) string {
+	t.Helper()
+	return registerRepoURL(t, runUnique(name))
+}
+
+// runUnique returns name with a random suffix. The lane stores outlive one
+// test run (go test -count=N reuses them), so a repository name or URL that
+// a test writes to them must differ per run: a fixed one already exists,
+// with the refs of the run before.
+func runUnique(name string) string {
+	return name + "-" + strings.ToLower(rand.Text()[:8])
+}
+
+// registerRepoURL is registerRepo with exactly url as the stored URL.
+func registerRepoURL(t *testing.T, url string) string {
 	t.Helper()
 	repo, err := testMeta.CreateRepo(context.Background(), testOrg, url, "main")
 	if err != nil {
@@ -1241,10 +1267,11 @@ func TestNamespace_EphemeralIsolated(t *testing.T) {
 	}
 }
 
-// docs/explanation/git-protocol-and-namespaces.md `+import` namespace: bulk history round-trips through its own
-// isolated ref space (clone/push/fetch), invisible from the persistent
-// remote.
-func TestNamespace_ImportRoundTrip(t *testing.T) {
+// TestNamespace_ImportPushWritesNormalBranches pins the `+import` remote of
+// code.storage docs/repos/imports: an import push creates normal branches
+// and tags that the persistent remote, a cold clone and the REST branch list
+// all show, and a later import push updates them like any push.
+func TestNamespace_ImportPushWritesNormalBranches(t *testing.T) {
 	repo := registerRepo(t, "t10-import")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
@@ -1253,35 +1280,124 @@ func TestNamespace_ImportRoundTrip(t *testing.T) {
 	mustGit(t, work, "push", remoteURL(nodeA, repo+"+import", token), "HEAD:refs/heads/main", "refs/tags/v1")
 	head := revParse(t, work, "HEAD")
 
-	importOut := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo+"+import", token))
-	if !strings.Contains(importOut, "refs/heads/main") || !strings.Contains(importOut, "refs/tags/v1") {
-		t.Fatalf("import advertisement missing pushed refs:\n%s", importOut)
+	persistent := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
+	if !strings.Contains(persistent, head+"\trefs/heads/main") || !strings.Contains(persistent, "refs/tags/v1") {
+		t.Fatalf("persistent remote missing the imported refs:\n%s", persistent)
 	}
-	if persistent := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token)); strings.Contains(persistent, "refs/heads/main") {
-		t.Fatalf("persistent remote sees import refs:\n%s", persistent)
+	var branches struct {
+		Branches []struct {
+			Name    string `json:"name"`
+			HeadSHA string `json:"head_sha"`
+		} `json:"branches"`
+	}
+	if status := apiGet(t, nodeA, token, "/api/v1/repos/branches", &branches); status != http.StatusOK {
+		t.Fatalf("GET /repos/branches = %d", status)
+	}
+	if len(branches.Branches) != 1 || branches.Branches[0].Name != "main" || branches.Branches[0].HeadSHA != head {
+		t.Fatalf("read API branches = %+v, want main@%s", branches.Branches, head)
 	}
 
-	// Clone the import namespace (fresh replica, cold cache), verify
-	// integrity, extend it, and fetch the extension back in the original
-	// working repo.
+	// A normal clone on a fresh replica (cold cache) gets the import.
 	nodeB := startNodeT(t)
 	cloneDir := filepath.Join(t.TempDir(), "clone")
-	mustGit(t, "", "clone", remoteURL(nodeB, repo+"+import", token), cloneDir)
+	mustGit(t, "", "clone", remoteURL(nodeB, repo, token), cloneDir)
 	if got := revParse(t, cloneDir, "HEAD"); got != head {
-		t.Fatalf("import clone HEAD = %q, want %q", got, head)
+		t.Fatalf("clone HEAD = %q, want %q", got, head)
 	}
 	if out, err := tryGit(cloneDir, "fsck", "--strict"); err != nil {
 		t.Fatalf("git fsck: %v\n%s", err, out)
 	}
+
+	// The import remote advertises the normal refs to a push, so a second
+	// import push fast-forwards main from its real old value.
 	writeFile(t, cloneDir, "bulk.txt", "imported\n")
 	mustGit(t, cloneDir, "add", ".")
 	mustGit(t, cloneDir, "commit", "-m", "bulk")
 	newHead := revParse(t, cloneDir, "HEAD")
 	mustGit(t, cloneDir, "push", remoteURL(nodeB, repo+"+import", token), "HEAD:refs/heads/main")
+	if got := lsRemoteSHA(t, "", remoteURL(nodeA, repo, token), "refs/heads/main"); got != newHead {
+		t.Fatalf("persistent main after the second import push = %q, want %q", got, newHead)
+	}
+}
 
-	mustGit(t, work, "fetch", remoteURL(nodeA, repo+"+import", token), "refs/heads/main")
-	if got := revParse(t, work, "FETCH_HEAD"); got != newHead {
-		t.Fatalf("fetched import main = %q, want %q", got, newHead)
+// TestNamespace_ImportRefusesReads pins the push-only rule of the `+import`
+// remote: clone, fetch and ls-remote fail with upstream's text, which git
+// prints because the body is text/plain. The refusal follows auth and the
+// existence check, so a bad token still gets git's 401 prompt and an
+// unregistered repo still answers 404.
+func TestNamespace_ImportRefusesReads(t *testing.T) {
+	repo := registerRepo(t, "t10-import-read")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	importURL := remoteURL(nodeA, repo+"+import", token)
+	// Upstream's text (code.storage docs/repos/imports, "Caveats"), spelled
+	// out here so that a change to importReadRefusal fails the test.
+	const upstreamText = "reads are disabled for +import remotes; use the repository remote for clone/fetch"
+
+	for _, args := range [][]string{
+		{"clone", importURL, filepath.Join(t.TempDir(), "clone")},
+		{"ls-remote", importURL},
+		{"-C", work, "fetch", importURL, "refs/heads/main"},
+	} {
+		out, err := tryGit("", args...)
+		if err == nil {
+			t.Fatalf("git %s through +import succeeded:\n%s", args[0], out)
+		}
+		if !strings.Contains(out, "remote: "+upstreamText) || !strings.Contains(out, "403") {
+			t.Fatalf("git %s through +import: want the 403 refusal text, got:\n%s", args[0], out)
+		}
+	}
+
+	for _, rpc := range []struct{ method, path string }{
+		{http.MethodGet, "/info/refs?service=git-upload-pack"},
+		{http.MethodPost, "/git-upload-pack"},
+	} {
+		req, err := http.NewRequest(rpc.method, "http://"+nodeA.addr+"/"+repo+"+import.git"+rpc.path, strings.NewReader("0000"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth("t", token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || string(body) != upstreamText+"\n" {
+			t.Fatalf("%s %s = %d %q %q, want 403 text/plain refusal", rpc.method, rpc.path, resp.StatusCode, resp.Header.Get("Content-Type"), body)
+		}
+
+		req, err = http.NewRequest(rpc.method, "http://"+nodeA.addr+"/"+repo+"+import.git"+rpc.path, strings.NewReader("0000"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth("t", "not-a-token")
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s %s with a bad token = %d, want 401", rpc.method, rpc.path, resp.StatusCode)
+		}
+
+		// A token whose claim names the unregistered path verbatim passes
+		// auth; the repo still does not exist.
+		missing := runUnique("t10-import-missing")
+		req, err = http.NewRequest(rpc.method, "http://"+nodeA.addr+"/"+missing+"+import.git"+rpc.path, strings.NewReader("0000"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth("t", mintTestToken(t, missing, "git:read,git:write", ""))
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s %s on an unregistered repo = %d, want 404", rpc.method, rpc.path, resp.StatusCode)
+		}
 	}
 }
 
@@ -1525,7 +1641,7 @@ func TestRepack_PushesFoldToOnePack(t *testing.T) {
 		}
 		t.Cleanup(metadata.Close)
 	}
-	record, err := metadata.CreateRepo(t.Context(), testOrg, "t-repack", "main")
+	record, err := metadata.CreateRepo(t.Context(), testOrg, runUnique("t-repack"), "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1597,8 +1713,8 @@ func TestRepack_PushesFoldToOnePack(t *testing.T) {
 // API; the repo_id-style URL addresses the same repo; unregistered names
 // are 404 on the git surface even for authenticated callers.
 func TestRepoKeySplit_CrossSurface(t *testing.T) {
-	const url = "t-keysplit"
-	repoID := registerRepo(t, url)
+	url := runUnique("t-keysplit")
+	repoID := registerRepoURL(t, url)
 	work := initWorkRepo(t)
 	token := mintTestToken(t, url, "git:read,git:write", "") // claim carries the url
 
@@ -1710,8 +1826,8 @@ func apiJSON(t *testing.T, n *testNode, method, token, path, body string, out an
 // ref-store generation — so it also proves the default-branch change
 // defeats the issue-#4 hydrate short-circuit.
 func TestPatchDefaultBranch_CloneHEADFollows(t *testing.T) {
-	const repoURL = "t18-patch-default"
-	repoID := registerRepo(t, repoURL)
+	repoURL := runUnique("t18-patch-default")
+	repoID := registerRepoURL(t, repoURL)
 	// One URL-claim token works on both surfaces (docs/reference/authentication.md): the git path
 	// resolves the claim against the repo record, and the API accepts
 	// url-style claims directly.

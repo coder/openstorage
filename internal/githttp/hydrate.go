@@ -28,10 +28,11 @@ import (
 )
 
 // A repo URL element is a base repo name optionally followed by one
-// namespace suffix, `+ephemeral` or `+import` (docs/explanation/git-protocol-and-namespaces.md). Namespaced repos
-// use fully separate ref stores, pack spaces, and cache dirs keyed by the
-// full name — docs/explanation/git-protocol-and-namespaces.md allows "git namespaces or separate ref stores", and
-// separate stores give the required isolation for free.
+// namespace suffix, `+ephemeral` or `+import` (docs/explanation/git-protocol-and-namespaces.md). The ephemeral
+// namespace uses a fully separate ref store, pack space, and cache dir keyed
+// by the full name — docs/explanation/git-protocol-and-namespaces.md allows "git namespaces or separate ref stores", and
+// separate stores give the required isolation for free. The push-only
+// `+import` remote keys the base repo (resolveTarget).
 var repoNameRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*(\+(ephemeral|import))?\z`)
 
 // ValidRepoName guards against path traversal via the URL repo element.
@@ -86,19 +87,27 @@ func runGit(dir string, args ...string) (string, error) {
 // not match errors.Is(err, context.DeadlineExceeded), and the repack
 // worker classifies deterministic budget exhaustion by that identity.
 func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) {
+	return runGitLeased(ctx, dir, dir, args...)
+}
+
+// runGitLeased is runGitCtx for a child that holds the lease of the cache
+// repository at leaseDir (gitlimit.LeaseFile). dir is the child's working
+// directory. It is empty for `git init --bare <leaseDir>`, which runs where
+// serve runs.
+func runGitLeased(ctx context.Context, dir, leaseDir string, args ...string) (string, error) {
 	observeGitSpawn(dir, args)
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer // the error below reaches the log
 	cmd.Stderr = &stderr
-	out, err := gitlimit.Output(cmd)
+	out, err := gitlimit.OutputIn(ctx, leaseDir, cmd)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			err = fmt.Errorf("%w: %w", cerr, err)
 		}
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr.String())
 	}
 	return string(out), nil
 }
@@ -399,7 +408,7 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (repoPath st
 		}
 	}()
 	if needsInit {
-		if _, err := runGitCtx(ctx, "", "init", "--bare", "--initial-branch=main", path); err != nil {
+		if _, err := runGitLeased(ctx, "", path, "init", "--bare", "--initial-branch=main", path); err != nil {
 			return "", err
 		}
 	}
@@ -1199,7 +1208,7 @@ func (s *sliceRefSeq) next() (string, string, bool, error) {
 type localRefSeq struct {
 	cmd    *exec.Cmd
 	sc     *bufio.Scanner
-	stderr bytes.Buffer
+	stderr gitlimit.TailBuffer
 	prev   string
 	waited bool
 }
@@ -1215,7 +1224,7 @@ func startLocalRefSeq(ctx context.Context, repoPath string) (*localRefSeq, error
 	if err != nil {
 		return nil, err
 	}
-	if err := gitlimit.Start(l.cmd); err != nil {
+	if err := gitlimit.StartIn(ctx, repoPath, l.cmd); err != nil {
 		return nil, fmt.Errorf("git for-each-ref: %w", err)
 	}
 	l.sc = bufio.NewScanner(stdout)
@@ -1513,8 +1522,10 @@ func updateRefStdin(repoPath, commands string) error {
 	cmd := exec.Command("git", "update-ref", "--stdin")
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(commands)
-	if out, err := gitlimit.CombinedOutput(cmd); err != nil {
-		return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
+	var stderr gitlimit.TailBuffer // update-ref --stdin prints nothing else
+	cmd.Stderr = &stderr
+	if err := gitlimit.RunIn(context.Background(), repoPath, cmd); err != nil {
+		return fmt.Errorf("update-ref --stdin: %w: %s", err, stderr.String())
 	}
 	return nil
 }
@@ -2315,7 +2326,7 @@ func holdSidecarOwner(path string) string {
 // growth, so the budget is enforced against each file's CURRENT size
 // immediately before its bytes are read — zero overshoot by construction,
 // independent of when the growth lands.
-var errPushScanBudget = errors.New("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+var errPushScanBudget = Refuse(errors.New("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push"))
 
 // readFileLimit reads at most limit bytes of path — os.ReadFile with a
 // hard cap for files that can grow under the reader (PR #195 round-11
@@ -2813,6 +2824,28 @@ func pushHoldPendingBytes(dir, exceptPath string, cached map[string]holdFilePars
 // Hold windows are server-controlled and normally millisecond-scale.
 var pushHoldWaitMax = 10 * time.Second
 
+// ErrRefHeld marks a push-hold reservation that gave up after
+// pushHoldWaitMax because a concurrent push or ref write still holds a
+// conflicting ref, or the reservation lock. It is transient: the API
+// answers a ref write that fails with it with 503 and Retry-After.
+var ErrRefHeld = errors.New("a concurrent push or ref write holds the ref")
+
+// refHeldError is such a give-up. It keeps the reservation's own message,
+// which a pushing git client shows, and matches ErrRefHeld.
+type refHeldError struct{ err error }
+
+func (e refHeldError) Error() string   { return e.err.Error() }
+func (e refHeldError) Unwrap() []error { return []error{e.err, ErrRefHeld} }
+
+// heldUnlessCanceled marks a give-up err as ErrRefHeld, unless the
+// caller's own context ended: then nothing waits for an answer.
+func heldUnlessCanceled(parent context.Context, err error) error {
+	if parent.Err() != nil {
+		return err
+	}
+	return refHeldError{err}
+}
+
 // reservePushHolds atomically verifies that no OTHER live push holds any
 // of names or a strict D/F relative of one (covers semantics — see
 // conflicts for why equality is a conflict here), then appends all of
@@ -2877,6 +2910,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 	// the pushes queued behind it, not an unbounded hang.
 	lockPath := dir + ".reserve.lock"
 	deadline := time.Now().Add(pushHoldWaitMax)
+	parent := ctx
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	// One parse cache across the poll iterations (Codex round-10 P2): a
@@ -2888,7 +2922,10 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 		unlock, err := flockExclusiveCtx(ctx, lockPath)
 		if err != nil {
 			if ctx.Err() != nil {
-				return fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", err)
+				// The refusal is outermost: the pusher sees the retry
+				// guidance, and errors.Is still finds ErrRefHeld for the
+				// REST 503.
+				return Refuse(heldUnlessCanceled(parent, fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", ctx.Err())))
 			}
 			return err
 		}
@@ -2915,7 +2952,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 			}
 			if used+pending > maxPushPeerScanBytes {
 				unlock()
-				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+				return refusef("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
 			covered, n, err := peerHoldCovers(dir, holdPath, names[0], maxPushPeerScanBytes-used)
 			if err != nil {
@@ -2960,7 +2997,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 			}
 			if used+pending > maxPushPeerScanBytes {
 				unlock()
-				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+				return refusef("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
 			before := cache.parsedBytes
 			// The in-load budget (round-12 P2): allowance still unspent
@@ -2999,7 +3036,7 @@ func reservePushHoldsCovering(ctx context.Context, holdPath string, names []stri
 		}
 		unlock()
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return fmt.Errorf("a concurrent push holds a ref conflicting with %s (same ref or directory/file relative); retry shortly", conflict)
+			return Refuse(heldUnlessCanceled(parent, fmt.Errorf("a concurrent push holds a ref conflicting with %s (same ref or directory/file relative); retry shortly", conflict)))
 		}
 		select {
 		case <-ctx.Done():
@@ -3706,12 +3743,21 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 // before the caller acts on the stale value.
 var ErrHeldRefStale = errors.New("a push holds a ref whose cached value is older than the authority")
 
-// hydrateRefs is Hydrate. With strictHeld (a local push run's loopback
-// fetch, Server.StrictSyncFetch), a sync that skips a held ref returns
+// hydrateRefs is Hydrate. With strictHeld (a push run's loopback fetch,
+// Server.hydrate), a sync that skips a held ref returns
 // ErrHeldRefStale, and a held-skip verdict never short-cuts the sync.
 // Hold and marker handling is the same in both modes.
 func hydrateRefs(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string, strictHeld bool) (repoPath string, refsErr error, err error) {
 	headTarget := HeadTarget(defaultBranch)
+	if hiddenOnRemote(repo, headTarget) {
+		// git advertises HEAD and its symref whatever HEAD points at, so a
+		// HEAD on a ref that the persistent remote hides (an earlier
+		// version, an older replica or a sync could store such a default)
+		// would show that ref's name and commit. Point it at the same name
+		// under refs/heads/ instead, which normally does not exist: the
+		// remote then advertises no HEAD.
+		headTarget = "refs/heads/" + headTarget
+	}
 	repoPath, err = EnsureCacheRepoCtx(ctx, cacheDir, repo)
 	if err != nil {
 		return "", nil, err

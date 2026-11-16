@@ -40,7 +40,9 @@ func OpenFile(blobURL string) (*File, error) {
 	assertf(blobURL != "", "OpenFile: empty blob URL")
 	u, err := url.Parse(blobURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse blob URL: %w", err)
+		// Not err: url.Parse's error quotes the URL, password included,
+		// and its reason can quote part of it.
+		return nil, errors.New("parse blob URL: malformed URL (not shown: it can hold a password)")
 	}
 	if u.Scheme != fileblob.Scheme {
 		return nil, fmt.Errorf("blob URL scheme %q unsupported (want file)", u.Scheme)

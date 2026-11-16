@@ -18,6 +18,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -490,6 +491,178 @@ func TestCommitPack(t *testing.T) {
 	})
 }
 
+// TestCommitPackModeAliases pins #806 (spec 5d8e1801): commit-pack stores
+// the permission-style modes that upstream normalizes as a regular file or
+// an executable, and still refuses every other mode.
+func TestCommitPackModeAliases(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+
+		stored := map[string]string{
+			"644": "100644", "100664": "100644", "100644": "100644",
+			"755": "100755", "100775": "100755", "100755": "100755",
+		}
+		var files []map[string]any
+		var chunks []any
+		for mode := range stored {
+			files = append(files, map[string]any{"path": "m" + mode, "content_id": "id-" + mode, "operation": "upsert", "mode": mode})
+			chunks = append(chunks, wctChunk("id-"+mode, []byte(mode+"\n"), true))
+		}
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok,
+			bytes.NewReader(wctLines(t, append([]any{wctMeta("main", "modes", files, nil)}, chunks...)...)))
+		wctRequireOK(t, resp, body)
+		var listing listFilesResponse
+		wctReadJSON(t, e, "/api/v1/repos/files?ref=main", readTok, &listing)
+		got := map[string]string{}
+		for _, entry := range listing.Entries {
+			got[strings.TrimPrefix(entry.Path, "m")] = entry.Mode
+		}
+		if !maps.Equal(got, stored) {
+			t.Fatalf("stored modes = %v, want %v", got, stored)
+		}
+
+		for _, mode := range []string{"600", "664", "775", "777", "100600", "100700", "0644", "0100644", "1006440", "64", "100", "040000", "abc", " 644", "644 "} {
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+				wctMeta("main", "bad mode", []map[string]any{{"path": "bad", "content_id": "id1", "operation": "upsert", "mode": mode}}, nil),
+				wctChunk("id1", []byte("x\n"), true))))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `invalid mode \"`+mode+`\" for \"bad\"`) {
+				t.Errorf("mode %q: status %d body %s, want 400 invalid mode", mode, resp.StatusCode, body)
+			}
+		}
+
+		// A delete ignores its mode, as before.
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "delete with a mode", []map[string]any{{"path": "m644", "content_id": "id-del", "operation": "delete", "mode": "600"}}, nil))))
+		wctRequireOK(t, resp, body)
+	})
+}
+
+// TestCommitPackFileDefaults pins FileOperation rules of the spec: an entry
+// without operation is an upsert, a delete needs no content_id, and a
+// delete may send one empty final chunk, as the spec's request example does.
+func TestCommitPackFileDefaults(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+		ls := func(t *testing.T) map[string]string {
+			t.Helper()
+			var listing listFilesResponse
+			wctReadJSON(t, e, "/api/v1/repos/files?ref=main", readTok, &listing)
+			got := map[string]string{}
+			for _, entry := range listing.Entries {
+				got[entry.Path] = entry.Mode
+			}
+			return got
+		}
+
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "no operation", []map[string]any{
+				{"path": "a.txt", "content_id": "id-a"},
+				{"path": "b.txt", "content_id": "id-b", "operation": ""},
+			}, nil),
+			wctChunk("id-a", []byte("a\n"), true),
+			wctChunk("id-b", []byte("b\n"), true))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); !maps.Equal(got, map[string]string{"a.txt": "100644", "b.txt": "100644"}) {
+			t.Fatalf("files = %v, want a.txt and b.txt as 100644", got)
+		}
+
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "delete without content_id", []map[string]any{
+				{"path": "a.txt", "operation": "delete"},
+				{"path": "b.txt", "content_id": "", "operation": "delete"},
+			}, nil))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); len(got) != 0 {
+			t.Fatalf("files = %v, want none after the deletes", got)
+		}
+
+		for name, files := range map[string][]map[string]any{
+			"upsert without content_id":  {{"path": "c.txt"}},
+			"explicit upsert without id": {{"path": "c.txt", "operation": "upsert"}},
+		} {
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, wctMeta("main", "m", files, nil))))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `missing content_id for \"c.txt\"`) {
+				t.Errorf("%s: status %d body %s, want 400 missing content_id", name, resp.StatusCode, body)
+			}
+		}
+		// The spec's request example: one empty final chunk for a delete.
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "spec example", []map[string]any{
+				{"path": "f.txt", "content_id": "id-f", "operation": "upsert"},
+			}, nil),
+			wctChunk("id-f", []byte("f\n"), true))))
+		wctRequireOK(t, resp, body)
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "spec example", []map[string]any{
+				{"path": "g.txt", "content_id": "blob-1", "operation": "upsert", "mode": "100644"},
+				{"path": "f.txt", "content_id": "blob-2", "operation": "delete"},
+			}, nil),
+			wctChunk("blob-1", []byte("g\n"), true),
+			wctChunk("blob-2", nil, true))))
+		wctRequireOK(t, resp, body)
+		if got := ls(t); !maps.Equal(got, map[string]string{"g.txt": "100644"}) {
+			t.Fatalf("files = %v, want only g.txt", got)
+		}
+		for name, chunks := range map[string][]any{
+			"two empty chunks":    {wctChunk("del", nil, true), wctChunk("del", nil, true)},
+			"empty chunk, no eof": {wctChunk("del", nil, false)},
+			"chunk with data":     {wctChunk("del", []byte("x"), true)},
+		} {
+			frames := append([]any{wctMeta("main", "m", []map[string]any{{"path": "g.txt", "content_id": "del", "operation": "delete"}}, nil)}, chunks...)
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, frames...)))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "unknown or non-upsert content_id del") {
+				t.Errorf("%s: status %d body %s, want 400 unknown or non-upsert", name, resp.StatusCode, body)
+			}
+		}
+		// The empty chunk must not cut into an upsert's stream, and a delete
+		// without content_id gets no chunk at all.
+		for name, frames := range map[string][]any{
+			"empty delete chunk mid-upsert": {
+				wctMeta("main", "m", []map[string]any{
+					{"path": "h.txt", "content_id": "up", "operation": "upsert"},
+					{"path": "g.txt", "content_id": "del", "operation": "delete"},
+				}, nil),
+				wctChunk("up", []byte("h"), false), wctChunk("del", nil, true), wctChunk("up", []byte("\n"), true),
+			},
+			"empty chunk for a delete without content_id": {
+				wctMeta("main", "m", []map[string]any{{"path": "g.txt", "operation": "delete"}}, nil),
+				wctChunk("", nil, true),
+			},
+		} {
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t, frames...)))
+			if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "unknown or non-upsert content_id") {
+				t.Errorf("%s: status %d body %s, want 400 unknown or non-upsert", name, resp.StatusCode, body)
+			}
+		}
+		// An unknown operation is reported as such, also without content_id.
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{{"path": "g.txt", "operation": "remove"}}, nil))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `invalid operation \"remove\" for \"g.txt\"`) {
+			t.Errorf("unknown operation: status %d body %s, want 400 invalid operation", resp.StatusCode, body)
+		}
+
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{
+				{"path": "d.txt", "content_id": "same", "operation": "upsert"},
+				{"path": "e.txt", "content_id": "same", "operation": "delete"},
+			}, nil),
+			wctChunk("same", []byte("d\n"), true))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `duplicate content_id \"same\"`) {
+			t.Errorf("shared content_id: status %d body %s, want 400 duplicate content_id", resp.StatusCode, body)
+		}
+		resp, body = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(wctLines(t,
+			wctMeta("main", "m", []map[string]any{
+				{"path": "g.txt", "content_id": "twice", "operation": "delete"},
+				{"path": "h.txt", "content_id": "twice", "operation": "delete"},
+			}, nil))))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), `duplicate content_id \"twice\"`) {
+			t.Errorf("content_id shared by two deletes: status %d body %s, want 400 duplicate content_id", resp.StatusCode, body)
+		}
+	})
+}
+
 func TestCommitPackValidation(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := wctServer(t, e)
@@ -507,6 +680,12 @@ func TestCommitPackValidation(t *testing.T) {
 			{"refs-prefixed target branch",
 				[]any{wctMeta("refs/heads/main", "m", nil, nil)},
 				http.StatusBadRequest, "refs/ prefix"},
+			{"ephemeral HEAD target branch",
+				[]any{wctMeta("HEAD", "m", nil, map[string]any{"target_is_ephemeral": true})},
+				http.StatusBadRequest, "invalid target_branch"},
+			{"ephemeral HEAD target branch, deprecated flag",
+				[]any{wctMeta("HEAD", "m", nil, map[string]any{"ephemeral": true})},
+				http.StatusBadRequest, "invalid target_branch"},
 			{"missing commit message",
 				[]any{wctMeta("main", "", nil, nil)},
 				http.StatusBadRequest, "commit_message"},
@@ -600,6 +779,17 @@ func TestCommitPackValidation(t *testing.T) {
 			})
 		}
 
+		t.Run("persistent HEAD target allowed", func(t *testing.T) {
+			// Only an ephemeral target named HEAD is refused.
+			frames := wctLines(t,
+				wctMeta("HEAD", "m", []map[string]any{upsert("a", "id1")}, nil),
+				wctChunk("id1", []byte("x"), true))
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(frames))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d body %s, want 200", resp.StatusCode, body)
+			}
+		})
+
 		t.Run("oversize decoded chunk", func(t *testing.T) {
 			frames := wctLines(t,
 				wctMeta("main", "m", []map[string]any{upsert("a", "id1")}, nil),
@@ -646,6 +836,121 @@ func TestCommitPackValidation(t *testing.T) {
 	})
 }
 
+// TestCommitWriteRefusesANULInTextFields: git takes the commit message as an
+// argument and each ident as an environment value, and neither can hold a
+// NUL. A request with a NUL in one of them passed the validation and
+// answered 500 when git ran, after the files or the patch were applied.
+// Each route that writes a commit answers 400 and moves no ref.
+func TestCommitWriteRefusesANULInTextFields(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, readTok := wctRepo(t, e)
+
+		commitFile := func(msg, path, expected string) wcEnvelope {
+			t.Helper()
+			extra := map[string]any{}
+			if expected != "" {
+				extra["expected_head_sha"] = expected
+			}
+			frames := wctLines(t,
+				wctMeta("main", msg, []map[string]any{{"path": path, "content_id": "id-" + path, "operation": "upsert"}}, extra),
+				wctChunk("id-"+path, []byte(path+"\n"), true))
+			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(frames))
+			return wctRequireOK(t, resp, body)
+		}
+		c1 := commitFile("c1", "f1.txt", "")
+		c2 := commitFile("c2", "f2.txt", c1.Commit.CommitSHA)
+		const patch = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+x\n"
+
+		// metadata builds the metadata object of a request.
+		metadata := func(message string, extra map[string]any) map[string]any {
+			return wctMeta("main", message, nil, extra)["metadata"].(map[string]any)
+		}
+		routes := []struct {
+			name string
+			body func(md map[string]any) []byte
+		}{
+			{"commit-pack", func(md map[string]any) []byte {
+				md["files"] = []map[string]any{{"path": "new.txt", "content_id": "id1", "operation": "upsert"}}
+				return wctLines(t, map[string]any{"metadata": md}, wctChunk("id1", []byte("x\n"), true))
+			}},
+			{"diff-commit", func(md map[string]any) []byte {
+				return wctLines(t, map[string]any{"metadata": md}, wctDiffChunk([]byte(patch), true))
+			}},
+			{"restore-commit", func(md map[string]any) []byte {
+				md["target_commit_sha"] = c1.Commit.CommitSHA
+				raw, err := json.Marshal(map[string]any{"metadata": md})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return raw
+			}},
+		}
+		ident := func(name, email string) map[string]any { return map[string]any{"name": name, "email": email} }
+		fields := []struct {
+			name, message string
+			extra         map[string]any
+		}{
+			{"commit_message", "m\x00x", nil},
+			{"author.name", "m", map[string]any{"author": ident("a\x00b", "a@x.invalid")}},
+			{"author.email", "m", map[string]any{"author": ident("a", "a\x00@x.invalid")}},
+			{"committer.name", "m", map[string]any{"committer": ident("c\x00", "c@x.invalid")}},
+			{"committer.email", "m", map[string]any{"committer": ident("c", "c@x.invalid\x00")}},
+		}
+		for _, rt := range routes {
+			for _, f := range fields {
+				t.Run(rt.name+"/"+f.name, func(t *testing.T) {
+					body := rt.body(metadata(f.message, f.extra))
+					resp, respBody := wctPost(t, srv, "/api/v1/repos/"+rt.name, writeTok, bytes.NewReader(body))
+					wctRequireFail(t, resp, respBody, http.StatusBadRequest, "invalid")
+					if want := invalidTextMsg(f.name); !bytes.Contains(respBody, []byte(want)) {
+						t.Errorf("body %s does not say %q", respBody, want)
+					}
+					if tip := wctBranchTip(t, e, readTok, "main", false); tip != c2.Commit.CommitSHA {
+						t.Errorf("tip = %q after a refused request, want %q", tip, c2.Commit.CommitSHA)
+					}
+				})
+			}
+		}
+
+		// The default message of a restore names the target. A NUL in the
+		// target is a problem of the target, which is checked after the
+		// metadata, and not of a commit_message the request never sent.
+		restoreTarget := func(t *testing.T, target map[string]any) (*http.Response, []byte) {
+			t.Helper()
+			md := map[string]any{"target_branch": "main", "author": wctAuthor}
+			maps.Copy(md, target)
+			raw, err := json.Marshal(map[string]any{"metadata": md})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return wctPost(t, srv, "/api/v1/repos/restore-commit", writeTok, bytes.NewReader(raw))
+		}
+		t.Run("restore-commit/a NUL in base_ref without a message", func(t *testing.T) {
+			resp, body := restoreTarget(t, map[string]any{"base_ref": "x\x00"})
+			if resp.StatusCode != http.StatusNotFound || !bytes.Contains(body, []byte(`"code":"ref_not_found"`)) {
+				t.Errorf("status = %d, body %s, want 404 ref_not_found", resp.StatusCode, body)
+			}
+		})
+		t.Run("restore-commit/a valid base_ref without a message names the target", func(t *testing.T) {
+			resp, body := restoreTarget(t, map[string]any{"base_ref": c1.Commit.CommitSHA})
+			wctRequireOK(t, resp, body)
+			var commits listCommitsResponse
+			wctReadJSON(t, e, "/api/v1/repos/commits?branch=main&limit=1", readTok, &commits)
+			if got, want := commits.Commits[0].Message, "Restore to "+c1.Commit.CommitSHA; got != want {
+				t.Errorf("restore message = %q, want %q", got, want)
+			}
+		})
+		t.Run("restore-commit/a NUL in target_commit_sha without a message", func(t *testing.T) {
+			resp, body := restoreTarget(t, map[string]any{"target_commit_sha": c1.Commit.CommitSHA[:39] + "\x00"})
+			wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid")
+			if want := "base_ref is required (or the deprecated 40-hex target_commit_sha)"; !bytes.Contains(body, []byte(want)) {
+				t.Errorf("body %s does not say %q", body, want)
+			}
+		})
+	})
+}
+
 // TestCommitPackTotalSizeLimit (#597, spec 2026-10-28): commit-pack answers
 // 413 payload_too_large once the decoded file contents of one commit pass
 // 262144000 bytes, summed over every chunk of every file, and moves no ref.
@@ -688,6 +993,46 @@ func TestCommitPackTotalSizeLimit(t *testing.T) {
 			t.Fatalf("tip = %q, want %q", tip, c1.Commit.CommitSHA)
 		}
 	})
+}
+
+// TestFirstCommitZeroGuard pins spec 5d8e1801: 40 zeros as
+// expected_target_sha creates the first commit of an empty repository
+// without base_branch, on commit-pack and diff-commit. Once the branch
+// exists, the same guard fails with its tip.
+func TestFirstCommitZeroGuard(t *testing.T) {
+	patch := "diff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+a\n"
+	for _, tc := range []struct {
+		route   string
+		files   []map[string]any
+		content any
+	}{
+		{"commit-pack", []map[string]any{{"path": "a.txt", "content_id": "id-a", "operation": "upsert"}}, wctChunk("id-a", []byte("a\n"), true)},
+		{"diff-commit", nil, wctDiffChunk([]byte(patch), true)},
+	} {
+		t.Run(tc.route, func(t *testing.T) {
+			runBackends(t, func(t *testing.T, e *testEnv) {
+				srv := wctServer(t, e)
+				_, writeTok, readTok := wctRepo(t, e)
+				post := func() (*http.Response, []byte) {
+					t.Helper()
+					body := wctLines(t, wctMeta("main", "first", tc.files, map[string]any{"expected_target_sha": ref.ZeroSHA}), tc.content)
+					return wctPost(t, srv, "/api/v1/repos/"+tc.route, writeTok, bytes.NewReader(body))
+				}
+				resp, raw := post()
+				env := wctRequireOK(t, resp, raw)
+				if env.Result.OldSHA != ref.ZeroSHA {
+					t.Fatalf("old_sha = %q, want 40 zeros", env.Result.OldSHA)
+				}
+				var commits listCommitsResponse
+				wctReadJSON(t, e, "/api/v1/repos/commits?branch=main&limit=10", readTok, &commits)
+				if len(commits.Commits) != 1 || commits.Commits[0].SHA != env.Commit.CommitSHA || len(commits.Commits[0].ParentSHAs) != 0 {
+					t.Fatalf("main history = %+v, want the one root commit %s", commits.Commits, env.Commit.CommitSHA)
+				}
+				resp, raw = post()
+				assertCommitRefGuard(t, resp.StatusCode, raw, "main", env.Commit.CommitSHA, env.Commit.CommitSHA)
+			})
+		})
+	}
 }
 
 // TestCommitPackCASRace loses the publish-time CAS deterministically: the
@@ -1351,6 +1696,44 @@ func wctFakeGit(t *testing.T, repoPath string) (sc *wcScratch, patch string, set
 	}
 }
 
+// gitFailsOnArgStderr is what gitFailsOnArg's git prints: a server-side
+// read error, which no response may echo.
+const gitFailsOnArgStderr = "fatal: unable to read 1111111111111111111111111111111111111111"
+
+// gitFailsOnArg puts a git first on PATH that runs the real git, except
+// that a call with the argument arg prints gitFailsOnArgStderr and fails:
+// how is an exit status, or "kill" for a git that dies of SIGKILL.
+func gitFailsOnArg(t *testing.T, arg, how string) {
+	t.Helper()
+	gitFailsOnArgWith(t, arg, how, gitFailsOnArgStderr)
+}
+
+// gitFailsOnArgWith is gitFailsOnArg with stderr as git's message.
+func gitFailsOnArgWith(t *testing.T, arg, how, stderr string) {
+	t.Helper()
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	argFile := filepath.Join(bin, "arg")
+	if err := os.WriteFile(argFile, []byte(arg+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fail := "exit " + how
+	if how == "kill" {
+		fail = "kill -KILL $$"
+	}
+	// read, [ and kill are shell builtins: the server runs some git
+	// children with an environment that has no PATH.
+	fail = "echo '" + strings.ReplaceAll(stderr, "'", `'\''`) + "' >&2; " + fail
+	script := fmt.Sprintf("#!/bin/sh\nread -r fail < %q\nfor a in \"$@\"; do [ \"$a\" = \"$fail\" ] && { %s; }; done\nexec %q \"$@\"\n", argFile, fail, real)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // TestApplyPatchServerFailure: git's stderr that names the server's scratch
 // directory or the cached repository, or that has a fatal line, is a failure
 // of the server's git whatever other lines it holds, and the same lines
@@ -1801,6 +2184,10 @@ func TestRestoreCommit(t *testing.T) {
 			if commits.Commits[0].ParentSHAs[0] != c3.Commit.CommitSHA {
 				t.Errorf("restore parent = %v, want c3", commits.Commits[0].ParentSHAs)
 			}
+			// No commit_message: the message names the target.
+			if got, want := commits.Commits[0].Message, "Restore to "+c1.Commit.CommitSHA; got != want {
+				t.Errorf("restore message = %q, want %q", got, want)
+			}
 		})
 
 		t.Run("stale guard is 409 ref_guard_failed", func(t *testing.T) {
@@ -1824,6 +2211,40 @@ func TestRestoreCommit(t *testing.T) {
 				"author":            wctAuthor,
 			})
 			wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
+		})
+
+		// Only git's exit 1 says that the target names no commit, and
+		// only when the target is no commit: for c1, which exists, a
+		// failed peel is the repository's failure.
+		for _, how := range []string{"1", "128", "kill"} {
+			t.Run("git "+how+" on the target is 500, not 404", func(t *testing.T) {
+				gitFailsOnArg(t, c1.Commit.CommitSHA+"^{commit}^{tree}", how)
+				resp, body := restore(map[string]any{
+					"target_branch":     "main",
+					"target_commit_sha": c1.Commit.CommitSHA,
+					"author":            wctAuthor,
+				})
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("status = %d, want 500 (body %s)", resp.StatusCode, body)
+				}
+			})
+		}
+
+		// target_commit_sha names a commit: a tree or blob id that git
+		// can peel to a tree must not be restored.
+		t.Run("a tree or blob as target is 404", func(t *testing.T) {
+			tip := wctBranchTip(t, e, readTok, "main", false)
+			for _, id := range []string{c1.Commit.TreeSHA, fmt.Sprintf("%x", sha1.Sum([]byte("blob 4\x00one\n")))} {
+				resp, body := restore(map[string]any{
+					"target_branch":     "main",
+					"target_commit_sha": id,
+					"author":            wctAuthor,
+				})
+				wctRequireFail(t, resp, body, http.StatusNotFound, "not_found")
+			}
+			if got := wctBranchTip(t, e, readTok, "main", false); got != tip {
+				t.Fatalf("main moved to %q, want %q", got, tip)
+			}
 		})
 
 		t.Run("unborn branch is 404", func(t *testing.T) {
@@ -1908,6 +2329,8 @@ func TestWriteCommitRefPolicies(t *testing.T) {
 			tok := mint(`["not-a-tuple"]`, nil)
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", tok, bytes.NewReader(commitBody("main", nil)))
 			wctRequireFail(t, resp, body, http.StatusForbidden, "forbidden")
+			// Issue #841: the answer is the fixed text, never the decoder's.
+			tcdRequireFixed(t, "commit-pack", body, "malformed refs claim")
 		})
 
 		t.Run("restore-commit honors policies", func(t *testing.T) {

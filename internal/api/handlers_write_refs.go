@@ -78,8 +78,8 @@ func wrefDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		writeErr(w, http.StatusBadRequest, "missing request body")
 		return false
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(body, dst); err != nil {
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -98,8 +98,8 @@ func wrefDecodeOptionalBody(w http.ResponseWriter, r *http.Request, dst any) boo
 	if len(body) == 0 {
 		return true
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(body, dst); err != nil {
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -149,11 +149,28 @@ func wrefRefName(branch string, ephemeral bool) string {
 	return "refs/heads/" + branch
 }
 
+// wrefEphemeralHEAD reports a write target named HEAD in the ephemeral
+// namespace. auth.EphemeralRefName keeps a bare HEAD as it is (the policy
+// shorthand rule), so such a write would store
+// refs/namespaces/ephemeral/HEAD, outside the refs/heads/ prefix that the
+// ephemeral branch list and GET branch read: it answered 200, and the
+// branch never showed up. The write paths refuse it instead. Reads and
+// deletes still reach a ref that an older version stored there.
+func wrefEphemeralHEAD(name string, ephemeral bool) bool {
+	return ephemeral && name == "HEAD"
+}
+
 // wrefValidBranchInput validates a request branch/tag name (docs/reference/http-api.md: bare
 // name, never refs/-prefixed) with the same conservative rules as the
 // default-branch validator.
 func wrefValidBranchInput(name string) bool {
 	return !strings.HasPrefix(name, "refs/") && validBranchName(name)
+}
+
+// wrefValidNewBranchInput is wrefValidBranchInput for a name that the
+// request writes (validNewBranchName). Deletes keep wrefValidBranchInput.
+func wrefValidNewBranchInput(name string) bool {
+	return !strings.HasPrefix(name, "refs/") && validNewBranchName(name)
 }
 
 // wrefPolicyCheck evaluates the token's ref policies (docs/reference/authentication.md, invariant 5)
@@ -229,11 +246,11 @@ func wrefGit(ctx context.Context, repoPath string, extraEnv []string, stdin io.R
 	cmd.Env = append(cmd.Env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdin = stdin
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
-	out, err := gitlimit.Output(cmd)
+	out, err := gitlimit.OutputIn(ctx, repoPath, cmd)
 	if err != nil {
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return string(out), fmt.Errorf("%s: %w: %s", gitlimit.Name(args), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
 }
@@ -249,6 +266,21 @@ func (s *server) wrefListRefs(w http.ResponseWriter, r *http.Request, repoID str
 	return refs, true
 }
 
+// wrefTip point-reads the stored tip of refName, or ref.ZeroSHA when the
+// ref does not exist.
+func (s *server) wrefTip(w http.ResponseWriter, r *http.Request, repoID, refName string) (string, bool) {
+	tip, err := s.refStore.GetRef(r.Context(), repoID, refName)
+	switch {
+	case errors.Is(err, ref.ErrNotFound):
+		return ref.ZeroSHA, true
+	case err != nil:
+		s.internalErr(w, r, "read target ref", err)
+		return "", false
+	}
+	assertf(ref.ValidSHA(tip) && tip != ref.ZeroSHA, "wrefTip: stored tip %q of %s", tip, refName)
+	return tip, true
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/v1/repos/branches/create (git:write)
 
@@ -262,8 +294,13 @@ type wrefCreateBranchRequest struct {
 	// stay subject to the no-force-push ref-policy op (real ancestry check).
 	Force bool `json:"force"`
 	// PreferredBase is the fallback base: used when no base_ref/base_branch
-	// is given, or when the primary base does not resolve.
+	// is given, or when the primary base names no ref. A primary base
+	// whose commit git cannot read is a 500, not a reason to fall back.
 	PreferredBase string `json:"preferred_base"`
+	// ExpectedTargetSHA guards the target tip (spec 5d8e1801, #803): 40
+	// zeros requires a missing branch, a full sha its current tip, and ""
+	// sets no guard. A failed guard changes nothing, even with force.
+	ExpectedTargetSHA string `json:"expected_target_sha"`
 }
 
 func (req *wrefCreateBranchRequest) UnmarshalJSON(data []byte) error {
@@ -281,6 +318,14 @@ func (req *wrefCreateBranchRequest) UnmarshalJSON(data []byte) error {
 	return dec.Decode((*request)(req))
 }
 
+// wrefFailTargetGuard answers a failed branches/create expected_target_sha
+// with 409 ref_guard_failed; current is the target tip, or 40 zeros.
+func wrefFailTargetGuard(w http.ResponseWriter, guard, current string) {
+	assertf(guard != current, "wrefFailTargetGuard: guard %s holds", guard)
+	writeRefGuardFailed(w, "expected_target_sha", current,
+		fmt.Sprintf("expected_target_sha %s does not match current tip %s", guard, current))
+}
+
 type wrefCreateBranchResponse struct {
 	Message           string `json:"message"`
 	TargetBranch      string `json:"target_branch"`
@@ -288,13 +333,66 @@ type wrefCreateBranchResponse struct {
 	CommitSHA         string `json:"commit_sha"`
 }
 
+func wrefCreateBranchOK(w http.ResponseWriter, message, branch string, ephemeral bool, sha string) {
+	writeJSON(w, http.StatusOK, wrefCreateBranchResponse{
+		Message:           message,
+		TargetBranch:      branch,
+		TargetIsEphemeral: ephemeral,
+		CommitSHA:         sha,
+	})
+}
+
+// wrefValidateCreateBranch checks the body of branches/create and names
+// every invalid field, in the order of the docs table (bodyErrors): the
+// target, the base, force, and the guard. It returns the target name (""
+// for an allocated one), whether the server allocates the name, and the
+// guard in lower case. Only an omitted target_branch asks for an
+// allocated name, so force and a guard other than 40 zeros are wrong
+// only then: a target that is named but invalid leaves them alone.
+// Whatever needs the repository (the tip, the base ref) runs after this.
+func wrefValidateCreateBranch(req *wrefCreateBranchRequest) (target string, allocate bool, guard string, err error) {
+	assertf(req != nil, "wrefValidateCreateBranch: nil request")
+	var errs bodyErrors
+	// Only omission requests allocation; explicit empty/null targets stay invalid.
+	allocate = req.TargetBranch == nil
+	if !allocate {
+		switch {
+		case json.Unmarshal(req.TargetBranch, &target) != nil || !wrefValidNewBranchInput(target):
+			errs.add(newFieldError("target_branch", "must be a valid branch name", "invalid target_branch"))
+		case wrefEphemeralHEAD(target, req.TargetIsEphemeral):
+			errs.add(newFieldError("target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch"))
+		}
+	}
+	// These two rules name no field: each adds its message only.
+	if wrefAliasField(req.BaseRef, req.BaseBranch) == "" && req.PreferredBase == "" {
+		errs.add(errors.New("base_ref, base_branch, or preferred_base is required"))
+	}
+	if allocate && req.Force {
+		errs.add(errors.New("force requires target_branch"))
+	}
+	guard = lowerFullSHA(req.ExpectedTargetSHA)
+	switch {
+	case guard != "" && !ref.ValidSHA(guard):
+		errs.add(newFieldError("expected_target_sha", "must be a full commit SHA", "invalid expected_target_sha"))
+	// An allocated name is always new, so only the zero guard can hold.
+	case allocate && guard != "" && guard != ref.ZeroSHA:
+		errs.add(newFieldError("expected_target_sha", "requires target_branch unless it is 40 zeros",
+			"expected_target_sha requires target_branch"))
+	}
+	return target, allocate, guard, errs.err()
+}
+
 // handleCreateBranch resolves the base to a commit (branch, tag — peeled —
 // or hex sha via gitread.ResolveRef; preferred_base is the fallback when
-// the primary base is absent or unresolvable), policy-checks the new ref,
+// the primary base is absent or names no ref, and a base whose commit git
+// cannot read is a 500, with no fallback), policy-checks the new ref,
 // and CAS creates it. With force, an existing target is CAS-recreated at
 // the base — no-force-push policies still deny non-fast-forward moves via a
-// real ancestry check. No new objects are created, so there is nothing to
-// publish.
+// real ancestry check. expected_target_sha set to the current tip moves
+// an existing target too, without force only as a fast-forward (412
+// otherwise). A failed expected_target_sha answers 409 ref_guard_failed and
+// leaves the target alone, with or without force. No new objects are
+// created, so there is nothing to publish.
 func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -304,24 +402,28 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	if !wrefDecodeBody(w, r, &req) {
 		return
 	}
-	// Only omission requests allocation; explicit empty/null targets stay invalid.
-	allocate := req.TargetBranch == nil
-	var targetBranch string
-	if !allocate && (json.Unmarshal(req.TargetBranch, &targetBranch) != nil || !wrefValidBranchInput(targetBranch)) {
-		writeInvalidField(w, "target_branch", "must be a valid branch name", "invalid target_branch")
-		return
-	}
-	if allocate && req.Force {
-		writeErr(w, http.StatusBadRequest, "force requires target_branch")
+	targetBranch, allocate, guard, err := wrefValidateCreateBranch(&req)
+	if err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	base := req.BaseRef
 	if base == "" {
 		base = req.BaseBranch
 	}
-	if base == "" && req.PreferredBase == "" {
-		writeErr(w, http.StatusBadRequest, "base_ref, base_branch, or preferred_base is required")
-		return
+	// A named target's tip is read before materializing, so the read repo
+	// holds its objects for the fast-forward and policy checks. An
+	// allocated name is new by construction: the zero CAS is its guard.
+	current := ref.ZeroSHA
+	if !allocate && (req.Force || guard != "") {
+		var ok bool
+		if current, ok = s.wrefTip(w, r, repo.RepoID, wrefRefName(targetBranch, req.TargetIsEphemeral)); !ok {
+			return
+		}
+		if guard != "" && guard != current {
+			wrefFailTargetGuard(w, guard, current)
+			return
+		}
 	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
@@ -333,7 +435,8 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		sha, err := gitread.ResolveRef(ctx, repoPath, base, req.BaseIsEphemeral)
 		switch {
 		case errors.Is(err, gitread.ErrNotFound):
-			// Fall through to preferred_base below (when given).
+			// Fall through to preferred_base below (when given). An
+			// unreadable base is an error below, never a fallback.
 		case err != nil:
 			s.internalErr(w, r, "resolve base ref", err)
 			return
@@ -364,19 +467,24 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	for range attempts {
 		if allocate {
 			targetBranch = rand.Text()
-			assertf(wrefValidBranchInput(targetBranch), "invalid allocated branch name %q", targetBranch)
+			assertf(wrefValidNewBranchInput(targetBranch), "invalid allocated branch name %q", targetBranch)
 		}
 		targetRef := wrefRefName(targetBranch, req.TargetIsEphemeral)
-		// The CAS precondition: zero for plain create, the current tip when
-		// force re-creates an existing branch.
-		oldSHA := ref.ZeroSHA
-		if req.Force {
-			refs, ok := s.wrefListRefs(w, r, repo.RepoID)
-			if !ok {
+		// The CAS precondition: zero for plain create, the tip read above
+		// when force re-creates an existing branch or a guard moves it.
+		oldSHA := current
+		// Without force, a guarded move only fast-forwards (upstream's 412
+		// for "a branch creation whose target cannot be fast-forwarded").
+		if !req.Force && oldSHA != ref.ZeroSHA {
+			ff, err := wrefIsAncestor(ctx, repoPath, nil, oldSHA, baseSHA)
+			if err != nil {
+				s.internalErr(w, r, "check fast-forward", err)
 				return
 			}
-			if cur, exists := refs[targetRef]; exists {
-				oldSHA = cur
+			if !ff {
+				writeErr(w, http.StatusPreconditionFailed,
+					"branch "+targetBranch+" cannot be fast-forwarded to "+baseSHA+" without force")
+				return
 			}
 		}
 		deny, err := wrefPolicyCheck(mustClaims(r), targetRef, oldSHA, baseSHA, func(a, b string) (bool, error) {
@@ -390,6 +498,23 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusForbidden, deny)
 			return
 		}
+		// The branch is already at the base: no ref write, so no
+		// generation bump, webhook or sync poke for an unchanged ref. The
+		// tip was read before the base resolved, so read it again, as the
+		// CAS would have checked it.
+		if oldSHA != ref.ZeroSHA && oldSHA == baseSHA {
+			now, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
+			switch {
+			case !ok:
+			case now == oldSHA:
+				wrefCreateBranchOK(w, "branch updated", targetBranch, req.TargetIsEphemeral, baseSHA)
+			case guard != "":
+				wrefFailTargetGuard(w, guard, now)
+			default:
+				writeErr(w, http.StatusConflict, "branch moved concurrently")
+			}
+			return
+		}
 		won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)
 		if err != nil {
 			s.internalErr(w, r, "create branch ref", err)
@@ -399,7 +524,19 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 			if allocate {
 				continue
 			}
-			if req.Force {
+			// The tip moved after the guard check: report the guard when the
+			// new tip fails it.
+			if guard != "" {
+				current, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
+				if !ok {
+					return
+				}
+				if current != guard {
+					wrefFailTargetGuard(w, guard, current)
+					return
+				}
+			}
+			if req.Force || oldSHA != ref.ZeroSHA {
 				writeErr(w, http.StatusConflict, "branch moved concurrently")
 				return
 			}
@@ -410,12 +547,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		if oldSHA != ref.ZeroSHA {
 			message = "branch updated"
 		}
-		writeJSON(w, http.StatusOK, wrefCreateBranchResponse{
-			Message:           message,
-			TargetBranch:      targetBranch,
-			TargetIsEphemeral: req.TargetIsEphemeral,
-			CommitSHA:         baseSHA,
-		})
+		wrefCreateBranchOK(w, message, targetBranch, req.TargetIsEphemeral, baseSHA)
 		return
 	}
 	writeErr(w, http.StatusConflict, "could not allocate an unused branch name")
@@ -534,6 +666,25 @@ type wrefCreateTagResponse struct {
 	Message string `json:"message"`
 }
 
+// wrefValidateCreateTag checks the body of POST tags and names every
+// invalid field, in the order of the docs table (bodyErrors): name, then
+// ref. It returns the revision to tag.
+func wrefValidateCreateTag(req *wrefCreateTagRequest) (target string, err error) {
+	assertf(req != nil, "wrefValidateCreateTag: nil request")
+	var errs bodyErrors
+	if !wrefValidNewBranchInput(req.Name) {
+		errs.add(newFieldError("name", "must be a valid tag name", "invalid tag name"))
+	}
+	// openapi (issue #17): ref is the current field, target the deprecated
+	// alias; both have always accepted any revision (branch, tag, or
+	// commit) — ResolveRef peels to a commit either way.
+	target = wrefAliasField(req.Ref, req.Target)
+	if target == "" {
+		errs.add(newFieldError("ref", "is required", "ref is required"))
+	}
+	return target, errs.err()
+}
+
 // handleCreateTag creates a lightweight tag (invariant 10): target must
 // resolve — and peel, for annotated-tag or branch targets — to a commit
 // (gitread.ResolveRef applies ^{commit}); the stored ref value is that
@@ -547,16 +698,9 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	if !wrefDecodeBody(w, r, &req) {
 		return
 	}
-	if !wrefValidBranchInput(req.Name) {
-		writeInvalidField(w, "name", "must be a valid tag name", "invalid tag name")
-		return
-	}
-	// openapi (issue #17): ref is the current field, target the deprecated
-	// alias; both have always accepted any revision (branch, tag, or
-	// commit) — ResolveRef peels to a commit either way.
-	target := wrefAliasField(req.Ref, req.Target)
-	if target == "" {
-		writeInvalidField(w, "ref", "is required", "ref is required")
+	target, err := wrefValidateCreateTag(&req)
+	if err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
@@ -726,12 +870,12 @@ func wrefNotesRefName(raw string) (string, error) {
 	}
 	if strings.HasPrefix(raw, "refs/") {
 		name, found := strings.CutPrefix(raw, "refs/notes/")
-		if !found || !validBranchName(name) {
+		if !found || !validNewBranchName(name) {
 			return "", fmt.Errorf("ref %q is not a valid refs/notes/ ref", raw)
 		}
 		return raw, nil
 	}
-	if !validBranchName(raw) {
+	if !validNewBranchName(raw) {
 		return "", fmt.Errorf("invalid notes ref name %q", raw)
 	}
 	return "refs/notes/" + raw, nil
@@ -789,14 +933,14 @@ func strictJSON(body []byte, dst any) error {
 	t := reflect.TypeOf(dst)
 	assertf(t != nil && t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct, "strictJSON: dst %T is not a struct pointer", dst)
 	if err := checkStrictObject(body, t.Elem(), ""); err != nil {
-		return err
+		return strictError{err}
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return errors.New("trailing data")
+		return strictError{errors.New("trailing data")}
 	}
 	return nil
 }
@@ -892,7 +1036,7 @@ func wrefDecodeStrictBody(w http.ResponseWriter, r *http.Request, dst any) bool 
 		return false
 	}
 	if err := strictJSON(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -944,22 +1088,22 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	objectSHA := wrefAliasField(req.ObjectRef, req.SHA)
 	notesRefRaw := wrefAliasField(req.NotesRef, req.Ref)
 	expectedRefSHA := wrefAliasField(req.ExpectedNotesRefSHA, req.ExpectedRefSHA)
-	// invalid writes a 400 for one field. A body member is named in
+	// invalid returns the problem of one field. A body member is named in
 	// invalid_params (the member the request sent, alias included); a
 	// DELETE query parameter is not, and neither is a DELETE field that
-	// the body did not carry, because its current form is the query.
+	// the body did not carry, because its current form is the query: that
+	// problem adds its message only.
 	objectField := wrefAliasName("object_ref", req.ObjectRef, "sha", req.SHA)
 	notesRefField := wrefAliasName("notes_ref", req.NotesRef, "ref", req.Ref)
 	guardField := wrefAliasName("expected_notes_ref_sha", req.ExpectedNotesRefSHA, "expected_ref_sha", req.ExpectedRefSHA)
 	if deleteNote && objectSHA == "" {
 		objectField = ""
 	}
-	invalid := func(field, reason, msg string) {
+	invalid := func(field, reason, msg string) error {
 		if field == "" {
-			writeErr(w, http.StatusBadRequest, msg)
-			return
+			return errors.New(msg)
 		}
-		writeInvalidField(w, field, reason, msg)
+		return newFieldError(field, reason, msg)
 	}
 	// The 2026-10-05 spec (issue #378) moves the DELETE fields to query
 	// parameters: a present query parameter wins over the body, even when
@@ -976,14 +1120,13 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			expectedRefSHA, guardField = q.Get("expected_notes_ref_sha"), ""
 		}
 	}
-	targetRef, err := wrefNotesRefName(notesRefRaw)
-	if err != nil {
-		invalid(notesRefField, "must be a valid notes ref", err.Error())
-		return
-	}
+	// Every field adds its first problem, in the order of the route's
+	// request body in docs/reference/http-api.md, so a body with several
+	// bad fields names them all (bodyErrors). All of these checks are
+	// stateless: the ones that need git run below, after this batch.
+	var errs bodyErrors
 	if objectSHA == "" {
-		invalid(objectField, "is required", "object_ref is required")
-		return
+		errs.add(invalid(objectField, "is required", "object_ref is required"))
 	}
 	action := "remove"
 	if !deleteNote {
@@ -993,27 +1136,34 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			action = "add"
 		}
 		if action != "add" && action != "append" {
-			writeInvalidField(w, "action", "must be add or append", "action must be add or append")
-			return
+			errs.add(invalid("action", "must be add or append", "action must be add or append"))
 		}
 		if req.Note == "" {
-			writeInvalidField(w, "note", "is required", "note is required")
-			return
+			errs.add(invalid("note", "is required", "note is required"))
 		}
+	}
+	targetRef, err := wrefNotesRefName(notesRefRaw)
+	if err != nil {
+		errs.add(invalid(notesRefField, "must be a valid notes ref", err.Error()))
 	}
 	expectedRefSHA = lowerFullSHA(expectedRefSHA)
 	if expectedRefSHA != "" && !ref.ValidSHA(expectedRefSHA) {
-		invalid(guardField, "must be a full 40-hex object id", "expected_notes_ref_sha must be a full 40-hex object id")
-		return
+		errs.add(invalid(guardField, "must be a full 40-hex object id", "expected_notes_ref_sha must be a full 40-hex object id"))
 	}
 	author := wrefNoteAuthor{Name: "open.storage", Email: "notes@openstorage.invalid"}
 	if req.Author != nil {
-		const msg = "author name and email are required when author is provided"
-		if err := requiredFields(msg, [2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}); err != nil {
-			writeInvalid(w, msg, err)
-			return
+		errs.add(requiredFields("author name and email are required when author is provided",
+			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}))
+		// git gets the author in GIT_COMMITTER_EMAIL and its siblings.
+		for _, err := range identValueProblems(
+			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}) {
+			errs.add(err)
 		}
 		author = *req.Author
+	}
+	if err := errs.err(); err != nil {
+		writeInvalid(w, err.Error(), err)
+		return
 	}
 
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
@@ -1060,18 +1210,34 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 
 	// The note target must exist (any object kind, per git notes; a
-	// revision-resolved objectSHA re-verifies trivially).
+	// revision-resolved objectSHA re-verifies trivially). rev-parse
+	// --verify --quiet exits 1 for a missing object. Any other failure (a
+	// fatal exit, a killed git) says nothing about the object.
 	if _, err := wrefGit(ctx, repoPath, nil, nil,
 		"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
-		writeProblem(w, http.StatusNotFound, codeRefNotFound, "object not found: "+objectSHA)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			writeProblem(w, http.StatusNotFound, codeRefNotFound, "object not found: "+objectSHA)
+			return
+		}
+		s.internalErr(w, r, "verify note object", err)
 		return
 	}
 	// Existence check drives add-vs-existing (409) and delete-missing (404).
 	// The cache repo's notes ref was just synced from the ref authority.
 	noteExists := false
 	if old != "" {
-		if _, err := wrefGit(ctx, repoPath, nil, nil, "notes", "--ref", targetRef, "show", objectSHA); err == nil {
+		_, err := wrefGit(ctx, repoPath, nil, nil, "notes", "--ref", targetRef, "show", objectSHA)
+		var exitErr *exec.ExitError
+		switch {
+		case err == nil:
 			noteExists = true
+		case errors.As(err, &exitErr) && exitErr.ExitCode() == 1:
+			// git notes show exits 1 for an object with no note. Any other
+			// failure (a fatal exit, a killed git) says nothing about it.
+		default:
+			s.internalErr(w, r, "look up the note", err)
+			return
 		}
 	}
 	if action == "add" && noteExists {

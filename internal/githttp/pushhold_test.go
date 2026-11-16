@@ -271,11 +271,20 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	}
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a/b"}); err == nil {
 		t.Fatal("reservation past a live D/F-conflicting hold accepted")
-	} else if !strings.Contains(err.Error(), "conflicting") {
-		t.Fatalf("denial reason = %v, want a conflict message", err)
+	} else if !strings.Contains(err.Error(), "conflicting") || !errors.Is(err, ErrRefHeld) || !ShownToPusher(err) {
+		t.Fatalf("denial reason = %v, want a conflict message that matches ErrRefHeld (the API's 503) and that the pusher sees", err)
 	}
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a"}); err == nil {
 		t.Fatal("reservation past a live same-name hold accepted")
+	} else if !errors.Is(err, ErrRefHeld) {
+		t.Fatalf("same-name denial = %v, want it to match ErrRefHeld", err)
+	}
+	// A caller whose own context ended gets no ErrRefHeld: nothing waits
+	// for its answer.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := reservePushHolds(canceled, own, []string{"refs/heads/a"}); err == nil || errors.Is(err, ErrRefHeld) {
+		t.Fatalf("canceled reservation = %v, want an error that does not match ErrRefHeld", err)
 	}
 	// Unrelated refs reserve immediately.
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/z"}); err != nil {
@@ -289,6 +298,21 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	}
 	if err := reservePushHolds(context.Background(), own2, []string{"refs/heads/a/c"}); err != nil {
 		t.Fatalf("reservation blocked by an expired hold: %v", err)
+	}
+}
+
+// TestReservePushHolds_LockOpenFailureIsNotRefHeld: a reservation lock
+// that cannot be opened (here a directory sits at its path) is a failure
+// a retry does not fix, so it must not match ErrRefHeld (the API's 503).
+func TestReservePushHolds_LockOpenFailureIsNotRefHeld(t *testing.T) {
+	dir := t.TempDir()
+	holdsDir := filepath.Join(dir, pushHoldDir)
+	if err := os.MkdirAll(holdsDir+".reserve.lock", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := reservePushHolds(context.Background(), filepath.Join(holdsDir, "push-own"), []string{"refs/heads/x"})
+	if err == nil || errors.Is(err, ErrRefHeld) {
+		t.Fatalf("reservation with an unopenable lock = %v, want a plain error that does not match ErrRefHeld", err)
 	}
 }
 
@@ -310,6 +334,8 @@ func TestReservePushHolds_FailsClosedOnUnreadableHolds(t *testing.T) {
 	own := filepath.Join(holdsDir, "push-own")
 	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/x"}); err == nil {
 		t.Fatal("reservation succeeded over an unreadable hold directory")
+	} else if errors.Is(err, ErrRefHeld) {
+		t.Fatalf("unreadable holds = %v, want a failure that does not match ErrRefHeld: a retry does not fix it", err)
 	}
 }
 
@@ -366,8 +392,8 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	if err == nil {
 		t.Fatal("reservation succeeded while the reserve lock was held elsewhere")
 	}
-	if !strings.Contains(err.Error(), "retry shortly") {
-		t.Fatalf("denial = %v, want a retryable timeout", err)
+	if !strings.Contains(err.Error(), "retry shortly") || !ShownToPusher(err) || !errors.Is(err, ErrRefHeld) {
+		t.Fatalf("denial = %v, want a retryable timeout that the pusher sees and that matches ErrRefHeld", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("reservation blocked %v, want the ~150ms deadline", elapsed)

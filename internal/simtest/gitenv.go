@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/coder/openstorage/internal/gitlimit"
 )
 
 // Deterministic git identity for every object the simulation writes. Commit
@@ -47,12 +49,12 @@ func simGit(dir string, stdin []byte, extraEnv []string, args ...string) (string
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
-	var stderr bytes.Buffer
+	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
 		return string(out), fmt.Errorf("git %s: %w: %s",
-			strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+			strings.Join(args, " "), err, stderr.String())
 	}
 	return string(out), nil
 }

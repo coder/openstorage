@@ -4,21 +4,26 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httptrace"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // withGitReadPolicy swaps the process-wide read-side git policy for one
@@ -51,6 +56,30 @@ func requireSlotsFree(t *testing.T, p *gitReadPolicy) {
 	if n := p.slots.InUse() + p.streamSlots.InUse(); n != 0 {
 		t.Fatalf("%d git read slots still held after the responses", n)
 	}
+}
+
+// parkingRefStore parks the first ref listing of one repository until
+// release is closed. Hydration lists refs after it has built the cache
+// repo, so a cold read parked here is inside hydration. Reads of every
+// other repository pass through.
+type parkingRefStore struct {
+	ref.Store
+	repo    string
+	parked  chan struct{} // closed when the first listing of repo parks
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *parkingRefStore) ListRefsAfter(ctx context.Context, repo, after string, limit int) ([]ref.RefEntry, error) {
+	if repo == s.repo {
+		s.once.Do(func() { close(s.parked) })
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.Store.ListRefsAfter(ctx, repo, after, limit)
 }
 
 // deepFixture seeds a repo whose main branch is a linear history of n
@@ -248,6 +277,114 @@ func TestGitReadBudgetAdmissionAndDeadline(t *testing.T) {
 			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits", byID, nil)
 			coreRequireStatus(t, resp, body, http.StatusOK)
 			requireSlotsFree(t, p)
+		})
+
+		t.Run("hydration holds no read slot", func(t *testing.T) {
+			// ADR-049: the slot starts at a read's first git child, and
+			// repository hydration is not included. With one slot and no
+			// wait, a request that took its slot before it hydrated would
+			// answer every other read 503 for as long as the hydration lasts.
+			// One route per helper that materializes the cache repo:
+			// materializeReadRepo (commit) and resolveQueryRepo, which serves
+			// diff from the JSON pool and archive from the download pool.
+			for _, tc := range []struct {
+				name, method, path, body string
+			}{
+				{"commit", http.MethodGet, "/api/v1/repos/commit?ref=main", ""},
+				{"diff", http.MethodGet, "/api/v1/repos/diff?ref=main", ""},
+				{"archive", http.MethodPost, "/api/v1/repos/archive", "{}"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					p := withGitReadPolicy(t, testGitReadPolicy(1, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
+					cold := coreSeedFixture(t, e, org)
+					if _, err := os.Stat(githttp.RepoPath(e.cacheDir, cold.repo.RepoID)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("fixture cache must be cold: %v", err)
+					}
+					parking := &parkingRefStore{Store: e.refStore, repo: cold.repo.RepoID, parked: make(chan struct{}), release: make(chan struct{})}
+					var releaseOnce sync.Once
+					release := func() { releaseOnce.Do(func() { close(parking.release) }) }
+					t.Cleanup(release)
+					handler, err := New(Config{
+						Store:       e.store,
+						Verifier:    auth.NewVerifier(e.store),
+						Logger:      discardLogger(),
+						HTTPBaseURL: testHTTPBaseURL,
+						RefStore:    parking,
+						BlobStore:   e.blobStore,
+						CacheDir:    e.cacheDir,
+						SyncQueue:   envSyncQueue{},
+					})
+					if err != nil {
+						t.Fatalf("api.New: %v", err)
+					}
+					srv := httptest.NewServer(handler)
+					t.Cleanup(srv.Close)
+
+					type answer struct {
+						status int
+						body   []byte
+						err    error
+					}
+					// send never calls t.Fatal, so the cold read can run in a goroutine.
+					send := func(ctx context.Context, token string) answer {
+						var payload io.Reader
+						if tc.body != "" {
+							payload = strings.NewReader(tc.body)
+						}
+						req, err := http.NewRequestWithContext(ctx, tc.method, srv.URL+tc.path, payload)
+						if err != nil {
+							return answer{err: err}
+						}
+						req.Header.Set("Authorization", "Bearer "+token)
+						if tc.body != "" {
+							req.Header.Set("Content-Type", "application/json")
+						}
+						resp, err := srv.Client().Do(req)
+						if err != nil {
+							return answer{err: err}
+						}
+						defer resp.Body.Close()
+						body, err := io.ReadAll(resp.Body)
+						return answer{status: resp.StatusCode, body: body, err: err}
+					}
+
+					coldRead := make(chan answer, 1)
+					go func() { coldRead <- send(t.Context(), cold.token) }()
+					select {
+					case <-parking.parked:
+					case a := <-coldRead:
+						t.Fatalf("cold read answered %d (err %v) before it listed refs: %s", a.status, a.err, a.body)
+					case <-time.After(30 * time.Second):
+						t.Fatal("cold read never reached its ref listing")
+					}
+
+					// The cold read is parked inside hydration. The warm read has a
+					// deadline: a blocker that holds no slot, such as a lock shared
+					// by all hydrations, must fail here, not hang the test run.
+					if n := p.slots.InUse() + p.streamSlots.InUse(); n != 0 {
+						t.Fatalf("a read parked in hydration holds %d read slots, want 0", n)
+					}
+					warmCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+					defer cancel()
+					if a := send(warmCtx, fx.token); a.err != nil || a.status != http.StatusOK {
+						t.Fatalf("read of another repository while a cold read is parked in hydration: status %d, err %v: %s", a.status, a.err, a.body)
+					}
+
+					release()
+					select {
+					case a := <-coldRead:
+						if a.err != nil || a.status != http.StatusOK {
+							t.Fatalf("cold read after release: status %d, err %v: %s", a.status, a.err, a.body)
+						}
+					case <-time.After(30 * time.Second):
+						t.Fatal("cold read did not finish after its hydration was released")
+					}
+					// A slot is released when the handler returns, a moment after
+					// the client has read the whole response.
+					slotsFreeAfter(p, t.TempDir(), 10*time.Second)
+					requireSlotsFree(t, p)
+				})
+			}
 		})
 
 		t.Run("spent time budget answers 503 without Retry-After", func(t *testing.T) {

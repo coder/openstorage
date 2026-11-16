@@ -3,6 +3,11 @@
 > Extracted verbatim from [`13-phase4-implementation-notes.md`](../archive/phases/13-phase4-implementation-notes.md)
 > (“Phase-4 Implementation Notes & ADRs (write API + p3 read burn-down)”). Historical decision record — later issues and PRs may have
 > superseded details; the git history of the source file is authoritative.
+>
+> **Amended by [#804](https://github.com/coder/openstorage/issues/804):** the `+import`
+> remote no longer has its own storage key. It is push-only, and an import push writes the
+> base repository's refs ([import remote](../explanation/git-protocol-and-namespaces.md#import-remote)).
+> Data that 0.20.0 and earlier stored under `{repo}+import` stays in storage.
 
 The p3 gate surfaced a repo-key split: `internal/githttp` keyed packs/refs/hook env by the
 git URL path element verbatim while `internal/api` keyed by `RepoID`, so a push to
