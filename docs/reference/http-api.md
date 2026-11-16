@@ -51,7 +51,17 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   per-repo route refuses it with 403 `forbidden`, as it refuses `repo: "org"`
   ([authentication](authentication.md)). As upstream advises, treat an unknown code as
   the generic code for its status. Branch on the status code or `code`, not on the
-  message.
+  message. On every status, an `error` or `detail` of more than 16384 bytes, and an
+  `invalid_params` `name` of more than 16384 bytes, is cut at a character boundary and
+  ends with `…`, so that a large value in a request is not repeated whole in the answer.
+  The limit counts the bytes of the text as the server holds it, before JSON escapes
+  them, so a text with invalid UTF-8 or with bytes that JSON escapes takes more bytes in
+  the answer. A text that has up to 16384 bytes is not cut, and the bytes of a message
+  that holds request text count with the rest of the message. The same cut applies to
+  the `result.message` of a commit write (`commit-pack`, `diff-commit` and
+  `restore-commit`), which can repeat a `content_id`, a `mode` or a path, and to the
+  error text of the git smart HTTP and Git LFS routes (`error` on a git route, `message`
+  on an LFS route), which can repeat the issuer of a token.
   A `400` for a request body can also carry `invalid_params` (`[{name, reason}]`, as
   upstream's `ValidationProblemDetails`): `name` is the dotted wire path of the invalid
   field, and `reason` is the rule its value breaks. open.storage sends it when a body
@@ -76,23 +86,31 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `body must be {"metadata": {...}}`. The `upstream` member, the copy form of
   `base_repo` and a branch create without `target_branch` refuse an unknown member, put
   it in `detail` (`invalid upstream: unknown field "branch"`) and name no
-  `invalid_params` item. A
+  `invalid_params` item. A member name of more than 256 bytes is cut there to its
+  first 256 bytes or fewer, at a character, and ends with `…` and its length in bytes,
+  all counted in the decoded name (an escape counts as the character it stands for, and
+  a byte that is not UTF-8 as the 3 bytes of U+FFFD):
+  `unknown field "xx…" (1000000 bytes)`. A
   frame of a `commit-pack` or `diff-commit` stream that has a field of the wrong type
   answers in the same way, in the `message` of its result:
   `malformed NDJSON frame: metadata.target_branch must be a string`.
   A body with several invalid fields gets one item for each of them, as upstream says
   (`invalid_params` "names each invalid field"). The items follow the order of the
   route's request body in this document, array elements by index, and a field appears
-  once. `detail` then holds the message of each problem, joined by `; `. One answer
-  holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
-  out (not for fields of the wrong type, see below). A check that needs the repository's
-  state (for example, that a merge creates a commit and so needs an `author`) runs after
-  the checks of the body. A strictly decoded
+  once. `detail` then holds the message of each problem, joined by `; ` (a problem whose
+  fields all appear in earlier problems adds no message). One answer holds at most 100
+  items, and `detail` ends with `; and N more` when it leaves some out (not for fields
+  of the wrong type, see below): N counts what it leaves out, one for each item and one
+  for each problem that names no field. The cut of a long `detail` above can remove that
+  ending or cut it short, and then `detail` ends with `…`. A check that needs the
+  repository's state (for example, that a merge creates a commit and so needs an
+  `author`) runs after the checks of the body, except where this paragraph or the notes
+  on `POST /repos` below say otherwise. A strictly decoded
   body (`POST /api/repos/{repo_name}/notes/append` and `POST
   /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
   of the body, and the check stops at the first problem: the answer names the first
-  member that is unknown, repeated or `null`, or that must be an object and is not, and
-  none of the other problems. When the check reaches a JSON syntax error or trailing
+  member that is unknown, repeated or `null`, or that must be an object and is not (an
+  empty member name names no field), and none of the other problems. When the check reaches a JSON syntax error or trailing
   data before it finds a bad member, the answer names no member. The other checks run
   only when the members are fine, and then the decoder of a strictly decoded body names
   only the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
@@ -118,30 +136,41 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   credential routes that name the repository or credential in the path
   (`/repos/{repo_name}/git-credentials` and
   `/repos/{repo_name}/git-credentials/{git_credential_id}`) look that one up before they
-  read the body, so on them a missing one is `404` even when the body is invalid. A grep
+  read the body, so on them a missing one is `404` even when the body is invalid. The
+  merge, branch, tag and note routes look up the repository before they read the body in
+  the same way, and so does every route on the `/api/repos/{repo_name}/...` path style.
+  A grep
   `pagination.cursor` that does not decode is named with the other invalid fields when
   the body has any. Alone, it keeps its place after the lookup of the repository, so a
-  missing repository is `404` first. `POST /repos/merge`, `POST /repos/branches/create`,
-  `POST /repos/tags`, `POST /repos`, `POST /repos/grep`, `POST /repos/archive`,
-  `POST /repos/notes`, `DELETE /repos/notes`,
+  missing repository is `404` first. A grep `query.pattern` that git refuses is found
+  when git runs the search, after the checks of the body and the lookups of the
+  repository and the ref, so it is named alone and a missing repository or ref is `404`
+  first. `POST /repos/merge`, `POST /repos/branches/create`, `DELETE /repos/branches`
+  (for a name that comes from the body: an `ephemeral` query parameter that is not valid
+  answers first and names no field), `POST /repos/tags`, `POST /repos`,
+  `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`, `DELETE /repos/notes`,
   `POST /api/repos/{repo_name}/notes/append` (when its members
   and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
   `/repos/{repo_name}/git-credentials`, and `PUT
-  /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. A `DELETE
+  /repos/{repo_name}/git-credentials/{git_credential_id}` give a body with several
+  invalid fields one item for each of them. A `DELETE
   /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
-  adds its message to `detail` and names no field. `PATCH /repo` and the pull-upstream
-  routes check one body field each (`default_branch`, `ref`), so they name that field.
-  The other routes with a request body do not collect problems yet: a check there can
-  hide the checks after it. Every route that decodes its body as one JSON object names
-  each field of the wrong type, as above, with these exceptions: the two strictly
-  decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name the first
-  bad member or the first field of the wrong type, the `upstream` member of `POST /repos`
-  does the same, and `commit-pack`, `diff-commit` and `restore-commit` follow their own
-  rules. `POST /repos` decodes `upstream` and `base_repo` on their own (see its body
-  below), and only when the fields of the body itself (`repo_name`, `default_branch`)
-  have the right types: `{"default_branch":7,"base_repo":{"owner":1}}` names only
-  `default_branch`. When those fields are fine, a body with several fields of the wrong
-  type inside `base_repo` names each of them.
+  adds its message to `detail` and names no field. `PATCH /repo`, the pull-upstream
+  routes, `DELETE /repos/tags` and `DELETE /repos/git-credentials` check one body field
+  each (`default_branch`, `ref`, `name`, `id`), so they name that field. The commit
+  write routes (`commit-pack`, `diff-commit`, `restore-commit`) answer with upstream's
+  `CommitWriteResponse` or `ProblemDetails`, which have no `invalid_params`, and the
+  webhook routes and `push-upstream` are not part of upstream's API. A check on these
+  routes can hide the checks after it. Every route that decodes its body as one JSON
+  object names each field of the wrong type, as above, with these exceptions: the two
+  strictly decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name
+  the first bad member or the first field of the wrong type, the `upstream` member of
+  `POST /repos` does the same, and `commit-pack`, `diff-commit` and `restore-commit`
+  follow their own rules. `POST /repos` decodes `upstream` and `base_repo` on their own
+  (see its body below), and only when the fields of the body itself (`repo_name`,
+  `default_branch`) have the right types: `{"default_branch":7,"base_repo":{"owner":1}}`
+  names only `default_branch`. When those fields are fine, a body with several fields of
+  the wrong type inside `base_repo` names each of them.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -189,6 +218,19 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   and so is a path with a NUL byte. The files listings and grep check the path
   without its trailing `/`: there `/` alone names the root of the listing, and
   matches no file in grep.
+- **Values that git takes as one argument** must fit what Linux lets a program take
+  as one argument: 128 KiB (131,072 bytes) with its terminating NUL, so at most
+  131,071 bytes with what the server puts around the value. A longer value answers
+  `400` before git starts, on every platform: a `path` param or grep `paths` entry
+  over 131,060 bytes (git gets it at most as `:(literal)<path>/`; the files listings
+  check it without its trailing `/`), and a blame `range` or grep `query.pattern` over
+  131,071 bytes. The message names the field and its limit, and grep names the field
+  in `invalid_params`. The limits on idents are with the
+  [commit writes](#commit-messages-and-idents). Linux also limits all arguments and
+  environment entries of one program together: a quarter of the server's stack limit,
+  at most 6 MiB (2 MiB with the usual 8 MiB stack limit). A request with many values
+  whose sizes each fit, such as a grep with many short `paths`, or a server with a low
+  stack limit, can pass that total, and that answer is a `500`.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field
@@ -218,6 +260,13 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   archive and grep globs match it only through a wildcard (`a?b`, `a*`), which can
   match other names too. Upstream documents no path encoding, so the siblings are an
   extension ([#587](https://github.com/coder/openstorage/issues/587)).
+- **Paths that are not clean**: a path that holds `//`, `/./` or `/../` gets a `307` to
+  the clean path, and `/api` gets a `307` to `/api/`. `Location` keeps the query string,
+  and a `GET` also gets a short HTML body that links to it. When that `Location` would
+  be longer than 16384 bytes, the server answers `404` instead of the redirect: the
+  `route_not_found` problem body (with `instance` cut as above) when the `Location`
+  starts with `/api/`, else the git surface's `{"error":"not a smart-http path"}`.
+  Send clean paths.
 - **No client retries**: no SDK retries; every error surfaces immediately. Python
   client-side timeouts: 30s default, 60s diff/grep, 180s
   branch-create/merge/merge-preview/commit/tag/restore-commit.
@@ -341,9 +390,15 @@ the same scopes, query parameters and responses.
   checked. An invalid `base_repo.operation` is the only `base_repo` problem: the
   operation decides which `base_repo` fields apply. One "are required" message names all
   the empty fields of `upstream` (`provider`, `owner`, `name`) or of `base_repo`
-  (`owner`, `name`). The `default_branch` query parameter is no body field and names
-  none.
-- The checks of state answer after the checks of the body fields: the ref policy (403),
+  (`owner`, `name`). A `base_repo.default_branch` is checked only when the body has no
+  `default_branch` of its own, because a create uses the first of the two. The
+  `default_branch` query parameter is no body field and names none.
+- A token whose `refs` claim does not parse is refused with 403 before the fields of
+  the body are checked, after the body has been read. Three problems answer `400`
+  first: a `repo` claim that holds a NUL byte (checked before the body is read), an
+  unreadable body, and an unknown member in the `base_repo` of a copy body without
+  `upstream` that is valid JSON with no field of the wrong type. The checks of state
+  answer after the checks of the body fields: the ref policy (403),
   the egress check of the upstream host (it looks the host up), and for a copy or fork
   the source token (403), the source repository (404) and the fork point (400). A
   `default_branch` of the body that is the only invalid field answers after the ref
@@ -449,7 +504,9 @@ an sr.ht upstream still gets the `git` default.
 
 The worker hands the pair to git through a credential helper that reads it from the
 environment. A stored username or password that contains a carriage return, line feed
-or NUL fails the sync as a configuration error.
+or NUL fails the sync as a configuration error. So does one over 131,042 bytes, before
+git gets it: git takes it as one environment entry, such as
+`OPENSTORAGE_ASKPASS_PASSWORD=<password>`, which must fit 128 KiB with its terminating NUL.
 
 ### Files & trees (`git:read`)
 
@@ -670,11 +727,18 @@ space after their trailing whitespace is removed, and an empty message gives `""
 continuation line keeps its leading whitespace, so `"subj\n  next"` gives `subj   next`.
 Before that spec, both carried the full message.
 
+#### Commit messages and idents
+
 A NUL byte in a `commit_message`, or in the `name` or `email` of an `author` or `committer`,
 answers 400 on `commit-pack`, `diff-commit`, `restore-commit` and `POST /repos/merge`. A NUL
 in the `author` of `POST /repos/notes` (also the deprecated body of `DELETE /repos/notes`)
-answers 400 too. git takes a message as an argument and an ident as an environment value,
-and neither can hold a NUL. `merge` and `notes` name each such field in `invalid_params`.
+answers 400 too. git refuses a NUL in a commit message, and takes an ident as an
+environment value, which cannot hold a NUL. So does a `name` or `email` over 131,051 bytes:
+git gets it as one environment entry such as `GIT_COMMITTER_EMAIL=<email>`, which must fit
+128 KiB with its terminating NUL. The message names the field and the limit. A commit
+message goes to git on standard input, so it has no such limit: the request limits bound
+it, 1 MiB for the body of `merge` and `restore-commit` and 8 MiB for one metadata line of
+`commit-pack` and `diff-commit`. `merge` and `notes` name each such field in `invalid_params`.
 `commit-pack` and `diff-commit` answer the result envelope with `status` `invalid`, as for
 their other invalid metadata, and `restore-commit` answers the plain problem body. A
 `restore-commit` without a `commit_message` gets a default message that names the target,
@@ -762,6 +826,15 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 | `POST /repos/pull-upstream` | git:write | Optional body `{ref?, after?}` → **202 Accepted** (async). Sync-linked repos (`upstream` or `base_repo` sync) only. Deprecated upstream (2026-10-05) for `POST /api/repos/{repo_name}/upstream/pull`; still served. Every response on both path styles, errors included, carries a [`Deprecation`](#deprecation-header) header. Both body fields are accepted and ignored: every pull syncs all branches and tags of the upstream. A `ref` that holds a NUL byte is still a 400 on every backend, because PostgreSQL's job queue stores it as `jsonb`, which cannot hold a NUL. Upstream deprecated the body on 2026-10-08 |
 | `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional, deprecated body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400. Its fields are ignored |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
+
+A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`) is over
+131,070 bytes fails as `repository configuration error` before git starts. git gets the URL
+as one argument, and its HTTP transport hands it on with a `/` added, which must fit
+128 KiB with its terminating NUL. A stored credential that git cannot take fails the same
+way ([Git credentials](#git-credentials-generic-https-upstreams)). Values that each fit
+can still pass the total limit together: one git start can carry the URL twice and both
+credential entries, about 512 KiB at the limits, so a server with a stack limit of 2 MiB
+or less can fail such a run as a failed fetch or push.
 
 #### Deprecation header
 
@@ -893,7 +966,7 @@ On a 300,000-commit linear history, `git log -1 -- <file added in the root commi
 | `files` | `git ls-tree [-r]`; for a recursive call with a `cursor`, `git cat-file --batch` for the folders on the cursor's path and the ones after it, and `git cat-file --batch-check` for the sizes of the page's files, and `git config --type=int --get core.maxTreeDepth` once for a page the walk has filled, then `git ls-tree -r` again when the walk gives way | tree size; for a recursive call with `limit` or `cursor`, the entries of the page and, with a cursor, the folders on its path and the ones after it, each read whole (not the folders before it). A walk that gives way has already paid for the folders it read when the stream starts |
 | `files/metadata` | `git ls-tree -r`; `git rev-list --topo-order --parents` and `git diff-tree --stdin` for the last commit of every file under `path`; `git log --no-walk` for the listed files' commits | tree size; history length; history depth to the oldest last commit |
 | `file` | `git ls-tree`, `git log -1 -- <path>`, `git cat-file blob` | history depth; file size |
-| `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git ls-tree` and `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
+| `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
 | `blame` | `git blame` | file length × history depth |
 | `grep` | `git grep` (one thread) | tree size; number of matches |
 | `archive` | `git ls-tree -r`, `git cat-file blob` per file | tree size |
@@ -917,7 +990,7 @@ Other limits and gaps:
 | 400 | invalid input, a `diff-commit` patch over 262144000 bytes among them ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 401 | no `Authorization` header, or a scheme other than `Bearer` (`Authentication required`) |
 | 403 | a token that fails verification (`Invalid or expired token`); permission or ref-policy denied; `authentication_unavailable` when the key store fails (retry) ([failure mapping](authentication.md#failure-mapping)) |
-| 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`) |
+| 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`); a path that is not clean, when its redirect `Location` would be longer than 16384 bytes |
 | 405 | the path has routes, but not for this method (`Allow` lists them) |
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, failed ref guard (`expected_target_sha`, `expected_source_sha`, `expected_notes_ref_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 412 | a failed `restore-commit` `base_ref` precondition; a merge that is not a fast-forward under `ff_only`, or a merge or merge preview of unrelated histories without `allow_unrelated_histories` (a preview with `ff_only` answers `rejected` instead); a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)); a `branches/create` move guarded by `expected_target_sha` without `force` that is not a fast-forward ([details](#guarded-branch-create-and-move)) |

@@ -9,7 +9,7 @@ updates use compare-and-swap; several response details are load-bearing for clie
 ```
 Organization (org)                     ← tenant; from subdomain + JWT `iss`
  └── Repository
-      ├── repo_id: string             ← internal ID (e.g. "repo_7f2b3d9" / UUID)
+      ├── repo_id: string             ← internal ID (server-generated: `repo_` and 12 hex digits, e.g. "repo_761aac427fd3")
       ├── url: string                 ← client-facing URL path; may contain slashes ("team/project"); the value used in the JWT `repo` claim
       ├── default_branch: string      ← defaults to "main"
       ├── created_at: ISO-8601 string

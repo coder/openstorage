@@ -103,8 +103,8 @@ func s3walCoverAncestors(base string) []string {
 // the stack at any base is exactly its low-extended prefix chain, each
 // entry low-extending the one below, so popping top-first emits in
 // strictly ascending decorated order. Bases nesting across a '/'
-// boundary ("abc" and "abc/x" — impossible under production's [0-9a-z-]
-// repo IDs, reachable only with conformance-test names) can interleave at
+// boundary ("abc" and "abc/x" — impossible under production's
+// `repo_<12 hex>` IDs, reachable only with conformance-test names) can interleave at
 // the ROW level, which no per-base traversal can serialize; the caller's
 // ascending-emission assert turns that into a loud failure instead of a
 // silent loss.

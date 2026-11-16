@@ -2329,6 +2329,8 @@ func TestWriteCommitRefPolicies(t *testing.T) {
 			tok := mint(`["not-a-tuple"]`, nil)
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", tok, bytes.NewReader(commitBody("main", nil)))
 			wctRequireFail(t, resp, body, http.StatusForbidden, "forbidden")
+			// Issue #841: the answer is the fixed text, never the decoder's.
+			tcdRequireFixed(t, "commit-pack", body, "malformed refs claim")
 		})
 
 		t.Run("restore-commit honors policies", func(t *testing.T) {

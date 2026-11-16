@@ -198,6 +198,9 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 	srcClaims, err := verifier.Verify(r.Context(), spec.Auth.Token)
+	if err != nil {
+		keyFailures.Report(r.Context(), err)
+	}
 	if keyStoreFailed(err) {
 		writeProblem(w, http.StatusForbidden, codeAuthenticationUnavailable, "cannot verify base_repo.auth.token now, retry")
 		return

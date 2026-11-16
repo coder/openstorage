@@ -6,12 +6,14 @@ import (
 	"encoding"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"net/http"
 	"reflect"
 	"slices"
 	"strings"
 
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -144,6 +146,17 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		assertf(p.Name != "" && p.Reason != "", "writeProblem: incomplete invalid param %+v", p)
 	}
 	assertf(msg != "", "writeProblem called with empty message")
+	// errtext.MaxBytes is far above the message that joins the 100 problems
+	// of a body (bodyErrors), so an ordinary answer is not cut: a message of
+	// 100 problems that each repeat 125 bytes or more of request text is, and
+	// then loses its `and N more` ending.
+	msg = errtext.Bound(msg)
+	if len(params) > 0 {
+		params = slices.Clone(params)
+		for i := range params {
+			params[i].Name = errtext.Bound(params[i].Name)
+		}
+	}
 	// RFC 9457 `title` is the status text, so only registered statuses are
 	// valid here (499 is never emitted: ADR-26).
 	title := http.StatusText(status)
@@ -259,16 +272,20 @@ func invalidTextFields(fields ...[2]string) error {
 	return nil
 }
 
-// invalidTextEach returns a fieldError for each field (dotted wire path ->
-// value) whose value is not meta.ValidText, in the order given.
-func invalidTextEach(fields ...[2]string) []error {
-	var problems []error
-	for _, f := range fields {
-		if err := invalidTextFields(f); err != nil {
-			problems = append(problems, err)
-		}
+// tooLongMsg is the 400 message for a request value longer than max bytes.
+// git would take the value as one argument or one environment entry, which
+// must fit gitlimit.MaxArgBytes with what the server puts around it.
+func tooLongMsg(name string, max int) string {
+	return fmt.Sprintf("invalid %s (want at most %d bytes)", name, max)
+}
+
+// tooLongField returns a fieldError when value, the request field name (a
+// dotted wire path), is longer than max bytes (tooLongMsg), or nil.
+func tooLongField(name, value string, max int) error {
+	if len(value) <= max {
+		return nil
 	}
-	return problems
+	return newFieldError(name, fmt.Sprintf("must be at most %d bytes", max), tooLongMsg(name, max))
 }
 
 // writeInvalidText writes the 400 for the first field that is not

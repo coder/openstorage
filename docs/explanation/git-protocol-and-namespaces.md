@@ -35,6 +35,14 @@ The receive path must:
 
 - Enforce JWT ref policies per ref update (`no-push`, `no-force-push`, `verify-sig`),
   first match wins, reporting per-ref `ng` results with a policy message.
+- Refuse a push command that sets a branch under `refs/heads/` to an object that is not a
+  commit (a blob, a tree or an annotated tag), with a per-ref `ng`, as git does. Git checks
+  only after the hooks have run, and the server's ref store has taken the value by then, so
+  the hooks refuse it first. The refusal comes before the ref policy check. A policy denial
+  and this refusal take the same push rules: an `--atomic` push that carries one lands
+  nothing, and a push whose objects only refused commands need is declined whole, with no
+  pack stored. A branch delete and a new value that the server does not have are not
+  refused here. Other namespaces, such as tags, take any object.
 - Map namespaces: `+ephemeral` remotes see and update only the ephemeral ref space;
   persistent remotes must not see ephemeral refs (git namespaces or separate ref stores).
   open.storage gives the `+ephemeral` remote its own storage key. The HTTP API, though, stores its
@@ -158,10 +166,22 @@ configuration").
 A batch body that does not decode answers `400` with the LFS error body
 `{"message":"bad batch request: operation has the wrong JSON type"}`, which names the
 field of the wrong JSON type (`objects.0.size` for a nested one), with
-`bad batch request: request body too large` for a body over 4 MiB, or with
+`bad batch request: request body too large` for a body over 4 MiB (a gzip body counts
+against that limit twice: its compressed bytes and its decoded bytes), or with
 `bad batch request` for any other body that does not decode (invalid JSON, or a value of
 the wrong top-level type). The body is decoded before the request is authenticated, so
 the message never holds the text of Go's JSON decoder, which names Go types and structs.
+
+A batch that is not rejected as a whole answers `200` with one entry per requested
+object, in request order, and each entry names its object by the `oid`. An entry whose
+`oid` is not 64 lowercase hex digits carries the per-object error `422` `oid must be 64
+lowercase hex digits (sha256)`. It repeats an invalid `oid` of up to 64 bytes unchanged,
+and a longer one cut to its first 64 bytes at a character boundary and ended with `…`,
+so the answer stays small whatever the `oid` holds. The 64 bytes count the `oid` as
+decoded from the request, before JSON escapes it, with each byte of invalid UTF-8 read
+as U+FFFD (3 bytes). git-lfs builds an `oid` from the content's SHA-256, but `git lfs
+push --object-id` sends the `oid` it is given; git-lfs reports the error of an entry
+without matching its `oid` to the request.
 
 ## Interop invariant
 

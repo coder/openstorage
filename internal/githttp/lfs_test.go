@@ -256,6 +256,47 @@ func TestLFS_BatchValidation(t *testing.T) {
 	}
 }
 
+// TestLFS_BatchInvalidOIDEcho: the entry of an invalid oid keeps its
+// per-object 422 and repeats the oid only up to 64 bytes (the length of a
+// valid one), so the answer stays small whatever the oid holds.
+func TestLFS_BatchInvalidOIDEcho(t *testing.T) {
+	srv, mint := newLFSServer(t, openFileBlob(t))
+	tok := "basic:" + mint(auth.ScopeGitRead, auth.ScopeGitWrite)
+	long, upper := strings.Repeat("<", 1<<20), strings.ToUpper(sha256Hex(nil))
+	for _, tc := range []struct {
+		name, oid, want string
+		n               int
+	}{
+		{"short", "NOT-HEX", "NOT-HEX", 1},
+		{"64 bytes", upper, upper, 1},
+		{"one long", long, long[:64] + "…", 1},
+		{"many long", long[:16384], long[:64] + "…", 250},
+		{"rune boundary", "a" + strings.Repeat("é", 40), "a" + strings.Repeat("é", 31) + "…", 1},
+		{"three-byte rune at the cut", strings.Repeat("a", 62) + strings.Repeat("中", 3), strings.Repeat("a", 62) + "…", 1},
+		{"four-byte rune at the cut", strings.Repeat("a", 61) + strings.Repeat("😀", 2), strings.Repeat("a", 61) + "…", 1},
+	} {
+		for _, op := range []string{"download", "upload"} {
+			t.Run(tc.name+"/"+op, func(t *testing.T) {
+				obj := fmt.Sprintf(`{"oid":%q,"size":1}`, tc.oid)
+				body := `{"operation":"` + op + `","objects":[` + strings.Repeat(obj+",", tc.n-1) + obj + `]}`
+				w := doLFS(t, srv, http.MethodPost, lfsBatchPath, tok, body)
+				if w.Body.Len() > tc.n*1024 {
+					t.Fatalf("answer has %d bytes, want at most %d", w.Body.Len(), tc.n*1024)
+				}
+				resp := decodeBatch(t, w)
+				if len(resp.Objects) != tc.n {
+					t.Fatalf("answer has %d entries, want %d", len(resp.Objects), tc.n)
+				}
+				for i, o := range resp.Objects {
+					if o.OID != tc.want || o.Error == nil || o.Error.Code != http.StatusUnprocessableEntity {
+						t.Fatalf("entry %d = oid %q, error %+v; want oid %q with a 422", i, o.OID, o.Error, tc.want)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestLFS_ProxyUploadHashMismatch(t *testing.T) {
 	srv, mint := newLFSServer(t, openFileBlob(t))
 	oid := sha256Hex([]byte("expected content"))

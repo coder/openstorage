@@ -43,9 +43,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -56,6 +58,8 @@ const (
 	lfsURLExpiry = 15 * time.Minute
 	// lfsMaxBatchBody bounds the JSON batch request (defensive: a batch of
 	// 100 objects is ~10KB; 4MiB is far beyond any legitimate request).
+	// A gzip body is bounded twice: its compressed bytes and its decoded
+	// bytes each count against it.
 	lfsMaxBatchBody = 4 << 20
 	// lfsMaxBatchObjects bounds one batch's object count (defensive:
 	// git-lfs sends at most 100 per batch; each entry costs a blob Stat
@@ -176,14 +180,14 @@ const lfsRetryAfterSecs = 10
 // media type, so git-lfs surfaces the message to the user. Throttled
 // responses uniformly carry the Retry-After + RateLimit header pair
 // (SetRateLimited, issue #150) — stamped here so no 429 path can forget
-// them.
+// them. It cuts msg as httpError does.
 func lfsError(w http.ResponseWriter, status int, msg string) {
 	if status == http.StatusTooManyRequests {
 		SetRateLimited(w.Header(), lfsRetryAfterSecs)
 	}
 	w.Header().Set("Content-Type", lfsMediaType)
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"message": msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": errtext.Bound(msg)})
 }
 
 // lfsToken extracts the JWT from either Basic auth (username "t" — what
@@ -251,7 +255,11 @@ func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repo str
 			return
 		}
 		defer gz.Close()
-		body = gz
+		// The cap above counts the compressed bytes. The decoded stream
+		// gets the same bound, so a small body cannot make the server
+		// decode far more than the limit before it authenticates the
+		// request.
+		body = http.MaxBytesReader(w, gz, lfsMaxBatchBody)
 	}
 	var req lfsBatchRequest
 	if err := json.NewDecoder(body).Decode(&req); err != nil {
@@ -318,12 +326,33 @@ func lfsObjectFail(res *lfsObjectResult, code int, msg string) {
 	res.Error = &lfsObjectError{Code: code, Message: msg}
 }
 
+// lfsMaxEchoOID bounds the invalid oid that a batch entry repeats, at the
+// length of a valid one: every entry repeats its oid, so a batch of long
+// oids would otherwise answer with several times its 4 MiB body. git-lfs
+// reports the error of an entry without looking its oid up.
+const lfsMaxEchoOID = 64
+
+// lfsEchoOID is the oid that the entry of an invalid oid repeats: an oid
+// of up to lfsMaxEchoOID bytes unchanged, a longer one cut to that length
+// at a rune boundary and ended with an ellipsis.
+func lfsEchoOID(oid string) string {
+	if len(oid) <= lfsMaxEchoOID {
+		return oid
+	}
+	cut := lfsMaxEchoOID
+	for cut > 0 && !utf8.RuneStart(oid[cut]) {
+		cut--
+	}
+	return oid[:cut] + "…"
+}
+
 // lfsValidateSpec applies the shared per-object validation and key
 // resolution. LFS keys are scoped to the base RepoID (blob.LFSKey): the
 // `+ephemeral` / `+import` namespaces share the repo's LFS object space,
 // since pointers in any namespace address the same content.
 func lfsValidateSpec(res *lfsObjectResult, target repoTarget, obj lfsObjectSpec) (key string, ok bool) {
 	if !lfsOIDPattern.MatchString(obj.OID) {
+		res.OID = lfsEchoOID(obj.OID)
 		lfsObjectFail(res, http.StatusUnprocessableEntity, "oid must be 64 lowercase hex digits (sha256)")
 		return "", false
 	}

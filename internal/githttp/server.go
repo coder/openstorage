@@ -26,6 +26,7 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -119,6 +120,9 @@ type Server struct {
 	// (issue #59, verifystate.go); <= 0 disables the budget. Set by the
 	// serve wiring.
 	VerifySigBudget int
+	// keyFailures rate-limits the log lines of key failures (see
+	// verifyFailure).
+	keyFailures KeyFailureLog
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
@@ -500,10 +504,13 @@ func NewServer(st ref.RefStore, bl blob.BlobStore, cacheDir string, verifier aut
 	}
 }
 
+// httpError writes the JSON error body of a git route. It cuts msg with
+// errtext.Bound: a message can repeat request text, such as the issuer of a
+// token (verifyFailure).
 func httpError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": errtext.Bound(msg)})
 }
 
 // Handler routes the smart-HTTP and LFS endpoints per repo (docs/explanation/git-protocol-and-namespaces.md):
@@ -567,7 +574,7 @@ func (s *Server) verifyClaims(ctx context.Context, token, repo, scope string) (*
 	assertf(s.Verifier != nil && s.Org != "", "Server used without Verifier/Org")
 	claims, err := s.Verifier.Verify(ctx, token)
 	if err != nil {
-		return nil, http.StatusUnauthorized, err
+		return nil, http.StatusUnauthorized, s.verifyFailure(ctx, err)
 	}
 	// A signature valid for some *other* registered org must not grant
 	// access to this org's repos.

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // maxDecodeWork bounds the bytes that unmarshalBody decodes for one body
@@ -116,19 +117,36 @@ func paramsText(params []invalidParam) string {
 	return strings.Join(items, "; ")
 }
 
+// maxUnknownNameBytes bounds the member name that unknownFieldText repeats.
+// The longest field name of a request body has 25 bytes, so a misspelled
+// name is repeated whole. A longer name is no field name, and the body
+// limit lets it reach 1 MiB: `error` and `detail` repeat it with escapes
+// of up to 6 bytes for each byte, which made answers of 12 MB.
+const maxUnknownNameBytes = 256
+
 // unknownFieldText returns `unknown field "x"` for the error that
 // encoding/json gives a member that DisallowUnknownFields refuses, and ""
 // for any other error. That error has no type: its text is fixed (pinned by
-// TestDecodeError), and it holds the member name only.
+// TestDecodeError), and it holds the member name only. A name of more than
+// maxUnknownNameBytes is cut at a character to at most that many bytes, and
+// ends with an ellipsis and its length: `unknown field "xx…" (1000000 bytes)`.
 func unknownFieldText(err error) string {
 	rest, ok := strings.CutPrefix(err.Error(), "json: unknown field ")
 	if !ok || !strings.HasPrefix(rest, `"`) {
 		return ""
 	}
-	if _, uerr := strconv.Unquote(rest); uerr != nil {
+	name, uerr := strconv.Unquote(rest)
+	if uerr != nil {
 		return ""
 	}
-	return "unknown field " + rest
+	if len(name) <= maxUnknownNameBytes {
+		return "unknown field " + rest
+	}
+	cut := maxUnknownNameBytes
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return "unknown field " + strconv.Quote(name[:cut]+"…") + " (" + strconv.Itoa(len(name)) + " bytes)"
 }
 
 // nullMembers returns body with every value at the dotted path field

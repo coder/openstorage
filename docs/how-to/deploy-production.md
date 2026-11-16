@@ -38,7 +38,10 @@ package fixes:
 
 - `apk add --no-cache` resolves packages from the Alpine v3.24 repositories at build
   time, so an uncached rebuild re-resolves them. It does not upgrade every package
-  inherited from the base.
+  inherited from the base. The Dockerfile upgrades one of them, `zlib`, by name
+  (`apk upgrade --no-cache zlib`), because the pinned base holds a version that
+  Alpine's security database lists as vulnerable. That line goes away once the
+  pinned base ships the fixed version.
 - Base-image and package upgrades still need qualification.
 
 Alpine v3.24 upstream support ([release inventory](https://alpinelinux.org/releases.json),
@@ -300,36 +303,62 @@ Unable to create '<path>.lock': File name too long`. A REST request that hydrate
 repository logs the same git error under `materialize repository`, without the repo
 ID. Rebuilding the cache does not help, because the ref is in the ref store. No API
 route, push or sync deletes a notes ref: `DELETE /repos/notes` removes one note, not the
-ref. Remove the ref from the ref store with
+ref.
+
+A branch whose tip is not a commit wedges a repository the same way. Before the update
+hook refused such a push, a token with `git:write` could push a branch at a blob, a tree
+or an annotated tag. git refuses to write a non-commit under `refs/heads/`, so the ref
+store holds a value that no cache can take. The git read logs the `hydrate <repo ID>:
+update-ref --stdin: exit status 128` line, and the git error in it holds `trying to write
+non-commit object <sha> to branch '<ref>'`. Rebuilding the cache does not help here either.
+
+Remove either kind of ref from the ref store with
 [`openstorage repair-refs`](../reference/cli.md#openstorage-repair-refs):
 
 1. Find the repo ID in the log: it is the text after `hydrate`, without the colon that
    follows it. The ID is also in the cache path of the error, `<cache dir>/<repo ID>.git`,
    so a REST request's `materialize repository` line shows it. To get the `hydrate`
    line, run `git ls-remote` on the repository with a token that has `git:read`.
-2. List the refs, with the same database URL (or `--data-dir`) as `serve`:
-   `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints the
-   repository's URL, the number of refs that it scanned, and each ref that git can never
-   lock, with its SHA. A ref
+2. List the refs, with the same database URL and blob store URL (or `--data-dir`) as
+   `serve`: `openstorage repair-refs <repo ID>`. This dry run changes no ref. It prints the
+   repository's URL, the number of refs that it scanned, each ref that git can never
+   lock, each branch whose tip is not a commit, and each lockable branch whose tip object
+   the packs do not hold, with its SHA and, for a branch whose tip is not a commit, the
+   object type. A ref
    is on the list when any part of its name is over 255 bytes, or its last part is over
-   250 bytes. A ref that git can lock is never on the list.
+   250 bytes. A branch is on the list when its tip is a blob, a tree or an annotated tag.
+   The command reads that type from the repository's packs: it downloads them into a
+   temporary directory under `$TMPDIR` and removes the directory as soon as it has read the
+   tips, and also after an error, `SIGINT`, `SIGTERM` or `SIGHUP`. A run that `nohup` started
+   ignores `SIGHUP`. After `SIGKILL` or `SIGQUIT`, delete the `openstorage-repair-refs-*`
+   directory by hand. Run the command where `$TMPDIR` has room for the packs. A ref that git can
+   lock is on the list only as a branch whose tip is not a commit, or whose tip object the
+   packs do not hold. A branch at a commit and a tag at a blob stay off it.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
    and exits with an error. Run it again to list what is left. The command keeps a ref
    that is the repository's default branch, as `DELETE /repos/branches` does: the list
-   marks it. Set another default branch with `PATCH /repo`, then run the command again.
-4. Run the dry run once more. It must list no ref. An ID with no repository, and a
+   marks it. Set another default branch with `PATCH /repo`, then run the command again. The
+   command never deletes a branch whose tip object the packs do not hold, unless git can
+   never lock its name (the name rule comes first, and it needs no object). The list shows
+   the kept branch as missing, and the command exits with an error after it deleted the rest.
+   That branch still wedges the repository, so find the pack first (`openstorage list-packs --repo <repo ID>`,
+   with the same `--data-dir` or URLs as `serve`).
+4. Run the dry run once more. It must list no ref, apart from a branch that the command
+   keeps because its tip object is missing. An ID with no repository, and a
    database URL or `--data-dir` that is not the one `serve` uses, are errors. A scan of
-   0 refs means that the repository has no refs. The next clone or fetch hydrates the
-   repository again, on every replica.
+   0 refs means that the repository has no refs. When the list holds no ref, the next
+   clone or fetch hydrates the repository again, on every replica. A kept branch with a
+   missing tip object still wedges it.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and
 no sync poke. It also lists a branch or tag with such a name. Delete a branch or tag
 over REST (`DELETE /repos/branches`, `DELETE /repos/tags`) when you want its push
 webhook. With `--yes` the command lists the refs again and deletes what it finds, so a
-ref that appeared after your dry run goes too.
+ref that appeared after your dry run goes too. It deletes refs only: the objects and
+packs of a deleted branch stay.
 
 ## Concurrent boot: schema setup and migrations
 
@@ -393,6 +422,7 @@ The server bounds request bodies natively:
 |---|---|---|
 | Push | Decoded body ≤ [`OPENSTORAGE_MAX_PUSH_BYTES`](../reference/configuration.md#openstorage_max_push_bytes) (default 2 × the pack quota, 2 MiB minimum). Git is fed at most the cap's worth of bytes. | `413`. Git discards the truncated quarantine; a declared oversize is rejected without reading. |
 | Gzip-encoded `git-upload-pack` (fetch negotiation) | Fixed 4 MiB decoded, plus a small compressed-stream allowance so decode-to-nothing gzip streams cannot hold a connection open. Must finish within 30 seconds. | `413` before Git runs |
+| Git LFS batch request body | 4 MiB. A gzip-encoded body counts against it twice: its compressed bytes and its decoded bytes. The server reads at most that much of either before it authenticates the request. | `400` with `bad batch request: request body too large` |
 
 - Size temporary disk for up to one push cap per concurrent push.
 - A proxy request-body cap is optional defense in depth. If you set one, size it at or
@@ -599,6 +629,13 @@ repository. Repair after the roll, not during it: when the last replica runs the
 build, follow [Refs that git can never lock](#refs-that-git-can-never-lock) for each
 repository whose hydration logs `File name too long`.
 
+**A replica on v0.20.0 or earlier, or on a build of `main` from before the update hook refused a
+branch at a blob, a tree or an annotated tag, still stores the value of such a push.** The
+pusher reads `ng`, but the ref store has taken the value by then. Later builds refuse it
+per ref before the ref store takes it. Until the last replica runs a later build, a token
+with `git:write` can wedge a repository this way. Repair after the roll: follow the same section for each
+repository whose hydration logs `trying to write non-commit object`.
+
 ## JWT keys across the fleet
 
 Tokens are verified against the org's public keys in the database. Each replica
@@ -663,6 +700,7 @@ webhook events.
 | `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
 | `commit-graph refresh outcome=…` log lines | A `repo=` that repeats `lock_held`, `timed_out`, or `failed` needs a look ([outcomes and stale-lock runbook](#commit-graph-refresh)) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
+| `verify token: key store lookup failed` / `verify token: a registered key cannot be used` log lines | A git, LFS or REST request reached the key store or a registered key, and it failed. The line holds the cause (a cause of more than 300 runes loses its middle). A git or LFS client reads a text that does not hold the cause. For each kind, the git and LFS routes together write at most one line per minute in each `serve` process, the REST routes write at most one more, and a line says how many earlier lines of its kind were held back when some were |
 | `lane scan: requeued a lane whose work had no job` log line | A sync or push request lost its job and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
@@ -693,6 +731,7 @@ line can be up to 1 MiB.
 | `repack: folded packs` / `repack trigger: scheduled fold` (What to monitor) | `openstorage_job_runs_total{job="repack"}` | Fold outcomes only; trigger lines stay **log only** |
 | Pack quota exceeded (What to monitor) | **log only** | Client-visible hook error plus the `quota: receive-pack … at/over quota` server line |
 | Postgres availability and advisory-lock waits (What to monitor) | **log only** | Observe PostgreSQL itself (`pg_locks`) |
+| `verify token: …` lines (What to monitor) | **log only** | The two texts shown, at most one line for each kind per minute for the git and LFS routes together, and one more for the REST routes, in each `serve` process |
 | `lane scan: requeued a lane whose work had no job` (What to monitor) | **log only** | Fields `org`, `repo` and `lane` |
 | S3WAL `… conditional-write contention retries exhausted` (S3WAL signals) | `openstorage_s3wal_cas_contention_exhausted_total` by `scope` | Serve-process mutations only; push-side failures reach the client and hook stderr |
 | `WARN s3wal manifest approaching size cap` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="warn"}` | Counts when the once-per-repository warning is logged |
