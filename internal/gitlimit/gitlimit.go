@@ -48,10 +48,11 @@ const (
 	// counted by ArgListBytes. Linux limits all arguments and environment
 	// entries of one program together, their pointers included, to a
 	// quarter of the stack limit, at most 6 MiB, and to 128 KiB (ARG_MAX,
-	// 32 pages of 4 KiB) for a stack limit from 144 KiB to 512 KiB, below
-	// which the stack itself holds less. macOS limits them to 1 MiB. Half
-	// of the 128 KiB leaves the other half to the server's environment,
-	// which git inherits, and to git's own arguments.
+	// 131,072 bytes) for a stack limit from 144 KiB to 512 KiB (measured
+	// with 4 KiB pages), below which the stack itself holds less. macOS
+	// limits them to 1 MiB. Half of the 128 KiB leaves the other half to
+	// the server's environment, which git inherits, and to git's own
+	// arguments.
 	MaxArgListBytes = 64 << 10
 	// ArgListEntryBytes is what a value of such a list costs beyond its
 	// length: what the server puts around it (":(literal)", or a "-L"

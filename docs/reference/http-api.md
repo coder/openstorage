@@ -230,19 +230,22 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
 - **Lists of such values** have a limit for all their entries together. Linux limits all
   arguments and environment entries of one program together, their pointers included: a
   quarter of the server's stack limit, at most 6 MiB (2 MiB with the usual 8 MiB stack
-  limit), and 128 KiB (131,072 bytes) for a stack limit from 144 KiB to 512 KiB. A
-  smaller stack limit holds less. macOS allows 1 MiB. So the grep `paths`, the `path`
-  params of a diff, and the blame `range` params may hold at most 65,536 bytes together,
-  half of those 128 KiB, where each entry counts its length plus 32 bytes (what git gets
-  around it: `:(literal)` or `-L`, the terminating NULs and the argument pointers). The
-  other half is for the server's environment, which git inherits, and git's own
-  arguments. A longer list answers `400` before git starts, once each of its entries is
-  valid. The message names the list and the limit (`invalid paths (want at most 65536
-  bytes for all entries, each counting 32 more)`; `path params` and `range params` on
-  the query routes), and grep names `paths` in `invalid_params`. Values that each fit
-  can still pass the total, and that answer is a `500`: a single value near its own
-  limit with a stack limit below about 1 MiB, any request with a stack limit below 144
-  KiB, or a large server environment.
+  limit), and 128 KiB (131,072 bytes) for a stack limit from 144 KiB to 512 KiB
+  (measured with 4 KiB pages). A smaller stack limit holds less. macOS allows 1 MiB. So
+  the grep `paths`, the `path` params of a diff, and the blame `range` params may hold
+  at most 65,536 bytes together, half of those 128 KiB, where each entry counts its
+  length plus 32 bytes (what git gets around it: `:(literal)` or `-L`, the terminating
+  NULs and the argument pointers). The other half is for the server's environment, which
+  git inherits, and git's own arguments. A longer list answers `400` before git starts,
+  once each of its entries is valid, so one entry over 65,504 bytes already answers
+  `400` although its own limit is higher. The message names the list and the limit
+  (`invalid paths (want at most 65536 bytes for all entries, each counting 32 more)`;
+  `path params` and `range params` on the query routes), and grep names `paths` in
+  `invalid_params`. Values that each fit can still pass the total, and that answer is a
+  `500`: a value over about 64 KiB, such as a long `query.pattern`, next to a list near
+  the budget with a stack limit below about 1 MiB, or a large server environment. With a
+  stack limit below 144 KiB, git can also crash after it starts, and that answer is a
+  `422`. A list at the budget still worked with a stack limit of 112 KiB.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field

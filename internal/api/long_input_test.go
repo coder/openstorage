@@ -29,8 +29,9 @@ import (
 )
 
 // TestGitArgLimitsAreTheDocumentedNumbers pins the limits that
-// docs/reference/http-api.md states. The other tests take them from the
-// constants, so a limit made too strict would pass them.
+// docs/reference/http-api.md states, and the texts of the list limit. The
+// other tests take them from the constants, so a limit made too strict, or
+// a text that drifts from the docs, would pass them.
 func TestGitArgLimitsAreTheDocumentedNumbers(t *testing.T) {
 	for _, c := range []struct {
 		name      string
@@ -44,6 +45,14 @@ func TestGitArgLimitsAreTheDocumentedNumbers(t *testing.T) {
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+	for _, c := range [][2]string{
+		{listTooLongMsg("paths"), "invalid paths (want at most 65536 bytes for all entries, each counting 32 more)"},
+		{listTooLongReason, "must total at most 65536 bytes, each entry counting 32 more"},
+	} {
+		if c[0] != c[1] {
+			t.Errorf("text %q, want the documented %q", c[0], c[1])
 		}
 	}
 }
