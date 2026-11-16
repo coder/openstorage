@@ -46,8 +46,8 @@ Each setting takes its value from the first source that is set:
 | [`OPENSTORAGE_RATE_RPS`](#openstorage_rate_rps--openstorage_rate_burst) | unset (disabled) | Per-client-IP rate limit: sustained requests/second |
 | [`OPENSTORAGE_RATE_BURST`](#openstorage_rate_rps--openstorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
 | [`OPENSTORAGE_TRUSTED_PROXIES`](#openstorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
-| [`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`](#openstorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
-| [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) | unset (transitional) | Unified sync egress policy: permit private-network upstreams for pull and push (two metadata addresses stay blocked) |
+| [`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`](#openstorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (cloud metadata endpoints and redirects stay blocked) |
+| [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) | unset (transitional) | Unified sync egress policy: permit private-network upstreams for pull and push (cloud metadata endpoints stay blocked) |
 | [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) | `false` | **Deprecated** push-only spelling of the sync egress policy |
 | [`OPENSTORAGE_SECRETS_KEY`](#openstorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
 | [`OPENSTORAGE_SECRETS_MODE`](#openstorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
@@ -333,6 +333,38 @@ limiters may trust. Bare IPs count as single-address entries.
 
 ## Egress policy
 
+### Cloud metadata endpoints
+
+Both egress guards, for webhook deliveries and for sync transfers, deny these
+instance-metadata and credential endpoints under every policy, also with
+`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE=true` or `OPENSTORAGE_SYNC_ALLOW_PRIVATE=true`. Each
+entry is one address. Most lie inside a private class (link-local, RFC 6598 shared,
+ULA), and the rest of that class stays admitted when the policy admits it.
+`168.63.129.16` is a public address, so the strict policy denies it too. An IPv4
+address is denied in its IPv4-mapped IPv6 form too, and a DNS name is denied when it
+resolves to one of them, as `metadata.google.internal` does.
+
+| Address | Endpoint of |
+|---|---|
+| `169.254.169.254` | AWS, Google Cloud, Azure, Oracle Cloud, DigitalOcean, Akamai (Linode), Hetzner, Huawei Cloud, OpenStack |
+| `fd00:ec2::254` | AWS (IPv6) |
+| `169.254.170.2` | AWS ECS task metadata and task role credentials |
+| `169.254.170.23`, `fd00:ec2::23` | AWS EKS Pod Identity Agent |
+| `fd20:ce::254` | Google Cloud (IPv6-only instances) |
+| `169.254.169.252` | Google Kubernetes Engine metadata server (Workload Identity) |
+| `100.100.100.200` | Alibaba Cloud |
+| `169.254.10.10`, `169.254.0.23` | Tencent Cloud (`metadata.tencentyun.com`, Cloudbase-Init) |
+| `169.254.42.42`, `fd00:42::42` | Scaleway |
+| `fd00:a9fe:a9fe::1` | Akamai (Linode) (IPv6) |
+| `fe80::a9fe:a9fe` | OpenStack, Hetzner, Akamai (Linode) (IPv6) |
+| `fd00:c1::a9fe:a9fe` | Oracle Cloud (IPv6) |
+| `168.63.129.16` | Azure WireServer (metadata and VM credential bootstrap) |
+| `192.0.0.192` | Oracle Cloud Infrastructure Classic |
+
+`internal/events/guard.go` (`metadataAddrs`) cites a source of each: the provider's
+documentation, or for `fd00:c1::a9fe:a9fe` Oracle's own SDK, whose documentation names
+only `169.254.169.254`.
+
 ### `OPENSTORAGE_SYNC_ALLOW_PRIVATE`
 
 Unified egress policy for upstream sync in **both** directions (ADR-45).
@@ -342,18 +374,20 @@ Unified egress policy for upstream sync in **both** directions (ADR-45).
   this one, so an empty value here lets it decide pushes.
 - **Values:**
   - `true`: both directions may target internal forges: loopback, RFC 1918, RFC 6598
-    shared, link-local and ULA addresses. Only two cloud-metadata addresses
-    (`169.254.169.254`, `fd00:ec2::254`) and the other IANA special-purpose ranges stay
-    denied; a metadata endpoint inside an admitted range, such as `100.100.100.200`, is
-    admitted.
+    shared, link-local and ULA addresses. The
+    [cloud metadata endpoints](#cloud-metadata-endpoints), the other IANA
+    special-purpose ranges, multicast, broadcast, unspecified and zone-scoped
+    addresses, and the rest of IPv6 outside `2000::/3` stay denied. An IPv4-mapped IPv6
+    address (`::ffff:10.0.0.1`) counts as its IPv4 address.
   - `false`: strict both ways; only public upstreams are dialable.
   - **Unset or empty:** pushes stay strict (the deprecated
     [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) may relax
-    them); pulls ALLOW private upstreams, and `serve` logs a boot warning.
+    them); pulls ALLOW the private upstreams that `true` admits, and `serve` logs a boot
+    warning.
   - Malformed booleans are startup errors.
 - **Enforcement:** every http(s) sync transfer (`upstream_host` is caller-linked data)
   dials through a vetting proxy with the webhook destination policy: private, loopback,
-  RFC 6598 shared, link-local, metadata, and special-purpose targets are denied, with
+  RFC 6598 shared, link-local, cloud metadata, and special-purpose targets are denied, with
   every DNS answer re-vetted at connect time.
 - **Covered:** pulls (`POST /repos/pull-upstream`, the first sync at `POST /repos`,
   freshness pokes) and push forwards (`POST /repos/push-upstream`, `forward_pushes`).
@@ -392,11 +426,13 @@ Controls the native webhook SSRF guard.
 - **Default:** `false`. Delivery rejects IANA special-purpose ranges, including loopback,
   RFC 1918, RFC 6598 shared, IPv4/IPv6 link-local, IPv6 ULA, translation/protocol
   anycast, documentation, benchmarking, reserved, unspecified, multicast, broadcast, and
-  cloud-metadata targets. IPv4-mapped IPv6 is normalized first, so `::ffff:10.0.0.1` is
-  private.
+  the [cloud metadata endpoints](#cloud-metadata-endpoints). IPv4-mapped IPv6 is
+  normalized first, so `::ffff:10.0.0.1` is private.
 - **`true`** (Go boolean; logs a startup warning): admits loopback, RFC 1918, RFC 6598
   shared, link-local, and ULA receivers. Use it only for intentionally internal webhooks.
-  It **still blocks** cloud metadata, unspecified/multicast/broadcast, other IANA
+  It **still blocks** the [cloud metadata endpoints](#cloud-metadata-endpoints) (such
+  as `100.100.100.200` inside RFC 6598 shared space), unspecified/multicast/broadcast,
+  zone-scoped addresses, other IANA
   special-purpose ranges (documentation, benchmarking, reserved, translation,
   protocol-anycast), and redirects.
 - Malformed booleans are startup errors.

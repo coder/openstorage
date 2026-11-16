@@ -12,8 +12,9 @@ package sync
 // whose dials go through TargetGuard.DialContext. The operator escape
 // hatch (OPENSTORAGE_SYNC_ALLOW_PRIVATE; deprecated push-only spelling
 // OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE) relaxes only the private receiver
-// classes, exactly like the webhook hatch: metadata, broadcast, and the
-// special-purpose registry stay denied.
+// classes (loopback, RFC 1918, RFC 6598 shared, link-local, ULA), exactly
+// like the webhook hatch: the cloud metadata endpoints, broadcast, and the
+// other special-purpose ranges stay denied.
 
 import (
 	"context"

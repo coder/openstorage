@@ -351,8 +351,10 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		}},
 		Logger: logger,
 		// Sync egress guard policy (see upsync/egress.go, issue #139):
-		// operators syncing with genuinely internal forges opt private
-		// receiver classes in; metadata/special ranges stay denied. The
+		// operators syncing with genuinely internal forges opt the private
+		// receiver classes in (loopback, RFC 1918, RFC 6598 shared,
+		// link-local, ULA); the cloud metadata endpoints and the other
+		// special-purpose ranges stay denied. The
 		// pull side's transitional default is allow (0.6.x compatibility)
 		// until a future release flips it — logSyncEgressWarnings
 		// announces the flip at boot.
