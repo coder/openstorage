@@ -142,3 +142,94 @@ func TestNewRegisteredPackViewHealsAgainWhenTheListingGrows(t *testing.T) {
 		t.Fatalf("CheckAnswer on a complete view = %v, want nil", err)
 	}
 }
+
+// A "missing" answer stands only when no pack was registered since the view was
+// built: another node can register a pack that holds the object right after
+// the listing, so the answer is asked again over a new view, a bounded number
+// of times.
+func TestAskRegisteredPacksAsksAgainWhenAPackWasRegisteredSinceTheView(t *testing.T) {
+	repoPath := t.TempDir()
+	packDir := filepath.Join(repoPath, "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	id := func(i int) string { return strings.Repeat(string(rune('a'+i)), 40) }
+	for i := range 8 {
+		for _, ext := range []string{".pack", ".idx"} {
+			if err := os.WriteFile(filepath.Join(packDir, "pack-"+id(i)+ext), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	ctx := t.Context()
+	listing := func(n int) func(int) []ref.Pack {
+		return func(int) []ref.Pack {
+			var packs []ref.Pack
+			for i := range n {
+				packs = append(packs, ref.Pack{ID: id(i)})
+			}
+			return packs
+		}
+	}
+
+	t.Run("a pack registered after the view holds the object", func(t *testing.T) {
+		// The first listing names one pack, the later ones two.
+		st := &listsPacks{packs: func(call int) []ref.Pack { return listing(min(call, 2))(call) }}
+		asks := 0
+		kinds, err := AskRegisteredPacks(ctx, st, repoPath, "r", nil, func(*RegisteredPackView) (map[string]string, error) {
+			asks++
+			if asks == 1 {
+				return map[string]string{"x": "missing"}, nil
+			}
+			return map[string]string{"x": "commit"}, nil
+		})
+		if err != nil || kinds["x"] != "commit" || asks != 2 {
+			t.Fatalf("AskRegisteredPacks = %v, %v after %d asks, want commit after 2", kinds, err, asks)
+		}
+	})
+
+	t.Run("a listing that did not change keeps the missing answer", func(t *testing.T) {
+		st := &listsPacks{packs: listing(2)}
+		asks := 0
+		kinds, err := AskRegisteredPacks(ctx, st, repoPath, "r", nil, func(*RegisteredPackView) (map[string]string, error) {
+			asks++
+			return map[string]string{"x": "missing"}, nil
+		})
+		if err != nil || kinds["x"] != "missing" || asks != 1 || st.calls != 2 {
+			t.Fatalf("AskRegisteredPacks = %v, %v after %d asks and %d listings, want missing after 1 ask and 2 listings", kinds, err, asks, st.calls)
+		}
+	})
+
+	t.Run("a found answer never lists again", func(t *testing.T) {
+		st := &listsPacks{packs: listing(2)}
+		kinds, err := AskRegisteredPacks(ctx, st, repoPath, "r", nil, func(*RegisteredPackView) (map[string]string, error) {
+			return map[string]string{"x": "commit"}, nil
+		})
+		if err != nil || kinds["x"] != "commit" || st.calls != 1 {
+			t.Fatalf("AskRegisteredPacks = %v, %v after %d listings, want commit after 1", kinds, err, st.calls)
+		}
+	})
+
+	t.Run("a registry that keeps growing ends at the bound", func(t *testing.T) {
+		// Each listing names one more pack than the last, and the cache has them all.
+		st := &listsPacks{packs: func(call int) []ref.Pack { return listing(min(call, 8))(call) }}
+		asks := 0
+		kinds, err := AskRegisteredPacks(ctx, st, repoPath, "r", nil, func(*RegisteredPackView) (map[string]string, error) {
+			asks++
+			return map[string]string{"x": "missing"}, nil
+		})
+		if err != nil || kinds["x"] != "missing" || asks != registryViewHealRounds+1 {
+			t.Fatalf("AskRegisteredPacks = %v, %v after %d asks, want missing after %d", kinds, err, asks, registryViewHealRounds+1)
+		}
+	})
+
+	t.Run("an incomplete view fails the missing answer", func(t *testing.T) {
+		st := &listsPacks{packs: func(int) []ref.Pack { return []ref.Pack{{ID: id(0)}, {ID: strings.Repeat("z", 40)}} }}
+		_, err := AskRegisteredPacks(ctx, st, repoPath, "r", nil, func(*RegisteredPackView) (map[string]string, error) {
+			return map[string]string{"x": "missing"}, nil
+		})
+		if !errors.Is(err, ErrPackMissing) {
+			t.Fatalf("AskRegisteredPacks on an incomplete view = %v, want ErrPackMissing", err)
+		}
+	})
+}

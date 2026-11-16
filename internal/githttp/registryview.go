@@ -36,6 +36,9 @@ type RegisteredPackView struct {
 	// absent lists the registered packs that the cache still lacked after the
 	// heal rounds. The view does not link them.
 	absent []string
+	// listed holds the IDs of every pack that the registry listed when the view
+	// was built.
+	listed map[string]bool
 }
 
 // NewRegisteredPackView lists the packs that st has for repo and links their
@@ -76,7 +79,11 @@ func NewRegisteredPackView(ctx context.Context, st ref.RefStore, repoPath, repo 
 	if err != nil {
 		return nil, err
 	}
-	v := &RegisteredPackView{dir: dir, repoPath: repoPath, repo: repo, absent: absent}
+	listed := make(map[string]bool, len(packs))
+	for _, p := range packs {
+		listed[p.ID] = true
+	}
+	v := &RegisteredPackView{dir: dir, repoPath: repoPath, repo: repo, absent: absent, listed: listed}
 	viewPacks := filepath.Join(dir, "pack")
 	if err := os.Mkdir(viewPacks, 0o700); err != nil {
 		v.Close()
@@ -92,6 +99,63 @@ func NewRegisteredPackView(ctx context.Context, st ref.RefStore, repoPath, repo 
 		}
 	}
 	return v, nil
+}
+
+// listingChanged reports whether the registry now lists a pack that the view was
+// not built from. Another node can register a pack that holds an object after
+// the view was built, so a "missing" answer is final only when this is false.
+func (v *RegisteredPackView) listingChanged(ctx context.Context, st ref.RefStore) (bool, error) {
+	packs, err := st.ListPacks(ctx, v.repo)
+	if err != nil {
+		return false, fmt.Errorf("list the packs of %s: %w", v.repo, err)
+	}
+	for _, p := range packs {
+		if !v.listed[p.ID] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// AskRegisteredPacks builds a view, calls ask with it and returns the answer of
+// ask, the type of each id as the registered packs show it ("missing" for an
+// object that no registered pack holds). A "missing" answer stands only when the
+// registry lists no pack that the view was built without, so it builds a new
+// view and asks again, at most registryViewHealRounds more times, when another
+// node registered a pack since the view was built. An incomplete view fails a
+// "missing" answer (CheckAnswer).
+func AskRegisteredPacks(ctx context.Context, st ref.RefStore, repoPath, repo string, heal func(context.Context) error, ask func(*RegisteredPackView) (map[string]string, error)) (map[string]string, error) {
+	for round := 0; ; round++ {
+		view, err := NewRegisteredPackView(ctx, st, repoPath, repo, heal)
+		if err != nil {
+			return nil, err
+		}
+		kinds, err := ask(view)
+		if err == nil && hasMissing(kinds) && round < registryViewHealRounds {
+			var changed bool
+			if changed, err = view.listingChanged(ctx, st); err == nil && changed {
+				view.Close()
+				continue
+			}
+		}
+		if err == nil {
+			err = view.CheckAnswer(kinds)
+		}
+		view.Close()
+		if err != nil {
+			return nil, err
+		}
+		return kinds, nil
+	}
+}
+
+func hasMissing(kinds map[string]string) bool {
+	for _, k := range kinds {
+		if k == "missing" {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckAnswer returns an error that wraps ErrPackMissing when kinds, an answer

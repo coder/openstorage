@@ -288,24 +288,14 @@ func RegisteredKinds(ctx context.Context, st ref.RefStore, bl blob.BlobStore, re
 	if len(ids) == 0 {
 		return map[string]string{}, nil
 	}
-	view, err := githttp.NewRegisteredPackView(ctx, st, repoPath, repo, func(ctx context.Context) error {
+	return githttp.AskRegisteredPacks(ctx, st, repoPath, repo, func(ctx context.Context) error {
 		return githttp.HydratePacks(ctx, st, bl, repoPath, repo)
+	}, func(view *githttp.RegisteredPackView) (map[string]string, error) {
+		out, err := Run(ctx, Cmd{Class: Light, Dir: repoPath, Env: view.Env(os.Environ()), Stdin: strings.NewReader(strings.Join(ids, "\n") + "\n"),
+			Args: []string{"cat-file", "--batch-check=%(objecttype)"}})
+		if err != nil {
+			return nil, err
+		}
+		return githttp.ParseObjectKinds(ids, out)
 	})
-	if err != nil {
-		return nil, err
-	}
-	defer view.Close()
-	out, err := Run(ctx, Cmd{Class: Light, Dir: repoPath, Env: view.Env(os.Environ()), Stdin: strings.NewReader(strings.Join(ids, "\n") + "\n"),
-		Args: []string{"cat-file", "--batch-check=%(objecttype)"}})
-	if err != nil {
-		return nil, err
-	}
-	kinds, err := githttp.ParseObjectKinds(ids, out)
-	if err != nil {
-		return nil, err
-	}
-	if err := view.CheckAnswer(kinds); err != nil {
-		return nil, err
-	}
-	return kinds, nil
 }

@@ -3009,32 +3009,26 @@ func denyUnregisteredTargets(ctx context.Context, repo string, commands []refCom
 		return fmt.Errorf("pre-receive: open ref store: %w", err)
 	}
 	defer st.Close()
-	view, err := NewRegisteredPackView(ctx, st, repoPath, repo, func(ctx context.Context) error {
+	kinds, err := AskRegisteredPacks(ctx, st, repoPath, repo, func(ctx context.Context) error {
 		bl, err := blob.Open(ctx, mustEnv(envHookBlobURL...))
 		if err != nil {
 			return err
 		}
 		defer bl.Close()
 		return HydratePacks(ctx, st, bl, repoPath, repo)
+	}, func(view *RegisteredPackView) (map[string]string, error) {
+		var out strings.Builder
+		cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check=%(objecttype)")
+		cmd.Env = gitlimit.NoReplaceObjects(view.EnvForPush(os.Environ(), envconfig.Getenv("GIT_QUARANTINE_PATH")))
+		cmd.Stdin = strings.NewReader(strings.Join(stored, "\n") + "\n")
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("read the object types of the new values in the registered packs: %w", err)
+		}
+		return ParseObjectKinds(stored, out.String())
 	})
 	if err != nil {
 		return fmt.Errorf("pre-receive: read the registered packs: %w", err)
-	}
-	defer view.Close()
-	var out strings.Builder
-	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check=%(objecttype)")
-	cmd.Env = gitlimit.NoReplaceObjects(view.EnvForPush(os.Environ(), envconfig.Getenv("GIT_QUARANTINE_PATH")))
-	cmd.Stdin = strings.NewReader(strings.Join(stored, "\n") + "\n")
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("pre-receive: read the object types of the new values in the registered packs: %w", err)
-	}
-	kinds, err := ParseObjectKinds(stored, out.String())
-	if err != nil {
-		return fmt.Errorf("pre-receive: %w", err)
-	}
-	if err := view.CheckAnswer(kinds); err != nil {
-		return fmt.Errorf("pre-receive: %w", err)
 	}
 	for _, c := range commands {
 		if c.new != ref.ZeroSHA && kinds[c.new] == "missing" {
