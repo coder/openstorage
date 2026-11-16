@@ -193,8 +193,8 @@ type walkFound struct {
 }
 
 // scanWalkSites returns, for each function of file that names an entry, as
-// `Recv.Name` or `Name`, how many places in it do and which identifiers its
-// body holds. It reads the syntax only, so it does not see the type of the
+// `Recv.Name` or `Name`, and for each package-level variable that does, how
+// many places in it do and which identifiers its body holds. It reads the syntax only, so it does not see the type of the
 // destination: it sees the type names that the function writes.
 func scanWalkSites(file *ast.File, entries []string) map[string]walkFound {
 	sites := make(map[string]walkFound)
@@ -225,6 +225,34 @@ func scanWalkSites(file *ast.File, entries []string) map[string]walkFound {
 		})
 		if found.places > 0 {
 			sites[name] = found
+		}
+	}
+	// A package-level variable that holds an entry (`var decode = unmarshalBody`)
+	// is a helper by another name.
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			vs := spec.(*ast.ValueSpec)
+			found := walkFound{names: make(map[string]bool)}
+			for _, value := range vs.Values {
+				ast.Inspect(value, func(n ast.Node) bool {
+					if id, ok := n.(*ast.Ident); ok {
+						found.names[id.Name] = true
+						if slices.Contains(entries, id.Name) {
+							found.places++
+						}
+					}
+					return true
+				})
+			}
+			if found.places > 0 {
+				for _, id := range vs.Names {
+					sites[id.Name] = found
+				}
+			}
 		}
 	}
 	return sites
@@ -289,9 +317,9 @@ func TestRequestTypesStayInsideTheDecodeWalk(t *testing.T) {
 }
 
 // TestScanWalkSites: the scan finds a typed handler, a decode through a
-// value, a helper, a method helper, and the callers of a helper that is an
-// entry, with the identifiers that each body holds, and it leaves other
-// functions out.
+// value, a helper, a method helper, a package-level variable that holds an
+// entry, and the callers of a helper that is an entry, with the identifiers
+// that each body holds, and it leaves other functions and variables out.
 func TestScanWalkSites(t *testing.T) {
 	const src = `package p
 
@@ -299,6 +327,10 @@ func handleA(w W, r R)                { var req T; _ = unmarshalBody(body, &req)
 func (s *server) handleB(w W, r R)    { decode := unmarshalBody; _ = decode(b, &u); _ = unmarshalBody(b, &v) }
 func decodeAny(w W, r R, dst any) bool { return unmarshalBody(b, dst) == nil }
 func (s *server) viaHelper(w W, r R)  { var req U; _ = decodeAny(w, r, &req) }
+var decodeBody = unmarshalBody
+var table = map[string]func([]byte, any) error{"a": unmarshalBody, "b": other}
+var unrelated = strictJSON
+func viaAlias(w W, r R)               { _ = decodeBody(b, &x) }
 func other(w W, r R)                  { _ = strictJSON(b, &req) }
 `
 	file, err := parser.ParseFile(token.NewFileSet(), "src.go", src, 0)
@@ -313,7 +345,7 @@ func other(w W, r R)                  { _ = strictJSON(b, &req) }
 		return out
 	}
 	got := scanWalkSites(file, []string{"unmarshalBody"})
-	if want := map[string]int{"handleA": 1, "server.handleB": 2, "decodeAny": 1}; !reflect.DeepEqual(places(got), want) {
+	if want := map[string]int{"handleA": 1, "server.handleB": 2, "decodeAny": 1, "decodeBody": 1, "table": 1}; !reflect.DeepEqual(places(got), want) {
 		t.Fatalf("with unmarshalBody only: %v, want %v", places(got), want)
 	}
 	if !got["handleA"].names["T"] || got["handleA"].names["U"] || got["decodeAny"].names["T"] {
@@ -325,8 +357,8 @@ func other(w W, r R)                  { _ = strictJSON(b, &req) }
 	if got, want := walkEntries(sites), []string{"unmarshalBody", "decodeAny", "decodeMethod"}; !slices.Equal(got, want) {
 		t.Fatalf("entries %q, want %q", got, want)
 	}
-	got = scanWalkSites(file, []string{"unmarshalBody", "decodeAny"})
-	if want := map[string]int{"handleA": 1, "server.handleB": 2, "decodeAny": 1, "server.viaHelper": 1}; !reflect.DeepEqual(places(got), want) {
+	got = scanWalkSites(file, []string{"unmarshalBody", "decodeAny", "decodeBody"})
+	if want := map[string]int{"handleA": 1, "server.handleB": 2, "decodeAny": 1, "server.viaHelper": 1, "decodeBody": 1, "table": 1, "viaAlias": 1}; !reflect.DeepEqual(places(got), want) {
 		t.Fatalf("with the helper as an entry: %v, want %v", places(got), want)
 	}
 }
