@@ -616,15 +616,16 @@ func TestReadValueListsPastGitArgBudget(t *testing.T) {
 		resp, out := e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token, grepBody(paths), "")
 		requireListTooLong(t, resp, out, "paths", true)
 
-		// An entry with a problem of its own is named, and the list is not.
-		paths[3000] = "../x"
+		// An entry with a problem of its own is named, and the list is not,
+		// also when good entries follow it.
+		paths[0] = "../x"
 		resp, out = e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token, grepBody(paths[:3001]), "")
 		var p problemBody
 		if err := json.Unmarshal(out, &p); err != nil {
 			t.Fatal(err)
 		}
-		if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != "paths.3000" {
-			t.Fatalf("status %d, invalid_params %+v; want 400 naming paths.3000 only", resp.StatusCode, p.InvalidParams)
+		if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != "paths.0" {
+			t.Fatalf("status %d, invalid_params %+v; want 400 naming paths.0 only", resp.StatusCode, p.InvalidParams)
 		}
 	})
 }

@@ -241,11 +241,13 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `400` although its own limit is higher. The message names the list and the limit
   (`invalid paths (want at most 65536 bytes for all entries, each counting 32 more)`;
   `path params` and `range params` on the query routes), and grep names `paths` in
-  `invalid_params`. Values that each fit can still pass the total, and that answer is a
-  `500`: a value over about 64 KiB, such as a long `query.pattern`, next to a list near
-  the budget with a stack limit below about 1 MiB, or a large server environment. With a
-  stack limit below 144 KiB, git can also crash after it starts, and that answer is a
-  `422`. A list at the budget still worked with a stack limit of 112 KiB.
+  `invalid_params`. These limits do not make every request fit. Values that each fit can
+  still pass the total, and that answer is a `500`: a single value near its own limit
+  with a stack limit of about 512 KiB or less, a value over about 64 KiB next to a list
+  near the budget with a stack limit below about 1 MiB, or a large server environment.
+  git also needs stack of its own: with a stack limit below about 176 KiB it can start
+  and then crash, and that answer is a `422`. Below that, even a list within the budget
+  can fail with a `422` or a `500`.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field
