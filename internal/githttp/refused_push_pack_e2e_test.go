@@ -236,7 +236,8 @@ func TestGitRefusalProbeBoundsTheChecks(t *testing.T) {
 	// A target that passes is remembered and never costs a failure.
 	asked = nil
 	probe = newGitRefusalProbe(func(sha string) bool { asked = append(asked, sha); return sha == "ok" })
-	if !probe.reaches("ok") || !probe.reaches("ok") || len(asked) != 1 {
-		t.Fatalf("a passing target asked git %d times, want 1", len(asked))
+	first, again := probe.reaches("ok"), probe.reaches("ok")
+	if !first || !again || len(asked) != 1 {
+		t.Fatalf("a passing target asked git %d times (answers %v, %v), want 1 and true, true", len(asked), first, again)
 	}
 }
