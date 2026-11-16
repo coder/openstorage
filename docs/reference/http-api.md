@@ -90,17 +90,20 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   A body with several invalid fields gets one item for each of them, as upstream says
   (`invalid_params` "names each invalid field"). The items follow the order of the
   route's request body in this document, array elements by index, and a field appears
-  once. `detail` then holds the message of each problem, joined by `; `. One answer
-  holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
-  out (not for fields of the wrong type, see below), unless the cut of a long `detail`
-  above removes that ending: then `detail` ends with `…` and gives no count. A check
-  that needs the repository's
-  state (for example, that a merge creates a commit and so needs an `author`) runs after
-  the checks of the body. A strictly decoded
+  once. `detail` then holds the message of each problem, joined by `; ` (a problem whose
+  fields all appear in earlier problems adds no message). One answer holds at most 100
+  items, and `detail` ends with `; and N more` when it leaves some out (not for fields
+  of the wrong type, see below): N counts what it leaves out, one for each item and one
+  for each problem that names no field. The cut of a long `detail` above can remove that
+  ending or cut it short, and then `detail` ends with `…`. A check that needs the
+  repository's state (for example, that a merge creates a commit and so needs an
+  `author`) runs after the checks of the body, except where this paragraph or the notes
+  on `POST /repos` below say otherwise. A strictly decoded
   body (`POST /api/repos/{repo_name}/notes/append` and `POST
   /api/repos/{repo_name}/upstream/pull`) is checked for its members first: the answer
   names each member that is unknown, repeated or `null`, or that must be an object and
-  is not, and none of the other problems. The members of the route's request body come
+  is not (an empty member name adds its message and names no field), and none of the
+  other problems. The members of the route's request body come
   first, in its order in this document (the problem of an object member before the
   problems of the members inside it), then the unknown members in the order of the
   request. A member that the request repeats is named once, and two members with one
@@ -136,31 +139,41 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   credential routes that name the repository or credential in the path
   (`/repos/{repo_name}/git-credentials` and
   `/repos/{repo_name}/git-credentials/{git_credential_id}`) look that one up before they
-  read the body, so on them a missing one is `404` even when the body is invalid. A grep
+  read the body, so on them a missing one is `404` even when the body is invalid. The
+  merge, branch, tag and note routes look up the repository before they read the body in
+  the same way, and so does every route on the `/api/repos/{repo_name}/...` path style.
+  A grep
   `pagination.cursor` that does not decode is named with the other invalid fields when
   the body has any. Alone, it keeps its place after the lookup of the repository, so a
-  missing repository is `404` first. `POST /repos/merge`, `POST /repos/branches/create`,
-  `POST /repos/tags`, `POST /repos`, `POST /repos/grep`, `POST /repos/archive`,
-  `POST /repos/notes`, `DELETE /repos/notes`,
+  missing repository is `404` first. A grep `query.pattern` that git refuses is found
+  when git runs the search, after the checks of the body and the lookups of the
+  repository and the ref, so it is named alone and a missing repository or ref is `404`
+  first. `POST /repos/merge`, `POST /repos/branches/create`, `DELETE /repos/branches`
+  (for a name that comes from the body: an `ephemeral` query parameter that is not valid
+  answers first and names no field), `POST /repos/tags`, `POST /repos`,
+  `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`, `DELETE /repos/notes`,
   `POST /api/repos/{repo_name}/notes/append` (when its members
   and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
   `/repos/{repo_name}/git-credentials`, and `PUT
   /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. A `DELETE
   /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
-  adds its message to `detail` and names no field. `PATCH /repo` and the pull-upstream
-  routes check one body field each (`default_branch`, `ref`), so they name that field.
-  The other routes with a request body do not collect problems yet: a check there can
-  hide the checks after it. Every route that decodes its body as one JSON object names
-  each field of the wrong type, as above, with these exceptions: the two strictly
-  decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name each bad
-  member, or else the first field of the wrong type, the `upstream` member of `POST
-  /repos` names the first bad member or the first field of the wrong type, and
-  `commit-pack`, `diff-commit` and `restore-commit` follow their own rules.
-  `POST /repos` decodes `upstream` and `base_repo` on their own (see its body
-  below), and only when the fields of the body itself (`repo_name`, `default_branch`)
-  have the right types: `{"default_branch":7,"base_repo":{"owner":1}}` names only
-  `default_branch`. When those fields are fine, a body with several fields of the wrong
-  type inside `base_repo` names each of them.
+  adds its message to `detail` and names no field. `PATCH /repo`, the pull-upstream
+  routes, `DELETE /repos/tags` and `DELETE /repos/git-credentials` check one body field
+  each (`default_branch`, `ref`, `name`, `id`), so they name that field. The commit
+  write routes (`commit-pack`, `diff-commit`, `restore-commit`) answer with upstream's
+  `CommitWriteResponse` or `ProblemDetails`, which have no `invalid_params`, and the
+  webhook routes and `push-upstream` are not part of upstream's API. A check on these
+  routes can hide the checks after it. Every route that decodes its body as one JSON
+  object names each field of the wrong type, as above, with these exceptions: the two
+  strictly decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name
+  each bad member, or else the first field of the wrong type, the `upstream` member of
+  `POST /repos` names the first bad member or the first field of the wrong type, and
+  `commit-pack`, `diff-commit` and `restore-commit` follow their own rules. `POST
+  /repos` decodes `upstream` and `base_repo` on their own (see its body below), and only
+  when the fields of the body itself (`repo_name`, `default_branch`) have the right
+  types: `{"default_branch":7,"base_repo":{"owner":1}}` names only `default_branch`.
+  When those fields are fine, a body with several fields of the wrong type inside
+  `base_repo` names each of them.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -208,6 +221,17 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   and so is a path with a NUL byte. The files listings and grep check the path
   without its trailing `/`: there `/` alone names the root of the listing, and
   matches no file in grep.
+- **Values that git takes as one argument** must fit what Linux lets a program take
+  as one argument: 128 KiB (131,072 bytes) with its terminating NUL, so at most
+  131,071 bytes with what the server puts around the value. A longer value answers
+  `400` before git starts, on every platform: a `path` param or grep `paths` entry
+  over 131,060 bytes (git gets it at most as `:(literal)<path>/`), and a blame `range`
+  or grep `query.pattern` over 131,071 bytes. The message names the field and its
+  limit, and grep names the field in `invalid_params`. The limits on idents are with
+  the [commit writes](#commit-messages-and-idents). Linux also limits all arguments
+  and environment entries of one program together, to a quarter of the server's stack
+  limit (2 MiB with the usual 8 MiB). A server started with a stack limit of 2 MiB or
+  less can fail a request whose values each fit, and that answer is a 500.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field
@@ -360,9 +384,13 @@ the same scopes, query parameters and responses.
   checked. An invalid `base_repo.operation` is the only `base_repo` problem: the
   operation decides which `base_repo` fields apply. One "are required" message names all
   the empty fields of `upstream` (`provider`, `owner`, `name`) or of `base_repo`
-  (`owner`, `name`). The `default_branch` query parameter is no body field and names
-  none.
-- The checks of state answer after the checks of the body fields: the ref policy (403),
+  (`owner`, `name`). A `base_repo.default_branch` is checked only when the body has no
+  `default_branch` of its own, because a create uses the first of the two. The
+  `default_branch` query parameter is no body field and names none.
+- A token whose `refs` claim does not parse is refused with 403 before the fields of
+  the body are checked, after the body has been read (an unreadable body, and a copy body
+  with an unknown member, answer `400` first). The checks of state answer after
+  the checks of the body fields: the ref policy (403),
   the egress check of the upstream host (it looks the host up), and for a copy or fork
   the source token (403), the source repository (404) and the fork point (400). A
   `default_branch` of the body that is the only invalid field answers after the ref
@@ -689,11 +717,18 @@ space after their trailing whitespace is removed, and an empty message gives `""
 continuation line keeps its leading whitespace, so `"subj\n  next"` gives `subj   next`.
 Before that spec, both carried the full message.
 
+#### Commit messages and idents
+
 A NUL byte in a `commit_message`, or in the `name` or `email` of an `author` or `committer`,
 answers 400 on `commit-pack`, `diff-commit`, `restore-commit` and `POST /repos/merge`. A NUL
 in the `author` of `POST /repos/notes` (also the deprecated body of `DELETE /repos/notes`)
-answers 400 too. git takes a message as an argument and an ident as an environment value,
-and neither can hold a NUL. `merge` and `notes` name each such field in `invalid_params`.
+answers 400 too. git refuses a NUL in a commit message, and takes an ident as an
+environment value, which cannot hold a NUL. So does a `name` or `email` over 131,051 bytes:
+git gets it as one environment entry such as `GIT_COMMITTER_EMAIL=<email>`, which must fit
+128 KiB with its terminating NUL. The message names the field and the limit. A commit
+message goes to git on standard input, so it has no such limit: the request limits bound
+it, 1 MiB for the body of `merge` and `restore-commit` and 8 MiB for one metadata line of
+`commit-pack` and `diff-commit`. `merge` and `notes` name each such field in `invalid_params`.
 `commit-pack` and `diff-commit` answer the result envelope with `status` `invalid`, as for
 their other invalid metadata, and `restore-commit` answers the plain problem body. A
 `restore-commit` without a `commit_message` gets a default message that names the target,
@@ -912,7 +947,7 @@ On a 300,000-commit linear history, `git log -1 -- <file added in the root commi
 | `files` | `git ls-tree [-r]`; for a recursive call with a `cursor`, `git cat-file --batch` for the folders on the cursor's path and the ones after it, and `git cat-file --batch-check` for the sizes of the page's files, and `git config --type=int --get core.maxTreeDepth` once for a page the walk has filled, then `git ls-tree -r` again when the walk gives way | tree size; for a recursive call with `limit` or `cursor`, the entries of the page and, with a cursor, the folders on its path and the ones after it, each read whole (not the folders before it). A walk that gives way has already paid for the folders it read when the stream starts |
 | `files/metadata` | `git ls-tree -r`; `git rev-list --topo-order --parents` and `git diff-tree --stdin` for the last commit of every file under `path`; `git log --no-walk` for the listed files' commits | tree size; history length; history depth to the oldest last commit |
 | `file` | `git ls-tree`, `git log -1 -- <path>`, `git cat-file blob` | history depth; file size |
-| `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git ls-tree` and `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
+| `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
 | `blame` | `git blame` | file length × history depth |
 | `grep` | `git grep` (one thread) | tree size; number of matches |
 | `archive` | `git ls-tree -r`, `git cat-file blob` per file | tree size |

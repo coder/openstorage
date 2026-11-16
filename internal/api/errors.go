@@ -6,6 +6,7 @@ import (
 	"encoding"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"net/http"
 	"reflect"
@@ -299,6 +300,34 @@ func invalidTextEach(fields ...[2]string) []error {
 	var problems []error
 	for _, f := range fields {
 		if err := invalidTextFields(f); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return problems
+}
+
+// tooLongMsg is the 400 message for a request value longer than max bytes.
+// git would take the value as one argument or one environment entry, which
+// must fit gitlimit.MaxArgBytes with what the server puts around it.
+func tooLongMsg(name string, max int) string {
+	return fmt.Sprintf("invalid %s (want at most %d bytes)", name, max)
+}
+
+// tooLongField returns a fieldError when value, the request field name (a
+// dotted wire path), is longer than max bytes (tooLongMsg), or nil.
+func tooLongField(name, value string, max int) error {
+	if len(value) <= max {
+		return nil
+	}
+	return newFieldError(name, fmt.Sprintf("must be at most %d bytes", max), tooLongMsg(name, max))
+}
+
+// tooLongEach returns tooLongField's problem of each field (dotted wire
+// path -> value), in the order given.
+func tooLongEach(max int, fields ...[2]string) []error {
+	var problems []error
+	for _, f := range fields {
+		if err := tooLongField(f[0], f[1], max); err != nil {
 			problems = append(problems, err)
 		}
 	}
