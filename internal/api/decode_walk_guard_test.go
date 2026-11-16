@@ -31,10 +31,10 @@ import (
 
 // decodeWalkSite is a function that names unmarshalBody or a helper of it (a
 // call, or a value as in `decode := unmarshalBody`): the number of such places
-// in it and the request types that it decodes there. A helper that decodes
-// into a value of its caller's type (it takes the destination as a parameter
-// of type any, interface{} or a type parameter) has no types. Its name is
-// scanned for as well, so that its callers are listed with their types.
+// in it and the request types that it decodes there. Each type is named in the
+// function, as a declaration or a literal does. A helper that decodes into a
+// value of its caller's type has no types: its name is scanned for as well, so
+// that its callers are listed with their types.
 type decodeWalkSite struct {
 	places int
 	types  []reflect.Type
@@ -84,12 +84,17 @@ var decodeWalkSites = map[string]decodeWalkSite{
 }
 
 // decodeWalkUnmarshalers are the types with their own UnmarshalJSON or
-// UnmarshalText that a request type may hold, and why the walk is right for
-// them. Any other such type fails walkProblems.
+// UnmarshalText that a request type may hold, and the test that shows the
+// walk right for them. Any other such type fails walkProblems.
 var decodeWalkUnmarshalers = map[reflect.Type]string{
-	reflect.TypeFor[json.RawMessage]():         "keeps the bytes, never fails",
-	reflect.TypeFor[wrefCreateBranchRequest](): "decodes the whole object as a copy of itself, so the paths of its errors are the same",
+	reflect.TypeFor[json.RawMessage](): "TestUnmarshalBody (a raw member is never a type error)",
+	// It decodes the object again as a copy of itself, so the paths of its
+	// errors are those of the object.
+	reflect.TypeFor[wrefCreateBranchRequest](): "TestDecodeNamesEveryWrongTypeField (branch create)",
 }
+
+// maxWalkDepth is far beyond a request type.
+const maxWalkDepth = 32
 
 var walkNameRE = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
@@ -100,10 +105,14 @@ func walkProblems(t reflect.Type) []string {
 	var (
 		out  []string
 		seen = make(map[reflect.Type]bool)
-		walk func(t reflect.Type, path string)
+		walk func(t reflect.Type, path string, depth int)
 	)
 	add := func(path, format string, args ...any) { out = append(out, path+": "+fmt.Sprintf(format, args...)) }
-	walk = func(t reflect.Type, path string) {
+	walk = func(t reflect.Type, path string, depth int) {
+		if depth > maxWalkDepth { // a type that holds itself must reach seen, never this
+			add(path, "nested more than %d levels deep", maxWalkDepth)
+			return
+		}
 		for t.Kind() == reflect.Pointer {
 			t = t.Elem()
 		}
@@ -113,22 +122,29 @@ func walkProblems(t reflect.Type) []string {
 			add(path, "%s decodes itself (UnmarshalJSON or UnmarshalText), and the path of its errors is its own", t)
 			return
 		}
+		if t == reflect.TypeFor[json.Number]() {
+			add(path, "json.Number: the error for a string that is no number, or for a bool, holds no field path")
+			return
+		}
+		switch t.Kind() {
+		case reflect.Slice, reflect.Array, reflect.Struct:
+			if seen[t] {
+				return
+			}
+			seen[t] = true
+		}
 		switch t.Kind() {
 		case reflect.Bool, reflect.String,
 			reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 			reflect.Float32, reflect.Float64:
 		case reflect.Slice, reflect.Array:
-			walk(t.Elem(), path+"[]")
+			walk(t.Elem(), path+"[]", depth+1)
 		case reflect.Map:
 			add(path, "a map: the path of an error holds the key, which can hold a dot, be an escape or fail to decode")
 		case reflect.Interface:
 			add(path, "an interface decodes any JSON, maps included")
 		case reflect.Struct:
-			if seen[t] {
-				return
-			}
-			seen[t] = true
 			byName := make(map[string]string)
 			for f := range t.Fields() {
 				fpath := path + "." + f.Name
@@ -159,26 +175,27 @@ func walkProblems(t reflect.Type) []string {
 					add(fpath, "the member name %q is the name of %s without regard to case: the walk replaces both", name, other)
 				}
 				byName[strings.ToLower(name)] = f.Name
-				walk(f.Type, fpath)
+				walk(f.Type, fpath, depth+1)
 			}
 		default:
 			add(path, "%s is no JSON type", t.Kind())
 		}
 	}
-	walk(t, t.String())
+	walk(t, t.String(), 0)
 	return out
 }
 
 // walkFound is what the scan finds in one function: the places that name an
-// entry, and whether the function takes its destination as a parameter.
+// entry, and every identifier in its body.
 type walkFound struct {
-	places   int
-	takesDst bool
+	places int
+	names  map[string]bool
 }
 
-// scanWalkSites returns, for each function of file, as `Recv.Name` or `Name`,
-// how many places in it name an entry. It reads the syntax only, so it does
-// not see the type of the destination.
+// scanWalkSites returns, for each function of file that names an entry, as
+// `Recv.Name` or `Name`, how many places in it do and which identifiers its
+// body holds. It reads the syntax only, so it does not see the type of the
+// destination: it sees the type names that the function writes.
 func scanWalkSites(file *ast.File, entries []string) map[string]walkFound {
 	sites := make(map[string]walkFound)
 	for _, decl := range file.Decls {
@@ -196,10 +213,13 @@ func scanWalkSites(file *ast.File, entries []string) map[string]walkFound {
 				name = id.Name + "." + name
 			}
 		}
-		found := walkFound{takesDst: takesDestination(fn)}
+		found := walkFound{names: make(map[string]bool)}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			if id, ok := n.(*ast.Ident); ok && slices.Contains(entries, id.Name) {
-				found.places++
+			if id, ok := n.(*ast.Ident); ok {
+				found.names[id.Name] = true
+				if slices.Contains(entries, id.Name) {
+					found.places++
+				}
 			}
 			return true
 		})
@@ -208,33 +228,6 @@ func scanWalkSites(file *ast.File, entries []string) map[string]walkFound {
 		}
 	}
 	return sites
-}
-
-// takesDestination reports whether a parameter of fn has type any,
-// interface{} or one of its type parameters (or holds one), so that fn
-// decodes into a value of its caller's type.
-func takesDestination(fn *ast.FuncDecl) bool {
-	typeParams := make(map[string]bool)
-	if fn.Type.TypeParams != nil {
-		for _, field := range fn.Type.TypeParams.List {
-			for _, id := range field.Names {
-				typeParams[id.Name] = true
-			}
-		}
-	}
-	takes := false
-	for _, param := range fn.Type.Params.List {
-		ast.Inspect(param.Type, func(n ast.Node) bool {
-			switch n := n.(type) {
-			case *ast.InterfaceType:
-				takes = true
-			case *ast.Ident:
-				takes = takes || n.Name == "any" || typeParams[n.Name]
-			}
-			return true
-		})
-	}
-	return takes
 }
 
 // decodeWalkSitesInSource scans the files of the package that are not tests.
@@ -267,19 +260,20 @@ func decodeWalkSitesInSource(t *testing.T) map[string]walkFound {
 // interface, a member name or a tag option outside what the walk handles, or
 // when a function starts to decode a body with the walk without being listed.
 func TestRequestTypesStayInsideTheDecodeWalk(t *testing.T) {
-	const fix = "list it in decodeWalkSites with the request types it decodes; a type outside the walk needs its own decode, not a change of the walk (see the top of decode_walk_guard_test.go)"
+	const fix = "list it in decodeWalkSites with the request types it decodes, or with none when it decodes into a value of its caller's type (a helper: its callers must be listed then); a type outside the walk needs its own decode, not a change of the walk (see the top of decode_walk_guard_test.go)"
 	got := decodeWalkSitesInSource(t)
 	for _, name := range slices.Sorted(maps.Keys(got)) {
 		site, listed := decodeWalkSites[name]
 		switch {
 		case !listed:
-			t.Errorf("%s names unmarshalBody (or a helper of it) %d times and is not in decodeWalkSites: %s. A function with a destination parameter (any, interface{} or a type parameter) is a helper: list it with no types, and then list its callers", name, got[name].places, fix)
+			t.Errorf("%s names unmarshalBody (or a helper of it) %d times and is not in decodeWalkSites: %s", name, got[name].places, fix)
 		case site.places != got[name].places:
 			t.Errorf("%s names unmarshalBody (or a helper of it) %d times, decodeWalkSites says %d: %s", name, got[name].places, site.places, fix)
-		case got[name].takesDst && site.types != nil:
-			t.Errorf("%s takes its destination as a parameter, so it is a helper: list it with no types, and list its callers with theirs", name)
-		case !got[name].takesDst && site.types == nil:
-			t.Errorf("%s takes no destination parameter, so it decodes a type of its own: %s", name, fix)
+		}
+		for _, typ := range site.types {
+			if !got[name].names[typ.Name()] {
+				t.Errorf("decodeWalkSites lists %s for %s, which does not name that type: it decodes another type, or one of its caller's (a helper has no types): %s", typ, name, fix)
+			}
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(decodeWalkSites)) {
@@ -294,29 +288,36 @@ func TestRequestTypesStayInsideTheDecodeWalk(t *testing.T) {
 	}
 }
 
-// TestScanWalkSites: the scan finds a helper, the callers of a helper that
-// is an entry, a decode through a value, and a destination that is a type
-// parameter, and it leaves other functions out.
+// TestScanWalkSites: the scan finds a typed handler, a decode through a
+// value, a helper, a method helper, and the callers of a helper that is an
+// entry, with the identifiers that each body holds, and it leaves other
+// functions out.
 func TestScanWalkSites(t *testing.T) {
 	const src = `package p
 
-func handleA(w W, r R)                        { var req T; _ = unmarshalBody(body, &req) }
-func (s *server) handleB(w W, r R)            { decode := unmarshalBody; _ = decode(b, &req); _ = unmarshalBody(b, &req) }
-func decodeAny(w W, r R, dst any) bool        { return unmarshalBody(b, dst) == nil }
-func decodeEmpty(dst interface{ M() }) bool   { return unmarshalBody(b, dst) == nil }
-func decodeGeneric[T any](w W, dst *T) bool   { return unmarshalBody(b, dst) == nil }
-func (s *server) viaHelper(w W, r R)          { var req T; _ = decodeAny(w, r, &req) }
-func other(w W, r R)                          { _ = strictJSON(b, &req) }
+func handleA(w W, r R)                { var req T; _ = unmarshalBody(body, &req) }
+func (s *server) handleB(w W, r R)    { decode := unmarshalBody; _ = decode(b, &u); _ = unmarshalBody(b, &v) }
+func decodeAny(w W, r R, dst any) bool { return unmarshalBody(b, dst) == nil }
+func (s *server) viaHelper(w W, r R)  { var req U; _ = decodeAny(w, r, &req) }
+func other(w W, r R)                  { _ = strictJSON(b, &req) }
 `
 	file, err := parser.ParseFile(token.NewFileSet(), "src.go", src, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]walkFound{
-		"handleA": {1, false}, "server.handleB": {2, false}, "decodeAny": {1, true}, "decodeEmpty": {1, true}, "decodeGeneric": {1, true},
+	places := func(sites map[string]walkFound) map[string]int {
+		out := make(map[string]int)
+		for name, found := range sites {
+			out[name] = found.places
+		}
+		return out
 	}
-	if got := scanWalkSites(file, []string{"unmarshalBody"}); !reflect.DeepEqual(got, want) {
-		t.Fatalf("with unmarshalBody only: %+v, want %+v", got, want)
+	got := scanWalkSites(file, []string{"unmarshalBody"})
+	if want := map[string]int{"handleA": 1, "server.handleB": 2, "decodeAny": 1}; !reflect.DeepEqual(places(got), want) {
+		t.Fatalf("with unmarshalBody only: %v, want %v", places(got), want)
+	}
+	if !got["handleA"].names["T"] || got["handleA"].names["U"] || got["decodeAny"].names["T"] {
+		t.Fatalf("identifiers of the bodies: %v", got)
 	}
 	sites := map[string]decodeWalkSite{
 		"decodeAny": {1, nil}, "server.decodeMethod": {1, nil}, "handleA": {1, []reflect.Type{reflect.TypeFor[walkLeaf]()}},
@@ -324,9 +325,9 @@ func other(w W, r R)                          { _ = strictJSON(b, &req) }
 	if got, want := walkEntries(sites), []string{"unmarshalBody", "decodeAny", "decodeMethod"}; !slices.Equal(got, want) {
 		t.Fatalf("entries %q, want %q", got, want)
 	}
-	want["server.viaHelper"] = walkFound{1, false}
-	if got := scanWalkSites(file, []string{"unmarshalBody", "decodeAny"}); !reflect.DeepEqual(got, want) {
-		t.Fatalf("with the helper as an entry: %+v, want %+v", got, want)
+	got = scanWalkSites(file, []string{"unmarshalBody", "decodeAny"})
+	if want := map[string]int{"handleA": 1, "server.handleB": 2, "decodeAny": 1, "server.viaHelper": 1}; !reflect.DeepEqual(places(got), want) {
+		t.Fatalf("with the helper as an entry: %v, want %v", places(got), want)
 	}
 }
 
@@ -338,6 +339,9 @@ type (
 		Next *walkSelfRef `json:"next"`
 		Name string       // no tag: the Go name is the member name
 	}
+	walkNodes      []*walkNodes // a cycle through a slice
+	walkLoop       [1]*walkLoop // a cycle through an array
+	walkName       string
 	walkOwnDecode  struct{ N int }
 	walkTextDecode struct{ N int }
 	walkInner      struct {
@@ -353,11 +357,15 @@ type (
 		Ptr      *walkLeaf       `json:"ptr"`
 		Items    []walkLeaf      `json:"items"`
 		Grid     [2][]string     `json:"grid"`
+		Bytes    []byte          `json:"bytes"`
 		Raw      json.RawMessage `json:"raw"`
 		Self     walkSelfRef     `json:"self"`
+		Nodes    walkNodes       `json:"nodes"`
+		Named    walkName        `json:"named"`
+		Small    uint8           `json:"small"`
+		Single   float32         `json:"single"`
 		Skipped  int             `json:"-"`
 		Untagged float64
-		Under9   uint8             `json:"under_9"`
 		_        map[string]string // unexported: encoding/json ignores it
 	}
 )
@@ -375,6 +383,10 @@ func TestDecodeWalkProblems(t *testing.T) {
 	}{
 		{"clean: every shape the request types use", reflect.TypeFor[walkShapes](), ""},
 		{"clean: a type that holds itself", reflect.TypeFor[walkSelfRef](), ""},
+		{"clean: a cycle through a slice", reflect.TypeFor[walkNodes](), ""},
+		{"clean: a cycle through an array", reflect.TypeFor[struct {
+			A [2]*walkLoop `json:"a"`
+		}](), ""},
 		{"clean: the allowed raw member", reflect.TypeFor[struct {
 			R json.RawMessage `json:"r"`
 		}](), ""},
@@ -419,6 +431,9 @@ func TestDecodeWalkProblems(t *testing.T) {
 		{"time.Time", reflect.TypeFor[struct {
 			At *time.Time `json:"at"`
 		}](), "decodes itself"},
+		{"json.Number", reflect.TypeFor[struct {
+			N json.Number `json:"n"`
+		}](), "json.Number"},
 		{"a channel", reflect.TypeFor[struct {
 			C chan int `json:"c"`
 		}](), "is no JSON type"},
@@ -445,14 +460,58 @@ func TestDecodeWalkProblems(t *testing.T) {
 }
 
 // TestDecodeWalkHandlesWhatTheGuardAllows: for a type with every shape that
-// walkProblems allows, unmarshalBody names each field of the wrong type, in
-// body order, with one decode for each and one more. This is what lets the
-// guard pass a type.
+// walkProblems allows, unmarshalBody names each field of the wrong type, and
+// only it, for each of the wrong values below, one decode for each and one
+// more; and it names all of them in one body. This is what lets the guard pass
+// a type, and it fails when a Go release changes the errors of encoding/json
+// (the `,string` and `[]byte` fields are the ones that have plain errors in
+// other releases).
 func TestDecodeWalkHandlesWhatTheGuardAllows(t *testing.T) {
+	type bad struct {
+		member, value string // a member that is the wrong type
+		want          string // the name in the answer
+	}
+	var cases []bad
+	add := func(member, want string, values ...string) {
+		for _, v := range values {
+			cases = append(cases, bad{member, v, want})
+		}
+	}
+	add("plain", "plain", `"x"`, `true`, `{}`, `[]`, `1.5`, `1e999`)
+	add("omit", "omit", `1`, `true`, `{}`, `[]`)
+	add("zero", "zero", `1`, `"x"`, `{}`, `[]`)
+	add("quoted", "quoted", `3`, `true`, `"x"`, `"3.5"`, `"300000000000000000000"`, `{}`, `[]`)
+	add("ptr", "ptr", `"x"`, `1`, `[]`)
+	add("ptr", "ptr.name", `{"name":3}`)
+	add("items", "items", `"x"`, `{}`)
+	add("items", "items.1.name", `[{"name":"ok"},{"name":4}]`)
+	add("items", "items.0", `[1]`)
+	add("grid", "grid", `"x"`, `{}`)
+	add("grid", "grid.0.1", `[["a",2]]`)
+	add("grid", "grid.1", `[["a"],5]`)
+	add("bytes", "bytes", `5`, `"!!!"`, `{}`)
+	add("bytes", "bytes.1", `[1,"x"]`)
+	add("self", "self.next.name", `{"next":{"name":9}}`)
+	add("nodes", "nodes", `5`, `"x"`)
+	add("named", "named", `5`, `[]`)
+	add("small", "small", `"v"`, `300`, `-1`, `1.5`)
+	add("single", "single", `"v"`, `1e999`)
+	add("UNTAGGED", "UNTAGGED", `"u"`, `true`)
+	for _, tc := range cases {
+		body := `{"` + tc.member + `":` + tc.value + `}`
+		var calls int
+		err := unmarshalBody([]byte(body), &decodeCount[walkShapes]{calls: &calls})
+		items := invalidParamsFor(err)
+		if len(items) != 1 || items[0].Name != tc.want {
+			t.Errorf("%s: named %+v, want %q (err %v)", body, items, tc.want, err)
+		}
+	}
+	// One body with the wrong type in each of its members.
 	body := `{"plain":"x","omit":1,"zero":2,"quoted":"x","ptr":{"name":3},"items":[{"name":4},{"name":"ok"},{"NAME":5}],` +
-		`"grid":[["a",6],[7]],"raw":8,"self":{"next":{"name":9}},"skipped":"s","UNTAGGED":"u","under_9":"v"}`
-	want := []string{"plain", "omit", "zero", "quoted", "ptr.name", "items.0.name", "items.2.NAME", "grid.0.1", "grid.1.0",
-		"self.next.name", "UNTAGGED", "under_9"}
+		`"grid":[["a",6],[7]],"bytes":"!!!","raw":8,"self":{"next":{"name":9}},"nodes":7,"named":8,"small":"s","single":"t","skipped":"s",` +
+		`"UNTAGGED":"u"}`
+	want := []string{"plain", "omit", "zero", "quoted", "ptr.name", "items.0.name", "items.2.NAME", "grid.0.1", "grid.1.0", "bytes",
+		"self.next.name", "nodes", "named", "small", "single", "UNTAGGED"}
 	var calls int
 	err := unmarshalBody([]byte(body), &decodeCount[walkShapes]{calls: &calls})
 	var got []string
