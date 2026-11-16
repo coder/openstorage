@@ -43,10 +43,10 @@ func logSyncEgressWarnings(logger *slog.Logger, s syncEgressSettings) {
 	assertf(logger != nil, "logSyncEgressWarnings: nil logger")
 	switch {
 	case s.pullTransitional:
-		logger.Warn("sync egress guard transitional default: pull-upstream fetches may target loopback/private/link-local upstreams (0.6.x compatibility); a future release flips this default to deny — set the policy explicitly to keep internal-forge pulls (true) or adopt strict mode early (false)",
+		logger.Warn("sync egress guard transitional default: pull-upstream fetches may target loopback, private, shared (RFC 6598), link-local and ULA upstreams, but never a cloud metadata endpoint (0.6.x compatibility); a future release flips this default to deny — set the policy explicitly to keep internal-forge pulls (true) or adopt strict mode early (false)",
 			"env", envSyncAllowPrivate)
 	case s.pullAllowPrivate:
-		logger.Warn("sync egress guard relaxed: pull and push transfers may target loopback/private/link-local upstreams",
+		logger.Warn("sync egress guard relaxed: pull and push transfers may target loopback, private, shared (RFC 6598), link-local and ULA upstreams, but never a cloud metadata endpoint",
 			"env", envSyncAllowPrivate)
 	}
 	if s.legacyPushFlagSet {
@@ -106,7 +106,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// enabling it means any org repo:write holder can point deliveries at
 	// internal addresses, so it must never be flipped silently.
 	if webhookAllowPrivate {
-		logger.Warn("webhook SSRF guard relaxed: deliveries may target loopback/private/link-local addresses",
+		logger.Warn("webhook SSRF guard relaxed: deliveries may target loopback, private, shared (RFC 6598), link-local and ULA addresses, but never a cloud metadata endpoint",
 			"env", envWebhookAllowPrivate)
 	}
 	logSyncEgressWarnings(logger, syncEgress)

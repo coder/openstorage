@@ -20,7 +20,7 @@ Outbound webhooks. The package signs and delivers webhook POSTs through a dial-t
 - `Attempt` maps `meta.ErrNotFound` to `ErrWebhookGone`, fails on an empty URL or secret, and treats non-2xx as an error [deliver.go:Attempt]
 - `Deliver` stops on `ErrWebhookGone` or cancel and gives up after `maxAttempts` (default 10) [deliver.go:Deliver]
 - `defaultBackoff` asserts attempt >= 1 and caps the sleep at 64 s [deliver.go:defaultBackoff]
-- `deniedReason` always denies metadata, unspecified, multicast, and broadcast addresses, and denies private classes unless `AllowPrivate` [guard.go:deniedReason]
+- `deniedReason` always denies the cloud metadata endpoints (`metadataAddrs`, single addresses inside the private classes too), unspecified, multicast, and broadcast addresses, and denies private classes unless `AllowPrivate` [guard.go:deniedReason]
 - `vetHost` rejects the whole resolved set when one address is denied [guard.go:vetHost]
 - `CheckRegistration` and `CheckHost` fail open on resolution errors; the dial-time check stays authoritative [guard.go:CheckRegistration]
 - `DialContext` accepts only tcp, tcp4, tcp6 and dials only vetted IP literals [guard.go:DialContext]
