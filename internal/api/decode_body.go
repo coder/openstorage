@@ -26,6 +26,16 @@ const maxDecodeWork = 256 << 10
 // until the body decodes or a bound is reached. A body with one wrong-type
 // field returns the error of encoding/json unchanged. Any other error
 // (syntax, a wrong top-level type) is returned unchanged.
+//
+// The search for the member finds it by the dotted path that encoding/json
+// reports, which names a member of a struct, a slice or an array and nothing
+// else. Where the path is not that of one member (a map key with a dot in it,
+// a key that does not decode, a type that refuses null) the member is not
+// found, or nulling it does not clear the error. The loop stops at the first
+// pass that leaves the body unchanged and at the first error that names a
+// field again, and the answer holds what was found so far. The request types
+// that reach unmarshalBody have no such place:
+// TestRequestTypesStayInsideTheDecodeWalk fails when one gains it.
 func unmarshalBody(body []byte, dst any) error {
 	err := json.Unmarshal(body, dst)
 	te, ok := errors.AsType[*json.UnmarshalTypeError](err)
@@ -34,18 +44,20 @@ func unmarshalBody(body []byte, dst any) error {
 	}
 	var errs bodyErrors
 	errs.add(te)
+	named := map[string]bool{te.Field: true}
 	work, budget := body, maxDecodeWork-len(body) // the first decode counts
 	for !errs.full() && budget >= len(work) {
 		next, ok := nullMembers(work, te.Field)
 		// null is longer than a value of 1 to 3 bytes, so the body can grow.
-		if !ok || len(next) > budget {
+		if !ok || len(next) > budget || bytes.Equal(next, work) {
 			break
 		}
 		work, budget = next, budget-len(next)
 		te, ok = errors.AsType[*json.UnmarshalTypeError](json.Unmarshal(work, dst))
-		if !ok || te.Field == "" {
+		if !ok || te.Field == "" || named[te.Field] {
 			break
 		}
+		named[te.Field] = true
 		errs.add(te)
 	}
 	return errs.err()
