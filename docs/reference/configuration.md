@@ -339,10 +339,12 @@ Unified egress policy for upstream sync in **both** directions (ADR-45).
 
 - **Default:** unset (transitional; see below).
 - **Values:**
-  - `true`: both directions may target internal forges (RFC 1918, loopback, ULA,
-    link-local). Cloud-metadata and special-purpose ranges stay denied.
+  - `true`: both directions may target internal forges: loopback, RFC 1918, RFC 6598
+    shared, link-local and ULA addresses. The cloud-metadata addresses
+    (`169.254.169.254`, `fd00:ec2::254`) and the other IANA special-purpose ranges stay
+    denied.
   - `false`: strict both ways; only public upstreams are dialable.
-  - **Unset:** pushes stay strict (the deprecated
+  - **Unset or empty:** pushes stay strict (the deprecated
     [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) may relax
     them); pulls ALLOW private upstreams, and `serve` logs a boot warning.
   - Malformed booleans are startup errors.
@@ -373,10 +375,10 @@ through an external proxy.
 **Deprecated** push-only spelling of the sync egress policy, kept for 0.6.x deployments.
 
 - **Default:** `false`.
-- If [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) is unset, `true`
-  relaxes the private receiver classes for push forwards only.
-- If the unified variable is set, the value of this one is ignored. A malformed value
-  still stops `serve` at startup.
+- If [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) is unset or
+  empty, `true` relaxes the private receiver classes for push forwards only.
+- If the unified variable has a value, the value of this one is ignored. A malformed
+  value still stops `serve` at startup.
 - Either way, setting it logs a boot deprecation notice naming the replacement.
 
 ### `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`
