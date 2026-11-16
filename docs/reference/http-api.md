@@ -25,7 +25,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   problem-details fields alongside `error`: `type` (`about:blank`), `title` (the status
   text), `status`, `code`, `detail` (same string as `error`), and `instance` (the
   escaped request path the client sent, without the query string; for a
-  `/api/repos/{repo_name}/...` alias, the alias path). `code` is upstream's
+  `/api/repos/{repo_name}/...` alias, the alias path; an escaped path of more than 16384
+  bytes is cut to at most 16384 bytes, never inside a `%XX` escape, and without `…`). `code` is upstream's
   generic code for the status (`bad_request`, `unauthorized`, `forbidden`, `not_found`,
   `conflict`, `unprocessable_entity`, `rate_limited`, `internal_error`,
   `service_unavailable`, …), except for these specific upstream codes:
@@ -69,31 +70,86 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   member out when it cannot name the fields: an unreadable or empty body, a JSON syntax
   error, a body that is not an object, an empty member name, unknown fields on the
   other bodies, rules across fields (such as `base_repo` and `upstream` together), and
-  query parameters. For a body with one problem, the message in `detail` does not change.
+  query parameters. For a body with one problem, `detail` is the message of that
+  problem. For a request body that does not decode, `detail` never holds text of the
+  JSON decoder, which names Go types. It states a field of the wrong JSON type as `name
+  reason`, as upstream's example does (`default_branch must be a string`), and a body
+  that is not valid JSON, or whose top-level value has the wrong type, as `invalid JSON
+  body`. Three cases keep their own message. The two strictly decoded routes answer with
+  `invalid JSON body: ` and the problem that their member check found: `body must be a
+  JSON object`, `unknown field "x"`, `duplicate field "x"`, `x must not be null` or `x
+  must be a JSON object`. `restore-commit` answers every body that does not decode with
+  `body must be {"metadata": {...}}`. The `upstream` member, the copy form of
+  `base_repo` and a branch create without `target_branch` refuse an unknown member, put
+  it in `detail` (`invalid upstream: unknown field "branch"`) and name no
+  `invalid_params` item. A
+  frame of a `commit-pack` or `diff-commit` stream that has a field of the wrong type
+  answers in the same way, in the `message` of its result:
+  `malformed NDJSON frame: metadata.target_branch must be a string`.
   A body with several invalid fields gets one item for each of them, as upstream says
   (`invalid_params` "names each invalid field"). The items follow the order of the
   route's request body in this document, array elements by index, and a field appears
   once. `detail` then holds the message of each problem, joined by `; `. One answer
   holds at most 100 items, and `detail` ends with `; and N more` when it leaves some
-  out, unless the cut of a long `detail` above removes that ending: then `detail` ends
-  with `…` and gives no count. A check that needs the repository's state (for example, that a merge creates a
-  commit and so needs an `author`) runs after the checks of the body. When the JSON
-  decoder finds a field of the wrong type, the answer names one such field (the first
-  that the decoder finds) and none of the other problems: the other checks run only when
-  every field has its right type. A field that stays raw for a check of its own (the
-  `expected_source_sha` of a merge, the `target_branch` of a branch create) is checked
-  with the others. A check of the store (a credential `password` that starts with
-  `enc:`) runs after the lookups of the route, so a missing repository or credential is
-  `404` first. When another field of the body is invalid, the answer is `400` and names
-  the password with the other fields. The credential routes that name the repository or
-  credential in the path (`/repos/{repo_name}/git-credentials` and
+  out (not for fields of the wrong type, see below), unless the cut of a long `detail`
+  above removes that ending: then `detail` ends with `…` and gives no count. A check
+  that needs the repository's
+  state (for example, that a merge creates a commit and so needs an `author`) runs after
+  the checks of the body. A strictly decoded
+  body (`POST /api/repos/{repo_name}/notes/append` and `POST
+  /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
+  of the body, and the check stops at the first problem: the answer names the first
+  member that is unknown, repeated or `null`, or that must be an object and is not, and
+  none of the other problems. When the check reaches a JSON syntax error or trailing
+  data before it finds a bad member, the answer names no member. The other checks run
+  only when the members are fine, and then the decoder of a strictly decoded body names
+  only the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
+  `POST /api/repos/{repo_name}/upstream/pull` takes `{ref?, after?}` and works the same
+  way. The pull-upstream routes that are not strict, `POST /repos/pull-upstream` and its
+  deprecated path form, name both `ref` and `after` when both have the wrong type. On
+  every other route that decodes its body as one JSON object, when the JSON decoder
+  finds fields of the wrong type,
+  the answer names each of them, in the order of the body (array elements by index,
+  nested fields by their dotted path), and none of the other problems: the other checks
+  run only when every field has its right type. A body with fields of the wrong type and
+  fields that fail a check of their own names the wrong-type fields only. The answer
+  names up to 100 wrong-type fields, within a work bound: the server decodes the body
+  once more for each field it names, and stops when the decodes add up to 256 KiB. So a
+  body of 2 KiB can name 100 fields, a body of 10 KiB about 25, and a body of more than
+  128 KiB only the first. The server neither names nor counts the other wrong-type
+  fields, so `detail` does not end with `and N more` for them. A field that stays raw
+  for a check of its own (the `expected_source_sha` of a merge, the `target_branch` of a
+  branch create) is checked with the others. A check of the store
+  (a credential `password` that starts with `enc:`) runs after the lookups of the route,
+  so a missing repository or credential is `404` first. When another field of the body
+  is invalid, the answer is `400` and names the password with the other fields. The
+  credential routes that name the repository or credential in the path
+  (`/repos/{repo_name}/git-credentials` and
   `/repos/{repo_name}/git-credentials/{git_credential_id}`) look that one up before they
-  read the body, so on them a missing one is `404` even when the body is invalid. `POST
-  /repos/merge`, `POST /repos/branches/create`, `POST /repos/tags`, `POST` and `PUT` on
-  `/repos/git-credentials` and on `/repos/{repo_name}/git-credentials`, and `PUT
-  /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. The other
-  routes with a request body do not collect problems yet: a check there can hide the
-  checks after it.
+  read the body, so on them a missing one is `404` even when the body is invalid. A grep
+  `pagination.cursor` that does not decode is named with the other invalid fields when
+  the body has any. Alone, it keeps its place after the lookup of the repository, so a
+  missing repository is `404` first. `POST /repos/merge`, `POST /repos/branches/create`,
+  `POST /repos/tags`, `POST /repos`, `POST /repos/grep`, `POST /repos/archive`,
+  `POST /repos/notes`, `DELETE /repos/notes`,
+  `POST /api/repos/{repo_name}/notes/append` (when its members
+  and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
+  `/repos/{repo_name}/git-credentials`, and `PUT
+  /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. A `DELETE
+  /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
+  adds its message to `detail` and names no field. `PATCH /repo` and the pull-upstream
+  routes check one body field each (`default_branch`, `ref`), so they name that field.
+  The other routes with a request body do not collect problems yet: a check there can
+  hide the checks after it. Every route that decodes its body as one JSON object names
+  each field of the wrong type, as above, with these exceptions: the two strictly
+  decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name the first
+  bad member or the first field of the wrong type, the `upstream` member of `POST /repos`
+  does the same, and `commit-pack`, `diff-commit` and `restore-commit` follow their own
+  rules. `POST /repos` decodes `upstream` and `base_repo` on their own (see its body
+  below), and only when the fields of the body itself (`repo_name`, `default_branch`)
+  have the right types: `{"default_branch":7,"base_repo":{"owner":1}}` names only
+  `default_branch`. When those fields are fine, a body with several fields of the wrong
+  type inside `base_repo` names each of them.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
@@ -273,12 +329,36 @@ the same scopes, query parameters and responses.
   `owner`, `upstream_host`, `forward_pushes`, and `auth.auth_type`, → 400.
 - `base_repo` (deprecated sync and fork form): `{provider, owner, name, operation?: "fork", auth?: {token}|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`.
 - A sync create whose `owner`, `name` or `auth.token` holds a NUL byte → 400 `bad_request`
-  with `invalid_params` naming the field (`base_repo.owner`, `base_repo.name`,
+  with `invalid_params` naming each such field (`base_repo.owner`, `base_repo.name`,
   `base_repo.auth.token`, `upstream.owner`, `upstream.name`), and nothing is stored. The
   stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
   decodes to valid UTF-8 already.
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
   generic with `upstream_host`.
+- A body with several invalid fields, in any create form, gets an `invalid_params` item
+  for each, in the order `default_branch`, then the fields of `upstream` or `base_repo`
+  as listed above. The create decodes `upstream` and `base_repo` on their own, before it
+  checks any field other than `repo_name`. When that decode fails (a field of the wrong
+  type, an unknown field), the answer is that failure alone: it names each field of the
+  wrong type in `base_repo`, the first problem of `upstream` (decoded strictly), and no
+  other check of the body runs. A body that sets both members is decoded as neither.
+  A check that needs another field is skipped when that field is invalid. A missing or
+  unsupported `provider` skips the checks that need it: the rules that tie `access` to
+  the provider (only `github` takes it, and then it must be `public`) and the default
+  host. The value of `access` (`app` or `public`) and the shape of the host are still
+  checked. An invalid `base_repo.operation` is the only `base_repo` problem: the
+  operation decides which `base_repo` fields apply. One "are required" message names all
+  the empty fields of `upstream` (`provider`, `owner`, `name`) or of `base_repo`
+  (`owner`, `name`). The `default_branch` query parameter is no body field and names
+  none.
+- The checks of state answer after the checks of the body fields: the ref policy (403),
+  the egress check of the upstream host (it looks the host up), and for a copy or fork
+  the source token (403), the source repository (404) and the fork point (400). A
+  `default_branch` of the body that is the only invalid field answers after the ref
+  policy and before the egress check for a sync create, and after the fork point for a
+  copy or fork. When the host is denied as well, the `default_branch` answers first. The
+  query parameter `default_branch` answers after the egress check, so a denied host
+  answers first.
 - `forward_pushes: true` (default false; open.storage extension) schedules a push-upstream
   run after every won local push. It also inverts the sync conflict rule: local wins, and
   inbound syncs never force-rewind local refs. See [Upstream sync](#upstream-sync).
@@ -597,6 +677,17 @@ paragraph are skipped, a whitespace-only line ends it, its lines are joined with
 space after their trailing whitespace is removed, and an empty message gives `""`. A
 continuation line keeps its leading whitespace, so `"subj\n  next"` gives `subj   next`.
 Before that spec, both carried the full message.
+
+A NUL byte in a `commit_message`, or in the `name` or `email` of an `author` or `committer`,
+answers 400 on `commit-pack`, `diff-commit`, `restore-commit` and `POST /repos/merge`. A NUL
+in the `author` of `POST /repos/notes` (also the deprecated body of `DELETE /repos/notes`)
+answers 400 too. git takes a message as an argument and an ident as an environment value,
+and neither can hold a NUL. `merge` and `notes` name each such field in `invalid_params`.
+`commit-pack` and `diff-commit` answer the result envelope with `status` `invalid`, as for
+their other invalid metadata, and `restore-commit` answers the plain problem body. A
+`restore-commit` without a `commit_message` gets a default message that names the target,
+and a NUL in the target is a problem of the target, not of the message. See [wire
+compatibility](../explanation/wire-compatibility.md).
 
 #### Commit write guards
 

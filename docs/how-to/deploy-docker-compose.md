@@ -65,6 +65,13 @@ docker compose --profile replicas up -d --wait --build
 Node A publishes on `:8081` and node B on `:8082`. Both listen on `0.0.0.0:8080`
 inside their containers.
 
+Postgres (`PGPORT`) and the S3 gateway (`S3PORT`) publish on `127.0.0.1` only,
+because the Postgres password and the gateway's static Admin identity are public
+development defaults. Reach them as `127.0.0.1`, not `localhost`, which can resolve
+to `::1`. To publish one on every interface on purpose, remove the `127.0.0.1:`
+prefix from its `ports:` entry in `docker-compose.yml` and change its credentials
+first. The nodes reach both over the Compose network, so this does not affect them.
+
 > [!NOTE]
 > The SeaweedFS healthcheck does not prove volumes accept writes. Before storage
 > validation, require `HeadBucket` plus a scratch object PUT/DELETE on the target

@@ -16,13 +16,13 @@ Test lanes in depth: [testing reference](docs/reference/testing.md).
 
 | Tool | Why |
 |---|---|
-| Go ≥ 1.27.3 | `go.mod` toolchain; CI resolves the version from `go.mod` |
+| Go ≥ 1.27.4 | `go.mod` toolchain; CI resolves the version from `go.mod` |
 | git | the server shells out to it; every test uses it |
 | git-lfs | LFS e2e tests drive a real `git lfs` client; CI fails fast without it |
 | Docker | default test lane (Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/)) and the compose stack |
 | gpg / ssh-keygen | only `verify-sig` ref-policy tests and manual signature dogfooding |
 
-[`mise.toml`](mise.toml) pins Go, golangci-lint, and the AWS-reference Terraform.
+[`mise.toml`](mise.toml) pins Go, golangci-lint, the AWS-reference Terraform, and govulncheck.
 [mise](https://mise.jdx.dev/)'s `mise install` fetches CI's exact versions;
 installing them by hand also works.
 
@@ -98,7 +98,7 @@ Run it one of three ways:
   durable (`s3wal://` refs + metadata, `s3://` blobs). It must exist before boot.
 
   ```sh
-  docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.51@sha256:f7a49e3f3972ebed5be2ed4befa4a0c68eb7bdddba6e692d42729ceb545134b8 server -s3 -dir=/data -ip.bind=0.0.0.0
+  docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.53@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0 server -s3 -dir=/data -ip.bind=0.0.0.0
   until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
   # Cold start: bucket creation and object writes can both precede a writable volume,
   # so retry create + a real write roundtrip as one unit (create tolerates already-exists).

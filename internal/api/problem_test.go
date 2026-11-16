@@ -6,6 +6,7 @@ package api
 // changes upstream's table fails here until the map is updated.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -13,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -236,14 +239,60 @@ func TestUnmatchedAPIRoutes(t *testing.T) {
 type (
 	failingKeys    struct{}
 	unknownOrgKeys struct{}
+	// corruptKeys has a registered key that does not parse.
+	corruptKeys struct{}
 )
 
+// failingKeysText is what the failing store says. It names its host, so no
+// answer may hold it.
+const failingKeysText = "dial tcp canary-db.internal:5432: connection refused"
+
 func (failingKeys) PublicKeysForOrg(context.Context, string) ([]string, error) {
-	return nil, errors.New("connection refused")
+	return nil, errors.New(failingKeysText)
+}
+
+func (corruptKeys) PublicKeysForOrg(context.Context, string) ([]string, error) {
+	return []string{"-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"}, nil
 }
 
 func (unknownOrgKeys) PublicKeysForOrg(_ context.Context, name string) ([]string, error) {
 	return nil, fmt.Errorf("org %q: %w", name, meta.ErrNotFound)
+}
+
+// lockedLog is what the log package writes to in a test. Other goroutines of
+// the process can write to the log while the test reads it.
+type lockedLog struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// captureKeyFailureLog gives the REST routes a fresh key failure limiter, and
+// returns what they log through the log package until the test ends.
+func captureKeyFailureLog(t *testing.T) *lockedLog {
+	t.Helper()
+	out := &lockedLog{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(out)
+	log.SetFlags(0)
+	keyFailures = githttp.KeyFailureLog{}
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		keyFailures = githttp.KeyFailureLog{}
+	})
+	return out
 }
 
 // TestAuthenticationUnavailable: a key store failure is upstream's 403
@@ -263,16 +312,29 @@ func TestAuthenticationUnavailable(t *testing.T) {
 		keys   auth.KeySource
 		status int
 		code   string
+		// logged is the start of the log line that the failure writes, and
+		// cause the part of the failure that the line holds. ended means
+		// that the client's request has ended: no line.
+		logged, cause string
+		ended         bool
 	}{
-		{failingKeys{}, http.StatusForbidden, "authentication_unavailable"},
-		{unknownOrgKeys{}, http.StatusForbidden, "forbidden"},
+		{failingKeys{}, http.StatusForbidden, "authentication_unavailable", "verify token: key store lookup failed", "canary-db.internal", false},
+		{unknownOrgKeys{}, http.StatusForbidden, "forbidden", "", "", false},
+		{corruptKeys{}, http.StatusForbidden, "forbidden", "verify token: a registered key cannot be used", "asn1", false},
+		{failingKeys{}, http.StatusForbidden, "authentication_unavailable", "", "", true},
 	} {
+		out := captureKeyFailureLog(t)
 		h := requireAuth(auth.NewVerifier(tc.keys), "", false, auth.ScopeGitRead)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 			t.Error("handler ran")
 		}))
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/repo", nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
+		if tc.ended {
+			ctx, cancel := context.WithCancel(req.Context())
+			cancel()
+			req = req.WithContext(ctx)
+		}
 		h.ServeHTTP(rr, req)
 		if rr.Code != tc.status {
 			t.Errorf("%T: status %d (%s), want %d", tc.keys, rr.Code, rr.Body, tc.status)
@@ -283,6 +345,23 @@ func TestAuthenticationUnavailable(t *testing.T) {
 			t.Errorf("%T: body %s, want code %s", tc.keys, rr.Body, tc.code)
 		}
 		assertProblemFields(t, rr.Code, rr.Body.Bytes())
+		// The answer holds no text of the store or of the key parser.
+		for _, leak := range []string{"canary-db", "dial tcp", "asn1", "x509", "PEM", "parse public key"} {
+			if strings.Contains(rr.Body.String(), leak) {
+				t.Errorf("%T: the answer holds %q: %s", tc.keys, leak, rr.Body)
+			}
+		}
+		// The server logs the cause, and logs nothing for an unknown issuer.
+		if got := out.String(); (tc.logged == "") != (got == "") || !strings.Contains(got, tc.logged) || !strings.Contains(got, tc.cause) {
+			t.Errorf("%T: the log is %q, want a line with %q and %q", tc.keys, got, tc.logged, tc.cause)
+		}
+		// More requests inside the minute write no more lines.
+		for range 4 {
+			h.ServeHTTP(httptest.NewRecorder(), req.Clone(req.Context()))
+		}
+		if n := strings.Count(out.String(), "verify token: "); n != min(1, strings.Count(tc.logged, "verify token: ")) {
+			t.Errorf("%T: 5 requests wrote %d lines: %q", tc.keys, n, out)
+		}
 	}
 }
 
@@ -1221,23 +1300,24 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 	for _, tc := range []struct {
 		name, method, path, token string
 		body                      string
+		msg                       string // the whole message: a decode failure holds no text of encoding/json
 		want                      *param // nil: no invalid_params
 	}{
 		// Upstream's own example (PATCH /repos, ValidationProblemDetails).
-		{"patch type error", http.MethodPatch, "/api/v1/repo", repoTok, `{"default_branch":5}`, &param{"default_branch", "must be a string"}},
-		{"alias patch type error", http.MethodPatch, "/api/repos/" + url, repoTok, `{"default_branch":5}`, &param{"default_branch", "must be a string"}},
-		{"create type error", http.MethodPost, "/api/v1/repos", freshTok, `{"default_branch":true}`, &param{"default_branch", "must be a string"}},
-		{"create branch type error", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":"x","force":"yes"}`, &param{"force", "must be a boolean"}},
-		{"strict unknown field", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"sha":"main","note":"n","bogus":1}`, &param{"bogus", "is not a known field"}},
+		{"patch type error", http.MethodPatch, "/api/v1/repo", repoTok, `{"default_branch":5}`, "default_branch must be a string", &param{"default_branch", "must be a string"}},
+		{"alias patch type error", http.MethodPatch, "/api/repos/" + url, repoTok, `{"default_branch":5}`, "default_branch must be a string", &param{"default_branch", "must be a string"}},
+		{"create type error", http.MethodPost, "/api/v1/repos", freshTok, `{"default_branch":true}`, "default_branch must be a string", &param{"default_branch", "must be a string"}},
+		{"create branch type error", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"target_branch":"x","force":"yes"}`, "force must be a boolean", &param{"force", "must be a boolean"}},
+		{"strict unknown field", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"sha":"main","note":"n","bogus":1}`, `invalid JSON body: unknown field "bogus"`, &param{"bogus", "is not a known field"}},
 		{"nested base_repo type", http.MethodPost, "/api/v1/repos", freshTok, `{"base_repo":{"provider":"github","owner":"o","name":"n","auth":{"token":1}}}`,
-			&param{"base_repo.auth.token", "must be a string"}},
+			"base_repo.auth.token must be a string", &param{"base_repo.auth.token", "must be a string"}},
 		{"nested upstream type", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":1,"name":"n"}}`,
-			&param{"upstream.owner", "must be a string"}},
-		{"upstream not an object", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":3}`, &param{"upstream", "must be an object"}},
-		{"upstream unknown field", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":"o","name":"n","x":1}}`, nil},
-		{"strict empty member name", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"":1}`, nil},
-		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, nil},
-		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, nil},
+			"upstream.owner must be a string", &param{"upstream.owner", "must be a string"}},
+		{"upstream not an object", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":3}`, "upstream must be an object", &param{"upstream", "must be an object"}},
+		{"upstream unknown field", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"provider":"github","owner":"o","name":"n","x":1}}`, `invalid upstream: unknown field "x"`, nil},
+		{"strict empty member name", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"":1}`, `invalid JSON body: unknown field ""`, nil},
+		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, "invalid JSON body", nil},
+		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, "invalid JSON body", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(tc.body), "")
@@ -1249,6 +1329,9 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			if err := json.Unmarshal(body, &p); err != nil {
 				t.Fatal(err)
 			}
+			if p.Error != tc.msg {
+				t.Fatalf("error = %q, want %q", p.Error, tc.msg)
+			}
 			if tc.want == nil {
 				if strings.Contains(string(body), `"invalid_params"`) {
 					t.Fatalf("body %s has invalid_params, want none", body)
@@ -1257,9 +1340,6 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			}
 			if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != tc.want.name || p.InvalidParams[0].Reason != tc.want.reason {
 				t.Fatalf("invalid_params = %+v, want [{%s %s}] (body %s)", p.InvalidParams, tc.want.name, tc.want.reason, body)
-			}
-			if !strings.HasPrefix(p.Error, "invalid ") {
-				t.Fatalf("error = %q, want the unchanged decode message", p.Error)
 			}
 		})
 	}
@@ -1293,7 +1373,7 @@ func testInvalidParamsOnValidators(t *testing.T, e *testEnv) {
 		{"patch invalid", http.MethodPatch, "/api/v1/repo", repoTok, `{"default_branch":"bad..name"}`, []param{req("default_branch", "is not a valid branch name")}},
 		{"create invalid", http.MethodPost, "/api/v1/repos", fresh(), `{"default_branch":"bad..name"}`, []param{req("default_branch", "is not a valid branch name")}},
 		{"create query param", http.MethodPost, "/api/v1/repos?default_branch=bad..name", fresh(), `{}`, nil},
-		{"upstream required", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"github"}}`,
+		{"upstream required", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"github","access":"public"}}`,
 			[]param{req("upstream.owner", "is required"), req("upstream.name", "is required")}},
 		{"upstream provider", http.MethodPost, "/api/v1/repos", fresh(), `{"upstream":{"provider":"nope","owner":"o","name":"n"}}`,
 			[]param{req("upstream.provider", "is not supported")}},

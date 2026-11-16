@@ -5,7 +5,7 @@ Pins the container images that tests and fixtures start. The package declares tw
 
 ## Interface
 - `Postgres` — pinned `postgres:17-alpine@sha256:...` reference [testimages.go:Postgres]
-- `SeaweedFS` — pinned `chrislusf/seaweedfs:4.51@sha256:...` reference [testimages.go:SeaweedFS]
+- `SeaweedFS` — pinned `chrislusf/seaweedfs:4.53@sha256:...` reference [testimages.go:SeaweedFS]
 
 ## Invariants
 - Each constant has the form `<image>:<tag>@sha256:<digest>` [testimages.go:Postgres]

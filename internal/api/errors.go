@@ -171,7 +171,7 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		Status:        status,
 		Code:          code,
 		Detail:        msg,
-		Instance:      problemInstance(w),
+		Instance:      boundInstance(problemInstance(w)),
 		InvalidParams: params,
 		Guard:         guard,
 		CurrentSHA:    currentSHA,
@@ -199,6 +199,26 @@ func boundEcho(s string) string {
 		cut--
 	}
 	return s[:cut] + "…"
+}
+
+// maxInstanceBytes bounds `instance`, the escaped request path that an error
+// answer repeats. No route validates the length of a path, and a path of
+// `&` bytes (six bytes each in JSON) of the 1 MiB header limit answers with 6 MB.
+const maxInstanceBytes = 16384
+
+// boundInstance cuts an `instance` to maxInstanceBytes. EscapedPath
+// percent-encodes every byte that is not ASCII, so the cut cannot split a
+// character. It backs off from a partial `%XX` escape and adds no ellipsis, so
+// the value stays a URI reference.
+func boundInstance(s string) string {
+	if len(s) <= maxInstanceBytes {
+		return s
+	}
+	cut := maxInstanceBytes
+	if i := strings.LastIndexByte(s[cut-2:cut], '%'); i >= 0 {
+		cut += i - 2
+	}
+	return s[:cut]
 }
 
 var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
@@ -268,6 +288,18 @@ func invalidTextFields(fields ...[2]string) error {
 		}
 	}
 	return nil
+}
+
+// invalidTextEach returns a fieldError for each field (dotted wire path ->
+// value) whose value is not meta.ValidText, in the order given.
+func invalidTextEach(fields ...[2]string) []error {
+	var problems []error
+	for _, f := range fields {
+		if err := invalidTextFields(f); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return problems
 }
 
 // writeInvalidText writes the 400 for the first field that is not

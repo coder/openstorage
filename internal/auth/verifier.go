@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -83,6 +84,45 @@ func checkCanonicalSegments(token string) error {
 	return nil
 }
 
+// errCritNotSupported marks a token refused because its protected header has
+// a `crit` member (RFC 7515 §4.1.11). A client reads this text: the git and
+// LFS transports answer with the text of the verifier's error.
+var errCritNotSupported = errors.New("jwt crit header is not supported")
+
+// errHeaderNotOneObject is the cause of a MalformedError for a protected
+// header that is not exactly one JSON object.
+var errHeaderNotOneObject = errors.New("protected header is not one JSON object")
+
+// checkHeader requires the decoded protected header of a compact token to be
+// exactly one JSON object, and refuses a `crit` member (RFC 7515 §4.1.11). No
+// byte may stand outside the object, whitespace included. jwx decodes only
+// the first JSON value of the header, ignores any bytes after it, and signs
+// and verifies over the object alone, so the header segment that the client
+// sent must be those bytes. It then has one spelling, and the check and jwx
+// read the same object. `crit` is read from the header text, because jwx
+// drops a null member and keeps only the last of two. The check is not
+// jws.WithCritValidation(true): the key loop in Verify drops that error, and a
+// token that a registered key signed would read "signature verification
+// failed". The caller has checked that the segments are canonical base64url.
+func checkHeader(token string) error {
+	seg, _, _ := strings.Cut(token, ".")
+	raw, err := strictRawURL.DecodeString(seg)
+	if err != nil {
+		return &MalformedError{What: "jwt", Err: err}
+	}
+	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' || !json.Valid(raw) {
+		return &MalformedError{What: "jwt", Err: errHeaderNotOneObject}
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return &MalformedError{What: "jwt", Err: err}
+	}
+	if _, has := members[jws.CriticalKey]; has {
+		return errCritNotSupported
+	}
+	return nil
+}
+
 // KeySource resolves an org's registered PEM public key blocks by org name
 // (the JWT `iss` claim). meta.Store satisfies this. Implementations return
 // an error for unknown orgs.
@@ -92,16 +132,36 @@ type KeySource interface {
 
 // KeySourceError is a Verify failure from the KeySource: the org is not
 // registered, or the key store failed. The caller tells them apart with
-// errors.Is on the store's not-found error.
+// errors.Is on the store's not-found error. Error names only the issuer: the
+// store's error can name its database host, user and name or its S3
+// endpoint and bucket, and the git and LFS transports can show Error to a
+// client. The store's error stays behind Unwrap, for a log.
 type KeySourceError struct {
 	Org string
 	Err error
 }
 
-func (e *KeySourceError) Error() string { return fmt.Sprintf("issuer %q: %v", e.Org, e.Err) }
+func (e *KeySourceError) Error() string { return fmt.Sprintf("issuer %q: keys unavailable", e.Org) }
 
 // Unwrap exposes the KeySource error.
 func (e *KeySourceError) Unwrap() error { return e.Err }
+
+// StoredKeyError is a Verify failure because ParsePublicKeysPEM refuses a
+// public key that the org has registered. The token is not at fault. Error
+// names only the issuer, because the parser's text is for a log, and the git
+// and LFS transports can show Error to a client. Unwrap has the parser's
+// error.
+type StoredKeyError struct {
+	Org string
+	Err error
+}
+
+func (e *StoredKeyError) Error() string {
+	return fmt.Sprintf("issuer %q: a registered key cannot be used", e.Org)
+}
+
+// Unwrap exposes the parser's error.
+func (e *StoredKeyError) Unwrap() error { return e.Err }
 
 // OrgKeyVerifier implements Verifier: it resolves the issuing org's public
 // keys through a KeySource and verifies the token signature against them,
@@ -156,9 +216,10 @@ func (s unionKeySource) PublicKeysForOrg(ctx context.Context, name string) ([]st
 }
 
 // Verify authenticates a compact JWT per the Verifier contract: allowed
-// algorithm, valid signature for one of the issuer's registered keys,
-// `exp` in the future, a non-empty `sub`. Any failure returns an error. A
-// token without a `repo` claim verifies with Repo == RepoClaimOrg.
+// algorithm, no `crit` header, valid signature for one of the issuer's
+// registered keys, `exp` in the future, a non-empty `sub`. Any failure
+// returns an error. A token without a `repo` claim verifies with Repo ==
+// RepoClaimOrg.
 func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, error) {
 	// Bearer tokens are compact JWS only; rejecting other serializations up
 	// front keeps the single-signature/protected-header assumptions below.
@@ -169,9 +230,16 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	if err := checkCanonicalSegments(token); err != nil {
 		return nil, err
 	}
+	// Before jws.Parse: jwx reads only the first JSON value of the header,
+	// and rejects some `crit` values with its own text.
+	if err := checkHeader(token); err != nil {
+		return nil, err
+	}
 	msg, err := jws.Parse([]byte(token))
 	if err != nil {
-		return nil, fmt.Errorf("malformed jwt: %w", err)
+		// The parser's text can hold the text of a JSON decoder (see
+		// MalformedError). It is not logged: the client chose these bytes.
+		return nil, &MalformedError{What: "jwt", Err: err}
 	}
 	// jws.Parse auto-detects JSON serializations, and a JSON-serialized JWS
 	// can contain exactly two '.' characters (e.g. in an unprotected header),
@@ -191,12 +259,16 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	}
 
 	// Peek at the UNVERIFIED iss claim solely to select the org's keys;
-	// nothing else is trusted until the signature verifies.
+	// nothing else is trusted until the signature verifies. The signature
+	// cannot be checked first: no key is known until iss names the org, and
+	// a token that another registered org signed must keep its own answer,
+	// which differs from the answer to a bad signature. The error carries no
+	// log line: the client chose these bytes.
 	var unverified struct {
 		Iss string `json:"iss"`
 	}
 	if err := json.Unmarshal(msg.Payload(), &unverified); err != nil {
-		return nil, fmt.Errorf("jwt claims: %w", err)
+		return nil, &MalformedError{What: "jwt claims", Err: err}
 	}
 	if unverified.Iss == "" {
 		return nil, errors.New("jwt missing iss claim")
@@ -217,7 +289,7 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	for i, p := range pems {
 		keys, err := ParsePublicKeysPEM([]byte(p))
 		if err != nil {
-			return nil, fmt.Errorf("org %q registered key %d: %w", unverified.Iss, i+1, err)
+			return nil, &StoredKeyError{Org: unverified.Iss, Err: fmt.Errorf("registered key %d: %w", i+1, err)}
 		}
 		pubs = append(pubs, keys...)
 	}
@@ -247,7 +319,11 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 
 	var c Claims
 	if err := json.Unmarshal(payload, &c); err != nil {
-		return nil, fmt.Errorf("jwt claims: %w", err)
+		// A registered key signed these claims, so the operator who minted
+		// the token can fix them and needs the decoder's text. The client
+		// does not get it (see MalformedError).
+		slog.Warn("token claims signed by a registered key do not decode", "iss", unverified.Iss, "err", err)
+		return nil, &MalformedError{What: "jwt claims", Err: err}
 	}
 	// A token without a `repo` claim is org-wide ("omit for org-wide
 	// tokens", docs/upstream/getting-started/authentication.md), so it gets

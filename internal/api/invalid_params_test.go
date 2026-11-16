@@ -175,6 +175,55 @@ func TestBodyErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("a loop counts the entries it skips once the collector is full", func(t *testing.T) {
+		var b bodyErrors
+		built := 0
+		for i := range maxInvalidParams + 25 {
+			if b.full() {
+				b.skip()
+				continue
+			}
+			built++
+			b.add(field(fmt.Sprintf("paths.%d", i)))
+		}
+		if built != maxInvalidParams {
+			t.Fatalf("the loop built %d problems, want %d", built, maxInvalidParams)
+		}
+		err := b.err()
+		got := invalidParamsFor(err)
+		if len(got) != maxInvalidParams || got[maxInvalidParams-1].Name != fmt.Sprintf("paths.%d", maxInvalidParams-1) {
+			t.Fatalf("got %d params, last %v", len(got), got[len(got)-1])
+		}
+		if !strings.HasSuffix(err.Error(), "; and 25 more") {
+			t.Fatalf("message tail = %q", err.Error()[len(err.Error())-30:])
+		}
+		var one bodyErrors
+		one.add(field("a"))
+		if one.full() {
+			t.Fatal("a collector with one problem is full")
+		}
+	})
+
+	t.Run("a dropped problem counts each field that it names", func(t *testing.T) {
+		var b bodyErrors
+		for i := range maxInvalidParams {
+			b.add(field(fmt.Sprintf("paths.%d", i)))
+		}
+		b.add(newFieldErrors("context lines must be non-negative",
+			invalidParam{Name: "context.before", Reason: "must be at least 0"},
+			invalidParam{Name: "context.after", Reason: "must be at least 0"}))
+		b.add(fmt.Errorf("a rule across fields"))
+		b.add(field("limits.max_lines"))
+		err := b.err()
+		if got := invalidParamsFor(err); len(got) != maxInvalidParams {
+			t.Fatalf("got %d params, want %d", len(got), maxInvalidParams)
+		}
+		// Two fields, a rule that names none (one), and one field.
+		if !strings.HasSuffix(err.Error(), "; and 4 more") {
+			t.Fatalf("message tail = %q", err.Error()[len(err.Error())-30:])
+		}
+	})
+
 	t.Run("a problem with two fields can cross the bound", func(t *testing.T) {
 		var b bodyErrors
 		for i := range maxInvalidParams - 1 {
@@ -289,6 +338,31 @@ func TestMergeNamesEveryInvalidField(t *testing.T) {
 					{"committer.email", "is required"}, {"committer", "must not contain newlines"},
 				},
 			},
+			// git takes the message as an argument and each ident as an
+			// environment value, and neither can hold a NUL.
+			{
+				name: "a NUL in the message and in each ident", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"source_ref":"f","target_branch":"main","strategy":"merge","commit_message":"m\u0000x",` +
+					`"author":{"name":"a\u0000","email":"e\u0000"},"committer":{"name":"c","email":"e\u0000"}}`,
+				wantError: invalidTextMsg("commit_message") + "; " + invalidTextMsg("author.name") + "; " + invalidTextMsg("author.email") +
+					"; " + invalidTextMsg("committer.email"),
+				want: []ipParam{
+					{"commit_message", ipcNulReason}, {"author.name", ipcNulReason}, {"author.email", ipcNulReason},
+					{"committer.email", ipcNulReason},
+				},
+			},
+			{
+				name: "a NUL in the name of an ident with an empty email", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"merge","author":{"name":"a\u0000","email":""}}`,
+				wantError: "author name and email are required; " + invalidTextMsg("author.name"),
+				want:      []ipParam{{"author.email", "is required"}, {"author.name", ipcNulReason}},
+			},
+			{
+				name: "one problem: a NUL in the message", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"source_ref":"f","target_branch":"main","strategy":"merge","squash":true,"commit_message":"m\u0000"}`,
+				wantError: invalidTextMsg("commit_message"),
+				want:      []ipParam{{"commit_message", ipcNulReason}},
+			},
 			{
 				name: "a raw expected_source_sha is checked with the others", method: http.MethodPost, path: path, token: fx.gitTok,
 				body:      `{"target_branch":"main","strategy":"merge","expected_source_sha":5}`,
@@ -303,8 +377,8 @@ func TestMergeNamesEveryInvalidField(t *testing.T) {
 			},
 		})
 
-		// A wrong-type field stops the decode: only that field is named, and
-		// the checks of the other fields run once every type is right.
+		// A wrong-type field hides the problems of the other fields: the
+		// checks of those run once every type is right.
 		t.Run("a wrong-type field is named alone", func(t *testing.T) {
 			resp, body := e.doReq(t, http.MethodPost, path, fx.gitTok,
 				[]byte(`{"target_branch":"refs/heads/main","strategy":5,"author":{"email":"e"}}`), "")

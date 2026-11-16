@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -112,13 +113,19 @@ func mustClaims(r *http.Request) *auth.Claims {
 // refPolicies parses the token's ref-policy claims the same way the git
 // update hook does (docs/reference/authentication.md): the ordered `refs` tuples with the deprecated
 // repo-wide `ops` claim folded in exactly once. Malformed claims fail
-// closed — callers must map the error to 403.
+// closed — callers must map the error to 403. The error is an
+// *auth.MalformedError, whose text a caller may show a client. The
+// decoder's text goes to the log here: a registered key signed the claim,
+// so the operator who minted the token can fix it.
 func refPolicies(claims *auth.Claims) ([]auth.RefPolicy, error) {
 	var policies []auth.RefPolicy
 	if len(claims.Refs) > 0 {
 		var err error
 		policies, err = auth.ParseRefPolicies(string(claims.Refs))
 		if err != nil {
+			var bad *auth.MalformedError
+			assertf(errors.As(err, &bad), "ParseRefPolicies returned %T, not *auth.MalformedError", err)
+			slog.Warn("token refs claim does not parse", "iss", claims.Iss, "repo", claims.Repo, "err", bad.Err)
 			return nil, err
 		}
 	}
@@ -187,6 +194,48 @@ func validNewBranchName(name string) bool {
 func validDefaultBranch(branch string) bool {
 	short := strings.TrimPrefix(branch, "refs/heads/")
 	return !strings.HasPrefix(short, "refs/") && validNewBranchName(short)
+}
+
+// defaultBranchProblem returns the 400 problem of a default branch that is
+// not valid, or nil. It names the body field at path. The query parameter
+// and the source repository's branch (path "") have no body field to name.
+func defaultBranchProblem(branch, path string) error {
+	if validDefaultBranch(branch) {
+		return nil
+	}
+	if path == "" {
+		return errors.New("invalid default_branch")
+	}
+	return newFieldError(path, "is not a valid branch name", "invalid default_branch")
+}
+
+// bodyBranchProblem returns the problem of the default branch that the body
+// of a create names: top for its default_branch, or base for the
+// base_repo's, which a create uses only when the body has no default_branch
+// of its own. The query parameter is no body field and is not part of it.
+// At most one of the two is not nil.
+func bodyBranchProblem(req *createRepoRequest, spec *usyncBaseRepo) (top, base error) {
+	switch {
+	case req.DefaultBranch != "":
+		return defaultBranchProblem(req.DefaultBranch, "default_branch"), nil
+	case spec != nil && spec.DefaultBranch != "":
+		return nil, defaultBranchProblem(spec.DefaultBranch, "base_repo.default_branch")
+	}
+	return nil, nil
+}
+
+// writeBodyErrors writes the 400 for the problems of a create body (in the
+// order of the docs) and reports whether it did. A held problem that is the
+// only one is not reported here: the default branch check of a create runs
+// after checks of state (a ref policy, a source repository), and a request
+// with that one problem keeps the answer of the first of them.
+func writeBodyErrors(w http.ResponseWriter, errs *bodyErrors, held ...error) bool {
+	err := errs.err()
+	if err == nil || (len(errs.errs) == 1 && errs.dropped == 0 && slices.Contains(held, errs.errs[0])) {
+		return false
+	}
+	writeInvalid(w, err.Error(), err)
+	return true
 }
 
 type createRepoRequest struct {
@@ -341,7 +390,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	var req createRepoRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -522,7 +571,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	var req patchRepoRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -545,9 +594,12 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	// HEAD <target>` on every node, and a persisted target git rejects
 	// would break the repo's git/read surface until another PATCH repairs
 	// the row.
-	target := githttp.HeadTarget(branch)
 	valid := validDefaultBranch(branch)
+	var target string
 	if valid {
+		// HeadTarget asserts that the name has no whitespace, so it runs
+		// only for a name that validDefaultBranch accepted.
+		target = githttp.HeadTarget(branch)
 		var err error
 		if valid, err = validRefFormat(r.Context(), target); err != nil {
 			s.internalErr(w, r, "check default_branch with git", err)

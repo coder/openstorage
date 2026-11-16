@@ -57,13 +57,13 @@ These do **not** reclaim space:
 List a repository's blobs under `packs/` straight from the blob store:
 
 ```sh
-openstorage list-packs --repo repo_01k5abc...   # takes the server-generated RepoID
+openstorage list-packs --repo repo_761aac427fd3   # takes the server-generated RepoID
 ```
 
 - `--repo` takes the **RepoID** (`repo_...`, returned by repo creation and
   `GET /api/v1/repo`), not the repository name.
 - Namespace pushes store under sibling prefixes. List them with a suffix:
-  `--repo repo_01k5abc...+ephemeral`.
+  `--repo repo_761aac427fd3+ephemeral`.
 - A quota denial's `stored` bytes cover the base **and** all namespace prefixes.
 - The command reads `OPENSTORAGE_S3_URL`/`OPENSTORAGE_PG_URL` (or `--data-dir` in local
   mode) from the environment. See the [CLI reference](../reference/cli.md#openstorage-list-packs).

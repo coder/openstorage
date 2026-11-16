@@ -1018,4 +1018,5 @@ Not part of the operator surface; listed for completeness. Never set these manua
 
 The Docker Compose file has its own host-port overrides (`PGPORT`, `S3PORT`,
 `NODEA_PORT`, `NODEB_PORT`, `CS_KEYS_DIR`); see the
-[`docker-compose.yml`](../../docker-compose.yml) header.
+[`docker-compose.yml`](../../docker-compose.yml) header. Postgres and the S3
+gateway publish on `127.0.0.1` only.

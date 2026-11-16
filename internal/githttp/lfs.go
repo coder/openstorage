@@ -56,6 +56,8 @@ const (
 	lfsURLExpiry = 15 * time.Minute
 	// lfsMaxBatchBody bounds the JSON batch request (defensive: a batch of
 	// 100 objects is ~10KB; 4MiB is far beyond any legitimate request).
+	// A gzip body is bounded twice: its compressed bytes and its decoded
+	// bytes each count against it.
 	lfsMaxBatchBody = 4 << 20
 	// lfsMaxBatchObjects bounds one batch's object count (defensive:
 	// git-lfs sends at most 100 per batch; each entry costs a blob Stat
@@ -224,6 +226,21 @@ func (s *Server) handleLFS(w http.ResponseWriter, r *http.Request, repo, rest st
 	}
 }
 
+// lfsBatchDecodeMsg is the 400 message for a batch body that does not
+// decode. The text of encoding/json names Go types and structs, and any
+// client can read this answer (the body is decoded before the request is
+// authenticated), so the message names only the field of the wrong JSON type,
+// or says that the body is too large.
+func lfsBatchDecodeMsg(err error) string {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		return "bad batch request: request body too large"
+	}
+	if te, ok := errors.AsType[*json.UnmarshalTypeError](err); ok && te.Field != "" {
+		return "bad batch request: " + te.Field + " has the wrong JSON type"
+	}
+	return "bad batch request"
+}
+
 // handleLFSBatch implements the LFS Batch API. The operation in the body
 // selects the required scope (download → git:read, upload → git:write), so
 // the body is parsed (size-bounded) before authentication.
@@ -236,11 +253,15 @@ func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repo str
 			return
 		}
 		defer gz.Close()
-		body = gz
+		// The cap above counts the compressed bytes. The decoded stream
+		// gets the same bound, so a small body cannot make the server
+		// decode far more than the limit before it authenticates the
+		// request.
+		body = http.MaxBytesReader(w, gz, lfsMaxBatchBody)
 	}
 	var req lfsBatchRequest
 	if err := json.NewDecoder(body).Decode(&req); err != nil {
-		lfsError(w, http.StatusBadRequest, "bad batch request: "+err.Error())
+		lfsError(w, http.StatusBadRequest, lfsBatchDecodeMsg(err))
 		return
 	}
 	var scope string
