@@ -375,7 +375,8 @@ through an external proxy.
 - **Default:** `false`.
 - If [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) is unset, `true`
   relaxes the private receiver classes for push forwards only.
-- If the unified variable is set, this one is ignored.
+- If the unified variable is set, the value of this one is ignored. A malformed value
+  still stops `serve` at startup.
 - Either way, setting it logs a boot deprecation notice naming the replacement.
 
 ### `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`
