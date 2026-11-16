@@ -5,6 +5,7 @@ Shared admission and process control for git subprocesses. It provides a slot po
 
 ## Interface
 - `HeavyHeapBytes` (256 MiB), `ReadSlotCount` (8), `RepoSlotCount` (2), `ReadSlotWait` (1 s), `MaintenanceShare` (2) — sizing constants [gitlimit.go:HeavyHeapBytes]
+- `MaxArgBytes` (131,071), `MaxArgListBytes` (65,536), `ArgListEntryBytes` (32), `ArgListBytes` — the longest argument or environment entry a git child gets, and the budget of a list of request values that git gets as arguments of their own [gitlimit.go:MaxArgBytes] [gitlimit.go:ArgListBytes]
 - `ErrBusy`, `ErrMemoryLimit` — no slot in time, and git stopped by its own allocation failure [gitlimit.go:ErrBusy]
 - `Slots`, `NewSlots`, `(*Slots).Acquire`, `TryAcquire`, `Release`, `InUse` — slot pool with a per-key cap [gitlimit.go:Slots]
 - `RepoKey` — per-repository slot key from a canonical repo ID [gitlimit.go:RepoKey]
