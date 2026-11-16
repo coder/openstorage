@@ -119,3 +119,30 @@ func TestPreReceiveRefusesTheWholePushForATargetThatNoRegisteredPackHolds(t *tes
 		})
 	}
 }
+
+// The check runs before any upload or registration: a push that carries a new
+// commit beside a command at a cache-only target is refused whole, and it
+// stores no pack, as a row or as a blob.
+func TestPreReceiveRefusesBeforeAnyUploadOrRegistration(t *testing.T) {
+	f := newUnregisteredFixture(t, "t-unregistered-noupload")
+	packsBefore, blobsBefore := len(pgPacks(t, f.repo)), len(s3Packs(t, f.repo))
+	fresh := commitFile(t, f.work, "fresh.txt", "fresh\n", "fresh", nil)
+	cmd := exec.Command("git", "pack-objects", "--revs", "--stdout", "-q")
+	cmd.Dir = f.work
+	cmd.Stdin = strings.NewReader(fresh + "\n^" + f.c1 + "\n")
+	pack, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git pack-objects of the new commit: %v", err)
+	}
+	_, remote := rawReceivePack(t, f.node, f.repo, f.token, false, pack,
+		rawPushCommand{ref.ZeroSHA, fresh, "refs/heads/fresh"}, rawPushCommand{ref.ZeroSHA, f.cacheOnly, "refs/heads/planted"})
+	if !strings.Contains(remote, unregisteredRefusal) {
+		t.Fatalf("the push was not refused with %q:\n%s", unregisteredRefusal, remote)
+	}
+	if packs, blobs := len(pgPacks(t, f.repo)), len(s3Packs(t, f.repo)); packs != packsBefore || blobs != blobsBefore {
+		t.Errorf("registered packs %d -> %d and stored pack blobs %d -> %d: a refused push stored its pack", packsBefore, packs, blobsBefore, blobs)
+	}
+	if _, ok := pgRefs(t, f.repo)["refs/heads/fresh"]; ok {
+		t.Error("refs/heads/fresh moved although the push was refused")
+	}
+}

@@ -105,7 +105,7 @@ func TestNewRegisteredPackViewHealsAgainWhenTheListingGrows(t *testing.T) {
 
 	// A pack that stays missing ends the loop at the bound. The view is built
 	// without it: an answer that holds each object stands, and a "missing"
-	// answer is an error that wraps ErrPackMissing.
+	// answer is an error that wraps ErrViewIncomplete.
 	st2 := &listsPacks{packs: func(int) []ref.Pack {
 		return []ref.Pack{{ID: strings.Repeat("b", 40)}, {ID: strings.Repeat("f", 40)}}
 	}}
@@ -127,8 +127,8 @@ func TestNewRegisteredPackViewHealsAgainWhenTheListingGrows(t *testing.T) {
 	if err := view2.CheckAnswer(map[string]string{"x": "commit", "y": "tree"}); err != nil {
 		t.Fatalf("CheckAnswer(all held) = %v, want nil", err)
 	}
-	if err := view2.CheckAnswer(map[string]string{"x": "commit", "y": "missing"}); !errors.Is(err, ErrPackMissing) {
-		t.Fatalf("CheckAnswer(one missing) = %v, want ErrPackMissing", err)
+	if err := view2.CheckAnswer(map[string]string{"x": "commit", "y": "missing"}); !errors.Is(err, ErrViewIncomplete) {
+		t.Fatalf("CheckAnswer(one missing) = %v, want ErrViewIncomplete", err)
 	}
 
 	// A complete view never fails a "missing" answer: the object is not in the registry.
@@ -228,8 +228,8 @@ func TestAskRegisteredPacksAsksAgainWhenAPackWasRegisteredSinceTheView(t *testin
 		_, err := AskRegisteredPacks(ctx, st, repoPath, "r", nil, func(*RegisteredPackView) (map[string]string, error) {
 			return map[string]string{"x": "missing"}, nil
 		})
-		if !errors.Is(err, ErrPackMissing) {
-			t.Fatalf("AskRegisteredPacks on an incomplete view = %v, want ErrPackMissing", err)
+		if !errors.Is(err, ErrViewIncomplete) {
+			t.Fatalf("AskRegisteredPacks on an incomplete view = %v, want ErrViewIncomplete", err)
 		}
 	})
 }

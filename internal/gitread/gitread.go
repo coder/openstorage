@@ -283,7 +283,7 @@ func resolveCommitObject(ctx context.Context, repoPath, cand, id string) (string
 // A registered pack that the cache lacks is downloaded first. When new packs
 // keep arriving and the view still lacks one, an object that the view does hold
 // reads as held, and a "missing" answer is an error that wraps
-// githttp.ErrPackMissing: the object may be in the pack that the view lacks.
+// githttp.ErrViewIncomplete: the object may be in the pack that the view lacks.
 func RegisteredKinds(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo string, ids []string) (map[string]string, error) {
 	if len(ids) == 0 {
 		return map[string]string{}, nil

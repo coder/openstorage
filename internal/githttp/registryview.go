@@ -158,7 +158,13 @@ func hasMissing(kinds map[string]string) bool {
 	return false
 }
 
-// CheckAnswer returns an error that wraps ErrPackMissing when kinds, an answer
+// ErrViewIncomplete is returned (wrapped, match with errors.Is) when an object
+// reads as missing from a view that lacks a registered pack: the object may be in
+// that pack, so the request fails and the client can retry. The blob store holds
+// the pack. Only the node's cache lacks it.
+var ErrViewIncomplete = errors.New("githttp: the node's cache lacks a registered pack")
+
+// CheckAnswer returns an error that wraps ErrViewIncomplete when kinds, an answer
 // that git gave over this view, reads an object as "missing" and the view lacks
 // a registered pack: the object may be in that pack, so refusing it would be
 // refusing a ref that is healthy. The caller must fail the request and let the
@@ -170,7 +176,7 @@ func (v *RegisteredPackView) CheckAnswer(kinds map[string]string) error {
 	}
 	for _, k := range kinds {
 		if k == "missing" {
-			return fmt.Errorf("%w: the cache of %s lacks the registered pack %s", ErrPackMissing, v.repo, v.absent[0])
+			return fmt.Errorf("%w: the cache of %s lacks the registered pack %s", ErrViewIncomplete, v.repo, v.absent[0])
 		}
 	}
 	return nil

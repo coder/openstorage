@@ -75,8 +75,8 @@ func TestRegisteredPackViewFailsAMissingAnswerWhenAPackCannotBeFetched(t *testin
 		if err := view.CheckAnswer(map[string]string{"a": "commit"}); err != nil {
 			t.Fatalf("%s: CheckAnswer(held) = %v, want nil", name, err)
 		}
-		if err := view.CheckAnswer(map[string]string{"a": "commit", "b": "missing"}); !errors.Is(err, githttp.ErrPackMissing) {
-			t.Fatalf("%s: CheckAnswer(missing) = %v, want ErrPackMissing", name, err)
+		if err := view.CheckAnswer(map[string]string{"a": "commit", "b": "missing"}); !errors.Is(err, githttp.ErrViewIncomplete) {
+			t.Fatalf("%s: CheckAnswer(missing) = %v, want ErrViewIncomplete", name, err)
 		}
 		view.Close()
 	}

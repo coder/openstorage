@@ -736,7 +736,8 @@ The server checks the registered packs, not the node's cache repository, because
 ref at any other object. A commit that only a cache holds answers `404`, like a commit that does
 not exist, and a `base_ref` that names no usable commit still falls back to `preferred_base`. The
 server reads the registry only for a request that is about to write: after the ref policy, and not
-for a tag that exists or a branch that stays where it is. So a request that the policy denies
+for a tag that exists or for a create that leaves the branch at its tip (with `force` or
+`expected_target_sha`). So a request that the policy denies
 answers `403` even when its commit is only in the cache.
 
 #### Guarded branch create and move
