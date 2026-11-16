@@ -227,7 +227,7 @@ func wrefPolicyCheck(claims *auth.Claims, refName, old, new string, isAncestor f
 			}
 			return fmt.Sprintf("policy verify-sig cannot be satisfied by this endpoint for %s", refName), nil
 		default:
-			return fmt.Sprintf("unknown policy op %q for %s", op, refName), nil
+			return "unknown policy op " + errtext.Quote("", op) + " for " + refName, nil
 		}
 	}
 	return "", nil

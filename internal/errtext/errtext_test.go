@@ -41,6 +41,9 @@ func TestQuote(t *testing.T) {
 		{"a long value", "", strings.Repeat("x", 1_000_000), `"` + strings.Repeat("x", 256) + `…" (1000000 bytes)`},
 		// The prefix is never cut, and the length is the value's own.
 		{"a prefix", "base_repo.", exact + "<", `"base_repo.` + exact + `…" (257 bytes)`},
+		// Only v counts: a prefix that takes the text past the limit cuts
+		// nothing.
+		{"a prefix and a value of exactly the limit", "base_repo.", exact, `"base_repo.` + exact + `"`},
 		// A cut inside a rune moves back to its start; Go quotes "é" as is.
 		{"a cut inside a rune", "", "a" + strings.Repeat("é", 200), `"a` + strings.Repeat("é", 127) + `…" (401 bytes)`},
 		{"control characters are escaped", "", "a\nb", `"a\nb"`},

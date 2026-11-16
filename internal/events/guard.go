@@ -234,7 +234,9 @@ func (g TargetGuard) CheckRegistration(ctx context.Context, rawURL string) error
 		if errors.As(err, &uerr) {
 			err = uerr.Err // url.Error repeats the whole URL
 		}
-		return fmt.Errorf("parse webhook url %s: %w", errtext.Quote("", rawURL), err)
+		// The parse error can repeat a part of the URL too, such as an
+		// invalid port.
+		return fmt.Errorf("parse webhook url %s: %s", errtext.Quote("", rawURL), errtext.Cut(err.Error(), errtext.MaxQuotedBytes))
 	}
 	host := u.Hostname()
 	if host == "" {
