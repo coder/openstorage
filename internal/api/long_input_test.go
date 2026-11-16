@@ -332,6 +332,21 @@ func TestValuesPastGitArgLimitAreNotEchoed(t *testing.T) {
 		if want := []string{"author.name", "author.email"}; !slices.Equal(names, want) {
 			t.Fatalf("invalid_params names %v, want %v (body %.300s)", names, want, body)
 		}
+
+		// A name over the limit that also holds a NUL is one problem.
+		raw, err = json.Marshal(wmMergeBody("feature", "main", "merge", map[string]any{
+			"author": map[string]any{"name": strings.Repeat("n", maxGitIdentBytes+1) + "\x00", "email": "a@b"}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos/merge", fx.token, raw, "")
+		p = problemBody{}
+		if err := json.Unmarshal(body, &p); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != "author.name" {
+			t.Fatalf("merge: status %d, invalid_params %+v; want 400 naming author.name once", resp.StatusCode, p.InvalidParams)
+		}
 	})
 }
 

@@ -27,7 +27,7 @@ Upstream git mirror sync (pull) and outbound push-forward. The package defines t
 - `Worker.assertReady` panics when a required dependency is unset; `Run` and `RunPush` assert non-empty org and repo ID [worker.go:assertReady]
 - `Run` returns nil without events when the repo no longer exists [worker.go:Run]
 - A transfer refuses to push when the holder changed (`errClaimStolen`), the row is gone (`errDetached`), or the claim lease is inside `claimFenceMargin` [worker.go:transfer]
-- `hermeticGitEnv` strips inherited `GIT_*` variables and sets `GIT_ALLOW_PROTOCOL` [worker.go:hermeticGitEnv]; stored credentials containing CR, LF, or NUL fail with `FailConfig`, and so do an upstream URL over `gitlimit.MaxArgBytes` and a stored credential over `maxCredentialBytes`, before git starts [worker.go:Worker.upstreamAuth]
+- `hermeticGitEnv` strips inherited `GIT_*` variables and sets `GIT_ALLOW_PROTOCOL` [worker.go:hermeticGitEnv]; stored credentials containing CR, LF, or NUL fail with `FailConfig`, and so does one over `maxCredentialBytes` [worker.go:Worker.upstreamAuth]; an upstream URL over `maxUpstreamURLBytes` fails with `FailConfig` before any git starts [worker.go:upstreamURLFailure]
 - Only `FailUnreachable` push failures retry, at most `MaxPushTransientRetries` times; pushes use `--atomic` [worker_push.go:RunPush]
 - `proxyEnv` removes inherited proxy variables in any case; the egress proxy maps policy denials to 403 and dial failures to 502 [egress.go:proxyEnv]
 - `MemStore.BeginSync` returns `ErrSyncInProgress` while an unexpired claim exists; legacy claims get a grace period; `RequestPush` never downgrades force; a stolen push claim inherits force [memstore.go:BeginPush]

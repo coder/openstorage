@@ -752,6 +752,9 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		return &syncFailure{code: FailConfig, cause: fmt.Errorf(
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
 	}
+	if fail := upstreamURLFailure(up); fail != nil {
+		return fail
+	}
 
 	tmp, err := os.MkdirTemp("", "openstorage-sync-*")
 	if err != nil {
@@ -766,7 +769,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 
 	// Upstream credential: absent = public upstream. An omitted username
 	// gets the per-provider default (credentialAuth).
-	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up)
+	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up.Provider)
 	if fail != nil {
 		return fail
 	}
@@ -1029,19 +1032,30 @@ func hermeticGitEnv(allowProtocol string) []string {
 // username entry, as long), which must fit gitlimit.MaxArgBytes.
 const maxCredentialBytes = gitlimit.MaxArgBytes - len("OPENSTORAGE_ASKPASS_PASSWORD=")
 
+// maxUpstreamURLBytes bounds an upstream URL. git gets it as one argument,
+// and its HTTP transport hands it on to send-pack and fetch-pack with a
+// "/" added, which must fit gitlimit.MaxArgBytes.
+const maxUpstreamURLBytes = gitlimit.MaxArgBytes - len("/")
+
+// upstreamURLFailure fails a run whose upstream URL is over
+// maxUpstreamURLBytes, before any git starts: such a link fails the same
+// way on every run, so it is configuration. The error never names the URL.
+func upstreamURLFailure(up Upstream) *syncFailure {
+	if len(up.CloneURL()) <= maxUpstreamURLBytes {
+		return nil
+	}
+	return &syncFailure{code: FailConfig, cause: errors.New("upstream URL is longer than git takes as one argument")}
+}
+
 // upstreamAuth loads the repo's stored upstream credential and returns
 // the Basic-auth pair the worker sends. ("", "") means none: no stored
 // credential, or one with an empty password (sent nothing before #400
 // either). The pair travels through git's line-based credential-helper
 // protocol, so a stored value with CR, LF or NUL fails the run as
-// configuration instead of injecting helper attributes. So do an upstream
-// URL that git cannot take as one argument and a credential over
-// maxCredentialBytes: the run would fail the same way every time. The
+// configuration instead of injecting helper attributes. So does a value
+// over maxCredentialBytes, which git cannot take in its environment. The
 // error never names the value.
-func (w *Worker) upstreamAuth(ctx context.Context, repoID string, up Upstream) (username, password string, fail *syncFailure) {
-	if len(up.CloneURL()) > gitlimit.MaxArgBytes {
-		return "", "", &syncFailure{code: FailConfig, cause: errors.New("upstream URL is longer than git takes as one argument")}
-	}
+func (w *Worker) upstreamAuth(ctx context.Context, repoID, provider string) (username, password string, fail *syncFailure) {
 	cred, err := w.Credentials.CredentialForRepo(ctx, repoID)
 	switch {
 	case errors.Is(err, ErrNotFound):
@@ -1055,7 +1069,7 @@ func (w *Worker) upstreamAuth(ctx context.Context, repoID string, up Upstream) (
 	case max(len(cred.Username), len(cred.Password)) > maxCredentialBytes:
 		return "", "", &syncFailure{code: FailConfig, cause: errors.New("stored git credential is longer than git takes in its environment")}
 	}
-	username, password = credentialAuth(up.Provider, cred.Username, cred.Password)
+	username, password = credentialAuth(provider, cred.Username, cred.Password)
 	return username, password, nil
 }
 

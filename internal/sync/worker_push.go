@@ -537,6 +537,9 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 		return nil, &syncFailure{code: FailConfig, cause: fmt.Errorf(
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
 	}
+	if fail := upstreamURLFailure(up); fail != nil {
+		return nil, fail
+	}
 
 	tmp, err := os.MkdirTemp("", "openstorage-push-*")
 	if err != nil {
@@ -613,7 +616,7 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	// credential-less file:// upstreams in tests just work). An omitted
 	// username gets the per-provider default (credentialAuth), like the
 	// pull fetch.
-	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up)
+	username, password, fail := w.upstreamAuth(ctx, job.RepoID, up.Provider)
 	if fail != nil {
 		return nil, fail
 	}

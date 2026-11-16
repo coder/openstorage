@@ -470,9 +470,9 @@ an sr.ht upstream still gets the `git` default.
 
 The worker hands the pair to git through a credential helper that reads it from the
 environment. A stored username or password that contains a carriage return, line feed
-or NUL fails the sync as a configuration error. So does one over 131,042 bytes: git gets
-it as one environment entry, such as `OPENSTORAGE_ASKPASS_PASSWORD=<password>`, which
-must fit 128 KiB with its terminating NUL.
+or NUL fails the sync as a configuration error. So does one over 131,042 bytes, before
+git gets it: git takes it as one environment entry, such as
+`OPENSTORAGE_ASKPASS_PASSWORD=<password>`, which must fit 128 KiB with its terminating NUL.
 
 ### Files & trees (`git:read`)
 
@@ -793,6 +793,12 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 | `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional, deprecated body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400. Its fields are ignored |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 
+A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`) is over
+131,070 bytes fails as `repository configuration error` before git starts. git gets the URL
+as one argument, and its HTTP transport hands it on with a `/` added, which must fit
+128 KiB with its terminating NUL. A stored credential that git cannot take fails the same
+way ([Git credentials](#git-credentials-generic-https-upstreams)).
+
 #### Deprecation header
 
 Every response of the four deprecated routes carries `Deprecation: @1791331200`:
@@ -886,9 +892,6 @@ freshness pokes) and push-upstream forwards.
   Transitional default: pulls allow private upstreams, pushes deny.
 - A denied pull destination fails the run as `repository configuration error`; a denied
   push destination as `invalid sync configuration`.
-- An upstream URL (`https://{host}/{owner}/{name}.git`) over 131,071 bytes fails a pull or
-  a push as `repository configuration error` before git starts: git gets the URL as one
-  argument, which must fit 128 KiB with its terminating NUL.
 - `POST /repos` with `upstream` or a `base_repo` sync also rejects, with 400, an
   `upstream.host` or `upstream_host` the pull policy denies. This registration check is a courtesy; dial time is authoritative.
 
