@@ -38,8 +38,10 @@ func TestStrictJSONRejectsDuplicateMembers(t *testing.T) {
 // TestStrictJSONKeepsNoNamePastTheBound: a body of 1 MiB can hold 80,000
 // unknown members. The walk keeps the names of the first maxInvalidParams
 // of them and a hash of each of the others, so a member past the bound
-// costs the walk about two allocations (its name token). Keeping each
-// member's problem costs ten, and 48 MB for such a body.
+// costs the walk about one allocation (its name). Keeping each member's
+// problem costs ten, and 48 MB for such a body. Each copy of author is
+// read by the decoder of its path, reset for it: a new decoder for each
+// copy costs eleven more allocations.
 func TestStrictJSONKeepsNoNamePastTheBound(t *testing.T) {
 	const n = 20000
 	var b strings.Builder
@@ -55,7 +57,16 @@ func TestStrictJSONKeepsNoNamePastTheBound(t *testing.T) {
 		}
 	})
 	if perMember := allocs / n; perMember > 3 {
-		t.Fatalf("%.1f allocations for each unknown member, want about 2", perMember)
+		t.Fatalf("%.1f allocations for each unknown member, want about 1", perMember)
+	}
+	copies := []byte("{" + strings.Repeat(`"author":{"x":1,"name":"a"},`, n) + `"note":"n"}`)
+	allocs = testing.AllocsPerRun(1, func() {
+		if strictJSON(copies, new(wrefNoteAppendRequest)) == nil {
+			t.Fatal("strictJSON succeeded")
+		}
+	})
+	if perCopy := allocs / n; perCopy > 5 {
+		t.Fatalf("%.1f allocations for each copy of author, want about 3 (its names)", perCopy)
 	}
 }
 

@@ -206,9 +206,9 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 // .../notes/append and POST .../upstream/pull name each unknown, duplicate
 // or null member, and each member that must be an object: the known members
 // in the order of the docs body (a member's own problem before those below
-// it), then the unknown ones in the order of the request. A body with one
-// bad member answers as before. The field checks run only when the members
-// are fine.
+// it), then the unknown ones in the order of the request. The copies of a
+// repeated object are one object. A body with one bad member answers as
+// before. The field checks run only when the members are fine.
 func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := ipNewFixture(t, e)
@@ -242,9 +242,25 @@ func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 				want: []ipParam{twice("author"), unknown("author.x")},
 			},
 			{
+				name: "a repeated object names the members of each copy", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":{},"author":{"x":1}}`, wantError: prefix + `duplicate field "author"; unknown field "author.x"`,
+				want: []ipParam{twice("author"), unknown("author.x")},
+			},
+			{
+				name: "the copies of a repeated object are one object", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"author":{"name":"a","x":1},"author":{"x":2,"name":null}}`,
+				wantError: prefix + `duplicate field "author"; author.name must not be null; unknown field "author.x"`,
+				want:      []ipParam{twice("author"), null("author.name"), unknown("author.x")},
+			},
+			{
 				name: "a member that must be an object", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"author":3,"bogus":1}`, wantError: prefix + `author must be a JSON object; unknown field "bogus"`,
 				want: []ipParam{{"author", "must be an object"}, unknown("bogus")},
+			},
+			{
+				name: "a null object and an unknown member", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":null,"bogus":1}`, wantError: prefix + `author must not be null; unknown field "bogus"`,
+				want: []ipParam{null("author"), unknown("bogus")},
 			},
 			{
 				name: "bad members before a syntax error", method: http.MethodPost, path: path, token: fx.gitTok,
@@ -278,6 +294,11 @@ func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 				name: "empty member names add their message only", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"":1,"bogus":1,"author":{"":1}}`, wantError: prefix + `unknown field "author."; unknown field ""; unknown field "bogus"`,
 				want: []ipParam{unknown("bogus")},
+			},
+			{
+				name: "an empty name below a member with its dotted path", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author.":1,"author":{"":1},"bogus":1}`, wantError: prefix + `unknown field "author."; unknown field "bogus"`,
+				want: []ipParam{unknown("author."), unknown("bogus")},
 			},
 			{
 				name: "pull: every kind", method: http.MethodPost, path: pull, token: fx.gitTok,
@@ -320,6 +341,10 @@ func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 				body: `{"author":3}`, wantError: prefix + "author must be a JSON object", want: []ipParam{{"author", "must be an object"}},
 			},
 			{
+				name: "one null object", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":null}`, wantError: prefix + "author must not be null", want: []ipParam{null("author")},
+			},
+			{
 				name: "one empty member name", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"":1}`, wantError: prefix + `unknown field ""`,
 			},
@@ -358,15 +383,17 @@ func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 	})
 }
 
-// TestStrictBodiesBoundTheNamesTheyRepeat: an unknown member name is request
-// text. An answer that names several members repeats at most 32 bytes of
-// each, so a 1 MiB body of long names answers with less than 70,000 bytes.
-// An answer that names one member keeps its name up to 16384 bytes
+// TestStrictBodiesBoundTheNamesTheyRepeat: an unknown member name is
+// request text. An answer that names several members repeats at most 32
+// bytes of each, so it has at most 105,203 bytes and the request path: 100
+// items, each with two messages in `error` and in `detail` (a name in
+// author and the same name at the top level as author.<name>). An answer
+// that names one member keeps its name up to 16384 bytes
 // (TestLongValuesAreCutInAnswers). A name that an earlier item shows after
 // the cut gives no item of its own and counts in `and N more`. Each object
-// keeps 100 unknown names, and `and N more` counts each member that the
-// answer leaves out once: a repeat, or a member with the dotted path of a
-// named or counted one, adds nothing.
+// (all copies of author are one) keeps 100 unknown names, and `and N more`
+// counts each member that the answer leaves out once: a repeat, or a member
+// with the dotted path of a named or counted one, adds nothing.
 func TestStrictBodiesBoundTheNamesTheyRepeat(t *testing.T) {
 	// name is the i-th member name of 8,600 bytes of <, > and &, which JSON
 	// escapes to six bytes each. The names differ in their first 32 bytes.
@@ -402,10 +429,23 @@ func TestStrictBodiesBoundTheNamesTheyRepeat(t *testing.T) {
 		}
 		return items
 	}
-	var alike strings.Builder // 150 names with one first 32 bytes
-	for i := range 150 {
-		fmt.Fprintf(&alike, `"%s%03d":1,`, strings.Repeat("p", 32), i)
+	alike := func(n int) string { // n names with one first 32 bytes
+		var b strings.Builder
+		for i := range n {
+			fmt.Fprintf(&b, `"%s%03d":1,`, strings.Repeat("p", 32), i)
+		}
+		return b.String()
 	}
+	// twice has 100 names of 33 bytes in author and again at the top level
+	// as author.<name>: 100 items with two messages each, the longest answer.
+	var inAuthor, atTop []string
+	var twiceItems []ipParam
+	for i := range 100 {
+		inAuthor = append(inAuthor, `"`+name(i)[:33]+`":1`)
+		atTop = append(atTop, `"author.`+name(i)[:33]+`":1`)
+		twiceItems = append(twiceItems, ipParam{"author." + name(i)[:32] + "…", "is not a known field"})
+	}
+	twice := `{"author":{` + strings.Join(inAuthor, ",") + "}," + strings.Join(atTop, ",") + "}"
 	nullNote, nullName := []ipParam{{"note", "must not be null"}}, []ipParam{{"author.name", "must not be null"}}
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := ipNewFixture(t, e)
@@ -420,9 +460,19 @@ func TestStrictBodiesBoundTheNamesTheyRepeat(t *testing.T) {
 			{"append: a long name and a null member", "/notes/append", `{"` + long + `":1,"note":null}`,
 				`note must not be null; unknown field "` + long[:32] + `…"`,
 				[]ipParam{{"note", "must not be null"}, {long[:32] + "…", "is not a known field"}}},
-			{"append: names cut to one text", "/notes/append", "{" + alike.String() + `"note":null}`,
+			{"append: names cut to one text", "/notes/append", "{" + alike(150) + `"note":null}`,
 				`; unknown field "` + strings.Repeat("p", 32) + `…"; and 149 more`,
 				append(nullNote, ipParam{strings.Repeat("p", 32) + "…", "is not a known field"})},
+			{"append: a name past 100 names cut to one text", "/notes/append", "{" + alike(100) + `"zzz":1}`,
+				`unknown field "` + strings.Repeat("p", 32) + `…"; and 100 more`,
+				[]ipParam{{strings.Repeat("p", 32) + "…", "is not a known field"}}},
+			{"append: the copies of author keep 100 names", "/notes/append",
+				`{"author":{` + strings.TrimSuffix(alike(100), ",") + `},"author":{"zzz":1}}`,
+				`duplicate field "author"; unknown field "author.` + strings.Repeat("p", 32) + `…"; and 100 more`,
+				[]ipParam{{"author", "appears more than once"}, {"author." + strings.Repeat("p", 32) + "…", "is not a known field"}}},
+			{"append: 100 long names in author and at the top level", "/notes/append",
+				twice,
+				`; unknown field "author.` + name(99)[:25] + `…"`, twiceItems},
 			{"append: repeats of left-out names", "/notes/append",
 				"{" + members("u", 100) + strings.Repeat(`"zz":1,"yy":1,`, 500) + `"note":"n"}`, "; and 2 more", unknown("u", 100)},
 			{"append: 120 names in author", "/notes/append", `{"note":null,"author":{` + strings.TrimSuffix(members("n", 120), ",") + "}}",
@@ -447,9 +497,10 @@ func TestStrictBodiesBoundTheNamesTheyRepeat(t *testing.T) {
 				for _, ip := range p.InvalidParams {
 					got = append(got, ipParam{ip.Name, ip.Reason})
 				}
-				if len(body) >= 70_000 || !strings.HasSuffix(msg, tc.tail) || !slices.Equal(got, tc.want) {
-					t.Fatalf("%d bytes, message ends %q, %d items; want under 70,000 bytes, the end %q, %d items",
-						len(body), msg[max(0, len(msg)-60):], len(got), tc.tail, len(tc.want))
+				limit := 105_203 + len(p.Instance)
+				if len(body) > limit || !strings.HasSuffix(msg, tc.tail) || !slices.Equal(got, tc.want) {
+					t.Fatalf("%d bytes, message ends %q, %d items; want at most %d bytes, the end %q, %d items",
+						len(body), msg[max(0, len(msg)-60):], len(got), limit, tc.tail, len(tc.want))
 				}
 			})
 		}

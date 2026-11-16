@@ -114,24 +114,31 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   other problems. The members of the route's request body come
   first, in its order in this document (the problem of an object member before the
   problems of the members inside it), then the unknown members in the order of the
-  request. A member that the request repeats is named once, and two members with one
-  dotted path (an unknown member called `author.name`, and the `name` of an `author`
-  object) give one item with both messages. When the check reaches a JSON syntax error
-  or trailing data, the answer names the members that it found before that point, and
-  when there are none it is `body must be a JSON object`. An answer that names more than
-  one member cuts each unknown member name, which is request text, at 32 bytes and ends
-  it with `…`, so that a body of 1 MiB full of long names gets an answer of about 69,000
-  bytes. Two unknown names that are the same in their first 32 bytes give one item, for
-  the first of them, and `and N more` counts the others, so that a name appears once in
-  `invalid_params`. The body and `author` each keep their first 100 unknown member
-  names, and `and N more` counts the others. N counts each member that the answer
-  leaves out once: a member that the request repeats, or that has the dotted path of a
-  member named or counted already, adds nothing. Past the 100 names of an object the
-  count compares 64-bit hashes of the names, so two of them count as one in about one
-  body of 1 MiB in a billion. An answer that names one member keeps its name up to the
-  cut of 16384 bytes above. The other checks run only when the members are fine, and
-  then the decoder of a strictly decoded body names only the first field of the wrong
-  type (`{"note":1,"object_ref":2}` names `note`).
+  request. A member that the request repeats is named once, for its first problem. The
+  copies of an `author` object that the request repeats are one object: each copy is
+  checked for its own members (a name that one copy holds twice is repeated), and a bad
+  member of any copy is named once, in the order above. Two members with one dotted path
+  (an unknown member called `author.name`, and the `name` of an `author` object) give
+  one item with both messages, or with one message when they say the same (an unknown
+  member called `author.`, and an empty member name in `author`). When the check reaches
+  a JSON syntax error or trailing data, the answer names the members that it found
+  before that point, and when there are none it is `body must be a JSON object`. An
+  answer that names more than one member cuts each unknown member name, which is request
+  text, at 32 bytes and ends it with `…`. Such an answer names at most 100 fields: one
+  item each in `invalid_params`, and in `error` and in `detail` at most two messages
+  each (for an unknown name in `author` sent again at the top level as `author.<name>`).
+  JSON escapes each byte of a cut name to at most six bytes, so the answer has at most
+  105,203 bytes and the request path in `instance`. Two unknown names that are the same
+  in their first 32 bytes give one item, for the first of them, and `and N more` counts
+  the others, so that a name appears once in `invalid_params`. The body and `author`
+  each keep their first 100 unknown member names, and `and N more` counts the others. N
+  counts each member that the answer leaves out once: a member that the request repeats,
+  or that has the dotted path of a member named or counted already, adds nothing. Past
+  the 100 names of an object the count compares 64-bit hashes of the names, so two of
+  them count as one in about one body of 1 MiB in a billion. An answer that names one
+  member keeps its name up to the cut of 16384 bytes above. The other checks run only
+  when the members are fine, and then the decoder of a strictly decoded body names only
+  the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
   `POST /api/repos/{repo_name}/upstream/pull` takes `{ref?, after?}` and works the same
   way. The pull-upstream routes that are not strict, `POST /repos/pull-upstream` and its
   deprecated path form, name both `ref` and `after` when both have the wrong type. On

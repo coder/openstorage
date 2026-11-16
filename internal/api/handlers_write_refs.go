@@ -28,6 +28,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -993,11 +994,13 @@ func strictJSON(body []byte, dst any) error {
 // maxListedNameBytes cuts an unknown member name, which is request text,
 // in an answer that names more than one bad member. 100 names of 16 KiB
 // would repeat 1.6 MB in `invalid_params` and as much in `error` and
-// `detail`. 100 names of 32 bytes, each in those three members, take at
-// most 57,600 bytes of the answer, even when JSON escapes each byte to
-// six. No field name in upstream's spec has more than 25 bytes. An answer
-// that names one member keeps its whole name, as before (errtext.MaxBytes
-// cuts it).
+// `detail`. With the cut, an answer has at most 100 items, and in `error`
+// and in `detail` 100 slots of at most two messages (a name in author and
+// the same name at the top level as author.<name>), each name 32 bytes
+// that JSON escapes to at most 192: at most 105,203 bytes and the request
+// path in `instance` (TestStrictBodiesBoundTheNamesTheyRepeat). No field
+// name in upstream's spec has more than 25 bytes. An answer that names
+// one member keeps its whole name, as before (errtext.MaxBytes cuts it).
 const maxListedNameBytes = 32
 
 // checkStrictObject verifies raw is a JSON object whose member names are
@@ -1010,15 +1013,19 @@ const maxListedNameBytes = 32
 // It names every bad member (bodyErrors) in a fixed order: the members t
 // knows in the order of its fields (a member's own problem, then the
 // problems below it), then the unknown members in the order of the body.
-// A member sent twice is named once, and two problems with one dotted path
-// take one item. Each object keeps the first maxInvalidParams unknown
-// names, and `and N more` counts the others, each name once. A syntax
+// A member sent twice is named once, for its first problem. The copies of
+// an object member sent twice are one object: each copy is checked for
+// its own members, and a bad member of any copy is named once. Two
+// problems with one dotted path take one item. Each object keeps the
+// first maxInvalidParams unknown names, and `and N more` counts the
+// others, each name once. A syntax
 // error or trailing data ends the walk: the answer names the problems
 // found before it, and is the plain error "body must be a JSON object"
 // when there are none, as for a body that is not an object.
 func checkStrictObject(raw []byte, t reflect.Type) error {
-	w := strictWalk{seed: maphash.MakeSeed()}
-	found, ok := w.members(raw, t, "")
+	w := strictWalk{seed: maphash.MakeSeed(), objects: make(map[string]*strictObject)}
+	ok := w.members(raw, t, "")
+	found := w.problems(nil, "")
 	if !ok && len(found) == 0 {
 		return errors.New("body must be a JSON object")
 	}
@@ -1068,13 +1075,55 @@ func (p strictProblem) err(cut bool) error {
 // strictWalk is the state of one checkStrictObject.
 type strictWalk struct {
 	seed maphash.Seed
+	// objects holds what the walk found in the objects at each dotted path
+	// ("" for the body): the copies of an object member that the body
+	// repeats are one object here.
+	objects map[string]*strictObject
 	// omitted holds a hash of the dotted path of each unknown member past
 	// the first maxInvalidParams unknown names of its object, so that
 	// `and N more` counts each of them once: err sorts the list and skips
-	// repeats. A 1 MiB body holds at most 174,762 members, so the list
-	// stays below 1.4 MB. Two names with one hash count once: with a random
-	// seed, about one body of that size in 10^9.
+	// repeats. It grows with the body: a member takes at least five bytes
+	// (`"":0,`), so a 1 MiB body can add 209,715 hashes, 1.7 MB. Two names
+	// with one hash count once: with a random seed, about one body of that
+	// size in 10^9.
 	omitted []uint64
+}
+
+// strictObject is what the walk found in the objects at one dotted path.
+type strictObject struct {
+	names   []string                // known member names, in field order
+	fields  map[string]reflect.Type // known member name -> its type
+	own     map[string]strictKind   // known member name -> its first problem
+	unknown []strictProblem         // the kept unknown names, in body order
+	kept    map[string]bool         // the names in unknown
+	// r and dec read each copy of the object, reset for it: a new decoder
+	// for each copy allocated 48 MB for 1 MiB of `"author":{},`.
+	r   bytes.Reader
+	dec jsontext.Decoder
+}
+
+// add gives the known member name the problem kind, unless it has one: a
+// member is named once, for its first problem.
+func (o *strictObject) add(name string, kind strictKind) {
+	if _, bad := o.own[name]; !bad {
+		o.own[name] = kind
+	}
+}
+
+// problems appends the problems of the objects at the dotted path path to
+// found, in the order of checkStrictObject.
+func (w *strictWalk) problems(found []strictProblem, path string) []strictProblem {
+	o := w.objects[path]
+	if o == nil {
+		return found
+	}
+	for _, name := range o.names {
+		if kind, bad := o.own[name]; bad {
+			found = append(found, strictProblem{path: path, name: name, kind: kind})
+		}
+		found = w.problems(found, path+name+".")
+	}
+	return append(found, o.unknown...)
 }
 
 // hash returns the hash of the dotted path path+name.
@@ -1089,8 +1138,9 @@ func (w *strictWalk) hash(path, name string) uint64 {
 // err returns nil for no problem, the problem itself for one, and for
 // several the answer of bodyErrors, with each unknown name cut at
 // maxListedNameBytes. A dotted path is one field: problems with one path
-// (a member named "author.name" and the "name" of an author object) take
-// one slot, where the later one adds its message to the first one's, or
+// (a member named "author.name" and the "name" of an author object, or a
+// member named "author." and an empty name in author) take one slot with
+// one item, where the later one adds its message to the first one's, or
 // nothing when it says the same. `and N more` counts each other field
 // once: one after maxInvalidParams items, one whose cut name an earlier
 // item shows (invalid_params shows each name once), and each dotted path
@@ -1112,11 +1162,7 @@ func (w *strictWalk) err(problems []strictProblem) error {
 	omitted := slices.Compact(w.omitted)
 	for _, p := range problems {
 		err := p.err(true)
-		items := invalidParamsFor(err)
-		if len(items) == 0 { // an empty member name: a message only
-			errs.add(err)
-			continue
-		}
+		items := invalidParamsFor(err) // none for an empty member name
 		path := p.path + p.name
 		h := w.hash(p.path, p.name)
 		if _, found := slices.BinarySearch(omitted, h); found {
@@ -1124,16 +1170,26 @@ func (w *strictWalk) err(problems []strictProblem) error {
 		}
 		i, seen := at[path]
 		switch {
-		case seen && i >= 0 && errs.errs[i].Error() != err.Error():
+		case seen && i >= 0:
+			// The slot keeps its item, or takes this one's when it has none
+			// (an empty member name below the field), and each message once.
 			first := errs.errs[i]
-			errs.errs[i] = newFieldErrors(first.Error()+"; "+err.Error(), invalidParamsFor(first)...)
+			msg, params := first.Error(), append(invalidParamsFor(first), items...)
+			if msg != err.Error() {
+				msg += "; " + err.Error()
+			}
+			if len(params) > 0 {
+				errs.errs[i] = newFieldErrors(msg, params[0])
+			}
 		case seen:
-		case shown[items[0].Name] || errs.full():
+		case (len(items) > 0 && shown[items[0].Name]) || errs.full():
 			at[path] = -1
 			errs.skip()
 		default:
 			at[path] = len(errs.errs)
-			shown[items[0].Name] = true
+			for _, item := range items {
+				shown[item.Name] = true
+			}
 			errs.add(err)
 		}
 	}
@@ -1142,119 +1198,93 @@ func (w *strictWalk) err(problems []strictProblem) error {
 }
 
 // members walks the members of raw, a JSON object of type t at the dotted
-// path path, and returns their problems in the order of checkStrictObject.
-// ok is false when raw is not one JSON object: found then holds the
-// problems before the point where the walk stopped. A member value is one
-// complete JSON value, so the walk below a member stops only at its start,
-// for a value that is not an object.
-func (w *strictWalk) members(raw []byte, t reflect.Type, path string) (found []strictProblem, ok bool) {
-	var (
-		names  = make([]string, 0, t.NumField()) // known member names, in field order
-		fields = make(map[string]reflect.Type, t.NumField())
-	)
-	for i := range t.NumField() {
-		ft := t.Field(i).Type
-		if k := ft.Kind(); k == reflect.Slice || k == reflect.Array || k == reflect.Map {
-			et := ft.Elem()
-			if et.Kind() == reflect.Pointer {
-				et = et.Elem()
-			}
-			assertf(et.Kind() != reflect.Struct, "checkStrictObject: %s field %s holds structs, which are not checked", t, t.Field(i).Name)
-		}
-		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
-		if name != "" && name != "-" {
-			names = append(names, name)
-			fields[name] = ft
-		}
-	}
-	// member is what a known member has: its own problem (the first one: a
-	// repeat of a bad member adds none) and the problems below it.
-	type member struct {
-		own    *strictProblem
-		nested []strictProblem
-	}
-	var (
-		members = make(map[string]*member, len(fields))
-		unknown []strictProblem
-		kept    = make(map[string]bool) // the names in unknown
-	)
-	done := func(ok bool) ([]strictProblem, bool) {
-		for _, name := range names {
-			if m := members[name]; m != nil {
-				if m.own != nil {
-					found = append(found, *m.own)
+// path path, and records their problems in w.objects. It returns false
+// when raw is not one JSON object: w.objects then holds the problems
+// before the point where the walk stopped. A member value is one complete
+// JSON value, so the walk below a member stops only at its start, for a
+// value that is not an object. Each copy of a repeated object member is
+// walked: a member is repeated when one copy holds it twice.
+func (w *strictWalk) members(raw []byte, t reflect.Type, path string) bool {
+	o := w.objects[path]
+	if o == nil {
+		o = &strictObject{fields: make(map[string]reflect.Type, t.NumField()), own: make(map[string]strictKind), kept: make(map[string]bool)}
+		for i := range t.NumField() {
+			ft := t.Field(i).Type
+			if k := ft.Kind(); k == reflect.Slice || k == reflect.Array || k == reflect.Map {
+				et := ft.Elem()
+				if et.Kind() == reflect.Pointer {
+					et = et.Elem()
 				}
-				found = append(found, m.nested...)
+				assertf(et.Kind() != reflect.Struct, "checkStrictObject: %s field %s holds structs, which are not checked", t, t.Field(i).Name)
+			}
+			name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+			if name != "" && name != "-" {
+				o.names = append(o.names, name)
+				o.fields[name] = ft
 			}
 		}
-		return append(found, unknown...), ok
+		w.objects[path] = o
 	}
-	// Walk the members in order with a token decoder: unmarshaling into a
-	// map would hide a duplicate name.
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return done(false)
+	seen := make(map[string]bool, len(o.fields)) // the known names of this copy
+	// Walk the members in order with a token decoder, the one that
+	// json.NewDecoder makes: unmarshaling into a map would hide a
+	// duplicate name.
+	o.r.Reset(raw)
+	o.dec.Reset(&o.r, json.DefaultOptionsV1())
+	dec := &o.dec
+	if tok, err := dec.ReadToken(); err != nil || tok.Kind() != '{' {
+		return false
 	}
-	var v json.RawMessage // reused for every member: its UnmarshalJSON appends into the old buffer
-	for dec.More() {
-		tok, err := dec.Token()
+	for dec.PeekKind() != '}' {
+		tok, err := dec.ReadToken()
 		if err != nil {
-			return done(false)
+			return false
 		}
-		name, isName := tok.(string)
-		assertf(isName, "checkStrictObject: member name token %T", tok)
-		if err := dec.Decode(&v); err != nil {
-			return done(false)
+		assertf(tok.Kind() == '"', "checkStrictObject: member name token %v", tok.Kind())
+		name := tok.String()
+		v, err := dec.ReadValue() // valid until dec reads again
+		if err != nil {
+			return false
 		}
-		ft, known := fields[name]
+		ft, known := o.fields[name]
 		if !known {
 			switch {
-			case kept[name]:
-			case len(kept) < maxInvalidParams:
-				kept[name] = true
-				unknown = append(unknown, strictProblem{path: path, name: name, kind: strictUnknown})
+			case o.kept[name]:
+			case len(o.kept) < maxInvalidParams:
+				o.kept[name] = true
+				o.unknown = append(o.unknown, strictProblem{path: path, name: name, kind: strictUnknown})
 			default:
 				// Past the bound the walk keeps a hash, not a problem: a
-				// member of six bytes would otherwise cost ten
+				// member of five bytes would otherwise cost ten
 				// allocations. The rest of raw holds at most one member
-				// in six bytes, which sizes the list once.
+				// in five bytes, which sizes the list for this object.
 				if w.omitted == nil {
-					w.omitted = make([]uint64, 0, (len(raw)-int(dec.InputOffset()))/6+1)
+					w.omitted = make([]uint64, 0, (len(raw)-int(dec.InputOffset()))/5+1)
 				}
 				w.omitted = append(w.omitted, w.hash(path, name))
 			}
 			continue
 		}
-		if m := members[name]; m != nil {
-			if m.own == nil {
-				m.own = &strictProblem{path: path, name: name, kind: strictRepeated}
-			}
-			continue
+		if seen[name] {
+			o.add(name, strictRepeated)
 		}
-		m := &member{}
-		members[name] = m
-		if string(bytes.TrimSpace(v)) == "null" {
-			m.own = &strictProblem{path: path, name: name, kind: strictNull}
-			continue
-		}
+		seen[name] = true
 		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
 		}
-		if ft.Kind() == reflect.Struct {
-			var isObject bool
-			if m.nested, isObject = w.members(v, ft, path+name+"."); !isObject {
-				m.own = &strictProblem{path: path, name: name, kind: strictNotObject}
-			}
+		switch {
+		case string(bytes.TrimSpace(v)) == "null":
+			o.add(name, strictNull)
+		case ft.Kind() == reflect.Struct && !w.members(v, ft, path+name+"."):
+			o.add(name, strictNotObject)
 		}
 	}
 	// The closing brace, then nothing: trailing data is not an object.
-	if _, err := dec.Token(); err != nil {
-		return done(false)
+	if _, err := dec.ReadToken(); err != nil {
+		return false
 	}
-	if _, err := dec.Token(); err != io.EOF {
-		return done(false)
-	}
-	return done(true)
+	_, err := dec.ReadToken()
+	return err == io.EOF
 }
 
 // wrefDecodeStrictBody is wrefDecodeBody with strictJSON.
