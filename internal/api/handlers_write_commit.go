@@ -53,6 +53,7 @@ import (
 	"syscall"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/meta"
@@ -174,11 +175,13 @@ type wcResult struct {
 }
 
 // wcRefUpdate builds every wcResult, so target_branch and branch always
-// name the same branch and success is true only for status "ok".
+// name the same branch and success is true only for status "ok". It cuts
+// msg as newProblem cuts `error`: a failure message can repeat a value of
+// the request, such as a 1 MiB content_id.
 func wcRefUpdate(branch, oldSHA, newSHA, status, msg string) wcResult {
 	return wcResult{
 		TargetBranch: branch, Branch: branch, OldSHA: oldSHA, NewSHA: newSHA,
-		Success: status == "ok", Status: status, Message: msg,
+		Success: status == "ok", Status: status, Message: errtext.Bound(msg),
 	}
 }
 
