@@ -38,7 +38,7 @@ counted; their failures reach the client and the hook's stderr.
 
 | Metric | Type | Labels | Counts |
 |---|---|---|---|
-| `openstorage_http_requests_total` | counter | `surface` (`api`, `git`, `health`), `code_class` (`1xx`–`5xx`) | Requests on the API/Git listener by final status class. `git` includes LFS and unmatched paths. |
+| `openstorage_http_requests_total` | counter | `surface` (`api`, `git`, `health`), `code_class` (`1xx`–`5xx`) | Requests on the API/Git listener by final status class. `git` includes LFS and unmatched paths. A redirect that the server answers with a `404` because its `Location` would pass 16384 bytes ([HTTP API](http-api.md#conventions)) counts under the surface whose `404` it sends, `api` or `git`, also when it leads to `/healthz`. |
 | `openstorage_http_request_duration_seconds` | histogram | `surface` | Request wall time, including streamed Git pack transfer. |
 | `openstorage_s3wal_cas_contention_exhausted_total` | counter | `scope` (`refs`, `scan_state`, `meta`) | S3WAL mutations in this process that returned "conditional-write contention retries exhausted". Once per mutation, not per attempt. |
 | `openstorage_s3wal_lease_renewal_failures_total` | counter | none | Instance-lease renewal writes that returned an error, including ambiguous writes later resolved as landed. Not a count of lost leases. |
