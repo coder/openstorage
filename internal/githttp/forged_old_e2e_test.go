@@ -157,7 +157,9 @@ func TestForgedOldIDUnderNoForcePushIsRefused(t *testing.T) {
 		{"old id the server does not have, atomic push", token, true, ffPack, []rawPushCommand{{forgedOldID, c2, main}}, noff, false},
 		{"old id the server does not have, mixed push", token, false, ffPack, []rawPushCommand{{forgedOldID, c2, main}, {ref.ZeroSHA, c2, feature}}, noff, true},
 		{"old id names a tree", token, false, ffPack, []rawPushCommand{{tree1, c2, main}}, noff, false},
-		{"new id names a blob", token, false, packObjects(t, work, blob), []rawPushCommand{{c1, blob, main}}, noff, false},
+		// A branch at a blob is refused as a branch tip before the policy asks
+		// for ancestry. The tag test below keeps the ancestry case.
+		{"new id names a blob", token, false, packObjects(t, work, blob), []rawPushCommand{{c1, blob, main}}, "must point at a commit, not a blob", false},
 		{"real force push", token, false, packObjects(t, work, rewrite, "^"+c1), []rawPushCommand{{c1, rewrite, main}}, noff, false},
 		{"old id the server does not have, verify-sig", signedOnly, false, ffPack, []rawPushCommand{{forgedOldID, c2, main}}, noCommit, false},
 	} {
@@ -183,6 +185,53 @@ func TestForgedOldIDUnderNoForcePushIsRefused(t *testing.T) {
 			t.Fatalf("fast-forward report %v, main %s, want ok at %s\nremote:\n%s", report, pgRefs(t, repo)[main], c2, remote)
 		}
 	})
+}
+
+// A tag can name a blob, a tree or an annotated tag, so a forced update of a tag
+// moves between a commit and a non-commit under a no-force-push tag policy. The
+// ancestry check must refuse it like any non-fast-forward update, and the
+// pusher must read no Go trace.
+func TestForcedTagUpdateBetweenACommitAndANonCommitIsRefused(t *testing.T) {
+	repo := registerRepo(t, "t-forced-tag")
+	work := initWorkRepo(t)
+	c1 := revParse(t, work, "HEAD")
+	setup := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, setup), "HEAD:refs/heads/main")
+	blob := revParse(t, work, c1+":a.txt")
+	tree := revParse(t, work, c1+"^{tree}")
+	const toBlob, toCommit, toTree = "refs/tags/to-blob", "refs/tags/to-commit", "refs/tags/to-tree"
+	// Tags at a commit and at a blob, made with a token that has no policy.
+	if report, remote := rawReceivePack(t, nodeA, repo, setup, false, packObjects(t, work, blob), rawPushCommand{ref.ZeroSHA, blob, toCommit}); report[toCommit] != "ok" {
+		t.Fatalf("create %s at a blob: %v\n%s", toCommit, report, remote)
+	}
+	mustGit(t, work, "push", remoteURL(nodeA, repo, setup), c1+":"+toBlob)
+	tagToken := mintTestToken(t, repo, "git:read,git:write", `[["refs/tags/*",["no-force-push"]],["*",[]]]`)
+	for _, tc := range []struct {
+		name string
+		pack []byte
+		cmd  rawPushCommand
+	}{
+		{"a tag at a commit moves to a blob", packObjects(t, work, blob), rawPushCommand{c1, blob, toBlob}},
+		{"a tag at a commit moves to a tree", packObjects(t, work, tree), rawPushCommand{c1, tree, toTree}},
+		{"a tag at a blob moves to a commit", packObjects(t, work, c1), rawPushCommand{blob, c1, toCommit}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.cmd.ref == toTree {
+				if report, remote := rawReceivePack(t, nodeA, repo, setup, false, packObjects(t, work, c1), rawPushCommand{ref.ZeroSHA, c1, toTree}); report[toTree] != "ok" {
+					t.Fatalf("create %s: %v\n%s", toTree, report, remote)
+				}
+			}
+			report, remote := rawReceivePack(t, nodeA, repo, tagToken, false, tc.pack, tc.cmd)
+			assertNoCrashText(t, remote)
+			want := "no-force-push denies non-fast-forward update to " + tc.cmd.ref
+			if !strings.HasPrefix(report[tc.cmd.ref], "ng") || !strings.Contains(remote, want) {
+				t.Fatalf("%s was not refused with %q: report %v\nremote:\n%s", tc.cmd.ref, want, report, remote)
+			}
+			if got := pgRefs(t, repo)[tc.cmd.ref]; got != tc.cmd.old {
+				t.Fatalf("%s = %s after a refused push, want %s", tc.cmd.ref, got, tc.cmd.old)
+			}
+		})
+	}
 }
 
 // plantCommit writes a commit with the given parent into dir's object
