@@ -18,9 +18,8 @@ loopback/private/link-local/ULA/metadata/special-purpose destinations,
 re-resolving and vetting every DNS answer at connect time (no rebinding
 TOCTOU). The proxy's recorded verdicts outrank git's stderr phrasing: a
 policy denial classifies as permanent configuration
-(`repository configuration error` on pull, `invalid sync configuration` on
-push), a non-policy dial failure as the transient
-`upstream repository unreachable`.
+(`repository configuration error` on pull and on push), a non-policy
+dial failure as the transient `upstream repository unreachable`.
 
 **One knob, tri-state, compatibility-first.** `OPENSTORAGE_SYNC_ALLOW_PRIVATE`
 governs BOTH directions: `true` admits the private receiver classes
