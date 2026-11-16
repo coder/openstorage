@@ -142,13 +142,38 @@ type preReceiveCase struct {
 	beforeHook func(t *testing.T, packID string)
 }
 
+// registerStoredCommits packs the objects of the work repository and registers
+// the pack for repo, so that the registry holds what the repository's cache holds.
+func registerStoredCommits(t *testing.T, rs ref.RefStore, repo, work string) {
+	t.Helper()
+	mustGit(t, work, "repack", "-a", "-d", "-q")
+	packs, err := filepath.Glob(filepath.Join(work, ".git", "objects", "pack", "pack-*.pack"))
+	if err != nil || len(packs) != 1 {
+		t.Fatalf("packs of the work repository: %v, %v", packs, err)
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(packs[0]), "pack-"), ".pack")
+	if err := rs.RegisterPacks(t.Context(), repo, []ref.Pack{{ID: id, Key: blob.PackKey(repo, id), Size: 1}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // run runs pre-receive for refs/heads/main and returns its error.
 func (c preReceiveCase) run(t *testing.T) error {
 	t.Helper()
 	work := initWorkRepo(t)
 	commit := revParse(t, work, "HEAD")
-	dir := work
+	dir := filepath.Join(work, ".git") // git runs hooks in the repository
 	packID := ""
+	if !c.pack {
+		// A stored commit is held by a registered pack on a real node:
+		// pre-receive refuses a new value that only the cache holds.
+		rs, err := ref.Open(t.Context(), os.Getenv("OPENSTORAGE_PG_URL"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rs.Close()
+		registerStoredCommits(t, rs, os.Getenv(EnvRepo), work)
+	}
 	if c.pack {
 		bare := t.TempDir()
 		mustGit(t, bare, "init", "-q", "--bare", ".")

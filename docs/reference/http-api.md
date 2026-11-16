@@ -727,6 +727,19 @@ old behavior, read `default_branch` from `GET /repo` and send it as `base_ref`.
 This follows the public OpenAPI/SDK contract, not demonstrated upstream cluster behavior
 ([contract audit](../explanation/wire-compatibility.md#server-allocated-branch-contract)).
 
+#### Which commit the base and the tag target can name
+
+The commit that `base_ref`, `base_branch` or `preferred_base` of `POST /repos/branches/create`, or
+`ref` of `POST /repos/tags`, names must be in a pack that the repository's pack registry lists.
+The server checks the registered packs, not the node's cache repository, because every other node
+(and this node after it loses its cache) hydrates from the registered packs alone and cannot hold a
+ref at any other object. A commit that only a cache holds answers `404`, like a commit that does
+not exist, and a `base_ref` that names no usable commit still falls back to `preferred_base`. The
+server reads the registry only for a request that is about to write: after the ref policy, and not
+for a tag that exists or for a create that leaves the branch at its tip (with `force` or
+`expected_target_sha`). So a request that the policy denies
+answers `403` even when its commit is only in the cache.
+
 #### Guarded branch create and move
 
 `expected_target_sha` on `POST /repos/branches/create` (both path styles) guards the
