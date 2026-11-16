@@ -185,14 +185,17 @@ const (
 	envRepackThreshold = "OPENSTORAGE_REPACK_THRESHOLD"
 
 	// Webhook SSRF-guard escape hatch (issue #53): "true" admits
-	// loopback/private/link-local/ULA delivery targets for genuinely
-	// internal deployments. Default off; the redirect refusal is NOT
+	// loopback, RFC 1918, RFC 6598 shared, link-local and ULA delivery
+	// targets for genuinely internal deployments; the cloud metadata
+	// endpoints (events.metadataAddrs) and the other special-purpose
+	// ranges stay denied. Default off; the redirect refusal is NOT
 	// relaxed. Enabling it logs a boot-time warning.
 	envWebhookAllowPrivate = "OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE"
 	// envSyncAllowPrivate is the unified sync egress policy knob (issue
 	// #139): it governs BOTH git transfer directions — inbound pull
-	// fetches and outbound push forwards. "true" admits loopback/private/
-	// link-local/ULA upstreams (metadata/special-purpose stay denied);
+	// fetches and outbound push forwards. "true" admits loopback, RFC
+	// 1918, RFC 6598 shared, link-local and ULA upstreams (the cloud
+	// metadata endpoints and the other special-purpose ranges stay denied);
 	// "false" denies the private classes in both directions. Unset is the
 	// transitional compatibility default: pushes stay strict (the
 	// deprecated push-only variable below may relax them) while pulls

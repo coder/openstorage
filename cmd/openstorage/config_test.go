@@ -1662,11 +1662,11 @@ func TestLogSyncEgressWarnings(t *testing.T) {
 	}{
 		"transitional default warns about the flip": {
 			settings: syncEgressSettings{pullAllowPrivate: true, pullTransitional: true},
-			want:     []string{"transitional default", "future release flips", envSyncAllowPrivate},
+			want:     []string{"transitional default", "future release flips", "shared (RFC 6598)", "never a cloud metadata endpoint", envSyncAllowPrivate},
 		},
 		"explicit relaxed policy warns": {
 			settings: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true},
-			want:     []string{"sync egress guard relaxed", envSyncAllowPrivate},
+			want:     []string{"sync egress guard relaxed", "shared (RFC 6598)", "never a cloud metadata endpoint", envSyncAllowPrivate},
 		},
 		"deprecated spelling still honored names replacement": {
 			settings: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true, pullTransitional: true, legacyPushFlagSet: true},

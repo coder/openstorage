@@ -26,7 +26,7 @@ func TestTargetGuardRejectsDeniedDialTargets(t *testing.T) {
 		"172.31.255.254",         // RFC 1918 172.16/12 upper bound
 		"192.168.1.1",            // RFC 1918 192.168/16
 		"100.64.0.1",             // RFC 6598 shared lower bound
-		"100.100.100.200",        // RFC 6598 shared internal target
+		"100.100.100.201",        // RFC 6598 shared internal target
 		"100.127.255.254",        // RFC 6598 shared upper bound
 		"0.0.0.1",                // this-network special use
 		"192.0.0.9",              // protocol anycast special use

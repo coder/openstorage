@@ -13,8 +13,9 @@
 sync transfer — inbound pull fetches (`POST /repos/pull-upstream`, the
 first sync at `POST /repos`, freshness pokes) and outbound push forwards —
 runs behind the short-lived loopback proxy from ADR-44, whose dials go
-through the webhook `TargetGuard.DialContext` (issue #53): deny
-loopback/private/link-local/ULA/metadata/special-purpose destinations,
+through the webhook `TargetGuard.DialContext` (issue #53): deny loopback,
+RFC 1918, RFC 6598 shared, link-local, ULA, cloud metadata and
+special-purpose destinations,
 re-resolving and vetting every DNS answer at connect time (no rebinding
 TOCTOU). The proxy's recorded verdicts outrank git's stderr phrasing: a
 policy denial classifies as permanent configuration
@@ -23,7 +24,8 @@ dial failure as the transient `upstream repository unreachable`.
 
 **One knob, tri-state, compatibility-first.** `OPENSTORAGE_SYNC_ALLOW_PRIVATE`
 governs BOTH directions: `true` admits the private receiver classes
-(internal forges), `false` is strict, and **unset is the transitional
+(internal forges: loopback, RFC 1918, RFC 6598 shared, link-local, ULA),
+`false` is strict, and **unset is the transitional
 default** — pushes stay strict while pulls ALLOW private upstreams with a
 boot warning announcing the future flip of that default to deny. Syncing
 from internal RFC 1918 gitea/forgejo/GitLab forges is a mainstream released
@@ -53,8 +55,17 @@ rejects an `upstream_host` whose literal or currently-resolved addresses
 the effective pull policy denies (400, before any rows are created),
 mirroring webhook `CheckRegistration`: fast feedback at link time, fail-open
 on resolution errors, never a substitute for dial-time enforcement. Under
-the transitional default this already rejects metadata/special-purpose
-targets while admitting private forges.
+the transitional default this already rejects cloud metadata and
+special-purpose targets while admitting private forges.
+
+**Cloud metadata stays denied under every setting.** The private classes
+hold the instance-metadata and credential endpoints of the clouds
+(`169.254.169.254` in link-local space, Alibaba Cloud's `100.100.100.200`
+in RFC 6598 shared space, `fd20:ce::254` in ULA space, and more). The guard
+denies each of these single addresses whatever the policy, so admitting a
+private class never admits instance credentials. The list and its sources
+are in the
+[configuration reference](../reference/configuration.md#cloud-metadata-endpoints).
 
 **Migration plan (release-notes language).** This release: pull fetches
 gain the dial-time guard with private targets still allowed by default;

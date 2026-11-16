@@ -383,7 +383,8 @@ Verification).
   server, and `serve` exits when it loses the lease [internal/ref/s3wal/lease.go:AcquireInstanceLease]
   [cmd/openstorage/main.go:cmdServe].
 - Outbound webhook and upstream sync traffic goes through an SSRF guard. The guard always
-  denies metadata, unspecified, multicast, and broadcast addresses, and denies private
+  denies the cloud metadata endpoints (`metadataAddrs`, such as `169.254.169.254` and
+  `100.100.100.200`), unspecified, multicast, and broadcast addresses, and denies private
   addresses unless allowed [internal/events/guard.go:deniedReason]
   [internal/sync/egress.go:startEgressProxy].
 - Git subprocesses run under shared admission slots, in tracked process groups that

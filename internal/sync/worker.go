@@ -218,9 +218,10 @@ type Worker struct {
 	// PushEgressAllowPrivate relaxes the outbound push egress guard's
 	// private receiver classes (resolved from OPENSTORAGE_SYNC_ALLOW_PRIVATE
 	// with OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE as the deprecated push-only
-	// spelling, see egress.go): loopback/RFC1918/link-local/ULA upstreams
-	// for genuinely internal forges. Metadata and the special-purpose
-	// registry stay denied either way — every http(s) push dials through
+	// spelling, see egress.go): loopback, RFC 1918, RFC 6598 shared,
+	// link-local and ULA upstreams for genuinely internal forges. The
+	// cloud metadata endpoints and the other special-purpose ranges stay
+	// denied either way — every http(s) push dials through
 	// the guard's vetting proxy. Tests set it (fixture upstreams are
 	// 127.0.0.1).
 	PushEgressAllowPrivate bool
@@ -232,8 +233,9 @@ type Worker struct {
 	// whose TRANSITIONAL default keeps it true — internal-forge mirrors
 	// are a mainstream released deployment shape, and a future release
 	// flips the unset default to deny (boot warning announces the flip).
-	// Metadata and the special-purpose registry stay denied either way.
-	// Tests set it (fixture upstreams are 127.0.0.1).
+	// The cloud metadata endpoints and the other special-purpose ranges
+	// stay denied either way. Tests set it (fixture upstreams are
+	// 127.0.0.1).
 	PullEgressAllowPrivate bool
 }
 
