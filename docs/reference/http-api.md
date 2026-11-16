@@ -872,7 +872,7 @@ Upstream documents no value and no `Link` or `Sunset` header, so open.storage se
   Auth, config, and rejection failures do not retry.
 - A successful run schedules one follow-up inbound sync, so a pull that raced the forward
   cannot strand a stale local snapshot.
-- Private/special destinations are denied (permanent `invalid sync configuration`
+- Private/special destinations are denied (permanent `repository configuration error`
   failure) unless
   [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](configuration.md#openstorage_sync_push_allow_private)
   opts internal forges in.
@@ -928,7 +928,7 @@ freshness pokes) and push-upstream forwards.
   [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#openstorage_sync_allow_private).
   Transitional default: pulls allow private upstreams, pushes deny.
 - A denied pull destination fails the run as `repository configuration error`; a denied
-  push destination as `invalid sync configuration`.
+  push destination fails the same way.
 - `POST /repos` with `upstream` or a `base_repo` sync also rejects, with 400, an
   `upstream.host` or `upstream_host` the pull policy denies. This registration check is a courtesy; dial time is authoritative.
 

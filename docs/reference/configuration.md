@@ -352,9 +352,8 @@ Unified egress policy for upstream sync in **both** directions (ADR-45).
   re-vetted at connect time.
 - **Covered:** pulls (`POST /repos/pull-upstream`, the first sync at `POST /repos`,
   freshness pokes) and push forwards (`POST /repos/push-upstream`, `forward_pushes`).
-- **Denied destination:** the upstream is never contacted. Pulls fail as
-  `repository configuration error`; pushes fail as `invalid sync configuration`, with no
-  retry.
+- **Denied destination:** the upstream is never contacted. Pulls and pushes fail as
+  `repository configuration error`, with no retry.
 - **Registration** (`POST /repos` with `upstream` or `base_repo`) also runs a courtesy
   check against the pull policy. Dial-time enforcement stays authoritative.
 
