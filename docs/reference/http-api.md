@@ -819,7 +819,10 @@ A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`) is o
 131,070 bytes fails as `repository configuration error` before git starts. git gets the URL
 as one argument, and its HTTP transport hands it on with a `/` added, which must fit
 128 KiB with its terminating NUL. A stored credential that git cannot take fails the same
-way ([Git credentials](#git-credentials-generic-https-upstreams)).
+way ([Git credentials](#git-credentials-generic-https-upstreams)). Values that each fit
+can still pass the total limit together: one git start can carry the URL twice and both
+credential entries, about 512 KiB at the limits, so a server with a stack limit of 2 MiB
+or less can fail such a run as a failed fetch or push.
 
 #### Deprecation header
 

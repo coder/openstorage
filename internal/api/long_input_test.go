@@ -282,9 +282,10 @@ func TestIdentsPastGitArgLimit(t *testing.T) {
 }
 
 // TestValuesPastGitArgLimitAreNotEchoed sends values over their limit that
-// also hold a NUL. The size answers first, so the 400 never quotes the
-// value, and the items of invalid_params keep the order of the body's
-// fields.
+// also hold a NUL. For a path, a range or a paths entry the size answers
+// first, so the 400 never quotes the value. For an ident the NUL answers
+// (neither problem quotes it), each field is named once, and the items of
+// invalid_params keep the order of the body's fields.
 func TestValuesPastGitArgLimitAreNotEchoed(t *testing.T) {
 	long := strings.Repeat("v", 200_000) + "\x00"
 	runBackends(t, func(t *testing.T, e *testEnv) {
@@ -344,8 +345,9 @@ func TestValuesPastGitArgLimitAreNotEchoed(t *testing.T) {
 		if err := json.Unmarshal(body, &p); err != nil {
 			t.Fatal(err)
 		}
-		if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != "author.name" {
-			t.Fatalf("merge: status %d, invalid_params %+v; want 400 naming author.name once", resp.StatusCode, p.InvalidParams)
+		if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 ||
+			p.InvalidParams[0].Name != "author.name" || p.InvalidParams[0].Reason != ipcNulReason {
+			t.Fatalf("merge: status %d, invalid_params %+v; want 400 naming author.name once, for its NUL", resp.StatusCode, p.InvalidParams)
 		}
 	})
 }

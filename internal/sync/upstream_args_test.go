@@ -12,7 +12,8 @@ import (
 
 // longPathUpstream is a git smart-HTTP upstream (git http-backend over CGI)
 // that serves root/own/proj.git under any repository name, so a URL of any
-// length can name a real repository.
+// length can name a real repository. It answers protocol v0, where git
+// hands the URL with a "/" added to fetch-pack as well as to send-pack.
 func longPathUpstream(t *testing.T, root string) string {
 	t.Helper()
 	gitPath, err := exec.LookPath("git")
@@ -28,6 +29,7 @@ func longPathUpstream(t *testing.T, root string) string {
 		if name, rest, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/own/"), ".git/"); ok && name != "" {
 			r.URL.Path = "/own/proj.git/" + rest
 		}
+		r.Header.Del("Git-Protocol")
 		backend.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
@@ -62,6 +64,7 @@ func TestUpstreamValuesPastGitArgLimit(t *testing.T) {
 		{"password one byte over", values{password: maxCredentialBytes + 1}, true},
 		{"password of 200,000 bytes", values{password: 200_000}, true},
 		{"username at the limit", values{username: maxCredentialBytes}, false},
+		{"password at the limit next to a username", values{username: 1, password: maxCredentialBytes}, false},
 		{"username one byte over", values{username: maxCredentialBytes + 1}, true},
 	} {
 		for _, lane := range []string{"pull", "push"} {
@@ -91,7 +94,8 @@ func TestUpstreamValuesPastGitArgLimit(t *testing.T) {
 				if tc.v.username+tc.v.password > 0 {
 					cred := Credential{RepoID: "repo_arg", Username: strings.Repeat("u", tc.v.username), Password: "p"}
 					if tc.v.password > 0 {
-						// Gitea sends a token with no username as the username.
+						// With no username, gitea sends the token as the
+						// username: git gets the password entry only next to one.
 						cred.Password = strings.Repeat("p", tc.v.password)
 					}
 					if _, err := f.store.CreateCredential(context.Background(), cred); err != nil {
