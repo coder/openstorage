@@ -2,8 +2,10 @@ package githttp
 
 import (
 	"fmt"
+	"runtime/debug"
 	"slices"
 
+	"github.com/coder/openstorage/internal/envconfig"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -76,4 +78,22 @@ func hookFailure(hook string, err error) error {
 	}
 	hookErrorsLogger().Error(hook+" failed", "err", err)
 	return fmt.Errorf("%s failed; push again later (the server log has the cause)", hook)
+}
+
+// recoverHook is deferred by RunHook. A panic in a hook reaches the pusher
+// as Go's panic output, which git relays and which names server paths. So
+// the pusher gets the fixed hookFailure line, and the panic and its stack
+// go to the hook-errors file. serve gives every push that file. A hook
+// without it, such as one that hydration starts, has no pusher, and its
+// panic keeps going to the operator's stderr. It cannot catch a panic in
+// another goroutine.
+func recoverHook(hook string, retErr *error) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	if envconfig.Getenv(EnvHookErrors) == "" {
+		panic(r)
+	}
+	*retErr = hookFailure(hook, fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
 }
