@@ -211,6 +211,10 @@ func refusedRawPush(t *testing.T, repo, token, work string, bad []string, perCom
 // The probe asks once for each distinct target and stops asking after
 // maxGitRefusedProbes failures.
 func TestGitRefusalProbeBoundsTheChecks(t *testing.T) {
+	// The docs say eight, so the value is pinned here and in the docs together.
+	if maxGitRefusedProbes != 8 {
+		t.Fatalf("maxGitRefusedProbes = %d, want 8: docs/explanation/wire-compatibility.md says eight", maxGitRefusedProbes)
+	}
 	var asked []string
 	probe := newGitRefusalProbe(func(sha string) bool { asked = append(asked, sha); return false })
 	for range 1000 {

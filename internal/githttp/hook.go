@@ -2947,7 +2947,7 @@ const maxGitRefusedProbes = 8
 // about reads as reaching the update hook: the gate then publishes, as it did
 // before the check, because a quota-counted junk pack costs less than a wrong
 // refusal of a push that git accepts. The gate stops asking at the first target
-// that passes, so one push spends at most maxGitRefusedProbes+1 checks.
+// that passes, so one push spends at most maxGitRefusedProbes checks.
 type gitRefusalProbe struct {
 	reach   func(sha string) bool
 	known   map[string]bool
