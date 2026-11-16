@@ -172,6 +172,14 @@ func TestSyncValuesGitCannotTakeAtRegistration(t *testing.T) {
 			{name: "PUT by path username and password over", method: http.MethodPut, path: byPath, token: repoTok, body: both, wantError: bothMsg, want: bothItems},
 			{name: "POST password over", method: http.MethodPost, path: v1, token: repoTok, body: `{"password":"` + long + `"}`,
 				wantError: "invalid password (want at most 131042 bytes)", want: []ipParam{{"password", credWhy}}},
+			// A username over the limit is a problem on its own, next to
+			// a valid password.
+			{name: "POST username over next to a short password", method: http.MethodPost, path: v1, token: repoTok,
+				body: `{"username":"` + long + `","password":"p"}`, wantError: "invalid username (want at most 131042 bytes)",
+				want: []ipParam{{"username", credWhy}}},
+			{name: "PUT by path username over next to a short password", method: http.MethodPut, path: byPath, token: repoTok,
+				body: `{"username":"` + long + `","password":"p"}`, wantError: "invalid username (want at most 131042 bytes)",
+				want: []ipParam{{"username", credWhy}}},
 			// A value over the limit that also holds a NUL is one problem.
 			{name: "POST username over with a NUL", method: http.MethodPost, path: v1, token: repoTok,
 				body: `{"username":"` + long + `\u0000","password":"p"}`, wantError: "invalid username (want UTF-8 text without NUL)",

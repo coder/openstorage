@@ -616,16 +616,56 @@ func TestReadValueListsPastGitArgBudget(t *testing.T) {
 		resp, out := e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token, grepBody(paths), "")
 		requireListTooLong(t, resp, out, "paths", true)
 
-		// An entry with a problem of its own is named, and the list is not,
-		// also when good entries follow it.
-		paths[0] = "../x"
-		resp, out = e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token, grepBody(paths[:3001]), "")
-		var p problemBody
-		if err := json.Unmarshal(out, &p); err != nil {
-			t.Fatal(err)
+		// The count is of the request as sent: a bare "/" gives git no
+		// argument, but counts 1 + 32 bytes like any other entry.
+		for _, n := range []int{1985, 1986} {
+			resp, out = e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token, grepBody(slices.Repeat([]string{"/"}, n)), "")
+			if n*(1+gitlimit.ArgListEntryBytes) > gitlimit.MaxArgListBytes {
+				requireListTooLong(t, resp, out, "paths", true)
+			} else if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%d bare / entries: status = %d, want 200 (body %.300s)", n, resp.StatusCode, out)
+			}
 		}
-		if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != "paths.0" {
-			t.Fatalf("status %d, invalid_params %+v; want 400 naming paths.0 only", resp.StatusCode, p.InvalidParams)
+
+		// An entry with a problem of its own is named, and the list total is
+		// not checked, wherever that entry is in a list over the budget.
+		over := paths[:3001] // 3,001 one-byte entries count 99,033 bytes
+		for _, bad := range []int{0, 1500, 3000} {
+			entries := slices.Clone(over)
+			entries[bad] = "../x"
+			resp, out = e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token, grepBody(entries), "")
+			var p problemBody
+			if err := json.Unmarshal(out, &p); err != nil {
+				t.Fatal(err)
+			}
+			want := "paths." + strconv.Itoa(bad)
+			if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != want {
+				t.Fatalf("status %d, invalid_params %+v; want 400 naming %s only", resp.StatusCode, p.InvalidParams, want)
+			}
+		}
+		// The query routes answer with the entry's own message.
+		ranges := slices.Repeat([]string{blameRange(5000)}, maxBlameRanges) // 80,512 bytes counted
+		for _, tc := range []struct {
+			name, route, param string
+			list               []string
+			bad                int
+			entry, want        string
+		}{
+			{"diff outside", "/api/v1/repos/diff?ref=main&", "path", over, 1500, "../x", `path filter "../x" is outside the repository`},
+			{"diff blank", "/api/v1/repos/diff?ref=main&", "path", over, 1500, " ", `invalid path filter " "`},
+			{"branches/diff outside", "/api/v1/repos/branches/diff?branch=main&", "path", over, 3000, "../x", `path filter "../x" is outside the repository`},
+			{"blame blank", "/api/v1/repos/blame?ref=main&path=a.txt&", "range", ranges, 8, " ", `invalid range " "`},
+		} {
+			entries := slices.Clone(tc.list)
+			entries[tc.bad] = tc.entry
+			resp, out = e.doReq(t, http.MethodGet, tc.route+url.Values{tc.param: entries}.Encode(), token, nil, "")
+			var p problemBody
+			if err := json.Unmarshal(out, &p); err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusBadRequest || p.Detail != tc.want {
+				t.Fatalf("%s: status %d, detail %q; want 400 %q", tc.name, resp.StatusCode, p.Detail, tc.want)
+			}
 		}
 	})
 }
