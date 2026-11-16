@@ -272,3 +272,30 @@ func resolveCommitObject(ctx context.Context, repoPath, cand, id string) (string
 	}
 	return "", fmt.Errorf("git cannot read commit or tag chain %s", id)
 }
+
+// RegisteredKinds returns the type of each id as the registered packs show it:
+// commit, tree, blob, tag, or "missing" when no pack that the registry lists
+// for repo holds the object. It reads a view of the cache that links only those
+// packs (githttp.RegisteredPackView), so an object that only the node's cache
+// holds reads as missing. ResolveRef and the other reads here consult the
+// cache, which can hold more than the registry. A write that stores an object id
+// in a ref must ask this, because every other node hydrates from the packs.
+// A registered pack that the cache lacks is downloaded first.
+func RegisteredKinds(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo string, ids []string) (map[string]string, error) {
+	if len(ids) == 0 {
+		return map[string]string{}, nil
+	}
+	view, err := githttp.NewRegisteredPackView(ctx, st, repoPath, repo, func(ctx context.Context) error {
+		return githttp.HydratePacks(ctx, st, bl, repoPath, repo)
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer view.Close()
+	out, err := Run(ctx, Cmd{Class: Light, Dir: repoPath, Env: view.Env(os.Environ()), Stdin: strings.NewReader(strings.Join(ids, "\n") + "\n"),
+		Args: []string{"cat-file", "--batch-check=%(objecttype)"}})
+	if err != nil {
+		return nil, err
+	}
+	return githttp.ParseObjectKinds(ids, out)
+}

@@ -1840,6 +1840,21 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 			return err
 		}
 	}
+	// The new value must be in a pack that the registry lists. git has already
+	// checked that the object is readable, but it reads the node's cache, which
+	// can hold objects that no registered pack holds (a cache that was copied or
+	// edited out of band, or a registry that was rolled back). A ref at such an
+	// object wedges every node that hydrates from the registered packs. A push
+	// that carries its objects is safe: pre-receive registered its pack before
+	// this hook runs, and git moved the pack into the cache. The case that this
+	// closes is an update to an object that no pack of this push carries.
+	// Checked on the raw store, before the CAS, and denied per ref like a policy
+	// denial. Deletions have no new value.
+	if new != ref.ZeroSHA {
+		if err := unregisteredTargetCheck(ctx, st, repo, refName, new); err != nil {
+			return err
+		}
+	}
 	var inner ref.RefStore = st
 	if testMode() {
 		inner = injectCASDrop(inner)
@@ -2915,6 +2930,51 @@ func objectExists(sha string) bool {
 	}
 	// Not an exit status (git missing, spawn failure): a bug, fail fast.
 	panic(fmt.Sprintf("githttp assertion failed: cat-file -e %s: %v", sha, err))
+}
+
+// unregisteredTargetCheck is denyUnregisteredTarget. Tests that run the update
+// hook on an object id that they invented, to reach a later step, replace it.
+var unregisteredTargetCheck = denyUnregisteredTarget
+
+// denyUnregisteredTarget refuses the update of refName to new when no pack that
+// the registry lists for repo holds the object. It reads the cache repository
+// through a RegisteredPackView, so only the registered packs answer. A registered
+// pack that the cache lacks (a fold replaced the packs after the cache was
+// hydrated) is downloaded first. An object that is no commit is left to the
+// other checks: only "missing" is refused here.
+func denyUnregisteredTarget(ctx context.Context, st ref.RefStore, repo, refName, new string) error {
+	repoPath, err := os.Getwd() // git runs hooks in the repository
+	if err != nil {
+		return fmt.Errorf("update: find the repository: %w", err)
+	}
+	view, err := NewRegisteredPackView(ctx, st, repoPath, repo, func(ctx context.Context) error {
+		bl, err := blob.Open(ctx, mustEnv(envHookBlobURL...))
+		if err != nil {
+			return err
+		}
+		defer bl.Close()
+		return HydratePacks(ctx, st, bl, repoPath, repo)
+	})
+	if err != nil {
+		return fmt.Errorf("update: read the registered packs: %w", err)
+	}
+	defer view.Close()
+	var out strings.Builder
+	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check=%(objecttype)")
+	cmd.Env = gitlimit.NoReplaceObjects(view.Env(os.Environ()))
+	cmd.Stdin = strings.NewReader(new + "\n")
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("update: read the object type of %s in the registered packs: %w", new, err)
+	}
+	kinds, err := ParseObjectKinds([]string{new}, out.String())
+	if err != nil {
+		return fmt.Errorf("update: %w", err)
+	}
+	if kinds[new] == "missing" {
+		return refusef("update: %s is at %s, which no pack of this repository's registry holds", refName, new)
+	}
+	return nil
 }
 
 // objectInMainStore reports whether sha is resolvable WITHOUT the

@@ -386,6 +386,29 @@ func wrefValidateCreateBranch(req *wrefCreateBranchRequest) (target string, allo
 	return target, allocate, guard, errs.err()
 }
 
+// wrefResolveHeld is gitread.ResolveRef for a write that stores the commit in a
+// ref. The commit must also be in a pack that the registry lists for the
+// repository: the node's cache can hold objects that no registered pack holds
+// (a cache that was copied or edited out of band, or a registry that was rolled
+// back), and a ref at such an object wedges every other node and this node
+// after its cache is gone, because they hydrate from the registered packs
+// alone. A commit that no registered pack holds answers like one that does not
+// exist.
+func (s *server) wrefResolveHeld(ctx context.Context, repoID, repoPath, spec string, ephemeral bool) (string, error) {
+	sha, err := gitread.ResolveRef(ctx, repoPath, spec, ephemeral)
+	if err != nil {
+		return "", err
+	}
+	kinds, err := gitread.RegisteredKinds(ctx, s.refStore, s.blobStore, repoPath, repoID, []string{sha})
+	if err != nil {
+		return "", fmt.Errorf("check that a registered pack holds %s: %w", sha, err)
+	}
+	if kinds[sha] != "commit" {
+		return "", gitread.ErrNotFound
+	}
+	return sha, nil
+}
+
 // handleCreateBranch resolves the base to a commit (branch, tag — peeled —
 // or hex sha via gitread.ResolveRef; preferred_base is the fallback when
 // the primary base is absent or names no ref, and a base whose commit git
@@ -436,7 +459,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	baseSHA := ""
 	if base != "" {
-		sha, err := gitread.ResolveRef(ctx, repoPath, base, req.BaseIsEphemeral)
+		sha, err := s.wrefResolveHeld(ctx, repo.RepoID, repoPath, base, req.BaseIsEphemeral)
 		switch {
 		case errors.Is(err, gitread.ErrNotFound):
 			// Fall through to preferred_base below (when given). An
@@ -449,7 +472,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if baseSHA == "" && req.PreferredBase != "" {
-		sha, err := gitread.ResolveRef(ctx, repoPath, req.PreferredBase, req.BaseIsEphemeral)
+		sha, err := s.wrefResolveHeld(ctx, repo.RepoID, repoPath, req.PreferredBase, req.BaseIsEphemeral)
 		switch {
 		case errors.Is(err, gitread.ErrNotFound):
 			// Report below with the primary-base message.
@@ -752,7 +775,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	sha, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
+	sha, err := s.wrefResolveHeld(r.Context(), repo.RepoID, repoPath, target, false)
 	switch {
 	case errors.Is(err, gitread.ErrNotFound):
 		writeProblem(w, http.StatusNotFound, codeRefNotFound, "ref does not resolve to a commit")

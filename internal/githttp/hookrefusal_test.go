@@ -154,6 +154,7 @@ func TestUpdateHookHidesStoreErrors(t *testing.T) {
 		st.Close()
 		c := pgCanary()
 		records := hookEnv(t, dbURL)
+		skipRegisteredTargetCheck(t)
 		prev := WrapHookRefStore
 		t.Cleanup(func() { WrapHookRefStore = prev })
 		WrapHookRefStore = func(_ context.Context, st ref.RefStore) (ref.RefStore, error) {
