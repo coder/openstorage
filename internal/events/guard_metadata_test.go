@@ -19,6 +19,7 @@ var cloudMetadataAddrs = []string{
 	"169.254.170.23",     // AWS EKS Pod Identity Agent
 	"fd00:ec2::23",       // AWS EKS Pod Identity Agent IPv6
 	"fd20:ce::254",       // Google Cloud IPv6-only instances
+	"169.254.169.252",    // GKE metadata server
 	"100.100.100.200",    // Alibaba Cloud
 	"169.254.10.10",      // Tencent Cloud metadata.tencentyun.com
 	"169.254.0.23",       // Tencent Cloud Cloudbase-Init
@@ -103,6 +104,7 @@ func TestTargetGuardMetadataNeighborsKeepTheirClass(t *testing.T) {
 
 	for _, raw := range []string{
 		"169.254.169.253",
+		"169.254.169.251",
 		"169.254.170.3",
 		"100.100.100.201",
 		"169.254.10.11",

@@ -339,9 +339,9 @@ Both egress guards, for webhook deliveries and for sync transfers, deny these
 instance-metadata and credential endpoints under every policy, also with
 `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE=true` or `OPENSTORAGE_SYNC_ALLOW_PRIVATE=true`. Each
 entry is one address. Most lie inside a private class (link-local, RFC 6598 shared,
-ULA), and the rest of that class stays admitted when the policy admits it. An IPv4 address is denied in its
-IPv4-mapped IPv6 form too, and a DNS name is denied when it resolves to one of them, as
-`metadata.google.internal` does.
+ULA), and the rest of that class stays admitted when the policy admits it. An IPv4
+address is denied in its IPv4-mapped IPv6 form too, and a DNS name is denied when it
+resolves to one of them, as `metadata.google.internal` does.
 
 | Address | Endpoint of |
 |---|---|
@@ -350,6 +350,7 @@ IPv4-mapped IPv6 form too, and a DNS name is denied when it resolves to one of t
 | `169.254.170.2` | AWS ECS task metadata and task role credentials |
 | `169.254.170.23`, `fd00:ec2::23` | AWS EKS Pod Identity Agent |
 | `fd20:ce::254` | Google Cloud (IPv6-only instances) |
+| `169.254.169.252` | Google Kubernetes Engine metadata server (Workload Identity) |
 | `100.100.100.200` | Alibaba Cloud |
 | `169.254.10.10`, `169.254.0.23` | Tencent Cloud (`metadata.tencentyun.com`, Cloudbase-Init) |
 | `169.254.42.42`, `fd00:42::42` | Scaleway |
@@ -374,7 +375,8 @@ Unified egress policy for upstream sync in **both** directions (ADR-45).
     shared, link-local and ULA addresses. The
     [cloud metadata endpoints](#cloud-metadata-endpoints), the other IANA
     special-purpose ranges, multicast, broadcast, unspecified and zone-scoped
-    addresses, and the rest of IPv6 outside `2000::/3` stay denied.
+    addresses, and the rest of IPv6 outside `2000::/3` stay denied. An IPv4-mapped IPv6
+    address (`::ffff:10.0.0.1`) counts as its IPv4 address.
   - `false`: strict both ways; only public upstreams are dialable.
   - **Unset or empty:** pushes stay strict (the deprecated
     [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) may relax

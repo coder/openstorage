@@ -18,7 +18,9 @@ import (
 // addresses around an endpoint stay admitted.)
 func TestRegistrationDeniesCloudMetadataWithPrivateAllowed(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
-		s := newPendingSyncStack(t, e, true) // its guard admits private targets
+		// The stack's sync server always runs with a guard that admits
+		// private targets (events.TargetGuard{AllowPrivate: true}).
+		s := newPendingSyncStack(t, e, true)
 		for _, host := range []string{"100.100.100.200", "169.254.170.2", "[fd20:ce::254]"} {
 			name := "meta-" + randomHex(t, 4)
 			code, _, msg := s.create(t, name, `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"http://`+host+`"}}`)

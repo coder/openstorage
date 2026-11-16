@@ -19,18 +19,20 @@ func TestEgressProxyDeniesCloudMetadataUnderEveryPolicy(t *testing.T) {
 	for _, allow := range []bool{false, true} {
 		for _, ip := range []string{"169.254.169.254", "100.100.100.200", "169.254.170.2", "fd20:ce::254", "fe80::a9fe:a9fe"} {
 			t.Run(fmt.Sprintf("allow_private=%v/%s", allow, strings.ReplaceAll(ip, ":", "_")), func(t *testing.T) {
-				p, err := startEgressProxy(allow)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer p.Close()
 				target := net.JoinHostPort(ip, "443")
 				for _, req := range []string{
 					fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target),
 					fmt.Sprintf("GET http://%s/o/n.git/info/refs HTTP/1.1\r\nHost: %s\r\n\r\n", target, target),
 				} {
+					// A proxy for each request: it records only its first
+					// denial.
+					p, err := startEgressProxy(allow)
+					if err != nil {
+						t.Fatal(err)
+					}
 					conn, err := net.Dial("tcp", p.ln.Addr().String())
 					if err != nil {
+						p.Close()
 						t.Fatal(err)
 					}
 					fmt.Fprint(conn, req)
@@ -38,16 +40,16 @@ func TestEgressProxyDeniesCloudMetadataUnderEveryPolicy(t *testing.T) {
 					resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: method})
 					if err != nil {
 						conn.Close()
+						p.Close()
 						t.Fatalf("%s: read response: %v", method, err)
 					}
 					resp.Body.Close()
 					conn.Close()
-					if resp.StatusCode != http.StatusForbidden {
-						t.Fatalf("%s %s: status %d, want 403", method, target, resp.StatusCode)
+					denied := p.deniedReason()
+					p.Close()
+					if resp.StatusCode != http.StatusForbidden || !strings.Contains(denied, "cloud metadata address") {
+						t.Fatalf("%s %s: status %d, recorded denial %q; want 403 and a cloud metadata denial", method, target, resp.StatusCode, denied)
 					}
-				}
-				if got := p.deniedReason(); !strings.Contains(got, "cloud metadata address") {
-					t.Fatalf("recorded denial %q, want a cloud metadata denial", got)
 				}
 			})
 		}

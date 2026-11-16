@@ -84,6 +84,9 @@ const dialTimeout = 10 * time.Second
 //     (docs.aws.amazon.com/eks/latest/userguide/pod-identities.html).
 //   - fd20:ce::254: Google Cloud metadata on IPv6-only instances
 //     (docs.cloud.google.com/compute/docs/metadata/querying-metadata).
+//   - 169.254.169.252: the GKE metadata server that Pods reach for
+//     Workload Identity
+//     (cloud.google.com/kubernetes-engine/docs/how-to/network-policy).
 //   - 100.100.100.200: Alibaba Cloud ECS metadata and RAM role credentials
 //     (alibabacloud.com/help/en/ecs/user-guide/view-instance-metadata).
 //   - 169.254.10.10: Tencent Cloud metadata.tencentyun.com
@@ -111,6 +114,7 @@ var metadataAddrs = []netip.Addr{
 	netip.MustParseAddr("169.254.170.23"),
 	netip.MustParseAddr("fd00:ec2::23"),
 	netip.MustParseAddr("fd20:ce::254"),
+	netip.MustParseAddr("169.254.169.252"),
 	netip.MustParseAddr("100.100.100.200"),
 	netip.MustParseAddr("169.254.10.10"),
 	netip.MustParseAddr("169.254.0.23"),
