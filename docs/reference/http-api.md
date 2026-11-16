@@ -409,8 +409,10 @@ the same scopes, query parameters and responses.
     a valid host`:
     - an IP address without a zone, or a DNS name: at most 253 bytes (254 with a final
       dot), labels of 1 to 63 letters, digits, `_` and `-` that do not start or end with
-      `-`, and no number form that curl reads as an IPv4 address (`2130706433`, `1.2.3`
-      and `0x7f.1` → 400: curl would dial `127.0.0.1`, `1.2.0.3` and `127.0.0.1`);
+      `-`, not only digits and dots, and not a numerical IPv4 address in curl's forms:
+      one to four decimal, octal or `0x` hexadecimal numbers within IPv4's range
+      (`2130706433`, `1.2.3` and `0x7f.1` → 400: curl would dial `127.0.0.1`, `1.2.0.3`
+      and `127.0.0.1`; `0x100.1` is out of range, so it stays a name);
     - a name with other letters in its ASCII form (`xn--bcher-kva.example`, not
       `bücher.example`);
     - a port from 1 to 65535, or an empty one, which is the default;

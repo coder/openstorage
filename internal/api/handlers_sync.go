@@ -471,32 +471,45 @@ func resolverName(name string) bool {
 	return prev != '-' && label <= 63 && letters
 }
 
-// curlIPv4Name reports whether curl reads name as an IPv4 address: one to
-// four labels (a final dot aside), each a decimal, octal or hexadecimal
-// (0x) number, such as 0x7f000001, 0x7f.1 or 1.2.3.0x4. curl dials such a
-// name as the address (127.0.0.1, 1.2.3.4), which the registration check,
-// which reads it as a name, never saw.
+// curlIPv4Name reports whether curl reads name as an IPv4 address, as its
+// URL parser does (ipv4_normalize): one to four labels, a final dot aside,
+// each a decimal, octal (leading 0) or hexadecimal (0x) number of at most
+// 32 bits, all but the last at most 255, and the last within the bits the
+// others leave, such as 2130706433, 0x7f000001, 0x7f.1 or 1.2.3.0x4. curl
+// dials such a name as the address (127.0.0.1, 1.2.3.4), which the
+// registration check, which reads it as a name, never saw. A name that only
+// looks numeric, such as 0x100.1 or 0x100000000, stays a name for curl.
 func curlIPv4Name(name string) bool {
 	labels := strings.Split(strings.TrimSuffix(name, "."), ".")
 	if len(labels) > 4 {
 		return false
 	}
-	for _, label := range labels {
-		digits, hex := label, false
-		if len(label) >= 2 && label[0] == '0' && (label[1] == 'x' || label[1] == 'X') {
-			digits, hex = label[2:], true
-		}
-		if digits == "" && !hex {
+	last := len(labels) - 1
+	for i, label := range labels {
+		v, ok := curlIPv4Part(label)
+		if !ok || i < last && v > 0xff || i == last && v > 0xffffffff>>(8*last) {
 			return false
-		}
-		for i := 0; i < len(digits); i++ {
-			c := digits[i]
-			if !('0' <= c && c <= '9' || hex && ('a' <= c && c <= 'f' || 'A' <= c && c <= 'F')) {
-				return false
-			}
 		}
 	}
 	return true
+}
+
+// curlIPv4Part parses one label of a numerical IPv4 address as curl does:
+// 0x or 0X and hexadecimal digits, 0 and octal digits, or decimal digits,
+// at most 32 bits.
+func curlIPv4Part(label string) (uint64, bool) {
+	base, digits := 10, label
+	switch {
+	case len(label) >= 2 && label[0] == '0' && (label[1] == 'x' || label[1] == 'X'):
+		base, digits = 16, label[2:]
+	case len(label) >= 1 && label[0] == '0':
+		base = 8
+	}
+	if digits == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(digits, base, 32)
+	return v, err == nil
 }
 
 // upstreamHostname extracts the hostname the sync fetch will dial from a
