@@ -3015,6 +3015,9 @@ func denyUnregisteredTargets(ctx context.Context, repo string, commands []refCom
 	if err != nil {
 		return fmt.Errorf("pre-receive: %w", err)
 	}
+	if err := view.CheckAnswer(kinds); err != nil {
+		return fmt.Errorf("pre-receive: %w", err)
+	}
 	for _, c := range commands {
 		if c.new != ref.ZeroSHA && kinds[c.new] == "missing" {
 			return refusef("pre-receive: %s is at %s, which no pack of this repository's registry holds: only this node's cache has the object. Push the object again with its pack", c.ref, c.new)

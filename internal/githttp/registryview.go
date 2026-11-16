@@ -32,38 +32,41 @@ const registryViewHealRounds = 3
 type RegisteredPackView struct {
 	dir      string
 	repoPath string
+	repo     string
+	// absent lists the registered packs that the cache still lacked after the
+	// heal rounds. The view does not link them.
+	absent []string
 }
 
 // NewRegisteredPackView lists the packs that st has for repo and links their
 // files from repoPath's object directory. A registered pack that is not in the
-// cache (a fold replaced the packs since the cache was last hydrated) is
-// fetched by heal, once, and the listing is read again. A nil heal, or a pack
-// that is still missing after it, is an error that wraps ErrPackMissing: the
-// view would lack objects that the registry holds, and a caller that read
-// "missing" from it would refuse a ref that is healthy.
+// cache (a fold replaced the packs since the cache was last hydrated, or
+// another node registered it a moment ago) is fetched by heal and the listing
+// is read again, at most registryViewHealRounds times, because packs keep
+// arriving while pushes run. A pack that the cache still lacks after that is
+// left out of the view: an object that the view
+// holds is held by a registered pack, but an object that it does not hold may
+// be in a pack that it lacks. A caller that reads "missing" from an incomplete
+// view must call CheckAnswer.
 func NewRegisteredPackView(ctx context.Context, st ref.RefStore, repoPath, repo string, heal func(context.Context) error) (*RegisteredPackView, error) {
 	packDir := filepath.Join(repoPath, "objects", "pack")
-	var packs []ref.Pack
-	// Another node can register a pack between the listing and the heal, so a
-	// listing that still names a missing pack heals again, within a bound, like
-	// HydratePacks.
+	var packs, present []ref.Pack
+	var absent []string
 	for attempt := 0; ; attempt++ {
 		var err error
 		if packs, err = st.ListPacks(ctx, repo); err != nil {
 			return nil, fmt.Errorf("list the packs of %s: %w", repo, err)
 		}
-		missing := ""
+		present, absent = present[:0], absent[:0]
 		for _, p := range packs {
-			if !packFilesExist(packDir, p.ID) {
-				missing = p.ID
-				break
+			if packFilesExist(packDir, p.ID) {
+				present = append(present, p)
+			} else {
+				absent = append(absent, p.ID)
 			}
 		}
-		if missing == "" {
+		if len(absent) == 0 || heal == nil || attempt >= registryViewHealRounds {
 			break
-		}
-		if heal == nil || attempt >= registryViewHealRounds {
-			return nil, fmt.Errorf("%w: the cache of %s lacks the registered pack %s", ErrPackMissing, repo, missing)
 		}
 		if err := heal(ctx); err != nil {
 			return nil, fmt.Errorf("fetch the registered packs of %s: %w", repo, err)
@@ -73,13 +76,13 @@ func NewRegisteredPackView(ctx context.Context, st ref.RefStore, repoPath, repo 
 	if err != nil {
 		return nil, err
 	}
-	v := &RegisteredPackView{dir: dir, repoPath: repoPath}
+	v := &RegisteredPackView{dir: dir, repoPath: repoPath, repo: repo, absent: absent}
 	viewPacks := filepath.Join(dir, "pack")
 	if err := os.Mkdir(viewPacks, 0o700); err != nil {
 		v.Close()
 		return nil, err
 	}
-	for _, p := range packs {
+	for _, p := range present {
 		for _, ext := range []string{".pack", ".idx"} {
 			name := "pack-" + p.ID + ext
 			if err := os.Symlink(filepath.Join(packDir, name), filepath.Join(viewPacks, name)); err != nil {
@@ -89,6 +92,24 @@ func NewRegisteredPackView(ctx context.Context, st ref.RefStore, repoPath, repo 
 		}
 	}
 	return v, nil
+}
+
+// CheckAnswer returns an error that wraps ErrPackMissing when kinds, an answer
+// that git gave over this view, reads an object as "missing" and the view lacks
+// a registered pack: the object may be in that pack, so refusing it would be
+// refusing a ref that is healthy. The caller must fail the request and let the
+// client retry. Every other answer stands: an object that the view holds is
+// held by a registered pack.
+func (v *RegisteredPackView) CheckAnswer(kinds map[string]string) error {
+	if len(v.absent) == 0 {
+		return nil
+	}
+	for _, k := range kinds {
+		if k == "missing" {
+			return fmt.Errorf("%w: the cache of %s lacks the registered pack %s", ErrPackMissing, v.repo, v.absent[0])
+		}
+	}
+	return nil
 }
 
 func packFilesExist(packDir, id string) bool {

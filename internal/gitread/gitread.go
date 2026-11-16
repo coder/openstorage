@@ -280,7 +280,10 @@ func resolveCommitObject(ctx context.Context, repoPath, cand, id string) (string
 // holds reads as missing. ResolveRef and the other reads here consult the
 // cache, which can hold more than the registry. A write that stores an object id
 // in a ref must ask this, because every other node hydrates from the packs.
-// A registered pack that the cache lacks is downloaded first.
+// A registered pack that the cache lacks is downloaded first. When new packs
+// keep arriving and the view still lacks one, an object that the view does hold
+// reads as held, and a "missing" answer is an error that wraps
+// githttp.ErrPackMissing: the object may be in the pack that the view lacks.
 func RegisteredKinds(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo string, ids []string) (map[string]string, error) {
 	if len(ids) == 0 {
 		return map[string]string{}, nil
@@ -297,5 +300,12 @@ func RegisteredKinds(ctx context.Context, st ref.RefStore, bl blob.BlobStore, re
 	if err != nil {
 		return nil, err
 	}
-	return githttp.ParseObjectKinds(ids, out)
+	kinds, err := githttp.ParseObjectKinds(ids, out)
+	if err != nil {
+		return nil, err
+	}
+	if err := view.CheckAnswer(kinds); err != nil {
+		return nil, err
+	}
+	return kinds, nil
 }
